@@ -72,7 +72,7 @@ mod tests {
                         vec![Value::Obj(target)],
                     );
                     let second = Object::new(None);
-                    second.borrow_mut().call = object(&first).borrow().call.clone();
+                    second.borrow_mut().kind = object(&first).borrow().kind.clone_callable();
                     target
                         .borrow_mut()
                         .props
@@ -123,7 +123,7 @@ mod tests {
                 );
                 // Internal construction can share a newly allocated payload with an
                 // existing function object.
-                old_owner.borrow_mut().call = object(&young_owner).borrow().call.clone();
+                old_owner.borrow_mut().kind = object(&young_owner).borrow().kind.clone_callable();
                 target
                     .borrow_mut()
                     .props
@@ -185,7 +185,7 @@ mod tests {
                         reentrant,
                         vec![Value::Obj(target), Value::Bool(throws)],
                     );
-                    let lease = object(&callback).borrow().call.clone();
+                    let lease = object(&callback).borrow().kind.clone_callable();
                     (lease, Gc::downgrade(&target))
                 });
                 // Exercise dispatch with no function Object owner at all. Its

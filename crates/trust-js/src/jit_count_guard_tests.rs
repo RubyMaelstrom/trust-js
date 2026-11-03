@@ -1,7 +1,7 @@
 //! Count-free overwrites retain property/read semantics (ECMA-262 e28783d5,
 //! OrdinarySetWithOwnDescriptor / GetValue / ToNumeric).
 use crate::bytecode::Tier;
-use crate::value::Callable;
+use crate::value::ObjectKind;
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -23,7 +23,7 @@ fn native(engine: &mut Engine, name: &str) {
     let value = engine.interp.get_var(name, &env).ok().unwrap();
     let object_handle = value.as_obj().unwrap();
     let borrowed = object_handle.borrow();
-    let Callable::User(user) = &borrowed.call else {
+    let ObjectKind::User(user) = &borrowed.kind else {
         panic!("writer")
     };
     let runtime = user.func.runtime();

@@ -18,7 +18,7 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
     };
     let obj = Object::new(proto);
     if target.is_callable() {
-        obj.borrow_mut().call = Callable::Native(proxy_uncallable);
+        obj.borrow_mut().kind = ObjectKind::Native(proxy_uncallable);
         // A proxy is a constructor exactly when its target is one.
         obj.borrow_mut().is_constructor = is_constructor_value(&target);
     }

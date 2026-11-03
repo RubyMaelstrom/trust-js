@@ -9,7 +9,7 @@
 ))]
 
 use crate::bytecode::{Chunk, Tier};
-use crate::value::{Callable, Gc, ValueView};
+use crate::value::{Gc, ObjectKind, ValueView};
 use crate::{Completion, Engine};
 use std::rc::Rc;
 
@@ -35,7 +35,7 @@ fn object(engine: &mut Engine, name: &str) -> Gc {
 fn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {
     let object = object(engine, name);
     let object = object.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("{name} is not a user function")
     };
     let runtime = user.func.runtime();
@@ -171,7 +171,7 @@ fn constructors_run_only_under_new_reach_their_second_stage_compile() {
     for name in ["Box", "Plain"] {
         let constructor = object(&mut engine, name);
         let constructor = constructor.borrow();
-        let Callable::User(user) = &constructor.call else {
+        let ObjectKind::User(user) = &constructor.kind else {
             panic!("{name} is not a user function")
         };
         assert!(
@@ -199,7 +199,7 @@ fn every_construction_counts_once() {
     let runs = |engine: &mut Engine| {
         let constructor = object(engine, "F");
         let constructor = constructor.borrow();
-        let Callable::User(user) = &constructor.call else {
+        let ObjectKind::User(user) = &constructor.kind else {
             panic!("F is not a user function")
         };
         let runtime = user.func.runtime();

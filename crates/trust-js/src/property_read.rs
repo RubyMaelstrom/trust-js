@@ -264,10 +264,10 @@ impl Interp {
     /// TDZ bindings, imports, `with` scopes and global lookups keep the real Call.
     pub(crate) fn try_binding_getter(&self, getter: &Value) -> Option<Value> {
         use crate::ast::{Expr, Stmt};
-        use crate::value::Callable;
+        use crate::value::ObjectKind;
         let getter_object = getter.as_obj()?;
         let getter_object = getter_object.borrow();
-        let Callable::User(user) = &getter_object.call else {
+        let ObjectKind::User(user) = &getter_object.kind else {
             return None;
         };
 
@@ -466,7 +466,7 @@ impl Interp {
         use crate::interpreter::{
             execution_stack_exhausted, with_execution_stack, GC_CALL_POLL_MASK,
         };
-        use crate::value::Callable;
+        use crate::value::ObjectKind;
         if self.tier != crate::bytecode::Tier::Jit || self.pending_tail.is_some() {
             return None;
         }
@@ -478,7 +478,7 @@ impl Interp {
         }
         let chunk = {
             let getter = getter.borrow();
-            let Callable::User(user) = &getter.call else {
+            let ObjectKind::User(user) = &getter.kind else {
                 return None;
             };
             let f = &user.func;
@@ -509,7 +509,7 @@ impl Interp {
         }
         let values = {
             let receiver = receiver.borrow();
-            if !receiver.ic_plain.get() || !receiver.exotic.is_ordinary() {
+            if !receiver.ic_plain.get() || !receiver.kind.is_ordinary() {
                 return None;
             }
             chunk.record_getter_values(&receiver.props)?

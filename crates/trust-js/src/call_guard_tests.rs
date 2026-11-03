@@ -5,7 +5,7 @@ use crate::value::ValueView;
 use std::rc::Rc;
 
 use crate::bytecode::{Chunk, Tier};
-use crate::value::{Callable, Gc};
+use crate::value::{Gc, ObjectKind};
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -30,7 +30,7 @@ fn object(engine: &mut Engine, name: &str) -> Gc {
 fn chunk(engine: &mut Engine, name: &str) -> Rc<Chunk> {
     let object = object(engine, name);
     let object = object.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("{name} is not a user function")
     };
     let runtime = user.func.runtime();
@@ -86,7 +86,7 @@ fn checked_calls_cache_self_hosted_private_environments_in_multi_realm_agents() 
         );
         let method = object(&mut engine, "mappingMethod");
         let method_record = method.borrow();
-        let Callable::User(user) = &method_record.call else {
+        let ObjectKind::User(user) = &method_record.kind else {
             panic!("self-hosted map")
         };
         assert!(user.func.self_hosted);
@@ -315,8 +315,8 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
         engine.set_tier_threshold(0);
         assert_eq!(eval(&mut engine, &source), "56", "{tier:?}");
         let deep = object(&mut engine, "deep");
-        let mut current = match &deep.borrow().call {
-            Callable::User(user) => user.env,
+        let mut current = match &deep.borrow().kind {
+            ObjectKind::User(user) => user.env,
             _ => panic!("deep user closure"),
         };
         let mut depth = 0;
@@ -336,8 +336,8 @@ fn checked_calls_cache_deep_same_realm_closures_without_flattening_environments(
                 .expect("deep same-Realm closure fills the native call cache");
             assert_eq!(
                 entry.env,
-                match &deep.borrow().call {
-                    Callable::User(user) => crate::interpreter::Env::as_ptr(&user.env),
+                match &deep.borrow().kind {
+                    ObjectKind::User(user) => crate::interpreter::Env::as_ptr(&user.env),
                     _ => unreachable!(),
                 }
             );

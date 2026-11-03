@@ -220,7 +220,7 @@ fn owner(i: &Interp, site: &LoopSite) -> Option<Owner> {
     let frame = i.fn_frames.last()?;
     let callee = frame.callee();
     let callee = callee.borrow();
-    let crate::value::Callable::User(user) = &callee.call else {
+    let crate::value::ObjectKind::User(user) = &callee.kind else {
         return None;
     };
     let function = &user.func;
@@ -392,7 +392,7 @@ pub(crate) fn enter(
     let run_once = i.fn_frames.last().is_some_and(|frame| {
         let callee = frame.callee();
         let borrowed = callee.borrow();
-        matches!(&borrowed.call, crate::value::Callable::User(user)
+        matches!(&borrowed.kind, crate::value::ObjectKind::User(user)
             if user.func.run_once && function_owns_loop(&user.func, site))
     });
     let native = matches!(i.tier, Tier::Jit) && !run_once;
@@ -518,8 +518,8 @@ fn function_private_bindings(
         return Vec::new();
     };
     let callee = frame.callee();
-    let (function, closure) = match &callee.borrow().call {
-        crate::value::Callable::User(user) => (user.func.clone(), user.env),
+    let (function, closure) = match &callee.borrow().kind {
+        crate::value::ObjectKind::User(user) => (user.func.clone(), user.env),
         _ => return Vec::new(),
     };
     if env.borrow().under_with() || !function_owns_loop(&function, site) {

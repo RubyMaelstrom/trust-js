@@ -1354,7 +1354,6 @@ pub struct JitLayout {
     pub(crate) repr: &'static JitRepr,
     pub obj_proto: usize,
     pub obj_props: usize,
-    pub obj_exotic: usize,
     pub obj_is_constructor: usize,
     pub obj_extensible: usize,
     pub props_shape: usize,
@@ -1405,17 +1404,16 @@ pub struct JitLayout {
     pub property_meta: usize,
     /// The element words' pointer and header matched a live probe.
     pub words_valid: bool,
-    /// `Exotic::None`'s discriminant byte (the inline path requires an ordinary object).
-    pub exotic_none_tag: u8,
-    /// `Exotic::Array`'s discriminant byte (the element templates also accept arrays).
+    /// `ObjectKind::Array`'s discriminant byte (the element templates also accept arrays). The
+    /// kinds an ordinary-object guard admits are one tag range ([`KIND_ORDINARY_LAST`]).
     pub exotic_array_tag: u8,
-    /// `Exotic::StrWrap`'s discriminant byte (String.prototype IS a StrWrap — the GetMethod
+    /// `ObjectKind::StrWrap`'s discriminant byte (String.prototype IS a StrWrap — the GetMethod
     /// template accepts it as a named-read holder; index/length reads never take that path).
     pub exotic_strwrap_tag: u8,
-    /// `Exotic::NumWrap`'s discriminant byte (Number.prototype and Number wrappers: named
+    /// `ObjectKind::NumWrap`'s discriminant byte (Number.prototype and Number wrappers: named
     /// entries are shape-pinned like StrWrap's, and no name is exotic-provided).
     pub exotic_numwrap_tag: u8,
-    /// `Exotic::BoolWrap`'s discriminant byte (Boolean.prototype and Boolean wrappers).
+    /// `ObjectKind::BoolWrap`'s discriminant byte (Boolean.prototype and Boolean wrappers).
     pub exotic_boolwrap_tag: u8,
     /// `ic_plain` byte within `Object` (the per-receiver "not in an exotic side table" flag).
     pub obj_ic_plain: usize,
@@ -1456,9 +1454,9 @@ pub struct JitLayout {
     /// Whether the four fields above probed successfully (key-checked array-holder entries can
     /// inline their key compare only when they did).
     pub key_probe_ok: bool,
-    /// `call` within `Object`: [`Callable`]'s discriminant byte at +0, its payload word at +8.
-    pub obj_call: usize,
-    /// `Callable::User`'s payload word (a [`UserFn`]: the closure cell's address) → the
+    /// `kind` within `Object`: [`ObjectKind`]'s discriminant byte at +0, its payload word at +8.
+    pub obj_kind: usize,
+    /// `ObjectKind::User`'s payload word (a [`UserFn`]: the closure cell's address) → the
     /// [`UserCallable`]'s `func`, `env` (a stored environment handle word) and `realm` fields.
     pub user_func: usize,
     pub user_env: usize,
@@ -1510,16 +1508,7 @@ pub(crate) struct JitRepr {
     /// keeping the first binding in the environment cell. The source of `JitLayout`'s
     /// `scope_small_*` fields; `None` when the probe disagreed.
     pub(crate) scope_small: Option<crate::interpreter::JitBindingStorage>,
-    /// `Exotic::Collection`'s discriminant byte (a Map's or Set's data in the cell of an
-    /// otherwise ordinary object).
-    pub(crate) exotic_collection_tag: Option<u8>,
-    /// Whether the tags [`Exotic::is_ordinary`] accepts form one range from
-    /// `JitLayout::exotic_none_tag`: `exotic_none_tag ..= exotic_collection_tag` (or None's tag
-    /// alone), so one unsigned range test can admit them. Probed: Collection's tag must directly
-    /// follow None's.
-    pub(crate) exotic_ordinary_contiguous: bool,
-    /// The named-field and Collection-tag probes held: a `JitLayout` is
-    /// valid only if they did.
+    /// The named-field probe held: a `JitLayout` is valid only if it did.
     pub(crate) valid: bool,
 }
 
@@ -1534,35 +1523,6 @@ fn probe_jit_repr() -> JitRepr {
     // place and spilled.
     let props_fields = Fields::probe_jit_layout(|| Property::plain(Value::Num(0.0)));
 
-    // A Map's or Set's data is `Exotic::Collection`, declared right after `None` so
-    // that `Exotic::is_ordinary` is one tag range. Its tag must be payload-independent and
-    // distinct from every admitted tag, or no tag guard is sound: fail closed.
-    let tag = |exotic: &Exotic| unsafe { *(exotic as *const Exotic as *const u8) };
-    let none_tag = tag(&Exotic::None);
-    let (exotic_collection_tag, collection_ok) = {
-        use crate::ordered_collection::{CollectionKind, OrderedCollection};
-        let map = Exotic::Collection(crate::gc_storage::PayloadBox::new(OrderedCollection::new(
-            CollectionKind::Map,
-        )));
-        let set = Exotic::Collection(crate::gc_storage::PayloadBox::new(OrderedCollection::new(
-            CollectionKind::Set,
-        )));
-        let collection = tag(&map);
-        let others = [
-            none_tag,
-            tag(&Exotic::Array),
-            tag(&Exotic::str_wrap("".into())),
-            tag(&Exotic::NumWrap(0.0)),
-            tag(&Exotic::BoolWrap(false)),
-        ];
-        (
-            Some(collection),
-            tag(&set) == collection && !others.contains(&collection),
-        )
-    };
-    let exotic_ordinary_contiguous = collection_ok
-        && exotic_collection_tag.is_none_or(|tag| none_tag.checked_add(1) == Some(tag));
-
     JitRepr {
         props_fields: props_fields.unwrap_or(JitVecLayout::Vec {
             ptr: 0,
@@ -1570,9 +1530,7 @@ fn probe_jit_repr() -> JitRepr {
             cap: 0,
         }),
         scope_small: Some(crate::interpreter::VarMap::jit_slots_layout()),
-        exotic_collection_tag,
-        exotic_ordinary_contiguous,
-        valid: props_fields.is_some() && collection_ok,
+        valid: props_fields.is_some(),
     }
 }
 
@@ -1699,38 +1657,27 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         }
     };
 
-    // Exotic::None / Exotic::Array discriminants (Exotic is repr(Rust); probe to be certain).
-    let none = Exotic::None;
-    let exotic_none_tag = unsafe { *(&none as *const Exotic as *const u8) };
-    let arr = Exotic::Array;
-    let exotic_array_tag = unsafe { *(&arr as *const Exotic as *const u8) };
-    let sw = Exotic::str_wrap("".into());
-    let exotic_strwrap_tag = unsafe { *(&sw as *const Exotic as *const u8) };
-    let nw = Exotic::NumWrap(0.0);
-    let exotic_numwrap_tag = unsafe { *(&nw as *const Exotic as *const u8) };
-    let bw = Exotic::BoolWrap(false);
-    let exotic_boolwrap_tag = unsafe { *(&bw as *const Exotic as *const u8) };
-    // The tag byte is a sound guard only while it is distinct per admitted variant and
-    // payload-independent (a repr(Rust) niche layout could break either property).
-    debug_assert!({
-        let tags = [
-            exotic_none_tag,
-            exotic_array_tag,
-            exotic_strwrap_tag,
-            exotic_numwrap_tag,
-            exotic_boolwrap_tag,
-        ];
-        tags.iter().enumerate().all(|(i, t)| !tags[..i].contains(t))
-    });
-    debug_assert_eq!(exotic_numwrap_tag, unsafe {
-        *(&Exotic::NumWrap(-1.25) as *const Exotic as *const u8)
-    });
-    debug_assert_eq!(exotic_boolwrap_tag, unsafe {
-        *(&Exotic::BoolWrap(true) as *const Exotic as *const u8)
-    });
-    debug_assert_eq!(exotic_strwrap_tag, unsafe {
-        *(&Exotic::str_wrap("x".into()) as *const Exotic as *const u8)
-    });
+    // The kinds' discriminants are fixed (`ObjectKind` is repr(u8)): the tag byte at offset 0,
+    // whatever the payload. Check the ones generated code compares on live values.
+    let kind_tag = |kind: &ObjectKind| kind.tag();
+    let exotic_array_tag = kind_tag(&ObjectKind::Array);
+    let exotic_strwrap_tag = kind_tag(&ObjectKind::str_wrap("".into()));
+    let exotic_numwrap_tag = kind_tag(&ObjectKind::NumWrap(0.0));
+    let exotic_boolwrap_tag = kind_tag(&ObjectKind::BoolWrap(false));
+    let kinds_ok = exotic_array_tag == KIND_ARRAY_TAG
+        && exotic_strwrap_tag == 19
+        && exotic_numwrap_tag == 18
+        && exotic_boolwrap_tag == 17
+        && kind_tag(&ObjectKind::NumWrap(-1.25)) == exotic_numwrap_tag
+        && kind_tag(&ObjectKind::BoolWrap(true)) == exotic_boolwrap_tag
+        && kind_tag(&ObjectKind::Plain) == 0
+        && {
+            use crate::ordered_collection::{CollectionKind, OrderedCollection};
+            let map = ObjectKind::Collection(crate::gc_storage::PayloadBox::new(
+                OrderedCollection::new(CollectionKind::Map),
+            ));
+            kind_tag(&map) == KIND_ORDINARY_LAST
+        };
 
     // Scope offsets for the inline LoadName template, relative to `Env::as_ptr` (the
     // RefCell<Scope>) → Scope.vars → VarMap generation. The RefCell value offset is probed on a
@@ -1804,10 +1751,10 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         Ok(Value::Undefined)
     }
     let native: NativeFn = call_layout_probe;
-    let native_callable = Callable::Native(native);
-    // Callable's discriminant is one initialized byte; the rest of its first word is padding.
+    let native_callable = ObjectKind::Native(native);
+    // The kind's discriminant is one initialized byte; the rest of its first word is padding.
     // Read only that byte and its initialized pointer payload, never the padding as a usize.
-    let callable_words = |call: &Callable| {
+    let callable_words = |call: &ObjectKind| {
         let bytes = std::ptr::from_ref(call).cast::<u8>();
         unsafe {
             (
@@ -1820,8 +1767,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         }
     };
     let native_words = callable_words(&native_callable);
-    let callable_ok = std::mem::size_of::<Callable>() == 16
-        && native_words.0 == 1
+    let callable_ok = std::mem::size_of::<ObjectKind>() == 16
+        && native_words.0 == KIND_CALLABLE_FIRST
         && native_words.1 == native as usize
         && std::mem::align_of::<UserCallable>() == 8
         && std::mem::align_of::<Function>() <= 8;
@@ -1835,8 +1782,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             Ok(crate::scope::Value::Undefined)
         }
         let function: crate::scope::NativeFn = scoped_probe;
-        let words = callable_words(&Callable::ScopedNative(function));
-        callable_ok && words.0 == 13 && words.1 == function as usize
+        let words = callable_words(&ObjectKind::ScopedNative(function));
+        callable_ok && words.0 == KIND_EXOTIC_NONE_LAST && words.1 == function as usize
     };
     let parsed = crate::parser::parse_script("function probe(){}", false).ok();
     let probe_func = match parsed.as_deref() {
@@ -1846,7 +1793,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let (user_func, user_env, user_realm, func_data_off, closure_ok) = match probe_func {
         Some(func) => {
             let realm = obj_addr; // any identity the probe can recognize
-            let closure = Callable::user(
+            let closure = ObjectKind::user(
                 func.clone(),
                 probe_env,
                 realm,
@@ -1854,8 +1801,8 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
                 crate::agent_access::RealmId::ROOT,
             );
             let words = callable_words(&closure);
-            let Callable::User(user) = &closure else {
-                unreachable!("Callable::user makes a user callable")
+            let ObjectKind::User(user) = &closure else {
+                unreachable!("ObjectKind::user makes a user callable")
             };
             let payload = words.1;
             let user_data_off = (user_fn_ptr(user) as usize).wrapping_sub(payload);
@@ -1882,6 +1829,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let call_probe_valid = callable_ok && closure_ok;
 
     let valid = repr.valid
+        && kinds_ok
         && object_identity_ok
         && scope_identity_ok
         && niche_ok
@@ -1894,12 +1842,11 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         repr,
         obj_proto: offset_of!(Object, proto),
         obj_ic_plain: offset_of!(Object, ic_plain),
-        native_typed_array: crate::native_typed_array::probe_layout(offset_of!(
-            Object,
-            native_typed_array
-        )),
+        // The view is the kind's payload word, read once the tag says TypedArray.
+        native_typed_array: crate::native_typed_array::probe_layout(
+            offset_of!(Object, kind) + std::mem::size_of::<usize>(),
+        ),
         obj_props: offset_of!(Object, props),
-        obj_exotic: offset_of!(Object, exotic),
         obj_is_constructor: offset_of!(Object, is_constructor),
         obj_extensible: offset_of!(Object, extensible),
         props_shape: offset_of!(Props, shape),
@@ -1931,7 +1878,6 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         property_value: offset_of!(Property, packed),
         property_meta: offset_of!(Property, meta),
         words_valid,
-        exotic_none_tag,
         exotic_array_tag,
         exotic_strwrap_tag,
         exotic_numwrap_tag,
@@ -1948,7 +1894,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         scope_with_none,
         scope_with_valid,
         binding_value,
-        obj_call: offset_of!(Object, call),
+        obj_kind: offset_of!(Object, kind),
         user_func,
         user_env,
         user_realm,
@@ -2047,7 +1993,7 @@ impl Value {
         }
     }
     pub fn is_callable(&self) -> bool {
-        matches!(&(self).view(), ValueView::Obj(o) if !matches!(o.borrow().call, Callable::None))
+        matches!(&(self).view(), ValueView::Obj(o) if o.borrow().kind.is_callable())
     }
     /// The `typeof` result determined by the value alone. The Annex B.3.6 [[IsHTMLDDA]] object
     /// (`document.all`) is branded in its Agent, so this reports "function" for it; use
@@ -2062,7 +2008,7 @@ impl Value {
             ValueView::Str(_) => "string",
             ValueView::Sym(_) => "symbol",
             ValueView::Obj(o) => {
-                if matches!(o.borrow().call, Callable::None) {
+                if !o.borrow().kind.is_callable() {
                     "object"
                 } else {
                     "function"
@@ -2115,51 +2061,107 @@ pub(crate) fn user_fn_ptr(user: &UserFn) -> *const UserCallable {
     crate::gc_box::GcBox::as_ptr(user)
 }
 
-/// How an object can be called. Most objects are not callable (`None`).
+/// What kind of object a cell holds, beyond its properties (W2d step 1): an ordinary object
+/// (`Plain`), a typed array's view, one of the callables, a Map's or Set's data, or one of the
+/// exotic built-in kinds. One field replaces the object's former `call`, `exotic` and typed-array
+/// view fields: no object holds two of them (W2d's census).
 ///
-/// `repr(u8)` with fixed discriminants gives the enum a defined layout: the discriminant byte
-/// at offset 0 and the single pointer-sized payload at offset 8. The JIT's code-keyed call
-/// probe reads [`Callable::User`]'s tag and its [`UserFn`] word (the closure cell's address)
-/// straight from a callee object (see `JitLayout::obj_call` and `JitLayout::user_func`).
-#[derive(Clone)]
+/// `repr(u8)` with fixed discriminants gives the enum a defined layout: the discriminant byte at
+/// offset 0 and the single pointer-sized payload at offset 8 (16 bytes). The tags are ordered so
+/// that each of the old tests is one unsigned compare, which generated code relies on (see
+/// [`KIND_CALLABLE_FIRST`], [`KIND_EXOTIC_NONE_LAST`] and [`KIND_ORDINARY_LAST`]):
+/// - the former "`exotic` is None" (plain objects, typed arrays and functions): tags up to
+///   [`KIND_EXOTIC_NONE_LAST`];
+/// - the former `ObjectKind::is_ordinary` (those, and a Map's or Set's data): tags up to
+///   [`KIND_ORDINARY_LAST`];
+/// - the former "`call` is not None": [`KIND_CALLABLE_FIRST`] ..= [`KIND_EXOTIC_NONE_LAST`].
+///
+/// The JIT's code-keyed call probe reads [`ObjectKind::User`]'s tag and its [`UserFn`] word (the
+/// closure cell's address) straight from a callee object (see `JitLayout::obj_kind` and
+/// `JitLayout::user_func`).
 #[repr(u8)]
-pub enum Callable {
-    None = 0,
-    Native(NativeFn) = 1,
+#[allow(dead_code)]
+pub enum ObjectKind {
+    /// An ordinary object with nothing beyond its properties.
+    Plain = 0,
+    /// A typed array's view (its buffer, offset and element kind), which generated element
+    /// accesses read. The object's behavior otherwise lives in the interpreter's side table, and
+    /// its clear `ic_plain` keeps the property caches off it.
+    TypedArray(crate::gc_storage::PayloadBox<crate::native_typed_array::NativeTypedArray>) = 1,
+    Native(NativeFn) = 2,
     /// A native function carrying captured state (see [`NativeClosure`]).
-    NativeData(crate::gc_storage::SharedPayload<Rc<NativeCallable>>) = 2,
+    NativeData(crate::gc_storage::SharedPayload<Rc<NativeCallable>>) = 3,
     /// An interpreted function: its AST plus the lexical environment it closed over.
     User(UserFn) = CALLABLE_USER_TAG,
     /// The result of `Function.prototype.bind`.
-    Bound(crate::gc_storage::SharedPayload<BoundCallable>) = 4,
+    Bound(crate::gc_storage::SharedPayload<BoundCallable>) = 5,
     /// A ShadowRealm wrapped function: `target` is a callable inside the realm of the ShadowRealm
     /// object `realm`, which the wrapper keeps alive. Calls marshal primitive args in and the
     /// primitive result out.
-    WrappedShadow(crate::gc_storage::SharedPayload<Rc<WrappedShadowCallable>>) = 5,
+    WrappedShadow(crate::gc_storage::SharedPayload<Rc<WrappedShadowCallable>>) = 6,
     /// The inverse: a function living *inside* a ShadowRealm whose `target` is a callable of the
     /// host realm. It runs only in its own realm's interpreter, which knows its host (see
     /// `Interp::shadow_home`).
-    WrappedCross(crate::gc_storage::SharedPayload<WrappedCrossCallable>) = 6,
+    WrappedCross(crate::gc_storage::SharedPayload<WrappedCrossCallable>) = 7,
     /// An auto-accessor's synthesized getter: reads the private backing field (brand-checked) off
     /// the receiver.
-    AccessorGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 7,
+    AccessorGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 8,
     /// An auto-accessor's synthesized setter: writes the private backing field (brand-checked).
-    AccessorSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 8,
+    AccessorSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 9,
     /// A decorator `context.access.get`: returns `args[0][name]`.
-    PropGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 9,
+    PropGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 10,
     /// A decorator `context.access.set`: performs `args[0][name] = args[1]`.
-    PropSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 10,
+    PropSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 11,
     /// A decorator's private access functions use PrivateGet/PrivateSet, not [[Get]]/[[Set]].
-    PrivatePropGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 11,
-    PrivatePropSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 12,
+    PrivatePropGet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 12,
+    PrivatePropSet(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) = 13,
     /// A host callback called through its actual scoped Rust signature. Its result is mapped
     /// explicitly at the public boundary, never reinterpreted as an engine-native Result.
     #[cfg(feature = "embed")]
-    ScopedNative(crate::scope::NativeFn) = 13,
+    ScopedNative(crate::scope::NativeFn) = 14,
+    /// P1 S4: a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
+    /// `Interp::collection`). Its tag directly follows the callables', so that
+    /// [`ObjectKind::is_ordinary`] tests one tag range.
+    Collection(crate::gc_storage::PayloadBox<crate::ordered_collection::OrderedCollection>) = 15,
+    Array = 16,
+    /// The [[BooleanData]], [[NumberData]], [[StringData]], [[SymbolData]] and [[BigIntData]] of
+    /// primitive wrapper objects.
+    BoolWrap(bool) = 17,
+    NumWrap(f64) = 18,
+    StrWrap(crate::gc_storage::PayloadBox<crate::lstr::LStr>) = 19,
+    SymWrap(SymbolRef) = 20,
+    BigIntWrap(crate::gc_storage::PayloadBox<crate::bigint::JsBigInt>) = 21,
+    /// An error object. Carries the stack frames captured at construction (see
+    /// `crate::stack_trace`), None when `Error.stackTraceLimit` was not a Number then; the
+    /// `Error.prototype.stack` getter formats them after the live `name: message` head.
+    /// name/message live as ordinary properties, and the tag lets `Error.prototype.toString` /
+    /// the test262 runner recognise an error cheaply.
+    Error(Option<crate::gc_storage::PayloadBox<crate::stack_trace::StackTrace>>) = 22,
+    /// An `arguments` exotic object; a mapped one's ParameterMap, while it maps an index, in a
+    /// storage block it reports (`interpreter::ParameterMap`).
+    Arguments(Option<crate::gc_storage::StorageBox<crate::interpreter::ParameterMap>>) = 23,
+    ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>) = 24,
+    StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>) = 25,
+    /// ECMA-262 CreateMapIterator's and CreateSetIterator's private state: the collection and a
+    /// live cursor over it, which its collection's deletions and clears keep in place.
+    CollectionIterator(
+        crate::gc_storage::PayloadBox<crate::ordered_collection::CollectionIterator>,
+    ) = 26,
 }
 
-/// The discriminant of [`Callable::User`] (see the enum's layout note).
-pub(crate) const CALLABLE_USER_TAG: u8 = 3;
+/// The discriminant of [`ObjectKind::User`] (see the enum's layout note).
+pub(crate) const CALLABLE_USER_TAG: u8 = 4;
+/// The first callable's tag: callables are [`KIND_CALLABLE_FIRST`] ..= [`KIND_EXOTIC_NONE_LAST`].
+pub(crate) const KIND_CALLABLE_FIRST: u8 = 2;
+/// The last tag of the kinds that carry no exotic internal state (plain objects, typed arrays'
+/// views and the callables): the former `ObjectKind::ExoticNone`.
+pub(crate) const KIND_EXOTIC_NONE_LAST: u8 = 14;
+/// The last tag [`ObjectKind::is_ordinary`] accepts: those, and a Map's or Set's data.
+pub(crate) const KIND_ORDINARY_LAST: u8 = 15;
+/// [`ObjectKind::TypedArray`]'s tag.
+pub(crate) const KIND_TYPED_ARRAY_TAG: u8 = 1;
+/// [`ObjectKind::Array`]'s tag.
+pub(crate) const KIND_ARRAY_TAG: u8 = 16;
 
 /// Cold payloads boxed out of [`Callable`], so every non-callable ordinary object does not pay
 /// for the largest function variants inline.
@@ -2368,7 +2370,76 @@ pub struct WrappedCrossCallable {
     pub(crate) target: Value,
 }
 
-impl Callable {
+impl ObjectKind {
+    /// The discriminant byte (see the enum's layout note).
+    #[inline]
+    pub(crate) fn tag(&self) -> u8 {
+        // SAFETY: `repr(u8)` puts the discriminant in the first byte.
+        unsafe { *(self as *const ObjectKind as *const u8) }
+    }
+
+    /// Whether the object has a [[Call]] (any callable kind): the former "`call` is not None".
+    #[inline]
+    pub(crate) fn is_callable(&self) -> bool {
+        (KIND_CALLABLE_FIRST..=KIND_EXOTIC_NONE_LAST).contains(&self.tag())
+    }
+
+    /// No exotic internal state: a plain object, a typed array's view (whose behavior is the
+    /// side table's) or a callable. The former "`exotic` is None", which functions and typed
+    /// arrays passed.
+    #[inline]
+    pub(crate) fn exotic_is_none(&self) -> bool {
+        self.tag() <= KIND_EXOTIC_NONE_LAST
+    }
+
+    /// No exotic internal methods: [`ObjectKind::exotic_is_none`], or a Map's or Set's
+    /// [[MapData]]/[[SetData]], which an otherwise ordinary object carries in its cell. Property
+    /// caches and fast paths that admit plain objects ask this, so Maps and Sets keep them.
+    #[inline]
+    pub(crate) fn is_ordinary(&self) -> bool {
+        self.tag() <= KIND_ORDINARY_LAST
+    }
+
+    /// A Map's or Set's in-cell data.
+    #[cfg(test)]
+    #[inline]
+    pub(crate) fn is_collection(&self) -> bool {
+        matches!(self, ObjectKind::Collection(_))
+    }
+
+    /// A typed array's view, which generated element accesses read.
+    #[inline]
+    pub(crate) fn typed_array(
+        &self,
+    ) -> Option<&crate::gc_storage::PayloadBox<crate::native_typed_array::NativeTypedArray>> {
+        match self {
+            ObjectKind::TypedArray(view) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// A copy of the object's [[Call]] (the former `call` field's clone): a callable kind's
+    /// copy, which shares its payload cell, or `Plain` for an object that is not callable.
+    pub(crate) fn clone_callable(&self) -> ObjectKind {
+        match self {
+            ObjectKind::Native(f) => ObjectKind::Native(*f),
+            ObjectKind::NativeData(d) => ObjectKind::NativeData(*d),
+            ObjectKind::User(u) => ObjectKind::User(*u),
+            ObjectKind::Bound(b) => ObjectKind::Bound(*b),
+            ObjectKind::WrappedShadow(w) => ObjectKind::WrappedShadow(*w),
+            ObjectKind::WrappedCross(w) => ObjectKind::WrappedCross(*w),
+            ObjectKind::AccessorGet(k) => ObjectKind::AccessorGet(*k),
+            ObjectKind::AccessorSet(k) => ObjectKind::AccessorSet(*k),
+            ObjectKind::PropGet(k) => ObjectKind::PropGet(*k),
+            ObjectKind::PropSet(k) => ObjectKind::PropSet(*k),
+            ObjectKind::PrivatePropGet(k) => ObjectKind::PrivatePropGet(*k),
+            ObjectKind::PrivatePropSet(k) => ObjectKind::PrivatePropSet(*k),
+            #[cfg(feature = "embed")]
+            ObjectKind::ScopedNative(f) => ObjectKind::ScopedNative(*f),
+            _ => ObjectKind::Plain,
+        }
+    }
+
     /// Native capability, independent of the Rust callback signature. Intrinsic identity
     /// recognizers must continue to match only `Native`, whose type is the engine signature.
     pub(crate) fn is_native(&self) -> bool {
@@ -2386,7 +2457,7 @@ impl Callable {
         realm: usize,
         origin: Option<crate::agent_control::RuntimeOrigin>,
         _owner: crate::agent_access::RealmId,
-    ) -> Callable {
+    ) -> ObjectKind {
         let lease = func.runtime();
         // The active heap's: `runtime` finds the entry of the active heap.
         let heap_id = lease.heap.id;
@@ -2418,11 +2489,11 @@ impl Callable {
             realm,
             cache: Cell::new(metadata),
         };
-        Callable::User(crate::gc_box::new(user))
+        ObjectKind::User(crate::gc_box::new(user))
     }
 
-    pub(crate) fn wrapped_shadow(realm: Gc, target: Value) -> Callable {
-        Callable::WrappedShadow(crate::gc_storage::SharedPayload::new(Rc::new(
+    pub(crate) fn wrapped_shadow(realm: Gc, target: Value) -> ObjectKind {
+        ObjectKind::WrappedShadow(crate::gc_storage::SharedPayload::new(Rc::new(
             WrappedShadowCallable {
                 realm,
                 target: Box::new(target),
@@ -2431,23 +2502,23 @@ impl Callable {
     }
 
     /// A native function with captured state, its data in a payload cell.
-    pub(crate) fn native_data(data: Rc<NativeCallable>) -> Callable {
-        Callable::NativeData(crate::gc_storage::SharedPayload::new(data))
+    pub(crate) fn native_data(data: Rc<NativeCallable>) -> ObjectKind {
+        ObjectKind::NativeData(crate::gc_storage::SharedPayload::new(data))
     }
 
     /// An accessor or decorator access function (`variant`) for the field `key`, its key in a
     /// payload cell.
     pub(crate) fn accessor_key(
-        variant: fn(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) -> Callable,
+        variant: fn(crate::gc_storage::SharedPayload<Rc<Rc<str>>>) -> ObjectKind,
         key: Rc<str>,
-    ) -> Callable {
+    ) -> ObjectKind {
         variant(crate::gc_storage::SharedPayload::new(Rc::new(key)))
     }
 
-    pub(crate) fn bound(target: Gc, this: Value, args: Vec<Value>) -> Callable {
+    pub(crate) fn bound(target: Gc, this: Value, args: Vec<Value>) -> ObjectKind {
         let mut charge = ExternalCharge::default();
         charge.settle(args.capacity() * std::mem::size_of::<Value>());
-        Callable::Bound(crate::gc_storage::SharedPayload::new(BoundCallable {
+        ObjectKind::Bound(crate::gc_storage::SharedPayload::new(BoundCallable {
             target,
             this,
             args,
@@ -2455,8 +2526,8 @@ impl Callable {
         }))
     }
 
-    pub(crate) fn wrapped_cross(target: Value) -> Callable {
-        Callable::WrappedCross(crate::gc_storage::SharedPayload::new(
+    pub(crate) fn wrapped_cross(target: Value) -> ObjectKind {
+        ObjectKind::WrappedCross(crate::gc_storage::SharedPayload::new(
             WrappedCrossCallable { target },
         ))
     }
@@ -2479,82 +2550,38 @@ pub struct StringIteratorState {
     pub(crate) index: usize,
 }
 
-/// Exotic internal data for built-in object kinds: arrays, primitive wrappers (the
-/// [[BooleanData]]/[[NumberData]]/[[StringData]]/[[SymbolData]]/[[BigIntData]] of wrapper
-/// objects), errors, arguments objects, array/string iterators, and Maps and Sets.
-#[allow(dead_code)]
-pub enum Exotic {
-    None,
-    /// P1 S4: a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
-    /// `Interp::collection`). Declared next to `None` so that [`Exotic::is_ordinary`] tests one
-    /// tag range.
-    Collection(crate::gc_storage::PayloadBox<crate::ordered_collection::OrderedCollection>),
-    Array,
-    BoolWrap(bool),
-    NumWrap(f64),
-    StrWrap(crate::gc_storage::PayloadBox<crate::lstr::LStr>),
-    SymWrap(SymbolRef),
-    BigIntWrap(crate::gc_storage::PayloadBox<crate::bigint::JsBigInt>),
-    /// An error object. Carries the stack frames captured at construction (see
-    /// `crate::stack_trace`), None when `Error.stackTraceLimit` was not a Number then; the
-    /// `Error.prototype.stack` getter formats them after the live `name: message` head.
-    /// name/message live as ordinary properties, and the tag lets `Error.prototype.toString` /
-    /// the test262 runner recognise an error cheaply.
-    Error(Option<crate::gc_storage::PayloadBox<crate::stack_trace::StackTrace>>),
-    /// An `arguments` exotic object; a mapped one's ParameterMap, while it maps an index, in a
-    /// storage block it reports (`interpreter::ParameterMap`).
-    Arguments(Option<crate::gc_storage::StorageBox<crate::interpreter::ParameterMap>>),
-    ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>),
-    StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>),
-    /// ECMA-262 CreateMapIterator's and CreateSetIterator's private state: the collection and a
-    /// live cursor over it, which its collection's deletions and clears keep in place.
-    CollectionIterator(
-        crate::gc_storage::PayloadBox<crate::ordered_collection::CollectionIterator>,
-    ),
-}
-
-impl Exotic {
-    /// No exotic internal methods: `None`, or a Map's or Set's [[MapData]]/[[SetData]], which an
-    /// otherwise ordinary object carries in its cell. Property caches and fast paths that admit
-    /// plain objects ask this, so Maps and Sets keep them.
-    #[inline]
-    pub(crate) fn is_ordinary(&self) -> bool {
-        matches!(self, Exotic::None | Exotic::Collection(_))
+impl ObjectKind {
+    pub(crate) fn str_wrap(value: crate::lstr::LStr) -> ObjectKind {
+        ObjectKind::StrWrap(crate::gc_storage::PayloadBox::new(value))
     }
 
-    /// A Map's or Set's in-cell data.
-    #[inline]
-    pub(crate) fn is_collection(&self) -> bool {
-        matches!(self, Exotic::Collection(_))
+    pub(crate) fn bigint_wrap(value: crate::bigint::JsBigInt) -> ObjectKind {
+        ObjectKind::BigIntWrap(crate::gc_storage::PayloadBox::new(value))
     }
 
-    pub(crate) fn str_wrap(value: crate::lstr::LStr) -> Exotic {
-        Exotic::StrWrap(crate::gc_storage::PayloadBox::new(value))
-    }
-
-    pub(crate) fn bigint_wrap(value: crate::bigint::JsBigInt) -> Exotic {
-        Exotic::BigIntWrap(crate::gc_storage::PayloadBox::new(value))
-    }
-
-    pub(crate) fn error(stack: Option<Box<crate::stack_trace::StackTrace>>) -> Exotic {
-        Exotic::Error(stack.map(|stack| crate::gc_storage::PayloadBox::new(*stack)))
+    pub(crate) fn error(stack: Option<Box<crate::stack_trace::StackTrace>>) -> ObjectKind {
+        ObjectKind::Error(stack.map(|stack| crate::gc_storage::PayloadBox::new(*stack)))
     }
 }
+
+const _: () = {
+    assert!(std::mem::size_of::<ObjectKind>() == 16);
+    assert!(std::mem::align_of::<ObjectKind>() == 8);
+};
 
 pub(crate) struct Object {
     pub(crate) proto: Option<Gc>,
     pub(crate) props: Props,
     pub(crate) extensible: bool,
-    pub(crate) call: Callable,
-    pub(crate) exotic: Exotic,
+    /// What the object is beyond its properties: plain, a typed array's view, a callable, a
+    /// collection or an exotic built-in kind ([`ObjectKind`]).
+    pub(crate) kind: ObjectKind,
     /// `false` for objects whose behavior lives in an interpreter side table — proxies, typed
-    /// arrays, module namespaces — which the `exotic` tag can't reveal. The JIT's inline
+    /// arrays, module namespaces — which the kind can't reveal. The JIT's inline
     /// property/element caches check this byte on the receiver and take the checked helper when
     /// clear, so ONE proxy existing somewhere no longer disables the caches for every plain
     /// object in the program (the old global `inline_ic_safe` latch).
     pub(crate) ic_plain: Cell<bool>,
-    pub(crate) native_typed_array:
-        Option<crate::gc_storage::PayloadBox<crate::native_typed_array::NativeTypedArray>>,
     /// IsConstructor, recorded when the object gets its [[Call]]: set for user functions other
     /// than arrows, methods, generators and async functions, for natives marked as constructors,
     /// and for bound functions and callable proxies whose target was one. A native with an own
@@ -2633,14 +2660,18 @@ impl Object {
     /// growth sequence with one exact allocation. The hint lives on shared code, not instances.
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_capacity(proto: Option<Gc>, property_capacity: usize) -> Gc {
-        Self::new_with_parts(proto, Props::with_capacity(property_capacity), Exotic::None)
+        Self::new_with_parts(
+            proto,
+            Props::with_capacity(property_capacity),
+            ObjectKind::Plain,
+        )
     }
 
     /// Allocate an object around an already-finalized property map. Literal fast paths can build
     /// the map from moved stack values before allocation, avoiding an empty map plus RefCell
     /// replacement on every object.
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
-    pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, exotic: Exotic) -> Gc {
+    pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, kind: ObjectKind) -> Gc {
         // Moving a property payload to a new receiver cannot inherit the old owner's proof.
         props.elems.2.force_full();
         #[cfg(feature = "architecture-diagnostics")]
@@ -2661,10 +2692,8 @@ impl Object {
                     proto,
                     props,
                     extensible: true,
-                    call: Callable::None,
-                    exotic,
+                    kind,
                     ic_plain: Cell::new(true),
-                    native_typed_array: None,
                     is_constructor: false,
                     class_kind: 0,
                 }),
@@ -2675,7 +2704,7 @@ impl Object {
                 heap.diagnostics.borrow_mut().born(
                     Gc::as_ptr(&obj) as usize,
                     caller,
-                    &object.exotic,
+                    &object.kind,
                     object.props.entries.capacity(),
                 );
             }
@@ -3663,19 +3692,13 @@ impl Object {
             proto,
             props,
             extensible: _,
-            call,
-            exotic,
+            kind,
             ic_plain: _,
-            native_typed_array,
             is_constructor: _,
             class_kind: _,
         } = self;
         if let Some(proto) = proto {
             sink.object(proto);
-        }
-        // The view's payload cell; its buffer is byte storage.
-        if let Some(view) = native_typed_array {
-            crate::gc_storage::PayloadBox::trace(view, sink);
         }
         // The storage blocks the payloads live in, in every trace: they live as long as an owner
         // reports them (`gc_storage`).
@@ -3699,46 +3722,41 @@ impl Object {
         // Each payload cell (`gc_storage::PayloadBox`, `gc_storage::SharedPayload`), with what
         // its value holds.
         use crate::gc_storage::{PayloadBox, SharedPayload};
-        match exotic {
-            Exotic::ArrayIterator(state) => {
+        match kind {
+            // The view's payload cell; its buffer is byte storage.
+            ObjectKind::TypedArray(view) => PayloadBox::trace(view, sink),
+            ObjectKind::ArrayIterator(state) => {
                 PayloadBox::trace(state, sink);
                 sink.value(&state.target);
             }
-            Exotic::BigIntWrap(bigint) => {
+            ObjectKind::BigIntWrap(bigint) => {
                 PayloadBox::trace(bigint, sink);
                 sink.word(bigint.cell_word());
             }
-            Exotic::SymWrap(symbol) => sink.word(symbol_identity(symbol) as u64),
-            Exotic::StrWrap(string) => {
+            ObjectKind::SymWrap(symbol) => sink.word(symbol_identity(symbol) as u64),
+            ObjectKind::StrWrap(string) => {
                 PayloadBox::trace(string, sink);
                 sink.word(string.cell_word());
             }
-            Exotic::StringIterator(state) => {
+            ObjectKind::StringIterator(state) => {
                 PayloadBox::trace(state, sink);
                 state.string.trace_gc(sink.as_dyn());
             }
-            Exotic::CollectionIterator(state) => {
+            ObjectKind::CollectionIterator(state) => {
                 PayloadBox::trace(state, sink);
                 if let Some(target) = &state.target {
                     sink.object(target);
                 }
             }
-            Exotic::Error(stack) => stack.trace_gc(sink.as_dyn()), // the cell and the frame names
-            Exotic::Collection(data) => data.trace_gc(sink.as_dyn()), // the cell and the entries
-            Exotic::Arguments(Some(map)) => {
+            ObjectKind::Error(stack) => stack.trace_gc(sink.as_dyn()), // the cell and the frame names
+            ObjectKind::Collection(data) => data.trace_gc(sink.as_dyn()), // the cell and the entries
+            ObjectKind::Arguments(Some(map)) => {
                 crate::gc_storage::StorageBox::trace(map, sink);
                 map.trace(sink);
             }
-            Exotic::None
-            | Exotic::Array
-            | Exotic::BoolWrap(_)
-            | Exotic::NumWrap(_)
-            | Exotic::Arguments(None) => {}
-        }
-        match call {
             // The closure cell, which traces its environment.
-            Callable::User(user) => sink.word(crate::gc_box::GcBox::as_ptr(user) as u64),
-            Callable::Bound(bound) => {
+            ObjectKind::User(user) => sink.word(crate::gc_box::GcBox::as_ptr(user) as u64),
+            ObjectKind::Bound(bound) => {
                 SharedPayload::trace(bound, sink);
                 sink.object(&bound.target);
                 sink.value(&bound.this);
@@ -3746,25 +3764,30 @@ impl Object {
                     sink.value(argument);
                 }
             }
-            Callable::WrappedShadow(shadow) => {
+            ObjectKind::WrappedShadow(shadow) => {
                 SharedPayload::trace(shadow, sink);
                 sink.object(&shadow.realm);
                 sink.value(&shadow.target);
             }
-            Callable::WrappedCross(cross) => {
+            ObjectKind::WrappedCross(cross) => {
                 SharedPayload::trace(cross, sink);
                 sink.value(&cross.target);
             }
-            Callable::NativeData(native) => native.trace_gc(sink.as_dyn()), // the cell and the captures
-            Callable::AccessorGet(key)
-            | Callable::AccessorSet(key)
-            | Callable::PropGet(key)
-            | Callable::PropSet(key)
-            | Callable::PrivatePropGet(key)
-            | Callable::PrivatePropSet(key) => SharedPayload::trace(key, sink),
-            Callable::None | Callable::Native(_) => {}
+            ObjectKind::NativeData(native) => native.trace_gc(sink.as_dyn()), // the cell and the captures
+            ObjectKind::AccessorGet(key)
+            | ObjectKind::AccessorSet(key)
+            | ObjectKind::PropGet(key)
+            | ObjectKind::PropSet(key)
+            | ObjectKind::PrivatePropGet(key)
+            | ObjectKind::PrivatePropSet(key) => SharedPayload::trace(key, sink),
+            ObjectKind::Plain
+            | ObjectKind::Native(_)
+            | ObjectKind::Array
+            | ObjectKind::BoolWrap(_)
+            | ObjectKind::NumWrap(_)
+            | ObjectKind::Arguments(None) => {}
             #[cfg(feature = "embed")]
-            Callable::ScopedNative(_) => {}
+            ObjectKind::ScopedNative(_) => {}
         }
     }
 }
@@ -3898,7 +3921,7 @@ fn census_dead_object(cell: *mut u8) {
 /// as they die, by family. It sizes inline property slots (Decision 3). S4 adds environment
 /// records: bindings per record and the binding storage beside the cell.
 pub(crate) mod layout_census {
-    use super::{Callable, Exotic, GcHeap, Object};
+    use super::{GcHeap, Object, ObjectKind};
     use std::cell::RefCell;
     use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 
@@ -3963,11 +3986,11 @@ pub(crate) mod layout_census {
     }
 
     pub(crate) fn record(population: usize, object: &Object) {
-        let family = if !matches!(object.call, Callable::None) {
+        let family = if object.kind.is_callable() {
             0
-        } else if matches!(object.exotic, Exotic::Array) {
+        } else if matches!(object.kind, ObjectKind::Array) {
             1
-        } else if !matches!(object.exotic, Exotic::None) || !object.ic_plain.get() {
+        } else if !object.kind.exotic_is_none() || !object.ic_plain.get() {
             2
         } else {
             3
@@ -6568,7 +6591,7 @@ pub struct Props {
     /// while it is set, the words' append/pop fast paths stand down. Truncation rebuilds it;
     /// deleting a named index can clear it after a bounded scan of the remaining entries.
     has_far: std::cell::Cell<bool>,
-    /// This `Props` belongs to an `Exotic::Array` object: canonical-index key inserts skip the
+    /// This `Props` belongs to an `ObjectKind::Array` object: canonical-index key inserts skip the
     /// shape transition. Array shapes encode the *named*-key sequence only (matching
     /// `push_dense`, which never transitioned) — the get-IC only ever uses an array's shape to
     /// prove a named key's ABSENCE or with a per-hit key re-check, never for bare slot trust,
@@ -7649,7 +7672,7 @@ impl Props {
     }
 
     /// Mark this map as an array's (see `elem_mode`). One-way, set when the owning object
-    /// becomes `Exotic::Array`.
+    /// becomes `ObjectKind::Array`.
     #[inline]
     pub(crate) fn mark_array(&self) {
         self.elem_mode.set(true);
@@ -9323,7 +9346,7 @@ mod object_accounting_tests {
         let dropped = Rc::new(Cell::new(0));
         let witness = Witness(dropped.clone());
         let native = Object::new(None);
-        native.borrow_mut().call = Callable::native_data(Rc::new(NativeCallable {
+        native.borrow_mut().kind = ObjectKind::native_data(Rc::new(NativeCallable {
             body: NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
                 let _keep = &witness;
                 Ok(Value::Undefined)

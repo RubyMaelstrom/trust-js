@@ -3,7 +3,7 @@
 //! static Rust allocation locations only. They cannot extend JavaScript liveness.
 //! Feature-gated out of ordinary builds. Lifetimes use allocation ordinals and GC
 //! generations, not a clock per allocation; initial families are explicitly labelled.
-use super::{Callable, Exotic, GcHeap, Property, Props, PACK_LAZY_PROTO};
+use super::{GcHeap, ObjectKind, Property, Props, PACK_LAZY_PROTO};
 use std::collections::BTreeMap;
 use std::panic::Location;
 
@@ -43,12 +43,12 @@ pub(super) struct State {
     untracked_allocations: u64,
 }
 
-fn initial_family(exotic: &Exotic) -> &'static str {
+fn initial_family(exotic: &ObjectKind) -> &'static str {
     match exotic {
-        Exotic::None => "ordinary",
-        Exotic::Array => "array",
-        Exotic::Arguments(_) => "arguments",
-        Exotic::Error(_) => "error",
+        kind if kind.exotic_is_none() => "ordinary",
+        ObjectKind::Array => "array",
+        ObjectKind::Arguments(_) => "arguments",
+        ObjectKind::Error(_) => "error",
         _ => "wrapper",
     }
 }
@@ -568,7 +568,7 @@ impl State {
         &mut self,
         cell: usize,
         caller: &'static Location<'static>,
-        exotic: &Exotic,
+        exotic: &ObjectKind,
         capacity: usize,
     ) {
         self.ordinal = self.ordinal.wrapping_add(1);
@@ -676,14 +676,14 @@ pub(super) fn report(heap: &GcHeap) {
         };
         let family = if !object.ic_plain.get() {
             6
-        } else if !matches!(object.call, Callable::None) {
+        } else if object.kind.is_callable() {
             1
         } else {
-            match object.exotic {
-                Exotic::None => 0,
-                Exotic::Array => 2,
-                Exotic::Arguments(_) => 3,
-                Exotic::Error(_) => 4,
+            match object.kind {
+                ref kind if kind.exotic_is_none() => 0,
+                ObjectKind::Array => 2,
+                ObjectKind::Arguments(_) => 3,
+                ObjectKind::Error(_) => 4,
                 _ => 5,
             }
         };
@@ -716,9 +716,9 @@ mod tests {
     #[test]
     fn address_reuse_and_collection_age_do_not_retain_objects() {
         let mut state = State::default();
-        state.born(0, Location::caller(), &Exotic::None, 4);
+        state.born(0, Location::caller(), &ObjectKind::Plain, 4);
         state.died(0);
-        state.born(0, Location::caller(), &Exotic::Array, 0);
+        state.born(0, Location::caller(), &ObjectKind::Array, 0);
         state.finish_generation();
         state.died(0);
         assert_eq!(state.counts.iter().map(|s| s.allocations).sum::<u64>(), 2);
@@ -733,9 +733,9 @@ mod tests {
         );
         assert!(state.births.is_empty());
         for cell in 0..MAX_LIVE_BIRTHS {
-            state.born(cell, Location::caller(), &Exotic::None, 0);
+            state.born(cell, Location::caller(), &ObjectKind::Plain, 0);
         }
-        state.born(MAX_LIVE_BIRTHS, Location::caller(), &Exotic::None, 0);
+        state.born(MAX_LIVE_BIRTHS, Location::caller(), &ObjectKind::Plain, 0);
         assert_eq!(state.untracked_allocations, 1);
     }
 

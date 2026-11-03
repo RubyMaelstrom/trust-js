@@ -43,7 +43,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         }))
     });
     // Error.prototype.stack accessor (error-stack-accessor proposal). The frames are captured
-    // at construction (Exotic::Error, see crate::stack_trace); the getter formats V8-style:
+    // at construction (ObjectKind::Error, see crate::stack_trace); the getter formats V8-style:
     // `Name: message` followed by the `\n    at name (url:line:column)` lines. get stack:
     // non-object → TypeError; an object without [[ErrorData]] → undefined; an Error instance →
     // the formatted (implementation-defined) trace, or undefined when `Error.stackTraceLimit`
@@ -51,8 +51,8 @@ pub(super) fn install_errors(it: &mut Interp) {
     // `err.stack = x` caches as usual.
     let get_stack = it.make_native("get stack", 0, |i, this, _| {
         let lines = match &(this).view() {
-            ValueView::Obj(o) => match &mut o.borrow_mut().exotic {
-                Exotic::Error(Some(trace)) => trace.lines(),
+            ValueView::Obj(o) => match &mut o.borrow_mut().kind {
+                ObjectKind::Error(Some(trace)) => trace.lines(),
                 _ => return Ok(Value::Undefined),
             },
             _ => {
@@ -169,7 +169,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         if name == "Error" {
             it.def_method(&ctor, "isError", 1, |_i, _t, a| {
                 Ok(Value::Bool(
-                    matches!((arg(a, 0)).view(), ValueView::Obj(o) if matches!(o.borrow().exotic, Exotic::Error(_))),
+                    matches!((arg(a, 0)).view(), ValueView::Obj(o) if matches!(o.borrow().kind, ObjectKind::Error(_))),
                 ))
             });
             // V8's stack-trace controls, which libraries feature-test. Captures read the limit
@@ -312,7 +312,7 @@ pub(super) fn install_errors(it: &mut Interp) {
 /// subclass's constructors (and its `super()` chain) do not appear in its errors' stacks.
 fn constructor_skip(i: &Interp) -> Skip {
     match &(i.constructor_new_target()).view() {
-        ValueView::Obj(target) if matches!(target.borrow().call, Callable::User(_)) => {
+        ValueView::Obj(target) if matches!(target.borrow().kind, ObjectKind::User(_)) => {
             Skip::UntilSeen(Gc::as_ptr(target) as usize)
         }
         _ => Skip::None,

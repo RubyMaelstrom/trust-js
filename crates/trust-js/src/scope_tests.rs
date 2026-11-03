@@ -464,7 +464,7 @@ fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
         return;
     }
     use crate::bytecode::{CallIc, CallSite, CALL_IC_SCOPED_NATIVE};
-    use crate::value::{Callable, Value as Internal};
+    use crate::value::{ObjectKind, Value as Internal};
     let mut engine = Engine::new();
     engine.set_tier(crate::bytecode::Tier::Jit);
     engine.set_tier_threshold(0);
@@ -533,10 +533,10 @@ fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
     let through = global.props.get("through").unwrap().value();
     drop(global);
     let callable_object = callable.as_obj().unwrap();
-    assert!(matches!(&callable_object.borrow().call,
-        Callable::ScopedNative(actual) if *actual as usize == function as usize));
-    let user = match &through.as_obj().unwrap().borrow().call {
-        Callable::User(user) => *user,
+    assert!(matches!(&callable_object.borrow().kind,
+        ObjectKind::ScopedNative(actual) if *actual as usize == function as usize));
+    let user = match &through.as_obj().unwrap().borrow().kind {
+        ObjectKind::User(user) => *user,
         _ => panic!("compiled caller"),
     };
     let runtime = user.func.runtime();
@@ -623,7 +623,7 @@ fn empty_bare<'s>(
 
 #[test]
 fn bare_scoped_empty_is_undefined_in_inputs_outputs_forwarding_and_handles() {
-    use crate::value::{Callable, NativeCallable, NativeCallableBody, Value as Internal};
+    use crate::value::{NativeCallable, NativeCallableBody, ObjectKind, Value as Internal};
     let mut engine = Engine::new();
     let function = std::hint::black_box(empty_bare as crate::embed::NativeFn);
     let this = Internal::Empty;
@@ -666,7 +666,7 @@ fn bare_scoped_empty_is_undefined_in_inputs_outputs_forwarding_and_handles() {
             .all(|value| value.into_internal().bits() == crate::value::PACK_UNDEFINED));
         Ok(raw_scoped_empty())
     }
-    let call = Callable::native_data(Rc::new(NativeCallable {
+    let call = ObjectKind::native_data(Rc::new(NativeCallable {
         body: NativeCallableBody::ScopedCaptured {
             function: std::hint::black_box(captures as crate::embed::NativeCaptureFn),
             captures: vec![Internal::Empty, Internal::Empty].into_boxed_slice(),
@@ -755,7 +755,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
                 .unwrap_or_else(|_| panic!("native churn function"));
             let object = value.as_obj().unwrap();
             let call = object.borrow();
-            let crate::value::Callable::User(user) = &call.call else {
+            let crate::value::ObjectKind::User(user) = &call.kind else {
                 panic!("user churn function");
             };
             let runtime = user.func.runtime();
@@ -1194,7 +1194,7 @@ fn a_native_argument_window_survives_resuming_a_distinct_suspended_continuation(
 
 #[test]
 fn opaque_scoped_captures_preserve_every_word_in_both_result_arms() {
-    use crate::value::{Callable, NativeCallableBody};
+    use crate::value::{NativeCallableBody, ObjectKind};
     #[derive(Clone)]
     struct Expected {
         capture_address: usize,
@@ -1252,7 +1252,7 @@ fn opaque_scoped_captures_preserve_every_word_in_both_result_arms() {
         let capture_address = {
             let object = callback.as_obj().unwrap().gc();
             let call = object.borrow();
-            let Callable::NativeData(data) = &call.call else {
+            let ObjectKind::NativeData(data) = &call.kind else {
                 panic!("captured callable");
             };
             let NativeCallableBody::ScopedCaptured {
@@ -1302,7 +1302,7 @@ fn opaque_scoped_captures_preserve_every_word_in_both_result_arms() {
 #[test]
 fn opaque_scoped_captures_trace_cycles_and_survive_their_functions_collection_during_call() {
     use crate::gc_core::CollectionKind;
-    use crate::value::{Callable, NativeCallableBody};
+    use crate::value::{NativeCallableBody, ObjectKind};
     #[derive(Clone)]
     struct Watched {
         function: crate::value::WeakGc,
@@ -1353,7 +1353,7 @@ fn opaque_scoped_captures_trace_cycles_and_survive_their_functions_collection_du
         let callback = cx.new_native_fn_with_captures("activeCapture", 0, function, &values);
         let object = callback.as_obj().unwrap().gc();
         let call = object.borrow();
-        assert!(matches!(&call.call, Callable::NativeData(data) if matches!(&data.body,
+        assert!(matches!(&call.kind, ObjectKind::NativeData(data) if matches!(&data.body,
             NativeCallableBody::ScopedCaptured {function: actual, captures} if *actual as usize == function as usize && captures.len() == 5)));
         drop(call);
         cx.member_set(&target, "callback", callback).unwrap();

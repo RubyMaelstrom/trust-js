@@ -20,7 +20,7 @@ fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
     let value = engine.interp.get_var(name, &env).ok().unwrap();
     let object_handle = value.as_obj().unwrap();
     let object = object_handle.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("user function")
     };
     user.func.clone()
@@ -326,7 +326,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
         let value = engine.interp.get_var("subject", &env).ok().unwrap();
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let crate::value::Callable::User(user) = &object.call else {
+        let crate::value::ObjectKind::User(user) = &object.kind else {
             panic!("prepared user")
         };
         let realm = user.realm;
@@ -348,8 +348,8 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
             .find_map(|op| match op {
                 Op::InlineGuard(target, _) => {
                     let callee = chunk.jit_inline_target(*target).pin.upgrade()?;
-                    let is_leaf = matches!(&callee.borrow().call,
-                        crate::value::Callable::User(user) if user.func.name.as_deref() == Some("leaf"));
+                    let is_leaf = matches!(&callee.borrow().kind,
+                        crate::value::ObjectKind::User(user) if user.func.name.as_deref() == Some("leaf"));
                     is_leaf.then_some(callee)
                 }
                 _ => None,
@@ -357,7 +357,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
             .expect("the named leaf must actually have been spliced");
         let leaf_code = {
             let object = leaf.borrow();
-            let crate::value::Callable::User(user) = &object.call else {
+            let crate::value::ObjectKind::User(user) = &object.kind else {
                 panic!("leaf")
             };
             user.func

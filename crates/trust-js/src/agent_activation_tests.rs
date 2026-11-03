@@ -95,7 +95,7 @@ fn native_reentry_restores_the_agent_during_unwinding() {
         }),
         NativeCaptures::None,
     );
-    let call = native.borrow().call.clone();
+    let call = native.borrow().kind.clone_callable();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         outer.interp.dispatch_native(&call, Value::Undefined, &[])
     }));
@@ -299,7 +299,7 @@ fn bare_native_reentry_restores_the_heap_on_committed_calls_and_interruption() {
             }),
             NativeCaptures::None,
         );
-        let call = interrupter.borrow().call.clone();
+        let call = interrupter.borrow().kind.clone_callable();
         assert!(matches!(
             outer.interp.dispatch_native(&call, Value::Undefined, &[]),
             Err(crate::interpreter::Abrupt::Interrupt(_))

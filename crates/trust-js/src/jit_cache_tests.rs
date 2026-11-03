@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::bytecode::Tier;
-use crate::value::Callable;
+use crate::value::ObjectKind;
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -18,7 +18,7 @@ fn chunk(i: &mut Interp, name: &str) -> Rc<Chunk> {
     let value = i.get_var(name, &env).ok().expect("fixture function");
     let object_handle = value.as_obj().expect("function object");
     let object = object_handle.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("user function")
     };
     user.func
@@ -524,7 +524,7 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
     fn function_pin(value: &Value) -> std::rc::Weak<crate::ast::Function> {
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let Callable::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.kind else {
             panic!("ordinary function")
         };
         Rc::downgrade(&user.func)

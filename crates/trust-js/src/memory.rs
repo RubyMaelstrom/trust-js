@@ -11,7 +11,7 @@ use std::mem::size_of;
 use std::rc::Rc;
 
 use crate::interpreter::{Env, Interp, Scope};
-use crate::value::{Callable, Exotic, Gc, Object, SymbolData, Value};
+use crate::value::{Gc, Object, ObjectKind, SymbolData, Value};
 
 #[derive(Clone, Copy)]
 enum Quality {
@@ -598,12 +598,12 @@ impl Visitor {
         }
     }
 
-    fn callable(&mut self, callable: &Callable) {
+    fn callable(&mut self, callable: &ObjectKind) {
         match callable {
-            Callable::None | Callable::Native(_) => {}
+            ObjectKind::Native(_) => {}
             #[cfg(feature = "embed")]
-            Callable::ScopedNative(_) => {}
-            Callable::NativeData(value) => {
+            ObjectKind::ScopedNative(_) => {}
+            ObjectKind::NativeData(value) => {
                 // The shared Rc inside the object's payload cell.
                 let value: &Rc<crate::value::NativeCallable> = value;
                 let identity = Rc::as_ptr(value) as usize;
@@ -671,7 +671,7 @@ impl Visitor {
                     self.unreported_native_closures.insert(closure_identity);
                 }
             }
-            Callable::User(value) => {
+            ObjectKind::User(value) => {
                 let identity = crate::value::user_fn_ptr(value) as usize;
                 if self.callable_allocations.insert(identity) {
                     self.callable_metadata = self
@@ -705,7 +705,7 @@ impl Visitor {
                 }
                 self.function(&value.func);
             }
-            Callable::Bound(value) => {
+            ObjectKind::Bound(value) => {
                 // A shared payload cell: a constructor's result can share its function's (see
                 // `gc_storage::SharedPayload`), so count each cell once.
                 let identity = value.as_ref() as *const crate::value::BoundCallable as usize;
@@ -720,7 +720,7 @@ impl Visitor {
                     self.value(argument);
                 }
             }
-            Callable::WrappedShadow(value) => {
+            ObjectKind::WrappedShadow(value) => {
                 // The shared Rc inside the object's payload cell.
                 let value: &Rc<crate::value::WrappedShadowCallable> = value;
                 let identity = Rc::as_ptr(value) as usize;
@@ -732,19 +732,19 @@ impl Visitor {
                     self.value(&value.target);
                 }
             }
-            Callable::WrappedCross(value) => {
+            ObjectKind::WrappedCross(value) => {
                 // See Bound above: this Box cannot be shared between object holders.
                 self.callable_metadata = self
                     .callable_metadata
                     .saturating_add(size_of_val(value.as_ref()));
                 self.value(&value.target);
             }
-            Callable::AccessorGet(name)
-            | Callable::AccessorSet(name)
-            | Callable::PropGet(name)
-            | Callable::PropSet(name)
-            | Callable::PrivatePropGet(name)
-            | Callable::PrivatePropSet(name) => {
+            ObjectKind::AccessorGet(name)
+            | ObjectKind::AccessorSet(name)
+            | ObjectKind::PropGet(name)
+            | ObjectKind::PropSet(name)
+            | ObjectKind::PrivatePropGet(name)
+            | ObjectKind::PrivatePropSet(name) => {
                 let outer = Rc::as_ptr(name) as usize;
                 if self.callable_allocations.insert(outer) {
                     self.callable_metadata =
@@ -752,6 +752,8 @@ impl Visitor {
                 }
                 self.rc_str(name.as_ref());
             }
+            // Not callable: the kind's other payloads are the exotic visitor's.
+            _ => {}
         }
     }
 
@@ -1119,38 +1121,38 @@ impl Visitor {
         for value in object.props.word_values() {
             self.value(&value);
         }
-        self.callable(&object.call);
+        self.callable(&object.kind);
         let mut internal_bytes = object.internal_slots().retained_storage_bytes();
-        if let Some(view) = &object.native_typed_array {
+        if let Some(view) = object.kind.typed_array() {
             internal_bytes += size_of::<crate::native_typed_array::NativeTypedArray>();
             internal_bytes += self.native_buffer(&view.buffer);
         }
-        match &object.exotic {
-            Exotic::StrWrap(value) => self.value(&Value::Str(**value)),
-            Exotic::SymWrap(value) => self.symbol(value),
-            Exotic::BigIntWrap(value) => self.value(&Value::BigInt(**value)),
-            Exotic::Error(trace) => {
+        match &object.kind {
+            ObjectKind::StrWrap(value) => self.value(&Value::Str(**value)),
+            ObjectKind::SymWrap(value) => self.symbol(value),
+            ObjectKind::BigIntWrap(value) => self.value(&Value::BigInt(**value)),
+            ObjectKind::Error(trace) => {
                 internal_bytes += trace
                     .as_deref()
                     .map_or(0, crate::stack_trace::StackTrace::retained_bytes);
             }
-            Exotic::ArrayIterator(state) => {
+            ObjectKind::ArrayIterator(state) => {
                 internal_bytes += std::mem::size_of_val(&**state);
                 self.value(&state.target);
             }
-            Exotic::StringIterator(state) => {
+            ObjectKind::StringIterator(state) => {
                 internal_bytes += std::mem::size_of_val(&**state);
                 if let Some(string) = &state.string {
                     self.value(&Value::Str(*string));
                 }
             }
-            Exotic::CollectionIterator(state) => {
+            ObjectKind::CollectionIterator(state) => {
                 internal_bytes += std::mem::size_of_val(&**state);
                 if let Some(target) = &state.target {
                     self.value(&Value::Obj(*target));
                 }
             }
-            Exotic::Collection(entries) => {
+            ObjectKind::Collection(entries) => {
                 internal_bytes += std::mem::size_of_val(&**entries)
                     .saturating_add(entries.storage_bytes_lower_bound());
                 for (key, value) in entries.iter() {
@@ -1159,12 +1161,10 @@ impl Visitor {
                 }
             }
             // The environment is its function's activation, which its own owners report.
-            Exotic::Arguments(Some(map)) => internal_bytes += map.retained_bytes(),
-            Exotic::None
-            | Exotic::Array
-            | Exotic::BoolWrap(_)
-            | Exotic::NumWrap(_)
-            | Exotic::Arguments(None) => {}
+            ObjectKind::Arguments(Some(map)) => internal_bytes += map.retained_bytes(),
+            // Plain objects and the payload-free exotics hold nothing more; a callable's payload
+            // is `callable`'s, a typed array's view the native buffers'.
+            _ => {}
         }
         let (bytes, exact) = object.props.retained_requested_storage_bytes();
         (bytes.saturating_add(internal_bytes), exact)
@@ -2729,7 +2729,7 @@ mod tests {
             let source = Value::Obj(crate::value::Object::new_with_parts(
                 None,
                 props,
-                Exotic::None,
+                ObjectKind::Plain,
             ));
             let weak_source = Gc::downgrade(&source.as_obj().unwrap());
             let keys = engine
@@ -3048,7 +3048,7 @@ mod tests {
     #[test]
     fn explicit_native_captures_are_complete_and_shared_storage_is_counted_once() {
         let string = LStr::from("explicit native capture");
-        let callable = Callable::native_data(Rc::new(crate::value::NativeCallable {
+        let callable = ObjectKind::native_data(Rc::new(crate::value::NativeCallable {
             body: crate::value::NativeCallableBody::Captured {
                 function: |_, _, _, captures| Ok(captures[0]),
                 captures: vec![Value::Str(string), Value::Str(string)].into_boxed_slice(),
@@ -3058,7 +3058,7 @@ mod tests {
         }));
         let mut visitor = Visitor::default();
         visitor.callable(&callable);
-        visitor.callable(&callable.clone());
+        visitor.callable(&callable.clone_callable());
         assert_eq!(
             visitor.callable_metadata,
             size_of::<crate::value::NativeCallable>() + 2 * size_of::<Value>()
@@ -3073,8 +3073,8 @@ mod tests {
         let interp = Interp::new();
         let first = Object::new(None);
         let second = Object::new(None);
-        first.borrow_mut().call = callable.clone();
-        second.borrow_mut().call = callable;
+        first.borrow_mut().kind = callable.clone_callable();
+        second.borrow_mut().kind = callable;
         let snapshot = measure(&interp, &[first, second], &[]);
         assert!(matches!(snapshot.callable_metadata.quality, Quality::Exact));
         assert!(snapshot.callable_metadata.coverage_complete);
@@ -3129,7 +3129,7 @@ mod tests {
         let mut visitor = Visitor::default();
         let (first_func, first_retained) = make_closure();
         let first_callable =
-            crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
+            crate::value::ObjectKind::native_data(Rc::new(crate::value::NativeCallable {
                 body: crate::value::NativeCallableBody::CapturedClosure {
                     function: first_func,
                     captures: vec![Value::Str(string)].into_boxed_slice(),
@@ -3139,7 +3139,7 @@ mod tests {
             }));
         let (second_func, second_retained) = make_closure();
         let second_callable =
-            crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
+            crate::value::ObjectKind::native_data(Rc::new(crate::value::NativeCallable {
                 body: crate::value::NativeCallableBody::CapturedClosure {
                     function: second_func,
                     captures: vec![Value::Str(string)].into_boxed_slice(),
@@ -3175,8 +3175,8 @@ mod tests {
                 true,
             ),
         );
-        let identity = match &callable.borrow().call {
-            crate::value::Callable::NativeData(native) => native.identity.to_string(),
+        let identity = match &callable.borrow().kind {
+            crate::value::ObjectKind::NativeData(native) => native.identity.to_string(),
             _ => panic!("expected data-carrying native"),
         };
         assert_eq!(identity, "registeredOperation");

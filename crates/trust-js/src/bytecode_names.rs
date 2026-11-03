@@ -6,7 +6,7 @@
 
 use super::{Chunk, NameIc};
 use crate::interpreter::{Abrupt, BindingSlot, Env, Interp, Scope, VarMap};
-use crate::value::{Exotic, Value};
+use crate::value::Value;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 
@@ -161,7 +161,7 @@ impl ResolutionIc {
                         return None;
                     }
                     let global = i.global.borrow();
-                    if !matches!(global.exotic, Exotic::None)
+                    if !global.kind.exotic_is_none()
                         || global.props.shape() != shape
                         || global.props.property_at(slot).is_none()
                     {
@@ -211,7 +211,7 @@ impl ResolutionIc {
                     return None;
                 }
                 let global = i.global.borrow();
-                if !matches!(global.exotic, Exotic::None)
+                if !global.kind.exotic_is_none()
                     || !crate::value::is_cacheable_shape(global.props.shape())
                 {
                     return None;
@@ -341,7 +341,7 @@ impl DeepNameIc {
                     return None;
                 }
                 let global = i.global.borrow();
-                if !matches!(global.exotic, Exotic::None) || global.props.shape() != shape {
+                if !global.kind.exotic_is_none() || global.props.shape() != shape {
                     return None;
                 }
                 let property = global.props.property_at(slot)?;
@@ -399,7 +399,7 @@ impl DeepNameIc {
                     return false;
                 }
                 let mut global = i.global.borrow_mut();
-                if !matches!(global.exotic, Exotic::None) || global.props.shape() != shape {
+                if !global.kind.exotic_is_none() || global.props.shape() != shape {
                     return false;
                 }
                 if let Some((_, property)) = global.props.entry_at(slot) {
@@ -479,7 +479,7 @@ impl Chunk {
                     return None;
                 }
                 let global = i.global.borrow();
-                if !matches!(global.exotic, Exotic::None)
+                if !global.kind.exotic_is_none()
                     || !crate::value::is_cacheable_shape(global.props.shape())
                 {
                     return None;
@@ -547,7 +547,7 @@ mod tests {
     use super::*;
     use crate::bytecode::Op;
     use crate::interpreter::{new_binding_layout_id, new_scope, Binding};
-    use crate::value::Callable;
+    use crate::value::ObjectKind;
     use crate::value::ValueView;
     use crate::Engine;
 
@@ -566,7 +566,7 @@ mod tests {
             .value();
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let Callable::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.kind else {
             panic!("function")
         };
         let chunk = super::super::compile(&user.func).unwrap();

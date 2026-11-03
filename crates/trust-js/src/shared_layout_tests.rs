@@ -4,7 +4,7 @@
 
 use crate::bytecode::Tier;
 use crate::value::ValueView;
-use crate::value::{Callable, Gc, Property, Props, Value};
+use crate::value::{Gc, ObjectKind, Property, Props, Value};
 use crate::{Completion, Engine};
 use std::rc::Rc;
 
@@ -299,7 +299,7 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
         if tier == Tier::Jit && cfg!(any(target_arch = "aarch64", target_arch = "x86_64")) {
             let maker = object(&mut engine, "make");
             let maker = maker.borrow();
-            let Callable::User(user) = &maker.call else {
+            let ObjectKind::User(user) = &maker.kind else {
                 panic!("user maker")
             };
             assert!(user
@@ -331,7 +331,7 @@ fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
     let wrapper = object(&mut engine, "init");
     {
         let wrapper = wrapper.borrow();
-        let Callable::User(user) = &wrapper.call else {
+        let ObjectKind::User(user) = &wrapper.kind else {
             panic!("user wrapper")
         };
         let runtime = user.func.runtime();

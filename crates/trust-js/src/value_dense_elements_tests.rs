@@ -633,7 +633,7 @@ fn every_array_keeps_length_at_slot_zero() {
             .as_obj()
             .unwrap();
         let body = array.borrow();
-        assert!(matches!(body.exotic, Exotic::Array), "{n}");
+        assert!(matches!(body.kind, ObjectKind::Array), "{n}");
         assert!(body.props.elem_mode.get(), "{n}");
         assert_eq!(
             body.props.entries.keys()[0],

@@ -49,7 +49,7 @@ fn local_typeof_literals_avoid_strings_and_use_native_scalar_classification() {
         panic!("fixture is callable")
     };
     let object = object.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("fixture is an ordinary function")
     };
     let runtime = user.func.runtime();
@@ -255,7 +255,7 @@ fn native_void_releases_scalars_and_shared_owners_without_a_general_helper() {
         panic!("fixture is callable")
     };
     let object = object.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("ordinary fixture")
     };
     let runtime = user.func.runtime();
@@ -298,8 +298,8 @@ fn native_void_preserves_getvalue_effects_and_checked_final_destruction() {
             Rc::new(move |i, _, _| {
                 let probe = Probe(count.clone());
                 let object = crate::value::Object::new(Some(i.object_proto));
-                object.borrow_mut().call =
-                    crate::value::Callable::native_data(Rc::new(crate::value::NativeCallable {
+                object.borrow_mut().kind =
+                    crate::value::ObjectKind::native_data(Rc::new(crate::value::NativeCallable {
                         body: crate::value::NativeCallableBody::Opaque(Rc::new(move |_, _, _| {
                             let _ = &probe;
                             Ok(crate::value::Value::Undefined)
@@ -427,7 +427,7 @@ fn in_operator_dense_element_hits_stay_native() {
         panic!("fixture is callable")
     };
     let object = object.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("ordinary fixture")
     };
     let runtime = user.func.runtime();

@@ -1183,7 +1183,7 @@ fn re_sym_replace_impl(
                     .as_ref()
                     .zip(i.extra_protos.get("RegExp"))
                     .is_some_and(|(a, b)| Gc::ptr_eq(a, b));
-                if !matches!(b.exotic, Exotic::None)
+                if !b.kind.exotic_is_none()
                     || b.props.contains("exec")
                     || !direct_proto
                     || re.flags != flags.as_ref()
@@ -1205,8 +1205,8 @@ fn re_sym_replace_impl(
                             return false;
                         };
                         let canonical = matches!(
-                            exec.borrow().call,
-                            Callable::Native(nf)
+                            exec.borrow().kind,
+                            ObjectKind::Native(nf)
                                 if nf as usize == regexp_exec as *const () as usize
                         );
                         canonical

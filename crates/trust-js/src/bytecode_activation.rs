@@ -458,8 +458,8 @@ mod tests {
             .view() else {
                 panic!("expected closure")
             };
-            let activation = match &one.borrow().call {
-                crate::value::Callable::User(user) => user.env,
+            let activation = match &one.borrow().kind {
+                crate::value::ObjectKind::User(user) => user.env,
                 _ => panic!("expected user closure"),
             };
             if activation_plans_enabled() {
@@ -526,7 +526,7 @@ mod tests {
                     .unwrap_or_else(|_| panic!("missing fixture closure {name}"));
                 let object_handle = value.as_obj().unwrap();
                 let object = object_handle.borrow();
-                let crate::value::Callable::User(user) = &object.call else {
+                let crate::value::ObjectKind::User(user) = &object.kind else {
                     panic!("fixture closure")
                 };
                 user.env

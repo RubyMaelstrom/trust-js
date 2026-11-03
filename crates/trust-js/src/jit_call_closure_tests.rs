@@ -102,7 +102,7 @@ fn packed_new_target_survives_direct_normal_throw_nested_and_lexical_calls() {
             let outer = engine.interp.get_var("Outer", &env).ok().unwrap();
             let outer_handle = outer.as_obj().unwrap();
             let outer_object = outer_handle.borrow();
-            let crate::value::Callable::User(outer_user) = &outer_object.call else {
+            let crate::value::ObjectKind::User(outer_user) = &outer_object.kind else {
                 panic!("Outer user function")
             };
             let outer_runtime = outer_user.func.runtime();
@@ -116,7 +116,7 @@ fn packed_new_target_survives_direct_normal_throw_nested_and_lexical_calls() {
             let value = engine.interp.get_var("plain", &env).ok().unwrap();
             let handle = value.as_obj().unwrap();
             let object = handle.borrow();
-            let crate::value::Callable::User(user) = &object.call else {
+            let crate::value::ObjectKind::User(user) = &object.kind else {
                 panic!("plain user function")
             };
             Some(user.func.clone())
@@ -507,7 +507,7 @@ fn settle(engine: &mut Engine, name: &str) {
     let function = engine.interp.get_var(name, &env).ok().expect("function");
     let function_handle = function.as_obj().expect("object");
     let object = function_handle.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("{name} is not a user function")
     };
     let runtime = user.func.runtime();

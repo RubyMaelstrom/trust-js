@@ -2,7 +2,7 @@
 //! EvaluatePropertyAccessWithExpressionKey, ToPropertyKey, PropertyDefinitionEvaluation,
 //! OrdinaryOwnPropertyKeys. A Reference owns its Symbol key until the heap takes ownership.
 
-use crate::{bytecode::Tier, value::Callable, Completion, Engine};
+use crate::{bytecode::Tier, value::ObjectKind, Completion, Engine};
 
 fn check_all_tiers(source: &str, native_functions: &[&str]) {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -34,7 +34,7 @@ fn check_all_tiers(source: &str, native_functions: &[&str]) {
                     .unwrap_or_else(|_| panic!("{name}"));
                 let object_handle = function.as_obj().expect("fixture function");
                 let object = object_handle.borrow();
-                let Callable::User(user) = &object.call else {
+                let ObjectKind::User(user) = &object.kind else {
                     panic!("fixture user function")
                 };
                 let runtime = user.func.runtime();

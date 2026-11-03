@@ -480,8 +480,8 @@ pub(super) fn install_boolean(it: &mut Interp) {
 fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
     match &(this).view() {
         ValueView::Bool(b) => Ok(*b),
-        ValueView::Obj(o) => match o.borrow().exotic {
-            Exotic::BoolWrap(b) => Ok(b),
+        ValueView::Obj(o) => match o.borrow().kind {
+            ObjectKind::BoolWrap(b) => Ok(b),
             _ => Err(i.make_error(
                 "TypeError",
                 "Boolean method called on incompatible receiver",
@@ -498,8 +498,8 @@ fn this_boolean(i: &mut Interp, this: &Value) -> Result<bool, Value> {
 fn this_symbol(i: &mut Interp, this: &Value) -> Result<crate::value::SymbolRef, Value> {
     match &(this).view() {
         ValueView::Sym(s) => Ok(*s),
-        ValueView::Obj(o) => match &o.borrow().exotic {
-            Exotic::SymWrap(s) => Ok(*s),
+        ValueView::Obj(o) => match &o.borrow().kind {
+            ObjectKind::SymWrap(s) => Ok(*s),
             _ => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "Symbol method called on incompatible receiver")),
@@ -642,8 +642,8 @@ fn to_bigint(i: &mut Interp, v: &Value) -> Result<crate::bigint::JsBigInt, Value
 fn this_bigint(i: &mut Interp, this: &Value) -> Result<crate::bigint::JsBigInt, Value> {
     match &(this).view() {
         ValueView::BigInt(n) => Ok(*n),
-        ValueView::Obj(o) => match &o.borrow().exotic {
-            Exotic::BigIntWrap(n) => Ok(**n),
+        ValueView::Obj(o) => match &o.borrow().kind {
+            ObjectKind::BigIntWrap(n) => Ok(**n),
             _ => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "BigInt method called on incompatible receiver")),

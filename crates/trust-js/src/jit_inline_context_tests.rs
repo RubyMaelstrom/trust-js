@@ -2,7 +2,7 @@
 //! GetThisEnvironment, GetSuperBase, MakeSuperPropertyReference and ResolveBinding;
 //! official local snapshot e28783d5fc9dc12b3de905961e2c71410b38a202 (2026-09-06).
 
-use crate::{ast::Function, bytecode::Tier, value::Callable, Completion, Engine};
+use crate::{ast::Function, bytecode::Tier, value::ObjectKind, Completion, Engine};
 use std::rc::Rc;
 
 fn evaluate(engine: &mut Engine, source: &str) -> String {
@@ -23,7 +23,7 @@ fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
         .unwrap_or_else(|_| panic!("missing fixture function {name}"));
     let object_handle = value.as_obj().expect("fixture function object");
     let object = object_handle.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("fixture user function")
     };
     user.func.clone()

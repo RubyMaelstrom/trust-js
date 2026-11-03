@@ -91,7 +91,7 @@ fn predicted_object(layout: &crate::value::PropertyLayout, count: usize) -> Valu
     Value::Obj(Object::new_with_parts(
         None,
         props,
-        crate::value::Exotic::None,
+        crate::value::ObjectKind::Plain,
     ))
 }
 

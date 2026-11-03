@@ -23,8 +23,8 @@ fn trace_function_to_string(value: &Value) {
         Some(ValueView::Str(name)) => name.text().chars().take(80).collect::<String>(),
         _ => String::new(),
     };
-    let source = match &object.call {
-        Callable::User(user) => user.func.source.as_deref(),
+    let source = match &object.kind {
+        ObjectKind::User(user) => user.func.source.as_deref(),
         _ => None,
     };
     let source_bytes = source.map_or(0, str::len);
@@ -42,7 +42,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
     // returns undefined, with length 0 and the empty name.
     {
         let mut b = fp.borrow_mut();
-        b.call = crate::value::Callable::Native(|_i, _this, _args| Ok(Value::Undefined));
+        b.kind = crate::value::ObjectKind::Native(|_i, _this, _args| Ok(Value::Undefined));
         b.props.insert(
             "length",
             Property::data(Value::Num(0.0), false, false, true),
@@ -93,7 +93,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         };
         let obj = Object::new(bound_proto);
         let target_is_ctor = i.value_is_constructor(&this);
-        obj.borrow_mut().call = Callable::bound(target, bound_this, bound_args);
+        obj.borrow_mut().kind = ObjectKind::bound(target, bound_this, bound_args);
         // A bound function is a constructor exactly when its target is.
         obj.borrow_mut().is_constructor = target_is_ctor;
         obj.borrow_mut()
@@ -117,7 +117,7 @@ pub(super) fn install_function_proto(it: &mut Interp) {
         // A user function returns the source text it was parsed from; everything else
         // (natives, bound functions, proxies) renders as a native function carrying its name.
         if let ValueView::Obj(o) = &(this).view() {
-            if let Callable::User(user) = &o.borrow().call {
+            if let ObjectKind::User(user) = &o.borrow().kind {
                 if let Some(src) = &user.func.source {
                     // SourceText is already immutable; copy it directly into the engine string
                     // instead of materializing an intermediate Rust String first.

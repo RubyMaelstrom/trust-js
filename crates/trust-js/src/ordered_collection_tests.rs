@@ -291,19 +291,19 @@ fn ordered_collection_iterator_cycle_is_collectable() {
 #[test]
 fn move_collection_moves_only_map_and_set_data() {
     use crate::ordered_collection::{CollectionKind, OrderedCollection};
-    use crate::value::{Exotic, Object};
+    use crate::value::{Object, ObjectKind};
     let mut engine = Engine::new();
     let interp = &mut engine.interp;
     let array = Object::new(None);
-    array.borrow_mut().exotic = Exotic::Array;
+    array.borrow_mut().kind = ObjectKind::Array;
     let to = Object::new(None);
     assert!(!interp.move_collection(&array, &to));
-    assert!(matches!(array.borrow().exotic, Exotic::Array));
-    assert!(matches!(to.borrow().exotic, Exotic::None));
+    assert!(matches!(array.borrow().kind, ObjectKind::Array));
+    assert!(to.borrow().kind.exotic_is_none());
     let map = Object::new(None);
     interp.set_collection(&map, OrderedCollection::new(CollectionKind::Map));
     assert!(interp.move_collection(&map, &to));
-    assert!(matches!(map.borrow().exotic, Exotic::None));
+    assert!(map.borrow().kind.exotic_is_none());
     assert!(interp
         .collection(&to)
         .is_some_and(|data| data.kind() == CollectionKind::Map));

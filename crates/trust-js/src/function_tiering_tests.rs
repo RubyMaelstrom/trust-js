@@ -13,7 +13,7 @@ fn function(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::ast::Function
     let environment = engine.interp.global_env;
     let value = engine.interp.get_var(name, &environment).ok().unwrap();
     let object = value.as_obj().unwrap();
-    let crate::value::Callable::User(user) = &object.borrow().call else {
+    let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
         panic!("user function")
     };
     user.func.clone()
@@ -662,7 +662,7 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
             if let Some(frame) = i.fn_frames.last() {
                 let callee = frame.callee();
                 let outer = callee.borrow();
-                if let crate::value::Callable::User(user) = &outer.call {
+                if let crate::value::ObjectKind::User(user) = &outer.kind {
                     observation.outer_second_stage = user.func.runtime().code2.get().is_some();
                     if let Some(chunk) = user.func.runtime().code.get().and_then(Option::as_ref) {
                         observation.outer_borrowed = chunk.osr.get().is_some();
@@ -674,7 +674,7 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
             if let Ok(hot) = i.get_var("hot", &global) {
                 if let Some(hot) = hot.as_obj() {
                     let hot = hot.borrow();
-                    if let crate::value::Callable::User(user) = &hot.call {
+                    if let crate::value::ObjectKind::User(user) = &hot.kind {
                         observation.primary_runs = user
                             .func
                             .runtime()
@@ -803,7 +803,7 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
     if crate::bytecode::inline_recompile_at() == 100 {
         let callee_handle = callee.as_obj().unwrap();
         let callee = callee_handle.borrow();
-        let crate::value::Callable::User(user) = &callee.call else {
+        let crate::value::ObjectKind::User(user) = &callee.kind else {
             panic!("child user callee")
         };
         let runtime = user.func.runtime();

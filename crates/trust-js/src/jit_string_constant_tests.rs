@@ -48,7 +48,7 @@ fn with_chunk<R>(engine: &mut Engine, name: &str, spliced: bool, f: impl FnOnce(
     let value = global(engine, name);
     let object_handle = value.as_obj().expect("a function object");
     let object = object_handle.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("{name} is not a user function")
     };
     let stage = if spliced {
@@ -68,7 +68,7 @@ fn second_stage(engine: &mut Engine, name: &str) -> bool {
     let value = global(engine, name);
     let object_handle = value.as_obj().expect("a function object");
     let object = object_handle.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("{name} is not a user function")
     };
     user.func
@@ -420,7 +420,7 @@ fn inlined_string_constants_belong_to_the_caller() {
             let object = callee.as_obj().expect("a function object");
             let function = {
                 let borrowed = object.borrow();
-                let crate::value::Callable::User(user) = &borrowed.call else {
+                let crate::value::ObjectKind::User(user) = &borrowed.kind else {
                     panic!("callee is not a user function")
                 };
                 std::rc::Rc::downgrade(&user.func)

@@ -262,7 +262,7 @@ fn bound_trace_preview(value: &Value, depth: usize) -> String {
                 },
                 _ => String::new(),
             };
-            if let Callable::Bound(bound) = &object.call {
+            if let ObjectKind::Bound(bound) = &object.kind {
                 let metadata = if depth < 2 {
                     bound
                         .args
@@ -275,10 +275,10 @@ fn bound_trace_preview(value: &Value, depth: usize) -> String {
                 };
                 return format!("bound@{id:x}({name:?},metadata={metadata:?})");
             }
-            if !matches!(object.call, Callable::None) {
+            if object.kind.is_callable() {
                 return format!("function@{id:x}({name:?})");
             }
-            if matches!(object.exotic, Exotic::Array) && depth < 2 {
+            if matches!(object.kind, ObjectKind::Array) && depth < 2 {
                 let items = (0..8)
                     .map(|index| match object.props.get(&index.to_string()) {
                         Some(property) if !property.accessor() => {
@@ -358,7 +358,7 @@ fn bound_trace_arrays(value: &Value) -> Vec<(usize, String, Vec<String>)> {
         let Ok(array) = array.try_borrow() else {
             continue;
         };
-        if !matches!(array.exotic, Exotic::Array) {
+        if !matches!(array.kind, ObjectKind::Array) {
             continue;
         }
         let Some(length) = array.props.get("length").filter(|p| !p.accessor()) else {
@@ -432,7 +432,7 @@ mod bound_trace_tests {
     #[test]
     fn native_previews_are_bounded_and_skip_accessors() {
         let object = Object::new(None);
-        object.borrow_mut().exotic = Exotic::Array;
+        object.borrow_mut().kind = ObjectKind::Array;
         object
             .borrow_mut()
             .props
@@ -464,7 +464,7 @@ mod bound_trace_tests {
     fn array_state_previews_skip_accessors_and_bound_their_arrays() {
         let owner = Object::new(None);
         let array = Object::new(None);
-        array.borrow_mut().exotic = Exotic::Array;
+        array.borrow_mut().kind = ObjectKind::Array;
         array
             .borrow_mut()
             .props
@@ -594,8 +594,8 @@ fn function_profile_enter(
                 }
                 scope = env.borrow().parent;
             }
-            let same_realm = match &fn_obj.borrow().call {
-                Callable::User(user) => user.realm == realm_key,
+            let same_realm = match &fn_obj.borrow().kind {
+                ObjectKind::User(user) => user.realm == realm_key,
                 _ => false,
             };
             let (code_used, code_limit, code_denials) = crate::jit::executable_code_stats();
@@ -1248,7 +1248,7 @@ pub struct FnFrame {
 }
 
 /// A mapped arguments object's ParameterMap (ECMA-262 CreateMappedArgumentsObject,
-/// spec.html:15083-15148), which the object keeps (`Exotic::Arguments`; W3 item 3's step 6,
+/// spec.html:15083-15148), which the object keeps (`ObjectKind::Arguments`; W3 item 3's step 6,
 /// Decision 20f): the Function Environment Record its mapped indices alias and, per argument
 /// index, the slot there of the formal parameter's binding the index aliases, or
 /// [`ParameterMap::UNMAPPED`]: an earlier duplicate formal's index, one past the formals, or one
@@ -1417,8 +1417,8 @@ impl Interp {
         };
         let (chain, _) = crate::stack_trace::inline_chain(self.fn_frames[k].call_site);
         if let Some((callee, _)) = chain.into_iter().nth(next) {
-            let strict = match &callee.borrow().call {
-                Callable::User(user) => user.func.is_strict,
+            let strict = match &callee.borrow().kind {
+                ObjectKind::User(user) => user.func.is_strict,
                 _ => false,
             };
             return if strict {
@@ -3189,8 +3189,8 @@ mod binding_layout_tests {
         .view() else {
             panic!("expected function object");
         };
-        let result = match &object.borrow().call {
-            crate::value::Callable::User(user) => user.env,
+        let result = match &object.borrow().kind {
+            crate::value::ObjectKind::User(user) => user.env,
             _ => panic!("expected user closure"),
         };
         result
@@ -6390,9 +6390,9 @@ impl Interp {
         let string_proto = Object::new(Some(object_proto));
         let number_proto = Object::new(Some(object_proto));
         let boolean_proto = Object::new(Some(object_proto));
-        string_proto.borrow_mut().exotic = Exotic::str_wrap("".into());
-        number_proto.borrow_mut().exotic = Exotic::NumWrap(0.0);
-        boolean_proto.borrow_mut().exotic = Exotic::BoolWrap(false);
+        string_proto.borrow_mut().kind = ObjectKind::str_wrap("".into());
+        number_proto.borrow_mut().kind = ObjectKind::NumWrap(0.0);
+        boolean_proto.borrow_mut().kind = ObjectKind::BoolWrap(false);
         let symbol_proto = Object::new(Some(object_proto));
         let global = Object::new(Some(object_proto));
         self.object_proto = object_proto;
@@ -6687,9 +6687,9 @@ fn function_realm_key(callback: &Value) -> Option<usize> {
         return None;
     };
     let function = function.borrow();
-    match &function.call {
-        Callable::User(user) => Some(user.realm),
-        Callable::Bound(bound) => function_realm_key(&Value::Obj(bound.target)),
+    match &function.kind {
+        ObjectKind::User(user) => Some(user.realm),
+        ObjectKind::Bound(bound) => function_realm_key(&Value::Obj(bound.target)),
         _ => None,
     }
 }
@@ -6703,7 +6703,7 @@ fn ta_accessor_on_chain(start: &Gc, key: &str) -> Option<(TaAccessor, Gc)> {
     while let Some(object) = cur {
         let next = {
             let b = object.borrow();
-            if !b.ic_plain.get() || !b.exotic.is_ordinary() {
+            if !b.ic_plain.get() || !b.kind.is_ordinary() {
                 return None;
             }
             if let Some(property) = b.props.get(key) {
@@ -6726,7 +6726,7 @@ fn ta_accessor_on_chain(start: &Gc, key: &str) -> Option<(TaAccessor, Gc)> {
 fn ta_accessor_holder_is_pristine(holder: &Gc) -> bool {
     let holder = holder.borrow();
     holder.ic_plain.get()
-        && holder.exotic.is_ordinary()
+        && holder.kind.is_ordinary()
         && [
             TaAccessor::Length,
             TaAccessor::ByteLength,
@@ -6853,9 +6853,9 @@ impl Interp {
         let boolean_proto = Object::new(Some(object_proto));
         // These prototypes are themselves wrapper exotics with default primitive data, so e.g.
         // `Number.prototype.valueOf()` / `Number.prototype == 0` work.
-        string_proto.borrow_mut().exotic = Exotic::str_wrap("".into());
-        number_proto.borrow_mut().exotic = Exotic::NumWrap(0.0);
-        boolean_proto.borrow_mut().exotic = Exotic::BoolWrap(false);
+        string_proto.borrow_mut().kind = ObjectKind::str_wrap("".into());
+        number_proto.borrow_mut().kind = ObjectKind::NumWrap(0.0);
+        boolean_proto.borrow_mut().kind = ObjectKind::BoolWrap(false);
         let symbol_proto = Object::new(Some(object_proto));
         let global = Object::new(Some(object_proto));
         let global_env = new_var_scope(None);
@@ -7130,7 +7130,7 @@ impl Interp {
         let stack_started = crate::jit::perf_stage_start();
         let stack = self.capture_stack_trace(skip);
         crate::jit::perf_error_stack_capture_end(stack_started);
-        obj.borrow_mut().exotic = Exotic::error(stack);
+        obj.borrow_mut().kind = ObjectKind::error(stack);
         let message_started = crate::jit::perf_stage_start();
         let msg = message.into();
         crate::jit::perf_error_message_end(message_started);
@@ -7177,7 +7177,7 @@ impl Interp {
                         for frame in self.fn_frames.iter().rev().take(4) {
                             let callee = frame.callee();
                             let object = callee.borrow();
-                            if let Callable::User(user) = &object.call {
+                            if let ObjectKind::User(user) = &object.kind {
                                 if let Some(source) = &user.func.source {
                                     eprintln!(
                                         "trust-js-error-source: {:?}",
@@ -7434,7 +7434,7 @@ impl Interp {
             return false;
         }
         let source = source.borrow();
-        if !matches!(source.exotic, Exotic::Array)
+        if !matches!(source.kind, ObjectKind::Array)
             || !(0..len).all(|index| {
                 source
                     .props
@@ -7601,11 +7601,10 @@ impl Interp {
                 {
                     return ElementReceiverKind::Exotic;
                 }
-                match &object.borrow().exotic {
-                    crate::value::Exotic::Array => ElementReceiverKind::Array,
-                    crate::value::Exotic::StrWrap(_) => ElementReceiverKind::String,
-                    crate::value::Exotic::None => ElementReceiverKind::Ordinary,
-                    crate::value::Exotic::Collection(_) => ElementReceiverKind::Ordinary,
+                match &object.borrow().kind {
+                    crate::value::ObjectKind::Array => ElementReceiverKind::Array,
+                    crate::value::ObjectKind::StrWrap(_) => ElementReceiverKind::String,
+                    kind if kind.is_ordinary() => ElementReceiverKind::Ordinary,
                     _ => ElementReceiverKind::Exotic,
                 }
             }
@@ -7647,14 +7646,14 @@ impl Interp {
             return CallTargetKind::Proxy;
         }
         let body = object.borrow();
-        match &body.call {
-            Callable::User(_) => CallTargetKind::UserFunction,
+        match &body.kind {
+            ObjectKind::User(_) => CallTargetKind::UserFunction,
             native if native.is_native() => CallTargetKind::NativeFunction,
-            Callable::Bound(_) => CallTargetKind::BoundFunction,
-            Callable::WrappedShadow(_) | Callable::WrappedCross(_) => {
+            ObjectKind::Bound(_) => CallTargetKind::BoundFunction,
+            ObjectKind::WrappedShadow(_) | ObjectKind::WrappedCross(_) => {
                 CallTargetKind::WrappedFunction
             }
-            Callable::None => CallTargetKind::NonCallable,
+            kind if !kind.is_callable() => CallTargetKind::NonCallable,
             _ => CallTargetKind::CallableObject,
         }
     }
@@ -7678,7 +7677,7 @@ impl Interp {
                 let ValueView::Obj(object) = (callee).view() else {
                     return CallEnvironmentKind::Unknown;
                 };
-                let Callable::User(user) = &object.borrow().call else {
+                let ObjectKind::User(user) = &object.borrow().kind else {
                     return CallEnvironmentKind::Unknown;
                 };
                 match user.func.runtime().code.get() {
@@ -7732,8 +7731,8 @@ impl Interp {
             .fn_frames
             .get(floor..)
             .and_then(|frames| frames.last())
-            .and_then(|frame| match &frame.callee().borrow().call {
-                Callable::User(user) => Some(user.realm),
+            .and_then(|frame| match &frame.callee().borrow().kind {
+                ObjectKind::User(user) => Some(user.realm),
                 _ => None,
             })
             .or_else(|| self.script_entry.map(|(realm, _)| realm));
@@ -7838,7 +7837,7 @@ impl Interp {
     /// its own, whose function context would always be found first.
     fn job_active_script(&self, callback: &Value) -> Option<crate::agent_control::RuntimeOrigin> {
         if let ValueView::Obj(function) = &(callback).view() {
-            if let Callable::User(user) = &function.borrow().call {
+            if let ObjectKind::User(user) = &function.borrow().kind {
                 if !user.func.self_hosted
                     && user
                         .func
@@ -8196,7 +8195,7 @@ impl Interp {
     pub fn is_error_value(&self, v: &Value) -> bool {
         let mut cur = v.as_obj();
         while let Some(o) = cur {
-            if matches!(o.borrow().exotic, Exotic::Error(_)) {
+            if matches!(o.borrow().kind, ObjectKind::Error(_)) {
                 return true;
             }
             cur = o.borrow().proto;
@@ -8213,7 +8212,7 @@ impl Interp {
     pub fn error_diagnostic(&self, value: &Value) -> Option<String> {
         let handle = value.as_obj()?;
         let object = handle.try_borrow().ok()?;
-        let Exotic::Error(trace) = &object.exotic else {
+        let ObjectKind::Error(trace) = &object.kind else {
             return None;
         };
         let message = match object.props.get("message") {
@@ -8303,8 +8302,8 @@ impl Interp {
         }
         {
             let borrowed = object.borrow();
-            let ordinary = borrowed.exotic.is_ordinary()
-                && matches!(borrowed.call, Callable::None)
+            let ordinary = borrowed.kind.is_ordinary()
+                && !borrowed.kind.is_callable()
                 && borrowed.extensible
                 && self.ordinary_get_ptr(ptr);
             let has_index = borrowed
@@ -8454,7 +8453,7 @@ impl Interp {
         Value::Obj(Object::new_with_parts(
             Some(self.array_proto),
             Props::packed_array_from_slice(&items),
-            Exotic::Array,
+            ObjectKind::Array,
         ))
     }
 
@@ -8464,7 +8463,7 @@ impl Interp {
         Value::Obj(Object::new_with_parts(
             Some(self.array_proto),
             Props::packed_array([(Value::Str(key)), value].into_iter()),
-            Exotic::Array,
+            ObjectKind::Array,
         ))
     }
 
@@ -8521,7 +8520,7 @@ impl Interp {
             return None;
         }
         let object = object.borrow();
-        if !matches!(object.exotic, Exotic::Array) {
+        if !matches!(object.kind, ObjectKind::Array) {
             return None;
         }
         let length = object.props.get("length")?;
@@ -8571,7 +8570,7 @@ impl Interp {
         Value::Obj(Object::new_with_parts(
             Some(self.array_proto),
             unsafe { Props::packed_array_from_raw(items, len) },
-            Exotic::Array,
+            ObjectKind::Array,
         ))
     }
 
@@ -8598,7 +8597,7 @@ impl Interp {
     /// call/construct/super dispatch paths.
     pub(crate) fn dispatch_native(
         &mut self,
-        call: &Callable,
+        call: &ObjectKind,
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
@@ -8608,12 +8607,12 @@ impl Interp {
         let _arguments = crate::rooting::root_slice(args);
         let result = self.with_host_callback(|interp| {
             match call {
-                Callable::Native(f) => f(interp, this, args),
+                ObjectKind::Native(f) => f(interp, this, args),
                 #[cfg(feature = "embed")]
-                Callable::ScopedNative(f) => crate::scope::invoke_native(*f, interp, this, args),
+                ObjectKind::ScopedNative(f) => crate::scope::invoke_native(*f, interp, this, args),
                 // The call's own handle: the function object, and with it the payload cell that
                 // `call` names, may become unreachable while the function runs.
-                Callable::NativeData(data) => match &Rc::clone(data).body {
+                ObjectKind::NativeData(data) => match &Rc::clone(data).body {
                     crate::value::NativeCallableBody::Opaque(f) => {
                         let f = f.clone();
                         f(interp, this, args)
@@ -8744,7 +8743,7 @@ impl Interp {
         self.make_callable_object(
             name,
             len,
-            Callable::native_data(Rc::new(crate::value::NativeCallable {
+            ObjectKind::native_data(Rc::new(crate::value::NativeCallable {
                 body,
                 retained,
                 identity: Rc::from(name),
@@ -8753,11 +8752,11 @@ impl Interp {
     }
 
     /// Install the common ordinary-function properties without adapting the callback type.
-    fn make_callable_object(&self, name: &str, len: usize, call: Callable) -> Gc {
+    fn make_callable_object(&self, name: &str, len: usize, call: ObjectKind) -> Gc {
         let obj = Object::new(Some(self.function_proto));
         {
             let mut b = obj.borrow_mut();
-            b.call = call;
+            b.kind = call;
             b.props.insert(
                 "length",
                 Property::data(Value::Num(len as f64), false, false, true),
@@ -8773,7 +8772,7 @@ impl Interp {
 
     pub(crate) fn make_native(&self, name: &str, len: usize, f: NativeFn) -> Gc {
         crate::jit::perf_native_register(f as usize, name);
-        self.make_callable_object(name, len, Callable::Native(f))
+        self.make_callable_object(name, len, ObjectKind::Native(f))
     }
 
     #[cfg(feature = "embed")]
@@ -8784,7 +8783,7 @@ impl Interp {
         f: crate::scope::NativeFn,
     ) -> Gc {
         crate::jit::perf_native_register(f as usize, name);
-        self.make_callable_object(name, len, Callable::ScopedNative(f))
+        self.make_callable_object(name, len, ObjectKind::ScopedNative(f))
     }
 
     #[cfg(feature = "embed")]
@@ -9541,7 +9540,7 @@ impl Interp {
         let obj = Object::new(Some(fn_proto));
         {
             let mut b = obj.borrow_mut();
-            b.call = Callable::user(
+            b.kind = ObjectKind::user(
                 func.clone(),
                 self_env.as_ref().cloned().unwrap_or(env),
                 Gc::as_ptr(&self.global) as usize,
@@ -9677,11 +9676,11 @@ impl Interp {
                 } else if self.typed_arrays.contains_key(&id) {
                     "TypedArray"
                 } else {
-                    match &object.exotic {
-                        Exotic::Array => "Array",
-                        Exotic::StrWrap(_) => "String object",
-                        Exotic::Arguments(_) => "Arguments",
-                        Exotic::None => "ordinary/host object",
+                    match &object.kind {
+                        ObjectKind::Array => "Array",
+                        ObjectKind::StrWrap(_) => "String object",
+                        ObjectKind::Arguments(_) => "Arguments",
+                        kind if kind.exotic_is_none() => "ordinary/host object",
                         _ => "other exotic",
                     }
                 };
@@ -9785,7 +9784,7 @@ impl Interp {
             && self.ordinary_get_ptr(Gc::as_ptr(op) as usize)
             && matches!(ap.borrow().proto.as_ref(), Some(p) if Gc::ptr_eq(p, op))
             && op.borrow().proto.is_none()
-            && op.borrow().exotic.is_ordinary()
+            && op.borrow().kind.is_ordinary()
             && no_index_keys(ap)
             && no_index_keys(op)
             && {
@@ -9808,7 +9807,7 @@ impl Interp {
         if !self.non_typed_ordinary_get_ptr(Gc::as_ptr(o) as usize) {
             return false;
         }
-        if !(matches!(o.borrow().exotic, Exotic::Array) || o.borrow().exotic.is_ordinary()) {
+        if !(matches!(o.borrow().kind, ObjectKind::Array) || o.borrow().kind.is_ordinary()) {
             return false;
         }
         true
@@ -9824,7 +9823,7 @@ impl Interp {
     pub(crate) fn plain_own_element_present(object: &Gc, index: u32) -> bool {
         let body = object.borrow();
         body.ic_plain.get()
-            && (matches!(body.exotic, Exotic::Array) || body.exotic.is_ordinary())
+            && (matches!(body.kind, ObjectKind::Array) || body.kind.is_ordinary())
             && body.props.get_index(index).is_some()
     }
 
@@ -9853,7 +9852,7 @@ impl Interp {
                 return None;
             }
             b = o.borrow();
-        } else if !(matches!(b.exotic, Exotic::Array) || b.exotic.is_ordinary()) {
+        } else if !(matches!(b.kind, ObjectKind::Array) || b.kind.is_ordinary()) {
             return None;
         }
         let p = b.props.get_index(n as u32)?;
@@ -9906,7 +9905,7 @@ impl Interp {
         }
         let n = n as u32;
         let mut b = o.borrow_mut();
-        if !(matches!(b.exotic, Exotic::Array) || b.exotic.is_ordinary()) {
+        if !(matches!(b.kind, ObjectKind::Array) || b.kind.is_ordinary()) {
             return Err(v);
         }
         // Mirror-coherent overwrite (does NOT invalidate the mirror like a raw get_index_mut).
@@ -9917,7 +9916,7 @@ impl Interp {
         // A fresh dense element is the other overwhelmingly common array write. The protector
         // proof executes no JS, so all receiver validation and the eventual commit can safely
         // remain under this single borrow.
-        if !matches!(b.exotic, Exotic::Array)
+        if !matches!(b.kind, ObjectKind::Array)
             || !b.extensible
             || !matches!(b.proto.as_ref(), Some(p) if Gc::ptr_eq(p, &self.array_proto))
             || !self.array_prototypes_unshadowed()
@@ -10226,7 +10225,7 @@ impl Interp {
     }
 
     /// Whether object pointer `ptr` (holding `b`) reads like an ordinary object for IC purposes.
-    /// `Exotic::Array` is allowed: array *named* reads are ordinary (`length` is a real stored
+    /// `ObjectKind::Array` is allowed: array *named* reads are ordinary (`length` is a real stored
     /// property); the primitive wrappers are allowed as justified below; everything else exotic
     /// (arguments, …) and anything in a side table (proxy, namespace, typed array) is not.
     #[inline]
@@ -10236,15 +10235,15 @@ impl Interp {
         // so named entries stay shape-pinned — a named non-index IC over one is as sound as
         // over an ordinary object. NumWrap/BoolWrap (Number/Boolean prototypes and their
         // wrappers) are stricter still: no name is exotic-provided at all, and they are never
-        // `elem_mode` either (`mark_array` fires only on becoming `Exotic::Array`).
-        (matches!(
-            b.exotic,
-            Exotic::None
-                | Exotic::Array
-                | Exotic::StrWrap(_)
-                | Exotic::NumWrap(_)
-                | Exotic::BoolWrap(_)
-        ) || b.exotic.is_collection())
+        // `elem_mode` either (`mark_array` fires only on becoming `ObjectKind::Array`).
+        (b.kind.is_ordinary()
+            || matches!(
+                b.kind,
+                ObjectKind::Array
+                    | ObjectKind::StrWrap(_)
+                    | ObjectKind::NumWrap(_)
+                    | ObjectKind::BoolWrap(_)
+            ))
             && b.ic_plain.get()
     }
 
@@ -10366,10 +10365,8 @@ impl Interp {
                 // Absence-of-entry proves OrdinaryGet absence only where no name is
                 // exotic-provided: `None` plus NumWrap/BoolWrap (never StrWrap's
                 // `length`/indices, never Array elements), mirrored in the fill.
-                if !((matches!(
-                    b.exotic,
-                    Exotic::None | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
-                ) || b.exotic.is_collection())
+                if !((b.kind.is_ordinary()
+                    || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)))
                     && b.ic_plain.get()
                     && b.props.shape() == shape)
                 {
@@ -10409,14 +10406,14 @@ impl Interp {
             // (element entries occupy slots without transitioning the shape, so two
             // same-shape arrays can hold `length` at different slots).
             let non_digit = !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
-            let recv_shape_ok = rb.exotic.is_ordinary()
-                || (matches!(rb.exotic, Exotic::Array) && (depth >= 1 || keychk) && non_digit)
+            let recv_shape_ok = rb.kind.is_ordinary()
+                || (matches!(rb.kind, ObjectKind::Array) && (depth >= 1 || keychk) && non_digit)
                 // Wrapper named entries are shape-pinned (not elem_mode); StrWrap index/length
                 // reads are exotic-provided and never fill states at this site's name, and the
                 // digit gate is kept for Num/Bool wrappers too, mirroring StrWrap.
                 || (matches!(
-                    rb.exotic,
-                    Exotic::StrWrap(_) | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
+                    rb.kind,
+                    ObjectKind::StrWrap(_) | ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)
                 ) && non_digit);
             if recv_shape_ok && rb.ic_plain.get() && rb.props.shape() == st.recv_shape {
                 if depth == 0 {
@@ -10452,13 +10449,13 @@ impl Interp {
                         .take(depth.saturating_sub(1) as usize)
                     {
                         let mb = (*hp).borrow();
-                        if !((matches!(
-                            mb.exotic,
-                            Exotic::None
-                                | Exotic::StrWrap(_)
-                                | Exotic::NumWrap(_)
-                                | Exotic::BoolWrap(_)
-                        ) || mb.exotic.is_collection())
+                        if !((mb.kind.is_ordinary()
+                            || matches!(
+                                mb.kind,
+                                ObjectKind::StrWrap(_)
+                                    | ObjectKind::NumWrap(_)
+                                    | ObjectKind::BoolWrap(_)
+                            ))
                             && mb.ic_plain.get()
                             && mb.props.shape() == mid_shape)
                         {
@@ -10467,14 +10464,14 @@ impl Interp {
                         hp = Gc::as_ptr(mb.proto.as_ref()?);
                     }
                     let hb = (*hp).borrow();
-                    let holder_exotic_ok = (matches!(
-                        hb.exotic,
-                        Exotic::None
-                            | Exotic::StrWrap(_)
-                            | Exotic::NumWrap(_)
-                            | Exotic::BoolWrap(_)
-                    ) || hb.exotic.is_collection())
-                        || (keychk && matches!(hb.exotic, Exotic::Array));
+                    let holder_exotic_ok = (hb.kind.is_ordinary()
+                        || matches!(
+                            hb.kind,
+                            ObjectKind::StrWrap(_)
+                                | ObjectKind::NumWrap(_)
+                                | ObjectKind::BoolWrap(_)
+                        ))
+                        || (keychk && matches!(hb.kind, ObjectKind::Array));
                     if holder_exotic_ok && hb.ic_plain.get() && hb.props.shape() == st.holder_shape
                     {
                         let property = if keychk {
@@ -10534,7 +10531,7 @@ impl Interp {
         // a shape match couldn't prove an index-like name is still absent).
         let mut mids = [None; 4];
         // Level shapes for an absent-property fill (see `IC_ABSENT`): valid only while every
-        // level so far answers no name outside its entries — plain `Exotic::None` objects and
+        // level so far answers no name outside its entries — plain `ObjectKind::ExoticNone` objects and
         // NumWrap/BoolWrap wrappers. StrWrap (`length`/indices) and Array (elements) answer
         // names exotically, so absence-of-entry proves nothing across them.
         let mut absent_shapes = [0; 6];
@@ -10547,10 +10544,8 @@ impl Interp {
                 }
                 absent_shapes[depth as usize] = b.props.shape();
                 absent_ok = absent_ok
-                    && (matches!(
-                        b.exotic,
-                        Exotic::None | Exotic::NumWrap(_) | Exotic::BoolWrap(_)
-                    ) || b.exotic.is_collection());
+                    && (b.kind.is_ordinary()
+                        || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)));
                 if let Some(slot) = key.and_then(|key| b.props.slot_of_key(key)) {
                     let p = b.props.property_at(slot).unwrap();
                     let v = self.snapshot_cached_get(
@@ -10558,7 +10553,7 @@ impl Interp {
                         name,
                         b.props.shape(),
                         depth,
-                        matches!(b.exotic, Exotic::Array),
+                        matches!(b.kind, ObjectKind::Array),
                     )?;
                     // An Array HOLDER's slot can't be trusted by shape alone: element entries
                     // occupy slots without transitioning the shape, so two same-shape arrays
@@ -10566,13 +10561,13 @@ impl Interp {
                     // (`IC_ARR_KEYCHK`): hits re-verify the entry's key, and the JIT templates
                     // (exact depth compares, no bounds check) route it to the helper. Digit
                     // names stay uncached (element reads have their own paths).
-                    let keychk = !(matches!(
-                        b.exotic,
-                        Exotic::None
-                            | Exotic::StrWrap(_)
-                            | Exotic::NumWrap(_)
-                            | Exotic::BoolWrap(_)
-                    ) || b.exotic.is_collection());
+                    let keychk = !(b.kind.is_ordinary()
+                        || matches!(
+                            b.kind,
+                            ObjectKind::StrWrap(_)
+                                | ObjectKind::NumWrap(_)
+                                | ObjectKind::BoolWrap(_)
+                        ));
                     if keychk && name.as_bytes().first().is_some_and(|b| b.is_ascii_digit()) {
                         return Some(v);
                     }
@@ -10616,13 +10611,13 @@ impl Interp {
                     return Some(v);
                 }
                 if (1..=4).contains(&depth)
-                    && (matches!(
-                        b.exotic,
-                        Exotic::None
-                            | Exotic::StrWrap(_)
-                            | Exotic::NumWrap(_)
-                            | Exotic::BoolWrap(_)
-                    ) || b.exotic.is_collection())
+                    && (b.kind.is_ordinary()
+                        || matches!(
+                            b.kind,
+                            ObjectKind::StrWrap(_)
+                                | ObjectKind::NumWrap(_)
+                                | ObjectKind::BoolWrap(_)
+                        ))
                 {
                     mids[depth as usize - 1] = Some(b.props.shape());
                 }
@@ -10709,7 +10704,7 @@ impl Interp {
                 if p.accessor() {
                     return "accessor descriptor";
                 }
-                if matches!(b.exotic, Exotic::Array) {
+                if matches!(b.kind, ObjectKind::Array) {
                     return "array holder (key-checked)";
                 }
                 if depth > 3 {
@@ -10905,7 +10900,7 @@ impl Interp {
             return Err(lval); // the generic path raises the RangeError
         }
         let mut b = o.borrow_mut();
-        if !b.ic_plain.get() || !b.exotic.is_ordinary() {
+        if !b.ic_plain.get() || !b.kind.is_ordinary() {
             return Err(lval);
         }
         let Some(p) = b.props.get(name) else {
@@ -10944,7 +10939,7 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> IcSet {
         let mut b = o.borrow_mut();
-        if !b.exotic.is_ordinary() {
+        if !b.kind.is_ordinary() {
             return IcSet::Miss;
         }
         if !b.ic_plain.get() {
@@ -11122,14 +11117,14 @@ impl Interp {
             // SAFETY: every hop is kept alive by the receiver the caller holds, and nothing
             // mutates the chain during the probe.
             let mb = unsafe { (*hop).try_borrow().ok()? };
-            if !(mb.exotic.is_ordinary() && mb.ic_plain.get() && mb.props.shape() == mid) {
+            if !(mb.kind.is_ordinary() && mb.ic_plain.get() && mb.props.shape() == mid) {
                 return None;
             }
             hop = Gc::as_ptr(mb.proto.as_ref()?);
         }
         // SAFETY: as above.
         let hb = unsafe { (*hop).try_borrow().ok()? };
-        if !(hb.exotic.is_ordinary() && hb.ic_plain.get() && hb.props.shape() == st.holder_shape) {
+        if !(hb.kind.is_ordinary() && hb.ic_plain.get() && hb.props.shape() == st.holder_shape) {
             return None;
         }
         hb.props
@@ -11159,7 +11154,7 @@ impl Interp {
             // SAFETY: every object on the chain is kept alive by `o`, and nothing mutates the
             // chain during the walk.
             let b = unsafe { (*cur).try_borrow().ok()? };
-            if !(b.exotic.is_ordinary() && b.ic_plain.get()) {
+            if !(b.kind.is_ordinary() && b.ic_plain.get()) {
                 return None;
             }
             if depth == 0 {
@@ -11198,7 +11193,7 @@ impl Interp {
     /// constructor pattern `this.x = v` inserts a fresh own property on every call. A cache hit
     /// (same before-shape + same prototype identity + unchanged proto epoch + extensible)
     /// re-proves the fill-time chain walk, so the insert skips `OrdinarySet` entirely. `b` is the
-    /// receiver's live borrow (the receiver is already known ordinary, `Exotic::None`).
+    /// receiver's live borrow (the receiver is already known ordinary, `ObjectKind::ExoticNone`).
     fn try_ic_create(
         &mut self,
         _o: &Gc,
@@ -11242,7 +11237,7 @@ impl Interp {
                     return false;
                 }
                 let hb = h.borrow();
-                if !(hb.exotic.is_ordinary() && hb.ic_plain.get()) {
+                if !(hb.kind.is_ordinary() && hb.ic_plain.get()) {
                     return false;
                 }
                 if let Some(slot) = hb.props.slot_of_key(key) {
@@ -11561,9 +11556,9 @@ impl Interp {
                 let o = *o;
                 let ptr = Gc::as_ptr(&o) as usize;
                 // One look at the exotic kind: a mapped `arguments` object or a string wrapper.
-                let (mapped, wrapped_string) = match &o.borrow().exotic {
-                    Exotic::Arguments(Some(_)) => (true, None),
-                    Exotic::StrWrap(s) => (false, Some(**s)),
+                let (mapped, wrapped_string) = match &o.borrow().kind {
+                    ObjectKind::Arguments(Some(_)) => (true, None),
+                    ObjectKind::StrWrap(s) => (false, Some(**s)),
                     _ => (false, None),
                 };
                 // A mapped `arguments` index aliases its parameter binding.
@@ -11906,8 +11901,8 @@ impl Interp {
                     )
                 {
                     if let ValueView::Obj(r) = &(receiver).view() {
-                        let plain = match &r.borrow().call {
-                            Callable::User(user) => {
+                        let plain = match &r.borrow().kind {
+                            ObjectKind::User(user) => {
                                 !user.func.is_strict
                                     && !user.func.is_arrow
                                     && !user.func.is_generator
@@ -12023,9 +12018,7 @@ impl Interp {
             TypeofTest::Symbol => matches!(&(value).view(), ValueView::Sym(_)),
             TypeofTest::Object => match &(value).view() {
                 ValueView::Null => true,
-                ValueView::Obj(object) => {
-                    matches!(object.borrow().call, Callable::None)
-                }
+                ValueView::Obj(object) => !object.borrow().kind.is_callable(),
                 _ => false,
             },
             TypeofTest::Function => value.is_callable(),
@@ -12050,7 +12043,7 @@ impl Interp {
     /// ParameterMap, which the object keeps, [`ParameterMap`]).
     pub(crate) fn mapped_arg_binding(object: &Gc, key: &str) -> Option<(Env, usize)> {
         let body = object.borrow();
-        let Exotic::Arguments(Some(map)) = &body.exotic else {
+        let ObjectKind::Arguments(Some(map)) = &body.kind else {
             return None;
         };
         // ParameterMap keys are exact array-index strings, not every spelling accepted by an
@@ -12062,7 +12055,7 @@ impl Interp {
     /// Whether `object` is a mapped arguments object, whose indices may alias bindings: its
     /// [[Get]] and [[Set]] are not an ordinary object's.
     pub(crate) fn is_mapped_arguments(object: &Gc) -> bool {
-        matches!(object.borrow().exotic, Exotic::Arguments(Some(_)))
+        matches!(object.borrow().kind, ObjectKind::Arguments(Some(_)))
     }
 
     /// The current value of the parameter a mapped `arguments[key]` aliases, if the index is
@@ -12107,7 +12100,7 @@ impl Interp {
         let Some(index) = crate::value::canonical_index(key) else {
             return;
         };
-        if let Exotic::Arguments(Some(map)) = &mut object.borrow_mut().exotic {
+        if let ObjectKind::Arguments(Some(map)) = &mut object.borrow_mut().kind {
             map.unmap(index as usize);
         }
     }
@@ -12336,7 +12329,7 @@ impl Interp {
         };
 
         let ptr = Gc::as_ptr(&obj) as usize;
-        if matches!(obj.borrow().exotic, Exotic::Arguments(_)) {
+        if matches!(obj.borrow().kind, ObjectKind::Arguments(_)) {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.record(
                     crate::feedback::PropertyOutcome::Exotic,
@@ -12657,7 +12650,7 @@ impl Interp {
                 }
                 // Proxy and arguments receivers require their [[DefineOwnProperty]]:
                 // observable traps and live parameter mappings must not be bypassed.
-                let arguments_receiver = matches!(r.borrow().exotic, Exotic::Arguments(_));
+                let arguments_receiver = matches!(r.borrow().kind, ObjectKind::Arguments(_));
                 if arguments_receiver || self.proxies.contains_key(&rptr) {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(
@@ -12686,7 +12679,7 @@ impl Interp {
                 // Array's read-only length rejects *before* either length conversion.
                 let rejected_array_descriptor = {
                     let receiver = r.borrow();
-                    matches!(receiver.exotic, Exotic::Array)
+                    matches!(receiver.kind, ObjectKind::Array)
                         && receiver
                             .props
                             .get(key)
@@ -12731,7 +12724,7 @@ impl Interp {
             }
             return Ok(false);
         }
-        let is_array = matches!(obj.borrow().exotic, Exotic::Array);
+        let is_array = matches!(obj.borrow().kind, ObjectKind::Array);
         if is_array {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.record(
@@ -12976,7 +12969,7 @@ impl Interp {
         let concrete = {
             let concrete = proto.borrow();
             concrete.ic_plain.get()
-                && concrete.exotic.is_ordinary()
+                && concrete.kind.is_ordinary()
                 && concrete
                     .proto
                     .as_ref()
@@ -13769,7 +13762,7 @@ impl Interp {
         };
         let body = target.borrow();
         body.ic_plain.get()
-            && (body.exotic.is_ordinary() || matches!(body.exotic, Exotic::Array))
+            && (body.kind.is_ordinary() || matches!(body.kind, ObjectKind::Array))
             && body
                 .props
                 .get(key)
@@ -13783,7 +13776,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         if self.tier != crate::bytecode::Tier::Jit
-            || !matches!(&(callee).view(), ValueView::Obj(o) if matches!(&o.borrow().call, Callable::User(_)))
+            || !matches!(&(callee).view(), ValueView::Obj(o) if matches!(&o.borrow().kind, ObjectKind::User(_)))
         {
             return self.call(callee, this, args);
         }
@@ -13811,8 +13804,8 @@ impl Interp {
             return None;
         }
         let object = next.as_obj()?;
-        let native = match object.borrow().call {
-            Callable::Native(native) => native,
+        let native = match object.borrow().kind {
+            ObjectKind::Native(native) => native,
             _ => return None,
         };
         let step = crate::builtins::intrinsic_iterator_step(native)?;
@@ -13934,8 +13927,8 @@ impl Interp {
                     _ => return Ok(None),
                 }
             }
-            let bound = match &cur.borrow().call {
-                Callable::Bound(bound) => Some(bound.target),
+            let bound = match &cur.borrow().kind {
+                ObjectKind::Bound(bound) => Some(bound.target),
                 _ => None,
             };
             match bound {
@@ -13999,11 +13992,11 @@ impl Interp {
     ) -> Option<(crate::agent_access::RealmId, usize)> {
         let realm = {
             let body = object.borrow();
-            match &body.call {
-                Callable::User(user) => user.realm,
+            match &body.kind {
+                ObjectKind::User(user) => user.realm,
                 // ShadowRealm WrappedFunctionCreate gives a wrapper its caller Realm's
                 // %Function.prototype%; that Realm is the wrapper's [[Realm]] (one of ours).
-                Callable::WrappedShadow(_) | Callable::WrappedCross(_) => {
+                ObjectKind::WrappedShadow(_) | ObjectKind::WrappedCross(_) => {
                     let realm = self
                         .wrapper_prototype_realm(body.proto)
                         .unwrap_or(Gc::as_ptr(&self.global) as usize);
@@ -14116,7 +14109,7 @@ impl Interp {
             if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&obj) as usize) {
                 // ProxyCreate step 5 gives a proxy [[Call]] only when its target is callable,
                 // and Call step 2 throws before any trap is read (ECMA-262, local e28783d).
-                if matches!(obj.borrow().call, Callable::None) {
+                if !obj.borrow().kind.is_callable() {
                     return Err(self.throw("TypeError", "value is not a function"));
                 }
                 if matches!((handler).view(), ValueView::Null) {
@@ -14150,7 +14143,7 @@ impl Interp {
             }
         }
 
-        let call = obj.borrow().call.clone();
+        let call = obj.borrow().kind.clone_callable();
         // A plain call is never constructing (only `new` sets the flag). Clearing it here keeps a
         // wrapper constructor invoked as a function — `Number(x)` — from boxing. `new.target` is
         // likewise cleared so a native constructor called *as a function* during an outer `new`
@@ -14159,17 +14152,16 @@ impl Interp {
         let saved_nt = self.new_target;
         self.constructing = false;
         // An arrow inherits the enclosing new.target lexically — don't clear it for one.
-        if !matches!(&call, Callable::User(user) if user.func.is_arrow) {
+        if !matches!(&call, ObjectKind::User(user) if user.func.is_arrow) {
             self.new_target = Value::Undefined;
         }
         let r = match call {
-            Callable::None => Err(self.throw("TypeError", "value is not a function")),
-            Callable::Native(_) | Callable::NativeData(_) => {
+            ObjectKind::Native(_) | ObjectKind::NativeData(_) => {
                 self.dispatch_native(&call, this, args)
             }
             #[cfg(feature = "embed")]
-            Callable::ScopedNative(_) => self.dispatch_native(&call, this, args),
-            Callable::User(user) => {
+            ObjectKind::ScopedNative(_) => self.dispatch_native(&call, this, args),
+            ObjectKind::User(user) => {
                 // A class constructor cannot be [[Call]]ed. (Empty-map guard: this runs on every
                 // single call, and most programs define no classes.)
                 if obj.borrow().class_kind != 0 {
@@ -14180,7 +14172,7 @@ impl Interp {
                 }
                 self.call_user(&user.func, user.env, this, args, false, &obj)
             }
-            Callable::Bound(bound) => {
+            ObjectKind::Bound(bound) => {
                 let mut all = bound.args.clone();
                 all.extend_from_slice(args);
                 // ECMA-262 BoundFunction [[Call]] still forwards the original
@@ -14197,12 +14189,12 @@ impl Interp {
                 }
                 result
             }
-            Callable::WrappedShadow(shadow) => {
+            ObjectKind::WrappedShadow(shadow) => {
                 // The call's own handle, as for native data (`dispatch_native`).
                 let shadow = Rc::clone(&shadow);
                 self.call_wrapped_shadow(&shadow.realm, *shadow.target, args)
             }
-            Callable::WrappedCross(cross) => {
+            ObjectKind::WrappedCross(cross) => {
                 let target = cross.target;
                 // A cross wrapper runs only in its own realm, entered from its parent.
                 let (realm, parent) = {
@@ -14226,10 +14218,10 @@ impl Interp {
                         Gc::as_ptr(&realm),
                         self as *const Interp,
                         match &(target).view() {
-                            ValueView::Obj(o) => match &o.borrow().call {
-                                Callable::User(_) => "user",
-                                Callable::WrappedShadow(_) => "wshadow",
-                                Callable::WrappedCross(_) => "wcross",
+                            ValueView::Obj(o) => match &o.borrow().kind {
+                                ObjectKind::User(_) => "user",
+                                ObjectKind::WrappedShadow(_) => "wshadow",
+                                ObjectKind::WrappedCross(_) => "wcross",
                                 native if native.is_native() => "native",
                                 _ => "other",
                             },
@@ -14307,8 +14299,8 @@ impl Interp {
             }
             // Auto-accessor get/set: the receiver must *own* the private backing field (so a static
             // accessor reached through a subclass, which doesn't carry the slot, throws).
-            Callable::AccessorGet(key) => self.accessor_load(&this, &key),
-            Callable::AccessorSet(key) => self.accessor_store(
+            ObjectKind::AccessorGet(key) => self.accessor_load(&this, &key),
+            ObjectKind::AccessorSet(key) => self.accessor_store(
                 &this,
                 &key,
                 args.first().cloned().unwrap_or(Value::Undefined),
@@ -14316,30 +14308,32 @@ impl Interp {
             // Decorator `context.access` get/set: read/write a named property on the first argument.
             // The key lives in the callee's payload cell; a getter or setter may let the callee
             // die, so each holds its own count while it runs.
-            Callable::PropGet(key) => {
+            ObjectKind::PropGet(key) => {
                 let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 self.get_member_key(&recv, &key)
             }
-            Callable::PropSet(key) => {
+            ObjectKind::PropSet(key) => {
                 let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 let val = args.get(1).cloned().unwrap_or(Value::Undefined);
                 self.set_member_key(&recv, &key, val)
                     .map(|_| Value::Undefined)
             }
-            Callable::PrivatePropGet(key) => {
+            ObjectKind::PrivatePropGet(key) => {
                 let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 self.get_private_member(&recv, &key)
             }
-            Callable::PrivatePropSet(key) => {
+            ObjectKind::PrivatePropSet(key) => {
                 let key = Rc::clone(&key);
                 let recv = args.first().cloned().unwrap_or(Value::Undefined);
                 let val = args.get(1).cloned().unwrap_or(Value::Undefined);
                 self.set_private_member(&recv, &key, val)
                     .map(|_| Value::Undefined)
             }
+            // Not callable.
+            _ => Err(self.throw("TypeError", "value is not a function")),
         };
         self.constructing = saved_ctor;
         self.new_target = saved_nt;
@@ -14407,7 +14401,7 @@ impl Interp {
         target: Value,
     ) -> Result<Value, Abrupt> {
         let f = Object::new(Some(self.function_proto));
-        f.borrow_mut().call = Callable::wrapped_shadow(*realm, target);
+        f.borrow_mut().kind = ObjectKind::wrapped_shadow(*realm, target);
         // CopyNameAndLength: the Gets run in the realm that owns `target` (its proxy state
         // lives there); an abrupt Get is a TypeError of the calling realm.
         let bad = |i: &mut Interp| {
@@ -14546,7 +14540,7 @@ impl Interp {
     /// Create the sub-realm-side wrapper for a host callable.
     pub(crate) fn make_wrapped_cross(&mut self, target: Value) -> Value {
         let f = Object::new(Some(self.function_proto));
-        f.borrow_mut().call = Callable::wrapped_cross(target);
+        f.borrow_mut().kind = ObjectKind::wrapped_cross(target);
         f.borrow_mut().props.insert(
             "length",
             Property::data(Value::Num(0.0), false, false, true),
@@ -14575,7 +14569,7 @@ impl Interp {
         let ao = Object::new(Some(self.object_proto));
         let packed = {
             let mut object = ao.borrow_mut();
-            object.exotic = crate::value::Exotic::Arguments(None);
+            object.kind = crate::value::ObjectKind::Arguments(None);
             // Create{Unmapped,Mapped}ArgumentsObject defines a contiguous run of
             // ordinary indexed data properties. Use the same packed storage as
             // fresh arrays without changing the arguments object's exotic kind,
@@ -14671,7 +14665,7 @@ impl Interp {
             if slots.iter().any(|&slot| slot != ParameterMap::UNMAPPED) {
                 MAPPED_ARGUMENTS_MADE.with(|made| made.set(true));
                 let map = crate::gc_storage::StorageBox::new(ParameterMap::new(*scope, &slots));
-                ao.borrow_mut().exotic = crate::value::Exotic::Arguments(Some(map));
+                ao.borrow_mut().kind = crate::value::ObjectKind::Arguments(Some(map));
             }
         }
         ao
@@ -14723,8 +14717,8 @@ impl Interp {
             .last()
             .expect("compiled arguments object requires an active function frame")
             .callee();
-        let func = match &fn_obj.borrow().call {
-            Callable::User(user) => user.func.clone(),
+        let func = match &fn_obj.borrow().kind {
+            ObjectKind::User(user) => user.func.clone(),
             _ => unreachable!("compiled arguments object belongs to a user function"),
         };
         self.make_arguments_object(&func, args, scope, &fn_obj)
@@ -14978,8 +14972,8 @@ impl Interp {
         // same-Agent call from another Window must activate that Realm before
         // resolving intrinsics, global declarations, and host settings; the
         // caller's Realm is restored after completion (including throws).
-        let target_key = match &fn_obj.borrow().call {
-            Callable::User(user) => user.realm,
+        let target_key = match &fn_obj.borrow().kind {
+            ObjectKind::User(user) => user.realm,
             _ => 0,
         };
         let current_key = Gc::as_ptr(&self.global) as usize;
@@ -15159,12 +15153,12 @@ impl Interp {
                     return CachedCall::Miss;
                 }
                 let object = o.borrow();
-                let (fp, ep) = match &object.call {
+                let (fp, ep) = match &object.kind {
                     // `under_with`: see the refusal in `call_jit_fast` — this retry runs a
                     // FRESH closure instance whose environment/realm was never vetted there.
                     // The immutable [[Realm]] slot proves same-realm execution independently
                     // of user mutations to the function object's prototype chain.
-                    Callable::User(user)
+                    ObjectKind::User(user)
                         if object.ic_plain.get()
                             && user.realm == Gc::as_ptr(&self.global) as usize
                             && !user.env.borrow().under_with() =>
@@ -15450,7 +15444,7 @@ impl Interp {
         target
             .with_object(|object| {
                 let body = object.borrow();
-                body.ic_plain.get() && matches!(body.call, Callable::User(_))
+                body.ic_plain.get() && matches!(body.kind, ObjectKind::User(_))
             })
             .unwrap_or(false)
     }
@@ -15471,9 +15465,9 @@ impl Interp {
         if !body.ic_plain.get() {
             return None;
         }
-        let length = match body.exotic {
-            Exotic::Array => crate::builtins::ordinary_array_length(&body.props)?,
-            Exotic::Arguments(None) => {
+        let length = match body.kind {
+            ObjectKind::Array => crate::builtins::ordinary_array_length(&body.props)?,
+            ObjectKind::Arguments(None) => {
                 // Writable and configurable: author code may have changed or removed it.
                 let length = body.props.length_property()?.number_value()?;
                 if !(length >= 0.0 && length.fract() == 0.0 && length <= out.len() as f64) {
@@ -15946,8 +15940,8 @@ impl Interp {
         // cache state only: function/source identity and observed argument/result values never
         // participate.
         if !self.native_call_in_current_realm(apply_obj)
-            || !matches!(&initializer_obj.borrow().call,
-                Callable::User(user) if user.realm == Gc::as_ptr(&self.global) as usize)
+            || !matches!(&initializer_obj.borrow().kind,
+                ObjectKind::User(user) if user.realm == Gc::as_ptr(&self.global) as usize)
         {
             return None;
         }
@@ -15957,15 +15951,15 @@ impl Interp {
             Some(runtime)
         } else {
             if !matches!(
-                apply_obj.borrow().call,
-                Callable::Native(native)
+                apply_obj.borrow().kind,
+                ObjectKind::Native(native)
                     if native as usize
                         == crate::builtins::nf_function_apply as *const () as usize
             ) {
                 return None;
             }
             let callable = initializer_obj.borrow();
-            let Callable::User(user) = &callable.call else {
+            let ObjectKind::User(user) = &callable.kind else {
                 return None;
             };
             if user.func.is_arrow || user.env.borrow().under_with() || callable.class_kind != 0 {
@@ -16204,8 +16198,8 @@ impl Interp {
             // actual callee's internal methods matter; unrelated proxies must not disable
             // ordinary native construction throughout the Agent.
             if b.ic_plain.get() && (b.is_constructor || b.props.contains("prototype")) {
-                match &b.call {
-                    native if native.is_native() => Some(native.clone()),
+                match &b.kind {
+                    native if native.is_native() => Some(native.clone_callable()),
                     _ => None,
                 }
             } else {
@@ -16316,7 +16310,7 @@ impl Interp {
         let this = crate::value::Object::new_with_parts(
             Some(proto),
             crate::value::Props::with_layout(instance_capacity, instance_layout),
-            crate::value::Exotic::None,
+            crate::value::ObjectKind::Plain,
         );
         let this_val = Value::Obj(this);
         // --- committed: identical shape to call_jit_cached's committed path ---
@@ -16516,8 +16510,8 @@ impl Interp {
         genv: usize,
     ) -> Option<(crate::bytecode::CallIc, u32, u32, bool)> {
         let object = o.borrow();
-        let (func, env) = match &object.call {
-            Callable::User(user)
+        let (func, env) = match &object.kind {
+            ObjectKind::User(user)
                 if object.ic_plain.get() && user.realm == Gc::as_ptr(&self.global) as usize =>
             {
                 (user.func.clone(), user.env)
@@ -16661,8 +16655,8 @@ impl Interp {
             return None;
         };
         let object = o.borrow();
-        let (func, env, realm) = match &object.call {
-            Callable::User(user) if object.ic_plain.get() => {
+        let (func, env, realm) = match &object.kind {
+            ObjectKind::User(user) if object.ic_plain.get() => {
                 (user.func.clone(), user.env, user.realm)
             }
             _ => return None,
@@ -17621,7 +17615,7 @@ impl Interp {
             },
         );
         let bound = Object::new(Some(self.function_proto));
-        bound.borrow_mut().call = Callable::bound(target, *r, vec![generator, *r]);
+        bound.borrow_mut().kind = ObjectKind::bound(target, *r, vec![generator, *r]);
         Value::Obj(bound)
     }
 
@@ -17656,7 +17650,7 @@ impl Interp {
         );
         let bound = Object::new(Some(self.function_proto));
         // Await's continuation owns the generator, not just its recyclable address.
-        bound.borrow_mut().call = Callable::bound(target, *r, vec![generator, *r]);
+        bound.borrow_mut().kind = ObjectKind::bound(target, *r, vec![generator, *r]);
         Value::Obj(bound)
     }
 
@@ -17858,7 +17852,7 @@ impl Interp {
     fn construct_native_dispatch(
         &mut self,
         obj: &Gc,
-        call: &Callable,
+        call: &ObjectKind,
         args: &[Value],
         new_target: Value,
     ) -> Result<Value, Abrupt> {
@@ -17921,16 +17915,16 @@ impl Interp {
                 return Ok(result);
             }
         }
-        let call = obj.borrow().call.clone();
+        let call = obj.borrow().kind.clone_callable();
         match call {
-            Callable::Native(_) | Callable::NativeData(_) => {
+            ObjectKind::Native(_) | ObjectKind::NativeData(_) => {
                 self.construct_native_dispatch(&obj, &call, args, new_target)
             }
             #[cfg(feature = "embed")]
-            Callable::ScopedNative(_) => {
+            ObjectKind::ScopedNative(_) => {
                 self.construct_native_dispatch(&obj, &call, args, new_target)
             }
-            Callable::User(user) => {
+            ObjectKind::User(user) => {
                 // Arrows, concise methods, getters/setters, generators and async functions have no
                 // [[Construct]].
                 if user.func.is_arrow
@@ -17971,7 +17965,7 @@ impl Interp {
                 let this = Object::new_with_parts(
                     proto,
                     crate::value::Props::with_layout(capacity, layout),
-                    crate::value::Exotic::None,
+                    crate::value::ObjectKind::Plain,
                 );
                 let this_val = Value::Obj(this);
                 self.pending_new_target = new_target;
@@ -17993,7 +17987,7 @@ impl Interp {
                     _ => this_val,
                 })
             }
-            Callable::Bound(bound) => {
+            ObjectKind::Bound(bound) => {
                 let mut all = bound.args.clone();
                 all.extend_from_slice(args);
                 // BoundFunction [[Construct]]: if new.target is the bound function itself, use the
@@ -18005,17 +17999,8 @@ impl Interp {
                 };
                 self.construct_nt(Value::Obj(bound.target), &all, nt)
             }
-            Callable::None
-            | Callable::WrappedShadow(_)
-            | Callable::WrappedCross(_)
-            | Callable::AccessorGet(_)
-            | Callable::AccessorSet(_)
-            | Callable::PropGet(_)
-            | Callable::PropSet(_)
-            | Callable::PrivatePropGet(_)
-            | Callable::PrivatePropSet(_) => {
-                Err(self.throw("TypeError", "value is not a constructor"))
-            }
+            // Not callable, or a callable that is never a constructor.
+            _ => Err(self.throw("TypeError", "value is not a constructor")),
         }
     }
 

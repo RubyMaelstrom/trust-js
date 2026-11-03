@@ -2,7 +2,7 @@
 //! OrdinaryFunctionCreate / PrepareForOrdinaryCall / RunJobs).
 use crate::bytecode::Tier;
 use crate::gc_trace::{GcSink, GcTrace};
-use crate::value::{Callable, Gc, PropertyLayout};
+use crate::value::{Gc, ObjectKind, PropertyLayout};
 use crate::{Completion, Engine};
 use std::rc::Rc;
 
@@ -24,7 +24,7 @@ fn function(engine: &mut Engine, name: &str) -> Rc<crate::ast::Function> {
     let value = engine.interp.get_var(name, &env).ok().unwrap();
     let object_handle = value.as_obj().unwrap();
     let object = object_handle.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("user function")
     };
     user.func.clone()
@@ -310,7 +310,7 @@ fn retiring_an_evicted_foreign_runtime_fences_warmed_same_ast_call_ics() {
             let value = outer.interp.get_var("f", &env).ok().unwrap();
             let object = value.as_obj().unwrap();
             let borrowed = object.borrow();
-            let Callable::User(user) = &borrowed.call else {
+            let ObjectKind::User(user) = &borrowed.kind else {
                 panic!("user function")
             };
             let sidecar = user.cache.take().expect("foreign sidecar");
@@ -417,7 +417,7 @@ fn foreign_getter_fill_stale_reset_and_tdz_preserve_the_runtime_lease() {
     let getter = outer.interp.get_var("getter", &env).ok().unwrap();
     let borrowed_handle = getter.as_obj().unwrap();
     let borrowed = borrowed_handle.borrow();
-    let Callable::User(user) = &borrowed.call else {
+    let ObjectKind::User(user) = &borrowed.kind else {
         panic!("getter")
     };
     let captured = user.env;

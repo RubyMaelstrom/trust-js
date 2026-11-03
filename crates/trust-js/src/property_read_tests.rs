@@ -53,7 +53,7 @@ fn global_user_callable(engine: &mut Engine, name: &str) -> crate::value::UserFn
         .as_obj()
         .unwrap_or_else(|| panic!("{name} is not an object"));
     let borrowed = object.borrow();
-    let crate::value::Callable::User(user) = &borrowed.call else {
+    let crate::value::ObjectKind::User(user) = &borrowed.kind else {
         panic!("{name} is not an ordinary function")
     };
     *user

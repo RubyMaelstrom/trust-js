@@ -37,7 +37,7 @@
 use crate::interpreter::{Abrupt, Interp};
 use crate::lstr::LStr;
 use crate::value::ValueView;
-use crate::value::{Callable, Exotic, Value};
+use crate::value::{ObjectKind, Value};
 use std::rc::Rc;
 
 /// The position of an operation that has none (see the module documentation).
@@ -825,7 +825,7 @@ impl Interp {
                 let Some(callee) = site.callee.upgrade() else {
                     return Some(self.closed_runtime_origin());
                 };
-                if let Callable::User(user) = &callee.borrow().call {
+                if let ObjectKind::User(user) = &callee.borrow().kind {
                     if let Some(origin) =
                         user.runtime_origin(self.realm_id, crate::value::heap_id(&self.gc_heap))
                     {
@@ -841,8 +841,8 @@ impl Interp {
             } else {
                 function -= 1;
                 position = self.fn_frames[function].call_site;
-                match &self.fn_frames[function].callee().borrow().call {
-                    Callable::User(user) => {
+                match &self.fn_frames[function].callee().borrow().kind {
+                    ObjectKind::User(user) => {
                         user.runtime_origin(self.realm_id, crate::value::heap_id(&self.gc_heap))
                     }
                     _ => None,
@@ -1086,8 +1086,8 @@ impl Interp {
     ) -> Option<(std::cell::RefMut<'a, StackTrace>, usize)> {
         let object = object.try_borrow_mut().ok()?;
         let depth = self.context_depth();
-        let trace = std::cell::RefMut::filter_map(object, |object| match &mut object.exotic {
-            Exotic::Error(Some(trace)) => Some(&mut **trace),
+        let trace = std::cell::RefMut::filter_map(object, |object| match &mut object.kind {
+            ObjectKind::Error(Some(trace)) => Some(&mut **trace),
             _ => None,
         })
         .ok()?;
@@ -1119,7 +1119,7 @@ fn function_frame(
     } else {
         FrameKind::Function
     };
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         return Some(Frame {
             kind: FrameKind::Native,
             name,

@@ -32,7 +32,7 @@
 use crate::ast::{Expr, Stmt};
 use crate::interpreter::{abrupt_value, Abrupt, Binding, Env, Interp};
 use crate::value::ValueView;
-use crate::value::{Exotic, Gc, Property, Value};
+use crate::value::{Gc, ObjectKind, Property, Value};
 use std::rc::Rc;
 
 /// The `Array.prototype` iteration methods (forEach, map, filter, some, every, find, findIndex,
@@ -192,7 +192,7 @@ pub(crate) fn length_of_array_like(i: &mut Interp, object: &Value) -> Result<f64
     };
     {
         let body = target.borrow();
-        if body.ic_plain.get() && matches!(body.exotic, Exotic::Array) {
+        if body.ic_plain.get() && matches!(body.kind, ObjectKind::Array) {
             if let Some(ValueView::Num(length)) =
                 (body.props.length_property().map(|p| p.value())).map(|__value| (__value).view())
             {

@@ -3,7 +3,7 @@
 
 use crate::bytecode::{self, Tier};
 use crate::realm_inline_guard_tests::{eval_string, in_realm, set_global};
-use crate::value::{Callable, Value};
+use crate::value::{ObjectKind, Value};
 use crate::Engine;
 use std::rc::Rc;
 
@@ -12,7 +12,7 @@ fn subject(i: &mut crate::interpreter::Interp) -> crate::value::UserFn {
     let value = i.get_var("subject", &env).ok().unwrap();
     let object_handle = value.as_obj().unwrap();
     let object = object_handle.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("snapshot subject")
     };
     *user

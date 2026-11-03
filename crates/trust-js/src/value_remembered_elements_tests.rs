@@ -172,7 +172,7 @@ fn batch_edits_stay_bounded_but_reorders_copies_and_map_moves_start_full() {
     );
     clean(elements(&properties));
     // The record of a map moved to another object described its old owner's marks.
-    let array = Object::new_with_parts(None, properties, Exotic::Array);
+    let array = Object::new_with_parts(None, properties, ObjectKind::Array);
     assert_eq!(remembered(&array), Some((None, Vec::new())));
 }
 
@@ -435,7 +435,7 @@ fn remembered_slots_keep_string_bigint_symbol_closure_and_accessor_edges() {
     ];
     {
         let body = closure_object.borrow();
-        let Callable::User(user) = &body.call else {
+        let ObjectKind::User(user) = &body.kind else {
             panic!("user closure")
         };
         words.push(crate::gc_box::GcBox::as_ptr(user) as u64);
@@ -539,13 +539,13 @@ fn remembered_object_trace_preserves_every_non_element_edge_family() {
             .insert("internal", Property::plain(values[2]));
         body.props
             .insert(key.as_str(), Property::plain(Value::Null));
-        body.exotic =
-            Exotic::ArrayIterator(crate::gc_storage::PayloadBox::new(ArrayIteratorState {
+        body.kind =
+            ObjectKind::ArrayIterator(crate::gc_storage::PayloadBox::new(ArrayIteratorState {
                 target: values[3],
                 index: 0,
                 kind: 0,
             }));
-        body.call = Callable::bound(object(values[4]), values[5], vec![values[6]]);
+        body.kind = ObjectKind::bound(object(values[4]), values[5], vec![values[6]]);
     }
     let words: Vec<u64> = values.into_iter().chain([symbol]).map(witness).collect();
     let labels = [
@@ -588,7 +588,7 @@ fn unwinding_after_elements_before_callable_edges_does_not_consume_dirtiness() {
     {
         let mut body = array.borrow_mut();
         assert!(body.props.set_index_value(65, Value::Obj(child)).is_ok());
-        body.call = Callable::bound(target, Value::Null, Vec::new());
+        body.kind = ObjectKind::bound(target, Value::Null, Vec::new());
     }
     let dirty = remembered(&array);
     assert_eq!(dirty, Some((Some(128), vec![1])));
@@ -777,7 +777,7 @@ fn named_and_sparse_element_edges_remain_complete_outside_the_packed_blocks() {
     props.mark_array();
     assert!(!props.elems.has_words());
     assert!(props.has_far.get());
-    let array = Object::new_with_parts(None, props, Exotic::Array);
+    let array = Object::new_with_parts(None, props, ObjectKind::Array);
     let _owner = Rooted::new(Value::Obj(array));
     engine
         .interp
@@ -847,7 +847,7 @@ fn native_append_guards(array: &Gc) -> NativeAppendGuards {
     let body = array.borrow();
     let length_memo = body.props.len_slot.get().slot();
     let snapshot = NativeAppendGuards {
-        array: matches!(body.exotic, Exotic::Array),
+        array: matches!(body.kind, ObjectKind::Array),
         plain: body.ic_plain.get(),
         extensible: body.extensible,
         prototype: body.props.proto_flag.get(),
@@ -975,7 +975,7 @@ fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
     let map = object(map);
     let chunk = {
         let body = map.borrow();
-        let Callable::User(user) = &body.call else {
+        let ObjectKind::User(user) = &body.kind else {
             panic!("self-hosted map")
         };
         user.func

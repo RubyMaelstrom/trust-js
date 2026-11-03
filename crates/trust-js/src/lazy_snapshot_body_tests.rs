@@ -12,7 +12,7 @@
 use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::realm_inline_guard_tests::{eval_string, in_realm, render, TIERS};
-use crate::value::Callable;
+use crate::value::ObjectKind;
 use crate::value::ValueView;
 use crate::Engine;
 use std::rc::Rc;
@@ -181,7 +181,7 @@ fn global_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
         panic!("{name} is a global function");
     };
     let borrowed = object.borrow();
-    let Callable::User(user) = &borrowed.call else {
+    let ObjectKind::User(user) = &borrowed.kind else {
         panic!("{name} is an ordinary function");
     };
     user.func.clone()

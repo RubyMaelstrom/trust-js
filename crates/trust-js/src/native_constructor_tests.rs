@@ -108,8 +108,8 @@ fn bare_scoped_native_constructors_cover_new_target_bound_proxy_reflect_and_supe
                 std::hint::black_box(constructor as crate::embed::NativeFn),
             );
             assert!(matches!(
-                &ctor.gc().borrow().call,
-                crate::value::Callable::ScopedNative(_)
+                &ctor.gc().borrow().kind,
+                crate::value::ObjectKind::ScopedNative(_)
             ));
             let ctor = Value::Obj(ctor);
             cx.set_constructor_prototype(&ctor, &Value::Obj(cx.new_object()));

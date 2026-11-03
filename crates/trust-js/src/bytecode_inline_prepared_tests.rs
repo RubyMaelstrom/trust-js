@@ -2,7 +2,7 @@
 //! ECMA-262 e28783d5 FunctionDeclarationInstantiation, mapped arguments, eval and closures.
 
 use crate::bytecode::{self as bytecode, Op, Tier};
-use crate::value::Callable;
+use crate::value::ObjectKind;
 use crate::{Completion, Engine};
 
 thread_local! {
@@ -63,7 +63,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
         let value = engine.interp.get_var("subject", &env).ok().unwrap();
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let Callable::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.kind else {
             panic!("prepared subject")
         };
         let user = *user;
@@ -103,7 +103,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
             };
             let callee = chunk.jit_inline_target(target).pin.upgrade().unwrap();
             let object = callee.borrow();
-            let Callable::User(user) = &object.call else {
+            let ObjectKind::User(user) = &object.kind else {
                 panic!("planned user callee")
             };
             // FnFrame tracks the callable object identity, rather than the shared AST.
@@ -188,7 +188,7 @@ fn prepared_native_hot_calls_publish_and_execute_baseline_inline_bodies() {
     let value = engine.interp.get_var("subject", &env).ok().unwrap();
     let object_handle = value.as_obj().unwrap();
     let object = object_handle.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("prepared subject")
     };
     let function = user.func.clone();

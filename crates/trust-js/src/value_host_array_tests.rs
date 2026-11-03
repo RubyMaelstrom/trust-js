@@ -21,7 +21,7 @@ fn host_arrays_preserve_descriptors_at_storage_boundaries() {
             array.proto.as_ref().unwrap(),
             &engine.interp.array_proto
         ));
-        assert!(matches!(array.exotic, Exotic::Array));
+        assert!(matches!(array.kind, ObjectKind::Array));
         let length = array.props.length_property().unwrap();
         assert_eq!(length.number_value(), Some(len as f64));
         assert!(length.writable() && !length.enumerable() && !length.configurable());

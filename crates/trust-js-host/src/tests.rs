@@ -62,7 +62,7 @@ fn extension_installs_state_globals_and_namespaces() {
 #[test]
 fn native_fn_survives_the_bytecode_tier() {
     // The embed hooks must work on every execution tier (a native call from JIT/bytecode
-    // frames goes through the same Callable::Native dispatch, but verify, don't assume).
+    // frames goes through the same ObjectKind::Native dispatch, but verify, don't assume).
     let mut engine = Engine::new();
     engine.set_tier(trust_js::Tier::Bytecode);
     engine.set_tier_threshold(0);

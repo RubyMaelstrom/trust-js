@@ -128,7 +128,7 @@ fn adisp_reaction(
         },
     );
     let bound = Object::new(Some(i.function_proto));
-    bound.borrow_mut().call = Callable::bound(
+    bound.borrow_mut().kind = ObjectKind::bound(
         target,
         Value::Undefined,
         vec![
@@ -338,7 +338,7 @@ pub(super) fn install_async_disposable_stack(it: &mut Interp) {
         } else {
             let target = i.make_native("", 0, ds_sync_dispose_wrapper);
             let bound = Object::new(Some(i.function_proto));
-            bound.borrow_mut().call = Callable::bound(target, Value::Undefined, vec![disp, v]);
+            bound.borrow_mut().kind = ObjectKind::bound(target, Value::Undefined, vec![disp, v]);
             i.make_array(vec![Value::Obj(bound), Value::Undefined])
         };
         ds_push(i, &this, entry)?;

@@ -3,7 +3,7 @@
 use super::*;
 use crate::bytecode::{CallIc, Tier, CALL_IC_EPOCH, CALL_IC_WAYS};
 use crate::value::ValueView;
-use crate::value::{Callable, Object};
+use crate::value::{Object, ObjectKind};
 use std::cell::Cell;
 use std::mem::{offset_of, size_of};
 use std::sync::atomic::Ordering::Relaxed;
@@ -100,7 +100,7 @@ fn caller_chunk(engine: &mut crate::Engine) -> Rc<Chunk> {
         .expect("caller");
     let function_handle = value.as_obj().expect("function");
     let object = function_handle.borrow();
-    let Callable::User(user) = &object.call else {
+    let ObjectKind::User(user) = &object.kind else {
         panic!("user function")
     };
     user.func

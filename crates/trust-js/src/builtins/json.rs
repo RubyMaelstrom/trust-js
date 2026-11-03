@@ -32,7 +32,10 @@ pub(super) fn install_json(it: &mut Interp) {
                     ValueView::Str(s) => Some(s.to_string()),
                     ValueView::Num(n) => Some(i.num_to_str(*n)),
                     ValueView::Obj(o)
-                        if matches!(o.borrow().exotic, Exotic::StrWrap(_) | Exotic::NumWrap(_)) =>
+                        if matches!(
+                            o.borrow().kind,
+                            ObjectKind::StrWrap(_) | ObjectKind::NumWrap(_)
+                        ) =>
                     {
                         Some(ab(i.to_string(&item))?.to_string())
                     }
@@ -62,10 +65,10 @@ pub(super) fn install_json(it: &mut Interp) {
         if let ValueView::Obj(o) = &(space).view() {
             // Classify first: the conversions may run JavaScript, which needs `o` unborrowed.
             let (number, string) = {
-                let exotic = &o.borrow().exotic;
+                let exotic = &o.borrow().kind;
                 (
-                    matches!(exotic, Exotic::NumWrap(_)),
-                    matches!(exotic, Exotic::StrWrap(_)),
+                    matches!(exotic, ObjectKind::NumWrap(_)),
+                    matches!(exotic, ObjectKind::StrWrap(_)),
                 )
             };
             if number {
@@ -467,7 +470,7 @@ impl JsonKey<'_> {
 /// is not a mapped arguments object.
 fn json_plain_get(object: &Gc) -> bool {
     let body = object.borrow();
-    body.ic_plain.get() && !matches!(body.exotic, crate::value::Exotic::Arguments(Some(_)))
+    body.ic_plain.get() && !matches!(body.kind, crate::value::ObjectKind::Arguments(Some(_)))
 }
 
 /// Get(holder, key) for SerializeJSONProperty: an own data property of a plain object is read
@@ -570,11 +573,11 @@ fn json_serialize_property(
         }
         // A primitive-wrapper object re-coerces through ToNumber/ToString (so an overridden
         // valueOf/toString is observed); booleans read the wrapped datum directly.
-        let wrapped = match o.borrow().exotic {
-            Exotic::NumWrap(_) => Some(0),
-            Exotic::StrWrap(_) => Some(1),
-            Exotic::BoolWrap(b) => Some(2 + b as u8),
-            Exotic::BigIntWrap(_) => {
+        let wrapped = match o.borrow().kind {
+            ObjectKind::NumWrap(_) => Some(0),
+            ObjectKind::StrWrap(_) => Some(1),
+            ObjectKind::BoolWrap(b) => Some(2 + b as u8),
+            ObjectKind::BigIntWrap(_) => {
                 return Err(i.make_error("TypeError", "Do not know how to serialize a BigInt"));
             }
             _ => None,
@@ -607,7 +610,7 @@ fn json_serialize_property(
             json_quote_units(&mut s.out, text.units());
         }
         ValueView::Obj(o) => {
-            if !matches!(o.borrow().call, Callable::None) {
+            if o.borrow().kind.is_callable() {
                 return Ok(false); // functions are omitted
             }
             let o = *o;

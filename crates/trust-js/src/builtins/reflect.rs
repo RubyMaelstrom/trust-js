@@ -76,7 +76,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
             }
-            if matches!(o.borrow().exotic, Exotic::Arguments(_)) {
+            if matches!(o.borrow().kind, ObjectKind::Arguments(_)) {
                 // Arguments [[Delete]] severs a parameter mapping only after a
                 // successful ordinary deletion. Share the delete operator's path;
                 // a proxy trap that merely reports success never reaches this branch.
@@ -292,7 +292,7 @@ fn set_own_data_property(object: &Gc, key: &str, value: Value) -> bool {
     };
     let slot = {
         let body = object.borrow();
-        if !body.ic_plain.get() || !body.exotic.is_ordinary() {
+        if !body.ic_plain.get() || !body.kind.is_ordinary() {
             return false;
         }
         let Some(slot) = body.props.slot_of_key(key) else {

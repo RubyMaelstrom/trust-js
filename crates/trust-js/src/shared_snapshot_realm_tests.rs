@@ -12,7 +12,7 @@ use crate::bytecode::Tier;
 use crate::interpreter::{Abrupt, Interp};
 use crate::realm_inline_guard_tests::{eval_string, in_realm, render, set_global, TIERS};
 use crate::value::ValueView;
-use crate::value::{Callable, Value};
+use crate::value::{ObjectKind, Value};
 use crate::Engine;
 use std::rc::Rc;
 
@@ -118,7 +118,7 @@ fn shared_method(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
         panic!("shared.{name} is a function");
     };
     let borrowed = function.borrow();
-    let Callable::User(user) = &borrowed.call else {
+    let ObjectKind::User(user) = &borrowed.kind else {
         panic!("shared.{name} is an ordinary function");
     };
     user.func.clone()
@@ -136,7 +136,7 @@ fn probe_function(it: &mut Interp, name: &str) -> Rc<crate::ast::Function> {
         panic!("probe.{name} is a function");
     };
     let borrowed = function.borrow();
-    let Callable::User(user) = &borrowed.call else {
+    let ObjectKind::User(user) = &borrowed.kind else {
         panic!("probe.{name} is an ordinary function");
     };
     user.func.clone()
@@ -151,7 +151,7 @@ fn global_user_callable(it: &mut Interp, name: &str) -> crate::value::UserFn {
         panic!("{name} is not an object")
     };
     let borrowed = object.borrow();
-    let Callable::User(user) = &borrowed.call else {
+    let ObjectKind::User(user) = &borrowed.kind else {
         panic!("{name} is not an ordinary function")
     };
     *user

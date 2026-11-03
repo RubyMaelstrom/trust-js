@@ -128,7 +128,7 @@ pub const IC_OFF_MID4_SHAPE: u32 = 28;
 
 pub const IC_EMPTY: u8 = u8::MAX;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
-/// is missing along the entire (all `Exotic::None`, all ic-plain) prototype chain. The chain's
+/// is missing along the entire (all `ObjectKind::ExoticNone`, all ic-plain) prototype chain. The chain's
 /// shapes sit in recv_shape/mid_shape/mid2_shape/mid3_shape/mid4_shape/holder_shape in walk
 /// order with the level count in `slot` (1-6); a hit re-walks the live chain and yields
 /// `undefined`. Shape-only proof is sound for absence: a shape pins the exact key set of a
@@ -139,7 +139,7 @@ pub const IC_ABSENT: u8 = 0xFC;
 /// inline (a 3-4 shape site — one dispatch loop over a class hierarchy — otherwise thrashes
 /// 2 ways and helper-calls forever).
 pub const PROP_IC_WAYS: usize = 4;
-/// Flag bit OR'd into `IcState::depth` when the HOLDER is an `Exotic::Array` (including a
+/// Flag bit OR'd into `IcState::depth` when the HOLDER is an `ObjectKind::Array` (including a
 /// depth-0 array receiver — `arr.length`, and `Array.prototype`, itself an Array exotic, as a
 /// method holder): array shapes don't pin named slots (element entries occupy slots without
 /// transitioning the shape), so a hit must re-check the entry's key. The JIT templates compare
@@ -416,8 +416,8 @@ mod binding_layout_cache_tests {
             .get("layoutReader")
             .unwrap()
             .value();
-        let function = match &function.as_obj().unwrap().borrow().call {
-            crate::value::Callable::User(user) => user.func.clone(),
+        let function = match &function.as_obj().unwrap().borrow().kind {
+            crate::value::ObjectKind::User(user) => user.func.clone(),
             _ => panic!("user function"),
         };
         let chunk = compile(&function).unwrap();
@@ -943,8 +943,8 @@ mod computed_read_cache_tests {
 /// handle word, its cell's address; a weak pin in [`Chunk::call_pins`] keeps that ADDRESS from
 /// ever being recycled, so a live `Value::Obj` whose payload equals `callee` proves it is the
 /// *same, still-alive* object — and therefore that everything recorded at fill time still
-/// holds: its `call` field is the same `Callable::User` (a live function's `call` is never
-/// reassigned; the one upgrade site only converts `Callable::None`), which pins the `Function`,
+/// holds: its `call` field is the same `ObjectKind::User` (a live function's `call` is never
+/// reassigned; the one upgrade site only converts `ObjectKind::CallNone`), which pins the `Function`,
 /// its env, its compiled chunk (`FunctionRuntime::code` is set once). Machine code is separately
 /// protected by the non-sentinel epoch and an owned lease acquired before reentrancy. A hit
 /// therefore skips the object borrow and dispatch checks. Rust dispatch leases the code;
@@ -9070,7 +9070,7 @@ fn plan_inlines_at(
                 skip!(idx, "dead callee")
             };
             let b = obj.borrow();
-            let crate::value::Callable::User(user) = &b.call else {
+            let crate::value::ObjectKind::User(user) = &b.kind else {
                 continue;
             };
             // A splice runs in the caller's Realm: its literals, intrinsics and global object
@@ -9926,7 +9926,7 @@ pub(crate) fn lazy_arguments_element(
     materialized: impl FnOnce(&Value),
 ) -> Result<Value, Abrupt> {
     let still_lazy = matches!(&(list).view(), ValueView::Obj(object)
-        if matches!(object.borrow().exotic, crate::value::Exotic::Array));
+        if matches!(object.borrow().kind, crate::value::ObjectKind::Array));
     if !still_lazy {
         // Already materialized by an earlier fallback: an ordinary arguments object.
         return get_computed_element(i, chunk, pc, list, key);
@@ -16618,8 +16618,8 @@ pub(crate) fn try_function_osr(
     };
     let construct = frame.construct;
     let callee = frame.callee();
-    let (function, closure) = match &callee.borrow().call {
-        crate::value::Callable::User(user) => (user.func.clone(), user.env),
+    let (function, closure) = match &callee.borrow().kind {
+        crate::value::ObjectKind::User(user) => (user.func.clone(), user.env),
         _ => return Ok(None),
     };
     let address = site as *const _ as usize;
@@ -21335,8 +21335,8 @@ impl Chunk {
     pub(crate) fn inline_target_env(&self, t: u32) -> Option<Env> {
         let object = self.inline_targets[t as usize].pin.upgrade()?;
         let object = object.borrow();
-        match &object.call {
-            crate::value::Callable::User(user) => Some(user.env),
+        match &object.kind {
+            crate::value::ObjectKind::User(user) => Some(user.env),
             _ => None,
         }
     }
@@ -21455,7 +21455,7 @@ impl Chunk {
         function: &Value,
     ) -> Option<(&CallSite, &CalleePins)> {
         let object = function.as_obj()?;
-        if !matches!(object.borrow().call, crate::value::Callable::User(_)) {
+        if !matches!(object.borrow().kind, crate::value::ObjectKind::User(_)) {
             return None;
         }
         let calls = {
@@ -21550,9 +21550,7 @@ impl Chunk {
                 return None;
             }
             let g = i.global.borrow();
-            if !matches!(g.exotic, crate::value::Exotic::None)
-                || g.props.shape() != (ic.binding >> 32) as u32
-            {
+            if !g.kind.exotic_is_none() || g.props.shape() != (ic.binding >> 32) as u32 {
                 return None;
             }
             let p = g.props.property_at(ic.binding as u32 as usize)?;
@@ -21831,9 +21829,7 @@ impl Chunk {
             return self.deep_name_ic_fill(i, env, n, c, store);
         }
         let g = i.global.borrow();
-        if !matches!(g.exotic, crate::value::Exotic::None)
-            || !crate::value::is_cacheable_shape(g.props.shape())
-        {
+        if !g.kind.exotic_is_none() || !crate::value::is_cacheable_shape(g.props.shape()) {
             return None;
         }
         let slot = g.props.slot_of(&self.names[n as usize])?;
@@ -22065,9 +22061,7 @@ impl Chunk {
         } else if ic.env == raw | 1 {
             if env.borrow().vars.matches_generation(ic.gen) {
                 let mut g = i.global.borrow_mut();
-                if matches!(g.exotic, crate::value::Exotic::None)
-                    && g.props.shape() == (ic.binding >> 32) as u32
-                {
+                if g.kind.exotic_is_none() && g.props.shape() == (ic.binding >> 32) as u32 {
                     if let Some((_, p)) = g.props.entry_at(ic.binding as u32 as usize) {
                         if !p.accessor() && p.writable() {
                             g.props.set_value_at(ic.binding as u32 as usize, value);
@@ -24320,8 +24314,8 @@ unsafe fn jit_reflect_apply_operand_only(
     };
     let nf = {
         let object = target_object.borrow();
-        match &object.call {
-            crate::value::Callable::Native(nf)
+        match &object.kind {
+            crate::value::ObjectKind::Native(nf)
                 if object.ic_plain.get() && i.native_call_in_current_realm(target_object) =>
             {
                 *nf
@@ -24462,7 +24456,7 @@ unsafe fn jit_call_hit_inner(
     let _ = (*sp.sub(argc + 1)).with_object(|callee| {
         let key = crate::value::Gc::as_ptr(callee) as usize;
         if key != ic.callee {
-            if let crate::value::Callable::User(user) = &callee.borrow().call {
+            if let crate::value::ObjectKind::User(user) = &callee.borrow().kind {
                 debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
                 ic.callee = key;
                 ic.env = Env::as_ptr(&user.env);
@@ -25607,7 +25601,7 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     Value::Obj(crate::value::Object::new_with_parts(
         Some(proto),
         crate::value::Props::with_layout(capacity, layout),
-        crate::value::Exotic::None,
+        crate::value::ObjectKind::Plain,
     ))
     .bits()
 }
@@ -26261,16 +26255,16 @@ unsafe fn jit_call_inner(
             if let ValueView::Obj(o) = &(callee).view() {
                 let nf = {
                     let object = o.borrow();
-                    match &object.call {
+                    match &object.kind {
                         // Callable proxies carry a Native sentinel. Never cache it as the
                         // implementation of [[Call]] or bypass apply/revocation checks.
-                        crate::value::Callable::Native(nf)
+                        crate::value::ObjectKind::Native(nf)
                             if object.ic_plain.get() && i.native_call_in_current_realm(o) =>
                         {
                             Some((*nf as usize, 0, Some(*nf)))
                         }
                         #[cfg(feature = "embed")]
-                        crate::value::Callable::ScopedNative(nf)
+                        crate::value::ObjectKind::ScopedNative(nf)
                             if object.ic_plain.get() && i.native_call_in_current_realm(o) =>
                         {
                             Some((*nf as usize, CALL_IC_SCOPED_NATIVE, None))
@@ -26778,8 +26772,8 @@ unsafe fn jit_callstat(
             let name = match &((*sp.sub(argc + 1)).clone()).view() {
                 ValueView::Obj(o) => {
                     let borrowed = o.borrow();
-                    match &borrowed.call {
-                        crate::value::Callable::NativeData(native) => native.identity.to_string(),
+                    match &borrowed.kind {
+                        crate::value::ObjectKind::NativeData(native) => native.identity.to_string(),
                         // Bare native functions predate the data-carrying host API. Their
                         // registration name remains the best available label, but unlike
                         // NativeData it is necessarily observable/mutable legacy metadata.
@@ -26912,9 +26906,9 @@ fn jit_method_operand_stat(obj: &Value, key: &Value) {
             let object = object.borrow();
             if !object.ic_plain.get() {
                 "exotic object"
-            } else if !matches!(object.call, crate::value::Callable::None) {
+            } else if object.kind.is_callable() {
                 "callable object"
-            } else if matches!(object.exotic, crate::value::Exotic::Array) {
+            } else if matches!(object.kind, crate::value::ObjectKind::Array) {
                 "array"
             } else {
                 "object"
@@ -27085,7 +27079,7 @@ fn name_call_error(
         return error;
     };
     let mut object = object.borrow_mut();
-    let unnamed = matches!(object.exotic, crate::value::Exotic::Error(_))
+    let unnamed = matches!(object.kind, crate::value::ObjectKind::Error(_))
         && matches!(
             (object.props.get("message").map(crate::value::Element::value)).map(|__value| (__value).view()),
             Some(ValueView::Str(message))

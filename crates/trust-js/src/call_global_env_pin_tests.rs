@@ -4,7 +4,7 @@
 
 use crate::bytecode::{CallIc, Op, Tier, CALL_IC_EPOCH, CALL_IC_WAYS};
 use crate::realm_inline_guard_tests::{eval_string, in_realm, set_global};
-use crate::value::Callable;
+use crate::value::ObjectKind;
 use crate::{Completion, Engine};
 use std::cell::Cell;
 use std::rc::Rc;
@@ -82,8 +82,8 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             .member_get(&main, "subject")
             .ok()
             .expect("shared caller callable");
-        let function = match &subject.as_obj().unwrap().borrow().call {
-            Callable::User(user) => user.func.clone(),
+        let function = match &subject.as_obj().unwrap().borrow().kind {
+            ObjectKind::User(user) => user.func.clone(),
             _ => panic!("shared caller function"),
         };
         (
@@ -179,7 +179,7 @@ fn expired_call_global_env_pin_fences_live_native_cache_before_identity_reuse() 
             .expect("child caller callable");
         let body_handle = child_subject.as_obj().unwrap();
         let body = body_handle.borrow();
-        let Callable::User(user) = &body.call else {
+        let ObjectKind::User(user) = &body.kind else {
             panic!("child caller");
         };
         assert!(

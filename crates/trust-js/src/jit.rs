@@ -626,14 +626,14 @@ fn record_native_op_src(
     let label: &str = match src {
         NativeLabelSrc::Call(call) => match call {
             // Immutable registration identity, independent of the mutable `name` property.
-            crate::value::Callable::NativeData(data) => &data.identity,
-            crate::value::Callable::Native(f) => tables
+            crate::value::ObjectKind::NativeData(data) => &data.identity,
+            crate::value::ObjectKind::Native(f) => tables
                 .names
                 .get(&(*f as usize))
                 .map(String::as_str)
                 .unwrap_or(NATIVE_OP_UNKNOWN),
             #[cfg(feature = "embed")]
-            crate::value::Callable::ScopedNative(f) => tables
+            crate::value::ObjectKind::ScopedNative(f) => tables
                 .names
                 .get(&(*f as usize))
                 .map(String::as_str)
@@ -708,7 +708,7 @@ fn relabel_native_name(tables: &mut NativeOpTables, addr: usize, label: String) 
 #[derive(Clone, Copy)]
 pub(crate) enum NativeLabelSrc<'a> {
     /// Ordinary dispatch: the dispatched callable is still borrowed by the caller.
-    Call(&'a crate::value::Callable),
+    Call(&'a crate::value::ObjectKind),
     /// Native-entry IC funnel: only the bare fn address is available in scope.
     Addr(usize),
 }
@@ -1519,7 +1519,7 @@ mod executable_code_budget_tests {
             );
             return;
         }
-        use crate::value::{Callable, Value};
+        use crate::value::{ObjectKind, Value};
         let mut engine = crate::Engine::new();
         engine.set_tier(crate::bytecode::Tier::Jit);
         engine.set_tier_threshold(0);
@@ -1541,8 +1541,8 @@ mod executable_code_budget_tests {
         let ValueView::Obj(object) = &(function).view() else {
             panic!("function object")
         };
-        let chunk = match &object.borrow().call {
-            Callable::User(user) => user
+        let chunk = match &object.borrow().kind {
+            ObjectKind::User(user) => user
                 .func
                 .runtime()
                 .code
@@ -2487,7 +2487,7 @@ mod native_op_tests {
         let mut t = tables();
         register_native_name(&mut t, probe_op as *const () as usize, "first");
         register_native_name(&mut t, probe_op as *const () as usize, "second");
-        let call = crate::value::Callable::Native(probe_op);
+        let call = crate::value::ObjectKind::Native(probe_op);
         record_native_op_src(&mut t, NativeLabelSrc::Call(&call), 5, true);
         let rendered = render_native_ops(&t);
         assert!(
@@ -2528,7 +2528,7 @@ mod native_op_tests {
             retained: None,
             identity: Rc::from("test.extension.op"),
         });
-        let call = crate::value::Callable::native_data(data);
+        let call = crate::value::ObjectKind::native_data(data);
         let mut t = tables();
         record_native_op_src(&mut t, NativeLabelSrc::Call(&call), 5, true);
         let rendered = render_native_ops(&t);
@@ -2793,6 +2793,24 @@ mod asm {
         B,
         /// B.cond/CBZ/CBNZ: imm19.
         Cb,
+        /// TBZ/TBNZ: imm14.
+        Tb,
+    }
+
+    impl PatchKind {
+        /// A conditional branch, which relaxation can widen into its inverse over a B.
+        fn conditional(self) -> bool {
+            !matches!(self, PatchKind::B)
+        }
+        /// Whether a branch of this kind reaches `delta` instructions.
+        fn fits(self, delta: i64) -> bool {
+            let bits = match self {
+                PatchKind::B => 26,
+                PatchKind::Cb => 19,
+                PatchKind::Tb => 14,
+            };
+            (-(1i64 << (bits - 1))..(1i64 << (bits - 1))).contains(&delta)
+        }
     }
 
     impl Asm {
@@ -3120,6 +3138,19 @@ mod asm {
         pub fn cbnz(&mut self, rt: u32, is64: bool, label: usize) {
             self.patches.push((self.buf.len(), label, PatchKind::Cb));
             self.emit(if is64 { 0xB500_0000 } else { 0x3500_0000 } | rt);
+        }
+        /// tbz reg, #bit, label: branch when bit `bit` (0-63) of `rt` is clear (patched imm14,
+        /// +-32 KiB; relaxation widens a farther one into TBNZ over a B).
+        pub fn tbz(&mut self, rt: u32, bit: u32, label: usize) {
+            debug_assert!(bit < 64);
+            self.patches.push((self.buf.len(), label, PatchKind::Tb));
+            self.emit(0x3600_0000 | ((bit >> 5) << 31) | ((bit & 31) << 19) | rt);
+        }
+        /// tbnz reg, #bit, label: branch when bit `bit` (0-63) of `rt` is set (see `tbz`).
+        pub fn tbnz(&mut self, rt: u32, bit: u32, label: usize) {
+            debug_assert!(bit < 64);
+            self.patches.push((self.buf.len(), label, PatchKind::Tb));
+            self.emit(0x3700_0000 | ((bit >> 5) << 31) | ((bit & 31) << 19) | rt);
         }
 
         /// ldrb wt, [xn, #imm] (unsigned byte offset; any offset, see `mem`)
@@ -3927,6 +3958,14 @@ mod asm {
                         let imm19 = ((delta as u32) & 0x7FFFF) << 5;
                         self.buf[at] |= imm19;
                     }
+                    PatchKind::Tb => {
+                        assert!(
+                            (-(1 << 13)..(1 << 13)).contains(&delta),
+                            "JIT imm14 branch out of range: {delta} instructions"
+                        );
+                        let imm14 = ((delta as u32) & 0x3FFF) << 5;
+                        self.buf[at] |= imm14;
+                    }
                 }
             }
             let offsets = exported
@@ -3952,10 +3991,9 @@ mod asm {
         /// functions. Prefix counts relocate branches and catch labels consistently (ECMA-262
         /// TryStatement Evaluation); the emitted imm19/imm26 encodings are unchanged.
         fn relax_branches(&mut self, exact_batches: usize) {
-            let fits = |delta: i64| (-(1 << 18)..(1 << 18)).contains(&delta);
             if !self.patches.iter().any(|&(at, label, kind)| {
-                matches!(kind, PatchKind::Cb)
-                    && !fits(self.labels[label].expect("unbound jit label") as i64 - at as i64)
+                kind.conditional()
+                    && !kind.fits(self.labels[label].expect("unbound jit label") as i64 - at as i64)
             }) {
                 return; // Ordinary functions need no extra allocation or code-buffer copy.
             }
@@ -3994,12 +4032,12 @@ mod asm {
             for _ in 0..exact_batches {
                 let mut changed = false;
                 for (k, &(at, label, kind)) in self.patches.iter().enumerate() {
-                    if wide[k] || !matches!(kind, PatchKind::Cb) {
+                    if wide[k] || !kind.conditional() {
                         continue;
                     }
                     let target = self.labels[label].expect("unbound jit label")
                         + prefix[cuts[label].expect("unbound jit label")];
-                    if !fits(target as i64 - (at + prefix[k]) as i64) {
+                    if !kind.fits(target as i64 - (at + prefix[k]) as i64) {
                         wide[k] = true;
                         changed = true;
                     }
@@ -4017,13 +4055,13 @@ mod asm {
                 // branches then provably fit for the actual subset, without more iterations.
                 // Only this rare fallback may choose a larger layout than the least fixed point.
                 for (k, &(_, _, kind)) in self.patches.iter().enumerate() {
-                    prefix[k + 1] = prefix[k] + usize::from(matches!(kind, PatchKind::Cb));
+                    prefix[k + 1] = prefix[k] + usize::from(kind.conditional());
                 }
                 for (k, &(at, label, kind)) in self.patches.iter().enumerate() {
-                    if !wide[k] && matches!(kind, PatchKind::Cb) {
+                    if !wide[k] && kind.conditional() {
                         let target = self.labels[label].expect("unbound jit label")
                             + prefix[cuts[label].expect("unbound jit label")];
-                        wide[k] = !fits(target as i64 - (at + prefix[k]) as i64);
+                        wide[k] = !kind.fits(target as i64 - (at + prefix[k]) as i64);
                     }
                 }
                 rebuild(&mut prefix, &wide);
@@ -4044,7 +4082,8 @@ mod asm {
                     code[*at] = if insn & 0xff00_0000 == 0x5400_0000 {
                         insn ^ 1 // B.cond: invert the low condition bit.
                     } else {
-                        insn ^ 0x0100_0000 // CBZ <-> CBNZ, preserving register and width.
+                        // CBZ <-> CBNZ and TBZ <-> TBNZ, preserving register, width and bit.
+                        insn ^ 0x0100_0000
                     } | (2 << 5); // The inverted branch skips the following B.
                     code.push(0x1400_0000);
                     *at += 1;
@@ -4563,6 +4602,7 @@ mod asm {
                 let delta = match kind {
                     super::PatchKind::B => ((word << 6) as i32 >> 6) as i64,
                     super::PatchKind::Cb => ((word << 8) as i32 >> 13) as i64,
+                    super::PatchKind::Tb => ((word << 13) as i32 >> 18) as i64,
                 };
                 assert_eq!(at as i64 + delta, labels[label].unwrap() as i64);
                 match (old_kind, kind) {
@@ -4580,6 +4620,13 @@ mod asm {
                     }
                     (super::PatchKind::Cb, super::PatchKind::Cb) => {
                         assert_eq!(word & !(0x7ffff << 5), insn);
+                    }
+                    (super::PatchKind::Tb, super::PatchKind::B) => {
+                        assert_eq!(result.0[at - 1], insn ^ 0x0100_0000 | (2 << 5));
+                        assert_eq!(word & 0xfc00_0000, 0x1400_0000);
+                    }
+                    (super::PatchKind::Tb, super::PatchKind::Tb) => {
+                        assert_eq!(word & !(0x3fff << 5), insn);
                     }
                     _ => panic!("unconditional branch was narrowed"),
                 }
@@ -4614,6 +4661,46 @@ mod asm {
                 let expected = reference_finish(a.clone(), &[start, middle, end]);
                 assert_eq!(checked_relaxation(a.clone(), 8), expected);
                 // Force the bounded conservative fallback as well as the ordinary fixed point.
+                checked_relaxation(a, 0);
+            }
+        }
+
+        #[test]
+        fn test_bit_branches_encode_and_widen_past_their_range() {
+            // In range: TBZ w3, #5 and TBNZ x9, #33 to labels 3 and -2 instructions away.
+            let mut a = super::Asm::new();
+            let back = a.new_label();
+            let ahead = a.new_label();
+            a.bind(back);
+            a.mov(0, 0);
+            a.tbz(3, 5, ahead);
+            a.tbnz(9, 33, back);
+            a.mov(0, 0);
+            a.bind(ahead);
+            a.ret();
+            let code = a.finish();
+            assert_eq!(code[1], 0x3600_0000 | (5 << 19) | (3 << 5) | 3);
+            assert_eq!(
+                code[2],
+                0x3700_0000 | (1 << 31) | (1 << 19) | (0x3ffe << 5) | 9
+            );
+            // Out of range both ways (imm14 reaches +-8191 instructions): each becomes its
+            // inverse over a B, and every label still resolves.
+            for backward in [false, true] {
+                let mut a = super::Asm::new();
+                let start = a.new_label();
+                let end = a.new_label();
+                a.bind(start);
+                if !backward {
+                    a.tbnz(4, 0, end);
+                }
+                a.buf.resize(9000, 0xaa00_03e0);
+                if backward {
+                    a.tbz(4, 7, start);
+                }
+                a.bind(end);
+                a.ret();
+                checked_relaxation(a.clone(), 8);
                 checked_relaxation(a, 0);
             }
         }
@@ -6266,7 +6353,7 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
         // enabled. In the old wide layout `meta` followed the full 16-byte Value.
         && layout.entry_accessor >= layout.entry_value + 8
         && layout.obj_from_cell < 4096
-        && layout.obj_exotic < 4096
+        && layout.obj_kind < 4096
         && layout.obj_ic_plain < 4096
         && sh.is_multiple_of(4)
         && sh / 4 < 4096
@@ -6313,100 +6400,80 @@ fn guard_prop_writable(a: &mut asm::Asm, reg: u32, base: u32, flags: u32, slow: 
     a.cbz(reg, false, slow);
 }
 
-/// Whether generated code admits a Map's or Set's `Exotic::Collection` wherever it
-/// admits an ordinary object: [`crate::value::Exotic::is_ordinary`] accepts it, and the
-/// interpreter's caches treat its named fields and elements as ordinary. Its tag must directly
-/// follow None's (`JitRepr::exotic_ordinary_contiguous`) for one range test to admit both;
-/// otherwise a Collection takes the checked path. Both backends' ordinary-object guards ask it.
-#[cfg(any(
-    test,
-    all(
-        any(target_arch = "aarch64", target_arch = "x86_64"),
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    )
-))]
-fn exotic_collection_admitted(layout: &crate::value::JitLayout) -> bool {
-    layout.repr.exotic_collection_tag.is_some() && layout.repr.exotic_ordinary_contiguous
-}
-
-/// Branch to `ok` when the exotic discriminant byte loaded in `reg` is one
-/// [`crate::value::Exotic::is_ordinary`] accepts; otherwise fall through. Without Collection
-/// admitted: `cmp reg, #none; b.eq ok`. With it ([`exotic_collection_admitted`]), one
-/// unsigned range test from None's tag: `sub scratch, reg, #none; cmp scratch, #1; b.ls ok`,
-/// which preserves `reg` unless `scratch` is `reg`. Clobbers NZCV and `scratch`.
+/// Branch to `ok` when the kind tag loaded in `reg` is one [`crate::value::ObjectKind::is_ordinary`]
+/// accepts (a plain object, a typed array's view, a callable, or a Map's or Set's data): one
+/// unsigned compare, `cmp reg, #KIND_ORDINARY_LAST; b.ls ok` (the kinds' tag order, W2d step 1).
+/// Typed arrays pass, as they passed the former exotic-None test: their clear `ic_plain` is what
+/// sends them to the checked path. `scratch` is unused (kept for the callers' register plans).
+/// Clobbers NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn branch_exotic_ordinary(
     a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
+    _layout: &crate::value::JitLayout,
     reg: u32,
-    scratch: u32,
+    _scratch: u32,
     ok: usize,
 ) {
-    let none_tag = layout.exotic_none_tag as u32;
-    if exotic_collection_admitted(layout) {
-        a.sub_imm(scratch, reg, none_tag);
-        a.cmp_imm_w(scratch, 1);
-        a.b_cond(C_LS, ok);
-    } else {
-        a.cmp_imm_w(reg, none_tag);
-        a.b_cond(C_EQ, ok);
-    }
+    a.cmp_imm_w(reg, crate::value::KIND_ORDINARY_LAST as u32);
+    a.b_cond(C_LS, ok);
 }
 
-/// Branch to `miss` unless the exotic discriminant byte loaded in `reg` is one
-/// [`crate::value::Exotic::is_ordinary`] accepts (see [`branch_exotic_ordinary`]):
-/// `cmp reg, #none; b.ne miss`, or with Collection admitted
-/// `sub scratch, reg, #none; cmp scratch, #1; b.hi miss`. `scratch` may be `reg` when the tag
-/// is dead afterwards. Clobbers NZCV and `scratch`.
+/// Branch to `miss` unless the kind tag loaded in `reg` is one
+/// [`crate::value::ObjectKind::is_ordinary`] accepts (see [`branch_exotic_ordinary`]):
+/// `cmp reg, #KIND_ORDINARY_LAST; b.hi miss`. `reg` is preserved; `scratch` is unused. Clobbers
+/// NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn guard_exotic_ordinary(
     a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
+    _layout: &crate::value::JitLayout,
     reg: u32,
-    scratch: u32,
+    _scratch: u32,
     miss: usize,
 ) {
-    let none_tag = layout.exotic_none_tag as u32;
-    if exotic_collection_admitted(layout) {
-        a.sub_imm(scratch, reg, none_tag);
-        a.cmp_imm_w(scratch, 1);
-        a.b_cond(C_HI, miss);
-    } else {
-        a.cmp_imm_w(reg, none_tag);
-        a.b_cond(C_NE, miss);
-    }
+    a.cmp_imm_w(reg, crate::value::KIND_ORDINARY_LAST as u32);
+    a.b_cond(C_HI, miss);
 }
 
-/// [`guard_exotic_ordinary`] that also admits `Exotic::Array` (the element templates and the
-/// key-checked Array holder): the ordinary test, then `cmp reg, #array; b.ne miss`, so
-/// `scratch` must differ from `reg`. Clobbers NZCV and `scratch`.
+/// Branch to `miss` unless the kind tag loaded in `reg` carries no exotic state (a plain object,
+/// a typed array's view or a callable, the former `Exotic::None`):
+/// `cmp reg, #KIND_EXOTIC_NONE_LAST; b.hi miss`. Clobbers NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn guard_exotic_none(a: &mut asm::Asm, reg: u32, miss: usize) {
+    a.cmp_imm_w(reg, crate::value::KIND_EXOTIC_NONE_LAST as u32);
+    a.b_cond(C_HI, miss);
+}
+
+/// [`guard_exotic_ordinary`] that also admits `ObjectKind::Array` (the element templates and the
+/// key-checked Array holder): the Array's tag directly follows the ordinary kinds', so this is
+/// one unsigned compare too, `cmp reg, #KIND_ARRAY_TAG; b.hi miss`. `reg` is preserved; `scratch`
+/// is unused. Clobbers NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn guard_exotic_ordinary_or_array(
     a: &mut asm::Asm,
-    layout: &crate::value::JitLayout,
+    _layout: &crate::value::JitLayout,
     reg: u32,
-    scratch: u32,
+    _scratch: u32,
     miss: usize,
 ) {
-    debug_assert_ne!(reg, scratch, "the Array compare reads the tag");
-    let ok = a.new_label();
-    branch_exotic_ordinary(a, layout, reg, scratch, ok);
-    a.cmp_imm_w(reg, layout.exotic_array_tag as u32);
-    a.b_cond(C_NE, miss);
-    a.bind(ok);
+    const _: () = assert!(crate::value::KIND_ARRAY_TAG == crate::value::KIND_ORDINARY_LAST + 1);
+    a.cmp_imm_w(reg, crate::value::KIND_ARRAY_TAG as u32);
+    a.b_cond(C_HI, miss);
 }
 
-/// Branch to `miss` unless the exotic discriminant byte already loaded in `reg` is ordinary
-/// (`Exotic::None`, or a Collection: see [`branch_exotic_ordinary`]) or an
+/// Branch to `miss` unless the kind tag already loaded in `reg` is ordinary
+/// ([`crate::value::ObjectKind::is_ordinary`]: see [`branch_exotic_ordinary`]) or an
 /// admitted primitive-wrapper tag. Wrapper tags are admitted only at sites whose compile-time
 /// name passed the wrapper name gates (not `length`/`description`, not digit-leading): StrWrap
 /// answers those names outside its entries, Num/Bool wrappers answer none. Shape, `ic_plain`,
@@ -6496,7 +6563,7 @@ enum PropRecv {
 ))]
 #[derive(Clone, Copy)]
 struct PropProbeFlags {
-    /// An `Exotic::Array` receiver may shape-validate (the site's name is not an element key).
+    /// An `ObjectKind::Array` receiver may shape-validate (the site's name is not an element key).
     arr_ok: bool,
     /// A primitive read in a non-consuming form probes the active realm's wrapper
     /// prototype (and Str/Num/Bool wrapper receivers, mids and holders pass).
@@ -6537,7 +6604,7 @@ fn emit_prop_way_probe(
         kc,
     } = flags;
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let plain = layout.obj_ic_plain as u32;
@@ -6834,15 +6901,15 @@ fn emit_prop_load_inline(
     pc: u32,
     l_unwind: usize,
     method: bool,
-    // Whether an `Exotic::Array` receiver may shape-validate: true when the site's (compile-time)
+    // Whether an `ObjectKind::Array` receiver may shape-validate: true when the site's (compile-time)
     // name cannot be an element key — element inserts don't transition an array's shape, but
     // element keys are all canonical indices, so a name that doesn't start with a digit cannot
-    // collide with one. Prototype hops stay `Exotic::None`-only.
+    // collide with one. Prototype hops stay `ObjectKind::ExoticNone`-only.
     arr_ok: bool,
     recv: PropRecv,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let ev = layout.entry_value as i32;
@@ -7862,7 +7929,7 @@ fn emit_method_elem_dense(
     done: usize,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let plain = layout.obj_ic_plain as u32;
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_tag_guard(a, 10, crate::value::PACK_OBJ, 11, slow);
@@ -7920,7 +7987,7 @@ fn emit_computed_method_inline(
     let receiver = a.new_label();
     let string_key = a.new_label();
     let shape = (layout.obj_props + layout.props_shape) as u32;
-    let exotic = layout.obj_exotic as u32;
+    let exotic = layout.obj_kind as u32;
     let plain = layout.obj_ic_plain as u32;
     let object_data = layout.obj_from_cell as u32;
     if get_elem_inlinable(layout) {
@@ -8640,7 +8707,7 @@ fn emit_is_array_template(
     a.lsr_imm(16, 11, 48);
     a.cbnz(16, true, not_array);
     a.add_imm(11, 11, layout.obj_from_cell as u32);
-    a.ldrb_imm(14, 11, layout.obj_exotic as u32);
+    a.ldrb_imm(14, 11, layout.obj_kind as u32);
     a.cmp_imm_w(14, layout.exotic_array_tag as u32);
     a.b_cond(C_EQ, array);
     a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
@@ -9433,7 +9500,7 @@ fn emit_call_secondary_probes(
 /// function. ECMA-262 OrdinaryFunctionCreate gives every evaluation of a function expression a
 /// new object with its own [[Environment]] and [[Realm]], but all of them run the same code, so
 /// a way filled for one closure serves the others once the live callee is proven to be an
-/// ordinary user closure (`Callable::User`, `ic_plain`) of the way's function (`CallIc::func`,
+/// ordinary user closure (`ObjectKind::User`, `ic_plain`) of the way's function (`CallIc::func`,
 /// which the site pins against address reuse — see `CallSite`), in the way's Realm and the
 /// fill-time epoch/active Realm, and not under a `with` (see `Interp::call_jit_fast`). Class
 /// constructors never match: every closure of a class constructor's function is a class
@@ -9456,7 +9523,7 @@ fn emit_call_code_probe(
     miss: usize,
 ) {
     use std::mem::offset_of;
-    let call_tag = layout.obj_from_cell + layout.obj_call;
+    let call_tag = layout.obj_from_cell + layout.obj_kind;
     let call_payload = call_tag + 8;
     let ic_plain = layout.obj_from_cell + layout.obj_ic_plain;
     let ic_func = offset_of!(crate::bytecode::CallIc, func);
@@ -9518,7 +9585,7 @@ fn emit_call_code_probe(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn call_code_probe_supported(layout: &crate::value::JitLayout) -> bool {
-    let call_tag = layout.obj_from_cell + layout.obj_call;
+    let call_tag = layout.obj_from_cell + layout.obj_kind;
     let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
     layout.valid
         && layout.call_probe_valid
@@ -9547,7 +9614,7 @@ fn emit_call_code_way(a: &mut asm::Asm, layout: &crate::value::JitLayout, way: u
     use std::mem::offset_of;
     debug_assert!(call_code_probe_supported(layout));
     debug_assert!(![7, 9, 11, 16].contains(&way));
-    let call_tag = layout.obj_from_cell + layout.obj_call;
+    let call_tag = layout.obj_from_cell + layout.obj_kind;
     a.ldrb_imm(9, 10, call_tag as u32);
     a.cmp_imm_w(9, crate::value::CALLABLE_USER_TAG as u32);
     a.b_cond(C_NE, miss);
@@ -9853,7 +9920,7 @@ fn emit_direct_sequence(
     // A construct site's single entry is keyed by identity alone.
     let call_env_from_callee = !construct
         && layout.call_probe_valid
-        && fits8(layout.obj_from_cell + layout.obj_call + 8)
+        && fits8(layout.obj_from_cell + layout.obj_kind + 8)
         && fits8(layout.user_env);
 
     // ---- checks (entry state: x12 = ic0 ptr, x10 = callee cell address; NO mutations) ----
@@ -9955,7 +10022,7 @@ fn emit_direct_sequence(
         a.ldur(13, 12, IC_ENV);
         a.b(env_done);
         a.bind(code_env);
-        a.ldr_imm(13, 10, (layout.obj_from_cell + layout.obj_call + 8) as u32);
+        a.ldr_imm(13, 10, (layout.obj_from_cell + layout.obj_kind + 8) as u32);
         a.ldr_imm(13, 13, layout.user_env as u32);
         a.bind(env_done);
     } else {
@@ -11158,7 +11225,7 @@ fn emit_update_prop_inline(
 ) {
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT};
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
@@ -11262,7 +11329,7 @@ fn emit_update_elem_inline(
     l_unwind: usize,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
@@ -11537,7 +11604,7 @@ fn instanceof_inlinable(
         && layout.obj_from_cell < 4096
         && layout.obj_proto.is_multiple_of(8)
         && layout.obj_proto / 8 < 4096
-        && layout.obj_exotic < 4096
+        && layout.obj_kind < 4096
         && layout.obj_ic_plain < 4096
         && layout.obj_is_constructor < 4096
         && sh.is_multiple_of(4)
@@ -11601,9 +11668,8 @@ fn emit_instanceof_inline(
 
     // RHS: ordinary/plain constructor, canonical Function.prototype, and cached shape.
     a.add_imm(12, 11, layout.obj_from_cell as u32);
-    a.ldrb_imm(9, 12, layout.obj_exotic as u32);
-    a.cmp_imm_w(9, layout.exotic_none_tag as u32);
-    a.b_cond(C_NE, slow);
+    a.ldrb_imm(9, 12, layout.obj_kind as u32);
+    guard_exotic_none(a, 9, slow);
     a.ldrb_imm(9, 12, layout.obj_ic_plain as u32);
     a.cbz(9, false, slow);
     a.ldrb_imm(9, 12, layout.obj_is_constructor as u32);
@@ -11852,7 +11918,7 @@ fn emit_set_prop_inline(
         return;
     }
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let ev = layout.entry_value as i32;
     let ea = layout.entry_accessor as u32;
@@ -13371,8 +13437,16 @@ impl SharedStub {
             SharedStub::TypedElement { write } => {
                 let hit = a.new_label();
                 let miss = a.new_label();
+                // W12 = the Object's kind tag (see `typed_array::emit`).
                 match layout.native_typed_array {
-                    Some(native) => typed_array::emit_access(a, &native, write, hit, miss),
+                    Some(native) => typed_array::emit_access(
+                        a,
+                        &native,
+                        write,
+                        hit,
+                        miss,
+                        typed_array::KindTag::InW12,
+                    ),
                     None => a.b(miss),
                 }
                 a.bind(hit);
@@ -13993,12 +14067,11 @@ fn emit_name_ic_value_ptr_in(
         NAME_IC_OFF_LAYOUT,
     };
     let sg = layout.scope_gen as u32;
-    let g_ex = layout.obj_exotic as u32;
+    let g_ex = layout.obj_kind as u32;
     let g_sh = (layout.obj_props + layout.props_shape) as u32;
     let g_ea = layout.entry_accessor as u32;
     let g_ev = layout.entry_value as u32;
     let g_es = layout.entry_size as u64;
-    let none_tag = layout.exotic_none_tag as u32;
 
     if env == NameEnv::Running {
         a.ldr_imm(9, 19, 40); // ctx.env_raw
@@ -14044,8 +14117,7 @@ fn emit_name_ic_value_ptr_in(
     }
     a.ldr_imm(14, 19, 56); // the realm's global Object
     a.ldrb_imm(15, 14, g_ex);
-    a.cmp_imm_w(15, none_tag);
-    a.b_cond(C_NE, slow);
+    guard_exotic_none(a, 15, slow);
     a.ldrb_imm(15, 14, layout.obj_ic_plain as u32); // not side-table masked
     a.cbz(15, false, slow);
     a.ldr_w_imm(15, 14, g_sh); // live shape vs cached (packed high half)
@@ -14384,7 +14456,7 @@ fn emit_get_elem_inline_marked(
     l_unwind: usize,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -14405,13 +14477,13 @@ fn emit_get_elem_inline_marked(
     // 3. x10 = the receiver's payload
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_payload(a, 10, 10);
-    // 4. object base; exotic must be ordinary (None, or a Map/Set) or Array, and plain
-    //    (no side-table behavior)
+    // 4. object base; the kind must be ordinary or Array, and plain (no side-table behavior);
+    //    a typed array's view is read with its tag still in w12
     a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
-    a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, typed);
+    a.ldrb_imm(13, 11, plain);
+    a.cbz(13, false, typed);
     // 5. element words: a plain element's value in one indexed load, with no index string or
     // entry-table chase (x9's upper bits are zero from the w-form fcvtzu); a hole is absent and
     // consults the prototype chain.
@@ -14423,7 +14495,7 @@ fn emit_get_elem_inline_marked(
     a.sub_imm(20, 20, 8);
     a.b(done);
     a.bind(typed);
-    typed_array::emit(a, layout, None, hit, slow);
+    typed_array::emit(a, layout, None, hit, slow, typed_array::KindTag::InW12);
     a.bind(slow);
     emit_op_helper(a, H_GET_ELEM, pc, l_unwind);
     a.bind(done);
@@ -14463,7 +14535,7 @@ fn emit_set_elem_inline_marked(
     keep: bool,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
 
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
@@ -14481,12 +14553,13 @@ fn emit_set_elem_inline_marked(
     // 3. x10 = the receiver's payload
     emit_exec_word_load(a, 10, 20, -24);
     emit_exec_payload(a, 10, 10);
-    // 4. object base; exotic ordinary (None, or a Map/Set) or Array, and plain
+    // 4. object base; the kind ordinary or Array, and plain (a typed array's view is read with
+    //    its tag still in w12)
     a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
-    a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, typed);
+    a.ldrb_imm(13, 11, plain);
+    a.cbz(13, false, typed);
     // 5. element words: any value over an existing element, into a hole, or appended
     emit_word_store(a, layout, slow, done, true, keep);
     a.bind(typed);
@@ -14497,6 +14570,7 @@ fn emit_set_elem_inline_marked(
         Some(typed_array::WriteValue::Stack),
         typed_hit,
         slow,
+        typed_array::KindTag::InW12,
     );
     a.bind(typed_hit);
     if keep {
@@ -14753,7 +14827,7 @@ fn emit_word_create(
     let no_card = a.new_label();
     // 1. An extensible Array that is no marked prototype, with no index among its named
     //    entries.
-    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+    a.ldrb_imm(12, 11, layout.obj_kind as u32);
     a.cmp_imm_w(12, layout.exotic_array_tag as u32);
     a.b_cond(C_NE, slow);
     a.ldrb_imm(12, 11, layout.obj_extensible as u32);
@@ -14914,7 +14988,7 @@ fn emit_in_keyed(
     let stack_receiver = receiver_slot.is_none();
     debug_assert!(stack_receiver == matches!(key, KeySrc::Stack));
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let plain = layout.obj_ic_plain as u32;
     let slow = a.new_label();
     let done = a.new_label();
@@ -15060,7 +15134,7 @@ fn emit_define_elem_inline(
     emit_exec_payload(a, 10, 10);
     // 3. An extensible, plain Array (x11 = Object) ...
     a.add_imm(11, 10, layout.obj_from_cell as u32);
-    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+    a.ldrb_imm(12, 11, layout.obj_kind as u32);
     a.cmp_imm_w(12, layout.exotic_array_tag as u32);
     a.b_cond(C_NE, slow);
     a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
@@ -15251,7 +15325,7 @@ fn emit_elem_local_keyed(
     #[cfg(not(test))]
     let _ = fast_event;
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let get = kind == ElemLocalKind::Get;
     debug_assert!(get || key == KeySrc::Stack);
     debug_assert!(
@@ -15294,12 +15368,13 @@ fn emit_elem_local_keyed(
     // 3. the receiver's cell address straight from the slot (nothing is counted or dropped)
     emit_exec_word_load(a, 10, 22, slot_off as i32);
     emit_exec_payload(a, 10, 10);
-    // 4. object base; exotic ordinary (None, or a Map/Set) or Array, and plain
+    // 4. object base; the kind ordinary or Array, and plain (a typed array's view is read with
+    //    its tag still in w12)
     a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
-    a.ldrb_imm(12, 11, plain);
-    a.cbz(12, false, typed);
+    a.ldrb_imm(13, 11, plain);
+    a.cbz(13, false, typed);
     // 5. element words: a read copies a plain element's value; a store writes any value over
     // an existing element, into a hole, or appended ([`emit_word_store`]).
     if get {
@@ -15330,7 +15405,7 @@ fn emit_elem_local_keyed(
     }
     a.bind(typed);
     if get {
-        typed_array::emit(a, layout, None, hit, slow);
+        typed_array::emit(a, layout, None, hit, slow, typed_array::KindTag::InW12);
     } else {
         let typed_hit = a.new_label();
         typed_array::emit(
@@ -15339,6 +15414,7 @@ fn emit_elem_local_keyed(
             Some(typed_array::WriteValue::Stack),
             typed_hit,
             slow,
+            typed_array::KindTag::InW12,
         );
         a.bind(typed_hit);
         if kind == ElemLocalKind::SetKeep {
@@ -15388,7 +15464,7 @@ fn emit_local_own_dense_data_guard(
     slow: usize,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let plain = layout.obj_ic_plain as u32;
 
     // In source order the key local is loaded before the receiver local. Merely probing
@@ -16233,7 +16309,7 @@ fn emit_chain_marked(
     l_unwind: usize,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let pr = layout.obj_proto as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
     let ev = layout.entry_value as i32;
@@ -16483,8 +16559,10 @@ fn emit_chain_marked(
                         a.add_imm(11, 10, obj_off);
                         a.ldrb_imm(12, 11, ex);
                         guard_exotic_ordinary_or_array(a, layout, 12, 13, guard!());
-                        a.ldrb_imm(12, 11, plain); // no side-table behavior
-                        a.cbz(12, false, typed);
+                        // No side-table behavior; a typed array's view is read with its tag
+                        // still in w12.
+                        a.ldrb_imm(13, 11, plain);
+                        a.cbz(13, false, typed);
                         if let Some(base) = rfree.pop() {
                             a.mov(base, 11);
                             rcache.push(RcEnt { off: xoff, base });
@@ -16532,6 +16610,9 @@ fn emit_chain_marked(
                     if let Some(entry) = rcache.iter().find(|entry| entry.off == xoff) {
                         a.mov(entry.base, 11);
                     }
+                } else {
+                    // A cached receiver's kind was checked by its first access, not here.
+                    a.ldrb_imm(12, 11, ex);
                 }
                 typed_array::emit(
                     a,
@@ -16539,6 +16620,7 @@ fn emit_chain_marked(
                     is_set.then_some(typed_array::WriteValue::Register(dv)),
                     typed_hit,
                     guard!(),
+                    typed_array::KindTag::InW12,
                 );
                 a.bind(typed_hit);
                 if !is_set {
@@ -18117,7 +18199,7 @@ fn emit_region_own_entry(
     fail: usize,
 ) {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let plain = layout.obj_ic_plain as u32;
     let shape = (layout.obj_props + layout.props_shape) as u32;
     a.add_imm(body_reg, rc_reg, obj_off);
@@ -18247,7 +18329,7 @@ fn emit_loop_chain(
     targeted: &mut [bool],
 ) -> usize {
     let obj_off = layout.obj_from_cell as u32;
-    let ex = layout.obj_exotic as u32;
+    let ex = layout.obj_kind as u32;
     let plain = layout.obj_ic_plain as u32;
     let words_off = (layout.obj_props + layout.props_words) as u32;
 

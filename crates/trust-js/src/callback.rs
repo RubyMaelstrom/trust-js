@@ -173,7 +173,7 @@ impl CallbackCache {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::value::Callable;
+    use crate::value::ObjectKind;
     use crate::value::ValueView;
     use crate::{Completion, Engine};
 
@@ -580,7 +580,7 @@ mod tests {
         }
         let object_handle = entry.callee.as_obj().unwrap();
         let object = object_handle.borrow();
-        let Callable::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.kind else {
             panic!("user")
         };
         let runtime = user.func.runtime();
@@ -621,7 +621,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("laterHot"));
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let Callable::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.kind else {
             panic!("user")
         };
         let runtime = user.func.runtime();
@@ -663,7 +663,7 @@ mod tests {
             .unwrap_or_else(|_| panic!("arrowHot"));
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let Callable::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.kind else {
             panic!("user")
         };
         let runtime = user.func.runtime();
@@ -688,7 +688,7 @@ mod tests {
 mod entry_root_tests {
     use super::*;
     use crate::gc_core::MarkSource;
-    use crate::value::{Callable, Gc};
+    use crate::value::{Gc, ObjectKind};
     use crate::{Completion, Engine};
 
     fn check(warm_cache: bool) {
@@ -736,7 +736,7 @@ mod entry_root_tests {
             .unwrap_or_else(|_| panic!("compiled callback"));
         let object = callee.as_obj().unwrap();
         let body = object.borrow();
-        let Callable::User(user) = &body.call else {
+        let ObjectKind::User(user) = &body.kind else {
             panic!("user callback");
         };
         let chunk = user

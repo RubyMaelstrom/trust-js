@@ -58,9 +58,9 @@ struct Family {
 /// Add one object's element storage to its family; an ordinary object without index keys or
 /// element storage is not counted.
 fn record(families: &mut [Family; 3], object: &Object) {
-    let family = match object.exotic {
-        Exotic::Array => 0,
-        Exotic::Arguments(_) => 1,
+    let family = match object.kind {
+        ObjectKind::Array => 0,
+        ObjectKind::Arguments(_) => 1,
         _ => 2,
     };
     let p = &object.props;

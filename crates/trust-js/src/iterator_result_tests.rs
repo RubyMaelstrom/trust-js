@@ -258,7 +258,7 @@ fn iterator_results_private_target_is_traced_and_collectable() {
         let iterator = global(&mut engine, "iterator");
         let object_handle = iterator.as_obj().unwrap();
         let object = object_handle.borrow();
-        let crate::value::Exotic::ArrayIterator(state) = &object.exotic else {
+        let crate::value::ObjectKind::ArrayIterator(state) = &object.kind else {
             panic!("private iterator slots")
         };
         crate::value::Gc::downgrade(&state.target.as_obj().unwrap())

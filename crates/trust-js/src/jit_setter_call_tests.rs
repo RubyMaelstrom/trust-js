@@ -403,7 +403,7 @@ fn function_of(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::ast::Funct
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
     let object = value.as_obj().expect("a function object");
     let object = object.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("{name} is not a user function")
     };
     user.func.clone()

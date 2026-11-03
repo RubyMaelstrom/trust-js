@@ -1456,7 +1456,7 @@ fn emit_borrowed_own_read(
             a.b_cond(C_NE, fail);
         }
     } else {
-        a.ldrb_imm(14, 11, layout.obj_exotic as u32);
+        a.ldrb_imm(14, 11, layout.obj_kind as u32);
         guard_exotic_ordinary(a, layout, 14, 14, fail);
         a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
         a.cbz(14, false, fail);
@@ -1545,7 +1545,7 @@ fn emit_borrowed_method(
             a.cbz(17, true, fail);
             a.add_imm(11, 17, layout.obj_from_cell as u32);
         }
-        a.ldrb_imm(14, 11, layout.obj_exotic as u32);
+        a.ldrb_imm(14, 11, layout.obj_kind as u32);
         guard_exotic_ordinary(a, layout, 14, 14, fail);
         a.ldrb_imm(14, 11, layout.obj_ic_plain as u32);
         a.cbz(14, false, fail);
@@ -2011,10 +2011,10 @@ pub(super) fn emit_name_element_body(
     a.ldur(12, 14, 0);
     emit_exec_tag_guard(a, 12, crate::value::PACK_OBJ, 13, value_miss);
     emit_exec_payload(a, 12, 10);
-    // An ordinary Object that is not exotic (a typed array is neither Array nor plain).
+    // A typed array: its kind's tag, and side-table behavior (no `ic_plain`).
     a.add_imm(11, 10, layout.obj_from_cell as u32);
-    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
-    a.cmp_imm_w(12, layout.exotic_none_tag as u32);
+    a.ldrb_imm(12, 11, layout.obj_kind as u32);
+    a.cmp_imm_w(12, crate::value::KIND_TYPED_ARRAY_TAG as u32);
     a.b_cond(C_NE, value_miss);
     a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
     a.cbnz(12, false, value_miss);
@@ -2033,10 +2033,24 @@ pub(super) fn emit_name_element_body(
     }
     // The value (d1) is in place: the access reads it as a register operand.
     match layout.native_typed_array {
-        Some(native) if leaf => typed_array::emit_access(a, &native, write, committed, name_miss),
+        Some(native) if leaf => typed_array::emit_access(
+            a,
+            &native,
+            write,
+            committed,
+            name_miss,
+            typed_array::KindTag::Checked,
+        ),
         _ => {
             let value = write.then_some(typed_array::WriteValue::Register(1));
-            typed_array::emit(a, layout, value, committed, name_miss);
+            typed_array::emit(
+                a,
+                layout,
+                value,
+                committed,
+                name_miss,
+                typed_array::KindTag::Checked,
+            );
         }
     }
     #[cfg(test)]
@@ -3258,16 +3272,17 @@ pub(super) fn emit(
                     a.ucvtf_d_w(1, 9);
                     a.fcmp(key, 1);
                     a.b_cond(C_NE, bailout);
-                    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+                    a.ldrb_imm(12, 11, layout.obj_kind as u32);
                     guard_exotic_ordinary_or_array(a, layout, 12, 13, bailout);
                     let typed = a.new_label();
                     let read = a.new_label();
-                    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
-                    a.cbz(12, false, typed);
+                    // A typed array's view is read with its tag still in w12.
+                    a.ldrb_imm(13, 11, layout.obj_ic_plain as u32);
+                    a.cbz(13, false, typed);
                     emit_word_read(a, layout, 11, 9, 12, bailout);
                     a.b(read);
                     a.bind(typed);
-                    typed_array::emit(a, layout, None, read, bailout);
+                    typed_array::emit(a, layout, None, read, bailout, typed_array::KindTag::InW12);
                     a.bind(read);
                     // The key's register holds the key until the read is known to be a Number.
                     emit_exec_number_guard(a, 12, 0, 13, bailout);
@@ -3305,12 +3320,13 @@ pub(super) fn emit(
                     a.ucvtf_d_w(1, 9);
                     a.fcmp(key, 1);
                     a.b_cond(C_NE, bailout);
-                    a.ldrb_imm(12, 11, layout.obj_exotic as u32);
+                    a.ldrb_imm(12, 11, layout.obj_kind as u32);
                     guard_exotic_ordinary_or_array(a, layout, 12, 13, bailout);
                     let typed = a.new_label();
                     let stored = a.new_label();
-                    a.ldrb_imm(12, 11, layout.obj_ic_plain as u32);
-                    a.cbz(12, false, typed);
+                    // A typed array's view is read with its tag still in w12.
+                    a.ldrb_imm(13, 11, layout.obj_ic_plain as u32);
+                    a.cbz(13, false, typed);
                     emit_words_base(a, layout, 11, 15, 14);
                     a.cmp_reg_x(9, 14);
                     a.b_cond(C_HS, bailout);
@@ -3336,6 +3352,7 @@ pub(super) fn emit(
                         Some(typed_array::WriteValue::Register(1)),
                         stored,
                         bailout,
+                        typed_array::KindTag::InW12,
                     );
                     a.bind(stored);
                     stack.pop();

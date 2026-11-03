@@ -209,7 +209,7 @@ fn string_concat_helpers_reach_compiled_tiers() {
                 panic!("{name} is not an object");
             };
             let object = object.borrow();
-            let crate::value::Callable::User(user) = &object.call else {
+            let crate::value::ObjectKind::User(user) = &object.kind else {
                 panic!("{name} is not a user function");
             };
             let runtime = user.func.runtime();

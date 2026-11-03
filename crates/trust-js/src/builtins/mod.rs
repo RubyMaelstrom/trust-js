@@ -206,9 +206,7 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
     // Overwriting an existing own writable data property (the shape of every hot builtin write,
     // e.g. a RegExp's `lastIndex` after each exec) needs none of the [[Set]] machinery.
     if let ValueView::Obj(o) = &(base).view() {
-        if matches!(o.borrow().exotic, crate::value::Exotic::None)
-            && i.ordinary_get_ptr(Gc::as_ptr(o) as usize)
-        {
+        if o.borrow().kind.exotic_is_none() && i.ordinary_get_ptr(Gc::as_ptr(o) as usize) {
             let mut b = o.borrow_mut();
             if b.props
                 .get(key)
@@ -863,8 +861,8 @@ pub(crate) fn ta_accessor_of(getter: &Value) -> Option<TaAccessor> {
     let ValueView::Obj(getter) = &(getter).view() else {
         return None;
     };
-    let f = match getter.borrow().call {
-        Callable::Native(f) => f,
+    let f = match getter.borrow().kind {
+        ObjectKind::Native(f) => f,
         _ => return None,
     };
     ta_accessor_getters()
@@ -942,7 +940,7 @@ pub(crate) fn object_get_own_property(
     {
         let body = o.borrow();
         if body.ic_plain.get()
-            && (body.exotic.is_ordinary() || matches!(body.exotic, Exotic::Array))
+            && (body.kind.is_ordinary() || matches!(body.kind, ObjectKind::Array))
         {
             return Ok(body.props.get(key).map(crate::value::Element::to_property));
         }
@@ -1400,7 +1398,7 @@ fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
         }
         return json_is_array(i, &target);
     }
-    Ok(matches!(&(v).view(), ValueView::Obj(o) if matches!(o.borrow().exotic, Exotic::Array)))
+    Ok(matches!(&(v).view(), ValueView::Obj(o) if matches!(o.borrow().kind, ObjectKind::Array)))
 }
 
 /// EnumerableOwnProperties for Object.values/entries: for each own string key (in order), do
@@ -1416,8 +1414,8 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
     {
         let object = object.borrow();
         if object.ic_plain.get()
-            && matches!(object.exotic, Exotic::None)
-            && matches!(object.call, Callable::None)
+            && object.kind.exotic_is_none()
+            && !object.kind.is_callable()
             && object.props.named_data_keys().is_some()
         {
             #[cfg(test)]
@@ -1678,8 +1676,8 @@ pub(crate) fn declare_light(target: &Gc, names: &[&str], class: u8) {
 
 /// Declare the native function object `function` of `class` (see [`declare_light`]).
 pub(crate) fn declare_light_function(function: &Gc, class: u8) {
-    let native = match &function.borrow().call {
-        Callable::Native(f) => Some(*f),
+    let native = match &function.borrow().kind {
+        ObjectKind::Native(f) => Some(*f),
         _ => None,
     };
     let Some(f) = native else {
@@ -1877,7 +1875,10 @@ pub(crate) fn reflect_define_on_receiver(
     // OrdinarySetWithOwnDescriptor calls the receiver's [[DefineOwnProperty]], not [[Set]].
     // Re-running [[Set]] here would invoke its own/inherited setter instead of defining a
     // data property, and would repeat the prototype search on the wrong object.
-    if matches!(ro.borrow().exotic, Exotic::Array | Exotic::Arguments(_)) {
+    if matches!(
+        ro.borrow().kind,
+        ObjectKind::Array | ObjectKind::Arguments(_)
+    ) {
         let mut descriptor = PartialDesc {
             value: Some(value),
             ..PartialDesc::default()
@@ -2193,7 +2194,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         let plain = {
             let body = object.borrow();
             body.ic_plain.get()
-                && (matches!(body.exotic, crate::value::Exotic::Array) || body.exotic.is_ordinary())
+                && (matches!(body.kind, crate::value::ObjectKind::Array) || body.kind.is_ordinary())
         };
         if plain {
             object.borrow_mut().props.seal_elements(freeze);
@@ -2445,8 +2446,8 @@ fn ctor_realm_proto(i: &mut Interp, nt: &Value, default_proto: &str) -> Result<O
                 _ => return Ok(None),
             }
         }
-        let bound = match &ntobj.borrow().call {
-            Callable::Bound(bound) => Some(bound.target),
+        let bound = match &ntobj.borrow().kind {
+            ObjectKind::Bound(bound) => Some(bound.target),
             _ => None,
         };
         match bound {
@@ -2631,7 +2632,7 @@ fn regexp_array(
     Value::Obj(Object::new_with_parts(
         Some(i.array_proto),
         props,
-        Exotic::Array,
+        ObjectKind::Array,
     ))
 }
 
@@ -2739,7 +2740,7 @@ fn regexp_builtin_exec(
                         Props::packed_array(
                             [Value::Num(a as f64), Value::Num(b as f64)].into_iter(),
                         ),
-                        Exotic::Array,
+                        ObjectKind::Array,
                     )),
                     None => Value::Undefined,
                 };
@@ -2968,7 +2969,7 @@ pub(crate) fn vm_discard_call(
     let ValueView::Obj(obj) = &(method).view() else {
         return Ok(None);
     };
-    let Callable::Native(nf) = &obj.borrow().call else {
+    let ObjectKind::Native(nf) = &obj.borrow().kind else {
         return Ok(None);
     };
     let native = (*nf) as usize;
@@ -3235,12 +3236,12 @@ pub fn install(it: &mut Interp) {
 fn is_constructor_value(v: &Value) -> bool {
     matches!(&(v).view(), ValueView::Obj(o) if {
         let b = o.borrow();
-        match &b.call {
-            Callable::None => false,
+        match &b.kind {
+            kind if !kind.is_callable() => false,
             // A user function's constructability is determined by its shape: arrows, methods,
             // generators and async functions are never constructors (a generator still has a
             // `prototype` property, so the fallback below would misclassify it).
-            Callable::User(user) => {
+            ObjectKind::User(user) => {
                 !user.func.is_arrow
                     && !user.func.is_method
                     && !user.func.is_generator
@@ -3340,7 +3341,7 @@ fn array_species_is_intrinsic(i: &Interp, original: &Gc) -> bool {
     {
         let body = original.borrow();
         if !body.ic_plain.get()
-            || !matches!(body.exotic, Exotic::Array)
+            || !matches!(body.kind, ObjectKind::Array)
             || !body
                 .proto
                 .as_ref()
@@ -3387,8 +3388,8 @@ fn verify_intrinsic_species(i: &Interp) -> Option<usize> {
     let intrinsic_getter = array_ctor.borrow().props.get(&species).is_some_and(|p| {
         p.accessor()
             && matches!((p.getter()).map(|__value| (__value).view()), Some(ValueView::Obj(getter)) if matches!(
-                getter.borrow().call,
-                crate::value::Callable::Native(f)
+                getter.borrow().kind,
+                crate::value::ObjectKind::Native(f)
                     if f as *const () == nf_species_getter as *const ()
             ))
     });
@@ -3495,19 +3496,19 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
         ValueView::Bool(_) => "Boolean",
         ValueView::Obj(o) => {
             let b = o.borrow();
-            if matches!(b.exotic, Exotic::Array) {
+            if matches!(b.kind, ObjectKind::Array) {
                 "Array"
-            } else if matches!(b.exotic, Exotic::Arguments(_)) {
+            } else if matches!(b.kind, ObjectKind::Arguments(_)) {
                 "Arguments"
-            } else if !matches!(b.call, Callable::None) {
+            } else if b.kind.is_callable() {
                 "Function"
-            } else if matches!(b.exotic, Exotic::Error(_)) {
+            } else if matches!(b.kind, ObjectKind::Error(_)) {
                 "Error"
-            } else if matches!(b.exotic, Exotic::BoolWrap(_)) {
+            } else if matches!(b.kind, ObjectKind::BoolWrap(_)) {
                 "Boolean"
-            } else if matches!(b.exotic, Exotic::NumWrap(_)) {
+            } else if matches!(b.kind, ObjectKind::NumWrap(_)) {
                 "Number"
-            } else if matches!(b.exotic, Exotic::StrWrap(_)) {
+            } else if matches!(b.kind, ObjectKind::StrWrap(_)) {
                 "String"
             } else if b.internal_slots().contains("#\u{0}date_ms") {
                 "Date"
@@ -3595,7 +3596,7 @@ fn collection_iter(i: &mut Interp, this: &Value, kind: u8) -> Result<Value, Valu
     let obj = Object::new_with_parts(
         proto,
         crate::value::Props::new(),
-        Exotic::CollectionIterator(crate::gc_storage::PayloadBox::new(
+        ObjectKind::CollectionIterator(crate::gc_storage::PayloadBox::new(
             crate::ordered_collection::CollectionIterator {
                 target: Some(target),
                 cursor: Some(cursor),
@@ -3618,7 +3619,7 @@ fn map_set_iter_step(
     };
     let (kind, entry) = {
         let iterator = object.borrow();
-        let Exotic::CollectionIterator(state) = &iterator.exotic else {
+        let ObjectKind::CollectionIterator(state) = &iterator.kind else {
             drop(iterator);
             return Err(i.make_error("TypeError", "incompatible collection iterator"));
         };
@@ -3641,7 +3642,7 @@ fn map_set_iter_step(
         Ok(Some(value))
     } else {
         // Done: let go of the collection and the cursor its deletions would keep updating.
-        if let Exotic::CollectionIterator(state) = &mut object.borrow_mut().exotic {
+        if let ObjectKind::CollectionIterator(state) = &mut object.borrow_mut().kind {
             state.target = None;
             state.cursor = None;
         }
@@ -3687,7 +3688,7 @@ pub(crate) fn inert_iterator_step(
         return inert_array_iter_step(i, &object);
     }
     if std::ptr::fn_addr_eq(native, string_iter_next as NativeFn) {
-        if !matches!(object.borrow().exotic, Exotic::StringIterator(_)) {
+        if !matches!(object.borrow().kind, ObjectKind::StringIterator(_)) {
             return None;
         }
         return string_iter_step(i, *iterator).ok();
@@ -3702,8 +3703,8 @@ pub(crate) fn inert_iterator_step(
     // A Map/Set iterator step reads only its private cursor; a brand mismatch must still
     // create its TypeError inside the native call.
     let branded = matches!(
-        &object.borrow().exotic,
-        Exotic::CollectionIterator(state) if state.brand == brand
+        &object.borrow().kind,
+        ObjectKind::CollectionIterator(state) if state.brand == brand
     );
     if !branded {
         return None;
@@ -3729,7 +3730,7 @@ pub(crate) fn own_data_element(props: &Props, index: usize) -> Option<Value> {
 fn inert_array_iter_step(i: &mut Interp, iterator: &Gc) -> Option<Option<Value>> {
     let (index, element) = {
         let object = iterator.borrow();
-        let Exotic::ArrayIterator(state) = &object.exotic else {
+        let ObjectKind::ArrayIterator(state) = &object.kind else {
             return None;
         };
         let target = match (state.target).view() {
@@ -3739,7 +3740,7 @@ fn inert_array_iter_step(i: &mut Interp, iterator: &Gc) -> Option<Option<Value>>
         };
         let array = target.borrow();
         // `ic_plain` excludes proxies and typed arrays.
-        if !array.ic_plain.get() || !matches!(array.exotic, Exotic::Array) {
+        if !array.ic_plain.get() || !matches!(array.kind, ObjectKind::Array) {
             return None;
         }
         let index = state.index;
@@ -3752,7 +3753,7 @@ fn inert_array_iter_step(i: &mut Interp, iterator: &Gc) -> Option<Option<Value>>
         }
     };
     let mut object = iterator.borrow_mut();
-    let Exotic::ArrayIterator(state) = &mut object.exotic else {
+    let ObjectKind::ArrayIterator(state) = &mut object.kind else {
         unreachable!("checked above")
     };
     let Some(element) = element else {
@@ -3809,7 +3810,7 @@ pub(crate) fn make_bound_len(
     let obj = Object::new(Some(i.function_proto));
     {
         let mut b = obj.borrow_mut();
-        b.call = Callable::bound(t, Value::Undefined, bound_args);
+        b.kind = ObjectKind::bound(t, Value::Undefined, bound_args);
         b.props.insert(
             "length",
             Property::data(Value::Num(length), false, false, true),
@@ -4306,7 +4307,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
         return false;
     }
     let source = source.borrow();
-    if !source.ic_plain.get() || !matches!(source.exotic, Exotic::None) {
+    if !source.ic_plain.get() || !source.kind.exotic_is_none() {
         return false;
     }
     let Some(keys) = source.props.named_data_keys() else {
@@ -4317,7 +4318,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
     }
     let mut target = target.borrow_mut();
     if !target.ic_plain.get()
-        || !matches!(target.exotic, Exotic::None)
+        || !target.kind.exotic_is_none()
         || !target.extensible
         || !target
             .props
@@ -4330,7 +4331,7 @@ fn try_assign_named_data(target: &Value, source: &Value) -> bool {
     while let Some(parent) = prototype {
         let parent = parent.borrow();
         if !parent.ic_plain.get()
-            || !matches!(parent.exotic, Exotic::None)
+            || !parent.kind.exotic_is_none()
             || keys.iter().any(|&key| parent.props.contains_key(key))
         {
             return false;
@@ -5178,7 +5179,7 @@ fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
     Value::Obj(Object::new_with_parts(
         Some(i.object_proto),
         props,
-        Exotic::None,
+        ObjectKind::Plain,
     ))
 }
 
@@ -5238,7 +5239,7 @@ fn plain_descriptor_fields(o: &Gc) -> Option<[Option<Value>; 6]> {
     let mut current = Some(*o);
     while let Some(object) = current {
         let body = object.try_borrow().ok()?;
-        if !body.ic_plain.get() || !matches!(body.exotic, Exotic::None) {
+        if !body.ic_plain.get() || !body.kind.exotic_is_none() {
             return None;
         }
         for (field, name) in fields.iter_mut().zip(FIELDS) {
@@ -5513,7 +5514,7 @@ fn define_own_property_ordinary(
     if i.host_indexed_array_key(o, key) || i.host_named_reject_define(o, key) {
         return Ok(false);
     }
-    let is_array = matches!(o.borrow().exotic, crate::value::Exotic::Array);
+    let is_array = matches!(o.borrow().kind, crate::value::ObjectKind::Array);
     // Array exotic [[DefineOwnProperty]]: `length` and array indices have special rules.
     if is_array && key == "length" {
         crate::value::bump_proto_epoch();
@@ -5831,7 +5832,7 @@ fn is_native_function(value: &Value, expected: NativeFn) -> bool {
     matches!(
         &(value).view(),
         ValueView::Obj(object)
-            if matches!(object.borrow().call, Callable::Native(actual)
+            if matches!(object.borrow().kind, ObjectKind::Native(actual)
                 if std::ptr::fn_addr_eq(actual, expected))
     )
 }
@@ -5885,11 +5886,11 @@ pub(crate) fn inert_array_iterator_remaining(
         return None;
     }
     let object = object.borrow();
-    let Exotic::ArrayIterator(state) = &object.exotic else {
+    let ObjectKind::ArrayIterator(state) = &object.kind else {
         return None;
     };
     let target = state.target.as_obj()?;
-    if !matches!(target.borrow().exotic, Exotic::Array)
+    if !matches!(target.borrow().kind, ObjectKind::Array)
         || !i.ordinary_get_ptr(Gc::as_ptr(&target) as usize)
         || !i.array_append_unshadowed(&target)
         || target
@@ -5913,7 +5914,7 @@ pub(crate) fn array_iterator_fast_path_is_safe(i: &Interp, value: &Value) -> boo
     let ValueView::Obj(object) = &(value).view() else {
         return false;
     };
-    if !matches!(object.borrow().exotic, Exotic::Array)
+    if !matches!(object.borrow().kind, ObjectKind::Array)
         || !i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
         || !matches!(
             object.borrow().proto.as_ref(),
@@ -5969,7 +5970,7 @@ pub(crate) fn dense_array_snapshot(i: &Interp, value: &Value) -> Option<Vec<Valu
     let ValueView::Obj(object) = &(value).view() else {
         return None;
     };
-    if !matches!(object.borrow().exotic, Exotic::Array)
+    if !matches!(object.borrow().kind, ObjectKind::Array)
         || !i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
     {
         return None;
@@ -6050,7 +6051,7 @@ fn verify_array_iteration(i: &Interp, epoch: u32) -> Option<ArrayIterationProof>
         }
         let parent = {
             let body = object.borrow();
-            if !matches!(body.exotic, Exotic::None) || body.props.get("return").is_some() {
+            if !body.kind.exotic_is_none() || body.props.get("return").is_some() {
                 return None;
             }
             body.proto
@@ -6118,7 +6119,7 @@ fn with_intrinsic_array_iteration<R>(
     with_array_iteration_proof(i, |proof| {
         {
             let body = array.borrow();
-            if !matches!(body.exotic, Exotic::Array)
+            if !matches!(body.kind, ObjectKind::Array)
                 || !matches!(body.proto.as_ref(), Some(proto) if Gc::ptr_eq(proto, &i.array_proto))
                 || !i.ordinary_get_ptr(Gc::as_ptr(&array) as usize)
                 || body.props.get(proof.iterator_key.as_deref()?).is_some()
@@ -6141,7 +6142,7 @@ fn with_intrinsic_array_iteration<R>(
 pub(crate) fn array_values_iterator(i: &mut Interp, array: Value, index: usize) -> Value {
     let iterator = make_array_iterator(i, array, 0);
     if let Some(object) = iterator.as_obj() {
-        if let Exotic::ArrayIterator(state) = &mut object.borrow_mut().exotic {
+        if let ObjectKind::ArrayIterator(state) = &mut object.borrow_mut().kind {
             state.index = index;
         }
     }
@@ -6157,7 +6158,7 @@ pub(crate) fn array_iterator_close_is_inert(i: &Interp, iterator: &Value) -> boo
     };
     with_array_iteration_proof(i, |proof| {
         let body = object.borrow();
-        (matches!(body.exotic, Exotic::ArrayIterator(_))
+        (matches!(body.kind, ObjectKind::ArrayIterator(_))
             && matches!(body.proto.as_ref(),
                 Some(proto) if std::ptr::eq(Gc::as_ptr(proto), proof.prototype.as_ptr()))
             && body.props.values().next().is_none()
@@ -6179,7 +6180,7 @@ fn nf_array_values(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value
 fn install_array(it: &mut Interp) {
     let ap = it.array_proto;
     ap.borrow().props.mark_array();
-    ap.borrow_mut().exotic = Exotic::Array;
+    ap.borrow_mut().kind = ObjectKind::Array;
     ap.borrow_mut().props.insert(
         "length",
         Property::data(Value::Num(0.0), true, false, false),
@@ -6228,7 +6229,7 @@ pub(crate) fn nf_array_push(i: &mut Interp, this: Value, args: &[Value]) -> Resu
     // Dense fast path: a plain array whose `length` is a writable own data property and
     // whose tail is exactly the dense frontier appends in place — no key strings, no
     // existence scans, no observable coercions (a whole-number own `length` needs none).
-    if matches!(o.borrow().exotic, Exotic::Array)
+    if matches!(o.borrow().kind, ObjectKind::Array)
         && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         && i.array_append_unshadowed(&o)
     {
@@ -6290,7 +6291,7 @@ pub(crate) fn nf_array_pop(i: &mut Interp, this: Value, _args: &[Value]) -> Resu
     // Dense fast path (mirror of push's): take the last element straight off the entries
     // tail — no key strings, no hash lookups, and crucially NO shape reset, so the array's
     // inline caches survive a pop (stack-discipline arrays live on push/pop).
-    if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize) {
+    if matches!(o.borrow().kind, ObjectKind::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize) {
         let mut b = o.borrow_mut();
         let len = match b.props.length_property() {
             Some(p) if !p.accessor() && p.writable() => match (p.value()).view() {
@@ -6338,7 +6339,7 @@ pub(crate) fn jit_array_push_one(i: &mut Interp, o: &Gc, value: Value) -> Result
 pub(crate) fn array_push_dense(i: &Interp, o: &Gc, value: Value) -> Result<u32, Value> {
     {
         let b = o.borrow();
-        if !matches!(b.exotic, Exotic::Array) || !b.ic_plain.get() || !b.extensible {
+        if !matches!(b.kind, ObjectKind::Array) || !b.ic_plain.get() || !b.extensible {
             return Err(value);
         }
     }
@@ -6365,7 +6366,8 @@ pub(crate) fn array_push_dense(i: &Interp, o: &Gc, value: Value) -> Result<u32, 
 
 /// JIT-only dense `Array#pop` form. `None` is a guard miss with no mutation.
 pub(crate) fn jit_array_pop(i: &Interp, o: &Gc) -> Option<Value> {
-    if !matches!(o.borrow().exotic, Exotic::Array) || !i.ordinary_get_ptr(Gc::as_ptr(o) as usize) {
+    if !matches!(o.borrow().kind, ObjectKind::Array) || !i.ordinary_get_ptr(Gc::as_ptr(o) as usize)
+    {
         return None;
     }
     let mut b = o.borrow_mut();
@@ -6399,7 +6401,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // proof rejects accessors/failing descriptors before any mutation, and
         // holes unless no prototype has an indexed property and the Array is
         // extensible (see `Props::shift_dense_array`).
-        if matches!(o.borrow().exotic, Exotic::Array) && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
+        if matches!(o.borrow().kind, ObjectKind::Array)
+            && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
         {
             let holes_read_absent = o.borrow().extensible && i.array_append_unshadowed(&o);
             if let Some(first) = o
@@ -6433,7 +6436,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 return Err(i.make_error("TypeError", "unshift result is too long"));
             }
             if len + n <= u64::from(u32::MAX)
-                && matches!(o.borrow().exotic, Exotic::Array)
+                && matches!(o.borrow().kind, ObjectKind::Array)
                 && i.ordinary_get_ptr(Gc::as_ptr(&o) as usize)
                 && o.borrow().extensible
                 && i.array_append_unshadowed(&o)
@@ -6629,8 +6632,8 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // HasProperty/Get. Only an ordinary result can define properties without
         // invoking author code that changes the source between those reads.
         let unobservable_defines = result.as_obj().is_some_and(|object| {
-            (object.borrow().exotic.is_ordinary()
-                || matches!(object.borrow().exotic, Exotic::Array))
+            (object.borrow().kind.is_ordinary()
+                || matches!(object.borrow().kind, ObjectKind::Array))
                 && i.ordinary_get_ptr(Gc::as_ptr(&object) as usize)
         });
         let mut n = 0u64;
@@ -6810,7 +6813,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         // A real Array's filled span is bounded by the engine cap (it materializes one property
         // per index); a generic array-like iterates lazily — its accessors typically throw or
         // the per-op caps stop runaway growth.
-        if matches!(o.borrow().exotic, Exotic::Array)
+        if matches!(o.borrow().kind, ObjectKind::Array)
             && (end - start).max(0) as usize > MAX_ARRAY_OP_LEN
         {
             return Err(i.make_error("RangeError", "array length exceeds engine limit"));
@@ -7184,7 +7187,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
         let mut v = arg(args, 0);
         loop {
             match &(v).view() {
-                ValueView::Obj(o) if matches!(o.borrow().exotic, Exotic::Array) => {
+                ValueView::Obj(o) if matches!(o.borrow().kind, ObjectKind::Array) => {
                     return Ok(Value::Bool(true));
                 }
                 ValueView::Obj(_) => match proxy_pair(i, &v) {
@@ -7393,7 +7396,7 @@ fn edit_plain_elements(
     edit: impl FnOnce(&mut crate::value::word_block::Words),
 ) -> bool {
     if len.saturating_add(growth) > u64::from(u32::MAX)
-        || !matches!(object.borrow().exotic, Exotic::Array)
+        || !matches!(object.borrow().kind, ObjectKind::Array)
         || !i.ordinary_get_ptr(Gc::as_ptr(object) as usize)
         || (growth != 0 && (!object.borrow().extensible || !i.array_append_unshadowed(object)))
     {
@@ -7416,7 +7419,7 @@ fn edit_plain_elements(
 fn search_length(i: &mut Interp, object: &Gc) -> Result<usize, Value> {
     {
         let body = object.borrow();
-        if matches!(body.exotic, Exotic::Array) && body.ic_plain.get() {
+        if matches!(body.kind, ObjectKind::Array) && body.ic_plain.get() {
             if let Some(length) = ordinary_array_length(&body.props) {
                 return Ok(length);
             }
@@ -7519,7 +7522,7 @@ fn search_packed_elements(
     equality: ElementEquality,
 ) -> Option<Option<usize>> {
     let body = object.borrow();
-    if !matches!(body.exotic, Exotic::Array) || !body.ic_plain.get() {
+    if !matches!(body.kind, ObjectKind::Array) || !body.ic_plain.get() {
         return None;
     }
     let packed = body.props.element_words()?;
@@ -7575,7 +7578,7 @@ fn search_packed_elements(
 /// properties (no hole, accessor or index past its length): reads without observable work.
 fn own_data_elements(object: &Gc, range: std::ops::Range<usize>) -> Option<Vec<Value>> {
     let body = object.borrow();
-    if !matches!(body.exotic, Exotic::Array) || !body.ic_plain.get() {
+    if !matches!(body.kind, ObjectKind::Array) || !body.ic_plain.get() {
         return None;
     }
     if range.end > ordinary_array_length(&body.props)? {
@@ -7758,7 +7761,7 @@ fn flatten_dense_target_safe(i: &Interp, target: &Value, source: &Value) -> bool
         return false;
     };
     !Gc::ptr_eq(target, source)
-        && matches!(target.borrow().exotic, Exotic::Array)
+        && matches!(target.borrow().kind, ObjectKind::Array)
         && i.ordinary_get_ptr(Gc::as_ptr(target) as usize)
 }
 
@@ -9241,7 +9244,7 @@ fn try_define_plain_array_index(
         return Err(property);
     };
     let mut object = object.borrow_mut();
-    if !object.ic_plain.get() || !matches!(object.exotic, Exotic::Array) || !object.extensible {
+    if !object.ic_plain.get() || !matches!(object.kind, ObjectKind::Array) || !object.extensible {
         return Err(property);
     }
     let Some(length) = object.props.length_property().and_then(|length| {
@@ -9315,7 +9318,7 @@ pub(crate) fn cdp_or_throw(
     if !i.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
         let fast = {
             let b = o.borrow();
-            matches!(b.exotic, Exotic::Array)
+            matches!(b.kind, ObjectKind::Array)
                 && b.extensible
                 && !b.props.contains(key)
                 && b.props.get("length").map(|p| p.writable()).unwrap_or(true)
@@ -9694,7 +9697,7 @@ fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
     Value::Obj(Object::new_with_parts(
         Some(i.object_proto),
         props,
-        Exotic::None,
+        ObjectKind::Plain,
     ))
 }
 
@@ -10572,7 +10575,7 @@ fn make_array_iterator(i: &mut Interp, target: Value, kind: u8) -> Value {
     let obj = Object::new_with_parts(
         proto,
         crate::value::Props::new(),
-        Exotic::ArrayIterator(crate::gc_storage::PayloadBox::new(
+        ObjectKind::ArrayIterator(crate::gc_storage::PayloadBox::new(
             crate::value::ArrayIteratorState {
                 target,
                 index: 0,
@@ -10597,7 +10600,7 @@ fn string_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value>
         ));
     };
     let mut object = object.borrow_mut();
-    let Exotic::StringIterator(state) = &mut object.exotic else {
+    let ObjectKind::StringIterator(state) = &mut object.kind else {
         drop(object);
         return Err(i.make_error(
             "TypeError",
@@ -10818,7 +10821,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
     // JavaScript. The index snapshot and update order follow the native slots.
     let (target, idx, kind) = {
         let object = object.borrow();
-        let Exotic::ArrayIterator(state) = &object.exotic else {
+        let ObjectKind::ArrayIterator(state) = &object.kind else {
             return Err(i.make_error(
                 "TypeError",
                 "Array Iterator next called on an incompatible receiver",
@@ -10845,7 +10848,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
             // same operation without allocating the property key or coercing a Number. Proxies,
             // host objects, and ordinary array-likes retain the observable generic path.
             ValueView::Obj(object)
-                if matches!(object.borrow().exotic, Exotic::Array)
+                if matches!(object.borrow().kind, ObjectKind::Array)
                     && i.ordinary_get_ptr(Gc::as_ptr(object) as usize) =>
             {
                 i.array_length(object)
@@ -10866,7 +10869,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
     };
     if idx >= len {
         let mut object = object.borrow_mut();
-        let Exotic::ArrayIterator(state) = &mut object.exotic else {
+        let ObjectKind::ArrayIterator(state) = &mut object.kind else {
             unreachable!()
         };
         state.target = Value::Undefined;
@@ -10874,7 +10877,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
     }
     {
         let mut object = object.borrow_mut();
-        let Exotic::ArrayIterator(state) = &mut object.exotic else {
+        let ObjectKind::ArrayIterator(state) = &mut object.kind else {
             unreachable!()
         };
         state.index = idx + 1;
@@ -11231,8 +11234,8 @@ fn string_arg(i: &mut Interp, value: &Value) -> Result<LStr, Value> {
 fn this_string(i: &mut Interp, this: &Value) -> Result<crate::lstr::LStr, Value> {
     match &(this).view() {
         ValueView::Str(s) => Ok(*s),
-        ValueView::Obj(o) => match &o.borrow().exotic {
-            Exotic::StrWrap(s) => Ok(**s),
+        ValueView::Obj(o) => match &o.borrow().kind {
+            ObjectKind::StrWrap(s) => Ok(**s),
             _ => ab(i.to_string(this)),
         },
         // String.prototype methods RequireObjectCoercible(this): null/undefined → TypeError.
@@ -11603,7 +11606,7 @@ fn nf_string_iterator(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Va
     let obj = Object::new_with_parts(
         i.extra_protos.get("%StringIteratorPrototype%").cloned(),
         crate::value::Props::new(),
-        Exotic::StringIterator(crate::gc_storage::PayloadBox::new(
+        ObjectKind::StringIterator(crate::gc_storage::PayloadBox::new(
             crate::value::StringIteratorState {
                 string: Some(s),
                 index: 0,
@@ -12580,12 +12583,12 @@ pub(crate) fn nf_string_slice(i: &mut Interp, this: Value, args: &[Value]) -> Re
 /// values pass through unchanged (Symbol/BigInt wrappers are not modeled yet).
 fn box_primitive(i: &mut Interp, v: Value) -> Value {
     let (proto, exotic) = match &(v).view() {
-        ValueView::Num(n) => (i.number_proto, Exotic::NumWrap(*n)),
-        ValueView::Bool(b) => (i.boolean_proto, Exotic::BoolWrap(*b)),
-        ValueView::Str(s) => (i.string_proto, Exotic::str_wrap(*s)),
-        ValueView::Sym(s) => (i.symbol_proto, Exotic::SymWrap(*s)),
+        ValueView::Num(n) => (i.number_proto, ObjectKind::NumWrap(*n)),
+        ValueView::Bool(b) => (i.boolean_proto, ObjectKind::BoolWrap(*b)),
+        ValueView::Str(s) => (i.string_proto, ObjectKind::str_wrap(*s)),
+        ValueView::Sym(s) => (i.symbol_proto, ObjectKind::SymWrap(*s)),
         ValueView::BigInt(n) => match i.extra_protos.get("BigInt").cloned() {
-            Some(p) => (p, Exotic::bigint_wrap(*n)),
+            Some(p) => (p, ObjectKind::bigint_wrap(*n)),
             None => return v,
         },
         _ => return v,
@@ -12593,7 +12596,7 @@ fn box_primitive(i: &mut Interp, v: Value) -> Value {
     let obj = Object::new(Some(proto));
     // A String exotic object exposes each character as an own, enumerable, non-writable,
     // non-configurable index property, plus a non-enumerable `length`.
-    if let Exotic::StrWrap(s) = &exotic {
+    if let ObjectKind::StrWrap(s) = &exotic {
         let units = s.units().to_utf16();
         let mut b = obj.borrow_mut();
         for (idx, u) in units.iter().enumerate() {
@@ -12607,7 +12610,7 @@ fn box_primitive(i: &mut Interp, v: Value) -> Value {
             Property::data(Value::Num(units.len() as f64), false, false, false),
         );
     }
-    obj.borrow_mut().exotic = exotic;
+    obj.borrow_mut().kind = exotic;
     Value::Obj(obj)
 }
 
@@ -12621,10 +12624,10 @@ fn maybe_box(i: &mut Interp, v: Value) -> Result<Value, Value> {
     let boxed = box_primitive(i, v);
     let nt = i.constructor_new_target();
     if let (ValueView::Obj(o), ValueView::Obj(_)) = (&(boxed).view(), &(nt).view()) {
-        let key = match o.borrow().exotic {
-            Exotic::NumWrap(_) => "Number",
-            Exotic::BoolWrap(_) => "Boolean",
-            Exotic::StrWrap(_) => "String",
+        let key = match o.borrow().kind {
+            ObjectKind::NumWrap(_) => "Number",
+            ObjectKind::BoolWrap(_) => "Boolean",
+            ObjectKind::StrWrap(_) => "String",
             _ => "",
         };
         if !key.is_empty() {
@@ -12688,8 +12691,8 @@ fn string_pad(i: &mut Interp, this: Value, args: &[Value], at_start: bool) -> Re
 fn string_this_value(i: &mut Interp, this: &Value) -> Result<Value, Value> {
     match &(this).view() {
         ValueView::Str(s) => Ok(Value::Str(*s)),
-        ValueView::Obj(o) => match &o.borrow().exotic {
-            Exotic::StrWrap(s) => Ok(Value::Str(**s)),
+        ValueView::Obj(o) => match &o.borrow().kind {
+            ObjectKind::StrWrap(s) => Ok(Value::Str(**s)),
             _ => Err(i.make_error("TypeError", "not a String object")),
         },
         _ => Err(i.make_error("TypeError", "not a String object")),
@@ -12860,8 +12863,8 @@ fn this_number(i: &mut Interp, this: &Value) -> Result<f64, Value> {
     // thisNumberValue: only a Number primitive or Number wrapper is acceptable.
     match &(this).view() {
         ValueView::Num(n) => Ok(*n),
-        ValueView::Obj(o) => match o.borrow().exotic {
-            Exotic::NumWrap(n) => Ok(n),
+        ValueView::Obj(o) => match o.borrow().kind {
+            ObjectKind::NumWrap(n) => Ok(n),
             _ => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),
         },
         _ => Err(i.make_error("TypeError", "Number method called on incompatible receiver")),

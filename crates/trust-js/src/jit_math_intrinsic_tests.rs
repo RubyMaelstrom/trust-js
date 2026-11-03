@@ -17,7 +17,7 @@ fn assert_native_intrinsic(engine: &mut Engine, name: &str, intrinsic: u8) -> u3
     let function = engine.interp.get_var(name, &env).ok().unwrap();
     let function_handle = function.as_obj().unwrap();
     let object = function_handle.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("{name} must be an author function")
     };
     let runtime = user.func.runtime();

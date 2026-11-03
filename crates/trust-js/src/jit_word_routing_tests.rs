@@ -44,7 +44,7 @@ fn assert_native(engine: &mut Engine, names: &[&str]) {
         let value = engine.interp.get_var(name, &env).ok().expect("bound name");
         let function_handle = value.as_obj().expect("a function object");
         let object = function_handle.borrow();
-        let crate::value::Callable::User(user) = &object.call else {
+        let crate::value::ObjectKind::User(user) = &object.kind else {
             panic!("{name} is not a user function")
         };
         let runtime = user.func.runtime();

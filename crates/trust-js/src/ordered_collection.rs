@@ -433,8 +433,8 @@ impl crate::interpreter::Interp {
     /// object's cell and is borrowed with the object, so hold it for one step and never across
     /// JavaScript.
     pub(crate) fn collection<'a>(&'a self, object: &'a Gc) -> Option<CollectionRef<'a>> {
-        std::cell::Ref::filter_map(object.borrow(), |object| match &object.exotic {
-            crate::value::Exotic::Collection(data) => Some(&**data),
+        std::cell::Ref::filter_map(object.borrow(), |object| match &object.kind {
+            crate::value::ObjectKind::Collection(data) => Some(&**data),
             _ => None,
         })
         .ok()
@@ -442,8 +442,8 @@ impl crate::interpreter::Interp {
 
     /// [`Interp::collection`], writable.
     pub(crate) fn collection_mut<'a>(&'a mut self, object: &'a Gc) -> Option<CollectionMut<'a>> {
-        std::cell::RefMut::filter_map(object.borrow_mut(), |object| match &mut object.exotic {
-            crate::value::Exotic::Collection(data) => Some(&mut **data),
+        std::cell::RefMut::filter_map(object.borrow_mut(), |object| match &mut object.kind {
+            crate::value::ObjectKind::Collection(data) => Some(&mut **data),
             _ => None,
         })
         .ok()
@@ -451,8 +451,8 @@ impl crate::interpreter::Interp {
 
     /// Give a new Map or Set `object` its [[MapData]]/[[SetData]].
     pub(crate) fn set_collection(&mut self, object: &Gc, data: OrderedCollection) {
-        object.borrow_mut().exotic =
-            crate::value::Exotic::Collection(crate::gc_storage::PayloadBox::new(data));
+        object.borrow_mut().kind =
+            crate::value::ObjectKind::Collection(crate::gc_storage::PayloadBox::new(data));
     }
 
     /// Move `from`'s [[MapData]]/[[SetData]], if it has one, to `to` (the subclass instance a
@@ -460,15 +460,15 @@ impl crate::interpreter::Interp {
     pub(crate) fn move_collection(&mut self, from: &Gc, to: &Gc) -> bool {
         // Taken in a statement of its own: `from`'s borrow ends before the match puts back a
         // state that is not a collection.
-        let taken = std::mem::replace(&mut from.borrow_mut().exotic, crate::value::Exotic::None);
+        let taken = std::mem::replace(&mut from.borrow_mut().kind, crate::value::ObjectKind::Plain);
         let moved = match taken {
-            crate::value::Exotic::Collection(data) => data,
+            crate::value::ObjectKind::Collection(data) => data,
             other => {
-                from.borrow_mut().exotic = other;
+                from.borrow_mut().kind = other;
                 return false;
             }
         };
-        to.borrow_mut().exotic = crate::value::Exotic::Collection(moved);
+        to.borrow_mut().kind = crate::value::ObjectKind::Collection(moved);
         true
     }
 }

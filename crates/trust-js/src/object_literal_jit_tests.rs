@@ -36,7 +36,7 @@ fn check(source: &str, expected: &str) {
 ))]
 #[test]
 fn object_literal_builders_have_real_native_entries() {
-    use crate::value::Callable;
+    use crate::value::ObjectKind;
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
@@ -70,8 +70,8 @@ fn object_literal_builders_have_real_native_entries() {
         let ValueView::Obj(object) = (function).view() else {
             panic!("function object")
         };
-        let chunk = match &object.borrow().call {
-            Callable::User(user) => user
+        let chunk = match &object.borrow().kind {
+            ObjectKind::User(user) => user
                 .func
                 .runtime()
                 .code

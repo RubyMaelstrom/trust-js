@@ -145,7 +145,7 @@ fn fixed_activations_check_their_own_lexicals_once_a_block() {
 #[test]
 fn fixed_slot_stores_mark_an_old_activations_card() {
     use crate::gc_core::{CellAge, CollectionKind};
-    use crate::value::{Callable, Value, ValueView};
+    use crate::value::{ObjectKind, Value, ValueView};
     use std::cell::Cell;
     thread_local! {
         static FRESH: Cell<usize> = const { Cell::new(0) };
@@ -231,7 +231,7 @@ fn fixed_slot_stores_mark_an_old_activations_card() {
         panic!("keep is a function")
     };
     let keep = keep.borrow();
-    let Callable::User(user) = &keep.call else {
+    let ObjectKind::User(user) = &keep.kind else {
         panic!("keep is a user function")
     };
     let chunk = user
@@ -253,7 +253,7 @@ fn fixed_slot_stores_mark_an_old_activations_card() {
         panic!("read is a function")
     };
     let read = read.borrow();
-    let Callable::User(user) = &read.call else {
+    let ObjectKind::User(user) = &read.kind else {
         panic!("read is a user function")
     };
     assert_eq!(

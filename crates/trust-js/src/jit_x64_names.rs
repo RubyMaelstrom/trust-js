@@ -62,7 +62,7 @@ fn valid(l: &JitLayout) -> bool {
             l.binding_value,
             l.obj_props + l.props_shape,
             l.obj_ic_plain,
-            l.obj_exotic,
+            l.obj_kind,
             l.entry_size,
             l.entry_value,
             l.entry_accessor,
@@ -84,7 +84,7 @@ fn scope_plain(a: &mut Asm, l: &JitLayout, slow: usize) {
 
 /// R9=Object (a stored cell word plus `obj_from_cell`), AX=shape, DX=slot. Output CX=Property,
 /// R11=1. No value flags yet. `valid` admitted the layout. A global object is never a Map or Set
-/// (the VM checks `Exotic::None` there); a Reference's object base (`ordinary`) may be any object
+/// (the VM checks `ObjectKind::ExoticNone` there); a Reference's object base (`ordinary`) may be any object
 /// with ordinary internal methods, as ARM64's Reference template admits.
 fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     a.nr_zero_guard(R9, slow);
@@ -96,9 +96,7 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     if ordinary {
         a.guard_exotic_ordinary(l, R9, CX, slow);
     } else {
-        a.nr_load8(CX, R9, l.obj_exotic);
-        a.nr_op_imm(7, CX, l.exotic_none_tag as i32);
-        a.jcc(NE, slow);
+        a.guard_exotic_none(l, R9, CX, slow);
     }
     a.nr_load8(CX, R9, l.obj_ic_plain);
     a.nr_zero_guard(CX, slow);

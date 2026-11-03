@@ -43,7 +43,7 @@ fn check(source: &str, expected: &str, functions: &[(&str, Entry)], native: bool
                 panic!("{name} is not an object")
             };
             let object = object.borrow();
-            let crate::value::Callable::User(user) = &object.call else {
+            let crate::value::ObjectKind::User(user) = &object.kind else {
                 panic!("{name} is not a user function")
             };
             let runtime = user.func.runtime();
@@ -407,7 +407,7 @@ fn named_expression_self_environment_is_created_once_and_collectible() {
             let weak = crate::value::Gc::downgrade(&object);
             {
                 let borrowed = object.borrow();
-                let crate::value::Callable::User(user) = &borrowed.call else {
+                let crate::value::ObjectKind::User(user) = &borrowed.kind else {
                     panic!("not a function")
                 };
                 let closure = user.env.borrow();
@@ -465,7 +465,7 @@ fn named_expression_unused_self_environment_is_elided_without_changing_identity(
             let weak = crate::value::Gc::downgrade(&object);
             {
                 let borrowed = object.borrow();
-                let crate::value::Callable::User(user) = &borrowed.call else {
+                let crate::value::ObjectKind::User(user) = &borrowed.kind else {
                     panic!("user function")
                 };
                 assert_eq!(user.env.borrow().vars.get("unused").is_none(), enabled);

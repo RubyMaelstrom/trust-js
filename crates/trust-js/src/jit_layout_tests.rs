@@ -79,7 +79,6 @@ fn layout_is_valid_with_the_build_ownership() {
     let layout = probe(&engine);
     assert!(layout.valid && layout.key_probe_ok && layout.call_probe_valid);
     assert!(layout.scope_parent_valid && layout.scope_small_valid && layout.scope_with_valid);
-    assert!(layout.repr.exotic_ordinary_contiguous);
     let object = Object::new(None);
     assert_eq!(
         body(&layout, &object),
@@ -105,7 +104,6 @@ fn layout_is_valid_with_the_build_ownership() {
             ..
         }
     ));
-    assert!(layout.repr.exotic_collection_tag.is_some());
 }
 
 #[test]
@@ -135,41 +133,34 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
     );
     assert_eq!(read::<u8>(base, layout.obj_ic_plain), 1);
     assert_eq!(read::<u8>(base, layout.obj_extensible), 1);
-    let tag = |object: &Gc| read::<u8>(body(&layout, object), layout.obj_exotic);
-    assert_eq!(tag(&object), layout.exotic_none_tag);
+    let tag = |object: &Gc| read::<u8>(body(&layout, object), layout.obj_kind);
+    assert_eq!(tag(&object), 0, "a plain object's kind");
     for (exotic, expected) in [
-        (Exotic::Array, layout.exotic_array_tag),
-        (Exotic::str_wrap("s".into()), layout.exotic_strwrap_tag),
-        (Exotic::NumWrap(2.5), layout.exotic_numwrap_tag),
-        (Exotic::BoolWrap(true), layout.exotic_boolwrap_tag),
+        (ObjectKind::Array, layout.exotic_array_tag),
+        (ObjectKind::str_wrap("s".into()), layout.exotic_strwrap_tag),
+        (ObjectKind::NumWrap(2.5), layout.exotic_numwrap_tag),
+        (ObjectKind::BoolWrap(true), layout.exotic_boolwrap_tag),
     ] {
         let wrapper = Object::new_with_parts(None, Props::new(), exotic);
         assert_eq!(tag(&wrapper), expected);
     }
-    // Maps and Sets keep their data in the cell (`Exotic::Collection`, declared right after
-    // `None`).
+    // Maps and Sets keep their data in the cell (`ObjectKind::Collection`), whose tag is the last
+    // the ordinary-object guards admit: plain objects, typed arrays' views and the callables come
+    // before it, every exotic kind after it.
     let map = global(&mut engine, "var probeMap = new Map([[1, 2]]);", "probeMap");
     let set = global(&mut engine, "var probeSet = new Set([3]);", "probeSet");
+    let function = global(&mut engine, "var probeFn = function() {};", "probeFn");
     for collection in [&map, &set] {
-        let found = tag(collection);
-        assert_eq!(
-            collection.borrow().exotic.is_collection(),
-            layout.repr.exotic_collection_tag.is_some()
-        );
-        assert_eq!(
-            found,
-            layout
-                .repr
-                .exotic_collection_tag
-                .unwrap_or(layout.exotic_none_tag)
-        );
-        let last = layout
-            .repr
-            .exotic_collection_tag
-            .unwrap_or(layout.exotic_none_tag);
-        assert!((layout.exotic_none_tag..=last).contains(&found));
-        assert_eq!(last - layout.exotic_none_tag, 1);
+        assert!(collection.borrow().kind.is_collection());
+        assert_eq!(tag(collection), crate::value::KIND_ORDINARY_LAST);
     }
+    let function_tag = tag(&function);
+    assert_eq!(function_tag, crate::value::CALLABLE_USER_TAG);
+    assert!(
+        (crate::value::KIND_CALLABLE_FIRST..=crate::value::KIND_EXOTIC_NONE_LAST)
+            .contains(&function_tag)
+    );
+    assert!(layout.exotic_array_tag > crate::value::KIND_ORDINARY_LAST);
 }
 
 #[test]
@@ -359,11 +350,11 @@ fn callable_fields_read_a_live_closure() {
         "function probe(a){return a;} var probeClosure = (function(k){return function(){return k;};})(1);",
         "probeClosure",
     );
-    let call = body(&layout, &function) + layout.obj_call;
+    let call = body(&layout, &function) + layout.obj_kind;
     assert_eq!(read::<u8>(call, 0), CALLABLE_USER_TAG);
     let payload = read::<usize>(call, 8);
     let borrowed = function.borrow();
-    let Callable::User(user) = &borrowed.call else {
+    let ObjectKind::User(user) = &borrowed.kind else {
         panic!("a closure")
     };
     assert_eq!(payload, read(user as *const UserFn as usize, 0));

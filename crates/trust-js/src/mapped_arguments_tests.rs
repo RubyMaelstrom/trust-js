@@ -93,7 +93,7 @@ fn a_materialized_object_aliases_the_activation() {
 /// activation and no prepared entry.
 #[test]
 fn element_reads_leave_the_prepared_entry() {
-    use crate::value::{Callable, ValueView};
+    use crate::value::{ObjectKind, ValueView};
     let mut engine = Engine::new();
     engine.set_tier(Tier::Bytecode);
     engine.set_tier_threshold(0);
@@ -116,7 +116,7 @@ fn element_reads_leave_the_prepared_entry() {
         panic!("argsMapped is a function")
     };
     let function = function.borrow();
-    let Callable::User(user) = &function.call else {
+    let ObjectKind::User(user) = &function.kind else {
         panic!("argsMapped is a user function")
     };
     let chunk = user

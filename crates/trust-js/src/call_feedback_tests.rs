@@ -3,7 +3,7 @@
 //! `Builtin` id, which the optimizing tiers key their reductions on).
 
 use crate::bytecode::*;
-use crate::value::{Callable, Value, ValueView};
+use crate::value::{ObjectKind, Value, ValueView};
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) -> String {
@@ -25,9 +25,9 @@ fn native(engine: &mut Engine, path: &str) -> crate::value::NativeFn {
     let ValueView::Obj(function) = value.view() else {
         panic!("{path} is not an object")
     };
-    let call = &function.borrow().call;
+    let call = &function.borrow().kind;
     match call {
-        Callable::Native(f) => *f,
+        ObjectKind::Native(f) => *f,
         _ => panic!("{path} is not a bare native"),
     }
 }
@@ -111,8 +111,8 @@ fn chunk_of(engine: &mut Engine, name: &str) -> std::rc::Rc<Chunk> {
     let ValueView::Obj(function) = value.view() else {
         panic!("{name} is not an object")
     };
-    let call = &function.borrow().call;
-    let Callable::User(user) = call else {
+    let call = &function.borrow().kind;
+    let ObjectKind::User(user) = call else {
         panic!("{name} is not a user function")
     };
     let runtime = user.func.runtime();
@@ -350,8 +350,8 @@ fn the_inline_planner_skips_megamorphic_sites_and_recompiles_keep_them() {
     let ValueView::Obj(function) = value.view() else {
         panic!("wide is not an object")
     };
-    let (func, realm) = match &function.borrow().call {
-        Callable::User(user) => (std::rc::Rc::clone(&user.func), user.realm),
+    let (func, realm) = match &function.borrow().kind {
+        ObjectKind::User(user) => (std::rc::Rc::clone(&user.func), user.realm),
         _ => panic!("wide is not a user function"),
     };
     let plan = plan_inlines(&chunk, &func, realm, &env);
@@ -398,8 +398,8 @@ fn a_construct_site_of_fresh_constructors_pins_only_its_entry() {
         let ValueView::Obj(function) = value.view() else {
             panic!("{maker} is not an object")
         };
-        let call = &function.borrow().call;
-        let Callable::User(user) = call else {
+        let call = &function.borrow().kind;
+        let ObjectKind::User(user) = call else {
             panic!("{maker} is not a user function")
         };
         let runtime = user.func.runtime();

@@ -265,7 +265,7 @@ fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
     let function = {
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let crate::value::Callable::User(user) = &object.call else {
+        let crate::value::ObjectKind::User(user) = &object.kind else {
             panic!("callback")
         };
         user.func.clone()
@@ -468,7 +468,7 @@ fn shared_snapshot_native_code_uses_each_realms_live_declarative_holder() {
         let value = i.get_var("appendPart", &env).ok().unwrap();
         let object_handle = value.as_obj().unwrap();
         let object = object_handle.borrow();
-        let crate::value::Callable::User(user) = &object.call else {
+        let crate::value::ObjectKind::User(user) = &object.kind else {
             panic!("shared function")
         };
         user.func.clone()

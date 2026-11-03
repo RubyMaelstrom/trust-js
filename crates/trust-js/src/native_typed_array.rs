@@ -83,8 +83,16 @@ impl Interp {
                 })
             })
             .clone();
-        object.borrow_mut().native_typed_array =
-            Some(crate::gc_storage::PayloadBox::new(NativeTypedArray {
+        let mut object = object.borrow_mut();
+        debug_assert!(
+            matches!(
+                object.kind,
+                crate::value::ObjectKind::Plain | crate::value::ObjectKind::TypedArray(_)
+            ),
+            "a typed array's view goes on an object with no other kind"
+        );
+        object.kind = crate::value::ObjectKind::TypedArray(crate::gc_storage::PayloadBox::new(
+            NativeTypedArray {
                 buffer_ptr: Rc::as_ptr(&buffer),
                 offset: info.offset,
                 end,
@@ -94,7 +102,8 @@ impl Interp {
                 kind,
                 shift: size.trailing_zeros() as u8,
                 buffer,
-            }));
+            },
+        ));
     }
 
     pub(crate) fn invalidate_native_buffer(&mut self, ptr: usize) {

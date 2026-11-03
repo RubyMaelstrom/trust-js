@@ -7,7 +7,7 @@
 //! code, and where a test counter records it, the inline template must have run rather than its
 //! helper. Together they exercise the templates that copy, overwrite and pop execution words,
 //! property words and the direct call's frame (none of which emits a count), and the guards
-//! that admit a Map's or Set's `Exotic::Collection` as ordinary. The template counters and the
+//! that admit a Map's or Set's `ObjectKind::Collection` as ordinary. The template counters and the
 //! direct call sequence these programs check are ARM64's; on x86-64 the programs run without
 //! them, except that the Map and Set program counts x64's own-data reads. The tests at the end
 //! check assembled ARM64 code: the finish stub's `this` reset, the property-word guard and the
@@ -42,7 +42,7 @@ pub(super) fn with_chunk<R>(
     let value = engine.interp.get_var(name, &env).ok().expect("bound name");
     let object_handle = value.as_obj().expect("a function object");
     let object = object_handle.borrow();
-    let crate::value::Callable::User(user) = &object.call else {
+    let crate::value::ObjectKind::User(user) = &object.kind else {
         panic!("{name} is not a user function")
     };
     let runtime = user.func.runtime();
@@ -556,7 +556,7 @@ fn direct_calls_keep_the_construct_state() {
     }
 }
 
-/// Maps and Sets (`Exotic::Collection`) through the ordinary-object guards: named
+/// Maps and Sets (`ObjectKind::Collection`) through the ordinary-object guards: named
 /// property loads (slot and operand-stack receivers, a Collection as a prototype hop, method
 /// loads through Map.prototype and Set.prototype), stores, updates and creations (a Map
 /// subclass's constructor), and element reads, writes, updates and `in`.

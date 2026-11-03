@@ -14,7 +14,7 @@
 
 use super::{
     asm, emit_exec_number_guard, emit_exec_word_load, jscvt_available, SharedStub, C_EQ, C_GE,
-    C_HS, C_LO, C_LS, C_VS,
+    C_HS, C_LO, C_LS, C_NE, C_VS,
 };
 use crate::native_typed_array::{
     Layout as NativeLayout, NativeBuffer as Buffer, NativeTypedArray as View,
@@ -26,6 +26,17 @@ use std::mem::offset_of;
 pub(super) enum WriteValue {
     Stack,
     Register(u32),
+}
+
+/// What the caller knows of the Object's kind (W2d step 1: the view is the payload of the
+/// object's `ObjectKind::TypedArray`, a word that holds another kind's payload on any other
+/// object, so the tag must say TypedArray before the view is read).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum KindTag {
+    /// W12 holds the Object's kind tag: the access compares it first.
+    InW12,
+    /// The caller has compared the tag with TypedArray's already.
+    Checked,
 }
 
 // Element kinds, as registered by `Interp::register_native_typed_array`.
@@ -50,14 +61,16 @@ fn use_stub() -> bool {
         && *STUBS.get_or_init(|| std::env::var("TRUST_JS_JIT_TYPED_STUBS").as_deref() != Ok("0"))
 }
 
-/// X11 = Object, X9 = exact unsigned index. On read, X12 is a packed Number and D1 its
-/// numeric value. The caller chooses the ownership/stack commit at `hit`.
+/// X11 = Object, X9 = exact unsigned index, W12 its kind tag unless `tag` says the caller
+/// checked it. On read, X12 is a packed Number and D1 its numeric value. The caller chooses the
+/// ownership/stack commit at `hit`.
 pub(super) fn emit(
     a: &mut asm::Asm,
     layout: &JitLayout,
     write: Option<WriteValue>,
     hit: usize,
     slow: usize,
+    tag: KindTag,
 ) {
     let Some(native) = layout.native_typed_array else {
         a.b(slow);
@@ -77,7 +90,11 @@ pub(super) fn emit(
         None => {}
     }
     if use_stub() {
-        // The stub returns W13 = 1 after an access and 0 when this template declines it.
+        // The stub takes W12 = the kind tag (a checked one is TypedArray's), and returns W13 = 1
+        // after an access and 0 when this template declines it.
+        if tag == KindTag::Checked {
+            a.movz(12, crate::value::KIND_TYPED_ARRAY_TAG as u32, 0);
+        }
         let stub = a.shared_stub(
             SharedStub::TypedElement {
                 write: write.is_some(),
@@ -88,13 +105,14 @@ pub(super) fn emit(
         a.cbz(13, false, slow);
         a.b(hit);
     } else {
-        emit_access(a, &native, write.is_some(), hit, slow);
+        emit_access(a, &native, write.is_some(), hit, slow, tag);
     }
     a.mark_pop();
 }
 
-/// The element access proper: X11 = Object, X9 = exact unsigned index (and D1 the value to
-/// store). Every guard branches to `slow` before the first write; the access ends at `hit`.
+/// The element access proper: X11 = Object, X9 = exact unsigned index, W12 its kind tag unless
+/// `tag` says the caller checked it (and D1 the value to store). Every guard branches to `slow`
+/// before the first write; the access ends at `hit`.
 ///
 /// After the receiver/index guards the template loads the live view, buffer and backing Vec,
 /// leaving X15 at the address of element zero (the Vec's data plus the view's byte offset), X13
@@ -106,9 +124,14 @@ pub(super) fn emit_access(
     write: bool,
     hit: usize,
     slow: usize,
+    tag: KindTag,
 ) {
+    if tag == KindTag::InW12 {
+        // Proxies, namespaces and unsupported typed-array kinds have another kind.
+        a.cmp_imm_w(12, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+        a.b_cond(C_NE, slow);
+    }
     a.ldr_imm(12, 11, layout.object_view as u32);
-    a.cbz(12, true, slow); // proxies, namespaces and unsupported typed-array kinds
     a.ldr_imm(13, 12, offset_of!(View, buffer_ptr) as u32);
     a.ldr_imm(14, 12, offset_of!(View, limit) as u32);
     a.cmp_reg_x(9, 14);

@@ -83,7 +83,7 @@ impl ForInKeys {
             props.push_dense(Property::plain(Value::Str(key.into())));
         }
         bytes = bytes.saturating_add(props.retained_requested_storage_bytes().0);
-        let object = Object::new_with_parts(None, props, Exotic::None);
+        let object = Object::new_with_parts(None, props, ObjectKind::Plain);
         object.borrow_mut().extensible = false;
         (Self(object), bytes)
     }
@@ -2272,7 +2272,7 @@ impl Interp {
             }
             // The receiver transitively owns every prototype. This walk runs no author code.
             let object = unsafe { (*current).borrow() };
-            if !object.ic_plain.get() || !object.exotic.is_ordinary() {
+            if !object.ic_plain.get() || !object.kind.is_ordinary() {
                 return None;
             }
             let (layout, prefix, enumerable) = object.props.enumeration_layout()?;
@@ -2665,7 +2665,7 @@ impl Interp {
         // resolution for builtins and script-level bindings) — one hash lookup, no trap walk.
         if self.ordinary_get_ptr(Gc::as_ptr(&self.global) as usize) {
             let b = self.global.borrow();
-            if matches!(b.exotic, crate::value::Exotic::None) {
+            if b.kind.exotic_is_none() {
                 if let Some(p) = b
                     .props
                     .get_walking(name, &mut atom.map(crate::atom::PropKey::atom))
@@ -3138,10 +3138,8 @@ impl Interp {
             let next = {
                 let object = current.borrow();
                 if !object.ic_plain.get()
-                    || !(matches!(
-                        object.exotic,
-                        crate::value::Exotic::None | crate::value::Exotic::Array
-                    ) || object.exotic.is_collection())
+                    || !(object.kind.is_ordinary()
+                        || matches!(object.kind, crate::value::ObjectKind::Array))
                 {
                     return None;
                 }
@@ -3168,10 +3166,8 @@ impl Interp {
             let next = {
                 let object = current.borrow();
                 if !object.ic_plain.get()
-                    || !(matches!(
-                        object.exotic,
-                        crate::value::Exotic::None | crate::value::Exotic::Array
-                    ) || object.exotic.is_collection())
+                    || !(object.kind.is_ordinary()
+                        || matches!(object.kind, crate::value::ObjectKind::Array))
                 {
                     return None;
                 }
@@ -3202,10 +3198,8 @@ impl Interp {
         };
         let mut object = object.borrow_mut();
         if !object.ic_plain.get()
-            || !(matches!(
-                object.exotic,
-                crate::value::Exotic::None | crate::value::Exotic::Array
-            ) || object.exotic.is_collection())
+            || !(object.kind.is_ordinary()
+                || matches!(object.kind, crate::value::ObjectKind::Array))
         {
             return Err(value);
         }
@@ -3286,7 +3280,7 @@ impl Interp {
             return Ok(true);
         }
         // A String wrapper's `length` and in-range indices are own exotic properties.
-        if let crate::value::Exotic::StrWrap(s) = &o.borrow().exotic {
+        if let crate::value::ObjectKind::StrWrap(s) = &o.borrow().kind {
             if key == "length" {
                 return Ok(true);
             }
@@ -4787,7 +4781,7 @@ impl Interp {
             },
         );
         let bound = Object::new(Some(self.function_proto));
-        bound.borrow_mut().call = Callable::bound(target, *promise, vec![Value::Obj(*flag)]);
+        bound.borrow_mut().kind = ObjectKind::bound(target, *promise, vec![Value::Obj(*flag)]);
         // A promise resolving function has `length` 1 and an empty `name`.
         bound.borrow_mut().props.insert(
             "length",
@@ -4826,7 +4820,7 @@ impl Interp {
             return false;
         };
         let function = function.borrow();
-        let Callable::Bound(bound) = &function.call else {
+        let ObjectKind::Bound(bound) = &function.kind else {
             return false;
         };
         matches!((bound.args.first()).map(|__value| (__value).view()), Some(ValueView::Obj(flag))
@@ -6794,10 +6788,10 @@ impl Interp {
         let o = Object::new(Some(self.function_proto));
         {
             let mut b = o.borrow_mut();
-            b.call = if is_get {
-                Callable::accessor_key(Callable::AccessorGet, backing.clone())
+            b.kind = if is_get {
+                ObjectKind::accessor_key(ObjectKind::AccessorGet, backing.clone())
             } else {
-                Callable::accessor_key(Callable::AccessorSet, backing.clone())
+                ObjectKind::accessor_key(ObjectKind::AccessorSet, backing.clone())
             };
             let prefix = if is_get { "get " } else { "set " };
             b.props.insert(
@@ -6850,11 +6844,11 @@ impl Interp {
 
     /// A function object wrapping an internal [`Callable`] (used for accessor get/set and decorator
     /// `access` helpers), with a spec-shaped `name`/`length`.
-    fn make_callable(&self, call: Callable, name: &str, len: f64) -> Value {
+    fn make_callable(&self, call: ObjectKind, name: &str, len: f64) -> Value {
         let o = Object::new(Some(self.function_proto));
         {
             let mut b = o.borrow_mut();
-            b.call = call;
+            b.kind = call;
             b.props.insert(
                 "name",
                 Property::data(Value::lstr(name.to_string()), false, false, true),
@@ -6890,18 +6884,18 @@ impl Interp {
         let access = self.new_object();
         if matches!(kind, "method" | "getter" | "field" | "accessor") {
             let call = if is_private {
-                Callable::accessor_key(Callable::PrivatePropGet, key_rc.clone())
+                ObjectKind::accessor_key(ObjectKind::PrivatePropGet, key_rc.clone())
             } else {
-                Callable::accessor_key(Callable::PropGet, key_rc.clone())
+                ObjectKind::accessor_key(ObjectKind::PropGet, key_rc.clone())
             };
             let g = self.make_callable(call, "get", 1.0);
             access.borrow_mut().props.insert("get", Property::plain(g));
         }
         if matches!(kind, "setter" | "field" | "accessor") {
             let call = if is_private {
-                Callable::accessor_key(Callable::PrivatePropSet, key_rc.clone())
+                ObjectKind::accessor_key(ObjectKind::PrivatePropSet, key_rc.clone())
             } else {
-                Callable::accessor_key(Callable::PropSet, key_rc.clone())
+                ObjectKind::accessor_key(ObjectKind::PropSet, key_rc.clone())
             };
             let s = self.make_callable(call, "set", 2.0);
             access.borrow_mut().props.insert("set", Property::plain(s));
@@ -7071,16 +7065,16 @@ impl Interp {
         let class_kind = obj.borrow().class_kind;
         let is_class = class_kind != 0;
         let derived = class_kind == crate::value::CLASS_DERIVED;
-        let call = obj.borrow().call.clone();
+        let call = obj.borrow().kind.clone_callable();
         match call {
             // A bound-function parent constructs through its target with the bound arguments
             // prepended (BoundFunction [[Construct]]).
-            Callable::Bound(bound) => {
+            ObjectKind::Bound(bound) => {
                 let mut all = bound.args.clone();
                 all.extend_from_slice(args);
                 self.run_constructor_on(&Value::Obj(bound.target), this, &all)
             }
-            Callable::User(user) => {
+            ObjectKind::User(user) => {
                 // A base class initializes its fields before its body runs; a derived class does so
                 // inside its own `super()`.
                 if is_class && !derived {
@@ -7120,13 +7114,11 @@ impl Interp {
                         }
                         // A Function (or GeneratorFunction/AsyncFunction) subclass instance is
                         // itself callable: carry the built-in's [[Call]] behavior onto `this`.
-                        let src_call = src.borrow().call.clone();
-                        if !matches!(src_call, Callable::None)
-                            && matches!(dst.borrow().call, Callable::None)
-                        {
+                        let src_call = src.borrow().kind.clone_callable();
+                        if src_call.is_callable() && !dst.borrow().kind.is_callable() {
                             let is_ctor = src.borrow().is_constructor;
                             let mut db = dst.borrow_mut();
-                            db.call = src_call;
+                            db.kind = src_call;
                             db.is_constructor = is_ctor;
                         }
                         // Move the native object's internal slots (Map/Set/TypedArray/buffer/etc.)
@@ -7137,15 +7129,19 @@ impl Interp {
                         // A subclass instance inherits the built-in's exotic behavior (e.g. an Array
                         // subclass is itself an Array exotic). The native object is discarded, so
                         // its exotic state moves rather than copies.
-                        let src_exotic = std::mem::replace(
-                            &mut src.borrow_mut().exotic,
-                            crate::value::Exotic::None,
-                        );
-                        if !matches!(src_exotic, crate::value::Exotic::None) {
-                            if matches!(src_exotic, crate::value::Exotic::Array) {
+                        let src_exotic = if src.borrow().kind.exotic_is_none() {
+                            crate::value::ObjectKind::Plain
+                        } else {
+                            std::mem::replace(
+                                &mut src.borrow_mut().kind,
+                                crate::value::ObjectKind::Plain,
+                            )
+                        };
+                        if !src_exotic.exotic_is_none() {
+                            if matches!(src_exotic, crate::value::ObjectKind::Array) {
                                 dst.borrow().props.mark_array();
                             }
-                            dst.borrow_mut().exotic = src_exotic;
+                            dst.borrow_mut().kind = src_exotic;
                         }
                         // WeakMap/WeakSet's [[WeakMapData]]/[[WeakSetData]] and its acceleration
                         // index are one internal slot implementation and must move together to the
@@ -7159,8 +7155,14 @@ impl Interp {
                         if let Some(v) = self.typed_arrays.remove(&sp) {
                             dst.borrow().ic_plain.set(false);
                             self.typed_arrays.insert(dp, v);
-                            dst.borrow_mut().native_typed_array =
-                                src.borrow_mut().native_typed_array.take();
+                            // The view moves with its side-table entry.
+                            if src.borrow().kind.typed_array().is_some() {
+                                let view = std::mem::replace(
+                                    &mut src.borrow_mut().kind,
+                                    crate::value::ObjectKind::Plain,
+                                );
+                                dst.borrow_mut().kind = view;
+                            }
                         }
                         // The TypedArray's `buffer` slot lives in a parallel side table keyed by the
                         // view's pointer, so it must move to `this` alongside its TaInfo.
@@ -7229,10 +7231,10 @@ impl Interp {
             if let ValueView::Obj(source) = &(value).view() {
                 if !Gc::ptr_eq(source, rest) {
                     let source = source.borrow();
-                    if source.ic_plain.get() && matches!(source.exotic, Exotic::None) {
+                    if source.ic_plain.get() && source.kind.exotic_is_none() {
                         let mut target = rest.borrow_mut();
                         if target.ic_plain.get()
-                            && matches!(target.exotic, Exotic::None)
+                            && target.kind.exotic_is_none()
                             && target.extensible
                             && target.props.try_copy_named_data_from(&source.props)
                         {
@@ -7541,7 +7543,7 @@ impl Interp {
         let obj = crate::value::Object::new_with_parts(
             Some(self.object_proto),
             props,
-            crate::value::Exotic::None,
+            crate::value::ObjectKind::Plain,
         );
         Value::Obj(obj)
     }
@@ -7570,7 +7572,7 @@ impl Interp {
         let obj = crate::value::Object::new_with_parts(
             Some(self.object_proto),
             map.instantiate_plain(values.into_iter()),
-            crate::value::Exotic::None,
+            crate::value::ObjectKind::Plain,
         );
         Value::Obj(obj)
     }
@@ -8823,8 +8825,8 @@ impl Interp {
                     &(handler).view(),
                     ValueView::Obj(o)
                         if matches!(
-                            o.borrow().call,
-                            Callable::Native(f)
+                            o.borrow().kind,
+                            ObjectKind::Native(f)
                                 if f as usize
                                     == crate::builtins::default_has_instance as NativeFn as usize
                         )
@@ -8876,8 +8878,8 @@ impl Interp {
                             (value).view(),
                             ValueView::Obj(ref function)
                                 if matches!(
-                                    function.borrow().call,
-                                    Callable::Native(native)
+                                    function.borrow().kind,
+                                    ObjectKind::Native(native)
                                         if native as usize
                                             == crate::builtins::default_has_instance
                                                 as *const () as usize
@@ -8887,7 +8889,7 @@ impl Interp {
                 let target = if canonical {
                     let b = rhs.borrow();
                     (b.is_constructor
-                        && matches!(b.exotic, Exotic::None)
+                        && b.kind.exotic_is_none()
                         && b.ic_plain.get()
                         && b.props.shape() == cached.recv_shape
                         && b.proto
@@ -8923,7 +8925,7 @@ impl Interp {
             (Some(key), ValueView::Obj(o)) if self.ordinary_get_ptr(Gc::as_ptr(o) as usize) => {
                 let b = o.borrow();
                 if b.is_constructor
-                    && matches!(b.exotic, Exotic::None)
+                    && b.kind.exotic_is_none()
                     && b.ic_plain.get()
                     && crate::value::is_cacheable_shape(b.props.shape())
                     && b.proto
@@ -8963,10 +8965,10 @@ impl Interp {
     /// `prototype` appears on `O`'s prototype chain.
     pub(crate) fn ordinary_has_instance(&mut self, c: &Value, o: &Value) -> Result<bool, Abrupt> {
         let co = match &(c).view() {
-            ValueView::Obj(x) if !matches!(x.borrow().call, Callable::None) => *x,
+            ValueView::Obj(x) if x.borrow().kind.is_callable() => *x,
             _ => return Ok(false),
         };
-        if let Callable::Bound(bound) = &co.borrow().call {
+        if let ObjectKind::Bound(bound) = &co.borrow().kind {
             let target = Value::Obj(bound.target);
             return self.ordinary_has_instance(&target, o);
         }
@@ -9269,8 +9271,8 @@ impl Interp {
             return self.value_is_constructor(&target.clone());
         }
         let b = o.borrow();
-        match &b.call {
-            Callable::User(user) => {
+        match &b.kind {
+            ObjectKind::User(user) => {
                 !(user.func.is_arrow
                     || user.func.is_method
                     || user.func.is_generator
@@ -9286,7 +9288,7 @@ impl Interp {
             // ECMA-262 BoundFunctionCreate step 5: [[Construct]] is installed at creation exactly
             // when IsConstructor(targetFunc) held then; `bind` records that answer. Reading the
             // record (instead of re-walking the target chain) keeps long bind chains O(1) here.
-            Callable::Bound(_) => b.is_constructor,
+            ObjectKind::Bound(_) => b.is_constructor,
             _ => false,
         }
     }

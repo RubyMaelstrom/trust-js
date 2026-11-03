@@ -4,7 +4,7 @@
 //! one stable object with its creation realm's intrinsic parent and the correct constructor.
 //! Collector and memory traversal must not count as value observations.
 
-use super::{Exotic, Gc, Object, PropClass, Property, PropertyLayout, Props};
+use super::{Gc, Object, ObjectKind, PropClass, Property, PropertyLayout, Props};
 use crate::gc_trace::GcTrace;
 use std::cell::RefCell;
 
@@ -75,7 +75,7 @@ impl LazyFunctionPrototype {
                 .push(Property::builtin(super::Value::Obj(owner)));
         }
         props.shape = self.shape;
-        let prototype = Object::new_with_parts(Some(*parent), props, Exotic::None);
+        let prototype = Object::new_with_parts(Some(*parent), props, ObjectKind::Plain);
         // The write barrier: this cell now names the fresh prototype. No safepoint lies between
         // the card and the store.
         // SAFETY: `self` is the payload of a live deferred-prototype cell (`gc_box::new` moves

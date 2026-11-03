@@ -2,7 +2,7 @@
 //! JavaScript dispatch. Run with
 //! `cargo test --release -p trust-js --lib object_alloc_bench -- --ignored --nocapture`.
 
-use crate::value::{Exotic, Object, Property, Props, Value};
+use crate::value::{Object, ObjectKind, Property, Props, Value};
 use std::rc::Rc;
 
 fn time_per_op(label: &str, iterations: u32, mut op: impl FnMut(u32)) {
@@ -36,7 +36,11 @@ fn object_alloc_bench() {
     time_per_op("templated {x,y} + drop", N, |i| {
         let props =
             template.instantiate_plain([(Value::Num(f64::from(i))), (Value::Num(1.0))].into_iter());
-        std::hint::black_box(Object::new_with_parts(Some(proto), props, Exotic::None));
+        std::hint::black_box(Object::new_with_parts(
+            Some(proto),
+            props,
+            ObjectKind::Plain,
+        ));
     });
 
     let mut kept = Vec::with_capacity(N as usize);
@@ -80,8 +84,8 @@ fn object_layout_sizes() {
         "Object {} Props {} Callable {} Exotic {} Property {} RefCell<Object> {}",
         std::mem::size_of::<Object>(),
         std::mem::size_of::<Props>(),
-        std::mem::size_of::<Callable>(),
-        std::mem::size_of::<Exotic>(),
+        std::mem::size_of::<ObjectKind>(),
+        std::mem::size_of::<ObjectKind>(),
         std::mem::size_of::<Property>(),
         std::mem::size_of::<std::cell::RefCell<Object>>()
     );

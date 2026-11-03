@@ -85,7 +85,7 @@ fn active_code(interp: &Interp, name: &str) -> Option<Rc<crate::jit::JitCode>> {
     for frame in interp.fn_frames.iter().rev() {
         let callee = frame.callee();
         let object = callee.borrow();
-        if let crate::value::Callable::User(user) = &object.call {
+        if let crate::value::ObjectKind::User(user) = &object.kind {
             if user.func.name.as_deref() == Some(name) {
                 return user
                     .func
@@ -856,7 +856,7 @@ fn agent_limit_and_next_threshold_changes_reach_same_warmed_native_parent_poll()
             .as_obj()
             .expect("parent function");
         let object = function.borrow();
-        let crate::value::Callable::User(user) = &object.call else {
+        let crate::value::ObjectKind::User(user) = &object.kind else {
             panic!("user parent")
         };
         user.func
@@ -1769,18 +1769,18 @@ fn agent_derived_function_retains_actual_source_record_and_module_namespace_iden
             let wrapper = global(&mut engine.interp, "derivedWrapper")
                 .as_obj()
                 .expect("wrapped derived function");
-            let cross = match &wrapper.borrow().call {
-                crate::value::Callable::WrappedShadow(wrapped) => *wrapped.target,
+            let cross = match &wrapper.borrow().kind {
+                crate::value::ObjectKind::WrappedShadow(wrapped) => *wrapped.target,
                 _ => panic!("explicit ShadowRealm wrapper"),
             };
             // Wrapping never unwraps: the child's own wrapper of the parent Function is inside.
-            let actual = match &cross.as_obj().expect("child wrapper").borrow().call {
-                crate::value::Callable::WrappedCross(wrapped) => wrapped.target,
+            let actual = match &cross.as_obj().expect("child wrapper").borrow().kind {
+                crate::value::ObjectKind::WrappedCross(wrapped) => wrapped.target,
                 _ => panic!("child-side wrapper of the parent Function"),
             };
             let derived = actual.as_obj().expect("actual parent Function");
-            match &derived.borrow().call {
-                crate::value::Callable::User(user) => {
+            match &derived.borrow().kind {
+                crate::value::ObjectKind::User(user) => {
                     assert_eq!(
                         user.realm,
                         Gc::as_ptr(&engine.interp.global) as usize,
@@ -2176,12 +2176,12 @@ fn agent_child_await_resumes_in_its_own_interpreter_when_the_parent_settles() {
         let wrapper = global(&mut engine.interp, "derivedWrapper")
             .as_obj()
             .expect("wrapped derived function");
-        let cross = match &wrapper.borrow().call {
-            crate::value::Callable::WrappedShadow(wrapped) => *wrapped.target,
+        let cross = match &wrapper.borrow().kind {
+            crate::value::ObjectKind::WrappedShadow(wrapped) => *wrapped.target,
             _ => panic!("explicit ShadowRealm wrapper"),
         };
-        let actual = match &cross.as_obj().expect("child wrapper").borrow().call {
-            crate::value::Callable::WrappedCross(wrapped) => wrapped.target,
+        let actual = match &cross.as_obj().expect("child wrapper").borrow().kind {
+            crate::value::ObjectKind::WrappedCross(wrapped) => wrapped.target,
             _ => panic!("child-side wrapper of the parent Function"),
         };
         engine

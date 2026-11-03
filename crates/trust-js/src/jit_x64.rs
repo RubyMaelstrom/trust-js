@@ -501,10 +501,9 @@ impl Asm {
         self.jcc(EQ, slow);
     }
     /// Branch to `slow` unless the Object at `obj` has ordinary internal methods
-    /// ([`crate::value::Exotic::is_ordinary`]), as ARM64's `guard_exotic_ordinary`: its exotic
-    /// tag is None's, or, where `jit::exotic_collection_admitted` holds, a Map's or Set's
-    /// Collection's, which one unsigned range test from None's tag admits. Clobbers `scratch`
-    /// and the flags.
+    /// ([`crate::value::ObjectKind::is_ordinary`]), as ARM64's `guard_exotic_ordinary`: one
+    /// unsigned compare of its kind tag with [`crate::value::KIND_ORDINARY_LAST`]. Clobbers
+    /// `scratch` and the flags.
     fn guard_exotic_ordinary(
         &mut self,
         layout: &crate::value::JitLayout,
@@ -512,15 +511,23 @@ impl Asm {
         scratch: u8,
         slow: usize,
     ) {
-        self.nr_load8(scratch, obj, layout.obj_exotic);
-        if super::exotic_collection_admitted(layout) {
-            self.nr_op_imm(5, scratch, i32::from(layout.exotic_none_tag)); // sub
-            self.nr_op_imm(7, scratch, 1);
-            self.jcc(ABOVE, slow);
-        } else {
-            self.nr_op_imm(7, scratch, i32::from(layout.exotic_none_tag));
-            self.jcc(NE, slow);
-        }
+        self.nr_load8(scratch, obj, layout.obj_kind);
+        self.nr_op_imm(7, scratch, i32::from(crate::value::KIND_ORDINARY_LAST));
+        self.jcc(ABOVE, slow);
+    }
+    /// Branch to `slow` unless the Object at `obj` carries no exotic state (a plain object, a
+    /// typed array's view or a callable: the former `Exotic::None`), one unsigned compare of its
+    /// kind tag with [`crate::value::KIND_EXOTIC_NONE_LAST`]. Clobbers `scratch` and the flags.
+    fn guard_exotic_none(
+        &mut self,
+        layout: &crate::value::JitLayout,
+        obj: u8,
+        scratch: u8,
+        slow: usize,
+    ) {
+        self.nr_load8(scratch, obj, layout.obj_kind);
+        self.nr_op_imm(7, scratch, i32::from(crate::value::KIND_EXOTIC_NONE_LAST));
+        self.jcc(ABOVE, slow);
     }
 }
 
@@ -575,7 +582,7 @@ fn emit_prop_own(
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS};
     let offsets = [
         layout.obj_from_cell,
-        layout.obj_exotic,
+        layout.obj_kind,
         layout.obj_ic_plain,
         layout.obj_props + layout.props_shape,
         layout.entry_size,
@@ -697,7 +704,7 @@ fn emit_prop_num(
 ) -> bool {
     if !layout.valid
         || !storage::fields_data_fits(layout)
-        || layout.obj_exotic > i32::MAX as usize
+        || layout.obj_kind > i32::MAX as usize
         || st.depth > 2
         || (st.depth == 2 && st.mid_ok & 1 == 0)
         || layout.entry_size.checked_mul(st.slot as usize).is_none()
@@ -1508,7 +1515,7 @@ mod encoding_tests {
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
     use crate::value::ValueView;
-    use crate::{bytecode::Tier, value::Callable, Completion, Engine};
+    use crate::{bytecode::Tier, value::ObjectKind, Completion, Engine};
 
     fn engine() -> Engine {
         let mut engine = Engine::new();
@@ -1534,7 +1541,7 @@ mod tests {
             panic!("{name} is not an object");
         };
         let object = object.borrow();
-        let Callable::User(user) = &object.call else {
+        let ObjectKind::User(user) = &object.call else {
             panic!("{name} is not a user function");
         };
         let runtime = user.func.runtime();
