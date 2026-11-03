@@ -608,6 +608,14 @@ does (Order, step 0).
 27. Region admission's step 3 (2026-11-03) is parked, as its record measured it: exit sites with
     recompilation get another attempt in Phase 3, with the speculative tier (see "Carried to
     Phase 3"). Its branch, p2-region-s3, is kept for that attempt. P2 continues with W2d.
+28. W2d's open questions (2026-11-03) are answered as its design note recommends ("W2d: a slimmer
+    cell"), and the design goes ahead in its order:
+    a. A named slot is one value word, with attributes in the layout and the shape as their
+       proof, as in V8, SpiderMonkey and JSC.
+    b. The header is 72 bytes, with the kind as a 16-byte enum; the hand-packed 64-byte header
+       is not taken.
+    c. Small arrays' elements: copy-on-write for constant literals first (V8, JSC), then fixed
+       elements in the array's cell (SpiderMonkey), measured after it.
 
 ## Non-goals
 
@@ -6586,7 +6594,7 @@ Left from the design:
 Lead for a baseline item: Vue's reactive proxy `get` trap runs GetProp, CallWithThis, GetElem
 and TypeofIs about 77,000 times each in the exact-PC helper (TRUST_JS_JIT_OPSTAT=2).
 
-### W2d: a slimmer cell (census and design, 2026-11-03)
+### W2d: a slimmer cell (census and design, 2026-11-03; decided, Decision 28)
 
 Census: main 4a13ca45 with a census patch (target/p2/w2d/census-src: w2d_census.rs and its hooks,
 TRUST_JS_W2D_CENSUS=1), a release build without LTO (the census counts objects, not
@@ -6892,3 +6900,5 @@ Open questions for the owner:
      the header below 192 B;
    - or both. Recommended: copy-on-write first, for the exit, then fixed elements measured after
      it.
+
+The owner approved the three recommendations on 2026-11-03 (Decision 28).
