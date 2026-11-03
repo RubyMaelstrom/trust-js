@@ -16343,6 +16343,7 @@ impl Interp {
             crate::value::class_for(instance_capacity),
             |props| props.init_layout(instance_capacity, instance_layout),
         );
+        chunk.note_instance(&this);
         let this_val = Value::Obj(this);
         // --- committed: identical shape to call_jit_cached's committed path ---
         self.depth += 1;

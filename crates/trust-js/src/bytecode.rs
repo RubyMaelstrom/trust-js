@@ -2913,6 +2913,16 @@ pub struct Chunk {
     /// Field count learned from a structurally proven `initialize.apply(this, arguments)`
     /// forwarder. Once set it is as stable as the immutable forwarding/initializer chunks.
     forwarded_capacity_hint: std::cell::Cell<u8>,
+    /// The most named slots an instance of this constructor held when its next construction
+    /// looked, over its first [`CONSTRUCT_LEARNING`] constructions (W2d step 3d): fields set
+    /// after the constructor returned count, as V8's slack tracking measures the most an initial
+    /// map's tree took after seven constructions (js-function.cc:1507-1549,
+    /// map-updater.cc:472-511). It only grows, and picks later instances' capacity class.
+    learned_capacity: std::cell::Cell<u8>,
+    /// The constructions [`Chunk::note_instance`] has seen, up to [`CONSTRUCT_LEARNING`], and the
+    /// latest one's instance, held weakly until the next construction measures it.
+    learning: std::cell::Cell<u8>,
+    learning_instance: std::cell::RefCell<Option<crate::value::WeakGc>>,
     /// Key-only prediction learned from this chunk's guarded initializer plan. Forwarding
     /// closures may share a wrapper chunk while selecting different initializers, so the keys
     /// belong to the initializer, not the wrapper. Live plan guards remain authoritative.
@@ -3140,6 +3150,9 @@ impl crate::gc_trace::GcTrace for Chunk {
             instance_capacity_hint: _,
             instance_layout,
             forwarded_capacity_hint: _,
+            learned_capacity: _,
+            learning: _,
+            learning_instance: _, // weak: the heap clears it
             initializer_layout,
             funcs: _,
             templates: _,
@@ -3854,7 +3867,35 @@ impl Chunk {
 
     pub(crate) fn instance_capacity_hint(&self) -> usize {
         self.instance_capacity_hint
-            .max(self.forwarded_capacity_hint.get()) as usize
+            .max(self.forwarded_capacity_hint.get())
+            .max(self.learned_capacity.get()) as usize
+    }
+    /// Note a construction's new instance (W2d step 3d): over the first [`CONSTRUCT_LEARNING`]
+    /// constructions, raise the learned capacity to what the previous instance holds now, and
+    /// keep this one, weakly, for the next. Afterwards one compare.
+    #[inline]
+    pub(crate) fn note_instance(&self, instance: &crate::value::Gc) {
+        let seen = self.learning.get();
+        if seen < CONSTRUCT_LEARNING {
+            self.note_instance_learning(instance, seen);
+        }
+    }
+    #[inline(never)]
+    fn note_instance_learning(&self, instance: &crate::value::Gc, seen: u8) {
+        let mut previous = self.learning_instance.borrow_mut();
+        if let Some(previous) = previous.take().and_then(|weak| weak.upgrade()) {
+            let held = previous
+                .try_borrow()
+                .map_or(0, |object| object.props.named_len());
+            let held = u8::try_from(held).unwrap_or(u8::MAX);
+            if held > self.learned_capacity.get() {
+                self.learned_capacity.set(held);
+            }
+        }
+        self.learning.set(seen + 1);
+        if seen + 1 < CONSTRUCT_LEARNING {
+            *previous = Some(crate::value::Gc::downgrade(instance));
+        }
     }
     pub(crate) fn instance_layout(&self) -> Option<&crate::value::PropertyLayout> {
         self.initializer_layout
@@ -8604,6 +8645,9 @@ fn finish_chunk(
         instance_capacity_hint,
         instance_layout,
         forwarded_capacity_hint: std::cell::Cell::new(0),
+        learned_capacity: std::cell::Cell::new(0),
+        learning: std::cell::Cell::new(0),
+        learning_instance: std::cell::RefCell::new(None),
         initializer_layout: std::cell::OnceCell::new(),
         funcs: c.funcs,
         templates: c.templates,
@@ -24970,6 +25014,10 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
     }
 }
 
+/// Constructions over which a constructor learns its instances' capacity ([`Chunk::note_instance`],
+/// W2d step 3d): V8's slack tracking decides after seven (map.h:443-479).
+const CONSTRUCT_LEARNING: u8 = 8;
+
 /// Dedicated `Op::MakeObject` entry (same contract as [`jit_exec`]): clones the site's
 /// pre-shaped map and moves the values straight off the operand stack — no generic op
 /// dispatch, no intermediate `Vec`.
@@ -25625,13 +25673,14 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     let capacity = chunk
         .instance_capacity_hint()
         .max(layout.as_ref().map_or(0, |keys| keys.len()));
-    Value::Obj(crate::value::Object::new_built(
+    let instance = crate::value::Object::new_built(
         Some(proto),
         crate::value::ObjectKind::Plain,
         crate::value::class_for(capacity),
         |props| props.init_layout(capacity, layout),
-    ))
-    .bits()
+    );
+    chunk.note_instance(&instance);
+    Value::Obj(instance).bits()
 }
 
 #[cfg(test)]
