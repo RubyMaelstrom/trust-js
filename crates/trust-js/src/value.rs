@@ -7155,6 +7155,8 @@ impl NamedEntries {
     fn clear(&mut self) {
         self.len = 0;
         self.layout = None;
+        // The key index lives in the record (W2d step 2): it goes with the keys.
+        self.set_index(None);
     }
     /// Report the record's blocks: its own, the key index's (and its slots') and the extras'
     /// payload cell.

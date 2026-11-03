@@ -11851,7 +11851,8 @@ fn emit_card_mark(a: &mut asm::Asm, owner: u32, s1: u32, s2: u32) {
 }
 
 /// Debug check for [`emit_card_mark`]'s use of an Object address: it lies in its cell's card.
-/// Object cells (192 bytes) start 0 or 64 bytes into a 128-byte card.
+/// Object cells (128 bytes since W2d step 2, 192 before) start at a multiple of 64 bytes into a
+/// 128-byte card, so an Object fewer than 64 bytes past its cell's start shares that card.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
