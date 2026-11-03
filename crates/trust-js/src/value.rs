@@ -7724,11 +7724,36 @@ impl NamedEntries {
             crate::gc_storage::PayloadBox::trace(extras, sink);
         }
     }
-    /// The slot words' edges.
+    /// The slot words' edges: the cell's run, then the record's, each a loop over consecutive
+    /// words, so marking decides once per map, not per slot, where its slots live (W2d step 3).
     #[inline]
     fn trace_slots<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        for i in 0..self.len() {
-            self.slot(i).trace_gc_edges(sink);
+        let len = self.len();
+        let in_cell = len.min(self.cell as usize);
+        let cell = self.cell_slots();
+        for i in 0..in_cell {
+            // SAFETY: a map with cell slots is in its cell, which holds `cell` slot words after
+            // its header, the first `len` of them initialized (see `slot`).
+            unsafe { &*cell.add(i) }.trace_gc_edges(sink);
+        }
+        if len > in_cell {
+            let block = self
+                .record
+                .0
+                .expect("the slots past the cell's are in the record");
+            // SAFETY: the record's block holds its slot words after the header, the first
+            // `len - cell` of them written (see `Record::slot`).
+            let record = unsafe {
+                block
+                    .as_ptr()
+                    .cast::<u8>()
+                    .add(RECORD_SLOTS_OFF)
+                    .cast::<PropWord>()
+            };
+            for i in 0..len - in_cell {
+                // SAFETY: as above.
+                unsafe { &*record.add(i) }.trace_gc_edges(sink);
+            }
         }
     }
 }
