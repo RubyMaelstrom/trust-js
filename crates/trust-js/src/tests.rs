@@ -6357,13 +6357,23 @@ fn compiled_allocation_loop_safepoints_preserve_live_and_kept_roots() {
         engine
             .interp
             .set_agent_next(engine.interp.live_object_count() + 128);
+        // The task boundary's collection is deferred, so only the loop's allocation safepoints
+        // can collect during the call. Whether the previous job's dead cycle goes depends on
+        // stale words in native frames, which the stack scan may take for references (W2d
+        // step 3: a 96-byte cell moved it under one in the tree-walker's frames), so the
+        // collection itself is the evidence, as in the test below.
+        let before = engine.interp.gc_heap.core.borrow().collections();
         assert!(
             eval_true(
                 &mut engine,
                 "var kept=new WeakRef({answer:17});\n\
-                 allocate()===1042 && previous.deref()===undefined && kept.deref().answer===17",
+                 allocate()===1042 && kept.deref().answer===17",
             ),
             "{tier:?}"
+        );
+        assert!(
+            engine.interp.gc_heap.core.borrow().collections() > before,
+            "{tier:?}: no allocation safepoint collected"
         );
         engine.run_microtasks_interruptible().unwrap();
         engine.collect_garbage_at_idle();

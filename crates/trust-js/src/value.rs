@@ -2891,7 +2891,7 @@ impl Object {
     ) -> Gc {
         #[cfg(feature = "architecture-diagnostics")]
         let caller = std::panic::Location::caller();
-        let obj = Self::alloc(proto, Props::new_in_class(class), kind);
+        let obj = Self::alloc_empty(proto, kind, class);
         // SAFETY: the object is fresh, so nothing else refers to it or borrows its map.
         init(unsafe { &mut (*obj.object_ptr()).props });
         debug_assert_eq!(
@@ -2902,6 +2902,26 @@ impl Object {
         #[cfg(feature = "architecture-diagnostics")]
         Self::note_birth(&obj, caller);
         obj
+    }
+
+    /// Allocate a cell of capacity class `class` for an object whose empty map is in the cell from
+    /// birth: it has no slots to move ([`NamedEntries::attach`]).
+    #[inline(always)]
+    fn alloc_empty(proto: Option<Gc>, kind: ObjectKind, class: u32) -> Gc {
+        let mut props = Props::new_in_class(class);
+        props.entries.cell = class_slots(class) as u8;
+        with_active_gc_heap(|heap| {
+            debug_assert!(
+                proto.as_ref().is_none_or(|prototype| {
+                    heap.core
+                        .borrow()
+                        .owns_cell(Gc::as_ptr(prototype) as usize, heap.object_desc)
+                }),
+                "object prototype belongs to another Agent heap (I6)"
+            );
+            heap.allocated.set(heap.allocated.get().wrapping_add(1));
+            Gc::new_in(heap, class, RefCell::new(Object { proto, props, kind }))
+        })
     }
 
     /// Allocate a cell for an object of `props`, a map outside any cell, in the capacity class its
@@ -6432,6 +6452,7 @@ impl NamedEntries {
         }
     }
     /// The extras and index of `other`'s record, copied into this map's (a template's instance).
+    #[inline]
     fn copy_record_parts_from(&mut self, other: &NamedEntries) {
         let Some(header) = other.record.header() else {
             return;
@@ -6439,6 +6460,10 @@ impl NamedEntries {
         if header.index.is_none() && header.extras.is_none() {
             return;
         }
+        self.copy_record_parts_out_of_line(header);
+    }
+    #[inline(never)]
+    fn copy_record_parts_out_of_line(&mut self, header: &RecordHeader) {
         let index = header.index.clone();
         let extras = header.extras.clone();
         let mine = self.record.ensure();
@@ -7514,6 +7539,33 @@ impl NamedEntries {
         }
         self.push_predicted(word);
     }
+    /// Append `word` in the cell, which has room for it: a builder's append to a map whose slots
+    /// all fit its cell (W2d step 3).
+    #[inline(always)]
+    fn push_in_cell(&mut self, word: PropWord) {
+        let len = self.len();
+        debug_assert!(len < self.cell as usize, "room in the cell");
+        // SAFETY: a map with cell slots is in its cell, which has room past `len`.
+        unsafe { self.cell_slots().add(len).write(word) };
+        self.len += 1;
+    }
+    /// Append `words`, `count` of them, to this map, fresh and empty: straight into the cell when
+    /// they fit it, else after reserving the record once (W2d step 3).
+    #[inline(always)]
+    fn extend_fresh(&mut self, count: usize, words: impl Iterator<Item = PropWord>) {
+        debug_assert!(self.is_empty());
+        if count <= self.cell as usize {
+            for word in words {
+                self.push_in_cell(word);
+            }
+        } else {
+            self.reserve_exact(count);
+            for word in words {
+                self.push_predicted(word);
+            }
+        }
+        debug_assert_eq!(self.len(), count);
+    }
     /// Append the slot word of the key the layout predicts. When the slots are full the record
     /// grows at once to the layout's length (a constructor's whole field list), or doubles;
     /// callers that know the final count reserve it first.
@@ -8409,6 +8461,7 @@ impl Props {
 
     /// [`Props::with_layout`] for this map, fresh and empty (W2d step 3: an object's, in its
     /// cell, from [`Object::new_built`]): room for `capacity` slots and the predicted keys.
+    #[inline]
     pub(crate) fn init_layout(&mut self, capacity: usize, layout: Option<PropertyLayout>) {
         debug_assert!(self.entries.is_empty() && self.entries.layout.is_none());
         self.entries.reserve_exact(capacity);
@@ -8605,6 +8658,7 @@ impl Props {
     ///
     /// # Safety
     /// `items..items+len` contains immutable initialized execution words valid through this call.
+    #[inline]
     pub(crate) unsafe fn init_packed_array_from_raw(&mut self, items: *const Value, len: usize) {
         // SAFETY: the caller's `len` initialized words; a Value is its word (repr transparent).
         let words = unsafe { std::slice::from_raw_parts(items.cast::<u64>(), len) };
@@ -8612,6 +8666,7 @@ impl Props {
     }
 
     /// [`Props::init_packed_array`] of a list in hand: its words are copied in one pass.
+    #[inline]
     pub(crate) fn init_packed_array_from_slice(&mut self, items: &[Value]) {
         // SAFETY: a Value is its word (repr transparent over u64).
         let words =
@@ -8619,6 +8674,7 @@ impl Props {
         self.init_packed_array_words(word_block::Words::from_words(words), items.len());
     }
 
+    #[inline]
     fn init_packed_array_words(&mut self, words: word_block::Words, len: usize) {
         let shape = array_length_shape(self.entries.class());
         self.init_packed_array_named_words(
@@ -8640,6 +8696,7 @@ impl Props {
     }
 
     /// [`Props::packed_array`] into this map, fresh and empty.
+    #[inline]
     pub(crate) fn init_packed_array(&mut self, items: impl ExactSizeIterator<Item = Value>) {
         let shape = array_length_shape(self.entries.class());
         self.init_packed_array_named(items, shape, array_length_layout(), std::iter::empty());
@@ -8682,12 +8739,12 @@ impl Props {
         // The layout lists ArrayCreate's `length` and then the named properties, with their
         // attributes: the slots take only their values.
         entries.layout = Some(layout);
-        entries.reserve_exact(1 + named.len());
         entries.shape = shape;
-        entries.push_predicted(PropWord::from_value(Value::Num(len as f64)));
-        for value in named {
-            entries.push_predicted(PropWord::from_value(value));
-        }
+        entries.extend_fresh(
+            1 + named.len(),
+            std::iter::once(PropWord::from_value(Value::Num(len as f64)))
+                .chain(named.map(PropWord::from_value)),
+        );
         debug_assert!(entries.layout.as_ref().is_some_and(|layout| {
             layout.attr(0) == PROP_WRITABLE as u8
                 && (1..entries.len()).all(|slot| layout.attr(slot) == PROP_PLAIN)
@@ -8743,12 +8800,9 @@ impl Props {
         debug_assert!(entries.is_empty() && entries.layout.is_none());
         // The layout lists the keys with their attributes; the slots take only the values.
         entries.layout = template.entries.layout.clone();
-        entries.reserve_exact(values.len());
         entries.shape = template.entries.shape;
         entries.copy_record_parts_from(&template.entries);
-        for value in values {
-            entries.push_predicted(PropWord::from_value(value));
-        }
+        entries.extend_fresh(values.len(), values.map(PropWord::from_value));
         // The template's map bits; the object's own.
         entries.flags.set(
             template.entries.flags.get() & (FLAG_HAS_FAR | FLAG_ELEM_MODE)
@@ -8762,17 +8816,18 @@ impl Props {
     /// Make this map, fresh and empty, a copy of `template`: its layout, shape, map bits, memos,
     /// record parts, elements and slot words (W2d step 3: in place, where `clone` makes a copy
     /// outside any cell). A deferred prototype is materialized, as a clone's is.
+    #[inline]
     pub(crate) fn init_copy_of(&mut self, template: &Props) {
         let source = &template.entries;
         let entries = &mut self.entries;
         debug_assert!(entries.is_empty() && entries.layout.is_none());
         entries.layout = source.layout.clone();
-        entries.reserve_exact(source.len());
         entries.shape = source.shape;
         entries.copy_record_parts_from(source);
-        for i in 0..source.len() {
-            entries.push_predicted(source.slot(i).copied_for_another_map());
-        }
+        entries.extend_fresh(
+            source.len(),
+            (0..source.len()).map(|i| source.slot(i).copied_for_another_map()),
+        );
         entries
             .flags
             .set(source.flags.get() & !OBJECT_FLAGS | entries.flags.get() & OBJECT_FLAGS);

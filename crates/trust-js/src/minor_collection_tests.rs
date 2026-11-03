@@ -297,8 +297,9 @@ fn allocation_safepoints_collect_minorly_until_a_major_collection_is_due() {
             "function churn(n) { var o; for (var i = 0; i < n; i++) o = { i: i }; return o.i; } 0",
         );
         let before = collections(&engine);
-        // 20,000 objects of 192 bytes: about 15 nursery budgets.
-        assert_eq!(eval(&mut engine, "churn(20000)"), "19999", "{tier:?}");
+        // 40,000 objects of 96 bytes (W2d step 3: a literal's key count picks its cell): about
+        // 15 nursery budgets.
+        assert_eq!(eval(&mut engine, "churn(40000)"), "39999", "{tier:?}");
         let (minor, major) = since(&engine, before);
         assert!(
             minor >= 8 && major == 0,
