@@ -11782,6 +11782,27 @@ fn emit_prop_create_probe(
     a.ldr_w_imm(14, 12, IC_OFF_RECV_SHAPE);
     a.cmp_reg_w(13, 14);
     a.b_cond(C_NE, miss);
+    // The way's prototype next, then its epoch: a site whose receivers share one shape under
+    // many prototypes (TypeScript's AST, which each node class's constructor calls on its own
+    // instance) fills ways that differ only there, and these compares reject them before the
+    // map's checks. The cache stores `Gc::as_ptr(proto)`; Object::proto stores the cell address,
+    // the same word (or null).
+    a.ldr_w_imm(14, 12, IC_OFF_SLOT);
+    a.ldr_w_imm(15, 12, IC_OFF_MID2_SHAPE);
+    a.lsl_imm(15, 15, 32);
+    a.logic_x(1, 14, 14, 15);
+    a.ldr_imm(16, 11, layout.obj_proto as u32);
+    a.cmp_reg_x(14, 16);
+    a.b_cond(C_NE, miss);
+    // Same live global epoch recorded by the fill; saturation is never cacheable.
+    a.mov_imm64(16, crate::value::proto_epoch_ptr() as usize as u64);
+    a.ldr_w_imm(16, 16, 0);
+    a.ldr_w_imm(17, 12, IC_OFF_MID_SHAPE);
+    a.cmp_reg_w(16, 17);
+    a.b_cond(C_NE, miss);
+    a.mov_imm64(9, u32::MAX as u64);
+    a.cmp_reg_w(16, 9);
+    a.b_cond(C_EQ, miss);
     a.ldrb_imm(9, 11, layout.obj_flags as u32);
     a.tbz(9, flag_bit(crate::value::FLAG_EXTENSIBLE), miss);
     a.tbnz(9, flag_bit(crate::value::FLAG_PROTO), miss);
@@ -11848,24 +11869,6 @@ fn emit_prop_create_probe(
     a.cmp_reg_x(13, 17);
     a.b_cond(C_HS, miss);
     a.bind(key_ready);
-    // Same live global epoch recorded by the fill; saturation is never cacheable.
-    a.mov_imm64(16, crate::value::proto_epoch_ptr() as usize as u64);
-    a.ldr_w_imm(16, 16, 0);
-    a.ldr_w_imm(17, 12, IC_OFF_MID_SHAPE);
-    a.cmp_reg_w(16, 17);
-    a.b_cond(C_NE, miss);
-    a.mov_imm64(9, u32::MAX as u64);
-    a.cmp_reg_w(16, 9);
-    a.b_cond(C_EQ, miss);
-    // The cache stores `Gc::as_ptr(proto)`; Object::proto stores the cell address, the same
-    // word (or null).
-    a.ldr_w_imm(14, 12, IC_OFF_SLOT);
-    a.ldr_w_imm(15, 12, IC_OFF_MID2_SHAPE);
-    a.lsl_imm(15, 15, 32);
-    a.logic_x(1, 14, 14, 15);
-    a.ldr_imm(16, 11, layout.obj_proto as u32);
-    a.cmp_reg_x(14, 16);
-    a.b_cond(C_NE, miss);
     // Every execution word transfers unchanged.
     a.b(commit);
     // The record lacks room for the new slot: make it (W2d step 3), as SpiderMonkey's creation
