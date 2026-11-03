@@ -217,9 +217,7 @@ fn emit_target_value_ptr(a: &mut asm::Asm, _layout: &crate::value::JitLayout, sl
     a.b(done);
     a.bind(property);
     a.ldr_imm(13, 14, 0);
-    a.lsr_imm(13, 13, 48);
-    a.cmp_imm_w(13, (crate::value::PACK_ACCESSOR >> 48) as u32);
-    a.b_cond(C_EQ, slow);
+    branch_accessor_word(a, 13, 13, slow);
     a.bind(done);
 }
 

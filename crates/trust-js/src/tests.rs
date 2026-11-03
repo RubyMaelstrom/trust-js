@@ -8776,6 +8776,59 @@ fn global_numeric_fast_paths_preserve_conversion_edges() {
     );
 }
 
+/// A global name cache trusts the global object's shape for its slot's attributes (W2d step 2):
+/// a store or update site fills only for a writable data property, and each attribute change
+/// (writable to read-only and back, data to accessor and back) takes a new shape. So every tier's
+/// stores after a change fail silently, throw, or call the setter as PutValue requires
+/// (ECMA-262 sec-putvalue, sec-ordinaryset), and resume writing once the property is writable.
+#[test]
+fn global_name_stores_follow_attribute_changes_in_every_tier() {
+    use crate::Tier;
+    let source = r#"
+Object.defineProperty(globalThis, 'g', {value: 0, writable: true, configurable: true});
+function put(v) { g = v; }
+function bump() { g++; }
+function strictPut(v) { "use strict"; try { g = v; return 'ok'; } catch (e) { return e.name; } }
+var log = [];
+for (var i = 0; i < 60; i++) {
+  if (i === 20) Object.defineProperty(globalThis, 'g', {writable: false});
+  if (i === 30) Object.defineProperty(globalThis, 'g', {writable: true});
+  if (i === 40) Object.defineProperty(globalThis, 'g', {get() { return -1; }, set(v) { log.push('set' + v); }});
+  if (i === 50) Object.defineProperty(globalThis, 'g', {value: 7, writable: true});
+  put(i); bump();
+  log.push(g, strictPut(i));
+}
+log.join();
+"#;
+    let mut expected = Vec::new();
+    for i in 0..60 {
+        match i {
+            20..=29 => expected.extend(["19".to_string(), "TypeError".to_string()]),
+            40..=49 => expected.extend([
+                format!("set{i}"),
+                "set0".to_string(),
+                format!("set{i}"),
+                "-1".to_string(),
+                "ok".to_string(),
+            ]),
+            _ => expected.extend([(i + 1).to_string(), "ok".to_string()]),
+        }
+    }
+    let expected = expected.join(",");
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        for threshold in [0, 8] {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine.set_tier_threshold(threshold);
+            assert_eq!(
+                run_in(&mut engine, source),
+                expected,
+                "tier {tier:?} threshold {threshold}"
+            );
+        }
+    }
+}
+
 #[test]
 fn destructuring_assignment() {
     assert_eq!(run("var a,b; [a,b]=[1,2]; a+','+b"), "1,2");

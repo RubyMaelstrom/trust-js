@@ -197,6 +197,10 @@ fn operands_in_range_encode_as_before() {
         [0x8B00_0000 | 11 << 16 | 63 << 10 | 10 << 5 | 9]
     );
     assert_eq!(
+        words(|a| a.asr_imm(9, 10, 63)),
+        [0x9340_FC00 | 63 << 16 | 10 << 5 | 9]
+    );
+    assert_eq!(
         words(|a| a.asr_imm_w(9, 10, 31)),
         [0x1300_7C00 | 31 << 16 | 10 << 5 | 9]
     );
@@ -334,6 +338,7 @@ fn field_widths_out_of_range_are_reported() {
         (|a: &mut Asm| a.lsl_imm(0, 0, 64)) as fn(&mut Asm),
         |a| a.lsr_imm(0, 0, 64),
         |a| a.add_shifted(0, 0, 1, 64),
+        |a| a.asr_imm(0, 0, 64),
         |a| a.asr_imm_w(0, 0, 32),
         |a| a.lsr_imm_w(0, 0, 32),
         |a| a.lsl_imm_w(0, 0, 32),

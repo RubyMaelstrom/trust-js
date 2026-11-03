@@ -161,7 +161,8 @@ pub(super) fn named_set_len(
 
 /// Load the address of slot `slot` (a register holding an index below the count) into `dst`,
 /// which must differ from `obj` and `slot`: in the cell below [`INLINE_NAMED_SLOTS`], else in the
-/// record (which a count past the cell's slots implies). Clobbers NZCV.
+/// record (which a count past the cell's slots implies). The cell's case falls through to a
+/// shared scaled add, four instructions; the record's adds a load and a bias. Clobbers NZCV.
 pub(super) fn slot_addr(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
@@ -173,23 +174,22 @@ pub(super) fn slot_addr(
         dst != obj && dst != slot,
         "the slot address is built from both"
     );
-    let record = a.new_label();
-    let done = a.new_label();
+    let cell = a.new_label();
+    let scaled = a.new_label();
     a.cmp_imm_x(slot, INLINE_NAMED_SLOTS as u32);
-    a.b_cond(C_HS, record);
-    a.add_imm(dst, obj, slots_off(layout) as u32);
-    a.add_shifted(dst, dst, slot, 3);
-    a.b(done);
-    a.bind(record);
+    a.b_cond(C_LO, cell);
     a.ldr_imm(dst, obj, record_off(layout) as u32);
-    a.add_shifted(dst, dst, slot, 3);
     // Slot INLINE + i is record_slots + 8i into the block: dst = record + 8 * slot - the cell's.
     a.sub_imm(
         dst,
         dst,
         (8 * INLINE_NAMED_SLOTS - layout.record_slots) as u32,
     );
-    a.bind(done);
+    a.b(scaled);
+    a.bind(cell);
+    a.add_imm(dst, obj, slots_off(layout) as u32);
+    a.bind(scaled);
+    a.add_shifted(dst, dst, slot, 3);
 }
 
 /// Load the address of slot `slot`, known at compile time, into `dst` (which may be `obj` only in

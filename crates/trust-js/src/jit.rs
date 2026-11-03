@@ -3508,6 +3508,14 @@ mod asm {
         pub fn sxtw(&mut self, rd: u32, rn: u32) {
             self.emit(0x9340_7C00 | (rn << 5) | rd);
         }
+        /// asr xd, xn, #shift (SBFM xd, xn, #shift, #63)
+        #[inline]
+        pub fn asr_imm(&mut self, rd: u32, rn: u32, shift: u32) {
+            if shift >= 64 {
+                return self.bad("a shift past 63");
+            }
+            self.emit(0x9340_FC00 | (shift << 16) | (rn << 5) | rd);
+        }
         /// asr wd, wn, #shift (SBFM wd, wn, #shift, #31)
         #[inline]
         pub fn asr_imm_w(&mut self, rd: u32, rn: u32, shift: u32) {
@@ -6371,20 +6379,33 @@ fn get_prop_inlinable(layout: &crate::value::JitLayout) -> bool {
 }
 
 /// Branch to `target` when `word`, a named slot's word just loaded, is an accessor's (its pair
-/// cell under [`crate::value::PACK_ACCESSOR`], W2d step 2): `lsr scratch, word, #48;
-/// cmp scratch, #0xfffb; b.eq target`. A slot keeps no attribute bits: where its shape does not
-/// already prove data or accessor, the word's tag tells. `word` is preserved; `scratch` and NZCV
-/// are clobbered.
+/// cell under [`crate::value::PACK_ACCESSOR`], W2d step 2): `asr scratch, word, #48;
+/// cmn scratch, #5; b.eq target`. The tag 0xfffb is -5 as a signed half, which `cmn` encodes
+/// directly where `cmp #0xfffb` would need its immediate built in a pushed register. A slot keeps
+/// no attribute bits: where its shape does not already prove data or accessor, the word's tag
+/// tells. `word` is preserved unless it is `scratch`; `scratch` and NZCV are clobbered.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn branch_accessor_word(a: &mut asm::Asm, word: u32, scratch: u32, target: usize) {
-    assert_ne!(word, scratch);
-    a.lsr_imm(scratch, word, 48);
-    a.cmp_imm_w(scratch, (crate::value::PACK_ACCESSOR >> 48) as u32);
+    a.asr_imm(scratch, word, 48);
+    a.cmn_imm_x(scratch, ACCESSOR_TAG_NEGATED);
     a.b_cond(C_EQ, target);
 }
+
+/// The accessor tag's negation: an arithmetic shift of an accessor's word by 48 leaves its
+/// negative, which `cmn #ACCESSOR_TAG_NEGATED` tests in one 12-bit immediate.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const ACCESSOR_TAG_NEGATED: u32 = (-((crate::value::PACK_ACCESSOR as i64) >> 48)) as u32;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const _: () = assert!(ACCESSOR_TAG_NEGATED > 0 && ACCESSOR_TAG_NEGATED < 1 << 12);
 
 /// Branch to `ok` when the kind tag loaded in `reg` is one [`crate::value::ObjectKind::is_ordinary`]
 /// accepts (a plain object, a typed array's view, a callable, or a Map's or Set's data): one
@@ -14067,12 +14088,11 @@ fn emit_name_ic_value_ptr_in(
     a.b_cond(C_NE, slow);
     a.mov_w(16, 16); // zero-extend the slot half
     slot_addr(a, layout, 15, 14, 16);
-    // A data property: an accessor's word (W2d step 2) takes the checked path.
-    a.ldr_imm(17, 15, 0);
-    a.lsr_imm(17, 17, 48);
-    a.cmp_imm_w(17, (crate::value::PACK_ACCESSOR >> 48) as u32);
-    a.b_cond(C_EQ, slow);
-    emit_property_kind(a, layout, 14, 16, 17, 13); // x7 = 1 (writable) or 2: a global property
+    // x7 = 1, a global data property, and a writable one at a store or update site: the shape
+    // covers the slot's attributes (W2d step 2), which the site's fill admitted
+    // (`Chunk::name_ic_fill`), as JSC caches a global put only for a writable property under
+    // its Structure check.
+    a.movz(7, 1, 0);
     a.mov(14, 15); // x14 → the slot's word
     a.b(have);
     // The uncommon chain proof lives off the successful ordinary paths. GetValue still

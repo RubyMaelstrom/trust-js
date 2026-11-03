@@ -232,8 +232,10 @@ impl IcState {
 /// the scope and landed on an own data property of the ordinary global object caches
 /// `(env|1, shape<<32|slot, gen)` — the low bit of `env` tags the mode (scope pointers are
 /// ≥8-aligned). A hit revalidates the scope generation (no shadowing binding appeared) and the
-/// global object's shape (same ordered key layout ⇒ the slot still maps this name), then
-/// re-checks `accessor` at the slot (attributes are not part of the shape).
+/// global object's shape (same ordered key layout and attributes ⇒ the slot still maps this
+/// name to the data property the fill admitted, writable where a store or update site filled
+/// it; W2d step 2). Generated code trusts the shape; the interpreter's hits still check the
+/// attributes at the slot.
 ///
 /// `repr(C)` with this field order gives the JIT template fixed offsets: env@0, binding@8,
 /// layout@16, gen@24, act_gen@28.
@@ -21834,7 +21836,9 @@ impl Chunk {
         }
         let slot = g.props.slot_of(&self.names[n as usize])?;
         let p = g.props.property_at(slot)?;
-        if p.accessor() {
+        // A data property, and at a store or update site a writable one: the shape the hit
+        // compares covers the slot's attributes (W2d step 2), so generated code checks neither.
+        if p.accessor() || (store && !p.writable()) {
             return None;
         }
         let v = p.value();
