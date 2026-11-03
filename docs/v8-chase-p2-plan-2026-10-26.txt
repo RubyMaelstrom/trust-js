@@ -6902,3 +6902,127 @@ Open questions for the owner:
      it.
 
 The owner approved the three recommendations on 2026-11-03 (Decision 28).
+
+### W2d steps 1 and 2: the kind field and one-word slots (design, 2026-11-03)
+
+Step-level design for Decision 28's first two steps, which land together (main 2f018bae). JSC
+and SpiderMonkey sources at the revisions of the W2d note (target/p2/w2d/exemplars.txt).
+
+Step 1, the kind field:
+- `Object::call`, `exotic` and `native_typed_array` become one field, `kind: ObjectKind`: a
+  `repr(u8)` enum with its tag byte at 0 and one payload word at 8 (16 bytes, as `Callable` and
+  `Exotic` are now). The tags are ordered so that every old test is one unsigned compare:
+
+| tags | kinds | old test |
+| --- | --- | --- |
+| 0 | Plain | |
+| 1 | TypedArray (the view's payload cell) | `native_typed_array` set |
+| 2-14 | the thirteen callables | `call` not None |
+| 15 | Collection | |
+| 16-26 | Array, the five wrappers, Error, Arguments, the three iterators | |
+
+  - `exotic` is None today exactly for tags 0-14: functions and typed arrays carry no exotic
+    tag. So every guard that admits None keeps admitting them, and typed arrays still leave
+    through their clear `ic_plain`.
+  - `Exotic::is_ordinary` (None or Collection) is tags 0-15.
+  - `call` is None exactly outside 2-14.
+- Matches keep their arms and the variants keep their names. The tests for None become methods
+  (`is_callable`, `exotic_is_none`, `is_ordinary`). There is no `None` variant, so the compiler
+  finds every site, and each `_` arm of a match on the old fields is reviewed.
+- Generated code reads one tag:
+  - the ordinary guard becomes `cmp tag, #15; b.hi`, in place of `sub`, `cmp #1` and `b.hi`;
+  - the exotic-None guard becomes `cmp tag, #14`;
+  - the call probe compares the User tag and reads the payload at kind+8, as now.
+- The flags become bits of one byte in Props, tested with tbz/tbnz on ARM64 and a byte `test`
+  on x86-64: extensible, ic_plain, is_constructor, class_kind's two bits, proto_flag, has_far
+  and elem_mode. Four of them are written through `&self` today, which makes the byte a
+  `Cell<u8>`.
+- Debug builds assert that an object never gains a second kind (the census found none).
+
+Step 2, one-word slots:
+- Props holds, with the object's borrow flag, proto and kind, a 72-byte header:
+  - the layout pointer;
+  - the shape and the named count (u32 each);
+  - the flag byte, the two slot memos and the inline capacity;
+  - the element words' pointer;
+  - the out-of-line record's pointer;
+  - then seven slots of one word.
+  RefCell<Object> is 128 bytes.
+- A slot is a PropWord:
+  - a data property's value, or a deferred prototype, as now;
+  - an accessor's pair cell under a new tag, PACK_ACCESSOR (0xfffb). Tracing reads the tag, as
+    it reads PACK_LAZY_PROTO's, and generated code's property-word guard (tag at least
+    PACK_LAZY_PROTO) already sends it to the checked path. An accessor's `value()` is
+    undefined, as the accessor Property's packed word is now.
+- Attributes:
+  - Each key's attributes are one byte in the layout, beside its keys: the four PROP_* bits.
+  - The objects sharing a layout hold its prefix of (key, attributes). A prediction matches
+    only when both match. Otherwise the layout detaches (copy-on-write), as on a key mismatch
+    today.
+  - Shape transitions are keyed (parent, key, attributes), in place of (parent, key,
+    PropClass), and the shape directory's layouts carry the attributes. Equal cacheable shapes
+    then mean equal keys with equal attributes, in the same order. An array's shape covers its
+    named keys only, as now.
+- Attribute changes take memoized transitions, as JSC's do (runtime/Structure.cpp:806-850,
+  keyed by name, attributes and the kind PropertyAttributeChange; seal and freeze are
+  transitions of their own, 893-901):
+  - a change to one existing key's attributes: (parent, key, new attributes, change);
+  - `Object.freeze`'s and `Object.seal`'s descriptor passes: (parent, freeze) and
+    (parent, seal).
+  - Objects making the same change share the child shape.
+  - V8 (MapUpdater::ReconfigureToDataField, map-updater.cc:175-230) and SpiderMonkey
+    (NativeObject::changeProperty, vm/Shape.cpp:526-600) instead replay transitions from the
+    root to the shared shape of the new sequence: more work per change.
+  - Today TRust gives a class change a fresh unique shape and keeps the shape across an
+    enumerable or configurable change. Both go. Removals keep taking fresh shapes.
+- Reads: the map's accessors return a PropRef in place of `&Property`.
+  - It is one word: the slot's address, with the writable, enumerable and configurable bits in
+    its low three bits. The word's tag says whether it is an accessor.
+  - `Option<Element>` therefore stays a register pair. A second field made it memory-returned
+    in W2c, which cost Vue 0.56%.
+  - It has Property's read methods, and `to_property` copies it out.
+- Writes: nothing can take a `&mut Property` into a map any more. Attributes change only through
+  the map's own methods: insert's replacement, freeze, seal and the test fixtures' setter. Each
+  writes the layout and takes the transition. The audit is the list of those methods, and the
+  type system closes the escapes that Pilot C's steps 5-6 named (value.rs:6678-6688). `Property`
+  stays the owned descriptor: insert takes one, and internal slots keep theirs.
+- Overflow: slots past the seventh live in one out-of-line record, a storage block. It holds its
+  length and capacity, the key index and the extras (both moved out of the header), then the
+  slots. The record's slot capacity starts at 6 and doubles, as SpiderMonkey's dynamic slots do
+  (SLOT_CAPACITY_MIN, vm/NativeObject.h:1098). A capacity hint past seven reserves the record
+  once.
+- Generated code:
+  - A slot below seven sits at a fixed offset from the object; slot seven and above, at a fixed
+    offset from the record. A baked slot is one load in the cell, or two through the record. A
+    slot read at run time from an IC cell first tests `slot < 7`. The in-place-or-heap test of
+    `fields_data` goes.
+  - Caches keyed by named keys trust the shape for data or accessor and for writability. They
+    drop the meta-word loads: guard_prop_data's 9 callers, guard_prop_writable's 8 and x86-64's
+    flag tests.
+  - Key-checked caches (array holders) keep their key compare. With the shape, it proves the
+    attributes.
+  - Getters and setters come from the slot word's payload.
+  - The 15 gates that need the meta word right after the value word are rewritten, and
+    get_prop_inlinable checks the new offsets.
+  - The creation probe also checks that the predicted attributes at the new slot are plain when
+    it uses the object's own layout. It writes no meta word, and when the object already has
+    seven properties it stores into the record's first free slot.
+- The interpreter's caches trust the shape the same way: their live accessor and writable checks
+  after a shape match go.
+- memory.rs's accounting, the census hooks and allocation diagnostics count the record. The size
+  assertion becomes 128 bytes, and the card-offset debug assertion (jit.rs:11816-11827, which
+  assumes 192-byte cells) follows.
+
+Order and checks:
+1. Step 1 on a branch (p2-w2d). Checks: the lib suite, counts against main, and both backends'
+   clippy (x86-64 on zombie).
+2. Step 2 on top, in commits that build:
+   - the map's representation and its Rust API (PropRef);
+   - generated code on ARM64;
+   - generated code on x86-64.
+3. Both land together after:
+   - the lib suite;
+   - Test262 in full (defineProperty, freeze, seal), and difftest;
+   - the fixtures' output;
+   - the census rerun: the "128 B, 7 one-word slots" column, -15% to -56% of bytes;
+   - counts, and code dumps diffed by hand on ARM64.
