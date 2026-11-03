@@ -7327,3 +7327,254 @@ Risks:
 Exit: the W2d note's, measured on the tip: objects' bytes (the census's measure) and the heap's.
 chai is the close one. Its Object.create(null) objects mostly hold 4-8 keys, and three slots
 spill them; the census's sized column assumed their final count.
+
+### W2d step 3e: constructors' classes (design, 2026-11-03)
+
+Why: built as the step 3 design had it, a constructor's class grew with what it learned (3 to 7
+to 15 slots), and the construct paths disagreed: the generic dispatch sized by the layout it had
+learned (none before the first instance), the compiled paths by their static counts, which
+learning raised. A constructor's instances landed in two classes, so two shapes, and a compiled
+read that bakes one shape sent the others to its helper for good: Richards +56%, Djot +9.6%,
+TypeScript +8% (PROPSTAT=2: "data cached (other template guard)" at this.currentTcb). 9bb34bea
+put every constructor's instances in the seven-slot class instead, and objects' bytes then miss
+the exit on EarleyBoyer (-33.8% against -35%): its constructors' instances, mostly Scheme pairs
+(sc_Pair, two fields), sit in 128-byte cells, which 96 bytes would hold.
+
+Exemplars (target/p2/w2d/exemplars.txt, 4.3; JSC 260278048486):
+- JSC sizes `new F()` once per function, at its first construction (runtime/JSFunction.cpp:
+  155-163), and keeps it; a store to F.prototype clears the profile. initializeProfile
+  (bytecode/ObjectAllocationProfileInlines.h:67-89): the count of names put on `this`
+  (StaticPropertyAnalyzer, flow-insensitive over the constructor's code); below its default of
+  six, plus the prototype's own properties that hold no function (possibleDefaultPropertyCount,
+  :146-168), a sum of none taking six ("the static analyzer just didn't see the real
+  initializer function") and a larger one clamped to six ("default properties are weak
+  guesses"); six or more as counted. Then it fills the size class.
+- V8 sizes by the parser's expected count plus slack and shrinks after seven constructions
+  (slack tracking), shrinking objects in place with a filler, which segregated size classes
+  cannot do. SpiderMonkey gives `new` OBJECT4 at least.
+
+Design: JSC's rule, our seven slots standing for its six.
+- Function::this_store_count: the distinct names the function's own code assigns as `this.name`
+  (statements, branches, loops, handlers, comma sequences, chained assignments, conditionals'
+  arms; not nested functions or classes), from the AST, so the tree-walker and compiled code count
+  alike.
+- value::constructed_class: decided at the first construction in a heap and kept in
+  FunctionRuntime::instance_class (per heap and function, since the prototype is the heap's).
+  Below seven stores, plus the prototype's own data properties holding no function (accessors
+  are not counted: an assignment would run their setter); a sum of none takes seven slots
+  (DEFAULT_CLASS), a larger one is held to seven; seven or more as counted; class_for maps the
+  count to 3, 7 or 15 slots.
+- Every construct path asks it: the generic dispatch by the callee's function, the compiled
+  construct-this helper and construct_jit_fast through a copy on the chunk. A derived class's
+  instance is its base constructor's, which allocates it.
+- Learning (3d) only reserves the record for fields past the class's cell slots.
+Expected: Splay's Node (two stores, `left` and `right` defaults) keeps seven slots; EarleyBoyer's
+sc_Pair takes three; constructors with no stores (forwarders, `init()` callers) keep seven.
+RayTrace's Class.create closures share one function, so its first construction decides for all
+of them. Risk: a constructor whose instances outgrow a small class (TypeScript's node classes,
+with two or three stores of their own after `_super.call(this)`) keeps more fields in its
+record.
+
+### W2d step 3: cells sized at allocation (record, 2026-11-03)
+
+Commits, from main fda4de9e (the design note), on p2-w2d3 then p2-w2d3e:
+- 2047fce8 (3a): the map's cell slots follow the object's 72-byte header.
+- d79b2a13 (3b and 3c, measured together): caches record slot locations; shape ids carry a
+  capacity class; objects are allocated in 96, 128 or 192-byte cells.
+- ff4cbc61, 7b9d17f7 (3c): built objects start in their cell; a creation that outgrows the cell
+  grows the record from the probe's line; object cells are allocated unzeroed. Two tests follow
+  the smaller cells.
+- 007cc432 (3d): constructors learn their instances' capacity.
+- 9bb34bea: every constructor instance takes the seven-slot class (an interim fix; see 3e).
+- b4611a32: marking traces a map's cell slots, then its record's, as two loops.
+- d8c8cadb (3e): a constructor's instances take the class JSC's rule picks.
+- f56a49c3: creation probes compare the prototype right after the shape.
+- a4164542 (3e): Object.create and `new Object()` take the seven-slot class, as JSC's do.
+- a1e92447: take_props leaves the cell's class's empty shape; the design's model test of maps.
+- d1d36453: templates' records hold exactly their slots.
+
+As designed:
+- RefCell<Object> is the 72-byte header; a map's cell slots follow it (check_object_layout). A
+  map outside a cell keeps every slot in its record; take_props detaches; new_with_parts and
+  replace_properties attach.
+- IcState.loc@14 (SpiderMonkey's TaggedSlotOffset form); NameIc's global mode keeps it in
+  act_gen; NativeNameDescriptor, PreparedReference and JitCtx::accessor_loc carry it.
+  slot_addr_loc on ARM64 and x86-64.
+- Shape ids' top two bits are the capacity class; three empty shapes; children keep the class;
+  rebased_shape (memoized) where a map changes class.
+- Predictions as the table, except constructors and Object.create (3e).
+
+Where the build differs from the design:
+1. 3b and 3c landed in one commit; 3b's encoding was not measured alone.
+2. A creation whose new slot is a record slot the record lacks room for calls a small helper
+   (value::jit_grow_named_record) out of the probe's line, as SpiderMonkey calls growSlotsPure
+   and V8's builtin extends its PropertyArray. Without it every object outgrowing its cell took
+   the generic store helper (`{}` and five adds: +512 instructions an object).
+3. Object cells are allocated unzeroed (alloc_small_uninit, as records are).
+4. Constructors take the class JSC's rule picks, decided once (3e above), not the learned count;
+   Object.create and `new Object()` take seven slots, as JSC's constructEmptyObject and
+   createDefaultEmptyObject do (runtime/ObjectConstructor.cpp:1036-1038, ObjectConstructor.h:
+   73-81, JSGlobalObject.cpp:1209), not three.
+5. Marking traces the cell's run of slots, then the record's (b4611a32), not one loop through
+   the cell-or-record branch: TypeScript -0.56%, Splay -0.22%.
+6. Creation probes compare the prototype and its epoch right after the shape (f56a49c3), not
+   last: AST's creation sites in TypeScript see one shape under about 100 prototypes (each node
+   class's constructor calls AST on its own instance), so their ways matched the shape and failed
+   on the prototype after about 40 instructions. TypeScript -0.32%.
+7. The model test came last (a1e92447), and found a bug: take_props left the emptied map at
+   class 0's empty shape over a cell of any class. Array.fill, its one caller, takes the map of a
+   fresh class-0 array, so no shipped path met it.
+8. A template keeps its map outside any cell, so its slots are in a record (3a). Built by
+   growth, each function's template and its prototype's kept the record's six-slot minimum,
+   96 bytes for one to three slots: 3,000 function declarations held 6,000 more cells than on
+   main and 742 KB more. Props::for_slots and for_slots_in_class reserve exactly (d1d36453):
+   the same declarations then hold 117 KB more than on main (each function object is 32 bytes
+   smaller, and its two template records are 80 bytes).
+9. Two tests changed: minor_collection churns 40,000 objects (its count assumed 192-byte cells);
+   compiled_allocation_loop takes a collection during the loop as its evidence, as its
+   neighbour does, since under the tree-walker the previous job's dead cycle, now in a 96-byte
+   cell, sits under a stale native-stack word (retention_path: a frame below
+   Interp::call_dispatch), which the conservative scan keeps.
+
+Micro-benchmarks (instructions an iteration against main 4acf5166, fat LTO; `nothing` is the
+loop alone, whose -7.95 is startup spread over its 2M iterations):
+
+| script | change |
+| --- | --- |
+| nothing | -7.95 |
+| `{}` | +5.37 |
+| `[i, i]` | +2.86 |
+| `{x, y}` | -44.09 |
+| `{a, b, c, d, e}` | -81.61 |
+| `new P(x, y)` | -19.52 |
+| function expression | -61.10 |
+| `{}` then five adds (1M iterations) | +168.26 |
+
+Counts against main 4acf5166 (fat LTO, CPUs 10-13, pacing off, median of 3):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,837,418,513 | 1,834,610,220 | -0.15% |
+| React | 333,303,530 | 331,315,714 | -0.60% |
+| Djot | 664,977,728 | 661,664,331 | -0.50% |
+| chai | 81,935,037,561 | 81,861,913,425 | -0.09% |
+| Richards | 137,614,834 | 136,858,464 | -0.55% |
+| DeltaBlue | 263,665,809 | 263,693,326 | +0.01% |
+| Crypto | 730,380,697 | 730,034,389 | -0.05% |
+| RayTrace | 1,045,712,042 | 1,019,236,170 | -2.53% |
+| EarleyBoyer | 3,447,077,320 | 3,399,955,105 | -1.37% |
+| RegExp | 2,795,041,226 | 2,803,289,533 | +0.30% |
+| Splay | 1,671,503,562 | 1,678,670,289 | +0.43% |
+| NavierStokes | 451,824,844 | 451,881,324 | +0.01% |
+| PdfJS | 7,992,147,459 | 7,942,190,047 | -0.63% |
+| Mandreel | 63,862,288,580 | 62,957,966,518 | -1.42% |
+| Gameboy | 21,756,183,744 | 21,541,903,567 | -0.98% |
+| CodeLoad | 482,605,613 | 483,556,228 | +0.20% |
+| Box2D | 4,524,206,021 | 4,493,279,223 | -0.68% |
+| zlib | 138,041,700,507 | 138,040,295,315 | -0.00% |
+| TypeScript | 59,662,428,184 | 59,324,393,392 | -0.57% |
+
+Small regressions: Splay +0.43%, RegExp +0.30%, CodeLoad +0.20%, DeltaBlue and NavierStokes
++0.01%. By commit, 3e moved Splay +0.23% and RayTrace +0.33% although neither's classes changed
+(RayTrace's objects' bytes are the same, Splay's objects are literals): their profiles move cost
+between the allocation and construct paths' functions as fat LTO inlines them differently
+(Splay: allocation +22M, strings +11M, marking -15M; RayTrace: construct_arguments_apply_forwarder
++20M, its callers -20M, net about ten instructions a construction). The rest of 3e: EarleyBoyer
+-0.19%, Djot -0.18%, Richards -0.13%, TypeScript -0.49%. Object.create's class and the take_props
+fix are within 0.03%, the exact template records within 0.11% but PdfJS +0.20%.
+
+W2d as a whole, against main before W2d (c8351b71, 50d308cb with 4acf5166's hasher):
+
+| workload | before W2d | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,838,036,406 | 1,834,617,201 | -0.19% |
+| React | 337,554,741 | 331,319,059 | -1.85% |
+| Djot | 673,146,526 | 661,658,813 | -1.71% |
+| chai | 82,528,270,464 | 81,853,686,530 | -0.82% |
+| Richards | 141,870,087 | 136,858,651 | -3.53% |
+| DeltaBlue | 266,230,925 | 263,697,558 | -0.95% |
+| Crypto | 749,116,493 | 730,019,597 | -2.55% |
+| RayTrace | 1,056,254,446 | 1,019,235,615 | -3.50% |
+| EarleyBoyer | 3,641,125,383 | 3,399,953,181 | -6.62% |
+| RegExp | 2,814,904,799 | 2,803,346,751 | -0.41% |
+| Splay | 1,887,931,256 | 1,678,671,146 | -11.08% |
+| NavierStokes | 458,549,928 | 451,874,523 | -1.46% |
+| PdfJS | 8,051,021,309 | 7,942,102,122 | -1.35% |
+| Mandreel | 65,656,072,665 | 62,958,299,500 | -4.11% |
+| Gameboy | 21,996,054,346 | 21,541,887,696 | -2.06% |
+| CodeLoad | 481,472,577 | 483,554,602 | +0.43% |
+| Box2D | 4,622,080,413 | 4,493,273,746 | -2.79% |
+| zlib | 138,962,053,558 | 138,040,281,975 | -0.66% |
+| TypeScript | 59,681,397,316 | 59,324,139,167 | -0.60% |
+
+Only CodeLoad is slower than before W2d (+0.43%; steps 1 and 2 left it +0.24%).
+
+Exit (the W2d note's): objects' bytes allocated over the run (the census's measure, the cell,
+named record and element words of each object at its size class, summed at its death and at the
+heap's release; a measurement patch, not landed), against the census's "today":
+
+| workload | exit | today MB | tip MB | change |
+| --- | --- | --- | --- | --- |
+| Vue | -20% | 27.71 | 17.41 | -37.2% |
+| React | -20% | 12.66 | 9.78 | -22.7% |
+| Djot | -35% | 26.55 | 14.32 | -46.1% |
+| sustained | -35% | 291.43 | 153.08 | -47.5% |
+| chai | -35% | 1259.87 | 795.38 | -36.9% |
+| Splay (bytes an object) | -35% | 223.0 B | 128.3 B | -42.4% |
+| RayTrace | -35% | 96.98 | 42.80 | -55.9% |
+| EarleyBoyer | -35% | 264.28 | 132.53 | -49.9% |
+| Box2D | -35% | 46.44 | 27.29 | -41.2% |
+| TypeScript | -35% | 988.91 | 497.88 | -49.7% |
+| DeltaBlue | | 3.57 | 2.21 | -38.0% |
+| Richards | | 0.28 | 0.14 | -48.7% |
+
+Splay's driver runs for a time, so its row compares bytes an object (the census's 1,455,811
+objects, the tip's 4,801,302). On 9bb34bea, EarleyBoyer was at -33.8% and chai at -34.5%: 3e
+took EarleyBoyer to the census's sized model (-49.9%), chai to -35.4%, and Object.create's class
+to -36.9%. RayTrace keeps -55.9% (the model's -66.7%): its Class.create constructors share one
+function, whose first construction decides seven slots for all.
+- Splay's live heap at its largest major collection: 131.6 MB on the tip, 156.0 MB on main
+  (the exit: at or below 135 MB; 123 MB with step 4).
+- The fixtures' peak RSS (fresh copies made together, median of 7, MiB): Vue 23.12 before W2d,
+  23.24 on main, 22.99 on the tip; React 15.39, 15.53, 15.39; Djot 35.87, 34.49, 34.61; an empty
+  script 15.39 on all three.
+- Bytes allocated over the run, main to tip (MB): Vue 26.35 to 22.96 (-12.9%), React 18.05 to
+  17.10 (-5.3%), Djot 26.38 to 23.20 (-12.1%), sustained 267.3 to 221.2 (-17.2%), chai 2386 to
+  2248 (-5.8%), DeltaBlue 3.12 to 2.84 (-8.9%), RayTrace 55.30 to 43.24 (-21.8%), EarleyBoyer
+  183.0 to 139.1 (-24.0%), Box2D 42.74 to 38.98 (-8.8%), TypeScript 1114.6 to 1091.3 (-2.1%),
+  Richards 0.54 to 0.52 (-4.5%). Splay's driver runs for a time.
+- Live heaps sampled every 100,000 cell allocations (GC stress, majors only), since a byte
+  threshold falls later in a run whose objects are smaller, so the largest major alone
+  misleads (TypeScript's: 469.4 MB on main, 490.1 MB on the tip): TypeScript's peak is
+  579.1 MB on main and 572.3 MB on the tip, both at 1.755M live objects (552.2 MB on 9bb34bea,
+  before 3e: 3e holds 20 MB more there in 35K fewer cells); chai's median is 2.09 MB on main and
+  2.22 MB on the tip (3.06 MB before d1d36453), its peak 2.23 and 2.36 MB.
+
+Checks on d1d36453: the lib suite on ARM64 (2749) and x86-64 (zombie, 2538); clippy in the
+three configurations on both; rustfmt; Test262 at --tier=jit threshold 8, 53575 of 53575 and
+identical to the base's report; the fixtures' masked output the same as the base's; difftest
+138 agree, 12 skipped (budget). GC stress passes on 9bb34bea over memory::, shared_layout,
+property_shape, property_read, property_layout_cell, remembered, accessor, getter, setter,
+jit::storage, global_name_stores, value::, construct, creation, minor_collection and
+name_dispatch; on a4164542 over constructed_class, property_store and the step's other filters;
+on a1e92447 over the model test; on d1d36453 over memory::, property_layout_cell, function_,
+template and descriptor; but for memory::temporal_records_account_zone_and_calendar_strings_
+once, which fails under stress on main too. Code dumps on ARM64, compared by
+hand (AST in TypeScript): reads take the slot from the way's location word (a halfword load, a
+bit test and an add in the cell, where main compared the index and added twice); creations add
+the room guard and an out-of-line growth block.
+
+Follow-ups:
+- `{}` objects that grow past three keys pay a record (`{}` and five adds: +168 instructions an
+  object); JSC sizes `{}` by the stores its static analyzer counts on the new object.
+- Templates keep their slots in records outside cells: two for each function declaration, its
+  map's and its prototype's (chai: 8,500 more live cells than main, its live heap +6%); a
+  template could keep its values outside the heap's cells.
+- Class fields: JSC adds a class constructor's field definitions over its super chain
+  (runtime/FunctionRareData.cpp:88-131); ours count only `this.name` stores.
+- Forwarding constructors that share one function (RayTrace's Class.create) share its first
+  construction's class; JSC keeps a profile per closure.
+- NewObject (non-plain literals) has no key count; the compiler could pass one, as V8's
+  boilerplate_properties and SpiderMonkey's NewInit count do.
+- JSON.parse's objects are made empty; V8's parser sizes them by their keys.
+- Step 4 (copy-on-write literal elements) is next (Decision 28).
