@@ -362,7 +362,9 @@ W2. Object model, second pass (layout and the collector's remaining costs)
   elements kinds). Halves arrays; one load per JIT element read.
 - W2d A slimmer cell: `Callable`, the typed-array pointer and mirror state move to kind-specific
   payloads, flags pack, only the overflow spills; then either the 128 B class or more inline
-  slots at 192 B, chosen by allocation-site slack tracking (V8's).
+  slots at 192 B, chosen by allocation-site slack tracking (V8's). Revised by its census and
+  design note ("W2d: a slimmer cell"): V8's slack tracking is per constructor, not per site, and
+  the cells are sized at allocation with one-word slots.
 - W2e Inline allocation in generated code: cursor take, byte charge and template copy, keeping
   the poll after allocation.
 - W2f A chunk-level card summary (one more barrier store in both backends).
@@ -6583,3 +6585,310 @@ Left from the design:
 
 Lead for a baseline item: Vue's reactive proxy `get` trap runs GetProp, CallWithThis, GetElem
 and TypeofIs about 77,000 times each in the exact-PC helper (TRUST_JS_JIT_OPSTAT=2).
+
+### W2d: a slimmer cell (census and design, 2026-11-03)
+
+Census: main 4a13ca45 with a census patch (target/p2/w2d/census-src: w2d_census.rs and its hooks,
+TRUST_JS_W2D_CENSUS=1), a release build without LTO (the census counts objects, not
+instructions), one run of each workload pinned to CPUs 10-13. After every collection it
+classifies the live objects. It also classifies every object that dies, and every one left when
+the heap is released. For each it records:
+- the fields the object uses;
+- its named count at birth (the template's count, a predicted layout's length, or the capacity
+  asked for) and at death, and the Rust site that made it;
+- its bytes (cell, named spill and element words, by size class), today and under candidate
+  layouts: a header of H bytes, slots of S bytes, and a cell-size policy.
+Splay is splay.js with base.js and the shells' driver, as in W2c's census; the Octane benchmarks
+run the fixed driver (five runs). Data and scripts: target/p2/w2d (type-sizes.txt from
+-Zprint-type-sizes; census/*.err, summary.txt, table2.py, births.py). The exemplar survey is
+target/p2/w2d/exemplars.txt; the map of what depends on the cell's layout is summarized under
+Risks.
+
+Today's cell (main, -Zprint-type-sizes):
+- RefCell<Object> is 184 bytes in the 192-byte class: the borrow flag (8) and Object (176).
+- Object holds:
+  - `call` 16 (Callable, repr(u8): the tag at 0, one payload word at 8);
+  - `exotic` 16, `proto` 8, `native_typed_array` 8;
+  - `props` 120;
+  - four flag bytes (ic_plain, class_kind, extensible, is_constructor) and 4 bytes of padding.
+- Props, 120 bytes, holds:
+  - `elems` 24: the key index, the Rust-heap extras and the element words;
+  - `entries` 80: InlineVec<Property, 4> (four 16-byte slots or a heap pointer, plus its length
+    and capacity, 72) and the layout pointer (8);
+  - `shape` 4, the `prototype` and `length` slot memos 2 each, three flag bytes, and 5 bytes of
+    padding.
+- A named slot is a Property (value.rs:5445-5457): the value word and a meta word. The meta
+  word's low bits hold the four descriptor flags; its upper bits point at an accessor pair.
+- Up to four slots sit in the cell. A fifth moves all of them into one heap block, and the cell's
+  64 inline bytes go unused.
+- The header is 120 of the 184 bytes. A two-property object uses 32 bytes of values in a 192-byte
+  cell.
+
+1. Who uses which field (14.4M objects allocated over the twelve workloads).
+
+| kind | objects |
+| --- | --- |
+| plain objects | 7.1M |
+| arrays | 3.96M |
+| functions | 1.43M, of them chai 727,572 |
+| `arguments` objects | 0.39M |
+| proxies | 0.37M |
+| native functions, iterators, wrappers, errors, Maps and Sets | 0.1M |
+
+- No object carries two kind payloads: a callable, an exotic payload and a typed array never
+  coexist.
+- 108,494 plain objects have a key index of their own (TypeScript's large maps), and 939 have
+  extras.
+
+2. Bytes over the run. These are objects allocated (dead, plus left at release): cells, named
+slots and element words in MB, against today.
+- "128 B" columns: every cell 128 bytes, with only the overflow outside it.
+- "Sized" columns: each cell is the smallest class holding the header and the object's named
+  count, capped at 192 B, with the overflow outside it. The header is 72 bytes unless stated.
+- The last column also puts small arrays' elements in the array's cell (SpiderMonkey's fixed
+  elements) when the cell stays within 192 B.
+
+| | objects | today | 128 B, 4 two-word slots (H64) | 128 B, 7 one-word slots | sized, one-word slots | sized, 64-byte header | sized, small arrays' elements in the cell |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 107,200 | 27.7 | 20.8 (-25%) | 20.8 (-25%) | 17.4 (-37%) | 16.1 (-42%) | 10.3 (-63%) |
+| React | 29,931 | 12.7 | 10.7 (-15%) | 10.7 (-15%) | 9.8 (-23%) | 9.8 (-23%) | 9.8 (-23%) |
+| Djot | 122,278 | 26.5 | 17.9 (-32%) | 17.5 (-34%) | 14.4 (-46%) | 13.7 (-49%) | 13.1 (-51%) |
+| chai | 4,875,050 | 1259.9 | 937.0 (-26%) | 934.1 (-26%) | 792.1 (-37%) | 768.6 (-39%) | 590.1 (-53%) |
+| sustained | 1,441,021 | 291.4 | 199.2 (-32%) | 199.2 (-32%) | 153.1 (-47%) | 153.1 (-47%) | 140.3 (-52%) |
+| Splay | 1,455,811 | 324.6 | 231.4 (-29%) | 231.4 (-29%) | 186.9 (-42%) | 184.8 (-43%) | 186.9 (-42%) |
+| DeltaBlue | 12,590 | 3.6 | 2.6 (-27%) | 2.5 (-30%) | 2.2 (-39%) | 2.2 (-39%) | 1.9 (-47%) |
+| RayTrace | 334,496 | 97.0 | 43.1 (-56%) | 42.8 (-56%) | 32.3 (-67%) | 32.3 (-67%) | 32.3 (-67%) |
+| EarleyBoyer | 1,372,267 | 264.3 | 176.4 (-33%) | 176.4 (-33%) | 132.5 (-50%) | 132.5 (-50%) | 132.5 (-50%) |
+| Box2D | 227,508 | 46.4 | 31.3 (-33%) | 30.9 (-33%) | 24.1 (-48%) | 23.9 (-49%) | 23.8 (-49%) |
+| TypeScript | 3,399,936 | 988.9 | 644.2 (-35%) | 535.9 (-46%) | 478.4 (-52%) | 469.3 (-53%) | 443.7 (-55%) |
+| Richards | 1,253 | 0.3 | 0.2 (-34%) | 0.2 (-38%) | 0.1 (-51%) | 0.1 (-51%) | 0.1 (-51%) |
+
+- Splay's live heap at its largest major collection holds 769,268 objects, 172.3 MB:
+  - 512,221 plain objects, 504,143 of them with two properties;
+  - 256,071 ten-element arrays.
+  The "128 B, 7 one-word slots" column takes it to 123.1 MB (-28.6%), the "sized, one-word
+  slots" column to 98.7 MB (-42.7%). With its strings (about 33 MB) the live heap goes from
+  205 MB to about 132 MB. The W2 exit asks for 123 MB, half of 246.2. Reaching it needs one of:
+  - copy-on-write literal elements: its payload arrays are never written (-24.6 MB);
+  - smaller leaf strings.
+- More inline slots at 192 B (the plan's other option) saves nothing: 0.0% on every workload.
+- Sized cells use the 8-byte slots and 72-byte header of design 2. A 16-byte slot needs a 64-byte
+  header to put two properties in 96 B.
+- With a 72-byte header the classes hold three one-word slots (96 B), seven (128 B) or fifteen
+  (192 B). A 64-byte header adds the 64-byte class for objects with no properties, which matters
+  for Vue's 39,136 iterators and chai's 371,886 proxies, and puts a fourth slot in 96 B.
+- Sizing by the birth count comes within 1.5 points of sizing by the count at death on every
+  workload except Vue (6 points) and chai (5.5). Those two make their functions and `arguments`
+  objects empty and add the properties afterwards:
+  - functions get the template map's `length`, `name` and a lazy `prototype`
+    (interpreter.rs:9541-9572);
+  - `arguments` objects get three properties (interpreter.rs:14575).
+- Construct sites predict their instances' keys:
+  - The JIT's path uses the constructor's static layout (bytecode.rs:25599-25612). TypeScript's
+    objects from it are made with 3.46 slots on average and die with 8.33; 1.25M of 1.78M grow.
+  - RayTrace's Class.create constructors all share one forwarding wrapper chunk, whose single
+    capacity hint (about 15 slots) serves every class (construct_jit_fast,
+    interpreter.rs:16297-16310). 125,320 of its three-property objects carry a spill block of
+    that size: 448 bytes for three values.
+  - The per-constructor learned layout (construct_capacity_hints, interpreter.rs:15856-15890)
+    would fit both. construct_jit_fast reads it except for forwarding constructors, and
+    construct_dispatch reads it; the JIT's construct-this helper (bytecode.rs:25575-25612) does
+    not.
+
+What the exemplars do (target/p2/w2d/exemplars.txt; V8 c8b70908, SpiderMonkey 6bb81100,
+JavaScriptCore 26027804):
+- The header before the inline slots is 24 bytes in V8 without pointer compression, which is
+  Node's default build (3 tagged words), 24 bytes in SpiderMonkey (shape, slots_, elements_), and
+  16 bytes in JSC (the cell word, then the butterfly).
+- None of the three keeps a per-object flag word or per-kind state in the generic header:
+  - callable, constructor and extensible are hidden-class bits: V8's Map (map.tq:10-41),
+    SpiderMonkey's JSClass and ObjectFlags (vm/ObjectFlags.h:22), JSC's JSType and Structure
+    (runtime/Structure.h:834);
+  - kind state lives in subclass fields placed before the in-object properties in V8
+    (js-objects.cc:2622-2662), in reserved fixed slots counted by the JSClass in SpiderMonkey
+    (gc/ObjectKind-inl.h:41-48), and in C++ members in JSC.
+- A slot is one value word (8 bytes; 4 in V8 with pointer compression). Attributes live in the
+  hidden class: V8's DescriptorArray PropertyDetails (property-details.h:473-497), SpiderMonkey's
+  PropMap PropertyInfo (vm/PropertyInfo.h:85-98), JSC's PropertyTable
+  (runtime/Structure.h:109-174). An accessor's slot holds its getter/setter cell
+  (JSC runtime/JSObjectInlines.h:499).
+- The inline count belongs to the hidden class: V8's in-object count in the map
+  (map-inl.h:450-453), SpiderMonkey's nfixed in the shape (vm/Shape.h:340-351), JSC's inline
+  capacity in the Structure (runtime/Structure.h:1001). It is fixed when the object is allocated:
+  - A literal gets its key count:
+    - V8 exactly, from a map cache keyed by count (factory.cc:4611-4636);
+    - SpiderMonkey rounded to its kinds (frontend/ObjLiteral.cpp:143-149);
+    - JSC filled to its size class (bytecode/ObjectAllocationProfileInlines.h:99-108).
+  - `{}` gets 4 slots in V8 (bootstrapper.cc:877-884) and SpiderMonkey (vm/JSObject-inl.h:27-29),
+    and 6 in JSC.
+  - `new F()` gets the static count of `this.x =` assignments:
+    - SpiderMonkey at least 4 (vm/JSFunction-inl.h:142-157);
+    - JSC the bytecode count, fixed at the first construction;
+    - V8 that count plus 8, shrunk after 7 constructions to what the objects used. This is V8's
+      slack tracking, keyed by the constructor's initial map (map.h:443-479,
+      map-updater.cc:472-511, js-function.cc:1507-1549).
+- No engine sizes cells from allocation-site feedback. V8's sites track only arrays' elements
+  kinds (allocation-site-inl.h:110-113), and SpiderMonkey's AllocSite only pretenures. The
+  plan's W2d line ("allocation-site slack tracking (V8's)") had that wrong.
+- Only the overflow leaves the cell:
+  - V8's PropertyArray grows 3 slots at a time (js-objects.h:986-991);
+  - SpiderMonkey's dynamic slots start at 6, then go up in powers of two;
+  - JSC's out-of-line butterfly storage starts at 4, then doubles.
+- Size classes:
+  - V8 allocates exact sizes;
+  - SpiderMonkey's object kinds run from 24 to 152 bytes (0, 2, 4, 6, 8, 12 or 16 slots);
+  - JSC steps by 16 bytes up to 80, then by about 1.4x.
+- `{}` is 56 bytes in V8 (uncompressed) and in SpiderMonkey, and 64 in JSC. A function is 56 to
+  64 bytes in V8, 56 in SpiderMonkey and 32 in JSC, and holds no inline properties:
+  - V8's `length` and `name` are accessors on the map, and `prototype` is a field;
+  - SpiderMonkey resolves them lazily (vm/JSFunction.cpp:600-613);
+  - JSC asserts zero inline capacity (runtime/JSFunction.h:76-80).
+- Small arrays:
+  - V8 and JSC share one copy-on-write store among the copies of a constant literal and copy it
+    on the first write (V8 ast.cc:815-821, js-objects.cc:2598-2606; JSC NodesCodegen.cpp:442-517,
+    JSObject.cpp:1848-1884). Each of Splay's ten-element arrays costs one array header.
+  - SpiderMonkey removed copy-on-write in 2020 ("harder to implement efficiently without TI", its
+    commit message) and keeps up to 14 elements in the array's cell (gc/ObjectKind-inl.h:50-71).
+
+Design:
+1. One kind field.
+   - `call`, `exotic` and `native_typed_array` become one `kind`: a 16-byte enum with a tag byte
+     and a payload word. No object holds two of them.
+   - Tag order keeps every kind that generated code admits as ordinary contiguous (None,
+     Collection, the callables), so each guard stays one range test (jit.rs:6328-6448). Functions
+     must stay inside that range: today they pass the property guards because their exotic tag
+     is None.
+   - The call probe reads the user-function tag and payload at kind's offsets (jit.rs:9452-9575,
+     9854-9959).
+   - Typed arrays get a variant; their route through a clear `ic_plain` stays.
+   - The flag bytes pack into one byte of bits, tested with tbz/tbnz on ARM64 at the cost of
+     today's cbz: extensible, ic_plain, is_constructor and the two class_kind bits, and Props'
+     proto_flag, has_far and elem_mode. The same word holds the inline capacity and the two slot
+     memos.
+2. Slots of one word.
+   - A named slot holds the value only, as in all three engines. An accessor property's slot
+     holds its pair cell.
+   - Attributes move to the layout, one byte per key beside the keys, and the shape becomes their
+     proof: every change to a key's attributes moves the object to a new shape. Today only
+     class-changing replacements do; enumerable and configurable changes do not. This is Pilot C's
+     steps 5-6, which the shape table's comment names (value.rs:6678-6688): every `&mut Property`
+     escape demotes on class change.
+   - Inline caches then trust the shape for data or accessor and for writability, as V8's map
+     checks do, and drop their meta-word tests: the 9 data guards and 8 writability guards
+     (guard_prop_data, guard_prop_writable), the getter/setter pointer extraction, and
+     x86-64's flag tests.
+   - The 15 gates that require the meta word right after the value word are rewritten, not left
+     to fail closed.
+   - Property stays the descriptor type of the paths that keep per-entry attributes: internal
+     slots, and elements that are not plain.
+   - Only the overflow leaves the cell. It goes into one out-of-line record, which also takes the
+     key index and the extras (all three are rare), and grows like SpiderMonkey's dynamic slots
+     (6, then powers of two).
+   - Generated code addresses slot i in the cell below the inline capacity and in the record
+     above it. Each IC knows which from its shape, and the in-place-or-heap test of
+     jit_storage.rs and jit_x64_storage.rs goes.
+   - The header is then 72 bytes: borrow flag 8, proto 8, kind 16, layout 8, shape and named
+     count 8, flags, capacity and memos 8, element words 8, out-of-line record 8. Every cell is
+     128 bytes with seven slots.
+3. Cells sized at allocation.
+   - An object gets the smallest class that holds its predicted count, filled to the class as JSC
+     fills it: three slots in 96 B, seven in 128 B, fifteen in 192 B. Past fifteen the overflow
+     goes to the record.
+   - The capacity is part of the shape, with one root shape per capacity, as V8's in-object count
+     is part of the map and SpiderMonkey's fixed-slot count part of the shape. An IC's location
+     for a slot is fixed at fill time.
+   - Predictions:
+     - a literal: its template's count;
+     - `{}`, Object.create and `new Object`: three slots (V8 and SpiderMonkey give `{}` four);
+     - an array: one (`length`);
+     - a function: its template's count;
+     - an `arguments` object: three;
+     - a constructor: the most any earlier instance took, from the learned layout, and its static
+       layout before the first instance. V8's slack tracking learns the same per initial map.
+       Forwarding constructors learn per constructor too, not per shared wrapper chunk.
+   - Environment records already allocate this way (record_cell, interpreter.rs:2315-2359).
+   - Props stops holding its slots by value. Templates (literal maps, function maps, array
+     templates) keep theirs in the record until they are copied into a cell, as a scope
+     descriptor's records do.
+4. Small arrays' elements: W2c's open question 8, left for W2d's cell size (open question 3
+   below).
+
+Order. Each series is behaviour-preserving: Test262 identical, difftest, the fixtures' output, the
+census and counts recorded, and the code dumps changing only in the offsets and tests named.
+1. The kind field and the packed flags. No size change. Dumps change in the kind and flag offsets
+   and in the tag and bit tests.
+2. One-word slots, attributes in the layout, the shape as their proof, and only the overflow out
+   of the cell: every cell 128 bytes. Steps 1 and 2 land together after counts and dump checks,
+   as W2c's step 2c did.
+3. Cells sized by prediction, with the capacity in the shape.
+4. Small arrays' elements, as the owner decides.
+
+Predicted gains (bytes allocated over the run, from the census table):
+- After step 2:
+
+| Vue | React | Djot | chai | sustained | Splay | DeltaBlue | RayTrace | EarleyBoyer | Box2D | TypeScript |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| -25% | -15% | -34% | -26% | -32% | -29% | -30% | -56% | -33% | -33% | -46% |
+
+- After step 3, sizing by birth comes within a point or two of the sized column:
+
+| Vue | React | Djot | chai | sustained | Splay | DeltaBlue | RayTrace | EarleyBoyer | Box2D | TypeScript |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| -37% | -23% | -46% | -37% | -47% | -42% | -39% | -67% | -50% | -48% | -52% |
+
+- Splay's live heap would be about 132 MB after step 3, and about 107 MB with copy-on-write
+  literal elements. That second figure meets the W2 exit.
+- Instructions and collection time are not predicted: the counts decide at each step. The
+  mechanisms are:
+  - allocation writes 96 or 128 bytes instead of 184 (Splay spends 6.8% of its instructions
+    creating its payload arrays, the sustained workload 4.8% creating pairs);
+  - objects take 15-67% fewer bytes, so the nursery holds that much more work between minor
+    collections;
+  - tracing covers less;
+  - shape-proven inline caches drop their attribute tests and their in-place-or-heap test.
+
+Risks:
+- Step 2 moves attributes out of the slot. A missed shape change on an attribute change would let
+  an inline cache write a non-writable property or read an accessor as data. That is a
+  correctness bug, not a slowdown. The guards against it:
+  - an audit of every path that changes a key's attributes;
+  - Test262 in full, especially defineProperty, freeze and seal;
+  - difftest.
+  The audit also covers the two consumers that already trust the shape's class: baked data states
+  (jit.rs:7079-7087) and the region's borrowed reads (jit_regions.rs:1475-1480).
+- The cell layout is read by 92 functions across both backends, 53 of which emit code. The
+  gates fail closed: a gate left on the old rule silently turns off nearly every property cache.
+  The counts and TRUST_JS_JIT_PROPSTAT catch that, not the tests.
+- Variable cells:
+  - about 25 places build a Props before allocating or move one whole (literal templates,
+    function maps, array templates, replace_properties, new_with_parts);
+  - the size assertions and memory.rs's accounting assume one object size;
+  - the card-offset debug assertion assumes 192-byte cells (jit.rs:11816-11827).
+- No code dump comparison is automated: the dump checks stay manual diffs of
+  TRUST_JS_JIT_CODEDUMP on ARM64.
+
+Exit (proposed, within W2's), after step 3:
+- objects' bytes allocated over the run at least 35% lower on Djot, chai, sustained, Splay,
+  RayTrace, EarleyBoyer, Box2D and TypeScript, and 20% on Vue and React;
+- Splay's live heap at or below 135 MB, and with step 4's copy-on-write at or below 123 MB (W2's
+  halving);
+- no fixture or Octane benchmark slower beyond noise (instructions per step; time at the stage
+  end);
+- the fixtures' peak RSS at or below today's.
+
+Open questions for the owner:
+1. Slots. One word, with attributes in the layout and the shape as their proof: the three
+   engines' design, recommended. Or keep two-word slots and squeeze the header to 64 bytes for
+   four slots in 128 B: a smaller change, -15% to -56% instead of -23% to -67%, and no shape
+   proof.
+2. Header. The 16-byte kind enum, giving a 72-byte header with safe Rust matches: recommended
+   first. Or a hand-packed tag in the flag word with an unsafe union behind accessors, giving 64
+   bytes. That buys the 64-byte class for objects with no properties: Vue -42% instead of -37%,
+   chai -39% instead of -37%, the rest within a point.
+3. Small arrays' elements:
+   - copy-on-write for constant literals (V8, JSC): Splay -24.6 MB, which the halving needs;
+   - fixed elements (SpiderMonkey): Vue -63% instead of -37%, chai -53% instead of -37%,
+     TypeScript -55% instead of -52%; nothing on Splay, whose ten elements do not fit beside
+     the header below 192 B;
+   - or both. Recommended: copy-on-write first, for the exit, then fixed elements measured after
+     it.
