@@ -2849,6 +2849,13 @@ impl Object {
         Self::new_with_capacity(proto, 0)
     }
 
+    /// An empty ordinary object whose size nothing predicts, which its author fills (Object.create,
+    /// `new Object()`): the [`DEFAULT_CLASS`], as JSC's are (W2d step 3e).
+    #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
+    pub(crate) fn new_default_class(proto: Option<Gc>) -> Gc {
+        Self::new_built(proto, ObjectKind::Plain, DEFAULT_CLASS, |_| {})
+    }
+
     /// Allocate an ordinary object's named-property vector at its known final size. Constructor
     /// chunks derive a conservative straight-line field count, replacing the usual 1 → 2 → 4
     /// growth sequence with one exact allocation. The hint lives on shared code, not instances.
@@ -4340,13 +4347,15 @@ pub(crate) mod layout_census {
 pub(crate) const OBJECT_HEADER: usize = std::mem::size_of::<RefCell<Object>>();
 const _: () = assert!(OBJECT_HEADER == 72);
 
-/// The capacity class a constructor's instances take when its code assigns no `this` property
-/// and its prototype holds no default (W2d step 3e): seven slots in a 128-byte cell, as JSC
-/// gives such a `new F()` its default six inline slots ("the static analyzer just didn't see
-/// the real initializer function", bytecode/ObjectAllocationProfileInlines.h:67-83),
-/// SpiderMonkey `new` at least OBJECT4 (vm/JSFunction-inl.h:142-157) and V8 its expected count
-/// plus 8 (js-function.cc:1507-1549). See [`constructed_class`].
-pub(crate) const CONSTRUCTED_CLASS: u32 = 1;
+/// The capacity class of an object whose size nothing predicts (W2d step 3e): seven slots in a
+/// 128-byte cell, as JSC gives its default six inline slots to a `new F()` whose code assigns no
+/// `this` property and whose prototype holds no default ("the static analyzer just didn't see
+/// the real initializer function", bytecode/ObjectAllocationProfileInlines.h:67-83), to both
+/// forms of Object.create (runtime/ObjectConstructor.cpp:1036-1038, JSGlobalObject.cpp:1209) and
+/// to `new Object()` (runtime/ObjectConstructor.h:73-81); SpiderMonkey gives `new` at least
+/// OBJECT4 (vm/JSFunction-inl.h:142-157) and V8 its expected count plus 8
+/// (js-function.cc:1507-1549). See [`constructed_class`] and [`Object::new_default_class`].
+pub(crate) const DEFAULT_CLASS: u32 = 1;
 
 /// The capacity class of `func`'s instances in this heap (W2d step 3e): decided once, at its
 /// first construction, then kept, as JSC fills `new F()`'s allocation profile once per function
@@ -4359,7 +4368,7 @@ pub(crate) const CONSTRUCTED_CLASS: u32 = 1;
 ///   ([`crate::ast::Function::this_store_count`]);
 /// - below seven, plus the prototype's own data properties that hold no function (JSC's
 ///   possibleDefaultPropertyCount, ObjectAllocationProfileInlines.h:146-168, which counts
-///   accessors as well), a sum of none taking [`CONSTRUCTED_CLASS`] and a larger one held to it
+///   accessors as well), a sum of none taking [`DEFAULT_CLASS`] and a larger one held to it
 ///   ("default properties are weak guesses");
 /// - seven or more, as counted.
 /// Fields past the class's cell slots go to the record, which the construct paths reserve by
@@ -4379,7 +4388,7 @@ pub(crate) fn constructed_class(func: &crate::ast::Function, proto: Option<&Gc>)
 #[cold]
 #[inline(never)]
 fn decide_constructed_class(func: &crate::ast::Function, proto: Option<&Gc>) -> u32 {
-    let default = class_slots(CONSTRUCTED_CLASS);
+    let default = class_slots(DEFAULT_CLASS);
     let stores = func.this_store_count(MAX_CELL_SLOTS + 1);
     let count = if stores < default {
         let defaults = proto.map_or(0, |proto| {

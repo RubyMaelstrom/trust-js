@@ -4652,14 +4652,16 @@ fn install_object(it: &mut Interp) {
                             ctor_realm_proto(i, &Value::Obj(nt), "Object")?.or(Some(i.object_proto))
                         }
                     };
-                    return Ok(Value::Obj(Object::new(proto)));
+                    return Ok(Value::Obj(Object::new_default_class(proto)));
                 }
             }
         }
         Ok({
             let __value_match_original = arg(args, 0);
             match (__value_match_original).view() {
-                ValueView::Undefined | ValueView::Null => Value::Obj(i.new_object()),
+                ValueView::Undefined | ValueView::Null => {
+                    Value::Obj(Object::new_default_class(Some(i.object_proto)))
+                }
                 ValueView::Obj(o) => Value::Obj(o),
                 // ToObject of a primitive yields its wrapper object.
                 _ => {
@@ -4894,7 +4896,7 @@ fn install_object(it: &mut Interp) {
                 return Err(i.make_error("TypeError", "Object.create proto must be object or null"));
             }
         };
-        let obj = Object::new(proto);
+        let obj = Object::new_default_class(proto);
         // Object.create(O, Properties): when Properties is not undefined, ObjectDefineProperties.
         let props_arg = arg(args, 1);
         if !matches!((props_arg).view(), ValueView::Undefined) {

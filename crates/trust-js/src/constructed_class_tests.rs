@@ -122,3 +122,20 @@ fn a_constructors_class_is_decided_once_whatever_path_constructs() {
         assert_eq!(instance.borrow().props.shape(), shape, "instance {index}");
     }
 }
+
+#[test]
+fn empty_objects_nothing_sizes_take_the_default_class() {
+    // Object.create and `new Object()` are filled by their author, as JSC's default six slots
+    // assume; a literal's own keys size it.
+    let mut engine = crate::Engine::new();
+    for source in [
+        "var probe = Object.create(null);",
+        "var probe = Object.create({ inherited: 1 });",
+        "var probe = new Object();",
+        "var probe = Object();",
+        "class Sub extends Object { constructor() { super(); this.a = 1; } } var probe = new Sub();",
+    ] {
+        assert_eq!(class(&mut engine, source), DEFAULT_CLASS, "{source}");
+    }
+    assert_eq!(class(&mut engine, "var probe = { a: 1 };"), 0);
+}
