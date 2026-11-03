@@ -400,3 +400,127 @@ fn native_creation_records_an_old_receivers_only_edge_to_a_young_layout() {
     }
     panic!("prototype epoch changed during every native creation trial");
 }
+
+/// W2d step 3's map guard: random operations on maps of every capacity class, in their cells and
+/// moved out and back or into another class's cell, checked against a model after each, through
+/// minor and major collections that reach each value only through the map's slots, in the cell
+/// and in the record.
+#[test]
+fn maps_in_and_out_of_cells_of_every_class_agree_with_a_model() {
+    for seed in [
+        0x9e37_79b9_7f4a_7c15u64,
+        0x2545_f491_4f6c_dd1d,
+        0xd1b5_4a32_d192_ed03,
+    ] {
+        maps_agree_with_a_model_from(seed);
+    }
+}
+
+fn maps_agree_with_a_model_from(mut seed: u64) {
+    let (heap, _release, _active) = isolated();
+    let mut below = move |n: u64| {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        seed % n
+    };
+    // A fresh value: an object holding its serial.
+    let held = |serial: u64| {
+        let held = Object::new(None);
+        held.borrow_mut()
+            .props
+            .insert("id", Property::plain(Value::Num(serial as f64)));
+        Value::Obj(held)
+    };
+    for start in 0..3 {
+        let mut object = Object::new_with_capacity(None, class_slots(start));
+        assert_eq!(object.borrow().props.class(), start);
+        let mut model: Vec<(String, u64)> = Vec::new();
+        let mut serial = 0;
+        for step in 0..700 {
+            let op = below(12);
+            match op {
+                // Add a key: up to ~200, past the cell, the record's growth and the key index.
+                0..=3 => {
+                    serial += 1;
+                    let key = format!("k{serial}");
+                    object
+                        .borrow_mut()
+                        .props
+                        .insert(key.as_str(), Property::plain(held(serial)));
+                    model.push((key, serial));
+                }
+                4 | 5 if !model.is_empty() => {
+                    let i = below(model.len() as u64) as usize;
+                    serial += 1;
+                    object
+                        .borrow_mut()
+                        .props
+                        .insert(model[i].0.as_str(), Property::plain(held(serial)));
+                    model[i].1 = serial;
+                }
+                6 if !model.is_empty() => {
+                    let i = below(model.len() as u64) as usize;
+                    let (key, _) = model.remove(i);
+                    assert!(object.borrow_mut().props.remove(&key), "step {step}");
+                }
+                // Out of the cell and back into it.
+                7 => {
+                    let props = object.borrow_mut().take_props();
+                    object.borrow_mut().replace_properties(props);
+                }
+                // Into a new object's cell, of any class.
+                8 => {
+                    let props = object.borrow_mut().take_props();
+                    let class = below(3) as u32;
+                    let moved = Object::new_with_capacity(None, class_slots(class));
+                    moved.borrow_mut().replace_properties(props);
+                    assert_eq!(moved.borrow().props.class(), class, "step {step}");
+                    object = moved;
+                }
+                // A detached copy, whose slots all live in its record, into a new cell.
+                9 => {
+                    let copy = object.borrow().props.clone();
+                    object = Object::new_with_parts(None, copy, ObjectKind::Plain);
+                }
+                10 => collect(&heap, &object, CollectionKind::Minor),
+                11 => collect(&heap, &object, CollectionKind::Major),
+                _ => {}
+            }
+            let borrowed = object.borrow();
+            let props = &borrowed.props;
+            assert_eq!(
+                props.entries.cell as usize,
+                class_slots(props.class()),
+                "class {start} step {step} op {op}: the shape names the cell's class"
+            );
+            assert_eq!(
+                props.named_len(),
+                model.len(),
+                "class {start} step {step} op {op}"
+            );
+            let keys: Vec<String> = props.keys().iter().map(|k| k.text().to_string()).collect();
+            let expected: Vec<&str> = model.iter().map(|(k, _)| k.as_str()).collect();
+            assert_eq!(
+                keys, expected,
+                "class {start} step {step} op {op}: key order"
+            );
+            for (key, serial) in &model {
+                let value = props.get_named(key).expect("a modelled key").slot().value();
+                let ValueView::Obj(value) = value.view() else {
+                    panic!("class {start} step {step}: {key} holds an object")
+                };
+                let id = value
+                    .borrow()
+                    .props
+                    .get_named("id")
+                    .map(|p| p.slot().value());
+                assert_eq!(
+                    id.and_then(|id| id.as_num_opt()),
+                    Some(*serial as f64),
+                    "class {start} step {step} op {op}: {key}"
+                );
+            }
+        }
+    }
+}

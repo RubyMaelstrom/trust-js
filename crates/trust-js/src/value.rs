@@ -2808,11 +2808,15 @@ impl Object {
 
     /// Take this object's map out of its cell, leaving it an empty map with the object's flag
     /// bits (W2d step 3): the taken map keeps every slot in its record, as a map outside a cell
-    /// does, for [`Object::replace_properties`] on another object.
+    /// does, for [`Object::replace_properties`] on another object. The empty map stays in the
+    /// cell, at the empty shape of the cell's class.
     pub(crate) fn take_props(&mut self) -> Props {
         let cell = self.props.entries.cell as usize;
         self.props.entries.detach();
-        let empty = Props::with_entries(NamedEntries::default());
+        let empty = Props::with_entries(NamedEntries {
+            shape: empty_shape(class_for(cell)),
+            ..NamedEntries::default()
+        });
         empty
             .entries
             .flags
