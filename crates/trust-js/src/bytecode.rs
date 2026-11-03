@@ -2917,7 +2917,8 @@ pub struct Chunk {
     /// looked, over its first [`CONSTRUCT_LEARNING`] constructions (W2d step 3d): fields set
     /// after the constructor returned count, as V8's slack tracking measures the most an initial
     /// map's tree took after seven constructions (js-function.cc:1507-1549,
-    /// map-updater.cc:472-511). It only grows, and picks later instances' capacity class.
+    /// map-updater.cc:472-511). It only grows, and reserves later instances' records for the
+    /// fields past their cell's seven (`value::CONSTRUCTED_CLASS`).
     learned_capacity: std::cell::Cell<u8>,
     /// The constructions [`Chunk::note_instance`] has seen, up to [`CONSTRUCT_LEARNING`], and the
     /// latest one's instance, held weakly until the next construction measures it.
@@ -25676,7 +25677,7 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     let instance = crate::value::Object::new_built(
         Some(proto),
         crate::value::ObjectKind::Plain,
-        crate::value::class_for(capacity),
+        crate::value::CONSTRUCTED_CLASS,
         |props| props.init_layout(capacity, layout),
     );
     chunk.note_instance(&instance);

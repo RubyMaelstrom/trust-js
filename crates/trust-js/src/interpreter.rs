@@ -16340,7 +16340,7 @@ impl Interp {
         let this = crate::value::Object::new_built(
             Some(proto),
             crate::value::ObjectKind::Plain,
-            crate::value::class_for(instance_capacity),
+            crate::value::CONSTRUCTED_CLASS,
             |props| props.init_layout(instance_capacity, instance_layout),
         );
         chunk.note_instance(&this);
@@ -16376,7 +16376,7 @@ impl Interp {
             // capacity class it was allocated in (W2d step 3), and its prototype is the live
             // object just read above. Avoid re-borrowing the new RefCell twice merely to
             // rediscover those construction invariants.
-            let start_shape = crate::value::empty_shape(crate::value::class_for(instance_capacity));
+            let start_shape = crate::value::empty_shape(crate::value::CONSTRUCTED_CLASS);
             let shapes = if epoch == u32::MAX {
                 None
             } else if let Some(cached) = simple.cached_shapes(epoch, proto_ptr, start_shape) {
@@ -17999,7 +17999,7 @@ impl Interp {
                 let this = Object::new_built(
                     proto,
                     crate::value::ObjectKind::Plain,
-                    crate::value::class_for(capacity),
+                    crate::value::CONSTRUCTED_CLASS,
                     |props| props.init_layout(capacity, layout),
                 );
                 let this_val = Value::Obj(this);

@@ -551,20 +551,27 @@ impl PropWord {
     #[inline]
     fn materialize(&self) -> Value {
         if self.tag() == PACK_LAZY_PROTO {
-            // SAFETY: only defer_function_prototype publishes this property-only tag.
-            let lazy = unsafe { Value::decode_payload::<LazyProto>(self.0.get()) };
-            let prototype = lazy.materialize();
-            // Representation-only promotion invokes no JS. Record the owning function before
-            // publishing its new object edge, with no safepoint between barrier and store.
-            lazy.mark_owner_card();
-            self.0
-                .set(PACK_OBJ | unsafe { Value::into_word(prototype) });
-            Value::Obj(prototype)
+            self.materialize_prototype()
         } else {
             // SAFETY: ordinary property words hold valid execution values; the property-only
             // deferred tag was handled above, before constructing an execution value.
             unsafe { Value::from_bits(self.0.get()) }
         }
+    }
+
+    /// [`PropWord::materialize`] of a deferred prototype, out of the reads' line.
+    #[cold]
+    #[inline(never)]
+    fn materialize_prototype(&self) -> Value {
+        // SAFETY: only defer_function_prototype publishes this property-only tag.
+        let lazy = unsafe { Value::decode_payload::<LazyProto>(self.0.get()) };
+        let prototype = lazy.materialize();
+        // Representation-only promotion invokes no JS. Record the owning function before
+        // publishing its new object edge, with no safepoint between barrier and store.
+        lazy.mark_owner_card();
+        self.0
+            .set(PACK_OBJ | unsafe { Value::into_word(prototype) });
+        Value::Obj(prototype)
     }
 
     #[inline]
@@ -4332,6 +4339,16 @@ pub(crate) mod layout_census {
 /// which the map's cell slots follow.
 pub(crate) const OBJECT_HEADER: usize = std::mem::size_of::<RefCell<Object>>();
 const _: () = assert!(OBJECT_HEADER == 72);
+
+/// The capacity class of every constructor's instance (W2d step 3): seven slots in a 128-byte
+/// cell, as SpiderMonkey gives `new` at least OBJECT4 (vm/JSFunction-inl.h:142-157), JSC at
+/// least 6 inline slots (bytecode/ObjectAllocationProfileInlines.h:67-83) and V8 its expected
+/// count plus 8 (js-function.cc:1507-1549). One class, not one by count: the construct paths
+/// count differently (the generic dispatch by the layout it learned, none before the first
+/// instance; the compiled paths by their static counts, which learning raises), and a compiled
+/// read bakes the shape it saw, which a constructor's instances must therefore all share. The
+/// counts reserve the record for the fields past seven ([`Props::init_layout`]).
+pub(crate) const CONSTRUCTED_CLASS: u32 = 1;
 
 /// The offset of an object's first cell slot from its Object, which, after the borrow flag, is
 /// the rest of the cell's header (W2d step 3): generated code addresses the Object.
