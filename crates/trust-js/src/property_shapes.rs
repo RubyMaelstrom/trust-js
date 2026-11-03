@@ -7,27 +7,91 @@
 use super::PropertyLayout;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+/// A shape id's top two bits are its capacity class (W2d step 3): the class of the cell its
+/// objects are allocated in, which fixes how many slots the cell keeps ([`class_slots`]), as
+/// SpiderMonkey's shape holds nfixed and V8's map the in-object count. The other 30 bits are a
+/// serial, process-wide, never reused; serial 0 is each class's empty shape, the root of its
+/// transition tree, and the all-ones serial the class's uncacheable token.
+pub(crate) const SHAPE_CLASS_SHIFT: u32 = 30;
+const SHAPE_SERIAL_MASK: u32 = (1 << SHAPE_CLASS_SHIFT) - 1;
+
 /// Exhaustion disables new shape proofs, never wraps or terminates the host. Every
-/// cache proof producer rejects this token; a native comparison with a cached
-/// cacheable token consequently misses without an extra hot-path guard.
+/// cache proof producer rejects these tokens (one per class, [`uncacheable_shape`]); a native
+/// comparison with a cached cacheable token consequently misses without an extra hot-path
+/// guard. This one, the all-ones word, names no class: a placeholder where no map's shape is.
 pub(crate) const SHAPE_UNCACHEABLE: u32 = u32::MAX;
 
 static NEXT_SHAPE: AtomicU32 = AtomicU32::new(1);
 
 #[inline]
 pub(crate) fn is_cacheable_shape(shape: u32) -> bool {
-    shape != SHAPE_UNCACHEABLE
+    shape & SHAPE_SERIAL_MASK != SHAPE_SERIAL_MASK
 }
 
-fn allocate_from(next: &AtomicU32) -> u32 {
+/// The capacity class of `shape` (0, 1 or 2; 3 only for [`SHAPE_UNCACHEABLE`]).
+#[inline]
+pub(crate) fn shape_class(shape: u32) -> u32 {
+    shape >> SHAPE_CLASS_SHIFT
+}
+
+/// The empty shape of capacity class `class`: the root its objects' transitions start from.
+#[inline]
+pub(crate) const fn empty_shape(class: u32) -> u32 {
+    class << SHAPE_CLASS_SHIFT
+}
+
+/// Whether `shape` is a class's empty shape.
+#[inline]
+pub(crate) fn is_empty_shape(shape: u32) -> bool {
+    shape & SHAPE_SERIAL_MASK == 0
+}
+
+/// The uncacheable token of capacity class `class`.
+#[inline]
+pub(crate) const fn uncacheable_shape(class: u32) -> u32 {
+    class << SHAPE_CLASS_SHIFT | SHAPE_SERIAL_MASK
+}
+
+/// The slots a cell of capacity class `class` keeps after its header: three in 96 bytes, seven in
+/// 128, fifteen in 192 (W2d step 3).
+#[inline]
+pub(crate) const fn class_slots(class: u32) -> usize {
+    match class {
+        0 => 3,
+        1 => 7,
+        _ => 15,
+    }
+}
+
+/// The smallest capacity class whose cell keeps `slots` slots, or the largest (15 slots, the rest
+/// in the record).
+#[inline]
+pub(crate) const fn class_for(slots: usize) -> u32 {
+    if slots <= 3 {
+        0
+    } else if slots <= 7 {
+        1
+    } else {
+        2
+    }
+}
+
+/// The next serial: below the all-ones serial, which is the uncacheable tokens'.
+fn allocate_from(next: &AtomicU32) -> Option<u32> {
     crate::atomic_compat::try_update_u32(next, Ordering::Relaxed, Ordering::Relaxed, |id| {
-        id.checked_add(1)
+        id.checked_add(1).filter(|&id| id <= SHAPE_SERIAL_MASK)
     })
-    .unwrap_or(SHAPE_UNCACHEABLE)
+    .ok()
 }
 
-pub(super) fn fresh_shape() -> u32 {
-    allocate_from(&NEXT_SHAPE)
+/// A new shape id of capacity class `class`, or the class's uncacheable token once the serials
+/// are spent.
+pub(super) fn fresh_shape(class: u32) -> u32 {
+    debug_assert!(class <= 2, "a capacity class");
+    match allocate_from(&NEXT_SHAPE) {
+        Some(serial) => class << SHAPE_CLASS_SHIFT | serial,
+        None => uncacheable_shape(class),
+    }
 }
 
 pub(crate) const SHAPE_LAYOUT_PAGE_BITS: u32 = 6;
@@ -242,15 +306,38 @@ mod tests {
 
     #[test]
     fn shape_identity_exhaustion_disables_proofs_without_wrapping() {
-        let next = AtomicU32::new(u32::MAX - 2);
-        assert_eq!(allocate_from(&next), u32::MAX - 2);
-        assert_eq!(allocate_from(&next), u32::MAX - 1);
+        let next = AtomicU32::new(SHAPE_SERIAL_MASK - 2);
+        assert_eq!(allocate_from(&next), Some(SHAPE_SERIAL_MASK - 2));
+        assert_eq!(allocate_from(&next), Some(SHAPE_SERIAL_MASK - 1));
         for _ in 0..8 {
-            assert_eq!(allocate_from(&next), SHAPE_UNCACHEABLE);
+            assert_eq!(allocate_from(&next), None);
         }
-        assert_eq!(next.load(Ordering::Relaxed), SHAPE_UNCACHEABLE);
-        assert!(is_cacheable_shape(0), "the empty key sequence is universal");
+        assert_eq!(next.load(Ordering::Relaxed), SHAPE_SERIAL_MASK);
+        for class in 0..3 {
+            assert!(
+                is_cacheable_shape(empty_shape(class)),
+                "the empty key sequence is universal"
+            );
+            assert!(!is_cacheable_shape(uncacheable_shape(class)));
+            assert_eq!(shape_class(uncacheable_shape(class)), class);
+            assert!(is_empty_shape(empty_shape(class)));
+        }
         assert!(!is_cacheable_shape(SHAPE_UNCACHEABLE));
+    }
+
+    #[test]
+    fn shape_ids_carry_their_capacity_class() {
+        for (class, slots) in [(0, 3), (1, 7), (2, 15)] {
+            let shape = fresh_shape(class);
+            assert_eq!(shape_class(shape), class);
+            assert!(is_cacheable_shape(shape) && !is_empty_shape(shape));
+            assert_eq!(class_slots(class), slots);
+            assert_eq!(class_for(slots), class);
+        }
+        assert_eq!(
+            (class_for(0), class_for(4), class_for(8), class_for(40)),
+            (0, 1, 2, 2)
+        );
     }
 
     #[test]
@@ -260,7 +347,11 @@ mod tests {
             let workers: Vec<_> = (0..4)
                 .map(|_| {
                     let next = &next;
-                    scope.spawn(move || (0..1024).map(|_| allocate_from(next)).collect::<Vec<_>>())
+                    scope.spawn(move || {
+                        (0..1024)
+                            .map(|_| allocate_from(next).expect("a serial"))
+                            .collect::<Vec<_>>()
+                    })
                 })
                 .collect();
             let mut ids: Vec<_> = workers

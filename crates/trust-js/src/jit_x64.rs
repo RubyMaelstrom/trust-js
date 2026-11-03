@@ -446,6 +446,10 @@ impl Asm {
     fn nr_load8(&mut self, reg: u8, base: u8, off: usize) {
         self.nr_mem(false, &[0x0f, 0xb6], reg, base, off as i32);
     }
+    /// movzx reg32, word [base+off]
+    fn nr_load16(&mut self, reg: u8, base: u8, off: usize) {
+        self.nr_mem(false, &[0x0f, 0xb7], reg, base, off as i32);
+    }
     fn nr_store(&mut self, base: u8, off: usize, reg: u8) {
         self.nr_mem(true, &[0x89], reg, base, off as i32);
     }
@@ -633,7 +637,9 @@ fn emit_prop_own(
     storage::named_len(a, layout, CX, R11); // rcx=live named count
     a.nr_cmp(DX, CX);
     a.jcc(AE, slow);
-    storage::slot_addr(a, layout, AX, R11, DX); // rax=the slot (W2d step 2)
+    // rcx=the slot's location word (W2d step 3), which the way's shape fixes; rax=the slot.
+    a.nr_load16(CX, R9, crate::bytecode::IC_OFF_LOC as usize);
+    storage::slot_addr_loc(a, layout, AX, R11, CX);
     a.bytes(&[0x4c, 0x8b, 0x10]); // r10=[rax]: the borrowed live slot word
                                   // An accessor's word (PACK_ACCESSOR) fails the execution-tag guard below, as a deferred
                                   // prototype's does: the slot keeps no attribute bits to test.
@@ -753,9 +759,10 @@ fn emit_prop_num(
         guard_object(a, st.holder_shape, slow);
     }
 
-    // rdx=the holder's slot word (in the cell, or the record: W2d step 2); decode only packed
-    // Numbers, which an accessor's word (PACK_ACCESSOR, a negative NaN pattern) is not.
-    storage::load_slot_const(a, layout, DX, R11, st.slot as usize);
+    // rdx=the holder's slot word (in the cell, or the record, where the state's location word
+    // says: W2d step 3); decode only packed Numbers, which an accessor's word (PACK_ACCESSOR, a
+    // negative NaN pattern) is not.
+    storage::load_slot_loc_const(a, layout, DX, R11, st.loc);
     a.bytes(&[0x48, 0x89, 0xd0, 0x48, 0xc1, 0xe8, 0x30]); // eax=upper 16 bits
     let number = a.label();
     a.bytes(&[0x3d]);

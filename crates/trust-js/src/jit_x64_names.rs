@@ -76,12 +76,13 @@ fn scope_plain(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.jcc(NE, slow);
 }
 
-/// R9=Object (a stored cell word plus `obj_from_cell`), AX=shape, DX=slot. Output CX=the slot's
+/// R9=Object (a stored cell word plus `obj_from_cell`), AX=shape, DX=slot, and R8 the record
+/// whose `u32` at `loc_off` is the slot's location word (W2d step 3). Output CX=the slot's
 /// address, R11=its owner kind (1 for a writable data property, 2 for any other: the layout's
 /// attributes, W2d step 2). No value flags yet. `valid` admitted the layout. A global object is never a Map or Set
 /// (the VM checks `ObjectKind::ExoticNone` there); a Reference's object base (`ordinary`) may be any object
 /// with ordinary internal methods, as ARM64's Reference template admits.
-fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
+fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, loc_off: usize, slow: usize) {
     a.nr_zero_guard(R9, slow);
     a.nr_zero_guard(AX, slow);
     a.nr_max_guard(AX, CX, slow);
@@ -99,7 +100,8 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     storage::named_len(a, l, CX, R9);
     a.nr_cmp(DX, CX);
     a.jcc(AE, slow);
-    storage::slot_addr(a, l, CX, R9, DX);
+    a.nr_load32(AX, R8, loc_off);
+    storage::slot_addr_loc(a, l, CX, R9, AX);
     storage::property_kind(a, l, R9, DX);
 }
 
@@ -190,7 +192,7 @@ fn deep_target(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.nr_load(R9, CTX, offset_of!(super::super::JitCtx, global_body));
     a.nr_load32(AX, R8, offset_of!(NativeNameDescriptor, shape));
     a.nr_load(DX, R8, offset_of!(NativeNameDescriptor, slot));
-    global_target(a, l, false, slow);
+    global_target(a, l, false, offset_of!(NativeNameDescriptor, loc), slow);
     a.bind(done);
     #[cfg(test)]
     record(
@@ -246,7 +248,14 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, hops: u16, slow: usize)
     a.nr_shift(true, AX, 32);
     // A 32-bit self move zero-extends the compact slot without sign extension.
     a.bytes(&[0x89, 0xd2]);
-    global_target(a, l, false, slow);
+    // Global mode keeps the slot's location word in `act_gen` (W2d step 3).
+    global_target(
+        a,
+        l,
+        false,
+        crate::bytecode::NAME_IC_OFF_ACT_GEN as usize,
+        slow,
+    );
     a.jmp(done);
     a.bind(direct);
     a.nr_load32(AX, R9, l.scope_gen);
@@ -455,7 +464,7 @@ fn reference_target(a: &mut Asm, l: &JitLayout, slot: u16, slow: usize) {
     a.nr_lea(R9, R9, l.obj_from_cell as i32);
     a.nr_load32(AX, R8, offset_of!(PreparedReference, shape));
     a.nr_load(DX, R8, offset_of!(PreparedReference, slot));
-    global_target(a, l, true, slow);
+    global_target(a, l, true, offset_of!(PreparedReference, loc), slow);
     a.bind(done);
 }
 

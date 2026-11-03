@@ -34,6 +34,9 @@ pub(crate) use property_shapes::SHAPE_LAYOUT_PAGE_BITS;
     )
 ))]
 pub(crate) use property_shapes::SHAPE_LAYOUT_PAGE_COUNT;
+pub(crate) use property_shapes::{
+    class_for, class_slots, empty_shape, is_empty_shape, shape_class, uncacheable_shape,
+};
 pub(crate) use property_shapes::{is_cacheable_shape, SHAPE_LAYOUT_PAGE_SIZE, SHAPE_UNCACHEABLE};
 use property_shapes::{LayoutEntry, LayoutPage, ShapeLayouts};
 
@@ -1464,9 +1467,9 @@ pub struct JitLayout {
     /// [`FLAG_CONSTRUCTOR`] and the class kind's two bits.
     pub obj_flags: usize,
     pub props_shape: usize,
-    /// The named slots within `Props` (W2d step 2): one word each, [`INLINE_NAMED_SLOTS`] of them
-    /// in the cell from `props_slots`, the rest in the out-of-line record that the pointer at
-    /// `props_record` addresses (null while the map has none), slot `INLINE_NAMED_SLOTS + i`
+    /// The named slots (W2d step 3): one word each, the cell's capacity class's in the cell from
+    /// `props_slots` past `obj_props` (right after the Object), the rest in the out-of-line record
+    /// that the pointer at `props_record` addresses (null while the map has none), record slot `i`
     /// `record_slots + 8 * i` bytes into its block, whose slot capacity (a `u32`) is at
     /// `record_cap` and whose key index pointer (null while the map keeps none) at
     /// `record_index`. The named count is the `u32` at `props_len`. A slot's attributes are its
@@ -2789,6 +2792,8 @@ impl Object {
         // The words' remembered record described their old owner's marks.
         properties.elems.0.force_full();
         let cell = self.props.entries.cell as usize;
+        // The map takes this cell's capacity class (W2d step 3).
+        properties.entries.shape = rebased_shape(&properties.entries, class_for(cell));
         self.props = properties;
         // SAFETY: this Object's cell holds `cell` slots after its header.
         unsafe { self.props.entries.attach(cell) };
@@ -2814,12 +2819,20 @@ impl Object {
     /// Tests: replace the whole map, flag byte included, with `props`, a map outside any cell, as
     /// an assignment to `props` did before the slots moved into the cell (W2d step 3).
     #[cfg(test)]
-    pub(crate) fn set_props_for_test(&mut self, props: Props) {
+    pub(crate) fn set_props_for_test(&mut self, mut props: Props) {
         debug_assert_eq!(props.entries.cell, 0, "a map outside a cell");
         let cell = self.props.entries.cell as usize;
+        props.entries.shape = rebased_shape(&props.entries, class_for(cell));
         self.props = props;
         // SAFETY: this Object's cell holds `cell` slots after its header.
         unsafe { self.props.entries.attach(cell) };
+    }
+
+    /// A prototype or a global object, which holds many properties: the largest capacity class,
+    /// fifteen slots in its 192-byte cell (W2d step 3), as SpiderMonkey's largest fixed-slot kind.
+    #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
+    pub(crate) fn new_prototype(proto: Option<Gc>) -> Gc {
+        Self::new_built(proto, ObjectKind::Plain, 2, |_| {})
     }
 
     // Objects exist only behind their collected handle; `Gc` is that handle.
@@ -2834,9 +2847,12 @@ impl Object {
     /// growth sequence with one exact allocation. The hint lives on shared code, not instances.
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_capacity(proto: Option<Gc>, property_capacity: usize) -> Gc {
-        Self::new_built(proto, ObjectKind::Plain, |props| {
-            props.entries.reserve_exact(property_capacity);
-        })
+        Self::new_built(
+            proto,
+            ObjectKind::Plain,
+            class_for(property_capacity),
+            |props| props.entries.reserve_exact(property_capacity),
+        )
     }
 
     /// Allocate an object around an already-finalized property map, one outside any cell, whose
@@ -2863,25 +2879,33 @@ impl Object {
     /// Allocate an object whose map `init` builds in its cell, from an empty one (W2d step 3):
     /// the hot builders write each slot where it stays, not into a record that a copy into the
     /// cell then empties. `init` runs no JavaScript and does not collect.
+    /// The object is allocated in capacity class `class` (W2d step 3), and its map starts at that
+    /// class's empty shape: `init` installs only shapes of the class.
     #[inline(always)]
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_built(
         proto: Option<Gc>,
         kind: ObjectKind,
+        class: u32,
         init: impl FnOnce(&mut Props),
     ) -> Gc {
         #[cfg(feature = "architecture-diagnostics")]
         let caller = std::panic::Location::caller();
-        let obj = Self::alloc(proto, Props::with_entries(NamedEntries::default()), kind);
+        let obj = Self::alloc(proto, Props::new_in_class(class), kind);
         // SAFETY: the object is fresh, so nothing else refers to it or borrows its map.
         init(unsafe { &mut (*obj.object_ptr()).props });
+        debug_assert_eq!(
+            unsafe { (*obj.object_ptr()).props.entries.class() },
+            class,
+            "a built map keeps its cell's class"
+        );
         #[cfg(feature = "architecture-diagnostics")]
         Self::note_birth(&obj, caller);
         obj
     }
 
-    /// Allocate a cell for an object of `props`, a map outside any cell, and move the map's
-    /// slots into it.
+    /// Allocate a cell for an object of `props`, a map outside any cell, in the capacity class its
+    /// shape names (W2d step 3), and move the map's slots into it.
     #[inline(always)]
     fn alloc(proto: Option<Gc>, props: Props, kind: ObjectKind) -> Gc {
         with_active_gc_heap(|heap| {
@@ -2894,10 +2918,11 @@ impl Object {
                 "object prototype belongs to another Agent heap (I6)"
             );
             heap.allocated.set(heap.allocated.get().wrapping_add(1));
-            let obj = Gc::new_in(heap, RefCell::new(Object { proto, props, kind }));
-            // SAFETY: the object is fresh (nothing else refers to it) and its cell holds
-            // `INLINE_NAMED_SLOTS` slots after its header.
-            unsafe { (*obj.object_ptr()).props.entries.attach(INLINE_NAMED_SLOTS) };
+            let class = props.entries.class();
+            let obj = Gc::new_in(heap, class, RefCell::new(Object { proto, props, kind }));
+            // SAFETY: the object is fresh (nothing else refers to it) and its cell holds its
+            // class's slots after its header.
+            unsafe { (*obj.object_ptr()).props.entries.attach(class_slots(class)) };
             obj
         })
     }
@@ -3039,7 +3064,8 @@ pub(crate) struct GcState {
     /// The heap's markings (`gc_core::Control::markings`) when a collection last judged the
     /// registry: the young functions' closures are young only at the marking after it.
     closure_functions_judged: Cell<u64>,
-    array_length_shape: Cell<u32>,
+    /// [`array_length_shape`]'s memo, per capacity class (0 until made).
+    array_length_shapes: [Cell<u32>; 3],
     array_length_layout: RefCell<Option<PropertyLayout>>,
     live: LiveCount,
     allocated: Cell<u64>,
@@ -3897,6 +3923,12 @@ impl Object {
         // assigned over it from outside a cell would keep them in its record instead, where
         // generated code does not look.
         debug_assert_ne!(props.entries.cell, 0, "an object's map is in its cell");
+        // ... in a cell of its shape's capacity class: the cell keeps that class's slots.
+        debug_assert_eq!(
+            props.entries.cell as usize,
+            class_slots(props.entries.class()),
+            "an object's shape names its cell's class"
+        );
         if let Some(proto) = proto {
             sink.object(proto);
         }
@@ -4281,9 +4313,38 @@ pub(crate) mod layout_census {
 pub(crate) const OBJECT_HEADER: usize = std::mem::size_of::<RefCell<Object>>();
 const _: () = assert!(OBJECT_HEADER == 72);
 
-/// An object cell: the header and [`INLINE_NAMED_SLOTS`] slots, 128 bytes.
-pub(crate) const OBJECT_CELL: usize = OBJECT_HEADER + 8 * INLINE_NAMED_SLOTS;
-const _: () = assert!(OBJECT_CELL == 128);
+/// The offset of an object's first cell slot from its Object, which, after the borrow flag, is
+/// the rest of the cell's header (W2d step 3): generated code addresses the Object.
+pub(crate) const OBJECT_SLOTS_OFF: usize = std::mem::size_of::<Object>();
+
+/// The location word of slot `slot` of a map that keeps `cell` slots in its object's cell (W2d
+/// step 3, SpiderMonkey's TaggedSlotOffset, vm/NativeObject.h:2010-2019): the slot's byte
+/// offset from the Object when it is in the cell, else its byte offset from the record's block
+/// with bit 0 set, shifted left by one. `None` past the 15 bits a cache keeps. An inline cache
+/// records it when it fills, from the holder, whose shape fixes it, so generated code never
+/// reads a capacity.
+pub(crate) fn location_word(cell: usize, slot: usize) -> Option<u16> {
+    let word = if slot < cell {
+        (OBJECT_SLOTS_OFF + 8 * slot) << 1
+    } else {
+        ((RECORD_SLOTS_OFF + 8 * (slot - cell)) << 1) | 1
+    };
+    u16::try_from(word).ok()
+}
+
+/// The most slots an object's cell keeps after its header (W2d step 3: fifteen in a 192-byte cell),
+/// which generated code's slot offsets in the cell stay within.
+pub(crate) const MAX_CELL_SLOTS: usize = 15;
+
+/// An object cell of capacity class `class` (W2d step 3): the header and [`class_slots`] slots,
+/// 96, 128 or 192 bytes, each a size class of the heap.
+pub(crate) const fn object_cell_bytes(class: u32) -> usize {
+    OBJECT_HEADER + 8 * class_slots(class)
+}
+const _: () = assert!(
+    object_cell_bytes(0) == 96 && object_cell_bytes(1) == 128 && object_cell_bytes(2) == 192
+);
+const _: () = assert!(class_slots(2) == MAX_CELL_SLOTS);
 
 /// The bytes from a map's named entries to its object's first cell slot: the rest of the Object,
 /// which `RefCell<Object>` ends with ([`check_object_layout`]).
@@ -4309,12 +4370,17 @@ pub(crate) fn check_object_layout() {
     );
 }
 
-/// A fresh cell for one object in `heap` (see `Gc::new_in`): its header and slots.
-pub(crate) fn alloc_object_cell(heap: &GcState) -> *mut RefCell<Object> {
-    heap.core
-        .borrow_mut()
-        .alloc(heap.object_desc, OBJECT_CELL)
-        .cast()
+/// A fresh cell for one object of capacity class `class` in `heap` (see `Gc::new_in`): its header
+/// and slots. Each arm's size is a constant, so the allocation's zeroing stays in line.
+#[inline]
+pub(crate) fn alloc_object_cell(heap: &GcState, class: u32) -> *mut RefCell<Object> {
+    let mut core = heap.core.borrow_mut();
+    let cell = match class {
+        0 => core.alloc(heap.object_desc, object_cell_bytes(0)),
+        1 => core.alloc(heap.object_desc, object_cell_bytes(1)),
+        _ => core.alloc(heap.object_desc, object_cell_bytes(2)),
+    };
+    cell.cast()
 }
 
 /// Ends an Agent's object heap: declared as the interpreter's LAST field, so it runs after every
@@ -4709,7 +4775,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         closure_functions: RefCell::default(),
         young_closure_functions: RefCell::default(),
         closure_functions_judged: Cell::new(0),
-        array_length_shape: Cell::new(SHAPE_EMPTY),
+        array_length_shapes: Default::default(),
         array_length_layout: RefCell::default(),
         live: LiveCount::new(0),
         allocated: Cell::new(0),
@@ -6761,11 +6827,6 @@ fn new_shared_layout_of(entries: impl IntoIterator<Item = (PropKey, u8)>) -> Pro
     layout
 }
 
-/// Named properties kept in an object's cell, after its 72-byte header: seven one-word slots,
-/// which fill a 128-byte cell (W2d step 2; since step 3 they follow the header, outside the Rust
-/// struct). The rest live in the out-of-line record ([`Record`]).
-pub(crate) const INLINE_NAMED_SLOTS: usize = 7;
-
 /// The header of an object's out-of-line record (W2d step 2), at the start of its storage block:
 /// the slots past the cell's, the map's own key index and its Rust-heap extras, each rare. `cap`
 /// slot words follow the header.
@@ -7222,14 +7283,15 @@ impl Clone for NamedEntries {
 }
 
 impl NamedEntries {
-    fn with_capacity(capacity: usize) -> Self {
-        let mut entries = NamedEntries::default();
-        entries.reserve_exact(capacity);
-        entries
-    }
+    /// Tests: a map outside any cell with room for `capacity` slots and the predicted keys, of the
+    /// smallest capacity class holding them.
     #[cfg(test)]
     fn with_layout(capacity: usize, layout: Option<PropertyLayout>) -> Self {
-        let mut entries = NamedEntries::with_capacity(capacity);
+        let mut entries = NamedEntries {
+            shape: empty_shape(class_for(capacity)),
+            ..NamedEntries::default()
+        };
+        entries.reserve_exact(capacity);
         entries.layout = layout;
         entries
     }
@@ -7248,6 +7310,14 @@ impl NamedEntries {
     #[inline]
     fn capacity(&self) -> usize {
         self.cell as usize + self.record.cap()
+    }
+    /// The capacity class of the map's shape (W2d step 3): the class of the cell its object is
+    /// allocated in, whose slots the cell keeps after its header.
+    #[inline]
+    fn class(&self) -> u32 {
+        let class = shape_class(self.shape);
+        debug_assert!(class <= 2, "a map's shape names its capacity class");
+        class
     }
     /// The slots in the record, of the first `len` (those past the cell's).
     #[inline]
@@ -7679,9 +7749,10 @@ fn dictionary_words(n: usize) -> usize {
     (n + n / 2).next_power_of_two().max(4) * 3
 }
 
-/// The empty-object shape: every `Props` starts here and all empty objects share it, so adding
-/// the same first key to two of them lands on the same child shape.
-const SHAPE_EMPTY: u32 = 0;
+/// The empty-object shape of the three-slot class, where a map starts unless it names another
+/// class ([`empty_shape`]): all empty objects of a class share their class's, so adding the same
+/// first key to two of them lands on the same child shape.
+const SHAPE_EMPTY: u32 = empty_shape(0);
 
 /// The property-creation epoch (see [`Props::proto_flag`]): bumped whenever a marked prototype
 /// mutates structurally, any `[[SetPrototypeOf]]` succeeds, or a `defineProperty` rewrites
@@ -7735,6 +7806,9 @@ struct ShapeTable {
     /// on first use): most transitions skip hashing the triple. `transitions` is append-only,
     /// so an entry never disagrees with it.
     recent: Vec<Option<(u32, PropKey, u8, u32)>>,
+    /// The shape a cacheable shape's (key, attributes) sequence reaches from another capacity
+    /// class's empty shape ([`rebased_shape`], W2d step 3), by (shape, class).
+    rebased: crate::fasthash::FastMap<(u32, u32), u32>,
 }
 
 const RECENT_TRANSITIONS: usize = 512;
@@ -7761,11 +7835,13 @@ impl ShapeTable {
             transitions: Default::default(),
             layouts: ShapeLayouts::default(),
             recent: Vec::new(),
+            rebased: Default::default(),
         }
     }
 
-    fn fresh(&mut self) -> u32 {
-        property_shapes::fresh_shape()
+    /// A new shape id of capacity class `class` (W2d step 3).
+    fn fresh(&mut self, class: u32) -> u32 {
+        property_shapes::fresh_shape(class)
     }
 }
 
@@ -7780,10 +7856,13 @@ fn shape_transition(
 ) -> (u32, Option<PropertyLayout>) {
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
+        // A child keeps its parent's capacity class (W2d step 3), as V8's maps, SpiderMonkey's
+        // shapes and JSC's structures keep their root's inline capacity.
+        let class = shape_class(parent);
         // Unknown parents do not describe one key sequence. In particular, never memoize
         // (uncacheable, key): two exhausted maps can have entirely different prefixes.
         if !is_cacheable_shape(parent) {
-            return (SHAPE_UNCACHEABLE, None);
+            return (uncacheable_shape(class), None);
         }
         let slot = recent_transition_slot(parent, key);
         let recent = shapes.recent.get(slot).and_then(Option::as_ref).and_then(
@@ -7799,7 +7878,7 @@ fn shape_transition(
             let id = if let Some(&id) = shapes.transitions.get(&pair) {
                 id
             } else {
-                let id = shapes.fresh();
+                let id = shapes.fresh(class);
                 if is_cacheable_shape(id) {
                     shapes.transitions.insert(pair, id);
                 }
@@ -7834,7 +7913,7 @@ fn shape_transition(
         // instances can reserve once and append into its live prefix without another lookup.
         // Extend only matching predictions, never oscillate between incompatible branches.
         // No shape identity or observable property changes: field count still defines presence.
-        let mut prefix_shape = SHAPE_EMPTY;
+        let mut prefix_shape = empty_shape(class);
         for &(name, attrs) in prefix {
             let Some(&prefix_id) = shapes.transitions.get(&(prefix_shape, name, attrs)) else {
                 break;
@@ -7857,14 +7936,15 @@ fn shape_change(parent: u32, key: PropKey, attrs: u8) -> u32 {
     debug_assert!(attrs & !(PROP_FLAG_MASK as u8) == 0);
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
+        let class = shape_class(parent);
         if !is_cacheable_shape(parent) {
-            return SHAPE_UNCACHEABLE;
+            return uncacheable_shape(class);
         }
         let pair = (parent, key, attrs | SHAPE_CHANGE);
         if let Some(&id) = shapes.transitions.get(&pair) {
             return id;
         }
-        let id = shapes.fresh();
+        let id = shapes.fresh(class);
         if is_cacheable_shape(id) {
             shapes.transitions.insert(pair, id);
         }
@@ -7872,13 +7952,49 @@ fn shape_change(parent: u32, key: PropKey, attrs: u8) -> u32 {
     })
 }
 
+/// The shape a map of `entries`' keys and attributes has in capacity class `class` (W2d step 3):
+/// its own when the classes agree, else the one the same sequence of additions reaches from the
+/// class's empty shape, memoized by (shape, class). No engine installs a hidden class on an
+/// object of another capacity: SpiderMonkey reuses the property map under the target's nfixed
+/// (vm/NativeObject.h:924-954), and V8 caches the cross-root map as a side-step transition
+/// (kObjectAssign, kCloneObject; ic/ic.cc:4466-4542).
+fn rebased_shape(entries: &NamedEntries, class: u32) -> u32 {
+    let shape = entries.shape;
+    if shape_class(shape) == class {
+        return shape;
+    }
+    if !is_cacheable_shape(shape) {
+        return uncacheable_shape(class);
+    }
+    let memo =
+        with_active_gc_heap(|heap| heap.shapes.borrow().rebased.get(&(shape, class)).copied());
+    if let Some(rebased) = memo {
+        return rebased;
+    }
+    let mut rebased = empty_shape(class);
+    for (slot, &key) in entries.keys().iter().enumerate() {
+        rebased = shape_transition(rebased, key, entries.attrs(slot), None).0;
+        if !is_cacheable_shape(rebased) {
+            return rebased;
+        }
+    }
+    with_active_gc_heap(|heap| {
+        heap.shapes
+            .borrow_mut()
+            .rebased
+            .insert((shape, class), rebased);
+    });
+    rebased
+}
+
 fn shape_layout(id: u32) -> Option<PropertyLayout> {
     with_active_gc_heap(|heap| heap.shapes.borrow().layouts.get(id).cloned())
 }
 
-/// A fresh unique shape id (a structural removal / deopt — no cache should still match).
-fn shape_fresh() -> u32 {
-    with_active_gc_heap(|heap| heap.shapes.borrow_mut().fresh())
+/// A fresh unique shape id of capacity class `class` (a structural removal / deopt — no cache
+/// should still match).
+fn shape_fresh(class: u32) -> u32 {
+    with_active_gc_heap(|heap| heap.shapes.borrow_mut().fresh(class))
 }
 
 /// Entry count up to which a `Props` runs without a hash index (linear-scan lookups, no hash
@@ -7907,9 +8023,12 @@ fn array_length_layout() -> PropertyLayout {
     })
 }
 
-fn array_length_shape() -> u32 {
+/// The shape an empty map of capacity class `class` reaches by adding ArrayCreate's `length`
+/// (W2d step 3: one per class, most arrays' the three-slot class's), memoized per Agent.
+fn array_length_shape(class: u32) -> u32 {
     with_active_gc_heap(|heap| {
-        let cached = heap.array_length_shape.get();
+        let memo = &heap.array_length_shapes[class as usize];
+        let cached = memo.get();
         if cached != SHAPE_EMPTY {
             return cached;
         }
@@ -7917,20 +8036,20 @@ fn array_length_shape() -> u32 {
         // Array `length` is created writable, neither enumerable nor configurable; a later
         // non-writable redefinition takes the ordinary insert path's attribute change.
         let key = (
-            SHAPE_EMPTY,
+            empty_shape(class),
             crate::atom::names::LENGTH.key(),
             PROP_WRITABLE as u8,
         );
         let shape = if let Some(&shape) = shapes.transitions.get(&key) {
             shape
         } else {
-            let shape = shapes.fresh();
+            let shape = shapes.fresh(class);
             if is_cacheable_shape(shape) {
                 shapes.transitions.insert(key, shape);
             }
             shape
         };
-        heap.array_length_shape.set(shape);
+        memo.set(shape);
         shape
     })
 }
@@ -8249,12 +8368,38 @@ impl std::fmt::Debug for Props {
 }
 
 impl Props {
+    /// A map outside any cell, of the three-slot capacity class: an object made from it is
+    /// allocated in a 96-byte cell (W2d step 3).
     pub(crate) fn new() -> Props {
         Self::with_capacity(0)
     }
 
+    /// A map outside any cell with room for `capacity` slots, of the smallest capacity class
+    /// holding them ([`class_for`]).
     pub(crate) fn with_capacity(capacity: usize) -> Props {
-        Self::with_entries(NamedEntries::with_capacity(capacity))
+        let mut props = Self::new_in_class(class_for(capacity));
+        props.entries.reserve_exact(capacity);
+        props
+    }
+
+    /// An empty map outside any cell, of capacity class `class` (W2d step 3): its shape is the
+    /// class's empty shape, so its object is allocated in that class's cell.
+    pub(crate) fn new_in_class(class: u32) -> Props {
+        Self::with_entries(NamedEntries {
+            shape: empty_shape(class),
+            ..NamedEntries::default()
+        })
+    }
+
+    /// [`Props::new_in_class`] for the class of a map that will hold `slots` slots.
+    pub(crate) fn for_slots(slots: usize) -> Props {
+        Self::new_in_class(class_for(slots))
+    }
+
+    /// The capacity class of the map's shape (W2d step 3).
+    #[inline]
+    pub(crate) fn class(&self) -> u32 {
+        self.entries.class()
     }
 
     #[cfg(test)]
@@ -8326,7 +8471,9 @@ impl Props {
                 self.entries
                     .push_predicted(PropWord::from_value(property.value()));
             }
-            self.entries.shape = source.entries.shape;
+            // The source's shape, or across capacity classes the one its keys reach in this
+            // map's class (W2d step 3).
+            self.entries.shape = rebased_shape(&source.entries, self.entries.class());
             self.entries.len_slot.set(source.entries.len_slot.get());
             self.entries.proto_slot.set(source.entries.proto_slot.get());
             self.ensure_fallback_index();
@@ -8341,7 +8488,7 @@ impl Props {
     /// Supply keys to a fresh, still-empty receiver after its initializer plan is validated.
     /// The existing field capacity remains usable; no predicted property becomes observable.
     pub(crate) fn predict_empty_layout(&mut self, layout: &PropertyLayout) {
-        assert_eq!(self.entries.shape, SHAPE_EMPTY);
+        assert!(is_empty_shape(self.entries.shape), "an empty map's shape");
         assert!(self.entries.is_empty());
         self.entries.reserve_exact(layout.len());
         self.entries.layout = Some(layout.clone());
@@ -8426,9 +8573,18 @@ impl Props {
         self.set_flag(FLAG_ELEM_MODE, on);
     }
 
-    /// A fresh map with no properties and the initial flags, outside any cell.
+    /// A fresh map with no properties and the initial flags, outside any cell, of the three-slot
+    /// capacity class.
     fn fresh() -> Props {
         Props::with_entries(NamedEntries::default())
+    }
+
+    /// The map of an empty array outside any cell, of capacity class `class` (W2d step 3): a
+    /// template whose instances keep `length` and the template's other keys in their cell.
+    pub(crate) fn empty_array_in_class(class: u32) -> Props {
+        let mut props = Props::new_in_class(class);
+        props.init_packed_array(std::iter::empty());
+        props
     }
 
     /// Construct a dense array by copying canonical words from a JIT argument window.
@@ -8464,7 +8620,7 @@ impl Props {
     }
 
     fn init_packed_array_words(&mut self, words: word_block::Words, len: usize) {
-        let shape = array_length_shape();
+        let shape = array_length_shape(self.entries.class());
         self.init_packed_array_named_words(
             words,
             len,
@@ -8485,7 +8641,7 @@ impl Props {
 
     /// [`Props::packed_array`] into this map, fresh and empty.
     pub(crate) fn init_packed_array(&mut self, items: impl ExactSizeIterator<Item = Value>) {
-        let shape = array_length_shape();
+        let shape = array_length_shape(self.entries.class());
         self.init_packed_array_named(items, shape, array_length_layout(), std::iter::empty());
     }
 
@@ -8887,7 +9043,7 @@ impl Props {
     /// changing identities owned by other tests/Agents. This only withdraws this map's proof.
     #[cfg(test)]
     pub(crate) fn force_uncacheable_shape_for_test(&mut self) {
-        self.entries.shape = SHAPE_UNCACHEABLE;
+        self.entries.shape = uncacheable_shape(self.entries.class());
     }
 
     /// Borrow the immutable key layout, live prefix and attributes for enumeration. Numeric
@@ -8915,8 +9071,7 @@ impl Props {
         Some((layout, self.entries.len() as u8, enumerable))
     }
     /// The named-field count and capacity, as the JIT's storage emitters read them.
-    #[cfg(test)]
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    #[inline]
     pub(crate) fn named_len(&self) -> usize {
         self.entries.len()
     }
@@ -9255,7 +9410,7 @@ impl Props {
             && array_index.is_none()
             && key != length
             && is_cacheable_shape(self.entries.shape)
-            && self.entries.shape == array_length_shape()
+            && self.entries.shape == array_length_shape(self.entries.class())
         {
             return None;
         }
@@ -9321,7 +9476,7 @@ impl Props {
                 && self.elem_mode()
                 && text != "length"
                 && is_cacheable_shape(self.entries.shape)
-                && self.entries.shape == array_length_shape()
+                && self.entries.shape == array_length_shape(self.entries.class())
             {
                 return None;
             }
@@ -9379,6 +9534,15 @@ impl Props {
     fn build_index(&mut self) {
         let index = KeyIndex::of(self.entries.keys());
         self.entries.set_index(Some(index));
+    }
+
+    /// The location word of slot `slot` ([`location_word`]) of this map, which is an object's,
+    /// in its cell: where generated code finds the slot's word. `None` past the 15 bits a cache
+    /// keeps.
+    #[inline]
+    pub(crate) fn slot_location(&self, slot: usize) -> Option<u16> {
+        debug_assert_ne!(self.entries.cell, 0, "an object's map, in its cell");
+        location_word(self.entries.cell as usize, slot)
     }
 
     /// Recover the generic lookup table if a non-array map reached the indexed size without a
@@ -9494,7 +9658,7 @@ impl Props {
     /// Mint a fresh unique shape: no inline cache recorded against the old id can hit
     /// again, so any proof it carried (slot, and eventually class) is abandoned.
     pub(crate) fn demote_shape(&mut self) {
-        self.entries.shape = shape_fresh();
+        self.entries.shape = shape_fresh(self.entries.class());
     }
     /// Value-only write to an existing property (the caller has established it is a
     /// writable data property): the descriptor — and therefore the shape class — is
@@ -9684,7 +9848,7 @@ impl Props {
         self.entries.len_slot.set(SlotMemo::NONE);
         self.entries.proto_slot.set(SlotMemo::NONE);
         self.set_has_far(false);
-        self.entries.shape = shape_fresh();
+        self.entries.shape = shape_fresh(self.entries.class());
     }
     /// Append the next element word while *building a fresh array in order* (its elements so
     /// far are exactly the words 0..len, with no index key in the named entries): skips the
@@ -9935,7 +10099,7 @@ impl Props {
             self.note_inserted(slot);
         }
         // A removal shifts slots: it can't be a tree transition, so deopt to a fresh unique id.
-        self.entries.shape = shape_fresh();
+        self.entries.shape = shape_fresh(self.entries.class());
     }
 
     pub(crate) fn remove(&mut self, key: &str) -> bool {
@@ -9972,7 +10136,7 @@ impl Props {
         // this for ELEMENT keys: their shape tracks named keys only, and array entry slots are
         // only ever trusted through key-checked ICs (IC_ARR_KEYCHK), which re-verify on hit.
         if !(self.elem_mode() && key.as_index().is_some()) {
-            self.entries.shape = shape_fresh();
+            self.entries.shape = shape_fresh(self.entries.class());
         }
         self.entries.len_slot.set(SlotMemo::NONE);
         self.entries.proto_slot.set(SlotMemo::NONE);

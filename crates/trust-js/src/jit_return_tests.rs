@@ -77,6 +77,7 @@ fn enter(
         references_raw: std::ptr::null_mut(),
         accessor_holder: 0,
         accessor_slot: 0,
+        accessor_loc: 0,
         resume_pc: 0,
         resume_step: None,
     };

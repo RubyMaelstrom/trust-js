@@ -83,7 +83,7 @@ pub enum Tier {
 ///
 /// `repr(C)` with this field order gives the JIT's inline templates fixed byte offsets to read
 /// the live cache from machine code: recv_shape@0, holder_shape@4, slot@8, depth@12, mid_ok@13,
-/// mid_shape@16.
+/// loc@14, mid_shape@16.
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub struct IcState {
@@ -95,6 +95,11 @@ pub struct IcState {
     /// ordinary object); bits 1..3 cover `mid2_shape` through `mid4_shape`. Shape id 0
     /// is a real shape (the empty object).
     pub mid_ok: u8,
+    /// Where the slot lives, for generated code (W2d step 3; [`crate::value::Props::slot_location`]):
+    /// the holder's slot in a data, accessor or key-checked state, the new slot in a creation
+    /// state; 0 in the other states. The fill computes it from the holder, whose shape fixes it,
+    /// so generated code never reads a capacity; `slot` stays the slot's index.
+    pub loc: u16,
     /// The intermediate (depth-1) hop's shape for a `depth == 2` hit: a match proves that hop
     /// still lacks the name, making the two-hop shape fast path sound.
     pub mid_shape: u32,
@@ -114,6 +119,8 @@ pub const IC_OFF_RECV_SHAPE: u32 = 0;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_HOLDER_SHAPE: u32 = 4;
 pub const IC_OFF_SLOT: u32 = 8;
+/// The slot's location word ([`IcState::loc`]), a `u16`.
+pub const IC_OFF_LOC: u32 = 14;
 pub const IC_OFF_DEPTH: u32 = 12;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_MID_OK: u32 = 13;
@@ -125,6 +132,11 @@ pub const IC_OFF_MID2_SHAPE: u32 = 20;
 pub const IC_OFF_MID3_SHAPE: u32 = 24;
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub const IC_OFF_MID4_SHAPE: u32 = 28;
+
+const _: () = {
+    assert!(std::mem::offset_of!(IcState, loc) == IC_OFF_LOC as usize);
+    assert!(std::mem::size_of::<IcState>() == 32);
+};
 
 pub const IC_EMPTY: u8 = u8::MAX;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
@@ -261,6 +273,7 @@ pub struct NameIc {
     pub gen: u32,
     /// Depth-1 generation mode (env bit 2 clear): this chunk's activation post-construction
     /// generation (the legacy own-activation mode). Structural mutations invalidate either proof.
+    /// Global mode: the global property's location word (W2d step 3, `IcState::loc`).
     pub act_gen: u32,
 }
 
@@ -555,6 +568,7 @@ impl IcState {
         slot: 0,
         depth: IC_EMPTY,
         mid_ok: 0,
+        loc: 0,
         mid_shape: 0,
         mid2_shape: 0,
         mid3_shape: 0,
@@ -6791,6 +6805,7 @@ mod feedback_layout_tests {
             slot: 2,
             depth: 1,
             mid_ok: 0,
+            loc: 0,
             mid_shape: 0,
             mid2_shape: 0,
             mid3_shape: 0,
@@ -6827,6 +6842,7 @@ mod feedback_layout_tests {
             slot: 2,
             depth: 1,
             mid_ok: 0,
+            loc: 0,
             mid_shape: 0,
             mid2_shape: 0,
             mid3_shape: 0,
@@ -6863,6 +6879,7 @@ mod feedback_layout_tests {
             slot: 1,
             depth: IC_ABSENT,
             mid_ok: 0,
+            loc: 0,
             mid_shape: 0,
             mid2_shape: 0,
             mid3_shape: 0,
@@ -6905,6 +6922,7 @@ mod feedback_layout_tests {
             slot: 0,
             depth: IC_CREATE,
             mid_ok: 0,
+            loc: 0,
             mid_shape: 0,
             mid2_shape: 0,
             mid3_shape: 0,
@@ -21842,13 +21860,16 @@ impl Chunk {
             return None;
         }
         let v = p.value();
+        // Generated code finds the slot by its location word (W2d step 3), which global mode
+        // keeps in `act_gen`; a slot past the cache's reach stays uncached.
+        let loc = g.props.slot_location(slot)?;
         self.record_name_number(c as usize, &v);
         self.name_caches[c as usize].set(NameIc {
             env: Env::as_ptr(env) as usize | 1,
             binding: ((g.props.shape() as u64) << 32) | slot as u64,
             layout: 0,
             gen: env.borrow().vars.generation(),
-            act_gen: 0,
+            act_gen: u32::from(loc),
         });
         drop(g);
         self.name_pins.borrow_mut()[c as usize] = Some(Env::downgrade(env));
@@ -25607,6 +25628,7 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     Value::Obj(crate::value::Object::new_built(
         Some(proto),
         crate::value::ObjectKind::Plain,
+        crate::value::class_for(capacity),
         |props| props.init_layout(capacity, layout),
     ))
     .bits()
@@ -28748,6 +28770,7 @@ mod return_slot_tests {
             references_raw: std::ptr::null_mut(),
             accessor_holder: 0,
             accessor_slot: 0,
+            accessor_loc: 0,
             resume_pc: 0,
             resume_step: None,
             handler_floor: 0,

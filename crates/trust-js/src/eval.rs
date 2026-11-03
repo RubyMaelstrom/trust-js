@@ -72,7 +72,7 @@ impl ForInKeys {
         // Include the object's cell (plus two words) and conservatively charge string
         // headers/index keys.
         // Unlike a normal Array, this backing cannot retain %Array.prototype% or its realm.
-        let mut bytes = crate::value::OBJECT_CELL + 2 * std::mem::size_of::<usize>();
+        let mut bytes = crate::value::object_cell_bytes(0) + 2 * std::mem::size_of::<usize>();
         let mut props = Props::new();
         props.reserve_dense_exact(keys.len());
         for key in keys {
@@ -6264,7 +6264,7 @@ impl Interp {
         let ctor_parent = prepared.ctor_parent;
         let derived = prepared.derived;
 
-        let proto = Object::new(proto_parent);
+        let proto = Object::new_prototype(proto_parent);
 
         // The constructor: explicit member, or a synthesized default. Either way its rendered
         // source (Function.prototype.toString) is the whole class's source text.
@@ -7506,7 +7506,7 @@ impl Interp {
         keys: &[std::rc::Rc<str>],
         values: Vec<Value>,
     ) -> Value {
-        let obj = crate::value::Object::new(Some(self.object_proto));
+        let obj = crate::value::Object::new_with_capacity(Some(self.object_proto), keys.len());
         {
             let mut b = obj.borrow_mut();
             for (k, v) in keys.iter().zip(values) {
@@ -7529,7 +7529,8 @@ impl Interp {
         count: usize,
     ) -> Value {
         let map = tmpl.get_or_init(|| {
-            let mut p = crate::value::Props::new();
+            // The class holding the literal's keys (W2d step 3).
+            let mut p = crate::value::Props::for_slots(keys.len());
             for k in keys {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
@@ -7541,6 +7542,7 @@ impl Interp {
         let obj = crate::value::Object::new_built(
             Some(self.object_proto),
             crate::value::ObjectKind::Plain,
+            map.class(),
             |props| {
                 props.init_instance_plain(
                     map,
@@ -7563,7 +7565,8 @@ impl Interp {
         values: Vec<Value>,
     ) -> Value {
         let map = tmpl.get_or_init(|| {
-            let mut p = crate::value::Props::new();
+            // The class holding the literal's keys (W2d step 3).
+            let mut p = crate::value::Props::for_slots(keys.len());
             for k in keys {
                 p.insert(k.clone(), crate::value::Property::plain(Value::Undefined));
             }
@@ -7575,6 +7578,7 @@ impl Interp {
         let obj = crate::value::Object::new_built(
             Some(self.object_proto),
             crate::value::ObjectKind::Plain,
+            map.class(),
             |props| props.init_instance_plain(map, values.into_iter()),
         );
         Value::Obj(obj)
@@ -8938,8 +8942,9 @@ impl Interp {
                 {
                     b.props.prototype_slot().and_then(|slot| {
                         let prop = b.props.get("prototype")?;
+                        let loc = b.props.slot_location(slot as usize)?;
                         (!prop.accessor() && matches!((prop.value()).view(), ValueView::Obj(_)))
-                            .then_some((b.props.shape(), slot))
+                            .then_some((b.props.shape(), slot, loc))
                     })
                 } else {
                     None
@@ -8948,13 +8953,14 @@ impl Interp {
             _ => None,
         };
         let out = self.instanceof(l, r)?;
-        if let Some((shape, slot)) = fill {
+        if let Some((shape, slot, loc)) = fill {
             cache.set(crate::bytecode::IcState {
                 recv_shape: shape,
                 holder_shape: shape,
                 slot,
                 depth: 0,
                 mid_ok: 0,
+                loc,
                 mid_shape: 0,
                 mid2_shape: 0,
                 mid3_shape: 0,

@@ -4266,6 +4266,7 @@ impl Default for StubEntry {
                 slot: 0,
                 depth: crate::bytecode::IC_EMPTY,
                 mid_ok: 0,
+                loc: 0,
                 mid_shape: 0,
                 mid2_shape: 0,
                 mid3_shape: 0,
@@ -6384,17 +6385,17 @@ impl Interp {
         // Fresh intrinsics, mirroring `Interp::new`. The new realm's Symbol constructor gets the
         // Agent's well-known Symbols (`Interp::well_known_symbol`), so `@@iterator` etc. match
         // cross-realm whatever the creating realm's global `Symbol` now holds.
-        let object_proto = Object::new(None);
-        let function_proto = Object::new(Some(object_proto));
-        let array_proto = Object::new(Some(object_proto));
-        let string_proto = Object::new(Some(object_proto));
-        let number_proto = Object::new(Some(object_proto));
-        let boolean_proto = Object::new(Some(object_proto));
+        let object_proto = Object::new_prototype(None);
+        let function_proto = Object::new_prototype(Some(object_proto));
+        let array_proto = Object::new_prototype(Some(object_proto));
+        let string_proto = Object::new_prototype(Some(object_proto));
+        let number_proto = Object::new_prototype(Some(object_proto));
+        let boolean_proto = Object::new_prototype(Some(object_proto));
         string_proto.borrow_mut().kind = ObjectKind::str_wrap("".into());
         number_proto.borrow_mut().kind = ObjectKind::NumWrap(0.0);
         boolean_proto.borrow_mut().kind = ObjectKind::BoolWrap(false);
-        let symbol_proto = Object::new(Some(object_proto));
-        let global = Object::new(Some(object_proto));
+        let symbol_proto = Object::new_prototype(Some(object_proto));
+        let global = Object::new_prototype(Some(object_proto));
         self.object_proto = object_proto;
         self.function_proto = function_proto;
         self.array_proto = array_proto;
@@ -6845,19 +6846,19 @@ impl Interp {
         #[cfg(all(test, target_os = "linux"))]
         crate::gc_test::install_crash_backtrace();
         crate::value::activate_agent(&gc_heap, &symbol_agent);
-        let object_proto = Object::new(None);
-        let function_proto = Object::new(Some(object_proto));
-        let array_proto = Object::new(Some(object_proto));
-        let string_proto = Object::new(Some(object_proto));
-        let number_proto = Object::new(Some(object_proto));
-        let boolean_proto = Object::new(Some(object_proto));
+        let object_proto = Object::new_prototype(None);
+        let function_proto = Object::new_prototype(Some(object_proto));
+        let array_proto = Object::new_prototype(Some(object_proto));
+        let string_proto = Object::new_prototype(Some(object_proto));
+        let number_proto = Object::new_prototype(Some(object_proto));
+        let boolean_proto = Object::new_prototype(Some(object_proto));
         // These prototypes are themselves wrapper exotics with default primitive data, so e.g.
         // `Number.prototype.valueOf()` / `Number.prototype == 0` work.
         string_proto.borrow_mut().kind = ObjectKind::str_wrap("".into());
         number_proto.borrow_mut().kind = ObjectKind::NumWrap(0.0);
         boolean_proto.borrow_mut().kind = ObjectKind::BoolWrap(false);
-        let symbol_proto = Object::new(Some(object_proto));
-        let global = Object::new(Some(object_proto));
+        let symbol_proto = Object::new_prototype(Some(object_proto));
+        let global = Object::new_prototype(Some(object_proto));
         let global_env = new_var_scope(None);
         let live_object_limit = gc_heap.agent.next.get();
         let poll = std::sync::Arc::new(crate::interrupt::PollWord::default());
@@ -8453,6 +8454,7 @@ impl Interp {
         Value::Obj(Object::new_built(
             Some(self.array_proto),
             ObjectKind::Array,
+            0,
             |props| props.init_packed_array_from_slice(&items),
         ))
     }
@@ -8463,6 +8465,7 @@ impl Interp {
         Value::Obj(Object::new_built(
             Some(self.array_proto),
             ObjectKind::Array,
+            0,
             |props| props.init_packed_array([(Value::Str(key)), value].into_iter()),
         ))
     }
@@ -8570,6 +8573,7 @@ impl Interp {
         Value::Obj(Object::new_built(
             Some(self.array_proto),
             ObjectKind::Array,
+            0,
             // SAFETY: the caller's.
             |props| unsafe { props.init_packed_array_from_raw(items, len) },
         ))
@@ -9469,7 +9473,8 @@ impl Interp {
                 );
             }
             let pp = if has_prototype {
-                let mut q = crate::value::Props::new();
+                // The largest capacity class, as a prototype holds its methods (W2d step 3).
+                let mut q = crate::value::Props::new_in_class(2);
                 // A generator's `.prototype` has no own `constructor` (the methods live on the
                 // intrinsic).
                 if !is_generator {
@@ -9523,7 +9528,7 @@ impl Interp {
         );
         // The object's map is a copy of its template, written into its cell (W2d step 3).
         let obj = match named {
-            None => Object::new_built(Some(fn_proto), kind, |props| {
+            None => Object::new_built(Some(fn_proto), kind, maps.function.class(), |props| {
                 props.init_copy_of(&maps.function)
             }),
             Some(name) => {
@@ -9532,7 +9537,7 @@ impl Interp {
                     // A creation site passes its chunk's interned name, so identity is the common
                     // proof; equal text from another site shares the template too.
                     Some((cached, template)) if Rc::ptr_eq(cached, name) || **cached == **name => {
-                        Object::new_built(Some(fn_proto), kind, |props| {
+                        Object::new_built(Some(fn_proto), kind, template.class(), |props| {
                             props.init_copy_of(template)
                         })
                     }
@@ -10578,6 +10583,11 @@ impl Interp {
                         .fold(0, |mask, (index, shape)| {
                             mask | ((shape.is_some() as u8) << index)
                         });
+                    // Generated code finds the slot by its location (W2d step 3); a slot past
+                    // the cache's reach stays uncached.
+                    let Some(loc) = b.props.slot_location(slot) else {
+                        return Some(v);
+                    };
                     // Demote the previous ways before refilling: a site rotating through up
                     // to PROP_IC_WAYS shapes stabilizes with one shape per way instead of
                     // thrashing a single cell.
@@ -10597,6 +10607,7 @@ impl Interp {
                         recv_shape,
                         holder_shape: b.props.shape(),
                         mid_ok,
+                        loc,
                         mid_shape: mids[0].unwrap_or(0),
                         mid2_shape: mids[1].unwrap_or(0),
                         mid3_shape: mids[2].unwrap_or(0),
@@ -10636,6 +10647,7 @@ impl Interp {
                                 recv_shape: absent_shapes[0],
                                 holder_shape: absent_shapes[5],
                                 mid_ok: 0,
+                                loc: 0,
                                 mid_shape: absent_shapes[1],
                                 mid2_shape: absent_shapes[2],
                                 mid3_shape: absent_shapes[3],
@@ -11028,20 +11040,23 @@ impl Interp {
                     // An own accessor: OrdinarySetWithOwnDescriptor calls its setter. The
                     // receiver's shape proves the slot (shapes encode the descriptor class).
                     let shape = b.props.shape();
-                    self.ic_insert(
-                        cache,
-                        crate::bytecode::IcState {
-                            depth: crate::bytecode::IC_ACCESSOR,
-                            slot: slot as u32,
-                            recv_shape: shape,
-                            holder_shape: shape,
-                            mid_ok: 0,
-                            mid_shape: 0,
-                            mid2_shape: 0,
-                            mid3_shape: 0,
-                            mid4_shape: 0,
-                        },
-                    );
+                    if let Some(loc) = b.props.slot_location(slot) {
+                        self.ic_insert(
+                            cache,
+                            crate::bytecode::IcState {
+                                depth: crate::bytecode::IC_ACCESSOR,
+                                slot: slot as u32,
+                                recv_shape: shape,
+                                holder_shape: shape,
+                                mid_ok: 0,
+                                loc,
+                                mid_shape: 0,
+                                mid2_shape: 0,
+                                mid3_shape: 0,
+                                mid4_shape: 0,
+                            },
+                        );
+                    }
                     return IcSet::Setter {
                         holder: head as usize,
                         slot: slot as u32,
@@ -11052,12 +11067,16 @@ impl Interp {
                 }
                 let shape = b.props.shape();
                 b.props.set_value_at(slot, *v);
+                let Some(loc) = b.props.slot_location(slot) else {
+                    return IcSet::Stored;
+                };
                 let st = crate::bytecode::IcState {
                     depth: 0,
                     slot: slot as u32,
                     recv_shape: shape,
                     holder_shape: shape,
                     mid_ok: 0,
+                    loc,
                     mid_shape: 0,
                     mid2_shape: 0,
                     mid3_shape: 0,
@@ -11164,21 +11183,24 @@ impl Interp {
                 if !b.props.slot_at(slot)?.accessor() {
                     return None;
                 }
-                self.ic_insert(
-                    cache,
-                    IcState {
-                        depth: IC_ACCESSOR | depth,
-                        slot: slot as u32,
-                        recv_shape,
-                        holder_shape: b.props.shape(),
-                        // Every hop below the holder is ordinary and plain.
-                        mid_ok: (1u8 << depth.saturating_sub(1)) - 1,
-                        mid_shape: mids[0],
-                        mid2_shape: mids[1],
-                        mid3_shape: mids[2],
-                        mid4_shape: mids[3],
-                    },
-                );
+                if let Some(loc) = b.props.slot_location(slot) {
+                    self.ic_insert(
+                        cache,
+                        IcState {
+                            depth: IC_ACCESSOR | depth,
+                            slot: slot as u32,
+                            recv_shape,
+                            holder_shape: b.props.shape(),
+                            // Every hop below the holder is ordinary and plain.
+                            mid_ok: (1u8 << depth.saturating_sub(1)) - 1,
+                            loc,
+                            mid_shape: mids[0],
+                            mid2_shape: mids[1],
+                            mid3_shape: mids[2],
+                            mid4_shape: mids[3],
+                        },
+                    );
+                }
                 return Some((cur as usize, slot as u32));
             }
             if (1..=4).contains(&depth) {
@@ -11255,6 +11277,11 @@ impl Interp {
             }
         }
         b.props.insert(key, Property::plain(*v));
+        // Where the appended slot lives, which every receiver of `recv_shape` appends at (W2d
+        // step 3); a slot past the cache's reach stays uncached.
+        let Some(loc) = b.props.slot_location(b.props.named_len() - 1) else {
+            return true;
+        };
         self.ic_insert(
             cache,
             IcState {
@@ -11264,6 +11291,7 @@ impl Interp {
                 // The memoized child shape the insert just landed on: hits append straight to it.
                 holder_shape: b.props.shape(),
                 mid_ok: 0,
+                loc,
                 mid_shape: crate::value::proto_epoch(),
                 mid2_shape: ((proto_ptr as u64) >> 32) as u32,
                 mid3_shape: 0,
@@ -16057,7 +16085,7 @@ impl Interp {
                 .expect("initializer plan checked above");
             chunk.note_forwarded_capacity(plan.len());
             let mut object = this.borrow_mut();
-            let empty_receiver = object.props.shape() == 0;
+            let empty_receiver = crate::value::is_empty_shape(object.props.shape());
             let initialized_layout =
                 empty_receiver && initializer_chunk.initializer_layout().is_some();
             if empty_receiver {
@@ -16312,6 +16340,7 @@ impl Interp {
         let this = crate::value::Object::new_built(
             Some(proto),
             crate::value::ObjectKind::Plain,
+            crate::value::class_for(instance_capacity),
             |props| props.init_layout(instance_capacity, instance_layout),
         );
         let this_val = Value::Obj(this);
@@ -16342,10 +16371,11 @@ impl Interp {
         // the ordinary compiled constructor and refreshes its live ICs.
         if let Some(simple) = chunk.jit_simple_constructor() {
             let epoch = crate::value::proto_epoch();
-            // A freshly allocated ordinary object always starts at the shared empty shape, and
-            // its prototype is the live object just read above. Avoid re-borrowing the new
-            // RefCell twice merely to rediscover those construction invariants.
-            let start_shape = 0;
+            // A freshly allocated ordinary object always starts at the shared empty shape of the
+            // capacity class it was allocated in (W2d step 3), and its prototype is the live
+            // object just read above. Avoid re-borrowing the new RefCell twice merely to
+            // rediscover those construction invariants.
+            let start_shape = crate::value::empty_shape(crate::value::class_for(instance_capacity));
             let shapes = if epoch == u32::MAX {
                 None
             } else if let Some(cached) = simple.cached_shapes(epoch, proto_ptr, start_shape) {
@@ -17965,9 +17995,12 @@ impl Interp {
                 };
                 let layout = self.learned_construct_layout(&obj);
                 let capacity = layout.as_ref().map_or(0, |keys| keys.len());
-                let this = Object::new_built(proto, crate::value::ObjectKind::Plain, |props| {
-                    props.init_layout(capacity, layout)
-                });
+                let this = Object::new_built(
+                    proto,
+                    crate::value::ObjectKind::Plain,
+                    crate::value::class_for(capacity),
+                    |props| props.init_layout(capacity, layout),
+                );
                 let this_val = Value::Obj(this);
                 self.pending_new_target = new_target;
                 // Base class constructors run their field initializers before the body; plain

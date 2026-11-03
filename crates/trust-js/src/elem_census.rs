@@ -139,7 +139,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
     }
     // Bytes by allocated size (small-cell classes; a large block counts its own bytes).
     let mut b = [0u64; PARTS.len()];
-    b[0] = class_bytes(crate::value::OBJECT_CELL);
+    b[0] = class_bytes(crate::value::object_cell_bytes(p.class()));
     let index = p.entries.index();
     let mut capacity = 0usize;
     if let Some(words) = words {
@@ -176,7 +176,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
         if words != 0 {
             model += class_bytes(16 + 8 * (words + word_block::record_words(words)));
         }
-        if named > INLINE_NAMED_SLOTS {
+        if named > crate::value::class_slots(p.class()) {
             model += class_bytes(named * std::mem::size_of::<Property>());
         }
         if index.is_some() {

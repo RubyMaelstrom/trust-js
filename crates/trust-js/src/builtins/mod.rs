@@ -2620,7 +2620,9 @@ fn regexp_array(
     let keys = kind.keys();
     debug_assert_eq!(keys.len(), named.len());
     let map = i.regexp_array_maps[kind as usize].get_or_init(|| {
-        let mut map = Props::packed_array(std::iter::empty());
+        // The class holding `length` and the kind's keys, as V8 keeps a match array's index,
+        // input and groups in-object (W2d step 3).
+        let mut map = Props::empty_array_in_class(crate::value::class_for(1 + keys.len()));
         for key in keys {
             map.insert(*key, Property::plain(Value::Undefined));
         }
@@ -2629,6 +2631,7 @@ fn regexp_array(
     Value::Obj(Object::new_built(
         Some(i.array_proto),
         ObjectKind::Array,
+        map.class(),
         |props| props.init_array_from_template(map, items, named.iter().copied()),
     ))
 }
@@ -2735,6 +2738,7 @@ fn regexp_builtin_exec(
                     Some((a, b)) => Value::Obj(Object::new_built(
                         Some(array_proto),
                         ObjectKind::Array,
+                        0,
                         |props| {
                             props.init_packed_array(
                                 [Value::Num(a as f64), Value::Num(b as f64)].into_iter(),
@@ -5170,7 +5174,7 @@ fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
         ["value", "writable", "enumerable", "configurable"]
     };
     let map = i.descriptor_maps[usize::from(accessor)].get_or_init(|| {
-        let mut map = Props::new();
+        let mut map = Props::for_slots(keys.len());
         for key in keys {
             map.insert(key, Property::plain(Value::Undefined));
         }
@@ -5179,6 +5183,7 @@ fn descriptor_from_prop(i: &mut Interp, mut p: Property) -> Value {
     Value::Obj(Object::new_built(
         Some(i.object_proto),
         ObjectKind::Plain,
+        map.class(),
         |props| props.init_instance_plain(map, values.into_iter()),
     ))
 }
@@ -9690,7 +9695,7 @@ fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
     // properties `value` then `done` are created by CreateDataPropertyOrThrow. The key sequence
     // is fixed, so the finished map is built once per Agent and instantiated.
     let map = i.iter_result_map.get_or_init(|| {
-        let mut map = Props::new();
+        let mut map = Props::for_slots(2);
         map.insert("value", Property::plain(Value::Undefined));
         map.insert("done", Property::plain(Value::Undefined));
         map
@@ -9698,6 +9703,7 @@ fn iter_result(i: &mut Interp, value: Value, done: bool) -> Value {
     Value::Obj(Object::new_built(
         Some(i.object_proto),
         ObjectKind::Plain,
+        map.class(),
         |props| props.init_instance_plain(map, [value, Value::Bool(done)].into_iter()),
     ))
 }

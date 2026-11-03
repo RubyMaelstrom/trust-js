@@ -1469,7 +1469,9 @@ fn emit_borrowed_own_read(
     named_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    slot_addr(a, layout, 15, 11, 13);
+    // The slot's location word (W2d step 3), which the cell's shape fixes.
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+    slot_addr_loc(a, layout, 15, 11, 14);
     // No live descriptor-kind check: the receiver shape was just proved equal
     // to the cell shape (directly, or transitively through equal cell shapes
     // on the reuse path), the cell depth byte is 0 (data only), and shapes
@@ -1565,7 +1567,7 @@ fn emit_borrowed_method(
     named_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    slot_addr_const(a, layout, 15, 11, state.slot as usize);
+    slot_addr_loc_const(a, layout, 15, 11, state.loc);
     // No live descriptor-kind check: holder shape was just proved equal to
     // the baked feedback shape, the baked depth is a data depth (<= 3), and
     // shapes encode (key, attributes) per slot, so (shape, slot) proves a

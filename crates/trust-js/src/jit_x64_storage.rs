@@ -80,12 +80,11 @@ pub(super) fn vec_data_fits(seq: JitVecLayout, off: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Named slots (W2d step 2): the value words of the Object at `obj` (a stored cell word plus
-// `obj_from_cell`), in key-layout order, [`INLINE_NAMED_SLOTS`] in the cell and the rest in the
-// out-of-line record, as the ARM64 emitters address them
+// Named slots (W2d step 3): the value words of the Object at `obj` (a stored cell word plus
+// `obj_from_cell`), in key-layout order, the first in the cell after its header and the rest in
+// the out-of-line record, where each slot's location word says, as the ARM64 emitters address
+// them
 // ---------------------------------------------------------------------------------------------
-
-use crate::value::INLINE_NAMED_SLOTS;
 
 /// The cell's first slot, from the Object.
 fn slots_off(layout: &JitLayout) -> usize {
@@ -102,48 +101,36 @@ pub(super) fn named_len(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8) {
     a.nr_load32(dst, obj, layout.obj_props + layout.props_len);
 }
 
-/// Load the address of slot `slot` (a register holding an index below the count) into `dst`,
-/// which must differ from `obj` and `slot`: in the cell below [`INLINE_NAMED_SLOTS`], else in the
-/// record (which a count past the cell's slots implies). Clobbers the flags.
-pub(super) fn slot_addr(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8, slot: u8) {
+/// Load the address of the slot whose location word (W2d step 3: `IcState::loc`,
+/// [`crate::value::location_word`]) is in register `loc`, zero-extended, into `dst`, which must
+/// differ from `obj` and `loc`: the Object plus the word's offset in the cell, or the record plus
+/// its offset there (bit 0 set), as ARM64's `slot_addr_loc`. Clobbers the flags.
+pub(super) fn slot_addr_loc(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8, loc: u8) {
     assert!(
-        dst != obj && dst != slot,
+        dst != obj && dst != loc,
         "the slot address is built from both"
     );
     let record = a.label();
     let done = a.label();
-    a.nr_op_imm(7, slot, INLINE_NAMED_SLOTS as i32); // cmp slot, INLINE
-    a.jcc(AE, record);
-    a.nr_mov(dst, slot);
-    a.nr_shift(false, dst, 3);
+    a.nr_mov(dst, loc);
+    a.nr_shift(true, dst, 1); // shr dst, 1: CF = bit 0, the record's
+    a.jcc(BELOW, record);
     a.nr_reg(0x01, dst, obj); // add dst, obj
-    a.nr_op_imm(0, dst, slots_off(layout) as i32); // add dst, slots_off
     a.jmp(done);
     a.bind(record);
-    a.nr_mov(dst, slot);
-    a.nr_shift(false, dst, 3);
     a.nr_mem(true, &[0x03], dst, obj, record_off(layout) as i32); // add dst, [obj+record]
-                                                                  // Slot INLINE + i is record_slots + 8i into the block: dst = record + 8 * slot - the cell's.
-    a.nr_op_imm(
-        5,
-        dst,
-        (8 * INLINE_NAMED_SLOTS - layout.record_slots) as i32,
-    ); // sub
     a.bind(done);
 }
 
-/// Load the word of slot `slot`, known at compile time, into `dst` (which may be `obj`): one load
-/// in the cell, two through the record.
-pub(super) fn load_slot_const(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8, slot: usize) {
-    if slot < INLINE_NAMED_SLOTS {
-        a.nr_load(dst, obj, slots_off(layout) + 8 * slot);
+/// Load the word of the slot whose location word `loc` is known at compile time into `dst`
+/// (which may be `obj`): one load in the cell, two through the record.
+pub(super) fn load_slot_loc_const(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8, loc: u16) {
+    let off = usize::from(loc >> 1);
+    if loc & 1 == 0 {
+        a.nr_load(dst, obj, off);
     } else {
         a.nr_load(dst, obj, record_off(layout));
-        a.nr_load(
-            dst,
-            dst,
-            layout.record_slots + 8 * (slot - INLINE_NAMED_SLOTS),
-        );
+        a.nr_load(dst, dst, off);
     }
 }
 
@@ -178,7 +165,7 @@ pub(super) fn property_kind(a: &mut Asm, layout: &JitLayout, obj: u8, slot: u8) 
 pub(super) fn named_slots_fit(layout: &JitLayout) -> bool {
     layout.valid
         && [
-            slots_off(layout) + 8 * INLINE_NAMED_SLOTS,
+            slots_off(layout) + 8 * crate::value::MAX_CELL_SLOTS,
             record_off(layout),
             layout.obj_props + layout.props_len,
             layout.record_slots,
@@ -188,7 +175,6 @@ pub(super) fn named_slots_fit(layout: &JitLayout) -> bool {
         ]
         .iter()
         .all(|&off| fits_disp32(off, 0))
-        && layout.record_slots <= 8 * INLINE_NAMED_SLOTS
 }
 
 // ---------------------------------------------------------------------------------------------

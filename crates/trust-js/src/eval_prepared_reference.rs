@@ -27,6 +27,8 @@ pub(crate) struct PreparedReference {
     pub(crate) shape: u32,
     pub(crate) binding: *mut BindingSlot,
     pub(crate) slot: usize,
+    /// The slot's location word (W2d step 3, `IcState::loc`), for generated code.
+    pub(crate) loc: u32,
 }
 
 /// Canonical VM/native Reference owner. Explicit presence avoids depending on an Option niche
@@ -135,6 +137,7 @@ impl PreparedReference {
             shape: 0,
             binding,
             slot: usize::MAX,
+            loc: 0,
         }
     }
 
@@ -163,6 +166,7 @@ impl PreparedReference {
             shape: 0,
             binding: std::ptr::null_mut(),
             slot: usize::MAX,
+            loc: 0,
         }
     }
 
@@ -177,6 +181,7 @@ impl PreparedReference {
             shape: 0,
             binding: std::ptr::null_mut(),
             slot: usize::MAX,
+            loc: 0,
         }
     }
 
@@ -215,25 +220,27 @@ impl Interp {
                     body.props.slot_of(&reference.name)
                 };
                 slot.filter(|slot| body.props.slot_at(*slot).is_some_and(|p| !p.accessor()))
-                    .map(|slot| (shape, slot))
+                    .and_then(|slot| Some((shape, slot, body.props.slot_location(slot)?)))
             } else {
                 None
             }
         } else {
             None
         };
-        if let Some((shape, slot)) = hint {
+        if let Some((shape, slot, loc)) = hint {
             #[cfg(test)]
             if reference.shape != shape || reference.slot != slot {
                 record_reference_own_path(1);
             }
             reference.shape = shape;
             reference.slot = slot;
+            reference.loc = u32::from(loc);
             true
         } else {
             // Never leave a stale raw hint behind after a changed descriptor or owner kind.
             reference.shape = 0;
             reference.slot = usize::MAX;
+            reference.loc = 0;
             false
         }
     }
@@ -501,6 +508,7 @@ impl crate::gc_trace::GcTrace for PreparedReferenceSlot {
                 shape: _,
                 binding: _, // points into `scope`'s storage
                 slot: _,
+                loc: _,
             } = reference;
             if let Some(scope) = scope {
                 sink.env(scope);

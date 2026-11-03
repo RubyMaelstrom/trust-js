@@ -121,17 +121,15 @@ fn named_slot_emitters_read_live_objects() {
     let engine = crate::Engine::new();
     let layout = layout(&engine);
     assert!(named_slots_fit(&layout));
-    // Slot `rsi` of the Object at rdi, as the property templates read it (W2d step 2): the bounds
-    // check against the live count, then the word at the slot's address, in the cell or the
-    // record.
+    // The word of the slot whose location word (W2d step 3) is rsi, of the Object at rdi, as
+    // the property templates read it: in the cell or the record.
     let (_code, value) = assemble(|a| {
-        let miss = a.label();
-        named_len(a, &layout, CX, DI);
-        a.nr_cmp(SI, CX);
-        a.jcc(AE, miss);
-        slot_addr(a, &layout, AX, DI, SI);
+        slot_addr_loc(a, &layout, AX, DI, SI);
         a.nr_load(AX, AX, 0);
-        ret_none(a, miss);
+    });
+    // The live count, which the templates bound a cached slot's index by.
+    let (_len_code, len) = assemble(|a| {
+        named_len(a, &layout, AX, DI);
     });
     // In the cell up to seven slots; the rest in the record.
     for count in [1usize, 2, 6, 7, 8, 9, 14, 40] {
@@ -146,26 +144,38 @@ fn named_slot_emitters_read_live_objects() {
         let stored = unsafe { *(&object as *const crate::value::Gc as *const usize) };
         let base = stored + layout.obj_from_cell;
         assert_eq!(base, &*object.borrow() as *const Object as usize);
-        for slot in 0..=count {
-            // A packed Number is its f64 bits; past the count the sequence answers all ones.
-            let read = value(base, slot);
-            match object.borrow().props.property_at(slot) {
-                Some(property) => assert_eq!(
-                    Some(f64::from_bits(read as u64)),
-                    property.number_value(),
-                    "{count} fields, slot {slot}"
-                ),
-                None => assert_eq!(read, usize::MAX, "{count} fields, slot {slot}"),
-            }
+        assert_eq!(len(base, 0), count);
+        let location = |slot: usize| {
+            object
+                .borrow()
+                .props
+                .slot_location(slot)
+                .expect("a location")
+        };
+        for slot in 0..count {
+            // A packed Number is its f64 bits.
+            let read = value(base, usize::from(location(slot)));
+            let expected = object
+                .borrow()
+                .props
+                .property_at(slot)
+                .expect("a property")
+                .number_value();
+            assert_eq!(
+                Some(f64::from_bits(read as u64)),
+                expected,
+                "{count} fields, slot {slot}"
+            );
         }
-        // A compile-time slot reads the same word.
+        // A compile-time location reads the same word.
         for slot in [0, count - 1] {
+            let loc = location(slot);
             let (_code, constant) = assemble(|a| {
-                load_slot_const(a, &layout, AX, DI, slot);
+                load_slot_loc_const(a, &layout, AX, DI, loc);
             });
             assert_eq!(
                 constant(base, 0),
-                value(base, slot),
+                value(base, usize::from(loc)),
                 "{count} fields, slot {slot}"
             );
         }

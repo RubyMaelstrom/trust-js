@@ -83,6 +83,7 @@ fn uncacheable_shapes_distinguish_absence_levels_from_creation_metadata() {
                 mid4_shape: shapes[4],
                 holder_shape: shapes[5],
                 mid_ok: 0,
+                loc: 0,
             };
             assert_eq!(absent.has_cacheable_shapes(), bad >= levels as usize);
         }

@@ -407,17 +407,24 @@ fn name_dispatch_native_global_checks_identity_before_generation_without_losing_
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
     let env = engine.interp.global_env;
     let context = ProbeContext::new(&engine, &env);
-    let (slot, shape, expected) = {
+    let (slot, shape, expected, loc) = {
         let global = engine.interp.global.borrow();
         let slot = global.props.slot_of("dispatchGlobal").unwrap();
-        (slot, global.props.shape(), global.props.slot_address(slot))
+        let loc = global.props.slot_location(slot).unwrap();
+        (
+            slot,
+            global.props.shape(),
+            global.props.slot_address(slot),
+            loc,
+        )
     };
+    // Global mode keeps the slot's location word in `act_gen` (W2d step 3).
     let ic = NameIc {
         env: Env::as_ptr(&env) as usize | 1,
         binding: (u64::from(shape) << 32) | slot as u64,
         layout: 0,
         gen: env.borrow().vars.generation(),
-        act_gen: 0,
+        act_gen: u32::from(loc),
     };
     let cache = Cell::new(ic);
     let code = native_probe(&layout, &cache, true);

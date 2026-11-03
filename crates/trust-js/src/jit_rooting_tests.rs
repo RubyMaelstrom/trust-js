@@ -715,6 +715,7 @@ fn return_context() -> super::JitCtx {
         references_raw: std::ptr::null_mut(),
         accessor_holder: 0,
         accessor_slot: 0,
+        accessor_loc: 0,
     }
 }
 

@@ -56,7 +56,7 @@ fn private_mutation_reuses_its_cell_and_clone_sharing_is_sticky() {
     let (_heap, _release, _active) = isolated();
     let mut props = predicted("unused");
     // Keep this test on the private COW path rather than adopting a shape-cache layout.
-    props.entries.shape = SHAPE_UNCACHEABLE;
+    props.entries.shape = crate::value::uncacheable_shape(0);
     let private = props.shared_layout().unwrap().as_ptr();
     assert!(!props.shared_layout().unwrap().is_shared());
     props.insert("first", Property::plain(Value::Num(1.0)));
@@ -116,7 +116,7 @@ fn array_length_and_shape_cache_are_layout_roots_in_minor_and_major() {
     let array_word = array.cell_word();
     assert!(array.is_shared());
     drop(array);
-    let shape = heap.shapes.borrow_mut().fresh();
+    let shape = heap.shapes.borrow_mut().fresh(0);
     let layout = new_property_layout(vec![Rc::from("shape only")]);
     let shape_word = layout.cell_word();
     heap.shapes.borrow_mut().layouts.insert(shape, layout);

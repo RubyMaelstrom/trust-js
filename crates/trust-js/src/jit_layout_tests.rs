@@ -89,9 +89,9 @@ fn layout_is_valid_with_the_build_ownership() {
         Gc::as_ptr(&object) as usize,
         "the stored word is the cell address, the `Gc::as_ptr` identity"
     );
-    // Named slots (W2d step 3): seven words in the cell right after the Object (the cell's
-    // header), then the record; the map is 40 bytes of the 72-byte header.
-    assert_eq!(INLINE_NAMED_SLOTS, 7);
+    // Named slots (W2d step 3): three, seven or fifteen words in the cell right after the
+    // Object (the cell's header), then the record; the map is 40 bytes of the 72-byte header.
+    assert_eq!(crate::value::MAX_CELL_SLOTS, 15);
     assert_eq!(
         layout.obj_props + layout.props_slots,
         std::mem::size_of::<Object>(),
@@ -173,41 +173,45 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
 fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
     let engine = crate::Engine::new();
     let layout = probe(&engine);
-    for count in [1usize, 2, 4, 5, 9, 40] {
-        let object = Object::new(None);
-        for slot in 0..count {
-            object.borrow_mut().props.insert(
-                format!("f{slot}").as_str(),
-                Property::plain(Value::Num(slot as f64)),
-            );
-        }
-        // W2d step 3: slots below INLINE_NAMED_SLOTS sit in the cell after the Object; the rest
-        // in the record's block that `props_record` points to, from RECORD_SLOTS_OFF.
-        let base = body(&layout, &object) + layout.obj_props;
-        let borrowed = object.borrow();
-        let props = &borrowed.props;
-        let record = read::<usize>(base, layout.props_record);
-        assert_eq!(
-            record != 0,
-            count > INLINE_NAMED_SLOTS,
-            "{count} fields: a record exactly past the cell's slots"
-        );
-        for slot in 0..count {
-            let expected = if slot < INLINE_NAMED_SLOTS {
-                base + layout.props_slots + slot * 8
-            } else {
-                record + crate::value::RECORD_SLOTS_OFF + (slot - INLINE_NAMED_SLOTS) * 8
-            };
+    // W2d step 3: each capacity class's cell keeps its slots after the Object; the rest live in
+    // the record's block that `props_record` points to, from RECORD_SLOTS_OFF.
+    for class in 0..3 {
+        let cell = crate::value::class_slots(class);
+        for count in [1usize, 2, 3, 4, 5, 7, 8, 9, 15, 16, 40] {
+            let object = Object::new_with_capacity(None, cell);
+            assert_eq!(object.borrow().props.class(), class);
+            for slot in 0..count {
+                object.borrow_mut().props.insert(
+                    format!("f{slot}").as_str(),
+                    Property::plain(Value::Num(slot as f64)),
+                );
+            }
+            let base = body(&layout, &object) + layout.obj_props;
+            let borrowed = object.borrow();
+            let props = &borrowed.props;
+            let record = read::<usize>(base, layout.props_record);
             assert_eq!(
-                props.slot_address(slot),
-                expected,
-                "{count} fields: slot {slot}"
+                record != 0,
+                count > cell,
+                "class {class}, {count} fields: a record exactly past the cell's slots"
             );
-            assert_eq!(
-                read::<u64>(expected, 0),
-                Value::Num(slot as f64).bits(),
-                "{count} fields: slot {slot}"
-            );
+            for slot in 0..count {
+                let expected = if slot < cell {
+                    base + layout.props_slots + slot * 8
+                } else {
+                    record + crate::value::RECORD_SLOTS_OFF + (slot - cell) * 8
+                };
+                assert_eq!(
+                    props.slot_address(slot),
+                    expected,
+                    "class {class}, {count} fields: slot {slot}"
+                );
+                assert_eq!(
+                    read::<u64>(expected, 0),
+                    Value::Num(slot as f64).bits(),
+                    "class {class}, {count} fields: slot {slot}"
+                );
+            }
         }
     }
 }

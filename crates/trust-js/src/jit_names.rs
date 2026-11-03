@@ -164,7 +164,9 @@ fn emit_deep_name_target_ptr(
     named_len(a, layout, 15, 14);
     a.cmp_reg_x(13, 15);
     a.b_cond(C_HS, slow);
-    slot_addr(a, layout, 15, 14, 13);
+    // The slot's location word (W2d step 3), which the descriptor's fill recorded.
+    a.ldr_w_imm(16, 12, offset_of!(NativeNameDescriptor, loc) as u32);
+    slot_addr_loc(a, layout, 15, 14, 16);
     emit_property_kind(a, layout, 14, 13, 16, 17); // x7 = 1 (writable) or 2
     a.mov(14, 15);
     a.bind(done);
@@ -262,7 +264,9 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     named_len(a, layout, 11, 9);
     a.cmp_reg_x(10, 11);
     a.b_cond(C_HS, slow);
-    slot_addr(a, layout, 14, 9, 10);
+    // The slot's location word (W2d step 3), which the Reference's hint recorded.
+    a.ldr_w_imm(11, 8, offset_of!(R, loc) as u32);
+    slot_addr_loc(a, layout, 14, 9, 11);
     emit_property_kind(a, layout, 9, 10, 11, 13); // x7 = 1 (writable) or 2
     a.bind(done);
 }

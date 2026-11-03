@@ -179,6 +179,7 @@ fn invoke(
         references_raw: std::ptr::null_mut(),
         accessor_holder: 0,
         accessor_slot: 0,
+        accessor_loc: 0,
     };
 
     let result = unsafe { jit_get_prop(&mut ctx, site.pc as u32, base.add(stack_len)) };

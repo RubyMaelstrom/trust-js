@@ -1276,6 +1276,8 @@ impl crate::host::HostRetainedMemoryVisitor for HostMemoryAdapter<'_> {
 
 struct DirectTotals {
     object_count: usize,
+    /// The objects' cells' bytes: each cell's capacity class's size (W2d step 3).
+    object_bytes: usize,
     scope_count: usize,
     property_storage: Category,
     scope_storage: Category,
@@ -1288,6 +1290,7 @@ impl Default for DirectTotals {
     fn default() -> Self {
         Self {
             object_count: 0,
+            object_bytes: 0,
             scope_count: 0,
             property_storage: Category::exact(0),
             scope_storage: Category::exact(0),
@@ -1306,6 +1309,11 @@ fn scan_realm(
     totals: &mut DirectTotals,
 ) {
     totals.object_count = totals.object_count.saturating_add(objects.len());
+    totals.object_bytes = objects.iter().fold(totals.object_bytes, |bytes, object| {
+        bytes.saturating_add(crate::value::object_cell_bytes(
+            object.borrow().props.class(),
+        ))
+    });
     totals.scope_count = totals.scope_count.saturating_add(scopes.len());
     totals.interpreter_side_tables.add(size_of::<Interp>());
     let mut host_memory = interp.host_state.retained_memory();
@@ -2473,11 +2481,7 @@ fn measure(interp: &Interp, objects: &[Gc], scopes: &[Env]) -> Snapshot {
     }
 
     Snapshot {
-        object_bodies: Category::exact(
-            totals
-                .object_count
-                .saturating_mul(crate::value::OBJECT_CELL),
-        ),
+        object_bodies: Category::exact(totals.object_bytes),
         property_storage: totals.property_storage,
         scope_bodies: Category::exact(
             totals
@@ -2629,7 +2633,8 @@ mod tests {
     #[test]
     fn property_storage_counts_capacity_not_length() {
         // W2d step 3: a map outside any cell keeps all seventeen in its record, one word each,
-        // unused as they are; an object's keeps seven in its cell and the other ten there.
+        // unused as they are; an object's, of the fifteen-slot class, keeps fifteen in its cell
+        // and the other two there.
         let props = Props::with_capacity(17);
         let (bytes, exact) = props.retained_requested_storage_bytes();
         assert!(exact);
@@ -2640,7 +2645,7 @@ mod tests {
         assert!(exact);
         assert_eq!(
             bytes,
-            crate::value::RECORD_SLOTS_OFF + (17 - crate::value::INLINE_NAMED_SLOTS) * 8
+            crate::value::RECORD_SLOTS_OFF + (17 - crate::value::MAX_CELL_SLOTS) * 8
         );
     }
 
@@ -3262,7 +3267,10 @@ mod tests {
         let aggregate = measure(&root, &objects, &scopes);
         assert_eq!(
             aggregate.object_bodies.bytes,
-            objects.len().saturating_mul(crate::value::OBJECT_CELL)
+            objects
+                .iter()
+                .map(|object| crate::value::object_cell_bytes(object.borrow().props.class()))
+                .sum::<usize>()
         );
         assert_eq!(
             aggregate.scope_bodies.bytes,

@@ -34,13 +34,15 @@ pub(crate) struct NativeNameDescriptor {
     pub(crate) shape: u32,
     pub(crate) binding: *const BindingSlot,
     pub(crate) slot: usize,
+    /// A global target's location word (W2d step 3, `IcState::loc`), for generated code.
+    pub(crate) loc: u32,
 }
 
 impl NativeNameDescriptor {
     fn new(guards: &[Guard], target: &Target) -> Self {
-        let (kind, shape, binding, slot) = match *target {
-            Target::Binding { pointer, slot } => (0, 0, pointer, slot.unwrap_or(usize::MAX)),
-            Target::Global { shape, slot } => (1, shape, std::ptr::null(), slot),
+        let (kind, shape, binding, slot, loc) = match *target {
+            Target::Binding { pointer, slot } => (0, 0, pointer, slot.unwrap_or(usize::MAX), 0),
+            Target::Global { shape, slot, loc } => (1, shape, std::ptr::null(), slot, loc),
         };
         Self {
             guards: guards.as_ptr().cast(),
@@ -49,6 +51,7 @@ impl NativeNameDescriptor {
             shape,
             binding,
             slot,
+            loc: u32::from(loc),
         }
     }
 }
@@ -75,6 +78,8 @@ enum Target {
     Global {
         shape: u32,
         slot: usize,
+        /// The slot's location word (W2d step 3).
+        loc: u16,
     },
 }
 
@@ -154,7 +159,7 @@ impl ResolutionIc {
                         binding.cast_mut(),
                     ));
                 }
-                Target::Global { shape, slot } => {
+                Target::Global { shape, slot, loc } => {
                     if !Env::ptr_eq(&env, &i.global_env)
                         || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                     {
@@ -171,6 +176,7 @@ impl ResolutionIc {
                         crate::eval::PreparedReference::object(name.clone(), i.global, i.strict);
                     reference.shape = shape;
                     reference.slot = slot;
+                    reference.loc = u32::from(loc);
                     return Some(reference);
                 }
             }
@@ -217,9 +223,11 @@ impl ResolutionIc {
                     return None;
                 }
                 // HasBinding is true for any own property, not merely readable data values.
+                let slot = global.props.slot_of(name)?;
                 Some(Target::Global {
                     shape: global.props.shape(),
-                    slot: global.props.slot_of(name)?,
+                    slot,
+                    loc: global.props.slot_location(slot)?,
                 })
             } else {
                 None
@@ -334,7 +342,7 @@ impl DeepNameIc {
                 // The fill refused an import; the proof covers the attributes.
                 binding.initialized().then(|| binding.value())
             }
-            Target::Global { shape, slot } => {
+            Target::Global { shape, slot, .. } => {
                 if !Env::ptr_eq(env, &i.global_env)
                     || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                 {
@@ -392,7 +400,7 @@ impl DeepNameIc {
                 }
                 false
             }
-            Target::Global { shape, slot } => {
+            Target::Global { shape, slot, .. } => {
                 if !Env::ptr_eq(env, &i.global_env)
                     || !i.ordinary_get_ptr(crate::value::Gc::as_ptr(&i.global) as usize)
                 {
@@ -493,6 +501,7 @@ impl Chunk {
                     Target::Global {
                         shape: global.props.shape(),
                         slot,
+                        loc: global.props.slot_location(slot)?,
                     },
                     property.value(),
                 ))

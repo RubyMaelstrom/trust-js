@@ -23,8 +23,12 @@ mod cell {
     impl Gc {
         /// Allocate `object` in `heap`, the agent heap that owns it.
         #[inline]
-        pub(crate) fn new_in(heap: &crate::value::GcState, object: RefCell<Object>) -> Gc {
-            let cell = crate::value::alloc_object_cell(heap);
+        pub(crate) fn new_in(
+            heap: &crate::value::GcState,
+            class: u32,
+            object: RefCell<Object>,
+        ) -> Gc {
+            let cell = crate::value::alloc_object_cell(heap, class);
             // SAFETY: a fresh cell sized and aligned for `RefCell<Object>`, its header, with room
             // for the map's cell slots after it (W2d step 3), which the map's attach fills.
             // Allocation never collects, so the cell is initialized before any collection can

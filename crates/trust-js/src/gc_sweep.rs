@@ -43,9 +43,9 @@ enum Membership<'h> {
     List(crate::fasthash::FastSet<usize>),
 }
 
-// Objects are never large cells (value.rs keeps an object's cell at 128 bytes), so membership
+// Objects are never large cells (an object's cell is at most 192 bytes, W2d step 3), so membership
 // reads the pages alone and never the heap's map of large cells.
-const _: () = assert!(crate::value::OBJECT_CELL <= gc_core::LARGEST_SMALL_CELL);
+const _: () = assert!(crate::value::object_cell_bytes(2) <= gc_core::LARGEST_SMALL_CELL);
 
 impl<'h> DeadObjects<'h> {
     /// The objects of `heap` found dead by the collection between whose phases the heap is.

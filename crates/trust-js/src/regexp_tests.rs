@@ -1308,10 +1308,17 @@ fn match_arrays_share_one_layout_and_the_ordinary_shape() {
         );
         assert_eq!(&first_layout[..], &ordinary_layout[..], "{other}: keys");
         assert_eq!(first_shape, other_shape, "{other}: one shape");
-        assert_eq!(
-            first_shape, ordinary_shape,
-            "{other}: the shape of insertion"
-        );
+        // W2d step 3: a match array keeps `length`, index, input and groups in its cell, a
+        // capacity class of their own (as V8's JSRegExpResult map has its own in-object count),
+        // so its shape is the shape of insertion only within one class.
+        if crate::value::shape_class(first_shape) == crate::value::shape_class(ordinary_shape) {
+            assert_eq!(
+                first_shape, ordinary_shape,
+                "{other}: the shape of insertion"
+            );
+        } else {
+            assert_ne!(first_shape, ordinary_shape, "{other}: another class");
+        }
     }
     let (a, a_shape) = layout(&mut engine, "a");
     engine.interp.gc_collect();

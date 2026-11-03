@@ -1877,6 +1877,8 @@ pub struct JitCtx {
     /// state can outlive the synchronous helper call that observed it. 0 = none.
     pub accessor_holder: usize,
     pub accessor_slot: u32,
+    /// The slot's location word (W2d step 3, `IcState::loc`), for the getter stub's read.
+    pub accessor_loc: u32,
     /// Points at `Interp::strict` (a `bool` byte), written once with the interpreter-constant
     /// fields: every prologue saves the caller's strictness through it and every epilogue
     /// restores it. The flag lies beyond a byte load's 12-bit offset from the interpreter, so
@@ -2015,6 +2017,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             references_raw: _,  // into `activation` or the borrowed continuation
             accessor_holder: _, // consumed before any JavaScript runs
             accessor_slot: _,
+            accessor_loc: _,
             strict_flag: _,
             call_ic_epoch: _,
             argc: _,
@@ -3445,6 +3448,13 @@ mod asm {
                 return self.bad("a register shift past 63");
             }
             self.emit(0x8B00_0000 | (rm << 16) | (shift << 10) | (rn << 5) | rd);
+        }
+        /// add xd, xn, xm, lsr #shift
+        pub fn add_lsr(&mut self, rd: u32, rn: u32, rm: u32, shift: u32) {
+            if shift >= 64 {
+                return self.bad("a register shift past 63");
+            }
+            self.emit(0x8B40_0000 | (rm << 16) | (shift << 10) | (rn << 5) | rd);
         }
         /// cmp xn, xm (SUBS xzr, xn, xm)
         pub fn cmp_reg_x(&mut self, rn: u32, rm: u32) {
@@ -6954,6 +6964,9 @@ fn emit_prop_load_inline(
     let load = a.new_label();
     let load_data = a.new_label();
     let load_kc = a.new_label();
+    // A way's landings (x12 = the way): they take its location word first (W2d step 3).
+    let load_way = a.new_label();
+    let load_kc_way = a.new_label();
     let absent_hit = a.new_label();
     // 1. receiver must be an Obj (tag 8); x10 = its stored pointer — hop walking uses x17. The
     //    this/slot forms read a binding the frame keeps.
@@ -7172,6 +7185,8 @@ fn emit_prop_load_inline(
             a.b_cond(C_NE, miss);
         }
         a.mov_imm64(13, st.slot as u64);
+        // The slot's location word (W2d step 3): the baked shape fixes it.
+        a.movz(14, u32::from(st.loc), 0);
         if accessor_state(&st) {
             a.b(load);
         } else {
@@ -7218,10 +7233,10 @@ fn emit_prop_load_inline(
             a.bl_label(stub);
             a.cbz(9, false, slow);
             a.cmp_imm_w(9, PROP_PROBE_LOAD);
-            a.b_cond(C_EQ, load);
+            a.b_cond(C_EQ, load_way);
             if kc {
                 a.cmp_imm_w(9, PROP_PROBE_LOAD_KC);
-                a.b_cond(C_EQ, load_kc);
+                a.b_cond(C_EQ, load_kc_way);
             }
             if !method {
                 a.cmp_imm_w(9, PROP_PROBE_ABSENT);
@@ -7229,7 +7244,7 @@ fn emit_prop_load_inline(
             }
             a.b(slow);
         } else {
-            emit_prop_way_loop(a, layout, flags, slow, load, load_kc, absent_hit);
+            emit_prop_way_loop(a, layout, flags, slow, load_way, load_kc_way, absent_hit);
         }
     }
     // 6. x11 = holder base: bounds-check the cached slot against the live named count (defense
@@ -7239,11 +7254,12 @@ fn emit_prop_load_inline(
     let val = a.new_label();
     let val_body = a.new_label();
     let accessor_hit = a.new_label();
+    // x13 = the slot's index (bounds-checked against the live count), x14 = its location word.
     let emit_entry = |a: &mut asm::Asm| {
         named_len(a, layout, 16, 11);
         a.cmp_reg_x(13, 16);
         a.b_cond(C_HS, slow);
-        slot_addr(a, layout, 15, 11, 13);
+        slot_addr_loc(a, layout, 15, 11, 14);
         a.ldr_imm(12, 15, 0); // Heap and execution storage share the complete word.
     };
     // Baked (data-only, shape-proven) hits skip the accessor test: the shape proves a data
@@ -7251,6 +7267,8 @@ fn emit_prop_load_inline(
     a.bind(load_data);
     emit_entry(a);
     a.b(val_body);
+    a.bind(load_way);
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
     a.bind(load);
     emit_entry(a);
     a.bind(val);
@@ -7285,8 +7303,10 @@ fn emit_prop_load_inline(
     // address (an atom lives as long as its heap, which this code belongs to) or a tagged
     // index. Mismatch (slot shifted since fill) → helper re-derives. Ends by jumping back
     // into the shared value path.
+    a.bind(load_kc_way);
     a.bind(load_kc);
     if kc {
+        a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
         emit_entry(a);
         // Named fields have no inline key: follow the holder's shared layout at the same slot,
         // which its keys always cover.
@@ -7328,6 +7348,7 @@ fn emit_prop_load_inline(
     a.sub_imm(9, 11, obj_off);
     a.str_imm(9, 19, std::mem::offset_of!(JitCtx, accessor_holder) as u32);
     a.str_w_imm(13, 19, std::mem::offset_of!(JitCtx, accessor_slot) as u32);
+    a.str_w_imm(14, 19, std::mem::offset_of!(JitCtx, accessor_loc) as u32);
     a.bind(slow);
     #[cfg(test)]
     regions::emit_property_event(a, 2);
@@ -7413,6 +7434,9 @@ fn emit_get_prop_getter(
     use std::mem::offset_of;
     let holder_off = offset_of!(JitCtx, accessor_holder) as u32;
     let slot_off = offset_of!(JitCtx, accessor_slot) as u32;
+    // The published slot's location word (W2d step 3), which the getter's read takes; the
+    // index is the helper's.
+    let loc_off = offset_of!(JitCtx, accessor_loc) as u32;
     // An entry without a compiled user-code entry whose frame fits a record (`CallIc::direct`
     // bits 0 and 3; a getter that builds an environment, say) would fail the sequence's first
     // gates on every read: it keeps the helper. A ready entry has both.
@@ -7469,9 +7493,9 @@ fn emit_get_prop_getter(
     // x9 = the live getter's word, which the slot's accessor pair (its word's payload under
     // PACK_ACCESSOR, W2d step 2; none when the accessor never had a function) holds: Undefined's
     // for an absent [[Get]]. The slot is the published one.
-    a.ldr_w_imm(13, 19, slot_off);
+    a.ldr_w_imm(13, 19, loc_off);
     a.add_imm(11, 9, layout.obj_from_cell as u32);
-    slot_addr(a, layout, 15, 11, 13);
+    slot_addr_loc(a, layout, 15, 11, 13);
     a.ldr_imm(9, 15, 0);
     let accessor_word = a.new_label();
     branch_accessor_word(a, 9, 16, accessor_word);
@@ -7778,7 +7802,8 @@ fn emit_set_prop_setter(
     named_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, plain);
-    slot_addr(a, layout, 15, 11, 13);
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+    slot_addr_loc(a, layout, 15, 11, 14);
     a.ldr_imm(9, 15, 0);
     let accessor_word = a.new_label();
     branch_accessor_word(a, 9, 16, accessor_word);
@@ -8115,7 +8140,8 @@ fn emit_computed_method_inline(
     named_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, slow);
-    slot_addr(a, layout, 15, 11, 13);
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+    slot_addr_loc(a, layout, 15, 11, 14);
     a.ldr_imm(12, 15, 0);
     // The key is known only at run time: it may be `prototype` on a function. One unsigned
     // compare also refuses an accessor's word (PACK_ACCESSOR is above PACK_LAZY_PROTO).
@@ -11256,7 +11282,8 @@ fn emit_update_prop_inline(
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, slow);
     guard_slot_writable_data(a, layout, 11, 13, 9, 16, slow);
-    slot_addr(a, layout, 15, 11, 13);
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+    slot_addr_loc(a, layout, 15, 11, 14);
     a.ldr_imm(16, 15, 0);
     a.lsr_imm(9, 16, 48);
     let number = a.new_label();
@@ -11678,11 +11705,12 @@ fn emit_instanceof_inline(
     // Resolve the cached own `.prototype` slot defensively, require a word holding an object (an
     // accessor's word, under PACK_ACCESSOR, is none), and untag its cell address from the packed
     // heap value.
+    a.ldrh_imm(16, 13, crate::bytecode::IC_OFF_LOC);
     a.ldr_w_imm(13, 13, IC_OFF_SLOT);
     named_len(a, layout, 14, 12);
     a.cmp_reg_x(13, 14);
     a.b_cond(C_HS, slow);
-    slot_addr(a, layout, 15, 12, 13);
+    slot_addr_loc(a, layout, 15, 12, 16);
     a.ldr_imm(15, 15, 0);
     a.lsr_imm(16, 15, 48);
     a.movz(17, (crate::value::PACK_OBJ >> 48) as u32, 0);
@@ -11739,8 +11767,8 @@ fn emit_prop_create_probe(
     commit: usize,
 ) {
     use crate::bytecode::{
-        IC_CREATE, IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_MID2_SHAPE, IC_OFF_MID_SHAPE,
-        IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
+        IC_CREATE, IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_LOC, IC_OFF_MID2_SHAPE,
+        IC_OFF_MID_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
     };
     let sh = (layout.obj_props + layout.props_shape) as u32;
     a.ldrb_imm(9, 12, IC_OFF_DEPTH);
@@ -11759,7 +11787,9 @@ fn emit_prop_create_probe(
     named_len(a, layout, 13, 11);
     a.cmp_imm_x(13, 8);
     a.b_cond(C_HS, miss);
-    guard_named_room(a, layout, 13, 11, 14, miss);
+    // Room for the new slot: the way records where it lives (W2d step 3).
+    a.ldrh_imm(14, 12, IC_OFF_LOC);
+    guard_loc_room(a, layout, 14, 11, 15, 16, miss);
     let transition_layout = a.new_label();
     let key_ready = a.new_label();
     a.movz(7, 0, 0);
@@ -11872,15 +11902,15 @@ fn emit_card_mark(a: &mut asm::Asm, owner: u32, s1: u32, s2: u32) {
 }
 
 /// Debug check for [`emit_card_mark`]'s use of an Object address: it lies in its cell's card.
-/// Object cells (128 bytes since W2d step 2, 192 before) start at a multiple of 64 bytes into a
-/// 128-byte card, so an Object fewer than 64 bytes past its cell's start shares that card.
+/// Object cells (96, 128 or 192 bytes since W2d step 3) start at a multiple of 32 bytes into a
+/// 128-byte card, so an Object fewer than 32 bytes past its cell's start shares that card.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn debug_assert_object_in_cell_card(layout: &crate::value::JitLayout) {
     debug_assert!(
-        layout.obj_from_cell < (1 << crate::gc_core::CARD_SHIFT) / 2,
+        layout.obj_from_cell < (1 << crate::gc_core::CARD_SHIFT) / 4,
         "an Object's address must share its cell's card"
     );
 }
@@ -11979,7 +12009,8 @@ fn emit_set_prop_inline(
         // A writable data property (its layout's attributes, W2d step 2): a way records no
         // writability, as the get path fills ways too.
         guard_slot_writable_data(a, layout, 11, 13, 9, 16, miss);
-        slot_addr(a, layout, 15, 11, 13);
+        a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+        slot_addr_loc(a, layout, 15, 11, 14);
         // The incoming word replaces the old value without observing it, including a
         // deferred prototype. Shape/data/writability and the write barrier remain in force.
     };
@@ -12045,8 +12076,9 @@ fn emit_set_prop_inline(
         a.str_imm(7, 11, (layout.obj_props + layout.props_layout) as u32);
         a.bind(layout_installed);
         // From here no branch can fail: compute the vacant slot (in the cell, or the record whose
-        // room the probe proved) and move the incoming value in.
-        slot_addr(a, layout, 15, 11, 13);
+        // room the probe proved) from the way's location word and move the incoming value in.
+        a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+        slot_addr_loc(a, layout, 15, 11, 14);
         emit_exec_word_load(a, 16, 20, -8);
         // The predicted key and its plain attributes are already the layout's (validated
         // pre-commit): the slot takes only the value word (W2d step 2).
@@ -14086,8 +14118,9 @@ fn emit_name_ic_value_ptr_in(
     a.lsr_imm(17, 16, 32);
     a.cmp_reg_w(15, 17);
     a.b_cond(C_NE, slow);
-    a.mov_w(16, 16); // zero-extend the slot half
-    slot_addr(a, layout, 15, 14, 16);
+    // Global mode keeps the slot's location word in `act_gen` (W2d step 3).
+    a.ldr_w_imm(16, 12, NAME_IC_OFF_ACT_GEN);
+    slot_addr_loc(a, layout, 15, 14, 16);
     // x7 = 1, a global data property, and a writable one at a store or update site: the shape
     // covers the slot's attributes (W2d step 2), which the site's fill admitted
     // (`Chunk::name_ic_fill`), as JSC caches a global put only for a writable property under
@@ -14847,7 +14880,7 @@ fn emit_word_create(
     a.ldur_w(16, 15, -(layout.words_capacity as i32));
     a.cmp_reg_x(14, 16);
     a.b_cond(C_HS, slow);
-    slot_addr_const(a, layout, 17, 11, 0);
+    first_slot_addr(a, layout, 17, 11);
     a.ldur(16, 17, 0);
     emit_exec_number_guard(a, 16, 4, 12, slow);
     a.ucvtf_d_w(5, 9);
@@ -15106,7 +15139,7 @@ fn emit_define_elem_inline(
     // ... and has a writable `length` holding a Number (x14 = its slot, d1 = L): slot 0, a data
     // property (an Array's first entry, never removed; V8's descriptor 0), whose attributes are
     // its layout's (W2d step 2; XZR is index 0).
-    slot_addr_const(a, layout, 14, 11, 0);
+    first_slot_addr(a, layout, 14, 11);
     guard_slot_writable_data(a, layout, 11, 31, 15, 16, slow);
     a.ldur(15, 14, 0);
     emit_exec_number_guard(a, 15, 1, 16, slow);
@@ -16382,8 +16415,9 @@ fn emit_chain_marked(
                 a.mov_imm64(13, st.slot as u64);
                 a.cmp_reg_x(13, 16);
                 a.b_cond(C_HS, guard!());
-                // The slot is the state's, known now (W2d step 2: in the cell, or the record).
-                slot_addr_const(a, layout, 15, 11, st.slot as usize);
+                // The slot's location is the state's, known now (W2d step 3: in the cell, or the
+                // record).
+                slot_addr_loc_const(a, layout, 15, 11, st.loc);
                 let rd = free.pop().expect("chain reg underflow");
                 // A numeric read still rejects every execution tag before entering FP state,
                 // an accessor's word (PACK_ACCESSOR, a NaN pattern) among them.
@@ -16421,7 +16455,7 @@ fn emit_chain_marked(
                 a.b_cond(C_HS, guard!());
                 // A writable data property (its layout's attributes, W2d step 2).
                 guard_slot_writable_data(a, layout, 11, 13, 9, 16, guard!());
-                slot_addr_const(a, layout, 15, 11, st.slot as usize);
+                slot_addr_loc_const(a, layout, 15, 11, st.loc);
                 emit_exec_number_store(a, dv, 15, 0, 13);
                 #[cfg(test)]
                 {
@@ -18167,7 +18201,7 @@ fn emit_region_own_entry(
         // A writable data property: its layout's attributes (W2d step 2).
         guard_slot_writable_data(a, layout, body_reg, 13, 9, 16, fail);
     }
-    slot_addr_const(a, layout, entry_reg, body_reg, state.slot as usize);
+    slot_addr_loc_const(a, layout, entry_reg, body_reg, state.loc);
     if !writable {
         // A data property: an accessor's word takes the checked path.
         a.ldr_imm(9, entry_reg, 0);
@@ -19971,6 +20005,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         references_raw: (&mut *state.references).as_mut_ptr(),
         accessor_holder: 0,
         accessor_slot: 0,
+        accessor_loc: 0,
         resume_pc: *pc,
         resume_step: None,
     };
@@ -20121,6 +20156,7 @@ pub fn run(
         references_raw: std::ptr::null_mut(),
         accessor_holder: 0,
         accessor_slot: 0,
+        accessor_loc: 0,
         resume_pc: 0,
         resume_step: None,
         handler_floor: 0,
@@ -20326,6 +20362,7 @@ impl JitFrame {
                 references_raw: std::ptr::null_mut(),
                 accessor_holder: 0,
                 accessor_slot: 0,
+                accessor_loc: 0,
             });
             std::ptr::NonNull::new_unchecked(Box::into_raw(record.assume_init()))
         };
@@ -20588,6 +20625,7 @@ unsafe fn run_moved_oversized(
         references_raw: std::ptr::null_mut(),
         accessor_holder: 0,
         accessor_slot: 0,
+        accessor_loc: 0,
         resume_pc: 0,
         resume_step: None,
         handler_floor: 0,

@@ -151,11 +151,13 @@ fn property_shapes_uncacheable_prefix_never_enters_transition_or_layout_cache() 
     let mut second = Props::new();
     first.insert("first", Property::plain(Value::Num(1.0)));
     second.insert("second", Property::plain(Value::Num(2.0)));
-    first.entries.shape = SHAPE_UNCACHEABLE;
-    second.entries.shape = SHAPE_UNCACHEABLE;
+    first.entries.shape = crate::value::uncacheable_shape(0);
+    second.entries.shape = crate::value::uncacheable_shape(0);
+    // A map's uncacheable token keeps its capacity class (W2d step 3).
+    let uncacheable = crate::value::uncacheable_shape(0);
     for map in [&mut first, &mut second] {
         map.insert("tail", Property::plain(Value::Num(3.0)));
-        assert_eq!(map.shape(), SHAPE_UNCACHEABLE);
+        assert_eq!(map.shape(), uncacheable);
     }
     assert!(first.contains("first") && !first.contains("second"));
     assert!(second.contains("second") && !second.contains("first"));
@@ -163,8 +165,8 @@ fn property_shapes_uncacheable_prefix_never_enters_transition_or_layout_cache() 
     assert!(!shapes
         .transitions
         .keys()
-        .any(|(parent, ..)| *parent == SHAPE_UNCACHEABLE));
-    assert!(shapes.layouts.get(SHAPE_UNCACHEABLE).is_none());
+        .any(|(parent, ..)| !crate::value::is_cacheable_shape(*parent)));
+    assert!(shapes.layouts.get(uncacheable).is_none());
 }
 
 #[test]
@@ -187,11 +189,7 @@ fn property_shapes_exhausted_array_length_hint_does_not_hide_named_properties() 
     assert!(props.entries.len() > INDEX_THRESHOLD);
     props.force_uncacheable_shape_for_test();
     // Only this disposable test Agent's hint is exhausted, never the global ID allocator.
-    engine
-        .interp
-        .gc_heap
-        .array_length_shape
-        .set(SHAPE_UNCACHEABLE);
+    engine.interp.gc_heap.array_length_shapes[0].set(crate::value::uncacheable_shape(0));
     assert!(matches!(
         (props.get("named").unwrap().value()).view(),
         ValueView::Num(37.0)

@@ -1,8 +1,9 @@
 //! ARM64 storage accessors: where generated code finds an object's named-field values, a binding
 //! map's entries and a slot memo, in the build's layout (probed into the [`JitLayout`]).
 //!
-//! Named slots are one word each, the first [`crate::value::INLINE_NAMED_SLOTS`] in the object's
-//! cell and the rest in its out-of-line record (W2d step 2); binding-map entries are an
+//! Named slots are one word each, the first in the object's cell after its header and the rest
+//! in its out-of-line record, each where its location word says (W2d step 3); binding-map
+//! entries are an
 //! `InlineVec` whose first elements stay in the environment cell ([`JitVecLayout::Inline`]), and a
 //! slot memo is 2 bytes wide.
 //! Templates never address these words themselves: they call the emitters below, which also
@@ -125,13 +126,11 @@ pub(super) fn vec_data_fits(seq: JitVecLayout, off: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Named slots (W2d step 2): the value words of the Object at `obj` (the stored handle word plus
-// `obj_from_cell`), in key-layout order, [`INLINE_NAMED_SLOTS`] in the cell and the rest in the
-// out-of-line record. A slot holds only its value word: its attributes are the layout's, which
-// the shape proves.
+// Named slots (W2d step 3): the value words of the Object at `obj` (the stored handle word plus
+// `obj_from_cell`), in key-layout order, the first in the cell after its header and the rest in
+// the out-of-line record, each where its location word says. A slot holds only its value word:
+// its attributes are the layout's, which the shape proves.
 // ---------------------------------------------------------------------------------------------
-
-use crate::value::INLINE_NAMED_SLOTS;
 
 /// The cell's first slot, from the Object.
 fn slots_off(layout: &crate::value::JitLayout) -> usize {
@@ -159,78 +158,87 @@ pub(super) fn named_set_len(
     a.str_w_imm(src, obj, (layout.obj_props + layout.props_len) as u32);
 }
 
-/// Load the address of slot `slot` (a register holding an index below the count) into `dst`,
-/// which must differ from `obj` and `slot`: in the cell below [`INLINE_NAMED_SLOTS`], else in the
-/// record (which a count past the cell's slots implies). The cell's case falls through to a
-/// shared scaled add, four instructions; the record's adds a load and a bias. Clobbers NZCV.
-pub(super) fn slot_addr(
+/// Load the address of slot 0 into `dst` (which may be `obj`): one instruction, since every
+/// object's cell keeps at least its first slot (an Array's `length`, W2c step 7).
+pub(super) fn first_slot_addr(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     dst: u32,
     obj: u32,
-    slot: u32,
+) {
+    a.add_imm(dst, obj, slots_off(layout) as u32);
+}
+
+/// Load the address of the slot whose location word (W2d step 3: `IcState::loc`,
+/// [`crate::value::location_word`]) is in register `loc`, zero-extended, into `dst`, which must
+/// differ from `obj` and `loc`: the Object plus the word's offset in the cell, or the record plus
+/// its offset there (bit 0 set). Two instructions in the cell, four through the record; the
+/// shape that validated the location proves which. Clobbers nothing else (NZCV is preserved).
+pub(super) fn slot_addr_loc(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    dst: u32,
+    obj: u32,
+    loc: u32,
 ) {
     assert!(
-        dst != obj && dst != slot,
+        dst != obj && dst != loc,
         "the slot address is built from both"
     );
     let cell = a.new_label();
-    let scaled = a.new_label();
-    a.cmp_imm_x(slot, INLINE_NAMED_SLOTS as u32);
-    a.b_cond(C_LO, cell);
+    let done = a.new_label();
+    a.tbz(loc, 0, cell);
     a.ldr_imm(dst, obj, record_off(layout) as u32);
-    // Slot INLINE + i is record_slots + 8i into the block: dst = record + 8 * slot - the cell's.
-    a.sub_imm(
-        dst,
-        dst,
-        (8 * INLINE_NAMED_SLOTS - layout.record_slots) as u32,
-    );
-    a.b(scaled);
+    a.add_lsr(dst, dst, loc, 1);
+    a.b(done);
     a.bind(cell);
-    a.add_imm(dst, obj, slots_off(layout) as u32);
-    a.bind(scaled);
-    a.add_shifted(dst, dst, slot, 3);
+    a.add_lsr(dst, obj, loc, 1);
+    a.bind(done);
 }
 
-/// Load the address of slot `slot`, known at compile time, into `dst` (which may be `obj` only in
-/// the cell's case): one instruction in the cell, two through the record.
-pub(super) fn slot_addr_const(
+/// [`slot_addr_loc`] for a location word known at compile time: one instruction in the cell, two
+/// through the record. `dst` may be `obj` only in the cell's case.
+pub(super) fn slot_addr_loc_const(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     dst: u32,
     obj: u32,
-    slot: usize,
+    loc: u16,
 ) {
-    if slot < INLINE_NAMED_SLOTS {
-        a.add_imm(dst, obj, (slots_off(layout) + 8 * slot) as u32);
+    let off = u32::from(loc >> 1);
+    if loc & 1 == 0 {
+        a.add_imm(dst, obj, off);
     } else {
         a.ldr_imm(dst, obj, record_off(layout) as u32);
-        a.add_imm(
-            dst,
-            dst,
-            (layout.record_slots + 8 * (slot - INLINE_NAMED_SLOTS)) as u32,
-        );
+        a.add_imm(dst, dst, off);
     }
 }
 
-/// Branch to `miss` unless the Object at `obj` has room for one more slot past `len` (a register
-/// holding its count): the cell's, or the record's capacity. Clobbers `scratch` and NZCV.
-pub(super) fn guard_named_room(
+/// Branch to `miss` unless the Object at `obj` has room for the slot whose location word is in
+/// `loc` (a creation way's new slot, W2d step 3): in the cell the way's shape proves the room,
+/// so only a record slot is tested, against the record's capacity, as V8's IC builtin tests its
+/// PropertyArray's length (a record's capacity is not a function of the shape). `s1` and `s2`
+/// must differ from the inputs; both and NZCV are clobbered.
+pub(super) fn guard_loc_room(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
-    len: u32,
+    loc: u32,
     obj: u32,
-    scratch: u32,
+    s1: u32,
+    s2: u32,
     miss: usize,
 ) {
+    debug_assert!(s1 != loc && s1 != obj && s2 != loc && s2 != obj && s1 != s2);
     let room = a.new_label();
-    a.cmp_imm_x(len, INLINE_NAMED_SLOTS as u32);
-    a.b_cond(C_LO, room);
-    a.ldr_imm(scratch, obj, record_off(layout) as u32);
-    a.cbz(scratch, true, miss);
-    a.ldr_w_imm(scratch, scratch, layout.record_cap as u32);
-    a.add_imm(scratch, scratch, INLINE_NAMED_SLOTS as u32);
-    a.cmp_reg_x(len, scratch);
+    a.tbz(loc, 0, room);
+    a.ldr_imm(s1, obj, record_off(layout) as u32);
+    a.cbz(s1, true, miss);
+    a.ldr_w_imm(s1, s1, layout.record_cap as u32);
+    a.lsl_imm(s1, s1, 3);
+    a.add_imm(s1, s1, layout.record_slots as u32);
+    // The slot's offset in the record, from its location word.
+    a.lsr_imm(s2, loc, 1);
+    a.cmp_reg_x(s2, s1);
     a.b_cond(C_HS, miss);
     a.bind(room);
 }
@@ -314,14 +322,13 @@ pub(super) fn emit_property_kind(
 /// record's capacity and index with their instructions' immediates.
 pub(super) fn named_slots_fit(layout: &crate::value::JitLayout) -> bool {
     layout.valid
-        && slots_off(layout) + 8 * INLINE_NAMED_SLOTS < 4096
+        && slots_off(layout) + 8 * crate::value::MAX_CELL_SLOTS < 4096
         && slots_off(layout).is_multiple_of(8)
         && fits_scaled(record_off(layout), 8)
         && fits_scaled(layout.obj_props + layout.props_len, 4)
         && fits_scaled(layout.record_cap, 4)
         && fits_scaled(layout.record_index, 8)
         && layout.record_slots.is_multiple_of(8)
-        && layout.record_slots <= 8 * INLINE_NAMED_SLOTS
         && fits_scaled(layout.obj_props + layout.props_layout, 8)
         && fits_scaled(layout.layout_attrs_len, 4)
         && fits_scaled(layout.layout_attrs_ptr, 8)

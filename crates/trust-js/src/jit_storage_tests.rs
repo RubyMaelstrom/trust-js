@@ -119,23 +119,23 @@ fn named_slot_emitters_read_live_objects() {
     let engine = crate::Engine::new();
     let layout = layout(&engine);
     assert!(named_slots_fit(&layout));
-    // Slot `x1` of the Object at x0, as the property templates read it (W2d step 2): the bounds
-    // check against the live count, then the word at the slot's address, in the cell or the
-    // record.
+    // The word of the slot whose location word (W2d step 3) is x1, of the Object at x0, as the
+    // property templates read it: in the cell or the record.
     let (_value_code, value) = assemble(|a| {
-        let miss = a.new_label();
-        named_len(a, &layout, 2, 0);
-        a.cmp_reg_x(1, 2);
-        a.b_cond(C_HS, miss);
-        slot_addr(a, &layout, 3, 0, 1);
+        slot_addr_loc(a, &layout, 3, 0, 1);
         a.ldur(0, 3, 0);
-        ret_none(a, miss);
+        a.ret();
     });
-    // The room check of a creation, and the owner kind of a name's property.
+    // The live count, which the templates bound a cached slot's index by.
+    let (_len_code, len) = assemble(|a| {
+        named_len(a, &layout, 0, 0);
+        a.ret();
+    });
+    // The room check of a creation (x1 = the new slot's location word), and the owner kind of a
+    // name's property.
     let (_room_code, room) = assemble(|a| {
         let miss = a.new_label();
-        named_len(a, &layout, 2, 0);
-        guard_named_room(a, &layout, 2, 0, 3, miss);
+        guard_loc_room(a, &layout, 1, 0, 2, 3, miss);
         a.movz(0, 1, 0);
         a.ret();
         a.bind(miss);
@@ -160,25 +160,37 @@ fn named_slot_emitters_read_live_objects() {
         let stored = unsafe { *(&object as *const crate::value::Gc as *const usize) };
         let base = stored + layout.obj_from_cell;
         assert_eq!(base, &*object.borrow() as *const Object as usize);
-        for slot in 0..=count {
-            // A packed Number is its f64 bits; past the count the sequence answers all ones.
-            let read = value(base, slot);
-            match object.borrow().props.property_at(slot) {
-                Some(property) => assert_eq!(
-                    Some(f64::from_bits(read as u64)),
-                    property.number_value(),
-                    "{count} fields, slot {slot}"
-                ),
-                None => assert_eq!(read, usize::MAX, "{count} fields, slot {slot}"),
-            }
-            if slot < count {
-                // Plain data: kind 1.
-                assert_eq!(kind(base, slot), 1, "{count} fields, slot {slot}");
-            }
+        assert_eq!(len(base, 0), count);
+        for slot in 0..count {
+            // A packed Number is its f64 bits.
+            let loc = object
+                .borrow()
+                .props
+                .slot_location(slot)
+                .expect("a location");
+            let read = value(base, usize::from(loc));
+            let expected = object
+                .borrow()
+                .props
+                .property_at(slot)
+                .expect("a property")
+                .number_value();
+            assert_eq!(
+                Some(f64::from_bits(read as u64)),
+                expected,
+                "{count} fields, slot {slot}"
+            );
+            // Plain data: kind 1.
+            assert_eq!(kind(base, slot), 1, "{count} fields, slot {slot}");
         }
         let capacity = object.borrow().props.named_capacity();
+        let next = object
+            .borrow()
+            .props
+            .slot_location(count)
+            .expect("a location");
         assert_eq!(
-            room(base, 0),
+            room(base, usize::from(next)),
             usize::from(count < capacity),
             "{count} fields: room for one more"
         );
