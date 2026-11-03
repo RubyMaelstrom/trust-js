@@ -50,9 +50,15 @@ impl Hasher for FxHasher {
     fn write_usize(&mut self, i: usize) {
         self.add(i as u64);
     }
+    /// The multiply leaves its entropy in the high bits, and a key's known-zero low bits (a cell
+    /// address's alignment: 7 bits for 128-byte cells) stay zero in the product's low bits, which
+    /// hashbrown takes for the bucket. Rotating the high bits down spreads such keys over the
+    /// table, as rustc-hash 2's `finish` does; SpiderMonkey's tables index by the product's high
+    /// bits instead (mfbt/HashTable.h, `hash >> hashShift`), and JSC and V8 hash pointers through
+    /// an avalanche mix (`intHash`, `ComputeLongHash`).
     #[inline]
     fn finish(&self) -> u64 {
-        self.hash
+        self.hash.rotate_left(26)
     }
 }
 
