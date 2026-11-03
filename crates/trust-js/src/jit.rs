@@ -2134,6 +2134,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_call_spread as *const () as usize,
         crate::bytecode::jit_construct_this as *const () as usize,
         crate::bytecode::jit_frame_setup as *const () as usize,
+        crate::value::jit_grow_named_record as *const () as usize,
     ]
 }
 
@@ -2239,7 +2240,9 @@ pub const H_CONSTRUCT_THIS: usize = 32;
 /// (`bytecode::jit_frame_setup`, the `(ctx, imm, sp)` contract): it allocates, so its call ends
 /// in the explicit poll, and it never throws.
 pub const H_FRAME_SETUP: usize = 33;
-pub const N_HELPERS: usize = 34;
+/// The creation commit's record growth (W2d step 3): `value::jit_grow_named_record`.
+pub const H_GROW_NAMED_RECORD: usize = 34;
+pub const N_HELPERS: usize = 35;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2279,6 +2282,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "call_spread",
     "construct_this",
     "frame_setup",
+    "grow_named_record",
 ];
 
 #[inline]
@@ -11787,9 +11791,13 @@ fn emit_prop_create_probe(
     named_len(a, layout, 13, 11);
     a.cmp_imm_x(13, 8);
     a.b_cond(C_HS, miss);
-    // Room for the new slot: the way records where it lives (W2d step 3).
+    // Room for the new slot: the way records where it lives (W2d step 3). A record slot that
+    // the record lacks room for is made below, out of the line (`grow`).
+    let grow = a.new_label();
+    let room = a.new_label();
     a.ldrh_imm(14, 12, IC_OFF_LOC);
-    guard_loc_room(a, layout, 14, 11, 15, 16, miss);
+    guard_loc_room(a, layout, 14, 11, 15, 16, grow);
+    a.bind(room);
     let transition_layout = a.new_label();
     let key_ready = a.new_label();
     a.movz(7, 0, 0);
@@ -11860,6 +11868,24 @@ fn emit_prop_create_probe(
     a.b_cond(C_NE, miss);
     // Every execution word transfers unchanged.
     a.b(commit);
+    // The record lacks room for the new slot: make it (W2d step 3), as SpiderMonkey's creation
+    // stubs call growSlotsPure and V8's builtin extends its PropertyArray, keeping the way loop's
+    // registers (x6 ways left, x8 cursor) and the probe's (x10-x13), then take the room check's
+    // exit. The call allocates a storage block and does not collect.
+    a.bind(grow);
+    a.stp_pre(6, 8, -64);
+    a.stp_off(10, 11, 16);
+    a.stp_off(12, 13, 32);
+    a.str_imm(30, 31, 48);
+    a.mov(0, 10);
+    a.mov(1, 13);
+    a.ldr_imm(16, 21, (H_GROW_NAMED_RECORD * 8) as u32);
+    a.blr(16);
+    a.ldr_imm(30, 31, 48);
+    a.ldp_off(12, 13, 32);
+    a.ldp_off(10, 11, 16);
+    a.ldp_post(6, 8, 64);
+    a.b(room);
 }
 
 /// The write barrier's card store (S6 step 10b; `gc_core::card_mark`), emitted after a store of

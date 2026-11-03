@@ -4390,18 +4390,56 @@ pub(crate) fn check_object_layout() {
     );
 }
 
-/// A fresh cell for one object of capacity class `class` in `heap` (see `Gc::new_in`): its header
-/// and slots. Each arm's size is a constant, so the allocation's zeroing stays in line.
-#[inline]
-pub(crate) fn alloc_object_cell(heap: &GcState, class: u32) -> *mut RefCell<Object> {
-    let mut core = heap.core.borrow_mut();
-    let cell = match class {
-        0 => core.alloc(heap.object_desc, object_cell_bytes(0)),
-        1 => core.alloc(heap.object_desc, object_cell_bytes(1)),
-        _ => core.alloc(heap.object_desc, object_cell_bytes(2)),
-    };
-    cell.cast()
+/// Generated code's creation commit (W2d step 3): make room in the record of the object whose
+/// cell is at `cell` for its named slot `len`, the next, which its record lacks (absent, or full),
+/// as SpiderMonkey's creation stubs call growSlotsPure (jit/BaselineCacheIRCompiler.cpp:931-1006)
+/// and V8's builtin extends its PropertyArray (ic/accessor-assembler.cc:2645-2690). Runs no
+/// JavaScript and does not collect; the caller marks the object's card after its store. Returns 1.
+///
+/// # Safety
+/// `cell` is a live object cell that nothing borrows, whose map's count is `len` and whose cell
+/// slots are full.
+pub(crate) unsafe extern "C" fn jit_grow_named_record(cell: usize, len: usize) -> usize {
+    // SAFETY: the caller's: a live, unborrowed object cell.
+    let object = unsafe { &mut *(*(cell as *const RefCell<Object>)).as_ptr() };
+    let entries = &mut object.props.entries;
+    debug_assert_eq!(entries.len(), len, "the creation's slot is the next");
+    debug_assert!(len >= entries.cell as usize, "a record slot");
+    entries.grow_for_layout();
+    1
 }
+
+/// A fresh cell for one object of capacity class `class` in `heap` (see `Gc::new_in`): its header
+/// and slots, not zeroed. Its owner writes the whole header at once, and a slot only as the map's
+/// count grows past it, which bounds every read of the slots (and the trace's), before any
+/// safepoint (`gc_core::Heap::alloc_small_uninit`, as environment records allocate theirs).
+#[inline(always)]
+pub(crate) fn alloc_object_cell(heap: &GcState, class: u32) -> *mut RefCell<Object> {
+    let size_class = match class {
+        0 => OBJECT_SIZE_CLASSES[0],
+        1 => OBJECT_SIZE_CLASSES[1],
+        _ => OBJECT_SIZE_CLASSES[2],
+    };
+    heap.core
+        .borrow_mut()
+        .alloc_small_uninit(heap.object_desc, size_class)
+        .cast()
+}
+
+/// The heap's size classes of the three object cells ([`object_cell_bytes`]).
+const OBJECT_SIZE_CLASSES: [u8; 3] = {
+    let mut classes = [0u8; 3];
+    let mut class = 0;
+    while class < 3 {
+        classes[class] =
+            match crate::gc_core::small_cell_class_const(object_cell_bytes(class as u32)) {
+                Some(size_class) => size_class,
+                None => panic!("an object cell is a small cell"),
+            };
+        class += 1;
+    }
+    classes
+};
 
 /// Ends an Agent's object heap: declared as the interpreter's LAST field, so it runs after every
 /// other field (anything that might still read an object) has dropped. Makes the heap's rooted

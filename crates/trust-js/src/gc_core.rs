@@ -149,6 +149,16 @@ pub(crate) fn small_cell_class(size: usize) -> Option<(u8, usize)> {
     size_class(size).map(|class| (class as u8, SIZE_CLASSES[class]))
 }
 
+/// [`small_cell_class`]'s size class, at compile time (W2d step 3: the object cells').
+pub(crate) const fn small_cell_class_const(size: usize) -> Option<u8> {
+    let units = size.div_ceil(16);
+    if units < CLASS_OF.len() {
+        Some(CLASS_OF[units])
+    } else {
+        None
+    }
+}
+
 /// The cell size of the small size class `class` ([`small_cell_class`]).
 #[inline]
 pub(crate) fn small_class_size(class: u8) -> usize {
