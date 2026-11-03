@@ -95,7 +95,9 @@ P2: Baseline strengthening: call path (frame/argument costs),
 P3: Speculative optimizing tier: inlining, type speculation with
   deopt, global load elimination, escape analysis/allocation
   sinking, range analysis. Reuse Pilot A-C/R1 guard infrastructure
-  (class shapes, landing, region facts) as the proof layer.
+  (class shapes, landing, region facts) as the proof layer. P2 hands
+  P3 the items under "Carried to Phase 3" in its plan
+  (docs/v8-chase-p2-plan-2026-10-26.txt).
 P4: Long-tail parity: strings, JSON, collections, startup snapshots.
 
 Expectation setting: P1 alone is expected to be roughly

@@ -603,6 +603,9 @@ does (Order, step 0).
     exit sites, the small acyclic spans, then W4's feedback). Step 3 is JSC's per-site exit
     profile with recompilation, not whole-region refusal. Acyclic spans stay until steps 3 and 4
     are measured.
+27. Region admission's step 3 (2026-11-03) is parked, as its record measured it: exit sites with
+    recompilation get another attempt in Phase 3, with the speculative tier (see "Carried to
+    Phase 3"). Its branch, p2-region-s3, is kept for that attempt. P2 continues with W2d.
 
 ## Non-goals
 
@@ -625,6 +628,44 @@ startup snapshots (P4); Speedometer acceptance beyond the replays.
 - Incremental marking (W6) puts a barrier on every pointer store in the interpreter, the VM and
   both JIT backends; it lands behind GC stress with marking forced into small slices, and
   TRUST_JS_GC_VERIFY.
+
+## Carried to Phase 3
+
+Work P2 tried or found that belongs with Phase 3's speculative tier (docs/v8-chase-2026-10-15.txt,
+"Phases and gates"). P3's plan starts from this list.
+
+- Exit sites with recompilation (Decision 27). Region admission's step 3 (its design and record
+  under "Stage records") counted each region bail site. At a threshold the chunk recorded the
+  site's pc in an exit profile that outlives the chunk's code, discarded that code, and recompiled
+  the pc without its speculation, as JSC's ExitProfile and SpiderMonkey's bailout flags do. It
+  worked, and its profile saved about 1.5% of DeltaBlue. The recompiles cost three times that
+  (DeltaBlue +3.46%, Djot +0.96%, RayTrace +0.95% at a threshold of 100), for two reasons the
+  second attempt has to remove:
+  - Regions compile with the baseline, after eight calls, so a record recompiles code that has
+    barely warmed up. The exemplars recompile only hot code: JSC's DFG after 1,000 executions,
+    SpiderMonkey's Ion after 1,500 warm-ups. After an invalidation, Ion's counter drops back to
+    the baseline's 100, so its next compile waits about 1,400 more (jit/Ion.cpp:2630-2645), and
+    JSC doubles its thresholds with each reoptimization (bytecode/CodeBlock.cpp:2737-2770).
+  - Each record moves the call caches' global epoch, so every call site in the program
+    re-resolves. The exemplars reach only the discarded code's callers:
+    - JSC unlinks the jettisoned CodeBlock's incoming calls, which each linked site registered
+      (bytecode/CodeBlock.cpp:2221-2239, 2415-2434). W4's dependency registry is the natural
+      home for that form.
+    - SpiderMonkey's and V8's calls load the callee's current entry on every call, so replacing
+      the code reaches every caller with nothing to clear. SpiderMonkey loads the script's
+      jitCodeRaw (jit/CodeGenerator.cpp:7335), which invalidation resets through
+      updateJitCodeRaw (jit/JitScript.cpp:713, vm/JSScript.cpp:3481-3505). V8 loads the
+      function's dispatch-table entry (src/codegen/arm64/macro-assembler-arm64.cc:2487-2519).
+  These pieces of branch p2-region-s3 (e8208730) carry over:
+  - per-site counters owned by the code, incremented only on the bail path;
+  - the chunk's exit profile;
+  - discarded code kept on the chunk until no activation runs it (a list in the code cache's
+    thread-local registry aborted at thread exit);
+  - a recorded pc lowered without its speculation;
+  - the tests: recorded sites converge, a polymorphic inlined call refuses its region, and an
+    activation discards the code it runs and finishes in it.
+  The fused typed-array access's fallbacks were never counted: counting them called the helper
+  while x14 still held the pointer that the value-miss path reads.
 
 ## Stage records
 
@@ -6506,8 +6547,8 @@ Landed:
   5cbcad6a);
 - step 4c's first part, TailDeep in place (03a57cc4).
 
-Step 3 is measured and parked (above). Against the item's start (fat LTO; Octane at five runs
-with clock.js):
+Step 3 is measured and parked for Phase 3 (above; Decision 27). Against the item's start (fat
+LTO; Octane at five runs with clock.js):
 | | 5d40ee64 | 5cbcad6a | change |
 | --- | --- | --- | --- |
 | Vue | 1,892,196,944 | 1,875,736,106 | -0.87% |
