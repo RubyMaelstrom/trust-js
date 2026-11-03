@@ -5490,6 +5490,25 @@ impl<'a> Element<'a> {
             Element::Entry(property) => property.to_property(),
         }
     }
+    /// What OrdinarySet reads of an own property (ECMA-262 sec-ordinarysetwithowndescriptor),
+    /// owned past the map's borrow: an accessor's setter, or a data property's writability. The
+    /// value, which the store replaces, is not copied out.
+    #[inline]
+    pub(crate) fn set_facts(self) -> SetFacts {
+        if self.accessor() {
+            SetFacts {
+                setter: self.setter().cloned(),
+                accessor: true,
+                writable: false,
+            }
+        } else {
+            SetFacts {
+                setter: None,
+                accessor: false,
+                writable: self.writable(),
+            }
+        }
+    }
     /// The stored entry, for tests of the entries' own representation.
     #[cfg(test)]
     pub(crate) fn as_entry(self) -> PropRef<'a> {
@@ -6925,6 +6944,28 @@ impl<'a> SlotRef<'a> {
     #[inline]
     pub(crate) fn setter(self) -> Option<&'a Value> {
         self.0.accessors().and_then(|pair| pair.set.get())
+    }
+}
+
+/// An own property's facts for OrdinarySet ([`Element::set_facts`]).
+pub(crate) struct SetFacts {
+    setter: Option<Value>,
+    accessor: bool,
+    writable: bool,
+}
+
+impl SetFacts {
+    #[inline]
+    pub(crate) fn accessor(&self) -> bool {
+        self.accessor
+    }
+    #[inline]
+    pub(crate) fn setter(&self) -> Option<&Value> {
+        self.setter.as_ref()
+    }
+    #[inline]
+    pub(crate) fn writable(&self) -> bool {
+        self.writable
     }
 }
 
@@ -9745,8 +9786,11 @@ impl Props {
             .map(move |value| Element::word(value, integrity))
             .chain(
                 self.entries
+                    .keys()
                     .iter()
-                    .filter_map(|(key, property)| key.as_index().map(|_| Element::entry(property))),
+                    .enumerate()
+                    .filter(|(_, key)| key.as_index().is_some())
+                    .map(|(slot, _)| Element::entry(self.entries.prop(slot))),
             )
     }
 

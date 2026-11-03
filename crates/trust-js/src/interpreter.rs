@@ -12269,7 +12269,7 @@ impl Interp {
                         .borrow()
                         .props
                         .get(key)
-                        .map(crate::value::Element::to_property);
+                        .map(crate::value::Element::set_facts);
                     if let Some(p) = prop {
                         if p.accessor() {
                             if let Some(trace) = trace.as_deref_mut() {
@@ -12539,7 +12539,7 @@ impl Interp {
                 .borrow()
                 .props
                 .get(key)
-                .map(crate::value::Element::to_property);
+                .map(crate::value::Element::set_facts);
             if let Some(p) = prop {
                 if p.accessor() {
                     if let Some(trace) = trace.as_deref_mut() {
