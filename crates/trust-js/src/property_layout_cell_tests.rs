@@ -524,3 +524,36 @@ fn maps_agree_with_a_model_from(mut seed: u64) {
         }
     }
 }
+
+/// A template keeps its map outside any cell, every slot in its record, so the record holds
+/// exactly its slots, not a growing record's minimum (W2d step 3).
+#[test]
+fn function_templates_keep_records_of_exactly_their_slots() {
+    let mut engine = crate::Engine::new();
+    engine
+        .eval(
+            "function f(a, b) { return a + b; } var g = () => 0; f(1, 2);",
+            false,
+        )
+        .expect("fixture parses");
+    let env = engine.interp.global_env;
+    for (name, function_slots, prototype_slots) in [("f", 3, Some(1)), ("g", 2, None)] {
+        let value = engine.interp.get_var(name, &env).ok().expect("bound");
+        let ValueView::Obj(closure) = value.view() else {
+            panic!("{name} is a function")
+        };
+        let func = match &closure.borrow().kind {
+            ObjectKind::User(user) => Rc::clone(&user.func),
+            _ => panic!("{name} is a user function"),
+        };
+        let runtime = func.runtime();
+        let maps = runtime.fn_maps.get().expect("made with the closure");
+        assert_eq!(maps.function.entries.len(), function_slots, "{name}");
+        assert_eq!(maps.function.entries.capacity(), function_slots, "{name}");
+        let prototype = maps
+            .prototype
+            .as_ref()
+            .map(|p| (p.entries.len(), p.entries.capacity()));
+        assert_eq!(prototype, prototype_slots.map(|n| (n, n)), "{name}");
+    }
+}

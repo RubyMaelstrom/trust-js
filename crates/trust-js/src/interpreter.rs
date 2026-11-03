@@ -9457,7 +9457,8 @@ impl Interp {
                 .take_while(|p| p.default.is_none() && !p.rest)
                 .count();
             let name = Value::lstr(func.name.clone().unwrap_or_default());
-            let mut p = crate::value::Props::new();
+            // The template keeps its map, so its record holds exactly its slots (W2d step 3).
+            let mut p = crate::value::Props::for_slots(2 + usize::from(has_prototype));
             p.insert(
                 crate::value::fn_key(0), // "length"
                 Property::data(Value::Num(arity as f64), false, false, true),
@@ -9473,8 +9474,9 @@ impl Interp {
                 );
             }
             let pp = if has_prototype {
-                // The largest capacity class, as a prototype holds its methods (W2d step 3).
-                let mut q = crate::value::Props::new_in_class(2);
+                // The largest capacity class, as a prototype holds its methods (W2d step 3);
+                // the template's record holds just its `constructor`.
+                let mut q = crate::value::Props::for_slots_in_class(2, usize::from(!is_generator));
                 // A generator's `.prototype` has no own `constructor` (the methods live on the
                 // intrinsic).
                 if !is_generator {

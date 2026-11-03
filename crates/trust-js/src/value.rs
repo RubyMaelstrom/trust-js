@@ -8583,9 +8583,20 @@ impl Props {
         })
     }
 
-    /// [`Props::new_in_class`] for the class of a map that will hold `slots` slots.
+    /// [`Props::new_in_class`] for the class of a map that will hold `slots` slots, with room
+    /// for exactly them ([`Props::for_slots_in_class`]).
     pub(crate) fn for_slots(slots: usize) -> Props {
-        Self::new_in_class(class_for(slots))
+        Self::for_slots_in_class(class_for(slots), slots)
+    }
+
+    /// An empty map outside any cell, of capacity class `class`, whose record has room for
+    /// exactly `slots` slots (W2d step 3): a map outside a cell keeps every slot in its record,
+    /// and a template keeps its map, which growth would leave with at least
+    /// [`RECORD_MIN_SLOTS`] of them.
+    pub(crate) fn for_slots_in_class(class: u32, slots: usize) -> Props {
+        let mut props = Self::new_in_class(class);
+        props.entries.reserve_exact(slots);
+        props
     }
 
     /// The capacity class of the map's shape (W2d step 3).
