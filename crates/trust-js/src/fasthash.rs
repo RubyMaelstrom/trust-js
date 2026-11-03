@@ -64,3 +64,33 @@ impl Hasher for FxHasher {
 
 pub type FastMap<K, V> = std::collections::HashMap<K, V, BuildHasherDefault<FxHasher>>;
 pub type FastSet<K> = std::collections::HashSet<K, BuildHasherDefault<FxHasher>>;
+
+#[cfg(test)]
+mod tests {
+    use super::FxHasher;
+    use std::hash::Hasher;
+
+    fn hash_usize(key: usize) -> u64 {
+        let mut hasher = FxHasher::default();
+        hasher.write_usize(key);
+        hasher.finish()
+    }
+
+    /// Cell addresses share their alignment's zero low bits (7 for 128-byte cells), which a
+    /// multiplicative product keeps; the low bits a hashbrown table buckets by must still
+    /// spread them. Without the rotation 1024 cells 128 bytes apart reach 8 of 1024 buckets (16
+    /// at 192 bytes); with it, 862 (a random hash reaches about 647).
+    #[test]
+    fn aligned_addresses_spread_over_the_low_bits() {
+        for align in [8_usize, 64, 128, 192, 4096] {
+            let buckets: std::collections::HashSet<u64> = (0..1024)
+                .map(|i| hash_usize(0x7f12_3450_0000 + i * align) & 1023)
+                .collect();
+            assert!(
+                buckets.len() > 400,
+                "{align}-byte strides reach only {} of 1024 buckets",
+                buckets.len()
+            );
+        }
+    }
+}
