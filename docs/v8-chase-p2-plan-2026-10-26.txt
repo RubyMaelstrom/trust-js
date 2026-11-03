@@ -6428,3 +6428,70 @@ a recorded one refuses the region (refusing DeltaBlue's saved 1.69%).
 Tests: each kind fails its guard past the threshold, recompiles without it, and gives the
 interpreter's result. A long-running loop discards the code it is running and finishes in it, and
 later calls run the new code. The cap holds under alternating speculations. All under GC stress.
+
+### Region admission: step 3 measured, not landed (record, 2026-11-03)
+
+Step 3's mechanism, as designed above, is on branch p2-region-s3 (e8208730). It works:
+- Each region bail stub counts its site. Returns and throws are not counted.
+- At the threshold the chunk records the site and discards its resident code, fresh-frame and
+  OSR alike. The discarded code stays with the chunk until nothing runs it, then is swept, and
+  the call caches' epoch moves.
+- The recompile lowers the recorded pcs without their speculation.
+- Its tests pass:
+  - recorded sites converge;
+  - a polymorphic inlined call refuses its region;
+  - an activation discards the code it runs and finishes in it.
+
+Two findings shaped it:
+- Discarded code first went to a list in the code cache's thread-local registry. Dropping it there
+  at thread exit ran JitCode's running-code check against a thread-local already destroyed, which
+  aborted the test binary. The chunk keeps it instead.
+- Counting the fused typed-array access's fallbacks called the helper while x14 still pointed at
+  the name's value, which the value-miss path then reads. RegExp, EarleyBoyer and chai crashed.
+  The fallbacks do not count, so RegExp's fusion misses are not recorded.
+
+The counts say not to land it. Against main 5cbcad6a (fat LTO; Octane at five runs):
+| | T=10 | T=100 |
+| --- | --- | --- |
+| Vue | +0.05% | +0.05% |
+| React | +0.21% | +0.21% |
+| Djot | +1.27% | +0.96% |
+| chai | +0.38% | +0.26% |
+| Richards | +0.06% | +0.06% |
+| DeltaBlue | +3.72% | +3.46% |
+| Crypto | +0.26% | -0.11% |
+| RayTrace | +1.05% | +0.95% |
+| EarleyBoyer | +0.40% | +0.39% |
+| RegExp | +0.11% | +0.11% |
+| Splay | -0.13% | -0.13% |
+| NavierStokes | +0.02% | +0.02% |
+| PdfJS | +0.61% | +0.37% |
+| Mandreel | +0.06% | +0.06% |
+| Gameboy | +1.16% | +0.51% |
+| CodeLoad | +0.08% | +0.08% |
+| Box2D | +0.84% | +0.19% |
+| zlib | -0.29% | -0.29% |
+| TypeScript | +0.08% | -0.05% |
+
+Three variants of e8208730 separate the costs (one run each):
+| | DeltaBlue | RayTrace | Djot |
+| --- | --- | --- | --- |
+| counting only (never records) | +0.24% | +0.06% | +0.20% |
+| records and recompiles, profile ignored | +4.94% | +1.07% | +0.81% |
+| all of it, T=100 | +3.46% | +0.95% | +0.96% |
+
+The profile does what the census promised: about 1.5% of DeltaBlue, in the region its inline
+guard refuses. The recompiles cost three times that. DeltaBlue compiles 99 times instead of 89.
+Each record moves the call caches' epoch, which every call site in the program then pays for by
+re-resolving. The epoch must move: a cache that kept calling discarded code would call freed
+code once the chunk swept it.
+
+The exemplars recompile code that is already hot. JSC's DFG enters at 1,000 executions and
+SpiderMonkey's Ion at 1,500 warm-ups. Their invalidation reaches only the jettisoned code's
+callers. Here regions compile with the baseline, after eight calls, and the only invalidation
+there is reaches every call site. What would make step 3 pay is invalidating per callee, or
+recording only sites whose function stays hot after the record; both are designs of their own.
+
+The lib tests that would need changing if it landed check native residency, call-cache epochs or
+one activation record a level right after a site recorded and discarded the code
+(traced_tests' assert_native, the math intrinsics' epoch test, rooting_tests' census).
