@@ -106,7 +106,7 @@ fn dense_shift_storage_drains_words_without_losing_views() {
                 assert!(props
                     .try_append_element(0, Property::plain(Value::Num(42.0)))
                     .is_ok());
-                props.get_mut("length").unwrap().set_value(Value::Num(1.0));
+                assert!(props.update_property("length", |p| p.set_value(Value::Num(1.0))));
                 assert_eq!(number(props.shift_dense_array(1, false).unwrap()), 42.0);
             }
         }
@@ -118,7 +118,7 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
     // Element words hold plain elements only: an attribute change moves the element to the
     // named entries, and the storage path then refuses, leaving the generic algorithm to run.
     let mut words = numbers(3, true, false, true);
-    words.get_mut("0").unwrap().set_configurable(false);
+    assert!(words.update_property("0", |p| p.set_configurable(false)));
     assert!(words.has_far());
     assert!(words.shift_dense_array(3, false).is_none());
     assert_eq!(words.get("0").unwrap().number_value(), Some(0.0));
@@ -126,12 +126,12 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
     // Elements kept in the named entries (out of order, with their own attributes) refuse
     // too, changing nothing.
     let mut props = numbers(3, false, true, true);
-    props.get_mut("0").unwrap().set_configurable(false);
-    props.get_mut("2").unwrap().set_writable(false);
-    let zero_flags = props.get("0").unwrap().as_entry().meta;
+    assert!(props.update_property("0", |p| p.set_configurable(false)));
+    assert!(props.update_property("2", |p| p.set_writable(false)));
+    let zero_flags = props.get("0").unwrap().as_entry().attrs();
     let shape = props.shape();
     assert!(props.shift_dense_array(3, false).is_none());
-    assert_eq!(props.get("0").unwrap().as_entry().meta, zero_flags);
+    assert_eq!(props.get("0").unwrap().as_entry().attrs(), zero_flags);
     assert_eq!(props.get("0").unwrap().number_value(), Some(0.0));
     assert_eq!(props.get("2").unwrap().number_value(), Some(2.0));
     assert_eq!(props.shape(), shape);
@@ -149,10 +149,10 @@ fn dense_shift_storage_preserves_out_of_order_slots_and_destination_attributes()
 fn dense_shift_storage_rejections_are_atomic() {
     let edits: [fn(&mut Props); 10] = [
         |p| {
-            p.get_mut("0").unwrap().set_writable(false);
+            assert!(p.update_property("0", |p| p.set_writable(false)));
         },
         |p| {
-            p.get_mut("2").unwrap().set_configurable(false);
+            assert!(p.update_property("2", |p| p.set_configurable(false)));
         },
         |p| {
             p.remove("1");
@@ -164,10 +164,10 @@ fn dense_shift_storage_rejections_are_atomic() {
             p.insert("1", Property::plain(Value::Empty));
         },
         |p| {
-            p.get_mut("length").unwrap().set_writable(false);
+            assert!(p.update_property("length", |p| p.set_writable(false)));
         },
         |p| {
-            p.get_mut("length").unwrap().set_value(Value::Num(4.0));
+            assert!(p.update_property("length", |p| p.set_value(Value::Num(4.0))));
         },
         |p| {
             p.set_has_far(true);

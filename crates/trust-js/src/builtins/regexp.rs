@@ -441,7 +441,7 @@ pub(super) fn slot_last_index(i: &Interp, object: &Gc) -> Option<f64> {
     plain_number(body.props.property_at(LAST_INDEX_SLOT)?)
 }
 
-fn plain_number(last: &Property) -> Option<f64> {
+fn plain_number(last: crate::value::PropRef<'_>) -> Option<f64> {
     if !last.writable() {
         return None;
     }

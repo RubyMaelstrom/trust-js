@@ -83,7 +83,7 @@ fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
         }
         for n in (0..4096).step_by(5) {
             assert!(props.remove(&n.to_string()));
-            assert!(props.get_mut(&n.to_string()).is_none());
+            assert!(!props.update_property(&n.to_string(), |_| {}));
             assert!(props.slot_of(&n.to_string()).is_none());
             assert!(!props.remove(&n.to_string()));
         }
@@ -117,7 +117,7 @@ fn dense_slot_mutation_removal_and_reinsertion_keep_sidecar_consistent() {
         );
         assert_eq!(number(props.get("named")), -1.0);
         props.remove_indices_from(100);
-        assert!(props.get_mut("100").is_none());
+        assert!(!props.update_property("100", |_| {}));
         props.insert("101", Property::plain(Value::Num(101.0)));
         assert_eq!(number(props.get_index(101)), 101.0);
     }

@@ -118,7 +118,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
     }
     let holes = slots.saturating_sub(elements.min(slots));
     let length = (family == 0)
-        .then(|| p.length_property().and_then(Property::number_value))
+        .then(|| p.length_property().and_then(super::PropRef::number_value))
         .flatten();
     let far = p.has_far();
     let plain = !nonplain && !far;
@@ -140,7 +140,7 @@ fn record(families: &mut [Family; 3], object: &Object) {
     // Bytes by allocated size (small-cell classes; a large block counts its own bytes).
     let mut b = [0u64; PARTS.len()];
     b[0] = class_bytes(std::mem::size_of::<RefCell<Object>>());
-    let index = p.elems.index();
+    let index = p.entries.index();
     let mut capacity = 0usize;
     if let Some(words) = words {
         // The word block: its header, front room, capacity and remembered record (its dirty
@@ -153,8 +153,8 @@ fn record(families: &mut [Family; 3], object: &Object) {
     if let Some(index) = index {
         b[7] = class_bytes(std::mem::size_of::<KeyIndex>()) + class_bytes(index.bytes());
     }
-    if p.entries.fields.spilled() {
-        b[8] = class_bytes(p.entries.fields.capacity() * std::mem::size_of::<Property>());
+    if p.entries.heap_capacity() > 0 {
+        b[8] = class_bytes(super::RECORD_SLOTS_OFF + p.entries.heap_capacity() * 8);
     }
     if let Some(layout) = p.entries.layout.as_ref().filter(|l| !l.is_shared()) {
         b[9] = class_bytes(std::mem::size_of::<PropertyLayoutData>())

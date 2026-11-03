@@ -1103,12 +1103,18 @@ impl Visitor {
         for (key, _) in object.internal_slots().iter() {
             self.rc_str(key);
         }
-        for property in object
-            .props
-            .iter()
-            .map(|(_, property)| property)
-            .chain(object.internal_slots().values())
-        {
+        // A named property's slot and an internal slot's property hold the same edges; neither
+        // read materializes a deferred prototype.
+        for (_, property) in object.props.iter() {
+            property.visit_retained_value(self);
+            if let Some(getter) = property.getter() {
+                self.value(getter);
+            }
+            if let Some(setter) = property.setter() {
+                self.value(setter);
+            }
+        }
+        for property in object.internal_slots().values() {
             property.visit_retained_value(self);
             if let Some(getter) = property.getter() {
                 self.value(getter);

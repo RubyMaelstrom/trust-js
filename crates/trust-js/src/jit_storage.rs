@@ -160,19 +160,20 @@ pub(super) fn fields_data(a: &mut asm::Asm, layout: &crate::value::JitLayout, ds
     vec_data(a, layout.repr.props_fields, dst, obj, fields_off(layout));
 }
 
-/// Whether [`fields_len`] and [`fields_set_len`] can address an Object's count.
+/// Whether [`fields_len`] and [`fields_set_len`] can address an Object's count. Never while the
+/// named fields' probe failed (`JitRepr::valid`).
 pub(super) fn fields_len_fits(layout: &crate::value::JitLayout) -> bool {
-    vec_len_fits(layout.repr.props_fields, fields_off(layout))
+    layout.repr.valid && vec_len_fits(layout.repr.props_fields, fields_off(layout))
 }
 
 /// Whether [`fields_capacity`] can address an Object's capacity.
 pub(super) fn fields_capacity_fits(layout: &crate::value::JitLayout) -> bool {
-    vec_capacity_fits(layout.repr.props_fields, fields_off(layout))
+    layout.repr.valid && vec_capacity_fits(layout.repr.props_fields, fields_off(layout))
 }
 
 /// Whether [`fields_data`] can address an Object's field storage.
 pub(super) fn fields_data_fits(layout: &crate::value::JitLayout) -> bool {
-    vec_data_fits(layout.repr.props_fields, fields_off(layout))
+    layout.repr.valid && vec_data_fits(layout.repr.props_fields, fields_off(layout))
 }
 
 // ---------------------------------------------------------------------------------------------

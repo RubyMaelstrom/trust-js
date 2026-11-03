@@ -10683,9 +10683,7 @@ mod direct_call_tests {
             holder
                 .borrow_mut()
                 .props
-                .get_mut(&key.text())
-                .unwrap()
-                .set_value(Value::Num(31.0));
+                .update_property(&key.text(), |p| p.set_value(Value::Num(31.0)));
             // Same string contents at a different allocation must miss the identity probe.
             let fresh = crate::lstr::LStr::from(&*key.text());
             let mut operands = [(receiver), (Value::Str(fresh))];

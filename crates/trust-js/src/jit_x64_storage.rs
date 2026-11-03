@@ -101,12 +101,12 @@ pub(super) fn fields_data(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8) {
 
 /// Whether [`fields_len`] can address an Object's count.
 pub(super) fn fields_len_fits(layout: &JitLayout) -> bool {
-    vec_len_fits(layout.repr.props_fields, fields_off(layout))
+    layout.repr.valid && vec_len_fits(layout.repr.props_fields, fields_off(layout))
 }
 
 /// Whether [`fields_data`] can address an Object's field storage.
 pub(super) fn fields_data_fits(layout: &JitLayout) -> bool {
-    vec_data_fits(layout.repr.props_fields, fields_off(layout))
+    layout.repr.valid && vec_data_fits(layout.repr.props_fields, fields_off(layout))
 }
 
 // ---------------------------------------------------------------------------------------------

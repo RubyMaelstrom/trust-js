@@ -312,6 +312,9 @@ pub(crate) const PACK_STR: u64 = 0x7ffe_0000_0000_0000;
 pub(crate) const PACK_SYM: u64 = 0x7fff_0000_0000_0000;
 pub(crate) const PACK_OBJ: u64 = 0xfff9_0000_0000_0000;
 pub(crate) const PACK_LAZY_PROTO: u64 = 0xfffa_0000_0000_0000;
+/// An accessor property's slot word (W2d step 2): its pair cell's address ([`Accessors`]), or
+/// 0 for an accessor with neither function. Property-only, as a deferred prototype's word is.
+pub(crate) const PACK_ACCESSOR: u64 = 0xfffb_0000_0000_0000;
 pub(crate) const PACK_CANON_NAN: u64 = 0x7ff8_0000_0000_0000;
 
 #[path = "lazy_function_prototype.rs"]
@@ -456,6 +459,74 @@ impl PropWord {
         self.0.get()
     }
 
+    /// `owner`'s deferred MakeConstructor prototype: a lazy word naming a new [`LazyProto`], a
+    /// cell in the active heap (which is `owner`'s).
+    fn deferred_prototype(owner: &Gc, parent: Gc, template: &Props) -> Self {
+        let lazy = LazyFunctionPrototype::new(owner, parent, template);
+        let lazy: LazyProto = crate::gc_box::new(lazy);
+        Self(
+            Cell::new(PACK_LAZY_PROTO | unsafe { Value::into_word(lazy) }),
+            std::marker::PhantomData,
+        )
+    }
+
+    /// An accessor's word: its pair cell at `cell` (0 for none).
+    #[inline]
+    fn accessor(cell: usize) -> Self {
+        debug_assert_eq!(cell as u64 & !PACK_PAYLOAD, 0);
+        Self(
+            Cell::new(PACK_ACCESSOR | cell as u64),
+            std::marker::PhantomData,
+        )
+    }
+
+    #[inline]
+    fn is_accessor(&self) -> bool {
+        self.tag() == PACK_ACCESSOR
+    }
+
+    /// An accessor's pair cell, as its holder reports it.
+    #[inline]
+    fn accessor_cell_word(&self) -> Option<u64> {
+        let cell = self.0.get() & PACK_PAYLOAD;
+        (self.is_accessor() && cell != 0).then_some(cell)
+    }
+
+    /// An accessor's pair.
+    #[inline]
+    fn accessors(&self) -> Option<&Accessors> {
+        // SAFETY: a word that names a pair keeps its cell alive (its holder traces it).
+        self.accessor_cell_word()
+            .map(|cell| unsafe { &*(cell as usize as *const Accessors) })
+    }
+
+    /// Write a data value over the word.
+    #[inline]
+    fn set_value(&self, value: Value) {
+        debug_assert_ne!(value.tag(), PACK_LAZY_PROTO);
+        self.0.set(value.0);
+    }
+
+    /// The word's value, which a new value replaces (a deferred prototype is materialized).
+    #[inline]
+    fn replace_value(&self, value: Value) -> Value {
+        let old = self.materialize();
+        self.set_value(value);
+        old
+    }
+
+    /// The bytes this word owns outside its cell: an accessor's pair, or a deferred prototype's
+    /// payload (see [`Property::retained_requested_storage_bytes`]).
+    fn retained_requested_storage_bytes(&self) -> usize {
+        if self.accessor_cell_word().is_some() {
+            std::mem::size_of::<Accessors>()
+        } else if self.tag() == PACK_LAZY_PROTO {
+            std::mem::size_of::<LazyFunctionPrototype>()
+        } else {
+            0
+        }
+    }
+
     #[inline]
     fn materialize(&self) -> Value {
         if self.tag() == PACK_LAZY_PROTO {
@@ -487,20 +558,36 @@ impl PropWord {
 
     #[inline]
     fn number(&self) -> Option<f64> {
-        if self.tag() == PACK_LAZY_PROTO {
+        if matches!(self.tag(), PACK_LAZY_PROTO | PACK_ACCESSOR) {
             return None;
         }
-        // SAFETY: a non-deferred property contains an execution word.
+        // SAFETY: a property word with neither property-only tag is an execution word.
         unsafe { Value::from_bits(self.0.get()) }.number()
     }
 
     #[inline]
     fn trace_gc_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        if self.tag() == PACK_LAZY_PROTO {
-            sink.word(self.0.get() & PACK_PAYLOAD);
-        } else {
-            // SAFETY: the property-only tag was handled separately above.
-            sink.value(&unsafe { Value::from_bits(self.0.get()) });
+        match self.tag() {
+            PACK_LAZY_PROTO => sink.word(self.0.get() & PACK_PAYLOAD),
+            PACK_ACCESSOR => self.trace_accessor_edges(sink),
+            // SAFETY: the property-only tags were handled separately above.
+            _ => sink.value(&unsafe { Value::from_bits(self.0.get()) }),
+        }
+    }
+
+    /// An accessor's pair: its cell, and its functions, which its trace reports again.
+    #[inline(never)]
+    fn trace_accessor_edges<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        let Some(cell) = self.accessor_cell_word() else {
+            return;
+        };
+        sink.word(cell);
+        let pair = self.accessors().expect("a pair cell");
+        if let Some(getter) = pair.get.get() {
+            sink.value(getter);
+        }
+        if let Some(setter) = pair.set.get() {
+            sink.value(setter);
         }
     }
 }
@@ -836,15 +923,15 @@ mod packed_value_tests {
         let object_handle = function.as_obj().unwrap();
         let object = object_handle.borrow();
         let prototype = object.props.get_named("prototype").unwrap();
-        assert_eq!(prototype.packed.tag(), PACK_LAZY_PROTO);
-        let bits = prototype.packed.bits();
+        assert_eq!(prototype.word().tag(), PACK_LAZY_PROTO);
+        let bits = prototype.word().bits();
         for _ in 0..20 {
             assert!(!prototype.is_empty());
             assert!(prototype.number_value().is_none());
         }
-        assert_eq!(prototype.packed.bits(), bits);
+        assert_eq!(prototype.word().bits(), bits);
         assert!(matches!((prototype.value()).view(), ValueView::Obj(_)));
-        assert_eq!(prototype.packed.tag(), PACK_OBJ);
+        assert_eq!(prototype.word().tag(), PACK_OBJ);
         let mut property = Property::plain(Value::Num(3.0));
         assert_eq!(property.number_value(), Some(3.0));
         property.set_accessor(true);
@@ -1514,9 +1601,10 @@ pub(crate) fn jit_repr() -> &'static JitRepr {
 }
 
 fn probe_jit_repr() -> JitRepr {
-    // Named fields: an InlineVec keeping the first INLINE_NAMED_SLOTS in the cell, probed in
-    // place and spilled.
-    let props_fields = Fields::probe_jit_layout(|| Property::plain(Value::Num(0.0)));
+    // Named fields (W2d step 2): one word each, INLINE_NAMED_SLOTS in the cell and the rest in
+    // the record. Generated code does not read them yet: every named-field template fails
+    // closed until its emitters address the new slots.
+    let props_fields: Option<JitVecLayout> = None;
 
     JitRepr {
         props_fields: props_fields.unwrap_or(JitVecLayout::Vec {
@@ -1611,24 +1699,17 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         && shape_layout_entry_size == 16
         && shape_layout_entry_id == 0
         && shape_layout_entry_keys == 8;
-    // DenseStorage's first word is deliberately a nullable pointer to the map's own key index
-    // (the creation template reads it as "this map keeps a key index"). Verify the niche rather
-    // than relying on it silently if a future compiler changes the representation.
-    let thin_some = DenseStorage(
-        Some(crate::gc_storage::StorageBox::new(KeyIndex::of(&[]))),
-        None,
-        word_block::Words::new(),
-    );
-    let thin_word = unsafe { *(&thin_some as *const DenseStorage as *const usize) };
-    let thin_expected = thin_some.0.as_deref().unwrap() as *const KeyIndex as usize;
-    let thin_none = DenseStorage(None, None, word_block::Words::new());
-    let thin_none_word = unsafe { *(&thin_none as *const DenseStorage as *const usize) };
-    let thin_vec_ok = thin_word == thin_expected && thin_none_word == 0;
+    // The named entries' record is a nullable pointer (the creation template reads it as "this
+    // map keeps a record"). Verify the niche rather than relying on it silently.
+    let thin_vec_ok = std::mem::size_of::<Record>() == std::mem::size_of::<usize>() && {
+        let none = Record::default();
+        unsafe { *(&none as *const Record as *const usize) == 0 }
+    };
     // The element words: the pointer at `props_words` is the first word's address, with the
     // header just before it.
     let header_bytes = std::mem::size_of::<word_block::WordHeader>();
     let words_at = |field: usize| header_bytes - field;
-    let props_words = offset_of!(Props, elems) + offset_of!(DenseStorage, 2);
+    let props_words = offset_of!(Props, elems) + offset_of!(DenseStorage, 0);
     let (words_used, words_capacity, words_shifted, words_flags) = (
         words_at(offset_of!(word_block::WordHeader, used)),
         words_at(offset_of!(word_block::WordHeader, capacity)),
@@ -1842,28 +1923,30 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         ),
         obj_props: offset_of!(Object, props),
         obj_flags: offset_of!(Object, props) + offset_of!(Props, flags),
-        props_shape: offset_of!(Props, shape),
-        props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, fields),
+        props_shape: offset_of!(Props, entries) + offset_of!(NamedEntries, shape),
+        props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, inline),
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
         layout_keys_len,
         layout_keys_ptr,
         shape_layout_entry_size,
         shape_layout_entry_id,
         shape_layout_entry_keys,
-        props_elems: offset_of!(Props, elems),
+        props_elems: offset_of!(Props, entries) + offset_of!(NamedEntries, record),
         props_words,
         words_used,
         words_capacity,
         words_shifted,
         words_flags,
-        entry_size: std::mem::size_of::<Property>(),
+        // One word per slot, no descriptor word beside it: the templates that read a slot's
+        // flags fail closed on these (W2d step 2) until their emitters change.
+        entry_size: std::mem::size_of::<PropWord>(),
         str_len_word,
         str_ptr_word,
         str_data_off,
         key_probe_ok,
-        entry_value: offset_of!(Property, packed),
-        entry_accessor: offset_of!(Property, meta),
-        entry_writable: offset_of!(Property, meta),
+        entry_value: 0,
+        entry_accessor: 0,
+        entry_writable: 0,
         property_size: std::mem::size_of::<Property>(),
         property_value: offset_of!(Property, packed),
         property_meta: offset_of!(Property, meta),
@@ -2628,18 +2711,17 @@ impl Object {
     /// ECMAScript properties. Author strings, reflection, proxies and integrity levels cannot
     /// address this map (ECMA-262 6.1.7.2). Ordinary objects retain their compact body layout.
     pub(crate) fn internal_slots(&self) -> &InternalSlots {
-        self.props.elems.internal_slots()
+        self.props.entries.internal_slots()
     }
 
     pub(crate) fn internal_slots_mut(&mut self) -> &mut InternalSlots {
-        &mut self.props.elems.extras_mut().internal_slots
+        &mut self.props.entries.extras_mut().internal_slots
     }
 
     fn take_internal_slots(&mut self) -> InternalSlots {
         self.props
-            .elems
-            .1
-            .as_deref_mut()
+            .entries
+            .extras_if_any_mut()
             .map_or_else(InternalSlots::default, |extras| {
                 std::mem::take(&mut extras.internal_slots)
             })
@@ -2657,13 +2739,13 @@ impl Object {
             properties.flags.get() & !OBJECT_FLAGS | self.props.flags.get() & OBJECT_FLAGS | proto,
         );
         let slots = self.take_internal_slots();
-        if let Some(extras) = properties.elems.1.as_deref_mut() {
+        if let Some(extras) = properties.entries.extras_if_any_mut() {
             extras.internal_slots = slots;
         } else if slots.entries.is_some() {
-            properties.elems.extras_mut().internal_slots = slots;
+            properties.entries.extras_mut().internal_slots = slots;
         }
         // The words' remembered record described their old owner's marks.
-        properties.elems.2.force_full();
+        properties.elems.0.force_full();
         self.props = properties;
     }
 
@@ -2702,7 +2784,7 @@ impl Object {
     #[cfg_attr(feature = "architecture-diagnostics", track_caller)]
     pub(crate) fn new_with_parts(proto: Option<Gc>, props: Props, kind: ObjectKind) -> Gc {
         // Moving a property payload to a new receiver cannot inherit the old owner's proof.
-        props.elems.2.force_full();
+        props.elems.0.force_full();
         // Nor its flags: a new object is extensible and ordinary, with the map's own bits.
         props
             .flags
@@ -3623,7 +3705,7 @@ fn mark_object<S: crate::gc_trace::TraceSink + ?Sized>(
     object.trace_gc_fields(sink, Some(purpose));
     // Commit only after ALL element and non-element edges were reported. A panic leaves the
     // words' obligations intact; writes between phases are recorded afterwards.
-    object.props.elems.2.finish_mark_trace();
+    object.props.elems.0.finish_mark_trace();
 }
 
 /// Strong edges of an environment record.
@@ -3719,14 +3801,10 @@ impl Object {
         props.trace_storage(sink);
         // The element words' edges, in every trace (the block itself is in trace_storage); a
         // marker's remembered trace reports only those written since its last mark.
-        props.elems.2.trace_values(purpose, sink);
+        props.elems.0.trace_values(purpose, sink);
         // Named properties and every non-element edge are ALWAYS complete.
-        for property in props
-            .entries
-            .fields
-            .iter()
-            .chain(self.internal_slots().values())
-        {
+        props.entries.trace_slots(sink);
+        for property in self.internal_slots().values() {
             property.trace_edges(sink);
         }
         if let Some(layout) = &props.entries.layout {
@@ -3810,30 +3888,26 @@ impl crate::gc_trace::GcTrace for Props {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         self.trace_storage(sink);
         crate::gc_trace::GcTrace::trace_gc(&self.entries.layout, sink);
-        self.elems.2.trace_values(None, sink);
-        for property in self.entries.fields.iter() {
-            crate::gc_trace::GcTrace::trace_gc(property, sink);
-        }
+        self.elems.0.trace_values(None, sink);
+        self.entries.trace_slots(sink);
         self.trace_symbol_keys(sink);
     }
 }
 
 impl Props {
     /// Report the storage blocks this map's payloads live in (`gc_storage`): the named
-    /// properties' spill, the element words and the key index. Every trace of the map's
-    /// owner reports them, since nothing else keeps them alive.
+    /// properties' record (with the key index and the extras) and the element words. Every
+    /// trace of the map's owner reports them, since nothing else keeps them alive.
     #[inline]
     pub(crate) fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        if let Some(spill) = self.entries.fields.spill_ptr() {
-            crate::gc_storage::trace_block(spill, sink);
-        }
+        self.entries.trace_storage(sink);
         self.elems.trace_storage(sink);
     }
 
     /// The Symbols of Symbol-valued keys, which the encoded keys only name by id.
     #[inline]
     pub(crate) fn trace_symbol_keys<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        if let Some(symbols) = self.elems.symbols() {
+        if let Some(symbols) = self.entries.symbols() {
             for symbol in symbols.values() {
                 sink.word(symbol_identity(symbol) as u64);
             }
@@ -4014,11 +4088,9 @@ pub(crate) mod layout_census {
         let counts = &POPULATIONS[population];
         counts.named[family][bucket].fetch_add(1, Relaxed);
         counts.named_total[family].fetch_add(named as u64, Relaxed);
-        counts.named_capacity[family]
-            .fetch_add(object.props.entries.fields.capacity() as u64, Relaxed);
-        // The map's first word: its own key index since W2c step 3 removed the sidecar around
-        // it (the column keeps its name).
-        if object.props.elems.0.is_some() {
+        counts.named_capacity[family].fetch_add(object.props.entries.capacity() as u64, Relaxed);
+        // The map's own key index, in its record since W2d step 2 (the column keeps its name).
+        if object.props.entries.index().is_some() {
             counts.sidecars[family].fetch_add(1, Relaxed);
         }
     }
@@ -4103,7 +4175,8 @@ pub(crate) mod layout_census {
 // S3: the header and its inline named slots fit in the 192 B size class (184 B after S4 narrowed
 // the slots' header, 176 B after S6 dropped two unused fields); growing either past it moves
 // every object into the 256 B class.
-const _: () = assert!(std::mem::size_of::<RefCell<Object>>() <= 192);
+// W2d step 2: the 72-byte header and seven one-word slots fill a 128-byte cell.
+const _: () = assert!(std::mem::size_of::<RefCell<Object>>() == 128);
 
 /// A fresh cell for one object in `heap` (see `Gc::new_in`).
 pub(crate) fn alloc_object_cell(heap: &GcState) -> *mut RefCell<Object> {
@@ -5364,12 +5437,12 @@ pub(crate) enum Element<'a> {
     /// A word of a frozen block ([`word_block::KIND_FROZEN`]): enumerable, non-writable,
     /// non-configurable.
     FrozenWord(Value),
-    Entry(&'a Property),
+    Entry(PropRef<'a>),
 }
 
 impl<'a> Element<'a> {
     #[inline]
-    pub(crate) fn entry(property: &'a Property) -> Self {
+    pub(crate) fn entry(property: PropRef<'a>) -> Self {
         Element::Entry(property)
     }
     /// The element of a word in a block with the integrity bits `integrity`
@@ -5401,12 +5474,12 @@ impl<'a> Element<'a> {
             Element::Word(value) => Property::plain(value),
             Element::SealedWord(value) => Property::data(value, true, true, false),
             Element::FrozenWord(value) => Property::data(value, false, true, false),
-            Element::Entry(property) => property.clone(),
+            Element::Entry(property) => property.to_property(),
         }
     }
     /// The stored entry, for tests of the entries' own representation.
     #[cfg(test)]
-    pub(crate) fn as_entry(self) -> &'a Property {
+    pub(crate) fn as_entry(self) -> PropRef<'a> {
         match self {
             Element::Entry(property) => property,
             _ => panic!("a word element has no entry"),
@@ -5714,6 +5787,23 @@ impl Property {
     pub(crate) fn into_value(mut self) -> Value {
         self.take_value()
     }
+    /// A data property read in place, as a map's slot would lend it (tests).
+    #[cfg(test)]
+    pub(crate) fn data_ref_for_test(&self) -> PropRef<'_> {
+        assert!(!self.accessor(), "a data property");
+        PropRef::new(&self.packed, self.attrs())
+    }
+    /// The slot word and attributes this property is stored as (W2d step 2): a data property's
+    /// value, or an accessor's pair cell under [`PACK_ACCESSOR`].
+    #[inline]
+    fn into_slot(self) -> (PropWord, u8) {
+        let attrs = self.attrs();
+        if self.accessor() {
+            (PropWord::accessor(self.meta & !PROP_FLAG_MASK), attrs)
+        } else {
+            (self.packed, attrs)
+        }
+    }
     #[inline]
     pub(crate) fn value(&self) -> Value {
         self.packed.materialize()
@@ -5751,12 +5841,7 @@ impl Property {
     /// Make this property's value `owner`'s deferred MakeConstructor prototype: a lazy word
     /// naming a new [`LazyProto`], a cell in the active heap (which is `owner`'s).
     pub(crate) fn defer_function_prototype(&mut self, owner: &Gc, parent: Gc, template: &Props) {
-        let lazy = LazyFunctionPrototype::new(owner, parent, template);
-        let lazy: LazyProto = crate::gc_box::new(lazy);
-        self.packed = PropWord(
-            Cell::new(PACK_LAZY_PROTO | unsafe { Value::into_word(lazy) }),
-            std::marker::PhantomData,
-        );
+        self.packed = PropWord::deferred_prototype(owner, parent, template);
     }
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
@@ -6013,35 +6098,10 @@ static EMPTY_INTERNAL_SLOTS: EmptyInternalSlots = EmptyInternalSlots(InternalSlo
     charge: ExternalCharge::new(),
 });
 
-/// A property map's own key index (its first word, the nullable pointer the JIT's creation
-/// template reads), its Rust-heap extras, and its element words (W2c; the static empty block
-/// until it has elements).
-#[derive(Default)]
-#[repr(C)]
-struct DenseStorage(
-    Option<crate::gc_storage::StorageBox<KeyIndex>>,
-    Option<crate::gc_storage::PayloadBox<DenseExtras>>,
-    word_block::Words,
-);
-
-impl Clone for DenseStorage {
-    /// Most maps a template or literal clones keep none of the three: that copy is a few loads,
-    /// in line.
-    #[inline]
-    fn clone(&self) -> Self {
-        if self.0.is_none() && self.1.is_none() && self.2.is_empty() {
-            return DenseStorage::default();
-        }
-        self.clone_parts()
-    }
-}
-
-impl DenseStorage {
-    #[inline(never)]
-    fn clone_parts(&self) -> Self {
-        DenseStorage(self.0.clone(), self.1.clone(), self.2.clone())
-    }
-}
+/// A property map's element words (W2c; the static empty block until it has elements).
+#[derive(Default, Clone)]
+#[repr(transparent)]
+struct DenseStorage(word_block::Words);
 
 /// Whether no used word is a hole: the kind bit, else a scan (a cleared bit is not proof of a
 /// hole).
@@ -6051,48 +6111,94 @@ fn words_have_no_holes(words: &word_block::Words) -> bool {
 }
 
 impl DenseStorage {
+    /// Report the element block (see [`Props::trace_storage`]).
+    #[inline]
+    fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        if let Some(block) = self.0.block_start() {
+            crate::gc_storage::trace_block(block, sink);
+        }
+    }
+    /// The element words, while the map keeps its elements as words.
+    #[inline]
+    fn words(&self) -> Option<&word_block::Words> {
+        (!self.0.is_static_empty()).then_some(&self.0)
+    }
+    #[inline]
+    fn words_mut(&mut self) -> Option<&mut word_block::Words> {
+        (!self.0.is_static_empty()).then_some(&mut self.0)
+    }
+    /// The words, the static empty block included, for a map that starts keeping them.
+    #[inline]
+    fn words_start(&mut self) -> &mut word_block::Words {
+        &mut self.0
+    }
+    #[inline]
+    fn has_words(&self) -> bool {
+        !self.0.is_static_empty()
+    }
+    /// Stop keeping element words.
+    fn clear_words(&mut self) {
+        self.0 = word_block::Words::new();
+    }
+    #[cfg(test)]
+    fn clear(&mut self) {
+        self.0 = word_block::Words::new();
+    }
+}
+
+/// The record's key index and Rust-heap extras (W2d step 2: they moved out of the map's header
+/// into its out-of-line record, made on first need).
+impl NamedEntries {
     #[inline]
     fn extras_mut(&mut self) -> &mut DenseExtras {
-        self.1.get_or_insert_with(Default::default)
+        self.record
+            .ensure()
+            .extras
+            .get_or_insert_with(Default::default)
     }
 
     /// The map's own index, when it keeps one (`Props::build_index`).
     #[inline]
     fn index(&self) -> Option<&KeyIndex> {
-        self.0.as_deref()
+        self.record.index()
+    }
+
+    #[inline]
+    fn index_mut(&mut self) -> Option<&mut KeyIndex> {
+        self.record.index_mut()
+    }
+
+    fn set_index(&mut self, index: Option<KeyIndex>) {
+        match index {
+            Some(index) => {
+                self.record.ensure().index = Some(crate::gc_storage::StorageBox::new(index));
+            }
+            None => {
+                if let Some(header) = self.record.header_mut() {
+                    header.index = None;
+                }
+            }
+        }
     }
 
     /// The Symbols of the map's Symbol-valued keys, if it has any.
     #[inline]
     fn symbols(&self) -> Option<&crate::fasthash::FastMap<u64, SymbolRef>> {
-        self.1.as_deref()?.symbols.as_deref()
+        self.record.extras()?.symbols.as_deref()
     }
 
     /// The map's internal slots (empty while it has none).
     #[inline]
     fn internal_slots(&self) -> &InternalSlots {
-        self.1
-            .as_deref()
+        self.record
+            .extras()
             .map_or(&EMPTY_INTERNAL_SLOTS.0, |extras| &extras.internal_slots)
     }
 
-    /// Report the map's blocks: the extras, the element words and the key index with its
-    /// slots (see [`Props::trace_storage`]).
+    /// The internal slots, if the map has extras, to take them out.
     #[inline]
-    fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
-        use crate::gc_storage::{trace_block, StorageBox};
-        if let Some(extras) = &self.1 {
-            crate::gc_storage::PayloadBox::trace(extras, sink);
-        }
-        if let Some(block) = self.2.block_start() {
-            trace_block(block, sink);
-        }
-        if let Some(index) = &self.0 {
-            StorageBox::trace(index, sink);
-            if let Some(block) = index.slots.spill_ptr() {
-                trace_block(block, sink);
-            }
-        }
+    fn extras_if_any_mut(&mut self) -> Option<&mut DenseExtras> {
+        self.record.extras_box_mut().map(|extras| &mut **extras)
     }
 
     fn retain_symbol_key(&mut self, key: PropKey) {
@@ -6113,50 +6219,36 @@ impl DenseStorage {
         let Some(id) = key.symbol_id() else {
             return;
         };
-        if let Some(extras) = self.1.as_deref_mut() {
+        if let Some(extras) = self.extras_if_any_mut() {
             if let Some(symbols) = extras.symbols.as_deref_mut() {
                 symbols.remove(&id);
             }
         }
     }
-    fn index_mut(&mut self) -> Option<&mut KeyIndex> {
-        self.0.as_deref_mut()
-    }
-    /// The element words, while the map keeps its elements as words.
-    #[inline]
-    fn words(&self) -> Option<&word_block::Words> {
-        (!self.2.is_static_empty()).then_some(&self.2)
-    }
-    #[inline]
-    fn words_mut(&mut self) -> Option<&mut word_block::Words> {
-        (!self.2.is_static_empty()).then_some(&mut self.2)
-    }
-    /// The words, the static empty block included, for a map that starts keeping them.
-    #[inline]
-    fn words_start(&mut self) -> &mut word_block::Words {
-        &mut self.2
-    }
-    #[inline]
-    fn has_words(&self) -> bool {
-        !self.2.is_static_empty()
-    }
-    /// Stop keeping element words.
-    fn clear_words(&mut self) {
-        self.2 = word_block::Words::new();
-    }
-    fn set_index(&mut self, index: Option<KeyIndex>) {
-        self.0 = index.map(crate::gc_storage::StorageBox::new);
-    }
-    #[cfg(test)]
-    fn clear(&mut self) {
-        self.0 = None;
-        self.2 = word_block::Words::new();
+    /// The extras and index of `other`'s record, copied into this map's (a template's instance).
+    fn copy_record_parts_from(&mut self, other: &NamedEntries) {
+        let Some(header) = other.record.header() else {
+            return;
+        };
+        if header.index.is_none() && header.extras.is_none() {
+            return;
+        }
+        let index = header.index.clone();
+        let extras = header.extras.clone();
+        let mine = self.record.ensure();
+        mine.index = index;
+        mine.extras = extras;
     }
 }
 
 /// A layout's keys: a vector in a storage block (`gc_storage::GcSpill`) that the layout's cell
 /// traces. The keys' atoms live as long as their heap, so the cell reports only the block.
 type LayoutKeys = crate::inline_vec::InlineVec<PropKey, 0, crate::gc_storage::GcSpill>;
+
+/// A layout's keys' attributes (W2d step 2), one byte each ([`Property::attrs`]), in a storage
+/// block beside the keys': empty while every key is plain ([`PROP_PLAIN`]), as most are, and
+/// otherwise as long as the keys.
+type LayoutAttrs = crate::inline_vec::InlineVec<u8, 0, crate::gc_storage::GcSpill>;
 
 /// The slots of a layout's index: twice the most keys a layout with an index has.
 const LAYOUT_INDEX_SLOTS: usize = 2 * SHARED_LAYOUT_MAX_FIELDS;
@@ -6202,9 +6294,9 @@ impl LayoutIndex {
     }
 }
 
-/// Shared ordered keys, independent of instance values and descriptor attributes. A constructor
-/// may reserve a longer layout than its live prefix; only `NamedEntries::fields.len()` keys are
-/// observable. The immutable name index is built once with the layout and shared by every object
+/// Shared ordered keys and their attributes (W2d step 2), independent of instance values. A
+/// constructor may reserve a longer layout than its live prefix; only `NamedEntries::len` keys
+/// are observable, and the maps that share a layout hold its prefix of (key, attributes). The immutable name index is built once with the layout and shared by every object
 /// with that ordered key sequence. Layouts contain no JS values, prototypes, or SymbolData
 /// ownership, and nothing outside the heap: the cell needs no finalizer.
 #[repr(C)]
@@ -6213,6 +6305,8 @@ pub(crate) struct PropertyLayoutData {
     /// use it to compare a constructor's predicted next key. Never dropped: keys own nothing and
     /// the block is the collector's.
     keys: std::mem::ManuallyDrop<LayoutKeys>,
+    /// The keys' attributes ([`LayoutAttrs`]); never dropped, as `keys`.
+    attrs: std::mem::ManuallyDrop<LayoutAttrs>,
     /// Read-only after publication. A structural mutation first detaches shared data, updates
     /// `keys`, then rebuilds this table on that private copy.
     index: Option<crate::gc_storage::StorageBox<LayoutIndex>>,
@@ -6322,6 +6416,7 @@ impl Clone for PropertyLayoutData {
     fn clone(&self) -> Self {
         Self {
             keys: std::mem::ManuallyDrop::new((*self.keys).clone()),
+            attrs: std::mem::ManuallyDrop::new((*self.attrs).clone()),
             index: self.index.clone(),
             shared: Cell::new(false),
         }
@@ -6329,25 +6424,39 @@ impl Clone for PropertyLayoutData {
 }
 
 impl PropertyLayoutData {
+    /// A layout of `keys`, every one plain.
     pub(crate) fn new(keys: impl IntoIterator<Item = PropKey>) -> Self {
         Self {
             keys: std::mem::ManuallyDrop::new(keys.into_iter().collect()),
+            attrs: std::mem::ManuallyDrop::new(LayoutAttrs::new()),
             index: None,
             shared: Cell::new(false),
         }
     }
 
-    fn with_shared_index(keys: impl IntoIterator<Item = PropKey>) -> Self {
-        let mut layout = Self::new(keys);
+    /// A layout of `entries`, each a key and its attributes.
+    fn with_attrs(entries: impl IntoIterator<Item = (PropKey, u8)>) -> Self {
+        let mut layout = Self::new([]);
+        for (key, attrs) in entries {
+            layout.push(key, attrs);
+        }
+        layout
+    }
+
+    fn with_shared_index(entries: impl IntoIterator<Item = (PropKey, u8)>) -> Self {
+        let mut layout = Self::with_attrs(entries);
         if layout.keys.len() > INDEX_THRESHOLD && layout.keys.len() <= SHARED_LAYOUT_MAX_FIELDS {
             layout.index = Some(layout.build_index());
         }
         layout
     }
 
-    /// Report the storage blocks: the keys' and the index's.
+    /// Report the storage blocks: the keys', the attributes' and the index's.
     fn trace_blocks(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         if let Some(block) = self.keys.spill_ptr() {
+            crate::gc_storage::trace_block(block, sink);
+        }
+        if let Some(block) = self.attrs.spill_ptr() {
             crate::gc_storage::trace_block(block, sink);
         }
         if let Some(index) = &self.index {
@@ -6395,8 +6504,76 @@ impl PropertyLayoutData {
         &self.keys
     }
 
-    fn keys_mut(&mut self) -> &mut LayoutKeys {
-        &mut self.keys
+    /// Key `i`'s attributes.
+    #[inline]
+    pub(crate) fn attr(&self, i: usize) -> u8 {
+        if self.attrs.is_empty() {
+            PROP_PLAIN
+        } else {
+            self.attrs[i]
+        }
+    }
+
+    /// Whether every key is plain (no attribute bytes).
+    #[inline]
+    pub(crate) fn all_plain(&self) -> bool {
+        self.attrs.is_empty()
+    }
+
+    /// Give every key its attribute byte, before a key that is not plain.
+    fn spell_out_attrs(&mut self) {
+        if self.attrs.is_empty() {
+            self.attrs
+                .extend(std::iter::repeat_n(PROP_PLAIN, self.keys.len()));
+        }
+    }
+
+    fn push(&mut self, key: PropKey, attrs: u8) {
+        if attrs != PROP_PLAIN {
+            self.spell_out_attrs();
+        }
+        self.keys.push(key);
+        if !self.attrs.is_empty() {
+            self.attrs.push(attrs);
+        }
+    }
+
+    fn truncate(&mut self, len: usize) {
+        self.keys.truncate(len);
+        if !self.attrs.is_empty() {
+            self.attrs.truncate(len);
+        }
+    }
+
+    fn remove(&mut self, i: usize) {
+        self.keys.remove(i);
+        if !self.attrs.is_empty() {
+            self.attrs.remove(i);
+        }
+    }
+
+    fn set_attr(&mut self, i: usize, attrs: u8) {
+        if self.attrs.is_empty() {
+            if attrs == PROP_PLAIN {
+                return;
+            }
+            self.spell_out_attrs();
+        }
+        self.attrs[i] = attrs;
+    }
+
+    /// Key `from`'s entry (key and attributes) also at `to` (a compaction's move).
+    fn move_entry(&mut self, from: usize, to: usize) {
+        self.keys[to] = self.keys[from];
+        if !self.attrs.is_empty() {
+            self.attrs[to] = self.attrs[from];
+        }
+    }
+
+    /// Whether `self` begins with `prefix`'s keys and attributes.
+    fn begins_with(&self, prefix: &PropertyLayoutData) -> bool {
+        self.keys.starts_with(prefix.as_slice())
+            && (0..prefix.keys.len()).all(|i| self.attr(i) == prefix.attr(i))
     }
 }
 
@@ -6417,70 +6594,420 @@ pub(crate) fn new_property_layout<K: IntoPropKey>(
     )))
 }
 
-/// Build an immutable layout index for a bounded shape/constructor key sequence. Longer maps
-/// retain the existing per-object index and its incremental insertion behavior.
+/// Build an immutable layout index for a bounded shape/constructor key sequence, every key
+/// plain. Longer maps retain the existing per-object index and its incremental insertion
+/// behavior.
 pub(crate) fn new_shared_indexed_property_layout<K: IntoPropKey>(
     keys: impl IntoIterator<Item = K>,
 ) -> PropertyLayout {
+    new_shared_layout_of(
+        keys.into_iter()
+            .map(|key| (IntoPropKey::into_prop_key(key), PROP_PLAIN)),
+    )
+}
+
+/// [`new_shared_indexed_property_layout`] of keys with their attributes.
+fn new_shared_layout_of(entries: impl IntoIterator<Item = (PropKey, u8)>) -> PropertyLayout {
     let layout = PropertyLayout(crate::gc_box::new(PropertyLayoutData::with_shared_index(
-        keys.into_iter().map(IntoPropKey::into_prop_key),
+        entries,
     )));
     layout.mark_shared();
     layout
 }
 
-/// Named properties kept in the object cell (S3, Decision 3): the measured count that holds
-/// nearly every short-lived plain object in one allocation.
-pub(crate) const INLINE_NAMED_SLOTS: usize = 4;
+/// Named properties kept in the object cell (W2d step 2): seven one-word slots, which with the
+/// 72-byte header fill a 128-byte cell. The rest live in the out-of-line record ([`Record`]).
+pub(crate) const INLINE_NAMED_SLOTS: usize = 7;
 
-/// Named-property values in key-layout order: in the cell up to [`INLINE_NAMED_SLOTS`], beyond
-/// that in one heap buffer (see `crate::inline_vec`), a layout the JIT reads.
-type Fields =
-    crate::inline_vec::InlineVec<Property, INLINE_NAMED_SLOTS, crate::gc_storage::GcSpill>;
-
-/// Bytes a map with room for `capacity` named values owns outside its object: none while they
-/// fit the inline slots.
-#[cfg(test)]
-pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
-    if capacity <= INLINE_NAMED_SLOTS {
-        return 0;
-    }
-    capacity * std::mem::size_of::<Property>()
+/// The header of an object's out-of-line record (W2d step 2), at the start of its storage block:
+/// the slots past the cell's, the map's own key index and its Rust-heap extras, each rare. `cap`
+/// slot words follow the header.
+#[repr(C)]
+struct RecordHeader {
+    /// The slot words the block has room for.
+    cap: u32,
+    _reserved: u32,
+    /// The map's own key index, when its layout has none past [`INDEX_THRESHOLD`] keys.
+    index: Option<crate::gc_storage::StorageBox<KeyIndex>>,
+    /// The Symbols of its Symbol keys and its internal slots ([`DenseExtras`]).
+    extras: Option<crate::gc_storage::PayloadBox<DenseExtras>>,
 }
 
-#[derive(Clone, Default)]
+/// Where a record's first slot word sits in its block.
+pub(crate) const RECORD_SLOTS_OFF: usize = std::mem::size_of::<RecordHeader>();
+/// Where a record's slot capacity (a `u32`) sits in its block.
+pub(crate) const RECORD_CAP_OFF: usize = std::mem::offset_of!(RecordHeader, cap);
+/// Where a record's key index pointer sits in its block (null while the map keeps none).
+pub(crate) const RECORD_INDEX_OFF: usize = std::mem::offset_of!(RecordHeader, index);
+
+/// The overflow slots a record starts with, then doubles, as SpiderMonkey's dynamic slots do
+/// (SLOT_CAPACITY_MIN, vm/NativeObject.h:1098).
+const RECORD_MIN_SLOTS: usize = 6;
+
+/// An object's out-of-line record, or none (a null pointer): the slots past the cell's, the key
+/// index and the extras, in one storage block. The block is the collector's: its owner reports
+/// it ([`NamedEntries::trace_storage`]), replacing it (growth) drops the old address, and nothing
+/// frees it, so a record has no drop glue.
+#[derive(Default)]
+#[repr(transparent)]
+struct Record(Option<std::ptr::NonNull<RecordHeader>>);
+
+impl Record {
+    #[inline]
+    fn header(&self) -> Option<&RecordHeader> {
+        // SAFETY: a record's block holds an initialized header while its owner reports it.
+        self.0.map(|block| unsafe { &*block.as_ptr() })
+    }
+    #[inline]
+    fn header_mut(&mut self) -> Option<&mut RecordHeader> {
+        // SAFETY: as in `header`; `&mut self` makes the access unique.
+        self.0.map(|block| unsafe { &mut *block.as_ptr() })
+    }
+    /// The block's address, for its owner's trace.
+    #[inline]
+    fn block(&self) -> Option<*const u8> {
+        self.0.map(|block| block.as_ptr().cast_const().cast())
+    }
+    /// The slot words the record has room for.
+    #[inline]
+    fn cap(&self) -> usize {
+        self.header().map_or(0, |header| header.cap as usize)
+    }
+    /// The record's slot `i` (below its capacity).
+    #[inline]
+    fn slot(&self, i: usize) -> &PropWord {
+        let block = self.0.expect("a record slot past the cell's");
+        debug_assert!(i < self.cap());
+        // SAFETY: the block holds `cap` slot words after the header; the owner reads only the
+        // ones it wrote (its `len` counts them).
+        unsafe {
+            &*block
+                .as_ptr()
+                .cast::<u8>()
+                .add(RECORD_SLOTS_OFF)
+                .cast::<PropWord>()
+                .add(i)
+        }
+    }
+    /// A record of `cap` slots, the first `used` of them `self`'s, and `self`'s index and
+    /// extras. The new block replaces `self`'s, which the collector frees.
+    fn grow(&mut self, cap: usize, used: usize) {
+        debug_assert!(used <= cap && used <= self.cap());
+        let cap32 = u32::try_from(cap).expect("named slots fit a u32");
+        let block =
+            crate::gc_storage::alloc_block(RECORD_SLOTS_OFF + cap * 8).cast::<RecordHeader>();
+        let (index, extras) = match self.header_mut() {
+            Some(old) => (old.index.take(), old.extras.take()),
+            None => (None, None),
+        };
+        // SAFETY: the block is fresh and large enough for the header and `cap` words.
+        unsafe {
+            block.as_ptr().write(RecordHeader {
+                cap: cap32,
+                _reserved: 0,
+                index,
+                extras,
+            });
+            if let Some(old) = self.0 {
+                std::ptr::copy_nonoverlapping(
+                    old.as_ptr().cast::<u8>().add(RECORD_SLOTS_OFF),
+                    block.as_ptr().cast::<u8>().add(RECORD_SLOTS_OFF),
+                    used * 8,
+                );
+            }
+        }
+        self.0 = Some(block);
+    }
+    /// The record, made (with no slots) if the map had none.
+    #[inline]
+    fn ensure(&mut self) -> &mut RecordHeader {
+        if self.0.is_none() {
+            self.grow(0, 0);
+        }
+        self.header_mut().expect("a record was made")
+    }
+    #[inline]
+    fn index(&self) -> Option<&KeyIndex> {
+        self.header()?.index.as_deref()
+    }
+    #[inline]
+    fn index_mut(&mut self) -> Option<&mut KeyIndex> {
+        self.header_mut()?.index.as_deref_mut()
+    }
+    #[inline]
+    fn extras(&self) -> Option<&DenseExtras> {
+        self.header()?.extras.as_deref()
+    }
+    #[inline]
+    fn extras_box_mut(&mut self) -> Option<&mut crate::gc_storage::PayloadBox<DenseExtras>> {
+        self.header_mut()?.extras.as_mut()
+    }
+}
+
+/// A named property as its map stores it, read in place (W2d step 2): its slot's word and its
+/// attributes, which the map's layout keeps beside its key. One word, the slot's address with the
+/// writable, enumerable and configurable bits in its low three bits (the slot's word says whether
+/// it is an accessor), so an `Option<Element>` stays a register pair. It reads as a [`Property`]
+/// does, and [`PropRef::to_property`] makes one when a caller needs to own or store it.
+#[derive(Clone, Copy)]
+pub(crate) struct PropRef<'a> {
+    bits: std::num::NonZeroUsize,
+    _slot: std::marker::PhantomData<&'a PropWord>,
+}
+
+/// The attribute bits a [`PropRef`] keeps beside its slot's address.
+const PROP_REF_ATTRS: usize = 7;
+
+impl<'a> PropRef<'a> {
+    #[inline]
+    fn new(word: &'a PropWord, attrs: u8) -> Self {
+        let address = std::ptr::from_ref(word) as usize;
+        debug_assert_eq!(address & PROP_REF_ATTRS, 0, "slot words are 8-byte aligned");
+        debug_assert_eq!(
+            word.is_accessor(),
+            attrs & PROP_ACCESSOR as u8 != 0,
+            "a slot's word and its attributes agree on an accessor"
+        );
+        let bits = address | ((attrs as usize >> 1) & PROP_REF_ATTRS);
+        PropRef {
+            // SAFETY: a reference is never null.
+            bits: unsafe { std::num::NonZeroUsize::new_unchecked(bits) },
+            _slot: std::marker::PhantomData,
+        }
+    }
+    #[inline]
+    fn word(self) -> &'a PropWord {
+        // SAFETY: the address of a slot word the map lends for `'a`.
+        unsafe { &*((self.bits.get() & !PROP_REF_ATTRS) as *const PropWord) }
+    }
+    /// The four attribute bits ([`Property::attrs`]).
+    #[inline]
+    pub(crate) fn attrs(self) -> u8 {
+        (((self.bits.get() & PROP_REF_ATTRS) << 1) as u8) | u8::from(self.accessor())
+    }
+    #[inline]
+    pub(crate) fn accessor(self) -> bool {
+        self.word().is_accessor()
+    }
+    #[inline]
+    pub(crate) fn writable(self) -> bool {
+        self.bits.get() & (PROP_WRITABLE >> 1) != 0
+    }
+    #[inline]
+    pub(crate) fn enumerable(self) -> bool {
+        self.bits.get() & (PROP_ENUMERABLE >> 1) != 0
+    }
+    #[inline]
+    pub(crate) fn configurable(self) -> bool {
+        self.bits.get() & (PROP_CONFIGURABLE >> 1) != 0
+    }
+    /// The data property's value (undefined for an accessor, as an accessor descriptor's
+    /// [[Value]] reads).
+    #[inline]
+    pub(crate) fn value(self) -> Value {
+        if self.accessor() {
+            Value::Undefined
+        } else {
+            self.word().materialize()
+        }
+    }
+    /// OrdinaryGet's own-data Number case (see [`Property::number_value`]).
+    #[inline]
+    pub(crate) fn number_value(self) -> Option<f64> {
+        self.word().number()
+    }
+    /// Whether this data property holds exactly the object at `expected` (see
+    /// [`Property::holds_object`]).
+    #[inline]
+    pub(crate) fn holds_object(self, expected: *const RefCell<Object>) -> bool {
+        self.word()
+            .with_object(|object| std::ptr::eq(Gc::as_ptr(object), expected))
+            .unwrap_or(false)
+    }
+    #[inline]
+    pub(crate) fn getter(self) -> Option<&'a Value> {
+        self.word().accessors().and_then(|pair| pair.get.get())
+    }
+    #[inline]
+    pub(crate) fn setter(self) -> Option<&'a Value> {
+        self.word().accessors().and_then(|pair| pair.set.get())
+    }
+    #[inline]
+    pub(crate) fn is_empty(self) -> bool {
+        self.word().tag() == PACK_EMPTY
+    }
+    /// A present element as Array methods create it (see [`Property::is_plain_element`]).
+    #[inline]
+    pub(crate) fn is_plain_element(self) -> bool {
+        self.attrs() == PROP_PLAIN && !self.is_empty()
+    }
+    /// A plain element's attributes, whether the slot holds an element or a hole.
+    #[inline]
+    pub(crate) fn has_plain_element_attributes(self) -> bool {
+        self.attrs() == PROP_PLAIN
+    }
+    /// The property this reference reads, owned: an accessor shares its pair cell, and a
+    /// deferred prototype is materialized (see [`Property`]'s `Clone`).
+    pub(crate) fn to_property(self) -> Property {
+        let attrs = self.attrs() as usize;
+        if self.accessor() {
+            Property {
+                packed: PropWord::from_value(Value::Undefined),
+                meta: self.word().accessor_cell_word().unwrap_or(0) as usize | attrs,
+            }
+        } else {
+            Property {
+                packed: PropWord::from_value(self.word().materialize()),
+                meta: attrs,
+            }
+        }
+    }
+    /// The value's retained memory, without materializing a deferred prototype (a memory scan
+    /// creates no object).
+    pub(crate) fn visit_retained_value(self, visitor: &mut crate::memory::Visitor) {
+        let word = self.word();
+        if word.tag() == PACK_LAZY_PROTO {
+            let lazy = std::mem::ManuallyDrop::new(unsafe {
+                Value::decode_payload::<LazyProto>(word.0.get())
+            });
+            lazy.visit_retained_memory(visitor);
+        } else if !word.is_accessor() {
+            visitor.value(&self.value());
+        }
+    }
+}
+
+/// An object's named properties (W2d step 2): their values, one word each in key-layout order,
+/// the first [`INLINE_NAMED_SLOTS`] in the cell and the rest in the out-of-line [`Record`]; the
+/// keys and their attributes in the shared layout; the count; and the shape, the transition
+/// tree's id for the (key, attributes) sequence.
 struct NamedEntries {
-    /// Never dropped: its elements and its spill own nothing to release (`Property` holds no
-    /// drop glue, the spill is a storage block), so a map, and an object, carry no drop glue.
-    fields: std::mem::ManuallyDrop<Fields>,
+    inline: [PropWord; INLINE_NAMED_SLOTS],
+    record: Record,
     layout: Option<PropertyLayout>,
+    len: u32,
+    /// Object shape (hidden class): the id encoding this map's ordered (key, attributes)
+    /// sequence (see [`ShapeTable`]). A shared cacheable id proves the same keys with the same
+    /// attributes in the same order, so an inline cache that recorded (shape, slot) from one
+    /// object can trust that slot, and its attributes, on any other object of the same shape —
+    /// without a key compare. Moved to a child on a new key's insert or an attribute change, to a
+    /// fresh unique id on a structural removal. Only consulted for non-exotic objects (arrays keep
+    /// the key-compare path — same shape can mean different element counts).
+    shape: u32,
+}
+
+/// The word of an unused slot (never read: `len` bounds every read).
+const UNUSED_SLOT: PropWord = PropWord(Cell::new(PACK_UNDEFINED), std::marker::PhantomData);
+
+impl Default for NamedEntries {
+    fn default() -> Self {
+        NamedEntries {
+            inline: [UNUSED_SLOT; INLINE_NAMED_SLOTS],
+            record: Record::default(),
+            layout: None,
+            len: 0,
+            shape: SHAPE_EMPTY,
+        }
+    }
+}
+
+impl Clone for NamedEntries {
+    fn clone(&self) -> Self {
+        let mut copy = NamedEntries {
+            layout: self.layout.clone(),
+            shape: self.shape,
+            ..NamedEntries::default()
+        };
+        if let Some(header) = self.record.header() {
+            copy.record.grow(header.cap as usize, 0);
+            let new = copy.record.header_mut().expect("grown");
+            new.index = header.index.clone();
+            new.extras = header.extras.clone();
+        }
+        for i in 0..self.len() {
+            // A copy can be stored under another key or on another object (a template's
+            // instance), where a deferred prototype must not travel unmaterialized; an accessor's
+            // pair is immutable, and its copy shares it.
+            let word = self.slot(i);
+            let word = if word.is_accessor() {
+                PropWord(Cell::new(word.0.get()), std::marker::PhantomData)
+            } else {
+                PropWord::from_value(word.materialize())
+            };
+            copy.store(i, word);
+        }
+        copy.len = self.len;
+        copy
+    }
 }
 
 impl NamedEntries {
     fn with_capacity(capacity: usize) -> Self {
-        Self {
-            fields: std::mem::ManuallyDrop::new(Fields::with_capacity(capacity)),
-            layout: None,
-        }
+        let mut entries = NamedEntries::default();
+        entries.reserve_exact(capacity);
+        entries
     }
-    /// The capacity of a separate heap buffer for the values: none while they sit in the cell.
+    fn with_layout(capacity: usize, layout: Option<PropertyLayout>) -> Self {
+        let mut entries = NamedEntries::with_capacity(capacity);
+        entries.layout = layout;
+        entries
+    }
+    /// The slot words the map keeps outside its cell (the record's room).
     fn heap_capacity(&self) -> usize {
-        if !self.fields.spilled() {
-            return 0;
-        }
-        self.fields.capacity()
+        self.record.cap()
     }
+    #[inline]
     fn len(&self) -> usize {
-        self.fields.len()
+        self.len as usize
     }
+    #[inline]
     fn is_empty(&self) -> bool {
-        self.fields.is_empty()
+        self.len == 0
     }
+    #[inline]
     fn capacity(&self) -> usize {
-        self.fields.capacity()
+        INLINE_NAMED_SLOTS + self.record.cap()
     }
+    /// Room for `additional` more slots, exactly.
     fn reserve_exact(&mut self, additional: usize) {
-        self.fields.reserve_exact(additional);
+        let needed = self.len() + additional;
+        if needed > self.capacity() {
+            let used = self.len().saturating_sub(INLINE_NAMED_SLOTS);
+            self.record.grow(needed - INLINE_NAMED_SLOTS, used);
+        }
+    }
+    /// Room for one more slot: the record grows to at least [`RECORD_MIN_SLOTS`], then doubles,
+    /// or to `predicted` slots when the layout predicts more keys.
+    fn reserve_one(&mut self, predicted: usize) {
+        if self.len() < self.capacity() {
+            return;
+        }
+        let needed = self.len() + 1 - INLINE_NAMED_SLOTS;
+        let cap = needed
+            .max(RECORD_MIN_SLOTS)
+            .max(self.record.cap() * 2)
+            .max(predicted.saturating_sub(INLINE_NAMED_SLOTS));
+        let used = self.len() - INLINE_NAMED_SLOTS.min(self.len());
+        self.record.grow(cap, used);
+    }
+    /// Slot `i`'s word (below the count).
+    #[inline]
+    fn slot(&self, i: usize) -> &PropWord {
+        debug_assert!(i < self.len());
+        if i < INLINE_NAMED_SLOTS {
+            &self.inline[i]
+        } else {
+            self.record.slot(i - INLINE_NAMED_SLOTS)
+        }
+    }
+    /// Write slot `i` (below the capacity) with `word`.
+    #[inline]
+    fn store(&mut self, i: usize, word: PropWord) {
+        if i < INLINE_NAMED_SLOTS {
+            self.inline[i] = word;
+        } else {
+            self.record.slot(i - INLINE_NAMED_SLOTS).0.set(word.0.get());
+        }
     }
     #[inline]
     fn keys(&self) -> &[PropKey] {
@@ -6488,24 +7015,53 @@ impl NamedEntries {
             .as_deref()
             .map_or(&[], |keys| &keys[..self.len()])
     }
+    /// Slot `i`'s attributes (below the count), from the layout.
     #[inline]
-    fn iter(&self) -> impl Iterator<Item = (PropKey, &Property)> {
-        self.keys().iter().copied().zip(self.fields.iter())
+    fn attrs(&self, i: usize) -> u8 {
+        self.layout
+            .as_ref()
+            .map_or(PROP_PLAIN, |layout| layout.attr(i))
+    }
+    /// Slot `i` as a property (below the count).
+    #[inline]
+    fn prop(&self, i: usize) -> PropRef<'_> {
+        PropRef::new(self.slot(i), self.attrs(i))
     }
     #[inline]
-    fn get(&self, slot: usize) -> Option<(PropKey, &Property)> {
-        Some((*self.keys().get(slot)?, self.fields.get(slot)?))
+    fn iter(&self) -> impl Iterator<Item = (PropKey, PropRef<'_>)> {
+        self.keys()
+            .iter()
+            .enumerate()
+            .map(|(i, &key)| (key, self.prop(i)))
     }
+    #[inline]
+    fn props(&self) -> impl Iterator<Item = PropRef<'_>> {
+        (0..self.len()).map(|i| self.prop(i))
+    }
+    #[inline]
+    fn get(&self, slot: usize) -> Option<(PropKey, PropRef<'_>)> {
+        let key = *self.keys().get(slot)?;
+        Some((key, self.prop(slot)))
+    }
+    #[inline]
+    fn get_prop(&self, slot: usize) -> Option<PropRef<'_>> {
+        (slot < self.len()).then(|| self.prop(slot))
+    }
+    /// Whether the layout predicts `key` with `attrs` as the next key.
+    fn predicts(&self, key: PropKey, attrs: u8) -> bool {
+        let len = self.len();
+        self.layout
+            .as_ref()
+            .is_some_and(|layout| layout.get(len) == Some(&key) && layout.attr(len) == attrs)
+    }
+    /// Append `key` with `property` (room for it reserved).
     fn push(&mut self, (key, property): (PropKey, Property)) {
+        let (word, attrs) = property.into_slot();
         let len = self.len();
         // A template/constructor's predicted next key is already owned once by the layout.
         // A mismatch detaches before mutation; speculation never creates an observable key.
-        if !self
-            .layout
-            .as_ref()
-            .is_some_and(|keys| keys.get(len) == Some(&key))
-        {
-            if len == 0 && key == crate::atom::names::LENGTH.key() {
+        if !self.predicts(key, attrs) {
+            if len == 0 && key == crate::atom::names::LENGTH.key() && attrs == PROP_WRITABLE as u8 {
                 // Array builders outside the native literal helper share this key-only prefix
                 // too; element slots remain in their existing independent dense representation.
                 self.layout = Some(array_length_layout());
@@ -6514,53 +7070,121 @@ impl NamedEntries {
                     .layout
                     .get_or_insert_with(|| new_property_layout::<PropKey>([]))
                     .make_mut();
-                layout.keys_mut().truncate(len);
-                layout.keys_mut().push(key);
+                layout.truncate(len);
+                layout.push(key, attrs);
                 layout.rebuild_index();
             }
         }
-        self.fields.push(property);
+        self.push_predicted(word);
     }
-    fn predicts(&self, key: PropKey) -> bool {
-        self.layout
-            .as_ref()
-            .is_some_and(|keys| keys.get(self.len()) == Some(&key))
+    /// Append the slot word of the key the layout predicts (room for it reserved).
+    #[inline]
+    fn push_predicted(&mut self, word: PropWord) {
+        let len = self.len();
+        debug_assert!(len < self.capacity());
+        self.store(len, word);
+        self.len += 1;
+    }
+    /// Replace slot `i`'s property; whether its attributes changed (the layout then detaches,
+    /// copy-on-write, to record them).
+    fn replace(&mut self, i: usize, property: Property) -> bool {
+        let (word, attrs) = property.into_slot();
+        let changed = self.attrs(i) != attrs;
+        if changed {
+            let layout = self.layout.as_mut().expect("live entry layout").make_mut();
+            layout.set_attr(i, attrs);
+        }
+        self.store(i, word);
+        changed
     }
     fn remove(&mut self, slot: usize) {
         let len = self.len();
+        for i in slot..len - 1 {
+            let next = PropWord(
+                Cell::new(self.slot(i + 1).0.get()),
+                std::marker::PhantomData,
+            );
+            self.store(i, next);
+        }
+        self.len -= 1;
         let layout = self.layout.as_mut().expect("live entry layout").make_mut();
-        layout.keys_mut().truncate(len);
-        layout.keys_mut().remove(slot);
-        self.fields.remove(slot);
+        layout.truncate(len);
+        layout.remove(slot);
         layout.rebuild_index();
     }
-    fn retain(&mut self, mut keep: impl FnMut((PropKey, &Property)) -> bool) {
+    fn retain(&mut self, mut keep: impl FnMut((PropKey, PropRef<'_>)) -> bool) {
         let len = self.len();
         if len == 0 {
             return;
         }
-        let layout = self.layout.as_mut().expect("live entry layout").make_mut();
-        let keys = layout.keys_mut();
-        keys.truncate(len);
-        let mut slot = 0;
+        let kept: Vec<bool> = (0..len)
+            .map(|i| {
+                let key = self.keys()[i];
+                keep((key, self.prop(i)))
+            })
+            .collect();
+        let mut moves = Vec::new();
         let mut retained = 0;
-        self.fields.retain(|property| {
-            let yes = keep((keys[slot], property));
+        for (i, &yes) in kept.iter().enumerate() {
             if yes {
-                keys.swap(retained, slot);
+                if retained != i {
+                    let word = PropWord(Cell::new(self.slot(i).0.get()), std::marker::PhantomData);
+                    self.store(retained, word);
+                    moves.push((i, retained));
+                }
                 retained += 1;
             }
-            slot += 1;
-            yes
-        });
-        keys.truncate(retained);
+        }
+        let layout = self.layout.as_mut().expect("live entry layout").make_mut();
+        layout.truncate(len);
+        for (from, to) in moves {
+            layout.move_entry(from, to);
+        }
+        layout.truncate(retained);
         layout.rebuild_index();
+        self.len = retained as u32;
     }
     #[cfg(test)]
     fn clear(&mut self) {
-        self.fields.clear();
+        self.len = 0;
         self.layout = None;
     }
+    /// Report the record's blocks: its own, the key index's (and its slots') and the extras'
+    /// payload cell.
+    #[inline]
+    fn trace_storage<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        use crate::gc_storage::{trace_block, StorageBox};
+        let Some(header) = self.record.header() else {
+            return;
+        };
+        trace_block(self.record.block().expect("a record"), sink);
+        if let Some(index) = &header.index {
+            StorageBox::trace(index, sink);
+            if let Some(block) = index.slots.spill_ptr() {
+                trace_block(block, sink);
+            }
+        }
+        if let Some(extras) = &header.extras {
+            crate::gc_storage::PayloadBox::trace(extras, sink);
+        }
+    }
+    /// The slot words' edges.
+    #[inline]
+    fn trace_slots<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
+        for i in 0..self.len() {
+            self.slot(i).trace_gc_edges(sink);
+        }
+    }
+}
+
+/// Bytes a map with room for `capacity` named values owns outside its object: none while they
+/// fit the cell's slots, then its record's block.
+#[cfg(test)]
+pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
+    if capacity <= INLINE_NAMED_SLOTS {
+        return 0;
+    }
+    RECORD_SLOTS_OFF + (capacity - INLINE_NAMED_SLOTS) * std::mem::size_of::<PropWord>()
 }
 
 /// The flag byte of an object and its property map ([`Props::flags`], W2d step 1). The object's
@@ -6611,25 +7235,19 @@ const OBJECT_FLAGS: u8 =
 /// A new object's: extensible and ordinary (`ic_plain`).
 const OBJECT_FLAGS_INITIAL: u8 = FLAG_IC_PLAIN | FLAG_EXTENSIBLE;
 
-/// Insertion-ordered string-keyed property map. A `Vec` of entries preserves order (good enough for
-/// `for-in`/`Object.keys`); a side `HashMap` keeps lookup O(1).
+/// Insertion-ordered string-keyed property map (W2d step 2): the named properties' slots, layout,
+/// count and shape ([`NamedEntries`]), the element words, and the flag and memo bytes, 96 bytes
+/// that with the object's proto and kind fill a 128-byte cell's 72-byte header and its seven
+/// slots.
 #[derive(Clone)]
 pub struct Props {
     entries: NamedEntries,
     /// The object's and the map's flag bits ([`FLAG_IC_PLAIN`] and the rest), one byte that
     /// generated code tests a bit of (W2d step 1).
     flags: Cell<u8>,
-    /// Object shape (hidden class): the id encoding this map's ordered (key, descriptor
-    /// class) sequence (see [`ShapeTable`]). A shared cacheable id proves the same keys in
-    /// the same order, so an inline cache that recorded (shape, slot) from one object can
-    /// trust that slot on any other object of the same shape — without a key compare.
-    /// Bumped to a child on new-key insert, to a fresh unique on a structural removal or
-    /// a class-changing descriptor replacement. Only consulted for non-exotic
-    /// objects (arrays keep the key-compare path — same shape can mean different element counts).
-    shape: u32,
-    /// The map's own key index (a nullable pointer), the Rust-heap extras, and the
-    /// element words (W2c): every map's plain data elements, as V8, SpiderMonkey and JSC give
-    /// every object element storage. Ordinary small named-property objects allocate none of it.
+    /// The element words (W2c): every map's plain data elements, as V8, SpiderMonkey and JSC
+    /// give every object element storage, the static empty block until the first. The map's own
+    /// key index and Rust-heap extras live in the named entries' record.
     elems: DenseStorage,
     /// The `entries` slot of the `"prototype"` key, or `NO_SLOT` — same memo discipline as
     /// `len_slot`. Every `new` reads the constructor's `.prototype`; function objects are
@@ -6840,11 +7458,9 @@ fn shape_transition(
         if prefix.len() >= SHARED_LAYOUT_MAX_FIELDS {
             return (id, None);
         }
-        let names = prefix
-            .iter()
-            .map(|&(name, _)| name)
-            .chain(std::iter::once(key));
-        let layout = new_shared_indexed_property_layout(names);
+        // The shape's (key, attributes) sequence, which every map of the shape holds.
+        let entries = prefix.iter().copied().chain(std::iter::once((key, attrs)));
+        let layout = new_shared_layout_of(entries);
         shapes.layouts.insert(id, layout.clone());
         // Cold transition learning: a previously seen prefix can predict the rest of this
         // ordered insertion chain. Existing instances retain their pinned layout; subsequent
@@ -6857,7 +7473,7 @@ fn shape_transition(
                 break;
             };
             if let Some(prediction) = shapes.layouts.get_mut(prefix_id) {
-                if prediction.len() < layout.len() && layout.starts_with(prediction.as_slice()) {
+                if prediction.len() < layout.len() && layout.begins_with(prediction) {
                     *prediction = layout.clone();
                 }
             }
@@ -6911,7 +7527,12 @@ fn array_length_layout() -> PropertyLayout {
         let mut cached = heap.array_length_layout.borrow_mut();
         cached
             .get_or_insert_with(|| {
-                let layout = new_property_layout([crate::atom::names::LENGTH.key()]);
+                // ArrayCreate's `length`: writable, neither enumerable nor configurable.
+                let layout =
+                    PropertyLayout(crate::gc_box::new(PropertyLayoutData::with_attrs([(
+                        crate::atom::names::LENGTH.key(),
+                        PROP_WRITABLE as u8,
+                    )])));
                 layout.mark_shared();
                 layout
             })
@@ -7255,7 +7876,7 @@ impl std::fmt::Debug for Props {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Props")
             .field("entries", &self.entries.len())
-            .field("shape", &self.shape)
+            .field("shape", &self.entries.shape)
             .finish()
     }
 }
@@ -7276,10 +7897,7 @@ impl Props {
     }
 
     pub(crate) fn with_layout(capacity: usize, layout: Option<PropertyLayout>) -> Props {
-        Self::with_entries(NamedEntries {
-            fields: std::mem::ManuallyDrop::new(Fields::with_capacity(capacity)),
-            layout,
-        })
+        Self::with_entries(NamedEntries::with_layout(capacity, layout))
     }
 
     /// Cached layouts are immutable before their first instance is created.
@@ -7319,12 +7937,11 @@ impl Props {
             return true;
         }
         if self.entries.is_empty()
-            && self.elems.0.is_none()
+            && self.entries.index().is_none()
             && !self.elem_mode()
             && source
                 .entries
-                .fields
-                .iter()
+                .props()
                 .all(|property| property.attrs() == PROP_PLAIN)
         {
             // Shapes encode (key, attributes): sharing the source shape is sound only when
@@ -7334,15 +7951,12 @@ impl Props {
             // for them.
             self.note_structural();
             self.entries.layout = source.entries.layout.clone();
-            self.entries.fields.reserve_exact(source.entries.len());
-            self.entries.fields.extend(
-                source
-                    .entries
-                    .fields
-                    .iter()
-                    .map(|property| Property::plain(property.value())),
-            );
-            self.shape = source.shape;
+            self.entries.reserve_exact(source.entries.len());
+            for property in source.entries.props() {
+                self.entries
+                    .push_predicted(PropWord::from_value(property.value()));
+            }
+            self.entries.shape = source.entries.shape;
             self.len_slot.set(source.len_slot.get());
             self.proto_slot.set(source.proto_slot.get());
             self.ensure_fallback_index();
@@ -7357,9 +7971,9 @@ impl Props {
     /// Supply keys to a fresh, still-empty receiver after its initializer plan is validated.
     /// The existing field capacity remains usable; no predicted property becomes observable.
     pub(crate) fn predict_empty_layout(&mut self, layout: &PropertyLayout) {
-        assert_eq!(self.shape, SHAPE_EMPTY);
+        assert_eq!(self.entries.shape, SHAPE_EMPTY);
         assert!(self.entries.is_empty());
-        self.entries.fields.reserve_exact(layout.len());
+        self.entries.reserve_exact(layout.len());
         self.entries.layout = Some(layout.clone());
     }
 
@@ -7368,24 +7982,28 @@ impl Props {
     /// cold storage. `exact` is false when a standard-library hash table owns opaque bucket
     /// storage whose requested allocation size Rust does not expose.
     pub(crate) fn retained_requested_storage_bytes(&self) -> (usize, bool) {
-        let mut bytes = self
-            .entries
-            .heap_capacity()
-            .saturating_mul(std::mem::size_of::<Property>());
+        // The record's block: its header and slot words, when the map has one.
+        let mut bytes = self.entries.record.header().map_or(0, |_| {
+            RECORD_SLOTS_OFF
+                + self
+                    .entries
+                    .heap_capacity()
+                    .saturating_mul(std::mem::size_of::<PropWord>())
+        });
         let mut exact = true;
-        for property in self.entries.fields.iter() {
-            bytes = bytes.saturating_add(property.retained_requested_storage_bytes());
+        for i in 0..self.entries.len() {
+            bytes = bytes.saturating_add(self.entries.slot(i).retained_requested_storage_bytes());
         }
         if let Some(words) = self.elems.words() {
             // The block: front room, header, words and remembered record.
             bytes = bytes.saturating_add(words.block_bytes());
         }
-        if let Some(index) = self.elems.index() {
+        if let Some(index) = self.entries.index() {
             bytes = bytes
                 .saturating_add(std::mem::size_of::<KeyIndex>())
                 .saturating_add(index.bytes());
         }
-        if self.elems.symbols().is_some() {
+        if self.entries.symbols().is_some() {
             bytes = bytes
                 .saturating_add(std::mem::size_of::<crate::fasthash::FastMap<u64, SymbolRef>>());
             exact = false;
@@ -7397,7 +8015,6 @@ impl Props {
         debug_assert!(entries.is_empty());
         Props {
             entries,
-            shape: SHAPE_EMPTY,
             elems: DenseStorage::default(),
             flags: Cell::new(OBJECT_FLAGS_INITIAL),
             proto_slot: std::cell::Cell::new(SlotMemo::NONE),
@@ -7505,17 +8122,22 @@ impl Props {
         named: impl ExactSizeIterator<Item = Value>,
     ) -> Props {
         debug_assert_eq!(words.len(), len);
-        let length = Property::data(Value::Num(len as f64), true, false, false);
+        // The layout lists ArrayCreate's `length` and then the named properties, with their
+        // attributes: the slots take only their values.
+        let mut entries = NamedEntries::with_layout(1 + named.len(), Some(layout));
+        entries.shape = shape;
+        entries.push_predicted(PropWord::from_value(Value::Num(len as f64)));
+        for value in named {
+            entries.push_predicted(PropWord::from_value(value));
+        }
+        debug_assert!(entries.layout.as_ref().is_some_and(|layout| {
+            layout.attr(0) == PROP_WRITABLE as u8
+                && (1..entries.len()).all(|slot| layout.attr(slot) == PROP_PLAIN)
+        }));
         Props {
-            entries: NamedEntries {
-                fields: std::mem::ManuallyDrop::new(Fields::from_iter(
-                    std::iter::once(length).chain(named.map(Property::plain)),
-                )),
-                layout: Some(layout),
-            },
-            shape,
+            entries,
             // An empty array keeps the static empty block until its first element.
-            elems: DenseStorage(None, None, words),
+            elems: DenseStorage(words),
             flags: Cell::new(OBJECT_FLAGS_INITIAL | FLAG_ELEM_MODE),
             proto_slot: Cell::new(SlotMemo::NONE),
             len_slot: Cell::new(SlotMemo::of(0)),
@@ -7537,22 +8159,23 @@ impl Props {
         // all plain, so the template's must be too.
         debug_assert!(
             self.entries
-                .fields
-                .iter()
+                .props()
                 .all(|property| property.attrs() == PROP_PLAIN),
             "plain object template with a field that is not plain"
         );
-        let entries = NamedEntries {
-            fields: std::mem::ManuallyDrop::new(values.map(Property::plain).collect()),
-            layout: self.entries.layout.clone(),
-        };
+        // The layout lists the keys with their attributes; the slots take only the values.
+        let mut entries = NamedEntries::with_layout(values.len(), self.entries.layout.clone());
+        entries.shape = self.entries.shape;
+        entries.copy_record_parts_from(&self.entries);
+        for value in values {
+            entries.push_predicted(PropWord::from_value(value));
+        }
         Props {
             entries,
             // The template's map bits; a new object's own.
             flags: Cell::new(
                 self.flags.get() & (FLAG_HAS_FAR | FLAG_ELEM_MODE) | OBJECT_FLAGS_INITIAL,
             ),
-            shape: self.shape,
             elems: self.elems.clone(),
             proto_slot: std::cell::Cell::new(self.proto_slot.get()),
             len_slot: std::cell::Cell::new(self.len_slot.get()),
@@ -7592,25 +8215,15 @@ impl Props {
             .layout
             .clone()
             .expect("an array template lists its keys");
-        Self::packed_array_named(items, self.shape, layout, named)
+        Self::packed_array_named(items, self.entries.shape, layout, named)
     }
 
-    /// Grow tiny property maps exactly: `Vec`'s default first allocation has room for four
-    /// 16-byte fields, while one- and two-property objects dominate real heaps. Past two entries
-    /// resume geometric growth so larger maps retain amortized insertion.
+    /// Room for one more named entry: the cell's seven slots, then the record, which starts at
+    /// six slots and doubles, or takes the layout's predicted count at once (W2d step 2).
     #[inline]
     fn reserve_entry(&mut self) {
-        if self.entries.len() == self.entries.capacity() {
-            let predicted = self.entries.layout.as_ref().map_or(0, |keys| keys.len());
-            let additional = if predicted > self.entries.len() {
-                predicted - self.entries.len()
-            } else if self.entries.len() < 2 {
-                1
-            } else {
-                self.entries.len()
-            };
-            self.entries.reserve_exact(additional);
-        }
+        let predicted = self.entries.layout.as_ref().map_or(0, |keys| keys.len());
+        self.entries.reserve_one(predicted);
     }
 
     /// Reserve the element words of a fresh dense array (or arguments object) of known size; the
@@ -7739,7 +8352,7 @@ impl Props {
         self.entries.retain(|(key, _)| key.as_index().is_none());
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
-        self.elems.set_index(None);
+        self.entries.set_index(None);
         if self.entries.len() > INDEX_THRESHOLD {
             self.build_index();
         }
@@ -7768,12 +8381,12 @@ impl Props {
 
     /// The `"length"` property, resolved through the `len_slot` memo (one compare, no hashing).
     /// `None` when there is no own `length`.
-    pub(crate) fn length_property(&self) -> Option<&Property> {
+    pub(crate) fn length_property(&self) -> Option<PropRef<'_>> {
         let length = crate::atom::names::LENGTH.key();
         if let Some(s) = self.len_slot.get().slot() {
             debug_assert!(matches!(self.entries.get(s), Some((k, _)) if k == length));
             debug_assert!(!self.elem_mode() || s == 0, "an Array's length is slot 0");
-            return self.entries.fields.get(s);
+            return self.entries.get_prop(s);
         }
         let slot = self.find(length)?;
         // Generated code reads an Array's `length` at slot 0 (W2c step 7b, V8's descriptor 0):
@@ -7783,7 +8396,7 @@ impl Props {
             "an Array's length is slot 0"
         );
         self.len_slot.set(SlotMemo::of(slot));
-        Some(&self.entries.fields[slot])
+        Some(self.entries.prop(slot))
     }
 
     /// Replace the value of an Array's own writable `length` data property, found through the
@@ -7798,7 +8411,7 @@ impl Props {
             slot
         };
         debug_assert!(matches!(self.entries.get(slot), Some((k, _)) if k == key));
-        self.entries.fields[slot].set_value(Value::Num(length));
+        self.entries.slot(slot).set_value(Value::Num(length));
     }
 
     /// Mark this object as a live prototype (see `proto_flag`).
@@ -7825,14 +8438,14 @@ impl Props {
     /// This map's shape id — the inline cache's structural validation token (see the `shape` field).
     #[inline]
     pub(crate) fn shape(&self) -> u32 {
-        self.shape
+        self.entries.shape
     }
 
     /// Exercise the exhausted identity path without resetting the process-wide allocator or
     /// changing identities owned by other tests/Agents. This only withdraws this map's proof.
     #[cfg(test)]
     pub(crate) fn force_uncacheable_shape_for_test(&mut self) {
-        self.shape = SHAPE_UNCACHEABLE;
+        self.entries.shape = SHAPE_UNCACHEABLE;
     }
 
     /// Borrow the immutable key layout, live prefix and attributes for enumeration. Numeric
@@ -7854,7 +8467,7 @@ impl Props {
             )
         };
         let mut enumerable = 0;
-        for (index, property) in self.entries.fields.iter().enumerate() {
+        for (index, property) in self.entries.props().enumerate() {
             enumerable |= u64::from(property.enumerable()) << index;
         }
         Some((layout, self.entries.len() as u8, enumerable))
@@ -7876,7 +8489,7 @@ impl Props {
     /// after a successful call so forwarding constructors whose own bytecode has no direct
     /// `this.x` stores can reserve the right capacity on later allocations.
     pub(crate) fn observed_instance_capacity(&self) -> usize {
-        if self.elems.0.is_none() && self.entries.len() <= 16 {
+        if self.entries.index().is_none() && self.entries.len() <= 16 {
             self.entries.len()
         } else {
             0
@@ -7896,7 +8509,7 @@ impl Props {
             return None;
         }
         self.find(PropKey::index(n))
-            .map(|slot| Element::entry(&self.entries.fields[slot]))
+            .map(|slot| Element::entry(self.entries.prop(slot)))
     }
 
     /// Own element `n`'s value when it is a data property (a word at any integrity level, or a
@@ -7911,9 +8524,9 @@ impl Props {
             return None;
         }
         self.find(PropKey::index(n))
-            .map(|slot| &self.entries.fields[slot])
+            .map(|slot| self.entries.prop(slot))
             .filter(|property| !property.accessor())
-            .map(Property::value)
+            .map(PropRef::value)
     }
 
     /// Overwrite dense element `n`'s value. `Err` hands the value
@@ -8199,8 +8812,8 @@ impl Props {
             && self.elem_mode()
             && array_index.is_none()
             && key != length
-            && is_cacheable_shape(self.shape)
-            && self.shape == array_length_shape()
+            && is_cacheable_shape(self.entries.shape)
+            && self.entries.shape == array_length_shape()
         {
             return None;
         }
@@ -8231,7 +8844,7 @@ impl Props {
                 return slot;
             }
         }
-        let found = match self.elems.index() {
+        let found = match self.entries.index() {
             None => self.entries.keys().iter().position(|&k| k == key),
             Some(index) => index.get(key),
         };
@@ -8259,14 +8872,14 @@ impl Props {
         if let Some(n) = canonical_index(text) {
             return self.find(PropKey::index(n));
         }
-        if self.entries.len() > INDEX_THRESHOLD || self.elems.index().is_some() {
+        if self.entries.len() > INDEX_THRESHOLD || self.entries.index().is_some() {
             // The array-length shape proves every other named key absent (see `find`), with
             // no atom to look up.
             if self.entries.len() > INDEX_THRESHOLD
                 && self.elem_mode()
                 && text != "length"
-                && is_cacheable_shape(self.shape)
-                && self.shape == array_length_shape()
+                && is_cacheable_shape(self.entries.shape)
+                && self.entries.shape == array_length_shape()
             {
                 return None;
             }
@@ -8323,7 +8936,7 @@ impl Props {
     /// Build the hash index for every current entry (crossing the small-map threshold).
     fn build_index(&mut self) {
         let index = KeyIndex::of(self.entries.keys());
-        self.elems.set_index(Some(index));
+        self.entries.set_index(Some(index));
     }
 
     /// Recover the generic lookup table if a non-array map reached the indexed size without a
@@ -8339,8 +8952,8 @@ impl Props {
             .as_ref()
             .is_some_and(|layout| layout.has_index())
         {
-            self.elems.set_index(None);
-        } else if self.entries.len() > INDEX_THRESHOLD && self.elems.index().is_none() {
+            self.entries.set_index(None);
+        } else if self.entries.len() > INDEX_THRESHOLD && self.entries.index().is_none() {
             self.build_index();
         }
     }
@@ -8351,12 +8964,12 @@ impl Props {
             return self.get_key(PropKey::index(n));
         }
         self.find_text(key)
-            .map(|i| Element::entry(&self.entries.fields[i]))
+            .map(|i| Element::entry(self.entries.prop(i)))
     }
     /// A named key's property: never an element, so always a stored entry.
-    pub(crate) fn get_named(&self, key: &str) -> Option<&Property> {
+    pub(crate) fn get_named(&self, key: &str) -> Option<PropRef<'_>> {
         debug_assert!(canonical_index(key).is_none(), "get_named of an index key");
-        self.find_text(key).map(|i| &self.entries.fields[i])
+        self.find_text(key).map(|i| self.entries.prop(i))
     }
     pub(crate) fn get_key(&self, key: PropKey) -> Option<Element<'_>> {
         if let Some(n) = key.as_index() {
@@ -8370,8 +8983,7 @@ impl Props {
                 return None;
             }
         }
-        self.find(key)
-            .map(|i| Element::entry(&self.entries.fields[i]))
+        self.find(key).map(|i| Element::entry(self.entries.prop(i)))
     }
     /// Semantic lookup plus the named-entry slot when the result lives in `entries`, in a walk
     /// over several maps (see [`Props::get_walking`]). Dense indexed results have no named field
@@ -8391,7 +9003,7 @@ impl Props {
             }
         }
         self.find_text_with(key, atom)
-            .map(|slot| (Element::entry(&self.entries.fields[slot]), Some(slot)))
+            .map(|slot| (Element::entry(self.entries.prop(slot)), Some(slot)))
     }
     /// [`Props::get`] in a walk that reads `key` from several maps (a prototype chain): `atom`
     /// carries the text's atom from the map that looked it up to the next ones.
@@ -8401,7 +9013,7 @@ impl Props {
             return self.get_key(PropKey::index(n));
         }
         self.find_text_with(key, atom)
-            .map(|i| Element::entry(&self.entries.fields[i]))
+            .map(|i| Element::entry(self.entries.prop(i)))
     }
     /// The memoized own `prototype` slot, for guarded constructor fast paths.
     #[inline]
@@ -8409,58 +9021,24 @@ impl Props {
         self.find(crate::atom::names::PROTOTYPE.key())
             .map(|slot| slot as u32)
     }
-    /// Test-only mutable escape (descriptor fixtures simulate descriptor edits
-    /// through it). Production descriptor changes go through `insert`; value-only writes
-    /// go through `set_value`/`set_value_at`. Acquisition still demotes, matching the
-    /// contract those fixtures must not accidentally rely on.
+    /// Test-only descriptor edit (descriptor fixtures simulate defines through it): `key`'s
+    /// property, as `f` changes it, defined again through `insert`, which moves an element that
+    /// stops being plain to the named entries and takes the shape's attribute-change transition
+    /// (no `&mut Property` into the map exists, W2d step 2). Whether `key` was present.
     #[cfg(test)]
-    pub(crate) fn get_mut(&mut self, key: &str) -> Option<&mut Property> {
-        let text = key;
-        let index = canonical_index(text);
-        if let Some(n) = index {
-            if let Some(value) = self.elems.words().and_then(|words| words.get(n as usize)) {
-                // The escape may change the element's attributes, which a word does not keep:
-                // the element leaves for the named entries first, as a non-plain one does (a
-                // non-configurable define moves it), then takes back its plain attributes. A
-                // sealed or frozen element leaves with its implied ones (W2c step 7a).
-                let integrity = self.word_integrity();
-                if integrity == 0 {
-                    self.insert(PropKey::index(n), Property::data(value, true, true, false));
-                    let slot = self.find(PropKey::index(n)).expect("the moved element");
-                    self.entries.fields[slot].set_configurable(true);
-                } else {
-                    self.note_structural();
-                    self.elems.words_mut().unwrap().move_out(n as usize);
-                    self.insert(
-                        PropKey::index(n),
-                        Property::data(
-                            value,
-                            integrity & word_block::KIND_FROZEN == 0,
-                            true,
-                            false,
-                        ),
-                    );
-                }
-            }
-        }
-        match self.find_text(text) {
-            Some(i) => {
-                // Handing out `&mut Property` can change the descriptor class behind the
-                // shape's back, so acquiring one for a shape-tracked entry demotes the
-                // shape (array element entries are exempt, as in `remove`). Value-only
-                // writers use `set_value`/`set_value_at` and pay nothing.
-                if !(self.elem_mode() && index.is_some()) {
-                    self.demote_shape();
-                }
-                Some(&mut self.entries.fields[i])
-            }
-            None => None,
-        }
+    pub(crate) fn update_property(&mut self, key: &str, f: impl FnOnce(&mut Property)) -> bool {
+        let Some(element) = self.get(key) else {
+            return false;
+        };
+        let mut property = element.to_property();
+        f(&mut property);
+        self.insert(key, property);
+        true
     }
     /// Mint a fresh unique shape: no inline cache recorded against the old id can hit
     /// again, so any proof it carried (slot, and eventually class) is abandoned.
     pub(crate) fn demote_shape(&mut self) {
-        self.shape = shape_fresh();
+        self.entries.shape = shape_fresh();
     }
     /// Value-only write to an existing property (the caller has established it is a
     /// writable data property): the descriptor — and therefore the shape class — is
@@ -8480,7 +9058,7 @@ impl Props {
         }
         match self.find_text(text) {
             Some(i) => {
-                self.entries.fields[i].set_value(v);
+                self.entries.slot(i).set_value(v);
                 true
             }
             None => false,
@@ -8490,12 +9068,11 @@ impl Props {
     /// `set_value`). The caller has shape/key-validated the slot and established a
     /// writable data descriptor there.
     pub(crate) fn set_value_at(&mut self, slot: usize, v: Value) -> bool {
-        match self.entries.fields.get_mut(slot) {
-            Some(p) => {
-                p.set_value(v);
-                true
-            }
-            None => false,
+        if slot < self.entries.len() {
+            self.entries.slot(slot).set_value(v);
+            true
+        } else {
+            false
         }
     }
     /// Move an existing property's value out (leaving `Empty`), descriptor untouched:
@@ -8511,7 +9088,7 @@ impl Props {
             }
         }
         let i = self.find_text(text)?;
-        Some(self.entries.fields[i].take_value())
+        Some(self.entries.slot(i).replace_value(Value::Undefined))
     }
     /// Merge `get`/`set` into an EXISTING accessor descriptor at `key` (the
     /// `__defineGetter__`/`__defineSetter__` and accessor-merge paths): the class stays
@@ -8526,7 +9103,7 @@ impl Props {
         let Some(i) = self.find_text(key) else {
             return false;
         };
-        let p = &mut self.entries.fields[i];
+        let mut p = self.entries.prop(i).to_property();
         if !p.accessor() {
             return false;
         }
@@ -8536,6 +9113,9 @@ impl Props {
         if set.is_some() {
             p.set_setter(set);
         }
+        // A new pair cell in the same slot: the attributes, and so the shape, are unchanged.
+        let changed = self.entries.replace(i, p);
+        debug_assert!(!changed, "a merge keeps the accessor's attributes");
         true
     }
     /// Install the deferred function-`prototype` thunk at a resolved slot: a value-only
@@ -8547,12 +9127,12 @@ impl Props {
         parent: Gc,
         template: &Props,
     ) -> bool {
-        match self.entries.fields.get_mut(slot) {
-            Some(p) => {
-                p.defer_function_prototype(owner, parent, template);
-                true
-            }
-            None => false,
+        if slot < self.entries.len() {
+            let word = PropWord::deferred_prototype(owner, parent, template);
+            self.entries.store(slot, word);
+            true
+        } else {
+            false
         }
     }
     /// `Object.freeze`'s descriptor pass: every own data property becomes non-writable
@@ -8574,19 +9154,19 @@ impl Props {
         // as `Object.freeze`'s defines do (an array's element entries are exempt, as in
         // `insert`).
         let elem_mode = self.elem_mode();
-        let mut shape = self.shape;
+        let mut shape = self.entries.shape;
         let len = self.entries.len();
         for slot in 0..len {
             let key = self.entries.keys()[slot];
-            let p = &mut self.entries.fields[slot];
-            let before = p.attrs();
+            let mut p = self.entries.prop(slot).to_property();
             p.set_writable(false);
             p.set_configurable(false);
-            if p.attrs() != before && !(elem_mode && key.as_index().is_some()) {
-                shape = shape_change(shape, key, p.attrs());
+            let attrs = p.attrs();
+            if self.entries.replace(slot, p) && !(elem_mode && key.as_index().is_some()) {
+                shape = shape_change(shape, key, attrs);
             }
         }
-        self.shape = shape;
+        self.entries.shape = shape;
     }
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.get(key).is_some()
@@ -8608,14 +9188,20 @@ impl Props {
     /// The (key, property) at `slot`, or `None` if out of range. The caller re-checks the key —
     /// slots shift on `remove`, so a cached slot is only trusted after the key matches.
     #[inline]
-    pub(crate) fn entry_at(&self, slot: usize) -> Option<(PropKey, &Property)> {
+    pub(crate) fn entry_at(&self, slot: usize) -> Option<(PropKey, PropRef<'_>)> {
         self.entries.get(slot)
+    }
+    /// The address of slot `slot`'s word, in the cell or the record (tests of generated code's
+    /// addressing).
+    #[cfg(test)]
+    pub(crate) fn slot_address(&self, slot: usize) -> usize {
+        std::ptr::from_ref(self.entries.slot(slot)) as usize
     }
     /// A live field at an already-resolved slot. Shape/memo-validated callers do not need to
     /// follow the key layout; array-holder ICs still use `entry_at` to re-check their key.
     #[inline]
-    pub(crate) fn property_at(&self, slot: usize) -> Option<&Property> {
-        self.entries.fields.get(slot)
+    pub(crate) fn property_at(&self, slot: usize) -> Option<PropRef<'_>> {
+        self.entries.get_prop(slot)
     }
     /// Drop every property.
     #[cfg(test)]
@@ -8626,7 +9212,7 @@ impl Props {
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
         self.set_has_far(false);
-        self.shape = shape_fresh();
+        self.entries.shape = shape_fresh();
     }
     /// Append the next element word while *building a fresh array in order* (its elements so
     /// far are exactly the words 0..len, with no index key in the named entries): skips the
@@ -8641,28 +9227,28 @@ impl Props {
     /// the transition table; otherwise a bounded small-layout lookup supplies shared keys.
     /// `new_shape` must be the transition recorded when this pair was first inserted normally.
     pub(crate) fn append_new(&mut self, key: PropKey, prop: Property, new_shape: u32) {
-        self.elems.retain_symbol_key(key);
+        self.entries.retain_symbol_key(key);
         self.note_structural();
         let slot = self.entries.len();
-        if self.elems.index().is_some() {
-            if let Some(index) = self.elems.index_mut() {
+        if self.entries.index().is_some() {
+            if let Some(index) = self.entries.index_mut() {
                 index.insert(key, slot);
             }
         } else if self.should_build_index() {
             self.build_index();
-            self.elems.index_mut().unwrap().insert(key, slot);
+            self.entries.index_mut().unwrap().insert(key, slot);
         }
         // If the constructor did not predict this key, reuse the small ordinary transition's
         // key layout. The creation IC still saves the semantic absence/prototype-chain walk.
         if !self.elem_mode()
-            && !self.entries.predicts(key)
+            && !self.entries.predicts(key, prop.attrs())
             && self.entries.len() < SHARED_LAYOUT_MAX_FIELDS
         {
             if let Some(layout) = shape_layout(new_shape) {
                 self.entries.layout = Some(layout);
             }
         }
-        self.shape = new_shape;
+        self.entries.shape = new_shape;
         self.reserve_entry();
         self.entries.push((key, prop));
         self.note_inserted(slot);
@@ -8674,13 +9260,13 @@ impl Props {
     /// threshold no dense/index sidecar or special-slot memo can be required, so the whole batch
     /// is just entry appends followed by its already-known final shape.
     pub(crate) fn append_proven_plain(&mut self, key: PropKey, prop: Property) {
-        self.elems.retain_symbol_key(key);
+        self.entries.retain_symbol_key(key);
         debug_assert!(self.entries.len() < INDEX_THRESHOLD);
         debug_assert!(key.as_index().is_none());
-        debug_assert!(self.elems.0.is_none());
+        debug_assert!(self.entries.index().is_none());
         self.reserve_entry();
-        if self.entries.predicts(key) {
-            self.entries.fields.push(prop);
+        if self.entries.predicts(key, prop.attrs()) {
+            self.entries.push_predicted(prop.into_slot().0);
         } else {
             self.entries.push((key, prop));
         }
@@ -8689,26 +9275,27 @@ impl Props {
     /// The immutable initializer plan proved this exact ordered layout before the batch began.
     /// No key ownership or runtime key comparison is needed while moving its field values.
     pub(crate) fn append_initialized_field(&mut self, key: PropKey, prop: Property) {
-        debug_assert!(self.entries.predicts(key));
+        debug_assert!(self.entries.predicts(key, prop.attrs()));
         debug_assert!(key.as_index().is_none(), "an index key is an element word");
-        self.elems.retain_symbol_key(key);
+        self.entries.retain_symbol_key(key);
         let slot = self.entries.len();
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(index) = self.entries.index_mut() {
             index.insert(key, slot);
         }
-        self.entries.fields.push(prop);
+        self.reserve_entry();
+        self.entries.push_predicted(prop.into_slot().0);
         self.ensure_fallback_index();
     }
 
     pub(crate) fn finish_proven_plain_shape(&mut self, shape: u32) {
         debug_assert!(!self.entries.is_empty());
         debug_assert!(self.entries.len() <= INDEX_THRESHOLD);
-        self.shape = shape;
+        self.entries.shape = shape;
     }
 
     pub(crate) fn insert(&mut self, key: impl IntoPropKey, prop: Property) {
         let key = key.into_prop_key();
-        self.elems.retain_symbol_key(key);
+        self.entries.retain_symbol_key(key);
         if let Some(n) = key.as_index() {
             if prop.is_plain_element() && self.can_start_packed_elements(n as usize) {
                 self.note_structural();
@@ -8782,27 +9369,25 @@ impl Props {
             // shape that records the old ones: it takes the attribute-change transition (W2d
             // step 2). Array element entries are exempt exactly as in `remove` — their shape
             // tracks named keys only. A replacement that keeps the attributes keeps the shape.
-            if self.entries.fields[i].attrs() != prop.attrs()
-                && !(self.elem_mode() && key.as_index().is_some())
-            {
-                self.shape = shape_change(self.shape, key, prop.attrs());
+            let attrs = prop.attrs();
+            if self.entries.replace(i, prop) && !(self.elem_mode() && key.as_index().is_some()) {
+                self.entries.shape = shape_change(self.entries.shape, key, attrs);
             }
-            self.entries.fields[i] = prop;
         } else {
             self.note_structural();
             let slot = self.entries.len();
-            if self.elems.index().is_some() {
-                if let Some(index) = self.elems.index_mut() {
+            if self.entries.index().is_some() {
+                if let Some(index) = self.entries.index_mut() {
                     index.insert(key, slot);
                 }
             } else if self.should_build_index() {
                 self.build_index();
-                self.elems.index_mut().unwrap().insert(key, slot);
+                self.entries.index_mut().unwrap().insert(key, slot);
             }
             if !(self.elem_mode() && key.as_index().is_some()) {
                 let prefix = (!self.elem_mode()
                     && self.entries.len() < SHARED_LAYOUT_MAX_FIELDS
-                    && !self.entries.predicts(key))
+                    && !self.entries.predicts(key, prop.attrs()))
                 .then(|| {
                     self.entries
                         .iter()
@@ -8810,8 +9395,8 @@ impl Props {
                         .collect::<Vec<_>>()
                 });
                 let (shape, layout) =
-                    shape_transition(self.shape, key, prop.attrs(), prefix.as_deref());
-                self.shape = shape;
+                    shape_transition(self.entries.shape, key, prop.attrs(), prefix.as_deref());
+                self.entries.shape = shape;
                 if let Some(layout) = layout {
                     self.entries.layout = Some(layout);
                 }
@@ -8865,7 +9450,7 @@ impl Props {
         self.entries.retain(|(k, _)| keep(k));
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
-        self.elems.set_index(None);
+        self.entries.set_index(None);
         if self.entries.len() > INDEX_THRESHOLD
             && (self.elem_mode()
                 || !self
@@ -8882,7 +9467,7 @@ impl Props {
             self.note_inserted(slot);
         }
         // A removal shifts slots: it can't be a tree transition, so deopt to a fresh unique id.
-        self.shape = shape_fresh();
+        self.entries.shape = shape_fresh();
     }
 
     pub(crate) fn remove(&mut self, key: &str) -> bool {
@@ -8919,11 +9504,11 @@ impl Props {
         // this for ELEMENT keys: their shape tracks named keys only, and array entry slots are
         // only ever trusted through key-checked ICs (IC_ARR_KEYCHK), which re-verify on hit.
         if !(self.elem_mode() && key.as_index().is_some()) {
-            self.shape = shape_fresh();
+            self.entries.shape = shape_fresh();
         }
         self.len_slot.set(SlotMemo::NONE);
         self.proto_slot.set(SlotMemo::NONE);
-        if let Some(index) = self.elems.index_mut() {
+        if let Some(index) = self.entries.index_mut() {
             index.remove(key);
             // Every later entry moved down one slot. The index covers every entry, so
             // adjust positions in place instead of rehashing and reinserting each later key:
@@ -8938,9 +9523,9 @@ impl Props {
                 .as_ref()
                 .is_some_and(|layout| layout.has_index())
         {
-            self.elems.set_index(None);
+            self.entries.set_index(None);
         }
-        self.elems.release_symbol_key(key);
+        self.entries.release_symbol_key(key);
         if removed_far {
             self.recover_dense_coverage();
         }
@@ -9003,7 +9588,7 @@ impl Props {
             .chain(syms)
             .collect()
     }
-    pub(crate) fn iter(&self) -> impl Iterator<Item = (PropKey, &Property)> {
+    pub(crate) fn iter(&self) -> impl Iterator<Item = (PropKey, PropRef<'_>)> {
         self.entries.iter()
     }
 
@@ -9012,7 +9597,7 @@ impl Props {
         let integrity = self.word_integrity();
         self.word_values()
             .map(move |value| Element::word(value, integrity))
-            .chain(self.entries.fields.iter().map(Element::entry))
+            .chain(self.entries.props().map(Element::entry))
     }
 
     /// The element words' values, holes left out: the elements no named entry holds.
@@ -9070,7 +9655,8 @@ impl Props {
     }
 
     pub(crate) fn integrity_ok(&self, frozen: bool) -> bool {
-        let valid = |p: &Property| !p.configurable() && (!frozen || p.accessor() || !p.writable());
+        let valid =
+            |p: PropRef<'_>| !p.configurable() && (!frozen || p.accessor() || !p.writable());
         // Present words are elements of the block's integrity level (W2c step 7a).
         let need = if frozen {
             word_block::KIND_FROZEN

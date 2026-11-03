@@ -151,8 +151,8 @@ fn property_shapes_uncacheable_prefix_never_enters_transition_or_layout_cache() 
     let mut second = Props::new();
     first.insert("first", Property::plain(Value::Num(1.0)));
     second.insert("second", Property::plain(Value::Num(2.0)));
-    first.shape = SHAPE_UNCACHEABLE;
-    second.shape = SHAPE_UNCACHEABLE;
+    first.entries.shape = SHAPE_UNCACHEABLE;
+    second.entries.shape = SHAPE_UNCACHEABLE;
     for map in [&mut first, &mut second] {
         map.insert("tail", Property::plain(Value::Num(3.0)));
         assert_eq!(map.shape(), SHAPE_UNCACHEABLE);
@@ -271,7 +271,7 @@ fn attribute_changes_take_shared_transitions_and_value_writes_keep_the_shape() {
 }
 
 #[test]
-fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
+fn value_only_writes_keep_shape_and_attribute_defines_transition() {
     let engine = Engine::new();
     engine.interp.activate_gc_heap();
     let mut props = Props::new();
@@ -286,10 +286,12 @@ fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
     );
     assert_eq!(props.shape(), shared, "value-only take");
     assert!(props.set_value("pc_k", Value::Num(4.0)));
-    // Acquiring &mut Property demotes even before any descriptor is touched: the
-    // caller *could* flip the class behind the shape's back.
-    let _ = props.get_mut("pc_k").unwrap();
-    assert_ne!(props.shape(), shared, "mutable escape acquisition demotes");
+    // No `&mut Property` into a map exists (W2d step 2): a define that keeps the attributes
+    // keeps the shape, and one that changes them takes the change's transition.
+    assert!(props.update_property("pc_k", |_| {}));
+    assert_eq!(props.shape(), shared, "a define keeping the attributes");
+    assert!(props.update_property("pc_k", |p| p.set_enumerable(false)));
+    assert_ne!(props.shape(), shared, "a define changing them");
 
     // Freeze takes each key's attribute-change transition: two maps frozen alike share the
     // result, and a map already frozen keeps its shape.

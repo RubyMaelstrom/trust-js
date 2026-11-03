@@ -410,12 +410,7 @@ fn name_dispatch_native_global_checks_identity_before_generation_without_losing_
     let (slot, shape, expected) = {
         let global = engine.interp.global.borrow();
         let slot = global.props.slot_of("dispatchGlobal").unwrap();
-        (
-            slot,
-            global.props.shape(),
-            global.props.property_at(slot).unwrap() as *const crate::value::Property as usize
-                + layout.property_value,
-        )
+        (slot, global.props.shape(), global.props.slot_address(slot))
     };
     let ic = NameIc {
         env: Env::as_ptr(&env) as usize | 1,

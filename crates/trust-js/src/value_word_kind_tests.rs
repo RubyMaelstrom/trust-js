@@ -14,10 +14,7 @@ fn packed(length: usize) -> Props {
         properties.push_dense(Property::plain(Value::Num(index as f64)));
     }
     if length != initial {
-        properties
-            .get_mut("length")
-            .unwrap()
-            .set_value(Value::Num(length as f64));
+        properties.update_property("length", |p| p.set_value(Value::Num(length as f64)));
     }
     properties
 }
@@ -61,7 +58,7 @@ fn number_words_keep_their_kind_bits() {
 fn word_edits_keep_the_kind_bits_exact() {
     let edits: [(&str, fn(&mut Props)); 9] = [
         ("get_mut", |p| {
-            p.get_mut("0").unwrap().set_value(Value::Num(8.0));
+            assert!(p.update_property("0", |p| p.set_value(Value::Num(8.0))));
         }),
         ("insert", |p| {
             p.insert("0", Property::plain(Value::Num(8.0)))

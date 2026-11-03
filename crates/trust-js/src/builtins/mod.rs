@@ -3712,7 +3712,9 @@ pub(crate) fn inert_iterator_step(
 
 /// LengthOfArrayLike of an ordinary Array: its length slot, never an accessor.
 pub(crate) fn ordinary_array_length(props: &Props) -> Option<usize> {
-    match (props.length_property().map(Property::value)).map(|__value| (__value).view()) {
+    match (props.length_property().map(crate::value::PropRef::value))
+        .map(|__value| (__value).view())
+    {
         Some(ValueView::Num(length)) => Some(length as usize),
         _ => None,
     }

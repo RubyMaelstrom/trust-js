@@ -81,7 +81,7 @@ impl Interp {
     #[inline(always)]
     pub(super) fn snapshot_cached_get(
         &self,
-        property: &Property,
+        property: crate::value::PropRef<'_>,
         name: &str,
         holder_shape: u32,
         depth: u8,
@@ -96,7 +96,7 @@ impl Interp {
     #[inline(never)]
     fn snapshot_cached_accessor(
         &self,
-        property: &Property,
+        property: crate::value::PropRef<'_>,
         name: &str,
         holder_shape: u32,
         depth: u8,

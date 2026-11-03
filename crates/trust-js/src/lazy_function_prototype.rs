@@ -38,8 +38,7 @@ impl LazyFunctionPrototype {
         debug_assert!(
             template
                 .entries
-                .fields
-                .iter()
+                .props()
                 .all(|property| property.attrs() == Property::builtin(super::Value::Null).attrs()),
             "lazy prototype template with a field that is not a builtin data property"
         );
@@ -69,12 +68,15 @@ impl LazyFunctionPrototype {
             // A descriptor clone materializes before it can outlive the function. All other
             // value reads retain their receiver, including reads while its RefCell is borrowed.
             let owner = self.owner;
+            debug_assert!(props.entries.predicts(
+                crate::atom::PropKey::from_text("constructor"),
+                Property::builtin(super::Value::Null).attrs()
+            ));
             props
                 .entries
-                .fields
-                .push(Property::builtin(super::Value::Obj(owner)));
+                .push_predicted(super::PropWord::from_value(super::Value::Obj(owner)));
         }
-        props.shape = self.shape;
+        props.entries.shape = self.shape;
         let prototype = Object::new_with_parts(Some(*parent), props, ObjectKind::Plain);
         // The write barrier: this cell now names the fresh prototype. No safepoint lies between
         // the card and the store.
@@ -199,7 +201,7 @@ mod tests {
                 .props
                 .get_named("prototype")
                 .unwrap()
-                .packed
+                .word()
                 .tag()
         };
         assert_eq!(tag(), PACK_LAZY_PROTO);
@@ -340,7 +342,7 @@ mod tests {
                 .props
                 .get_named("prototype")
                 .unwrap()
-                .packed
+                .word()
                 .tag()
         })
     }
@@ -388,7 +390,7 @@ mod tests {
                 .props
                 .get_named("prototype")
                 .unwrap()
-                .packed
+                .word()
                 .bits();
             let cell = (word & 0xffff_ffff_ffff) as usize;
             let path = heap.core.borrow().retention_path(cell);
@@ -430,7 +432,7 @@ mod tests {
                     .props
                     .get_named("prototype")
                     .unwrap()
-                    .packed
+                    .word()
                     .bits();
                 assert_eq!(word & !0xffff_ffff_ffff, PACK_LAZY_PROTO);
                 let cell = (word & 0xffff_ffff_ffff) as *const u8;
@@ -587,7 +589,7 @@ mod tests {
     #[test]
     fn deferred_prototype_transfers_materialize_once_through_each_explicit_read() {
         type Read = fn(&Gc) -> (Option<u64>, Value);
-        fn property<R>(function: &Gc, read: impl FnOnce(&Property) -> R) -> R {
+        fn property<R>(function: &Gc, read: impl FnOnce(crate::value::PropRef<'_>) -> R) -> R {
             read(
                 function
                     .borrow()
@@ -599,15 +601,15 @@ mod tests {
         const MOVE: &str = "Property::take_value";
         let reads: [(&str, Read); 4] = [
             ("PropWord::materialize", |function| {
-                let value = property(function, |stored| stored.packed.materialize());
+                let value = property(function, |stored| stored.word().materialize());
                 (Some(value.tag()), value)
             }),
-            ("Property::clone", |function| {
-                let snapshot = property(function, Property::clone);
+            ("PropRef::to_property", |function| {
+                let snapshot = property(function, |stored| stored.to_property());
                 (Some(snapshot.packed.tag()), snapshot.value())
             }),
-            ("Property::value", |function| {
-                (None, property(function, Property::value))
+            ("PropRef::value", |function| {
+                (None, property(function, |stored| stored.value()))
             }),
             (MOVE, |function| {
                 let value = function.borrow_mut().props.take_value("prototype");
@@ -626,7 +628,7 @@ mod tests {
                 let label = format!("{tier:?} {read_name}");
                 let name = format!("F{k}");
                 let function = object(&mut engine, &name);
-                let tag = || property(&function, |stored| stored.packed.tag());
+                let tag = || property(&function, |stored| stored.word().tag());
                 assert_eq!(tag(), PACK_LAZY_PROTO, "{label}");
                 let before = super::materialized();
                 let (word, first) = read(&function);
@@ -641,7 +643,7 @@ mod tests {
                     .borrow()
                     .props
                     .get_named("constructor")
-                    .map(Property::value);
+                    .map(crate::value::PropRef::value);
                 assert!(
                     matches!((constructor).map(|__value| (__value).view()), Some(ValueView::Obj(c)) if Gc::ptr_eq(&c, &function)),
                     "{label}: constructor"
@@ -656,7 +658,7 @@ mod tests {
                 );
                 if *read_name == MOVE {
                     assert!(matches!(
-                        (property(&function, Property::value)).view(),
+                        (property(&function, |stored| stored.value())).view(),
                         ValueView::Undefined
                     ));
                     assert_eq!(eval(&mut engine, &format!("{name}.prototype")), "undefined");
@@ -693,8 +695,8 @@ mod tests {
         let function = object(&mut engine, "F");
         let body = function.borrow();
         let property = body.props.get_named("prototype").expect("a prototype");
-        assert_eq!(property.packed.tag(), PACK_LAZY_PROTO);
-        let _copy = unsafe { crate::value::Value::from_bits(property.packed.bits()) };
+        assert_eq!(property.word().tag(), PACK_LAZY_PROTO);
+        let _copy = unsafe { crate::value::Value::from_bits(property.word().bits()) };
     }
 
     #[test]
@@ -711,7 +713,7 @@ mod tests {
                     .props
                     .get_named("prototype")
                     .unwrap()
-                    .packed
+                    .word()
                     .tag(),
                 PACK_LAZY_PROTO
             );

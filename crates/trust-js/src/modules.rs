@@ -1143,7 +1143,7 @@ impl Interp {
             let src = base_o.borrow();
             let mut dst = dns.borrow_mut();
             for (k, p) in src.props.iter() {
-                let mut p = p.clone();
+                let mut p = p.to_property();
                 if k.is_symbol() {
                     if let ValueView::Str(tag) = (p.value()).view() {
                         if &*tag.text() == "Module" {
@@ -1206,7 +1206,7 @@ impl Interp {
                             let mut dst = stub.borrow_mut();
                             for (k, p) in src.props.iter() {
                                 if dst.props.get_key(k).is_none() {
-                                    let mut p = p.clone();
+                                    let mut p = p.to_property();
                                     if k.is_symbol() {
                                         if let ValueView::Str(tag) = (p.value()).view() {
                                             if &*tag.text() == "Module" {

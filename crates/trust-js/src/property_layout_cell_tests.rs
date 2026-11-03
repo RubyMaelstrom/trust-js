@@ -56,7 +56,7 @@ fn private_mutation_reuses_its_cell_and_clone_sharing_is_sticky() {
     let (_heap, _release, _active) = isolated();
     let mut props = predicted("unused");
     // Keep this test on the private COW path rather than adopting a shape-cache layout.
-    props.shape = SHAPE_UNCACHEABLE;
+    props.entries.shape = SHAPE_UNCACHEABLE;
     let private = props.shared_layout().unwrap().as_ptr();
     assert!(!props.shared_layout().unwrap().is_shared());
     props.insert("first", Property::plain(Value::Num(1.0)));

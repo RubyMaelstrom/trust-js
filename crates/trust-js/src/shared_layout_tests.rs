@@ -80,7 +80,7 @@ fn templates_share_keys_but_not_values_or_descriptors() {
         a.retained_requested_storage_bytes(),
         (crate::value::detached_field_bytes(2), true)
     );
-    a.get_mut("x").unwrap().set_writable(false);
+    assert!(a.update_property("x", |p| p.set_writable(false)));
     assert!(b.get("x").unwrap().writable());
     assert!(matches!(
         (b.get("x").unwrap().value()).view(),

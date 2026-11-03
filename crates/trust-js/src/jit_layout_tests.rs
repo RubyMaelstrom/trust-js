@@ -178,27 +178,32 @@ fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
                 Property::plain(Value::Num(slot as f64)),
             );
         }
-        let at = body(&layout, &object) + layout.obj_props + layout.props_entries;
-        let (data, len, cap) = sequence(layout.repr.props_fields, at);
+        // W2d step 2: slots below INLINE_NAMED_SLOTS sit in the cell, from `props_entries`; the
+        // rest in the record's block that `props_elems` points to, from RECORD_SLOTS_OFF.
+        let base = body(&layout, &object) + layout.obj_props;
         let borrowed = object.borrow();
         let props = &borrowed.props;
-        let values: &[Property] = &props.entries.fields;
-        assert_eq!(len, values.len(), "{count} fields");
-        assert_eq!(data, values.as_ptr() as usize, "{count} fields");
-        assert_eq!(cap, props.entries.heap_capacity(), "{count} fields");
+        let record = read::<usize>(base, layout.props_elems);
         assert_eq!(
-            cap == 0,
-            count <= INLINE_NAMED_SLOTS,
-            "in place exactly while the capacity word is 0"
+            record != 0,
+            count > INLINE_NAMED_SLOTS,
+            "{count} fields: a record exactly past the cell's slots"
         );
-        for (slot, value) in values.iter().enumerate() {
-            let entry = data + slot * layout.entry_size;
-            assert_eq!(read::<u64>(entry, layout.entry_value), value.packed.bits());
+        for slot in 0..count {
+            let expected = if slot < INLINE_NAMED_SLOTS {
+                base + layout.props_entries + slot * 8
+            } else {
+                record + crate::value::RECORD_SLOTS_OFF + (slot - INLINE_NAMED_SLOTS) * 8
+            };
             assert_eq!(
-                props
-                    .property_at(slot)
-                    .map(|p| p as *const Property as usize),
-                Some(entry)
+                props.slot_address(slot),
+                expected,
+                "{count} fields: slot {slot}"
+            );
+            assert_eq!(
+                read::<u64>(expected, 0),
+                Value::Num(slot as f64).bits(),
+                "{count} fields: slot {slot}"
             );
         }
     }

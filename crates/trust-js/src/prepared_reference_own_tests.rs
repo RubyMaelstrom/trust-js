@@ -109,9 +109,7 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
     owner
         .borrow_mut()
         .props
-        .get_mut("value")
-        .unwrap()
-        .set_value(Value::Num(7.0));
+        .update_property("value", |p| p.set_value(Value::Num(7.0)));
     engine
         .interp
         .global
@@ -127,9 +125,7 @@ fn prepared_reference_own_refresh_keeps_saved_owner_and_live_descriptor_strictne
     owner
         .borrow_mut()
         .props
-        .get_mut("value")
-        .unwrap()
-        .set_writable(false);
+        .update_property("value", |p| p.set_writable(false));
     assert!(engine
         .interp
         .write_prepared_reference(&mut reference, Value::Num(11.0))

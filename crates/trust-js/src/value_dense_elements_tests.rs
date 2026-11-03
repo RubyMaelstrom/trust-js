@@ -10,7 +10,7 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
     let number = |props: &Props, n: u32| props.get_index(n).and_then(|e| e.number_value());
     let mut props = Props::packed_array((0..8192).map(|n| Value::Num(n as f64)));
     assert_eq!(props.entries.len(), 1);
-    assert!(props.elems.0.is_none());
+    assert!(props.entries.index().is_none());
     assert_eq!(props.elems.words().unwrap().len(), 8192);
     assert_eq!(number(&props, 8191), Some(8191.0));
     assert!(props
@@ -27,7 +27,7 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
             .is_ok());
     }
     assert_eq!(grown.entries.len(), 1);
-    assert!(grown.elems.0.is_none());
+    assert!(grown.entries.index().is_none());
     assert_eq!(number(&grown, 8191), Some(8191.0));
     assert!(grown.set_index_value(12, Value::lstr("mixed")).is_ok());
     assert_eq!(number(&grown, 12), None);
@@ -43,11 +43,8 @@ fn dense_elements_large_lists_and_growth_keep_only_named_keys() {
 #[test]
 fn dense_elements_sparse_length_does_not_reserve_storage() {
     let mut props = Props::packed_array(std::iter::empty());
-    props
-        .get_mut("length")
-        .unwrap()
-        .set_value(Value::Num(u32::MAX as f64));
-    assert!(props.elems.0.is_none());
+    props.update_property("length", |p| p.set_value(Value::Num(u32::MAX as f64)));
+    assert!(props.entries.index().is_none());
     assert!(props
         .try_define_dense_element(200, Property::plain(Value::Num(2.0)))
         .is_ok());
@@ -218,7 +215,7 @@ fn dense_elements_far_keys_index_the_named_entries() {
             );
         }
         assert!(props.has_far(), "{start}");
-        assert!(props.elems.index().is_some(), "{start}: no key index");
+        assert!(props.entries.index().is_some(), "{start}: no key index");
         for n in 0..start + 2000 {
             assert_eq!(
                 props.get(&n.to_string()).and_then(|p| p.number_value()),
@@ -318,7 +315,7 @@ fn dense_elements_recovery_keeps_named_elements_far_and_word_kinds_exact() {
         match blocked {
             "hole" => assert!(props.remove("1")),
             "accessor" => props.insert("1", Property::accessor_prop(None, None, true, true)),
-            "non-writable" => props.get_mut("1").unwrap().set_writable(false),
+            "non-writable" => assert!(props.update_property("1", |p| p.set_writable(false))),
             "non-number" => assert!(props.set_index_value(1, Value::lstr("s")).is_ok()),
             _ => unreachable!(),
         }
