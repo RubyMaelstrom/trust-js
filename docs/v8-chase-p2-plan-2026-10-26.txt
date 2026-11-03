@@ -7161,3 +7161,169 @@ Follow-ups:
 - Change transitions could share their layouts through the shape directory (memory for code that
   freezes many objects).
 - Steps 3 (cells sized at allocation) and 4 (copy-on-write literals) are next (Decision 28).
+
+### W2d step 3: cells sized at allocation (design, 2026-11-03)
+
+Step-level design for Decision 28's third step, on main ffcc4431. Exemplar sources at the W2d
+note's revisions: target/p2/w2d/exemplars.txt, and for this step's questions (where an inline
+cache finds a value, transitions that add a slot, copies, templates, roots per capacity)
+target/p2/w2d/exemplars-step3.txt.
+
+What the exemplars agree on:
+- No inline cache reads an object's capacity. The capacity belongs to the hidden class, so the
+  hidden-class check also fixes where every property lives, and the cache records the location
+  when it is filled:
+  - SpiderMonkey splits slot numbers at nfixed when it attaches a stub and emits a fixed-slot or
+    dynamic-slot access with a byte offset (jit/CacheIR.cpp:321-331). Its megamorphic cache holds a
+    TaggedSlotOffset, (byte offset << 1) | is-fixed (vm/NativeObject.h:2010-2019).
+  - V8's handlers carry an in-object bit and a word offset taken from the map's descriptor
+    (ic/handler-configuration.h:97-108).
+  - JSC numbers out-of-line offsets from 64, above every inline capacity, so one compare against a
+    constant splits them (runtime/PropertyOffset.h:35, 136-144).
+- A transition that adds a property takes the new slot's place from the target hidden class. V8's
+  IC builtin alone checks the out-of-line store's length at run time, since deletions can leave
+  room (ic/accessor-assembler.cc:2645-2690).
+- The capacity belongs to the root. The transition key is (key, attributes) and children inherit
+  the capacity (V8 objects/map.cc:1576-1587, SpiderMonkey vm/Shape.cpp:381-389, JSC
+  runtime/Structure.cpp:330-332), so the same keys under two capacities make two hidden classes.
+- No engine installs a hidden class on an object of another capacity. Copies either allocate at
+  the source's capacity (JSC's spread clone, V8's identical-map clone) or rebuild the class under
+  the target's own root (SpiderMonkey reuses the PropMap with the target's nfixed,
+  vm/NativeObject.h:924-954).
+- No engine grows an object's cell. Only V8 shrinks one, in place, behind fillers.
+
+The cell:
+- `RefCell<Object>` becomes the 72-byte header alone. The map's cell slots follow it in the cell:
+  three in 96 B, seven in 128 B, fifteen in 192 B. Environment records already keep their slots
+  after `RefCell<Scope>` (interpreter.rs RECORD_HEADER), and a heap is made only where
+  `RefCell<Object>` ends with the Object, checked as check_record_layout checks records.
+- NamedEntries drops `inline` and gains `cell`, the number of slots it keeps in its cell. It also
+  takes in the flag byte and the two slot memos from Props, so Props stays 40 bytes.
+- A map in a cell keeps slot i in the cell below `cell`, else in its record at i - `cell`. A map
+  outside a cell has `cell` 0 and keeps every slot in its record. That covers templates, maps being
+  built and clones.
+- No map leaves a cell by value:
+  - Props loses Default. Its one `mem::take`, Array.fill's materialization
+    (builtins/mod.rs:6849), becomes Object::take_props, which moves the cell's slots into the map's
+    record.
+  - new_with_parts, replace_properties and adopt_props take maps outside cells (debug builds
+    assert it) and copy the slots into the cell.
+
+Capacity in the shape:
+- A shape id's top two bits name its capacity class: 0 for three slots, 1 for seven, 2 for
+  fifteen. The three empty shapes are 0, 1 << 30 and 2 << 30.
+  - A transition's child and an attribute change's child take their parent's class.
+  - A removal's fresh id and the uncacheable sentinel keep the map's class.
+  - The transition key stays (parent, key, attributes).
+- A map's capacity is its shape's. An object is allocated in that class, and a map in a cell has
+  `cell` equal to it.
+- These places install one map's shape on another:
+  - a template's instances;
+  - clones;
+  - try_copy_named_data_from (spread, Object.assign);
+  - replace_properties and adopt_props;
+  - the cached chains (InitializerShapes, Chunk::simple_constructor_shapes, interpreter.rs
+    16059-16097 and 16347-16418, whose root is hard-coded 0);
+  - lazy prototypes' recorded shape;
+  - the `arguments` shapes;
+  - the array `length` shape.
+  Each either has equal capacities by construction or rebases: the target keeps the source's key
+  layout, which has no capacity, and takes the shape that layout reaches from its own root. A
+  memo keyed by (shape, class) answers that, as V8's kObjectAssign and kCloneObject side-step
+  transitions do (ic/ic.cc:4466-4542). Debug builds assert the class wherever a shape is
+  installed.
+
+Caches record where the slot is:
+- A location word, SpiderMonkey's TaggedSlotOffset: (byte offset << 1) | in-record. The offset
+  runs from the Object for a cell slot and from the record block for a record slot. The fill
+  computes it from the holder's `cell`, and generated code never reads a capacity.
+- IcState holds it in its two padding bytes (offset 14) as `loc`: a data, accessor or key-checked
+  way's holder slot, or a creation way's new slot. `slot` stays the index, which is overloaded in
+  absent and creation ways.
+- The other caches that feed a slot to generated code at run time record the location too:
+  NameIc's global mode, NativeNameDescriptor, PreparedReference and JitCtx::accessor_slot. Baked
+  states and plans compute it at compile time from their IcState, or from (shape, slot).
+- slot_addr by location (ARM64):
+  - in the cell, `tbnz loc, #0, rec; add dst, obj, loc, lsr #1`, two instructions (four today);
+  - in the record, `ldr dst, [obj, #record]; add dst, dst, loc, lsr #1` after the branch (six
+    today).
+  The readers of a slot's attributes or key keep loading the index: the stores' writability
+  guard, the names' owner kind and the key-checked compare.
+- Creation takes the new slot's location from its way. In the cell, the shape proves the room and
+  nothing is tested. In the record, the probe checks the record's capacity at run time, as V8's
+  builtin does: a record's capacity is not a function of the shape.
+- x86-64 does the same with its own sequences.
+- The fill caches no slot whose record offset needs more than 15 bits (about 4,000 record slots).
+- Rust readers keep the index: slot_at reads `cell`.
+
+Predictions (exemplars.txt section 4; exemplars-step3.txt section 8):
+| birth | step 3 |
+| --- | --- |
+| literal templates: MakeObject, iterator results, descriptors | the key count's class |
+| other literals (NewObject, make_plain_object_vm) | the key count when the compiler knows it, else 3 |
+| `{}`, new_object(), Object.create, new Object (V8 and SpiderMonkey 4, JSC 6) | 3 |
+| arrays (`length`) | 3 |
+| RegExp exec results (`length`, index, input, groups; V8 5 in-object) | 7 |
+| user functions (the template map: `length`, `name`, `prototype`) | 3 |
+| native and bound functions | 3 |
+| `arguments` (`length`, callee, @@iterator) | 3 |
+| constructors | the learned count, else the static count |
+| function and class prototypes, built-in prototypes, the global object | 15 |
+| every other Object::new (130 sites) | 3 |
+- A constructor's learned count is the most any instance held, observed when the constructor
+  returns (as today) and also for the previous instance at the next construction. That counts
+  fields set after the constructor returns: Splay's nodes get `left` and `right`, and TypeScript's
+  parser objects grow from 3.46 slots to 8.33. V8's slack tracking measures the same thing, the
+  most the initial map's tree took after seven constructions; JSC fixes the count at the first
+  construction; SpiderMonkey counts statically.
+- The JIT's construct-this helper reads the learned count (bytecode.rs 25567-25612), and
+  forwarding constructors learn per constructor, not per wrapper chunk (RayTrace's Class.create).
+- A constructor's class only grows, so at most twice (3 to 7 to 15). Its instances' shapes change
+  root each time.
+
+In-place construction:
+- The hot builders allocate the cell and write into it:
+  - literal templates (instantiate_plain);
+  - arrays (packed_array*);
+  - functions (the template map);
+  - `arguments`;
+  - construct-this;
+  - iterator results.
+- Cold builders still build a map outside a cell, which new_with_parts copies in.
+
+GC and accounting:
+- Object cells come from three classes of the object kind, which the heap already supports per
+  descriptor. Tracing reads `len` slots, as now.
+- A 96-byte cell starts 32 bytes apart within a 128-byte card. The Object at +8 still lies in its
+  start's card, so the card-mark debug bound becomes 32 (jit.rs:11874-11885).
+- memory.rs, the allocation diagnostics and the census count each cell's class.
+
+Order, on branch p2-w2d3, each commit building and passing the lib suite:
+1. 3a, the representation: slots after the header, maps outside cells, take_props, the in-place
+   builders. Every cell is still 128 B, with one root.
+2. 3b, caches record locations. Every capacity is still seven, so this measures the encoding.
+3. 3c, capacities: the class bits, three roots, the rebase memo, the predictions and three cell
+   classes. ARM64, then x86-64.
+4. 3d, constructors' learning.
+They land together after:
+- the lib suite on both architectures;
+- clippy in the three configurations on both;
+- Test262, difftest and the fixtures' output;
+- GC stress over the tests touched;
+- counts at each commit and code dumps on ARM64;
+- the census (the exit's measure), the heap measurement and Splay's live heap.
+
+Risks:
+- A map read through the wrong cell, or a shape installed across capacities, reads or writes the
+  wrong word: memory unsafety, not a slowdown. The guards:
+  - the few whole-map moves each go through a method that copies the slots;
+  - the class bits, and debug assertions wherever a shape is installed;
+  - a random-operation test of maps in and out of cells of every class against a model;
+  - GC stress, Test262 and difftest.
+- A prediction too small costs a record; one too large wastes slots.
+- A site that sees the same keys at two capacities becomes polymorphic. All three engines accept
+  this.
+
+Exit: the W2d note's, measured on the tip: objects' bytes (the census's measure) and the heap's.
+chai is the close one. Its Object.create(null) objects mostly hold 4-8 keys, and three slots
+spill them; the census's sized column assumed their final count.
