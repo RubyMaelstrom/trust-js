@@ -54,11 +54,11 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
         // only neutral keys and an integer identity. Heap-local shape counters would give
         // this alpha/delta child the same ID as the owner's alpha/gamma child. The layout
         // allocated here belongs to foreign; publishing it in original would violate I6.
-        let prefix = [(PropKey::from_text("alpha"), PropClass::DataWritable)];
+        let prefix = [(PropKey::from_text("alpha"), PROP_PLAIN)];
         let (foreign_shape, foreign_layout) = shape_transition(
             parent_shape,
             PropKey::from_text("delta"),
-            PropClass::DataWritable,
+            PROP_PLAIN,
             Some(&prefix),
         );
         assert_ne!(
@@ -235,25 +235,38 @@ fn shape_transitions_distinguish_descriptor_classes() {
 }
 
 #[test]
-fn class_changing_insert_demotes_but_class_preserving_insert_keeps_shape() {
+fn attribute_changes_take_shared_transitions_and_value_writes_keep_the_shape() {
     let engine = Engine::new();
     engine.interp.activate_gc_heap();
     let mut props = Props::new();
     props.insert("pc_k", Property::plain(Value::Num(1.0)));
     let shared = props.shape();
-    // Same-class replacement (enumerable-only difference included) keeps the shape.
-    props.insert("pc_k", Property::data(Value::Num(2.0), true, false, true));
+    // A replacement that keeps the attributes keeps the shape.
+    props.insert("pc_k", Property::plain(Value::Num(1.5)));
     assert_eq!(props.shape(), shared);
-    // Writable -> non-writable is a class change: demote to a fresh unique shape.
+    // Shapes encode every attribute (W2d step 2): an enumerable-only change moves the map to
+    // the change's child shape ...
+    props.insert("pc_k", Property::data(Value::Num(2.0), true, false, true));
+    let non_enumerable = props.shape();
+    assert_ne!(non_enumerable, shared);
+    // ... which a second map making the same change shares (JSC's attribute-change
+    // transition), as one built with those attributes directly does not.
+    let mut twin = Props::new();
+    twin.insert("pc_k", Property::plain(Value::Num(9.0)));
+    assert_eq!(twin.shape(), shared);
+    twin.insert("pc_k", Property::data(Value::Num(8.0), true, false, true));
+    assert_eq!(twin.shape(), non_enumerable);
+    // Writable -> non-writable, and data -> accessor, are changes of their own.
     props.insert("pc_k", Property::data(Value::Num(3.0), false, false, true));
-    assert_ne!(props.shape(), shared);
-    let demoted = props.shape();
-    // Data -> accessor likewise demotes again rather than reusing any shared shape.
+    let non_writable = props.shape();
+    assert_ne!(non_writable, non_enumerable);
+    assert_ne!(non_writable, shared);
     props.insert(
         "pc_k",
         Property::accessor_prop(Some(Value::Num(0.0)), None, false, true),
     );
-    assert_ne!(props.shape(), demoted);
+    assert_ne!(props.shape(), non_writable);
+    assert_ne!(props.shape(), non_enumerable);
     assert_ne!(props.shape(), shared);
 }
 
@@ -278,25 +291,29 @@ fn value_only_writes_keep_shape_but_mutable_escape_demotes() {
     let _ = props.get_mut("pc_k").unwrap();
     assert_ne!(props.shape(), shared, "mutable escape acquisition demotes");
 
-    // Freeze demotes exactly when a writable data entry flips class.
-    let mut frozen = Props::new();
-    frozen.insert("pc_k", Property::plain(Value::Num(1.0)));
-    let frozen_shape = frozen.shape();
-    frozen.freeze_descriptors();
-    assert_ne!(
-        frozen.shape(),
-        frozen_shape,
-        "freeze flips writable -> demote"
-    );
-    assert!(!frozen.get("pc_k").unwrap().writable());
+    // Freeze takes each key's attribute-change transition: two maps frozen alike share the
+    // result, and a map already frozen keeps its shape.
+    let frozen_shape = |seed: f64| {
+        let mut frozen = Props::new();
+        frozen.insert("pc_k", Property::plain(Value::Num(seed)));
+        let before = frozen.shape();
+        frozen.freeze_descriptors();
+        assert_ne!(frozen.shape(), before, "freeze changes the attributes");
+        assert!(!frozen.get("pc_k").unwrap().writable());
+        let after = frozen.shape();
+        frozen.freeze_descriptors();
+        assert_eq!(frozen.shape(), after, "a second freeze changes nothing");
+        after
+    };
+    assert_eq!(frozen_shape(1.0), frozen_shape(2.0));
     let mut accessor_only = Props::new();
     accessor_only.insert("pc_k", Property::accessor_prop(None, None, false, true));
     let accessor_shape = accessor_only.shape();
     accessor_only.freeze_descriptors();
-    assert_eq!(
+    assert_ne!(
         accessor_only.shape(),
         accessor_shape,
-        "configurable-only freeze keeps the shape"
+        "a configurable-only change is an attribute change too"
     );
     assert!(!accessor_only.get("pc_k").unwrap().configurable());
 }

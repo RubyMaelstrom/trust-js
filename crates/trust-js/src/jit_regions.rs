@@ -1475,7 +1475,7 @@ fn emit_borrowed_own_read(
     // No live descriptor-kind check: the receiver shape was just proved equal
     // to the cell shape (directly, or transitively through equal cell shapes
     // on the reuse path), the cell depth byte is 0 (data only), and shapes
-    // encode (key, PropClass) per slot, so (shape, slot) proves this entry
+    // encode (key, attributes) per slot, so (shape, slot) proves this entry
     // is a data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
     emit_borrowed_word_guard(a, prototype_key, fail);
@@ -1572,7 +1572,7 @@ fn emit_borrowed_method(
     a.madd(15, 13, 16, 15);
     // No live descriptor-kind check: holder shape was just proved equal to
     // the baked feedback shape, the baked depth is a data depth (<= 3), and
-    // shapes encode (key, PropClass) per slot, so (shape, slot) proves a
+    // shapes encode (key, attributes) per slot, so (shape, slot) proves a
     // data descriptor. A class-changing write demotes the shape.
     a.ldur(12, 15, layout.entry_value as i32);
     emit_borrowed_word_guard(a, prototype_key, fail);

@@ -4295,14 +4295,14 @@ pub(crate) fn scan_gc_heap_retained_memory(
         shapes
             .transitions
             .len()
-            .saturating_mul(std::mem::size_of::<((u32, PropKey, PropClass), u32)>()),
+            .saturating_mul(std::mem::size_of::<((u32, PropKey, u8), u32)>()),
     );
     bytes = bytes.saturating_add(shapes.layouts.allocated_bytes());
     bytes = bytes.saturating_add(
         shapes
             .recent
             .capacity()
-            .saturating_mul(std::mem::size_of::<Option<(u32, PropKey, PropClass, u32)>>()),
+            .saturating_mul(std::mem::size_of::<Option<(u32, PropKey, u8, u32)>>()),
     );
     for layout in shapes.layouts.iter() {
         visitor.property_layout(layout);
@@ -5580,22 +5580,13 @@ fn accessor_cell(get: Option<Value>, set: Option<Value>) -> usize {
     ptr
 }
 
-/// Descriptor class as encoded in shape transitions (Pilot C): the only descriptor facts
-/// a shape may eventually prove. Until every `&mut Property` escape demotes on class
-/// change, a shape's classes are recorded but are NOT yet a consumer proof — consumers
-/// still re-check descriptor bits live.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-pub(crate) enum PropClass {
-    DataWritable,
-    DataNonWritable,
-    Accessor,
-}
-
 pub(crate) const PROP_ACCESSOR: usize = 1;
 pub(crate) const PROP_WRITABLE: usize = 2;
 pub(crate) const PROP_ENUMERABLE: usize = 4;
 pub(crate) const PROP_CONFIGURABLE: usize = 8;
 const PROP_FLAG_MASK: usize = 15;
+/// A plain data property's attributes: writable, enumerable, configurable.
+pub(crate) const PROP_PLAIN: u8 = (PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE) as u8;
 
 impl Clone for Property {
     fn clone(&self) -> Self {
@@ -5683,17 +5674,12 @@ impl Property {
     pub(crate) fn writable(&self) -> bool {
         self.meta & PROP_WRITABLE != 0
     }
-    /// The descriptor class this property contributes to its object's shape. Accessor
-    /// takes precedence (an accessor descriptor's writable bit is meaningless).
+    /// The four attribute bits ([`PROP_ACCESSOR`], [`PROP_WRITABLE`], [`PROP_ENUMERABLE`] and
+    /// [`PROP_CONFIGURABLE`]) this property contributes to its object's shape: two maps share a
+    /// cacheable shape only if their keys have the same attributes, in the same order.
     #[inline]
-    pub(crate) fn class(&self) -> PropClass {
-        if self.accessor() {
-            PropClass::Accessor
-        } else if self.writable() {
-            PropClass::DataWritable
-        } else {
-            PropClass::DataNonWritable
-        }
+    pub(crate) fn attrs(&self) -> u8 {
+        (self.meta & PROP_FLAG_MASK) as u8
     }
     #[inline]
     pub(crate) fn enumerable(&self) -> bool {
@@ -6747,26 +6733,30 @@ pub(crate) fn bump_proto_epoch() {
 }
 
 /// The object-shape (hidden-class) transition tree. A shape id encodes an *ordered sequence
-/// of (property key, descriptor class) pairs*. A shared cacheable id proves the same keys
-/// in the same order; the recorded classes are not yet a consumer proof — the inline cache
-/// still re-checks accessor/writable at the slot until every `&mut Property` escape demotes
-/// on class change (Pilot C steps 5-6).
-/// `transitions[(parent, key, class)] = child` is memoized within an Agent, so its structurally-identical
-/// objects converge on one id. Fresh IDs are process-wide and never reused: foreign objects and
+/// of (property key, attributes) pairs* (W2d step 2): a shared cacheable id proves the same keys
+/// with the same attributes in the same order. `transitions[(parent, key, attrs)] = child` is
+/// memoized within an Agent, so its structurally-identical objects converge on one id. A change
+/// of an existing key's attributes is a transition too, keyed `(parent, key, attrs |
+/// SHAPE_CHANGE)`, as JSC's attribute-change transition is (Structure.cpp:806-850): objects
+/// making the same change converge on its child. Fresh IDs are process-wide and never reused: foreign objects and
 /// foreign-context mutations cannot collide with another Agent's proofs. A structural *removal* can't be a tree
 /// transition (it doesn't extend the key sequence), so it mints a fresh unique id that no cache
 /// ever holds — forcing a re-derive.
 struct ShapeTable {
-    transitions: crate::fasthash::FastMap<(u32, PropKey, PropClass), u32>,
+    transitions: crate::fasthash::FastMap<(u32, PropKey, u8), u32>,
     /// Bounded tagged lookup: process-wide IDs are never dense within a particular heap.
     layouts: ShapeLayouts,
     /// Direct-mapped memo of recent `transitions` hits keyed by parent shape and key (allocated
     /// on first use): most transitions skip hashing the triple. `transitions` is append-only,
     /// so an entry never disagrees with it.
-    recent: Vec<Option<(u32, PropKey, PropClass, u32)>>,
+    recent: Vec<Option<(u32, PropKey, u8, u32)>>,
 }
 
 const RECENT_TRANSITIONS: usize = 512;
+
+/// The transition-key bit of an attribute change ([`shape_change`]), above the four attribute
+/// bits of a key's addition.
+const SHAPE_CHANGE: u8 = 0x10;
 
 #[inline]
 fn recent_transition_slot(parent: u32, key: PropKey) -> usize {
@@ -6794,14 +6784,14 @@ impl ShapeTable {
     }
 }
 
-/// The child shape reached by adding `key` with descriptor class `class` to shape
-/// `parent` (memoized so it is shared). Two maps with the same keys but different
-/// descriptor classes now get different shapes; the layout still records keys only.
+/// The child shape reached by adding `key` with attributes `attrs` ([`Property::attrs`]) to
+/// shape `parent` (memoized so it is shared). Two maps with the same keys but different
+/// attributes get different shapes; the layout records keys only.
 fn shape_transition(
     parent: u32,
     key: PropKey,
-    class: PropClass,
-    prefix: Option<&[(PropKey, PropClass)]>,
+    attrs: u8,
+    prefix: Option<&[(PropKey, u8)]>,
 ) -> (u32, Option<PropertyLayout>) {
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
@@ -6812,15 +6802,15 @@ fn shape_transition(
         }
         let slot = recent_transition_slot(parent, key);
         let recent = shapes.recent.get(slot).and_then(Option::as_ref).and_then(
-            |(cached_parent, cached_key, cached_class, child)| {
-                (*cached_parent == parent && *cached_key == key && *cached_class == class)
+            |(cached_parent, cached_key, cached_attrs, child)| {
+                (*cached_parent == parent && *cached_key == key && *cached_attrs == attrs)
                     .then_some(*child)
             },
         );
         let id = if let Some(id) = recent {
             id
         } else {
-            let pair = (parent, key, class);
+            let pair = (parent, key, attrs);
             let id = if let Some(&id) = shapes.transitions.get(&pair) {
                 id
             } else {
@@ -6834,7 +6824,7 @@ fn shape_transition(
                 if shapes.recent.is_empty() {
                     shapes.recent.resize(RECENT_TRANSITIONS, None);
                 }
-                shapes.recent[slot] = Some((parent, key, class, id));
+                shapes.recent[slot] = Some((parent, key, attrs, id));
             }
             id
         };
@@ -6862,8 +6852,8 @@ fn shape_transition(
         // Extend only matching predictions, never oscillate between incompatible branches.
         // No shape identity or observable property changes: field count still defines presence.
         let mut prefix_shape = SHAPE_EMPTY;
-        for &(name, class) in prefix {
-            let Some(&prefix_id) = shapes.transitions.get(&(prefix_shape, name, class)) else {
+        for &(name, attrs) in prefix {
+            let Some(&prefix_id) = shapes.transitions.get(&(prefix_shape, name, attrs)) else {
                 break;
             };
             if let Some(prediction) = shapes.layouts.get_mut(prefix_id) {
@@ -6874,6 +6864,28 @@ fn shape_transition(
             prefix_shape = prefix_id;
         }
         (id, Some(layout))
+    })
+}
+
+/// The child shape reached when the existing key `key` of a map of shape `parent` takes the
+/// attributes `attrs` (memoized under `attrs | SHAPE_CHANGE`, as JSC memoizes an attribute
+/// change). The keys keep their order and slots: the map keeps its layout.
+fn shape_change(parent: u32, key: PropKey, attrs: u8) -> u32 {
+    debug_assert!(attrs & !(PROP_FLAG_MASK as u8) == 0);
+    with_active_gc_heap(|heap| {
+        let mut shapes = heap.shapes.borrow_mut();
+        if !is_cacheable_shape(parent) {
+            return SHAPE_UNCACHEABLE;
+        }
+        let pair = (parent, key, attrs | SHAPE_CHANGE);
+        if let Some(&id) = shapes.transitions.get(&pair) {
+            return id;
+        }
+        let id = shapes.fresh();
+        if is_cacheable_shape(id) {
+            shapes.transitions.insert(pair, id);
+        }
+        id
     })
 }
 
@@ -6914,12 +6926,12 @@ fn array_length_shape() -> u32 {
             return cached;
         }
         let mut shapes = heap.shapes.borrow_mut();
-        // Array `length` is created writable; a later non-writable redefinition demotes
-        // through the ordinary insert path like any other class change.
+        // Array `length` is created writable, neither enumerable nor configurable; a later
+        // non-writable redefinition takes the ordinary insert path's attribute change.
         let key = (
             SHAPE_EMPTY,
             crate::atom::names::LENGTH.key(),
-            PropClass::DataWritable,
+            PROP_WRITABLE as u8,
         );
         let shape = if let Some(&shape) = shapes.transitions.get(&key) {
             shape
@@ -7313,13 +7325,13 @@ impl Props {
                 .entries
                 .fields
                 .iter()
-                .all(|property| property.class() == PropClass::DataWritable)
+                .all(|property| property.attrs() == PROP_PLAIN)
         {
-            // Shapes encode (key, class): sharing the source shape is sound only when
-            // every copied field's class matches its plain replacement (all data
-            // writable). Otherwise the per-key insert path below rebuilds the correct
-            // all-writable chain. In particular a frozen source must not produce frozen
-            // copied properties — nor may its non-writable shape be reused for them.
+            // Shapes encode (key, attributes): sharing the source shape is sound only when
+            // every copied field's attributes match its plain replacement's. Otherwise the
+            // per-key insert path below rebuilds the correct plain chain. In particular a frozen
+            // source must not produce frozen copied properties — nor may its shape be reused
+            // for them.
             self.note_structural();
             self.entries.layout = source.entries.layout.clone();
             self.entries.fields.reserve_exact(source.entries.len());
@@ -7521,14 +7533,14 @@ impl Props {
         I: ExactSizeIterator<Item = Value>,
     {
         assert_eq!(values.len(), self.entries.len(), "object-template arity");
-        // The copied shape records the template's classes; the instantiated fields are
-        // all plain (data writable), so the template must be too.
+        // The copied shape records the template's attributes; the instantiated fields are
+        // all plain, so the template's must be too.
         debug_assert!(
             self.entries
                 .fields
                 .iter()
-                .all(|property| property.class() == PropClass::DataWritable),
-            "plain object template with a non-writable or accessor field"
+                .all(|property| property.attrs() == PROP_PLAIN),
+            "plain object template with a field that is not plain"
         );
         let entries = NamedEntries {
             fields: std::mem::ManuallyDrop::new(values.map(Property::plain).collect()),
@@ -7571,10 +7583,7 @@ impl Props {
                     .first()
                     .is_some_and(|&key| key == crate::atom::names::LENGTH.key())
                 && self.entries.iter().skip(1).all(|(key, property)| {
-                    key.as_index().is_none()
-                        && property.class() == PropClass::DataWritable
-                        && property.enumerable()
-                        && property.configurable()
+                    key.as_index().is_none() && property.attrs() == PROP_PLAIN
                 }),
             "array template: an empty array's `length` and plain named properties"
         );
@@ -8561,17 +8570,23 @@ impl Props {
                 self.insert(PropKey::index(n), Property::data(value, false, true, false));
             }
         }
-        let mut class_changed = false;
-        for p in self.entries.fields.iter_mut() {
-            if !p.accessor() && p.writable() {
-                class_changed = true;
-            }
+        // Each key whose attributes change takes its attribute-change transition, in key order,
+        // as `Object.freeze`'s defines do (an array's element entries are exempt, as in
+        // `insert`).
+        let elem_mode = self.elem_mode();
+        let mut shape = self.shape;
+        let len = self.entries.len();
+        for slot in 0..len {
+            let key = self.entries.keys()[slot];
+            let p = &mut self.entries.fields[slot];
+            let before = p.attrs();
             p.set_writable(false);
             p.set_configurable(false);
+            if p.attrs() != before && !(elem_mode && key.as_index().is_some()) {
+                shape = shape_change(shape, key, p.attrs());
+            }
         }
-        if class_changed {
-            self.demote_shape();
-        }
+        self.shape = shape;
     }
     pub(crate) fn contains(&self, key: &str) -> bool {
         self.get(key).is_some()
@@ -8763,15 +8778,14 @@ impl Props {
             self.set_has_far(true);
         }
         if let Some(i) = self.find(key) {
-            // A whole-descriptor replacement that changes descriptor class cannot stay
-            // on a shape that records the old class: demote to a fresh unique shape
-            // (the removal precedent). Array element entries are exempt exactly as in
-            // `remove` — their shape tracks named keys only. Class-preserving
-            // replacements (including enumerable/configurable-only changes) keep it.
-            if self.entries.fields[i].class() != prop.class()
+            // A whole-descriptor replacement that changes the key's attributes cannot stay on a
+            // shape that records the old ones: it takes the attribute-change transition (W2d
+            // step 2). Array element entries are exempt exactly as in `remove` — their shape
+            // tracks named keys only. A replacement that keeps the attributes keeps the shape.
+            if self.entries.fields[i].attrs() != prop.attrs()
                 && !(self.elem_mode() && key.as_index().is_some())
             {
-                self.shape = shape_fresh();
+                self.shape = shape_change(self.shape, key, prop.attrs());
             }
             self.entries.fields[i] = prop;
         } else {
@@ -8792,11 +8806,11 @@ impl Props {
                 .then(|| {
                     self.entries
                         .iter()
-                        .map(|(name, property)| (name, property.class()))
+                        .map(|(name, property)| (name, property.attrs()))
                         .collect::<Vec<_>>()
                 });
                 let (shape, layout) =
-                    shape_transition(self.shape, key, prop.class(), prefix.as_deref());
+                    shape_transition(self.shape, key, prop.attrs(), prefix.as_deref());
                 self.shape = shape;
                 if let Some(layout) = layout {
                     self.entries.layout = Some(layout);
