@@ -585,14 +585,9 @@ fn emit_prop_own(
         layout.obj_kind,
         layout.obj_flags,
         layout.obj_props + layout.props_shape,
-        layout.entry_size,
-        layout.entry_value,
-        layout.entry_accessor,
     ];
     if !layout.valid
-        || !storage::fields_len_fits(layout)
-        || !storage::fields_data_fits(layout)
-        || layout.entry_accessor != layout.entry_value + 8
+        || !storage::named_slots_fit(layout)
         || cache == 0
         || offsets.iter().any(|offset| *offset > i32::MAX as usize)
     {
@@ -635,19 +630,13 @@ fn emit_prop_own(
     a.jcc(0x85, probe);
     a.jmp(slow);
     a.bind(found);
-    storage::fields_len(a, layout, CX, R11); // rcx=live entry count
+    storage::named_len(a, layout, CX, R11); // rcx=live named count
     a.nr_cmp(DX, CX);
     a.jcc(AE, slow);
-    storage::fields_data(a, layout, AX, R11); // rax=live entries
-    a.bytes(&[0x48, 0x69, 0xd2]); // imul rdx,rdx,entry_size
-    a.bytes(&(layout.entry_size as i32).to_le_bytes());
-    a.bytes(&[0x48, 0x01, 0xd0]); // rax=Property address
-    a.bytes(&[0xf6, 0x80]); // reject live accessor, even if its cached shape still matches
-    a.bytes(&(layout.entry_accessor as i32).to_le_bytes());
-    a.bytes(&[crate::value::PROP_ACCESSOR as u8]);
-    a.jcc(0x85, slow);
-    a.bytes(&[0x4c, 0x8b, 0x90]); // r10=borrowed live packed property word
-    a.bytes(&(layout.entry_value as i32).to_le_bytes());
+    storage::slot_addr(a, layout, AX, R11, DX); // rax=the slot (W2d step 2)
+    a.bytes(&[0x4c, 0x8b, 0x10]); // r10=[rax]: the borrowed live slot word
+                                  // An accessor's word (PACK_ACCESSOR) fails the execution-tag guard below, as a deferred
+                                  // prototype's does: the slot keeps no attribute bits to test.
     a.bytes(&[0x4c, 0x89, 0xd0, 0x48, 0xc1, 0xe8, 0x30]); // eax=value tag
     a.cmp_eax((crate::value::PACK_EMPTY >> 48) as u32);
     a.jcc(0x84, slow);
@@ -703,11 +692,11 @@ fn emit_prop_num(
     slow: usize,
 ) -> bool {
     if !layout.valid
-        || !storage::fields_data_fits(layout)
+        || !storage::named_slots_fit(layout)
         || layout.obj_kind > i32::MAX as usize
         || st.depth > 2
         || (st.depth == 2 && st.mid_ok & 1 == 0)
-        || layout.entry_size.checked_mul(st.slot as usize).is_none()
+        || st.slot as usize >= 1 << 20
     {
         return false;
     }
@@ -721,15 +710,6 @@ fn emit_prop_num(
         return false;
     };
     let Ok(proto) = i32::try_from(layout.obj_proto) else {
-        return false;
-    };
-    let Some(entry_base) = layout.entry_size.checked_mul(st.slot as usize) else {
-        return false;
-    };
-    let Ok(value_off) = i32::try_from(entry_base + layout.entry_value) else {
-        return false;
-    };
-    let Ok(accessor_off) = i32::try_from(entry_base + layout.entry_accessor) else {
         return false;
     };
 
@@ -773,15 +753,9 @@ fn emit_prop_num(
         guard_object(a, st.holder_shape, slow);
     }
 
-    // rax=the holder's entries; reject a live accessor descriptor, then decode only packed
-    // Numbers.
-    storage::fields_data(a, layout, AX, R11);
-    a.bytes(&[0xf6, 0x80]);
-    a.bytes(&accessor_off.to_le_bytes());
-    a.bytes(&[crate::value::PROP_ACCESSOR as u8]);
-    a.jcc(0x85, slow);
-    a.bytes(&[0x48, 0x8b, 0x90]); // rdx=packed value
-    a.bytes(&value_off.to_le_bytes());
+    // rdx=the holder's slot word (in the cell, or the record: W2d step 2); decode only packed
+    // Numbers, which an accessor's word (PACK_ACCESSOR, a negative NaN pattern) is not.
+    storage::load_slot_const(a, layout, DX, R11, st.slot as usize);
     a.bytes(&[0x48, 0x89, 0xd0, 0x48, 0xc1, 0xe8, 0x30]); // eax=upper 16 bits
     let number = a.label();
     a.bytes(&[0x3d]);

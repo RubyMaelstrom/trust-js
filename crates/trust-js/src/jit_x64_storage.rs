@@ -1,8 +1,9 @@
-//! x86-64 storage accessors: where the x64 templates find an object's named-field values and a
-//! binding map's entries, in the build's layout (probed into the [`JitLayout`]), as the ARM64
-//! accessors (`jit_storage.rs`) do.
+//! x86-64 storage accessors: where the x64 templates find an object's named slots and a binding
+//! map's entries, in the build's layout (probed into the [`JitLayout`]), as the ARM64 accessors
+//! (`jit_storage.rs`) do. Named slots are one word each, in the cell and then the record (W2d
+//! step 2).
 //!
-//! Both sequences are an `InlineVec` ([`JitVecLayout::Inline`]): 4-byte length
+//! Binding entries are an `InlineVec` ([`JitVecLayout::Inline`]): 4-byte length
 //! and capacity words, with the first elements in the object or environment cell exactly while
 //! the capacity word is 0, else behind a heap pointer. A length is loaded as the 32-bit word it
 //! is: a 64-bit load would read `len | cap << 32`, which passes any bounds check of a spilled
@@ -79,34 +80,115 @@ pub(super) fn vec_data_fits(seq: JitVecLayout, off: usize) -> bool {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Named fields: the `Property` values of the Object at `obj` (a stored cell word plus
-// `obj_from_cell`), in key-layout order
+// Named slots (W2d step 2): the value words of the Object at `obj` (a stored cell word plus
+// `obj_from_cell`), in key-layout order, [`INLINE_NAMED_SLOTS`] in the cell and the rest in the
+// out-of-line record, as the ARM64 emitters address them
 // ---------------------------------------------------------------------------------------------
 
-/// The named-field storage within an Object.
-fn fields_off(layout: &JitLayout) -> usize {
-    layout.obj_props + layout.props_entries
+use crate::value::INLINE_NAMED_SLOTS;
+
+/// The cell's first slot, from the Object.
+fn slots_off(layout: &JitLayout) -> usize {
+    layout.obj_props + layout.props_slots
 }
 
-/// Load the Object's named-field count into `dst` ([`vec_len`]).
-pub(super) fn fields_len(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8) {
-    vec_len(a, layout.repr.props_fields, dst, obj, fields_off(layout));
+/// The record pointer, from the Object.
+fn record_off(layout: &JitLayout) -> usize {
+    layout.obj_props + layout.props_record
 }
 
-/// Load the address of the Object's first named-field `Property` into `dst` ([`vec_data`]).
-/// Field `slot` is `entry_size * slot` bytes on.
-pub(super) fn fields_data(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8) {
-    vec_data(a, layout.repr.props_fields, dst, obj, fields_off(layout));
+/// Load the Object's named count (a `u32`) into `dst`, zero-extended.
+pub(super) fn named_len(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8) {
+    a.nr_load32(dst, obj, layout.obj_props + layout.props_len);
 }
 
-/// Whether [`fields_len`] can address an Object's count.
-pub(super) fn fields_len_fits(layout: &JitLayout) -> bool {
-    layout.repr.valid && vec_len_fits(layout.repr.props_fields, fields_off(layout))
+/// Load the address of slot `slot` (a register holding an index below the count) into `dst`,
+/// which must differ from `obj` and `slot`: in the cell below [`INLINE_NAMED_SLOTS`], else in the
+/// record (which a count past the cell's slots implies). Clobbers the flags.
+pub(super) fn slot_addr(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8, slot: u8) {
+    assert!(
+        dst != obj && dst != slot,
+        "the slot address is built from both"
+    );
+    let record = a.label();
+    let done = a.label();
+    a.nr_op_imm(7, slot, INLINE_NAMED_SLOTS as i32); // cmp slot, INLINE
+    a.jcc(AE, record);
+    a.nr_mov(dst, slot);
+    a.nr_shift(false, dst, 3);
+    a.nr_reg(0x01, dst, obj); // add dst, obj
+    a.nr_op_imm(0, dst, slots_off(layout) as i32); // add dst, slots_off
+    a.jmp(done);
+    a.bind(record);
+    a.nr_mov(dst, slot);
+    a.nr_shift(false, dst, 3);
+    a.nr_mem(true, &[0x03], dst, obj, record_off(layout) as i32); // add dst, [obj+record]
+                                                                  // Slot INLINE + i is record_slots + 8i into the block: dst = record + 8 * slot - the cell's.
+    a.nr_op_imm(
+        5,
+        dst,
+        (8 * INLINE_NAMED_SLOTS - layout.record_slots) as i32,
+    ); // sub
+    a.bind(done);
 }
 
-/// Whether [`fields_data`] can address an Object's field storage.
-pub(super) fn fields_data_fits(layout: &JitLayout) -> bool {
-    layout.repr.valid && vec_data_fits(layout.repr.props_fields, fields_off(layout))
+/// Load the word of slot `slot`, known at compile time, into `dst` (which may be `obj`): one load
+/// in the cell, two through the record.
+pub(super) fn load_slot_const(a: &mut Asm, layout: &JitLayout, dst: u8, obj: u8, slot: usize) {
+    if slot < INLINE_NAMED_SLOTS {
+        a.nr_load(dst, obj, slots_off(layout) + 8 * slot);
+    } else {
+        a.nr_load(dst, obj, record_off(layout));
+        a.nr_load(
+            dst,
+            dst,
+            layout.record_slots + 8 * (slot - INLINE_NAMED_SLOTS),
+        );
+    }
+}
+
+/// R11 = the owner kind of slot `slot` (a register) of the Object at `obj`, as ARM64's
+/// `emit_property_kind` makes x7: 1 for a writable data property, 2 for any other, from the
+/// layout's attribute byte (W2d step 2). Clobbers AX and the flags; `obj` and `slot` must not be
+/// AX or R11.
+pub(super) fn property_kind(a: &mut Asm, layout: &JitLayout, obj: u8, slot: u8) {
+    debug_assert!(![AX, R11].contains(&obj) && ![AX, R11].contains(&slot));
+    let done = a.label();
+    a.nr_imm(R11, 1);
+    a.nr_load(AX, obj, layout.obj_props + layout.props_layout);
+    a.nr_mem(false, &[0x83], 7, AX, layout.layout_attrs_len as i32); // cmp dword [rax+len],0
+    a.bytes(&[0]);
+    a.jcc(EQ, done);
+    a.nr_load(AX, AX, layout.layout_attrs_ptr);
+    a.nr_reg(0x01, AX, slot); // add rax, slot
+    a.nr_load8(AX, AX, 0);
+    a.nr_op_imm(
+        4,
+        AX,
+        (crate::value::PROP_ACCESSOR | crate::value::PROP_WRITABLE) as i32,
+    ); // and
+    a.nr_op_imm(7, AX, crate::value::PROP_WRITABLE as i32); // cmp
+    a.jcc(EQ, done);
+    a.nr_imm(R11, 2);
+    a.bind(done);
+}
+
+/// Whether the named-slot emitters above can address an Object's slots, count and record, and a
+/// layout's attribute bytes, with their disp32 forms.
+pub(super) fn named_slots_fit(layout: &JitLayout) -> bool {
+    layout.valid
+        && [
+            slots_off(layout) + 8 * INLINE_NAMED_SLOTS,
+            record_off(layout),
+            layout.obj_props + layout.props_len,
+            layout.record_slots,
+            layout.obj_props + layout.props_layout,
+            layout.layout_attrs_len,
+            layout.layout_attrs_ptr,
+        ]
+        .iter()
+        .all(|&off| fits_disp32(off, 0))
+        && layout.record_slots <= 8 * INLINE_NAMED_SLOTS
 }
 
 // ---------------------------------------------------------------------------------------------

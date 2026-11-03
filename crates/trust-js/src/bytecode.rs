@@ -28838,15 +28838,8 @@ mod return_slot_tests {
                 crate::value::Object::new(None),
                 &crate::value::Props::with_layout(0, Some(keys.clone())),
             );
-            let entry_value = crate::value::jit_layout(&owner).entry_value;
-            // The word at the offset generated stores address it by.
-            let word = unsafe {
-                (&raw const *property)
-                    .cast::<u8>()
-                    .add(entry_value)
-                    .cast::<u64>()
-                    .read()
-            };
+            // The property's value word, as a slot stores it (W2d step 2).
+            let word = property.packed_bits_for_test();
             word & !0xffff_ffff_ffff == crate::value::PACK_LAZY_PROTO
         });
         assert!(deferred, "the property holds a lazy word");

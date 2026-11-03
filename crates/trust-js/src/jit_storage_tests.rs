@@ -115,30 +115,40 @@ fn sequence_emitters_follow_both_layouts() {
 }
 
 #[test]
-fn named_field_emitters_read_live_objects() {
+fn named_slot_emitters_read_live_objects() {
     let engine = crate::Engine::new();
     let layout = layout(&engine);
-    assert!(fields_len_fits(&layout) && fields_capacity_fits(&layout) && fields_data_fits(&layout));
-    // Field `x1` of the Object at x0, as the property templates read it: the bounds check against
-    // the live count, then the packed word at `data + slot * entry_size`.
+    assert!(named_slots_fit(&layout));
+    // Slot `x1` of the Object at x0, as the property templates read it (W2d step 2): the bounds
+    // check against the live count, then the word at the slot's address, in the cell or the
+    // record.
     let (_value_code, value) = assemble(|a| {
         let miss = a.new_label();
-        fields_len(a, &layout, 2, 0);
+        named_len(a, &layout, 2, 0);
         a.cmp_reg_x(1, 2);
         a.b_cond(C_HS, miss);
-        fields_data(a, &layout, 3, 0);
-        a.mov_imm64(4, layout.entry_size as u64);
-        a.madd(3, 1, 4, 3);
-        a.ldur(0, 3, layout.entry_value as i32);
+        slot_addr(a, &layout, 3, 0, 1);
+        a.ldur(0, 3, 0);
         ret_none(a, miss);
     });
-    let (_capacity_code, capacity) = assemble(|a| {
-        fields_capacity(a, &layout, 1, 0);
-        ret_reg(a, 1);
+    // The room check of a creation, and the owner kind of a name's property.
+    let (_room_code, room) = assemble(|a| {
+        let miss = a.new_label();
+        named_len(a, &layout, 2, 0);
+        guard_named_room(a, &layout, 2, 0, 3, miss);
+        a.movz(0, 1, 0);
+        a.ret();
+        a.bind(miss);
+        a.movz(0, 0, 0);
+        a.ret();
     });
-    let (_set_code, set_len) = assemble(|a| fields_set_len(a, &layout, 1, 0));
-    // In place up to four fields; spilled beyond.
-    for count in [1usize, 2, 4, 5, 9] {
+    let (_kind_code, kind) = assemble(|a| {
+        emit_property_kind(a, &layout, 0, 1, 2, 3);
+        ret_reg(a, 7);
+    });
+    let (_set_code, set_len) = assemble(|a| named_set_len(a, &layout, 1, 0));
+    // In the cell up to seven slots; the rest in the record.
+    for count in [1usize, 2, 6, 7, 8, 9, 13, 14, 40] {
         let object = Object::new(None);
         for slot in 0..count {
             object.borrow_mut().props.insert(
@@ -161,14 +171,40 @@ fn named_field_emitters_read_live_objects() {
                 ),
                 None => assert_eq!(read, usize::MAX, "{count} fields, slot {slot}"),
             }
+            if slot < count {
+                // Plain data: kind 1.
+                assert_eq!(kind(base, slot), 1, "{count} fields, slot {slot}");
+            }
         }
-        assert_eq!(capacity(base, 0), object.borrow().props.named_capacity());
+        let capacity = object.borrow().props.named_capacity();
+        assert_eq!(
+            room(base, 0),
+            usize::from(count < capacity),
+            "{count} fields: room for one more"
+        );
         // A creation commit publishes the count last; drop the count and restore it.
         set_len(base, count - 1);
         assert_eq!(object.borrow().props.named_len(), count - 1);
         set_len(base, count);
         assert_eq!(object.borrow().props.named_len(), count);
     }
+    // A slot that is not a writable data property: kind 2, from the layout's attribute byte.
+    let object = Object::new(None);
+    object
+        .borrow_mut()
+        .props
+        .insert("data", Property::plain(Value::Num(1.0)));
+    object
+        .borrow_mut()
+        .props
+        .insert("fixed", Property::data(Value::Num(2.0), false, true, true));
+    object
+        .borrow_mut()
+        .props
+        .insert("get", Property::accessor_prop(None, None, true, true));
+    let stored = unsafe { *(&object as *const crate::value::Gc as *const usize) };
+    let base = stored + layout.obj_from_cell;
+    assert_eq!([kind(base, 0), kind(base, 1), kind(base, 2)], [1, 2, 2]);
 }
 
 #[test]

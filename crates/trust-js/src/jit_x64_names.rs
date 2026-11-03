@@ -45,12 +45,10 @@ fn valid(l: &JitLayout) -> bool {
         && l.binding_value == 0
         && l.scope_binding_stride == 8
         && l.scope_binding_offset == 0
-        && storage::fields_len_fits(l)
-        && storage::fields_data_fits(l)
+        && storage::named_slots_fit(l)
         && l.scope_parent_valid
         && l.scope_with_valid
         && l.key_probe_ok
-        && l.entry_accessor == l.entry_value + 8
         && [
             l.scope_gen,
             l.scope_layout,
@@ -63,10 +61,6 @@ fn valid(l: &JitLayout) -> bool {
             l.obj_props + l.props_shape,
             l.obj_flags,
             l.obj_kind,
-            l.entry_size,
-            l.entry_value,
-            l.entry_accessor,
-            l.entry_writable,
             l.obj_from_cell,
             l.str_ptr_word,
             l.str_len_word,
@@ -82,8 +76,9 @@ fn scope_plain(a: &mut Asm, l: &JitLayout, slow: usize) {
     a.jcc(NE, slow);
 }
 
-/// R9=Object (a stored cell word plus `obj_from_cell`), AX=shape, DX=slot. Output CX=Property,
-/// R11=1. No value flags yet. `valid` admitted the layout. A global object is never a Map or Set
+/// R9=Object (a stored cell word plus `obj_from_cell`), AX=shape, DX=slot. Output CX=the slot's
+/// address, R11=its owner kind (1 for a writable data property, 2 for any other: the layout's
+/// attributes, W2d step 2). No value flags yet. `valid` admitted the layout. A global object is never a Map or Set
 /// (the VM checks `ObjectKind::ExoticNone` there); a Reference's object base (`ordinary`) may be any object
 /// with ordinary internal methods, as ARM64's Reference template admits.
 fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
@@ -101,13 +96,11 @@ fn global_target(a: &mut Asm, l: &JitLayout, ordinary: bool, slow: usize) {
     a.nr_load8(CX, R9, l.obj_flags);
     a.nr_op_imm(4, CX, i32::from(crate::value::FLAG_IC_PLAIN)); // and
     a.jcc(EQ, slow);
-    storage::fields_len(a, l, CX, R9);
+    storage::named_len(a, l, CX, R9);
     a.nr_cmp(DX, CX);
     a.jcc(AE, slow);
-    storage::fields_data(a, l, CX, R9);
-    a.nr_mul_imm(DX, l.entry_size);
-    a.nr_reg(0x01, CX, DX);
-    a.nr_imm(R11, 1);
+    storage::slot_addr(a, l, CX, R9, DX);
+    storage::property_kind(a, l, R9, DX);
 }
 
 /// R8 supplies a validated layout's slot index; R9 is its actual current scope. Address
@@ -313,7 +306,7 @@ fn name_target(a: &mut Asm, l: &JitLayout, cache: usize, hops: u16, slow: usize)
 /// binding's TDZ (the proof that found it covers its attributes: a cache's fill refused an
 /// import, and a writing site's an immutable binding; a Reference names a plain binding only),
 /// a property's descriptor.
-fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
+fn value_address(a: &mut Asm, _l: &JitLayout, store: bool, slow: usize) {
     let property = a.label();
     let done = a.label();
     a.nr_test(R11);
@@ -327,16 +320,16 @@ fn value_address(a: &mut Asm, l: &JitLayout, store: bool, slow: usize) {
     }
     a.jmp(done);
     a.bind(property);
-    a.nr_load(AX, CX, l.entry_accessor);
-    a.nr_op_imm(4, AX, crate::value::PROP_ACCESSOR as i32);
-    a.nr_test(AX);
-    a.jcc(NE, slow);
+    // A data property: an accessor's word (PACK_ACCESSOR) takes the checked path; a store needs
+    // owner kind 1, a writable one (W2d step 2).
+    a.nr_load(AX, CX, 0);
+    a.nr_shift(true, AX, 48);
+    a.nr_op_imm(7, AX, (crate::value::PACK_ACCESSOR >> 48) as i32); // cmp
+    a.jcc(EQ, slow);
     if store {
-        a.nr_load(AX, CX, l.entry_writable);
-        a.nr_op_imm(4, AX, crate::value::PROP_WRITABLE as i32);
-        a.nr_zero_guard(AX, slow);
+        a.nr_op_imm(7, R11, 1); // cmp r11, 1
+        a.jcc(NE, slow);
     }
-    a.nr_lea(CX, CX, l.entry_value as i32);
     a.bind(done);
 }
 

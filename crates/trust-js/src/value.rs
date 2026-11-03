@@ -1446,10 +1446,20 @@ pub struct JitLayout {
     /// [`FLAG_CONSTRUCTOR`] and the class kind's two bits.
     pub obj_flags: usize,
     pub props_shape: usize,
-    /// The contiguous instance-field storage within `Props` (an `InlineVec` holding the first
-    /// fields in the cell). Generated code reaches its elements, length and capacity only as
-    /// `JitRepr::props_fields` describes.
-    pub props_entries: usize,
+    /// The named slots within `Props` (W2d step 2): one word each, [`INLINE_NAMED_SLOTS`] of them
+    /// in the cell from `props_slots`, the rest in the out-of-line record that the pointer at
+    /// `props_record` addresses (null while the map has none), slot `INLINE_NAMED_SLOTS + i`
+    /// `record_slots + 8 * i` bytes into its block, whose slot capacity (a `u32`) is at
+    /// `record_cap` and whose key index pointer (null while the map keeps none) at
+    /// `record_index`. The named count is the `u32` at `props_len`. A slot's attributes are its
+    /// layout's, which the shape proves: a slot holds only its value word (an accessor's pair
+    /// under [`PACK_ACCESSOR`]).
+    pub props_slots: usize,
+    pub props_record: usize,
+    pub props_len: usize,
+    pub record_slots: usize,
+    pub record_cap: usize,
+    pub record_index: usize,
     /// Nullable stored layout cell address; live keys are its fields-length prefix.
     pub props_layout: usize,
     /// Stored layout cell address -> its key count (a `u32`) and the address of its keys, one
@@ -1459,9 +1469,10 @@ pub struct JitLayout {
     pub shape_layout_entry_size: usize,
     pub shape_layout_entry_id: usize,
     pub shape_layout_entry_keys: usize,
-    /// The map's own key index within `Props`: a nullable pointer, non-null while the map keeps
-    /// an index of its own (`Props::build_index`).
-    pub props_elems: usize,
+    /// A layout's attribute bytes ([`LayoutAttrs`]): their count (a `u32`, 0 while every key is
+    /// plain) and their block's address, within the layout cell.
+    pub layout_attrs_len: usize,
+    pub layout_attrs_ptr: usize,
     /// The element words' pointer within `Props` (W2c, [`word_block::Words`]): the address of
     /// the first word, never null (a map without words points past the static empty block's
     /// header, whose used length is zero). A word is a plain element's value, a hole the
@@ -1474,18 +1485,6 @@ pub struct JitLayout {
     pub words_capacity: usize,
     pub words_shifted: usize,
     pub words_flags: usize,
-    /// `size_of::<Property>()` — the keyless instance-field stride.
-    pub entry_size: usize,
-    /// Packed value within a keyless instance field.
-    pub entry_value: usize,
-    /// Descriptor flags byte within an entry (used to test `PROP_ACCESSOR`).
-    pub entry_accessor: usize,
-    /// Descriptor flags byte within an entry (used to test `PROP_WRITABLE`).
-    pub entry_writable: usize,
-    /// Standalone `Property` layout used by keyless packed elements.
-    pub property_size: usize,
-    pub property_value: usize,
-    pub property_meta: usize,
     /// The element words' pointer and header matched a live probe.
     pub words_valid: bool,
     /// `ObjectKind::Array`'s discriminant byte (the element templates also accept arrays). The
@@ -1584,8 +1583,6 @@ pub(crate) enum JitVecLayout {
 /// interpreter's fields at probed offsets.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct JitRepr {
-    /// How the instance-field storage at `JitLayout::props_entries` holds its `Property` values.
-    pub(crate) props_fields: JitVecLayout,
     /// Where a small (or indexed) binding map keeps its ordered entries, and how: an `InlineVec`
     /// keeping the first binding in the environment cell. The source of `JitLayout`'s
     /// `scope_small_*` fields; `None` when the probe disagreed.
@@ -1601,19 +1598,10 @@ pub(crate) fn jit_repr() -> &'static JitRepr {
 }
 
 fn probe_jit_repr() -> JitRepr {
-    // Named fields (W2d step 2): one word each, INLINE_NAMED_SLOTS in the cell and the rest in
-    // the record. Generated code does not read them yet: every named-field template fails
-    // closed until its emitters address the new slots.
-    let props_fields: Option<JitVecLayout> = None;
-
+    // Named fields (W2d step 2) have a fixed layout: `JitLayout`'s slot offsets are exact.
     JitRepr {
-        props_fields: props_fields.unwrap_or(JitVecLayout::Vec {
-            ptr: 0,
-            len: 0,
-            cap: 0,
-        }),
         scope_small: Some(crate::interpreter::VarMap::jit_slots_layout()),
-        valid: props_fields.is_some(),
+        valid: true,
     }
 }
 
@@ -1679,8 +1667,35 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             }
             _ => (0, 0, false),
         };
+    // The attribute bytes beside the keys (W2d step 2): measured the same way, on a layout
+    // whose second key is not plain.
+    let attrs_layout = PropertyLayout(crate::gc_box::new(PropertyLayoutData::with_attrs([
+        (PropKey::index(7), PROP_PLAIN),
+        (PropKey::index(9), PROP_WRITABLE as u8),
+    ])));
+    let attrs: &LayoutAttrs = &attrs_layout.attrs;
+    let attrs_word = attrs_layout.cell_word() as usize;
+    let attrs_off = (attrs as *const LayoutAttrs as usize).wrapping_sub(attrs_word);
+    let (layout_attrs_len, layout_attrs_ptr, attrs_ok) =
+        match LayoutAttrs::probe_jit_layout(|| PROP_WRITABLE as u8) {
+            Some(JitVecLayout::Inline { len, heap, .. }) => {
+                let (len, ptr) = (attrs_off + len, attrs_off + heap);
+                // SAFETY: measured offsets of fields within the live layout cell.
+                let (live_len, live_ptr) = unsafe {
+                    (
+                        ((attrs_word + len) as *const u32).read(),
+                        ((attrs_word + ptr) as *const usize).read(),
+                    )
+                };
+                let ok = live_len == 2 && live_ptr == <[u8]>::as_ptr(attrs) as usize;
+                (len, ptr, ok)
+            }
+            _ => (0, 0, false),
+        };
     let empty_layout: Option<PropertyLayout> = None;
     let layout_ok = keys_off < 256
+        && attrs_ok
+        && attrs_off < 256
         && std::mem::size_of::<PropKey>() == 8
         && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
         && unsafe { *(&empty_layout as *const Option<PropertyLayout> as *const usize) } == 0;
@@ -1924,32 +1939,29 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         obj_props: offset_of!(Object, props),
         obj_flags: offset_of!(Object, props) + offset_of!(Props, flags),
         props_shape: offset_of!(Props, entries) + offset_of!(NamedEntries, shape),
-        props_entries: offset_of!(Props, entries) + offset_of!(NamedEntries, inline),
+        props_slots: offset_of!(Props, entries) + offset_of!(NamedEntries, inline),
+        props_record: offset_of!(Props, entries) + offset_of!(NamedEntries, record),
+        props_len: offset_of!(Props, entries) + offset_of!(NamedEntries, len),
+        record_slots: RECORD_SLOTS_OFF,
+        record_cap: RECORD_CAP_OFF,
+        record_index: RECORD_INDEX_OFF,
+        layout_attrs_len,
+        layout_attrs_ptr,
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
         layout_keys_len,
         layout_keys_ptr,
         shape_layout_entry_size,
         shape_layout_entry_id,
         shape_layout_entry_keys,
-        props_elems: offset_of!(Props, entries) + offset_of!(NamedEntries, record),
         props_words,
         words_used,
         words_capacity,
         words_shifted,
         words_flags,
-        // One word per slot, no descriptor word beside it: the templates that read a slot's
-        // flags fail closed on these (W2d step 2) until their emitters change.
-        entry_size: std::mem::size_of::<PropWord>(),
         str_len_word,
         str_ptr_word,
         str_data_off,
         key_probe_ok,
-        entry_value: 0,
-        entry_accessor: 0,
-        entry_writable: 0,
-        property_size: std::mem::size_of::<Property>(),
-        property_value: offset_of!(Property, packed),
-        property_meta: offset_of!(Property, meta),
         words_valid,
         exotic_array_tag,
         exotic_strwrap_tag,
@@ -5787,6 +5799,11 @@ impl Property {
     pub(crate) fn into_value(mut self) -> Value {
         self.take_value()
     }
+    /// The value word's bits (tests of deferred prototypes).
+    #[cfg(test)]
+    pub(crate) fn packed_bits_for_test(&self) -> u64 {
+        self.packed.bits()
+    }
     /// A data property read in place, as a map's slot would lend it (tests).
     #[cfg(test)]
     pub(crate) fn data_ref_for_test(&self) -> PropRef<'_> {
@@ -5807,16 +5824,6 @@ impl Property {
     #[inline]
     pub(crate) fn value(&self) -> Value {
         self.packed.materialize()
-    }
-    /// Whether this data property holds exactly the object at `expected`, compared without
-    /// creating an owner. A deferred prototype has no address yet and never matches.
-    #[inline]
-    pub(crate) fn holds_object(&self, expected: *const RefCell<Object>) -> bool {
-        !self.accessor()
-            && self
-                .packed
-                .with_object(|object| std::ptr::eq(Gc::as_ptr(object), expected))
-                .unwrap_or(false)
     }
     /// OrdinaryGet's own-data Number case, with no getter invocation or value conversion.
     /// Callers must still prove ordinary internal methods and fall back for every other case.
@@ -5840,6 +5847,7 @@ impl Property {
     }
     /// Make this property's value `owner`'s deferred MakeConstructor prototype: a lazy word
     /// naming a new [`LazyProto`], a cell in the active heap (which is `owner`'s).
+    #[cfg(test)]
     pub(crate) fn defer_function_prototype(&mut self, owner: &Gc, parent: Gc, template: &Props) {
         self.packed = PropWord::deferred_prototype(owner, parent, template);
     }
@@ -5852,12 +5860,6 @@ impl Property {
     #[inline]
     pub(crate) fn is_plain_element(&self) -> bool {
         self.meta == PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE && !self.is_empty()
-    }
-    /// A plain element's attributes, whether the slot holds an element or a hole (packed
-    /// storage writes a hole as `Property::plain(Value::Empty)`).
-    #[inline]
-    pub(crate) fn has_plain_element_attributes(&self) -> bool {
-        self.meta == PROP_WRITABLE | PROP_ENUMERABLE | PROP_CONFIGURABLE
     }
     #[inline]
     pub(crate) fn set_value(&mut self, value: Value) {
@@ -6510,14 +6512,9 @@ impl PropertyLayoutData {
         if self.attrs.is_empty() {
             PROP_PLAIN
         } else {
+            debug_assert_eq!(self.attrs.len(), self.keys.len());
             self.attrs[i]
         }
-    }
-
-    /// Whether every key is plain (no attribute bytes).
-    #[inline]
-    pub(crate) fn all_plain(&self) -> bool {
-        self.attrs.is_empty()
     }
 
     /// Give every key its attribute byte, before a key that is not plain.
@@ -6529,13 +6526,16 @@ impl PropertyLayoutData {
     }
 
     fn push(&mut self, key: PropKey, attrs: u8) {
-        if attrs != PROP_PLAIN {
+        // Spelled out from the first key that is not plain on (the first key included).
+        let spelled = !self.attrs.is_empty() || attrs != PROP_PLAIN;
+        if spelled {
             self.spell_out_attrs();
         }
         self.keys.push(key);
-        if !self.attrs.is_empty() {
+        if spelled {
             self.attrs.push(attrs);
         }
+        debug_assert!(self.attrs.is_empty() || self.attrs.len() == self.keys.len());
     }
 
     fn truncate(&mut self, len: usize) {

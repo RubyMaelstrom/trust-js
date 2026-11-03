@@ -382,11 +382,9 @@ pub(super) fn emit(
                     && elem_inlinable(layout)
                     // Packed local stores are enabled with the complete numeric-loop pipeline.
                     // In reduced diagnostic masks, mixing this baseline store with helper-side
-                    // name/element state can violate Navier's aliasing checksum; the old wide
-                    // property layout remains independently safe.
-                    && (layout.entry_accessor != layout.entry_value + 8
-                        || fast & (1024 | 8192 | 32768 | 262144)
-                            == (1024 | 8192 | 32768 | 262144))
+                    // name/element state can violate Navier's aliasing checksum.
+                    && fast & (1024 | 8192 | 32768 | 262144)
+                        == (1024 | 8192 | 32768 | 262144)
                     && (*slot as u32) * 8 + 8 < 4096 =>
         {
             emit_elem_local_inline(
@@ -667,11 +665,7 @@ pub(super) fn emit(
             );
         }
         Op::UpdateElem(kind)
-            if fast & 2048 != 0
-                && fast & 65536 != 0
-                && layout.valid
-                && elem_inlinable(layout)
-                && layout.entry_accessor == layout.entry_value + 8 =>
+            if fast & 2048 != 0 && fast & 65536 != 0 && layout.valid && elem_inlinable(layout) =>
         {
             emit_update_elem_inline(a, layout, *kind, pc as u32, unwind);
         }

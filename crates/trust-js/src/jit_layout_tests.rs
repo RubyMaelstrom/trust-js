@@ -89,13 +89,13 @@ fn layout_is_valid_with_the_build_ownership() {
         Gc::as_ptr(&object) as usize,
         "the stored word is the cell address, the `Gc::as_ptr` identity"
     );
-    assert!(matches!(
-        layout.repr.props_fields,
-        JitVecLayout::Inline {
-            inline_capacity: INLINE_NAMED_SLOTS,
-            ..
-        }
-    ));
+    // Named slots (W2d step 2): seven words in the cell, then the record.
+    assert_eq!(INLINE_NAMED_SLOTS, 7);
+    assert_eq!(
+        layout.props_slots + 8 * INLINE_NAMED_SLOTS,
+        std::mem::size_of::<crate::value::Props>(),
+        "the cell's slots end the map, and the 128-byte cell"
+    );
     // A record's cell holds at least two slots in place (more in a larger cell).
     assert!(matches!(
         entries_of(&layout),
@@ -183,7 +183,7 @@ fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
         let base = body(&layout, &object) + layout.obj_props;
         let borrowed = object.borrow();
         let props = &borrowed.props;
-        let record = read::<usize>(base, layout.props_elems);
+        let record = read::<usize>(base, layout.props_record);
         assert_eq!(
             record != 0,
             count > INLINE_NAMED_SLOTS,
@@ -191,7 +191,7 @@ fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
         );
         for slot in 0..count {
             let expected = if slot < INLINE_NAMED_SLOTS {
-                base + layout.props_entries + slot * 8
+                base + layout.props_slots + slot * 8
             } else {
                 record + crate::value::RECORD_SLOTS_OFF + (slot - INLINE_NAMED_SLOTS) * 8
             };

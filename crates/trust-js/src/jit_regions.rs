@@ -1466,18 +1466,16 @@ fn emit_borrowed_own_read(
         a.b_cond(C_NE, fail);
     }
     a.ldr_w_imm(13, 12, IC_OFF_SLOT);
-    fields_len(a, layout, 16, 11);
+    named_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, layout.entry_size as u64);
-    a.madd(15, 13, 16, 15);
+    slot_addr(a, layout, 15, 11, 13);
     // No live descriptor-kind check: the receiver shape was just proved equal
     // to the cell shape (directly, or transitively through equal cell shapes
     // on the reuse path), the cell depth byte is 0 (data only), and shapes
-    // encode (key, attributes) per slot, so (shape, slot) proves this entry
-    // is a data descriptor. A class-changing write demotes the shape.
-    a.ldur(12, 15, layout.entry_value as i32);
+    // encode (key, attributes) per slot, so (shape, slot) proves this slot
+    // holds a data property's word. An attribute change moves the shape.
+    a.ldur(12, 15, 0);
     emit_borrowed_word_guard(a, prototype_key, fail);
     a.fmov_d_x(output, 12);
     #[cfg(test)]
@@ -1564,17 +1562,15 @@ fn emit_borrowed_method(
         a.b_cond(C_NE, fail);
     }
     a.mov_imm64(13, state.slot as u64);
-    fields_len(a, layout, 16, 11);
+    named_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, fail);
-    fields_data(a, layout, 15, 11);
-    a.mov_imm64(16, layout.entry_size as u64);
-    a.madd(15, 13, 16, 15);
+    slot_addr_const(a, layout, 15, 11, state.slot as usize);
     // No live descriptor-kind check: holder shape was just proved equal to
     // the baked feedback shape, the baked depth is a data depth (<= 3), and
     // shapes encode (key, attributes) per slot, so (shape, slot) proves a
-    // data descriptor. A class-changing write demotes the shape.
-    a.ldur(12, 15, layout.entry_value as i32);
+    // data property's word. An attribute change moves the shape.
+    a.ldur(12, 15, 0);
     emit_borrowed_word_guard(a, prototype_key, fail);
     a.fmov_d_x(16 + depth as u32, 12);
     #[cfg(test)]
@@ -1911,7 +1907,6 @@ fn plan_name_element(
     if env_flag!("TRUST_JS_JIT_NO_NAME_ELEM")
         || !layout.valid
         || layout.native_typed_array.is_none()
-        || layout.entry_accessor != layout.entry_value + 8
         || fast & 8192 == 0
         || !load_name_inlinable(layout)
     {
@@ -3088,7 +3083,6 @@ pub(super) fn emit(
                 Op::GetPropLocal(_, _, _) | Op::GetPropThis(_, _)
                     if fast & 256 != 0
                         && get_prop_inlinable(layout)
-                        && layout.entry_accessor == layout.entry_value + 8
                         && borrowed_own_state(chunk, &ops[pc]).is_some()
                         && !matches!(ops[pc], Op::GetPropLocal(slot, ..)
                             if plan.reg(slot).is_some() || slot as u32 * 8 + 8 >= 4096) =>
@@ -4090,8 +4084,7 @@ fn emit_effect(
             if fast & 2048 != 0
                 && elem_inlinable(layout)
                 && slot as u32 * 8 + 8 < 4096
-                && (layout.entry_accessor != layout.entry_value + 8
-                    || fast & (1024 | 8192 | 32768 | 262144) == (1024 | 8192 | 32768 | 262144)) =>
+                && fast & (1024 | 8192 | 32768 | 262144) == (1024 | 8192 | 32768 | 262144) =>
         {
             // Keep the baseline emitter's diagnostic-mask eligibility identical.
             emit_elem_local_inline(

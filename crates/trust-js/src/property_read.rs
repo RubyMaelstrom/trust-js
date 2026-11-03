@@ -7,7 +7,7 @@
 
 use super::{Abrupt, Interp};
 use crate::feedback::{CurrentPropertyTrace, PropertyOutcome};
-use crate::value::{Property, Value};
+use crate::value::Value;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(u8)]

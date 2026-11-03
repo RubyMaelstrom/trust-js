@@ -161,14 +161,12 @@ fn emit_deep_name_target_ptr(
     a.cmp_reg_w(13, 15);
     a.b_cond(C_NE, slow);
     a.ldr_imm(13, 12, offset_of!(NativeNameDescriptor, slot) as u32);
-    fields_len(a, layout, 15, 14);
+    named_len(a, layout, 15, 14);
     a.cmp_reg_x(13, 15);
     a.b_cond(C_HS, slow);
-    fields_data(a, layout, 15, 14);
-    a.mov_imm64(16, layout.entry_size as u64);
-    a.madd(15, 13, 16, 15);
+    slot_addr(a, layout, 15, 14, 13);
+    emit_property_kind(a, layout, 14, 13, 16, 17); // x7 = 1 (writable) or 2
     a.mov(14, 15);
-    a.movz(7, 1, 0);
     a.bind(done);
 }
 
@@ -206,19 +204,22 @@ pub(super) fn emit_deep_name_value_ptr(
     }
 }
 
-/// x14 = a binding slot (x7 0) or a Property (x7 1) → its value's address, after the live checks:
-/// a binding's TDZ, the empty word (the proof that found it covers its attributes: a deep cache's
-/// fill refused an import, a Reference names a plain binding only), or a property's data
-/// descriptor. Clobbers x13 and x15.
-fn emit_target_value_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout, slow: usize) {
+/// x14 = a binding slot (x7 0) or a property's slot (x7 1 or 2) → its value's address, after the
+/// live checks: a binding's TDZ, the empty word (the proof that found it covers its attributes: a
+/// deep cache's fill refused an import, a Reference names a plain binding only), or a data
+/// property's word (an accessor's, under PACK_ACCESSOR, takes the checked path; W2d step 2).
+/// Clobbers x13 and x15.
+fn emit_target_value_ptr(a: &mut asm::Asm, _layout: &crate::value::JitLayout, slow: usize) {
     let property = a.new_label();
     let done = a.new_label();
     a.cbnz(7, false, property);
     emit_tdz_guard(a, 13, 14, 15, slow);
     a.b(done);
     a.bind(property);
-    guard_prop_data(a, 13, 14, layout.entry_accessor as u32, slow);
-    a.add_imm(14, 14, layout.entry_value as u32);
+    a.ldr_imm(13, 14, 0);
+    a.lsr_imm(13, 13, 48);
+    a.cmp_imm_w(13, (crate::value::PACK_ACCESSOR >> 48) as u32);
+    a.b_cond(C_EQ, slow);
     a.bind(done);
 }
 
@@ -260,12 +261,11 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
     a.cmp_reg_w(10, 11);
     a.b_cond(C_NE, slow);
     a.ldr_imm(10, 8, offset_of!(R, slot) as u32);
-    fields_len(a, layout, 11, 9);
+    named_len(a, layout, 11, 9);
     a.cmp_reg_x(10, 11);
     a.b_cond(C_HS, slow);
-    fields_data(a, layout, 14, 9);
-    a.mov_imm64(11, layout.entry_size as u64);
-    a.madd(14, 10, 11, 14);
+    slot_addr(a, layout, 14, 9, 10);
+    emit_property_kind(a, layout, 9, 10, 11, 13); // x7 = 1 (writable) or 2
     a.bind(done);
 }
 

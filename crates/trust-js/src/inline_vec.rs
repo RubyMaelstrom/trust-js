@@ -176,6 +176,7 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
         }
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reserve_exact(&mut self, additional: usize) {
         let needed = self
             .len()
@@ -241,6 +242,7 @@ impl<T, const N: usize, S: Spill> InlineVec<T, N, S> {
     }
 
     /// Keep the elements `keep` accepts, in order; drop the others.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         let len = self.len();
         // A panicking `keep` leaks the unvisited tail rather than dropping anything twice.
