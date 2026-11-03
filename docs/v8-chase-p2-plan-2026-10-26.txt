@@ -6495,3 +6495,50 @@ recording only sites whose function stays hot after the record; both are designs
 The lib tests that would need changing if it landed check native residency, call-cache epochs or
 one activation record a level right after a site recorded and discarded the code
 (traced_tests' assert_native, the math intrinsics' epoch test, rooting_tests' census).
+
+### Region admission so far (record, 2026-11-03)
+
+Landed:
+- step 1, the region IR in linear time (b36823b4);
+- step 4b's first part, the fused typed-array access reading static names in place (6ba8756b);
+- step 2, the budget in operations with no size test (91cab361);
+- step 4a, static names, numeric element reads and stores in place (805fac44, 32f3fd3f,
+  5cbcad6a);
+- step 4c's first part, TailDeep in place (03a57cc4).
+
+Step 3 is measured and parked (above). Against the item's start (fat LTO; Octane at five runs
+with clock.js):
+| | 5d40ee64 | 5cbcad6a | change |
+| --- | --- | --- | --- |
+| Vue | 1,892,196,944 | 1,875,736,106 | -0.87% |
+| React | 337,925,403 | 337,643,784 | -0.08% |
+| Djot | 676,746,931 | 673,764,130 | -0.44% |
+| chai | 83,476,909,792 | 83,464,325,803 | -0.02% |
+| Richards | 141,837,303 | 141,931,024 | +0.07% |
+| DeltaBlue | 295,500,987 | 266,288,033 | -9.89% |
+| Crypto | 750,426,299 | 749,430,946 | -0.13% |
+| RayTrace | 1,059,323,560 | 1,056,024,464 | -0.31% |
+| EarleyBoyer | 3,669,255,362 | 3,642,603,530 | -0.73% |
+| RegExp | 2,839,511,449 | 2,827,236,235 | -0.43% |
+| Splay | 1,890,605,127 | 1,888,127,282 | -0.13% |
+| NavierStokes | 496,779,235 | 458,723,356 | -7.66% |
+| PdfJS | 8,123,823,638 | 8,082,478,194 | -0.51% |
+| Mandreel | 65,815,609,179 | 65,702,931,516 | -0.17% |
+| Gameboy | 22,800,339,131 | 22,755,864,000 | -0.20% |
+| CodeLoad | 485,371,269 | 481,709,952 | -0.75% |
+| Box2D | 4,669,568,201 | 4,624,262,278 | -0.97% |
+| zlib | 167,353,774,088 | 138,963,102,608 | -16.96% |
+| TypeScript | 60,126,087,195 | 59,734,144,307 | -0.65% |
+Richards' +0.07% is the only rise: +0.02% at step 1 and +0.04% at step 2, neither in its
+generated code.
+
+Left from the design:
+- step 4b's shared cold path, and RegExp's fused sites that find no typed array (511,908
+  fallbacks), which wait for a way to count them;
+- step 4c's remaining overhead of small acyclic spans that end at a return (EarleyBoyer -1.01%,
+  React -0.50%, Splay -0.37%, DeltaBlue -0.36% without them);
+- advect's locals outside the numeric homes (about 4% of NavierStokes);
+- step 5, speculation from W4's value classes, with W4's remainder.
+
+Lead for a baseline item: Vue's reactive proxy `get` trap runs GetProp, CallWithThis, GetElem
+and TypeofIs about 77,000 times each in the exact-PC helper (TRUST_JS_JIT_OPSTAT=2).
