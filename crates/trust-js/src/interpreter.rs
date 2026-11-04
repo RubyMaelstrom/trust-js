@@ -8832,8 +8832,8 @@ impl Interp {
         // realm's (make_callable_object registers it at creation) and no realm's `eval` is tagged
         // (only a created realm tags its own, `create_realm`), so an ordinary native needs no
         // probe of either table, as V8, SpiderMonkey and JSC reach a function's realm from the
-        // function. A proxy's callability sentinel and IsHTMLDDA (not `ic_plain`), a second realm
-        // and a ShadowRealm's interpreters take the tables.
+        // function. IsHTMLDDA (not `ic_plain`), a second realm and a ShadowRealm's interpreters
+        // take the tables.
         if !self.multi_realm() && self.single_interpreter() {
             if let Ok(object) = function.try_borrow() {
                 if object.ic_plain()
