@@ -11772,3 +11772,58 @@ checks the invariant; Reflect.get is a builtin over an internalized key (builtin
 V8 c8b709085e21). Candidate 2 is therefore Vue's first: the trap called from generated code
 (the stub's direct sequence, as the getters' since Decision 17), its arguments rooted by the
 frame rather than the registry, and the key kept as the atom the read already holds.
+
+### W6 step 1: the log's pauses and the major collection's cycle (record, 2026-11-04)
+
+Commit, from main 662e2216, on p2-w6 (an agent's; worktree target/p2/w6-impl-wt), landed on main
+as bca828ba over c5b00828 (main's commits since 662e2216 change only this plan; the code is
+71739c46's):
+- 71739c46: TRUST_JS_GC_LOG's collection lines report each pause whole (`pause`, in the line's
+  microseconds: from the collection's choice of its kind to its end, the allocator's trim
+  included, which now runs just before the line is written). A major collection's line
+  describes it as the final pause of its marking cycle: the slices that marked before it
+  (`slices`), the bytes allocated from the cycle's start to the pause (`cycle_alloc`), and the
+  cycle's whole marking time (`cycle_mark`: the slices' marking and the pause's). Every major
+  collection marks in one pause so far, so these are 0, 0 and its `mark`. The heap keeps the
+  cycle's figures in its statistics (GcStats::last_cycle_slices, last_cycle_allocated,
+  last_cycle_slice_nanos), which step 2's slices fill; DIAGNOSTICS.md describes the fields.
+  A tool for the pause tables: target/p2/w6/impl/pauses.py (the largest pause by kind: minor,
+  major in one pause, slice, final pause).
+
+As designed (order, step 1). The slices' own lines (`[gc-slice]`) come with the slices, in
+step 2.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; base main 662e2216's engine,
+which is 634ca6c7's (target/p2/w2g/rest-lto-634ca6c7; crates/ identical), the tip 71739c46; the
+last column with collections suppressed, where run):
+
+| workload | base | tip | collections suppressed |
+| --- | --- | --- | --- |
+| Vue | 1,715,814,019 | +0.01% | |
+| React | 315,947,553 | +0.00% | |
+| Djot | 627,778,592 | -0.00% | |
+| chai | 79,014,187,774 | +0.08% | +0.01% |
+| Richards | 136,069,116 | +0.00% | |
+| DeltaBlue | 260,338,382 | +0.01% | |
+| Crypto | 728,385,135 | +0.00% | |
+| RayTrace | 993,930,695 | +0.00% | |
+| EarleyBoyer | 3,195,998,362 | -0.05% | +0.00% |
+| RegExp | 2,738,504,115 | +0.01% | |
+| Splay | 1,401,409,464 | -0.00% | |
+| NavierStokes | 451,390,544 | +0.00% | |
+| PdfJS | 7,651,002,527 | +0.07% | +0.00% |
+| Mandreel | 62,935,944,681 | -0.00% | |
+| Gameboy | 21,036,338,680 | +0.00% | |
+| CodeLoad | 481,259,447 | +0.02% | -0.00% |
+| Box2D | 4,457,246,306 | +0.00% | |
+| zlib | 138,039,204,844 | +0.00% | |
+| TypeScript | 58,587,609,875 | +0.01% | |
+
+The log is off by default: the moves past 0.02% (chai +0.08%, one run; PdfJS +0.07%, EarleyBoyer
+-0.05%) are the collection schedule's, the conservative stack's one-object differences at a
+collection: with collections suppressed they are +0.01%, +0.00% and +0.00% (CodeLoad's +0.02%
+-0.00%).
+
+Checks at 71739c46:
+- lib: ARM64 2,767 passed, 9 ignored; x86-64 (zombie) 2,548 passed, 9 ignored; clippy -D warnings
+  in the three configurations on both (ARM64 on the worktree at the commit).
