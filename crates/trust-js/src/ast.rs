@@ -1555,6 +1555,9 @@ impl Function {
         self.runtime.get()?.primary_origin()
     }
 
+    /// The function's runtime entry for the active heap. A call wherever it is used: in line,
+    /// it moved the inlining around every construct path's instance class (W2e step 7).
+    #[inline(never)]
     pub(crate) fn runtime(&self) -> crate::function_runtime::RuntimeLease<'_> {
         self.runtime_cache().current()
     }
