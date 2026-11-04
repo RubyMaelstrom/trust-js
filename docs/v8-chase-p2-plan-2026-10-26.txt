@@ -10829,3 +10829,154 @@ and TRust already shares stubs for name reads, property probes and calls outside
 (use_shared_stub). The sites outside hot code that still emit hundreds of bytes take that
 mechanism (StrictEq, SetProp, the first property and call probe of a site first); hot code keeps
 today's in-line templates. A design note first, with the census of template bytes by operation.
+
+### W2g step 5: WeakMap's and WeakSet's data in the object (record, 2026-11-04)
+
+Commits, from main 50c474de, on p2-w2g-rest (an agent's; worktree target/p2/w2g-rest-wt), landed
+on main as 65bf3bfc (58cbbfbe) and fd0ddfe8 (82ef8fab), whose code is the measured commits' (main's
+commits since 50c474de change only this plan; the measurements below name the branch's SHAs):
+- 58cbbfbe: room in the ordinary kinds' tag range for the payload kinds of steps 2, 4 and 5.
+  WeakMaps and WeakSets, ArrayBuffers, DataViews and RegExps have ordinary internal methods, so
+  their kinds must stay inside KIND_ORDINARY_LAST, or every property cache's ordinary-object
+  guard (one unsigned compare) would turn their receivers away. Tags 16 to 19, after
+  Collection's (15, now KIND_COLLECTION_TAG), are theirs: KIND_ORDINARY_LAST is 19, and Array
+  and the kinds after it move up by four (Array 20, still KIND_ORDINARY_LAST + 1 for the
+  "ordinary or Array" guard; the wrappers 21 to 25, Error 26, Arguments 27, the iterators 28 to
+  30), all below the Proxy tag's bit 5. kinds_ok and the layout tests check the new values.
+- 82ef8fab: a WeakMap's and WeakSet's data in its object. ObjectKind::WeakCollection(PayloadBox<
+  weak_metadata::WeakCollection>) (tag 16) holds the collection's kind and one map of its
+  entries by key identity (WeakKey -> (WeakTarget, value)): the brand is the object's kind, a
+  get or has one probe of the payload's map, under one borrow (nf_weak_map_get). A write goes
+  through the object's mutable borrow, which sets its card, and records its entry for the next
+  minor collection (ClientRecords::record_weak_entry, from WeakCollection::put), as the side
+  table's writes did; a new key subscribes the collection to its target's death, as before. The
+  payload cell's finalizer drops the map. Interp's weak_collection_data and
+  weak_collection_index go; in their place a registry of the interpreter's collections by
+  address (weak_collections, a FastSet), which only the collector reads: a major collection
+  registers each registered collection's entries as ephemerons, a minor one finds a recorded
+  entry's collection there, and gc_forget_weak_owners drops a dead collection's subscriptions
+  and registration before its sweep (the smaller of the registry and the dead set iterated, as
+  before). super()'s graft moves the kind with the other payload kinds; the registration, the
+  subscriptions and the records follow it (move_weak_slots). The memory inventory counts the
+  payload in the object visitor and the registry in the side tables.
+
+As designed (A6: V8's `table`, SpiderMonkey's WeakMap in a slot, JSC's WeakMapImpl in the cell):
+the brand probe and the data probe go and a get is one probe of the collection's own map; the
+ephemeron records stay per entry.
+
+Where the build differs from the design:
+1. A registry stays, a set of addresses with no data: the GC core takes ephemerons only from
+   the client's callback (MarkClient::ephemerons), which must enumerate the live collections at
+   a major collection, and a dead collection's subscriptions in weak_metadata's target index
+   must go before its cell is swept. The mutator touches it only when a collection is made.
+   A minor collection's recorded entry is looked up only if its owner is registered, so a
+   record that outlived its collection (or another interpreter's) never names a freed cell.
+2. The pin stays. The registration and the subscriptions are the interpreter's metadata, which
+   a ShadowRealm's interpreter must keep while one of its collections lives elsewhere
+   (agent_control_tests::agent_kept_prototype_null_native_owners_preserve_metadata_and_then_
+   retire failed without it: the child interpreter retired while its WeakMap was alive).
+3. The kinds take tags 16 to 19 inside the ordinary range (58cbbfbe) rather than following
+   Array's (the design's note): after Array they would fail the property caches' guard.
+4. Interp's inventory has one field fewer (148).
+
+Per operation (instructions an iteration: the difference of 1.2M and 200k iterations over 1M,
+least of 3; target/p2/w2g/rest-micro; base a31509fe, the tip 82ef8fab, fat LTO):
+
+| operation | base | tip | change |
+| --- | --- | --- | --- |
+| WeakMap get of a present key | 535.0 | 494.0 | -41.0 (-7.7%) |
+| WeakSet has of a present member | 572.0 | 535.0 | -37.0 (-6.5%) |
+| WeakMap set of an existing key | 766.0 | 705.0 | -61.0 (-8.0%) |
+| a WeakMap's creation, one set, one has | 4,599.6 | 4,339.5 | -260.1 (-5.7%) |
+
+The get saves 41 of the 84 instructions the census put in its three probes (the model said 50):
+the remaining probe is the payload's map's, and the brand is a tag test under the borrow the
+probe needs anyway.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; one session for all three
+binaries: base a31509fe, the renumbering 58cbbfbe, the tip 82ef8fab, whose binary is byte for byte
+11f8772b's (the amend changed only a test's field count); the last column with collections
+suppressed, TRUST_JS_GC_NURSERY_BYTES=0 and TRUST_JS_GC_MIN_HEAP_BYTES=4000000000, where run):
+
+| workload | base | renumbering | tip | tip, collections suppressed |
+| --- | --- | --- | --- | --- |
+| Vue | 1,765,186,973 | +0.02% | -0.21% | -0.24% |
+| React | 315,976,416 | -0.00% | -0.00% | |
+| Djot | 633,140,715 | -0.00% | -0.01% | |
+| chai | 79,530,406,122 | +0.02% | +0.00% | -0.01% |
+| Richards | 136,275,779 | -0.00% | -0.00% | |
+| DeltaBlue | 261,570,118 | -0.00% | -0.01% | |
+| Crypto | 728,968,264 | -0.00% | -0.00% | |
+| RayTrace | 994,487,490 | -0.00% | +0.00% | |
+| EarleyBoyer | 3,200,960,065 | +0.00% | +0.00% | |
+| RegExp | 2,776,414,557 | +0.00% | -0.00% | |
+| Splay | 1,401,351,672 | -0.00% | +0.00% | |
+| NavierStokes | 451,444,697 | -0.00% | -0.02% | -0.02% |
+| PdfJS | 7,708,082,411 | +0.00% | +0.04% | -0.00% |
+| Mandreel | 62,954,442,184 | +0.00% | -0.00% | |
+| Gameboy | 21,512,004,602 | -0.00% | -0.17% | +0.00% |
+| CodeLoad | 482,277,806 | +0.00% | -0.00% | |
+| Box2D | 4,476,116,609 | +0.00% | +0.00% | |
+| zlib | 138,040,659,793 | -0.00% | -0.00% | |
+| TypeScript | 58,761,742,963 | +0.05% | +0.01% | +0.01% |
+
+Vue -0.21% (-0.24% with collections suppressed; the design's estimate was 0.44%, from the
+census's 25 instructions a probe and its count of WeakMap probes): 4.4M of the mutator's
+instructions, against the renumbering commit's +0.27M. The others:
+- Gameboy -0.17% is its collector's and comes from the build's layout, not its code: with
+  collections suppressed it is +0.00%, and a comparison build of the tip with the renumbering
+  commit's Interp layout and descriptor order (below) counts 21,511,909,056 against the
+  renumbering commit's 21,511,943,741 (target/p2/w2g/rest-layout-counts-step5.txt). Its
+  collections are the same in number (25 minor, 4 major, TRUST_JS_GC_LOG); SPE puts the
+  difference in the marker's side-slot and wake work (trace_side_slots, side_slot_owners,
+  Heap::wake, try_fire, trace_gc_fields), whose code is the same size in both builds: the
+  same work over a heap laid out differently (the descriptor ids pick the in-line allocation
+  cursors), which I have not traced further.
+- PdfJS +0.04% is its collection schedule's: -0.00% with collections suppressed, and in a later
+  session the tip and the renumbering commit count 7,707,832,151 and 7,707,933,339 (the
+  conservative stack's one-object differences, as in step 1).
+- TypeScript: the renumbering commit is +0.05% with collections and +0.026% (+13.7M) without; the
+  tip +0.01% either way. The renumbering's generated code differs from base's only in the tag
+  compares' immediates (below), and its Rust code only in one emitter's size
+  (emit_set_prop_inline, 4 bytes smaller, which moves every later function); SPE (collections
+  suppressed) spreads the difference over the property-set paths (shape_transition,
+  set_named_property_at, jit_set_prop up, jit_cond and slot_of_key down), not one changed
+  function. I have not found more than that layout change behind it.
+- chai's +0.02% at the renumbering is its collection schedule's (-0.02% for the tip against it).
+
+Code dumps (the gate's three modes over the fixtures, tools/dumpsum.py,
+target/p2/w2g/rest-dumps): the renumbering commit's differ from base's only in the immediates of
+kind-tag compares (cmp #15 -> #19, #16 -> #20, #17/#18/#19 -> #21/#22/#23; no chunk changes size;
+chunkdiff over react and djot in all modes). The tip's differ from the renumbering commit's in
+Interp's field offsets and the descriptor ids; a comparison build of the tip that re-declares the
+removed table (a FastMap of the same layout) and registers the weak collection descriptor last
+(target/p2/w2g/rest-layout/patch-step5.py, measurement only) dumps the fixtures exactly as the
+renumbering commit does in all three modes (0 differing chunks of 56, 12 and 163).
+
+GC: the payload is reported in the object's trace, the one edge inventory (marking,
+verification, the barrier's check); the entries stay ephemerons (the major collection's
+enumeration through the registry, the minor's through the records). Under TRUST_JS_GC_STRESS=1000
+and at 10, with TRUST_JS_GC_VERIFY=1, the 48 lib tests whose bodies make WeakMaps or WeakSets or
+name the collections' machinery (target/p2/w2g/rest-stress/select.py), each in its own process,
+pass. Test262's WeakMap and WeakSet suites with every other test that names them (276 tests, a
+dev-profile test262-runner at 82ef8fab) pass at stress 1000 with --tier=jit threshold 0 and in
+the default tier; at stress 1, in both, only staging/sm/regress/regress-1507322-deep-weakmap.js
+times out (the runner's 60-second window). The same test at stress 1 without the window, base's
+runner beside the tip's: both still running after 45 minutes (slowness, not the change).
+
+Checks at 82ef8fab:
+- lib: ARM64 2,764 passed, 9 ignored; x86-64 (zombie) 2,545 passed, 9 ignored; clippy -D warnings
+  in the three configurations on both (ARM64 on an export of the commit).
+- The release gate, on an export of 82ef8fab: the fixtures' masked output as the base's;
+  difftest 138 agree, 12 skipped (budget); Test262 at --tier=jit threshold 8, 53,575 of 53,575
+  and identical to the base's report.
+
+Notes for landing:
+- 11f8772b (the measured binary's commit) became 82ef8fab: the inventory test's field count (149
+  -> 148), which 11f8772b's lib runs on both machines failed and nothing else; the binaries are
+  identical (sha256 b98ec026...).
+- On review: a key's death skips the removal when the collection's object is borrowed
+  (weak_collection_delete's try_borrow_mut), which would leave an entry under a dead key's
+  address. No drain runs under such a borrow (weak_insert drains before it borrows, and a
+  collection is deferred under borrows), so it does not arise; a debug assertion of it comes
+  with step 2.
