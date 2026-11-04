@@ -2392,6 +2392,18 @@ pub(crate) enum ClosureOrigin {
 }
 
 impl UserCallable {
+    /// The binding getter's proof, read in place: the probe that uses it runs no JavaScript and
+    /// writes no cache, so it borrows the proof rather than moving it out of the sidecar and
+    /// back (two take-and-set pairs of a 48-byte value a call, on Vue's export accessors).
+    pub(crate) fn binding_getter_proof(&self) -> Option<&crate::interpreter::BindingGetterCache> {
+        // SAFETY: only this type's setters (`put_binding_getter_cache` and the runtime and origin
+        // ones; `take_binding_getter_cache` in tests) replace the sidecar or its proof, and the
+        // caller drops the reference before calling any of them (`Interp::try_binding_getter`).
+        let sidecar = unsafe { &*self.cache.as_ptr() }.as_ref()?;
+        sidecar.binding_getter.as_ref()
+    }
+
+    #[cfg(test)]
     pub(crate) fn take_binding_getter_cache(
         &self,
     ) -> Option<crate::interpreter::BindingGetterCache> {

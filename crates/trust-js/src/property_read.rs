@@ -274,10 +274,12 @@ impl Interp {
         // The first successful proof retains the identifier and a bounded structural proof for
         // this closure's own environment. The AST is shared by closures and Realms, so dynamic
         // binding state belongs on UserCallable and is guarded by the live environment chain.
-        if let Some(cache) = user.take_binding_getter_cache() {
-            match self.probe_binding_getter_cache(&user.env, &cache) {
+        // The proof is read in place (`UserCallable::binding_getter_proof`): a hit and a
+        // TDZ/import answer leave it as it is, and a stale one is replaced after the reference
+        // ends.
+        if let Some(cache) = user.binding_getter_proof() {
+            match self.probe_binding_getter_cache(&user.env, cache) {
                 BindingGetterProbe::Value(value) => {
-                    user.put_binding_getter_cache(Some(cache));
                     #[cfg(test)]
                     record_binding_getter(1);
                     return Some(value);
@@ -285,12 +287,12 @@ impl Interp {
                 BindingGetterProbe::UninitializedOrImport => {
                     // The structural proof still holds. Read TDZ/import state live on every
                     // access, and retain the cache so a later ordinary binding write can hit.
-                    user.put_binding_getter_cache(Some(cache));
                     return None;
                 }
                 BindingGetterProbe::Stale => {
+                    let name = cache.name.clone();
                     if let Some((next, value)) =
-                        self.resolve_binding_getter(&user.env, cache.name.as_ref())
+                        self.resolve_binding_getter(&user.env, name.as_ref())
                     {
                         user.put_binding_getter_cache(Some(next));
                         #[cfg(test)]
