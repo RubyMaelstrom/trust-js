@@ -169,6 +169,54 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
     assert!(layout.exotic_array_tag > crate::value::KIND_ORDINARY_LAST);
 }
 
+/// W2g step 1: the in-line `instanceof` walk tells a proxy by one bit of each holder's kind tag
+/// (`KIND_PROXY_BIT`), read at its offset from the cell: a proxy's tag alone has it, callable or
+/// not, revoked or not, and every other kind's lacks it.
+#[test]
+fn only_a_proxys_kind_tag_has_the_proxy_bit() {
+    let mut engine = crate::Engine::new();
+    let layout = probe(&engine);
+    let tag = |object: &Gc| read::<u8>(body(&layout, object), layout.obj_kind);
+    engine
+        .eval(
+            "var kinds = [{}, [], function () {}, () => 0, Math.max, function () {}.bind(null),
+               new Map(), new Set(), new Map().entries(), [].values(), ''[Symbol.iterator](),
+               new Error('e'), (function () { return arguments; })(), new String('s'),
+               new Number(1), new Boolean(true), Object(Symbol()), Object(1n),
+               new Uint8Array(1), new ArrayBuffer(1), new DataView(new ArrayBuffer(1)),
+               new WeakMap(), new WeakSet(), /r/, new Date(0), Promise.resolve(),
+               (function* () {})(), class {}, Object.create(null)];
+             var proxies = [new Proxy({}, {}), new Proxy(function () {}, {}), new Proxy(class {}, {}),
+               Proxy.revocable({}, {}), Proxy.revocable(function () {}, {})];
+             proxies[3].revoke(); proxies[3] = proxies[3].proxy;
+             proxies[4].revoke(); proxies[4] = proxies[4].proxy; 0",
+            false,
+        )
+        .expect("fixture parses");
+    for (name, proxy) in [("kinds", false), ("proxies", true)] {
+        let list = global(&mut engine, "0", name);
+        let count = engine.interp.array_length(&list);
+        assert!(count >= 5, "{name}");
+        for index in 0..count {
+            let element = list
+                .borrow()
+                .props
+                .get_index(index as u32)
+                .map(|element| element.value());
+            let Some(ValueView::Obj(object)) = element.map(|value| value.view()) else {
+                panic!("{name}[{index}] is an object")
+            };
+            assert_eq!(
+                tag(&object) & (1 << crate::value::KIND_PROXY_BIT) != 0,
+                proxy,
+                "{name}[{index}]: tag {}",
+                tag(&object)
+            );
+            assert_eq!(object.borrow().kind.is_proxy(), proxy, "{name}[{index}]");
+        }
+    }
+}
+
 #[test]
 fn named_fields_read_through_the_fields_description_in_place_and_spilled() {
     let engine = crate::Engine::new();

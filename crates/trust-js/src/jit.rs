@@ -11640,12 +11640,16 @@ fn instanceof_inlinable(
     il: &crate::interpreter::InterpLayout,
 ) -> bool {
     let sh = layout.obj_props + layout.props_shape;
+    let walk_proto = layout.obj_from_cell + layout.obj_proto;
     layout.valid
         && il.valid
         && layout.obj_from_cell < 4096
         && layout.obj_proto.is_multiple_of(8)
         && layout.obj_proto / 8 < 4096
         && layout.obj_kind < 4096
+        && walk_proto.is_multiple_of(8)
+        && walk_proto / 8 < 4096
+        && layout.obj_from_cell + layout.obj_kind < 4096
         && layout.obj_flags < 4096
         && sh.is_multiple_of(4)
         && sh / 4 < 4096
@@ -11678,7 +11682,6 @@ fn emit_instanceof_inline(
     let done = a.new_label();
     let refs_ok = a.new_label();
     let walk = a.new_label();
-    let yes = a.new_label();
     let no = a.new_label();
     let have = a.new_label();
     let sh = (layout.obj_props + layout.props_shape) as u32;
@@ -11741,21 +11744,20 @@ fn emit_instanceof_inline(
 
     // A scalar LHS is false. Otherwise walk lhs.[[Prototype]] until target or null. Cycles are
     // rejected by SetPrototypeOf, and each hop's [[GetPrototypeOf]] is a direct field read once
-    // its kind's tag shows no Proxy.
+    // the holder's tag shows no Proxy: one bit of it (`KIND_PROXY_BIT`), tested after the two
+    // loads, which read the cell as any object's. Six instructions a hop, as the walk was before
+    // it tested the holders: the offsets from the cell fold into the loads, and the loop
+    // branches back while the prototype is not the target.
     a.cmp_imm_w(7, 8);
     a.b_cond(C_NE, no);
     a.mov(12, 10);
     a.bind(walk);
-    a.add_imm(12, 12, layout.obj_from_cell as u32);
-    a.ldrb_imm(9, 12, layout.obj_kind as u32);
-    a.cmp_imm_w(9, crate::value::KIND_PROXY_TAG as u32);
-    a.b_cond(C_EQ, slow);
-    a.ldr_imm(12, 12, layout.obj_proto as u32);
+    a.ldrb_imm(9, 12, (layout.obj_from_cell + layout.obj_kind) as u32);
+    a.ldr_imm(12, 12, (layout.obj_from_cell + layout.obj_proto) as u32);
+    a.tbnz(9, crate::value::KIND_PROXY_BIT, slow);
     a.cbz(12, true, no);
     a.cmp_reg_x(12, 15);
-    a.b_cond(C_EQ, yes);
-    a.b(walk);
-    a.bind(yes);
+    a.b_cond(C_NE, walk);
     a.movz(9, 1, 0);
     a.b(have);
     a.bind(no);

@@ -2191,7 +2191,9 @@ pub(crate) fn user_fn_ptr(user: &UserFn) -> *const UserCallable {
 ///   [`KIND_EXOTIC_NONE_LAST`];
 /// - the former `ObjectKind::is_ordinary` (those, and a Map's or Set's data): tags up to
 ///   [`KIND_ORDINARY_LAST`];
-/// - the former "`call` is not None": [`KIND_CALLABLE_FIRST`] ..= [`KIND_EXOTIC_NONE_LAST`].
+/// - the former "`call` is not None": [`KIND_CALLABLE_FIRST`] ..= [`KIND_EXOTIC_NONE_LAST`]
+///   (and a callable proxy: [`ObjectKind::is_callable`]);
+/// - a Proxy: the one tag with bit [`KIND_PROXY_BIT`] set, every other being below 32.
 ///
 /// The JIT's code-keyed call probe reads [`ObjectKind::User`]'s tag and its [`UserFn`] word (the
 /// closure cell's address) straight from a callee object (see `JitLayout::obj_kind` and
@@ -2286,9 +2288,14 @@ pub(crate) const KIND_ORDINARY_LAST: u8 = 15;
 pub(crate) const KIND_TYPED_ARRAY_TAG: u8 = 1;
 /// [`ObjectKind::Array`]'s tag.
 pub(crate) const KIND_ARRAY_TAG: u8 = 16;
-/// [`ObjectKind::Proxy`]'s tag, after every other kind's: the in-line `instanceof` walk
-/// compares it at each object whose [[GetPrototypeOf]] it reads.
-pub(crate) const KIND_PROXY_TAG: u8 = 27;
+/// [`ObjectKind::Proxy`]'s tag, the one with bit [`KIND_PROXY_BIT`] set: every other kind's is
+/// below 32, so the in-line `instanceof` walk tells a proxy, whose [[GetPrototypeOf]] is a trap,
+/// by one bit test at each holder. A new kind takes a tag below 32 (or, if its
+/// [[GetPrototypeOf]] is not the field read either, one with that bit set).
+pub(crate) const KIND_PROXY_TAG: u8 = 32;
+/// The bit of an object's kind tag that only [`KIND_PROXY_TAG`] sets.
+pub(crate) const KIND_PROXY_BIT: u32 = 5;
+const _: () = assert!(KIND_PROXY_TAG == 1 << KIND_PROXY_BIT);
 
 /// A Proxy's internal slots ([`ObjectKind::Proxy`]): ProxyCreate's [[ProxyTarget]] and
 /// [[ProxyHandler]], the handler null once the proxy is revoked (the target stays, which nothing
