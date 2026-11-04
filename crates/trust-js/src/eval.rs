@@ -3241,63 +3241,82 @@ impl Interp {
             ValueView::Obj(o) => *o,
             _ => return Ok(false),
         };
-        // A deferred namespace evaluates on [[HasProperty]] with a string key.
-        self.defer_trigger(&o, Some(key))?;
-        if let Some((target, handler)) = proxy_parts(&o) {
-            if matches!((handler).view(), ValueView::Null) {
-                return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
+        // One test per holder (W2g step 7): a set `ic_plain` proves none of the exotic
+        // [[HasProperty]]s below (a deferred namespace's trigger, a proxy's trap, a typed array's
+        // elements, a Web IDL platform object's indices).
+        let exotic = {
+            let body = o.borrow();
+            (!body.ic_plain()).then(|| {
+                (
+                    body.kind.proxy().map(|proxy| (proxy.target, proxy.handler)),
+                    body.kind.typed_array_info(),
+                )
+            })
+        };
+        if let Some((proxy, typed)) = exotic {
+            // A proxy or a typed array is never a namespace, a deferred one or a Web IDL
+            // platform object.
+            let tables = proxy.is_none() && typed.is_none();
+            // A deferred namespace evaluates on [[HasProperty]] with a string key.
+            if tables {
+                self.defer_trigger(&o, Some(key))?;
             }
-            let Some(trap) =
-                self.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_HAS, "has")?
-            else {
-                return self.proxy_forward(|me| me.js_has_property(&target, key));
-            };
-            // The trap receives the original property key — a symbol stays a symbol.
-            let key_val = self.key_value(key);
-            let res = self.proxy_call_trap(
-                crate::interpreter::PROXY_TRAP_HAS,
-                &trap,
-                handler,
-                [target, key_val],
-            )?;
-            let present = self.to_boolean(&res);
-            if !present {
-                // ECMA-262 §10.5.7 step 9: target.[[GetOwnProperty]](P), then IsExtensible(target)
-                // only for a configurable target property; both may run a Proxy target's traps.
-                if let ValueView::Obj(t) = &(target).view() {
-                    let target_desc = crate::builtins::object_get_own_property(self, t, key)
-                        .map_err(Abrupt::Throw)?;
-                    if let Some(target_desc) = target_desc {
-                        if !target_desc.configurable() {
-                            return Err(self.throw(
-                                "TypeError",
-                                "proxy 'has' trap hid a non-configurable property",
-                            ));
-                        }
-                        if !crate::builtins::js_is_extensible(self, &target)
-                            .map_err(Abrupt::Throw)?
-                        {
-                            return Err(self.throw(
-                                "TypeError",
-                                "proxy 'has' trap hid a property of a non-extensible target",
-                            ));
+            if let Some((target, handler)) = proxy {
+                if matches!((handler).view(), ValueView::Null) {
+                    return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
+                }
+                let Some(trap) =
+                    self.proxy_get_trap(&handler, crate::interpreter::PROXY_TRAP_HAS, "has")?
+                else {
+                    return self.proxy_forward(|me| me.js_has_property(&target, key));
+                };
+                // The trap receives the original property key — a symbol stays a symbol.
+                let key_val = self.key_value(key);
+                let res = self.proxy_call_trap(
+                    crate::interpreter::PROXY_TRAP_HAS,
+                    &trap,
+                    handler,
+                    [target, key_val],
+                )?;
+                let present = self.to_boolean(&res);
+                if !present {
+                    // ECMA-262 §10.5.7 step 9: target.[[GetOwnProperty]](P), then IsExtensible(target)
+                    // only for a configurable target property; both may run a Proxy target's traps.
+                    if let ValueView::Obj(t) = &(target).view() {
+                        let target_desc = crate::builtins::object_get_own_property(self, t, key)
+                            .map_err(Abrupt::Throw)?;
+                        if let Some(target_desc) = target_desc {
+                            if !target_desc.configurable() {
+                                return Err(self.throw(
+                                    "TypeError",
+                                    "proxy 'has' trap hid a non-configurable property",
+                                ));
+                            }
+                            if !crate::builtins::js_is_extensible(self, &target)
+                                .map_err(Abrupt::Throw)?
+                            {
+                                return Err(self.throw(
+                                    "TypeError",
+                                    "proxy 'has' trap hid a property of a non-extensible target",
+                                ));
+                            }
                         }
                     }
                 }
+                return Ok(present);
             }
-            return Ok(present);
-        }
-        if let Some(info) = self.typed_array_of(&o) {
-            match self.ta_index_kind(&info, key) {
-                TaIndex::Element(_) => return Ok(true),
-                TaIndex::Exotic => return Ok(false),
-                TaIndex::Ordinary => {}
+            if let Some(info) = typed {
+                match self.ta_index_kind(&info, key) {
+                    TaIndex::Element(_) => return Ok(true),
+                    TaIndex::Exotic => return Ok(false),
+                    TaIndex::Ordinary => {}
+                }
             }
-        }
-        // HasProperty calls the Web IDL legacy object's [[GetOwnProperty]], so observing a
-        // supported index also runs the platform getter and propagates an abrupt completion.
-        if self.host_indexed_own_value(&o, key)?.is_some() {
-            return Ok(true);
+            // HasProperty calls the Web IDL legacy object's [[GetOwnProperty]], so observing a
+            // supported index also runs the platform getter and propagates an abrupt completion.
+            if tables && self.host_indexed_own_value(&o, key)?.is_some() {
+                return Ok(true);
+            }
         }
         // A String wrapper's `length` and in-range indices are own exotic properties.
         if let crate::value::ObjectKind::StrWrap(s) = &o.borrow().kind {

@@ -695,6 +695,20 @@ impl BufferData {
     }
 }
 
+/// What one look at an object tells the property walks and the ordinary-get check (W2g step 7,
+/// `Interp::object_look`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ObjectLook {
+    /// `ic_plain` is set: no side-table behavior, and neither a proxy nor a typed array.
+    Plain,
+    Proxy,
+    TypedArray,
+    /// `ic_plain` is clear, the kind neither: the side tables tell the rest.
+    Other,
+    /// Borrowed mutably elsewhere: unknown.
+    Borrowed,
+}
+
 /// A weak reference to a JavaScript object, for tests that watch an object die (embedders use
 /// `embed::WeakHandle`).
 #[cfg(test)]
@@ -9794,7 +9808,7 @@ impl Interp {
             return None;
         }
         let mut b = o.borrow();
-        // A set `ic_plain` byte proves no side-table internal methods (see `object_ic_plain`).
+        // A set `ic_plain` byte proves no side-table internal methods (see `object_look`).
         if !b.ic_plain() {
             let info = b.kind.typed_array_info();
             drop(b);
@@ -11270,79 +11284,68 @@ impl Interp {
     /// table is skipped without hashing, which is the common case in a hot loop.
     #[inline]
     pub(crate) fn ordinary_get_ptr(&self, ptr: usize) -> bool {
-        if Self::object_ic_plain(ptr) {
-            debug_assert!(self.side_table_ordinary_get_ptr(ptr));
-            return true;
+        match Self::object_look(ptr) {
+            ObjectLook::Plain => {
+                debug_assert!(self.no_side_table_behavior(ptr));
+                true
+            }
+            ObjectLook::Other => self.no_side_table_behavior(ptr),
+            ObjectLook::Proxy | ObjectLook::TypedArray | ObjectLook::Borrowed => false,
         }
-        self.side_table_ordinary_get_ptr(ptr)
     }
 
-    #[inline]
-    fn side_table_ordinary_get_ptr(&self, ptr: usize) -> bool {
-        !Self::object_may_be_typed_array(ptr) && self.side_table_non_typed_ordinary_get_ptr(ptr)
-    }
-
-    /// A Proxy, a typed array, and an object whose [[Get]]/[[Set]] behavior lives in an
-    /// interpreter side table (module namespace, Web IDL indexed host object), always has its
-    /// `ic_plain` byte cleared at its creation or registration, and that byte is never set again.
-    /// A set byte therefore proves the object is none of them, with one load instead of a kind
-    /// test and several hash probes. A clear byte (including an object currently borrowed
-    /// mutably) is only a hint.
+    /// What one look at the object at `ptr` tells (W2g step 7: one test per holder). A Proxy, a
+    /// typed array, and an object whose [[Get]]/[[Set]] behavior lives in an interpreter side
+    /// table (module namespace, Web IDL indexed host object), always has its `ic_plain` byte
+    /// cleared at its creation or registration, and that byte is never set again. A set byte
+    /// therefore proves the object is none of them, with one load; a clear one leaves the kind,
+    /// which tells a proxy and a typed array, and the tables only for the rest. An object
+    /// currently borrowed mutably is conservatively unknown.
     ///
     /// `ptr` must be the address of a live object (`Gc::as_ptr` of a held `Gc`).
     #[inline(always)]
-    fn object_ic_plain(ptr: usize) -> bool {
+    fn object_look(ptr: usize) -> ObjectLook {
         let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
-        // The shared reference ends before this returns, and a mutable borrow elsewhere makes
-        // this conservatively report "not proven plain".
-        matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if object.ic_plain())
+        // The shared reference ends before this returns.
+        match unsafe { cell.try_borrow_unguarded() } {
+            Ok(object) if object.ic_plain() => ObjectLook::Plain,
+            Ok(object) if object.kind.is_proxy() => ObjectLook::Proxy,
+            Ok(object) if object.kind.typed_array().is_some() => ObjectLook::TypedArray,
+            Ok(_) => ObjectLook::Other,
+            Err(_) => ObjectLook::Borrowed,
+        }
     }
 
-    /// Whether the object at `ptr` may be a Proxy: its kind's tag, or conservatively yes while
-    /// a mutable borrow elsewhere hides it. `ptr` must be the address of a live object.
-    #[inline(always)]
-    fn object_may_be_proxy(ptr: usize) -> bool {
-        let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
-        // As in `object_ic_plain`, the shared reference ends before this returns.
-        !matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if !object.kind.is_proxy())
-    }
-
-    /// Whether the object at `ptr` may be a typed array, as [`Self::object_may_be_proxy`].
-    #[inline(always)]
-    fn object_may_be_typed_array(ptr: usize) -> bool {
-        let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
-        // As in `object_ic_plain`, the shared reference ends before this returns.
-        !matches!(
-            unsafe { cell.try_borrow_unguarded() },
-            Ok(object) if object.kind.typed_array().is_none()
-        )
-    }
-
+    /// [`Self::ordinary_get_ptr`] that admits a typed array (its named properties are ordinary).
     #[inline]
     fn non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
-        if Self::object_ic_plain(ptr) {
-            debug_assert!(self.side_table_non_typed_ordinary_get_ptr(ptr));
-            return true;
+        match Self::object_look(ptr) {
+            ObjectLook::Plain => {
+                debug_assert!(self.no_side_table_behavior(ptr));
+                true
+            }
+            ObjectLook::TypedArray | ObjectLook::Other => self.no_side_table_behavior(ptr),
+            ObjectLook::Proxy | ObjectLook::Borrowed => false,
         }
-        self.side_table_non_typed_ordinary_get_ptr(ptr)
     }
 
+    /// Whether no side table gives the object at `ptr` exotic behavior: a module or deferred
+    /// namespace's, a Web IDL indexed platform object's. Each empty table is skipped without
+    /// hashing, which is the common case in a hot loop.
     #[inline]
-    fn side_table_non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
+    fn no_side_table_behavior(&self, ptr: usize) -> bool {
         if !self.single_interpreter() {
-            return self.agent_side_table_non_typed_ordinary_get_ptr(ptr);
+            return self.agent_no_side_table_behavior(ptr);
         }
-        !Self::object_may_be_proxy(ptr)
-            && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
+        (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
             && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
             && (self.host_indexed.is_empty() || !self.host_indexed.contains_key(&ptr))
     }
 
     /// The same probe when another interpreter may own the side-table entry.
     #[inline(never)]
-    fn agent_side_table_non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
-        !Self::object_may_be_proxy(ptr)
-            && !self.is_namespace(ptr)
+    fn agent_no_side_table_behavior(&self, ptr: usize) -> bool {
+        !self.is_namespace(ptr)
             && !self.is_deferred_namespace(ptr)
             && self
                 .metadata_owner(ptr, |interp, key| interp.host_indexed.contains_key(&key))
@@ -11450,21 +11453,6 @@ impl Interp {
         mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
         atom: Option<crate::atom::PropKey>,
     ) -> Result<Value, Abrupt> {
-        // An `import defer` namespace evaluates its module on string-keyed access.
-        if let ValueView::Obj(o) = &(base).view() {
-            if self.is_deferred_namespace(Gc::as_ptr(o) as usize) {
-                let shape = o.borrow().props.shape();
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record(
-                        crate::feedback::PropertyOutcome::Exotic,
-                        Some(shape),
-                        0,
-                        None,
-                    );
-                }
-            }
-            self.defer_trigger(o, Some(key))?;
-        }
         match &(base).view() {
             ValueView::Undefined | ValueView::Empty | ValueView::Null => {
                 if let Some(trace) = trace.as_deref_mut() {
@@ -11537,17 +11525,41 @@ impl Interp {
             ValueView::Obj(o) => {
                 let o = *o;
                 let ptr = Gc::as_ptr(&o) as usize;
-                // One look at the exotic kind: a mapped `arguments` object, a string wrapper, a
-                // proxy or a typed array.
-                let (mapped, wrapped_string, proxy, typed) = match &o.borrow().kind {
-                    ObjectKind::Arguments(Some(_)) => (true, None, None, None),
-                    ObjectKind::StrWrap(s) => (false, Some(**s), None, None),
-                    ObjectKind::Proxy(proxy) => {
-                        (false, None, Some((proxy.target, proxy.handler)), None)
-                    }
-                    ObjectKind::TypedArray(view) => (false, None, None, Some(view.info)),
-                    _ => (false, None, None, None),
+                // One look at the receiver (W2g step 7): whether it has side-table behavior
+                // (`ic_plain` clear: a namespace, a deferred one, a Web IDL platform object, a
+                // proxy, a typed array) and its exotic kind: a mapped `arguments` object, a
+                // string wrapper, a proxy or a typed array.
+                let (plain, (mapped, wrapped_string, proxy, typed)) = {
+                    let body = o.borrow();
+                    let exotic = match &body.kind {
+                        ObjectKind::Arguments(Some(_)) => (true, None, None, None),
+                        ObjectKind::StrWrap(s) => (false, Some(**s), None, None),
+                        ObjectKind::Proxy(proxy) => {
+                            (false, None, Some((proxy.target, proxy.handler)), None)
+                        }
+                        ObjectKind::TypedArray(view) => (false, None, None, Some(view.info)),
+                        _ => (false, None, None, None),
+                    };
+                    (body.ic_plain(), exotic)
                 };
+                // Only an object with side-table behavior that is neither a proxy nor a typed
+                // array can be a module namespace, a deferred one or a Web IDL platform object.
+                let tables = !plain && proxy.is_none() && typed.is_none();
+                // An `import defer` namespace evaluates its module on string-keyed access.
+                if tables {
+                    if self.is_deferred_namespace(ptr) {
+                        let shape = o.borrow().props.shape();
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(shape),
+                                0,
+                                None,
+                            );
+                        }
+                    }
+                    self.defer_trigger(&o, Some(key))?;
+                }
                 // A mapped `arguments` index aliases its parameter binding.
                 if mapped {
                     if let Some(v) = self.mapped_arg_value(&o, key) {
@@ -11592,7 +11604,10 @@ impl Interp {
                 }
                 // Copy only the actual live binding descriptor from its metadata owner.
                 // Binding reads and their errors still belong to this executing algorithm.
-                if let Some(property) = self.namespace_own_property(ptr, key) {
+                if let Some(property) = tables
+                    .then(|| self.namespace_own_property(ptr, key))
+                    .flatten()
+                {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(
                             crate::feedback::PropertyOutcome::Exotic,
@@ -11681,18 +11696,21 @@ impl Interp {
                 }
                 // Web IDL legacy platform object [[GetOwnProperty]]: a supported indexed
                 // property is a lazy, enumerable/configurable, read-only data property.
-                if let Some(value) = self.host_indexed_own_value(&o, key)? {
-                    if let Some(trace) = trace.as_deref_mut() {
-                        trace.record(
-                            crate::feedback::PropertyOutcome::Exotic,
-                            Some(o.borrow().props.shape()),
-                            0,
-                            None,
-                        );
+                if tables {
+                    if let Some(value) = self.host_indexed_own_value(&o, key)? {
+                        if let Some(trace) = trace.as_deref_mut() {
+                            trace.record(
+                                crate::feedback::PropertyOutcome::Exotic,
+                                Some(o.borrow().props.shape()),
+                                0,
+                                None,
+                            );
+                        }
+                        return Ok(value);
                     }
-                    return Ok(value);
                 }
-                self.get_from_chain(&o, key, &receiver, trace, atom)
+                // The receiver's own exotic behavior is settled: the walk starts at its map.
+                self.get_from_chain_checked(&o, key, &receiver, trace, atom, true)
             }
         }
     }
@@ -11748,79 +11766,130 @@ impl Interp {
         Some(self.proxy_get(target, handler, key, Some(key_value), Value::Obj(*object)))
     }
 
+    /// The exotic [[Get]] of a holder on the chain whose `ic_plain` is clear (W2g step 7): a
+    /// deferred namespace evaluates its module first; a proxy answers with its trap (with the
+    /// original receiver); a Web IDL platform object's supported index is its own lazy
+    /// property; a typed array (`Object.create(typedArray)[1]`) answers a canonical numeric key
+    /// with its own [[Get]] (ECMA-262 §10.4.5.4): TypedArrayGetElement, undefined for an invalid
+    /// index, never its prototype's. `None` continues with OrdinaryGet.
+    fn get_exotic_holder(
+        &mut self,
+        obj: &Gc,
+        key: &str,
+        receiver: &Value,
+        mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
+        depth: u8,
+    ) -> Result<Option<Value>, Abrupt> {
+        let (proxy, typed) = {
+            let body = obj.borrow();
+            (
+                body.kind.proxy().map(|proxy| (proxy.target, proxy.handler)),
+                body.kind.typed_array_info(),
+            )
+        };
+        // A proxy or a typed array is never a namespace, a deferred one or a Web IDL platform
+        // object.
+        let tables = proxy.is_none() && typed.is_none();
+        if tables {
+            self.defer_trigger(obj, Some(key))?;
+        }
+        if let Some((target, handler)) = proxy {
+            if let Some(trace) = trace.as_deref_mut() {
+                trace.record(
+                    crate::feedback::PropertyOutcome::Exotic,
+                    Some(obj.borrow().props.shape()),
+                    depth,
+                    None,
+                );
+            }
+            if matches!((handler).view(), ValueView::Null) {
+                return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
+            }
+            let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
+                return self
+                    .proxy_forward(|me| me.get_member_recv(&target, key, *receiver))
+                    .map(Some);
+            };
+            let key_value = self.key_value(key);
+            let res = self.proxy_call_trap(
+                PROXY_TRAP_GET,
+                &trap,
+                handler,
+                [target, key_value, *receiver],
+            )?;
+            self.proxy_get_invariant(&target, key, &res)?;
+            return Ok(Some(res));
+        }
+        if tables {
+            if let Some(value) = self.host_indexed_own_value(obj, key)? {
+                if let Some(trace) = trace.as_deref_mut() {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(obj.borrow().props.shape()),
+                        depth,
+                        None,
+                    );
+                }
+                return Ok(Some(value));
+            }
+        }
+        // A typed array's elements live in its buffer, not in the property map OrdinaryGet
+        // reads.
+        if let Some(info) = typed {
+            let element = match self.ta_index_kind(&info, key) {
+                TaIndex::Element(index) => Some(self.ta_read(&info, index)),
+                TaIndex::Exotic => Some(Value::Undefined),
+                TaIndex::Ordinary => None,
+            };
+            if let Some(value) = element {
+                if let Some(trace) = trace {
+                    trace.record(
+                        crate::feedback::PropertyOutcome::Exotic,
+                        Some(obj.borrow().props.shape()),
+                        depth,
+                        None,
+                    );
+                }
+                return Ok(Some(value));
+            }
+        }
+        Ok(None)
+    }
+
     fn get_from_chain(
+        &mut self,
+        start: &Gc,
+        key: &str,
+        receiver: &Value,
+        trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
+        atom: Option<crate::atom::PropKey>,
+    ) -> Result<Value, Abrupt> {
+        self.get_from_chain_checked(start, key, receiver, trace, atom, false)
+    }
+
+    /// [`Self::get_from_chain`], where `checked` says the caller has settled `start`'s exotic
+    /// behavior (the receiver's [[Get]]).
+    fn get_from_chain_checked(
         &mut self,
         start: &Gc,
         key: &str,
         receiver: &Value,
         mut trace: Option<&mut crate::feedback::CurrentPropertyTrace>,
         atom: Option<crate::atom::PropKey>,
+        checked: bool,
     ) -> Result<Value, Abrupt> {
         let mut cur = Some(*start);
         let mut depth = 0_u8;
         // The key's atom: the caller's, or once a map on the chain has looked it up.
         let mut walk_atom = atom;
+        let mut settled = checked;
         while let Some(obj) = cur {
-            // A deferred namespace anywhere on the chain evaluates its module first.
-            self.defer_trigger(&obj, Some(key))?;
-            // A proxy anywhere on the chain handles the read itself (with the original receiver).
-            if let Some((target, handler)) = proxy_parts(&obj) {
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record(
-                        crate::feedback::PropertyOutcome::Exotic,
-                        Some(obj.borrow().props.shape()),
-                        depth,
-                        None,
-                    );
-                }
-                if matches!((handler).view(), ValueView::Null) {
-                    return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
-                }
-                let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
-                    return self.proxy_forward(|me| me.get_member_recv(&target, key, *receiver));
-                };
-                let key_value = self.key_value(key);
-                let res = self.proxy_call_trap(
-                    PROXY_TRAP_GET,
-                    &trap,
-                    handler,
-                    [target, key_value, *receiver],
-                )?;
-                self.proxy_get_invariant(&target, key, &res)?;
-                return Ok(res);
-            }
-            if let Some(value) = self.host_indexed_own_value(&obj, key)? {
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record(
-                        crate::feedback::PropertyOutcome::Exotic,
-                        Some(obj.borrow().props.shape()),
-                        depth,
-                        None,
-                    );
-                }
-                return Ok(value);
-            }
-            // A TypedArray on the chain (`Object.create(typedArray)[1]`) answers with its own
-            // [[Get]] (ECMA-262 §10.4.5.4): a canonical numeric key reads TypedArrayGetElement,
-            // which is undefined for an invalid index and never consults its prototype; any
-            // other key continues with OrdinaryGet. Its elements live in the buffer, not in the
-            // property map read below.
-            let typed = obj.borrow().kind.typed_array_info();
-            if let Some(info) = typed {
-                let element = match self.ta_index_kind(&info, key) {
-                    TaIndex::Element(index) => Some(self.ta_read(&info, index)),
-                    TaIndex::Exotic => Some(Value::Undefined),
-                    TaIndex::Ordinary => None,
-                };
-                if let Some(value) = element {
-                    if let Some(trace) = trace.as_deref_mut() {
-                        trace.record(
-                            crate::feedback::PropertyOutcome::Exotic,
-                            Some(obj.borrow().props.shape()),
-                            depth,
-                            None,
-                        );
-                    }
+            // One test per holder (W2g step 7): a set `ic_plain` proves none of the exotic
+            // [[Get]]s (`get_exotic_holder`), and OrdinaryGet follows.
+            if !std::mem::take(&mut settled) && !obj.borrow().ic_plain() {
+                if let Some(value) =
+                    self.get_exotic_holder(&obj, key, receiver, trace.as_deref_mut(), depth)?
+                {
                     return Ok(value);
                 }
             }
@@ -12328,12 +12397,15 @@ impl Interp {
         };
 
         let ptr = Gc::as_ptr(&obj) as usize;
-        // One look at the exotic kind: an arguments object or a proxy.
-        let (arguments, proxy) = {
+        // One look at the receiver (W2g step 7): whether it has side-table behavior (`ic_plain`
+        // clear) and its exotic kind: an arguments object, a proxy or a typed array.
+        let (plain, arguments, proxy, typed) = {
             let body = obj.borrow();
             (
+                body.ic_plain(),
                 matches!(body.kind, ObjectKind::Arguments(_)),
                 body.kind.proxy().map(|proxy| (proxy.target, proxy.handler)),
+                body.kind.typed_array_info(),
             )
         };
         if arguments {
@@ -12354,7 +12426,7 @@ impl Interp {
         // A module namespace exotic object's [[Set]] always fails: in strict code (all module code
         // is strict) the assignment throws a TypeError; a sloppy caller sees an inert no-op. The
         // property is resolved first, so a binding still in its TDZ throws ReferenceError instead.
-        if self.is_namespace(ptr) {
+        if !plain && proxy.is_none() && typed.is_none() && self.is_namespace(ptr) {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.record(
                     crate::feedback::PropertyOutcome::Exotic,
@@ -12407,7 +12479,6 @@ impl Interp {
         }
         // TypedArray integer-index writes go straight to the backing buffer; a canonical-numeric key
         // that isn't a valid index is inert (the value coercion still runs, then is discarded).
-        let typed = obj.borrow().kind.typed_array_info();
         if let Some(info) = typed {
             match self.ta_index_kind(&info, key) {
                 TaIndex::Element(_) | TaIndex::Exotic => {
@@ -12440,109 +12511,130 @@ impl Interp {
         let mut cur = Some(obj);
         let mut depth = 0_u8;
         while let Some(o) = cur {
-            // A deferred namespace anywhere on the chain evaluates its module first.
-            self.defer_trigger(&o, Some(key))?;
-            // A proxy on the chain handles the write itself (with the original receiver).
-            if let Some((target, handler)) = proxy_parts(&o) {
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record(
-                        crate::feedback::PropertyOutcome::Exotic,
-                        Some(o.borrow().props.shape()),
-                        depth,
-                        None,
-                    );
+            // One test per holder (W2g step 7): a set `ic_plain` proves none of the exotic
+            // [[Set]] behaviors below (a deferred namespace's trigger, a proxy's trap, a typed
+            // array's elements, a Web IDL platform object's read-only indices).
+            let exotic = {
+                let body = o.borrow();
+                (!body.ic_plain()).then(|| {
+                    (
+                        body.kind.proxy().map(|proxy| (proxy.target, proxy.handler)),
+                        body.kind.typed_array_info(),
+                    )
+                })
+            };
+            if let Some((proxy, typed)) = exotic {
+                // A proxy or a typed array is never a namespace, a deferred one or a Web IDL
+                // platform object.
+                let tables = proxy.is_none() && typed.is_none();
+                // A deferred namespace anywhere on the chain evaluates its module first.
+                if tables {
+                    self.defer_trigger(&o, Some(key))?;
                 }
-                if matches!((handler).view(), ValueView::Null) {
-                    return Err(self.throw("TypeError", "cannot perform 'set' on a revoked proxy"));
+                // A proxy on the chain handles the write itself (with the original receiver).
+                if let Some((target, handler)) = proxy {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(o.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
+                    }
+                    if matches!((handler).view(), ValueView::Null) {
+                        return Err(
+                            self.throw("TypeError", "cannot perform 'set' on a revoked proxy")
+                        );
+                    }
+                    let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
+                        return self
+                            .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
+                    };
+                    let key_value = self.key_value(key);
+                    let ok = self.proxy_call_trap(
+                        PROXY_TRAP_SET,
+                        &trap,
+                        handler,
+                        [target, key_value, value, receiver],
+                    )?;
+                    let success = self.to_boolean(&ok);
+                    if success {
+                        self.proxy_set_invariant(&target, key, &value)?;
+                    }
+                    return Ok(success);
                 }
-                let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_SET, "set")? else {
-                    return self
-                        .proxy_forward(|me| me.set_member_recv(&target, key, value, receiver));
-                };
-                let key_value = self.key_value(key);
-                let ok = self.proxy_call_trap(
-                    PROXY_TRAP_SET,
-                    &trap,
-                    handler,
-                    [target, key_value, value, receiver],
-                )?;
-                let success = self.to_boolean(&ok);
-                if success {
-                    self.proxy_set_invariant(&target, key, &value)?;
-                }
-                return Ok(success);
-            }
-            // A TypedArray reached via the prototype chain: its integer-indexed elements are its own
-            // properties, so the search must stop here (never consulting the TA prototype's
-            // accessors). A valid index is a writable data property → create one on the receiver; a
-            // canonical-numeric non-index is an inert success.
-            if !Gc::ptr_eq(&o, &obj) {
-                let typed = o.borrow().kind.typed_array_info();
-                if let Some(info) = typed {
-                    match self.ta_index_kind(&info, key) {
-                        TaIndex::Element(_) | TaIndex::Exotic if matches!(&(receiver).view(), ValueView::Obj(r) if Gc::ptr_eq(r, &o)) =>
-                        {
-                            if let Some(trace) = trace.as_deref_mut() {
-                                trace.record(
-                                    crate::feedback::PropertyOutcome::Exotic,
-                                    Some(o.borrow().props.shape()),
-                                    depth,
-                                    None,
-                                );
+                // A TypedArray reached via the prototype chain: its integer-indexed elements are its own
+                // properties, so the search must stop here (never consulting the TA prototype's
+                // accessors). A valid index is a writable data property → create one on the receiver; a
+                // canonical-numeric non-index is an inert success.
+                if !Gc::ptr_eq(&o, &obj) {
+                    if let Some(info) = typed {
+                        match self.ta_index_kind(&info, key) {
+                            TaIndex::Element(_) | TaIndex::Exotic if matches!(&(receiver).view(), ValueView::Obj(r) if Gc::ptr_eq(r, &o)) =>
+                            {
+                                if let Some(trace) = trace.as_deref_mut() {
+                                    trace.record(
+                                        crate::feedback::PropertyOutcome::Exotic,
+                                        Some(o.borrow().props.shape()),
+                                        depth,
+                                        None,
+                                    );
+                                }
+                                // The receiver IS this TypedArray: IntegerIndexedElementSet applies
+                                // (coerce, then store or silently drop an out-of-range write).
+                                let num = if info.kind.is_bigint() {
+                                    Value::BigInt(self.to_bigint(&value)?)
+                                } else {
+                                    Value::Num(self.to_number(&value)?)
+                                };
+                                if let TaIndex::Element(idx) = self.ta_index_kind(&info, key) {
+                                    self.ta_store(&info, idx, &num)?;
+                                }
+                                return Ok(true);
                             }
-                            // The receiver IS this TypedArray: IntegerIndexedElementSet applies
-                            // (coerce, then store or silently drop an out-of-range write).
-                            let num = if info.kind.is_bigint() {
-                                Value::BigInt(self.to_bigint(&value)?)
-                            } else {
-                                Value::Num(self.to_number(&value)?)
-                            };
-                            if let TaIndex::Element(idx) = self.ta_index_kind(&info, key) {
-                                self.ta_store(&info, idx, &num)?;
+                            // Foreign receiver: a valid element behaves as a writable data property
+                            // (create it on the receiver, uncoerced); a numeric non-index is inert.
+                            TaIndex::Element(_) => break,
+                            TaIndex::Exotic => {
+                                if let Some(trace) = trace.as_deref_mut() {
+                                    trace.record(
+                                        crate::feedback::PropertyOutcome::Exotic,
+                                        Some(o.borrow().props.shape()),
+                                        depth,
+                                        None,
+                                    );
+                                }
+                                return Ok(true);
                             }
-                            return Ok(true);
+                            TaIndex::Ordinary => {}
                         }
-                        // Foreign receiver: a valid element behaves as a writable data property
-                        // (create it on the receiver, uncoerced); a numeric non-index is inert.
-                        TaIndex::Element(_) => break,
-                        TaIndex::Exotic => {
-                            if let Some(trace) = trace.as_deref_mut() {
-                                trace.record(
-                                    crate::feedback::PropertyOutcome::Exotic,
-                                    Some(o.borrow().props.shape()),
-                                    depth,
-                                    None,
-                                );
-                            }
-                            return Ok(true);
-                        }
-                        TaIndex::Ordinary => {}
                     }
                 }
-            }
-            // Web IDL legacy platform object [[Set]] first obtains the indexed own descriptor.
-            // A supported read-only index therefore runs its getter and then rejects the write.
-            if self.host_indexed_array_key(&o, key)
-                && self.host_indexed_own_value(&o, key)?.is_some()
-            {
-                if let Some(trace) = trace.as_deref_mut() {
-                    trace.record(
-                        crate::feedback::PropertyOutcome::Exotic,
-                        Some(o.borrow().props.shape()),
-                        depth,
-                        None,
-                    );
+                // Web IDL legacy platform object [[Set]] first obtains the indexed own descriptor.
+                // A supported read-only index therefore runs its getter and then rejects the write.
+                if tables
+                    && self.host_indexed_array_key(&o, key)
+                    && self.host_indexed_own_value(&o, key)?.is_some()
+                {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(o.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
+                    }
+                    if self.strict {
+                        return Err(self.throw(
+                            "TypeError",
+                            format!(
+                                "cannot assign to read-only indexed property '{}'",
+                                crate::value::decode_string_key(key)
+                            ),
+                        ));
+                    }
+                    return Ok(false);
                 }
-                if self.strict {
-                    return Err(self.throw(
-                        "TypeError",
-                        format!(
-                            "cannot assign to read-only indexed property '{}'",
-                            crate::value::decode_string_key(key)
-                        ),
-                    ));
-                }
-                return Ok(false);
             }
             let prop = o
                 .borrow()
