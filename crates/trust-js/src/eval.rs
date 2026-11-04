@@ -4029,6 +4029,14 @@ impl Interp {
         // Elements are created as own data properties (CreateDataProperty), so accessors on
         // Array.prototype are never consulted.
         let arr = self.make_array(Vec::new());
+        // A literal without a spread has exactly its elements' words (W2d step 4's census: the
+        // appends' growth gave every literal of up to 16 elements a 16-word block, 15% of PdfJS's
+        // live heap in its run-once tables), as MakeArray's block is exact.
+        if !elems.is_empty() && !elems.iter().any(|e| matches!(e, ArrayElem::Spread(_))) {
+            if let Some(object) = arr.as_obj() {
+                object.borrow_mut().props.reserve_dense_exact(elems.len());
+            }
+        }
         for e in elems {
             match e {
                 ArrayElem::Item(e) => {
