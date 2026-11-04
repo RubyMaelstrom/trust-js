@@ -1090,22 +1090,33 @@ impl Default for Words {
 }
 
 impl Clone for Words {
-    /// An exact copy of the used words and their kind bits; a shared block is shared again.
+    /// An exact copy of the used words and their kind bits; a shared block is shared again. A
+    /// map without words (an object literal's template: every copy of it) keeps the static
+    /// block, in line.
+    #[inline]
     fn clone(&self) -> Self {
+        if self.is_empty() {
+            return Words::new();
+        }
+        self.clone_words()
+    }
+}
+
+impl Words {
+    /// [`Clone::clone`] of a block with words: shared again, or an exact copy.
+    #[inline(never)]
+    fn clone_words(&self) -> Self {
         if self.is_shared() {
             return self.share();
         }
-        let mut copy = Words::new();
-        if !self.is_empty() {
-            copy = Words::fresh(self.len());
-            // SAFETY: a fresh exact block; the used words are written now and `used` set after.
-            unsafe {
-                std::ptr::copy_nonoverlapping(self.0.as_ptr(), copy.0.as_ptr(), self.len());
-            }
-            let header = copy.header_mut();
-            header.used = self.len() as u32;
-            header.flags = self.kind();
+        let mut copy = Words::fresh(self.len());
+        // SAFETY: a fresh exact block; the used words are written now and `used` set after.
+        unsafe {
+            std::ptr::copy_nonoverlapping(self.0.as_ptr(), copy.0.as_ptr(), self.len());
         }
+        let header = copy.header_mut();
+        header.used = self.len() as u32;
+        header.flags = self.kind();
         copy
     }
 }
