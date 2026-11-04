@@ -11580,3 +11580,147 @@ Vue's 386k native calls spend about 41M instructions (2.4% of Vue) in it. Candid
 native call from generated code for natives the call cache proves (V8 calls a builtin from
 Sparkplug's code directly), with the receiver-gated light classes for the collections' get and
 has, before the light class alone.
+
+### W2g step 7: one test per holder (record, 2026-11-04)
+
+Commit, from main 574c4b97, on p2-w2g-rest (an agent's; worktree target/p2/w2g-rest-wt), landed on
+main as 6e506db4 over 18cf822e (main's commits since 574c4b97 change only this plan; the code is
+634ca6c7's):
+- 634ca6c7: with the Proxy, typed array, WeakMap and RegExp state in their objects (steps 1, 2, 4
+  and 5), an object's `ic_plain` byte, set unless it has side-table behavior or is a proxy or a
+  typed array, is the first test at each holder of the [[Get]], [[Set]] and HasProperty walks:
+  when it is set, the walk goes straight to the ordinary lookup. A holder whose byte is clear is
+  read for its kind in the same look: a proxy takes its trap, a typed array its elements, and
+  only the other objects (a module namespace, a deferred one, a Web IDL platform object,
+  IsHTMLDDA's) probe the namespace and platform-object tables, which a proxy or a typed array
+  is never in (a platform object's registration takes only an ordinary-get object). The
+  receiver's [[Get]] reads its byte and kind under one borrow and starts the chain at its own
+  map (get_from_chain_checked), instead of checking the receiver again as the chain's first
+  holder; the chain's other holders take their exotic [[Get]] in get_exotic_holder. The
+  ordinary-get check makes one look at the object (object_look): a set byte answers; a clear one
+  leaves the kind, which tells a proxy and a typed array, and only the remaining objects probe
+  the tables.
+
+As designed (A2: the walks test the object once per holder, `ic_plain` and then the kind).
+
+Where the build differs from the design:
+1. No kind for namespaces: the design's "namespaces' kind" would let a clear byte's dispatch skip
+   the module_ns, deferred_ns and host_indexed guards for the objects that are none of them, but
+   with the proxy and typed array tags read in the same look only those objects (and IsHTMLDDA's)
+   still reach the guards. A namespace kind remains possible later (SpiderMonkey makes
+   namespaces proxies with their own handler; V8 and JSC give them a type).
+2. The walks test the byte, then the kind only when it is clear: a String wrapper's and a mapped
+   arguments object's [[Get]] (whose bytes are set) stay where they were, on the receiver's kind.
+3. A first version (c07b8f9f, measured, then amended) tested the byte alone, so a proxy or a
+   typed array still probed the namespace and platform tables at each look: Gameboy +0.08%,
+   proxy-reflect +0.17%, the typed array micro-benchmark +0.4%. Reading the kind in the same look
+   turns them into -0.45%, -0.48% and -1.3% (below); nothing else moved by more than 0.16%
+   between the two (chai, one run, -0.30% -> -0.46%).
+4. No new test: the exotic holders' walks are the existing lib tests' (proxies and typed arrays
+   on a chain: computed_key_tests, reflect_key_tests, property_read_tests, the proxy suites) and
+   Test262's (below).
+
+Per operation (instructions an iteration: the difference of 1.2M and 200k iterations over 1M,
+least of 3; target/p2/w2g/rest-micro; base main 574c4b97's engine, the tip 634ca6c7, fat LTO):
+
+| operation | base | tip | change |
+| --- | --- | --- | --- |
+| a miss through a 4-deep chain (protohop, a Proxy alive) | 2,197.0 | 1,769.0 | -428.0 (-19.5%) |
+| the same with no Proxy alive (protohop0) | 2,173.0 | 1,756.0 | -417.0 (-19.2%) |
+| a typed array's `length` and an element (talen) | 1,315.0 | 1,298.0 | -17.0 (-1.3%) |
+| `in` of an inherited key, 3 deep (hasin) | 710.0 | 710.0 | 0 |
+| Reflect.has of the same (reflhas) | 1,133.6 | 1,133.6 | 0 |
+| a new property's store under a 3-deep chain (setdeep) | 987.7 | 987.7 | 0 |
+| Reflect.set of an own property (reflset) | 977.6 | 977.6 | 0 |
+| Reflect.set with another receiver (reflsetr) | 2,144.6 | 2,144.6 | 0 |
+
+A miss walks seven holders to the null prototype (the receiver, four created levels, their base
+and Object.prototype); at each one a set byte now stands for the base's four tests (the deferred
+namespace guard, the proxy and typed array kind reads and a host_indexed_own_value call, three
+borrows among them), and the receiver is no longer tested twice: about 60 instructions a
+holder. The unchanged rows never reach the walks: `in` and Reflect.has take
+ordinary_chain_has_property along an ordinary chain, Reflect.set its own-data and ordinary-set
+paths, a new property's store the generated code's transition (TRUST_JS_JIT_OPSTAT: only the `In`
+op and the Object.create and Reflect calls reach a helper), none of which the step changes.
+
+W1's Proxy micro-benchmarks (whole runs, median of 3; target/p2/w1-census/micro):
+
+| run | base | tip | change |
+| --- | --- | --- | --- |
+| proxy-none (no traps) | 4,462,348,449 | 4,220,730,504 | -5.41% |
+| proxy-reflect (traps forwarding with Reflect) | 4,918,998,804 | 4,895,171,337 | -0.48% |
+| proxy-direct (traps reading the target) | 7,843,833,092 | 7,664,960,890 | -2.28% |
+
+The design's estimate for these: 0.4-1.1%.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; base 574c4b97, the tip
+634ca6c7; the last column with collections suppressed, where run):
+
+| workload | base | tip | collections suppressed |
+| --- | --- | --- | --- |
+| Vue | 1,747,001,459 | -1.79% | -1.78% |
+| React | 315,979,194 | -0.01% | |
+| Djot | 631,216,192 | -0.55% | -0.55% |
+| chai | 79,377,203,236 | -0.46% | -0.35% |
+| Richards | 136,253,062 | -0.14% | |
+| DeltaBlue | 261,428,330 | -0.42% | -0.42% |
+| Crypto | 728,902,215 | -0.07% | |
+| RayTrace | 994,499,162 | -0.06% | |
+| EarleyBoyer | 3,201,753,377 | -0.18% | |
+| RegExp | 2,739,734,665 | -0.04% | |
+| Splay | 1,401,474,891 | -0.00% | |
+| NavierStokes | 451,449,871 | -0.01% | |
+| PdfJS | 7,675,382,596 | -0.32% | -0.31% |
+| Mandreel | 62,939,244,752 | -0.00% | |
+| Gameboy | 21,130,481,366 | -0.45% | -0.43% |
+| CodeLoad | 482,214,003 | -0.20% | |
+| Box2D | 4,475,485,462 | -0.41% | -0.41% |
+| zlib | 138,039,152,631 | +0.00% | |
+| TypeScript | 58,777,431,653 | -0.32% | -0.30% |
+
+Vue -1.79% (the design's estimate: 0.17%), Gameboy -0.45% (0.12%), chai -0.46% (0.06%); Djot
+-0.55%, DeltaBlue -0.42%, Box2D -0.41%, PdfJS -0.32%, TypeScript -0.32%. With collections
+suppressed the changes are the same but for chai's (-0.35%, its collection schedule's share), so
+they are the mutator's. Vue's, by symbol (perf record of instructions:u every 200,000, setarch -R,
+three runs per binary with equal totals: base 8,735 samples, tip 8,579, -1.79%): get_from_chain
+and get_from_chain_checked -27 samples, get_member_recv_impl -64, host_indexed_own_value -44
+(called at every hop before; only for a non-plain holder that is neither a proxy nor a typed
+array now), proxy_get -20; Vue's JIT helper traffic is identical in both (TRUST_JS_JIT_OPSTAT and
+PROPSTAT: among others 123,162 named reads of a proxy receiver and 57,361 absent uncached reads
+reach the helper, each of which walks to the end of its chain). The design's model counted only
+the guards' probes into tables, at 25 instructions; the walks also paid each hop's calls and
+borrows. Gameboy's (1,000,000 an interval): get_prop_ic_impl -121, get_named_property_from_slot
+-92, with_buffer_data and ta_len +14 together (an inlining change), the rest within the samples'
+noise: its typed arrays' `length` and method reads no longer probe the namespace tables.
+
+Code dumps (the gate's three modes over the fixtures, tools/dumpsum.py,
+target/p2/w2g/rest-dumps): the tip's dumps are identical to the base's in all three modes (Vue 64,
+React 12 and Djot 163 chunks); the step changes no generated code and no Interp field.
+
+GC: nothing the collector sees changes. Under TRUST_JS_GC_STRESS=1000 with TRUST_JS_GC_VERIFY=1,
+the 568 lib tests that make a namespace, a deferred one, a platform object, a proxy or a typed
+array or walk a chain (target/p2/w2g/rest-stress/names-step7.txt: their bodies name namespaces,
+`import defer`, host_indexed, ic_plain, HasProperty, Object.create or [[Get/SetPrototypeOf]], or
+their names namespaces, prototypes or chains, with step 1's and step 2's selections), each in its
+own process, pass (the known-slow integer_comparisons_and_branches_match_in_every_tier is left
+out; tests::execution_stack_resource_exhaustion_unwinds_and_recovers takes 761 s, as at step 1),
+but for two still running when the step landed: tests::long_expression_chains_run and
+tests::releasing_long_object_chains_uses_bounded_native_stack (their results to follow in this
+record's addendum).
+Test262's Proxy suite, Reflect's get, set and has, the typed arrays' internal methods
+(TypedArrayConstructors/internals), module namespaces, `import defer`, `in`, the arguments
+objects and `super` property references (1,124 tests; a dev-profile test262-runner at 634ca6c7)
+pass at stress 1000 and at 10, in the default tier and at --tier=jit threshold 0.
+
+Checks at 634ca6c7:
+- lib: ARM64 2,767 passed, 9 ignored; x86-64 (zombie) 2,548 passed, 9 ignored; clippy -D warnings
+  in the three configurations on both. (zombie's run at 73a5e44a, the same change before its
+  rebase onto 574c4b97, failed payload_cell_tests::a_long_string_held_only_by_a_property_lives_
+  and_dies_with_it once, the x86 conservative-stack flake seen in step 1; c07b8f9f's and
+  634ca6c7's runs pass it.)
+- The release gate, on an export of 634ca6c7: the fixtures' masked output as the base's;
+  difftest 138 agree, 12 skipped (budget); Test262 at --tier=jit threshold 8, 53,575 of 53,575
+  and identical to the base's report.
+
+Notes for landing: main's 18cf822e (docs only) is not under the branch; crates/ at 634ca6c7 is
+574c4b97's plus this commit.
