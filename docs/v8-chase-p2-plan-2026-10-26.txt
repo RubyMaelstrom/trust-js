@@ -11264,3 +11264,167 @@ Candidates (each to be designed against the exemplars):
 2. A Proxy's [[Get]] from generated code: the stub calls the trap directly when the handler's
    `get` is a user function (V8's ProxyGetProperty builtin calls the trap from generated code).
 3. Absent reads cached where the chain allows it (the miss reasons first).
+
+### W2g step 2: typed arrays', ArrayBuffers' and DataViews' state in the object (record, 2026-11-04)
+
+Commits, from main f3d0622e, on p2-w2g-rest (an agent's; worktree target/p2/w2g-rest-wt), landed
+on main as 34892de4 (241f031a) and 7d24cb0b (27c53db6), whose code is the measured commits' (main's
+commits since f3d0622e change only this plan; the measurements name the branch's SHAs):
+- 241f031a: step 5's review item. weak_collection_delete skipped the removal when the
+  collection's object was borrowed, which would leave an entry under a dead key's address; no
+  path borrows it there (a key's death drains only where no cell is borrowed, and `delete`
+  holds none), and a debug assertion now says so.
+- 27c53db6: typed arrays', ArrayBuffers' and DataViews' state in their objects.
+  - A typed array's TaInfo (its buffer object, byte offset, length, element type and length
+    tracking) joins the native view in its ObjectKind::TypedArray payload, for every element
+    type and over either kind of buffer. A view generated code must decline (BigInt and
+    Float16 elements, a SharedArrayBuffer's, an overflowing range) has no guard record and an
+    element count of zero, which every access compares before it reads the record; the fields
+    generated code reads keep their offsets (NativeTypedArray stays repr(C): `native`, an
+    Option of the former Rc, and `info` follow them). TaInfo's buffer is the buffer object,
+    the view's traced edge, in place of ta_buffer's side slot.
+  - ObjectKind::ArrayBuffer(PayloadBox<ArrayBufferData>) (tag 17): an ArrayBuffer's or
+    SharedArrayBuffer's Data Block (None once detached), the guard record of its native views,
+    its mutation generation and dirty ranges (Cells: they hold no edge, so they change under a
+    shared borrow), and its immutable and host-keyed flags.
+  - ObjectKind::DataView(PayloadBox<DataViewData>) (tag 18): a DataView's buffer object, offset,
+    length and tracking; its `buffer` getter reads the payload instead of a hidden slot, and
+    ArrayBuffer.isView tests the kinds.
+  - Both kinds are ordinary for the property caches (tags inside KIND_ORDINARY_LAST, room made by
+    step 5's renumbering). Detaching takes the Data Block and the guard record through the
+    object's mutable borrow (ArrayBufferData::detach). Every reader goes through the objects,
+    whichever interpreter it runs in.
+  - typed_arrays, ta_buffer, array_buffers, native_buffers, array_buffer_versions,
+    array_buffer_dirty_ranges, immutable_buffers, host_keyed_buffers and data_views go, with
+    their pins, ta_buffer's side-slot records and conditional edges, the cross-interpreter
+    routing of typed_array_at and the nine tables' eviction. The ordinary-get check tests the
+    object's kind for a typed array (as it does for a proxy) instead of probing a table.
+  - The buffer-pressure trigger's retained data (reset_buffer_pressure, after each major
+    collection) was every interpreter's array_buffers walked; it is now counted by the buffers'
+    payloads in the Agent's BufferLedger (AgentControl): a buffer's own bytes as it is made,
+    resized and detached and as its payload dies, and each Shared Data Block once while a
+    SharedArrayBuffer of the Agent holds it, as SpiderMonkey counts a zone's malloc memory
+    (AddCellMemory at creation, RemoveCellMemory at finalization).
+
+Where the build differs from the design:
+1. immutable_buffers and host_keyed_buffers move too, as flags of the payload: an address-keyed
+   set needs its keys pinned and evicted, which the step removes.
+2. Every typed array has the payload, not only those generated code serves: before, a BigInt64,
+   Float16 or shared view had a typed_arrays entry and a plain object.
+3. The retained buffer data is counted by the payloads (above): with no table left to walk.
+4. $262.detachArrayBuffer detaches as the embedder API does, without zeroing its views' lengths
+   (a buffer does not know its views; every reader of a view's length goes through the buffer's
+   Data Block, as after the embedder's detach and a transfer already).
+5. A ShadowRealm's buffer that outlives its realm no longer keeps the realm's interpreter alive
+   (its pin went): agent_kept_prototype_null_native_owners_... drops its ArrayBuffer case, and
+   agent_kept_prototype_null_buffers_need_no_realm checks that the realm retires while the
+   buffer stays whole.
+6. Tests: the memory accounting tests make real buffer objects (they inserted table entries
+   under fake addresses); the shared-buffer lifetime tests find blocks in a heap snapshot; the
+   side-slot record tests lose ta_buffer (8 tables); Interp's inventory has nine fields fewer
+   (139). New: native_typed_array::tests::views_and_buffers_keep_their_state_in_their_objects
+   (three tiers: twelve element types over both buffer kinds, subclass instances, no pins, the
+   views alone keeping their buffers' bytes through a collection) and
+   the_buffer_ledger_follows_buffers_through_their_lives (a buffer made, resized and transferred,
+   a SharedArrayBuffer, and their deaths).
+
+Per operation (instructions an iteration: the difference of 1.2M and 200k iterations over 1M,
+least of 3; target/p2/w2g/rest-micro; base main f3d0622e's engine (82ef8fab's binary), the tip
+27c53db6, fat LTO):
+
+| operation | base | tip | change |
+| --- | --- | --- | --- |
+| a Uint8Array's `length` and an element (the Rust [[Get]]) | 1,367.0 | 1,315.0 | -52.0 (-3.8%) |
+| a BigInt64Array's `length` and an element | 3,239.9 | 3,094.9 | -145.0 (-4.5%) |
+| a Uint8Array's creation (and its buffer's), a store, its `length` | 6,112.4 | 4,388.4 | -1,724.0 (-28.2%) |
+| an ArrayBuffer's creation and its byteLength | 4,533.8 | 4,094.0 | -439.8 (-9.7%) |
+| `subarray` and the result's byteOffset | 9,284.0 | 7,541.5 | -1,742.5 (-18.8%) |
+| a DataView's setUint32 and getUint32 | 1,808.0 | 1,673.0 | -135.0 (-7.5%) |
+
+The `length` read loses its two probes (the census's model: 4.8% of 1,365); a creation its four
+table inserts, three pins, a side slot's record and the collector's conditional edge, noting and
+eviction for each of the view and the buffer.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; one session for base, the tip
+and 46a0a450, the same code before its comments, test and step 5's assertion moved its line
+numbers; the last column with collections suppressed, TRUST_JS_GC_NURSERY_BYTES=0 and
+TRUST_JS_GC_MIN_HEAP_BYTES=4000000000, where run):
+
+| workload | base | 46a0a450 | tip 27c53db6 | tip, collections suppressed |
+| --- | --- | --- | --- | --- |
+| Vue | 1,761,166,185 | -0.31% | -0.31% | -0.31% |
+| React | 315,975,659 | +0.00% | +0.00% | |
+| Djot | 633,115,191 | +0.00% | -0.00% | |
+| chai | 79,512,541,646 | -0.00% | -0.01% | -0.02% |
+| Richards | 136,273,080 | -0.01% | -0.01% | |
+| DeltaBlue | 261,550,920 | -0.04% | -0.04% | -0.05% |
+| Crypto | 728,963,349 | -0.01% | -0.01% | |
+| RayTrace | 994,515,837 | -0.00% | -0.00% | |
+| EarleyBoyer | 3,201,011,118 | +0.02% | +0.02% | -0.03% |
+| RegExp | 2,776,417,368 | +0.00% | +0.00% | |
+| Splay | 1,401,369,424 | +0.00% | +0.00% | |
+| NavierStokes | 451,374,267 | +0.02% | +0.02% | +0.02% |
+| PdfJS | 7,711,100,874 | -0.45% | -0.45% | -0.28% |
+| Mandreel | 62,953,890,434 | -0.02% | -0.02% | -0.03% |
+| Gameboy | 21,474,480,478 | -1.60% | -1.60% | -1.67% |
+| CodeLoad | 482,290,242 | +0.02% | +0.02% | -0.01% |
+| Box2D | 4,476,125,375 | -0.00% | -0.00% | |
+| zlib | 138,040,635,018 | -0.00% | -0.00% | |
+| TypeScript | 58,767,924,654 | -0.02% | -0.02% | -0.04% |
+
+Gameboy -1.60% (the design's estimate: 1.53%; the exit's -1.2% for W2g), PdfJS -0.45% (0.22%),
+Mandreel -0.02% (0.02%). Vue's -0.31%, with collections suppressed too, was not in the design's
+estimate: Vue makes no typed array, but HasProperty, Reflect.get's walk, array_length and
+element_receiver_kind probed typed_arrays unconditionally (element_receiver_kind data_views and
+array_buffers too), the element fast paths for every object whose `ic_plain` is clear, and the
+[[Get]] and [[Set]] slow paths tested its emptiness at each holder; they test the kind now (the
+census counted about 160k probes of the empty table and 500k emptiness guards on Vue: about 1.6M
+of the 5.5M by its model; the rest not attributed yet). EarleyBoyer's and CodeLoad's +0.02% are their collection schedules'
+(-0.03% and -0.01% suppressed); NavierStokes's +0.02% stays with collections suppressed (82k
+instructions; it makes no typed array or buffer: the build's layout, as for step 5's
+renumbering). 46a0a450 and 27c53db6 count alike to the hundredth.
+
+Collections (TRUST_JS_GC_LOG, one run each): Gameboy makes two minor collections more (27
+against 25, 4 major as before), each far cheaper: over the run the side slots' work 21.4 ms
+against 1.3, the eviction 2.9 against 0.4 and marking 54 against 24 (times as an indication
+only). PdfJS makes 132 minor and 6 major collections against 132 and 5. The new payload cells
+count in the heap's budget where the tables' entries did not: a typed array's view grew from
+48 to 80 bytes (its TaInfo), and a buffer has an 88-byte ArrayBufferData cell (a DataView a
+32-byte one).
+
+Code dumps (the gate's three modes over the fixtures, tools/dumpsum.py,
+target/p2/w2g/rest-dumps): no chunk changes size; the hashes differ where Interp's field offsets
+and the descriptor ids do. A comparison build of the tip that re-declares the nine removed tables
+(maps of the same layout) and registers the two new descriptors last
+(target/p2/w2g/rest-layout/patch-step2.py, measurement only) dumps the fixtures exactly as step
+5's tip does in all three modes (0 differing chunks of 56, 12 and 163), and Gameboy's 397 chunks
+(every typed array template it compiles) too.
+
+GC: every new edge is in the object's trace, the one inventory (marking, verification, the
+barrier's check): the view's buffer object and the DataView's. Under TRUST_JS_GC_STRESS=1000 and
+TRUST_JS_GC_VERIFY=1, the 194 lib tests whose bodies make typed arrays, buffers, DataViews or
+Atomics or name their machinery (target/p2/w2g/rest-stress/names-step2.txt), each in its own
+process, pass, but for jit::int_typed_tests::integer_comparisons_and_branches_match_in_every_tier,
+stopped after 1,167 s (known to take over nine hours under stress, the tree-walker tier's; not a
+hang). Test262's TypedArray, TypedArrayConstructors, ArrayBuffer,
+SharedArrayBuffer, DataView and Atomics directories with every other test that names one of
+them (paths-step2.txt, 3,872 tests; a dev-profile test262-runner at 27c53db6) pass at stress
+1000 with --tier=jit threshold 0 but for staging/sm/TypedArray/element-setting-converts-using-
+ToNumber.js, and in the default tier but for it and staging/sm/TypedArray/sort_large_countingsort.js:
+both time out in the runner's 60-second window. Without the window both pass, at base's runner
+(step 5's tip) as at the tip's, the tip faster: 171 s against 153 at threshold 0, 331 s against
+317 for the two in the default tier.
+
+Checks at 27c53db6:
+- lib: ARM64 2,767 passed, 9 ignored (an export of the commit); x86-64 (zombie) 2,548 passed, 9
+  ignored; clippy -D warnings in the three configurations on both (ARM64 on the export), and the
+  workspace's on ARM64 at 46a0a450's code.
+- The release gate, on an export of 27c53db6: the fixtures' masked output as the base's;
+  difftest 138 agree, 12 skipped (budget); Test262 at --tier=jit threshold 8, 53,575 of 53,575
+  and identical to the base's report.
+
+Notes for landing:
+- 46a0a450 (the first measured binary's commit, before the rebase onto f3d0622e) became 27c53db6
+  with comments, a test (the_buffer_ledger_follows_buffers_through_their_lives) and step 5's
+  assertion before it (241f031a); its binary differs from 27c53db6's in layout only (line
+  numbers in panic locations) and counts alike (the table's middle column).
