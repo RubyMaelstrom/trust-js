@@ -3955,11 +3955,12 @@ pub(crate) fn object_inline_alloc_site(class: u32) -> Option<crate::gc_core::Inl
 
 /// The header word of an object's cell that holds its prototype (W2e step 3's images): the
 /// Object ends its `RefCell` ([`check_object_layout`]).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const OBJECT_PROTO_WORD: usize =
     (OBJECT_HEADER - std::mem::size_of::<Object>() + std::mem::offset_of!(Object, proto)) / 8;
-const _: () = assert!(
-    (OBJECT_HEADER - std::mem::size_of::<Object>() + std::mem::offset_of!(Object, proto)) % 8 == 0
-);
+const _: () = assert!((OBJECT_HEADER - std::mem::size_of::<Object>()
+    + std::mem::offset_of!(Object, proto))
+.is_multiple_of(8));
 
 /// The cell header's words of `object`, a fresh plain object or Array the helper path made, for
 /// generated code to copy into objects it makes as that one (W2e steps 3 and 4); `None` when its

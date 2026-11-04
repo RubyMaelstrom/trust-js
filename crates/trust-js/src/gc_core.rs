@@ -1236,6 +1236,7 @@ pub(crate) mod inline_alloc {
     pub(crate) const HEAP_FAST_ALLOC: usize = offset_of!(super::Heap, fast_alloc);
     pub(crate) const HEAP_ALLOCATED_BYTES: usize = offset_of!(super::Heap, allocated_bytes);
     pub(crate) const HEAP_INLINE_CHECK_BYTES: usize = offset_of!(super::Heap, inline_check_bytes);
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) const HEAP_LIVE_CHECK: usize = offset_of!(super::Heap, live_check);
     pub(crate) const HEAP_CURSOR_BASE: usize = offset_of!(super::Heap, cursor_base);
     pub(crate) const CURSOR_SIZE: usize = size_of::<super::Cursor>();
