@@ -8886,3 +8886,81 @@ Decided (mine, reported to the owner):
 2. The filtering barrier (A1) is carried to Phase 3 (see "Carried to Phase 3"): the card pass and
    the card cells without a young edge matter to minor collections on EarleyBoyer, TypeScript and
    Box2D, not to the fixtures, whose minor collections are a small part of their runs.
+
+### W2e's exit (record, 2026-11-04)
+
+W2e ran from main 13645c27 (b00bb6dc's engine) to 498d98d4 (c90b3889's engine): steps 1, 3 and 4
+(literals in line), 5 and 6 (array literals with elements, the `this` of a direct construction),
+8 (counts at the cursor's flush) with the shared stub's heap fix, and 7 (closures' helper, an
+agent's, rebased onto step 8). Step 2 (objects' live count in line) went in with step 1 and left
+with step 8, which counts at the cursor's flush. x86-64 keeps its helpers for the objects (its
+template backend calls helpers for most operations) and shares steps 1 and 8 and the heap's load.
+
+Micro-benchmarks (instructions an iteration over the loop's 18, base against exit, fat LTO, 2M
+iterations of a function's loop, the same session):
+
+| script | base | exit | change |
+| --- | --- | --- | --- |
+| `{}` | 309.4 | 84.4 | -72.7% |
+| `{x: i, y: i}` | 346.6 | 102.9 | -70.3% |
+| five keys | 384.3 | 131.6 | -65.8% |
+| `[]` | 356.5 | 87.2 | -75.5% |
+| `[1, 2, 3]` (shared) | 345.6 | 87.4 | -74.7% |
+| `[i, i]` | 532.6 | 174.5 | -67.2% |
+| `new P(x, y)` | 682.8 | 523.2 | -23.4% |
+| a function expression | 1,056.8 | 659.4 | -37.6% |
+| an arrow | 760.0 | 527.8 | -30.6% |
+| returning `arguments` | 1,760.6 | 1,695.2 | -3.7% |
+| a rest array | 784.7 | 719.6 | -8.3% |
+| a plain call | 231.2 | 231.2 | 0 |
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3; chai one run; the sustained workload with
+target/p2/w2e/closures/sa.sh):
+
+| workload | W2e's base | exit | change |
+| --- | --- | --- | --- |
+| Vue | 1,832,364,746 | 1,822,360,129 | -0.55% |
+| React | 320,690,438 | 315,992,431 | -1.46% |
+| Djot | 660,828,911 | 635,441,677 | -3.84% |
+| chai | 82,148,350,250 | 80,392,875,799 | -2.14% |
+| Richards | 136,863,953 | 136,555,090 | -0.23% |
+| DeltaBlue | 263,599,711 | 262,320,280 | -0.49% |
+| Crypto | 730,122,862 | 729,772,405 | -0.05% |
+| RayTrace | 1,019,279,310 | 1,003,595,057 | -1.54% |
+| EarleyBoyer | 3,406,061,733 | 3,185,104,379 | -6.49% |
+| RegExp | 2,803,053,954 | 2,775,209,793 | -0.99% |
+| Splay | 1,609,526,209 | 1,401,524,705 | -12.92% |
+| NavierStokes | 451,914,438 | 451,659,301 | -0.06% |
+| PdfJS | 7,948,803,055 | 7,706,598,633 | -3.05% |
+| Mandreel | 62,958,156,184 | 62,954,244,601 | -0.01% |
+| Gameboy | 21,542,489,619 | 21,515,553,238 | -0.13% |
+| CodeLoad | 483,623,904 | 482,561,753 | -0.22% |
+| Box2D | 4,493,913,184 | 4,478,567,016 | -0.34% |
+| zlib | 138,040,524,281 | 138,040,721,797 | +0.00% |
+| TypeScript | 59,385,041,446 | 58,871,507,551 | -0.86% |
+| sustained allocation | 2,175,283,630 | 1,767,725,477 | -18.74% |
+
+Against the exit (the design note's):
+- Instructions per operation: `{}` 84.4, `[]` 87.2 and `[1, 2, 3]` 87.4 (bound 100); `{x, y}`
+  102.9 (bound 120). `new P(x, y)` is 523.2 with its call, its constructor's two stores and its
+  return (a plain call is 231.2); its allocation is one in-line cell, as `{x, y}`'s is. Met.
+- Splay -12.92% (bound -8%). Met.
+- No fixture or Octane benchmark slower beyond noise: every workload falls but zlib (+0.0001%).
+  Met.
+- Collections: majors the same on all fourteen workloads counted (target/p2/w2e/refill/
+  gccount-exit.txt); minors the same on eight and fewer on six (TypeScript 509 to 484, PdfJS 139 to
+  132, chai 1,030 to 1,013, one fewer on Djot, Splay and the sustained workload), from step 8's
+  trigger at the refill after the budget, with the same bytes promoted. The exit asked for the
+  same counts; this is the one part not met to the letter, in the direction of less work.
+- GC stress and verification: W2e's 22 allocation, count and two-engine tests pass under
+  TRUST_JS_GC_STRESS=1000 with TRUST_JS_GC_VERIFY=1, each in its own process
+  (target/p2/w2e/stress.sh; the in-line counters' checks skip under stress, which turns the
+  in-line path off: 498d98d4). The lib suites verify the heap at every collection. Met.
+
+Found on the way (step 8's record): a shared stub is process-wide, so generated code builds in no
+heap's or thread's address; the heap is read through the context.
+
+Left for later stages: x86-64's in-line objects; NewObject (literals with spread, computed or
+accessor keys: React's 8,746) and NewArray in line; the in-line closure (three cells and the kind
+payload); the deferred prototype's cell; constructions the direct sequence declines (New: chai
+736,167, TypeScript 681,917, RayTrace 332,643, Box2D 110,387), W3's.
