@@ -207,16 +207,22 @@ impl Interp {
         let Some(getter) = getter else {
             return Some(Ok(Value::Undefined));
         };
-        if let Some(value) = self.try_binding_getter(&getter) {
-            return Some(Ok(value));
-        }
         if let Some(result) = self.try_record_getter(&getter, receiver) {
             return Some(result);
         }
+        // A user getter at a read whose helper stub calls getters (`site`) is called through
+        // the read's call cache, which its call fills once the getter has compiled: the stub's
+        // direct sequence then runs every later read in generated code, as the exemplars'
+        // baselines call a getter from the read's IC. A bundler's export getter answered by
+        // its binding proof instead (`try_binding_getter`) would leave the cache empty and
+        // bring every read back here.
         if let Some((calls, pins)) =
             site.and_then(|(chunk, pc, form)| chunk.getter_calls(pc, form, &getter))
         {
             return Some(self.call_getter(getter, receiver, calls, pins));
+        }
+        if let Some(value) = self.try_binding_getter(&getter) {
+            return Some(Ok(value));
         }
         Some(self.call_callback(getter, *receiver, &[]))
     }
