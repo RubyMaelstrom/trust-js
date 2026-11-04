@@ -6793,59 +6793,72 @@ pub(crate) fn named_site_cache(op: &Op) -> Option<u32> {
 
 /// Record an element access (W4 step 4; feedback-schema.txt section 5.2): the receiver's family
 /// by its kind's tag, an Array's lost kind facts and whether an index lies past its words, and
-/// the key's kind. Out of line: it runs on the VM's path and the element helpers' misses only.
+/// the key's kind. Out of line: it runs on the VM's path and the element helpers' misses only,
+/// most of which are a String key on an ordinary object (chai's, Vue's), so the key's and the
+/// receiver's tags are tested first and the receiver is read without a borrow's counter.
 #[inline(never)]
 fn record_element(chunk: &Chunk, pc: usize, object: &Value, key: &Value) {
     use crate::feedback::*;
-    use crate::value::ObjectKind;
+    use crate::value::{ObjectKind, KIND_ARRAY_TAG, KIND_ORDINARY_LAST, KIND_TYPED_ARRAY_TAG};
+    const TAG: u64 = 0xffff_0000_0000_0000;
     let mut index = None;
-    let key_bits = match key.view() {
-        // An array index as `fast_get_elem` takes one.
-        ValueView::Num(number)
-            if number.trunc() == number && (0.0..u32::MAX as f64).contains(&number) =>
-        {
-            index = Some(number as usize);
-            ELEM_KEY_INDEX
+    let key_bits = if key.bits() & TAG == crate::value::PACK_STR {
+        ELEM_KEY_STRING
+    } else {
+        match key.view() {
+            // An array index as `fast_get_elem` takes one.
+            ValueView::Num(number)
+                if number.trunc() == number && (0.0..u32::MAX as f64).contains(&number) =>
+            {
+                index = Some(number as usize);
+                ELEM_KEY_INDEX
+            }
+            ValueView::Num(_) => ELEM_KEY_NUMBER,
+            ValueView::Sym(_) => ELEM_KEY_SYMBOL,
+            _ => ELEM_KEY_OTHER,
         }
-        ValueView::Num(_) => ELEM_KEY_NUMBER,
-        ValueView::Str(_) => ELEM_KEY_STRING,
-        ValueView::Sym(_) => ELEM_KEY_SYMBOL,
-        _ => ELEM_KEY_OTHER,
     };
-    let receiver_bits = match object.view() {
-        ValueView::Obj(object) => {
-            let b = object.borrow();
-            match &b.kind {
-                ObjectKind::Array => {
-                    use crate::value::word_block::{
-                        KIND_COW, KIND_FROZEN, KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS,
-                    };
-                    let (facts, used) = b.props.element_facts();
-                    let mut bits = ELEM_ARRAY;
-                    if facts & KIND_NO_HOLES == 0 {
-                        bits |= ELEM_HOLEY;
+    let receiver_bits = match object.bits() & TAG {
+        crate::value::PACK_OBJ => {
+            let ValueView::Obj(object) = object.view() else {
+                unreachable!("an object's tag")
+            };
+            // SAFETY: the handle keeps the cell alive, and nothing borrows it mutably while an
+            // element access classifies it; a borrowed one reads as exotic.
+            match unsafe { (*crate::value::Gc::as_ptr(&object)).try_borrow_unguarded() } {
+                Ok(b) => match b.kind.tag() {
+                    KIND_ARRAY_TAG => {
+                        use crate::value::word_block::{
+                            KIND_COW, KIND_FROZEN, KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS,
+                        };
+                        let (facts, used) = b.props.element_facts();
+                        let mut bits = ELEM_ARRAY;
+                        if facts & KIND_NO_HOLES == 0 {
+                            bits |= ELEM_HOLEY;
+                        }
+                        if facts & KIND_NUMBERS == 0 {
+                            bits |= ELEM_NON_NUMBER;
+                        }
+                        if facts & KIND_INT32 == 0 {
+                            bits |= ELEM_NON_INT32;
+                        }
+                        if facts & (KIND_FROZEN | KIND_COW) != 0 {
+                            bits |= ELEM_UNWRITABLE;
+                        }
+                        if index.is_some_and(|index| index >= used) {
+                            bits |= ELEM_OUT_OF_BOUNDS;
+                        }
+                        bits
                     }
-                    if facts & KIND_NUMBERS == 0 {
-                        bits |= ELEM_NON_NUMBER;
-                    }
-                    if facts & KIND_INT32 == 0 {
-                        bits |= ELEM_NON_INT32;
-                    }
-                    if facts & (KIND_FROZEN | KIND_COW) != 0 {
-                        bits |= ELEM_UNWRITABLE;
-                    }
-                    if index.is_some_and(|index| index >= used) {
-                        bits |= ELEM_OUT_OF_BOUNDS;
-                    }
-                    bits
-                }
-                ObjectKind::TypedArray(_) => ELEM_TYPED_ARRAY,
-                ObjectKind::Arguments(_) => ELEM_ARGUMENTS,
-                kind if kind.is_ordinary() => ELEM_ORDINARY,
-                _ => ELEM_EXOTIC,
+                    KIND_TYPED_ARRAY_TAG => ELEM_TYPED_ARRAY,
+                    tag if tag <= KIND_ORDINARY_LAST => ELEM_ORDINARY,
+                    _ if matches!(b.kind, ObjectKind::Arguments(_)) => ELEM_ARGUMENTS,
+                    _ => ELEM_EXOTIC,
+                },
+                Err(_) => ELEM_EXOTIC,
             }
         }
-        ValueView::Str(_) => ELEM_STRING,
+        crate::value::PACK_STR => ELEM_STRING,
         _ => ELEM_PRIMITIVE,
     };
     chunk.feedback.record(pc, key_bits | receiver_bits);
