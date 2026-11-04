@@ -97,7 +97,9 @@ a --tier=bytecode run (whose dispatches are every compiled-code execution) with 
 run (whose snapshot is the production feedback) and prints both shares by kind (DIAGNOSTICS.md).
 Its file's header names the records the engine writes (`records=`), whose readings the script
 applies. A site counts as usable when:
-- named load or store: a filled way of its property cache, or its generic mark (step 5);
+- named load or store: a filled way of its property cache, or its generic mark (step 5); a
+  `length` load also always (a String's length, read in line by the receiver's tag, fills no
+  way: strings take no property cache);
 - call: a filled way or the megamorphic state of its CallSite (spread and argument-array calls
   have no cache);
 - construct: its ConstructSite's way;

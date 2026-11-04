@@ -98,6 +98,23 @@ pub(crate) fn census_kind(op: &Op, pc: usize) -> u8 {
     }) as u8
 }
 
+/// The name of a named load's or store's operation.
+fn named_site_name(op: &Op) -> Option<u32> {
+    match *op {
+        Op::GetProp(name, _)
+        | Op::GetPropThis(name, _)
+        | Op::GetPropLocal(_, name, _)
+        | Op::GetMethod(name, _)
+        | Op::SetProp(name, _)
+        | Op::SetPropDrop(name, _)
+        | Op::SetPropThisDrop(name, _)
+        | Op::SetPropLocalDrop(_, name, _)
+        | Op::AppendProp(name, _)
+        | Op::UpdateProp(name, _, _) => Some(name),
+        _ => None,
+    }
+}
+
 impl Chunk {
     /// Merge this chunk's production feedback, per pc, into the census, at its drop and at the
     /// shell's exit. The state word, by kind: a named site's filled ways in bits 0-2, its
@@ -210,7 +227,11 @@ impl Chunk {
                     _ => 0,
                 };
                 crate::feedback_census::OpSnapshot {
-                    op: format!("{op:?}"),
+                    // A named site's name follows its operation (the script reads `length`).
+                    op: match named_site_name(op) {
+                        Some(name) => format!("{op:?} {}", self.names[name as usize]),
+                        None => format!("{op:?}"),
+                    },
                     kind: census_kind(op, pc),
                     state,
                     record: self.feedback.record_word(pc),

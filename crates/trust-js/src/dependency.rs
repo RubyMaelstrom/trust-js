@@ -251,7 +251,10 @@ mod tests {
     #[test]
     fn a_set_invalidates_its_codes_once_and_refuses_later_installs() {
         let set = WatchpointSet::new("a test fact");
-        assert_eq!((set.state(), set.what()), (WatchState::Clear, "a test fact"));
+        assert_eq!(
+            (set.state(), set.what()),
+            (WatchState::Clear, "a test fact")
+        );
         let code = CodeDependencies::new();
         let mut desired = DesiredWatchpoints::default();
         desired.add(Arc::clone(&set));

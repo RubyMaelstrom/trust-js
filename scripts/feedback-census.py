@@ -167,6 +167,10 @@ def usable(kind, op, state, records):
     name = name_of(op)
     if kind in (1, 2) and "generic" in records and state & GENERIC:
         return True  # the generic mark (step 5): a refused fill or a fifth receiver shape
+    if kind == 1 and op.endswith(") length"):
+        # A String's `length`, which the templates read in line by the receiver's tag, as V8's
+        # StringLength handler: its site fills no way (strings take no property cache).
+        return True
     if kind == 13 and name in ("Typeof", "TypeofIs", "TypeofName", "In"):
         return True  # lowered generically by the templates; no exit for missing feedback
     if "values" in records and (in_line_set(op) is not None or name in EQUALITY):
