@@ -1,0 +1,100 @@
+TRust JS feedback schema (SCHEMA_VERSION 1)
+
+What generated and interpreted code record about the operations they run, for the speculative
+tier (the plan's Phase 3) to read. crates/trust-js/src/feedback.rs holds the encodings; this file
+is their reference. The numeric encodings below are append-only within a schema version: a value
+may be added after the last one of its type, never renumbered or reused. Recorded state only ever
+grows (an observed class is never forgotten), so a reader may trust anything a record holds and
+must treat an empty record as "not observed", never as "impossible".
+
+1. Where feedback lives today
+
+Production feedback is the baseline's own caches; nothing extra is recorded on a hit.
+- Named property reads and stores: the property inline caches (IcState ways: receiver shape,
+  holder shape, depth, slot location; bytecode.rs), filled on the miss path.
+- Calls and constructions: CallSite and CallIc (callee identity, function literal, chunk, realm,
+  epoch; the megamorphic state, W3 item 7), ConstructSite (the prototype's shape and slot).
+- Elements: the word block's kind bits (word_block.rs: NO_HOLES, NUMBERS, INT32, FROZEN, COW,
+  SEALED), read live by the element templates.
+- Allocations: a literal site's image (W2e: bytecode.rs ObjectImage), a constructor's learned
+  capacity and class (Chunk::note_instance, W2d step 3).
+The detailed vector below (section 3) is a diagnostic, never an acceptance setting: it routes the
+operations it observes through helpers, so it does not observe optimized execution.
+
+2. Encodings
+
+OperationKind (u8): the source-level operation a site represents.
+  1 NamedLoad, 2 NamedStore, 3 ElementLoad, 4 ElementStore, 5 Call, 6 Construct, 7 Arithmetic,
+  8 Branch, 9 Loop, 10 Allocation.
+ObservationKind (u8): what a slot's payload means.
+  1 ValueClass, 2 ReceiverLayout, 3 HolderLayout, 4 ElementAccess, 5 CallTarget, 6 BranchCount,
+  7 Allocation, 8 PropertyAccess.
+ObservationRole (u8): a slot's position in its site.
+  1 Operand0, 2 Operand1, 3 Result, 4 Receiver, 5 Holder, 6 Access, 7 Target, 8 Outcome.
+ObservationState (u8): a slot's abstract state.
+  0 Uninitialized, 1 Monomorphic, 2 Polymorphic, 3 Absent, 4 Generic.
+ValueClass (u8; a set is a bitmask with bit (class - 1)): ECMAScript's types, with Number split
+  into an optimizer refinement that never changes the operation's Number semantics.
+  1 Undefined, 2 Null, 3 Boolean, 4 NumberInt32 (an int32 value without -0), 5 NumberDouble,
+  6 String, 7 BigInt, 8 Symbol, 9 Object.
+PropertyOutcome (u8): a named access's result family, in the high nibble of the observation's
+  flags; the low nibble's bits 0-2 hold the prototype depth (PROPERTY_DEPTH_MASK 0x07) and bit 3
+  that an array key was checked (PROPERTY_ARRAY_KEY_CHECK 0x08).
+  1 Data, 2 Absent, 3 Created, 4 Accessor, 5 Exotic, 6 Rejected.
+ElementAccess payload: three bit sets, each with bit (value - 1) at its shift.
+  Receiver (shift 0): 1 Ordinary, 2 Array, 3 TypedArray, 4 String, 5 Primitive, 6 Exotic.
+  Key (shift 8): 1 Index, 2 CanonicalNumeric, 3 String, 4 Symbol.
+  Outcome (shift 16): 1 OwnData, 2 Hole, 3 Prototype, 4 Absent, 5 Accessor, 6 Exotic, 7 Created,
+  8 Rejected.
+CallTarget payload: three bit sets.
+  Target (shift 0): 1 UserFunction, 2 NativeFunction, 3 BoundFunction, 4 Proxy,
+  5 WrappedFunction, 6 CallableObject, 7 NonCallable.
+  Arity (shift 8): 1 Zero, 2 One, 3 Few, 4 Many (the expanded list's length for spread calls).
+  Environment (shift 16): 1 None, 2 Captured, 3 Dynamic, 4 Unknown.
+Allocation payload: two bit sets.
+  Object (shift 0): 1 Function, 2 RegExp, 3 Array, 4 Object.
+  Size (shift 8): 1 Zero, 2 Small, 3 Medium, 4 Large (array elements, object properties or a
+  RegExp's source bytes, never allocator metadata).
+
+An observation word (u64): bits 0-7 the ObservationState, 8-15 the flags, 16-47 the payload.
+Exact indices, strings, addresses, shape numbers and Value encodings are never recorded in an
+observation: they are workload facts or representation details, which belong to the versioned
+runtime adapters (the caches of section 1).
+
+3. The detailed vector (TRUST_JS_FEEDBACK_PROFILE=1, a diagnostic)
+
+A chunk's FeedbackLayout lists its sites (SiteDescriptor: bytecode pc, first slot, operation,
+slot count) and their slots (SlotDescriptor: kind and role); its FeedbackVector holds one
+observation word a slot, merged monotonically. Its profile envelope (serialize_profile), little
+endian, 48 bytes of header then one word a slot:
+  0   8 bytes  magic "TRUST_JS"
+  8   u16      format version (1)
+  10  u16      schema version (SCHEMA_VERSION, 1)
+  12  u8       scope (1: vector-local, meaningful only to the vector that wrote it)
+  13  3 bytes  zero
+  16  u64      the process's profile session
+  24  u64      the vector's id
+  32  u64      the layout's stable hash
+  40  u32      site count
+  44  u32      slot count
+A merge (merge_serialized_profile) validates all of it and refuses a profile from another
+session, vector or layout.
+
+4. Coverage and precision (W4's standing metrics)
+
+Coverage: the share of the speculation kinds' executed operations (named and element loads and
+stores, calls, constructions, arithmetic, unary, update and comparison operations) whose site the
+speculative tier could compile without an exit for missing feedback (V8's sense of usable
+feedback; megamorphic and generic count as usable). Precision: the share whose feedback names
+exactly the coarse classes the operation saw. W4's census (the plan's "W4: feedback for the
+speculative tier") measured both; its census tool makes them a tracked diagnostic (W4 step 2).
+
+5. Added by W4's later steps (the plan's W4 design note; each step updates this file)
+
+- The always-on value-class record (step 3): one u32 a pc, three ValueClass sets (operand 0,
+  operand 1, result) ORed on change, written by the VM on every execution and by generated code's
+  miss paths only, with each template's in-line set (the classes it takes without a record)
+  listed here, and rule U (the record plus the in-line set) as the reading.
+- The element record (step 4), the named sites' generic mark (step 5), the read API (step 6),
+  the pc map of inlined and recompiled code (step 7), Pilot C's store writability (step 9) and the
+  dependency registry (step 10).

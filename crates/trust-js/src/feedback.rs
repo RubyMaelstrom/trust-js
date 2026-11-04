@@ -1,7 +1,8 @@
 //! Versioned, representation-independent per-function feedback layout.
 //!
-//! See `FEEDBACK_SCHEMA.md`. This module deliberately contains no `Value` discriminants, shape
-//! numbers, object addresses, or IC structs. Those belong to versioned runtime adapters.
+//! See `feedback-schema.txt` beside this file: the encodings, the records and their reading. This
+//! module deliberately contains no `Value` discriminants, shape numbers, object addresses, or IC
+//! structs. Those belong to versioned runtime adapters.
 
 use std::cell::{Cell, OnceCell};
 use std::collections::hash_map::RandomState;
