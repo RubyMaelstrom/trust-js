@@ -9993,3 +9993,46 @@ Decided (mine, reported to the owner; the exemplars' answers taken):
    literals' boilerplates are W2e's images, slack tracking is W2d's per constructor), and moves to
    P3 with this census's survival tables.
 3. No equality feedback: P3 types equality from its operands, as JSC does.
+
+### Export accessors' binding proof read in place (record, 2026-11-04)
+
+A phase-exit item ("The phase exit's gap, measured": Vue's Interp::try_binding_getter, 5.0% of
+its instructions). The bundler's export accessors (`get: () => binding`) read their binding
+through a cached proof of the scope chain (property_read.rs), which try_binding_getter took out
+of the getter's sidecar and set back on every call: two take-and-set pairs of the 48-byte proof,
+about half of the function's instructions (perf annotate). The probe runs no JavaScript and
+writes no cache, so UserCallable::binding_getter_proof borrows the proof in place; a stale proof
+is replaced after the reference ends (f0810c79, rebased onto main as the commit before this
+record).
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3; main 146a807c's engine):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,813,498,958 | 1,791,644,533 | -1.21% |
+| React | 315,990,054 | 315,995,361 | +0.00% |
+| Djot | 635,327,264 | 635,317,225 | -0.00% |
+| chai | 80,346,877,417 | 80,351,132,246 | +0.01% |
+| Richards | 136,548,831 | 136,553,345 | +0.00% |
+| DeltaBlue | 262,208,317 | 262,214,525 | +0.00% |
+| Crypto | 729,751,899 | 729,758,586 | +0.00% |
+| RayTrace | 994,926,667 | 994,934,850 | +0.00% |
+| EarleyBoyer | 3,185,100,044 | 3,185,102,735 | +0.00% |
+| RegExp | 2,775,207,908 | 2,775,177,473 | -0.00% |
+| Splay | 1,401,517,792 | 1,401,517,771 | -0.00% |
+| NavierStokes | 451,650,205 | 451,656,704 | +0.00% |
+| PdfJS | 7,706,089,766 | 7,706,086,455 | -0.00% |
+| Mandreel | 62,954,792,110 | 62,954,303,678 | -0.00% |
+| Gameboy | 21,515,012,035 | 21,515,015,098 | +0.00% |
+| CodeLoad | 482,545,582 | 482,549,291 | +0.00% |
+| Box2D | 4,478,422,912 | 4,478,422,713 | -0.00% |
+| zlib | 138,040,687,923 | 138,040,697,559 | +0.00% |
+| TypeScript | 58,775,072,972 | 58,768,412,632 | -0.01% |
+
+Vue -1.21%; every other workload within 0.01%. Checks on f0810c79: the lib suite with the embed
+feature on ARM64 (2,761 of 2,762: tests::execution_deadlines_abort_without_running_catch_or_
+finally_on_every_tier failed once under the suite's load, at its deadline's timing, and passes
+alone three of three and in eight parallel runs on this build and on main's) and x86-64 (zombie,
+2,543); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575
+of 53,575 and identical to main's report; the fixtures' masked output as main's; difftest 138
+agree, 12 skipped (budget).
