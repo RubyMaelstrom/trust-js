@@ -7815,3 +7815,132 @@ Follow-ups:
   a lookup through the active heap (the micro-benchmarks' profile); W2e's in-line allocation takes
   them out of the path.
 - Fixed elements (Decision 28c's second half) are measured next, on this tree.
+
+### W2d step 4b: fixed elements measured; small first blocks instead (census, design and record, 2026-11-04)
+
+Decision 28c's second half: fixed elements in the array's cell (SpiderMonkey's), measured after
+copy-on-write. Census: step 4's tree (37d488ca) with a census patch (target/p2/w2d4/census-fixed:
+census.patch, run.sh, summary.txt; TRUST_JS_FIXED_CENSUS=1, an agent's). Every Array is tagged at
+creation with its Rust creation site and birth length, and a census-only fill of the words past
+`used` tells at death the most words it ever held. Each object is costed at its death and at the
+heap's release (cell, named record and element block at their size classes, as W2d's census),
+today and under two models: the element header (16 bytes) and the words follow the array's named
+slots in its cell, in the smallest of the 96, 128 and 192-byte classes that holds its birth count,
+and elements that outgrow the room take today's final block (model A); and also `[]` with room for
+four words (model B, as SpiderMonkey's GuessArrayGCKind(0) gives `[]` six).
+
+| workload | arrays | arrays today MB | model A | model B | all objects, A | all objects, B |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 38,198 | 10.76 | -0.0% | -54.5% | -0.0% | -33.7% |
+| React | 4,511 | 7.33 | +0.0% | +0.0% | +0.0% | +0.0% |
+| Djot | 49,748 | 6.94 | -2.8% | +2.6% | -1.3% | +1.3% |
+| chai | 1,893,641 | 479.30 | -1.8% | -4.2% | -1.1% | -2.5% |
+| DeltaBlue | 4,174 | 1.28 | +0.0% | -51.1% | +0.0% | -29.6% |
+| RegExp | 213,228 | 43.35 | -5.0% | -5.0% | -4.2% | -4.2% |
+| PdfJS | 233,949 | 60.98 | -2.0% | -2.4% | -1.2% | -1.5% |
+| Gameboy | 22,016 | 16.61 | -2.1% | -2.1% | -1.6% | -1.6% |
+| TypeScript | 1,096,645 | 145.49 | -0.0% | +0.0% | -0.0% | +0.0% |
+| Splay, sustained, the rest | | | | | -0.6% to +0.2% | Crypto +2.9% |
+
+- Model A saves allocations, not bytes: the element header is paid either way, and exact blocks
+  already fill their classes (the sustained workload's 400,001 element blocks go to one, PdfJS's
+  228,539 to 12,410).
+- Model B's gains are arrays born empty that take one to four elements, whose first push grows a
+  16-word block (V8's `old + old / 2 + 16` from none; 144 bytes, the 192-byte class): Vue 36,813 of
+  its 37,497 born empty, DeltaBlue 4,111 of 4,172. Where `[]` stays empty, B costs: TypeScript's
+  897,365 never-filled arrays pay 32 bytes more each, Djot +1.3%, Crypto +2.9%.
+- Builtins that know their result's length (slice, splice, map, concat and flat, through
+  ArraySpeciesCreate) build through ArrayCreate(len) and appends, so they take growth blocks:
+  chai's slice results are 45% smaller under model A, and React's (98.5% of its arrays, from
+  builtins, 13 elements or more) the same in every model.
+- The live heaps do not move: Splay 107.04 MB (all its arrays share their literal), TypeScript
+  490.13 MB (B: -0.2%), chai 2.43 MB.
+
+What the exemplars do (target/p2/w2d/exemplars.txt, 5 and 6): V8 grows a FixedArray from none to
+`0 + 0 / 2 + 16` (17 for one element, js-objects.h:691-697) and allocates exact sizes;
+SpiderMonkey gives a dynamic elements buffer at least ELEMENT_CAPACITY_MIN = 6 elements
+(vm/NativeObject.h:1100-1103) and `[]` six fixed elements; JSC gives an empty request a vector of
+5 (runtime/ArrayConventions.h:80-81), rounded to fill its size class (runtime/ButterflyInlines.h:
+72-93), and sizes a site's arrays by its ArrayAllocationProfile.
+
+Decision: not fixed elements. Their measured gain is the first growth of born-empty arrays and the
+builtins' growth blocks, which two changes to the element block take without moving elements into
+cells:
+1. A block grows from none to six words (SpiderMonkey's least capacity; JSC's five filled to our
+   64-byte class), then to V8's first 16, and by V8's rule after, so every block past six words
+   takes exactly the capacities it took before.
+2. ArrayCreate(len) reserves its words, up to the words' unchecked limit (5,000), since its callers
+   fill them in order: V8's ArrayCreate preallocates the elements too.
+Tried and dropped: filling each growth block to its storage class (JSC's rule) with the ladder
+started at six. Every later capacity shifted, so a given length could land a class higher:
+Gameboy's 64K-word arrays ended 30% larger (its objects' bytes +15.0%), while lengths of 1,000 or
+16K landed 13% lower. Rejoining V8's ladder at 16 keeps every length's block as before.
+
+Commits, from main 9ccd52d0, on p2-w2d4b:
+- 954c9b10: from none a block grows to six words and fills its storage class; ArrayCreate reserves.
+- 19a770d7: blocks rejoin V8's ladder at 16, without class filling (the first try's Gameboy +15%).
+- 13645c27: Words::clone keeps the empty block in line (fat LTO had moved the clone of every
+  object literal's empty elements out of line: Splay +0.53%).
+- then this record.
+
+Objects' bytes allocated over the run (step 4's objbytes measure), against step 4's tip:
+
+| workload | step 4 MB | step 4b MB | change |
+| --- | --- | --- | --- |
+| Vue | 17.41 | 12.70 | -27.1% |
+| React | 9.78 | 7.51 | -23.3% |
+| DeltaBlue | 2.21 | 1.69 | -23.8% |
+| chai | 791.84 | 673.63 | -14.9% |
+| TypeScript | 497.88 | 473.78 | -4.8% |
+| Djot | 14.32 | 14.00 | -2.2% |
+| PdfJS | 96.74 | 96.24 | -0.5% |
+| Box2D | 27.29 | 27.19 | -0.4% |
+| Crypto | 0.44 | 0.44 | -0.2% |
+
+Splay (97.8 bytes an object), the sustained workload, RayTrace, EarleyBoyer, Richards, RegExp and
+Gameboy are unchanged within 0.1%. Against the census's "today", before W2d: Vue 27.71 to 12.70 MB
+(-54.2%), React 12.66 to 7.51 (-40.7%), chai 1259.87 to 673.63 (-46.5%), DeltaBlue 3.57 to 1.69
+(-52.7%), TypeScript 988.91 to 473.78 (-52.1%).
+
+Counts against step 4's tip, 37d488ca (fat LTO, CPUs 10-13, pacing off, median of 3):
+
+| workload | step 4 | step 4b | change |
+| --- | --- | --- | --- |
+| Vue | 1,832,837,304 | 1,832,346,882 | -0.03% |
+| React | 331,379,605 | 320,686,608 | -3.23% |
+| Djot | 661,950,774 | 660,804,231 | -0.17% |
+| chai | 81,862,068,110 | 82,131,545,906 | +0.33% |
+| Richards | 136,867,403 | 136,861,727 | -0.00% |
+| DeltaBlue | 263,748,206 | 263,595,439 | -0.06% |
+| Crypto | 730,083,401 | 730,133,907 | +0.01% |
+| RayTrace | 1,019,264,341 | 1,019,275,889 | +0.00% |
+| EarleyBoyer | 3,399,918,550 | 3,406,069,390 | +0.18% |
+| RegExp | 2,802,730,553 | 2,803,071,542 | +0.01% |
+| Splay | 1,609,972,297 | 1,609,524,116 | -0.03% |
+| NavierStokes | 451,909,169 | 451,909,998 | +0.00% |
+| PdfJS | 7,949,522,040 | 7,948,845,121 | -0.01% |
+| Mandreel | 62,958,593,715 | 62,958,861,813 | +0.00% |
+| Gameboy | 21,544,028,913 | 21,542,480,763 | -0.01% |
+| CodeLoad | 483,606,838 | 483,615,099 | +0.00% |
+| Box2D | 4,493,595,740 | 4,493,899,824 | +0.01% |
+| zlib | 138,040,523,083 | 138,040,507,485 | -0.00% |
+| TypeScript | 59,345,970,506 | 59,382,511,098 | +0.06% |
+
+React -3.23%: its arrays are builtins' results (98.5%), which ArrayCreate now sizes. chai +0.33%:
+its arrays born empty that pass six elements, over a million (the census: 1,203,451 pass four),
+take one more block and a six-word copy (storage allocation +50M instructions, memcpy +110M in its
+profile): SpiderMonkey's and JSC's small first capacity costs this too, against chai's -14.9% of
+bytes. EarleyBoyer +0.18%: the same 75 collections, and the moves spread over its generated code's
+attribution and marking, with no array path among them.
+
+The fixtures' peak RSS (fresh copies made together, median of 9, MiB; before W2d, step 4, step
+4b): Vue 23.53, 23.48, 23.79, which over 15 rounds is 23.13, 23.00 and 23.08 (ranges 22.5-24.0,
+22.6-23.7, 22.3-24.2); React 15.54, 15.23, 14.86; Djot 35.83, 32.60, 32.41.
+
+Checks on 19a770d7: the lib suite on ARM64 (2,619) and x86-64 (zombie, 2,542); clippy in the three
+configurations on both; Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to main's
+report; the fixtures' masked output as main's; difftest 138 agree. 13645c27 moves code only; its
+targeted tests pass.
+
+With step 4b, W2d's steps are done: Decision 28 is carried out, its third question answered by the
+census (copy-on-write, then small first blocks for what fixed elements would have saved).
