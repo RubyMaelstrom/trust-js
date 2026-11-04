@@ -11346,7 +11346,15 @@ impl Interp {
             },
         );
         let pin = cur.take().map(|p| Gc::downgrade(&p)).unwrap_or_default();
-        self.creation_pins.insert(proto_ptr, pin);
+        // A prototype keeps one pin: a fill under a prototype pinned already (the same live
+        // object) inserts nothing (TypeScript re-inserted 3.18M times, W2g's census).
+        let pinned = self
+            .creation_pins
+            .get(&proto_ptr)
+            .is_some_and(|held| held.strong_count() != 0 && held.ptr_eq(&pin));
+        if !pinned {
+            self.creation_pins.insert(proto_ptr, pin);
+        }
         true
     }
 
