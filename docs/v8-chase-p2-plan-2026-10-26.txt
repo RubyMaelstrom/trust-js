@@ -11227,3 +11227,40 @@ Exit (proposed):
   table; Djot's elapsed time at least 2% lower.
 - The gate and both lib suites as each step lands; the code dumps change only in the templates the
   step names.
+
+### Vue's gap, by its misses (census, 2026-11-04)
+
+Vue needs about -13% to reach the phase exit (260 ms against node-sp's 113 at t8, session 1
+above). SPE on main a31509fe's engine (fat LTO, CPU 13, one operation in about 1,024;
+target/p2/compact/vue-prof.txt): generated code 31.5% of Vue's operations; the rest is led by
+property reads that leave it (jit_get_prop 3.09%, get_named_property_from_slot 1.76%,
+get_member_recv_impl 1.62%, get_prop_ic_impl 1.49%, ic_get_rederive 1.44%, Props::get 1.35%,
+get_from_chain 1.30%, Props::read_walking 1.16%, PropKey position scans 0.99%), calls into Rust
+(jit_call_hit 2.61%, call_jit_committed 1.61%), the binding getters (try_binding_getter 1.99%,
+jit_accessor_validated 1.59%), the rooting registry (register 1.06%, unregister 1.11%) and the
+Proxy paths (proxy_get_trap 0.81%, proxy_get 0.55%, Reflect's get 0.59%, WeakMap get 1.01%
+before W2g step 5).
+
+Why the reads leave generated code (TRUST_JS_JIT_PROPSTAT=2, vue-propstat2.txt): 443,188 reads
+find an accessor, 123,162 a Proxy receiver, 57,361 an absent property no cache records.
+- The accessors are a bundler's module exports (minified names: kJ, yk, Kn, RI, aU, _N, S0; one
+  getter `() => binding` each), read at a few sites 10,000-79,000 times each. The template's
+  validated accessor landing calls the helper, whose stub calls the getter directly once the
+  read's getter call cache holds it (Decision 17). For these getters it never does: the helper
+  answers them in Rust without calling them (accessor_validated_get, property_read.rs:181-213:
+  try_binding_getter reads the binding the getter would return), so the call cache stays empty
+  and every read takes the Rust round trip.
+- The Proxy receivers are Vue's reactive objects (__v_raw, items, count, nested, length, scale):
+  each read runs the handler's `get` trap from Rust (proxy_get_trap).
+- The absent reads are Vue's flag tests (__v_isRef, __v_raw, __v_isReadonly), uncached.
+
+Candidates (each to be designed against the exemplars):
+1. Binding getters served by the shared property stub: the read's getter call cache records the
+   binding proof (its environment and slot), and the stub reads the binding (TDZ to the
+   helper), as an inlined getter would read it. The exemplars call such a getter (Sparkplug's
+   LoadIC handler, SpiderMonkey's CacheIR CallScriptedGetter, JSC's getter access case) and
+   inline it in their optimizing tiers; the alternative here is to let the call cache fill so
+   the stub's direct call runs it.
+2. A Proxy's [[Get]] from generated code: the stub calls the trap directly when the handler's
+   `get` is a user function (V8's ProxyGetProperty builtin calls the trap from generated code).
+3. Absent reads cached where the chain allows it (the miss reasons first).
