@@ -9403,3 +9403,61 @@ W5a item 3); the Proxy micro-benchmarks -3% (reflect) to -8% (none); a Proxy's c
 800 instructions fewer; no workload slower beyond noise; collections as before; Test262 identical,
 GC stress and TRUST_JS_GC_VERIFY over the moved kinds' tests, difftest; dumps unchanged apart from
 the `instanceof` walk and the typed arrays' layout.
+
+### W2g steps 3 and 6, and the creation pins (record, 2026-11-04)
+
+Commits, from main 3e7d856f, on p2-w2g-small:
+- 66b6bbca (step 6): Interp::is_htmldda tests the object's kind and `ic_plain` before its table.
+  An [[IsHTMLDDA]] object is a native function the engine makes not ordinary, and `$262` keeps the
+  table non-empty in every realm, so every ToBoolean, `typeof` and loose equality of an object
+  probed it. An ordinary object, or one of another kind, is none without the probe.
+- 62d55433: a creation cache's fill pins its prototype once; a fill under a prototype pinned
+  already (the same live object) inserts nothing.
+- 146a807c (step 3): in a one-realm interpreter, Interp::native_call_in_current_realm answers an
+  ordinary native (Native or NativeData, `ic_plain`) without probing eval_realm_fns and
+  native_function_realms. Every native made there is that realm's (make_callable_object registers
+  it at creation) and no realm's eval is tagged (create_realm tags only the realms it makes). A
+  proxy's callability sentinel and IsHTMLDDA (not `ic_plain`), a second realm and a ShadowRealm's
+  interpreters take the tables.
+
+As designed, except:
+1. Step 6 has no flag bit of its own: the flag byte is full (bits 0-5 and the two class bits),
+   and the kind and `ic_plain` already say what the bit would (only a native made not ordinary
+   can be IsHTMLDDA). The table keeps the identity.
+2. Step 3 keeps the realm out of the function: ObjectKind's payload is one word, and the
+   realm's global beside a NativeFn would grow every object's header. One realm in one
+   interpreter is the case the acceptance set runs; a second realm keeps today's probes.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3; main c90b3889's engine, step 6 and the
+pins at 62d55433 against main, step 3 at 146a807c against 62d55433):
+
+| workload | main | step 6 and the pins | step 3 | the three |
+| --- | --- | --- | --- | --- |
+| Vue | 1,822,359,607 | -0.22% | -0.27% | -0.49% |
+| React | 315,992,476 | +0.00% | -0.00% | -0.00% |
+| Djot | 635,439,940 | -0.01% | -0.00% | -0.02% |
+| chai | 80,394,768,165 | -0.03% | -0.02% | -0.06% |
+| Richards | 136,551,808 | -0.00% | +0.00% | -0.00% |
+| DeltaBlue | 262,323,467 | +0.00% | -0.04% | -0.04% |
+| Crypto | 729,772,386 | -0.00% | +0.00% | -0.00% |
+| RayTrace | 1,003,581,000 | -0.00% | -0.86% | -0.86% |
+| EarleyBoyer | 3,185,104,238 | +0.00% | -0.00% | -0.00% |
+| RegExp | 2,775,212,132 | +0.00% | -0.00% | -0.00% |
+| Splay | 1,401,525,243 | -0.00% | +0.00% | -0.00% |
+| NavierStokes | 451,650,939 | -0.00% | +0.00% | +0.00% |
+| PdfJS | 7,706,699,885 | -0.01% | -0.00% | -0.01% |
+| Mandreel | 62,954,012,011 | +0.00% | -0.00% | +0.00% |
+| Gameboy | 21,515,617,165 | -0.00% | -0.00% | -0.00% |
+| CodeLoad | 482,562,416 | -0.00% | -0.00% | -0.00% |
+| Box2D | 4,478,550,358 | -0.00% | -0.00% | -0.00% |
+| zlib | 138,040,691,492 | -0.00% | -0.00% | -0.00% |
+| TypeScript | 58,871,486,044 | -0.16% | -0.00% | -0.16% |
+
+RayTrace -0.86% (the census's estimate for step 3), Vue -0.49% (the census's 0.32% for step 6,
+and step 3's native calls), TypeScript -0.16% (the census's 0.20% for step 6 and 0.28% for the
+pins, together), chai -0.06%, DeltaBlue -0.04%; nothing slower.
+
+Checks on 146a807c: the lib suite with the embed feature on ARM64 (2,762) and x86-64 (zombie,
+2,543); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575
+of 53,575 and identical to main's report; the fixtures' masked output as main's; difftest 138
+agree, 12 skipped (budget).
