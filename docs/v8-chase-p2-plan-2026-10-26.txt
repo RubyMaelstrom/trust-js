@@ -9461,3 +9461,535 @@ Checks on 146a807c: the lib suite with the embed feature on ARM64 (2,762) and x8
 2,543); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575
 of 53,575 and identical to main's report; the fixtures' masked output as main's; difftest 138
 agree, 12 skipped (budget).
+
+### W4: feedback for the speculative tier (census, survey and design, 2026-11-04)
+
+W4's remainder, as planned: always-on value classes for arithmetic and comparison sites, written
+only on the VM's and the miss paths; a production read API; the schema documented in the tree;
+call-target identity exported from CallSite; elements kinds; a megamorphic state; allocation-site
+records with survival counted at minor collections; inlined and recompiled code's pcs mapped to
+their baseline sites; Pilot C finished and a dependency registry. W3 item 7 already landed the
+call cache's builtin ids and its megamorphic state (afe58a1e, 140d2d83); its per-way call count is
+parked (e854636e). Census and survey on main 0d724e3d, whose engine is c90b3889's (main moved to
+3e7d856f meanwhile, with plan records only); no engine change on main. Everything below is in
+target/p2/w4 (untracked).
+
+What exists:
+- feedback.rs: a versioned schema (SCHEMA_VERSION 1, feedback.rs:13) of OperationKind
+  (feedback.rs:46-57: named and element loads and stores, call, construct, arithmetic, branch, loop,
+  allocation; no comparison), ObservationKind (62-71), ValueClass (329-339) and the states
+  Uninitialized, Monomorphic, Polymorphic, Absent and Generic (373-379). A layout is built per
+  chunk from its operations (bytecode.rs:6074-6221). The words exist only with
+  TRUST_JS_FEEDBACK_PROFILE=1, every write finds its site by a binary search over the sites
+  (feedback.rs:1247-1278), and nothing reads them in production (`read` is cfg(test)). The header
+  names FEEDBACK_SCHEMA.md, which does not exist (feedback.rs:3).
+- The detailed vector changes what it observes: it clears 14 template bits (arithmetic,
+  comparison, branches, elements, names, stores, chains, regions' fusions, the call probe, direct
+  calls; jit.rs:4868-4892), turns regions off (jit_regions.rs:634-636) and in-line allocation off
+  (bytecode.rs:3411-3418). Inlined chunks get an unbound vector that records nothing
+  (feedback.rs:735-741).
+- What production already records, by kind:
+
+| kind | production state | written | read |
+| --- | --- | --- | --- |
+| named load, store | 4 IcState ways a site (bytecode.rs:89-114, 153); the engine's stub cache by (shape, key) (interpreter.rs:4702-4711); no megamorphic mark | fills on the VM's and helpers' misses (interpreter.rs:10360) | the VM, both backends' templates, regions |
+| element load, store | none a site; each array's kind bits in its word block (word_block.rs:35-71) | every write keeps the bits | templates and builtins at run time |
+| call | CallSite: 4 CallIc ways (callee, func, builtin id, native entry, class) and a megamorphic state (bytecode.rs:984-1047, 1328-1409) | the JIT's call helpers; not the VM's Op::Call | the ARM64 probe and direct sequence; the inliner |
+| construct | ConstructSite: one CallIc and the prototype's shape and slot (bytecode.rs:2005-2011) | the construct helpers | the direct construction |
+| arithmetic, comparison | none | | regions speculate from SSA demand |
+| branch, loop | none a site; tier-up counters a function and a VM loop (function_runtime.rs:71-74; tiering.rs:41-54) | | tier-up |
+| allocation | object- and array-literal images, the empty array's, shared literal blocks (bytecode.rs:3171-3240); constructors' InstanceImage and class learning (bytecode.rs:3250-3255, 4201-4212); RegExp programs | first execution | W2e's in-line allocation |
+
+- Region admission's exit profile is not on main: it is parked on p2-region-s3 (Decision 27).
+
+Census (target/p2/w4: census/, counts/, perf/, scripts/; commits 537ec5f1 (the always-on record)
+and 3180b163 (the census) on branch p2-w4-census, from main 0d724e3d; fat LTO through
+target/p2/tools/build-lto.sh, binaries in target/p2/w4/lto/537ec5f1 and lto/census):
+- Method. Each workload ran twice with TRUST_JS_W4_CENSUS. A --tier=bytecode run puts every
+  compiled-code operation through the VM's loop, which counts it by pc and records the full value
+  classes, element facts, allocations and survivors. The production --tier=jit run gives each
+  site's production state at exit and the always-on record (below). Chunks join on a hash of
+  their origin and operations, and every compiled-code execution joined (100% on every workload).
+  Pacing off; census runs on the A725 cores, counts on CPUs 10-13 (setarch -R, median of 3; chai
+  one run). Not counted: the tree-walker's first 8 calls of each function (it has no pcs). The
+  VM-only run inlines nothing, so inlined code counts at its callee's pcs; the JIT run's inlined
+  chunks keep their own state, which joins nothing (below).
+- The always-on record (537ec5f1), the plan's "VM and miss paths only": one u32 per pc in the
+  feedback vector, ORed and stored only when it changes. Arithmetic, unary, update and comparison
+  pcs keep three ValueClass sets (operand 0, operand 1, result); element pcs keep the receiver's
+  family (Array, typed array, arguments, other object, string, other), an Array's lost kind facts
+  (holey, non-Number, non-int32, frozen or shared, out of bounds) and the key's kind. The VM writes
+  it on every execution; generated code only where its fast path missed (jit_exec's operations,
+  String + String, the strict-equality helper, the element helpers). Nothing is written in line.
+- Executed operations in compiled code, by kind (% of all; target/p2/w4/census/summary1.md has
+  every kind):
+
+| workload | operations | named | element | call, construct | arithmetic | comparison | allocation | typeof, in, instanceof, ! | names | branch, loop | in the VM, JIT tier |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 16,469,762 | 14.9 | 2.0 | 11.8 | 5.6 | 9.9 | 0.4 | 8.7 | 20.9 | 25.8 | 0.001 |
+| React | 6,545,026 | 21.3 | 7.1 | 7.0 | 7.4 | 14.4 | 0.4 | 7.0 | 7.1 | 28.4 | 0.000 |
+| Djot | 5,764,435 | 24.7 | 1.6 | 9.4 | 6.7 | 17.8 | 1.5 | 1.3 | 8.8 | 28.2 | 0.035 |
+| chai | 699,984,913 | 28.7 | 16.8 | 11.8 | 3.0 | 5.0 | 0.5 | 9.2 | 8.6 | 16.4 | 0.000 |
+| sustained | 12,275,820 | 12.4 | 8.8 | 4.9 | 22.2 | 6.8 | 11.7 | 0.0 | 17.9 | 15.3 | 0.048 |
+| Richards | 2,539,221 | 48.6 | 1.0 | 8.0 | 4.1 | 13.9 | 0.0 | 0.0 | 8.1 | 16.3 | 0.001 |
+| DeltaBlue | 3,404,227 | 52.1 | 2.2 | 17.2 | 3.1 | 8.3 | 0.0 | 0.2 | 5.4 | 11.4 | 0.002 |
+| Crypto | 113,842,446 | 2.8 | 14.5 | 0.4 | 69.2 | 4.5 | 0.0 | 0.0 | 0.4 | 8.3 | 0.000 |
+| RayTrace | 11,425,825 | 52.8 | 0.5 | 9.9 | 13.2 | 2.2 | 0.0 | 4.5 | 4.8 | 12.1 | 0.000 |
+| EarleyBoyer | 47,307,174 | 24.9 | 1.2 | 8.2 | 1.3 | 13.1 | 0.0 | 10.6 | 16.5 | 24.1 | 0.000 |
+| RegExp | 20,109,740 | 18.5 | 9.1 | 6.7 | 19.9 | 8.5 | 0.4 | 0.0 | 12.0 | 24.8 | 0.004 |
+| Splay | 8,521,869 | 23.5 | 0.2 | 8.0 | 15.6 | 11.6 | 9.4 | 3.4 | 9.3 | 19.1 | 0.001 |
+| NavierStokes | 89,138,001 | 0.0 | 25.2 | 0.0 | 51.0 | 6.2 | 0.0 | 0.0 | 6.4 | 11.2 | 0.000 |
+| PdfJS | 116,173,788 | 10.5 | 10.9 | 5.2 | 25.8 | 14.9 | 0.4 | 1.1 | 6.4 | 24.9 | 0.003 |
+| Mandreel | 2,029,517,922 | 0.1 | 18.4 | 2.1 | 40.1 | 6.5 | 0.0 | 1.0 | 22.1 | 9.7 | 0.000 |
+| Gameboy | 320,638,461 | 31.5 | 13.3 | 2.2 | 23.8 | 11.3 | 0.0 | 0.1 | 0.5 | 17.3 | 0.005 |
+| CodeLoad | 25,050 | 12.3 | 13.1 | 4.7 | 3.1 | 12.1 | 5.5 | 4.4 | 10.3 | 34.4 | 0.000 |
+| Box2D | 96,350,038 | 50.1 | 2.3 | 2.7 | 29.0 | 5.6 | 0.0 | 0.2 | 3.1 | 7.0 | 0.001 |
+| zlib | 9,735,732,336 | 0.0 | 14.6 | 0.0 | 56.5 | 5.8 | 0.0 | 0.1 | 14.6 | 8.4 | 0.000 |
+| TypeScript | 843,907,670 | 48.9 | 1.7 | 8.2 | 3.1 | 9.8 | 0.1 | 0.7 | 8.6 | 19.0 | 0.000 |
+
+- The VM runs almost none of them in the JIT tier: 0.000-0.048%. It also runs the scope operations
+  generated code hands it (PushLex, PopEnv and the like, 6.5% of the sustained workload's
+  operations), which are no feedback sites. A function runs its first 8 calls (or 128 back edges)
+  in the tree-walker, which records nothing, and its first admission compiles bytecode and native
+  code together (TRUST_JS_JIT_ADMIT_RUNS defaults to 0, interpreter.rs:6064, 14846-14858). A loop
+  entered from the tree-walker runs the rest of one iteration in the VM. So "the VM's paths" give
+  W4 almost nothing, and the miss paths are all there is.
+- Usable feedback today (the production state at exit), % of the kind's executions; element,
+  arithmetic, comparison, typeof and `in` sites have none. Closures and empty literals need no
+  per-site state (V8's need none either) and count as usable:
+
+| workload | named load | named store | call | construct | allocation | all speculation kinds |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 96.7 | 92.2 | 99.7 | 0.0 | 100.0 | 57.6 |
+| React | 99.8 |  | 100.0 |  | 100.0 | 44.5 |
+| Djot | 99.2 | 99.8 | 97.5 | 78.4 | 99.3 | 56.8 |
+| chai | 33.4 | 100.0 | 99.9 | 46.8 | 99.9 | 32.8 |
+| sustained | 100.0 |  | 100.0 |  | 100.0 | 43.4 |
+| Richards | 100.0 | 100.0 | 100.0 | 44.8 |  | 74.9 |
+| DeltaBlue | 99.6 | 99.6 | 99.3 | 61.3 |  | 83.1 |
+| Crypto | 100.0 | 100.0 | 100.0 | 48.5 |  | 3.5 |
+| RayTrace | 98.9 | 99.2 | 98.2 | 100.0 | 100.0 | 78.9 |
+| EarleyBoyer | 99.2 | 100.0 | 98.2 | 100.0 | 100.0 | 70.2 |
+| RegExp | 72.8 | 100.0 | 100.0 |  | 100.0 | 33.7 |
+| Splay | 100.0 | 100.0 | 100.0 | 100.0 | 100.0 | 59.9 |
+| NavierStokes | 100.0 | 100.0 | 98.3 | 0.0 | 100.0 | 0.0 |
+| PdfJS | 88.8 | 99.2 | 99.0 | 66.0 | 99.9 | 22.1 |
+| Mandreel | 89.4 |  | 89.0 |  | 100.0 | 2.9 |
+| Gameboy | 94.0 | 100.0 | 99.3 | 0.0 | 100.0 | 39.1 |
+| CodeLoad | 100.0 | 100.0 | 99.0 | 98.4 | 100.0 | 43.2 |
+| Box2D | 97.8 | 98.8 | 99.4 | 97.3 | 100.0 | 57.7 |
+| zlib | 99.5 | 100.0 | 100.0 | 100.0 | 100.0 | 0.0 |
+| TypeScript | 96.7 | 99.7 | 98.9 | 73.4 | 100.0 | 77.5 |
+
+  "All speculation kinds" counts named, element, call, construct, arithmetic, comparison,
+  allocation, typeof, `in` and instanceof; branches, loops, `!` and names are apart (no exemplar
+  records branch directions, A4; names mostly have static addresses, Decision 21). chai's named
+  loads are 66% at sites whose ways never filled, which no state marks (receivers the ICs refuse,
+  its `proxify`'s proxies [inference]).
+  Calls: 0-17.7% of executions at megamorphic sites (Gameboy 17.7%), 0-81% at native targets.
+- The always-on record against the full record, % of the kind's executions. "Recorded": the
+  site's record is not empty. P3 can read it two ways. Rule U takes the record together with the
+  classes the in-line path accepts (Number for arithmetic and relational comparison, the Array and
+  typed-array words with an index key for elements; nothing for equality, whose in-line path
+  covers nearly every pair). Rule R takes the record alone when it is not empty. U is safe by
+  construction: every class seen outside the in-line set was recorded on 99.8-100% of arithmetic
+  executions. "Coarse" compares Number, String, BigInt, Boolean, undefined, null, Symbol and Object
+  (int32 and double merged); "fine" splits int32 from double:
+
+| workload | arith. recorded | arith. coarse (U) | arith. int32-only | arith. fine (R) | arith. R-safe | comparison recorded | comparison coarse (U) | element load recorded | element load coarse (R) |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 5.1 | 98.5 | 98.5 | 5.1 | 100.0 | 12.8 | 43.1 | 42.5 | 42.5 |
+| React | 1.8 | 98.6 | 98.6 | 1.8 | 100.0 | 1.4 | 50.8 | 0.0 | 0.0 |
+| Djot | 61.7 | 89.7 | 89.7 | 61.7 | 99.9 | 54.1 | 69.5 | 19.8 | 16.4 |
+| chai | 3.6 | 96.9 | 96.6 | 3.6 | 100.0 | 19.4 | 25.3 | 20.2 | 20.2 |
+| sustained | 76.5 | 100.0 | 55.9 | 33.8 | 55.9 | 95.2 | 100.0 | 19.2 | 19.2 |
+| Richards | 0.0 | 100.0 | 100.0 | 0.0 | 100.0 | 15.1 | 9.4 | 0.0 | 0.0 |
+| DeltaBlue | 7.7 | 98.9 | 98.9 | 7.7 | 100.0 | 2.5 | 37.2 | 1.3 | 1.3 |
+| Crypto | 97.4 | 100.0 | 100.0 | 97.4 | 100.0 | 89.2 | 98.8 | 97.0 | 97.0 |
+| RayTrace | 1.5 | 100.0 | 4.7 | 61.5 | 99.2 | 0.8 | 77.0 | 0.0 | 0.0 |
+| EarleyBoyer | 78.0 | 100.0 | 100.0 | 78.0 | 100.0 | 35.0 | 21.5 | 8.4 | 8.4 |
+| RegExp | 5.5 | 99.2 | 84.4 | 5.5 | 100.0 | 2.1 | 100.0 | 2.1 | 2.1 |
+| Splay | 44.3 | 59.5 | 48.7 | 44.3 | 100.0 | 3.3 | 43.8 | 100.0 | 100.0 |
+| NavierStokes | 93.6 | 100.0 | 41.8 | 45.9 | 52.2 | 93.7 | 100.0 | 92.8 | 92.8 |
+| PdfJS | 58.2 | 91.0 | 83.4 | 51.6 | 93.4 | 61.6 | 88.2 | 55.4 | 48.6 |
+| Mandreel | 11.3 | 99.9 | 96.6 | 11.9 | 99.8 | 26.1 | 79.6 | 15.1 | 15.1 |
+| Gameboy | 72.7 | 99.9 | 98.0 | 71.5 | 98.8 | 59.1 | 88.0 | 69.2 | 69.2 |
+| CodeLoad | 0.3 | 99.7 | 85.3 | 0.3 | 100.0 | 2.5 | 25.4 | 73.4 | 73.4 |
+| Box2D | 26.6 | 100.0 | 8.2 | 28.5 | 75.0 | 19.6 | 60.8 | 14.1 | 14.1 |
+| zlib | 31.3 | 99.7 | 99.6 | 31.3 | 99.8 | 26.1 | 58.6 | 33.0 | 33.0 |
+| TypeScript | 9.2 | 98.9 | 98.9 | 9.2 | 99.9 | 5.8 | 31.7 | 33.1 | 32.8 |
+
+  - Arithmetic: rule U names the coarse classes exactly for 89.7-100% of executions on 19 of 20
+    workloads. Splay's 59.5% is its string-building Add sites, recorded as String and widened by
+    U with Number, the in-line set. Records come from the loops' one VM iteration and from misses.
+  - int32: 83-100% of arithmetic executions are int32-only on 15 workloads, 42-56% on
+    NavierStokes, Splay and sustained, 5-8% on RayTrace and Box2D. The record splits them only
+    where it was written (fine, rule R: 0-97%), and believing a one-iteration sample is unsafe on
+    sustained (55.9%), NavierStokes (52.2%) and Box2D (75.0%): their loops' first iteration sees
+    int32, later ones doubles.
+  - Comparison: relational operators behave as arithmetic; equality does not. Its in-line
+    template answers every pair but content-compared strings, which go to H_STRICT_EQ, and
+    coercions (jit.rs:12166-12404), so its record stays empty: coarse 9.4-100% (Richards 9.4%,
+    EarleyBoyer 21.5%, chai 25.3%, TypeScript 31.7%).
+  - Elements: the in-line template reads Array words and typed arrays alike (jit.rs:14471-14536),
+    so an empty record cannot tell them apart: coarse is the recorded share, 0-100%.
+- Records in inlined chunks never reach the baseline's sites: Vue's 270,844 records went 98% to
+  18 sites of its 10 inlined chunks (TypeScript has 293 inlined chunks with 22,868 sites).
+- A VM warm-up (TRUST_JS_JIT_ADMIT_RUNS=4: a loop-free function's first 4 compiled runs in the
+  VM) raises the recorded share where calls dominate (arithmetic: Vue 5.1 to 41.2%, Richards 0 to
+  95.5%, DeltaBlue 7.7 to 29.4%; equality's samples most: comparison coarse Vue 43.1 to 91.3%,
+  React 50.8 to 98.8%, Splay 43.8 to 99.2%) and makes rule R less safe where a sample drifts
+  (RayTrace's arithmetic R-safe 99.2 to 20.8%). Loops gain nothing. Precision over all kinds
+  (below) goes from 67.2-99.5% to 75.1-99.5%: Vue 81.7 to 92.1%, Richards 82.0 to 94.8%,
+  TypeScript 88.9 to 94.2%, zlib and NavierStokes unchanged (census/summaryA4.md,
+  census/coverageA4.txt).
+- Coverage, % of the speculation kinds' executions (target/p2/w4/census/coverage1.txt).
+  "Usable" is V8's sense (A10): P3 can compile the operation without an exit for missing
+  feedback, so an executed site whose in-line path took the operation counts, as do a filled or
+  megamorphic cache, an allocation image, a generic mark at a named site whose fill was refused
+  (design 3), and a closure or an empty literal. "Precise": the feedback, read by rule U
+  (elements by rule R), names exactly the coarse classes the operation saw:
+
+| workload | today | W4, usable | W4, precise | not precise, largest kinds (% of the operations) |
+| --- | --- | --- | --- | --- |
+| Vue | 57.6 | 99.9 | 81.7 | comparison 12.3, element 2.9, typeof/in/instanceof 2.9 |
+| React | 44.5 | 100.0 | 67.2 | element 11.1, comparison 11.0, typeof/in/instanceof 10.7 |
+| Djot | 56.8 | 99.6 | 87.3 | comparison 8.8, element 2.2, arithmetic 1.1 |
+| chai | 32.8 | 99.9 | 75.1 | element 18.0, comparison 5.7, typeof/in/instanceof 1.0 |
+| sustained | 43.4 | 100.0 | 89.8 | element 10.2 |
+| Richards | 74.9 | 100.0 | 82.0 | comparison 16.7, element 1.3 |
+| DeltaBlue | 83.1 | 99.7 | 90.8 | comparison 6.3, element 2.6 |
+| Crypto | 3.5 | 100.0 | 99.5 | element 0.5 |
+| RayTrace | 78.9 | 99.8 | 98.5 | comparison 0.7, element 0.6 |
+| EarleyBoyer | 70.2 | 99.7 | 78.2 | comparison 18.9, element 1.9, typeof/in/instanceof 0.8 |
+| RegExp | 33.7 | 100.0 | 85.8 | element 14.0 |
+| Splay | 59.9 | 100.0 | 81.2 | comparison 9.5, arithmetic 9.3 |
+| NavierStokes | 0.0 | 100.0 | 97.6 | element 2.4 |
+| PdfJS | 22.1 | 99.9 | 85.7 | element 7.4, arithmetic 3.4, comparison 2.6 |
+| Mandreel | 2.9 | 99.7 | 75.3 | element 22.3, comparison 2.0 |
+| Gameboy | 39.1 | 100.0 | 92.6 | element 5.7, comparison 1.7 |
+| CodeLoad | 43.2 | 99.9 | 75.3 | comparison 17.3, element 4.8, typeof/in/instanceof 2.5 |
+| Box2D | 57.7 | 100.0 | 95.4 | comparison 2.4, element 2.2 |
+| zlib | 0.0 | 100.0 | 84.3 | element 12.3, comparison 3.1 |
+| TypeScript | 77.5 | 99.8 | 88.9 | comparison 9.4, element 1.4 |
+
+- Costs, user-mode instructions (counts/; the detailed vector and templates-off rows of Mandreel,
+  Gameboy, CodeLoad, Box2D, zlib and TypeScript are one run each, cut at 600 s, ">" a lower bound):
+
+| workload | main | always-on record | detailed vector | its templates off, nothing observed | VM warm-up (4 runs) | record and warm-up |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 1,822,354,965 | +0.34% | 4.4x | 2.12x | -0.17% | +0.59% |
+| React | 315,993,249 | +0.26% | 8.5x | 4.47x | -6.28% | -5.99% |
+| Djot | 635,448,531 | +0.48% | 3.6x | 2.06x | +0.19% | +0.77% |
+| chai | 80,376,897,891 | +1.62% | 5.1x | 1.92x | -0.01% | +1.67% |
+| sustained | 1,767,722,799 | +0.09% | 4.3x | 2.31x | -0.41% | -0.31% |
+| Richards | 136,551,533 | +0.02% | 6.2x | 3.28x | -2.34% | -2.32% |
+| DeltaBlue | 262,317,924 | +0.06% | 5.7x | 1.92x | +3.67% | +3.77% |
+| Crypto | 729,772,083 | +0.02% | 124.9x | 40.30x | +0.95% | +1.42% |
+| RayTrace | 1,003,584,940 | +0.09% | 5.4x | 1.75x | -0.13% | -0.04% |
+| EarleyBoyer | 3,185,113,673 | +0.35% | 5.7x | 3.08x | +0.04% | +0.38% |
+| RegExp | 2,775,199,851 | +0.01% | 4.1x | 1.99x | +0.00% | +0.02% |
+| Splay | 1,401,522,473 | +0.43% | 3.1x | 1.80x | +0.02% | +0.44% |
+| NavierStokes | 451,650,083 | +0.01% | 173.9x | 47.01x | -0.02% | -0.01% |
+| PdfJS | 7,706,657,073 | +1.46% | 9.6x | 3.70x | -0.04% | +1.39% |
+| Mandreel | 62,955,124,585 | +0.00% | 29.3x | 9.55x | -0.04% | -0.04% |
+| Gameboy | 21,515,500,097 | +1.66% | 9.9x | 3.53x | +4.09% | +6.07% |
+| CodeLoad | 482,554,626 | +0.02% | 1.0x | 0.97x | -0.11% | -0.09% |
+| Box2D | 4,478,558,704 | +0.24% | 8.8x | 3.42x | -0.49% | -0.25% |
+| zlib | 138,040,683,216 | +0.08% | >16.8x | 19.02x | -0.00% | +0.08% |
+| TypeScript | 58,871,487,274 | +0.28% | 5.0x | 2.38x | -1.81% | -1.53% |
+
+  - The detailed vector costs 3.1-9.9x on the fixtures and the object-heavy benchmarks, 17-174x on
+    the numeric kernels (Mandreel 29x, Crypto 125x, NavierStokes 174x, zlib more than 17x when
+    cut), and nothing on CodeLoad, which mostly compiles. On Vue its observation functions take
+    3.0 of its 7.99G instructions (observe_value_class 12.3%, observe_branch 10.5%, observe_call
+    5.2%: each a binary search for its site and a merge; DeltaBlue 37.0%), and the templates it
+    turns off most of the rest: with the same 14 template bits off and nothing observed
+    (TRUST_JS_JIT_FAST=4291167192), Vue takes 2.12x. NavierStokes's 174x is every element and
+    arithmetic operation in the exact-pc helper, whose profiled element path formats keys
+    (observation 56.6% of its instructions). It is a diagnostic and stays one.
+  - The always-on record costs what its records cost, about 10-80 instructions each (Splay 11,
+    PdfJS 23, Vue 23, chai 56, Gameboy 76), and nothing where nothing misses. chai's +1.62% is
+    23.4M records, 15.8M of them element misses, which borrow the receiver once more. Gameboy's
+    +1.66% is 4.7M, mostly comparisons and arithmetic whose operands leave the in-line Number
+    paths. PdfJS's +1.46% is 4.8M; Vue's +0.34% is 271K, 98% of them element and strict-equality
+    misses in its inlined chunks. The fixtures' costs are real, not the stack scan's luck: over ten
+    nursery sizes (counts/nursery.log) Vue +0.34%, React +0.26% and Djot +0.49%, the same at every
+    size.
+  - The VM warm-up moves counts by -6.3% to +4.1% on its own (React -6.28%, Richards -2.34%,
+    DeltaBlue +3.67%, Gameboy +4.09%): it changes which functions compile and when. It is a
+    tiering change, not a cost of feedback.
+- Allocation sites and survival (VM-only runs with TRUST_JS_GC_LOG=1; a survivor is an object the
+  next collection marked; objects are attributed to the operation that made them, a call's or a
+  construction's result to that pc when a built-in made it; census/survival1.txt):
+
+| workload | attributed allocations | survival | sites >= 0.85 (allocations, survivor bytes) | sites < 0.10 (allocations) | of the heap's promoted bytes | minor collections, % of run (pacing on / off) |
+| --- | --- | --- | --- | --- | --- | --- |
+| Splay | 824,373 | 97.8% | 4 sites (97.8%, 100%) | 2.2% | 69.1% | 28.1 / 23.7 |
+| TypeScript | 3,326,720 | 56.5% | 229 sites (53.2%, 90.9%) | 40.4% | 44.7% | 5.1 / 6.3 |
+| EarleyBoyer | 1,347,209 | 40.0% | 11 sites (0.8%, 2.1%) | 31.4% | 98.0% | 6.6 / 10.9 |
+| PdfJS | 579,721 | 4.4% | 19 sites (3.4%, 79.0%) | 94.3% | 7.2% | |
+| chai | 4,248,105 | 1.0% | 6 sites (0.0%, 3.1%) | 98.6% | 31.9% | |
+| sustained | 1,439,533 | 16.7% | 2 sites (16.7%, 99.9%) | 83.3% | 79.7% | |
+
+  - Survival per site is bimodal where it matters: Splay's payload literals and its node
+    construction survive at 100%; TypeScript's constructions split into 229 long-lived and 74
+    short-lived sites; PdfJS's and chai's closures, arrays and literals die young. EarleyBoyer's
+    cons cells sit between, at 57-58%.
+  - Minor collections take 24-28% of Splay's run (one X925 core, the GC log's mark and sweep),
+    5-6% of TypeScript's, 7-11% of EarleyBoyer's.
+
+What the exemplars do (target/p2/w4/exemplars.txt; V8 c8b70908, SM 6bb81100, JSC 26027804, each
+checked at its main of 2026-11-04, where the cited code holds; 1,370 ranges checked, 0 problems):
+- A1: each first tier records value feedback on every execution, before an optimizing tier
+  exists: V8's Ignition in a byte of the bytecode (V8 interpreter-generator.cc:991-1012), SM's
+  Baseline Interpreter by attaching stubs (SM jit/JitScript.h:317-340), JSC's LLInt in its arith
+  and value profiles (JSC LowLevelInterpreter64.asm:1236-1290). TRust's first tier, the
+  tree-walker, records nothing.
+- A2: in the baseline, V8's Sparkplug+ calls a typed stub chosen from that byte, whose fast path
+  writes nothing; a type miss merges the byte and repatches the call
+  (V8 baseline-compiler.cc:1258-1299; V8 runtime-compiler.cc:158-198). JSC's baseline writes arith
+  result bits on its double paths only (JSC ArithProfile.cpp:74-93). SM's stubs count their
+  entries (SM jit/BaselineCacheIRCompiler.cpp:233-236), and JSC's value profiles store on every
+  baseline execution (JSC JITInlines.h:311-319).
+- A3: int32-ness is a tag in all three; an integral double is a double (V8 records kNumber,
+  V8 binary-op-assembler.cc:572-581; JSC's SpecAnyIntAsDouble, JSC SpeculatedType.cpp:637-648).
+  Only V8 tests a double by value, for kAdditiveSafeInteger
+  (V8 code-stub-assembler.cc:7626-7661).
+- A4: V8 records comparisons in the same byte (V8 globals.h:2663-2703); JSC records none and
+  types them from their operands' predictions (JSC DFGFixupPhase.cpp:824-904). None records branch
+  directions (V8 interpreter-generator.cc:1414-1432; JSC LowLevelInterpreter64.asm:2263-2275).
+- A5: calls: V8 keeps a weak target, a closure literal's FeedbackCell or the megamorphic symbol,
+  with a count on every call (V8 ic-callable.tq:91-168); SM a function, then a script, then
+  "scripted" stubs, whose entry count drives trial inlining (SM jit/CacheIR.cpp:6607-6624;
+  SM jit/TrialInlining.cpp:779-784); JSC up to 8 callees, then a virtual call
+  (JSC Repatch.cpp:171-184).
+- A6: property feedback changes on misses only, up to 4 maps in V8 (then homomorphic) and 6 stubs
+  in SM (V8 ic.cc:569-648; SM jit/ICState.h:26-34). Elements: V8's kinds live in the map and its
+  handlers' load and store modes (V8 map.h:368-382; V8 globals.h:3131-3168); SM has none, a shape
+  and a packed bit (SM jit/CacheIR.cpp:3018-3065); JSC's access paths store the last StructureID
+  on every execution (JSC LowLevelInterpreter64.asm:2022-2029).
+- A7: V8 removed allocation-site pretenuring on 2026-10-27 (commit 21e810452ab9; before it, 100
+  mementos and a survival ratio of 0.80, V8 pretenuring-handler.cc@9e976bfb:28-69); its sites
+  keep elements kinds and boilerplates, made at a literal's second execution
+  (V8 runtime-literals.cc:711-734). SM keeps a site word in every nursery cell and counts
+  promotions at minor collections, tenuring at 0.9 over more than 200 allocations
+  (SM gc/Heap.h:589-602; SM gc/Pretenuring.cpp:175-245, 270-352). JSC, non-moving with sticky marks
+  like TRust, counts no survival and never pretenured (JSC MarkedSpace.cpp:404-433).
+- A8: inlined code reads its callee's own feedback: V8's (vector, slot)
+  (V8 feedback-source.h:15-39), SM's per-call-site ICScript (SM jit/TrialInlining.cpp:809-861),
+  JSC's CodeOrigin, whose baseline CodeBlock owns the profiles (JSC InlineCallFrame.h:196-205);
+  JSC's exits record FrequentExitSite by bytecode index (JSC DFGOSRExitBase.cpp:38-60).
+- A9: dependencies are recorded during compilation and checked at install: V8's
+  CompilationDependencies into per-object DependentCode (V8 compilation-dependencies.cc:1450-1510),
+  SM's fuses (SM jit/WarpOracle.cpp:1236-1283), JSC's DesiredWatchpoints into three-state
+  watchpoint sets, whose firing jettisons the code and unlinks its incoming calls
+  (JSC DFGPlan.cpp:553-600; JSC CodeBlock.cpp:2431-2433).
+- A10: missing feedback is an exit, megamorphic feedback is not: V8's "insufficient type
+  feedback" deopt (V8 js-type-hint-lowering.cc:774-803; V8 js-heap-broker.cc:579-584), SM's
+  MBail(FirstExecution) for a never-run IC (SM jit/WarpOracle.cpp:1074-1096), JSC's ForceOSRExit
+  for an empty prediction (JSC DFGByteCodeParser.cpp:1319-1330).
+- A11: none reports coverage of executed operations. JSC gates DFG tier-up on 75% of a
+  function's value profiles being live, after up to 5 delays (JSC CodeBlock.cpp:3049-3058;
+  JSC OptionsList.h:401-404).
+- A12: V8 allocates a function's vector once it has executed 8 times its bytecode length
+  (V8 flag-definitions.h:1110-1111); SM makes its ICScript at a warm-up count of 10 and drops it
+  with the JIT code at a major collection (SM jit/BaselineJIT.cpp:631-644; SM gc/GC.cpp:3006-3036).
+
+Design:
+1. Value classes, always on, on the VM's and miss paths only (the plan's rule; A2's Sparkplug+ and
+   JSC's baseline arith):
+   - For arithmetic, unary, update and comparison (relational and equality) operations: three
+     ValueClass sets (operand 0, operand 1, result) in one u32, ORed and stored only on change.
+     The VM writes it on every execution; generated code where its in-line path misses (the
+     census's patch, 537ec5f1, measured as is).
+   - The record is a u32 a pc in an array the chunk makes at its first record: only 7-76% of the
+     compiled chunks recorded anything in the census's JIT runs (target/p2/w4/census/). A write
+     indexes it by pc, with no search: today's detailed vector searches its sites on every write
+     (feedback.rs:1247-1278). The patch's array, made with each chunk, is the measured form.
+   - The in-line set is part of the schema: each template publishes the classes it takes without
+     a record (Number for arithmetic and relational comparison, int32 for `%`, the element
+     templates' word and typed-array receivers with index keys). P3 reads rule U: the record plus
+     the in-line set. It is safe by construction, and exact at the coarse grain for 89.7-100% of
+     arithmetic executions on 19 of 20 workloads.
+   - int32: the record's int32 bit is a hint, written only by the VM and misses. P3 speculates
+     int32 where the record has no double and the use wants an integer (bit operations, indices,
+     int32 element stores), f64 elsewhere: a Number is already its f64 word, so f64 arithmetic
+     needs no boxing [inference]. A wrong int32 speculation is an exit, which Phase 3's exit
+     profile turns into a recompile (Carried to Phase 3).
+   - Equality is not recorded in line (JSC records no comparison, A4). P3 lowers it as the
+     baseline does, by tag, and narrows it from its operands' producers.
+   - Cheaper records than the patch's: the element record is taken in fast_get_elem and
+     fast_set_elem, which borrow the receiver and test its kind and the key anyway (chai's 15.8M
+     element records then cost a few instructions each [inference]); a word already Generic is
+     not reclassified.
+2. Elements kinds: the element record above, from the word block's kind bits (W2c's byte,
+   word_block.rs:35-71), on the VM's and miss paths. Its known gap: an in-line hit tells an
+   Array from a typed array only if a miss or the VM ran there. P3 keeps the baseline's two-way
+   dispatch where the record is empty, and reads the array's kind bits at run time as the
+   templates do. Recording in line would cost a load, a test and a branch at every element
+   access; the census's 14.6% of zlib's operations are element accesses, so it stays out of W4.
+3. Megamorphic and generic states:
+   - Named sites: a per-site state byte beside its 4 ways, set by a fill that is refused (an
+     uncacheable receiver, chai's proxies [inference]) or that evicts a live way, as CallSite
+     counts evictions in an epoch (bytecode.rs:1350-1366). It marks a site generic, which P3
+     lowers to the stub cache's probe (A10: megamorphic feedback is usable). The fill path only.
+   - Calls: CallSite's megamorphic state (W3 item 7) as is. The per-way count stays parked
+     (e854636e) until P3's inliner reads it: P3's hotness can come from the callee's jit_runs.
+4. The read API: crate::feedback::read, for a chunk and a baseline pc, returning one typed view a
+   kind:
+   - values: the three class sets with the in-line set applied (rule U), and whether a record
+     exists;
+   - element: receiver families, the Array facts, key kinds, out of bounds;
+   - named: each way's receiver shape, holder shape, depth, slot location and kind (data,
+     accessor, absent, creation), and the generic mark;
+   - call and construct: the state (empty, monomorphic, polymorphic, megamorphic) and each way's
+     target: the callee cell, its function literal (the FeedbackCell's role, as V8's one literal
+     with many closures), the builtin id, the native entry, the class;
+   - allocation: the image or template if made, the constructor's class, the site's survival
+     record (design 6).
+   It allocates nothing and interns nothing: P3 runs in the process that made the shapes. The
+   versioned envelope and refresh_current_layout_feedback (bytecode.rs:6243) remain the
+   diagnostics' adapters, built on the same views. The detailed vector stays a diagnostic.
+5. The schema document, tracked as crates/trust-js/src/feedback-schema.txt (AGENTS.md ignores
+   Markdown workfiles), and feedback.rs's header pointing at it. It holds:
+   - the numeric encodings, append-only within a version: OperationKind (with Comparison, 11),
+     ObservationKind, ValueClass, ObservationState, roles;
+   - each kind's record word: the value-class layout, the element bits, the named state byte;
+   - each template's in-line set, the rule-U reading, and that a record never shrinks;
+   - the read API's fields, which are exact and which hints (int32), and when a view goes stale
+     (call-cache epochs, shapes);
+   - the pc map (design 7) and site identity;
+   - the coverage and precision definitions (design 8) and the census tool that measures them.
+6. Allocation-site records and survival:
+   - A site record a pc for MakeObject, MakeArray, MakeArrayLiteral, NewObject, NewArray,
+     MakeClosure, MakeRegExp and New, plus one "built-in" record a call site: allocations,
+     survivors and their bytes.
+   - The object's cell carries its site's 16-bit index in the two padding bytes after
+     NamedEntries' len_slot [inference from the fields' sizes, to be confirmed with
+     -Zprint-type-sizes]. The allocation helpers and the in-line allocation store it and increment
+     the site's count, as SM's Baseline does in machine code (SM jit/MacroAssembler.cpp:708-737;
+     SM gc/Nursery-inl.h:213-247): about 5 instructions an in-line allocation [inference], Splay's
+     800K in-line allocations about 0.3% of its run. A minor collection's marking reads the index
+     of each young object it marks and increments the survivors (SM gc/Tenuring.cpp:945-958).
+   - What the records serve: P3's allocation sinking (sites that die young: PdfJS's and chai's
+     94-99% of allocations), and the class and slack decisions W2d step 3e makes per constructor.
+     Pretenuring is not W4's: V8 removed it and JSC never had it (A7), and in a non-moving heap it
+     saves a minor collection's mark of a survivor, not a copy, while its initializing stores
+     then need their cards. Splay (24-28% of its run in minor collections, 97.8% survival) is
+     where an experiment would pay; it waits for the records and an owner's decision.
+7. Inlined and recompiled pcs mapped to their baseline sites (A8's form):
+   - The inliner's splice records, for each spliced operation, the callee's chunk and pc; the
+     transformed chunk keeps the map (one u32 a pc and the callee chunks' list) beside its inline
+     sites (stack_trace.rs:86-97, bytecode.rs:9107).
+   - A transformed chunk's miss paths write the always-on record through the map into the
+     baseline site's word, so a callee's sites see what its inlined copies saw (Vue's 98%). Its
+     caches stay its own (they are its speed); the read API merges a transformed site's ways with
+     its baseline site's.
+   - FeedbackVector::unbound goes (feedback.rs:735-741): the map makes the "coincidentally equal
+     pc" it guards against impossible.
+   - P3's own exits (Phase 3) record by baseline pc through the same map, as JSC's FrequentExitSite
+     does (A8).
+8. Coverage and precision as standing metrics:
+   - Coverage: the share of the speculation kinds' executed operations whose site P3 can compile
+     without an exit for missing feedback (V8's sense, A10). Precision: the share whose feedback,
+     read by rule U, names exactly the coarse classes the operation saw.
+   - Measured by the census's two runs, made a tracked diagnostic under the
+     architecture-diagnostics feature, as the allocation-site probes are (DIAGNOSTICS.md), so that
+     ordinary builds pay nothing: TRUST_JS_FEEDBACK_CENSUS=<path> (the VM loop's counts and full
+     records in a --tier=bytecode run; the production state in the --tier=jit run) and
+     scripts/feedback-census.py, which joins them and prints both metrics by kind. Reported at
+     every stage exit beside instruction counts, from W4's exit on.
+   - JSC's live-profile share (A11) is a per-function gate, not a measure of executed operations;
+     P3 may add it at its tier-up.
+9. Pilot C and the dependency registry:
+   - Pilot C's proof is shapes keyed by attributes, landed by W2d steps 1-2: reads trust the shape
+     where a way proves data. What remains is writability: a store's way cannot prove it, because
+     a read's fill and a store's share one cache (W2d's record, item 2), so generated stores
+     test the attribute byte (guard_slot_writable_data, jit_storage.rs:268). Finishing Pilot C:
+     a store site's fill admits only a writable data property, and a read site's fill never reaches
+     a store site's ways, as the global name cache already does (c9d8babe); the three-instruction
+     test then goes from the stores, and the read API reports writability as proven.
+   - The dependency registry, JSC's form (A9): a watchpoint set (clear, watched, invalidated)
+     on each fact compiled code may assume: a shape with no transitions out, a prototype's
+     shape, a protector (array_prototypes_unshadowed, interpreter.rs:9820), a global binding's
+     constancy, an allocation site's decision. A compilation collects the sets it relies on and
+     installs itself in them at the end, failing if one has fired; firing marks its codes
+     invalid and unlinks their callers' call caches (Carried to Phase 3 names this as the home of
+     JSC's incoming-call unlinking). PROTO_EPOCH and CALL_IC_EPOCH (value.rs:8168,
+     bytecode.rs:1206) stay for the baseline's caches.
+   - W4 builds the registry with its first producers (protectors, prototype shapes) and a test
+     consumer; P3 is its first real one.
+
+Order (each step measured on its own, as the plan's stages):
+1. The schema document and feedback.rs's header (no code).
+2. The census tool as a tracked diagnostic (TRUST_JS_FEEDBACK_CENSUS and the script), so every
+   later step reports coverage and precision.
+3. The value-class record (design 1), with the in-line sets in the schema, ARM64 and x86-64 miss
+   paths.
+4. The element record (design 2), inside the receiver reads the miss paths make.
+5. Named sites' generic mark (design 3).
+6. The read API (design 4), with its tests against the census's records.
+7. The pc map and write-through for inlined chunks (design 7).
+8. Allocation-site records and survival counting (design 6), with the header's site index.
+9. Pilot C's store writability (design 9), with dump checks: store templates change.
+10. The dependency registry (design 9).
+Region admission's step 5 (speculation from W4's value classes) follows step 6.
+
+Change surface:
+- feedback.rs (the record, the read API, the schema's encodings), a new
+  crates/trust-js/src/feedback-schema.txt.
+- bytecode.rs: the chunk's record; the VM's arithmetic, comparison and element paths
+  (bin_num, bin_i32, bin_cmp and the unary and update paths, bytecode.rs:21617-21756; the element
+  paths, 26238-26340); jit_exec's operations, jit_add_strings and jit_strict_eq (24066-24260); the
+  allocation helpers; the inliner's splice (the pc map).
+- interpreter.rs: fast_get_elem and fast_set_elem (the element record), ic_insert (the generic
+  mark).
+- value.rs and gc_core.rs: the header's site index; the minor collection's marking (survivors).
+- jit.rs, jit_alloc.rs, jit_x64_alloc.rs: in-line allocation's site-index store; the store
+  templates' writability test (Pilot C).
+- The census tool: the VM loop's count (bytecode.rs:18155) and a dump at exit; a script.
+- Tests: the record's writes per path (VM, each miss helper; never an in-line hit), rule U against
+  the full record on a test program, the pc map under inlining, survival counts across minor and
+  major collections, the registry's install-time check and firing.
+
+Risks:
+- x86-64 was not measured. Its backend has in-line comparisons, equality and bit operations but
+  no in-line f64 Add, Sub, Mul or Div: they take jit_exec on every execution (jit_x64.rs:1048-1099),
+  so the record runs there every time. Measure on zombie before landing step 3; if it is over
+  budget, x86-64 records the tag's coarse class only, or gets the f64 templates first.
+- A record written in line by mistake costs every execution: a test runs each template's hit
+  and checks the record unchanged.
+- A template whose in-line set grows without the schema saying so makes rule U wrong. The census
+  tool's "complete" column (99.8-100% today) is its check, at every stage exit.
+- int32 hints from one-iteration samples drift (sustained, NavierStokes, Box2D). P3 must treat
+  them as hints guarded by exits, not as proofs.
+- The header's site index must stay out of the way of W2d's layout; if the padding is not free,
+  the index costs a word, which the census then has to price.
+- Equality and element receivers stay imprecise (precision 67.2-99.5%). Raising them needs records
+  on in-line paths or a recording warm-up; either is P3's call, priced by this census's numbers.
+
+Exit (proposed):
+- The record on by default at <= 2% instructions on the acceptance set (the plan's), on ARM64 and
+  on x86-64 (zombie). The patch measured 0.00-1.66% on ARM64 (Gameboy 1.66%, chai 1.62%, PdfJS
+  1.46%), before design 1's cheaper element record.
+- Coverage >= 95% on every workload, as the census tool measures it (the plan's number; the
+  census gives 99.6-100.0% for W4's design, against 0.0-83.1% today). The plan's "usable
+  feedback" can mean usable or right; this note measures both, and the 95% applies to usable.
+- Precision reported beside it, by kind, with no workload below this census's (67.2-99.5%), so a
+  change that loses records shows. A precision target belongs to P3, whose speculation sets the
+  grain.
+- The detailed vector stays a diagnostic.
+Why change the plan's exit: under the in-line convention every executed site whose in-line path
+ran is usable, so coverage meets 95% by construction and stops measuring how good the feedback
+is. Precision does, and it is where the remaining gaps are (equality, element receivers, int32).
+
+Decided (mine, reported to the owner; the exemplars' answers taken):
+1. No recording warm-up. A VM warm-up is a compile-policy change (the counts moved -6.3% to
+   +4.1% for reasons other than feedback), and it belongs with the tier threshold, which the
+   owner has open ("The phase exit's gap, measured"); W4 records on VM and miss paths only.
+2. No pretenuring in P2: V8 removed allocation-site pretenuring (2026-10-27) and JSC never had
+   it. Step 8 (allocation-site records and survival counting) then has no consumer in P2 (the
+   literals' boilerplates are W2e's images, slack tracking is W2d's per constructor), and moves to
+   P3 with this census's survival tables.
+3. No equality feedback: P3 types equality from its operands, as JSC does.
