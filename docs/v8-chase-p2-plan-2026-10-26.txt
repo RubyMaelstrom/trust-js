@@ -13609,3 +13609,65 @@ Checks at 4fc709f2 (849dbd18's earlier, before the walk's copy, the same):
   2,603/2,603 at TRUST_JS_TIER=jit with threshold 0 (s2c-*; 849dbd18's s2b-*, the same).
 - lib under GC stress (TRUST_JS_GC_STRESS=1000, TRUST_JS_GC_INCREMENTAL=force,
   TRUST_JS_GC_VERIFY=1; impl/stress, W6's 663 selected tests, 2b's among them): running; its result follows as an addendum.
+
+### TRust's pages reusing their compiled code (census, survey and scope, 2026-11-05)
+
+The threshold's prerequisite (the threshold record above) and, as measured here, the largest
+part of a small page's engine time. TRust 78435d0 on engine f3d0622e (target/p2/threshold-t1/
+trust-main), the offline replays on the X925 cores, TRUST_JS_PERF_METRICS's dump per page (each
+dump cumulative; a page's share is the difference; target/p2/page-reuse):
+
+| page | engine time a page | bytecode compiles | their time | native compiles | their time | machine code |
+| --- | --- | --- | --- | --- | --- | --- |
+| event-loop | 28-30 ms (21 ms without metrics) | 134 | 4.5-4.7 ms | 105 | 14.5-15.0 ms | 1.23 MB |
+| dom-reconcile | 1,759-1,791 ms | 246 | 7.7 ms | 215 | 28.4-29.0 ms | 2.54 MB |
+| Vue TodoMVC | 533-557 ms | 693 | 22.6-24.4 ms | 655 | 104-108 ms | 9.78 MB |
+
+Every page compiles the same functions again: the platform's (the static snapshot's prelude:
+WebIDL glue such as enumerableMembers and idlImplements, the event loop's) and, on TodoMVC, the
+page's own bundle (Vue's chunk-vendors.js and app.js), which every load of the page brings
+unchanged. Compiling is about two thirds of the event-loop page's engine time and about a quarter
+of TodoMVC's, at threshold 8; at threshold 1 with two bytecode runs the event-loop page compiles
+3.4 MB.
+
+What the exemplars do:
+- JSC shares a function's baseline machine code among its CodeBlocks: the code belongs to the
+  UnlinkedCodeBlock (UnlinkedCodeBlock::m_unlinkedBaselineCode,
+  Source/JavaScriptCore/bytecode/UnlinkedCodeBlock.h:414), which the VM's CodeCache shares
+  between evaluations of the same source in any global object. The code reads its CodeBlock's
+  data through two registers it loads at entry, the JIT data (constants, inline caches) and the
+  metadata table (jit/JIT.cpp:653-658); constants are a pool indexed at run time (JITConstantPool,
+  jit/BaselineJITCode.h:60-85). A few operations make a function's code unshareable
+  (m_isShareable, jit/JITOpcodes.cpp:1895, 1994). WebKit main, fetched 2026-11-04.
+- V8 compiles bytecode once per source and isolate (the compilation cache) and serializes it in
+  its code cache, which Node and Chrome load instead of compiling (the context snapshot carries
+  the platform's); Sparkplug code is per isolate but compiled from bytecode in one fast pass.
+  [to cite]
+- SpiderMonkey shares a script's immutable data (SharedImmutableScriptData, the stencil) across
+  realms and caches stencils for its chrome code. [to cite]
+
+Two tiers of remedy, to be designed in this order:
+1. Cheaper compiles a page makes anyway: the compact templates (designed above; every first-stage
+   byte they shed is shed on every page) and region code only where a function has run (the
+   phase exit's candidates: a recompile when hot), since region spans are most of a large
+   function's bytes (Djot's census: 2.30 of 3.96 MB).
+2. Reuse, as JSC's: a function's first-stage machine code compiled once per process for its
+   bytecode identity (a static snapshot's function, a script's by its source) and shared by every
+   heap that runs it, reading its per-heap data through ctx as JSC's baseline reads its
+   CodeBlock's. What first-stage code embeds today, by the emitters' immediates (jit*.rs): the
+   site's cache cells (mov_imm64 of cache_ptr, at every property, call, name and element site),
+   static name addresses (Decision 21: environment slots by address), atom words (key-checked
+   reads, PropKey::from_text), environment pointers, the epoch cells (process-wide already) and,
+   in second-stage code only, baked shapes. Bytecode chunks would split as JSC's UnlinkedCodeBlock
+   from CodeBlock and SpiderMonkey's stencil from its script: the ops, constants' descriptions and
+   the code, shared; the caches, constants' values and environment homes, per heap.
+
+Scope (proposed, the owner's to decide): tier 1 in P2, with the compact templates (designed and
+approved; queued behind Vue's Proxy reads) and a design for region code only where a function has
+run; tier 2 in P3. Tier 2 is a change to every first-stage emitter (each per-heap immediate read
+through ctx instead) and to the bytecode chunk (Chunk, bytecode.rs:2845-3136: its ops and
+constants' descriptions shared, its caches, values and code slot per heap), which is a phase's
+work, and it is what lets the threshold drop (t1a2: Djot -9.5%, React -3.2% on the fixtures'
+timers) without TRust's pages paying for it. A measured intermediate, if wanted in P2: the bytecode
+shared alone, which a page's bytecode compiles bound at a quarter of its compile time on the
+event-loop page (4.6 of about 19 ms).
