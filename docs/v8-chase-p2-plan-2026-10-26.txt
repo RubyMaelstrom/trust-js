@@ -11834,3 +11834,210 @@ with TRUST_JS_GC_VERIFY=1: tests::long_expression_chains_run in 3,272 s (its win
 tests::releasing_long_object_chains_uses_bounded_native_stack in 1,035 s
 (tests::execution_stack_resource_exhaustion_unwinds_and_recovers 761 s; 772-849 s at step 1).
 long_expression_chains_run joins the known-slow tests of future stress lists.
+
+### W6 step 2: the marking cycle behind TRUST_JS_GC_INCREMENTAL (record, 2026-11-04)
+
+Commit, from main 4cf200d5, on p2-w6 (an agent's; worktree target/p2/w6-impl-wt), landed on main
+as 018ca6d9 over 8370e936 (main's commits since 4cf200d5 change only this plan; the code is
+b4f2e2e0's):
+- b4f2e2e0: a major collection the heap asks for on its own (its byte budget after a minor
+  collection, the stress interval's) marks in a cycle when TRUST_JS_GC_INCREMENTAL is `1`
+  (`on`) or `force`; unset, as by default, every major collection marks in one pause, as
+  before.
+  - The cycle's start (Heap::start_cycle, the engine's gc_heap_start_cycle): with heap
+    verification the write barrier's and the records' checks, as a major collection's start;
+    every mark and card cleared; the client, built as a major collection's, reports the roots;
+    the native stack scanned; then the cycle's first slice. The marking consumes the tables'
+    and the handles' records, as a collection's does. The heap counts one marking
+    (Control::markings) for the whole cycle, and the cycle keeps one closure mark stamp, which
+    its slices and its final pause mark with (value::start_agent_cycle, slice_agent_heap).
+  - Slices (Heap::slice, gc_heap_slice): at the first safepoint once 64 KB were allocated since
+    the last one ended (V8's young step), through the heap bit as a collection falls due; each
+    traces grey cells within a budget, by the bytes of the cells it traces as V8 measures a step
+    (provisional until the schedule, step 4: four times the bytes allocated since the last
+    slice, at least 64 KB), with no client, no root and no stack, and leaves the rest in the
+    marker's worklist, which the cycle keeps (gc_core::Cycle).
+  - Minor collections are suspended while a cycle marks: the nursery's budget waits (bytes_due,
+    due_kind) and the young generation grows; the external bytes' budget waits too, their
+    bytes counting toward the margin.
+  - White allocation: nothing changes at an allocation; a cell made during the cycle is
+    unmarked until the marker reaches it.
+  - The final pause: when the worklist empties (at the next safepoint), when the cycle's
+    allocation passes V8's overshoot margin over the byte budget, min(max(budget / 2, 32 MB),
+    (maximum - budget) / 2) (V8 src/heap/heap-controller.h:160-176), and at once for every
+    requested collection: explicit ones, the exit's, the live-object ceiling, ArrayBuffer
+    pressure, a deferred major request, and an explicit minor one (V8 collects fully for a
+    young-generation request while it marks, src/heap/heap.cc:588-591). It is a major
+    collection's marking from the cycle's marks and worklist (Heap::final_marking, which
+    start_marking dispatches to while a cycle runs; mark_phase is unchanged): the marked
+    cells whose cards are set are rescanned with full traces and every card is cleared; every
+    root and the native stack are marked again; the side tables' conditional edges and the
+    ephemerons are added in full, as now (design 8; step 2b moves them into the slices); the
+    drain; verification; then a major collection's sweep. The GC log's line for it is a major
+    collection's, with step 1's `slices`, `cycle_alloc` and `cycle_mark` filled.
+  - Verification (design 11): with heap verification each slice's end and the final pause's
+    start check that no traced cell (marked, not in the worklist) whose card is clean holds an
+    edge to an unmarked cell (Heap::check_cycle_barrier); `TRUST_JS_GC_INCREMENTAL=force` makes
+    every slice four cells, at every safepoint while a cycle marks.
+  - The GC log: `[gc-slice]` lines for the start and each slice (`phase`, `n`, `traced`,
+    `marked`, `cycle_marked`, `worklist`, `cycle_alloc`, `complete`, `pause`); TRUST_JS_PERF_METRICS
+    counts slices apart from collections (`gc_slices`, `gc_slice_pause_seconds`,
+    `gc_max_slice_pause_seconds`). DIAGNOSTICS.md describes the mode and the lines.
+  - No change to the barrier, the allocator's paths or either JIT backend (design 10). The
+    cycle's code is out of line (`#[cold]`, `#[inline(never)]`) and a collection's marking
+    (mark_phase) is compiled as before: see the counts below. The fixtures' JIT dumps (Vue, React,
+    Djot; plain, chunk stubs, inline stubs) differ from the base's only in Heap::fast_alloc's
+    offset, #1214 -> #1222 (the Heap's new fields), in all nine (impl/dumps/offsets-only.py).
+
+Where the build differs from the design:
+1. An explicit major collection is precise: one that finishes a running cycle is followed by a
+   second collection (V8's PreciseCollectAllGarbage: FinalizeIncrementalMarkingAtomically, then
+   CollectAllGarbage, src/heap/heap.cc:1365-1370). The design had explicit requests finish the
+   cycle in one pause; alone, that keeps what the cycle marked before it died, which $262.gc,
+   hosts and the tests take to free everything unreachable. The second collection runs from the
+   explicit entry (Interp::gc_heap_collect_explicit), once the first's frames are popped and
+   zeroed.
+2. An explicit minor request while a cycle marks finishes it, as V8's young request selects the
+   mark-compactor (src/heap/heap.cc:588-591); the design's list did not name it.
+3. Only the major collections the heap asks for on its own start cycles: an embedder's request
+   (Heap::request_major, for a released document's Realm, whose boundary collection expects it
+   gone) and a deferred major request collect in one pause, as other requests do. A cycle whose
+   start is deferred (a borrow, an unscannable stack) also collects in one pause at the next
+   safepoint, since the deferral records a major request.
+4. The external bytes' budget waits while a cycle marks, as the nursery's does: their charges
+   bring no collection then and count toward the margin (V8 counts external memory toward its
+   limits; the design did not say).
+5. Provisional until step 4: the slice budget (four times the bytes allocated since the last
+   slice, at least 64 KB; no time cap), the start at the hard limit (when a major collection is
+   due), no 8 MB floor, and pacing's speed, which still divides the marked bytes by the final
+   pause alone, so with cycles on the growing factor runs toward its minimum.
+6. Under `force` the barrier check is sampled (each of the first 64 slices, every 64th, as the
+   worklist runs out, and the final pause): its slices are four cells at every safepoint and each
+   check walks the heap. An ordinary cycle checks after every slice.
+7. The schedule's tests (jit_poll_tests' stress census, which counts where collections run, and
+   minor_collection_tests) pin one-pause majors, so that they test the schedule they describe
+   under TRUST_JS_GC_INCREMENTAL too; gc_cycle_tests' engines pin the stress interval off, since
+   their tests start and end the cycles they watch and a stress collection would start one first
+   under TRUST_JS_GC_STRESS.
+
+Tests: gc_cycle_tests (every tier where the program matters): a graph rewired between slices
+(new objects into old ones by property, element, closure variable and Map, old objects moved
+from far to near holders) kept by the final pause; weak collections across a cycle (dead keys'
+entries go, entries made meanwhile in collections already traced stay, a WeakRef to a dead
+object reads undefined); the final pause on its own once the worklist runs out; an explicit
+minor request finishing the cycle; the precise explicit collection freeing what the cycle
+marked before it died. gc_core's: no minor collection due while a cycle marks, and a requested
+major or explicit minor one finishing it; the margin forcing the final pause; a store into a
+traced cell with its card kept by the final pause's rescan, every card clean after, and the
+cells that floated through the cycle freed by the next; a store without its card caught by the
+next slice's check (should_panic); white allocation.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; base main 4cf200d5's engine
+(step 1's, 71739c46's binary), the tip b4f2e2e0 (built as 00d3c29e, which differs from it in
+gc_cycle_tests.rs alone, a test module); incremental marking off; the last column with
+collections suppressed, TRUST_JS_GC_NURSERY_BYTES=0 and TRUST_JS_GC_MIN_HEAP_BYTES=4000000000,
+where run):
+
+| workload | base | tip | collections suppressed |
+| --- | --- | --- | --- |
+| Vue | 1,715,977,311 | +0.01% | |
+| React | 315,957,856 | -0.00% | |
+| Djot | 627,740,462 | +0.01% | +0.00% |
+| chai | 79,072,059,776 | +0.02% | -0.01% |
+| Richards | 136,070,435 | +0.01% | |
+| DeltaBlue | 260,354,957 | +0.00% | |
+| Crypto | 728,394,279 | +0.01% | |
+| RayTrace | 993,938,326 | +0.00% | |
+| EarleyBoyer | 3,194,474,784 | +0.10% | +0.00% |
+| RegExp | 2,738,672,291 | +0.00% | |
+| Splay | 1,401,395,782 | -0.00% | |
+| NavierStokes | 451,401,530 | +0.00% | |
+| PdfJS | 7,656,262,571 | -0.07% | +0.01% |
+| Mandreel | 62,936,449,460 | +0.00% | |
+| Gameboy | 21,036,427,306 | -0.03% | |
+| CodeLoad | 481,341,945 | +0.00% | |
+| Box2D | 4,457,422,788 | +0.01% | |
+| zlib | 138,039,326,411 | +0.00% | |
+| TypeScript | 58,591,357,072 | +0.04% | -0.05% |
+
+(chai's column with collections suppressed is a median of 3 runs; its single runs there vary by
+up to 0.07%, impl/countsel/chai-nogc-3.txt.)
+
+The cycle off, the counts took three builds to settle (target/p2/w6/impl: counts-*.txt,
+countsel/, prof/eb/):
+- 49fd1762 (a cycle branch in mark_phase, its marking tail shared with the final pause) moved
+  chai +0.55%, Djot -0.19% and RayTrace -0.23%. A layout control (71739c46 with step 2's Heap and
+  GcState fields alone, lto-layoutctl) moved Vue +0.20% and nothing else past 0.02%: the fields'
+  offsets. Builds bisecting the change: the due functions alone (V3) and mark_phase's split
+  alone (V4) were neutral, gc_core.rs whole (V2) moved them, LLVM's function merging off did not
+  undo it, and with the final pause unreachable from mark_phase (V6) the moves were gone. The
+  moves were LTO's inlining decisions in the engine's object and string paths, which the step
+  does not touch, shifted by the final pause's code reachable from mark_phase. The fix (F1):
+  mark_phase is as it was; start_marking dispatches a cycle's final pause, which has its own copy
+  of the marking tail (Heap::mark_from_roots). Against the layout control, 49fd1762 changed the
+  size of 51 functions outside the collector (Props::unshift_dense_array -1,744 bytes,
+  Object::new_with_parts +504, Props::remove -384, Props::maybe_densify -380,
+  NamedEntries::push -328 and ::replace -308, Interp::make_array +264, LStr::from_units_at_width
+  +220 among them; prof/symdiff.py); 4e70cf79 and 00d3c29e change 6, each the step's own:
+  $262.gc and Interp::collect_for_failed_allocation (+332, +316: the precise explicit collection,
+  inlined there), performance_metrics_json and finalize_performance_metrics (+80, +32: the slice
+  metrics), AgentControl::request (+16) and the .bss.
+- 4e70cf79 (F1) left chai -0.02%, Djot +0.08%, RayTrace +0.01% and Vue +0.02%, but moved
+  EarleyBoyer +0.50% and TypeScript +0.12%, by +0.00% and -0.07% with collections suppressed:
+  the collections' code. A profile (perf, instructions, three runs a build) put EarleyBoyer's
+  +16M a run in Heap::begin_marking (+13.8M: the card walk's purpose, a runtime parameter of
+  take_card_cells since step 2, made the minor collection's walk reload the page's fields at
+  every marked cell, 15 instructions an iteration instead of 11) and in Heap::drain, out of line
+  once the final pause called it too (+0.8M net). The fix (F3): the purpose is a const parameter
+  of take_card_cells, so that each caller has its own copy, and the final pause drains through
+  the cycle's drain_within without a budget, so that drain keeps its one caller. At 00d3c29e
+  begin_marking and the marking's functions (mark_unmarked, Object::trace_gc_fields,
+  PropWord::trace_gc_edges, mark_stack_range) are the base's instructions but for the addresses
+  of their panics' messages, and their samples the base's.
+- EarleyBoyer's +0.10% at 00d3c29e is the conservative stack's: its first minor collection keeps
+  5,335 objects instead of the base's 5,331 (a stale word in a frame laid out anew), after which
+  every collection's live count differs by under 0.6%, the kinds the same (prof/eb, the GC logs);
+  with collections suppressed +0.00%. PdfJS -0.07% and TypeScript +0.04% are +0.01% and -0.05%
+  with collections suppressed. Step 1's record found moves of this size (EarleyBoyer -0.05%,
+  PdfJS +0.07%) from a change to the log alone.
+
+Pauses (TRUST_JS_GC_LOG=1, default pacing, one run per workload pinned to CPU 13, the machine
+otherwise loaded with about five cores of checks (run.py's `other`); the count and the largest
+pause of each kind in ms; incremental marking off, then TRUST_JS_GC_INCREMENTAL=1;
+target/p2/w6/runs/w6s2g-off and w6s2g-on; the workloads with no major collection omitted):
+
+| workload | off: majors | on: slices | on: final pauses | minors (off / on) |
+| --- | --- | --- | --- | --- |
+| sa | 1 (7.65) | 39 (2.73) | 1 (2.24) | 18 (3.41) / 18 (2.80) |
+| chai | 1 (7.59) | 7 (2.36) | 1 (4.74) | 396 (3.33) / 395 (3.46) |
+| EarleyBoyer | 1 (5.78) | 44 (0.51) | 2 (1.33) | 17 (6.49) / 17 (5.77) |
+| Splay | 2 (49.29) | 52 (0.30) | 2 (44.56) | 10 (26.31) / 10 (26.63) |
+| PdfJS | 1 (3.89) | 10 (1.11) | 1 (1.13) | 33 (2.74) / 33 (2.73) |
+| Gameboy | 1 (3.81) | 5 (1.30) | 1 (1.79) | 12 (1.73) / 12 (1.64) |
+| zlib | 1 (0.94) | 0 | 0 | 0 / 0 |
+| TypeScript | 5 (326.74) | 3,110 (2.03) | 9 (69.22) | 38 (59.03) / 32 (58.31) |
+| SplayLatency | 4 (97.97) | 187 (1.00) | 4 (84.24) | 33 (27.07) / 33 (26.87) |
+
+zlib's major is requested (its ArrayBuffer pressure, a deferred major request) and marks in one
+pause either way (0.84 ms on). The final pauses of TypeScript, Splay and SplayLatency are the
+card rescan's: TypeScript's largest (69.2 ms) drains for 57.7 ms after 7.0 ms of taking the cards,
+the cells written during the cycle and what they reach, and SplayLatency's (84.2 ms) for
+72.6 ms (step 3's precleaning); their side tables took 0.15 and 0.13 ms.
+
+Checks at b4f2e2e0:
+- lib (ARM64): 2,777 passed, 9 ignored; with TRUST_JS_GC_INCREMENTAL=force, 2,777 passed.
+- x86-64 (zombie, slot w2g-rest): lib 2,558 passed, 9 ignored; clippy -D warnings in the three
+  configurations clean, as on ARM64.
+- Test262 under GC stress (TRUST_JS_GC_STRESS=100, every 2nd stress collection major,
+  TRUST_JS_GC_INCREMENTAL=force, TRUST_JS_GC_VERIFY=1; a dev runner at 00d3c29e, whose engine is
+  b4f2e2e0's): the subset of 13 directories, 2,603/2,603 in the default tier and at
+  TRUST_JS_TIER=jit with threshold 0 (impl/t262stress/paths-s2.txt; s2g-*). Earlier, at 49fd1762,
+  a wider set of 7 directories: 15,207/15,209 in both tiers, the 2 timeouts passing without the
+  harness's time limit (408 s with the cycle forced, 183 s without).
+- lib under GC stress (TRUST_JS_GC_STRESS=1000, TRUST_JS_GC_INCREMENTAL=force,
+  TRUST_JS_GC_VERIFY=1; impl/stress, the 653 tests selected for W6, each in its own process) at
+  4e70cf79, whose cycle is b4f2e2e0's but for F3's code shapes: 652 of 653 passed. The one that
+  did not, memory::tests::temporal_records_account_zone_and_calendar_strings_once, fails under GC
+  stress at main's engine before W6 too; releasing_long_object_chains_uses_bounded_native_stack
+  passed in 2,813 s (known-slow.txt's one test left out).
+- The fixtures' JIT dumps: Heap::fast_alloc's offset alone (above).
