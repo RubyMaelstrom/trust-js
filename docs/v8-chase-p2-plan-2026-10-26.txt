@@ -9047,3 +9047,359 @@ with the most work, all run natively but three: two on the single-element scan (
 and one below the tier's 64 executions (`/.+(?:ei|vg|en|vr)[\/: ]([\d.]+)/`, 60). The refused
 compilations' patterns are outside the top 40 by work. Both caps stay. W5's exit keeps its timing
 (Octane RegExp's score at least 1.15x W5a's), owed to the stage-end timing on a quiet machine.
+
+### W2g: exotic state into payload cells (census, survey and design, 2026-11-04)
+
+W2g as planned: exotic state into payload cells, as P1 did for Map and Set: proxies, promises,
+generators, `class_info`, RegExps (with W5), typed arrays. Other stages handed it four items:
+WeakMap's single probe (W3 2d, Decision 10), mapped arguments' slot map (W3 item 6), String
+wrappers' code units (W2c's census) and bound functions' data finalizing (W2a's record). Census
+and survey on main 498d98d4, whose engine is c90b3889's (target/p2/w2g; README.txt lists the
+files, census-table.md holds the full tables), an agent's. Decided (mine, reported): steps 1-7 in
+the order below, each its own series; step 8 waits for an async workload's census; step 9 is not
+done.
+
+What the tables are now:
+- 37 address-keyed tables on Interp hold exotic state, caches and pins. Twelve are side-slot
+  tables (gc_collect.rs:328-408), whose values are edges traced once the owner is marked:
+  proxies, promises, generators, `class_info`, module_ns, ta_buffer, host_indexed,
+  promise_forward, routed_imports, async_gen_queue, finalization_registries and
+  construct_capacity_hints (interpreter.rs:5551-5567, 4797, 4967, 4988, 5043). The others are
+  FastMaps and sets: typed_arrays, array_buffers and data_views, regexps, the WeakMap index and
+  data, htmldda, eval_realm_fns and gc_pins among them (interpreter.rs:4803, 4904, 4913, 4934,
+  4946, 4959, 4978). The native functions' [[Realm]] table is in a RefCell beside them
+  (interpreter.rs:4807).
+- Reads go through accessors that test the table's emptiness first (proxy_at,
+  interpreter.rs:11481-11490). For an object whose `ic_plain` byte is clear, the ordinary-get
+  check tests four tables and probes each non-empty one (interpreter.rs:11396-11404). The
+  [[Get]] slow path tests every hop for a deferred namespace, a proxy, a host-indexed object and
+  a typed array before its own lookup (interpreter.rs:11843-11920).
+- A side-slot table's write adds its owner to ClientRecords' set (gc_collect.rs:358-392), which
+  each collection clears, shrinking it to 64 slots once it has passed 1,024
+  (gc_collect.rs:295-306). An object with an entry in most tables is also pinned in gc_pins
+  (interpreter.rs:13325-13340): every Proxy, RegExp, typed array and buffer, namespace and
+  promise.
+- The collector makes every side-slot owner a conditional edge. A major collection notes every
+  table's keys and every pin, a minor the recorded owners (gc_collect.rs:894-944,
+  gc_core.rs:3353-3366). A marked owner's edge probes gc_pins and the twelve tables
+  (gc_collect.rs:947-985, 1520-1531); an owner left unmarked waits in the marker's `waiting` map
+  (gc_core.rs:3827-3842). After marking, gc_evict_dead_owners removes the dead objects' entries
+  from 29 tables, min(dead objects, capacity) operations each (interpreter.rs:13392-13600,
+  gc_sweep.rs:186-203).
+- A Proxy clears the realm-wide `inline_ic_safe` latch (builtins/proxy.rs:28), which the in-line
+  `instanceof` walk tests (jit.rs:11685; eval.rs:8880). With a Proxy alive, every `instanceof`
+  takes the helper: 158,205 on chai (TRUST_JS_JIT_OPSTAT).
+- Already in the object: Map and Set data (ObjectKind::Collection, value.rs:2242), a typed
+  array's native view (value.rs:2207, whose TaInfo and buffer object stay in typed_arrays and
+  ta_buffer), a mapped arguments object's ParameterMap (value.rs:2257-2259, W3 item 6), a String
+  wrapper's string (StrWrap; its code units are also materialized as properties,
+  builtins/mod.rs:12599-12628) and a bound function's data (value.rs:2287-2295).
+
+Census (target/p2/w2g: census/, census2/, prof/, micro/, gclog/, tools/; fat LTO; CPUs 10-13,
+pacing off). A counting patch (p2-w2g-census, e79168e9 and ed95bb74 on main 498d98d4) wraps each
+table and counts its probes by table, operation, call site (`#[track_caller]`, also on the
+accessors) and whether the table was empty. SPE profiles of c90b3889 built with line tables
+attribute the in-line probes and the collector's side-table work by inline chain. Costs: a probe
+into a non-empty table takes 28 instructions (24-33 by SPE over the census's counts; the
+out-of-line get's disassembly: 28 on a hit at the first candidate, about 22 on a miss), an insert
+or owner record 50, a probe into an empty table 4, an emptiness guard 2. A kind-tag test takes
+about 3 on a borrowed object.
+
+Probes the mutator makes into non-empty tables (inserts, records and pins included):
+
+| workload | Proxy | typed arrays | WeakMap | RegExp | IsHTMLDDA | native [[Realm]] | construct caches | pins | promises, generators, class_info |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 930k | | 323k | 12k | 233k | 25k | 1k | 708 | 8 |
+| React | | | | | | 1 | | | |
+| Djot | | | | 37k | 6k | 2k | 3k | 3k | 126 |
+| chai | 14.2M | 2 | 191k | 716k | 1.6M | 694k | 861k | 656k | 4 |
+| sustained | | | | | 40k | 1 | | | |
+| DeltaBlue | | | | | 111 | 4k | 6k | | |
+| RayTrace | | | | | 54 | 333k | 1k | | |
+| RegExp | | | | 823k | 2 | 771 | 9 | 82k | |
+| PdfJS | | 555k | | 10k | 49k | 3k | 1k | 2k | |
+| Box2D | | | | | 2k | 6k | 214k | | |
+| Gameboy | | 10.6M | | | 51 | 20k | 166 | 40k | |
+| TypeScript | | | | 3k | 4.7M | 596k | 3.4M | 1k | |
+| Mandreel | | 548k | | 22 | 14 | 79 | 21 | 26 | |
+| zlib | | 82k | | | 104 | 19 | 27 | 21 | |
+
+Richards, Crypto, EarleyBoyer, Splay, NavierStokes and CodeLoad make under 10,000 of any item's.
+Promises, generators and `class_info` take no measurable probe on the acceptance set: no
+fixture, chai or Octane benchmark awaits, yields or constructs a class with fields in volume.
+
+Their instructions (the model's, millions and share of the run) and the collector's side-table
+work (SPE: the eviction, conditional edges, owner noting and trace probes):
+
+| workload | instructions | Proxy | typed arrays | WeakMap | RegExp | IsHTMLDDA | native [[Realm]] | construct caches | guards, empty | mutator | collector |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 1.82G | 26.1 | | 9.0 | 0.3 | 6.5 | 0.7 | 0.1 | 6.2 | 49.0 (2.69%) | 0.9 (0.05%) |
+| Djot | 0.64G | | | | 1.1 | 0.2 | 0.1 | 0.1 | 0.6 | 2.2 (0.35%) | 0.7 (0.11%) |
+| chai | 80.39G | 413.7 | | 5.7 | 25.9 | 45.4 | 19.4 | 27.8 | 95.8 | 666.6 (0.83%) | 338.0 (0.42%) |
+| RayTrace | 1.00G | | | | | | 9.3 | | 1.4 | 10.8 (1.08%) | 0.4 (0.04%) |
+| RegExp | 2.78G | | | | 24.9 | | | | 0.2 | 29.1 (1.05%) | 8.4 (0.30%) |
+| PdfJS | 7.71G | | 15.8 | | 0.3 | 1.4 | 0.1 | | 3.7 | 21.4 (0.28%) | 5.1 (0.07%) |
+| Box2D | 4.48G | | | | | 0.1 | 0.2 | 6.0 | 3.0 | 9.2 (0.21%) | 0.4 (0.01%) |
+| Gameboy | 21.52G | | 299.7 | | | | 0.6 | | 51.7 | 354.0 (1.65%) | 58.4 (0.27%) |
+| TypeScript | 58.87G | | | | 0.1 | 132.7 | 16.7 | 166.2 | 52.6 | 368.2 (0.63%) | 5.3 (0.01%) |
+| proxy-none | 4.86G | 446.9 | | | | | | | 103.3 | 550.2 (11.32%) | 0.4 |
+| proxy-reflect | 5.10G | 173.1 | | | | | | | 37.1 | 210.1 (4.12%) | 0.4 |
+| proxy-direct | 8.11G | 314.2 | | | | | | | 79.3 | 393.5 (4.85%) | 0.4 |
+
+The other workloads' totals are at most 0.27% (DeltaBlue); React's, Splay's and EarleyBoyer's
+(0.14-0.15%) are almost all the collector's.
+- Proxy: Vue's probes are the [[Get]] entry's and each hop's (get_member_recv_impl 284k,
+  get_from_chain 325k), the builtins' (proxy_pair 147k) and the call dispatch's (79k); chai's are
+  [[Set]]'s (6.2M), [[Get]]'s (4.2M) and HasProperty's (1.6M), and it creates 371,886 proxies.
+- Typed arrays: Gameboy reads `length` (or another of %TypedArray.prototype%'s accessors)
+  through the Rust [[Get]] 5.1M times, two probes each (typed_arrays in typed_array_at,
+  array_buffers in array_buffer_byte_length; interpreter.rs:11710, 12944-12953). perf names that
+  probe `HashMap<usize, HashMap<String, NsBinding>>::get` (the owner's first pass: module_ns
+  1.04%): one machine body serves every HashMap<usize, V> of its bucket size; module_ns has no
+  probe there outside the collector.
+- WeakMap: a get probes the brand's index, the entries index and the data
+  (builtins/collections.rs:998-1017): 84 of the micro-benchmark's 535 instructions; Vue makes
+  160k.
+- IsHTMLDDA: every realm installs `$262` with an IsHTMLDDA object (builtins/mod.rs:3226,
+  builtins/host.rs:25), so htmldda is never empty and the VM's and helpers' `typeof`, ToBoolean
+  and loose equality of an object probe it (is_htmldda, interpreter.rs:12068-12076, 12082;
+  eval.rs:9045, 9315-9316): TypeScript 4.7M.
+- Native [[Realm]]: a native call from the VM probes eval_realm_fns and native_function_realms
+  (interpreter.rs:8843-8852): RayTrace's 333k.
+- Construct caches (not exotic state): TypeScript's 3.18M inserts are try_ic_create's
+  unconditional re-insert of a prototype pin already present (interpreter.rs:11349).
+- Guards and empty tables: the emptiness tests (Gameboy 25.7M, chai 42.5M, TypeScript 20.1M).
+- The collector: chai's 338M are mostly the eviction (242M: each of its 1,013 minors finds 4,757
+  dead objects on average and removes each one's key from gc_pins, about 10,100 slots, and the
+  smaller tables are scanned) and the conditional edges (82M); Gameboy's 58M are its typed
+  arrays' and buffers' edges and trace probes (4,001 of each live at a major).
+
+Per operation (instructions an iteration on main, the difference of 1.2M and 200k iterations of
+a function's loop over 1M; the loop alone is 13; micro/per-op.md; probes from the census, and
+for five of them the side-table share from SPE, collector included):
+
+| operation | instructions | probes (non-empty / inserts / empty / guards) | side-table work |
+| --- | --- | --- | --- |
+| an await | 4,952 | 5 / 6 / 2 / 0 | 25% (probes and record sets 15%, collector 9.7%) |
+| a generator step | 4,851 | 1 / 1 / 1 / 17 | 3% |
+| `new C()`, two fields | 4,346 | 5 / 0 / 10 / 15 | 4.8% (model) |
+| `new Promise` + `then` | 20,250 | 8 / 9 / 3 / 12 | 12% |
+| RegExp exec | 2,331 | 1 / 0 / 0 / 0 | 1.2% (model) |
+| a RegExp literal | 1,124 | 0 / 2 / 0 / 0 | 21% (probes 11%, collector 9.3%) |
+| a typed array's `length` and an element | 1,365 | 2 / 0 / 0 / 5 | 4.8% (model) |
+| WeakMap get | 535 | 3 / 0 / 0 / 0 | 16% (model) |
+| a read through a Proxy without handlers | 1,256 | 3 / 0 / 0 / 12 | 8.6% (model) |
+| a 4-deep prototype miss, a Proxy alive | 2,346 | 8 / 0 / 0 / 26 | 177 more than without (2,169) |
+| `typeof` of an object and a test | 430 | 1 / 0 / 0 / 0 | 6.5% (model) |
+| a Proxy's creation | 2,297 | 1 / 3 / 1 / 0 | 41% (probes 7.6%, record and noting sets 13%, collector 20%) |
+
+A Proxy's creation and collection takes about 950 instructions of side-table work, most of it
+after its death: its conditional edge waits in the marker's map, the noting and record sets
+regrow, and its eviction probes two tables. A generator step removes the coroutine from its
+table and inserts it back with a record (builtins/mod.rs:10664-10678).
+
+Live entries and bytes: at a major collection the tables hold at most Gameboy's 4,001 typed
+arrays and buffers (13,669 slots each in four tables and 26,387 in gc_pins: about 2.1 MB of
+buckets); every other workload's are under 0.5 MB (chai's 0.45 MB, most of it gc_pins' spare
+capacity; census2/*.tsv, `major` lines). Memory is not W2g's case. Finalizers
+(TRUST_JS_GC_LOG): bound functions' data at most 10 a run (PdfJS), Map and Set data at most 806
+(chai), typed arrays' views 11,976 (Gameboy).
+
+What the exemplars do (target/p2/w2g/exemplars-{v8,sm,jsc}.txt; V8 c8b70908, SpiderMonkey
+6bb81100, JSC 26027804; each re-diffed against its main of 2026-11-04, where the cited code is
+unchanged: V8 7615c0a0, SM 98bddef2, JSC c27ccd84; citations checked, target/p2/w2g/cite-*.txt):
+- A1: every kind's state is fields or slots of the object itself, and no engine keys it by
+  address. Proxy target and handler (V8 src/objects/js-proxy.tq:5-11; SM vm/ProxyObject.h:54-62
+  and proxy/ScriptedProxyHandler.h:108-117; JSC runtime/ProxyObject.h:32-49); a promise's state,
+  result and reactions (V8 src/objects/js-promise.tq:5-39; SM vm/PromiseObject.h:74-100; JSC
+  runtime/JSPromise.h:37-42); a generator's suspended frame (V8 src/objects/js-generator.tq:15-39;
+  SM vm/GeneratorObject.h:28-43; JSC runtime/JSGenerator.h:66-81); a RegExp's program and
+  lastIndex (V8 src/objects/js-regexp.tq:65-69, src/objects/js-regexp.h:134-140; SM
+  vm/RegExpObject.h:42-55; JSC runtime/RegExpObject.h:42-45); a typed array's view (V8
+  src/objects/js-array-buffer.tq:61-127; SM vm/ArrayBufferViewObject.h:28-56; JSC
+  runtime/JSArrayBufferView.h:374-377); a bound function's target, this and arguments (V8
+  src/objects/js-function.tq:9-20; SM vm/BoundFunctionObject.h:19-99; JSC
+  runtime/JSBoundFunction.h:133-140).
+- A2: the property-get path tells an exotic object from an ordinary one by one test of the
+  object's header or map at each holder: V8 compares the map's instance type with
+  LAST_SPECIAL_RECEIVER_TYPE (V8 src/objects/objects-inl.h:901-912; src/objects/lookup.cc:
+  1360-1443), SpiderMonkey tests the class's getProperty hook through the shape (SM
+  vm/ObjectOperations-inl.h:104-112; vm/NativeObject.cpp:2322-2376), JSC tests a byte the cell
+  header copies from its structure (JSC runtime/JSCell.h:293-302; runtime/JSObject.h:1185-1232).
+  None has a "no Proxy exists" protector (V8 src/execution/protectors.h:18-106; SM
+  vm/RuntimeFuses.h:51-55; JSC runtime/JSGlobalObject.h:493-547).
+- A3: a proxy's callability is a property of its map or handler, not another kind: V8 picks one
+  of three proxy maps from the target (V8 src/heap/factory.cc:4304-4324), SpiderMonkey asks the
+  handler (SM vm/ProxyObject.h:134-137), JSC picks one of two structures (JSC
+  runtime/ProxyObject.cpp:59).
+- A4: the collector traces the state as the object's own fields and records stores with the
+  ordinary write barrier; nothing is evicted by address: V8's visitor follows the instance type
+  and an old-to-young store enters OLD_TO_NEW (V8 src/objects/map.cc:228-273;
+  src/heap/heap-write-barrier.cc:373-420); SpiderMonkey traces reserved slots as slots and its
+  store buffer records the slot range (SM gc/Marking.cpp:1907-1996; gc/Barrier.h:1023-1126); JSC's
+  visitChildren appends the members and its barrier greys the owner (JSC
+  runtime/ProxyObject.cpp:1293-1301; runtime/WriteBarrierInlines.h:34-63).
+- A5: few of these kinds need anything at death: in V8 only an ArrayBuffer's extension, swept
+  (V8 src/heap/array-buffer-sweeper.cc:440-445); SpiderMonkey finalizes proxies, fixed-length
+  typed arrays, ArrayBuffers, WeakRefs and registries (SM proxy/Proxy.cpp:938-955;
+  vm/ArrayBufferObject.cpp:310-312); JSC destroys RegExp, WeakMapImpl, module namespaces and
+  registries (JSC runtime/RegExp.h:63; runtime/WeakMapImpl.h:216;
+  runtime/JSModuleNamespaceObject.h:39; runtime/JSFinalizationRegistry.h:75).
+- A6: a WeakMap's table hangs off the collection and a get is one lookup in it: V8's `table`
+  (V8 src/objects/js-collection.tq:18-27) with the key's identity hash in the key (V8
+  src/codegen/code-stub-assembler.cc:2721-2786, src/builtins/builtins-collections-gen.cc:
+  2828-2879); SpiderMonkey's C++ WeakMap in a slot, hashed by pointer bits (SM
+  builtin/WeakMapObject.h:13-19; gc/WeakMap.h:275-322); JSC's WeakMapImpl buckets in the cell,
+  hashed by address (JSC runtime/WeakMapImpl.h:470-506; runtime/WeakMapImplInlines.h:38-41).
+- A7: an undetectable object (IsHTMLDDA, document.all) is a bit of the object's type: V8's map
+  bit, tested with is_callable as one mask (V8 src/objects/map.h:333-349); SpiderMonkey's class
+  flag (SM js/public/Class.h:516, 691); JSC's type-info flag (JSC runtime/JSTypeInfo.h:42, 93).
+- A8: a function's realm is reached from the function: V8 through its context (V8
+  src/objects/js-function-inl.h:403-404), SpiderMonkey through its shape (SM vm/Shape.h:246,
+  261, 393), JSC through the callee's scope (JSC runtime/JSCallee.h:56-58, 95).
+- A9: class constructors are told apart by the function's kind and their fields run from the
+  constructor's own code: V8 gives them an instance type its Call builtin compares (V8
+  src/objects/instance-type.h:201-203; src/builtins/x64/builtins-x64.cc:2110-2125), SpiderMonkey
+  a function-kind field (SM vm/FunctionFlags.h:41-45; jit/MacroAssembler-inl.h:632-640), JSC a
+  constructor kind whose call code block throws (JSC bytecompiler/BytecodeGenerator.cpp:597-611);
+  the field initializer is a closure on the constructor (V8
+  src/interpreter/bytecode-generator.cc:3808-3815; SM frontend/ObjectEmitter.cpp:687-773; JSC
+  bytecompiler/NodesCodegen.cpp:5855-5868).
+- A10: a generator's live registers are copied into the generator object at a suspend (V8
+  src/interpreter/interpreter-generator.cc:3530-3624; SM vm/GeneratorObject.cpp:26-57; JSC
+  bytecode/BytecodeGeneratorification.cpp:142-167).
+- A11: a String wrapper answers its indices from the string (V8 src/objects/elements.cc:
+  5729-5800; SM builtin/String.cpp:393-449; JSC runtime/StringObject.cpp:47-62).
+
+Design. An exotic kind's state lives in its object (A1): a tag of ObjectKind and the state in
+the kind's payload word or in a PayloadBox, P1's pattern for Map and Set (value.rs:2242;
+gc_storage.rs:180-217). The object's trace reports the payload and traces its edges; a change
+goes through the object's mutable borrow, which sets its card; the payload dies with the object.
+The [[Get]], [[Set]] and HasProperty paths test the object once per holder (A2): `ic_plain` for
+an ordinary object, then the kind tag. A side table stays only for state keyed by something
+other than one object. Steps, in the order of their measured value on the acceptance set
+(savings by the model: a probe into a non-empty table becomes a tag test, 25 instructions saved;
+an insert, record or pin goes, 50 each, for a payload cell's 30 per object; the collector's
+work goes with its owners; tools/savings.py, savings.md):
+
+1. Proxy. ObjectKind::Proxy(PayloadBox<ProxyData>): target, handler (null once revoked) and
+   whether the target was callable (A3). is_callable, a range of tags today (value.rs:2529-2531),
+   gains one compare for the Proxy tag; IsConstructor is already a flag bit the creation sets,
+   and the call dispatch's proxy test (interpreter.rs:14185) becomes a tag test, where the
+   `Native(proxy_uncallable)` kind stands in for callability today (builtins/proxy.rs:20-24).
+   Revocation writes the payload through the object's borrow. The pin, the table, its record,
+   the conditional edge and the eviction go; the `inline_ic_safe` latch goes, and the in-line
+   `instanceof` walk tests each prototype's tag (A2). Saves Vue 23.3M (1.28%), chai 634M (0.79%,
+   three quarters of its collector work with it), the Proxy micro-benchmarks 3.0-8.2%; a
+   Proxy's creation about 950 instructions. Dumps: the `instanceof` template.
+2. Typed arrays and buffers. A typed array's TaInfo and buffer object join its NativeTypedArray
+   payload (every element type, shared buffers included), an ArrayBuffer's data moves into an
+   ArrayBuffer kind's payload and a DataView's state into a DataView kind's. typed_arrays,
+   ta_buffer, array_buffers, native_buffers, data_views and their pins go;
+   array_buffer_versions and dirty ranges move with the data. Saves Gameboy 328M (1.53%), PdfJS
+   17.3M (0.22%), Mandreel 15.0M (0.02%). Generated code reads NativeTypedArray's fields
+   (JitLayout); dumps change where its offsets do. A JIT `length` of a typed array (V8 reads the
+   view's field) is a later step this one makes possible.
+3. Native functions' [[Realm]] (found by this census). The realm's global in the native
+   function's own payload or a field beside its NativeFn, and "is a realm's eval" as a flag bit
+   of the function (A8). eval_realm_fns and native_function_realms' probes leave the VM's native
+   call. Saves RayTrace 8.7M (0.86%), TypeScript 15.5M (0.03%), chai 18.0M (0.02%). The table
+   stays for the collector's [[Realm]] sweep until the payload holds the edge.
+4. RegExp (W5a item 3, Exotic::RegExp(PayloadBox<..>) as recorded there): the program and
+   flags in the payload, `lastIndex` an own data property at the initial shape's slot (SM and V8
+   keep it a slot of the object, A1). The regexps table, the pin per RegExp and their eviction
+   go. Saves Octane RegExp 32.7M (1.18%), chai 97.5M (0.12%, a fifth of its collector work),
+   Djot 1.1M (0.17%). Built with W5a, which owns the matcher's entry.
+5. WeakMap and WeakSet. ObjectKind::WeakCollection(PayloadBox<..>) with the kind, the entries'
+   index by key identity and the entries; a get is one probe of that index (A6). The brand probe
+   and the data probe go; the ephemeron records stay as they are (they are per entry). Saves Vue
+   8.1M (0.44%), chai 5.2M. Its payload owns maps and finalizes, once per collection object.
+6. IsHTMLDDA as a flag bit (found by this census): a bit of the object's flag byte set by
+   make_html_dda, tested where is_htmldda probes today (A7); htmldda's weak pin can stay for the
+   object's identity. Saves Vue 5.8M (0.32%), TypeScript 118M (0.20%), chai 40.5M (0.05%), the
+   sustained workload 0.06%.
+7. One test per holder. With 1, 2, 5 and the namespaces' kind, the [[Get]], [[Set]] and
+   HasProperty walks and the ordinary-get check read `ic_plain` (already "no side-table
+   behavior") and, when it is clear, the kind tag, instead of four emptiness guards and two
+   probes. Saves about half of the guards' and empty tables' instructions: Gameboy 25.9M
+   (0.12%), Vue 3.1M (0.17%), chai 47.9M (0.06%), the Proxy micro-benchmarks 0.4-1.1%.
+8. Promises, generators and `class_info`: worth nothing on the acceptance set (no probe in
+   volume on any of its workloads). Per operation they are worth more: an await's side-table
+   work is a quarter of its 4,952 instructions, a generator step's 3% of 4,851, `new C()`'s
+   about 5% of 4,346. The design for them: a promise's state, result and reactions in its
+   payload (A1; V8 and SpiderMonkey keep reactions in one slot that turns into the result), a
+   generator's coroutine in its object's payload with an executing state in place of the remove
+   and re-insert (A10), a class constructor's ClassInfo with its function (A9; the kind bits are
+   already in the flag byte, value.rs:2791-2808). Proposed after 1-7, measured on an async
+   workload first.
+9. Not done, worth nothing on the acceptance set: bound functions' data (at most 10 finalized a
+   run), Map and Set data's finalizing (at most 806), String wrappers' code units (box_primitive
+   is at most 0.016% of any workload: chai 2.1M, CodeLoad 0.1M; A11 is the way when a workload
+   needs it), mapped arguments (done by W3 item 6).
+
+The steps' estimates on the acceptance set (savings.md): Vue 2.3% (steps 1, 5, 6, 7), chai 1.05%,
+Gameboy 1.65%, RegExp 1.18%, RayTrace 0.93%, PdfJS 0.27%, TypeScript 0.27% (step 6 and the
+native realm); every other workload at most 0.25% (Djot) and React, Splay, NavierStokes and
+EarleyBoyer about nothing. TypeScript's construct-cache re-inserts (0.28%) are not W2g's: an
+insert that skips a present pin fixes them, as its own commit.
+
+What stays a side table, and why:
+- State keyed by something other than one object: realms (a realm's state by its global, probed
+  on cross-realm calls), shadow_realms, host_settings_states, template_cache, and the
+  unhandled-rejection list (ordered for the host). The weak-target index of weak_metadata (a
+  target's observers, by the target) stays, as SpiderMonkey's per-zone maps do (SM
+  gc/FinalizationObservers.h:151-213).
+- Caches keyed by a constructor or prototype (construct_ics, construct_capacity_hints,
+  creation_pins): inline-cache data with weak pins, not exotic state.
+- Embedder state of host objects (host_indexed, host_state's resources) and module namespaces
+  (module_ns, deferred_ns): guards only on the acceptance set; namespaces can take a kind of their
+  own later (SpiderMonkey makes them proxies with their own handler, V8 and JSC give them a type).
+- WeakRef and FinalizationRegistry slots, Temporal's: worth nothing measured; later, with the
+  pattern.
+- gc_pins, for what stays keyed by address.
+
+The collector:
+- Tracing: a moved kind's state is traced in its object's trace, as Map and Set data are (A4).
+  Its objects stop being side-slot owners: no noting, no conditional edge, no `waiting` entry for
+  a dead owner, no twelve-table probe when marked. That work is 0.42% of chai, 0.30% of Octane
+  RegExp and 0.27% of Gameboy today.
+- Minor collections: a write into a payload sets the owner's card through its borrow, as P1's
+  collections do; the moved tables' records go from ClientRecords.
+- Eviction: a moved kind's state dies with its object; gc_evict_dead_owners loses its tables and
+  gc_pins its pins (chai's eviction: 242M instructions, 0.30%).
+- Finalization: a payload cell finalizes when its value owns Rust-heap memory
+  (gc_storage.rs:159-178). ProxyData and TaInfo hold none; a RegExp's Rc<Regex>, a WeakMap's
+  index, a PromiseState's reactions Vec, a Coroutine and a ClassInfo do. Today eviction drops
+  them, so a finalizer replaces an eviction rather than adding work; storage blocks (P1 S6) can
+  replace the finalizers where a census shows volume.
+- Verification: check_side_slot_records covers the tables that stay; a payload's edges are
+  checked as any cell's (the write barrier's verification).
+
+The change surface: proxies 70 lines in 12 files; typed arrays and buffers 142 lines (typed_arrays
+60, array_buffers 36, ta_buffer 16, data_views 16, native_buffers 14); WeakMap 50 in 4 files;
+htmldda 9 in 2; the native realm 28 in 4; RegExp 26 in 5 (W5a's); promises 84 in 12, generators 77
+in 9, class_info 12 in 4 (test files excluded). ObjectKind gains Proxy, ArrayBuffer, DataView and
+WeakCollection tags (value.rs:2201-2282): the JIT's range constants (KIND_CALLABLE_FIRST,
+KIND_EXOTIC_NONE_LAST, KIND_ORDINARY_LAST) stay ranges if the new tags follow Array's. The
+memory inventory classifies each payload.
+
+Risks:
+- A payload missed in one trace (marking, verification, the barrier's check) is a use after free
+  ("Heap-held Values are unrooted"): Test262 under GC stress and TRUST_JS_GC_VERIFY over each
+  moved kind's tests, as P1's collections had.
+- Callable and constructor proxies: typeof, IsCallable, IsConstructor, `new` and `bind` of a
+  proxy through the new tag (Test262's Proxy and Reflect suites, difftest).
+- Re-entrancy: a generator resumed from inside itself, a promise resolved while its reactions
+  run; the payload's state must say "executing" where the table's removal said it.
+- Cross-interpreter ownership: ShadowRealm interpreters route a foreign object's metadata
+  through metadata_owner (agent_control.rs:274-310); with the state in the object that routing
+  goes for the moved kinds, and the tests of shared heaps must still pass.
+- Layout: TypedArray's payload grows; the JIT's element templates read its fields at their
+  offsets (dump checks).
+
+Exit (proposed): instruction counts against the series' base, fat LTO, pacing off: Vue -1.5% or
+better (steps 1, 5, 6 and 7), Gameboy -1.2%, chai -0.7%, RayTrace -0.7%, Octane RegExp -1.0% (with
+W5a item 3); the Proxy micro-benchmarks -3% (reflect) to -8% (none); a Proxy's creation at least
+800 instructions fewer; no workload slower beyond noise; collections as before; Test262 identical,
+GC stress and TRUST_JS_GC_VERIFY over the moved kinds' tests, difftest; dumps unchanged apart from
+the `instanceof` walk and the typed arrays' layout.
