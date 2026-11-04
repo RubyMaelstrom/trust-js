@@ -6603,6 +6603,140 @@ fn record_binary_miss(
     }
 }
 
+/// Each operation's origin for a transformed chunk's record map (W4 step 7): its inline target
+/// (u32::MAX for the function's own body) and its splice's position in the caller (NO_POSITION
+/// for the function's own body), which tells two splices of one callee apart.
+fn record_origins(c: &Compiler) -> Vec<(u32, u32)> {
+    let count = c.ops.len();
+    let mut origins = vec![(u32::MAX, NO_POSITION); count];
+    for (index, &(first, position)) in c.positions.runs.iter().enumerate() {
+        let end = c
+            .positions
+            .runs
+            .get(index + 1)
+            .map_or(count, |&(next, _)| next as usize)
+            .min(count);
+        let origin = if crate::stack_trace::is_inline_position(position) {
+            match c
+                .inline_sites
+                .get(crate::stack_trace::inline_index(position))
+            {
+                Some(&(target, _, outer)) => (target, outer),
+                None => continue,
+            }
+        } else {
+            (u32::MAX, NO_POSITION)
+        };
+        for slot in origins.iter_mut().take(end).skip(first as usize) {
+            *slot = origin;
+        }
+    }
+    origins
+}
+
+/// Whether an operation has a baseline site the record map names: a value, element or named one.
+fn mapped_operation(op: &Op) -> bool {
+    feedback_read::value_in_line_set(op).is_some()
+        || feedback_read::is_element_access(op)
+        || named_site_cache(op).is_some()
+}
+
+/// A transformed chunk's record map (W4 step 7): each of its value, element and named operations
+/// to the baseline site it was compiled from. The second stage compiles the same AST, the
+/// function's own body around its splices and each splice from its callee's body, so within one
+/// origin (the function's own body, or one splice) the k-th operation of a kind is the k-th of
+/// that kind in the origin's baseline chunk (the function's, or the callee's). A kind whose count
+/// differs between the two is left unmapped in that origin, as is an origin without a baseline
+/// chunk. None without the function's baseline chunk.
+fn transformed_record_map(
+    source: Option<&Function>,
+    hot: &Chunk,
+    ops: &[Op],
+    origins: &[(u32, u32)],
+    inline_targets: &[InlineTarget],
+) -> Option<crate::feedback::RecordMap> {
+    use crate::feedback::RecordMap;
+    use std::collections::HashMap;
+    use std::mem::Discriminant;
+    let baseline = source?.runtime().code.get()?.as_ref()?.clone();
+    if !std::ptr::eq(&*baseline, hot) {
+        return None;
+    }
+    let mut targets = vec![baseline];
+    let mut target_of = vec![None; inline_targets.len()];
+    for (index, target) in inline_targets.iter().enumerate() {
+        if targets.len() >= RecordMap::MAX_TARGETS {
+            break;
+        }
+        let Some(callee) = target.pin.upgrade() else {
+            continue;
+        };
+        let chunk = match &callee.borrow().kind {
+            crate::value::ObjectKind::User(user) => {
+                user.func.runtime().code.get().and_then(Option::clone)
+            }
+            _ => None,
+        };
+        if let Some(chunk) = chunk {
+            target_of[index] = Some(targets.len());
+            targets.push(chunk);
+        }
+    }
+    // Each target's mapped operations by kind, in order.
+    let kinds: Vec<HashMap<Discriminant<Op>, Vec<u32>>> = targets
+        .iter()
+        .map(|chunk| {
+            let mut kinds: HashMap<Discriminant<Op>, Vec<u32>> = HashMap::new();
+            for (pc, op) in chunk.ops.iter().enumerate() {
+                if mapped_operation(op) {
+                    kinds
+                        .entry(std::mem::discriminant(op))
+                        .or_default()
+                        .push(pc as u32);
+                }
+            }
+            kinds
+        })
+        .collect();
+    // The transformed chunk's mapped operations by origin and kind, in order.
+    let mut sources: HashMap<((u32, u32), Discriminant<Op>), Vec<usize>> = HashMap::new();
+    for (pc, op) in ops.iter().enumerate() {
+        if mapped_operation(op) {
+            let origin = origins.get(pc).copied().unwrap_or((u32::MAX, NO_POSITION));
+            sources
+                .entry((origin, std::mem::discriminant(op)))
+                .or_default()
+                .push(pc);
+        }
+    }
+    let mut pcs = vec![RecordMap::UNMAPPED; ops.len()];
+    for (((inline_target, _), kind), transformed) in &sources {
+        let target = if *inline_target == u32::MAX {
+            Some(0)
+        } else {
+            target_of.get(*inline_target as usize).copied().flatten()
+        };
+        let Some(target) = target else {
+            continue;
+        };
+        let Some(baseline) = kinds[target].get(kind) else {
+            continue;
+        };
+        if baseline.len() != transformed.len() {
+            continue;
+        }
+        for (&pc, &target_pc) in transformed.iter().zip(baseline) {
+            if target_pc as usize <= RecordMap::MAX_PC {
+                pcs[pc] = RecordMap::encode(target, target_pc as usize);
+            }
+        }
+    }
+    Some(RecordMap::new(
+        pcs.into_boxed_slice(),
+        targets.into_boxed_slice(),
+    ))
+}
+
 /// The property cache (its way 0's index) of a named load's or store's operation.
 pub(crate) fn named_site_cache(op: &Op) -> Option<u32> {
     match *op {
@@ -9058,6 +9192,9 @@ fn finish_chunk(
     });
     let cap_cache_len = c.names.len();
     let op_count = c.ops.len();
+    // Each operation's origin, read before the registration renames the inline positions (W4
+    // step 7: the transformed chunk's record map).
+    let origins = hot.is_some().then(|| record_origins(&c));
     let inline_sites = register_inline_sites(&mut c);
     c.positions.runs.shrink_to_fit();
     let mut call_positions = vec![NO_POSITION; c.call_caches.len()].into_boxed_slice();
@@ -9075,17 +9212,23 @@ fn finish_chunk(
             *slot = c.positions.at(pc);
         }
     }
-    let feedback = if let Some(chunk) = hot {
-        // The transformed/inlined bytecode has different PCs. Retain the baseline schema without
-        // guessing new runtime bindings; the original chunk remains the current-shape adapter.
-        crate::feedback::FeedbackVector::unbound(chunk.feedback.layout().clone())
-            .with_record_len(c.ops.len())
+    // Mutable for the record map below (W4 step 7); the census rebinds it first.
+    #[cfg_attr(feature = "architecture-diagnostics", allow(unused_mut))]
+    let mut feedback = if let Some(chunk) = hot {
+        // The transformed/inlined bytecode has different PCs: the baseline schema, with its
+        // writes going through the record map (W4 step 7, made below once the operations are
+        // final); the original chunk remains the current-shape adapter.
+        crate::feedback::FeedbackVector::transformed(
+            chunk.feedback.layout().clone(),
+            crate::feedback::RecordMap::new(Box::new([]), Box::new([])),
+        )
+        .with_record_len(c.ops.len())
     } else {
         let (layout, bindings) = feedback_layout_for_ops(&c.ops, &c.names);
         crate::feedback::FeedbackVector::new(layout, bindings).with_record_len(c.ops.len())
     };
     #[cfg(feature = "architecture-diagnostics")]
-    let feedback = {
+    let mut feedback = {
         let mut feedback = feedback;
         if crate::feedback_census::enabled() {
             let (start, len, url, name) = source.map_or_else(
@@ -9156,6 +9299,12 @@ fn finish_chunk(
         && !prepared_entry
         && c.rest_slot
             .is_some_and(|slot| lazy_rest_rewrite(&mut c.ops, slot, &c.names));
+    // The record map on the final operations (W4 step 7).
+    if let (Some(hot), Some(origins)) = (hot, origins.as_deref()) {
+        if let Some(map) = transformed_record_map(source, hot, &c.ops, origins, &c.inline_targets) {
+            feedback.set_record_map(map);
+        }
+    }
     if c.arguments_length_only
         && !(lazy_arguments && !c.ops.iter().any(|op| matches!(op, Op::ArgElem(_))))
     {
@@ -22068,6 +22217,14 @@ impl Chunk {
     }
     pub(crate) fn jit_detailed_feedback_enabled(&self) -> bool {
         self.feedback.detailed_enabled()
+    }
+    /// The chunk's feedback vector.
+    pub(crate) fn feedback_vector(&self) -> &crate::feedback::FeedbackVector {
+        &self.feedback
+    }
+    /// The chunk's current-shape adapter table (the detailed vector's, see `feedback_shapes`).
+    pub(crate) fn feedback_shapes(&self) -> &std::cell::RefCell<Vec<u32>> {
+        &self.feedback_shapes
     }
     /// Whether the named site of the operation at `pc` carries the generic mark (W4 step 5;
     /// feedback-schema.txt section 5.3): a refused fill or a fifth receiver shape.

@@ -249,5 +249,22 @@ constructor's capacity class stays in the callee's chunk (Chunk::instance_class)
 allocation sites' survival record went to Phase 3 with W4's decision 2. The detailed vector
 (section 3) and its envelope stay diagnostics.
 
-5.5 Later steps: the pc map of inlined and recompiled code (step 7), Pilot C's store writability
-(step 9) and the dependency registry (step 10).
+5.5 The pc map of inlined and recompiled code (step 7). A transformed chunk (a second-stage
+compile, its hot callees spliced in) maps each of its value, element and named operations to the
+baseline site it was compiled from (feedback.rs RecordMap): an operation of the function's own
+body to the function's baseline chunk, a splice's to its callee's baseline chunk. Both compiles
+read the same AST, the function's own body around its splices and each splice from its callee's
+body, so within one origin (the function's own body, or one splice, told apart by its position
+in the caller) the k-th operation of a kind is the k-th of that kind in the origin's baseline
+chunk; a kind whose count differs between the two stays unmapped in that origin. (Source
+positions would not do: the compiler attributes them to the nodes that can throw a located
+error, calls and property accesses, not to arithmetic.) One u32 a pc (the target's index in bits
+24-31, its pc in 0-23), and the targets, which the map keeps alive. The transformed chunk's vector
+(FeedbackVector::transformed) sends its always-on records and its detailed observations through
+the map into the baseline sites (its own words stay empty), so a callee's sites see what its
+inlined copies saw; an operation the map cannot place records nothing. Its caches stay its own (they are its speed):
+crate::feedback::read_merged adds a transformed chunk's ways of a site to the baseline site's
+named view, a union past four ways being generic. The speculative tier's own exits (Phase 3)
+record by baseline pc through the same map, as JSC's CodeOrigin and FrequentExitSite do.
+
+5.6 Later steps: Pilot C's store writability (step 9) and the dependency registry (step 10).

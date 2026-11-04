@@ -344,8 +344,8 @@ pub(crate) enum ValueClass {
 mod read_api;
 #[allow(unused_imports)]
 pub(crate) use read_api::{
-    read, AllocationKind, AllocationView, CallState, CallTarget, CallView, ConstructView,
-    ElementView, NamedView, NamedWay, NamedWayKind, SiteView, ValuesView,
+    read, read_merged, AllocationKind, AllocationView, CallState, CallTarget, CallView,
+    ConstructView, ElementView, NamedView, NamedWay, NamedWayKind, SiteView, ValuesView,
 };
 
 /// The element record (W4 step 4; feedback-schema.txt section 5.2): an element load's or store's
@@ -759,10 +759,84 @@ pub(crate) struct FeedbackVector {
     record: OnceCell<Box<[Cell<u32>]>>,
     /// The chunk's operation count, the record's length.
     record_len: u32,
+    /// A transformed chunk's map to the baseline sites its operations came from (W4 step 7):
+    /// its records and detailed observations go through it, and its own words stay empty.
+    through: Option<Box<RecordMap>>,
     /// The feedback census's state for this vector's chunk (W4 step 2; None unless
     /// TRUST_JS_FEEDBACK_CENSUS is set).
     #[cfg(feature = "architecture-diagnostics")]
     pub(crate) census: Option<Box<crate::feedback_census::ChunkCensus>>,
+}
+
+/// A transformed chunk's pc map (W4 step 7; feedback-schema.txt section 5.5): each operation's
+/// baseline site, in its function's baseline chunk for the function's own body and in a spliced
+/// callee's chunk for the callee's, so that the always-on record and the detailed vector see at
+/// the baseline site what the inlined and recompiled copies saw (JSC's CodeOrigin, A8). The map
+/// holds the chunks it names.
+pub(crate) struct RecordMap {
+    /// Per transformed pc: the target chunk's index in bits 24-31 and its pc in bits 0-23, or
+    /// [`RecordMap::UNMAPPED`].
+    pcs: Box<[u32]>,
+    targets: Box<[std::rc::Rc<crate::bytecode::Chunk>]>,
+}
+
+impl RecordMap {
+    pub(crate) const UNMAPPED: u32 = u32::MAX;
+    /// The largest pc and target count a map encodes.
+    pub(crate) const MAX_PC: usize = 0xff_ffff;
+    pub(crate) const MAX_TARGETS: usize = 0xff;
+
+    pub(crate) fn new(
+        pcs: Box<[u32]>,
+        targets: Box<[std::rc::Rc<crate::bytecode::Chunk>]>,
+    ) -> Self {
+        debug_assert!(targets.len() <= Self::MAX_TARGETS);
+        Self { pcs, targets }
+    }
+
+    /// A mapped pc's word.
+    pub(crate) fn encode(target: usize, pc: usize) -> u32 {
+        debug_assert!(target < Self::MAX_TARGETS && pc <= Self::MAX_PC);
+        ((target as u32) << 24) | pc as u32
+    }
+
+    /// The baseline chunk and pc of transformed `pc`.
+    #[inline]
+    pub(crate) fn target(&self, pc: usize) -> Option<(&crate::bytecode::Chunk, usize)> {
+        let word = *self.pcs.get(pc)?;
+        if word == Self::UNMAPPED {
+            return None;
+        }
+        let chunk = self.targets.get((word >> 24) as usize)?;
+        Some((chunk, (word & 0xff_ffff) as usize))
+    }
+
+    /// The transformed pcs whose baseline site is `pc` of `chunk`.
+    pub(crate) fn sources<'a>(
+        &'a self,
+        chunk: &'a crate::bytecode::Chunk,
+        pc: usize,
+    ) -> impl Iterator<Item = usize> + 'a {
+        (0..self.pcs.len()).filter(move |&source| {
+            self.target(source)
+                .is_some_and(|(target, target_pc)| std::ptr::eq(target, chunk) && target_pc == pc)
+        })
+    }
+
+    /// The mapped pcs.
+    #[cfg(test)]
+    pub(crate) fn mapped(&self) -> usize {
+        self.pcs
+            .iter()
+            .filter(|&&word| word != Self::UNMAPPED)
+            .count()
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.pcs.len() * std::mem::size_of::<u32>()
+            + self.targets.len() * std::mem::size_of::<std::rc::Rc<crate::bytecode::Chunk>>()
+    }
 }
 
 impl FeedbackVector {
@@ -784,9 +858,26 @@ impl FeedbackVector {
             detailed_enabled,
             record: OnceCell::new(),
             record_len: 0,
+            through: None,
             #[cfg(feature = "architecture-diagnostics")]
             census: None,
         }
+    }
+
+    /// A transformed (inlined or recompiled) chunk's vector (W4 step 7): the baseline `layout`'s
+    /// schema identity, with every record and detailed observation going through `map` to the
+    /// baseline sites. Its bindings stay unbound: the baseline chunks keep their current-shape
+    /// adapters.
+    pub(crate) fn transformed(layout: FeedbackLayout, map: RecordMap) -> Self {
+        let bindings = vec![RuntimeBinding::Unbound; layout.len()].into_boxed_slice();
+        let mut vector = Self::new(layout, bindings);
+        vector.through = Some(Box::new(map));
+        vector
+    }
+
+    /// A transformed chunk's map, if this is its vector.
+    pub(crate) fn record_map(&self) -> Option<&RecordMap> {
+        self.through.as_deref()
     }
 
     /// The vector of a chunk of `ops` operations, which its record covers.
@@ -803,6 +894,12 @@ impl FeedbackVector {
         #[cfg(feature = "architecture-diagnostics")]
         if let Some(census) = self.census.as_deref() {
             census.count_record(pc);
+        }
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(pc) {
+                chunk.feedback_vector().record(pc, bits);
+            }
+            return;
         }
         let words = self
             .record
@@ -823,14 +920,6 @@ impl FeedbackVector {
             .get()
             .and_then(|words| words.get(pc))
             .map_or(0, Cell::get)
-    }
-
-    pub(crate) fn unbound(layout: FeedbackLayout) -> Self {
-        let bindings = vec![RuntimeBinding::Unbound; layout.len()].into_boxed_slice();
-        // Transformed/inlined chunks retain canonical schema identity but do not yet carry an
-        // exact transformed-PC → baseline-site map. Disable detailed writes rather than letting
-        // a coincidentally equal PC corrupt the baseline meaning.
-        Self::new_with_enabled(layout, bindings, false)
     }
 
     pub(crate) fn layout(&self) -> &FeedbackLayout {
@@ -856,6 +945,12 @@ impl FeedbackVector {
             .saturating_add(self.record.get().map_or(0, |words| {
                 words.len().saturating_mul(std::mem::size_of::<Cell<u32>>())
             }))
+            .saturating_add(self.through.as_deref().map_or(0, RecordMap::retained_bytes))
+    }
+
+    /// Give a transformed chunk's vector its map, once its operations are final (W4 step 7).
+    pub(crate) fn set_record_map(&mut self, map: RecordMap) {
+        self.through = Some(Box::new(map));
     }
 
     pub(crate) fn sites(&self) -> impl ExactSizeIterator<Item = (SiteId, RuntimeBinding)> + '_ {
@@ -922,6 +1017,17 @@ impl FeedbackVector {
         trace: CurrentPropertyTrace,
     ) {
         if !self.detailed_enabled {
+            return;
+        }
+        // A transformed chunk's observation goes to its baseline site (W4 step 7).
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(bytecode_pc) {
+                chunk.feedback_vector().observe_current_property(
+                    pc,
+                    chunk.feedback_shapes(),
+                    trace,
+                );
+            }
             return;
         }
         let Some(outcome) = trace.outcome else {
@@ -1050,6 +1156,15 @@ impl FeedbackVector {
         if !self.detailed_enabled {
             return;
         }
+        // A transformed chunk's observation goes to its baseline site (W4 step 7).
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(bytecode_pc) {
+                chunk
+                    .feedback_vector()
+                    .observe_element(pc, receiver, key, outcome);
+            }
+            return;
+        }
         let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
             return;
         };
@@ -1127,6 +1242,15 @@ impl FeedbackVector {
         if !self.detailed_enabled {
             return;
         }
+        // A transformed chunk's observation goes to its baseline site (W4 step 7).
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(bytecode_pc) {
+                chunk
+                    .feedback_vector()
+                    .observe_call(pc, target, arity, environment);
+            }
+            return;
+        }
         let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
             return;
         };
@@ -1197,6 +1321,13 @@ impl FeedbackVector {
         if !self.detailed_enabled {
             return;
         }
+        // A transformed chunk's observation goes to its baseline site (W4 step 7).
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(bytecode_pc) {
+                chunk.feedback_vector().observe_branch(pc, taken);
+            }
+            return;
+        }
         let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
             return;
         };
@@ -1254,6 +1385,13 @@ impl FeedbackVector {
         if !self.detailed_enabled {
             return;
         }
+        // A transformed chunk's observation goes to its baseline site (W4 step 7).
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(bytecode_pc) {
+                chunk.feedback_vector().observe_loop_backedge(pc);
+            }
+            return;
+        }
         let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
             return;
         };
@@ -1302,6 +1440,15 @@ impl FeedbackVector {
         if !self.detailed_enabled {
             return;
         }
+        // A transformed chunk's observation goes to its baseline site (W4 step 7).
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(bytecode_pc) {
+                chunk
+                    .feedback_vector()
+                    .observe_allocation(pc, object, requested_units);
+            }
+            return;
+        }
         let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
             return;
         };
@@ -1346,6 +1493,13 @@ impl FeedbackVector {
         role: ObservationRole,
         class: ValueClass,
     ) {
+        // A transformed chunk's observation goes to its baseline site (W4 step 7).
+        if let Some(map) = self.through.as_deref() {
+            if let Some((chunk, pc)) = map.target(bytecode_pc) {
+                chunk.feedback_vector().observe_value_class(pc, role, class);
+            }
+            return;
+        }
         let Ok(bytecode_pc) = u32::try_from(bytecode_pc) else {
             return;
         };

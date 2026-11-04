@@ -45,6 +45,41 @@ pub(crate) fn read(chunk: &Chunk, pc: usize) -> SiteView {
     chunk.feedback_view(pc)
 }
 
+/// [`read`], with the ways of a transformed chunk's copies of the site merged into a named view
+/// (W4 step 7): the transformed chunk's caches are its own, its record map names their baseline
+/// site. A union past the site's four ways is generic.
+pub(crate) fn read_merged(chunk: &Chunk, pc: usize, transformed: &Chunk) -> SiteView {
+    let view = read(chunk, pc);
+    let Some(map) = transformed.feedback_vector().record_map() else {
+        return view;
+    };
+    let merge = |mut named: NamedView| {
+        for source in map.sources(chunk, pc) {
+            let (SiteView::Named(copy) | SiteView::NamedUpdate(copy, _)) =
+                read(transformed, source)
+            else {
+                continue;
+            };
+            named.generic |= copy.generic;
+            for way in copy.filled() {
+                if named.filled().any(|held| held == way) {
+                    continue;
+                }
+                match named.ways.iter_mut().find(|slot| slot.is_none()) {
+                    Some(slot) => *slot = Some(*way),
+                    None => named.generic = true,
+                }
+            }
+        }
+        named
+    };
+    match view {
+        SiteView::Named(named) => SiteView::Named(merge(named)),
+        SiteView::NamedUpdate(named, values) => SiteView::NamedUpdate(merge(named), values),
+        other => other,
+    }
+}
+
 /// The value record's view (section 5.1): ValueClass sets, a class's bit `1 << (class - 1)`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ValuesView {

@@ -602,3 +602,111 @@ fn the_allocation_view_reads_images_and_templates() {
     assert!(regexp.template, "its compiled pattern: {regexp:?}");
     assert_eq!(allocation(&mut engine, "c").kind, AllocationKind::Closure);
 }
+
+/// The global function `name`'s second-stage chunk, driving `drive` until it exists (the
+/// recompile checkpoint reads call-cache feedback, which a concurrent test's invalidation can
+/// empty for a while); None where the second stage does not run at this threshold.
+fn second_stage(engine: &mut Engine, name: &str, drive: &str) -> Option<std::rc::Rc<Chunk>> {
+    if crate::bytecode::inline_recompile_at() != 100 {
+        return None;
+    }
+    for _ in 0..20 {
+        let env = engine.interp.global_env;
+        let value: Value = engine.interp.get_var(name, &env).ok().expect("bound name");
+        let ValueView::Obj(function) = value.view() else {
+            panic!("{name} is not an object")
+        };
+        let ObjectKind::User(user) = &function.borrow().kind else {
+            panic!("{name} is not a user function")
+        };
+        if let Some(chunk) = user.func.runtime().code2.get().and_then(Option::as_ref) {
+            return Some(std::rc::Rc::clone(chunk));
+        }
+        eval(engine, drive);
+    }
+    panic!("{name} never reached its second stage")
+}
+
+#[test]
+fn an_inlined_sites_record_reaches_its_baseline_site() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function add(a, b) { return a + b; }
+         function caller(x) { return add(x, 1); }
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(i); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    let map = transformed
+        .feedback_vector()
+        .record_map()
+        .expect("a transformed chunk has a record map");
+    assert!(map.mapped() > 0, "{:?}", transformed.jit_ops());
+    let spliced: Vec<usize> = (0..transformed.jit_ops().len())
+        .filter(|&pc| matches!(transformed.jit_ops()[pc], Op::Add))
+        .collect();
+    assert!(
+        !spliced.is_empty(),
+        "add is spliced: {:?}",
+        transformed.jit_ops()
+    );
+    let add = chunk_of(&mut engine, "add");
+    assert!(spliced.iter().any(|&pc| map
+        .target(pc)
+        .is_some_and(|(chunk, _)| std::ptr::eq(chunk, &*add))));
+    eval(&mut engine, "caller('s');");
+    assert_eq!(
+        record(&mut engine, "add", |op| matches!(op, Op::Add)),
+        (STRING, INT32, STRING),
+        "the spliced Add's miss lands in add's own site"
+    );
+    for pc in spliced {
+        assert_eq!(
+            transformed.feedback_record(pc),
+            0,
+            "the transformed words stay empty"
+        );
+    }
+}
+
+#[test]
+fn the_merged_view_holds_a_transformed_sites_ways() {
+    use crate::feedback::SiteView;
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function get(o) { return o.x; }
+         function caller(o) { return get(o); }
+         var a = {x: 1};
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(a); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    eval(&mut engine, "caller({x: 2, y: 3});");
+    let get = chunk_of(&mut engine, "get");
+    let pc = (0..get.jit_ops().len())
+        .find(|&pc| named_load(&get.jit_ops()[pc]))
+        .expect("get's named load");
+    let ways = |view: SiteView| match view {
+        SiteView::Named(named) => named.filled().count(),
+        other => panic!("{other:?}"),
+    };
+    let own = ways(crate::feedback::read(&get, pc));
+    let merged = ways(crate::feedback::read_merged(&get, pc, &transformed));
+    let map = transformed
+        .feedback_vector()
+        .record_map()
+        .expect("a transformed chunk has a record map");
+    if map.sources(&get, pc).next().is_some() {
+        assert_eq!(
+            merged,
+            own + 1,
+            "the inlined copy's second shape: {own} {merged}"
+        );
+    }
+}
