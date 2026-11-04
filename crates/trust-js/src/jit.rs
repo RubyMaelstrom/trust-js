@@ -6728,9 +6728,11 @@ fn emit_prop_way_probe(
     a.cmp_imm_w(9, 3);
     a.b_cond(C_NE, other);
     a.bind(depth3);
+    // Both intermediate shapes recorded (`mid_ok` bits 0 and 1), tested bit by bit: the byte's
+    // bit 7 is the site's generic mark (`IC_MID_GENERIC`, W4 step 5), which no probe reads.
     a.ldrb_imm(14, 12, IC_OFF_MID_OK);
-    a.cmp_imm_w(14, 3);
-    a.b_cond(C_NE, miss);
+    a.tbz(14, 0, miss);
+    a.tbz(14, 1, miss);
     // depth-3 first intermediate hop.
     a.ldr_imm(17, 11, pr);
     a.cbz(17, true, miss);
@@ -6757,8 +6759,9 @@ fn emit_prop_way_probe(
     a.b_cond(C_NE, miss);
     a.b(d1);
     a.bind(depth2);
+    // The intermediate shape recorded (`mid_ok` bit 0; bit 7 is the generic mark).
     a.ldrb_imm(14, 12, IC_OFF_MID_OK);
-    a.cbz(14, false, miss);
+    a.tbz(14, 0, miss);
     // depth-2 mid hop: follow the live proto, validate against mid_shape
     a.ldr_imm(17, 11, pr); // Option<Gc> niche: pointer or 0
     a.cbz(17, true, miss);

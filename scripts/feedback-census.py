@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """Join two feedback-census files into coverage by operation kind (W4; DIAGNOSTICS.md).
 
-usage: python3 -I scripts/feedback-census.py BYTECODE_FILE JIT_FILE [--name NAME]
+usage: python3 -I scripts/feedback-census.py BYTECODE_FILE JIT_FILE [--name NAME] [--records LIST]
 
 BYTECODE_FILE is TRUST_JS_FEEDBACK_CENSUS's file from a --tier=bytecode run of a program: every
 compiled-code operation passes the VM's loop there, so its dispatch counts are each site's
 executions. JIT_FILE is the file from the production --tier=jit run of the same program: each
 site's production feedback at exit. Both come from an engine built with the
-architecture-diagnostics feature. Chunks join on their census key (not inlined).
+architecture-diagnostics feature. Chunks join on their census key (not inlined). --records
+(e.g. `values`, or `none`) reads the files as if the engine wrote only those records.
 
 For each kind it prints the executions, their share of all operations, the share whose site has
 usable feedback in production today, and coverage (feedback-schema.txt, section 4): the share of
@@ -18,7 +19,9 @@ record (the VM records every execution) being what it saw. A value operation's r
 its in-line set (rule U, feedback-schema.txt section 5.1), an element access's alone when it is not
 empty (rule R, section 5.2).
 Branches, loops, `!` and names are counted but left out of the totals (no exemplar records
-branch directions or ToBoolean; names mostly resolve to static addresses).
+branch directions or ToBoolean; names mostly resolve to static addresses). Equality (==, !=, ===,
+!==) has no record by design (the plan's W4 decision 3: typed from its operands, as JSC does): it
+is in the comparison row and the first total, and a second total leaves it out.
 """
 
 import sys
@@ -58,7 +61,8 @@ def name_of(op):
 
 
 def usable_today(kind, op, state):
-    """Production feedback the census's state word shows (bytecode_census.rs)."""
+    """Production feedback the census's state word shows (bytecode_census.rs) from the baseline's
+    caches (no record's)."""
     name = name_of(op)
     if kind in (1, 2):
         return (state & 7) > 0
@@ -90,6 +94,8 @@ ELEMENT_OPS = ("GetElem", "GetElemLocal", "GetMethodElem", "SetElem", "SetElemDr
                "SetElemLocal", "SetElemLocalDrop")
 E_RECEIVERS, E_KEYS = 0x7F, 0x1F << 8
 E_IN_LINE_RECEIVERS, E_KEY_INDEX = 0b111, 1 << 8
+# A named site's generic mark in its state word (step 5).
+GENERIC = 1 << 7
 
 
 def in_line_set(op):
@@ -141,6 +147,8 @@ def precise_site(kind, op, state, full, recorded, records):
     shapes, or a record that, read by its rule, names exactly the coarse classes seen. typeof
     and `in` record nothing, nor does equality (W4's decision 3)."""
     name = name_of(op)
+    if kind in (1, 2) and "generic" in records and state & GENERIC:
+        return True  # megamorphic or uncacheable: exactly what P3 lowers generically
     if kind in (1, 2, 5, 6, 10) or (kind == 13 and name == "InstanceOf"):
         return usable_today(kind, op, state)
     inline = in_line_set(op)
@@ -157,6 +165,8 @@ def usable(kind, op, state, records):
     if usable_today(kind, op, state):
         return True
     name = name_of(op)
+    if kind in (1, 2) and "generic" in records and state & GENERIC:
+        return True  # the generic mark (step 5): a refused fill or a fifth receiver shape
     if kind == 13 and name in ("Typeof", "TypeofIs", "TypeofName", "In"):
         return True  # lowered generically by the templates; no exit for missing feedback
     if "values" in records and (in_line_set(op) is not None or name in EQUALITY):
@@ -169,15 +179,25 @@ def usable(kind, op, state, records):
 
 
 def main():
-    args = [a for a in sys.argv[1:] if not a.startswith("--")]
-    name = sys.argv[sys.argv.index("--name") + 1] if "--name" in sys.argv else args[0]
+    argv = sys.argv[1:]
+    options = {}
+    for flag in ("--name", "--records"):
+        if flag in argv:
+            k = argv.index(flag)
+            options[flag] = argv[k + 1]
+            del argv[k:k + 2]
+    args = argv
+    name = options.get("--name", args[0])
     vm_header, _, vm = load(args[0])
     jit_header, jit_chunks, jit = load(args[1])
     records = set()
     for word in jit_header:
         if word.startswith("records="):
             records = set(filter(None, word[len("records="):].split(",")))
+    if "--records" in options:
+        records = set(filter(None, options["--records"].split(","))) - {"none"}
     total, today, covered, joined, precise = (defaultdict(int) for _ in range(5))
+    equality = defaultdict(int)  # executions, usable, precise of equality (in comparison)
     for (key, inlined, pc), o in vm.items():
         count, kind = o["count"], o["kind"]
         if not count or kind == 0:
@@ -195,6 +215,11 @@ def main():
             covered[kind] += count
         if precise_site(kind, o["op"], state, o["record"], j["record"] if j else 0, records):
             precise[kind] += count
+            equality["precise"] += count if name_of(o["op"]) in EQUALITY else 0
+        if name_of(o["op"]) in EQUALITY:
+            equality["total"] += count
+            equality["covered"] += count if usable(kind, o["op"], state, records) else 0
+            equality["today"] += count if usable_today(kind, o["op"], state) else 0
     everything = sum(total.values())
     counted = sum(v for k, v in total.items() if k not in APART)
     print(f"== {name} (records: {', '.join(sorted(records)) or 'none'})")
@@ -213,6 +238,13 @@ def main():
         q = sum(v for k, v in precise.items() if k not in APART)
         print(f"all but branches, loops and names\t{counted}\t{100 * counted / everything:.2f}"
               f"\t{100 * t / counted:.1f}\t{100 * c / counted:.1f}\t\t{100 * q / counted:.1f}")
+        n = counted - equality["total"]
+        if n and equality["total"]:
+            t -= equality["today"]
+            c -= equality["covered"]
+            q -= equality["precise"]
+            print(f"  and without equality\t{n}\t{100 * n / everything:.2f}\t{100 * t / n:.1f}"
+                  f"\t{100 * c / n:.1f}\t\t{100 * q / n:.1f}")
 
 
 main()

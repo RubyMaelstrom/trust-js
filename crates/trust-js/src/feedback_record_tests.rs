@@ -1,6 +1,7 @@
-//! The always-on records (W4 steps 3 and 4; feedback-schema.txt section 5): the VM records every
+//! The always-on records (W4 steps 3-5; feedback-schema.txt section 5): the VM records every
 //! execution; generated code records only what its in-line path does not take, on its miss
-//! paths; equality records nothing. The value record (step 3), then the element record (step 4).
+//! paths; equality records nothing. The value record (step 3), the element record (step 4), then
+//! the named sites' generic mark (step 5).
 
 use crate::bytecode::*;
 use crate::feedback::{
@@ -320,4 +321,98 @@ fn native_element_stores_record_only_what_leaves_the_in_line_set() {
         element(&mut engine, "s", store),
         ELEM_ARRAY | ELEM_UNWRITABLE | ELEM_KEY_STRING | ELEM_KEY_INDEX
     );
+}
+
+/// Whether `name`'s one named operation that `which` accepts carries the generic mark.
+fn generic(engine: &mut Engine, name: &str, which: impl Fn(&Op) -> bool) -> bool {
+    let chunk = chunk_of(engine, name);
+    let pcs: Vec<usize> = (0..chunk.jit_ops().len())
+        .filter(|&pc| which(&chunk.jit_ops()[pc]))
+        .collect();
+    assert_eq!(
+        pcs.len(),
+        1,
+        "one such operation in {name}: {:?}",
+        chunk.jit_ops()
+    );
+    chunk.named_site_generic(pcs[0])
+}
+
+fn named_load(op: &Op) -> bool {
+    matches!(op, Op::GetProp(..) | Op::GetPropLocal(..))
+}
+
+#[test]
+fn a_fifth_receiver_shape_marks_a_named_site_generic() {
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier);
+        eval(
+            &mut engine,
+            "function g(o) { return o.x; }
+             var shapes = [{x: 1}, {x: 1, a: 1}, {x: 1, b: 1}, {x: 1, c: 1}];
+             for (var i = 0; i < 20; i++) g(shapes[i % 4]);",
+        );
+        assert!(
+            !generic(&mut engine, "g", named_load),
+            "{tier:?}: four shapes fit the ways"
+        );
+        eval(&mut engine, "g({x: 1, d: 1});");
+        assert!(
+            generic(&mut engine, "g", named_load),
+            "{tier:?}: a fifth evicts a live way"
+        );
+        eval(
+            &mut engine,
+            "for (var i = 0; i < 20; i++) g(shapes[i % 4]);",
+        );
+        assert!(
+            generic(&mut engine, "g", named_load),
+            "{tier:?}: the mark stays"
+        );
+    }
+}
+
+#[test]
+fn a_refused_fill_marks_a_named_site_generic() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function g(o) { return o.x; } function m(o) { return o.x; }
+         function s(a) { a.foo = 1; }
+         for (var i = 0; i < 20; i++) { g({x: i}); m({x: i}); }",
+    );
+    assert!(!generic(&mut engine, "g", named_load));
+    eval(&mut engine, "g(new Proxy({x: 2}, {})); s([]);");
+    assert!(generic(&mut engine, "g", named_load), "a proxy receiver");
+    assert!(!generic(&mut engine, "m", named_load), "a monomorphic site");
+    assert!(
+        generic(&mut engine, "s", |op| matches!(
+            op,
+            Op::SetProp(..) | Op::SetPropDrop(..) | Op::SetPropLocalDrop(..)
+        )),
+        "an Array receiver of a store"
+    );
+}
+
+#[test]
+fn a_generic_sites_prototype_ways_still_hit() {
+    // Two and three hops to the method: the templates test the intermediate shapes' bits of
+    // `mid_ok` alone, beside the generic mark.
+    let mut engine = engine(Tier::Jit);
+    let total = eval(
+        &mut engine,
+        "class A { m() { return 1; } } class B extends A {} class C extends B {}
+         function c(o) { return o.m(); }
+         var others = [{m() { return 2; }}, {a: 1, m() { return 2; }}, {b: 1, m() { return 2; }},
+                       {c: 1, m() { return 2; }}, {d: 1, m() { return 2; }}];
+         var total = 0;
+         for (var i = 0; i < 5; i++) total += c(others[i]);
+         for (var i = 0; i < 40; i++) total += c(i % 2 ? new B() : new C());
+         total",
+    );
+    assert_eq!(total, "50");
+    assert!(generic(&mut engine, "c", |op| matches!(
+        op,
+        Op::GetMethod(..)
+    )));
 }

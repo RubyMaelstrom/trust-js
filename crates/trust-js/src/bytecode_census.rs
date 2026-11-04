@@ -100,8 +100,9 @@ pub(crate) fn census_kind(op: &Op, pc: usize) -> u8 {
 
 impl Chunk {
     /// Merge this chunk's production feedback, per pc, into the census, at its drop and at the
-    /// shell's exit. The state word, by kind: a named site's filled ways in bits 0-2 and its
-    /// uncacheable, accessor, absent and creation ways in bits 3-6; a call site's filled ways in
+    /// shell's exit. The state word, by kind: a named site's filled ways in bits 0-2, its
+    /// uncacheable, accessor, absent and creation ways in bits 3-6 and its generic mark (W4 step
+    /// 5) in bit 7; a call site's filled ways in
     /// bits 0-2, its megamorphic state in bit 3, a native way in bit 4 and its first builtin id in
     /// bits 16-31; bit 0 for a filled construct, `instanceof` or name cache and for a made
     /// allocation image (bit 1: a literal's template or shared block exists).
@@ -110,7 +111,9 @@ impl Chunk {
             return;
         };
         let named = |cache: u32| {
-            let mut bits = 0u32;
+            let mut bits = self.caches.get(cache as usize).map_or(0, |way| {
+                u32::from(way.get().mid_ok & crate::bytecode::IC_MID_GENERIC != 0) << 7
+            });
             for way in self.caches.iter().skip(cache as usize).take(PROP_IC_WAYS) {
                 let state = way.get();
                 if state.depth == IC_EMPTY {
@@ -155,17 +158,9 @@ impl Chunk {
             .iter()
             .enumerate()
             .map(|(pc, op)| {
+                let site = named_site_cache(op);
                 let state = match *op {
-                    Op::GetProp(_, cache)
-                    | Op::GetPropThis(_, cache)
-                    | Op::GetPropLocal(_, _, cache)
-                    | Op::GetMethod(_, cache)
-                    | Op::SetProp(_, cache)
-                    | Op::SetPropDrop(_, cache)
-                    | Op::SetPropThisDrop(_, cache)
-                    | Op::SetPropLocalDrop(_, _, cache)
-                    | Op::AppendProp(_, cache)
-                    | Op::UpdateProp(_, cache, _) => named(cache),
+                    _ if site.is_some() => site.map_or(0, named),
                     Op::Call(_, cache)
                     | Op::CallWithThis(_, cache)
                     | Op::CallSpread(_, cache)

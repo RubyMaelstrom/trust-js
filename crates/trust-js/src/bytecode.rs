@@ -93,7 +93,8 @@ pub struct IcState {
     pub depth: u8,
     /// Bit 0: `mid_shape` was recorded (a `depth ≥ 2` fill whose depth-1 hop was a plain
     /// ordinary object); bits 1..3 cover `mid2_shape` through `mid4_shape`. Shape id 0
-    /// is a real shape (the empty object).
+    /// is a real shape (the empty object). Bit 7, in a site's way 0 only, is the site's generic
+    /// mark ([`IC_MID_GENERIC`]); every probe tests bits 0-3 alone.
     pub mid_ok: u8,
     /// Where the slot lives, for generated code (W2d step 3; [`crate::value::Props::slot_location`]):
     /// the holder's slot in a data, accessor or key-checked state, the new slot in a creation
@@ -139,6 +140,13 @@ const _: () = {
 };
 
 pub const IC_EMPTY: u8 = u8::MAX;
+/// A named site's generic mark (W4 step 5; feedback-schema.txt section 5.3), bit 7 of its way
+/// 0's `mid_ok`: a fill was refused (an uncacheable receiver or chain: a proxy, a typed array, a
+/// side-table object; an Array or other exotic receiver of a store) or evicted a live way (a
+/// fifth receiver shape, V8's megamorphic transition past kMaxPolymorphism). The fills set it
+/// ([`crate::interpreter::Interp::ic_insert`] carries it into each new way 0) and nothing
+/// clears it; no probe reads it, the templates testing `mid_ok`'s bits 0-3 one by one.
+pub const IC_MID_GENERIC: u8 = 0x80;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
 /// is missing along the entire (all `ObjectKind::ExoticNone`, all ic-plain) prototype chain. The chain's
 /// shapes sit in recv_shape/mid_shape/mid2_shape/mid3_shape/mid4_shape/holder_shape in walk
@@ -6588,6 +6596,23 @@ fn record_binary_miss(
     };
     if !inline {
         record_binary(feedback, pc, left, right, result);
+    }
+}
+
+/// The property cache (its way 0's index) of a named load's or store's operation.
+pub(crate) fn named_site_cache(op: &Op) -> Option<u32> {
+    match *op {
+        Op::GetProp(_, cache)
+        | Op::GetPropThis(_, cache)
+        | Op::GetPropLocal(_, _, cache)
+        | Op::GetMethod(_, cache)
+        | Op::SetProp(_, cache)
+        | Op::SetPropDrop(_, cache)
+        | Op::SetPropThisDrop(_, cache)
+        | Op::SetPropLocalDrop(_, _, cache)
+        | Op::AppendProp(_, cache)
+        | Op::UpdateProp(_, cache, _) => Some(cache),
+        _ => None,
     }
 }
 
@@ -22039,6 +22064,16 @@ impl Chunk {
     }
     pub(crate) fn jit_detailed_feedback_enabled(&self) -> bool {
         self.feedback.detailed_enabled()
+    }
+    /// Whether the named site of the operation at `pc` carries the generic mark (W4 step 5;
+    /// feedback-schema.txt section 5.3): a refused fill or a fifth receiver shape.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn named_site_generic(&self, pc: usize) -> bool {
+        self.ops
+            .get(pc)
+            .and_then(named_site_cache)
+            .and_then(|cache| self.caches.get(cache as usize))
+            .is_some_and(|way| way.get().mid_ok & IC_MID_GENERIC != 0)
     }
     /// The always-on record of the operation at `pc` (W4 steps 3 and 4; feedback-schema.txt
     /// section 5).

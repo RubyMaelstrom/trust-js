@@ -10277,18 +10277,40 @@ impl Interp {
     /// Install `st` as way 1 of the site, demoting the existing ways one step (LRU-ish: a site
     /// cycling through up to `PROP_IC_WAYS` shapes keeps them all resident).
     #[inline]
+    ///
+    /// The fill path keeps the site's generic mark (W4 step 5, [`crate::bytecode::IC_MID_GENERIC`]
+    /// in way 0): a refused fill sets it, so does a fill that evicts a live way, and each new
+    /// way 0 inherits it.
     pub(crate) fn ic_insert(
         &self,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
-        st: crate::bytecode::IcState,
+        mut st: crate::bytecode::IcState,
     ) {
+        use crate::bytecode::{IC_EMPTY, IC_MID_GENERIC, PROP_IC_WAYS};
         if !st.has_cacheable_shapes() {
+            self.ic_mark_generic(cache);
             return;
         }
-        for k in (1..crate::bytecode::PROP_IC_WAYS).rev() {
+        let generic = cache.get().mid_ok & IC_MID_GENERIC != 0
+            || self.ic_way(cache, PROP_IC_WAYS - 1).get().depth != IC_EMPTY;
+        for k in (1..PROP_IC_WAYS).rev() {
             self.ic_way(cache, k).set(self.ic_way(cache, k - 1).get());
         }
+        if generic {
+            st.mid_ok |= IC_MID_GENERIC;
+        }
         cache.set(st);
+    }
+
+    /// Mark a named site generic (W4 step 5): its fill was refused, an uncacheable receiver or
+    /// chain. Once a site: the mark stays in way 0 (see [`Interp::ic_insert`]).
+    #[cold]
+    pub(crate) fn ic_mark_generic(&self, cache: &std::cell::Cell<crate::bytecode::IcState>) {
+        let mut head = cache.get();
+        if head.mid_ok & crate::bytecode::IC_MID_GENERIC == 0 {
+            head.mid_ok |= crate::bytecode::IC_MID_GENERIC;
+            cache.set(head);
+        }
     }
 
     /// One way's shape fast path: a `depth == 0` (own), `depth == 1` (immediate-prototype, e.g.
@@ -10512,6 +10534,8 @@ impl Interp {
             for depth in 0..=IC_MAX_DEPTH {
                 let b = (*cur).borrow();
                 if !self.ic_plain_ptr(cur as usize, &b) {
+                    // An uncacheable receiver or chain: the site is generic (W4 step 5).
+                    self.ic_mark_generic(cache);
                     return None;
                 }
                 absent_shapes[depth as usize] = b.props.shape();
@@ -10918,10 +10942,10 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
     ) -> IcSet {
         let mut b = o.borrow_mut();
-        if !b.kind.is_ordinary() {
-            return IcSet::Miss;
-        }
-        if !b.ic_plain() {
+        // A receiver the store cache cannot hold (an Array or other exotic, a proxy or
+        // side-table object) makes the site generic (W4 step 5).
+        if !b.kind.is_ordinary() || !b.ic_plain() {
+            self.ic_mark_generic(cache);
             return IcSet::Miss;
         }
         // Shape fast path (own writable data property), every way: a shape match means `slot`

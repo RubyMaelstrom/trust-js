@@ -97,7 +97,7 @@ a --tier=bytecode run (whose dispatches are every compiled-code execution) with 
 run (whose snapshot is the production feedback) and prints both shares by kind (DIAGNOSTICS.md).
 Its file's header names the records the engine writes (`records=`), whose readings the script
 applies. A site counts as usable when:
-- named load or store: a filled way of its property cache;
+- named load or store: a filled way of its property cache, or its generic mark (step 5);
 - call: a filled way or the megamorphic state of its CallSite (spread and argument-array calls
   have no cache);
 - construct: its ConstructSite's way;
@@ -109,13 +109,16 @@ applies. A site counts as usable when:
 - element loads and stores: always, once the element record exists (step 4): its record and the
   in-line set's two-way dispatch, as the templates lower it;
 - the records' other kinds, as the steps below add them.
-Precision counts the caches' sites as coverage does, a value operation when its record read by
+Precision counts the caches' sites as coverage does (a generic named site is precise: it is
+megamorphic or uncacheable, exactly what the speculative tier lowers generically), a value
+operation when its record read by
 rule U (section 5.1) names exactly the coarse classes the bytecode run's record saw (the VM records
 every execution there), an element access when its record read by rule R (section 5.2) names
 exactly the receivers and keys that record saw, and typeof, `in` and equality, which record
 nothing, as not precise.
 Branches, loops, `!` (ToBoolean) and names are counted but left out: no exemplar records branch
-directions or ToBoolean, and names mostly have static addresses.
+directions or ToBoolean, and names mostly have static addresses. Equality has no record by design
+(W4 decision 3), so the script prints a second total without it.
 
 5. The always-on records (W4; each step adds its record here)
 
@@ -202,6 +205,22 @@ keeps the baseline's dispatch there). An Array's facts are hints, as the value r
 is: an in-line hit records none, so a fact is known only where the VM or a miss saw it, and P3
 reads the kind bits at run time, as the templates do.
 
-5.3 Later steps: the named sites' generic mark (step 5), the read API (step 6), the pc map of
-inlined and recompiled code (step 7), Pilot C's store writability (step 9) and the dependency
-registry (step 10).
+5.3 The named sites' generic mark (step 5). A named load's or store's property cache (its four
+IcState ways) carries one site-level bit: bit 7 of way 0's mid_ok (bytecode.rs IC_MID_GENERIC),
+which no probe reads (the templates test mid_ok's bits 0-3 one by one). The fill path sets it,
+and only it:
+- a refused fill: a read's uncacheable receiver or chain (a level ic_plain refuses: a proxy, a
+  typed array, a side-table object), a store's receiver its cache cannot hold (an Array or other
+  exotic, a proxy, a side-table object), a state whose shapes are uncacheable;
+- a fill that evicts a live way: a fifth receiver shape (V8's megamorphic transition past its
+  four maps; CallSite's megamorphic state counts its own evictions, W3 item 7).
+Interp::ic_insert carries the mark into each new way 0; nothing clears it. Reading it: a marked
+site is generic, which the speculative tier lowers to the stub cache's probe or the generic
+[[Get]] and [[Set]], its ways a fast path, and never an exit for missing feedback. An unmarked
+site's filled ways are every receiver shape it saw, up to four, but for fills refused for the
+property (a non-writable or index-named one, a slot past the cache's reach, a deeper chain),
+which leave no mark. The census's state word reports the mark in bit 7 (`generic` in its header's
+records).
+
+5.4 Later steps: the read API (step 6), the pc map of inlined and recompiled code (step 7), Pilot
+C's store writability (step 9) and the dependency registry (step 10).
