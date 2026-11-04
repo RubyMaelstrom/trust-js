@@ -717,7 +717,8 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
     struct Expected {
         address: usize,
         // Obscure words so neither diagnostic state nor conservative scanning can retain the
-        // argument cells. Real precise collections below see only the boundary's slice root.
+        // argument cells. Real precise collections below see only the caller's slice root, which
+        // the boundary requires of a Rust-heap window (`Interp::call_native_committed_with`).
         hidden: Vec<u64>,
         weak: Vec<crate::gc_handle::WeakRef>,
         calls: usize,
@@ -892,6 +893,9 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
             calls: 0,
         });
         let words = &arguments;
+        // The caller roots its Rust-heap window for both calls below, their polls, reentry
+        // and tail drains: the boundary makes no root of its own.
+        let window = crate::rooting::root_slice(words);
         let result = unsafe {
             engine.interp.call_native_address_committed(
                 function as usize,
@@ -916,8 +920,8 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
             .zip(&engine.interp.host::<Expected>().unwrap().hidden)
             .all(|(value, hidden)| value.bits() == !hidden));
         // The scoped native returns before this queued engine-native tail collects. No live
-        // native callback frame still holds the inputs: only the committed boundary's ongoing
-        // immutable loan/root scope can retain these otherwise unregistered heap words.
+        // native callback frame still holds the inputs: only the caller's root of the window,
+        // which lasts through the boundary's loan, retains these otherwise unregistered words.
         let tail_result = unsafe {
             engine.interp.call_native_address_committed(
                 queue as usize,
@@ -929,6 +933,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
         }
         .unwrap_or_else(|_| panic!("post-native tail collection"));
         assert_eq!(tail_result.as_num_opt(), Some(9.0));
+        drop(window);
         drop(arguments);
         engine
             .interp

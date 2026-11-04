@@ -840,22 +840,25 @@ fn context_return_slot_is_a_root() {
 
 /// The committed native-call boundary called from Rust (as `call_jit_cached`'s native entry
 /// calls it), with `collect` as the native: the receiver word stays in this frame, and the
-/// argument word is moved out of an unregistered Rust-heap buffer, so in the native the
-/// boundary's own rooting of the moved arguments (`rooting::root_slice`) is the argument's only
-/// root. Returns the markers of the receiver and the argument.
+/// argument word is in a Rust-heap buffer, which the caller roots for the call
+/// (`rooting::root_slice`), as the boundary requires of a window outside every frame: in the
+/// native that registration is the argument's only root. Returns the markers of the receiver
+/// and the argument.
 #[inline(never)]
 fn committed_from_rust(i: &mut Interp) -> String {
     let mut this_slot = std::mem::ManuallyDrop::new(Value::Undefined);
     track_into(i, &mut this_slot, "receiver");
     let mut args = vec![(Value::Undefined)];
     track_into(i, &mut args[0], "argument");
-    // A stack copy of the argument word until the boundary has moved it: a collection at the
-    // boundary's entry (GC stress) must not find the argument unrooted. It marks as `S`.
+    // A stack copy of the argument word until the window is registered: a collection in
+    // between (GC stress) must not find the argument unrooted. It marks as `S`.
     let held = std::mem::ManuallyDrop::new(args[0]);
-    // SAFETY: the receiver word and one argument word are written; the boundary consumes the
-    // argument, and `args` is emptied before it drops.
-    let result = unsafe { i.call_native_committed(collect, &*this_slot, args.as_mut_ptr(), 1) };
-    unsafe { args.set_len(0) };
+    let result = {
+        let _window = crate::rooting::root_slice(&args);
+        // SAFETY: the receiver word and one argument word are written, and the window is
+        // registered for the whole call.
+        unsafe { i.call_native_committed(collect, &*this_slot, args.as_ptr(), 1) }
+    };
     std::hint::black_box(&held);
     match (result).map(|__value| (__value).view()) {
         Ok(ValueView::Str(marks)) => marks.text().into_owned(),
@@ -864,14 +867,13 @@ fn committed_from_rust(i: &mut Interp) -> String {
 }
 
 /// (15) The committed native-call boundary (`Interp::call_native_committed`), reached from a
-/// warmed site's native call cache entry. The receiver word stays in the caller's operand stack
-/// and the arguments move into the call, which roots them. A collection in the native
-/// (`collect` itself), in a callback the native calls and which throws through it, and in a tail
-/// call the boundary drains after the native returns, finds the receiver and the argument marked
-/// by roots. In generated code the argument's moved word also stays in the caller's scanned
-/// operand stack, so the boundary's own rooting shows only from Rust, with the operands outside
-/// any root (`committed_from_rust`): there the receiver is marked by the stack and the argument
-/// by the boundary.
+/// warmed site's native call cache entry. The receiver and argument words stay in the caller's
+/// operand stack, which the collector scans whole while the caller's record runs: the boundary
+/// makes no root of its own. A collection in the native (`collect` itself), in a callback the
+/// native calls and which throws through it, and in a tail call the boundary drains after the
+/// native returns, finds the receiver and the argument marked by roots. From Rust, a window
+/// outside every frame is the caller's to root (`committed_from_rust`): there the receiver is
+/// marked by the stack and the argument by the caller's registration.
 #[test]
 fn committed_native_call_operands_are_roots() {
     /// `callThrough(callback, ...args)`: `callback(...args)`, whose throw propagates.

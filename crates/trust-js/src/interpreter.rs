@@ -15780,13 +15780,14 @@ impl Interp {
     }
 
     /// A native-entry IC hit, borrowing the caller's canonical evaluated argument window.
-    /// Roots and loans last through post-call interruption and the pending-tail drain. The
-    /// caller retires its operands only after this returns; the callee never clears or pools them.
+    /// Loans last through post-call interruption and the pending-tail drain. The caller roots
+    /// the receiver and the window for all of it (see [`Interp::call_native_committed_with`])
+    /// and retires its operands only after this returns; the callee never clears or pools them.
     ///
     /// # Safety
     /// `args` is aligned and non-null even for zero arity. `args..args+argc` and `this_slot`
-    /// are initialized execution words in stable immutable
-    /// storage, retained by the caller through this entire operation and all nested reentry.
+    /// are initialized execution words in stable immutable storage, retained and rooted by the
+    /// caller through this entire operation and all nested reentry.
     #[inline]
     pub(crate) unsafe fn call_native_committed(
         &mut self,
@@ -15802,9 +15803,18 @@ impl Interp {
 
     /// Share native bookkeeping while Rust monomorphizes each actual callback signature.
     ///
+    /// The receiver and the window are rooted by the caller for the whole call, its polls, any
+    /// reentry and the tail drain, and the boundary makes no root of its own: generated code's
+    /// window is its record's operands, which the collector scans whole while the record runs
+    /// (`jit::JitFrame`; a frame past the pool's records, its registered buffer,
+    /// `gc_trace::JitFrameRoots`); a Rust caller's is on the native stack, which the conservative
+    /// scan roots (Decision 0), or in storage it registers (`rooting::root_slice`), as
+    /// [`Interp::call_jit_cached`] and [`Interp::call_prepared`] require of theirs.
+    ///
     /// # Safety
-    /// The receiver/arguments obey `call_native_committed`'s stable immutable-window contract.
-    /// `invoke` calls its function at the actual declared signature, mapping its Result explicitly.
+    /// The receiver/arguments obey `call_native_committed`'s stable immutable-window contract,
+    /// rooted as above. `invoke` calls its function at the actual declared signature, mapping
+    /// its Result explicitly.
     pub(crate) unsafe fn call_native_committed_with(
         &mut self,
         address: usize,
@@ -15817,7 +15827,6 @@ impl Interp {
         // may churn other frames and pools, but cannot retire or reuse this caller's allocation.
         unsafe {
             crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
-                let _arguments = crate::rooting::root_slice(arguments);
                 self.depth += 1;
                 if execution_stack_exhausted(self.depth) {
                     self.depth -= 1;
