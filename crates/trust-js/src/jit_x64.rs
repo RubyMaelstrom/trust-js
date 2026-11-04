@@ -938,13 +938,13 @@ pub(super) fn compile_entry(
         if let Some(activation) = chunk.jit_inline_activation() {
             // W3 item 3's step 7 (W2e's first use), as ARM64's prologue: an activation that is
             // only its record is made in line, its captured parameters and `this` copied
-            // before the next safepoint, then the poll; the helper below is its slow path.
+            // before the next safepoint; the helper below is its slow path, whose call ends in
+            // the poll (no poll follows the in-line path: W2e's design 1).
             let slow = a.label();
             alloc::emit_inline_activation(&mut a, &activation, slow);
             names::emit_activation_copies(&mut a, chunk, false);
             #[cfg(test)]
             names::record_inline_activation(&mut a);
-            a.helper_end_poll(unwind);
             a.jmp(done);
             a.bind(slow);
         }

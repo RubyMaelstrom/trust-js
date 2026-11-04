@@ -835,8 +835,20 @@ pub(super) fn emit(
                 direct_finish,
             );
         }
-        Op::MakeObject(..) => {
-            emit_op_helper(a, H_MAKE_OBJECT, pc as u32, unwind);
+        Op::MakeObject(_, count, tidx) => {
+            // W2e step 3: the literal's instance in line from its site's image.
+            match chunk.jit_object_site(*tidx, usize::from(*count)) {
+                Some((site, image)) if *tidx != u32::MAX => super::alloc::emit_inline_object(
+                    a,
+                    &site,
+                    image,
+                    usize::from(*count),
+                    H_MAKE_OBJECT,
+                    pc as u32,
+                    unwind,
+                ),
+                _ => emit_op_helper(a, H_MAKE_OBJECT, pc as u32, unwind),
+            }
         }
         Op::MakeClosure(..) => {
             emit_op_helper(a, H_MAKE_CLOSURE, pc as u32, unwind);

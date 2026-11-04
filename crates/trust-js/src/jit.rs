@@ -4989,14 +4989,14 @@ fn compile_entry(
         if let Some(activation) = chunk.jit_inline_activation() {
             // W3 item 3's step 7 (W2e's first use): an activation that is only its record is
             // made in line, its captured parameters and `this` copied before the next
-            // safepoint (no barrier: the record is young), then the poll; the frame setup
-            // helper below is its slow path.
+            // safepoint (no barrier: the record is young); the frame setup helper below is its
+            // slow path. No poll follows (W2e's design 1): a due collection fails the in-line
+            // check, and the helper's call ends in the poll.
             let slow = a.new_label();
             alloc::emit_inline_activation(&mut a, &activation, slow);
             emit_prologue_copies(&mut a, chunk, false);
             #[cfg(test)]
             names::record_inline_activation(&mut a);
-            emit_helper_end_poll(&mut a, l_unwind);
             a.b(done);
             a.bind(slow);
         }
@@ -14793,6 +14793,8 @@ fn emit_word_block_unrecorded(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 const INTERP_ARRAY_PROTO: usize = std::mem::offset_of!(crate::interpreter::Interp, array_proto);
+/// The realm's %Object.prototype% (W2e step 3's in-line objects).
+const INTERP_OBJECT_PROTO: usize = std::mem::offset_of!(crate::interpreter::Interp, object_proto);
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -20788,3 +20790,11 @@ mod count_guard_tests;
 ))]
 #[path = "jit_element_store_tests.rs"]
 mod element_store_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_inline_object_tests.rs"]
+mod inline_object_tests;

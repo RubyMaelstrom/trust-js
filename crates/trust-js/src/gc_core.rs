@@ -1205,12 +1205,14 @@ const NO_PAGE: u32 = u32::MAX;
 /// cursor as [`Heap::alloc_small_uninit`] takes it, by code that reads and writes the heap and
 /// the cursor at the offsets of [`inline_alloc`]. The code takes the fast path's steps: it
 /// branches to its slow path (a helper that allocates in Rust) unless the heap allocates fast
-/// ([`Heap::fast_alloc`]), the cursor's word has a free cell and the cell's bytes keep the
-/// allocated bytes at or under the byte check ([`Heap::due_check_bytes`]); then it charges
-/// the bytes, takes the lowest free cell (the page's bitmap bit, the cursor's `taken` and
-/// `high`) and computes its address. Collections run only at safepoints, so the code polls
-/// after it has initialized the cell, as SpiderMonkey's Baseline checks its stack after making
-/// a CallObject in line (jit/BaselineCodeGen.cpp:7059-7080, MacroAssembler.cpp:362-406).
+/// ([`Heap::fast_alloc`]), the cursor's word has a free cell, the cell's bytes keep the
+/// allocated bytes at or under the in-line check ([`Heap::inline_check_bytes`]) and, for the
+/// descriptor whose cells the embedder counts, one more cell keeps the count at or under
+/// `live_check`; then it charges the bytes, counts the cell, takes the lowest free cell (the
+/// page's bitmap bit, the cursor's `taken` and `high`) and computes its address. The in-line
+/// check is zero while a collection is due, so the code then takes its slow path, a helper that
+/// polls: no poll follows an in-line allocation (W2e's design 1; V8, SpiderMonkey and JSC poll in
+/// the miss, which a pending collection forces).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlineAllocSite {
     /// The heap's address: its fields sit at [`inline_alloc`]'s offsets from it.
@@ -1219,6 +1221,9 @@ pub(crate) struct InlineAllocSite {
     pub(crate) cursor: usize,
     /// The size class's cell size.
     pub(crate) cell_size: usize,
+    /// The embedder's live count of the descriptor's cells (a `Cell<i64>`), or 0 when the heap
+    /// counts none of them ([`Heap::count_live`]).
+    pub(crate) live_count: usize,
 }
 
 /// The offsets inline allocation reads and writes ([`InlineAllocSite`]).
@@ -1226,7 +1231,8 @@ pub(crate) mod inline_alloc {
     use std::mem::{offset_of, size_of};
     pub(crate) const HEAP_FAST_ALLOC: usize = offset_of!(super::Heap, fast_alloc);
     pub(crate) const HEAP_ALLOCATED_BYTES: usize = offset_of!(super::Heap, allocated_bytes);
-    pub(crate) const HEAP_DUE_CHECK_BYTES: usize = offset_of!(super::Heap, due_check_bytes);
+    pub(crate) const HEAP_INLINE_CHECK_BYTES: usize = offset_of!(super::Heap, inline_check_bytes);
+    pub(crate) const HEAP_LIVE_CHECK: usize = offset_of!(super::Heap, live_check);
     pub(crate) const HEAP_CURSOR_BASE: usize = offset_of!(super::Heap, cursor_base);
     pub(crate) const CURSOR_SIZE: usize = size_of::<super::Cursor>();
     pub(crate) const CURSOR_FREE: usize = offset_of!(super::Cursor, free);
@@ -1678,6 +1684,10 @@ pub(crate) struct Heap {
     /// allocation recomputes); `usize::MAX` once due (no allocation can make it false; marking,
     /// sweeping and the settings recompute it).
     due_check_bytes: usize,
+    /// The bytes past which generated code's in-line allocation takes its slow path
+    /// ([`InlineAllocSite`]): `due_check_bytes`, but zero while the heap bit is set, so that a
+    /// pending collection sends every in-line allocation to a helper, whose end poll collects.
+    inline_check_bytes: usize,
     stats: GcStats,
     /// Time the phases of each collection into `stats.last_phase_nanos` (diagnostics).
     phase_timing: bool,
@@ -1747,6 +1757,7 @@ impl Heap {
             live_limit: i64::MAX,
             live_check: i64::MAX,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
+            inline_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
             phase_timing: false,
             #[cfg(test)]
@@ -1770,17 +1781,19 @@ impl Heap {
         id
     }
 
-    /// Where generated code takes a cell of `class` for `desc` in line (W2e): `None` for a
-    /// descriptor whose live cells the embedder counts, which inline allocation does not do.
+    /// Where generated code takes a cell of `class` for `desc` in line (W2e), with the
+    /// embedder's live count when it counts `desc`'s cells.
     pub(crate) fn inline_alloc_site(&self, desc: DescId, class: u8) -> Option<InlineAllocSite> {
-        if self.live_count.is_some_and(|(counted, _)| counted == desc) {
-            return None;
-        }
         let class = usize::from(class);
+        let live_count = match self.live_count {
+            Some((counted, count)) if counted == desc => count.as_ptr() as usize,
+            _ => 0,
+        };
         Some(InlineAllocSite {
             heap: std::ptr::from_ref(self) as usize,
             cursor: desc.0 as usize * SIZE_CLASSES.len() + class,
             cell_size: SIZE_CLASSES[class],
+            live_count,
         })
     }
 
@@ -2164,6 +2177,7 @@ impl Heap {
         } else {
             self.live_limit
         };
+        self.inline_check_bytes = if due || over { 0 } else { self.due_check_bytes };
         self.control.poll_words.publish(due || over);
     }
 

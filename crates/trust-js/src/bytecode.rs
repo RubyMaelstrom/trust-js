@@ -2989,6 +2989,8 @@ pub struct Chunk {
     /// Per object-literal site, the template built by its first execution; boxed, since most
     /// sites of a large program never run.
     obj_maps: Vec<std::cell::OnceCell<Box<crate::value::Props>>>,
+    /// Per object-literal template site, the instance header native code copies (W2e step 3).
+    obj_images: Box<[ObjectImage]>,
     /// Per constant array-literal site (`Op::MakeArrayLiteral`), its elements and, from its
     /// first execution, the block its copies share (W2d step 4).
     array_literals: Box<[ArrayLiteralSite]>,
@@ -3152,6 +3154,18 @@ impl crate::gc_trace::GcTrace for ArrayLiteralSite {
     }
 }
 
+/// An object-literal site's instance header for native code to copy (W2e step 3): `ready` once
+/// the site's first execution made its template and the image could be made
+/// ([`crate::value::object_header_image`]), then the header's words, the prototype's word left
+/// for the code to fill. The chunk holds one per template site at a fixed address, which the code
+/// names; its words name the template's layout, which the template keeps alive.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct ObjectImage {
+    pub(crate) ready: std::cell::Cell<u64>,
+    pub(crate) words: [std::cell::Cell<u64>; crate::value::OBJECT_HEADER / 8],
+}
+
 pub(crate) struct RecordGetterPlan {
     fields: [(u32, u32); 8],
     count: usize,
@@ -3218,6 +3232,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             feedback: _,
             feedback_shapes: _,
             obj_maps,
+            obj_images: _, // words naming the templates' layouts, which `obj_maps` traces
             array_literals,
             record_getter: _,
             name_caches: _,
@@ -3287,6 +3302,52 @@ impl crate::gc_trace::GcTrace for Chunk {
 }
 
 impl Chunk {
+    /// Make object-literal template site `tidx`'s image (W2e step 3) once its template exists,
+    /// after an execution that made or used it; a site whose image cannot be made stays unready,
+    /// and native code keeps taking the helper there.
+    #[inline]
+    pub(crate) fn fill_object_image(&self, tidx: u32, proto: crate::value::Gc) {
+        let Some(image) = self.obj_images.get(tidx as usize) else {
+            return;
+        };
+        if image.ready.get() != 0 {
+            return;
+        }
+        self.fill_object_image_cold(image, tidx, proto);
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_object_image_cold(&self, image: &ObjectImage, tidx: u32, proto: crate::value::Gc) {
+        let Some(template) = self.obj_maps.get(tidx as usize).and_then(|map| map.get()) else {
+            return;
+        };
+        if let Some(words) = crate::value::object_header_image(template, Some(proto)) {
+            for (cell, word) in image.words.iter().zip(words) {
+                cell.set(word);
+            }
+            image.ready.set(1);
+        }
+    }
+
+    /// W2e step 3: where native code makes object-literal template site `tidx`'s instance of
+    /// `count` values in line: the cell's allocation site, and the image its first execution
+    /// makes ready (checked at run time, as JSC's baseline code reads its site's profile), unless
+    /// the values would not fit the cell or allocation feedback is recorded (`observe_allocation`).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_object_site(
+        &self,
+        tidx: u32,
+        count: usize,
+    ) -> Option<(crate::gc_core::InlineAllocSite, &ObjectImage)> {
+        if self.feedback.detailed_enabled() {
+            return None;
+        }
+        let image = self.obj_images.get(tidx as usize)?;
+        let class = crate::value::cell_class_for(count)?;
+        Some((crate::value::object_inline_alloc_site(class)?, image))
+    }
+
     /// The block constant array-literal site `site` shares among its copies
     /// (`Op::MakeArrayLiteral`), made at its first execution.
     #[inline]
@@ -3513,6 +3574,7 @@ impl Chunk {
                 obj_maps,
                 std::cell::OnceCell<Box<crate::value::Props>>
             ))
+            .saturating_add(self.obj_images.len() * std::mem::size_of::<ObjectImage>())
             .saturating_add(vec_bytes!(name_caches, std::cell::Cell<NameIc>))
             .saturating_add(vec_bytes!(name_num_bits, std::cell::Cell<u64>))
             .saturating_add(vec_bytes!(name_num_valid, std::cell::Cell<bool>))
@@ -8768,6 +8830,7 @@ fn finish_chunk(
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),
+        obj_images: (0..c.obj_maps).map(|_| ObjectImage::default()).collect(),
         array_literals: c
             .array_literals
             .into_iter()
@@ -19287,7 +19350,10 @@ fn run_vm_inner(
                 let values: Vec<Value> = stack.split_off(at);
                 let keys = &chunk.names[start as usize..start as usize + count as usize];
                 let v = if tidx != u32::MAX {
-                    i.make_plain_object_templated(&chunk.obj_maps[tidx as usize], keys, values)
+                    let value =
+                        i.make_plain_object_templated(&chunk.obj_maps[tidx as usize], keys, values);
+                    chunk.fill_object_image(tidx, i.object_proto);
+                    value
                 } else {
                     i.make_plain_object_vm(keys, values)
                 };
@@ -25203,7 +25269,10 @@ pub(crate) unsafe extern "C" fn jit_make_object(
     let base = sp.sub(count);
     let keys = &chunk.names[start as usize..start as usize + count];
     let v = if tidx != u32::MAX {
-        i.make_plain_object_templated_from(&chunk.obj_maps[tidx as usize], keys, base, count)
+        let value =
+            i.make_plain_object_templated_from(&chunk.obj_maps[tidx as usize], keys, base, count);
+        chunk.fill_object_image(tidx, i.object_proto);
+        value
     } else {
         let mut values = Vec::with_capacity(count);
         for k in 0..count {
@@ -28367,7 +28436,10 @@ unsafe fn jit_exec_inner(
             *sp = base;
             let keys = &chunk.names[start as usize..start as usize + count];
             let v = if tidx != u32::MAX {
-                i.make_plain_object_templated(&chunk.obj_maps[tidx as usize], keys, values)
+                let value =
+                    i.make_plain_object_templated(&chunk.obj_maps[tidx as usize], keys, values);
+                chunk.fill_object_image(tidx, i.object_proto);
+                value
             } else {
                 i.make_plain_object_vm(keys, values)
             };

@@ -3913,14 +3913,118 @@ fn census_dead_scope(cell: *mut u8) {
     }
 }
 
+/// Whether generated code allocates in line (W2e), unless `TRUST_JS_JIT_INLINE_ALLOC=0` turns it
+/// off.
+fn inline_alloc_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("TRUST_JS_JIT_INLINE_ALLOC").as_deref() != Ok("0"))
+}
+
 /// Where generated code takes an environment record's cell of `class` in line in the active
 /// heap (W2e; W3 item 3's step 7), unless `TRUST_JS_JIT_INLINE_ALLOC=0` turns it off.
 pub(crate) fn scope_inline_alloc_site(class: u8) -> Option<crate::gc_core::InlineAllocSite> {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    if !*ENABLED.get_or_init(|| std::env::var("TRUST_JS_JIT_INLINE_ALLOC").as_deref() != Ok("0")) {
+    if !inline_alloc_enabled() {
         return None;
     }
     with_agent_heap(|heap| heap.core.borrow().inline_alloc_site(heap.scope_desc, class))
+}
+
+/// The capacity class whose cell holds a map of `slots` slots (W2d step 3), when one does.
+pub(crate) fn cell_class_for(slots: usize) -> Option<u32> {
+    let class = class_for(slots);
+    (slots <= class_slots(class)).then_some(class)
+}
+
+/// Where generated code takes an object's cell of capacity class `class` in line in the active
+/// heap (W2e step 3), with the heap's live count of objects, unless `TRUST_JS_JIT_INLINE_ALLOC=0`.
+pub(crate) fn object_inline_alloc_site(class: u32) -> Option<crate::gc_core::InlineAllocSite> {
+    if !inline_alloc_enabled() {
+        return None;
+    }
+    let size_class = OBJECT_SIZE_CLASSES[(class as usize).min(2)];
+    with_agent_heap(|heap| {
+        heap.core
+            .borrow()
+            .inline_alloc_site(heap.object_desc, size_class)
+    })
+}
+
+/// The header word of an object's cell that holds its prototype (W2e step 3's images): the
+/// Object ends its `RefCell` ([`check_object_layout`]).
+pub(crate) const OBJECT_PROTO_WORD: usize =
+    (OBJECT_HEADER - std::mem::size_of::<Object>() + std::mem::offset_of!(Object, proto)) / 8;
+const _: () = assert!(
+    (OBJECT_HEADER - std::mem::size_of::<Object>() + std::mem::offset_of!(Object, proto)) % 8 == 0
+);
+
+/// The cell header's words of the instance of the plain-object literal template `template` that
+/// holds its values in its cell, as the helper makes it (`init_instance_plain`, with `proto`), for
+/// generated code to copy (W2e step 3); `None` when the values would not fit the cell or the map
+/// would keep a record (a key index or extras copied from the template). Each field is read from
+/// such an instance and copied at its offset into a zeroed image, so padding stays zero, as does
+/// the kind's payload word, which a plain object's tag leaves unread; the prototype's word
+/// ([`OBJECT_PROTO_WORD`]) is the code's to fill.
+pub(crate) fn object_header_image(
+    template: &Props,
+    proto: Option<Gc>,
+) -> Option<[u64; OBJECT_HEADER / 8]> {
+    use std::mem::{offset_of, size_of};
+    let class = template.entries.class();
+    let count = template.entries.len();
+    if count > class_slots(class) {
+        return None;
+    }
+    let reference = Object::new_built(proto, ObjectKind::Plain, class, |props| {
+        props.init_instance_plain(template, (0..count).map(|_| Value::Undefined))
+    });
+    let cell = Gc::as_ptr(&reference).cast::<u8>();
+    // SAFETY: the fresh reference object, which nothing borrows.
+    let body = unsafe { &*(*Gc::as_ptr(&reference)).as_ptr() };
+    if body.props.entries.record.header().is_some() {
+        return None;
+    }
+    let object = std::ptr::from_ref(body) as usize - cell as usize;
+    debug_assert_eq!(object, OBJECT_HEADER - size_of::<Object>());
+    let props = object + offset_of!(Object, props);
+    let entries = props + offset_of!(Props, entries);
+    let mut image = [0u8; OBJECT_HEADER];
+    let mut copy = |offset: usize, size: usize| {
+        // SAFETY: an initialized field of the live reference cell's header, inside the image.
+        unsafe {
+            std::ptr::copy_nonoverlapping(cell.add(offset), image.as_mut_ptr().add(offset), size)
+        };
+    };
+    // RefCell's borrow word, then the map's fields, its element words and the kind's tag.
+    copy(0, object);
+    copy(
+        entries + offset_of!(NamedEntries, record),
+        size_of::<Record>(),
+    );
+    copy(
+        entries + offset_of!(NamedEntries, layout),
+        size_of::<Option<PropertyLayout>>(),
+    );
+    copy(entries + offset_of!(NamedEntries, len), size_of::<u32>());
+    copy(entries + offset_of!(NamedEntries, shape), size_of::<u32>());
+    copy(entries + offset_of!(NamedEntries, cell), size_of::<u8>());
+    copy(
+        entries + offset_of!(NamedEntries, flags),
+        size_of::<Cell<u8>>(),
+    );
+    copy(
+        entries + offset_of!(NamedEntries, proto_slot),
+        size_of::<Cell<SlotMemo>>(),
+    );
+    copy(
+        entries + offset_of!(NamedEntries, len_slot),
+        size_of::<Cell<SlotMemo>>(),
+    );
+    copy(props + offset_of!(Props, elems), size_of::<DenseStorage>());
+    // `ObjectKind` is repr(u8): a plain object's is its tag byte alone.
+    copy(object + offset_of!(Object, kind), size_of::<u8>());
+    Some(std::array::from_fn(|k| {
+        u64::from_ne_bytes(image[8 * k..8 * k + 8].try_into().expect("a word"))
+    }))
 }
 
 /// A fresh cell for one environment record in the active heap, of the small size class `class`
