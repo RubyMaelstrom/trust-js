@@ -2988,7 +2988,8 @@ impl Object {
     fn alloc_empty(proto: Option<Gc>, kind: ObjectKind, class: u32) -> Gc {
         let mut props = Props::new_in_class(class);
         props.entries.cell = class_slots(class) as u8;
-        with_active_gc_heap(|heap| {
+        // The active Agent's heap by its tag, without the active-heap cell's borrow (W2e step 7).
+        with_agent_heap(|heap| {
             debug_assert!(
                 proto.as_ref().is_none_or(|prototype| {
                     heap.core
@@ -3005,7 +3006,7 @@ impl Object {
     /// shape names (W2d step 3), and move the map's slots into it.
     #[inline(always)]
     fn alloc(proto: Option<Gc>, props: Props, kind: ObjectKind) -> Gc {
-        with_active_gc_heap(|heap| {
+        with_agent_heap(|heap| {
             debug_assert!(
                 proto.as_ref().is_none_or(|prototype| {
                     heap.core
