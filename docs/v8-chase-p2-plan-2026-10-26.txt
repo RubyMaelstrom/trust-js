@@ -11747,3 +11747,28 @@ exit's numbers (the steps' own counts, each against its parent, fat LTO, pacing 
 All met. The steps' gains compound to more than their designs estimated, step 7's most (Vue -1.79%
 against 0.17%: the walks paid for each hop's calls and borrows as well as the table probes).
 Their sum is an approximation; P2's stage end counts W2g's base and main in one session.
+
+### Vue's Proxy reads, measured (addendum to "Vue's gap, by its misses", 2026-11-04)
+
+Candidate 2 sized: a read through a Proxy whose `get` trap forwards to Reflect.get (Vue's
+reactive shape) costs 2,700 instructions; with a trap returning target[key] 2,266; through a
+Proxy without handlers 1,188; from a plain object 123 (a loop of `s += p.x`, instructions an
+iteration, the difference of 1.2M and 200k iterations; target/p2/compact/prx.js; main's engine
+with the getter change, lto/12657b48). Vue's 123,162 proxy reads at about 2,500 instructions
+over a plain read are about 300M instructions, some 17% of Vue's 1.76G: its largest single cost.
+SPE on the Reflect.get loop (one operation in 1,024): generated code 14.6%; the trap called from
+Rust about 15% (call_jit_committed 5.9%, CallbackCache::call_values 2.0%, run_pending_tail 1.8%,
+JitFrame::release 1.8%, RuntimeInterrupt::current_reason 1.4%, activate_agent 1.0%, proxy_get
+2.5%, proxy_get_trap 2.5%); the rooting registry 6.2% (register 3.0%, unregister 3.2%, the
+trap's arguments); Reflect.get's string key looked up by its text about 25% (its closure 5.9%,
+get_named_property_from_slot 5.5%, get_prop_ic_impl 4.4%, get_member_recv_impl 3.5%,
+ic_get_rederive 2.5%, AtomTable::recent 2.2%, atom lookups 3.2%, Props::get 2.0%, the text scans
+1.5%, memcmp 1.4%, property_key_string 1.4%); the [[Get]] invariant's descriptor check 2.3%
+(proxy_get_invariant, proxy_invariant_vacuous); the call helper for Reflect.get 4.6%.
+V8 runs the same read through builtins: the load builtins' proxy case tail-calls ProxyGetProperty
+(src/builtins/builtins-internal-gen.cc:1603, 1673; src/builtins/proxy-get-property.tq:14, with
+its CSA fast path at builtins-proxy-gen.cc:436), which calls the trap as a JavaScript call and
+checks the invariant; Reflect.get is a builtin over an internalized key (builtins/reflect.tq;
+V8 c8b709085e21). Candidate 2 is therefore Vue's first: the trap called from generated code
+(the stub's direct sequence, as the getters' since Decision 17), its arguments rooted by the
+frame rather than the registry, and the key kept as the atom the read already holds.
