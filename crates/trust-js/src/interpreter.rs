@@ -8841,6 +8841,24 @@ impl Interp {
     /// Never infer [[Realm]] from the mutable prototype chain. Indirect eval retains
     /// its special dispatch, and unregistered native sentinels take the generic path.
     pub(crate) fn native_call_in_current_realm(&self, function: &Gc) -> bool {
+        // One realm in one interpreter (W2g step 3): every native function made here is this
+        // realm's (make_callable_object registers it at creation) and no realm's `eval` is tagged
+        // (only a created realm tags its own, `create_realm`), so an ordinary native needs no
+        // probe of either table, as V8, SpiderMonkey and JSC reach a function's realm from the
+        // function. A proxy's callability sentinel and IsHTMLDDA (not `ic_plain`), a second realm
+        // and a ShadowRealm's interpreters take the tables.
+        if !self.multi_realm() && self.single_interpreter() {
+            if let Ok(object) = function.try_borrow() {
+                if object.ic_plain()
+                    && matches!(
+                        object.kind,
+                        ObjectKind::Native(_) | ObjectKind::NativeData(_)
+                    )
+                {
+                    return true;
+                }
+            }
+        }
         let key = Gc::as_ptr(function) as usize;
         if self.eval_realm_fns.contains(&key) {
             return false;
