@@ -8291,3 +8291,120 @@ Exit: `{}`, `[]` and `[1, 2, 3]` at most 100 instructions in W2e's micro-benchma
 most 120; no workload slower beyond noise; collections as before (kinds and counts, within one
 where a trigger falls at a word's boundary); the lib suite, TRUST_JS_GC_VERIFY and GC stress over
 the allocation tests.
+
+### W2e step 8 and the shared stub's heap (record, 2026-11-04)
+
+Commits, from main e288bfd5, on p2-w2e-refill:
+- b195dd87 (step 8): a small cell's bytes, the embedder's live and allocated counts and the
+  statistics are taken from a cursor's `taken` cells when it is flushed (at its next refill, as
+  a collection starts and before a sweep). The fast paths, Rust's and both backends' generated
+  code, take the cell and nothing else; the in-line check, live count and allocated count go
+  from the code, and Heap::inline_check_bytes goes. heap_live_objects and heap_allocated_objects
+  add the cursors' unflushed cells (Heap::unflushed_cells); the heap keeps GcState's allocated
+  count (attach_allocated_count), so Object::alloc and alloc_empty stop counting.
+- 15739ba9: generated code reads the heap through its context's interpreter
+  (Interp::gc_core_raw), not an address built into the code. Step 6's construct sequence is a
+  process-wide shared stub (SharedStub::DirectConstruct), and it built in the heap it was first
+  assembled under: later engines and threads allocated their `this` objects there. Under the lib
+  suite, call_error_name_tests (six engines in turn on one thread) crashed in 2 runs of 16 on
+  main, the stub reading a dropped heap's cursors. The heap's address is now two loads from the
+  context (the immediate was three or four instructions), and a test runs two live engines on
+  one thread and requires each one's in-line `this` objects in its own heap (it fails when the
+  code builds in the heap).
+- 0f56ebc8: in test builds the stub counts its in-line `this` objects through a call (it built
+  in the assembling test thread's counter's address), and Interp's memory inventory classifies
+  the new field.
+
+As designed, except:
+1. The fix, which the step's crash hunt found (the lib suite's SIGSEGV was main's, not the
+   step's).
+2. Six tests read the counts as the step defines them: the budget and live-ceiling tests allow
+   a cursor's word of cells (64) past their threshold, the published-count tests add the
+   unflushed cells, and jit::poll_tests' overshoot bounds allow a word of 64-byte cells.
+
+Micro-benchmarks (instructions an iteration over the loop's 18, against main e288bfd5, fat LTO,
+2M iterations of a function's loop; the base column is W2e's, 13645c27):
+
+| script | W2e's base | main | tip |
+| --- | --- | --- | --- |
+| `{}` | 309.4 | 106.2 | 84.7 |
+| `{x: i, y: i}` | 347.6 | 124.8 | 103.2 |
+| five keys | 385.3 | 153.5 | 131.9 |
+| `[]` | 356.5 | 109.0 | 87.4 |
+| `[1, 2, 3]` (shared) | 345.6 | 109.0 | 87.5 |
+| `[i, i]` | 532.6 | 204.0 | 174.9 |
+| `new P(x, y)` | 682.8 | 544.7 | 523.4 |
+| a function expression | 1,061 | 1,056.8 | 1,007.4 |
+| an arrow | 762 | 760.0 | 721.8 |
+| returning `arguments` | 1,761 | 1,760.6 | 1,708.2 |
+| a rest array | 785 | 784.7 | 732.6 |
+| a plain call | 231 | 231.2 | 231.2 |
+
+Each in-line object takes 21.5 fewer: the byte charge and its check, the live count and its check,
+the allocated count, and the heap's immediate for two loads. Rust's allocations lose the same
+counts (a closure's three cells -49, an `arguments` object or rest array and its block -52). W2e's
+exit bounds are met: 85-88 for `{}`, `[]` and `[1, 2, 3]` (bound 100), 103 for `{x, y}` (120).
+
+Counts against main e288bfd5 (fat LTO, CPUs 10-13, pacing off, median of 3):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,825,458,925 | 1,824,201,034 | -0.07% |
+| React | 318,425,048 | 317,049,360 | -0.43% |
+| Djot | 643,126,720 | 637,013,602 | -0.95% |
+| chai | 81,638,968,256 | 80,755,711,187 | -1.08% |
+| Richards | 136,870,847 | 136,619,978 | -0.18% |
+| DeltaBlue | 263,079,864 | 262,593,969 | -0.18% |
+| Crypto | 730,079,723 | 729,918,422 | -0.02% |
+| RayTrace | 1,019,354,616 | 1,011,651,285 | -0.76% |
+| EarleyBoyer | 3,220,537,020 | 3,212,540,780 | -0.25% |
+| RegExp | 2,802,828,365 | 2,778,783,446 | -0.86% |
+| Splay | 1,424,565,225 | 1,401,778,550 | -1.60% |
+| NavierStokes | 451,909,451 | 451,736,504 | -0.04% |
+| PdfJS | 7,905,507,287 | 7,815,671,868 | -1.14% |
+| Mandreel | 62,959,464,617 | 62,958,464,418 | -0.00% |
+| Gameboy | 21,491,532,300 | 21,519,178,751 | +0.13% |
+| CodeLoad | 483,730,050 | 483,901,080 | +0.04% |
+| Box2D | 4,494,365,132 | 4,483,111,018 | -0.25% |
+| zlib | 138,040,551,422 | 138,040,867,777 | +0.00% |
+| TypeScript | 59,121,830,567 | 58,998,626,330 | -0.21% |
+
+Splay -1.60%, PdfJS -1.14%, chai -1.08%, Djot -0.95%, RegExp -0.86%, RayTrace -0.76%, React
+-0.43%, EarleyBoyer and Box2D -0.25%, TypeScript -0.21%, Richards and DeltaBlue -0.18%; Gameboy
++0.13%, CodeLoad +0.04%, the rest within 0.07%. Gameboy allocates little. Its two profiles
+(perf, user instructions sampled, both builds) differ most in an address-keyed table's probe:
+Interp::module_ns, which the ordinary-get check asks
+(side_table_non_typed_ordinary_get_ptr), 1.73% of the samples on main and 1.92% on the tip.
+Its probe lengths follow where objects land, which the step moves; W2g takes such tables into
+the objects' payloads.
+
+Collections (TRUST_JS_GC_LOG=1, pacing off; target/p2/w2e/refill/gccount.sh), minor and major,
+main against the tip:
+
+| workload | minor | major |
+| --- | --- | --- |
+| Vue | 9, 9 | 0, 0 |
+| React | 5, 5 | 0, 0 |
+| Djot | 11, 10 | 0, 0 |
+| sustained | 106, 105 | 2, 2 |
+| chai | 1,030, 1,013 | 1, 1 |
+| Splay | 56, 55 | 4, 4 |
+| PdfJS | 139, 132 | 5, 5 |
+| TypeScript | 509, 485 | 7, 7 |
+| EarleyBoyer | 67, 67 | 8, 8 |
+| RayTrace, DeltaBlue, Box2D, Gameboy | 21, 2, 19, 25: the same | 0, 0, 0, 4: the same |
+
+Majors are the same everywhere. Minors fall on chai (-1.7%), PdfJS (-5.0%) and TypeScript
+(-4.7%), and by one on Djot, the sustained workload and Splay: the nursery's trigger now fires
+at the refill after the budget, so each minor collects the cursors' unflushed cells beyond it,
+and the minors are fewer and larger. They promote the same bytes in all (TypeScript 616.1 and
+616.0 MB, PdfJS 40.0 and 39.6, chai 13.4 and 13.4). The design's exit asked for the counts
+within one; three workloads are outside it, in this direction, which JSC's charge also takes.
+
+Checks on 0f56ebc8: the lib suite with the embed feature on ARM64 (2,760 and the inventory test,
+which 0f56ebc8 fixes; the allocation, poll, count and two-engine tests again after it) and x86-64
+(zombie, 2,542); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8,
+53,575 of 53,575 and identical to main's report; the fixtures' masked output as main's; difftest
+138 agree, 12 skipped (budget); call_error_name_tests 16 runs of 16 (main crashed in 2 of 16).
+
+Next: step 7 (closures), then W2e's exit.
