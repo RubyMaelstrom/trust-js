@@ -169,6 +169,15 @@ impl FunctionRuntimeCache {
         if self.primary.heap.id == id {
             return RuntimeLease::Primary(&self.primary);
         }
+        self.current_foreign(id)
+    }
+
+    /// [`FunctionRuntimeCache::current`] for a heap other than the primary entry's, out of the
+    /// primary lookup's line: in line, its search and pruning made every lease save the
+    /// callee-saved registers (W2e step 7).
+    #[cold]
+    #[inline(never)]
+    fn current_foreign(&self, id: u64) -> RuntimeLease<'_> {
         let mut foreign = self.foreign.borrow_mut();
         let foreign = &mut foreign.get_or_insert_with(Box::default).entries;
         if let Some(entry) = foreign.iter().find(|entry| entry.heap.id == id) {
