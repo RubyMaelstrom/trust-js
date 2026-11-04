@@ -9698,11 +9698,12 @@ fn jit_small_packed_array_reads_and_writes_stay_native() {
         function read(a){return a[0]+a[1]+a[2];}
         function write(a,v){a[1]=v;return a[0]*a[1]+a[2];}
         var small; for(var n=0;n<200;n++){small=make();read(small);write(small,2);}
-        small=make(); 'ok'
+        small=make(); small[0]=1; 'ok'
     "#
         ),
         "ok"
     );
+    // A private copy (the write above copied the literal's shared block, W2d step 4).
     crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(0));
     crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(0));
     assert_eq!(
@@ -9719,6 +9720,24 @@ fn jit_small_packed_array_reads_and_writes_stay_native() {
     assert_eq!(
         crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.get()),
         0
+    );
+    // A fresh copy shares the block: reads stay native, its first write copies the block in
+    // the helper, and the writes after it stay native.
+    run_in(&mut engine, "small=make(); 'ok'");
+    crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.set(0));
+    crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.set(0));
+    assert_eq!(
+        run_in(
+            &mut engine,
+            "read(small)+':'+write(small,0.5)+':'+write(small,2)+':'+read(small)"
+        ),
+        "6:3.5:5:6"
+    );
+    assert_eq!(
+        crate::bytecode::TEST_JIT_EXEC_ELEMENT_HELPERS.with(|count| count.get())
+            + crate::bytecode::TEST_JIT_SET_ELEM_HELPERS.with(|count| count.get()),
+        1,
+        "one helper call, the first write's"
     );
 }
 

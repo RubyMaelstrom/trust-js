@@ -280,8 +280,10 @@ fn numeric_array_alias_writes_revalidate_integer_facts_before_dependent_arithmet
                     let mut engine = Engine::new();
                     engine.set_tier(tier);
                     engine.set_tier_threshold(0);
+                    // A written copy: the literal's shared block (W2d step 4) would keep the
+                    // storing region out until a plain iteration copied it.
                     let make = if packed {
-                        "return [1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1];"
+                        "var p=[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1];p[0]=1;return p;"
                     } else {
                         "let a=[];for(let k=0;k<16;k++)a[k]=1;return a;"
                     };
@@ -350,7 +352,7 @@ fn numeric_array_nested_loops_and_checked_gc_exits_preserve_owners_and_writes() 
         eval(
             &mut engine,
             r#"
-            function make(){return [1,1,1,1,1,1,1,1];}
+            function make(){var p=[1,1,1,1,1,1,1,1];p[0]=1;return p;}
             var a=make(),saved=a; a.self=a;
             function nested(a,b){let sum=0;for(let p=0;p<3;p++){
                 for(let k=0;k<8;k++){b[k]=0.5;sum+=(a[k]*2)|0;}
