@@ -11452,3 +11452,113 @@ property_read_tests::record_getter_specialization_returns_fresh_live_records; no
 
 Checks at 12657b48: ARM64 lib 2,767 passed, 9 ignored; x86-64 (zombie) 2,548 passed, 9 ignored,
 clippy -D warnings in the three configurations.
+
+### W2g step 4: a RegExp's program in the object (record, 2026-11-04)
+
+Commit, from main 2919fb80, on p2-w2g-rest (an agent's; worktree target/p2/w2g-rest-wt), landed on
+main as 35367c78 over c80a966b, whose code is 861649a5's plus the getter change (12657b48, which
+touches only property_read.rs's accessor path; measured apart):
+- 861649a5 (measured as 9b213dfe before the rebase onto 2919fb80; crates/ identical): a RegExp's
+  [[RegExpMatcher]], [[OriginalSource]] and [[OriginalFlags]], the shared compiled program
+  (regex::Regex, which holds the source and the flags), are its object's payload:
+  ObjectKind::RegExp(PayloadBox<Rc<Regex>>), tag 19, inside KIND_ORDINARY_LAST, so the property
+  caches keep admitting a RegExp. `lastIndex` stays the own data property at the slot
+  RegExpAlloc's shape gives it (W5a item 3's builtins part). Every reader takes the program from
+  the object: the flag and source getters, exec and its direct paths, the RegExp protector's
+  receivers (intrinsic_regexp), IsRegExp, the constructor's pattern, compile(), the
+  replace-discarding path and Object.prototype.toString's tag; compile() replaces the payload's
+  program through the object's mutable borrow. The regexps table, the pin per RegExp, their
+  eviction and the super() graft's table move go (the kind moves with the other payload kinds);
+  the payload cell's finalizer drops the program's reference. The memory inventory counts the
+  program per object (each shared program once).
+
+As designed (A1: V8, SpiderMonkey and JSC keep a RegExp's program and lastIndex in the object).
+
+Where the build differs from the design:
+1. set_throw's own-data-property path, which every exec's `lastIndex` write takes, admitted only
+   the kinds without exotic state (exotic_is_none); it admits the ordinary payload kinds
+   (is_ordinary) now, or a RegExp, once a Plain object, would have lost it. The
+   replace-discarding path's exotic test goes for the same reason. Other fast paths that admit
+   exotic_is_none alone (CopyDataProperties, Object.keys/values/entries, Object.assign's) were
+   left: a RegExp is rarely their source.
+2. A ShadowRealm's RegExp no longer keeps the realm's interpreter alive (its pin went), as for
+   buffers in step 2: agent_kept_prototype_null_buffers_and_regexps_need_no_realm takes the
+   RegExp case from agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire.
+3. Tests: the root-pin record test (a_minor_collection_reports_no_pins_of_the_root_interpreter)
+   uses WeakMaps, the old-native-owner fixture a pin alone; jit_layout_tests checks that every
+   ordinary payload kind (WeakMap, WeakSet, ArrayBuffer, SharedArrayBuffer, DataView, RegExp)
+   has a tag between Collection's and KIND_ORDINARY_LAST. Interp's inventory has one field fewer
+   (138).
+
+Per operation (instructions an iteration: the difference of 1.2M and 200k iterations over 1M,
+least of 3; target/p2/w2g/rest-micro; base main 2919fb80's engine (27c53db6's binary), the tip
+9b213dfe, fat LTO):
+
+| operation | base | tip | change |
+| --- | --- | --- | --- |
+| a RegExp literal's evaluation | 1,124.1 | 918.2 | -205.9 (-18.3%) |
+| `new RegExp` of a cached source | 2,879.1 | 2,672.2 | -206.9 (-7.2%) |
+| exec of a global RegExp (and its lastIndex) | 2,331.6 | 2,320.7 | -10.9 (-0.5%) |
+| test of a non-global RegExp | 1,983.6 | 1,969.6 | -14.0 (-0.7%) |
+| String.prototype.replace with a global RegExp | 3,958.1 | 3,944.1 | -14.0 (-0.4%) |
+| `flags` and `source` | 13,770.5 | 13,417.5 | -353.0 (-2.6%) |
+
+A creation loses the table insert, the pin and the collector's eviction (the census's model:
+21% of a literal's 1,124); a read of the program, one probe for a borrow of the object (the
+`flags` getter reads eight flag getters' programs and `source` one).
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; base 27c53db6, the tip
+9b213dfe; the last column with collections suppressed, where run):
+
+| workload | base | tip | collections suppressed |
+| --- | --- | --- | --- |
+| Vue | 1,755,737,546 | -0.07% | -0.07% |
+| React | 315,985,340 | -0.00% | |
+| Djot | 633,104,977 | -0.30% | -0.53% |
+| chai | 79,510,761,889 | -0.16% | -0.78% |
+| Richards | 136,258,074 | -0.00% | |
+| DeltaBlue | 261,433,809 | -0.00% | |
+| Crypto | 728,900,682 | +0.00% | |
+| RayTrace | 994,496,119 | +0.00% | |
+| EarleyBoyer | 3,201,629,266 | +0.00% | -0.00% |
+| RegExp | 2,776,528,645 | -1.33% | -5.53% |
+| Splay | 1,401,435,384 | +0.00% | |
+| NavierStokes | 451,451,426 | -0.00% | |
+| PdfJS | 7,676,233,096 | -0.01% | |
+| Mandreel | 62,939,192,022 | +0.00% | |
+| Gameboy | 21,130,530,442 | -0.00% | |
+| CodeLoad | 482,404,067 | -0.04% | -0.01% |
+| Box2D | 4,475,979,558 | -0.01% | -0.01% |
+| zlib | 138,039,277,875 | -0.00% | |
+| TypeScript | 58,758,622,363 | +0.01% | -0.00% |
+
+Octane RegExp -1.33% (the design's estimate: 1.18%; the exit's -1.0% with W5a item 3), chai
+-0.16% (0.12%), Djot -0.30% (0.17%). With collections suppressed the base's regexps table and
+pins, no longer evicted, grow to every RegExp the run makes and rehash as they grow, which the
+tip does not have: those columns overstate the step (RegExp -5.53%, chai -0.78%) and are not
+the mutator's share. Octane RegExp's collections are 49 minor and no major in both
+(TRUST_JS_GC_LOG); the eviction's share of them goes from 5.8 ms to 0.4 ms over the run (one run
+each, times as an indication only).
+
+Code dumps (the gate's three modes over the fixtures): no chunk changes size; a comparison build
+of the tip with step 2's Interp layout and descriptor order (target/p2/w2g/rest-layout/
+patch-step4.py: the removed table re-declared, the RegExp descriptor registered last) dumps the
+fixtures exactly as step 2's tip does in all three modes (0 differing chunks).
+
+GC: the payload holds no edge and is reported in the object's trace. Under TRUST_JS_GC_STRESS=1000
+and at 10, with TRUST_JS_GC_VERIFY=1, the 146 lib tests whose bodies make RegExps or name the
+matcher (target/p2/w2g/rest-stress/names-step4.txt), each in its own process, pass.
+Test262's RegExp suites but its property escapes (generated over the code points: the matcher's
+tables, not the object's state), Annex B's RegExp tests, the RegExp literals and String's match,
+matchAll, replace, replaceAll, search and split (1,905 tests; a dev-profile test262-runner at
+861649a5) pass at stress 1000 in the default tier, and at --tier=jit threshold 0 but for
+annexB/built-ins/RegExp/RegExp-leading-escape-BMP.js, which times out in the runner's 60-second
+window: without the window it passes at base's runner (step 2's tip) in 89 s and at the tip's in
+93 s (one run each, beside each other).
+
+Checks at 9b213dfe (crates/ as 861649a5):
+- lib: ARM64 2,767 passed, 9 ignored; x86-64 (zombie) 2,548 passed, 9 ignored; clippy -D warnings
+  in the three configurations on both (ARM64 on an export of 861649a5).
+- The release gate, on an export of 861649a5: the fixtures' masked output as the base's;
+  difftest 138 agree, 12 skipped (budget); Test262 at --tier=jit threshold 8, 53,575 of 53,575
+  and identical to the base's report.
