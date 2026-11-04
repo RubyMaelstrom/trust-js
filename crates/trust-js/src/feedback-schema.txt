@@ -258,7 +258,9 @@ body to the function's baseline chunk, a splice's to its callee's baseline chunk
 read the same AST, the function's own body around its splices and each splice from its callee's
 body, so within one origin (the function's own body, or one splice, told apart by its position
 in the caller) the k-th operation of a kind is the k-th of that kind in the origin's baseline
-chunk; a kind whose count differs between the two stays unmapped in that origin. (Source
+chunk; a kind whose count differs between the two stays unmapped in that origin. The map is made
+at the second-stage compile by two passes and a counting sort by kind code (bytecode.rs
+mapped_kind), no hashing. (Source
 positions would not do: the compiler attributes them to the nodes that can throw a located
 error, calls and property accesses, not to arithmetic.) One u32 a pc (the target's index in bits
 24-31, its pc in 0-23), and the targets, which the map keeps alive. The transformed chunk's

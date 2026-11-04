@@ -6678,13 +6678,103 @@ fn mapped_operation(op: &Op) -> bool {
         || named_site_cache(op).is_some()
 }
 
+/// A code for each kind of operation the record map names, one a variant (0: not named): the
+/// map groups operations by kind with arrays of counts, not hash maps.
+fn mapped_kind(op: &Op) -> usize {
+    match op {
+        Op::Add => 1,
+        Op::Sub => 2,
+        Op::Mul => 3,
+        Op::Div => 4,
+        Op::Mod => 5,
+        Op::BitAnd => 6,
+        Op::BitOr => 7,
+        Op::BitXor => 8,
+        Op::Shl => 9,
+        Op::Shr => 10,
+        Op::UShr => 11,
+        Op::GenBin(..) => 12,
+        Op::Neg => 13,
+        Op::Plus => 14,
+        Op::BitNot => 15,
+        Op::UpdateLocal(..) => 16,
+        Op::UpdateCap(..) => 17,
+        Op::UpdateName(..) => 18,
+        Op::UpdateNameCached(..) => 19,
+        Op::UpdateConst(..) => 20,
+        Op::UpdatePrivate(..) => 21,
+        Op::SuperUpdate(..) => 22,
+        Op::UpdateProp(..) => 23,
+        Op::UpdateElem(..) => 24,
+        Op::Lt => 25,
+        Op::Gt => 26,
+        Op::Le => 27,
+        Op::Ge => 28,
+        Op::GetElem => 29,
+        Op::GetElemLocal(..) => 30,
+        Op::GetMethodElem => 31,
+        Op::SetElem => 32,
+        Op::SetElemDrop => 33,
+        Op::SetElemLocal(..) => 34,
+        Op::SetElemLocalDrop(..) => 35,
+        Op::GetProp(..) => 36,
+        Op::GetPropThis(..) => 37,
+        Op::GetPropLocal(..) => 38,
+        Op::GetMethod(..) => 39,
+        Op::SetProp(..) => 40,
+        Op::SetPropDrop(..) => 41,
+        Op::SetPropThisDrop(..) => 42,
+        Op::SetPropLocalDrop(..) => 43,
+        Op::AppendProp(..) => 44,
+        _ => 0,
+    }
+}
+
+/// The kind codes' count (0 included).
+const MAPPED_KINDS: usize = 45;
+
+/// A chunk's named operations grouped by kind, each group in pc order (a counting sort): kind
+/// k's pcs are `pcs[start[k]..start[k + 1]]`.
+struct KindIndex {
+    start: [u32; MAPPED_KINDS + 1],
+    pcs: Vec<u32>,
+}
+
+impl KindIndex {
+    fn new(ops: &[Op]) -> Self {
+        let mut start = [0u32; MAPPED_KINDS + 1];
+        for op in ops {
+            start[mapped_kind(op) + 1] += 1;
+        }
+        start[1] = 0; // kind 0, the operations the map does not name, keeps no pcs
+        for k in 1..=MAPPED_KINDS {
+            start[k] += start[k - 1];
+        }
+        let mut fill = start;
+        let mut pcs = vec![0; start[MAPPED_KINDS] as usize];
+        for (pc, op) in ops.iter().enumerate() {
+            let kind = mapped_kind(op);
+            if kind != 0 {
+                pcs[fill[kind] as usize] = pc as u32;
+                fill[kind] += 1;
+            }
+        }
+        Self { start, pcs }
+    }
+
+    fn count(&self, kind: usize) -> u32 {
+        self.start[kind + 1] - self.start[kind]
+    }
+}
+
 /// A transformed chunk's record map (W4 step 7): each of its value, element and named operations
 /// to the baseline site it was compiled from. The second stage compiles the same AST, the
 /// function's own body around its splices and each splice from its callee's body, so within one
 /// origin (the function's own body, or one splice) the k-th operation of a kind is the k-th of
 /// that kind in the origin's baseline chunk (the function's, or the callee's). A kind whose count
 /// differs between the two is left unmapped in that origin, as is an origin without a baseline
-/// chunk. None without the function's baseline chunk.
+/// chunk. None without the function's baseline chunk. Two passes over the operations and a
+/// counting sort of each target's, made at every second-stage compile.
 fn transformed_record_map(
     source: Option<&Function>,
     hot: &Chunk,
@@ -6693,8 +6783,6 @@ fn transformed_record_map(
     inline_targets: &[InlineTarget],
 ) -> Option<crate::feedback::RecordMap> {
     use crate::feedback::RecordMap;
-    use std::collections::HashMap;
-    use std::mem::Discriminant;
     let baseline = source?.runtime().code.get()?.as_ref()?.clone();
     if !std::ptr::eq(&*baseline, hot) {
         return None;
@@ -6719,53 +6807,75 @@ fn transformed_record_map(
             targets.push(chunk);
         }
     }
-    // Each target's mapped operations by kind, in order.
-    let kinds: Vec<HashMap<Discriminant<Op>, Vec<u32>>> = targets
+    let indexes: Vec<KindIndex> = targets
         .iter()
-        .map(|chunk| {
-            let mut kinds: HashMap<Discriminant<Op>, Vec<u32>> = HashMap::new();
-            for (pc, op) in chunk.ops.iter().enumerate() {
-                if mapped_operation(op) {
-                    kinds
-                        .entry(std::mem::discriminant(op))
-                        .or_default()
-                        .push(pc as u32);
-                }
-            }
-            kinds
-        })
+        .map(|chunk| KindIndex::new(&chunk.ops))
         .collect();
-    // The transformed chunk's mapped operations by origin and kind, in order.
-    let mut sources: HashMap<((u32, u32), Discriminant<Op>), Vec<usize>> = HashMap::new();
+    // The origins (the own body, each splice), with their operations' counts by kind, then,
+    // where a kind's count is its target's, the next ordinal (u32::MAX: the kind stays unmapped).
+    type Instance = ((u32, u32), Option<usize>, [u32; MAPPED_KINDS]);
+    fn find(
+        instances: &mut Vec<Instance>,
+        target_of: &[Option<usize>],
+        origin: (u32, u32),
+        last: &mut usize,
+    ) -> usize {
+        if instances
+            .get(*last)
+            .is_some_and(|instance| instance.0 == origin)
+        {
+            return *last;
+        }
+        *last = match instances.iter().position(|instance| instance.0 == origin) {
+            Some(index) => index,
+            None => {
+                let target = if origin.0 == u32::MAX {
+                    Some(0)
+                } else {
+                    target_of.get(origin.0 as usize).copied().flatten()
+                };
+                instances.push((origin, target, [0; MAPPED_KINDS]));
+                instances.len() - 1
+            }
+        };
+        *last
+    }
+    let mut instances: Vec<Instance> = Vec::new();
+    let origin_of = |pc: usize| origins.get(pc).copied().unwrap_or((u32::MAX, NO_POSITION));
+    let mut last = 0;
     for (pc, op) in ops.iter().enumerate() {
-        if mapped_operation(op) {
-            let origin = origins.get(pc).copied().unwrap_or((u32::MAX, NO_POSITION));
-            sources
-                .entry((origin, std::mem::discriminant(op)))
-                .or_default()
-                .push(pc);
+        let kind = mapped_kind(op);
+        debug_assert_eq!(kind != 0, mapped_operation(op), "{op:?}");
+        if kind != 0 {
+            let instance = find(&mut instances, &target_of, origin_of(pc), &mut last);
+            instances[instance].2[kind] += 1;
+        }
+    }
+    for (_, target, counts) in instances.iter_mut() {
+        for (kind, count) in counts.iter_mut().enumerate() {
+            let matches = target.is_some_and(|target| indexes[target].count(kind) == *count);
+            *count = if matches { 0 } else { u32::MAX };
         }
     }
     let mut pcs = vec![RecordMap::UNMAPPED; ops.len()];
-    for (((inline_target, _), kind), transformed) in &sources {
-        let target = if *inline_target == u32::MAX {
-            Some(0)
-        } else {
-            target_of.get(*inline_target as usize).copied().flatten()
-        };
-        let Some(target) = target else {
-            continue;
-        };
-        let Some(baseline) = kinds[target].get(kind) else {
-            continue;
-        };
-        if baseline.len() != transformed.len() {
+    for (pc, op) in ops.iter().enumerate() {
+        let kind = mapped_kind(op);
+        if kind == 0 {
             continue;
         }
-        for (&pc, &target_pc) in transformed.iter().zip(baseline) {
-            if target_pc as usize <= RecordMap::MAX_PC {
-                pcs[pc] = RecordMap::encode(target, target_pc as usize);
-            }
+        let instance = find(&mut instances, &target_of, origin_of(pc), &mut last);
+        let (_, target, ordinals) = &mut instances[instance];
+        let (Some(target), ordinal) = (*target, ordinals[kind]) else {
+            continue;
+        };
+        if ordinal == u32::MAX {
+            continue;
+        }
+        ordinals[kind] += 1;
+        let index = &indexes[target];
+        let target_pc = index.pcs[(index.start[kind] + ordinal) as usize] as usize;
+        if target_pc <= RecordMap::MAX_PC {
+            pcs[pc] = RecordMap::encode(target, target_pc);
         }
     }
     Some(RecordMap::new(
