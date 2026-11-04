@@ -8250,3 +8250,44 @@ x86-64 keeps the helpers for steps 3-6: its backend is a template backend that c
 helpers for most operations, and its in-line objects wait for its templates (a follow-up).
 
 Next: step 7 (closures' helper) and step 8 (counts at the cursor's flush).
+
+### W2e step 8: counts at the cursor's flush (design, 2026-11-04)
+
+Today every small cell's allocation charges its bytes and compares them with a check: Rust's
+fast paths (Heap::alloc_cell, alloc_small_uninit) against due_check_bytes, generated code
+(emit_inline_alloc, both backends) against inline_check_bytes. An object also adds one to the
+embedder's live count, compared with live_check, and one to GcState's allocated count (Rust's
+Object::alloc and alloc_empty, and generated code). In generated code these are 21 of an
+in-line object allocation's 52 instructions.
+
+None of the exemplars counts per cell (A2). V8 charges a whole LAB when it installs it
+(main-allocator.cc:288-293). JSC charges a block's consumed free list at the refill that follows
+its exhaustion (heap/LocalAllocator.cpp:137-139, then collectIfNecessaryOrDefer at 143): after the
+fact. SpiderMonkey charges 4 KiB per new arena (gc/Allocator.cpp:483-504).
+
+Design (JSC's after-the-fact charge, at a cursor word's granularity):
+1. A cursor's cells are counted when it is flushed (Heap::flush_cursor, which already brings the
+   page's `live` and `next_unused` up to date from `taken`): their bytes charged, with the
+   budget's compare (charge_bytes), the embedder's live count with its compare, the objects'
+   allocated count, and the statistics (count_cells). A cursor is flushed at every refill (a
+   bitmap word: at most 64 cells), as a collection starts and before a sweep.
+2. The fast paths take the cell (its bitmap bit, `taken`, `high`) and nothing else. Generated code
+   keeps its fast_alloc test (stress, collecting) and drops the charge, the live count and the
+   allocated count; Heap::inline_check_bytes goes.
+3. A collection that becomes due between refills (external bytes, a request, the live ceiling
+   from another path) runs at the next poll: function entry, loop back edges, a helper's end
+   (A3's requested collections). A budget's trigger fires at most one word of cells late per
+   cursor (64 cells, at most a 64 KiB page: 12 KiB in the 192-byte class), against today's exact
+   cell; JSC's is one block (16 KiB) late per allocator, V8's one LAB early.
+4. Exact reads: the engine's reads of the live and allocated counts (heap_live_objects,
+   heap_allocated_objects: the task boundary's policy, the agent's trigger, tests) add the counted
+   descriptor's unflushed `taken`; the sweep's checks (GC byte accounting, live-cell accounting)
+   follow flush_cursors, as now. Under GC stress and during a collection every allocation takes
+   the slow path, which flushes its cursor at once, so stress intervals stay exact.
+5. GcState's allocated count is kept by the heap: a second count attached with the live one
+   (the same descriptor), so Object::alloc and alloc_empty stop counting.
+
+Exit: `{}`, `[]` and `[1, 2, 3]` at most 100 instructions in W2e's micro-benchmarks, `{x, y}` at
+most 120; no workload slower beyond noise; collections as before (kinds and counts, within one
+where a trigger falls at a word's boundary); the lib suite, TRUST_JS_GC_VERIFY and GC stress over
+the allocation tests.
