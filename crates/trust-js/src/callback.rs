@@ -97,6 +97,11 @@ impl CallbackCache {
         }
     }
 
+    /// Call(callee, this, args) with an argument array of the caller's own: the array and `this`
+    /// are words of this native frame for the whole call, its polls and its tail drain, where
+    /// the conservative stack scan roots them (Decision 0), as `Interp::call_getter`'s window and
+    /// `Callback::call`'s prepared entry are. So the call makes no entry in the rooting registry;
+    /// a Proxy trap's arguments come this way.
     pub(crate) fn call<const N: usize>(
         &self,
         interp: &mut Interp,
@@ -104,7 +109,12 @@ impl CallbackCache {
         this: Value,
         args: [Value; N],
     ) -> Result<Value, Abrupt> {
-        self.call_values(interp, callee, this, &args)
+        if interp.tier != Tier::Jit {
+            return interp.call(*callee, this, &args);
+        }
+        // SAFETY: `args` and `this` stay in this frame, unchanged, until the call returns.
+        unsafe { self.call_window(interp, callee, &this, &args) }
+            .unwrap_or_else(|| interp.call(*callee, this, &args))
     }
 
     pub(crate) fn call_values(
@@ -122,23 +132,39 @@ impl CallbackCache {
         // generic fallback, post-call polls and pending tails, without copying the window.
         let _arguments = crate::rooting::root_slice(args);
         let this_word = this;
-        let words = args;
         // SAFETY: the original evaluated argument window stays borrowed until the committed
         // call (including polls and tails) returns. Nothing mutates or pools it here.
-        let result = unsafe {
+        unsafe { self.call_window(interp, callee, &this_word, args) }
+            .unwrap_or_else(|| interp.call(*callee, this, args))
+    }
+
+    /// The cached and the guarded compiled call of `callee` on `this` and `args`, or `None` for
+    /// the generic call.
+    ///
+    /// # Safety
+    /// `*this` and `args` are rooted by the caller (its native frame, or a registry entry for a
+    /// Rust-heap window) and stay unchanged until the call, its polls and its tail drain return.
+    #[inline(always)]
+    unsafe fn call_window(
+        &self,
+        interp: &mut Interp,
+        callee: &Value,
+        this: &Value,
+        args: &[Value],
+    ) -> Option<Result<Value, Abrupt>> {
+        unsafe {
             interp
-                .call_jit_cached(&self.site, callee, &this_word, words.as_ptr(), words.len())
+                .call_jit_cached(&self.site, callee, this, args.as_ptr(), args.len())
                 .or_else(|| {
                     interp.call_jit_fast(
                         callee,
-                        &this_word,
-                        words.as_ptr(),
-                        words.len(),
+                        this,
+                        args.as_ptr(),
+                        args.len(),
                         Some((&self.site, &self.pins)),
                     )
                 })
-        };
-        result.unwrap_or_else(|| interp.call(*callee, this, args))
+        }
     }
 
     pub(crate) fn prune_dead(&self) {
