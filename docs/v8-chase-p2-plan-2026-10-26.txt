@@ -676,6 +676,16 @@ Work P2 tried or found that belongs with Phase 3's speculative tier (docs/v8-cha
     activation discards the code it runs and finishes in it.
   The fused typed-array access's fallbacks were never counted: counting them called the helper
   while x14 still held the pointer that the value-miss path reads.
+- A filtering write barrier (W2f's census, under "Stage records"). TRust's barrier records every
+  written cell, young ones too, so a minor collection walks the old cells of every young page
+  written since the last one and traces old cells that hold no young cell: the card pass is up to
+  13.6% of minor time and 1.0% of EarleyBoyer's run at the default pacing (14.7% and 1.6% with
+  pacing off), TypeScript 9.5%, Box2D 8.6%, and 64-100% of the card cells have no young edge. V8
+  and SpiderMonkey filter by the value's youth and the holder's age, JSC by the holder's state
+  byte alone, on a non-moving heap with sticky marks like TRust's. The price is a load and a
+  branch at every barrier site (ten on ARM64, three on x86-64, and Rust's mutable borrows), which
+  W2f's census did not count: the next attempt counts barrier executions and the card cells
+  actually written first, and evaluates JSC's cell state first.
 
 ## Stage records
 
@@ -8670,3 +8680,209 @@ skipped (budget).
 
 Left for later: the in-line closure (three cells and the kind payload); the deferred prototype's
 cell, which needs materialization to know its owner.
+
+### W2f: a chunk-level card summary, closed by its census (census, survey and record, 2026-11-04)
+
+W2f as planned: one more barrier store, a summary byte per chunk of pages, so that a minor
+collection skips the page summaries of clean chunks. Census and survey on main e288bfd5 (whose
+engine is 1037fefd's), an agent's. W2f closes with this record and no barrier change (below).
+
+What the barrier and the scan are now:
+- The barrier stores two bytes from the cell's address alone, with no load and no branch: the
+  card of the cell's start in the 512-byte table that ends its 64 KiB page, and the page's summary,
+  the table's last byte (gc_core.rs:76-91, 101-122). Rust calls it on every mutable borrow of an
+  object or environment (gc_handle.rs:90-110, env_handle.rs:88-107). Generated code stores the
+  same bytes after a store of a word that can be a reference: five instructions on ARM64
+  (jit.rs:11902-11939) at ten sites, six on x86-64 (jit_x64_names.rs:374-390) at three.
+- It records every written cell, young or old. A minor collection reads every page slot's
+  metadata and, for a carded page, its summary byte; a page with its summary set has its cards
+  read and cleared: a page that received cells since the last collection is walked by its old
+  cells, any other by its set cards (gc_core.rs:1076-1144, 3398-3406). The old cells found (the
+  card cells) are traced as roots.
+- TRUST_JS_GC_LOG's `begin` phase holds both passes and the cursors' flush; nothing reports
+  pages, summaries or dirty cards. Hence the census patch.
+
+Census (target/p2/w2f/census: apply-patch.py, apply-patch-2.py, apply-patch-3.py, run.sh,
+batch.sh, batch2.sh, runone.py, parse.py, tables.py, tables2.py, summary.txt; commits 31377809
+and a7c2a448 on p2-w2f-census, from main e288bfd5; fat LTO; CPU 15, an X925 core, one run at a
+time, median of 3; each run behind a gate of under 8 busy cores, its other load recorded: a median
+of 2.5-4.0 cores, other sessions' test suites and builds and a game). With TRUST_JS_GC_LOG on, the
+patch times the summary pass (every page slot's metadata and each carded page's summary byte,
+listing the set pages) and the card pass (take_card_cells on the set pages) apart; a count mode
+counts pages, carded and set pages, dirty cards, 2 MiB chunks, and the card cells and their
+edges. With TRUST_JS_GC_LOG off it runs main's loop, and those runs give the run times. The two
+passes' sum agrees with main's single pass timed the same way (TypeScript 1,778 against 1,763 us
+a minor, chai 45.1 against 45.2).
+
+Pacing on (the default), per minor collection: counts are means over a run's minors, times the
+median of 3 runs' means; shares are of the minors' mark and sweep time and of the run's wall time
+(runs without the log):
+
+| workload | minors | pages | carded | summary set (young) | dirty cards | summary us | card us | summary, % of minor time | of run | card pass, % of minor time | of run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 9 | 77 | 38 | 28 (25) | 8,464 | 1.0 | 9.1 | 0.41 | 0.003 | 3.7 | 0.024 |
+| React | 5 | 59 | 19 | 12 (12) | 2,430 | 0.6 | 2.9 | 0.46 | 0.007 | 2.0 | 0.029 |
+| Djot | 8 | 94 | 49 | 43 (43) | 2,364 | 1.5 | 29.9 | 0.30 | 0.007 | 6.0 | 0.145 |
+| sustained | 18 | 442 | 412 | 23 (23) | 11,205 | 4.8 | 2.7 | 0.67 | 0.033 | 0.4 | 0.019 |
+| chai | 403 | 253 | 121 | 45 (44) | 9,325 | 3.7 | 41.4 | 0.40 | 0.012 | 4.5 | 0.135 |
+| Splay | 10 | 622 | 422 | 13 (11) | 4,208 | 7.4 | 19.8 | 0.12 | 0.035 | 0.3 | 0.093 |
+| PdfJS | 34 | 242 | 100 | 38 (36) | 8,321 | 4.3 | 27.9 | 0.64 | 0.013 | 4.2 | 0.085 |
+| TypeScript | 38 | 4,187 | 1,742 | 799 (659) | 120,097 | 58.3 | 1,720.0 | 0.32 | 0.016 | 9.5 | 0.487 |
+| EarleyBoyer | 18 | 288 | 264 | 233 (232) | 59,653 | 4.2 | 224.5 | 0.26 | 0.019 | 13.6 | 0.990 |
+| RayTrace | 21 | 60 | 41 | 34 (33) | 15,922 | 0.6 | 5.9 | 0.68 | 0.007 | 6.2 | 0.065 |
+| Box2D | 12 | 127 | 80 | 60 (54) | 19,920 | 3.0 | 66.9 | 0.38 | 0.004 | 8.6 | 0.092 |
+
+Pacing off (TRUST_JS_GC_PACING=0, the instruction counts' setting: a 2 MiB nursery), the same:
+
+| workload | minors | pages | carded | summary set (young) | dirty cards | summary us | card us | summary, % of minor time | of run | card pass, % of minor time | of run |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 9 | 77 | 38 | 28 (25) | 8,463 | 1.0 | 9.3 | 0.42 | 0.003 | 3.8 | 0.024 |
+| React | 5 | 59 | 19 | 12 (12) | 2,430 | 0.7 | 2.9 | 0.46 | 0.007 | 2.1 | 0.030 |
+| Djot | 11 | 92 | 47 | 40 (40) | 1,734 | 1.3 | 34.5 | 0.31 | 0.009 | 8.1 | 0.236 |
+| sustained | 106 | 351 | 331 | 5 (4) | 1,919 | 2.6 | 0.8 | 2.02 | 0.106 | 0.7 | 0.035 |
+| chai | 1,030 | 184 | 93 | 27 (26) | 3,735 | 2.1 | 30.6 | 0.43 | 0.018 | 6.2 | 0.252 |
+| Splay | 56 | 917 | 627 | 12 (5) | 1,418 | 7.6 | 20.7 | 0.68 | 0.168 | 1.9 | 0.456 |
+| PdfJS | 139 | 167 | 70 | 15 (13) | 2,099 | 1.8 | 11.7 | 0.58 | 0.022 | 3.8 | 0.143 |
+| TypeScript | 509 | 4,516 | 1,876 | 127 (65) | 9,842 | 46.6 | 197.0 | 2.59 | 0.174 | 10.9 | 0.737 |
+| EarleyBoyer | 67 | 196 | 172 | 93 (92) | 16,228 | 2.2 | 108.5 | 0.30 | 0.033 | 14.7 | 1.638 |
+| RayTrace | 21 | 60 | 41 | 34 (33) | 15,922 | 0.6 | 4.1 | 0.65 | 0.006 | 4.8 | 0.047 |
+| Box2D | 19 | 119 | 76 | 49 (39) | 13,893 | 2.6 | 60.1 | 0.45 | 0.006 | 10.2 | 0.131 |
+
+The summary:
+- The summary pass costs 11-24 ns a page slot (7-22 with pacing off): 0.6-7.6 us a minor on every
+  workload but TypeScript, whose 4,187 pages take 58 us (at most 359; its heap peaks at 8,979
+  pages). That is 0.12-0.68% of minor time and at most 0.035% of any run at the default pacing.
+  With pacing off, the same heaps collect more often: TypeScript's pass is 2.6% of its minor time
+  and 0.17% of its run, the sustained workload's 2.0% and 0.11%, the rest under 0.7% and 0.17%.
+- Splay's heap now averages 622 pages (1,763 at most): the 0.4 ms of P2's start, on a ~480 MB heap
+  (about 7,300 pages), is 7.4 us (23 us at most).
+- About half of the pass is the walk of the page slots' metadata: alone it takes 0.3-3.5 us a
+  minor, TypeScript 26.5 of its 58.
+- The set pages are young pages: the barrier records writes into young cells too, so a page that
+  received cells since the last collection mostly has its summary set. Old pages with a set
+  summary: 0 to 7 a minor, but TypeScript's 141; their dirty cards: 0 to 3, but Box2D's 879 and
+  TypeScript's 17,930.
+- The young pages are spread over the heap's 2 MiB chunks (allocation fills pages with free cells
+  before it takes a new one, gc_core.rs:2479-2516): at the default pacing 55-100% of the chunks hold
+  a set page (TypeScript 93 of 130, Splay 11 of 20, chai 7 of 8, each fixture all of its 2 or 3).
+  So a chunk summary would read 1-11% more summary bytes on seven workloads (the chunk bytes on
+  top of the same pages) and 4-42% fewer on four: at most 3 us a minor on Splay and 12 us on
+  TypeScript. With pacing off the set pages gather in fewer chunks (TypeScript 24 of 142): 60-76%
+  fewer bytes on Splay, the sustained workload and TypeScript, whose 35 us a minor come to 0.13%
+  of its run [arithmetic, taking the pass's time to follow the bytes it reads: 76% of 46.6 us over
+  509 minors is 18 ms of 13.6 s].
+
+The card pass and the card cells (second build; target/p2/w2f/census/summary.txt, last tables):
+- The card pass costs more than the summary pass on every workload but the sustained one, up to
+  53 times (EarleyBoyer): 2.7-1,720 us a minor, 0.3-13.6% of minor time; EarleyBoyer 225 us
+  (13.6%, 1.0% of its run; 14.7% and 1.6% with pacing off), TypeScript 1,720 us (9.5%, 0.49%),
+  Box2D 67 us (8.6%). It reads only the set pages, so no summary above the page changes it.
+- 75-99% of it is the walk of the young set pages by their old cells, at 3-9 ns a cell walked
+  (the sustained workload, with 48 a minor, aside): TypeScript walks 361,539 old cells a minor on
+  660 young pages (1,503 of its 1,739 us), EarleyBoyer 76,673 (222 of 224 us).
+- At the default pacing the card cells are 73-100% old cells on young pages, and few hold an
+  edge to a young cell: 0-36% of them (TypeScript 8% of 69,766 a minor, whose 323,104 edges hold
+  7,551 young ones; EarleyBoyer 4 young edges in 9,586; chai 5 in 3,206). [The edges are the
+  cells' full trace's; a minor collection's trace of an element block reports only its dirty runs,
+  word_block.rs:18-23.]
+- Where minor time goes: tracing (`drain`) is 84% on TypeScript and 98% on Splay; chai's 403
+  minors spend 26% in the side tables and 35% in the engine's steps around the heap's phases.
+
+What the exemplars do (target/p2/w2f/exemplars.txt; V8 c8b70908, SpiderMonkey 6bb81100, JSC
+26027804, each re-diffed against its main of 2026-11-04, where the cited code is unchanged):
+- A1: every barrier filters before it records, and a store into a young holder records nothing.
+  V8 tests the value's and the host's page flags, a load each from the page header (V8
+  macro-assembler-arm64.cc:4376-4436, 3786-3799); SM tests that the value is in a nursery chunk
+  and the holder is not, a load each from the chunk header
+  (SM jit/arm64/MacroAssembler-arm64.cpp:2093-2135); JSC tests the holder's state byte in its
+  header against a threshold (JSC jit/AssemblyHelpers.h:1275-1285). JSC's heap is non-moving with
+  sticky mark bits, like TRust's (JSC heap/BlockDirectory.cpp:304-306); so is V8's sticky-mark-bits
+  build, whose barrier tests the host's and the value's mark bits (V8
+  macro-assembler-x64.cc:1257-1275; off by default).
+- A2: the slow path records the slot or the holder, at most once per cycle: V8 the slot, a bit in
+  its page's slot set (V8 builtins-internal-gen.cc:167-245); SM's Baseline the holder, a bit in its
+  4 KiB arena's bitmap behind a last-cell cache (SM jit/BaselineCodeGen.cpp:650-702;
+  SM gc/StoreBuffer-inl.h:62-84); JSC the holder, appended to a mark stack as its state turns grey
+  (JSC heap/Heap.cpp:1165-1221).
+- A3: discovery: V8 walks every old page's metadata, 256 KiB a page, and iterates the slot sets
+  of the pages that have one (V8 scavenger.cc:1689-1703, 2440-2457); SM and JSC read no heap, only
+  their lists (SM gc/Nursery.cpp:1741-1804; JSC heap/MarkStackMergingConstraint.cpp:60-74).
+- A4: none keeps a summary above the page; V8's walk, the only one, tests pointers in each
+  page's metadata (V8 mutable-page.h:288-295).
+- A5: the fast path is loads and branches; stores happen only on the slow path (SM ARM64: 3 to 9
+  instructions, no store; JSC: 7 with 2 loads, plus the operands' loads) [inferred, from the
+  emitters].
+
+Options:
+1. A chunk summary byte (W2f as planned). A third store in gc_core::card_mark and in both
+   emitters, and a byte per 2 MiB chunk at an address computed from the cell's. No page has a free
+   byte for it today: a chunk's pages are pages of cells, carded or not, so the page source would
+   reserve a page a chunk (3.1% of a huge page) or a tail in every page. It saves at most 3 us a
+   minor on Splay and 12 on TypeScript at the default pacing, and costs a little on the small
+   heaps. No exemplar keeps one (A4).
+2. A dirty-page list: the barrier tests the page's summary and, the first time in a cycle, a slow
+   path sets it and appends the page to the heap's list, which the minor collection reads instead
+   of the page slots. A load and a branch instead of the summary store, and a call per page per
+   cycle (12-799 a minor). It saves the summary pass, 0.6-58 us a minor. It is SM's arena list
+   and JSC's mark stack at a page's granularity (A2, A3), without their filter (A1).
+3. A dense list of the carded pages' addresses (Rust only): the pass reads 8 bytes a carded page
+   instead of every slot's metadata. It saves up to the metadata walk, 0.3-26.5 us a minor. V8's
+   walk is a list of old pages (A3).
+4. Leave the summary as it is.
+
+Recommendation: option 4, and W2f closed with this census as its record. The summary pass is
+under 0.7% of every workload's minor time and 0.035% of its run at the default pacing (TypeScript
+2.6% and 0.17% with pacing off). A chunk summary would save at most 42% of it at the default pacing
+(3 us a minor) and 76% of TypeScript's with pacing off (0.13% of its run), and cost a little on
+the fixtures, for a third store at every barrier site and a page layout change. The exemplars do
+not support it (A4).
+
+What to do instead: the census points at the card pass and the card cells, not the summary.
+Both come from recording every write: a write into a young cell sets its card and its page's
+summary, so the minor collection walks the old cells of every young page written since the last
+one (75-99% of the card pass), and it traces old cells whose cards were set but which hold no
+young cell (64-100% of the card cells). The card pass alone is up to 13.6% of minor time and 1.0%
+of a run at the default pacing (EarleyBoyer; 14.7% and 1.6% with pacing off); the useless cells'
+tracing comes on top, untimed here. Every exemplar filters before it records (A1): V8 and SM by
+the value's youth and the holder's age, JSC by the holder's state byte alone, on a non-moving heap
+with sticky marks like TRust's. A holder filter would leave most young pages' summaries clear
+(no walk of their old cells), and a value filter would drop the cells written with old values
+[inferred]. TRust keeps its marks in side bitmaps (gc_core.rs:938-944), so either test would read
+a page's mark bits (V8's sticky-mark-bits barrier) or a header byte that marking sets (JSC's
+holder test). It turns the summary store into loads and a branch at every barrier, a price this
+census did not count. If the owner wants this cost taken, it is its own item, with a census of
+barrier executions and of the card cells written themselves (against those that only share a
+card), and JSC's cell state evaluated first; W2's exit does not need it.
+
+Change surface, if option 1 or 2 went ahead:
+- Rust: gc_core::card_mark (gc_core.rs:101-122) and its callers, the handles' mutable borrows
+  (gc_handle.rs:90-110, env_handle.rs:88-107).
+- ARM64: emit_card_mark (jit.rs:11902-11939) at its ten sites (jit.rs: emit_set_prop_inline,
+  emit_prologue_copies, emit_store_name_value, emit_word_store_body, emit_word_create,
+  emit_define_elem_inline; jit_operations.rs: emit_cap_store); option 2 also needs a heap pointer
+  and a slow-path call at each.
+- x86-64: card_mark (jit_x64_names.rs:374-390) at its three sites (store_value,
+  emit_activation_copies, emit_fixed_cap).
+- The minor collection: begin_marking's loop and take_card_cells (gc_core.rs:3398-3406,
+  1076-1144); for option 1 the page source, which carves pages from chunks of 2 MiB
+  (gc_core.rs:495-512); for option 2 the list's reset at each collection.
+- Verification: check_write_barrier's summary check (gc_core.rs:3492-3500), extended to the chunk
+  byte or the list.
+- Tests: card_mark_sets_exactly_its_cells_card, carded_pages_end_in_a_card_table,
+  no_cell_resolves_in_a_card_table, cards_clear_when_a_collection_starts, the two write-barrier
+  check tests and the minor-collection card tests
+  (gc_core.rs:7715, 7746, 7844, 7893, 8034, 8057, 8146, 8196), and the backends' card tests
+  (jit_names_tests.rs:182-200; jit_x64_names_tests.rs:231, 420, 563).
+
+Exit (proposed): W2f closed by its census, with no barrier change, and the census line of the
+plan's start ("~0.4 ms per minor on Splay's ~480 MB heap") superseded by this record. Were option 1
+or 2 chosen instead: the summary pass's time a minor halved on TypeScript and Splay, no fixture or
+Octane benchmark slower beyond noise (instructions; the barrier is on every store site), and the
+backends' barrier tests and TRUST_JS_GC_VERIFY's barrier check passing.
+
+Decided (mine, reported to the owner):
+1. W2f closes with this record (option 4): no barrier change. The census line of the plan's start
+   ("~0.4 ms per minor on Splay's ~480 MB heap") is superseded by the tables above.
+2. The filtering barrier (A1) is carried to Phase 3 (see "Carried to Phase 3"): the card pass and
+   the card cells without a young edge matter to minor collections on EarleyBoyer, TypeScript and
+   Box2D, not to the fixtures, whose minor collections are a small part of their runs.
