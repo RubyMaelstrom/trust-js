@@ -131,8 +131,10 @@ comment/example in the same change.
   the execution paths that collect it, so its observations are not observations of ordinary
   optimized execution and it is never an acceptance setting.
 - `TRUST_JS_GC_LOG=1` logs collections, each line with its phases' times in microseconds:
-  `mark` and `sweep` as the engine drives them, `engine` for what the engine does around the
-  heap's phases, the heap's phases (`begin`: cards and marks; `roots`; `stack`; `side`:
+  `pause`, the whole collection, the time the program waited for it; `mark` and `sweep` as the
+  engine drives them, `engine` for what the engine does around the heap's phases; for a major
+  collection, which is the final pause of its marking cycle, `cycle_mark`, the cycle's whole
+  marking time (its slices' and this pause's marking); the heap's phases (`begin`: cards and marks; `roots`; `stack`; `side`:
   side-table edges and side-slot owners; `drain`: tracing; `finalize`; `free`), the engine's
   steps (`scrub`: zeroing the native stack below the collection's frames; `client`: building
   the marking client; `dead`: listing the dead objects for the tables' sweeps; `weak`:
@@ -217,7 +219,9 @@ comment/example in the same change.
   collection sets (`budget`), and the heap's atoms, static names included, with the bytes of
   its own (`atoms`, `atom_bytes`); a minor collection's line adds
   the young pages it swept, the old cells it traced because their cards were set
-  (`card_cells`) and the bytes it promoted. `TRUST_JS_GC_CENSUS=1`
+  (`card_cells`) and the bytes it promoted, and a major collection's the slices that marked
+  before its final pause (`slices`) and the bytes allocated from its cycle's start to that
+  pause (`cycle_alloc`): 0 for a major collection that marks in one pause, as all do now. `TRUST_JS_GC_CENSUS=1`
   adds a `gc_layout_census` to the `TRUST_JS_PERF_METRICS` record: named-property counts of the
   live objects after every collection and of objects as they die, by family (it walks the
   heap at each collection; diagnostic only), and prints a `[gc-elements]` line after each

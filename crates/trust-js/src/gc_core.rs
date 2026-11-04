@@ -1530,6 +1530,13 @@ pub(crate) struct GcStats {
     pub(crate) last_finalized: [u32; COUNTED_DESCS],
     /// The time their finalizers took, in nanoseconds, by descriptor as `last_finalized`.
     pub(crate) last_finalize_nanos: [u64; COUNTED_DESCS],
+    /// The last major collection's marking cycle (W6): the slices that marked before its final
+    /// pause (none for a major collection marked in one pause, as every one is so far), the
+    /// bytes allocated from the cycle's start to that pause, and the slices' marking time in
+    /// nanoseconds while phases are timed. Set as a major collection starts its final marking.
+    pub(crate) last_cycle_slices: u32,
+    pub(crate) last_cycle_allocated: usize,
+    pub(crate) last_cycle_slice_nanos: u64,
 }
 
 /// How many descriptors [`GcStats::last_finalized`] counts.
@@ -3292,6 +3299,10 @@ impl Heap {
         if kind == CollectionKind::Major {
             self.major_due = false;
             self.major_requested = false;
+            // A major collection marked in one pause: its cycle is that pause alone.
+            self.stats.last_cycle_slices = 0;
+            self.stats.last_cycle_allocated = 0;
+            self.stats.last_cycle_slice_nanos = 0;
         } else {
             self.stats.minor_collections += 1;
         }

@@ -1120,7 +1120,13 @@ impl Interp {
         } else {
             limit
         });
+        #[cfg(not(target_arch = "wasm32"))]
+        if reclaimed >= 50_000 {
+            crate::fastalloc::trim();
+        }
         if let (Some(started), Some(marked), Some(swept)) = (log_started, log_marked, log_swept) {
+            // The pause: the whole collection, from the choice of its kind to here.
+            let pause_nanos = started.elapsed().as_nanos() as u64;
             let stats = heap.core.borrow().stats();
             let micros = |nanos: u64| nanos as f64 / 1000.0;
             let phases = crate::gc_core::Phase::NAMES
@@ -1149,15 +1155,30 @@ impl Interp {
                 .collect::<String>();
             let mark_nanos = (marked - started).as_nanos() as u64;
             let sweep_nanos = (swept - marked).as_nanos() as u64;
-            let minor = match kind {
-                CollectionKind::Minor => format!(
-                    " young_pages={} card_cells={} promoted={}",
-                    stats.last_pages_swept, stats.last_card_cells, stats.last_marked_bytes
+            let (kind_fields, cycle) = match kind {
+                CollectionKind::Minor => (
+                    format!(
+                        " young_pages={} card_cells={} promoted={}",
+                        stats.last_pages_swept, stats.last_card_cells, stats.last_marked_bytes
+                    ),
+                    String::new(),
                 ),
-                CollectionKind::Major => String::new(),
+                // A major collection is the final pause of its marking cycle (W6): the slices
+                // that marked before it, the bytes allocated since the cycle started, and the
+                // cycle's whole marking time, its slices' and this pause's.
+                CollectionKind::Major => (
+                    format!(
+                        " slices={} cycle_alloc={}",
+                        stats.last_cycle_slices, stats.last_cycle_allocated
+                    ),
+                    format!(
+                        " cycle_mark={:.0}",
+                        micros(stats.last_cycle_slice_nanos + mark_nanos)
+                    ),
+                ),
             };
             eprintln!(
-                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{minor} external={} budget={} atoms={} atom_bytes={} us: mark={:.0} sweep={:.0} engine={:.0}{phases}{steps}{finalized}",
+                "[gc-heap] kind={} cause={cause:?} objects={objects_before}->{live} cells={} bytes={} pages={} spare={} collections={} deferred={}{kind_fields} external={} budget={} atoms={} atom_bytes={} us: pause={:.0} mark={:.0} sweep={:.0} engine={:.0}{cycle}{phases}{steps}{finalized}",
                 match kind {
                     CollectionKind::Minor => "minor",
                     CollectionKind::Major => "major",
@@ -1172,14 +1193,11 @@ impl Interp {
                 stats.trigger_bytes,
                 heap.atoms.borrow().len(),
                 heap.atoms.borrow().heap_bytes(),
+                micros(pause_nanos),
                 micros(mark_nanos),
                 micros(sweep_nanos),
                 micros((mark_nanos + sweep_nanos).saturating_sub(core_nanos)),
             );
-        }
-        #[cfg(not(target_arch = "wasm32"))]
-        if reclaimed >= 50_000 {
-            crate::fastalloc::trim();
         }
         if let Some(started) = performance_started {
             crate::value::gc_performance_metrics_finish(
