@@ -10076,3 +10076,187 @@ work the phase's gap names. Checks on 3c09e454: the lib suite with the embed fea
 them); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575 of
 53,575 and identical to main's report; the fixtures' masked output as main's; difftest 138 agree,
 12 skipped (budget).
+
+### W2g step 1: Proxy state in the object (record, 2026-11-04)
+
+Commits, from main 3e7d856f, on p2-w2g-proxy (an agent's; rebased onto main dffe8831 as e7aed168,
+5249c358, d3843a2e and 710191fd, with a31509fe correcting step 3's comment, which named the
+sentinel this series removes; the measurements below name the series as written, then the rebased
+one against dffe8831):
+- c26c97b7: a Proxy's target and handler in its object. ObjectKind::Proxy(PayloadBox<ProxyData>)
+  holds the target, the handler (null once revoked) and whether the target was callable. The
+  object's trace reports the payload cell and its two edges, and revocation nulls the handler
+  through the object's mutable borrow, which sets its card. is_callable gains the Proxy tag and
+  the `Native(proxy_uncallable)` kind goes; the call dispatch's proxy test is a test of the tag,
+  and every other reader (proxy_pair, the [[Get]], [[Set]], HasProperty and delete walks, the
+  construct dispatch, GetFunctionRealm, the ordinary-get check, for-in, the feedback kinds,
+  Engine::is_proxy_value) tests the kind. IsConstructor stays the flag bit the creation sets,
+  which value_is_constructor now reads instead of recursing into the target. The table, the pin,
+  its ClientRecords record, the conditional edge, the eviction and the cross-interpreter routing
+  go, with with_metadata_table (revocation was its only use) and call_inner's and
+  construct_inner's proxy guards before callable_home (which finds no [[Realm]] for the kind).
+- 9a76763f: the realm-wide inline_ic_safe latch goes. The JIT's in-line `instanceof` walk and its
+  interpreter counterpart (instanceof_ic) test each holder for a proxy; OrdinaryHasInstance's walk
+  shares the interpreter's (prototype_chain_has), which stops at the first proxy, from which the
+  observable walk goes on. JitCtx keeps its slot [32], unused (`reserved`), so that the fixed
+  offsets after it stay.
+- 93b6151e: the walk in six instructions a hop, as before it tested anything (9a76763f's took
+  nine): KIND_PROXY_TAG is 32, the one tag with bit 5 set, so a TBNZ tells a proxy after the
+  holder's tag and prototype loads, whose offsets from the cell fold in, and the loop branches
+  back while the prototype is not the target. The entry loses the latch's three instructions.
+- cedee510: the call and construct dispatch take the callee's [[Call]] copy and a proxy's slots
+  under one borrow, and the [[Get]] and [[Set]] entries test for a proxy in the look at the kind
+  they make already (mapped arguments and string wrappers; arguments objects).
+
+As designed: ProxyData in a payload cell without a finalizer (two Values and a bool;
+`needs_drop` is false, asserted); the tag after Array's, so KIND_CALLABLE_FIRST,
+KIND_EXOTIC_NONE_LAST and KIND_ORDINARY_LAST stay ranges, which a proxy now fails as it already
+failed `ic_plain` (still clear: the property caches stay off it); callability in the payload, as
+SpiderMonkey asks the handler (V8 and JSC choose the proxy's map or structure by it); one test
+per holder in the `instanceof` walk, as V8's HasInPrototypeChain makes (V8 c8b70908
+src/codegen/code-stub-assembler.cc:13663-13725: each hop's map instance type, JS_PROXY_TYPE to the
+runtime). Every other side table is as it was.
+
+Where the build differs from the design:
+1. The tag is 32, not the next free one: bit 5 is set in no other kind's tag (all are below 32),
+   and the walk tests it with one TBNZ. A new kind takes a tag below 32, or one with the bit if its
+   [[GetPrototypeOf]] is not the field read either (value.rs; jit_layout_tests::
+   only_a_proxys_kind_tag_has_the_proxy_bit checks the kinds JavaScript makes).
+2. JitCtx's slot [32] stays, unused, rather than moving the five fixed offsets after it, which
+   every template reads by number.
+3. Revocation keeps the target, as the side table did (the spec nulls it; nothing observes it):
+   typeof, IsCallable and IsConstructor of a revoked proxy come from the payload and the flag
+   bit, and every operation tests the handler.
+4. A native parent's graft in super() (eval.rs; %Proxy% reached as the parent through a changed
+   [[Prototype]]) leaves a proxy's state with it, as the side table did, rather than making the
+   new `this` a proxy whose `ic_plain` is set.
+5. Tests: the side-slot record tests use a promise and a class where they used a proxy, and check
+   that a proxy owns no side slot (table_record_tests); the owner-index test routes a Realm's
+   record (agent_control_tests); Interp's inventory has two fields fewer (149). New:
+   tests::instanceof_walks_ask_a_proxy_on_the_chain_through_its_trap (three tiers: a proxy as the
+   left operand, mid-chain and revoked, a warmed site with a proxy alive elsewhere) and the tag
+   test above.
+
+Per operation (instructions an iteration: the difference of 1.2M and 200k iterations over 1M,
+least of 3; target/p2/w2g/proxy-micro; main c90b3889, the tip cedee510, fat LTO):
+
+| operation | main | tip | change |
+| --- | --- | --- | --- |
+| a Proxy's creation | 2,297.5 | 1,128.3 | -1,169.2 (-50.9%) |
+| a read through a Proxy without handlers | 1,256.0 | 1,193.0 | -5.0% |
+| a 4-deep prototype miss, a Proxy alive | 2,346.0 | 2,181.0 | -7.0% |
+| the same miss, no Proxy | 2,169.0 | 2,168.0 | -0.0% |
+| `instanceof` over a 2-deep chain, a Proxy alive | 1,709.0 | 298.0 | -82.6% |
+| the same, no Proxy | 300.0 | 298.0 | -0.7% |
+| `typeof` of an object and a test | 430.0 | 435.3 | +1.2% |
+
+W1's Proxy micro-benchmarks (whole runs, median of 3): proxy-none 4,862,219,895 ->
+4,471,539,196 (-8.04%), proxy-reflect 5,095,057,289 -> 4,916,261,846 (-3.51%), proxy-direct
+8,105,448,483 -> 7,852,072,213 (-3.13%). A creation saves 1,169 (the design's estimate: about
+950). `typeof` of an object pays is_callable's compare with the Proxy tag, an Array's and a
+wrapper's (SPE: typeof_matches +2.2 an iteration; the rest is LTO's layout of that function).
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; main c90b3889's engine against
+cedee510; the second column with collections suppressed, TRUST_JS_GC_NURSERY_BYTES=0 and
+TRUST_JS_GC_MIN_HEAP_BYTES=4000000000, which leaves the collection at the end of the task, main's
+count there its own):
+
+| workload | main | tip | collections suppressed |
+| --- | --- | --- | --- |
+| Vue | 1,822,358,087 | -1.57% | -1.73% |
+| React | 315,993,573 | +0.03% | +0.03% |
+| Djot | 635,462,390 | -0.09% | -0.02% |
+| chai | 80,392,670,102 | -1.02% | -0.99% |
+| Richards | 136,550,747 | +0.02% | +0.01% |
+| DeltaBlue | 262,317,964 | +0.00% | +0.00% |
+| Crypto | 729,774,676 | +0.00% | +0.00% |
+| RayTrace | 1,003,576,063 | +0.01% | +0.00% |
+| EarleyBoyer | 3,185,102,592 | +0.52% | -0.21% |
+| RegExp | 2,775,202,043 | +0.04% | +0.04% |
+| Splay | 1,401,517,733 | +0.01% | +0.00% |
+| NavierStokes | 451,646,383 | +0.01% | +0.00% |
+| PdfJS | 7,706,699,701 | +0.03% | +0.02% |
+| Mandreel | 62,955,477,361 | -0.00% | +0.00% |
+| Gameboy | 21,515,504,166 | +0.01% | -0.02% |
+| CodeLoad | 482,561,248 | +0.01% | +0.01% |
+| Box2D | 4,478,548,964 | -0.01% | -0.01% |
+| zlib | 138,040,690,109 | +0.00% | +0.00% |
+| TypeScript | 58,871,596,843 | +0.01% | -0.01% |
+
+Vue -1.57% and chai -1.02% (the design's estimates: 1.28% and 0.79%). EarleyBoyer's +0.52% is
+its collection schedule's, not its code's: with collections suppressed it is -0.21% (the
+`instanceof`s). In every workload checked, the first collection keeps one object more or fewer
+than main's (EarleyBoyer 5,328 of 10,769 against 5,329; RegExp, Box2D and Gameboy one more),
+the same in a build with main's Interp layout and descriptor order (below) and not moved by the
+environment's size: a conservative stack word that the changed Rust frames leave or no longer
+leave. EarleyBoyer's schedule then diverges (its second major collection one minor earlier), and
+SPE put 9a76763f's +21M there in marking (PropWord::trace_gc_edges, Object::trace_gc_fields,
+mark_unmarked, mark_phase). What stays with collections suppressed is a few hundredths: React
++0.03%, RegExp +0.04%, PdfJS +0.02%, Richards and CodeLoad +0.01%, below what SPE resolves
+(RegExp's hot functions moved under LTO: regexp_exec_abstract 1,236 -> 1,332 bytes, call_dispatch
+6,280 -> 5,980); is_callable's compare is one known part.
+
+Collections: as main's in number where no proxy is made (EarleyBoyer 75, RegExp 49, Box2D 19,
+Gameboy 29; TRUST_JS_GC_LOG). chai makes five minor collections more (1,019 against 1,014) for its
+371,886 proxies' payload cells, and each does less: its log puts the side slots' work
+(`side`) at 59 ms against 323 and the tables' (`tables`, the eviction) at 217 against 474
+(times from one run each, as an indication only).
+
+Code dumps (the gate's three modes over the fixtures, tools/dumpsum.py) differ from main's in
+Interp's field offsets (the two fields' removal moves later fields by 32 bytes) and in the
+object descriptor's id (the payload descriptor registered before it moves the in-line
+allocation's cursor by 768 bytes). A comparison build of cedee510 that re-declares the two fields
+and registers the proxy descriptor last (target/p2/w2g/proxy-layout/patch.py, for measurement
+only) dumps the fixtures as main does in all three modes: the fixtures make no in-line
+`instanceof`. On EarleyBoyer that build differs from main in the 39 chunks of 83 that hold the
+`instanceof` template, each by three tokens a template and in at most twelve tokens a template.
+
+GC: the object's trace is the one edge inventory every trace uses (marking, verification, the
+barrier's check). Under TRUST_JS_GC_STRESS=1000 and TRUST_JS_GC_VERIFY=1, the 210 lib tests whose
+bodies make proxies (target/p2/w2g/proxy-stress/select.py), each in its own process, pass at
+9a76763f (the trace's last change) and at cedee510. Test262's Proxy and Reflect
+suites with every other test that makes a proxy (846 tests, a dev-profile test262-runner at
+9a76763f) pass at 1000 with --tier=jit threshold 0; at stress 1, in that tier and in the default
+one, only timeouts fail (22 and 21, slowness).
+
+Checks at cedee510:
+- lib: ARM64 2,764 passed, 9 ignored; x86-64 (zombie) 2,545 passed, 9 ignored; clippy -D warnings
+  in the three configurations on both.
+- The release gate: the fixtures' masked output as the base's; difftest 138 agree, 12 skipped
+  (budget); Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to the base's
+  report.
+- An edge-case script (target/p2/w2g/proxy-edge/edge.js: typeof, calls and constructions of
+  callable, class, arrow and revoked proxies, bind, IsArray, JSON, proxies as prototypes, in,
+  delete, instanceof with a proxy on either side, Function.prototype.toString, super() with
+  %Proxy% and with a proxy parent, ShadowRealm and $262.createRealm proxies, species, WeakMap
+  keys, collections of live and revoked proxies) prints main's output.
+
+The rebased series against main dffe8831 (fat LTO, CPUs 10-13, pacing off, median of 3):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,791,103,453 | 1,765,176,017 | -1.45% |
+| React | 315,873,409 | 315,972,066 | +0.03% |
+| Djot | 633,640,023 | 633,118,723 | -0.08% |
+| chai | 80,340,966,171 | 79,516,754,722 | -1.03% |
+| Richards | 136,261,460 | 136,275,416 | +0.01% |
+| DeltaBlue | 261,554,654 | 261,569,551 | +0.01% |
+| Crypto | 728,945,484 | 728,970,487 | +0.00% |
+| RayTrace | 994,421,522 | 994,487,886 | +0.01% |
+| EarleyBoyer | 3,184,296,898 | 3,200,974,754 | +0.52% |
+| RegExp | 2,775,294,649 | 2,776,381,634 | +0.04% |
+| Splay | 1,401,266,404 | 1,401,356,734 | +0.01% |
+| NavierStokes | 451,417,937 | 451,438,840 | +0.00% |
+| PdfJS | 7,707,069,710 | 7,708,048,751 | +0.01% |
+| Mandreel | 62,956,075,362 | 62,954,123,744 | -0.00% |
+| Gameboy | 21,510,656,201 | 21,511,964,166 | +0.01% |
+| CodeLoad | 482,246,050 | 482,300,594 | +0.01% |
+| Box2D | 4,476,564,828 | 4,476,113,399 | -0.01% |
+| zlib | 138,040,589,810 | 138,040,636,524 | +0.00% |
+| TypeScript | 58,763,096,501 | 58,761,322,815 | -0.00% |
+
+As at cedee510: Vue -1.45%, chai -1.03%, EarleyBoyer +0.52% (its collection schedule, above),
+RegExp +0.04%, React +0.03%, the rest within 0.01%. Checks on a31509fe: the lib suite with the
+embed feature on ARM64 (2,764) and x86-64 (zombie, 2,545); clippy in the three configurations on
+x86-64; Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to main's report; the
+fixtures' masked output as main's; difftest 138 agree, 12 skipped (budget).
