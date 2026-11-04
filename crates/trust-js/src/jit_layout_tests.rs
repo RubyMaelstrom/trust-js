@@ -150,15 +150,16 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
         let wrapper = Object::new_with_parts(None, Props::new(), exotic);
         assert_eq!(tag(&wrapper), expected);
     }
-    // Maps and Sets keep their data in the cell (`ObjectKind::Collection`), whose tag is the last
-    // the ordinary-object guards admit: plain objects, typed arrays' views and the callables come
-    // before it, every exotic kind after it.
+    // Maps and Sets keep their data in the cell (`ObjectKind::Collection`), whose tag the
+    // ordinary-object guards admit: plain objects, typed arrays' views and the callables come
+    // before it, the other ordinary payload kinds after it, every exotic kind after those.
     let map = global(&mut engine, "var probeMap = new Map([[1, 2]]);", "probeMap");
     let set = global(&mut engine, "var probeSet = new Set([3]);", "probeSet");
     let function = global(&mut engine, "var probeFn = function() {};", "probeFn");
     for collection in [&map, &set] {
         assert!(collection.borrow().kind.is_collection());
-        assert_eq!(tag(collection), crate::value::KIND_ORDINARY_LAST);
+        assert_eq!(tag(collection), crate::value::KIND_COLLECTION_TAG);
+        assert!(tag(collection) <= crate::value::KIND_ORDINARY_LAST);
     }
     let function_tag = tag(&function);
     assert_eq!(function_tag, crate::value::CALLABLE_USER_TAG);

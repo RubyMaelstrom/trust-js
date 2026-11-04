@@ -1785,9 +1785,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
     let exotic_numwrap_tag = kind_tag(&ObjectKind::NumWrap(0.0));
     let exotic_boolwrap_tag = kind_tag(&ObjectKind::BoolWrap(false));
     let kinds_ok = exotic_array_tag == KIND_ARRAY_TAG
-        && exotic_strwrap_tag == 19
-        && exotic_numwrap_tag == 18
-        && exotic_boolwrap_tag == 17
+        && exotic_strwrap_tag == 23
+        && exotic_numwrap_tag == 22
+        && exotic_boolwrap_tag == 21
         && kind_tag(&ObjectKind::NumWrap(-1.25)) == exotic_numwrap_tag
         && kind_tag(&ObjectKind::BoolWrap(true)) == exotic_boolwrap_tag
         && kind_tag(&ObjectKind::Plain) == 0
@@ -1796,7 +1796,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             let map = ObjectKind::Collection(crate::gc_storage::PayloadBox::new(
                 OrderedCollection::new(CollectionKind::Map),
             ));
-            kind_tag(&map) == KIND_ORDINARY_LAST
+            kind_tag(&map) == KIND_COLLECTION_TAG
         };
 
     // Scope offsets for the inline LoadName template, relative to `Env::as_ptr` (the
@@ -2189,7 +2189,8 @@ pub(crate) fn user_fn_ptr(user: &UserFn) -> *const UserCallable {
 /// [`KIND_CALLABLE_FIRST`], [`KIND_EXOTIC_NONE_LAST`] and [`KIND_ORDINARY_LAST`]):
 /// - the former "`exotic` is None" (plain objects, typed arrays and functions): tags up to
 ///   [`KIND_EXOTIC_NONE_LAST`];
-/// - the former `ObjectKind::is_ordinary` (those, and a Map's or Set's data): tags up to
+/// - the former `ObjectKind::is_ordinary` (those, and a Map's or Set's data, and the payload
+///   kinds of other objects whose internal methods are ordinary): tags up to
 ///   [`KIND_ORDINARY_LAST`];
 /// - the former "`call` is not None": [`KIND_CALLABLE_FIRST`] ..= [`KIND_EXOTIC_NONE_LAST`]
 ///   (and a callable proxy: [`ObjectKind::is_callable`]);
@@ -2239,33 +2240,37 @@ pub enum ObjectKind {
     #[cfg(feature = "embed")]
     ScopedNative(crate::scope::NativeFn) = 14,
     /// P1 S4: a Map's or Set's [[MapData]]/[[SetData]], in its own cell (see
-    /// `Interp::collection`). Its tag directly follows the callables', so that
-    /// [`ObjectKind::is_ordinary`] tests one tag range.
-    Collection(crate::gc_storage::PayloadBox<crate::ordered_collection::OrderedCollection>) = 15,
-    Array = 16,
+    /// `Interp::collection`). Its tag directly follows the callables', and the tags after it up
+    /// to [`KIND_ORDINARY_LAST`] are the other objects whose state is a payload but whose
+    /// internal methods are ordinary (W2g's moved kinds: 16 to 19 for WeakMaps and WeakSets,
+    /// ArrayBuffers, DataViews and RegExps), so that [`ObjectKind::is_ordinary`] tests one tag
+    /// range and the property caches admit them.
+    Collection(crate::gc_storage::PayloadBox<crate::ordered_collection::OrderedCollection>) =
+        KIND_COLLECTION_TAG,
+    Array = KIND_ARRAY_TAG,
     /// The [[BooleanData]], [[NumberData]], [[StringData]], [[SymbolData]] and [[BigIntData]] of
     /// primitive wrapper objects.
-    BoolWrap(bool) = 17,
-    NumWrap(f64) = 18,
-    StrWrap(crate::gc_storage::PayloadBox<crate::lstr::LStr>) = 19,
-    SymWrap(SymbolRef) = 20,
-    BigIntWrap(crate::gc_storage::PayloadBox<crate::bigint::JsBigInt>) = 21,
+    BoolWrap(bool) = 21,
+    NumWrap(f64) = 22,
+    StrWrap(crate::gc_storage::PayloadBox<crate::lstr::LStr>) = 23,
+    SymWrap(SymbolRef) = 24,
+    BigIntWrap(crate::gc_storage::PayloadBox<crate::bigint::JsBigInt>) = 25,
     /// An error object. Carries the stack frames captured at construction (see
     /// `crate::stack_trace`), None when `Error.stackTraceLimit` was not a Number then; the
     /// `Error.prototype.stack` getter formats them after the live `name: message` head.
     /// name/message live as ordinary properties, and the tag lets `Error.prototype.toString` /
     /// the test262 runner recognise an error cheaply.
-    Error(Option<crate::gc_storage::PayloadBox<crate::stack_trace::StackTrace>>) = 22,
+    Error(Option<crate::gc_storage::PayloadBox<crate::stack_trace::StackTrace>>) = 26,
     /// An `arguments` exotic object; a mapped one's ParameterMap, while it maps an index, in a
     /// storage block it reports (`interpreter::ParameterMap`).
-    Arguments(Option<crate::gc_storage::StorageBox<crate::interpreter::ParameterMap>>) = 23,
-    ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>) = 24,
-    StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>) = 25,
+    Arguments(Option<crate::gc_storage::StorageBox<crate::interpreter::ParameterMap>>) = 27,
+    ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>) = 28,
+    StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>) = 29,
     /// ECMA-262 CreateMapIterator's and CreateSetIterator's private state: the collection and a
     /// live cursor over it, which its collection's deletions and clears keep in place.
     CollectionIterator(
         crate::gc_storage::PayloadBox<crate::ordered_collection::CollectionIterator>,
-    ) = 26,
+    ) = 30,
     /// A Proxy exotic object (ECMA-262 10.5): its target, its handler and whether it has a
     /// [[Call]], in a cell of its own (W2g step 1), as V8, SpiderMonkey and JSC keep a proxy's
     /// target and handler in the object. Its clear `ic_plain` keeps the property caches off it.
@@ -2281,13 +2286,17 @@ pub(crate) const KIND_CALLABLE_FIRST: u8 = 2;
 /// The last tag of the kinds that carry no exotic internal state (plain objects, typed arrays'
 /// views and the callables): the former `ObjectKind::ExoticNone`.
 pub(crate) const KIND_EXOTIC_NONE_LAST: u8 = 14;
-/// The last tag [`ObjectKind::is_ordinary`] accepts: those, and a Map's or Set's data.
-pub(crate) const KIND_ORDINARY_LAST: u8 = 15;
+/// [`ObjectKind::Collection`]'s tag, the first after the callables'.
+pub(crate) const KIND_COLLECTION_TAG: u8 = 15;
+/// The last tag [`ObjectKind::is_ordinary`] accepts: those, a Map's or Set's data and the other
+/// payload kinds whose internal methods are ordinary (see [`ObjectKind::Collection`]).
+pub(crate) const KIND_ORDINARY_LAST: u8 = 19;
 /// [`ObjectKind::TypedArray`]'s tag (ARM64's typed-array templates compare it).
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const KIND_TYPED_ARRAY_TAG: u8 = 1;
-/// [`ObjectKind::Array`]'s tag.
-pub(crate) const KIND_ARRAY_TAG: u8 = 16;
+/// [`ObjectKind::Array`]'s tag, the first after the ordinary kinds' (the element templates admit
+/// both with one compare).
+pub(crate) const KIND_ARRAY_TAG: u8 = KIND_ORDINARY_LAST + 1;
 /// [`ObjectKind::Proxy`]'s tag, the one with bit [`KIND_PROXY_BIT`] set: every other kind's is
 /// below 32, so the in-line `instanceof` walk tells a proxy, whose [[GetPrototypeOf]] is a trap,
 /// by one bit test at each holder. A new kind takes a tag below 32 (or, if its
