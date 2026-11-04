@@ -13,9 +13,10 @@ For each kind it prints the executions, their share of all operations, the share
 usable feedback in production today, and coverage (feedback-schema.txt, section 4): the share of
 executions whose site the speculative tier could compile without an exit for missing feedback.
 Where the engine writes the always-on records (the header's `records=`), it also prints precision:
-the share whose record, read with its operation's in-line set (rule U, feedback-schema.txt
-section 5), names exactly the coarse classes the operation saw, the bytecode run's record (the VM
-records every execution) being what it saw.
+the share whose record names exactly the coarse classes the operation saw, the bytecode run's
+record (the VM records every execution) being what it saw. A value operation's record is read with
+its in-line set (rule U, feedback-schema.txt section 5.1), an element access's alone when it is not
+empty (rule R, section 5.2).
 Branches, loops, `!` and names are counted but left out of the totals (no exemplar records
 branch directions or ToBoolean; names mostly resolve to static addresses).
 """
@@ -82,6 +83,13 @@ UNARY_UPDATES = ("Neg", "Plus", "BitNot", "UpdateLocal", "UpdateCap", "UpdateNam
                  "UpdateElem")
 RELATIONAL = ("Lt", "Gt", "Le", "Ge")
 EQUALITY = ("EqEq", "NotEq", "StrictEq", "StrictNotEq")
+# The element record's sets (section 5.2): receivers in bits 0-6, keys in bits 8-12, an Array's
+# facts in bits 16-20; the in-line set's receivers (an Array, a typed array, another ordinary
+# object) and key (an array index).
+ELEMENT_OPS = ("GetElem", "GetElemLocal", "GetMethodElem", "SetElem", "SetElemDrop",
+               "SetElemLocal", "SetElemLocalDrop")
+E_RECEIVERS, E_KEYS = 0x7F, 0x1F << 8
+E_IN_LINE_RECEIVERS, E_KEY_INDEX = 0b111, 1 << 8
 
 
 def in_line_set(op):
@@ -118,9 +126,19 @@ def value_precise(full, recorded, inline):
     return True
 
 
+def element_precise(full, recorded):
+    """Rule R: the record's receivers and keys alone when it holds any, else the in-line set's,
+    are exactly those seen (an Array's facts are hints, not compared)."""
+    if recorded & (E_RECEIVERS | E_KEYS):
+        receivers, keys = recorded & E_RECEIVERS, recorded & E_KEYS
+    else:
+        receivers, keys = E_IN_LINE_RECEIVERS, E_KEY_INDEX
+    return receivers == full & E_RECEIVERS and keys == full & E_KEYS
+
+
 def precise_site(kind, op, state, full, recorded, records):
     """Precision's sense (feedback-schema.txt section 4): a cache that holds the site's targets or
-    shapes, or a record that, with its in-line set, names exactly the coarse classes seen. typeof
+    shapes, or a record that, read by its rule, names exactly the coarse classes seen. typeof
     and `in` record nothing, nor does equality (W4's decision 3)."""
     name = name_of(op)
     if kind in (1, 2, 5, 6, 10) or (kind == 13 and name == "InstanceOf"):
@@ -128,6 +146,8 @@ def precise_site(kind, op, state, full, recorded, records):
     inline = in_line_set(op)
     if "values" in records and inline is not None:
         return value_precise(full, recorded, inline)
+    if "elements" in records and name in ELEMENT_OPS:
+        return element_precise(full, recorded)
     return False
 
 
@@ -143,6 +163,8 @@ def usable(kind, op, state, records):
         # The record with the in-line set; equality is lowered by tag, with no record (W4's
         # decision 3), as the templates lower it.
         return True
+    if "elements" in records and name in ELEMENT_OPS:
+        return True  # the record with the in-line set's two-way dispatch, as the templates'
     return False
 
 

@@ -6591,6 +6591,66 @@ fn record_binary_miss(
     }
 }
 
+/// Record an element access (W4 step 4; feedback-schema.txt section 5.2): the receiver's family
+/// by its kind's tag, an Array's lost kind facts and whether an index lies past its words, and
+/// the key's kind. Out of line: it runs on the VM's path and the element helpers' misses only.
+#[inline(never)]
+fn record_element(chunk: &Chunk, pc: usize, object: &Value, key: &Value) {
+    use crate::feedback::*;
+    use crate::value::ObjectKind;
+    let mut index = None;
+    let key_bits = match key.view() {
+        // An array index as `fast_get_elem` takes one.
+        ValueView::Num(number)
+            if number.trunc() == number && (0.0..u32::MAX as f64).contains(&number) =>
+        {
+            index = Some(number as usize);
+            ELEM_KEY_INDEX
+        }
+        ValueView::Num(_) => ELEM_KEY_NUMBER,
+        ValueView::Str(_) => ELEM_KEY_STRING,
+        ValueView::Sym(_) => ELEM_KEY_SYMBOL,
+        _ => ELEM_KEY_OTHER,
+    };
+    let receiver_bits = match object.view() {
+        ValueView::Obj(object) => {
+            let b = object.borrow();
+            match &b.kind {
+                ObjectKind::Array => {
+                    use crate::value::word_block::{
+                        KIND_COW, KIND_FROZEN, KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS,
+                    };
+                    let (facts, used) = b.props.element_facts();
+                    let mut bits = ELEM_ARRAY;
+                    if facts & KIND_NO_HOLES == 0 {
+                        bits |= ELEM_HOLEY;
+                    }
+                    if facts & KIND_NUMBERS == 0 {
+                        bits |= ELEM_NON_NUMBER;
+                    }
+                    if facts & KIND_INT32 == 0 {
+                        bits |= ELEM_NON_INT32;
+                    }
+                    if facts & (KIND_FROZEN | KIND_COW) != 0 {
+                        bits |= ELEM_UNWRITABLE;
+                    }
+                    if index.is_some_and(|index| index >= used) {
+                        bits |= ELEM_OUT_OF_BOUNDS;
+                    }
+                    bits
+                }
+                ObjectKind::TypedArray(_) => ELEM_TYPED_ARRAY,
+                ObjectKind::Arguments(_) => ELEM_ARGUMENTS,
+                kind if kind.is_ordinary() => ELEM_ORDINARY,
+                _ => ELEM_EXOTIC,
+            }
+        }
+        ValueView::Str(_) => ELEM_STRING,
+        _ => ELEM_PRIMITIVE,
+    };
+    chunk.feedback.record(pc, key_bits | receiver_bits);
+}
+
 /// The relational comparisons, the operations among `bin_cmp`'s whose operands are recorded.
 #[inline(always)]
 fn records_comparison(op: &str) -> bool {
@@ -19131,6 +19191,7 @@ fn run_vm_inner(
             Op::GetElem => {
                 let key = pop!();
                 let obj = pop!();
+                record_element(chunk, op_pc, &obj, &key);
                 let value = get_computed_element(i, chunk, op_pc, &obj, &key)?;
                 stack.push(value);
             }
@@ -19138,6 +19199,7 @@ fn run_vm_inner(
                 let v = pop!();
                 let key = pop!();
                 let obj = pop!();
+                record_element(chunk, op_pc, &obj, &key);
                 set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
                 stack.push(v);
             }
@@ -19145,6 +19207,7 @@ fn run_vm_inner(
                 let v = pop!();
                 let key = pop!();
                 let obj = pop!();
+                record_element(chunk, op_pc, &obj, &key);
                 set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
             }
             // The VM's entries fill an elided rest parameter's slot with its Array: its reads
@@ -19152,6 +19215,7 @@ fn run_vm_inner(
             Op::GetElemLocal(s) | Op::RestElem(s) => {
                 let key = pop!();
                 let obj = slots.read_value(s as usize);
+                record_element(chunk, op_pc, &obj, &key);
                 let value = get_computed_element(i, chunk, op_pc, &obj, &key)?;
                 stack.push(value);
             }
@@ -19176,6 +19240,7 @@ fn run_vm_inner(
                     stack.push(v);
                 }
                 let obj = slots.read_value(s as usize);
+                record_element(chunk, op_pc, &obj, &key);
                 set_computed_element(i, chunk, op_pc, &obj, &key, v)?;
             }
             Op::UpdateProp(n, c, kind) => {
@@ -19294,6 +19359,7 @@ fn run_vm_inner(
             Op::GetMethodElem => {
                 let key = pop!();
                 let obj = pop!();
+                record_element(chunk, op_pc, &obj, &key);
                 let m = get_computed_element(i, chunk, op_pc, &obj, &key)?;
                 stack.push(obj);
                 stack.push(m);
@@ -21974,7 +22040,8 @@ impl Chunk {
     pub(crate) fn jit_detailed_feedback_enabled(&self) -> bool {
         self.feedback.detailed_enabled()
     }
-    /// The always-on record of the operation at `pc` (W4 step 3; feedback-schema.txt section 5).
+    /// The always-on record of the operation at `pc` (W4 steps 3 and 4; feedback-schema.txt
+    /// section 5).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn feedback_record(&self, pc: usize) -> u32 {
         self.feedback.record_word(pc)
@@ -26457,12 +26524,19 @@ fn get_computed_element(
     if chunk.feedback.detailed_enabled() {
         return get_element_profiled(i, chunk, pc, obj, key);
     }
+    // The element record (W4 step 4): written here only for an access outside the in-line set
+    // (an own data element of an Array or another ordinary object, or a typed array's element,
+    // at an array index: what `fast_get_elem` reads), so x86-64, whose element reads all take
+    // this helper, records what ARM64's in-line path would. The VM records every access before
+    // it calls this.
     if matches!(&(obj).view(), ValueView::Undefined | ValueView::Null) {
+        record_element(chunk, pc, obj, key);
         crate::value::trace_nullish_property("get-method-elem", key);
         return Err(i.throw("TypeError", "cannot read property of null or undefined"));
     }
-    if let ValueView::Str(key) = &(key).view() {
-        return i.get_computed_property(obj, key);
+    if let ValueView::Str(key_text) = &(key).view() {
+        record_element(chunk, pc, obj, key);
+        return i.get_computed_property(obj, key_text);
     }
     match (&(obj).view(), &(key).view()) {
         (ValueView::Obj(object), ValueView::Num(index)) => {
@@ -26476,11 +26550,14 @@ fn get_computed_element(
             if *index >= 0.0 && index.fract() == 0.0 && *index < u32::MAX as f64 =>
         {
             if let Some(unit) = i.unit_at(string, *index as usize) {
+                use crate::feedback::{ELEM_KEY_INDEX, ELEM_STRING};
+                chunk.feedback.record(pc, ELEM_STRING | ELEM_KEY_INDEX);
                 return Ok(Value::Str(crate::jstr::unit_lstr(unit)));
             }
         }
         _ => {}
     }
+    record_element(chunk, pc, obj, key);
     // ToPropertyKey of an integral Number is its decimal text, and of a Symbol its encoded
     // key; skip the temporary strings. The Symbol stays owned by `key` during the read.
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
@@ -26519,15 +26596,20 @@ fn set_computed_element(
     if chunk.feedback.detailed_enabled() {
         return set_element_profiled(i, chunk, pc, object, key, value);
     }
+    // The element record, as `get_computed_element` writes it; a store's in-line set is what
+    // `fast_set_elem` writes (an own writable data element of an Array or another ordinary
+    // object, an Array's append, a typed array's element, at an array index) and
+    // `ordinary_set_existing_index` (an existing writable data property at an index).
     if matches!(&(object).view(), ValueView::Undefined | ValueView::Null) {
+        record_element(chunk, pc, object, key);
         return Err(i.throw("TypeError", "cannot set property of null or undefined"));
     }
-    let value = if let (ValueView::Obj(object), ValueView::Num(index)) =
+    let value = if let (ValueView::Obj(target), ValueView::Num(index)) =
         (&(object).view(), &(key).view())
     {
-        match i.fast_set_elem(object, *index, value) {
+        match i.fast_set_elem(target, *index, value) {
             Ok(()) => return Ok(()),
-            Err(value) => match Interp::ordinary_set_existing_index(object, *index, value) {
+            Err(value) => match Interp::ordinary_set_existing_index(target, *index, value) {
                 Ok(()) => return Ok(()),
                 Err(value) => value,
             },
@@ -26535,6 +26617,7 @@ fn set_computed_element(
     } else {
         value
     };
+    record_element(chunk, pc, object, key);
     // ToPropertyKey of a String is itself, and of an integral Number its decimal text: pass
     // them without building an owned key string.
     if let ValueView::Str(key) = &(key).view() {

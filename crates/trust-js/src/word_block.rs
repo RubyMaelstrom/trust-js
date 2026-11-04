@@ -408,6 +408,12 @@ impl Words {
         self.header().flags & KIND_ALL
     }
 
+    /// The kind and integrity bits and the shared-literal bit, for the element record (W4 step 4).
+    #[inline]
+    pub(crate) fn facts(&self) -> u32 {
+        self.header().flags & (KIND_ALL | KIND_FROZEN | KIND_COW)
+    }
+
     /// Whether a scan made the kind bits exact ([`KIND_SCANNED`]).
     #[inline]
     pub(crate) fn scanned(&self) -> bool {

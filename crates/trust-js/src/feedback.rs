@@ -339,6 +339,34 @@ pub(crate) enum ValueClass {
     Object = 9,
 }
 
+/// The element record (W4 step 4; feedback-schema.txt section 5.2): an element load's or store's
+/// word holds three bit sets, a byte each, ORed in. The receiver (bits 0-6), by its kind's tag:
+/// an Array, a typed array, another ordinary kind (plain objects, functions, a Map's or Set's
+/// data; `ObjectKind::is_ordinary`), an arguments object, any other object, a String, any other
+/// primitive.
+pub(crate) const ELEM_ARRAY: u32 = 1 << 0;
+pub(crate) const ELEM_TYPED_ARRAY: u32 = 1 << 1;
+pub(crate) const ELEM_ORDINARY: u32 = 1 << 2;
+pub(crate) const ELEM_ARGUMENTS: u32 = 1 << 3;
+pub(crate) const ELEM_EXOTIC: u32 = 1 << 4;
+pub(crate) const ELEM_STRING: u32 = 1 << 5;
+pub(crate) const ELEM_PRIMITIVE: u32 = 1 << 6;
+/// The key (bits 8-12), before ToPropertyKey: a Number that is an array index (an integer in
+/// 0..2^32-1, -0 included), another Number, a String, a Symbol, anything else.
+pub(crate) const ELEM_KEY_INDEX: u32 = 1 << 8;
+pub(crate) const ELEM_KEY_NUMBER: u32 = 1 << 9;
+pub(crate) const ELEM_KEY_STRING: u32 = 1 << 10;
+pub(crate) const ELEM_KEY_SYMBOL: u32 = 1 << 11;
+pub(crate) const ELEM_KEY_OTHER: u32 = 1 << 12;
+/// An Array receiver's facts (bits 16-20), from its element words' kind bits (word_block.rs): a
+/// hole, a non-Number, a non-int32 among them; frozen or a shared literal's; an index key at or
+/// past their used count.
+pub(crate) const ELEM_HOLEY: u32 = 1 << 16;
+pub(crate) const ELEM_NON_NUMBER: u32 = 1 << 17;
+pub(crate) const ELEM_NON_INT32: u32 = 1 << 18;
+pub(crate) const ELEM_UNWRITABLE: u32 = 1 << 19;
+pub(crate) const ELEM_OUT_OF_BOUNDS: u32 = 1 << 20;
+
 /// The value record's roles (W4 step 3): a word holds three ValueClass sets, operand 0 in bits
 /// 0-8, operand 1 in bits 9-17 and the result in bits 18-26.
 pub(crate) const RECORD_OPERAND1_SHIFT: u32 = 9;
@@ -716,8 +744,9 @@ pub(crate) struct FeedbackVector {
     /// Assigned only when this vector participates in profile serialization or ingestion.
     profile_vector_id: Cell<u64>,
     detailed_enabled: bool,
-    /// The always-on value record (W4 step 3, feedback-schema.txt section 5): one word a bytecode
-    /// pc, made at the chunk's first record, so a chunk that never records holds none.
+    /// The always-on records (W4, feedback-schema.txt section 5): one word a bytecode pc, the
+    /// value record's (step 3) or the element record's (step 4) by the operation, made at the
+    /// chunk's first record, so a chunk that never records holds none.
     record: OnceCell<Box<[Cell<u32>]>>,
     /// The chunk's operation count, the record's length.
     record_len: u32,
@@ -758,8 +787,8 @@ impl FeedbackVector {
     }
 
     /// OR `bits` into the record of the operation at `pc`, storing only when the word changes
-    /// (W4 step 3). The record's layout per operation kind is feedback-schema.txt's section 5;
-    /// callers write it only on the VM's paths and generated code's miss paths.
+    /// (W4 steps 3 and 4). The record's layout per operation kind is feedback-schema.txt's
+    /// section 5; callers write it only on the VM's paths and generated code's miss paths.
     #[inline]
     pub(crate) fn record(&self, pc: usize, bits: u32) {
         #[cfg(feature = "architecture-diagnostics")]

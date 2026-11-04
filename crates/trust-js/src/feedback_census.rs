@@ -231,7 +231,7 @@ pub(crate) fn dump() {
 /// The census file's text.
 fn render() -> String {
     // `records=` names the records the engine writes, whose readings the script applies.
-    let mut out = String::from("# feedback-census 1 records=values\n");
+    let mut out = String::from("# feedback-census 1 records=values,elements\n");
     STATE.with(|state| {
         let state = state.borrow();
         let mut keys: Vec<_> = state.chunks.keys().copied().collect();

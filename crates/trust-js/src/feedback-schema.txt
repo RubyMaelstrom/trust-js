@@ -106,10 +106,14 @@ applies. A site counts as usable when:
 - instanceof: its cache's way; typeof and `in`: always (the templates lower them generically);
 - arithmetic, unary, update and comparison operations: always, once the value record exists
   (step 3): its record and in-line set are the feedback, and equality is lowered by tag;
+- element loads and stores: always, once the element record exists (step 4): its record and the
+  in-line set's two-way dispatch, as the templates lower it;
 - the records' other kinds, as the steps below add them.
 Precision counts the caches' sites as coverage does, a value operation when its record read by
 rule U (section 5.1) names exactly the coarse classes the bytecode run's record saw (the VM records
-every execution there), and typeof, `in` and equality, which record nothing, as not precise.
+every execution there), an element access when its record read by rule R (section 5.2) names
+exactly the receivers and keys that record saw, and typeof, `in` and equality, which record
+nothing, as not precise.
 Branches, loops, `!` (ToBoolean) and names are counted but left out: no exemplar records branch
 directions or ToBoolean, and names mostly have static addresses.
 
@@ -152,6 +156,52 @@ not split) where the in-line set's classes were seen or the record holds them. T
 split inside the in-line set is known only where the VM or a miss recorded it: a hint for
 speculation guarded by exits, not a proof.
 
-5.2 Later steps: the element record (step 4), the named sites' generic mark (step 5), the read
-API (step 6), the pc map of inlined and recompiled code (step 7), Pilot C's store writability
-(step 9) and the dependency registry (step 10).
+5.2 The element record (step 4). An element load's or store's word (GetElem, GetElemLocal,
+GetMethodElem, SetElem, SetElemDrop, SetElemLocal, SetElemLocalDrop; UpdateElem's word is the
+value record's) holds three bit sets, a byte each (feedback.rs ELEM_*), ORed in like the value
+record's:
+  Receiver (bits 0-6), by its kind's tag: 0 an Array, 1 a typed array, 2 another ordinary kind
+    (ObjectKind::is_ordinary: plain objects, functions, a Map's or Set's data; a side-table
+    object such as a module namespace counts here, and generated code tells it by ic_plain),
+    3 an arguments object, 4 any other object (wrappers, errors, iterators, proxies), 5 a String,
+    6 any other primitive (undefined and null included).
+  Key (bits 8-12), before ToPropertyKey: 8 a Number that is an array index (an integer in
+    0..2^32-1, -0 included), 9 another Number, 10 a String, 11 a Symbol, 12 anything else.
+  An Array's facts (bits 16-20), from its element words' kind bits (word_block.rs): 16 a hole
+    (NO_HOLES clear), 17 a non-Number (NUMBERS clear), 18 a non-int32 (INT32 clear), 19 frozen
+    or a shared literal's block (FROZEN or COW), 20 an index key at or past the used words (a
+    read out of bounds, a store that appends or leaves a gap).
+
+Who writes it:
+- The VM, on every element access, before it runs it.
+- The element helpers (H_GET_ELEM's, H_SET_ELEM's, jit_exec's element operations, the elided and
+  lazy arguments' reads), only for an access outside the in-line set: get_computed_element and
+  set_computed_element record where fast_get_elem, fast_set_elem and ordinary_set_existing_index
+  decline, for a String key, and for a String receiver. x86-64, whose element accesses all take
+  these helpers, records what ARM64's in-line paths would.
+- Nothing on an in-line path.
+
+The in-line sets (receiver, key):
+  loads    an own data element of an Array or another ordinary object, or a typed array's
+           element (not BigInt content), at an array index: fast_get_elem's set, which holds
+           ARM64's templates' (an Array's or an ordinary object's words, a typed array's view)
+  stores   an own writable data element of an Array or another ordinary object, an Array's
+           append (extensible, its prototype Array.prototype with the protector intact), an
+           existing writable data property at an index, or a typed array's element with a value
+           of its content type, at an array index: fast_set_elem's and
+           ordinary_set_existing_index's set
+In the record's terms: an Array, typed-array or ordinary receiver (bits 0-2) with an index key
+(bit 8).
+
+Reading it: rule U, the receivers and keys an access saw are its record's together with the
+in-line set's; that is complete. Rule R, the record alone where it holds a receiver or key and
+the in-line set's where it holds none, is what the census's precision measures: it names them
+exactly where the VM's iteration or a miss also saw the in-line hits' receivers, and an empty
+record never tells an Array from a typed array or an ordinary object (the plan's design 2: P3
+keeps the baseline's dispatch there). An Array's facts are hints, as the value record's int32
+is: an in-line hit records none, so a fact is known only where the VM or a miss saw it, and P3
+reads the kind bits at run time, as the templates do.
+
+5.3 Later steps: the named sites' generic mark (step 5), the read API (step 6), the pc map of
+inlined and recompiled code (step 7), Pilot C's store writability (step 9) and the dependency
+registry (step 10).

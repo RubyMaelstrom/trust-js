@@ -9980,6 +9980,17 @@ impl Props {
         self.elems.words().map(word_block::Words::as_slice)
     }
 
+    /// The element words' kind, integrity and shared bits (`word_block::Words::facts`) and their
+    /// used count, for the element record (W4 step 4); a map without words has every kind fact
+    /// and none.
+    #[inline]
+    pub(crate) fn element_facts(&self) -> (u32, usize) {
+        match self.elems.words() {
+            Some(words) => (words.facts(), words.len()),
+            None => (word_block::KIND_ALL, 0),
+        }
+    }
+
     /// The packed elements of an Array whose `length` is the writable data value `len` and
     /// whose every index below it holds a plain element ([`Property::is_plain_element`]), for
     /// an edit that leaves them plain and contiguous. The caller proves ordinary Array internal
