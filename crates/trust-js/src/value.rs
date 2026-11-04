@@ -7935,7 +7935,7 @@ impl SlotMemo {
 /// (`kMaxUncheckedFastElementsLength`), and the largest span the named entries may move to
 /// (`NumberDictionary::kRequiresSlowElementsLimit`).
 const WORDS_MAX_GAP: usize = 1024;
-const WORDS_MAX_UNCHECKED: usize = 5000;
+pub(crate) const WORDS_MAX_UNCHECKED: usize = 5000;
 const WORDS_MAX_SPAN: usize = (1 << 29) - 1;
 
 /// The words V8's NumberDictionary takes for `n` elements: ComputeCapacity(n) (1.5 n rounded up

@@ -3312,10 +3312,16 @@ fn array_create(i: &mut Interp, length: u64) -> Result<Value, Value> {
     let array = i.make_array(Vec::new());
     if length != 0 {
         if let ValueView::Obj(object) = &(array).view() {
-            object
-                .borrow_mut()
-                .props
-                .set_array_length_value(length as f64);
+            let mut body = object.borrow_mut();
+            // Its callers (ArraySpeciesCreate's: slice, splice, map, concat and flat's
+            // starts) fill the elements they asked for in order: room for them up front, as
+            // V8's ArrayCreate preallocates them, instead of the appends' growth blocks (W2d step
+            // 4b's census: chai's slice results 45% smaller). A length past the words' unchecked
+            // limit (a map over a large sparse array) reserves nothing.
+            if length as usize <= crate::value::WORDS_MAX_UNCHECKED {
+                body.props.reserve_dense_exact(length as usize);
+            }
+            body.props.set_array_length_value(length as f64);
         }
     }
     Ok(array)

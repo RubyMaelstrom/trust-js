@@ -969,6 +969,7 @@ impl Words {
         );
         // The new block is this owner's own, whoever else shares the old one.
         let flags = self.header().flags & !KIND_COW;
+        let capacity = class_filled(capacity, shifted);
         let total = shifted + capacity;
         let record = record_words(total);
         // Words that keep their indices keep the old record's traced length and dirty blocks
@@ -1047,11 +1048,39 @@ fn is_number_word(word: u64) -> bool {
     tag.wrapping_sub(0x7ff9) >= 7 && tag.wrapping_sub(0xfff9) >= 2
 }
 
-/// The capacity to grow a block of `len` used words to for `additional` more: V8's
-/// (JSObject::NewElementsCapacity, `old + old / 2 + 16`), at least what is needed.
+/// The words a block grows to from none (W2d step 4b): SpiderMonkey's least element capacity,
+/// ELEMENT_CAPACITY_MIN (vm/NativeObject.h:1100-1103), which is also JSC's empty-array vector of
+/// 5 (runtime/ArrayConventions.h:80-81) filled to its storage class, here the 64-byte one; not
+/// V8's 16, whose 144-byte block takes the 192-byte class. The census of step 4b: most arrays
+/// born empty take one to four elements (Vue 36,813 of 37,497, DeltaBlue 4,111 of 4,172).
+const FIRST_WORDS: usize = 6;
+
+/// The capacity to grow a block of `len` used words to for `additional` more: [`FIRST_WORDS`]
+/// from none, else V8's (JSObject::NewElementsCapacity, `old + old / 2 + 16`), at least what is
+/// needed. [`Words::reallocate_with_room`] then fills the block's storage class.
 fn grown(len: usize, additional: usize) -> usize {
     let needed = len + additional;
-    (len + len / 2 + 16).max(needed).min(MAX_WORDS.max(needed))
+    let rule = if len == 0 {
+        FIRST_WORDS
+    } else {
+        len + len / 2 + 16
+    };
+    rule.max(needed).min(MAX_WORDS.max(needed))
+}
+
+/// The capacity a block with room for `capacity` words and `shifted` words of front room gets
+/// from its storage class (W2d step 4b, as JSC's optimalContiguousVectorLength fills a butterfly's
+/// size class, runtime/ButterflyInlines.h:72-93): the words the class holds past the header, up to
+/// [`REMEMBER_MIN`] in all, so a block keeps no remembered record it would not have kept.
+fn class_filled(capacity: usize, shifted: usize) -> usize {
+    let total = shifted + capacity;
+    if total >= REMEMBER_MIN {
+        return capacity;
+    }
+    match crate::gc_core::small_cell_class(block_size(total)) {
+        Some((_, class)) => ((class - HEADER_BYTES) / 8).min(REMEMBER_MIN) - shifted,
+        None => capacity,
+    }
 }
 
 /// A shared literal's block as a code root's late fill reports it
@@ -1076,9 +1105,8 @@ impl Clone for Words {
         }
         let mut copy = Words::new();
         if !self.is_empty() {
-            copy.reallocate(self.len(), 0);
-            // SAFETY: `reallocate` copied from the static block's empty words; the used words
-            // are written now and `used` set after.
+            copy = Words::fresh(self.len());
+            // SAFETY: a fresh exact block; the used words are written now and `used` set after.
             unsafe {
                 std::ptr::copy_nonoverlapping(self.0.as_ptr(), copy.0.as_ptr(), self.len());
             }
@@ -1252,17 +1280,39 @@ mod tests {
     }
 
     #[test]
-    fn copies_are_exact_and_growth_follows_v8() {
+    fn copies_are_exact_and_growth_follows_the_exemplars() {
         let _engine = crate::Engine::new();
         let mut words = Words::new();
         words.push(Value::Undefined);
-        assert_eq!(words.capacity(), 16, "0 + 0 / 2 + 16");
-        for _ in 0..15 {
+        assert_eq!(words.capacity(), 6, "FIRST_WORDS: the 64-byte class");
+        for _ in 0..5 {
             words.push(num(1.0));
         }
-        assert_eq!(words.capacity(), 16);
+        assert_eq!(words.capacity(), 6);
         words.push(num(2.0));
-        assert_eq!(words.capacity(), 16 + 8 + 16);
+        assert_eq!(
+            words.capacity(),
+            30,
+            "6 + 3 + 16 = 25, filled to the 256-byte class"
+        );
+        for _ in 0..23 {
+            words.push(num(3.0));
+        }
+        assert_eq!(words.capacity(), 30);
+        words.push(num(4.0));
+        assert_eq!(
+            words.capacity(),
+            62,
+            "30 + 15 + 16 = 61, filled to the 512-byte class"
+        );
+        while words.len() < 63 {
+            words.push(num(5.0));
+        }
+        assert_eq!(
+            words.capacity(),
+            62 + 31 + 16,
+            "past 64 words, V8's rule alone"
+        );
         let copy = words.clone();
         assert_eq!(copy.as_slice(), words.as_slice());
         assert_eq!((copy.capacity(), copy.kind()), (words.len(), words.kind()));
