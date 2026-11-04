@@ -711,6 +711,10 @@ pub(crate) struct FeedbackVector {
     /// Assigned only when this vector participates in profile serialization or ingestion.
     profile_vector_id: Cell<u64>,
     detailed_enabled: bool,
+    /// The feedback census's state for this vector's chunk (W4 step 2; None unless
+    /// TRUST_JS_FEEDBACK_CENSUS is set).
+    #[cfg(feature = "architecture-diagnostics")]
+    pub(crate) census: Option<Box<crate::feedback_census::ChunkCensus>>,
 }
 
 impl FeedbackVector {
@@ -730,6 +734,8 @@ impl FeedbackVector {
             words: OnceCell::new(),
             profile_vector_id: Cell::new(0),
             detailed_enabled,
+            #[cfg(feature = "architecture-diagnostics")]
+            census: None,
         }
     }
 

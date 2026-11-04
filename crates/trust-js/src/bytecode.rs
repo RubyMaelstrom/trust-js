@@ -1207,6 +1207,10 @@ pub static CALL_IC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::Atom
 #[cfg(feature = "architecture-diagnostics")]
 #[path = "call_cache_diagnostics.rs"]
 pub(crate) mod call_cache_diagnostics;
+/// The feedback census's view of a chunk (W4 step 2; `crate::feedback_census`).
+#[cfg(feature = "architecture-diagnostics")]
+#[path = "bytecode_census.rs"]
+pub(crate) mod census;
 
 /// Exhaustion permanently disables raw call caches instead of admitting a
 /// repeated generation after code has been reclaimed: the fills refuse u32::MAX, so no probe
@@ -3117,6 +3121,16 @@ pub struct Chunk {
     pub(crate) jit_budget_wait_bytes: std::cell::Cell<usize>,
     /// Separate native entry kind borrowing a live Script VM activation.
     pub(crate) osr: std::cell::OnceCell<Box<crate::tiering::OsrCodeState>>,
+}
+
+/// The feedback census snapshots a chunk's production feedback when it drops (W4 step 2).
+#[cfg(feature = "architecture-diagnostics")]
+impl Drop for Chunk {
+    fn drop(&mut self) {
+        if self.feedback.census.is_some() {
+            self.feedback_census_snapshot();
+        }
+    }
 }
 
 struct FunctionOsrEntry {
@@ -8866,6 +8880,33 @@ fn finish_chunk(
         let (layout, bindings) = feedback_layout_for_ops(&c.ops, &c.names);
         crate::feedback::FeedbackVector::new(layout, bindings)
     };
+    #[cfg(feature = "architecture-diagnostics")]
+    let feedback = {
+        let mut feedback = feedback;
+        if crate::feedback_census::enabled() {
+            let (start, len, url, name) = source.map_or_else(
+                || (0, 0, String::new(), String::new()),
+                |func| {
+                    (
+                        func.start,
+                        func.source.as_ref().map_or(0, |text| text.len() as u32),
+                        func.script
+                            .as_ref()
+                            .map_or_else(String::new, |script| script.url().to_string()),
+                        func.name.clone().unwrap_or_default(),
+                    )
+                },
+            );
+            let key = crate::feedback_census::chunk_key(&format!("{:?}", c.ops), start, len, &url);
+            feedback.census = Some(Box::new(crate::feedback_census::ChunkCensus::new(
+                key,
+                hot.is_some(),
+                format!("{name}@{url}:{start}+{len}"),
+                c.ops.len(),
+            )));
+        }
+        feedback
+    };
     if let Some(func) = source.filter(|_| {
         env_flag!("TRUST_JS_NULLISH_TRACE")
             && c.ops.len() == 179
@@ -9059,6 +9100,10 @@ fn finish_chunk(
     };
     let chunk = Rc::new(chunk);
     crate::value::register_code_roots(&chunk);
+    #[cfg(feature = "architecture-diagnostics")]
+    if chunk.feedback.census.is_some() {
+        crate::feedback_census::register(&chunk);
+    }
     Some(chunk)
 }
 
@@ -18155,6 +18200,10 @@ fn run_vm_inner(
         let op_pc = *pc;
         let op = chunk.ops[op_pc];
         *pc += 1;
+        #[cfg(feature = "architecture-diagnostics")]
+        if let Some(census) = chunk.feedback.census.as_deref() {
+            census.count(op_pc);
+        }
         // A checked operation can enter author code implicitly (getter, coercion, trap).
         // Its logical spliced callers must remain visible throughout that callback.
         let _inline_position = unsafe { ImplicitCallPosition::enter(interpreter, chunk, op_pc) };

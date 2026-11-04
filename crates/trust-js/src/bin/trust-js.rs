@@ -136,6 +136,7 @@ fn main() {
 /// the shell (and behind the existing opt-in switch) so library embedders retain control of their
 /// own idle/collection boundaries and normal CLI runs do no extra work.
 fn finalize_performance_metrics(engine: &mut Engine) {
+    trust_js::unstable_feedback_census_dump();
     if let Some(report) = trust_js::unstable_regexp_prof_report() {
         eprintln!("[regexp-prof] {report}");
     }

@@ -132,6 +132,16 @@ comment/example in the same change.
 - `TRUST_JS_FEEDBACK_PROFILE=1` enables the detailed per-site feedback vector; it changes
   the execution paths that collect it, so its observations are not observations of ordinary
   optimized execution and it is never an acceptance setting.
+- `TRUST_JS_FEEDBACK_CENSUS=<path>` (builds with the `architecture-diagnostics` feature; ordinary
+  builds compile it out) writes the feedback census to `<path>` at the shell's exit: the
+  operations the VM's loop dispatched, by chunk and bytecode pc, and each site's production
+  feedback (its property, call, construct and name caches and allocation images, snapshotted when
+  its chunk drops or at exit). Run a program twice, once with `--tier=bytecode` (every
+  compiled-code operation passes the VM's loop, so its counts are executions) and once with the
+  production `--tier=jit`, and `python3 -I scripts/feedback-census.py <bytecode file> <jit file>`
+  prints, by operation kind, the executions and the share whose site has usable feedback:
+  coverage (crates/trust-js/src/feedback-schema.txt, section 4). A function's first calls in the
+  tree-walker have no pcs and are not counted.
 - `TRUST_JS_GC_LOG=1` logs collections, each line with its phases' times in microseconds:
   `pause`, the whole collection, the time the program waited for it; `mark` and `sweep` as the
   engine drives them, `engine` for what the engine does around the heap's phases; for a major

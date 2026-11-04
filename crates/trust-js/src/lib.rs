@@ -132,6 +132,11 @@ fn scrubbed<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 mod deopt;
+/// The feedback census (W4 step 2): a diagnostic compiled only with `architecture-diagnostics`.
+#[cfg(feature = "architecture-diagnostics")]
+mod feedback_census;
+#[cfg(all(test, feature = "architecture-diagnostics"))]
+mod feedback_census_tests;
 mod gc_handle;
 mod gc_native;
 #[cfg(test)]
@@ -341,6 +346,14 @@ pub use stack_trace::SourceOrigin;
 /// Opt-in matcher profiling report (`TRUST_JS_REGEXP_PROF=1`); `None` when disabled or idle.
 pub fn unstable_regexp_prof_report() -> Option<String> {
     crate::regex::regexp_prof_report()
+}
+
+/// Write the feedback census's file (`TRUST_JS_FEEDBACK_CENSUS`, DIAGNOSTICS.md) at the shell's
+/// exit. Nothing happens in a build without the `architecture-diagnostics` feature.
+#[doc(hidden)]
+pub fn unstable_feedback_census_dump() {
+    #[cfg(feature = "architecture-diagnostics")]
+    crate::feedback_census::dump();
 }
 
 pub fn unstable_performance_metrics_json(engine: &Engine) -> Option<String> {

@@ -87,7 +87,26 @@ stores, calls, constructions, arithmetic, unary, update and comparison operation
 speculative tier could compile without an exit for missing feedback (V8's sense of usable
 feedback; megamorphic and generic count as usable). Precision: the share whose feedback names
 exactly the coarse classes the operation saw. W4's census (the plan's "W4: feedback for the
-speculative tier") measured both; its census tool makes them a tracked diagnostic (W4 step 2).
+speculative tier") measured both.
+
+The census tool (W4 step 2; crates/trust-js/src/feedback_census.rs, compiled only with the
+architecture-diagnostics feature, so ordinary builds pay nothing) measures them on any program:
+TRUST_JS_FEEDBACK_CENSUS=<path> writes, at the shell's exit, the operations the VM's loop
+dispatched by chunk and pc and each site's production feedback; scripts/feedback-census.py joins
+a --tier=bytecode run (whose dispatches are every compiled-code execution) with a --tier=jit
+run (whose snapshot is the production feedback) and prints both shares by kind (DIAGNOSTICS.md).
+Its file's header names the records the engine writes (`records=`), whose readings the script
+applies. A site counts as usable when:
+- named load or store: a filled way of its property cache;
+- call: a filled way or the megamorphic state of its CallSite (spread and argument-array calls
+  have no cache);
+- construct: its ConstructSite's way;
+- allocation: its image (object and array literals, RegExp literals), or always for closures and
+  empty literals, which need no per-site state;
+- instanceof: its cache's way; typeof and `in`: always (the templates lower them generically);
+- the records' kinds, as the steps below add them.
+Branches, loops, `!` (ToBoolean) and names are counted but left out: no exemplar records branch
+directions or ToBoolean, and names mostly have static addresses.
 
 5. Added by W4's later steps (the plan's W4 design note; each step updates this file)
 
