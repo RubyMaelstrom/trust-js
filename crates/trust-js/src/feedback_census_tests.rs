@@ -32,7 +32,7 @@ fn chunk_ops(text: &str, name: &str) -> ((u32, u32), Vec<(u8, u64, u32, String)>
                 fields[4].parse().unwrap(),
                 fields[5].parse().unwrap(),
                 u32::from_str_radix(fields[6], 16).unwrap(),
-                fields[7].to_string(),
+                fields[9].to_string(),
             )),
             _ => {}
         }

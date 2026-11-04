@@ -10,10 +10,11 @@
 //! of their operations and their function's origin, which the two runs share; an inlined
 //! (transformed) chunk is keyed apart, since its pcs are its own.
 //!
-//! The file: a `#` header line; per chunk key a `C` line (key, inlined, chunks merged into it,
-//! chunks with native code, label); per pc with anything to say an `O` line (key, inlined, pc,
-//! census kind, VM dispatches, state word in hex, operation). The state word's meaning per kind is
-//! `Chunk::feedback_census_snapshot`'s.
+//! The file: a `#` header line naming the records the engine writes; per chunk key a `C` line
+//! (key, inlined, chunks merged into it, chunks with native code, label); per pc with anything to
+//! say an `O` line (key, inlined, pc, census kind, VM dispatches, state word in hex, the
+//! always-on record's writes, its word in hex, operation). The state word's meaning per kind is
+//! `Chunk::feedback_census_snapshot`'s; the record's is feedback-schema.txt's section 5.
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::io::Write;
@@ -59,6 +60,9 @@ pub(crate) struct ChunkCensus {
     pub(crate) inlined: bool,
     pub(crate) label: String,
     counts: Box<[Cell<u64>]>,
+    /// The always-on record's writes per pc (W4 step 3): the VM's executions, and generated
+    /// code's misses outside their in-line sets.
+    records: Box<[Cell<u64>]>,
     /// Snapshotted already (at exit or by a test), so its drop adds nothing.
     snapped: Cell<bool>,
 }
@@ -70,6 +74,7 @@ impl ChunkCensus {
             inlined,
             label,
             counts: (0..ops).map(|_| Cell::new(0)).collect(),
+            records: (0..ops).map(|_| Cell::new(0)).collect(),
             snapped: Cell::new(false),
         }
     }
@@ -78,6 +83,14 @@ impl ChunkCensus {
     #[inline(always)]
     pub(crate) fn count(&self, pc: usize) {
         if let Some(cell) = self.counts.get(pc) {
+            cell.set(cell.get() + 1);
+        }
+    }
+
+    /// Count one write of the always-on record at `pc`.
+    #[inline(always)]
+    pub(crate) fn count_record(&self, pc: usize) {
+        if let Some(cell) = self.records.get(pc) {
             cell.set(cell.get() + 1);
         }
     }
@@ -105,7 +118,9 @@ struct OpRecord {
     op: String,
     kind: u8,
     count: u64,
+    records: u64,
     state: u32,
+    record: u32,
 }
 
 #[derive(Default)]
@@ -137,11 +152,12 @@ pub(crate) fn register(chunk: &std::rc::Rc<crate::bytecode::Chunk>) {
     });
 }
 
-/// One operation of a chunk's snapshot: its text, census kind and state word.
+/// One operation of a chunk's snapshot: its text, census kind, state word and always-on record.
 pub(crate) struct OpSnapshot {
     pub(crate) op: String,
     pub(crate) kind: u8,
     pub(crate) state: u32,
+    pub(crate) record: u32,
 }
 
 /// Merge a chunk's snapshot with its dispatch counts (at its drop, or at exit for a live one),
@@ -174,7 +190,9 @@ pub(crate) fn merge(census: &ChunkCensus, ops: Vec<OpSnapshot>, native: bool) {
                 slot.kind = snapshot.kind;
             }
             slot.state |= snapshot.state;
+            slot.record |= snapshot.record;
             slot.count += census.counts.get(pc).map_or(0, Cell::get);
+            slot.records += census.records.get(pc).map_or(0, Cell::get);
         }
     });
 }
@@ -212,7 +230,8 @@ pub(crate) fn dump() {
 
 /// The census file's text.
 fn render() -> String {
-    let mut out = String::from("# feedback-census 1\n");
+    // `records=` names the records the engine writes, whose readings the script applies.
+    let mut out = String::from("# feedback-census 1 records=values\n");
     STATE.with(|state| {
         let state = state.borrow();
         let mut keys: Vec<_> = state.chunks.keys().copied().collect();
@@ -228,17 +247,19 @@ fn render() -> String {
                 record.label.replace(['\t', '\n'], " ")
             ));
             for (pc, op) in record.ops.iter().enumerate() {
-                if op.count == 0 && op.state == 0 {
+                if op.count == 0 && op.state == 0 && op.record == 0 && op.records == 0 {
                     continue;
                 }
                 out.push_str(&format!(
-                    "O\t{:016x}\t{}\t{}\t{}\t{}\t{:x}\t{}\n",
+                    "O\t{:016x}\t{}\t{}\t{}\t{}\t{:x}\t{}\t{:x}\t{}\n",
                     key.0,
                     u8::from(key.1),
                     pc,
                     op.kind,
                     op.count,
                     op.state,
+                    op.records,
+                    op.record,
                     op.op.replace(['\t', '\n'], " ")
                 ));
             }

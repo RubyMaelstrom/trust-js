@@ -6485,6 +6485,118 @@ fn observe_arithmetic_value(
     }
 }
 
+/// The ValueClass bit of `value` for the always-on record (W4 step 3), as
+/// [`arithmetic_value_class`] classes it: an int32 is a Number equal to its int32 truncation and
+/// not -0.
+#[inline(always)]
+fn value_class_bit(value: &Value) -> u32 {
+    use crate::feedback::ValueClass;
+    match value.view() {
+        ValueView::Num(number) => {
+            let int = number as i32;
+            if int as f64 == number && (int != 0 || number.to_bits() == 0) {
+                ValueClass::NumberInt32.bit()
+            } else {
+                ValueClass::NumberDouble.bit()
+            }
+        }
+        ValueView::Undefined => ValueClass::Undefined.bit(),
+        ValueView::Null => ValueClass::Null.bit(),
+        ValueView::Bool(_) => ValueClass::Boolean.bit(),
+        ValueView::Str(_) => ValueClass::String.bit(),
+        ValueView::BigInt(_) => ValueClass::BigInt.bit(),
+        ValueView::Sym(_) => ValueClass::Symbol.bit(),
+        ValueView::Obj(_) => ValueClass::Object.bit(),
+        ValueView::Empty => 0,
+    }
+}
+
+#[inline(always)]
+fn is_number(value: &Value) -> bool {
+    matches!(value.view(), ValueView::Num(_))
+}
+
+/// Record a binary operation's operands and result (the VM records every execution).
+#[inline(always)]
+fn record_binary(
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
+    left: &Value,
+    right: &Value,
+    result: &Value,
+) {
+    use crate::feedback::{RECORD_OPERAND1_SHIFT, RECORD_RESULT_SHIFT};
+    feedback.record(
+        pc,
+        value_class_bit(left)
+            | (value_class_bit(right) << RECORD_OPERAND1_SHIFT)
+            | (value_class_bit(result) << RECORD_RESULT_SHIFT),
+    );
+}
+
+/// Record a unary or update operation's operand and result.
+#[inline(always)]
+fn record_unary(
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
+    operand: &Value,
+    result: &Value,
+) {
+    feedback.record(
+        pc,
+        value_class_bit(operand)
+            | (value_class_bit(result) << crate::feedback::RECORD_RESULT_SHIFT),
+    );
+}
+
+/// Record a relational comparison's operands (`<`, `>`, `<=`, `>=`; equality records nothing,
+/// the plan's W4 decision 3).
+#[inline(always)]
+fn record_comparison(
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
+    left: &Value,
+    right: &Value,
+) {
+    feedback.record(
+        pc,
+        value_class_bit(left) | (value_class_bit(right) << crate::feedback::RECORD_OPERAND1_SHIFT),
+    );
+}
+
+/// A miss path's record of a binary operation that the caller does not split by its operands
+/// (`**` through GenBin; `%`'s Number case): nothing when its operands and result lie in the
+/// operation's in-line set (feedback-schema.txt section 5), which generated code takes without
+/// a record. `int32` selects the remainder's in-line set (int32 operands and result); every
+/// other binary operation's is Number. The helpers' Number paths record nothing and test
+/// nothing, so x86-64, which runs its arithmetic in them, pays nothing for Numbers.
+#[inline(always)]
+fn record_binary_miss(
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
+    int32: bool,
+    left: &Value,
+    right: &Value,
+    result: &Value,
+) {
+    let inline = if int32 {
+        [left, right, result]
+            .iter()
+            .all(|value| value.as_num_opt().is_some_and(crate::value::f64_exact_i32))
+    } else {
+        is_number(left) && is_number(right) && is_number(result)
+    };
+    if !inline {
+        record_binary(feedback, pc, left, right, result);
+    }
+}
+
+/// The relational comparisons, the operations among `bin_cmp`'s whose operands are recorded.
+#[inline(always)]
+fn records_comparison(op: &str) -> bool {
+    matches!(op, "<" | ">" | "<=" | ">=")
+}
+
 #[inline(always)]
 fn observe_arithmetic_operand(
     feedback: &crate::feedback::FeedbackVector,
@@ -7098,6 +7210,7 @@ mod feedback_layout_tests {
             &mut interp,
             &feedback,
             0,
+            false,
             UpdKind::PostInc,
             Value::lstr("4"),
             |_, value| {
@@ -7143,6 +7256,7 @@ mod feedback_layout_tests {
             &mut interp,
             &feedback,
             0,
+            false,
             UpdKind::PreInc,
             Value::Num(2.0),
             |interp, _| Err(interp.throw("TypeError", "setter rejected update")),
@@ -8876,9 +8990,10 @@ fn finish_chunk(
         // The transformed/inlined bytecode has different PCs. Retain the baseline schema without
         // guessing new runtime bindings; the original chunk remains the current-shape adapter.
         crate::feedback::FeedbackVector::unbound(chunk.feedback.layout().clone())
+            .with_record_len(c.ops.len())
     } else {
         let (layout, bindings) = feedback_layout_for_ops(&c.ops, &c.names);
-        crate::feedback::FeedbackVector::new(layout, bindings)
+        crate::feedback::FeedbackVector::new(layout, bindings).with_record_len(c.ops.len())
     };
     #[cfg(feature = "architecture-diagnostics")]
     let feedback = {
@@ -18256,6 +18371,7 @@ fn run_vm_inner(
                             UpdKind::PreDec | UpdKind::PostDec | UpdKind::DecDiscard => old - 1.0,
                         };
                         slots.write_value(idx, Value::Num(new));
+                        record_unary(&chunk.feedback, op_pc, &current, &Value::Num(new));
                         observe_arithmetic_result(
                             &chunk.feedback,
                             op_pc,
@@ -18284,6 +18400,7 @@ fn run_vm_inner(
                             }
                         };
                         let value = Value::BigInt(new);
+                        record_unary(&chunk.feedback, op_pc, &current, &value);
                         observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &value);
                         slots.write_value(idx, value);
                         match kind {
@@ -18297,7 +18414,7 @@ fn run_vm_inner(
                     _ => {
                         let old = current;
                         if let Some(value) =
-                            step_value(i, &chunk.feedback, op_pc, kind, old, |_, value| {
+                            step_value(i, &chunk.feedback, op_pc, false, kind, old, |_, value| {
                                 slots.write_value(idx, value);
                                 Ok(())
                             })?
@@ -18456,7 +18573,7 @@ fn run_vm_inner(
             Op::UpdateConst(n, kind) => {
                 let old = pop!();
                 let name = chunk.names[n as usize].clone();
-                step_value(i, &chunk.feedback, op_pc, kind, old, |i, _| {
+                step_value(i, &chunk.feedback, op_pc, false, kind, old, |i, _| {
                     Err(i.throw(
                         "TypeError",
                         format!("assignment to constant variable '{name}'"),
@@ -19106,9 +19223,11 @@ fn run_vm_inner(
                 }
                 if chunk.feedback.detailed_enabled() {
                     let old = get_element_profiled(i, chunk, op_pc, &obj, &key)?;
-                    if let Some(v) = step_value(i, &chunk.feedback, op_pc, kind, old, |i, v| {
-                        set_element_profiled(i, chunk, op_pc, &obj, &key, v)
-                    })? {
+                    if let Some(v) =
+                        step_value(i, &chunk.feedback, op_pc, false, kind, old, |i, v| {
+                            set_element_profiled(i, chunk, op_pc, &obj, &key, v)
+                        })?
+                    {
                         stack.push(v);
                     }
                     continue;
@@ -19196,14 +19315,16 @@ fn run_vm_inner(
             Op::UShr => bin_num(i, stack, &chunk.feedback, op_pc, ">>>", |a, b| {
                 ((crate::eval::to_int32(a) as u32) >> (crate::eval::to_int32(b) as u32 & 31)) as f64
             })?,
-            Op::Lt => bin_cmp(i, &mut *stack, "<", |a, b| a < b)?,
-            Op::Gt => bin_cmp(i, &mut *stack, ">", |a, b| a > b)?,
-            Op::Le => bin_cmp(i, &mut *stack, "<=", |a, b| a <= b)?,
-            Op::Ge => bin_cmp(i, &mut *stack, ">=", |a, b| a >= b)?,
-            Op::EqEq => bin_cmp(i, &mut *stack, "==", |a, b| a == b)?,
-            Op::NotEq => bin_cmp(i, &mut *stack, "!=", |a, b| a != b)?,
-            Op::StrictEq => bin_cmp(i, &mut *stack, "===", |a, b| a == b)?,
-            Op::StrictNotEq => bin_cmp(i, &mut *stack, "!==", |a, b| a != b)?,
+            Op::Lt => bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, "<", |a, b| a < b)?,
+            Op::Gt => bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, ">", |a, b| a > b)?,
+            Op::Le => bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, "<=", |a, b| a <= b)?,
+            Op::Ge => bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, ">=", |a, b| a >= b)?,
+            Op::EqEq => bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, "==", |a, b| a == b)?,
+            Op::NotEq => bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, "!=", |a, b| a != b)?,
+            Op::StrictEq => bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, "===", |a, b| a == b)?,
+            Op::StrictNotEq => {
+                bin_cmp(i, &mut *stack, &chunk.feedback, op_pc, "!==", |a, b| a != b)?
+            }
             Op::InstanceOf(c) => {
                 let b = pop!();
                 let a = pop!();
@@ -19230,6 +19351,7 @@ fn run_vm_inner(
                 } else {
                     i.binary(&chunk.names[n as usize], a, b)?
                 };
+                record_binary(&chunk.feedback, op_pc, &a, &b, &v);
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
             }
@@ -19240,6 +19362,7 @@ fn run_vm_inner(
                     Some(value) => value,
                     None => i.eval_unary_vm("-", a)?,
                 };
+                record_unary(&chunk.feedback, op_pc, &a, &v);
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
             }
@@ -19250,6 +19373,7 @@ fn run_vm_inner(
                     Some(value) => value,
                     None => i.eval_unary_vm("+", a)?,
                 };
+                record_unary(&chunk.feedback, op_pc, &a, &v);
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
             }
@@ -19264,6 +19388,7 @@ fn run_vm_inner(
                     Some(value) => value,
                     None => i.eval_unary_vm("~", a)?,
                 };
+                record_unary(&chunk.feedback, op_pc, &a, &v);
                 observe_arithmetic_result(&chunk.feedback, op_pc, profiling, &v);
                 stack.push(v);
             }
@@ -19743,7 +19868,7 @@ fn run_vm_inner(
                 let base = pop!();
                 let old = i.private_get_vm(&chunk.names[name as usize], &base, env, None)?;
                 if let Some(value) =
-                    step_value(i, &chunk.feedback, op_pc, kind, old, |i, value| {
+                    step_value(i, &chunk.feedback, op_pc, false, kind, old, |i, value| {
                         i.private_set_vm(&chunk.names[name as usize], &base, value, env, None)
                     })?
                 {
@@ -19842,7 +19967,7 @@ fn run_vm_inner(
                 let key = i.to_property_key(&key)?;
                 let old = i.get_member_recv(&base, &key, receiver)?;
                 if let Some(value) =
-                    step_value(i, &chunk.feedback, op_pc, kind, old, |i, value| {
+                    step_value(i, &chunk.feedback, op_pc, false, kind, old, |i, value| {
                         i.set_member_recv(&base, &key, value, receiver).map(|_| ())
                     })?
                 {
@@ -21386,25 +21511,42 @@ fn step_value(
     i: &mut Interp,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
+    miss: bool,
     kind: UpdKind,
     old: Value,
     set: impl FnOnce(&mut Interp, Value) -> Result<(), Abrupt>,
 ) -> Result<Option<Value>, Abrupt> {
     let profiling = observe_arithmetic_operand(feedback, pc, &old);
+    let recorded_old = old;
     let inc = matches!(
         kind,
         UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
     );
-    let old_numeric = i.to_numeric(old)?;
-    let new_value = match &(old_numeric).view() {
-        ValueView::BigInt(old) => {
-            let one = crate::bigint::JsBigInt::from_u64(1);
-            Value::BigInt(if inc { old.add(&one) } else { old.sub(&one) })
+    // A Number is its own ToNumeric, and its update every update's in-line set (W4 step 3): a
+    // miss path (`miss`, generated code's) records only the other operands; the VM records all.
+    let (old_numeric, new_value, in_line) = match old.view() {
+        ValueView::Num(old) => (
+            Value::Num(old),
+            Value::Num(if inc { old + 1.0 } else { old - 1.0 }),
+            miss,
+        ),
+        _ => {
+            let old_numeric = i.to_numeric(old)?;
+            let new_value = match &(old_numeric).view() {
+                ValueView::BigInt(old) => {
+                    let one = crate::bigint::JsBigInt::from_u64(1);
+                    Value::BigInt(if inc { old.add(&one) } else { old.sub(&one) })
+                }
+                ValueView::Num(old) => Value::Num(if inc { old + 1.0 } else { old - 1.0 }),
+                _ => unreachable!("ToNumeric returns only Number or BigInt"),
+            };
+            (old_numeric, new_value, false)
         }
-        ValueView::Num(old) => Value::Num(if inc { old + 1.0 } else { old - 1.0 }),
-        _ => unreachable!("ToNumeric returns only Number or BigInt"),
     };
     set(i, new_value)?;
+    if !in_line {
+        record_unary(feedback, pc, &recorded_old, &new_value);
+    }
     observe_arithmetic_result(feedback, pc, profiling, &new_value);
     Ok(match kind {
         UpdKind::PreInc | UpdKind::PreDec => Some(new_value),
@@ -21423,7 +21565,7 @@ fn step_and_store(
     old: Value,
     set: impl FnOnce(&mut Interp, Value) -> Result<(), Abrupt>,
 ) -> Result<(), Abrupt> {
-    if let Some(v) = step_value(i, feedback, pc, kind, old, set)? {
+    if let Some(v) = step_value(i, feedback, pc, false, kind, old, set)? {
         stack.push(v);
     }
     Ok(())
@@ -21678,6 +21820,7 @@ fn bin_num(
         Some(value) => value,
         None => i.binary(op, a, b)?,
     };
+    record_binary(feedback, pc, &a, &b, &v);
     observe_arithmetic_result(feedback, pc, profiling, &v);
     stack.push(v);
     Ok(())
@@ -21782,6 +21925,7 @@ fn bin_i32(
         Some(value) => value,
         None => i.binary(op, a, b)?,
     };
+    record_binary(feedback, pc, &a, &b, &v);
     observe_arithmetic_result(feedback, pc, profiling, &v);
     stack.push(v);
     Ok(())
@@ -21791,11 +21935,16 @@ fn bin_i32(
 fn bin_cmp(
     i: &mut Interp,
     stack: &mut ValueStack,
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
     op: &'static str,
     f: impl Fn(f64, f64) -> bool,
 ) -> Result<(), Abrupt> {
     let b = stack.pop().expect("vm stack underflow");
     let a = stack.pop().expect("vm stack underflow");
+    if records_comparison(op) {
+        record_comparison(feedback, pc, &a, &b);
+    }
     let v = match try_numeric_cmp(&a, &b, &f) {
         Some(value) => value,
         None => i.binary(op, a, b)?,
@@ -21824,6 +21973,11 @@ impl Chunk {
     }
     pub(crate) fn jit_detailed_feedback_enabled(&self) -> bool {
         self.feedback.detailed_enabled()
+    }
+    /// The always-on record of the operation at `pc` (W4 step 3; feedback-schema.txt section 5).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn feedback_record(&self, pc: usize) -> u32 {
+        self.feedback.record_word(pc)
     }
     /// Leading slot names, for debug identification of a chunk (`TRUST_JS_JIT_DUMP`).
     pub(crate) fn jit_slot_names(&self) -> &[Rc<str>] {
@@ -24293,6 +24447,15 @@ pub(crate) unsafe extern "C" fn jit_add_strings(
     let ValueView::Str(right) = (unsafe { base.add(1).read() }).view() else {
         unreachable!()
     };
+    {
+        use crate::feedback::{ValueClass, RECORD_OPERAND1_SHIFT, RECORD_RESULT_SHIFT};
+        let string = ValueClass::String.bit();
+        let chunk = unsafe { &*(*ctx).chunk };
+        chunk.feedback.record(
+            pc as usize,
+            string | (string << RECORD_OPERAND1_SHIFT) | (string << RECORD_RESULT_SHIFT),
+        );
+    }
     if left.unit_len().saturating_add(right.unit_len()) > crate::interpreter::MAX_STR_LEN {
         let ctx = unsafe { &mut *ctx };
         let i = unsafe { &mut *ctx.interp };
@@ -27790,10 +27953,12 @@ unsafe fn jit_exec_inner(
                 ));
             }
             let old = slots.read_value(idx);
-            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |_, v| {
-                slots.write_value(idx, v);
-                Ok(())
-            })? {
+            if let Some(v) =
+                step_value(i, &chunk.feedback, pc as usize, true, kind, old, |_, v| {
+                    slots.write_value(idx, v);
+                    Ok(())
+                })?
+            {
                 push!(v);
             }
         }
@@ -27823,18 +27988,22 @@ unsafe fn jit_exec_inner(
                 }
                 bd.value()
             };
-            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.write_prepared_reference(&mut reference, v)
-            })? {
+            if let Some(v) =
+                step_value(i, &chunk.feedback, pc as usize, true, kind, old, |i, v| {
+                    i.write_prepared_reference(&mut reference, v)
+                })?
+            {
                 push!(v);
             }
         }
         Op::UpdateName(n, kind) => {
             let mut reference = chunk.resolve_name_reference(i, env, n)?;
             let old = i.read_prepared_reference(&mut reference)?;
-            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.write_prepared_reference(&mut reference, v)
-            })? {
+            if let Some(v) =
+                step_value(i, &chunk.feedback, pc as usize, true, kind, old, |i, v| {
+                    i.write_prepared_reference(&mut reference, v)
+                })?
+            {
                 push!(v);
             }
         }
@@ -27842,17 +28011,18 @@ unsafe fn jit_exec_inner(
             // The binding a static address names stays the Reference's through ToNumeric.
             let result = if let Some((record, slot)) = chunk.static_store_target(env, n, c) {
                 let old = Chunk::static_target_value(&record, slot);
-                let result = step_value(i, &chunk.feedback, pc as usize, kind, old, |_, v| {
-                    Chunk::static_target_store(&record, slot, v);
-                    Ok(())
-                })?;
+                let result =
+                    step_value(i, &chunk.feedback, pc as usize, true, kind, old, |_, v| {
+                        Chunk::static_target_store(&record, slot, v);
+                        Ok(())
+                    })?;
                 chunk.fill_static_store_cache(i, env, n, c);
                 result
             } else {
                 let mut reference = chunk.resolve_name_reference(i, env, n)?;
                 let old = i.read_prepared_reference(&mut reference)?;
                 let _ = chunk.name_ic_fill(i, env, n, c, true);
-                step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
+                step_value(i, &chunk.feedback, pc as usize, true, kind, old, |i, v| {
                     i.write_prepared_reference(&mut reference, v)
                 })?
             };
@@ -28253,9 +28423,11 @@ unsafe fn jit_exec_inner(
             let obj = pop!();
             let cache = &chunk.caches[c as usize];
             let old = get_named_property(i, chunk, pc as usize, &obj, n, cache)?;
-            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                set_named_property(i, chunk, pc as usize, &obj, n, v, cache)
-            })? {
+            if let Some(v) =
+                step_value(i, &chunk.feedback, pc as usize, true, kind, old, |i, v| {
+                    set_named_property(i, chunk, pc as usize, &obj, n, v, cache)
+                })?
+            {
                 push!(v);
             }
         }
@@ -28284,9 +28456,11 @@ unsafe fn jit_exec_inner(
             }
             if chunk.feedback.detailed_enabled() {
                 let old = get_element_profiled(i, chunk, pc as usize, &obj, &key)?;
-                if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                    set_element_profiled(i, chunk, pc as usize, &obj, &key, v)
-                })? {
+                if let Some(v) =
+                    step_value(i, &chunk.feedback, pc as usize, true, kind, old, |i, v| {
+                        set_element_profiled(i, chunk, pc as usize, &obj, &key, v)
+                    })?
+                {
                     push!(v);
                 }
                 return Ok(());
@@ -28297,9 +28471,11 @@ unsafe fn jit_exec_inner(
             }
             let k = i.to_property_key(&key)?;
             let old = i.get_member_key(&obj, &k)?;
-            if let Some(v) = step_value(i, &chunk.feedback, pc as usize, kind, old, |i, v| {
-                i.set_member_key(&obj, &k, v)
-            })? {
+            if let Some(v) =
+                step_value(i, &chunk.feedback, pc as usize, true, kind, old, |i, v| {
+                    i.set_member_key(&obj, &k, v)
+                })?
+            {
                 push!(v);
             }
         }
@@ -28359,16 +28535,25 @@ unsafe fn jit_exec_inner(
             push!(obj);
             push!(m);
         }
-        Op::Add => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "+", |a, b| a + b)?,
-        Op::Sub => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "-", |a, b| a - b)?,
-        Op::Mul => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "*", |a, b| a * b)?,
-        Op::Div => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "/", |a, b| a / b)?,
+        Op::Add => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "+", false, |a, b| {
+            a + b
+        })?,
+        Op::Sub => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "-", false, |a, b| {
+            a - b
+        })?,
+        Op::Mul => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "*", false, |a, b| {
+            a * b
+        })?,
+        Op::Div => jit_bin_num(i, sp, &chunk.feedback, pc as usize, "/", false, |a, b| {
+            a / b
+        })?,
         Op::Mod => jit_bin_num(
             i,
             sp,
             &chunk.feedback,
             pc as usize,
             "%",
+            true,
             crate::eval::js_mod,
         )?,
         Op::BitAnd => jit_bin_i32(i, sp, &chunk.feedback, pc as usize, "&", |a, b| a & b)?,
@@ -28380,17 +28565,17 @@ unsafe fn jit_exec_inner(
         Op::Shr => jit_bin_i32(i, sp, &chunk.feedback, pc as usize, ">>", |a, b| {
             a >> (b as u32 & 31)
         })?,
-        Op::UShr => jit_bin_num(i, sp, &chunk.feedback, pc as usize, ">>>", |a, b| {
+        Op::UShr => jit_bin_num(i, sp, &chunk.feedback, pc as usize, ">>>", false, |a, b| {
             ((crate::eval::to_int32(a) as u32) >> (crate::eval::to_int32(b) as u32 & 31)) as f64
         })?,
-        Op::Lt => jit_bin_cmp(i, sp, "<", |a, b| a < b)?,
-        Op::Gt => jit_bin_cmp(i, sp, ">", |a, b| a > b)?,
-        Op::Le => jit_bin_cmp(i, sp, "<=", |a, b| a <= b)?,
-        Op::Ge => jit_bin_cmp(i, sp, ">=", |a, b| a >= b)?,
-        Op::EqEq => jit_bin_cmp(i, sp, "==", |a, b| a == b)?,
-        Op::NotEq => jit_bin_cmp(i, sp, "!=", |a, b| a != b)?,
-        Op::StrictEq => jit_bin_cmp(i, sp, "===", |a, b| a == b)?,
-        Op::StrictNotEq => jit_bin_cmp(i, sp, "!==", |a, b| a != b)?,
+        Op::Lt => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, "<", |a, b| a < b)?,
+        Op::Gt => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, ">", |a, b| a > b)?,
+        Op::Le => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, "<=", |a, b| a <= b)?,
+        Op::Ge => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, ">=", |a, b| a >= b)?,
+        Op::EqEq => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, "==", |a, b| a == b)?,
+        Op::NotEq => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, "!=", |a, b| a != b)?,
+        Op::StrictEq => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, "===", |a, b| a == b)?,
+        Op::StrictNotEq => jit_bin_cmp(i, sp, &chunk.feedback, pc as usize, "!==", |a, b| a != b)?,
         Op::InstanceOf(c) => {
             let b = pop!();
             let a = pop!();
@@ -28409,6 +28594,7 @@ unsafe fn jit_exec_inner(
             let a = pop!();
             let profiling = observe_arithmetic_operands(&chunk.feedback, pc as usize, &a, &b);
             let v = i.binary(&chunk.names[n as usize], a, b)?;
+            record_binary_miss(&chunk.feedback, pc as usize, false, &a, &b, &v);
             observe_arithmetic_result(&chunk.feedback, pc as usize, profiling, &v);
             push!(v);
         }
@@ -28417,7 +28603,11 @@ unsafe fn jit_exec_inner(
             let profiling = observe_arithmetic_operand(&chunk.feedback, pc as usize, &a);
             let v = match a.view() {
                 ValueView::Num(n) => Value::Num(-n),
-                _ => i.eval_unary_vm("-", a)?,
+                _ => {
+                    let v = i.eval_unary_vm("-", a)?;
+                    record_unary(&chunk.feedback, pc as usize, &a, &v);
+                    v
+                }
             };
             observe_arithmetic_result(&chunk.feedback, pc as usize, profiling, &v);
             push!(v);
@@ -28427,7 +28617,11 @@ unsafe fn jit_exec_inner(
             let profiling = observe_arithmetic_operand(&chunk.feedback, pc as usize, &a);
             let v = match a.view() {
                 ValueView::Num(n) => Value::Num(n),
-                _ => i.eval_unary_vm("+", a)?,
+                _ => {
+                    let v = i.eval_unary_vm("+", a)?;
+                    record_unary(&chunk.feedback, pc as usize, &a, &v);
+                    v
+                }
             };
             observe_arithmetic_result(&chunk.feedback, pc as usize, profiling, &v);
             push!(v);
@@ -28442,7 +28636,11 @@ unsafe fn jit_exec_inner(
             let profiling = observe_arithmetic_operand(&chunk.feedback, pc as usize, &a);
             let v = match a.view() {
                 ValueView::Num(n) => Value::Num(!crate::eval::to_int32(n) as f64),
-                _ => i.eval_unary_vm("~", a)?,
+                _ => {
+                    let v = i.eval_unary_vm("~", a)?;
+                    record_unary(&chunk.feedback, pc as usize, &a, &v);
+                    v
+                }
             };
             observe_arithmetic_result(&chunk.feedback, pc as usize, profiling, &v);
             push!(v);
@@ -28865,12 +29063,17 @@ unsafe fn jit_consume(sp: *mut Value, n: usize) -> *mut Value {
     base
 }
 
+/// A binary Number operation for generated code (x86-64 runs Add, Sub, Mul, Div, `%` and `>>>`
+/// here on every execution, ARM64 on its templates' misses). The value record (W4 step 3) is
+/// written only outside the operation's in-line set: never on Number x Number but for `%`
+/// (`int32_set`), whose in-line set is int32, so the Number path pays nothing.
 unsafe fn jit_bin_num(
     i: &mut Interp,
     sp: &mut *mut Value,
     feedback: &crate::feedback::FeedbackVector,
     pc: usize,
     op: &'static str,
+    int32_set: bool,
     f: impl Fn(f64, f64) -> f64,
 ) -> Result<(), Abrupt> {
     *sp = sp.sub(1);
@@ -28879,9 +29082,15 @@ unsafe fn jit_bin_num(
     let a = sp.read();
     let profiling = observe_arithmetic_operands(feedback, pc, &a, &b);
     let v = if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
-        Value::Num(f(*x, *y))
+        let v = Value::Num(f(*x, *y));
+        if int32_set {
+            record_binary_miss(feedback, pc, true, &a, &b, &v);
+        }
+        v
     } else {
-        i.binary(op, a, b)?
+        let v = i.binary(op, a, b)?;
+        record_binary(feedback, pc, &a, &b, &v);
+        v
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
     sp.write(v);
@@ -28907,10 +29116,18 @@ unsafe fn jit_bin_i32(
         ValueView::Bool(b) => Some(i32::from(b)),
         _ => None,
     };
-    let v = if let (Some(x), Some(y)) = (primitive_i32(&a), primitive_i32(&b)) {
-        Value::Num(f(x, y) as f64)
+    // Number x Number, the in-line set, records nothing (W4 step 3); a Boolean or any other
+    // operand leaves it.
+    let v = if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
+        Value::Num(f(crate::eval::to_int32(*x), crate::eval::to_int32(*y)) as f64)
     } else {
-        i.binary(op, a, b)?
+        let v = if let (Some(x), Some(y)) = (primitive_i32(&a), primitive_i32(&b)) {
+            Value::Num(f(x, y) as f64)
+        } else {
+            i.binary(op, a, b)?
+        };
+        record_binary(feedback, pc, &a, &b, &v);
+        v
     };
     observe_arithmetic_result(feedback, pc, profiling, &v);
     sp.write(v);
@@ -28921,6 +29138,8 @@ unsafe fn jit_bin_i32(
 unsafe fn jit_bin_cmp(
     i: &mut Interp,
     sp: &mut *mut Value,
+    feedback: &crate::feedback::FeedbackVector,
+    pc: usize,
     op: &'static str,
     f: impl Fn(f64, f64) -> bool,
 ) -> Result<(), Abrupt> {
@@ -28928,9 +29147,13 @@ unsafe fn jit_bin_cmp(
     let b = sp.read();
     *sp = sp.sub(1);
     let a = sp.read();
+    // The relational comparisons' in-line set is Number x Number, which records nothing.
     let v = if let (ValueView::Num(x), ValueView::Num(y)) = (&(a).view(), &(b).view()) {
         Value::Bool(f(*x, *y))
     } else {
+        if records_comparison(op) {
+            record_comparison(feedback, pc, &a, &b);
+        }
         i.binary(op, a, b)?
     };
     sp.write(v);

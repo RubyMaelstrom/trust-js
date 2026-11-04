@@ -137,6 +137,8 @@ mod deopt;
 mod feedback_census;
 #[cfg(all(test, feature = "architecture-diagnostics"))]
 mod feedback_census_tests;
+#[cfg(test)]
+mod feedback_record_tests;
 mod gc_handle;
 mod gc_native;
 #[cfg(test)]

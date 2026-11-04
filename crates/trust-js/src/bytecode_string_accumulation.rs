@@ -9,7 +9,7 @@
 use crate::value::ValueView;
 use std::cell::Cell;
 
-use super::{observe_arithmetic_operands, observe_arithmetic_result, Chunk, Op};
+use super::{observe_arithmetic_operands, observe_arithmetic_result, record_binary, Chunk, Op};
 use crate::execution_storage::{SlotAccess, ValueStack};
 use crate::interpreter::{Env, Interp, MAX_STR_LEN};
 use crate::value::Value;
@@ -120,6 +120,7 @@ fn try_store(
                 prefix.append_or_replace(suffix);
                 let result = Value::Str(prefix);
                 binding.set_value(result);
+                record_binary(&chunk.feedback, plan.pc + 2, &original, &right, &result);
                 observe_arithmetic_result(&chunk.feedback, plan.pc + 2, profiling, &result);
                 let stored = Stored {
                     result: plan.keep.then_some(result),

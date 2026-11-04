@@ -218,6 +218,7 @@ impl Chunk {
                     op: format!("{op:?}"),
                     kind: census_kind(op, pc),
                     state,
+                    record: self.feedback.record_word(pc),
                 }
             })
             .collect();

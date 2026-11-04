@@ -104,16 +104,54 @@ applies. A site counts as usable when:
 - allocation: its image (object and array literals, RegExp literals), or always for closures and
   empty literals, which need no per-site state;
 - instanceof: its cache's way; typeof and `in`: always (the templates lower them generically);
-- the records' kinds, as the steps below add them.
+- arithmetic, unary, update and comparison operations: always, once the value record exists
+  (step 3): its record and in-line set are the feedback, and equality is lowered by tag;
+- the records' other kinds, as the steps below add them.
+Precision counts the caches' sites as coverage does, a value operation when its record read by
+rule U (section 5.1) names exactly the coarse classes the bytecode run's record saw (the VM records
+every execution there), and typeof, `in` and equality, which record nothing, as not precise.
 Branches, loops, `!` (ToBoolean) and names are counted but left out: no exemplar records branch
 directions or ToBoolean, and names mostly have static addresses.
 
-5. Added by W4's later steps (the plan's W4 design note; each step updates this file)
+5. The always-on records (W4; each step adds its record here)
 
-- The always-on value-class record (step 3): one u32 a pc, three ValueClass sets (operand 0,
-  operand 1, result) ORed on change, written by the VM on every execution and by generated code's
-  miss paths only, with each template's in-line set (the classes it takes without a record)
-  listed here, and rule U (the record plus the in-line set) as the reading.
-- The element record (step 4), the named sites' generic mark (step 5), the read API (step 6),
-  the pc map of inlined and recompiled code (step 7), Pilot C's store writability (step 9) and the
-  dependency registry (step 10).
+5.1 The value record (step 3). A chunk's feedback vector holds one u32 a bytecode pc, in an array
+it makes at the chunk's first record (FeedbackVector::record), so a chunk that never records holds
+none. An arithmetic, unary, update or relational-comparison operation's word holds three
+ValueClass sets: operand 0 in bits 0-8, operand 1 in bits 9-17 (RECORD_OPERAND1_SHIFT), the result
+in bits 18-26 (RECORD_RESULT_SHIFT); a set has bit (class - 1). A record only grows: the writer
+ORs the classes in and stores only when the word changes.
+
+Who writes it:
+- The VM, on every execution of these operations (its arithmetic, unary, update and comparison
+  paths, and the string accumulation's fused concatenation).
+- Generated code, only where its in-line path missed: jit_exec's operations, String + String's
+  helper (jit_add_strings), the string accumulation, the update helpers. A miss records only
+  values outside its operation's in-line set, so a backend that runs an operation out of line
+  (x86-64's Add, Sub, Mul, Div, `%`, shifts, Neg, updates) records what ARM64's in-line path would.
+- Nothing on an in-line path, and nothing for equality (==, !=, ===, !==): the speculative tier
+  types equality from its operands, as JSC does (the plan's W4 decision 3).
+
+The in-line sets, by operation (operand 0, operand 1, result):
+  Add, Sub, Mul, Div, UShr, `**` (GenBin)        Number, Number, Number
+  BitAnd, BitOr, BitXor, Shl, Shr                Number, Number, Number (an int32)
+  % (Mod)                                       int32, int32, int32 (not -0)
+  Neg, Plus, BitNot; the updates (++, --:
+    UpdateLocal, UpdateCap, UpdateName,
+    UpdateNameCached, UpdateConst, UpdatePrivate,
+    SuperUpdate, UpdateProp, UpdateElem)         Number, -, Number
+  Lt, Gt, Le, Ge                                Number, Number, -
+Number is NumberInt32 | NumberDouble. ARM64's bit operations also take Booleans in line without a
+record; their in-line set stays Number, so a Boolean there reads as a miss the speculative tier
+did not see (it exits, and its exit profile learns it).
+
+Reading it (rule U): the classes an operation saw are its record together with its in-line set,
+for each role. That is complete: every class outside the in-line set was recorded on a miss or by
+the VM (W4's census: 99.8-100% of arithmetic executions). It is exact at the coarse grain (Number
+not split) where the in-line set's classes were seen or the record holds them. The int32/double
+split inside the in-line set is known only where the VM or a miss recorded it: a hint for
+speculation guarded by exits, not a proof.
+
+5.2 Later steps: the element record (step 4), the named sites' generic mark (step 5), the read
+API (step 6), the pc map of inlined and recompiled code (step 7), Pilot C's store writability
+(step 9) and the dependency registry (step 10).

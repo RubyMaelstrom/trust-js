@@ -339,6 +339,11 @@ pub(crate) enum ValueClass {
     Object = 9,
 }
 
+/// The value record's roles (W4 step 3): a word holds three ValueClass sets, operand 0 in bits
+/// 0-8, operand 1 in bits 9-17 and the result in bits 18-26.
+pub(crate) const RECORD_OPERAND1_SHIFT: u32 = 9;
+pub(crate) const RECORD_RESULT_SHIFT: u32 = 18;
+
 impl ValueClass {
     const ALL_BITS: u32 = (1 << 9) - 1;
 
@@ -711,6 +716,11 @@ pub(crate) struct FeedbackVector {
     /// Assigned only when this vector participates in profile serialization or ingestion.
     profile_vector_id: Cell<u64>,
     detailed_enabled: bool,
+    /// The always-on value record (W4 step 3, feedback-schema.txt section 5): one word a bytecode
+    /// pc, made at the chunk's first record, so a chunk that never records holds none.
+    record: OnceCell<Box<[Cell<u32>]>>,
+    /// The chunk's operation count, the record's length.
+    record_len: u32,
     /// The feedback census's state for this vector's chunk (W4 step 2; None unless
     /// TRUST_JS_FEEDBACK_CENSUS is set).
     #[cfg(feature = "architecture-diagnostics")]
@@ -734,9 +744,47 @@ impl FeedbackVector {
             words: OnceCell::new(),
             profile_vector_id: Cell::new(0),
             detailed_enabled,
+            record: OnceCell::new(),
+            record_len: 0,
             #[cfg(feature = "architecture-diagnostics")]
             census: None,
         }
+    }
+
+    /// The vector of a chunk of `ops` operations, which its record covers.
+    pub(crate) fn with_record_len(mut self, ops: usize) -> Self {
+        self.record_len = u32::try_from(ops).expect("a chunk's operation count fits a u32");
+        self
+    }
+
+    /// OR `bits` into the record of the operation at `pc`, storing only when the word changes
+    /// (W4 step 3). The record's layout per operation kind is feedback-schema.txt's section 5;
+    /// callers write it only on the VM's paths and generated code's miss paths.
+    #[inline]
+    pub(crate) fn record(&self, pc: usize, bits: u32) {
+        #[cfg(feature = "architecture-diagnostics")]
+        if let Some(census) = self.census.as_deref() {
+            census.count_record(pc);
+        }
+        let words = self
+            .record
+            .get_or_init(|| (0..self.record_len).map(|_| Cell::new(0)).collect());
+        if let Some(cell) = words.get(pc) {
+            let old = cell.get();
+            let new = old | bits;
+            if new != old {
+                cell.set(new);
+            }
+        }
+    }
+
+    /// The record of the operation at `pc`: 0 where nothing was recorded.
+    #[cfg_attr(not(any(test, feature = "architecture-diagnostics")), allow(dead_code))]
+    pub(crate) fn record_word(&self, pc: usize) -> u32 {
+        self.record
+            .get()
+            .and_then(|words| words.get(pc))
+            .map_or(0, Cell::get)
     }
 
     pub(crate) fn unbound(layout: FeedbackLayout) -> Self {
@@ -766,6 +814,9 @@ impl FeedbackVector {
             )
             .saturating_add(self.words.get().map_or(0, |words| {
                 words.len().saturating_mul(std::mem::size_of::<Cell<u64>>())
+            }))
+            .saturating_add(self.record.get().map_or(0, |words| {
+                words.len().saturating_mul(std::mem::size_of::<Cell<u32>>())
             }))
     }
 
