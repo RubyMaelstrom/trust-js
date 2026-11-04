@@ -124,3 +124,44 @@ fn literals_past_the_cell_take_the_helper() {
     );
     assert_eq!(eval(&mut engine, &source), "20:2");
 }
+
+/// `{}`, `[]` and a constant literal's copy (W2e step 4) made in line read as the helper's, and
+/// behave as theirs under later writes: properties added to `{}`, elements pushed onto `[]`, and
+/// a write to a shared literal's copy, which copies its block first (W2d step 4).
+#[test]
+fn empty_literals_and_shared_copies_are_the_helpers() {
+    let cases = [
+        ("{}", "o.a = 1; o.b = 2; Object.keys(o).join()", "a,b"),
+        (
+            "[]",
+            "o.push(1, 2, 3); o.length + ':' + o.join()",
+            "3:1,2,3",
+        ),
+        (
+            "[1, 'two', 3]",
+            "o[0] = 9; String(o) + ':' + String(make())",
+            "9,two,3:1,two,3",
+        ),
+    ];
+    for (literal, after, expected) in cases {
+        let mut engine = engine(Tier::Jit);
+        let before = in_line();
+        let source = format!(
+            "function make() {{ return {literal}; }}
+             var first = make();
+             for (var i = 0; i < 20; i++) make();
+             var later = make();
+             var d = function (o) {{
+                 return JSON.stringify(Object.getOwnPropertyDescriptors(o)) +
+                     Object.getPrototypeOf(o) + Array.isArray(o) + Object.isExtensible(o);
+             }};
+             d(first) === d(later) ? 'same' : d(first) + ' / ' + d(later)"
+        );
+        assert_eq!(eval(&mut engine, &source), "same", "{literal}");
+        assert!(in_line() > before, "{literal}: no in-line object");
+        let (first, later) = (global(&mut engine, "first"), global(&mut engine, "later"));
+        assert_eq!(header(&first), header(&later), "{literal}");
+        let result = eval(&mut engine, &format!("var o = later; {after}"));
+        assert_eq!(result, expected, "{literal}");
+    }
+}

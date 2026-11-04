@@ -863,7 +863,23 @@ pub(super) fn emit(
             emit_op_helper(a, H_OBJECT_LITERAL, pc as u32, unwind);
         }
         Op::MakeArray(..) | Op::MakeArrayLiteral(_) => {
-            emit_op_helper(a, H_MAKE_ARRAY, pc as u32, unwind);
+            // W2e step 4: `[]` and a constant literal's copy in line from their site's image.
+            let literal = match op {
+                Op::MakeArray(0) => Some(None),
+                Op::MakeArrayLiteral(site) => Some(Some(*site)),
+                _ => None,
+            };
+            match literal.and_then(|literal| chunk.jit_array_site(literal)) {
+                Some((site, image)) => super::alloc::emit_inline_array(
+                    a,
+                    &site,
+                    image,
+                    H_MAKE_ARRAY,
+                    pc as u32,
+                    unwind,
+                ),
+                None => emit_op_helper(a, H_MAKE_ARRAY, pc as u32, unwind),
+            }
         }
         Op::Abstract(crate::bytecode::AbstractOp::CreateDataPropertyOrThrow)
             if fast & 4096 != 0 && define_elem_inlinable(layout) =>

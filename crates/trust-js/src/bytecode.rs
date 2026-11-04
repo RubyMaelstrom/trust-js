@@ -2991,6 +2991,10 @@ pub struct Chunk {
     obj_maps: Vec<std::cell::OnceCell<Box<crate::value::Props>>>,
     /// Per object-literal template site, the instance header native code copies (W2e step 3).
     obj_images: Box<[ObjectImage]>,
+    /// Per array-literal site (`array_literals`), and for `[]`, the instance header native code
+    /// copies (W2e step 4).
+    array_images: Box<[ObjectImage]>,
+    empty_array_image: ObjectImage,
     /// Per constant array-literal site (`Op::MakeArrayLiteral`), its elements and, from its
     /// first execution, the block its copies share (W2d step 4).
     array_literals: Box<[ArrayLiteralSite]>,
@@ -3154,16 +3158,55 @@ impl crate::gc_trace::GcTrace for ArrayLiteralSite {
     }
 }
 
-/// An object-literal site's instance header for native code to copy (W2e step 3): `ready` once
-/// the site's first execution made its template and the image could be made
-/// ([`crate::value::object_header_image`]), then the header's words, the prototype's word left
-/// for the code to fill. The chunk holds one per template site at a fixed address, which the code
-/// names; its words name the template's layout, which the template keeps alive.
+/// A literal site's instance header for native code to copy (W2e steps 3 and 4): `ready` once an
+/// execution of the site made an image ([`crate::value::header_image`]), the header's words, the
+/// prototype's word left for the code to fill, and for an Array its first slot (`length`). The
+/// chunk holds one per object-literal template site and array-literal site, at a fixed address
+/// the code names; their words name the templates' layouts and the shared literal blocks, which
+/// the templates, the literal sites and the heap keep alive.
 #[repr(C)]
 #[derive(Default)]
 pub(crate) struct ObjectImage {
     pub(crate) ready: std::cell::Cell<u64>,
     pub(crate) words: [std::cell::Cell<u64>; crate::value::OBJECT_HEADER / 8],
+    pub(crate) slot0: std::cell::Cell<u64>,
+}
+
+impl ObjectImage {
+    /// Make the image `object`'s (a fresh Array or plain object the helper made), with its first
+    /// `slots` slots as the image's fixed slots (an Array's `length`), unless it is ready.
+    #[inline]
+    fn fill_from(&self, object: &crate::value::Value, slots: usize) {
+        if self.ready.get() == 0 {
+            self.fill_from_cold(object, slots);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_from_cold(&self, object: &crate::value::Value, slots: usize) {
+        let Some(object) = object.as_obj() else {
+            return;
+        };
+        let Some(words) = crate::value::header_image(&object) else {
+            return;
+        };
+        if slots == 1 {
+            let Some(length) = object
+                .borrow()
+                .props
+                .slot_at(0)
+                .map(|slot| slot.value().bits())
+            else {
+                return;
+            };
+            self.slot0.set(length);
+        }
+        for (cell, word) in self.words.iter().zip(words) {
+            cell.set(word);
+        }
+        self.ready.set(1);
+    }
 }
 
 pub(crate) struct RecordGetterPlan {
@@ -3233,6 +3276,8 @@ impl crate::gc_trace::GcTrace for Chunk {
             feedback_shapes: _,
             obj_maps,
             obj_images: _, // words naming the templates' layouts, which `obj_maps` traces
+            array_images: _, // words naming the literals' blocks, which `array_literals` traces
+            empty_array_image: _, // words naming the heap's array layout
             array_literals,
             record_getter: _,
             name_caches: _,
@@ -3346,6 +3391,38 @@ impl Chunk {
         let image = self.obj_images.get(tidx as usize)?;
         let class = crate::value::cell_class_for(count)?;
         Some((crate::value::object_inline_alloc_site(class)?, image))
+    }
+
+    /// W2e step 4: where native code makes `[]` (`literal` none) or constant array-literal site
+    /// `literal`'s copy in line: the class-0 cell's allocation site and the image an execution of
+    /// the site makes ready, unless allocation feedback is recorded.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_array_site(
+        &self,
+        literal: Option<u32>,
+    ) -> Option<(crate::gc_core::InlineAllocSite, &ObjectImage)> {
+        if self.feedback.detailed_enabled() {
+            return None;
+        }
+        let image = match literal {
+            Some(site) => self.array_images.get(site as usize)?,
+            None => &self.empty_array_image,
+        };
+        Some((crate::value::object_inline_alloc_site(0)?, image))
+    }
+
+    /// Make `[]`'s image from `array`, a fresh empty Array a MakeArray(0) made.
+    #[inline]
+    pub(crate) fn fill_empty_array_image(&self, array: &Value) {
+        self.empty_array_image.fill_from(array, 1);
+    }
+
+    /// Make array-literal site `site`'s image from `array`, its fresh copy.
+    #[inline]
+    pub(crate) fn fill_array_image(&self, site: u32, array: &Value) {
+        if let Some(image) = self.array_images.get(site as usize) {
+            image.fill_from(array, 1);
+        }
     }
 
     /// The block constant array-literal site `site` shares among its copies
@@ -3574,7 +3651,10 @@ impl Chunk {
                 obj_maps,
                 std::cell::OnceCell<Box<crate::value::Props>>
             ))
-            .saturating_add(self.obj_images.len() * std::mem::size_of::<ObjectImage>())
+            .saturating_add(
+                (self.obj_images.len() + self.array_images.len() + 1)
+                    * std::mem::size_of::<ObjectImage>(),
+            )
             .saturating_add(vec_bytes!(name_caches, std::cell::Cell<NameIc>))
             .saturating_add(vec_bytes!(name_num_bits, std::cell::Cell<u64>))
             .saturating_add(vec_bytes!(name_num_valid, std::cell::Cell<bool>))
@@ -8831,6 +8911,10 @@ fn finish_chunk(
             .map(|_| std::cell::OnceCell::new())
             .collect(),
         obj_images: (0..c.obj_maps).map(|_| ObjectImage::default()).collect(),
+        array_images: (0..c.array_literals.len())
+            .map(|_| ObjectImage::default())
+            .collect(),
+        empty_array_image: ObjectImage::default(),
         array_literals: c
             .array_literals
             .into_iter()
@@ -16282,8 +16366,9 @@ impl Compiler {
                 let tidx = {
                     let mut sorted: Vec<&String> = keys.iter().collect();
                     sorted.sort();
-                    if count > 0
-                        && sorted.windows(2).all(|w| w[0] != w[1])
+                    // `{}` takes a template too (no keys, class 0), so native code makes it in
+                    // line (W2e step 4).
+                    if sorted.windows(2).all(|w| w[0] != w[1])
                         && keys
                             .iter()
                             .all(|key| crate::value::canonical_index(key).is_none())
@@ -19299,6 +19384,9 @@ fn run_vm_inner(
                 let at = stack.len() - n as usize;
                 let items: Vec<Value> = stack.split_off(at);
                 let value = i.make_array(items);
+                if n == 0 {
+                    chunk.fill_empty_array_image(&value);
+                }
                 observe_allocation(
                     &chunk.feedback,
                     op_pc,
@@ -19310,6 +19398,7 @@ fn run_vm_inner(
             Op::MakeArrayLiteral(site) => {
                 let block = chunk.array_literal_block(site);
                 let value = i.make_shared_array(block);
+                chunk.fill_array_image(site, &value);
                 observe_allocation(
                     &chunk.feedback,
                     op_pc,
@@ -25310,6 +25399,7 @@ pub(crate) unsafe extern "C" fn jit_make_array(
         Op::MakeArrayLiteral(site) => {
             let block = chunk.array_literal_block(site);
             let value = unsafe { (&*ctx.interp).make_shared_array(block) };
+            chunk.fill_array_image(site, &value);
             observe_allocation(
                 &chunk.feedback,
                 pc as usize,
@@ -25326,6 +25416,9 @@ pub(crate) unsafe extern "C" fn jit_make_array(
     };
     let base = unsafe { sp.sub(count as usize) };
     let value = unsafe { (&*ctx.interp).make_array_from_raw(base, count as usize) };
+    if count == 0 {
+        chunk.fill_empty_array_image(&value);
+    }
     observe_allocation(
         &chunk.feedback,
         pc as usize,
@@ -28407,6 +28500,9 @@ unsafe fn jit_exec_inner(
             }
             *sp = base;
             let value = i.make_array(items);
+            if n == 0 {
+                chunk.fill_empty_array_image(&value);
+            }
             observe_allocation(
                 &chunk.feedback,
                 pc as usize,
@@ -28418,6 +28514,7 @@ unsafe fn jit_exec_inner(
         Op::MakeArrayLiteral(site) => {
             let block = chunk.array_literal_block(site);
             let value = i.make_shared_array(block);
+            chunk.fill_array_image(site, &value);
             observe_allocation(
                 &chunk.feedback,
                 pc as usize,

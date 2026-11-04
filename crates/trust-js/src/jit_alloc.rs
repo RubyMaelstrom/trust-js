@@ -139,6 +139,49 @@ pub(super) fn emit_inline_object(
     pc: u32,
     unwind: usize,
 ) {
+    emit_inline_cell(
+        a,
+        site,
+        image,
+        INTERP_OBJECT_PROTO,
+        0,
+        slots,
+        helper,
+        pc,
+        unwind,
+    );
+}
+
+/// Make an Array in line from `image` (W2e step 4: `[]` and a constant literal's copy, which
+/// shares its site's block): the image's header and its `length` slot, with the realm's
+/// %Array.prototype%, pushed; or the helper, as [`emit_inline_object`]. Clobbers x9-x17.
+pub(super) fn emit_inline_array(
+    a: &mut asm::Asm,
+    site: &InlineAllocSite,
+    image: &crate::bytecode::ObjectImage,
+    helper: usize,
+    pc: u32,
+    unwind: usize,
+) {
+    emit_inline_cell(a, site, image, INTERP_ARRAY_PROTO, 1, 0, helper, pc, unwind);
+}
+
+/// [`emit_inline_object`] and [`emit_inline_array`]: the image's `fixed` slots (an Array's
+/// `length`) then `stacked` slots from the operand stack, the prototype at `proto` in the
+/// interpreter.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_cell(
+    a: &mut asm::Asm,
+    site: &InlineAllocSite,
+    image: &crate::bytecode::ObjectImage,
+    proto: usize,
+    fixed: usize,
+    slots: usize,
+    helper: usize,
+    pc: u32,
+    unwind: usize,
+) {
+    debug_assert!(fixed <= 1);
     let slow = a.new_label();
     let done = a.new_label();
     let image = std::ptr::from_ref(image) as u64;
@@ -155,7 +198,7 @@ pub(super) fn emit_inline_object(
         image + std::mem::offset_of!(crate::bytecode::ObjectImage, words) as u64,
     );
     a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, interp) as u32);
-    a.ldr_imm(10, 10, INTERP_OBJECT_PROTO as u32);
+    a.ldr_imm(10, 10, proto as u32);
     for k in 0..crate::value::OBJECT_HEADER / 8 {
         let offset = (8 * k) as u32;
         if k == crate::value::OBJECT_PROTO_WORD {
@@ -165,9 +208,19 @@ pub(super) fn emit_inline_object(
             a.str_imm(11, 9, offset);
         }
     }
+    if fixed == 1 {
+        let slot0 = std::mem::offset_of!(crate::bytecode::ObjectImage, slot0)
+            - std::mem::offset_of!(crate::bytecode::ObjectImage, words);
+        a.ldr_imm(11, 15, slot0 as u32);
+        a.str_imm(11, 9, crate::value::OBJECT_HEADER as u32);
+    }
     for slot in 0..slots {
         emit_exec_word_load(a, 12, 20, -(8 * (slots - slot) as i32));
-        a.str_imm(12, 9, (crate::value::OBJECT_HEADER + 8 * slot) as u32);
+        a.str_imm(
+            12,
+            9,
+            (crate::value::OBJECT_HEADER + 8 * (fixed + slot)) as u32,
+        );
     }
     // The object's word over the first value's (or pushed, for none).
     a.mov_imm64(12, crate::value::PACK_OBJ);

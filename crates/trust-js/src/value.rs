@@ -3960,15 +3960,11 @@ const _: () = assert!(
 /// The cell header's words of the instance of the plain-object literal template `template` that
 /// holds its values in its cell, as the helper makes it (`init_instance_plain`, with `proto`), for
 /// generated code to copy (W2e step 3); `None` when the values would not fit the cell or the map
-/// would keep a record (a key index or extras copied from the template). Each field is read from
-/// such an instance and copied at its offset into a zeroed image, so padding stays zero, as does
-/// the kind's payload word, which a plain object's tag leaves unread; the prototype's word
-/// ([`OBJECT_PROTO_WORD`]) is the code's to fill.
+/// would keep a record (a key index or extras copied from the template).
 pub(crate) fn object_header_image(
     template: &Props,
     proto: Option<Gc>,
 ) -> Option<[u64; OBJECT_HEADER / 8]> {
-    use std::mem::{offset_of, size_of};
     let class = template.entries.class();
     let count = template.entries.len();
     if count > class_slots(class) {
@@ -3977,9 +3973,20 @@ pub(crate) fn object_header_image(
     let reference = Object::new_built(proto, ObjectKind::Plain, class, |props| {
         props.init_instance_plain(template, (0..count).map(|_| Value::Undefined))
     });
-    let cell = Gc::as_ptr(&reference).cast::<u8>();
-    // SAFETY: the fresh reference object, which nothing borrows.
-    let body = unsafe { &*(*Gc::as_ptr(&reference)).as_ptr() };
+    header_image(&reference)
+}
+
+/// The cell header's words of `object`, a fresh plain object or Array the helper path made, for
+/// generated code to copy into objects it makes as that one (W2e steps 3 and 4); `None` when its
+/// map keeps a record. Each field is copied at its offset into a zeroed image, so padding stays
+/// zero, as does the kind's payload word, which a plain object's and an Array's tag leave unread;
+/// the prototype's word ([`OBJECT_PROTO_WORD`]) is the code's to fill.
+pub(crate) fn header_image(object: &Gc) -> Option<[u64; OBJECT_HEADER / 8]> {
+    use std::mem::{offset_of, size_of};
+    let cell = Gc::as_ptr(object).cast::<u8>();
+    // SAFETY: a live object, which nothing borrows mutably while its fields are read.
+    let body = unsafe { &*(*Gc::as_ptr(object)).as_ptr() };
+    debug_assert!(matches!(body.kind, ObjectKind::Plain | ObjectKind::Array));
     if body.props.entries.record.header().is_some() {
         return None;
     }
@@ -3989,7 +3996,7 @@ pub(crate) fn object_header_image(
     let entries = props + offset_of!(Props, entries);
     let mut image = [0u8; OBJECT_HEADER];
     let mut copy = |offset: usize, size: usize| {
-        // SAFETY: an initialized field of the live reference cell's header, inside the image.
+        // SAFETY: an initialized field of the live cell's header, inside the image.
         unsafe {
             std::ptr::copy_nonoverlapping(cell.add(offset), image.as_mut_ptr().add(offset), size)
         };
@@ -4020,7 +4027,7 @@ pub(crate) fn object_header_image(
         size_of::<Cell<SlotMemo>>(),
     );
     copy(props + offset_of!(Props, elems), size_of::<DenseStorage>());
-    // `ObjectKind` is repr(u8): a plain object's is its tag byte alone.
+    // `ObjectKind` is repr(u8): a plain object's and an Array's are their tag byte alone.
     copy(object + offset_of!(Object, kind), size_of::<u8>());
     Some(std::array::from_fn(|k| {
         u64::from_ne_bytes(image[8 * k..8 * k + 8].try_into().expect("a word"))
