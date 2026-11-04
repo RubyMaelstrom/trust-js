@@ -9467,8 +9467,9 @@ impl Interp {
         // transitions, key hashing and name string once. Each closure copies the field words,
         // shares the layout, and patches the two identity-dependent values in place; value
         // writes never touch the shape.
-        let runtime = func.runtime();
-        let maps = runtime.fn_maps.get_or_init(|| {
+        // The function's entry for the active heap, taken once for the closure (W2e step 7).
+        let lease = func.runtime();
+        let maps = lease.fn_maps.get_or_init(|| {
             let arity = func
                 .params
                 .iter()
@@ -9535,16 +9536,32 @@ impl Interp {
         } else {
             None
         };
-        let kind = ObjectKind::user(
-            func.clone(),
+        // The closure's [[ScriptOrModule]]: most closures are made where their function's
+        // shared record is the active one, which the innermost context's own record proves
+        // without the walk of every context (W2e step 7).
+        let origin = if func.self_hosted {
+            crate::value::ClosureOrigin::Active(None)
+        } else {
+            match &lease {
+                crate::function_runtime::RuntimeLease::Primary(primary)
+                    if primary.origin.get().is_some_and(|shared| {
+                        Rc::as_ptr(shared) == self.innermost_runtime_origin_identity()
+                    }) =>
+                {
+                    debug_assert!(self
+                        .active_runtime_origin()
+                        .is_some_and(|active| Rc::ptr_eq(&active, primary.origin.get().unwrap())));
+                    crate::value::ClosureOrigin::Primary
+                }
+                _ => crate::value::ClosureOrigin::Active(self.active_runtime_origin()),
+            }
+        };
+        let kind = ObjectKind::user_leased(
+            &lease,
+            &func,
             self_env.as_ref().cloned().unwrap_or(env),
             Gc::as_ptr(&self.global) as usize,
-            if func.self_hosted {
-                None
-            } else {
-                self.active_runtime_origin()
-            },
-            self.realm_id,
+            origin,
         );
         // The object's map is a copy of its template, written into its cell (W2d step 3).
         let obj = match named {

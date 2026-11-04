@@ -854,6 +854,46 @@ impl Interp {
         }
     }
 
+    /// The identity of the record [`Interp::active_runtime_origin`] returns when its walk's first
+    /// step decides it, else null: no caller floor at the innermost depth, no job context pushed
+    /// at or above it and no splice position, and the innermost context, a code frame or a
+    /// function frame, has a record of its own. No count is taken: a closure's creation compares
+    /// it with its function's shared record, and walks only when they differ (W2e step 7).
+    #[inline]
+    pub(crate) fn innermost_runtime_origin_identity(
+        &self,
+    ) -> *const crate::agent_control::ReferrerRecord {
+        let function = self.fn_frames.len();
+        let code = self.code_frames.len();
+        let depth = function + code;
+        let first_step_decides = self
+            .caller_origin
+            .as_ref()
+            .is_none_or(|caller| depth > caller.floor as usize)
+            && self
+                .job_script_contexts
+                .last()
+                .is_none_or(|(pushed_at, _)| (*pushed_at as usize) < depth)
+            && !is_inline_position(self.call_site);
+        if !first_step_decides {
+            return std::ptr::null();
+        }
+        if let Some(frame) = self
+            .code_frames
+            .last()
+            .filter(|frame| frame.depth as usize >= function)
+        {
+            return frame.origin.as_ref().map_or(std::ptr::null(), Rc::as_ptr);
+        }
+        let Some(frame) = self.fn_frames.last() else {
+            return std::ptr::null();
+        };
+        match &frame.callee().borrow().kind {
+            ObjectKind::User(user) => user.runtime_origin_identity(),
+            _ => std::ptr::null(),
+        }
+    }
+
     fn closed_runtime_origin(&self) -> crate::agent_control::RuntimeOrigin {
         // Missing active inline metadata violates the compiled-frame contract. It must never
         // turn an originating authorization into the ambient caller/default context.

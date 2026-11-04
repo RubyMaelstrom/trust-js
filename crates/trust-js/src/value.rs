@@ -2380,6 +2380,16 @@ pub(crate) struct UserCallableCache {
     pub(crate) own_origin: bool,
 }
 
+/// A new closure's runtime ScriptOrModule, as its creation found it
+/// ([`ObjectKind::user_leased`]).
+pub(crate) enum ClosureOrigin {
+    /// The record the function's primary entry shares (`FunctionRuntime::origin`), which the
+    /// creation proved the active one (`Interp::innermost_runtime_origin_identity`).
+    Primary,
+    /// The active record (`Interp::active_runtime_origin`); None for self-hosted code.
+    Active(Option<crate::agent_control::RuntimeOrigin>),
+}
+
 impl UserCallable {
     pub(crate) fn take_binding_getter_cache(
         &self,
@@ -2436,6 +2446,24 @@ impl UserCallable {
             .map(|sidecar| sidecar.origin.clone());
         self.cache.set(sidecar);
         own.unwrap_or_else(|| self.func.shared_origin().cloned())
+    }
+
+    /// The identity of [`UserCallable::runtime_origin`]'s record, null for None, taking no
+    /// count (closure creation compares it, W2e step 7).
+    #[inline]
+    pub(crate) fn runtime_origin_identity(&self) -> *const crate::agent_control::ReferrerRecord {
+        if self.func.self_hosted {
+            return std::ptr::null();
+        }
+        // SAFETY: a shared read of the sidecar, which nothing replaces while it lasts.
+        let sidecar = unsafe { &*self.cache.as_ptr() };
+        match sidecar.as_ref().filter(|sidecar| sidecar.own_origin) {
+            Some(sidecar) => sidecar.origin.as_ref().map_or(std::ptr::null(), Rc::as_ptr),
+            None => self
+                .func
+                .shared_origin()
+                .map_or(std::ptr::null(), Rc::as_ptr),
+        }
     }
 
     fn cloned_runtime_pin(&self) -> Option<crate::gc_storage::PayloadBox<UserCallableCache>> {
@@ -2575,19 +2603,51 @@ impl ObjectKind {
         origin: Option<crate::agent_control::RuntimeOrigin>,
         _owner: crate::agent_access::RealmId,
     ) -> ObjectKind {
-        let lease = func.runtime();
+        Self::user_leased(
+            &func.runtime(),
+            &func,
+            env,
+            realm,
+            ClosureOrigin::Active(origin),
+        )
+    }
+
+    /// [`ObjectKind::user`] under `lease`, the function's entry for the active heap, which the
+    /// closure's creation has taken already (W2e step 7: one lease per closure).
+    #[inline]
+    pub(crate) fn user_leased(
+        lease: &crate::function_runtime::RuntimeLease<'_>,
+        func: &Rc<Function>,
+        env: Env,
+        realm: usize,
+        origin: ClosureOrigin,
+    ) -> ObjectKind {
         // The active heap's: `runtime` finds the entry of the active heap.
         let heap_id = lease.heap.id;
-        let (runtime, own_origin) = match lease {
+        let (runtime, own_origin, origin) = match (lease, origin) {
+            // The creation proved the active record the primary entry's own.
+            (crate::function_runtime::RuntimeLease::Primary(primary), ClosureOrigin::Primary) => {
+                debug_assert!(primary.origin.get().is_some(), "a shared record to share");
+                (None, false, None)
+            }
             // Most closures of one function in one heap come from the same record: they share
             // the primary entry's copy, and only a differing (or absent) record is boxed.
-            crate::function_runtime::RuntimeLease::Primary(primary) => {
+            (
+                crate::function_runtime::RuntimeLease::Primary(primary),
+                ClosureOrigin::Active(origin),
+            ) => {
                 let shared = origin.as_ref().is_some_and(|origin| {
                     Rc::ptr_eq(primary.origin.get_or_init(|| origin.clone()), origin)
                 });
-                (None, !shared && !func.self_hosted)
+                (None, !shared && !func.self_hosted, origin)
             }
-            crate::function_runtime::RuntimeLease::Foreign(runtime) => (Some(runtime), true),
+            (
+                crate::function_runtime::RuntimeLease::Foreign(runtime),
+                ClosureOrigin::Active(origin),
+            ) => (Some(runtime.clone()), true, origin),
+            (crate::function_runtime::RuntimeLease::Foreign(_), ClosureOrigin::Primary) => {
+                unreachable!("only a primary entry's closure shares its record")
+            }
         };
         let metadata = (runtime.is_some() || own_origin).then(|| {
             crate::gc_storage::PayloadBox::new(UserCallableCache {
@@ -2598,10 +2658,10 @@ impl ObjectKind {
             })
         });
         if func.runtime_cache().closure_heap.get() != heap_id {
-            hold_closure_function_in(&func, heap_id);
+            hold_closure_function_in(func, heap_id);
         }
         let user = UserCallable {
-            func: ClosureFunction::new(&func),
+            func: ClosureFunction::new(func),
             env,
             realm,
             cache: Cell::new(metadata),
