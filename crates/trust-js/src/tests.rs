@@ -19057,7 +19057,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     let mut engine = Engine::new();
     let before = [
         engine.interp.gc_pins.len(),
-        engine.interp.regexps.len(),
         engine.interp.promises.len(),
         engine.interp.shadow_realms.len(),
         engine.interp.realms.len(),
@@ -19084,7 +19083,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     engine.interp.gc_collect();
     let after = [
         engine.interp.gc_pins.len(),
-        engine.interp.regexps.len(),
         engine.interp.promises.len(),
         engine.interp.shadow_realms.len(),
         engine.interp.realms.len(),

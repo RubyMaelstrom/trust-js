@@ -5526,8 +5526,8 @@ impl Interp {
         Ok(())
     }
 
-    /// Compile a regular expression and build a RegExp object (its metadata stored as own props,
-    /// the compiled program in the `regexps` side table). A bad pattern throws a SyntaxError.
+    /// Compile a regular expression and build a RegExp object (`lastIndex` an own property, the
+    /// compiled program the object's payload). A bad pattern throws a SyntaxError.
     pub(crate) fn make_regexp(&mut self, source: &str, flags: &str) -> Result<Value, Abrupt> {
         let proto = self.regexp_alloc_proto()?;
         self.make_regexp_with_proto(source, flags, proto)
@@ -5586,20 +5586,21 @@ impl Interp {
         proto: Option<crate::value::Gc>,
     ) -> Value {
         let obj = Object::new(proto);
-        let ptr = Gc::as_ptr(&obj) as usize;
         // source/flags/global/... are accessor getters on RegExp.prototype (computed from the
-        // matcher); only `lastIndex` is an own writable data property.
-        obj.borrow_mut().props.insert(
-            "lastIndex",
-            Property::data(Value::Num(0.0), true, false, false),
-        );
+        // matcher, the object's payload); only `lastIndex` is an own writable data property.
+        {
+            let mut object = obj.borrow_mut();
+            object.props.insert(
+                "lastIndex",
+                Property::data(Value::Num(0.0), true, false, false),
+            );
+            object.kind = ObjectKind::RegExp(crate::gc_storage::PayloadBox::new(re));
+        }
         // Every RegExp starts at the same shape, which the RegExp protector's receivers keep.
         let shape = obj.borrow().props.shape();
         self.regexp_protector
             .borrow_mut()
             .note_instance_shape(shape);
-        self.gc_pin(&obj);
-        self.regexps.insert(ptr, re);
         Value::Obj(obj)
     }
 
@@ -7184,8 +7185,8 @@ impl Interp {
                             self.gc_pins.remove(&sp);
                         }
                         // A typed array's view, buffer, offset and length move with its kind; its
-                        // clear `ic_plain` comes with them. An ArrayBuffer's or a DataView's state
-                        // moved with its kind above.
+                        // clear `ic_plain` comes with them. An ArrayBuffer's, a DataView's or a
+                        // RegExp's state moved with its kind above.
                         if src.borrow().kind.typed_array().is_some() {
                             dst.borrow().set_ic_plain(false);
                             let view = std::mem::replace(
@@ -7193,9 +7194,6 @@ impl Interp {
                                 crate::value::ObjectKind::Plain,
                             );
                             dst.borrow_mut().kind = view;
-                        }
-                        if let Some(v) = self.regexps.remove(&sp) {
-                            self.regexps.insert(dp, v);
                         }
                         if let Some(v) = self.promises.remove(&sp) {
                             self.promises.insert(&self.gc_heap, dp, v);

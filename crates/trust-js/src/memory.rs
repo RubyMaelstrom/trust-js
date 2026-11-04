@@ -1206,6 +1206,11 @@ impl Visitor {
                 }
             }
             ObjectKind::DataView(view) => internal_bytes += std::mem::size_of_val(&**view),
+            // A RegExp's program, which RegExps of one source and flags share.
+            ObjectKind::RegExp(program) => {
+                internal_bytes += std::mem::size_of_val(&**program);
+                self.regex(program);
+            }
             // Plain objects and the payload-free exotics hold nothing more; a callable's payload
             // is `callable`'s, a typed array's view the native buffers'.
             _ => {}
@@ -1506,20 +1511,6 @@ fn scan_realm(
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
-    totals.interpreter_side_tables.add(
-        interp
-            .regexps
-            .len()
-            .saturating_mul(size_of::<(usize, Rc<crate::regex::Regex>)>()),
-    );
-    if !interp.regexps.is_empty() {
-        totals
-            .interpreter_side_tables
-            .make_lower_bound("opaque standard-library HashMap bucket storage");
-    }
-    for regex in interp.regexps.values() {
-        visitor.regex(regex);
-    }
     if let Some(last) = &interp.regexp_last {
         totals.interpreter_side_tables.add(
             last.caps

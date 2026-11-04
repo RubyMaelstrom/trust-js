@@ -3,15 +3,28 @@
 use super::*;
 use crate::value::ValueView;
 
+/// The compiled program of the RegExp `value` (its [[RegExpMatcher]], source and flags, the
+/// object's payload); `None` for any other value.
+#[inline]
+pub(crate) fn regexp_program(value: &Value) -> Option<Rc<crate::regex::Regex>> {
+    value.as_obj()?.borrow().kind.regexp().cloned()
+}
+
+/// Whether `object` is a RegExp: it has a [[RegExpMatcher]].
+#[inline]
+pub(crate) fn is_regexp_object(object: &Gc) -> bool {
+    object.borrow().kind.regexp().is_some()
+}
+
 /// A RegExp prototype getter: a flag boolean (`Some(char)`), or the special source/flags string.
 fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Value> {
+    if let Some(re) = regexp_program(this) {
+        return Ok(match flag {
+            Some(c) => Value::Bool(re.has_flag(c)),
+            None => Value::lstr(re.flags.clone()),
+        });
+    }
     if let Some(ptr) = map_ptr(this) {
-        if let Some(re) = i.regexps.get(&ptr) {
-            return Ok(match flag {
-                Some(c) => Value::Bool(re.has_flag(c)),
-                None => Value::lstr(re.flags.clone()),
-            });
-        }
         // The %RegExp.prototype% object itself has default values rather than throwing.
         if i.extra_protos.get("RegExp").map(|p| Gc::as_ptr(p) as usize) == Some(ptr) {
             return Ok(match flag {
@@ -27,7 +40,7 @@ fn re_flag_get(i: &Interp, this: &Value, flag: Option<char>) -> Result<Value, Va
 }
 fn re_source_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
     if let Some(ptr) = map_ptr(&this) {
-        if let Some(re) = i.regexps.get(&ptr) {
+        if let Some(re) = regexp_program(&this) {
             if re.source.is_empty() {
                 return Ok(Value::lstr("(?:)"));
             }
@@ -363,7 +376,7 @@ pub(super) fn intrinsic_regexp(
         if !intrinsic_receiver(proof, pins, prototype, &object, members) {
             return None;
         }
-        let re = i.regexps.get(&(Gc::as_ptr(&object) as usize))?.clone();
+        let re = object.borrow().kind.regexp()?.clone();
         Some((object, re))
     })
 }
@@ -551,8 +564,9 @@ pub(super) fn install_regexp(it: &mut Interp) {
     add_getter(it, &proto, "unicodeSets", re_unicode_sets_get);
     // Annex B B.2.5 RegExp.prototype.compile(pattern, flags): recompile this regex in place.
     it.def_method(&proto, "compile", 2, |i, this, a| {
-        let ptr = map_ptr(&this).filter(|p| i.regexps.contains_key(p));
-        let ptr = ptr.ok_or_else(|| i.make_error("TypeError", "compile called on non-RegExp"))?;
+        let target = this.as_obj().filter(is_regexp_object);
+        let target =
+            target.ok_or_else(|| i.make_error("TypeError", "compile called on non-RegExp"))?;
         // The legacy-regexp proposal: compile requires a DIRECT same-realm RegExp instance (a
         // subclass or cross-realm instance is a TypeError).
         if let (ValueView::Obj(o), Some(rp)) = (&(this).view(), i.extra_protos.get("RegExp")) {
@@ -572,7 +586,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         let (source, flags) = {
             let __value_match_original = arg(a, 0);
             match (__value_match_original).view() {
-                ValueView::Obj(o) if i.regexps.contains_key(&(Gc::as_ptr(&o) as usize)) => {
+                ValueView::Obj(o) if is_regexp_object(&o) => {
                     // A RegExp pattern copies its source/flags; a second flags argument is then an error.
                     if !matches!((arg(a, 1)).view(), ValueView::Undefined) {
                         return Err(i.make_error(
@@ -580,7 +594,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
                             "cannot supply flags when compiling a RegExp",
                         ));
                     }
-                    let re = i.regexps[&(Gc::as_ptr(&o) as usize)].clone();
+                    let re = o.borrow().kind.regexp().unwrap().clone();
                     (re.source.clone(), re.flags.clone())
                 }
                 ValueView::Undefined => (String::new(), regexp_flags_arg(i, a)?),
@@ -595,10 +609,10 @@ pub(super) fn install_regexp(it: &mut Interp) {
         };
         let re = crate::regex::Regex::new(&source, &flags)
             .map_err(|e| i.make_error("SyntaxError", &e))?;
-        if let ValueView::Obj(o) = &(this).view() {
-            i.gc_pin(o);
+        // [[RegExpMatcher]], [[OriginalSource]] and [[OriginalFlags]] change in place.
+        if let ObjectKind::RegExp(program) = &mut target.borrow_mut().kind {
+            **program = Rc::new(re);
         }
-        i.regexps.insert(ptr, Rc::new(re));
         set_throw(i, &this, "lastIndex", Value::Num(0.0))?;
         ab(i.set_member_key(&this, "lastIndex", Value::Num(0.0)))?;
         Ok(this)
@@ -641,8 +655,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         let pattern = arg(a, 0);
         let flags_arg = arg(a, 1);
         // IsRegExp: an Object whose truthy @@match (when defined) or [[RegExpMatcher]] slot.
-        let has_slots = matches!(&(pattern).view(), ValueView::Obj(o)
-            if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)));
+        let has_slots = matches!(&(pattern).view(), ValueView::Obj(o) if is_regexp_object(o));
         let pattern_is_regexp = if matches!((pattern).view(), ValueView::Obj(_)) {
             let m = match well_known_key(i, "match") {
                 Some(key) => ab(i.get_member_key(&pattern, &key))?,
@@ -675,10 +688,7 @@ pub(super) fn install_regexp(it: &mut Interp) {
         // read first, then RegExpAlloc fetches newTarget's `prototype`, and only then does
         // RegExpInitialize run the ToString coercions.
         let (src_v, fl_v) = if has_slots {
-            let re = match &(pattern).view() {
-                ValueView::Obj(o) => i.regexps[&(Gc::as_ptr(o) as usize)].clone(),
-                _ => unreachable!(),
-            };
+            let re = regexp_program(&pattern).expect("a RegExp's program");
             let fl = {
                 let __value_match_original = flags_arg;
                 match (__value_match_original).view() {
@@ -1174,8 +1184,7 @@ fn re_sym_replace_impl(
     // internal flags are checked before entering the allocation-free matcher.
     if discard_result && !functional {
         if let ValueView::Obj(obj) = &(this).view() {
-            let ptr = Gc::as_ptr(obj) as usize;
-            let re = i.regexps.get(&ptr).cloned();
+            let re = obj.borrow().kind.regexp().cloned();
             let direct_exec = re.as_ref().is_some_and(|re| {
                 let b = obj.borrow();
                 let direct_proto = b
@@ -1183,11 +1192,8 @@ fn re_sym_replace_impl(
                     .as_ref()
                     .zip(i.extra_protos.get("RegExp"))
                     .is_some_and(|(a, b)| Gc::ptr_eq(a, b));
-                if !b.kind.exotic_is_none()
-                    || b.props.contains("exec")
-                    || !direct_proto
-                    || re.flags != flags.as_ref()
-                {
+                // A RegExp's kind is its payload's: an ordinary object otherwise.
+                if b.props.contains("exec") || !direct_proto || re.flags != flags.as_ref() {
                     return false;
                 }
                 drop(b);

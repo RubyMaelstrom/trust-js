@@ -1591,11 +1591,7 @@ fn agent_kept_symbol_can_outlive_its_former_child_realm_without_retaining_it() {
 
 #[test]
 fn agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire() {
-    for (constructor, kind) in [
-        ("/native-metadata/u", 1),
-        ("new WeakMap", 2),
-        ("new WeakSet", 2),
-    ] {
+    for (constructor, kind) in [("new WeakMap", 2), ("new WeakSet", 2)] {
         let mut engine = Engine::new();
         without_checkpoint(&mut engine, "globalThis.realm=new ShadowRealm;0");
         let outer = owner(&mut engine, "realm");
@@ -1625,7 +1621,6 @@ fn agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire() {
             .expect("retained owner slot")
             .id();
         engine.interp.with_realm_view(id, |child| match kind {
-            1 => assert!(native.in_map(&child.regexps)),
             2 => assert!(child.weak_collections.contains(&native.get())),
             _ => unreachable!(),
         });
@@ -1639,42 +1634,57 @@ fn agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire() {
     }
 }
 
-/// W2g step 2: a buffer's state is its own payload's, so a ShadowRealm's buffer that outlives its
-/// realm (kept alive for the job by a WeakRef, with no prototype) holds no pin on the realm's
-/// interpreter: the realm retires at the next collection and the buffer stays whole.
+/// W2g steps 2 and 4: a buffer's and a RegExp's state is their own payloads', so a ShadowRealm's
+/// buffer or RegExp that outlives its realm (kept alive for the job by a WeakRef, with no
+/// prototype) holds no pin on the realm's interpreter: the realm retires at the next collection
+/// and the object stays whole.
 #[test]
-fn agent_kept_prototype_null_buffers_need_no_realm() {
-    let mut engine = Engine::new();
-    without_checkpoint(&mut engine, "globalThis.realm=new ShadowRealm;0");
-    let outer = owner(&mut engine, "realm");
-    without_checkpoint(
-        &mut engine,
-        "realm.evaluate('let value=new ArrayBuffer(16);Object.setPrototypeOf(value,null);new WeakRef(value);0');0",
-    );
-    let native = crate::gc_test::in_frame(|| {
-        let kept = engine.interp.gc_heap.agent.kept_alive.borrow();
-        let value = kept
-            .iter()
-            .find(|value| matches!(value.view(), ValueView::Obj(_)))
-            .expect("native kept owner");
-        crate::gc_test::HiddenAddress::of(value)
-    });
-    without_checkpoint(&mut engine, "globalThis.realm=null;0");
-    precise(&mut engine);
-    assert!(
-        !crate::gc_test::alive(outer.as_ref()),
-        "a buffer keeps no realm alive"
-    );
-    assert!(engine.interp.shadow_realms.is_empty());
-    assert_eq!(
-        native.with_object(|buffer| engine.interp.array_buffer_byte_length(buffer)),
-        Some(16)
-    );
-    engine.interp.drain_microtasks();
-    precise(&mut engine);
+fn agent_kept_prototype_null_buffers_and_regexps_need_no_realm() {
+    for constructor in ["new ArrayBuffer(16)", "/native-metadata/u"] {
+        let mut engine = Engine::new();
+        without_checkpoint(&mut engine, "globalThis.realm=new ShadowRealm;0");
+        let outer = owner(&mut engine, "realm");
+        let child_source = format!(
+            "let value={constructor};Object.setPrototypeOf(value,null);new WeakRef(value);0"
+        );
+        without_checkpoint(&mut engine, &format!("realm.evaluate({child_source:?});0"));
+        let native = crate::gc_test::in_frame(|| {
+            let kept = engine.interp.gc_heap.agent.kept_alive.borrow();
+            let value = kept
+                .iter()
+                .find(|value| matches!(value.view(), ValueView::Obj(_)))
+                .expect("native kept owner");
+            crate::gc_test::HiddenAddress::of(value)
+        });
+        without_checkpoint(&mut engine, "globalThis.realm=null;0");
+        precise(&mut engine);
+        assert!(
+            !crate::gc_test::alive(outer.as_ref()),
+            "{constructor}: keeps no realm alive"
+        );
+        assert!(engine.interp.shadow_realms.is_empty());
+        native.with_object(|object| {
+            let object = object.borrow();
+            match &object.kind {
+                crate::value::ObjectKind::ArrayBuffer(data) => {
+                    assert_eq!(
+                        data.data.as_ref().and_then(|data| data.byte_len()),
+                        Some(16)
+                    )
+                }
+                crate::value::ObjectKind::RegExp(program) => {
+                    assert_eq!(program.source, "native-metadata")
+                }
+                _ => panic!("{constructor}: its kind"),
+            }
+        });
+        engine.interp.drain_microtasks();
+        precise(&mut engine);
+    }
 }
 
-/// Attach only scalar native data, whose map does NOT itself record SideSlotTable writes.
+/// Attach only a pin (the ownership of the child's native data for the object), which does NOT
+/// itself record a SideSlotTable write.
 /// The old language object is the sole conditional edge into a newly created child.
 fn old_native_owner_fixture() -> (Engine, crate::rooting::Rooted<Value>, Box<WeakGc>) {
     let mut engine = Engine::new();
@@ -1702,13 +1712,6 @@ fn old_native_owner_fixture() -> (Engine, crate::rooting::Rooted<Value>, Box<Wea
             .with_shadow(&shadow, |child| {
                 let owner = object.as_obj().expect("old native owner");
                 child.gc_pin(&owner);
-                child.regexps.insert(
-                    Gc::as_ptr(&owner) as usize,
-                    Rc::new(
-                        crate::regex::Regex::new("x", "")
-                            .unwrap_or_else(|_| panic!("static regex")),
-                    ),
-                );
             })
             .expect("new child");
         Box::new(Gc::downgrade(&shadow))

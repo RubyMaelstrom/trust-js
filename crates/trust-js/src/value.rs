@@ -2261,6 +2261,11 @@ pub enum ObjectKind {
     /// W2g step 2: a DataView's [[ViewedArrayBuffer]], [[ByteOffset]] and [[ByteLength]] in a
     /// cell of its own (`native_typed_array::DataViewData`). An ordinary kind.
     DataView(crate::gc_storage::PayloadBox<crate::native_typed_array::DataViewData>) = 18,
+    /// W2g step 4: a RegExp's [[RegExpMatcher]], [[OriginalSource]] and [[OriginalFlags]], the
+    /// shared compiled program (`regex::Regex`, which holds the source and the flags), in a cell
+    /// of its own. `lastIndex` stays an own data property at the slot RegExpAlloc's shape gives
+    /// it. An ordinary kind: the property caches admit the object.
+    RegExp(crate::gc_storage::PayloadBox<Rc<crate::regex::Regex>>) = 19,
     Array = KIND_ARRAY_TAG,
     /// The [[BooleanData]], [[NumberData]], [[StringData]], [[SymbolData]] and [[BigIntData]] of
     /// primitive wrapper objects.
@@ -2694,6 +2699,15 @@ impl ObjectKind {
     pub(crate) fn data_view(&self) -> Option<crate::native_typed_array::DataViewData> {
         match self {
             ObjectKind::DataView(view) => Some(**view),
+            _ => None,
+        }
+    }
+
+    /// A RegExp's compiled program (its [[RegExpMatcher]], source and flags).
+    #[inline]
+    pub(crate) fn regexp(&self) -> Option<&Rc<crate::regex::Regex>> {
+        match self {
+            ObjectKind::RegExp(program) => Some(program),
             _ => None,
         }
     }
@@ -3459,6 +3473,7 @@ pub(crate) struct PayloadDescs {
     typed_array: crate::gc_core::DescId,
     array_buffer: crate::gc_core::DescId,
     data_view: crate::gc_core::DescId,
+    regexp: crate::gc_core::DescId,
     extras: crate::gc_core::DescId,
     closure_cache: crate::gc_core::DescId,
     name_index: crate::gc_core::DescId,
@@ -3494,6 +3509,7 @@ payload_kinds! {
     crate::native_typed_array::NativeTypedArray => typed_array,
     crate::native_typed_array::ArrayBufferData => array_buffer,
     crate::native_typed_array::DataViewData => data_view,
+    Rc<crate::regex::Regex> => regexp,
     DenseExtras => extras,
     UserCallableCache => closure_cache,
     crate::interpreter::NameIndex => name_index,
@@ -3547,6 +3563,7 @@ impl PayloadDescs {
             data_view: leaf(payload_layout::<crate::native_typed_array::DataViewData>(
                 "data view state",
             )),
+            regexp: leaf(payload_layout::<Rc<crate::regex::Regex>>("regexp program")),
             extras: leaf(payload_layout::<DenseExtras>("property map extras")),
             closure_cache: leaf(payload_layout::<UserCallableCache>("closure cache")),
             name_index: leaf(payload_layout::<crate::interpreter::NameIndex>(
@@ -4336,6 +4353,8 @@ impl Object {
                 sink.object(&view.info.buffer);
             }
             ObjectKind::ArrayBuffer(data) => PayloadBox::trace(data, sink),
+            // The program holds no edge.
+            ObjectKind::RegExp(program) => PayloadBox::trace(program, sink),
             ObjectKind::DataView(view) => {
                 PayloadBox::trace(view, sink);
                 sink.object(&view.buffer);

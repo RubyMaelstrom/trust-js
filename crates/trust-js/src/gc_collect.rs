@@ -1698,7 +1698,6 @@ impl Interp {
             gc_pins: _,       // bookkeeping for side-table owners, not holders
             shadow_realms: _, // members of the collection's tree, traced as side slots
             shadow_home: _,   // a weak owner; its entry count is read by `Marking`
-            regexps: _,
             regexp_programs: _,
             host_indexed: _, // side slots
             new_target,

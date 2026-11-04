@@ -136,29 +136,23 @@ fn a_minor_collection_reports_written_and_young_side_slot_owners_only() {
     }
 }
 
-/// Make a RegExp object no one keeps, in a frame of its own.
-#[inline(never)]
-fn dropped_regexp(engine: &mut Engine) -> HiddenAddress {
-    let regexp = engine
-        .interp
-        .make_regexp("dropped", "g")
-        .unwrap_or_else(|_| panic!("a RegExp"));
-    HiddenAddress::of(&regexp)
-}
-
 /// A pin of the root interpreter adds no edge (a ShadowRealm interpreter's pin keeps its place in
 /// the tree), so a minor collection does not report a pinned object as a side-slot owner: every
-/// RegExp object is pinned, and reporting each made every minor collection visit every one made
-/// since the last. A pinned object keeps its metadata while it lives, and a minor collection that
-/// finds a young one dead evicts its pin and metadata.
+/// WeakMap is pinned (as every RegExp was until W2g step 4), and reporting each made every minor
+/// collection visit every one made since the last. A pinned object keeps its metadata while it
+/// lives, and a minor collection that finds a young one dead evicts its pin and metadata.
 #[test]
 fn a_minor_collection_reports_no_pins_of_the_root_interpreter() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(tier);
         engine.interp.gc_collect();
-        eval(&mut engine, "var kept = /k(e)pt/g; 0");
+        eval(
+            &mut engine,
+            "var key = {}, kept = new WeakMap([[key, 7]]), dropped = new WeakMap; 0",
+        );
         let kept = global_address(&mut engine, "kept");
-        let dropped = dropped_regexp(&mut engine);
+        let dropped = global_address(&mut engine, "dropped");
+        eval(&mut engine, "dropped = undefined; 0");
         assert!(kept.in_map(&engine.interp.gc_pins), "{tier:?}: pinned");
         assert!(dropped.in_map(&engine.interp.gc_pins), "{tier:?}: pinned");
         engine.interp.gc_collect_minor();
@@ -167,17 +161,14 @@ fn a_minor_collection_reports_no_pins_of_the_root_interpreter() {
             !listed(kept, &minor.side_slot_owners),
             "{tier:?}: {minor:?}"
         );
-        assert!(kept.in_map(&engine.interp.regexps), "{tier:?}: live");
+        let registered = |address: HiddenAddress| -> bool {
+            engine.interp.weak_collections.contains(&address.get())
+        };
+        assert!(registered(kept), "{tier:?}: live");
         assert!(kept.in_map(&engine.interp.gc_pins), "{tier:?}: live");
-        assert!(!dropped.in_map(&engine.interp.regexps), "{tier:?}: dead");
+        assert!(!registered(dropped), "{tier:?}: dead");
         assert!(!dropped.in_map(&engine.interp.gc_pins), "{tier:?}: dead");
-        assert_eq!(
-            eval(
-                &mut engine,
-                "kept.exec('a kept').index + ':' + kept.lastIndex"
-            ),
-            "2:6"
-        );
+        assert_eq!(eval(&mut engine, "kept.get(key)"), "7");
     }
 }
 

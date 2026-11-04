@@ -206,7 +206,7 @@ fn set_throw(i: &mut Interp, base: &Value, key: &str, value: Value) -> Result<()
     // Overwriting an existing own writable data property (the shape of every hot builtin write,
     // e.g. a RegExp's `lastIndex` after each exec) needs none of the [[Set]] machinery.
     if let ValueView::Obj(o) = &(base).view() {
-        if o.borrow().kind.exotic_is_none() && i.ordinary_get_ptr(Gc::as_ptr(o) as usize) {
+        if o.borrow().kind.is_ordinary() && i.ordinary_get_ptr(Gc::as_ptr(o) as usize) {
             let mut b = o.borrow_mut();
             if b.props
                 .get(key)
@@ -2487,7 +2487,7 @@ fn regexp_exec_abstract(i: &mut Interp, r: &Value, s: crate::lstr::LStr) -> Resu
         }
         return Ok(res);
     }
-    if map_ptr(r).map(|p| i.regexps.contains_key(&p)) != Some(true) {
+    if !r.as_obj().is_some_and(|o| regexp::is_regexp_object(&o)) {
         return Err(i.make_error("TypeError", "exec called on a non-RegExp object"));
     }
     regexp_exec(i, *r, &[Value::Str(s)])
@@ -2620,11 +2620,7 @@ fn regexp_array(
 /// `RegExp.prototype.exec`: returns the match array (with `index`/`input`) or `null`, advancing
 /// `lastIndex` for global/sticky regexes.
 pub(crate) fn regexp_exec(i: &mut Interp, this: Value, args: &[Value]) -> Result<Value, Value> {
-    let ptr = map_ptr(&this).ok_or_else(|| i.make_error("TypeError", "exec on non-RegExp"))?;
-    let matcher = i
-        .regexps
-        .get(&ptr)
-        .cloned()
+    let matcher = regexp::regexp_program(&this)
         .ok_or_else(|| i.make_error("TypeError", "exec on non-RegExp"))?;
     let subject = arg(args, 0);
     // ToString of a String runs no code, so nothing can have recompiled the matcher (`compile()`)
@@ -2672,13 +2668,8 @@ fn regexp_builtin_exec(
     };
     let re = match matcher {
         Some(re) => re,
-        None => {
-            let ptr = map_ptr(&this).unwrap_or(0);
-            i.regexps
-                .get(&ptr)
-                .cloned()
-                .ok_or_else(|| i.make_error("TypeError", "exec on non-RegExp"))?
-        }
+        None => regexp::regexp_program(&this)
+            .ok_or_else(|| i.make_error("TypeError", "exec on non-RegExp"))?,
     };
     let set_last = |i: &mut Interp, units: usize| match &at_slot {
         Some((object, _)) => {
@@ -2831,8 +2822,7 @@ pub(crate) fn regexp_exec_discard_fast(
     let ValueView::Obj(obj) = &(this).view() else {
         return None;
     };
-    let ptr = Gc::as_ptr(obj) as usize;
-    let re = i.regexps.get(&ptr)?.clone();
+    let re = obj.borrow().kind.regexp()?.clone();
     regexp::slot_last_index(i, obj)?;
     Some(regexp_exec_discard_direct(i, obj, &re, input))
 }
@@ -3479,7 +3469,7 @@ pub(crate) fn set_to_string_tag(i: &Interp, obj: &Gc, tag: &str) {
 
 /// The Object.prototype.toString builtin tag for `this` (the `[object <tag>]` body without an
 /// overriding `@@toStringTag`).
-fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
+fn builtin_tag(this: &Value) -> &'static str {
     match &(this).view() {
         ValueView::Num(_) => "Number",
         ValueView::Str(_) => "String",
@@ -3502,7 +3492,7 @@ fn builtin_tag(i: &Interp, this: &Value) -> &'static str {
                 "String"
             } else if b.internal_slots().contains("#\u{0}date_ms") {
                 "Date"
-            } else if i.regexps.contains_key(&(Gc::as_ptr(o) as usize)) {
+            } else if b.kind.regexp().is_some() {
                 "RegExp"
             } else {
                 "Object"
@@ -4558,7 +4548,7 @@ fn install_object(it: &mut Interp) {
         let builtin = if json_is_array(i, &this)? {
             "Array"
         } else {
-            builtin_tag(i, &this)
+            builtin_tag(&this)
         };
         // Object.prototype.toString's final step is the concatenation of three strings
         // (ECMA-262 §20.1.3.6). Keep a String @@toStringTag borrowed through the one result
@@ -6742,7 +6732,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
             let builtin = if json_is_array(i, &ov)? {
                 "Array"
             } else {
-                builtin_tag(i, &ov)
+                builtin_tag(&ov)
             };
             match to_string_tag_key(i) {
                 Some(key) => match (ab(i.get_member_key(&ov, &key))?).view() {
@@ -11298,7 +11288,7 @@ fn arg_is_regexp(i: &mut Interp, v: &Value) -> Result<bool, Value> {
                 return Ok(i.to_boolean(&m));
             }
         }
-        return Ok(i.regexps.contains_key(&(Gc::as_ptr(&o) as usize)));
+        return Ok(regexp::is_regexp_object(&o));
     }
     Ok(false)
 }

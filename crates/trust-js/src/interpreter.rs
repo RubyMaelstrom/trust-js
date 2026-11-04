@@ -4914,7 +4914,7 @@ pub struct Interp {
     pub(crate) global_var_names: Rc<RefCell<std::collections::HashSet<String>>>,
 
     /// GC pins: a `Gc` for each object that has an entry in a pointer-keyed side table
-    /// (promises, regexps, …), keyed by its address. A pin keeps nothing
+    /// (promises, namespaces, WeakMaps, …), keyed by its address. A pin keeps nothing
     /// alive (the collector does not trace pins): such an object dies in a collection like any
     /// other, whose sweep evicts its table entries and its pin before a later allocation can
     /// reuse the address.
@@ -4924,8 +4924,6 @@ pub struct Interp {
     pub(crate) shadow_realms: crate::fasthash::FastMap<usize, crate::agent_access::Owned<Interp>>,
     /// A ShadowRealm's interpreter: its place in its parent's tree (None for an Agent's root).
     pub(crate) shadow_home: Option<ShadowHome>,
-    /// Compiled regular expressions, keyed by the RegExp object's pointer.
-    pub(crate) regexps: crate::fasthash::FastMap<usize, Rc<crate::regex::Regex>>,
     /// Immutable matcher programs shared by RegExp instances with the same source and flags.
     /// A literal expression must still produce a fresh object (and therefore a fresh
     /// `lastIndex`) each time it is evaluated, but recompiling its parser/bytecode and first-set
@@ -5206,7 +5204,6 @@ interp_memory_inventory! {
     gc_pins => "measured",
     shadow_realms => "measured",
     shadow_home => "non_owning",
-    regexps => "measured",
     regexp_programs => "measured",
     host_indexed => "measured",
     new_target => "measured",
@@ -5280,7 +5277,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 139);
+    assert_eq!(names.len(), 138);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6924,7 +6921,6 @@ impl Interp {
             gc_pins: Default::default(),
             shadow_realms: Default::default(),
             shadow_home: None,
-            regexps: Default::default(),
             regexp_programs: crate::cache::RegexpProgramCache::new(16 << 20, 512),
             host_indexed: Default::default(),
             new_target: (Value::Undefined),
@@ -13354,7 +13350,6 @@ impl Interp {
             eval_realm_fns,
             module_ns,
             realms,
-            regexps,
             host_indexed,
             promises,
             temporal,
@@ -13503,7 +13498,6 @@ impl Interp {
         crate::gc_sweep::set(eval_realm_fns, dead);
         module_ns.evict_dead(dead);
         crate::gc_sweep::map(realms, dead);
-        crate::gc_sweep::map(regexps, dead);
         host_indexed.evict_dead(dead);
         promises.evict_dead(dead);
         crate::gc_sweep::map(temporal, dead);

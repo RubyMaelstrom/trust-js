@@ -161,6 +161,24 @@ fn object_offsets_read_proto_shape_and_exotic_tags() {
         assert_eq!(tag(collection), crate::value::KIND_COLLECTION_TAG);
         assert!(tag(collection) <= crate::value::KIND_ORDINARY_LAST);
     }
+    // W2g's other ordinary payload kinds: WeakMaps and WeakSets (step 5), ArrayBuffers,
+    // SharedArrayBuffers and DataViews (step 2), RegExps (step 4).
+    for (source, name) in [
+        ("var probeWeakMap = new WeakMap;", "probeWeakMap"),
+        ("var probeWeakSet = new WeakSet;", "probeWeakSet"),
+        ("var probeBuffer = new ArrayBuffer(8);", "probeBuffer"),
+        ("var probeShared = new SharedArrayBuffer(8);", "probeShared"),
+        ("var probeView = new DataView(probeBuffer);", "probeView"),
+        ("var probeRegExp = /probe/g;", "probeRegExp"),
+    ] {
+        let object = global(&mut engine, source, name);
+        let kind = tag(&object);
+        assert!(
+            kind > crate::value::KIND_COLLECTION_TAG && kind <= crate::value::KIND_ORDINARY_LAST,
+            "{name}: tag {kind}"
+        );
+        assert!(object.borrow().kind.is_ordinary());
+    }
     let function_tag = tag(&function);
     assert_eq!(function_tag, crate::value::CALLABLE_USER_TAG);
     assert!(
