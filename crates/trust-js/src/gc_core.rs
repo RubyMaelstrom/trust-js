@@ -84,6 +84,16 @@ const FORCED_SLICE_CELLS: usize = 4;
 /// W6: the floor of V8's overshoot margin, past which a cycle's allocation forces its final
 /// pause (src/heap/heap-controller.h:160-176).
 const MIN_CYCLE_MARGIN: usize = 32 << 20;
+/// W6 step 3's provisional precleaning budget, until the schedule (step 4): a preclean round (a
+/// preclean, and the drain of what its cells reach) that found fewer marked cells than this on
+/// set cards and traced fewer bytes than [`PRECLEAN_DONE_BYTES`] is the cycle's last, and the
+/// final pause follows once the worklist runs out after it (design 5: about 0.5 ms of the final
+/// pause's rescan, at the 67-78 ns a cell of TypeScript's rescans).
+const PRECLEAN_DONE_CELLS: usize = 7_000;
+/// W6 step 3: the bytes a last preclean round may trace (see [`PRECLEAN_DONE_CELLS`]): about
+/// 0.5 ms of marking. A round's few cells can reach far: Splay's rotations move subtrees the
+/// marker has not reached under nodes it has, and the next round finds them.
+const PRECLEAN_DONE_BYTES: usize = 1 << 20;
 
 /// S6 step 10b: a page of a kind whose cells gain references after their initialization
 /// ([`LayoutDesc::carded`]) ends in a card table, a byte per card of `1 << CARD_SHIFT` bytes of
@@ -1521,8 +1531,34 @@ struct Cycle {
     slice_nanos: u64,
     /// The bytes of the cells the last slice traced (its work, [`Heap::drain_within`]).
     last_traced: usize,
-    /// The worklist ran out: the final pause is due.
+    /// Precleaning (step 3, [`Heap::preclean`]): the precleans so far, the marked cells their
+    /// cards named in all and in the last, and the bytes traced since the last.
+    precleans: u32,
+    precleaned: usize,
+    last_precleaned: usize,
+    round_traced: usize,
+    /// The worklist ran out after the last preclean: the final pause is due.
     complete: bool,
+}
+
+/// W6: what the GC log's slice lines report of a running cycle ([`Heap::cycle_progress`]).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CycleProgress {
+    /// The slices so far, the start's among them.
+    pub(crate) slices: u32,
+    /// The bytes of the cells the last slice traced.
+    pub(crate) traced: usize,
+    /// The bytes the cycle marked so far.
+    pub(crate) marked: usize,
+    /// The grey cells its worklist holds.
+    pub(crate) worklist: usize,
+    /// The bytes allocated since it started.
+    pub(crate) allocated: usize,
+    /// The precleans so far, and the marked cells the last one's cards named.
+    pub(crate) precleans: u32,
+    pub(crate) last_precleaned: usize,
+    /// Its marking is complete but for the final pause.
+    pub(crate) complete: bool,
 }
 
 /// A small direct-mapped table of exact positive words. Cell and page bits both
@@ -2148,20 +2184,19 @@ impl Heap {
         self.cycle.is_some()
     }
 
-    /// W6: the running cycle's slices so far, the bytes its last slice traced, the bytes it
-    /// marked, the grey cells its worklist holds, the bytes allocated since it started, and
-    /// whether its marking is complete but for the final pause (the GC log's slice lines).
-    pub(crate) fn cycle_progress(&self) -> Option<(u32, usize, usize, usize, usize, bool)> {
-        self.cycle.as_ref().map(|cycle| {
-            (
-                cycle.slices,
-                cycle.last_traced,
-                self.marked_bytes,
-                cycle.marker.worklist.len(),
-                self.allocated_bytes
-                    .saturating_sub(cycle.allocated_at_start),
-                cycle.complete,
-            )
+    /// W6: the running cycle's progress (the GC log's slice lines).
+    pub(crate) fn cycle_progress(&self) -> Option<CycleProgress> {
+        self.cycle.as_ref().map(|cycle| CycleProgress {
+            slices: cycle.slices,
+            traced: cycle.last_traced,
+            marked: self.marked_bytes,
+            worklist: cycle.marker.worklist.len(),
+            allocated: self
+                .allocated_bytes
+                .saturating_sub(cycle.allocated_at_start),
+            precleans: cycle.precleans,
+            last_precleaned: cycle.last_precleaned,
+            complete: cycle.complete,
         })
     }
 
@@ -3745,6 +3780,10 @@ impl Heap {
             slices: 0,
             slice_nanos: 0,
             last_traced: 0,
+            precleans: 0,
+            precleaned: 0,
+            last_precleaned: 0,
+            round_traced: 0,
             complete: false,
         });
         self.run_slice(&mut cycle, client, started);
@@ -3804,8 +3843,15 @@ impl Heap {
                     .max(SLICE_BYTES),
             ),
         };
-        (cycle.complete, cycle.last_traced) =
-            self.drain_within(&mut cycle.marker, client, budget);
+        let (out_of_work, traced) = self.drain_within(&mut cycle.marker, client, budget);
+        cycle.last_traced = traced;
+        cycle.round_traced = cycle.round_traced.saturating_add(traced);
+        // Once the worklist runs out, a preclean, until a round (a preclean and the drain of what
+        // it found) is small: then the final pause.
+        let small_round = cycle.precleans > 0
+            && cycle.last_precleaned < PRECLEAN_DONE_CELLS
+            && cycle.round_traced < PRECLEAN_DONE_BYTES;
+        cycle.complete = out_of_work && (small_round || self.preclean(cycle) == 0);
         cycle.slices += 1;
         cycle.allocated_at_slice = self.allocated_bytes;
         // The check walks the heap: after every slice of an ordinary cycle, but under `Force`,
@@ -3824,6 +3870,32 @@ impl Heap {
         if let Some(started) = started {
             cycle.slice_nanos += started.elapsed().as_nanos() as u64;
         }
+    }
+
+    /// W6 step 3: a cycle's preclean (design 5), in a slice whose drain ran out of work: the
+    /// marked cells whose cards are set, written since their trace, go back to the worklist for
+    /// full traces, which the next slices do while the program runs, and their cards are cleared,
+    /// so that the final pause rescans only the cells written after the cycle's last preclean, as
+    /// JSC rescans the cells its barrier re-greyed at each of its marking's stops. Not on a
+    /// timer: a program's hot cells would be rescanned at every preclean. It starts a round,
+    /// whose drain `run_slice` counts. The cells found.
+    fn preclean(&mut self, cycle: &mut Cycle) -> usize {
+        let found = self.take_cycle_card_cells(&mut cycle.marker);
+        cycle.precleans += 1;
+        cycle.precleaned += found;
+        cycle.last_precleaned = found;
+        cycle.round_traced = 0;
+        found
+    }
+
+    /// W6: queue for full traces every marked cell of the heap that starts in a set card, and
+    /// clear the cards (a cycle's preclean and its final pause): the number queued.
+    fn take_cycle_card_cells(&mut self, m: &mut Marker) -> usize {
+        let queued = m.worklist.len();
+        for page in self.pages.iter_mut().flatten() {
+            page.take_card_cells::<true>(&mut m.worklist);
+        }
+        m.worklist.len() - queued
     }
 
     /// W6: a cycle's final pause marks (design 7), as a major collection marks but from the
@@ -3871,11 +3943,7 @@ impl Heap {
         if self.verifies() {
             self.check_cycle_barrier(&m);
         }
-        let queued = m.worklist.len();
-        for page in self.pages.iter_mut().flatten() {
-            page.take_card_cells::<true>(&mut m.worklist);
-        }
-        self.stats.last_card_cells = m.worklist.len() - queued;
+        self.stats.last_card_cells = self.take_cycle_card_cells(&mut m);
         // Taking the cards handled cells' addresses in frames below this one, which the stack
         // scan's frames reuse (see `mark_phase`).
         #[cfg(not(target_arch = "wasm32"))]
@@ -10375,6 +10443,77 @@ mod tests {
         fx.collect();
         assert!(!fx.heap.owns_cell(chain[0] as usize, fx.carded));
         assert!(fx.heap.owns_cell(young as usize, fx.carded));
+    }
+
+    /// W6 step 3: once a cycle's worklist runs out, a slice precleans: a store into a traced cell
+    /// (its card set) is rescanned while the program runs, and what it stored is marked before the
+    /// final pause, which then has no card to rescan.
+    #[test]
+    fn a_cycles_preclean_rescans_a_written_cell_before_the_final_pause() {
+        let (mut fx, chain) = cycle_fixture(5_000);
+        assert!(start_cycle(&mut fx));
+        // The start's slice traced the chain's head and left the rest of the chain.
+        let head = *chain.last().unwrap();
+        assert_eq!(fx.heap.cell_age(head as u64), Some(CellAge::Old));
+        assert!(!fx.heap.cycle.as_ref().unwrap().complete);
+        let young = fx.heap.alloc(fx.carded, 16);
+        set_word(young, 0, 0);
+        set_word(young, 1, 77);
+        set_word(head, 0, tagged(young));
+        // SAFETY: the head is a live carded cell of this heap.
+        unsafe { card_mark(head) };
+        slice_to_completion(&mut fx);
+        let cycle = fx.heap.cycle.as_ref().unwrap();
+        assert_eq!(cycle.precleans, 1, "a small round: the final pause is due");
+        // The head's card names every marked cell that starts in its 128 bytes: 8 of 16 bytes.
+        assert_eq!(cycle.last_precleaned, (1 << CARD_SHIFT) / 16);
+        assert!(cycle.round_traced < PRECLEAN_DONE_BYTES);
+        assert_eq!(
+            fx.heap.cell_age(young as u64),
+            Some(CellAge::Old),
+            "the preclean marked the stored cell"
+        );
+        fx.collect();
+        assert_eq!(fx.heap.stats().last_card_cells, 0, "the final pause rescanned no card");
+        assert!(fx.heap.owns_cell(young as usize, fx.carded));
+    }
+
+    /// W6 step 3: precleaning repeats while a round finds at least `PRECLEAN_DONE_CELLS` marked
+    /// cells on set cards, and the cycle's marking is complete once the worklist runs out after a
+    /// round that found fewer and traced little.
+    #[test]
+    fn precleaning_repeats_until_a_preclean_finds_fewer_cells_than_its_budget() {
+        let (mut fx, chain) = cycle_fixture(20_000);
+        assert!(start_cycle(&mut fx));
+        assert!(fx.heap.slice(&NoClient).is_some());
+        // The cells traced so far are written (their cards set), as a program writing its old
+        // objects while the cycle marks.
+        let traced: Vec<*mut u8> = chain
+            .iter()
+            .copied()
+            .filter(|&cell| fx.heap.cell_age(cell as u64) == Some(CellAge::Old))
+            .collect();
+        assert!(traced.len() >= PRECLEAN_DONE_CELLS, "{} traced", traced.len());
+        assert!(!fx.heap.cycle.as_ref().unwrap().complete);
+        for &cell in &traced {
+            // SAFETY: a live carded cell of this heap.
+            unsafe { card_mark(cell) };
+        }
+        slice_to_completion(&mut fx);
+        let cycle = fx.heap.cycle.as_ref().unwrap();
+        assert_eq!(cycle.precleans, 2, "one that found the written cells, one that found none");
+        // Their cards name them and the cells traced since that start in the last card.
+        let per_card = (1 << CARD_SHIFT) / 16;
+        assert!(
+            (traced.len()..traced.len() + per_card).contains(&cycle.precleaned),
+            "{} precleaned for {} written",
+            cycle.precleaned,
+            traced.len()
+        );
+        assert_eq!(cycle.last_precleaned, 0);
+        fx.collect();
+        assert_eq!(fx.heap.stats().last_card_cells, 0);
+        assert!(chain.iter().all(|&cell| fx.heap.owns_cell(cell as usize, fx.carded)));
     }
 
     /// W6, design 11: a store into a traced cell that set no card is caught by the cycle's

@@ -1484,12 +1484,13 @@ impl Interp {
                     String::new(),
                 ),
                 // A major collection is the final pause of its marking cycle (W6): the slices
-                // that marked before it, the bytes allocated since the cycle started, and the
-                // cycle's whole marking time, its slices' and this pause's.
+                // that marked before it, the marked cells it rescanned for their set cards (none
+                // in one pause), the bytes allocated since the cycle started, and the cycle's
+                // whole marking time, its slices' and this pause's.
                 CollectionKind::Major => (
                     format!(
-                        " slices={} cycle_alloc={}",
-                        stats.last_cycle_slices, stats.last_cycle_allocated
+                        " slices={} card_cells={} cycle_alloc={}",
+                        stats.last_cycle_slices, stats.last_card_cells, stats.last_cycle_allocated
                     ),
                     format!(
                         " cycle_mark={:.0}",
@@ -1622,16 +1623,25 @@ impl Interp {
     ) {
         let pause = started.elapsed().as_nanos() as f64 / 1000.0;
         let core = heap.core.borrow();
-        let Some((slices, traced, cycle_marked, worklist, allocated, complete)) =
-            core.cycle_progress()
-        else {
+        let Some(progress) = core.cycle_progress() else {
             return;
         };
         // The start's marking is the cycle's so far.
-        let marked = if phase == "start" { cycle_marked } else { marked };
+        let marked = if phase == "start" {
+            progress.marked
+        } else {
+            marked
+        };
         eprintln!(
-            "[gc-slice] phase={phase} cause={cause:?} n={slices} traced={traced} marked={marked} cycle_marked={cycle_marked} worklist={worklist} cycle_alloc={allocated} complete={} us: pause={pause:.0}",
-            u8::from(complete)
+            "[gc-slice] phase={phase} cause={cause:?} n={} traced={} marked={marked} cycle_marked={} worklist={} cycle_alloc={} precleans={} precleaned={} complete={} us: pause={pause:.0}",
+            progress.slices,
+            progress.traced,
+            progress.marked,
+            progress.worklist,
+            progress.allocated,
+            progress.precleans,
+            progress.last_precleaned,
+            u8::from(progress.complete)
         );
     }
 
@@ -1656,7 +1666,7 @@ impl Interp {
     pub(crate) fn gc_slice_to_completion(&mut self) {
         let complete = |interp: &Self| {
             let progress = interp.gc_heap.core.borrow().cycle_progress();
-            progress.expect("a running cycle").5
+            progress.expect("a running cycle").complete
         };
         for _ in 0..10_000_000 {
             if complete(self) {
