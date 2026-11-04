@@ -9468,8 +9468,9 @@ impl Interp {
         // transitions, key hashing and name string once. Each closure copies the field words,
         // shares the layout, and patches the two identity-dependent values in place; value
         // writes never touch the shape.
-        // The function's entry for the active heap, taken once for the closure (W2e step 7).
-        let lease = func.runtime();
+        // The function's entry for the active heap, taken once for the closure, in line
+        // (`Function::runtime` is a call; W2e step 7).
+        let lease = func.runtime_cache().current();
         let maps = lease.fn_maps.get_or_init(|| {
             let arity = func
                 .params
