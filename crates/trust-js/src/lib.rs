@@ -245,6 +245,8 @@ mod spread;
 mod spread_call_tests;
 mod stack_trace;
 #[cfg(test)]
+mod store_writability_tests;
+#[cfg(test)]
 mod string_concat_tests;
 #[cfg(test)]
 mod string_key_order_tests;

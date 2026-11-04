@@ -4825,6 +4825,10 @@ pub struct Interp {
     /// the proof lapses. Every defineProperty / proto swap / structural change to a marked
     /// prototype bumps the epoch, forcing a re-verify.
     pub(crate) elems_protector: std::cell::Cell<(u32, bool)>,
+    /// Set by an update site's read for its cache probe, which consumes it (W4 step 9): that
+    /// probe's fills admit only an own writable data property, the store its update makes (see
+    /// `bytecode::writes_property`), and promote nothing from the stub cache.
+    pub(crate) ic_store_fill: std::cell::Cell<bool>,
     /// The ArraySpeciesCreate protector (see `builtins::array_species_is_intrinsic`):
     /// `(epoch, slot)`. While `epoch` matches the live [`crate::value::proto_epoch`], the
     /// current Realm's %Array% has its intrinsic `@@species` getter and `slot` is the `entries`
@@ -5188,6 +5192,7 @@ interp_memory_inventory! {
     eval_realm_fns => "measured",
     native_function_realms => "measured",
     elems_protector => "non_owning",
+    ic_store_fill => "non_owning",
     species_protector => "non_owning",
     ta_accessor_protector => "non_owning",
     array_iteration_protector => "non_owning",
@@ -5291,7 +5296,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 138);
+    assert_eq!(names.len(), 139);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6868,6 +6873,7 @@ impl Interp {
             eval_realm_fns: Default::default(),
             native_function_realms: Default::default(),
             elems_protector: std::cell::Cell::new((0, false)),
+            ic_store_fill: std::cell::Cell::new(false),
             species_protector: std::cell::Cell::new((0, u32::MAX)),
             ta_accessor_protector: RefCell::default(),
             array_iteration_protector: Default::default(),
@@ -10075,7 +10081,7 @@ impl Interp {
                 // Derive once and retain the key only in the bounded computed cache.
                 let prop_key = crate::atom::PropKey::lookup_text(&text);
                 if let Some(value) =
-                    self.ic_get_rederive(&object, &text, prop_key, &scratch[0], false)
+                    self.ic_get_rederive(&object, &text, prop_key, &scratch[0], false, false)
                 {
                     let young = self.gc_heap.is_young(key.cell_word());
                     self.computed_reads.insert(
@@ -10143,7 +10149,7 @@ impl Interp {
         }
         let scratch = [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
             crate::bytecode::PROP_IC_WAYS];
-        self.ic_get_rederive(object, name, key, &scratch[0], key.is_some())
+        self.ic_get_rederive(object, name, key, &scratch[0], key.is_some(), false)
     }
 
     fn get_prop_ic_impl(
@@ -10234,6 +10240,8 @@ impl Interp {
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
     ) -> Option<CachedGet> {
+        // The update's own read consumes the flag, so a getter it calls reads as any read does.
+        let store_fill = self.ic_store_fill.replace(false);
         let head = Gc::as_ptr(o);
         // PROP_IC_WAYS ways per site (polymorphic receivers — subclass hierarchies rotating
         // through one access site — miss fewer ways constantly): probe all, then the global
@@ -10245,10 +10253,11 @@ impl Interp {
                 return Some(v);
             }
         }
-        if stable_name {
+        // A read's stub-cache entry never reaches an update site's ways (W4 step 9).
+        if stable_name && !store_fill {
             let shape = unsafe { (*head).borrow().props.shape() };
             let Some(e) = self.stub_cache_get(shape, key) else {
-                return self.ic_get_rederive(o, name, Some(key), cache, stable_name);
+                return self.ic_get_rederive(o, name, Some(key), cache, stable_name, store_fill);
             };
             if e.st.recv_shape == shape {
                 if let Some(v) = self.ic_shape_probe(head, name, Some(key), e.st) {
@@ -10259,7 +10268,7 @@ impl Interp {
                 }
             }
         }
-        self.ic_get_rederive(o, name, Some(key), cache, stable_name)
+        self.ic_get_rederive(o, name, Some(key), cache, stable_name, store_fill)
     }
 
     /// Cache way `k` of a property site (sites allocate `PROP_IC_WAYS` consecutive cells — see
@@ -10503,6 +10512,8 @@ impl Interp {
         key: Option<crate::atom::PropKey>,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         stable_name: bool,
+        // An update site's read (W4 step 9, `Interp::ic_store_fill`): fill only own writable data.
+        store_fill: bool,
     ) -> Option<CachedGet> {
         use crate::bytecode::{IcState, IC_MAX_DEPTH};
         type ObjCell = std::cell::RefCell<Object>;
@@ -10579,6 +10590,14 @@ impl Interp {
                     let Some(loc) = b.props.slot_location(slot) else {
                         return Some(v);
                     };
+                    // An update site's ways are store ways (W4 step 9): own writable data only.
+                    if store_fill
+                        && (depth != 0
+                            || p.accessor()
+                            || !b.props.property_at(slot).is_some_and(|p| p.writable()))
+                    {
+                        return Some(v);
+                    }
                     // Demote the previous ways before refilling: a site rotating through up
                     // to PROP_IC_WAYS shapes stabilizes with one shape per way instead of
                     // thrashing a single cell.
@@ -10631,7 +10650,7 @@ impl Interp {
                         // and the chain fits the recorded shape fields. OrdinaryGet must observe
                         // additions and prototype swaps at every level, including deep bases.
                         let levels = depth as usize + 1;
-                        if absent_ok && levels <= absent_shapes.len() {
+                        if absent_ok && levels <= absent_shapes.len() && !store_fill {
                             let st = IcState {
                                 depth: crate::bytecode::IC_ABSENT,
                                 slot: levels as u32,
@@ -10949,8 +10968,9 @@ impl Interp {
             return IcSet::Miss;
         }
         // Shape fast path (own writable data property), every way: a shape match means `slot`
-        // still maps `name`; skip the key compare. `accessor`/`writable` are re-checked (an
-        // in-place defineProperty could have flipped them without changing the shape).
+        // still maps `name`; skip the key compare. The shape keys the attributes too (W2d step 2),
+        // so a store site's way proves its property writable data (W4 step 9); the interpreter's
+        // hits keep their live check of `accessor`/`writable` all the same.
         for k in 0..crate::bytecode::PROP_IC_WAYS {
             let st = self.ic_way(cache, k).get();
             if st.depth == 0 && b.props.shape() == st.recv_shape {
@@ -13563,6 +13583,7 @@ impl Interp {
             proxy_forward_depth: _,
             eval_fn: _,
             elems_protector: _,
+            ic_store_fill: _,
             species_protector: _,
             self_hosted: _,
             shared_snapshots: _,

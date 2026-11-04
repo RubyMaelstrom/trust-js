@@ -1854,6 +1854,7 @@ impl Interp {
             eval_realm_fns: _,         // addresses
             native_function_realms: _, // weak pins; [[Realm]] edges are reported as ephemerons
             elems_protector: _,
+            ic_store_fill: _,
             species_protector: _,
             ta_accessor_protector: _,     // weak pins
             array_iteration_protector: _, // weak pins

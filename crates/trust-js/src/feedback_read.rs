@@ -125,6 +125,9 @@ pub(crate) struct NamedView {
     pub(crate) ways: [Option<NamedWay>; PROP_IC_WAYS],
     /// Megamorphic or uncacheable (a refused fill or a fifth receiver shape).
     pub(crate) generic: bool,
+    /// A store's or an update's site, whose Data ways are writable data properties (W4 step 9,
+    /// Pilot C): a matching shape proves the property writable.
+    pub(crate) writable: bool,
 }
 
 impl NamedView {

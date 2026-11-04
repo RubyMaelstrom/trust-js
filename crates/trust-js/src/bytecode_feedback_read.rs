@@ -72,7 +72,7 @@ impl Chunk {
         };
         let word = self.feedback.record_word(pc);
         if let Some(cache) = named_site_cache(op) {
-            let named = self.named_view(cache);
+            let named = self.named_view(cache, writes_property(op));
             return match value_in_line_set(op) {
                 Some(in_line) => SiteView::NamedUpdate(named, values_view(word, in_line)),
                 None => SiteView::Named(named),
@@ -154,7 +154,7 @@ impl Chunk {
     }
 
     /// The named view of the property cache whose way 0 is `cache`.
-    fn named_view(&self, cache: u32) -> NamedView {
+    fn named_view(&self, cache: u32, writable: bool) -> NamedView {
         let way = |k: usize| {
             self.caches
                 .get(cache as usize + k)
@@ -163,6 +163,7 @@ impl Chunk {
         NamedView {
             ways: std::array::from_fn(|k| way(k).and_then(named_way)),
             generic: way(0).is_some_and(|state| state.mid_ok & IC_MID_GENERIC != 0),
+            writable,
         }
     }
 }

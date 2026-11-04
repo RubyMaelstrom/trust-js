@@ -6603,6 +6603,43 @@ fn record_binary_miss(
     }
 }
 
+/// Whether a named operation writes its property (a store, an append, an update): its site's
+/// ways admit only writable data (W4 step 9, feedback-schema.txt section 5.6).
+pub(crate) fn writes_property(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::SetProp(..)
+            | Op::SetPropDrop(..)
+            | Op::SetPropThisDrop(..)
+            | Op::SetPropLocalDrop(..)
+            | Op::AppendProp(..)
+            | Op::UpdateProp(..)
+    )
+}
+
+/// Empty the store and update sites a read site's ways seeded (W4 step 9): a recompilation's
+/// seeds follow the sites' order and names, and a read's ways may hold a property that is not
+/// writable, which a store site's generated code no longer tests.
+fn clear_read_seeded_stores(
+    ops: &[Op],
+    read_seeded: &[u32],
+    caches: &mut [std::cell::Cell<IcState>],
+) {
+    if read_seeded.is_empty() {
+        return;
+    }
+    for op in ops.iter().filter(|op| writes_property(op)) {
+        let Some(cache) = named_site_cache(op) else {
+            continue;
+        };
+        if read_seeded.contains(&cache) {
+            for way in caches.iter().skip(cache as usize).take(PROP_IC_WAYS) {
+                way.set(IcState::EMPTY);
+            }
+        }
+    }
+}
+
 /// Each operation's origin for a transformed chunk's record map (W4 step 7): its inline target
 /// (u32::MAX for the function's own body) and its splice's position in the caller (NO_POSITION
 /// for the function's own body), which tells two splices of one callee apart.
@@ -8247,7 +8284,11 @@ pub(crate) fn compile_with_inlines(
     result
 }
 
-fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])> {
+/// A recompilation's property cache seeds: each named site's name, ways and whether a read site
+/// filled them (W4 step 9: a read's ways never seed a store's or an update's site).
+type PropertySeed = (Rc<str>, [IcState; PROP_IC_WAYS], bool);
+
+fn property_cache_seeds(chunk: &Chunk) -> Vec<PropertySeed> {
     chunk
         .ops
         .iter()
@@ -8265,7 +8306,11 @@ fn property_cache_seeds(chunk: &Chunk) -> Vec<(Rc<str>, [IcState; PROP_IC_WAYS])
                 _ => return None,
             };
             let states = std::array::from_fn(|way| chunk.caches[cache as usize + way].get());
-            Some((chunk.names[name as usize].clone(), states))
+            Some((
+                chunk.names[name as usize].clone(),
+                states,
+                !writes_property(op),
+            ))
         })
         .collect()
 }
@@ -8615,6 +8660,7 @@ fn compile_inner_mode(
         cache_seed_stack: hot
             .map(|chunk| vec![(property_cache_seeds(chunk), 0)])
             .unwrap_or_default(),
+        read_seeded: Vec::new(),
         name_seed_stack: hot
             .map(|chunk| vec![(name_cache_seeds(chunk), 0)])
             .unwrap_or_default(),
@@ -9299,6 +9345,7 @@ fn finish_chunk(
         && !prepared_entry
         && c.rest_slot
             .is_some_and(|slot| lazy_rest_rewrite(&mut c.ops, slot, &c.names));
+    clear_read_seeded_stores(&c.ops, &c.read_seeded, &mut c.caches);
     // The record map on the final operations (W4 step 7).
     if let (Some(hot), Some(origins)) = (hot, origins.as_deref()) {
         if let Some(map) = transformed_record_map(source, hot, &c.ops, origins, &c.inline_targets) {
@@ -10250,7 +10297,10 @@ struct Compiler {
     /// hot first-stage property-site vector. Cursors follow source property-op order, which is
     /// stable for a function's AST even when `this` becomes an inline local; each seed also
     /// carries its property name so a compiler-shape mismatch safely leaves the new site cold.
-    cache_seed_stack: Vec<(Vec<(Rc<str>, [IcState; PROP_IC_WAYS])>, usize)>,
+    cache_seed_stack: Vec<(Vec<PropertySeed>, usize)>,
+    /// The caches a read site's ways seeded (W4 step 9): a store or update site among them starts
+    /// empty instead (see `clear_read_seeded_stores`).
+    read_seeded: Vec<u32>,
     name_caches: Vec<std::cell::Cell<NameIc>>,
     name_pins: Vec<NamePin>,
     name_num_bits: Vec<std::cell::Cell<u64>>,
@@ -11129,9 +11179,15 @@ impl Compiler {
             .and_then(|(sites, cursor)| {
                 let site = sites.get(*cursor);
                 *cursor += 1;
-                site.filter(|(hot_name, _)| hot_name.as_ref() == self.names[name as usize].as_ref())
-                    .map(|(_, states)| *states)
+                site.filter(|(hot_name, ..)| {
+                    hot_name.as_ref() == self.names[name as usize].as_ref()
+                })
+                .map(|&(_, states, read)| (states, read))
             });
+        if seed.is_some_and(|(_, read)| read) {
+            self.read_seeded.push(idx);
+        }
+        let seed = seed.map(|(states, _)| states);
         for way in 0..PROP_IC_WAYS {
             self.caches.push(std::cell::Cell::new(
                 seed.map(|states| states[way]).unwrap_or(IcState::EMPTY),
@@ -19424,7 +19480,7 @@ fn run_vm_inner(
             Op::UpdateProp(n, c, kind) => {
                 let obj = pop!();
                 let cache = &chunk.caches[c as usize];
-                let old = get_named_property(i, chunk, op_pc, &obj, n, cache)?;
+                let old = get_update_property(i, chunk, op_pc, &obj, n, cache)?;
                 step_and_store(i, stack, &chunk.feedback, op_pc, kind, old, |i, v| {
                     set_named_property(i, chunk, op_pc, &obj, n, v, cache)
                 })?;
@@ -21813,6 +21869,22 @@ fn step_and_store(
         stack.push(v);
     }
     Ok(())
+}
+
+/// An update's (`o.x++`) read at `pc`: a named read whose fill admits only an own writable data
+/// property, the one its store reuses (W4 step 9: an update site's ways are store ways).
+fn get_update_property(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    obj: &Value,
+    n: u32,
+    cache: &std::cell::Cell<IcState>,
+) -> Result<Value, Abrupt> {
+    i.ic_store_fill.set(true);
+    let old = get_named_property(i, chunk, pc, obj, n, cache);
+    i.ic_store_fill.set(false);
+    old
 }
 
 /// A named read at `pc`, of the chunk's name `n`.
@@ -28701,7 +28773,7 @@ unsafe fn jit_exec_inner(
         Op::UpdateProp(n, c, kind) => {
             let obj = pop!();
             let cache = &chunk.caches[c as usize];
-            let old = get_named_property(i, chunk, pc as usize, &obj, n, cache)?;
+            let old = get_update_property(i, chunk, pc as usize, &obj, n, cache)?;
             if let Some(v) =
                 step_value(i, &chunk.feedback, pc as usize, true, kind, old, |i, v| {
                     set_named_property(i, chunk, pc as usize, &obj, n, v, cache)

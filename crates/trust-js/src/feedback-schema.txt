@@ -259,12 +259,26 @@ in the caller) the k-th operation of a kind is the k-th of that kind in the orig
 chunk; a kind whose count differs between the two stays unmapped in that origin. (Source
 positions would not do: the compiler attributes them to the nodes that can throw a located
 error, calls and property accesses, not to arithmetic.) One u32 a pc (the target's index in bits
-24-31, its pc in 0-23), and the targets, which the map keeps alive. The transformed chunk's vector
-(FeedbackVector::transformed) sends its always-on records and its detailed observations through
-the map into the baseline sites (its own words stay empty), so a callee's sites see what its
-inlined copies saw; an operation the map cannot place records nothing. Its caches stay its own (they are its speed):
-crate::feedback::read_merged adds a transformed chunk's ways of a site to the baseline site's
-named view, a union past four ways being generic. The speculative tier's own exits (Phase 3)
-record by baseline pc through the same map, as JSC's CodeOrigin and FrequentExitSite do.
+24-31, its pc in 0-23), and the targets, which the map keeps alive. The transformed chunk's
+vector (FeedbackVector::transformed) sends its always-on records and its detailed observations
+through the map into the baseline sites (its own words stay empty), so a callee's sites see what
+its inlined copies saw; an operation the map cannot place records nothing. Its caches stay its
+own (they are its speed): crate::feedback::read_merged adds a transformed chunk's ways of a site
+to the baseline site's named view, a union past four ways being generic. The speculative tier's
+own exits (Phase 3) record by baseline pc through the same map, as JSC's CodeOrigin and
+FrequentExitSite do.
 
-5.6 Later steps: Pilot C's store writability (step 9) and the dependency registry (step 10).
+5.6 Store writability, Pilot C (step 9). A store's or an update's site (SetProp, SetPropDrop,
+SetPropThisDrop, SetPropLocalDrop, AppendProp, UpdateProp: bytecode.rs writes_property) holds data
+ways for writable data properties only: Interp::try_ic_set fills and promotes nothing else; an
+update's read (get_update_property) fills only an own writable data property and promotes
+nothing from the stub cache, which reads share; a recompilation's seeds from a read site's ways
+never stay in a store's or an update's site (clear_read_seeded_stores). Shapes key the
+properties' attributes (W2d step 2), so a way's matching shape proves its property still a
+writable data property: ARM64's SetProp and UpdateProp templates and the loop chains' property
+stores (whose states are store sites' ways) test no attribute byte any more
+(guard_slot_writable_data: three instructions where the layout has no attribute bytes, seven
+where it has). The read API reports it (NamedView::writable): a store's or an update's site's
+Data ways are writable data properties. x86-64 keeps its shared live checks.
+
+5.7 Later steps: the dependency registry (step 10).

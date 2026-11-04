@@ -11240,9 +11240,10 @@ fn get_method_inlinable(layout: &crate::value::JitLayout) -> bool {
     get_prop_inlinable(layout) && layout.obj_proto < 4096
 }
 
-/// Same gate as [`get_prop_inlinable`] plus the `writable` byte (the store re-checks it — an
-/// in-place defineProperty can flip attributes without changing the shape) and the creation
-/// commit's layout-cell stores.
+/// Same gate as [`get_prop_inlinable`] plus the offsets the creation commit's layout-cell stores
+/// and the string checks use. A store site's way proves its property writable (W4 step 9: the
+/// shape keys the attributes and the site's fills admit only writable data), so the store reads
+/// no attribute byte.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -11300,12 +11301,11 @@ fn emit_update_prop_inline(
     a.ldr_w_imm(9, 11, sh);
     a.cmp_reg_w(9, 14);
     a.b_cond(C_NE, slow);
-    // 4. bounds-check the cached slot, then the slot: a writable data property (its layout's
-    //    attributes, W2d step 2) holding a Num
+    // 4. bounds-check the cached slot, then the slot holding a Num; it is a writable data
+    //    property, which an update site's fills alone admit and the shape keeps (W4 step 9)
     named_len(a, layout, 16, 11);
     a.cmp_reg_x(13, 16);
     a.b_cond(C_HS, slow);
-    guard_slot_writable_data(a, layout, 11, 13, 9, 16, slow);
     a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
     slot_addr_loc(a, layout, 15, 11, 14);
     a.ldr_imm(16, 15, 0);
@@ -12060,9 +12060,9 @@ fn emit_set_prop_inline(
         named_len(a, layout, 16, 11);
         a.cmp_reg_x(13, 16);
         a.b_cond(C_HS, miss);
-        // A writable data property (its layout's attributes, W2d step 2): a way records no
-        // writability, as the get path fills ways too.
-        guard_slot_writable_data(a, layout, 11, 13, 9, 16, miss);
+        // The slot is a writable data property: a store site's fills admit only one and no read's
+        // ways reach it (W4 step 9, Pilot C), and the shape keys the attributes (W2d step 2), so
+        // a matching shape proves it still is.
         a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
         slot_addr_loc(a, layout, 15, 11, 14);
         // The incoming word replaces the old value without observing it, including a
@@ -16512,8 +16512,8 @@ fn emit_chain_marked(
                 a.mov_imm64(13, st.slot as u64);
                 a.cmp_reg_x(13, 16);
                 a.b_cond(C_HS, guard!());
-                // A writable data property (its layout's attributes, W2d step 2).
-                guard_slot_writable_data(a, layout, 11, 13, 9, 16, guard!());
+                // A writable data property: the state is a store site's way, which admits no
+                // other (W4 step 9), and the shape keys the attributes (W2d step 2).
                 slot_addr_loc_const(a, layout, 15, 11, st.loc);
                 emit_exec_number_store(a, dv, 15, 0, 13);
                 #[cfg(test)]
