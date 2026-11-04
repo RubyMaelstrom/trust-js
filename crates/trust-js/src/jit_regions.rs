@@ -933,6 +933,7 @@ fn frame_effect(op: &Op) -> FrameEffect {
         | Op::Abstract(..)
         | Op::MakeObject(..)
         | Op::MakeArray(..)
+        | Op::MakeArrayLiteral(_)
         | Op::MakeRegExp(..)
         | Op::New(..)
         | Op::InstanceOf(..)
@@ -4234,7 +4235,9 @@ fn emit_effect(
         ),
         Op::MakeRegExp(..) => emit_op_helper(a, H_MAKE_REGEXP, pc_u32, unwind),
         Op::MakeObject(..) => emit_op_helper(a, H_MAKE_OBJECT, pc_u32, unwind),
-        Op::MakeArray(..) => emit_op_helper(a, H_MAKE_ARRAY, pc_u32, unwind),
+        Op::MakeArray(..) | Op::MakeArrayLiteral(_) => {
+            emit_op_helper(a, H_MAKE_ARRAY, pc_u32, unwind)
+        }
         Op::New(argc, _) => {
             a.mov(0, 19);
             a.movz(1, pc_u32, 0);

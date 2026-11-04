@@ -14377,12 +14377,13 @@ fn emit_word_number_kind(
 }
 
 /// [`emit_word_number_kind`] before d`value`, a Number, replaces a present element of the words
-/// at x`words`, with W2c step 7a's frozen guard folded into its tests: a frozen block's words
-/// take no write, so it branches to `slow` before any write. `KIND_FROZEN` lies between
-/// `KIND_INT32` and `KIND_SCANNED`, so each test's mask is one logical immediate and the guard
-/// costs one instruction on either path (the compare that tells INT32 from FROZEN), where a
-/// guard of its own cost three. The caller stores the word after it. Clobbers x`t1`, x`t2`,
-/// x`t3`, d`dt` and NZCV.
+/// at x`words`, with W2c step 7a's frozen guard and W2d step 4's shared-block guard folded into
+/// its tests: a frozen block's words take no write, and a shared literal's block is copied
+/// first, which the helper does, so either branches to `slow` before any write.
+/// `KIND_FROZEN` and `KIND_COW` lie between `KIND_INT32` and `KIND_SCANNED`, so each test's mask
+/// is one logical immediate and the guard costs one instruction on either path (the compare that
+/// tells INT32 from the other two), where a guard of its own cost three. The caller stores the
+/// word after it. Clobbers x`t1`, x`t2`, x`t3`, d`dt` and NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14399,7 +14400,7 @@ fn emit_word_number_kind_unfrozen(
     dt: u32,
     slow: usize,
 ) {
-    use crate::value::word_block::{KIND_FROZEN, KIND_INT32, KIND_SCANNED};
+    use crate::value::word_block::{KIND_INT32, KIND_SCANNED, KIND_UNWRITABLE};
     let done = a.new_label();
     let int32 = a.new_label();
     let flags = -(layout.words_flags as i32);
@@ -14408,19 +14409,20 @@ fn emit_word_number_kind_unfrozen(
         0,
         t2,
         t1,
-        asm::logical_imm_w(KIND_INT32 | KIND_FROZEN).unwrap(),
+        asm::logical_imm_w(KIND_INT32 | KIND_UNWRITABLE).unwrap(),
     );
     a.cmp_imm_w(t2, KIND_INT32);
     a.b_cond(C_EQ, int32);
-    // INT32 clear, or the block frozen: with neither FROZEN nor SCANNED, nothing changes.
+    // INT32 clear, or the block frozen or shared: with neither of those nor SCANNED, nothing
+    // changes.
     a.logic_imm_w(
         0,
         t2,
         t1,
-        asm::logical_imm_w(KIND_FROZEN | KIND_SCANNED).unwrap(),
+        asm::logical_imm_w(KIND_UNWRITABLE | KIND_SCANNED).unwrap(),
     );
     a.cbz(t2, false, done);
-    a.logic_imm_w(0, t2, t1, asm::logical_imm_w(KIND_FROZEN).unwrap());
+    a.logic_imm_w(0, t2, t1, asm::logical_imm_w(KIND_UNWRITABLE).unwrap());
     a.cbnz(t2, false, slow);
     a.logic_imm_w(0, t1, t1, asm::logical_imm_w(!KIND_SCANNED).unwrap());
     a.stur_w(t1, words, flags);
@@ -14724,7 +14726,8 @@ fn emit_word_store_body(
 }
 
 /// Branch to `slow` when the words at x`words` are frozen elements (W2c step 7a: a frozen
-/// block's words take no write; a sealed one's take overwrites). Clobbers x`t` and NZCV.
+/// block's words take no write; a sealed one's take overwrites) or a shared literal's block
+/// (W2d step 4: the helper copies it first). Clobbers x`t` and NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14741,7 +14744,7 @@ fn emit_words_frozen_guard(
         0,
         t,
         t,
-        asm::logical_imm_w(crate::value::word_block::KIND_FROZEN).unwrap(),
+        asm::logical_imm_w(crate::value::word_block::KIND_UNWRITABLE).unwrap(),
     );
     a.cbnz(t, false, slow);
 }
@@ -18492,7 +18495,7 @@ fn emit_loop_chain(
             // enters here again, so an unbounded scan of a large holey receiver whose holes
             // the loop fills (each fill withdraws the scan) would cost its length an iteration.
             use crate::value::word_block::{
-                KIND_FROZEN, KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS, KIND_SCANNED,
+                KIND_INT32, KIND_NO_HOLES, KIND_NUMBERS, KIND_SCANNED, KIND_UNWRITABLE,
             };
             if words_inlinable(layout) {
                 let mut need = KIND_NUMBERS | KIND_NO_HOLES;
@@ -18534,14 +18537,16 @@ fn emit_loop_chain(
                 a.cmp_imm_w(14, need);
                 a.b_cond(C_NE, pre_fail);
                 a.bind(ready);
-                // A frozen receiver's words take no store (W2c step 7a): one the chain stores
-                // to takes the plain loop; one it only reads stays (reads ignore the level).
+                // A frozen receiver's words take no store (W2c step 7a), nor a shared literal's
+                // (W2d step 4: the plain loop's helper copies it, and the back edge enters
+                // again): one the chain stores to takes the plain loop; one it only reads stays
+                // (reads ignore both).
                 let stored = plan
                     .chain
                     .iter()
                     .any(|(op, _)| matches!(op, ChainOp::SetElem(xoff, _) if *xoff == rp.off));
                 if stored {
-                    a.logic_imm_w(0, 14, 13, asm::logical_imm_w(KIND_FROZEN).unwrap());
+                    a.logic_imm_w(0, 14, 13, asm::logical_imm_w(KIND_UNWRITABLE).unwrap());
                     a.cbnz(14, false, pre_fail);
                 }
             } else {

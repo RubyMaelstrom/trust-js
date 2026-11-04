@@ -6464,14 +6464,34 @@ impl DenseStorage {
     fn words(&self) -> Option<&word_block::Words> {
         (!self.0.is_static_empty()).then_some(&self.0)
     }
+    /// The element words to change, while the map keeps its elements as words: a shared
+    /// literal's block is copied first (W2d step 4, [`word_block::Words::unshare`]), so every
+    /// Rust write of the words, which comes through here or [`Self::words_start`], writes the
+    /// map's own block.
     #[inline]
     fn words_mut(&mut self) -> Option<&mut word_block::Words> {
-        (!self.0.is_static_empty()).then_some(&mut self.0)
+        if self.0.is_static_empty() {
+            return None;
+        }
+        self.0.unshare();
+        Some(&mut self.0)
     }
-    /// The words, the static empty block included, for a map that starts keeping them.
+    /// The words to append to, the static empty block included, for a map that starts keeping
+    /// them (a shared block copied first, as in [`Self::words_mut`], with room for the append).
     #[inline]
     fn words_start(&mut self) -> &mut word_block::Words {
+        self.0.unshare_with_room(1);
         &mut self.0
+    }
+    /// [`Self::words_mut`] before a write that adds `additional` words: a shared block's copy
+    /// has room for them ([`word_block::Words::unshare_with_room`]).
+    #[inline]
+    fn words_to_grow(&mut self, additional: usize) -> Option<&mut word_block::Words> {
+        if self.0.is_static_empty() {
+            return None;
+        }
+        self.0.unshare_with_room(additional);
+        Some(&mut self.0)
     }
     #[inline]
     fn has_words(&self) -> bool {
@@ -8715,8 +8735,9 @@ impl Props {
         for i in 0..self.entries.len() {
             bytes = bytes.saturating_add(self.entries.slot(i).retained_requested_storage_bytes());
         }
-        if let Some(words) = self.elems.words() {
-            // The block: front room, header, words and remembered record.
+        if let Some(words) = self.elems.words().filter(|words| !words.is_shared()) {
+            // The block: front room, header, words and remembered record. A shared literal's
+            // block is its site's (W2d step 4), counted with the chunk.
             bytes = bytes.saturating_add(words.block_bytes());
         }
         if let Some(index) = self.entries.index() {
@@ -8823,6 +8844,14 @@ impl Props {
         let words =
             unsafe { std::slice::from_raw_parts(items.as_ptr().cast::<u64>(), items.len()) };
         self.init_packed_array_words(word_block::Words::from_words(words), items.len());
+    }
+
+    /// [`Props::init_packed_array`] of a constant literal's elements: this map, fresh and
+    /// empty, shares the site's block (W2d step 4, [`word_block::KIND_COW`]) until it writes
+    /// one.
+    #[inline]
+    pub(crate) fn init_shared_array(&mut self, block: &word_block::Words) {
+        self.init_packed_array_words(block.share(), block.len());
     }
 
     #[inline]
@@ -9072,8 +9101,12 @@ impl Props {
     /// allocation or edge change.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn reprove_words(&mut self) {
-        if let Some(words) = self.elems.words_mut().filter(|words| !words.scanned()) {
-            words.reprove();
+        // A shared literal's block is scanned for good (W2d step 4), so `words_mut`, which would
+        // copy it, is reached only for a private one.
+        if self.elems.words().is_some_and(|words| !words.scanned()) {
+            if let Some(words) = self.elems.words_mut() {
+                words.reprove();
+            }
         }
     }
 
@@ -9337,20 +9370,17 @@ impl Props {
     /// generic path.
     #[inline]
     pub(crate) fn set_index_value(&mut self, n: u32, v: Value) -> Result<(), Value> {
-        if let Some(words) = self
-            .elems
-            .words_mut()
-            .filter(|words| words.integrity() & word_block::KIND_FROZEN == 0)
-        {
-            // An existing word only: a hole is an absent element (the prototype chain's, or a
-            // named entry's after a non-plain define), which the caller's slow path handles.
-            if words.get(n as usize).is_none() {
-                return Err(v);
-            }
-            words.set(n as usize, v);
-            return Ok(());
+        // An existing word only: a hole is an absent element (the prototype chain's, or a
+        // named entry's after a non-plain define), which the caller's slow path handles. A
+        // shared literal's block is copied only for a store that happens (W2d step 4).
+        let writes = self.elems.words().is_some_and(|words| {
+            words.integrity() & word_block::KIND_FROZEN == 0 && words.get(n as usize).is_some()
+        });
+        if !writes {
+            return Err(v);
         }
-        Err(v)
+        self.elems.words_mut().unwrap().set(n as usize, v);
+        Ok(())
     }
 
     /// Record a fresh named entry at `slot`: an index key there sets `has_far`, so lookups of
@@ -9423,7 +9453,10 @@ impl Props {
             return Err(prop);
         }
         self.note_structural();
-        let words = self.elems.words_mut().unwrap();
+        let words = self
+            .elems
+            .words_to_grow((index + 1).saturating_sub(len))
+            .unwrap();
         if index < len {
             words.set(index, prop.into_value());
         } else {
@@ -10564,6 +10597,10 @@ mod host_array_tests;
 #[cfg(test)]
 #[path = "value_dense_elements_tests.rs"]
 mod dense_elements_tests;
+
+#[cfg(test)]
+#[path = "shared_literal_tests.rs"]
+mod shared_literal_tests;
 
 #[cfg(all(
     test,

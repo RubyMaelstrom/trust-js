@@ -8564,6 +8564,17 @@ impl Interp {
         crate::builtins::map_set(self, map, key, value)
     }
 
+    /// A constant array literal's copy (W2d step 4): a fresh Array whose elements are the
+    /// site's shared block, until it writes them ([`crate::value::word_block::KIND_COW`]).
+    pub(crate) fn make_shared_array(&self, block: &crate::value::word_block::Words) -> Value {
+        Value::Obj(Object::new_built(
+            Some(self.array_proto),
+            ObjectKind::Array,
+            0,
+            |props| props.init_shared_array(block),
+        ))
+    }
+
     /// Build an array by copying `len` canonical words from an immutable evaluated window.
     ///
     /// # Safety

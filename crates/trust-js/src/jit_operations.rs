@@ -850,7 +850,7 @@ pub(super) fn emit(
         | Op::ObjectMethodName(..) => {
             emit_op_helper(a, H_OBJECT_LITERAL, pc as u32, unwind);
         }
-        Op::MakeArray(..) => {
+        Op::MakeArray(..) | Op::MakeArrayLiteral(_) => {
             emit_op_helper(a, H_MAKE_ARRAY, pc as u32, unwind);
         }
         Op::Abstract(crate::bytecode::AbstractOp::CreateDataPropertyOrThrow)

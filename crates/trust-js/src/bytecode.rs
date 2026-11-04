@@ -2406,6 +2406,9 @@ pub enum Op {
     /// JS RegExp object while `Interp::regexp_programs` shares the immutable compiled matcher.
     MakeRegExp(u32, u32),
     MakeArray(u16),
+    /// A constant array literal (W2d step 4; [`constant_array_literal`]): a fresh Array whose
+    /// elements are its site's shared block (`Chunk::array_literals`), copied at its first write.
+    MakeArrayLiteral(u32),
     /// Incremental ArrayLiteral construction used when holes/spreads or suspending elements make
     /// one batched `MakeArray` impossible. Every op retains the fresh array on the stack.
     NewArray,
@@ -2986,6 +2989,9 @@ pub struct Chunk {
     /// Per object-literal site, the template built by its first execution; boxed, since most
     /// sites of a large program never run.
     obj_maps: Vec<std::cell::OnceCell<Box<crate::value::Props>>>,
+    /// Per constant array-literal site (`Op::MakeArrayLiteral`), its elements and, from its
+    /// first execution, the block its copies share (W2d step 4).
+    array_literals: Box<[ArrayLiteralSite]>,
     /// A bounded structural plan, never a receiver/descriptor/value snapshot.
     record_getter: std::cell::OnceCell<Option<Box<RecordGetterPlan>>>,
     /// One [`NameIc`] slot per free-name op (`LoadName`/`LoadNameForCall`), persisting across
@@ -3112,6 +3118,40 @@ struct FunctionOsrEntry {
     environment_handlers: Vec<usize>,
 }
 
+/// A constant array-literal site's elements, and from its first execution the block every copy
+/// shares (W2d step 4; V8's copy-on-write boilerplate elements, ast.cc:815-821, JSC's constant
+/// butterfly, NodesCodegen.cpp:442-517). The values are roots for the chunk's life, as `consts`;
+/// the block lives while the site or any copy reports it.
+pub(crate) struct ArrayLiteralSite {
+    values: Box<[Value]>,
+    block: std::cell::OnceCell<crate::value::word_block::Words>,
+}
+
+impl ArrayLiteralSite {
+    fn new(values: Box<[Value]>) -> Self {
+        debug_assert!(!values.is_empty());
+        Self {
+            values,
+            block: std::cell::OnceCell::new(),
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            .saturating_add(self.values.len() * std::mem::size_of::<Value>())
+            .saturating_add(self.block.get().map_or(0, |block| block.block_bytes()))
+    }
+}
+
+impl crate::gc_trace::GcTrace for ArrayLiteralSite {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.values.as_ref().trace_gc(sink);
+        if let Some(block) = self.block.get() {
+            block.trace(sink);
+        }
+    }
+}
+
 pub(crate) struct RecordGetterPlan {
     fields: [(u32, u32); 8],
     count: usize,
@@ -3178,6 +3218,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             feedback: _,
             feedback_shapes: _,
             obj_maps,
+            array_literals,
             record_getter: _,
             name_caches: _,
             deep_name_caches: _,
@@ -3239,10 +3280,31 @@ impl crate::gc_trace::GcTrace for Chunk {
                 map.trace_gc(sink);
             }
         }
+        for site in array_literals.iter() {
+            site.trace_gc(sink);
+        }
     }
 }
 
 impl Chunk {
+    /// The block constant array-literal site `site` shares among its copies
+    /// (`Op::MakeArrayLiteral`), made at its first execution.
+    #[inline]
+    pub(crate) fn array_literal_block(&self, site: u32) -> &crate::value::word_block::Words {
+        let site = &self.array_literals[site as usize];
+        site.block.get_or_init(|| {
+            // SAFETY: a Value is its word (repr transparent over u64).
+            let words = unsafe {
+                std::slice::from_raw_parts(site.values.as_ptr().cast::<u64>(), site.values.len())
+            };
+            let block = crate::value::word_block::Words::shared_literal(words);
+            // A late fill of this registered code root: the next minor collection must find
+            // the block (see `value::remember_code_edges`).
+            crate::value::remember_code_edges(&block);
+            block
+        })
+    }
+
     /// Rewrite a uniquely owned test fixture while its GC-cell roots are unpublished. Weak
     /// root registration intentionally prevents Rc::get_mut; try_unwrap permits those weak
     /// registrations while still proving that no other code owner can observe the mutation.
@@ -3468,6 +3530,14 @@ impl Chunk {
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
         bytes = bytes.saturating_add(self.feedback.retained_bytes());
+        for site in self.array_literals.iter() {
+            bytes = bytes.saturating_add(site.retained_bytes());
+            if cells_live {
+                for value in site.values.iter() {
+                    visitor.value(value);
+                }
+            }
+        }
         for table in [&self.getter_table, &self.setter_table] {
             if let Some(table) = table.borrow().as_deref() {
                 bytes = bytes.saturating_add(table.retained_bytes());
@@ -5915,6 +5985,7 @@ fn feedback_layout_for_ops(
             Op::MakeClosure(..)
             | Op::MakeRegExp(..)
             | Op::MakeArray(..)
+            | Op::MakeArrayLiteral(_)
             | Op::NewArray
             | Op::MakeObject(..)
             | Op::NewObject => (OperationKind::Allocation, &[ALLOCATION_OUTCOME]),
@@ -8697,6 +8768,11 @@ fn finish_chunk(
         obj_maps: (0..c.obj_maps)
             .map(|_| std::cell::OnceCell::new())
             .collect(),
+        array_literals: c
+            .array_literals
+            .into_iter()
+            .map(ArrayLiteralSite::new)
+            .collect(),
         record_getter: std::cell::OnceCell::new(),
         caches: c.caches,
         name_pins: std::cell::RefCell::new(c.name_pins),
@@ -9053,6 +9129,7 @@ fn inline_capability(op: &Op) -> InlineCapability {
         | Op::NewArgsArray
         | Op::MakeRegExp(..)
         | Op::MakeArray(_)
+        | Op::MakeArrayLiteral(_)
         | Op::NewArray
         | Op::ArrayPush
         | Op::ArrayHole
@@ -9371,6 +9448,49 @@ mod compiler_name_tests {
     }
 }
 
+/// The elements of an array literal whose copies share one block (W2d step 4), as V8 shares a
+/// "simple and shallow" literal's (ast.cc:815-821) and JSC a constant buffer's
+/// (NodesCodegen.cpp:442-517): no hole or spread, at least one element, and every element a
+/// literal the compiler would push as a constant (a Number, signed or not, a String, a Boolean,
+/// null, `undefined`, a BigInt), with the values those pushes and signs make. No nested literal
+/// (V8's "shallow"), and at most `u16::MAX` elements, `Op::MakeArray`'s bound.
+fn constant_array_literal(elems: &[ArrayElem]) -> Option<Box<[Value]>> {
+    fn constant(expr: &Expr) -> Option<Value> {
+        Some(match expr {
+            Expr::Num(n) => Value::Num(*n),
+            Expr::Str(s) => Value::Str(s.clone().into()),
+            Expr::Bool(b) => Value::Bool(*b),
+            Expr::Null => Value::Null,
+            Expr::Undefined => Value::Undefined,
+            Expr::BigInt(n) => Value::BigInt(n.value()),
+            Expr::Paren(inner) => constant(inner)?,
+            // ECMA-262 UnaryExpression `-` / `+` of a Number: Number::unaryMinus, ToNumber.
+            Expr::Unary { op: "-", arg } => Value::Num(-number(arg)?),
+            Expr::Unary { op: "+", arg } => Value::Num(number(arg)?),
+            _ => return None,
+        })
+    }
+    fn number(expr: &Expr) -> Option<f64> {
+        match expr {
+            Expr::Num(n) => Some(*n),
+            Expr::Paren(inner) => number(inner),
+            Expr::Unary { op: "-", arg } => number(arg).map(|n| -n),
+            Expr::Unary { op: "+", arg } => number(arg),
+            _ => None,
+        }
+    }
+    if elems.is_empty() || elems.len() > usize::from(u16::MAX) {
+        return None;
+    }
+    elems
+        .iter()
+        .map(|element| match element {
+            ArrayElem::Item(expr) => constant(expr),
+            ArrayElem::Spread(_) | ArrayElem::Hole => None,
+        })
+        .collect()
+}
+
 /// A bounded selector set keeps pathological source from expanding compiler work. Unary signs
 /// and parentheses over numeric literals are pure; identifiers and other expressions are not.
 fn integer_switch_cases(cases: &[SwitchCase]) -> Option<Vec<(i32, usize)>> {
@@ -9495,6 +9615,8 @@ struct Compiler {
     uses_this: bool,
     /// Count of object-literal template sites handed out (see `Chunk::obj_maps`).
     obj_maps: u32,
+    /// The constant array-literal sites' elements (see `Chunk::array_literals`).
+    array_literals: Vec<Box<[Value]>>,
     caches: Vec<std::cell::Cell<IcState>>,
     /// Property-cache snapshots for the source frame currently being recompiled. The hot
     /// first-stage caller is the root; entering a speculative inline pushes that callee's own
@@ -10660,6 +10782,7 @@ impl Compiler {
             self.assignment_targets.len(),
             self.private_sites,
             self.inline_sites.len(),
+            self.array_literals.len(),
         );
         if self.try_emit_inline(&entry, argc, cc, has_this).is_err() {
             let sites = snap.14;
@@ -10688,6 +10811,7 @@ impl Compiler {
             self.class_plans.truncate(snap.11);
             self.assignment_targets.truncate(snap.12);
             self.private_sites = snap.13;
+            self.array_literals.truncate(snap.15);
             if has_this {
                 self.emit(Op::CallWithThis(argc, cc));
             } else {
@@ -15945,6 +16069,12 @@ impl Compiler {
                 Ok(())
             }
             Expr::Array(elems) => {
+                if let Some(values) = constant_array_literal(elems) {
+                    let site = u32::try_from(self.array_literals.len()).map_err(|_| Bail)?;
+                    self.array_literals.push(values);
+                    self.emit(Op::MakeArrayLiteral(site));
+                    return Ok(());
+                }
                 if elems
                     .iter()
                     .all(|element| matches!(element, ArrayElem::Item(_)))
@@ -19111,6 +19241,17 @@ fn run_vm_inner(
                     op_pc,
                     crate::feedback::AllocationObjectKind::Array,
                     n as usize,
+                );
+                stack.push(value);
+            }
+            Op::MakeArrayLiteral(site) => {
+                let block = chunk.array_literal_block(site);
+                let value = i.make_shared_array(block);
+                observe_allocation(
+                    &chunk.feedback,
+                    op_pc,
+                    crate::feedback::AllocationObjectKind::Array,
+                    block.len(),
                 );
                 stack.push(value);
             }
@@ -23028,7 +23169,7 @@ impl Chunk {
             Op::NewArgsArray => (2, 1),
             Op::MakeRegExp(..) => (0, 1),
             Op::MakeArray(n) => (*n as usize, 1),
-            Op::NewArray => (0, 1),
+            Op::MakeArrayLiteral(_) | Op::NewArray => (0, 1),
             Op::ArrayPush | Op::ArraySpread => (2, 1),
             Op::ArrayHole => (1, 1),
             Op::MakeObject(_, count, _) => (*count as usize, 1),
@@ -25085,7 +25226,8 @@ pub(crate) unsafe extern "C" fn jit_make_object(
 }
 
 /// Dedicated `Op::MakeArray` entry: moves the operand values directly into the fresh array's
-/// dense property storage, avoiding both generic opcode dispatch and an intermediate `Vec`.
+/// dense property storage, avoiding both generic opcode dispatch and an intermediate `Vec`; and
+/// `Op::MakeArrayLiteral`'s, whose array shares its site's block (W2d step 4).
 pub(crate) unsafe extern "C" fn jit_make_array(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -25094,8 +25236,24 @@ pub(crate) unsafe extern "C" fn jit_make_array(
     let ctx = unsafe { &mut *ctx };
     jit_opstat(ctx, pc);
     let chunk = unsafe { &*ctx.chunk };
-    let Op::MakeArray(count) = chunk.ops[pc as usize] else {
-        unreachable!("jit_make_array emitted only for MakeArray");
+    let count = match chunk.ops[pc as usize] {
+        Op::MakeArray(count) => count,
+        Op::MakeArrayLiteral(site) => {
+            let block = chunk.array_literal_block(site);
+            let value = unsafe { (&*ctx.interp).make_shared_array(block) };
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::Array,
+                block.len(),
+            );
+            unsafe { sp.write(value) };
+            return crate::jit::SpFlag {
+                sp: unsafe { sp.add(1) },
+                flag: 0,
+            };
+        }
+        _ => unreachable!("jit_make_array emitted only for MakeArray and MakeArrayLiteral"),
     };
     let base = unsafe { sp.sub(count as usize) };
     let value = unsafe { (&*ctx.interp).make_array_from_raw(base, count as usize) };
@@ -28185,6 +28343,17 @@ unsafe fn jit_exec_inner(
                 pc as usize,
                 crate::feedback::AllocationObjectKind::Array,
                 n,
+            );
+            push!(value);
+        }
+        Op::MakeArrayLiteral(site) => {
+            let block = chunk.array_literal_block(site);
+            let value = i.make_shared_array(block);
+            observe_allocation(
+                &chunk.feedback,
+                pc as usize,
+                crate::feedback::AllocationObjectKind::Array,
+                block.len(),
             );
             push!(value);
         }

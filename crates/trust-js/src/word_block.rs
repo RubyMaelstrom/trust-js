@@ -21,6 +21,13 @@
 //! dirty runs and the words past the traced length, not every word, as P1's PackedBuffer did
 //! (S6). Every write of an edge goes through [`Words::set`], growth that keeps the words' indices
 //! keeps the record, and every reordering forces the next trace to report all words.
+//!
+//! A constant array literal's copies share one block (W2d step 4; V8's fixed_cow_array_map, JSC's
+//! CopyOnWrite indexing type): the site makes it once, marked [`KIND_COW`], and every copy points
+//! at it ([`Words::share`]). No owner writes a shared block, not a word, the header or a record
+//! (it keeps none): a map that changes its elements takes a private copy first
+//! ([`Words::unshare`]), and generated code tests the bit with FROZEN's, so its stores send a
+//! shared block to the helpers, which copy.
 use super::*;
 use std::ptr::NonNull;
 
@@ -39,16 +46,26 @@ pub(crate) const KIND_ALL: u32 = KIND_NO_HOLES | KIND_NUMBERS | KIND_INT32;
 /// on a block the object owns (never the static one), by SetIntegrityLevel; never cleared. A
 /// sealed block's words take overwrites only; a frozen one's take no write.
 ///
-/// FROZEN lies between INT32 and SCANNED so that `INT32 | FROZEN` and `FROZEN | SCANNED` are
-/// each one run of bits, a single logical immediate: a generated Number store tests FROZEN
-/// within its kind update's own tests (`emit_word_number_kind_unfrozen` in jit.rs).
+/// FROZEN and COW lie between INT32 and SCANNED so that `INT32 | FROZEN | COW` and
+/// `FROZEN | COW | SCANNED` are each one run of bits, a single logical immediate: a generated
+/// Number store tests both within its kind update's own tests
+/// (`emit_word_number_kind_unfrozen` in jit.rs), and every other generated write tests
+/// [`KIND_UNWRITABLE`], one run too.
 pub(crate) const KIND_FROZEN: u32 = 1 << 3;
+/// Not a fact about the words or their attributes: the block is a constant literal's, shared by
+/// the literal's site and every copy (see the module comment), so no owner writes it. A shared
+/// block is exact (`capacity` = `used`), holds no hole, has no front room and no remembered
+/// record, and its kind bits are exact and [`KIND_SCANNED`] for good. Set only by
+/// [`Words::shared_literal`]; a private copy ([`Words::unshare`]) drops it.
+pub(crate) const KIND_COW: u32 = 1 << 4;
+/// The words no generated code writes in line: frozen elements, or a shared block.
+pub(crate) const KIND_UNWRITABLE: u32 = KIND_FROZEN | KIND_COW;
 /// Not a fact about the words: a scan proved the kind bits ([`Words::reprove`]) and no write
 /// since could have made a cleared fact true again (a write that keeps a fact can only clear
 /// it), so a cleared kind bit is exact and another proof need not scan. Every write through
 /// [`Words::set`] and every removal clears it.
-pub(crate) const KIND_SCANNED: u32 = 1 << 4;
-pub(crate) const KIND_SEALED: u32 = 1 << 5;
+pub(crate) const KIND_SCANNED: u32 = 1 << 5;
+pub(crate) const KIND_SEALED: u32 = 1 << 6;
 pub(crate) const KIND_INTEGRITY: u32 = KIND_SEALED | KIND_FROZEN;
 
 /// The 16 bytes before a block's first word. Generated code reads `used` at -16, `capacity` at
@@ -199,6 +216,80 @@ impl Words {
         words
     }
 
+    /// The shared block of a constant array literal's `values` (see [`KIND_COW`]): exact, with
+    /// their kind bits, scanned, and no remembered record. `values` is not empty and holds no
+    /// hole.
+    pub(crate) fn shared_literal(values: &[u64]) -> Self {
+        debug_assert!(!values.is_empty() && !values.contains(&PACK_EMPTY));
+        let capacity = values.len();
+        assert!(capacity <= MAX_WORDS, "element block of {capacity} words");
+        let flags = values
+            .iter()
+            .fold(KIND_ALL, |flags, &word| flags & word_kind(word));
+        let block = crate::gc_storage::alloc_block(block_size(capacity));
+        // SAFETY: a fresh block of a header and `capacity` words, which `values` (a slice
+        // elsewhere) does not overlap; a shared block keeps no record.
+        unsafe {
+            let words = block.as_ptr().add(HEADER_BYTES).cast::<u64>();
+            std::ptr::copy_nonoverlapping(values.as_ptr(), words, capacity);
+            words.cast::<WordHeader>().sub(1).write(WordHeader {
+                used: capacity as u32,
+                capacity: capacity as u32,
+                shifted: 0,
+                flags: flags | KIND_SCANNED | KIND_COW,
+            });
+            Words(NonNull::new_unchecked(words))
+        }
+    }
+
+    /// Another owner of this shared block (see [`KIND_COW`]).
+    #[inline]
+    pub(crate) fn share(&self) -> Self {
+        debug_assert!(self.is_shared(), "only a shared block has two owners");
+        Words(self.0)
+    }
+
+    /// Whether the block is a constant literal's shared one ([`KIND_COW`]), which no owner
+    /// writes.
+    #[inline]
+    pub(crate) fn is_shared(&self) -> bool {
+        self.header().flags & KIND_COW != 0
+    }
+
+    /// Make the block this owner's own before a write: a shared block's words, kind bits and
+    /// scan go into an exact private block, whose next trace reports every word (V8's
+    /// CopyElementsOnWrite, JSC's convertFromCopyOnWrite). A private block stays.
+    #[inline]
+    pub(crate) fn unshare(&mut self) {
+        if self.is_shared() {
+            self.copy_shared();
+        }
+    }
+
+    /// [`Words::unshare`] before a write that adds `additional` words: a shared block's words go
+    /// straight into a private block with room for them, so the growth that follows copies
+    /// nothing more (V8's growing copy, KeyedAccessStoreMode::kGrowAndHandleCOW).
+    #[inline]
+    pub(crate) fn unshare_with_room(&mut self, additional: usize) {
+        if self.is_shared() {
+            let len = self.len();
+            self.reallocate(grown(len, additional), 0);
+        }
+    }
+
+    #[inline(never)]
+    fn copy_shared(&mut self) {
+        let len = self.len();
+        let flags = self.header().flags & !KIND_COW;
+        let mut copy = Words::fresh(len);
+        // SAFETY: a fresh block with room for the `len` used words of another block.
+        unsafe { std::ptr::copy_nonoverlapping(self.0.as_ptr(), copy.0.as_ptr(), len) };
+        let header = copy.header_mut();
+        header.used = len as u32;
+        header.flags = flags;
+        *self = copy;
+    }
+
     /// An exact block of `values`, written in one pass with their kind bits (array literals
     /// and host lists build their elements here).
     pub(crate) fn from_values(values: impl ExactSizeIterator<Item = Value>) -> Self {
@@ -238,6 +329,7 @@ impl Words {
             !self.is_static_empty(),
             "the static empty block is never written"
         );
+        debug_assert!(!self.is_shared(), "a shared block is written");
         // SAFETY: a heap block's header, which `&mut self` holds uniquely.
         unsafe { &mut *self.0.as_ptr().cast::<WordHeader>().sub(1) }
     }
@@ -297,6 +389,7 @@ impl Words {
     /// Give every element the integrity level `bits` (sealed, or frozen and sealed). The
     /// static block has no element to describe and is never written.
     pub(crate) fn set_integrity(&mut self, bits: u32) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(bits == KIND_SEALED || bits == KIND_INTEGRITY);
         if !self.is_static_empty() {
             self.header_mut().flags |= bits | KIND_SEALED;
@@ -332,6 +425,7 @@ impl Words {
 
     /// Store `value` at `index`, below the used length, keeping the kind bits and the record.
     pub(crate) fn set(&mut self, index: usize, value: Value) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         assert!(index < self.len(), "word index {index} past {}", self.len());
         debug_assert!(
             self.integrity() & KIND_FROZEN == 0,
@@ -348,6 +442,7 @@ impl Words {
     /// with attributes a word cannot keep (a define, or a descriptor escape). Not a write of the
     /// element: a sealed or frozen block allows it (W2c step 7a).
     pub(crate) fn move_out(&mut self, index: usize) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         assert!(index < self.len(), "word index {index} past {}", self.len());
         self.note(PACK_EMPTY);
         // SAFETY: a used word of a heap block (the static block has none).
@@ -356,6 +451,7 @@ impl Words {
 
     /// Append `value`, growing the block when it is full.
     pub(crate) fn push(&mut self, value: Value) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let len = self.len();
         if len == self.capacity() {
@@ -370,6 +466,7 @@ impl Words {
 
     /// Remove and return the last word (a hole's too).
     pub(crate) fn pop(&mut self) -> Option<u64> {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let len = self.len().checked_sub(1)?;
         let word = self.as_slice()[len];
@@ -382,6 +479,7 @@ impl Words {
 
     /// Remove and return the first word, leaving its room in front of the header.
     pub(crate) fn shift(&mut self) -> Option<u64> {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         if self.is_empty() {
             return None;
@@ -407,6 +505,7 @@ impl Words {
 
     /// Insert `values` before the first word, in front room when there is enough.
     pub(crate) fn unshift(&mut self, values: &[Value]) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let n = values.len();
         if n == 0 {
@@ -454,6 +553,7 @@ impl Words {
 
     /// Reverse the used words in place; their kind bits stay true.
     pub(crate) fn reverse(&mut self) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(
             self.integrity() & KIND_FROZEN == 0,
             "a frozen element is written"
@@ -477,6 +577,7 @@ impl Words {
         range: std::ops::Range<usize>,
         values: &[Value],
     ) -> Vec<Option<Value>> {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let len = self.len();
         assert!(
@@ -523,6 +624,7 @@ impl Words {
 
     /// Keep the first `len` words.
     pub(crate) fn truncate(&mut self, len: usize) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(
             self.integrity() == 0
                 || self
@@ -541,6 +643,7 @@ impl Words {
 
     /// Lengthen to `len` words with holes after the used ones.
     pub(crate) fn resize_with_holes(&mut self, len: usize) {
+        debug_assert!(!self.is_shared(), "a shared block is written");
         debug_assert!(self.integrity() == 0, "a sealed block changes its elements");
         let used = self.len();
         if len <= used {
@@ -587,7 +690,8 @@ impl Words {
     /// block is then [`KIND_SCANNED`].
     pub(crate) fn reprove(&mut self) -> u32 {
         let flags = self.computed_kind();
-        if !self.is_static_empty() {
+        // A shared block's bits are exact and scanned for good, and it is never written.
+        if !self.is_static_empty() && !self.is_shared() {
             let integrity = self.integrity();
             self.header_mut().flags = flags | KIND_SCANNED | integrity;
         }
@@ -605,8 +709,8 @@ impl Words {
         Some(unsafe { self.0.as_ptr().cast::<u8>().sub(front) })
     }
 
-    /// Report the block and the edges of its words.
-    #[cfg(test)]
+    /// Report the block and the edges of its words (a shared literal's site traces its block
+    /// so; maps report the block and trace the words apart).
     pub(crate) fn trace<S: crate::gc_trace::GcSink + ?Sized>(&self, sink: &mut S) {
         if let Some(start) = self.block_start() {
             crate::gc_storage::trace_block(start, sink);
@@ -751,7 +855,12 @@ impl Words {
             return 0;
         }
         let words = self.block_words();
-        HEADER_BYTES + 8 * (words + record_words(words))
+        let record = if self.is_shared() {
+            0
+        } else {
+            record_words(words)
+        };
+        HEADER_BYTES + 8 * (words + record)
     }
 
     /// The words the block has room for, front room included (a shift moves the first word and
@@ -768,8 +877,8 @@ impl Words {
     #[inline]
     fn record(&self) -> Option<NonNull<u64>> {
         // SAFETY: `capacity` words on from the first word is the block's end, where the record
-        // begins (`reallocate`); the static block keeps none.
-        (self.block_words() > REMEMBER_MIN)
+        // begins (`reallocate`); the static block and a shared one keep none.
+        (self.block_words() > REMEMBER_MIN && !self.is_shared())
             .then(|| unsafe { self.0.add(self.header().capacity as usize) })
     }
 
@@ -841,7 +950,8 @@ impl Words {
             capacity <= MAX_WORDS && shifted <= MAX_WORDS && len + front <= capacity,
             "element block of {capacity} words"
         );
-        let flags = self.header().flags;
+        // The new block is this owner's own, whoever else shares the old one.
+        let flags = self.header().flags & !KIND_COW;
         let total = shifted + capacity;
         let record = record_words(total);
         // Words that keep their indices keep the old record's traced length and dirty blocks
@@ -927,6 +1037,14 @@ fn grown(len: usize, additional: usize) -> usize {
     (len + len / 2 + 16).max(needed).min(MAX_WORDS.max(needed))
 }
 
+/// A shared literal's block as a code root's late fill reports it
+/// (`value::remember_code_edges`).
+impl crate::gc_trace::GcTrace for Words {
+    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
+        self.trace(sink);
+    }
+}
+
 impl Default for Words {
     fn default() -> Self {
         Words::new()
@@ -934,8 +1052,11 @@ impl Default for Words {
 }
 
 impl Clone for Words {
-    /// An exact copy of the used words and their kind bits.
+    /// An exact copy of the used words and their kind bits; a shared block is shared again.
     fn clone(&self) -> Self {
+        if self.is_shared() {
+            return self.share();
+        }
         let mut copy = Words::new();
         if !self.is_empty() {
             copy.reallocate(self.len(), 0);
