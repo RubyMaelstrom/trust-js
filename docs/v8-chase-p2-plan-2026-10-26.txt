@@ -13092,3 +13092,344 @@ ARM64 (2,794 passed, 9 ignored) and x86-64 (zombie: 2,575 passed, 9 ignored); th
 with architecture-diagnostics (70 of 70); clippy in the three configurations on both; Test262 at
 --tier=jit threshold 8, 53,575 of 53,575 and identical to main's report; the fixtures' masked
 output as main's; difftest 138 agree, 12 skipped (budget).
+
+### Vue's Proxy reads: census, exemplars and design (design note, 2026-11-05)
+
+Base: main 88067f94. Counts: fat LTO (target/p2/proxy/lto/main-88067f94), CPUs 10-13, setarch -R,
+pacing off. The census: a measurement-only patch (branch p2-proxy-census, f3d106b1, never for
+landing; TRUST_JS_PROXY_CENSUS=1 prints counts by category at exit) in a non-LTO release build.
+Files: target/p2/proxy/census/ (vue-census.txt, chai-census.txt, refl-prof.txt, reflget-prof.txt,
+vue-prof.txt, *-propstat-base.txt, *-nativestat-base.txt); micros target/p2/proxy/micro/
+(micro.sh, base-88067f94.txt). Exemplar sources at the W4 pins in target/p2/proxy/src/ (V8
+c8b709085e21, SpiderMonkey firefox 6bb811006a50 js/src, JSC WebKit 260278048486); the citations
+below are checked by target/p2/proxy/scripts/cite-all.py (repository paths: src/ for V8, js/src/
+for SpiderMonkey, Source/JavaScriptCore/ for JSC).
+
+Census 1: what a Proxy read costs (instructions an iteration, the difference of the 1.2M- and
+200k-iteration runs, median of 3; the loops are target/p2/compact/prx.js's):
+
+| loop body | instructions |
+| --- | --- |
+| `p.x`, trap `get(t, k, r) { return Reflect.get(t, k, r); }` | 2,675.3 |
+| `p.x`, trap `get(t, k) { return t[k]; }` | 2,251.6 |
+| `p.x`, empty handler (forwarded) | 1,061.0 |
+| `t.x`, a plain object | 124.0 |
+| `h.get(t, 'x', p)`: the Reflect.get trap called directly, no Proxy | 1,321.6 |
+| `h2.get(t, 'x')`: the target[key] trap called directly | 838.0 |
+| `Reflect.get(t, 'x', p)` | 1,021.6 |
+| `Reflect.has(t, 'x') ? 1 : 0` | 953.6 |
+
+So the Proxy's [[Get]] costs about 1,354 instructions a read over its trap's own body (2,675 -
+1,322; 1,414 with target[key]), and Reflect.get about 900 over a plain read.
+
+SPE on the Reflect.get read (one operation in 1,024, CPU 13; refl-prof.txt; the plan's breakdown
+at 12657b48 holds within 0.2 points): generated code 14.7%; the trap called from Rust 19% (Interp::
+call_jit_committed 5.9, call_jit_cached 2.8, run_moved_inner 3.3, CallbackCache::call_values
+2.0, run_pending_tail 1.8, JitFrame::release 1.8, RuntimeInterrupt::current_reason 1.4,
+activate_agent 1.0); the read's way to the trap 21% (jit_get_prop 3.0,
+get_named_property_from_slot 5.6, get_prop_ic_impl 4.5 for the handler's `get`,
+get_member_recv_impl 2.3, proxy_get 2.6, proxy_get_trap 2.5); the trap's key value made from the
+key's text 2.6 (key_value 1.2, property_key_string 1.4); the rooting registry 6.2 (register 3.0,
+unregister 3.2: the trap's arguments and Reflect.get's, about half each); the invariant 2.3
+(proxy_invariant_vacuous 1.3, proxy_get_invariant 1.0) and part of Props::get 2.0; and
+Reflect.get: its closure 6.0, the call
+helper jit_call_hit 4.6, the native call 5.9 (with_borrowed_values 4.4, call_native_committed_with
+1.5), its key's atom found by text 5.4 (AtomTable::recent 2.2, with_atoms 1.9, atom::lookup 1.3),
+encode_string_key 0.7, ic_get_rederive 2.7. SPE on Reflect.get alone (reflget-prof.txt): generated
+code 29.7%, the closure 15.2%, the native call's machinery 45% (jit_call_hit 11.9, the native call
+15.0, the rooting registry 8.0, current_reason 3.5, activate_agent 2.4, run_pending_tail 2.4), the
+key's atom by its text 8.5% (AtomTable::recent 2.8, with_atoms 2.4, atom::lookup 1.6,
+encode_string_key 1.8).
+
+Census 2: the reads and the Reflect calls (React, Djot and Octane make no Proxy read and no
+Reflect call; chai is the CLI bundle of the acceptance set):
+
+| | Vue | chai |
+| --- | --- | --- |
+| get traps called | 135,999 | 2,322,400 |
+| of which from a JIT named read (PROPSTAT's "receiver: proxy") | 123,162 (90.6%) | 2,288,917 (98.6%) |
+| forms GetProp / GetPropLocal / GetMethod / GetPropThis | 64,466 / 57,345 / 1,351 / 0 | 141,990 / 1,980,888 / 162,775 / 3,264 |
+| other paths (Vue: index-key element reads 11,407, Rust's own [[Get]]s) | 12,837 | 33,483 |
+| named-read sites that saw a Proxy receiver | 14 | 3,807 |
+| handler's `get`: own data property of a plain handler, a user function, no class constructor | 100% | 100% |
+| a site's first (handler shape, trap) seen again | 99.99% | 14.6% |
+| a site's first (handler shape, trap's code) seen again | 99.99% | 99.83% |
+| a site's first target shape seen again; within its first four | 79.8%; 99.99% | 98.3%; 99.83% |
+| targets ordinary / array / function | 94,641 / 28,521 / 0 | 2,250,684 / 0 / 38,233 |
+| the [[Get]] invariant vacuous (no non-configurable read-only or accessor own `key`) | 100% | 100% |
+| ... with every own attribute plain (else arrays' `length`, functions' `length`, `name`, `prototype`) | 76.8% | 98.3% |
+| the read's key a heap atom / a static name | 109,451 / 13,711 | 2,267,413 / 21,504 |
+| the trap's key value: the heap atom itself / a static name's copy / an index string | 80.5% / 11.1% / 8.4% | 98.8% / 1.2% / 0 |
+| Reflect.get calls | 78,652, 3 arguments | 2,322,120, 2 arguments |
+| ... inside a get trap, with the trap's target and key value | 98.3% | 100% |
+| ... the receiver the proxy of its target | 98.3% | (none passed) |
+| ... answered by get_named_cached (the stub cache by shape and atom) | 67.2%; declined on arrays: `length` 14,405, an index 11,407 | 99.9% |
+| Reflect.has calls | 10,736 (arrays, index keys) | 2,322,360 (ordinary 98.3%, heap-atom keys 98.8%) |
+| Reflect.set calls | 23,781, 4 arguments (ordinary 11,000; arrays 12,781: an index 11,423, `length` 1,358) | none |
+| other traps | set 23,781, has 10,736, deleteProperty 671 | ownKeys 80, isExtensible 40 |
+
+Vue's static-name keys are `length` (14,405) and `push` (687) on arrays. NATIVESTAT (lto main):
+Vue's natives from generated code include `get` argc=3 78,629, `set` argc=4 23,763 and `has`
+argc=2 10,724 (Reflect's) beside 245,079 WeakMap/Map `get`s; chai's are led by indexOf 4,891,284
+(two in each trap: `config.proxyExcludedKeys.indexOf(property)`, `builtins.indexOf(property)`),
+`has` 2,322,321 and `get` 2,322,081. The fixture's Vue is 3.2 (handlers are object literals whose
+`get` is a closure, `get: L()`), as is Speedometer 3.1's TodoMVC Vue (3.2.47); Vue 3.4 keeps
+`get` on a class prototype (BaseReactiveHandler; target/p2/proxy/src/vue/baseHandlers-v3.4.0.ts:89,
+95, 166). chai's trap (proxify's `proxyGetter`) is a new closure for each proxy, the reason its
+sites see many trap identities and one code.
+
+What they cost, from the micros (approximate, since the traps' bodies differ): Vue's 136k get
+traps at about 1,354 instructions of [[Get]] machinery are about 184M, 10.5% of Vue's 1.75G; its
+78.6k Reflect.get calls at about 900 about 71M (4%), Reflect.set and has another 30M or so. chai's
+2.32M get traps are about 3.1G and its 4.6M Reflect.get and has calls about 4.0G, 9% of its 80.4G.
+
+Exemplars.
+
+V8. The load builtins' proxy case converts the key to a Name and tail-calls ProxyGetProperty
+(src/builtins/builtins-internal-gen.cc:1595-1605, 1662-1675). ProxyGetProperty
+(src/builtins/proxy-get-property.tq:14-62) throws for a revoked proxy, finds the trap with a
+generic lookup (GetInterestingMethod(handler, 'get'), :42-44), forwards to GetPropertyWithReceiver
+without one, calls it as a JavaScript call (:47) and checks the invariant (:60) with
+CheckGetSetTrapResult, which looks the name up on the target in line by unique name and calls the
+runtime only for slow cases (src/builtins/builtins-proxy-gen.cc:218-235). With fast_proxy_ic (on by
+default, src/flags/flag-definitions.h:4367) the load IC also caches a proxy read: LoadIC::
+ComputeHandler (src/ic/ic.cc:1441-1519) makes a fast handler for a named read (not an element, not
+`in`, :1449) when the target is extensible and neither a dictionary nor a special map (:1462-1470),
+the target's own property of the name, if any, is configurable (:1474-1491), and the handler's
+`get` is an own data field holding a JSFunction that is no class constructor (:1493-1511). The
+handler holds the target's map, the handler's map, the field's location, the trap (weakly) and a
+call counter (src/ic/handler-configuration.h:181-201). The load IC's proxy case calls
+ProxyGetPropertyFastPath with it (src/ic/accessor-assembler.cc:983-1002), which checks the
+target's map (src/builtins/builtins-proxy-gen.cc:447-463), loads `get` from the handler at the
+cached field under its map (:465-498), compares it with the cached trap (:500-510), counts the
+call (:512-527), calls the trap directly (CallFunction, :529-534), and skips the invariant check
+when the target's map is the same after the call (:535-543); any miss returns the hole and the IC
+misses (src/ic/accessor-assembler.cc:1000). A site that sees the proxies' map again with another
+fast handler (another target map, handler map or trap) is downgraded to the slow handler, not to
+megamorphic (src/ic/ic.cc:759-768, 1135-1141). Maglev inlines the access: receiver, target and
+handler map checks, the trap's load and identity check, the call (inlinable) under a lazy-deopt
+continuation that checks the result, and the target-map test after it
+(src/maglev/maglev-graph-builder.cc:6390-6501; src/builtins/builtins-proxy-gen.cc:550-561).
+Reflect.get is ToName and GetPropertyWithReceiver (src/builtins/reflect.tq:63-75), a generic
+lookup by unique name with no IC; TurboFan and Maglev reduce a Reflect.get call to a call of that
+builtin (src/compiler/js-call-reducer.cc:3855-3943; src/maglev/maglev-graph-builder.cc:10696-10727).
+Reflect.has is HasProperty (src/builtins/reflect.tq:86-92); Reflect.set is a C++ builtin
+(src/builtins/builtins-definitions.h:1165). Property keys are internalized strings, so ToName of a
+key is itself; a string internalized later becomes a ThinString pointing at its internalized copy
+(src/objects/string.h:1134-1141).
+
+SpiderMonkey. GetPropIRGenerator tries a scripted proxy before anything else, even at a
+megamorphic IC, since on Speedometer 3 many differently shaped objects become proxies of few
+handlers (js/src/jit/CacheIR.cpp:2099-2123). tryAttachScriptedProxy
+(js/src/jit/CacheIR.cpp:1679-1799), for GetProp and GetElem with a string, int32 or symbol key,
+finds the handler's `get` as a native read would, missing or a slot on the handler or its
+prototypes (CanAttachNativeGetProp, :1706-1717), requires a JSFunction that is no class
+constructor, has a JIT entry and is of the same realm (:1719-1743), and a native target
+(:1745-1755). It emits guards (a proxy with the scripted handler, the handler and target loaded,
+the target native, :1757-1763), then the target's read when `get` is missing (:1765-1771), or the
+trap's slot read, a callee guard and CallScriptedProxyGetResult (:1772-1794). The callee guard is
+the function's identity in a site's first stub and its BaseScript afterwards, for lambda clones
+(js/src/jit/CacheIR.cpp:6607-6624). Baseline's stub (js/src/jit/BaselineCacheIRCompiler.cpp:3442-3540)
+enters a stub frame that keeps the target and the key as traced values (:3463-3488), pushes the
+receiver, key, target and handler as a JIT call and calls the trap's JIT code (:3490-3517), then
+calls the VM's check only if the target needs validation (:3519-3535). The test
+(js/src/jit/MacroAssembler.cpp:6222-6248) reads one shape flag, NeedsProxyGetSetResultValidation
+(js/src/vm/ObjectFlags.h:67-78), which a property's addition sets when it is non-configurable and
+either read-only data or an accessor (js/src/vm/ObjectFlags-inl.h:33-52), as freezing elements does
+(js/src/vm/NativeObject.cpp:140-146); a non-native shape or a class with a resolve hook validates
+too. The check is CheckProxyGetByValueResult (js/src/jit/VMFunctions.cpp:1889-1907). Warp
+transpiles the op into an MCall of the trap, with the key as its atom constant (:6652), and
+MCheckScriptedProxyGetResult (js/src/jit/WarpCacheIRTranspiler.cpp:6604-6672;
+js/src/jit/CodeGenerator.cpp:18038-18057). Element reads take the same path (tryAttachProxyElement,
+js/src/jit/CacheIR.cpp:3262-3291), other proxies ProxyGetResult, a VM call (:1801-1826). Reflect.get
+and Reflect.has are self-hosted (js/src/builtin/Reflect.cpp:205, 210; Reflect.set is a C++
+native, :214): getPropertySuper(target, key, receiver) or target[key], and `key in target`
+(js/src/builtin/Reflect.js:148-161, 165-184), so their reads are ordinary GetElem and In ICs, which
+trial inlining copies for each calling site (js/src/jit/TrialInlining.h:26-46). An atom is a string
+with ATOM_BIT: atomizing one returns it, about 71% of atomizations on Speedometer 3
+(js/src/vm/JSAtomUtils.h:85-92), and PrimitiveValueToId atomizes a string key
+(js/src/vm/JSAtomUtils-inl.h:38-67); another string looks in a string-to-atom cache before the
+table (js/src/vm/JSAtomUtils.cpp:657-723; js/src/vm/Caches.h:421).
+
+JavaScriptCore. tryCacheGetBy gives a ProxyObject base its own access case, ProxyObjectLoad for a
+by-id read and IndexedProxyObjectLoad for a by-val one
+(Source/JavaScriptCore/bytecode/Repatch.cpp:539-558; Source/JavaScriptCore/bytecode/AccessCase.h:88-95).
+Its code (Source/JavaScriptCore/bytecode/InlineCacheCompiler.cpp:4145-4328) checks the cell type
+(:4154-4155), builds a callee frame with the proxy as `this`, the key (the case's identifier cell or
+the property register) and the receiver (:4199-4223), and makes a linked JavaScript call (CallLinkInfo,
+:4284-4304) of the global object's performProxyObjectGet (:4242-4249). That is JavaScript
+(Source/JavaScriptCore/builtins/ProxyHelpers.js:81-105): the target and handler from internal
+fields, a TypeError for a revoked proxy, `handler.get` through its own IC, the target's read without
+a trap, `trap.@call(handler, target, propertyName, receiver)`, then the invariant check only when
+@mustValidateResultOfProxyGetAndSetTraps(target), a structure-flag test
+(Source/JavaScriptCore/bytecompiler/NodesCodegen.cpp:2075-2082) of
+hasNonConfigurableReadOnlyOrGetterSetterProperties (Source/JavaScriptCore/runtime/Structure.h:843-844).
+The C++ path does the same (Source/JavaScriptCore/runtime/ProxyObject.cpp:183-207, its check
+:210-233) and caches the handler's trap offsets by the handler's structure and its prototype's
+(Source/JavaScriptCore/runtime/ProxyObject.h:199-221). Reflect.get and Reflect.has are JavaScript
+builtins (Source/JavaScriptCore/runtime/ReflectObject.cpp:63, 66; Reflect.set is a host function,
+:70): target[propertyKey] or @getByValWithThis(target, receiver, propertyKey), and `propertyKey in
+target` (Source/JavaScriptCore/builtins/ReflectObject.js:52-76), with their own by-val ICs. A
+JSString whose StringImpl is an atom is a key at once (JSString::toIdentifier,
+Source/JavaScriptCore/runtime/JSString.h:896-914, with its per-cell atom bit :291-308); another
+string takes a one-entry cache and the atom table, and then holds the atom itself.
+
+In all three the trap is a JavaScript call from generated code whose arguments live in a stack
+frame (V8's builtin frame, SpiderMonkey's stub frame and its traced values, JSC's callee frame); none
+keeps them in a separate root table.
+
+TRust today. Whatever tier makes it, a read through a Proxy reaches the trap in Rust: the read's
+template fails its probes on the proxy's kind tag, the helper stub finds no published accessor and
+calls jit_get_prop, which reaches proxy_get (crates/trust-js/src/interpreter.rs:11801) through
+get_prop_ic_from_slot. proxy_get_trap reads `get` through one interpreter-wide cache for each trap
+kind (:13870); the key value is made from the key's text (key_value, :8430: the heap atom itself,
+or a static name's copy from the property_key_strings LRU, :8440); the trap is called through one
+interpreter-wide callback cache per kind, which roots the arguments in the rooting registry
+(crates/trust-js/src/callback.rs:123); the invariant looks the key up on the target by its text
+(proxy_invariant_vacuous, interpreter.rs:13912). In the trap, Reflect.get makes the key's text
+again, finds its atom in the AtomTable (lookup_text: the recent cache by text address, then the
+hash) and reads through the stub cache by (shape, atom) (crates/trust-js/src/builtins/reflect.rs:8;
+get_named_cached, interpreter.rs:10142); an array's `length` and index keys take the generic path.
+
+Design forks, each with a recommendation.
+
+Fork 1. Where the trap call runs: (a) in the read's helper stub (the shared H_GET_PROP stub), driven
+by a per-read slot, as Decision 17's getters; (b) in each read's template. Recommend (a). V8's
+fast path is a shared builtin driven by the IC handler's data (builtins-proxy-gen.cc:436),
+SpiderMonkey's baseline stub is CacheIR code shared by op sequence with per-stub fields, JSC's
+ProxyObjectLoad is an access case of the IC; only the optimizing tiers put it in line (Maglev,
+Warp). Vue has 14 such sites, chai 3,807 of its many thousands.
+
+Fork 2. How the stub proves the trap: (a) the read's own call cache, by identity in way 0 and by
+code after it (the CallSecondary stub's code-keyed way, which matches the closures of one
+function); (b) by identity only. Recommend (a): chai's proxify makes a new trap closure for each
+proxy, so a site sees its first trap again in 14.6% of its reads but that trap's code in 99.83%.
+SpiderMonkey guards the BaseScript after a site's first stub for these lambda clones
+(CacheIR.cpp:6607-6624); V8 holds one trap by identity (builtins-proxy-gen.cc:500-510) and sends
+the site to its slow handler on a miss (ic.cc:759-768).
+
+Fork 3. How the stub finds `get` on the handler: (a) a per-read property cache on the handler,
+read by the PropWays way loop at any depth; (b) an own data property only (V8: ic.cc:1496-1501).
+Recommend (a), with SpiderMonkey (a slot on the handler or its prototypes, CacheIR.cpp:1706-1717,
+1777-1781) and JSC (`handler.get` through an IC, ProxyHelpers.js:92). Both workloads' handlers have
+`get` own (Vue 3.2's object literals, chai's), but Vue 3.3 and later keep it on a class prototype,
+two levels up from a MutableReactiveHandler; the way loop costs the stub nothing more for depth 0.
+
+Fork 4. The invariant check after the trap: (a) a flag on the target, tested after the call: set
+when the target gains a non-configurable property that is read-only data or an accessor
+(SpiderMonkey's NeedsProxyGetSetResultValidation, MacroAssembler.cpp:6222-6248,
+ObjectFlags-inl.h:33-52; JSC's hasNonConfigurableReadOnlyOrGetterSetterProperties,
+NodesCodegen.cpp:2075-2082, ProxyObject.cpp:202); (b) V8's: prove at fill that the target is
+extensible and its own `key` configurable or absent, record the target's shape, and skip the check
+when that shape is still the target's after the call (ic.cc:1462-1491, builtins-proxy-gen.cc:535-543).
+Recommend (a). The check was vacuous for every read of the census, but Vue's sites vary their
+targets: 20.2% of its proxy reads are at a site whose first target shape is not theirs, so (b) would
+need several target shapes a site or send those reads to Rust, where (a) is one load and a test for
+any target. In TRust the flag fits on the property layout: a sticky byte that PropertyLayoutData's
+push and set_attr set (a shape's layout carries its keys' attributes, value.rs:7101-7118; the
+object's flag byte has no bit free). "Every attribute plain" would not do: it sends every array
+(`length`) and function target to Rust, 23% of Vue's reads. An exotic target (a Proxy, a typed
+array, a string wrapper, a side-table object) and index keys keep the Rust check.
+
+Fork 5. The key's atom (candidate 3): (a) a mark in the string header that carries the key: an
+atom's frontier word (exact strings never take an in-place append, lstr.rs:864-884, so the word is
+free in them) holds a mark bit and the key's word, set where the atom is made; (b) atoms by text, as
+today, perhaps behind a string-to-atom cache (SpiderMonkey's and JSC's paths for strings that are
+not atoms). Recommend (a), as all three engines: V8's internalized strings, SpiderMonkey's ATOM_BIT
+(JSAtomUtils.h:85-92: 71% of its atomizations), JSC's atom StringImpl and per-cell bit
+(JSString.h:291-308). A key value that is an atom then becomes a PropKey in a load, a test and a
+mask. TRust's static names live outside every heap and so are never Values; their key values are
+LRU copies. Sub-recommendation: each heap keeps one marked copy of each static name it uses, for
+its life, carrying the static name's key (the exemplars have no such split: their static names are
+ordinary key values, V8's in the read-only heap, SpiderMonkey's permanent atoms, JSC's static
+atoms), and the canonical index strings (jstr::index_lstr) carry their index keys. Vue's trap keys
+are 80.5% heap atoms, 11.1% static names (`length`, `push`) and 8.4% index strings.
+
+Fork 6. Reflect.get's lookup (candidate 4): (a) by the key's mark through the stub cache by (shape,
+key), arrays' `length` and index keys read in place, and a lean entry from generated code once the
+call cache proves %Reflect.get% (or has, set), skipping the native-call machinery (45% of
+Reflect.get's instructions); (b) an IC for each Reflect.get call site. V8 reads with a generic lookup
+by unique name and no IC (reflect.tq:63-75), and its optimizing tiers call that builtin directly
+(js-call-reducer.cc:3855-3943, maglev-graph-builder.cc:10696-10727); SpiderMonkey and JSC write
+Reflect.get in JavaScript, so its read is an ordinary IC, one for each call site after trial
+inlining (Reflect.js:165-184, TrialInlining.h:26-46) or DFG inlining (ReflectObject.js:52-65).
+Recommend (a) now, as V8's baseline: in both workloads the Reflect calls are inside the traps (98.3%
+and 100%), at few sites, and read the trap's key, so the stub cache answers what a per-site IC
+would; (b) belongs with inlining traps in code2 (Maglev's TryBuildProxyPropertyAccess, Warp's
+MCall), later.
+
+Fork 7. Element reads through a Proxy (8.4% of Vue's get traps, none of chai's): SpiderMonkey and JSC
+call the trap from their by-value ICs too (CacheIR.cpp:3262-3291; Repatch.cpp:547-550); V8 does not
+(ic.cc:1449). Recommend the named reads first and elements after step 3, if the TodoMVC page's
+census shows them.
+
+Steps, each its own commit, measured against its parent.
+
+Step 1 (candidate 2): the trap's arguments rooted by the native frame. proxy_call_trap calls through
+a callback entry for a fixed array on the Rust stack, which the conservative scan roots through the
+call, its polls and its tail drain, as call_getter's window is (property_read.rs:234), so a trap's
+call makes no registry entry. For every trap kind and path. Expected: the trap's half of the
+registry's 6.2% of the Reflect.get read, about 84 instructions. A second commit, measured on its
+own, would do the same for a native's arguments from generated code: call_native_committed_with
+roots its window in the registry (interpreter.rs:15820) though the window is on the frame's operand
+buffer, which the collector already scans whole (a JIT entry's JitFrameRoots, gc_trace.rs:294-301;
+the pool's records, gc_collect.rs:1965). That is 8% of the Reflect.get loop (about 82 instructions
+a call), and every native call from generated code pays it (Vue's 386k, chai's 10.9M).
+
+Step 2 (candidate 3, Fork 5): property-key strings carry their key. Heap atoms are marked when
+made, each heap keeps its static names' marked copies, the canonical index strings carry their
+indices; a string's PropKey tests the mark first (Reflect.get, has and set, ToPropertyKey, computed
+reads by a string key, the `in` operator), and key_value returns the marked string. Expected: the
+key-by-text share of Reflect.get (8.5% of its loop, about 90 instructions a call), and of keyed
+reads by string generally.
+
+Step 3 (candidate 1, Forks 1-4): the trap called from the read's helper stub. Rust: jit_get_prop
+answers a Proxy receiver through the read's proxy slot (a chunk table keyed by pc, as the getter
+table: the read's form, position and key value, a property cache for the handler's `get`, the
+trap's call cache), whose first calls fill it; the layout's validation byte (Fork 4). Generated code
+(ARM64), in the H_GET_PROP stub after its accessor test: the slot's probe by pc; the receiver by the
+slot's form; its kind tag (KIND_PROXY_TAG) and the payload's target and handler; `get` through the
+PropWays loop on the slot's cache; the call cache's probe (way 0, then CallSecondary); [handler,
+trap, target, key, receiver] pushed and the direct sequence entered (three arguments, with `this`);
+the target kept in the stub's frame for the check; after the return, the target's validation byte,
+and a Rust check when it is set. Every decline before the call leaves the operands as found and
+takes the ordinary helper. The operand stack keeps the five-word window (as setter_window keeps a
+store's). x86-64 keeps the Rust half (the per-read caches). Expected: most of the [[Get]]
+machinery's 1,354 instructions a read.
+
+Step 4 (candidate 4, Fork 6): Reflect.get, has and set over an ordinary target: by the key's mark
+through the stub cache, arrays' `length` and index keys in place, and a lean entry from generated
+code when the call cache proves %Reflect.get% (or has, set).
+
+Later, if they pay: the set and has traps from stores and `in` (Vue's 23,781 and 10,736; V8's store
+IC calls ProxySetProperty, src/ic/accessor-assembler.cc:2327-2357; JSC has ProxyObjectStore and
+ProxyObjectIn cases, Source/JavaScriptCore/bytecode/InlineCacheCompiler.cpp:4170-4185); element
+reads (Fork 7); a trap inlined by code2. chai's 4.9M indexOf calls are the natives' lean entry
+(the "native calls" addendum's candidate 4), not this series.
+
+Each step: the micros above; fat-LTO counts against the parent for Vue, React, Djot, chai and Octane
+(w2e/counts.sh); PROPSTAT and NATIVESTAT before and after; W1's proxy-shift.js; Test262's
+built-ins/Proxy and built-ins/Reflect, and the whole run at the series' end; GC stress
+(TRUST_JS_GC_VERIFY) over the proxy tests; both lib suites, clippy in the three configurations on
+both machines, the gate at the end; TRust's Vue TodoMVC page at the end, if TRust builds on the
+series' head (its manifest takes the engine by path, so a copy with the path changed).
+
+Decided (mine, 2026-11-05, as recommended; each grounded in the exemplars above):
+1-3. The trap called from the read's helper stub, its call cache matching by identity in way 0
+   and then by code, `get` found through a per-read cache on the handler.
+4. The invariant check: SpiderMonkey's and JSC's sticky flag on the target's layout, tested after
+   the call (V8's per-site target shape would miss on the 20% of Vue's reads whose sites vary their
+   targets).
+5. Strings carry their key (V8's internalized strings, SpiderMonkey's atoms, JSC's atom strings);
+   for the static names that live outside every heap, one permanent marked copy per heap, as JSC
+   keeps its common identifiers per VM (V8's read-only space and SpiderMonkey's permanent atoms share
+   them across isolates and runtimes instead, which would need a Value that points outside every
+   heap: not taken in this series).
+6. Reflect.get, has and set through the stub cache by the key's mark, arrays' `length` and indices
+   read in place, and a lean call entry from generated code (V8's); per-site caches wait for the
+   traps' inlining in the second stage.
+7. Elements through a Proxy after step 3, if the TodoMVC page's census asks for them.
+Step 1 includes, as its own commit, every native call from generated code rooted by its frame
+rather than the rooting registry (Vue's 386k native calls, chai's 10.9M): approved, with the
+argument that the JIT frame's operand window is scanned for the whole call and GC stress with
+TRUST_JS_GC_VERIFY over the native-call tests.
