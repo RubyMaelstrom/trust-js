@@ -9428,15 +9428,16 @@ impl Interp {
     }
 
     pub(crate) fn make_function(&self, func: Rc<Function>, env: Env) -> Value {
-        self.make_function_named(func, env, None)
+        self.make_function_named(&func, env, None)
     }
 
     /// [`Interp::make_function`] followed by SetFunctionName(F, `name`) (ECMA-262 §10.2.9) for an
     /// anonymous function expression's NamedEvaluation or a concise method's key: the name is
-    /// part of the cloned property template.
+    /// part of the cloned property template. `func` is borrowed: the closure's function is the
+    /// copy its heap's closure registry holds (`value::ClosureFunction`).
     pub(crate) fn make_function_named(
         &self,
-        func: Rc<Function>,
+        func: &Rc<Function>,
         env: Env,
         name: Option<&Rc<str>>,
     ) -> Value {
@@ -9462,7 +9463,7 @@ impl Interp {
         // none. A generator's `.prototype` chains to %GeneratorPrototype% / %AsyncGeneratorPrototype%
         // (an ordinary function's is a plain object). Only ordinary functions are constructors.
         let has_prototype = !is_arrow && (is_generator || (!is_async && !is_method));
-        crate::workload_metrics::function_created(&func, has_prototype);
+        crate::workload_metrics::function_created(func, has_prototype);
         // Per-function, heap-local map templates (see `FunctionRuntime::fn_maps`) pay the shape
         // transitions, key hashing and name string once. Each closure copies the field words,
         // shares the layout, and patches the two identity-dependent values in place; value
@@ -9558,7 +9559,7 @@ impl Interp {
         };
         let kind = ObjectKind::user_leased(
             &lease,
-            &func,
+            func,
             self_env.as_ref().cloned().unwrap_or(env),
             Gc::as_ptr(&self.global) as usize,
             origin,
@@ -9603,8 +9604,10 @@ impl Interp {
                 _ => None,
             }
             .or(Some(self.object_proto));
+            // One borrow (and so one card) for the slot's new edge and the constructor bit.
+            let mut object = obj.borrow_mut();
             assert!(
-                obj.borrow_mut().props.defer_function_prototype_at(
+                object.props.defer_function_prototype_at(
                     2,
                     &obj,
                     proto_parent.expect("function prototype intrinsic parent"),
@@ -9612,9 +9615,10 @@ impl Interp {
                 ),
                 "prototype slot"
             );
-        }
-        if !is_arrow && !is_method && !is_async && !is_generator {
-            obj.borrow_mut().set_constructor(true);
+            // Only ordinary functions are constructors, and each has a `prototype`.
+            if !is_arrow && !is_method && !is_async && !is_generator {
+                object.set_constructor(true);
+            }
         }
         if let Some(self_env) = self_env {
             self_env.borrow_mut().vars.insert(

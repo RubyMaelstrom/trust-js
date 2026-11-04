@@ -18315,7 +18315,7 @@ fn run_vm_inner(
             }
             Op::MakeClosure(fidx, name_n) => {
                 let name = (name_n != u32::MAX).then(|| &chunk.names[name_n as usize]);
-                let v = i.make_function_named(chunk.funcs[fidx as usize].clone(), *env, name);
+                let v = i.make_function_named(&chunk.funcs[fidx as usize], *env, name);
                 observe_allocation(
                     &chunk.feedback,
                     op_pc,
@@ -25401,7 +25401,7 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
         ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
     ));
     let name = (name != u32::MAX).then(|| &chunk.names[name as usize]);
-    let closure = i.make_function_named(chunk.funcs[function as usize].clone(), *env, name);
+    let closure = i.make_function_named(&chunk.funcs[function as usize], *env, name);
     observe_allocation(
         &chunk.feedback,
         pc as usize,
@@ -27802,7 +27802,7 @@ unsafe fn jit_exec_inner(
         }
         Op::MakeClosure(fidx, name_n) => {
             let name = (name_n != u32::MAX).then(|| &chunk.names[name_n as usize]);
-            let v = i.make_function_named(chunk.funcs[fidx as usize].clone(), *env, name);
+            let v = i.make_function_named(&chunk.funcs[fidx as usize], *env, name);
             observe_allocation(
                 &chunk.feedback,
                 pc as usize,
