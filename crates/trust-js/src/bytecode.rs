@@ -6971,7 +6971,32 @@ fn record_element(chunk: &Chunk, pc: usize, object: &Value, key: &Value) {
         crate::value::PACK_STR => ELEM_STRING,
         _ => ELEM_PRIMITIVE,
     };
-    chunk.feedback.record(pc, key_bits | receiver_bits);
+    // A key that is not an index, on an object: the site is generic, and its helpers' misses stop
+    // here from now on (`record_element_miss`).
+    let generic = if key_bits != ELEM_KEY_INDEX
+        && receiver_bits
+            & (ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY | ELEM_ARGUMENTS | ELEM_EXOTIC)
+            != 0
+    {
+        ELEM_GENERIC
+    } else {
+        0
+    };
+    chunk
+        .feedback
+        .record(pc, key_bits | receiver_bits | generic);
+}
+
+/// An element helper's miss: [`record_element`], unless the site is generic already, where a
+/// miss classifies and writes nothing (as V8 leaves a megamorphic keyed site's feedback).
+#[inline(always)]
+fn record_element_miss(chunk: &Chunk, pc: usize, object: &Value, key: &Value) {
+    if !chunk
+        .feedback
+        .record_holds(pc, crate::feedback::ELEM_GENERIC)
+    {
+        record_element(chunk, pc, object, key);
+    }
 }
 
 /// The relational comparisons, the operations among `bin_cmp`'s whose operands are recorded.
@@ -26921,12 +26946,12 @@ fn get_computed_element(
     // this helper, records what ARM64's in-line path would. The VM records every access before
     // it calls this.
     if matches!(&(obj).view(), ValueView::Undefined | ValueView::Null) {
-        record_element(chunk, pc, obj, key);
+        record_element_miss(chunk, pc, obj, key);
         crate::value::trace_nullish_property("get-method-elem", key);
         return Err(i.throw("TypeError", "cannot read property of null or undefined"));
     }
     if let ValueView::Str(key_text) = &(key).view() {
-        record_element(chunk, pc, obj, key);
+        record_element_miss(chunk, pc, obj, key);
         return i.get_computed_property(obj, key_text);
     }
     match (&(obj).view(), &(key).view()) {
@@ -26948,7 +26973,7 @@ fn get_computed_element(
         }
         _ => {}
     }
-    record_element(chunk, pc, obj, key);
+    record_element_miss(chunk, pc, obj, key);
     // ToPropertyKey of an integral Number is its decimal text, and of a Symbol its encoded
     // key; skip the temporary strings. The Symbol stays owned by `key` during the read.
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
@@ -26992,7 +27017,7 @@ fn set_computed_element(
     // object, an Array's append, a typed array's element, at an array index) and
     // `ordinary_set_existing_index` (an existing writable data property at an index).
     if matches!(&(object).view(), ValueView::Undefined | ValueView::Null) {
-        record_element(chunk, pc, object, key);
+        record_element_miss(chunk, pc, object, key);
         return Err(i.throw("TypeError", "cannot set property of null or undefined"));
     }
     let value = if let (ValueView::Obj(target), ValueView::Num(index)) =
@@ -27008,7 +27033,7 @@ fn set_computed_element(
     } else {
         value
     };
-    record_element(chunk, pc, object, key);
+    record_element_miss(chunk, pc, object, key);
     // ToPropertyKey of a String is itself, and of an integral Number its decimal text: pass
     // them without building an owned key string.
     if let ValueView::Str(key) = &(key).view() {

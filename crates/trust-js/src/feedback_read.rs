@@ -110,6 +110,9 @@ pub(crate) struct ElementView {
     pub(crate) recorded_receivers: u32,
     pub(crate) recorded_keys: u32,
     pub(crate) facts: u32,
+    /// The site is generic (a key that is not an index reached an object): it is lowered to the
+    /// generic keyed access, and its record stopped growing at its helpers' misses.
+    pub(crate) generic: bool,
 }
 
 impl ElementView {

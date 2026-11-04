@@ -375,6 +375,12 @@ pub(crate) const ELEM_NON_NUMBER: u32 = 1 << 17;
 pub(crate) const ELEM_NON_INT32: u32 = 1 << 18;
 pub(crate) const ELEM_UNWRITABLE: u32 = 1 << 19;
 pub(crate) const ELEM_OUT_OF_BOUNDS: u32 = 1 << 20;
+/// The site is generic (bit 24): a key that is not an array index (a String, a Symbol, another
+/// Number, anything else) reached an object receiver. Its keys are names and values the record
+/// does not hold, so the speculative tier lowers the site to the generic keyed access, as V8 does
+/// a megamorphic keyed load; as V8 stops updating a megamorphic site's feedback, the element
+/// helpers stop classifying and writing at its later misses (the VM goes on recording).
+pub(crate) const ELEM_GENERIC: u32 = 1 << 24;
 
 /// The value record's roles (W4 step 3): a word holds three ValueClass sets, operand 0 in bits
 /// 0-8, operand 1 in bits 9-17 and the result in bits 18-26.
@@ -911,6 +917,22 @@ impl FeedbackVector {
                 cell.set(new);
             }
         }
+    }
+
+    /// Whether the record of the operation at `pc` holds every bit of `bits` (a transformed chunk's:
+    /// its baseline site's), read before a miss path classifies anything (W4 step 4's generic
+    /// mark).
+    #[inline]
+    pub(crate) fn record_holds(&self, pc: usize, bits: u32) -> bool {
+        if let Some(map) = self.through.as_deref() {
+            return map
+                .target(pc)
+                .is_some_and(|(chunk, pc)| chunk.feedback_vector().record_holds(pc, bits));
+        }
+        self.record
+            .get()
+            .and_then(|words| words.get(pc))
+            .is_some_and(|word| word.get() & bits == bits)
     }
 
     /// The record of the operation at `pc`: 0 where nothing was recorded.

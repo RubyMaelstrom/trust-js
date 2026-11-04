@@ -94,6 +94,8 @@ ELEMENT_OPS = ("GetElem", "GetElemLocal", "GetMethodElem", "SetElem", "SetElemDr
                "SetElemLocal", "SetElemLocalDrop")
 E_RECEIVERS, E_KEYS = 0x7F, 0x1F << 8
 E_IN_LINE_RECEIVERS, E_KEY_INDEX = 0b111, 1 << 8
+# A generic element site (a key that is not an index on an object), lowered generically.
+E_GENERIC = 1 << 24
 # A named site's generic mark in its state word (step 5).
 GENERIC = 1 << 7
 
@@ -134,7 +136,10 @@ def value_precise(full, recorded, inline):
 
 def element_precise(full, recorded):
     """Rule R: the record's receivers and keys alone when it holds any, else the in-line set's,
-    are exactly those seen (an Array's facts are hints, not compared)."""
+    are exactly those seen (an Array's facts are hints, not compared). A generic site is: it is
+    exactly what the speculative tier lowers generically."""
+    if recorded & E_GENERIC:
+        return True
     if recorded & (E_RECEIVERS | E_KEYS):
         receivers, keys = recorded & E_RECEIVERS, recorded & E_KEYS
     else:

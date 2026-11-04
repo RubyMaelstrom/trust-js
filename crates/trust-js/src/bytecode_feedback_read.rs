@@ -90,6 +90,7 @@ impl Chunk {
                 recorded_receivers,
                 recorded_keys,
                 facts: word & ELEMENT_FACTS,
+                generic: word & crate::feedback::ELEM_GENERIC != 0,
             });
         }
         let allocation = |kind, image: bool, template: bool| {

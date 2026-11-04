@@ -5,10 +5,10 @@
 
 use crate::bytecode::*;
 use crate::feedback::{
-    ValueClass as C, ELEM_ARGUMENTS, ELEM_ARRAY, ELEM_EXOTIC, ELEM_HOLEY, ELEM_KEY_INDEX,
-    ELEM_KEY_NUMBER, ELEM_KEY_OTHER, ELEM_KEY_STRING, ELEM_KEY_SYMBOL, ELEM_NON_INT32,
-    ELEM_NON_NUMBER, ELEM_ORDINARY, ELEM_OUT_OF_BOUNDS, ELEM_PRIMITIVE, ELEM_STRING,
-    ELEM_TYPED_ARRAY, ELEM_UNWRITABLE, RECORD_OPERAND1_SHIFT, RECORD_RESULT_SHIFT,
+    ValueClass as C, ELEM_ARGUMENTS, ELEM_ARRAY, ELEM_EXOTIC, ELEM_GENERIC, ELEM_HOLEY,
+    ELEM_KEY_INDEX, ELEM_KEY_NUMBER, ELEM_KEY_OTHER, ELEM_KEY_STRING, ELEM_KEY_SYMBOL,
+    ELEM_NON_INT32, ELEM_NON_NUMBER, ELEM_ORDINARY, ELEM_OUT_OF_BOUNDS, ELEM_PRIMITIVE,
+    ELEM_STRING, ELEM_TYPED_ARRAY, ELEM_UNWRITABLE, RECORD_OPERAND1_SHIFT, RECORD_RESULT_SHIFT,
 };
 use crate::value::{ObjectKind, Value, ValueView};
 use crate::{Completion, Engine};
@@ -227,6 +227,8 @@ fn the_vm_records_every_element_receiver_and_key() {
             | ELEM_KEY_STRING
             | ELEM_KEY_SYMBOL
             | ELEM_KEY_OTHER
+            | ELEM_GENERIC,
+        "the VM records every access, past the generic mark too"
     );
 }
 
@@ -279,21 +281,38 @@ fn native_element_reads_record_only_what_leaves_the_in_line_set() {
         0,
         "an Array's, a typed array's and an ordinary object's own elements at an index"
     );
-    eval(&mut engine, "g(p, 'length');");
-    assert_eq!(
-        element(&mut engine, "g", load),
-        ELEM_ARRAY | ELEM_KEY_STRING
-    );
     eval(&mut engine, "g([1, , 3], 1); g(p, 10);");
     assert_eq!(
         element(&mut engine, "g", load),
-        ELEM_ARRAY | ELEM_HOLEY | ELEM_OUT_OF_BOUNDS | ELEM_KEY_STRING | ELEM_KEY_INDEX
+        ELEM_ARRAY | ELEM_HOLEY | ELEM_OUT_OF_BOUNDS | ELEM_KEY_INDEX
     );
     eval(&mut engine, "g('abc', 1);");
     assert_eq!(
-        element(&mut engine, "g", load) & (ELEM_STRING | ELEM_KEY_INDEX),
-        ELEM_STRING | ELEM_KEY_INDEX,
+        element(&mut engine, "g", load),
+        ELEM_ARRAY | ELEM_HOLEY | ELEM_OUT_OF_BOUNDS | ELEM_KEY_INDEX | ELEM_STRING,
         "a String receiver is outside the in-line set"
+    );
+    eval(&mut engine, "g(p, 'length');");
+    let generic = element(&mut engine, "g", load);
+    assert_eq!(
+        generic,
+        ELEM_ARRAY
+            | ELEM_HOLEY
+            | ELEM_OUT_OF_BOUNDS
+            | ELEM_KEY_INDEX
+            | ELEM_STRING
+            | ELEM_KEY_STRING
+            | ELEM_GENERIC,
+        "a String key on an object makes the site generic"
+    );
+    eval(
+        &mut engine,
+        "g(new Proxy({}, {}), 0); g({}, Symbol.iterator);",
+    );
+    assert_eq!(
+        element(&mut engine, "g", load),
+        generic,
+        "a generic site's misses classify and write nothing"
     );
 }
 
@@ -315,11 +334,12 @@ fn native_element_stores_record_only_what_leaves_the_in_line_set() {
     );
     eval(
         &mut engine,
-        "s(p, 'x', 1); s(Object.freeze([1, 2].slice()), 0, 3);",
+        "s(Object.freeze([1, 2].slice()), 0, 3); s(p, 'x', 1); s(new Proxy({}, {}), 0, 1);",
     );
     assert_eq!(
         element(&mut engine, "s", store),
-        ELEM_ARRAY | ELEM_UNWRITABLE | ELEM_KEY_STRING | ELEM_KEY_INDEX
+        ELEM_ARRAY | ELEM_UNWRITABLE | ELEM_KEY_STRING | ELEM_KEY_INDEX | ELEM_GENERIC,
+        "the proxy's store came after the site went generic"
     );
 }
 

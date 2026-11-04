@@ -198,8 +198,16 @@ The in-line sets (receiver, key):
 In the record's terms: an Array, typed-array or ordinary receiver (bits 0-2) with an index key
 (bit 8).
 
+The generic mark (bit 24, ELEM_GENERIC): a key that is not an array index (a String, a Symbol,
+another Number, anything else) on an object receiver makes the site generic. Its keys are names
+and values the record does not hold, so the speculative tier lowers it to the generic keyed
+access, as V8 does a megamorphic keyed load; and as V8 stops updating a megamorphic site's
+feedback, the helpers classify and write nothing at a generic site's later misses (one load
+reads the mark; FeedbackVector::record_holds). The VM goes on recording.
+
 Reading it: rule U, the receivers and keys an access saw are its record's together with the
-in-line set's; that is complete. Rule R, the record alone where it holds a receiver or key and
+in-line set's; that is complete but at a generic site, whose record stopped growing (it needs no
+more). Rule R, the record alone where it holds a receiver or key and
 the in-line set's where it holds none, is what the census's precision measures: it names them
 exactly where the VM's iteration or a miss also saw the in-line hits' receivers, and an empty
 record never tells an Array from a typed array or an ordinary object (the plan's design 2: P3
