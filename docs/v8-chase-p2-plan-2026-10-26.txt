@@ -11562,3 +11562,21 @@ Checks at 9b213dfe (crates/ as 861649a5):
 - The release gate, on an export of 861649a5: the fixtures' masked output as the base's;
   difftest 138 agree, 12 skipped (budget); Test262 at --tier=jit threshold 8, 53,575 of 53,575
   and identical to the base's report.
+
+### Vue's native calls, measured (addendum to "Vue's gap, by its misses", 2026-11-04)
+
+TRUST_JS_JIT_NATIVESTAT on Vue (main's engine with the getter change, lto/12657b48): 386,430 calls
+reach the call helper for a native callee: `get` with one argument 245,079 (WeakMap's and Map's,
+from Vue's reactivity maps), `get` with three 78,629 and `set` with four 23,763 (Reflect's, in its
+Proxy traps), parseInt 13,452, Number 12,085, `has` 10,724. A micro-benchmark (a loop of
+`wm.get(k)` with script-level constants; instructions an iteration, the difference of 1.2M and
+200k iterations; target/p2/compact/nat.js) costs 438 for WeakMap's get, 622 for Map's, 409 for
+Number.isInteger (a light native already) and 239 for Number.isNaN. SPE on the WeakMap loop:
+generated code 58% (its region's two LoadNames of the constants about 64 instructions an
+iteration, GetMethod about 41, the call template about 47), jit_call_hit 24% (about 107) and the
+native 15% (about 67). So the light class (bytecode.rs:1110-1115) saves only the native-call
+boundary's bookkeeping, about 30 instructions; the helper's own path is the larger part, and
+Vue's 386k native calls spend about 41M instructions (2.4% of Vue) in it. Candidate 4: a lean
+native call from generated code for natives the call cache proves (V8 calls a builtin from
+Sparkplug's code directly), with the receiver-gated light classes for the collections' get and
+has, before the light class alone.
