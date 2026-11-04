@@ -1608,10 +1608,15 @@ impl Function {
 
     /// Cache the conservative self-binding query on shared source, never per
     /// closure. The analysis has a finite syntax budget and retains on doubt.
+    #[inline]
     pub(crate) fn needs_self_environment(&self) -> bool {
-        if !self.is_fn_expr || self.name.is_none() {
-            return false;
-        }
+        // Only a named function expression has the binding: every other closure's creation
+        // asks in line (W2e step 7).
+        self.is_fn_expr && self.name.is_some() && self.named_expression_needs_self_environment()
+    }
+
+    /// [`Function::needs_self_environment`] of a named function expression.
+    fn named_expression_needs_self_environment(&self) -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| std::env::var("TRUST_JS_ELIDE_SELF_ENV").as_deref() != Ok("0"))
         {

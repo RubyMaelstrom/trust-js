@@ -25390,7 +25390,11 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
-    jit_opstat(ctx, pc);
+    // The opt-in profile out of line: its formatting code in line made the helper save every
+    // callee-saved register (W2e step 7).
+    if ctx.opstat_enabled {
+        jit_opstat_out_of_line(ctx, pc);
+    }
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
     let Op::MakeClosure(function, name) = chunk.ops[pc as usize] else {
@@ -27389,6 +27393,13 @@ unsafe fn jit_opstat(ctx: &mut crate::jit::JitCtx, pc: u32) {
             let _ = COUNTS.try_with(|c| *c.borrow_mut().0.entry(name).or_insert(0) += 1);
         }
     }
+}
+
+/// [`jit_opstat`] out of a helper's line, for a helper whose own work is short.
+#[cold]
+#[inline(never)]
+unsafe fn jit_opstat_out_of_line(ctx: &mut crate::jit::JitCtx, pc: u32) {
+    unsafe { jit_opstat(ctx, pc) }
 }
 
 /// Aggregate operand categories only: no author source, property text, or payload values.
