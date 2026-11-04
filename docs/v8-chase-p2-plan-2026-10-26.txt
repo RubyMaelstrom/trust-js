@@ -8408,3 +8408,265 @@ which 0f56ebc8 fixes; the allocation, poll, count and two-engine tests again aft
 138 agree, 12 skipped (budget); call_error_name_tests 16 runs of 16 (main crashed in 2 of 16).
 
 Next: step 7 (closures), then W2e's exit.
+### W2e step 7: closures' helper, its Rust path (record, 2026-11-04)
+
+Commits, from main 527c2db7, on p2-w2e-closures (an agent's; rebased onto main c7916f37, after
+steps 5, 6 and 8, as 561622f4..c90b3889, in order: 862b5c62 561622f4, 91eb4d39 ebe1f141,
+62f1ee85 635023aa, 2ded36c1 6de8558a, 80e54b25 3910c5d2, 287ab64c b2aad58d, a1f16afd 36d38cbb,
+2582f306 aff2282c, b44a9e56 82cc8183, 002c2297 f9189ac2, 39c287b2 47dc061a, 4227f431 656193b2,
+2f8136ce c90b3889; the measurements name the series as written, on 527c2db7, and the rebased
+series is measured against c7916f37 at the end):
+- 862b5c62: the deferred prototype looks `constructor` up in its template by atom, not by text.
+- 91eb4d39: one runtime lease per closure (ObjectKind::user_leased), and the closure's record
+  proved without the walk of the contexts (Interp::innermost_runtime_origin_identity,
+  ClosureOrigin).
+- 62f1ee85: object cells allocated through the Agent's tag (with_agent_heap), not the
+  active-heap cell.
+- 2ded36c1: one borrow (one card) for the prototype slot and the constructor bit; the function
+  borrowed, not counted up and down.
+- 80e54b25: a function template's copy in one pass over its record.
+- 287ab64c: jit_make_closure's opt-in profile out of its line.
+- a1f16afd: the test, function_runtime_tests::
+  closures_of_one_function_keep_the_script_each_was_made_in.
+- 2582f306: the deferred prototype told whether its template has `constructor`.
+- b44a9e56: a self-name environment binds its function's atom (FunctionMaps::self_name); the
+  self-environment query's scan out of line.
+- 002c2297: the foreign runtime lease out of the primary lookup's line.
+- 39c287b2: the function template's copy in line, any other template's out of it.
+- 4227f431: Function::runtime stays a call.
+- 2f8136ce: the closure's lease taken in line.
+
+Where a function expression's 1,057 instructions went on main (SPE on a fat-LTO build with line
+tables, target/p2/w2e/closures/prof; PMU sampling's skid had put 175 in active_runtime_origin,
+SPE about 90): make_function_named itself about 300 (of which the deferred prototype's cell
+about 100), the object's cell about 120, ObjectKind::user about 115 (its UserCallable cell
+about 50), the template copy about 115, the text lookup about 120 (Props::get, its key scan and
+memcmp), active_runtime_origin about 90, Function::runtime twice about 60, jit_make_closure
+about 55, needs_self_environment about 17.
+
+What changed, and why:
+1. The text lookups. The "key lookups by text inlined into make_function_named" were
+   LazyFunctionPrototype::new's `template.contains("constructor")`: every constructor
+   function's creation asked its prototype template for the key by text. 862b5c62 took the
+   atom (-64); the lookup by atom still cost about 65 (Props::get_key's general path), and
+   2582f306 passes the bit, which the creation knows (the template has `constructor` unless the
+   function is a generator; debug builds compare it with the lookup). A self-name environment's
+   binding cloned the name's String for each closure and interned it again in the record's
+   insert; the function's heap-local maps keep the atom now (b44a9e56: a named expression whose
+   body uses its name, -186).
+2. The origin (91eb4d39). ObjectKind::user compared the record active_runtime_origin returns with
+   the function's primary entry's by identity, and shared it when they were the same: the walk
+   and an Rc count up and down for each closure, most of them sharing. The walk's first step
+   decides it whenever the innermost context has its own record: with no caller floor at the
+   innermost depth, no job context pushed at or above it and no splice position, the record is
+   the innermost code frame's, else the innermost function frame's callee's
+   (UserCallable::runtime_origin). innermost_runtime_origin_identity gives that record's
+   address under exactly those conditions, else null, and a closure whose function's primary
+   entry holds the same record shares it (ClosureOrigin::Primary) with no walk and no count;
+   anything else walks as before (ClosureOrigin::Active), and the record is boxed or shared as
+   ObjectKind::user decided it. Debug builds assert, for every closure the proof shares, that
+   the walk returns the same record (the lib suite runs it on each closure it makes). The test
+   runs one parsed script under two bases, so one function's closures are made under two
+   records: each closure keeps its creating context's record, identity and referrer, in the
+   three tiers, whichever record the function's first closure had; a fast path that took the
+   shared record without the proof fails it. MakeClosure is never spliced
+   (inline_capability), so a closure is made in its own frame. The exemplars keep a function's
+   script with its code (V8's SharedFunctionInfo, the canonical function's script that
+   SpiderMonkey's Lambda stub copies, JSC's FunctionExecutable) and compute nothing at
+   creation; TRust's records can differ between runs of shared parsed code, so the walk stays
+   for the cases the proof does not cover.
+3. One lease (91eb4d39, 002c2297, 4227f431, 2f8136ce). make_function_named took the function's
+   runtime lease and ObjectKind::user took it again; user_leased takes the first. The lease's
+   foreign path (another heap's entries, their pruning) sat in FunctionRuntimeCache::current's
+   line and made every lease save all the callee-saved registers; it is a cold call. That made
+   Function::runtime small enough for LLVM to inline at 33 of its 42 call sites, and
+   Chunk::instance_class, which grew with it, left jit_construct_this's line (`new P(x, y)` +15
+   at 002c2297): Function::runtime stays a call (4227f431), and make_function_named takes its
+   lease through current, in line (2f8136ce).
+4. The template copy (80e54b25, 39c287b2). Props::init_copy_of (only closures call it) copied
+   each slot through NamedEntries::slot, which tests the index against the template's cell and
+   the record's presence, stored the count at each slot and then copied the template's elements.
+   A template outside any cell whose record has no index or extras, without elements, whose slots
+   fit the new cell, as a function's are, now copies its record's words straight into the cell
+   and sets the count once, in line; any other template takes the general copy, out of line.
+5. The allocation (62f1ee85). Object::alloc_empty and Object::alloc found the heap through
+   with_active_gc_heap, which borrowed and released the thread-local active-heap RefCell at
+   each allocation; with_agent_heap reads the heap the Agent's tag names, as the payload,
+   string and scope cells' allocations already did. Every object allocation gains (`[i, i]`,
+   `arguments` and rest arrays -12 to -13, `new P(x, y)` -11).
+6. Smaller cuts. One borrow (one card mark) for the prototype slot and the constructor bit, which
+   only a function with that slot gets, and the function borrowed instead of an Rc count up and
+   down (2ded36c1, -19 to -21). jit_make_closure's in-line jit_opstat made the helper save every
+   callee-saved register (287ab64c, -11). Function::needs_self_environment answers false in line
+   for every closure but a named expression's: in 287ab64c LLVM still inlined the scan back into
+   the query, which then stayed a call; the scan is #[inline(never)] since b44a9e56 (-13).
+
+Not done: the deferred prototype's cell. A constructor function's closure allocates three cells
+(the object, its UserCallable and its LazyFunctionPrototype, 48 bytes); V8 (an accessor and the
+hole in prototype_or_initial_map), SpiderMonkey (a resolve hook) and JSC (lazy reification)
+allocate nothing for `prototype` at creation. TRust's lazy word names a per-closure cell because
+materialization reads only the word, not its owner; removing the cell needs the owner found at
+materialization, a change of the property words' contract. Each cell's allocation is about 45
+instructions of the allocator's own (gc_core's bitmap take, the live count and the byte
+charge), which step 8's refill charge and an in-line path address. The in-line closure
+(step 7's second half) needs those three cells and the kind payload; its template copy is now
+straight words, as the in-line literals' images are.
+
+Micro-benchmarks (instructions an iteration over the loop's 18, 2M iterations of a function's
+loop, fat LTO, CPU 11, pacing off; target/p2/w2e/micro/run.sh, and
+target/p2/w2e/closures/micro/run.sh for the closure kinds):
+
+| script | main | tip | change |
+| --- | --- | --- | --- |
+| `{}` | 114.1 | 113.8 | -0.2 |
+| `{x: i, y: i}` | 132.6 | 132.3 | -0.3 |
+| five keys | 161.3 | 161.1 | -0.3 |
+| `[]` | 116.8 | 116.6 | -0.2 |
+| `[i, i]` | 533.6 | 520.6 | -13.0 |
+| `[1, 2, 3]` (shared) | 116.9 | 116.8 | -0.0 |
+| a function expression | 1,056.8 | 706.8 | -350.0 |
+| an arrow | 760.0 | 562.0 | -198.0 |
+| `new P(x, y)` | 682.8 | 671.8 | -11.0 |
+| returning `arguments` | 1,760.6 | 1,748.6 | -12.0 |
+| a rest array | 784.7 | 772.7 | -12.0 |
+| a plain call | 231.2 | 231.2 | -0.0 |
+| a closure of a parameter, made by a call | 1,327.6 | 973.9 | -353.7 |
+| `function f() {...}` (self-name elided) | 1,048.8 | 712.8 | -336.0 |
+| `function f() { return f; }` (self-name environment) | 1,547.4 | 1,024.4 | -523.0 |
+| a function expression bound by `let` | 1,069.9 | 719.9 | -350.0 |
+| `{ m() {...} }` (the object and its method) | 865.9 | 666.6 | -199.3 |
+| a generator expression | 1,103.8 | 835.8 | -268.0 |
+| an async arrow | 825.0 | 628.0 | -197.0 |
+
+Per step (closures/micro/run-*.txt):
+
+| commit | fn | arrow | selfref | method |
+| --- | --- | --- | --- | --- |
+| main 527c2db7 | 1,056.8 | 760.0 | 1,547.4 | 865.9 |
+| 862b5c62 | 992.8 | 758.0 | 1,483.4 | 863.9 |
+| 91eb4d39 | 907.8 | 676.0 | 1,398.4 | 781.9 |
+| 62f1ee85 | 897.8 | 666.0 | 1,388.4 | 771.6 |
+| 2ded36c1 | 878.8 | 645.0 | 1,368.8 | 750.6 |
+| 80e54b25 | 849.8 | 626.0 | 1,339.8 | 731.6 |
+| 287ab64c | 838.8 | 615.0 | 1,328.7 | 720.6 |
+| 2582f306 | 763.8 | 614.0 | 1,253.7 | 719.6 |
+| b44a9e56 | 750.8 | 600.0 | 1,067.4 | 705.6 |
+| 002c2297 | 736.8 | 585.0 | 1,051.4 | 690.6 |
+| 39c287b2 | 706.8 | 562.0 | 1,024.4 | 666.6 |
+| 4227f431 | 719.8 | 570.0 | 1,037.9 | 675.6 |
+| 2f8136ce | 706.8 | 562.0 | 1,024.4 | 666.6 |
+
+`new P(x, y)`: 682.8 on main, 671.8 from 62f1ee85, 686.8 at 002c2297 and 39c287b2, 671.8 again
+from 4227f431.
+
+Counts against main 527c2db7 (fat LTO, CPUs 10-13, pacing off, median of 3; chai one run;
+target/p2/w2e/closures/counts-tip.txt; the sustained-allocation workload with sa.sh):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,825,907,082 | 1,823,372,799 | -0.14% |
+| React | 318,472,348 | 317,365,610 | -0.35% |
+| Djot | 643,790,873 | 642,269,832 | -0.24% |
+| chai | 81,618,064,042 | 81,265,307,034 | -0.43% |
+| Richards | 136,862,868 | 136,796,966 | -0.05% |
+| DeltaBlue | 263,571,902 | 263,232,667 | -0.13% |
+| Crypto | 730,138,650 | 729,987,881 | -0.02% |
+| RayTrace | 1,019,263,904 | 1,011,516,454 | -0.76% |
+| EarleyBoyer | 3,405,887,119 | 3,381,065,422 | -0.73% |
+| RegExp | 2,802,415,300 | 2,798,052,994 | -0.16% |
+| Splay | 1,434,252,264 | 1,433,738,907 | -0.04% |
+| NavierStokes | 451,899,265 | 451,827,488 | -0.02% |
+| PdfJS | 7,940,371,099 | 7,828,197,967 | -1.41% |
+| Mandreel | 62,958,339,153 | 62,953,995,382 | -0.01% |
+| Gameboy | 21,499,872,342 | 21,535,293,461 | +0.16% |
+| CodeLoad | 483,714,469 | 482,345,467 | -0.28% |
+| Box2D | 4,493,943,008 | 4,490,413,838 | -0.08% |
+| zlib | 138,040,540,143 | 138,040,355,797 | -0.00% |
+| TypeScript | 59,239,941,387 | 59,115,339,802 | -0.21% |
+| sustained allocation | 2,038,208,645 | 1,953,506,966 | -4.16% |
+
+The sustained-allocation workload -4.16% (its 400,000 arrows), PdfJS -1.41% (325,000 function
+expressions: about 345 each), RayTrace -0.76% (two thirds of it 62f1ee85's, its objects'
+allocation), EarleyBoyer -0.73% (about a third each from 91eb4d39, 62f1ee85 and the rest),
+chai -0.43%, React -0.35%, CodeLoad -0.28%, Djot -0.24%, TypeScript -0.21%,
+RegExp -0.16%, Vue -0.14%, DeltaBlue -0.13%; the rest within 0.08%. Gameboy +0.16%, which makes
+no closures to speak of, moved at 62f1ee85 alone (one run each: 21,499.5M at 91eb4d39,
+21,538.9M at 62f1ee85), and not in its code's work but in its collection history: under
+TRUST_JS_PERF_METRICS it collects 30 times (5 major, 399,349 objects seen) at 91eb4d39 and 29
+times (4 major, 546,199 seen, a peak of 35,144 objects before a collection instead of 18,741)
+at 62f1ee85, with two to five more objects and up to 250 KB more surviving its early minor
+collections; with TRUST_JS_GC_LOG=1 both builds collect the same 29 times and count the same
+instructions (21,500,885,691 and 21,500,694,356). The heap is the same one either way (the
+Agent's tag names the heap the active-heap cell holds), so the likeliest cause is a
+conservatively scanned stack word that the allocation path's new code leaves elsewhere: a
+schedule that a few retained objects tip, as the log's own code tips it.
+
+Checks on 2f8136ce (and 39c287b2 before it): rustfmt; clippy with -D warnings in the three
+configurations (`--features embed`, `--features embed,architecture-diagnostics`,
+`--no-default-features`) on ARM64 and x86-64 (zombie); the lib suite on ARM64 (2,624) and
+x86-64 (zombie, 2,543); Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to the
+base's report (target/p2/w2d3/gate-d1d); the fixtures' masked output as the base's; difftest
+138 agree, 12 skipped (budget); the closure tests (function_runtime_tests, named evaluation,
+self-names, deferred prototypes: 37) under TRUST_JS_GC_STRESS=1 and TRUST_JS_GC_VERIFY=1.
+payload_cell_tests::a_long_string_held_only_by_a_property_lives_and_dies_with_it failed once
+in the ARM64 lib suite on a1f16afd (two large cells where one was expected: a stale stack word
+keeping the string's intermediate alive) and passes alone (three of three); it failed so before
+W2e (target/p2/w2c/step2c-lib4.txt).
+
+The rebased series against main c7916f37, after step 8 (fat LTO; the micro-benchmarks as
+above; counts as above):
+
+| script | main | tip | change |
+| --- | --- | --- | --- |
+| a function expression | 1,007.4 | 659.4 | -348.0 |
+| an arrow | 721.8 | 527.8 | -194.0 |
+| a closure of a parameter, made by a call | 1,267.5 | 919.5 | -348.0 |
+| `function f() {...}` (self-name elided) | 999.4 | 665.4 | -334.0 |
+| `function f() { return f; }` (self-name environment) | 1,474.2 | 953.1 | -521.0 |
+| a function expression bound by `let` | 1,020.6 | 672.6 | -348.0 |
+| `{ m() {...} }` (the object and its method) | 798.2 | 602.9 | -195.3 |
+| a generator expression | 1,058.5 | 791.4 | -267.0 |
+| an async arrow | 788.8 | 593.8 | -195.0 |
+| returning `arguments` | 1,708.2 | 1,695.2 | -13.0 |
+| a rest array | 732.6 | 719.6 | -13.0 |
+| `{}` | 84.7 | 84.4 | -0.3 |
+| `[]` | 87.4 | 87.2 | -0.2 |
+| `[i, i]` | 174.9 | 174.5 | -0.4 |
+| `new P(x, y)` | 523.4 | 523.2 | -0.2 |
+
+The in-line objects make no Rust allocation, so 62f1ee85's -11 to -13 reach only the helpers'
+objects now. Counts:
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,824,191,250 | 1,822,363,253 | -0.10% |
+| React | 317,052,065 | 315,990,936 | -0.33% |
+| Djot | 637,033,986 | 635,432,394 | -0.25% |
+| chai | 80,754,747,189 | 80,393,214,776 | -0.45% |
+| Richards | 136,622,481 | 136,554,509 | -0.05% |
+| DeltaBlue | 262,598,396 | 262,321,892 | -0.11% |
+| Crypto | 729,922,259 | 729,773,360 | -0.02% |
+| RayTrace | 1,011,655,133 | 1,003,579,941 | -0.80% |
+| EarleyBoyer | 3,212,539,854 | 3,185,101,778 | -0.85% |
+| RegExp | 2,778,783,274 | 2,775,210,574 | -0.13% |
+| Splay | 1,401,777,613 | 1,401,525,283 | -0.02% |
+| NavierStokes | 451,751,387 | 451,655,263 | -0.02% |
+| PdfJS | 7,815,695,155 | 7,706,614,936 | -1.40% |
+| Mandreel | 62,958,324,264 | 62,954,099,446 | -0.01% |
+| Gameboy | 21,519,164,405 | 21,515,528,108 | -0.02% |
+| CodeLoad | 483,890,965 | 482,556,695 | -0.28% |
+| Box2D | 4,483,092,797 | 4,478,539,686 | -0.10% |
+| zlib | 138,040,874,764 | 138,040,682,339 | -0.00% |
+| TypeScript | 58,999,510,812 | 58,871,501,080 | -0.22% |
+| sustained allocation | 1,845,707,406 | 1,767,726,724 | -4.22% |
+
+Every workload falls: the sustained workload -4.22%, PdfJS -1.40%, EarleyBoyer -0.85%,
+RayTrace -0.80%, chai -0.45%, React -0.33%, CodeLoad -0.28%, Djot -0.25%, TypeScript -0.22%;
+Gameboy -0.02% (its +0.16% on 527c2db7 was the collection history's, as above). Checks on
+c90b3889: the lib suite with the embed feature on ARM64 (2,762) and x86-64 (zombie, 2,543);
+clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575 of 53,575
+and identical to main's report; the fixtures' masked output as main's; difftest 138 agree, 12
+skipped (budget).
+
+Left for later: the in-line closure (three cells and the kind payload); the deferred prototype's
+cell, which needs materialization to know its owner.
