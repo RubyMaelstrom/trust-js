@@ -222,5 +222,32 @@ property (a non-writable or index-named one, a slot past the cache's reach, a de
 which leave no mark. The census's state word reports the mark in bit 7 (`generic` in its header's
 records).
 
-5.4 Later steps: the read API (step 6), the pc map of inlined and recompiled code (step 7), Pilot
-C's store writability (step 9) and the dependency registry (step 10).
+5.4 The read API (step 6). crate::feedback::read(chunk, pc) answers one view of the operation at
+a baseline pc (feedback_read.rs; the chunk's side in bytecode_feedback_read.rs), allocating and
+interning nothing: its shapes are the process's shape ids, its targets the process's cells.
+- Values (arithmetic, unary, update and relational operations, UpdateElem's too): the three
+  ValueClass sets by rule U, and the record alone, whose int32/double split is a hint.
+- Element (element loads and stores): the receivers and keys by rule U, and the record alone with
+  an Array's facts, hints.
+- Named (named loads and stores): each filled way, most recent first (receiver and holder shapes,
+  depth, slot, slot location, kind: data, key-checked, accessor, absent or creation), and the
+  generic mark; NamedUpdate (UpdateProp) adds the value record's view.
+- Call (Call, CallWithThis, CallSpread, CallSpreadThis): the state (empty, monomorphic,
+  polymorphic, megamorphic) and each way's target: the callee's cell, its function literal (the
+  FeedbackCell's role: closures of one literal share it), a native's builtin id and entry, the
+  callee's realm, and whether the entry was filled in the current call-cache epoch.
+- Construct (New): its target and the instances' prototype's shape.
+- Allocation: the kind (object, array, RegExp, closure) and whether the image and the template (an
+  object literal's template, an array literal's shared block, a RegExp literal's compiled
+  pattern) exist.
+- None: the rest, equality (no record by design), typeof and `in` among them.
+Exact: the ways and targets as read, each a proof that generated code re-validates (a shape is
+never reused; a way may name a shape no live object has any more), and an epoch-current call
+target. Hints: the int32/double split and an Array's facts. Stale: a call target of an older
+epoch, whose chunk and code may have been replaced (its callee and literal stay). The
+constructor's capacity class stays in the callee's chunk (Chunk::instance_class); the
+allocation sites' survival record went to Phase 3 with W4's decision 2. The detailed vector
+(section 3) and its envelope stay diagnostics.
+
+5.5 Later steps: the pc map of inlined and recompiled code (step 7), Pilot C's store writability
+(step 9) and the dependency registry (step 10).

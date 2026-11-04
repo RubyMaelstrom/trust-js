@@ -1,7 +1,7 @@
 //! The always-on records (W4 steps 3-5; feedback-schema.txt section 5): the VM records every
 //! execution; generated code records only what its in-line path does not take, on its miss
-//! paths; equality records nothing. The value record (step 3), the element record (step 4), then
-//! the named sites' generic mark (step 5).
+//! paths; equality records nothing. The value record (step 3), the element record (step 4), the
+//! named sites' generic mark (step 5), then the read API's views of them and the caches (step 6).
 
 use crate::bytecode::*;
 use crate::feedback::{
@@ -415,4 +415,190 @@ fn a_generic_sites_prototype_ways_still_hit() {
         op,
         Op::GetMethod(..)
     )));
+}
+
+/// The read API's view of `name`'s one operation that `which` accepts.
+fn view(engine: &mut Engine, name: &str, which: impl Fn(&Op) -> bool) -> crate::feedback::SiteView {
+    let chunk = chunk_of(engine, name);
+    let pcs: Vec<usize> = (0..chunk.jit_ops().len())
+        .filter(|&pc| which(&chunk.jit_ops()[pc]))
+        .collect();
+    assert_eq!(
+        pcs.len(),
+        1,
+        "one such operation in {name}: {:?}",
+        chunk.jit_ops()
+    );
+    crate::feedback::read(&chunk, pcs[0])
+}
+
+#[test]
+fn the_values_view_reads_rule_u() {
+    use crate::feedback::SiteView;
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function f(a, b) { return a + b; } for (var i = 0; i < 20; i++) f(i, 0.5);",
+    );
+    let SiteView::Values(values) = view(&mut engine, "f", |op| matches!(op, Op::Add)) else {
+        panic!("Add has the value record's view")
+    };
+    assert!(!values.has_record(), "Numbers in line record nothing");
+    assert_eq!(
+        (values.operand0, values.operand1, values.result),
+        (INT32 | DOUBLE, INT32 | DOUBLE, INT32 | DOUBLE),
+        "rule U: the in-line set"
+    );
+    eval(&mut engine, "f('x', 1);");
+    let SiteView::Values(values) = view(&mut engine, "f", |op| matches!(op, Op::Add)) else {
+        panic!()
+    };
+    assert_eq!(values.recorded, [STRING, INT32, STRING]);
+    assert_eq!(values.operand0, STRING | INT32 | DOUBLE);
+}
+
+#[test]
+fn the_element_view_reads_the_record_and_the_in_line_set() {
+    use crate::feedback::SiteView;
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        &format!("{PACKED} function g(a, k) {{ return a[k]; }} for (var i = 0; i < 20; i++) g(p, i % 4); g(p, 'length');"),
+    );
+    let SiteView::Element(element) = view(&mut engine, "g", load) else {
+        panic!("an element load has the element view")
+    };
+    assert!(element.has_record());
+    assert_eq!(
+        (element.recorded_receivers, element.recorded_keys),
+        (ELEM_ARRAY, ELEM_KEY_STRING)
+    );
+    assert_eq!(
+        element.receivers,
+        ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY
+    );
+    assert_eq!(element.keys, ELEM_KEY_INDEX | ELEM_KEY_STRING);
+    assert_eq!(element.facts, 0);
+}
+
+#[test]
+fn the_named_view_reads_each_way_and_the_mark() {
+    use crate::feedback::{NamedWayKind as K, SiteView};
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function P() { this.x = 1; } P.prototype.m = function () { return 2; };
+         Object.defineProperty(P.prototype, 'g', { get() { return 3; } });
+         function own(o) { return o.x; } function up(o) { return o.m; }
+         function none(o) { return o.nothing; } function getter(o) { return o.g; }
+         for (var i = 0; i < 20; i++) { var o = new P(); own(o); up(o); none(o); getter(o); }",
+    );
+    let way = |engine: &mut Engine, name: &str| {
+        let SiteView::Named(named) = view(engine, name, |op| {
+            matches!(op, Op::GetProp(..) | Op::GetPropLocal(..))
+        }) else {
+            panic!("{name}: a named load has the named view")
+        };
+        assert!(!named.generic, "{name}");
+        let filled: Vec<_> = named.filled().copied().collect();
+        assert_eq!(filled.len(), 1, "{name}: {filled:?}");
+        filled[0]
+    };
+    let own = way(&mut engine, "own");
+    assert_eq!((own.kind, own.depth), (K::Data, 0));
+    assert_eq!(own.receiver_shape, own.holder_shape);
+    let up = way(&mut engine, "up");
+    assert_eq!((up.kind, up.depth), (K::Data, 1));
+    assert_ne!(up.receiver_shape, up.holder_shape);
+    assert_eq!(way(&mut engine, "none").kind, K::Absent);
+    let getter = way(&mut engine, "getter");
+    assert_eq!((getter.kind, getter.depth), (K::Accessor, 1));
+    let SiteView::Named(creation) = view(&mut engine, "P", |op| {
+        matches!(
+            op,
+            Op::SetProp(..) | Op::SetPropDrop(..) | Op::SetPropThisDrop(..)
+        )
+    }) else {
+        panic!("a constructor's store has the named view")
+    };
+    assert!(creation.filled().any(|way| way.kind == K::Creation));
+}
+
+#[test]
+fn the_call_and_construct_views_read_their_targets() {
+    use crate::feedback::{CallState, SiteView};
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function one() { return 1; } function two() { return 2; } function P() {}
+         function mono() { return one(); } function poly(f) { return f(); }
+         function native(x) { return Math.abs(x); } function make() { return new P(); }
+         for (var i = 0; i < 20; i++) { mono(); poly(i % 2 ? one : two); native(-i); make(); }",
+    );
+    let call = |engine: &mut Engine, name: &str| {
+        let SiteView::Call(call) = view(engine, name, |op| {
+            matches!(op, Op::Call(..) | Op::CallWithThis(..))
+        }) else {
+            panic!("{name}: a call has the call view")
+        };
+        call
+    };
+    let mono = call(&mut engine, "mono");
+    assert_eq!(mono.state, CallState::Monomorphic);
+    let target = mono.ways.iter().flatten().next().copied().unwrap();
+    // `current` may be off: a concurrent test can bump the process-wide call-cache epoch.
+    assert!(!target.function.is_null() && target.builtin == 0);
+    assert_eq!(call(&mut engine, "poly").state, CallState::Polymorphic);
+    let native = call(&mut engine, "native");
+    let target = native.ways.iter().flatten().next().copied().unwrap();
+    assert!(target.builtin != 0 && target.native != 0, "{target:?}");
+    let SiteView::Construct(construct) = view(&mut engine, "make", |op| matches!(op, Op::New(..)))
+    else {
+        panic!("new has the construct view")
+    };
+    assert!(construct
+        .target
+        .is_some_and(|target| !target.function.is_null()));
+}
+
+#[test]
+fn the_allocation_view_reads_images_and_templates() {
+    use crate::feedback::{AllocationKind, SiteView};
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function o() { return {a: 1, b: 2}; } function a() { return [1, 2, 3]; }
+         function r() { return /x+/; } function c() { return function () {}; }
+         for (var i = 0; i < 4; i++) { o(); a(); r(); c(); }",
+    );
+    let allocation = |engine: &mut Engine, name: &str| {
+        let SiteView::Allocation(view) = view(engine, name, |op| {
+            matches!(
+                op,
+                Op::MakeObject(..)
+                    | Op::NewObject
+                    | Op::MakeArray(..)
+                    | Op::MakeArrayLiteral(..)
+                    | Op::NewArray
+                    | Op::MakeRegExp(..)
+                    | Op::MakeClosure(..)
+            )
+        }) else {
+            panic!("{name}: an allocation has the allocation view")
+        };
+        view
+    };
+    let object = allocation(&mut engine, "o");
+    assert_eq!(object.kind, AllocationKind::Object);
+    assert!(object.template, "{object:?}");
+    let array = allocation(&mut engine, "a");
+    assert_eq!(array.kind, AllocationKind::Array);
+    assert!(
+        array.template,
+        "a constant literal's shared block: {array:?}"
+    );
+    let regexp = allocation(&mut engine, "r");
+    assert_eq!(regexp.kind, AllocationKind::RegExp);
+    assert!(regexp.template, "its compiled pattern: {regexp:?}");
+    assert_eq!(allocation(&mut engine, "c").kind, AllocationKind::Closure);
 }

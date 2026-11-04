@@ -339,6 +339,15 @@ pub(crate) enum ValueClass {
     Object = 9,
 }
 
+/// The read API (W4 step 6; feedback-schema.txt section 5.4).
+#[path = "feedback_read.rs"]
+mod read_api;
+#[allow(unused_imports)]
+pub(crate) use read_api::{
+    read, AllocationKind, AllocationView, CallState, CallTarget, CallView, ConstructView,
+    ElementView, NamedView, NamedWay, NamedWayKind, SiteView, ValuesView,
+};
+
 /// The element record (W4 step 4; feedback-schema.txt section 5.2): an element load's or store's
 /// word holds three bit sets, a byte each, ORed in. The receiver (bits 0-6), by its kind's tag:
 /// an Array, a typed array, another ordinary kind (plain objects, functions, a Map's or Set's

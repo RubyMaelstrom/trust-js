@@ -1220,6 +1220,10 @@ pub(crate) mod call_cache_diagnostics;
 #[path = "bytecode_census.rs"]
 pub(crate) mod census;
 
+/// A chunk's side of the feedback read API (W4 step 6; `crate::feedback::read`).
+#[path = "bytecode_feedback_read.rs"]
+pub(crate) mod feedback_read;
+
 /// Exhaustion permanently disables raw call caches instead of admitting a
 /// repeated generation after code has been reclaimed: the fills refuse u32::MAX, so no probe
 /// matches once the epoch reaches it.
