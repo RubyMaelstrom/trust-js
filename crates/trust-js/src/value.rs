@@ -6464,34 +6464,17 @@ impl DenseStorage {
     fn words(&self) -> Option<&word_block::Words> {
         (!self.0.is_static_empty()).then_some(&self.0)
     }
-    /// The element words to change, while the map keeps its elements as words: a shared
-    /// literal's block is copied first (W2d step 4, [`word_block::Words::unshare`]), so every
-    /// Rust write of the words, which comes through here or [`Self::words_start`], writes the
-    /// map's own block.
+    /// The element words to change. A shared literal's block (W2d step 4) is copied by the
+    /// write itself: every in-place write of [`word_block::Words`] makes the block its own first,
+    /// and an append reallocates an exact shared block into a private one.
     #[inline]
     fn words_mut(&mut self) -> Option<&mut word_block::Words> {
-        if self.0.is_static_empty() {
-            return None;
-        }
-        self.0.unshare();
-        Some(&mut self.0)
+        (!self.0.is_static_empty()).then_some(&mut self.0)
     }
-    /// The words to append to, the static empty block included, for a map that starts keeping
-    /// them (a shared block copied first, as in [`Self::words_mut`], with room for the append).
+    /// The words, the static empty block included, for a map that starts keeping them.
     #[inline]
     fn words_start(&mut self) -> &mut word_block::Words {
-        self.0.unshare_with_room(1);
         &mut self.0
-    }
-    /// [`Self::words_mut`] before a write that adds `additional` words: a shared block's copy
-    /// has room for them ([`word_block::Words::unshare_with_room`]).
-    #[inline]
-    fn words_to_grow(&mut self, additional: usize) -> Option<&mut word_block::Words> {
-        if self.0.is_static_empty() {
-            return None;
-        }
-        self.0.unshare_with_room(additional);
-        Some(&mut self.0)
     }
     #[inline]
     fn has_words(&self) -> bool {
@@ -9101,12 +9084,9 @@ impl Props {
     /// allocation or edge change.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn reprove_words(&mut self) {
-        // A shared literal's block is scanned for good (W2d step 4), so `words_mut`, which would
-        // copy it, is reached only for a private one.
-        if self.elems.words().is_some_and(|words| !words.scanned()) {
-            if let Some(words) = self.elems.words_mut() {
-                words.reprove();
-            }
+        // A shared literal's block (W2d step 4) is scanned for good, and `reprove` writes none.
+        if let Some(words) = self.elems.words_mut().filter(|words| !words.scanned()) {
+            words.reprove();
         }
     }
 
@@ -9370,17 +9350,20 @@ impl Props {
     /// generic path.
     #[inline]
     pub(crate) fn set_index_value(&mut self, n: u32, v: Value) -> Result<(), Value> {
-        // An existing word only: a hole is an absent element (the prototype chain's, or a
-        // named entry's after a non-plain define), which the caller's slow path handles. A
-        // shared literal's block is copied only for a store that happens (W2d step 4).
-        let writes = self.elems.words().is_some_and(|words| {
-            words.integrity() & word_block::KIND_FROZEN == 0 && words.get(n as usize).is_some()
-        });
-        if !writes {
-            return Err(v);
+        if let Some(words) = self
+            .elems
+            .words_mut()
+            .filter(|words| words.integrity() & word_block::KIND_FROZEN == 0)
+        {
+            // An existing word only: a hole is an absent element (the prototype chain's, or a
+            // named entry's after a non-plain define), which the caller's slow path handles.
+            if words.get(n as usize).is_none() {
+                return Err(v);
+            }
+            words.set(n as usize, v);
+            return Ok(());
         }
-        self.elems.words_mut().unwrap().set(n as usize, v);
-        Ok(())
+        Err(v)
     }
 
     /// Record a fresh named entry at `slot`: an index key there sets `has_far`, so lookups of
@@ -9453,10 +9436,7 @@ impl Props {
             return Err(prop);
         }
         self.note_structural();
-        let words = self
-            .elems
-            .words_to_grow((index + 1).saturating_sub(len))
-            .unwrap();
+        let words = self.elems.words_mut().unwrap();
         if index < len {
             words.set(index, prop.into_value());
         } else {
