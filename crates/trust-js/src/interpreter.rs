@@ -11639,11 +11639,13 @@ impl Interp {
             ValueView::Obj(o) => {
                 let o = *o;
                 let ptr = Gc::as_ptr(&o) as usize;
-                // One look at the exotic kind: a mapped `arguments` object or a string wrapper.
-                let (mapped, wrapped_string) = match &o.borrow().kind {
-                    ObjectKind::Arguments(Some(_)) => (true, None),
-                    ObjectKind::StrWrap(s) => (false, Some(**s)),
-                    _ => (false, None),
+                // One look at the exotic kind: a mapped `arguments` object, a string wrapper or a
+                // proxy.
+                let (mapped, wrapped_string, proxy) = match &o.borrow().kind {
+                    ObjectKind::Arguments(Some(_)) => (true, None, None),
+                    ObjectKind::StrWrap(s) => (false, Some(**s), None),
+                    ObjectKind::Proxy(proxy) => (false, None, Some((proxy.target, proxy.handler))),
+                    _ => (false, None, None),
                 };
                 // A mapped `arguments` index aliases its parameter binding.
                 if mapped {
@@ -11702,7 +11704,7 @@ impl Interp {
                 }
                 // Proxy: invoke the `get` trap, or forward to the target.
                 {
-                    if let Some((target, handler)) = proxy_parts(&o) {
+                    if let Some((target, handler)) = proxy {
                         if let Some(trace) = trace.as_deref_mut() {
                             trace.record(
                                 crate::feedback::PropertyOutcome::Exotic,
@@ -12431,7 +12433,15 @@ impl Interp {
         };
 
         let ptr = Gc::as_ptr(&obj) as usize;
-        if matches!(obj.borrow().kind, ObjectKind::Arguments(_)) {
+        // One look at the exotic kind: an arguments object or a proxy.
+        let (arguments, proxy) = {
+            let body = obj.borrow();
+            (
+                matches!(body.kind, ObjectKind::Arguments(_)),
+                body.kind.proxy().map(|proxy| (proxy.target, proxy.handler)),
+            )
+        };
+        if arguments {
             if let Some(trace) = trace.as_deref_mut() {
                 trace.record(
                     crate::feedback::PropertyOutcome::Exotic,
@@ -12471,7 +12481,7 @@ impl Interp {
         }
         // Proxy: invoke the `set` trap, or forward to the target.
         {
-            if let Some((target, handler)) = proxy_parts(&obj) {
+            if let Some((target, handler)) = proxy {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
                         crate::feedback::PropertyOutcome::Exotic,
@@ -14205,12 +14215,17 @@ impl Interp {
         // A call is a safepoint that polls the interrupt bit, so loop-free recursion in the
         // interpreter and bytecode tiers stays abortable (HTML §8.1.4.5).
         self.interrupt_poll()?;
-        // Proxy with an `apply` trap (or forward to the target): a test of the kind's tag.
-        let proxy = obj
-            .borrow()
-            .kind
-            .proxy()
-            .map(|proxy| (proxy.target, proxy.handler, proxy.callable));
+        // One borrow of the callee for its kind: a copy of its [[Call]], or a proxy's slots (a
+        // proxy with an `apply` trap, or a call of its target).
+        let (call, proxy) = {
+            let body = obj.borrow();
+            (
+                body.kind.clone_callable(),
+                body.kind
+                    .proxy()
+                    .map(|proxy| (proxy.target, proxy.handler, proxy.callable)),
+            )
+        };
         if let Some((target, handler, callable)) = proxy {
             // ProxyCreate step 5 gives a proxy [[Call]] only when its target is callable,
             // and Call step 2 throws before any trap is read (ECMA-262, local e28783d).
@@ -14247,7 +14262,6 @@ impl Interp {
             }
         }
 
-        let call = obj.borrow().kind.clone_callable();
         // A plain call is never constructing (only `new` sets the flag). Clearing it here keeps a
         // wrapper constructor invoked as a function — `Number(x)` — from boxing. `new.target` is
         // likewise cleared so a native constructor called *as a function* during an outer `new`
@@ -17996,35 +18010,37 @@ impl Interp {
             ValueView::Obj(o) => *o,
             _ => return Err(self.throw("TypeError", "value is not a constructor")),
         };
-        // Proxy with a `construct` trap (or forward to the target).
-        {
-            if let Some((target, handler)) = proxy_parts(&obj) {
-                if matches!((handler).view(), ValueView::Null) {
-                    return Err(self.throw("TypeError", "proxy is revoked"));
-                }
-                let Some(trap) =
-                    self.proxy_get_trap(&handler, PROXY_TRAP_CONSTRUCT, "construct")?
-                else {
-                    // Forward to the target's [[Construct]] with the original new.target.
-                    return self.construct_inner(target, args, new_target);
-                };
-                let arr = self.make_array(args.to_vec());
-                let result = self.proxy_call_trap(
-                    PROXY_TRAP_CONSTRUCT,
-                    &trap,
-                    handler,
-                    [target, arr, new_target],
-                )?;
-                // [[Construct]] invariant: the trap must return an Object.
-                if !matches!((result).view(), ValueView::Obj(_)) {
-                    return Err(
-                        self.throw("TypeError", "proxy construct trap returned a non-object")
-                    );
-                }
-                return Ok(result);
+        // One borrow of the callee for its kind: a copy of its [[Call]], or a proxy's slots (a
+        // proxy with a `construct` trap, or a construction of its target).
+        let (call, proxy) = {
+            let body = obj.borrow();
+            (
+                body.kind.clone_callable(),
+                body.kind.proxy().map(|proxy| (proxy.target, proxy.handler)),
+            )
+        };
+        if let Some((target, handler)) = proxy {
+            if matches!((handler).view(), ValueView::Null) {
+                return Err(self.throw("TypeError", "proxy is revoked"));
             }
+            let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_CONSTRUCT, "construct")?
+            else {
+                // Forward to the target's [[Construct]] with the original new.target.
+                return self.construct_inner(target, args, new_target);
+            };
+            let arr = self.make_array(args.to_vec());
+            let result = self.proxy_call_trap(
+                PROXY_TRAP_CONSTRUCT,
+                &trap,
+                handler,
+                [target, arr, new_target],
+            )?;
+            // [[Construct]] invariant: the trap must return an Object.
+            if !matches!((result).view(), ValueView::Obj(_)) {
+                return Err(self.throw("TypeError", "proxy construct trap returned a non-object"));
+            }
+            return Ok(result);
         }
-        let call = obj.borrow().kind.clone_callable();
         match call {
             ObjectKind::Native(_) | ObjectKind::NativeData(_) => {
                 self.construct_native_dispatch(&obj, &call, args, new_target)
