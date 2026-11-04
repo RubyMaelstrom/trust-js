@@ -8964,3 +8964,75 @@ Left for later stages: x86-64's in-line objects; NewObject (literals with spread
 accessor keys: React's 8,746) and NewArray in line; the in-line closure (three cells and the kind
 payload); the deferred prototype's cell; constructions the direct sequence declines (New: chai
 736,167, TypeScript 681,917, RayTrace 332,643, Box2D 110,387), W3's.
+
+### The phase exit's gap, measured (2026-11-04)
+
+A timing snapshot on main 0d724e3d's engine (c90b3889, fat LTO), Crystal, pinned to CPU 5, five
+rounds rotating the engines, at a quiet moment (other load a median 1.02 cores, at most 2.77;
+target/p2/timing/snap-1104), against Node v24.22.2 in full and limited to Sparkplug (node-sp),
+the fixtures' own elapsed_ms (medians):
+
+| fixture | TRust | node-sp | Node | TRust / node-sp | at W3's exit |
+| --- | --- | --- | --- | --- | --- |
+| Vue | 270 | 114 | 111 | 2.37x | 287 |
+| React | 32 | 16 | 18 | 2.00x | 49 |
+| Djot | 95 | 39 | 51 | 2.44x | 110 |
+
+The phase's exit (each fixture within 2x of node-sp) holds for React only, at its edge. Vue needs
+about -16% and Djot about -18%. The stages left in the plan (W2g, W4, W6) are not throughput work
+on these fixtures, but W2g's WeakMap and Proxy paths reach Vue.
+
+Where the time goes (perf, user cycles or instructions sampled; TRUST_JS_PERF_METRICS):
+- Djot: the native compiler is 17.2% of its user cycles (163 compiles, 3.98 MB of code, 24 KB a
+  function, the largest 190 KB; 32-35 ms of compile time in a 110 ms metrics run), and lexing,
+  parsing and bytecode compilation another 14 ms. Of the compiler's cycles, region planning and
+  emission are about 6 points (regions::Plan::build_kind 3.1%, regions::emit 2.1%, dominators),
+  operations::emit 2.9%, ExecutableBuffer::from_bytes 1.6%, finish_with_offsets 1.4%. Its
+  templates are large: per operation, GetPropLocal 497 bytes, CallWithThis 526, GetMethod 460,
+  StrictEq 556, SetProp 828 (region code counts toward a region's head operation).
+- React: 81% of its instructions are in generated code.
+- Vue: 34% in generated code; the runtime's helpers lead: Interp::try_binding_getter 5.0% (the
+  bundler's export accessors), jit_get_prop 3.4%, nf_weak_map_get 2.8% (W2g), jit_call_hit 2.4%,
+  get_member_recv_impl 1.9%, PropKey position scans 1.7%.
+
+Register regions, measured by kind (instructions, fat LTO, CPUs 10-13, pacing off; regions off
+by TRUST_JS_JIT_FAST without bit 32768; acyclic or loop regions off in an experiment build,
+target/p2/djot-compile):
+
+| workload | no regions | no acyclic regions | no loop regions |
+| --- | --- | --- | --- |
+| Vue | +0.84% | +0.22% | +0.42% |
+| React | +13.34% | +0.98% | +15.12% |
+| Djot | -2.37% | -2.14% | -0.59% |
+| chai | +1.06% | -0.14% | -0.15% |
+| Richards | +5.44% | +4.56% | +5.95% |
+| DeltaBlue | +2.04% | +1.01% | -6.60% |
+| Crypto | +122.22% | -0.16% | +104.42% |
+| RayTrace | +0.07% | +0.55% | -0.73% |
+| EarleyBoyer | -3.34% | -1.21% | -1.75% |
+| RegExp | +1.21% | +0.97% | +0.45% |
+| Splay | -1.08% | -0.46% | -0.18% |
+| NavierStokes | +132.00% | +1.37% | +132.53% |
+| PdfJS | +31.68% | -0.37% | +27.17% |
+| Mandreel | +11.97% | -0.07% | +12.33% |
+| Gameboy | +16.81% | +2.94% | +2.81% |
+| CodeLoad | -0.86% | +0.83% | +0.08% |
+| Box2D | -0.06% | -0.74% | -0.73% |
+| zlib | +41.31% | +0.19% | +41.12% |
+| TypeScript | +6.24% | -0.18% | -1.19% |
+
+Regions are a large net gain. Acyclic regions cost Djot 2.1% and EarleyBoyer 1.2% (code that
+does not run enough to repay their compile) and gain Richards 4.6% and Gameboy 2.9%; a loop
+region costs DeltaBlue 6.6%.
+
+What the exemplars do with the same choices (from the plan's earlier surveys): all three compile
+a function to bytecode at its first call (TRust's threshold of 8 tree-walker calls is the
+outlier; at 1, W3's exit measured Djot -8.6%, and TRust's event-loop page +129% because its
+platform functions compile again on each page); their baseline code calls shared IC stubs or
+builtins (Sparkplug, SpiderMonkey's Baseline with CacheIR stubs, JSC's Baseline with shared
+thunks) and leaves in-line fast paths to the optimizing tiers.
+
+Candidates for the exit, beside W2g: the threshold at 1 with TRust's pages reusing their
+compiled platform code; acyclic regions only for code that has run (a recompile when hot), and
+DeltaBlue's loop region; compact baseline templates, with today's in-line templates for hot code
+(the compile's code volume); Vue's binding getters and property-read helpers.
