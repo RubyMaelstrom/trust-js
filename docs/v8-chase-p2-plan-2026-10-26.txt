@@ -13639,12 +13639,16 @@ What the exemplars do:
   metadata table (jit/JIT.cpp:653-658); constants are a pool indexed at run time (JITConstantPool,
   jit/BaselineJITCode.h:60-85). A few operations make a function's code unshareable
   (m_isShareable, jit/JITOpcodes.cpp:1895, 1994). WebKit main, fetched 2026-11-04.
-- V8 compiles bytecode once per source and isolate (the compilation cache) and serializes it in
-  its code cache, which Node and Chrome load instead of compiling (the context snapshot carries
-  the platform's); Sparkplug code is per isolate but compiled from bytecode in one fast pass.
-  [to cite]
-- SpiderMonkey shares a script's immutable data (SharedImmutableScriptData, the stencil) across
-  realms and caches stencils for its chrome code. [to cite]
+- V8 compiles bytecode once per source and isolate: the compilation cache's script table maps a
+  source to its SharedFunctionInfo (CompilationCacheScript::Lookup and Put,
+  src/codegen/compilation-cache.h:48-59), and the code cache serializes compiled bytecode for an
+  embedder to load instead of compiling (CodeSerializer::Serialize and Deserialize,
+  src/snapshot/code-serializer.h:191-222), as Node does for its own JavaScript; Sparkplug's code is
+  per isolate, compiled from that bytecode in one pass. V8 main, fetched 2026-11-05.
+- SpiderMonkey shares a script's immutable data, its bytecode included, among the scripts that
+  compile the same source, by reference count through a table (SharedImmutableScriptData,
+  js/src/vm/SharedStencil.h:636-660, "each pointer from a JSScript counts as one reference plus
+  there may be one reference from the shared script data table"). Firefox main, fetched 2026-11-05.
 
 Two tiers of remedy, to be designed in this order:
 1. Cheaper compiles a page makes anyway: the compact templates (designed above; every first-stage
