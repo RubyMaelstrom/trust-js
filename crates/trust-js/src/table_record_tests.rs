@@ -424,6 +424,113 @@ fn every_side_slot_table_records_its_writes_for_minor_collections() {
     }
 }
 
+/// W6 step 2b: each of the 8 side-slot tables, written from Rust while a marking cycle runs, after
+/// its slices traced the owner's entry: the object written (allocated during the cycle, white)
+/// survives the cycle's final pause through that entry alone, since the final pause registers
+/// the owners the tables recorded during the cycle.
+#[test]
+fn every_side_slot_table_records_its_writes_for_a_cycles_final_pause() {
+    let mut engine = engine(Tier::Interp);
+    eval(&mut engine, "var owner = {}, old = {}; 0");
+    let owner = global_address(&mut engine, "owner");
+    for write in &table_writes() {
+        let old = global_object(&mut engine, "old");
+        let env = engine.interp.global_env;
+        (write.write)(&mut engine.interp, owner.get(), old, env);
+        assert!(engine.interp.gc_start_cycle(), "{}", write.table);
+        // Every slice done: the owner's entry was traced as it stood.
+        engine.interp.gc_slice_to_completion();
+        let (young, young_env) = write_young(&mut engine.interp, write, owner);
+        // An explicit minor request finishes the cycle with its final pause alone.
+        engine.interp.gc_collect_minor();
+        assert!(
+            !engine.interp.gc_heap.core.borrow().cycle_running(),
+            "{}",
+            write.table
+        );
+        let (holds_object, holds_env) = write.holds;
+        assert!(
+            !holds_object || alive(&young),
+            "{}: the object",
+            write.table
+        );
+        assert!(
+            !holds_env || alive(&young_env),
+            "{}: the environment",
+            write.table
+        );
+        (write.remove)(&mut engine.interp, owner.get());
+    }
+}
+
+/// W6 step 2b: a marking cycle's start registers every side-slot owner and every weak collection
+/// (whose entries its slices discover), and its final pause, of the tables and the collections,
+/// only what was written during the cycle: the others' edges fired in the slices or wait in the
+/// marker.
+#[test]
+fn a_cycles_final_pause_reports_what_was_written_during_the_cycle_only() {
+    let mut engine = engine(Tier::Interp);
+    eval(
+        &mut engine,
+        "var written = new Promise(function () {}), clean = new Promise(function () {});
+         var map = new WeakMap(), key = {}, other = {}; map.set(key, {}); map.set(other, {}); 0",
+    );
+    let written = global_address(&mut engine, "written");
+    let clean = global_address(&mut engine, "clean");
+    let map = global_address(&mut engine, "map");
+    assert!(engine.interp.gc_start_cycle());
+    let start = report(&engine);
+    assert_eq!(start.kind, Some(CollectionKind::Major));
+    assert!(listed(written, &start.side_slot_owners), "{start:?}");
+    assert!(listed(clean, &start.side_slot_owners), "{start:?}");
+    assert_eq!(
+        entries_of(map, &start.weak_entries),
+        0,
+        "the start registers the collection, not its entries"
+    );
+    engine.interp.gc_slice_to_completion();
+    let writes = table_writes();
+    let write = writes
+        .iter()
+        .find(|write| write.table == "promises")
+        .expect("the promises table");
+    write_young(&mut engine.interp, write, written);
+    write_weak_entry(&mut engine);
+    engine.interp.gc_collect_minor();
+    assert!(!engine.interp.gc_heap.core.borrow().cycle_running());
+    let last = report(&engine);
+    assert_eq!(last.kind, Some(CollectionKind::Major));
+    assert!(listed(written, &last.side_slot_owners), "{last:?}");
+    assert!(!listed(clean, &last.side_slot_owners), "{last:?}");
+    assert_eq!(entries_of(map, &last.weak_entries), 1, "the entry written: {last:?}");
+}
+
+/// W6 step 2b: the final pause's closure check (heap verification) panics on a side-slot write
+/// during the cycle that the record missed, into an owner whose entry the slices had traced.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "marking cycle: side-slot table promises: marked owner")]
+fn an_unrecorded_side_slot_write_during_a_cycle_fails_the_closure_check() {
+    let mut engine = engine(Tier::Interp);
+    eval(&mut engine, "var p = new Promise(function () {}); 0");
+    let promise = global_address(&mut engine, "p");
+    assert!(engine.interp.gc_start_cycle());
+    engine.interp.gc_slice_to_completion();
+    let writes = table_writes();
+    let write = writes
+        .iter()
+        .find(|write| write.table == "promises")
+        .expect("the promises table");
+    write_young(&mut engine.interp, write, promise);
+    engine
+        .interp
+        .gc_heap
+        .records
+        .borrow_mut()
+        .forget_side_slot_owner(promise.get());
+    engine.interp.gc_collect_minor();
+}
+
 /// The side-slot check panics when an old owner's entry got a young value that the record
 /// missed: a write that bypasses the record.
 #[test]
@@ -546,6 +653,52 @@ fn an_unrecorded_weak_entry_write_fails_the_check() {
         .borrow_mut()
         .forget_weak_entry(map.get(), WeakKey::Object(key.get()));
     engine.interp.gc_collect_minor();
+}
+
+/// W6 step 2b: the final pause's closure check panics on a WeakMap write during the cycle that the
+/// record missed, into a collection whose entries the slices had discovered.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "marking cycle: weak collection")]
+fn an_unrecorded_weak_entry_write_during_a_cycle_fails_the_closure_check() {
+    let mut engine = engine(Tier::Interp);
+    eval(
+        &mut engine,
+        "var map = new WeakMap(), key = {}; map.set(key, {}); 0",
+    );
+    let map = global_address(&mut engine, "map");
+    let key = global_address(&mut engine, "key");
+    assert!(engine.interp.gc_start_cycle());
+    engine.interp.gc_slice_to_completion();
+    // The write runs no safepoint before its record is forgotten: the cycle's final pause is
+    // due, and comes with the explicit request below.
+    write_weak_entry(&mut engine);
+    engine
+        .interp
+        .gc_heap
+        .records
+        .borrow_mut()
+        .forget_weak_entry(map.get(), WeakKey::Object(key.get()));
+    engine.interp.gc_collect_minor();
+}
+
+/// Set the entry of the WeakMap the global `map` holds under the object the global `key` holds to
+/// a new object, from Rust (no safepoint), in a frame of its own.
+#[inline(never)]
+fn write_weak_entry(engine: &mut Engine) {
+    let young = engine.interp.new_object();
+    let map = global_object(engine, "map");
+    let key = global_object(engine, "key");
+    let target = crate::interpreter::WeakTarget::of(&Value::Obj(key)).expect("an object key");
+    let owner = Gc::as_ptr(&map) as usize;
+    let heap = engine.interp.gc_heap.clone();
+    let mut object = map.borrow_mut();
+    match &mut object.kind {
+        crate::value::ObjectKind::WeakCollection(data) => {
+            data.put(&heap, owner, &target, Value::Obj(young));
+        }
+        _ => panic!("map: not a WeakMap"),
+    }
 }
 
 // ---------------------------------------------------------------------------------------------

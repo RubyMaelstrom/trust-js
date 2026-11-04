@@ -564,11 +564,33 @@ impl HostGcVisitor for HostGraph {
     }
 }
 
+/// Which marking a [`Marking`] reports for (W6 step 2b): a collection's in one pause, or a
+/// marking cycle's start or final pause, whose kind is major.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Purpose {
+    /// A collection's marking, of the client's kind: a major one reports every table in full, a
+    /// minor one what the tables recorded since the last collection.
+    Collection,
+    /// A marking cycle's start: every table as a major collection's start, but for the weak
+    /// collections, reported as side-slot owners whose entries the cycle discovers once it marks
+    /// them ([`crate::gc_core::MarkClient::discovered_ephemerons`]).
+    CycleStart,
+    /// A marking cycle's final pause: the roots and the host graphs in full, of the tables what
+    /// they recorded during the cycle (its start consumed the records before), and every Realm
+    /// group and ShadowRealm again.
+    FinalPause,
+}
+
 /// The [`crate::gc_core::MarkClient`] of one collection over a ShadowRealm tree.
 struct Marking<'a> {
     /// A minor collection's client reports what the tables recorded instead of the tables (see
     /// [`ClientRecords`]).
     kind: CollectionKind,
+    /// The marking it reports for: a collection's, or a cycle's start or final pause (W6).
+    purpose: Purpose,
+    /// The weak collections whose side slots a cycle's start or final pause traced, whose
+    /// entries it reports next ([`crate::gc_core::MarkClient::discovered_ephemerons`]).
+    discovered: RefCell<Vec<usize>>,
     /// Root first, then descendants in stable creation/topological order.
     interps: Vec<&'a Interp>,
     /// Parallel to `interps`.
@@ -598,7 +620,7 @@ struct Marking<'a> {
 impl<'a> Marking<'a> {
     /// Out of line: its frames must be dead (and scrubbed) before the native stack is scanned.
     #[inline(never)]
-    fn new(root: &'a Interp, kind: CollectionKind) -> Self {
+    fn new(root: &'a Interp, kind: CollectionKind, purpose: Purpose) -> Self {
         let pointers = root
             .gc_heap
             .agent
@@ -642,9 +664,10 @@ impl<'a> Marking<'a> {
                 // A minor collection keeps every cell an earlier collection marked: a group
                 // whose global object one marked is active from the start, and the global
                 // object, marked already, stands for its members (it activates the group at
-                // once). The members of the others are its members.
+                // once). The members of the others are its members. So does a cycle's final
+                // pause, whose marks are the cycle's: it traces each active group again.
                 let global = Gc::as_ptr(&realm.global) as usize;
-                if kind == CollectionKind::Minor
+                if (kind == CollectionKind::Minor || purpose == Purpose::FinalPause)
                     && core.cell_age(global as u64) == Some(crate::gc_core::CellAge::Old)
                 {
                     realm_members.entry(global).or_default().push((index, key));
@@ -666,6 +689,8 @@ impl<'a> Marking<'a> {
         }
         Marking {
             kind,
+            purpose,
+            discovered: RefCell::default(),
             interps,
             hosts,
             shadow_owners,
@@ -704,6 +729,16 @@ impl<'a> Marking<'a> {
                 )
             })
             .collect()
+    }
+}
+
+/// W6 step 2b: what a collection's marking of `kind` reports for: a major one while a cycle
+/// marks is the cycle's final pause.
+fn marking_purpose(heap: &crate::value::GcState, kind: CollectionKind) -> Purpose {
+    if kind == CollectionKind::Major && heap.core.borrow().cycle_running() {
+        Purpose::FinalPause
+    } else {
+        Purpose::Collection
     }
 }
 
@@ -761,11 +796,7 @@ impl Marking<'_> {
         #[cfg(debug_assertions)]
         self.traced.borrow_mut().insert(index);
         let interp = self.interps[index];
-        interp.trace_gc_roots(words);
-        interp
-            .computed_reads
-            .trace_pins(words, self.kind, interp.gc_heap.markings());
-        interp.trace_cache_roots(self.kind, words);
+        interp.trace_own_roots(self.kind, words);
         let mut host = self.hosts[index].borrow_mut();
         for &root in &host.roots {
             words.word(root);
@@ -775,6 +806,223 @@ impl Marking<'_> {
         for target in reached {
             words.word(target as u64);
         }
+    }
+
+    /// W6 step 2b: the Realm groups as a cycle's start found them, and those it activated, for
+    /// its slices (`GcState::cycle_realms`).
+    fn cycle_realms(&self) -> CycleRealms {
+        let members = self
+            .realm_members
+            .iter()
+            .map(|(&member, groups)| (member, groups.iter().map(|&(_, key)| key).collect()))
+            .collect();
+        let activated = self
+            .activated_realms
+            .borrow()
+            .iter()
+            .map(|&(_, key)| key)
+            .collect();
+        CycleRealms { members, activated }
+    }
+
+    /// W6 step 2b, heap verification once a cycle's final pause has marked
+    /// ([`crate::gc_core::MarkClient::check_closure`]): beside each interpreter's tables (see
+    /// `Interp::check_side_slots_closed`), a Realm group with a marked member is marked whole,
+    /// with its template map, and a marked ShadowRealm's interpreter roots are marked.
+    fn verify_closure(&self, heap: &crate::gc_core::Heap) {
+        let check = |what: &str, word: u64| {
+            if let Some(age @ (CellAge::Young | CellAge::Dead)) = heap.cell_age(word) {
+                panic!(
+                    "marking cycle: {what} holds an unmarked ({age:?}) cell {word:#x} after the \
+                     final pause"
+                );
+            }
+        };
+        let marked = |word: u64| heap.cell_age(word) == Some(CellAge::Old);
+        for (index, interp) in self.interps.iter().enumerate() {
+            interp.check_side_slots_closed(heap);
+            interp.check_weak_entries_closed(heap);
+            interp.check_native_realms_closed(heap);
+            for (&key, realm) in &interp.realms {
+                let mut members = Vec::new();
+                realm.trace_gc(&mut WordSink(&mut |word| members.push(word)));
+                if !members.iter().any(|&word| marked(word)) {
+                    continue;
+                }
+                for &word in &members {
+                    check("a Realm group with a marked member", word);
+                }
+                for &word in self.templates.get(&(index, key)).into_iter().flatten() {
+                    check("the template map of a Realm group with a marked member", word);
+                }
+            }
+        }
+        for (&owner, &index) in &self.shadow_owners {
+            if marked(owner as u64) {
+                self.interps[index].trace_gc_roots(&mut WordSink(&mut |word| {
+                    check("a marked ShadowRealm's interpreter", word)
+                }));
+            }
+        }
+    }
+}
+
+/// W6 step 2b: report the entries of the weak collections at `discovered`, those whose side slots
+/// a cycle's client traced, as ephemerons ([`crate::gc_core::MarkClient::discovered_ephemerons`]),
+/// skipping an address no interpreter registers as a collection.
+fn report_discovered(
+    interps: &[&Interp],
+    discovered: Vec<usize>,
+    sink: &mut crate::gc_core::EdgeSink<'_>,
+) {
+    let mut edges = EdgeReporter {
+        sink,
+        #[cfg(test)]
+        report: ClientReport::default(),
+    };
+    for owner in discovered {
+        if !interps
+            .iter()
+            .any(|interp| interp.weak_collections.contains(&owner))
+        {
+            continue;
+        }
+        // SAFETY: a registered collection's address names an allocated object, which nothing
+        // writes while the collector marks.
+        unsafe {
+            crate::weak_metadata::with_weak_collection(owner, |data| {
+                for (key, value) in data.iter() {
+                    edges.weak_entry(owner, key, value);
+                }
+            })
+        };
+    }
+}
+
+/// W6 step 2b: what a marking cycle's clients share from its start to its final pause
+/// (`GcState::cycle_realms`): the Realm groups' members as the start found them, each with its
+/// group's Realm key (its global object's address, which names one Realm of the tree while the
+/// cycle runs, since no cell is freed before its final pause), and the groups activated since.
+/// A slice's client activates a group once in the cycle; the final pause traces every active
+/// group again, from its own client.
+#[derive(Default)]
+pub(crate) struct CycleRealms {
+    members: FastMap<usize, Vec<usize>>,
+    activated: FastSet<usize>,
+}
+
+/// W6 step 2b: the client of a marking cycle's slice (`Interp::gc_heap_slice`), built for that
+/// slice over the tree's interpreters as they are at its safepoint. The heap asks it only for the
+/// side slots of the owners the slice marks and for the entries of the weak collections among
+/// them. It traces an owner's side-slot tables, a ShadowRealm's home and interpreter roots and a
+/// Realm group as a major collection's client does, and discovers a weak collection's entries.
+/// It reports no root and no host graph (an embedder's), which the cycle's start and final pause
+/// report in full, as V8 marks the embedder's roots again at its final pause.
+struct SliceMarking<'a> {
+    interps: Vec<&'a Interp>,
+    /// ShadowRealm object -> the index of its realm's interpreter.
+    shadow_owners: FastMap<usize, usize>,
+    realms: &'a RefCell<CycleRealms>,
+    activated_homes: RefCell<FastSet<usize>>,
+    discovered: RefCell<Vec<usize>>,
+}
+
+impl<'a> SliceMarking<'a> {
+    #[inline(never)]
+    fn new(root: &'a Interp) -> Self {
+        let pointers = root
+            .gc_heap
+            .agent
+            .access
+            .shared_snapshot(root.realm_id, root);
+        let mut interps = Vec::with_capacity(pointers.len());
+        let mut shadow_owners = FastMap::default();
+        for (_, pointer) in pointers {
+            // SAFETY: as in `Marking::new`: the slice's current lease refreshes the requester,
+            // every other active participant published its current borrow at suspension, and
+            // the references end with the slice.
+            let interp = unsafe { &*pointer };
+            if let Some(home) = &interp.shadow_home {
+                let owner = home
+                    .owner
+                    .upgrade()
+                    .expect("a registered realm has a live owner cell");
+                shadow_owners.insert(Gc::as_ptr(&owner) as usize, interps.len());
+            }
+            interps.push(interp);
+        }
+        SliceMarking {
+            interps,
+            shadow_owners,
+            realms: &root.gc_heap.cycle_realms,
+            activated_homes: RefCell::default(),
+            discovered: RefCell::default(),
+        }
+    }
+
+    fn trace_home(&self, index: usize, words: &mut dyn GcSink) {
+        let Some(home) = &self.interps[index].shadow_home else {
+            return;
+        };
+        if self.activated_homes.borrow_mut().insert(index) {
+            home.route.trace_gc(words);
+        }
+    }
+}
+
+impl crate::gc_core::MarkClient for SliceMarking<'_> {
+    // A slice marks from its worklist alone: the heap asks for no root and no owner.
+    fn roots(&self, _: &mut dyn FnMut(u64)) {}
+    fn side_slot_owners(&self, _: &mut dyn FnMut(usize)) {}
+    fn ephemerons(&self, _: &mut crate::gc_core::EdgeSink<'_>) {}
+
+    fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64)) {
+        let mut words = WordSink(sink);
+        if let Some(&index) = self.shadow_owners.get(&owner) {
+            self.trace_home(index, &mut words);
+            // An entered realm's roots are roots, at the cycle's start and its final pause.
+            let interp = self.interps[index];
+            if !interp.shadow_entered() {
+                interp.trace_own_roots(CollectionKind::Major, &mut words);
+            }
+        }
+        for (index, interp) in self.interps.iter().enumerate() {
+            if interp.gc_pins.contains_key(&owner) {
+                self.trace_home(index, &mut words);
+            }
+            interp.trace_owner_slots_in_slice(owner, &mut words);
+            if interp.weak_collections.contains(&owner) {
+                self.discovered.borrow_mut().push(owner);
+            }
+        }
+        // A Realm group the cycle's start found, once in the cycle (a Realm made since is the
+        // final pause's).
+        let keys: Vec<usize> = {
+            let mut realms = self.realms.borrow_mut();
+            let CycleRealms { members, activated } = &mut *realms;
+            members
+                .get(&owner)
+                .into_iter()
+                .flatten()
+                .copied()
+                .filter(|&key| activated.insert(key))
+                .collect()
+        };
+        for key in keys {
+            for (index, interp) in self.interps.iter().enumerate() {
+                if let Some(realm) = interp.realms.get(&key) {
+                    // A child global/intrinsic may be retained directly (AddToKeptObjects).
+                    self.trace_home(index, &mut words);
+                    realm.trace_gc(&mut words);
+                    interp.trace_realm_templates(key, &mut words);
+                }
+            }
+        }
+    }
+
+    fn discovered_ephemerons(&self, sink: &mut crate::gc_core::EdgeSink<'_>) {
+        let discovered = std::mem::take(&mut *self.discovered.borrow_mut());
+        report_discovered(&self.interps, discovered, sink);
     }
 }
 
@@ -833,8 +1081,8 @@ impl crate::gc_core::MarkClient for Marking<'_> {
             }
         }
         let mut noted = Noted::default();
-        match self.kind {
-            CollectionKind::Major => {
+        match (self.kind, self.purpose) {
+            (CollectionKind::Major, Purpose::Collection | Purpose::CycleStart) => {
                 for interp in &self.interps {
                     interp.for_each_side_slot_owner(&mut |owner| noted.note(owner));
                     // Owner pins are callback identities, not roots. Full collections census
@@ -845,8 +1093,10 @@ impl crate::gc_core::MarkClient for Marking<'_> {
                 }
             }
             // The owners whose entries were written since the last collection, the young ones
-            // among them (see `SideSlotTable`).
-            CollectionKind::Minor => {
+            // among them (see `SideSlotTable`); at a cycle's final pause, those written during
+            // the cycle: its start registered the others, whose edges wait in the marker or
+            // fired with the slots as they are.
+            (CollectionKind::Minor, _) | (CollectionKind::Major, Purpose::FinalPause) => {
                 for &owner in &self.records().side_slot_owners {
                     noted.note(owner);
                 }
@@ -854,6 +1104,15 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         }
         #[cfg(test)]
         self.report(|report| report.side_slot_owners = noted.list.clone());
+        // A cycle's start registers the weak collections as owners: marking one brings its
+        // entries (`discovered_ephemerons`).
+        if self.purpose == Purpose::CycleStart {
+            for interp in &self.interps {
+                for &owner in &interp.weak_collections {
+                    noted.note(owner);
+                }
+            }
+        }
         for &owner in self.shadow_owners.keys() {
             noted.note(owner);
         }
@@ -886,12 +1145,17 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         // owner's others hold cells that collection marked (see `ClientRecords`).
         let slots =
             self.kind == CollectionKind::Major || self.records().side_slot_owners.contains(&owner);
+        let cycle = self.purpose != Purpose::Collection;
         for (index, interp) in self.interps.iter().enumerate() {
             if interp.gc_pins.contains_key(&owner) {
                 self.trace_home(index, &mut words);
             }
             if slots {
                 interp.trace_owner_slots(owner, &mut words);
+            }
+            // A cycle discovers a weak collection's entries once it marks the collection.
+            if cycle && interp.weak_collections.contains(&owner) {
+                self.discovered.borrow_mut().push(owner);
             }
         }
         for &(index, key) in self.realm_members.get(&owner).into_iter().flatten() {
@@ -922,19 +1186,23 @@ impl crate::gc_core::MarkClient for Marking<'_> {
             #[cfg(test)]
             report: ClientReport::default(),
         };
-        match self.kind {
-            CollectionKind::Major => {
+        match (self.kind, self.purpose) {
+            (CollectionKind::Major, Purpose::Collection | Purpose::CycleStart) => {
                 for (interp, host) in self.interps.iter().zip(&self.hosts) {
-                    for &owner in &interp.weak_collections {
-                        // SAFETY: a registered collection's address names an allocated object,
-                        // which nothing writes while the collector marks.
-                        unsafe {
-                            crate::weak_metadata::with_weak_collection(owner, |data| {
-                                for (key, value) in data.iter() {
-                                    edges.weak_entry(owner, key, value);
-                                }
-                            })
-                        };
+                    // A cycle's start reports the weak collections as side-slot owners instead,
+                    // and discovers their entries as it marks them.
+                    if self.purpose == Purpose::Collection {
+                        for &owner in &interp.weak_collections {
+                            // SAFETY: a registered collection's address names an allocated
+                            // object, which nothing writes while the collector marks.
+                            unsafe {
+                                crate::weak_metadata::with_weak_collection(owner, |data| {
+                                    for (key, value) in data.iter() {
+                                        edges.weak_entry(owner, key, value);
+                                    }
+                                })
+                            };
+                        }
                     }
                     for (&function, &(_, realm)) in interp.native_function_realms.borrow().iter() {
                         edges.realm(function, realm);
@@ -942,7 +1210,9 @@ impl crate::gc_core::MarkClient for Marking<'_> {
                     edges.host(host);
                 }
             }
-            CollectionKind::Minor => {
+            // A minor collection, and a cycle's final pause, whose start registered every
+            // collection, entry and function then: what was written since.
+            (CollectionKind::Minor, _) | (CollectionKind::Major, Purpose::FinalPause) => {
                 let records = self.records();
                 // The entries written since the last collection, those of young keys among them
                 // (see `weak_metadata::WeakCollection`), each in its collection, which an
@@ -986,6 +1256,15 @@ impl crate::gc_core::MarkClient for Marking<'_> {
             report.weak_entries = edges.report.weak_entries;
             report.realm_edges = edges.report.realm_edges;
         });
+    }
+
+    fn discovered_ephemerons(&self, sink: &mut crate::gc_core::EdgeSink<'_>) {
+        let discovered = std::mem::take(&mut *self.discovered.borrow_mut());
+        report_discovered(&self.interps, discovered, sink);
+    }
+
+    fn check_closure(&self, heap: &crate::gc_core::Heap) {
+        self.verify_closure(heap);
     }
 
     fn check_records(&self, heap: &crate::gc_core::Heap) {
@@ -1253,11 +1532,13 @@ impl Interp {
     }
 
     /// W6: start a marking cycle over the whole Agent heap from this interpreter's safepoint
-    /// (design 6): the client, built as a major collection builds it, reports the roots, and the
-    /// heap marks them and the native stack and runs the cycle's first slice; the side tables and
-    /// the ephemerons wait for the final pause. This marking consumes the tables' and the
-    /// handles' records, as a collection's does: what is written from now on is recorded for the
-    /// final pause. Deferred as a collection is.
+    /// (design 6): the client, built as a major collection builds it, reports the roots and the
+    /// side tables' conditional edges (step 2b: the weak collections as owners, whose entries
+    /// the slices discover), and the heap marks the roots and the native stack and runs the
+    /// cycle's first slice. This marking consumes the tables' and the handles' records, as a
+    /// collection's does: what is written from now on is recorded for the final pause. The
+    /// Realm groups the client found stay for the slices (`GcState::cycle_realms`). Deferred as a
+    /// collection is.
     #[cold]
     #[inline(never)]
     fn gc_heap_start_cycle(
@@ -1273,7 +1554,7 @@ impl Interp {
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
         self.gc_evict_young_cache_keys();
-        let marking = Marking::new(self, CollectionKind::Major);
+        let marking = Marking::new(self, CollectionKind::Major, Purpose::CycleStart);
         // Building the client enumerated Realm members and host values in frames below this
         // one, which the marker's frames reuse (see `gc_heap_mark`).
         #[cfg(not(target_arch = "wasm32"))]
@@ -1287,6 +1568,7 @@ impl Interp {
         }
         heap.records.borrow_mut().consume();
         heap.handles.consume();
+        *heap.cycle_realms.borrow_mut() = marking.cycle_realms();
         drop(marking);
         if let Some(started) = log_started {
             self.gc_log_slice(heap, cause, "start", 0, started);
@@ -1298,8 +1580,9 @@ impl Interp {
     }
 
     /// W6: a slice of the running cycle's marking (design 4), from this interpreter's
-    /// safepoint: no client, no root and no stack, the marker's worklist alone. Deferred as a
-    /// collection is.
+    /// safepoint: no root and no stack, the marker's worklist alone, with a client built for the
+    /// slice that traces the side slots of the owners it marks (step 2b, `SliceMarking`).
+    /// Deferred as a collection is.
     #[cold]
     #[inline(never)]
     fn gc_heap_slice(
@@ -1312,7 +1595,8 @@ impl Interp {
         let _collecting = crate::agent_control::Collecting(heap.clone());
         let performance_started = crate::value::gc_performance_metrics_start();
         let log_started = gc_log().then(std::time::Instant::now);
-        let Some(marked) = crate::value::slice_agent_heap(heap) else {
+        let client = SliceMarking::new(self);
+        let Some(marked) = crate::value::slice_agent_heap(heap, &client) else {
             heap.agent.request(heap, None);
             return CollectionOutcome::Deferred;
         };
@@ -1366,6 +1650,23 @@ impl Interp {
         outcome == crate::agent_control::CollectionOutcome::Marked
     }
 
+    /// W6 (tests): slice the running cycle until its worklist runs out, so that its final pause
+    /// is due (at the next safepoint, or an explicit collection's).
+    #[cfg(test)]
+    pub(crate) fn gc_slice_to_completion(&mut self) {
+        let complete = |interp: &Self| {
+            let progress = interp.gc_heap.core.borrow().cycle_progress();
+            progress.expect("a running cycle").5
+        };
+        for _ in 0..10_000_000 {
+            if complete(self) {
+                return;
+            }
+            assert!(self.gc_slice(), "a slice of the running cycle");
+        }
+        panic!("the cycle's worklist never ran out");
+    }
+
     /// W6 (tests): run a slice of the running cycle now. False when none runs.
     #[cfg(test)]
     pub(crate) fn gc_slice(&mut self) -> bool {
@@ -1390,11 +1691,12 @@ impl Interp {
     pub(crate) fn gc_collect_precise_for_test(&mut self, kind: CollectionKind) {
         let heap = self.gc_heap.clone();
         self.gc_evict_young_cache_keys();
-        let marking = Marking::new(self, kind);
+        let marking = Marking::new(self, kind, marking_purpose(&heap, kind));
         heap.handles.set_collecting(true);
         assert!(crate::value::mark_agent_heap(&heap, false, &marking, kind));
         heap.records.borrow_mut().consume();
         heap.handles.consume();
+        heap.cycle_realms.take();
         let native = marking.into_native_graphs();
         self.gc_heap_sweep(&heap, native, kind);
         crate::value::gc_finish_generation(&heap);
@@ -1410,7 +1712,8 @@ impl Interp {
         kind: CollectionKind,
     ) -> Option<FastMap<usize, NativeGcGraph>> {
         self.gc_evict_young_cache_keys();
-        let marking = timed(EngineStep::Client, || Marking::new(self, kind));
+        let purpose = marking_purpose(heap, kind);
+        let marking = timed(EngineStep::Client, || Marking::new(self, kind, purpose));
         // Building the client just enumerated every Realm member and host value, dead or
         // alive, in frames below this one; the marker's frames reuse that region.
         #[cfg(not(target_arch = "wasm32"))]
@@ -1445,6 +1748,9 @@ impl Interp {
             // included, is recorded for the next one.
             heap.records.borrow_mut().consume();
             heap.handles.consume();
+            if purpose == Purpose::FinalPause {
+                heap.cycle_realms.take();
+            }
             marking.into_native_graphs()
         })
     }
@@ -1641,6 +1947,132 @@ impl Interp {
         gc_side_slot_tables!(slots);
         if let Some(coroutine) = self.generators.get(&owner) {
             GcTrace::trace_gc(coroutine, sink);
+        }
+    }
+
+    /// The roots this interpreter holds itself, as a marking of `kind` traces them; its host's
+    /// are its host graph's (`Marking::trace_interp_roots`).
+    fn trace_own_roots(&self, kind: CollectionKind, words: &mut dyn GcSink) {
+        self.trace_gc_roots(words);
+        self.computed_reads
+            .trace_pins(words, kind, self.gc_heap.markings());
+        self.trace_cache_roots(kind, words);
+    }
+
+    /// W6 step 2b: [`Interp::trace_owner_slots`] for a marking cycle's slices (`SliceMarking`), a
+    /// copy of its own: with the slices as its second caller, LTO stopped inlining the walk into a
+    /// collection's client (`Marking::trace_side_slots`), which takes it for every marked owner,
+    /// and a collection's side phase grew by a third (W6 step 2b's record).
+    fn trace_owner_slots_in_slice(&self, owner: usize, sink: &mut dyn GcSink) {
+        macro_rules! slots {
+            ($($table:ident),+ $(,)?) => {
+                $(if let Some(slots) = self.$table.get(&owner) {
+                    slots.trace_gc(sink);
+                })+
+            };
+        }
+        gc_side_slot_tables!(slots);
+        if let Some(coroutine) = self.generators.get(&owner) {
+            GcTrace::trace_gc(coroutine, sink);
+        }
+    }
+
+    /// W6 step 2b: the values of the Realm `realm`'s [[TemplateMap]] (GetTemplateObject's), as a
+    /// slice activates the Realm's group (`SliceMarking::trace_side_slots`).
+    fn trace_realm_templates(&self, realm: usize, words: &mut dyn GcSink) {
+        for (&(of, _), value) in &self.template_cache {
+            if of == realm {
+                if let Some(word) = value_word(value) {
+                    words.word(word);
+                }
+            }
+        }
+    }
+
+    /// W6 step 2b, heap verification once a cycle's final pause has marked
+    /// (`Marking::verify_closure`): every side slot of a marked owner, in the tables, the
+    /// generators and, in a ShadowRealm's interpreter, the route its pins keep, names a marked
+    /// cell. The final pause registered only the owners written during the cycle: this catches a
+    /// write its records missed. Panics naming the table, the owner and the value.
+    fn check_side_slots_closed(&self, heap: &crate::gc_core::Heap) {
+        let check = |table: &str, owner: usize, slots: &dyn GcTrace| {
+            if heap.cell_age(owner as u64) != Some(CellAge::Old) {
+                return;
+            }
+            slots.trace_gc(&mut WordSink(&mut |value| {
+                if let Some(age @ (CellAge::Young | CellAge::Dead)) = heap.cell_age(value) {
+                    panic!(
+                        "marking cycle: side-slot table {table}: marked owner {owner:#x} holds an \
+                         unmarked ({age:?}) value {value:#x} after the final pause: a write its \
+                         records missed"
+                    );
+                }
+            }));
+        };
+        macro_rules! tables {
+            ($($table:ident),+ $(,)?) => {
+                $(for (&owner, slots) in self.$table.iter() {
+                    check(stringify!($table), owner, slots);
+                })+
+            };
+        }
+        gc_side_slot_tables!(tables);
+        if let Some(home) = &self.shadow_home {
+            for &owner in self.gc_pins.keys() {
+                check("native owner route", owner, &*home.route);
+            }
+        }
+        for (&owner, coroutine) in self.generators.iter() {
+            check("generators", owner, coroutine);
+        }
+    }
+
+    /// W6 step 2b, heap verification once a cycle's final pause has marked: every entry of a
+    /// marked WeakMap or WeakSet under a marked key holds a marked value. Panics naming the
+    /// collection, the key and the value.
+    fn check_weak_entries_closed(&self, heap: &crate::gc_core::Heap) {
+        for &owner in &self.weak_collections {
+            if heap.cell_age(owner as u64) != Some(CellAge::Old) {
+                continue;
+            }
+            let check = |data: &crate::weak_metadata::WeakCollection| {
+                for (target, value) in data.iter() {
+                    let Some(key) = target.upgrade().as_ref().and_then(Value::cell_word) else {
+                        continue;
+                    };
+                    if heap.cell_age(key) != Some(CellAge::Old) {
+                        continue;
+                    }
+                    let age = value_word(value).and_then(|value| Some((value, heap.cell_age(value)?)));
+                    if let Some((value, age @ (CellAge::Young | CellAge::Dead))) = age {
+                        panic!(
+                            "marking cycle: weak collection {owner:#x}: the entry under marked \
+                             key {key:#x} holds an unmarked ({age:?}) value {value:#x} after the \
+                             final pause: a write its records missed"
+                        );
+                    }
+                }
+            };
+            // SAFETY: a registered collection's address names an allocated object, which nothing
+            // writes while the collection marks.
+            unsafe { crate::weak_metadata::with_weak_collection(owner, check) };
+        }
+    }
+
+    /// W6 step 2b, heap verification once a cycle's final pause has marked: a marked built-in's
+    /// [[Realm]] is marked. Panics naming the function and the Realm.
+    fn check_native_realms_closed(&self, heap: &crate::gc_core::Heap) {
+        for (&function, &(_, realm)) in self.native_function_realms.borrow().iter() {
+            if heap.cell_age(function as u64) != Some(CellAge::Old) {
+                continue;
+            }
+            if let Some(age @ (CellAge::Young | CellAge::Dead)) = heap.cell_age(realm as u64) {
+                panic!(
+                    "marking cycle: native_function_realms: marked function {function:#x} has an \
+                     unmarked ({age:?}) [[Realm]] {realm:#x} after the final pause: a \
+                     registration its records missed"
+                );
+            }
         }
     }
 

@@ -3313,6 +3313,9 @@ pub(crate) struct GcState {
     /// W6: the closure mark stamp of the marking cycle running ([`start_agent_cycle`]), which
     /// its slices and its final pause trace closures with; 0 while none runs.
     cycle_closure_stamp: Cell<u64>,
+    /// W6 step 2b: the Realm groups of the marking cycle running, as its start found them, for
+    /// its slices' clients (`gc_collect::CycleRealms`); empty while none runs.
+    pub(crate) cycle_realms: RefCell<crate::interpreter::gc_collect::CycleRealms>,
     /// [`array_length_shape`]'s memo, per capacity class (0 until made).
     array_length_shapes: [Cell<u32>; 3],
     array_length_layout: RefCell<Option<PropertyLayout>>,
@@ -5307,6 +5310,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         young_closure_functions: RefCell::default(),
         closure_functions_judged: Cell::new(0),
         cycle_closure_stamp: Cell::new(0),
+        cycle_realms: RefCell::default(),
         array_length_shapes: Default::default(),
         array_length_layout: RefCell::default(),
         live: LiveCount::new(0),
@@ -5540,13 +5544,16 @@ pub(crate) fn start_agent_cycle(
     started
 }
 
-/// W6: a slice of `heap`'s running cycle ([`crate::gc_core::Heap::slice`]), marking with its
-/// stamp: the bytes it marked, or `None` when it was deferred.
-pub(crate) fn slice_agent_heap(heap: &GcState) -> Option<usize> {
+/// W6: a slice of `heap`'s running cycle ([`crate::gc_core::Heap::slice`]) with the slice's
+/// `client`, marking with the cycle's stamp: the bytes it marked, or `None` when it was deferred.
+pub(crate) fn slice_agent_heap(
+    heap: &GcState,
+    client: &dyn crate::gc_core::MarkClient,
+) -> Option<usize> {
     let stamp = heap.cycle_closure_stamp.get();
     debug_assert_ne!(stamp, 0, "a slice of a running cycle");
     CLOSURE_MARK_STAMP.with(|current| current.set(stamp));
-    let marked = heap.core.borrow_mut().slice();
+    let marked = heap.core.borrow_mut().slice(client);
     CLOSURE_MARK_STAMP.with(|current| current.set(0));
     marked
 }

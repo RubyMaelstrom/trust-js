@@ -1414,6 +1414,14 @@ pub(crate) trait MarkClient {
     fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64));
     /// Ephemeron entries kept in side tables (WeakMap/WeakSet data).
     fn ephemerons(&self, sink: &mut EdgeSink<'_>);
+    /// W6 step 2b, a marking cycle's clients: the entries of the weak collections whose side
+    /// slots the heap asked for since the last call, reported as [`MarkClient::ephemerons`]
+    /// reports them. A cycle's start reports each weak collection as a side-slot owner instead
+    /// of its entries, and the cycle discovers the entries once it marks the collection, as V8
+    /// discovers an ephemeron table's entries when its marker visits the table
+    /// (src/heap/marking-visitor-inl.h:696-753). The cycle asks whenever its marking runs out of
+    /// work, and before a slice ends.
+    fn discovered_ephemerons(&self, _sink: &mut EdgeSink<'_>) {}
     /// Heap verification, as each collection starts (beside the write barrier's check, before
     /// any mark is cleared): check what the embedder recorded since the last collection against
     /// that collection's marks, read with [`Heap::cell_age`], and panic on a violation. A minor
@@ -1421,6 +1429,12 @@ pub(crate) trait MarkClient {
     /// 10d): an old owner whose entries were not written holds old values, which the last
     /// collection traced.
     fn check_records(&self, _heap: &Heap) {}
+    /// W6 step 2b, heap verification once a cycle's final pause has marked: every side-table edge
+    /// of a marked owner and every ephemeron of a marked collection under a marked key names a
+    /// marked cell, read with [`Heap::cell_age`]; panic on a violation. A final pause's client
+    /// reports only what the program wrote during the cycle (its records), so this catches a
+    /// write the records missed.
+    fn check_closure(&self, _heap: &Heap) {}
 }
 
 /// What the marks say of an allocated cell between collections, and as one starts before its
@@ -3614,11 +3628,12 @@ impl Heap {
 
     /// The rest of a cycle's final pause after its begin, as a collection's marking does it in
     /// `mark_phase`: mark the client's roots and the native stack, add the side tables'
-    /// conditional edges and owners, drain, and with heap verification check the marked graph.
-    /// A copy, not shared with `mark_phase`, which drains through the cycle's `drain_within`:
-    /// with the two sharing their code, LTO compiled the engine's object and string paths and the
-    /// collections' marking differently (W6 step 2's record), so a collection's marking stays as
-    /// it was.
+    /// conditional edges and owners (the final pause's client reports those written during the
+    /// cycle, step 2b), drain, with the weak collections' discovered entries, and with heap
+    /// verification check the marked graph and the side tables' closure. A copy, not shared with
+    /// `mark_phase`, which drains through the cycle's `drain_within`: with the two sharing their
+    /// code, LTO compiled the engine's object and string paths and the collections' marking
+    /// differently (W6 step 2's record), so a collection's marking stays as it was.
     #[inline(always)]
     fn mark_from_roots(
         &mut self,
@@ -3643,26 +3658,15 @@ impl Heap {
             m.source = MarkSource::Root;
         }
         self.add_source_edges(&mut m, client);
-        client.side_slot_owners(&mut |owner| {
-            // An owner outside this heap is not a condition: its slots are traced now.
-            let condition = self.locate(owner as u64);
-            self.add_edge(
-                CondEdge {
-                    owner: condition,
-                    key: None,
-                    value: EdgeValue::SideSlots(owner),
-                    fired: false,
-                },
-                &mut m,
-                client,
-            );
-        });
+        self.add_side_slot_owners(&mut m, client);
         self.phase_done(Phase::Side, clock);
-        // The cycle's drain, without a budget: `drain` keeps its one caller, `mark_phase`.
+        // The cycle's drain, without a budget (its discovery of the weak collections' entries
+        // included): `drain` keeps its one caller, `mark_phase`.
         self.drain_within(&mut m, client, SliceBudget::Unbounded);
         self.phase_done(Phase::Drain, clock);
         if self.verifies() {
             self.verify(&m);
+            client.check_closure(self);
         }
         #[cfg(test)]
         if let Some(parents) = m.parents.take() {
@@ -3672,10 +3676,10 @@ impl Heap {
 
     /// W6: start a marking cycle (design 6), at a safepoint: with heap verification, the write
     /// barrier's and the records' checks; then clear every mark and card, as a major
-    /// collection's marking starts, mark the client's roots and the native stack, and run the
-    /// cycle's first slice. The side tables' conditional edges and the ephemerons wait for the
-    /// final pause, which reports them in full. Deferred as a collection is (a deferred start
-    /// makes a major collection due); false then.
+    /// collection's marking starts, mark the client's roots and the native stack, register the
+    /// side tables' conditional edges (step 2b: the weak collections as owners, whose entries
+    /// the slices discover), and run the cycle's first slice. Deferred as a collection is (a
+    /// deferred start makes a major collection due); false then.
     #[cold]
     #[inline(never)]
     pub(crate) fn start_cycle(&mut self, native_roots: bool, client: &dyn MarkClient) -> bool {
@@ -3724,6 +3728,15 @@ impl Heap {
             scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
             self.mark_native_stack(&mut m);
         }
+        #[cfg(test)]
+        {
+            m.source = MarkSource::Root;
+        }
+        // The side tables' conditional edges, as a major collection's start registers them
+        // (step 2b): they fire in the slices as their owners and keys are marked. The weak
+        // collections come as owners, whose entries the slices discover.
+        self.add_source_edges(&mut m, client);
+        self.add_side_slot_owners(&mut m, client);
         let allocated = self.allocated_bytes;
         let mut cycle = Box::new(Cycle {
             marker: m,
@@ -3744,11 +3757,13 @@ impl Heap {
 
     /// W6: a slice of the running cycle's marking, at a safepoint (design 4): it traces grey
     /// cells within its budget and leaves the rest for the next slice; a worklist that runs out
-    /// makes the final pause due. It reads no root and scans no stack. Deferred as a collection
-    /// is: `None` then; otherwise the bytes it marked.
+    /// makes the final pause due. It reads no root and scans no stack. `client` is the slice's,
+    /// built for it (step 2b): the heap asks it only for the side slots of the owners the slice
+    /// marks and for the weak collections' discovered entries. Deferred as a collection is:
+    /// `None` then; otherwise the bytes it marked.
     #[cold]
     #[inline(never)]
-    pub(crate) fn slice(&mut self) -> Option<usize> {
+    pub(crate) fn slice(&mut self, client: &dyn MarkClient) -> Option<usize> {
         if self.blocked() {
             self.defer(false, CollectionKind::Minor);
             return None;
@@ -3763,8 +3778,7 @@ impl Heap {
         self.control.pending_collect.set(false);
         self.allocs_since_gc = 0;
         let before = self.marked_bytes;
-        // Slices fire no conditional edge: the final pause adds them (step 2).
-        self.run_slice(&mut cycle, &NoClient, started);
+        self.run_slice(&mut cycle, client, started);
         self.cycle = Some(cycle);
         self.control.collecting.set(false);
         self.update_fast_alloc();
@@ -3875,7 +3889,8 @@ impl Heap {
     /// W6: [`Heap::drain`] within a slice's `budget`: whether the worklist and the ready
     /// conditional edges ran out, so that only the final pause is left, and the bytes of the
     /// cells traced. The cells fetched ahead of the trace that ends the slice go back to the
-    /// worklist.
+    /// worklist. The weak collections' entries the client discovered join the conditional edges
+    /// whenever the work runs out and before the slice ends (step 2b).
     #[inline(never)]
     fn drain_within(
         &mut self,
@@ -3944,16 +3959,24 @@ impl Heap {
                     for index in 0..queued {
                         m.worklist.push(ahead[(head + index) % MARK_PREFETCH]);
                     }
+                    // The slice's client lives for this slice alone: the entries of the weak
+                    // collections it marked wait in the marker from here.
+                    self.add_discovered_edges(m, client);
                     return (
                         m.worklist.is_empty() && m.ready.is_empty(),
                         traced_bytes,
                     );
                 }
             }
-            let Some(edge) = m.ready.pop() else {
+            if let Some(edge) = m.ready.pop() {
+                self.try_fire(edge, m, client);
+                continue;
+            }
+            // Out of work: the entries of the weak collections marked since (step 2b), whose
+            // values may bring more.
+            if !self.add_discovered_edges(m, client) {
                 return (true, traced_bytes);
-            };
-            self.try_fire(edge, m, client);
+            }
         }
     }
 
@@ -4366,6 +4389,51 @@ impl Heap {
                 client,
             );
         }
+    }
+
+    /// W6: register the client's side-slot owners' conditional edges (a cycle's start and final
+    /// pause; `mark_phase` keeps its own copy, see `mark_from_roots`).
+    fn add_side_slot_owners(&mut self, m: &mut Marker, client: &dyn MarkClient) {
+        client.side_slot_owners(&mut |owner| {
+            // An owner outside this heap is not a condition: its slots are traced now.
+            let condition = self.locate(owner as u64);
+            self.add_edge(
+                CondEdge {
+                    owner: condition,
+                    key: None,
+                    value: EdgeValue::SideSlots(owner),
+                    fired: false,
+                },
+                m,
+                client,
+            );
+        });
+    }
+
+    /// W6 step 2b: register the weak collections' entries the client discovered since it was
+    /// last asked ([`MarkClient::discovered_ephemerons`]), as [`Heap::add_source_edges`]
+    /// registers the reported ephemerons. Whether it reported any.
+    fn add_discovered_edges(&mut self, m: &mut Marker, client: &dyn MarkClient) -> bool {
+        let mut reported = Vec::new();
+        client.discovered_ephemerons(&mut EdgeSink {
+            edges: &mut reported,
+        });
+        let any = !reported.is_empty();
+        for edge in reported {
+            let owner = self.locate(edge.owner);
+            let key = edge.key.and_then(|key| self.locate(key));
+            self.add_edge(
+                CondEdge {
+                    owner,
+                    key,
+                    value: EdgeValue::Word(edge.value),
+                    fired: false,
+                },
+                m,
+                client,
+            );
+        }
+        any
     }
 
     fn drain(&mut self, m: &mut Marker, client: &dyn MarkClient) {
@@ -10123,9 +10191,101 @@ mod tests {
             if fx.heap.cycle.as_ref().is_some_and(|cycle| cycle.complete) {
                 return;
             }
-            assert!(fx.heap.slice().is_some());
+            assert!(fx.heap.slice(&NoClient).is_some());
         }
         panic!("the cycle's worklist never ran out");
+    }
+
+    /// W6 step 2b: an embedder whose side slots a cycle's slices fire, with a weak collection whose
+    /// entry it reports once the heap traces the collection's side slots, as the engine's cycle
+    /// clients discover a WeakMap's entries.
+    struct DiscoveringClient {
+        roots: Vec<u64>,
+        side_slots: Vec<(usize, u64)>,
+        collection: usize,
+        entry: (u64, u64),
+        noted: Cell<bool>,
+        reported: Cell<usize>,
+    }
+
+    impl MarkClient for DiscoveringClient {
+        fn roots(&self, sink: &mut dyn FnMut(u64)) {
+            for &root in &self.roots {
+                sink(root);
+            }
+        }
+
+        fn side_slot_owners(&self, owners: &mut dyn FnMut(usize)) {
+            for &(owner, _) in &self.side_slots {
+                owners(owner);
+            }
+            owners(self.collection);
+        }
+
+        fn trace_side_slots(&self, owner: usize, sink: &mut dyn FnMut(u64)) {
+            for &(entry_owner, value) in &self.side_slots {
+                if entry_owner == owner {
+                    sink(value);
+                }
+            }
+            if owner == self.collection {
+                self.noted.set(true);
+            }
+        }
+
+        fn ephemerons(&self, _: &mut EdgeSink<'_>) {}
+
+        fn discovered_ephemerons(&self, sink: &mut EdgeSink<'_>) {
+            if self.noted.replace(false) {
+                self.reported.set(self.reported.get() + 1);
+                sink.ephemeron(self.collection as *const u8, self.entry.0, self.entry.1);
+            }
+        }
+    }
+
+    /// W6 step 2b: a cycle's slices fire the side-slot edges its start registered, as their owners
+    /// are marked, and register a weak collection's discovered entries; an entry whose key is
+    /// unmarked waits in the marker, and the final pause, whose client reports no side table,
+    /// marks its value once a root marks the key.
+    #[test]
+    fn a_cycles_slices_fire_side_slot_edges_and_register_discovered_ephemerons() {
+        let mut fx = Fixture::new();
+        let [owner, slot_value, collection, key, value] =
+            [0; 5].map(|_| fx.heap.alloc(fx.leaf, 16) as usize);
+        let client = DiscoveringClient {
+            roots: vec![tagged(owner as *const u8), tagged(collection as *const u8)],
+            side_slots: vec![(owner, tagged(slot_value as *const u8))],
+            collection,
+            entry: (tagged(key as *const u8), tagged(value as *const u8)),
+            noted: Cell::new(false),
+            reported: Cell::new(0),
+        };
+        assert!(fx.heap.start_cycle(false, &client));
+        for _ in 0..1000 {
+            if fx.heap.cycle.as_ref().is_some_and(|cycle| cycle.complete) {
+                break;
+            }
+            assert!(fx.heap.slice(&client).is_some());
+        }
+        assert!(fx.heap.cycle.as_ref().is_some_and(|cycle| cycle.complete));
+        let age = |heap: &Heap, cell: usize| heap.cell_age(cell as u64);
+        assert_eq!(age(&fx.heap, slot_value), Some(CellAge::Old), "fired in the cycle");
+        assert_eq!(client.reported.get(), 1, "the entry was discovered once");
+        assert_eq!(age(&fx.heap, value), Some(CellAge::Young), "it waits for its key");
+        let roots = [
+            tagged(owner as *const u8),
+            tagged(collection as *const u8),
+            tagged(key as *const u8),
+        ];
+        let final_client = FixtureClient {
+            roots: &roots,
+            edges: &no_edges,
+        };
+        assert!(fx.heap.start_marking(false, &final_client, CollectionKind::Major));
+        assert!(fx.heap.cycle.is_none(), "the final pause ended the cycle");
+        assert!(fx.heap.dead_cells(fx.leaf).is_empty(), "every cell is reached");
+        fx.heap.finish_collection(&[]);
+        assert_eq!(fx.live(), 5);
     }
 
     /// W6: while a cycle marks, allocation past the nursery's budget brings a slice, not a minor
@@ -10155,7 +10315,7 @@ mod tests {
             fx.heap.due_work(Some(CollectionKind::Minor), false, true),
             DueWork::Collect(CollectionKind::Major)
         );
-        assert!(fx.heap.slice().is_some());
+        assert!(fx.heap.slice(&NoClient).is_some());
         let minors = fx.heap.minor_collections();
         fx.collect();
         assert_eq!(fx.heap.minor_collections(), minors);
@@ -10200,7 +10360,7 @@ mod tests {
         // SAFETY: the head is a live carded cell of this heap.
         unsafe { card_mark(head) };
         // The store cut the chain below the head off.
-        assert!(fx.heap.slice().is_some());
+        assert!(fx.heap.slice(&NoClient).is_some());
         fx.collect();
         assert!(fx.heap.cycle.is_none());
         assert!(fx.heap.owns_cell(young as usize, fx.carded), "the stored cell survives");
@@ -10229,7 +10389,7 @@ mod tests {
         let young = fx.heap.alloc(fx.carded, 16);
         set_word(young, 0, 0);
         set_word(head, 0, tagged(young));
-        fx.heap.slice();
+        fx.heap.slice(&NoClient);
     }
 
     /// W6: cells allocated while a cycle marks are white: the final pause frees those the roots

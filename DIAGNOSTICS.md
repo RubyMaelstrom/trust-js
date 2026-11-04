@@ -158,9 +158,11 @@ comment/example in the same change.
 - `TRUST_JS_GC_INCREMENTAL=1` (W6, off by default) marks the major collections the heap asks
   for on its own (its byte budget, a stress interval) in a cycle between whose slices the
   program runs: the cycle's start marks the roots and the native stack, each slice traces part
-  of what they reach, at the first safepoint after every 64 KiB allocated, and a final pause
-  once nothing is left to trace marks the roots, the stack and the cells written since their
-  trace (their cards) again, with the side tables, then sweeps as a major collection does. No
+  of what they reach, with the engine's side tables (internal slots kept outside objects, WeakMap
+  and WeakSet entries, discovered as their collections are marked), at the first safepoint
+  after every 64 KiB allocated, and a final pause once nothing is left to trace marks the roots,
+  the stack and the cells written since their trace (their cards) again, with the side-table
+  entries written during the cycle, then sweeps as a major collection does. No
   minor collection runs while a cycle marks; the cycle's allocation past a margin over the byte
   budget (V8's), and every requested collection (explicit, the exit's, the live-object limit,
   ArrayBuffer pressure, an explicit minor one) finish it at once; an explicit major collection
@@ -168,7 +170,8 @@ comment/example in the same change.
   `TRUST_JS_GC_INCREMENTAL=force`
   makes the slices a few cells each, at every safepoint while a cycle marks, and with
   `TRUST_JS_GC_VERIFY` each slice's end checks that no traced cell with a clean card holds an
-  edge to an unmarked one. `TRUST_JS_GC_LOG=1` prints a `[gc-slice]` line for the cycle's start
+  edge to an unmarked one, and the final pause's end that every side-table entry of a marked
+  owner names marked cells. `TRUST_JS_GC_LOG=1` prints a `[gc-slice]` line for the cycle's start
   (`phase=start`) and each slice: the slices so far (`n`), the bytes of the cells it traced
   (`traced`), the bytes it marked and the cycle's so far (`cycle_marked`), the cells left in the
   worklist, the bytes allocated since the cycle started (`cycle_alloc`), whether the marking

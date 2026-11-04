@@ -253,3 +253,202 @@ fn an_explicit_collection_during_a_cycle_frees_what_died_after_the_cycle_marked_
     assert!(!crate::gc_test::alive(&*weak), "the precise collection freed it");
     assert_eq!(eval(&mut engine, "bulk.length"), "30000");
 }
+
+/// The address of the object a weak handle names, kept complemented (a plain address in a test's
+/// frame would keep the object alive).
+fn hidden_address(weak: &crate::value::WeakGc) -> crate::gc_test::HiddenAddress {
+    crate::gc_test::HiddenAddress::from_fn(|| {
+        weak.upgrade()
+            .map(|object| crate::value::Gc::as_ptr(&object) as usize)
+            .expect("alive")
+    })
+}
+
+/// Whether the running cycle has marked the cell at `address`.
+#[inline(never)]
+fn marked(engine: &Engine, address: crate::gc_test::HiddenAddress) -> bool {
+    engine.interp.gc_heap.core.borrow().cell_age(address.get() as u64)
+        == Some(crate::gc_core::CellAge::Old)
+}
+
+/// Run slices of the running cycle until it has marked the cell at `address`.
+fn slice_until_marked(engine: &mut Engine, address: crate::gc_test::HiddenAddress, what: &str) {
+    let mut slices = 0;
+    while !marked(engine, address) {
+        assert!(engine.interp.gc_slice(), "{what}: the cycle runs until it is marked");
+        slices += 1;
+        assert!(slices < 1_000_000, "{what}: never marked");
+    }
+}
+
+/// W6 step 2b: a WeakMap's entries are discovered in the slices that mark it (as V8 discovers an
+/// ephemeron table's entries as its marker visits the table): a value only the map holds is
+/// marked before the final pause. The entries the program writes after that, under new keys and
+/// old ones, are the final pause's, from the cycle's records, and survive it. The final pause
+/// alone ends the cycle (an explicit minor request), so no collection after it hides a miss.
+#[test]
+fn a_weak_maps_entries_are_discovered_in_the_slices_and_merged_at_the_final_pause_in_every_tier()
+{
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = cycling_engine(tier);
+        eval(
+            &mut engine,
+            r#"
+            var keys = [], wm = new WeakMap();
+            for (let i = 0; i < 200; i++) {
+                const k = { i };
+                keys.push(k);
+                wm.set(k, { v: i });
+            }
+            // A long chain that only the first entry's value holds keeps the marker busy once
+            // the entry is discovered.
+            wm.set(keys[0], { v: 0, chain: (function () {
+                let head = null;
+                for (let i = 0; i < 20000; i++) head = { next: head, i };
+                return head;
+            })() });
+            var probe = wm.get(keys[0]);
+            true
+            "#,
+        );
+        let weak = weak_global(&mut engine, "probe");
+        let probe = hidden_address(&weak);
+        eval(&mut engine, "probe = null; 0");
+        assert!(engine.interp.gc_start_cycle(), "{tier:?}");
+        slice_until_marked(&mut engine, probe, "the first entry's value");
+        assert!(cycle_running(&engine), "{tier:?}: the chain keeps the cycle marking");
+        eval(
+            &mut engine,
+            r#"
+            for (let i = 0; i < 100; i++) {
+                const k = { j: i };
+                keys.push(k);
+                wm.set(k, { w: i, back: k });
+            }
+            for (let i = 1; i < 51; i++) wm.set(keys[i], { replaced: i });
+            true
+            "#,
+        );
+        assert!(cycle_running(&engine), "{tier:?}: the program ran within the cycle");
+        engine.interp.gc_collect_minor();
+        assert!(!cycle_running(&engine), "{tier:?}");
+        let result = eval(
+            &mut engine,
+            r#"
+            let ok = keys.length === 300;
+            for (let i = 1; i < 51; i++) ok = ok && wm.get(keys[i]).replaced === i;
+            for (let i = 51; i < 200; i++) ok = ok && wm.get(keys[i]).v === i;
+            for (let i = 200; i < 300; i++) {
+                const entry = wm.get(keys[i]);
+                ok = ok && entry.w === i - 200 && entry.back === keys[i];
+            }
+            let n = 0;
+            for (let node = wm.get(keys[0]).chain; node; node = node.next) n++;
+            ok && n === 20000
+            "#,
+        );
+        assert_eq!(result, "true", "{tier:?}");
+    }
+}
+
+/// W6 step 2b: a side-slot table's edges fire in the slices as their owners are marked, and a
+/// write during the cycle into an owner the slices traced is the final pause's (the cycle's
+/// records): a reaction added to a pending promise after the slices traced its reactions
+/// survives the final pause alone, and runs once the promise settles.
+#[test]
+fn a_promise_reaction_added_during_a_cycle_survives_its_final_pause_in_every_tier() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = cycling_engine(tier);
+        eval(
+            &mut engine,
+            r#"
+            var settle, counted = 0, result = 0;
+            var p = new Promise(function (resolve) { settle = resolve; });
+            // The first reaction alone holds a long chain, which keeps the marker busy once the
+            // promise's reactions are traced.
+            var first = (function () {
+                let head = null;
+                for (let i = 0; i < 20000; i++) head = { next: head, i };
+                return function () {
+                    for (let node = head; node; node = node.next) counted++;
+                };
+            })();
+            p.then(first);
+            true
+            "#,
+        );
+        let weak = weak_global(&mut engine, "first");
+        let first = hidden_address(&weak);
+        eval(&mut engine, "first = null; 0");
+        assert!(engine.interp.gc_start_cycle(), "{tier:?}");
+        slice_until_marked(&mut engine, first, "the first reaction");
+        assert!(cycle_running(&engine), "{tier:?}: the chain keeps the cycle marking");
+        eval(
+            &mut engine,
+            r#"
+            p.then((function () {
+                const captured = { v: 41 };
+                return function () { result = captured.v + 1; };
+            })());
+            true
+            "#,
+        );
+        assert!(cycle_running(&engine), "{tier:?}: the program ran within the cycle");
+        engine.interp.gc_collect_minor();
+        assert!(!cycle_running(&engine), "{tier:?}");
+        assert_eq!(
+            eval(&mut engine, "settle(1); 0"),
+            "0",
+            "{tier:?}: the reactions run"
+        );
+        assert_eq!(eval(&mut engine, "counted + ':' + result"), "20000:42", "{tier:?}");
+    }
+}
+
+/// W6 step 2b: a Realm group activates in the slice that marks a member, and the final pause
+/// traces every active group again: a template object a Realm's [[TemplateMap]] gains during the
+/// cycle (GetTemplateObject's per-Realm cache) survives the final pause alone, and its site keeps
+/// returning it.
+#[test]
+fn a_realm_groups_template_map_gains_an_entry_during_a_cycle_in_every_tier() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = cycling_engine(tier);
+        eval(
+            &mut engine,
+            r#"
+            var other = $262.createRealm().global;
+            var first = other.eval("(function () { return (function (s) { return s; })`first`; })");
+            var second = other.eval("(function () { return (function (s) { return s; })`second`; })");
+            var template = first();
+            // A long chain that only the first template's entry holds: marking the template
+            // (the Realm group's activation) brings it, and it keeps the marker busy.
+            var byTemplate = new WeakMap();
+            byTemplate.set(template, (function () {
+                let head = null;
+                for (let i = 0; i < 20000; i++) head = { next: head, i };
+                return head;
+            })());
+            true
+            "#,
+        );
+        let weak = weak_global(&mut engine, "template");
+        let template = hidden_address(&weak);
+        eval(&mut engine, "template = null; 0");
+        assert!(engine.interp.gc_start_cycle(), "{tier:?}");
+        slice_until_marked(&mut engine, template, "the first template");
+        assert!(cycle_running(&engine), "{tier:?}: the chain keeps the cycle marking");
+        eval(&mut engine, "second(); 0");
+        assert!(cycle_running(&engine), "{tier:?}: the program ran within the cycle");
+        engine.interp.gc_collect_minor();
+        assert!(!cycle_running(&engine), "{tier:?}");
+        let result = eval(
+            &mut engine,
+            r#"
+            let n = 0;
+            for (let node = byTemplate.get(first()); node; node = node.next) n++;
+            second() === second() && second()[0] === "second" && n === 20000
+            "#,
+        );
+        assert_eq!(result, "true", "{tier:?}");
+    }
+}
