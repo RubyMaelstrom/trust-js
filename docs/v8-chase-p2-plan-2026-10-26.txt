@@ -10980,3 +10980,114 @@ Notes for landing:
   address. No drain runs under such a borrow (weak_insert drains before it borrows, and a
   collection is deferred under borrows), so it does not arise; a debug assertion of it comes
   with step 2.
+
+### The tier threshold, timed (record, 2026-11-04)
+
+For the owner's threshold decision ("The owner's answers" above: the timing decides it). Main's
+engine a31509fe (fat LTO, target/p2/lto/a31509fe; main f3d0622e's engine adds only W2g step 5),
+pinned to CPU 5 (an X925 core), rounds rotating the engines, the fixtures' own elapsed_ms
+(medians), at moments when no agent built (the hold, target/p2/timing/HOLD; the other load
+0.5-3.7 cores, mostly two single-threaded Test262 stress workers). Everything is in
+target/p2/threshold-t1 (session.sh, session2.sh, session3.sh, counts-env.sh and their outputs).
+
+How a function tiers today: its first 8 calls (TRUST_JS_TIER_THRESHOLD) run in the tree-walker,
+which fills no cache; then it compiles to bytecode, and a function without loops compiles to
+native code at its first bytecode run (TRUST_JS_JIT_ADMIT_RUNS, default 0), so its first native
+code is made with every cache empty. The exemplars compile to bytecode at the first call and to
+baseline code once the interpreter has run it and filled its feedback (V8's Sparkplug after a
+budget of Ignition, JSC's Baseline after LLInt, SpiderMonkey's Baseline after the Baseline
+Interpreter).
+
+Session 1 (10 rounds of the fixtures with Node limited to Sparkplug, 3 of Octane, 1 of Web
+Tooling): threshold 1 (t1) against 8 (t8).
+
+| fixture | t8 | t1 | node-sp | t8 / node-sp | t1 / node-sp |
+| --- | --- | --- | --- | --- | --- |
+| Djot | 93 ms | 83 (-10.8%) | 38 | 2.45x | 2.18x |
+| React | 31 | 33 (+6.5%) | 16 | 1.94x | 2.06x |
+| Vue | 260 | 262 (+0.8%) | 113 | 2.30x | 2.32x |
+
+Octane's score (higher is better): 4,070 at t8, 4,096 at t1 (+0.6%); by benchmark TypeScript
+-4.7%, CodeLoad -4.2%, MandreelLatency -3.4%, Box2D -2.0%; Splay +4.2%, SplayLatency +21.4% (its
+peak RSS -16.6%: another collection schedule), Gameboy +1.4%. Web Tooling (runs a second, higher
+is better; one round): geomean +0.7%; typescript +2.9%, prepack +3.1%, esprima +2.6%; jshint
+-3.3%, babel-minify -2.4%, source-map -1.8%. Threshold 1 compiles to native code at a function's second call,
+before any cache has a state: React pays for the compiles of functions it calls a few times.
+
+Session 2 (fixtures, 10 rounds): the exemplars' order, threshold 1 with 2, 4 or 8 bytecode runs
+before a loop-free function's native compile (t1a2, t1a4, t1a8), and thresholds 2 and 4.
+
+| variant | Djot | React | Vue |
+| --- | --- | --- | --- |
+| t8 | 94.5 ms | 31 | 261 |
+| t1 | -11.1% | +6.5% | +0.8% |
+| t1a2 | -9.5% | -3.2% | +0.0% |
+| t1a4 | -9.0% | -3.2% | +0.0% |
+| t1a8 | -6.9% | -1.6% | -0.6% |
+| t2 | -10.1% | +6.5% | +0.6% |
+| t4 | -6.9% | +1.6% | +0.0% |
+
+The wall time of the whole process orders the variants alike (t1a2: Djot -2.7%, React -2.3%, Vue
+-0.6%): part of the fixtures' gain is compile work that moves before their timers start. The
+bytecode runs fill the caches (the VM's reads go through them, bytecode.rs:21399), so the native
+compile that follows bakes the warm probes (Chunk::jit_cache_preferred), which no first native
+compile can today.
+
+Instructions (fat LTO, CPUs 10-13, pacing off, median of 3; counts/counts.txt):
+
+| workload | t8 | t1a2 | t1a4 |
+| --- | --- | --- | --- |
+| Vue | 1,765,183,422 | -0.08% | +0.01% |
+| React | 315,974,141 | -6.77% | -6.55% |
+| Djot | 633,123,997 | -2.07% | -1.68% |
+| chai | 79,510,891,950 | -0.12% | -0.12% |
+| Richards | 136,280,221 | -2.28% | -3.31% |
+| DeltaBlue | 261,569,908 | -1.15% | -0.76% |
+| Crypto | 728,967,121 | -1.42% | -1.00% |
+| RayTrace | 994,507,070 | +0.30% | +1.04% |
+| EarleyBoyer | 3,200,963,206 | +1.77% | +0.11% |
+| RegExp | 2,776,389,125 | -1.34% | -1.32% |
+| Splay | 1,401,356,796 | -0.62% | -0.61% |
+| NavierStokes | 451,444,172 | -1.81% | -2.02% |
+| PdfJS | 7,708,034,122 | -0.54% | -0.70% |
+| Mandreel | 62,955,005,140 | +0.15% | +0.15% |
+| Gameboy | 21,511,950,098 | +2.60% | +2.69% |
+| CodeLoad | 482,295,078 | +6.06% | +5.85% |
+| Box2D | 4,476,114,346 | -2.74% | -2.80% |
+| zlib | 138,040,640,045 | -0.04% | -0.04% |
+| TypeScript | 58,761,939,848 | -1.41% | -1.35% |
+
+Threshold 2 with 2 bytecode runs (t2a2, counts/counts-t2a2.txt), against t8: Vue -0.17%, React
+-6.72%, Djot -2.79%, chai +0.19%, Richards -3.04%, DeltaBlue -0.95%, Crypto -1.21%, RayTrace
+-0.25%, EarleyBoyer +0.18%, RegExp -2.07%, Splay -0.63%, NavierStokes -1.63%, PdfJS -0.26%,
+Mandreel +0.08%, Gameboy +2.95%, CodeLoad +1.87%, Box2D -2.04%, zlib -0.04%, TypeScript -1.73%:
+a function's single call stays in the tree-walker, which spares CodeLoad its compiles.
+
+Session 3 (t1a2 against t8): Octane's score -1.5% (4,006 against 4,069; CodeLoad -6.9%,
+NavierStokes -3.1%, MandreelLatency -2.8%, Gameboy -2.3%, EarleyBoyer -2.1%, TypeScript -1.7%;
+Box2D +3.7%, SplayLatency +3.8%, RayTrace +1.8%; peak RSS -18.2%); Web Tooling's geomean 0.0%
+(one round, tools within +-5%). Session 4 (fixtures, 10 rounds): t1a2 Djot -8.9%, t2a2 -7.3%;
+React 31 ms in all three (wall: t1a2 -2.2%, t2a2 -1.4%); Vue +0.0% and +0.4%.
+
+TRust's replays (TRust 78435d0 on engine f3d0622e, the X925 cores; engine time, median of 20
+samples, 4 rounds, session 3; t2a2 against session 4's own t8, 10 samples):
+
+| page | t8 | t1 | t1a2 | t2a2 |
+| --- | --- | --- | --- | --- |
+| event-loop | 21.0 ms | +129.5% | +106.2% | +76.2% |
+| dom-reconcile | 1,414 ms | +1.3% | -2.6% | +0.1% |
+| Vue TodoMVC | 505 ms | +4.5% | +0.9% | +1.5% |
+
+Their wall times: event-loop +75.8%, +66.4% and +11.9%; Vue TodoMVC +17.9%, +13.1% and +2.0%. A
+page compiles its platform functions again (TRUST_JS_TIER_LOG over one event-loop page,
+tierlog-*.err): at t8 105 bytecode and 102 native compiles, 1.18 MB of machine code; at t2a2 250,
+207 and 3.26 MB; at t1a2 350, 235 and 3.44 MB.
+
+Decision: the threshold stays at 8 for now. Every variant that compiles earlier costs TRust's
+event-loop page 76-130% of its engine time, which is the condition the recommendation named
+(TRust's pages reusing their compiled platform code); and at t8 too every page compiles 1.18 MB of
+machine code for the same platform functions. So the reuse comes first, as its own design note
+(the exemplars: V8's code cache and its isolate-independent embedded builtins, SpiderMonkey's
+shared script data, JSC's bytecode cache), with the compact templates (which shrink every compile
+at any threshold); then the threshold, where t1a2 is the measured choice (Djot -9.5%, React -3.2%,
+Vue 0.0% on the fixtures' timers).
