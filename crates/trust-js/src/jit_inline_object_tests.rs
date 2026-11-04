@@ -35,6 +35,13 @@ fn in_line() -> usize {
     alloc::INLINE_OBJECTS.with(|count| count.get())
 }
 
+/// Whether generated code made objects in line since a counter read `before`: so under GC
+/// stress too, which turns the in-line path off (the heap counts each allocation), and the
+/// tests then check the helpers' objects alone.
+fn grew(now: usize, before: usize) -> bool {
+    crate::gc_test::stress_active() || now > before
+}
+
 /// What a reader of an object's header sees: class, shape, flag bits and element words.
 fn header(object: &Gc) -> (u32, u32, bool, bool, usize) {
     let body = object.borrow();
@@ -74,7 +81,7 @@ fn in_line_objects_are_the_helpers_objects() {
              d(first) === d(later) ? 'same' : d(first) + ' / ' + d(later)"
         );
         assert_eq!(eval(&mut engine, &source), "same", "{literal}");
-        assert!(in_line() > before, "{literal}: no in-line object");
+        assert!(grew(in_line(), before), "{literal}: no in-line object");
         let (first, later) = (global(&mut engine, "first"), global(&mut engine, "later"));
         assert_eq!(header(&first), header(&later), "{literal}");
         assert!(Gc::ptr_eq(
@@ -103,7 +110,10 @@ fn in_line_objects_survive_collections_and_keep_the_live_count() {
          sum + ':' + keep.length + ':' + keep[199].y",
     );
     assert_eq!(result, "39800400:200:v4");
-    assert!(in_line() - before > 100_000, "the loop allocated in line");
+    assert!(
+        crate::gc_test::stress_active() || in_line() - before > 100_000,
+        "the loop allocated in line"
+    );
     engine.interp.gc_collect();
     let heap = crate::value::active_gc_heap();
     let counted = crate::value::live_objects();
@@ -158,7 +168,7 @@ fn empty_literals_and_shared_copies_are_the_helpers() {
              d(first) === d(later) ? 'same' : d(first) + ' / ' + d(later)"
         );
         assert_eq!(eval(&mut engine, &source), "same", "{literal}");
-        assert!(in_line() > before, "{literal}: no in-line object");
+        assert!(grew(in_line(), before), "{literal}: no in-line object");
         let (first, later) = (global(&mut engine, "first"), global(&mut engine, "later"));
         assert_eq!(header(&first), header(&later), "{literal}");
         let result = eval(&mut engine, &format!("var o = later; {after}"));
@@ -196,7 +206,7 @@ fn in_line_this_objects_are_the_helpers() {
          (d(first) === d(later) ? 'same' : d(first) + ' / ' + d(later)) + ':' + total",
     );
     assert_eq!(result, "same:14850000");
-    assert!(in_line_constructs() > before, "no in-line this");
+    assert!(grew(in_line_constructs(), before), "no in-line this");
     let (first, later) = (global(&mut engine, "first"), global(&mut engine, "later"));
     assert_eq!(header(&first), header(&later));
     // A new `prototype`: the site's cached shape no longer matches, and the next instance takes
@@ -235,7 +245,7 @@ fn in_line_this_objects_live_in_the_running_agents_heap() {
             let _active = engine.interp.enter_agent();
             assert_eq!(eval(engine, source), "40", "engine {index}, round {round}");
             assert!(
-                in_line_constructs() > before,
+                grew(in_line_constructs(), before),
                 "engine {index}: no in-line this"
             );
             let made = global(engine, "made");
@@ -315,7 +325,7 @@ fn in_line_arrays_with_elements_are_the_helpers() {
              d(first) === d(later) ? 'same' : d(first) + ' / ' + d(later)"
         );
         assert_eq!(eval(&mut engine, &source), "same", "{literal}");
-        assert!(in_line() > before, "{literal}: no in-line array");
+        assert!(grew(in_line(), before), "{literal}: no in-line array");
         let (first, later) = (global(&mut engine, "first"), global(&mut engine, "later"));
         assert_eq!(header(&first), header(&later), "{literal}");
         assert_eq!(
