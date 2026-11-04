@@ -12041,3 +12041,1054 @@ Checks at b4f2e2e0:
   stress at main's engine before W6 too; releasing_long_object_chains_uses_bounded_native_stack
   passed in 2,813 s (known-slow.txt's one test left out).
 - The fixtures' JIT dumps: Heap::fast_alloc's offset alone (above).
+
+### W4: the series landed (record, 2026-11-04)
+
+W4's implementation, an agent's: steps 1-7, 9 and 10 (step 8, allocation sites, moved to P3 by
+the design), with a census change, a follow-up and two fixes, measured on branch p2-w4 (from main
+1ca3e94f) and p2-w4-rebased (main 8370e936), landed on main over bf606dda (W6 step 2) as below.
+The landed tree is p2-w4-rebased's tip 1fcb4c71 plus W6 step 2's change, line for line, and its
+ARM64 lib suite passed before main moved (2,804 passed, 9 ignored). The records below name the branches' SHAs:
+
+| landed | p2-w4-rebased | what |
+| --- | --- | --- |
+| f31b71fd | cb9cd1d3 (p2-w4 8868b9a2) | step 1, the feedback schema |
+| 44b57d07 | d22812ba (9ddee0d7) | step 2, the census tool |
+| dfca8d51 | 05fc3e2c (0be2ad19) | step 3, the value record |
+| b17cdc6c | 4ceb7896 (9163183e) | step 4, the element record |
+| d69833dc | 7b5c78ab (ed1ebdc8) | step 5, the generic mark |
+| 756d114f | e8e1d8d3 (1cbdda97) | step 6, the read API |
+| 3b9d712f | ac3546f4 (63344d12) | step 7, the pc map |
+| 8b85ef1a | 3daf839f (734c413d) | DIAGNOSTICS' census entry |
+| 46d7e1ad | f85a3d86 (f8f8bb01) | step 9, Pilot C |
+| b9755ab7 | 3446b246 (d3657ec7) | step 10, the registry |
+| 5dd68f08 | 05b29756 (463a7312) | the census counts a `length` load usable |
+| 0e76ab39 | f51ac144 (737046b0) | step 4's follow-up |
+| f2ec7a4f | be015ee4 | step 7's fix |
+| 5550a01e | 1fcb4c71 | step 4's fix |
+
+For the owner: the exit's precision floor (no workload below the census's 67.2-99.5%) is missed
+on React, Djot and PdfJS when equality counts, because decision 3 gives equality no record while
+the census's model had one; by the census's own definitions and without equality, the tip matches
+the census within 0.4 points on 18 of 19 workloads, chai 2.3 points under (the element helpers'
+fast paths leave no record). The record's cost exit (<= 2%) and coverage exit (>= 95%) are met.
+
+### W4: the series, steps 2-7, 9 and 10 (record, 2026-11-04)
+
+p2-w4-rebased, on main 8370e936 (worktree target/p2/w4/rebase-wt): cb9cd1d3 step 1 (the schema),
+d22812ba step 2, 05fc3e2c step 3, 4ceb7896 step 4, 7b5c78ab step 5, e8e1d8d3 step 6, ac3546f4 step
+7, 3daf839f (DIAGNOSTICS' census entry), f85a3d86 step 9, 3446b246 step 10, 05b29756 (the
+census's `length` rule), f51ac144 (step 4's follow-up), be015ee4 (step 7's fix), 1fcb4c71 (step
+4's fix). The series was built and measured step by step on main 1ca3e94f (p2-w4, worktree
+target/p2/w4-impl-wt: 9ddee0d7, 0be2ad19, 9163183e, ed1ebdc8, 1cbdda97, 63344d12, 734c413d,
+f8f8bb01, d3657ec7, 463a7312, 737046b0); the rebase onto main 8370e936 had one conflict, the
+Interp inventory test's field count (main's 138 plus step 9's field: 139). Each step's record:
+target/p2/w4/impl-step{2,3,4,4b,5,6,7,9,10}-record-draft.txt, impl-census-length-record-draft.txt
+and impl-fixes-record-draft.txt.
+
+Per step (fat LTO, median of 3 for the fixtures; each against its parent's build: steps 2-10 and
+step 4's follow-up on main 1ca3e94f, the two fixes and the series on main 8370e936):
+
+| ARM64, vs the parent | Vue | React | Djot | chai | TypeScript | Octane, lowest .. highest |
+| --- | --- | --- | --- | --- | --- | --- |
+| 2 census tool | +0.00% | -0.00% | +0.00% | +0.04% | +0.00% | NavierStokes -0.00% .. Mandreel +0.00% |
+| 3 value record | +0.05% | +0.13% | +0.17% | +0.03% | +0.00% | Gameboy -0.01% .. Splay +0.50% |
+| 4 element record | +0.42% | -0.00% | +0.15% | +1.49% | +0.37% | RayTrace -0.00% .. TypeScript +0.37% |
+| 5 generic mark | +0.03% | -0.00% | +0.00% | -0.00% | +0.08% | PdfJS -0.02% .. TypeScript +0.08% |
+| 6 read API | -0.00% | +0.00% | +0.00% | -0.01% | -0.00% | TypeScript -0.00% .. Mandreel +0.00% |
+| 7 pc map | +0.20% | +0.04% | +0.36% | +0.08% | +0.15% | NavierStokes +0.00% .. DeltaBlue +0.37% |
+| 9 Pilot C | +0.08% | +0.00% | +0.01% | +0.02% | -0.21% | Richards -0.58% .. RayTrace +0.21% |
+| 10 registry | +0.05% | -0.00% | +0.00% | +0.03% | -0.02% | PdfJS -0.07% .. Box2D +0.01% |
+| 4, follow-up | -0.14% | -0.00% | -0.03% | -0.19% | -0.06% | TypeScript -0.06% .. Gameboy +0.00% |
+| 7, fix (rebased) | -0.04% | -0.00% | -0.15% | -0.01% | -0.04% | Richards -0.14% .. PdfJS +0.01% |
+| 4, fix (rebased) | -0.25% | -0.00% | -0.11% | -0.08% | -0.12% | TypeScript -0.12% .. EarleyBoyer +0.01% |
+| series on main 8370e936 | +0.44% | +0.16% | +0.37% | +1.36% | +0.16% | Richards -0.45% .. PdfJS +0.79% |
+
+| x86-64 (zombie), vs the parent | Vue | React | Djot | chai | TypeScript | Octane, lowest .. highest |
+| --- | --- | --- | --- | --- | --- | --- |
+| 3 value record | +0.10% | -0.61% | -0.11% | +0.07% | -0.26% | NavierStokes -1.26% .. zlib +1.40% |
+| 4 element record | +0.22% | +0.10% | +0.10% | +1.75% | +0.26% | Splay +0.00% .. NavierStokes +0.33% |
+| 4, follow-up | -0.05% | -0.00% | +0.00% | -0.08% | -0.02% | EarleyBoyer -0.24% .. Gameboy +0.01% |
+| both fixes (rebased) | -0.30% | -0.03% | -0.20% | -0.07% | +0.00% | DeltaBlue -0.20% .. PdfJS +0.07% |
+| series on main 8370e936 | +0.02% | -0.49% | +0.10% | +1.20% | +0.19% | NavierStokes -1.50% .. zlib +1.26% |
+
+The series on main 8370e936, ARM64 (CPUs 10-13, pacing off; base cb9cd1d3, main's engine with
+the schema):
+
+| workload | base (cb9cd1d3) | tip (1fcb4c71) | change |
+| --- | --- | --- | --- |
+| Vue | 1,715,978,078 | 1,723,566,122 | +0.44% |
+| React | 315,956,173 | 316,467,531 | +0.16% |
+| Djot | 627,729,118 | 630,033,519 | +0.37% |
+| chai | 79,100,832,356 | 80,179,709,112 | +1.36% |
+| Richards | 136,068,976 | 135,451,275 | -0.45% |
+| DeltaBlue | 260,353,538 | 260,820,954 | +0.18% |
+| Crypto | 728,399,361 | 728,195,281 | -0.03% |
+| RayTrace | 993,936,002 | 996,950,178 | +0.30% |
+| EarleyBoyer | 3,194,477,568 | 3,198,161,154 | +0.12% |
+| RegExp | 2,738,657,363 | 2,735,676,594 | -0.11% |
+| Splay | 1,401,395,720 | 1,408,920,164 | +0.54% |
+| NavierStokes | 451,396,379 | 451,411,091 | +0.00% |
+| PdfJS | 7,656,218,897 | 7,717,005,404 | +0.79% |
+| Mandreel | 62,935,819,439 | 62,939,970,934 | +0.01% |
+| Gameboy | 21,036,455,040 | 21,115,113,016 | +0.37% |
+| CodeLoad | 481,326,405 | 481,331,231 | +0.00% |
+| Box2D | 4,457,417,124 | 4,447,205,140 | -0.23% |
+| zlib | 138,039,323,287 | 138,090,708,889 | +0.04% |
+| TypeScript | 58,591,040,577 | 58,686,262,954 | +0.16% |
+
+The series on main 8370e936, x86-64 (zombie, release with fat LTO, CPU 2, pacing off):
+
+| workload | base (cb9cd1d3) | tip (1fcb4c71) | change |
+| --- | --- | --- | --- |
+| Vue | 3,664,695,064 | 3,665,583,734 | +0.02% |
+| React | 1,526,990,892 | 1,519,486,248 | -0.49% |
+| Djot | 1,359,266,244 | 1,360,679,331 | +0.10% |
+| chai | 176,521,374,932 | 178,630,872,790 | +1.20% |
+| Richards | 418,750,309 | 417,616,692 | -0.27% |
+| DeltaBlue | 749,305,273 | 750,237,803 | +0.12% |
+| Crypto | 27,115,645,588 | 27,104,752,246 | -0.04% |
+| RayTrace | 2,176,867,644 | 2,188,214,411 | +0.52% |
+| EarleyBoyer | 8,828,197,884 | 8,816,609,225 | -0.13% |
+| RegExp | 5,607,170,229 | 5,583,360,503 | -0.42% |
+| Splay | 2,691,965,494 | 2,721,995,101 | +1.12% |
+| NavierStokes | 19,052,147,253 | 18,766,855,606 | -1.50% |
+| PdfJS | 24,497,346,880 | 24,592,542,323 | +0.39% |
+| Mandreel | 453,144,850,640 | 457,446,911,388 | +0.95% |
+| Gameboy | 62,191,716,867 | 62,075,031,966 | -0.19% |
+| CodeLoad | 471,799,017 | 471,856,930 | +0.01% |
+| Box2D | 18,016,911,840 | 18,155,865,673 | +0.77% |
+| zlib | 1,795,766,536,697 | 1,818,319,316,693 | +1.26% |
+| TypeScript | 162,393,372,003 | 162,704,626,234 | +0.19% |
+
+Within W4's exit (the record at <= 2% instructions on the acceptance set): the highest is chai's,
++1.36% on ARM64 and +1.20% on x86-64; the fixtures' are +0.44% (Vue), +0.16% (React) and +0.37%
+(Djot) on ARM64.
+
+Coverage and precision at the tip (the census tool on an architecture-diagnostics build of
+1fcb4c71; % of the speculation kinds' executions):
+
+| workload | today | values,elements,generic: usable | values,elements,generic: precise | values,elements,generic: precise, no equality |
+| --- | --- | --- | --- | --- |
+| Vue | 57.6 | 99.8 | 79.0 | 92.8 |
+| React | 44.5 | 100.0 | 66.8 | 75.3 |
+| Djot | 56.8 | 99.4 | 72.1 | 94.6 |
+| chai | 32.8 | 99.9 | 42.9 | 46.2 |
+| Richards | 74.9 | 100.0 | 82.0 | 98.4 |
+| DeltaBlue | 83.1 | 99.5 | 90.5 | 96.6 |
+| Crypto | 3.5 | 100.0 | 99.2 | 99.3 |
+| RayTrace | 78.9 | 99.2 | 97.9 | 98.5 |
+| EarleyBoyer | 70.2 | 99.5 | 73.2 | 95.8 |
+| RegExp | 33.7 | 100.0 | 78.9 | 78.9 |
+| Splay | 59.9 | 100.0 | 81.1 | 89.8 |
+| NavierStokes | 0.0 | 100.0 | 97.6 | 97.6 |
+| PdfJS | 22.1 | 99.8 | 78.2 | 85.5 |
+| Mandreel | 2.9 | 99.7 | 75.0 | 76.8 |
+| Gameboy | 39.1 | 100.0 | 90.6 | 93.7 |
+| CodeLoad | 43.2 | 99.9 | 74.8 | 91.0 |
+| Box2D | 57.7 | 98.8 | 94.0 | 96.5 |
+| zlib | 0.0 | 100.0 | 83.4 | 86.9 |
+| TypeScript | 77.5 | 99.2 | 86.6 | 95.8 |
+
+Coverage is 98.8-100% on all 19 workloads (today's caches: 0.0-83.1%). Precision by the tool's
+definitions (a generic named or element site precise, a String `length` site and equality, which
+records nothing by decision 3, not precise) is 42.9-99.2%.
+
+Precision by the census's own definitions (scripts/census-defs.py, Phase 1's census.py and
+coverage.py: every named site precise, as the generic marker the census assumed would make
+them; values and equality by their records under rule U, equality's in-line set empty;
+elements by rule R with the Array and typed-array receivers in line), on the census's files
+(Phase 1's patch) and this tip's, and both without equality:
+
+| workload | census | this run | census, no equality | this run, no equality |
+| --- | --- | --- | --- | --- |
+| Vue | 81.7 | 78.7 | 92.9 | 92.5 |
+| React | 67.2 | 66.9 | 75.4 | 75.4 |
+| Djot | 87.3 | 72.3 | 94.8 | 94.8 |
+| chai | 75.1 | 71.5 | 79.3 | 77.0 |
+| Richards | 82.0 | 82.0 | 98.4 | 98.4 |
+| DeltaBlue | 90.8 | 90.7 | 96.8 | 96.8 |
+| Crypto | 99.5 | 99.2 | 99.5 | 99.3 |
+| RayTrace | 98.5 | 98.5 | 99.2 | 99.2 |
+| EarleyBoyer | 78.2 | 73.4 | 96.2 | 96.0 |
+| RegExp | 85.8 | 85.8 | 85.8 | 85.8 |
+| Splay | 81.2 | 81.1 | 89.8 | 89.8 |
+| NavierStokes | 97.6 | 97.6 | 97.6 | 97.6 |
+| PdfJS | 85.7 | 79.7 | 87.1 | 87.1 |
+| Mandreel | 75.3 | 75.0 | 76.8 | 76.8 |
+| Gameboy | 92.6 | 90.6 | 94.1 | 93.7 |
+| CodeLoad | 75.3 | 74.8 | 91.0 | 91.0 |
+| Box2D | 95.4 | 95.1 | 97.7 | 97.7 |
+| zlib | 84.3 | 83.4 | 86.9 | 86.9 |
+| TypeScript | 88.9 | 88.5 | 98.1 | 97.9 |
+
+Without equality the tip's precision is the census's within 0.4 point on 18 of 19 workloads and
+2.3 points under it on chai. The records lost are elements': accesses the helpers' fast paths take
+without a record (step 4 records outside fast_get_elem's set, the census's patch outside the
+templates'), chai's 2.3 points and Gameboy's, Crypto's, EarleyBoyer's and TypeScript's 0.2-0.4,
+and what the element fix's generic sites no longer record, Vue's 0.4 point. With equality,
+the difference from the census is equality's records, which decision 3 removed: Djot 87.3% to
+72.3%, PdfJS 85.7% to 79.7%, EarleyBoyer 78.2% to 73.4%, Vue 81.7% to 78.7%, React 67.2% to 66.9%,
+chai 75.1% to 71.5%.
+
+### W4 step 2: the feedback census as a tracked diagnostic (record, 2026-11-04)
+
+The census tool of W4's design 8, behind the architecture-diagnostics feature, so ordinary builds
+compile none of it (9ddee0d7 on p2-w4, after step 1's schema, 8868b9a2, on main 1ca3e94f).
+TRUST_JS_FEEDBACK_CENSUS=<path> makes the VM's loop count its dispatches by chunk and pc, and
+snapshots each chunk's production feedback (property, call, construct and name caches, the
+allocation images; with steps 3-5 the always-on records and the named sites' generic mark) at the
+chunk's drop and at the shell's exit, which writes the file. Chunks are keyed by an FNV hash of
+their operations' text and their function's origin (start, length, url), which a --tier=bytecode
+run and a --tier=jit run share; a transformed (inlined) chunk is keyed apart. The file: a header
+naming the records the engine writes (`records=`), a C line per chunk key and an O line per pc
+with anything to say. scripts/feedback-census.py joins the two runs into coverage and precision
+by kind (feedback-schema.txt section 4); DIAGNOSTICS.md lists the variable after
+TRUST_JS_FEEDBACK_PROFILE.
+
+Files: crates/trust-js/src/feedback_census.rs (the registry, merge and file), bytecode_census.rs
+(a chunk's snapshot: each op's census kind and its caches' state word), feedback_census_tests.rs
+(3 tests: the VM's counts, a native chunk's mark and its uncounted dispatches, the snapshot of a
+dropped chunk), the hooks in bytecode.rs (the VM loop's count, the chunk's registration and
+Drop), lib.rs (unstable_feedback_census_dump, which the shell calls at exit), the shell
+(bin/trust-js.rs), scripts/feedback-census.py.
+
+The tool against the census's patch (Phase 1, 537ec5f1) on Vue: usable today 57.6% of the
+speculation kinds' executions, as the census measured, and the per-kind shares the same.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 1's engine, which is
+main 1ca3e94f's):
+
+| workload | step 1 (8868b9a2) | step 2 (9ddee0d7) | change |
+| --- | --- | --- | --- |
+| Vue | 1,765,188,495 | 1,765,188,883 | +0.00% |
+| React | 315,975,068 | 315,974,323 | -0.00% |
+| Djot | 633,121,634 | 633,148,059 | +0.00% |
+| chai | 79,510,774,361 | 79,539,301,039 | +0.04% |
+| Richards | 136,275,292 | 136,276,556 | +0.00% |
+| DeltaBlue | 261,571,409 | 261,569,594 | -0.00% |
+| Crypto | 728,972,545 | 728,966,809 | -0.00% |
+| RayTrace | 994,487,527 | 994,485,654 | -0.00% |
+| EarleyBoyer | 3,200,954,317 | 3,200,953,765 | -0.00% |
+| RegExp | 2,776,370,864 | 2,776,388,670 | +0.00% |
+| Splay | 1,401,352,438 | 1,401,348,187 | -0.00% |
+| NavierStokes | 451,452,526 | 451,440,511 | -0.00% |
+| PdfJS | 7,708,104,485 | 7,708,083,340 | -0.00% |
+| Mandreel | 62,954,030,592 | 62,954,842,281 | +0.00% |
+| Gameboy | 21,511,993,363 | 21,511,969,015 | -0.00% |
+| CodeLoad | 482,288,570 | 482,285,570 | -0.00% |
+| Box2D | 4,476,101,414 | 4,476,100,081 | -0.00% |
+| zlib | 138,040,672,479 | 138,040,658,163 | -0.00% |
+| TypeScript | 58,761,803,541 | 58,761,808,471 | +0.00% |
+
+No change (chai is one run, within its run-to-run spread). Checks on 9ddee0d7: the lib suite
+with the embed feature on ARM64 (2,764 passed, 9 ignored) and x86-64 (zombie: 2,545 passed, 9
+ignored); the census tests with architecture-diagnostics (3 of 3); clippy in the three
+configurations on both; Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to the
+base's report; the fixtures' masked output as the base's; difftest 138 agree, 12 skipped (budget).
+
+### W4 step 3: the value record, on the VM's paths and the miss paths only (record, 2026-11-04)
+
+W4's design 1 (0be2ad19 on p2-w4, after step 2). A chunk's feedback vector holds one u32 a
+bytecode pc, in an array made at the chunk's first record (FeedbackVector::record), so a chunk
+that never records holds none. An arithmetic, unary, update or relational comparison's word holds
+three ValueClass sets (operand 0 in bits 0-8, operand 1 in 9-17, the result in 18-26), ORed in and
+stored only when the word changes. The VM records every execution of these operations; generated
+code records on its miss paths (jit_exec's operations, String + String's helper, the string
+accumulation, the update helpers) only what lies outside the operation's in-line set: Number for
+all of them but `%`, whose in-line set is int32 (feedback-schema.txt section 5.1 lists the sets
+and rule U, the reading). Equality records nothing (decision 3). Nothing is written on an in-line
+path.
+
+x86-64 runs Add, Sub, Mul, Div, `%`, the shifts, Neg, Plus, BitNot and the updates in the
+helpers on every execution (it has in-line templates for comparisons, equality and the bitwise
+operators only). The first form of the step (15689456) tested each helper's operands against the
+in-line set after the operation, on every execution: x86-64 paid up to +11.4% (counts below). The
+step as landed splits the in-line set off by the helpers' own Number paths, which record and test
+nothing, and records on the other paths unconditionally (their operands are outside the set):
+x86-64 then pays -1.3% to +1.4% (its helpers' Number paths are a little shorter than before), and
+ARM64 is unchanged by the split.
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 2's engine):
+
+| workload | step 2 (9ddee0d7) | step 3 (0be2ad19) | change |
+| --- | --- | --- | --- |
+| Vue | 1,765,187,673 | 1,766,069,646 | +0.05% |
+| React | 315,974,097 | 316,388,162 | +0.13% |
+| Djot | 633,127,443 | 634,226,434 | +0.17% |
+| chai | 79,531,915,641 | 79,551,887,785 | +0.03% |
+| Richards | 136,278,165 | 136,272,160 | -0.00% |
+| DeltaBlue | 261,568,522 | 261,611,406 | +0.02% |
+| Crypto | 728,979,555 | 729,006,855 | +0.00% |
+| RayTrace | 994,481,204 | 994,943,740 | +0.05% |
+| EarleyBoyer | 3,200,955,569 | 3,200,995,837 | +0.00% |
+| RegExp | 2,776,412,701 | 2,777,035,546 | +0.02% |
+| Splay | 1,401,349,153 | 1,408,316,612 | +0.50% |
+| NavierStokes | 451,439,443 | 451,470,687 | +0.01% |
+| PdfJS | 7,708,042,611 | 7,742,651,750 | +0.45% |
+| Mandreel | 62,953,961,293 | 62,954,373,588 | +0.00% |
+| Gameboy | 21,512,008,278 | 21,509,140,729 | -0.01% |
+| CodeLoad | 482,285,558 | 482,291,598 | +0.00% |
+| Box2D | 4,476,098,763 | 4,476,819,571 | +0.02% |
+| zlib | 138,040,660,275 | 138,086,005,896 | +0.03% |
+| TypeScript | 58,761,113,571 | 58,762,391,396 | +0.00% |
+
+Counts, x86-64 (zombie, release with fat LTO, CPU 2, pacing off, median of 3 for the fixtures):
+
+| workload | step 2 (9ddee0d7) | step 3 (0be2ad19) | change |
+| --- | --- | --- | --- |
+| Vue | 3,698,088,043 | 3,701,677,908 | +0.10% |
+| React | 1,524,676,855 | 1,515,409,271 | -0.61% |
+| Djot | 1,365,567,751 | 1,364,068,229 | -0.11% |
+| chai | 177,147,527,269 | 177,277,113,258 | +0.07% |
+| Richards | 417,810,148 | 417,572,822 | -0.06% |
+| DeltaBlue | 749,464,841 | 748,826,550 | -0.09% |
+| Crypto | 27,030,912,871 | 27,115,802,969 | +0.31% |
+| RayTrace | 2,174,586,055 | 2,183,078,266 | +0.39% |
+| EarleyBoyer | 8,848,302,265 | 8,854,585,033 | +0.07% |
+| RegExp | 5,653,236,315 | 5,631,679,816 | -0.38% |
+| Splay | 2,688,076,429 | 2,719,837,944 | +1.18% |
+| NavierStokes | 18,985,225,919 | 18,745,793,797 | -1.26% |
+| PdfJS | 24,885,930,764 | 24,964,651,819 | +0.32% |
+| Mandreel | 472,889,836,340 | 477,471,870,164 | +0.97% |
+| Gameboy | 64,657,077,031 | 64,625,891,503 | -0.05% |
+| CodeLoad | 472,809,314 | 472,831,910 | +0.00% |
+| Box2D | 18,004,294,642 | 18,143,301,955 | +0.77% |
+| zlib | 1,859,373,237,640 | 1,885,322,340,795 | +1.40% |
+| TypeScript | 162,424,638,128 | 161,995,813,556 | -0.26% |
+
+The first form on x86-64, for the record: Vue +0.62%, React +1.31%, Djot +1.23%, Crypto +11.37%, NavierStokes +10.24%, zlib +8.70%, Mandreel +7.18%, Box2D +6.91%.
+
+Costs where the record is written: ARM64's fixtures +0.05% (Vue), +0.13% (React), +0.17% (Djot),
+against the census patch's +0.34%, +0.26% and +0.48% for the value and element records together;
+Splay +0.50% (its String + Number keys, whose Add takes the helper and records each time) and PdfJS
++0.45%, the rest within 0.05%.
+
+Coverage and precision (the census tool, step 2, on an architecture-diagnostics build of step 4,
+read with `--records values`: this step's record and the baseline's caches; "today" is the
+caches alone; "no equality" leaves out equality, which has no record by decision 3; % of the
+speculation kinds' executions):
+
+| workload | today | values: usable | values: precise | values: precise, no equality |
+| --- | --- | --- | --- | --- |
+| Vue | 57.6 | 94.2 | 76.3 | 89.6 |
+| React | 44.5 | 88.9 | 66.8 | 75.3 |
+| Djot | 56.8 | 96.7 | 71.6 | 93.9 |
+| chai | 32.8 | 45.9 | 37.7 | 40.6 |
+| Richards | 74.9 | 98.6 | 82.0 | 98.4 |
+| DeltaBlue | 83.1 | 96.8 | 90.4 | 96.5 |
+| Crypto | 3.5 | 84.1 | 84.0 | 84.1 |
+| RayTrace | 78.9 | 98.5 | 97.9 | 98.5 |
+| EarleyBoyer | 70.2 | 97.3 | 73.0 | 95.6 |
+| RegExp | 33.7 | 78.7 | 78.5 | 78.5 |
+| Splay | 59.9 | 99.7 | 80.8 | 89.5 |
+| NavierStokes | 0.0 | 69.4 | 69.4 | 69.4 |
+| PdfJS | 22.1 | 82.5 | 69.7 | 76.2 |
+| Mandreel | 2.9 | 72.2 | 69.9 | 71.5 |
+| Gameboy | 39.1 | 81.9 | 78.6 | 81.2 |
+| CodeLoad | 43.2 | 74.7 | 54.4 | 66.2 |
+| Box2D | 57.7 | 96.3 | 93.7 | 96.2 |
+| zlib | 0.0 | 81.1 | 76.8 | 80.0 |
+| TypeScript | 77.5 | 95.5 | 85.7 | 94.9 |
+
+Arithmetic's precision (rule U) is 89.7-100% on every workload but Splay (its string-building Add
+sites, read as String or Number by rule U: the census's own 59.5%), as the census measured.
+
+Checks on 0be2ad19: the lib suite with the embed feature on ARM64 (2,770 passed, 9 ignored) and
+x86-64 (zombie: 2,551 passed, 9 ignored); the record and census tests with architecture-
+diagnostics (56 of 56); clippy in the three configurations on x86-64 (this tree) and ARM64 (step
+4's tree, which holds it; the first form's on its own); Test262 at --tier=jit
+threshold 8, 53,575 of 53,575 and identical to the base's report; the fixtures' masked output as
+the base's; difftest 138 agree, 12 skipped (budget).
+
+### W4 step 4: the element record, on the VM's paths and the element helpers' misses (record, 2026-11-04)
+
+W4's design 2 (9163183e on p2-w4, after step 3). An element load's or store's word in the
+always-on record holds three bit sets, a byte each (feedback-schema.txt section 5.2): the
+receiver by its kind's tag (an Array, a typed array, another ordinary kind, an arguments object,
+another object, a String, another primitive), the key before ToPropertyKey (an array index,
+another Number, a String, a Symbol, anything else), and an Array's lost kind facts from its
+element words' kind bits (a hole, a non-Number, a non-int32, frozen or a shared literal's block,
+an index at or past the used words). The VM records every access before it runs it;
+get_computed_element and set_computed_element record only where fast_get_elem, fast_set_elem and
+ordinary_set_existing_index decline, and for String keys and receivers. The in-line set is then
+fast_get_elem's (an own data element of an Array or another ordinary object, or a typed array's
+element, at an array index), which holds ARM64's templates', and x86-64, whose element accesses
+all take the helpers, records what ARM64 would. The record is written by one out-of-line
+function, so the helpers' fast paths carry only a call on their miss branches. UpdateElem's word
+stays the value record's.
+
+The bits are the census patch's (Phase 1), regrouped a byte a set, with the patch's "object"
+split into ordinary kinds (the in-line set's) and other objects (exotic). The census's element
+precision (rule R: the record alone where it holds a receiver or key) is the census's within 0.1
+point on 15 of the 17 workloads measured (element loads: Vue 42.4%, React 0.0%, Djot 16.4%, chai
+20.1%, Crypto 97.0%, NavierStokes 92.8%, PdfJS 48.6%, Mandreel 15.1%, Gameboy 69.2%, CodeLoad
+73.4%), and lower on EarleyBoyer (4.4% against 8.4%) and Box2D (12.6% against 14.1%), whose
+helpers' fast paths take accesses the templates miss, which the patch recorded and this step
+does not: fewer records, the price of recording only outside fast_get_elem's set. An empty
+record never tells an Array from a typed array (design 2's known gap).
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 3's engine):
+
+| workload | step 3 (0be2ad19) | step 4 (9163183e) | change |
+| --- | --- | --- | --- |
+| Vue | 1,766,066,182 | 1,773,446,851 | +0.42% |
+| React | 316,387,266 | 316,386,299 | -0.00% |
+| Djot | 634,223,600 | 635,147,854 | +0.15% |
+| chai | 79,564,429,510 | 80,751,396,711 | +1.49% |
+| Richards | 136,268,263 | 136,273,226 | +0.00% |
+| DeltaBlue | 261,610,928 | 261,614,298 | +0.00% |
+| Crypto | 728,996,858 | 729,007,364 | +0.00% |
+| RayTrace | 994,953,306 | 994,943,274 | -0.00% |
+| EarleyBoyer | 3,200,993,392 | 3,202,926,005 | +0.06% |
+| RegExp | 2,777,048,391 | 2,777,047,163 | -0.00% |
+| Splay | 1,408,316,271 | 1,408,317,884 | +0.00% |
+| NavierStokes | 451,465,707 | 451,462,135 | -0.00% |
+| PdfJS | 7,742,616,305 | 7,760,963,131 | +0.24% |
+| Mandreel | 62,955,287,083 | 62,955,638,750 | +0.00% |
+| Gameboy | 21,509,151,431 | 21,509,439,504 | +0.00% |
+| CodeLoad | 482,287,066 | 482,469,683 | +0.04% |
+| Box2D | 4,476,776,019 | 4,476,887,468 | +0.00% |
+| zlib | 138,086,004,268 | 138,086,324,934 | +0.00% |
+| TypeScript | 58,762,416,033 | 58,982,123,135 | +0.37% |
+
+Counts, x86-64 (zombie, release, CPU 2, pacing off, median of 3 for the fixtures; step 3's engine):
+
+| workload | step 3 (0be2ad19) | step 4 (9163183e) | change |
+| --- | --- | --- | --- |
+| Vue | 3,701,677,398 | 3,709,713,123 | +0.22% |
+| React | 1,515,407,479 | 1,516,887,648 | +0.10% |
+| Djot | 1,364,078,936 | 1,365,487,671 | +0.10% |
+| chai | 177,212,823,541 | 180,315,651,045 | +1.75% |
+| Richards | 417,572,741 | 417,652,652 | +0.02% |
+| DeltaBlue | 748,833,653 | 749,049,621 | +0.03% |
+| Crypto | 27,115,788,645 | 27,160,922,535 | +0.17% |
+| RayTrace | 2,183,081,750 | 2,183,241,180 | +0.01% |
+| EarleyBoyer | 8,854,555,984 | 8,857,051,529 | +0.03% |
+| RegExp | 5,631,687,333 | 5,637,615,547 | +0.11% |
+| Splay | 2,719,835,308 | 2,719,900,471 | +0.00% |
+| NavierStokes | 18,745,799,700 | 18,807,811,214 | +0.33% |
+| PdfJS | 24,964,589,429 | 25,003,681,765 | +0.16% |
+| Mandreel | 477,471,806,227 | 478,453,995,436 | +0.21% |
+| Gameboy | 64,625,919,743 | 64,719,275,470 | +0.14% |
+| CodeLoad | 472,829,373 | 473,007,922 | +0.04% |
+| Box2D | 18,143,322,398 | 18,149,421,140 | +0.03% |
+| zlib | 1,885,322,557,664 | 1,889,221,912,858 | +0.21% |
+| TypeScript | 161,996,453,057 | 162,422,981,289 | +0.26% |
+
+Coverage and precision (the census tool on an architecture-diagnostics build of this step, read
+with `--records values,elements`; % of the speculation kinds' executions):
+
+| workload | today | values,elements: usable | values,elements: precise | values,elements: precise, no equality |
+| --- | --- | --- | --- | --- |
+| Vue | 57.6 | 98.7 | 77.8 | 91.4 |
+| React | 44.5 | 99.9 | 66.8 | 75.3 |
+| Djot | 56.8 | 99.3 | 72.0 | 94.5 |
+| chai | 32.8 | 71.2 | 42.8 | 46.1 |
+| Richards | 74.9 | 100.0 | 82.0 | 98.4 |
+| DeltaBlue | 83.1 | 99.5 | 90.5 | 96.6 |
+| Crypto | 3.5 | 100.0 | 99.2 | 99.3 |
+| RayTrace | 78.9 | 99.2 | 97.9 | 98.5 |
+| EarleyBoyer | 70.2 | 99.4 | 73.1 | 95.7 |
+| RegExp | 33.7 | 93.1 | 78.9 | 78.9 |
+| Splay | 59.9 | 100.0 | 81.1 | 89.8 |
+| NavierStokes | 0.0 | 100.0 | 97.6 | 97.6 |
+| PdfJS | 22.1 | 98.4 | 78.2 | 85.5 |
+| Mandreel | 2.9 | 99.6 | 75.0 | 76.7 |
+| Gameboy | 39.1 | 98.0 | 88.7 | 91.7 |
+| CodeLoad | 43.2 | 99.9 | 74.8 | 91.0 |
+| Box2D | 57.7 | 98.8 | 94.0 | 96.5 |
+| zlib | 0.0 | 100.0 | 83.4 | 86.9 |
+| TypeScript | 77.5 | 97.9 | 86.5 | 95.8 |
+
+Coverage is 97.9-100% on every workload but chai (71.2%) and RegExp (93.1%), whose uncovered
+named loads (66% and 27% of them) are String `length` reads that ARM64's templates answer in line
+by the receiver's tag, filling no way: not the uncacheable receivers the census inferred, so step
+5's generic mark leaves them, and the census commit after step 10 (54bed072) counts them usable.
+
+Costs: Vue +0.42%, React 0.00%, Djot +0.15%, chai +1.49% on ARM64 (Vue +0.22%, React +0.10%,
+Djot +0.10%, chai +1.75% on x86-64), PdfJS +0.24%, TypeScript +0.37%, the rest within 0.06%. The
+misses are mostly a String key on an ordinary object (chai's 104.6M element loads, most of them
+string-keyed), each recorded: record_element was 1.11% of chai's instructions (perf), its tag
+chains and the receiver's borrow most of it. A follow-up commit (737046b0, after step 10)
+classifies by tags first and reads the receiver without a borrow's counter; its record has its
+counts.
+
+Checks on 9163183e: the lib suite with the embed feature on ARM64 (2,769 of 2,770, 9 ignored:
+tests::execution_deadlines_abort_without_running_catch_or_finally_on_every_tier failed once under
+the suite's load, at its deadline's timing, as the plan's export-accessors record saw, and passes
+alone three of three) and x86-64 (zombie: 2,555 passed, 9 ignored); the record and census tests
+with architecture-diagnostics (56 of 56); clippy in the three configurations on both; Test262 at
+--tier=jit threshold 8, 53,575 of 53,575 and identical to the base's report; the fixtures' masked
+output as the base's; difftest 138 agree, 12 skipped (budget).
+
+### W4 step 4's follow-up: the element record classified by tags (record, 2026-11-04)
+
+Step 4's record cost chai +1.49% and Vue +0.42% on ARM64 (chai +1.75% on x86-64): their element
+helpers' misses are mostly a String key on an ordinary object, each recorded, and record_element
+(1.11% of chai's instructions, perf) matched the key's and the receiver's views through their
+tag chains and borrowed the receiver. It now tests a String key's tag first and reads the
+receiver's kind tag through an unguarded borrow (a mutably borrowed receiver reads as exotic):
+the same bits (737046b0, after the census commit).
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 10's engine):
+
+| workload | step 10 (d3657ec7) | follow-up (737046b0) | change |
+| --- | --- | --- | --- |
+| Vue | 1,779,897,988 | 1,777,356,881 | -0.14% |
+| React | 316,499,743 | 316,493,211 | -0.00% |
+| Djot | 637,553,756 | 637,348,793 | -0.03% |
+| chai | 80,846,499,643 | 80,691,323,254 | -0.19% |
+| Richards | 135,854,671 | 135,844,704 | -0.01% |
+| DeltaBlue | 262,372,718 | 262,371,611 | -0.00% |
+| Crypto | 728,996,250 | 728,992,272 | -0.00% |
+| RayTrace | 997,942,631 | 997,931,983 | -0.00% |
+| EarleyBoyer | 3,201,588,100 | 3,201,467,227 | -0.00% |
+| RegExp | 2,773,288,205 | 2,773,273,820 | -0.00% |
+| Splay | 1,409,000,507 | 1,408,997,569 | -0.00% |
+| NavierStokes | 451,465,538 | 451,453,596 | -0.00% |
+| PdfJS | 7,768,307,556 | 7,767,283,920 | -0.01% |
+| Mandreel | 62,959,246,380 | 62,958,860,201 | -0.00% |
+| Gameboy | 21,598,550,098 | 21,598,574,270 | +0.00% |
+| CodeLoad | 482,498,812 | 482,444,336 | -0.01% |
+| Box2D | 4,468,096,146 | 4,468,076,381 | -0.00% |
+| zlib | 138,092,080,442 | 138,092,035,373 | -0.00% |
+| TypeScript | 58,985,759,927 | 58,951,147,007 | -0.06% |
+
+Counts, x86-64 (zombie, release, CPU 2, pacing off, median of 3 for the fixtures):
+
+| workload | step 10 (d3657ec7) | follow-up (737046b0) | change |
+| --- | --- | --- | --- |
+| Vue | 3,719,694,393 | 3,717,826,591 | -0.05% |
+| React | 1,520,016,667 | 1,520,013,729 | -0.00% |
+| Djot | 1,371,884,433 | 1,371,918,345 | +0.00% |
+| chai | 180,724,591,114 | 180,584,530,456 | -0.08% |
+| Richards | 418,043,092 | 418,046,404 | +0.00% |
+| DeltaBlue | 752,508,176 | 752,498,846 | -0.00% |
+| Crypto | 27,096,207,959 | 27,096,223,056 | +0.00% |
+| RayTrace | 2,190,129,695 | 2,190,180,863 | +0.00% |
+| EarleyBoyer | 8,883,833,391 | 8,862,220,623 | -0.24% |
+| RegExp | 5,653,215,965 | 5,653,202,637 | -0.00% |
+| Splay | 2,722,398,660 | 2,722,343,095 | -0.00% |
+| NavierStokes | 18,757,792,112 | 18,757,791,518 | -0.00% |
+| PdfJS | 25,030,032,690 | 25,028,650,016 | -0.01% |
+| Mandreel | 477,888,468,121 | 477,888,701,104 | +0.00% |
+| Gameboy | 64,665,193,864 | 64,671,769,266 | +0.01% |
+| CodeLoad | 473,121,709 | 473,030,330 | -0.02% |
+| Box2D | 18,184,716,547 | 18,184,326,855 | -0.00% |
+| zlib | 1,885,549,289,607 | 1,885,549,432,416 | +0.00% |
+| TypeScript | 163,084,843,826 | 163,057,526,954 | -0.02% |
+
+It recovers a third of step 4's cost on Vue (-0.14%) and an eighth of chai's (-0.19%); what
+remains is the records' number, not their cost: chai's 104.6M element loads are mostly
+string-keyed and each is a miss.
+
+Checks on 737046b0: the lib suite with the embed feature on ARM64 (2,790 of 2,791, 9 ignored:
+gc_scan_spike::spike_scan_cost_is_linear_and_small, a wall-clock bound on a debug build's
+conservative-scan spike that W4 does not touch, failed under the suite's load and again alone
+while another agent's lib suite and Test262 ran at load 28) and x86-64 (zombie: 2,572 passed, 9
+ignored); the record and census tests with architecture-diagnostics (70 of 70); clippy in the
+three configurations on both; Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical
+to the base's report; the fixtures' masked output as the base's; difftest 138 agree, 12 skipped
+(budget).
+
+### W4 step 5: the named sites' generic mark (record, 2026-11-04)
+
+W4's design 3 (ed1ebdc8 on p2-w4, after step 4). A named load's or store's property cache carries
+one site-level bit: bit 7 of its way 0's mid_ok (bytecode.rs IC_MID_GENERIC), a byte no probe
+reads (feedback-schema.txt section 5.3). The fill path sets it, and only it: a refused fill (a
+read's uncacheable receiver or chain, a level ic_plain refuses: a proxy, a typed array, a
+side-table object; a store's receiver its cache cannot hold: an Array or other exotic, a proxy, a
+side-table object; a state with uncacheable shapes) or a fill that evicts a live way (a fifth
+receiver shape: V8's megamorphic transition past its four maps). Interp::ic_insert carries the
+mark into each new way 0; nothing clears it. The speculative tier reads a marked site as generic
+(the stub cache's probe or the generic [[Get]]/[[Set]], its ways a fast path), never as missing
+feedback.
+
+ARM64's property read template tested mid_ok by value at its depth-2 and depth-3 ways (`cbz`;
+`cmp #3; b.ne`); it now tests bits 0 and 1 (`tbz`), the same instructions, so the mark changes no
+generated code's length. x86-64's templates read no mid_ok.
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 4's engine):
+
+| workload | step 4 (9163183e) | step 5 (ed1ebdc8) | change |
+| --- | --- | --- | --- |
+| Vue | 1,773,460,915 | 1,774,006,083 | +0.03% |
+| React | 316,387,784 | 316,373,959 | -0.00% |
+| Djot | 635,189,330 | 635,201,622 | +0.00% |
+| chai | 80,756,757,226 | 80,754,441,063 | -0.00% |
+| Richards | 136,269,525 | 136,258,868 | -0.01% |
+| DeltaBlue | 261,614,606 | 261,598,045 | -0.01% |
+| Crypto | 729,014,998 | 729,002,990 | -0.00% |
+| RayTrace | 994,947,867 | 994,941,278 | -0.00% |
+| EarleyBoyer | 3,202,926,109 | 3,202,989,678 | +0.00% |
+| RegExp | 2,777,070,890 | 2,777,046,467 | -0.00% |
+| Splay | 1,408,315,494 | 1,408,303,391 | -0.00% |
+| NavierStokes | 451,466,418 | 451,447,793 | -0.00% |
+| PdfJS | 7,761,014,243 | 7,759,714,506 | -0.02% |
+| Mandreel | 62,954,156,351 | 62,955,287,876 | +0.00% |
+| Gameboy | 21,509,429,258 | 21,519,710,841 | +0.05% |
+| CodeLoad | 482,460,879 | 482,457,474 | -0.00% |
+| Box2D | 4,476,895,484 | 4,476,885,111 | -0.00% |
+| zlib | 138,086,321,679 | 138,086,285,715 | -0.00% |
+| TypeScript | 58,981,762,793 | 59,027,012,745 | +0.08% |
+
+Coverage and precision (the census tool on an architecture-diagnostics build of this step, read
+with `--records values,elements,generic`):
+
+| workload | today | values,elements,generic: usable | values,elements,generic: precise | values,elements,generic: precise, no equality |
+| --- | --- | --- | --- | --- |
+| Vue | 57.6 | 99.8 | 79.0 | 92.8 |
+| React | 44.5 | 99.9 | 66.8 | 75.3 |
+| Djot | 56.8 | 99.3 | 72.0 | 94.5 |
+| chai | 32.8 | 71.3 | 42.9 | 46.2 |
+| Richards | 74.9 | 100.0 | 82.0 | 98.4 |
+| DeltaBlue | 83.1 | 99.5 | 90.5 | 96.6 |
+| Crypto | 3.5 | 100.0 | 99.2 | 99.3 |
+| RayTrace | 78.9 | 99.2 | 97.9 | 98.5 |
+| EarleyBoyer | 70.2 | 99.5 | 73.2 | 95.8 |
+| RegExp | 33.7 | 93.1 | 78.9 | 78.9 |
+| Splay | 59.9 | 100.0 | 81.1 | 89.8 |
+| NavierStokes | 0.0 | 100.0 | 97.6 | 97.6 |
+| PdfJS | 22.1 | 98.4 | 78.2 | 85.5 |
+| Mandreel | 2.9 | 99.7 | 75.0 | 76.8 |
+| Gameboy | 39.1 | 100.0 | 90.6 | 93.7 |
+| CodeLoad | 43.2 | 99.9 | 74.8 | 91.0 |
+| Box2D | 57.7 | 98.8 | 94.0 | 96.5 |
+| zlib | 0.0 | 100.0 | 83.4 | 86.9 |
+| TypeScript | 77.5 | 97.9 | 86.5 | 95.8 |
+
+Costs: within 0.05% on every workload but TypeScript (+0.08%): the mark is written on the fill
+path only (Vue +0.03%, Gameboy +0.05%). Coverage rises where megamorphic or refused sites are:
+Vue 98.7% to 99.8%, Gameboy 98.0% to 100.0%, with precision (Vue 77.8% to 79.0%, Gameboy 88.7%
+to 90.6%). chai's and RegExp's named-load gaps stay (71.3%, 93.1%): they are not refused fills
+but String `length` reads, which the templates answer in line by the receiver's tag and which
+fill no way (chai's stringDistance, 66% of its named loads; RegExp's Exec, 19.6%); the census
+commit after step 10 (463a7312) counts them usable.
+
+Checks on ed1ebdc8: the lib suite with the embed feature on ARM64 (2,777 passed, 9 ignored) and
+x86-64 (zombie: 2,558 passed, 9 ignored); the record and census tests with architecture-
+diagnostics (63 of 63); clippy in the three configurations on both; Test262 at --tier=jit
+threshold 8, 53,575 of 53,575 and identical to the base's report; the fixtures' masked output as
+the base's; difftest 138 agree, 12 skipped (budget).
+
+### W4 step 6: the read API (record, 2026-11-04)
+
+W4's design 4 (1cbdda97 on p2-w4, after step 5). crate::feedback::read(chunk, pc) answers one typed
+view of the operation at a baseline pc, allocating and interning nothing: its shapes are the
+process's shape ids and its targets the process's cells, which the speculative tier, in the
+process that made them, compares directly (feedback_read.rs holds the views,
+bytecode_feedback_read.rs the chunk's side; feedback-schema.txt section 5.4):
+- Values (arithmetic, unary, update and relational operations, UpdateElem's too): the three
+  ValueClass sets by rule U and the record alone, whose int32/double split is a hint.
+- Element: the receivers and keys by rule U, and the record alone with an Array's facts (hints).
+- Named: each filled way, most recent first (receiver and holder shapes, depth, slot, slot
+  location; kind data, key-checked, accessor, absent or creation) and the generic mark;
+  NamedUpdate (UpdateProp) adds its value record's view.
+- Call: the state (empty, monomorphic, polymorphic, megamorphic) and each target's cell, function
+  literal (closures of one literal share it, V8's FeedbackCell), builtin id, native entry, realm,
+  and whether it was filled in the current call-cache epoch.
+- Construct: the target and the instances' prototype's shape.
+- Allocation: the kind (object, array, RegExp, closure) and whether the image and the template
+  (an object literal's template, an array literal's shared block, a RegExp literal's compiled
+  pattern) exist.
+- None: the rest; equality (no record by design), typeof and `in` among them.
+The schema says which parts are exact (ways and targets as read, each a proof generated code
+re-validates), which hints (int32, an Array's facts) and when a view goes stale (a call target
+of an older epoch). The constructor's capacity class stays in the callee's chunk; the survival
+record went to Phase 3 with decision 2. Nothing executes the API yet (its consumer is P3): the
+tests read each kind's view after a program that fills it.
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 5's engine):
+
+| workload | step 5 (ed1ebdc8) | step 6 (1cbdda97) | change |
+| --- | --- | --- | --- |
+| Vue | 1,773,998,630 | 1,773,987,481 | -0.00% |
+| React | 316,374,234 | 316,374,488 | +0.00% |
+| Djot | 635,170,542 | 635,179,639 | +0.00% |
+| chai | 80,751,276,965 | 80,745,970,516 | -0.01% |
+| Richards | 136,260,635 | 136,256,920 | -0.00% |
+| DeltaBlue | 261,606,089 | 261,601,563 | -0.00% |
+| Crypto | 729,004,875 | 729,019,899 | +0.00% |
+| RayTrace | 994,937,058 | 994,945,501 | +0.00% |
+| EarleyBoyer | 3,202,992,979 | 3,203,000,720 | +0.00% |
+| RegExp | 2,777,027,914 | 2,777,043,404 | +0.00% |
+| Splay | 1,408,307,054 | 1,408,302,924 | -0.00% |
+| NavierStokes | 451,452,904 | 451,452,627 | -0.00% |
+| PdfJS | 7,759,748,240 | 7,759,709,511 | -0.00% |
+| Mandreel | 62,955,392,721 | 62,957,153,186 | +0.00% |
+| Gameboy | 21,519,703,558 | 21,519,720,336 | +0.00% |
+| CodeLoad | 482,467,566 | 482,460,731 | -0.00% |
+| Box2D | 4,476,862,054 | 4,476,896,741 | +0.00% |
+| zlib | 138,086,307,602 | 138,086,317,126 | +0.00% |
+| TypeScript | 59,029,269,474 | 59,026,926,358 | -0.00% |
+
+No change (no code runs it). Checks on 1cbdda97: the lib suite with the embed feature on ARM64
+(2,782 passed, 9 ignored) and x86-64 (zombie: 2,563 passed, 9 ignored); the record and census
+tests with architecture-diagnostics (68 of 68); clippy in the three configurations on both;
+Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to the base's report; the
+fixtures' masked output as the base's; difftest 138 agree, 12 skipped (budget).
+
+### W4 step 7: the pc map and write-through of inlined and recompiled chunks (record, 2026-11-04)
+
+W4's design 7 (63344d12 on p2-w4, after step 6). A second-stage chunk (its hot callees spliced in)
+maps each of its value, element and named operations to the baseline site it was compiled from
+(feedback.rs RecordMap; feedback-schema.txt section 5.5): an operation of the function's own body
+to the function's baseline chunk, a splice's to its callee's. Both compiles read the same AST,
+the function's own body around its splices and each splice from its callee's body, so within one
+origin (the function's own body, or one splice, told apart by its position in the caller) the
+k-th operation of a kind is the k-th of that kind in the origin's baseline chunk; a kind whose
+count differs stays unmapped there. Source positions would not do: the compiler gives them only
+to nodes that can throw a located error (the spliced Add of the test has none). One u32 a pc and
+the targets, which the map holds.
+
+The second-stage chunk's vector (FeedbackVector::transformed, which replaces ::unbound) sends
+its always-on records and its detailed observations through the map into the baseline sites; its
+own words stay empty. The census's Phase 1 run found 98% of Vue's records in 18 sites of its 10
+inlined chunks, which no baseline site saw: they now land in the callees' and callers' own
+sites. Its caches stay its own; crate::feedback::read_merged adds a second-stage chunk's ways of
+a site to the baseline site's named view (a union past four ways is generic).
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 6's engine):
+
+| workload | step 6 (1cbdda97) | step 7 (63344d12) | change |
+| --- | --- | --- | --- |
+| Vue | 1,773,992,658 | 1,777,586,825 | +0.20% |
+| React | 316,373,522 | 316,485,034 | +0.04% |
+| Djot | 635,181,151 | 637,496,596 | +0.36% |
+| chai | 80,741,224,540 | 80,804,944,062 | +0.08% |
+| Richards | 136,257,038 | 136,651,987 | +0.29% |
+| DeltaBlue | 261,598,019 | 262,574,266 | +0.37% |
+| Crypto | 729,002,525 | 729,378,227 | +0.05% |
+| RayTrace | 994,938,816 | 995,847,113 | +0.09% |
+| EarleyBoyer | 3,202,997,668 | 3,203,856,822 | +0.03% |
+| RegExp | 2,777,026,048 | 2,777,172,033 | +0.01% |
+| Splay | 1,408,306,639 | 1,410,299,807 | +0.14% |
+| NavierStokes | 451,459,707 | 451,462,409 | +0.00% |
+| PdfJS | 7,759,717,628 | 7,774,707,051 | +0.19% |
+| Mandreel | 62,954,871,119 | 62,958,236,758 | +0.01% |
+| Gameboy | 21,519,727,223 | 21,561,449,704 | +0.19% |
+| CodeLoad | 482,468,067 | 482,473,647 | +0.00% |
+| Box2D | 4,476,865,180 | 4,480,974,690 | +0.09% |
+| zlib | 138,086,307,238 | 138,089,119,413 | +0.00% |
+| TypeScript | 59,027,117,422 | 59,117,106,969 | +0.15% |
+
+Coverage and precision (the census tool on an architecture-diagnostics build of this step):
+
+| workload | today | values,elements,generic: usable | values,elements,generic: precise | values,elements,generic: precise, no equality |
+| --- | --- | --- | --- | --- |
+| Vue | 57.6 | 99.8 | 79.0 | 92.8 |
+| React | 44.5 | 99.9 | 66.8 | 75.3 |
+| Djot | 56.8 | 99.3 | 72.0 | 94.5 |
+| chai | 32.8 | 71.2 | 42.9 | 46.2 |
+| Richards | 74.9 | 100.0 | 82.0 | 98.4 |
+| DeltaBlue | 83.1 | 99.5 | 90.5 | 96.6 |
+| Crypto | 3.5 | 100.0 | 99.2 | 99.3 |
+| RayTrace | 78.9 | 99.2 | 97.9 | 98.5 |
+| EarleyBoyer | 70.2 | 99.5 | 73.2 | 95.8 |
+| RegExp | 33.7 | 93.1 | 78.9 | 78.9 |
+| Splay | 59.9 | 100.0 | 81.1 | 89.8 |
+| NavierStokes | 0.0 | 100.0 | 97.6 | 97.6 |
+| PdfJS | 22.1 | 98.4 | 78.2 | 85.5 |
+| Mandreel | 2.9 | 99.7 | 75.0 | 76.8 |
+| Gameboy | 39.1 | 100.0 | 90.6 | 93.7 |
+| CodeLoad | 43.2 | 99.9 | 74.8 | 91.0 |
+| Box2D | 57.7 | 98.8 | 94.0 | 96.5 |
+| zlib | 0.0 | 100.0 | 83.4 | 86.9 |
+| TypeScript | 77.5 | 97.9 | 86.6 | 95.8 |
+
+Costs: Vue +0.20%, React +0.04%, Djot +0.36%, DeltaBlue +0.37%, Richards +0.29%, the rest within
+0.2%. They are the second stage's compile, not the records: the map's construction (std HashMaps
+over the chunks' operations) is in finish_chunk at every second-stage compile, and Djot's
+profile shows finish_chunk and the JIT's compile entry points up by about 0.5% of its
+instructions; a cheaper construction (a fast hasher, or the map made at the chunk's first
+record) is the obvious follow-up, not made here. The census's precision is unchanged on every
+workload: Vue's inlined chunks' 127,778 record writes now land in baseline sites (their own
+words, 6 nonzero before, are empty), but those sites' words already held the same classes (12
+nonzero baseline words either way): the census's records are no longer equality's, which
+filled the inlined sites' words in Phase 1's patch.
+
+Checks on 63344d12: the lib suite with the embed feature on ARM64 (2,784 passed, 9 ignored) and
+x86-64 (zombie: 2,565 passed, 9 ignored); the record and census tests with architecture-
+diagnostics (70 of 70); clippy in the three configurations on x86-64 (this tree) and ARM64 (step
+9's, which holds it); Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to the
+base's report; the fixtures' masked output as the base's; difftest 138 agree, 12 skipped
+(budget).
+
+### W4 step 9: Pilot C's store writability (record, 2026-11-04)
+
+W4's design 9, first half (f8f8bb01 on p2-w4, after step 7; step 8 moved to Phase 3 with decision
+2). Pilot C's proof is shapes keyed by attributes (W2d steps 1-2): a way's matching shape proves
+its property's attributes unchanged since the fill. What a store site's way could not prove was
+writability, since a read's fill could reach a store site's ways; the store templates tested the
+layout's attribute byte (guard_slot_writable_data). Now a store's or an update's site (SetProp,
+SetPropDrop, SetPropThisDrop, SetPropLocalDrop, AppendProp, UpdateProp) holds data ways for
+writable data properties only (feedback-schema.txt section 5.6), as the global name cache does
+since c9d8babe:
+- Interp::try_ic_set fills and promotes only a writable data property (as before);
+- an update's read (get_update_property) fills only an own writable data property and promotes
+  nothing from the stub cache, which reads share: its probe consumes Interp::ic_store_fill, so a
+  getter it calls reads as any read does;
+- a recompilation's seeds follow the sites' order and names, and a read's ways seeded into a
+  store's or an update's site are cleared (clear_read_seeded_stores).
+ARM64's SetProp and UpdateProp templates and the loop chains' property stores (their states are
+store sites' ways) then test no attribute byte: three instructions fewer at every hit where the
+layout has no attribute bytes (ldr, ldr, cbz), seven fewer in the code.
+x86-64 keeps its shared live checks. The read API reports the proof (NamedView::writable): a
+store's or an update's site's Data ways are writable data properties.
+
+Dump check (TRUST_JS_JIT_CODEDUMP, a monomorphic store site and update site, target/p2/w4/dump):
+
+The store chunk (`storeTarget.x = storeValue`) 272 words to 265, the update chunk
+(`updateTarget.x++`) 155 to 148: in each, the seven instructions of guard_slot_writable_data
+(ldr x9, [x11, #32]; ldr w16, [x9, #24]; cbz w16; ldr x9, [x9, #16]; ldrb w9, [x9, x13]; tbnz;
+tbz) are gone and nothing else changed but addresses and branch offsets (dump/step7.*.s,
+dump/step9.*.s).
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 7's engine):
+
+| workload | step 7 (63344d12) | step 9 (f8f8bb01) | change |
+| --- | --- | --- | --- |
+| Vue | 1,777,584,715 | 1,779,048,454 | +0.08% |
+| React | 316,485,331 | 316,497,448 | +0.00% |
+| Djot | 637,498,878 | 637,532,910 | +0.01% |
+| chai | 80,804,847,279 | 80,821,563,990 | +0.02% |
+| Richards | 136,653,633 | 135,859,918 | -0.58% |
+| DeltaBlue | 262,574,715 | 262,376,995 | -0.08% |
+| Crypto | 729,386,345 | 729,001,828 | -0.05% |
+| RayTrace | 995,843,498 | 997,946,254 | +0.21% |
+| EarleyBoyer | 3,203,865,885 | 3,201,575,743 | -0.07% |
+| RegExp | 2,777,168,742 | 2,774,144,269 | -0.11% |
+| Splay | 1,410,302,244 | 1,409,041,893 | -0.09% |
+| NavierStokes | 451,462,733 | 451,469,107 | +0.00% |
+| PdfJS | 7,774,736,156 | 7,773,604,983 | -0.01% |
+| Mandreel | 62,957,279,716 | 62,958,117,701 | +0.00% |
+| Gameboy | 21,561,457,837 | 21,598,594,521 | +0.17% |
+| CodeLoad | 482,481,676 | 482,511,235 | +0.01% |
+| Box2D | 4,481,015,444 | 4,467,742,988 | -0.30% |
+| zlib | 138,089,113,727 | 138,091,983,500 | +0.00% |
+| TypeScript | 59,117,598,085 | 58,995,438,481 | -0.21% |
+
+Costs: a gain where stores dominate (Richards -0.58%, Box2D -0.30%, TypeScript -0.21%, RegExp
+-0.11%), Vue +0.08%, React and Djot within 0.01%, RayTrace +0.21% and Gameboy +0.17%, which
+update sites' reads that no longer fill a non-writable or inherited way, or promote from the
+stub cache, may cost [inference].
+
+Checks on f8f8bb01 (counts, gate and dump on e331645c, the same engine: f8f8bb01 corrects a test's
+field count, 149 to 150, for the new Interp field): the lib suite with the embed feature on
+ARM64 (2,787 of 2,788, 9 ignored: tests::execution_deadlines_abort_without_running_catch_or_
+finally_on_every_tier under the suite's load, passing alone three of three) and x86-64 (zombie:
+2,569 passed, 9 ignored); the record and census tests with architecture-diagnostics (70 of 70);
+clippy in the three configurations on both; Test262 at --tier=jit threshold 8, 53,575 of 53,575
+and identical to the base's report; the fixtures' masked output as the base's; difftest 138
+agree, 12 skipped (budget).
+
+### W4 step 10: the dependency registry (record, 2026-11-04)
+
+W4's design 9, second half (d3657ec7 on p2-w4, after step 9): JSC's watchpoint sets
+(crates/trust-js/src/dependency.rs; feedback-schema.txt section 5.7). A set guards one fact
+compiled code may assume: clear (it holds and nothing relies on it), watched, or invalidated for
+good. A compilation gathers the sets it relies on (DesiredWatchpoints) and installs its code
+(CodeDependencies) in all of them at its end, failing with the fact's name if one fired
+meanwhile; firing invalidates every code installed in the set and unlinks the call caches that
+could enter it (CALL_IC_EPOCH's bump: Carried to Phase 3 names this registry as the home of
+JSC's incoming-call unlinking). The first producers:
+- a prototype's shape (Interp::prototype_shape_set): one set a prototype, shared until it fires
+  at the prototype's next structural change (Props::note_structural, which marking it a
+  prototype makes report);
+- the Array elements protector (Interp::array_protector_set): array_prototypes_unshadowed's
+  fact, guarded conservatively (the set fires at any structural change of Array.prototype or
+  Object.prototype, an indexed property's appearance among them) and invalidated from the start
+  where the fact does not hold.
+Sets are atomic and locked, as generator and async bodies run on pooled threads sharing the
+engine. The registry costs a marked prototype's structural change one load while no set is
+registered, nothing elsewhere. The test consumer (dependency_tests.rs) compiles "a method call on
+P's instances" relying on both sets: a new method on P.prototype invalidates it with the
+prototype's shape as the reason, an indexed Array.prototype with the protector, and a
+compilation after the protector fired fails to install. PROTO_EPOCH and CALL_IC_EPOCH stay the
+baseline caches' invalidation; P3 is the registry's first real consumer.
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; step 9's engine):
+
+| workload | step 9 (f8f8bb01) | step 10 (d3657ec7) | change |
+| --- | --- | --- | --- |
+| Vue | 1,779,055,162 | 1,779,869,357 | +0.05% |
+| React | 316,498,651 | 316,497,086 | -0.00% |
+| Djot | 637,508,547 | 637,526,654 | +0.00% |
+| chai | 80,820,938,107 | 80,842,311,568 | +0.03% |
+| Richards | 135,858,111 | 135,848,306 | -0.01% |
+| DeltaBlue | 262,373,586 | 262,375,604 | +0.00% |
+| Crypto | 729,005,288 | 728,997,358 | -0.00% |
+| RayTrace | 997,943,239 | 997,938,330 | -0.00% |
+| EarleyBoyer | 3,201,570,744 | 3,201,594,911 | +0.00% |
+| RegExp | 2,774,117,237 | 2,773,272,285 | -0.03% |
+| Splay | 1,409,040,715 | 1,409,001,664 | -0.00% |
+| NavierStokes | 451,470,462 | 451,458,508 | -0.00% |
+| PdfJS | 7,773,563,662 | 7,768,307,085 | -0.07% |
+| Mandreel | 62,957,599,277 | 62,959,572,624 | +0.00% |
+| Gameboy | 21,598,608,737 | 21,598,625,021 | +0.00% |
+| CodeLoad | 482,491,033 | 482,471,451 | -0.00% |
+| Box2D | 4,467,764,504 | 4,468,097,943 | +0.01% |
+| zlib | 138,092,004,385 | 138,092,065,383 | +0.00% |
+| TypeScript | 58,995,260,082 | 58,985,507,711 | -0.02% |
+
+No change but noise (Vue +0.05%, PdfJS -0.07%): nothing registers a set outside the tests.
+
+Checks on d3657ec7 (counts and gate on 969cc2fb, the same engine): the lib suite with the embed
+feature on ARM64 (2,791 passed, 9 ignored) and x86-64 (zombie: 2,572 passed, 9 ignored); the
+record and census tests with architecture-diagnostics (70 of 70); clippy in the three
+configurations on both; Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to the
+base's report; the fixtures' masked output as the base's; difftest 138 agree, 12 skipped
+(budget).
+
+### W4's census: a `length` load usable by its in-line String path (record, 2026-11-04)
+
+The census had put chai's and RegExp's uncovered named loads (66% and 27% of their named loads,
+at sites whose ways never fill) down to uncacheable receivers, which step 5's generic mark was
+to cover. They are String `length` reads (chai's stringDistance, RegExp's Exec), which ARM64's
+templates answer in line by the receiver's tag (emit_ascii_string_length) and which take no
+property cache. The snapshot now writes a named site's name after its operation, and the script
+counts a `length` load usable, as the plan's sense of usable counts an executed site its
+in-line path took (463a7312, after step 10; architecture-diagnostics and the script only, so no
+engine changes). Coverage and precision of the series' tip (737046b0) by the census tool:
+
+| workload | today | values,elements,generic: usable | values,elements,generic: precise | values,elements,generic: precise, no equality |
+| --- | --- | --- | --- | --- |
+| Vue | 57.6 | 99.8 | 79.0 | 92.8 |
+| React | 44.5 | 100.0 | 66.8 | 75.3 |
+| Djot | 56.8 | 99.4 | 72.0 | 94.5 |
+| chai | 32.8 | 99.9 | 42.9 | 46.2 |
+| Richards | 74.9 | 100.0 | 82.0 | 98.4 |
+| DeltaBlue | 83.1 | 99.5 | 90.5 | 96.6 |
+| Crypto | 3.5 | 100.0 | 99.2 | 99.3 |
+| RayTrace | 78.9 | 99.2 | 97.9 | 98.5 |
+| EarleyBoyer | 70.2 | 99.5 | 73.2 | 95.8 |
+| RegExp | 33.7 | 100.0 | 78.9 | 78.9 |
+| Splay | 59.9 | 100.0 | 81.1 | 89.8 |
+| NavierStokes | 0.0 | 100.0 | 97.6 | 97.6 |
+| PdfJS | 22.1 | 99.8 | 78.2 | 85.5 |
+| Mandreel | 2.9 | 99.7 | 75.0 | 76.8 |
+| Gameboy | 39.1 | 100.0 | 90.6 | 93.7 |
+| CodeLoad | 43.2 | 99.9 | 74.8 | 91.0 |
+| Box2D | 57.7 | 98.8 | 94.0 | 96.5 |
+| zlib | 0.0 | 100.0 | 83.4 | 86.9 |
+| TypeScript | 77.5 | 99.2 | 86.6 | 95.8 |
+
+Checks on 463a7312: the census and record tests with architecture-diagnostics (70 of 70); the
+lib suite with the embed feature on ARM64 (2,790 of 2,791: payload_cell_tests::a_long_string_
+held_only_by_a_property_lives_and_dies_with_it failed under the suite's load and passes alone
+three of three; the engine is step 10's, whose suite passed) and x86-64 (zombie: 2,572 passed, 9
+ignored); clippy in the three configurations on both.
+
+### W4's two fixes before landing: the record map's construction and the element record's generic mark (record, 2026-11-04)
+
+On p2-w4-rebased (the series rebased onto main 8370e936; worktree target/p2/w4/rebase-wt), after
+the series' tip f51ac144, each its own commit:
+
+be015ee4, step 7's fix: the record map made by kind codes and counting sorts, not hash maps. Step
+7's map cost each second-stage compile a std HashMap of Vecs a target chunk and another an origin
+(Djot +0.36%, DeltaBlue +0.37%, Vue +0.20%). Each operation kind the map names has a small code
+(mapped_kind); a target's operations are grouped by a counting sort, the transformed chunk's in
+two passes (counts by origin and kind, then ordinals), with an array of counts an origin: no
+hashing, an allocation a target, the same map.
+
+Counts, ARM64 (fat LTO, CPUs 10-13, pacing off, median of 3 for the fixtures; the rebased tip
+f51ac144's engine):
+
+| workload | f51ac144 | step 7's fix (be015ee4) | change |
+| --- | --- | --- | --- |
+| Vue | 1,728,690,122 | 1,727,929,427 | -0.04% |
+| React | 316,481,896 | 316,475,147 | -0.00% |
+| Djot | 631,591,650 | 630,670,155 | -0.15% |
+| chai | 80,250,693,408 | 80,243,828,040 | -0.01% |
+| Richards | 135,647,844 | 135,454,897 | -0.14% |
+| DeltaBlue | 261,150,939 | 260,818,295 | -0.13% |
+| Crypto | 728,419,161 | 728,209,292 | -0.03% |
+| RayTrace | 997,386,972 | 996,964,607 | -0.04% |
+| EarleyBoyer | 3,198,093,857 | 3,197,771,979 | -0.01% |
+| RegExp | 2,735,689,935 | 2,735,666,184 | -0.00% |
+| Splay | 1,409,089,045 | 1,408,931,381 | -0.01% |
+| NavierStokes | 451,423,675 | 451,413,478 | -0.00% |
+| PdfJS | 7,718,265,001 | 7,719,022,999 | +0.01% |
+| Mandreel | 62,941,912,177 | 62,940,094,334 | -0.00% |
+| Gameboy | 21,122,641,977 | 21,120,783,792 | -0.01% |
+| CodeLoad | 481,432,790 | 481,441,172 | +0.00% |
+| Box2D | 4,449,075,755 | 4,447,421,545 | -0.04% |
+| zlib | 138,090,624,156 | 138,090,675,543 | +0.00% |
+| TypeScript | 58,780,465,575 | 58,757,892,292 | -0.04% |
+
+It recovers Djot's -0.15%, DeltaBlue's -0.13%, Richards' -0.14% and Vue's -0.04% of step 7's +0.36%,
++0.37%, +0.29% and +0.20%; the rest is the records' write-through and the baseline sites' record
+arrays the transformed chunks now fill [inference].
+
+1fcb4c71, step 4's fix: a generic element site stops classifying at its helpers' misses. A key
+that is not an array index (a String, a Symbol, another Number, anything else) on an object
+receiver marks the site generic (ELEM_GENERIC, bit 24): its keys are names and values the record
+does not hold, so the speculative tier lowers it to the generic keyed access, as V8 does a
+megamorphic keyed load. As V8 stops updating a megamorphic site's feedback, the helpers' misses
+then read the mark (FeedbackVector::record_holds, one load) and classify and write nothing; the
+VM goes on recording, so the census's ground truth stays whole. The read API's element view and
+the census report the mark; the census counts a generic element site precise, as it does a
+generic named site. feedback-schema.txt section 5.2.
+
+Counts, ARM64 (as above; be015ee4's engine):
+
+| workload | be015ee4 | step 4's fix (1fcb4c71) | change |
+| --- | --- | --- | --- |
+| Vue | 1,727,932,109 | 1,723,567,304 | -0.25% |
+| React | 316,473,060 | 316,466,430 | -0.00% |
+| Djot | 630,694,459 | 630,023,056 | -0.11% |
+| chai | 80,241,263,633 | 80,175,815,153 | -0.08% |
+| Richards | 135,458,270 | 135,447,915 | -0.01% |
+| DeltaBlue | 260,817,071 | 260,815,361 | -0.00% |
+| Crypto | 728,198,477 | 728,197,752 | -0.00% |
+| RayTrace | 996,959,940 | 996,950,791 | -0.00% |
+| EarleyBoyer | 3,197,768,664 | 3,198,158,024 | +0.01% |
+| RegExp | 2,735,681,544 | 2,735,649,726 | -0.00% |
+| Splay | 1,408,932,035 | 1,408,921,167 | -0.00% |
+| NavierStokes | 451,421,022 | 451,401,077 | -0.00% |
+| PdfJS | 7,719,068,009 | 7,717,022,796 | -0.03% |
+| Mandreel | 62,940,662,852 | 62,940,476,247 | -0.00% |
+| Gameboy | 21,120,790,965 | 21,115,123,047 | -0.03% |
+| CodeLoad | 481,440,692 | 481,325,079 | -0.02% |
+| Box2D | 4,447,392,243 | 4,447,206,022 | -0.00% |
+| zlib | 138,090,699,062 | 138,090,693,850 | -0.00% |
+| TypeScript | 58,757,906,555 | 58,685,646,808 | -0.12% |
+
+Counts, x86-64, both fixes (zombie, release, CPU 2, pacing off; f51ac144's engine):
+
+| workload | f51ac144 | both fixes (1fcb4c71) | change |
+| --- | --- | --- | --- |
+| Vue | 3,676,668,132 | 3,665,582,938 | -0.30% |
+| React | 1,519,999,205 | 1,519,486,882 | -0.03% |
+| Djot | 1,363,394,827 | 1,360,693,218 | -0.20% |
+| chai | 178,953,207,781 | 178,822,516,093 | -0.07% |
+| Richards | 417,842,856 | 417,618,392 | -0.05% |
+| DeltaBlue | 751,709,495 | 750,234,591 | -0.20% |
+| Crypto | 27,099,868,140 | 27,104,750,767 | +0.02% |
+| RayTrace | 2,189,805,067 | 2,188,213,735 | -0.07% |
+| EarleyBoyer | 8,816,598,719 | 8,816,590,034 | -0.00% |
+| RegExp | 5,585,720,821 | 5,583,346,671 | -0.04% |
+| Splay | 2,722,384,502 | 2,721,998,581 | -0.01% |
+| NavierStokes | 18,762,805,781 | 18,766,852,215 | +0.02% |
+| PdfJS | 24,574,438,809 | 24,592,391,433 | +0.07% |
+| Mandreel | 457,125,535,442 | 457,447,799,148 | +0.07% |
+| Gameboy | 62,154,511,318 | 62,074,958,480 | -0.13% |
+| CodeLoad | 471,996,998 | 471,860,452 | -0.03% |
+| Box2D | 18,160,278,975 | 18,155,818,135 | -0.02% |
+| zlib | 1,817,972,666,694 | 1,818,319,306,549 | +0.02% |
+| TypeScript | 162,703,252,363 | 162,704,100,206 | +0.00% |
+
+Vue -0.25% and Djot -0.11% (x86-64 with both fixes -0.30% and -0.20%), TypeScript -0.12%, chai
+-0.08%: chai's records are not generic. Its element accesses at the census are 79.6% in line, 4.4%
+at String-keyed generic sites (61 record writes in all), and 15.9% at Array sites with index keys
+whose misses (holes and reads past the end, 8.7M record writes) each reclassify the Array's
+facts; record_element is still 0.94% of chai's instructions. A rule that stops a site's fact
+updates once its word holds ARRAY and an index key would remove them at the price of the facts'
+completeness (hints); not made.
+
+Checks on 1fcb4c71 (the series' tip on main 8370e936): the lib suite with the embed feature on
+ARM64 (2,794 passed, 9 ignored) and x86-64 (zombie: 2,575 passed, 9 ignored); the record and census tests
+with architecture-diagnostics (70 of 70); clippy in the three configurations on both; Test262 at
+--tier=jit threshold 8, 53,575 of 53,575 and identical to main's report; the fixtures' masked
+output as main's; difftest 138 agree, 12 skipped (budget).
