@@ -3957,25 +3957,6 @@ const _: () = assert!(
     (OBJECT_HEADER - std::mem::size_of::<Object>() + std::mem::offset_of!(Object, proto)) % 8 == 0
 );
 
-/// The cell header's words of the instance of the plain-object literal template `template` that
-/// holds its values in its cell, as the helper makes it (`init_instance_plain`, with `proto`), for
-/// generated code to copy (W2e step 3); `None` when the values would not fit the cell or the map
-/// would keep a record (a key index or extras copied from the template).
-pub(crate) fn object_header_image(
-    template: &Props,
-    proto: Option<Gc>,
-) -> Option<[u64; OBJECT_HEADER / 8]> {
-    let class = template.entries.class();
-    let count = template.entries.len();
-    if count > class_slots(class) {
-        return None;
-    }
-    let reference = Object::new_built(proto, ObjectKind::Plain, class, |props| {
-        props.init_instance_plain(template, (0..count).map(|_| Value::Undefined))
-    });
-    header_image(&reference)
-}
-
 /// The cell header's words of `object`, a fresh plain object or Array the helper path made, for
 /// generated code to copy into objects it makes as that one (W2e steps 3 and 4); `None` when its
 /// map keeps a record. Each field is copied at its offset into a zeroed image, so padding stays

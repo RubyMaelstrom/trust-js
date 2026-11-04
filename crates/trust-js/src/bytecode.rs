@@ -3347,31 +3347,13 @@ impl crate::gc_trace::GcTrace for Chunk {
 }
 
 impl Chunk {
-    /// Make object-literal template site `tidx`'s image (W2e step 3) once its template exists,
-    /// after an execution that made or used it; a site whose image cannot be made stays unready,
-    /// and native code keeps taking the helper there.
+    /// Make object-literal template site `tidx`'s image (W2e step 3) from `object`, the fresh
+    /// instance an execution of the site just made, unless it is ready. A site whose image cannot
+    /// be made (a map that keeps a record) stays unready, and native code keeps taking the helper.
     #[inline]
-    pub(crate) fn fill_object_image(&self, tidx: u32, proto: crate::value::Gc) {
-        let Some(image) = self.obj_images.get(tidx as usize) else {
-            return;
-        };
-        if image.ready.get() != 0 {
-            return;
-        }
-        self.fill_object_image_cold(image, tidx, proto);
-    }
-
-    #[cold]
-    #[inline(never)]
-    fn fill_object_image_cold(&self, image: &ObjectImage, tidx: u32, proto: crate::value::Gc) {
-        let Some(template) = self.obj_maps.get(tidx as usize).and_then(|map| map.get()) else {
-            return;
-        };
-        if let Some(words) = crate::value::object_header_image(template, Some(proto)) {
-            for (cell, word) in image.words.iter().zip(words) {
-                cell.set(word);
-            }
-            image.ready.set(1);
+    pub(crate) fn fill_object_image(&self, tidx: u32, object: &Value) {
+        if let Some(image) = self.obj_images.get(tidx as usize) {
+            image.fill_from(object, 0);
         }
     }
 
@@ -19441,7 +19423,7 @@ fn run_vm_inner(
                 let v = if tidx != u32::MAX {
                     let value =
                         i.make_plain_object_templated(&chunk.obj_maps[tidx as usize], keys, values);
-                    chunk.fill_object_image(tidx, i.object_proto);
+                    chunk.fill_object_image(tidx, &value);
                     value
                 } else {
                     i.make_plain_object_vm(keys, values)
@@ -25360,7 +25342,7 @@ pub(crate) unsafe extern "C" fn jit_make_object(
     let v = if tidx != u32::MAX {
         let value =
             i.make_plain_object_templated_from(&chunk.obj_maps[tidx as usize], keys, base, count);
-        chunk.fill_object_image(tidx, i.object_proto);
+        chunk.fill_object_image(tidx, &value);
         value
     } else {
         let mut values = Vec::with_capacity(count);
@@ -28535,7 +28517,7 @@ unsafe fn jit_exec_inner(
             let v = if tidx != u32::MAX {
                 let value =
                     i.make_plain_object_templated(&chunk.obj_maps[tidx as usize], keys, values);
-                chunk.fill_object_image(tidx, i.object_proto);
+                chunk.fill_object_image(tidx, &value);
                 value
             } else {
                 i.make_plain_object_vm(keys, values)
