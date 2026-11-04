@@ -1681,6 +1681,7 @@ impl Interp {
     fn trace_gc_roots(&self, sink: &mut dyn GcSink) {
         let Interp {
             gc_heap: _,
+            gc_core_raw: _,
             realm_id: _,
             symbol_agent,
             global,

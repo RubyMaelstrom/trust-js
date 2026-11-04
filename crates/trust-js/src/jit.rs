@@ -10033,9 +10033,11 @@ fn emit_direct_sequence(
         a.mov(1, 10);
         // W2e step 6: `this` in line from the callee's instance image; the helper otherwise.
         let made = a.new_label();
-        if let Some(heap) = crate::value::object_inline_alloc_site(0) {
+        // In a shared stub too: the allocation reads the running Agent's heap (see
+        // `gc_core::InlineAllocSite`).
+        if crate::value::object_inline_alloc_site(0).is_some() {
             let helper = a.new_label();
-            alloc::emit_inline_construct_this(a, &heap, helper, made);
+            alloc::emit_inline_construct_this(a, helper, made);
             a.bind(helper);
         }
         a.ldr_imm(16, 21, (H_CONSTRUCT_THIS * 8) as u32);

@@ -217,6 +217,53 @@ fn in_line_this_objects_are_the_helpers() {
     );
 }
 
+/// In-line `this` objects live in the running Agent's heap, whichever heap was active when the
+/// code was assembled: the direct construct sequence is a process-wide shared stub, which once
+/// built in the heap it was first assembled under and handed later engines that heap's cells
+/// (a dropped heap's: a crash). Two engines on one thread, each alive while the other runs.
+#[test]
+fn in_line_this_objects_live_in_the_running_agents_heap() {
+    let source = "function P(x, y) { this.x = x; this.y = y; }
+         function make(i) { return new P(i, 2 * i); }
+         var made = [];
+         for (var i = 0; i < 2000; i++) { var p = make(i); if (i % 50 === 0) made.push(p); }
+         made.length";
+    let mut engines = [engine(Tier::Jit), engine(Tier::Jit)];
+    for round in 0..2 {
+        for (index, engine) in engines.iter_mut().enumerate() {
+            let before = in_line_constructs();
+            let _active = engine.interp.enter_agent();
+            assert_eq!(eval(engine, source), "40", "engine {index}, round {round}");
+            assert!(
+                in_line_constructs() > before,
+                "engine {index}: no in-line this"
+            );
+            let made = global(engine, "made");
+            let heap = engine.interp.gc_heap.clone();
+            for k in 0..40 {
+                let p = engine
+                    .interp
+                    .get_member_key(&Value::Obj(made), &k.to_string())
+                    .ok()
+                    .and_then(|value| value.as_obj())
+                    .expect("an instance");
+                assert!(
+                    heap.core
+                        .borrow()
+                        .owns_cell(Gc::as_ptr(&p) as usize, heap.object_desc),
+                    "engine {index}, round {round}: instance {k} lives in another heap"
+                );
+            }
+            engine.interp.gc_collect();
+            assert_eq!(
+                crate::value::heap_live_objects(&heap),
+                heap.core.borrow().live_count(heap.object_desc) as i64,
+                "engine {index}: the live count is the live cells'"
+            );
+        }
+    }
+}
+
 /// A constructor whose instances reserve a record (more fields than their cell holds) keeps the
 /// helper, and a deferred `prototype` is made by the helper's first construction.
 #[test]

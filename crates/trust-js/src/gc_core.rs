@@ -1201,9 +1201,9 @@ struct Cursor {
 const NO_PAGE: u32 = u32::MAX;
 
 /// W2e's inline allocation in generated code (its first use: a fresh frame's activation, W3
-/// item 3's step 7): a small cell of one size class for one descriptor, taken from the heap's
-/// cursor as [`Heap::alloc_small_uninit`] takes it, by code that reads and writes the heap and
-/// the cursor at the offsets of [`inline_alloc`]. The code takes the fast path's steps: it
+/// item 3's step 7): a small cell of one size class for one descriptor, taken from the running
+/// heap's cursor as [`Heap::alloc_small_uninit`] takes it, by code that reads and writes the heap
+/// and the cursor at the offsets of [`inline_alloc`]. The code takes the fast path's steps: it
 /// branches to its slow path (a helper that allocates in Rust) unless the heap allocates fast
 /// ([`Heap::fast_alloc`]) and the cursor's word has a free cell; then it takes the lowest free
 /// cell (the page's bitmap bit, the cursor's `taken` and `high`) and computes its address. It
@@ -1211,10 +1211,13 @@ const NO_PAGE: u32 = u32::MAX;
 /// refill), as JavaScriptCore charges a consumed free list at its refill (W2e step 8). No poll
 /// follows an in-line allocation (W2e's design 1): a collection falls due at a refill, inside the
 /// helper, whose end poll collects, or runs at the next entry or back-edge poll.
+///
+/// The code reads the heap's address at run time, from its context's interpreter
+/// (`Interp::gc_core_raw`): the running Agent's heap. It builds in no heap's address, since a
+/// process-wide shared stub (the direct construct sequence's) runs under every Agent and thread;
+/// a cursor's index is the same in every engine heap, whose descriptors register in one order.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlineAllocSite {
-    /// The heap's address: its fields sit at [`inline_alloc`]'s offsets from it.
-    pub(crate) heap: usize,
     /// The cursor's index in the heap's cursors ([`inline_alloc::HEAP_CURSOR_BASE`]).
     pub(crate) cursor: usize,
     /// The size class's cell size.
@@ -1778,7 +1781,6 @@ impl Heap {
     pub(crate) fn inline_alloc_site(&self, desc: DescId, class: u8) -> Option<InlineAllocSite> {
         let class = usize::from(class);
         Some(InlineAllocSite {
-            heap: std::ptr::from_ref(self) as usize,
             cursor: desc.0 as usize * SIZE_CLASSES.len() + class,
             cell_size: SIZE_CLASSES[class],
         })

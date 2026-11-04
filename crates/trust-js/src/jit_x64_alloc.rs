@@ -11,7 +11,13 @@ use crate::gc_core::{inline_alloc as off, InlineAllocSite};
 /// the cell is charged and counted at its cursor's next flush (W2e step 8). Clobbers rax, rcx,
 /// rdx, r8, r10 and r11.
 pub(super) fn emit_inline_alloc(a: &mut Asm, site: &InlineAllocSite, slow: usize) {
-    a.nr_imm(R10, site.heap as u64);
+    // The running interpreter's heap, through the context (see `gc_core::InlineAllocSite`).
+    a.nr_load(R10, CTX, std::mem::offset_of!(super::super::JitCtx, interp));
+    a.nr_load(
+        R10,
+        R10,
+        std::mem::offset_of!(crate::interpreter::Interp, gc_core_raw),
+    );
     a.nr_load8(AX, R10, off::HEAP_FAST_ALLOC);
     a.nr_zero_guard(AX, slow);
     a.nr_load(R11, R10, off::HEAP_CURSOR_BASE);

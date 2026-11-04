@@ -24,6 +24,17 @@ fn lsl_reg_x(a: &mut asm::Asm, rd: u32, rn: u32, rm: u32) {
     a.word(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd);
 }
 
+/// The running interpreter's heap into x10, through the context (x19): the code allocates in
+/// its Agent's heap, wherever it was assembled ([`InlineAllocSite`]).
+fn emit_heap_load(a: &mut asm::Asm) {
+    a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.ldr_imm(
+        10,
+        10,
+        std::mem::offset_of!(crate::interpreter::Interp, gc_core_raw) as u32,
+    );
+}
+
 /// Take a cell of `site`'s size class into `dst` in line, or branch to `slow` having changed
 /// nothing ([`InlineAllocSite`]): when the heap counts each allocation or the cursor's word has
 /// no free cell (the slow path's Rust allocation then refills the cursor, which charges and
@@ -33,7 +44,7 @@ fn lsl_reg_x(a: &mut asm::Asm, rd: u32, rn: u32, rm: u32) {
 /// barrier: the cell is young. Clobbers x10-x15.
 pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u32, slow: usize) {
     debug_assert!(!(10..=15).contains(&dst));
-    a.mov_imm64(10, site.heap as u64);
+    emit_heap_load(a);
     a.ldrb_imm(11, 10, off::HEAP_FAST_ALLOC as u32);
     a.cbz(11, false, slow);
     a.ldr_imm(12, 10, off::HEAP_CURSOR_BASE as u32);
@@ -186,18 +197,17 @@ pub(super) fn emit_inline_array_elements(
 }
 
 /// [`emit_inline_alloc`] of a class chosen at run time (W2e step 6): the cursor's byte offset
-/// among the heap's cursors in x`cursor` and the cell's size in x`size` (neither in x10-x15);
-/// `heap`'s heap is the code's own. Clobbers x10-x15.
+/// among the heap's cursors in x`cursor` and the cell's size in x`size` (neither in x10-x15).
+/// Clobbers x10-x15.
 pub(super) fn emit_inline_alloc_dynamic(
     a: &mut asm::Asm,
-    heap: &InlineAllocSite,
     cursor: u32,
     size: u32,
     dst: u32,
     slow: usize,
 ) {
     debug_assert!(![dst, cursor, size].iter().any(|r| (10..=15).contains(r)));
-    a.mov_imm64(10, heap.heap as u64);
+    emit_heap_load(a);
     a.ldrb_imm(11, 10, off::HEAP_FAST_ALLOC as u32);
     a.cbz(11, false, slow);
     a.ldr_imm(12, 10, off::HEAP_CURSOR_BASE as u32);
@@ -216,12 +226,7 @@ pub(super) fn emit_inline_alloc_dynamic(
 /// cached shape and slot (in the cell, an Object: not the deferred prototype, which the helper
 /// makes), then allocates the image's class, as V8's FastNewObject and SpiderMonkey's call stub
 /// make `this` on the caller's side (target/p2/w2e/exemplars.txt, 1.4, 2.4). Clobbers x2-x17.
-pub(super) fn emit_inline_construct_this(
-    a: &mut asm::Asm,
-    heap: &InlineAllocSite,
-    helper: usize,
-    made: usize,
-) {
+pub(super) fn emit_inline_construct_this(a: &mut asm::Asm, helper: usize, made: usize) {
     use crate::bytecode::{CallIc, Chunk, ConstructSite, InstanceImage};
     use std::mem::offset_of;
     let chunk = offset_of!(ConstructSite, call) + offset_of!(CallIc, chunk_raw);
@@ -248,7 +253,7 @@ pub(super) fn emit_inline_construct_this(
     a.ubfx(8, 8, 0, 48);
     a.ldr_imm(5, 3, offset_of!(InstanceImage, cursor) as u32);
     a.ldr_imm(6, 3, offset_of!(InstanceImage, cell_size) as u32);
-    emit_inline_alloc_dynamic(a, heap, 5, 6, 9, helper);
+    emit_inline_alloc_dynamic(a, 5, 6, 9, helper);
     emit_header_copy(
         a,
         3,

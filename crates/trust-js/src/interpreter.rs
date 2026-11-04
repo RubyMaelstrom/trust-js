@@ -4643,6 +4643,11 @@ pub struct Interp {
     /// Collector ownership follows the ECMAScript Agent, not the native thread currently running
     /// one of its suspended execution contexts. All realms in this interpreter share this heap.
     pub(crate) gc_heap: crate::value::GcHeap,
+    /// The address of `gc_heap`'s core (`gc_core::Heap`), fixed for the interpreter's life: what
+    /// generated code's in-line allocation reads through its context's interpreter (W2e), so
+    /// that it allocates in the running Agent's heap. Code builds in no heap's address, since a
+    /// process-wide shared stub (the direct construct sequence's) runs under every Agent.
+    pub(crate) gc_core_raw: usize,
     pub(crate) realm_id: crate::agent_access::RealmId,
     /// ECMA-262 Agent Record symbol state, shared by all realms including ShadowRealms.
     pub(crate) symbol_agent: crate::value::SymbolAgent,
@@ -5149,6 +5154,7 @@ macro_rules! interp_memory_inventory {
 #[cfg(test)]
 interp_memory_inventory! {
     gc_heap => "measured",
+    gc_core_raw => "non_owning",
     realm_id => "non_owning",
     symbol_agent => "measured",
     global => "measured",
@@ -6865,6 +6871,7 @@ impl Interp {
         runtime_interrupt.register(&poll);
         crate::value::attach_poll_word(&gc_heap, &poll);
         let mut interp = Interp {
+            gc_core_raw: gc_heap.core.as_ptr() as usize,
             gc_heap: gc_heap.clone(),
             realm_id: if owns_heap {
                 crate::agent_access::RealmId::ROOT
@@ -13425,6 +13432,7 @@ impl Interp {
             // Not keyed by object addresses: intrinsics and roots, execution state, counters, and
             // tables keyed by shapes, names, ids, source text or AST nodes.
             gc_heap: _,
+            gc_core_raw: _,
             realm_id: _,
             global: _,
             global_env: _,
