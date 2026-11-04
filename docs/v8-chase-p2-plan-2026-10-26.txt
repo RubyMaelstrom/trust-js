@@ -10260,3 +10260,17 @@ RegExp +0.04%, React +0.03%, the rest within 0.01%. Checks on a31509fe: the lib 
 embed feature on ARM64 (2,764) and x86-64 (zombie, 2,545); clippy in the three configurations on
 x86-64; Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to main's report; the
 fixtures' masked output as main's; difftest 138 agree, 12 skipped (budget).
+
+### The tier threshold at 1, counted on today's main (record, 2026-11-04)
+
+For the owner's open threshold decision ("The phase exit's gap, measured"): instructions at
+TRUST_JS_TIER_THRESHOLD=1 against the default 8, main 3c09e454's engine (fat LTO, CPUs 10-13,
+pacing off, median of 3; target/p2/djot-compile/counts-t1.txt): Vue +0.28%, React +5.57%, Djot
+-0.87%, chai -0.19%, Richards +5.95%, DeltaBlue -3.77%, Crypto -0.71%, RayTrace +2.26%,
+EarleyBoyer +2.40%, RegExp -1.01%, Splay -0.00%, NavierStokes +0.14%, PdfJS -0.55%, Mandreel
++0.21%, Gameboy -1.07%, CodeLoad +10.12%, Box2D -2.07%, zlib -0.03%, TypeScript -1.12%.
+Instructions do not price the tree-walker's time per instruction, which is where threshold 1
+saves, so the decision needs the timing (at W3's exit threshold 1 took Djot from 105 to 96 ms,
+-8.6%); it waits for a quiet machine (the other load was 3.7 cores, over the 2 the timing rule
+allows).
+
