@@ -11091,3 +11091,139 @@ machine code for the same platform functions. So the reuse comes first, as its o
 shared script data, JSC's bytecode cache), with the compact templates (which shrink every compile
 at any threshold); then the threshold, where t1a2 is the measured choice (Djot -9.5%, React -3.2%,
 Vue 0.0% on the fixtures' timers).
+
+### Compact baseline templates (census, survey and design, 2026-11-04)
+
+The owner approved compact baseline templates on 2026-11-04 ("The owner's answers" above): the
+sites outside hot code that still emit hundreds of bytes take the shared-stub mechanism, hot code
+keeps today's in-line templates; a design note first. Census on main a31509fe's engine (fat LTO,
+target/p2/lto/a31509fe; main f3ab7b2b's engine adds W2g step 5); tools and data in target/p2/compact (untracked): opbytes.py (bytes by
+operation from a TRUST_JS_JIT_MAP=1 log), opsamples.py (the same split by instruction samples),
+census.sh.
+
+What exists:
+- Tiering. A function runs its first 8 calls (TRUST_JS_TIER_THRESHOLD; backedges count 1/16) in
+  the tree-walker, which fills no cache (W4's census). Its first native compile happens at its
+  first bytecode run (TRUST_JS_JIT_ADMIT_RUNS, default 0, interpreter.rs:14884-14897), so every
+  property, call and name cache of the chunk is empty when its code is made. The second stage
+  (try_inline_recompile, interpreter.rs:15896-15905) recompiles a function at 100 machine-code
+  runs with its callees spliced in, seeded with the warm caches (Chunk::jit_cache_preferred,
+  bytecode.rs:21854-21863), and bumps the global call-cache epoch; a function with nothing to
+  inline ("empty plan") keeps its first-stage code.
+- So a first-stage property read bakes no probe: it probes the cache's ways through the shared
+  PropWays stub (jit.rs:7234-7261), and its in-line code is the receiver's test, the stub call,
+  the landings (entry and bounds, the accessor test, the `prototype` guard, the key-checked arm,
+  the absent value), the commit and the slow path (jit.rs:6942-7368).
+- Shared stubs: one process-wide copy each, reached through a two-instruction-target veneer per
+  chunk (emit_shared_stubs, jit.rs:13810-13830). use_shared_stub (jit.rs:13730-13743) puts the
+  name reads' cache proof, the direct call and construct sequences and the call intrinsics in a
+  stub outside loops (`hot` = the pc is in a loop, jit.rs:5122); the property way loop, the
+  secondary call probes and every slow path's helper call (three instructions a site,
+  jit.rs:19455-19472) are shared everywhere.
+
+Census (main a31509fe's engine; a site's span runs from its [jit-map-pc] offset to the next;
+spans holding a `region:` mark are region code; SPE samples about one operation in 1,024, user
+mode, on CPU 13 (census.sh); a site never sampled ran fewer than about a thousand operations of its
+template after its compile). PMU sampling returned IP 0 for 75% of its samples here; SPE did not.
+
+| fixture | compiles | template bytes | never sampled | region bytes | never sampled | samples in generated code |
+| --- | --- | --- | --- | --- | --- | --- |
+| Djot | 159 | 1,664,924 | 72.4% | 2,297,924 | 55.0% | 22.9% |
+| React | 11 | 79,880 | 67.8% | 224,884 | 38.5% | 67.5% |
+| Vue | 55 | 343,448 | 51.8% | 278,316 | 53.1% | 22.7% |
+
+Djot's templates by operation (the largest; bytes, the share in sites never sampled):
+
+| operation | sites | bytes | a site | never sampled |
+| --- | --- | --- | --- | --- |
+| GetPropLocal | 696 | 310,552 | 446 | 77.5% |
+| CallWithThis | 518 | 215,872 | 417 | 77.0% |
+| GetMethod | 370 | 168,204 | 455 | 75.3% |
+| LoadLocal | 1,496 | 116,232 | 78 | 78.0% |
+| StrictEq | 188 | 104,852 | 558 | 48.1% |
+| GetProp | 232 | 79,716 | 344 | 68.1% |
+| ReturnUndef (with the chunk's tail) | 147 | 61,696 | 420 | 13.0% |
+| GetPropThis | 131 | 55,260 | 422 | 69.8% |
+| Not | 140 | 42,000 | 300 | 84.3% |
+| LoadName | 392 | 35,276 | 90 | 77.4% |
+| SetProp | 42 | 34,776 | 828 | 78.6% |
+| SetPropThisDrop, SetPropDrop | 72 | 52,412 | 728 | 84.7% |
+
+The four property reads, CallWithThis and LoadLocal are 56.8% of Djot's template bytes, 75.8% of
+those bytes in sites that barely run. Djot's 159 compiles make 3.96 MB, 24.9 KB each; its compile is spread
+over the emitter and its tables (finish_with_offsets 1.75% of Djot's operations, compile_entry
+1.53%, get_prop_inlinable 0.81%, build_chain 0.65%, regions::emit 0.60%, Plan::build_kind
+0.54%, emit_prop_load_inline 0.45%; SPE without the JIT map, djot-prof.txt).
+
+What the exemplars do (current sources):
+- V8's Sparkplug calls a builtin for every operation with feedback, with the operands, the name
+  and the feedback slot as arguments: LoadICGenericBaseline (or LoadICUninitializedBaseline) for a
+  named read, StoreICBaseline for a named store, the call builtins through BuildCall, and the
+  generic compare builtins for equality (baseline/baseline-compiler.cc:1071-1083, 1189-1199,
+  1737-1760, 2153-2194; V8 c8b709085e21). Its in-line Smi compare and typed compare stubs exist
+  behind flags that are read-only false (sparkplug_inline_smi, sparkplug_plus;
+  flags/flag-definitions.h:3338-3347). A return tail-calls BaselineLeaveFrame
+  (baseline-compiler.cc:2903-2911). The in-line fast paths are Maglev's and TurboFan's.
+- SpiderMonkey's Baseline compiler calls the site's IC (emitNextIC: a call to the IC stored in
+  the JitScript) for a property read and for every comparison, StrictEq included
+  (js/src/jit/BaselineCodeGen.cpp:777-800, 3145-3162, 3929-3940), and an IC stub's code is
+  compiled once per zone for its CacheIR and shared by every site that attaches the same CacheIR
+  (BaselineCacheIRCompiler.cpp:2058-2108, LookupOrCompileStub). Firefox main, fetched
+  2026-11-04 (target/p2/compact/exemplar-src).
+- JSC's Baseline JIT reads a property through a data IC: the site loads its property cache's
+  address, tests for a cell, and the fast path runs the shared handler the cache names
+  (Source/JavaScriptCore/jit/JITPropertyAccess.cpp:548-580, generateDataICFastPath). Its strict
+  equality specializes on a constant operand at compile time: undefined, null or a Boolean is
+  one 64-bit compare of the word; an atom string is a pointer test and an atom compare; the rest
+  is a short generic path (cells by pointer unless String or BigInt, int32s, doubles to the slow
+  call) (jit/JITOpcodes.cpp:642-765). WebKit main, fetched 2026-11-04.
+
+Design:
+1. Scope: first-stage code outside loops. Second-stage code and loop bodies keep today's
+   templates, as use_shared_stub decides now.
+2. Property reads with no baked way (every first-stage read): the receiver's load and object tag
+   test stay in line; one shared stub per (receiver form, method, key-checked, Array receiver,
+   wrapper receiver) runs the way loop, the landings and the commit, and returns w9 = 1 when the
+   read is done; w9 = 0 takes the site's slow path (the helper's stub call, as now). The name
+   word the key-checked arm and the `prototype` guard compare against comes from the site's
+   cache cell, not an immediate. `length` of a string stays in line.
+3. Equality (StrictEq, StrictNotEq, EqEq, NotEq) and Not: an operand that is a compile-time
+   constant specializes the site in line, as JSC's Baseline does (undefined, null or a Boolean:
+   one compare of the word; an interned string: identity, then the stub for content; a Number:
+   the number guard and fcmp); otherwise the generic body is one shared stub per (strict,
+   negate) returning the Boolean, and a fused branch tests it (V8's and SpiderMonkey's
+   baselines call for every comparison).
+4. Property writes (SetProp, SetPropDrop, SetPropThisDrop, SetPropLocalDrop): as reads, one
+   shared stub for the probe, the writability test, the transition with record room, the card
+   and the commit.
+5. Calls (Call, CallWithThis, New) whose cache is empty at compile time: way 0's identity test
+   stays in line; the intrinsic dispatch (charCodeAt, Math.min/max, Function.prototype.call)
+   moves into the shared stubs it already has outside loops.
+6. LoadLocal: no TDZ test where the compiler proves the slot initialized (parameters, `var`
+   slots, a read dominated by a store); the test elsewhere, with the shared slow path.
+
+Order (each measured: fat-LTO instruction counts on the fixtures and Octane, code bytes, and the
+compile's share of Djot):
+1. The census (first and second stage, executed and not).
+2. Property reads (design 2): the largest share of template bytes.
+3. Equality and Not (design 3).
+4. Property writes (design 4).
+5. Calls (design 5).
+6. LoadLocal (design 6).
+
+With TRust's pages (the threshold record above): a page compiles 1.18 MB of machine code for its
+platform functions at threshold 8, made again on every page, so every byte the templates shed is
+shed on every page, whatever the threshold. When the threshold drops (t1a2, after the pages' reuse),
+a loop-free function's bytecode runs fill its caches before its first native compile; the split
+then follows the sites' state: a site those runs executed keeps its in-line template, a site they
+did not takes the compact form, as the exemplars' baselines compile behind an interpreter's
+feedback.
+
+Exit (proposed):
+- Djot's machine code at least 25% smaller (its template bytes at least 40% smaller), and the
+  compile's share of its operations down with it; the event-loop page's machine code a page down
+  by its share.
+- Instructions: no fixture, chai or Octane workload slower beyond 0.2%, each step reporting its own
+  table; Djot's elapsed time at least 2% lower.
+- The gate and both lib suites as each step lands; the code dumps change only in the templates the
+  step names.
