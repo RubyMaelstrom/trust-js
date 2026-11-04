@@ -166,17 +166,16 @@ pub(super) fn emit_inline_array_elements(
     );
     a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, interp) as u32);
     a.ldr_imm(10, 10, INTERP_ARRAY_PROTO as u32);
-    for k in 0..crate::value::OBJECT_HEADER / 8 {
-        let offset = (8 * k) as u32;
-        if k == crate::value::OBJECT_PROTO_WORD {
-            a.str_imm(10, 9, offset);
-        } else if k == crate::value::CELL_ELEMS_OFFSET / 8 {
-            a.str_imm(6, 9, offset);
-        } else {
-            a.ldr_imm(11, 15, offset);
-            a.str_imm(11, 9, offset);
-        }
-    }
+    emit_header_copy(
+        a,
+        15,
+        0,
+        9,
+        &[
+            (crate::value::OBJECT_PROTO_WORD, 10),
+            (crate::value::CELL_ELEMS_OFFSET / 8, 6),
+        ],
+    );
     a.mov_imm64(11, crate::value::Value::Num(count as f64).bits());
     a.str_imm(11, 9, crate::value::OBJECT_HEADER as u32);
     a.mov_imm64(12, crate::value::PACK_OBJ);
@@ -298,16 +297,13 @@ pub(super) fn emit_inline_construct_this(
     a.ldr_imm(5, 3, offset_of!(InstanceImage, cursor) as u32);
     a.ldr_imm(6, 3, offset_of!(InstanceImage, cell_size) as u32);
     emit_inline_alloc_dynamic(a, heap, 5, 6, 9, helper);
-    let words = offset_of!(InstanceImage, words);
-    for k in 0..crate::value::OBJECT_HEADER / 8 {
-        let offset = (8 * k) as u32;
-        if k == crate::value::OBJECT_PROTO_WORD {
-            a.str_imm(8, 9, offset);
-        } else {
-            a.ldr_imm(11, 3, (words + 8 * k) as u32);
-            a.str_imm(11, 9, offset);
-        }
-    }
+    emit_header_copy(
+        a,
+        3,
+        offset_of!(InstanceImage, words),
+        9,
+        &[(crate::value::OBJECT_PROTO_WORD, 8)],
+    );
     a.mov_imm64(12, crate::value::PACK_OBJ);
     a.logic_x(1, 0, 9, 12);
     #[cfg(test)]
@@ -366,6 +362,40 @@ pub(super) fn emit_inline_activation(a: &mut asm::Asm, activation: &InlineActiva
     }
     a.str_imm(10, 19, std::mem::offset_of!(JitCtx, env_parent_raw) as u32);
     a.str_imm(9, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+}
+
+/// Copy an image's nine header words, at x`src` + `src_off`, into the cell at x`dst`, but the
+/// words `specials` names, which take their registers' values: the copies go in pairs (ldp/stp
+/// through x11 and x12). Clobbers x11 and x12.
+fn emit_header_copy(
+    a: &mut asm::Asm,
+    src: u32,
+    src_off: usize,
+    dst: u32,
+    specials: &[(usize, u32)],
+) {
+    let n = crate::value::OBJECT_HEADER / 8;
+    let special = |k: usize| {
+        specials
+            .iter()
+            .find(|&&(word, _)| word == k)
+            .map(|&(_, r)| r)
+    };
+    let mut k = 0;
+    while k < n {
+        if let Some(reg) = special(k) {
+            a.str_imm(reg, dst, (8 * k) as u32);
+            k += 1;
+        } else if k + 1 < n && special(k + 1).is_none() {
+            a.ldp_base(11, 12, src, (src_off + 8 * k) as i32);
+            a.stp_base(11, 12, dst, (8 * k) as i32);
+            k += 2;
+        } else {
+            a.ldr_imm(11, src, (src_off + 8 * k) as u32);
+            a.str_imm(11, dst, (8 * k) as u32);
+            k += 1;
+        }
+    }
 }
 
 /// Make an object literal's instance in line (W2e step 3), its `slots` values taken from the
@@ -444,15 +474,7 @@ fn emit_inline_cell(
     );
     a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, interp) as u32);
     a.ldr_imm(10, 10, proto as u32);
-    for k in 0..crate::value::OBJECT_HEADER / 8 {
-        let offset = (8 * k) as u32;
-        if k == crate::value::OBJECT_PROTO_WORD {
-            a.str_imm(10, 9, offset);
-        } else {
-            a.ldr_imm(11, 15, offset);
-            a.str_imm(11, 9, offset);
-        }
-    }
+    emit_header_copy(a, 15, 0, 9, &[(crate::value::OBJECT_PROTO_WORD, 10)]);
     if fixed == 1 {
         let slot0 = std::mem::offset_of!(crate::bytecode::ObjectImage, slot0)
             - std::mem::offset_of!(crate::bytecode::ObjectImage, words);
