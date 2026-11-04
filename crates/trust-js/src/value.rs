@@ -2937,7 +2937,6 @@ impl Object {
                 }),
                 "object prototype belongs to another Agent heap (I6)"
             );
-            heap.allocated.set(heap.allocated.get().wrapping_add(1));
             Gc::new_in(heap, class, RefCell::new(Object { proto, props, kind }))
         })
     }
@@ -2955,7 +2954,6 @@ impl Object {
                 }),
                 "object prototype belongs to another Agent heap (I6)"
             );
-            heap.allocated.set(heap.allocated.get().wrapping_add(1));
             let class = props.entries.class();
             let obj = Gc::new_in(heap, class, RefCell::new(Object { proto, props, kind }));
             // SAFETY: the object is fresh (nothing else refers to it) and its cell holds its
@@ -3106,6 +3104,8 @@ pub(crate) struct GcState {
     array_length_shapes: [Cell<u32>; 3],
     array_length_layout: RefCell<Option<PropertyLayout>>,
     live: LiveCount,
+    /// The objects ever allocated, which the core counts as `live` (its cursors' flushes and
+    /// large cells; read through [`heap_allocated_objects`]): the task boundary's churn.
     allocated: Cell<u64>,
     /// P1 S2: the cells holding this Agent's objects. Allocation never collects (see
     /// `new_object_heap`); collections run at interpreter safepoints, which supply the roots.
@@ -3936,20 +3936,16 @@ pub(crate) fn cell_class_for(slots: usize) -> Option<u32> {
 }
 
 /// Where generated code takes an object's cell of capacity class `class` in line in the active
-/// heap (W2e step 3), with the heap's live count of objects, unless `TRUST_JS_JIT_INLINE_ALLOC=0`.
+/// heap (W2e step 3), unless `TRUST_JS_JIT_INLINE_ALLOC=0`.
 pub(crate) fn object_inline_alloc_site(class: u32) -> Option<crate::gc_core::InlineAllocSite> {
     if !inline_alloc_enabled() {
         return None;
     }
     let size_class = OBJECT_SIZE_CLASSES[(class as usize).min(2)];
     with_agent_heap(|heap| {
-        let mut site = heap
-            .core
+        heap.core
             .borrow()
-            .inline_alloc_site(heap.object_desc, size_class)?;
-        // Every object counts toward the heap's allocated objects, as `Object::alloc` counts.
-        site.allocated = heap.allocated.as_ptr() as usize;
-        Some(site)
+            .inline_alloc_site(heap.object_desc, size_class)
     })
 }
 
@@ -5077,7 +5073,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         // SAFETY: the count lives in this heap's `GcState`, which the `Rc` keeps at one address
         // for as long as the core, one of its fields, lives; nothing but the core writes it.
         unsafe {
-            core.attach_live_count(heap.object_desc, std::ptr::NonNull::from(&heap.live.count))
+            core.attach_live_count(heap.object_desc, std::ptr::NonNull::from(&heap.live.count));
+            core.attach_allocated_count(std::ptr::NonNull::from(&heap.allocated));
         };
         core.set_live_limit(heap.agent.next.get());
     }
@@ -5562,12 +5559,17 @@ pub fn live_objects() -> i64 {
     heap_live_objects(&active_gc_heap())
 }
 
+/// The live objects of `heap`: the core's count plus the cells its cursors took since they
+/// were last flushed (W2e step 8: the core counts cells as a cursor is flushed).
 pub(crate) fn heap_live_objects(heap: &GcHeap) -> i64 {
-    heap.live.get()
+    heap.live.get() + heap.core.borrow().unflushed_cells(heap.object_desc) as i64
 }
 
+/// The objects `heap` has allocated: the core's count, kept as [`heap_live_objects`]'s is.
 pub(crate) fn heap_allocated_objects(heap: &GcHeap) -> u64 {
-    heap.allocated.get()
+    heap.allocated
+        .get()
+        .wrapping_add(heap.core.borrow().unflushed_cells(heap.object_desc) as u64)
 }
 
 /// Number of memoized `(parent, key)` shape transitions in the active heap's shape
@@ -5621,8 +5623,19 @@ mod jit_heap_tests {
         let first_counter = live_objects_ptr(&first.interp.gc_heap);
         let second_counter = live_objects_ptr(&second.interp.gc_heap);
         assert_ne!(first_counter, second_counter);
+        let (first_heap, second_heap) =
+            (first.interp.gc_heap.clone(), second.interp.gc_heap.clone());
+        // Each counter, plus the objects its heap's cursors took since their last flush, which
+        // adds them to the counter (W2e step 8).
         // SAFETY: both heap owners remain alive throughout these counter reads.
-        let counts = || unsafe { (*first_counter, *second_counter) };
+        let counts = || unsafe {
+            let unflushed =
+                |heap: &GcHeap| heap.core.borrow().unflushed_cells(heap.object_desc) as i64;
+            (
+                *first_counter + unflushed(&first_heap),
+                *second_counter + unflushed(&second_heap),
+            )
+        };
         {
             let _first_active = first.interp.enter_agent();
             first.interp.gc_collect();

@@ -25,15 +25,14 @@ fn lsl_reg_x(a: &mut asm::Asm, rd: u32, rn: u32, rm: u32) {
 }
 
 /// Take a cell of `site`'s size class into `dst` in line, or branch to `slow` having changed
-/// nothing ([`InlineAllocSite`]): when the heap counts each allocation, the cursor's word has no
-/// free cell, the cell's bytes would pass the in-line check (zero while a collection is due; the
-/// slow path's Rust allocation then charges them, recomputes the heap's due bit, and its helper
-/// polls), or one more counted cell would pass the live check. The cell is neither zeroed nor
-/// initialized: the caller writes every word a trace reads before the next safepoint. No poll
-/// follows (W2e's design 1), and no barrier: the cell is young. Clobbers x10-x15, and x16-x17
-/// for a counted descriptor or an allocation count.
+/// nothing ([`InlineAllocSite`]): when the heap counts each allocation or the cursor's word has
+/// no free cell (the slow path's Rust allocation then refills the cursor, which charges and
+/// counts the cells the word gave out, and its helper polls). The cell is charged and counted at
+/// the cursor's next flush (W2e step 8). It is neither zeroed nor initialized: the caller writes
+/// every word a trace reads before the next safepoint. No poll follows (W2e's design 1), and no
+/// barrier: the cell is young. Clobbers x10-x15.
 pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u32, slow: usize) {
-    debug_assert!(!(10..=17).contains(&dst));
+    debug_assert!(!(10..=15).contains(&dst));
     a.mov_imm64(10, site.heap as u64);
     a.ldrb_imm(11, 10, off::HEAP_FAST_ALLOC as u32);
     a.cbz(11, false, slow);
@@ -41,32 +40,21 @@ pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u
     a.add_imm(12, 12, (site.cursor * off::CURSOR_SIZE) as u32);
     a.ldr_imm(13, 12, off::CURSOR_FREE as u32);
     a.cbz(13, true, slow);
-    // The byte charge (`Heap::charge_bytes`), unless it would pass the check.
-    a.ldr_imm(14, 10, off::HEAP_ALLOCATED_BYTES as u32);
-    a.ldr_imm(15, 10, off::HEAP_INLINE_CHECK_BYTES as u32);
-    a.add_imm(14, 14, site.cell_size as u32);
-    a.cmp_reg_x(14, 15);
-    a.b_cond(C_HI, slow);
-    if site.live_count != 0 {
-        // The embedder's live count (`Heap::count_live`): one more cell, unless it would pass
-        // the live check (a signed count; `i64::MAX` while the heap bit is set).
-        a.mov_imm64(16, site.live_count as u64);
-        a.ldr_imm(17, 16, 0);
-        a.add_imm(17, 17, 1);
-        a.ldr_imm(15, 10, off::HEAP_LIVE_CHECK as u32);
-        a.cmp_reg_x(17, 15);
-        a.b_cond(C_GT, slow);
-        a.str_imm(17, 16, 0);
-    }
-    if site.allocated != 0 {
-        // The embedder's count of the cells it allocated (objects': the task boundary's policy).
-        a.mov_imm64(16, site.allocated as u64);
-        a.ldr_imm(17, 16, 0);
-        a.add_imm(17, 17, 1);
-        a.str_imm(17, 16, 0);
-    }
-    a.str_imm(14, 10, off::HEAP_ALLOCATED_BYTES as u32);
-    // The cursor's lowest free cell (`Cursor::take`): its bit in x15, the word without it.
+    emit_cursor_take(a, dst, CellSize::Const(site.cell_size));
+}
+
+/// The cell size of an in-line allocation: a constant, or a register's (W2e step 6).
+#[derive(Clone, Copy)]
+enum CellSize {
+    Const(usize),
+    Reg(u32),
+}
+
+/// Take the cursor's lowest free cell into `dst` (`Cursor::take`), with x12 the cursor and x13
+/// its free word, which has one: the word without the cell's bit, the page's bitmap bit, the
+/// cursor's `taken` and `high`, and the cell's address. Clobbers x11 and x13-x15.
+fn emit_cursor_take(a: &mut asm::Asm, dst: u32, size: CellSize) {
+    // The lowest free cell's bit in x15, the word without it.
     rbit_x(a, 15, 13);
     clz_x(a, 15, 15);
     a.sub_imm(14, 13, 1);
@@ -90,8 +78,13 @@ pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u
     a.str_w_imm(11, 12, off::CURSOR_HIGH as u32);
     // The cell: the page's first cell plus index cells.
     a.ldr_imm(11, 12, off::CURSOR_PAGE_BASE as u32);
-    a.mov_imm64(13, site.cell_size as u64);
-    a.madd(dst, 14, 13, 11);
+    match size {
+        CellSize::Const(size) => {
+            a.mov_imm64(13, size as u64);
+            a.madd(dst, 14, 13, 11);
+        }
+        CellSize::Reg(size) => a.madd(dst, 14, size, 11),
+    }
 }
 
 /// An array literal with `count` elements in line (W2e step 5; MakeArray, what
@@ -193,8 +186,8 @@ pub(super) fn emit_inline_array_elements(
 }
 
 /// [`emit_inline_alloc`] of a class chosen at run time (W2e step 6): the cursor's byte offset
-/// among the heap's cursors in x`cursor` and the cell's size in x`size` (neither in x10-x17);
-/// `heap`'s heap, live count and allocation count are the code's own. Clobbers x10-x17.
+/// among the heap's cursors in x`cursor` and the cell's size in x`size` (neither in x10-x15);
+/// `heap`'s heap is the code's own. Clobbers x10-x15.
 pub(super) fn emit_inline_alloc_dynamic(
     a: &mut asm::Asm,
     heap: &InlineAllocSite,
@@ -203,7 +196,7 @@ pub(super) fn emit_inline_alloc_dynamic(
     dst: u32,
     slow: usize,
 ) {
-    debug_assert!(![dst, cursor, size].iter().any(|r| (10..=17).contains(r)));
+    debug_assert!(![dst, cursor, size].iter().any(|r| (10..=15).contains(r)));
     a.mov_imm64(10, heap.heap as u64);
     a.ldrb_imm(11, 10, off::HEAP_FAST_ALLOC as u32);
     a.cbz(11, false, slow);
@@ -211,48 +204,7 @@ pub(super) fn emit_inline_alloc_dynamic(
     a.add_shifted(12, 12, cursor, 0);
     a.ldr_imm(13, 12, off::CURSOR_FREE as u32);
     a.cbz(13, true, slow);
-    a.ldr_imm(14, 10, off::HEAP_ALLOCATED_BYTES as u32);
-    a.ldr_imm(15, 10, off::HEAP_INLINE_CHECK_BYTES as u32);
-    a.add_shifted(14, 14, size, 0);
-    a.cmp_reg_x(14, 15);
-    a.b_cond(C_HI, slow);
-    if heap.live_count != 0 {
-        a.mov_imm64(16, heap.live_count as u64);
-        a.ldr_imm(17, 16, 0);
-        a.add_imm(17, 17, 1);
-        a.ldr_imm(15, 10, off::HEAP_LIVE_CHECK as u32);
-        a.cmp_reg_x(17, 15);
-        a.b_cond(C_GT, slow);
-        a.str_imm(17, 16, 0);
-    }
-    if heap.allocated != 0 {
-        a.mov_imm64(16, heap.allocated as u64);
-        a.ldr_imm(17, 16, 0);
-        a.add_imm(17, 17, 1);
-        a.str_imm(17, 16, 0);
-    }
-    a.str_imm(14, 10, off::HEAP_ALLOCATED_BYTES as u32);
-    rbit_x(a, 15, 13);
-    clz_x(a, 15, 15);
-    a.sub_imm(14, 13, 1);
-    a.logic_x(0, 13, 13, 14);
-    a.str_imm(13, 12, off::CURSOR_FREE as u32);
-    a.ldr_w_imm(14, 12, off::CURSOR_WORD as u32);
-    a.ldr_imm(11, 12, off::CURSOR_BITS as u32);
-    a.add_shifted(11, 11, 14, 3);
-    a.ldr_imm(13, 11, 0);
-    a.movz(dst, 1, 0);
-    lsl_reg_x(a, dst, dst, 15);
-    a.logic_x(1, 13, 13, dst);
-    a.str_imm(13, 11, 0);
-    a.add_shifted(14, 15, 14, 6);
-    a.ldr_w_imm(11, 12, off::CURSOR_TAKEN as u32);
-    a.add_imm(11, 11, 1);
-    a.str_w_imm(11, 12, off::CURSOR_TAKEN as u32);
-    a.add_imm(11, 14, 1);
-    a.str_w_imm(11, 12, off::CURSOR_HIGH as u32);
-    a.ldr_imm(11, 12, off::CURSOR_PAGE_BASE as u32);
-    a.madd(dst, 14, size, 11);
+    emit_cursor_take(a, dst, CellSize::Reg(size));
 }
 
 /// The `this` of a direct construction in line (W2e step 6; [[Construct]] step 3,

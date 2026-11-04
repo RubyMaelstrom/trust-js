@@ -7,12 +7,10 @@ use crate::bytecode::activation::InlineActivation;
 use crate::gc_core::{inline_alloc as off, InlineAllocSite};
 
 /// Take a cell of `site`'s size class into r9 in line, or jump to `slow` having changed
-/// nothing, as ARM64's `jit::alloc::emit_inline_alloc` does (see `gc_core::InlineAllocSite`).
-/// Clobbers rax, rcx, rdx, r8, r10 and r11.
+/// nothing, as ARM64's `jit::alloc::emit_inline_alloc` does (see `gc_core::InlineAllocSite`):
+/// the cell is charged and counted at its cursor's next flush (W2e step 8). Clobbers rax, rcx,
+/// rdx, r8, r10 and r11.
 pub(super) fn emit_inline_alloc(a: &mut Asm, site: &InlineAllocSite, slow: usize) {
-    // The live count is ARM64's so far (W2e step 2): x86-64 allocates no counted cell in line.
-    debug_assert_eq!(site.live_count, 0, "x86-64 counts no live cell in line");
-    debug_assert_eq!(site.allocated, 0, "x86-64 counts no allocated cell in line");
     a.nr_imm(R10, site.heap as u64);
     a.nr_load8(AX, R10, off::HEAP_FAST_ALLOC);
     a.nr_zero_guard(AX, slow);
@@ -20,13 +18,6 @@ pub(super) fn emit_inline_alloc(a: &mut Asm, site: &InlineAllocSite, slow: usize
     a.nr_op_imm(0, R11, (site.cursor * off::CURSOR_SIZE) as i32); // add r11,cursor
     a.nr_load(AX, R11, off::CURSOR_FREE);
     a.nr_zero_guard(AX, slow);
-    // The byte charge (`Heap::charge_bytes`), unless it would pass the check.
-    a.nr_load(CX, R10, off::HEAP_ALLOCATED_BYTES);
-    a.nr_op_imm(0, CX, site.cell_size as i32); // add rcx,cell_size
-    a.nr_load(DX, R10, off::HEAP_INLINE_CHECK_BYTES);
-    a.nr_cmp(CX, DX);
-    a.jcc(ABOVE, slow);
-    a.nr_store(R10, off::HEAP_ALLOCATED_BYTES, CX);
     // The cursor's lowest free cell (`Cursor::take`): its bit in rcx, the word without it.
     a.nr_rex(true, CX, AX);
     a.bytes(&[0x0f, 0xbc, 0xc8]); // bsf rcx,rax

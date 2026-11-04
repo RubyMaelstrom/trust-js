@@ -1205,14 +1205,12 @@ const NO_PAGE: u32 = u32::MAX;
 /// cursor as [`Heap::alloc_small_uninit`] takes it, by code that reads and writes the heap and
 /// the cursor at the offsets of [`inline_alloc`]. The code takes the fast path's steps: it
 /// branches to its slow path (a helper that allocates in Rust) unless the heap allocates fast
-/// ([`Heap::fast_alloc`]), the cursor's word has a free cell, the cell's bytes keep the
-/// allocated bytes at or under the in-line check ([`Heap::inline_check_bytes`]) and, for the
-/// descriptor whose cells the embedder counts, one more cell keeps the count at or under
-/// `live_check`; then it charges the bytes, counts the cell, takes the lowest free cell (the
-/// page's bitmap bit, the cursor's `taken` and `high`) and computes its address. The in-line
-/// check is zero while a collection is due, so the code then takes its slow path, a helper that
-/// polls: no poll follows an in-line allocation (W2e's design 1; V8, SpiderMonkey and JSC poll in
-/// the miss, which a pending collection forces).
+/// ([`Heap::fast_alloc`]) and the cursor's word has a free cell; then it takes the lowest free
+/// cell (the page's bitmap bit, the cursor's `taken` and `high`) and computes its address. It
+/// charges and counts nothing: the cursor's flush does ([`Heap::flush_cursor`], at its next
+/// refill), as JavaScriptCore charges a consumed free list at its refill (W2e step 8). No poll
+/// follows an in-line allocation (W2e's design 1): a collection falls due at a refill, inside the
+/// helper, whose end poll collects, or runs at the next entry or back-edge poll.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct InlineAllocSite {
     /// The heap's address: its fields sit at [`inline_alloc`]'s offsets from it.
@@ -1221,23 +1219,12 @@ pub(crate) struct InlineAllocSite {
     pub(crate) cursor: usize,
     /// The size class's cell size.
     pub(crate) cell_size: usize,
-    /// The embedder's live count of the descriptor's cells (a `Cell<i64>`), or 0 when the heap
-    /// counts none of them ([`Heap::count_live`]).
-    pub(crate) live_count: usize,
-    /// A count of the cells the embedder's allocation made (a `Cell<u64>`) that in-line
-    /// allocation adds to as well, or 0: objects' (`value::GcState`'s `allocated`, which the
-    /// task boundary's collection policy reads).
-    pub(crate) allocated: usize,
 }
 
 /// The offsets inline allocation reads and writes ([`InlineAllocSite`]).
 pub(crate) mod inline_alloc {
     use std::mem::{offset_of, size_of};
     pub(crate) const HEAP_FAST_ALLOC: usize = offset_of!(super::Heap, fast_alloc);
-    pub(crate) const HEAP_ALLOCATED_BYTES: usize = offset_of!(super::Heap, allocated_bytes);
-    pub(crate) const HEAP_INLINE_CHECK_BYTES: usize = offset_of!(super::Heap, inline_check_bytes);
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
-    pub(crate) const HEAP_LIVE_CHECK: usize = offset_of!(super::Heap, live_check);
     pub(crate) const HEAP_CURSOR_BASE: usize = offset_of!(super::Heap, cursor_base);
     pub(crate) const CURSOR_SIZE: usize = size_of::<super::Cursor>();
     pub(crate) const CURSOR_FREE: usize = offset_of!(super::Cursor, free);
@@ -1669,30 +1656,30 @@ pub(crate) struct Heap {
     /// [`Heap::collection_due`] at its own safepoints, where it can supply
     /// roots the heap cannot see (the interpreter's state).
     collect_on_alloc: bool,
-    /// Allocation may take its fast path ([`Heap::alloc_cell`]), which charges each cell's
-    /// bytes at once but counts the cells (statistics, a stress interval's count, the page's)
-    /// only as their cursor is flushed (at a refill, and as a collection starts and as it
-    /// sweeps): not when allocation may collect, under a stress interval or during a
-    /// collection, which count each cell as it is taken ([`Heap::update_fast_alloc`]).
+    /// Allocation may take its fast path ([`Heap::alloc_cell`]), which only takes the cell: a
+    /// small cell is charged and counted (its bytes, the embedder's counts, the statistics, the
+    /// page's) as its cursor is flushed (at a refill, and as a collection starts and as it
+    /// sweeps; W2e step 8). Not when allocation may collect, under a stress interval or during a
+    /// collection, which flush each cell's cursor as it is taken ([`Heap::update_fast_alloc`]).
     fast_alloc: bool,
-    /// The embedder's live-cell count for one descriptor, stored at a stable address.
-    /// Allocation increments it; each swept page subtracts its newly dead cells.
+    /// The embedder's live-cell count for one descriptor, stored at a stable address. A
+    /// cursor's flush adds its cells; each swept page subtracts its newly dead cells. Between
+    /// flushes it lacks the cursors' cells ([`Heap::unflushed_cells`]).
     live_count: Option<(DescId, NonNull<Cell<i64>>)>,
+    /// The embedder's count of the cells of `live_count`'s descriptor ever allocated, at a
+    /// stable address ([`Heap::attach_allocated_count`]): a cursor's flush adds its cells too.
+    allocated_count: Option<NonNull<Cell<u64>>>,
     /// The embedder's threshold for `live_count` (its live-object ceiling): a count above it
     /// makes the poll words' heap bit set ([`Heap::poll_due`]).
     live_limit: i64,
     /// The count past which [`Heap::count_live`] recomputes the heap bit: `live_limit` while
     /// the bit is clear, `i64::MAX` while it is set (no allocation can clear it).
     live_check: i64,
-    /// Allocated bytes past which [`Heap::alloc`] recomputes the heap bit: the byte trigger;
-    /// under a stress interval the current total (the allocation count decides, so every
-    /// allocation recomputes); `usize::MAX` once due (no allocation can make it false; marking,
-    /// sweeping and the settings recompute it).
+    /// Allocated bytes past which [`Heap::charge_bytes`] recomputes the heap bit: the byte
+    /// trigger; under a stress interval the current total (the allocation count decides, so
+    /// every allocation recomputes); `usize::MAX` once due (no allocation can make it false;
+    /// marking, sweeping and the settings recompute it).
     due_check_bytes: usize,
-    /// The bytes past which generated code's in-line allocation takes its slow path
-    /// ([`InlineAllocSite`]): `due_check_bytes`, but zero while the heap bit is set, so that a
-    /// pending collection sends every in-line allocation to a helper, whose end poll collects.
-    inline_check_bytes: usize,
     stats: GcStats,
     /// Time the phases of each collection into `stats.last_phase_nanos` (diagnostics).
     phase_timing: bool,
@@ -1761,8 +1748,8 @@ impl Heap {
             live_count: None,
             live_limit: i64::MAX,
             live_check: i64::MAX,
+            allocated_count: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
-            inline_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
             phase_timing: false,
             #[cfg(test)]
@@ -1790,16 +1777,10 @@ impl Heap {
     /// embedder's live count when it counts `desc`'s cells.
     pub(crate) fn inline_alloc_site(&self, desc: DescId, class: u8) -> Option<InlineAllocSite> {
         let class = usize::from(class);
-        let live_count = match self.live_count {
-            Some((counted, count)) if counted == desc => count.as_ptr() as usize,
-            _ => 0,
-        };
         Some(InlineAllocSite {
             heap: std::ptr::from_ref(self) as usize,
             cursor: desc.0 as usize * SIZE_CLASSES.len() + class,
             cell_size: SIZE_CLASSES[class],
-            live_count,
-            allocated: 0,
         })
     }
 
@@ -2106,6 +2087,26 @@ impl Heap {
         self.refresh_due();
     }
 
+    /// Count the cells of the live count's descriptor ([`Heap::attach_live_count`]) that the
+    /// heap allocates from now on through `count` as well: a cursor's flush adds its cells
+    /// (W2e step 8), a large cell is added as it is made.
+    ///
+    /// # Safety
+    /// As [`Heap::attach_live_count`]'s `count`.
+    pub(crate) unsafe fn attach_allocated_count(&mut self, count: NonNull<Cell<u64>>) {
+        self.allocated_count = Some(count);
+    }
+
+    /// The cells of `desc` the cursors have taken since they were last flushed, which the
+    /// embedder's counts do not hold yet ([`Heap::flush_cursor`]): what an exact read of them
+    /// adds.
+    pub(crate) fn unflushed_cells(&self, desc: DescId) -> usize {
+        let first = desc.0 as usize * SIZE_CLASSES.len();
+        self.cursors
+            .get(first..first + SIZE_CLASSES.len())
+            .map_or(0, |cursors| cursors.iter().map(|c| c.taken as usize).sum())
+    }
+
     /// Whether `addr` is the start of an initialized, non-zombie cell of `desc`. This resolves
     /// ownership without reading the cell, including when another heap is active.
     pub(crate) fn owns_cell(&self, addr: usize, desc: DescId) -> bool {
@@ -2183,7 +2184,6 @@ impl Heap {
         } else {
             self.live_limit
         };
-        self.inline_check_bytes = if due || over { 0 } else { self.due_check_bytes };
         self.control.poll_words.publish(due || over);
     }
 
@@ -2319,10 +2319,7 @@ impl Heap {
             let slot = desc.0 as usize * SIZE_CLASSES.len() + class;
             if let Some(cursor) = self.cursors.get_mut(slot) {
                 if cursor.free != 0 {
-                    let ptr = cursor.take();
-                    self.count_live(desc);
-                    self.charge_bytes(SIZE_CLASSES[class]);
-                    return ptr;
+                    return cursor.take();
                 }
             }
         }
@@ -2348,8 +2345,6 @@ impl Heap {
                             // (the cursor's cell size), and now belongs to the caller.
                             unsafe { std::ptr::write_bytes(ptr, 0, SIZE_CLASSES[class]) };
                         }
-                        self.count_live(desc);
-                        self.charge_bytes(SIZE_CLASSES[class]);
                         return Some(ptr);
                     }
                 }
@@ -2359,9 +2354,10 @@ impl Heap {
     }
 
     /// Every allocation the fast path does not take: a cursor to load, a large cell, an
-    /// allocation that may collect first, under a stress interval or during a collection. The
-    /// fast path counts its cells as their cursor is flushed; this one, when the heap counts
-    /// each allocation, flushes the cursor at once. Both charge the bytes at once.
+    /// allocation that may collect first, under a stress interval or during a collection. A
+    /// small cell is charged and counted as its cursor is flushed: at the cursor's next refill
+    /// on the fast path's terms, at once when the heap counts each allocation. A large cell is
+    /// charged and counted at once.
     #[inline(never)]
     fn alloc_cell_slow(&mut self, desc: DescId, size: usize, zero: bool) -> Option<*mut u8> {
         debug_assert!(
@@ -2384,7 +2380,6 @@ impl Heap {
                     // SAFETY: as in `alloc_cell`.
                     unsafe { std::ptr::write_bytes(ptr, 0, SIZE_CLASSES[class]) };
                 }
-                self.charge_bytes(SIZE_CLASSES[class]);
                 if !self.fast_alloc {
                     self.flush_cursor(slot);
                 }
@@ -2394,6 +2389,7 @@ impl Heap {
                 let ptr = self.alloc_large(desc, size, zero)?;
                 self.charge_bytes(size);
                 self.count_cells(1);
+                self.count_live(desc, 1);
                 ptr
             }
         };
@@ -2403,20 +2399,25 @@ impl Heap {
                 .expect("a fresh cell resolves to itself");
             self.mark(&cell);
         }
-        self.count_live(desc);
         Some(ptr)
     }
 
-    /// Count a new cell of `desc` in the embedder's live count, if it keeps one for `desc`.
-    #[inline(always)]
-    fn count_live(&mut self, desc: DescId) {
+    /// Count `cells` new cells of `desc` in the embedder's counts (live and allocated), if it
+    /// keeps them for `desc`.
+    #[inline]
+    fn count_live(&mut self, desc: DescId, cells: usize) {
         if let Some((counted, count)) = self.live_count {
             if desc == counted {
+                if let Some(allocated) = self.allocated_count {
+                    // SAFETY: `attach_allocated_count`'s contract.
+                    let allocated = unsafe { allocated.as_ref() };
+                    allocated.set(allocated.get().wrapping_add(cells as u64));
+                }
                 // SAFETY: `attach_live_count` keeps the count valid until this heap is dropped.
                 let count = unsafe { count.as_ref() };
-                let live = count.get() + 1;
+                let live = count.get() + cells as i64;
                 count.set(live);
-                // The heap bit's other compare: the cell that passes the threshold recomputes
+                // The heap bit's other compare: the flush that passes the threshold recomputes
                 // it, out of line, as `charge_bytes` does for the byte budgets.
                 if live > self.live_check {
                     self.refresh_due_cold();
@@ -2425,8 +2426,9 @@ impl Heap {
         }
     }
 
-    /// Charge a new cell's `bytes` to the budgets: exactly, so the allocation that spends a
-    /// budget is the one that makes the collection due.
+    /// Charge new cells' `bytes` to the budgets: a flushed cursor's cells (W2e step 8: the
+    /// trigger falls due at most a cursor's word of cells late, at its refill, as
+    /// JavaScriptCore's falls due at a free list's), or a large cell's.
     #[inline(always)]
     fn charge_bytes(&mut self, bytes: usize) {
         self.allocated_bytes = self.allocated_bytes.saturating_add(bytes);
@@ -2532,16 +2534,20 @@ impl Heap {
     }
 
     /// Bring the cursor in `slot`'s page's `live` and `next_unused` up to date with the cells it
-    /// handed out.
+    /// handed out, and charge and count them: their bytes, the embedder's counts and the
+    /// statistics (W2e step 8).
     fn flush_cursor(&mut self, slot: usize) {
         let cursor = &mut self.cursors[slot];
         if cursor.page != NO_PAGE && cursor.taken != 0 {
             let taken = std::mem::take(&mut cursor.taken) as usize;
+            let cell_size = cursor.cell_size;
             let meta = self.pages[cursor.page as usize]
                 .as_mut()
                 .expect("a cursor's page is live");
             meta.live += taken;
             meta.next_unused = meta.next_unused.max(cursor.high as usize);
+            self.charge_bytes(taken * cell_size);
+            self.count_live(DescId((slot / SIZE_CLASSES.len()) as u32), taken);
             self.count_cells(taken);
         }
     }
@@ -6656,9 +6662,14 @@ mod tests {
         }
         assert!(
             due(&fx),
-            "the allocation that spends the budget sets the word"
+            "the refill after the budget is spent sets the word"
         );
-        assert!(allocated > 4096 && allocated <= 4096 + 16, "{allocated}");
+        // The cells are charged as their cursor is flushed (W2e step 8): the budget falls due at
+        // the refill after it, at most a word of 64 cells late.
+        assert!(
+            allocated > 4096 && allocated <= 4096 + 64 * 16 + 16,
+            "{allocated}"
+        );
         fx.collect();
         assert!(!due(&fx), "a collection resets the budget");
 
@@ -6729,13 +6740,17 @@ mod tests {
         };
         fx.heap.set_live_limit(10);
         let mut cells = Vec::new();
-        for _ in 0..10 {
+        // The counted cells are counted as their cursor is flushed (W2e step 8): the threshold's
+        // compare runs at the refill after the eleventh, at most a word of 64 cells late.
+        while !due(&fx) {
             cells.push(fx.heap.alloc(fx.leaf, 16));
             fx.alloc_node(0, 1); // another descriptor never counts
-            assert!(!due(&fx));
+            assert!(cells.len() <= 11 + 64, "the threshold passed unseen");
         }
-        cells.push(fx.heap.alloc(fx.leaf, 16));
-        assert!(due(&fx), "the eleventh counted cell passes the threshold");
+        assert!(
+            cells.len() > 11,
+            "the counted cells passed the threshold at a refill"
+        );
         assert!(!fx.heap.collection_due(), "no budget is spent");
         assert!(other.interrupt_pending() && !word.interrupt_pending());
         for (root, cell) in fx.roots.iter_mut().zip(&cells[..4]) {
@@ -6769,31 +6784,34 @@ mod tests {
         fx.heap.set_nursery_bytes(Some(1024 * 1024));
         // SAFETY: `count` outlives the heap and no other code writes it.
         unsafe { fx.heap.attach_live_count(fx.leaf, NonNull::from(&*count)) };
+        // The count as the engine reads it: the published count, plus the cells the cursors took
+        // since their last flush, which publishes them (W2e step 8).
+        let counted = |fx: &Fixture| count.get() + fx.heap.unflushed_cells(fx.leaf) as i64;
         let small = fx.heap.alloc(fx.leaf, 16);
         let large = fx.heap.alloc(fx.leaf, LARGEST_SMALL_CELL + 16);
         fx.alloc_node(0, 7); // another descriptor never contributes
         for _ in 0..4100 {
             fx.heap.alloc(fx.leaf, 16);
         }
-        assert_eq!(count.get(), 4102);
+        assert_eq!(counted(&fx), 4102);
         fx.roots[0] = small as u64;
         fx.roots[1] = large as u64;
         fx.collect();
-        assert_eq!(count.get(), 2);
+        assert_eq!(counted(&fx), 2);
 
         // An old object without a root stays counted through a minor collection; both kinds
         // of new dead cell are decremented once even when their memory becomes a zombie.
         fx.roots.fill(0);
         let young_small = fx.heap.alloc(fx.leaf, 16);
         let young_large = fx.heap.alloc(fx.leaf, LARGEST_SMALL_CELL + 32);
-        assert_eq!(count.get(), 4);
+        assert_eq!(counted(&fx), 4);
         assert!(fx.start_marking_kind(&no_edges, CollectionKind::Minor));
         // A cell allocated between phases is black and counted immediately.
         let black = fx.heap.alloc(fx.leaf, 16);
-        assert_eq!(count.get(), 5);
+        assert_eq!(counted(&fx), 5);
         fx.heap
             .finish_collection(&[young_small as usize, young_large as usize]);
-        assert_eq!(count.get(), 3);
+        assert_eq!(counted(&fx), 3);
         assert_eq!(fx.heap.cell_age(young_small as u64), Some(CellAge::Dead));
         assert_eq!(fx.heap.cell_age(young_large as u64), Some(CellAge::Dead));
         assert_eq!(fx.heap.live_count(fx.leaf), 3);
@@ -6801,7 +6819,7 @@ mod tests {
         // Unpinning the zombies frees storage without another death. Old live cells survive
         // the minor collection; the following major collection drops their count to zero.
         fx.collect_minor();
-        assert_eq!(count.get(), 3);
+        assert_eq!(counted(&fx), 3);
         // A zombie on a page with no new allocations waits for a major sweep, and so does an
         // old large zombie: a minor collection sweeps only the large cells allocated since the
         // last one. Neither kind is included in the published live count.
@@ -6809,14 +6827,14 @@ mod tests {
         assert!(fx.heap.is_allocated_word(young_large as u64));
         assert!(fx.heap.is_allocated_word(black as u64));
         fx.collect();
-        assert_eq!(count.get(), 0);
+        assert_eq!(counted(&fx), 0);
         fx.heap.alloc(fx.leaf, 16);
         fx.heap.alloc(fx.leaf, LARGEST_SMALL_CELL + 64);
-        assert_eq!(count.get(), 2);
+        assert_eq!(counted(&fx), 2);
         fx.heap.release_all();
-        assert_eq!(count.get(), 0);
+        assert_eq!(counted(&fx), 0);
         fx.heap.release_all();
-        assert_eq!(count.get(), 0);
+        assert_eq!(counted(&fx), 0);
     }
 
     #[test]
@@ -8337,7 +8355,8 @@ mod tests {
         fx.heap.set_nursery_bytes(Some(4 << 10));
         assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
         let mut head: *mut u8 = std::ptr::null_mut();
-        // Grow a live chain until a collection is due: the 257th cell passes the nursery.
+        // Grow a live chain until a collection is due: the refill after the 256th cell, whose
+        // flush charges the cells past the nursery (W2e step 8), at most a word of 64 cells late.
         let mut grow = |fx: &mut Fixture| {
             let mut cells = 0;
             while !fx.heap.collection_due() {
@@ -8348,27 +8367,39 @@ mod tests {
             }
             cells
         };
-        for round in 1..=4u64 {
+        let mut held = 0;
+        for round in 1..=3u64 {
             assert!(!due(&fx));
-            assert_eq!(grow(&mut fx), 257, "round {round}");
+            let cells = grow(&mut fx);
+            assert!((257..=256 + 65).contains(&cells), "round {round}: {cells}");
+            held += cells * 16;
             assert!(due(&fx));
             assert_eq!(fx.heap.due_kind(), CollectionKind::Minor, "round {round}");
             fx.collect_minor();
-            // The heap holds round × 4,112 bytes: past 16 KiB after the fourth round.
+            // The heap holds the rounds' cells: past 16 KiB after the fourth round.
             assert_eq!(
                 (due(&fx), fx.heap.due_kind() == CollectionKind::Major),
-                (round == 4, round == 4),
-                "round {round}"
+                (held > 16 << 10, held > 16 << 10),
+                "round {round}: {held} bytes"
             );
         }
+        assert!(!due(&fx));
+        held += grow(&mut fx) * 16;
+        fx.collect_minor();
+        assert!(held > 16 << 10, "{held} bytes");
+        assert!(due(&fx) && fx.heap.due_kind() == CollectionKind::Major);
         fx.collect();
         assert!(
             !due(&fx),
-            "a major collection sets the next budget, 2 × 16,448 bytes"
+            "a major collection sets the next budget, twice the bytes it kept"
         );
-        assert_eq!(fx.heap.stats().trigger_bytes, 2 * 4 * 257 * 16);
+        assert_eq!(fx.heap.stats().trigger_bytes, 2 * held as usize);
         assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
-        assert_eq!(grow(&mut fx), 257, "the nursery after a major collection");
+        let cells = grow(&mut fx);
+        assert!(
+            (257..=256 + 65).contains(&cells),
+            "the nursery after a major collection: {cells}"
+        );
         fx.collect_minor();
         assert!(!due(&fx));
         // A major request deferred in a no-GC region makes a major collection due.

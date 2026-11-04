@@ -248,9 +248,9 @@ fn call_only_code_collects_at_callee_entry_polls_at_stress_1() {
 }
 
 /// (3) The nursery budget, no stress: a loop allocating only strings, which move no live-object
-/// count, collects within one poll of spending its budget: every collection runs at a poll of
-/// generated code, and the most bytes a collecting poll found allocated past the budget stays
-/// within one iteration's allocations. (Until S6 step 10c the byte budget made allocation's
+/// count, collects within one poll of finding its budget spent: every collection runs at a poll
+/// of generated code, and the most bytes a collecting poll found allocated past the budget stays
+/// within a cursor's word of cells and one iteration's allocations. (Until S6 step 10c the byte budget made allocation's
 /// collections due; the nursery budget does now.)
 #[test]
 fn a_spent_byte_budget_collects_within_one_poll() {
@@ -307,9 +307,11 @@ fn a_spent_byte_budget_collects_within_one_poll() {
         "every collection ran at a poll of generated code"
     );
     // One iteration allocates two strings (the number's and the concatenation); a poll follows
-    // each allocating helper, and a region's backedge each iteration.
+    // each allocating helper, and a region's backedge each iteration. The cells are charged as
+    // their cursor is flushed (W2e step 8): the budget falls due at the refill after it, whose
+    // flush charges at most a word of 64 cells (the strings' cells are at most 64 bytes).
     assert!(
-        census.max_overshoot <= 256,
+        census.max_overshoot <= 64 * 64 + 256,
         "allocation passed the trigger by {} bytes",
         census.max_overshoot
     );
@@ -731,8 +733,10 @@ fn passing_the_live_object_ceiling_collects_at_the_next_poll() {
             "a poll of generated code collected: {census:?}"
         );
         assert_eq!(census.collections[ENTRY], 0, "{census:?}");
+        // The objects are counted as their cursor is flushed (W2e step 8): the ceiling's compare
+        // runs at the refill after it, at most a word of 64 cells late, then the next poll.
         assert!(
-            census.max_live_overshoot <= 2,
+            census.max_live_overshoot <= 64 + 2,
             "the collection waited {} objects past the ceiling",
             census.max_live_overshoot
         );
