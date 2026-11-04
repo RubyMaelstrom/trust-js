@@ -571,3 +571,116 @@ fn major_gc_prunes_dead_runtime_index_storage_and_recovers_its_live_entry() {
         "pruning preserves recovery of the live, evicted entry"
     );
 }
+
+/// The runtime ScriptOrModule record of the closure in global `name`.
+fn closure_origin(engine: &mut Engine, name: &str) -> crate::agent_control::RuntimeOrigin {
+    engine.interp.activate_gc_heap();
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var(name, &env).ok().unwrap();
+    let object_handle = value.as_obj().unwrap();
+    let object = object_handle.borrow();
+    let ObjectKind::User(user) = &object.kind else {
+        panic!("user function")
+    };
+    user.runtime_origin(
+        engine.interp.realm_id,
+        crate::value::heap_id(&engine.interp.gc_heap),
+    )
+    .expect("a closure of script code has a record")
+}
+
+#[test]
+fn closures_of_one_function_keep_the_script_each_was_made_in() {
+    // OrdinaryFunctionCreate's [[ScriptOrModule]] is GetActiveScriptOrModule() where the closure
+    // is made. Closure creation proves the common case (the function's shared record is the
+    // innermost context's own) without walking the contexts (W2e step 7); one parsed script
+    // run twice under two bases makes closures of the same functions under two records, which
+    // must each keep their own, in every tier and whichever record a function's first closure
+    // had.
+    let body = crate::parser::parse_script(
+        "globalThis.made = globalThis.made || [];
+         globalThis.makers = globalThis.makers || [];
+         function fill(n) { for (let i = 0; i < n; i++) made.push(() => import('./loop.js')); }
+         fill(20);
+         makers.push(() => () => import('./inner.js'));
+         globalThis.top = () => import('./top.js');",
+        false,
+    )
+    .ok()
+    .unwrap();
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        let seen = Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        engine.set_module_loader(move |specifier, referrer| {
+            log.borrow_mut().push(format!("{specifier} <- {referrer}"));
+            Some((
+                format!("{referrer}#{specifier}"),
+                "export default 1;".into(),
+            ))
+        });
+        for base in ["https://a.test/a.js", "https://b.test/b.js"] {
+            engine.set_import_base(base);
+            install(&mut engine, &body);
+        }
+        engine.set_import_base("https://doc.test/page.html");
+        // `makers[1]`'s inner closure is that function's first, so the record it shares is B's,
+        // which `makers[0]`'s (A's) is not.
+        assert_eq!(
+            eval(
+                &mut engine,
+                "globalThis.innerB = makers[1](); globalThis.innerA = makers[0]();
+                 globalThis.innerB2 = makers[1](); globalThis.innerA2 = makers[0]();
+                 [globalThis.made0, globalThis.made19, globalThis.made20, globalThis.made39] =
+                     [made[0], made[19], made[20], made[39]];
+                 made0(); made19(); made20(); made39(); top(); innerB(); innerA(); innerB2();
+                 innerA2();
+                 made.length + ',' + makers.length",
+            ),
+            "40,2",
+            "{tier:?}"
+        );
+        let a = closure_origin(&mut engine, "made0");
+        let b = closure_origin(&mut engine, "made20");
+        assert_eq!(
+            a.referrer.as_deref(),
+            Some("https://a.test/a.js"),
+            "{tier:?}"
+        );
+        assert_eq!(
+            b.referrer.as_deref(),
+            Some("https://b.test/b.js"),
+            "{tier:?}"
+        );
+        for (name, record) in [
+            ("made19", &a),
+            ("made39", &b),
+            ("top", &b),
+            ("innerB", &b),
+            ("innerA", &a),
+            ("innerB2", &b),
+            ("innerA2", &a),
+        ] {
+            assert!(
+                Rc::ptr_eq(&closure_origin(&mut engine, name), record),
+                "{tier:?}: {name}"
+            );
+        }
+        // Each record loads a specifier once ([[LoadedModules]]).
+        engine.interp.activate_gc_heap();
+        engine.interp.drain_microtasks();
+        assert_eq!(
+            *seen.borrow(),
+            [
+                "./loop.js <- https://a.test/a.js",
+                "./loop.js <- https://b.test/b.js",
+                "./top.js <- https://b.test/b.js",
+                "./inner.js <- https://b.test/b.js",
+                "./inner.js <- https://a.test/a.js",
+            ],
+            "{tier:?}"
+        );
+    }
+}
