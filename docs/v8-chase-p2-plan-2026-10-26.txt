@@ -10274,3 +10274,491 @@ saves, so the decision needs the timing (at W3's exit threshold 1 took Djot from
 -8.6%); it waits for a quiet machine (the other load was 3.7 cores, over the 2 the timing rule
 allows).
 
+
+### W6: incremental marking (census, survey and design; the owner's questions open, 2026-11-04)
+
+W6 as planned (Decision 4): a marking write barrier in the interpreter, the VM and both JIT
+backends, and major marking in slices interleaved with the program, as V8's incremental marking
+runs; concurrent marking stays a non-goal; marking's exit is set in this note, with SplayLatency at
+least the old engine's (6446) as the target. Census and survey on main 8f8139f0, whose engine is
+cbab4c2f's; no engine change on main. Everything below is in target/p2/w6 (untracked; README.txt
+lists the files). A draft: the decisions at its end are the owner's.
+
+What exists:
+- A major collection is one pause: the engine's whole collection (gc_collect.rs:1127-1275). The
+  client is built (gc_collect.rs:642-756); the heap clears every mark and card, then marks the
+  roots, the native stack, the side tables and ephemerons, and drains (gc_core.rs:3283-3420); the
+  engine evicts the dead from its tables and clears weak handles between the phases; the heap
+  sweeps every page (gc_collect.rs:1343-1390; gc_core.rs:3518-3633).
+- Collections run only at safepoints, when the poll words' heap bit says one is due: the
+  allocator's byte check raises it (gc_core.rs:2171-2196), and gc_check runs the collection, from
+  the VM, the tree-walker and generated code's polls (interpreter.rs:13273-13320;
+  bytecode.rs:29190-29220). Allocation never collects.
+- Marks are sticky, in side bitmaps (gc_core.rs:938-993): between collections a marked cell is
+  old. A minor collection reads them to tell old from young; a major clears them first.
+- The barrier stores the written cell's card and its page's summary, from the address alone, with
+  no load and no branch (gc_core.rs:101-122). Rust calls it at every mutable borrow of an object or
+  environment (gc_handle.rs:90-110, env_handle.rs:88-107) and at five other sites (closure caches,
+  private property layouts, deferred prototypes twice, the VM's captured stores). Generated code
+  stores the same bytes after every store of a word that can be a reference: ten ARM64 sites of
+  one emitter (jit.rs:11904-11941), three x86-64 sites (jit_x64_names.rs:374-390). Rust and
+  x86-64 store 1, ARM64 0xff; a set card is any nonzero byte.
+- What a minor collection consumes besides the cards, each a record of writes since the last
+  collection: ClientRecords (side-slot owners, WeakMap entries, native functions' realms;
+  gc_collect.rs:273-337), the handles written (handles.rs:112-140), code roots and their late
+  stores (value.rs:3688-3710), the shape directory's and atom table's young lists, the closure
+  registry's stamp (value.rs:5304-5345), and the dirty runs of element blocks of more than 64
+  words (word_block.rs:109-111).
+- Black allocation exists for the window between a collection's marking and its sweep
+  (gc_core.rs:2292-2303, 2398-2403). In-line allocation (W2e) takes cells unmarked.
+- Pacing (W6a, gc_pacing.rs): the next budget comes from V8's bounded limit
+  (gc_pacing.rs:111-121) with a growing factor from the major's speed, its marked bytes over its
+  pause (gc_pacing.rs:314-364).
+
+Census (target/p2/w6: scripts/, runs/, counts/, splay/, and census-tables.md and
+census-tables-s1.md, which hold every table of the two sessions in full; commit 4a4d8b40 on branch
+p2-w6-census, from main 8f8139f0; fat LTO,
+target/p2/lto/8f8139f0 (main) and target/p2/w6/lto-census (the census build)):
+- Method. Main's engine ran each workload with TRUST_JS_GC_LOG=1 at the default pacing (the
+  fixtures at --tier=jit, the sustained workload, chai, the Octane benchmarks at the fixed driver's
+  5 runs with clock.js, and Octane's own driver over splay.js, "splay-real", which scores
+  SplayLatency). The census build (scripts/apply-census.py) adds: a counter at each barrier site
+  (Rust's nine callers, ARM64's ten emitter sites; x86-64 is not counted on Crystal); the card byte
+  read as bits, every barrier storing 0xff, a minor collection clearing bit 0 alone (as it clears
+  the byte now), bit 1 kept from one major to the next, and bits 2-5 cleared by samples taken at the
+  first safepoint after every 64 KB of allocation and every 4th, 16th and 64th (64 KB, 256 KB, 1 MB
+  and 4 MB windows: a slice's preclean, simulated); each sample counts the set cards, the marked
+  (old) and unmarked (young) cells that start in them, and traces each old one with its full trace,
+  testing every edge against the marks (the rescan, as a proxy); the GC log's majors add their
+  marked bytes and conditional edges, and a first drain from the roots and stack alone before the
+  side tables. Counts: main's instructions on CPUs 10-13 (setarch -R, pacing off, one run each,
+  scripts/counts.sh); barrier counts with the census build at pacing off.
+- Load. The machine never fell under the plan's quiet threshold (2 cores): another session's
+  Test262 under GC stress, its builds and counts, and a game. The first runs (runs/gclog-main,
+  cards-64k, barriers-off) had 9-19 other cores busy; a second session at 15:44
+  (scripts/session-now.sh, the quiet session's script without its gate) had 2.5-7.6, its Splay runs
+  3.0-5.1 (median 3.8). Every run's other load is in its summary.jsonl. Counts, cards, cells and
+  edges do not depend on the load (each window is a number of bytes allocated); times do. The
+  tables take the second session's runs where it made them (runs/gclog-s2, cards-s2,
+  splaylat-main-r1..r10) and say so where they do not; the two sessions' pauses agree within 10%.
+
+Majors at the default pacing (main, CPU 15; the largest of each workload; ms; Gameboy from the first
+session; the fixtures and seven Octane benchmarks have none):
+
+| workload | majors | pause | drain (share) | marked MB | MB marked per ms of drain | roots and stack | side tables | sweep (core) | engine's steps |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sustained | 1 | 4.8 | 4.5 (93%) | 11.8 | 2.62 | 0.1 | 0.1 | 0.0 | 0.1 |
+| chai | 1 | 6.4 | 1.5 (23%) | 2.4 | 1.63 | 1.8 | 0.9 | 0.4 | 1.8 |
+| EarleyBoyer | 1 | 3.8 | 3.2 (84%) | 5.7 | 1.76 | 0.3 | 0.2 | 0.0 | 0.1 |
+| PdfJS | 1 | 2.7 | 1.6 (59%) | 4.9 | 3.04 | 0.7 | 0.2 | 0.1 | 0.1 |
+| Gameboy | 1 | 7.5 | 2.5 (34%) | 4.2 | 1.68 | 0.6 | 3.2 | 0.4 | 0.9 |
+| Splay (5 runs) | 2 | 32.8 | 32.3 (99%) | 61.5 | 1.90 | 0.1 | 0.1 | 0.1 | 0.1 |
+| TypeScript | 4 | 275.7 | 271.8 (99%) | 512.0 | 1.88 | 1.0 | 0.2 | 1.3 | 1.0 |
+| splay-real | 5 | 69.0 | 59.3 (86%) | 107.0 | 1.81 | 0.1 | 0.2 | 1.6 | 7.3 |
+
+Minor collections (main, the same runs; pause ms; promoted MB; the minor drain's MB per ms):
+
+| workload | minors | pause p50 / p90 / max | promoted p50 / max | MB per ms of drain |
+| --- | --- | --- | --- | --- |
+| splay-real | 46 | 17.5 / 18.0 / 19.2 | 31.9 / 32.8 | 1.86 |
+| TypeScript | 38 | 13.5 / 38.0 / 44.1 | 19.4 / 24.9 | 1.06 |
+| EarleyBoyer | 17 | 1.3 / 2.6 / 3.9 | 1.5 / 5.0 | 1.55 |
+| PdfJS | 33 | 0.5 / 1.0 / 2.0 | 0.6 / 3.5 | 3.16 |
+| sustained | 18 | 0.3 / 1.8 / 2.1 | 0.4 / 5.8 | 2.65 |
+| chai | 398 | 0.6 / 2.0 / 2.8 | 0.0 / 0.9 | 0.29 |
+
+- A major's pause is its drain: 84-99% where the heap is large (Splay, TypeScript, the sustained
+  workload, EarleyBoyer), 23-59% where it is small and the roots and side tables weigh more
+  (chai 2.4 MB, Gameboy, PdfJS). The drain marks 1.6-3.0 MB a ms (1.8-1.9 on the two largest
+  heaps).
+- What is left of a major once marking leaves its pause: the roots and stack, 0.1-1.8 ms; the side
+  tables, 0.1-3.2 ms (Gameboy's 17,023 conditional edges); the engine's steps, 0.1-1.8 ms; the core
+  sweep, 0.0-1.6 ms. Splay's two last majors also spend 7.3 and 6.9 ms in their sweep outside every
+  timed step, user time absent from a perf profile of the run (target/p2/w6/perf): the kernel's,
+  most likely the per-page discard of the spare pages beyond the cap (gc_core.rs:4264-4278), each
+  a separate call [inferred; perf at paranoid 2 samples no kernel time].
+- Every major runs at the safepoint after the minor whose sweep made it due, so the pause the
+  program sees is both: Splay's are 17-18 ms of minor and 58-69 ms of major.
+- Splay's minor collections take 17.5 ms each: its nursery grows to 32 MB (V8's largest
+  semi-space; the survivors pass the budget) and nearly all of it survives, so each minor promotes
+  31.9 MB at 1.9 MB a ms. TypeScript's take 13.5-44 ms, at half the rate: its card cells,
+  29,663-214,969 a minor, are W2f's card pass.
+
+SplayLatency (Octane's own driver over splay.js; main; score = 100 x 2,739,514 / RMS, the RMS in
+units of 0.1 us of Date.now's 1 ms clock, this shell having no performance.now):
+- Today: 5,645, the median of 10 runs (5,290-5,765; Splay 4,515) on CPU 15 with 3.0-5.1 other cores
+  busy; 4,365-5,535 in the first session's three runs under 10-17. The close-out measured 3,845, the
+  old engine 6,446.
+- The diagnostic (splay/stats.js and report.js wrap SplayUpdateStats and change nothing it
+  computes; three runs, splay/diag-r1..r3.txt) reproduces the score: 1,465-1,496 samples whose
+  squared pauses sum to 34,861-37,117 ms^2, of which 45-46 samples of 3 ms or more carry
+  33,495-35,764: the collections. The rest, about 1 ms each (Date.now's resolution), sum to about
+  1,390. The four largest samples, 84-86, 83-85, 74-77 and 41-42 ms, are each a minor and the major
+  it made due; they alone carry 22,145 ms^2 of run 2's 35,774.
+- 6,446 needs the squared pauses to average at most 18.1 ms^2 a sample, about 27,000 over 1,495
+  [arithmetic]. With the majors' part of those four samples removed, the sum falls to about 14,700
+  (9.8 a sample: about 8,700) [arithmetic]. Spreading each large cycle's marking over its samples
+  (design 4) adds about 1,200; the four 18 ms minors each of the three large cycles suspends
+  (design 2) take about 3,900 away: about 12,000, about 9,700 [arithmetic]. The ceiling, with all
+  of Splay's collection spread evenly, is the 1.46 ms average sample: about 18,700 [arithmetic].
+
+Barrier executions (census build, pacing off; main's instructions, pacing off; a flag-tested
+barrier, V8's or JSC's form, adds at least a load and a branch to each):
+
+| workload | executions | per 1000 instructions | +2 instructions each |
+| --- | --- | --- | --- |
+| Vue | 652,132 | 0.36 | 0.07% |
+| React | 474,137 | 1.50 | 0.30% |
+| Djot | 268,295 | 0.42 | 0.08% |
+| sustained | 646,009 | 0.37 | 0.07% |
+| chai | 10,635,818 | 0.13 | 0.03% |
+| Richards | 225,817 | 1.65 | 0.33% |
+| DeltaBlue | 136,007 | 0.52 | 0.10% |
+| RayTrace | 655,946 | 0.66 | 0.13% |
+| EarleyBoyer | 3,386,454 | 1.06 | 0.21% |
+| RegExp | 1,473,626 | 0.53 | 0.11% |
+| Splay | 523,624 | 0.37 | 0.07% |
+| PdfJS | 3,380,720 | 0.44 | 0.09% |
+| Gameboy | 13,936,027 | 0.65 | 0.13% |
+| Box2D | 5,380,891 | 1.20 | 0.24% |
+| TypeScript | 61,759,691 | 1.05 | 0.21% |
+
+- Crypto, NavierStokes, Mandreel, CodeLoad and zlib: 0.00-0.06 per 1000 instructions (0.00-0.01%).
+- By site, over the twenty workloads: Gc::borrow_mut 23.6M, the property-layout write 4.3M,
+  Env::borrow_mut 1.9M; set_prop_inline's two sites 58.4M and 10.3M, store_name_value 2.2M,
+  word_create 2.1M, cap_store 1.4M, define_elem_inline 0.5M, word_store_body 0.5M,
+  prologue_copies 0.2M; the closure cache, the lazy prototype and the VM's captured store under
+  25,000 together. The JIT's sites are 72% of all (75.5M of 105.4M).
+- x86-64's three sites were not counted: Crystal is ARM64, and zombie would need the census
+  patch's counter in x86-64's emitter. That backend calls helpers for most stores (W2e's exit
+  record), so its barriers are mostly the Rust sites' [inferred].
+- So a flag test's lower bound is 0.00-0.33% of instructions. Its Rust form cannot be a value
+  barrier where it stands: the borrow comes before the stores and does not see them. The object
+  model writes through 895 `.borrow_mut()` calls in 71 files (every RefCell's, so an upper bound on
+  the objects' and environments').
+
+Cards written per window (census build, default pacing; a window is 64 KB or 1 MB of allocation;
+the second session's runs, but Djot's and Box2D's from the first):
+
+| workload | window | cards p50 / p95 / max | old cells p50 / max | rescan us p50 / p95 / max | cards a ms of program | old cells a ms | rescan us a ms of program |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 64 KB | 304 / 334 / 912 | 17 / 40 | 2 / 3 / 6 | 246 | 13 | 1.6 |
+| Vue | 1 MB | 4,096 / 4,669 / 5,011 | 59 / 106 | 4 / 4 / 5 | 200 | 3 | 0.2 |
+| Djot | 64 KB | 82 / 153 / 858 | 21 / 157 | 1 / 8 / 15 | 104 | 26 | 2.3 |
+| sustained | 64 KB | 81 / 89 / 792 | 0 / 8 | 0 / 913 / 1,472 | 910 | 3 | 1,550 |
+| chai | 64 KB | 75 / 261 / 2,587 | 5 / 116 | 0 / 3 / 366 | 331 | 23 | 2.8 |
+| chai | 1 MB | 984 / 3,760 / 5,459 | 89 / 3,450 | 6 / 24 / 165 | 333 | 21 | 1.5 |
+| EarleyBoyer | 64 KB | 552 / 568 / 1,119 | 14 / 444 | 3 / 7 / 257 | 2,941 | 131 | 21.9 |
+| EarleyBoyer | 1 MB | 8,740 / 8,909 / 9,216 | 306 / 5,514 | 15 / 74 / 182 | 3,053 | 205 | 9.1 |
+| splay-real | 64 KB | 132 / 165 / 840 | 74 / 147 | 6 / 8 / 279 | 2,005 | 1,155 | 92.6 |
+| splay-real | 1 MB | 1,336 / 1,405 / 1,455 | 672 / 1,029 | 47 / 56 / 369 | 1,252 | 661 | 46.2 |
+| PdfJS | 64 KB | 3 / 269 / 10,980 | 0 / 14,469 | 0 / 5 / 817 | 270 | 25 | 9.6 |
+| Box2D | 64 KB | 800 / 2,491 / 2,611 | 234 / 2,618 | 16 / 96 / 370 | 653 | 311 | 16.3 |
+| TypeScript | 64 KB | 201 / 971 / 58,311 | 53 / 70,524 | 6 / 101 / 7,585 | 428 | 271 | 31.2 |
+| TypeScript | 1 MB | 3,106 / 14,465 / 154,445 | 1,042 / 182,531 | 50 / 1,152 / 20,655 | 417 | 267 | 22.9 |
+
+Cards written since the last major, as the next starts (no preclean: what a final pause would
+rescan after a cycle as long as the whole interval; the second session, but Gameboy from the first):
+
+| workload | program ms between | allocated MB | cards | old cells (MB) | edges | rescan ms |
+| --- | --- | --- | --- | --- | --- | --- |
+| sustained | 21 | 21 | 1,090 | 1,191 (0.1) | 111,545 | 0.6 |
+| chai | 9,018 | 1,732 | 78,975 | 38,566 (3.6) | 174,792 | 2.1 |
+| EarleyBoyer | 98 | 32 | 119,580 | 89,557 (8.6) | 322,795 | 3.2 |
+| PdfJS | 369 | 66 | 24,397 | 19,051 (1.8) | 103,797 | 1.3 |
+| Gameboy | 1,370 | 31 | 15,089 | 18,876 (1.8) | 412,672 | 2.6 |
+| splay-real, 3rd | 216 | 235 | 33,404 | 21,486 (2.7) | 99,211 | 1.1 |
+| TypeScript, 3rd | 3,414 | 304 | 669,859 | 845,446 (83.9) | 3,654,110 | 56.3 |
+| TypeScript, first session, to the run's end | 5,401 | 531 | 1,087,385 | 1,389,569 (131.3) | 5,864,348 | 109.1 |
+
+- The cards' rescan is small where writes repeat: Splay's whole interval, 216 ms of program and
+  235 MB allocated, leaves 33,404 cards and 1.1 ms. Its hot cells (the nodes near the tree's root)
+  are written in every window, so precleaning each window rescans them each time: 46-93 us a ms of
+  program, the most of any workload but the sustained one.
+- It is large where writes spread: TypeScript writes 417-428 distinct cards a ms of program at
+  both window sizes, and its interval since the last major leaves 670,000 to 1.1 million cards,
+  84-131 MB of old cells and 56-109 ms of rescan. Per 64 KB window the rescan is 6 us at the
+  median, 101 us at p95 and 7.6 ms in its largest burst; precleaning costs it 23-31 us a ms of
+  program.
+- A large element block makes one old cell expensive: the sustained workload rewrites an array of
+  200,025 words, whose owner's rescan traces every word, up to 1.5 ms a window (1,550 us a ms).
+  A minor collection reads such a block's dirty runs; a major rescan has none.
+- The side tables reach little (census build's first drain, before them): 0-2.8% of the marked
+  bytes, but Gameboy's 16.7% (0.7 MB through 17,023 conditional edges; 3.0 ms of side tables and
+  0.8 ms of drain).
+
+A final pause's estimate (scripts/final-pause.py; the largest major's parts other than its drain
+and begin, plus its cards' rescan: the p95 of a 64 KB window when precleaning ran, or the whole
+interval when it did not; ms; second session):
+
+| workload | today | roots, stack, client | side tables | engine's steps | core sweep | untimed sweep | cards, precleaned | cards, whole interval | estimate | without the untimed sweep |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| sustained | 4.8 | 0.07 | 0.13 | 0.06 | 0.02 | 0.03 | 0.91 | 0.6 | 1.2 | 1.2 |
+| chai | 6.4 | 1.81 | 0.89 | 1.25 | 0.38 | 0.54 | 0.00 | 2.1 | 4.9 | 4.3 |
+| EarleyBoyer | 3.8 | 0.28 | 0.17 | 0.09 | 0.04 | 0.01 | 0.01 | 3.2 | 0.6 | 0.6 |
+| Splay (5 runs) | 32.8 | 0.10 | 0.15 | 0.09 | 0.08 | 0.01 | 0.01 | 0.2 | 0.4 | 0.4 |
+| PdfJS | 2.7 | 0.74 | 0.17 | 0.11 | 0.07 | 0.02 | 0.01 | 1.3 | 1.1 | 1.1 |
+| Gameboy, first session | 7.5 | 0.64 | 3.15 | 0.63 | 0.35 | 0.22 | 0.11 | 2.6 | 5.1 | 4.9 |
+| TypeScript | 275.7 | 1.01 | 0.20 | 0.89 | 1.28 | 0.08 | 0.10 | 56.3 | 3.6 | 3.5 |
+| splay-real | 69.0 | 0.14 | 0.16 | 0.38 | 1.56 | 6.86 | 0.01 | 1.1 | 9.1 | 2.3 |
+
+- Precleaned, the final pause is 0.4-5.1 ms everywhere but splay-real (9.1, its untimed sweep), and
+  0.4-4.9 ms with that moved out. Not precleaned, TypeScript's would be 56-109 ms of cards alone.
+- Where today's major is mostly its drain the final pause is 1-4% of it (TypeScript 3.6 of 275.7
+  ms); chai's and Gameboy's keep two thirds of theirs (4.3-4.9 of 6.4-7.5 ms: roots, side tables
+  and table sweeps), which incremental marking does not touch.
+
+The cycle each major would need (scripts/cycle-model.py; marking keeps pace with allocation to end
+by half of V8's allowance, one nursery below the budget to the overshoot margin above it; survival
+from W4's census; allocation rates from the second session's card samples):
+
+| workload | allocation MB/s | live at the major MB | allowance MB | bytes marked per byte allocated | slices' share of the cycle | cycle ms | marking ms |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| splay-real, 4th and 5th | 1,086 | 107 | 264 | 1.79 | 51% | 248 | 126 |
+| TypeScript, 4th | 88 | 512 | 302 | 3.95 | 15% | 2,033 | 315 |
+| EarleyBoyer | 405 | 6 | 67 | 0.57 | 12% | 94 | 11 |
+| sustained | 1,054 | 12 | 67 | 0.52 | 17% | 38 | 7 |
+
+- Splay's cycle marks more than it allocates: what it allocates survives, so the slices take half
+  of the cycle's time. The marking itself is the same work its major and minors do today
+  [inferred: today the minors promote what the cycle would mark].
+
+What the exemplars do (target/p2/w6/exemplars.txt, A1-A14; the per-engine reports
+exemplars-v8.txt, exemplars-sm.txt and exemplars-jsc.txt; V8 c8b70908, SM 6bb81100, JSC 26027804,
+each checked at its main of 2026-11-04, where the cited code holds but for one V8 range noted there;
+V8's report 340 ranges, SM's 338, JSC's 354, the summary's 111, 0 problems):
+- A1: V8's barrier shades the stored value (Dijkstra), SM's the overwritten one (snapshot at the
+  beginning), JSC's the holder: a black holder stored into turns grey and is queued for a rescan,
+  in the same stack that is its remembered set between collections. V8 and SM get the value at
+  every store from their field types; JSC barriers the holder after the store, as TRust before it.
+- A2: with marking off a barrier costs V8 4-10 instructions on ARM64, SM 5-8, JSC 7.
+- A3: V8's young objects and all of JSC's are allocated white; SM's tenured cells black.
+- A4: V8 runs no scavenge while it marks ("Incremental marking forced finalization"; the young
+  generation grows instead until a large overshoot), and JSC no Eden collection inside a Full one;
+  SM collects the nursery before marking its roots and lets minors run between slices, safe
+  because its snapshot keeps every promoted cell's referents.
+- A5: V8 starts at a soft limit, when the headroom below its limit falls to one young generation's
+  capacity, and marks the roots without the stack; SM at a zone's start threshold, with an
+  incremental limit of 1.7x down to 1.1x it ("at least 1.7 to maintain performance on
+  splay-latency").
+- A6: V8's steps come every 64 KB of young and 256 KB of old allocation and from tasks, 5 ms and
+  1 ms at most, toward a 500 ms cycle; with concurrent marking off each step asks 64 KB. SM slices
+  at 1 MiB of allocation past the last slice, 5 ms in the shell. JSC's mutator marks in proportion
+  to its allocation only on one core.
+- A7: V8 marks every root at the start and again at the final pause; SM once, at the start
+  (the snapshot needs no rescan); JSC reruns its root constraints whenever the program has run.
+- A8: V8's final pause re-marks the roots, closes with the ephemeron fixpoint, scans the stack and
+  clears weak references; it finalizes once the worklists are empty, and is forced past an
+  overshoot margin of min(max(limit / 2, 32 MB), (maximum - limit) / 2).
+- A9: ephemerons are resolved at the end in V8 (discovered in steps) and JSC (a fixpoint
+  constraint); SM marks weak maps incrementally through a table of key edges.
+- A10: V8 grows its heap with the combined speed of the incremental steps and the final pause; its
+  memory reducer starts incremental marking.
+- A11: SM's gray marking serves the embedding's cycle collector; TRust has none.
+- A12: each engine's generated code shares one slow path (V8's RecordWrite builtin, SM's
+  trampolines, JSC's operationWriteBarrierSlowPath) and reads its flag from an address it embeds.
+- A13: JSC's fences, its tautological threshold and its race stack exist for concurrency alone.
+- A14: all three sweep outside the pause (concurrently, in slices, or on allocation).
+
+Design:
+1. The barrier is the card barrier as it stands: no new instruction at any site.
+   - During a cycle a set card names cells written since the cycle began or since the last
+     preclean. A marked cell on a set card may hold an edge the marker has not seen, and the marker
+     rescans it: JSC's re-grey of the holder (A1), at a card's granularity, which Boehm, Demers and
+     Shenker's mostly-parallel collector also used. Rust, the VM and both backends already store
+     the bytes it reads.
+   - A value barrier (V8's or SM's, A1) needs the stored or the overwritten value at each store. The
+     Rust barrier sits at the borrow, before the stores (A1: JSC's place), and the object model has
+     no field type that every store goes through, as V8's and SM's have: 895 `.borrow_mut()` calls
+     write through it. A store a value barrier missed would free a live cell.
+   - Its price would be at least a load and a branch at every barrier, 0.00-0.33% of instructions,
+     and 0.00-1.65% at A2's 4-10 instructions a barrier [arithmetic]. The cards cost no instruction
+     at a store; they cost the rescans (design 5 and the final pause).
+   - The cycle's start clears every card (as a major's start does now) and the final pause clears
+     them again, so the next minor collection finds only the writes made after it.
+   - A second bit a card (a minor bit and a major bit in the byte every barrier stores, so no new
+     instruction) is what minor collections during a cycle would need: the census build is that
+     scheme (bit 0 the minors', bit 1 the cycle's), and its tables are the rescans' cost. With no
+     minor collection in a cycle (design 2) the one bit suffices.
+2. No minor collection while a cycle marks (V8's and JSC's rule, A4).
+   - A minor collection that falls due during a cycle is not run: the nursery's budget is suspended
+     and the young generation grows, as V8's does, until the cycle ends.
+   - So the marks keep one meaning, this cycle's; a minor collection needs no change; the card byte
+     needs no second bit. The marker marks young cells as it reaches them, and the final pause,
+     a major collection's end, sweeps every page and leaves every live cell old.
+   - The price: the young garbage allocated during the cycle waits for its final pause, at most
+     the allowance (264-302 MB on Splay and TypeScript, 67 MB on the smaller heaps).
+   - SM's alternative (A4) would need its snapshot invariant: with a holder barrier a promoted cell
+     must be grey or rescanned, and minors would need their age apart from the cycle's marks, a
+     second bitmap a page. Not taken.
+3. Cells allocated during a cycle are white (V8's young space, JSC; A3).
+   - Allocation and in-line allocation do not change. An initializing store before the next
+     safepoint needs no barrier, as now, since a slice runs only at a safepoint. The prologue's
+     copies into an in-line record, which set no card (jit.rs:12519-12555), stay safe for the same
+     reason.
+   - The final pause's window between its marking and its sweep keeps today's black allocation.
+   - Not black during the cycle (SM's tenured cells, V8's old space): a black cell is not traced,
+     and a new cell's initializing stores (in-line allocation's template copy, Rust's construction
+     through Gc::object_ptr) set no card, so a black new cell holding the only edge to a white cell
+     would lose it. SM's snapshot keeps that cell's referent marked; a holder barrier does not
+     [inferred]. White allocation's price is the marking of the cycle's survivors, which a minor
+     collection would otherwise do (Splay's case).
+4. Slices.
+   - Due once 64 KB more were allocated since the last slice (V8's young step, A6), through the heap
+     bit's byte check as a collection is due now (gc_core.rs:2435-2445), at the next safepoint;
+     gc_check runs it. Deferred as a collection is, in no-GC regions and under borrows.
+   - Its work: the marked bytes the schedule asks, the larger of V8's time schedule (500 ms a
+     cycle) and an allocation schedule that ends marking by half the allowance, counting the
+     slices' own bytes (V8's main thread counts none, A6); capped at 1 ms (V8's task step; it
+     allows 5 ms on allocation, SM's shell 5 ms). At 1.8 MB a ms a slice marks about 1.8 MB.
+   - Between slices the program runs, with no minor collection (design 2).
+5. Precleaning.
+   - When the worklist empties, a slice scans the page summaries and rescans the marked cells on set
+     cards, clears those cards and drains what the rescan reaches (JSC rescans its re-grey queue at
+     every stop, A1, A7).
+   - Only after the worklist empties, not on a timer: Splay's hot cells would be rescanned at every
+     preclean (46-93 us a ms of program), while its whole cycle leaves 1.1 ms.
+   - Repeated until a preclean finds less than the final pause's budget for it (0.5 ms of rescan:
+     about 7,000 old cells at the 67-78 ns a cell of TypeScript's whole-interval rescans)
+     [arithmetic; to be set by measurement].
+6. Start and finalization (V8's rules, A5, A8).
+   - Start: at the safepoint after the minor collection whose sweep leaves the heap within one
+     nursery budget of the byte budget (V8's soft limit, A5); today that collection would make a
+     major due at the budget (gc_core.rs:3578). The first slice clears the marks and cards (the
+     begin phase, 0.4-0.6 ms on the largest heaps), reports the roots and the native stack (0.1-1.8
+     ms) and drains within its budget. Consuming the minor collections' records there is harmless:
+     no minor runs before the final pause, which reports everything.
+   - No cycle while the heap holds 8 MB or less: such a major stays one pause, about 4 ms at most
+     at the census's marking rate (V8's activation threshold, 8 MB in release builds and 0 in debug
+     builds, V8 src/heap/incremental-marking.cc:62-68, 135-138; TRust's budget floor is also 8 MB,
+     gc_collect.rs:50).
+   - Finalize at the first safepoint after a preclean found the dirty set below its budget and the
+     worklist empty.
+   - Forced: when the cycle's allocation passes V8's overshoot margin over the budget (A8), the next
+     safepoint finishes the marking in one pause, the old major's failure mode. Also at once for
+     the requests that want a collection now: explicit ones ($262.gc, a host's, the exit and idle
+     collections), the live-object ceiling and ArrayBuffer pressure.
+7. The final pause.
+   - A major collection's marking with the cycle's marks kept: the client (Marking::new), the
+     roots, the native stack, the strong handles and the code roots, all as a major reports them;
+     the marked cells on the cards still set; the side tables and the ephemerons in full; the drain;
+     then today's engine steps and sweep. Every root again, as V8's pause (A7, A8): TRust has no
+     barrier on roots.
+   - Its cost from the census (the final-pause table): roots and stack 0.1-1.8 ms, side tables
+     0.1-3.2 ms, the cards left by the last preclean (design 5) and the drain of what they reach,
+     the engine's steps 0.1-1.8 ms, the core sweep 0.0-1.6 ms: 0.4-5.1 ms on every workload measured
+     [arithmetic]. Splay's late majors add their 6.9-7.3 ms of untimed sweep work, which moves out
+     of the pause (order, step 5).
+8. Weak processing, ephemerons and finalization at the final pause, as now (V8's resolution and
+   JSC's fixpoint, A8, A9). The side tables reach 0-2.8% of the marked bytes on every workload but
+   Gameboy (16.7%, 3.0 ms). V8's discovery in steps or SM's edge table is a later step, if a
+   workload needs it.
+9. Pacing and the memory reducer.
+   - A major's speed for the growing factor: its marked bytes over the cycle's whole marking time,
+     slices and final pause (V8's combined speed, A10). Over the final pause alone the speed would
+     be tens of times the drain's, and the factor would fall toward its minimum, 1.1 [inferred from
+     gc_pacing.rs:65-84].
+   - The budget's rule (W6a) is unchanged; the cycle's allocation runs above it, within the margin.
+   - The memory reducer's collection stays one pause: it runs when the program allocates slowly.
+     V8 starts incremental marking for it (A10): owner's decision.
+10. The JIT changes nothing in either backend: the barrier stays (design 1), in-line allocation
+    stays white (design 3), slices enter through the existing poll (jit_interrupt), and no address
+    of a heap enters generated code, so the process-wide shared stubs are untouched.
+11. Verification.
+    - TRUST_JS_GC_VERIFY extends the write barrier's check (gc_core.rs:3468-3516) to the cycle: at
+      every slice's end and at the final pause, a marked cell whose card is clean holds no edge to
+      an allocated unmarked cell. It catches a missed barrier where it matters; the final pause's
+      verify (gc_core.rs:3848-3906) runs as now.
+    - TRUST_JS_GC_INCREMENTAL=force makes every major a cycle with slices of a few cells at every
+      safepoint; with GC stress, the lib suite and Test262 run under it and the verification (the
+      memory note's lesson: Test262 under stress finds unrooted values the gates miss).
+
+Order (each step measured on its own):
+1. The log: slices and final pauses in TRUST_JS_GC_LOG, the cycle's allocation and marking time.
+2. The cycle behind TRUST_JS_GC_INCREMENTAL (off by default): the marker's worklist kept across
+   slices; the start, the slices and the final pause; minors suspended; finalization when the
+   worklist empties; the forced finalization; verification (design 11). No dump changes.
+3. Precleaning and its finalization rule (design 5).
+4. The schedule: the start rule, the budgets, the 1 ms cap; pacing's combined speed (design 9).
+5. The spare pages' release out of the final pause (trim_spare_pages, gc_core.rs:4264-4278): at the
+   next slices, or batched, as V8's unmapper and SM's decommit work outside the pause (A14).
+6. Measurement, then on by default: the exit's timing on a quiet machine.
+7. Later, each measured first: a major rescan's own dirty runs for large element blocks and
+   payloads; ephemerons in steps; the memory reducer's collection as a cycle; idle slices from the
+   runtime's event loop (V8's tasks, A6).
+
+Change surface:
+- gc_core.rs: the Heap's cycle (its worklist and phase, its budgets and allocation since the start);
+  mark_phase and begin_marking split into the cycle's start, its slices and the final marking
+  (gc_core.rs:3283-3420); drain under a budget (gc_core.rs:3727-3775); the due logic
+  (collection_due, bytes_due, due_kind, refresh_due; gc_core.rs:2020-2057, 2171-2196) with slices
+  and the suspended nursery; sweep_phase's pacing call with the cycle's marking time
+  (gc_core.rs:3518-3633); the write barrier's check (gc_core.rs:3468-3516); trim_spare_pages
+  (gc_core.rs:4264-4278).
+- gc_collect.rs: gc_heap_collect_active dispatches a cycle's start, a slice or its final pause
+  (gc_collect.rs:1127-1275); gc_heap_mark splits; the client is built at the start and at the final
+  pause only (gc_collect.rs:642-756).
+- value.rs: mark_agent_heap and the closure registry's stamp kept across a cycle's slices
+  (value.rs:5304-5345).
+- gc_pacing.rs: Pacing::start and end with the cycle's marking time (gc_pacing.rs:302-364).
+- interpreter.rs: gc_check's dispatch (interpreter.rs:13273-13320), and the task boundary's
+  optional collection, which becomes a slice during a cycle (interpreter.rs:13324-13352).
+- Unchanged: gc_handle.rs, env_handle.rs, jit.rs, jit_operations.rs, jit_x64_names.rs, jit_alloc.rs.
+- Tests: a cycle's slices and final pause keep every reachable cell (all tiers, ShadowRealms
+  sharing a heap, a host graph); a store into a marked cell between slices, through every barrier
+  site (Rust's nine, ARM64's ten, x86-64's three), is rescanned; the forced finalization at the
+  margin; an explicit collection during a cycle; no minor collection during a cycle; the cards clean
+  after the final pause; pacing's speed over a cycle.
+
+Risks:
+- A missed barrier is a use-after-free, now for any edge stored into a marked cell, old or young.
+  Today only an old cell's edge to a young cell matters, and the write barrier's check verifies it.
+  Every write path's card_mark is the barrier; the raw writes (Gc::object_ptr, Env::scope_ptr) are
+  initializing stores into fresh cells before any safepoint (value.rs:2985-3035;
+  interpreter.rs:2440-2460). Design 11 is the mitigation, run at the stage's end.
+- Memory: the cycle's young garbage (design 2) raises peak RSS where a large heap is marked while
+  the program allocates fast. The margin bounds it.
+- The marking moves, it does not shrink: Splay's slices take about half of each cycle. Precleaning
+  adds rescans of what was written, most where writes spread (TypeScript, 23-31 us a ms of program
+  while it runs).
+- A burst of writes just before the final pause enlarges it (TypeScript's largest 64 KB window: 7.6
+  ms of rescan), and so does a forced finalization.
+- The schedule's numbers (64 KB, 1 ms, the finalization budget) are V8's or guesses until
+  measured.
+
+Exit (proposed):
+- SplayLatency >= 6446 (the plan's), median of 10 on a quiet machine (5,645 today with 3.0-5.1
+  other cores busy). Estimated about 8,700 with the majors' pauses removed and the minors
+  unchanged, about 9,700 when each of the three large cycles also suspends the four 32 MB minors it
+  spans and spreads its 126 ms of marking over its samples (design 2), and at most about 18,700
+  with all of Splay's collection spread evenly [arithmetic, from the census's samples].
+- No pause of a major collection, a slice or a final pause, above 5 ms on the fixtures, chai, the
+  sustained workload and Octane at the default pacing, where the largest today are 276 ms
+  (TypeScript) and 69 ms (Splay); slices at most 1 ms but for the one that starts a cycle. The
+  estimates leave chai and Gameboy little room (4.3-4.9 ms: their roots, side tables and table
+  sweeps). Minor collections are not W6's: Splay's take 17.5 ms and TypeScript's up to 44 ms.
+- No workload slower beyond noise in instructions at pacing off, but for precleaning where a
+  workload marks during most of its run, held to 1% [to be confirmed by the implementation's own
+  numbers].
+- Test262 identical; the lib suite and Test262 under GC stress with TRUST_JS_GC_INCREMENTAL=force
+  and TRUST_JS_GC_VERIFY.
+- Peak RSS reported beside it (fixtures, Octane, Web Tooling), not bounded.
+
+Recommended (mine): each as the design above has it (the census's and the agent's survey's
+answers: the cards because a value barrier cannot be complete in Rust, whose barrier fires at the
+borrow; V8's and JSC's order of minors and marking; white allocation, which the cards keep
+correct). W6 is the plan's last stage, so nothing waits on these yet.
+
+Decisions (the owner's):
+1. The barrier: the cards as the marking barrier, with no instruction added at any site (design 1),
+   where the plan's text names a new barrier in the interpreter, the VM and both backends. The
+   alternative is a value barrier at every Rust store under a borrow (895 calls).
+2. No minor collections while marking, as V8 and JSC (design 2), against SM's minors between
+   slices and their second bitmap.
+3. White allocation during a cycle (design 3).
+4. Slices: V8's 64 KB step; a 1 ms cap or V8's 5 ms; the schedule (design 4).
+5. Precleaning only once the worklist empties, and its finalization budget (design 5).
+6. Ephemerons and weak processing at the final pause in the first version (design 8).
+7. The memory reducer's and explicit collections as one pause (designs 6, 9).
+8. The spare pages' release out of the pause as part of W6 (order, step 5).
+9. The exit's numbers.
