@@ -9612,6 +9612,8 @@ impl Interp {
                     &obj,
                     proto_parent.expect("function prototype intrinsic parent"),
                     proto_map.as_ref().expect("prototype template"),
+                    // The template has `constructor` unless the function is a generator.
+                    !is_generator,
                 ),
                 "prototype slot"
             );

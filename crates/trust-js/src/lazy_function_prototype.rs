@@ -31,7 +31,10 @@ pub(super) struct LazyFunctionPrototype {
 }
 
 impl LazyFunctionPrototype {
-    pub(super) fn new(owner: &Gc, parent: Gc, template: &Props) -> Self {
+    /// `owner`'s deferred prototype, of `parent` and `template`'s map; `constructor` tells
+    /// whether the template has the `constructor` key, which its function's creation knows
+    /// without a lookup (W2e step 7): only a generator's prototype has none.
+    pub(super) fn new(owner: &Gc, parent: Gc, template: &Props, constructor: bool) -> Self {
         // Materialization pushes a `Property::builtin` constructor field and reuses the
         // template shape: sound only while the template's fields have the attributes that
         // replay produces (shapes encode them, W2d step 2).
@@ -42,15 +45,23 @@ impl LazyFunctionPrototype {
                 .all(|property| property.attrs() == Property::builtin(super::Value::Null).attrs()),
             "lazy prototype template with a field that is not a builtin data property"
         );
+        debug_assert_eq!(
+            constructor,
+            Self::has_constructor(template),
+            "a lazy prototype template's `constructor` key"
+        );
         Self {
             owner: *owner,
             state: RefCell::new(State::Parent(parent)),
             layout: template.shared_layout().cloned(),
             shape: template.shape(),
-            // By the key's atom: every function's creation asks, and a lookup by text compares
-            // the key's text with each of the template's (W2e step 7).
-            constructor: template.contains_key(crate::atom::names::CONSTRUCTOR.key()),
+            constructor,
         }
+    }
+
+    /// Whether `template` has the `constructor` key, looked up by its atom.
+    pub(super) fn has_constructor(template: &Props) -> bool {
+        template.contains_key(crate::atom::names::CONSTRUCTOR.key())
     }
 
     pub(super) fn materialize(&self) -> Gc {

@@ -140,7 +140,13 @@ fn deferred_prototype_retains_its_unused_layout_as_sole_holder() {
     let parent = Object::new(None);
     let template = predicted("deferred prediction");
     let word = template.shared_layout().unwrap().cell_word();
-    let lazy = crate::gc_box::new(LazyFunctionPrototype::new(&owner, parent, &template));
+    let constructor = LazyFunctionPrototype::has_constructor(&template);
+    let lazy = crate::gc_box::new(LazyFunctionPrototype::new(
+        &owner,
+        parent,
+        &template,
+        constructor,
+    ));
     drop(template);
     let root = Words(vec![crate::gc_box::GcBox::as_ptr(&lazy) as u64]);
     for kind in [CollectionKind::Major, CollectionKind::Minor] {

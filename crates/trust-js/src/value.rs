@@ -481,9 +481,10 @@ impl PropWord {
     }
 
     /// `owner`'s deferred MakeConstructor prototype: a lazy word naming a new [`LazyProto`], a
-    /// cell in the active heap (which is `owner`'s).
-    fn deferred_prototype(owner: &Gc, parent: Gc, template: &Props) -> Self {
-        let lazy = LazyFunctionPrototype::new(owner, parent, template);
+    /// cell in the active heap (which is `owner`'s). `constructor`: whether `template` has
+    /// the `constructor` key ([`LazyFunctionPrototype::new`]).
+    fn deferred_prototype(owner: &Gc, parent: Gc, template: &Props, constructor: bool) -> Self {
+        let lazy = LazyFunctionPrototype::new(owner, parent, template, constructor);
         let lazy: LazyProto = crate::gc_box::new(lazy);
         Self(
             Cell::new(PACK_LAZY_PROTO | unsafe { Value::into_word(lazy) }),
@@ -6393,7 +6394,8 @@ impl Property {
     /// naming a new [`LazyProto`], a cell in the active heap (which is `owner`'s).
     #[cfg(test)]
     pub(crate) fn defer_function_prototype(&mut self, owner: &Gc, parent: Gc, template: &Props) {
-        self.packed = PropWord::deferred_prototype(owner, parent, template);
+        let constructor = LazyFunctionPrototype::has_constructor(template);
+        self.packed = PropWord::deferred_prototype(owner, parent, template, constructor);
     }
     #[inline]
     pub(crate) fn is_empty(&self) -> bool {
@@ -10189,15 +10191,17 @@ impl Props {
     }
     /// Install the deferred function-`prototype` thunk at a resolved slot: a value-only
     /// replacement (the `prototype` descriptor itself never changes), so no demotion.
+    /// `constructor`: whether `template` has the `constructor` key.
     pub(crate) fn defer_function_prototype_at(
         &mut self,
         slot: usize,
         owner: &Gc,
         parent: Gc,
         template: &Props,
+        constructor: bool,
     ) -> bool {
         if slot < self.entries.len() {
-            let word = PropWord::deferred_prototype(owner, parent, template);
+            let word = PropWord::deferred_prototype(owner, parent, template, constructor);
             self.entries.store(slot, word);
             true
         } else {
