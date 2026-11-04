@@ -683,7 +683,7 @@ fn return_context() -> super::JitCtx {
         stack_base: std::ptr::null_mut(),
         final_sp: std::ptr::null_mut(),
         slots: std::ptr::null_mut(),
-        inline_ic_safe: std::ptr::null(),
+        reserved: 0,
         strict_flag: std::ptr::null_mut(),
         call_ic_epoch: std::ptr::null(),
         argc: 0,

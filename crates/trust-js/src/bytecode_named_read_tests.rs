@@ -147,7 +147,7 @@ fn invoke(
         stack_base: base,
         final_sp: base,
         slots: slots.as_mut_ptr(),
-        inline_ic_safe: &interp.inline_ic_safe as *const _ as *const u8,
+        reserved: 0,
         strict_flag: &mut interp.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         argc: 0,

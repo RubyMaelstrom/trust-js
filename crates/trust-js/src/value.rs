@@ -8130,7 +8130,7 @@ pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
 /// arrays, module namespaces — which the kind can't reveal. The JIT's inline property/element
 /// caches test this bit on the receiver and take the checked helper when it is clear, so ONE
 /// proxy existing somewhere does not disable the caches for every plain object in the program
-/// (the old global `inline_ic_safe` latch).
+/// (as the former realm-wide `inline_ic_safe` latch did).
 pub(crate) const FLAG_IC_PLAIN: u8 = 1 << 0;
 /// [[Extensible]].
 pub(crate) const FLAG_EXTENSIBLE: u8 = 1 << 1;

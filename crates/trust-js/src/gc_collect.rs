@@ -1726,7 +1726,6 @@ impl Interp {
             jit_helpers: _,
             jit_layout: _,
             interp_layout: _,
-            inline_ic_safe: _,
             regexp_protector: _, // weak pins
             regexp_last,
             depth: _,

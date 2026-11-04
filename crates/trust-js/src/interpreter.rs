@@ -4772,9 +4772,6 @@ pub struct Interp {
     /// Runtime-probed `Interp` field offsets for the asm call thunk (see [`InterpLayout`]).
     /// Filled by [`Interp::interp_layout_init`] on first JIT compile, like `jit_layout`.
     pub(crate) interp_layout: std::cell::Cell<InterpLayout>,
-    /// Realm-wide proof that no Proxy has been created. Raw prototype-chain walks read it live;
-    /// side-table exotics are guarded per receiver by `Object::ic_plain`.
-    pub(crate) inline_ic_safe: std::cell::Cell<bool>,
     /// The RegExp protector (see [`crate::builtins::RegexpProof`]): the current Realm's RegExp
     /// algorithms read the intrinsic methods, flag getters and species.
     pub(crate) regexp_protector: RefCell<crate::builtins::RegexpProof>,
@@ -5197,7 +5194,6 @@ interp_memory_inventory! {
     jit_helpers => "non_owning",
     jit_layout => "non_owning",
     interp_layout => "non_owning",
-    inline_ic_safe => "non_owning",
     regexp_protector => "non_owning",
     regexp_last => "measured",
     depth => "non_owning",
@@ -5322,7 +5318,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 150);
+    assert_eq!(names.len(), 149);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6956,7 +6952,6 @@ impl Interp {
             jit_helpers: crate::jit::helper_table(),
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
-            inline_ic_safe: std::cell::Cell::new(true),
             regexp_protector: RefCell::default(),
             regexp_last: None,
             weak_collection_data: Default::default(),
@@ -13532,7 +13527,6 @@ impl Interp {
             jit_helpers: _,
             jit_layout: _,
             interp_layout: _,
-            inline_ic_safe: _,
             regexp_protector: _,
             regexp_last: _,
             depth: _,

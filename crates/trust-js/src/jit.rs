@@ -1813,9 +1813,10 @@ pub struct JitCtx {
     pub final_sp: *mut Value,
     /// [24] Local slots base (the inline LoadLocal/StoreLocal templates index off this).
     pub slots: *mut Cell<Value>,
-    /// [32] Points at `Interp::inline_ic_safe` (a `Cell<bool>` byte): raw prototype-walk
-    /// templates read it live and fall to the helper after a Proxy is created.
-    pub inline_ic_safe: *const u8,
+    /// [32] Unused (zero): it held the address of the realm-wide "no Proxy yet" latch, which the
+    /// in-line `instanceof` walk read until each hop tested its object's kind (W2g step 1). It
+    /// keeps the fixed offsets of the fields after it.
+    pub reserved: usize,
     /// [40] `Env::as_ptr` of the activation env — what the inline LoadName template compares
     /// against the per-site name cache (see `bytecode::NameIc`).
     pub env_raw: *const u8,
@@ -1983,7 +1984,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             stack_base: _, // the operand words: scanned by the registration
             final_sp: _,
             slots: _, // the slot words: scanned by the registration
-            inline_ic_safe: _,
+            reserved: _,
             // The running environment: the callee closure's (which the caller's operand stack
             // and FnFrame also hold), a borrowed entry's VM frame's (registered by `drive_vm`),
             // or the activation the prologue made (`bytecode::jit_frame_setup`), which only this
@@ -2696,7 +2697,7 @@ mod layout_asserts {
     const _: () = assert!(std::mem::offset_of!(JitCtx, stack_base) == 8);
     const _: () = assert!(std::mem::offset_of!(JitCtx, final_sp) == 16);
     const _: () = assert!(std::mem::offset_of!(JitCtx, slots) == 24);
-    const _: () = assert!(std::mem::offset_of!(JitCtx, inline_ic_safe) == 32);
+    const _: () = assert!(std::mem::offset_of!(JitCtx, reserved) == 32);
     const _: () = assert!(std::mem::offset_of!(JitCtx, env_raw) == 40);
     // [48]: the 8-byte packed `this` word.
     const _: () = assert!(
@@ -11656,8 +11657,10 @@ fn instanceof_inlinable(
 /// Inline the default OrdinaryHasInstance case. A single cache cell proves that the RHS still
 /// has the key set observed by the checked path (notably, no own `@@hasInstance`); live guards
 /// additionally validate constructor identity facts and decode its current `.prototype` value.
-/// The LHS prototype walk is raw only while the realm-wide proxy latch remains clear. Every miss
-/// occurs before the stack is written and therefore cleanly replays through `jit_exec`.
+/// The LHS prototype walk reads each object's [[Prototype]] field once its kind's tag shows it is
+/// not a Proxy, whose [[GetPrototypeOf]] is a trap: one test per holder, as V8, SpiderMonkey and
+/// JavaScriptCore make (W2g step 1). Every miss, a proxy on the chain included, occurs before
+/// the stack is written and therefore cleanly replays through `jit_exec`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -11688,9 +11691,6 @@ fn emit_instanceof_inline(
     emit_exec_kind(a, 8, 7, 9, slow);
     emit_exec_word_load(a, 9, 20, -8);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
-    a.ldr_imm(9, 19, 32); // ctx.inline_ic_safe
-    a.ldrb_imm(9, 9, 0);
-    a.cbz(9, false, slow);
     emit_exec_word_load(a, 11, 20, -8);
     emit_exec_payload(a, 11, 11);
 
@@ -11740,12 +11740,16 @@ fn emit_instanceof_inline(
     a.lsr_imm(15, 15, 16); // x15 = the target prototype's cell address
 
     // A scalar LHS is false. Otherwise walk lhs.[[Prototype]] until target or null. Cycles are
-    // rejected by SetPrototypeOf, and the proxy latch above makes every hop a direct field read.
+    // rejected by SetPrototypeOf, and each hop's [[GetPrototypeOf]] is a direct field read once
+    // its kind's tag shows no Proxy.
     a.cmp_imm_w(7, 8);
     a.b_cond(C_NE, no);
     a.mov(12, 10);
     a.bind(walk);
     a.add_imm(12, 12, layout.obj_from_cell as u32);
+    a.ldrb_imm(9, 12, layout.obj_kind as u32);
+    a.cmp_imm_w(9, crate::value::KIND_PROXY_TAG as u32);
+    a.b_cond(C_EQ, slow);
     a.ldr_imm(12, 12, layout.obj_proto as u32);
     a.cbz(12, true, no);
     a.cmp_reg_x(12, 15);
@@ -12252,7 +12256,7 @@ fn emit_eq_inline(
     a.bind(l_notnum);
     if !strict {
         // Loose nullish: undefined/null equal each other and nothing else (helper handles the
-        // IsHTMLDDA exception via the inline_ic_safe gate below).
+        // IsHTMLDDA exception via the ic_plain gate below).
         let la_null = a.new_label();
         let lb_null = a.new_label();
         a.cmp_imm_w(9, 0);
@@ -14467,9 +14471,9 @@ fn get_elem_inlinable(layout: &crate::value::JitLayout) -> bool {
 /// Inline dense-element read (`a[i]`): an own data element of a plain object/array, indexed
 /// through `Props::elems` without hashing or stringifying the key — the machine-code mirror of
 /// `Interp::fast_get_elem`. Every guard branches to `slow` before any state is written. Handles a
-/// Num key that is exactly a u32 in dense bounds and a non-accessor slot; the live
-/// `inline_ic_safe` flag rules out proxies / typed arrays / module namespaces existing at all.
-/// Everything else falls to the checked helper.
+/// Num key that is exactly a u32 in dense bounds and a non-accessor slot; the receiver's kind
+/// and its `ic_plain` rule out proxies, typed arrays and module namespaces. Everything else falls
+/// to the checked helper.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -20027,7 +20031,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         stack_base,
         final_sp: stack_base.add(initial_depth),
         slots: slots.as_ptr().cast_mut(),
-        inline_ic_safe: &i.inline_ic_safe as *const _ as *const u8,
+        reserved: 0,
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         argc: 0,
@@ -20196,7 +20200,7 @@ pub fn run(
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         slots: slots.as_mut_ptr(),
-        inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+        reserved: 0,
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         argc: 0,
@@ -20382,7 +20386,7 @@ impl JitFrame {
                 stack_base: words,
                 final_sp: words,
                 slots,
-                inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+                reserved: 0,
                 strict_flag: &mut i.strict as *mut bool,
                 call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
                 argc: 0,
@@ -20665,7 +20669,7 @@ unsafe fn run_moved_oversized(
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         slots: slots_ptr,
-        inline_ic_safe: &i.inline_ic_safe as *const std::cell::Cell<bool> as *const u8,
+        reserved: 0,
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         argc: 0,

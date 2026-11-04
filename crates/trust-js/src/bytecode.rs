@@ -29258,7 +29258,7 @@ mod return_slot_tests {
             stack_base: std::ptr::null_mut(),
             final_sp: std::ptr::null_mut(),
             slots: std::ptr::null_mut(),
-            inline_ic_safe: std::ptr::null(),
+            reserved: 0,
             strict_flag: std::ptr::null_mut(),
             call_ic_epoch: std::ptr::null(),
             argc: 0,
@@ -29347,7 +29347,7 @@ mod return_slot_tests {
             assert_eq!(offset_of!(JitCtx, stack_base), 8);
             assert_eq!(offset_of!(JitCtx, final_sp), 16);
             assert_eq!(offset_of!(JitCtx, slots), 24);
-            assert_eq!(offset_of!(JitCtx, inline_ic_safe), 32);
+            assert_eq!(offset_of!(JitCtx, reserved), 32);
             assert_eq!(offset_of!(JitCtx, env_raw), 40);
             assert_eq!(offset_of!(JitCtx, this_word), 48);
             assert_eq!(offset_of!(JitCtx, global_body), 56);

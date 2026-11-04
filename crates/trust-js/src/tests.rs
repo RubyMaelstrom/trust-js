@@ -3218,6 +3218,42 @@ fn instanceof_default_intrinsic_and_override() {
     );
 }
 
+/// W2g step 1: `instanceof` reads [[GetPrototypeOf]] as a field at every object but a Proxy,
+/// which each hop tells by its kind, in every tier and in the JIT's in-line walk (no realm-wide
+/// latch). A warmed site still answers ordinary chains with proxies alive, and a proxy as the
+/// left operand, or anywhere on its chain, is asked through its trap (a revoked one throws).
+#[test]
+fn instanceof_walks_ask_a_proxy_on_the_chain_through_its_trap() {
+    for tier in [
+        crate::bytecode::Tier::Interp,
+        crate::bytecode::Tier::Bytecode,
+        crate::bytecode::Tier::Jit,
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            run_in(
+                &mut engine,
+                "function A(){} function B(){} B.prototype=Object.create(A.prototype);
+                 var b=new B(), calls=0, unrelated=new Proxy({}, {});
+                 function hit(v, C){ return v instanceof C; }
+                 for(var i=0;i<1000;i++) hit(b,A);
+                 var trap={getPrototypeOf(t){calls++;return B.prototype;}};
+                 var self=new Proxy({}, trap);
+                 var mid=Object.create(new Proxy(Object.create(null), trap));
+                 var revoked=Proxy.revocable({}, {}); revoked.revoke();
+                 var deep=Object.create(Object.create(revoked.proxy)), threw=false;
+                 try{hit(deep,A)}catch(e){threw=e instanceof TypeError}
+                 [hit(b,A),hit(b,B),hit({},A),hit(self,A),hit(mid,A),hit(mid,B),calls,threw]
+                   .join(',')"
+            ),
+            "true,true,false,true,true,true,3,true",
+            "{tier:?}"
+        );
+    }
+}
+
 #[test]
 fn jit_constructor_creation_cache_deopts_on_prototype_changes() {
     assert_eq!(

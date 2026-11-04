@@ -207,6 +207,28 @@ impl PreparedClassEvaluation {
     }
 }
 
+/// OrdinaryHasInstance's walk (ECMA-262 #sec-ordinaryhasinstance, step 6) of `object`'s prototype
+/// chain for `target`, while [[GetPrototypeOf]] is the field read: at every object but a Proxy,
+/// whose kind's tag each hop tests, as V8, SpiderMonkey and JavaScriptCore test each holder's
+/// type. `Err` holds the first proxy reached, from which the walk goes on through its trap.
+fn prototype_chain_has(object: Gc, target: &Gc) -> Result<bool, Gc> {
+    let mut cur = object;
+    loop {
+        let next = {
+            let body = cur.borrow();
+            if body.kind.is_proxy() {
+                return Err(cur);
+            }
+            body.proto
+        };
+        match next {
+            Some(proto) if Gc::ptr_eq(&proto, target) => return Ok(true),
+            Some(proto) => cur = proto,
+            None => return Ok(false),
+        }
+    }
+}
+
 impl Interp {
     // ----- statements -------------------------------------------------------------------------
 
@@ -8879,7 +8901,7 @@ impl Interp {
         // when the generated path cannot consume last-reference operands: the cached RHS shape
         // proves no own @@hasInstance appeared, while the inherited intrinsic is read live.
         let cached = cache.get();
-        if self.inline_ic_safe.get() && cached.depth == 0 {
+        if cached.depth == 0 {
             if let (Some(key), ValueView::Obj(lhs), ValueView::Obj(rhs)) =
                 (key.as_deref(), &(l).view(), &(r).view())
             {
@@ -8924,16 +8946,9 @@ impl Interp {
                     None
                 };
                 if let Some(ValueView::Obj(target)) = (target).map(|__value| (__value).view()) {
-                    let mut cur = Some(*lhs);
-                    while let Some(object) = cur {
-                        let next = object.borrow().proto;
-                        match next {
-                            Some(proto) if Gc::ptr_eq(&proto, &target) => {
-                                return Ok(Value::Bool(true));
-                            }
-                            Some(proto) => cur = Some(proto),
-                            None => return Ok(Value::Bool(false)),
-                        }
+                    // A proxy on the chain takes the observable path below, as in generated code.
+                    if let Ok(found) = prototype_chain_has(*lhs, &target) {
+                        return Ok(Value::Bool(found));
                     }
                 }
             }
@@ -8999,30 +9014,13 @@ impl Interp {
             ValueView::Obj(p) => p,
             _ => return Err(self.throw("TypeError", "prototype property is not an object")),
         };
-        // [[GetPrototypeOf]] is a direct field read at every object but a Proxy, which each hop
-        // tells by its kind's tag. Keep the walk in `Gc`s, with no `Value` constructions per
-        // prototype level, until it meets a proxy.
-        let mut cur = o_obj;
-        loop {
-            let next = {
-                let object = cur.borrow();
-                if object.kind.is_proxy() {
-                    break;
-                }
-                object.proto
-            };
-            match next {
-                Some(x) => {
-                    if Gc::ptr_eq(&x, &proto) {
-                        return Ok(true);
-                    }
-                    cur = x;
-                }
-                None => return Ok(false),
-            }
-        }
+        // In `Gc`s, with no `Value` constructions per prototype level, until a proxy.
+        let proxy = match prototype_chain_has(o_obj, &proto) {
+            Ok(found) => return Ok(found),
+            Err(proxy) => proxy,
+        };
         // From the proxy on, walk via [[GetPrototypeOf]] (so its trap participates).
-        let mut cur = Value::Obj(cur);
+        let mut cur = Value::Obj(proxy);
         loop {
             let next = crate::builtins::js_get_prototype_of(self, &cur).map_err(Abrupt::Throw)?;
             match (next).view() {

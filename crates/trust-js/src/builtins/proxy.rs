@@ -17,7 +17,6 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
         _ => None,
     };
     let obj = Object::new(proto);
-    i.inline_ic_safe.set(false);
     {
         let mut proxy = obj.borrow_mut();
         // A proxy has a [[Construct]] exactly when its target is a constructor (ProxyCreate
