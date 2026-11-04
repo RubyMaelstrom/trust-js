@@ -108,6 +108,8 @@ mod function_realm_lifetime_tests;
 mod function_runtime;
 mod gc_box;
 mod gc_core;
+#[cfg(test)]
+mod gc_cycle_tests;
 mod gc_pacing;
 #[cfg(test)]
 mod gc_pacing_tests;

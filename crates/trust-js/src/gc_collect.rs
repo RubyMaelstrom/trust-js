@@ -168,6 +168,19 @@ fn gc_pacing_enabled() -> bool {
     })
 }
 
+/// `TRUST_JS_GC_INCREMENTAL` (W6): `1` (or `on`) marks the major collections the heap asks for
+/// on its own in cycles of slices between which the program runs; `force` does so with slices
+/// of a few cells at every safepoint (verification's mode); unset or anything else, every major
+/// collection marks in one pause.
+fn gc_incremental() -> crate::gc_core::IncrementalMode {
+    static MODE: std::sync::OnceLock<crate::gc_core::IncrementalMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("TRUST_JS_GC_INCREMENTAL").as_deref() {
+        Ok("1" | "on") => crate::gc_core::IncrementalMode::On,
+        Ok("force") => crate::gc_core::IncrementalMode::Force,
+        _ => crate::gc_core::IncrementalMode::Off,
+    })
+}
+
 /// `TRUST_JS_GC_LOG=1` (diagnostic): log every collection, with its phases' times.
 fn gc_log() -> bool {
     static LOG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -238,6 +251,7 @@ pub(crate) fn configure_heap(core: &mut crate::gc_core::Heap) {
     core.set_stress_every(gc_stress());
     core.set_stress_major_every(gc_stress_major());
     core.set_heap_verification(gc_verify());
+    core.set_incremental(gc_incremental());
     // `TRUST_JS_GC_WHY=1`: record retention paths, which only tests read (see `gc_test::why`).
     #[cfg(test)]
     if std::env::var_os("TRUST_JS_GC_WHY").is_some() {
@@ -1025,7 +1039,23 @@ impl Interp {
     ) -> crate::agent_control::CollectionOutcome {
         #[cfg(not(target_arch = "wasm32"))]
         crate::gc_core::scrub_stack(EXPLICIT_SCRUB_BYTES);
-        self.gc_heap_collect(crate::value::GcCause::Explicit, Some(kind))
+        // W6: an explicit major collection is precise. One that finishes a running cycle keeps
+        // what the cycle marked before it died, so a second collection follows, once the first's
+        // frames are gone and zeroed, and frees it (V8's PreciseCollectAllGarbage,
+        // src/heap/heap.cc:1365-1370).
+        let finishes_cycle = kind == CollectionKind::Major
+            && self
+                .gc_heap
+                .core
+                .try_borrow()
+                .is_ok_and(|core| core.cycle_running());
+        let outcome = self.gc_heap_collect(crate::value::GcCause::Explicit, Some(kind));
+        if finishes_cycle && outcome == crate::agent_control::CollectionOutcome::Collected(kind) {
+            #[cfg(not(target_arch = "wasm32"))]
+            crate::gc_core::scrub_stack(EXPLICIT_SCRUB_BYTES);
+            return self.gc_heap_collect(crate::value::GcCause::Explicit, Some(kind));
+        }
+        outcome
     }
 
     /// Collect the whole Agent heap from this interpreter's current safepoint: a collection of `kind`,
@@ -1065,12 +1095,23 @@ impl Interp {
             } else {
                 kind.or(pending)
             };
-        let kind = match heap.core.try_borrow_mut() {
-            Ok(core) => requested.unwrap_or_else(|| core.due_kind()),
+        // W6: a major collection the heap asks for on its own may start a marking cycle, and
+        // while one runs the heap's own work is a slice; a requested major collection, or an
+        // explicit minor one, is the cycle's final pause.
+        let heap_choice = kind.is_none() && pending.is_none();
+        let explicit_minor = matches!(cause, crate::value::GcCause::Explicit)
+            && kind == Some(CollectionKind::Minor);
+        let work = match heap.core.try_borrow_mut() {
+            Ok(core) => core.due_work(requested, heap_choice, explicit_minor),
             Err(_) => {
                 heap.agent.request(&heap, requested);
                 return CollectionOutcome::Deferred;
             }
+        };
+        let kind = match work {
+            crate::gc_core::DueWork::Collect(kind) => kind,
+            crate::gc_core::DueWork::StartCycle => return self.gc_heap_start_cycle(&heap, cause),
+            crate::gc_core::DueWork::Slice => return self.gc_heap_slice(&heap, cause),
         };
         heap.agent.collecting.set(true);
         let _collecting = crate::agent_control::Collecting(heap.clone());
@@ -1209,6 +1250,133 @@ impl Interp {
             );
         }
         CollectionOutcome::Collected(kind)
+    }
+
+    /// W6: start a marking cycle over the whole Agent heap from this interpreter's safepoint
+    /// (design 6): the client, built as a major collection builds it, reports the roots, and the
+    /// heap marks them and the native stack and runs the cycle's first slice; the side tables and
+    /// the ephemerons wait for the final pause. This marking consumes the tables' and the
+    /// handles' records, as a collection's does: what is written from now on is recorded for the
+    /// final pause. Deferred as a collection is.
+    #[cold]
+    #[inline(never)]
+    fn gc_heap_start_cycle(
+        &mut self,
+        heap: &crate::value::GcHeap,
+        cause: crate::value::GcCause,
+    ) -> crate::agent_control::CollectionOutcome {
+        use crate::agent_control::CollectionOutcome;
+        heap.agent.collecting.set(true);
+        let _collecting = crate::agent_control::Collecting(heap.clone());
+        let performance_started = crate::value::gc_performance_metrics_start();
+        let log_started = gc_log().then(std::time::Instant::now);
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
+        self.gc_evict_young_cache_keys();
+        let marking = Marking::new(self, CollectionKind::Major);
+        // Building the client enumerated Realm members and host values in frames below this
+        // one, which the marker's frames reuse (see `gc_heap_mark`).
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
+        heap.handles.set_collecting(true);
+        let started = crate::value::start_agent_cycle(heap, true, &marking);
+        heap.handles.set_collecting(false);
+        if !started {
+            heap.agent.request(heap, Some(CollectionKind::Major));
+            return CollectionOutcome::Deferred;
+        }
+        heap.records.borrow_mut().consume();
+        heap.handles.consume();
+        drop(marking);
+        if let Some(started) = log_started {
+            self.gc_log_slice(heap, cause, "start", 0, started);
+        }
+        if let Some(started) = performance_started {
+            crate::value::gc_performance_metrics_slice(started);
+        }
+        CollectionOutcome::Marked
+    }
+
+    /// W6: a slice of the running cycle's marking (design 4), from this interpreter's
+    /// safepoint: no client, no root and no stack, the marker's worklist alone. Deferred as a
+    /// collection is.
+    #[cold]
+    #[inline(never)]
+    fn gc_heap_slice(
+        &mut self,
+        heap: &crate::value::GcHeap,
+        cause: crate::value::GcCause,
+    ) -> crate::agent_control::CollectionOutcome {
+        use crate::agent_control::CollectionOutcome;
+        heap.agent.collecting.set(true);
+        let _collecting = crate::agent_control::Collecting(heap.clone());
+        let performance_started = crate::value::gc_performance_metrics_start();
+        let log_started = gc_log().then(std::time::Instant::now);
+        let Some(marked) = crate::value::slice_agent_heap(heap) else {
+            heap.agent.request(heap, None);
+            return CollectionOutcome::Deferred;
+        };
+        if let Some(started) = log_started {
+            self.gc_log_slice(heap, cause, "slice", marked, started);
+        }
+        if let Some(started) = performance_started {
+            crate::value::gc_performance_metrics_slice(started);
+        }
+        CollectionOutcome::Marked
+    }
+
+    /// W6: the GC log's line for a cycle's start or slice (`TRUST_JS_GC_LOG`).
+    #[cold]
+    #[inline(never)]
+    fn gc_log_slice(
+        &self,
+        heap: &crate::value::GcHeap,
+        cause: crate::value::GcCause,
+        phase: &str,
+        marked: usize,
+        started: std::time::Instant,
+    ) {
+        let pause = started.elapsed().as_nanos() as f64 / 1000.0;
+        let core = heap.core.borrow();
+        let Some((slices, traced, cycle_marked, worklist, allocated, complete)) =
+            core.cycle_progress()
+        else {
+            return;
+        };
+        // The start's marking is the cycle's so far.
+        let marked = if phase == "start" { cycle_marked } else { marked };
+        eprintln!(
+            "[gc-slice] phase={phase} cause={cause:?} n={slices} traced={traced} marked={marked} cycle_marked={cycle_marked} worklist={worklist} cycle_alloc={allocated} complete={} us: pause={pause:.0}",
+            u8::from(complete)
+        );
+    }
+
+    /// W6 (tests): start a marking cycle now, whatever the heap asks for, as its own major
+    /// collection would when incremental marking is on. False when no cycle could start (one runs
+    /// already, or the start was deferred).
+    #[cfg(test)]
+    pub(crate) fn gc_start_cycle(&mut self) -> bool {
+        if self.gc_heap.core.borrow().cycle_running() {
+            return false;
+        }
+        let outcome = self.with_access(|current| {
+            let heap = current.gc_heap.clone();
+            current.gc_heap_start_cycle(&heap, crate::value::GcCause::Explicit)
+        });
+        outcome == crate::agent_control::CollectionOutcome::Marked
+    }
+
+    /// W6 (tests): run a slice of the running cycle now. False when none runs.
+    #[cfg(test)]
+    pub(crate) fn gc_slice(&mut self) -> bool {
+        if !self.gc_heap.core.borrow().cycle_running() {
+            return false;
+        }
+        let outcome = self.with_access(|current| {
+            let heap = current.gc_heap.clone();
+            current.gc_heap_slice(&heap, crate::value::GcCause::Explicit)
+        });
+        outcome == crate::agent_control::CollectionOutcome::Marked
     }
 
     /// Exercise the real root/side-slot/sweep client without conservative native roots. This

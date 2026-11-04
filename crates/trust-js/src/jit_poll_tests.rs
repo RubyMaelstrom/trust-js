@@ -42,8 +42,13 @@ fn engine() -> Engine {
 
 /// The heap's stress interval: a collection is due after every `every` cell allocations (0:
 /// never).
+/// Collect at every `every`th allocation's next safepoint. The polls' census counts each
+/// collection where it runs, so major ones mark in one pause here whatever
+/// `TRUST_JS_GC_INCREMENTAL` says (W6).
 fn stress(i: &Interp, every: usize) {
-    i.gc_heap.core.borrow_mut().set_stress_every(every);
+    let mut core = i.gc_heap.core.borrow_mut();
+    core.set_stress_every(every);
+    core.set_incremental(crate::gc_core::IncrementalMode::Off);
 }
 
 fn collections(i: &Interp) -> u64 {

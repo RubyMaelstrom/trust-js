@@ -3310,6 +3310,9 @@ pub(crate) struct GcState {
     /// The heap's markings (`gc_core::Control::markings`) when a collection last judged the
     /// registry: the young functions' closures are young only at the marking after it.
     closure_functions_judged: Cell<u64>,
+    /// W6: the closure mark stamp of the marking cycle running ([`start_agent_cycle`]), which
+    /// its slices and its final pause trace closures with; 0 while none runs.
+    cycle_closure_stamp: Cell<u64>,
     /// [`array_length_shape`]'s memo, per capacity class (0 until made).
     array_length_shapes: [Cell<u32>; 3],
     array_length_layout: RefCell<Option<PropertyLayout>>,
@@ -5120,6 +5123,11 @@ const GC_PAUSE_BUCKET_UPPER_NANOS: [u64; 15] = [
 ];
 static GC_PERF_METRICS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 static GC_COLLECTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// W6: a marking cycle's slices (its start among them), their pauses, and the largest.
+static GC_SLICES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_SLICE_PAUSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static GC_MAX_SLICE_PAUSE_NANOS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 static GC_PAUSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_MAX_PAUSE_NANOS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static GC_PAUSE_BUCKET_COUNTS: [std::sync::atomic::AtomicU64; 16] =
@@ -5190,6 +5198,15 @@ pub(crate) fn gc_performance_metrics_finish(
     GC_LAST_OBJECTS_AFTER.store(objects_after, Relaxed);
 }
 
+/// W6: a marking cycle's start or slice that began at `started` ended (`TRUST_JS_PERF_METRICS`).
+pub(crate) fn gc_performance_metrics_slice(started: std::time::Instant) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
+    GC_SLICES.fetch_add(1, Relaxed);
+    GC_SLICE_PAUSE_NANOS.fetch_add(elapsed, Relaxed);
+    GC_MAX_SLICE_PAUSE_NANOS.fetch_max(elapsed, Relaxed);
+}
+
 /// The S3 layout census as a JSON field, when it was requested.
 fn layout_census_field() -> String {
     if layout_census::enabled() {
@@ -5225,7 +5242,7 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
         GC_KIND_PAUSE_NANOS[kind as usize].load(Relaxed) as f64 / 1_000_000_000.0
     };
     format!(
-        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_kinds\":{{\"minor\":{},\"major\":{}}},\"gc_pause_seconds\":{:.9},\"gc_pause_seconds_by_cause\":{{\"allocation_threshold\":{:.9},\"task_boundary\":{:.9},\"explicit\":{:.9}}},\"gc_pause_seconds_by_kind\":{{\"minor\":{:.9},\"major\":{:.9}}},\"gc_max_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{}{}",
+        "\"gc_collections\":{},\"gc_causes\":{{\"allocation_threshold\":{},\"task_boundary\":{},\"explicit\":{}}},\"gc_kinds\":{{\"minor\":{},\"major\":{}}},\"gc_pause_seconds\":{:.9},\"gc_pause_seconds_by_cause\":{{\"allocation_threshold\":{:.9},\"task_boundary\":{:.9},\"explicit\":{:.9}}},\"gc_pause_seconds_by_kind\":{{\"minor\":{:.9},\"major\":{:.9}}},\"gc_max_pause_seconds\":{:.9},\"gc_slices\":{},\"gc_slice_pause_seconds\":{:.9},\"gc_max_slice_pause_seconds\":{:.9},\"gc_pause_histogram\":{{\"unit\":\"nanoseconds\",\"upper_bounds\":[{upper_bounds}],\"counts\":[{counts}]}},\"gc_objects_seen\":{},\"gc_objects_reclaimed\":{},\"gc_peak_objects_before\":{},\"gc_last_objects_after\":{}{}",
         GC_COLLECTIONS.load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::AllocationThreshold as usize].load(Relaxed),
         GC_CAUSE_COUNTS[GcCause::TaskBoundary as usize].load(Relaxed),
@@ -5239,6 +5256,9 @@ pub(crate) fn gc_performance_metrics_json_fields() -> String {
         kind_pause_seconds(Minor),
         kind_pause_seconds(Major),
         max_pause_nanos as f64 / 1_000_000_000.0,
+        GC_SLICES.load(Relaxed),
+        GC_SLICE_PAUSE_NANOS.load(Relaxed) as f64 / 1_000_000_000.0,
+        GC_MAX_SLICE_PAUSE_NANOS.load(Relaxed) as f64 / 1_000_000_000.0,
         GC_OBJECTS_SEEN.load(Relaxed),
         GC_OBJECTS_RECLAIMED.load(Relaxed),
         GC_PEAK_OBJECTS_BEFORE.load(Relaxed),
@@ -5286,6 +5306,7 @@ pub(crate) fn new_gc_heap() -> GcHeap {
         closure_functions: RefCell::default(),
         young_closure_functions: RefCell::default(),
         closure_functions_judged: Cell::new(0),
+        cycle_closure_stamp: Cell::new(0),
         array_length_shapes: Default::default(),
         array_length_layout: RefCell::default(),
         live: LiveCount::new(0),
@@ -5482,12 +5503,51 @@ pub(crate) fn mark_agent_heap(
     client: &dyn crate::gc_core::MarkClient,
     kind: crate::gc_core::CollectionKind,
 ) -> bool {
-    let stamp = closure_mark_stamp();
+    // A running cycle's final pause ends its marking, with its stamp (W6).
+    let cycle = heap.cycle_closure_stamp.get();
+    let stamp = if cycle != 0 {
+        CLOSURE_MARK_STAMP.with(|current| current.set(cycle));
+        cycle
+    } else {
+        closure_mark_stamp()
+    };
     let marked = heap
         .core
         .borrow_mut()
         .start_marking(native_roots, client, kind);
+    if marked {
+        heap.cycle_closure_stamp.set(0);
+    }
     sweep_closure_functions(heap, stamp, marked, kind);
+    marked
+}
+
+/// W6: start a marking cycle of `heap` ([`crate::gc_core::Heap::start_cycle`]) with a closure mark
+/// stamp of its own, which its slices and its final pause mark with too: one marking, which the
+/// final pause ends as [`mark_agent_heap`] ends every marking, judging the closure registry.
+pub(crate) fn start_agent_cycle(
+    heap: &GcState,
+    native_roots: bool,
+    client: &dyn crate::gc_core::MarkClient,
+) -> bool {
+    debug_assert_eq!(heap.cycle_closure_stamp.get(), 0, "a cycle is running");
+    let stamp = closure_mark_stamp();
+    let started = heap.core.borrow_mut().start_cycle(native_roots, client);
+    CLOSURE_MARK_STAMP.with(|current| current.set(0));
+    if started {
+        heap.cycle_closure_stamp.set(stamp);
+    }
+    started
+}
+
+/// W6: a slice of `heap`'s running cycle ([`crate::gc_core::Heap::slice`]), marking with its
+/// stamp: the bytes it marked, or `None` when it was deferred.
+pub(crate) fn slice_agent_heap(heap: &GcState) -> Option<usize> {
+    let stamp = heap.cycle_closure_stamp.get();
+    debug_assert_ne!(stamp, 0, "a slice of a running cycle");
+    CLOSURE_MARK_STAMP.with(|current| current.set(stamp));
+    let marked = heap.core.borrow_mut().slice();
+    CLOSURE_MARK_STAMP.with(|current| current.set(0));
     marked
 }
 

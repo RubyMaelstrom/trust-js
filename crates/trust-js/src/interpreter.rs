@@ -13286,7 +13286,12 @@ impl Interp {
         // major one.
         let kind = over_ceiling.then_some(crate::gc_core::CollectionKind::Major);
         let outcome = self.gc_collect_with_cause(crate::value::GcCause::AllocationThreshold, kind);
-        if outcome == crate::agent_control::CollectionOutcome::Deferred {
+        // A deferred collection, or a marking cycle's start or slice (W6), freed nothing.
+        if matches!(
+            outcome,
+            crate::agent_control::CollectionOutcome::Deferred
+                | crate::agent_control::CollectionOutcome::Marked
+        ) {
             return Ok(());
         }
         let live = crate::value::heap_live_objects(&self.gc_heap);

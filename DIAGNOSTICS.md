@@ -107,7 +107,9 @@ comment/example in the same change.
   exit, before printing it, so the GC counts and pauses include that collection (cause
   `explicit`, a major collection). Collections are counted by cause (`gc_causes`) and by kind
   (`gc_kinds`: `minor`, `major`), and their pauses are also reported by cause
-  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`). Production GC does
+  (`gc_pause_seconds_by_cause`) and by kind (`gc_pause_seconds_by_kind`); a marking cycle's
+  slices (its start among them) are not collections, and are counted apart (`gc_slices`,
+  `gc_slice_pause_seconds`, `gc_max_slice_pause_seconds`). Production GC does
   not record a managed-memory snapshot: `managed_memory` reports `safepoint: null`,
   `complete: false`, and unavailable requested/external byte totals, not measured zeros.
   Live rooted-handle counts (`handles`: `strong` and `weak`) remain available independently;
@@ -141,6 +143,25 @@ comment/example in the same change.
   clearing weak handles and weak cells; `tables`: evicting the dead from the engine's tables;
   `after`: the Agent's bookkeeping after the sweep), then the cells finalized, by kind, and
   the time their finalizers took (`fin:<kind>=count fin_us:<kind>=microseconds`).
+- `TRUST_JS_GC_INCREMENTAL=1` (W6, off by default) marks the major collections the heap asks
+  for on its own (its byte budget, a stress interval) in a cycle between whose slices the
+  program runs: the cycle's start marks the roots and the native stack, each slice traces part
+  of what they reach, at the first safepoint after every 64 KiB allocated, and a final pause
+  once nothing is left to trace marks the roots, the stack and the cells written since their
+  trace (their cards) again, with the side tables, then sweeps as a major collection does. No
+  minor collection runs while a cycle marks; the cycle's allocation past a margin over the byte
+  budget (V8's), and every requested collection (explicit, the exit's, the live-object limit,
+  ArrayBuffer pressure, an explicit minor one) finish it at once; an explicit major collection
+  that finishes one is followed by another, which frees what the cycle marked before it died.
+  `TRUST_JS_GC_INCREMENTAL=force`
+  makes the slices a few cells each, at every safepoint while a cycle marks, and with
+  `TRUST_JS_GC_VERIFY` each slice's end checks that no traced cell with a clean card holds an
+  edge to an unmarked one. `TRUST_JS_GC_LOG=1` prints a `[gc-slice]` line for the cycle's start
+  (`phase=start`) and each slice: the slices so far (`n`), the bytes of the cells it traced
+  (`traced`), the bytes it marked and the cycle's so far (`cycle_marked`), the cells left in the
+  worklist, the bytes allocated since the cycle started (`cycle_alloc`), whether the marking
+  is complete but for the final pause, and its `pause` in microseconds; the final pause's
+  `[gc-heap]` line is a major collection's.
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
   collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and

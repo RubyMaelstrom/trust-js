@@ -72,6 +72,18 @@ const MIN_SPARE_PAGES_WITH_NURSERY: usize = 16;
 const MIN_SPARE_PAGES: usize = 64;
 #[cfg(debug_assertions)]
 const POISON: u64 = 0xdddd_dddd_dddd_dddd;
+/// W6: a marking cycle's next slice falls due once this many bytes were allocated since its
+/// last one ended (V8's young-generation step, src/heap/incremental-marking.cc:53-54).
+const SLICE_BYTES: usize = 64 << 10;
+/// W6 step 2's provisional slice budget, until the schedule (step 4): a slice traces this many
+/// times the bytes allocated since the last one, and at least [`SLICE_BYTES`] (the step V8 asks
+/// for when marking makes no progress, src/heap/base/incremental-marking-schedule.h:48-56).
+const SLICE_MARK_FACTOR: usize = 4;
+/// W6: the cells a slice traces under [`IncrementalMode::Force`].
+const FORCED_SLICE_CELLS: usize = 4;
+/// W6: the floor of V8's overshoot margin, past which a cycle's allocation forces its final
+/// pause (src/heap/heap-controller.h:160-176).
+const MIN_CYCLE_MARGIN: usize = 32 << 20;
 
 /// S6 step 10b: a page of a kind whose cells gain references after their initialization
 /// ([`LayoutDesc::carded`]) ends in a card table, a byte per card of `1 << CARD_SHIFT` bytes of
@@ -840,6 +852,44 @@ pub(crate) enum CollectionKind {
     Major = 1,
 }
 
+/// W6: whether a major collection the heap asks for marks in a cycle of slices between which the
+/// program runs (`TRUST_JS_GC_INCREMENTAL`; [`Heap::set_incremental`]).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum IncrementalMode {
+    /// Every major collection marks in one pause.
+    #[default]
+    Off,
+    /// A major collection the heap asks for on its own (its byte budget, the stress interval)
+    /// starts a cycle; a requested one (explicit, the live-object ceiling, buffer pressure)
+    /// still marks in one pause, and finishes a running cycle.
+    On,
+    /// As `On`, with slices of a few cells each at every safepoint while a cycle marks
+    /// (verification's mode, design 11).
+    Force,
+}
+
+/// W6: what a safepoint's collection does ([`Heap::due_work`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DueWork {
+    /// A collection of this kind; while a cycle marks, a major one is its final pause.
+    Collect(CollectionKind),
+    /// Start a marking cycle ([`Heap::start_cycle`]).
+    StartCycle,
+    /// A slice of the running cycle's marking ([`Heap::slice`]).
+    Slice,
+}
+
+/// What a slice may trace ([`Heap::drain_within`]).
+#[derive(Clone, Copy)]
+enum SliceBudget {
+    /// Until it has traced cells of this many bytes.
+    Bytes(usize),
+    /// This many cells ([`IncrementalMode::Force`]).
+    Cells(usize),
+    /// Everything: the final pause's drain.
+    Unbounded,
+}
+
 /// Receives the edges a [`MarkClient`] keeps off-heap, in its side tables.
 pub(crate) struct EdgeSink<'a> {
     edges: &'a mut Vec<SourceEdge>,
@@ -1073,16 +1123,23 @@ impl PageMeta {
         }
     }
 
-    /// For a minor collection as it starts: list in `cells` every marked (old) cell that starts
-    /// in a set card of this page, and clear the cards. A card covers `1 << CARD_SHIFT` bytes,
-    /// so one card can cover the starts of several small cells; each marked one is listed. An
-    /// unmarked cell is young (or free, or a zombie) and is traced, if at all, as it is reached.
+    /// For a minor collection as it starts, and a marking cycle's final pause (W6): list in
+    /// `cells` every marked (old, or the cycle's) cell that starts in a set card of this page, for
+    /// a trace of the cycle's purpose (full) when `FULL` and a minor collection's (remembered)
+    /// otherwise, and clear the cards. A card covers `1 << CARD_SHIFT` bytes, so one card can cover
+    /// the starts of several small cells; each marked one is listed. An unmarked cell is young (or
+    /// free, or a zombie) and is traced, if at all, as it is reached.
     ///
     /// The barrier sets the card of every cell written, young or old, so a page that received
     /// cells since the last collection has most of its cards set for young cells, which this
     /// collection does not need: such a page is walked by its old cells, listing those whose
     /// card is set. An old page has few set cards and only old cells: it is walked by its cards.
-    fn take_card_cells(&mut self, cells: &mut Vec<TraceWork>) {
+    ///
+    /// The purpose is a parameter of the function's type, so that each caller gets a copy of its
+    /// own: the minor collection's, inlined into `begin_marking`, is compiled as before W6 (a
+    /// runtime purpose cost its walk a reload of the page's fields at every marked cell, W6 step
+    /// 2's record).
+    fn take_card_cells<const FULL: bool>(&mut self, cells: &mut Vec<TraceWork>) {
         // SAFETY: a carded page ends in its card table, the summary its last byte; the page is
         // live while its metadata is.
         if !self.carded || unsafe { ((self.base + CARD_SUMMARY) as *const u8).read() } == 0 {
@@ -1092,7 +1149,11 @@ impl PageMeta {
         let work = |index: usize| TraceWork {
             cell: self.cell_ptr(index),
             desc: self.desc,
-            purpose: TracePurpose::Remembered,
+            purpose: if FULL {
+                TracePurpose::Full
+            } else {
+                TracePurpose::Remembered
+            },
         };
         if self.young {
             for word in 0..self.next_unused.div_ceil(64) {
@@ -1429,6 +1490,27 @@ struct Marker {
     ready: Vec<u32>,
 }
 
+/// W6: a major collection's marking in progress across safepoints, from its start
+/// ([`Heap::start_cycle`]) through its slices ([`Heap::slice`]) to its final pause (a major
+/// collection's marking, [`Heap::start_marking`]). Its marker keeps the grey cells from one
+/// slice to the next. The marks are the cycle's: no minor collection, which reads them as ages,
+/// runs while it marks, cells allocated meanwhile are unmarked (white), and none is freed until
+/// the final pause sweeps, so every address the marker holds stays a live cell's. A marked cell
+/// written since its trace has its card set (the write barrier); the final pause rescans those.
+struct Cycle {
+    marker: Marker,
+    /// `Heap::allocated_bytes` as the cycle started, and as its last slice ended.
+    allocated_at_start: usize,
+    allocated_at_slice: usize,
+    /// The slices run so far (the start's among them), and their time while phases are timed.
+    slices: u32,
+    slice_nanos: u64,
+    /// The bytes of the cells the last slice traced (its work, [`Heap::drain_within`]).
+    last_traced: usize,
+    /// The worklist ran out: the final pause is due.
+    complete: bool,
+}
+
 /// A small direct-mapped table of exact positive words. Cell and page bits both
 /// participate so aligned shared prototype/layout addresses do not systematically collide.
 const MARK_CACHE_WORDS: usize = 32;
@@ -1693,6 +1775,10 @@ pub(crate) struct Heap {
     stats: GcStats,
     /// Time the phases of each collection into `stats.last_phase_nanos` (diagnostics).
     phase_timing: bool,
+    /// W6: whether the heap's own major collections mark in cycles ([`IncrementalMode`]).
+    incremental: IncrementalMode,
+    /// W6: the marking cycle running, between its start and its final pause ([`Cycle`]).
+    cycle: Option<Box<Cycle>>,
     #[cfg(test)]
     retention_tracing: bool,
     /// The last traced collection's mark sources, by cell start.
@@ -1762,6 +1848,8 @@ impl Heap {
             due_check_bytes: DEFAULT_MIN_TRIGGER,
             stats: GcStats::default(),
             phase_timing: false,
+            incremental: IncrementalMode::Off,
+            cycle: None,
             #[cfg(test)]
             retention_tracing: false,
             #[cfg(test)]
@@ -2029,6 +2117,103 @@ impl Heap {
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every)
             || self.bytes_due(0)
             || self.control.external.due.get()
+            || self.cycle.as_ref().is_some_and(|cycle| {
+                cycle.complete || self.incremental == IncrementalMode::Force
+            })
+    }
+
+    /// W6: see [`IncrementalMode`]; it takes effect at the next major collection the heap asks
+    /// for.
+    pub(crate) fn set_incremental(&mut self, mode: IncrementalMode) {
+        self.incremental = mode;
+        self.refresh_due();
+    }
+
+    /// W6: whether a marking cycle is running, between its start and its final pause.
+    pub(crate) fn cycle_running(&self) -> bool {
+        self.cycle.is_some()
+    }
+
+    /// W6: the running cycle's slices so far, the bytes its last slice traced, the bytes it
+    /// marked, the grey cells its worklist holds, the bytes allocated since it started, and
+    /// whether its marking is complete but for the final pause (the GC log's slice lines).
+    pub(crate) fn cycle_progress(&self) -> Option<(u32, usize, usize, usize, usize, bool)> {
+        self.cycle.as_ref().map(|cycle| {
+            (
+                cycle.slices,
+                cycle.last_traced,
+                self.marked_bytes,
+                cycle.marker.worklist.len(),
+                self.allocated_bytes
+                    .saturating_sub(cycle.allocated_at_start),
+                cycle.complete,
+            )
+        })
+    }
+
+    /// W6: V8's overshoot margin over the byte budget, past which a cycle's allocation forces
+    /// its final pause: min(max(budget / 2, 32 MB), (maximum - budget) / 2)
+    /// (src/heap/heap-controller.h:160-176).
+    #[cold]
+    #[inline(never)]
+    fn cycle_margin(&self) -> usize {
+        let limit = self.trigger_bytes;
+        (limit / 2)
+            .max(MIN_CYCLE_MARGIN)
+            .min(self.max_heap_bytes.saturating_sub(limit) / 2)
+    }
+
+    /// W6: the heap's bytes, with the external bytes still charged and `upcoming` more, have
+    /// passed the byte budget by [`Heap::cycle_margin`]: the running cycle's final pause is due
+    /// (V8's AllocationLimitOvershotByLargeMargin, which counts the young generation's bytes as
+    /// old while major marking runs, src/heap/heap.cc:5308-5338).
+    #[cold]
+    #[inline(never)]
+    fn cycle_overshot(&self, upcoming: usize) -> bool {
+        self.allocated_bytes
+            .saturating_add(upcoming)
+            .saturating_add(self.control.external.live.get())
+            > self.trigger_bytes.saturating_add(self.cycle_margin())
+    }
+
+    /// W6: what the collection at this safepoint does, for `requested`, the caller's kind or a
+    /// deferred request's. Outside a cycle: the requested collection, or the heap's own
+    /// ([`Heap::due_kind`]), whose major collection starts a cycle when incremental marking is on
+    /// and nothing asked for a kind (`heap_choice`). While a cycle marks: its final pause for a
+    /// major request, an explicit minor one (V8 collects fully for a young-generation request
+    /// while it marks, src/heap/heap.cc:588-591), a deferred major request, a worklist that ran
+    /// out or a margin passed; a slice otherwise.
+    #[inline(never)]
+    pub(crate) fn due_work(
+        &self,
+        requested: Option<CollectionKind>,
+        heap_choice: bool,
+        explicit_minor: bool,
+    ) -> DueWork {
+        if let Some(cycle) = &self.cycle {
+            let finalize = requested == Some(CollectionKind::Major)
+                || explicit_minor
+                || self.major_due
+                || cycle.complete
+                || self.cycle_overshot(0);
+            return if finalize {
+                DueWork::Collect(CollectionKind::Major)
+            } else {
+                DueWork::Slice
+            };
+        }
+        // An embedder's request for a major collection (`Heap::request_major`) is one: the
+        // boundary it collects at expects the graph it released gone after it.
+        match requested.unwrap_or_else(|| self.due_kind()) {
+            CollectionKind::Major
+                if heap_choice
+                    && !self.major_requested
+                    && self.incremental != IncrementalMode::Off =>
+            {
+                DueWork::StartCycle
+            }
+            kind => DueWork::Collect(kind),
+        }
     }
 
     /// The heap's control block, shared with the containers that charge external bytes to it
@@ -2040,6 +2225,13 @@ impl Heap {
     /// Whether the allocated bytes make a collection due, once `upcoming` more are allocated.
     fn bytes_due(&self, upcoming: usize) -> bool {
         let allocated = self.allocated_bytes.saturating_add(upcoming);
+        if let Some(cycle) = &self.cycle {
+            // No minor collection runs while a cycle marks (V8's rule, design 2): the nursery's
+            // budget waits, and allocation brings the next slice instead, or past the margin the
+            // final pause.
+            return allocated.saturating_sub(cycle.allocated_at_slice) > SLICE_BYTES
+                || self.cycle_overshot(upcoming);
+        }
         match self.nursery_bytes {
             Some(nursery) => self.major_due || allocated.saturating_sub(self.swept_bytes) > nursery,
             None => allocated > self.trigger_bytes,
@@ -2051,6 +2243,15 @@ impl Heap {
     /// collection is due or requested, or for every `stress_major_every`-th collection under a
     /// stress interval; minor otherwise.
     pub(crate) fn due_kind(&self) -> CollectionKind {
+        // While a cycle marks, the heap's own work is a slice, which a deferred request asks for
+        // as a minor collection, or with a major collection due the cycle's final pause.
+        if self.cycle.is_some() {
+            return if self.major_due {
+                CollectionKind::Major
+            } else {
+                CollectionKind::Minor
+            };
+        }
         let stress_major = self.stress_every > 0
             && (self.stress_collections + 1).is_multiple_of(self.stress_major_every as u64);
         if self.nursery_bytes.is_none() || self.major_due || self.major_requested || stress_major {
@@ -2182,6 +2383,16 @@ impl Heap {
             usize::MAX
         } else if self.stress_every > 0 {
             self.allocated_bytes
+        } else if let Some(cycle) = &self.cycle {
+            // The next slice, or the margin's final pause if it comes first.
+            let margin = self
+                .trigger_bytes
+                .saturating_add(self.cycle_margin())
+                .saturating_sub(self.control.external.live.get());
+            cycle
+                .allocated_at_slice
+                .saturating_add(SLICE_BYTES)
+                .min(margin)
         } else {
             match self.nursery_bytes {
                 Some(nursery) => self.swept_bytes.saturating_add(nursery),
@@ -2968,6 +3179,9 @@ impl Heap {
     /// outside every registered region (e.g. an unregistered `stacker::grow`
     /// segment), or no scanner for this target (wasm32).
     fn collect_kind(&mut self, kind: CollectionKind) -> bool {
+        // Marking cycles are the engine's (W6, `Heap::start_cycle`): a heap that collects for
+        // itself runs none.
+        debug_assert!(self.cycle.is_none(), "a self-collecting heap runs a cycle");
         if self.blocked() {
             return self.defer(false, kind);
         }
@@ -3001,7 +3215,8 @@ impl Heap {
     /// [`Heap::is_dead_small_cell`] and [`Heap::is_dead_target`], which in a minor collection
     /// find only young cells dead. Returns false when deferred, in which case
     /// `finish_collection` must not be called; a deferred major request makes a major
-    /// collection due.
+    /// collection due. While a cycle marks (W6), a major collection's marking is the cycle's
+    /// final pause ([`Heap::final_marking`]).
     pub(crate) fn start_marking(
         &mut self,
         native_roots: bool,
@@ -3014,7 +3229,17 @@ impl Heap {
         if native_roots && !native::scannable(native::current_sp()) {
             return self.defer(true, kind);
         }
-        self.mark_phase(native_roots, client, kind);
+        // W6: a major collection while a cycle marks is the cycle's final pause.
+        if self.cycle.is_some() {
+            debug_assert_eq!(
+                kind,
+                CollectionKind::Major,
+                "no minor collection while a cycle marks"
+            );
+            self.final_marking(native_roots, client);
+        } else {
+            self.mark_phase(native_roots, client, kind);
+        }
         true
     }
 
@@ -3387,6 +3612,414 @@ impl Heap {
         }
     }
 
+    /// The rest of a cycle's final pause after its begin, as a collection's marking does it in
+    /// `mark_phase`: mark the client's roots and the native stack, add the side tables'
+    /// conditional edges and owners, drain, and with heap verification check the marked graph.
+    /// A copy, not shared with `mark_phase`, which drains through the cycle's `drain_within`:
+    /// with the two sharing their code, LTO compiled the engine's object and string paths and the
+    /// collections' marking differently (W6 step 2's record), so a collection's marking stays as
+    /// it was.
+    #[inline(always)]
+    fn mark_from_roots(
+        &mut self,
+        mut m: Marker,
+        native_roots: bool,
+        client: &dyn MarkClient,
+        clock: &mut Option<std::time::Instant>,
+    ) {
+        client.roots(&mut |word| self.mark_word(word, &mut m));
+        self.phase_done(Phase::Roots, clock);
+        if native_roots {
+            // The roots' marking handled the heap's metadata (the large cells' span starts at a
+            // cell's address, which may be a dead one's) in frames below this one, which the
+            // stack scan's frame reuses: zero them first, as after `begin_marking`.
+            #[cfg(not(target_arch = "wasm32"))]
+            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
+            self.mark_native_stack(&mut m);
+        }
+        self.phase_done(Phase::Stack, clock);
+        #[cfg(test)]
+        {
+            m.source = MarkSource::Root;
+        }
+        self.add_source_edges(&mut m, client);
+        client.side_slot_owners(&mut |owner| {
+            // An owner outside this heap is not a condition: its slots are traced now.
+            let condition = self.locate(owner as u64);
+            self.add_edge(
+                CondEdge {
+                    owner: condition,
+                    key: None,
+                    value: EdgeValue::SideSlots(owner),
+                    fired: false,
+                },
+                &mut m,
+                client,
+            );
+        });
+        self.phase_done(Phase::Side, clock);
+        // The cycle's drain, without a budget: `drain` keeps its one caller, `mark_phase`.
+        self.drain_within(&mut m, client, SliceBudget::Unbounded);
+        self.phase_done(Phase::Drain, clock);
+        if self.verifies() {
+            self.verify(&m);
+        }
+        #[cfg(test)]
+        if let Some(parents) = m.parents.take() {
+            self.last_parents = parents;
+        }
+    }
+
+    /// W6: start a marking cycle (design 6), at a safepoint: with heap verification, the write
+    /// barrier's and the records' checks; then clear every mark and card, as a major
+    /// collection's marking starts, mark the client's roots and the native stack, and run the
+    /// cycle's first slice. The side tables' conditional edges and the ephemerons wait for the
+    /// final pause, which reports them in full. Deferred as a collection is (a deferred start
+    /// makes a major collection due); false then.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn start_cycle(&mut self, native_roots: bool, client: &dyn MarkClient) -> bool {
+        debug_assert!(self.cycle.is_none(), "a cycle is running already");
+        if self.blocked() {
+            return self.defer(false, CollectionKind::Major);
+        }
+        if native_roots && !native::scannable(native::current_sp()) {
+            return self.defer(true, CollectionKind::Major);
+        }
+        assert!(
+            !self.control.collecting.replace(true),
+            "re-entrant GC collection"
+        );
+        let started = self.phase_clock();
+        // One marking from here to the final pause: a cell made from now on is young at the next.
+        self.control.markings.set(self.control.markings.get() + 1);
+        self.update_fast_alloc();
+        self.control.pending_collect.set(false);
+        self.collecting_kind = CollectionKind::Major;
+        self.major_due = false;
+        self.major_requested = false;
+        if self.stress_every > 0 {
+            self.stress_collections += 1;
+        }
+        self.marked_bytes = 0;
+        self.allocs_since_gc = 0;
+        self.flush_cursors();
+        // The external bytes charged during the cycle count toward its margin, and their budget
+        // waits, as the nursery's does, for the final pause's sweep to set it again.
+        self.control.external.budget.set(0);
+        self.control.external.due.set(false);
+        self.begin_marking(CollectionKind::Major, client);
+        #[cfg(not(target_arch = "wasm32"))]
+        if native_roots {
+            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
+        }
+        let mut m = Marker::default();
+        #[cfg(test)]
+        {
+            m.parents = self.retention_tracing.then(FastMap::default);
+        }
+        client.roots(&mut |word| self.mark_word(word, &mut m));
+        if native_roots {
+            #[cfg(not(target_arch = "wasm32"))]
+            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
+            self.mark_native_stack(&mut m);
+        }
+        let allocated = self.allocated_bytes;
+        let mut cycle = Box::new(Cycle {
+            marker: m,
+            allocated_at_start: allocated,
+            allocated_at_slice: allocated,
+            slices: 0,
+            slice_nanos: 0,
+            last_traced: 0,
+            complete: false,
+        });
+        self.run_slice(&mut cycle, client, started);
+        self.cycle = Some(cycle);
+        self.control.collecting.set(false);
+        self.update_fast_alloc();
+        self.refresh_due();
+        true
+    }
+
+    /// W6: a slice of the running cycle's marking, at a safepoint (design 4): it traces grey
+    /// cells within its budget and leaves the rest for the next slice; a worklist that runs out
+    /// makes the final pause due. It reads no root and scans no stack. Deferred as a collection
+    /// is: `None` then; otherwise the bytes it marked.
+    #[cold]
+    #[inline(never)]
+    pub(crate) fn slice(&mut self) -> Option<usize> {
+        if self.blocked() {
+            self.defer(false, CollectionKind::Minor);
+            return None;
+        }
+        let mut cycle = self.cycle.take().expect("a slice of a running cycle");
+        assert!(
+            !self.control.collecting.replace(true),
+            "re-entrant GC collection"
+        );
+        let started = self.phase_clock();
+        self.update_fast_alloc();
+        self.control.pending_collect.set(false);
+        self.allocs_since_gc = 0;
+        let before = self.marked_bytes;
+        // Slices fire no conditional edge: the final pause adds them (step 2).
+        self.run_slice(&mut cycle, &NoClient, started);
+        self.cycle = Some(cycle);
+        self.control.collecting.set(false);
+        self.update_fast_alloc();
+        self.refresh_due();
+        Some(self.marked_bytes - before)
+    }
+
+    /// W6: one slice's tracing for `cycle` (the start's or a later one): within the slice's
+    /// budget, then with heap verification the cycle's barrier check.
+    #[inline(never)]
+    fn run_slice(
+        &mut self,
+        cycle: &mut Cycle,
+        client: &dyn MarkClient,
+        started: Option<std::time::Instant>,
+    ) {
+        let budget = match self.incremental {
+            IncrementalMode::Force => SliceBudget::Cells(FORCED_SLICE_CELLS),
+            IncrementalMode::On | IncrementalMode::Off => SliceBudget::Bytes(
+                self.allocated_bytes
+                    .saturating_sub(cycle.allocated_at_slice)
+                    .saturating_mul(SLICE_MARK_FACTOR)
+                    .max(SLICE_BYTES),
+            ),
+        };
+        (cycle.complete, cycle.last_traced) =
+            self.drain_within(&mut cycle.marker, client, budget);
+        cycle.slices += 1;
+        cycle.allocated_at_slice = self.allocated_bytes;
+        // The check walks the heap: after every slice of an ordinary cycle, but under `Force`,
+        // whose slices are a few cells at every safepoint, after its first 64 slices, then every
+        // 64th, as the worklist runs out and at the final pause. A store the barrier missed stays
+        // in the heap until the final pause's check, unless the program overwrote it.
+        let check = match self.incremental {
+            IncrementalMode::Force => {
+                cycle.slices <= 64 || cycle.slices.is_multiple_of(64) || cycle.complete
+            }
+            IncrementalMode::On | IncrementalMode::Off => true,
+        };
+        if check && self.verifies() {
+            self.check_cycle_barrier(&cycle.marker);
+        }
+        if let Some(started) = started {
+            cycle.slice_nanos += started.elapsed().as_nanos() as u64;
+        }
+    }
+
+    /// W6: a cycle's final pause marks (design 7), as a major collection marks but from the
+    /// cycle's marks and worklist: it rescans the marked cells whose cards are set, written since
+    /// the cycle began (a store into a cell the marker traced may hold the only edge to an
+    /// unmarked one), clearing every card, then re-marks every root and the native stack, adds
+    /// the side tables' edges and the ephemerons in full and drains.
+    #[cold]
+    #[inline(never)]
+    fn final_marking(&mut self, native_roots: bool, client: &dyn MarkClient) {
+        let cycle = self.cycle.take().expect("a running cycle");
+        assert!(
+            !self.control.collecting.replace(true),
+            "re-entrant GC collection"
+        );
+        // The cycle's start counted the marking (`Control::markings`) and the stress interval's
+        // collection; its marked bytes continue.
+        self.update_fast_alloc();
+        self.control.pending_collect.set(false);
+        self.collecting_kind = CollectionKind::Major;
+        self.major_due = false;
+        self.major_requested = false;
+        self.external_at_mark = self.control.external.live.get();
+        self.external_due_at_mark = self.control.external.due.get();
+        self.refresh_due();
+        self.stats.collections += 1;
+        self.stats.last_phase_nanos = [0; PHASES];
+        self.stats.last_finalized = [0; COUNTED_DESCS];
+        self.stats.last_finalize_nanos = [0; COUNTED_DESCS];
+        let mut clock = self.phase_clock();
+        self.flush_cursors();
+        self.stats.last_cycle_slices = cycle.slices;
+        self.stats.last_cycle_slice_nanos = cycle.slice_nanos;
+        self.stats.last_cycle_allocated = self
+            .allocated_bytes
+            .saturating_sub(cycle.allocated_at_start);
+        if self.pacing.is_some() {
+            self.committed_at_mark = self.committed_bytes();
+            let allocated = self.allocated_bytes.saturating_sub(self.swept_bytes);
+            if let Some(pacing) = &mut self.pacing {
+                pacing.start(std::time::Instant::now(), allocated);
+            }
+        }
+        let mut m = cycle.marker;
+        if self.verifies() {
+            self.check_cycle_barrier(&m);
+        }
+        let queued = m.worklist.len();
+        for page in self.pages.iter_mut().flatten() {
+            page.take_card_cells::<true>(&mut m.worklist);
+        }
+        self.stats.last_card_cells = m.worklist.len() - queued;
+        // Taking the cards handled cells' addresses in frames below this one, which the stack
+        // scan's frames reuse (see `mark_phase`).
+        #[cfg(not(target_arch = "wasm32"))]
+        if native_roots {
+            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
+        }
+        self.phase_done(Phase::Begin, &mut clock);
+        self.mark_from_roots(m, native_roots, client, &mut clock);
+    }
+
+    /// W6: [`Heap::drain`] within a slice's `budget`: whether the worklist and the ready
+    /// conditional edges ran out, so that only the final pause is left, and the bytes of the
+    /// cells traced. The cells fetched ahead of the trace that ends the slice go back to the
+    /// worklist.
+    #[inline(never)]
+    fn drain_within(
+        &mut self,
+        m: &mut Marker,
+        client: &dyn MarkClient,
+        budget: SliceBudget,
+    ) -> (bool, usize) {
+        // The slice's work is the cells it traces, by their bytes (V8 counts the bytes of the
+        // objects a step visits, src/heap/mark-compact.cc:2300-2373): a cell whose edges are all
+        // marked already still costs its trace.
+        let mut traced_bytes = 0usize;
+        let mut traced = 0usize;
+        let mut ahead = [TraceWork {
+            cell: 0,
+            desc: DescId(0),
+            purpose: TracePurpose::Full,
+        }; MARK_PREFETCH];
+        let (mut head, mut queued) = (0usize, 0usize);
+        loop {
+            loop {
+                while queued < MARK_PREFETCH {
+                    let Some(work) = m.worklist.pop() else {
+                        break;
+                    };
+                    prefetch_cell(work.cell);
+                    ahead[(head + queued) % MARK_PREFETCH] = work;
+                    queued += 1;
+                }
+                if queued == 0 {
+                    break;
+                }
+                let TraceWork {
+                    cell,
+                    desc,
+                    purpose,
+                } = ahead[head];
+                head = (head + 1) % MARK_PREFETCH;
+                queued -= 1;
+                #[cfg(test)]
+                {
+                    m.source = MarkSource::Cell(cell);
+                }
+                let descriptor = &self.descs[desc.0 as usize];
+                let (trace, mark_trace) = (descriptor.trace, descriptor.mark_trace);
+                match mark_trace {
+                    Some(mark_trace) => {
+                        mark_trace(cell as *const u8, purpose, &mut MarkSink { heap: self, m })
+                    }
+                    None => trace(cell as *const u8, &mut |edge| {
+                        self.mark_word(edge as u64, m)
+                    }),
+                }
+                traced += 1;
+                let spent = match budget {
+                    SliceBudget::Bytes(bytes) => {
+                        traced_bytes += self.cell_bytes(cell);
+                        traced_bytes >= bytes
+                    }
+                    SliceBudget::Cells(cells) => {
+                        traced_bytes += self.cell_bytes(cell);
+                        traced >= cells
+                    }
+                    SliceBudget::Unbounded => false,
+                };
+                if spent {
+                    for index in 0..queued {
+                        m.worklist.push(ahead[(head + index) % MARK_PREFETCH]);
+                    }
+                    return (
+                        m.worklist.is_empty() && m.ready.is_empty(),
+                        traced_bytes,
+                    );
+                }
+            }
+            let Some(edge) = m.ready.pop() else {
+                return (true, traced_bytes);
+            };
+            self.try_fire(edge, m, client);
+        }
+    }
+
+    /// The bytes of the allocated cell that starts at `cell` (a slice's measure of its work).
+    fn cell_bytes(&self, cell: usize) -> usize {
+        match self.page_table.get(cell >> PAGE_SHIFT) {
+            Some(slot) => self.pages[slot as usize]
+                .as_ref()
+                .map_or(0, |page| page.cell_size),
+            None => self.larges.get(&cell).map_or(0, |large| large.size),
+        }
+    }
+
+    /// W6, heap verification at every slice's end and as the final pause starts (design 11): a
+    /// marked cell that no longer waits in the worklist (traced: black) and whose card is clean
+    /// holds no edge to an allocated unmarked cell. The cycle relies on it: such a cell is not
+    /// traced again, so its card must name every edge stored into it since its trace, the final
+    /// pause rescanning those it names. A cell of a kind without cards, or a large cell, gains
+    /// no edge after its initialization. Panics naming the holder and the target.
+    #[cold]
+    #[inline(never)]
+    fn check_cycle_barrier(&self, m: &Marker) {
+        let grey: crate::fasthash::FastSet<usize> =
+            m.worklist.iter().map(|work| work.cell).collect();
+        let mut edges: Vec<*const u8> = Vec::new();
+        let mut check = |holder: usize, desc: DescId| {
+            if grey.contains(&holder) {
+                return;
+            }
+            let desc = &self.descs[desc.0 as usize];
+            edges.clear();
+            (desc.trace)(holder as *const u8, &mut |edge| edges.push(edge));
+            for &edge in &edges {
+                let Some(target) = self.locate(edge as u64) else {
+                    continue;
+                };
+                let unmarked = match target.loc {
+                    Loc::Small { page, index } => {
+                        self.pages[page as usize].as_ref().is_some_and(|p| {
+                            bit(&p.allocated, index as usize) && !bit(&p.marks, index as usize)
+                        })
+                    }
+                    Loc::Large => self.larges.get(&target.start).is_some_and(|l| !l.marked),
+                };
+                assert!(
+                    !unmarked,
+                    "marking cycle: traced cell {holder:#x} ({}) with a clean card holds an edge \
+                     to unmarked cell {:#x} ({}): a store the write barrier did not record",
+                    desc.name, target.start, self.descs[target.desc.0 as usize].name
+                );
+            }
+        };
+        for page in self.pages.iter().flatten() {
+            for i in 0..page.cells {
+                if bit(&page.marks, i) && !page.card_set(i) {
+                    check(page.cell_ptr(i), page.desc);
+                }
+            }
+        }
+        for (&start, large) in &self.larges {
+            if large.marked {
+                check(start, large.desc);
+            }
+        }
+    }
+
     /// As a collection starts: with heap verification, check the write barrier's invariant
     /// against the last collection's marks and the cards set since
     /// ([`Heap::check_write_barrier`]), the young pages' bookkeeping
@@ -3418,7 +4051,7 @@ impl Heap {
                 let mut cells = std::mem::take(&mut self.card_cells);
                 cells.clear();
                 for page in self.pages.iter_mut().flatten() {
-                    page.take_card_cells(&mut cells);
+                    page.take_card_cells::<false>(&mut cells);
                 }
                 self.stats.last_card_cells = cells.len();
                 self.card_cells = cells;
@@ -4304,6 +4937,8 @@ impl Heap {
     /// leaving an empty heap. Finalizers run in no particular order (see
     /// FinalizeFn). Every handle into this heap dangles afterwards.
     pub(crate) fn release_all(&mut self) {
+        // A cycle's marker names cells that go now (W6).
+        self.cycle = None;
         let pages = std::mem::take(&mut self.pages);
         self.mark_pages.clear();
         for page in pages.iter().flatten() {
@@ -9451,5 +10086,167 @@ mod tests {
             "perf alloc: {:.1} ns per 32 B cell",
             start.elapsed().as_nanos() as f64 / N as f64
         );
+    }
+
+    /// W6: a fixture heap that marks its own major collections in cycles (`IncrementalMode::On`),
+    /// collecting only when a test asks, with a chain of `n` carded nodes rooted in `roots[0]`
+    /// (more than a slice marks, for `n` past 4,096).
+    fn cycle_fixture(n: u64) -> (Fixture, Vec<*mut u8>) {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_incremental(IncrementalMode::On);
+        let mut chain = Vec::new();
+        let mut next = 0;
+        for i in 0..n {
+            let p = fx.heap.alloc(fx.carded, 16);
+            set_word(p, 0, next);
+            set_word(p, 1, i);
+            next = tagged(p);
+            chain.push(p);
+        }
+        fx.roots[0] = next;
+        (fx, chain)
+    }
+
+    /// Start a cycle through the fixture's client (no native roots).
+    fn start_cycle(fx: &mut Fixture) -> bool {
+        let client = FixtureClient {
+            roots: &fx.roots[..],
+            edges: &no_edges,
+        };
+        fx.heap.start_cycle(false, &client)
+    }
+
+    /// Slice the fixture's cycle until its worklist runs out.
+    fn slice_to_completion(fx: &mut Fixture) {
+        for _ in 0..100_000 {
+            if fx.heap.cycle.as_ref().is_some_and(|cycle| cycle.complete) {
+                return;
+            }
+            assert!(fx.heap.slice().is_some());
+        }
+        panic!("the cycle's worklist never ran out");
+    }
+
+    /// W6: while a cycle marks, allocation past the nursery's budget brings a slice, not a minor
+    /// collection (design 2), until the margin.
+    #[test]
+    fn no_minor_collection_is_due_while_a_cycle_marks() {
+        let (mut fx, _chain) = cycle_fixture(20_000);
+        fx.heap.set_nursery_bytes(Some(64 << 10));
+        assert!(start_cycle(&mut fx));
+        assert!(!fx.heap.cycle.as_ref().unwrap().complete, "a first slice marks part of the chain");
+        for _ in 0..10 * (64 << 10) / 16 {
+            fx.heap.alloc(fx.node, 16);
+        }
+        assert!(fx.heap.collection_due());
+        assert_eq!(fx.heap.due_kind(), CollectionKind::Minor);
+        assert_eq!(fx.heap.due_work(None, true, false), DueWork::Slice);
+        assert_eq!(
+            fx.heap.due_work(Some(CollectionKind::Minor), false, false),
+            DueWork::Slice
+        );
+        // A requested major collection, or an explicit minor one, is the final pause.
+        assert_eq!(
+            fx.heap.due_work(Some(CollectionKind::Major), false, false),
+            DueWork::Collect(CollectionKind::Major)
+        );
+        assert_eq!(
+            fx.heap.due_work(Some(CollectionKind::Minor), false, true),
+            DueWork::Collect(CollectionKind::Major)
+        );
+        assert!(fx.heap.slice().is_some());
+        let minors = fx.heap.minor_collections();
+        fx.collect();
+        assert_eq!(fx.heap.minor_collections(), minors);
+        assert!(fx.heap.cycle.is_none());
+    }
+
+    /// W6: allocation past V8's overshoot margin over the budget forces the final pause.
+    #[test]
+    fn allocation_past_the_margin_forces_a_cycles_final_pause() {
+        let (mut fx, _chain) = cycle_fixture(20_000);
+        fx.heap.set_heap_growth(1 << 20, 100);
+        // A maximum 2 MB past the budget: a margin of 1 MB.
+        fx.heap.set_max_heap_bytes(fx.heap.trigger_bytes + (2 << 20));
+        assert_eq!(fx.heap.cycle_margin(), 1 << 20);
+        assert!(start_cycle(&mut fx));
+        assert_eq!(fx.heap.due_work(None, true, false), DueWork::Slice);
+        while fx.heap.allocated_bytes <= fx.heap.trigger_bytes + (1 << 20) {
+            fx.heap.alloc(fx.node, 16);
+        }
+        assert!(fx.heap.collection_due());
+        assert_eq!(
+            fx.heap.due_work(None, true, false),
+            DueWork::Collect(CollectionKind::Major)
+        );
+        fx.collect();
+        assert!(fx.heap.cycle.is_none());
+    }
+
+    /// W6: a cell stored into a traced (black) cell after its trace survives the cycle when the
+    /// store set the holder's card: the final pause rescans it. Every card is clean after.
+    #[test]
+    fn a_cycle_rescans_the_traced_cells_whose_cards_are_set() {
+        let (mut fx, chain) = cycle_fixture(5_000);
+        assert!(start_cycle(&mut fx));
+        slice_to_completion(&mut fx);
+        // The chain's head is black now; a new (white) cell stored into it.
+        let head = *chain.last().unwrap();
+        let young = fx.heap.alloc(fx.carded, 16);
+        set_word(young, 0, 0);
+        set_word(young, 1, 77);
+        set_word(head, 0, tagged(young));
+        // SAFETY: the head is a live carded cell of this heap.
+        unsafe { card_mark(head) };
+        // The store cut the chain below the head off.
+        assert!(fx.heap.slice().is_some());
+        fx.collect();
+        assert!(fx.heap.cycle.is_none());
+        assert!(fx.heap.owns_cell(young as usize, fx.carded), "the stored cell survives");
+        assert_eq!(fx.heap.cell_age(young as u64), Some(CellAge::Old));
+        for page in fx.heap.pages.iter().flatten() {
+            assert!((0..page.cells).all(|i| !page.card_set(i)), "a card is set after the cycle");
+        }
+        // The chain below the head, marked before the store cut it off, floated through this
+        // cycle; the next marking frees it.
+        assert!(fx.heap.owns_cell(chain[0] as usize, fx.carded));
+        fx.heap.set_incremental(IncrementalMode::Off);
+        fx.collect();
+        assert!(!fx.heap.owns_cell(chain[0] as usize, fx.carded));
+        assert!(fx.heap.owns_cell(young as usize, fx.carded));
+    }
+
+    /// W6, design 11: a store into a traced cell that set no card is caught by the cycle's
+    /// barrier check at the next slice's end (heap verification).
+    #[test]
+    #[should_panic(expected = "a store the write barrier did not record")]
+    fn a_store_into_a_traced_cell_without_its_card_is_caught() {
+        let (mut fx, chain) = cycle_fixture(5_000);
+        assert!(start_cycle(&mut fx));
+        slice_to_completion(&mut fx);
+        let head = *chain.last().unwrap();
+        let young = fx.heap.alloc(fx.carded, 16);
+        set_word(young, 0, 0);
+        set_word(head, 0, tagged(young));
+        fx.heap.slice();
+    }
+
+    /// W6: cells allocated while a cycle marks are white: the final pause frees those the roots
+    /// do not reach and keeps those they do, through the roots' re-marking.
+    #[test]
+    fn a_cycle_frees_the_unreached_cells_allocated_while_it_marked() {
+        let (mut fx, _chain) = cycle_fixture(5_000);
+        assert!(start_cycle(&mut fx));
+        let kept = fx.heap.alloc(fx.node, 16);
+        set_word(kept, 0, 0);
+        let lost = fx.heap.alloc(fx.node, 16);
+        set_word(lost, 0, 0);
+        fx.roots[1] = tagged(kept);
+        slice_to_completion(&mut fx);
+        assert_eq!(fx.heap.cell_age(kept as u64), Some(CellAge::Young), "white until reached");
+        fx.collect();
+        assert!(fx.heap.owns_cell(kept as usize, fx.node));
+        assert!(!fx.heap.owns_cell(lost as usize, fx.node));
     }
 }

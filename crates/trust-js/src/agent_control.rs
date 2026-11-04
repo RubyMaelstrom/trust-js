@@ -383,6 +383,8 @@ impl Interp {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CollectionOutcome {
     Collected(crate::gc_core::CollectionKind),
+    /// W6: a marking cycle started or ran a slice: nothing was collected yet.
+    Marked,
     Deferred,
 }
 

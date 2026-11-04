@@ -18,11 +18,16 @@ use crate::value::{Gc, WeakGc};
 use crate::{Completion, Engine};
 
 /// An engine at `tier` (threshold 0) whose heap has no stress interval.
+/// An engine whose collections follow the minor and major schedule these tests check: major
+/// collections mark in one pause, whatever `TRUST_JS_GC_INCREMENTAL` says (W6).
 fn engine(tier: Tier) -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(0);
-    engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
+    let mut core = engine.interp.gc_heap.core.borrow_mut();
+    core.set_stress_every(0);
+    core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    drop(core);
     engine
 }
 
