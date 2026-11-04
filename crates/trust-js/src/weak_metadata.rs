@@ -441,7 +441,17 @@ impl Interp {
     /// Delete `collection`'s entry under `key`, and the key's subscription for it.
     pub(crate) fn weak_collection_delete(&mut self, collection: &Gc, key: WeakKey) -> bool {
         // Removing an entry adds no edge: its card needs no record, but the borrow sets it.
-        let removed = match collection.try_borrow_mut() {
+        let object = collection.try_borrow_mut();
+        // The collection's object is never borrowed here: a key's death is drained only where no
+        // cell is borrowed (`weak_insert` drains before it borrows the collection, and a
+        // collection is deferred while any borrow is outstanding), and `delete` holds none.
+        // Skipping the removal would leave the entry under the dead key's address, where a later
+        // object could find the freed value.
+        debug_assert!(
+            object.is_ok(),
+            "a weak collection's object is borrowed at the removal of an entry"
+        );
+        let removed = match object {
             Ok(mut object) => match &mut object.kind {
                 ObjectKind::WeakCollection(data) => data.remove(&key),
                 _ => None,
