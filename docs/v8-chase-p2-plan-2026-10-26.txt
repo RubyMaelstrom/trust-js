@@ -10762,3 +10762,70 @@ Decisions (the owner's):
 7. The memory reducer's and explicit collections as one pause (designs 6, 9).
 8. The spare pages' release out of the pause as part of W6 (order, step 5).
 9. The exit's numbers.
+
+### The owner's answers: W6, the threshold, compact templates (2026-11-04)
+
+The owner, about 16:50: "Your design questions are approved as recommended as long as they
+aren't simply to make implementation simpler." On timing: "You can do a timing run any time that
+your subagents aren't doing a build, we have 20 cores, 10 of them are fast cores, you don't have
+to wait for a 2-core minimum." The timing rule replaces the 2-core trigger: a session starts when
+no agent of this work builds or runs a suite, and agents hold new builds while it runs.
+
+Each recommendation, checked against the condition:
+
+W6 ("W6: incremental marking" above):
+1. The cards as the marking barrier: as recommended. Its reasons are soundness and cost: a value
+   barrier needs the stored or overwritten value at every store, the Rust barrier fires at the
+   borrow before the stores (JSC's place, A1), and a store such a barrier missed would free a live
+   cell; the cards add no instruction at a store.
+2. No minor collection while a cycle marks: as recommended. Current V8 (a young-generation request
+   during marking selects the mark-compactor and the scavenger asserts that marking is off, A4)
+   and JSC (one request a cycle) both; TRust's minors mark in place with the major's bits, as JSC's
+   Eden collections do, where SM's minors between slices copy out of a nursery. It also lifts
+   SplayLatency (about 9,700 against 8,700 with the minors kept, the exit's estimates). Its price,
+   the cycle's young garbage, is bounded by V8's margin.
+3. White allocation during a cycle: as recommended (V8's young space and all of JSC's): no store
+   at an allocation; its price is the marking of the cycle's survivors.
+4. Slices every 64 KB, capped at 1 ms: as recommended (V8's young step and task budget). The cap
+   is the exit's latency, to be set by measurement.
+5. Precleaning once the worklist empties: as recommended, a cost choice (Splay's hot cells would
+   be rescanned at every timed preclean).
+6. Changed to V8's: ephemerons are discovered in the slices and resolved at the final pause. The
+   draft left all of it to the pause in a first version because it is small, an argument from
+   ease. As V8 (src/heap/marking-visitor-inl.h:696-806; src/heap/mark-compact.cc:2142-2198,
+   2249-2285): a slice that traces a weak collection marks the values of its marked keys and
+   records the unresolved pairs; a weak reference or finalization cell whose target is unmarked
+   goes onto the cycle's weak list; the final pause merges the recorded pairs with the weak
+   collections on set cards, runs the fixpoint (V8's ten rounds, then its linear algorithm), and
+   clears and queues after marking, as now. The side-slot tables, which V8 has no counterpart of,
+   go the same way: their conditional edges are traced in the slices as their owners are marked,
+   as a major traces them now, and the final pause takes only the owners written during the cycle
+   (ClientRecords' set, the tables' cards) rather than every table in full (Gameboy's 3.0 ms of
+   side tables in the census's pause). It follows W2g step 5, whose WeakMap representation the
+   trace reads.
+7. Changed to V8's for the memory reducer: its collection starts a cycle (V8
+   src/heap/memory-reducer.cc:92-105, incremental marking with kReduceMemoryFootprint). The draft
+   kept one pause because the program then allocates slowly, so allocation would not bring the
+   slices; V8 runs them from tasks (IncrementalMarkingJob, A6), and so will TRust: the engine
+   reports the cycle's next slice deadline beside memory_reducer_deadline, and trust-js-runtime's
+   loop runs a slice when it is due, as it runs the reducer's timer
+   (crates/trust-js-runtime/src/lib.rs:510-513). Explicit collections ($262.gc, a host's, the
+   exit's), the live-object ceiling and ArrayBuffer pressure finish a running cycle at once in
+   one pause, as V8's full collections do: as recommended.
+8. The spare pages' release out of the pause, in W6: as recommended.
+9. The exit's numbers: as proposed.
+So the order's step 7 loses three items to W6 itself: ephemerons and the side tables in the
+slices (after step 2, before precleaning), and the reducer's cycle with the event loop's slices
+(with the schedule, step 4). A large block's own dirty runs stay measured first: JSC re-greys the
+whole holder too, and the census does not say whether TypeScript's 7.6 ms burst is large cells'.
+
+The threshold: as recommended, the exemplars' compile at the first call with TRust's pages reusing
+their compiled platform code (the phase exit's candidates), now that the timing can run; the
+timing on today's main decides it against the counts' mixed signs (record above).
+
+Compact baseline templates: as recommended. The exemplars' baselines call shared IC stubs or
+builtins (V8's Sparkplug, SM's Baseline with CacheIR stubs, JSC's Baseline with shared thunks),
+and TRust already shares stubs for name reads, property probes and calls outside hot code
+(use_shared_stub). The sites outside hot code that still emit hundreds of bytes take that
+mechanism (StrictEq, SetProp, the first property and call probe of a site first); hot code keeps
+today's in-line templates. A design note first, with the census of template bytes by operation.
