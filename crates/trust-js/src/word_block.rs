@@ -969,7 +969,6 @@ impl Words {
         );
         // The new block is this owner's own, whoever else shares the old one.
         let flags = self.header().flags & !KIND_COW;
-        let capacity = class_filled(capacity, shifted);
         let total = shifted + capacity;
         let record = record_words(total);
         // Words that keep their indices keep the old record's traced length and dirty blocks
@@ -1055,32 +1054,25 @@ fn is_number_word(word: u64) -> bool {
 /// born empty take one to four elements (Vue 36,813 of 37,497, DeltaBlue 4,111 of 4,172).
 const FIRST_WORDS: usize = 6;
 
-/// The capacity to grow a block of `len` used words to for `additional` more: [`FIRST_WORDS`]
-/// from none, else V8's (JSObject::NewElementsCapacity, `old + old / 2 + 16`), at least what is
-/// needed. [`Words::reallocate_with_room`] then fills the block's storage class.
+/// V8's first capacity (JSObject::NewElementsCapacity of 0): the second step of the ladder,
+/// which a block of fewer words grows to.
+const V8_FIRST_WORDS: usize = 16;
+
+/// The capacity to grow a block of `len` used words to for `additional` more, at least what is
+/// needed: [`FIRST_WORDS`] from none, then V8's ladder (JSObject::NewElementsCapacity, `old + old
+/// / 2 + 16` from its first 16), which a smaller block joins at 16, so that every block past
+/// [`FIRST_WORDS`] takes exactly the capacities it took before (W2d step 4b: starting the ladder
+/// at 6 shifted every later step, and Gameboy's 64K-word arrays ended 30% larger).
 fn grown(len: usize, additional: usize) -> usize {
     let needed = len + additional;
     let rule = if len == 0 {
         FIRST_WORDS
+    } else if len < V8_FIRST_WORDS {
+        V8_FIRST_WORDS
     } else {
         len + len / 2 + 16
     };
     rule.max(needed).min(MAX_WORDS.max(needed))
-}
-
-/// The capacity a block with room for `capacity` words and `shifted` words of front room gets
-/// from its storage class (W2d step 4b, as JSC's optimalContiguousVectorLength fills a butterfly's
-/// size class, runtime/ButterflyInlines.h:72-93): the words the class holds past the header, up to
-/// [`REMEMBER_MIN`] in all, so a block keeps no remembered record it would not have kept.
-fn class_filled(capacity: usize, shifted: usize) -> usize {
-    let total = shifted + capacity;
-    if total >= REMEMBER_MIN {
-        return capacity;
-    }
-    match crate::gc_core::small_cell_class(block_size(total)) {
-        Some((_, class)) => ((class - HEADER_BYTES) / 8).min(REMEMBER_MIN) - shifted,
-        None => capacity,
-    }
 }
 
 /// A shared literal's block as a code root's late fill reports it
@@ -1292,26 +1284,21 @@ mod tests {
         words.push(num(2.0));
         assert_eq!(
             words.capacity(),
-            30,
-            "6 + 3 + 16 = 25, filled to the 256-byte class"
+            16,
+            "V8's first capacity, joining its ladder"
         );
-        for _ in 0..23 {
+        for _ in 0..9 {
             words.push(num(3.0));
         }
-        assert_eq!(words.capacity(), 30);
+        assert_eq!(words.capacity(), 16);
         words.push(num(4.0));
+        assert_eq!(words.capacity(), 16 + 8 + 16, "then V8's ladder");
+        let mut exact = Words::from_values((0..10).map(|n| num(n as f64)));
+        exact.push(num(10.0));
         assert_eq!(
-            words.capacity(),
-            62,
-            "30 + 15 + 16 = 61, filled to the 512-byte class"
-        );
-        while words.len() < 63 {
-            words.push(num(5.0));
-        }
-        assert_eq!(
-            words.capacity(),
-            62 + 31 + 16,
-            "past 64 words, V8's rule alone"
+            exact.capacity(),
+            16,
+            "a smaller block joins the ladder at 16"
         );
         let copy = words.clone();
         assert_eq!(copy.as_slice(), words.as_slice());
