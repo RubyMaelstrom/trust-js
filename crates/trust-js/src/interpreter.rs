@@ -9517,6 +9517,9 @@ impl Interp {
                 function: p,
                 prototype: pp,
                 named: std::cell::RefCell::new(None),
+                self_name: func
+                    .needs_self_environment()
+                    .then(|| crate::atom::atomize(func.name.as_deref().expect("named expression"))),
                 heap: crate::value::active_heap_id(),
             });
             crate::value::register_code_roots(&maps);
@@ -9624,7 +9627,7 @@ impl Interp {
         }
         if let Some(self_env) = self_env {
             self_env.borrow_mut().vars.insert(
-                func.name.as_ref().expect("named expression").clone(),
+                maps.self_name.expect("a self-name environment's name"),
                 // CreateImmutableBinding(name, false): sloppy writes are silent no-ops.
                 Binding::data(Value::Obj(obj), false, true).with_strict_immutable(false),
             );

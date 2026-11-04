@@ -587,6 +587,11 @@ pub struct FunctionMaps {
     /// anonymous function (`var f = () => {}`): a creation site's inferred name is fixed, so
     /// later closures clone it instead of running SetFunctionName per instance.
     pub named: std::cell::RefCell<Option<(Rc<str>, crate::value::Props)>>,
+    /// A named function expression's own name as this heap's atom, when its closures bind it in
+    /// a self-name environment ([`Function::needs_self_environment`]): each binding takes the
+    /// atom, not a copy of the name's text to intern (W2e step 7). An atom lives as long as its
+    /// heap, which `heap` names.
+    pub(crate) self_name: Option<crate::atom::Atom>,
     /// The Agent heap whose cells the templates hold (layouts and `name` values; see
     /// `value::active_heap_id`). Parsed code can outlive an engine or serve several:
     /// another heap's runtime rebuilds these templates from neutral source facts.
@@ -599,6 +604,8 @@ impl crate::gc_trace::GcTrace for FunctionMaps {
             function,
             prototype,
             named,
+            // The heap's atom table holds its atoms.
+            self_name: _,
             heap: _,
         } = self;
         function.trace_gc(sink);
@@ -1615,7 +1622,9 @@ impl Function {
         self.is_fn_expr && self.name.is_some() && self.named_expression_needs_self_environment()
     }
 
-    /// [`Function::needs_self_environment`] of a named function expression.
+    /// [`Function::needs_self_environment`] of a named function expression, out of the callers'
+    /// line so that the query's first test stays in it.
+    #[inline(never)]
     fn named_expression_needs_self_environment(&self) -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if !*ENABLED.get_or_init(|| std::env::var("TRUST_JS_ELIDE_SELF_ENV").as_deref() != Ok("0"))

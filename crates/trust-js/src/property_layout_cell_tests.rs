@@ -165,6 +165,7 @@ fn actual_function_map_roots_cover_function_prototype_and_late_named_maps() {
         function: predicted("function map"),
         prototype: Some(predicted("prototype map")),
         named: RefCell::new(None),
+        self_name: None,
         heap: heap_id(&heap),
     });
     register_code_roots(&maps);
