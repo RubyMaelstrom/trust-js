@@ -3943,9 +3943,13 @@ pub(crate) fn object_inline_alloc_site(class: u32) -> Option<crate::gc_core::Inl
     }
     let size_class = OBJECT_SIZE_CLASSES[(class as usize).min(2)];
     with_agent_heap(|heap| {
-        heap.core
+        let mut site = heap
+            .core
             .borrow()
-            .inline_alloc_site(heap.object_desc, size_class)
+            .inline_alloc_site(heap.object_desc, size_class)?;
+        // Every object counts toward the heap's allocated objects, as `Object::alloc` counts.
+        site.allocated = heap.allocated.as_ptr() as usize;
+        Some(site)
     })
 }
 

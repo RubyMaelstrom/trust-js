@@ -1224,6 +1224,10 @@ pub(crate) struct InlineAllocSite {
     /// The embedder's live count of the descriptor's cells (a `Cell<i64>`), or 0 when the heap
     /// counts none of them ([`Heap::count_live`]).
     pub(crate) live_count: usize,
+    /// A count of the cells the embedder's allocation made (a `Cell<u64>`) that in-line
+    /// allocation adds to as well, or 0: objects' (`value::GcState`'s `allocated`, which the
+    /// task boundary's collection policy reads).
+    pub(crate) allocated: usize,
 }
 
 /// The offsets inline allocation reads and writes ([`InlineAllocSite`]).
@@ -1794,6 +1798,7 @@ impl Heap {
             cursor: desc.0 as usize * SIZE_CLASSES.len() + class,
             cell_size: SIZE_CLASSES[class],
             live_count,
+            allocated: 0,
         })
     }
 

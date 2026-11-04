@@ -12,6 +12,7 @@ use crate::gc_core::{inline_alloc as off, InlineAllocSite};
 pub(super) fn emit_inline_alloc(a: &mut Asm, site: &InlineAllocSite, slow: usize) {
     // The live count is ARM64's so far (W2e step 2): x86-64 allocates no counted cell in line.
     debug_assert_eq!(site.live_count, 0, "x86-64 counts no live cell in line");
+    debug_assert_eq!(site.allocated, 0, "x86-64 counts no allocated cell in line");
     a.nr_imm(R10, site.heap as u64);
     a.nr_load8(AX, R10, off::HEAP_FAST_ALLOC);
     a.nr_zero_guard(AX, slow);

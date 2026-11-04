@@ -31,7 +31,7 @@ fn lsl_reg_x(a: &mut asm::Asm, rd: u32, rn: u32, rm: u32) {
 /// polls), or one more counted cell would pass the live check. The cell is neither zeroed nor
 /// initialized: the caller writes every word a trace reads before the next safepoint. No poll
 /// follows (W2e's design 1), and no barrier: the cell is young. Clobbers x10-x15, and x16-x17
-/// for a counted descriptor.
+/// for a counted descriptor or an allocation count.
 pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u32, slow: usize) {
     debug_assert!(!(10..=17).contains(&dst));
     a.mov_imm64(10, site.heap as u64);
@@ -56,6 +56,13 @@ pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u
         a.ldr_imm(15, 10, off::HEAP_LIVE_CHECK as u32);
         a.cmp_reg_x(17, 15);
         a.b_cond(C_GT, slow);
+        a.str_imm(17, 16, 0);
+    }
+    if site.allocated != 0 {
+        // The embedder's count of the cells it allocated (objects': the task boundary's policy).
+        a.mov_imm64(16, site.allocated as u64);
+        a.ldr_imm(17, 16, 0);
+        a.add_imm(17, 17, 1);
         a.str_imm(17, 16, 0);
     }
     a.str_imm(14, 10, off::HEAP_ALLOCATED_BYTES as u32);
