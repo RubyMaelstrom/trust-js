@@ -4891,14 +4891,13 @@ pub struct Interp {
     /// star-as namespace re-export). Namespace property reads consult this so they stay live.
     pub(crate) module_ns:
         gc_collect::SideSlotTable<crate::fasthash::FastMap<String, crate::modules::NsBinding>>,
-    /// WeakMap/WeakSet cells. Keys are real weak handles; only WeakMap values are strong, and then
-    /// only ephemerally while both the collection and key are live.
-    pub(crate) weak_collection_data: gc_collect::WeakCollectionData,
-    /// Object/symbol identity to entry offset for WeakMap/WeakSet. Their order is unobservable, and
-    /// ECMA-262 requires average access time sublinear in the collection size; the parallel index
-    /// makes get/set/has/delete average O(1) while `weak_collection_data` retains the payload.
-    pub(crate) weak_collection_index:
-        crate::fasthash::FastMap<usize, crate::weak_metadata::WeakCollectionIndex>,
+    /// The WeakMaps and WeakSets this interpreter made, by their objects' addresses, for the
+    /// collector alone (W2g step 5): their data is their objects' payload
+    /// (`weak_metadata::WeakCollection`), which every operation reads through the object. A major
+    /// collection registers each one's entries as ephemerons, a minor one finds a recorded entry's
+    /// collection here, and a dead one's subscriptions go with it before its sweep
+    /// (`gc_forget_weak_owners`), as its address leaves this set.
+    pub(crate) weak_collections: crate::fasthash::FastSet<usize>,
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: IntrinsicMap,
@@ -5225,8 +5224,7 @@ interp_memory_inventory! {
     dynamic_module_loader => "external",
     routed_imports => "measured",
     module_ns => "measured",
-    weak_collection_data => "measured",
-    weak_collection_index => "measured",
+    weak_collections => "measured",
     extra_protos => "measured",
     array_buffers => "external",
     native_buffers => "measured",
@@ -5318,7 +5316,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 149);
+    assert_eq!(names.len(), 148);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6954,8 +6952,7 @@ impl Interp {
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
             regexp_protector: RefCell::default(),
             regexp_last: None,
-            weak_collection_data: Default::default(),
-            weak_collection_index: Default::default(),
+            weak_collections: Default::default(),
             extra_protos: Default::default(),
             array_buffers: Default::default(),
             native_buffers: Default::default(),
@@ -13469,8 +13466,7 @@ impl Interp {
             template_cache: _,
             native_function_realms: _,
             weak_refs: _,
-            weak_collection_data: _,
-            weak_collection_index: _,
+            weak_collections: _,
             weak_metadata: _,
             finalization_registries: _,
             // Weak pins, pruned after the collection (gc_prune_dead_pins). A dead address a pin

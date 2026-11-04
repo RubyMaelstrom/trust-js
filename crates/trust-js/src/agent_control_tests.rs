@@ -1637,7 +1637,7 @@ fn agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire() {
                 );
             }
             1 => assert!(native.in_map(&child.regexps)),
-            2 => assert!(child.weak_collection_data.contains_key(&native.get())),
+            2 => assert!(child.weak_collections.contains(&native.get())),
             _ => unreachable!(),
         });
         engine.interp.drain_microtasks();

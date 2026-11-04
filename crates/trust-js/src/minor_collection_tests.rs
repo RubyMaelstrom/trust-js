@@ -104,9 +104,9 @@ fn weak_targets_die_young_at_minor_collections_and_old_at_major_ones() {
         let entries = |engine: &Engine| -> usize {
             engine
                 .interp
-                .weak_collection_data
-                .values()
-                .map(Vec::len)
+                .weak_collection_census()
+                .iter()
+                .map(|census| census.0)
                 .sum()
         };
         eval(

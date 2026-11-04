@@ -2247,6 +2247,11 @@ pub enum ObjectKind {
     /// range and the property caches admit them.
     Collection(crate::gc_storage::PayloadBox<crate::ordered_collection::OrderedCollection>) =
         KIND_COLLECTION_TAG,
+    /// W2g step 5: a WeakMap's or WeakSet's [[WeakMapData]]/[[WeakSetData]] in a cell of its own
+    /// (`weak_metadata::WeakCollection`): the brand and the entries by key identity, whose
+    /// values the collector registers as ephemerons. An ordinary kind: the property caches admit
+    /// the object.
+    WeakCollection(crate::gc_storage::PayloadBox<crate::weak_metadata::WeakCollection>) = 16,
     Array = KIND_ARRAY_TAG,
     /// The [[BooleanData]], [[NumberData]], [[StringData]], [[SymbolData]] and [[BigIntData]] of
     /// primitive wrapper objects.
@@ -3406,6 +3411,7 @@ pub(crate) struct PayloadDescs {
     array_iterator: crate::gc_core::DescId,
     string_iterator: crate::gc_core::DescId,
     collection_iterator: crate::gc_core::DescId,
+    weak_collection: crate::gc_core::DescId,
     proxy: crate::gc_core::DescId,
     native: crate::gc_core::DescId,
     bound: crate::gc_core::DescId,
@@ -3438,6 +3444,7 @@ payload_kinds! {
     ArrayIteratorState => array_iterator,
     StringIteratorState => string_iterator,
     crate::ordered_collection::CollectionIterator => collection_iterator,
+    crate::weak_metadata::WeakCollection => weak_collection,
     ProxyData => proxy,
     Rc<NativeCallable> => native,
     BoundCallable => bound,
@@ -3476,6 +3483,9 @@ impl PayloadDescs {
             collection_iterator: leaf(payload_layout::<
                 crate::ordered_collection::CollectionIterator,
             >("map or set iterator state")),
+            weak_collection: leaf(payload_layout::<crate::weak_metadata::WeakCollection>(
+                "weak map or set data",
+            )),
             proxy: leaf(payload_layout::<ProxyData>("proxy target and handler")),
             native: leaf(payload_layout::<Rc<NativeCallable>>("native function data")),
             bound: leaf(payload_layout::<BoundCallable>("bound function data")),
@@ -4304,6 +4314,9 @@ impl Object {
                 sink.value(&proxy.target);
                 sink.value(&proxy.handler);
             }
+            // The payload cell alone: the keys are weak, and the collector registers the values
+            // as ephemerons (`Marking::ephemerons`).
+            ObjectKind::WeakCollection(data) => PayloadBox::trace(data, sink),
             ObjectKind::Arguments(Some(map)) => {
                 crate::gc_storage::StorageBox::trace(map, sink);
                 map.trace(sink);

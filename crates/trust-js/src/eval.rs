@@ -7174,9 +7174,10 @@ impl Interp {
                             }
                             dst.borrow_mut().kind = src_exotic;
                         }
-                        // WeakMap/WeakSet's [[WeakMapData]]/[[WeakSetData]] and its acceleration
-                        // index are one internal slot implementation and must move together to the
-                        // subclass instance created by super() (ECMA-262 §§24.3.1, 24.4.1).
+                        // A WeakMap's or WeakSet's [[WeakMapData]]/[[WeakSetData]] moved with its
+                        // kind above; its registration and its keys' subscriptions follow it to
+                        // the subclass instance created by super() (ECMA-262 §§24.3.1, 24.4.1),
+                        // as do WeakRefs' and FinalizationRegistries' side slots.
                         moved_collection |= self.move_weak_slots(sp, dp);
                         if moved_collection {
                             // The temporary object returned by the native constructor no longer

@@ -443,10 +443,15 @@ fn collection_ctor(
         CollectionKind::Map
     };
     if name.starts_with("Weak") {
+        // The data is the object's payload; the collector finds the collection through the
+        // interpreter's registry (W2g step 5). The registration and the keys' subscriptions are
+        // this interpreter's metadata, which the pin keeps a ShadowRealm's interpreter for while
+        // the collection lives (`gc_pin`).
+        obj.borrow_mut().kind = ObjectKind::WeakCollection(crate::gc_storage::PayloadBox::new(
+            crate::weak_metadata::WeakCollection::new(kind),
+        ));
         i.gc_pin(&obj);
-        i.weak_collection_data.insert(&i.gc_heap, ptr, Vec::new());
-        i.weak_collection_index
-            .insert(ptr, crate::weak_metadata::WeakCollectionIndex::new(kind));
+        i.weak_collections.insert(ptr);
     } else {
         i.set_collection(&obj, OrderedCollection::new(kind));
     }
@@ -734,71 +739,62 @@ pub(super) fn install_map_like(
 }
 
 /// WeakMap/WeakSet: like Map/Set but keys must be objects or unregistered symbols and there is no
-/// iteration/size. ECMA-262 requires average sublinear access, so all operations use the parallel
-/// identity index instead of scanning the specification's conceptual List.
-/// RequireInternalSlot checks the exact internal kind, including has/delete. No property lookup
-/// or Proxy operation participates in the brand check (ECMA-262 #sec-weakmap.prototype.has and
-/// #sec-weakset.prototype.has).
-fn weak_brand_ptr(i: &mut Interp, this: &Value, want: CollectionKind) -> Result<usize, Value> {
-    let ptr = map_ptr(this)
-        .filter(|p| {
-            i.weak_collection_index
-                .get(p)
-                .is_some_and(|index| index.kind == want)
+/// iteration/size. ECMA-262 requires average sublinear access, so all operations probe the
+/// payload's entries by key identity instead of scanning the specification's conceptual List.
+/// RequireInternalSlot checks the exact internal kind, including has/delete: the receiver's
+/// object kind and its payload's brand. No property lookup or Proxy operation participates in the
+/// brand check (ECMA-262 #sec-weakmap.prototype.has and #sec-weakset.prototype.has).
+fn weak_brand(i: &mut Interp, this: &Value, want: CollectionKind) -> Result<Gc, Value> {
+    this.as_obj()
+        .filter(|object| {
+            matches!(&object.borrow().kind, ObjectKind::WeakCollection(data) if data.kind == want)
         })
-        .ok_or_else(|| i.make_error("TypeError", "method called on incompatible receiver"))?;
-    Ok(ptr)
+        .ok_or_else(|| i.make_error("TypeError", "method called on incompatible receiver"))
 }
 
-fn weak_entry_index(i: &Interp, ptr: usize, key: &Value) -> Option<usize> {
+/// The value of `collection`'s entry under `key` (a branded WeakMap or WeakSet): one probe of its
+/// payload's entries.
+fn weak_entry_value(collection: &Gc, key: &Value) -> Option<Value> {
     let identity = crate::interpreter::WeakKey::of(key)?;
-    i.weak_collection_index
-        .get(&ptr)?
-        .entries
-        .get(&identity)
-        .copied()
+    match &collection.borrow().kind {
+        ObjectKind::WeakCollection(data) => data.get(&identity).map(|(_, value)| *value),
+        _ => None,
+    }
+}
+
+fn weak_entry_present(collection: &Gc, key: &Value) -> bool {
+    crate::interpreter::WeakKey::of(key).is_some_and(|identity| {
+        matches!(&collection.borrow().kind, ObjectKind::WeakCollection(data) if data.contains(&identity))
+    })
 }
 
 pub(crate) fn weak_map_get(i: &mut Interp, map: &Value, key: &Value) -> Result<Value, Value> {
-    let ptr = weak_brand_ptr(i, map, CollectionKind::Map)?;
-    Ok(weak_entry_index(i, ptr, key)
-        .and_then(|index| i.weak_collection_data.get(&ptr)?.get(index))
-        .map(|(_, value)| *value)
-        .unwrap_or(Value::Undefined))
+    let collection = weak_brand(i, map, CollectionKind::Map)?;
+    Ok(weak_entry_value(&collection, key).unwrap_or(Value::Undefined))
 }
 
-fn weak_insert(i: &mut Interp, ptr: usize, key: Value, value: Value) {
+fn weak_insert(i: &mut Interp, collection: &Gc, key: Value, value: Value) {
     i.gc_weak_metadata_safepoint(false);
     let target = crate::interpreter::WeakTarget::of(&key)
         .expect("WeakMap and WeakSet entries have weakly holdable keys");
-    let identity = target.key();
-    if let Some(index) = i
-        .weak_collection_index
-        .get(&ptr)
-        .and_then(|index| index.entries.get(&identity))
-        .copied()
-    {
-        i.weak_collection_data
-            .set_value(&i.gc_heap, ptr, index, value);
-        return;
+    let owner = Gc::as_ptr(collection) as usize;
+    // The write goes through the object's borrow, which sets its card; the entry's record is the
+    // payload's (`WeakCollection::put`).
+    let fresh = match &mut collection.borrow_mut().kind {
+        ObjectKind::WeakCollection(data) => data.put(&i.gc_heap, owner, &target, value),
+        _ => unreachable!("a branded weak collection"),
+    };
+    if fresh {
+        i.weak_metadata
+            .subscribe(target, crate::weak_metadata::Subscriber::Collection(owner));
     }
-    i.weak_metadata.subscribe(
-        target.clone(),
-        crate::weak_metadata::Subscriber::Collection(ptr),
-    );
-    let index = i.weak_collection_data.push(&i.gc_heap, ptr, target, value);
-    i.weak_collection_index
-        .get_mut(&ptr)
-        .expect("a weak collection has a branded index")
-        .entries
-        .insert(identity, index);
 }
 
-fn weak_delete(i: &mut Interp, ptr: usize, key: &Value) -> bool {
+fn weak_delete(i: &mut Interp, collection: &Gc, key: &Value) -> bool {
     let Some(identity) = crate::interpreter::WeakKey::of(key) else {
         return false;
     };
-    i.weak_collection_remove(ptr, identity)
+    i.weak_collection_delete(collection, identity)
 }
 
 pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ctor_fn: NativeFn) {
@@ -819,20 +815,20 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
         it.def_method(&proto, "get", 1, nf_weak_map_get);
         // Upsert proposal: getOrInsert(key, value) / getOrInsertComputed(key, callbackfn).
         it.def_method(&proto, "getOrInsert", 2, |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
+            let collection = weak_brand(i, &this, CollectionKind::Map)?;
             let key = arg(a, 0);
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
             }
-            if let Some(index) = weak_entry_index(i, ptr, &key) {
-                return Ok(i.weak_collection_data[&ptr][index].1);
+            if let Some(value) = weak_entry_value(&collection, &key) {
+                return Ok(value);
             }
             let value = arg(a, 1);
-            weak_insert(i, ptr, key, value);
+            weak_insert(i, &collection, key, value);
             Ok(value)
         });
         it.def_method(&proto, "getOrInsertComputed", 2, |i, this, a| {
-            let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
+            let collection = weak_brand(i, &this, CollectionKind::Map)?;
             let key = arg(a, 0);
             if !can_be_held_weakly(i, &key) {
                 return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
@@ -841,12 +837,12 @@ pub(super) fn install_weak(it: &mut Interp, name: &'static str, is_set: bool, ct
             if !cb.is_callable() {
                 return Err(i.make_error("TypeError", "callback is not callable"));
             }
-            if let Some(index) = weak_entry_index(i, ptr, &key) {
-                return Ok(i.weak_collection_data[&ptr][index].1);
+            if let Some(value) = weak_entry_value(&collection, &key) {
+                return Ok(value);
             }
             let value = ab(i.call(cb, Value::Undefined, std::slice::from_ref(&key)))?;
             // The callback may have inserted the key; the computed value overwrites that mutation.
-            weak_insert(i, ptr, key, value);
+            weak_insert(i, &collection, key, value);
             Ok(value)
         });
     }
@@ -881,10 +877,8 @@ fn weak_has(
     args: &[Value],
     kind: CollectionKind,
 ) -> Result<Value, Value> {
-    let ptr = weak_brand_ptr(i, &this, kind)?;
-    Ok(Value::Bool(
-        weak_entry_index(i, ptr, &arg(args, 0)).is_some(),
-    ))
+    let collection = weak_brand(i, &this, kind)?;
+    Ok(Value::Bool(weak_entry_present(&collection, &arg(args, 0))))
 }
 
 fn weak_remove(
@@ -893,8 +887,8 @@ fn weak_remove(
     args: &[Value],
     kind: CollectionKind,
 ) -> Result<Value, Value> {
-    let ptr = weak_brand_ptr(i, &this, kind)?;
-    Ok(Value::Bool(weak_delete(i, ptr, &arg(args, 0))))
+    let collection = weak_brand(i, &this, kind)?;
+    Ok(Value::Bool(weak_delete(i, &collection, &arg(args, 0))))
 }
 
 // Named collection methods: the JIT's call cache recognizes their exact identity (see
@@ -996,33 +990,30 @@ pub(crate) fn nf_set_delete(i: &mut Interp, this: Value, a: &[Value]) -> Result<
 }
 
 pub(crate) fn nf_weak_map_get(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    // `weak_map_get` with one brand-and-entry index lookup.
-    let index = map_ptr(&this)
-        .and_then(|ptr| {
-            i.weak_collection_index
-                .get(&ptr)
-                .filter(|index| index.kind == CollectionKind::Map)
-                .map(|index| (ptr, index))
-        })
-        .ok_or_else(|| i.make_error("TypeError", "method called on incompatible receiver"))?;
-    let (ptr, index) = index;
-    let entry = a
-        .first()
-        .and_then(crate::interpreter::WeakKey::of)
-        .and_then(|identity| index.entries.get(&identity).copied());
-    Ok(entry
-        .and_then(|entry| i.weak_collection_data.get(&ptr)?.get(entry))
-        .map(|(_, value)| *value)
-        .unwrap_or(Value::Undefined))
+    // `weak_map_get` under one borrow: the brand is the receiver's kind, the entry one probe of
+    // its payload's entries (W2g step 5).
+    if let Some(object) = this.as_obj() {
+        if let ObjectKind::WeakCollection(data) = &object.borrow().kind {
+            if data.kind == CollectionKind::Map {
+                let value = a
+                    .first()
+                    .and_then(crate::interpreter::WeakKey::of)
+                    .and_then(|identity| data.get(&identity))
+                    .map(|(_, value)| *value);
+                return Ok(value.unwrap_or(Value::Undefined));
+            }
+        }
+    }
+    Err(i.make_error("TypeError", "method called on incompatible receiver"))
 }
 
 pub(crate) fn nf_weak_map_set(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let ptr = weak_brand_ptr(i, &this, CollectionKind::Map)?;
+    let collection = weak_brand(i, &this, CollectionKind::Map)?;
     let (key, val) = (arg(a, 0), arg(a, 1));
     if !can_be_held_weakly(i, &key) {
         return Err(i.make_error("TypeError", "Invalid value used as weak map key"));
     }
-    weak_insert(i, ptr, key, val);
+    weak_insert(i, &collection, key, val);
     Ok(this)
 }
 
@@ -1035,15 +1026,15 @@ pub(crate) fn nf_weak_map_delete(i: &mut Interp, this: Value, a: &[Value]) -> Re
 }
 
 pub(crate) fn nf_weak_set_add(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value> {
-    let ptr = weak_brand_ptr(i, &this, CollectionKind::Set)?;
+    let collection = weak_brand(i, &this, CollectionKind::Set)?;
     let key = arg(a, 0);
     if !can_be_held_weakly(i, &key) {
         return Err(i.make_error("TypeError", "Invalid value used in weak set"));
     }
-    if weak_entry_index(i, ptr, &key).is_none() {
+    if !weak_entry_present(&collection, &key) {
         // ECMA-262 #sec-weakset.prototype.add stores only weak membership, unlike a
         // WeakMap's ephemeron value. A strong dummy copy would keep the member alive.
-        weak_insert(i, ptr, key, Value::Undefined);
+        weak_insert(i, &collection, key, Value::Undefined);
     }
     Ok(this)
 }

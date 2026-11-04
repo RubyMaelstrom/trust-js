@@ -1172,6 +1172,15 @@ impl Visitor {
                 self.value(&proxy.target);
                 self.value(&proxy.handler);
             }
+            ObjectKind::WeakCollection(data) => {
+                internal_bytes += std::mem::size_of_val(&**data).saturating_add(data.table_bytes());
+                // Weak keys must not become strong merely because diagnostics are enabled.
+                // WeakMap values are visited because the collector has already resolved
+                // ephemeron liveness.
+                for (_, value) in data.iter() {
+                    self.value(value);
+                }
+            }
             // The environment is its function's activation, which its own owners report.
             ObjectKind::Arguments(Some(map)) => internal_bytes += map.retained_bytes(),
             // Plain objects and the payload-free exotics hold nothing more; a callable's payload
@@ -2136,39 +2145,15 @@ fn scan_realm(
         );
     }
 
-    totals
-        .interpreter_side_tables
-        .add(interp.weak_collection_data.len().saturating_mul(size_of::<(
-            usize,
-            Vec<(crate::interpreter::WeakTarget, Value)>,
-        )>()));
-    for entries in interp.weak_collection_data.values() {
-        totals.interpreter_side_tables.add(
-            entries
-                .capacity()
-                .saturating_mul(size_of::<(crate::interpreter::WeakTarget, Value)>()),
-        );
-        // Weak keys must not become strong merely because diagnostics are enabled. WeakMap values
-        // are visited because the collector has already resolved ephemeron liveness.
-        for (_, value) in entries {
-            visitor.value(value);
-        }
-    }
+    // The WeakMaps and WeakSets themselves account their payloads (the object visitor); their
+    // registry is a set of addresses.
     totals.interpreter_side_tables.add(
         interp
-            .weak_collection_index
+            .weak_collections
             .capacity()
-            .saturating_mul(size_of::<(usize, crate::weak_metadata::WeakCollectionIndex)>()),
+            .saturating_mul(size_of::<usize>()),
     );
-    for index in interp.weak_collection_index.values() {
-        totals.interpreter_side_tables.add(
-            index
-                .entries
-                .capacity()
-                .saturating_mul(size_of::<(crate::interpreter::WeakKey, usize)>()),
-        );
-    }
-    if !interp.weak_collection_data.is_empty() || !interp.weak_collection_index.is_empty() {
+    if !interp.weak_collections.is_empty() {
         totals
             .interpreter_side_tables
             .make_lower_bound("opaque standard-library HashMap bucket storage");
@@ -3323,8 +3308,7 @@ mod tests {
         let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let after = measure(&engine.interp, &objects, &scopes);
 
-        assert!(!engine.interp.weak_collection_data.is_empty());
-        assert!(!engine.interp.weak_collection_index.is_empty());
+        assert!(!engine.interp.weak_collections.is_empty());
         assert!(after.interpreter_side_tables.bytes > before.interpreter_side_tables.bytes);
     }
 

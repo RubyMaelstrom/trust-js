@@ -262,8 +262,8 @@ fn value_word(value: &Value) -> Option<u64> {
 /// collection's marking consumed it: the side-slot owners, WeakMap and WeakSet entries and
 /// native functions' [[Realm]] registrations that a minor collection reports instead of whole
 /// tables. The tables record into it as they are written ([`SideSlotTable`],
-/// [`WeakCollectionData`], [`NativeFunctionRealms`]), each through the only methods that write
-/// them. It lives in the heap's `GcState`, not beside each table, so that the tables keep the
+/// `weak_metadata::WeakCollection`, [`NativeFunctionRealms`]), each through the only methods that
+/// write them. It lives in the heap's `GcState`, not beside each table, so that the tables keep the
 /// size of the maps they wrap: generated code embeds `Interp`'s field offsets.
 ///
 /// Each collection's marking consumes it once marked ([`ClientRecords::consume`]): what is
@@ -288,6 +288,13 @@ impl ClientRecords {
     /// shadow_home happens before marking.
     pub(crate) fn remember_owner(&mut self, owner: usize) {
         self.side_slot_owners.insert(owner);
+    }
+
+    /// The entry of the WeakMap or WeakSet at `owner` under `key` was written
+    /// (`weak_metadata::WeakCollection`, whose writes are the only callers).
+    #[inline]
+    pub(crate) fn record_weak_entry(&mut self, owner: usize, key: WeakKey) {
+        self.weak_entries.insert((owner, key));
     }
 
     /// The collection in progress has marked: start recording for the next one, keeping the
@@ -399,101 +406,6 @@ impl<V, S: std::hash::BuildHasher> SideSlotTable<V, S> {
     /// Evict the dead objects' entries (see [`crate::gc_sweep::map`]).
     pub(crate) fn evict_dead(&mut self, dead: &crate::gc_sweep::DeadObjects<'_>) {
         crate::gc_sweep::map(&mut self.0, dead);
-    }
-
-    /// Give back spare capacity (see [`crate::weak_metadata::shrink_map`]).
-    pub(crate) fn shrink(&mut self) {
-        crate::weak_metadata::shrink_map(&mut self.0);
-    }
-}
-
-/// `Interp::weak_collection_data`: each WeakMap's and WeakSet's entries, (weakly held key,
-/// value), by the collection's address. Reads go through `Deref` to the map. Each method that
-/// writes an entry records it, by (collection, key), in the heap's [`ClientRecords`] (S6 step
-/// 10d), and nothing else can write one; removing an entry records nothing. A minor collection
-/// registers the recorded entries only as ephemerons: an entry not written since the last
-/// collection whose key is old holds an old value (the last collection marked it, or found its
-/// key or its collection dead and evicted the entry), and an entry whose key is young was
-/// written since the key was allocated. Heap verification checks both as each collection
-/// starts (`Interp::check_weak_entry_records`).
-#[repr(transparent)]
-#[derive(Default)]
-pub(crate) struct WeakCollectionData(FastMap<usize, Vec<(WeakTarget, Value)>>);
-
-impl std::ops::Deref for WeakCollectionData {
-    type Target = FastMap<usize, Vec<(WeakTarget, Value)>>;
-
-    #[inline]
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl WeakCollectionData {
-    /// A collection's entries: a new collection's, or those moved to the instance a native base
-    /// constructor grafts its slots onto. Each entry is recorded.
-    pub(crate) fn insert(
-        &mut self,
-        heap: &GcState,
-        owner: usize,
-        entries: Vec<(WeakTarget, Value)>,
-    ) -> Option<Vec<(WeakTarget, Value)>> {
-        heap.records
-            .borrow_mut()
-            .weak_entries
-            .extend(entries.iter().map(|(key, _)| (owner, key.key())));
-        self.0.insert(owner, entries)
-    }
-
-    /// Replace the value of `owner`'s entry at `index`.
-    pub(crate) fn set_value(&mut self, heap: &GcState, owner: usize, index: usize, value: Value) {
-        let entry = &mut self
-            .0
-            .get_mut(&owner)
-            .expect("a weak collection has backing data")[index];
-        heap.records
-            .borrow_mut()
-            .weak_entries
-            .insert((owner, entry.0.key()));
-        entry.1 = value;
-    }
-
-    /// Append an entry to `owner`'s; returns its index.
-    pub(crate) fn push(
-        &mut self,
-        heap: &GcState,
-        owner: usize,
-        key: WeakTarget,
-        value: Value,
-    ) -> usize {
-        let entries = self
-            .0
-            .get_mut(&owner)
-            .expect("a weak collection has backing data");
-        heap.records
-            .borrow_mut()
-            .weak_entries
-            .insert((owner, key.key()));
-        entries.push((key, value));
-        entries.len() - 1
-    }
-
-    /// Remove `owner`'s entry at `index`, the last entry taking its place (with its edges
-    /// unchanged), and give back spare capacity.
-    pub(crate) fn swap_remove(&mut self, owner: usize, index: usize) -> (WeakTarget, Value) {
-        let entries = self
-            .0
-            .get_mut(&owner)
-            .expect("weak collection backing data");
-        let removed = entries.swap_remove(index);
-        if entries.capacity() > entries.len().saturating_mul(4).max(32) {
-            entries.shrink_to(entries.len().saturating_mul(2).max(16));
-        }
-        removed
-    }
-
-    pub(crate) fn remove(&mut self, owner: &usize) -> Option<Vec<(WeakTarget, Value)>> {
-        self.0.remove(owner)
     }
 
     /// Give back spare capacity (see [`crate::weak_metadata::shrink_map`]).
@@ -999,10 +911,16 @@ impl crate::gc_core::MarkClient for Marking<'_> {
         match self.kind {
             CollectionKind::Major => {
                 for (interp, host) in self.interps.iter().zip(&self.hosts) {
-                    for (&owner, entries) in interp.weak_collection_data.iter() {
-                        for (key, value) in entries {
-                            edges.weak_entry(owner, key, value);
-                        }
+                    for &owner in &interp.weak_collections {
+                        // SAFETY: a registered collection's address names an allocated object,
+                        // which nothing writes while the collector marks.
+                        unsafe {
+                            crate::weak_metadata::with_weak_collection(owner, |data| {
+                                for (key, value) in data.iter() {
+                                    edges.weak_entry(owner, key, value);
+                                }
+                            })
+                        };
                     }
                     for (&function, &(_, realm)) in interp.native_function_realms.borrow().iter() {
                         edges.realm(function, realm);
@@ -1013,16 +931,25 @@ impl crate::gc_core::MarkClient for Marking<'_> {
             CollectionKind::Minor => {
                 let records = self.records();
                 // The entries written since the last collection, those of young keys among them
-                // (see `WeakCollectionData`), each found in its collection's interpreter.
+                // (see `weak_metadata::WeakCollection`), each in its collection, which an
+                // interpreter registers while it is allocated.
                 for &(owner, key) in &records.weak_entries {
-                    let entry = self.interps.iter().find_map(|interp| {
-                        let entries = interp.weak_collection_data.get(&owner)?;
-                        let index = interp.weak_collection_index.get(&owner)?.entries.get(&key);
-                        Some(index.and_then(|&index| entries.get(index)))
-                    });
-                    if let Some((target, value)) = entry.flatten() {
-                        edges.weak_entry(owner, target, value);
+                    if !self
+                        .interps
+                        .iter()
+                        .any(|interp| interp.weak_collections.contains(&owner))
+                    {
+                        continue;
                     }
+                    // SAFETY: a registered collection's address names an allocated object, which
+                    // nothing writes while the collector marks.
+                    unsafe {
+                        crate::weak_metadata::with_weak_collection(owner, |data| {
+                            if let Some((target, value)) = data.get(&key) {
+                                edges.weak_entry(owner, target, value);
+                            }
+                        })
+                    };
                 }
                 // The functions registered since the last collection: an old function's Realm
                 // was marked when the function was (see `NativeFunctionRealms`).
@@ -1581,33 +1508,38 @@ impl Interp {
     /// old value, since a minor collection does not register it. Panics naming the collection,
     /// the key and the value.
     fn check_weak_entry_records(&self, records: &ClientRecords, heap: &crate::gc_core::Heap) {
-        for (&owner, entries) in self.weak_collection_data.iter() {
-            for (target, value) in entries {
-                if records.weak_entries.contains(&(owner, target.key())) {
-                    continue;
-                }
-                let Some(key) = target.upgrade().as_ref().and_then(Value::cell_word) else {
-                    continue;
-                };
-                match heap.cell_age(key) {
-                    Some(CellAge::Young) => panic!(
-                        "weak_collection_data: the entry of {owner:#x} under young key {key:#x} \
-                         was not recorded since the last collection"
-                    ),
-                    Some(CellAge::Old) => {
-                        let age = value_word(value)
-                            .and_then(|value| Some((value, heap.cell_age(value)?)));
-                        if let Some((value, age @ (CellAge::Young | CellAge::Dead))) = age {
-                            panic!(
-                                "weak_collection_data: the entry of {owner:#x} under old key \
-                                 {key:#x}, not recorded since the last collection, holds an \
-                                 unmarked ({age:?}) value {value:#x}"
-                            );
-                        }
+        for &owner in &self.weak_collections {
+            let check = |data: &crate::weak_metadata::WeakCollection| {
+                for (target, value) in data.iter() {
+                    if records.weak_entries.contains(&(owner, target.key())) {
+                        continue;
                     }
-                    _ => {}
+                    let Some(key) = target.upgrade().as_ref().and_then(Value::cell_word) else {
+                        continue;
+                    };
+                    match heap.cell_age(key) {
+                        Some(CellAge::Young) => panic!(
+                            "weak collection: the entry of {owner:#x} under young key {key:#x} \
+                             was not recorded since the last collection"
+                        ),
+                        Some(CellAge::Old) => {
+                            let age = value_word(value)
+                                .and_then(|value| Some((value, heap.cell_age(value)?)));
+                            if let Some((value, age @ (CellAge::Young | CellAge::Dead))) = age {
+                                panic!(
+                                    "weak collection: the entry of {owner:#x} under old key \
+                                     {key:#x}, not recorded since the last collection, holds an \
+                                     unmarked ({age:?}) value {value:#x}"
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-            }
+            };
+            // SAFETY: a registered collection's address names an allocated object, which nothing
+            // writes while the collection starts.
+            unsafe { crate::weak_metadata::with_weak_collection(owner, check) };
         }
     }
 
@@ -1755,10 +1687,9 @@ impl Interp {
             module_recs,
             module_loader: _,
             dynamic_module_loader: _,
-            routed_imports: _,       // conditional owner-keyed importValue bridge
-            module_ns: _,            // side slots
-            weak_collection_data: _, // ephemerons
-            weak_collection_index: _,
+            routed_imports: _,   // conditional owner-keyed importValue bridge
+            module_ns: _,        // side slots
+            weak_collections: _, // the collections, whose payloads' entries are ephemerons
             extra_protos,
             array_buffers: _,
             native_buffers: _,

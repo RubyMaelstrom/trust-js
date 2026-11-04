@@ -547,7 +547,7 @@ fn a_minor_collection_registers_written_and_young_keyed_weak_entries_only() {
 /// The weak-entry check panics when an old key's entry got a young value that the record missed.
 #[test]
 #[cfg(debug_assertions)]
-#[should_panic(expected = "weak_collection_data: the entry of")]
+#[should_panic(expected = "weak collection: the entry of")]
 fn an_unrecorded_weak_entry_write_fails_the_check() {
     let mut engine = engine(Tier::Interp);
     eval(

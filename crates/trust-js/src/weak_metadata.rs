@@ -8,7 +8,7 @@ use crate::fasthash::{FastMap, FastSet};
 use crate::gc_sweep::DeadObjects;
 use crate::interpreter::Interp;
 use crate::interpreter::{WeakKey, WeakTarget};
-use crate::value::Value;
+use crate::value::{Gc, Object, ObjectKind, Value};
 use std::cell::{Cell, RefCell};
 use std::mem::size_of;
 use std::rc::{Rc, Weak};
@@ -66,19 +66,115 @@ impl DeathQueue {
 }
 const DEATH_BATCH_LIMIT: usize = 256;
 
-/// [[WeakMapData]] and [[WeakSetData]] are distinct internal slots. Brand identity travels
-/// with the index during derived-constructor transplantation, never in an authored property.
-pub(crate) struct WeakCollectionIndex {
+/// A WeakMap's [[WeakMapData]] or a WeakSet's [[WeakSetData]] (ECMA-262 24.3, 24.4), in its
+/// object's payload cell (`ObjectKind::WeakCollection`, W2g step 5): which of the two distinct
+/// internal slots it is (the brand, which moves with the payload when a derived constructor's
+/// instance takes it, never an authored property), and each entry by its key's identity (SameValue
+/// on objects and symbols), with the weakly held key and the value (a WeakSet's is Undefined).
+/// Order is unobservable. A get is one probe of `entries`, as a lookup in V8's, SpiderMonkey's and
+/// JSC's weak maps is one probe of the collection's own table.
+///
+/// The values are ephemerons: the object's trace reports the payload cell alone, and the collector
+/// registers the entries from here (`Marking::ephemerons`, which finds the collections through
+/// their interpreter's `weak_collections`). Each write records its entry, by (collection, key),
+/// in the heap's ClientRecords (S6 step 10d), and nothing else writes one; removing an entry
+/// records nothing. A minor collection registers the recorded entries alone: an entry not
+/// written since the last collection whose key is old holds an old value, and an entry whose
+/// key is young was written since the key was allocated. Heap verification checks both as each
+/// collection starts (`Interp::check_weak_entry_records`).
+pub(crate) struct WeakCollection {
     pub(crate) kind: crate::ordered_collection::CollectionKind,
-    pub(crate) entries: FastMap<WeakKey, usize>,
+    entries: FastMap<WeakKey, (WeakTarget, Value)>,
 }
 
-impl WeakCollectionIndex {
+impl WeakCollection {
     pub(crate) fn new(kind: crate::ordered_collection::CollectionKind) -> Self {
         Self {
             kind,
             entries: FastMap::default(),
         }
+    }
+
+    /// The entry under `key`.
+    #[inline]
+    pub(crate) fn get(&self, key: &WeakKey) -> Option<&(WeakTarget, Value)> {
+        self.entries.get(key)
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, key: &WeakKey) -> bool {
+        self.entries.contains_key(key)
+    }
+
+    /// Set the entry of `target`'s key to `value`, keeping the key of an entry it has already, and
+    /// record the write for `owner`, this collection's object. Whether the entry is new.
+    pub(crate) fn put(
+        &mut self,
+        heap: &crate::value::GcState,
+        owner: usize,
+        target: &WeakTarget,
+        value: Value,
+    ) -> bool {
+        use std::collections::hash_map::Entry;
+        let key = target.key();
+        heap.records.borrow_mut().record_weak_entry(owner, key);
+        match self.entries.entry(key) {
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().1 = value;
+                false
+            }
+            Entry::Vacant(entry) => {
+                entry.insert((target.clone(), value));
+                true
+            }
+        }
+    }
+
+    /// Remove the entry under `key`, giving back spare capacity.
+    pub(crate) fn remove(&mut self, key: &WeakKey) -> Option<(WeakTarget, Value)> {
+        let removed = self.entries.remove(key);
+        shrink_map(&mut self.entries);
+        removed
+    }
+
+    /// Every entry: its key and value.
+    #[inline]
+    pub(crate) fn iter(&self) -> impl Iterator<Item = &(WeakTarget, Value)> {
+        self.entries.values()
+    }
+
+    /// Every entry's key identity.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = WeakKey> + '_ {
+        self.entries.keys().copied()
+    }
+
+    /// Record every entry as written for `owner`: a collection's object that took this data from
+    /// another (a derived constructor's instance).
+    pub(crate) fn record_all(&self, heap: &crate::value::GcState, owner: usize) {
+        let mut records = heap.records.borrow_mut();
+        for &key in self.entries.keys() {
+            records.record_weak_entry(owner, key);
+        }
+    }
+
+    /// The entries' count (tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The entries' capacity (tests: shrinking).
+    #[cfg(test)]
+    pub(crate) fn capacity(&self) -> usize {
+        self.entries.capacity()
+    }
+
+    /// Bytes the entries' table holds outside the payload cell (a lower bound: the table's
+    /// control bytes are not counted).
+    pub(crate) fn table_bytes(&self) -> usize {
+        self.entries
+            .capacity()
+            .saturating_mul(size_of::<(WeakKey, (WeakTarget, Value))>())
     }
 }
 
@@ -263,6 +359,47 @@ where
     }
 }
 
+#[cfg(test)]
+impl Interp {
+    /// Each registered WeakMap's and WeakSet's entry count, table capacity and values (tests).
+    pub(crate) fn weak_collection_census(&self) -> Vec<(usize, usize, Vec<Value>)> {
+        self.weak_collections
+            .iter()
+            .filter_map(|&owner| {
+                // SAFETY: a registered collection's address names an allocated object, which the
+                // test does not write meanwhile.
+                unsafe {
+                    with_weak_collection(owner, |data| {
+                        let values = data.iter().map(|(_, value)| *value).collect();
+                        (data.len(), data.capacity(), values)
+                    })
+                }
+            })
+            .collect()
+    }
+}
+
+/// Run `f` on the WeakMap or WeakSet data of the object at `owner`, read in place without a
+/// borrow's count, as the collector reads cells: `None` for an object of another kind or one
+/// borrowed mutably.
+///
+/// # Safety
+/// `owner` must be the address of an allocated object cell, as a registered collection's is
+/// (`Interp::weak_collections`: a collection leaves it before the sweep that frees its cell), and
+/// nothing may write the object while `f` runs.
+pub(crate) unsafe fn with_weak_collection<R>(
+    owner: usize,
+    f: impl FnOnce(&WeakCollection) -> R,
+) -> Option<R> {
+    // SAFETY: the caller's address names an allocated object cell.
+    let cell = unsafe { &*(owner as *const RefCell<Object>) };
+    // SAFETY: the shared reference ends before this returns, and the caller writes nothing.
+    match &unsafe { cell.try_borrow_unguarded() }.ok()?.kind {
+        ObjectKind::WeakCollection(data) => Some(f(data)),
+        _ => None,
+    }
+}
+
 impl Interp {
     /// Symbol-only churn may never cross the object allocation threshold. Consume already
     /// proven acyclic deaths in bounded batches at ordinary safepoints and weak insertions.
@@ -290,28 +427,32 @@ impl Interp {
         );
     }
 
-    /// Delete one weak entry and its identity index together. Weak collection order is not
-    /// observable; relocate the last entry and repair its index before releasing any payload.
+    /// Delete the entry under `key` of the WeakMap or WeakSet at `owner` when this interpreter
+    /// registered it (a key's death: its subscription names the collection by address).
     pub(crate) fn weak_collection_remove(&mut self, owner: usize, key: WeakKey) -> bool {
-        let Some(index) = self
-            .weak_collection_index
-            .get_mut(&owner)
-            .and_then(|index| index.entries.remove(&key))
-        else {
+        if !self.weak_collections.contains(&owner) {
+            return false;
+        }
+        // SAFETY: a registered collection's address names an allocated object cell.
+        let object = unsafe { Gc::from_raw(owner as *const RefCell<Object>) };
+        self.weak_collection_delete(&object, key)
+    }
+
+    /// Delete `collection`'s entry under `key`, and the key's subscription for it.
+    pub(crate) fn weak_collection_delete(&mut self, collection: &Gc, key: WeakKey) -> bool {
+        // Removing an entry adds no edge: its card needs no record, but the borrow sets it.
+        let removed = match collection.try_borrow_mut() {
+            Ok(mut object) => match &mut object.kind {
+                ObjectKind::WeakCollection(data) => data.remove(&key),
+                _ => None,
+            },
+            Err(_) => None,
+        };
+        let Some(removed) = removed else {
             return false;
         };
-        let removed = self.weak_collection_data.swap_remove(owner, index);
-        let lookup = &mut self
-            .weak_collection_index
-            .get_mut(&owner)
-            .expect("weak collection index")
-            .entries;
-        if let Some((moved, _)) = self.weak_collection_data[&owner].get(index) {
-            lookup.insert(moved.key(), index);
-        }
-        shrink_map(lookup);
         self.weak_metadata
-            .unsubscribe(key, Subscriber::Collection(owner));
+            .unsubscribe(key, Subscriber::Collection(Gc::as_ptr(collection) as usize));
         // Dropping an ephemeron payload can enqueue another observed identity. The collector
         // drains that cascade to a fixed point before resuming script.
         drop(removed);
@@ -460,14 +601,28 @@ impl Interp {
                     .unsubscribe(target.key(), Subscriber::WeakRef(owner));
             }
         }
-        for owner in owners(&self.weak_collection_data, dead) {
-            let entries = self.weak_collection_data.remove(&owner).unwrap();
-            self.weak_collection_index.remove(&owner);
-            for (target, _) in &entries {
+        let collections: Vec<usize> = if self.weak_collections.len() < dead.len() {
+            self.weak_collections
+                .iter()
+                .filter(|&&owner| dead.contains(owner))
+                .copied()
+                .collect()
+        } else {
+            dead.iter()
+                .filter(|owner| self.weak_collections.contains(owner))
+                .collect()
+        };
+        for owner in collections {
+            self.weak_collections.remove(&owner);
+            // SAFETY: a dead collection's cell stays allocated until this collection's sweep,
+            // which finalizes its payload (the entries' handles with it).
+            let keys: Vec<WeakKey> =
+                unsafe { with_weak_collection(owner, |data| data.keys().collect()) }
+                    .unwrap_or_default();
+            for key in keys {
                 self.weak_metadata
-                    .unsubscribe(target.key(), Subscriber::Collection(owner));
+                    .unsubscribe(key, Subscriber::Collection(owner));
             }
-            drop(entries);
         }
         for owner in owners(&self.finalization_registries, dead) {
             let registry = self.finalization_registries.remove(&owner).unwrap();
@@ -479,8 +634,12 @@ impl Interp {
             drop(registry);
         }
         shrink_map(&mut self.weak_refs);
-        self.weak_collection_data.shrink();
-        shrink_map(&mut self.weak_collection_index);
+        if self.weak_collections.capacity() > self.weak_collections.len().saturating_mul(4).max(32)
+        {
+            let len = self.weak_collections.len();
+            self.weak_collections
+                .shrink_to(len.saturating_mul(2).max(16));
+        }
         self.finalization_registries.shrink();
     }
 
@@ -498,17 +657,25 @@ impl Interp {
             self.weak_refs.insert(destination, target);
             moved = true;
         }
-        if let Some(entries) = self.weak_collection_data.remove(&source) {
-            for (target, _) in &entries {
-                self.weak_metadata
-                    .subscribe(target.clone(), Subscriber::Collection(destination));
-                self.weak_metadata
-                    .unsubscribe(target.key(), Subscriber::Collection(source));
+        if self.weak_collections.remove(&source) {
+            // The data moved with its kind (the graft makes the instance a WeakMap or WeakSet):
+            // the registry's address, the keys' subscriptions and the entries' records follow it.
+            self.weak_collections.insert(destination);
+            // SAFETY: the destination is the instance, an allocated object, which nothing else
+            // borrows here.
+            let targets: Vec<WeakTarget> = unsafe {
+                with_weak_collection(destination, |data| {
+                    data.record_all(&self.gc_heap, destination);
+                    data.iter().map(|(target, _)| target.clone()).collect()
+                })
             }
-            self.weak_collection_data
-                .insert(&self.gc_heap, destination, entries);
-            if let Some(index) = self.weak_collection_index.remove(&source) {
-                self.weak_collection_index.insert(destination, index);
+            .unwrap_or_default();
+            for target in targets {
+                let key = target.key();
+                self.weak_metadata
+                    .subscribe(target, Subscriber::Collection(destination));
+                self.weak_metadata
+                    .unsubscribe(key, Subscriber::Collection(source));
             }
             moved = true;
         }
@@ -775,9 +942,9 @@ mod tests {
             assert_eq!(
                 engine
                     .interp
-                    .weak_collection_data
-                    .values()
-                    .map(Vec::len)
+                    .weak_collection_census()
+                    .iter()
+                    .map(|census| census.0)
                     .sum::<usize>(),
                 10000
             );
@@ -824,16 +991,16 @@ mod tests {
                 );
                 assert!(engine
                     .interp
-                    .weak_collection_data
-                    .values()
-                    .flatten()
-                    .all(|(_, value)| matches!((value).view(), ValueView::Undefined)));
+                    .weak_collection_census()
+                    .iter()
+                    .flat_map(|census| census.2.iter())
+                    .all(|value| matches!((value).view(), ValueView::Undefined)));
                 engine.interp.gc_collect();
                 assert!(engine
                     .interp
-                    .weak_collection_data
-                    .values()
-                    .all(Vec::is_empty));
+                    .weak_collection_census()
+                    .iter()
+                    .all(|census| census.0 == 0));
                 eval(&mut engine, "reference.deref()===undefined", "true");
             }
         }
@@ -923,9 +1090,9 @@ mod tests {
         );
         assert!(engine
             .interp
-            .weak_collection_data
-            .values()
-            .all(|entries| entries.is_empty() && entries.capacity() <= 64));
+            .weak_collection_census()
+            .iter()
+            .all(|census| census.0 == 0 && census.1 <= 64));
     }
 
     #[test]
@@ -1055,9 +1222,9 @@ mod tests {
         assert!(metadata.deaths.entries.borrow().capacity() <= 64);
         assert!(engine
             .interp
-            .weak_collection_data
-            .values()
-            .all(|entries| entries.capacity() <= 64));
+            .weak_collection_census()
+            .iter()
+            .all(|census| census.1 <= 64));
     }
 
     #[test]
@@ -1085,9 +1252,9 @@ mod tests {
             assert!(engine.interp.weak_refs.values().all(Option::is_none));
             assert!(engine
                 .interp
-                .weak_collection_data
-                .values()
-                .all(Vec::is_empty));
+                .weak_collection_census()
+                .iter()
+                .all(|census| census.0 == 0));
             eval(&mut engine, "true", "true");
             eval(&mut engine, "cleaned.join(',')", "done");
         }

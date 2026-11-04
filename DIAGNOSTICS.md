@@ -203,7 +203,7 @@ comment/example in the same change.
   have had its card set when it was written, and a panic `write barrier: old cell …` names
   both cells. The side tables' records are checked the same way: a side-table entry that
   holds such a cell, or belongs to such a cell, must have been recorded when it was written,
-  and a panic `side-slot table …`, `weak_collection_data: …` or `native_function_realms: …`
+  and a panic `side-slot table …`, `weak collection: …` or `native_function_realms: …`
   names the table, the owner and the value. So are the rooted handles' (the values host code
   keeps): a handle not written since the last collection must name a cell that collection
   kept (or, if weak, nothing), and a panic `handle table of heap …` names the entry and the
