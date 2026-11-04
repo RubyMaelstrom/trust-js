@@ -231,3 +231,67 @@ fn this_objects_past_their_cell_take_the_helper() {
     );
     assert_eq!(eval(&mut engine, &source), "20:7:true");
 }
+
+/// The element words' used length, capacity and kind bits of `name`'s Array.
+fn words_of(engine: &mut Engine, name: &str) -> (usize, usize, u32) {
+    let handle = global(engine, name);
+    let body = handle.borrow();
+    let words = body.props.words().expect("element words");
+    (words.len(), words.capacity(), words.kind())
+}
+
+/// Array literals with elements made in line (W2e step 5) are the helper's Arrays: the same
+/// header, an exact block with the same kind bits for every kind of value, and the same behavior
+/// under later writes, growth and collections.
+#[test]
+fn in_line_arrays_with_elements_are_the_helpers() {
+    let cases = [
+        "[v, v]",
+        "[v, v + 0.5, v]",
+        "[v, -0, NaN]",
+        "[v, 'two', null, undefined]",
+        "[{}, [], v]",
+        "[v, v, v, v, v, v, v, v]",
+    ];
+    for literal in cases {
+        let mut engine = engine(Tier::Jit);
+        let before = in_line();
+        let source = format!(
+            "function make(v) {{ return {literal}; }}
+             var first = make(1);
+             for (var i = 0; i < 20; i++) make(i);
+             var later = make(1);
+             var d = function (o) {{
+                 return JSON.stringify(o) + Object.keys(o).length + o.length +
+                     Object.is(o[1], -0) + (Object.getPrototypeOf(o) === Array.prototype);
+             }};
+             d(first) === d(later) ? 'same' : d(first) + ' / ' + d(later)"
+        );
+        assert_eq!(eval(&mut engine, &source), "same", "{literal}");
+        assert!(in_line() > before, "{literal}: no in-line array");
+        let (first, later) = (global(&mut engine, "first"), global(&mut engine, "later"));
+        assert_eq!(header(&first), header(&later), "{literal}");
+        assert_eq!(
+            words_of(&mut engine, "first"),
+            words_of(&mut engine, "later"),
+            "{literal}: the element block"
+        );
+        let result = eval(
+            &mut engine,
+            "later.push('x'); later[0] = 5; String(later.length) + ':' + later[0] + ':' +
+             later[later.length - 1]",
+        );
+        assert_eq!(result.split(':').nth(1), Some("5"), "{literal}: {result}");
+    }
+    let mut engine = engine(Tier::Jit);
+    let result = eval(
+        &mut engine,
+        "function pair(a, b) { return [a, b]; }
+         var keep = [];
+         for (var i = 0; i < 100000; i++) { var p = pair(i, 'n' + i); if (i % 1000 === 0) keep.push(p); }
+         var sum = 0;
+         for (var k = 0; k < keep.length; k++) sum += keep[k][0] + keep[k][1].length;
+         sum + ':' + keep[99][1]",
+    );
+    assert_eq!(result, "4950587:n99000");
+}

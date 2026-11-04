@@ -869,16 +869,36 @@ pub(super) fn emit(
                 Op::MakeArrayLiteral(site) => Some(Some(*site)),
                 _ => None,
             };
-            match literal.and_then(|literal| chunk.jit_array_site(literal)) {
-                Some((site, image)) => super::alloc::emit_inline_array(
+            let elements = match op {
+                Op::MakeArray(n) if *n > 0 => chunk
+                    .jit_array_elements_site(usize::from(*n))
+                    .map(|site| (site, usize::from(*n))),
+                _ => None,
+            };
+            if let Some(((cell, block, image), count)) = elements {
+                // W2e step 5: an array literal with elements in line.
+                super::alloc::emit_inline_array_elements(
                     a,
-                    &site,
+                    &cell,
+                    &block,
                     image,
+                    count,
                     H_MAKE_ARRAY,
                     pc as u32,
                     unwind,
-                ),
-                None => emit_op_helper(a, H_MAKE_ARRAY, pc as u32, unwind),
+                );
+            } else {
+                match literal.and_then(|literal| chunk.jit_array_site(literal)) {
+                    Some((site, image)) => super::alloc::emit_inline_array(
+                        a,
+                        &site,
+                        image,
+                        H_MAKE_ARRAY,
+                        pc as u32,
+                        unwind,
+                    ),
+                    None => emit_op_helper(a, H_MAKE_ARRAY, pc as u32, unwind),
+                }
             }
         }
         Op::Abstract(crate::bytecode::AbstractOp::CreateDataPropertyOrThrow)

@@ -94,6 +94,105 @@ pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u
     a.madd(dst, 14, 13, 11);
 }
 
+/// An array literal with `count` elements in line (W2e step 5; MakeArray, what
+/// `Interp::make_array_from_raw` does): the values from the operand stack's top into an exact
+/// element block with their kind bits (`Words::from_words`'s), then the Array's cell from the
+/// chunk's MakeArray `image` with that block and `length`, pushed in the values' place; or the
+/// helper, having written nothing but possibly an element block that nothing names (plain data in
+/// a storage cell, which the next sweep frees): the block comes first so that no object cell is
+/// ever left unwritten. Clobbers x5-x17, d0 and d1.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_inline_array_elements(
+    a: &mut asm::Asm,
+    cell: &InlineAllocSite,
+    block: &InlineAllocSite,
+    image: &crate::bytecode::ObjectImage,
+    count: usize,
+    helper: usize,
+    pc: u32,
+    unwind: usize,
+) {
+    use crate::value::word_block::{KIND_ALL, KIND_INT32, KIND_NO_HOLES};
+    let slow = a.new_label();
+    let done = a.new_label();
+    let image_addr = std::ptr::from_ref(image) as u64;
+    a.mov_imm64(9, image_addr);
+    a.ldr_imm(
+        10,
+        9,
+        std::mem::offset_of!(crate::bytecode::ObjectImage, ready) as u32,
+    );
+    a.cbz(10, true, slow);
+    // The values' kind bits (w5), as `word_kind` folds them; a hole's tag (the TDZ marker) is
+    // the helper's.
+    a.movz(5, KIND_ALL, 0);
+    for k in 0..count {
+        let next = a.new_label();
+        let not_number = a.new_label();
+        emit_exec_word_load(a, 12, 20, -(8 * (count - k) as i32));
+        emit_exec_number_guard(a, 12, 0, 13, not_number);
+        a.fcvtzs_w_d(13, 0);
+        a.scvtf_d_w(1, 13);
+        a.fmov_x_d(13, 1);
+        a.cmp_reg_x(13, 12);
+        a.b_cond(C_EQ, next);
+        a.logic_imm_w(0, 5, 5, asm::logical_imm_w(!KIND_INT32).unwrap());
+        a.b(next);
+        a.bind(not_number);
+        a.lsr_imm(13, 12, 48);
+        a.movz(14, (crate::value::PACK_EMPTY >> 48) as u32, 0);
+        a.cmp_reg_w(13, 14);
+        a.b_cond(C_EQ, slow);
+        a.logic_imm_w(0, 5, 5, asm::logical_imm_w(KIND_NO_HOLES).unwrap());
+        a.bind(next);
+    }
+    // The element block (x6): its header {used, capacity, shifted, flags}, then the words.
+    emit_inline_alloc(a, block, 6, slow);
+    a.mov_imm64(7, count as u64 | ((count as u64) << 32));
+    a.str_imm(7, 6, 0);
+    a.lsl_imm(7, 5, 32);
+    a.str_imm(7, 6, 8);
+    for k in 0..count {
+        emit_exec_word_load(a, 12, 20, -(8 * (count - k) as i32));
+        a.str_imm(12, 6, (16 + 8 * k) as u32);
+    }
+    a.add_imm(6, 6, 16);
+    // The Array's cell (x9): the image's header with the block and the realm's %Array.prototype%,
+    // then `length`.
+    emit_inline_alloc(a, cell, 9, slow);
+    a.mov_imm64(
+        15,
+        image_addr + std::mem::offset_of!(crate::bytecode::ObjectImage, words) as u64,
+    );
+    a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.ldr_imm(10, 10, INTERP_ARRAY_PROTO as u32);
+    for k in 0..crate::value::OBJECT_HEADER / 8 {
+        let offset = (8 * k) as u32;
+        if k == crate::value::OBJECT_PROTO_WORD {
+            a.str_imm(10, 9, offset);
+        } else if k == crate::value::CELL_ELEMS_OFFSET / 8 {
+            a.str_imm(6, 9, offset);
+        } else {
+            a.ldr_imm(11, 15, offset);
+            a.str_imm(11, 9, offset);
+        }
+    }
+    a.mov_imm64(11, crate::value::Value::Num(count as f64).bits());
+    a.str_imm(11, 9, crate::value::OBJECT_HEADER as u32);
+    a.mov_imm64(12, crate::value::PACK_OBJ);
+    a.logic_x(1, 9, 9, 12);
+    emit_exec_word_store(a, 9, 20, -(8 * count as i32));
+    if count > 1 {
+        a.sub_imm(20, 20, (8 * (count - 1)) as u32);
+    }
+    #[cfg(test)]
+    record_inline_object(a);
+    a.b(done);
+    a.bind(slow);
+    emit_op_helper(a, helper, pc, unwind);
+    a.bind(done);
+}
+
 /// [`emit_inline_alloc`] of a class chosen at run time (W2e step 6): the cursor's byte offset
 /// among the heap's cursors in x`cursor` and the cell's size in x`size` (neither in x10-x17);
 /// `heap`'s heap, live count and allocation count are the code's own. Clobbers x10-x17.

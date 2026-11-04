@@ -333,6 +333,13 @@ impl Words {
         unsafe { &mut *self.0.as_ptr().cast::<WordHeader>().sub(1) }
     }
 
+    /// The address of the first word (the static empty block's for none), as a map's word
+    /// holds it (W2e step 5's array images).
+    #[inline]
+    pub(crate) fn words_address(&self) -> usize {
+        self.0.as_ptr() as usize
+    }
+
     /// Whether this is the static empty block, which holds no words and is never written.
     #[inline]
     pub(crate) fn is_static_empty(&self) -> bool {

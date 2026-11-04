@@ -3175,6 +3175,34 @@ pub(crate) struct ObjectImage {
 }
 
 impl ObjectImage {
+    /// Make the image an Array's with no elements from `array`, a fresh Array a MakeArray made
+    /// (W2e steps 4 and 5): its header with the static empty block for its element words and
+    /// `length` 0; a MakeArray with elements writes its own block and length.
+    #[inline]
+    fn fill_from_array(&self, array: &crate::value::Value) {
+        if self.ready.get() == 0 {
+            self.fill_from_array_cold(array);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_from_array_cold(&self, array: &crate::value::Value) {
+        let Some(object) = array.as_obj() else {
+            return;
+        };
+        let Some(mut words) = crate::value::header_image(&object) else {
+            return;
+        };
+        words[crate::value::CELL_ELEMS_OFFSET / 8] =
+            crate::value::word_block::Words::new().words_address() as u64;
+        self.slot0.set(crate::value::Value::Num(0.0).bits());
+        for (cell, word) in self.words.iter().zip(words) {
+            cell.set(word);
+        }
+        self.ready.set(1);
+    }
+
     /// Make the image `object`'s (a fresh Array or plain object the helper made), with its first
     /// `slots` slots as the image's fixed slots (an Array's `length`), unless it is ready.
     #[inline]
@@ -3411,10 +3439,32 @@ impl Chunk {
         Some((crate::value::object_inline_alloc_site(0)?, image))
     }
 
-    /// Make `[]`'s image from `array`, a fresh empty Array a MakeArray(0) made.
+    /// Make the image of the chunk's MakeArrays (`[]`'s, and with elements the header the code
+    /// gives its own block and length) from `array`, a fresh Array a MakeArray made.
     #[inline]
     pub(crate) fn fill_empty_array_image(&self, array: &Value) {
-        self.empty_array_image.fill_from(array, 1);
+        self.empty_array_image.fill_from_array(array);
+    }
+
+    /// W2e step 5: where native code makes a MakeArray of `count` elements in line: the array's
+    /// cell, the element block's cell, and the chunk's MakeArray image.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_array_elements_site(
+        &self,
+        count: usize,
+    ) -> Option<(
+        crate::gc_core::InlineAllocSite,
+        crate::gc_core::InlineAllocSite,
+        &ObjectImage,
+    )> {
+        if self.feedback.detailed_enabled() || count == 0 || count > MAX_INLINE_ELEMENTS {
+            return None;
+        }
+        Some((
+            crate::value::object_inline_alloc_site(0)?,
+            crate::value::words_inline_alloc_site(count)?,
+            &self.empty_array_image,
+        ))
     }
 
     /// Make array-literal site `site`'s image from `array`, its fresh copy.
@@ -19416,9 +19466,7 @@ fn run_vm_inner(
                 let at = stack.len() - n as usize;
                 let items: Vec<Value> = stack.split_off(at);
                 let value = i.make_array(items);
-                if n == 0 {
-                    chunk.fill_empty_array_image(&value);
-                }
+                chunk.fill_empty_array_image(&value);
                 observe_allocation(
                     &chunk.feedback,
                     op_pc,
@@ -25367,6 +25415,10 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
     }
 }
 
+/// The most elements a MakeArray native code makes in line has (W2e step 5): each costs a load,
+/// a store and its kind's test.
+const MAX_INLINE_ELEMENTS: usize = 8;
+
 /// Constructions over which a constructor learns its instances' capacity ([`Chunk::note_instance`],
 /// W2d step 3d): V8's slack tracking decides after seven (map.h:443-479).
 const CONSTRUCT_LEARNING: u8 = 8;
@@ -25448,9 +25500,7 @@ pub(crate) unsafe extern "C" fn jit_make_array(
     };
     let base = unsafe { sp.sub(count as usize) };
     let value = unsafe { (&*ctx.interp).make_array_from_raw(base, count as usize) };
-    if count == 0 {
-        chunk.fill_empty_array_image(&value);
-    }
+    chunk.fill_empty_array_image(&value);
     observe_allocation(
         &chunk.feedback,
         pc as usize,
@@ -28533,9 +28583,7 @@ unsafe fn jit_exec_inner(
             }
             *sp = base;
             let value = i.make_array(items);
-            if n == 0 {
-                chunk.fill_empty_array_image(&value);
-            }
+            chunk.fill_empty_array_image(&value);
             observe_allocation(
                 &chunk.feedback,
                 pc as usize,

@@ -3966,6 +3966,27 @@ pub(crate) const CELL_SLOTS_OFFSET: usize = OBJECT_HEADER - std::mem::size_of::<
     + std::mem::offset_of!(Props, entries)
     + std::mem::offset_of!(NamedEntries, cell);
 
+/// The byte offset, from an object's cell, of its map's element words' pointer (W2e step 5).
+pub(crate) const CELL_ELEMS_OFFSET: usize = OBJECT_HEADER - std::mem::size_of::<Object>()
+    + std::mem::offset_of!(Object, props)
+    + std::mem::offset_of!(Props, elems);
+const _: () = assert!(CELL_ELEMS_OFFSET.is_multiple_of(8));
+
+/// Where generated code takes an element block of `words` words in line in the active heap (W2e
+/// step 5): a storage cell of the block's 16-byte header and the words, which the code writes.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn words_inline_alloc_site(words: usize) -> Option<crate::gc_core::InlineAllocSite> {
+    if !inline_alloc_enabled() || words > word_block::REMEMBER_MIN {
+        return None;
+    }
+    let (class, _) = crate::gc_core::small_cell_class(16 + 8 * words)?;
+    with_agent_heap(|heap| {
+        heap.core
+            .borrow()
+            .inline_alloc_site(heap.storage_desc, class)
+    })
+}
+
 /// The header word of an object's cell that holds its prototype (W2e step 3's images): the
 /// Object ends its `RefCell` ([`check_object_layout`]).
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
