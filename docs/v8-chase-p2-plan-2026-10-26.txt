@@ -11428,3 +11428,27 @@ Notes for landing:
   with comments, a test (the_buffer_ledger_follows_buffers_through_their_lives) and step 5's
   assertion before it (241f031a); its binary differs from 27c53db6's in layout only (line
   numbers in panic locations) and counts alike (the table's middle column).
+
+### Vue's export getters called through the read's call cache (record, 2026-11-04)
+
+The first candidate of "Vue's gap, by its misses": 12657b48. accessor_validated_get, the JIT's
+validated accessor path, answered a bundler's export getter (`() => binding`) by its binding
+proof (try_binding_getter) before the read's getter call cache, so the cache never filled and
+every one of Vue's 443,188 such reads came back to Rust. The call cache now comes after the
+record plan and before the binding proof: once the getter has compiled, its call fills the cache
+and the stub's direct sequence runs every later read in generated code, as the exemplars'
+baselines call a getter from the read's IC (Decision 17). The binding proof still answers the
+VM's and the tree-walker's reads (finish_cached_accessor) and JIT reads without a call site.
+
+Measured (fat LTO, CPUs 10-13, pacing off, median of 3; base main 2919fb80's engine, the W2g
+agent's rest-lto-27c53db6 of the same code; target/p2/compact/getter-counts2.txt): Vue -0.48%
+(1,755,747,924 -> 1,747,331,369); every other workload within 0.00% but chai +0.06% in that
+session's single run and -0.05% in a second (its collection schedule's noise). TRUST_JS_JIT_
+PROPSTAT: Vue's reads leaving generated code for an accessor 443,188 -> 995. The saving is about
+27 instructions a read: the binding proof read in place (8f8139f0) had made the Rust path cheap.
+A variant that also put the call cache before the record plan (857e7bc6, measurement only)
+counted Vue -0.51%, the same within noise, and failed
+property_read_tests::record_getter_specialization_returns_fresh_live_records; not taken.
+
+Checks at 12657b48: ARM64 lib 2,767 passed, 9 ignored; x86-64 (zombie) 2,548 passed, 9 ignored,
+clippy -D warnings in the three configurations.
