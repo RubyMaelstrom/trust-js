@@ -430,7 +430,7 @@ pub(crate) fn object_own_property_keys(
     o: &Gc,
 ) -> Result<crate::rooting::RootedVec, Value> {
     ab(i.defer_trigger(o, None))?;
-    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(*o)) {
+    if let Some((target, handler)) = proxy_pair(&Value::Obj(*o)) {
         return proxy_own_keys(i, &target, &handler);
     }
     // Rooted: callers walk the keys while running traps and getters.
@@ -542,7 +542,7 @@ pub(crate) fn proxy_own_keys(
 /// Proxy `[[GetPrototypeOf]]`: call the trap or forward to the target.
 /// `[[IsExtensible]]`, proxy-aware (recurses into a proxy target, enforcing the trap invariant).
 pub(crate) fn js_is_extensible(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
-    if let Some((target, handler)) = proxy_pair(i, obj) {
+    if let Some((target, handler)) = proxy_pair(obj) {
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
@@ -575,7 +575,7 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         ValueView::Obj(o) => *o,
         _ => return Ok(true),
     };
-    if let Some((target, handler)) = proxy_pair(i, obj) {
+    if let Some((target, handler)) = proxy_pair(obj) {
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
@@ -632,7 +632,7 @@ fn js_set_prototype_of(i: &mut Interp, obj: &Value, proto: &Value) -> Result<boo
         if Gc::ptr_eq(po, &o) {
             return Ok(false);
         }
-        if proxy_pair(i, &p).is_some() {
+        if proxy_pair(&p).is_some() {
             break;
         }
         let next = po.borrow().proto;
@@ -666,7 +666,7 @@ pub(crate) fn proxy_enum_string_keys(
     i: &mut Interp,
     proxy: &Value,
 ) -> Result<crate::rooting::RootedVec, Value> {
-    let (target, handler) = proxy_pair(i, proxy).unwrap();
+    let (target, handler) = proxy_pair(proxy).unwrap();
     let keys = proxy_own_keys(i, &target, &handler)?;
     let mut out = crate::rooting::RootedVec::new();
     for k in keys {
@@ -681,7 +681,7 @@ pub(crate) fn proxy_enum_string_keys(
 
 /// `[[PreventExtensions]]`, proxy-aware. Returns whether it succeeded.
 fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
-    if let Some((target, handler)) = proxy_pair(i, obj) {
+    if let Some((target, handler)) = proxy_pair(obj) {
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
@@ -803,13 +803,10 @@ fn ta_buffer_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
     Ok(i.ta_buffer.get(&ptr).cloned().unwrap_or(Value::Undefined))
 }
 
-/// If `v` is a Proxy, its (target, handler) pair.
-pub(crate) fn proxy_pair(i: &Interp, v: &Value) -> Option<(Value, Value)> {
-    if let ValueView::Obj(o) = (v).view() {
-        i.proxies.get(&(Gc::as_ptr(&o) as usize)).cloned()
-    } else {
-        None
-    }
+/// If `v` is a Proxy, its (target, handler) pair (the handler null once revoked).
+#[inline]
+pub(crate) fn proxy_pair(v: &Value) -> Option<(Value, Value)> {
+    v.as_obj().and_then(|o| crate::value::proxy_parts(&o))
 }
 
 fn ta_bytelength_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
@@ -873,7 +870,7 @@ pub(crate) fn ta_accessor_of(getter: &Value) -> Option<TaAccessor> {
 
 /// `[[GetPrototypeOf]]`, proxy-aware.
 pub(crate) fn js_get_prototype_of(i: &mut Interp, obj: &Value) -> Result<Value, Value> {
-    if let Some((target, handler)) = proxy_pair(i, obj) {
+    if let Some((target, handler)) = proxy_pair(obj) {
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }
@@ -910,7 +907,7 @@ pub(crate) fn has_own_property_trapped(
             TaIndex::Ordinary => {}
         }
     }
-    if let Some((t, h)) = proxy_pair(i, v) {
+    if let Some((t, h)) = proxy_pair(v) {
         return Ok(proxy_get_own_property(i, &t, &h, key)?.is_some());
     }
     if ab(i.host_indexed_own_value(&o, key))?.is_some() {
@@ -982,7 +979,7 @@ pub(crate) fn object_get_own_property(
             true,
         )));
     }
-    if let Some((target, handler)) = proxy_pair(i, &Value::Obj(*o)) {
+    if let Some((target, handler)) = proxy_pair(&Value::Obj(*o)) {
         return proxy_get_own_property(i, &target, &handler, key);
     }
     if i.is_namespace(ptr) {
@@ -1223,7 +1220,7 @@ fn proxy_define_property_record(
         "defineProperty",
     )?
     else {
-        if let Some((t2, h2)) = proxy_pair(i, target) {
+        if let Some((t2, h2)) = proxy_pair(target) {
             return proxy_define_property_record(i, &t2, &h2, key, pd);
         }
         return if let ValueView::Obj(t) = &(target).view() {
@@ -1390,7 +1387,7 @@ fn assign_set(i: &mut Interp, to: &Value, key: &str, value: Value) -> Result<(),
 
 /// IsArray, seeing through proxies (a Proxy whose target is an Array is itself an Array).
 fn json_is_array(i: &mut Interp, v: &Value) -> Result<bool, Value> {
-    if let Some((target, handler)) = proxy_pair(i, v) {
+    if let Some((target, handler)) = proxy_pair(v) {
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "Cannot perform IsArray on a revoked Proxy"));
         }
@@ -1432,7 +1429,7 @@ fn enumerable_own_value_list(i: &mut Interp, o: &Value, entries: bool) -> Result
     }
     // Rooted across the getters and traps each later key runs (I1).
     let mut out = crate::rooting::RootedVec::new();
-    if let Some((t, h)) = proxy_pair(i, o) {
+    if let Some((t, h)) = proxy_pair(o) {
         for k in proxy_own_keys(i, &t, &h)? {
             if let ValueView::Str(ks) = &(k).view() {
                 if proxy_key_enumerable(i, &t, &h, &crate::value::encode_lstr_key(ks))? {
@@ -1738,7 +1735,7 @@ pub(crate) fn reflect_ordinary_set(
     }
     let mut current = *target;
     loop {
-        if proxy_pair(i, &current).is_some() {
+        if proxy_pair(&current).is_some() {
             // A proxy's [[Set]] returns its own success boolean (via the trap or a forwarded [[Set]]).
             // [[Set]] itself reports rejection as false even when the calling script is
             // strict. PutValue's caller applies strictness after this internal operation.
@@ -1827,7 +1824,7 @@ pub(crate) fn reflect_define_on_receiver(
     key: &str,
     value: Value,
 ) -> Result<bool, Value> {
-    if let Some((target, handler)) = proxy_pair(i, receiver) {
+    if let Some((target, handler)) = proxy_pair(receiver) {
         // OrdinarySetWithOwnDescriptor (ECMA-262 §10.1.9.2 step 2.c-h): the receiver's
         // [[GetOwnProperty]] runs first (its trap is observable); an existing accessor or
         // non-writable property rejects, an existing data property is redefined with just
@@ -1923,7 +1920,7 @@ pub(crate) fn reflect_ordinary_get(
 ) -> Result<Value, Value> {
     let mut current = *target;
     loop {
-        if proxy_pair(i, &current).is_some() {
+        if proxy_pair(&current).is_some() {
             // A proxy's [[Get]](P, Receiver) threads the explicit receiver.
             return ab(i.get_member_recv(&current, key, *receiver));
         }
@@ -1979,7 +1976,7 @@ pub(crate) fn reflect_ordinary_get(
 /// DeletePropertyOrThrow(O, P): [[Delete]] and throw a TypeError if it returns false. An absent
 /// property deletes successfully (returns true), matching the spec used by Array mutators.
 fn delete_or_throw(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Value> {
-    if let Some((target, handler)) = proxy_pair(i, holder) {
+    if let Some((target, handler)) = proxy_pair(holder) {
         let ok = ab(i.proxy_delete(target, handler, key))?;
         if !ok {
             return Err(i.make_error(
@@ -2073,12 +2070,6 @@ fn promise_resolve_value(i: &mut Interp, v: Value) -> Value {
     let p = i.new_promise();
     i.resolve_promise(&p, v);
     p
-}
-
-/// Sentinel call slot for a function-targeted proxy, so `is_callable()` is true; the actual
-/// dispatch happens in `call_inner`/`construct_inner` via the proxies table (this never runs).
-fn proxy_uncallable(i: &mut Interp, _t: Value, _a: &[Value]) -> Result<Value, Value> {
-    Err(i.make_error("TypeError", "proxy call dispatch error"))
 }
 
 /// OrdinaryCreateFromConstructor: a new object whose [[Prototype]] is `new.target.prototype` when
@@ -2182,7 +2173,7 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
             }
         }
     }
-    let proxy = proxy_pair(i, obj);
+    let proxy = proxy_pair(obj);
     // An Array's or ordinary object's element words become sealed (or frozen) elements in one
     // step (W2c step 7a; SpiderMonkey's elements flags, V8's elements kinds), so the defines
     // below skip them: no trap or exotic [[DefineOwnProperty]] observes the order. Mapped
@@ -2322,7 +2313,7 @@ fn object_define_properties(
     let props = Value::Obj(to_object_arg(i, props_arg, who)?);
     // Rooted: a Symbol key's cell outlives traps and getters, which may delete it.
     let keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
-        crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(i, &props) {
+        crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(&props) {
             let mut ks = Vec::new();
             let proxy_keys = proxy_own_keys(i, &t, &h)?;
             for k in proxy_keys.iter() {
@@ -2341,7 +2332,7 @@ fn object_define_properties(
     let mut descs: Vec<(crate::value::PropertyKey, PartialDesc)> = Vec::new();
     let mut roots = crate::rooting::ValueRoots::new();
     for key in keys.iter().cloned() {
-        let enumerable = if let Some((t, h)) = proxy_pair(i, &props) {
+        let enumerable = if let Some((t, h)) = proxy_pair(&props) {
             proxy_get_own_property(i, &t, &h, &key)?.is_some_and(|p| p.enumerable())
         } else {
             let object = props.as_obj().unwrap();
@@ -2366,7 +2357,7 @@ fn object_define_properties(
         }
     }
     for (key, desc) in descs {
-        let ok = if let Some((t, h)) = proxy_pair(i, o) {
+        let ok = if let Some((t, h)) = proxy_pair(o) {
             ab(proxy_define_property_record(i, &t, &h, &key, &desc))?
         } else {
             ab(define_own_property_partial(
@@ -2432,7 +2423,7 @@ fn ctor_realm_proto(i: &mut Interp, nt: &Value, default_proto: &str) -> Result<O
     let mut ntobj: Gc = o;
     // GetFunctionRealm unwraps bound functions and (unrevoked) proxies to their targets.
     for _ in 0..64 {
-        if let Some((target, handler)) = i.proxies.get(&(Gc::as_ptr(&ntobj) as usize)) {
+        if let Some((target, handler)) = crate::value::proxy_parts(&ntobj) {
             if matches!((handler).view(), ValueView::Null) {
                 return Err(i.make_error("TypeError", "cannot get the realm of a revoked proxy"));
             }
@@ -4052,7 +4043,7 @@ fn promise_keyed_combinator(
     let keys: Vec<String> = {
         let attempt = (|i: &mut Interp| -> Result<Vec<String>, Value> {
             let mut out = Vec::new();
-            if let Some((target, handler)) = proxy_pair(i, &input) {
+            if let Some((target, handler)) = proxy_pair(&input) {
                 for k in proxy_own_keys(i, &target, &handler)? {
                     let ValueView::Str(ks) = &(k).view() else {
                         continue;
@@ -4452,7 +4443,7 @@ fn install_object(it: &mut Interp) {
         };
         let key = ab(i.to_property_key(&arg(args, 0)))?;
         let ov = Value::Obj(o);
-        let ok = if let Some((t, h)) = proxy_pair(i, &ov) {
+        let ok = if let Some((t, h)) = proxy_pair(&ov) {
             ab(proxy_define_property_record(i, &t, &h, &key, &desc))?
         } else {
             ab(define_own_property_partial(i, &o, &key, &desc))?
@@ -4484,7 +4475,7 @@ fn install_object(it: &mut Interp) {
         let mut cur = Value::Obj(o);
         loop {
             // [[GetOwnProperty]] goes through a proxy's trap, propagating abrupt completions.
-            if let Some((t, h)) = proxy_pair(i, &cur) {
+            if let Some((t, h)) = proxy_pair(&cur) {
                 if let Some(desc) = proxy_get_own_property(i, &t, &h, &key)? {
                     let accessor = if is_get { desc.getter() } else { desc.setter() };
                     return Ok(match accessor {
@@ -4550,7 +4541,7 @@ fn install_object(it: &mut Interp) {
             }
         }
         // A proxy reads [[GetOwnProperty]]'s enumerable flag through its trap.
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
+        if let Some((target, handler)) = proxy_pair(&Value::Obj(o)) {
             let e = proxy_get_own_property(i, &target, &handler, &key)?
                 .is_some_and(|desc| desc.enumerable());
             return Ok(Value::Bool(e));
@@ -4741,7 +4732,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "keys", 1, |i, _this, args| {
         let o = to_object_arg(i, arg(args, 0), "Object.keys")?;
         ab(i.defer_trigger(&o, None))?;
-        if proxy_pair(i, &Value::Obj(o)).is_some() {
+        if proxy_pair(&Value::Obj(o)).is_some() {
             let keys = proxy_enum_string_keys(i, &Value::Obj(o))?;
             return Ok(i.make_array(keys.into_vec()));
         }
@@ -4798,7 +4789,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "getOwnPropertyNames", 1, |i, _this, args| {
         let o = to_object_arg(i, arg(args, 0), "Object.getOwnPropertyNames")?;
         ab(i.defer_trigger(&o, None))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
+        if let Some((target, handler)) = proxy_pair(&Value::Obj(o)) {
             let keys = proxy_own_keys(i, &target, &handler)?;
             let strs: Vec<Value> = keys
                 .into_iter()
@@ -4832,7 +4823,7 @@ fn install_object(it: &mut Interp) {
         ab(i.defer_trigger(&o, None))?;
         let ov = Value::Obj(o);
         // A proxy's symbol keys come from its [[OwnPropertyKeys]] trap.
-        if let Some((target, handler)) = proxy_pair(i, &ov) {
+        if let Some((target, handler)) = proxy_pair(&ov) {
             let syms: Vec<Value> = proxy_own_keys(i, &target, &handler)?
                 .into_iter()
                 .filter(|k| matches!((k).view(), ValueView::Sym(_)))
@@ -4849,7 +4840,7 @@ fn install_object(it: &mut Interp) {
     it.def_method(&ctor, "getPrototypeOf", 1, |i, _this, args| {
         match (arg(args, 0)).view() {
             ValueView::Obj(o) => {
-                if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
+                if let Some((target, handler)) = proxy_pair(&Value::Obj(o)) {
                     return proxy_get_prototype(i, &target, &handler);
                 }
                 Ok(o.borrow().proto.map(Value::Obj).unwrap_or(Value::Null))
@@ -4918,7 +4909,7 @@ fn install_object(it: &mut Interp) {
             }
         };
         let key = ab(i.to_property_key(&arg(args, 1)))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
+        if let Some((target, handler)) = proxy_pair(&Value::Obj(o)) {
             if !ab(proxy_define_property(
                 i,
                 &target,
@@ -4998,7 +4989,7 @@ fn install_object(it: &mut Interp) {
             if try_assign_named_data(&to_val, &from) {
                 continue;
             }
-            if let Some((t, h)) = proxy_pair(i, &from) {
+            if let Some((t, h)) = proxy_pair(&from) {
                 // Proxy source: enumerate all own keys (string + symbol) via the traps, copying each
                 // enumerable one.
                 for key in proxy_own_keys(i, &t, &h)? {
@@ -5136,7 +5127,7 @@ fn test_integrity_level(i: &mut Interp, v: &Value, frozen: bool) -> Result<bool,
             }
         }
     }
-    if let Some((t, h)) = proxy_pair(i, v) {
+    if let Some((t, h)) = proxy_pair(v) {
         for k in proxy_own_keys(i, &t, &h)? {
             let key = ab(i.to_property_key(&k))?;
             let Some(desc) = proxy_get_own_property(i, &t, &h, &key)? else {
@@ -7205,7 +7196,7 @@ fn install_array_rest(it: &mut Interp, ap: Gc) {
                 ValueView::Obj(o) if matches!(o.borrow().kind, ObjectKind::Array) => {
                     return Ok(Value::Bool(true));
                 }
-                ValueView::Obj(_) => match proxy_pair(i, &v) {
+                ValueView::Obj(_) => match proxy_pair(&v) {
                     Some((_, handler)) if matches!(handler.view(), ValueView::Null) => {
                         return Err(i.make_error("TypeError", "proxy is revoked"));
                     }
@@ -9330,33 +9321,31 @@ pub(crate) fn cdp_or_throw(
     };
     // Fast path: a fresh element on a plain, extensible Array with writable length skips the
     // descriptor-object round trip (this is the hot loop of from/map/filter/slice/concat).
-    if !i.proxies.contains_key(&(Gc::as_ptr(o) as usize)) {
-        let fast = {
-            let b = o.borrow();
-            matches!(b.kind, ObjectKind::Array)
-                && b.extensible()
-                && !b.props.contains(key)
-                && b.props.get("length").map(|p| p.writable()).unwrap_or(true)
-        };
-        if fast {
-            // Only an array index (canonical, below 2^32 - 1) moves `length`; "01" or "+1" is
-            // an ordinary key.
-            if let Some(idx) = crate::value::canonical_index(key) {
-                let len = i.array_length(o);
-                o.borrow_mut()
-                    .props
-                    .insert(key, Property::data(v, true, true, true));
-                if idx as usize >= len {
-                    o.borrow_mut().props.insert(
-                        "length",
-                        Property::data(Value::Num(f64::from(idx) + 1.0), true, false, false),
-                    );
-                }
-                return Ok(());
+    let fast = {
+        let b = o.borrow();
+        matches!(b.kind, ObjectKind::Array)
+            && b.extensible()
+            && !b.props.contains(key)
+            && b.props.get("length").map(|p| p.writable()).unwrap_or(true)
+    };
+    if fast {
+        // Only an array index (canonical, below 2^32 - 1) moves `length`; "01" or "+1" is
+        // an ordinary key.
+        if let Some(idx) = crate::value::canonical_index(key) {
+            let len = i.array_length(o);
+            o.borrow_mut()
+                .props
+                .insert(key, Property::data(v, true, true, true));
+            if idx as usize >= len {
+                o.borrow_mut().props.insert(
+                    "length",
+                    Property::data(Value::Num(f64::from(idx) + 1.0), true, false, false),
+                );
             }
+            return Ok(());
         }
     }
-    let r = if let Some((t, h)) = proxy_pair(i, target) {
+    let r = if let Some((t, h)) = proxy_pair(target) {
         proxy_define_property_record(i, &t, &h, key, &data_record(v))
     } else {
         define_own_property_record(i, o, key, &data_record(v))
@@ -9778,7 +9767,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
     if keyed {
         // zipKeyed: each own enumerable non-undefined-valued key of `iterables` is an input.
         let all_keys: crate::rooting::Rooted<Vec<crate::value::PropertyKey>> =
-            crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(i, &input) {
+            crate::rooting::Rooted::new(if let Some((t, h)) = proxy_pair(&input) {
                 let mut ks = Vec::new();
                 let proxy_keys = proxy_own_keys(i, &t, &h)?;
                 for k in proxy_keys.iter() {
@@ -9794,7 +9783,7 @@ fn iterator_zip(i: &mut Interp, a: &[Value], keyed: bool) -> Result<Value, Value
             });
         for k in all_keys.iter().cloned() {
             // [[GetOwnProperty]] fresh per key: skip missing or non-enumerable properties.
-            let enumerable = if let Some((t, h)) = proxy_pair(i, &input) {
+            let enumerable = if let Some((t, h)) = proxy_pair(&input) {
                 match proxy_get_own_property(i, &t, &h, &k) {
                     Ok(desc) => desc.is_some_and(|desc| desc.enumerable()),
                     Err(e) => {

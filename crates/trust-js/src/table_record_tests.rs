@@ -83,7 +83,8 @@ fn entries_of(owner: HiddenAddress, entries: &[(usize, u64)]) -> usize {
 /// A minor collection reports the side-slot owners written since the last collection and the
 /// young ones, and no old owner whose entries were not written: a reaction added to an old
 /// promise records it, and the reaction's new promise is young; an old pending promise and an
-/// old proxy beside it are not reported. A major collection reports every owner.
+/// old class beside it are not reported. A major collection reports every owner, and no proxy,
+/// whose target and handler are in its own cell (W2g step 1).
 #[test]
 fn a_minor_collection_reports_written_and_young_side_slot_owners_only() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
@@ -91,20 +92,25 @@ fn a_minor_collection_reports_written_and_young_side_slot_owners_only() {
         eval(
             &mut engine,
             "var written = new Promise(function () {}), clean = new Promise(function () {});
-             var proxy = new Proxy({}, {}); 0",
+             var klass = class {}, proxy = new Proxy({}, {}); 0",
         );
         let written = global_address(&mut engine, "written");
         let clean = global_address(&mut engine, "clean");
+        let klass = global_address(&mut engine, "klass");
         let proxy = global_address(&mut engine, "proxy");
         engine.interp.gc_collect();
         let major = report(&engine);
         assert_eq!(major.kind, Some(CollectionKind::Major));
-        for owner in [written, clean, proxy] {
+        for owner in [written, clean, klass] {
             assert!(
                 listed(owner, &major.side_slot_owners),
                 "{tier:?}: a major collection"
             );
         }
+        assert!(
+            !listed(proxy, &major.side_slot_owners),
+            "{tier:?}: a proxy owns no side slot"
+        );
         // Nothing was written since: a minor collection reports no table owner.
         engine.interp.gc_collect_minor();
         let idle = report(&engine);
@@ -124,8 +130,8 @@ fn a_minor_collection_reports_written_and_young_side_slot_owners_only() {
         assert!(listed(derived, &minor.side_slot_owners), "{tier:?}: young");
         assert!(!listed(clean, &minor.side_slot_owners), "{tier:?}: clean");
         assert!(
-            !listed(proxy, &minor.side_slot_owners),
-            "{tier:?}: clean proxy"
+            !listed(klass, &minor.side_slot_owners),
+            "{tier:?}: clean class"
         );
     }
 }
@@ -237,8 +243,8 @@ struct TableWrite {
     remove: fn(&mut Interp, usize),
 }
 
-/// A write to each of the 10 side-slot tables (`gc_side_slot_tables!` and the generators).
-fn table_writes() -> [TableWrite; 10] {
+/// A write to each of the 9 side-slot tables (`gc_side_slot_tables!` and the generators).
+fn table_writes() -> [TableWrite; 9] {
     use crate::interpreter::{ClassInfo, FinalizationState, HostIndexedProperties, JobCallback};
     [
         TableWrite {
@@ -283,17 +289,6 @@ fn table_writes() -> [TableWrite; 10] {
             },
             remove: |i, owner| {
                 i.ta_buffer.remove(&owner);
-            },
-        },
-        TableWrite {
-            table: "proxies",
-            holds: (true, false),
-            write: |i, owner, young, _| {
-                i.proxies
-                    .insert(&i.gc_heap, owner, (Value::Obj(young), Value::Null));
-            },
-            remove: |i, owner| {
-                i.proxies.remove(&owner);
             },
         },
         TableWrite {
@@ -403,7 +398,7 @@ fn write_young(interp: &mut Interp, write: &TableWrite, owner: HiddenAddress) ->
     watched
 }
 
-/// Each of the 10 side-slot tables, written from Rust: an old owner's entry gets a young object
+/// Each of the 9 side-slot tables, written from Rust: an old owner's entry gets a young object
 /// (and a young environment), which then survives a minor collection through that entry alone;
 /// the minor collection reports the written owner, and not an old owner beside it whose old
 /// entry in the same table was not written.
@@ -477,18 +472,18 @@ fn an_unrecorded_side_slot_write_fails_the_check() {
 /// young owners only through the record.
 #[test]
 #[cfg(debug_assertions)]
-#[should_panic(expected = "side-slot table proxies: young owner")]
+#[should_panic(expected = "side-slot table promises: young owner")]
 fn an_unrecorded_young_side_slot_owner_fails_the_check() {
     let mut engine = engine(Tier::Interp);
     engine.interp.gc_collect();
-    eval(&mut engine, "var p = new Proxy({}, {}); 0");
-    let proxy = global_address(&mut engine, "p");
+    eval(&mut engine, "var p = new Promise(function () {}); 0");
+    let promise = global_address(&mut engine, "p");
     engine
         .interp
         .gc_heap
         .records
         .borrow_mut()
-        .forget_side_slot_owner(proxy.get());
+        .forget_side_slot_owner(promise.get());
     engine.interp.gc_collect_minor();
 }
 

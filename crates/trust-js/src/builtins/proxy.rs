@@ -17,38 +17,26 @@ fn make_proxy(i: &mut Interp, target: Value, handler: Value) -> Result<Value, Va
         _ => None,
     };
     let obj = Object::new(proto);
-    if target.is_callable() {
-        obj.borrow_mut().kind = ObjectKind::Native(proxy_uncallable);
-        // A proxy is a constructor exactly when its target is one.
-        obj.borrow_mut()
-            .set_constructor(is_constructor_value(&target));
-    }
-    let p = Gc::as_ptr(&obj) as usize;
-    i.gc_pin(&obj);
     i.inline_ic_safe.set(false);
-    obj.borrow().set_ic_plain(false);
-    i.proxies.insert(&i.gc_heap, p, (target, handler));
+    {
+        let mut proxy = obj.borrow_mut();
+        // A proxy has a [[Construct]] exactly when its target is a constructor (ProxyCreate
+        // step 5), and a [[Call]] when the target is callable (its kind's).
+        proxy.set_constructor(is_constructor_value(&target));
+        // Its behavior is its kind's: the property caches stay off it.
+        proxy.set_ic_plain(false);
+        proxy.kind = ObjectKind::new_proxy(target, handler);
+    }
     Ok(Value::Obj(obj))
 }
 
-fn revoke_proxy(i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
+fn revoke_proxy(_i: &mut Interp, _this: Value, a: &[Value]) -> Result<Value, Value> {
     if let ValueView::Obj(o) = (arg(a, 0)).view() {
-        let ptr = Gc::as_ptr(&o) as usize;
-        // Keep the entry but null the handler, so the object stays a (revoked) Proxy and every
-        // operation throws a TypeError rather than silently acting like a plain object.
-        if let Some(owner) = i.metadata_owner(ptr, |owner, ptr| owner.proxies.contains_key(&ptr)) {
-            i.inline_ic_safe.set(false);
-            o.borrow().set_ic_plain(false);
-            let heap = i.gc_heap.clone();
-            i.with_metadata_table(
-                owner,
-                |owner| &mut owner.proxies,
-                |proxies| {
-                    if let Some((target, _)) = proxies.get(&ptr).copied() {
-                        proxies.insert(&heap, ptr, (target, Value::Null));
-                    }
-                },
-            );
+        // Null the handler but keep the kind, so the object stays a (revoked) Proxy and every
+        // operation throws a TypeError rather than silently acting like a plain object. The
+        // mutable borrow records the write in the proxy's card.
+        if let ObjectKind::Proxy(proxy) = &mut o.borrow_mut().kind {
+            proxy.handler = Value::Null;
         }
     }
     Ok(Value::Undefined)

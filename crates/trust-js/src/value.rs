@@ -2264,6 +2264,12 @@ pub enum ObjectKind {
     CollectionIterator(
         crate::gc_storage::PayloadBox<crate::ordered_collection::CollectionIterator>,
     ) = 26,
+    /// A Proxy exotic object (ECMA-262 10.5): its target, its handler and whether it has a
+    /// [[Call]], in a cell of its own (W2g step 1), as V8, SpiderMonkey and JSC keep a proxy's
+    /// target and handler in the object. Its clear `ic_plain` keeps the property caches off it.
+    /// A callable proxy is the one callable object whose tag is outside the callables' range
+    /// ([`ObjectKind::is_callable`]).
+    Proxy(crate::gc_storage::PayloadBox<ProxyData>) = KIND_PROXY_TAG,
 }
 
 /// The discriminant of [`ObjectKind::User`] (see the enum's layout note).
@@ -2280,6 +2286,36 @@ pub(crate) const KIND_ORDINARY_LAST: u8 = 15;
 pub(crate) const KIND_TYPED_ARRAY_TAG: u8 = 1;
 /// [`ObjectKind::Array`]'s tag.
 pub(crate) const KIND_ARRAY_TAG: u8 = 16;
+/// [`ObjectKind::Proxy`]'s tag, after every other kind's: the in-line `instanceof` walk
+/// compares it at each object whose [[GetPrototypeOf]] it reads.
+pub(crate) const KIND_PROXY_TAG: u8 = 27;
+
+/// A Proxy's internal slots ([`ObjectKind::Proxy`]): ProxyCreate's [[ProxyTarget]] and
+/// [[ProxyHandler]], the handler null once the proxy is revoked (the target stays, which nothing
+/// observes), and whether the target was callable, which gives the proxy its [[Call]] (ECMA-262
+/// 10.5.15 ProxyCreate step 5; V8 and JSC choose the proxy's map or structure by it). Its
+/// [[Construct]] is the object's IsConstructor bit ([`FLAG_CONSTRUCTOR`]), set by the creation.
+/// Both values are edges of the proxy, traced with it; revocation writes the handler through the
+/// object's mutable borrow, which records the write in its card.
+pub(crate) struct ProxyData {
+    pub(crate) target: Value,
+    pub(crate) handler: Value,
+    pub(crate) callable: bool,
+}
+
+// A proxy's slots own nothing outside the heap: its payload cell dies without a finalizer.
+const _: () = assert!(!std::mem::needs_drop::<ProxyData>());
+
+/// `object`'s [[ProxyTarget]] and [[ProxyHandler]] (null once revoked) when it is a Proxy: a test
+/// of its kind tag, whichever interpreter of the Agent made it.
+#[inline]
+pub(crate) fn proxy_parts(object: &Gc) -> Option<(Value, Value)> {
+    object
+        .borrow()
+        .kind
+        .proxy()
+        .map(|proxy| (proxy.target, proxy.handler))
+}
 
 /// Cold payloads boxed out of [`Callable`], so every non-callable ordinary object does not pay
 /// for the largest function variants inline.
@@ -2536,10 +2572,37 @@ impl ObjectKind {
         unsafe { *(self as *const ObjectKind as *const u8) }
     }
 
-    /// Whether the object has a [[Call]] (any callable kind): the former "`call` is not None".
+    /// Whether the object has a [[Call]]: a callable kind (the former "`call` is not None") or
+    /// a proxy whose target was callable.
     #[inline]
     pub(crate) fn is_callable(&self) -> bool {
         (KIND_CALLABLE_FIRST..=KIND_EXOTIC_NONE_LAST).contains(&self.tag())
+            || matches!(self, ObjectKind::Proxy(proxy) if proxy.callable)
+    }
+
+    /// A Proxy exotic object's internal slots, revoked or not.
+    #[inline]
+    pub(crate) fn proxy(&self) -> Option<&ProxyData> {
+        match self {
+            ObjectKind::Proxy(proxy) => Some(proxy),
+            _ => None,
+        }
+    }
+
+    /// A Proxy exotic object, revoked or not.
+    #[inline]
+    pub(crate) fn is_proxy(&self) -> bool {
+        self.tag() == KIND_PROXY_TAG
+    }
+
+    /// ProxyCreate's kind: a proxy of `target` with `handler`, callable when `target` is.
+    pub(crate) fn new_proxy(target: Value, handler: Value) -> ObjectKind {
+        let callable = target.is_callable();
+        ObjectKind::Proxy(crate::gc_storage::PayloadBox::new(ProxyData {
+            target,
+            handler,
+            callable,
+        }))
     }
 
     /// No exotic internal state: a plain object, a typed array's view (whose behavior is the
@@ -3327,6 +3390,7 @@ pub(crate) struct PayloadDescs {
     array_iterator: crate::gc_core::DescId,
     string_iterator: crate::gc_core::DescId,
     collection_iterator: crate::gc_core::DescId,
+    proxy: crate::gc_core::DescId,
     native: crate::gc_core::DescId,
     bound: crate::gc_core::DescId,
     wrapped_shadow: crate::gc_core::DescId,
@@ -3358,6 +3422,7 @@ payload_kinds! {
     ArrayIteratorState => array_iterator,
     StringIteratorState => string_iterator,
     crate::ordered_collection::CollectionIterator => collection_iterator,
+    ProxyData => proxy,
     Rc<NativeCallable> => native,
     BoundCallable => bound,
     Rc<WrappedShadowCallable> => wrapped_shadow,
@@ -3395,6 +3460,7 @@ impl PayloadDescs {
             collection_iterator: leaf(payload_layout::<
                 crate::ordered_collection::CollectionIterator,
             >("map or set iterator state")),
+            proxy: leaf(payload_layout::<ProxyData>("proxy target and handler")),
             native: leaf(payload_layout::<Rc<NativeCallable>>("native function data")),
             bound: leaf(payload_layout::<BoundCallable>("bound function data")),
             wrapped_shadow: leaf(payload_layout::<Rc<WrappedShadowCallable>>(
@@ -4217,6 +4283,11 @@ impl Object {
             }
             ObjectKind::Error(stack) => stack.trace_gc(sink.as_dyn()), // the cell and the frame names
             ObjectKind::Collection(data) => data.trace_gc(sink.as_dyn()), // the cell and the entries
+            ObjectKind::Proxy(proxy) => {
+                PayloadBox::trace(proxy, sink);
+                sink.value(&proxy.target);
+                sink.value(&proxy.handler);
+            }
             ObjectKind::Arguments(Some(map)) => {
                 crate::gc_storage::StorageBox::trace(map, sink);
                 map.trace(sink);
@@ -8055,7 +8126,7 @@ pub(crate) fn detached_field_bytes(capacity: usize) -> usize {
 /// the order puts the five that the array-append guard tests in the low bits, so one mask and
 /// compare tests them all.
 ///
-/// `false` for objects whose behavior lives in an interpreter side table — proxies, typed
+/// `false` for proxies and for objects whose behavior lives in an interpreter side table — typed
 /// arrays, module namespaces — which the kind can't reveal. The JIT's inline property/element
 /// caches test this bit on the receiver and take the checked helper when it is clear, so ONE
 /// proxy existing somewhere does not disable the caches for every plain object in the program

@@ -320,30 +320,6 @@ impl Interp {
         })
     }
 
-    /// A callback-free metadata loan, not a language Realm switch. The closure receives ONLY
-    /// the selected table, and must finish before author calls/collection. Return owned data,
-    /// never a reference into a table. Thus borrowed builtin algorithms retain their caller's
-    /// Realm for errors, species construction and observable callbacks.
-    pub(crate) fn with_metadata_table<T, R>(
-        &mut self,
-        owner: RealmId,
-        table: fn(&mut Interp) -> &mut T,
-        operation: impl FnOnce(&mut T) -> R,
-    ) -> R {
-        if owner == self.realm_id {
-            return operation(table(self));
-        }
-        let access = self.gc_heap.agent.access.clone();
-        self.with_raw_access(|_| {
-            let pointer = access
-                .resolve(owner)
-                .expect("authoritative metadata owner is live");
-            // SAFETY: requester is suspended; the newest owner lineage is used only during
-            // this short, callback-free loan. No table reference escapes the closure.
-            operation(table(unsafe { &mut *pointer.as_ptr() }))
-        })
-    }
-
     pub(crate) fn realm_route(&self) -> Rc<Route> {
         self.shadow_home.as_ref().map_or_else(
             || self.gc_heap.agent.root_route.clone(),

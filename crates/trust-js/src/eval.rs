@@ -2310,7 +2310,7 @@ impl Interp {
             let ov = Value::Obj(o);
             // A proxy level enumerates via its [[OwnPropertyKeys]] filtered by [[GetOwnProperty]]'s
             // enumerable flag, then walks its [[GetPrototypeOf]].
-            if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
+            if o.borrow().kind.is_proxy() {
                 let keys =
                     crate::builtins::proxy_enum_string_keys(self, &ov).map_err(Abrupt::Throw)?;
                 for k in keys {
@@ -2779,7 +2779,7 @@ impl Interp {
         // ownKeys/getOwnPropertyDescriptor traps), re-checking each descriptor before its Get;
         // every attribute value must be a string.
         let mut ty = None;
-        if let Some((t, h)) = crate::builtins::proxy_pair(self, &with) {
+        if let Some((t, h)) = crate::builtins::proxy_pair(&with) {
             let keys = crate::builtins::proxy_own_keys(self, &t, &h).map_err(Abrupt::Throw)?;
             for k in keys {
                 let pk = self.to_property_key(&k)?;
@@ -3127,7 +3127,7 @@ impl Interp {
     /// Arrays (ECMA-262 §10.1.7.1 OrdinaryHasProperty: [[GetOwnProperty]], then the
     /// prototype's [[HasProperty]]), which runs no author code: exactly `js_has_property`'s
     /// own-property test at every hop, without copying the key. `None` as soon as an object on
-    /// the chain is in an interpreter side table (`ic_plain` clear: proxies, typed arrays,
+    /// the chain is a proxy or in an interpreter side table (`ic_plain` clear: typed arrays,
     /// namespaces, Web IDL indexed objects) or is any other exotic object.
     pub(crate) fn ordinary_chain_has_property(start: &Gc, key: &str) -> Option<bool> {
         // The key's atom, once a map on the chain has looked it up (`Props::get_walking`).
@@ -3222,7 +3222,7 @@ impl Interp {
         // A deferred namespace evaluates on [[HasProperty]] with a string key.
         self.defer_trigger(&o, Some(key))?;
         let ptr = Gc::as_ptr(&o) as usize;
-        if let Some((target, handler)) = self.proxy_at(ptr) {
+        if let Some((target, handler)) = proxy_parts(&o) {
             if matches!((handler).view(), ValueView::Null) {
                 return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
             }
@@ -7062,10 +7062,9 @@ impl Interp {
             ValueView::Obj(o) => *o,
             _ => return Err(self.throw("TypeError", "super target is not a constructor")),
         };
-        let ptr = Gc::as_ptr(&obj) as usize;
         // A proxy parent constructs through its [[Construct]] trap machinery; the returned object
         // is what super() binds as `this` (the object-override path in the super-call code).
-        if self.proxies.contains_key(&ptr) {
+        if obj.borrow().kind.is_proxy() {
             let nt = self.constructor_new_target();
             return self.construct_nt(*ctor, args, nt);
         }
@@ -7135,15 +7134,18 @@ impl Interp {
                         let mut moved_collection = self.move_collection(src, dst);
                         // A subclass instance inherits the built-in's exotic behavior (e.g. an Array
                         // subclass is itself an Array exotic). The native object is discarded, so
-                        // its exotic state moves rather than copies.
-                        let src_exotic = if src.borrow().kind.exotic_is_none() {
-                            crate::value::ObjectKind::Plain
-                        } else {
-                            std::mem::replace(
-                                &mut src.borrow_mut().kind,
-                                crate::value::ObjectKind::Plain,
-                            )
-                        };
+                        // its exotic state moves rather than copies. A proxy's (%Proxy% reached as
+                        // the parent through a changed [[Prototype]]) stays with it, as it did in
+                        // the side table: `this` is not made a proxy.
+                        let src_exotic =
+                            if src.borrow().kind.exotic_is_none() || src.borrow().kind.is_proxy() {
+                                crate::value::ObjectKind::Plain
+                            } else {
+                                std::mem::replace(
+                                    &mut src.borrow_mut().kind,
+                                    crate::value::ObjectKind::Plain,
+                                )
+                            };
                         if !src_exotic.exotic_is_none() {
                             if matches!(src_exotic, crate::value::ObjectKind::Array) {
                                 dst.borrow().props.mark_array();
@@ -7251,7 +7253,7 @@ impl Interp {
                 }
             }
         }
-        if let Some((t, h)) = crate::builtins::proxy_pair(self, value) {
+        if let Some((t, h)) = crate::builtins::proxy_pair(value) {
             let keys = crate::builtins::proxy_own_keys(self, &t, &h).map_err(Abrupt::Throw)?;
             for k in keys {
                 let pk = self.to_property_key(&k)?;
@@ -7766,7 +7768,7 @@ impl Interp {
                 if let ValueView::Obj(o) = &(base).view() {
                     self.defer_trigger(o, Some(prop))?;
                     let ptr = Gc::as_ptr(o) as usize;
-                    if let Some((target, handler)) = self.proxy_at(ptr) {
+                    if let Some((target, handler)) = proxy_parts(o) {
                         let ok = self.proxy_delete(target, handler, prop)?;
                         if !ok && strict {
                             return Err(self.throw(
@@ -8997,27 +8999,30 @@ impl Interp {
             ValueView::Obj(p) => p,
             _ => return Err(self.throw("TypeError", "prototype property is not an object")),
         };
-        // With no proxies in the realm, [[GetPrototypeOf]] is a direct field read for every hop.
-        // Keep the walk in `Gc`s so the common `instanceof` path avoids a proxy-table probe and
-        // two `Value` constructions per prototype level. The moment a realm contains any proxy,
-        // retain the fully observable path below (a proxy may appear anywhere in the chain).
-        if self.proxies.is_empty() {
-            let mut cur = o_obj;
-            loop {
-                let next = cur.borrow().proto;
-                match next {
-                    Some(x) => {
-                        if Gc::ptr_eq(&x, &proto) {
-                            return Ok(true);
-                        }
-                        cur = x;
-                    }
-                    None => return Ok(false),
+        // [[GetPrototypeOf]] is a direct field read at every object but a Proxy, which each hop
+        // tells by its kind's tag. Keep the walk in `Gc`s, with no `Value` constructions per
+        // prototype level, until it meets a proxy.
+        let mut cur = o_obj;
+        loop {
+            let next = {
+                let object = cur.borrow();
+                if object.kind.is_proxy() {
+                    break;
                 }
+                object.proto
+            };
+            match next {
+                Some(x) => {
+                    if Gc::ptr_eq(&x, &proto) {
+                        return Ok(true);
+                    }
+                    cur = x;
+                }
+                None => return Ok(false),
             }
         }
-        // Walk O's prototype chain via [[GetPrototypeOf]] (so a proxy's trap participates).
-        let mut cur = Value::Obj(o_obj);
+        // From the proxy on, walk via [[GetPrototypeOf]] (so its trap participates).
+        let mut cur = Value::Obj(cur);
         loop {
             let next = crate::builtins::js_get_prototype_of(self, &cur).map_err(Abrupt::Throw)?;
             match (next).view() {
@@ -9283,12 +9288,11 @@ impl Interp {
         let ValueView::Obj(o) = &(v).view() else {
             return false;
         };
-        if let Some((target, _)) = self.proxies.get(&(Gc::as_ptr(o) as usize)) {
-            // A proxy is a constructor exactly when its target is.
-            return self.value_is_constructor(&target.clone());
-        }
         let b = o.borrow();
         match &b.kind {
+            // ProxyCreate step 5 gives a proxy [[Construct]] exactly when its target is a
+            // constructor, which the creation recorded.
+            ObjectKind::Proxy(_) => b.is_constructor(),
             ObjectKind::User(user) => {
                 !(user.func.is_arrow
                     || user.func.is_method

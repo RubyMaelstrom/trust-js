@@ -16,7 +16,7 @@ pub(super) fn install_json(it: &mut Interp) {
             }
         } else if json_is_array(i, &replacer)? {
             let len = match &(replacer).view() {
-                ValueView::Obj(o) if proxy_pair(i, &replacer).is_none() => i.array_length(o),
+                ValueView::Obj(o) if proxy_pair(&replacer).is_none() => i.array_length(o),
                 ValueView::Obj(o) => ab(i.to_length(o))?,
                 _ => 0,
             };
@@ -278,7 +278,7 @@ struct JsonOpts {
 
 /// [[Delete]] for the JSON reviver: trap-aware, discarding the boolean status (per `Perform ?`).
 fn json_delete_prop(i: &mut Interp, holder: &Value, key: &str) -> Result<(), Value> {
-    if let Some((target, handler)) = proxy_pair(i, holder) {
+    if let Some((target, handler)) = proxy_pair(holder) {
         ab(i.proxy_delete(target, handler, key))?;
         return Ok(());
     }
@@ -306,7 +306,7 @@ fn json_create_data_prop(i: &mut Interp, holder: &Value, key: &str, v: Value) ->
     set_data(&desc, "writable", Value::Bool(true));
     set_data(&desc, "enumerable", Value::Bool(true));
     set_data(&desc, "configurable", Value::Bool(true));
-    if let Some((target, handler)) = proxy_pair(i, holder) {
+    if let Some((target, handler)) = proxy_pair(holder) {
         ab(proxy_define_property(
             i,
             &target,
@@ -354,7 +354,7 @@ fn internalize_json_property(
                 }
             }
         } else {
-            let keys: Vec<String> = if proxy_pair(i, &val).is_some() {
+            let keys: Vec<String> = if proxy_pair(&val).is_some() {
                 proxy_enum_string_keys(i, &val)?
                     .iter()
                     .filter_map(|k| match &(k).view() {
@@ -680,7 +680,7 @@ fn json_serialize_object(
     // K: the replacer's PropertyList, or EnumerableOwnProperties(value, key).
     let keys: Vec<crate::atom::PropKey> = match &s.opts.keys {
         Some(list) => list.clone(),
-        None if proxy_pair(i, value).is_some() => proxy_enum_string_keys(i, value)?
+        None if proxy_pair(value).is_some() => proxy_enum_string_keys(i, value)?
             .iter()
             .filter_map(|key| match &(key).view() {
                 ValueView::Str(key) => Some(crate::atom::PropKey::from_text(
@@ -758,7 +758,7 @@ fn json_serialize_array(
     object: &Gc,
 ) -> Result<(), Value> {
     let stepback = json_enter(i, s, object)?;
-    let len = if proxy_pair(i, value).is_some() {
+    let len = if proxy_pair(value).is_some() {
         ab(i.to_length(object))?
     } else {
         i.array_length(object)

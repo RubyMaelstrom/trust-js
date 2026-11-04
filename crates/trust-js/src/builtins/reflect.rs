@@ -73,7 +73,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
         let key = ab(i.to_property_key(&arg(a, 1)))?;
         if let ValueView::Obj(o) = (arg(a, 0)).view() {
             ab(i.defer_trigger(&o, Some(&key)))?;
-            if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
+            if let Some((target, handler)) = proxy_pair(&Value::Obj(o)) {
                 return Ok(Value::Bool(ab(i.proxy_delete(target, handler, &key))?));
             }
             if matches!(o.borrow().kind, ObjectKind::Arguments(_)) {
@@ -123,7 +123,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
     it.def_method(&r, "getPrototypeOf", 1, |i, _t, a| {
         match (arg(a, 0)).view() {
             ValueView::Obj(o) => {
-                if proxy_pair(i, &Value::Obj(o)).is_some() {
+                if proxy_pair(&Value::Obj(o)).is_some() {
                     return js_get_prototype_of(i, &Value::Obj(o));
                 }
                 Ok(o.borrow().proto.map(Value::Obj).unwrap_or(Value::Null))
@@ -148,7 +148,7 @@ pub(super) fn install_reflect(it: &mut Interp) {
             _ => return Err(i.make_error("TypeError", "Reflect.defineProperty on non-object")),
         };
         let key = ab(i.to_property_key(&arg(a, 1)))?;
-        if let Some((target, handler)) = proxy_pair(i, &Value::Obj(o)) {
+        if let Some((target, handler)) = proxy_pair(&Value::Obj(o)) {
             return Ok(Value::Bool(ab(proxy_define_property(
                 i,
                 &target,
@@ -246,7 +246,7 @@ fn reflect_set(
     let target = Value::Obj(*object);
     // A proxy's [[Set]] returns the ToBoolean of its trap result; surface that as Reflect.set's
     // own boolean rather than always reporting success.
-    if let Some((ptarget, handler)) = proxy_pair(i, &target) {
+    if let Some((ptarget, handler)) = proxy_pair(&target) {
         if matches!((handler).view(), ValueView::Null) {
             return Err(i.make_error("TypeError", "proxy is revoked"));
         }

@@ -2010,11 +2010,16 @@ fn typed_array_copies_count_toward_buffer_pressure() {
 #[test]
 fn agent_owner_index_follows_the_first_and_last_child_interpreter() {
     let mut engine = Engine::new();
-    // Metadata a lone root interpreter created before any child existed.
-    without_checkpoint(&mut engine, "globalThis.p = new Proxy({}, {}); 0");
-    let proxy = crate::gc_test::in_frame(|| {
-        Gc::as_ptr(&global(&mut engine.interp, "p").as_obj().expect("proxy")) as usize
+    // Metadata a lone root interpreter created before any child existed: a Realm's.
+    without_checkpoint(&mut engine, "globalThis.r = $262.createRealm().global; 0");
+    let realm = crate::gc_test::in_frame(|| {
+        Gc::as_ptr(
+            &global(&mut engine.interp, "r")
+                .as_obj()
+                .expect("realm global"),
+        ) as usize
     });
+    let root = engine.interp.realm_id;
     assert!(engine
         .interp
         .gc_heap
@@ -2035,8 +2040,9 @@ fn agent_owner_index_follows_the_first_and_last_child_interpreter() {
         engine
             .interp
             .with_shadow(&shadow, |child| {
-                assert!(
-                    child.proxy_at(proxy).is_some(),
+                assert_eq!(
+                    child.realm_owner(realm),
+                    Some(root),
                     "round {round}: the child finds the root's earlier record"
                 );
             })
@@ -2061,7 +2067,7 @@ fn agent_owner_index_follows_the_first_and_last_child_interpreter() {
             "round {round}: a lone root keeps no owner index"
         );
     }
-    assert!(engine.interp.proxy_at(proxy).is_some());
+    assert_eq!(engine.interp.realm_owner(realm), Some(root));
 }
 
 #[test]

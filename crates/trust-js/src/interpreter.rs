@@ -4963,8 +4963,6 @@ pub struct Interp {
     /// table is pure duplicate work. The outer map is bounded in `compiled_regexp` so code that
     /// constructs unbounded dynamic patterns cannot retain them forever.
     pub(crate) regexp_programs: crate::cache::RegexpProgramCache,
-    /// Proxy `(target, handler)` pairs, keyed by the proxy object's pointer.
-    pub(crate) proxies: gc_collect::SideSlotTable<(Value, Value)>,
     /// Embedder-installed Web IDL indexed properties, keyed by the platform object's pointer.
     /// The object is pinned in `gc_pins`; `getter` is an internal GC edge owned by that object.
     pub(crate) host_indexed: gc_collect::SideSlotTable<HostIndexedProperties>,
@@ -4981,8 +4979,8 @@ pub struct Interp {
     /// belong to the caller's realm.
     pub(crate) ctor_caller_realm: Option<RealmState>,
     /// Additional realms created via `$262.createRealm()`, keyed by the realm's global-object pointer.
-    /// Each holds its own intrinsics; the shared side tables (proxies, buffers, …) and well-known
-    /// symbols are common, so objects cross realm boundaries freely.
+    /// Each holds its own intrinsics; the shared side tables (buffers, …) and well-known symbols
+    /// are common, so objects cross realm boundaries freely.
     pub(crate) realms: crate::fasthash::FastMap<usize, RealmState>,
     /// Promise state keyed by the promise object's pointer.
     pub(crate) promises: gc_collect::SideSlotTable<PromiseState>,
@@ -5252,7 +5250,6 @@ interp_memory_inventory! {
     data_views => "measured",
     regexps => "measured",
     regexp_programs => "measured",
-    proxies => "measured",
     host_indexed => "measured",
     new_target => "measured",
     pending_new_target => "measured",
@@ -5325,7 +5322,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 151);
+    assert_eq!(names.len(), 150);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -5554,7 +5551,6 @@ macro_rules! gc_side_slot_tables {
             class_info,
             module_ns,
             ta_buffer,
-            proxies,
             host_indexed,
             promises,
             promise_forward,
@@ -6984,7 +6980,6 @@ impl Interp {
             data_views: Default::default(),
             regexps: Default::default(),
             regexp_programs: crate::cache::RegexpProgramCache::new(16 << 20, 512),
-            proxies: Default::default(),
             host_indexed: Default::default(),
             new_target: (Value::Undefined),
             pending_new_target: Value::Undefined,
@@ -7600,7 +7595,7 @@ impl Interp {
                 if self.typed_arrays.contains_key(&ptr) {
                     return ElementReceiverKind::TypedArray;
                 }
-                if self.proxies.contains_key(&ptr)
+                if object.borrow().kind.is_proxy()
                     || self.module_ns.contains_key(&ptr)
                     || self.deferred_ns.contains_key(&ptr)
                     || self.data_views.contains_key(&ptr)
@@ -7649,12 +7644,9 @@ impl Interp {
         let ValueView::Obj(object) = (callee).view() else {
             return CallTargetKind::NonCallable;
         };
-        let ptr = Gc::as_ptr(&object) as usize;
-        if self.proxies.contains_key(&ptr) {
-            return CallTargetKind::Proxy;
-        }
         let body = object.borrow();
         match &body.kind {
+            ObjectKind::Proxy(_) => CallTargetKind::Proxy,
             ObjectKind::User(_) => CallTargetKind::UserFunction,
             native if native.is_native() => CallTargetKind::NativeFunction,
             ObjectKind::Bound(_) => CallTargetKind::BoundFunction,
@@ -7988,8 +7980,8 @@ impl Interp {
     /// Whether `v` has Proxy exotic behavior. Hosts need this for Node's
     /// `util.types.isProxy()`; exposing the predicate avoids leaking proxy targets or handlers.
     pub fn is_proxy_value(&self, v: &Value) -> bool {
-        self.object_addr(v)
-            .is_some_and(|ptr| self.proxies.contains_key(&ptr))
+        v.as_obj()
+            .is_some_and(|object| object.borrow().kind.is_proxy())
     }
 
     /// Run a full (major) collection and return the number of reclaimed heap objects.
@@ -11376,10 +11368,10 @@ impl Interp {
         true
     }
 
-    /// Whether object pointer `ptr` reads/writes like an ordinary object — i.e. it is not
-    /// registered in any of the exotic side tables (proxy, module namespace, typed array,
-    /// deferred namespace). Cheap: each empty table is skipped without hashing, which is the
-    /// common case in a hot loop.
+    /// Whether object pointer `ptr` reads/writes like an ordinary object — i.e. it is not a
+    /// proxy (its kind) and is not registered in any of the exotic side tables (module
+    /// namespace, typed array, deferred namespace). Cheap: each empty table is skipped without
+    /// hashing, which is the common case in a hot loop.
     #[inline]
     pub(crate) fn ordinary_get_ptr(&self, ptr: usize) -> bool {
         if Self::object_ic_plain(ptr) {
@@ -11394,11 +11386,12 @@ impl Interp {
         self.typed_array_at(ptr).is_none() && self.side_table_non_typed_ordinary_get_ptr(ptr)
     }
 
-    /// An object whose [[Get]]/[[Set]] behavior lives in an interpreter side table (Proxy,
-    /// typed array, module namespace, Web IDL indexed host object) always has its `ic_plain`
-    /// byte cleared at registration, and that byte is never set again. A set byte therefore
-    /// proves the object is in none of those tables with one load instead of several hash
-    /// probes. A clear byte (including an object currently borrowed mutably) is only a hint.
+    /// A Proxy, and an object whose [[Get]]/[[Set]] behavior lives in an interpreter side table
+    /// (typed array, module namespace, Web IDL indexed host object), always has its `ic_plain`
+    /// byte cleared at its creation or registration, and that byte is never set again. A set
+    /// byte therefore proves the object is neither, with one load instead of a kind test and
+    /// several hash probes. A clear byte (including an object currently borrowed mutably) is
+    /// only a hint.
     ///
     /// `ptr` must be the address of a live object (`Gc::as_ptr` of a held `Gc`).
     #[inline(always)]
@@ -11407,6 +11400,15 @@ impl Interp {
         // The shared reference ends before this returns, and a mutable borrow elsewhere makes
         // this conservatively report "not proven plain".
         matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if object.ic_plain())
+    }
+
+    /// Whether the object at `ptr` may be a Proxy: its kind's tag, or conservatively yes while
+    /// a mutable borrow elsewhere hides it. `ptr` must be the address of a live object.
+    #[inline(always)]
+    fn object_may_be_proxy(ptr: usize) -> bool {
+        let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
+        // As in `object_ic_plain`, the shared reference ends before this returns.
+        !matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if !object.kind.is_proxy())
     }
 
     #[inline]
@@ -11423,7 +11425,7 @@ impl Interp {
         if !self.single_interpreter() {
             return self.agent_side_table_non_typed_ordinary_get_ptr(ptr);
         }
-        (self.proxies.is_empty() || !self.proxies.contains_key(&ptr))
+        !Self::object_may_be_proxy(ptr)
             && (self.module_ns.is_empty() || !self.module_ns.contains_key(&ptr))
             && (self.deferred_ns.is_empty() || !self.deferred_ns.contains_key(&ptr))
             && (self.host_indexed.is_empty() || !self.host_indexed.contains_key(&ptr))
@@ -11432,7 +11434,7 @@ impl Interp {
     /// The same probe when another interpreter may own the side-table entry.
     #[inline(never)]
     fn agent_side_table_non_typed_ordinary_get_ptr(&self, ptr: usize) -> bool {
-        self.proxy_at(ptr).is_none()
+        !Self::object_may_be_proxy(ptr)
             && !self.is_namespace(ptr)
             && !self.is_deferred_namespace(ptr)
             && self
@@ -11495,26 +11497,6 @@ impl Interp {
             .map(Some)
     }
 
-    /// [[Get]](P, Receiver): like [`Self::get_member_key`] but with an explicit `receiver` — the `this` a
-    /// getter is invoked with, the proxy `get` trap's Receiver argument, and what a forwarded
-    /// `[[Get]]` carries through a proxy target chain.
-    /// The deferred-namespace evaluation trigger: most operations with a string key (and all
-    /// key-less ones like [[OwnPropertyKeys]]) evaluate the module; symbol keys and the "then"
-    /// property never do. Accessing a namespace whose module is mid-evaluation is a TypeError.
-    /// The proxy record for `ptr`, skipping the table probe entirely when no proxies exist
-    /// (every prototype-chain hop asks).
-    #[inline(always)]
-    pub(crate) fn proxy_at(&self, ptr: usize) -> Option<(Value, Value)> {
-        if !self.proxies.is_empty() {
-            if let Some(proxy) = self.proxies.get(&ptr) {
-                return Some(*proxy);
-            }
-        }
-        let owner =
-            self.foreign_metadata_owner(ptr, |interp, key| interp.proxies.contains_key(&key))?;
-        self.with_realm_view(owner, |interp| interp.proxies.get(&ptr).cloned())
-    }
-
     /// The TypedArray state of `ptr`, skipping the table probe when no TypedArray exists: the
     /// [[Get]]/[[Set]] slow paths ask for every object.
     #[inline(always)]
@@ -11529,6 +11511,9 @@ impl Interp {
         self.with_realm_view(owner, |interp| interp.typed_arrays.get(&ptr).copied())
     }
 
+    /// The deferred-namespace evaluation trigger: most operations with a string key (and all
+    /// key-less ones like [[OwnPropertyKeys]]) evaluate the module; symbol keys and the "then"
+    /// property never do. Accessing a namespace whose module is mid-evaluation is a TypeError.
     #[inline(always)]
     pub(crate) fn defer_trigger(&mut self, o: &Gc, key: Option<&str>) -> Result<(), Abrupt> {
         if self.deferred_ns.is_empty() && self.single_interpreter() {
@@ -11551,6 +11536,9 @@ impl Interp {
         self.with_route(owner, |owner| owner.evaluate_deferred(&module_key))
     }
 
+    /// [[Get]](P, Receiver): like [`Self::get_member_key`] but with an explicit `receiver` — the `this` a
+    /// getter is invoked with, the proxy `get` trap's Receiver argument, and what a forwarded
+    /// `[[Get]]` carries through a proxy target chain.
     pub(crate) fn get_member_recv(
         &mut self,
         base: &Value,
@@ -11719,7 +11707,7 @@ impl Interp {
                 }
                 // Proxy: invoke the `get` trap, or forward to the target.
                 {
-                    if let Some((target, handler)) = self.proxy_at(ptr) {
+                    if let Some((target, handler)) = proxy_parts(&o) {
                         if let Some(trace) = trace.as_deref_mut() {
                             trace.record(
                                 crate::feedback::PropertyOutcome::Exotic,
@@ -11856,7 +11844,7 @@ impl Interp {
         if object.borrow().ic_plain() {
             return None;
         }
-        let (target, handler) = self.proxy_at(Gc::as_ptr(object) as usize)?;
+        let (target, handler) = proxy_parts(object)?;
         let key_value = if index >= 0.0 && index < crate::jstr::INDEX_STRINGS as f64 {
             // -0 is the index 0: ToString(-0) is "0".
             Value::Str(crate::jstr::index_lstr(index as u32))
@@ -11883,7 +11871,7 @@ impl Interp {
             self.defer_trigger(&obj, Some(key))?;
             // A proxy anywhere on the chain handles the read itself (with the original receiver).
             let ptr = Gc::as_ptr(&obj) as usize;
-            if let Some((target, handler)) = self.proxy_at(ptr) {
+            if let Some((target, handler)) = proxy_parts(&obj) {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
                         crate::feedback::PropertyOutcome::Exotic,
@@ -12374,7 +12362,7 @@ impl Interp {
                 let mut depth = 0_u8;
                 while let Some(o) = cur {
                     // A proxy on the chain (or any accessor) takes over with the original receiver.
-                    if self.proxies.contains_key(&(Gc::as_ptr(&o) as usize)) {
+                    if o.borrow().kind.is_proxy() {
                         if let Some(trace) = trace.as_deref_mut() {
                             trace.record(
                                 crate::feedback::PropertyOutcome::Exotic,
@@ -12488,7 +12476,7 @@ impl Interp {
         }
         // Proxy: invoke the `set` trap, or forward to the target.
         {
-            if let Some((target, handler)) = self.proxy_at(ptr) {
+            if let Some((target, handler)) = proxy_parts(&obj) {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
                         crate::feedback::PropertyOutcome::Exotic,
@@ -12555,7 +12543,7 @@ impl Interp {
             self.defer_trigger(&o, Some(key))?;
             // A proxy on the chain handles the write itself (with the original receiver).
             let optr = Gc::as_ptr(&o) as usize;
-            if let Some((target, handler)) = self.proxy_at(optr) {
+            if let Some((target, handler)) = proxy_parts(&o) {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
                         crate::feedback::PropertyOutcome::Exotic,
@@ -12769,8 +12757,11 @@ impl Interp {
                 }
                 // Proxy and arguments receivers require their [[DefineOwnProperty]]:
                 // observable traps and live parameter mappings must not be bypassed.
-                let arguments_receiver = matches!(r.borrow().kind, ObjectKind::Arguments(_));
-                if arguments_receiver || self.proxies.contains_key(&rptr) {
+                let exotic_receiver = matches!(
+                    r.borrow().kind,
+                    ObjectKind::Arguments(_) | ObjectKind::Proxy(_)
+                );
+                if exotic_receiver {
                     if let Some(trace) = trace.as_deref_mut() {
                         trace.record(
                             crate::feedback::PropertyOutcome::Exotic,
@@ -13448,7 +13439,6 @@ impl Interp {
             typed_arrays,
             data_views,
             regexps,
-            proxies,
             host_indexed,
             promises,
             temporal,
@@ -13609,7 +13599,6 @@ impl Interp {
         crate::gc_sweep::map(typed_arrays, dead);
         crate::gc_sweep::map(data_views, dead);
         crate::gc_sweep::map(regexps, dead);
-        proxies.evict_dead(dead);
         host_indexed.evict_dead(dead);
         promises.evict_dead(dead);
         crate::gc_sweep::map(temporal, dead);
@@ -14035,7 +14024,7 @@ impl Interp {
         // and proxy target links always lead toward an already-created object,
         // so this iterative traversal cannot form a target cycle.
         loop {
-            if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&cur) as usize) {
+            if let Some((target, handler)) = proxy_parts(&cur) {
                 if matches!((handler).view(), ValueView::Null) {
                     return Err(self.throw("TypeError", "proxy has been revoked"));
                 }
@@ -14084,20 +14073,18 @@ impl Interp {
         // With one Realm and one interpreter, every callee already runs in the active Realm.
         let foreign_possible = self.multi_realm() || !self.single_interpreter();
         if let Some(object) = callee.as_obj().filter(|_| foreign_possible) {
-            // Proxy and Bound abstract-operation ordering stays in the caller. Their eventual
-            // trap/target call goes through this same actual callable-Realm funnel.
-            if self.proxy_at(Gc::as_ptr(&object) as usize).is_none() {
-                if let Some((owner, realm)) = self.callable_home(&object) {
-                    if owner != self.realm_id {
-                        return self
-                            .with_route(owner, |target| target.call_inner(callee, this, args));
-                    }
-                    if realm != Gc::as_ptr(&self.global) as usize {
-                        let state = self.realms[&realm].snapshot_clone();
-                        return self.with_realm_snapshot(realm, state, |target| {
-                            target.call_dispatch(callee, this, args)
-                        });
-                    }
+            // Proxy and Bound abstract-operation ordering stays in the caller: neither has a
+            // [[Realm]] of its own (`callable_home`). Their eventual trap/target call goes through
+            // this same actual callable-Realm funnel.
+            if let Some((owner, realm)) = self.callable_home(&object) {
+                if owner != self.realm_id {
+                    return self.with_route(owner, |target| target.call_inner(callee, this, args));
+                }
+                if realm != Gc::as_ptr(&self.global) as usize {
+                    let state = self.realms[&realm].snapshot_clone();
+                    return self.with_realm_snapshot(realm, state, |target| {
+                        target.call_dispatch(callee, this, args)
+                    });
                 }
             }
         }
@@ -14224,23 +14211,26 @@ impl Interp {
         // A call is a safepoint that polls the interrupt bit, so loop-free recursion in the
         // interpreter and bytecode tiers stays abortable (HTML §8.1.4.5).
         self.interrupt_poll()?;
-        // Proxy with an `apply` trap (or forward to the target).
-        {
-            if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&obj) as usize) {
-                // ProxyCreate step 5 gives a proxy [[Call]] only when its target is callable,
-                // and Call step 2 throws before any trap is read (ECMA-262, local e28783d).
-                if !obj.borrow().kind.is_callable() {
-                    return Err(self.throw("TypeError", "value is not a function"));
-                }
-                if matches!((handler).view(), ValueView::Null) {
-                    return Err(self.throw("TypeError", "proxy is revoked"));
-                }
-                let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_APPLY, "apply")? else {
-                    return self.call(target, this, args);
-                };
-                let arr = self.make_array(args.to_vec());
-                return self.proxy_call_trap(PROXY_TRAP_APPLY, &trap, handler, [target, this, arr]);
+        // Proxy with an `apply` trap (or forward to the target): a test of the kind's tag.
+        let proxy = obj
+            .borrow()
+            .kind
+            .proxy()
+            .map(|proxy| (proxy.target, proxy.handler, proxy.callable));
+        if let Some((target, handler, callable)) = proxy {
+            // ProxyCreate step 5 gives a proxy [[Call]] only when its target is callable,
+            // and Call step 2 throws before any trap is read (ECMA-262, local e28783d).
+            if !callable {
+                return Err(self.throw("TypeError", "value is not a function"));
             }
+            if matches!((handler).view(), ValueView::Null) {
+                return Err(self.throw("TypeError", "proxy is revoked"));
+            }
+            let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_APPLY, "apply")? else {
+                return self.call(target, this, args);
+            };
+            let arr = self.make_array(args.to_vec());
+            return self.proxy_call_trap(PROXY_TRAP_APPLY, &trap, handler, [target, this, arr]);
         }
         // An indirect call to another realm's `eval` runs in that realm's global scope. (A direct
         // `eval(...)` of the current realm is intercepted earlier, in `eval_call`.) Only a
@@ -16314,9 +16304,9 @@ impl Interp {
         // path because the callee's intrinsics must be installed before its native body runs.
         let native = if cached_site.is_none() && self.native_call_in_current_realm(o) {
             let b = o.borrow();
-            // Proxy callability uses a native sentinel, not its target's body. Only the
-            // actual callee's internal methods matter; unrelated proxies must not disable
-            // ordinary native construction throughout the Agent.
+            // Only the actual callee's internal methods matter: a proxy has a kind of its own,
+            // never a native's, and `ic_plain` keeps a native with side-table behavior on the
+            // layered path.
             if b.ic_plain() && (b.is_constructor() || b.props.contains("prototype")) {
                 match &b.kind {
                     native if native.is_native() => Some(native.clone_callable()),
@@ -17941,35 +17931,32 @@ impl Interp {
         // With one Realm and one interpreter, every constructor already runs in the active Realm.
         let foreign_possible = self.multi_realm() || !self.single_interpreter();
         if let Some(object) = callee.as_obj().filter(|_| foreign_possible) {
-            if self.proxy_at(Gc::as_ptr(&object) as usize).is_none() {
-                if let Some((owner, realm)) = self.callable_home(&object) {
-                    if owner != self.realm_id {
-                        let caller = crate::rooting::Rooted::new(self.snapshot_realm());
-                        return self.with_route(owner, |target| {
-                            target.with_constructor_caller(
-                                Some(caller.snapshot_clone()),
-                                |target| {
-                                    if realm == Gc::as_ptr(&target.global) as usize {
-                                        target.construct_dispatch(callee, args, new_target)
-                                    } else {
-                                        let state = target.realms[&realm].snapshot_clone();
-                                        target.with_realm_snapshot(realm, state, |target| {
-                                            target.construct_dispatch(callee, args, new_target)
-                                        })
-                                    }
-                                },
-                            )
-                        });
-                    }
-                    if realm != Gc::as_ptr(&self.global) as usize {
-                        let caller = self.snapshot_realm();
-                        let state = self.realms[&realm].snapshot_clone();
-                        return self.with_realm_snapshot(realm, state, |target| {
-                            target.with_constructor_caller(Some(caller), |target| {
+            // A proxy or a bound function has no [[Realm]] of its own (`callable_home`): its
+            // [[Construct]] runs here and reaches its target's through this same funnel.
+            if let Some((owner, realm)) = self.callable_home(&object) {
+                if owner != self.realm_id {
+                    let caller = crate::rooting::Rooted::new(self.snapshot_realm());
+                    return self.with_route(owner, |target| {
+                        target.with_constructor_caller(Some(caller.snapshot_clone()), |target| {
+                            if realm == Gc::as_ptr(&target.global) as usize {
                                 target.construct_dispatch(callee, args, new_target)
-                            })
-                        });
-                    }
+                            } else {
+                                let state = target.realms[&realm].snapshot_clone();
+                                target.with_realm_snapshot(realm, state, |target| {
+                                    target.construct_dispatch(callee, args, new_target)
+                                })
+                            }
+                        })
+                    });
+                }
+                if realm != Gc::as_ptr(&self.global) as usize {
+                    let caller = self.snapshot_realm();
+                    let state = self.realms[&realm].snapshot_clone();
+                    return self.with_realm_snapshot(realm, state, |target| {
+                        target.with_constructor_caller(Some(caller), |target| {
+                            target.construct_dispatch(callee, args, new_target)
+                        })
+                    });
                 }
             }
         }
@@ -18017,7 +18004,7 @@ impl Interp {
         };
         // Proxy with a `construct` trap (or forward to the target).
         {
-            if let Some((target, handler)) = self.proxy_at(Gc::as_ptr(&obj) as usize) {
+            if let Some((target, handler)) = proxy_parts(&obj) {
                 if matches!((handler).view(), ValueView::Null) {
                     return Err(self.throw("TypeError", "proxy is revoked"));
                 }

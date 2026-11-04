@@ -26767,8 +26767,8 @@ unsafe fn jit_call_inner(
                 let nf = {
                     let object = o.borrow();
                     match &object.kind {
-                        // Callable proxies carry a Native sentinel. Never cache it as the
-                        // implementation of [[Call]] or bypass apply/revocation checks.
+                        // A callable proxy has a kind of its own, never a native's, so its
+                        // apply and revocation checks are never bypassed here.
                         crate::value::ObjectKind::Native(nf)
                             if object.ic_plain() && i.native_call_in_current_realm(o) =>
                         {

@@ -1167,6 +1167,11 @@ impl Visitor {
                     self.value(value);
                 }
             }
+            ObjectKind::Proxy(proxy) => {
+                internal_bytes += std::mem::size_of_val(&**proxy);
+                self.value(&proxy.target);
+                self.value(&proxy.handler);
+            }
             // The environment is its function's activation, which its own owners report.
             ObjectKind::Arguments(Some(map)) => internal_bytes += map.retained_bytes(),
             // Plain objects and the payload-free exotics hold nothing more; a callable's payload
@@ -1922,12 +1927,6 @@ fn scan_realm(
             .saturating_mul(size_of::<(usize, Gc)>())
             .saturating_add(
                 interp
-                    .proxies
-                    .len()
-                    .saturating_mul(size_of::<(usize, (Value, Value))>()),
-            )
-            .saturating_add(
-                interp
                     .host_indexed
                     .len()
                     .saturating_mul(
@@ -1965,10 +1964,6 @@ fn scan_realm(
                     .saturating_mul(size_of::<(String, Value)>()),
             ),
     );
-    for (target, handler) in interp.proxies.values() {
-        visitor.value(target);
-        visitor.value(handler);
-    }
     for properties in interp.host_indexed.values() {
         visitor.value(&properties.getter);
         if let Some(live) = &properties.live {
@@ -2004,7 +1999,6 @@ fn scan_realm(
         visitor.value(source);
     }
     if !interp.gc_pins.is_empty()
-        || !interp.proxies.is_empty()
         || !interp.host_indexed.is_empty()
         || !interp.template_cache.is_empty()
         || !interp.annexb_fn_sync.is_empty()
@@ -3727,11 +3721,6 @@ mod tests {
         let identity = Gc::as_ptr(&object) as usize;
 
         engine.interp.gc_pins.insert(identity, object);
-        engine.interp.proxies.insert(
-            &engine.interp.gc_heap,
-            identity,
-            (Value::Obj(object), Value::Obj(object)),
-        );
         engine.interp.host_indexed.insert(
             &engine.interp.gc_heap,
             identity,

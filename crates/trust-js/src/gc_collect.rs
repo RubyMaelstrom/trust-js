@@ -1779,7 +1779,6 @@ impl Interp {
             data_views: _,
             regexps: _,
             regexp_programs: _,
-            proxies: _,      // side slots
             host_indexed: _, // side slots
             new_target,
             pending_new_target,

@@ -88,7 +88,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             return Err(i.make_error("TypeError", "cannot set stack on %Error.prototype%"));
         }
         // [[GetOwnProperty]]("stack") (proxy-aware): does the receiver already have its own stack?
-        let has_own = if let Some((t, h)) = proxy_pair(i, &this) {
+        let has_own = if let Some((t, h)) = proxy_pair(&this) {
             !matches!(
                 (proxy_gopd_value(i, &t, &h, "stack")?).view(),
                 ValueView::Undefined
@@ -98,7 +98,7 @@ pub(super) fn install_errors(it: &mut Interp) {
         };
         if has_own {
             // Set(this, "stack", v) with Throw=true.
-            if let Some((t, h)) = proxy_pair(i, &this) {
+            if let Some((t, h)) = proxy_pair(&this) {
                 // Surface the proxy [[Set]] result: a falsy trap return throws under Throw=true.
                 let trap = ab(i.get_member_key(&h, "set"))?;
                 if trap.is_callable() {
@@ -121,7 +121,7 @@ pub(super) fn install_errors(it: &mut Interp) {
             set_data(&desc, "writable", Value::Bool(true));
             set_data(&desc, "enumerable", Value::Bool(true));
             set_data(&desc, "configurable", Value::Bool(true));
-            let ok = if let Some((t, h)) = proxy_pair(i, &this) {
+            let ok = if let Some((t, h)) = proxy_pair(&this) {
                 ab(proxy_define_property(i, &t, &h, "stack", &Value::Obj(desc)))?
             } else {
                 ab(define_own_property(i, &o, "stack", &Value::Obj(desc)))?
@@ -403,7 +403,7 @@ fn capture_stack_trace(i: &mut Interp, _this: Value, args: &[Value]) -> Result<V
     set_data(&desc, "enumerable", Value::Bool(false));
     set_data(&desc, "configurable", Value::Bool(true));
     let target_value = Value::Obj(target);
-    let defined = if let Some((t, h)) = proxy_pair(i, &target_value) {
+    let defined = if let Some((t, h)) = proxy_pair(&target_value) {
         ab(proxy_define_property(i, &t, &h, "stack", &Value::Obj(desc)))?
     } else {
         ab(define_own_property(i, &target, "stack", &Value::Obj(desc)))?

@@ -11388,7 +11388,7 @@ fn emit_update_elem_inline(
     // 3. x10 = the receiver's payload
     emit_exec_word_load(a, 10, 20, -16);
     emit_exec_payload(a, 10, 10);
-    // 4. ordinary or Array exotic, not in any side table (proxy, typed array, host object)
+    // 4. ordinary or Array exotic (no proxy), not in any side table (typed array, host object)
     a.add_imm(11, 10, obj_off);
     a.ldrb_imm(12, 11, ex);
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
@@ -12014,8 +12014,8 @@ fn emit_set_prop_inline(
             emit_exec_payload(a, 9, 10);
         }
     }
-    // 2. object base; exotic ordinary (None, or a Map/Set), and not a side-table exotic
-    //    (proxy/typed-array/namespace). Receiver-wide facts — validated once, shared by both
+    // 2. object base; exotic ordinary (None, or a Map/Set: no proxy), and not a side-table
+    //    exotic (typed array/namespace). Receiver-wide facts — validated once, shared by both
     //    ways.
     a.add_imm(11, 10, obj_off);
     a.ldrb_imm(9, 11, ex);
