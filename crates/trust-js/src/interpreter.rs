@@ -12064,13 +12064,31 @@ impl Interp {
         }
     }
 
-    /// Whether `v` is the [[IsHTMLDDA]] object.
+    /// Whether `v` is the [[IsHTMLDDA]] object. Such an object is a native function made not
+    /// ordinary (`ic_plain` clear: [`Self::make_html_dda`], [`Self::make_html_all_collection`]),
+    /// so an ordinary object, or one of another kind, is none without a probe of the table,
+    /// which `$262.IsHTMLDDA` keeps non-empty in every realm (W2g step 6; V8, SpiderMonkey and
+    /// JSC test a bit of the object's type).
     pub(crate) fn is_htmldda(&self, v: &Value) -> bool {
         match &(v).view() {
-            ValueView::Obj(o) => self
-                .htmldda
-                .get(&(Gc::as_ptr(o) as usize))
-                .is_some_and(|dda| dda.ptr_eq(&Gc::downgrade(o))),
+            ValueView::Obj(o) => {
+                if self.htmldda.is_empty() {
+                    return false;
+                }
+                if let Ok(object) = o.try_borrow() {
+                    if object.ic_plain()
+                        || !matches!(
+                            object.kind,
+                            ObjectKind::Native(_) | ObjectKind::NativeData(_)
+                        )
+                    {
+                        return false;
+                    }
+                }
+                self.htmldda
+                    .get(&(Gc::as_ptr(o) as usize))
+                    .is_some_and(|dda| dda.ptr_eq(&Gc::downgrade(o)))
+            }
             _ => false,
         }
     }
