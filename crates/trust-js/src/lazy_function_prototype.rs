@@ -47,7 +47,9 @@ impl LazyFunctionPrototype {
             state: RefCell::new(State::Parent(parent)),
             layout: template.shared_layout().cloned(),
             shape: template.shape(),
-            constructor: template.contains("constructor"),
+            // By the key's atom: every function's creation asks, and a lookup by text compares
+            // the key's text with each of the template's (W2e step 7).
+            constructor: template.contains_key(crate::atom::names::CONSTRUCTOR.key()),
         }
     }
 
