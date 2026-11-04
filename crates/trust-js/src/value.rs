@@ -9192,18 +9192,43 @@ impl Props {
         entries.layout = source.layout.clone();
         entries.shape = source.shape;
         entries.copy_record_parts_from(source);
-        entries.extend_fresh(
-            source.len(),
-            (0..source.len()).map(|i| source.slot(i).copied_for_another_map()),
-        );
+        let len = source.len();
+        match source.record.0 {
+            // A template outside any cell, every slot in its record (as a function's templates
+            // are), whose slots fit this map's cell: one pass from the record's words into the
+            // cell's, the count set once (W2e step 7).
+            Some(block) if source.cell == 0 && len <= entries.cell as usize => {
+                // SAFETY: the record's block holds its `len` initialized slot words after its
+                // header, and this map's cell has room for `cell` words after the object's.
+                unsafe {
+                    let from = block
+                        .as_ptr()
+                        .cast::<u8>()
+                        .add(RECORD_SLOTS_OFF)
+                        .cast::<PropWord>();
+                    let to = entries.cell_slots();
+                    for i in 0..len {
+                        to.add(i).write((*from.add(i)).copied_for_another_map());
+                    }
+                }
+                entries.len = len as u32;
+            }
+            _ => entries.extend_fresh(
+                len,
+                (0..len).map(|i| source.slot(i).copied_for_another_map()),
+            ),
+        }
         entries
             .flags
             .set(source.flags.get() & !OBJECT_FLAGS | entries.flags.get() & OBJECT_FLAGS);
         entries.proto_slot.set(source.proto_slot.get());
         entries.len_slot.set(source.len_slot.get());
-        self.elems = template.elems.clone();
-        // Moving a payload to a new receiver cannot inherit the old owner's proof.
-        self.elems.0.force_full();
+        // A template without elements (every function's) leaves the fresh map's static block.
+        if !template.elems.0.is_static_empty() || !self.elems.0.is_static_empty() {
+            self.elems = template.elems.clone();
+            // Moving a payload to a new receiver cannot inherit the old owner's proof.
+            self.elems.0.force_full();
+        }
     }
 
     /// Make this map, fresh and empty, the map of an array of `items` that then gained the named
