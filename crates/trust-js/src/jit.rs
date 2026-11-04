@@ -4013,6 +4013,12 @@ mod asm {
         /// functions. Prefix counts relocate branches and catch labels consistently (ECMA-262
         /// TryStatement Evaluation); the emitted imm19/imm26 encodings are unchanged.
         fn relax_branches(&mut self, exact_batches: usize) {
+            // Every branch of code shorter than TBZ's reach (8,192 instructions, the shortest a
+            // conditional has: a label binds at most at the code's end) reaches its target, so no
+            // patch needs the scan below.
+            if self.buf.len() < 1 << 13 {
+                return;
+            }
             if !self.patches.iter().any(|&(at, label, kind)| {
                 kind.conditional()
                     && !kind.fits(self.labels[label].expect("unbound jit label") as i64 - at as i64)
