@@ -7944,3 +7944,116 @@ targeted tests pass.
 
 With step 4b, W2d's steps are done: Decision 28 is carried out, its third question answered by the
 census (copy-on-write, then small first blocks for what fixed elements would have saved).
+
+### W2e: in-line allocation in generated code (census and design, 2026-11-04)
+
+W2e's general form, on main b00bb6dc. Its first use landed with W3 item 3's step 7 (a fresh
+frame's activation, in line in the prologue: jit_alloc.rs, jit_x64_alloc.rs,
+gc_core::InlineAllocSite).
+
+Census (target/p2/w2e: opstat/, micro/, opstat-table.md; main's code, fat LTO, CPUs 10-13, pacing
+off):
+- Allocation operations that reach a native-code helper over each run (TRUST_JS_JIT_OPSTAT=1; New
+  counts only the constructions the direct sequence declined):
+
+| workload | MakeObject | NewObject | MakeArray | MakeArrayLiteral | NewArray | MakeClosure | New |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | | | 24,444 | | 12,351 | 26,068 | 1,371 |
+| React | 11,026 | 8,746 | 21 | | | 4,480 | |
+| Djot | 60,443 | | 22,459 | | | 2,145 | 1,580 |
+| chai | 561,923 | | 1,683,054 | 66,040 | | 702,725 | 736,167 |
+| sustained | 639,484 | | 399,886 | | | 399,886 | |
+| Splay | 529,192 | | | 268,798 | | | 21 |
+| PdfJS | 23,212 | | 114,106 | 4,896 | | 325,350 | |
+| TypeScript | 85,467 | | 512,497 | | | 245,922 | 681,917 |
+| RayTrace | | | | | | 6 | 332,643 |
+| Box2D | | | | | | | 110,387 |
+| EarleyBoyer | | | 432 | | | 20,182 | 9,744 |
+
+  The other Octane benchmarks make fewer than 22,000 of any kind.
+- Instructions per operation, the loop excluded (2M iterations in a function, fat LTO): `{}` 309,
+  `{x: i, y: i}` 348, five keys 385, `[]` 357, `[i, i]` 533, `[1, 2, 3]` (shared) 346, a function
+  expression 1,061, an arrow 762; with a call each, `new P(x, y)` (two stores) 683, returning
+  `arguments` 1,761, a rest array 785, against a plain call's 231.
+- Where a closure's 1,061 go (instructions sampled): make_function_named 255, active_runtime_origin
+  175 (a walk of the frames for the script origin), the copy of the function's template map 120,
+  the cell's allocation through the active-heap lookup 120, key lookups by text about 100,
+  ObjectKind::user 65, Function::runtime 46. An array's creation spends about 140 in
+  array_length_layout and array_length_shape (step 4's profile), each a lookup through the active
+  heap.
+- From the counts and costs, in-line allocation reaches about 15% of Splay's instructions (its
+  payload objects and shared arrays), about 4% of PdfJS's (closures), 3% of React's and Djot's,
+  2% of chai's and 1.7% of Vue's.
+
+What the exemplars do (target/p2/w2e/exemplars.txt; V8 c8b70908, SpiderMonkey 6bb81100, JSC
+26027804, re-diffed against each engine's main of 2026-11-03/04):
+- A1: the fast path is a bump against a limit (JSC: a free-list pop), with no byte budget charged
+  and no collector state tested (V8 memory-optimization-reducer.h:380-393; SM
+  jit/MacroAssembler.cpp:653-680; JSC jit/AssemblyHelpers.cpp:975-996).
+- A2: bytes are counted and the trigger evaluated when the allocation area is refilled, never per
+  object (V8 main-allocator.cc:288-293; SM gc/Allocator.cpp:483-504; JSC
+  heap/LocalAllocator.cpp:130-150).
+- A3: no poll follows an allocation. The miss is a call that evaluates the trigger before handing
+  out the cell, and collects there (V8 heap-allocator.cc:556-580, SM gc/Allocator.cpp:76-118); a
+  pending request makes the fast path fail (V8 lowers the area's limit, main-allocator.cc:372-382;
+  SM moves the nursery position to the chunk end, gc/Nursery.cpp:2013-2020). TRust's step 7 polls
+  after allocating, which none of them does.
+- A4: the fast path writes nothing before its last check; the slow path makes the whole object in
+  a call and rejoins after the operation.
+- A5: the initializing stores carry no barrier (the cell is young, or unmarked in JSC).
+- A6: the header comes from the hidden class, and every word the collector reads is written
+  before the next point a collection can run; only V8 copies values from a template (its
+  boilerplate).
+- A7: the fast path needs state an earlier execution made (V8's boilerplate from a literal's third
+  execution, SM's stub from the first, JSC's profile).
+- Where each case allocates: V8's Sparkplug calls builtins for all of them; SM's Baseline
+  allocates only its prologue's CallObject in its own code, the rest in CacheIR stubs or the VM;
+  JSC's baseline allocates `{...}`, `{}` and `this` in line and calls C++ for the rest. The `this`
+  of `new F()` is made on the caller's side in V8 (FastNewObject) and SM (the call IC stub, from
+  MetaCreateThis data), on the callee's side in JSC (op_create_this). Closures: V8's
+  FastNewClosure builtin, SM's Lambda stub that copies the canonical function's words, JSC's C++
+  call.
+
+Design. TRust has one native tier and no stubs per site, so its code allocates in line where the
+exemplars' stubs and builtins do, and its helpers stay the slow path:
+1. No poll after an in-line allocation, and the fast path fails while a collection is due (A3).
+   Generated code compares its charge with a word of its own, `inline_check_bytes`: the Rust
+   paths' due_check_bytes, but zero whenever a collection is due (Heap::refresh_due), so every
+   in-line allocation then takes its helper, whose end poll collects. The activation's poll after
+   its allocation goes; the entry poll before it stays. The charge stays exact per cell for now
+   (step 6 takes A2's refill charge).
+2. Objects' live count in line: object cells are counted for the embedder's live ceiling
+   (Heap::count_live), so an object's fast path adds one to the count and compares it with
+   live_check, going to the helper with nothing changed when it would pass.
+3. Object literals (MakeObject with a template): a per-site InlineObject made at compile time when
+   the site's template exists (A7) and its keys fit the cell: the size class, the header's fields
+   (the values a helper-made object's map would hold, read from a map the template initializes
+   in Rust, each stored at its field's offset and width, so no padding is read or written), the
+   prototype from the realm's %Object.prototype% at run time, and the slots from the operand
+   stack (V8's boilerplate copy, with the values). The helper remains for a site without a
+   template, keys past the cell, and every miss.
+4. `{}` (NewObject), `[]` (MakeArray(0)) and constant literals (MakeArrayLiteral): the same, with
+   no slots, `length` 0, or `length` and the shared block.
+5. Array literals with elements (MakeArray(n), n at most a cell's fifteen): the cell and an exact
+   element block (the storage cursor's), the words copied from the stack, and the kind bits
+   folded in line.
+6. The `this` of `new F()`: on the caller's side, in the direct construct sequence, from the
+   constructor's decided class (W2d step 3e) and its prototype through the site's cached shape and
+   slot (jit_construct_this's proof), once its learning is over; the helper otherwise.
+7. Closures: their helper's Rust path first (its frame walk for the origin, the runtime lease, the
+   key lookups by text), measured; in line after, if the template copy and kind payload allow.
+8. Refill charging (A2): the cursor's free word charged when it is taken, and refunded at a flush,
+   measured on its own, since it moves every allocation's accounting.
+Each step is ARM64 first; x86-64 follows where its backend already has the templates the step
+needs (it has the allocation itself and the activation).
+
+Exit (proposed): instructions per operation `{}`, `[]` and `[1, 2, 3]` at most 100, `{x, y}` and
+`new P(x, y)`'s allocation at most 120 more than the loop; Splay -8% or better; no fixture or
+Octane benchmark slower beyond noise; collections as before (counts, kinds), GC stress over the
+new tests, TRUST_JS_GC_VERIFY.
+
+Risks: an in-line object that misses a field the collector or a Rust reader expects (debug builds
+compare, at each site's compilation, the fields an in-line object gets with a helper-made object's,
+and a test reads every field of in-line objects back through the Rust accessors); the live count and byte charge as the helpers keep them (unit tests
+of the counts after in-line allocations); a template whose header depends on the realm or heap
+(only the prototype word is patched, and a template is per chunk, whose heap is fixed).
