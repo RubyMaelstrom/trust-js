@@ -9736,11 +9736,12 @@ impl Props {
     }
 
     /// Bump the creation-IC epoch if this object is a marked prototype (called by every
-    /// structural mutation).
+    /// structural mutation), and fire the dependency registry's sets on it (W4 step 10).
     #[inline]
     fn note_structural(&self) {
         if self.proto_flag() {
             bump_proto_epoch();
+            crate::dependency::note_prototype_changed(self as *const Self as usize);
         }
     }
 

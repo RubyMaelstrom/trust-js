@@ -9739,6 +9739,41 @@ impl Interp {
         self.array_prototypes_unshadowed()
     }
 
+    /// The dependency registry's set on the Array elements protector (W4 step 10; feedback-
+    /// schema.txt section 5.7): [`Self::array_prototypes_unshadowed`]'s fact, which the set guards
+    /// conservatively, firing at any structural change of Array.prototype or Object.prototype.
+    /// A fresh set each call; one already invalidated where the fact does not hold. (Its consumer
+    /// is the speculative tier; until then, the tests.)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn array_protector_set(&self) -> std::sync::Arc<crate::dependency::WatchpointSet> {
+        let set = crate::dependency::WatchpointSet::new(crate::dependency::ARRAY_PROTECTOR);
+        if !self.array_prototypes_unshadowed() {
+            set.fire();
+            return set;
+        }
+        for prototype in [&self.array_proto, &self.object_proto] {
+            let object = prototype.borrow();
+            object.props.mark_proto();
+            crate::dependency::watch_prototype(
+                &object.props as *const crate::value::Props as usize,
+                &set,
+            );
+        }
+        set
+    }
+
+    /// The dependency registry's set on `prototype`'s shape (W4 step 10): it fires at the
+    /// prototype's next structural change, which marking it a prototype makes report.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn prototype_shape_set(
+        &self,
+        prototype: &Gc,
+    ) -> std::sync::Arc<crate::dependency::WatchpointSet> {
+        let object = prototype.borrow();
+        object.props.mark_proto();
+        crate::dependency::prototype_shape_set(&object.props as *const crate::value::Props as usize)
+    }
+
     /// Realm-wide half of [`Self::array_append_unshadowed`]. Callers that already hold and have
     /// validated an array receiver can use this without releasing and re-borrowing it merely to
     /// repeat the prototype identity check.

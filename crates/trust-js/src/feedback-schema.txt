@@ -281,4 +281,20 @@ stores (whose states are store sites' ways) test no attribute byte any more
 where it has). The read API reports it (NamedView::writable): a store's or an update's site's
 Data ways are writable data properties. x86-64 keeps its shared live checks.
 
-5.7 Later steps: the dependency registry (step 10).
+5.7 The dependency registry (step 10; dependency.rs), JSC's watchpoint sets: a set guards one
+fact compiled code may assume, clear (it holds and nothing relies on it), watched (some code
+relies on it) or invalidated (it broke, for good). A compilation gathers the sets it relies on
+(DesiredWatchpoints) and installs its code (CodeDependencies) in all of them at its end, failing,
+with the fact's name, if one has fired meanwhile. Firing invalidates every code installed in the
+set and unlinks the call caches that could enter it (CALL_IC_EPOCH's bump). The first producers:
+- a prototype's shape (Interp::prototype_shape_set): one set a prototype, shared until it fires,
+  at the prototype's next structural change (Props::note_structural, which marking it a
+  prototype makes report);
+- the Array elements protector (Interp::array_protector_set): Interp::array_prototypes_
+  unshadowed's fact, guarded conservatively: the set fires at any structural change of
+  Array.prototype or Object.prototype, an indexed property's appearance among them, and is
+  invalidated from the start where the fact does not hold.
+The registry costs one load at a marked prototype's structural change while no set is
+registered, and nothing elsewhere. Its first consumer is the speculative tier (Phase 3); the
+tests (dependency_tests.rs) consume it meanwhile. PROTO_EPOCH and CALL_IC_EPOCH stay the
+baseline caches' invalidation.

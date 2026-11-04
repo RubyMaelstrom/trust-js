@@ -132,6 +132,10 @@ fn scrubbed<R>(f: impl FnOnce() -> R) -> R {
     result
 }
 mod deopt;
+/// The dependency registry (W4 step 10): watchpoint sets on the facts compiled code assumes.
+mod dependency;
+#[cfg(test)]
+mod dependency_tests;
 /// The feedback census (W4 step 2): a diagnostic compiled only with `architecture-diagnostics`.
 #[cfg(feature = "architecture-diagnostics")]
 mod feedback_census;
