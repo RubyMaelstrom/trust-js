@@ -275,14 +275,18 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-/// Count an in-line `this` for tests (x10 and x11 are scratch here).
+/// Count an in-line `this` for tests, keeping x0: a call that counts in the running thread's
+/// counter, since the sequence is a process-wide shared stub, which builds in no thread's
+/// address (see `gc_core::InlineAllocSite`).
 #[cfg(test)]
 fn record_inline_construct(a: &mut asm::Asm) {
-    let address = INLINE_CONSTRUCTS.with(|count| count.as_ptr() as usize);
-    a.mov_imm64(10, address as u64);
-    a.ldr_imm(11, 10, 0);
-    a.add_imm(11, 11, 1);
-    a.str_imm(11, 10, 0);
+    extern "C" fn count() {
+        INLINE_CONSTRUCTS.with(|count| count.set(count.get() + 1));
+    }
+    a.stp_pre(0, 30, -16);
+    a.mov_imm64(16, count as *const () as u64);
+    a.blr(16);
+    a.ldp_post(0, 30, 16);
 }
 
 /// Make the activation in line and install it as the frame's environment (what
