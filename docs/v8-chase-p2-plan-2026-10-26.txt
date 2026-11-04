@@ -11827,3 +11827,10 @@ collection: with collections suppressed they are +0.01%, +0.00% and +0.00% (Code
 Checks at 71739c46:
 - lib: ARM64 2,767 passed, 9 ignored; x86-64 (zombie) 2,548 passed, 9 ignored; clippy -D warnings
   in the three configurations on both (ARM64 on the worktree at the commit).
+
+Addendum to W2g step 7's record (2026-11-04): the two lib tests still running under GC stress when
+the step landed passed at 634ca6c7, so all 568 of names-step7.txt pass at TRUST_JS_GC_STRESS=1000
+with TRUST_JS_GC_VERIFY=1: tests::long_expression_chains_run in 3,272 s (its window 3,600 s) and
+tests::releasing_long_object_chains_uses_bounded_native_stack in 1,035 s
+(tests::execution_stack_resource_exhaustion_unwinds_and_recovers 761 s; 772-849 s at step 1).
+long_expression_chains_run joins the known-slow tests of future stress lists.
