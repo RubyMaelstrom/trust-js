@@ -10036,3 +10036,43 @@ alone three of three and in eight parallel runs on this build and on main's) and
 2,543); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575
 of 53,575 and identical to main's report; the fixtures' masked output as main's; difftest 138
 agree, 12 skipped (budget).
+
+### Branch relaxation's scan skipped for short code (record, 2026-11-04)
+
+A phase-exit item (compile cost: "The phase exit's gap, measured"). Asm::relax_branches scanned
+every patch for an out-of-range conditional on each compilation, most of
+Asm::finish_with_offsets's work (2-3% of the short workloads' instructions). Code shorter than
+TBZ's reach (8,192 instructions, the shortest conditional's; a label binds at most at the code's
+end) has no such branch, and skips the scan (3c09e454, rebased onto main as the commit before this
+record). Counts (fat LTO, CPUs 10-13, pacing off, median of 3; main f0810c79's engine):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,791,641,448 | 1,791,110,731 | -0.03% |
+| React | 315,988,441 | 315,871,361 | -0.04% |
+| Djot | 635,309,373 | 633,646,204 | -0.26% |
+| chai | 80,350,552,618 | 80,341,398,567 | -0.01% |
+| Richards | 136,545,965 | 136,258,711 | -0.21% |
+| DeltaBlue | 262,204,508 | 261,550,498 | -0.25% |
+| Crypto | 729,752,042 | 728,949,357 | -0.11% |
+| RayTrace | 994,926,038 | 994,416,093 | -0.05% |
+| EarleyBoyer | 3,185,091,782 | 3,184,265,798 | -0.03% |
+| RegExp | 2,775,173,174 | 2,775,280,967 | +0.00% |
+| Splay | 1,401,514,806 | 1,401,264,372 | -0.02% |
+| NavierStokes | 451,648,834 | 451,417,116 | -0.05% |
+| PdfJS | 7,706,081,807 | 7,706,938,732 | +0.01% |
+| Mandreel | 62,954,164,335 | 62,953,887,673 | -0.00% |
+| Gameboy | 21,514,948,664 | 21,510,600,693 | -0.02% |
+| CodeLoad | 482,544,986 | 482,236,683 | -0.06% |
+| Box2D | 4,478,407,190 | 4,476,559,677 | -0.04% |
+| zlib | 138,040,700,079 | 138,040,572,097 | -0.00% |
+| TypeScript | 58,768,852,739 | 58,762,579,272 | -0.01% |
+
+Djot -0.26%, DeltaBlue -0.25%, Richards -0.21%, Crypto -0.11%, the rest within 0.06%. The patch
+loop that remains is about 20 instructions a branch; labels as u32 words instead of
+Option<usize> would trim it further (about 0.5% of Djot by its profile), left for the compile-cost
+work the phase's gap names. Checks on 3c09e454: the lib suite with the embed feature on ARM64
+(2,762) and x86-64 (zombie, 2,543), the relaxation tests (the fuzzed checked_relaxation among
+them); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575 of
+53,575 and identical to main's report; the fixtures' masked output as main's; difftest 138 agree,
+12 skipped (budget).
