@@ -139,9 +139,11 @@ comment/example in the same change.
   its chunk drops or at exit). Run a program twice, once with `--tier=bytecode` (every
   compiled-code operation passes the VM's loop, so its counts are executions) and once with the
   production `--tier=jit`, and `python3 -I scripts/feedback-census.py <bytecode file> <jit file>`
-  prints, by operation kind, the executions and the share whose site has usable feedback:
-  coverage (crates/trust-js/src/feedback-schema.txt, section 4). A function's first calls in the
-  tree-walker have no pcs and are not counted.
+  prints, by operation kind, the executions, the share whose site has usable feedback (coverage)
+  and the share whose feedback names exactly what the operation saw (precision), reading the
+  always-on records the file's header names (`records=`; `--records values` reads the files as
+  if the build wrote only those) by crates/trust-js/src/feedback-schema.txt's sections 4 and 5. A
+  function's first calls in the tree-walker have no pcs and are not counted.
 - `TRUST_JS_GC_LOG=1` logs collections, each line with its phases' times in microseconds:
   `pause`, the whole collection, the time the program waited for it; `mark` and `sweep` as the
   engine drives them, `engine` for what the engine does around the heap's phases; for a major
