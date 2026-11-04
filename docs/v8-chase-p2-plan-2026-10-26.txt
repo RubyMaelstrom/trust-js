@@ -13433,3 +13433,179 @@ Step 1 includes, as its own commit, every native call from generated code rooted
 rather than the rooting registry (Vue's 386k native calls, chai's 10.9M): approved, with the
 argument that the JIT frame's operand window is scanned for the whole call and GC stress with
 TRUST_JS_GC_VERIFY over the native-call tests.
+
+### W6 step 2b: ephemerons and the side tables in the slices (record draft, 2026-11-05)
+
+Decisions (the coordinator's, approving the agent's recommendations, 2026-11-04):
+1. The ephemeron fixpoint: TRust's waiting map, discovered in the slices and merged at the final
+   pause. The marker resolves a conditional edge linearly: it waits on its first unmarked
+   condition (the key, or the owner) in the marker's waiting map and fires once that cell is
+   marked (gc_core.rs Heap::try_fire, wait_on, wake), so each edge waits at most twice and fires
+   at most once, in every ordering of map and key marking. That is SpiderMonkey's algorithm, "an
+   incremental linear-time algorithm that handles all orderings of map and key marking", a table
+   from a not-yet-marked key to its values consulted as keys are marked (gc/WeakMap.h:87-121;
+   gc/Zone.h:538-540; gc/Marking.cpp:838-873), and V8's fallback, ProcessEphemeronsLinear's
+   key-to-values map (src/heap/mark-compact.cc:2249-2285, 2326-2339). V8's ten rounds of
+   ProcessEphemeronsUntilFixpoint come first only to avoid allocating that map
+   (mark-compact.cc:2142-2198; src/flags/flag-definitions.h:2649-2651): a reason that does not
+   transfer, since TRust's map exists already.
+2. The cycle's weak list: the weak-cell lists, cleared after the final pause's marking, as now
+   (gc_handle.rs clear_dead_weak_cells_in). TRust's WeakRef targets and FinalizationRegistry
+   cells are weak cells in the heap's young and old lists, not fields of heap objects: those
+   lists are the list V8 builds while it marks. V8 discovers JSWeakRef and WeakCell targets in
+   its steps because they are weak fields, found only by visiting their objects
+   (src/heap/marking-visitor-inl.h:755-806), and processes them after marking
+   (src/heap/mark-compact.cc:4140-4164, 4240-4309).
+3. The side-slot tables (no counterpart in V8): their conditional edges are registered at the
+   cycle's start, every owner as a major collection's start registers them, and fire in the
+   slices as their owners are marked, through a client built for each slice (the interpreters'
+   tables change between slices). The final pause re-registers only the owners ClientRecords
+   recorded during the cycle (every write of a table records its owner), re-traces the Realm
+   groups activated in it (a RealmState can gain values), and reports the host graphs in full,
+   as V8 re-marks the embedder's roots at its final pause.
+
+Commit, from main bf606dda, on p2-w6 (an agent's; worktree target/p2/w6-impl-wt), landed on main
+as 7b2afa56 over 2c430516: the code is 4fc709f2's plus W4's series (88067f94), line for line, and
+that combined tree's ARM64 lib suite passed (2,812 passed, 9 ignored) before main moved:
+- 4fc709f2: with TRUST_JS_GC_INCREMENTAL, a marking cycle's side tables and ephemerons are
+  marked in its slices, and its final pause takes only what the program wrote during the cycle.
+  - The start registers the side tables' conditional edges as a major collection's start does:
+    every side-slot owner (the tables, the generators, the owner pins), every ShadowRealm, Realm
+    group member and host owner, every built-in's [[Realm]] edge and the host graphs' edges; the
+    weak collections come as side-slot owners instead of their entries (MarkClient::ephemerons
+    for the start, gc_collect::Purpose::CycleStart). The records are consumed after it, as before.
+  - The slices fire those edges as their owners and keys are marked, through a client built for
+    each slice over the tree's interpreters as they are then (gc_collect::SliceMarking): an
+    owner's side-slot tables, a ShadowRealm's home and interpreter roots, a Realm group once in
+    the cycle (its activation kept from slice to slice, GcState::cycle_realms, from the start's
+    client), and no host graph. Marking a weak collection discovers its entries (decision 1): the
+    client notes it as its side slots are traced, and the heap registers its entries as
+    ephemerons whenever its marking runs out of work and before a slice ends
+    (MarkClient::discovered_ephemerons, Heap::add_discovered_edges): a marked key's value is
+    marked at once, an unmarked key's entry waits on the key in the marker's waiting map, across
+    slices, to the final pause.
+  - The final pause (Purpose::FinalPause) reports the roots and the host graphs in full, as
+    before; of the tables, the owners and entries recorded during the cycle (ClientRecords: every
+    write of a table and of a weak collection records it) and the built-ins registered since;
+    every ShadowRealm again (its interpreter ran meanwhile; minors report them every time); and
+    the Realm groups as a minor collection does, a group whose global object the cycle marked by
+    that object alone, so each active group is traced again and the others wait on their
+    members. Edges registered at the start that have not fired wait in the marker and fire in the
+    final pause's drain, which is the slices' drain without a budget (discovery included).
+  - The weak-cell lists are as before (decision 2): cleared after the final pause's marking.
+  - Verification (design 11): with heap verification, the final pause ends with a closure check
+    of the side tables (MarkClient::check_closure; Marking::verify_closure): every side slot of a
+    marked owner, every entry of a marked weak collection under a marked key, every marked
+    built-in's [[Realm]], every Realm group with a marked member (and its template map) and every
+    marked ShadowRealm's interpreter roots name marked cells. The final pause reports only what
+    the records name, so this catches a write the records missed.
+  - No change to the barrier, the allocator, either JIT backend or a collection's marking in one
+    pause (mark_phase, drain, try_fire and add_source_edges are as in step 2).
+
+Where the build differs from the decisions:
+1. Decision 1's discovery (V8's behaviour) happens at SpiderMonkey's moment, through the
+   side-slot edges: a cycle's start registers each weak collection as a side-slot owner, the
+   client notes the collection when the heap asks for its side slots, which it does once the
+   collection is marked and the marker's ready edges come up (as every side-slot owner's: when
+   the worklist runs out), and the heap then registers the collection's entries as ephemerons.
+   SpiderMonkey's marker defers a traced weak map (one with an owner object) to a list
+   (js/src/gc/WeakMap-inl.h:337-360) whose entries it marks once the mark stack runs out
+   (js/src/gc/Marking.cpp:1479-1500, 1502-1512). V8 discovers a table's entries as its marker
+   visits the table (src/heap/marking-visitor-inl.h:696-753); in TRust that would be the object
+   model's trace of a WeakMap reporting its entries to the marker, a change to every marking's
+   trace and to the minor collections, which register recorded entries instead. Through the
+   edges, a collection's marking in one pause and the object model are unchanged. Accepted by the
+   coordinator as an implementation of the approved behaviour (2026-11-04).
+2. Every ShadowRealm is registered again at the final pause, beside the recorded owners, the
+   Realm groups and the host graphs the decision names: a ShadowRealm's interpreter roots, which
+   its object's side slots trace, change whenever the realm's code runs, without a record (minor
+   collections register every ShadowRealm for the same reason).
+3. A Realm group activated in the slices is activated once in the cycle (its activation kept from
+   slice to slice, GcState::cycle_realms, seeded by the start's client). A slice's client reads
+   the groups as the start found them; a Realm made during the cycle waits for the final pause,
+   whose client finds every group.
+4. The built-ins' [[Realm]] edges follow the tables: all at the start, at the final pause those
+   of the functions registered during the cycle (the records), as minor collections report them.
+
+Tests: gc_cycle_tests (every tier): a WeakMap's entries discovered in the slices (a value only
+the map holds is marked before the final pause), with entries written after the discovery under
+new keys and old ones surviving the final pause alone (an explicit minor request ends the cycle,
+so no later collection hides a miss); a promise reaction added during the cycle, after the slices
+traced the promise's reactions, surviving the final pause and running; a Realm group activated in
+a slice whose [[TemplateMap]] gains an entry during the cycle, kept by the final pause.
+table_record_tests: every side-slot table's write during a cycle, after the slices traced the
+owner's entry, kept by the final pause through that entry alone; the start's report (every owner,
+the collections but no entry) and the final pause's (the written owner and entry only); the
+closure check catching an unrecorded side-slot write and an unrecorded WeakMap write during a
+cycle (should_panic). gc_core: a cycle's slices firing the start's side-slot edges and registering
+discovered ephemerons, an entry under an unmarked key waiting to the final pause.
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; base step 2's engine, main
+018ca6d9 (built as 00d3c29e), the tip 4fc709f2; incremental marking off):
+
+| workload | base | tip |
+| --- | --- | --- |
+| Vue | 1,716,218,716 | -0.00% |
+| React | 315,957,058 | +0.00% |
+| Djot | 627,817,647 | -0.01% |
+| chai | 79,059,455,443 | +0.03% |
+| Richards | 136,077,943 | -0.00% |
+| DeltaBlue | 260,368,574 | -0.00% |
+| Crypto | 728,435,714 | +0.00% |
+| RayTrace | 993,964,249 | +0.00% |
+| EarleyBoyer | 3,197,742,335 | +0.00% |
+| RegExp | 2,738,718,545 | +0.00% |
+| Splay | 1,401,392,621 | -0.00% |
+| NavierStokes | 451,422,800 | -0.00% |
+| PdfJS | 7,650,741,341 | +0.00% |
+| Mandreel | 62,936,585,095 | +0.00% |
+| Gameboy | 21,030,929,375 | +0.00% |
+| CodeLoad | 481,356,758 | -0.01% |
+| Box2D | 4,457,800,605 | -0.01% |
+| zlib | 138,039,339,673 | +0.00% |
+| TypeScript | 58,613,327,090 | -0.03% |
+
+The cycle off, a first build (849dbd18, the step without the walk's copy below) moved Vue +0.07%
+and PdfJS +0.20%. Vue's +0.07% stayed with collections suppressed, where it still has one
+collection (a major at its task boundary), and PdfJS's went to -0.00%: the collections' code. Their
+side phase had grown by a third (Vue's one collection: 281 to 379 us). With the slices' client
+(SliceMarking::trace_side_slots) as its second caller, LTO no longer inlined
+Interp::trace_owner_slots, the walk of the side-slot tables, into a collection's client
+(Marking::trace_side_slots: 7,056 bytes, then 3,484), which takes it for every marked owner. The
+slices' client has its own copy now (Interp::trace_owner_slots_in_slice, the same tables through
+gc_side_slot_tables!): at 4fc709f2 Vue is -0.01% (-0.01% with collections suppressed) and PdfJS
++0.00% (impl/countsel/gc-4fc709f2.txt). Outside the collector three functions change size, each
+the step's own or a byte's worth: Rc<GcState>::drop_slow (+184, the new field),
+scope_desc_for's closure and Interp::drop (-4 each).
+
+Pauses (TRUST_JS_GC_LOG=1, TRUST_JS_GC_INCREMENTAL=1, default pacing, one run per workload pinned
+to CPU 13 with 2 to 5 cores of other load; the largest pause of each kind in ms, step 2's
+(target/p2/w6/runs/w6s2g-on) and this step's (w6s2d-on); a slice's count beside it):
+
+| workload | start | other slices | final pause | its side phase |
+| --- | --- | --- | --- | --- |
+| sa | 2.73 / 2.76 | 39 (2.73) / 39 (2.76) | 2.24 / 2.07 | 0.12 / 0.00 |
+| chai | 2.36 / 2.90 | 7 (2.36) / 7 (2.90) | 4.74 / 4.01 | 0.62 / 0.01 |
+| EarleyBoyer | 0.51 / 0.83 | 44 (0.51) / 44 (0.83) | 1.33 / 1.33 | 0.13 / 0.01 |
+| Splay | 0.30 / 0.55 | 52 (0.30) / 67 (0.55) | 44.56 / 41.60 | 0.22 / 0.01 |
+| PdfJS | 1.11 / 1.34 | 10 (1.11) / 10 (1.34) | 1.13 / 0.95 | 0.14 / 0.01 |
+| Gameboy | 0.62 / 0.92 | 5 (1.30) / 5 (1.32) | 1.79 / 1.57 | 0.13 / 0.01 |
+| TypeScript | 2.01 / 2.19 | 3,110 (2.03) / 3,111 (2.19) | 69.22 / 69.15 | 0.15 / 0.01 |
+| SplayLatency | 1.00 / 1.28 | 187 (1.00) / 243 (1.28) | 84.24 / 80.15 | 0.13 / 0.01 |
+
+The final pauses' side phase falls to 0.01 ms or less, and with it chai's final pause by 0.7 ms
+and Gameboy's and PdfJS's by 0.2 ms. The starts grow by 0.0 to 0.5 ms: a start registers every
+side-slot owner and weak collection and traces the slots of the owners its roots marked already
+(the start is the largest slice in every workload but Gameboy). TypeScript's, Splay's and
+SplayLatency's final pauses are their card rescans' and the schedule's (steps 3 and 4).
+
+Checks at 4fc709f2 (849dbd18's earlier, before the walk's copy, the same):
+- lib (ARM64): 2,785 passed, 9 ignored; with TRUST_JS_GC_INCREMENTAL=force, 2,785 passed.
+- x86-64 (zombie, slot w2g-rest): lib 2,566 passed, 9 ignored; clippy -D warnings in the three
+  configurations clean, as on ARM64.
+- Test262 under GC stress (TRUST_JS_GC_STRESS=100, every 2nd stress collection major,
+  TRUST_JS_GC_INCREMENTAL=force, TRUST_JS_GC_VERIFY=1, the closure check at every final pause;
+  a dev runner at 4fc709f2): the subset of 13 directories, 2,603/2,603 in the default tier and
+  2,603/2,603 at TRUST_JS_TIER=jit with threshold 0 (s2c-*; 849dbd18's s2b-*, the same).
+- lib under GC stress (TRUST_JS_GC_STRESS=1000, TRUST_JS_GC_INCREMENTAL=force,
+  TRUST_JS_GC_VERIFY=1; impl/stress, W6's 663 selected tests, 2b's among them): running; its result follows as an addendum.
