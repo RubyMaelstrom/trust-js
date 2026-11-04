@@ -1964,6 +1964,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         // The view is the kind's payload word, read once the tag says TypedArray.
         native_typed_array: crate::native_typed_array::probe_layout(
             offset_of!(Object, kind) + std::mem::size_of::<usize>(),
+            sample,
         ),
         obj_props: offset_of!(Object, props),
         obj_flags: offset_of!(Object, props)
@@ -2204,9 +2205,10 @@ pub(crate) fn user_fn_ptr(user: &UserFn) -> *const UserCallable {
 pub enum ObjectKind {
     /// An ordinary object with nothing beyond its properties.
     Plain = 0,
-    /// A typed array's view (its buffer, offset and element kind), which generated element
-    /// accesses read. The object's behavior otherwise lives in the interpreter's side table, and
-    /// its clear `ic_plain` keeps the property caches off it.
+    /// A typed array's state in a cell of its own (W2g step 2): its buffer object, byte offset,
+    /// length and element type, and the native view generated element accesses read
+    /// (`native_typed_array::NativeTypedArray`). Its clear `ic_plain` keeps the property caches
+    /// off it: its integer-indexed elements are exotic.
     TypedArray(crate::gc_storage::PayloadBox<crate::native_typed_array::NativeTypedArray>) = 1,
     Native(NativeFn) = 2,
     /// A native function carrying captured state (see [`NativeClosure`]).
@@ -2252,6 +2254,13 @@ pub enum ObjectKind {
     /// values the collector registers as ephemerons. An ordinary kind: the property caches admit
     /// the object.
     WeakCollection(crate::gc_storage::PayloadBox<crate::weak_metadata::WeakCollection>) = 16,
+    /// W2g step 2: an ArrayBuffer's or SharedArrayBuffer's [[ArrayBufferData]] and its embedder
+    /// bookkeeping in a cell of its own (`native_typed_array::ArrayBufferData`). An ordinary
+    /// kind: the property caches admit the object.
+    ArrayBuffer(crate::gc_storage::PayloadBox<crate::native_typed_array::ArrayBufferData>) = 17,
+    /// W2g step 2: a DataView's [[ViewedArrayBuffer]], [[ByteOffset]] and [[ByteLength]] in a
+    /// cell of its own (`native_typed_array::DataViewData`). An ordinary kind.
+    DataView(crate::gc_storage::PayloadBox<crate::native_typed_array::DataViewData>) = 18,
     Array = KIND_ARRAY_TAG,
     /// The [[BooleanData]], [[NumberData]], [[StringData]], [[SymbolData]] and [[BigIntData]] of
     /// primitive wrapper objects.
@@ -2649,13 +2658,42 @@ impl ObjectKind {
         matches!(self, ObjectKind::Collection(_))
     }
 
-    /// A typed array's view, which generated element accesses read.
+    /// A typed array's state: its view, which generated element accesses read, and its
+    /// [`TaInfo`].
     #[inline]
     pub(crate) fn typed_array(
         &self,
     ) -> Option<&crate::gc_storage::PayloadBox<crate::native_typed_array::NativeTypedArray>> {
         match self {
             ObjectKind::TypedArray(view) => Some(view),
+            _ => None,
+        }
+    }
+
+    /// A typed array's [[ViewedArrayBuffer]], [[ByteOffset]], [[ArrayLength]] and
+    /// [[TypedArrayName]].
+    #[inline]
+    pub(crate) fn typed_array_info(&self) -> Option<TaInfo> {
+        match self {
+            ObjectKind::TypedArray(view) => Some(view.info),
+            _ => None,
+        }
+    }
+
+    /// An ArrayBuffer's or SharedArrayBuffer's state.
+    #[inline]
+    pub(crate) fn array_buffer(&self) -> Option<&crate::native_typed_array::ArrayBufferData> {
+        match self {
+            ObjectKind::ArrayBuffer(data) => Some(data),
+            _ => None,
+        }
+    }
+
+    /// A DataView's state.
+    #[inline]
+    pub(crate) fn data_view(&self) -> Option<crate::native_typed_array::DataViewData> {
+        match self {
+            ObjectKind::DataView(view) => Some(**view),
             _ => None,
         }
     }
@@ -3419,6 +3457,8 @@ pub(crate) struct PayloadDescs {
     wrapped_cross: crate::gc_core::DescId,
     accessor_key: crate::gc_core::DescId,
     typed_array: crate::gc_core::DescId,
+    array_buffer: crate::gc_core::DescId,
+    data_view: crate::gc_core::DescId,
     extras: crate::gc_core::DescId,
     closure_cache: crate::gc_core::DescId,
     name_index: crate::gc_core::DescId,
@@ -3452,6 +3492,8 @@ payload_kinds! {
     WrappedCrossCallable => wrapped_cross,
     Rc<Rc<str>> => accessor_key,
     crate::native_typed_array::NativeTypedArray => typed_array,
+    crate::native_typed_array::ArrayBufferData => array_buffer,
+    crate::native_typed_array::DataViewData => data_view,
     DenseExtras => extras,
     UserCallableCache => closure_cache,
     crate::interpreter::NameIndex => name_index,
@@ -3499,6 +3541,12 @@ impl PayloadDescs {
             typed_array: leaf(
                 payload_layout::<crate::native_typed_array::NativeTypedArray>("typed array view"),
             ),
+            array_buffer: leaf(
+                payload_layout::<crate::native_typed_array::ArrayBufferData>("array buffer data"),
+            ),
+            data_view: leaf(payload_layout::<crate::native_typed_array::DataViewData>(
+                "data view state",
+            )),
             extras: leaf(payload_layout::<DenseExtras>("property map extras")),
             closure_cache: leaf(payload_layout::<UserCallableCache>("closure cache")),
             name_index: leaf(payload_layout::<crate::interpreter::NameIndex>(
@@ -4282,8 +4330,16 @@ impl Object {
         // its value holds.
         use crate::gc_storage::{PayloadBox, SharedPayload};
         match kind {
-            // The view's payload cell; its buffer is byte storage.
-            ObjectKind::TypedArray(view) => PayloadBox::trace(view, sink),
+            // The view's payload cell and its buffer object; the buffer's bytes are byte storage.
+            ObjectKind::TypedArray(view) => {
+                PayloadBox::trace(view, sink);
+                sink.object(&view.info.buffer);
+            }
+            ObjectKind::ArrayBuffer(data) => PayloadBox::trace(data, sink),
+            ObjectKind::DataView(view) => {
+                PayloadBox::trace(view, sink);
+                sink.object(&view.buffer);
+            }
             ObjectKind::ArrayIterator(state) => {
                 PayloadBox::trace(state, sink);
                 sink.value(&state.target);
@@ -6023,18 +6079,19 @@ impl TaKind {
 }
 
 /// A TypedArray view's internal state (the engine's `[[ViewedArrayBuffer]]`/`[[ByteOffset]]`/
-/// `[[ArrayLength]]`/`[[TypedArrayName]]`). Stored in an `Interp` side table keyed by object ptr.
+/// `[[ArrayLength]]`/`[[TypedArrayName]]`), in its object's payload
+/// (`native_typed_array::NativeTypedArray`).
 #[derive(Clone, Copy)]
-pub struct TaInfo {
-    /// Pointer of the backing ArrayBuffer or SharedArrayBuffer object (key into
-    /// `Interp::array_buffers`).
-    pub buffer: usize,
-    pub offset: usize,
-    pub len: usize,
-    pub kind: TaKind,
+pub(crate) struct TaInfo {
+    /// The backing ArrayBuffer or SharedArrayBuffer object, whose payload holds the bytes
+    /// (`native_typed_array::ArrayBufferData`); the view's trace reports it.
+    pub(crate) buffer: Gc,
+    pub(crate) offset: usize,
+    pub(crate) len: usize,
+    pub(crate) kind: TaKind,
     /// Length-tracking view (created on a resizable buffer with no explicit length): its length is
     /// recomputed from the buffer's current size rather than fixed at `len`.
-    pub track: bool,
+    pub(crate) track: bool,
 }
 
 impl TaInfo {

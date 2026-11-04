@@ -14,11 +14,8 @@ pub(super) fn install_atomics(it: &mut Interp) {
         target_rw(i, args, false)
     }
     fn target_rw(i: &mut Interp, args: &[Value], write: bool) -> Result<(TaInfo, usize), Value> {
-        let ptr = map_ptr(&arg(args, 0))
-            .ok_or_else(|| i.make_error("TypeError", "Atomics: not an integer TypedArray"))?;
-        let info = *i
-            .typed_arrays
-            .get(&ptr)
+        let info = i
+            .typed_array_of_value(&arg(args, 0))
             .ok_or_else(|| i.make_error("TypeError", "Atomics: not an integer TypedArray"))?;
         if matches!(
             info.kind,
@@ -26,7 +23,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         ) {
             return Err(i.make_error("TypeError", "Atomics requires an integer TypedArray"));
         }
-        if write && i.immutable_buffers.contains(&info.buffer) {
+        if write && i.is_immutable_buffer(&info.buffer) {
             return Err(i.make_error(
                 "TypeError",
                 "Atomics: cannot write into a view over an immutable ArrayBuffer",
@@ -197,14 +194,12 @@ pub(super) fn install_atomics(it: &mut Interp) {
                 "Atomics.wait/notify requires an Int32Array or BigInt64Array",
             )
         };
-        let info = map_ptr(ta)
-            .and_then(|p| i.typed_arrays.get(&p).copied())
-            .ok_or_else(err)?;
+        let info = i.typed_array_of_value(ta).ok_or_else(err)?;
         if !matches!(info.kind, TaKind::I32 | TaKind::I64) {
             return Err(err());
         }
         // A detached buffer (regular buffer removed from the store) has no [[ArrayBufferData]].
-        if !i.buffer_attached(info.buffer) {
+        if !i.buffer_attached(&info.buffer) {
             return Err(i.make_error("TypeError", "Atomics.wait/notify: buffer is detached"));
         }
         Ok(info)
@@ -212,7 +207,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
     it.def_method(&atomics, "wait", 4, |i, _t, a| {
         let winfo = require_waitable(i, &arg(a, 0))?;
         // Atomics.wait needs a *shared* buffer — checked before ValidateAtomicAccess (index coercion).
-        let id = match i.shared_block_id(winfo.buffer) {
+        let id = match i.shared_block_id(&winfo.buffer) {
             Some(id) => id,
             None => {
                 return Err(i.make_error(
@@ -275,7 +270,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
             }
         };
         // notify is a no-op (returns 0) on a non-shared buffer.
-        match i.shared_block_id(info.buffer) {
+        match i.shared_block_id(&info.buffer) {
             Some(id) => {
                 let byte_index = info.offset + idx * info.kind.elsize();
                 let own = i.gc_heap.agent.work.borrow().inbox.clone();
@@ -293,7 +288,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
     it.def_method(&atomics, "waitAsync", 4, |i, _t, a| {
         // ValidateIntegerTypedArray(waitable) runs before any index/value coercion.
         let winfo = require_waitable(i, &arg(a, 0))?;
-        let id = match i.shared_block_id(winfo.buffer) {
+        let id = match i.shared_block_id(&winfo.buffer) {
             Some(id) => id,
             None => {
                 return Err(i.make_error(
@@ -320,7 +315,7 @@ pub(super) fn install_atomics(it: &mut Interp) {
         // A notify resolves the promise (this agent's at once, another agent's through this
         // agent's inbox), or this agent's job checkpoints time it out (settle_async_waits).
         let promise = i.new_promise();
-        let block = i.shared_block(info.buffer).unwrap().clone();
+        let block = i.shared_block(&info.buffer).unwrap();
         i.enqueue_async_wait(AsyncWait {
             promise,
             token,

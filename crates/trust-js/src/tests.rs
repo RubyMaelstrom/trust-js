@@ -2709,12 +2709,7 @@ fn discarded_array_buffer_data_triggers_collection() {
             ),
             "100663296"
         );
-        let retained: usize = engine
-            .interp
-            .array_buffers
-            .values()
-            .map(|data| data.byte_len().unwrap_or(0))
-            .sum();
+        let retained = engine.interp.gc_heap.agent.buffer_ledger.retained_bytes();
         assert!(
             retained <= 72 * 1024 * 1024,
             "{tier:?} retains {retained} bytes of discarded buffers"
@@ -19062,9 +19057,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     let mut engine = Engine::new();
     let before = [
         engine.interp.gc_pins.len(),
-        engine.interp.array_buffers.len(),
-        engine.interp.typed_arrays.len(),
-        engine.interp.data_views.len(),
         engine.interp.regexps.len(),
         engine.interp.promises.len(),
         engine.interp.shadow_realms.len(),
@@ -19092,9 +19084,6 @@ fn pointer_keyed_side_tables_release_dead_owners() {
     engine.interp.gc_collect();
     let after = [
         engine.interp.gc_pins.len(),
-        engine.interp.array_buffers.len(),
-        engine.interp.typed_arrays.len(),
-        engine.interp.data_views.len(),
         engine.interp.regexps.len(),
         engine.interp.promises.len(),
         engine.interp.shadow_realms.len(),
@@ -19343,13 +19332,12 @@ out.join(',')"#;
             "5,8,4,8,8,4,5,5,7,9,9,10,4,5,RangeError,RangeError,8,3,0|5|10,12,12,12,1048576",
             "tier {tier:?}"
         );
-        let local_bytes: usize = engine
-            .interp
-            .array_buffers
-            .values()
-            .filter_map(|data| match data {
-                crate::interpreter::BufferData::Local(bytes) => Some(bytes.borrow().capacity()),
-                crate::interpreter::BufferData::Shared(_) => None,
+        let local_bytes: usize = crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
+            .iter()
+            .filter_map(|object| {
+                let bytes = object.borrow().kind.array_buffer()?.local()?.clone();
+                let capacity = bytes.borrow().capacity();
+                Some(capacity)
             })
             .sum();
         assert!(local_bytes < 1 << 20, "tier {tier:?}: {local_bytes}");

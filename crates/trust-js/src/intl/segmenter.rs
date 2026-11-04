@@ -642,8 +642,8 @@ fn boundary_records(i: &mut Interp, slots: &SegmentsSlots) -> crate::interpreter
         .get(BOUNDARIES_SLOT)
         .map(|p| p.value());
     if let Some(ValueView::Obj(buffer)) = (cached).map(|__value| (__value).view()) {
-        if let Some(bytes) = i.local_buffer(Gc::as_ptr(&buffer) as usize) {
-            return bytes.clone();
+        if let Some(bytes) = i.local_buffer(&buffer) {
+            return bytes;
         }
     }
     let text = slots.string.text();

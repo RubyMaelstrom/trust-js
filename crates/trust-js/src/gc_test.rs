@@ -243,6 +243,18 @@ impl HiddenAddress {
         map.contains_key(&!self.0)
     }
 
+    /// Run `f` on the object at this address, which the caller knows is alive, in a frame of
+    /// its own.
+    #[inline(never)]
+    #[cfg_attr(not(feature = "embed"), allow(dead_code))]
+    pub(crate) fn with_object<R>(self, f: impl FnOnce(&crate::value::Gc) -> R) -> R {
+        // SAFETY: the caller's proof that the object at this address is alive.
+        let object = unsafe {
+            crate::value::Gc::from_raw(!self.0 as *const std::cell::RefCell<crate::value::Object>)
+        };
+        f(&object)
+    }
+
     /// The address itself, for a check in a helper frame (its callers are `embed` tests).
     #[inline(never)]
     #[cfg_attr(not(feature = "embed"), allow(dead_code))]

@@ -725,22 +725,17 @@ fn js_prevent_extensions(i: &mut Interp, obj: &Value) -> Result<bool, Value> {
         // TypedArray [[PreventExtensions]] refuses unless IsTypedArrayFixedLength: length-tracking
         // views, and any view over a resizable (non-shared) buffer, can change length.
         if let Some(info) = ta_info(i, o) {
-            let resizable = Gc::as_ptr(o) as usize;
-            let resizable = i
-                .ta_buffer
-                .get(&resizable)
-                .and_then(|b| b.as_obj())
-                .is_some_and(|b| {
-                    matches!(
-                        (b.borrow()
-                            .internal_slots()
-                            .get("#\u{0}abResizable")
-                            .map(|p| p.value()))
-                        .map(|__value| (__value).view()),
-                        Some(ValueView::Bool(true))
-                    )
-                });
-            let shared = i.is_shared_buffer(info.buffer);
+            let resizable = matches!(
+                (info
+                    .buffer
+                    .borrow()
+                    .internal_slots()
+                    .get("#\u{0}abResizable")
+                    .map(|p| p.value()))
+                .map(|__value| (__value).view()),
+                Some(ValueView::Bool(true))
+            );
+            let shared = i.is_shared_buffer(&info.buffer);
             if info.track || (resizable && !shared) {
                 return Ok(false);
             }
@@ -798,9 +793,8 @@ fn ta_length_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Val
 }
 
 fn ta_buffer_get(i: &mut Interp, this: Value, _a: &[Value]) -> Result<Value, Value> {
-    let _ = ta_receiver(i, &this)?;
-    let ptr = map_ptr(&this).unwrap();
-    Ok(i.ta_buffer.get(&ptr).cloned().unwrap_or(Value::Undefined))
+    let (info, _) = ta_receiver(i, &this)?;
+    Ok(Value::Obj(info.buffer))
 }
 
 /// If `v` is a Proxy, its (target, handler) pair (the handler null once revoked).
@@ -1315,12 +1309,8 @@ fn proxy_define_property_record(
 
 /// `(info, detached)` for a TypedArray receiver, or a TypeError (brand check for the meta getters).
 fn ta_receiver(i: &mut Interp, this: &Value) -> Result<(crate::value::TaInfo, bool), Value> {
-    let ptr = map_ptr(this).filter(|p| i.typed_arrays.contains_key(p));
-    match ptr {
-        Some(p) => {
-            let info = i.typed_arrays[&p];
-            Ok((info, !i.buffer_attached(info.buffer)))
-        }
+    match i.typed_array_of_value(this) {
+        Some(info) => Ok((info, !i.buffer_attached(&info.buffer))),
         None => Err(i.make_error(
             "TypeError",
             "TypedArray.prototype accessor called on a non-TypedArray",
@@ -1341,7 +1331,7 @@ fn arr_require_coercible(i: &mut Interp, this: &Value) -> Result<(), Value> {
 
 /// TypedArray info for `o`, if it is one.
 fn ta_info(i: &Interp, o: &Gc) -> Option<crate::value::TaInfo> {
-    i.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied()
+    i.typed_array_of(o)
 }
 
 /// ToObject for an `Object.*` argument: an object is returned as-is, a primitive is boxed to its
@@ -1750,7 +1740,7 @@ pub(crate) fn reflect_ordinary_set(
         // coerces unconditionally and writes only in-range; with a foreign receiver, a valid
         // index acts as a writable data property (created on the receiver) and a canonical
         // non-index is an inert success.
-        if let Some(info) = map_ptr(&current).and_then(|p| i.typed_arrays.get(&p).copied()) {
+        if let Some(info) = i.typed_array_of_value(&current) {
             if i.canonical_numeric_index(key).is_some() {
                 let same = matches!((&(current).view(), &(receiver).view()), (ValueView::Obj(a), ValueView::Obj(b)) if Gc::ptr_eq(a, b));
                 if same {
@@ -1939,7 +1929,7 @@ pub(crate) fn reflect_ordinary_get(
         }
         // A TypedArray's integer-indexed elements are own properties; a canonical-numeric
         // non-index short-circuits to undefined without consulting the prototype chain.
-        if let Some(info) = i.typed_arrays.get(&ptr).copied() {
+        if let Some(info) = i.typed_array_of(&obj) {
             match i.ta_index_kind(&info, key) {
                 TaIndex::Element(idx) => return Ok(i.ta_read(&info, idx)),
                 TaIndex::Exotic => return Ok(Value::Undefined),
@@ -2150,8 +2140,8 @@ fn uri_decode(s: &str, preserve: &str) -> Option<String> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// ArrayBuffer + TypedArrays. Data Blocks live in `Interp::array_buffers`; each view's state in
-// `Interp::typed_arrays`. Integer-index get/set is wired in `get_member`/`set_member`; the named
+// ArrayBuffer + TypedArrays. Data Blocks live in their buffers' payloads; each view's state in its
+// own (`native_typed_array`). Integer-index get/set is wired in `get_member`/`set_member`; the named
 // metadata (length/byteLength/byteOffset/buffer/BYTES_PER_ELEMENT) is stored as real own props.
 // ---------------------------------------------------------------------------------------------
 
@@ -7642,7 +7632,7 @@ fn array_get_present_index(
         // IsValidIntegerIndex, snapshot e28783d5fc9d). Valid numeric elements cannot contain
         // undefined; ordinary own properties containing undefined must still be visited.
         if matches!((value).view(), ValueView::Undefined)
-            && i.typed_arrays.contains_key(&(Gc::as_ptr(object) as usize))
+            && object.borrow().kind.typed_array().is_some()
         {
             return Ok(None);
         }
@@ -10839,7 +10829,7 @@ fn array_iter_step(i: &mut Interp, this: Value) -> Result<Option<Value>, Value> 
     }
     // A TypedArray target re-derives its length each step; an out-of-bounds (detached/shrunk-past)
     // view throws TypeError.
-    let typed_info = map_ptr(&target).and_then(|p| i.typed_arrays.get(&p).copied());
+    let typed_info = i.typed_array_of_value(&target);
     let len = if let Some(info) = typed_info {
         match i.ta_len(&info) {
             Some(l) => l,

@@ -243,8 +243,8 @@ struct TableWrite {
     remove: fn(&mut Interp, usize),
 }
 
-/// A write to each of the 9 side-slot tables (`gc_side_slot_tables!` and the generators).
-fn table_writes() -> [TableWrite; 9] {
+/// A write to each of the 8 side-slot tables (`gc_side_slot_tables!` and the generators).
+fn table_writes() -> [TableWrite; 8] {
     use crate::interpreter::{ClassInfo, FinalizationState, HostIndexedProperties, JobCallback};
     [
         TableWrite {
@@ -279,16 +279,6 @@ fn table_writes() -> [TableWrite; 9] {
             },
             remove: |i, owner| {
                 i.module_ns.remove(&owner);
-            },
-        },
-        TableWrite {
-            table: "ta_buffer",
-            holds: (true, false),
-            write: |i, owner, young, _| {
-                i.ta_buffer.insert(&i.gc_heap, owner, Value::Obj(young));
-            },
-            remove: |i, owner| {
-                i.ta_buffer.remove(&owner);
             },
         },
         TableWrite {
@@ -398,7 +388,7 @@ fn write_young(interp: &mut Interp, write: &TableWrite, owner: HiddenAddress) ->
     watched
 }
 
-/// Each of the 9 side-slot tables, written from Rust: an old owner's entry gets a young object
+/// Each of the 8 side-slot tables, written from Rust: an old owner's entry gets a young object
 /// (and a young environment), which then survives a minor collection through that entry alone;
 /// the minor collection reports the written owner, and not an old owner beside it whose old
 /// entry in the same table was not written.

@@ -1410,7 +1410,7 @@ impl Interp {
         self.gc_heap.agent.task_pending.set(false);
         // ArrayBuffer data counts from the last major collection: a minor one leaves the old
         // buffers that died, and their data, for a major collection to free. The sweep has
-        // evicted the dead buffers' data from the tables.
+        // finalized the dead buffers' payloads, which left the Agent's buffer ledger.
         if kind == CollectionKind::Major {
             self.reset_buffer_pressure();
         }
@@ -1691,22 +1691,13 @@ impl Interp {
             module_ns: _,        // side slots
             weak_collections: _, // the collections, whose payloads' entries are ephemerons
             extra_protos,
-            array_buffers: _,
-            native_buffers: _,
-            array_buffer_versions: _,
-            array_buffer_dirty_ranges: _,
-            immutable_buffers: _,
-            host_keyed_buffers: _,
             can_block: _,
             agent: _,
-            typed_arrays: _,
             async_gens: _,
             global_var_names: _,
             gc_pins: _,       // bookkeeping for side-table owners, not holders
-            ta_buffer: _,     // side slots
             shadow_realms: _, // members of the collection's tree, traced as side slots
             shadow_home: _,   // a weak owner; its entry count is read by `Marking`
-            data_views: _,
             regexps: _,
             regexp_programs: _,
             host_indexed: _, // side slots

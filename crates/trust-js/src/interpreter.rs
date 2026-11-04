@@ -6,6 +6,7 @@
 
 use crate::ast::*;
 use crate::builtins::TaAccessor;
+use crate::native_typed_array::{with_array_buffer, with_buffer_data};
 use crate::value::ValueView;
 use crate::value::*;
 use std::cell::RefCell;
@@ -655,8 +656,8 @@ fn function_profile_dump() {
 pub type ArrayBufferBytes = Rc<RefCell<Vec<u8>>>;
 
 /// The Data Block behind an ArrayBuffer or SharedArrayBuffer object (its [[ArrayBufferData]]
-/// slot): the values of `Interp::array_buffers`. A detached ArrayBuffer has no entry, and a
-/// SharedArrayBuffer is never detached.
+/// slot), in the object's payload (`native_typed_array::ArrayBufferData`). A detached
+/// ArrayBuffer has none, and a SharedArrayBuffer is never detached.
 #[derive(Clone)]
 pub(crate) enum BufferData {
     /// An ArrayBuffer's own bytes, which an embedder resource such as wasm memory may share.
@@ -4901,33 +4902,11 @@ pub struct Interp {
     /// Prototypes for builtins created after `new()` (Map/Set/Date/...), looked up by name so their
     /// native constructors can stamp the right `[[Prototype]]`.
     pub(crate) extra_protos: IntrinsicMap,
-    /// The Data Block of every attached ArrayBuffer and every SharedArrayBuffer, keyed by the
-    /// buffer object's pointer: an ArrayBuffer's own bytes, whose indirection lets an embedder
-    /// identify them with an external resource such as wasm linear memory, or a
-    /// SharedArrayBuffer's owning Shared Data Block reference. Detaching an ArrayBuffer removes
-    /// its entry; sweeping the last shared owner releases that block's allocation.
-    pub(crate) array_buffers: crate::fasthash::FastMap<usize, BufferData>,
-    pub(crate) native_buffers:
-        crate::fasthash::FastMap<usize, Rc<crate::native_typed_array::NativeBuffer>>,
-    /// Monotonic mutation generations for ArrayBuffer byte storage. Host embedders use these
-    /// generations to avoid copying an unchanged external mirror across a synchronous boundary.
-    pub(crate) array_buffer_versions: crate::fasthash::FastMap<usize, u64>,
-    /// Bounded, conservative byte ranges covering writes since the last host synchronization.
-    pub(crate) array_buffer_dirty_ranges: crate::fasthash::FastMap<usize, Vec<Range<usize>>>,
-    /// Immutable ArrayBuffer pointers (created via `transferToImmutable`/`sliceToImmutable`): their
-    /// bytes can be read but never written, resized, detached, or transferred.
-    pub(crate) immutable_buffers: std::collections::HashSet<usize>,
-    /// ArrayBuffers carrying an embedder detach key. ECMAScript transfer operations do not know
-    /// that key and therefore cannot detach them; the embedder can still detach them explicitly
-    /// when the external resource changes identity (notably WebAssembly memory growth).
-    pub(crate) host_keyed_buffers: std::collections::HashSet<usize>,
     /// Whether this agent may block in `Atomics.wait` (false for the main agent, true for the
     /// worker agents spawned by `$262.agent.start`).
     pub(crate) can_block: bool,
     /// Agent-harness wiring (present only in spawned agents / a main with agents).
     pub(crate) agent: Option<Box<AgentChannels>>,
-    /// TypedArray view state, keyed by the typed-array object's pointer.
-    pub(crate) typed_arrays: crate::fasthash::FastMap<usize, TaInfo>,
     /// Object pointers of async generator instances (the AsyncGenerator brand).
     pub(crate) async_gens: std::collections::HashSet<usize>,
     /// The global environment's [[VarNames]]: names declared by `var`/function in global code, for
@@ -4935,22 +4914,16 @@ pub struct Interp {
     pub(crate) global_var_names: Rc<RefCell<std::collections::HashSet<String>>>,
 
     /// GC pins: a `Gc` for each object that has an entry in a pointer-keyed side table
-    /// (typed_arrays, promises, array_buffers, …), keyed by its address. A pin keeps nothing
+    /// (promises, regexps, …), keyed by its address. A pin keeps nothing
     /// alive (the collector does not trace pins): such an object dies in a collection like any
     /// other, whose sweep evicts its table entries and its pin before a later allocation can
     /// reuse the address.
     pub(crate) gc_pins: crate::fasthash::FastMap<usize, Gc>,
-    /// The backing ArrayBuffer *object* for each TypedArray (so the `buffer` getter can return it
-    /// without storing it as an observable own property). Keyed by the TypedArray's pointer.
-    pub(crate) ta_buffer: gc_collect::SideSlotTable<Value>,
     /// Each `ShadowRealm` instance owns an isolated realm (a full sub-interpreter), keyed by the
     /// ShadowRealm object's pointer. Only primitive completion values cross the boundary.
     pub(crate) shadow_realms: crate::fasthash::FastMap<usize, crate::agent_access::Owned<Interp>>,
     /// A ShadowRealm's interpreter: its place in its parent's tree (None for an Agent's root).
     pub(crate) shadow_home: Option<ShadowHome>,
-    /// DataView state `(buffer ptr, byteOffset, byteLength)`, keyed by the DataView's pointer.
-    /// DataView state: (buffer ptr, byteOffset, byteLength, is-length-tracking).
-    pub(crate) data_views: crate::fasthash::FastMap<usize, (usize, usize, usize, bool)>,
     /// Compiled regular expressions, keyed by the RegExp object's pointer.
     pub(crate) regexps: crate::fasthash::FastMap<usize, Rc<crate::regex::Regex>>,
     /// Immutable matcher programs shared by RegExp instances with the same source and flags.
@@ -4975,8 +4948,8 @@ pub struct Interp {
     /// belong to the caller's realm.
     pub(crate) ctor_caller_realm: Option<RealmState>,
     /// Additional realms created via `$262.createRealm()`, keyed by the realm's global-object pointer.
-    /// Each holds its own intrinsics; the shared side tables (buffers, …) and well-known symbols
-    /// are common, so objects cross realm boundaries freely.
+    /// Each holds its own intrinsics; the heap (buffers, …), the shared side tables and the
+    /// well-known symbols are common, so objects cross realm boundaries freely.
     pub(crate) realms: crate::fasthash::FastMap<usize, RealmState>,
     /// Promise state keyed by the promise object's pointer.
     pub(crate) promises: gc_collect::SideSlotTable<PromiseState>,
@@ -5226,22 +5199,13 @@ interp_memory_inventory! {
     module_ns => "measured",
     weak_collections => "measured",
     extra_protos => "measured",
-    array_buffers => "external",
-    native_buffers => "measured",
-    array_buffer_versions => "measured",
-    array_buffer_dirty_ranges => "measured",
-    immutable_buffers => "measured",
-    host_keyed_buffers => "measured",
     can_block => "non_owning",
     agent => "measured",
-    typed_arrays => "measured",
     async_gens => "measured",
     global_var_names => "measured",
     gc_pins => "measured",
-    ta_buffer => "measured",
     shadow_realms => "measured",
     shadow_home => "non_owning",
-    data_views => "measured",
     regexps => "measured",
     regexp_programs => "measured",
     host_indexed => "measured",
@@ -5316,7 +5280,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 148);
+    assert_eq!(names.len(), 139);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -5544,7 +5508,6 @@ macro_rules! gc_side_slot_tables {
         $callback!(
             class_info,
             module_ns,
-            ta_buffer,
             host_indexed,
             promises,
             promise_forward,
@@ -6954,22 +6917,13 @@ impl Interp {
             regexp_last: None,
             weak_collections: Default::default(),
             extra_protos: Default::default(),
-            array_buffers: Default::default(),
-            native_buffers: Default::default(),
-            array_buffer_versions: Default::default(),
-            array_buffer_dirty_ranges: Default::default(),
-            immutable_buffers: std::collections::HashSet::new(),
-            host_keyed_buffers: std::collections::HashSet::new(),
             can_block: true,
             agent: None,
-            typed_arrays: Default::default(),
             async_gens: std::collections::HashSet::new(),
             global_var_names: Rc::new(RefCell::new(std::collections::HashSet::new())),
             gc_pins: Default::default(),
-            ta_buffer: Default::default(),
             shadow_realms: Default::default(),
             shadow_home: None,
-            data_views: Default::default(),
             regexps: Default::default(),
             regexp_programs: crate::cache::RegexpProgramCache::new(16 << 20, 512),
             host_indexed: Default::default(),
@@ -7214,19 +7168,18 @@ impl Interp {
                 Value::Undefined
             }
         };
-        match self.array_buffers.get(&info.buffer) {
-            // Ordinary buffers validate and decode under one borrow, with just one backing-store
-            // lookup.
-            Some(BufferData::Local(buf)) => decode(&buf.borrow()),
+        with_buffer_data(&info.buffer, |data| match data {
+            // Ordinary buffers validate and decode under one borrow.
+            BufferData::Local(buf) => decode(&buf.borrow()),
             // Keep the shared length witness and synchronized data read.
-            Some(BufferData::Shared(mem)) => {
+            BufferData::Shared(mem) => {
                 if idx >= self.ta_len(info).unwrap_or(0) {
                     return Value::Undefined;
                 }
                 decode(&mem.lock().unwrap())
             }
-            None => Value::Undefined,
-        }
+        })
+        .unwrap_or(Value::Undefined)
     }
 
     /// The raw bytes of `nelems` elements starting at element `elem_start` (None when the view
@@ -7247,7 +7200,7 @@ impl Interp {
                 None
             }
         };
-        self.array_buffers.get(&info.buffer)?.with_bytes(take)?
+        with_buffer_data(&info.buffer, |data| data.with_bytes(take))??
     }
 
     /// Write raw bytes at element `elem_start` (bounds-checked; silently drops what doesn't fit).
@@ -7258,7 +7211,7 @@ impl Interp {
                 buf[start..start + bytes.len()].copy_from_slice(bytes);
             }
         };
-        match self.array_buffers.get(&info.buffer) {
+        with_array_buffer(&info.buffer, |buffer| match &buffer.data {
             Some(BufferData::Local(storage)) => {
                 let mut b = storage.borrow_mut();
                 if start
@@ -7267,13 +7220,13 @@ impl Interp {
                 {
                     put(&mut b);
                     drop(b);
-                    self.mark_array_buffer_dirty_range(info.buffer, start, bytes.len());
+                    buffer.mark_dirty_range(start, bytes.len());
                 }
             }
             // A Shared Data Block has no mutation generation or dirty ranges.
             Some(BufferData::Shared(mem)) => put(&mut mem.lock().unwrap()),
             None => {}
-        }
+        });
     }
 
     /// Atomically read-modify-write an integer TypedArray element: `f` maps the old raw value to
@@ -7292,7 +7245,6 @@ impl Interp {
         }
         let es = info.kind.elsize();
         let start = info.offset + idx * es;
-        self.mark_array_buffer_dirty_range(info.buffer, start, es);
         let apply = |buf: &mut [u8]| -> Option<i128> {
             if start + es > buf.len() {
                 return None;
@@ -7312,9 +7264,10 @@ impl Interp {
             }
             Some(old)
         };
-        self.array_buffers
-            .get(&info.buffer)?
-            .with_bytes_mut(apply)?
+        with_array_buffer(&info.buffer, |buffer| {
+            buffer.mark_dirty_range(start, es);
+            buffer.data.as_ref()?.with_bytes_mut(apply)?
+        })?
     }
 
     /// Store a JS value into a TypedArray element, coercing per the element type. BigInt arrays
@@ -7323,8 +7276,7 @@ impl Interp {
         // IntegerIndexedElementSet: the value coerces FIRST (observable, spec order); a write
         // into an immutable buffer then fails like a non-writable data property — a TypeError in
         // strict mode, a silent no-op in sloppy.
-        let immutable =
-            !self.immutable_buffers.is_empty() && self.immutable_buffers.contains(&info.buffer);
+        let immutable = self.is_immutable_buffer(&info.buffer);
         if info.kind.is_bigint() {
             let n = self.to_bigint(v)?;
             if !immutable {
@@ -7354,14 +7306,15 @@ impl Interp {
         let start = info.offset + idx * es;
         // Element encoding of a BigInt: wrapped modulo 2^64, little-endian.
         let bytes = (n as u64).to_le_bytes();
-        let wrote = match self.array_buffers.get(&info.buffer) {
+        with_array_buffer(&info.buffer, |buffer| match &buffer.data {
             Some(BufferData::Local(storage)) => {
                 let mut buf = storage.borrow_mut();
                 let fits = start + es <= buf.len();
                 if fits {
                     buf[start..start + es].copy_from_slice(&bytes);
+                    drop(buf);
+                    buffer.mark_dirty_range(start, es);
                 }
-                fits
             }
             // A Shared Data Block has no mutation generation or dirty ranges.
             Some(BufferData::Shared(mem)) => {
@@ -7369,27 +7322,23 @@ impl Interp {
                 if start + es <= buf.len() {
                     buf[start..start + es].copy_from_slice(&bytes);
                 }
-                false
             }
-            None => false,
-        };
-        if wrote {
-            self.mark_array_buffer_dirty_range(info.buffer, start, es);
-        }
+            None => {}
+        });
     }
 
     /// Write Number `n` into element `idx` of a TypedArray (out-of-range writes are ignored).
     pub(crate) fn ta_write(&mut self, info: &TaInfo, idx: usize, n: f64) {
         let es = info.kind.elsize();
-        let wrote = match self.array_buffers.get(&info.buffer) {
+        with_array_buffer(&info.buffer, |buffer| match &buffer.data {
             Some(BufferData::Local(storage)) => {
                 let mut buf = storage.borrow_mut();
-                let in_bounds = idx < info.length_for_buffer(buf.len()).unwrap_or(0);
-                if in_bounds {
+                if idx < info.length_for_buffer(buf.len()).unwrap_or(0) {
                     let start = info.offset + idx * es;
                     info.kind.write_into(n, &mut buf[start..start + es]);
+                    drop(buf);
+                    buffer.mark_dirty_range(start, es);
                 }
-                in_bounds
             }
             // A Shared Data Block has no mutation generation or dirty ranges.
             Some(BufferData::Shared(mem)) => {
@@ -7401,13 +7350,9 @@ impl Interp {
                 if start + es <= buf.len() {
                     info.kind.write_into(n, &mut buf[start..start + es]);
                 }
-                false
             }
-            None => false,
-        };
-        if wrote {
-            self.mark_array_buffer_dirty_range(info.buffer, info.offset + idx * es, es);
-        }
+            None => {}
+        });
     }
 
     /// SetTypedArrayFromArrayLike, specialized only after every source element is proven to be
@@ -7422,8 +7367,8 @@ impl Interp {
         len: usize,
     ) -> bool {
         if info.kind.is_bigint()
-            || self.is_shared_buffer(info.buffer)
-            || self.immutable_buffers.contains(&info.buffer)
+            || self.is_shared_buffer(&info.buffer)
+            || self.is_immutable_buffer(&info.buffer)
             || !self.ordinary_get_ptr(Gc::as_ptr(source) as usize)
         {
             return false;
@@ -7439,7 +7384,7 @@ impl Interp {
         {
             return false;
         }
-        let Some(storage) = self.local_buffer(info.buffer) else {
+        let Some(storage) = self.local_buffer(&info.buffer) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -7464,7 +7409,7 @@ impl Interp {
         }
         drop(buffer);
         drop(source);
-        self.mark_array_buffer_dirty_range(info.buffer, start, len * size);
+        self.mark_array_buffer_dirty_range(&info.buffer, start, len * size);
         true
     }
 
@@ -7584,14 +7529,14 @@ impl Interp {
         match &(base).view() {
             ValueView::Obj(object) => {
                 let ptr = Gc::as_ptr(object) as usize;
-                if self.typed_arrays.contains_key(&ptr) {
+                if object.borrow().kind.typed_array().is_some() {
                     return ElementReceiverKind::TypedArray;
                 }
                 if object.borrow().kind.is_proxy()
                     || self.module_ns.contains_key(&ptr)
                     || self.deferred_ns.contains_key(&ptr)
-                    || self.data_views.contains_key(&ptr)
-                    || self.buffer_attached(ptr)
+                    || object.borrow().kind.data_view().is_some()
+                    || self.buffer_attached(object)
                     || self.host_indexed.contains_key(&ptr)
                 {
                     return ElementReceiverKind::Exotic;
@@ -8404,11 +8349,7 @@ impl Interp {
     /// non-typed-array. The pointer aliases the live backing store; it is valid until the buffer
     /// is resized or detached. For `napi_get_typedarray_info`.
     pub fn typed_array_raw(&mut self, v: &Value) -> Option<(u8, usize, *mut u8)> {
-        let obj = v.as_obj()?;
-        let info = self
-            .typed_arrays
-            .get(&(Gc::as_ptr(&obj) as usize))
-            .copied()?;
+        let info = self.typed_array_of_value(v)?;
         let len = self.ta_len(&info)?;
         let (code, elem) = match info.kind {
             crate::value::TaKind::I8 => (0u8, 1usize),
@@ -8425,12 +8366,12 @@ impl Interp {
             crate::value::TaKind::F16 => (1, 2), // no N-API code for float16; report bytes
         };
         let byte_len = len * elem;
-        let ptr = match self.array_buffers.get(&info.buffer)? {
+        let ptr = match self.buffer_data(&info.buffer)? {
             BufferData::Local(storage) => {
                 let ptr = storage.borrow_mut().as_mut_ptr();
                 // N-API receives a live mutable pointer and may write through it after this call
                 // returns.
-                self.mark_array_buffer_dirty(info.buffer);
+                self.mark_array_buffer_dirty(&info.buffer);
                 ptr
             }
             // The backing buffer owns the Shared Data Block; only a grow moves its bytes.
@@ -9103,11 +9044,7 @@ impl Interp {
     /// is detached). The embedder's binary bridge: encoders/crypto/fetch move bytes through
     /// this.
     pub fn typed_array_bytes(&self, v: &Value) -> Option<Vec<u8>> {
-        let obj = v.as_obj()?;
-        let info = self
-            .typed_arrays
-            .get(&(Gc::as_ptr(&obj) as usize))
-            .copied()?;
+        let info = self.typed_array_of_value(v)?;
         let len = self.ta_len(&info)?;
         self.ta_read_bytes(&info, 0, len)
     }
@@ -9117,17 +9054,13 @@ impl Interp {
     /// borrowed while `f` runs, so `f` must not call back into the engine (it may use the
     /// embedder's own state).
     pub fn with_typed_array_bytes<R>(&self, v: &Value, f: impl FnOnce(&[u8]) -> R) -> Option<R> {
-        let obj = v.as_obj()?;
-        let info = self
-            .typed_arrays
-            .get(&(Gc::as_ptr(&obj) as usize))
-            .copied()?;
+        let info = self.typed_array_of_value(v)?;
         let len = self.ta_len(&info)?;
         let es = info.kind.elsize();
         let (start, end) = (info.offset, info.offset + len * es);
-        self.array_buffers
-            .get(&info.buffer)?
-            .with_bytes(|buf| (end <= buf.len()).then(|| f(&buf[start..end])))?
+        with_buffer_data(&info.buffer, |data| {
+            data.with_bytes(|buf| (end <= buf.len()).then(|| f(&buf[start..end])))?
+        })?
     }
 
     /// Snapshot a matching TypedArray over fixed backing storage for Web IDL unions.
@@ -9140,13 +9073,11 @@ impl Interp {
         name: &str,
         allow_shared: bool,
     ) -> Option<Vec<u8>> {
-        let ptr = self.object_addr(value)?;
-        let info = self.typed_arrays.get(&ptr)?;
-        if info.kind.name() != name || (!allow_shared && self.is_shared_buffer(info.buffer)) {
+        let info = &self.typed_array_of_value(value)?;
+        if info.kind.name() != name || (!allow_shared && self.is_shared_buffer(&info.buffer)) {
             return None;
         }
-        let handle = self.ta_buffer.get(&ptr)?.as_obj()?;
-        let buffer = handle.borrow();
+        let buffer = info.buffer.borrow();
         if !matches!(
             (buffer
                 .internal_slots()
@@ -9170,20 +9101,24 @@ impl Interp {
     /// the distinction between ordinary and shared backing stores.
     pub fn buffer_source_bytes(&self, v: &Value, allow_shared: bool) -> Option<Vec<u8>> {
         let obj = v.as_obj()?;
-        let ptr = Gc::as_ptr(&obj) as usize;
 
-        if let Some(info) = self.typed_arrays.get(&ptr).copied() {
-            if !allow_shared && self.is_shared_buffer(info.buffer) {
+        if let Some(info) = self.typed_array_of(&obj) {
+            if !allow_shared && self.is_shared_buffer(&info.buffer) {
                 return None;
             }
             let len = self.ta_len(&info)?;
             return self.ta_read_bytes(&info, 0, len);
         }
 
-        if let Some((buffer, offset, fixed_len, length_tracking)) =
-            self.data_views.get(&ptr).copied()
+        let view = obj.borrow().kind.data_view();
+        if let Some(crate::native_typed_array::DataViewData {
+            buffer,
+            offset,
+            len: fixed_len,
+            track: length_tracking,
+        }) = view
         {
-            let data = self.array_buffers.get(&buffer)?;
+            let data = self.buffer_data(&buffer)?;
             if matches!(data, BufferData::Shared(_)) && !allow_shared {
                 return None;
             }
@@ -9200,10 +9135,10 @@ impl Interp {
             return data.with_bytes(view)?;
         }
 
-        match self.array_buffers.get(&ptr)? {
+        with_buffer_data(&obj, |data| match data {
             BufferData::Shared(_) if !allow_shared => None,
             data => data.with_bytes(<[u8]>::to_vec),
-        }
+        })?
     }
 
     /// A fresh fixed-length `ArrayBuffer` initialized with `bytes`, with the realm's intrinsic
@@ -9237,8 +9172,10 @@ impl Interp {
         &mut self,
         storage: ArrayBufferBytes,
     ) -> Result<Value, Value> {
-        let (buffer, ptr) = crate::builtins::array_buffer_with_storage(self, storage);
-        self.host_keyed_buffers.insert(ptr);
+        let (buffer, object) = crate::builtins::array_buffer_with_storage(self, storage);
+        if let ObjectKind::ArrayBuffer(data) = &mut object.borrow_mut().kind {
+            data.host_keyed = true;
+        }
         Ok(buffer)
     }
 
@@ -9249,8 +9186,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(&obj) as usize;
-        let Some(storage) = self.local_buffer(ptr) else {
+        let Some(storage) = self.local_buffer(&obj) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -9273,8 +9209,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(&obj) as usize;
-        let Some(storage) = self.local_buffer(ptr) else {
+        let Some(storage) = self.local_buffer(&obj) else {
             return false;
         };
         let mut buffer = storage.borrow_mut();
@@ -9300,8 +9235,7 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(&obj) as usize;
-        let Some(storage) = self.local_buffer(ptr) else {
+        let Some(storage) = self.local_buffer(&obj) else {
             return false;
         };
         let buffer = storage.borrow();
@@ -9321,13 +9255,12 @@ impl Interp {
     /// to modify the mirror. Taking the ranges does not change the mutation generation. `None`
     /// for another value, a detached buffer or a SharedArrayBuffer, which has no dirty ranges.
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
-        let ptr = v.as_obj().map(|obj| Gc::as_ptr(&obj) as usize)?;
-        self.flush_native_buffer_writes(ptr);
-        self.local_buffer(ptr).is_some().then(|| {
-            self.array_buffer_dirty_ranges
-                .remove(&ptr)
-                .unwrap_or_default()
-        })
+        with_array_buffer(&v.as_obj()?, |data| {
+            data.flush_native_writes();
+            data.local()
+                .is_some()
+                .then(|| std::mem::take(&mut *data.dirty.borrow_mut()))
+        })?
     }
 
     /// Returns the mutation generation of an attached ordinary ArrayBuffer. The generation is
@@ -9336,47 +9269,30 @@ impl Interp {
     /// value, a detached buffer or a SharedArrayBuffer: other agents write a Shared Data Block
     /// without any generation this agent could observe.
     pub fn array_buffer_version(&self, v: &Value) -> Option<u64> {
-        let ptr = v.as_obj().map(|obj| Gc::as_ptr(&obj) as usize)?;
-        self.local_buffer(ptr).is_some().then(|| {
-            self.array_buffer_versions
-                .get(&ptr)
-                .copied()
-                .unwrap_or(0)
-                .wrapping_add(
-                    self.native_buffers
-                        .get(&ptr)
-                        .map_or(0, |buffer| buffer.writes.get()),
-                )
-        })
+        with_array_buffer(&v.as_obj()?, |data| {
+            data.local().is_some().then(|| {
+                data.version
+                    .get()
+                    .wrapping_add(data.native.as_ref().map_or(0, |buffer| buffer.writes.get()))
+            })
+        })?
     }
 
     /// Marks bytes in an ArrayBuffer as changed by an engine-owned view or host pointer. This is
     /// deliberately conservative: callers may mark a no-op or failed write, causing one extra
     /// mirror check but never allowing a stale external view to remain visible.
-    pub(crate) fn mark_array_buffer_dirty(&mut self, ptr: usize) {
+    pub(crate) fn mark_array_buffer_dirty(&mut self, buffer: &Gc) {
         let len = self
-            .local_buffer(ptr)
+            .local_buffer(buffer)
             .map_or(0, |buffer| buffer.borrow().len());
-        self.mark_array_buffer_dirty_range(ptr, 0, len);
+        self.mark_array_buffer_dirty_range(buffer, 0, len);
     }
 
     /// Marks a byte range as changed by an engine-owned view or host pointer. Only an
     /// ArrayBuffer's own bytes are tracked: a Shared Data Block, which other agents write too,
     /// has no mutation generation or dirty ranges.
-    pub(crate) fn mark_array_buffer_dirty_range(&mut self, ptr: usize, start: usize, len: usize) {
-        let Some(buffer_len) = self.local_buffer(ptr).map(|buffer| buffer.borrow().len()) else {
-            return;
-        };
-        let Some(end) = start.checked_add(len) else {
-            return;
-        };
-        if len == 0 || end > buffer_len {
-            return;
-        }
-        let ranges = self.array_buffer_dirty_ranges.entry(ptr).or_default();
-        record_buffer_write(ranges, start..end, buffer_len);
-        let version = self.array_buffer_versions.entry(ptr).or_default();
-        *version = version.wrapping_add(1);
+    pub(crate) fn mark_array_buffer_dirty_range(&mut self, buffer: &Gc, start: usize, len: usize) {
+        with_array_buffer(buffer, |data| data.mark_dirty_range(start, len));
     }
 
     /// Detach an ordinary `ArrayBuffer`, making its byte length zero and invalidating its views.
@@ -9385,27 +9301,19 @@ impl Interp {
         let Some(obj) = v.as_obj() else {
             return false;
         };
-        let ptr = Gc::as_ptr(&obj) as usize;
-        // A Shared Data Block cannot be detached.
-        if self.is_shared_buffer(ptr) {
-            return false;
-        }
-        self.host_keyed_buffers.remove(&ptr);
-        self.invalidate_native_buffer(ptr);
-        let removed = self.array_buffers.remove(&ptr).is_some();
-        self.array_buffer_versions.remove(&ptr);
-        self.array_buffer_dirty_ranges.remove(&ptr);
-        removed
+        // A Shared Data Block cannot be detached (`ArrayBufferData::detach`).
+        let detached = match &mut obj.borrow_mut().kind {
+            ObjectKind::ArrayBuffer(data) => data.detach().is_some(),
+            _ => false,
+        };
+        detached
     }
 
     /// Overwrite a TypedArray's leading bytes. The write must fit the view's current byte length:
     /// `false` (and no write) when `v` isn't a typed array, its buffer is detached or out of
     /// bounds, or `bytes` is longer than the view; bytes beyond the view are never touched.
     pub fn typed_array_set_bytes(&mut self, v: &Value, bytes: &[u8]) -> bool {
-        let Some(obj) = v.as_obj() else {
-            return false;
-        };
-        let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(&obj) as usize)).copied() else {
+        let Some(info) = self.typed_array_of_value(v) else {
             return false;
         };
         let Some(length) = self.ta_len(&info) else {
@@ -9721,14 +9629,14 @@ impl Interp {
         let mut entry = format!("function={function:?} base={} key={key:?}", type_name(base));
         if canonical_index(&key).is_none() {
             if let ValueView::Obj(object) = &(base).view() {
-                let id = Gc::as_ptr(object) as usize;
+                let data = self.buffer_data(object);
                 let object = object.borrow();
-                let kind = if let Some(data) = self.buffer_data(id) {
+                let kind = if let Some(data) = data {
                     match data {
                         BufferData::Local(_) => "ArrayBuffer",
                         BufferData::Shared(_) => "SharedArrayBuffer",
                     }
-                } else if self.typed_arrays.contains_key(&id) {
+                } else if object.kind.typed_array().is_some() {
                     "TypedArray"
                 } else {
                     match &object.kind {
@@ -9892,8 +9800,9 @@ impl Interp {
         let mut b = o.borrow();
         // A set `ic_plain` byte proves no side-table internal methods (see `object_ic_plain`).
         if !b.ic_plain() {
+            let info = b.kind.typed_array_info();
             drop(b);
-            if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(o) as usize)) {
+            if let Some(info) = &info {
                 // ECMA-262 ToPropertyKey + TypedArrayGetElement (snapshot e28783d5fc9d): a
                 // non-negative integral Number already identifies the element. Numeric -0
                 // becomes the key "0"; the distinct string "-0" still goes through the generic
@@ -9930,22 +9839,21 @@ impl Interp {
         // representation cannot accidentally bypass its trap or backing store. A set
         // `ic_plain` byte proves the object is in none of those tables.
         if !o.borrow().ic_plain() {
-            if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(o) as usize)).copied() {
+            let info = o.borrow().kind.typed_array_info();
+            if let Some(info) = info {
                 // TypedArraySetElement converts the value before checking current bounds. Only
                 // a value already of the view's content type (a Number, or a BigInt for BigInt
                 // content) can bypass that observable step; coercions, mismatched content and
                 // immutable-buffer errors retain the general path.
                 match &(v).view() {
                     ValueView::Num(value)
-                        if !info.kind.is_bigint()
-                            && !self.immutable_buffers.contains(&info.buffer) =>
+                        if !info.kind.is_bigint() && !self.is_immutable_buffer(&info.buffer) =>
                     {
                         self.ta_write(&info, n as usize, *value);
                         return Ok(());
                     }
                     ValueView::BigInt(value)
-                        if info.kind.is_bigint()
-                            && !self.immutable_buffers.contains(&info.buffer) =>
+                        if info.kind.is_bigint() && !self.is_immutable_buffer(&info.buffer) =>
                     {
                         self.ta_write_bigint(&info, n as usize, value.to_i128_wrapping());
                         return Ok(());
@@ -10282,7 +10190,7 @@ impl Interp {
     /// Whether object pointer `ptr` (holding `b`) reads like an ordinary object for IC purposes.
     /// `ObjectKind::Array` is allowed: array *named* reads are ordinary (`length` is a real stored
     /// property); the primitive wrappers are allowed as justified below; everything else exotic
-    /// (arguments, …) and anything in a side table (proxy, namespace, typed array) is not.
+    /// (arguments, …), a proxy, a typed array and anything in a side table (a namespace) is not.
     #[inline]
     fn ic_plain_ptr(&self, _ptr: usize, b: &Object) -> bool {
         // StrWrap (String.prototype, string wrapper objects): index and `length` reads are
@@ -11361,9 +11269,9 @@ impl Interp {
     }
 
     /// Whether object pointer `ptr` reads/writes like an ordinary object — i.e. it is not a
-    /// proxy (its kind) and is not registered in any of the exotic side tables (module
-    /// namespace, typed array, deferred namespace). Cheap: each empty table is skipped without
-    /// hashing, which is the common case in a hot loop.
+    /// proxy or a typed array (its kind) and is not registered in any of the exotic side tables
+    /// (module namespace, deferred namespace, Web IDL indexed host object). Cheap: each empty
+    /// table is skipped without hashing, which is the common case in a hot loop.
     #[inline]
     pub(crate) fn ordinary_get_ptr(&self, ptr: usize) -> bool {
         if Self::object_ic_plain(ptr) {
@@ -11375,15 +11283,15 @@ impl Interp {
 
     #[inline]
     fn side_table_ordinary_get_ptr(&self, ptr: usize) -> bool {
-        self.typed_array_at(ptr).is_none() && self.side_table_non_typed_ordinary_get_ptr(ptr)
+        !Self::object_may_be_typed_array(ptr) && self.side_table_non_typed_ordinary_get_ptr(ptr)
     }
 
-    /// A Proxy, and an object whose [[Get]]/[[Set]] behavior lives in an interpreter side table
-    /// (typed array, module namespace, Web IDL indexed host object), always has its `ic_plain`
-    /// byte cleared at its creation or registration, and that byte is never set again. A set
-    /// byte therefore proves the object is neither, with one load instead of a kind test and
-    /// several hash probes. A clear byte (including an object currently borrowed mutably) is
-    /// only a hint.
+    /// A Proxy, a typed array, and an object whose [[Get]]/[[Set]] behavior lives in an
+    /// interpreter side table (module namespace, Web IDL indexed host object), always has its
+    /// `ic_plain` byte cleared at its creation or registration, and that byte is never set again.
+    /// A set byte therefore proves the object is none of them, with one load instead of a kind
+    /// test and several hash probes. A clear byte (including an object currently borrowed
+    /// mutably) is only a hint.
     ///
     /// `ptr` must be the address of a live object (`Gc::as_ptr` of a held `Gc`).
     #[inline(always)]
@@ -11401,6 +11309,17 @@ impl Interp {
         let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
         // As in `object_ic_plain`, the shared reference ends before this returns.
         !matches!(unsafe { cell.try_borrow_unguarded() }, Ok(object) if !object.kind.is_proxy())
+    }
+
+    /// Whether the object at `ptr` may be a typed array, as [`Self::object_may_be_proxy`].
+    #[inline(always)]
+    fn object_may_be_typed_array(ptr: usize) -> bool {
+        let cell = unsafe { &*(ptr as *const RefCell<crate::value::Object>) };
+        // As in `object_ic_plain`, the shared reference ends before this returns.
+        !matches!(
+            unsafe { cell.try_borrow_unguarded() },
+            Ok(object) if object.kind.typed_array().is_none()
+        )
     }
 
     #[inline]
@@ -11487,20 +11406,6 @@ impl Interp {
         let getter = properties.getter;
         self.call_callback(getter, Value::Obj(*object), &[Value::Num(index as f64)])
             .map(Some)
-    }
-
-    /// The TypedArray state of `ptr`, skipping the table probe when no TypedArray exists: the
-    /// [[Get]]/[[Set]] slow paths ask for every object.
-    #[inline(always)]
-    pub(crate) fn typed_array_at(&self, ptr: usize) -> Option<TaInfo> {
-        if !self.typed_arrays.is_empty() {
-            if let Some(info) = self.typed_arrays.get(&ptr) {
-                return Some(*info);
-            }
-        }
-        let owner =
-            self.foreign_metadata_owner(ptr, |interp, key| interp.typed_arrays.contains_key(&key))?;
-        self.with_realm_view(owner, |interp| interp.typed_arrays.get(&ptr).copied())
     }
 
     /// The deferred-namespace evaluation trigger: most operations with a string key (and all
@@ -11636,13 +11541,16 @@ impl Interp {
             ValueView::Obj(o) => {
                 let o = *o;
                 let ptr = Gc::as_ptr(&o) as usize;
-                // One look at the exotic kind: a mapped `arguments` object, a string wrapper or a
-                // proxy.
-                let (mapped, wrapped_string, proxy) = match &o.borrow().kind {
-                    ObjectKind::Arguments(Some(_)) => (true, None, None),
-                    ObjectKind::StrWrap(s) => (false, Some(**s), None),
-                    ObjectKind::Proxy(proxy) => (false, None, Some((proxy.target, proxy.handler))),
-                    _ => (false, None, None),
+                // One look at the exotic kind: a mapped `arguments` object, a string wrapper, a
+                // proxy or a typed array.
+                let (mapped, wrapped_string, proxy, typed) = match &o.borrow().kind {
+                    ObjectKind::Arguments(Some(_)) => (true, None, None, None),
+                    ObjectKind::StrWrap(s) => (false, Some(**s), None, None),
+                    ObjectKind::Proxy(proxy) => {
+                        (false, None, Some((proxy.target, proxy.handler)), None)
+                    }
+                    ObjectKind::TypedArray(view) => (false, None, None, Some(view.info)),
+                    _ => (false, None, None, None),
                 };
                 // A mapped `arguments` index aliases its parameter binding.
                 if mapped {
@@ -11715,7 +11623,7 @@ impl Interp {
                 }
                 // TypedArray integer-index reads come from the backing buffer, not the property map.
                 // length/byteLength/byteOffset are computed (and 0 once the buffer is detached).
-                if let Some(info) = self.typed_array_at(ptr) {
+                if let Some(info) = typed {
                     match self.ta_index_kind(&info, key) {
                         TaIndex::Element(idx) => {
                             if let Some(trace) = trace.as_deref_mut() {
@@ -11771,11 +11679,7 @@ impl Interp {
                             } else {
                                 info.offset as f64
                             }),
-                            TaAccessor::Buffer => self
-                                .ta_buffer
-                                .get(&ptr)
-                                .cloned()
-                                .unwrap_or(Value::Undefined),
+                            TaAccessor::Buffer => Value::Obj(info.buffer),
                         });
                     }
                 }
@@ -11864,7 +11768,6 @@ impl Interp {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&obj, Some(key))?;
             // A proxy anywhere on the chain handles the read itself (with the original receiver).
-            let ptr = Gc::as_ptr(&obj) as usize;
             if let Some((target, handler)) = proxy_parts(&obj) {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
@@ -11906,24 +11809,23 @@ impl Interp {
             // which is undefined for an invalid index and never consults its prototype; any
             // other key continues with OrdinaryGet. Its elements live in the buffer, not in the
             // property map read below.
-            if !self.typed_arrays.is_empty() {
-                if let Some(info) = self.typed_arrays.get(&ptr).copied() {
-                    let element = match self.ta_index_kind(&info, key) {
-                        TaIndex::Element(index) => Some(self.ta_read(&info, index)),
-                        TaIndex::Exotic => Some(Value::Undefined),
-                        TaIndex::Ordinary => None,
-                    };
-                    if let Some(value) = element {
-                        if let Some(trace) = trace.as_deref_mut() {
-                            trace.record(
-                                crate::feedback::PropertyOutcome::Exotic,
-                                Some(obj.borrow().props.shape()),
-                                depth,
-                                None,
-                            );
-                        }
-                        return Ok(value);
+            let typed = obj.borrow().kind.typed_array_info();
+            if let Some(info) = typed {
+                let element = match self.ta_index_kind(&info, key) {
+                    TaIndex::Element(index) => Some(self.ta_read(&info, index)),
+                    TaIndex::Exotic => Some(Value::Undefined),
+                    TaIndex::Ordinary => None,
+                };
+                if let Some(value) = element {
+                    if let Some(trace) = trace.as_deref_mut() {
+                        trace.record(
+                            crate::feedback::PropertyOutcome::Exotic,
+                            Some(obj.borrow().props.shape()),
+                            depth,
+                            None,
+                        );
                     }
+                    return Ok(value);
                 }
             }
             // OrdinaryGet (ECMA-262): a data descriptor returns its owned value directly.
@@ -12509,7 +12411,8 @@ impl Interp {
         }
         // TypedArray integer-index writes go straight to the backing buffer; a canonical-numeric key
         // that isn't a valid index is inert (the value coercion still runs, then is discarded).
-        if let Some(info) = self.typed_array_at(ptr) {
+        let typed = obj.borrow().kind.typed_array_info();
+        if let Some(info) = typed {
             match self.ta_index_kind(&info, key) {
                 TaIndex::Element(_) | TaIndex::Exotic => {
                     if let Some(trace) = trace.as_deref_mut() {
@@ -12544,7 +12447,6 @@ impl Interp {
             // A deferred namespace anywhere on the chain evaluates its module first.
             self.defer_trigger(&o, Some(key))?;
             // A proxy on the chain handles the write itself (with the original receiver).
-            let optr = Gc::as_ptr(&o) as usize;
             if let Some((target, handler)) = proxy_parts(&o) {
                 if let Some(trace) = trace.as_deref_mut() {
                     trace.record(
@@ -12579,7 +12481,8 @@ impl Interp {
             // accessors). A valid index is a writable data property → create one on the receiver; a
             // canonical-numeric non-index is an inert success.
             if !Gc::ptr_eq(&o, &obj) {
-                if let Some(info) = self.typed_arrays.get(&optr).copied() {
+                let typed = o.borrow().kind.typed_array_info();
+                if let Some(info) = typed {
                     match self.ta_index_kind(&info, key) {
                         TaIndex::Element(_) | TaIndex::Exotic if matches!(&(receiver).view(), ValueView::Obj(r) if Gc::ptr_eq(r, &o)) =>
                         {
@@ -12978,55 +12881,68 @@ impl Interp {
     /// A TypedArray's *current* element length, or `None` if it's out of bounds (a fixed-length view
     /// whose resizable buffer shrank below its range) or its buffer is detached. A length-tracking
     /// view recomputes its length from the buffer's current size.
+    #[inline]
     pub(crate) fn ta_len(&self, info: &TaInfo) -> Option<usize> {
-        info.length_for_buffer(self.array_buffer_byte_length(info.buffer)?)
+        info.length_for_buffer(self.array_buffer_byte_length(&info.buffer)?)
     }
 
-    /// ArrayBufferByteLength (ECMA-262 #sec-arraybufferbytelength) of the buffer object at `ptr`,
-    /// or `None` when it is detached. A SharedArrayBuffer's length is that of its Shared Data
-    /// Block, which any agent sharing it may grow.
-    pub(crate) fn array_buffer_byte_length(&self, ptr: usize) -> Option<usize> {
-        self.array_buffers.get(&ptr)?.byte_len()
+    /// ArrayBufferByteLength (ECMA-262 #sec-arraybufferbytelength) of the buffer object
+    /// `buffer`, or `None` when it is detached. A SharedArrayBuffer's length is that of its
+    /// Shared Data Block, which any agent sharing it may grow.
+    #[inline]
+    pub(crate) fn array_buffer_byte_length(&self, buffer: &Gc) -> Option<usize> {
+        with_buffer_data(buffer, BufferData::byte_len)?
     }
 
-    /// The Data Block of the ArrayBuffer or SharedArrayBuffer object at `ptr`; `None` for a
+    /// The Data Block of the ArrayBuffer or SharedArrayBuffer object `buffer`; `None` for a
     /// detached ArrayBuffer or any other object.
-    pub(crate) fn buffer_data(&self, ptr: usize) -> Option<&BufferData> {
-        self.array_buffers.get(&ptr)
+    pub(crate) fn buffer_data(&self, buffer: &Gc) -> Option<BufferData> {
+        with_buffer_data(buffer, BufferData::clone)
     }
 
-    /// Whether `ptr` is a buffer object with a Data Block: an attached ArrayBuffer or a
+    /// Whether `buffer` is a buffer object with a Data Block: an attached ArrayBuffer or a
     /// SharedArrayBuffer (`!IsDetachedBuffer`).
-    pub(crate) fn buffer_attached(&self, ptr: usize) -> bool {
-        self.array_buffers.contains_key(&ptr)
+    pub(crate) fn buffer_attached(&self, buffer: &Gc) -> bool {
+        with_buffer_data(buffer, |_| ()).is_some()
     }
 
-    /// The Shared Data Block id of the SharedArrayBuffer at `ptr`; `None` for an ArrayBuffer,
+    /// The Shared Data Block id of the SharedArrayBuffer `buffer`; `None` for an ArrayBuffer,
     /// attached or detached, and any other object.
-    pub(crate) fn shared_block_id(&self, ptr: usize) -> Option<u64> {
-        self.shared_block(ptr).map(|block| block.id())
+    pub(crate) fn shared_block_id(&self, buffer: &Gc) -> Option<u64> {
+        with_array_buffer(buffer, |data| data.shared().map(|block| block.id()))?
     }
 
     /// An owning Shared Data Block reference that can outlive a JavaScript buffer wrapper.
-    pub(crate) fn shared_block(&self, ptr: usize) -> Option<&SharedMem> {
-        match self.array_buffers.get(&ptr)? {
-            BufferData::Shared(block) => Some(block),
-            BufferData::Local(_) => None,
-        }
+    pub(crate) fn shared_block(&self, buffer: &Gc) -> Option<SharedMem> {
+        with_array_buffer(buffer, |data| data.shared().cloned())?
     }
 
-    /// IsSharedArrayBuffer (ECMA-262 #sec-issharedarraybuffer) for the buffer object at `ptr`.
-    pub(crate) fn is_shared_buffer(&self, ptr: usize) -> bool {
-        self.shared_block_id(ptr).is_some()
+    /// IsSharedArrayBuffer (ECMA-262 #sec-issharedarraybuffer) for the buffer object `buffer`.
+    pub(crate) fn is_shared_buffer(&self, buffer: &Gc) -> bool {
+        with_array_buffer(buffer, |data| data.shared().is_some()).unwrap_or(false)
     }
 
-    /// The bytes of the attached ArrayBuffer at `ptr`; `None` for a SharedArrayBuffer, whose
+    /// IsImmutableBuffer (Immutable ArrayBuffer proposal) for the buffer object `buffer`.
+    pub(crate) fn is_immutable_buffer(&self, buffer: &Gc) -> bool {
+        with_array_buffer(buffer, |data| data.immutable).unwrap_or(false)
+    }
+
+    /// The bytes of the attached ArrayBuffer `buffer`; `None` for a SharedArrayBuffer, whose
     /// bytes are its Shared Data Block's, a detached ArrayBuffer or any other object.
-    pub(crate) fn local_buffer(&self, ptr: usize) -> Option<&ArrayBufferBytes> {
-        match self.array_buffers.get(&ptr)? {
-            BufferData::Local(bytes) => Some(bytes),
-            BufferData::Shared(_) => None,
-        }
+    pub(crate) fn local_buffer(&self, buffer: &Gc) -> Option<ArrayBufferBytes> {
+        with_array_buffer(buffer, |data| data.local().cloned())?
+    }
+
+    /// The TypedArray state of `object`: its view payload's.
+    #[inline]
+    pub(crate) fn typed_array_of(&self, object: &Gc) -> Option<TaInfo> {
+        object.borrow().kind.typed_array_info()
+    }
+
+    /// The TypedArray state of `value`, when it is a typed array.
+    #[inline]
+    pub(crate) fn typed_array_of_value(&self, value: &Value) -> Option<TaInfo> {
+        self.typed_array_of(&value.as_obj()?)
     }
 
     /// The intrinsic %TypedArray.prototype% getter that OrdinaryGet of `key` on the TypedArray
@@ -13148,8 +13064,8 @@ impl Interp {
 
     pub(crate) fn array_length(&self, obj: &Gc) -> usize {
         // A TypedArray's length lives in its info slot, not an own `length` property.
-        if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(obj) as usize)) {
-            return self.ta_len(info).unwrap_or(0);
+        if let Some(info) = self.typed_array_of(obj) {
+            return self.ta_len(&info).unwrap_or(0);
         }
         match (obj.borrow().props.length_property().map(|p| p.value()))
             .map(|__value| (__value).view())
@@ -13438,20 +13354,11 @@ impl Interp {
             eval_realm_fns,
             module_ns,
             realms,
-            typed_arrays,
-            data_views,
             regexps,
             host_indexed,
             promises,
             temporal,
-            array_buffers,
-            native_buffers,
-            array_buffer_versions,
-            array_buffer_dirty_ranges,
-            ta_buffer,
             shadow_realms,
-            immutable_buffers,
-            host_keyed_buffers,
             generators,
             async_gens,
             async_gen_busy,
@@ -13596,17 +13503,10 @@ impl Interp {
         crate::gc_sweep::set(eval_realm_fns, dead);
         module_ns.evict_dead(dead);
         crate::gc_sweep::map(realms, dead);
-        crate::gc_sweep::map(typed_arrays, dead);
-        crate::gc_sweep::map(data_views, dead);
         crate::gc_sweep::map(regexps, dead);
         host_indexed.evict_dead(dead);
         promises.evict_dead(dead);
         crate::gc_sweep::map(temporal, dead);
-        crate::gc_sweep::map(array_buffers, dead);
-        crate::gc_sweep::map(native_buffers, dead);
-        crate::gc_sweep::map(array_buffer_versions, dead);
-        crate::gc_sweep::map(array_buffer_dirty_ranges, dead);
-        ta_buffer.evict_dead(dead);
         if !shadow_realms.is_empty() {
             let collected: Vec<usize> = shadow_realms
                 .keys()
@@ -13619,8 +13519,6 @@ impl Interp {
                 }
             }
         }
-        crate::gc_sweep::set(immutable_buffers, dead);
-        crate::gc_sweep::set(host_keyed_buffers, dead);
         generators.evict_dead(dead);
         crate::gc_sweep::set(async_gens, dead);
         crate::gc_sweep::set(async_gen_busy, dead);
@@ -13738,36 +13636,11 @@ impl Interp {
         });
     }
 
-    /// Buffer data every interpreter of this Agent still holds. A surviving SharedArrayBuffer
-    /// retains its Shared Data Block; each block counts once, however many buffers (in however
-    /// many Realms) alias it.
+    /// Buffer data every interpreter of this Agent still holds: what the live buffers' payloads
+    /// count in the Agent's ledger. A surviving SharedArrayBuffer retains its Shared Data Block;
+    /// each block counts once, however many buffers (in however many Realms) alias it.
     fn agent_retained_buffer_bytes(&mut self) -> usize {
-        let mut local = 0usize;
-        let mut blocks = crate::fasthash::FastSet::default();
-        let access = self.gc_heap.agent.access.clone();
-        self.with_raw_access(|_| {
-            for (_, pointer) in access.snapshot() {
-                // SAFETY: a shared visit after the requester published its current lineage;
-                // nothing here runs JavaScript, collects or keeps a table reference.
-                let interp = unsafe { &*pointer.as_ptr() };
-                for data in interp.array_buffers.values() {
-                    match data {
-                        BufferData::Local(bytes) => {
-                            local += bytes.try_borrow().map_or(0, |bytes| bytes.len());
-                        }
-                        BufferData::Shared(block) => {
-                            blocks.insert(block.id());
-                        }
-                    }
-                }
-            }
-        });
-        let shared: usize = blocks
-            .into_iter()
-            .filter_map(shared_mem_get)
-            .map(|block| block.lock().unwrap().len())
-            .sum();
-        local.saturating_add(shared)
+        self.gc_heap.agent.buffer_ledger.retained_bytes()
     }
 
     /// Account for host-allocated data an ArrayBuffer can expose (a WebAssembly memory's

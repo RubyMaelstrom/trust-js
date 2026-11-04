@@ -1592,7 +1592,6 @@ fn agent_kept_symbol_can_outlive_its_former_child_realm_without_retaining_it() {
 #[test]
 fn agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire() {
     for (constructor, kind) in [
-        ("new ArrayBuffer(16)", 0),
         ("/native-metadata/u", 1),
         ("new WeakMap", 2),
         ("new WeakSet", 2),
@@ -1626,16 +1625,6 @@ fn agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire() {
             .expect("retained owner slot")
             .id();
         engine.interp.with_realm_view(id, |child| match kind {
-            0 => {
-                assert!(native.in_map(&child.array_buffers));
-                assert_eq!(
-                    child
-                        .array_buffers
-                        .get(&native.get())
-                        .and_then(|data| data.byte_len()),
-                    Some(16)
-                );
-            }
             1 => assert!(native.in_map(&child.regexps)),
             2 => assert!(child.weak_collections.contains(&native.get())),
             _ => unreachable!(),
@@ -1648,6 +1637,41 @@ fn agent_kept_prototype_null_native_owners_preserve_metadata_and_then_retire() {
         );
         assert!(engine.interp.shadow_realms.is_empty());
     }
+}
+
+/// W2g step 2: a buffer's state is its own payload's, so a ShadowRealm's buffer that outlives its
+/// realm (kept alive for the job by a WeakRef, with no prototype) holds no pin on the realm's
+/// interpreter: the realm retires at the next collection and the buffer stays whole.
+#[test]
+fn agent_kept_prototype_null_buffers_need_no_realm() {
+    let mut engine = Engine::new();
+    without_checkpoint(&mut engine, "globalThis.realm=new ShadowRealm;0");
+    let outer = owner(&mut engine, "realm");
+    without_checkpoint(
+        &mut engine,
+        "realm.evaluate('let value=new ArrayBuffer(16);Object.setPrototypeOf(value,null);new WeakRef(value);0');0",
+    );
+    let native = crate::gc_test::in_frame(|| {
+        let kept = engine.interp.gc_heap.agent.kept_alive.borrow();
+        let value = kept
+            .iter()
+            .find(|value| matches!(value.view(), ValueView::Obj(_)))
+            .expect("native kept owner");
+        crate::gc_test::HiddenAddress::of(value)
+    });
+    without_checkpoint(&mut engine, "globalThis.realm=null;0");
+    precise(&mut engine);
+    assert!(
+        !crate::gc_test::alive(outer.as_ref()),
+        "a buffer keeps no realm alive"
+    );
+    assert!(engine.interp.shadow_realms.is_empty());
+    assert_eq!(
+        native.with_object(|buffer| engine.interp.array_buffer_byte_length(buffer)),
+        Some(16)
+    );
+    engine.interp.drain_microtasks();
+    precise(&mut engine);
 }
 
 /// Attach only scalar native data, whose map does NOT itself record SideSlotTable writes.

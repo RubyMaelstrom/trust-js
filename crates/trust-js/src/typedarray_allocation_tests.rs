@@ -179,8 +179,14 @@ fn resizable_backing_retains_its_maximum_capacity_through_growth_and_transfer() 
     use crate::interpreter::BufferData;
 
     fn backing(engine: &Engine) -> (usize, usize, usize) {
-        assert_eq!(engine.interp.array_buffers.len(), 1);
-        match engine.interp.array_buffers.values().next().unwrap() {
+        // The one buffer object of the heap that has a Data Block (a transfer's source has
+        // none once detached).
+        let blocks: Vec<BufferData> = crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
+            .iter()
+            .filter_map(|object| object.borrow().kind.array_buffer()?.data.clone())
+            .collect();
+        assert_eq!(blocks.len(), 1);
+        match &blocks[0] {
             BufferData::Local(bytes) => {
                 let bytes = bytes.borrow();
                 (bytes.as_ptr() as usize, bytes.len(), bytes.capacity())

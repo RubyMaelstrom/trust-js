@@ -2388,7 +2388,7 @@ impl Interp {
                 .filter(|key| !key.is_symbol())
                 .map(|key| key.text().to_string())
                 .collect();
-            if let Some(info) = self.typed_arrays.get(&(Gc::as_ptr(&o) as usize)).copied() {
+            if let Some(info) = self.typed_array_of(&o) {
                 for idx in 0..self.ta_len(&info).unwrap_or(0) {
                     let k = idx.to_string();
                     if seen.insert(k.clone()) {
@@ -3243,7 +3243,6 @@ impl Interp {
         };
         // A deferred namespace evaluates on [[HasProperty]] with a string key.
         self.defer_trigger(&o, Some(key))?;
-        let ptr = Gc::as_ptr(&o) as usize;
         if let Some((target, handler)) = proxy_parts(&o) {
             if matches!((handler).view(), ValueView::Null) {
                 return Err(self.throw("TypeError", "cannot perform 'has' on a revoked proxy"));
@@ -3288,7 +3287,7 @@ impl Interp {
             }
             return Ok(present);
         }
-        if let Some(info) = self.typed_arrays.get(&ptr).copied() {
+        if let Some(info) = self.typed_array_of(&o) {
             match self.ta_index_kind(&info, key) {
                 TaIndex::Element(_) => return Ok(true),
                 TaIndex::Exotic => return Ok(false),
@@ -7184,38 +7183,16 @@ impl Interp {
                             // owns side-table state; the actual subclass instance is pinned above.
                             self.gc_pins.remove(&sp);
                         }
-                        if let Some(v) = self.typed_arrays.remove(&sp) {
+                        // A typed array's view, buffer, offset and length move with its kind; its
+                        // clear `ic_plain` comes with them. An ArrayBuffer's or a DataView's state
+                        // moved with its kind above.
+                        if src.borrow().kind.typed_array().is_some() {
                             dst.borrow().set_ic_plain(false);
-                            self.typed_arrays.insert(dp, v);
-                            // The view moves with its side-table entry.
-                            if src.borrow().kind.typed_array().is_some() {
-                                let view = std::mem::replace(
-                                    &mut src.borrow_mut().kind,
-                                    crate::value::ObjectKind::Plain,
-                                );
-                                dst.borrow_mut().kind = view;
-                            }
-                        }
-                        // The TypedArray's `buffer` slot lives in a parallel side table keyed by the
-                        // view's pointer, so it must move to `this` alongside its TaInfo.
-                        if let Some(v) = self.ta_buffer.remove(&sp) {
-                            self.ta_buffer.insert(&self.gc_heap, dp, v);
-                        }
-                        if let Some(v) = self.data_views.remove(&sp) {
-                            self.data_views.insert(dp, v);
-                        }
-                        // An ArrayBuffer's bytes or a SharedArrayBuffer's Shared Data Block.
-                        if let Some(v) = self.array_buffers.remove(&sp) {
-                            self.array_buffers.insert(dp, v);
-                        }
-                        if let Some(v) = self.native_buffers.remove(&sp) {
-                            self.native_buffers.insert(dp, v);
-                        }
-                        if let Some(v) = self.array_buffer_versions.remove(&sp) {
-                            self.array_buffer_versions.insert(dp, v);
-                        }
-                        if let Some(v) = self.array_buffer_dirty_ranges.remove(&sp) {
-                            self.array_buffer_dirty_ranges.insert(dp, v);
+                            let view = std::mem::replace(
+                                &mut src.borrow_mut().kind,
+                                crate::value::ObjectKind::Plain,
+                            );
+                            dst.borrow_mut().kind = view;
                         }
                         if let Some(v) = self.regexps.remove(&sp) {
                             self.regexps.insert(dp, v);
@@ -7790,7 +7767,6 @@ impl Interp {
             {
                 if let ValueView::Obj(o) = &(base).view() {
                     self.defer_trigger(o, Some(prop))?;
-                    let ptr = Gc::as_ptr(o) as usize;
                     if let Some((target, handler)) = proxy_parts(o) {
                         let ok = self.proxy_delete(target, handler, prop)?;
                         if !ok && strict {
@@ -7806,7 +7782,7 @@ impl Interp {
                     }
                     // A TypedArray integer index can't be deleted ([[Delete]] → false; strict
                     // throws); a canonical-numeric non-index reports success.
-                    if let Some(info) = self.typed_arrays.get(&ptr).copied() {
+                    if let Some(info) = self.typed_array_of(o) {
                         match self.ta_index_kind(&info, prop) {
                             TaIndex::Element(_) => {
                                 if strict {

@@ -165,6 +165,9 @@ pub(crate) struct AgentControl {
     /// ArrayBuffer data every member allocated since the last major collection, and the amount
     /// that triggers the next one (see [`Interp::note_buffer_allocation`]).
     pub(crate) buffers: Cell<crate::interpreter::BufferPressure>,
+    /// The buffer data every member's live ArrayBuffers and SharedArrayBuffers hold, which the
+    /// buffers' payloads count (`native_typed_array::BufferLedger`).
+    pub(crate) buffer_ledger: Rc<crate::native_typed_array::BufferLedger>,
 }
 
 impl AgentControl {
@@ -194,6 +197,7 @@ impl AgentControl {
             task_pending: Cell::new(false),
             task_deferred: Cell::new(false),
             buffers: Cell::new(crate::interpreter::BufferPressure::default()),
+            buffer_ledger: Rc::default(),
         }
     }
 }
@@ -908,6 +912,7 @@ impl GcTrace for AgentControl {
             task_pending: _,
             task_deferred: _,
             buffers: _,
+            buffer_ledger: _, // counts, no edges
         } = self;
         kept_alive.trace_gc(sink);
         work.trace_gc(sink);

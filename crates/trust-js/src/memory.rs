@@ -1132,7 +1132,9 @@ impl Visitor {
         let mut internal_bytes = object.internal_slots().retained_storage_bytes();
         if let Some(view) = object.kind.typed_array() {
             internal_bytes += size_of::<crate::native_typed_array::NativeTypedArray>();
-            internal_bytes += self.native_buffer(&view.buffer);
+            if let Some(buffer) = &view.native {
+                internal_bytes += self.native_buffer(buffer);
+            }
         }
         match &object.kind {
             ObjectKind::StrWrap(value) => self.value(&Value::Str(**value)),
@@ -1183,6 +1185,27 @@ impl Visitor {
             }
             // The environment is its function's activation, which its own owners report.
             ObjectKind::Arguments(Some(map)) => internal_bytes += map.retained_bytes(),
+            // A buffer's state, its guard record and its Data Block (an ArrayBuffer's own bytes
+            // once per block, a Shared Data Block once per block id).
+            ObjectKind::ArrayBuffer(data) => {
+                internal_bytes += std::mem::size_of_val(&**data).saturating_add(
+                    data.dirty
+                        .borrow()
+                        .capacity()
+                        .saturating_mul(size_of::<std::ops::Range<usize>>()),
+                );
+                if let Some(buffer) = &data.native {
+                    internal_bytes += self.native_buffer(buffer);
+                }
+                match &data.data {
+                    Some(crate::interpreter::BufferData::Local(bytes)) => self.array_buffer(bytes),
+                    Some(crate::interpreter::BufferData::Shared(block)) => {
+                        self.shared_array_buffer(block.id())
+                    }
+                    None => {}
+                }
+            }
+            ObjectKind::DataView(view) => internal_bytes += std::mem::size_of_val(&**view),
             // Plain objects and the payload-free exotics hold nothing more; a callable's payload
             // is `callable`'s, a typed array's view the native buffers'.
             _ => {}
@@ -2161,97 +2184,6 @@ fn scan_realm(
 
     totals.interpreter_side_tables.add(
         interp
-            .array_buffers
-            .len()
-            .saturating_mul(size_of::<(usize, crate::interpreter::BufferData)>())
-            .saturating_add(
-                interp
-                    .array_buffer_versions
-                    .len()
-                    .saturating_mul(size_of::<(usize, u64)>()),
-            )
-            .saturating_add(
-                interp
-                    .array_buffer_dirty_ranges
-                    .len()
-                    .saturating_mul(size_of::<(usize, Vec<std::ops::Range<usize>>)>()),
-            )
-            .saturating_add(
-                interp
-                    .immutable_buffers
-                    .len()
-                    .saturating_mul(size_of::<usize>()),
-            )
-            .saturating_add(
-                interp
-                    .host_keyed_buffers
-                    .len()
-                    .saturating_mul(size_of::<usize>()),
-            )
-            .saturating_add(
-                interp
-                    .typed_arrays
-                    .len()
-                    .saturating_mul(size_of::<(usize, crate::value::TaInfo)>()),
-            )
-            .saturating_add(
-                interp
-                    .ta_buffer
-                    .len()
-                    .saturating_mul(size_of::<(usize, Value)>()),
-            )
-            .saturating_add(
-                interp
-                    .data_views
-                    .len()
-                    .saturating_mul(size_of::<(usize, (usize, usize, usize, bool))>()),
-            ),
-    );
-    for ranges in interp.array_buffer_dirty_ranges.values() {
-        totals.interpreter_side_tables.add(
-            ranges
-                .capacity()
-                .saturating_mul(size_of::<std::ops::Range<usize>>()),
-        );
-    }
-    totals
-        .interpreter_side_tables
-        .add(interp.native_buffers.len().saturating_mul(size_of::<(
-            usize,
-            std::rc::Rc<crate::native_typed_array::NativeBuffer>,
-        )>()));
-    for buffer in interp.native_buffers.values() {
-        totals
-            .interpreter_side_tables
-            .add(visitor.native_buffer(buffer));
-    }
-    for buffer in interp.ta_buffer.values() {
-        visitor.value(buffer);
-    }
-    if !interp.array_buffers.is_empty()
-        || !interp.array_buffer_versions.is_empty()
-        || !interp.array_buffer_dirty_ranges.is_empty()
-        || !interp.immutable_buffers.is_empty()
-        || !interp.host_keyed_buffers.is_empty()
-        || !interp.typed_arrays.is_empty()
-        || !interp.ta_buffer.is_empty()
-        || !interp.data_views.is_empty()
-    {
-        totals
-            .interpreter_side_tables
-            .make_lower_bound("opaque standard-library HashMap/HashSet bucket storage");
-    }
-    for data in interp.array_buffers.values() {
-        match data {
-            crate::interpreter::BufferData::Local(bytes) => visitor.array_buffer(bytes),
-            crate::interpreter::BufferData::Shared(block) => {
-                visitor.shared_array_buffer(block.id())
-            }
-        }
-    }
-
-    totals.interpreter_side_tables.add(
-        interp
             .shadow_realms
             .len()
             .saturating_mul(size_of::<(usize, crate::agent_access::Owned<Interp>)>()),
@@ -2924,9 +2856,13 @@ mod tests {
     fn wasm_backing_alias_is_not_credited_again_as_an_array_buffer() {
         let mut interp = Interp::new();
         let storage = Rc::new(RefCell::new(Vec::with_capacity(79)));
+        // A buffer over the wasm memory's Data Block, which its payload holds.
+        let (buffer, _) = crate::builtins::array_buffer_with_storage(&mut interp, storage.clone());
         interp
-            .array_buffers
-            .insert(1, crate::interpreter::BufferData::Local(storage.clone()));
+            .global
+            .borrow_mut()
+            .props
+            .insert("wasmBuffer", crate::value::Property::plain(buffer));
         interp
             .host_state
             .put_external_memory(ExternalWasmState(storage.clone()));
@@ -2935,7 +2871,9 @@ mod tests {
             .resources
             .add_external_memory(ExternalWasmState(storage));
 
-        let snapshot = measure(&interp, &[], &[]);
+        let objects = crate::value::heap_gc_snapshot(&interp.gc_heap);
+        let scopes = crate::value::gc_scope_snapshot(&interp.gc_heap);
+        let snapshot = measure(&interp, &objects, &scopes);
         assert_eq!(snapshot.array_buffer_backing.bytes, 0);
         assert_eq!(snapshot.wasm_backing.bytes, 79);
         assert!(!snapshot.wasm_backing.identity_conflict);
@@ -3224,22 +3162,25 @@ mod tests {
         let id = shadow.id();
         root.shadow_realms
             .insert(Gc::as_ptr(&object) as usize, shadow);
+        // Buffers of both interpreters over one Data Block and one Shared Data Block, which
+        // their payloads hold (a heap snapshot lists them; no collection runs here).
+        let buffer = |interp: &mut Interp, data: BufferData| {
+            let object = Object::new(None);
+            interp.install_array_buffer(&object, data);
+            object
+        };
         let shared_buffer = Rc::new(RefCell::new(Vec::with_capacity(333)));
-        root.array_buffers
-            .insert(1, BufferData::Local(shared_buffer.clone()));
         let shared_data_block = crate::interpreter::alloc_shared_mem(337).unwrap();
         let shared_id = shared_data_block.id();
-        root.array_buffers
-            .insert(3, BufferData::Shared(shared_data_block.clone()));
+        let mut buffers = vec![
+            buffer(&mut root, BufferData::Local(shared_buffer.clone())),
+            buffer(&mut root, BufferData::Shared(shared_data_block.clone())),
+        ];
         let heap = root.gc_heap.clone();
         root.with_route(id, |shadow| {
             assert!(Rc::ptr_eq(&heap, &shadow.gc_heap));
-            shadow
-                .array_buffers
-                .insert(2, BufferData::Local(shared_buffer));
-            shadow
-                .array_buffers
-                .insert(4, BufferData::Shared(shared_data_block));
+            buffers.push(buffer(shadow, BufferData::Local(shared_buffer)));
+            buffers.push(buffer(shadow, BufferData::Shared(shared_data_block)));
         });
         let objects = crate::value::heap_gc_snapshot(&root.gc_heap);
         let scopes = crate::value::gc_scope_snapshot(&root.gc_heap);
@@ -3268,6 +3209,7 @@ mod tests {
         )));
         assert!(json.contains("\"externally_shared\":true"));
         assert!(aggregate.interpreter_side_tables.bytes >= 2 * size_of::<Interp>());
+        drop(buffers);
     }
 
     #[test]
@@ -3315,6 +3257,9 @@ mod tests {
     #[test]
     fn array_buffer_view_metadata_is_accounted_separately_from_backing() {
         let mut engine = crate::Engine::new();
+        let before_objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
+        let before_scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
+        let before = measure(&engine.interp, &before_objects, &before_scopes);
         engine
             .eval(
                 r#"
@@ -3330,11 +3275,13 @@ mod tests {
         let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let snapshot = measure(&engine.interp, &objects, &scopes);
 
-        assert!(!engine.interp.array_buffers.is_empty());
-        assert!(!engine.interp.typed_arrays.is_empty());
-        assert!(!engine.interp.ta_buffer.is_empty());
-        assert!(!engine.interp.data_views.is_empty());
-        assert!(snapshot.interpreter_side_tables.bytes > size_of::<Interp>());
+        // The buffer's, the typed array's and the DataView's state are their objects' payloads,
+        // counted with the objects' storage; the bytes are the buffer's backing.
+        let payloads = size_of::<crate::native_typed_array::ArrayBufferData>()
+            + size_of::<crate::native_typed_array::NativeTypedArray>()
+            + size_of::<crate::native_typed_array::NativeBuffer>()
+            + size_of::<crate::native_typed_array::DataViewData>();
+        assert!(snapshot.property_storage.bytes >= before.property_storage.bytes + payloads);
         assert!(snapshot.array_buffer_backing.bytes >= 64);
     }
 

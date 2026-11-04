@@ -4,7 +4,7 @@
 use std::sync::{mpsc, Arc};
 
 use crate::bytecode::Tier;
-use crate::interpreter::{self, AgentChannels, BufferData};
+use crate::interpreter::{self, AgentChannels};
 use crate::{Completion, Engine};
 
 fn eval(engine: &mut Engine, source: &str) {
@@ -12,6 +12,33 @@ fn eval(engine: &mut Engine, source: &str) {
         engine.eval(source, false).expect("fixture parses"),
         Completion::Value(_)
     ));
+}
+
+/// The first SharedArrayBuffer of `engine`'s heap: its block's id and a weak reference to it,
+/// found in a frame of its own (the collector scans the stack).
+#[inline(never)]
+fn first_shared_block(
+    engine: &Engine,
+) -> Option<(u64, std::sync::Weak<interpreter::SharedDataBlock>)> {
+    crate::gc_test::in_frame(|| {
+        crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
+            .iter()
+            .find_map(|object| {
+                let object = object.borrow();
+                let block = object.kind.array_buffer()?.shared()?;
+                Some((block.id(), Arc::downgrade(block)))
+            })
+    })
+}
+
+/// Whether `engine`'s heap holds an ArrayBuffer or SharedArrayBuffer object.
+#[inline(never)]
+fn has_buffer_objects(engine: &Engine) -> bool {
+    crate::gc_test::in_frame(|| {
+        crate::value::heap_gc_snapshot(&engine.interp.gc_heap)
+            .iter()
+            .any(|object| object.borrow().kind.array_buffer().is_some())
+    })
 }
 
 #[test]
@@ -24,15 +51,7 @@ fn shared_buffer_backing_is_collected_after_its_last_view() {
             &mut engine,
             "var view = new DataView(new SharedArrayBuffer(32, {maxByteLength:4096})); view.setUint32(0, 42);",
         );
-        let (id, weak) = engine
-            .interp
-            .array_buffers
-            .values()
-            .find_map(|data| match data {
-                BufferData::Shared(block) => Some((block.id(), Arc::downgrade(block))),
-                _ => None,
-            })
-            .unwrap();
+        let (id, weak) = first_shared_block(&engine).unwrap();
         engine.interp.gc_collect();
         assert!(weak.upgrade().is_some(), "a live view retains its block");
         eval(
@@ -63,15 +82,7 @@ fn queued_shared_buffer_broadcast_owns_bytes_until_receiving_agent_finishes() {
         &mut sender,
         "var shared = new SharedArrayBuffer(4); new Int32Array(shared)[0] = 42; $262.agent.broadcast(shared); shared = undefined;",
     );
-    let (id, weak) = sender
-        .interp
-        .array_buffers
-        .values()
-        .find_map(|data| match data {
-            BufferData::Shared(block) => Some((block.id(), Arc::downgrade(block))),
-            _ => None,
-        })
-        .unwrap();
+    let (id, weak) = first_shared_block(&sender).unwrap();
     sender.interp.gc_collect();
     drop(sender);
     assert!(
@@ -109,7 +120,7 @@ fn shared_buffer_wait_owns_bytes_until_resolution_or_agent_teardown() {
             (wait.id, Arc::downgrade(&wait.block))
         };
         engine.interp.gc_collect();
-        assert!(engine.interp.array_buffers.is_empty());
+        assert!(!has_buffer_objects(&engine));
         assert!(
             weak.upgrade().is_some(),
             "the pending wait retains the block"
