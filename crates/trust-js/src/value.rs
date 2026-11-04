@@ -9188,23 +9188,28 @@ impl Props {
     /// outside any cell). A deferred prototype is materialized, as a clone's is.
     #[inline]
     pub(crate) fn init_copy_of(&mut self, template: &Props) {
+        debug_assert!(self.entries.is_empty() && self.entries.layout.is_none());
         let source = &template.entries;
-        let entries = &mut self.entries;
-        debug_assert!(entries.is_empty() && entries.layout.is_none());
-        entries.layout = source.layout.clone();
-        entries.shape = source.shape;
-        entries.copy_record_parts_from(source);
         let len = source.len();
-        match source.record.0 {
-            // A template outside any cell, every slot in its record (as a function's templates
-            // are), whose slots fit this map's cell: one pass from the record's words into the
-            // cell's, the count set once (W2e step 7).
-            Some(block) if source.cell == 0 && len <= entries.cell as usize => {
+        match source.record.header() {
+            // A template outside any cell, its slots in its record, which holds no index or
+            // extras, and without elements, as a function's templates are, whose slots fit this
+            // map's cell: its words go straight into the cell, the count set once (W2e step 7).
+            Some(header)
+                if source.cell == 0
+                    && len <= self.entries.cell as usize
+                    && header.index.is_none()
+                    && header.extras.is_none()
+                    && template.elems.0.is_static_empty()
+                    && self.elems.0.is_static_empty() =>
+            {
+                let entries = &mut self.entries;
+                entries.layout = source.layout.clone();
+                entries.shape = source.shape;
                 // SAFETY: the record's block holds its `len` initialized slot words after its
                 // header, and this map's cell has room for `cell` words after the object's.
                 unsafe {
-                    let from = block
-                        .as_ptr()
+                    let from = std::ptr::from_ref(header)
                         .cast::<u8>()
                         .add(RECORD_SLOTS_OFF)
                         .cast::<PropWord>();
@@ -9214,23 +9219,36 @@ impl Props {
                     }
                 }
                 entries.len = len as u32;
+                entries
+                    .flags
+                    .set(source.flags.get() & !OBJECT_FLAGS | entries.flags.get() & OBJECT_FLAGS);
+                entries.proto_slot.set(source.proto_slot.get());
+                entries.len_slot.set(source.len_slot.get());
             }
-            _ => entries.extend_fresh(
-                len,
-                (0..len).map(|i| source.slot(i).copied_for_another_map()),
-            ),
+            _ => self.init_copy_of_any(template),
         }
+    }
+
+    /// [`Props::init_copy_of`] of any template, out of the common copy's line.
+    #[inline(never)]
+    fn init_copy_of_any(&mut self, template: &Props) {
+        let source = &template.entries;
+        let entries = &mut self.entries;
+        entries.layout = source.layout.clone();
+        entries.shape = source.shape;
+        entries.copy_record_parts_from(source);
+        entries.extend_fresh(
+            source.len(),
+            (0..source.len()).map(|i| source.slot(i).copied_for_another_map()),
+        );
         entries
             .flags
             .set(source.flags.get() & !OBJECT_FLAGS | entries.flags.get() & OBJECT_FLAGS);
         entries.proto_slot.set(source.proto_slot.get());
         entries.len_slot.set(source.len_slot.get());
-        // A template without elements (every function's) leaves the fresh map's static block.
-        if !template.elems.0.is_static_empty() || !self.elems.0.is_static_empty() {
-            self.elems = template.elems.clone();
-            // Moving a payload to a new receiver cannot inherit the old owner's proof.
-            self.elems.0.force_full();
-        }
+        self.elems = template.elems.clone();
+        // Moving a payload to a new receiver cannot inherit the old owner's proof.
+        self.elems.0.force_full();
     }
 
     /// Make this map, fresh and empty, the map of an array of `items` that then gained the named
