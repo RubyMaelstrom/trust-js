@@ -9036,3 +9036,14 @@ Candidates for the exit, beside W2g: the threshold at 1 with TRust's pages reusi
 compiled platform code; acyclic regions only for code that has run (a recompile when hot), and
 DeltaBlue's loop region; compact baseline templates, with today's in-line templates for hot code
 (the compile's code volume); Vue's binding getters and property-read helpers.
+
+### W5's open items, closed (record, 2026-11-04)
+
+`MAX_SLOTS` (4,000 capture and mark slots) and the code-size cap (`MAX_CODE_UNITS`, 2,048) keep a
+pattern on the matcher; neither has a pattern to move on the acceptance set. Under
+TRUST_JS_REGEXP_PROF on main c90b3889 (target/p2/w5-caps), the native tier compiled 29 of 36
+attempts on Djot, 134 of 217 on Octane RegExp and 28 of 37 on chai. Of Octane RegExp's 40 patterns
+with the most work, all run natively but three: two on the single-element scan (`/[+, ]/`, `/./`)
+and one below the tier's 64 executions (`/.+(?:ei|vg|en|vr)[\/: ]([\d.]+)/`, 60). The refused
+compilations' patterns are outside the top 40 by work. Both caps stay. W5's exit keeps its timing
+(Octane RegExp's score at least 1.15x W5a's), owed to the stage-end timing on a quiet machine.
