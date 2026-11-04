@@ -8149,3 +8149,104 @@ passes alone: it counts a process-wide total that parallel tests add to (a flake
 Next: step 5 (array literals with elements), step 6 (the `this` of `new F()`: its class and cursor
 come from the callee's chunk at run time, so the allocation's cursor is read, not built in), step
 7 (closures' helper), step 8 (refill charging), and x86-64's objects.
+
+### W2e steps 5 and 6: array literals with elements and `this` in line (record, 2026-11-04)
+
+Commits, from main 527c2db7, on p2-w2e-this:
+- ef5b7153 (step 6): the direct construct sequence makes its `this` in line from the callee
+  chunk's InstanceImage, which jit_construct_this fills from its fresh instance once the
+  constructor's learning is over (CONSTRUCT_LEARNING, eight constructions), unless that instance
+  keeps a record. The code tests the image's ready word, then the callee's `prototype` through the
+  site's cached shape and slot (jit_construct_this's proof: an Object in the cell), and allocates
+  from the image's cursor and cell size, read at run time (emit_inline_alloc_dynamic): the class
+  is the callee's, which the site does not know when it is compiled. V8's FastNewObject and
+  SpiderMonkey's call stub also make `this` on the caller's side.
+- 9ea3c9db (step 5): array literals of one to eight elements. The values' kind bits are folded in
+  line (a hole's tag takes the helper), then an exact element block is taken from the storage
+  cursor (first, so that a failed cell allocation leaves only plain data behind) and the Array's
+  cell from the chunk's MakeArray image, which every MakeArray fills now (the static empty block
+  and length 0, which the code replaces).
+- 1037fefd: in-line header copies go in pairs (ldp/stp), for every in-line object.
+
+As designed, except:
+1. Step 5 stops at eight elements (MAX_INLINE_ELEMENTS), not a cell's fifteen: each element adds
+   a load, its kind's test and a store to the site's code. Eight leave 0-6% of the measured
+   MakeArray helper calls (below), which include the cursors' refills.
+2. The paired copies were not in the design: they take about eight instructions from each
+   in-line object.
+
+Helper calls of the allocation operations over each run (TRUST_JS_JIT_OPSTAT=1, as the census;
+target/p2/w2e/opstat-1037): the census's main 37d488ca, before W2e, against this tip, so the
+object literals' and `[]`'s fall is steps 3 and 4's:
+
+| workload | MakeObject | MakeArray | MakeArrayLiteral |
+| --- | --- | --- | --- |
+| Vue | | 24,444 -> 0 | |
+| React | 11,026 -> 205 | 21 -> 2 | |
+| Djot | 60,443 -> 2,208 | 22,459 -> 777 | |
+| chai | 561,923 -> 0 | 1,683,054 -> 68,162 | 66,040 -> 0 |
+| sustained | 639,484 -> 10,469 | 399,886 -> 12,859 | |
+| Splay | 529,192 -> 8,651 | | 268,798 -> 4,393 |
+| PdfJS | 23,212 -> 0 | 114,106 -> 4,534 | 4,896 -> 0 |
+| TypeScript | 85,467 -> 0 | 512,497 -> 31,234 | |
+
+Splay's MakeObject calls left are 1.6% of its literals: a cursor's refill every 64 cells (a
+bitmap word). Unchanged: NewObject (React 8,746: literals with spread, computed or accessor
+keys), NewArray (Vue 12,351), MakeClosure (step 7) and New, which counts only the constructions
+the direct sequence declines (chai 736,167, TypeScript 681,917, RayTrace 332,643, Box2D 110,387).
+
+Micro-benchmarks (instructions an iteration over the loop's 18, against main 527c2db7, fat LTO,
+2M iterations of a function's loop):
+
+| script | main | tip |
+| --- | --- | --- |
+| `{}` | 114.1 | 106.2 |
+| `{x: i, y: i}` | 132.6 | 124.8 |
+| five keys | 161.3 | 153.5 |
+| `[]` | 116.9 | 109.0 |
+| `[1, 2, 3]` (shared) | 116.9 | 109.0 |
+| `[i, i]` | 533.6 | 204.0 |
+| `new P(x, y)` | 682.8 | 544.7 |
+| a function expression | 1,056.8 | 1,056.8 |
+
+`[i, i]` takes 209.8 at step 5 and `new P(x, y)` 552.6 at step 6, before the paired copies; a
+plain call takes 231.2. The exit's bounds (100 for `{}`, `[]` and `[1, 2, 3]`, 120 for `{x, y}`)
+are not met yet: step 8 takes the byte charge and the two counts out of the fast path.
+
+Counts against main 527c2db7 (fat LTO, CPUs 10-13, pacing off, median of 3):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,825,917,006 | 1,825,443,185 | -0.03% |
+| React | 318,472,145 | 318,424,705 | -0.01% |
+| Djot | 643,785,323 | 643,123,447 | -0.10% |
+| chai | 81,646,884,493 | 81,622,435,679 | -0.03% |
+| Richards | 136,864,969 | 136,870,583 | +0.00% |
+| DeltaBlue | 263,572,590 | 263,088,798 | -0.18% |
+| Crypto | 730,132,382 | 730,082,924 | -0.01% |
+| RayTrace | 1,019,262,038 | 1,019,351,044 | +0.01% |
+| EarleyBoyer | 3,405,891,290 | 3,220,520,705 | -5.44% |
+| RegExp | 2,802,418,154 | 2,802,823,337 | +0.01% |
+| Splay | 1,434,257,119 | 1,424,563,592 | -0.68% |
+| NavierStokes | 451,902,965 | 451,916,582 | +0.00% |
+| PdfJS | 7,940,393,692 | 7,905,517,898 | -0.44% |
+| Mandreel | 62,958,625,494 | 62,958,048,371 | -0.00% |
+| Gameboy | 21,499,806,011 | 21,491,529,150 | -0.04% |
+| CodeLoad | 483,711,337 | 483,726,704 | +0.00% |
+| Box2D | 4,493,937,301 | 4,494,395,638 | +0.01% |
+| zlib | 138,040,531,061 | 138,040,545,706 | +0.00% |
+| TypeScript | 59,239,873,479 | 59,121,976,248 | -0.20% |
+
+EarleyBoyer -5.44% (its `new sc_Pair(...)`), Splay -0.68%, PdfJS -0.44%, TypeScript -0.20%,
+DeltaBlue -0.18%, Djot -0.10%; the rest within 0.04% (RayTrace, RegExp and Box2D +0.01%).
+
+Checks on 1037fefd: the lib suite with the embed feature on ARM64 (2,760) and x86-64 (zombie,
+2,542); clippy in the three configurations on x86-64; Test262 at --tier=jit threshold 8, 53,575
+of 53,575 and identical to main's report; the fixtures' masked output as main's; difftest 138
+agree, 12 skipped (budget). The new tests (in-line `this` objects, past their cell, array
+literals with elements) check the in-line objects against helper-made ones.
+
+x86-64 keeps the helpers for steps 3-6: its backend is a template backend that calls the checked
+helpers for most operations, and its in-line objects wait for its templates (a follow-up).
+
+Next: step 7 (closures' helper) and step 8 (counts at the cursor's flush).
