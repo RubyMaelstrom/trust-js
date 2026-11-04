@@ -2991,6 +2991,8 @@ pub struct Chunk {
     obj_maps: Vec<std::cell::OnceCell<Box<crate::value::Props>>>,
     /// Per object-literal template site, the instance header native code copies (W2e step 3).
     obj_images: Box<[ObjectImage]>,
+    /// The constructor's instance header for native code's direct constructions (W2e step 6).
+    pub(crate) instance_image: InstanceImage,
     /// Per array-literal site (`array_literals`), and for `[]`, the instance header native code
     /// copies (W2e step 4).
     array_images: Box<[ObjectImage]>,
@@ -3209,6 +3211,21 @@ impl ObjectImage {
     }
 }
 
+/// A constructor's instance header for native code's direct constructions to copy (W2e step 6):
+/// `ready` once the constructor has learned its instances' capacity and its instance needs no
+/// record, the cursor's byte offset among the heap's cursors and the cell's size for its class
+/// (which the caller's code reads at run time: a construct site's callee may change), then the
+/// header's words, the prototype's word left for the code to fill. Its words name the chunk's
+/// instance layout, which the chunk keeps alive.
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct InstanceImage {
+    pub(crate) ready: std::cell::Cell<u64>,
+    pub(crate) cursor: std::cell::Cell<u64>,
+    pub(crate) cell_size: std::cell::Cell<u64>,
+    pub(crate) words: [std::cell::Cell<u64>; crate::value::OBJECT_HEADER / 8],
+}
+
 pub(crate) struct RecordGetterPlan {
     fields: [(u32, u32); 8],
     count: usize,
@@ -3276,6 +3293,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             feedback_shapes: _,
             obj_maps,
             obj_images: _, // words naming the templates' layouts, which `obj_maps` traces
+            instance_image: _, // words naming `instance_layout`, traced above
             array_images: _, // words naming the literals' blocks, which `array_literals` traces
             empty_array_image: _, // words naming the heap's array layout
             array_literals,
@@ -4088,6 +4106,37 @@ impl Chunk {
         self.instance_class.set(class as u8);
         class
     }
+    /// Make the constructor's instance image (W2e step 6) from `instance`, the fresh instance of
+    /// a direct construction, once its learning is over (the image then holds for every later
+    /// instance), unless it is ready or the instance keeps a record (its reserved capacity past
+    /// the cell's slots).
+    #[inline]
+    pub(crate) fn fill_instance_image(&self, instance: &crate::value::Gc, class: u32) {
+        if self.instance_image.ready.get() == 0 && self.learning.get() >= CONSTRUCT_LEARNING {
+            self.fill_instance_image_cold(instance, class);
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn fill_instance_image_cold(&self, instance: &crate::value::Gc, class: u32) {
+        let Some(words) = crate::value::header_image(instance) else {
+            return;
+        };
+        let Some(site) = crate::value::object_inline_alloc_site(class) else {
+            return;
+        };
+        let image = &self.instance_image;
+        image
+            .cursor
+            .set((site.cursor * crate::gc_core::inline_alloc::CURSOR_SIZE) as u64);
+        image.cell_size.set(site.cell_size as u64);
+        for (cell, word) in image.words.iter().zip(words) {
+            cell.set(word);
+        }
+        image.ready.set(1);
+    }
+
     /// Note a construction's new instance (W2d step 3d): over the first [`CONSTRUCT_LEARNING`]
     /// constructions, raise the learned capacity to what the previous instance holds now, and
     /// keep this one, weakly, for the next. Afterwards one compare.
@@ -8893,6 +8942,7 @@ fn finish_chunk(
             .map(|_| std::cell::OnceCell::new())
             .collect(),
         obj_images: (0..c.obj_maps).map(|_| ObjectImage::default()).collect(),
+        instance_image: InstanceImage::default(),
         array_images: (0..c.array_literals.len())
             .map(|_| ObjectImage::default())
             .collect(),
@@ -26009,6 +26059,7 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
         |props| props.init_layout(capacity, layout),
     );
     chunk.note_instance(&instance);
+    chunk.fill_instance_image(&instance, class);
     Value::Obj(instance).bits()
 }
 

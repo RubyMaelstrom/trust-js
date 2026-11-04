@@ -10031,8 +10031,16 @@ fn emit_direct_sequence(
         }
         a.mov(0, 12);
         a.mov(1, 10);
+        // W2e step 6: `this` in line from the callee's instance image; the helper otherwise.
+        let made = a.new_label();
+        if let Some(heap) = crate::value::object_inline_alloc_site(0) {
+            let helper = a.new_label();
+            alloc::emit_inline_construct_this(a, &heap, helper, made);
+            a.bind(helper);
+        }
         a.ldr_imm(16, 21, (H_CONSTRUCT_THIS * 8) as u32);
         a.blr(16);
+        a.bind(made);
         if keep_return {
             a.ldr_imm(30, 31, 16);
             a.ldp_post(12, 10, 32);

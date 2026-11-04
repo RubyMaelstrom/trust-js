@@ -94,6 +94,145 @@ pub(super) fn emit_inline_alloc(a: &mut asm::Asm, site: &InlineAllocSite, dst: u
     a.madd(dst, 14, 13, 11);
 }
 
+/// [`emit_inline_alloc`] of a class chosen at run time (W2e step 6): the cursor's byte offset
+/// among the heap's cursors in x`cursor` and the cell's size in x`size` (neither in x10-x17);
+/// `heap`'s heap, live count and allocation count are the code's own. Clobbers x10-x17.
+pub(super) fn emit_inline_alloc_dynamic(
+    a: &mut asm::Asm,
+    heap: &InlineAllocSite,
+    cursor: u32,
+    size: u32,
+    dst: u32,
+    slow: usize,
+) {
+    debug_assert!(![dst, cursor, size].iter().any(|r| (10..=17).contains(r)));
+    a.mov_imm64(10, heap.heap as u64);
+    a.ldrb_imm(11, 10, off::HEAP_FAST_ALLOC as u32);
+    a.cbz(11, false, slow);
+    a.ldr_imm(12, 10, off::HEAP_CURSOR_BASE as u32);
+    a.add_shifted(12, 12, cursor, 0);
+    a.ldr_imm(13, 12, off::CURSOR_FREE as u32);
+    a.cbz(13, true, slow);
+    a.ldr_imm(14, 10, off::HEAP_ALLOCATED_BYTES as u32);
+    a.ldr_imm(15, 10, off::HEAP_INLINE_CHECK_BYTES as u32);
+    a.add_shifted(14, 14, size, 0);
+    a.cmp_reg_x(14, 15);
+    a.b_cond(C_HI, slow);
+    if heap.live_count != 0 {
+        a.mov_imm64(16, heap.live_count as u64);
+        a.ldr_imm(17, 16, 0);
+        a.add_imm(17, 17, 1);
+        a.ldr_imm(15, 10, off::HEAP_LIVE_CHECK as u32);
+        a.cmp_reg_x(17, 15);
+        a.b_cond(C_GT, slow);
+        a.str_imm(17, 16, 0);
+    }
+    if heap.allocated != 0 {
+        a.mov_imm64(16, heap.allocated as u64);
+        a.ldr_imm(17, 16, 0);
+        a.add_imm(17, 17, 1);
+        a.str_imm(17, 16, 0);
+    }
+    a.str_imm(14, 10, off::HEAP_ALLOCATED_BYTES as u32);
+    rbit_x(a, 15, 13);
+    clz_x(a, 15, 15);
+    a.sub_imm(14, 13, 1);
+    a.logic_x(0, 13, 13, 14);
+    a.str_imm(13, 12, off::CURSOR_FREE as u32);
+    a.ldr_w_imm(14, 12, off::CURSOR_WORD as u32);
+    a.ldr_imm(11, 12, off::CURSOR_BITS as u32);
+    a.add_shifted(11, 11, 14, 3);
+    a.ldr_imm(13, 11, 0);
+    a.movz(dst, 1, 0);
+    lsl_reg_x(a, dst, dst, 15);
+    a.logic_x(1, 13, 13, dst);
+    a.str_imm(13, 11, 0);
+    a.add_shifted(14, 15, 14, 6);
+    a.ldr_w_imm(11, 12, off::CURSOR_TAKEN as u32);
+    a.add_imm(11, 11, 1);
+    a.str_w_imm(11, 12, off::CURSOR_TAKEN as u32);
+    a.add_imm(11, 14, 1);
+    a.str_w_imm(11, 12, off::CURSOR_HIGH as u32);
+    a.ldr_imm(11, 12, off::CURSOR_PAGE_BASE as u32);
+    a.madd(dst, 14, size, 11);
+}
+
+/// The `this` of a direct construction in line (W2e step 6; [[Construct]] step 3,
+/// OrdinaryCreateFromConstructor(F, "%Object.prototype%"), what `bytecode::jit_construct_this`
+/// does): with x0 the construct site (a `Cell<ConstructSite>`) and x1 the constructor's cell,
+/// leave the instance's word in x0 and branch to `made`, or branch to `helper` having changed
+/// nothing, with x0 and x1 as they came. It reads the callee's chunk's instance image (ready
+/// once the constructor's learning is over), the constructor's `prototype` through the site's
+/// cached shape and slot (in the cell, an Object: not the deferred prototype, which the helper
+/// makes), then allocates the image's class, as V8's FastNewObject and SpiderMonkey's call stub
+/// make `this` on the caller's side (target/p2/w2e/exemplars.txt, 1.4, 2.4). Clobbers x2-x17.
+pub(super) fn emit_inline_construct_this(
+    a: &mut asm::Asm,
+    heap: &InlineAllocSite,
+    helper: usize,
+    made: usize,
+) {
+    use crate::bytecode::{CallIc, Chunk, ConstructSite, InstanceImage};
+    use std::mem::offset_of;
+    let chunk = offset_of!(ConstructSite, call) + offset_of!(CallIc, chunk_raw);
+    a.ldr_imm(2, 0, chunk as u32);
+    a.cbz(2, true, helper);
+    a.mov_imm64(3, offset_of!(Chunk, instance_image) as u64);
+    a.add_shifted(3, 2, 3, 0);
+    a.ldr_imm(4, 3, offset_of!(InstanceImage, ready) as u32);
+    a.cbz(4, true, helper);
+    a.ldr_w_imm(5, 1, crate::value::CELL_SHAPE_OFFSET as u32);
+    a.ldr_w_imm(6, 0, offset_of!(ConstructSite, prototype_shape) as u32);
+    a.cmp_reg_w(5, 6);
+    a.b_cond(C_NE, helper);
+    a.ldr_w_imm(6, 0, offset_of!(ConstructSite, prototype_slot) as u32);
+    a.ldrb_imm(7, 1, crate::value::CELL_SLOTS_OFFSET as u32);
+    a.cmp_reg_w(6, 7);
+    a.b_cond(C_HS, helper);
+    a.add_shifted(7, 1, 6, 3);
+    a.ldr_imm(8, 7, crate::value::OBJECT_HEADER as u32);
+    a.lsr_imm(5, 8, 48);
+    a.movz(6, (crate::value::PACK_OBJ >> 48) as u32, 0);
+    a.cmp_reg_w(5, 6);
+    a.b_cond(C_NE, helper);
+    a.ubfx(8, 8, 0, 48);
+    a.ldr_imm(5, 3, offset_of!(InstanceImage, cursor) as u32);
+    a.ldr_imm(6, 3, offset_of!(InstanceImage, cell_size) as u32);
+    emit_inline_alloc_dynamic(a, heap, 5, 6, 9, helper);
+    let words = offset_of!(InstanceImage, words);
+    for k in 0..crate::value::OBJECT_HEADER / 8 {
+        let offset = (8 * k) as u32;
+        if k == crate::value::OBJECT_PROTO_WORD {
+            a.str_imm(8, 9, offset);
+        } else {
+            a.ldr_imm(11, 3, (words + 8 * k) as u32);
+            a.str_imm(11, 9, offset);
+        }
+    }
+    a.mov_imm64(12, crate::value::PACK_OBJ);
+    a.logic_x(1, 0, 9, 12);
+    #[cfg(test)]
+    record_inline_construct(a);
+    a.b(made);
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The `this` objects generated code made in line ([`emit_inline_construct_this`]).
+    pub(crate) static INLINE_CONSTRUCTS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
+/// Count an in-line `this` for tests (x10 and x11 are scratch here).
+#[cfg(test)]
+fn record_inline_construct(a: &mut asm::Asm) {
+    let address = INLINE_CONSTRUCTS.with(|count| count.as_ptr() as usize);
+    a.mov_imm64(10, address as u64);
+    a.ldr_imm(11, 10, 0);
+    a.add_imm(11, 11, 1);
+    a.str_imm(11, 10, 0);
+}
+
 /// Make the activation in line and install it as the frame's environment (what
 /// `bytecode::jit_frame_setup` does for such a chunk), or branch to `slow` having changed
 /// nothing: the cell (x9), its header's words, the closure's environment (`env_raw`) as its

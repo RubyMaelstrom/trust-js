@@ -165,3 +165,69 @@ fn empty_literals_and_shared_copies_are_the_helpers() {
         assert_eq!(result, expected, "{literal}");
     }
 }
+
+fn in_line_constructs() -> usize {
+    alloc::INLINE_CONSTRUCTS.with(|count| count.get())
+}
+
+/// The `this` of a direct construction made in line (W2e step 6) is the object the helper made
+/// before the constructor's learning ended: the same header, prototype and properties; a new
+/// `prototype` reaches the next instances; instances survive the collections their allocations
+/// make due.
+#[test]
+fn in_line_this_objects_are_the_helpers() {
+    let mut engine = engine(Tier::Jit);
+    let before = in_line_constructs();
+    let result = eval(
+        &mut engine,
+        "function P(x, y) { this.x = x; this.y = y; }
+         P.prototype.sum = function () { return this.x + this.y; };
+         function make(i) { return new P(i, 2 * i); }
+         var first = make(1);
+         var keep = [];
+         for (var i = 0; i < 100000; i++) { var p = make(i); if (i % 1000 === 0) keep.push(p); }
+         var later = make(1);
+         var d = function (o) {
+             return JSON.stringify(Object.getOwnPropertyDescriptors(o)) +
+                 (Object.getPrototypeOf(o) === P.prototype) + o.sum() + Object.isExtensible(o);
+         };
+         var total = 0;
+         for (var k = 0; k < keep.length; k++) total += keep[k].sum();
+         (d(first) === d(later) ? 'same' : d(first) + ' / ' + d(later)) + ':' + total",
+    );
+    assert_eq!(result, "same:14850000");
+    assert!(in_line_constructs() > before, "no in-line this");
+    let (first, later) = (global(&mut engine, "first"), global(&mut engine, "later"));
+    assert_eq!(header(&first), header(&later));
+    // A new `prototype`: the site's cached shape no longer matches, and the next instance takes
+    // it (through the helper, which refills the site).
+    let result = eval(
+        &mut engine,
+        "P.prototype = { sum: function () { return -1; } };
+         var after = make(3);
+         after.sum() + ':' + (Object.getPrototypeOf(after) === P.prototype)",
+    );
+    assert_eq!(result, "-1:true");
+    engine.interp.gc_collect();
+    let heap = crate::value::active_gc_heap();
+    assert_eq!(
+        crate::value::live_objects(),
+        heap.core.borrow().live_count(heap.object_desc) as i64,
+        "the live count is the live cells'"
+    );
+}
+
+/// A constructor whose instances reserve a record (more fields than their cell holds) keeps the
+/// helper, and a deferred `prototype` is made by the helper's first construction.
+#[test]
+fn this_objects_past_their_cell_take_the_helper() {
+    let mut engine = engine(Tier::Jit);
+    let fields: Vec<String> = (0..20).map(|k| format!("this.f{k} = v;")).collect();
+    let source = format!(
+        "function Big(v) {{ {} }} function make(i) {{ return new Big(i); }}
+         for (var i = 0; i < 50; i++) make(i);
+         var b = make(7); Object.keys(b).length + ':' + b.f19 + ':' + (b instanceof Big)",
+        fields.join(" ")
+    );
+    assert_eq!(eval(&mut engine, &source), "20:7:true");
+}

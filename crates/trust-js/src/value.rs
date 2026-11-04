@@ -3953,6 +3953,19 @@ pub(crate) fn object_inline_alloc_site(class: u32) -> Option<crate::gc_core::Inl
     })
 }
 
+/// The byte offsets, from an object's cell, of its map's shape (a `u32`) and of the count of
+/// slots its cell holds (a `u8`): what W2e step 6's in-line `this` reads of a constructor.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const CELL_SHAPE_OFFSET: usize = OBJECT_HEADER - std::mem::size_of::<Object>()
+    + std::mem::offset_of!(Object, props)
+    + std::mem::offset_of!(Props, entries)
+    + std::mem::offset_of!(NamedEntries, shape);
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const CELL_SLOTS_OFFSET: usize = OBJECT_HEADER - std::mem::size_of::<Object>()
+    + std::mem::offset_of!(Object, props)
+    + std::mem::offset_of!(Props, entries)
+    + std::mem::offset_of!(NamedEntries, cell);
+
 /// The header word of an object's cell that holds its prototype (W2e step 3's images): the
 /// Object ends its `RefCell` ([`check_object_layout`]).
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
