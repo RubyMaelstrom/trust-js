@@ -7578,3 +7578,240 @@ Follow-ups:
   boilerplate_properties and SpiderMonkey's NewInit count do.
 - JSON.parse's objects are made empty; V8's parser sizes them by their keys.
 - Step 4 (copy-on-write literal elements) is next (Decision 28).
+
+### W2d step 4: copy-on-write literal elements (census and design, 2026-11-04)
+
+Decision 28c's first half, on main 4e99a65a (code as d1d36453).
+
+Census: main with a census patch (target/p2/w2d4/census: census.patch, run.sh, summary.txt;
+TRUST_JS_COW_CENSUS=1, a release build without LTO, one run each on CPUs 10-13, pacing off; an
+agent's). The compiler classifies each literal it lowers to MakeArray, and the tree-walker its
+own; each constant literal's array is tagged at creation and compared at its death and at the
+heap's release (block, used length and words), so writes by generated code count too. A literal
+is constant when it has no hole or spread, at least one element, and every element a literal.
+- Constant literals are all of Splay's MakeArray executions (936,958 under the timed driver,
+  every one `[0, 1, 2, 3, 4, 5, 6, 7, 8, 9]` at splay.js:53), 3.8% of chai's (66,040: 92.7%
+  strings, 7.3% int32, two to eight elements), 4.1% of PdfJS's (4,896, 96% of them `[11]`), and
+  none elsewhere outside code the tree-walker runs at load. `[]`, which has no block to share,
+  is 95-100% of Vue's, Djot's, TypeScript's and chai's MakeArray.
+- Almost no copy is written: Splay 0 of 936,961, chai 80 of 67,446, PdfJS 0 of 11,891, five or
+  fewer elsewhere. The kinds are int32 and strings; two arrays in all the runs held a Number that
+  is not an int32.
+- Splay's live heap at its largest major (the timed driver's 86th collection): 131.62 MB, of
+  which 256,059 unwritten payload arrays hold 24.58 MB of blocks (96 bytes each); shared, it
+  would be 107.04 MB.
+- The tree-walker's literals: eval_array appends to an empty array, whose growth gives every
+  literal of up to 16 elements a 16-word block (192 bytes). PdfJS keeps 6,746 such pairs from its
+  run-once CID tables (pdfjs.js:8969-10134) live: 1.36 MB of its 8.83 MB live heap.
+
+What the exemplars do (target/p2/w2d/exemplars.txt, 5.1-5.3; V8 c8b70908, JSC 26027804,
+SpiderMonkey 6bb81100; V8's store paths from its tree at target/p2/w3-design/v8-src):
+- V8 shares the elements of a "simple and shallow" array literal: every element a compile-time
+  constant, no nested literal, at least one element, of Smi or object elements kind
+  (ast.cc:815-821). The first execution makes the boilerplate, whose elements get
+  fixed_cow_array_map, and every copy points at them (runtime-literals.cc:637-640,
+  factory.cc:2981-2982; CSA's CloneFastJSArray, code-stub-assembler.cc:5943-5975). Double
+  literals are copied (runtime-literals.cc:632-634): V8's double arrays have their own store.
+- A V8 element store handler compares the elements' map with fixed_cow_array_map and bails out
+  unless the site's store mode handles copy-on-write (code-stub-assembler.cc:14995-14998). The IC
+  picks that mode when it first meets a receiver with COW elements (ic/ic.cc:3030-3047); the
+  handler then copies at the same capacity before it stores (CopyElementsOnWrite,
+  code-stub-assembler.cc:15127-15133, 15230-15246), or into a grown store for an append
+  (kGrowAndHandleCOW). Array.prototype.pop's builtin sends a COW receiver to the runtime
+  (builtins-array-gen.cc:310-313), which copies in EnsureWritableFastElements
+  (js-objects-inl.h:1121-1131, js-objects.cc:2598-2606).
+- JSC decides at bytecode generation: a literal whose run of elements before any hole or spread
+  is non-empty and all constants gets a JSCellButterfly with the CopyOnWrite indexing bit and
+  op_new_array_buffer (NodesCodegen.cpp:442-517), for the Int32, Double and Contiguous shapes
+  (IndexingType.h:82-86, 114-116). The bit is part of the structure's indexing type, so every
+  put's indexing check fails on it, and writes take the slow path, where ensureWritable /
+  convertFromCopyOnWrite copies into a vector of length + length / 2 (JSObject.cpp:1848-1884,
+  JSObjectInlines.h:1629-1633). Its array allocation profile keeps the bit for its sites
+  (ArrayAllocationProfile.cpp:62-68).
+- SpiderMonkey removed copy-on-write elements in 2020 with type inference ("COW elements are
+  harder to implement efficiently without TI and were always pretty complicated", 45ee6a648bb7);
+  from 2018 it had not shared literals of fewer than five elements ("copying the elements
+  lazily is not worth it in that case", 208437186bcc).
+- Neither V8 nor JSC stops sharing at a site whose copies are written.
+
+Design:
+1. Which literals: an array literal with no hole or spread and at least one element, each a
+   literal the compiler pushes as a constant: a Number (signed or not: `-1`, `+2`, `-(3)`), a
+   String, a Boolean, null, `undefined` (which the compiler pushes as a constant, Op::Undef) or a
+   BigInt; no nested literal (V8's "shallow"); at most u16::MAX elements (MakeArray's bound).
+   Every kind of word, as JSC shares Int32, Double and Contiguous shapes: a Number word is the
+   double itself, so doubles need no store of their own (the census found V8's exclusion of
+   them would change nothing). No minimum length: the census's copies are almost never
+   written, so SpiderMonkey's reason for one does not arise.
+2. The site: the compiler emits Op::MakeArrayLiteral(site) instead of the constant pushes and
+   MakeArray(n). Chunk::array_literals holds each site's values, roots for the chunk's life as
+   `consts` are, and from its first execution its shared block: the values' words, exact, marked
+   KIND_COW and KIND_SCANNED (its kind bits come from every word). The fill is a late store into
+   a registered code root, so it reports the block (value::remember_code_edges), and
+   Chunk::trace_gc reports each site's values and block, as it reports obj_maps. The op's array
+   is a fresh array (`length` at slot 0) whose element storage points at the shared block; it
+   records its allocation as MakeArray does.
+3. The shared block: KIND_COW means no owner writes it, not a word, the header or a record. A
+   shared block is exact (capacity = used), holds no hole, has no front room and keeps no
+   remembered record (its words never change, so a remembered trace reports them all, which only
+   an old owner written elsewhere asks for). Words::share makes another owner; Clone of a shared
+   Words shares it.
+4. Rust writes copy first, inside Words: every write that keeps the words where they are (set,
+   move_out, reverse, splice, set_integrity) makes the block its own first, an exact copy (V8's
+   CopyElementsOnWrite); pop, shift and truncate copy the words they keep into one exact private
+   block; push, unshift and resize_with_holes grow an exact shared block into a private one (one
+   copy, V8's kGrowAndHandleCOW), as the generated appends do. The map's accessors stay as they
+   were, so the paths that never meet a shared block pay nothing. reprove writes no shared block,
+   which is scanned for good. Debug builds assert at every word and header write that the block
+   is not shared.
+5. Generated code: the kind bits are renumbered so that KIND_COW sits beside KIND_FROZEN, between
+   INT32 and SCANNED (INT32 4, FROZEN 8, COW 16, SCANNED 32, SEALED 64), and every in-line write
+   that tested FROZEN tests KIND_UNWRITABLE = FROZEN | COW, one logical immediate, and branches to
+   the same slow path, whose helper copies (as V8's handler bails without HandleCOW, and as
+   JSC's puts take the slow path):
+   - the Number overwrite with its kind update (emit_word_number_kind_unfrozen), whose masks
+     INT32|FROZEN|COW and FROZEN|COW|SCANNED stay single runs, so the guard costs nothing more:
+     element stores (emit_word_store), `a[i]++` (emit_update_elem_inline), the chains' element
+     stores (emit_chain_marked) and region SetElemLocal (jit_regions.rs);
+   - the other-value overwrite's guard (emit_words_frozen_guard);
+   - the loop chains' words-mode preamble, which refuses a receiver its chain stores to (the
+     plain loop's helper copies, and the back edge enters again); a receiver it only reads keeps
+     the block.
+   Appends (emit_word_create, emit_define_elem_inline) need used < capacity, which an exact block
+   never has, and hole fills need a hole, which a shared block never holds, so both take the
+   helper. The x86-64 backend writes no element word in line.
+6. Collection: every owner reports the shared block and traces its words (marking is
+   idempotent), and the site does too, so a block lives while its site or any copy does. A
+   Numbers block has no edges. Memory accounting counts a shared block with its chunk, not with
+   the arrays (retained_requested_storage_bytes).
+7. Tiers: the VM, the ARM64 helper (H_MAKE_ARRAY's entry dispatches on the op), regions (the same
+   helper) and x86-64 (jit_exec) make the shared array. The tree-walker, which runs a function's
+   first calls and run-once code, keeps copying its literals, now into exact blocks: a literal
+   without a spread reserves its elements' words before its appends.
+
+Expected: Splay's live heap 131.6 to about 107 MB (the census); bytes allocated: Splay's payload
+blocks go, chai's 3.1 MB and PdfJS's 0.15 MB of compiled literals, and PdfJS's tree-walked pairs
+shrink from 192 to 32 bytes each; instructions: a shared literal allocates one cell and copies
+nothing (Splay spends 6.8% of its instructions creating its payload objects), and a copy's first
+write pays the store helper and the copy, which the census finds almost never happens.
+
+Exit (W2's, Decision 28): Splay's live heap at or below 123 MB; no fixture or Octane benchmark
+slower beyond noise; objects' bytes allocated as step 3's exit or lower.
+
+Risks:
+- A write path that misses the bit writes every copy at once: a silent correctness bug. Guards:
+  the debug assertions at every word and header write; shared_literal_tests (32 ways of writing
+  one copy, in each tier, each checking a sibling copy and the site's next copy, which still
+  share the block); Test262 in full; difftest; GC stress over the new tests.
+- The renumbered bits change every generated element store's masks; the code dumps show it, and
+  the debug kind-bit check at every trace covers the bits' meanings.
+- A site whose copies are all written pays the store helper per copy (about 300 instructions
+  over today's in-line store); V8's handler copies in line instead, which a workload that shows
+  the cost would justify.
+
+### W2d step 4: copy-on-write literal elements (record, 2026-11-04)
+
+Commits, from main 4e99a65a, on p2-w2d4:
+- 726fb07c: constant array literals share one copy-on-write element block (Op::MakeArrayLiteral,
+  Chunk::array_literals, KIND_COW, the renumbered kind bits, KIND_UNWRITABLE in the ARM64 guards).
+- 64071742: tests follow shared literals.
+- 3e45acee: Words' in-place writes copy a shared block, and appends reallocate it.
+- 37d488ca: the tree-walker's array literals take exact blocks.
+- then the design note and this record.
+
+As designed, except:
+1. The copy is made inside Words, not in the map's accessors. The first build copied in
+   DenseStorage::words_mut and words_start, which put a test on every Rust write of element words,
+   shared or not; that left Djot +0.18% and moved fat LTO's inlining (push_packed_property out of
+   try_append_element). In 3e45acee the in-place writes (set, move_out, reverse, splice,
+   set_integrity) copy first, pop, shift and truncate copy only the words they keep, and push,
+   unshift and resize_with_holes rely on the exact block's growth, as the generated appends do:
+   Djot +0.04%, React +0.07% to +0.02%, DeltaBlue +0.07% to +0.02%.
+2. Three tests changed. Two region tests store into a literal and assert that their numeric region
+   ran: a storing region refuses a shared block until a plain iteration has copied it, so their
+   arrays are written once first. The small packed array test now checks both cases: a private
+   copy's reads and writes stay native, and a shared copy takes one helper call, at its first
+   write.
+3. The tree-walker sizes its literals exactly (37d488ca), from the census, which the design had
+   not planned.
+
+Micro-benchmarks (instructions an iteration against main d1d36453, fat LTO, 2M iterations of a
+function's loop):
+
+| script | change |
+| --- | --- |
+| loop alone | +0.00 |
+| `[0, 1, ..., 9]` | -403.13 |
+| `[1, 2, 3]` | -212.82 |
+| `[7]` | -147.98 |
+| `['a', 'b', 'c']` | -218.83 |
+| `[1, 2, 3]`, then `a[0] = i` | +296.74 |
+| `[1, 2, 3]`, then two writes | +311.74 |
+| `[1, 2, 3]`, then `a.push(i)` | -212.32 |
+| `[0, ..., 9]`, then all ten written | +168.55 |
+| `[i, i]` (not constant) | +1.01 |
+
+A copy's first write takes the store helper (jit_set_elem, set_computed_element, fast_set_elem and
+Words::set, about 240 instructions), then the copy (about 130), where main copied at creation. The
+census found almost no copy written.
+
+Counts against main d1d36453 (fat LTO, CPUs 10-13, pacing off, median of 3):
+
+| workload | main | tip | change |
+| --- | --- | --- | --- |
+| Vue | 1,834,632,135 | 1,832,831,106 | -0.10% |
+| React | 331,317,211 | 331,379,641 | +0.02% |
+| Djot | 661,674,444 | 661,919,952 | +0.04% |
+| chai | 81,870,912,692 | 81,860,921,008 | -0.01% |
+| Richards | 136,858,059 | 136,870,200 | +0.01% |
+| DeltaBlue | 263,697,645 | 263,754,027 | +0.02% |
+| Crypto | 730,031,032 | 730,098,261 | +0.01% |
+| RayTrace | 1,019,231,313 | 1,019,256,559 | +0.00% |
+| EarleyBoyer | 3,400,046,129 | 3,399,925,732 | -0.00% |
+| RegExp | 2,803,288,195 | 2,802,708,009 | -0.02% |
+| Splay | 1,678,675,395 | 1,609,974,069 | -4.09% |
+| NavierStokes | 451,878,403 | 451,906,511 | +0.01% |
+| PdfJS | 7,942,217,347 | 7,949,608,287 | +0.09% |
+| Mandreel | 62,958,748,248 | 62,957,771,329 | -0.00% |
+| Gameboy | 21,541,799,382 | 21,543,983,935 | +0.01% |
+| CodeLoad | 483,566,798 | 483,631,148 | +0.01% |
+| Box2D | 4,493,258,356 | 4,493,601,484 | +0.01% |
+| zlib | 138,040,193,853 | 138,040,537,488 | +0.00% |
+| TypeScript | 59,324,596,666 | 59,346,797,504 | +0.04% |
+
+Splay -4.09%: its payload literal makes no block and copies nothing. PdfJS +0.09% is one more major
+collection (5 against 4; minors and compilations the same): the tree-walker's exact blocks lower
+its live heap (dense-sampled: median 7.93 to 6.78 MB, peak 9.54 to 8.45 MB), and the next major's
+limit, which follows the live size, comes sooner. Without them (3e45acee) PdfJS was -0.19%. The
+rest are within 0.1%.
+
+Exit:
+- Splay's live heap at its largest major (the timed driver): 131.62 MB on main, 107.04 MB on the
+  tip (the census: 107.04). W2's halving asks for 123 MB, half of the close-out's 246.2; the tip is
+  56.5% below the close-out's.
+- Objects' bytes allocated over the run (step 3's objbytes measure; a shared block counts with no
+  array), against step 3's tip: Splay 128.3 to 97.8 bytes an object (-23.8%; the census's "today",
+  223.0: -56.1%), chai 795.38 to 791.84 MB (-0.45%; -37.1% against the census's today), the others
+  the same within 5 KB (the tree-walker's literals).
+- The fixtures' peak RSS (fresh copies made together, median of 7, MiB): Vue 24.07 before W2d,
+  23.55 on main, 22.96 on the tip; React 15.25, 15.40, 15.27; Djot 36.36, 31.59, 32.35, which over
+  15 rounds is 35.92, 32.68 and 32.72 (ranges 31.3-33.3 on main, 31.5-33.4 on the tip); an empty
+  script 13.83 on all three.
+
+Checks on 37d488ca: the lib suite on ARM64 (2,619) and x86-64 (zombie, 2,542); clippy in the
+three configurations on both; rustfmt; Test262 at --tier=jit threshold 8, 53,575 of 53,575 and
+identical to main's report; the fixtures' masked output as main's; difftest 138 agree, 12 skipped
+(budget); GC stress over shared_literal_tests. The code dumps on ARM64, compared by hand on a
+function that makes a constant literal and stores to it: the literal's site loses its constant
+pushes (`mov x1, #pc; bl` the array helper), and the store guards' masks change (INT32|FROZEN|COW
+0x1c for 0xc, FROZEN|COW|SCANNED 0x38 for 0x18, FROZEN|COW 0x18 for 0x8, ~SCANNED 0xffffffdf);
+nothing else does.
+
+Follow-ups:
+- A copy's first write costs about 300 instructions over an in-line store. V8's store handler
+  copies in line (kHandleCOW); a workload that writes its copies would justify it, which none of
+  the census's does.
+- Array creation spends about 140 instructions in array_length_layout and array_length_shape, each
+  a lookup through the active heap (the micro-benchmarks' profile); W2e's in-line allocation takes
+  them out of the path.
+- Fixed elements (Decision 28c's second half) are measured next, on this tree.
