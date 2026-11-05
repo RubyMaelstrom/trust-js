@@ -1502,6 +1502,9 @@ pub struct JitLayout {
     /// plain) and their block's address, within the layout cell.
     pub layout_attrs_len: usize,
     pub layout_attrs_ptr: usize,
+    /// A layout's Proxy-trap validation flag (a `bool` byte, [`PropertyLayoutData::validates`]),
+    /// within the layout cell.
+    pub(crate) layout_validates: usize,
     /// The element words' pointer within `Props` (W2c, [`word_block::Words`]): the address of
     /// the first word, never null (a map without words points past the static empty block's
     /// header, whose used length is zero). A word is a plain element's value, a hole the
@@ -1579,6 +1582,13 @@ pub struct JitLayout {
     /// The six fields above matched a live closure's representation, so the JIT's code-keyed
     /// call probe may read a callee's [`UserCallable`] directly.
     pub call_probe_valid: bool,
+    /// `ObjectKind::Proxy`'s payload word (its [`ProxyData`] cell's address) → the proxy's
+    /// [[ProxyTarget]] and [[ProxyHandler]] words (the reads' helper stub reads them,
+    /// `jit::emit_get_prop_trap`).
+    pub(crate) proxy_target: usize,
+    pub(crate) proxy_handler: usize,
+    /// The two fields above matched a live proxy's representation.
+    pub(crate) proxy_valid: bool,
     pub valid: bool,
 }
 
@@ -1721,9 +1731,19 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
             }
             _ => (0, 0, false),
         };
+    // The validation flag, measured the same way on that layout, whose keys are plain or
+    // writable (so its flag is clear).
+    let layout_validates = std::ptr::from_ref(&attrs_layout.validates)
+        .cast::<u8>()
+        .addr()
+        .wrapping_sub(attrs_word);
+    let validates_ok = layout_validates < 4096
+        && std::mem::size_of::<Cell<bool>>() == 1
+        && unsafe { ((attrs_word + layout_validates) as *const u8).read() } == 0;
     let empty_layout: Option<PropertyLayout> = None;
     let layout_ok = keys_off < 256
         && attrs_ok
+        && validates_ok
         && attrs_off < 256
         && std::mem::size_of::<PropKey>() == 8
         && std::mem::size_of::<Option<PropertyLayout>>() == std::mem::size_of::<usize>()
@@ -1905,6 +1925,22 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         let words = callable_words(&ObjectKind::ScopedNative(function));
         callable_ok && words.0 == KIND_EXOTIC_NONE_LAST && words.1 == function as usize
     };
+    // A proxy's kind: its tag, then its payload word, the ProxyData cell's address.
+    let (proxy_target, proxy_handler, proxy_valid) = {
+        let target = Value::Num(17.0);
+        let handler = Value::Bool(true);
+        let proxy = ObjectKind::new_proxy(target, handler);
+        let words = callable_words(&proxy);
+        let target_off = offset_of!(ProxyData, target);
+        let handler_off = offset_of!(ProxyData, handler);
+        let read = |off: usize| unsafe { *((words.1 + off) as *const u64) };
+        let ok = words.0 == KIND_PROXY_TAG
+            && target_off < 256
+            && handler_off < 256
+            && read(target_off) == target.bits()
+            && read(handler_off) == handler.bits();
+        (target_off, handler_off, ok)
+    };
     let parsed = crate::parser::parse_script("function probe(){}", false).ok();
     let probe_func = match parsed.as_deref() {
         Some([crate::ast::Stmt::FuncDecl(func)]) => Some(func.clone()),
@@ -1980,6 +2016,7 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         record_index: RECORD_INDEX_OFF,
         layout_attrs_len,
         layout_attrs_ptr,
+        layout_validates,
         props_layout: offset_of!(Props, entries) + offset_of!(NamedEntries, layout),
         layout_keys_len,
         layout_keys_ptr,
@@ -2019,6 +2056,9 @@ pub(crate) fn jit_layout(sample: &Gc) -> JitLayout {
         func_data_off,
         scope_under_with,
         call_probe_valid,
+        proxy_target,
+        proxy_handler,
+        proxy_valid,
         valid,
     }
 }
@@ -7122,9 +7162,25 @@ pub(crate) struct PropertyLayoutData {
     /// `keys`, then rebuilds this table on that private copy.
     index: Option<crate::gc_storage::StorageBox<LayoutIndex>>,
     shared: Cell<bool>,
+    /// Whether some key of the layout ever had attributes that constrain a Proxy's [[Get]] or
+    /// [[Set]] trap results (ECMA-262 §10.5.8 step 10, §10.5.9 step 10): non-configurable, and
+    /// read-only data or an accessor. Sticky, as SpiderMonkey's NeedsProxyGetSetResultValidation
+    /// and JSC's hasNonConfigurableReadOnlyOrGetterSetterProperties: while it is clear, no own
+    /// named property of an ordinary object of this layout constrains a trap, and a trap's
+    /// result needs no check against it (see [`attrs_constrain_proxy_traps`]).
+    validates: Cell<bool>,
 }
 
 const _: () = assert!(!std::mem::needs_drop::<PropertyLayoutData>());
+
+/// Whether a property with attributes `attrs` constrains a Proxy's [[Get]] or [[Set]] trap
+/// results (ECMA-262 §10.5.8 step 10, §10.5.9 step 10): non-configurable, and read-only data or
+/// an accessor (with or without its getter or setter, as SpiderMonkey's flag counts them).
+#[inline]
+pub(crate) fn attrs_constrain_proxy_traps(attrs: u8) -> bool {
+    let attrs = usize::from(attrs);
+    attrs & PROP_CONFIGURABLE == 0 && (attrs & PROP_ACCESSOR != 0 || attrs & PROP_WRITABLE == 0)
+}
 
 /// A non-Copy, count-free handle. A cloned handle permanently marks its data shared;
 /// structural mutation of shared data copies it into a new private cell.
@@ -7230,6 +7286,7 @@ impl Clone for PropertyLayoutData {
             attrs: std::mem::ManuallyDrop::new((*self.attrs).clone()),
             index: self.index.clone(),
             shared: Cell::new(false),
+            validates: Cell::new(self.validates.get()),
         }
     }
 }
@@ -7242,6 +7299,7 @@ impl PropertyLayoutData {
             attrs: std::mem::ManuallyDrop::new(LayoutAttrs::new()),
             index: None,
             shared: Cell::new(false),
+            validates: Cell::new(false),
         }
     }
 
@@ -7351,6 +7409,9 @@ impl PropertyLayoutData {
         self.keys.push(key);
         if spelled {
             self.attrs.push(attrs);
+            if attrs_constrain_proxy_traps(attrs) {
+                self.validates.set(true);
+            }
         }
         debug_assert!(self.attrs.is_empty() || self.attrs.len() == self.keys.len());
     }
@@ -7377,6 +7438,16 @@ impl PropertyLayoutData {
             self.spell_out_attrs();
         }
         self.attrs[i] = attrs;
+        if attrs_constrain_proxy_traps(attrs) {
+            self.validates.set(true);
+        }
+    }
+
+    /// Whether some key of the layout ever constrained a Proxy trap's results (see
+    /// [`PropertyLayoutData::validates`]).
+    #[inline]
+    pub(crate) fn validates_proxy_traps(&self) -> bool {
+        self.validates.get()
     }
 
     /// Key `from`'s entry (key and attributes) also at `to` (a compaction's move).
@@ -9762,6 +9833,17 @@ impl Props {
     #[inline]
     pub(crate) fn shape(&self) -> u32 {
         self.entries.shape
+    }
+
+    /// Whether an own property of this map may constrain a Proxy trap's results: `false` proves
+    /// that none does (see [`PropertyLayoutData::validates`]); a map without a layout has only
+    /// plain keys, and an element that is not plain lives in the named entries.
+    #[inline]
+    pub(crate) fn may_constrain_proxy_traps(&self) -> bool {
+        self.entries
+            .layout
+            .as_ref()
+            .is_some_and(|layout| layout.validates_proxy_traps())
     }
 
     /// Exercise the exhausted identity path without resetting the process-wide allocator or

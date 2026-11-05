@@ -2304,6 +2304,7 @@ impl Interp {
             call_overflow: _,             // weak pins
             native_callback_cache: _,     // weak pins
             proxy_trap_caches: _,         // weak pins
+            trap_calls: _,                // weak pins
             self_hosted: _,
             shared_snapshots: _,         // parsed source
             construct_capacity_hints: _, // conditional side slots

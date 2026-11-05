@@ -4854,6 +4854,9 @@ pub struct Interp {
     /// All JS identity and AST pins are Weak; this cache cannot keep a closure or realm alive.
     pub(crate) native_callback_cache: Option<Rc<crate::callback::CallbackCache>>,
     pub(crate) proxy_trap_caches: Option<Rc<ProxyTrapCaches>>,
+    /// The named reads' trap call caches (`bytecode::TrapCalls`, which their chunks own) that
+    /// have pins, which every collection prunes.
+    pub(crate) trap_calls: Vec<std::rc::Weak<crate::bytecode::TrapCalls>>,
     /// The parsed self-hosted built-in source, shared by every Realm this interpreter creates
     /// (see `crate::self_hosted`).
     pub(crate) self_hosted: std::cell::OnceCell<Rc<crate::self_hosted::SelfHostedSource>>,
@@ -5200,6 +5203,7 @@ interp_memory_inventory! {
     call_overflow => "measured",
     native_callback_cache => "measured",
     proxy_trap_caches => "measured",
+    trap_calls => "non_owning",
     self_hosted => "measured",
     shared_snapshots => "measured",
     construct_capacity_hints => "measured",
@@ -5296,7 +5300,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 139);
+    assert_eq!(names.len(), 140);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6881,6 +6885,7 @@ impl Interp {
             call_overflow: Default::default(),
             native_callback_cache: None,
             proxy_trap_caches: None,
+            trap_calls: Vec::new(),
             self_hosted: std::cell::OnceCell::new(),
             shared_snapshots: Vec::new(),
             construct_capacity_hints: Default::default(),
@@ -10020,13 +10025,16 @@ impl Interp {
         name: &str,
         key: crate::atom::PropKey,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
+        site: Option<(&crate::bytecode::Chunk, u32)>,
     ) -> Result<Value, Abrupt> {
         // Preserve the named-read String length shortcut without widening or
-        // retaining a temporary string, including when GetProp moved its operand.
-        if name == "length" {
-            if let Some(length) = unsafe { &*base }.with_string(|text| self.str_len(text)) {
-                return Ok(Value::Num(length as f64));
-            }
+        // retaining a temporary string, including when GetProp moved its operand. The receiver
+        // is tested first: an object's read compares no name.
+        if let Some(length) = unsafe { &*base }
+            .with_string(|text| (name == "length").then(|| self.str_len(text)))
+            .flatten()
+        {
+            return Ok(Value::Num(length as f64));
         }
         let read =
             unsafe { &*base }.with_object(|object| self.try_ic_get(object, name, key, cache, true));
@@ -10042,6 +10050,15 @@ impl Interp {
                 // The object IC already declined. Do not repeat its probes before
                 // the full exotic/prototype algorithm.
                 let receiver = *unsafe { &*base };
+                // A read from generated code (its chunk and operation): a Proxy receiver takes
+                // the read's Proxy caches (`bytecode::TrapTable`).
+                if let Some(site) = site {
+                    if let Some(result) =
+                        crate::bytecode::jit_proxy_read(self, site, &receiver, name, key, cache)
+                    {
+                        return result;
+                    }
+                }
                 self.get_member_recv_impl(&receiver, name, receiver, None, Some(key))
             }
             None => {
@@ -11848,6 +11865,77 @@ impl Interp {
         Ok(res)
     }
 
+    /// A named read's Proxy [[Get]] (ECMA-262 §10.5.8) of the key `key` (text `name`) through the
+    /// read's Proxy caches (`slot`, see [`crate::bytecode::TrapTable`]), with the Proxy as the
+    /// Receiver: GetMethod(handler, "get") reads through the slot's property cache, a trap is
+    /// called through the slot's call cache, which a compiled trap's call fills for the read's
+    /// helper stub, on (target, the slot's key value, receiver), with its arguments in this native
+    /// frame (as `call_getter`'s), and the invariant follows. Without a trap, the target's
+    /// [[Get]].
+    pub(crate) fn proxy_get_cached(
+        &mut self,
+        slot: &crate::bytecode::TrapSlot,
+        proxy: &Gc,
+        name: &str,
+        key: crate::atom::PropKey,
+    ) -> Result<Value, Abrupt> {
+        let receiver = Value::Obj(*proxy);
+        let Some((target, handler)) = proxy_parts(proxy) else {
+            unreachable!("the read's receiver is a Proxy");
+        };
+        if matches!(handler.view(), ValueView::Null) {
+            return Err(self.throw("TypeError", "cannot perform 'get' on a revoked proxy"));
+        }
+        // SAFETY: the slot's `get` cache (its property cache's first way, which begins its
+        // `TrapGet`) is boxed for the chunk's life.
+        let trap_get = unsafe { &*slot.get.cast::<crate::bytecode::TrapGet>() };
+        let get = PROXY_TRAP_NAMES[PROXY_TRAP_GET];
+        let trap = self.get_prop_ic(&handler, "get", get.key(), &trap_get.ways[0])?;
+        match trap.view() {
+            ValueView::Undefined | ValueView::Null => {
+                // The read's helper stub goes straight to the helper while handlers have none.
+                trap_get.no_trap.set(1);
+                // Forward to the target's [[Get]], preserving the original Receiver.
+                return self.proxy_forward(|me| me.get_member_recv(&target, name, receiver));
+            }
+            _ if !trap.is_callable() => {
+                return Err(self.throw("TypeError", "proxy 'get' trap is not callable"));
+            }
+            _ => trap_get.no_trap.set(0),
+        }
+        let arguments = [target, slot.key, receiver];
+        // SAFETY: the slot's call cache lives as long as the chunk; the handler and the
+        // argument window stay on this native frame, which the conservative scan roots through
+        // the whole call, its polls and tail drain.
+        let calls = unsafe { slot.trap_calls() };
+        let result = unsafe {
+            self.call_jit_cached(&calls.site, &trap, &handler, arguments.as_ptr(), 3)
+                .or_else(|| {
+                    self.call_jit_fast(
+                        &trap,
+                        &handler,
+                        arguments.as_ptr(),
+                        3,
+                        Some((&calls.site, &calls.pins)),
+                    )
+                })
+        }
+        .unwrap_or_else(|| self.call(trap, handler, &arguments));
+        // A fill pinned the trap: the collections prune the cache's pins from now on.
+        if let Some(calls) = calls.to_list() {
+            self.trap_calls.push(calls);
+        }
+        let result = result?;
+        debug_assert_eq!(
+            slot.key
+                .with_string(crate::atom::PropKey::of_marked)
+                .flatten(),
+            Some(key)
+        );
+        self.proxy_get_invariant(&target, name, &result)?;
+        Ok(result)
+    }
+
     /// `object[index]` when `object` is a Proxy, for an integral Number key whose
     /// ToPropertyKey is `key` (GetValue → [[Get]](P, object)); `None` for any other object. A
     /// Proxy is never a module or deferred namespace, mapped arguments object or String
@@ -13588,6 +13676,7 @@ impl Interp {
             call_overflow: _,
             native_callback_cache: _,
             proxy_trap_caches: _,
+            trap_calls: _,
             construct_capacity_hints,
             global_env_pins: _,
             htmldda: _,
@@ -13757,6 +13846,10 @@ impl Interp {
         if let Some(caches) = &self.proxy_trap_caches {
             caches.prune_dead();
         }
+        // The named reads' trap call caches with pins; one left with none, or a dead chunk's,
+        // leaves the list.
+        self.trap_calls
+            .retain(|calls| calls.upgrade().is_some_and(|calls| calls.prune_dead()));
 
         if self
             .global_env_pins
@@ -13950,10 +14043,13 @@ impl Interp {
         let body = target.borrow();
         body.ic_plain()
             && (body.kind.is_ordinary() || matches!(body.kind, ObjectKind::Array))
-            && body
-                .props
-                .get(key)
-                .is_none_or(crate::value::Element::configurable)
+            // A target whose layout never held a constraining property needs no lookup of
+            // `key` (SpiderMonkey's and JSC's flag; see `Props::may_constrain_proxy_traps`).
+            && (!body.props.may_constrain_proxy_traps()
+                || body
+                    .props
+                    .get(key)
+                    .is_none_or(crate::value::Element::configurable))
     }
 
     pub(crate) fn call_callback(
@@ -18252,7 +18348,7 @@ impl Interp {
     /// undefined. (`Abrupt` carries the thrown TypeError.)
     /// ECMA-262 §10.5.8 steps 8-9: validate a `get` trap result against
     /// target.[[GetOwnProperty]](P), which may itself run a Proxy target's traps.
-    fn proxy_get_invariant(
+    pub(crate) fn proxy_get_invariant(
         &mut self,
         target: &Value,
         key: &str,

@@ -115,6 +115,8 @@ pub(crate) struct Cfg {
     max_settled_stack: usize,
     /// The operand words the stores' setter calls need (see [`Cfg::jit_stack_capacity`]).
     setter_window: usize,
+    /// The operand words the reads' Proxy trap calls need (see [`trap_window`]).
+    trap_window: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1238,6 +1240,7 @@ impl Cfg {
 
         let (pc_depth, max_settled_stack, handler_depths) = analyze_stack(ops, &mut effect)?;
         let setter_window = setter_window(ops, &pc_depth);
+        let trap_window = trap_window(ops, &pc_depth);
 
         let starts = semantic_block_starts(ops)?;
         let mut blocks = Vec::with_capacity(starts.len().saturating_sub(1));
@@ -1345,6 +1348,7 @@ impl Cfg {
             osr_entries: Vec::new(),
             max_settled_stack,
             setter_window,
+            trap_window,
         })
     }
 
@@ -1391,10 +1395,13 @@ impl Cfg {
     }
 
     /// The operand words a frame allocates: the settled maximum and a temporary word, and on
-    /// ARM64 the window a store's setter call pushes (see [`setter_window`]).
+    /// ARM64 the windows a store's setter call and a read's Proxy trap call push (see
+    /// [`setter_window`], [`trap_window`]).
     #[inline]
     pub(crate) fn jit_stack_capacity(&self) -> usize {
-        (self.max_settled_stack + 1).max(self.setter_window)
+        (self.max_settled_stack + 1)
+            .max(self.setter_window)
+            .max(self.trap_window)
     }
 
     pub(crate) fn dominates(&self, a: BlockId, b: BlockId) -> bool {
@@ -1631,6 +1638,26 @@ fn setter_window(ops: &[Op], pc_depth: &[Option<usize>]) -> usize {
         .filter_map(|(op, depth)| match op {
             Op::SetProp(..) | Op::SetPropThisDrop(..) | Op::SetPropLocalDrop(..) => {
                 depth.map(|depth| depth + 2)
+            }
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0)
+}
+
+/// The operand words the reads' helper stub needs for a Proxy trap's call on ARM64 (see
+/// `jit::emit_get_prop_trap`): it runs the trap on [handler, trap, target, key, receiver] pushed
+/// above a named read's incoming operands, five words. 0 for a chunk without named reads, and on
+/// other targets.
+fn trap_window(ops: &[Op], pc_depth: &[Option<usize>]) -> usize {
+    if !cfg!(target_arch = "aarch64") {
+        return 0;
+    }
+    ops.iter()
+        .zip(pc_depth)
+        .filter_map(|(op, depth)| match op {
+            Op::GetProp(..) | Op::GetPropThis(..) | Op::GetPropLocal(..) | Op::GetMethod(..) => {
+                depth.map(|depth| depth + 5)
             }
             _ => None,
         })

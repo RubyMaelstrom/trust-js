@@ -1660,6 +1660,250 @@ pub(crate) const ACCESSOR_TABLE_MASK_OFF: usize = std::mem::offset_of!(AccessorT
 pub(crate) const ACCESSOR_TABLE_SLOTS_OFF: usize = std::mem::offset_of!(AccessorTable, slots);
 const _: () = assert!(std::mem::size_of::<AccessorSlot>() == 32);
 
+/// A named read's Proxy caches in its chunk's [`TrapTable`] (the design note's forks 1 to 3): the
+/// property cache that finds the handler's `get`, the trap's call cache, and the key's value, the
+/// trap's second argument. 64 bytes, so that the probe scales an index by a shift.
+#[repr(C, align(64))]
+#[derive(Clone, Copy)]
+pub(crate) struct TrapSlot {
+    /// The read's operation, or `u32::MAX` for an empty slot.
+    pub(crate) pc: u32,
+    /// `GETTER_READ_*`, with a local's byte offset above the low byte: where the read finds its
+    /// receiver and places its result, as an [`AccessorSlot`]'s.
+    pub(crate) form: u32,
+    /// The trap frame's `FnFrame::call_site`: the read's implicit inline position.
+    pub(crate) position: u32,
+    _reserved: u32,
+    /// The trap's call cache ([`CallSite`]), which its first way begins: a [`TrapCalls`]'s.
+    pub(crate) calls: *const CallSite,
+    /// The handler's `get` read's property cache (its first of [`PROP_IC_WAYS`] ways), which
+    /// begins the slot's [`TrapGet`].
+    pub(crate) get: *const std::cell::Cell<IcState>,
+    /// The key's value: a String that carries the key (`lstr::KEY_MARK`) and lives as long as
+    /// the chunk's heap (an atom, or a static name's copy).
+    pub(crate) key: Value,
+    _rest: [u64; 3],
+}
+
+const EMPTY_TRAP_SLOT: TrapSlot = TrapSlot {
+    pc: u32::MAX,
+    form: 0,
+    position: NO_POSITION,
+    _reserved: 0,
+    calls: std::ptr::null(),
+    get: std::ptr::null(),
+    key: Value::Undefined,
+    _rest: [0; 3],
+};
+
+const _: () = assert!(std::mem::size_of::<TrapSlot>() == 64);
+
+/// A named read's cache of its Proxy handlers' `get` (see [`TrapSlot::get`]): the property cache's
+/// ways, then whether the last handler had no `get` (absent, undefined or null), which sends the
+/// reads' helper stub straight to the helper, whose [[Get]] then reads the target.
+#[repr(C)]
+pub(crate) struct TrapGet {
+    pub(crate) ways: [std::cell::Cell<IcState>; PROP_IC_WAYS],
+    pub(crate) no_trap: std::cell::Cell<u32>,
+}
+
+/// A named read's trap call cache (see [`TrapSlot::calls`]) and the weak pins of the callees
+/// its ways record by identity (see [`CallIc`]), which the collections prune, as a callback
+/// cache's (`Interp::gc_prune_dead_pins`): a way whose callee died keeps its code and is matched
+/// by code only ([`TrapCalls::prune_dead`]). The chunk's own call pins outlive their ways, and a
+/// read whose traps are closures made for each Proxy (chai's) kept a dead closure's cell reserved
+/// for each one its ways had met, for every collection to see. A cache is on the interpreter's
+/// list (`Interp::trap_calls`) while it has pins, so a collection visits those alone.
+#[repr(C)]
+pub(crate) struct TrapCalls {
+    pub(crate) site: CallSite,
+    pub(crate) pins: CalleePins,
+    /// This cache, for the interpreter's list.
+    pub(crate) me: std::rc::Weak<TrapCalls>,
+    /// Whether the cache is on the interpreter's list.
+    pub(crate) listed: std::cell::Cell<bool>,
+}
+
+/// Machine code and [`TrapSlot::calls`] address the cache at the [`TrapCalls`] itself.
+const _: () = assert!(std::mem::offset_of!(TrapCalls, site) == 0);
+
+impl TrapCalls {
+    /// After a collection: a way whose pinned callee died forgets that identity, before its pin
+    /// goes and the address can be reused, and keeps the function, code and environment it
+    /// records, which a closure of the same function matches (the code-keyed probe compares the
+    /// function, whose allocation the way's function pin keeps reserved).
+    /// Whether the cache still has pins (it then stays on the interpreter's list).
+    pub(crate) fn prune_dead(&self) -> bool {
+        let mut pins = self.pins.borrow_mut();
+        for entry in &self.site.entries {
+            let mut ic = entry.get();
+            if ic.callee != 0
+                && pins
+                    .get(&ic.callee)
+                    .is_some_and(|pin| pin.strong_count() == 0)
+            {
+                ic.callee = 0;
+                entry.set(ic);
+            }
+        }
+        pins.retain(|_, pin| pin.strong_count() != 0);
+        let listed = !pins.is_empty();
+        self.listed.set(listed);
+        listed
+    }
+
+    /// The cache, when a fill has just pinned a callee and it is not on the interpreter's list.
+    pub(crate) fn to_list(&self) -> Option<std::rc::Weak<TrapCalls>> {
+        if self.listed.get() || self.pins.borrow().is_empty() {
+            return None;
+        }
+        self.listed.set(true);
+        Some(self.me.clone())
+    }
+}
+
+impl TrapSlot {
+    /// The slot's trap call cache.
+    ///
+    /// # Safety
+    /// The slot was made by its chunk's [`TrapTable`], which keeps the cache for the chunk's
+    /// life.
+    pub(crate) unsafe fn trap_calls(&self) -> &TrapCalls {
+        // SAFETY: `calls` addresses a live `TrapCalls`'s first field (the assertion above).
+        unsafe { &*self.calls.cast::<TrapCalls>() }
+    }
+}
+
+/// Where machine code reads a [`TrapGet`]'s flag, from its first way.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const TRAP_GET_NO_TRAP_OFF: usize = std::mem::offset_of!(TrapGet, no_trap);
+
+/// The Proxy caches of a chunk's named reads, keyed by the reads' operations: an open-addressed
+/// table, as [`AccessorTable`] is, which the reads' helper stub probes (`jit::emit_get_prop_trap`,
+/// slot `pc & mask`, then the next ones up to an empty slot) and the reads' helper fills. ECMA-262
+/// §10.5.8: GetMethod(handler, "get") reads through the slot's property cache, and Call(trap,
+/// handler, «target, P, Receiver») through its call cache, as a read's getter call goes through
+/// the read's own (Decision 17). A read gains its slot when its helper first meets a Proxy
+/// receiver. The caches are boxed and kept for the chunk's life; growing the table moves only its
+/// slots.
+#[repr(C)]
+pub(crate) struct TrapTable {
+    /// The slot count less one (a power of two less one).
+    mask: u32,
+    len: u32,
+    /// `storage`'s slots, as machine code reads them.
+    slots: *const TrapSlot,
+    storage: Box<[TrapSlot]>,
+    /// The call caches (each shared with the interpreter's list of them, which prunes their
+    /// pins, see [`TrapCalls`]) and the `get` reads' property caches, each boxed so that it
+    /// stays put.
+    calls: Vec<std::rc::Rc<TrapCalls>>,
+    #[allow(clippy::vec_box)]
+    gets: Vec<Box<TrapGet>>,
+}
+
+impl TrapTable {
+    #[allow(clippy::vec_box)]
+    fn with_slots(
+        count: usize,
+        calls: Vec<std::rc::Rc<TrapCalls>>,
+        gets: Vec<Box<TrapGet>>,
+    ) -> TrapTable {
+        debug_assert!(count.is_power_of_two());
+        let storage = vec![EMPTY_TRAP_SLOT; count].into_boxed_slice();
+        TrapTable {
+            mask: (count - 1) as u32,
+            len: 0,
+            slots: storage.as_ptr(),
+            storage,
+            calls,
+            gets,
+        }
+    }
+
+    /// The slot of `pc`, or the empty slot that would take it.
+    fn position(&self, pc: u32) -> usize {
+        let mut index = (pc & self.mask) as usize;
+        while self.storage[index].pc != pc && self.storage[index].pc != u32::MAX {
+            index = (index + 1) & self.mask as usize;
+        }
+        index
+    }
+
+    /// The slot of the read at `pc` (with form `form`, position `position` and key value `key`),
+    /// made on first request.
+    fn slot(&mut self, pc: u32, form: u32, position: u32, key: Value) -> TrapSlot {
+        let index = self.position(pc);
+        if self.storage[index].pc == pc {
+            return self.storage[index];
+        }
+        // At most half full, so every probe ends at an empty slot.
+        if 2 * (self.len as usize + 1) > self.storage.len() {
+            let mut grown = TrapTable::with_slots(
+                2 * self.storage.len(),
+                std::mem::take(&mut self.calls),
+                std::mem::take(&mut self.gets),
+            );
+            for slot in self.storage.iter().filter(|slot| slot.pc != u32::MAX) {
+                let index = grown.position(slot.pc);
+                grown.storage[index] = *slot;
+                grown.len += 1;
+            }
+            *self = grown;
+            return self.slot(pc, form, position, key);
+        }
+        let calls = std::rc::Rc::new_cyclic(|me| TrapCalls {
+            site: CallSite::empty(),
+            pins: Default::default(),
+            me: me.clone(),
+            listed: std::cell::Cell::new(false),
+        });
+        let calls_pointer: *const CallSite = &calls.site;
+        self.calls.push(calls);
+        let get = Box::new(TrapGet {
+            ways: [const { std::cell::Cell::new(IcState::EMPTY) }; PROP_IC_WAYS],
+            no_trap: std::cell::Cell::new(0),
+        });
+        let get_pointer: *const std::cell::Cell<IcState> = &get.ways[0];
+        self.gets.push(get);
+        self.storage[index] = TrapSlot {
+            pc,
+            form,
+            position,
+            _reserved: 0,
+            calls: calls_pointer,
+            get: get_pointer,
+            key,
+            _rest: [0; 3],
+        };
+        self.len += 1;
+        self.storage[index]
+    }
+
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<TrapTable>()
+            + self.storage.len() * std::mem::size_of::<TrapSlot>()
+            + self.calls.capacity() * std::mem::size_of::<std::rc::Rc<TrapCalls>>()
+            + self
+                .calls
+                .iter()
+                .map(|calls| {
+                    std::mem::size_of::<TrapCalls>()
+                        + calls.pins.borrow().capacity()
+                            * std::mem::size_of::<(usize, crate::value::WeakGc)>()
+                })
+                .sum::<usize>()
+            + self.gets.capacity() * std::mem::size_of::<Box<TrapGet>>()
+            + self.gets.len() * std::mem::size_of::<TrapGet>()
+    }
+}
+
+/// Where machine code reads a [`TrapTable`]'s mask and slots, and a slot's fields.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const TRAP_TABLE_MASK_OFF: usize = std::mem::offset_of!(TrapTable, mask);
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const TRAP_TABLE_SLOTS_OFF: usize = std::mem::offset_of!(TrapTable, slots);
+
 const CALL_OVERFLOW_SETS: usize = 128;
 const CALL_OVERFLOW_MAX_SETS: usize = 512;
 pub(crate) const CALL_OVERFLOW_WAYS: usize = 4;
@@ -3073,6 +3317,10 @@ pub struct Chunk {
     /// The setter call caches of the chunk's property stores, as the getters'.
     setter_table: std::cell::RefCell<Option<Box<AccessorTable>>>,
     setter_table_raw: std::cell::Cell<*const AccessorTable>,
+    /// The Proxy caches of the chunk's named reads (see [`TrapTable`]), and the table as machine
+    /// code reads it (null before the first).
+    trap_table: std::cell::RefCell<Option<Box<TrapTable>>>,
+    trap_table_raw: std::cell::Cell<*const TrapTable>,
     /// Source names of call and `new` targets, for TypeError messages (see [`Chunk::call_name`]).
     call_names: Option<Box<CallNames>>,
     /// Source positions of the operations (see [`Chunk::position`]).
@@ -3374,6 +3622,8 @@ impl crate::gc_trace::GcTrace for Chunk {
             getter_table_raw: _,
             setter_table: _,
             setter_table_raw: _,
+            trap_table: _,
+            trap_table_raw: _,
             call_names: _,
             positions: _,
             call_positions: _,
@@ -3760,6 +4010,9 @@ impl Chunk {
             if let Some(table) = table.borrow().as_deref() {
                 bytes = bytes.saturating_add(table.retained_bytes());
             }
+        }
+        if let Some(table) = self.trap_table.borrow().as_deref() {
+            bytes = bytes.saturating_add(table.retained_bytes());
         }
         if matches!(self.record_getter.get(), Some(Some(_))) {
             bytes = bytes.saturating_add(std::mem::size_of::<RecordGetterPlan>());
@@ -9617,6 +9870,8 @@ fn finish_chunk(
         getter_table_raw: std::cell::Cell::new(std::ptr::null()),
         setter_table: std::cell::RefCell::new(None),
         setter_table_raw: std::cell::Cell::new(std::ptr::null()),
+        trap_table: std::cell::RefCell::new(None),
+        trap_table_raw: std::cell::Cell::new(std::ptr::null()),
         call_names: c.call_names.into_table(),
         positions: c.positions,
         call_positions,
@@ -22061,6 +22316,9 @@ fn get_named_property(
     result
 }
 
+/// A named read at `pc` from generated code, of the chunk's name `n`, whose receiver `base`
+/// points at: a Proxy receiver, which the property cache declines, takes the read's Proxy caches
+/// ([`jit_proxy_read`]).
 #[inline]
 unsafe fn get_named_property_from_slot(
     i: &mut Interp,
@@ -22072,7 +22330,8 @@ unsafe fn get_named_property_from_slot(
 ) -> Result<Value, Abrupt> {
     if !chunk.feedback.detailed_enabled() {
         let (name, key) = (&*chunk.names[n as usize], chunk.name_key(n));
-        return unsafe { i.get_prop_ic_from_slot(base, name, key, cache) };
+        let site = Some((chunk, pc as u32));
+        return unsafe { i.get_prop_ic_from_slot(base, name, key, cache, site) };
     }
     let receiver = *unsafe { &*base };
     get_named_property(i, chunk, pc, &receiver, n, cache)
@@ -22621,10 +22880,34 @@ impl Chunk {
         // SAFETY: a call cache is boxed and kept for the chunk's life.
         Some((unsafe { &*calls }, &self.call_pins))
     }
+    /// The Proxy caches of the named read at `pc`, if it has them.
+    pub(crate) fn trap_slot_of(&self, pc: u32) -> Option<TrapSlot> {
+        let table = self.trap_table.borrow();
+        let table = table.as_deref()?;
+        let slot = table.storage[table.position(pc)];
+        (slot.pc == pc).then_some(slot)
+    }
+    /// The Proxy caches of the named read at `pc` (with form `form`, see [`TrapTable`]), made on
+    /// first request with `key_value`, the read's key's value, which must carry the key and live
+    /// as long as the chunk's heap (see [`TrapSlot::key`]).
+    pub(crate) fn trap_slot(&self, pc: u32, form: u32, key_value: Value) -> TrapSlot {
+        let mut table = self.trap_table.borrow_mut();
+        let table =
+            table.get_or_insert_with(|| Box::new(TrapTable::with_slots(8, Vec::new(), Vec::new())));
+        let position = self.inline_sites.implicit_position(pc as usize);
+        let slot = table.slot(pc, form, position, key_value);
+        self.trap_table_raw.set(&**table);
+        slot
+    }
     /// Byte offset of the field machine code reads the getter table through.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     pub(crate) fn jit_getter_table_off() -> usize {
         std::mem::offset_of!(Chunk, getter_table_raw)
+    }
+    /// Byte offset of the field machine code reads the trap table through.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_trap_table_off() -> usize {
+        std::mem::offset_of!(Chunk, trap_table_raw)
     }
     /// Byte offset of the field machine code reads the setter table through.
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -27164,6 +27447,44 @@ pub(crate) unsafe extern "C" fn jit_accessor_threw(ctx: *mut crate::jit::JitCtx,
     }
 }
 
+/// The [[Get]] invariant (ECMA-262 §10.5.8 step 10) of a named read at `pc` whose helper stub
+/// called its Proxy's `get` trap through the direct sequence (see `jit::emit_get_prop_trap`),
+/// for a target the stub could not prove unconstrained (its layout's validation flag set, or a
+/// target of another kind): 0 when the trap's result stands; 1, the error placed at the read,
+/// when it violates the invariant. `target` and `result` are packed words the stub's frame and
+/// the operand stack keep.
+///
+/// # Safety
+/// `ctx` is the live context of the code that made the read.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_proxy_get_checked(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    target: u64,
+    result: u64,
+) -> u32 {
+    let ctx = unsafe { &mut *ctx };
+    let chunk = unsafe { &*ctx.chunk };
+    let n = match chunk.ops[pc as usize] {
+        Op::GetProp(n, _) | Op::GetPropThis(n, _) | Op::GetPropLocal(_, n, _) => n,
+        Op::GetMethod(n, _) => n,
+        _ => unreachable!("a named read's trap"),
+    };
+    // SAFETY: both words are live packed values the caller keeps rooted.
+    let (target, result) = unsafe { (Value::from_bits(target), Value::from_bits(result)) };
+    let i = unsafe { &mut *ctx.interp };
+    match i.proxy_get_invariant(&target, &chunk.names[n as usize], &result) {
+        Ok(()) => 0,
+        Err(error) => {
+            ctx.throw_at(pc, error);
+            1
+        }
+    }
+}
+
 /// Dedicated property-read entry (same contract as [`jit_exec`]): straight into
 /// [`crate::interpreter::Interp::get_prop_ic`] for the four read shapes, skipping the generic
 /// op decode.
@@ -27206,6 +27527,74 @@ unsafe fn jit_accessor_validated(
         return None;
     }
     unsafe { i.accessor_validated_get(holder, slot, name, &receiver, Some((chunk, pc, form))) }
+}
+
+/// A named read's [[Get]] when its receiver is a Proxy (ECMA-262 §10.5.8), through the read's
+/// Proxy caches (see [`TrapTable`]), which the reads' helper stub then probes: `site` is the read's
+/// chunk and operation, as [`get_named_property_from_slot`] passes it to
+/// `Interp::get_prop_ic_from_slot`, which calls this where the read's property cache declined the
+/// receiver, so that no other read pays for it. `None` for any other receiver, a read of an index
+/// key or a key whose value carries no key, and under detailed feedback, whose profiled
+/// resolution observes every read.
+pub(crate) fn jit_proxy_read(
+    i: &mut Interp,
+    (chunk, pc): (&Chunk, u32),
+    receiver: &Value,
+    name: &str,
+    key: crate::atom::PropKey,
+    cache: &std::cell::Cell<IcState>,
+) -> Option<Result<Value, Abrupt>> {
+    let object = receiver.as_obj()?;
+    // The kind's tag read in place, without a borrow's count: a declined typed array or
+    // namespace read pays a load and a compare.
+    // SAFETY: the receiver's live payload, which nothing borrows mutably during the helper.
+    if !unsafe { (*object.object_ptr()).kind.is_proxy() } {
+        return None;
+    }
+    jit_proxy_read_cached(i, chunk, pc, &object, name, key, cache)
+}
+
+/// [`jit_proxy_read`] for a Proxy receiver, out of the line.
+#[inline(never)]
+fn jit_proxy_read_cached(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: u32,
+    proxy: &crate::value::Gc,
+    name: &str,
+    key: crate::atom::PropKey,
+    cache: &std::cell::Cell<IcState>,
+) -> Option<Result<Value, Abrupt>> {
+    if chunk.feedback.detailed_enabled() {
+        return None;
+    }
+    // A Proxy receiver is one the read's property cache refuses: the site is generic (W4 step
+    // 5), as the cache's refused fill marks it.
+    i.ic_mark_generic(cache);
+    // The read's slot, once made, answers every later read through it.
+    if let Some(slot) = chunk.trap_slot_of(pc) {
+        return Some(i.proxy_get_cached(&slot, proxy, name, key));
+    }
+    if key.as_index().is_some() || key.is_symbol() {
+        return None;
+    }
+    // Only a value that carries the key lives as long as the heap (an atom or a static name's
+    // copy), which the slot may keep.
+    let key_value = i.property_key_string(key);
+    if crate::atom::PropKey::of_marked(&key_value) != Some(key) {
+        return None;
+    }
+    // Where the read finds its receiver and places its result (`GETTER_READ_*`, see
+    // [`AccessorTable`]), which the stub reads from the slot.
+    let form = match chunk.ops[pc as usize] {
+        Op::GetProp(..) => GETTER_READ_OPERAND,
+        Op::GetPropThis(..) => GETTER_READ_THIS,
+        Op::GetPropLocal(s, ..) => GETTER_READ_LOCAL | (u32::from(s) * 8) << 8,
+        Op::GetMethod(..) => GETTER_READ_METHOD,
+        _ => return None,
+    };
+    let slot = chunk.trap_slot(pc, form, Value::Str(key_value));
+    Some(i.proxy_get_cached(&slot, proxy, name, key))
 }
 
 pub(crate) unsafe extern "C" fn jit_get_prop(
@@ -27285,7 +27674,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                     )
                 } {
                     Some(r) => r?,
-                    None => get_named_property(
+                    None => get_named_property_from_slot(
                         i,
                         chunk,
                         pc as usize,
@@ -27320,6 +27709,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         pc,
                     );
                 }
+                let form = GETTER_READ_LOCAL | (u32::from(s) * 8) << 8;
                 let v = match unsafe {
                     jit_accessor_fast(
                         accessor_validated,
@@ -27328,7 +27718,7 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
                         &chunk.names[n as usize],
                         obj,
                         pc,
-                        GETTER_READ_LOCAL | (u32::from(s) * 8) << 8,
+                        form,
                     )
                 } {
                     Some(r) => r?,

@@ -107,6 +107,13 @@ mod call_closure_tests;
 ))]
 #[path = "jit_getter_call_tests.rs"]
 mod getter_call_tests;
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_proxy_trap_tests.rs"]
+mod proxy_trap_tests;
 
 #[cfg(all(
     test,
@@ -7441,6 +7448,8 @@ fn emit_get_prop_getter(
     ilayout: &crate::interpreter::InterpLayout,
     direct: DirectCallContext,
     plain: usize,
+    // Where a read without a published accessor goes: the Proxy trap's path, or `plain`.
+    no_accessor: usize,
 ) {
     use crate::bytecode::{
         AccessorSlot, ACCESSOR_TABLE_MASK_OFF, ACCESSOR_TABLE_SLOTS_OFF, GETTER_READ_THIS,
@@ -7473,9 +7482,9 @@ fn emit_get_prop_getter(
     let found = a.new_label();
     let rest = a.new_label();
     let hit = a.new_label();
-    // x9 = the published holder's cell (its `Gc::as_ptr`); none: an ordinary read.
+    // x9 = the published holder's cell (its `Gc::as_ptr`); none: no accessor to call.
     a.ldr_imm(9, 19, holder_off);
-    a.cbz(9, true, plain);
+    a.cbz(9, true, no_accessor);
     // x13 = the read's slot in its chunk's getter table: slot `pc & mask`, then the next ones,
     // up to an empty slot (`u32::MAX`); the table is at most half full. Slots are 32 bytes.
     a.ldr_imm(16, 19, offset_of!(JitCtx, chunk) as u32);
@@ -7637,6 +7646,329 @@ fn emit_get_prop_getter(
     a.cbz(9, false, plain);
     entry_gates(a, plain);
     a.mov_imm64(16, crate::value::PACK_OBJ); // the probe used x9: the getter's word again
+    a.logic_x(2, 9, 10, 16);
+    a.b(hit);
+}
+
+/// Whether the property reads' helper stub can call a Proxy receiver's `get` trap (see
+/// [`emit_get_prop_trap`]): the proxy's payload was probed, every offset it addresses fits, and the
+/// direct sequence it enters (three arguments, with `this`) is supported.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn get_prop_trap_supported(
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    direct: DirectCallContext,
+) -> bool {
+    use crate::bytecode::{TrapSlot, TRAP_TABLE_MASK_OFF, TRAP_TABLE_SLOTS_OFF};
+    use std::mem::offset_of;
+    let fits8 = |o: usize| o.is_multiple_of(8) && o / 8 < 4096;
+    let fits4 = |o: usize| o.is_multiple_of(4) && o / 4 < 4096;
+    layout.valid
+        && layout.proxy_valid
+        && fits8(offset_of!(JitCtx, chunk))
+        && fits8(crate::bytecode::Chunk::jit_trap_table_off())
+        && fits4(TRAP_TABLE_MASK_OFF)
+        && fits8(TRAP_TABLE_SLOTS_OFF)
+        && fits4(offset_of!(TrapSlot, form))
+        && fits4(offset_of!(TrapSlot, position))
+        && fits8(offset_of!(TrapSlot, calls))
+        && fits8(offset_of!(TrapSlot, get))
+        && fits4(crate::bytecode::TRAP_GET_NO_TRAP_OFF)
+        && fits8(offset_of!(TrapSlot, key))
+        && layout.obj_from_cell < 4096
+        && layout.obj_kind < 4096
+        && fits8(layout.obj_kind + 8)
+        && fits8(layout.proxy_target)
+        && fits8(layout.proxy_handler)
+        && layout.obj_flags < 4096
+        && fits8(layout.obj_props + layout.props_layout)
+        && layout.layout_validates < 4096
+        && named_slots_fit(layout)
+        && direct_call_supported(
+            ilayout,
+            layout,
+            direct.attempted_off,
+            direct.runs_off,
+            direct.retry_off,
+            3,
+        )
+}
+
+/// The Proxy `get` trap's call of the property reads' helper stub (ECMA-262 §10.5.8 [[Get]] with
+/// the Proxy as the Receiver; the design note's forks 1 to 4, V8's ProxyGetPropertyFastPath,
+/// SpiderMonkey's CallScriptedProxyGetResult, JSC's ProxyObjectLoad), made at run time for any
+/// read site, whenever its code was made: a read whose template declined calls the helper with
+/// w1 = its pc, which finds the read's Proxy caches by that pc in its chunk's trap table (see
+/// [`crate::bytecode::TrapTable`]), which the helper made the first time the read met a Proxy.
+/// The receiver, as the slot's form places it, must be a Proxy whose handler is an Object (a
+/// revoked one takes the helper, which throws). `get` is read from the handler through the slot's
+/// property cache, at any depth, by the property way loop: a data property; an accessor or an
+/// absence takes the helper. The trap is found in the slot's call cache by identity (way 0 here)
+/// or by its code (the `CallSecondary` stub's code-keyed way, which matches the closures of one
+/// function), and the direct sequence, in line (three arguments, with `this`), runs it on
+/// [handler, trap, target, key, receiver] pushed above the operands, the key being the slot's
+/// value, a String that carries the key and lives as long as the heap. The trap frame records the
+/// read's implicit position from the slot. After the call, the [[Get]] invariant (§10.5.8 step 10)
+/// needs no check for an ordinary target (or Array) whose layout never held a constraining
+/// property (SpiderMonkey's and JSC's flag, `value::PropertyLayoutData::validates`), and is checked
+/// in Rust otherwise (`jit_proxy_get_checked`). The stub then returns as the helper would: the
+/// result in the read's place (a method read keeps the receiver under it), x20 the new top and w1
+/// clear. A throw, the trap's or the check's, places the error's pending frame at the read and
+/// returns w1 set, so the site unwinds.
+///
+/// Every decline leaves the operands as found and takes `plain`, the ordinary helper call; a gate
+/// of the sequence itself pops the window first. The stub's frame keeps the pc and form, the slot,
+/// the receiver, the target and the handler: words of the native stack, which the conservative
+/// scan roots, as the window's are rooted by the record's scan. Entry: w1 = pc, x30 = the site's
+/// return; the site's `bl` reached this stub.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_get_prop_trap(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    direct: DirectCallContext,
+    plain: usize,
+) {
+    use crate::bytecode::{TrapSlot, GETTER_READ_THIS, TRAP_TABLE_MASK_OFF, TRAP_TABLE_SLOTS_OFF};
+    use std::mem::offset_of;
+    let obj_off = layout.obj_from_cell as u32;
+    let entry_gates = |a: &mut asm::Asm, refuse: usize| {
+        let enter = a.new_label();
+        a.ldrb_imm(16, 12, offset_of!(crate::bytecode::CallIc, direct) as u32);
+        let ready = crate::bytecode::CALL_IC_DIRECT_READY as u32;
+        for bit in [ready, 1, 8] {
+            a.logic_imm_w(0, 14, 16, asm::logical_imm_w(bit).unwrap());
+            if bit == ready {
+                a.cbnz(14, false, enter);
+            } else {
+                a.cbz(14, false, refuse);
+            }
+        }
+        a.bind(enter);
+    };
+    let form_kind = asm::logical_imm_w(0xff).unwrap();
+    let probe = a.new_label();
+    let found = a.new_label();
+    let have_receiver = a.new_label();
+    let this_receiver = a.new_label();
+    let local_receiver = a.new_label();
+    let unframe = a.new_label();
+    let load_way = a.new_label();
+    let rest = a.new_label();
+    let hit = a.new_label();
+    // x13 = the read's slot in its chunk's trap table: slot `pc & mask`, then the next ones, up
+    // to an empty slot (`u32::MAX`); the table is at most half full. Slots are 64 bytes.
+    a.ldr_imm(16, 19, offset_of!(JitCtx, chunk) as u32);
+    a.ldr_imm(17, 16, crate::bytecode::Chunk::jit_trap_table_off() as u32);
+    a.cbz(17, true, plain);
+    a.ldr_w_imm(14, 17, TRAP_TABLE_MASK_OFF as u32);
+    a.ldr_imm(16, 17, TRAP_TABLE_SLOTS_OFF as u32);
+    a.logic_w(0, 15, 1, 14);
+    a.bind(probe);
+    a.add_shifted(13, 16, 15, 6);
+    a.ldr_w_imm(12, 13, offset_of!(TrapSlot, pc) as u32);
+    a.cmp_reg_w(12, 1);
+    a.b_cond(C_EQ, found);
+    a.cmn_imm_w(12, 1);
+    a.b_cond(C_EQ, plain);
+    a.add_imm(15, 15, 1);
+    a.logic_w(0, 15, 15, 14);
+    a.b(probe);
+    // A read whose last handler had no `get` takes the helper at once.
+    a.bind(found);
+    a.ldr_imm(16, 13, offset_of!(TrapSlot, get) as u32);
+    a.ldr_w_imm(14, 16, crate::bytecode::TRAP_GET_NO_TRAP_OFF as u32);
+    a.cbnz(14, false, plain);
+    // x9 = the read's receiver word, as its form (w3) places it: the top operand (`GetProp`,
+    // `GetMethod`), the frame's `this`, or a local.
+    a.ldr_w_imm(3, 13, offset_of!(TrapSlot, form) as u32);
+    a.logic_imm_w(0, 14, 3, form_kind);
+    a.cmp_imm_w(14, GETTER_READ_THIS);
+    a.b_cond(C_EQ, this_receiver);
+    a.b_cond(C_HI, local_receiver);
+    a.ldur(9, 20, -8);
+    a.b(have_receiver);
+    a.bind(this_receiver);
+    a.ldr_imm(9, 19, 48); // ctx.this_word
+    a.b(have_receiver);
+    a.bind(local_receiver);
+    a.lsr_imm_w(14, 3, 8); // the local's byte offset among the slots
+    a.add_shifted(16, 22, 14, 0);
+    a.ldr_imm(9, 16, 0);
+    a.bind(have_receiver);
+    // A Proxy: an Object whose kind tag is KIND_PROXY_TAG. x4 = its target's word, x5 = its
+    // handler's, which must be an Object (null once revoked).
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, plain);
+    emit_exec_payload(a, 9, 10);
+    a.add_imm(11, 10, obj_off);
+    a.ldrb_imm(14, 11, layout.obj_kind as u32);
+    a.cmp_imm_w(14, crate::value::KIND_PROXY_TAG as u32);
+    a.b_cond(C_NE, plain);
+    a.ldr_imm(16, 11, (layout.obj_kind + 8) as u32);
+    a.ldr_imm(4, 16, layout.proxy_target as u32);
+    a.ldr_imm(5, 16, layout.proxy_handler as u32);
+    emit_exec_tag_guard(a, 5, crate::value::PACK_OBJ, 11, plain);
+    // The frame: [fp, lr], [pc, form], [slot, receiver], [target, handler].
+    a.stp_pre(29, 30, -64);
+    a.stp_off(1, 3, 16);
+    a.stp_off(13, 9, 32);
+    a.stp_off(4, 5, 48);
+    // x9 = the handler's `get`, a data property its property cache proves: x8 = the cache's first
+    // way, x10 = the handler. The way loop lands with x11 = the holder, x13 = the slot, x12 = the
+    // way.
+    a.ldr_imm(8, 13, offset_of!(TrapSlot, get) as u32);
+    emit_exec_payload(a, 5, 10);
+    let flags = PropProbeFlags {
+        arr_ok: false,
+        wrap_ok: false,
+        method: true,
+        kc: false,
+    };
+    emit_prop_way_loop(a, layout, flags, unframe, load_way, unframe, unframe);
+    a.bind(load_way);
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+    named_len(a, layout, 16, 11);
+    a.cmp_reg_x(13, 16);
+    a.b_cond(C_HS, unframe);
+    slot_addr_loc(a, layout, 15, 11, 14);
+    a.ldr_imm(9, 15, 0);
+    branch_accessor_word(a, 9, 16, unframe);
+    // The call probe's inputs (as the getter's): x12 = the slot's call cache, x10 = the trap's
+    // word EOR the Object tag, w15 = the live epoch, x17 = the active Realm's global scope.
+    a.ldr_imm(13, 31, 32);
+    a.ldr_imm(12, 13, offset_of!(TrapSlot, calls) as u32);
+    a.mov_imm64(16, crate::value::PACK_OBJ);
+    a.logic_x(2, 10, 9, 16);
+    a.ldr_imm(16, 19, CALL_IC_EPOCH_OFF);
+    a.ldr_w_imm(15, 16, 0);
+    a.ldr_imm(17, 19, 64); // ctx.genv
+    a.ldur(16, 12, 0); // way 0's callee
+    a.cmp_reg_x(10, 16);
+    a.b_cond(C_NE, rest);
+    a.ldr_w_imm(16, 12, 56); // epoch
+    a.cmp_reg_w(16, 15);
+    a.b_cond(C_NE, rest);
+    a.ldr_imm(16, 12, 32); // global_env
+    a.cmp_reg_x(16, 17);
+    a.b_cond(C_NE, rest);
+    a.movz(15, 0, 0);
+    entry_gates(a, unframe);
+    // ---- hit (x9 = the trap's word, x10, x12 and x15 as the call template's): [handler, trap,
+    // target, key, receiver] above the operands, w2 = the trap frame's position ----
+    a.bind(hit);
+    a.ldp_off(4, 5, 48);
+    a.ldp_off(13, 6, 32);
+    a.ldr_imm(7, 13, offset_of!(TrapSlot, key) as u32);
+    a.stp_base(5, 9, 20, 0);
+    a.stp_base(4, 7, 20, 16);
+    a.str_imm(6, 20, 32);
+    a.add_imm(20, 20, 40);
+    a.ldr_w_imm(2, 13, offset_of!(TrapSlot, position) as u32);
+    let declined = a.new_label();
+    let returned = a.new_label();
+    let threw = a.new_label();
+    let emitted = emit_direct_call(
+        a,
+        ilayout,
+        layout,
+        direct.attempted_off,
+        direct.runs_off,
+        direct.retry_off,
+        3,
+        true,
+        declined,
+        threw,
+        returned,
+        direct.finish_stub,
+        DirectCallSite::Register(2),
+    );
+    debug_assert!(
+        emitted,
+        "`get_prop_trap_supported` checked the sequence's preconditions"
+    );
+    // ---- a gate of the sequence declined, before anything ran: pop the window ----
+    a.bind(declined);
+    a.sub_imm(20, 20, 40);
+    a.bind(unframe);
+    a.ldp_post(29, 30, 64);
+    a.b(plain);
+    // ---- the trap returned: its result replaced the window, at the old top ----
+    a.bind(returned);
+    let check = a.new_label();
+    let checked = a.new_label();
+    let kind_ok = a.new_label();
+    let placed = a.new_label();
+    let check_threw = a.new_label();
+    // The invariant needs no check for an ordinary target (or an Array) of a layout that never
+    // held a constraining property: its kind, its `ic_plain` flag and its layout's flag.
+    a.ldr_imm(16, 31, 48);
+    emit_exec_tag_guard(a, 16, crate::value::PACK_OBJ, 11, check);
+    emit_exec_payload(a, 16, 10);
+    a.add_imm(11, 10, obj_off);
+    a.ldrb_imm(14, 11, layout.obj_kind as u32);
+    branch_exotic_ordinary(a, layout, 14, 15, kind_ok);
+    a.cmp_imm_w(14, layout.exotic_array_tag as u32);
+    a.b_cond(C_NE, check);
+    a.bind(kind_ok);
+    a.ldrb_imm(14, 11, layout.obj_flags as u32);
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), check);
+    a.ldr_imm(16, 11, (layout.obj_props + layout.props_layout) as u32);
+    a.cbz(16, true, checked);
+    a.ldrb_imm(14, 16, layout.layout_validates as u32);
+    a.cbz(14, false, checked);
+    a.bind(check);
+    a.mov(0, 19);
+    a.ldr_w_imm(1, 31, 16); // pc
+    a.ldr_imm(2, 31, 48); // the target
+    a.ldur(3, 20, -8); // the result
+    a.mov_imm64(
+        16,
+        crate::bytecode::jit_proxy_get_checked as *const () as u64,
+    );
+    a.blr(16);
+    a.cbnz(0, false, check_threw);
+    // The result in the read's place: a `GetProp` result replaces its receiver.
+    a.bind(checked);
+    a.ldr_w_imm(3, 31, 24); // form
+    a.logic_imm_w(0, 14, 3, form_kind);
+    a.cbnz(14, false, placed);
+    a.ldur(16, 20, -8);
+    a.stur(16, 20, -16);
+    a.sub_imm(20, 20, 8);
+    a.bind(placed);
+    a.ldp_post(29, 30, 64);
+    a.movz(1, 0, 0);
+    a.ret();
+    // ---- the invariant failed: the check placed its error; drop the result ----
+    a.bind(check_threw);
+    a.sub_imm(20, 20, 8);
+    a.ldp_post(29, 30, 64);
+    a.movz(1, 1, 0);
+    a.ret();
+    // ---- the trap threw: the sequence popped the window, the error is in the context ----
+    a.bind(threw);
+    a.mov(0, 19);
+    a.ldr_w_imm(1, 31, 16); // pc
+    a.mov_imm64(16, crate::bytecode::jit_accessor_threw as *const () as u64);
+    a.blr(16);
+    a.ldp_post(29, 30, 64);
+    a.movz(1, 1, 0);
+    a.ret();
+    // ---- the probe after way 0: the `CallSecondary` stub keeps w1 and w3 ----
+    a.bind(rest);
+    let secondary = a.shared_stub(SharedStub::CallSecondary.key());
+    a.stp_pre(29, 30, -16);
+    a.bl_label(secondary);
+    a.ldp_post(29, 30, 16);
+    a.cbz(9, false, unframe);
+    entry_gates(a, unframe);
+    a.mov_imm64(16, crate::value::PACK_OBJ); // the probe used x9: the trap's word again
     a.logic_x(2, 9, 10, 16);
     a.b(hit);
 }
@@ -13436,8 +13768,18 @@ impl SharedStub {
                 let plain = a.new_label();
                 if let (Some(ilayout), Some(direct)) = (context.ilayout, context.direct) {
                     match usize::from(idx) {
-                        H_GET_PROP if get_prop_getter_supported(layout, ilayout, direct) => {
-                            emit_get_prop_getter(a, layout, ilayout, direct, plain);
+                        H_GET_PROP => {
+                            // A read without a published accessor tries its Proxy receiver's
+                            // trap (see `emit_get_prop_trap`).
+                            let trap = get_prop_trap_supported(layout, ilayout, direct);
+                            let trap_entry = if trap { a.new_label() } else { plain };
+                            if get_prop_getter_supported(layout, ilayout, direct) {
+                                emit_get_prop_getter(a, layout, ilayout, direct, plain, trap_entry);
+                            }
+                            if trap {
+                                a.bind(trap_entry);
+                                emit_get_prop_trap(a, layout, ilayout, direct, plain);
+                            }
                         }
                         H_SET_PROP if set_prop_setter_supported(layout, ilayout, direct) => {
                             emit_set_prop_setter(a, layout, ilayout, direct, plain);
