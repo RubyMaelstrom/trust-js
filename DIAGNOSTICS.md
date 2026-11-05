@@ -217,14 +217,20 @@ comment/example in the same change.
   the factor of 4 with a 4 GiB maximum, the bound binds above about 585 MiB kept. V8 fails
   with out-of-memory at its maximum; the heap does not, and like V8's global limit the bound
   never leaves less room than 8 MiB, so a heap past its maximum keeps collecting at that room.
-  V8's memory reducer runs when the host
-  calls `Engine::run_memory_reducer` at `Engine::memory_reducer_deadline`: 8 s after a major
-  collection that left the heap holding at least 10% and 10 MiB more than the reducer's last
-  run (30 s after `Engine::notify_possible_garbage`, or after the heap first grew 1 MiB past its
-  bootstrap without a major collection), it collects majorly to reduce memory if the program
-  allocates slowly, at most twice, 0.5 s apart; such a collection grows the budget by 1.1,
-  returns the nursery to 2 MiB and keeps no spare pages beyond the minimum, and while the
-  reducer is done the budget grows by at most 1.3. `TRUST_JS_GC_PACING=0` fixes the budgets
+  V8's memory reducer runs when the host calls `Engine::run_memory_reducer` at
+  `Engine::memory_reducer_deadline`: 8 s after a major collection that left the heap holding at
+  least 10% and 10 MiB more than the reducer's last run (30 s after
+  `Engine::notify_possible_garbage`, or after the heap first grew 1 MiB past its bootstrap
+  without a major collection), it collects majorly to reduce memory if the program allocates
+  slowly, at most twice, 0.5 s apart; such a collection grows the budget by 1.1, returns the
+  nursery to 2 MiB and keeps no spare pages beyond the minimum, and while the reducer is done
+  the budget grows by at most 1.3. The pages a collection frees beyond the spare pages the heap
+  keeps (a nursery's budget of them, at least 16, or without a nursery its budget's room) stay
+  pooled for reuse, out of its pause, and no longer count in its committed memory; they go back
+  to the system when the host calls `Engine::run_memory_reducer` 8 s after the pool formed
+  (`Engine::memory_reducer_deadline` then names that time too), or at once in a collection that
+  reduces memory (V8's memory pool); a host that never calls it keeps them. Without pacing,
+  every collection gives them back as it ends. `TRUST_JS_GC_PACING=0` fixes the budgets
   instead (the engine's unit tests' default; `1` turns pacing on there): a 2 MiB nursery and a
   byte budget of twice the bytes a major collection kept. For collector tuning,
   `TRUST_JS_GC_NURSERY_BYTES=N` fixes the nursery budget at N bytes (0 turns minor collections

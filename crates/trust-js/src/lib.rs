@@ -1834,15 +1834,19 @@ impl Engine {
     /// waits: V8's memory reducer (src/heap/memory-reducer.cc), which after a major collection
     /// that left the heap holding noticeably more memory, or after
     /// [`Engine::notify_possible_garbage`], waits 8 s and then collects to give memory back
-    /// while the program allocates slowly. A host runs it from its event loop between tasks,
-    /// whether or not other work is scheduled.
+    /// while the program allocates slowly; or the pool of pages the collections freed beyond
+    /// what the heap keeps, which goes back to the system 8 s after it formed (V8's memory pool,
+    /// src/heap/memory-pool.cc), whichever comes first. A host runs it from its event loop
+    /// between tasks, whether or not other work is scheduled; one that never does keeps the
+    /// pool for reuse.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn memory_reducer_deadline(&self) -> Option<std::time::Instant> {
         self.interp.memory_reducer_deadline()
     }
 
     /// Run the memory reducer's timer at `now`, between tasks (see
-    /// [`Engine::memory_reducer_deadline`]): a major collection that reduces memory when the
+    /// [`Engine::memory_reducer_deadline`]): the pool's pages go back if their time has come,
+    /// and at the reducer's own deadline, a major collection that reduces memory when the
     /// program has been allocating slowly, or else another wait. Returns whether it collected.
     /// Inlined: the stack below the host's frame is zeroed before the collection's frames are
     /// built (see `Interp::gc_collect`).

@@ -29,6 +29,12 @@ fn eval(engine: &mut Engine, source: &str) {
     }
 }
 
+/// The memory reducer's own deadline (the engine's `memory_reducer_deadline`, a host's, also
+/// counts the spare page pool's, W6 step 5).
+fn reducer_deadline(engine: &Engine) -> Option<Instant> {
+    reducer(engine).deadline()
+}
+
 fn reducer(engine: &Engine) -> MemoryReducer {
     engine
         .interp
@@ -73,16 +79,13 @@ fn the_memory_reducer_collects_a_quiet_heap_after_a_major_collection_left_it_lar
     );
     let before = Instant::now();
     engine.interp.collect_garbage_for_host();
-    let deadline = engine
-        .interp
-        .memory_reducer_deadline()
-        .expect("the reducer waits");
+    let deadline = reducer_deadline(&engine).expect("the reducer waits");
     assert!(deadline >= before + LONG_DELAY && deadline <= Instant::now() + LONG_DELAY);
     // An early timer leaves it waiting.
     assert!(!engine
         .interp
         .run_memory_reducer(deadline - Duration::from_secs(1)));
-    assert_eq!(engine.interp.memory_reducer_deadline(), Some(deadline));
+    assert_eq!(reducer_deadline(&engine), Some(deadline));
     // The objects die; at the deadline the program has been quiet, so it collects, and gives
     // the memory back.
     eval(&mut engine, "big = null;");
@@ -105,10 +108,7 @@ fn the_memory_reducer_collects_a_quiet_heap_after_a_major_collection_left_it_lar
     );
     // It freed memory, so a second collection follows after the short delay, and then it is
     // done: V8 runs at most two.
-    let next = engine
-        .interp
-        .memory_reducer_deadline()
-        .expect("a second run is due");
+    let next = reducer_deadline(&engine).expect("a second run is due");
     assert!(engine.interp.run_memory_reducer(next));
     while engine.interp.advance_incremental_marking() {}
     assert_eq!(MAX_GCS, 2);
@@ -134,10 +134,7 @@ fn the_memory_reducer_starts_a_cycle_that_idle_steps_finish() {
         "globalThis.big = []; for (let i = 0; i < 200000; i++) big.push({ i, s: 'x' + i });",
     );
     engine.interp.collect_garbage_for_host();
-    let deadline = engine
-        .interp
-        .memory_reducer_deadline()
-        .expect("the reducer waits");
+    let deadline = reducer_deadline(&engine).expect("the reducer waits");
     eval(&mut engine, "big = null;");
     let held = committed(&engine);
     let counts = engine.unstable_gc_collection_counts();
@@ -171,10 +168,7 @@ fn possible_garbage_and_growth_past_bootstrap_start_the_reducer() {
     let mut engine = engine();
     let before = Instant::now();
     engine.interp.notify_possible_garbage();
-    let deadline = engine
-        .interp
-        .memory_reducer_deadline()
-        .expect("the reducer waits");
+    let deadline = reducer_deadline(&engine).expect("the reducer waits");
     assert!(deadline >= before + START_DELAY);
     // A heap that grows 1 MB past its bootstrap before any major collection starts it too.
     let mut engine = self::engine();
@@ -184,19 +178,16 @@ fn possible_garbage_and_growth_past_bootstrap_start_the_reducer() {
         &mut engine,
         "globalThis.keep = []; for (let i = 0; i < 100000; i++) keep.push({ i });",
     );
-    assert!(engine.interp.memory_reducer_deadline().is_some());
+    assert!(reducer_deadline(&engine).is_some());
 }
 
 #[test]
 fn a_reducer_timer_inside_js_execution_waits() {
     let mut engine = engine();
     engine.interp.notify_possible_garbage();
-    let deadline = engine.interp.memory_reducer_deadline().unwrap();
+    let deadline = reducer_deadline(&engine).unwrap();
     engine.interp.gc_heap.agent.suppressed.set(1);
     assert!(!engine.interp.run_memory_reducer(deadline));
     engine.interp.gc_heap.agent.suppressed.set(0);
-    assert_eq!(
-        engine.interp.memory_reducer_deadline(),
-        Some(deadline + LONG_DELAY)
-    );
+    assert_eq!(reducer_deadline(&engine), Some(deadline + LONG_DELAY));
 }

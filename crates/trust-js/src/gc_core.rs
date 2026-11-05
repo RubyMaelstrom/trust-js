@@ -70,6 +70,11 @@ const DEFAULT_STRESS_MAJOR_EVERY: usize = 8;
 const MIN_SPARE_PAGES_WITH_NURSERY: usize = 16;
 /// The fewest released pages the spare pool keeps without a nursery.
 const MIN_SPARE_PAGES: usize = 64;
+/// W6 step 5: how long the spare pages beyond the cap stay pooled after the pool first passed
+/// it, before the memory reducer's timer gives them back in idle time: V8's pooled pages are
+/// released by a delayed task 8 s on (`memory_pool_timeout`, src/flags/flag-definitions.h:
+/// 2860-2867; src/heap/memory-pool.cc:446-529).
+const POOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
 #[cfg(debug_assertions)]
 const POISON: u64 = 0xdddd_dddd_dddd_dddd;
 /// W6: a marking cycle's next slice falls due once this many bytes were allocated since its
@@ -1801,7 +1806,15 @@ pub(crate) struct Heap {
     /// P1 S4: the memory of released pages, kept (resident) for reuse, so that pages that empty
     /// out every cycle do not go back to the page source and come again, faulting anew. Trimmed
     /// to `spare_page_cap` at the end of each sweep; the pages trimmed go back to the source.
+    /// W6 step 5: with pacing, the pages beyond the cap stay pooled instead (`pool_cap`), and go
+    /// back in idle time ([`Heap::release_pool`]).
     spare_pages: Vec<usize>,
+    /// W6 step 5: the spare pages the heap keeps as its own, the cap its last sweep set: those
+    /// beyond are pooled, counted in its committed memory no more (V8's pooled pages are outside
+    /// its spaces), and wait for `pool_since` + [`POOL_TIMEOUT`]. `usize::MAX` before a sweep.
+    pool_cap: usize,
+    /// W6 step 5: when the spare pages first passed `pool_cap` since they last went back.
+    pool_since: Option<std::time::Instant>,
     /// Where the pages come from (see `page_source`).
     page_source: page_source::PageSource,
     /// Page number (address >> PAGE_SHIFT) to index in `pages`, for the live pages: where every
@@ -1945,6 +1958,8 @@ impl Heap {
             mark_pages: Vec::new(),
             free_page_slots: Vec::new(),
             spare_pages: Vec::new(),
+            pool_cap: usize::MAX,
+            pool_since: None,
             page_source: page_source::PageSource::new(),
             page_table: PageTable::new(),
             larges: BTreeMap::new(),
@@ -2156,10 +2171,11 @@ impl Heap {
         self.pacing = Some(Box::new(pacing));
     }
 
-    /// The memory the heap holds from the system: its pages, spare ones included, and its large
-    /// cells.
+    /// The memory the heap holds from the system: its pages, spare ones included up to the cap
+    /// (step 5: the pooled ones beyond wait to go back), and its large cells.
     fn committed_bytes(&self) -> usize {
-        let pages = self.pages.len() - self.free_page_slots.len() + self.spare_pages.len();
+        let pages = self.pages.len() - self.free_page_slots.len()
+            + self.spare_pages.len().min(self.pool_cap);
         pages * PAGE_SIZE + self.larges.values().map(|large| large.size).sum::<usize>()
     }
 
@@ -2191,11 +2207,37 @@ impl Heap {
     }
 
     /// When the memory reducer's timer should next run ([`Heap::memory_reducer_timer`]), if it
-    /// waits to.
+    /// waits to: the reducer's deadline, or the pooled spare pages' (step 5), whichever comes
+    /// first.
     pub(crate) fn memory_reducer_deadline(&self) -> Option<std::time::Instant> {
-        self.pacing
+        let reducer = self
+            .pacing
             .as_ref()
-            .and_then(|pacing| pacing.reducer.deadline())
+            .and_then(|pacing| pacing.reducer.deadline());
+        match (reducer, self.pool_deadline()) {
+            (Some(reducer), Some(pool)) => Some(reducer.min(pool)),
+            (reducer, pool) => reducer.or(pool),
+        }
+    }
+
+    /// W6 step 5: when the pooled spare pages go back ([`Heap::release_pool`]), if any are.
+    fn pool_deadline(&self) -> Option<std::time::Instant> {
+        self.pool_since
+            .filter(|_| self.spare_pages.len() > self.pool_cap)
+            .map(|since| since + POOL_TIMEOUT)
+    }
+
+    /// W6 step 5: in the memory reducer's timer, at `now`: give the pooled spare pages back once
+    /// they have waited [`POOL_TIMEOUT`], as V8's delayed task releases its pool (which, with
+    /// `--single-threaded`, runs on the isolate's task runner between tasks,
+    /// src/heap/memory-pool.cc:492-513). Whether it gave any back.
+    fn release_pool(&mut self, now: std::time::Instant) -> bool {
+        if self.pool_deadline().is_none_or(|due| now < due) {
+            return false;
+        }
+        self.pool_since = None;
+        self.give_back_spare_pages(self.pool_cap);
+        true
     }
 
     /// Run the memory reducer's timer at `now` ([`crate::gc_pacing::MemoryReducer`]);
@@ -2207,11 +2249,17 @@ impl Heap {
         now: std::time::Instant,
         can_start: bool,
     ) -> bool {
+        self.release_pool(now);
         let allocated = self.allocated_bytes.saturating_sub(self.swept_bytes);
         let committed = self.committed_bytes();
         let Some(pacing) = &mut self.pacing else {
             return false;
         };
+        // The pool's deadline may bring the host here first: the reducer's own timer runs at its
+        // deadline alone (an early run would sample the allocation and could put it off).
+        if pacing.reducer.deadline().is_none_or(|due| now < due) {
+            return false;
+        }
         // V8's timer samples allocation, then asks whether its rate is low.
         pacing.sample(now, allocated);
         let low = pacing.low_allocation_rate(now, allocated);
@@ -5321,13 +5369,34 @@ impl Heap {
     /// Give the spare pages beyond the cap back to the page source, once the sweep has released
     /// its empty pages and set the next budget. (A cap checked as each page went would shrink
     /// with the pages still to go, and keep about half of a large heap that emptied at once.)
-    /// A collection that reduces memory keeps only the minimum.
+    /// A collection that reduces memory keeps only the minimum. W6 step 5: with pacing, whose
+    /// memory reducer's timer gives them back in idle time ([`Heap::release_pool`]), the others
+    /// keep them pooled for reuse instead, out of the pause, as V8 pools a collection's freed
+    /// pages (src/heap/memory-allocator.cc:368-407) and releases them at once only when it
+    /// reduces memory (ReleasePooledChunksImmediately, src/heap/heap.cc:1118-1121): a final
+    /// pause gave back 2,228 pages, 10.3 ms of it, in SplayLatency's driver.
     fn trim_spare_pages(&mut self, reducing: bool) {
-        let cap = if reducing {
-            MIN_SPARE_PAGES_WITH_NURSERY
-        } else {
-            self.spare_page_cap()
-        };
+        if reducing || self.pacing.is_none() {
+            self.pool_since = None;
+            let cap = if reducing {
+                MIN_SPARE_PAGES_WITH_NURSERY
+            } else {
+                self.spare_page_cap()
+            };
+            self.pool_cap = cap;
+            self.give_back_spare_pages(cap);
+            return;
+        }
+        self.pool_cap = self.spare_page_cap();
+        if self.spare_pages.len() <= self.pool_cap {
+            self.pool_since = None;
+        } else if self.pool_since.is_none() {
+            self.pool_since = Some(std::time::Instant::now());
+        }
+    }
+
+    /// Give the spare pages beyond `cap` back to the page source.
+    fn give_back_spare_pages(&mut self, cap: usize) {
         while self.spare_pages.len() > cap {
             let base = self
                 .spare_pages
@@ -9592,6 +9661,56 @@ mod tests {
         fx.heap.set_nursery_bytes(Some(64 << 10));
         fx.collect();
         assert_eq!(pages(&fx), (0, 16), "the floor");
+    }
+
+    /// W6 step 5: with pacing, a collection keeps the spare pages beyond the cap in a pool, which
+    /// its committed memory counts no more; the memory reducer's timer, whose deadline the
+    /// pool's then is, gives them back `POOL_TIMEOUT` after the pool first passed the cap, and a
+    /// collection that reduces memory at once.
+    #[test]
+    fn spare_pages_beyond_the_cap_wait_in_a_pool_for_the_reducers_timer() {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_heap_growth(8 << 20, 100);
+        fx.heap.set_nursery_bytes(Some(64 << 10));
+        fx.heap.enable_pacing(false);
+        let per_page = PAGE_SIZE / 16;
+        let fill = |fx: &mut Fixture| {
+            for i in 0..per_page * 100 {
+                fx.alloc_node(0, i as u64);
+            }
+        };
+        fill(&mut fx);
+        fx.collect();
+        let cap = fx.heap.pool_cap;
+        assert_eq!(cap, MIN_SPARE_PAGES_WITH_NURSERY, "the floor");
+        assert!(
+            fx.heap.spare_pages.len() > cap,
+            "pooled, not given back in the pause"
+        );
+        assert_eq!(
+            fx.heap.committed_bytes(),
+            cap * PAGE_SIZE,
+            "the pooled pages are not the heap's"
+        );
+        let due = fx.heap.pool_deadline().expect("the pool waits");
+        assert!(fx
+            .heap
+            .memory_reducer_deadline()
+            .is_some_and(|next| next <= due));
+        assert!(!fx
+            .heap
+            .release_pool(due - std::time::Duration::from_millis(1)));
+        assert!(fx.heap.spare_pages.len() > cap, "still pooled");
+        fx.heap.memory_reducer_timer(due, true);
+        assert_eq!(fx.heap.spare_pages.len(), cap, "given back in the timer");
+        assert_eq!(fx.heap.pool_deadline(), None);
+        // A collection that reduces memory gives them back at once.
+        fill(&mut fx);
+        fx.heap.pacing.as_mut().unwrap().reduce_memory_next();
+        fx.collect();
+        assert_eq!(fx.heap.spare_pages.len(), MIN_SPARE_PAGES_WITH_NURSERY);
+        assert_eq!(fx.heap.pool_deadline(), None);
     }
 
     /// Pins in minor collections: a pinned young cell that dies becomes a zombie; once its page
