@@ -14529,3 +14529,16 @@ Checks (2905c4c4, the series' head):
   reflect_calls_agree_across_tiers, which also checks that each kind of call is answered on its
   operands): 108 of 108 passed; the prototype-cycle test, run apart, passes at stress 1000 (23 s)
   and 200 (108 s).
+
+### The owner's answers: W4's precision floor, the pages' reuse, the push (2026-11-05)
+
+The owner, 2026-11-05: "Your recommendations are approved. Also, go ahead and push to main."
+1. W4's precision floor is stated without equality: no workload's precision below the census's
+   by the census's own definitions with equality left out (met within 0.4 points on 18 of 19
+   workloads, chai 2.3 under; W4's records above). Equality's typing stays with P3, as decision 3
+   has it.
+2. TRust's pages reusing their compiled code: tier 1 (cheaper compiles: the compact templates and
+   region code only where a function has run) in P2; tier 2 (first-stage code and bytecode shared
+   across heaps, as JSC's per-UnlinkedCodeBlock baseline code) in P3, and the tier threshold's drop
+   (t1a2) with it unless tier 1 makes it affordable first.
+3. Main pushed (below).
