@@ -3880,6 +3880,11 @@ impl Heap {
     /// timer: a program's hot cells would be rescanned at every preclean. It starts a round,
     /// whose drain `run_slice` counts. The cells found.
     fn preclean(&mut self, cycle: &mut Cycle) -> usize {
+        // A young page's walk over its marked cells stops at its `next_unused`, which the
+        // allocation cursors bring up to date only when flushed (as a collection starts): flushed
+        // first, a cell allocated since, traced and then written, is not left out with its card
+        // cleared.
+        self.flush_cursors();
         let found = self.take_cycle_card_cells(&mut cycle.marker);
         cycle.precleans += 1;
         cycle.precleaned += found;
@@ -10476,6 +10481,61 @@ mod tests {
         fx.collect();
         assert_eq!(fx.heap.stats().last_card_cells, 0, "the final pause rescanned no card");
         assert!(fx.heap.owns_cell(young as usize, fx.carded));
+    }
+
+    /// W6 step 3's fix: a preclean flushes the allocation cursors before it takes the cards. A
+    /// young page's walk over its marked cells stops at the page's `next_unused`, which a cursor
+    /// brings up to date only when flushed: without the flush, a cell allocated since the last
+    /// one, which the cycle traced and the program wrote since, kept its edge out of the preclean
+    /// and lost its card, and the final pause freed what only that edge reached.
+    #[test]
+    fn a_preclean_rescans_a_written_cell_allocated_since_the_cursors_were_flushed() {
+        let (mut fx, _chain) = cycle_fixture(5_000);
+        assert!(start_cycle(&mut fx));
+        slice_to_completion(&mut fx);
+        // Allocated since the start's flush, past a bitmap word the cursor left (its refill brought
+        // `next_unused` up to that word's end): a new cell, then its holder, in the word the
+        // cursor hands out from, which the page's `next_unused` does not reach yet.
+        for _ in 0..130 {
+            let filler = fx.heap.alloc(fx.carded, 16);
+            set_word(filler, 0, 0);
+        }
+        let young = fx.heap.alloc(fx.carded, 16);
+        set_word(young, 0, 0);
+        set_word(young, 1, 77);
+        let fresh = fx.heap.alloc(fx.carded, 16);
+        set_word(fresh, 0, 0);
+        set_word(fresh, 1, 1);
+        // The cycle traced the holder, as the marker leaves a cell it reached: marked, out of the
+        // worklist; then the program stored the new cell into it, setting its card.
+        let Some(CellRef {
+            loc: Loc::Small { page, index },
+            ..
+        }) = fx.heap.locate(fresh as u64)
+        else {
+            panic!("a small cell");
+        };
+        set_bit(
+            &mut fx.heap.pages[page as usize].as_mut().unwrap().marks,
+            index as usize,
+            true,
+        );
+        set_word(fresh, 0, tagged(young));
+        // SAFETY: a live carded cell of this heap.
+        unsafe { card_mark(fresh) };
+        let meta = fx.heap.pages[page as usize].as_ref().unwrap();
+        assert!(
+            meta.young && index as usize / 64 >= meta.next_unused.div_ceil(64),
+            "past the words of the page's stale prefix: cell {index}, next_unused {}",
+            meta.next_unused
+        );
+        let mut cycle = fx.heap.cycle.take().unwrap();
+        cycle.complete = false;
+        assert!(fx.heap.preclean(&mut cycle) >= 1, "the preclean found the written cell");
+        assert!(cycle.marker.worklist.iter().any(|work| work.cell == fresh as usize));
+        fx.heap.cycle = Some(cycle);
+        slice_to_completion(&mut fx);
+        assert_eq!(fx.heap.cell_age(young as u64), Some(CellAge::Old), "marked by the rescan");
     }
 
     /// W6 step 3: precleaning repeats while a round finds at least `PRECLEAN_DONE_CELLS` marked
