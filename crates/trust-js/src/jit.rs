@@ -253,6 +253,14 @@ mod baked_read_tests;
 
 #[cfg(all(
     test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_chain_reoptimize_tests.rs"]
+mod chain_reoptimize_tests;
+
+#[cfg(all(
+    test,
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -17611,8 +17619,12 @@ fn build_chain(
     let in_range = |s: u16| (s as u32) * 8 + 8 < 4096;
     let elem_ok = fast & 1024 != 0 && get_elem_inlinable(layout);
     let name_ok = fast & 8192 != 0 && load_name_inlinable(layout);
-    let prop_ok =
-        fast & 256 != 0 && get_prop_inlinable(layout) && !env_flag!("TRUST_JS_JIT_NO_PROP_CHAIN");
+    // A chunk recompiled after its property chains bailed builds none (see
+    // `Chunk::note_chain_replay`).
+    let prop_ok = fast & 256 != 0
+        && get_prop_inlinable(layout)
+        && !env_flag!("TRUST_JS_JIT_NO_PROP_CHAIN")
+        && !chunk.no_property_chains.get();
     let prop_store_ok = prop_ok
         && fast & 65536 != 0
         && set_prop_inlinable(layout)
@@ -17931,6 +17943,14 @@ fn build_chain(
                 1
             }
     });
+    if chain
+        .iter()
+        .any(|(op, _)| matches!(op, ChainOp::LoadProp(..) | ChainOp::StoreProp(..)))
+    {
+        // Its bail replays them through the generic helper, which counts (see
+        // `Chunk::note_chain_replay`).
+        chunk.property_chains.set(true);
+    }
     Some((chain, consumed))
 }
 

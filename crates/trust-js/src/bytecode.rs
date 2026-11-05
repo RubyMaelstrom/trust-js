@@ -159,6 +159,11 @@ pub const IC_ABSENT: u8 = 0xFC;
 /// inline (a 3-4 shape site — one dispatch loop over a class hierarchy — otherwise thrashes
 /// 2 ways and helper-calls forever).
 pub const PROP_IC_WAYS: usize = 4;
+
+/// Chain replays ([`Chunk::note_chain_replay`]) after which a chunk recompiles without property
+/// chains: JSC's osrExitCountForReoptimization (OptionsList.h); SpiderMonkey's
+/// frequentBailoutThreshold is 10 (JitOptions.cpp).
+pub(crate) const STALE_CHAIN_REPLAYS: u32 = 100;
 /// Flag bit OR'd into `IcState::depth` when the HOLDER is an `ObjectKind::Array` (including a
 /// depth-0 array receiver — `arr.length`, and `Array.prototype`, itself an Array exotic, as a
 /// method holder): array shapes don't pin named slots (element entries occupy slots without
@@ -3385,6 +3390,19 @@ pub struct Chunk {
     pub(crate) inline_retry_at: std::cell::Cell<u32>,
     inline_checks: std::cell::Cell<u8>,
     inline_feedback: std::cell::Cell<u64>,
+    /// Whether this chunk's native code may hold an operator chain with a property read or
+    /// store (`jit::build_chain`'s `LoadProp` and `StoreProp`), whose bail replays them through
+    /// the generic helper: only then does [`Chunk::note_chain_replay`] count.
+    pub(crate) property_chains: std::cell::Cell<bool>,
+    /// A recompile after the chunk it replaces bailed out of its property chains: its native
+    /// code builds none (`jit::build_chain`).
+    pub(crate) no_property_chains: std::cell::Cell<bool>,
+    /// Property operations that a chain's bail replayed while their site's cache held the
+    /// receiver's shape, toward [`STALE_CHAIN_REPLAYS`].
+    stale_chain_replays: std::cell::Cell<u32>,
+    /// The chunk asked its function to recompile it once without property chains, at its next
+    /// native entry's checkpoint (`Interp::try_inline_recompile`).
+    pub(crate) reoptimize: std::cell::Cell<bool>,
     /// Reclaimable native residency. Structural unavailability is permanent;
     /// capacity deferral/eviction remain retryable without discarding bytecode.
     pub(crate) jit: crate::jit::cache::NativeCodeSlot,
@@ -3660,6 +3678,10 @@ impl crate::gc_trace::GcTrace for Chunk {
             inline_retry_at: _,
             inline_checks: _,
             inline_feedback: _,
+            property_chains: _,
+            no_property_chains: _,
+            stale_chain_replays: _,
+            reoptimize: _,
             jit: _,
             jit_budget_wait_bytes: _,
             osr: _,
@@ -8698,6 +8720,18 @@ pub(crate) fn compile_with_inlines(
     result
 }
 
+/// [`compile_with_inlines`] for a function whose chunk bailed out of its property chains (see
+/// [`Chunk::note_chain_replay`]): the recompile's native code builds none.
+pub(crate) fn compile_without_property_chains(
+    func: &Function,
+    plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
+    hot: &Chunk,
+) -> Option<Rc<Chunk>> {
+    let chunk = compile_with_inlines(func, plan, hot)?;
+    chunk.no_property_chains.set(true);
+    Some(chunk)
+}
+
 /// A recompilation's property cache seeds: each named site's name, ways and whether a read site
 /// filled them (W4 step 9: a read's ways never seed a store's or an update's site).
 type PropertySeed = (Rc<str>, [IcState; PROP_IC_WAYS], bool);
@@ -9916,6 +9950,10 @@ fn finish_chunk(
         inline_retry_at: std::cell::Cell::new(inline_recompile_at()),
         inline_checks: std::cell::Cell::new(0),
         inline_feedback: std::cell::Cell::new(0),
+        property_chains: std::cell::Cell::new(false),
+        no_property_chains: std::cell::Cell::new(false),
+        stale_chain_replays: std::cell::Cell::new(0),
+        reoptimize: std::cell::Cell::new(false),
         jit: crate::jit::cache::NativeCodeSlot::new(),
         jit_budget_wait_bytes: std::cell::Cell::new(0),
         osr: std::cell::OnceCell::new(),
@@ -24084,6 +24122,53 @@ impl Chunk {
         let at = self.inline_retry_at.get();
         at != 0 && runs >= at
     }
+    /// A property operation that a chain's bail replays through the generic helper
+    /// (`jit_exec_inner`), counted when its site's cache holds the receiver's shape as a data
+    /// state, which a template without the chain would have served natively: the chain's baked
+    /// state went stale, or its value failed the chain's Number test. Past
+    /// [`STALE_CHAIN_REPLAYS`] the chunk asks once for a recompile without property chains, which
+    /// its function's next native entry makes (the inline checkpoint re-armed to it), as JSC
+    /// reoptimizes a code block past its OSR exit count (CodeBlock::shouldReoptimizeNow) and
+    /// SpiderMonkey invalidates a script after frequentBailoutThreshold bailouts. `prototype`
+    /// is not counted: its deferred word takes the helper once per function by design.
+    pub(crate) fn note_chain_replay(
+        &self,
+        i: &Interp,
+        base: &Value,
+        name: &str,
+        cache: &std::cell::Cell<IcState>,
+    ) {
+        if !self.property_chains.get() || self.reoptimize.get() || name == "prototype" {
+            return;
+        }
+        let ValueView::Obj(object) = &base.view() else {
+            return;
+        };
+        let Ok(borrowed) = (unsafe { (*crate::value::Gc::as_ptr(object)).try_borrow() }) else {
+            return;
+        };
+        let shape = borrowed.props.shape();
+        drop(borrowed);
+        let cached = (0..PROP_IC_WAYS).any(|way| {
+            let state = i.ic_way(cache, way).get();
+            state.depth <= 3 && state.recv_shape == shape && state.has_cacheable_shapes()
+        });
+        if !cached {
+            return;
+        }
+        let replays = self.stale_chain_replays.get().saturating_add(1);
+        self.stale_chain_replays.set(replays);
+        // Once a chunk: whatever the recompile's outcome, the chunk does not ask again.
+        if replays == STALE_CHAIN_REPLAYS && !env_flag!("TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE") {
+            self.reoptimize.set(true);
+            self.inline_retry_at
+                .set(self.jit_runs.get().saturating_add(1).max(1));
+        }
+    }
+    /// The replays [`Chunk::note_chain_replay`] counted.
+    pub(crate) fn stale_chain_replays(&self) -> u32 {
+        self.stale_chain_replays.get()
+    }
     /// Four exponentially spaced feedback checkpoints bound compilation work. Empty early
     /// profiles can mature, but unchanged profiles never rerun the planner. Only identities
     /// and immutable compile states enter this signature; no user property reads are needed.
@@ -29183,6 +29268,12 @@ unsafe fn jit_exec_inner(
                 &chunk.caches[c as usize],
                 pc,
             );
+            chunk.note_chain_replay(
+                i,
+                &this,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+            );
             let v = get_named_property(i, chunk, pc as usize, &this, n, &chunk.caches[c as usize])?;
             push!(v);
         }
@@ -29205,6 +29296,7 @@ unsafe fn jit_exec_inner(
                 &chunk.caches[c as usize],
                 pc,
             );
+            chunk.note_chain_replay(i, &obj, &chunk.names[n as usize], &chunk.caches[c as usize]);
             let v = get_named_property(i, chunk, pc as usize, &obj, n, &chunk.caches[c as usize])?;
             push!(v);
         }
@@ -29222,6 +29314,12 @@ unsafe fn jit_exec_inner(
         Op::SetPropThisDrop(n, c) => {
             let v = pop!();
             let this = ctx.this_value();
+            chunk.note_chain_replay(
+                i,
+                &this,
+                &chunk.names[n as usize],
+                &chunk.caches[c as usize],
+            );
             set_named_property(
                 i,
                 chunk,
@@ -29244,6 +29342,7 @@ unsafe fn jit_exec_inner(
                     ),
                 ));
             }
+            chunk.note_chain_replay(i, &obj, &chunk.names[n as usize], &chunk.caches[c as usize]);
             set_named_property(i, chunk, pc as usize, &obj, n, v, &chunk.caches[c as usize])?;
         }
         Op::DestructureGuard => {

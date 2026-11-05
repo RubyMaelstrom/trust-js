@@ -53,6 +53,12 @@ comment/example in the same change.
   reason (calls, loop budget or loop transfer).
 - `TRUST_JS_INLINE_AT=N` changes the speculative inline recompile threshold (default:
   100 machine-code runs); zero disables inlining.
+- `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
+  property reads and stores keep bailing. By default the generic helper counts each property
+  operation a chain's bail replays while its site's cache holds the receiver's shape, and at
+  100 the function recompiles once without property chains (`FunctionRuntime::code3`);
+  `TRUST_JS_TIER_LOG=1` reports each such recompile with its replay count, its inline sites
+  and its bytecode compile time, or why it was declined.
 - `TRUST_JS_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls and constructions (the inline
   call and `new` sequences that run the callee on a pooled frame record) while retaining
   ordinary JIT calls.

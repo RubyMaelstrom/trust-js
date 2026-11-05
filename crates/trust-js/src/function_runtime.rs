@@ -24,6 +24,11 @@ pub(crate) struct FunctionRuntime {
     pub(crate) backedges: Cell<u32>,
     pub(crate) code: OnceCell<Option<Rc<Chunk>>>,
     pub(crate) code2: OnceCell<Option<Rc<Chunk>>>,
+    /// The one recompile of a function whose second stage bailed out of its property chains
+    /// (see `Chunk::note_chain_replay`), built without them, preferred to `code2`; a first-stage
+    /// chunk's recompile lands in `code2` itself, so a function without a second stage never
+    /// looks here.
+    pub(crate) code3: OnceCell<Option<Rc<Chunk>>>,
     /// A sloppy body with mapped `arguments` whose chunk keeps its formals in its activation
     /// (Decision 20f): its prepared variant, which a tree-walked call parked at a loop enters
     /// (`bytecode::try_function_osr`), compiled the first time one does.
@@ -52,6 +57,7 @@ impl FunctionRuntime {
             backedges: Cell::new(0),
             code: OnceCell::new(),
             code2: OnceCell::new(),
+            code3: OnceCell::new(),
             osr_code: OnceCell::new(),
             fn_maps: OnceCell::new(),
             origin: OnceCell::new(),
@@ -78,14 +84,20 @@ impl FunctionRuntime {
     pub(crate) fn execution_code_for(&self, genv: usize) -> Option<&Option<Rc<Chunk>>> {
         match self.code2.get() {
             Some(Some(chunk)) if !chunk.inline_realm_compatible(genv) => self.code.get(),
-            Some(_) => self.code2.get(),
+            Some(_) => match self.code3.get() {
+                Some(Some(chunk)) if chunk.inline_realm_compatible(genv) => self.code3.get(),
+                _ => self.code2.get(),
+            },
             None => self.code.get(),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn execution_code(&self) -> Option<&Option<Rc<Chunk>>> {
-        self.code2.get().or_else(|| self.code.get())
+        self.code3
+            .get()
+            .or_else(|| self.code2.get())
+            .or_else(|| self.code.get())
     }
 }
 
@@ -93,6 +105,7 @@ impl Drop for FunctionRuntime {
     fn drop(&mut self) {
         if self.code.get().is_some_and(Option::is_some)
             || self.code2.get().is_some_and(Option::is_some)
+            || self.code3.get().is_some_and(Option::is_some)
             || self.osr_code.get().is_some_and(Option::is_some)
         {
             // Call ICs keep raw addresses inside these set-once slots, including code-keyed
@@ -112,6 +125,7 @@ impl std::fmt::Debug for FunctionRuntime {
             .field("backedges", &self.backedges.get())
             .field("compiled", &self.code.get().is_some())
             .field("inlined", &self.code2.get().is_some())
+            .field("reoptimized", &self.code3.get().is_some())
             .finish()
     }
 }

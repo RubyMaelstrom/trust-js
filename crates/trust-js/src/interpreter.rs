@@ -16360,6 +16360,13 @@ impl Interp {
             crate::jit::perf_inline_suppressed();
             return;
         }
+        // Alive as below: the callee object that carried this IC is alive. A declined recompile
+        // leaves the checkpoint to run as it would have.
+        if chunk.reoptimize.replace(false)
+            && self.reoptimize_without_property_chains(unsafe { &*func }, chunk, realm, genv)
+        {
+            return;
+        }
         if !chunk.advance_inline_feedback() {
             crate::jit::perf_inline_suppressed();
             return;
@@ -16408,6 +16415,73 @@ impl Interp {
         } else {
             crate::jit::perf_inline_failure();
         }
+    }
+
+    /// The one recompile of a function whose chunk asked for it (see `Chunk::note_chain_replay`):
+    /// from its first-stage chunk's caches and a fresh inline plan, as the inline recompile is,
+    /// but building no property chains. It lands in `FunctionRuntime::code3` when the function
+    /// has a second stage (the bailing chunk, mostly), else in `code2`, and moves the call
+    /// caches' epoch as a landed second stage does; frames already running the bailing chunk
+    /// finish in it. One a function: the request is made once a chunk (at
+    /// [`crate::bytecode::STALE_CHAIN_REPLAYS`]), and each slot is set once. Whether it landed:
+    /// a declined one (another Realm's call, a recompile already made, a compile that failed)
+    /// leaves the chunk's inline checkpoints as they were.
+    fn reoptimize_without_property_chains(
+        &mut self,
+        func: &crate::ast::Function,
+        chunk: &crate::bytecode::Chunk,
+        realm: usize,
+        genv: usize,
+    ) -> bool {
+        let runtime = func.runtime();
+        let log = std::env::var_os("TRUST_JS_TIER_LOG").is_some();
+        let decline = |reason: &str| {
+            if log {
+                eprintln!("[tier] recompile without property chains declined: {reason}");
+            }
+            false
+        };
+        let second_stage = runtime.code2.get().is_some();
+        if runtime.code3.get().is_some()
+            || runtime
+                .code2
+                .get()
+                .and_then(Option::as_ref)
+                .is_some_and(|chunk| chunk.no_property_chains.get())
+        {
+            return decline("already recompiled");
+        }
+        if genv != Env::as_ptr(&self.global_env) as usize {
+            return decline("another Realm's call");
+        }
+        let Some(base) = runtime.code.get().and_then(Option::as_ref).cloned() else {
+            return decline("no first-stage chunk");
+        };
+        let started = log.then(std::time::Instant::now);
+        let plan = crate::bytecode::plan_inlines(&base, func, realm, &self.global_env);
+        let Some(chunk3) = crate::bytecode::compile_without_property_chains(func, &plan, &base)
+        else {
+            return decline("the compile failed");
+        };
+        let _ = if second_stage {
+            runtime.code3.set(Some(chunk3))
+        } else {
+            runtime.code2.set(Some(chunk3))
+        };
+        chunk.inline_retry_at.set(0);
+        crate::bytecode::invalidate_call_caches();
+        if let Some(started) = started {
+            let src = func.source.as_deref().unwrap_or("<no source>");
+            let head: String = src.chars().take(60).collect();
+            eprintln!(
+                "[tier] recompiled without property chains after {} chain replays ({} inline sites, bytecode {:.3} ms): {}",
+                chunk.stale_chain_replays(),
+                plan.len(),
+                started.elapsed().as_secs_f64() * 1e3,
+                head.replace('\n', " ")
+            );
+        }
+        true
     }
 
     fn learned_construct_layout(&self, constructor: &Gc) -> Option<crate::value::PropertyLayout> {

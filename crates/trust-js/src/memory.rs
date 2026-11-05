@@ -943,6 +943,9 @@ impl Visitor {
         if let Some(chunk) = runtime.code2.get().and_then(Option::as_ref) {
             self.chunk(chunk);
         }
+        if let Some(chunk) = runtime.code3.get().and_then(Option::as_ref) {
+            self.chunk(chunk);
+        }
         if let Some(maps) = runtime.fn_maps.get() {
             self.add_function_bytecode_bytes(size_of::<crate::ast::FunctionMaps>());
             let cells_live = self.includes_heap(&runtime.heap);
