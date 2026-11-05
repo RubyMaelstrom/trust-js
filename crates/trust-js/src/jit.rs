@@ -6621,7 +6621,7 @@ enum PropRecv {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct PropProbeFlags {
     /// An `ObjectKind::Array` receiver may shape-validate (the site's name is not an element key).
     arr_ok: bool,
@@ -6632,6 +6632,23 @@ struct PropProbeFlags {
     method: bool,
     /// Key-checked Array holder states route to the site's key compare.
     kc: bool,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+/// A compact named read's options (see [`SharedStub::PropRead`]): its way probe's, and how it
+/// places its result and whether it guards a deferred `prototype`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PropReadFlags {
+    probe: PropProbeFlags,
+    /// The read pushes its value (a method read keeps its receiver under it; a `this` or local
+    /// receiver was never an operand); otherwise the value replaces the receiver operand.
+    push: bool,
+    /// The site's name is `prototype`: a function's deferred prototype takes the helper
+    /// (`property_word_guard`).
+    proto: bool,
 }
 
 /// One generic property-cache way probe: x12 = the way's `IcState` cell, x10 = the receiver's
@@ -6917,6 +6934,219 @@ fn emit_prop_way_loop(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+/// Packed receiver word in x9 → x10 = the object a named read's probe walks: the Obj payload
+/// itself, or the active realm's wrapper prototype for a Str/Num/Bool primitive (kinds are the
+/// wide-Value discriminants `emit_exec_kind` decodes: Bool 3, Num 4, Str 6, Obj 8). Every other
+/// kind (nullish, Symbol, BigInt, Empty) branches to `slow` before anything is written, where the
+/// helper reproduces OrdinaryGet, its TypeError included, with the original primitive receiver
+/// for any accessor it runs. Obj is the overwhelmingly common receiver: the cheap top-16 compare
+/// singles it out first, so ordinary object reads pay nothing for the primitive cases. Clobbers
+/// x11, x12 and NZCV.
+fn emit_packed_probe_receiver(
+    a: &mut asm::Asm,
+    il: &crate::interpreter::InterpLayout,
+    slow: usize,
+) {
+    let obj_recv = a.new_label();
+    let str_recv = a.new_label();
+    let bool_recv = a.new_label();
+    let probe_go = a.new_label();
+    a.lsr_imm(11, 9, 48);
+    a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
+    a.cmp_reg_w(11, 12);
+    a.b_cond(C_EQ, obj_recv);
+    emit_exec_kind(a, 9, 11, 12, slow);
+    a.cmp_imm_w(11, 6);
+    a.b_cond(C_EQ, str_recv);
+    a.cmp_imm_w(11, 3);
+    a.b_cond(C_EQ, bool_recv);
+    a.cmp_imm_w(11, 4); // Num is the only remaining admissible kind
+    a.b_cond(C_NE, slow);
+    emit_load_active_proto(a, il.number_proto);
+    a.b(probe_go);
+    a.bind(str_recv);
+    emit_load_active_proto(a, il.string_proto);
+    a.b(probe_go);
+    a.bind(bool_recv);
+    emit_load_active_proto(a, il.boolean_proto);
+    a.b(probe_go);
+    a.bind(obj_recv);
+    emit_exec_payload(a, 9, 10);
+    a.bind(probe_go);
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+/// The compact named read's shared stub (see [`SharedStub::PropRead`]): the work a first-stage
+/// read outside loops would otherwise carry at every site (see [`emit_prop_read_site`]) — the
+/// way loop over the site's cache, the landings (the slot's bounds and word, the accessor test
+/// and its publication, the deferred `prototype` guard, the key-checked arm, a cached absence)
+/// and the commit. Every decline before the commit returns w9 = 0 with the operands as they
+/// were. Process-wide: the key word the key-checked arm compares comes from the site (x6), never
+/// from this code. Clobbers x6..x17 and NZCV.
+fn emit_prop_read_stub(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    il: Option<&crate::interpreter::InterpLayout>,
+    flags: PropReadFlags,
+) {
+    let probe = flags.probe;
+    let obj_off = layout.obj_from_cell as u32;
+    let slow = a.new_label();
+    let load_way = a.new_label();
+    let load_kc_way = a.new_label();
+    let absent_hit = a.new_label();
+    let val = a.new_label();
+    let accessor_hit = a.new_label();
+    if probe.wrap_ok {
+        let il = il.expect("a wrapper receiver's read stub is requested by chunk compilation");
+        emit_packed_probe_receiver(a, il, slow);
+    }
+    emit_prop_way_loop(a, layout, probe, slow, load_way, load_kc_way, absent_hit);
+    // x13 = the slot's index (bounds-checked against the live count), x14 = its location word.
+    let emit_entry = |a: &mut asm::Asm| {
+        named_len(a, layout, 16, 11);
+        a.cmp_reg_x(13, 16);
+        a.b_cond(C_HS, slow);
+        slot_addr_loc(a, layout, 15, 11, 14);
+        a.ldr_imm(12, 15, 0);
+    };
+    let emit_place = |a: &mut asm::Asm, word: u32| {
+        if flags.push {
+            emit_exec_word_store(a, word, 20, 0);
+            a.add_imm(20, 20, 8);
+        } else {
+            emit_exec_word_store(a, word, 20, -8);
+        }
+    };
+    a.bind(load_way);
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+    emit_entry(a);
+    a.bind(val);
+    branch_accessor_word(a, 12, 9, accessor_hit);
+    if flags.proto {
+        property_word_guard(a, 12, 13, slow);
+    }
+    // --- commit: everything validated; from here only writes ---
+    emit_place(a, 12);
+    a.movz(9, 1, 0);
+    a.ret();
+    a.bind(load_kc_way);
+    if probe.kc {
+        // An Array holder's slot is not pinned by its shape: the entry's key, followed through
+        // the holder's shared layout, must be the site's (x6).
+        a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+        emit_entry(a);
+        a.ldr_imm(17, 11, (layout.obj_props + layout.props_layout) as u32);
+        a.cbz(17, true, slow);
+        a.ldr_imm(17, 17, layout.layout_keys_ptr as u32);
+        a.ldr_x_lsl3(17, 17, 13);
+        a.cmp_reg_x(17, 6);
+        a.b_cond(C_NE, slow);
+        a.b(val);
+    } else {
+        a.b(slow);
+    }
+    a.bind(absent_hit);
+    if probe.method {
+        a.b(slow);
+    } else {
+        a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+        emit_place(a, 9);
+        a.movz(9, 2, 0);
+        a.ret();
+    }
+    // The validated accessor: publish its holder (its `Gc::as_ptr`, `obj_from_cell` before the
+    // Object base), slot and location for the helper's validated accessor path, which the
+    // site's helper call reaches next with nothing run since.
+    a.bind(accessor_hit);
+    a.sub_imm(9, 11, obj_off);
+    a.str_imm(9, 19, std::mem::offset_of!(JitCtx, accessor_holder) as u32);
+    a.str_w_imm(13, 19, std::mem::offset_of!(JitCtx, accessor_slot) as u32);
+    a.str_w_imm(14, 19, std::mem::offset_of!(JitCtx, accessor_loc) as u32);
+    a.bind(slow);
+    a.movz(9, 0, 0);
+    a.ret();
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+/// A first-stage named read outside loops whose cache gave the compile no way to bake: the
+/// receiver's load, the object-tag test (or, for a read that probes a primitive's wrapper
+/// prototype, the receiver word for the stub) and a String's `length` stay in line; the shared
+/// [`SharedStub::PropRead`] stub does the rest, and a decline takes the helper's stub call, as
+/// the in-line template's slow path does. V8's Sparkplug calls a builtin for such a read
+/// (LoadICBaseline), SpiderMonkey's Baseline its site's IC stub, compiled once per zone and
+/// shared by the sites that attach the same CacheIR.
+#[allow(clippy::too_many_arguments)]
+fn emit_prop_read_site(
+    a: &mut asm::Asm,
+    cache_ptr: usize,
+    name: &str,
+    pc: u32,
+    l_unwind: usize,
+    flags: PropReadFlags,
+    recv: PropRecv,
+    string_length: bool,
+) {
+    let slow = a.new_label();
+    let done = a.new_label();
+    match recv {
+        PropRecv::Stack => {
+            emit_exec_word_load(a, 9, 20, -8);
+            if string_length {
+                emit_ascii_string_length(a, 9, true, done, slow);
+            }
+        }
+        PropRecv::This => emit_exec_word_load(a, 9, 19, 48), // ctx.this_word
+        PropRecv::Slot(off) => {
+            emit_exec_word_load(a, 9, 22, off as i32);
+            if string_length {
+                emit_ascii_string_length(a, 9, false, done, slow);
+            }
+        }
+    }
+    if !flags.probe.wrap_ok {
+        emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+        emit_exec_payload(a, 9, 10);
+    }
+    a.mov_imm64(8, cache_ptr as u64);
+    if flags.probe.kc {
+        // The site's key word: an atom's address, which lives as long as the heap this code
+        // belongs to, or a tagged index.
+        a.mov_imm64(6, crate::atom::PropKey::from_text(name).word());
+    }
+    let stub = a.shared_stub(SharedStub::PropRead(flags).key());
+    a.bl_label(stub);
+    #[cfg(not(test))]
+    a.cbnz(9, false, done);
+    #[cfg(test)]
+    {
+        let absent = a.new_label();
+        a.cbz(9, false, slow);
+        a.cmp_imm_w(9, 2);
+        a.b_cond(C_EQ, absent);
+        regions::emit_property_event(a, 0);
+        a.b(done);
+        a.bind(absent);
+        regions::emit_property_event(a, 1);
+        a.b(done);
+    }
+    a.bind(slow);
+    #[cfg(test)]
+    regions::emit_property_event(a, 2);
+    emit_op_helper(a, H_GET_PROP, pc, l_unwind);
+    a.bind(done);
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 /// `str.length` for a String primitive in execution word `raw` whose flat buffer is known
 /// ASCII: one UTF-16 code unit per byte, so the byte length is the answer. Any other String
 /// (a view, or text that may hold non-ASCII code points) goes to `slow`, which counts code
@@ -7006,47 +7236,66 @@ fn emit_prop_load_inline(
         && name != "length"
         && name != "description"
         && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
-    // Packed receiver word in x9 → x10 = the object the probe walks: the Obj payload itself,
-    // or the active realm's wrapper prototype for a Str/Num/Bool primitive (kinds are the
-    // wide-Value discriminants `emit_exec_kind` decodes: Bool 3, Num 4, Str 6, Obj 8).
-    // Every other kind (nullish, Symbol, BigInt, Empty) branches to `slow` before anything
-    // is written, where the helper reproduces OrdinaryGet — including its TypeError — with
-    // the original primitive receiver for any accessor it runs.
-    let emit_packed_probe_receiver = |a: &mut asm::Asm| {
-        let obj_recv = a.new_label();
-        let str_recv = a.new_label();
-        let bool_recv = a.new_label();
-        let probe_go = a.new_label();
-        // Obj is the overwhelmingly common receiver: single out with the cheap top-16
-        // compare first (as the string-method path always did) so ordinary object reads
-        // pay nothing for the primitive cases. Kind discrimination below runs only for
-        // non-object receivers.
-        a.lsr_imm(11, 9, 48);
-        a.movz(12, (crate::value::PACK_OBJ >> 48) as u32, 0);
-        a.cmp_reg_w(11, 12);
-        a.b_cond(C_EQ, obj_recv);
-        emit_exec_kind(a, 9, 11, 12, slow);
-        a.cmp_imm_w(11, 6);
-        a.b_cond(C_EQ, str_recv);
-        a.cmp_imm_w(11, 3);
-        a.b_cond(C_EQ, bool_recv);
-        a.cmp_imm_w(11, 4); // Num is the only remaining admissible kind
-        a.b_cond(C_NE, slow);
-        emit_load_active_proto(a, il.number_proto);
-        a.b(probe_go);
-        a.bind(str_recv);
-        emit_load_active_proto(a, il.string_proto);
-        a.b(probe_go);
-        a.bind(bool_recv);
-        emit_load_active_proto(a, il.boolean_proto);
-        a.b(probe_go);
-        a.bind(obj_recv);
-        emit_exec_payload(a, 9, 10);
-        a.bind(probe_go);
-    };
+    let emit_packed_probe_receiver = |a: &mut asm::Asm| emit_packed_probe_receiver(a, il, slow);
     // `length` of a String primitive is its own non-writable, non-configurable data property
     // (ECMA-262 §10.4.3.5 StringGetOwnProperty via ToObject), so no user code can intervene.
     let string_length = !method && name == "length";
+    // After bytecode warmup, ordinary OO sites overwhelmingly have one stable depth/shape/slot.
+    // Bake that state into a compact probe instead of embedding the full four-way/deep/exotic
+    // state machine at every site. Every fact that made the cached slot authoritative is guarded
+    // live; a miss goes to the checked helper, which observes mutations and arbitrary alternate
+    // shapes exactly like the generic JIT miss path.
+    // An accessor state (`IC_ACCESSOR` at depth 3 or less) bakes as its depth's data state does:
+    // its probe ends at the descriptor-checking landing, which diverts the live accessor to the
+    // validated accessor landing.
+    let accessor_state = |st: &crate::bytecode::IcState| {
+        (crate::bytecode::IC_ACCESSOR..=crate::bytecode::IC_ACCESSOR | 3).contains(&st.depth)
+    };
+    let plain_depth = |st: &crate::bytecode::IcState| {
+        if accessor_state(st) {
+            st.depth & !crate::bytecode::IC_ACCESSOR
+        } else {
+            st.depth
+        }
+    };
+    let bakeable = |st: &crate::bytecode::IcState| {
+        let depth = plain_depth(st);
+        depth <= 3
+            && (depth < 2
+                || (depth == 2 && st.mid_ok & 1 != 0)
+                || (depth == 3 && st.mid_ok & 3 == 3))
+    };
+    let compact = preferred.filter(bakeable);
+    // A polymorphic site (virtual methods over a few receiver classes) bakes each warm way into
+    // its own compact probe, tried in cache order; a miss on all of them falls to the generic
+    // way loop, which still sees ways filled after compilation, and then to the helper.
+    let baked: Vec<crate::bytecode::IcState> = match compact {
+        Some(st) => vec![st],
+        None if cache_ptr != 0 => (0..crate::bytecode::PROP_IC_WAYS)
+            .map(|way| unsafe {
+                (*(cache_ptr as *const std::cell::Cell<crate::bytecode::IcState>).add(way)).get()
+            })
+            .filter(|st| st.has_cacheable_shapes() && bakeable(st))
+            .collect(),
+        None => Vec::new(),
+    };
+    // A first-stage read outside loops whose cache gave no way to bake (every way empty at the
+    // first native compile): the compact form, whose shared stub carries the way loop, the
+    // landings and the commit (see `emit_prop_read_site`).
+    if baked.is_empty() && cache_ptr != 0 && use_shared_stub(a) {
+        let flags = PropReadFlags {
+            probe: PropProbeFlags {
+                arr_ok,
+                wrap_ok,
+                method,
+                kc,
+            },
+            push: method || !matches!(recv, PropRecv::Stack),
+            proto: name == "prototype",
+        };
+        emit_prop_read_site(a, cache_ptr, name, pc, l_unwind, flags, recv, string_length);
+        return;
+    }
     match recv {
         PropRecv::Stack => {
             emit_exec_word_load(a, 9, 20, -8);
@@ -7087,45 +7336,6 @@ fn emit_prop_load_inline(
             }
         }
     }
-    // After bytecode warmup, ordinary OO sites overwhelmingly have one stable depth/shape/slot.
-    // Bake that state into a compact probe instead of embedding the full four-way/deep/exotic
-    // state machine at every site. Every fact that made the cached slot authoritative is guarded
-    // live; a miss goes to the checked helper, which observes mutations and arbitrary alternate
-    // shapes exactly like the generic JIT miss path.
-    // An accessor state (`IC_ACCESSOR` at depth 3 or less) bakes as its depth's data state does:
-    // its probe ends at the descriptor-checking landing, which diverts the live accessor to the
-    // validated accessor landing.
-    let accessor_state = |st: &crate::bytecode::IcState| {
-        (crate::bytecode::IC_ACCESSOR..=crate::bytecode::IC_ACCESSOR | 3).contains(&st.depth)
-    };
-    let plain_depth = |st: &crate::bytecode::IcState| {
-        if accessor_state(st) {
-            st.depth & !crate::bytecode::IC_ACCESSOR
-        } else {
-            st.depth
-        }
-    };
-    let bakeable = |st: &crate::bytecode::IcState| {
-        let depth = plain_depth(st);
-        depth <= 3
-            && (depth < 2
-                || (depth == 2 && st.mid_ok & 1 != 0)
-                || (depth == 3 && st.mid_ok & 3 == 3))
-    };
-    let compact = preferred.filter(bakeable);
-    // A polymorphic site (virtual methods over a few receiver classes) bakes each warm way into
-    // its own compact probe, tried in cache order; a miss on all of them falls to the generic
-    // way loop, which still sees ways filled after compilation, and then to the helper.
-    let baked: Vec<crate::bytecode::IcState> = match compact {
-        Some(st) => vec![st],
-        None if cache_ptr != 0 => (0..crate::bytecode::PROP_IC_WAYS)
-            .map(|way| unsafe {
-                (*(cache_ptr as *const std::cell::Cell<crate::bytecode::IcState>).add(way)).get()
-            })
-            .filter(|st| st.has_cacheable_shapes() && bakeable(st))
-            .collect(),
-        None => Vec::new(),
-    };
     let emit_baked = |a: &mut asm::Asm, st: crate::bytecode::IcState, miss: usize| {
         let depth = plain_depth(&st);
         a.add_imm(11, 10, obj_off);
@@ -13354,6 +13564,17 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     PropWays(PropProbeFlags),
+    /// [`emit_prop_read_stub`], a first-stage named read outside loops whose site bakes no way
+    /// (see [`emit_prop_read_site`]): x8 = the site's first `IcState` cell, x10 = the receiver's
+    /// cell (or, with `wrap_ok`, x9 = the receiver's word), x6 = the site's key word when
+    /// `kc` → w9 = 1 when the value is in place (x20 moved as the form places it), 2 when it is
+    /// a cached absence's `undefined`, 0 for the site's helper call with every operand as it
+    /// was (a validated accessor published for the helper, as the in-line landing does).
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    PropRead(PropReadFlags),
     /// [`emit_call_ways`], a call site's probe after way 0's identity misses: its inputs →
     /// w9 = hit, with x12/x15 set as at the primary hit label.
     #[cfg(all(
@@ -13514,6 +13735,7 @@ impl SharedStub {
     const PLAIN_IS_ARRAY: u32 = 0xc00;
     const MIN_MAX: u32 = 0xd00;
     const ELEM_STORE: u32 = 0xe00;
+    const PROP_READ: u32 = 0xf00;
 
     fn key(self) -> u32 {
         match self {
@@ -13533,6 +13755,19 @@ impl SharedStub {
                     | u32::from(flags.wrap_ok) << 1
                     | u32::from(flags.method) << 2
                     | u32::from(flags.kc) << 3
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::PropRead(flags) => {
+                Self::PROP_READ
+                    | u32::from(flags.probe.arr_ok)
+                    | u32::from(flags.probe.wrap_ok) << 1
+                    | u32::from(flags.probe.method) << 2
+                    | u32::from(flags.probe.kc) << 3
+                    | u32::from(flags.push) << 4
+                    | u32::from(flags.proto) << 5
             }
             #[cfg(all(
                 target_arch = "aarch64",
@@ -13628,6 +13863,20 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
+            Self::PROP_READ => SharedStub::PropRead(PropReadFlags {
+                probe: PropProbeFlags {
+                    arr_ok: key & 1 != 0,
+                    wrap_ok: key & 2 != 0,
+                    method: key & 4 != 0,
+                    kc: key & 8 != 0,
+                },
+                push: key & 16 != 0,
+                proto: key & 32 != 0,
+            }),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             Self::CALL_SECONDARY => SharedStub::CallSecondary,
             #[cfg(all(
                 target_arch = "aarch64",
@@ -13712,6 +13961,17 @@ impl SharedStub {
                     ("wrap_ok", flags.wrap_ok),
                     ("method", flags.method),
                     ("kc", flags.kc),
+                ],
+            ),
+            SharedStub::PropRead(flags) => named(
+                "PropRead",
+                &[
+                    ("arr_ok", flags.probe.arr_ok),
+                    ("wrap_ok", flags.probe.wrap_ok),
+                    ("method", flags.probe.method),
+                    ("kc", flags.probe.kc),
+                    ("push", flags.push),
+                    ("proto", flags.proto),
                 ],
             ),
             SharedStub::CallSecondary => named("CallSecondary", &[]),
@@ -13858,6 +14118,13 @@ impl SharedStub {
                 a.bind(declined);
                 a.movz(13, 0, 0);
                 a.ret();
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::PropRead(flags) => {
+                emit_prop_read_stub(a, layout, context.ilayout, flags);
             }
             #[cfg(all(
                 target_arch = "aarch64",
