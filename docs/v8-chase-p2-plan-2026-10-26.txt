@@ -16165,3 +16165,352 @@ CHECKS
 - tests/eq-semantics.js, store-semantics.js and read-semantics.js agree across --tier=interp,
   --tier=jit, threshold 1, and threshold 1 with TRUST_JS_JIT_ADMIT_RUNS=20, whose native code
   bakes chains (c1c/).
+
+### Compact templates steps 4 and 5 landed; the series' exit (record, 2026-11-05)
+
+Four commits (an agent's, branch p2-compact-s5 on main e2ac4c7e), landed by fast-forward: 37ebcefa
+(a test's dead Realm asserted reclaimed after a host collection), c64d9abc (step 4, calls),
+07d3ad33 (the JIT map's region attribution ends with the region: a profiling-output fix, no
+machine code changes), 055f059a (step 5, a local read's TDZ test only where the slot may be in its
+TDZ). Records below.
+
+The JIT map's region marks leaked before 07d3ad33: after a region, later templates were counted as
+region code (907K of Djot's 2.14M template bytes), so the template-byte figures of the design's
+census and of steps 1-4's records are low; machine-code totals and span comparisons are not
+affected. The series' exit, recounted with the fix (Djot, base a3fd64da to 055f059a):
+
+| exit line | asked | result | met |
+| --- | --- | --- | --- |
+| machine code smaller | 25% | 3,987,956 to 2,700,068 bytes, -32.3% | yes |
+| template bytes smaller | 40% | 2,963,644 to 2,036,672, -31.3% | no |
+| no workload slower beyond 0.2% in instructions | | each step within it (steps 1-2 and 4-5 alone; step 3 with the veneer) | yes |
+| elapsed time lower | 2% | wall 160.9 to 153.3 ms, -4.7% (CPU 5, 15 rounds, a quiet window) | yes |
+
+Of the template bytes left, the first stage's are 39.6% fewer than at the base and the second
+stage's 17.6%; the second stage, which the design keeps in line, is 47% of what remains, and
+CallWithThis 21%. Decided (the coordinator's, 2026-11-05): the test change in 37ebcefa approved
+(the failing root was a stale word in the call helper's frame, 16 bytes deeper with the shared
+stub's frame record, which the conservative scan reads; the test still fails when the Realm is
+really kept, and V8's and Oilpan's tests assert reclamation after a host collection likewise);
+step 5's proof applied to every tier, loops, second stages and regions included (a test that cannot
+fail is no size-for-speed trade, and V8, SpiderMonkey and JSC drop such checks for every tier). The
+template-bytes line is the owner's to revise or to keep with a further item.
+
+### Compact baseline templates, step 4: calls (record, 2026-11-05)
+
+c64d9abc on p2-compact-s4b, from main e2ac4c7e (whose code is 63c80e0c's), after 37ebcefa (a test
+fix, below): the design's item 5. The measurements are 9321681d's, whose engine code c64d9abc's is
+(the rebase onto 37ebcefa changed only tests.rs).
+
+A call site's template (Call, CallWithThis) tests its call cache's way 0 in line and, on a native
+callee's hit, each intrinsic its arity can reach: CallWithThis(1)'s family already in a shared
+stub outside loops (Intrinsics1), but Function.prototype.call (argc 1 to 8, 17 instructions) and
+Array.prototype.pop (argc 0) in line at every site, then the direct call's stub, and the checked
+helpers H_CALL_HIT and H_CALL open-coded (11 and 7 instructions). At a compact site
+(compact_templates: first-stage code outside loops) the hit now enters one shared stub for every
+intrinsic of the site's arity (SharedStub::IntrinsicCall { argc, array, function_call, discard }:
+the one- and two-argument families, Math.max and Math.min, Array.prototype.pop,
+Function.prototype.call), only for a native callee (the intrinsic id's test stays in line), with
+the status return of the existing intrinsic stubs; and H_CALL_HIT, H_CALL and `new`'s H_NEW run
+through their shared helper stubs (SharedStub::Helper, which passes x1 = pc | way << 16 on). The
+callee's identity test, the direct sequence's stub call and the end poll stay in line. Second
+stages and loop bodies keep today's templates.
+
+V8's Sparkplug calls a Call builtin at every site (baseline-compiler.cc, BuildCall);
+SpiderMonkey's Baseline attaches its call intrinsics (Function.prototype.call, Math.max) to the
+call IC's stub chain; JSC's Baseline keeps the callee check of its call link in line and calls
+shared thunks for the rest.
+
+Test: jit::compact_call_tests calls each intrinsic at compact sites (completed, declined by a
+non-object receiver or another argument type, throwing), plain natives, user callees (one site
+polymorphic over five), uncached and non-callable callees and constructions, against the
+tree-walker; tests/call-semantics.js is the same program for the release binary.
+
+MEASURED
+
+Code bytes (TRUST_JS_JIT_MAP=1, opbytes.py; bytes-s4/, main the landed 63c80e0c's fat-LTO build).
+The template and region columns are attributed with the JIT map's fix (07d3ad33, described in
+step 5's record): main's from a fat-LTO build of main with the fix (f92ac532, bytes-attr/),
+step 4's from 07d3ad33's (bytes-s5/); without the fix 907K bytes of Djot's templates were
+counted as region spans.
+
+| fixture | machine code, main | step 4 | change | templates, main | step 4 | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| Djot | 2,872,268 | 2,819,872 | -1.82% | 2,169,412 | 2,135,668 | -1.56% |
+| React | 284,024 | 283,304 | -0.25% | 149,360 | 148,640 | -0.48% |
+| Vue | 505,052 | 493,928 | -2.20% | 378,784 | 370,516 | -2.18% |
+
+Djot's region spans fall too (687,476 to 668,832): a region's call sites take the same lowering
+(jit_regions.rs calls emit_call_inline). By operation (templates): CallWithThis 469,724 ->
+433,796 (525 -> 485 bytes a site, over all 894 sites, loops' and second stages' included), Call
+18,728 -> 17,928, New 19,276 -> 18,876; a compact CallWithThis(0) site in Djot's first stage went
+from 70 to 53 instructions. By site (span-diff.py and a mark check, s4/span-*.txt): every span that
+changed holds a call template (494 in Djot, -56,308 bytes) or is a New site (25, -400), a chunk's
+tail (106, +4,336: the new stubs' veneers) or one of two GetMethod spans whose cache address took
+one MOVK more (+4 each; the heap's addresses differ between the runs).
+
+Instructions (fat LTO, lto/c1-63c80e0c against lto/s4-9321681d, one session, CPUs 10-13,
+setarch -R, pacing off, median of 3; counts/s4.txt):
+
+| workload | main | step 4 | change |
+| --- | --- | --- | --- |
+| Vue | 1,415,508,959 | 1,416,458,542 | +0.07% |
+| React | 309,534,878 | 309,567,069 | +0.01% |
+| Djot | 608,684,163 | 608,936,312 | +0.04% |
+| chai | 73,130,035,895 | 73,122,786,645 | -0.01% |
+| Richards | 132,015,039 | 132,072,645 | +0.04% |
+| DeltaBlue | 256,235,402 | 256,475,384 | +0.09% |
+| Crypto | 722,851,297 | 722,968,207 | +0.02% |
+| RayTrace | 993,638,122 | 994,489,772 | +0.09% |
+| EarleyBoyer | 3,142,874,211 | 3,143,193,180 | +0.01% |
+| RegExp | 2,673,685,039 | 2,676,668,389 | +0.11% |
+| Splay | 1,405,298,126 | 1,405,411,113 | +0.01% |
+| NavierStokes | 450,994,994 | 451,230,336 | +0.05% |
+| PdfJS | 7,029,725,026 | 7,034,497,429 | +0.07% |
+| Mandreel | 61,599,889,254 | 61,602,810,667 | +0.00% |
+| Gameboy | 15,011,085,887 | 15,011,470,996 | +0.00% |
+| CodeLoad | 479,400,349 | 479,418,556 | +0.00% |
+| Box2D | 4,253,586,304 | 4,255,568,897 | +0.05% |
+| zlib | 134,528,460,903 | 134,528,555,648 | +0.00% |
+| TypeScript | 58,270,357,504 | 58,280,716,172 | +0.02% |
+
+None passes the 0.2% bound; the largest, RegExp +0.11%. A compact call that a helper or an
+intrinsic serves adds the stub's call and return (BL, the veneer's four instructions, RET, the
+status test).
+
+TRust's pages (TRust 78435d0's trust-browser-replay on 63c80e0c (trust/c1c-replay) and on
+9321681d, from exports, in one session in a quiet window (the 1-minute load under 2, twice 60 s
+apart; trust/metrics-s4q.tsv); trust/page-metrics.sh, CPU 5; a page's machine code and compile
+time, (s5 - s1) / 4 of the cumulative metrics):
+
+| page, variant | machine code a page, main | step 4 | change | compile a page, main | step 4 | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| event-loop, t8 | 980,004 | 945,097 | -3.6% | 13.3 ms | 13.1 ms | -0.8% |
+| Vue TodoMVC, t8 | 7,648,167 | 7,464,738 | -2.4% | 96.5 ms | 97.6 ms | +1.1% |
+| event-loop, t1a2 | 3,759,192 | 3,653,565 | -2.8% | 39.2 ms | 39.1 ms | -0.5% |
+| Vue TodoMVC, t1a2 | 10,363,651 | 10,125,377 | -2.3% | 124.3 ms | 125.0 ms | +0.5% |
+
+A first session, under another session's load (trust/metrics-s4.tsv), gave the same machine
+code and compile changes of +3.8%, +1.0%, -0.7% and -1.1%.
+
+x86-64: the step emits nothing there (its code is ARM64's), so no x86-64 counts.
+
+A TEST FIX FIRST (37ebcefa)
+
+The lib suite failed one test with step 4, deterministically:
+cross_realm_calls_keep_shared_intrinsic_tables_exact_across_collections, at the JIT tier, kept a
+dead Realm alive ("false/false/false" for its three WeakRefs). TRUST_JS_GC_WHY=1 showed the only
+root a native stack word in the generic call helper's frame (jit_call -> explicit_call, the call
+of `$262.gc()`), naming the dead Realm's self-hosting environment (the private record of its
+ToObject, LengthOfArrayLike, ... intrinsics); a collection from the host after the job
+(Interp::gc_collect) reclaimed the Realm, and one with every site's H_CALL open-coded again
+(a diagnostic switch, not committed) passed: the helper's frame sits 16 bytes deeper under the
+shared helper stub's frame record, and one of its unwritten slots now meets a stale cell address.
+The stack is scanned conservatively (Decision 0), which retains falsely, never unsoundly. A
+deep stack scrub before the job did not help: the word is written within the job, before the
+call.
+
+The test asserted reclamation from a collection JavaScript requested; it now asserts it after a
+host collection with no JavaScript frame on the stack (Interp::gc_collect, as the other
+collection tests do), keeping the collections the cross-Realm calls request. V8's tests assert
+collection with conservative stack scanning off (DisableConservativeStackScanningScopeForTesting)
+and Oilpan's with no heap pointers on the stack (StackState::kNoHeapPointers). The fixed test
+still fails when the Realm is kept (a global holding it: checked), and passes on main's code.
+
+CHECKS
+
+- Lib suite (embed) on 9321681d: ARM64 2,846 tests, 2,836 passed, the one above failed, 9
+  ignored; the test passes at 37ebcefa and at c64d9abc (with jit::compact_call_tests). x86-64
+  (zombie) 2,614 passed, 9 ignored, on 9321681d and on c64d9abc.
+- clippy -D warnings in the three configurations clean on both machines (ARM64 on c64d9abc,
+  zombie on c64d9abc); cargo fmt clean.
+- The release gate (gate-v2.sh, STAGES="rel fixtures difftest t262", BASE w2g's rest gate) on
+  9321681d, clean tree: the fixtures' masked outputs the base's, difftest 138 agree and 12
+  skipped (budget), Test262 at threshold 8 53,575/53,575 passed, the report identical to the
+  base's (gate-9321681d.txt).
+- tests/call-semantics.js, eq-, store- and read-semantics.js: the release binary's output at the
+  JIT tier, at threshold 1 and warm (TRUST_JS_JIT_ADMIT_RUNS=20) equals the tree-walker's.
+
+### Compact baseline templates, step 5: local reads without a dead TDZ test (record, 2026-11-05)
+
+055f059a on p2-compact-s5 (b57534d0's tree, its message's figure corrected; the measurements and
+checks are b57534d0's), from 07d3ad33 (the JIT map's attribution fix, below) over step 4
+(c64d9abc): the design's item 6.
+
+Every LoadLocal template tested its word for the TDZ marker (Empty) and carried the generic
+helper's call with its end poll; a parameter or a `var` can never hold the marker. Each compile
+now proves which reads find a value (Cfg::initialized_reads, a forward must-analysis over the
+compile's CFG, jit_ir.rs): only Tdz puts the marker in a slot, every other write stores a value
+(no operand word is Empty), and a read that did not throw leaves one (LoadLocal, GetPropLocal,
+SetPropLocalDrop; StoreLocal, UpdateLocal and ResetSlots write); the evaluator projections copy a
+binding back initialized exactly when it went in initialized. A fresh frame enters with every
+slot a value; a borrowed frame's entry (a function OSR seeds its lexical slots from the parked
+bindings, TDZ cells included), the catch and finally targets, the resumptions and the OSR
+headers know nothing of a Tdz'd slot, and in a loop fragment, whose private homes arrive seeded
+from parked bindings without a Tdz of their own, nothing of any slot it reads.
+
+A proven read copies its word (ldr, str, add), in templates and in regions (whose tagged-home
+read then emits nothing); the `LoadLocal; Pop` pair that guards a lexical's assignment emits
+nothing. A read that keeps its test branches over its slow path, which it reaches only with the
+marker in its slot and which therefore throws: the helper's call and a branch to the unwinder,
+without the flag's test, the end poll, or the pair's second, unreachable call. The proof and the
+new layout apply to every baseline site, loops and second stages included: a test that cannot
+fail is not a size-for-speed trade, and the exemplars drop theirs in the front end, for every
+tier. TRUST_JS_JIT_NO_TDZ_PROOF=1 keeps every test (DIAGNOSTICS.md).
+
+The exemplars' front ends drop the same tests over less of the graph: V8's bytecode generator
+remembers a variable's hole check for the rest of its basic block and keeps one checked on every
+arm of a branch (bytecode-generator.cc, HoleCheckElisionScope, HoleCheckElisionMergeScope),
+SpiderMonkey's emitter emits one CheckLexical a basic block (BytecodeEmitter.cpp, TDZCheckCache),
+and JSC's bytecode generator lifts a variable's TDZ check once it is initialized in scope
+(BytecodeGenerator.cpp, liftTDZCheckIfPossible); a test that stays calls the throw past it
+(SpiderMonkey's emitUninitializedLexicalCheck, ThrowRuntimeLexicalError; JSC's emit_op_check_tdz
+slow case).
+
+Tests: jit_ir's analysis over straight-line code, branches, loops, catch targets, resumptions,
+OSR entries, borrowed entries and fragments (three tests); jit::tdz_proof_tests runs reads before
+and after their declarations in straight-line code, branches, loops (an OSR'd one), switch cases,
+try/catch/finally, generators across yields, default parameters, classes, assignments,
+destructuring and inlined callees against the tree-walker (tests/tdz-semantics.js is the same
+program for the release binary). Treating every read as proven fails that test (branchTdz, sw1,
+sw2-1, tc2-1, gen2, cl, asg, ...); dropping the fragment rule fails
+function_tiering_tests::strict_private_fragments_publish_before_outer_author_cleanup.
+
+THE JIT MAP'S ATTRIBUTION (07d3ad33)
+
+opbytes.py counts a span holding a `region:` mark as region code. A region's operations take
+their family through Asm::mark_op, which replaces the open families, and nothing closed it when
+the region ended: a template emitted later in the chunk whose nested family closes (a helper
+call's, a call's) resumed the region's last family, and its span counted as region code. In
+Djot's map 907K bytes of baseline templates (of 2.14M) were counted as region spans, and the
+per-operation template bytes lost every such site. Region emission now ends with the baseline
+family; no machine code changes. Every templates figure in the design's census and the step
+records 1-4 undercounts the templates by this; the machine code totals and the span diffs are
+unaffected. Corrected figures, from fat-LTO builds with the fix (b0271a89 over the series base
+a3fd64da, f92ac532 over main e2ac4c7e, 07d3ad33 over step 4; bytes-attr/, bytes-s5/):
+
+| Djot | machine code | templates | region spans |
+| --- | --- | --- | --- |
+| series base a3fd64da | 3,987,956 | 2,963,644 | 1,008,940 |
+| main e2ac4c7e (steps 1-3, the fallbacks, C1) | 2,872,260 | 2,169,412 | 687,476 |
+| step 4 | 2,819,872 | 2,135,668 | 668,832 |
+| step 5 | 2,700,068 | 2,036,672 | 648,024 |
+| step 5 against the base | -32.3% | -31.3% | -35.8% |
+
+React: 306,388 -> 267,188 (-12.8%), templates 166,360 -> 138,364 (-16.8%). Vue: 628,816 ->
+461,076 (-26.7%), templates 474,588 -> 343,304 (-27.7%). Against the proposed exit, Djot's
+machine code is 32.3% smaller (25% asked), its templates 31.3% (40% asked): the template line is
+not met. What the templates still carry, by operation (step 5's Djot, all 163 chunks):
+CallWithThis 433,792 (894 sites, 485 a site; 21.3% of the templates), GetPropLocal 235,364 (994,
+237), GetMethod 188,336 (763, 247), GetProp 132,468 (647, 205), StrictEq 93,372 (309, 302),
+ReturnUndef with the chunks' tails 78,492, LoadLocal 68,476, Add 65,000 (435, 149), MakeObject
+59,968, JumpIfFalsePeek 55,668. By stage (a function's later chunk taken as its second stage):
+first-stage templates 1,074,356 (-39.6% from the base's 1,778,060, whose build is the one
+without LTO, bytes-s5/base0), second-stage templates 962,316 (-17.6% from 1,167,656), which keep
+the in-line templates by the series' scope, as the first stage's loop bodies do.
+
+MEASURED
+
+Code bytes (TRUST_JS_JIT_MAP=1, opbytes.py with the attribution fix; bytes-s5/, both fat LTO:
+lto/fix-07d3ad33, step 4's code, against lto/s5-b57534d0):
+
+| fixture | machine code, step 4 | step 5 | change | templates, step 4 | step 5 | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| Djot | 2,819,872 | 2,700,068 | -4.25% | 2,135,668 | 2,036,672 | -4.64% |
+| React | 283,304 | 267,188 | -5.69% | 148,640 | 138,364 | -6.91% |
+| Vue | 493,928 | 461,076 | -6.65% | 370,516 | 343,304 | -7.34% |
+
+LoadLocal's template bytes: Djot 166,532 -> 68,476 over 2,223 sites (-58.9%; a plain read's span
+from 64 bytes to 12, a pair's from 88 to nothing), React 13,236 -> 3,324, Vue 39,928 -> 13,528;
+region spans fall by their reads' tests (Djot 668,832 -> 648,024). Of Djot's 1,696 plain template
+reads, 1,655 take the proven form (97.6%) and 41 keep the test (36 bytes); of its 141 assignment
+guards, 117 emit nothing and 24 keep the test (20 of them 28 bytes). By site (span-diff.py and a mark check, s5/span-*.txt):
+every span that changed is a LoadLocal template (1,837 in Djot, -98,912 bytes), a region holding
+a LoadLocal (173, -20,808), a chunk's tail whose H_EXEC veneer went with its last tested read (5,
+-16 each), or one CallWithThis whose cache address took one MOVK fewer (-4).
+
+Instructions (fat LTO, lto/fix-07d3ad33 against lto/s5-b57534d0, one session, CPUs 10-13,
+setarch -R, pacing off, median of 3; counts/s5.txt):
+
+| workload | step 4 | step 5 | change |
+| --- | --- | --- | --- |
+| Vue | 1,416,660,310 | 1,398,823,679 | -1.26% |
+| React | 309,577,509 | 296,616,011 | -4.19% |
+| Djot | 609,005,321 | 602,824,585 | -1.01% |
+| chai | 73,124,958,069 | 72,679,579,668 | -0.61% |
+| Richards | 132,083,611 | 131,111,949 | -0.74% |
+| DeltaBlue | 256,491,553 | 254,851,303 | -0.64% |
+| Crypto | 722,984,534 | 715,111,732 | -1.09% |
+| RayTrace | 994,506,940 | 990,118,495 | -0.44% |
+| EarleyBoyer | 3,143,216,022 | 3,100,982,524 | -1.34% |
+| RegExp | 2,676,719,296 | 2,669,494,836 | -0.27% |
+| Splay | 1,405,416,608 | 1,395,842,863 | -0.68% |
+| NavierStokes | 451,228,291 | 439,798,457 | -2.53% |
+| PdfJS | 7,034,588,512 | 6,898,332,314 | -1.94% |
+| Mandreel | 61,602,476,649 | 61,204,948,550 | -0.65% |
+| Gameboy | 15,011,479,122 | 14,921,953,294 | -0.60% |
+| CodeLoad | 479,423,022 | 478,915,424 | -0.11% |
+| Box2D | 4,255,626,486 | 4,195,860,550 | -1.40% |
+| zlib | 134,528,646,875 | 133,596,087,438 | -0.69% |
+| TypeScript | 58,295,014,446 | 57,823,591,621 | -0.81% |
+
+Every workload runs fewer instructions: a proven read executes three instructions instead of
+seven (the old fast path's test, its not-taken branch and the branch over the slow path), in
+loops and second stages too, and a tested one six; a region's proven read runs three or four
+fewer.
+
+TRust's pages (TRust 78435d0's trust-browser-replay on 9321681d (trust/s4-replay, step 4's code)
+and on b57534d0, from exports, in one session in a quiet window (the 1-minute load under 2,
+twice 60 s apart; trust/metrics-s5.tsv); trust/page-metrics.sh, CPU 5; a page's machine code and
+compile time, (s5 - s1) / 4 of the cumulative metrics):
+
+| page, variant | machine code a page, step 4 | step 5 | change | compile a page, step 4 | step 5 | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| event-loop, t8 | 945,097 | 893,684 | -5.4% | 13.1 ms | 13.3 ms | +1.3% |
+| Vue TodoMVC, t8 | 7,464,738 | 7,004,894 | -6.2% | 98.5 ms | 95.6 ms | -2.9% |
+| event-loop, t1a2 | 3,653,561 | 3,493,017 | -4.4% | 38.8 ms | 39.0 ms | +0.4% |
+| Vue TodoMVC, t1a2 | 10,125,378 | 9,561,080 | -5.6% | 123.5 ms | 124.9 ms | +1.2% |
+
+The compile times move within the sessions' noise (step 4's Vue TodoMVC at t8 took 97.6 ms in
+its own session): the analysis is one pass over each compile's blocks, and the code it saves is
+emitted no more.
+
+Djot's elapsed time, the proposed exit's third line (elapsed/: the timing runner bench.py, fat
+LTO from fresh copies made together, pinned to CPU 5, 15 rounds rotating the order, after the
+pages in the same quiet window; the other cores were 2.4-2.6 busy, median, during the runs):
+
+| Djot at --tier=jit | series base a3fd64da | main e2ac4c7e | step 4 | step 5 |
+| --- | --- | --- | --- | --- |
+| wall, median (min-max) | 160.9 ms (157.7-170.2) | 154.4 ms (152.4-158.9) | 154.8 ms (153.0-159.9) | 153.3 ms (151.5-158.5) |
+| change | | -4.0% | -3.8% | -4.7% |
+| the fixture's elapsed_ms, median | 93 | 88 | 89 | 88 |
+
+Djot's elapsed time is 4.7% lower than the series base's (2% asked); steps 4 and 5 are within
+the runs' spread of main.
+
+THE PROPOSED EXIT
+
+- Djot's machine code: -32.3% from the series base (25% asked): met. Its templates, counted with
+  the attribution fix: -31.3% (40% asked): not met. Its first stage's templates are 39.6%
+  smaller; its second stage's, which the series' scope leaves in line, 17.6%, and they are 47%
+  of what remains. CallWithThis is 21% of the remaining templates.
+- Instructions: no fixture, chai or Octane workload slower beyond 0.2% as the steps landed (step
+  3's three, EarleyBoyer, RegExp and TypeScript, came back with the veneer as an LDR literal,
+  e34e863f); step 4's largest is RegExp +0.11%, and step 5 makes every workload faster, React by
+  4.2%.
+- Djot's elapsed time: -4.7% (2% asked): met.
+- The gate and both lib suites at every step; the code dumps change only in the named templates.
+
+CHECKS
+
+- Lib suite (embed) on b57534d0: ARM64 2,850 tests, 2,841 passed, 9 ignored; x86-64 (zombie)
+  2,618 passed, 9 ignored (jit::tdz_proof_tests runs there against the x86-64 JIT, which this
+  step leaves alone). clippy -D warnings in the three configurations clean on both machines;
+  cargo fmt clean.
+- The release gate (gate-v2.sh, STAGES="rel fixtures difftest t262", BASE w2g's rest gate) on
+  b57534d0, clean tree: the fixtures' masked outputs the base's, difftest 138 agree and 12
+  skipped (budget), Test262 at threshold 8 53,575/53,575 passed, the report identical to the
+  base's (gate-b57534d0.txt).
+- tests/tdz-semantics.js, call-, eq-, store- and read-semantics.js: the release binary's output
+  at the JIT tier, at threshold 1 and warm (TRUST_JS_JIT_ADMIT_RUNS=20) equals the tree-walker's.
+
