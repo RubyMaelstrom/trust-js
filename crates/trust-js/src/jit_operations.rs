@@ -706,20 +706,22 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
+        // A read whose slot surely holds a value (`Cfg::initialized_reads`: a parameter, a `var`,
+        // a lexical every path to the read initialized) copies the word; any other read tests it
+        // for the TDZ marker first.
         Op::LoadLocal(slot) if fast & 8 != 0 && layout.valid && (*slot as u32) * 8 + 8 < 4096 => {
             let off = *slot as i32 * 8;
-            let slow = a.new_label();
-            let done = a.new_label();
             emit_exec_word_load(a, 9, 22, off);
-            a.mov_imm64(10, crate::value::PACK_EMPTY);
-            a.cmp_reg_x(9, 10); // Empty = TDZ throw → slow
-            a.b_cond(C_EQ, slow);
+            if !a.initialized_read(pc) {
+                let ok = a.new_label();
+                a.mov_imm64(10, crate::value::PACK_EMPTY);
+                a.cmp_reg_x(9, 10);
+                a.b_cond(C_NE, ok);
+                emit_local_tdz_throw(a, pc as u32, unwind);
+                a.bind(ok);
+            }
             emit_exec_word_store(a, 9, 20, 0);
             a.add_imm(20, 20, 8);
-            a.b(done);
-            a.bind(slow);
-            emit_exec(a, pc as u32, unwind);
-            a.bind(done);
         }
         Op::StoreLocal(slot) if fast & 16 != 0 && (*slot as u32) * 8 + 8 < 4096 => {
             emit_store_local(

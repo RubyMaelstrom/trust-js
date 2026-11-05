@@ -59,6 +59,11 @@ comment/example in the same change.
   100 the function recompiles once without property chains (`FunctionRuntime::code3`);
   `TRUST_JS_TIER_LOG=1` reports each such recompile with its replay count, its inline sites
   and its bytecode compile time, or why it was declined.
+- `TRUST_JS_JIT_NO_TDZ_PROOF=1` keeps the ARM64 TDZ test of every local read. By default a
+  compile proves which `LoadLocal`s find their slot initialized on every path
+  (`Cfg::initialized_reads`: parameters, `var`s, temporaries, and lexicals a store or an
+  earlier read reaches) and emits those reads, and the `LoadLocal; Pop` pair that guards a
+  lexical's assignment, without the test.
 - `TRUST_JS_JIT_NO_DIRECT_CALLS=1` disables ARM64 direct calls and constructions (the inline
   call and `new` sequences that run the callee on a pooled frame record) while retaining
   ordinary JIT calls.

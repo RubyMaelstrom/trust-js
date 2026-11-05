@@ -253,6 +253,14 @@ mod compact_call_tests;
 
 #[cfg(all(
     test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_tdz_proof_tests.rs"]
+mod tdz_proof_tests;
+
+#[cfg(all(
+    test,
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -2835,6 +2843,9 @@ mod asm {
         /// (`Chunk::jit_fixed_activation`): a fresh frame's body and regions. Clear in code a
         /// borrowed frame enters, whose activation another tier may have made.
         fixed_activation: bool,
+        /// The local reads whose slot surely holds a value (`Cfg::initialized_reads`): their
+        /// TDZ test is dead. Empty in loose test assemblies, which keep every test.
+        initialized_reads: crate::jit_ir::InitializedReads,
     }
 
     #[derive(Clone, Copy)]
@@ -2880,6 +2891,7 @@ mod asm {
                 fp_callee_saved: false,
                 failed: None,
                 fixed_activation: false,
+                initialized_reads: Default::default(),
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -2960,6 +2972,14 @@ mod asm {
         }
         pub fn fixed_activation(&self) -> bool {
             self.fixed_activation
+        }
+        /// Declare the local reads whose TDZ test is dead (see `Cfg::initialized_reads`).
+        pub(crate) fn set_initialized_reads(&mut self, reads: crate::jit_ir::InitializedReads) {
+            self.initialized_reads = reads;
+        }
+        /// Whether the local read at `pc` surely finds a value, so that it needs no TDZ test.
+        pub(crate) fn initialized_read(&self, pc: usize) -> bool {
+            self.initialized_reads.contains(pc)
         }
         pub fn add_string_accumulation(&mut self, pc: u32, slot: u16, exit: usize) {
             self.string_accumulations.push((pc, slot, exit));
@@ -4989,6 +5009,10 @@ fn compile_entry(
     a.set_first_stage(!chunk.jit_second_stage());
     // A borrowed frame's activation may be another tier's, without the plan's fixed slots.
     a.set_fixed_activation(!borrowed_entry && chunk.jit_fixed_activation());
+    // The local reads that need no TDZ test (`TRUST_JS_JIT_NO_TDZ_PROOF` keeps every test).
+    if !env_flag!("TRUST_JS_JIT_NO_TDZ_PROOF") {
+        a.set_initialized_reads(cfg.initialized_reads(ops, !borrowed_entry));
+    }
     // One label per bytecode pc (branch/catch targets bind as we emit).
     let pc_labels: Vec<usize> = (0..ops.len()).map(|_| a.new_label()).collect();
     for pc in 0..ops.len() {
@@ -11946,14 +11970,45 @@ fn local_read_discard_pair(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_discard_local_read(a: &mut asm::Asm, off: u32, pc: u32, l_unwind: usize) {
+    if a.initialized_read(pc as usize) {
+        return; // the pair's one effect, its TDZ test, cannot fail
+    }
     let done = a.new_label();
     a.ldr_imm(9, 22, off);
     a.mov_imm64(10, crate::value::PACK_EMPTY);
     a.cmp_reg_x(9, 10);
     a.b_cond(C_NE, done);
-    emit_exec(a, pc, l_unwind);
-    emit_exec(a, pc + 1, l_unwind);
+    emit_local_tdz_throw(a, pc, l_unwind);
     a.bind(done);
+}
+
+/// The slow path of a local read that found the TDZ marker (Empty): `jit_exec` runs the read,
+/// which throws its ReferenceError, so the code unwinds at once, with neither a test of the
+/// helper's flag nor the poll after it. SpiderMonkey's Baseline calls ThrowRuntimeLexicalError
+/// past its test (BaselineCodeGen.cpp, emitUninitializedLexicalCheck) and JSC's Baseline takes
+/// a slow case that throws (JITOpcodes.cpp, emit_op_check_tdz).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_local_tdz_throw(a: &mut asm::Asm, pc: u32, l_unwind: usize) {
+    // A string accumulation starts at a LoadName (`string_accumulation::Plan::at`), never here.
+    debug_assert!(a.string_accumulation(pc).is_none());
+    a.mark_push("helper-call");
+    if a.stubs_ok() && shared_stubs_enabled() {
+        a.movz(1, pc, 0);
+        let stub = a.shared_stub(SharedStub::Helper { idx: H_EXEC as u8 }.key());
+        a.bl_label(stub);
+    } else {
+        a.mov(0, 19);
+        a.movz(1, pc, 0);
+        a.mov(2, 20);
+        a.ldr_imm(16, 21, (H_EXEC * 8) as u32);
+        a.blr(16);
+        a.mov(20, 0);
+    }
+    a.b(l_unwind);
+    a.mark_pop();
 }
 
 /// Move the stack's top value into a local, optionally retaining the expression result.

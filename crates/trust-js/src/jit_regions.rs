@@ -3226,10 +3226,14 @@ pub(super) fn emit(
                 Op::LoadLocal(slot) if plan.tagged_reg(slot).is_some() => {
                     saved_work += 2;
                     let home = plan.tagged_reg(slot).unwrap();
-                    a.fmov_x_d(10, home);
-                    a.mov_imm64(9, crate::value::PACK_EMPTY);
-                    a.cmp_reg_x(10, 9);
-                    a.b_cond(C_EQ, bailout);
+                    // A slot that surely holds a value (`Cfg::initialized_reads`) needs no TDZ
+                    // test.
+                    if !a.initialized_read(pc) {
+                        a.fmov_x_d(10, home);
+                        a.mov_imm64(9, crate::value::PACK_EMPTY);
+                        a.cmp_reg_x(10, 9);
+                        a.b_cond(C_EQ, bailout);
+                    }
                     stack.push(Operand::Borrowed(home));
                 }
                 Op::LoadLocal(slot) if slot < 256 => {
@@ -3238,9 +3242,11 @@ pub(super) fn emit(
                     // exact original-op fallback.
                     let off = slot as i32 * 8;
                     emit_exec_word_load(a, 10, 22, off);
-                    a.mov_imm64(9, crate::value::PACK_EMPTY);
-                    a.cmp_reg_x(10, 9);
-                    a.b_cond(C_EQ, bailout);
+                    if !a.initialized_read(pc) {
+                        a.mov_imm64(9, crate::value::PACK_EMPTY);
+                        a.cmp_reg_x(10, 9);
+                        a.b_cond(C_EQ, bailout);
+                    }
                     let dest = (depth as i32 - physical as i32) * 8;
                     emit_exec_word_store(a, 10, 20, dest);
                     stack.push(Operand::Canonical);

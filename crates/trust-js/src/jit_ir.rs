@@ -1459,6 +1459,227 @@ impl Cfg {
         }
         covered.iter().all(|yes| *yes).then_some(latch_pc)
     }
+
+    /// The local reads (`Op::LoadLocal` at their pcs) whose slot holds a value on every path
+    /// that reaches them, so that their TDZ test can never fail: definite initialization, a
+    /// forward must-analysis over this graph.
+    ///
+    /// Only `Op::Tdz` puts the TDZ marker (Empty) in a slot; no operand word is Empty, so every
+    /// other write stores a value. A slot no Tdz names (a parameter, a `var`, a temporary)
+    /// therefore always holds one. A Tdz'd slot holds one after a write or a successful read
+    /// (`StoreLocal`, `UpdateLocal`, `ResetSlots`; `LoadLocal`, `GetPropLocal` and
+    /// `SetPropLocalDrop` throw on Empty), until a Tdz again. Other operations leave a slot's
+    /// state as it was: the evaluator projections (`EvalExprPlan`, the assignment bridge) copy a
+    /// binding back initialized exactly when it went in initialized.
+    ///
+    /// A fresh frame (`fresh_entry`) starts with every slot a value (its parameters and
+    /// Undefined). The other entries a frame can come through know nothing of a Tdz'd slot:
+    /// a borrowed frame's entry, whose activation another tier made (a function OSR seeds its
+    /// lexical slots from the parked bindings, TDZ cells included), the catch and finally
+    /// targets, the resumptions after a suspension and the OSR loop headers. A loop fragment's
+    /// private homes arrive seeded from parked bindings as well, TDZ cells included, without a
+    /// Tdz of their own: in a fragment every slot it reads is in doubt at those entries.
+    ///
+    /// The exemplars' front ends drop the same tests, over less of the graph: V8's bytecode
+    /// generator remembers a variable's hole check for the rest of its basic block and keeps
+    /// one checked on every arm of a branch (bytecode-generator.cc, HoleCheckElisionScope,
+    /// HoleCheckElisionMergeScope), SpiderMonkey's emitter emits one CheckLexical a basic block
+    /// (BytecodeEmitter.cpp, TDZCheckCache), and JSC's bytecode generator lifts a variable's
+    /// TDZ check once it is initialized in scope (BytecodeGenerator.cpp,
+    /// liftTDZCheckIfPossible).
+    pub(crate) fn initialized_reads(&self, ops: &[Op], fresh_entry: bool) -> InitializedReads {
+        let mut reads = InitializedReads {
+            bits: vec![0; ops.len().div_ceil(64)],
+        };
+        let fragment = ops.iter().any(|op| matches!(op, Op::FragmentExit(_)));
+        let in_doubt = |op: &Op| match *op {
+            Op::Tdz(slot) => Some(slot),
+            Op::LoadLocal(slot) if fragment => Some(slot),
+            _ => None,
+        };
+        let Some(top) = ops.iter().filter_map(in_doubt).max() else {
+            for (pc, op) in ops.iter().enumerate() {
+                if matches!(op, Op::LoadLocal(_)) {
+                    reads.insert(pc);
+                }
+            }
+            return reads;
+        };
+        // The slots in doubt, numbered densely: a state is one bit per slot, set when the slot
+        // surely holds a value.
+        let mut bit = vec![u32::MAX; usize::from(top) + 1];
+        let mut tracked = 0u32;
+        for slot in ops.iter().filter_map(in_doubt) {
+            if bit[usize::from(slot)] == u32::MAX {
+                bit[usize::from(slot)] = tracked;
+                tracked += 1;
+            }
+        }
+        let words = (tracked as usize).div_ceil(64);
+        let index = |slot: u16| {
+            bit.get(usize::from(slot))
+                .copied()
+                .filter(|&b| b != u32::MAX)
+        };
+        let step = |state: &mut [u64], op: &Op| {
+            local_effects(op, |slot, value| {
+                if let Some(n) = index(slot) {
+                    let (word, mask) = ((n / 64) as usize, 1u64 << (n % 64));
+                    if value {
+                        state[word] |= mask;
+                    } else {
+                        state[word] &= !mask;
+                    }
+                }
+            })
+        };
+        // Each block's effect: the slots it leaves holding a value (`gen`) and those it leaves
+        // in doubt (`kill`), as out = (in & !kill) | gen.
+        let blocks = &self.blocks;
+        let mut gen = vec![0u64; blocks.len() * words];
+        let mut kill = vec![0u64; blocks.len() * words];
+        for (b, block) in blocks.iter().enumerate() {
+            let (gen, kill) = (
+                &mut gen[b * words..(b + 1) * words],
+                &mut kill[b * words..(b + 1) * words],
+            );
+            for op in &ops[block.start..block.end] {
+                local_effects(op, |slot, value| {
+                    if let Some(n) = index(slot) {
+                        let (word, mask) = ((n / 64) as usize, 1u64 << (n % 64));
+                        if value {
+                            gen[word] |= mask;
+                            kill[word] &= !mask;
+                        } else {
+                            gen[word] &= !mask;
+                            kill[word] |= mask;
+                        }
+                    }
+                });
+            }
+        }
+        let mut root = vec![false; blocks.len()];
+        for handler in self.handler_roots.iter().chain(&self.resume_roots) {
+            root[handler.target.index()] = true;
+        }
+        for (pc, depth) in self.osr_entries.iter().enumerate() {
+            if let (Some(_), Some(block)) = (depth, self.pc_block[pc]) {
+                root[block.index()] = true;
+            }
+        }
+        let entry = self.pc_block[0];
+        let entry_state = if fresh_entry && !fragment { !0u64 } else { 0 };
+        // Unreached blocks run nothing; they are in doubt so that no edge out of one proves
+        // anything. Reached blocks start from the optimistic top and only lose facts.
+        let mut out = vec![0u64; blocks.len() * words];
+        for &b in &self.rpo {
+            out[b.index() * words..(b.index() + 1) * words].fill(!0);
+        }
+        let meet = |b: BlockId, out: &[u64], state: &mut [u64]| {
+            let block = &blocks[b.index()];
+            let start = if root[b.index()] {
+                0
+            } else if Some(b) == entry {
+                entry_state
+            } else if block.predecessors.is_empty() {
+                0
+            } else {
+                !0
+            };
+            state.fill(start);
+            for pred in &block.predecessors {
+                for (w, word) in state.iter_mut().enumerate() {
+                    *word &= out[pred.index() * words + w];
+                }
+            }
+        };
+        let mut state = vec![0u64; words];
+        loop {
+            let mut changed = false;
+            for &b in &self.rpo {
+                meet(b, &out, &mut state);
+                let base = b.index() * words;
+                for (w, word) in state.iter().enumerate() {
+                    let next = (word & !kill[base + w]) | gen[base + w];
+                    if out[base + w] != next {
+                        out[base + w] = next;
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+        for (pc, op) in ops.iter().enumerate() {
+            if let Op::LoadLocal(slot) = *op {
+                if index(slot).is_none() {
+                    reads.insert(pc);
+                }
+            }
+        }
+        let mut reached = vec![false; blocks.len()];
+        for &b in &self.rpo {
+            reached[b.index()] = true;
+        }
+        for (b, block) in blocks.iter().enumerate() {
+            if !reached[b] {
+                continue;
+            }
+            meet(BlockId(b as u32), &out, &mut state);
+            for (offset, op) in ops[block.start..block.end].iter().enumerate() {
+                if let Op::LoadLocal(slot) = *op {
+                    if let Some(n) = index(slot) {
+                        if state[(n / 64) as usize] >> (n % 64) & 1 != 0 {
+                            reads.insert(block.start + offset);
+                        }
+                    }
+                }
+                step(&mut state, op);
+            }
+        }
+        reads
+    }
+}
+
+/// The slot states an operation leaves (see [`Cfg::initialized_reads`]): `f(slot, true)` for a
+/// slot that surely holds a value after it, `f(slot, false)` for one it puts in its TDZ.
+fn local_effects(op: &Op, mut f: impl FnMut(u16, bool)) {
+    match *op {
+        Op::Tdz(slot) => f(slot, false),
+        Op::LoadLocal(slot)
+        | Op::StoreLocal(slot)
+        | Op::UpdateLocal(slot, _)
+        | Op::GetPropLocal(slot, ..)
+        | Op::SetPropLocalDrop(slot, ..) => f(slot, true),
+        Op::ResetSlots(start, count) => {
+            for slot in start..start.saturating_add(count) {
+                f(slot, true);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The result of [`Cfg::initialized_reads`]: one bit per operation, set where the operation is
+/// a local read whose slot surely holds a value. Empty (the default) proves nothing.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct InitializedReads {
+    bits: Vec<u64>,
+}
+
+impl InitializedReads {
+    fn insert(&mut self, pc: usize) {
+        self.bits[pc / 64] |= 1 << (pc % 64);
+    }
+
+    /// Whether the local read at `pc` surely finds a value (its TDZ test is dead).
+    #[inline]
+    pub(crate) fn contains(&self, pc: usize) -> bool {
+        self.bits
+            .get(pc / 64)
+            .is_some_and(|word| word >> (pc % 64) & 1 != 0)
+    }
 }
 
 fn validate_target(len: usize, pc: usize, target: usize) -> Result<(), BuildError> {
@@ -1855,6 +2076,7 @@ mod tests {
             Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
             Op::ReturnUndef => (0, 0),
             Op::Await | Op::Yield | Op::YieldStar => (1, 1),
+            Op::FragmentExit(_) => (1, 0),
             _ => return None,
         })
     }
@@ -2053,6 +2275,149 @@ mod tests {
             "native registers die at suspension"
         );
         assert!(graph.blocks[entry.index()].successors.is_empty());
+    }
+
+    /// The pcs whose local read `Cfg::initialized_reads` proves initialized.
+    fn initialized(ops: &[Op], fresh_entry: bool, osr: bool) -> Vec<usize> {
+        let mut graph = cfg(ops).unwrap();
+        if osr {
+            graph.add_osr_entries(ops);
+        }
+        let reads = graph.initialized_reads(ops, fresh_entry);
+        (0..ops.len()).filter(|&pc| reads.contains(pc)).collect()
+    }
+
+    #[test]
+    fn initialized_reads_follow_writes_reads_and_tdz_in_order() {
+        use Op::*;
+        let ops = [
+            LoadLocal(0), // no Tdz names slot 0: always a value
+            Pop,
+            Tdz(1),
+            LoadLocal(1), // in its TDZ
+            Pop,
+            LoadLocal(1), // the read before threw on Empty or found a value
+            Pop,
+            Tdz(1),
+            LoadLocal(1), // in its TDZ again
+            Pop,
+            Const(0),
+            StoreLocal(1),
+            LoadLocal(1), // stored
+            Pop,
+            Tdz(2),
+            ResetSlots(2, 1),
+            LoadLocal(2), // reset to Undefined
+            Return,
+        ];
+        assert_eq!(initialized(&ops, true, false), [0, 5, 12, 16]);
+        // No Tdz at all: every read, whatever the entry.
+        let plain = [LoadLocal(0), LoadLocal(1), Add, Return];
+        assert_eq!(initialized(&plain, false, false), [0, 1]);
+    }
+
+    #[test]
+    fn initialized_reads_meet_every_path() {
+        use Op::*;
+        let both = [
+            Tdz(1),
+            LoadLocal(0),
+            JumpIfFalse(6),
+            Const(0),
+            StoreLocal(1),
+            Jump(8),
+            Const(0),
+            StoreLocal(1),
+            LoadLocal(1), // both arms stored
+            Return,
+        ];
+        assert_eq!(initialized(&both, true, false), [1, 8]);
+        let one = [
+            Tdz(1),
+            LoadLocal(0),
+            JumpIfFalse(6),
+            Const(0),
+            StoreLocal(1),
+            Jump(8),
+            Const(0),
+            Pop,
+            LoadLocal(1), // the else arm left it in its TDZ
+            Return,
+        ];
+        assert_eq!(initialized(&one, true, false), [1]);
+        let lp = [
+            Tdz(1),
+            LoadLocal(0),
+            JumpIfFalse(10),
+            LoadLocal(1), // the first iteration's read precedes the store
+            Pop,
+            Const(0),
+            StoreLocal(1),
+            LoadLocal(1),
+            Pop,
+            Jump(1),
+            LoadLocal(1), // the loop may run no iteration
+            Return,
+        ];
+        assert_eq!(initialized(&lp, true, false), [1, 7]);
+        let stored_before = [
+            Tdz(1),
+            Const(0),
+            StoreLocal(1),
+            LoadLocal(0),
+            JumpIfFalse(8),
+            LoadLocal(1), // every way into the loop stored it
+            Pop,
+            Jump(3),
+            LoadLocal(1),
+            Return,
+        ];
+        assert_eq!(initialized(&stored_before, true, false), [3, 5, 8]);
+        // An OSR entry at the loop header knows nothing the preheader proved.
+        assert_eq!(initialized(&stored_before, false, true), [3]);
+    }
+
+    #[test]
+    fn initialized_reads_doubt_every_independent_entry() {
+        use Op::*;
+        let handler = [
+            Tdz(1),
+            Const(0),
+            StoreLocal(1),
+            PushHandler(8),
+            LoadLocal(1),
+            Pop,
+            PopHandler,
+            ReturnUndef,
+            Pop,
+            LoadLocal(1), // a catch target is entered from anywhere in the try
+            Return,
+        ];
+        assert_eq!(initialized(&handler, true, false), [4]);
+        let resumed = [
+            Tdz(1),
+            Const(0),
+            StoreLocal(1),
+            Undef,
+            Yield,
+            Pop,
+            LoadLocal(1), // a resumption is an independent entry
+            Return,
+        ];
+        assert_eq!(initialized(&resumed, true, false), Vec::<usize>::new());
+        // A borrowed frame's activation may hold a lexical in its TDZ at pc 0.
+        let borrowed = [LoadLocal(1), Pop, Tdz(1), ReturnUndef];
+        assert_eq!(initialized(&borrowed, true, false), [0]);
+        assert_eq!(initialized(&borrowed, false, false), Vec::<usize>::new());
+        // A loop fragment's private homes come seeded, TDZ cells included, with no Tdz.
+        let fragment = [
+            LoadLocal(1),
+            Pop,
+            LoadLocal(1),
+            FragmentExit(crate::bytecode::FragmentExitKind::Normal),
+        ];
+        assert_eq!(initialized(&fragment, false, false), [2]);
+        assert_eq!(initialized(&fragment, true, false), [2]);
     }
 
     #[test]
