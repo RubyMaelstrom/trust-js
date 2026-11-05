@@ -13896,3 +13896,636 @@ precleans' cost on live_object_limit_error_handler_can_allocate (over 60 minutes
 bounded in step 4 (a forced slice precleans the next 16 pages of a resumable pass: 623 s, 92% of
 the catches); a preclean that traces only a large block's dirty runs, as minor collections do,
 is measured after step 4 (the design's order, step 7).
+
+### Vue's Proxy reads: the series landed (record, 2026-11-05)
+
+The design's four steps (an agent's, branch p2-proxy from main 2c430516), landed on main over
+060d739a (W6's steps 2b and 3 and its fix since the series' base). The landed tree is the series'
+head 2905c4c4 plus W6's changes since 2c430516, line for line; that combined tree's ARM64 lib
+suite passed by default and under TRUST_JS_GC_INCREMENTAL=force (2,821 passed, 9 ignored; under force 2,820 passed with
+live_object_limit_error_handler_can_allocate filtered, quadratic under forced precleans until W6
+step 4's bound) before main
+moved. The step records below name the branch's SHAs:
+
+| landed | p2-proxy | what |
+| --- | --- | --- |
+| 5f7e8d2e | 3df22f51 | step 1: a callback array's arguments rooted by its frame, not the registry |
+| 0f001e24 | 1d242967 | step 1, second part: a native's window rooted by its caller, not the boundary |
+| e89ea1c1 | 7cece2de | step 2: property-key strings carry their key |
+| 2c5b07a7 | cd271daa | step 3: a named read's Proxy trap called from the read's helper stub |
+| 8bf411c9 | 2905c4c4 | step 4: Reflect.get, has and set answered on their operands |
+
+Main to the series' head, measured directly (fat LTO, CPUs 10-13, pacing off, median of 3): Vue
+-16.88% on ARM64 (-5.09% on x86-64, where trap calls take the Rust path: the x86-64 template backend
+has no stub path for them), chai -6.55% (-1.03%); RegExp -2.16%, Gameboy -1.49%, Djot -0.33% on
+ARM64, no workload above +0.03% there; on x86-64 EarleyBoyer +0.20% and CodeLoad +0.07%, the rest
+flat or lower. TRust's Vue TodoMVC page (TRust 78435d0 on the base and on the head): the main
+thread's instructions -2.55% a page (2,313.6M to 2,254.7M). A read through a Reflect.get trap
+2,675 instructions to 1,019. Small costs reported to the owner: x86-64 chai +0.27% at step 3
+(every proxy read takes the Rust path there), ARM64 PdfJS +0.23% at step 3 (a sixth major
+collection), x86-64 EarleyBoyer +0.22% and ARM64 RegExp +0.08% at step 4 (layout: EarleyBoyer
+makes no native call); a read through a Proxy without a `get` trap +35 instructions (+3.3%; no
+workload has one); a Reflect call with a string-literal key +57-99 instructions (literals are not
+atoms: making them atoms, as V8 internalizes them, is the follow-up). Not done, as planned:
+elements through a Proxy (fork 7), the set and has traps from stores and `in`.
+
+### Vue's Proxy reads, step 1: arguments rooted by their frames, not the registry (record, 2026-11-05)
+
+Branch p2-proxy, on main 2c430516 (whose engine is 88067f94's: the base binary is that build,
+target/p2/proxy/lto/main-88067f94). Two commits, each measured against its parent.
+
+3df22f51, the first part: CallbackCache::call takes its arguments as an array of the caller's
+own, words of the native frame for the whole call, its polls and its tail drain, where the
+conservative stack scan roots them (Decision 0), as Interp::call_getter's window and
+Callback::call's prepared entry already were; it no longer enters them in the rooting registry.
+Every Proxy trap's call comes this way (Interp::proxy_call_trap), and so do Callback::call's calls
+before their callee is prepared. call_values, whose slice may be Rust-heap storage, keeps its
+registration.
+
+1d242967, the second part (approved with the design note): the native-call boundary
+(Interp::call_native_committed_with) no longer registers its window; its callers root the receiver
+and the window for the whole call. Every native call from generated code reaches the boundary on
+its record's operands: the call-hit helper (jit_call_hit), the generic call helpers (jit_call,
+jit_exec's Call and CallWithThis), and the spread call, whose arguments are in a native-stack
+buffer. The Rust callers, all through Interp::call_jit_cached and Interp::call_prepared, already had
+to root their windows by those functions' contracts: CallbackCache::call (the first part),
+call_values (its registration), call_getter and call_setter (native-stack windows). The two tests
+that called the boundary from Rust on an unregistered Rust-heap window register it themselves
+(jit::rooting_tests' committed_from_rust; scope_tests' committed scoped loan), as such a caller now
+must.
+
+Why generated code's window is a root for the whole call. A native called from generated code
+reads its arguments in place, in the calling activation's operand words. That activation runs on
+a pooled record (jit::JitFrame), which the collector traces from the pop that starts the activation
+to the push or free that ends it, scanning all of its FRAME_BUF words (slots and operands)
+conservatively, without a stack pointer; an activation too large for a record runs on a Rust
+entry's buffer, which it registers for its whole run (gc_trace::JitFrameRoots, words: the slots and
+the whole operand buffer). The caller's activation is suspended in the helper for the whole native
+call: it does not end, so its record or buffer stays traced through the native, every safepoint and
+collection inside it (allocation, polls, GC stress's collections), any reentry (a callback, a getter,
+a nested native: each runs on records and buffers of its own, so none writes the caller's words),
+the post-call interrupt poll and the pending-tail drain, which the boundary runs before returning.
+The window is immutable meanwhile: the boundary lends it as a slice and the caller retires those
+operand positions only after the boundary returns. A receiver-less call's `this` is a local
+Undefined on the helper's native frame. The spread call's buffer is an array on the helper's native
+frame, which the conservative scan roots until the helper returns. The rooting tests already showed
+the record's scan at work: a native called at a warmed site marks its receiver and argument by roots
+(jit::rooting_tests::committed_native_call_operands_are_roots, "RR"), which now holds with the
+boundary's registration gone.
+
+Measured (fat LTO, CPUs 10-13, setarch -R, pacing off, median of 3):
+
+Micros (instructions an iteration; target/p2/proxy/micro/):
+
+| loop body | main | 3df22f51 | 1d242967 |
+| --- | --- | --- | --- |
+| `p.x`, Reflect.get trap | 2,675.3 | 2,584.3 | 2,499.3 |
+| `p.x`, target[key] trap | 2,251.6 | 2,160.6 | 2,160.6 |
+| `p.x`, empty handler | 1,061.0 | 1,061.0 | 1,061.0 |
+| `t.x` | 124.0 | 124.0 | 124.0 |
+| `h.get(t, 'x', p)` | 1,321.6 | 1,321.6 | 1,236.6 |
+| `Reflect.get(t, 'x', p)` | 1,021.6 | 1,021.6 | 936.6 |
+| `Reflect.has(t, 'x')` | 953.6 | 953.6 | 868.6 |
+
+The first part takes 91 instructions from every trap call, the second 85 from every native call
+from generated code (the registry's register and unregister). W1's proxy-shift.js (whole run):
+7,971,106,304, 7,750,844,096 (-2.76%), 7,625,018,156 (-1.62%).
+
+ARM64 counts (target/p2/proxy/counts/s1a-3df22f51.txt, s1b-1d242967.txt; the two sessions' medians,
+each step against its parent in its own session):
+
+| workload | main | 3df22f51 | vs main | 1d242967 | vs 3df22f51 | step 1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 1,727,036,693 | 1,708,195,148 | -1.09% | 1,698,371,523 | -0.57% | -1.66% |
+| React | 316,472,093 | 316,482,443 | +0.00% | 316,483,783 | +0.00% | +0.00% |
+| Djot | 630,139,659 | 630,089,057 | -0.01% | 626,685,338 | -0.55% | -0.55% |
+| chai | 80,213,910,129 | 79,982,476,776 | -0.29% | 79,084,045,893 | -1.15% | -1.41% |
+| Richards | 135,451,713 | 135,462,426 | +0.01% | 135,457,106 | -0.00% | +0.00% |
+| DeltaBlue | 260,829,388 | 260,844,731 | +0.01% | 260,833,400 | -0.01% | +0.00% |
+| Crypto | 728,253,168 | 728,270,652 | +0.00% | 728,255,218 | -0.00% | +0.00% |
+| RayTrace | 997,031,084 | 997,041,280 | +0.00% | 996,053,350 | -0.10% | -0.10% |
+| EarleyBoyer | 3,194,399,614 | 3,194,417,082 | +0.00% | 3,194,415,189 | -0.00% | +0.00% |
+| RegExp | 2,735,697,777 | 2,735,712,746 | +0.00% | 2,673,949,623 | -2.26% | -2.26% |
+| Splay | 1,408,891,430 | 1,408,901,099 | +0.00% | 1,408,862,811 | -0.00% | -0.00% |
+| NavierStokes | 451,421,739 | 451,443,723 | +0.00% | 451,445,415 | +0.00% | +0.01% |
+| PdfJS | 7,713,789,733 | 7,726,782,982 | +0.17% | 7,713,434,654 | -0.17% | -0.00% |
+| Mandreel | 62,940,379,304 | 62,941,187,722 | +0.00% | 62,925,188,740 | -0.02% | -0.02% |
+| Gameboy | 21,124,251,938 | 21,124,347,901 | +0.00% | 21,124,338,544 | +0.00% | +0.00% |
+| CodeLoad | 481,322,754 | 481,339,797 | +0.00% | 481,324,642 | -0.00% | +0.00% |
+| Box2D | 4,447,266,937 | 4,447,473,325 | +0.00% | 4,447,318,270 | -0.00% | +0.00% |
+| zlib | 138,090,744,548 | 138,090,769,055 | +0.00% | 138,090,771,451 | +0.00% | +0.00% |
+| TypeScript | 58,709,630,678 | 58,697,214,369 | -0.02% | 58,684,002,372 | -0.02% | -0.04% |
+
+PdfJS's +0.17% at the first part and -0.17% at the second are its collection schedule, not a cost
+of either: under TRUST_JS_GC_LOG (target/p2/proxy/pdfjs/) both engines make the same 132 minor and
+5 major collections, but the third to fifth majors come at other points (main's fourth at 24,432
+objects, the first part's at 24,436 with 3,194 more live objects at the minors between), after a
+few objects more or fewer stayed marked by the stack's words rather than by the registry; an
+instruction profile of the run attributes the difference to marking (Heap::mark_stack_range,
+Words::trace_values, Heap::locate, mark_phase: +12M), none to the callback path.
+
+x86-64 counts (zombie, CPU 2; target/p2/proxy/zombie/counts-s1a.txt, counts-s1b.txt):
+
+| workload | main | 3df22f51 | vs main | 1d242967 | vs 3df22f51 | step 1 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 3,664,278,327 | 3,651,463,649 | -0.35% | 3,636,627,586 | -0.41% | -0.75% |
+| React | 1,519,522,372 | 1,519,525,662 | +0.00% | 1,519,373,464 | -0.01% | -0.01% |
+| Djot | 1,361,325,974 | 1,361,320,823 | -0.00% | 1,355,284,365 | -0.44% | -0.44% |
+| chai | 178,865,832,983 | 178,710,436,775 | -0.09% | 177,904,117,661 | -0.44% | -0.54% |
+| Richards | 418,323,179 | 418,317,358 | -0.00% | 418,318,000 | -0.00% | -0.00% |
+| DeltaBlue | 750,346,683 | 750,344,151 | -0.00% | 749,078,345 | -0.17% | -0.17% |
+| Crypto | 27,104,929,779 | 27,104,909,831 | -0.00% | 27,104,892,676 | -0.00% | -0.00% |
+| RayTrace | 2,188,633,754 | 2,188,645,199 | +0.00% | 2,187,816,440 | -0.04% | -0.04% |
+| EarleyBoyer | 8,813,454,107 | 8,813,468,416 | +0.00% | 8,813,442,307 | -0.00% | -0.00% |
+| RegExp | 5,584,990,270 | 5,584,981,178 | -0.00% | 5,533,419,937 | -0.92% | -0.92% |
+| Splay | 2,722,093,771 | 2,722,099,679 | +0.00% | 2,721,475,368 | -0.02% | -0.02% |
+| NavierStokes | 18,766,865,135 | 18,766,862,188 | -0.00% | 18,766,864,900 | +0.00% | -0.00% |
+| PdfJS | 24,597,791,525 | 24,581,097,831 | -0.07% | 24,533,741,108 | -0.19% | -0.26% |
+| Mandreel | 457,449,719,614 | 457,447,712,890 | -0.00% | 457,434,666,337 | -0.00% | -0.00% |
+| Gameboy | 62,069,199,555 | 62,069,346,859 | +0.00% | 62,069,230,061 | +0.00% | +0.00% |
+| CodeLoad | 471,913,967 | 471,910,135 | -0.00% | 471,866,722 | -0.01% | -0.01% |
+| Box2D | 18,156,264,455 | 18,153,041,241 | -0.02% | 18,152,932,471 | -0.00% | -0.02% |
+| zlib | 1,818,318,571,095 | 1,818,318,582,339 | +0.00% | 1,818,318,490,601 | -0.00% | -0.00% |
+| TypeScript | 162,750,578,907 | 162,733,270,008 | -0.01% | 162,696,668,796 | -0.02% | -0.03% |
+
+PROPSTAT and NATIVESTAT on Vue: the same before and after (these steps change no path).
+
+Checks on 1d242967 (both parts; the first part's own were its targeted tests):
+- ARM64 lib suite (embed): 2,804 tests, 2,803 passed and 9 ignored; the one failure,
+  gc_scan_spike::spike_scan_cost_is_linear_and_small, is the wall-clock bound under load (its
+  100 scans took over a second while the GC stress below ran), and passes alone in 0.26 s.
+- x86-64 (zombie): lib (embed) 2,585 passed, 9 ignored; clippy -D warnings in the three
+  configurations clean, as on ARM64.
+- Test262: built-ins/Proxy and built-ins/Reflect 464/464 at --tier=jit thresholds 8 and 0; under
+  GC stress (TRUST_JS_GC_STRESS=1, TRUST_JS_GC_VERIFY=1, a dev-profile runner) 464/464 at both;
+  the whole run 53,575/53,575.
+- GC stress with heap verification (TRUST_JS_GC_STRESS=1, TRUST_JS_GC_VERIFY=1), each test alone
+  in its own process, over the native-call and callback tests and the proxy and Reflect tests
+  (callback::, jit::rooting_tests::, scope_tests::, call_template, spread_call, call_apply,
+  getter_call, setter_call, native_call, light_native, native_entry, call_closure, call_epoch,
+  call_reference, borrowed_call, call_guard, call_feedback, native_constructor,
+  jit::native_op_tests, intrinsic, proxy, reflect): 268 tests, 265 passed in the half-hour limit;
+  the three over it are the ones the gates already run apart (val-8ed756bc-zombie,
+  val-d74d9c0b-zombie): borrowed_frames_recurse_past_the_stack_limit and
+  proxy_prototype_cycles_throw_range_error_instead_of_overflowing pass at stress 1000 and 200 (55
+  and 133 s, 52 and 114 s), and a_borrowed_frames_operands_survive_its_callees_collections
+ passes at stress 1 in 2,876 s. The rooting harness's own stress run (jit::rooting_tests::rooting_holds_under_gc_
+  stress, whose child runs the rooting, traced, this and callback tests stressed) passed.
+
+### Vue's Proxy reads, step 2: property-key strings carry their key (record, 2026-11-05)
+
+7cece2de on p2-proxy (after step 1's 1d242967), Fork 5 as decided. A string that is the value of
+one property key carries that key's word in its frontier, the header word an exact string never
+uses (an in-place append needs the string to end at its buffer's frontier), with the word's top
+bit as the mark (lstr::KEY_MARK). ToPropertyKey of such a string is then a load, a test and a mask
+(PropKey::of_marked), as V8's ToName of an internalized string, SpiderMonkey's AtomizeString of an
+atom and JSC's toIdentifier of an atom string return the key at once. The marked strings:
+- every heap atom, from its making (AtomTable::insert): its own key, or an index's for index text
+  (an atom of "17" is the key 17); text that begins with NUL is a Symbol's key or an escaped one,
+  whose value is another string, and carries none;
+- each heap's one copy of each static name it uses as a value (atom::static_name_string, kept with
+  the heap's interned strings for its life, after the ASCII units and the index strings), the
+  decision's one permanent marked copy per heap, as JSC keeps its common identifiers per VM; it
+  replaces the property_key_strings LRU for static names;
+- the canonical index strings below 1,024 (jstr::index_lstr), which replace the LRU for those
+  indices.
+property_key_string returns these, so a Proxy trap's key, and every key value made of an atom, a
+static name or a small index, is marked. A Proxy read makes its key value from the key the read
+already holds (Interp::key_value_of, through get_member_recv_impl's atom) rather than its text.
+The readers: Reflect.get (get_named_cached takes the key), the in operator and Reflect.has
+(ordinary_chain_has_key seeds the walk's atom), and computed reads by a String key (their cache
+miss). A map that has the key in hand now compares key words at any size (Props::find_text_with),
+where a small map compared each key's text. That lookup is out of line (Props::find_out_of_line):
+inlined into find_text_with, which every map walk inlines, it moved x86-64's code for EarleyBoyer's
+hot loops (+0.24% there in 48ab68bc, this step's first version; 7cece2de amends it to +0.00%,
+measured with variants without the key-word lookup, varA, and with it out of line, varD).
+
+Measured (fat LTO against 1d242967, CPUs 10-13, setarch -R, pacing off, median of 3).
+
+Micros, instructions an iteration (the difference of the 1.2M- and 200k-iteration runs over 1M;
+micro/s2s3-final.txt and the `in` loops' run):
+
+| loop body | step 1 | step 2 | change |
+| --- | --- | --- | --- |
+| `p.x`, trap `get(t, k, r) { return Reflect.get(t, k, r); }` | 2,499.3 | 2,297.3 | -8.1% |
+| `p.x`, trap `get(t, k) { return t[k]; }` | 2,160.6 | 2,048.6 | -5.2% |
+| `p.x`, empty handler (forwarded) | 1,061.0 | 1,065.0 | +0.4% |
+| `t.x`, a plain object | 124.0 | 124.0 | 0 |
+| `h.get(t, 'x', p)`, the Reflect.get trap called directly | 1,236.6 | 1,239.6 | +0.2% |
+| `Reflect.get(t, 'x', p)` | 936.6 | 939.6 | +0.3% |
+| `Reflect.has(t, 'x') ? 1 : 0` | 868.6 | 882.6 | +1.6% |
+| `'x' in t` | 531.0 | 545.0 | +2.6% |
+| `k in t`, `k` from Object.keys (carries its key) | 574.0 | 548.0 | -4.5% |
+
+The trap's key now carries its key: the trap's own Reflect.get and `t[k]` take it without a lookup
+of its text (-202 and -112 a read). A literal is not an atom and carries no key, so the last loops
+with a literal pay the test of the mark and the text's lookup as before (3 to 14 instructions; the
+`in` and Reflect.has paths' inlining moved too). V8 internalizes literals; making the compiler's
+string constants atoms would mark them, though for a one-key map the text compare costs about what
+the key-word lookup does (545 and 548 above).
+
+Counts (instructions, fat LTO; ARM64 on Crystal against 1d242967, counts/s2-7cece2de.txt; x86-64
+on zombie, CPU 2, zombie/counts-s2b.txt; Octane at a fixed five runs):
+
+| workload | ARM64 step 1 | ARM64 step 2 | change | x86-64 step 1 | x86-64 step 2 | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 1,698,376,916 | 1,673,786,467 | -1.45% | 3,636,610,429 | 3,613,636,126 | -0.63% |
+| React | 316,479,106 | 316,487,193 | +0.00% | 1,519,376,134 | 1,519,394,717 | +0.00% |
+| Djot | 626,681,466 | 627,970,604 | +0.21% | 1,355,307,116 | 1,355,373,533 | +0.00% |
+| chai | 79,058,108,612 | 78,480,325,580 | -0.73% | 177,741,926,108 | 177,168,596,969 | -0.32% |
+| Richards | 135,458,669 | 135,475,667 | +0.01% | 418,320,776 | 418,358,654 | +0.01% |
+| DeltaBlue | 260,830,708 | 260,881,422 | +0.02% | 749,078,315 | 749,146,523 | +0.01% |
+| Crypto | 728,252,777 | 728,318,633 | +0.01% | 27,104,906,791 | 27,104,990,214 | +0.00% |
+| RayTrace | 996,051,867 | 996,088,011 | +0.00% | 2,187,825,315 | 2,187,874,512 | +0.00% |
+| EarleyBoyer | 3,194,432,649 | 3,196,327,288 | +0.06% | 8,813,446,934 | 8,813,823,990 | +0.00% |
+| RegExp | 2,673,944,351 | 2,673,998,568 | +0.00% | 5,533,388,522 | 5,532,907,675 | -0.01% |
+| Splay | 1,408,860,753 | 1,408,879,454 | +0.00% | 2,721,474,402 | 2,721,522,988 | +0.00% |
+| NavierStokes | 451,443,141 | 451,442,610 | -0.00% | 18,766,865,010 | 18,766,886,957 | +0.00% |
+| PdfJS | 7,713,466,584 | 7,701,648,261 | -0.15% | 24,533,413,274 | 24,538,906,308 | +0.02% |
+| Mandreel | 62,923,178,688 | 62,925,960,339 | +0.00% | 457,433,642,064 | 457,438,467,628 | +0.00% |
+| Gameboy | 21,124,327,193 | 21,129,540,612 | +0.02% | 62,069,223,162 | 62,076,922,271 | +0.01% |
+| CodeLoad | 481,327,817 | 481,381,712 | +0.01% | 471,845,655 | 471,924,926 | +0.02% |
+| Box2D | 4,447,314,025 | 4,448,189,329 | +0.02% | 18,152,951,702 | 18,152,938,717 | -0.00% |
+| zlib | 138,090,760,841 | 138,090,828,582 | +0.00% | 1,818,318,483,807 | 1,818,318,578,119 | +0.00% |
+| TypeScript | 58,683,110,870 | 58,700,670,157 | +0.03% | 162,695,717,637 | 162,728,640,356 | +0.02% |
+
+Djot's +0.21% on ARM64 is there without the maps' key-word lookup too (variant A: 627,831,096 against
+the step's 627,853,043 in the same session, counts/s2vara.txt); its tier logs differ in inlining
+decisions and collection timing, not in a path this step changed. PROPSTAT and NATIVESTAT on Vue:
+unchanged (the step changes no path).
+
+Checks (48ab68bc unless named; the amendment changes one function's inlining):
+- ARM64 lib suite (embed): 2,814 tests, 2,805 passed, 9 ignored. x86-64 (zombie): lib (embed)
+  2,586 passed, 9 ignored on 48ab68bc and 2,587 on 94d1c9d4 (7cece2de and step 3's draft); clippy
+  -D warnings in the three configurations clean on both machines.
+- Test262: built-ins/Proxy and built-ins/Reflect 464/464 at --tier=jit thresholds 8 and 0, and
+  464/464 under GC stress (TRUST_JS_GC_STRESS=1, TRUST_JS_GC_VERIFY=1, a dev-profile runner); the
+  whole run 53,575/53,575.
+- GC stress with heap verification, each test alone in its own process, over the proxy, Reflect,
+  atom, string, property-key, computed-key, in-operator and callback tests: 129 of 129 passed.
+
+### Vue's Proxy reads, step 3: a named read's Proxy trap called from the read's helper stub (record, 2026-11-05)
+
+cd271daa on p2-proxy (after step 2's 7cece2de), the design note's forks 1 to 4 as decided. Its
+measured binaries were built from fb766b90, whose engine code it is (cd271daa only counts the new
+interpreter field in the memory-inventory test). A named read whose receiver is a Proxy (ECMA-262
+§10.5.8 [[Get]], the Proxy the Receiver) runs through the read's own Proxy caches, as Decision 17's
+getters run through the read's getter call cache: a chunk's trap table (bytecode::TrapTable), keyed
+by the read's pc as the getter table is, holds for each read its form and implicit position, the
+property cache that finds `get` on the handler, the trap's call cache, the key's value (a String
+that carries its key, step 2, and lives as long as the heap) and a flag set while the read's
+handlers have no `get` (bytecode::TrapGet).
+
+The helper (jit_get_prop, both backends) answers a Proxy receiver where the read's property cache
+has declined it (Interp::get_prop_ic_from_slot's declined branch, given the read's chunk and pc; the
+receiver's kind tag read in place), so that no other read pays for it: the read's slot, made at its
+first Proxy receiver (the form from the read's operation), marks the read's property cache generic
+as the cache's refused fill did (W4 step 5's mark) and answers the read (Interp::proxy_get_cached):
+GetMethod(handler, "get") through the slot's property cache; the trap through the slot's call cache,
+which a compiled trap's call fills, on (target, key, receiver) kept in the helper's native frame; a
+revoked handler, an absent or a non-callable `get` keep their errors and the target's [[Get]]. A
+slot's call cache keeps its own pins of the callees its ways record by identity
+(bytecode::TrapCalls), which every collection prunes as a callback cache's
+(Interp::gc_prune_dead_pins, through Interp::trap_calls): a way whose callee died forgets that
+identity and keeps its function and code, which another closure of the function matches by code.
+
+On ARM64 the reads' helper stub (H_GET_PROP), after its accessor test, probes the read's slot by pc
+(jit::emit_get_prop_trap): a read whose handlers had no `get` takes the helper at once; otherwise
+the receiver, as the slot's form places it, must be a Proxy (kind tag KIND_PROXY_TAG) whose handler
+is an Object; `get` is read from the handler by the property way loop on the slot's cache, at any
+depth (a data property; an accessor or an absence takes the helper); the trap is found in the slot's
+call cache by identity in way 0 or by code in the CallSecondary stub (which matches chai's per-proxy
+closures); and the direct sequence runs it on [handler, trap, target, key, receiver] above the
+operands. Every frame keeps room for that window (jit_ir::trap_window, five words above a named
+read's incoming depth). The trap frame records the read's position; a throw is placed at the read
+(jit_accessor_threw).
+
+The invariant (step 10) after the trap, Fork 4: a property layout keeps a sticky flag
+(value::PropertyLayoutData::validates), set where a key gets attributes that constrain a trap's
+result (non-configurable, and read-only data or an accessor), as SpiderMonkey's
+NeedsProxyGetSetResultValidation and JSC's hasNonConfigurableReadOnlyOrGetterSetterProperties. A
+target that is an ordinary object or an Array, ic_plain, whose layout's flag is clear needs no
+check: the stub tests its kind, its flag byte and its layout's byte; Rust tests the same before
+looking the key up (proxy_invariant_vacuous, which the Rust paths of every trap share). Any other
+target is checked in Rust (bytecode::jit_proxy_get_checked from the stub), which also catches a trap
+that made the target's property non-configurable during the call.
+
+The first versions and the amendments. db43d1e0 tested every read that reached the helper for a
+Proxy receiver before its property cache (a borrow and a tag compare in each of the four forms'
+arms), and its trap call caches pinned their callees in the chunk's call pins, which outlive their
+ways. Its counts (fat LTO against 7cece2de): ARM64 Vue -8.71%, but chai +0.36%, Gameboy +1.12%,
+PdfJS +0.31%, TypeScript +0.21%; x86-64 Vue -0.60%, chai +2.86%, DeltaBlue +1.92%, TypeScript
++1.73%, Box2D +1.37%, RayTrace +1.23%, RegExp +0.93%, Richards +0.91%, React +0.88%, Djot +0.85%
+(counts/s3-db43d1e0.txt, zombie/counts-s3c.txt). Gameboy's 18.2M helper reads (13.1M answered by the
+Rust property cache, 5.1M typed arrays) paid the test (+472 samples of 500,009 instructions:
+get_named_property_from_slot +245, get_prop_ic_impl +193, the moved inlining's memcmp calls +224).
+a2b4df2b moved the test to the declined branch and gave each slot its own pins, pruned to its ways
+at each call: ARM64 Vue -8.69%, chai -0.80%, Gameboy +0.17%, PdfJS +0.34%, TypeScript +0.10%, the
+rest within 0.04% (counts/s3e-a2b4df2b.txt); but x86-64 kept its regressions (React +0.93%,
+DeltaBlue +1.67%, Box2D +1.41%, chai +2.01%, Vue +0.31%; zombie/counts-s3e.txt). Box2D's profile put
+them in the slot read helper itself (get_named_property_from_slot +8% of its own samples,
+jit_get_prop +11%): the form had become its seventh argument, which x86-64 passes on the stack, and
+the receiver's form a load and spill on every read. And chai's collections, on x86-64 and on ARM64
+with in-line stubs (the Rust path for every read), still spent five to nine times as long in the
+weak-cell pass (x86-64 1.34 s against 0.15 s): a fill-counting variant found only 31k fills for 2.1M
+trap reads, so the cost was not new pins but the dead closures the ways' pins kept reserved, which
+every collection re-pins (gc_handle.rs: a dead target's cell stays young). cd271daa passes the
+helper its six arguments again (the slot's form comes from the read's operation when the slot is
+made), tests a String receiver before the name in the length shortcut, answers a slot's later reads
+before making its key value, and prunes the slots' pins at each collection.
+
+MEASURED
+
+Measured (fat LTO against 7cece2de, CPUs 10-13, setarch -R, pacing off, median of 3).
+
+Micros, instructions an iteration (micro/s3g-fb766b90.txt):
+
+| loop body | step 2 | step 3 | change |
+| --- | --- | --- | --- |
+| `p.x`, trap `get(t, k, r) { return Reflect.get(t, k, r); }` | 2,297.3 | 1,178.6 | -48.7% |
+| `p.x`, trap `get(t, k) { return t[k]; }` | 2,048.6 | 930.0 | -54.6% |
+| `p.x`, empty handler (forwarded) | 1,065.0 | 1,100.0 | +3.3% |
+| `t.x`, a plain object | 124.0 | 124.0 | 0 |
+| `'x' in t` | 545.0 | 545.0 | 0 |
+| `k in t`, `k` from Object.keys | 548.0 | 548.0 | 0 |
+
+A read through a trap now costs its trap's body and 1,050 instructions less than at step 2 (the
+design note's 1,354 of [[Get]] machinery at main). A read whose handler has no `get` pays the
+stub's probe of its slot and the slot's flag before the helper, 35 instructions: such a handler
+is rare (neither Vue's nor chai's reads meet one). W1's proxy-shift.js (whole run): 7,514,308,905
+at step 2, 7,239,753,671 (-3.65%).
+
+ARM64 counts (counts/s3g-fb766b90.txt):
+
+| workload | step 2 | step 3 | change |
+| --- | --- | --- | --- |
+| Vue | 1,673,787,489 | 1,527,991,394 | -8.71% |
+| React | 316,486,705 | 316,503,972 | +0.01% |
+| Djot | 627,994,061 | 627,828,340 | -0.03% |
+| chai | 78,486,397,424 | 75,704,856,506 | -3.54% |
+| Richards | 135,474,875 | 135,489,848 | +0.01% |
+| DeltaBlue | 260,880,581 | 260,899,393 | +0.01% |
+| Crypto | 728,319,715 | 728,302,540 | -0.00% |
+| RayTrace | 996,090,713 | 996,096,213 | +0.00% |
+| EarleyBoyer | 3,196,323,610 | 3,193,724,141 | -0.08% |
+| RegExp | 2,673,987,690 | 2,674,388,734 | +0.01% |
+| Splay | 1,408,884,217 | 1,408,852,953 | -0.00% |
+| NavierStokes | 451,439,977 | 451,459,943 | +0.00% |
+| PdfJS | 7,701,606,852 | 7,719,435,018 | +0.23% |
+| Mandreel | 62,925,424,532 | 62,920,300,911 | -0.01% |
+| Gameboy | 21,129,550,185 | 20,808,536,786 | -1.52% |
+| CodeLoad | 481,383,492 | 481,350,948 | -0.01% |
+| Box2D | 4,448,184,733 | 4,445,538,196 | -0.06% |
+| zlib | 138,090,802,516 | 138,091,064,047 | +0.00% |
+| TypeScript | 58,701,414,530 | 58,719,271,183 | +0.03% |
+
+PdfJS's +0.23% is its collection schedule again (as at step 1): under TRUST_JS_GC_LOG both
+engines make 132 minor collections, but step 3's majors fall at the 22nd, 39th, 57th, 82nd, 107th
+and 137th collections where step 2's fall at the 22nd, 39th, 59th, 83rd and 109th, a sixth major
+for 1.9% more promoted bytes (40.43M against 39.66M): a few more objects stay marked by the
+words of frames, whose operand areas the trap window lengthened (jit_ir::trap_window), not a
+path of the step. Gameboy's -1.52% and part of the x86-64 gains are the String length shortcut's
+order: the slot read helper compared the read's name with "length" before looking at its
+receiver, and now tests for a String first, for every read that reaches it.
+
+PROPSTAT on Vue (census/vue-propstat-s3g.txt): the reads that reach the helper with a Proxy
+receiver fall from 123,162 to 227 (the stub calls the rest's traps); on chai from 2,288,917 to
+31,579. NATIVESTAT: unchanged.
+
+x86-64 counts (zombie, CPU 2; zombie/counts-s3g.txt), where the stub's trap path is ARM64's alone
+and every Proxy read takes the helper's slot (the Rust path):
+
+| workload | step 2 | step 3 | change |
+| --- | --- | --- | --- |
+| Vue | 3,613,627,736 | 3,573,295,538 | -1.12% |
+| React | 1,519,397,607 | 1,518,702,706 | -0.05% |
+| Djot | 1,355,395,394 | 1,349,963,286 | -0.40% |
+| chai | 177,319,161,498 | 177,789,482,109 | +0.27% |
+| Richards | 418,348,343 | 418,048,419 | -0.07% |
+| DeltaBlue | 749,142,445 | 743,465,950 | -0.76% |
+| Crypto | 27,104,994,795 | 27,104,603,808 | -0.00% |
+| RayTrace | 2,187,871,115 | 2,174,985,471 | -0.59% |
+| EarleyBoyer | 8,813,827,997 | 8,812,063,095 | -0.02% |
+| RegExp | 5,532,818,199 | 5,493,435,097 | -0.71% |
+| Splay | 2,721,523,025 | 2,720,483,864 | -0.04% |
+| NavierStokes | 18,766,890,574 | 18,767,210,486 | +0.00% |
+| PdfJS | 24,539,073,966 | 24,520,878,963 | -0.07% |
+| Mandreel | 457,437,586,247 | 457,429,436,477 | -0.00% |
+| Gameboy | 62,076,925,146 | 61,882,988,960 | -0.31% |
+| CodeLoad | 471,953,163 | 472,254,310 | +0.06% |
+| Box2D | 18,152,936,661 | 18,126,975,858 | -0.14% |
+| zlib | 1,818,318,581,569 | 1,818,318,942,478 | +0.00% |
+| TypeScript | 162,728,467,021 | 162,331,288,538 | -0.24% |
+
+chai's +0.27% on x86-64 comes with its 2.3M Proxy reads on the Rust path (ARM64's stub calls
+them). Two instruction profiles of the two binaries (2M-instruction periods; the second with the
+JIT perf map) agree on the total (+233 and +236 samples) and that the Proxy path's own functions
+are cheaper on net (proxy_get_cached, the slot's lookup and jit_proxy_read_cached +296 samples,
+against proxy_get, proxy_get_trap, get_member_recv_impl and the callback cache's call -408), and
+chai's own code too (-480 in the second); the rest spreads over the property and call helpers,
+whose attribution differs between the two profiles by several hundred samples. The trap calls'
+pins are no longer a cost: before the collections pruned them (58b69cb0), x86-64 chai was +1.72%.
+
+CHECKS
+
+Checks (fb766b90, whose engine code cd271daa is; the lib suites' one failure there is the
+memory-inventory test's field count, which cd271daa corrects):
+- ARM64 lib suite (embed): 2,817 tests, 2,807 passed, 9 ignored, and the inventory test; x86-64
+  (zombie): 2,587 passed, 9 ignored, and the inventory test. The final head's lib suites (77bf04ed)
+  are in step 4's record. clippy -D warnings in the three configurations clean on both machines.
+- Test262: built-ins/Proxy and built-ins/Reflect 464/464 at --tier=jit thresholds 8 and 0, and
+  464/464 under GC stress (TRUST_JS_GC_STRESS=1, TRUST_JS_GC_VERIFY=1, a dev-profile runner).
+- GC stress with heap verification, each test alone in its own process, over the proxy, Reflect,
+  getter-call, feedback-record and in-operator tests (with the new jit::proxy_trap_tests:
+  reads through every form and handler shape, the direct sequence's completions, and the trap
+  pins' pruning): 107 of 107 passed; the prototype-cycle test, run apart, passes at stress 1000
+  (23 s) and 200 (110 s).
+
+### Vue's Proxy reads, step 4: Reflect.get, has and set answered on their operands (record, 2026-11-05)
+
+2905c4c4 on p2-proxy (after step 3's cd271daa), Fork 6 as decided: option (a), V8's baseline. A
+call of Reflect.get, Reflect.has or Reflect.set whose call cache proves the native (its class,
+bytecode::INTRINSIC_REFLECT_GET, _HAS and _SET, declared with the natives' templates), from
+generated code (jit_call_hit, through Interp::call_native_light) or from a call cache of the
+interpreter's (Interp::call_native_entry), is answered on the caller's operand window without
+the native call when its resolution runs no author code (Interp::reflect_resolved), as V8's
+optimizing tiers call GetPropertyWithReceiver and HasProperty directly
+(src/compiler/js-call-reducer.cc:3855-3943; src/maglev/maglev-graph-builder.cc:10696-10727): a
+target that is an Object and a key that is a String carrying its key (step 2: an atom, a static
+name's copy, a small index), so the key is never looked up by its text. Anything else takes the
+native, through the boundary, as before. The three classes join the native classes' one match
+(bytecode::native_operands for the hit, native_entry_class for the interpreter's caches), so no
+other native's call pays for them, where a first version (dbcffe1a) tested for them before that
+match.
+
+- Reflect.get (§28.1.5) reads a data property, whose value does not depend on the Receiver,
+  through the stub cache by the receiver's shape and the key (a re-derivation fills it: the
+  same resolution as get_named_cached's, without its getter call), an Array's `length`, or an
+  own plain element; a getter, an exotic object on the chain or a name the ICs leave to [[Get]]
+  (index-like or NUL-led text, `description`, long text) takes the native.
+- Reflect.has (§28.1.9) walks a chain of ordinary objects and Arrays by the key
+  (ordinary_chain_has_key) or finds an own element; a hole, a far index or another object on
+  the chain takes the native.
+- Reflect.set (§28.1.13) writes where OrdinarySet's steps on the Receiver are the target's own
+  (Interp::reflect_set_receiver_forwards): no receiver, the target, or a Proxy of the target
+  whose handler has neither a `getOwnPropertyDescriptor` nor a `defineProperty` trap (§10.5.5
+  step 7 and §10.5.6 step 7 forward those to the target), found by the property ICs on an
+  ordinary handler's chain without author code; Vue's set trap passes its Proxy so
+  (`Reflect.set(target, key, value, receiver)`), as the census's 23,781 four-argument calls show.
+  The write: the store IC's resolution with a scratch cache (try_ic_set: an own writable data
+  property, or a creation the chain allows on an extensible target), an element (fast_set_elem:
+  an overwrite, an append), or an Array's writable `length` (ArraySetLength of a Number that is
+  a valid length). A read-only property, a setter, a non-extensible target, an invalid length,
+  a typed array or any other receiver takes the native.
+
+V8, SpiderMonkey and JSC answer Reflect.set with a generic C++ builtin, which looks the receiver's
+traps up when it is a Proxy: V8's ReflectSet calls Object::SetSuperProperty
+(src/builtins/builtins-reflect.cc:72-97), whose JSPROXY receiver case asks the Proxy's
+GetOwnPropertyDescriptor and then defines (src/objects/objects.cc:2673-2690); SpiderMonkey's
+Reflect_set (js/src/builtin/Reflect.cpp:135) reaches SetPropertyByDefining
+(js/src/vm/NativeObject.cpp:2512); JSC's reflectObjectSet reaches definePropertyOnReceiver, whose
+Proxy receiver takes definePropertyOnReceiverSlow (Source/JavaScriptCore/runtime/JSObject.cpp:967,
+999-1016). The resolution here is that algorithm on the key in hand, where the Proxy has neither
+trap, without the native call's machinery.
+
+A literal key is not an atom and carries no key: `Reflect.get(t, 'x')` still takes the native (the
+micros' reflget and reflhas rows); the traps' keys and every key a property enumeration gives back
+carry theirs (reflgetk, reflhask, reflsetk).
+
+MEASURED
+
+Measured (fat LTO against step 3's build, fb766b90, CPUs 10-13, setarch -R, pacing off, median of
+3).
+
+Micros, instructions an iteration (micro/s4g-2905c4c4.txt; `K.x` a key from Object.keys, which
+carries it; a literal carries none):
+
+| loop body | step 3 | step 4 | change |
+| --- | --- | --- | --- |
+| `p.x`, trap `get(t, k, r) { return Reflect.get(t, k, r); }` | 1,178.6 | 1,019.0 | -13.5% |
+| `p.length` on an Array's Proxy, the same trap | 1,318.6 | 918.0 | -30.4% |
+| `p.x = i`, trap `set(t, k, v, r) { return Reflect.set(t, k, v, r); }` | 3,632.3 | 2,287.6 | -37.0% |
+| `p[i & 7] = i` on an Array's Proxy, the same trap | 3,916.7 | 2,482.0 | -36.6% |
+| `'x' in p`, trap `has(t, k) { return Reflect.has(t, k); }` | 2,161.3 | 1,939.6 | -10.3% |
+| `Reflect.get(t, K.x, p)` | 889.6 | 730.0 | -17.9% |
+| `Reflect.has(t, K.x)` | 885.6 | 651.0 | -26.5% |
+| `Reflect.set(t, K.x, i, p)`, a Proxy of the target as the Receiver | 2,496.6 | 1,151.0 | -53.9% |
+| `Reflect.set(t, K.x, i)` | 1,000.6 | 736.0 | -26.4% |
+| `Reflect.get(t, 'x', p)`, a literal | 939.6 | 1,038.6 | +10.5% |
+| `Reflect.has(t, 'x')`, a literal | 882.6 | 939.6 | +6.5% |
+| `h.get(t, 'x', p)`, the trap called directly with a literal | 1,239.6 | 1,338.6 | +8.0% |
+| `p.x`, trap `get(t, k) { return t[k]; }` | 930.0 | 930.0 | 0 |
+| `p.x`, empty handler | 1,100.0 | 1,100.0 | 0 |
+| `t.x` | 124.0 | 124.0 | 0 |
+
+A call whose key carries none (a literal is not an atom) still takes the native, and pays for
+the attempt: its class's template checks at the call site and the declined resolution (about 30
+instructions in Interp::reflect_resolved, by an instruction profile), and the boundary path's code
+moved, while the native's own lookup got cheaper. Literals made atoms, as V8 internalizes them,
+would give those calls the step too. W1's proxy-shift.js: 7,239,753,671 at step 3, 6,387,169,047
+(-11.8%). PROPSTAT and NATIVESTAT on Vue: unchanged (the calls still reach the call helper, which
+answers them).
+
+ARM64 counts (counts/s4g-2905c4c4.txt):
+
+| workload | step 3 | step 4 | change |
+| --- | --- | --- | --- |
+| Vue | 1,527,993,758 | 1,435,556,277 | -6.05% |
+| React | 316,504,219 | 316,508,392 | +0.00% |
+| Djot | 627,835,051 | 628,001,074 | +0.03% |
+| chai | 75,699,055,684 | 74,979,469,190 | -0.95% |
+| Richards | 135,488,222 | 135,494,781 | +0.00% |
+| DeltaBlue | 260,899,639 | 260,908,472 | +0.00% |
+| Crypto | 728,301,944 | 728,306,801 | +0.00% |
+| RayTrace | 996,100,437 | 996,140,650 | +0.00% |
+| EarleyBoyer | 3,193,730,550 | 3,193,741,767 | +0.00% |
+| RegExp | 2,674,398,471 | 2,676,602,676 | +0.08% |
+| Splay | 1,408,854,404 | 1,408,902,740 | +0.00% |
+| NavierStokes | 451,462,701 | 451,464,408 | +0.00% |
+| PdfJS | 7,719,401,595 | 7,707,381,006 | -0.16% |
+| Mandreel | 62,920,654,982 | 62,921,563,396 | +0.00% |
+| Gameboy | 20,808,487,557 | 20,809,419,705 | +0.00% |
+| CodeLoad | 481,342,825 | 481,375,319 | +0.01% |
+| Box2D | 4,445,533,262 | 4,446,061,555 | +0.01% |
+| zlib | 138,091,061,558 | 138,090,962,134 | -0.00% |
+| TypeScript | 58,719,078,744 | 58,726,183,259 | +0.01% |
+
+x86-64 counts (zombie, CPU 2; zombie/counts-s4g.txt, against cd271daa):
+
+| workload | step 3 | step 4 | change |
+| --- | --- | --- | --- |
+| Vue | 3,573,293,428 | 3,477,936,144 | -2.67% |
+| React | 1,518,707,616 | 1,518,707,236 | -0.00% |
+| Djot | 1,349,959,915 | 1,349,890,495 | -0.01% |
+| chai | 177,788,083,560 | 176,982,622,588 | -0.45% |
+| Richards | 418,036,778 | 417,790,851 | -0.06% |
+| DeltaBlue | 743,477,501 | 743,386,372 | -0.01% |
+| Crypto | 27,104,616,584 | 27,104,610,587 | -0.00% |
+| RayTrace | 2,175,004,204 | 2,174,227,375 | -0.04% |
+| EarleyBoyer | 8,812,077,547 | 8,831,220,599 | +0.22% |
+| RegExp | 5,493,653,028 | 5,495,138,124 | +0.03% |
+| Splay | 2,720,480,242 | 2,720,784,911 | +0.01% |
+| NavierStokes | 18,767,214,498 | 18,767,217,713 | +0.00% |
+| PdfJS | 24,520,915,507 | 24,522,941,847 | +0.01% |
+| Mandreel | 457,429,293,541 | 457,428,954,777 | -0.00% |
+| Gameboy | 61,882,954,103 | 61,878,769,957 | -0.01% |
+| CodeLoad | 472,236,296 | 472,232,843 | -0.00% |
+| Box2D | 18,126,942,312 | 18,122,685,676 | -0.02% |
+| zlib | 1,818,318,929,903 | 1,818,318,938,167 | +0.00% |
+| TypeScript | 162,329,284,408 | 162,287,582,787 | -0.03% |
+
+The series, main 88067f94 against 2905c4c4 (one session each; counts/series-88067f94-2905c4c4.txt,
+zombie/counts-series.txt):
+
+| workload | ARM64 main | ARM64 head | change | x86-64 main | x86-64 head | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 1,727,060,880 | 1,435,554,631 | -16.88% | 3,664,268,642 | 3,477,913,103 | -5.09% |
+| React | 316,470,990 | 316,504,269 | +0.01% | 1,519,525,350 | 1,518,707,332 | -0.05% |
+| Djot | 630,096,551 | 628,008,134 | -0.33% | 1,361,336,180 | 1,349,890,898 | -0.84% |
+| chai | 80,211,602,559 | 74,958,901,990 | -6.55% | 178,826,638,442 | 176,981,746,130 | -1.03% |
+| Richards | 135,451,965 | 135,491,575 | +0.03% | 418,314,892 | 417,790,590 | -0.13% |
+| DeltaBlue | 260,827,464 | 260,903,197 | +0.03% | 750,345,059 | 743,387,014 | -0.93% |
+| Crypto | 728,246,949 | 728,291,194 | +0.01% | 27,104,895,362 | 27,104,609,491 | -0.00% |
+| RayTrace | 997,025,984 | 996,126,270 | -0.09% | 2,188,644,075 | 2,174,232,536 | -0.66% |
+| EarleyBoyer | 3,194,388,778 | 3,193,732,256 | -0.02% | 8,813,452,716 | 8,831,223,841 | +0.20% |
+| RegExp | 2,735,730,908 | 2,676,597,020 | -2.16% | 5,584,976,246 | 5,495,102,367 | -1.61% |
+| Splay | 1,408,895,855 | 1,408,902,233 | +0.00% | 2,722,100,222 | 2,720,788,170 | -0.05% |
+| NavierStokes | 451,424,903 | 451,463,998 | +0.01% | 18,766,864,711 | 18,767,215,494 | +0.00% |
+| PdfJS | 7,713,828,581 | 7,707,437,995 | -0.08% | 24,597,606,157 | 24,522,931,078 | -0.30% |
+| Mandreel | 62,939,983,220 | 62,921,719,803 | -0.03% | 457,447,787,201 | 457,429,288,737 | -0.00% |
+| Gameboy | 21,124,318,770 | 20,809,406,404 | -1.49% | 62,069,229,076 | 61,878,759,163 | -0.31% |
+| CodeLoad | 481,328,194 | 481,367,558 | +0.01% | 471,933,612 | 472,241,462 | +0.07% |
+| Box2D | 4,447,270,423 | 4,446,032,737 | -0.03% | 18,156,220,845 | 18,122,668,108 | -0.18% |
+| zlib | 138,090,748,648 | 138,090,995,898 | +0.00% | 1,818,318,533,209 | 1,818,318,900,303 | +0.00% |
+| TypeScript | 58,709,438,163 | 58,726,890,928 | +0.03% | 162,750,056,808 | 162,282,916,368 | -0.29% |
+
+EarleyBoyer's +0.20% on x86-64 is step 4's +0.22% there, which no step-4 path explains:
+EarleyBoyer makes no native call from generated code (NATIVESTAT is empty), Interp::reflect_resolved
+kept out of line changes it by 0.00% (25b84cd6, measurement only), and two profiles of the run put
+it, within their noise, in text-keyed atom lookups (atom::lookup and its with_atoms closure +182
+samples against AtomTable::recent -109), as if the recent-lookup cache's pattern moved with the
+build. ARM64's RegExp +0.08% at step 4 (2.2M instructions, about three for each of its 759k native
+calls from generated code) is there in both versions of the step, with and without the class test
+before the native classes' match.
+
+TRust's Vue TodoMVC page (Speedometer 3.1's, benchmarks/browser-replays/speedometer-vue-todomvc.html
+replayed by TRust 78435d0's trust-browser-replay, built on the series' base 2c430516 and on its head
+2905c4c4 from exports, target/p2/proxy/trust/): user-mode instructions of the main thread (perf stat
+--no-inherit; the page's scripts run there, while the other threads' counts swung by gigabytes
+under the machine's load), CPUs 10-13, three repeats of one and five measured pages, (s5 - s1) / 4
+a page: 2,313.6M a page at the base, 2,254.7M at the head (-2.55%; repeats within 3.5M), and the
+first page's one-time part 1,181.0M against 1,172.1M (-0.75%).
+
+CHECKS
+
+Checks (2905c4c4, the series' head):
+- Lib suite (embed): ARM64 2,818 tests, 2,809 passed, 9 ignored; x86-64 (zombie) 2,589 passed, 9
+  ignored. clippy -D warnings in the three configurations clean on both machines.
+- Test262: built-ins/Proxy and built-ins/Reflect 464/464 at --tier=jit thresholds 8 and 0, and
+  464/464 under GC stress (TRUST_JS_GC_STRESS=1, TRUST_JS_GC_VERIFY=1, a dev-profile runner); the
+  whole run 53,575/53,575.
+- GC stress with heap verification, each test alone in its own process, over the proxy, Reflect,
+  getter-call, feedback-record and in-operator tests (with jit::proxy_trap_tests'
+  reflect_calls_agree_across_tiers, which also checks that each kind of call is answered on its
+  operands): 108 of 108 passed; the prototype-cycle test, run apart, passes at stress 1000 (23 s)
+  and 200 (108 s).
