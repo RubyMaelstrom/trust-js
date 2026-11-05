@@ -13684,3 +13684,106 @@ memory::tests::temporal_records_account_zone_and_calendar_strings_once, fails un
 before W6 as well. releasing_long_object_chains_uses_bounded_native_stack took 2,963 s; the
 known-slow integer_comparisons_and_branches_match_in_every_tier was left out
 (target/p2/w6/impl/stress/run-4fc709f2-force/results.txt).
+
+### W6 step 3: precleaning (record draft, 2026-11-05)
+
+Commit, from main 83a24a43, on p2-w6 (an agent's; worktree target/p2/w6-impl-wt), landed on main
+as e8cd037d over a53f1903 (main's commits since 83a24a43 change only this plan; the code is
+f63528c2's):
+- f63528c2: with TRUST_JS_GC_INCREMENTAL, a marking cycle precleans (design 5). Each time a
+  slice's drain runs out of work, the marked cells whose cards are set, written since their
+  trace, go back to the worklist for full traces, which the next slices do while the program
+  runs, and the cards are cleared (Heap::preclean). Precleaning repeats until a round, a
+  preclean and the drain of what its cells reach, finds fewer than 7,000 such cells and traces
+  under 1 MiB (PRECLEAN_DONE_CELLS, PRECLEAN_DONE_BYTES, provisional until the schedule, step 4:
+  the design's 0.5 ms of rescan at TypeScript's 67-78 ns a cell, and about 0.5 ms of marking);
+  the final pause follows once the worklist runs out after such a round, and rescans only the
+  cells written since.
+  - Not on a timer: a preclean comes only when the worklist runs out (design 5: a program's hot
+    cells would be rescanned at every preclean).
+  - The final pause's rescan and the preclean take the cards the same way
+    (Heap::take_cycle_card_cells: every page's marked cells on set cards, for full traces).
+  - The GC log: `[gc-slice]` lines add the cycle's precleans so far and the cells the last one
+    found (`precleans`, `precleaned`); a major collection's `[gc-heap]` line adds the marked cells
+    its final pause rescanned for their cards (`card_cells`, 0 for a major collection in one
+    pause). DIAGNOSTICS.md describes precleaning and the fields.
+  - No change to the barrier, the allocator, either JIT backend or a collection's marking in one
+    pause.
+
+Where the build differs from the design:
+1. A round ends precleaning by what its drain traced as well as by the cells its preclean found.
+   The design's rule (repeat until a preclean finds fewer cells than the final pause's budget)
+   left a SplayLatency final pause at 62 ms in a first build: the cycle's one preclean found 282
+   cells, whose drain took 150 slices and 40 MB, since Splay's rotations move subtrees the
+   marker had not reached under nodes it had, and meanwhile the program moved 63 MB more behind
+   1,371 written cells for the final pause to trace. With the drain's bytes in the rule its
+   cycles take 6 to 10 precleans and its final pauses 0.4-1.9 ms (impl/prof/s3).
+
+Tests: gc_core: a store into a traced cell during a cycle, rescanned by the preclean when the
+worklist runs out (what it stored is marked before the final pause, which rescans no card), and
+precleaning repeated while a preclean finds at least its budget (two precleans: one that finds
+the cells written, one that finds none, then the final pause with no card to rescan).
+
+Counts (fat LTO, CPUs 10-13, pacing off, median of 3, chai one run; base main 83a24a43's engine,
+built by its SHA, the tip f63528c2; incremental marking off):
+
+| workload | base | tip |
+| --- | --- | --- |
+| Vue | 1,724,572,961 | -0.03% |
+| React | 316,475,928 | -0.00% |
+| Djot | 630,242,138 | -0.00% |
+| chai | 80,203,642,864 | -0.02% |
+| Richards | 135,456,679 | -0.00% |
+| DeltaBlue | 260,834,388 | -0.00% |
+| Crypto | 728,250,226 | -0.00% |
+| RayTrace | 997,036,245 | -0.00% |
+| EarleyBoyer | 3,194,403,430 | -0.00% |
+| RegExp | 2,735,740,419 | +0.00% |
+| Splay | 1,408,899,638 | +0.00% |
+| NavierStokes | 451,432,273 | -0.00% |
+| PdfJS | 7,712,942,894 | +0.00% |
+| Mandreel | 62,940,814,496 | -0.00% |
+| Gameboy | 21,124,466,865 | -0.00% |
+| CodeLoad | 481,342,044 | +0.00% |
+| Box2D | 4,447,271,130 | +0.01% |
+| zlib | 138,090,766,501 | +0.00% |
+| TypeScript | 58,688,497,257 | +0.00% |
+
+(Before the rebase onto W4, the same step on 2b's 4fc709f2 counted within -0.03% and +0.01%
+of it too: impl/counts-16a1875b.txt.)
+
+Pauses (TRUST_JS_GC_LOG=1, TRUST_JS_GC_INCREMENTAL=1, default pacing, one run per workload pinned
+to CPU 13; the count and the largest pause in ms, main's (target/p2/w6/runs/w6main2b-on) and this
+step's (w6s3r-on); the drain of the largest final pause, and the cells it rescanned for their
+cards. Both under 11-17 cores of other load, another agent's test runs: indicative):
+
+| workload | slices | final pauses | largest final pause: drain | its card cells |
+| --- | --- | --- | --- | --- |
+| sa | 39 (2.82) / 46 (3.46) | 1 (2.23) / 1 (1.23) | 1.82 / 0.95 | 1 |
+| chai | 7 (2.97) / 8 (2.94) | 1 (4.14) / 1 (4.38) | 0.03 / 0.00 | 0 |
+| EarleyBoyer | 44 (0.83) / 46 (0.82) | 2 (1.35) / 2 (1.24) | 0.51 / 0.48 | 5 |
+| Splay | 99 (0.55) / 240 (0.58) | 2 (36.55) / 2 (48.24) | 36.05 / 47.58 | 807 |
+| PdfJS | 10 (1.38) / 13 (1.55) | 1 (1.02) / 1 (0.96) | 0.02 / 0.01 | 0 |
+| Gameboy | 5 (1.32) / 6 (1.33) | 1 (1.56) / 1 (1.36) | 0.32 / 0.08 | 1 |
+| TypeScript | 3,130 (2.33) / 3,211 (4.93) | 9 (69.62) / 8 (4.53) | 58.76 / 0.17 | 85 |
+| SplayLatency | 285 (1.27) / 2,612 (0.89) | 4 (72.13) / 7 (1.93) | 69.17 / 0.16 | 257 |
+
+- TypeScript's final pauses fall from 69.6 ms to 4.5 ms, their card rescans' drain from up to
+  58.8 ms to 0.2 ms. Its largest slice is now a preclean's (4.9 ms: 159,579 cells taken in one
+  slice; the schedule's 1 ms cap, step 4, spreads the taking over slices).
+- SplayLatency's cycles all complete now, each after 6 to 9 precleans, and its final pauses take
+  0.4-1.9 ms, their marking 0.05-0.2 ms and the rest the sweep (up to 1.4 ms). Before, its four
+  final pauses each traced up to 69 ms.
+- Splay's 48.2 ms final pause is the margin's: its second cycle starts past the 73.9 MB budget,
+  after a minor collection that promoted 32.8 MB (the growing nursery), and passes V8's margin
+  after 12.2 MB of allocation with 673 cells grey and most of its marking left. That is the
+  schedule's: step 4 starts a cycle at V8's soft limit, one nursery's budget below the budget.
+
+Checks at f63528c2 (main's 83a24a43 with this commit):
+- lib (ARM64): 2,814 passed, 9 ignored; with TRUST_JS_GC_INCREMENTAL=force, 2,814 passed.
+- x86-64 (zombie, slot w2g-rest): lib 2,595 passed, 9 ignored; clippy -D warnings in the three
+  configurations clean, as on ARM64.
+- Test262 under GC stress (TRUST_JS_GC_STRESS=100, every 2nd stress collection major,
+  TRUST_JS_GC_INCREMENTAL=force, TRUST_JS_GC_VERIFY=1; a dev runner at f63528c2): the subset of 13
+  directories, 2,603/2,603 in the default tier and 2,603/2,603 at TRUST_JS_TIER=jit with
+  threshold 0 (impl/t262stress s3r-*).
