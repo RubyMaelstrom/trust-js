@@ -16026,3 +16026,142 @@ SpiderMonkey's bailout counting); its own commit against main. Then compact temp
 and 5, then C2 (a recompiled chunk's records forwarded only when they add bits) and C3 (the
 tier-up at the last checkpoint, with V8's rule of waiting until feedback is stable), re-measured
 on top of C1.
+
+### JIT chains: the way back from a stale baked shape (C1, record, 2026-11-05)
+
+63c80e0c on p2-c1, from main 0546c1fc (an agent's; landed by fast-forward): the tier-up design
+note's C1, as decided. Two earlier
+versions were measured on the way: fcceec26 cleared a bailing chunk's inline checkpoint before
+the recompile, and kept it cleared when the recompile declined (now a declined recompile leaves
+the checkpoint to run as it would have; none declined in any measured run); fcceec26 and
+93219858 consulted code3 first on every execution-chunk lookup, which cost RayTrace about 0.06%
+(now a function without a second stage takes its recompile in code2, and code3 is consulted
+only after a second stage). The counts below are 63c80e0c's; the census and the controls are
+the earlier versions', whose recompiles are the same.
+
+An operator chain bakes its reads' and stores' single cached states (build_chain's LoadProp and
+StoreProp) and replays its remaining operations through the generic helper when a guard fails.
+The helper (jit_exec_inner) now counts, in a chunk whose native code built a property chain
+(Chunk::property_chains, set by build_chain), each replayed GetPropThis, GetPropLocal,
+SetPropThisDrop or SetPropLocalDrop whose site's cache holds the receiver's shape as a data
+state (Chunk::note_chain_replay: the receiver's shape against the four ways, a depth of at most
+3, no accessor or key-checked state; `prototype` excepted, whose deferred word takes the helper
+once a function by design). No machine code changes. At 100 (STALE_CHAIN_REPLAYS: JSC's
+osrExitCountForReoptimization, OptionsList.h; SpiderMonkey's frequentBailoutThreshold is 10,
+JitOptions.cpp) the chunk asks once (Chunk::reoptimize) and re-arms its inline checkpoint to the
+next native entry, where Interp::try_inline_recompile makes the recompile: plan_inlines over the
+function's first-stage chunk and compile_with_inlines from its caches, as the inline recompile
+is, with Chunk::no_property_chains set on the new chunk, so build_chain builds no property chain
+in it. After a second stage the chunk lands in a third set-once slot, FunctionRuntime::code3,
+which execution_code_for prefers (realm permitting) over code2; a function without a second
+stage takes it in code2 (so a function without one never looks at code3); the call caches'
+epoch moves, as a landed second stage's does. Frames running the bailing chunk finish in it. As JSC
+reoptimizes a code block past its exit count (CodeBlock::shouldReoptimizeNow, CodeBlock.cpp)
+and SpiderMonkey invalidates a script after frequentBailoutThreshold bailouts and sets
+JSScript::hadFrequentBailouts. TRUST_JS_TIER_LOG=1 reports each recompile (its replays, inline
+sites and bytecode compile time) or decline; TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1 turns it off.
+
+Test: jit::chain_reoptimize_tests (a warm engine bakes chains in five functions on one receiver
+class: a local's read compared, `this`'s read masked, a store of a masked value, one that
+keeps its class, and one whose inline checkpoint gives it a second stage first; read on a
+second class, the three recompile once into code2 and the staged one into code3, each running
+natively with no property chain, replaying nothing and computing the same; the fourth keeps
+its chain). With TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1 the test fails at its first recompile
+check.
+
+MEASURED
+
+Instruction counts (fat LTO, CPUs 10-13, setarch -R, pacing off; fixtures median of 3, chai one
+run, Octane fixed 5 runs median of 3; counts/c1c.txt, one session; main is 0546c1fc's code,
+879082db's build):
+
+| workload | main | C1 | change |
+| --- | --- | --- | --- |
+| React | 309,533,109 | 309,534,627 | +0.00% |
+| Vue | 1,415,173,587 | 1,415,503,107 | +0.02% |
+| Djot | 607,801,866 | 608,664,742 | +0.14% |
+| chai | 73,116,032,638 | 73,135,644,624 | +0.03% |
+| Richards | 132,009,637 | 132,010,768 | +0.00% |
+| DeltaBlue | 256,215,237 | 256,235,553 | +0.01% |
+| Crypto | 722,833,929 | 722,841,482 | +0.00% |
+| RayTrace | 991,708,290 | 993,641,179 | +0.19% |
+| EarleyBoyer | 3,168,888,138 | 3,142,882,149 | -0.82% |
+| RegExp | 2,674,359,466 | 2,673,672,591 | -0.03% |
+| Splay | 1,405,283,879 | 1,405,298,854 | +0.00% |
+| NavierStokes | 450,995,921 | 450,991,560 | -0.00% |
+| PdfJS | 7,026,309,386 | 7,029,707,360 | +0.05% |
+| Mandreel | 61,599,307,383 | 61,602,031,046 | +0.00% |
+| GBEmu | 18,748,327,941 | 15,011,045,520 | -19.93% |
+| CodeLoad | 479,399,273 | 479,421,204 | +0.00% |
+| Box2D | 4,294,695,804 | 4,253,599,920 | -0.96% |
+| zlib | 134,525,267,667 | 134,528,462,210 | +0.00% |
+| TypeScript | 58,214,073,336 | 58,269,883,908 | +0.10% |
+
+GBEmu runs 19.93% fewer instructions, more than TRUST_JS_JIT_NO_PROP_CHAIN=1's 19.23% on the
+same code (the chains that hold stay), and Box2D 0.96%. Richards, whose chains hold, recompiles
+nothing (+0.00%).
+
+Which effects are C1's (counts/c1b-*.txt, on 93219858 and two probes of it):
+- No recompile in RayTrace, EarleyBoyer or Djot; their changes are the new binary's: the same
+  with the recompile off (TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1: RayTrace +0.25%, EarleyBoyer
+  -0.82%, Djot +0.14% on 93219858) and with the counting calls removed (probe ec87838f: +0.24%,
+  -0.82%, +0.14%). Their tier decisions are main's, but for one of Djot's inline checkpoints,
+  where main finds a callee's pin dead and C1's binary finds it alive (the native stack is
+  scanned conservatively, gc_collect.rs, Decision 0), so two second stages inline more (Djot's
+  machine code +0.51%, 2,857,724 to 2,872,268 bytes); EarleyBoyer collects once more (76 against
+  75) and traces 6.63M objects against 8.30M; RayTrace's collections, tier decisions and machine
+  code are main's.
+- The counting alone, with the recompile off: GBEmu +2.21%, Box2D +0.16% (the replays' check,
+  about 40 instructions each, when nothing recompiles them away); +0.02% and +0.01% without the
+  counting calls.
+- The epoch: one move a recompile (GBEmu's call_ic_process_epoch 89 to 134). Its cost, the epoch
+  probe (a7e5ad8e) moving it where the request would be made against the same probe with the
+  recompile off: GBEmu -0.03%, Box2D +0.01%, TypeScript +0.01%, PdfJS +0.00%: not measurable.
+
+Recompiles per workload (TRUST_JS_TIER_LOG; c1c/census.txt, 63c80e0c; the native compile time
+is TRUST_JS_PERF_METRICS's jit_compile_seconds with the recompile on against off, one run each,
+CPU 14, a timing of a few milliseconds with its noise):
+
+| workload | recompiles | bytecode compile | native compile | native compiles | epoch moves |
+| --- | --- | --- | --- | --- | --- |
+| GBEmu | 46 | 3.9 ms | +14.7 ms | +45 | +45 |
+| TypeScript | 12 | 6.2 ms | +29.7 ms | +12 | +12 |
+| Box2D | 3 | 0.9 ms | +2.4 ms | +3 | +3 |
+| PdfJS | 1 | 0.3 ms | +0.3 ms | +1 | +1 |
+| every other workload, Richards among them | 0 | | | | |
+
+A recompile costs GBEmu about 0.4 ms (its handlers are small) and TypeScript about 3 ms (its
+parser's functions are large), once a function.
+
+TRust's pages (TRust 78435d0's trust-browser-replay on 63c80e0c against main's code, from
+exports, one session; trust/page-metrics.sh, CPU 5; trust/metrics-c1c.tsv): no recompile on five
+pages of event-loop or Vue TodoMVC at t8 or t1a2 (TRUST_JS_TIER_LOG, c1c/page-*.tier), so a
+page's compile is main's:
+
+| page, variant | machine code a page, main | C1 | compile a page, main | C1 |
+| --- | --- | --- | --- | --- |
+| event-loop, t8 | 980,004 | 980,004 | 13.6 ms | 13.7 ms |
+| event-loop, t1a2 | 3,759,194 | 3,759,194 | 39.8 ms | 40.4 ms |
+| Vue TodoMVC, t8 | 7,648,171 | 7,648,169 | 99.1 ms | 98.9 ms |
+| Vue TodoMVC, t1a2 | 10,363,653 | 10,363,654 | 127.0 ms | 129.4 ms |
+
+Code bytes (bytes-c1c/): Djot 2,857,724 to 2,872,268 (the inline checkpoint above, no
+recompile), React and Vue the same (284,024; 505,052 to 505,048).
+
+CHECKS
+
+- Lib suite (embed), ARM64, 63c80e0c: 2,836 passed, 9 ignored (c1c/lib.log). 93219858's first run
+  failed snapshot::tests::static_decode_validates_bodies_once_per_process once (its process-wide
+  list of 16 validated snapshots evicted the test's entry while other tests decoded theirs);
+  the module's three reruns and the suite's rerun (2,836) passed.
+- x86-64 (zombie), 63c80e0c's export: clippy clean in the three configurations, lib suite 2,613
+  passed, 9 ignored (zombie/zombie-c1c.txt). Chains are ARM64 code; x86-64 builds the counter
+  and never sets `property_chains`.
+- ARM64 clippy clean in the three configurations (c1c/clippy); cargo fmt clean.
+- Gate (gate-v2.sh, STAGES="rel fixtures difftest t262", BASE w2g's rest gate) on 63c80e0c, clean
+  tree: release builds; Vue, React and Djot masked outputs the base's; difftest 138 agree, 12
+  skipped (budget); Test262 at threshold 8 100.0% (53,575/53,575), identical to the base's report
+  (gate-63c80e0c.txt).
+- tests/eq-semantics.js, store-semantics.js and read-semantics.js agree across --tier=interp,
+  --tier=jit, threshold 1, and threshold 1 with TRUST_JS_JIT_ADMIT_RUNS=20, whose native code
+  bakes chains (c1c/).
