@@ -3020,6 +3020,16 @@ mod asm {
         pub fn word(&mut self, value: u32) {
             self.emit(value);
         }
+        /// ldr xt, label: a 64-bit load of the doubleword `offset` bytes from this instruction
+        /// (LDR (literal): a signed 19-bit word offset, +-1 MiB). The loaded words are data in
+        /// the code, which no branch patching moves apart from this instruction.
+        pub fn ldr_literal_x(&mut self, rt: u32, offset: i32) {
+            if offset % 4 != 0 || !(-(1 << 20)..(1 << 20)).contains(&offset) {
+                return self.bad("an LDR literal's offset off its word grid or past 1 MiB");
+            }
+            let imm19 = ((offset / 4) as u32) & 0x7_ffff;
+            self.emit(0x5800_0000 | (imm19 << 5) | rt);
+        }
 
         /// Best-effort hot-code alignment before branch relaxation. Padding executes only on
         /// fallthrough; bind the loop's back-edge label after it. NOP preserves registers/NZCV.
@@ -4562,6 +4572,26 @@ mod asm {
             assert!(super::logical_imm_w(0).is_none());
             assert!(super::logical_imm_w(u32::MAX).is_none());
             assert!(super::logical_imm_w(0x12345678).is_none());
+        }
+
+        /// A stub veneer's load (`super::super::emit_shared_stubs`): LDR (literal) reads the two
+        /// words after the BR, whatever comes before it.
+        #[test]
+        fn literal_load_reads_the_words_after_it() {
+            let value: u64 = 0x0000_ffff_1234_5678;
+            let mut a = super::Asm::new();
+            a.mov(0, 0);
+            a.ldr_literal_x(0, 8);
+            a.ret();
+            a.word(value as u32);
+            a.word((value >> 32) as u32);
+            let code = a.finish();
+            assert_eq!(code[1], 0x5800_0040, "ldr x0, #8");
+            let bytes: Vec<u8> = code.iter().flat_map(|w| w.to_le_bytes()).collect();
+            let buffer = super::super::ExecutableBuffer::from_bytes(&bytes).unwrap();
+            // SAFETY: the buffer holds a leaf function returning x0, which the literal loads.
+            let f: extern "C" fn() -> u64 = unsafe { std::mem::transmute(buffer.as_ptr()) };
+            assert_eq!(f(), value);
         }
 
         #[test]
@@ -6277,13 +6307,18 @@ fn skip_unused_callee_saved_fp(words: &mut [u32], at: &[usize], writes: bool) {
     }
     if cfg!(debug_assertions) {
         // Every SIMD&FP instruction came through `Asm::emit_fp`: none outside the save groups
-        // writes d8..d15.
+        // writes d8..d15. A stub veneer's two address words are data (`emit_shared_stubs`).
         let group = |k: usize| at.iter().any(|&start| (start..start + 4).contains(&k));
+        let veneer = |k: usize| {
+            (2..=3).any(|back| {
+                k >= back && words[k - back] == VENEER_LDR && words[k - back + 1] == VENEER_BR
+            })
+        };
         assert!(
             !words
                 .iter()
                 .enumerate()
-                .any(|(k, &word)| !group(k) && writes_callee_saved_fp(word)),
+                .any(|(k, &word)| !group(k) && !veneer(k) && writes_callee_saved_fp(word)),
             "a SIMD&FP instruction bypassed Asm::emit_fp"
         );
     }
@@ -15547,9 +15582,24 @@ fn loop_body_mask(ops: &[crate::bytecode::Op]) -> Vec<bool> {
         .collect()
 }
 
+/// A stub veneer's two instructions (see [`emit_shared_stubs`]): `ldr x16, #8` and `br x16`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const VENEER_LDR: u32 = 0x5800_0050;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const VENEER_BR: u32 = 0xD61F_0200;
+
 /// Emit every shared stub the chunk's sites requested (a stub may itself request others). A
-/// stub with a process-wide copy (see [`global_stub_address`]) gets a two-word-target veneer
-/// instead of its body.
+/// stub with a process-wide copy (see [`global_stub_address`]) gets a veneer instead of its
+/// body: LDR (literal) of the copy's address, which follows the BR as two data words, then BR,
+/// the 16 bytes a MOVZ/MOVK/MOVK/BR would take in two instructions at every call instead of
+/// four (V8's short builtin calls go further, remapping its builtins near the code; here each
+/// chunk is mapped on its own, out of a direct branch's reach).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -15566,8 +15616,11 @@ fn emit_shared_stubs(a: &mut asm::Asm, context: &StubContext<'_>) {
                 // Every stub's contract lets it clobber x16, and `br` keeps the site's return
                 // address in x30 for the stub's own `ret`.
                 Some(address) => {
-                    a.mov_imm64(16, address);
+                    a.ldr_literal_x(16, 8);
                     a.br(16);
+                    a.word(address as u32);
+                    a.word((address >> 32) as u32);
+                    debug_assert!(a.buf.len() >= 4 && a.buf[a.buf.len() - 4] == VENEER_LDR);
                 }
                 None => SharedStub::from_key(key).emit(a, context),
             }
