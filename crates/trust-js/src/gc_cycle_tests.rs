@@ -705,3 +705,40 @@ fn a_forced_cycle_finishes_while_the_program_writes_a_chunked_block() {
         "2000 1999"
     );
 }
+
+/// W6 step 6 (a step 4 bug, cycles on only, which the default-on suite found): the external
+/// bytes a program charges during a cycle count toward its margin as they come. A Map's tables
+/// grown past the margin make the cycle's final pause due, which the poll words' heap bit says
+/// at once (debug builds check at every safepoint that it agrees with `poll_due`), and a
+/// safepoint runs it while the program still grows the Map.
+#[test]
+fn a_maps_tables_grown_past_a_cycles_margin_bring_its_final_pause() {
+    let mut engine = cycling_engine(Tier::Bytecode);
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_incremental(IncrementalMode::On);
+    eval(
+        &mut engine,
+        "var keep = []; for (let i = 0; i < 20000; i++) keep.push({ i }); true",
+    );
+    {
+        let mut core = engine.interp.gc_heap.core.borrow_mut();
+        // A margin of 2 MB, half the room to a maximum 4 MB past the budget: it is passed once
+        // the heap's bytes and the external bytes exceed the budget by 2 MB, which the Map's
+        // tables (tens of bytes an entry, 8 MiB of budget) do before the loop ends.
+        let budget = core.stats().trigger_bytes;
+        core.set_max_heap_bytes(budget + (4 << 20));
+    }
+    assert!(engine.interp.gc_start_cycle());
+    let collections = engine.interp.gc_heap.core.borrow().collections();
+    let result = eval(
+        &mut engine,
+        "var m = new Map(); for (let j = 0; j < 300000; j++) m.set(j, j); m.size",
+    );
+    assert_eq!(result, "300000");
+    assert!(!cycle_running(&engine), "the margin's final pause ran");
+    assert!(engine.interp.gc_heap.core.borrow().collections() > collections);
+}

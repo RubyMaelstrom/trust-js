@@ -2048,6 +2048,12 @@ pub(crate) struct Heap {
     /// every allocation recomputes); `usize::MAX` once due (no allocation can make it false;
     /// marking, sweeping and the settings recompute it).
     due_check_bytes: usize,
+    /// W6 step 6: while a cycle marks, the allocated bytes past which the heap has passed the
+    /// byte budget by the cycle's margin with the external bytes charged at the last refresh
+    /// ([`Heap::refresh_due`]): `poll_due`'s view of the margin, which changes only where the poll
+    /// words' heap bit is recomputed (an external charge past its own limit sets the external
+    /// `due` instead, [`Control::charge_external`]).
+    cycle_overshoot_bytes: usize,
     stats: GcStats,
     /// Time the phases of each collection into `stats.last_phase_nanos` (diagnostics).
     phase_timing: bool,
@@ -2133,6 +2139,7 @@ impl Heap {
             live_check: i64::MAX,
             allocated_count: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
+            cycle_overshoot_bytes: usize::MAX,
             stats: GcStats::default(),
             phase_timing: false,
             incremental: IncrementalMode::Off,
@@ -2528,7 +2535,9 @@ impl Heap {
     /// W6: the heap's bytes, with the external bytes still charged and `upcoming` more, have
     /// passed the byte budget by [`Heap::cycle_margin`]: the running cycle's final pause is due
     /// (V8's AllocationLimitOvershotByLargeMargin, which counts the young generation's bytes as
-    /// old while major marking runs, src/heap/heap.cc:5308-5338).
+    /// old while major marking runs, src/heap/heap.cc:5308-5338). Exact, for the safepoint that
+    /// collects ([`Heap::due_work`]); `poll_due` sees it through the last refresh's limits
+    /// (`cycle_overshoot_bytes`, the external ledger's `cycle_limit`).
     #[cold]
     #[inline(never)]
     fn cycle_overshot(&self, upcoming: usize) -> bool {
@@ -2642,7 +2651,7 @@ impl Heap {
             // budget waits, and allocation brings the next slice instead, or past the margin the
             // final pause.
             return allocated.saturating_sub(cycle.allocated_at_slice) > SLICE_BYTES
-                || self.cycle_overshot(upcoming);
+                || allocated > self.cycle_overshoot_bytes;
         }
         match self.nursery_bytes {
             Some(nursery) => self.major_due || allocated.saturating_sub(self.swept_bytes) > nursery,
@@ -2789,6 +2798,20 @@ impl Heap {
     /// [`Heap::poll_due`] changed.
     #[cold]
     fn refresh_due(&mut self) {
+        // While a cycle marks, its margin (`cycle_overshot`) in the two parts its inputs change
+        // by: the allocated bytes past which it is passed with the external bytes charged now,
+        // and the external bytes past which it is passed with the bytes allocated now (step 6).
+        let external = &self.control.external;
+        if self.cycle.is_some() {
+            let limit = self.trigger_bytes.saturating_add(self.cycle_margin());
+            self.cycle_overshoot_bytes = limit.saturating_sub(external.live.get());
+            external
+                .cycle_limit
+                .set(Some(limit.saturating_sub(self.allocated_bytes)));
+        } else {
+            self.cycle_overshoot_bytes = usize::MAX;
+            external.cycle_limit.set(None);
+        }
         let due = self.collection_due();
         let over = self.over_live_limit();
         self.due_check_bytes = if due {
@@ -2797,14 +2820,10 @@ impl Heap {
             self.allocated_bytes
         } else if let Some(cycle) = &self.cycle {
             // The next slice, or the margin's final pause if it comes first.
-            let margin = self
-                .trigger_bytes
-                .saturating_add(self.cycle_margin())
-                .saturating_sub(self.control.external.live.get());
             cycle
                 .allocated_at_slice
                 .saturating_add(SLICE_BYTES)
-                .min(margin)
+                .min(self.cycle_overshoot_bytes)
         } else {
             match self.nursery_bytes {
                 Some(nursery) => self.swept_bytes.saturating_add(nursery),
@@ -5765,6 +5784,12 @@ struct ExternalBytes {
     budget: Cell<usize>,
     /// `since` passed `budget`: a collection is due. Cleared by every sweep.
     due: Cell<bool>,
+    /// W6 step 6: while a cycle marks, the `live` bytes past which the heap has passed the byte
+    /// budget by the cycle's margin with the bytes it had allocated at its last refresh
+    /// ([`Heap::refresh_due`]): a charge past them makes the final pause due (`due`), as V8
+    /// re-checks the margin as external memory grows (Heap::UpdateExternalMemory,
+    /// src/heap/heap.cc:6967-7020).
+    cycle_limit: Cell<Option<usize>>,
 }
 
 impl Control {
@@ -5785,11 +5810,14 @@ impl Control {
     /// external budget; the poll words' heap bit says so at once, so the next safepoint collects.
     pub(crate) fn charge_external(&self, bytes: usize) {
         let external = &self.external;
-        external.live.set(external.live.get().saturating_add(bytes));
+        let live = external.live.get().saturating_add(bytes);
+        external.live.set(live);
         let since = external.since.get().saturating_add(bytes);
         external.since.set(since);
         let budget = external.budget.get();
-        if budget != 0 && since > budget && !external.due.replace(true) {
+        let over = (budget != 0 && since > budget)
+            || external.cycle_limit.get().is_some_and(|limit| live > limit);
+        if over && !external.due.replace(true) {
             self.poll_words.publish(true);
         }
     }
@@ -11237,6 +11265,70 @@ mod tests {
         );
         fx.collect();
         assert!(fx.heap.cycle.is_none());
+    }
+
+    /// A cycle fixture with a margin of 1 MB (a maximum 2 MB past the budget), its cycle started:
+    /// the bytes it may allocate or charge before the margin forces the final pause.
+    fn margin_fixture() -> (Fixture, usize) {
+        let (mut fx, _chain) = cycle_fixture(20_000);
+        fx.heap.set_heap_growth(1 << 20, 100);
+        fx.heap
+            .set_max_heap_bytes(fx.heap.trigger_bytes + (2 << 20));
+        assert!(start_cycle(&mut fx));
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(!fx.heap.poll_due(), "the next slice is not due yet");
+        let room = (fx.heap.trigger_bytes + fx.heap.cycle_margin())
+            .saturating_sub(fx.heap.allocated_bytes);
+        (fx, room)
+    }
+
+    /// W6 step 6 (a step 4 bug, cycles on only, which the default-on suite found): the external
+    /// bytes charged during a cycle reach its margin as they come, as V8's UpdateExternalMemory
+    /// re-checks it (src/heap/heap.cc:6967-7020): a charge past the margin makes the final pause
+    /// due and publishes it, where the margin read the bytes charged now, which no publish
+    /// followed.
+    #[test]
+    fn external_charges_past_the_margin_make_a_cycles_final_pause_due() {
+        let (mut fx, room) = margin_fixture();
+        let control = fx.heap.control();
+        control.charge_external(room / 2);
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(!fx.heap.poll_due(), "within the margin");
+        control.charge_external(room - room / 2 + 1);
+        assert!(
+            fx.heap.poll_bit_agrees(),
+            "the charge past the margin published its due"
+        );
+        assert!(fx.heap.poll_due());
+        assert_eq!(
+            fx.heap.due_work(None, true, false),
+            DueWork::Collect(CollectionKind::Major)
+        );
+        fx.collect();
+        assert!(fx.heap.cycle.is_none());
+        assert!(fx.heap.poll_bit_agrees());
+    }
+
+    /// W6 step 6: a release of external bytes during a cycle leaves the poll words' heap bit and
+    /// `poll_due` agreeing: after a refresh that saw the bytes past the margin, their release
+    /// does not take back the final pause's due (it read the bytes charged now too).
+    #[test]
+    fn an_external_release_during_a_cycle_keeps_the_heap_bit_and_poll_due_agreeing() {
+        let (mut fx, room) = margin_fixture();
+        let control = fx.heap.control();
+        control.charge_external(room + 1);
+        // A refresh, with the bytes still charged.
+        fx.heap.set_incremental(IncrementalMode::On);
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(fx.heap.poll_due());
+        control.release_external(room + 1);
+        assert!(
+            fx.heap.poll_bit_agrees(),
+            "a release leaves the heap bit and poll_due agreeing"
+        );
+        fx.collect();
+        assert!(fx.heap.cycle.is_none());
+        assert!(fx.heap.poll_bit_agrees());
     }
 
     /// W6: a cell stored into a traced (black) cell after its trace survives the cycle when the
