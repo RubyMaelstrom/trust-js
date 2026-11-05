@@ -16514,3 +16514,349 @@ CHECKS
 - tests/tdz-semantics.js, call-, eq-, store- and read-semantics.js: the release binary's output
   at the JIT tier, at threshold 1 and warm (TRUST_JS_JIT_ADMIT_RUNS=20) equals the tree-walker's.
 
+### W6 step 6 landed: chunked blocks, the margin fix, on by default; W6's exit complete (record, 2026-11-06)
+
+Three commits (an agent's, on main 867ac484; branches p2-w6-s6-chunks, -margin, -default-on),
+landed on main over 670b8d7a as 203d5c62 (01accd72), 9f01f071 (c2b046a7) and b327786b (3d6d4f60):
+the code is 3d6d4f60's plus main's changes since 867ac484 (compact templates' steps 1-5, the
+veneer, the two fallbacks, C1), line for line, cargo fmt clean. That combined tree's checks before
+main moved: the release gate (target/p2/w6/gate-combined-b327786b.txt, base
+compact's gate-c50a0b4e: the fixtures' masked output as the base's, difftest 138 agree, 12 skipped,
+Test262 at threshold 8 53,575 of 53,575 and identical to the base's report) and the ARM64 lib suite
+by default, the cycle now on (2,847 passed, 9 ignored), and under TRUST_JS_GC_INCREMENTAL=force
+(2,847 passed).
+
+W6's exit, completed (the timed record "W6's exit, timed" above, and this step's): SplayLatency
+8,529 against 6,446, met; no pause above 5 ms, met (the largest a final pause of 3.57 ms); slices at
+most 1 ms but for a cycle's start, now met (the sustained allocation workload's largest 1.02 ms,
+1.04 at most, against 2.00 before the chunks; TypeScript's 1.01 ms is the 128-cell clock's
+overshoot); no workload slower beyond noise in instructions at pacing off (each step; the final
+tree with the cycle on by default against e50f5725: Splay -16.28%, TypeScript -1.47%,
+EarleyBoyer -1.36%, PdfJS +0.37% and Gameboy +0.12% (the new collection schedule), the rest within
+0.05%); Test262 identical, and the stage end's stress runs below; peak RSS reported (the timed
+record: +1-5% with the cycle on). Incremental marking is on by default (TRUST_JS_GC_INCREMENTAL=0
+or off turns it off; wasm32 keeps it off). For the TRust port: TRust's page actor calls the memory
+reducer's timer but not Engine::advance_incremental_marking, so on TRust a cycle advances on
+allocation and task boundaries and finishes at its final pause, with no idle slices, until the
+actor's loop runs them. Carried after W6: B (a large block's dirty runs re-traced instead of the
+whole block, about 0.8 ms of the sustained workload's final pause), sweeping out of the pause, the
+memory reducer's collection measured as a cycle on TRust.
+
+### W6 step 6, part 1: large element blocks traced in chunks (record, 2026-11-05)
+
+Why: the exit caps a slice at 1 ms but for the one that starts a cycle, and sustained
+allocation's 1.97 ms slice (step 5's pause table) was one trace: its 200,000-word retained
+array's block, which a trace reported whole.
+
+What the exemplars do:
+- V8 (main): an array larger than its largest regular object (128 KB) is marked in chunks of that
+  size (MarkingProgressTracker::kChunkSize = kMaxRegularHeapObjectSize; only large objects use the
+  tracker, src/heap/marking-progress-tracker.h:17-32). The visitor takes the next chunk, reposts
+  the array while chunks remain and returns the chunk's bytes as its work
+  (VisitFixedArrayWithProgressTracker, src/heap/marking-visitor-inl.h:618-687; the repost at
+  658-665, the size at 673), which the step counts against its byte budget, reading its clock
+  every 128 objects (src/heap/mark-compact.cc:2296, 2348-2370). The array stays black while
+  chunked: the Dijkstra barrier greys a stored value, so a chunk is never rescanned
+  (marking-progress-tracker.h:22-26); the tracker is reset at sweep (mark-compact.cc:5343, 6278).
+- SpiderMonkey (main): no fixed chunk; the marker scans an elements range checking its budget at
+  every value and pushes the rest of the range back when over (js/src/gc/Marking.cpp:1851-1858),
+  reading the clock every 1000 steps (js/public/SliceBudget.h:66); a pushed range's start is kept
+  valid across shifts (Marking.cpp:1660-1710). Its snapshot barrier needs no rescan either.
+- JSC: a butterfly's elements are visited whole (runtime/JSObject.cpp:131-139); a re-greyed cell
+  is rescanned whole.
+
+Decisions (the coordinator, 2026-11-05):
+- Fork 1, the chunk: V8's 128 KiB first, 32 KiB if sustained allocation's largest slice but the
+  start's measured visibly past 1 ms. It did (below): 32 KiB (4,096 words) for the threshold, the
+  chunk and the clock's interval.
+- Fork 2, how a chunked block meets the cards: A, a take of the owner's card drops its progress
+  and the block is traced again from its first chunk (JSC's whole rescan of a re-greyed cell,
+  which the cycle does for every other cell; the card covers every mutation). B, rescanning the
+  dirty runs below the progress, stays the post-W6 item (its measured value below).
+- Fork 3, the accounting: element words count in a slice's bytes (8 each, as V8 counts a chunk),
+  the clock is read every 4,096 such words, precleaning's small-round measure stays in cell
+  bytes, and the whole block counts in the schedule's marked bytes at its first chunk (the
+  cycle's live total).
+- Under force (found by 436275e7's checks, below): F2, a preclean's pass begun at a forced
+  slice's end leaves the cards of chunked blocks' owners set, for a pass begun out of work or the
+  final pause to take; and a block's chunks there are 16 words or its eighth (8 chunks at most).
+- mark_object asks the chunk window only for a block that keeps a record (Splay's +0.70% on the
+  stop-the-world path, below), on a path of its own.
+
+01accd72 (p2-w6-s6-chunks, on main 867ac484):
+1. A cycle's drain (its slices and the final pause's drain) traces an element block of more than
+   4,096 words 4,096 at a time (CHUNK_WORDS): the owner's trace reports its other edges and the
+   chunk its block is at (GcSink::element_range, MarkSink::chunk_range); the drain records where
+   the next chunk starts (Marker::chunked) and queues the owner again. A copy of the owner queued
+   before shares the progress; one popped after the last chunk traces the owner's other edges and
+   none of the words (CHUNK_DONE). The block's remembered record is committed after the last
+   chunk: mark_object checks first whether the block keeps a record (Words::keeps_record), and
+   only such an object takes mark_recorded_object (#[inline(never)]: the trace, then the commit
+   unless the trace left words for a later chunk); every other object's mark is a tail call to
+   its trace, without the frame the commit's check had made it keep.
+2. A take of cards by an out-of-work preclean or the final pause forgets the progress of every
+   owner it queues (Marker::restart_chunks). An ordinary cycle's precleans run only out of work,
+   while no block is between its chunks (the owner's queued copy keeps the worklist from running
+   out), so its restarts meet only blocks traced to their end; the final pause's meets blocks
+   between chunks when a request, the margin or an explicit collection ends a cycle early.
+3. Under force a chunk is 16 words (FORCED_CHUNK_WORDS), or a larger block's eighth
+   (FORCED_MAX_CHUNKS = 8, as V8 queues an array at most 8 times at once, kMaxQueuedWorklistItems,
+   src/heap/marking-visitor-inl.h:622), so that verification's cycles chunk most arrays in a few
+   traces, and a pass begun at a forced slice's end (Cycle::forced_pass) leaves the cards of
+   chunked blocks' owners set and drops their queued copies (Marker::keep_chunked_cards).
+4. The element words a drain's traces report count in a slice's bytes, and the clock is read
+   every 4,096 of them besides every 128 cells; the bytes a drain returns (a preclean round's
+   measure, the log's `traced`) stay the cells'.
+5. Stop-the-world markings (minor, major) and blocks of 4,096 words or fewer trace as before; the
+   progress map is looked up only for a large block, on a cold path.
+6. Tests (gc_cycle_tests): a_block_marked_in_chunks_keeps_what_is_stored_behind_its_chunks_in_
+   every_tier (an On cycle with 4-cell slices, a test-only budget: objects stored behind a
+   20,000-word block's chunks by an element write, a splice and an unshift are marked by the
+   slices once an out-of-work preclean restarts the block; a last store that no slice follows
+   survives the final pause through its take); a_forced_slices_preclean_leaves_a_chunked_blocks_
+   card_for_the_final_pause_in_every_tier; a_forced_cycle_finishes_while_the_program_writes_a_
+   chunked_block. Each piece removed in turn makes them fail:
+   - the out-of-work preclean's restart: the slice-end barrier check ("traced cell (object) with
+     a clean card holds an edge to unmarked cell");
+   - the final pause's restart: its verifier ("marked cell (object) references unmarked"), in the
+     new tests and in a_cycle_keeps_what_the_program_reaches... and a_weak_maps_entries_..., whose
+     arrays force chunks at 16 words;
+   - F2's kept cards: "the forced passes keep the card", and "the cycle's final pause ran on its
+     own" (the livelock below).
+7. DIAGNOSTICS.md describes the chunks, the budget and force's kept cards.
+
+How force met chunked blocks: 436275e7 (16-word chunks under force, before F2) took 11,610 s for
+its forced lib suite against e50f5725's 960 s (million_element_array_operations_succeed alone
+timed out at 900 s under force; long_expression_chains_run took 804 s). Force's slices end with
+the next 16 pages of a preclean's pass, which met blocks between their chunks, and a block
+written at every safepoint was restarted at every pass: with 16-word chunks and 4-cell slices
+its chunks never ended, the worklist never ran out, and the cycle marked until its margin forced
+the final pause. Before chunking the block's re-trace was one cell, and the next drain ran out of
+work. With F2 alone (307846a6) the cycles ended, but a block of a million words still took 65,536
+traces, each one of a forced slice's 4 cells: million_element_array_operations_succeed ran past
+8 minutes under force. With 8 chunks at most it takes 95 s (50 s with the cycle off), and the
+forced suite 1,056 s (2ba32733; e50f5725's 960 s, 5504ace9's 1,158 s).
+
+Measurements (fat LTO, TRUST_JS_GC_LOG=1, TRUST_JS_GC_INCREMENTAL=1, CPU 5 under the timing hold,
+10 runs each interleaved, 141 slices a run; runs/sa6-*):
+
+| engine | largest slice but the start's, median (max) ms | next two, typical | slices > 1.05 ms | p99 ms |
+| --- | --- | --- | --- | --- |
+| step 5 (e50f5725) | 2.00 (2.50) | 1.34, 1.00 | 20 | 1.32 |
+| 128 KiB chunks (436275e7) | 1.10 (1.14) | 0.86, 0.68 | 10 | 0.86 |
+| 32 KiB chunks (436275e7 with CHUNK_WORDS = 4096) | 1.02 (1.04) | 1.00, 0.75 | 0 | 1.00 |
+| 32 KiB chunks (b566871b, the amended commit, 12:57) | 1.02 (1.06) | | | |
+| 01accd72 (00:18, another agent's load 13-20) | 1.02 (1.04) | | | |
+| 3d6d4f60, the final tree (same window) | 1.03 (1.05) | | | |
+
+(In the 00:18 window step 5's engine measured 2.62 (2.82) ms; the final pause stayed 1.03 ms
+median, as before chunking.)
+
+With 128 KiB every run kept one slice near 1.10 ms: the one that reached the cap in the array's
+chunks overran it by a chunk's trace (16,384 words, about 0.1 ms at sustained allocation's rate);
+32 KiB leaves the overrun the 128-cell clock's (TypeScript's slices reach 1.01 ms the same way).
+
+B's value (the dirty-runs item after W6), measured with a diagnostic build of b566871b timing the
+final drain's chunk traces: in each of 10 runs sustained allocation's final pause (1.03-1.34 ms)
+spent 0.79 ms of its 0.79-0.80 ms drain on 41 chunk traces of the retained array (167,462
+words). The cycle starts while the program still builds the array (its pushes pass 8 MiB): it
+grows from 107,619 to 167,929 words during the cycle, each push setting its card. A printing
+diagnostic build (at 128 KiB) shows its trace in the slices (7 chunk traces, to its length then),
+two restarts by out-of-work precleans (10 and 11 chunk traces), and the final pause's take
+restarting it once more (11 in the final drain). Rescanning only the dirty runs below the traced
+length and the words past it would trace the 440 words pushed since the last preclean: about
+0.8 ms of the final pause, and the two full rescans in the slices. V8 never rescans here: its
+barrier greys the pushed values.
+
+Counts (fat LTO, CPUs 10-13, setarch -R, TRUST_JS_GC_PACING=0, median of 3) against e50f5725
+(main's engine; incremental marking off by default, so the stop-the-world path):
+- 436275e7: Splay +0.70%, EarleyBoyer +0.17%, TypeScript +0.13%, the rest within +-0.04%; no-GC
+  counts flat (EarleyBoyer +0.001%, TypeScript -0.001%, Vue -0.04%, Djot -0.007%): the marker's
+  own cost, mark_object's chunk-window check before every object's commit, Splay's nodes included.
+- 2ba32733 (the check made only for blocks with a record): Splay +0.28%, EarleyBoyer +0.07%,
+  TypeScript +0.05%; Splay's no-GC counts flat (599,369,206 -> 599,368,067): mark_object_cell
+  still kept the sink live across the trace for the commit's check, a second saved register and
+  two more instructions for every object marked.
+- 01accd72 (the recorded path of its own): an object without a recorded block now marks through
+  a tail call to its trace, with no frame. Its chain's counts (counts-01accd72.txt):
+
+| workload | e50f5725 | 01accd72 |
+| --- | ---: | ---: |
+| Vue | 1,434,907,166 | -0.02% |
+| React | 316,373,351 | -0.00% |
+| Djot | 619,331,042 | -0.04% |
+| chai | 74,948,167,351 | -0.02% |
+| Richards | 134,799,309 | +0.01% |
+| DeltaBlue | 259,208,621 | -0.02% |
+| Crypto | 726,118,911 | +0.00% |
+| RayTrace | 993,766,531 | -0.00% |
+| EarleyBoyer | 3,193,259,565 | -0.27% |
+| RegExp | 2,673,949,315 | -0.00% |
+| Splay | 1,408,466,680 | -1.30% |
+| NavierStokes | 451,448,836 | +0.00% |
+| PdfJS | 7,699,750,900 | -0.02% |
+| Mandreel | 62,920,074,803 | +0.00% |
+| Gameboy | 20,797,155,743 | -0.00% |
+| CodeLoad | 480,382,440 | -0.00% |
+| Box2D | 4,420,663,282 | -0.02% |
+| zlib | 137,938,845,397 | +0.00% |
+| TypeScript | 58,634,717,574 | -0.10% |
+
+  No-GC counts (TRUST_JS_GC_NURSERY_BYTES=0, TRUST_JS_GC_MIN_HEAP_BYTES=4000000000): EarleyBoyer
+  -0.001%, TypeScript +0.025%; chai x3 -0.002%.
+
+Checks:
+- 436275e7 (its chain, but for the forced suite's time): lib default 2,831 ok; lib force 2,831
+  ok in 11,610 s; clippy x3 clean; fmt clean; Test262's step subset (2,603 tests) under force,
+  verification and stress 100 (every 2nd major) 2,603/2,603 in both tiers, and at small budgets
+  without stress 2,603/2,603 in both; zombie clippy x3 clean, lib 2,611 ok; TypeScript with the
+  cycle on 8/8.
+- b566871b: cycle tests ok (default, force), fmt, clippy x3 clean; zombie clippy x3 clean, lib
+  2,611 ok.
+- 2ba32733: lib default 2,833 ok (434 s); lib force 2,833 ok (1,056 s); clippy x3, fmt clean;
+  the step subset's four Test262 runs 2,603/2,603 each; zombie clippy x3 clean, lib 2,613 ok;
+  TypeScript with the cycle on 8/8.
+- 01accd72 (every build in a target dir of its own): cycle tests 11 ok by default and under force
+  (17 s each); million_element_array_operations_succeed, long_expression_chains_run and
+  live_object_limit_is_configurable_and_enforced 456 s under force (123 s by default); the three
+  mutation proofs as above; lib default 2,833 ok (373 s); lib force 2,833 ok (947 s); clippy x3,
+  fmt clean; the step subset's four Test262 runs 2,603/2,603 each (73, 127, 30, 134 s); zombie
+  clippy x3 clean, lib 2,613 ok; TypeScript with the cycle on 8/8.
+- Round 2's b465cedf chain ran its lib suites on 2ba32733's binary (a shared target dir whose
+  artifacts were newer than the cherry-picked export's files): every check now builds in a dir of
+  its own.
+
+### W6 step 4's line of fixes: the margin and the external bytes (record, 2026-11-05)
+
+A step 4 bug, cycles on only, found by the default-on lib suite (step 6):
+external_memory_tests::replaced_maps_are_collected_as_their_tables_grow panicked at the debug
+check every safepoint makes (value.rs:3493): "the poll words' heap bit disagrees with poll_due
+(true)". Step 4's margin test, Heap::cycle_overshot (the heap's bytes, with the external bytes
+still charged, past the byte budget by the cycle's margin), read the external bytes charged at
+that moment from bytes_due, while Control::charge_external, which raises them, published nothing
+during a cycle: the external budget waits for the final pause's sweep (step 4). A Map whose
+tables grow by megabytes per few cells turned poll_due true with the heap bit clear; a release
+could turn it false under a set bit. In release builds the final pause the margin asked for
+waited until the next slice (64 KiB of cells later), however far the external bytes went past.
+Force hid it: there collection_due is true while a cycle runs.
+
+What V8 does: its overshoot test counts external memory in the global size it compares
+(GlobalSizeOfObjects = old generation + embedder + external memory, src/heap/heap.cc:5324-5327;
+AllocationLimitOvershotByLargeMargin, :5355-5385), and re-checks it as external memory grows:
+every 128 KB of growth (kExternalAllocationLimitForInterrupt, src/heap/heap-controller.h:217),
+UpdateExternalMemory finalizes a marking that overshot by a large margin at the charge
+(heap.cc:6967-7020).
+
+c2b046a7 (p2-w6-s6-margin, on the chunk commit 01accd72), approved as proposed: each refresh
+during a cycle keeps the margin as two limits, the allocated bytes past which it is passed with
+the external bytes charged then (Heap::cycle_overshoot_bytes, which bytes_due, so poll_due, and
+the allocation check read) and the external bytes past which it is passed with the bytes allocated
+then (the external ledger's cycle_limit); a charge past the latter sets the external `due` flag,
+sticky until the sweep, and publishes it, as the external budget's does. poll_due then changes
+only at a refresh, through allocation's slow path, or through a published flag, so neither a
+charge nor a release can leave the bit and poll_due apart; due_work's finalize test stays exact
+(the bytes allocated and charged now), so the safepoint after the crossing runs the final pause.
+
+Tests: external_charges_past_the_margin_make_a_cycles_final_pause_due and
+an_external_release_during_a_cycle_keeps_the_heap_bit_and_poll_due_agreeing (gc_core: a charge
+within the margin, one past it, due_work's final pause; a refresh past it, then the release), and
+a_maps_tables_grown_past_a_cycles_margin_bring_its_final_pause (gc_cycle_tests: a 300,000-entry
+Map grown during an On cycle with a 2 MB margin; the final pause runs within the loop). With the
+fix undone (bytes_due reading the bytes charged now, no publish at the charge) all three fail:
+"the charge past the margin published its due", "a release leaves the heap bit and poll_due
+agreeing", and the engine test the default-on suite's way, at value.rs:3493. With the fix,
+external_memory_tests, gc_cycle_tests, gc_pacing_tests and gc_core's tests (132) pass with the
+cycle off, on and forced, replaced_maps_are_collected_as_their_tables_grow among them with the
+cycle on: it needed no pin.
+
+Checks on c2b046a7 (a target dir of its own): those 132 tests ok with the cycle off, on and
+forced; the fix undone, the three new tests fail as above; fmt and clippy x3 clean. The final
+tree 3d6d4f60's chain and stage-end runs include it.
+
+### W6 step 6, part 2: incremental marking on by default (record, 2026-11-05)
+
+3d6d4f60 (p2-w6-s6-default-on, on the margin fix c2b046a7 and the chunks 01accd72):
+TRUST_JS_GC_INCREMENTAL is on by default: the major collections the heap asks for on its own are
+marked in cycles (V8's soft-limit start, slices of at most a millisecond, the final pause), and
+TRUST_JS_GC_INCREMENTAL=0 (or `off`) marks every major collection in one pause; `force` stays
+verification's mode. A wasm32 build keeps it off: a slice's time needs a clock, which
+wasm32-unknown-unknown lacks (std::time::Instant::now panics there; a cycle's start reads it),
+as it lacks pacing (gc_pacing_enabled is not compiled there). A heap starts Off (gc_core's own
+fixtures); the engine's heaps take the variable's mode in configure_heap. DIAGNOSTICS.md
+describes the switch.
+
+The default-mode lib suite (the cycle now on) on the first default-on tree found one failure:
+external_memory_tests::replaced_maps_are_collected_as_their_tables_grow panicked at the poll
+words' debug check, a step 4 bug of the cycle's margin (step 4's line of fixes, c2b046a7). With
+it fixed the test passes with the cycle on and needed no pin. gc_scan_spike::
+spike_scan_cost_is_linear_and_small failed once in that loaded suite and passed 3 of 3 alone: its
+wall-clock bound joins the known load flakes (with a_thread_local_is_not_a_root and
+payload_cell_tests::a_long_string_held_only_by_a_property_lives_and_dies_with_it).
+
+Counts (fat LTO, CPUs 10-13, setarch -R, TRUST_JS_GC_PACING=0, median of 3) against e50f5725, the
+cycle now on at TRUST_JS_GC_PACING=0's fixed budgets (counts-3d6d4f60.txt):
+
+| workload | e50f5725 | 3d6d4f60 |
+| --- | ---: | ---: |
+| Vue | 1,434,899,289 | -0.05% |
+| React | 316,372,898 | -0.00% |
+| Djot | 619,343,786 | -0.05% |
+| chai | 74,936,478,797 | -0.03% |
+| Richards | 134,802,052 | +0.00% |
+| DeltaBlue | 259,204,925 | -0.02% |
+| Crypto | 726,114,865 | +0.00% |
+| RayTrace | 993,764,602 | -0.00% |
+| EarleyBoyer | 3,193,254,084 | -1.36% |
+| RegExp | 2,673,925,945 | -0.00% |
+| Splay | 1,408,466,690 | -16.28% |
+| NavierStokes | 451,446,588 | +0.00% |
+| PdfJS | 7,699,711,876 | +0.37% |
+| Mandreel | 62,920,332,857 | +0.00% |
+| Gameboy | 20,797,176,499 | +0.12% |
+| CodeLoad | 480,385,111 | +0.00% |
+| Box2D | 4,420,620,442 | -0.01% |
+| zlib | 137,938,841,350 | -0.00% |
+| TypeScript | 58,634,108,695 | -1.47% |
+
+The cycles change which collections run and when, so these are the schedule's effect on the
+work, not a marker's cost (the chunk commit's own counts are against the same base). The no-GC
+setting moves too (EarleyBoyer -0.20%, TypeScript -0.06%): its one collection, at the task
+boundary after the driver, starts a cycle that the process's exit leaves unfinished instead of
+marking 1.37 million objects in one pause (TRUST_JS_GC_LOG on EarleyBoyer: cause=TaskBoundary,
+`phase=start` with the cycle on, a major collection reclaiming 1,366,769 objects with it off).
+
+Checks on 3d6d4f60 (every build in a target dir of its own): lib default, the cycle on, 2,836 ok
+(399 s); lib force 2,836 ok (956 s); clippy x3, fmt clean; the step subset's four Test262 runs
+2,603/2,603 each (75, 127, 29, 132 s); zombie clippy x3 clean, lib 2,616 ok; TypeScript with the
+cycle on 8/8; and the stage end's runs (impl-stage-end-summary.txt).
+
+### W6 stage end: the verification runs (for the exit record)
+
+The final tree: 3d6d4f60 = main 867ac484 + 01accd72 (large blocks in chunks) + c2b046a7 (the
+margin sees the external bytes as charged; step 4's line of fixes) + 3d6d4f60 (incremental
+marking on by default). All on Crystal (ARM64) unless marked, 2026-11-05/06, every build in a
+target dir of its own.
+
+| run | tree | result |
+| --- | --- | --- |
+| the gate, STAGES="rel fixtures difftest t262", BASE compact's gate-c50a0b4e | 3d6d4f60 | fixtures vue/react/djot masked output same as base; difftest 138 agree, 12 skipped (budget), seeds 7..157; Test262 at --tier=jit threshold 8 53,575/53,575, identical to the base's report |
+| lib suite, default (the cycle on) | 3d6d4f60 | 2,836 ok, 9 ignored (399 s) |
+| lib suite, TRUST_JS_GC_INCREMENTAL=force | 3d6d4f60 | 2,836 ok (956 s; e50f5725's 960 s) |
+| lib suite in full under TRUST_JS_GC_STRESS=1000 with force (the unit tests verify always), known-slow.txt's one test left out | 3d6d4f60 | 2,834 ok, 1 failed: memory::tests::temporal_records_account_zone_and_calendar_strings_once, which fails under GC stress at main's engine before W6 too (3,628 s) |
+| the stress list: 664 GC tests (names-2b.txt and the chunk test), one a process, N=1000, 6 jobs, force, verification | 3d6d4f60 | 663/664, the same temporal_records test |
+| Test262 step subset (13 dirs, 2,603) under stress 100 (every 2nd major), force + verification | 3d6d4f60 | 2,603/2,603 by default (75 s) and at --tier=jit threshold 0 (127 s) |
+| Test262 step subset, force + verification, no stress, small budgets (nursery 0, min heap 1, pacing off) | 3d6d4f60 | 2,603/2,603 in both tiers (29 s, 132 s) |
+| Test262 wide subset (7 dirs, 15,209) under stress 100 m2, force + verification | 3d6d4f60 | 15,207/15,209 in both tiers (671 s, 923 s): the 2 harness timeouts of the earlier wide runs, which pass without the time limit |
+| Test262 wide subset, force + verification, small budgets | 3d6d4f60 | 15,209/15,209 in both tiers (669 s, 1,065 s) |
+| clippy -D warnings x3 (embed, embed+architecture-diagnostics, no-default-features), fmt | 3d6d4f60 | clean |
+| zombie (x86-64): clippy x3, lib suite | 3d6d4f60 | clippy clean; lib 2,616 ok |
+| TypeScript with the cycle on, 8 runs (the step 3 crash repro) | 3d6d4f60 | 8/8 |
+| counts against e50f5725 (fat LTO, pacing off) | 3d6d4f60 | the cycle's schedule: Splay -16.28%, TypeScript -1.47%, EarleyBoyer -1.36%, PdfJS +0.37%, Gameboy +0.12%, the rest within +-0.05% |
+| sustained allocation's slices with the cycle on (fat LTO, CPU 5, 10 runs) | 3d6d4f60 | largest but the start's 1.03 (1.05) ms median (max); final pause 1.03 ms; step 5's engine 2.62 (2.82) ms in the same window |
+
+Each commit's own checks: 01accd72 (its chain: lib default 2,833 ok, lib force 2,833 ok in
+947 s, clippy x3, fmt, the subset's four Test262 runs, zombie, TypeScript 8/8, and the three
+mutation proofs) and c2b046a7 (132 GC tests in the three modes, the fix-undone proof, fmt,
+clippy x3). Round 2's b465cedf, the same but for mark_object's recorded path, passed the same
+stress runs (the full lib under stress: 2,834 ok and the temporal_records test; the stress list
+663/664; the wide subset 15,207/15,209 and 15,209/15,209 in both tiers).
