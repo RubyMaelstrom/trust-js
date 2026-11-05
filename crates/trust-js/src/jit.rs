@@ -245,6 +245,14 @@ mod compact_equality_tests;
 
 #[cfg(all(
     test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_baked_read_tests.rs"]
+mod baked_read_tests;
+
+#[cfg(all(
+    test,
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -7380,8 +7388,9 @@ fn emit_prop_load_inline(
     // After bytecode warmup, ordinary OO sites overwhelmingly have one stable depth/shape/slot.
     // Bake that state into a compact probe instead of embedding the full four-way/deep/exotic
     // state machine at every site. Every fact that made the cached slot authoritative is guarded
-    // live; a miss goes to the checked helper, which observes mutations and arbitrary alternate
-    // shapes exactly like the generic JIT miss path.
+    // live; a miss probes the live ways through the shared read stub, then goes to the checked
+    // helper, which observes mutations and arbitrary alternate shapes exactly like the generic
+    // JIT miss path.
     // An accessor state (`IC_ACCESSOR` at depth 3 or less) bakes as its depth's data state does:
     // its probe ends at the descriptor-checking landing, which diverts the live accessor to the
     // validated accessor landing.
@@ -7565,8 +7574,18 @@ fn emit_prop_load_inline(
         }
     };
     let generic_entry = a.new_label();
+    // A single baked state's miss probes the site's live ways through step 1's shared read stub
+    // (its way loop, landings and commit; see `emit_prop_read_site`) before the helper: a shape
+    // the cache took after this code was compiled (a second receiver class, a receiver whose
+    // shape moved on) hits there. JSC's Baseline runs its site's data IC handler, which covers
+    // every case the cache holds, and takes the slow path only after all of them
+    // (JITPropertyAccess.cpp, emit_op_get_by_id, generateDataICFastPath); SpiderMonkey's
+    // Baseline stubs end each failure path in the jump to the chain's next stub
+    // (BaselineCacheIRCompiler.cpp, EmitStubGuardFailure). A key-checked way (an Array holder)
+    // stays the helper's: the stub here carries no key word.
+    let live_ways = compact.is_some() && cache_ptr != 0 && a.stubs_ok() && shared_stubs_enabled();
     for (index, st) in baked.iter().enumerate() {
-        let miss = if index + 1 < baked.len() {
+        let miss = if index + 1 < baked.len() || live_ways {
             a.new_label()
         } else if compact.is_some() {
             slow
@@ -7577,6 +7596,38 @@ fn emit_prop_load_inline(
         if miss != slow && miss != generic_entry {
             a.bind(miss);
         }
+    }
+    if live_ways {
+        // x9 holds the receiver's word and x10 its payload (or a primitive's wrapper
+        // prototype), as the stub expects of a compact site's call.
+        let flags = PropReadFlags {
+            probe: PropProbeFlags {
+                arr_ok,
+                wrap_ok,
+                method,
+                kc: false,
+            },
+            push: method || !matches!(recv, PropRecv::Stack),
+            proto: name == "prototype",
+        };
+        a.mov_imm64(8, cache_ptr as u64);
+        let stub = a.shared_stub(SharedStub::PropRead(flags).key());
+        a.bl_label(stub);
+        #[cfg(not(test))]
+        a.cbnz(9, false, done);
+        #[cfg(test)]
+        {
+            let absent = a.new_label();
+            a.cbz(9, false, slow);
+            a.cmp_imm_w(9, 2);
+            a.b_cond(C_EQ, absent);
+            regions::emit_property_event(a, 0);
+            a.b(done);
+            a.bind(absent);
+            regions::emit_property_event(a, 1);
+            a.b(done);
+        }
+        a.b(slow);
     }
     a.bind(generic_entry);
     // 2-5. probe every cache way (sites allocate PROP_IC_WAYS consecutive cells; the fill path
