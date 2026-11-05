@@ -873,8 +873,8 @@ pub(crate) enum IncrementalMode {
     /// starts a cycle; a requested one (explicit, the live-object ceiling, buffer pressure)
     /// still marks in one pause, and finishes a running cycle.
     On,
-    /// As `On`, with slices of a few cells each at every safepoint while a cycle marks
-    /// (verification's mode, design 11).
+    /// As `On`, with slices of a few cells each at every safepoint while a cycle marks, each
+    /// ending with a preclean (verification's mode, design 11).
     Force,
 }
 
@@ -1166,6 +1166,15 @@ impl PageMeta {
             },
         };
         if self.young {
+            // The walk stops at `next_unused`, which must cover every cell allocated on the page:
+            // a cursor brings it up to date only when flushed (`Heap::flush_cursor`), as every
+            // caller does first (W6 step 3's fix).
+            debug_assert!(
+                self.allocated[self.next_unused.div_ceil(64)..]
+                    .iter()
+                    .all(|&word| word == 0),
+                "a young page's cards taken with cells allocated past its next_unused"
+            );
             for word in 0..self.next_unused.div_ceil(64) {
                 let mut old = old_word(word);
                 while old != 0 {
@@ -1212,6 +1221,48 @@ impl PageMeta {
             }
         }
         self.clear_cards();
+    }
+
+    /// [`PageMeta::take_card_cells`] for a cycle (`FULL`), checked (heap verification): the
+    /// cells the take queued are the page's marked cells whose cards are set, found by a walk
+    /// over all its marks, so that a card cleared without its cell is caught at the take that
+    /// cleared it (W6 step 3's fix: a young page's walk stopped short of such a cell).
+    #[cold]
+    #[inline(never)]
+    fn take_card_cells_checked(&mut self, cells: &mut Vec<TraceWork>) {
+        // SAFETY: as in `take_card_cells`.
+        let summary =
+            self.carded && unsafe { ((self.base + CARD_SUMMARY) as *const u8).read() } != 0;
+        let mut expected = Vec::new();
+        if summary {
+            for word in 0..self.marks.len() {
+                let mut marked = self.marks[word] & !self.zombies[word];
+                while marked != 0 {
+                    let index = word * 64 + marked.trailing_zeros() as usize;
+                    marked &= marked - 1;
+                    if self.card_set(index) {
+                        expected.push(self.cell_ptr(index));
+                    }
+                }
+            }
+        }
+        let queued = cells.len();
+        self.take_card_cells::<true>(cells);
+        // Both walks queue the cells in address order.
+        let taken = &cells[queued..];
+        if !taken.iter().map(|work| work.cell).eq(expected.iter().copied()) {
+            let missing = expected
+                .iter()
+                .find(|&&cell| !taken.iter().any(|work| work.cell == cell));
+            panic!(
+                "marking cycle: a page's cards were taken without its marked cell {missing:#x?}, \
+                 whose card was set ({} cells taken of {}; young {}, next_unused {})",
+                taken.len(),
+                expected.len(),
+                self.young,
+                self.next_unused
+            );
+        }
     }
 
     fn has_room(&self) -> bool {
@@ -3852,6 +3903,11 @@ impl Heap {
             && cycle.last_precleaned < PRECLEAN_DONE_CELLS
             && cycle.round_traced < PRECLEAN_DONE_BYTES;
         cycle.complete = out_of_work && (small_round || self.preclean(cycle) == 0);
+        // Verification's mode (design 11) precleans at every slice's end too, so that precleaning
+        // runs as often as slicing, in every state of the marking and of the allocation cursors.
+        if !out_of_work && self.incremental == IncrementalMode::Force {
+            self.preclean(cycle);
+        }
         cycle.slices += 1;
         cycle.allocated_at_slice = self.allocated_bytes;
         // The check walks the heap: after every slice of an ordinary cycle, but under `Force`,
@@ -3894,11 +3950,17 @@ impl Heap {
     }
 
     /// W6: queue for full traces every marked cell of the heap that starts in a set card, and
-    /// clear the cards (a cycle's preclean and its final pause): the number queued.
+    /// clear the cards (a cycle's preclean and its final pause): the number queued. With heap
+    /// verification, each page's take is checked against a walk over its every cell.
     fn take_cycle_card_cells(&mut self, m: &mut Marker) -> usize {
         let queued = m.worklist.len();
+        let verifies = self.verifies();
         for page in self.pages.iter_mut().flatten() {
-            page.take_card_cells::<true>(&mut m.worklist);
+            if verifies {
+                page.take_card_cells_checked(&mut m.worklist);
+            } else {
+                page.take_card_cells::<true>(&mut m.worklist);
+            }
         }
         m.worklist.len() - queued
     }
@@ -10536,6 +10598,31 @@ mod tests {
         fx.heap.cycle = Some(cycle);
         slice_to_completion(&mut fx);
         assert_eq!(fx.heap.cell_age(young as u64), Some(CellAge::Old), "marked by the rescan");
+    }
+
+    /// The fix's verification (debug builds): a cycle's take of the cards with cells allocated
+    /// past a young page's `next_unused` (its cursor not flushed) fails at that take, which would
+    /// have cleared their cards without walking them, whether or not they were marked or written.
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(
+        expected = "a young page's cards taken with cells allocated past its next_unused"
+    )]
+    fn taking_the_cards_past_an_unflushed_cursor_panics() {
+        let (mut fx, _chain) = cycle_fixture(5_000);
+        assert!(start_cycle(&mut fx));
+        slice_to_completion(&mut fx);
+        // Past the bitmap word the cursor left at its last refill, as in the test above.
+        for _ in 0..131 {
+            let filler = fx.heap.alloc(fx.carded, 16);
+            set_word(filler, 0, 0);
+        }
+        let written = fx.heap.alloc(fx.carded, 16);
+        set_word(written, 0, 0);
+        // SAFETY: a live carded cell of this heap.
+        unsafe { card_mark(written) };
+        let mut cycle = fx.heap.cycle.take().unwrap();
+        fx.heap.take_cycle_card_cells(&mut cycle.marker);
     }
 
     /// W6 step 3: precleaning repeats while a round finds at least `PRECLEAN_DONE_CELLS` marked
