@@ -14991,3 +14991,213 @@ Against the exit (proposed in W6's design, the owner's numbers):
   at small budgets, no stress) follow the chunking and the default-on commit.
 - Peak RSS reported: above.
 Then the cycle on by default (TRUST_JS_GC_INCREMENTAL=0 to turn it off).
+
+### Compact baseline templates, step 2: equality and `!` (record, 2026-11-05)
+
+7d0147a4 on p2-compact (from c50a0b4e, step 1 as landed; an agent's), landed on main as cbfa5881
+over f3b8700c: the code is 7d0147a4's plus W6's steps 4 and 5 (2af3bfee..e50f5725), line for line,
+and that combined tree's ARM64 lib suite passed (2,832 passed, 9 ignored) before main moved; the
+design's item 3 ("Compact baseline
+templates (census, survey and design, 2026-11-04)"). Scope as step 1: first-stage code outside
+loops. A chunk now records whether it is a second-stage recompilation (Chunk::second_stage, set
+when compile_with_inlines splices call sites), and jit::compact_templates is
+use_shared_stub's rule (shared stubs on, the site not in a loop body) for a first-stage chunk
+assembled by the chunk compiler. Second-stage code, loop bodies and a TRUST_JS_JIT_INLINE_STUBS
+build keep today's templates, emit_eq_inline and emit_not_inline, byte for byte.
+
+The compiler (all tiers):
+1. A literal operand of an equality compiles on the right: `"{" === x` is `x; "{"; StrictEq`.
+   A literal (a Number, signed or not, a String, a Boolean, null, undefined, or `!` or `void`
+   of one; bytecode::literal_truthiness) has no effect, and IsStrictlyEqual and IsLooselyEqual
+   are symmetric, the latter coercing only the operand that is not a literal, at most once,
+   whichever side it is on; so evaluating the other operand first is unobservable.
+   SpiderMonkey's emitter does the same for its constant operand (BytecodeEmitter.cpp,
+   tryEmitConstantEq: the expression, then StrictConstantEq with the constant as an
+   immediate), and V8's bytecode generator matches a literal undefined, null or Boolean on
+   either side and visits only the other (BytecodeGenerator::VisitCompareOperation,
+   IsLiteralCompareUndefined/Null, IsLiteralStrictCompareBoolean). Minified code puts the
+   literal first (Djot's `"{"===t.subject.charAt(e)`: 158 of its 330 compiled equality sites).
+2. `!` of a literal is its Boolean (`!0`, `!1`: minified true and false; 112 of Djot's 141
+   compiled `!` sites), as V8's parser folds `!` of a literal (parser.cc,
+   Parser::BuildUnaryExpression) and JSC's of a Number (ASTBuilder.h, createLogicalNot).
+3. `void` of a literal is `undefined` (Op::Undef), as V8's and JSC's generators evaluate
+   nothing for the literal (BytecodeGenerator::VisitVoid, VoidNode::emitBytecode).
+4. `!` of an equality is the negated equality (`!(a == b)` is `a != b`, asm.js's way of writing
+   it: Mandreel's and zlib's `if(!(r2 ==0))`): the same operands, the same comparison, its
+   Boolean negated, as JSC compiles `!` in a condition by inverting the condition's branches
+   (NodesCodegen.cpp, LogicalNotNode::emitBytecodeInConditionContext) and V8 by inverting the
+   test's control flow (BytecodeGenerator::VisitNot). A numeric chain then takes the comparison
+   and its branch in registers, as it took `a != b`.
+
+The generated code (ARM64), at compact sites:
+- An equality whose right operand is a constant (the operation before it pushes one, and the
+  equality is no jump target; jit::EqConstant, emit_eq_constant) never pushes it, as JSC's
+  Baseline specializes strict equality on a constant operand (JITOpcodes.cpp:642-765,
+  compileOpStrictEq) and SpiderMonkey's Baseline its StrictConstantEq
+  (BaselineCodeGen.cpp:3171-3232, emitConstantStrictEq):
+  - strict, undefined, null or a Boolean: one compare of the operand's word;
+  - a Number: FMOV and FCMP (FCMP #0.0 for zero), which every non-Number word fails as
+    unordered: unequal for a strict comparison, the stub for a loose one;
+  - loose, undefined or null: `tag | 2` against null's tag, and an Object's ic_plain byte
+    (unequal unless the Object may be [[IsHTMLDDA]]), as V8's Sparkplug tests a loose nil
+    comparison in line (baseline-compiler.cc, VisitTestUndetectable);
+  - a String whose text the heap already has a canonical string for (the interned one-unit
+    string of an ASCII unit, which charAt and indexing return, or the marked string of its
+    existing key: an index's, a static name's, a heap atom's; Chunk::jit_const_canonical_str_word,
+    which makes no atom): an identity test against that string, then the stub. A constant with
+    no canonical string takes the stub with the constant pushed.
+  The result drives a fused JumpIfFalse (also through a forwarding Jump), or replaces the
+  operand by the Boolean. A region's equality whose right operand is the constant the operation
+  before it pushed takes the same tests with both operands on the stack.
+- Every other equality tests two Numbers in line (LDP, two FMOVs, FCMP: unordered for every
+  other word, the canonical NaN included), as JSC's Baseline keeps its generic strict
+  equality's int32 test in line (compileOpStrictEq), and otherwise is w1 = the site's pc and a
+  call to the shared Equal stub for its (strict, negate) pair and result form, entered past its
+  own load and Number test (emit_equal_site, emit_equal_call, emit_equal_stub; a strict call is
+  two instructions, a loose one three, with the throw test, and a fused branch tests w9 with
+  one CBZ). The stub does emit_eq_inline's work once per process: two Numbers by FCMP (for a
+  constant's fallback, which enters at the top); one word one value
+  but the canonical NaN; two Strings by their keys when both carry one (one key a text, Proxy
+  step 2's lstr::KEY_MARK), else by length, else by content when both are flat buffers of one
+  width and at most 64 bytes (the in-line template sent every equal-length pair to the helper);
+  a strict pair of different tags, Objects, Symbols or Booleans unequal; a loose pair of
+  undefined and null equal, and either unequal to anything else but a possible [[IsHTMLDDA]]
+  Object. It calls the checked helper itself for the rest (H_STRICT_EQ, or H_EXEC for a loose
+  comparison, then the explicit poll when the site's baseline call would end in one), with the
+  pc the site passed, and returns the helper's flag for a loose one.
+- `!` is w1 = the pc and a call to the shared Not stub (emit_not_site, emit_not_stub), which
+  pushes the negated ToBoolean or, for a fused JumpIfFalse, returns it in w9 (one CBZ); a
+  BigInt takes the generic helper from the stub, whose ToBoolean neither throws nor allocates.
+  V8's Sparkplug calls ToBooleanForBaselineJump (VisitToBooleanLogicalNot), SpiderMonkey's
+  Baseline its ToBool IC (emit_Not).
+- A LoadLocal pair compared for a branch takes the two reads' templates and the compact
+  equality, in place of the in-line pair template (emit_local_eq_branch) and of a numeric
+  chain's speculation, as the pair template pre-empted the chain before. Every other numeric
+  chain keeps its equality branches.
+
+The first version (8a9224ca) differed in three ways that the counts showed wrong: it kept
+numeric chains from taking equality branches at compact sites (Mandreel +0.68%, zlib +0.55%:
+asm.js's `r13 == 0` in large loop bodies, which use_shared_stub treats as straight-line code,
+lost its chain), it called the stub for two Numbers (React +0.54%: the reducer callbacks'
+`todo.id === action.payload.id`, first-stage code that never gets a second stage, paid the call
+and the veneer, four instructions of its own), and its constant form asked the assembler
+whether each outcome label was referenced (a search of every patch so far: quadratic in a large
+function's compile, 146 of the 31K instruction samples of a Mandreel run).
+
+MEASURED
+
+Code bytes (TRUST_JS_JIT_MAP=1 over each fixture's run, opbytes.py; bytes-s2/; the bytes do not
+depend on how the engine itself was compiled):
+
+| fixture | machine code, main | step 1 | step 2 | step 2's change | templates, step 1 | step 2 | change |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Djot | 3,988,192 | 3,286,140 | 3,079,008 | -6.3% (-22.8% from main) | 1,358,140 | 1,298,084 | -4.4% |
+| React | 306,388 | 292,844 | 284,008 | -3.0% (-7.3%) | 72,176 | 67,288 | -6.8% |
+| Vue | 628,764 | 565,496 | 527,256 | -6.8% (-16.1%) | 300,584 | 281,880 | -6.2% |
+
+Of Djot's -207,132 bytes, the compiler's changes alone make -69,652 (a build of step 1 with step
+2's bytecode.rs, bytes-s2/vb2-*: the `!` and `void` folds and the forms they leave), the
+templates the rest. Djot's first-stage equalities outside loops are now 139 constant forms
+(6,056 bytes, 44 a site) and 30 generic sites (1,440 bytes, 48 a site, the in-line Number test
+included), where step 1 had 276 in-line templates of 558 bytes each among first- and
+second-stage code; its 57 equality sites in loop bodies keep the in-line template. `!`: 141 sites
+and 42,300 bytes to 24 and 4,000 (the compiler's folds remove 117; a compact site is 8 bytes, 12
+with its fused branch, and a loop body's keeps the 300-byte template).
+By site (span-diff.py, step 2's bytecode without and with its templates): every span that changed
+is an equality's or `!`'s (-104,128 bytes in Djot), the constant before a fused constant form
+(whose code now sits in the constant's span), a JumpIfFalse fused into an equality or `!`, a
+region's head holding equalities, or a chunk's tail (the new stubs' veneers, +344 bytes over
+Djot's chunks).
+
+Where Djot's machine code is now (first and later compiles by the map's chunk order; spans with
+region code by their marks): first-stage 1,611,520 bytes (region spans 998,288, templates
+613,232), second-stage 1,452,116 (767,264 and 684,852). Second-stage code keeps today's templates
+by the design's scope, and the optional region copies are the largest share of first-stage code.
+
+Instructions (fat LTO, step 1's 9c67bd05 build (c50a0b4e's code) against 7d0147a4, CPUs 10-13,
+setarch -R, pacing off, median of 3; counts/s2r-7d0147a4-subset.txt and -rest.txt):
+
+| workload | step 1 | step 2 | change |
+| --- | --- | --- | --- |
+| Vue | 1,434,295,428 | 1,430,555,314 | -0.26% |
+| React | 316,373,596 | 314,102,294 | -0.72% |
+| Djot | 619,279,604 | 615,081,252 | -0.68% |
+| chai | 74,907,406,297 | 74,005,235,922 | -1.20% |
+| Richards | 134,802,338 | 133,559,259 | -0.92% |
+| DeltaBlue | 259,204,866 | 259,153,874 | -0.02% |
+| Crypto | 726,123,288 | 725,455,821 | -0.09% |
+| RayTrace | 993,796,984 | 994,522,954 | +0.07% |
+| EarleyBoyer | 3,193,226,152 | 3,188,777,276 | -0.14% |
+| RegExp | 2,673,924,190 | 2,675,077,743 | +0.04% |
+| Splay | 1,408,497,433 | 1,408,542,007 | +0.00% |
+| NavierStokes | 451,456,612 | 451,484,050 | +0.01% |
+| PdfJS | 7,699,909,405 | 7,235,147,817 | -6.04% |
+| Mandreel | 62,921,677,349 | 62,612,779,447 | -0.49% |
+| Gameboy | 20,797,232,774 | 20,792,126,444 | -0.02% |
+| CodeLoad | 480,388,301 | 479,727,370 | -0.14% |
+| Box2D | 4,420,531,368 | 4,360,815,851 | -1.35% |
+| zlib | 137,938,845,096 | 138,084,334,591 | +0.11% |
+| TypeScript | 58,640,852,746 | 58,634,602,604 | -0.01% |
+
+PdfJS -6.04% and chai -1.20%: equal-length String contents, which the in-line template sent to
+the helper (a loose comparison's to the generic one), compare in the stub; in PdfJS's instruction
+samples (prof/pdfjs-*.data, 1M a sample) jit_exec, Interp::binary, Interp::strict_equals and
+__memcmpeq fall from 524 to 201. Box2D -1.35%, Richards -0.92% and Djot -0.68% are compact sites
+running fewer instructions than the in-line template (a constant's test, the stub's tag order)
+and compiles emitting less. zlib's +0.11% and RayTrace's +0.07% are the largest increases.
+
+x86-64 (zombie, fat LTO, c50a0b4e against 7d0147a4, CPU 2; zombie/counts-s2r.txt), where only the
+compiler's changes apply (x86-64 emits none of these templates): Vue -0.55%, Djot -0.83%,
+EarleyBoyer -0.24%, Mandreel -0.04%, CodeLoad -0.04%; every other workload within +-0.01%.
+
+TRust's pages (TRust 78435d0's trust-browser-replay on step 1 and on 7d0147a4, from exports;
+trust/page-metrics.sh, both engines in one session; CPU 5; trust/metrics-s2r.tsv): a page's
+machine code and compile time, (s5 - s1) / 4 of the cumulative metrics.
+
+| page, variant | machine code a page, step 1 | step 2 | change | compile a page, step 1 | step 2 | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| event-loop, t8 | 1,116,552 | 1,036,151 | -7.2% | 13.9 ms | 13.6 ms | -2.1% |
+| Vue TodoMVC, t8 | 8,793,958 | 8,179,716 | -7.0% | 102.7 ms | 101.0 ms | -1.7% |
+| event-loop, t1a2 | 4,148,094 | 3,907,523 | -5.8% | 41.5 ms | 40.6 ms | -2.1% |
+| Vue TodoMVC, t1a2 | 11,507,906 | 10,798,173 | -6.2% | 131.4 ms | 128.4 ms | -2.3% |
+
+From main (step 1's session): the event-loop page's machine code -15.9% at t8, Vue TodoMVC's
+-16.3%.
+
+CHECKS
+
+- Lib suite (embed): ARM64 2,832 tests, 2,823 passed, 9 ignored (the two new tests included);
+  x86-64 (zombie) 2,603 passed, 9 ignored. The React push callback's string-accumulation tests
+  count its operations: 14 now, `return !0` being one constant. clippy -D warnings in the three
+  configurations clean on both machines; cargo fmt clean.
+- The release gate (gate-v2.sh, STAGES="rel fixtures difftest t262", BASE w2g's rest gate) on
+  7d0147a4, clean tree: the fixtures' masked outputs the base's, difftest 138 agree and 12 skipped
+  (budget) over seeds 7..157, Test262 at threshold 8 53,575/53,575 passed, the report identical to
+  the base's (gate-7d0147a4.txt).
+- jit::compact_equality_tests: every operand kind (both zeroes, NaN, flat, view and two-byte
+  Strings, Strings that carry their key, charAt's one-unit Strings, Objects, Symbols, BigInts)
+  against every constant kind on either side, every operator, as a value, a branch and a negated
+  branch, two operands, and `!`, at the tree-walker, the bytecode VM and first-stage native code,
+  with a loose comparison's throwing and counted valueOf calls and the operands' evaluation order;
+  and the bytecode of a literal operand on the left, `!` and `void` of literals and `!` of an
+  equality. A build that inverted the stub's Number result, a constant's word compare and the Not
+  stub's falsy result failed the first version's matrix on 96 lines. tests/eq-semantics.js (830 results) agrees across
+  the tiers at thresholds 8 and 1.
+
+NOTES (for the steps after this one)
+
+- Every call of a process-wide stub goes through the chunk's veneer, MOVZ/MOVK/MOVK and BR: four
+  instructions on top of the BL and the RET, which first-stage code that never reaches a second
+  stage pays at every compact site (React's +0.54% in the first version was mostly that). V8
+  calls its builtins directly once it has remapped them into its code range (short builtin
+  calls), and JSC and SpiderMonkey allocate all JIT code in one executable region within a
+  branch's reach; here each chunk is mapped on its own. An LDR-literal veneer would halve the cost
+  at the same 16 bytes; direct calls need the chunk's address before its branches are resolved.
+- The optional region copies are 62% of Djot's first-stage machine code (998,288 of 1,611,520
+  bytes), the baseline templates under them still emitted. The exemplars' baselines emit no
+  optimized copies; their optimizing tiers come later, with feedback.
+- After an equality, `&&` and `||` (JumpIfFalsePeek, JumpIfTruePeek: 190 and 193 bytes a site,
+  167 and 89 sites in Djot) test the pushed Boolean through a ToBoolean template of their own.
+- The exemplars intern every string literal; here a constant pool's String is its own cell and
+  atoms are strong roots, so the constant forms test identity only against a canonical string
+  the heap already has, and make no atom.
