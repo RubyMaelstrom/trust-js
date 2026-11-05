@@ -176,7 +176,11 @@ comment/example in the same change.
   discovered as their collections are marked), at the first safepoint after every 64 KiB
   allocated: the bytes V8's schedule asks (those due by now if the cycle's marking took 500 ms,
   or by the time it has allocated half its room before the margin, whichever is more, and at
-  least 64 KiB), for at most a millisecond. A host's event loop advances a cycle while it waits
+  least 64 KiB), for at most a millisecond. The words of the element blocks its traces read
+  count in a slice's bytes (8 each), and its clock is read every 128 cells and every 4,096 such
+  words; a block of more words than that (32 KiB) is traced 4,096 of them at a time, its owner
+  queued again for the next chunk (as V8 does), and a take of the owner's card (see below) traces
+  it again from its first word. A host's event loop advances a cycle while it waits
   (`Engine::advance_incremental_marking`), as the runtime does. Each time nothing is left to
   trace, a slice precleans: the marked cells written since their trace (their cards set) are
   traced again while the program runs, until a preclean finds fewer than 7,000 such cells and
@@ -187,21 +191,23 @@ comment/example in the same change.
   a margin over the byte budget (V8's), and every requested collection (explicit, the exit's,
   the live-object limit, ArrayBuffer pressure, an explicit minor one) finish it at once; an
   explicit major collection that finishes one is followed by another, which frees what the cycle
-  marked before it died. `TRUST_JS_GC_INCREMENTAL=force` makes the slices a few cells each, at
-  every safepoint while a cycle marks, each ending with the next 16 pages of a preclean's pass,
-  and with `TRUST_JS_GC_VERIFY` each take of the cards (a preclean's, the final pause's) is
-  checked against a walk over the marks of their pages, the slices' ends (the first 64 of a
-  cycle, then every 64th) and the final pause's start check that no traced cell with a clean
-  card holds an edge to an unmarked one, and the final pause's end that every side-table entry
-  of a marked owner names marked cells. `TRUST_JS_GC_LOG=1` prints a `[gc-slice]` line for the
-  cycle's start (`phase=start`) and each slice: the slices so far (`n`), the bytes of the cells
-  it traced (`traced`), the bytes it marked and the cycle's so far (`cycle_marked`), the cells
-  left in the worklist, the bytes allocated since the cycle started (`cycle_alloc`), the cycle's
-  precleans so far and the cells the last one found (`precleans`, `precleaned`), whether the
-  marking is complete but for the final pause, and its `pause` in microseconds, the start's with
-  the heap's phases in it (`begin`: clearing the marks and cards, `roots`, `side`: the side
-  tables' edges; the rest is the engine's); the final pause's `[gc-heap]` line is a major
-  collection's.
+  marked before it died. `TRUST_JS_GC_INCREMENTAL=force` makes the slices a few cells each, at every
+  safepoint while a cycle marks, and a block's chunks 16 words, or a larger block's eighth, each
+  slice ending with the next 16 pages of a preclean's pass (which leaves the cards of chunked
+  blocks' owners set, for a pass begun out of work or the final pause to take, as an ordinary
+  cycle's precleans, out of work, never meet a block between its chunks), and with
+  `TRUST_JS_GC_VERIFY` each take of the cards (a preclean's, the final pause's) is checked against a
+  walk over the marks of their pages, the slices' ends (the first 64 of a cycle, then every 64th)
+  and the final pause's start check that no traced cell with a clean card holds an edge to an
+  unmarked one, and the final pause's end that every side-table entry of a marked owner names marked
+  cells. `TRUST_JS_GC_LOG=1` prints a `[gc-slice]` line for the cycle's start (`phase=start`) and
+  each slice: the slices so far (`n`), the bytes of the cells it traced (`traced`), the bytes it
+  marked and the cycle's so far (`cycle_marked`), the cells left in the worklist, the bytes
+  allocated since the cycle started (`cycle_alloc`), the cycle's precleans so far and the cells the
+  last one found (`precleans`, `precleaned`), whether the marking is complete but for the final
+  pause, and its `pause` in microseconds, the start's with the heap's phases in it (`begin`:
+  clearing the marks and cards, `roots`, `side`: the side tables' edges; the rest is the engine's);
+  the final pause's `[gc-heap]` line is a major collection's.
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
   collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and

@@ -4143,10 +4143,29 @@ fn mark_object<S: crate::gc_trace::TraceSink + ?Sized>(
     purpose: crate::gc_core::TracePurpose,
     sink: &mut S,
 ) {
+    // An element block without a remembered record has nothing to commit: the trace is all
+    // (and the sink is not needed after it, W6 step 6).
+    if object.props.elems.0.keeps_record() {
+        mark_recorded_object(object, purpose, sink);
+    } else {
+        object.trace_gc_fields(sink, Some(purpose));
+    }
+}
+
+/// [`mark_object`] for an object whose element block keeps a remembered record.
+#[inline(never)]
+fn mark_recorded_object<S: crate::gc_trace::TraceSink + ?Sized>(
+    object: &Object,
+    purpose: crate::gc_core::TracePurpose,
+    sink: &mut S,
+) {
     object.trace_gc_fields(sink, Some(purpose));
     // Commit only after ALL element and non-element edges were reported. A panic leaves the
-    // words' obligations intact; writes between phases are recorded afterwards.
-    object.props.elems.0.finish_mark_trace();
+    // words' obligations intact; writes between phases are recorded afterwards. A cycle's
+    // marker that traced a chunk of a large block commits after the last (W6 step 6).
+    if !sink.element_trace_partial() {
+        object.props.elems.0.finish_mark_trace();
+    }
 }
 
 /// Strong edges of an environment record.

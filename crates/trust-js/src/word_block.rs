@@ -751,10 +751,11 @@ impl Words {
     /// Report the edges of the words, not the block. A Numbers block has none. A marker's
     /// remembered trace reports only the dirty runs below the traced length and the words past
     /// it; every other trace (a marker's full one, or `None`'s, the verifiers' and the
-    /// heap walks') reports every word. The kind bits are proofs that this trace (NUMBERS: no
-    /// edge) and generated code trust, kept by every write in Rust and in generated code, so
-    /// debug builds check at every trace that each one set holds of the words (W2c step 5): a
-    /// NUMBERS bit left set over a reference would hide it from the collector.
+    /// heap walks') reports every word, but a marking cycle's marker reports a large block's a
+    /// chunk at a time (W6 step 6, `GcSink::element_range`). The kind bits are proofs that this
+    /// trace (NUMBERS: no edge) and generated code trust, kept by every write in Rust and in
+    /// generated code, so debug builds check at every trace that each one set holds of the words
+    /// (W2c step 5): a NUMBERS bit left set over a reference would hide it from the collector.
     pub(crate) fn trace_values<S: crate::gc_trace::GcSink + ?Sized>(
         &self,
         purpose: Option<crate::gc_core::TracePurpose>,
@@ -771,6 +772,17 @@ impl Words {
             return;
         }
         let words = self.as_slice();
+        let traced = match (purpose, self.record()) {
+            // SAFETY: a record's first word is its traced length.
+            (Some(crate::gc_core::TracePurpose::Remembered), Some(record)) => unsafe {
+                record.read()
+            },
+            _ => TRACED_NONE,
+        };
+        let len = words.len();
+        // A full trace reports the words the sink asks: all of them, or on a marking cycle's
+        // marker the chunk of a large block its owner is at (W6 step 6).
+        let full = (traced == TRACED_NONE).then(|| sink.element_range(len));
         let mut report = |range: std::ops::Range<usize>| {
             #[cfg(test)]
             if let Some(purpose) = purpose {
@@ -788,16 +800,8 @@ impl Words {
                 }
             }
         };
-        let traced = match (purpose, self.record()) {
-            // SAFETY: a record's first word is its traced length.
-            (Some(crate::gc_core::TracePurpose::Remembered), Some(record)) => unsafe {
-                record.read()
-            },
-            _ => TRACED_NONE,
-        };
-        let len = words.len();
-        if traced == TRACED_NONE {
-            report(0..len);
+        if let Some(range) = full {
+            report(range);
             return;
         }
         let prefix = (traced as usize).min(len);
@@ -834,6 +838,13 @@ impl Words {
             }
             None => report(prefix..len),
         }
+    }
+
+    /// Whether the block keeps a remembered record, which a marker's full trace commits
+    /// ([`Words::finish_mark_trace`]).
+    #[inline]
+    pub(crate) fn keeps_record(&self) -> bool {
+        self.record().is_some()
     }
 
     /// After a marker reported every edge of the owner: the used words are traced and clean.

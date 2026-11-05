@@ -498,3 +498,210 @@ fn a_realm_groups_template_map_gains_an_entry_during_a_cycle_in_every_tier() {
         assert_eq!(result, "true", "{tier:?}");
     }
 }
+
+/// The running cycle's slices so far.
+fn cycle_slices(engine: &Engine) -> u32 {
+    let core = engine.interp.gc_heap.core.borrow();
+    core.cycle_progress().expect("a running cycle").slices
+}
+
+/// Where the next chunk of the large element block of the owner at `address` starts, while the
+/// running cycle traces it in chunks.
+#[inline(never)]
+fn chunk_progress(engine: &Engine, address: crate::gc_test::HiddenAddress) -> Option<usize> {
+    let core = engine.interp.gc_heap.core.borrow();
+    core.chunk_progress(address.get())
+}
+
+/// Run slices of the running cycle until the large element block of the owner at `address` is
+/// between its chunks, past its first 128 words.
+fn slice_until_between_chunks(
+    engine: &mut Engine,
+    address: crate::gc_test::HiddenAddress,
+    what: &str,
+) {
+    let mut slices = 0;
+    while !chunk_progress(engine, address).is_some_and(|next| next >= 128) {
+        assert!(
+            engine.interp.gc_slice(),
+            "{what}: the cycle runs until the block is between its chunks"
+        );
+        slices += 1;
+        assert!(slices < 1_000_000, "{what}: never between chunks");
+    }
+}
+
+/// A weak handle to the object that element `index` of the array the global `name` holds names,
+/// made in a frame of its own.
+fn weak_element(engine: &mut Engine, name: &str, index: u32) -> Box<crate::value::WeakGc> {
+    crate::gc_test::in_frame(|| {
+        let env = engine.interp.global_env;
+        let array = engine
+            .interp
+            .get_var(name, &env)
+            .unwrap_or_else(|_| panic!("fixture global {name}"));
+        let array = array.as_obj().expect("an array");
+        let element = array
+            .borrow()
+            .props
+            .data_element(index)
+            .expect("an element");
+        Box::new(crate::value::Gc::downgrade(
+            &element.as_obj().expect("an object"),
+        ))
+    })
+}
+
+/// An engine whose heap marks its major collections in `On` cycles, each slice a few cells (a
+/// test-only budget in place of a slice's bytes and time), in `tier`: a large element block's
+/// chunks span slices as in an ordinary cycle, whose precleans run only once its worklist is
+/// out of work.
+fn chunking_engine(tier: Tier) -> Engine {
+    let engine = cycling_engine(tier);
+    let mut core = engine.interp.gc_heap.core.borrow_mut();
+    core.set_incremental(IncrementalMode::On);
+    core.set_test_slice_cells(Some(4));
+    drop(core);
+    engine
+}
+
+/// W6 step 6: a cycle traces a large element block a chunk at a time across its slices, its
+/// owner queued again for each chunk, and a take of the owner's card traces the block again from
+/// its first chunk: a write may have landed behind the chunks traced. Objects stored only behind
+/// them by an element write, a splice and an unshift are marked by the slices once the block's
+/// chunks end and a preclean, out of work, takes the card (only the block holds them, and slices
+/// mark no roots). A last store behind the chunks, which no slice follows, survives the final
+/// pause through its take of the card, and verification (the unit tests verify every
+/// collection) checks the final marking's closure.
+#[test]
+fn a_block_marked_in_chunks_keeps_what_is_stored_behind_its_chunks_in_every_tier() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = chunking_engine(tier);
+        eval(
+            &mut engine,
+            "var big = []; for (let i = 0; i < 20000; i++) big.push({ i }); true",
+        );
+        let big_weak = weak_global(&mut engine, "big");
+        let big = hidden_address(&big_weak);
+        assert!(engine.interp.gc_start_cycle(), "{tier:?}");
+        slice_until_between_chunks(&mut engine, big, "the first chunks");
+        eval(
+            &mut engine,
+            r#"
+            big[0] = { kept: 'first' };
+            big.splice(1, 0, { kept: 'spliced' });
+            big.unshift({ kept: 'unshifted' });
+            true
+            "#,
+        );
+        let stored: Vec<_> = (0..3)
+            .map(|index| weak_element(&mut engine, "big", index))
+            .collect();
+        for (index, weak) in stored.iter().enumerate() {
+            let what = format!("{tier:?}: the object stored at {index}");
+            slice_until_marked(&mut engine, hidden_address(weak), &what);
+        }
+        slice_until_between_chunks(&mut engine, big, "the chunks after the restart");
+        // No slice between the last store and the final pause.
+        let slices = cycle_slices(&engine);
+        eval(&mut engine, "big[3] = { kept: 'last' }; true");
+        assert_eq!(cycle_slices(&engine), slices, "{tier:?}: no slice ran");
+        assert!(
+            chunk_progress(&engine, big).is_some_and(|next| next > 3),
+            "{tier:?}: the store is behind the chunks traced"
+        );
+        engine.interp.gc_collect_minor();
+        assert!(!cycle_running(&engine), "{tier:?}");
+        let result = eval(
+            &mut engine,
+            r#"
+            let kept = '';
+            for (let i = 0; i < 4; i++) kept += big[i].kept + ' ';
+            kept + big.length + ' ' + big[4].i + ' ' + big[20001].i
+            "#,
+        );
+        assert_eq!(
+            result, "unshifted first spliced last 20002 2 19999",
+            "{tier:?}"
+        );
+    }
+}
+
+/// Whether the card of the cell at `address` is set.
+#[inline(never)]
+fn card_set(engine: &Engine, address: crate::gc_test::HiddenAddress) -> bool {
+    let core = engine.interp.gc_heap.core.borrow();
+    core.card_set_at(address.get())
+}
+
+/// W6 step 6: under force (verification's mode), a preclean's pass begun at a forced slice's end
+/// leaves the card of a chunked block's owner set, as an `On` cycle's precleans, which run only
+/// out of work, never meet a block between its chunks: the block keeps its chunks, and objects
+/// stored behind them survive the final pause through its take of the card, which traces the
+/// block again from its first chunk.
+#[test]
+fn a_forced_slices_preclean_leaves_a_chunked_blocks_card_for_the_final_pause_in_every_tier() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = cycling_engine(tier);
+        eval(
+            &mut engine,
+            "var big = []; for (let i = 0; i < 2000; i++) big.push({ i }); true",
+        );
+        let big_weak = weak_global(&mut engine, "big");
+        let big = hidden_address(&big_weak);
+        assert!(engine.interp.gc_start_cycle(), "{tier:?}");
+        slice_until_between_chunks(&mut engine, big, "the first chunks");
+        eval(
+            &mut engine,
+            "big[0] = { kept: 'first' }; big[1] = { kept: 'second' }; true",
+        );
+        for _ in 0..64 {
+            assert!(
+                card_set(&engine, big),
+                "{tier:?}: the forced passes keep the card"
+            );
+            assert!(engine.interp.gc_slice(), "{tier:?}");
+        }
+        assert!(
+            cycle_running(&engine),
+            "{tier:?}: the block's children keep the cycle marking"
+        );
+        engine.interp.gc_collect_minor();
+        assert!(!cycle_running(&engine), "{tier:?}");
+        let result = eval(
+            &mut engine,
+            "big[0].kept + ' ' + big[1].kept + ' ' + big.length + ' ' + big[1999].i",
+        );
+        assert_eq!(result, "first second 2000 1999", "{tier:?}");
+    }
+}
+
+/// W6 step 6: under force, a cycle finishes on its own while the program writes a chunked block
+/// at every safepoint: a forced slice's pass restarting the block at every pass would keep its
+/// chunks from ever ending, and the cycle marking until its margin forced the final pause.
+#[test]
+fn a_forced_cycle_finishes_while_the_program_writes_a_chunked_block() {
+    let mut engine = cycling_engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "var hot = []; for (let i = 0; i < 2000; i++) hot.push({ i }); true",
+    );
+    assert!(engine.interp.gc_start_cycle());
+    let collections = engine.interp.gc_heap.core.borrow().collections();
+    eval(
+        &mut engine,
+        "for (let i = 0; i < 100000; i++) hot[i % 2] = hot[(i + 1) % 2]; true",
+    );
+    assert!(
+        !cycle_running(&engine),
+        "the cycle's final pause ran on its own"
+    );
+    assert_eq!(
+        engine.interp.gc_heap.core.borrow().collections(),
+        collections + 1
+    );
+    assert_eq!(
+        eval(&mut engine, "hot.length + ' ' + hot[1999].i"),
+        "2000 1999"
+    );
+}

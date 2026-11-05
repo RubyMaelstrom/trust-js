@@ -99,6 +99,32 @@ const PRECLEAN_CLOCK_PAGES: usize = 16;
 const FORCED_PRECLEAN_PAGES: usize = 16;
 /// W6: the cells a slice traces under [`IncrementalMode::Force`].
 const FORCED_SLICE_CELLS: usize = 4;
+/// W6 step 6: a marking cycle traces an element block of more words than this a chunk of this
+/// many at a time, across its slices, as V8 marks an array larger than its largest regular
+/// object, 128 KB, in chunks of that size (MarkingProgressTracker::kChunkSize, src/heap/marking-
+/// progress-tracker.h:17-32; src/heap/marking-visitor-inl.h:618-687): one array's block alone
+/// can take milliseconds, past a slice's cap. A slice also reads its clock once its traces have
+/// reported this many element words since its last reading (V8 reads it every 128 objects alone,
+/// src/heap/mark-compact.cc:2296, 2364-2367; SpiderMonkey every 1000 values of an elements
+/// range, js/src/gc/Marking.cpp:1851-1858, js/public/SliceBudget.h:66). A quarter of V8's
+/// chunk, 32 KiB: a trace cannot stop inside a chunk, and with V8's 128 KB the slice that
+/// reached its cap in sustained allocation's array took 1.10 ms, where 32 KiB keeps it at
+/// 1.01-1.04 ms, as the clock's reading every 128 cells keeps the others.
+const CHUNK_WORDS: usize = (32 << 10) / 8;
+/// W6 step 6: the words of a chunk under [`IncrementalMode::Force`]: few, so that verification's
+/// cycles chunk most programs' arrays, as its slices are a few cells: the blocks that keep a
+/// remembered record (of more than `REMEMBER_MIN` words), and smaller ones, which generated
+/// code writes in line.
+const FORCED_CHUNK_WORDS: usize = 16;
+/// W6 step 6: the most chunks a block takes under [`IncrementalMode::Force`]: a larger block's
+/// chunk is its eighth, so that a cycle traces a block of a million words in 8 traces rather than
+/// 65,536, each one of a forced slice's 4 cells (V8 likewise queues an array at most 8 times at
+/// once, kMaxQueuedWorklistItems, src/heap/marking-visitor-inl.h:622).
+const FORCED_MAX_CHUNKS: usize = 8;
+/// W6 step 6: [`Marker::chunked`]'s mark of a block its owner's chunks traced to its end since
+/// the owner's card was last taken: a later pop of the owner is a copy queued before, which
+/// traces the owner's other edges but none of the block's words.
+const CHUNK_DONE: usize = usize::MAX;
 /// W6: the floor of V8's overshoot margin, past which a cycle's allocation forces its final
 /// pause (src/heap/heap-controller.h:160-176).
 const MIN_CYCLE_MARGIN: usize = 32 << 20;
@@ -841,6 +867,46 @@ impl MarkSink<'_> {
     #[inline(always)]
     pub(crate) fn mark(&mut self, word: u64) {
         self.heap.mark_word(word, self.m);
+    }
+
+    /// W6 step 6: the words of an element block of `len` words this trace reports
+    /// (`GcSink::element_range`): all of them, but in a cycle's drain, of a block of more than a
+    /// chunk's words, the chunk its owner is at ([`Marker::chunked`]).
+    #[inline(always)]
+    pub(crate) fn chunk_range(&mut self, len: usize) -> std::ops::Range<usize> {
+        let chunk = &mut self.m.chunk;
+        if chunk.cell == 0 {
+            return 0..len;
+        }
+        if len <= chunk.limit || chunk.taken.is_some() {
+            chunk.words += len;
+            return 0..len;
+        }
+        self.next_chunk(len)
+    }
+
+    /// [`MarkSink::chunk_range`] for a large block: the chunk its owner is at, from its first
+    /// word if the owner has none (its first trace in the cycle, or the first since a take of
+    /// its card), and none of its words after its last (a copy of the owner queued before).
+    #[cold]
+    #[inline(never)]
+    fn next_chunk(&mut self, len: usize) -> std::ops::Range<usize> {
+        let m = &mut *self.m;
+        let start = m
+            .chunked
+            .get(&m.chunk.cell)
+            .map_or(0, |&next| next.min(len));
+        let size = m.chunk.limit.max(len.div_ceil(m.chunk.max_chunks));
+        let end = start.saturating_add(size).min(len);
+        m.chunk.words += end - start;
+        m.chunk.taken = Some(if end < len { end } else { CHUNK_DONE });
+        start..end
+    }
+
+    /// W6 step 6: whether this trace left words of a large block for its owner's next one.
+    #[inline(always)]
+    pub(crate) fn chunk_partial(&self) -> bool {
+        self.m.chunk.taken.is_some_and(|next| next != CHUNK_DONE)
     }
 }
 
@@ -1590,6 +1656,71 @@ struct Marker {
     /// Waiting edges keyed by cell start >> 4 (cells are 16-aligned).
     waiting: FastMap<usize, Vec<u32>>,
     ready: Vec<u32>,
+    /// W6 step 6: the owners of the large element blocks a cycle traces a chunk at a time
+    /// ([`CHUNK_WORDS`]), each with the word its block's next chunk starts at, or [`CHUNK_DONE`]
+    /// after its last. Each chunk's trace queues its owner again for the next. A take of an
+    /// owner's card forgets its entry ([`Marker::restart_chunks`]): its next trace starts from
+    /// the block's first word, as a write since may have landed behind the chunks traced.
+    chunked: FastMap<usize, usize>,
+    /// W6 step 6: the chunks of the cycle's drain ([`MarkSink::chunk_range`]).
+    chunk: ChunkWindow,
+}
+
+impl Marker {
+    /// W6 step 6: a take of cards queued the cells of `self.worklist` from `queued` on for full
+    /// traces again: an owner of a large block among them traces it from its first chunk.
+    fn restart_chunks(&mut self, queued: usize) {
+        if self.chunked.is_empty() {
+            return;
+        }
+        for work in &self.worklist[queued..] {
+            self.chunked.remove(&work.cell);
+        }
+    }
+
+    /// W6 step 6: a pass begun at a forced slice's end ([`Cycle::forced_pass`]) took cards,
+    /// queuing the cells of `self.worklist` from `queued` on: the owners of chunked blocks among
+    /// them keep their cards instead, set again, and leave the worklist, for a pass begun out of
+    /// work or the final pause to take. `On`'s precleans run only out of work, while no block is
+    /// between its chunks (its owner's queued copy keeps the worklist from running out), and so
+    /// meet only blocks traced to their end; a forced pass would meet a block written at every
+    /// safepoint between its chunks at every pass, restarting it each time, and the cycle could
+    /// not finish.
+    fn keep_chunked_cards(&mut self, queued: usize) {
+        if self.chunked.is_empty() {
+            return;
+        }
+        let mut kept = queued;
+        for index in queued..self.worklist.len() {
+            let work = self.worklist[index];
+            if self.chunked.contains_key(&work.cell) {
+                // SAFETY: a take of cards queues the marked cells of carded pages, which a cycle
+                // frees none of.
+                unsafe { card_mark(work.cell as *const u8) };
+            } else {
+                self.worklist[kept] = work;
+                kept += 1;
+            }
+        }
+        self.worklist.truncate(kept);
+    }
+}
+
+/// W6 step 6: the element block chunks of a cycle's drain ([`Marker::chunk`]).
+#[derive(Default)]
+struct ChunkWindow {
+    /// The cell whose trace is in progress in a cycle's drain ([`Heap::drain_within`]); 0
+    /// outside one, whose traces report every block whole.
+    cell: usize,
+    /// The words of a chunk: [`CHUNK_WORDS`], or [`FORCED_CHUNK_WORDS`] under `Force`.
+    limit: usize,
+    /// The most chunks a block takes: [`FORCED_MAX_CHUNKS`] under `Force`, unbounded otherwise.
+    max_chunks: usize,
+    /// The trace in progress took a chunk of its owner's large block: where the next one starts,
+    /// or [`CHUNK_DONE`] after the last. Another large block in the same trace is reported whole.
+    taken: Option<usize>,
+    /// The element words the drain's traces reported: a part of its work.
+    words: usize,
 }
 
 /// W6: a major collection's marking in progress across safepoints, from its start
@@ -1619,6 +1750,9 @@ struct Cycle {
     last_precleaned: usize,
     round_traced: usize,
     preclean_page: Option<usize>,
+    /// W6 step 6: the pass in progress began at a forced slice's end ([`IncrementalMode::Force`]):
+    /// it leaves the cards of the owners of chunked blocks set ([`Marker::keep_chunked_cards`]).
+    forced_pass: bool,
     /// When the cycle started, for its schedule (step 4).
     started: std::time::Instant,
     /// The worklist ran out after the last preclean: the final pause is due.
@@ -1927,6 +2061,9 @@ pub(crate) struct Heap {
     min_cycle_heap_bytes: Option<usize>,
     #[cfg(test)]
     uncapped_slices: bool,
+    /// W6 step 6 (tests): the cells an `On` slice traces, instead of its bytes and time.
+    #[cfg(test)]
+    test_slice_cells: Option<usize>,
     #[cfg(test)]
     retention_tracing: bool,
     /// The last traced collection's mark sources, by cell start.
@@ -2004,6 +2141,8 @@ impl Heap {
             min_cycle_heap_bytes: None,
             #[cfg(test)]
             uncapped_slices: false,
+            #[cfg(test)]
+            test_slice_cells: None,
             #[cfg(test)]
             retention_tracing: false,
             #[cfg(test)]
@@ -2347,6 +2486,31 @@ impl Heap {
             last_precleaned: cycle.last_precleaned,
             complete: cycle.complete,
         })
+    }
+
+    /// W6 step 6, for tests: the cells an `On` slice traces (`None`: its bytes and time).
+    #[cfg(test)]
+    pub(crate) fn set_test_slice_cells(&mut self, cells: Option<usize>) {
+        self.test_slice_cells = cells;
+    }
+
+    /// W6 step 6, for tests: whether the card of the small cell at `cell` is set.
+    #[cfg(test)]
+    pub(crate) fn card_set_at(&self, cell: usize) -> bool {
+        match self.locate(cell as u64).map(|cell| cell.loc) {
+            Some(Loc::Small { page, index }) => self.pages[page as usize]
+                .as_ref()
+                .is_some_and(|page| page.card_set(index as usize)),
+            _ => false,
+        }
+    }
+
+    /// W6 step 6, for tests: the word the next chunk of the large element block of the owner at
+    /// `cell` starts at, while the running cycle traces the block in chunks.
+    #[cfg(test)]
+    pub(crate) fn chunk_progress(&self, cell: usize) -> Option<usize> {
+        let next = *self.cycle.as_ref()?.marker.chunked.get(&cell)?;
+        (next != CHUNK_DONE).then_some(next)
     }
 
     /// W6: V8's overshoot margin over the byte budget, past which a cycle's allocation forces
@@ -3982,6 +4146,7 @@ impl Heap {
             last_precleaned: 0,
             round_traced: 0,
             preclean_page: None,
+            forced_pass: false,
             started: std::time::Instant::now(),
             complete: false,
         }));
@@ -4033,6 +4198,11 @@ impl Heap {
     ) {
         let (budget, deadline) = match self.incremental {
             IncrementalMode::Force => (SliceBudget::Cells(FORCED_SLICE_CELLS), None),
+            #[cfg(test)]
+            IncrementalMode::On | IncrementalMode::Off if self.test_slice_cells.is_some() => (
+                SliceBudget::Cells(self.test_slice_cells.unwrap_or(FORCED_SLICE_CELLS)),
+                None,
+            ),
             IncrementalMode::On | IncrementalMode::Off => {
                 #[cfg(test)]
                 let cap = if self.uncapped_slices {
@@ -4071,7 +4241,7 @@ impl Heap {
             let first = match cycle.preclean_page {
                 Some(page) => page,
                 None => {
-                    Self::begin_preclean(cycle);
+                    Self::begin_preclean(cycle, true);
                     0
                 }
             };
@@ -4080,15 +4250,17 @@ impl Heap {
         cycle.slices += 1;
         cycle.allocated_at_slice = self.allocated_bytes;
         // The check walks the heap: after every slice of an ordinary cycle, but under `Force`,
-        // whose slices are a few cells at every safepoint, after its first 64 slices, then every
-        // 64th, as the worklist runs out and at the final pause. A store the barrier missed stays
-        // in the heap until the final pause's check, unless the program overwrote it.
-        let check = match self.incremental {
-            IncrementalMode::Force => {
-                cycle.slices <= 64 || cycle.slices.is_multiple_of(64) || cycle.complete
-            }
-            IncrementalMode::On | IncrementalMode::Off => true,
-        };
+        // whose slices are a few cells at every safepoint (as the tests' cell budgets', step 6),
+        // after its first 64 slices, then every 64th, as the worklist runs out and at the final
+        // pause. A store the barrier missed stays in the heap until the final pause's check,
+        // unless the program overwrote it.
+        #[cfg(test)]
+        let few_cells =
+            self.incremental == IncrementalMode::Force || self.test_slice_cells.is_some();
+        #[cfg(not(test))]
+        let few_cells = self.incremental == IncrementalMode::Force;
+        let check =
+            !few_cells || cycle.slices <= 64 || cycle.slices.is_multiple_of(64) || cycle.complete;
         if check && self.verifies() {
             self.check_cycle_barrier(&cycle.marker);
         }
@@ -4106,15 +4278,17 @@ impl Heap {
     /// whose drain `run_slice` counts, with a pass over the pages ([`Heap::preclean_pages`]).
     /// Whether the cycle's marking is complete.
     fn preclean(&mut self, cycle: &mut Cycle, deadline: Option<std::time::Instant>) -> bool {
-        Self::begin_preclean(cycle);
+        Self::begin_preclean(cycle, false);
         self.preclean_pages(cycle, 0, deadline, usize::MAX)
     }
 
-    /// W6 step 4: a preclean's pass begins: a round, whose drain `run_slice` counts.
-    fn begin_preclean(cycle: &mut Cycle) {
+    /// W6 step 4: a preclean's pass begins: a round, whose drain `run_slice` counts; `forced`, at
+    /// a forced slice's end (step 6, [`Cycle::forced_pass`]).
+    fn begin_preclean(cycle: &mut Cycle, forced: bool) {
         cycle.precleans += 1;
         cycle.last_precleaned = 0;
         cycle.round_traced = 0;
+        cycle.forced_pass = forced;
     }
 
     /// W6 step 4: the pass of the cycle's preclean over the pages from `first`, taking their
@@ -4155,6 +4329,11 @@ impl Heap {
                     page.take_card_cells::<true>(&mut m.worklist);
                 }
             }
+        }
+        if cycle.forced_pass {
+            m.keep_chunked_cards(queued);
+        } else {
+            m.restart_chunks(queued);
         }
         let found = m.worklist.len() - queued;
         cycle.precleaned += found;
@@ -4205,6 +4384,7 @@ impl Heap {
                 page.take_card_cells::<true>(&mut m.worklist);
             }
         }
+        m.restart_chunks(queued);
         m.worklist.len() - queued
     }
 
@@ -4287,6 +4467,18 @@ impl Heap {
         // objects a step visits, src/heap/mark-compact.cc:2300-2373): a cell whose edges are all
         // marked already still costs its trace.
         let mut traced_bytes = 0usize;
+        // The element words the traces report count in the slice's work, 8 bytes each, as V8
+        // counts an array's chunk (src/heap/marking-visitor-inl.h:673; src/heap/mark-compact.cc:
+        // 2348-2370), and the clock is read once a chunk's words were reported since its last
+        // reading (step 6). `traced_bytes` stays the cells' bytes: a preclean round's measure
+        // (`run_slice`) and the log's.
+        (m.chunk.limit, m.chunk.max_chunks) = if self.incremental == IncrementalMode::Force {
+            (FORCED_CHUNK_WORDS, FORCED_MAX_CHUNKS)
+        } else {
+            (CHUNK_WORDS, usize::MAX)
+        };
+        m.chunk.words = 0;
+        let mut clock_words = CHUNK_WORDS;
         let mut traced = 0usize;
         let mut fired = 0usize;
         let mut ahead = [TraceWork {
@@ -4315,6 +4507,7 @@ impl Heap {
                 } = ahead[head];
                 head = (head + 1) % MARK_PREFETCH;
                 queued -= 1;
+                m.chunk.cell = cell;
                 #[cfg(test)]
                 {
                     m.source = MarkSource::Cell(cell);
@@ -4329,13 +4522,29 @@ impl Heap {
                         self.mark_word(edge as u64, m)
                     }),
                 }
+                // The trace took a chunk of a large block: the owner goes back to the worklist for
+                // the next one, if any (V8's repost, src/heap/marking-visitor-inl.h:658-665).
+                if let Some(next) = m.chunk.taken.take() {
+                    m.chunked.insert(cell, next);
+                    if next != CHUNK_DONE {
+                        m.worklist.push(TraceWork {
+                            cell,
+                            desc,
+                            purpose,
+                        });
+                    }
+                }
                 traced += 1;
                 let spent = match budget {
                     SliceBudget::Bytes(bytes, deadline) => {
                         traced_bytes += self.cell_bytes(cell);
-                        traced_bytes >= bytes
-                            || (traced.is_multiple_of(SLICE_CLOCK_CELLS)
-                                && std::time::Instant::now() >= deadline)
+                        let words = m.chunk.words;
+                        traced_bytes + words * 8 >= bytes
+                            || ((traced.is_multiple_of(SLICE_CLOCK_CELLS) || words >= clock_words)
+                                && {
+                                    clock_words = words + CHUNK_WORDS;
+                                    std::time::Instant::now() >= deadline
+                                })
                     }
                     SliceBudget::Cells(cells) => {
                         traced_bytes += self.cell_bytes(cell);
@@ -4350,6 +4559,7 @@ impl Heap {
                     // The slice's client lives for this slice alone: the entries of the weak
                     // collections it marked wait in the marker from here.
                     self.add_discovered_edges(m, client);
+                    m.chunk.cell = 0;
                     return (m.worklist.is_empty() && m.ready.is_empty(), traced_bytes);
                 }
             }
@@ -4363,6 +4573,7 @@ impl Heap {
                         && std::time::Instant::now() >= deadline
                     {
                         self.add_discovered_edges(m, client);
+                        m.chunk.cell = 0;
                         return (false, traced_bytes);
                     }
                 }
@@ -4371,6 +4582,7 @@ impl Heap {
             // Out of work: the entries of the weak collections marked since (step 2b), whose
             // values may bring more.
             if !self.add_discovered_edges(m, client) {
+                m.chunk.cell = 0;
                 return (true, traced_bytes);
             }
         }

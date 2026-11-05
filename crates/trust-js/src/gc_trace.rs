@@ -37,6 +37,21 @@ pub(crate) trait GcSink {
             self.word(word);
         }
     }
+
+    /// W6 step 6: the words of an element block of `len` words this trace reports: all of them,
+    /// but on a marking cycle's marker, which traces a large block a chunk at a time across its
+    /// slices ([`crate::gc_core::MarkSink::chunk_range`]).
+    #[inline]
+    fn element_range(&mut self, len: usize) -> std::ops::Range<usize> {
+        0..len
+    }
+
+    /// W6 step 6: whether this trace left words of an element block for a later one
+    /// ([`GcSink::element_range`]): the block's remembered record waits for the last.
+    #[inline]
+    fn element_trace_partial(&self) -> bool {
+        false
+    }
 }
 
 /// A sink as a trait object, for the [`GcTrace`] impls a generic trace calls: a generic trace
@@ -92,6 +107,16 @@ impl GcSink for crate::gc_core::MarkSink<'_> {
         if let Some(word) = value.cell_word() {
             self.mark(word);
         }
+    }
+
+    #[inline(always)]
+    fn element_range(&mut self, len: usize) -> std::ops::Range<usize> {
+        self.chunk_range(len)
+    }
+
+    #[inline(always)]
+    fn element_trace_partial(&self) -> bool {
+        self.chunk_partial()
     }
 }
 
