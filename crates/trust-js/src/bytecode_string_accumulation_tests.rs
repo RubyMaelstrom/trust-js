@@ -278,7 +278,8 @@ fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
         plan.pc, 5,
         "same original operation sequence as React's push callback"
     );
-    assert_eq!(chunk.ops.len(), 15);
+    // `return !0` returns a Boolean constant (`bytecode::literal_truthiness`).
+    assert_eq!(chunk.ops.len(), 14);
     chunk.inline_attempted.set(true);
     chunk.inline_retry_at.set(0);
     assert!(function.runtime().code.set(Some(chunk.clone())).is_ok());

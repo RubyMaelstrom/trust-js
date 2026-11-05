@@ -3361,6 +3361,11 @@ pub struct Chunk {
     /// chunk has no exclusive single-Realm constraint (no targets, mixed or unrestricted
     /// targets). New invocations can avoid a body whose every inline guard must miss.
     inline_planning_genv: usize,
+    /// Whether this is a second-stage chunk ([`compile_with_inlines`]): its native code keeps
+    /// every in-line template, where a first-stage chunk's straight-line code takes the compact
+    /// forms (`jit::compact_templates`).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    second_stage: bool,
     /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
     pub(crate) jit_runs: std::cell::Cell<u32>,
     /// Test-only per-code evidence, recorded after the receiver word is pushed by native
@@ -3642,6 +3647,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             inline_sites: _,
             inline_targets: _,
             inline_planning_genv: _,
+            second_stage: _,
             jit_runs: _,
             #[cfg(test)]
                 test_this_commits: _,
@@ -9578,6 +9584,11 @@ fn finish_chunk(
     is_coroutine: bool,
     source: Option<&Function>,
 ) -> Option<Rc<Chunk>> {
+    // A recompilation with call sites to splice (`compile_with_inlines`).
+    let second_stage = c
+        .plan_stack
+        .first()
+        .is_some_and(|(plan, _)| !plan.is_empty());
     // Constructors in OO workloads overwhelmingly initialize a short, straight-line list of
     // fields. Count distinct names only until control flow can make the estimate speculative,
     // and decline large reservations: this is an allocation/memory optimization, not metadata
@@ -9892,6 +9903,7 @@ fn finish_chunk(
         call_pins: std::cell::RefCell::new(c.call_pins),
         inline_targets: c.inline_targets,
         inline_planning_genv,
+        second_stage,
         jit_runs: std::cell::Cell::new(0),
         #[cfg(test)]
         test_this_commits: std::cell::Cell::new(0),
@@ -10080,6 +10092,30 @@ fn is_literal_falsy(test: &Expr) -> bool {
         Expr::Null => true,
         _ => false,
     }
+}
+
+/// ToBoolean of `expr` when it is a literal whose evaluation has no effect: a Number (signed or
+/// not), a String, a Boolean, `null` or `undefined`, `!` or `void` of one, parenthesized or not.
+/// The compiler folds `!` of one to its Boolean, as V8's parser folds `!` of a literal
+/// (parser.cc, Parser::BuildUnaryExpression) and JSC's `!` of a Number (ASTBuilder.h,
+/// createLogicalNot), and `void` of one to `undefined`, as V8's and JSC's bytecode generators
+/// evaluate nothing for it (BytecodeGenerator::VisitVoid, VoidNode::emitBytecode). Each such
+/// literal compiles to one constant push (`Op::Const` or `Op::Undef`).
+fn literal_truthiness(expr: &Expr) -> Option<bool> {
+    Some(match expr {
+        Expr::Paren(inner) => literal_truthiness(inner)?,
+        Expr::Num(n) => !(*n == 0.0 || n.is_nan()),
+        Expr::Str(text) => !text.is_empty(),
+        Expr::Bool(value) => *value,
+        Expr::Null | Expr::Undefined => false,
+        Expr::Unary { op: "-", arg } if matches!(**arg, Expr::Num(_)) => literal_truthiness(arg)?,
+        Expr::Unary { op: "!", arg } => !literal_truthiness(arg)?,
+        Expr::Unary { op: "void", arg } => {
+            literal_truthiness(arg)?;
+            false
+        }
+        _ => return None,
+    })
 }
 
 /// For each call-cache site of `chunk`, whether its call lies inside a loop (between a backward
@@ -16487,6 +16523,72 @@ impl Compiler {
         }
     }
 
+    /// An equality whose left operand is a literal and whose right one is not (see
+    /// `literal_truthiness`), which compiles with the literal on the right, as SpiderMonkey's
+    /// emitter compares a constant operand on either side after the other
+    /// (BytecodeEmitter.cpp, tryEmitConstantEq) and V8's matches a literal undefined, null or
+    /// Boolean on either side (BytecodeGenerator::VisitCompareOperation): the literal has no
+    /// effect, and IsStrictlyEqual and IsLooselyEqual are symmetric, the latter coercing only
+    /// the operand that is not a literal, at most once, whichever side it is on. So evaluating
+    /// the other operand first is unobservable, and generated code tests the operand against an
+    /// immediate (`jit::emit_eq_constant`).
+    fn constant_comparison(op: &str, left: &Expr, right: &Expr) -> bool {
+        matches!(op, "==" | "!=" | "===" | "!==")
+            && literal_truthiness(left).is_some()
+            && literal_truthiness(right).is_none()
+    }
+
+    /// `!` of an equality whose left operand is no operator chain's (`!(a == b)`, as asm.js
+    /// writes `a != b`): the equality's negation, the same operation, and its operands.
+    /// JSC's bytecode generator compiles `!` in a condition by inverting the condition's
+    /// branches (NodesCodegen.cpp, LogicalNotNode::emitBytecodeInConditionContext) and V8's by
+    /// inverting the test's control flow (BytecodeGenerator::VisitNot); the negated
+    /// equality is that inversion, in any context, with no `!` left to run.
+    fn negated_equality(arg: &Expr) -> Option<(&'static str, &Expr, &Expr)> {
+        match arg {
+            Expr::Paren(inner) => Self::negated_equality(inner),
+            Expr::Binary { op, left, right }
+                if !matches!(**left, Expr::Binary { .. } | Expr::Logical { .. }) =>
+            {
+                let negated = match *op {
+                    "==" => "!=",
+                    "!=" => "==",
+                    "===" => "!==",
+                    "!==" => "===",
+                    _ => return None,
+                };
+                Some((negated, left, right))
+            }
+            _ => None,
+        }
+    }
+
+    /// A binary expression that heads no operator chain.
+    fn binary(&mut self, op: &'static str, left: &Expr, right: &Expr) -> CResult {
+        if let Some((argument, literal)) = Self::typeof_comparison(op, left, right) {
+            // An unknown identifier needs typeof's unresolvable-reference
+            // exception. Its existing TypeofName operation remains authoritative.
+            if !matches!(argument, Expr::Ident(name, _) if self.home(name).is_none()) {
+                self.expr(argument)?;
+                self.emit(Op::TypeofIs(
+                    crate::value::TypeofTest::from_literal(literal),
+                    matches!(op, "!=" | "!=="),
+                ));
+                return Ok(());
+            }
+        }
+        let (left, right) = if Self::constant_comparison(op, left, right) {
+            (right, left)
+        } else {
+            (left, right)
+        };
+        self.expr(left)?;
+        self.expr(right)?;
+        let bop = self.binary_operator(op);
+        self.emit(bop);
+        Ok(())
+    }
+
     /// A left-nested chain of binary and logical operators (`a + b + c`, `a && b || c`),
     /// compiled left to right in a loop rather than recursing once per link: generated and
     /// obfuscated code chains hundreds of thousands of operands. Each link emits exactly what
@@ -16497,7 +16599,8 @@ impl Compiler {
         loop {
             match node {
                 Expr::Binary { op, left, right }
-                    if Self::typeof_comparison(op, left, right).is_none() =>
+                    if Self::typeof_comparison(op, left, right).is_none()
+                        && !Self::constant_comparison(op, left, right) =>
                 {
                     links.push((true, *op, &**right));
                     node = left;
@@ -16840,25 +16943,7 @@ impl Compiler {
             {
                 self.operator_chain(e)
             }
-            Expr::Binary { op, left, right } => {
-                if let Some((argument, literal)) = Self::typeof_comparison(op, left, right) {
-                    // An unknown identifier needs typeof's unresolvable-reference
-                    // exception. Its existing TypeofName operation remains authoritative.
-                    if !matches!(argument, Expr::Ident(name, _) if self.home(name).is_none()) {
-                        self.expr(argument)?;
-                        self.emit(Op::TypeofIs(
-                            crate::value::TypeofTest::from_literal(literal),
-                            matches!(*op, "!=" | "!=="),
-                        ));
-                        return Ok(());
-                    }
-                }
-                self.expr(left)?;
-                self.expr(right)?;
-                let bop = self.binary_operator(op);
-                self.emit(bop);
-                Ok(())
-            }
+            Expr::Binary { op, left, right } => self.binary(op, left, right),
             Expr::Logical { op, left, right } => {
                 self.expr(left)?;
                 let j = match *op {
@@ -16900,16 +16985,27 @@ impl Compiler {
                         self.emit(Op::Plus);
                     }
                     "!" => {
-                        self.expr(arg)?;
-                        self.emit(Op::Not);
+                        if let Some(truthy) = literal_truthiness(arg) {
+                            let i = self.const_idx(Value::Bool(!truthy));
+                            self.emit(Op::Const(i));
+                        } else if let Some((op, left, right)) = Self::negated_equality(arg) {
+                            self.binary(op, left, right)?;
+                        } else {
+                            self.expr(arg)?;
+                            self.emit(Op::Not);
+                        }
                     }
                     "~" => {
                         self.expr(arg)?;
                         self.emit(Op::BitNot);
                     }
                     "void" => {
-                        self.expr(arg)?;
-                        self.emit(Op::Void);
+                        if literal_truthiness(arg).is_some() {
+                            self.emit(Op::Undef);
+                        } else {
+                            self.expr(arg)?;
+                            self.emit(Op::Void);
+                        }
                     }
                     "typeof" => {
                         if let Expr::Ident(n, _) = &**arg {
@@ -24116,6 +24212,44 @@ impl Chunk {
     #[cfg(test)]
     pub(crate) fn jit_const_ptr(&self, k: u32) -> *const Value {
         &self.consts[k as usize] as *const Value
+    }
+    /// The execution word of the active heap's canonical string of string const `k`'s text,
+    /// when the heap has one: the interned one-unit string of an ASCII unit (which `charAt` and
+    /// string indexing return), else the marked string of its existing key (an index's, a
+    /// static name's, a heap atom's). No atom is made. An equality site tests a string constant
+    /// against it by identity (see `jit::emit_eq_constant`), as JSC's Baseline tests an atom
+    /// string constant. The heap keeps each of these strings for its life, so code this chunk
+    /// owns may embed the word, never a process-wide shared stub.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_const_canonical_str_word(&self, k: u32) -> Option<u64> {
+        let ValueView::Str(string) = (self.consts[k as usize]).view() else {
+            return None;
+        };
+        let units = string.units();
+        let canonical = match units.get(0) {
+            Some(unit) if units.len() == 1 && unit < 128 => crate::jstr::unit_lstr(unit),
+            // Text that begins with NUL is a Symbol's key or an escaped one, whose value is
+            // another string (`Interp::property_key_string`).
+            None | Some(0) => return None,
+            Some(_) => {
+                let key =
+                    crate::value::with_atoms(|table| crate::atom::PropKey::lookup(table, units))?;
+                match (key.as_index(), key.as_atom()) {
+                    (Some(index), _) if index < crate::jstr::INDEX_STRINGS => {
+                        crate::jstr::index_lstr(index)
+                    }
+                    (_, Some(atom)) if atom.is_static() => crate::atom::static_name_string(atom),
+                    (_, Some(atom)) => atom.as_lstr(),
+                    _ => return None,
+                }
+            }
+        };
+        Some(crate::value::PACK_STR | canonical.cell_word())
+    }
+    /// Whether this chunk is a second-stage recompilation (see its `second_stage`).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_second_stage(&self) -> bool {
+        self.second_stage
     }
     /// Whether const `k` is a string: the string-const templates push it as an immediate
     /// (`jit_const_str_word`).

@@ -2610,7 +2610,12 @@ pub(super) fn emit(
             // A region keeps its private CFG, but does not discard the baseline's
             // stronger ownership-aware local templates. Spans stay within one block;
             // independent original entries remain separately emitted in the baseline.
-            if !parameter_aliases && pc + 3 < end && fast & 2 != 0 && eq_inlinable(layout) {
+            if !parameter_aliases
+                && pc + 3 < end
+                && fast & 2 != 0
+                && eq_inlinable(layout)
+                && !compact_templates(a)
+            {
                 if let (
                     Op::LoadLocal(lhs),
                     Op::LoadLocal(rhs),
@@ -2859,7 +2864,25 @@ pub(super) fn emit(
                     }
                 }
             }
-            if fast & 16384 != 0 && plan.homes.is_empty() && stack.is_empty() && fusing.is_none() {
+            // A compact site compares a pair of locals as the baseline does, with the reads'
+            // templates and the compact equality, not a numeric chain's speculation.
+            let local_pair_equality = compact_templates(a)
+                && pc + 3 < end
+                && matches!(
+                    (&ops[pc], &ops[pc + 1], &ops[pc + 2], &ops[pc + 3]),
+                    (
+                        Op::LoadLocal(_),
+                        Op::LoadLocal(_),
+                        Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq,
+                        Op::JumpIfFalse(_),
+                    )
+                );
+            if fast & 16384 != 0
+                && plan.homes.is_empty()
+                && stack.is_empty()
+                && fusing.is_none()
+                && !local_pair_equality
+            {
                 // The established scalar/property/element chain has stronger local
                 // representation propagation than independent opcode templates. Reuse
                 // it only at an empty operand boundary with no private numeric locals:
@@ -3476,15 +3499,40 @@ pub(super) fn emit(
                         emit_predicate_event(a);
                     }
                     if fast & 2 != 0 && eq_inlinable(layout) {
-                        emit_eq_inline(
-                            a,
-                            layout,
-                            pc as u32,
-                            private_unwind,
-                            matches!(ops[pc], Op::StrictEq | Op::StrictNotEq),
-                            matches!(ops[pc], Op::StrictNotEq | Op::NotEq),
-                            branch,
-                        );
+                        let strict = matches!(ops[pc], Op::StrictEq | Op::StrictNotEq);
+                        let negate = matches!(ops[pc], Op::StrictNotEq | Op::NotEq);
+                        // A compact site tests a constant right operand in line, as the
+                        // baseline does; reached only from the operation before it, the
+                        // operand on top is that operation's constant, which the region has
+                        // pushed.
+                        let constant = (compact_templates(a)
+                            && pc > 0
+                            && !source_targets[pc]
+                            && a.string_accumulation(pc as u32).is_none())
+                        .then(|| EqConstant::of(chunk, &ops[pc - 1], strict))
+                        .flatten();
+                        match constant {
+                            Some(constant) => emit_eq_constant(
+                                a,
+                                layout,
+                                pc as u32,
+                                private_unwind,
+                                strict,
+                                negate,
+                                constant,
+                                branch,
+                                true,
+                            ),
+                            None => emit_eq_inline(
+                                a,
+                                layout,
+                                pc as u32,
+                                private_unwind,
+                                strict,
+                                negate,
+                                branch,
+                            ),
+                        }
                     } else {
                         emit_exec(a, pc as u32, private_unwind);
                         if let Some(edge) = branch {

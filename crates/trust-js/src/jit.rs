@@ -240,6 +240,14 @@ mod string_constant_tests;
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_compact_equality_tests.rs"]
+mod compact_equality_tests;
+
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_traced_tests.rs"]
 mod traced_tests;
 
@@ -2779,6 +2787,9 @@ mod asm {
         /// The chunk compiler emits the shared stubs sites request (see `super::SharedStub`);
         /// template tests that assemble loose code leave this clear and get inline sequences.
         stubs_ok: bool,
+        /// The code being emitted is a first-stage chunk's (not `Chunk::jit_second_stage`):
+        /// its straight-line sites take the compact forms (see `super::compact_templates`).
+        first_stage: bool,
         /// Profiler attribution markers (`TRUST_JS_JIT_MAP` only): a bound label and the template
         /// family whose code starts there. Nested families restore their parent when they end.
         marks: Vec<(usize, &'static str)>,
@@ -2837,6 +2848,7 @@ mod asm {
                 stubs: Vec::new(),
                 hot: false,
                 stubs_ok: false,
+                first_stage: false,
                 marks: Vec::new(),
                 mark_stack: Vec::new(),
                 string_accumulations: Vec::new(),
@@ -2909,6 +2921,13 @@ mod asm {
         }
         pub fn stubs_ok(&self) -> bool {
             self.stubs_ok
+        }
+        /// Declare that the code emitted from here on is a first-stage chunk's.
+        pub fn set_first_stage(&mut self, first: bool) {
+            self.first_stage = first;
+        }
+        pub fn first_stage(&self) -> bool {
+            self.first_stage
         }
         /// Declare that the code emitted from here on runs only in activations its chunk's plan
         /// made (see the `fixed_activation` field).
@@ -4913,6 +4932,7 @@ fn compile_entry(
     let direct_on = fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled();
     let mut a = asm::Asm::new();
     a.set_stubs_ok(true);
+    a.set_first_stage(!chunk.jit_second_stage());
     // A borrowed frame's activation may be another tier's, without the plan's fixed slots.
     a.set_fixed_activation(!borrowed_entry && chunk.jit_fixed_activation());
     // One label per bytecode pc (branch/catch targets bind as we emit).
@@ -5320,7 +5340,10 @@ fn compile_entry(
         // Local identity/nullish comparison feeding a branch. Reading the two frame slots in
         // place avoids two Value copies, their stack traffic and the equality helper for hot
         // `if (object != excluded)` loops. Unsupported/coercing pairs replay all three value ops
-        // plus the condition from untouched state.
+        // plus the condition from untouched state. A compact site keeps the two reads' templates
+        // and the compact equality, whose operands may be of any type, rather than a numeric
+        // chain's speculation (`local_pair_equality`).
+        let mut local_pair_equality = false;
         if fast & 2 != 0 && eq_inlinable(layout) && pc + 3 < ops.len() {
             if let (
                 Op::LoadLocal(lhs),
@@ -5331,11 +5354,16 @@ fn compile_entry(
             {
                 let lhs_off = *lhs as u32 * 8;
                 let rhs_off = *rhs as u32 * 8;
+                local_pair_equality = compact_templates(&a)
+                    && !targeted[pc + 1]
+                    && !targeted[pc + 2]
+                    && !targeted[pc + 3];
                 if !targeted[pc + 1]
                     && !targeted[pc + 2]
                     && !targeted[pc + 3]
                     && lhs_off + 8 < 4096
                     && rhs_off + 8 < 4096
+                    && !local_pair_equality
                 {
                     emit_local_eq_branch(
                         &mut a,
@@ -5353,8 +5381,74 @@ fn compile_entry(
                 }
             }
         }
+        // A compact equality whose right operand is a constant (`x === null`, `x !== "a"`;
+        // the compiler puts a literal operand on the right, `constant_comparison`), and a compact
+        // `!` feeding a branch: the constant is tested in line and never pushed, and either
+        // result drives a fused JumpIfFalse (through a forwarding Jump too) without a Boolean.
+        if fast & 2 != 0
+            && eq_inlinable(layout)
+            && compact_templates(&a)
+            && pc + 1 < ops.len()
+            && !targeted[pc + 1]
+        {
+            let fused_branch = |at: usize| match ops.get(at) {
+                Some(Op::JumpIfFalse(target)) if !targeted[at] => {
+                    Some((pc_labels[*target as usize], None))
+                }
+                // A forward Jump only: a backward one's target may hold a loop's poll.
+                Some(Op::Jump(cond)) if !targeted[at] && *cond as usize > at => {
+                    match ops.get(*cond as usize) {
+                        Some(Op::JumpIfFalse(target)) => Some((
+                            pc_labels[*target as usize],
+                            Some(pc_labels[*cond as usize + 1]),
+                        )),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            if let Some(cmp @ (Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq)) =
+                ops.get(pc + 1)
+            {
+                let strict = matches!(cmp, Op::StrictEq | Op::StrictNotEq);
+                if let Some(constant) = EqConstant::of(chunk, op, strict)
+                    .filter(|_| a.string_accumulation(pc as u32 + 1).is_none())
+                {
+                    let branch = fused_branch(pc + 2);
+                    emit_eq_constant(
+                        &mut a,
+                        layout,
+                        pc as u32 + 1,
+                        l_unwind,
+                        strict,
+                        matches!(cmp, Op::StrictNotEq | Op::NotEq),
+                        constant,
+                        branch.map(|(target, _)| target),
+                        false,
+                    );
+                    if let Some((_, Some(after))) = branch {
+                        a.b(after);
+                    }
+                    skip = if branch.is_some() { 2 } else { 1 };
+                    continue;
+                }
+            }
+            if matches!(op, Op::Not)
+                && fast & 131072 != 0
+                && a.string_accumulation(pc as u32).is_none()
+            {
+                if let Some((target, after)) = fused_branch(pc + 1) {
+                    emit_not_site(&mut a, pc as u32, Some(target));
+                    if let Some(after) = after {
+                        a.b(after);
+                    }
+                    skip = 1;
+                    continue;
+                }
+            }
+        }
         // Numeric register chain: a run of ops whose values stay in FP registers end to end.
-        if fast & 16384 != 0 && layout.valid {
+        if fast & 16384 != 0 && layout.valid && !local_pair_equality {
             let accumulation = a.string_accumulation(pc as u32).is_some();
             let chain_targets = if accumulation {
                 &source_targets
@@ -12729,6 +12823,10 @@ fn emit_eq_inline(
     negate: bool,
     branch: Option<usize>,
 ) {
+    if compact_templates(a) && a.string_accumulation(pc).is_none() {
+        emit_equal_site(a, pc, l_unwind, strict, negate, branch);
+        return;
+    }
     let len_off = crate::lstr::LEN_OFF as u32;
     let slow = a.new_label();
     let done = a.new_label();
@@ -12970,6 +13068,10 @@ fn emit_eq_inline(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, l_unwind: usize) {
+    if compact_templates(a) && a.string_accumulation(pc).is_none() {
+        emit_not_site(a, pc, None);
+        return;
+    }
     let len_off = crate::lstr::LEN_OFF as u32;
     let slow = a.new_label();
     let done = a.new_label();
@@ -13049,6 +13151,648 @@ fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, 
     a.b(done);
     a.bind(slow);
     emit_exec(a, pc, l_unwind);
+    a.bind(done);
+}
+
+/// A compact equality site's options (see [`SharedStub::Equal`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct EqualFlags {
+    /// `===` or `!==` (IsStrictlyEqual), else `==` or `!=` (IsLooselyEqual).
+    strict: bool,
+    /// `!==` or `!=`: the operation's result is the comparison's negation.
+    negate: bool,
+    /// The site pushes the result; otherwise a fused branch tests it in w9.
+    push: bool,
+    /// The loose comparison's helper call ends in the explicit poll, as the site's in-line
+    /// call would (the site's `Asm::end_polls`).
+    poll: bool,
+    /// The site found the operands not two Numbers and left their words in x12 and x13: the
+    /// stub starts past its own load and Number test.
+    tagged: bool,
+}
+
+/// A compact equality site (see [`compact_templates`]) whose operands are on the stack: two
+/// Numbers compare in line with FCMP (unordered for every other word, the canonical NaN
+/// included), as JSC's Baseline keeps its generic strict equality's int32 test in line
+/// (JITOpcodes.cpp, compileOpStrictEq); any other pair calls the shared [`SharedStub::Equal`]
+/// stub for the site's (strict, negate) pair (see [`emit_equal_call`]). With `branch` (a fused
+/// `JumpIfFalse`'s target) the result drives the branch; otherwise the Boolean replaces the
+/// operands.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_equal_site(
+    a: &mut asm::Asm,
+    pc: u32,
+    l_unwind: usize,
+    strict: bool,
+    negate: bool,
+    branch: Option<usize>,
+) {
+    let call = a.new_label();
+    let done = a.new_label();
+    a.ldp_base(12, 13, 20, -16);
+    a.fmov_d_x(0, 12);
+    a.fmov_d_x(1, 13);
+    a.fcmp(0, 1);
+    a.b_cond(C_VS, call);
+    match branch {
+        Some(target) => {
+            // JumpIfFalse jumps when the operation's result is false.
+            a.sub_imm(20, 20, 16);
+            a.b_cond(if negate { C_EQ } else { C_NE }, target);
+        }
+        None => {
+            a.cset_w(9, if negate { C_NE } else { C_EQ });
+            a.mov_imm64(10, crate::value::PACK_BOOL);
+            a.logic_x(1, 9, 9, 10);
+            emit_exec_word_store(a, 9, 20, -16);
+            a.sub_imm(20, 20, 8);
+        }
+    }
+    a.b(done);
+    a.bind(call);
+    emit_equal_call(a, pc, l_unwind, strict, negate, branch, true);
+    a.bind(done);
+}
+
+/// A compact equality's call of the shared [`SharedStub::Equal`] stub, with w1 = the site's
+/// pc: the stub compares the two operands on the stack (`tagged`: whose words the site left in
+/// x12 and x13, not two Numbers), calls the checked helper itself for what it cannot decide, and
+/// returns the operation's Boolean pushed or, with `branch`, in w9 for the branch. V8's Sparkplug
+/// calls its compare builtins for every comparison (baseline-compiler.cc, VisitTestEqualStrict),
+/// SpiderMonkey's Baseline its site's IC (BaselineCodeGen.cpp, emitCompare).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_equal_call(
+    a: &mut asm::Asm,
+    pc: u32,
+    l_unwind: usize,
+    strict: bool,
+    negate: bool,
+    branch: Option<usize>,
+    tagged: bool,
+) {
+    let flags = EqualFlags {
+        strict,
+        negate,
+        push: branch.is_none(),
+        poll: !strict && a.end_polls(),
+        tagged,
+    };
+    a.movz(1, pc, 0);
+    let stub = a.shared_stub(SharedStub::Equal(flags).key());
+    a.bl_label(stub);
+    if !strict {
+        // IsLooselyEqual may call author conversion methods, which may throw.
+        a.cbnz(1, false, l_unwind);
+    }
+    if let Some(target) = branch {
+        // JumpIfFalse jumps when the operation's result is false.
+        a.cbz(9, false, target);
+    }
+}
+
+/// The shared stub of compact equality sites (see [`emit_equal_site`]), for one (strict, negate)
+/// pair and result form: the work of [`emit_eq_inline`], once per process. Two Numbers compare
+/// with FCMP; one word is the same value (but the canonical NaN); two Strings compare by their
+/// keys when both carry one (one key a text, `lstr::KEY_MARK`), else by length, else by content
+/// when both are flat buffers of one width and at most 64 bytes; a strict pair of other words
+/// of different tags, or of Objects, Symbols or Booleans, is unequal; a loose pair of
+/// `undefined` and `null` is equal, and either is unequal to any other value but an
+/// [[IsHTMLDDA]] Object, which `ic_plain` rules out. The rest (BigInts, longer or mixed-width
+/// String contents, loose coercions) calls the checked helper with the site's pc in w1, as the
+/// in-line template's slow path does. Clobbers x0-x17, d0, d1 and NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_equal_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, flags: EqualFlags) {
+    use crate::value::{PACK_BIGINT, PACK_BOOL, PACK_CANON_NAN, PACK_NULL, PACK_OBJ, PACK_STR};
+    let EqualFlags {
+        strict,
+        negate,
+        push,
+        poll,
+        tagged: entered_tagged,
+    } = flags;
+    let tagged = a.new_label();
+    let identical = a.new_label();
+    let different_tags = a.new_label();
+    let strings = a.new_label();
+    let equal = a.new_label();
+    let unequal = a.new_label();
+    let result = a.new_label();
+    let slow = a.new_label();
+    // w1 holds the site's pc until the helper call.
+    if !entered_tagged {
+        a.ldp_base(12, 13, 20, -16);
+        // Every tagged word is a NaN and the canonical NaN is the only Number NaN: two words
+        // that compare ordered as doubles are two Numbers, which Number::equal compares, signed
+        // zeroes equal.
+        a.fmov_d_x(0, 12);
+        a.fmov_d_x(1, 13);
+        a.fcmp(0, 1);
+        a.b_cond(C_VS, tagged);
+        a.cset_w(9, C_EQ);
+        a.b(result);
+    }
+    a.bind(tagged);
+    a.cmp_reg_x(12, 13);
+    a.b_cond(C_EQ, identical);
+    a.lsr_imm(10, 12, 48);
+    a.lsr_imm(11, 13, 48);
+    a.cmp_reg_w(10, 11);
+    a.b_cond(C_NE, different_tags);
+    // One tag, two words: Strings compare by content and BigInts in the helper; two Objects,
+    // Symbols or Booleans are different values, and no other tag has two words.
+    a.movz(14, (PACK_STR >> 48) as u32, 0);
+    a.cmp_reg_w(10, 14);
+    a.b_cond(C_EQ, strings);
+    a.movz(14, (PACK_BIGINT >> 48) as u32, 0);
+    a.cmp_reg_w(10, 14);
+    a.b_cond(C_EQ, slow);
+    a.b(unequal);
+    // One word, one value, but the canonical NaN, unequal to itself.
+    a.bind(identical);
+    a.mov_imm64(14, PACK_CANON_NAN);
+    a.cmp_reg_x(12, 14);
+    a.cset_w(9, C_NE);
+    a.b(result);
+    a.bind(different_tags);
+    if strict {
+        // Values of different types, or a Number and a NaN-tagged word.
+        a.b(unequal);
+    } else {
+        // `tag | 2` is null's tag exactly for undefined and null.
+        let left_nullish = a.new_label();
+        let against_nullish = a.new_label();
+        let nullish = (PACK_NULL >> 48) as u32;
+        let two = asm::logical_imm_w(2).unwrap();
+        a.logic_imm_w(1, 14, 10, two);
+        a.logic_imm_w(1, 15, 11, two);
+        a.movz(16, nullish, 0);
+        a.cmp_reg_w(14, 16);
+        a.b_cond(C_EQ, left_nullish);
+        a.cmp_reg_w(15, 16);
+        a.b_cond(C_NE, slow); // neither: a coercion
+        a.mov(17, 12);
+        a.b(against_nullish);
+        a.bind(left_nullish);
+        a.cmp_reg_w(15, 16);
+        a.b_cond(C_EQ, equal); // undefined and null
+        a.mov(17, 13);
+        // x17 = the operand that is not nullish: unequal, unless an Object that may be
+        // [[IsHTMLDDA]].
+        a.bind(against_nullish);
+        a.lsr_imm(14, 17, 48);
+        a.movz(15, (PACK_OBJ >> 48) as u32, 0);
+        a.cmp_reg_w(14, 15);
+        a.b_cond(C_NE, unequal);
+        emit_exec_payload(a, 17, 17);
+        a.add_imm(17, 17, layout.obj_from_cell as u32);
+        a.ldrb_imm(17, 17, layout.obj_flags as u32);
+        a.tbz(17, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+        a.b(unequal);
+    }
+    // Two String cells.
+    a.bind(strings);
+    {
+        const _: () = assert!(crate::lstr::LEN_OFF == 8 && crate::lstr::CAP_OFF == 12);
+        let unkeyed = a.new_label();
+        let one_byte = a.new_label();
+        let contents = a.new_label();
+        let words = a.new_label();
+        let tail = a.new_label();
+        let units = a.new_label();
+        emit_exec_payload(a, 12, 14);
+        emit_exec_payload(a, 13, 15);
+        // A flat buffer's frontier word carries the key mark and the key's word; a view's is 0.
+        a.ldr_imm(16, 14, 0);
+        a.ldr_imm(17, 15, 0);
+        a.logic_x(0, 9, 16, 17);
+        a.tbz(9, 63, unkeyed);
+        a.cmp_reg_x(16, 17);
+        a.cset_w(9, C_EQ);
+        a.b(result);
+        a.bind(unkeyed);
+        a.ldr_w_imm(16, 14, crate::lstr::LEN_OFF as u32);
+        a.ldr_w_imm(17, 15, crate::lstr::LEN_OFF as u32);
+        a.cmp_reg_w(16, 17);
+        a.b_cond(C_NE, unequal);
+        a.ldr_w_imm(10, 14, crate::lstr::CAP_OFF as u32);
+        a.ldr_w_imm(11, 15, crate::lstr::CAP_OFF as u32);
+        // `cap`'s top bit marks a flat one-byte (ASCII) buffer, whose bytes are its units. Two
+        // buffers of different widths, a view (whose `cap` is VIEW_CAP) and contents past 64
+        // bytes take the helper.
+        a.logic_w(2, 9, 10, 11);
+        a.tbnz(9, 31, slow);
+        a.tbnz(10, 31, one_byte);
+        a.mov_imm64(9, u64::from(crate::lstr::VIEW_CAP));
+        a.cmp_reg_w(10, 9);
+        a.b_cond(C_EQ, slow);
+        a.cmp_reg_w(11, 9);
+        a.b_cond(C_EQ, slow);
+        a.lsl_imm(16, 16, 1);
+        a.b(contents);
+        a.bind(one_byte);
+        a.bind(contents);
+        a.cmp_imm_w(16, 64);
+        a.b_cond(C_HI, slow);
+        a.add_imm(14, 14, crate::lstr::DATA_OFF as u32);
+        a.add_imm(15, 15, crate::lstr::DATA_OFF as u32);
+        a.cmp_imm_w(16, 8);
+        a.b_cond(C_LO, tail);
+        a.bind(words);
+        a.ldr_imm(10, 14, 0);
+        a.ldr_imm(11, 15, 0);
+        a.cmp_reg_x(10, 11);
+        a.b_cond(C_NE, unequal);
+        a.add_imm(14, 14, 8);
+        a.add_imm(15, 15, 8);
+        a.sub_imm(16, 16, 8);
+        a.cmp_imm_w(16, 8);
+        a.b_cond(C_HS, words);
+        a.bind(tail);
+        a.cbz(16, false, equal);
+        a.bind(units);
+        a.ldrb_imm(10, 14, 0);
+        a.ldrb_imm(11, 15, 0);
+        a.cmp_reg_w(10, 11);
+        a.b_cond(C_NE, unequal);
+        a.add_imm(14, 14, 1);
+        a.add_imm(15, 15, 1);
+        a.subs_imm_w(16, 16, 1);
+        a.b_cond(C_NE, units);
+    }
+    a.bind(equal);
+    a.movz(9, 1, 0);
+    a.b(result);
+    a.bind(unequal);
+    a.movz(9, 0, 0);
+    a.bind(result);
+    if negate {
+        a.logic_imm_w(2, 9, 9, asm::logical_imm_w(1).unwrap());
+    }
+    if push {
+        a.mov_imm64(10, PACK_BOOL);
+        a.logic_x(1, 10, 10, 9);
+        a.stur(10, 20, -16);
+        a.sub_imm(20, 20, 8);
+    } else {
+        a.sub_imm(20, 20, 16);
+    }
+    if !strict {
+        a.movz(1, 0, 0);
+    }
+    a.ret();
+    // The checked helper replaces the operands by the operation's Boolean: IsStrictlyEqual's
+    // (`jit_strict_eq`, which cannot throw) or the generic one's IsLooselyEqual, which may throw
+    // and allocate (then the explicit poll its in-line call ends in follows).
+    a.bind(slow);
+    let out = a.new_label();
+    a.stp_pre(29, 30, -16);
+    let helper = if strict { H_STRICT_EQ } else { H_EXEC };
+    a.mov(0, 19);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (helper * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    if !strict {
+        a.cbnz(1, false, out);
+        if poll {
+            let polled = a.new_label();
+            emit_poll_word(a, 9);
+            a.cbz(9, true, polled);
+            a.mov(0, 19);
+            a.movz(1, POLL_HELPER_END, 0);
+            a.mov(2, 20);
+            a.ldr_imm(16, 21, (H_INTERRUPT * 8) as u32);
+            a.blr(16);
+            a.mov(20, 0);
+            a.cbnz(1, false, out);
+            a.bind(polled);
+        }
+    }
+    if !push {
+        a.ldurb(9, 20, -8);
+        a.sub_imm(20, 20, 8);
+    }
+    a.bind(out);
+    a.ldp_post(29, 30, 16);
+    a.ret();
+}
+
+/// A compact `!` site (see [`compact_templates`]): w1 = the site's pc and a call to the shared
+/// [`SharedStub::Not`] stub, which returns the negated ToBoolean pushed in place of the operand
+/// or, with `branch` (a fused `JumpIfFalse`'s target), in w9 for the branch. V8's Sparkplug calls
+/// ToBooleanForBaselineJump for `!` (baseline-compiler.cc, VisitToBooleanLogicalNot),
+/// SpiderMonkey's Baseline its ToBool IC (BaselineCodeGen.cpp, emit_Not).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_not_site(a: &mut asm::Asm, pc: u32, branch: Option<usize>) {
+    a.movz(1, pc, 0);
+    let stub = a.shared_stub(
+        SharedStub::Not {
+            push: branch.is_none(),
+        }
+        .key(),
+    );
+    a.bl_label(stub);
+    if let Some(target) = branch {
+        a.cbz(9, false, target);
+    }
+}
+
+/// The shared stub of compact `!` sites (see [`emit_not_site`]): [`emit_not_inline`]'s work,
+/// once per process. A BigInt's ToBoolean takes the generic helper with the site's pc in w1;
+/// ToBoolean neither throws nor allocates, so that call needs neither a flag test nor a poll.
+/// Clobbers x0-x17, d0 and NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_not_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, push: bool) {
+    use crate::value::{PACK_BOOL, PACK_OBJ, PACK_STR, PACK_SYM};
+    let tagged = a.new_label();
+    let boolean = a.new_label();
+    let string = a.new_label();
+    let falsy = a.new_label();
+    let truthy = a.new_label();
+    let result = a.new_label();
+    let slow = a.new_label();
+    a.ldur(12, 20, -8);
+    // A Number is falsy when it is a zero (FCMP equal) or NaN, which compares unordered like
+    // every tagged word.
+    a.fmov_d_x(0, 12);
+    a.fcmp_zero(0);
+    a.b_cond(C_VS, tagged);
+    a.cset_w(9, C_EQ);
+    a.b(result);
+    a.bind(tagged);
+    a.lsr_imm(10, 12, 48);
+    a.movz(11, (PACK_BOOL >> 48) as u32, 0);
+    a.cmp_reg_w(10, 11);
+    a.b_cond(C_EQ, boolean);
+    // Below the Boolean tag: the canonical NaN, undefined, null and the Empty sentinel.
+    a.b_cond(C_LO, falsy);
+    a.movz(11, (PACK_STR >> 48) as u32, 0);
+    a.cmp_reg_w(10, 11);
+    a.b_cond(C_EQ, string);
+    a.b_cond(C_LO, slow); // a BigInt
+    a.movz(11, (PACK_SYM >> 48) as u32, 0);
+    a.cmp_reg_w(10, 11);
+    a.b_cond(C_EQ, truthy);
+    a.movz(11, (PACK_OBJ >> 48) as u32, 0);
+    a.cmp_reg_w(10, 11);
+    a.b_cond(C_NE, slow);
+    // An Object is truthy unless it is [[IsHTMLDDA]], which `ic_plain` rules out.
+    emit_exec_payload(a, 12, 11);
+    a.add_imm(11, 11, layout.obj_from_cell as u32);
+    a.ldrb_imm(11, 11, layout.obj_flags as u32);
+    a.tbz(11, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+    a.bind(truthy);
+    a.movz(9, 0, 0);
+    a.b(result);
+    a.bind(boolean);
+    let one = asm::logical_imm_w(1).unwrap();
+    a.logic_imm_w(0, 9, 12, one);
+    a.logic_imm_w(2, 9, 9, one);
+    a.b(result);
+    a.bind(string);
+    emit_exec_payload(a, 12, 11);
+    a.ldr_w_imm(11, 11, crate::lstr::LEN_OFF as u32);
+    a.cmp_imm_w(11, 0);
+    a.cset_w(9, C_EQ);
+    a.b(result);
+    a.bind(falsy);
+    a.movz(9, 1, 0);
+    a.bind(result);
+    if push {
+        a.mov_imm64(10, PACK_BOOL);
+        a.logic_x(1, 10, 10, 9);
+        a.stur(10, 20, -8);
+    } else {
+        a.sub_imm(20, 20, 8);
+    }
+    a.ret();
+    a.bind(slow);
+    a.stp_pre(29, 30, -16);
+    a.mov(0, 19);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_EXEC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    if !push {
+        a.ldurb(9, 20, -8);
+        a.sub_imm(20, 20, 8);
+    }
+    a.ldp_post(29, 30, 16);
+    a.ret();
+}
+
+/// An equality's right operand when the operation before it pushes a constant that a compact
+/// site tests in line (see [`emit_eq_constant`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EqConstant {
+    /// `undefined`, `null` or a Boolean: its word.
+    Scalar(u64),
+    /// A Number: its bits.
+    Number(u64),
+    /// A String whose text the heap has a canonical string for: that string's word
+    /// (`Chunk::jit_const_canonical_str_word`).
+    Str(u64),
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl EqConstant {
+    /// The constant `op` pushes, if a compact equality of that strictness tests it in line: a
+    /// loose comparison with a Boolean coerces, so it takes the stub with the constant pushed.
+    fn of(chunk: &Chunk, op: &crate::bytecode::Op, strict: bool) -> Option<EqConstant> {
+        use crate::bytecode::Op;
+        let constant = match *op {
+            Op::Undef => EqConstant::Scalar(crate::value::PACK_UNDEFINED),
+            Op::Const(k) => match chunk.jit_const_num(k) {
+                Some(bits) => EqConstant::Number(bits),
+                None if chunk.jit_const_copyable(k) => {
+                    EqConstant::Scalar(chunk.jit_const_scalar_bits(k)?)
+                }
+                None => EqConstant::Str(chunk.jit_const_canonical_str_word(k)?),
+            },
+            _ => return None,
+        };
+        let nullish =
+            |word: u64| word == crate::value::PACK_UNDEFINED || word == crate::value::PACK_NULL;
+        match constant {
+            EqConstant::Scalar(word) if !strict && !nullish(word) => None,
+            constant => Some(constant),
+        }
+    }
+}
+
+/// A compact equality site whose right operand is a constant (see [`EqConstant`]), which the
+/// baseline never pushes (a region's code has pushed it, `pushed`), as JSC's Baseline
+/// specializes strict equality on a constant operand
+/// (JITOpcodes.cpp, compileOpStrictEq) and SpiderMonkey's Baseline its StrictConstantEq
+/// (BaselineCodeGen.cpp, emitConstantStrictEq): `undefined`, `null` or a Boolean is one compare
+/// of the operand's word; a Number is one FCMP, unordered for every non-Number word, which a
+/// strict comparison finds unequal and a loose one leaves to the stub; a loose `undefined` or
+/// `null` is a nullish test and an Object's `ic_plain` (V8's Sparkplug tests a loose nil
+/// comparison in line, VisitTestUndetectable); a String is an identity test against the heap's
+/// canonical string, then the stub. The stub's fallback pushes the constant (unless `pushed`)
+/// and calls the [`SharedStub::Equal`] stub at `pc`, the equality's.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_eq_constant(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    pc: u32,
+    l_unwind: usize,
+    strict: bool,
+    negate: bool,
+    constant: EqConstant,
+    branch: Option<usize>,
+    pushed: bool,
+) {
+    let equal = a.new_label();
+    let unequal = a.new_label();
+    let generic = a.new_label();
+    let done = a.new_label();
+    // The operand's slot, and the operands' bytes a decided comparison pops.
+    let (operand, operands) = if pushed { (-16, 16) } else { (-8, 8) };
+    emit_exec_word_load(a, 9, 20, operand);
+    // The result in place of the operands: a Boolean word in w9, or w9's flag bit set.
+    let store = |a: &mut asm::Asm| {
+        emit_exec_word_store(a, 9, 20, operand);
+        if pushed {
+            a.sub_imm(20, 20, 8);
+        }
+    };
+    // Pop the operands and branch, or replace them by the result, on the flags' `cond` for
+    // equal.
+    let decide = |a: &mut asm::Asm, cond: u32| {
+        let differ = cond ^ 1;
+        match branch {
+            Some(target) => {
+                a.sub_imm(20, 20, operands);
+                a.b_cond(if negate { cond } else { differ }, target);
+            }
+            None => {
+                a.cset_w(9, if negate { differ } else { cond });
+                a.mov_imm64(10, crate::value::PACK_BOOL);
+                a.logic_x(1, 9, 9, 10);
+                store(a);
+            }
+        }
+    };
+    // The constant's word, for the stub's fallback that the fast path falls into, and which
+    // of the outcome labels the fast path branches to.
+    let (word, outcomes) = match constant {
+        EqConstant::Scalar(word) | EqConstant::Number(word) if strict => {
+            if let EqConstant::Number(bits) = constant {
+                a.fmov_d_x(0, 9);
+                if bits == 0 {
+                    a.fcmp_zero(0);
+                } else {
+                    a.mov_imm64(10, bits);
+                    a.fmov_d_x(1, 10);
+                    a.fcmp(0, 1);
+                }
+            } else {
+                a.mov_imm64(10, word);
+                a.cmp_reg_x(9, 10);
+            }
+            decide(a, C_EQ);
+            return;
+        }
+        EqConstant::Number(bits) => {
+            a.fmov_d_x(0, 9);
+            if bits == 0 {
+                a.fcmp_zero(0);
+            } else {
+                a.mov_imm64(10, bits);
+                a.fmov_d_x(1, 10);
+                a.fcmp(0, 1);
+            }
+            a.b_cond(C_VS, generic);
+            decide(a, C_EQ);
+            a.b(done);
+            (bits, [false, false])
+        }
+        EqConstant::Scalar(word) => {
+            // `tag | 2` is null's tag exactly for undefined and null.
+            a.lsr_imm(10, 9, 48);
+            a.logic_imm_w(1, 11, 10, asm::logical_imm_w(2).unwrap());
+            a.movz(12, (crate::value::PACK_NULL >> 48) as u32, 0);
+            a.cmp_reg_w(11, 12);
+            a.b_cond(C_EQ, equal);
+            a.movz(11, (crate::value::PACK_OBJ >> 48) as u32, 0);
+            a.cmp_reg_w(10, 11);
+            a.b_cond(C_NE, unequal);
+            emit_exec_payload(a, 9, 10);
+            a.add_imm(10, 10, layout.obj_from_cell as u32);
+            a.ldrb_imm(10, 10, layout.obj_flags as u32);
+            a.tbnz(10, flag_bit(crate::value::FLAG_IC_PLAIN), unequal);
+            (word, [true, true])
+        }
+        EqConstant::Str(word) => {
+            // x10 keeps the word for the fallback's push.
+            a.mov_imm64(10, word);
+            a.cmp_reg_x(9, 10);
+            a.b_cond(C_EQ, equal);
+            (word, [true, false])
+        }
+    };
+    a.bind(generic);
+    if !pushed {
+        if !matches!(constant, EqConstant::Str(_)) {
+            a.mov_imm64(10, word);
+        }
+        emit_exec_word_store(a, 10, 20, 0);
+        a.add_imm(20, 20, 8);
+    }
+    emit_equal_call(a, pc, l_unwind, strict, negate, branch, false);
+    for ((label, result), used) in [(equal, !negate), (unequal, negate)]
+        .into_iter()
+        .zip(outcomes)
+    {
+        if !used {
+            continue;
+        }
+        a.b(done);
+        a.bind(label);
+        match branch {
+            Some(target) => {
+                a.sub_imm(20, 20, operands);
+                if !result {
+                    a.b(target);
+                }
+            }
+            None => {
+                a.mov_imm64(9, crate::value::PACK_BOOL | u64::from(result));
+                store(a);
+            }
+        }
+    }
     a.bind(done);
 }
 
@@ -13575,6 +14319,25 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     PropRead(PropReadFlags),
+    /// [`emit_equal_stub`], a compact equality site's comparison (see [`emit_equal_call`]): the
+    /// operands at `[x20 - 16]` and `[x20 - 8]` (with `tagged`, also their words in x12 and x13,
+    /// not two Numbers), w1 = the site's pc → with `push`, the
+    /// operation's Boolean in their place (x20 moved down 8); without, w9 = the operation's
+    /// result, 0 or 1, with both popped. A loose comparison returns w1 = its helper's flag
+    /// (nonzero: threw, the operands as the helper left them), else 0.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    Equal(EqualFlags),
+    /// [`emit_not_stub`], a compact `!` site (see [`emit_not_site`]): the operand at
+    /// `[x20 - 8]`, w1 = the site's pc → with `push`, the operation's Boolean in its place;
+    /// without, w9 = the result, 0 or 1, with the operand popped. It cannot throw.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    Not { push: bool },
     /// [`emit_call_ways`], a call site's probe after way 0's identity misses: its inputs →
     /// w9 = hit, with x12/x15 set as at the primary hit label.
     #[cfg(all(
@@ -13736,6 +14499,8 @@ impl SharedStub {
     const MIN_MAX: u32 = 0xd00;
     const ELEM_STORE: u32 = 0xe00;
     const PROP_READ: u32 = 0xf00;
+    const EQUAL: u32 = 0x1000;
+    const NOT: u32 = 0x1100;
 
     fn key(self) -> u32 {
         match self {
@@ -13769,6 +14534,23 @@ impl SharedStub {
                     | u32::from(flags.push) << 4
                     | u32::from(flags.proto) << 5
             }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::Equal(flags) => {
+                Self::EQUAL
+                    | u32::from(flags.strict)
+                    | u32::from(flags.negate) << 1
+                    | u32::from(flags.push) << 2
+                    | u32::from(flags.poll) << 3
+                    | u32::from(flags.tagged) << 4
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::Not { push } => Self::NOT | u32::from(push),
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13877,6 +14659,22 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
+            Self::EQUAL => SharedStub::Equal(EqualFlags {
+                strict: key & 1 != 0,
+                negate: key & 2 != 0,
+                push: key & 4 != 0,
+                poll: key & 8 != 0,
+                tagged: key & 16 != 0,
+            }),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::NOT => SharedStub::Not { push: key & 1 != 0 },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             Self::CALL_SECONDARY => SharedStub::CallSecondary,
             #[cfg(all(
                 target_arch = "aarch64",
@@ -13974,6 +14772,17 @@ impl SharedStub {
                     ("proto", flags.proto),
                 ],
             ),
+            SharedStub::Equal(flags) => named(
+                "Equal",
+                &[
+                    ("strict", flags.strict),
+                    ("negate", flags.negate),
+                    ("push", flags.push),
+                    ("poll", flags.poll),
+                    ("tagged", flags.tagged),
+                ],
+            ),
+            SharedStub::Not { push } => named("Not", &[("push", push)]),
             SharedStub::CallSecondary => named("CallSecondary", &[]),
             SharedStub::DirectCall { argc, with_this } => format!(
                 "Stub:DirectCall(argc={argc}{})",
@@ -14126,6 +14935,16 @@ impl SharedStub {
             SharedStub::PropRead(flags) => {
                 emit_prop_read_stub(a, layout, context.ilayout, flags);
             }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::Equal(flags) => emit_equal_stub(a, layout, flags),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::Not { push } => emit_not_stub(a, layout, push),
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14352,6 +15171,19 @@ fn shared_stubs_enabled() -> bool {
 ))]
 fn use_shared_stub(a: &asm::Asm) -> bool {
     shared_stubs_enabled() && !a.hot()
+}
+
+/// Whether the site being emitted takes its compact form, a constant operand's test in line
+/// and the rest in a shared stub: first-stage code outside loops, most of which runs a few times
+/// or never, as V8's Sparkplug and SpiderMonkey's Baseline call a builtin or an IC for each
+/// comparison (baseline-compiler.cc, VisitTestEqualStrict; BaselineCodeGen.cpp, emitCompare).
+/// Second-stage code and loop bodies keep the in-line templates.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn compact_templates(a: &asm::Asm) -> bool {
+    a.stubs_ok() && a.first_stage() && use_shared_stub(a)
 }
 
 /// Loops whose bodies span at most this many operations keep their sites' shared-stub
