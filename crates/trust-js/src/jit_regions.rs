@@ -3967,6 +3967,12 @@ pub(super) fn emit(
     plan.flush_locals(a);
     a.b(unwind);
     a.set_end_polls(end_polls);
+    if jit_map_enabled() {
+        // The region's attribution ends with it (`mark_op` replaced the open families): a
+        // template emitted later, whose nested family closes, resumes the baseline's, not
+        // this region's last operation's.
+        a.mark_op("-");
+    }
     Emission {
         plain,
         targets,
