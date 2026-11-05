@@ -88,6 +88,10 @@ const SLICE_MAX_TIME: std::time::Duration = std::time::Duration::from_millis(1);
 const SLICE_CLOCK_CELLS: usize = 128;
 /// W6 step 4: a preclean pass checks its slice's time every this many pages it takes.
 const PRECLEAN_CLOCK_PAGES: usize = 16;
+/// W6 step 4: the pages a slice under [`IncrementalMode::Force`] precleans at its end, a part of
+/// a pass that the next slices resume: a cell the program writes at every safepoint (a growing
+/// array's owner, whose trace reads all its words) is rescanned once a pass, not at every slice.
+const FORCED_PRECLEAN_PAGES: usize = 16;
 /// W6: the cells a slice traces under [`IncrementalMode::Force`].
 const FORCED_SLICE_CELLS: usize = 4;
 /// W6: the floor of V8's overshoot margin, past which a cycle's allocation forces its final
@@ -4016,7 +4020,7 @@ impl Heap {
         // it found) is small: then the final pause.
         if out_of_work {
             cycle.complete = match cycle.preclean_page {
-                Some(page) => self.preclean_pages(cycle, page, deadline),
+                Some(page) => self.preclean_pages(cycle, page, deadline, usize::MAX),
                 None => {
                     let small_round = cycle.precleans > 0
                         && cycle.last_precleaned < PRECLEAN_DONE_CELLS
@@ -4027,8 +4031,15 @@ impl Heap {
         } else if self.incremental == IncrementalMode::Force {
             // Verification's mode (design 11) precleans at every slice's end too, so that
             // precleaning runs as often as slicing, in every state of the marking and of the
-            // allocation cursors (its slices have no deadline: the pass completes).
-            self.preclean(cycle, deadline);
+            // allocation cursors: the next `FORCED_PRECLEAN_PAGES` pages of a pass.
+            let first = match cycle.preclean_page {
+                Some(page) => page,
+                None => {
+                    Self::begin_preclean(cycle);
+                    0
+                }
+            };
+            self.preclean_pages(cycle, first, deadline, FORCED_PRECLEAN_PAGES);
         }
         cycle.slices += 1;
         cycle.allocated_at_slice = self.allocated_bytes;
@@ -4059,21 +4070,27 @@ impl Heap {
     /// whose drain `run_slice` counts, with a pass over the pages ([`Heap::preclean_pages`]).
     /// Whether the cycle's marking is complete.
     fn preclean(&mut self, cycle: &mut Cycle, deadline: Option<std::time::Instant>) -> bool {
+        Self::begin_preclean(cycle);
+        self.preclean_pages(cycle, 0, deadline, usize::MAX)
+    }
+
+    /// W6 step 4: a preclean's pass begins: a round, whose drain `run_slice` counts.
+    fn begin_preclean(cycle: &mut Cycle) {
         cycle.precleans += 1;
         cycle.last_precleaned = 0;
         cycle.round_traced = 0;
-        self.preclean_pages(cycle, 0, deadline)
     }
 
     /// W6 step 4: the pass of the cycle's preclean over the pages from `first`, taking their
-    /// cards until `deadline`; it resumes in the next slice when the deadline passes (a slice's
-    /// time is capped, and a pass can take hundreds of thousands of cells). Whether the cycle's
-    /// marking is complete: the pass found no written cell.
+    /// cards until `deadline`, or `pages` of them; the next slice resumes it where it stopped (a
+    /// slice's time is capped, and a pass can take hundreds of thousands of cells). Whether the
+    /// cycle's marking is complete: the pass found no written cell.
     fn preclean_pages(
         &mut self,
         cycle: &mut Cycle,
         first: usize,
         deadline: Option<std::time::Instant>,
+        pages: usize,
     ) -> bool {
         // A young page's walk over its marked cells stops at its `next_unused`, which the
         // allocation cursors bring up to date only when flushed (as a collection starts): flushed
@@ -4085,11 +4102,13 @@ impl Heap {
         let queued = m.worklist.len();
         let mut next = None;
         for index in first..self.pages.len() {
-            if deadline.is_some_and(|deadline| {
-                index > first
-                    && (index - first).is_multiple_of(PRECLEAN_CLOCK_PAGES)
-                    && std::time::Instant::now() >= deadline
-            }) {
+            if index - first == pages
+                || deadline.is_some_and(|deadline| {
+                    index > first
+                        && (index - first).is_multiple_of(PRECLEAN_CLOCK_PAGES)
+                        && std::time::Instant::now() >= deadline
+                })
+            {
                 next = Some(index);
                 break;
             }
@@ -10693,7 +10712,7 @@ mod tests {
         assert!(first > 0 && first < chain.len(), "{first}");
         assert!(!fx
             .heap
-            .preclean_pages(&mut cycle, PRECLEAN_CLOCK_PAGES, None));
+            .preclean_pages(&mut cycle, PRECLEAN_CLOCK_PAGES, None, usize::MAX));
         assert_eq!(cycle.preclean_page, None, "the pass ended");
         assert_eq!(cycle.precleans, precleans + 1, "one pass, in two parts");
         assert_eq!(
@@ -10701,6 +10720,52 @@ mod tests {
             chain.len(),
             "every written cell, once"
         );
+        fx.heap.cycle = Some(cycle);
+    }
+
+    /// W6 step 4: under `Force` a slice that leaves work in the worklist precleans
+    /// `FORCED_PRECLEAN_PAGES` pages of a pass at its end, and the next slices resume the pass, so
+    /// that a written cell is rescanned once a pass.
+    #[test]
+    fn a_forced_slice_precleans_part_of_a_pass() {
+        let (mut fx, chain) = cycle_fixture(FORCED_PRECLEAN_PAGES as u64 * 12_000);
+        assert!(start_cycle(&mut fx));
+        slice_to_completion(&mut fx);
+        fx.heap.set_incremental(IncrementalMode::Force);
+        let pages = fx.heap.pages.len();
+        assert!(pages > 2 * FORCED_PRECLEAN_PAGES, "{pages} pages");
+        // Every chain cell written: every page has cards set.
+        for &cell in &chain {
+            // SAFETY: a live carded cell of this heap.
+            unsafe { card_mark(cell) };
+        }
+        let mut cycle = fx.heap.cycle.take().unwrap();
+        cycle.complete = false;
+        let precleans = cycle.precleans;
+        // Grey work for the slices to leave: a few cells traced again.
+        let work = |cell: &*mut u8| TraceWork {
+            cell: *cell as usize,
+            desc: fx.carded,
+            purpose: TracePurpose::Full,
+        };
+        cycle.marker.worklist.extend(chain[..64].iter().map(work));
+        fx.heap.run_slice(&mut cycle, &NoClient, None);
+        assert_eq!(
+            cycle.preclean_page,
+            Some(FORCED_PRECLEAN_PAGES),
+            "a part of a pass"
+        );
+        assert_eq!(cycle.precleans, precleans + 1);
+        let first = cycle.last_precleaned;
+        assert!(first > 0 && first < chain.len(), "{first}");
+        fx.heap.run_slice(&mut cycle, &NoClient, None);
+        assert_eq!(
+            cycle.preclean_page,
+            Some(2 * FORCED_PRECLEAN_PAGES),
+            "the pass goes on"
+        );
+        assert_eq!(cycle.precleans, precleans + 1, "the same pass");
+        assert!(cycle.last_precleaned > first);
         fx.heap.cycle = Some(cycle);
     }
 
