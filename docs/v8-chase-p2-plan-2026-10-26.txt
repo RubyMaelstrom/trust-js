@@ -13675,3 +13675,12 @@ work, and it is what lets the threshold drop (t1a2: Djot -9.5%, React -3.2% on t
 timers) without TRust's pages paying for it. A measured intermediate, if wanted in P2: the bytecode
 shared alone, which a page's bytecode compiles bound at a quarter of its compile time on the
 event-loop page (4.6 of about 19 ms).
+
+Addendum to W6 step 2b's record (2026-11-05): lib GC stress at 4fc709f2 (landed as 7b2afa56) with
+TRUST_JS_GC_STRESS=1000, TRUST_JS_GC_INCREMENTAL=force and TRUST_JS_GC_VERIFY=1, each of 663 tests
+in its own process (W6's selection with 2b's: gc_cycle_tests and the table_record_tests that run
+cycles, both closure-check should_panic tests among them): 662 pass. The one that fails,
+memory::tests::temporal_records_account_zone_and_calendar_strings_once, fails under stress on main
+before W6 as well. releasing_long_object_chains_uses_bounded_native_stack took 2,963 s; the
+known-slow integer_comparisons_and_branches_match_in_every_tier was left out
+(target/p2/w6/impl/stress/run-4fc709f2-force/results.txt).
