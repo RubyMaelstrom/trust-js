@@ -5569,14 +5569,10 @@ pub(crate) fn mark_agent_heap(
 /// W6: start a marking cycle of `heap` ([`crate::gc_core::Heap::start_cycle`]) with a closure mark
 /// stamp of its own, which its slices and its final pause mark with too: one marking, which the
 /// final pause ends as [`mark_agent_heap`] ends every marking, judging the closure registry.
-pub(crate) fn start_agent_cycle(
-    heap: &GcState,
-    native_roots: bool,
-    client: &dyn crate::gc_core::MarkClient,
-) -> bool {
+pub(crate) fn start_agent_cycle(heap: &GcState, client: &dyn crate::gc_core::MarkClient) -> bool {
     debug_assert_eq!(heap.cycle_closure_stamp.get(), 0, "a cycle is running");
     let stamp = closure_mark_stamp();
-    let started = heap.core.borrow_mut().start_cycle(native_roots, client);
+    let started = heap.core.borrow_mut().start_cycle(client);
     CLOSURE_MARK_STAMP.with(|current| current.set(0));
     if started {
         heap.cycle_closure_stamp.set(stamp);

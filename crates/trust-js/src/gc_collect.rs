@@ -1540,8 +1540,8 @@ impl Interp {
     /// W6: start a marking cycle over the whole Agent heap from this interpreter's safepoint
     /// (design 6): the client, built as a major collection builds it, reports the roots and the
     /// side tables' conditional edges (step 2b: the weak collections as owners, whose entries
-    /// the slices discover), and the heap marks the roots and the native stack and runs the
-    /// cycle's first slice. This marking consumes the tables' and the handles' records, as a
+    /// the slices discover), and the heap marks the roots: no native stack and no slice, as V8's
+    /// start (step 4). This marking consumes the tables' and the handles' records, as a
     /// collection's does: what is written from now on is recorded for the final pause. The
     /// Realm groups the client found stay for the slices (`GcState::cycle_realms`). Deferred as a
     /// collection is.
@@ -1557,16 +1557,11 @@ impl Interp {
         let _collecting = crate::agent_control::Collecting(heap.clone());
         let performance_started = crate::value::gc_performance_metrics_start();
         let log_started = gc_log().then(std::time::Instant::now);
-        #[cfg(not(target_arch = "wasm32"))]
-        crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
+        // The start scans no native stack (V8's, step 4): no frame below is zeroed first.
         self.gc_evict_young_cache_keys();
         let marking = Marking::new(self, CollectionKind::Major, Purpose::CycleStart);
-        // Building the client enumerated Realm members and host values in frames below this
-        // one, which the marker's frames reuse (see `gc_heap_mark`).
-        #[cfg(not(target_arch = "wasm32"))]
-        crate::gc_core::scrub_stack(GC_SCRUB_BYTES);
         heap.handles.set_collecting(true);
-        let started = crate::value::start_agent_cycle(heap, true, &marking);
+        let started = crate::value::start_agent_cycle(heap, &marking);
         heap.handles.set_collecting(false);
         if !started {
             heap.agent.request(heap, Some(CollectionKind::Major));
@@ -1632,13 +1627,13 @@ impl Interp {
             return;
         };
         // The start's marking is the cycle's so far; its line adds the heap's phases (the rest of
-        // its pause is the engine's: the client, the stack's scrubbing, the records).
+        // its pause is the engine's: the client, the records).
         let (marked, phases) = if phase == "start" {
             let stats = core.stats();
             let phases = crate::gc_core::Phase::NAMES
                 .iter()
                 .zip(stats.last_phase_nanos)
-                .take(5)
+                .filter(|(name, _)| matches!(**name, "begin" | "roots" | "side"))
                 .map(|(name, nanos)| format!(" {name}={:.0}", nanos as f64 / 1000.0))
                 .collect::<String>();
             (progress.marked, phases)

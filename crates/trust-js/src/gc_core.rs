@@ -1599,8 +1599,8 @@ struct Cycle {
     /// `Heap::allocated_bytes` as the cycle started, and as its last slice ended.
     allocated_at_start: usize,
     allocated_at_slice: usize,
-    /// The slices run so far (the start's among them), and their time while phases are timed or
-    /// the heap paces its growth (step 4: the major collection's speed counts it).
+    /// The slices run so far (the start counting as one), and their time while phases are timed
+    /// or the heap paces its growth (step 4: the major collection's speed counts it).
     slices: u32,
     slice_nanos: u64,
     /// The bytes of the cells the last slice traced (its work, [`Heap::drain_within`]).
@@ -3862,19 +3862,18 @@ impl Heap {
 
     /// W6: start a marking cycle (design 6), at a safepoint: with heap verification, the write
     /// barrier's and the records' checks; then clear every mark and card, as a major
-    /// collection's marking starts, mark the client's roots and the native stack, register the
-    /// side tables' conditional edges (step 2b: the weak collections as owners, whose entries
-    /// the slices discover), and run the cycle's first slice. Deferred as a collection is (a
-    /// deferred start makes a major collection due); false then.
+    /// collection's marking starts, mark the client's roots and register the side tables'
+    /// conditional edges (step 2b: the weak collections as owners, whose entries the slices
+    /// discover). As V8's start (src/heap/incremental-marking.cc:247-324, step 4), it scans no
+    /// native stack, which the final pause scans with every root again (V8's MarkRoots skips the
+    /// stack, :221-228), and runs no slice: the schedule brings the first. Deferred as a
+    /// collection is (a deferred start makes a major collection due); false then.
     #[cold]
     #[inline(never)]
-    pub(crate) fn start_cycle(&mut self, native_roots: bool, client: &dyn MarkClient) -> bool {
+    pub(crate) fn start_cycle(&mut self, client: &dyn MarkClient) -> bool {
         debug_assert!(self.cycle.is_none(), "a cycle is running already");
         if self.blocked() {
             return self.defer(false, CollectionKind::Major);
-        }
-        if native_roots && !native::scannable(native::current_sp()) {
-            return self.defer(true, CollectionKind::Major);
         }
         assert!(
             !self.control.collecting.replace(true),
@@ -3902,10 +3901,6 @@ impl Heap {
         self.control.external.budget.set(0);
         self.control.external.due.set(false);
         self.begin_marking(CollectionKind::Major, client);
-        #[cfg(not(target_arch = "wasm32"))]
-        if native_roots {
-            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
-        }
         self.phase_done(Phase::Begin, &mut clock);
         let mut m = Marker::default();
         #[cfg(test)]
@@ -3914,12 +3909,6 @@ impl Heap {
         }
         client.roots(&mut |word| self.mark_word(word, &mut m));
         self.phase_done(Phase::Roots, &mut clock);
-        if native_roots {
-            #[cfg(not(target_arch = "wasm32"))]
-            scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
-            self.mark_native_stack(&mut m);
-        }
-        self.phase_done(Phase::Stack, &mut clock);
         #[cfg(test)]
         {
             m.source = MarkSource::Root;
@@ -3931,12 +3920,14 @@ impl Heap {
         self.add_side_slot_owners(&mut m, client);
         self.phase_done(Phase::Side, &mut clock);
         let allocated = self.allocated_bytes;
-        let mut cycle = Box::new(Cycle {
+        self.cycle = Some(Box::new(Cycle {
             marker: m,
             allocated_at_start: allocated,
             allocated_at_slice: allocated,
-            slices: 0,
-            slice_nanos: 0,
+            // The start counts among the cycle's pauses before its final one, and its time among
+            // their marking time (the major collection's speed counts it, step 4).
+            slices: 1,
+            slice_nanos: started.map_or(0, |started| started.elapsed().as_nanos() as u64),
             last_traced: 0,
             precleans: 0,
             precleaned: 0,
@@ -3945,10 +3936,7 @@ impl Heap {
             preclean_page: None,
             started: std::time::Instant::now(),
             complete: false,
-        });
-        self.run_slice(&mut cycle, client, started);
-        self.phase_done(Phase::Drain, &mut clock);
-        self.cycle = Some(cycle);
+        }));
         self.control.collecting.set(false);
         self.update_fast_alloc();
         self.refresh_due();
@@ -10545,7 +10533,7 @@ mod tests {
             roots: &fx.roots[..],
             edges: &no_edges,
         };
-        fx.heap.start_cycle(false, &client)
+        fx.heap.start_cycle(&client)
     }
 
     /// Slice the fixture's cycle until its worklist runs out.
@@ -10623,7 +10611,7 @@ mod tests {
             noted: Cell::new(false),
             reported: Cell::new(0),
         };
-        assert!(fx.heap.start_cycle(false, &client));
+        assert!(fx.heap.start_cycle(&client));
         for _ in 0..1000 {
             if fx.heap.cycle.as_ref().is_some_and(|cycle| cycle.complete) {
                 break;
@@ -10966,7 +10954,8 @@ mod tests {
     fn a_cycles_preclean_rescans_a_written_cell_before_the_final_pause() {
         let (mut fx, chain) = cycle_fixture(5_000);
         assert!(start_cycle(&mut fx));
-        // The start's slice traced the chain's head and left the rest of the chain.
+        // The first slice traced the chain's head and left the rest of the chain.
+        assert!(fx.heap.slice(&NoClient).is_some());
         let head = *chain.last().unwrap();
         assert_eq!(fx.heap.cell_age(head as u64), Some(CellAge::Old));
         assert!(!fx.heap.cycle.as_ref().unwrap().complete);
@@ -11094,7 +11083,9 @@ mod tests {
     fn precleaning_repeats_until_a_preclean_finds_fewer_cells_than_its_budget() {
         let (mut fx, chain) = cycle_fixture(20_000);
         assert!(start_cycle(&mut fx));
-        assert!(fx.heap.slice(&NoClient).is_some());
+        for _ in 0..2 {
+            assert!(fx.heap.slice(&NoClient).is_some());
+        }
         // The cells traced so far are written (their cards set), as a program writing its old
         // objects while the cycle marks.
         let traced: Vec<*mut u8> = chain

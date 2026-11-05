@@ -8029,13 +8029,11 @@ impl Interp {
     /// W6 step 4: start a marking cycle for the host, its memory reducer's, unless one runs
     /// already. Whether one runs now.
     #[cfg(not(target_arch = "wasm32"))]
-    #[inline(always)]
     fn gc_start_cycle_for_host(&mut self) -> bool {
         if self.incremental_marking_running() {
             return true;
         }
-        #[cfg(not(target_arch = "wasm32"))]
-        crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
+        // The start scans no native stack: no frame below is zeroed first.
         self.activate_gc_heap();
         let outcome = self.with_access(|current| {
             let heap = current.gc_heap.clone();

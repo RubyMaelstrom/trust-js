@@ -155,41 +155,42 @@ comment/example in the same change.
   clearing weak handles and weak cells; `tables`: evicting the dead from the engine's tables;
   `after`: the Agent's bookkeeping after the sweep), then the cells finalized, by kind, and
   the time their finalizers took (`fin:<kind>=count fin_us:<kind>=microseconds`).
-- `TRUST_JS_GC_INCREMENTAL=1` (W6, off by default) marks the major collections the heap asks
-  for on its own (its byte budget, a stress interval, the memory reducer) in a cycle between
-  whose slices the program runs, once the heap holds more than 8 MiB (in release builds): a
-  minor collection that leaves the room below the byte budget at one nursery's budget or less
-  starts it (V8's soft limit). The cycle's start marks the roots and the native stack, and each
-  slice traces part of what they reach, with the engine's side tables (internal slots kept
-  outside objects, WeakMap and WeakSet entries, discovered as their collections are marked), at
-  the first safepoint after every 64 KiB allocated: the bytes V8's schedule asks (those due by
-  now if the cycle's marking took 500 ms, or by the time it has allocated half its room before
-  the margin, whichever is more, and at least 64 KiB), for at most a millisecond. A host's
-  event loop advances a cycle while it waits (`Engine::advance_incremental_marking`), as the
-  runtime does. Each time nothing is left to trace, a slice precleans: the
-  marked cells written since their trace (their cards set) are traced again while the program
-  runs, until a preclean finds fewer than 7,000 such cells and what they reach is under 1 MiB; a
-  final pause once nothing is left after that marks the roots, the stack and the cells written
-  since (their cards) again, with the side-table entries written during the cycle, then sweeps
-  as a major collection does; the heap's growth counts the cycle's whole marking time. No minor
-  collection runs while a cycle marks; the cycle's allocation past a margin over the byte
-  budget (V8's), and every requested collection (explicit, the exit's, the live-object limit,
-  ArrayBuffer pressure, an explicit minor one) finish it at once; an explicit major collection
-  that finishes one is followed by another, which frees what the cycle marked before it died.
-  `TRUST_JS_GC_INCREMENTAL=force` makes the slices a few cells each, at every safepoint while a
-  cycle marks, each ending with a preclean, and with `TRUST_JS_GC_VERIFY` each take of the cards
-  (a preclean's, the final pause's) is checked against a walk over the marks of their pages, the
-  slices' ends (the first 64 of a cycle, then every 64th) and the final pause's start check that
-  no traced cell with a clean card holds an edge to an unmarked one, and the final pause's end
-  that every side-table entry of a marked owner names marked cells. `TRUST_JS_GC_LOG=1` prints a
-  `[gc-slice]` line for the cycle's start (`phase=start`) and each slice: the slices so far
-  (`n`), the bytes of the cells it traced (`traced`), the bytes it marked and the cycle's so far
-  (`cycle_marked`), the cells left in the worklist, the bytes allocated since the cycle started
-  (`cycle_alloc`), the cycle's precleans so far and the cells the last one found (`precleans`,
-  `precleaned`), whether the marking is complete but for the final pause, and its `pause` in
-  microseconds, the start's with the heap's phases in it (`begin`: clearing the marks and cards,
-  `roots`, `stack`, `side`: the side tables' edges, `drain`: its first slice; the rest is the
-  engine's); the final pause's `[gc-heap]` line is a major collection's.
+- `TRUST_JS_GC_INCREMENTAL=1` (W6, off by default) marks the major collections the heap asks for
+  on its own (its byte budget, a stress interval, the memory reducer) in a cycle between whose
+  slices the program runs, once the heap holds more than 8 MiB (in release builds): a minor
+  collection that leaves the room below the byte budget at one nursery's budget or less starts
+  it (V8's soft limit). The cycle's start marks the roots, but not the native stack, which the
+  final pause scans (V8's start), and each slice traces part of what they reach, with the
+  engine's side tables (internal slots kept outside objects, WeakMap and WeakSet entries,
+  discovered as their collections are marked), at the first safepoint after every 64 KiB
+  allocated: the bytes V8's schedule asks (those due by now if the cycle's marking took 500 ms,
+  or by the time it has allocated half its room before the margin, whichever is more, and at
+  least 64 KiB), for at most a millisecond. A host's event loop advances a cycle while it waits
+  (`Engine::advance_incremental_marking`), as the runtime does. Each time nothing is left to
+  trace, a slice precleans: the marked cells written since their trace (their cards set) are
+  traced again while the program runs, until a preclean finds fewer than 7,000 such cells and
+  what they reach is under 1 MiB; a final pause once nothing is left after that marks the roots,
+  the stack and the cells written since (their cards) again, with the side-table entries written
+  during the cycle, then sweeps as a major collection does; the heap's growth counts the cycle's
+  whole marking time. No minor collection runs while a cycle marks; the cycle's allocation past
+  a margin over the byte budget (V8's), and every requested collection (explicit, the exit's,
+  the live-object limit, ArrayBuffer pressure, an explicit minor one) finish it at once; an
+  explicit major collection that finishes one is followed by another, which frees what the cycle
+  marked before it died. `TRUST_JS_GC_INCREMENTAL=force` makes the slices a few cells each, at
+  every safepoint while a cycle marks, each ending with the next 16 pages of a preclean's pass,
+  and with `TRUST_JS_GC_VERIFY` each take of the cards (a preclean's, the final pause's) is
+  checked against a walk over the marks of their pages, the slices' ends (the first 64 of a
+  cycle, then every 64th) and the final pause's start check that no traced cell with a clean
+  card holds an edge to an unmarked one, and the final pause's end that every side-table entry
+  of a marked owner names marked cells. `TRUST_JS_GC_LOG=1` prints a `[gc-slice]` line for the
+  cycle's start (`phase=start`) and each slice: the slices so far (`n`), the bytes of the cells
+  it traced (`traced`), the bytes it marked and the cycle's so far (`cycle_marked`), the cells
+  left in the worklist, the bytes allocated since the cycle started (`cycle_alloc`), the cycle's
+  precleans so far and the cells the last one found (`precleans`, `precleaned`), whether the
+  marking is complete but for the final pause, and its `pause` in microseconds, the start's with
+  the heap's phases in it (`begin`: clearing the marks and cards, `roots`, `side`: the side
+  tables' edges; the rest is the engine's); the final pause's `[gc-heap]` line is a major
+  collection's.
 - Collections are minor or major. A minor collection traces from the roots and from the old
   cells (cells an earlier collection kept) whose cards the write barrier set since the last
   collection, and of the engine's side tables (internal slots kept outside objects, WeakMap and
