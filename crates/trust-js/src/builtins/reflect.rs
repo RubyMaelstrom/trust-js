@@ -18,7 +18,9 @@ pub(super) fn install_reflect(it: &mut Interp) {
             // ICs, by the key's atom, as `object[key]` would.
             ValueView::Str(name) => {
                 let text = crate::value::encode_lstr_key(&name);
-                if let Some(result) = i.get_named_cached(&object, &text, &receiver) {
+                // A marked String carries its key (see `lstr::KEY_MARK`): no lookup of its text.
+                let atom = crate::atom::PropKey::of_marked(&name);
+                if let Some(result) = i.get_named_cached(&object, &text, atom, &receiver) {
                     return ab(result);
                 }
                 reflect_ordinary_get(i, &target, &text, &receiver)

@@ -10190,6 +10190,11 @@ impl Props {
         }
         found
     }
+    /// [`Props::find`], never inlined: a walk's lookup of a key it has in hand.
+    #[inline(never)]
+    fn find_out_of_line(&self, key: PropKey) -> Option<usize> {
+        self.find(key)
+    }
     /// [`Props::find`] of a key's text. A small map without an index compares its keys' text
     /// and makes no atom lookup; a larger one takes the text's atom once, and text with no atom
     /// in the active heap names no property (every named key was made one when inserted).
@@ -10205,6 +10210,12 @@ impl Props {
         if let Some(n) = canonical_index(text) {
             return self.find(PropKey::index(n));
         }
+        // With the key in hand (looked up by an earlier map, or carried by a marked String), any
+        // map compares key words: its text is that atom's, the only one of its heap (I6). Out of
+        // the line that every caller inlines, which keeps their code as it was.
+        if let Some(key) = *atom {
+            return self.find_out_of_line(key);
+        }
         if self.entries.len() > INDEX_THRESHOLD || self.entries.index().is_some() {
             // The array-length shape proves every other named key absent (see `find`), with
             // no atom to look up.
@@ -10216,10 +10227,7 @@ impl Props {
             {
                 return None;
             }
-            let found = match *atom {
-                Some(key) => self.find(key),
-                None => PropKey::lookup_text(text).and_then(|key| self.find(*atom.insert(key))),
-            };
+            let found = PropKey::lookup_text(text).and_then(|key| self.find(*atom.insert(key)));
             #[cfg(debug_assertions)]
             if found.is_none() {
                 self.check_keys_of_active_heap();

@@ -3127,7 +3127,10 @@ impl Interp {
             }
             ValueView::Str(name) => {
                 let text = crate::value::encode_lstr_key(&name);
-                if let Some(present) = Self::ordinary_chain_has_property(target, &text) {
+                // A marked String carries its key (see `lstr::KEY_MARK`): the chain's maps read
+                // it without a lookup of the text.
+                let atom = crate::atom::PropKey::of_marked(&name);
+                if let Some(present) = Self::ordinary_chain_has_key(target, &text, atom) {
                     return Ok(present);
                 }
                 return self.js_has_property(object, &text);
@@ -3152,8 +3155,18 @@ impl Interp {
     /// the chain is a proxy or in an interpreter side table (`ic_plain` clear: typed arrays,
     /// namespaces, Web IDL indexed objects) or is any other exotic object.
     pub(crate) fn ordinary_chain_has_property(start: &Gc, key: &str) -> Option<bool> {
-        // The key's atom, once a map on the chain has looked it up (`Props::get_walking`).
-        let mut atom = None;
+        Self::ordinary_chain_has_key(start, key, None)
+    }
+
+    /// [`Interp::ordinary_chain_has_property`] with the key's atom when the caller has it.
+    pub(crate) fn ordinary_chain_has_key(
+        start: &Gc,
+        key: &str,
+        atom: Option<crate::atom::PropKey>,
+    ) -> Option<bool> {
+        // The key's atom, given or once a map on the chain has looked it up
+        // (`Props::get_walking`).
+        let mut atom = atom;
         let mut current = *start;
         loop {
             let next = {

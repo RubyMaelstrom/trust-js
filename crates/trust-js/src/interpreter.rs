@@ -8437,6 +8437,16 @@ impl Interp {
         }
     }
 
+    /// [`Interp::key_value`] of a key in hand, without a lookup of its text.
+    pub(crate) fn key_value_of(&mut self, key: crate::atom::PropKey) -> Value {
+        if key.is_symbol() {
+            if let Some(symbol) = self.sym_from_key(&key.text()) {
+                return symbol;
+            }
+        }
+        Value::Str(self.property_key_string(key))
+    }
+
     pub(crate) fn property_key_string(&mut self, key: crate::atom::PropKey) -> crate::lstr::LStr {
         use crate::lstr::Units;
         if let Some(atom) = key.as_atom() {
@@ -8447,6 +8457,14 @@ impl Interp {
             };
             if !escaped && !atom.is_static() {
                 return atom.as_lstr();
+            }
+            // A static name's value is its heap's marked copy (see `lstr::KEY_MARK`).
+            if !escaped {
+                return crate::atom::static_name_string(atom);
+            }
+        } else if let Some(index) = key.as_index() {
+            if index < crate::jstr::INDEX_STRINGS {
+                return crate::jstr::index_lstr(index);
             }
         }
         if let Some(string) = self
@@ -10114,7 +10132,9 @@ impl Interp {
                 // scratch ways are empty; probing them and copying the key into a second
                 // pointer-indexed stub table adds work on high-cardinality/transient inputs.
                 // Derive once and retain the key only in the bounded computed cache.
-                let prop_key = crate::atom::PropKey::lookup_text(&text);
+                // A marked key String carries its key (see `lstr::KEY_MARK`).
+                let prop_key = crate::atom::PropKey::of_marked(key)
+                    .or_else(|| crate::atom::PropKey::lookup_text(&text));
                 if let Some(value) =
                     self.ic_get_rederive(&object, &text, prop_key, &scratch[0], false, false)
                 {
@@ -10138,11 +10158,13 @@ impl Interp {
     /// cache, and a miss re-derives the read along the chain and fills it. A getter is called
     /// on `receiver`. `None` declines, having run no code, for an exotic or side-table object on
     /// the chain or a name the ICs leave to the general [[Get]] (index-like or NUL-led text,
-    /// `length`, `description`); the caller then runs that [[Get]].
+    /// `length`, `description`); the caller then runs that [[Get]]. `atom` is the key's when the
+    /// caller has it (a marked String's, see `lstr::KEY_MARK`); else its text is looked up.
     pub(crate) fn get_named_cached(
         &mut self,
         object: &Gc,
         name: &str,
+        atom: Option<crate::atom::PropKey>,
         receiver: &Value,
     ) -> Option<Result<Value, Abrupt>> {
         if name.len() > COMPUTED_STUB_KEY_MAX_BYTES
@@ -10155,7 +10177,7 @@ impl Interp {
         {
             return None;
         }
-        let key = crate::atom::PropKey::lookup_text(name);
+        let key = atom.or_else(|| crate::atom::PropKey::lookup_text(name));
         let read = self.ic_read_by_key(object, name, key)?;
         Some(self.finish_cached_get(read, receiver, None))
     }
@@ -11708,7 +11730,7 @@ impl Interp {
                                 None,
                             );
                         }
-                        return self.proxy_get(target, handler, key, None, receiver);
+                        return self.proxy_get(target, handler, key, None, atom, receiver);
                     }
                 }
                 // TypedArray integer-index reads come from the backing buffer, not the property map.
@@ -11797,20 +11819,25 @@ impl Interp {
     /// A Proxy's [[Get]] (ECMA-262 §10.5.8) of `key` with `receiver`: GetMethod(handler, "get");
     /// without a trap the target's [[Get]], else Call(trap, handler, «target, P, Receiver») and
     /// the invariant checks. `key_value` is P as an ECMAScript value when the caller already
-    /// has it; otherwise it is built from the internal key text.
+    /// has it; otherwise it is made from `atom`, the key's when the caller has it, or from the
+    /// internal key text.
     fn proxy_get(
         &mut self,
         target: Value,
         handler: Value,
         key: &str,
         key_value: Option<Value>,
+        atom: Option<crate::atom::PropKey>,
         receiver: Value,
     ) -> Result<Value, Abrupt> {
         let Some(trap) = self.proxy_get_trap(&handler, PROXY_TRAP_GET, "get")? else {
             // Forward to the target's [[Get]], preserving the original Receiver.
             return self.proxy_forward(|me| me.get_member_recv(&target, key, receiver));
         };
-        let key_value = key_value.unwrap_or_else(|| self.key_value(key));
+        let key_value = key_value.unwrap_or_else(|| match atom {
+            Some(atom) => self.key_value_of(atom),
+            None => self.key_value(key),
+        });
         let res = self.proxy_call_trap(
             PROXY_TRAP_GET,
             &trap,
@@ -11842,7 +11869,14 @@ impl Interp {
         } else {
             crate::value::string_key_value(key)
         };
-        Some(self.proxy_get(target, handler, key, Some(key_value), Value::Obj(*object)))
+        Some(self.proxy_get(
+            target,
+            handler,
+            key,
+            Some(key_value),
+            None,
+            Value::Obj(*object),
+        ))
     }
 
     /// The exotic [[Get]] of a holder on the chain whose `ic_plain` is clear (W2g step 7): a

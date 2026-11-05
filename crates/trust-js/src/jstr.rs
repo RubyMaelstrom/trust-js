@@ -233,15 +233,23 @@ pub fn unit_str(unit: u16) -> String {
 /// Canonical array-index strings below this bound are interned (see [`index_lstr`]).
 pub(crate) const INDEX_STRINGS: u32 = 1024;
 
+/// The first slot of the interned strings (`value::interned_string`) that holds the static
+/// names' string values (`atom::static_name_string`), after the ASCII units' 128 and the index
+/// strings'.
+pub(crate) const STATIC_NAME_STRINGS: usize = 128 + INDEX_STRINGS as usize;
+
 /// The canonical decimal string of array index `index` (ECMA-262 Number::toString), shared for
 /// indices below [`INDEX_STRINGS`]. Engine strings are immutable values; an interned one has no
-/// spare capacity, so an append to it copies.
+/// spare capacity, so an append to it copies. An interned one carries its index's key
+/// (`lstr::KEY_MARK`).
 pub(crate) fn index_lstr(index: u32) -> crate::lstr::LStr {
     if index >= INDEX_STRINGS {
         return crate::lstr::LStr::from(index.to_string().as_str());
     }
     crate::value::interned_string(128 + index as usize, || {
-        crate::lstr::LStr::from(index.to_string().as_str())
+        let string = crate::lstr::LStr::from(index.to_string().as_str());
+        string.mark_key(crate::atom::PropKey::index(index).word());
+        string
     })
 }
 

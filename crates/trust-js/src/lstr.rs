@@ -94,6 +94,14 @@ const CAP_BITS: u32 = TWO_BYTE - 1;
 // The JIT's codePointAt template recognizes a view by it, and reads a flat buffer's width from
 // ASCII_HINT, so that a `cap` without the hint and other than this is a flat two-byte buffer.
 pub(crate) const VIEW_CAP: u32 = ASCII_HINT - 1;
+/// The top bit of a flat buffer's frontier: the string is the value of one property key (a heap
+/// atom, a heap's copy of a static name, a canonical index string), whose word
+/// (`atom::PropKey::word`) the frontier's other bits hold, so that ToPropertyKey of the string
+/// reads the key in place, as V8 reads an internalized string's, SpiderMonkey an atom's and JSC an
+/// atom string's. Only exact strings carry it: no append writes into one, and an in-place append,
+/// which needs the string to end at its buffer's frontier, finds that a marked frontier is no
+/// string's end and copies (see [`LStr::append_units_in_place`]). A view's frontier is unused (0).
+const KEY_MARK: usize = 1 << 63;
 /// Byte offset of a view's flat owner (a string cell's address), for the JIT's codePointAt
 /// template.
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
@@ -473,6 +481,23 @@ impl LStr {
     /// is ever written past its units (see [`LStr::is_exact`]).
     pub(crate) fn exact(units: Units<'_>) -> LStr {
         LStr::from_units_at_width(units)
+    }
+
+    /// The word of the property key this string is the value of, if it carries one (see
+    /// [`KEY_MARK`]).
+    #[inline(always)]
+    pub(crate) fn key_word(&self) -> Option<u64> {
+        let frontier = self.hdr().frontier.get();
+        (frontier & KEY_MARK != 0).then_some((frontier & !KEY_MARK) as u64)
+    }
+
+    /// Mark this exact string as the value of the property key whose word is `word` (see
+    /// [`KEY_MARK`]): its own atom, a static name's, or an index's. Once marked, a string stays
+    /// marked for its life.
+    pub(crate) fn mark_key(&self, word: u64) {
+        debug_assert!(self.is_exact(), "only an exact string carries a key");
+        debug_assert_eq!(word as usize & KEY_MARK, 0);
+        self.hdr().frontier.set(KEY_MARK | word as usize);
     }
 
     /// Whether this is a flat buffer with no room past its units, which no append writes into,

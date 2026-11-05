@@ -234,6 +234,16 @@ impl PropKey {
         }
     }
 
+    /// The key whose value `string` is, if it carries one (see `lstr::KEY_MARK`): ToPropertyKey
+    /// of the string without its text, as an internalized string's in V8.
+    #[inline(always)]
+    pub(crate) fn of_marked(string: &LStr) -> Option<PropKey> {
+        // SAFETY: a mark holds a key's word (`LStr::mark_key`), which is never 0.
+        string
+            .key_word()
+            .map(|word| PropKey(unsafe { NonZeroU64::new_unchecked(word) }))
+    }
+
     /// The active heap's existing key of engine text `text` (see [`PropKey::lookup`]).
     #[inline]
     pub(crate) fn lookup_text(text: &str) -> Option<PropKey> {
@@ -598,6 +608,17 @@ impl AtomTable {
 
     fn insert(&mut self, slot: usize, hash: u32, string: LStr) -> Atom {
         let atom = Atom(string);
+        // A heap atom is the value of its text's key (see `lstr::KEY_MARK`): its own, or an
+        // index's. Text that begins with NUL is a Symbol's key or an escaped one, whose value is
+        // another string (`Interp::property_key_string`): no mark.
+        let units = string.units();
+        if units.get(0) != Some(0) {
+            let key = match canonical_index(units) {
+                Some(index) => PropKey::index(index),
+                None => PropKey::atom(atom),
+            };
+            string.mark_key(key.word());
+        }
         self.slots[slot] = Slot {
             hash,
             atom: Some(atom),
@@ -746,6 +767,23 @@ static STATIC_BLOCK: StaticBlock = StaticBlock(std::cell::UnsafeCell::new({
     }
     block
 }));
+
+/// The active heap's string value of the static name `atom`: one marked copy per heap (see
+/// `lstr::KEY_MARK`), made on first use and kept for the heap's life
+/// ([`crate::value::interned_string`]), as JSC keeps its common identifiers per VM. A static name
+/// lives outside every heap, so it is never a Value itself.
+pub(crate) fn static_name_string(atom: Atom) -> LStr {
+    debug_assert!(atom.is_static());
+    let offset = atom.0.as_ptr() as usize - STATIC_BLOCK.0.get() as usize;
+    let index = STATIC_OFFSETS
+        .binary_search(&offset)
+        .expect("a static name begins at its offset");
+    crate::value::interned_string(crate::jstr::STATIC_NAME_STRINGS + index, || {
+        let string = LStr::exact(atom.0.units());
+        string.mark_key(PropKey::atom(atom).word());
+        string
+    })
+}
 
 /// The static names' atoms, in [`STATIC_NAMES`] order.
 fn static_atoms() -> impl Iterator<Item = Atom> {
@@ -972,5 +1010,46 @@ mod tests {
         assert!(key == names::LENGTH.key() && key.as_atom() == Some(names::LENGTH.atom()));
         assert!(PropKey::lookup(&table, Units::Ascii(b"never made")).is_none());
         assert!(PropKey::index(5) != PropKey::from_units(&mut table, Units::Ascii(b"5x")));
+    }
+
+    /// A heap atom, a heap's copy of a static name and a canonical index string are each the
+    /// value of one key, which they carry (`lstr::KEY_MARK`); a copy of an atom's text, a
+    /// Symbol's key and an escaped key carry none. An append to a marked string copies it and
+    /// leaves it as it was.
+    #[test]
+    fn key_strings_carry_their_keys() {
+        let mut table = AtomTable::default();
+        for text in ["mark", "", "wïde"] {
+            let atom = table.atomize(Units::Utf16(&wide(text)));
+            assert!(
+                PropKey::of_marked(&atom.as_lstr()) == Some(PropKey::atom(atom)),
+                "{text:?}"
+            );
+            assert!(PropKey::of_marked(&LStr::from(text)).is_none(), "{text:?}");
+        }
+        // Text that spells an index is that index's key, even made an atom.
+        let digits = table.atomize(Units::Ascii(b"17"));
+        assert!(PropKey::of_marked(&digits.as_lstr()) == Some(PropKey::index(17)));
+        for text in ["\u{0}12", "\u{0}\u{0}escaped"] {
+            let atom = table.atomize(Units::Utf16(&wide(text)));
+            assert!(PropKey::of_marked(&atom.as_lstr()).is_none(), "{text:?}");
+        }
+        let atom = table.atomize(Units::Ascii(b"left"));
+        let mut joined = atom.as_lstr();
+        joined.append_or_replace(&LStr::from(" right"));
+        assert!(!LStr::ptr_eq(&joined, &atom.as_lstr()) && joined == *"left right");
+        assert!(atom.as_lstr() == *"left" && PropKey::of_marked(&joined).is_none());
+        assert!(PropKey::of_marked(&atom.as_lstr()) == Some(PropKey::atom(atom)));
+        // A static name's value is its heap's one marked copy; a small index's, its interned
+        // string.
+        let length = static_name_string(names::LENGTH.atom());
+        assert!(LStr::ptr_eq(
+            &length,
+            &static_name_string(names::LENGTH.atom())
+        ));
+        assert!(length == *"length" && PropKey::of_marked(&length) == Some(names::LENGTH.key()));
+        let five = crate::jstr::index_lstr(5);
+        assert!(five == *"5" && PropKey::of_marked(&five) == Some(PropKey::index(5)));
+        assert!(PropKey::of_marked(&crate::jstr::index_lstr(5000)).is_none());
     }
 }
