@@ -13787,3 +13787,36 @@ Checks at f63528c2 (main's 83a24a43 with this commit):
   TRUST_JS_GC_INCREMENTAL=force, TRUST_JS_GC_VERIFY=1; a dev runner at f63528c2): the subset of 13
   directories, 2,603/2,603 in the default tier and 2,603/2,603 at TRUST_JS_TIER=jit with
   threshold 0 (impl/t262stress s3r-*).
+
+### W6 step 3's fix: a preclean flushes the allocation cursors first (record, 2026-11-05)
+
+7ead16a2 (p2-w6-s3fix, an agent's, on main 0ffdedcb; landed by fast-forward). A use-after-free
+on main e8cd037d (step 3) to this fix with TRUST_JS_GC_INCREMENTAL on, the cycle off by default:
+a preclean takes a young page's cards by walking its marked cells up to the page's next_unused,
+which only a cursor's move to another bitmap word or a flush (a collection's start, the final
+pause) brings up to date; slices never flushed, so a cell allocated in the cursor's current word
+since its last refill, traced by the cycle and then written by the program, was skipped while its
+card was cleared, and the final pause swept what only its new edge reached (Octane TypeScript
+crashed once in about 36 runs of steps 3 and 4: SEGV_MAPERR in Object::trace_gc_fields at a task
+boundary's collection). The fix: Heap::preclean calls flush_cursors() first (the final pause's
+final_marking already flushed). Test:
+a_preclean_rescans_a_written_cell_allocated_since_the_cursors_were_flushed builds exactly that
+cell; it fails on main and passes with the fix. Why the gates missed it: allocation under
+TRUST_JS_GC_STRESS takes the slow path, which flushes at every allocation, so next_unused was never
+stale under stress; under force the unit tests precleaned rarely; and the cycle on at
+TRUST_JS_GC_INCREMENTAL=1 ran only in release builds, without verification. Checks at 7ead16a2:
+lib 2,815/2,815 by default and under force; clippy -D warnings x3; zombie 2,596 and clippy x3;
+the Test262 subset under force, stress 100 (every 2nd major) and verification 2,603/2,603 in both
+tiers; 18 TypeScript runs with the cycle on without a crash (the diagnosis rests on the core dump
+and the test). The verification that would have caught it follows as its own commit (the next
+record): forced precleaning at every slice end, checks where the class begins (no cell past the
+young walk's bound; each cycle take of the cards against a walk of the page's marks under
+TRUST_JS_GC_VERIFY), and a gate run of Test262 under force with verification and small budgets,
+no stress, so allocation takes the fast path as in production (75 tests catch the unfixed code).
+The every-slice barrier walk (the coordinator's first proposal) was measured and not taken: it is
+quadratic under force (the 44 cycle tests 929 s against 4.2 s), caught nothing beyond the sampled
+walk on the unfixed code, and no exemplar verifies after every increment (V8's
+FullMarkingVerifier once marking has finished, src/heap/mark-compact.cc:840-847; SpiderMonkey's
+IncrementalMarkingValidator as marking ends, js/src/gc/Sweeping.cpp:2004-2005, its pre-barrier
+verifier sampled, js/src/gc/Verifier.cpp:468-486; JSC's verifyGC once marking has finished,
+heap/Collector.cpp:716-719).
