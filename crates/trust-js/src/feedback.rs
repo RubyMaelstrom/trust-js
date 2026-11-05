@@ -761,12 +761,15 @@ pub(crate) struct FeedbackVector {
     detailed_enabled: bool,
     /// The always-on records (W4, feedback-schema.txt section 5): one word a bytecode pc, the
     /// value record's (step 3) or the element record's (step 4) by the operation, made at the
-    /// chunk's first record, so a chunk that never records holds none.
+    /// chunk's first record, so a chunk that never records holds none. A transformed chunk's
+    /// words hold the bits it has forwarded to its baseline sites, which filter its records
+    /// (see [`FeedbackVector::record`]); they are no record, and [`FeedbackVector::record_word`]
+    /// reads none of them.
     record: OnceCell<Box<[Cell<u32>]>>,
     /// The chunk's operation count, the record's length.
     record_len: u32,
     /// A transformed chunk's map to the baseline sites its operations came from (W4 step 7):
-    /// its records and detailed observations go through it, and its own words stay empty.
+    /// its records and detailed observations go through it.
     through: Option<Box<RecordMap>>,
     /// The feedback census's state for this vector's chunk (W4 step 2; None unless
     /// TRUST_JS_FEEDBACK_CENSUS is set).
@@ -895,27 +898,38 @@ impl FeedbackVector {
     /// OR `bits` into the record of the operation at `pc`, storing only when the word changes
     /// (W4 steps 3 and 4). The record's layout per operation kind is feedback-schema.txt's
     /// section 5; callers write it only on the VM's paths and generated code's miss paths.
+    ///
+    /// A transformed chunk's record goes to its operation's baseline site, through the record
+    /// map, only when it adds a bit to those this chunk has forwarded for the operation, which
+    /// the chunk's own word keeps. Nothing clears a record word (this is their only writer), so
+    /// a forwarded bit stays at the baseline site and a recompile there reads what it would
+    /// without the filter; a record that adds nothing costs the first stage's load and compare,
+    /// not the map's chase to the baseline vector.
     #[inline]
     pub(crate) fn record(&self, pc: usize, bits: u32) {
         #[cfg(feature = "architecture-diagnostics")]
         if let Some(census) = self.census.as_deref() {
             census.count_record(pc);
         }
-        if let Some(map) = self.through.as_deref() {
-            if let Some((chunk, pc)) = map.target(pc) {
-                chunk.feedback_vector().record(pc, bits);
-            }
-            return;
-        }
         let words = self
             .record
             .get_or_init(|| (0..self.record_len).map(|_| Cell::new(0)).collect());
-        if let Some(cell) = words.get(pc) {
-            let old = cell.get();
-            let new = old | bits;
-            if new != old {
-                cell.set(new);
+        let fresh = match words.get(pc) {
+            Some(cell) => {
+                let old = cell.get();
+                let new = old | bits;
+                if new != old {
+                    cell.set(new);
+                }
+                new != old
             }
+            None => true,
+        };
+        if !fresh {
+            return;
+        }
+        if let Some((chunk, pc)) = self.through.as_deref().and_then(|map| map.target(pc)) {
+            chunk.feedback_vector().record(pc, bits);
         }
     }
 
@@ -935,9 +949,13 @@ impl FeedbackVector {
             .is_some_and(|word| word.get() & bits == bits)
     }
 
-    /// The record of the operation at `pc`: 0 where nothing was recorded.
+    /// The record of the operation at `pc`: 0 where nothing was recorded, and in a transformed
+    /// chunk, whose records are its baseline sites'.
     #[cfg_attr(not(any(test, feature = "architecture-diagnostics")), allow(dead_code))]
     pub(crate) fn record_word(&self, pc: usize) -> u32 {
+        if self.through.is_some() {
+            return 0;
+        }
         self.record
             .get()
             .and_then(|words| words.get(pc))

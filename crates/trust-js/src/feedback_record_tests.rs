@@ -69,6 +69,7 @@ fn record(engine: &mut Engine, name: &str, which: impl Fn(&Op) -> bool) -> (u32,
 const INT32: u32 = C::NumberInt32.bit();
 const DOUBLE: u32 = C::NumberDouble.bit();
 const STRING: u32 = C::String.bit();
+const BOOLEAN: u32 = C::Boolean.bit();
 
 #[test]
 fn the_vm_records_every_class_it_executes() {
@@ -687,9 +688,39 @@ fn an_inlined_sites_record_reaches_its_baseline_site() {
         assert_eq!(
             transformed.feedback_record(pc),
             0,
-            "the transformed words stay empty"
+            "a transformed chunk reads no record of its own"
         );
     }
+}
+
+#[test]
+fn a_transformed_site_forwards_each_new_bit_to_its_baseline_site() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function add(a, b) { return a + b; }
+         function caller(x) { return add(x, 1); }
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(i); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    assert!(transformed.feedback_vector().record_map().is_some());
+    // The spliced Add's misses: a String operand, repeated (the repeat adds no bit and goes no
+    // further than the transformed chunk's own word), then a Boolean, which still reaches the
+    // baseline site after the filtered records.
+    eval(&mut engine, "caller('s'); caller('t'); caller('u');");
+    assert_eq!(
+        record(&mut engine, "add", |op| matches!(op, Op::Add)),
+        (STRING, INT32, STRING)
+    );
+    eval(&mut engine, "caller(true); caller(false);");
+    assert_eq!(
+        record(&mut engine, "add", |op| matches!(op, Op::Add)),
+        (STRING | BOOLEAN, INT32, STRING | INT32),
+        "a new bit reaches the baseline site"
+    );
 }
 
 #[test]
