@@ -236,6 +236,209 @@ round()
     }
 }
 
+/// Reflect.get, has and set from generated code, which answers a call on an Object with a key
+/// String that carries its key without the native when the resolution runs no author code
+/// (`Interp::reflect_resolved`). The keys are such Strings (`K`, a property's key as Object.keys
+/// gives it back; a literal is not one) but where a case says otherwise. Reads: own, inherited,
+/// absent and index properties, an Array's `length`, holes and methods, getters (with and
+/// without a receiver), a Proxy target, a frozen target, keys that carry no key (a literal, a
+/// concatenation, a Symbol), a property that becomes an accessor and then moves to the
+/// prototype, and the TypeErrors of a primitive target. Stores: an own property through the
+/// target and through a Proxy of it without traps, the Proxies whose defineProperty and
+/// getOwnPropertyDescriptor traps OrdinarySet calls, other receivers (an object, another
+/// target's Proxy, a revoked Proxy, a primitive), creation (refused when not extensible), the
+/// chain's read-only property, setter and writable data, read-only and accessor own
+/// properties, elements and Arrays' `length` (an append, a hole, truncation, an invalid length,
+/// a String, a read-only `length`), a typed array; and reactive Arrays and objects as Vue's
+/// handlers make them, whose traps call Reflect with their own key.
+const REFLECTS: &str = r#"
+function marked(names) {
+  var o = {};
+  for (var n = 0; n < names.length; n++) o[names[n]] = 0;
+  var m = {};
+  Object.keys(o).forEach(function (k) { m[k] = k; });
+  return m;
+}
+var K = marked(['own', 'inherited', 'missing', 'viaGetter', '0', '1', '2', '3', '5', '6', 'length', 'extra', 'push',
+  'description', 'toString', 'x', 'a', 'fresh', 'yes', 'no', 'roUp', 'setUp', 'dataUp']);
+function gets() {
+  var proto = { inherited: 'i', get viaGetter() { return 'g:' + (this === receiver ? 'r' : 'o'); } };
+  var o = Object.create(proto); o.own = 'o'; o[3] = 'three';
+  var receiver = { tag: 'receiver' };
+  var arr = [10, , 30]; arr.extra = 'e';
+  var key = 'ow' + 'n', sym = Symbol('s'); o[sym] = 'symbol';
+  var p = new Proxy({ own: 'proxied' }, { get(t, k, r) { return 'trap:' + String(k); } });
+  var frozen = Object.freeze({ own: 'frozen' });
+  function g2(t, k) { return Reflect.get(t, k); }
+  function g3(t, k, r) { return Reflect.get(t, k, r); }
+  var out = [];
+  for (var n = 0; n < 200; n++) {
+    var row = [g2(o, K.own), g2(o, K.inherited), g2(o, K.missing), g3(o, K.viaGetter, receiver), g2(o, K.viaGetter),
+      g2(o, K['3']), g2(arr, K.length), g2(arr, K['0']), g2(arr, K['1']), g2(arr, K['2']), g2(arr, K.extra),
+      g2(arr, K.push) === Array.prototype.push, g2(o, key), g2(o, sym), g2(p, K.own), g3(p, K.x, o), g2(frozen, K.own),
+      g2(o, K.description), g2(o, K.toString) === Object.prototype.toString, g2(o, 'own'), g2(arr, '2')];
+    if (n === 199) out = row;
+  }
+  var errors = [];
+  try { Reflect.get(1, K.x); } catch (e) { errors.push(e.constructor.name); }
+  try { g2(null, K.x); } catch (e) { errors.push(e.constructor.name); }
+  return out.join(',') + ';' + errors.join(',');
+}
+function hases() {
+  var proto = { inherited: 1 }, o = Object.create(proto); o.own = 1; o[5] = 1;
+  var arr = [1, , 3];
+  var p = new Proxy({}, { has(t, k) { return k === 'yes'; } });
+  function h(t, k) { return Reflect.has(t, k); }
+  var out = [];
+  for (var n = 0; n < 200; n++) {
+    var row = [h(o, K.own), h(o, K.inherited), h(o, K.missing), h(o, K['5']), h(o, K['6']), h(arr, K['0']), h(arr, K['1']),
+      h(arr, K['2']), h(arr, K.length), h(arr, K.push), h(p, K.yes), h(p, K.no), h(o, K.toString), h(o, 'ow' + 'n'), h(o, 'own')];
+    if (n === 199) out = row;
+  }
+  var errors = [];
+  try { h(1, K.x); } catch (e) { errors.push(e.constructor.name); }
+  return out.join(',') + ';' + errors.join(',');
+}
+function mutations() {
+  var o = { a: 1 }, t = 0;
+  function g(x) { return Reflect.get(x, K.a); }
+  for (var n = 0; n < 100; n++) t += g(o);
+  Object.defineProperty(o, 'a', { get() { return 100; }, configurable: true });
+  for (var n = 0; n < 100; n++) t += g(o);
+  delete o.a; Object.prototype.a = 7;
+  for (var n = 0; n < 100; n++) t += g(o);
+  delete Object.prototype.a;
+  return t + ':' + g(o);
+}
+function sets() {
+  var out = [], log = [];
+  var o = { a: 0 }, plain = new Proxy(o, {}), getOnly = new Proxy(o, { get(t, k, r) { return Reflect.get(t, k, r); } });
+  var defining = new Proxy(o, { defineProperty(t, k, d) { log.push('define:' + k + '=' + d.value); return Reflect.defineProperty(t, k, d); } });
+  var describing = new Proxy(o, { getOwnPropertyDescriptor(t, k) { log.push('describe:' + k); return Reflect.getOwnPropertyDescriptor(t, k); } });
+  var other = { a: 'other' }, otherProxy = new Proxy(other, {});
+  var revocable = Proxy.revocable(o, {}); revocable.revoke();
+  function s3(t, k, v) { return Reflect.set(t, k, v); }
+  function s4(t, k, v, r) { return Reflect.set(t, k, v, r); }
+  var t = 0;
+  for (var n = 0; n < 200; n++) t += s3(o, K.a, n) + s4(o, K.a, n, o) + s4(o, K.a, n + 1, plain) + s4(o, K.a, n + 2, getOnly);
+  out.push(t + ':' + o.a);
+  for (var n = 0; n < 2; n++) out.push(s4(o, K.a, 'd' + n, defining), s4(o, K.a, 'g' + n, describing));
+  out.push(log.join('/') + ':' + o.a);
+  out.push(s4(o, K.a, 'r', other) + ':' + o.a + ':' + other.a);
+  out.push(s4(o, K.a, 'q', otherProxy) + ':' + o.a + ':' + other.a);
+  try { s4(o, K.a, 'x', revocable.proxy); } catch (e) { out.push(e.constructor.name); }
+  out.push(s4(o, K.a, 'prim', 1));
+  var fresh = {}, closed = Object.preventExtensions({});
+  out.push(s3(fresh, K.fresh, 1) + ':' + s4(fresh, K.x, 2, new Proxy(fresh, {})) + ':' + Object.keys(fresh).join('|') + ':' +
+    s3(closed, K.fresh, 1) + ':' + Object.keys(closed).length);
+  var proto = { dataUp: 'proto' };
+  Object.defineProperty(proto, 'roUp', { value: 'ro', writable: false });
+  Object.defineProperty(proto, 'setUp', { set(v) { this.tagged = v; } });
+  var child = Object.create(proto), childProxy = new Proxy(child, {});
+  out.push([s3(child, K.roUp, 1), s3(child, K.setUp, 'set'), child.tagged, s4(child, K.setUp, 'viaProxy', childProxy), child.tagged,
+    s3(child, K.dataUp, 'own'), child.dataUp, proto.dataUp].join(','));
+  var frozen = Object.freeze({ a: 1 }), acc = { get a() { return 'acc'; }, set a(v) { log.push('acc:' + v); } };
+  out.push(s3(frozen, K.a, 2) + ':' + frozen.a + ':' + s3(acc, K.a, 'v') + ':' + log[log.length - 1]);
+  var arr = [0, 1, 2], arrProxy = new Proxy(arr, {});
+  out.push([s3(arr, K['1'], 'one'), s4(arr, K['3'], 'three', arrProxy), s4(arr, K.length, 4, arrProxy), s3(arr, K['5'], 'five'),
+    arr.length, s3(arr, K.length, 2), arr.length, arr.join('|'), s3(arr, K.length, 3), arr.length, String(arr[2])].join(','));
+  try { s3(arr, K.length, 1.5); } catch (e) { out.push(e.constructor.name + ':' + arr.length); }
+  out.push(s3(arr, K.length, '1') + ':' + arr.length);
+  var fixed = [1, 2]; Object.defineProperty(fixed, 'length', { writable: false });
+  out.push(s3(fixed, K.length, 2) + ':' + s3(fixed, K['2'], 3) + ':' + fixed.length);
+  var ta = new Uint8Array(2), sym = Symbol('s'), so = {};
+  out.push(s3(ta, K['1'], 7) + ':' + ta[1] + ':' + s3(ta, K['5'], 7) + ':' + s3(so, 'a', 1) + ':' + s3(so, sym, 2) + ':' + so.a + ':' + so[sym]);
+  try { s3(1, K.a, 1); } catch (e) { out.push(e.constructor.name); }
+  return out.join(';');
+}
+function reactive() {
+  var log = [];
+  var handler = {
+    get(t, k, r) { return Reflect.get(t, k, r); },
+    set(t, k, v, r) { log.push(String(k)); return Reflect.set(t, k, v, r); },
+    has(t, k) { return Reflect.has(t, k); }
+  };
+  var list = new Proxy([], handler), sum = 0;
+  for (var n = 0; n < 100; n++) list.push(n);
+  for (var n = 0; n < 50; n++) list.pop();
+  list.forEach(function (v) { sum += v; });
+  var obj = new Proxy({ count: 0 }, handler);
+  for (var n = 0; n < 100; n++) obj.count++;
+  return list.length + ':' + sum + ':' + obj.count + ':' + log.length + ':' + ('count' in obj) + ':' + (5 in list) + ':' + (60 in list);
+}
+[gets(), hases(), mutations(), sets(), reactive()].join('\n')
+"#;
+
+const REFLECT_RESULTS: &str = "\
+o,i,,g:r,g:o,three,3,10,,30,e,true,o,symbol,trap:own,trap:x,frozen,,true,o,30;TypeError,TypeError\n\
+true,true,false,true,false,true,false,true,true,true,true,false,true,true,true;TypeError\n\
+10800:undefined\n\
+800:201;true;true;true;true;define:a=d0/describe:a/define:a=d1/describe:a:g1;true:g1:r;true:g1:q;TypeError;false;\
+true:true:fresh|x:false:0;false,true,set,true,viaProxy,true,own,proto;false:1:true:acc:v;\
+true,true,true,true,6,true,2,0|one,true,3,undefined;RangeError:3;true:1;false:false:2;true:7:true:true:true:1:2;TypeError\n\
+50:1225:100:350:true:true:false";
+
+#[test]
+fn reflect_calls_agree_across_tiers() {
+    let runs = [
+        (Tier::Interp, false),
+        (Tier::Bytecode, false),
+        (Tier::Jit, false),
+        (Tier::Jit, true),
+    ];
+    let stressed = crate::gc_test::stress_active();
+    for (tier, warm) in runs.into_iter().skip(if stressed { 2 } else { 0 }) {
+        let mut engine = engine(tier, warm);
+        let before = crate::interpreter::TEST_REFLECT_RESOLVED.with(std::cell::Cell::get);
+        assert_eq!(
+            eval(&mut engine, REFLECTS),
+            REFLECT_RESULTS,
+            "{tier:?}, warm {warm}"
+        );
+        if tier == Tier::Jit {
+            assert!(
+                crate::interpreter::TEST_REFLECT_RESOLVED.with(std::cell::Cell::get) > before,
+                "{tier:?}, warm {warm}: calls answered on their operands"
+            );
+            // Each kind of call is answered: 300 of each, all but a call cache's warm-up.
+            for (script, result) in RESOLVED_KINDS {
+                let before = crate::interpreter::TEST_REFLECT_RESOLVED.with(std::cell::Cell::get);
+                assert_eq!(eval(&mut engine, script), *result, "{tier:?}, warm {warm}");
+                let resolved =
+                    crate::interpreter::TEST_REFLECT_RESOLVED.with(std::cell::Cell::get) - before;
+                assert!(
+                    resolved >= 250,
+                    "{tier:?}, warm {warm}: {resolved} of {script} answered on their operands"
+                );
+            }
+        }
+    }
+}
+
+/// One kind of Reflect call 300 times, with a key that carries its key, through a Proxy of the
+/// target as Vue's traps pass it, each answered on its operands once the call cache proves the
+/// native.
+const RESOLVED_KINDS: &[(&str, &str)] = &[
+    (
+        "(function () { var o = { a: 1 }, p = new Proxy(o, {}), k = Object.keys(o)[0], t = 0; \
+         function g(t, k, r) { return Reflect.get(t, k, r); } \
+         for (var n = 0; n < 300; n++) t += g(o, k, p); return t; })()",
+        "300",
+    ),
+    (
+        "(function () { var a = [1, 2], k = Object.keys(a)[1], t = 0; \
+         function h(t, k) { return Reflect.has(t, k); } \
+         for (var n = 0; n < 300; n++) t += h(a, k); return t; })()",
+        "300",
+    ),
+    (
+        "(function () { var o = { a: 0 }, p = new Proxy(o, {}), k = Object.keys(o)[0]; \
+         function s(t, k, v, r) { return Reflect.set(t, k, v, r); } \
+         for (var n = 0; n < 300; n++) s(o, k, n, p); return o.a; })()",
+        "299",
+    ),
+];
+
 /// One handler's trap and a throwing trap, read through each receiver form.
 #[cfg(target_arch = "aarch64")]
 const FORMS: &str = r#"

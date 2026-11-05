@@ -162,14 +162,14 @@ fn other_targets_and_lists_keep_the_builtins() {
     );
 }
 
-/// `call_native_entry`'s class match (`native_entry_class`) and the native-entry hit's light
-/// check (`native_light_operands`) agree on every class but call's and apply's, which only the
-/// former forwards, for receivers and arguments of every kind the light classes test.
+/// `call_native_entry`'s class match (`native_entry_class`) and the native-entry hit's
+/// (`native_operands`) agree on every class but call's and apply's, which only the former
+/// forwards, for receivers and arguments of every kind the light classes test.
 #[test]
 fn native_entry_classes_agree_with_the_light_check() {
     use crate::bytecode::{
-        native_entry_class, native_light_operands, NativeEntryClass, INTRINSIC_FUNCTION_APPLY,
-        INTRINSIC_FUNCTION_CALL,
+        native_entry_class, native_light_operands, native_operands, NativeEntryClass,
+        NativeOperands, INTRINSIC_FUNCTION_APPLY, INTRINSIC_FUNCTION_CALL,
     };
     use crate::value::Value;
     let engine = Engine::new();
@@ -188,23 +188,29 @@ fn native_entry_classes_agree_with_the_light_check() {
         for this in &values {
             for args in &lists {
                 // SAFETY: a receiver and an argument window of initialized values.
-                let (class, light) = unsafe {
+                let (class, operands, light) = unsafe {
                     (
                         native_entry_class(intrinsic, this, args.as_ptr(), args.len()),
+                        native_operands(intrinsic, this, args.as_ptr(), args.len()),
                         native_light_operands(intrinsic, this, args.as_ptr(), args.len()),
                     )
                 };
+                assert_eq!(
+                    light,
+                    operands == NativeOperands::Light,
+                    "class {intrinsic}"
+                );
                 if matches!(
                     intrinsic,
                     INTRINSIC_FUNCTION_CALL | INTRINSIC_FUNCTION_APPLY
                 ) {
                     assert_eq!(class, NativeEntryClass::Forward, "class {intrinsic}");
-                    assert!(!light, "class {intrinsic}");
+                    assert_eq!(operands, NativeOperands::Boundary, "class {intrinsic}");
                 } else {
-                    let expected = if light {
-                        NativeEntryClass::Light
-                    } else {
-                        NativeEntryClass::Boundary
+                    let expected = match operands {
+                        NativeOperands::Light => NativeEntryClass::Light,
+                        NativeOperands::Boundary => NativeEntryClass::Boundary,
+                        NativeOperands::Reflect => NativeEntryClass::Reflect,
                     };
                     assert_eq!(class, expected, "class {intrinsic}");
                 }

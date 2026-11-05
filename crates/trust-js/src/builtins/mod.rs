@@ -1694,6 +1694,9 @@ fn declare_template_natives() {
         (nf_number_is_nan, INTRINSIC_IS_NAN),
         (nf_from_char_code, INTRINSIC_FROM_CHAR_CODE),
         (nf_reflect_apply, INTRINSIC_REFLECT_APPLY),
+        (reflect::nf_reflect_get, INTRINSIC_REFLECT_GET),
+        (reflect::nf_reflect_has, INTRINSIC_REFLECT_HAS),
+        (reflect::nf_reflect_set, INTRINSIC_REFLECT_SET),
     ] {
         declare_native(f, class);
     }

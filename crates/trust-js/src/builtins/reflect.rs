@@ -3,59 +3,71 @@
 use super::*;
 use crate::value::ValueView;
 
+/// Reflect.get (ECMA-262 §28.1.5); its calls from generated code and the call caches may be
+/// answered without it (`bytecode::INTRINSIC_REFLECT_GET`).
+pub(super) fn nf_reflect_get(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let target = arg(a, 0);
+    let ValueView::Obj(object) = target.view() else {
+        return Err(i.make_error("TypeError", "Reflect.get called on non-object"));
+    };
+    // Reflect.get(target, key, receiver) — the receiver is the third argument.
+    let receiver = if a.len() > 2 { arg(a, 2) } else { target };
+    let key = arg(a, 1);
+    match key.view() {
+        // ToPropertyKey of a String is itself: an ordinary chain answers through the property
+        // ICs, by the key's atom, as `object[key]` would.
+        ValueView::Str(name) => {
+            let text = crate::value::encode_lstr_key(&name);
+            // A marked String carries its key (see `lstr::KEY_MARK`): no lookup of its text.
+            let atom = crate::atom::PropKey::of_marked(&name);
+            if let Some(result) = i.get_named_cached(&object, &text, atom, &receiver) {
+                return ab(result);
+            }
+            reflect_ordinary_get(i, &target, &text, &receiver)
+        }
+        _ => {
+            let text = property_key_text(i, &key)?;
+            reflect_ordinary_get(i, &target, &text, &receiver)
+        }
+    }
+}
+
+/// Reflect.has (ECMA-262 §28.1.9); its calls from generated code and the call caches may be
+/// answered without it (`bytecode::INTRINSIC_REFLECT_HAS`).
+pub(super) fn nf_reflect_has(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let target = arg(a, 0);
+    if !matches!((target).view(), ValueView::Obj(_)) {
+        return Err(i.make_error("TypeError", "Reflect.has called on non-object"));
+    }
+    // HasProperty(target, ? ToPropertyKey(key)) is the `in` operator's algorithm once its right
+    // operand is an Object, trap-aware for a Proxy on the chain.
+    Ok(Value::Bool(ab(i.in_operator(&arg(a, 1), &target))?))
+}
+
+/// Reflect.set (ECMA-262 §28.1.13); its calls from generated code and the call caches may be
+/// answered without it (`bytecode::INTRINSIC_REFLECT_SET`).
+pub(super) fn nf_reflect_set(i: &mut Interp, _t: Value, a: &[Value]) -> Result<Value, Value> {
+    let target = arg(a, 0);
+    let ValueView::Obj(object) = target.view() else {
+        return Err(i.make_error("TypeError", "Reflect.set called on non-object"));
+    };
+    let key = arg(a, 1);
+    let value = arg(a, 2);
+    let receiver = if a.len() > 3 { arg(a, 3) } else { target };
+    // ToPropertyKey of a String is itself.
+    if let ValueView::Str(name) = key.view() {
+        let text = crate::value::encode_lstr_key(&name);
+        return reflect_set(i, &object, &text, value, &receiver);
+    }
+    let text = property_key_text(i, &key)?;
+    reflect_set(i, &object, &text, value, &receiver)
+}
+
 pub(super) fn install_reflect(it: &mut Interp) {
     let r = it.new_object();
-    it.def_method(&r, "get", 2, |i, _t, a| {
-        let target = arg(a, 0);
-        let ValueView::Obj(object) = target.view() else {
-            return Err(i.make_error("TypeError", "Reflect.get called on non-object"));
-        };
-        // Reflect.get(target, key, receiver) — the receiver is the third argument.
-        let receiver = if a.len() > 2 { arg(a, 2) } else { target };
-        let key = arg(a, 1);
-        match key.view() {
-            // ToPropertyKey of a String is itself: an ordinary chain answers through the property
-            // ICs, by the key's atom, as `object[key]` would.
-            ValueView::Str(name) => {
-                let text = crate::value::encode_lstr_key(&name);
-                // A marked String carries its key (see `lstr::KEY_MARK`): no lookup of its text.
-                let atom = crate::atom::PropKey::of_marked(&name);
-                if let Some(result) = i.get_named_cached(&object, &text, atom, &receiver) {
-                    return ab(result);
-                }
-                reflect_ordinary_get(i, &target, &text, &receiver)
-            }
-            _ => {
-                let text = property_key_text(i, &key)?;
-                reflect_ordinary_get(i, &target, &text, &receiver)
-            }
-        }
-    });
-    it.def_method(&r, "set", 3, |i, _t, a| {
-        let target = arg(a, 0);
-        let ValueView::Obj(object) = target.view() else {
-            return Err(i.make_error("TypeError", "Reflect.set called on non-object"));
-        };
-        let key = arg(a, 1);
-        let value = arg(a, 2);
-        let receiver = if a.len() > 3 { arg(a, 3) } else { target };
-        // ToPropertyKey of a String is itself.
-        if let ValueView::Str(name) = key.view() {
-            let text = crate::value::encode_lstr_key(&name);
-            return reflect_set(i, &object, &text, value, &receiver);
-        }
-        let text = property_key_text(i, &key)?;
-        reflect_set(i, &object, &text, value, &receiver)
-    });
-    it.def_method(&r, "has", 2, |i, _t, a| {
-        let target = arg(a, 0);
-        if !matches!((target).view(), ValueView::Obj(_)) {
-            return Err(i.make_error("TypeError", "Reflect.has called on non-object"));
-        }
-        // HasProperty(target, ? ToPropertyKey(key)) is the `in` operator's algorithm once its
-        // right operand is an Object, trap-aware for a Proxy on the chain.
-        Ok(Value::Bool(ab(i.in_operator(&arg(a, 1), &target))?))
-    });
+    it.def_method(&r, "get", 2, nf_reflect_get);
+    it.def_method(&r, "set", 3, nf_reflect_set);
+    it.def_method(&r, "has", 2, nf_reflect_has);
     it.def_method(&r, "getOwnPropertyDescriptor", 2, |i, _t, a| {
         // ECMA-262 §28.1.7: TypeError for a non-object target, then ToPropertyKey exactly once,
         // then target.[[GetOwnProperty]](key) and FromPropertyDescriptor.

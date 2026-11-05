@@ -1393,6 +1393,10 @@ enum LegacyActivation {
 
 #[cfg(test)]
 thread_local! {
+    /// Reflect.get, has and set calls answered on their operands (`Interp::reflect_resolved`).
+    pub(crate) static TEST_REFLECT_RESOLVED: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     /// Natives [`Interp::call_native_light`] ran without the native-call boundary, for tests.
     pub(crate) static TEST_LIGHT_NATIVE_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
@@ -4294,6 +4298,19 @@ impl Default for StubEntry {
 /// Stub-cache capacity (power of two). 4096 × 24-byte entries = 96 KiB.
 const STUB_CACHE_SIZE: usize = 4096;
 const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
+
+/// Whether a named read of `name` is left to the general [[Get]] rather than the property ICs'
+/// resolution by key (see `Interp::get_named_cached`): long text, index-like or NUL-led text,
+/// `length` and `description`.
+fn named_read_uncached(name: &str) -> bool {
+    name.len() > COMPUTED_STUB_KEY_MAX_BYTES
+        || name == "length"
+        || name == "description"
+        || name
+            .as_bytes()
+            .first()
+            .is_some_and(|&byte| byte == 0 || byte.is_ascii_digit())
+}
 
 #[path = "property_read.rs"]
 mod property_read;
@@ -10169,6 +10186,193 @@ impl Interp {
         self.get_member_key(base, &text)
     }
 
+    /// Reflect.get(target, key[, receiver]), Reflect.has(target, key) or Reflect.set(target, key,
+    /// value[, receiver]) (`intrinsic`, the call cache's class of the native) answered on the
+    /// caller's operand window, without the native call, where that runs no author code (the
+    /// design note's fork 6; V8's optimizing tiers call its GetPropertyWithReceiver and
+    /// HasProperty builtins directly): a target that is an Object, a key that is a String
+    /// carrying its key (`lstr::KEY_MARK`: an atom, a static name's copy, a small index), and a
+    /// resolution along a chain of ordinary objects and Arrays that meets no accessor and no
+    /// other internal methods: the stub cache by the receiver's shape and the key (a
+    /// re-derivation fills it), an Array's `length`, or a plain element. `None` takes the
+    /// native, which does the rest (a TypeError, a getter or setter, a Proxy, a read-only
+    /// property, ToPropertyKey of anything else).
+    ///
+    /// # Safety
+    /// `args..args + argc` are initialized execution words.
+    pub(crate) unsafe fn reflect_resolved(
+        &mut self,
+        intrinsic: u8,
+        args: *const Value,
+        argc: usize,
+    ) -> Option<Value> {
+        let value = unsafe { self.reflect_resolution(intrinsic, args, argc) };
+        #[cfg(test)]
+        if value.is_some() {
+            TEST_REFLECT_RESOLVED.with(|count| count.set(count.get() + 1));
+        }
+        value
+    }
+
+    /// [`Interp::reflect_resolved`]'s resolution.
+    ///
+    /// # Safety
+    /// As [`Interp::reflect_resolved`].
+    #[inline(always)]
+    unsafe fn reflect_resolution(
+        &mut self,
+        intrinsic: u8,
+        args: *const Value,
+        argc: usize,
+    ) -> Option<Value> {
+        if argc < 2 {
+            return None;
+        }
+        // SAFETY: the caller's initialized window.
+        let (target, key) = unsafe { (*args, *args.add(1)) };
+        let object = target.as_obj()?;
+        let key = key.with_string(crate::atom::PropKey::of_marked).flatten()?;
+        match intrinsic {
+            crate::bytecode::INTRINSIC_REFLECT_HAS => Self::reflect_has_resolution(&object, key),
+            crate::bytecode::INTRINSIC_REFLECT_SET => {
+                if argc < 3 {
+                    return None;
+                }
+                // SAFETY: the caller's initialized window.
+                let (value, receiver) = unsafe { (*args.add(2), (argc > 3).then(|| *args.add(3))) };
+                self.reflect_set_resolution(&object, key, value, receiver)
+            }
+            _ => self.reflect_get_resolution(&object, key),
+        }
+    }
+
+    /// Reflect.get's resolution (ECMA-262 §28.1.5: target.[[Get]](key, receiver)) for a data
+    /// property, whose value does not depend on the Receiver.
+    fn reflect_get_resolution(&mut self, object: &Gc, key: crate::atom::PropKey) -> Option<Value> {
+        if let Some(index) = key.as_index() {
+            // An own element (a hole or a far key consults the chain: the native).
+            if !Self::plain_own_element_present(object, index) {
+                return None;
+            }
+            return self.fast_get_elem(object, f64::from(index));
+        }
+        if key == crate::atom::names::LENGTH.key() {
+            let body = object.borrow();
+            if !(body.ic_plain() && matches!(body.kind, ObjectKind::Array)) {
+                return None;
+            }
+            drop(body);
+            return Some(Value::Num(self.array_length(object) as f64));
+        }
+        let text = key.text();
+        if named_read_uncached(&text) {
+            return None;
+        }
+        self.ic_read_by_key(object, &text, Some(key))?.data()
+    }
+
+    /// Reflect.has's resolution (ECMA-262 §28.1.9: target.[[HasProperty]](key)).
+    fn reflect_has_resolution(object: &Gc, key: crate::atom::PropKey) -> Option<Value> {
+        if let Some(index) = key.as_index() {
+            return Self::plain_own_element_present(object, index).then_some(Value::Bool(true));
+        }
+        Self::ordinary_chain_has_key(object, &key.text(), Some(key)).map(Value::Bool)
+    }
+
+    /// Reflect.set's resolution (ECMA-262 §28.1.13: target.[[Set]](key, value, receiver)) where
+    /// OrdinarySet writes a data property of the target itself (see
+    /// [`Interp::reflect_set_receiver_forwards`]): an own writable data property's value, a
+    /// creation the chain allows, an element or an Array's `length` (ArraySetLength of a valid
+    /// length Number).
+    fn reflect_set_resolution(
+        &mut self,
+        object: &Gc,
+        key: crate::atom::PropKey,
+        value: Value,
+        receiver: Option<Value>,
+    ) -> Option<Value> {
+        // A typed array, a Proxy or another side-table object has its own [[Set]].
+        if !object.borrow().ic_plain() {
+            return None;
+        }
+        if let Some(receiver) = receiver {
+            if !self.reflect_set_receiver_forwards(object, receiver) {
+                return None;
+            }
+        }
+        if let Some(index) = key.as_index() {
+            return self
+                .fast_set_elem(object, f64::from(index), value)
+                .ok()
+                .map(|()| Value::Bool(true));
+        }
+        if key == crate::atom::names::LENGTH.key() {
+            let ValueView::Num(length) = value.view() else {
+                return None;
+            };
+            {
+                let body = object.borrow();
+                // A read-only `length` makes OrdinarySet false: the native's.
+                if !matches!(body.kind, ObjectKind::Array)
+                    || !body.props.length_property()?.writable()
+                {
+                    return None;
+                }
+            }
+            // ToUint32 and ToNumber of a Number run no code; an invalid length's RangeError is
+            // the native's.
+            if length != f64::from(length as u32) {
+                return None;
+            }
+            return crate::builtins::array_set_length_value(self, object, value)
+                .ok()
+                .map(Value::Bool);
+        }
+        let scratch = [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
+            crate::bytecode::PROP_IC_WAYS];
+        match self.try_ic_set::<false>(object, key, &value, &scratch[0]) {
+            IcSet::Stored => Some(Value::Bool(true)),
+            _ => None,
+        }
+    }
+
+    /// Whether OrdinarySet's steps on Reflect.set's Receiver (ECMA-262 §10.1.9.2
+    /// OrdinarySetWithOwnDescriptor, steps 2.c-e: its [[GetOwnProperty]] and
+    /// [[DefineOwnProperty]], or CreateDataProperty's) are the target's own: the receiver is the
+    /// target, or a Proxy of the target whose handler has neither a `getOwnPropertyDescriptor`
+    /// nor a `defineProperty` trap (§10.5.5 step 7 and §10.5.6 step 7 then forward to the
+    /// target), as the property ICs find on an ordinary handler's chain, without author code.
+    /// Vue's set trap passes its Proxy so.
+    fn reflect_set_receiver_forwards(&self, target: &Gc, receiver: Value) -> bool {
+        let Some(receiver) = receiver.as_obj() else {
+            return false;
+        };
+        if Gc::ptr_eq(&receiver, target) {
+            return true;
+        }
+        let Some((proxy_target, handler)) = crate::value::proxy_parts(&receiver) else {
+            return false;
+        };
+        // A revoked Proxy's handler is null: its TypeError is the native's.
+        let (Some(proxy_target), Some(handler)) = (proxy_target.as_obj(), handler.as_obj()) else {
+            return false;
+        };
+        Gc::ptr_eq(&proxy_target, target)
+            && [
+                PROXY_TRAP_GET_OWN_PROPERTY_DESCRIPTOR,
+                PROXY_TRAP_DEFINE_PROPERTY,
+            ]
+            .into_iter()
+            .all(|kind| {
+                let key = PROXY_TRAP_NAMES[kind].key();
+                self.ic_read_by_key(&handler, &key.text(), Some(key))
+                    .and_then(CachedGet::data)
+                    .is_some_and(|trap| {
+                        matches!(trap.view(), ValueView::Undefined | ValueView::Null)
+                    })
+            })
+    }
+
     /// [[Get]](P, Receiver) of `object` for a String key P whose engine text is `name`, resolved
     /// as a named read's helper resolves it when every object on the chain is one the property
     /// ICs read: the key's atom (text with none names no property) probes the megamorphic stub
@@ -10184,14 +10388,7 @@ impl Interp {
         atom: Option<crate::atom::PropKey>,
         receiver: &Value,
     ) -> Option<Result<Value, Abrupt>> {
-        if name.len() > COMPUTED_STUB_KEY_MAX_BYTES
-            || name == "length"
-            || name == "description"
-            || name
-                .as_bytes()
-                .first()
-                .is_some_and(|&byte| byte == 0 || byte.is_ascii_digit())
-        {
+        if named_read_uncached(name) {
             return None;
         }
         let key = atom.or_else(|| crate::atom::PropKey::lookup_text(name));
@@ -15638,6 +15835,14 @@ impl Interp {
                         )
                     };
                 }
+                // Reflect.get, has and set: answered on the operands when that runs no author
+                // code (see `Interp::reflect_resolved`).
+                crate::bytecode::NativeEntryClass::Reflect => {
+                    // SAFETY: the caller's window.
+                    if let Some(value) = unsafe { self.reflect_resolved(intrinsic, args, argc) } {
+                        return Ok(value);
+                    }
+                }
                 crate::bytecode::NativeEntryClass::Boundary => {}
             }
         }
@@ -15824,13 +16029,14 @@ impl Interp {
     }
 
     /// W3's item 2a: a native-entry hit whose class (`intrinsic`, see
-    /// [`crate::bytecode::native_light_operands`]) proves that the native runs no author code
+    /// [`crate::bytecode::native_operands`]) proves that the native runs no author code
     /// for these operands, makes no tail call and reaches no safepoint, run on the caller's
     /// window without [`Interp::call_native_committed_with`]'s bookkeeping. Nothing collects
     /// before it returns, so the window needs no root of its own, and nothing in it can be
     /// interrupted, run a host callback or leave a tail call. The construct state is cleared
-    /// around it, as the boundary does: natives that are also constructors read it. `None`: these
-    /// operands need the boundary.
+    /// around it, as the boundary does: natives that are also constructors read it. Reflect.get,
+    /// has and set are answered on the window when their resolution runs no author code
+    /// ([`Interp::reflect_resolved`]). `None`: these operands need the boundary.
     ///
     /// # Safety
     /// As [`Interp::call_native_committed`]; `function` is the entry's proven native.
@@ -15843,8 +16049,14 @@ impl Interp {
         args: *const Value,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
-        if !unsafe { crate::bytecode::native_light_operands(intrinsic, this_slot, args, argc) } {
-            return None;
+        match unsafe { crate::bytecode::native_operands(intrinsic, this_slot, args, argc) } {
+            crate::bytecode::NativeOperands::Light => {}
+            // Reflect.get, has and set: answered on the operands when that runs no author code.
+            crate::bytecode::NativeOperands::Reflect => {
+                // SAFETY: the caller's window.
+                return unsafe { self.reflect_resolved(intrinsic, args, argc) }.map(Ok);
+            }
+            crate::bytecode::NativeOperands::Boundary => return None,
         }
         #[cfg(test)]
         TEST_LIGHT_NATIVE_CALLS.with(|count| count.set(count.get() + 1));

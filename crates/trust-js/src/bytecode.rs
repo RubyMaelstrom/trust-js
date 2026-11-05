@@ -1136,6 +1136,13 @@ pub const INTRINSIC_ARRAY_IS_ARRAY: u8 = 24;
 /// like [`INTRINSIC_ARRAY_IS_ARRAY`]. The call template answers in line unless both operands
 /// are Strings of equal length or both BigInts, whose contents the native compares.
 pub const INTRINSIC_OBJECT_IS: u8 = 25;
+/// `Reflect.get`, `Reflect.has` and `Reflect.set`: a call whose target is an Object and whose
+/// key is a String that carries its key is answered on the caller's operand window when the
+/// resolution runs no author code ([`crate::interpreter::Interp::reflect_resolved`]); any other
+/// call takes the native through the boundary.
+pub const INTRINSIC_REFLECT_GET: u8 = 26;
+pub const INTRINSIC_REFLECT_HAS: u8 = 27;
+pub const INTRINSIC_REFLECT_SET: u8 = 28;
 
 /// Math numeric functions the call template finishes inline (a Number argument list, no
 /// coercion): ECMA-262 §21.3.2.16 floor, .10 ceil, .35 trunc, .1 abs, .17 fround, .11 clz32
@@ -26018,8 +26025,9 @@ unsafe fn jit_call_hit_native(
             crate::execution_storage::with_borrowed_values(args_ptr, argc, |args| nf(i, this, args))
                 .map_err(Abrupt::Throw)
         } else {
-            // The exact builtin is proven: when its class runs no author code for these operands,
-            // it runs on them directly, without an arbitrary native's call boundary.
+            // The exact builtin is proven: when its class runs no author code for these
+            // operands, it runs on them directly, without an arbitrary native's call boundary
+            // (Reflect.get, has and set are answered on them without the native).
             match i.call_native_light(nf, intrinsic, this_slot, args_ptr, argc) {
                 Some(r) => {
                     note_call_path(CallPath::NativeLight);
@@ -26052,30 +26060,52 @@ unsafe fn jit_call_hit_native(
     }
 }
 
+/// How a native entry's hit runs a native of class `intrinsic` on these operands (see
+/// [`crate::interpreter::Interp::call_native_light`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum NativeOperands {
+    /// Through the native-call boundary.
+    Boundary,
+    /// On the caller's window: the native runs no author code for these operands.
+    Light,
+    /// Reflect.get, has or set: answered on the caller's window when the resolution runs no
+    /// author code (`Interp::reflect_resolved`), else through the boundary.
+    Reflect,
+}
+
 /// Whether a native entry of class `intrinsic` runs no author code for this receiver and these
 /// arguments, so that it may run without the native-call boundary (W3's item 2a; see
-/// [`crate::interpreter::Interp::call_native_light`]). The template intrinsics on Strings and
-/// Numbers share the primitive classes: their templates finish only the guarded cases inline.
+/// [`crate::interpreter::Interp::call_native_light`]), or is one of Reflect's natives answered on
+/// its operands: one match on the class decides, so that no other class pays for Reflect's. The
+/// template intrinsics on Strings and Numbers share the primitive classes: their templates finish
+/// only the guarded cases inline.
 ///
 /// # Safety
 /// `this_slot` and `args..args+argc` are initialized words of the caller's operand window.
 #[inline(always)]
-pub(crate) unsafe fn native_light_operands(
+pub(crate) unsafe fn native_operands(
     intrinsic: u8,
     this_slot: *const Value,
     args: *const Value,
     argc: usize,
-) -> bool {
+) -> NativeOperands {
     let primitive_arguments = || (0..argc).all(|k| unsafe { (*args.add(k)).is_primitive() });
+    let light = |runs_no_code: bool| {
+        if runs_no_code {
+            NativeOperands::Light
+        } else {
+            NativeOperands::Boundary
+        }
+    };
     match intrinsic {
         INTRINSIC_OPERAND_ONLY
         | INTRINSIC_LIGHT
         | INTRINSIC_ARRAY_IS_ARRAY
-        | INTRINSIC_OBJECT_IS => true,
+        | INTRINSIC_OBJECT_IS => NativeOperands::Light,
         INTRINSIC_NUMERIC_ONLY
         | INTRINSIC_MATH_SQRT
         | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => {
-            (0..argc).all(|k| unsafe { (*args.add(k)).number().is_some() })
+            light((0..argc).all(|k| unsafe { (*args.add(k)).number().is_some() }))
         }
         INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => {
             let checked = if intrinsic == INTRINSIC_DATAVIEW_SET {
@@ -26083,10 +26113,10 @@ pub(crate) unsafe fn native_light_operands(
             } else {
                 1
             };
-            (0..argc.min(checked)).all(|k| unsafe { (*args.add(k)).is_primitive() })
+            light((0..argc.min(checked)).all(|k| unsafe { (*args.add(k)).is_primitive() }))
         }
         INTRINSIC_LIGHT_PRIMITIVE_ARGS | INTRINSIC_IS_NAN | INTRINSIC_FROM_CHAR_CODE => {
-            primitive_arguments()
+            light(primitive_arguments())
         }
         INTRINSIC_LIGHT_PRIMITIVE
         | INTRINSIC_CHAR_AT
@@ -26094,10 +26124,26 @@ pub(crate) unsafe fn native_light_operands(
         | INTRINSIC_CODE_POINT_AT
         | INTRINSIC_STRING_SLICE => {
             let receiver = unsafe { &*this_slot };
-            receiver.is_primitive() && primitive_arguments()
+            light(receiver.is_primitive() && primitive_arguments())
         }
-        _ => false,
+        INTRINSIC_REFLECT_GET..=INTRINSIC_REFLECT_SET => NativeOperands::Reflect,
+        _ => NativeOperands::Boundary,
     }
+}
+
+/// Whether [`native_operands`] runs a native of class `intrinsic` on these operands without the
+/// boundary, as `call_apply_forward_tests` compares it with [`native_entry_class`].
+///
+/// # Safety
+/// As [`native_operands`].
+#[cfg(test)]
+pub(crate) unsafe fn native_light_operands(
+    intrinsic: u8,
+    this_slot: *const Value,
+    args: *const Value,
+    argc: usize,
+) -> bool {
+    unsafe { native_operands(intrinsic, this_slot, args, argc) == NativeOperands::Light }
 }
 
 /// How [`crate::interpreter::Interp::call_native_entry`] runs a native entry of class
@@ -26107,21 +26153,23 @@ pub(crate) enum NativeEntryClass {
     /// Through the native-call boundary.
     Boundary,
     /// On the caller's window: the native runs no author code for these operands (W3's item
-    /// 2a; see [`native_light_operands`]).
+    /// 2a; see [`native_operands`]).
     Light,
     /// Function.prototype.call or apply, whose compiled target is entered as their ordinary
     /// call (item 6; see [`crate::interpreter::Interp::call_forwarded`]).
     Forward,
+    /// Reflect.get, has or set (see [`NativeOperands::Reflect`]).
+    Reflect,
 }
 
-/// [`native_light_operands`] with call's and apply's classes besides, for
-/// [`crate::interpreter::Interp::call_native_entry`]: one match on the class decides all three
-/// ways, so that the forwarding classes cost the other natives nothing. The native-entry hit
-/// keeps [`native_light_operands`] itself; `call_apply_forward_tests` checks that the two
-/// matches agree.
+/// [`native_operands`] with call's and apply's classes besides, for
+/// [`crate::interpreter::Interp::call_native_entry`]: one match on the class decides all four
+/// ways, so that the forwarding and Reflect classes cost the other natives nothing. The
+/// native-entry hit keeps [`native_operands`] itself; `call_apply_forward_tests` checks that the
+/// two matches agree.
 ///
 /// # Safety
-/// As [`native_light_operands`].
+/// As [`native_operands`].
 #[inline(always)]
 pub(crate) unsafe fn native_entry_class(
     intrinsic: u8,
@@ -26167,6 +26215,7 @@ pub(crate) unsafe fn native_entry_class(
             let receiver = unsafe { &*this_slot };
             light(receiver.is_primitive() && primitive_arguments())
         }
+        INTRINSIC_REFLECT_GET..=INTRINSIC_REFLECT_SET => NativeEntryClass::Reflect,
         _ => NativeEntryClass::Boundary,
     }
 }
