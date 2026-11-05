@@ -13820,3 +13820,79 @@ FullMarkingVerifier once marking has finished, src/heap/mark-compact.cc:840-847;
 IncrementalMarkingValidator as marking ends, js/src/gc/Sweeping.cpp:2004-2005, its pre-barrier
 verifier sampled, js/src/gc/Verifier.cpp:468-486; JSC's verifyGC once marking has finished,
 heap/Collector.cpp:716-719).
+
+### W6 step 3's fix: verification that catches a card cleared without its cell (record, 2026-11-05)
+
+7052d909 (p2-w6-s3fix, an agent's, on main 76647c1d, landed by fast-forward; 91944e3b before the
+rebase, the same engine tree, on which the checks and counts ran). Design 11's verification, made to catch the class of
+step 3's preclean bug (the previous record) where it begins:
+- Under TRUST_JS_GC_INCREMENTAL=force every slice ends with a preclean (Heap::run_slice), so that
+  precleaning runs as often as slicing, in every state of the marking and of the allocation
+  cursors; before, a forced slice precleaned only once its worklist ran out after a round that
+  was not small.
+- A young page's take of its cards asserts (debug builds) its walk's precondition: no cell
+  allocated in a word past next_unused, the walk's bound (PageMeta::take_card_cells). Every
+  caller flushes the cursors first; the unfixed preclean broke it at most takes.
+- With heap verification, each take of the cards in a cycle, a preclean's and the final pause's
+  (Heap::take_cycle_card_cells), is checked against a walk over its page's marks: the cells taken
+  are the page's marked cells whose cards are set, in address order
+  (PageMeta::take_card_cells_checked).
+- The barrier check's walk over the heap stays sampled under force, as on main and as
+  SpiderMonkey samples its barrier verifier (the previous record gives the measurements and the
+  exemplars).
+- Test taking_the_cards_past_an_unflushed_cursor_panics (debug builds): a cycle's take of the
+  cards with a cell allocated past an unflushed cursor's page bound panics at the take.
+- DIAGNOSTICS.md: force's slices each end with a preclean; the checked takes.
+
+The unfixed code caught:
+- 91944e3b without the fix's flush (target/p2/w6/impl/src-ver-nofix): the 45 cycle tests fail 4,
+  each at the bound's assertion (the fix's regression test,
+  a_cycle_keeps_what_the_program_reaches_through_its_slices_in_every_tier,
+  weak_collections_keep_their_live_entries_across_a_cycle_in_every_tier,
+  a_weak_maps_entries_are_discovered_in_the_slices_and_merged_at_the_final_pause_in_every_tier);
+  the Test262 subset under force and verification without stress at small budgets 2,528/2,603
+  (75 caught: 60 panics, 15 aborts where a panic cannot unwind); under stress 100 (every 2nd
+  major) 2,603/2,603, as expected (stress flushes at every allocation).
+- e8cd037d with each check behind a switch (impl/src-e8x; logs impl/logs/e8x and
+  impl/t262stress/e8x-*), beyond the fix's regression test, which fails there:
+  - The 44 cycle unit tests (gc_core's cycle tests, gc_cycle_tests, table_record): main's
+    verification 0; forced precleans 0; forced precleans with the walk after every slice 0 (in
+    681 s); the bound check 1; forced precleans with the bound check 3
+    (a_cycle_keeps_what_the_program_reaches_through_its_slices_in_every_tier,
+    weak_collections_keep_their_live_entries_across_a_cycle_in_every_tier,
+    a_weak_maps_entries_are_discovered_in_the_slices_and_merged_at_the_final_pause_in_every_tier).
+  - The Test262 subset (13 directories, 2,603 tests) under force and verification without stress
+    at small budgets (TRUST_JS_GC_NURSERY_BYTES=0, TRUST_JS_GC_MIN_HEAP_BYTES=1,
+    TRUST_JS_GC_PACING=0), default tier: main's verification 2,603/2,603; forced precleans
+    2,603/2,603; forced precleans with the bound check 2,528/2,603 (75 caught: 60 panics, 15
+    aborts where a panic cannot unwind). Under stress 100 (every 2nd major) with both:
+    2,603/2,603, as expected (stress flushes at every allocation).
+
+Gate: the stage end adds Test262 under TRUST_JS_GC_INCREMENTAL=force with TRUST_JS_GC_VERIFY=1, no
+stress, at small budgets (TRUST_JS_GC_NURSERY_BYTES=0, TRUST_JS_GC_MIN_HEAP_BYTES=1,
+TRUST_JS_GC_PACING=0), both tiers (the coordinator's decision; impl/step6-checklist.txt).
+
+Checks at 91944e3b: lib suite by default 2,816/2,816 (398 s); under force 2,815 of 2,816 in about
+20 minutes, the last, live_object_limit_error_handler_can_allocate, stopped after 63 minutes
+(220 s with the forced precleans switched off; see below); clippy -D warnings in the three
+configurations; the Test262 subset under force, stress 100 (every 2nd major) and verification
+2,603/2,603 in both tiers (91 s, 139 s); the stage end's new run, under force and verification
+without stress at small budgets, 2,603/2,603 in both tiers (33 s, 165 s); zombie x86-64: clippy
+x3 clean, lib 2,597/2,597 (452 s).
+
+The forced precleans' cost: a whole pass at every forced slice's end rescans, at every slice, a
+cell the program writes at every safepoint; a growing array's owner traces all its words, so
+live_object_limit_error_handler_can_allocate (250,000 pushes onto one array) became quadratic
+under force. Step 4 bounds it with its resumable pass (the step 4 record).
+
+Counts at 91944e3b (fat LTO, user-mode instructions, CPUs 10-13, setarch -R, pacing off, median of
+3; chai's median of 3 separately), against main's engine before the fix (e8cd037d's tree,
+lto-f63528c2), with the fix alone (7ead16a2) beside it: within noise everywhere. Vue -0.05% (the
+fix) and +0.02% (91944e3b), Djot -0.02% and +0.00%, chai -0.009% and -0.025% (median of 3; each
+binary's runs spread 0.09%), every Octane benchmark within ±0.01% (impl/counts-91944e3b.txt,
+impl/counts-91944e3b-chai3.txt).
+Decided (the coordinator's, 2026-11-05): landed now, the default path unchanged; the forced
+precleans' cost on live_object_limit_error_handler_can_allocate (over 60 minutes under force) is
+bounded in step 4 (a forced slice precleans the next 16 pages of a resumable pass: 623 s, 92% of
+the catches); a preclean that traces only a large block's dirty runs, as minor collections do,
+is measured after step 4 (the design's order, step 7).
