@@ -245,6 +245,14 @@ mod compact_equality_tests;
 
 #[cfg(all(
     test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_compact_call_tests.rs"]
+mod compact_call_tests;
+
+#[cfg(all(
+    test,
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -9014,15 +9022,44 @@ fn emit_call_inline_marked(
             // After the live IC proof, bypass every native-id comparison at once.
             // Keep the hit entry and way registers for the ordinary call below.
             let min_max = with_this && (3..=4).contains(argc) && layout.valid;
-            if with_this
+            let intrinsics = with_this
                 && ((*argc == 1 && layout.valid)
                     || (*argc == 0 && array_intrinsics_on)
                     || ((1..=8).contains(argc) && function_call_intrinsic_on)
                     || *argc == 2
-                    || min_max)
-            {
+                    || min_max);
+            if intrinsics {
                 a.ldrb_imm(9, 12, 96);
                 a.cbz(9, false, ordinary_hit);
+            }
+            // A compact site (compact templates' step 4: first-stage code outside loops) tests
+            // every intrinsic its arity can reach in one shared stub, which the hit enters only
+            // for a native callee, and takes its helpers through their shared stubs: SpiderMonkey's
+            // Baseline attaches its intrinsics to the call IC's stub chain (CacheIR's call
+            // generator), V8's Sparkplug calls a Call builtin at every site
+            // (baseline-compiler.cc, BuildCall); the callee's identity test stays in line, as
+            // JSC's Baseline keeps its call link check (JITCall.cpp).
+            let compact = compact_templates(a);
+            let compact_intrinsics = compact && intrinsics;
+            if compact_intrinsics {
+                let stub = a.shared_stub(
+                    SharedStub::IntrinsicCall {
+                        argc: *argc as u8,
+                        array: array_intrinsics_on,
+                        function_call: function_call_intrinsic_on,
+                        discard: matches!(ops.get(pc + 1), Some(Op::Pop)),
+                    }
+                    .key(),
+                );
+                emit_intrinsic_stub_call(
+                    a,
+                    pc as u32,
+                    stub,
+                    ordinary_hit,
+                    hit_slow,
+                    done,
+                    l_unwind,
+                );
             }
             // Inline intrinsics: a native entry the template can finish without
             // leaving machine code. charCodeAt on a known-ASCII receiver with an
@@ -9030,7 +9067,7 @@ fn emit_call_inline_marked(
             // make millions of these per parse. Any miss (intrinsic id, receiver
             // tag/hint, index shape, bounds) takes the H_CALL_HIT form, whose Rust
             // side handles native entries generally.
-            if with_this && *argc == 1 && layout.valid {
+            if !compact_intrinsics && with_this && *argc == 1 && layout.valid {
                 let discard = matches!(ops.get(pc + 1), Some(Op::Pop));
                 let no_intr = a.new_label();
                 if use_shared_stub(a) {
@@ -9057,7 +9094,7 @@ fn emit_call_inline_marked(
                 }
                 a.bind(no_intr);
             }
-            if with_this && *argc == 0 && array_intrinsics_on {
+            if !compact_intrinsics && with_this && *argc == 0 && array_intrinsics_on {
                 let no_intr = a.new_label();
                 a.ldrb_imm(9, 12, 96);
                 a.cmp_imm_w(9, crate::bytecode::INTRINSIC_ARRAY_POP as u32);
@@ -9075,7 +9112,11 @@ fn emit_call_inline_marked(
                 a.b(done);
                 a.bind(no_intr);
             }
-            if with_this && (1..=8).contains(argc) && function_call_intrinsic_on {
+            if !compact_intrinsics
+                && with_this
+                && (1..=8).contains(argc)
+                && function_call_intrinsic_on
+            {
                 let no_intr = a.new_label();
                 a.ldrb_imm(9, 12, 96);
                 a.cmp_imm_w(9, crate::bytecode::INTRINSIC_FUNCTION_CALL as u32);
@@ -9098,7 +9139,7 @@ fn emit_call_inline_marked(
                 a.b(done);
                 a.bind(no_intr);
             }
-            if min_max {
+            if !compact_intrinsics && min_max {
                 // Math.max and Math.min with three or four Number arguments (W3's item 2c), in
                 // the chunk's shared stub even in a loop: few of the sites that pass three or
                 // four arguments call either, and the stub's call and return cost little beside
@@ -9122,7 +9163,7 @@ fn emit_call_inline_marked(
                 }
                 a.bind(no_intr);
             }
-            if with_this && *argc == 2 {
+            if !compact_intrinsics && with_this && *argc == 2 {
                 let discard = matches!(ops.get(pc + 1), Some(Op::Pop));
                 let no_intr = a.new_label();
                 if use_shared_stub(a) {
@@ -9239,17 +9280,32 @@ fn emit_call_inline_marked(
             // hit's tagged index still names its primary way in the low bits.
             a.cmp_imm_w(15, crate::bytecode::CALL_IC_WAYS as u32);
             a.b_cond(C_EQ, slow);
-            a.mov(0, 19);
-            // x1 = pc | way << 16 (pcs are < 65536: every helper call encodes
-            // the pc as one movz)
-            a.movz(1, pc as u32, 0);
-            a.add_shifted(1, 1, 15, 16);
-            a.mov(2, 20);
-            a.ldr_imm(16, 21, (H_CALL_HIT * 8) as u32);
-            a.blr(16);
-            a.mov(20, 0);
-            a.cbnz(1, false, l_unwind);
-            a.b(done);
+            if compact {
+                // x1 = pc | way << 16, which the shared helper stub passes on.
+                a.movz(1, pc as u32, 0);
+                a.add_shifted(1, 1, 15, 16);
+                let stub = a.shared_stub(
+                    SharedStub::Helper {
+                        idx: H_CALL_HIT as u8,
+                    }
+                    .key(),
+                );
+                a.bl_label(stub);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+            } else {
+                a.mov(0, 19);
+                // x1 = pc | way << 16 (pcs are < 65536: every helper call encodes
+                // the pc as one movz)
+                a.movz(1, pc as u32, 0);
+                a.add_shifted(1, 1, 15, 16);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_CALL_HIT * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, l_unwind);
+                a.b(done);
+            }
 
             // ---- the probe after way 0: the chunk's shared stub, a site reaching it only
             // after its usual callee misses ----
@@ -9265,13 +9321,20 @@ fn emit_call_inline_marked(
         }
     }
     a.bind(slow);
-    a.mov(0, 19);
-    a.movz(1, pc as u32, 0);
-    a.mov(2, 20);
-    a.ldr_imm(16, 21, (H_CALL * 8) as u32);
-    a.blr(16);
-    a.mov(20, 0);
-    a.cbnz(1, false, l_unwind);
+    if compact_templates(a) {
+        a.movz(1, pc as u32, 0);
+        let stub = a.shared_stub(SharedStub::Helper { idx: H_CALL as u8 }.key());
+        a.bl_label(stub);
+        a.cbnz(1, false, l_unwind);
+    } else {
+        a.mov(0, 19);
+        a.movz(1, pc as u32, 0);
+        a.mov(2, 20);
+        a.ldr_imm(16, 21, (H_CALL * 8) as u32);
+        a.blr(16);
+        a.mov(20, 0);
+        a.cbnz(1, false, l_unwind);
+    }
     a.bind(done);
     // Every completed form of the call (H_CALL, H_CALL_HIT, an intrinsic, a direct
     // call) lands here with its result pushed. A native or intrinsic can allocate after the
@@ -10160,6 +10223,135 @@ fn emit_call_intrinsics2(
 
 /// Enter the chunk's shared intrinsic stub from a call site (w8 = the site's pc) and route its
 /// status: completed, no intrinsic (the ordinary call), declined (H_CALL_HIT) or thrown.
+/// The body of [`SharedStub::IntrinsicCall`]: each intrinsic a compact `CallWithThis(argc)` site
+/// can finish, tested in the order the in-line template tests them, then the status return of
+/// [`SharedStub::Intrinsics1`]. Its own frame keeps the site's return address across the
+/// helpers it calls.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_intrinsic_call_stub(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    argc: u8,
+    array: bool,
+    function_call: bool,
+    discard: bool,
+) {
+    use crate::bytecode::{INTRINSIC_ARRAY_POP, INTRINSIC_FUNCTION_CALL, INTRINSIC_MATH_MAX};
+    a.stp_pre(29, 30, -16);
+    let none = a.new_label();
+    let declined = a.new_label();
+    let done = a.new_label();
+    let threw = a.new_label();
+    let rest = a.new_label();
+    match argc {
+        0 if array => {
+            emit_intrinsic_helper_call(a, INTRINSIC_ARRAY_POP, 0, rest, declined, done, threw)
+        }
+        1 if layout.valid => emit_call_intrinsics1(
+            a,
+            layout,
+            IntrinsicPc::InW8,
+            array,
+            discard,
+            rest,
+            declined,
+            done,
+            threw,
+        ),
+        2 => emit_call_intrinsics2(
+            a,
+            layout,
+            IntrinsicPc::InW8,
+            discard,
+            rest,
+            declined,
+            done,
+            threw,
+        ),
+        3 | 4 if layout.valid => {
+            a.ldrb_imm(9, 12, 96);
+            a.sub_imm(16, 9, INTRINSIC_MATH_MAX as u32);
+            a.cmp_imm_x(16, 1);
+            a.b_cond(C_HI, rest);
+            emit_math_intrinsic(a, layout, u32::from(argc), rest, declined, done);
+        }
+        _ => {}
+    }
+    a.bind(rest);
+    if function_call && (1..=8).contains(&argc) {
+        emit_intrinsic_helper_call(
+            a,
+            INTRINSIC_FUNCTION_CALL,
+            argc,
+            none,
+            declined,
+            done,
+            threw,
+        );
+    } else {
+        a.b(none);
+    }
+    for (landing, status) in [
+        (done, INTRINSIC_DONE),
+        (none, INTRINSIC_NONE),
+        (declined, INTRINSIC_DECLINED),
+        (threw, INTRINSIC_THREW),
+    ] {
+        a.bind(landing);
+        a.ldp_post(29, 30, 16);
+        a.movz(9, status, 0);
+        a.ret();
+    }
+}
+
+/// An intrinsic the checked intrinsic helper completes (Array.prototype.pop, argc 0;
+/// Function.prototype.call, argc 1 to 8), inside [`emit_intrinsic_call_stub`] (w8 = the site's
+/// pc, x12 = the hit way): the hit's intrinsic id, then the receiver's object tag (a decline
+/// keeps every operand), then H_INTRINSIC with x1 = pc | (id | argc << 8) << 16, as the in-line
+/// template calls it.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_intrinsic_helper_call(
+    a: &mut asm::Asm,
+    id: u8,
+    argc: u8,
+    none: usize,
+    declined: usize,
+    done: usize,
+    threw: usize,
+) {
+    a.ldrb_imm(9, 12, 96);
+    a.cmp_imm_w(9, u32::from(id));
+    a.b_cond(C_NE, none);
+    // Pop's receiver sits under its callee; a call's under its callee and arguments.
+    let receiver_off = if argc == 0 {
+        -16
+    } else {
+        -((i32::from(argc) + 2) * 8)
+    };
+    emit_exec_word_load(a, 9, 20, receiver_off);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 16, declined);
+    a.mov(0, 19);
+    a.mov(1, 8);
+    let packed = if argc == 0 {
+        u32::from(id)
+    } else {
+        u32::from(id) | u32::from(argc) << 8
+    };
+    a.movk(1, packed, 1);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+    a.blr(16);
+    a.mov(20, 0);
+    a.cbnz(1, false, threw);
+    a.b(done);
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14769,6 +14961,22 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     MinMax { argc: u8 },
+    /// [`emit_intrinsic_call_stub`], a compact `CallWithThis(argc)` site's every intrinsic
+    /// (compact templates' step 4): the one-argument family of [`emit_call_intrinsics1`] (argc
+    /// 1), the two-argument one of [`emit_call_intrinsics2`] (argc 2), Math.max and Math.min
+    /// (argc 3 and 4), Array.prototype.pop (argc 0, with `array`) and Function.prototype.call
+    /// (argc 1 to 8, with `function_call`), at the site's live call-IC hit (x12 = the hit way)
+    /// with w8 = the site's pc → w9 = `INTRINSIC_*`, as [`SharedStub::Intrinsics1`]'s.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    IntrinsicCall {
+        argc: u8,
+        array: bool,
+        function_call: bool,
+        discard: bool,
+    },
     /// [`typed_array::emit_access`]: x11 = a typed array Object, x9 = its exact unsigned index
     /// (and d1 the Number to store) → w13 = 1 once the element is read (x12 = packed Number,
     /// d1 = value) or written, 0 when the access is declined before anything is written.
@@ -14879,6 +15087,7 @@ impl SharedStub {
     const EQUAL: u32 = 0x1000;
     const TO_BOOLEAN: u32 = 0x1100;
     const PROP_WRITE: u32 = 0x1200;
+    const INTRINSIC_CALL: u32 = 0x1300;
 
     fn key(self) -> u32 {
         match self {
@@ -14983,6 +15192,23 @@ impl SharedStub {
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
             SharedStub::MinMax { argc } => Self::MIN_MAX | u32::from(argc),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::IntrinsicCall {
+                argc,
+                array,
+                function_call,
+                discard,
+            } => {
+                debug_assert!(argc <= 8);
+                Self::INTRINSIC_CALL
+                    | u32::from(argc)
+                    | u32::from(array) << 4
+                    | u32::from(function_call) << 5
+                    | u32::from(discard) << 6
+            }
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
             SharedStub::ElemStore => Self::ELEM_STORE,
             SharedStub::NameElement { write, resolved } => {
@@ -15115,6 +15341,16 @@ impl SharedStub {
             Self::MIN_MAX => SharedStub::MinMax {
                 argc: (key & 0xff) as u8,
             },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::INTRINSIC_CALL => SharedStub::IntrinsicCall {
+                argc: (key & 0xf) as u8,
+                array: key & 0x10 != 0,
+                function_call: key & 0x20 != 0,
+                discard: key & 0x40 != 0,
+            },
             Self::TYPED_ELEMENT => SharedStub::TypedElement {
                 write: key & 1 != 0,
             },
@@ -15204,6 +15440,28 @@ impl SharedStub {
             SharedStub::Intrinsics2 { discard } => named("Intrinsics2", &[("discard", discard)]),
             SharedStub::PlainIsArray => named("PlainIsArray", &[]),
             SharedStub::MinMax { argc } => format!("Stub:MinMax(argc={argc})"),
+            SharedStub::IntrinsicCall {
+                argc,
+                array,
+                function_call,
+                discard,
+            } => {
+                let flags = [
+                    ("array", array),
+                    ("function_call", function_call),
+                    ("discard", discard),
+                ];
+                let set: Vec<&str> = flags
+                    .iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(name, _)| *name)
+                    .collect();
+                if set.is_empty() {
+                    format!("Stub:IntrinsicCall(argc={argc})")
+                } else {
+                    format!("Stub:IntrinsicCall(argc={argc},{})", set.join(","))
+                }
+            }
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
             SharedStub::ElemStore => named("ElemStore", &[]),
             SharedStub::NameElement { write, resolved } => {
@@ -15394,6 +15652,16 @@ impl SharedStub {
                 a.movz(9, 0, 0);
                 a.ret();
             }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::IntrinsicCall {
+                argc,
+                array,
+                function_call,
+                discard,
+            } => emit_intrinsic_call_stub(a, layout, argc, array, function_call, discard),
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")

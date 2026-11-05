@@ -930,15 +930,24 @@ pub(super) fn emit(
             a.bind(slow);
             // H_NEW needs only the pc for optional diagnostics and the statically encoded
             // arity. Pack both so the million-call constructor path does not reload/decode
-            // its bytecode op in Rust.
-            a.mov(0, 19);
-            a.movz(1, pc as u32, 0);
-            a.movk(1, *argc as u32, 1);
-            a.mov(2, 20);
-            a.ldr_imm(16, 21, (H_NEW * 8) as u32);
-            a.blr(16);
-            a.mov(20, 0);
-            a.cbnz(1, false, unwind);
+            // its bytecode op in Rust. A compact site (first-stage code outside loops) calls it
+            // through its shared helper stub, which passes x1 on.
+            if compact_templates(a) {
+                a.movz(1, pc as u32, 0);
+                a.movk(1, *argc as u32, 1);
+                let stub = a.shared_stub(SharedStub::Helper { idx: H_NEW as u8 }.key());
+                a.bl_label(stub);
+                a.cbnz(1, false, unwind);
+            } else {
+                a.mov(0, 19);
+                a.movz(1, pc as u32, 0);
+                a.movk(1, *argc as u32, 1);
+                a.mov(2, 20);
+                a.ldr_imm(16, 21, (H_NEW * 8) as u32);
+                a.blr(16);
+                a.mov(20, 0);
+                a.cbnz(1, false, unwind);
+            }
             // Either form lands here with its result pushed. A native constructor allocates
             // after the call's last safepoint.
             a.bind(done);
