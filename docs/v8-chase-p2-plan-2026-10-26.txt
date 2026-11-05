@@ -14840,3 +14840,103 @@ memory reducer's timer (trust_js_backend.rs:5115, 30051-30068) but not
 Engine::advance_incremental_marking, so on TRust a cycle that starts while a page is idle (the
 reducer's) advances only by allocation and task boundaries; the actor's loop should run slices
 when idle, as trust-js-runtime's loop now does.
+
+### W6 step 5: the spare pages' release out of the final pause (record, 2026-11-05)
+
+e50f5725 (p2-w6-s5-wip, an agent's, on main cccf7545; landed by fast-forward).
+
+What the pause spends: SplayLatency's driver's late final pauses (16.7 and 15.1 ms with step 4
+on CPU 5) were 14.3 and 12.3 ms of untimed sweep work. A probe around Heap::trim_spare_pages (a
+non-LTO build of 51cabcde, CPU 3) times it: one final pause gave 2,228 spare pages back (2,740
+down to the cap of 512), 139 MB, in 10.3 ms, about 4.6 us a page (os_pages::discard, one madvise
+each); the pause was 14.6 ms with 11.0 ms of the engine's sweep. The cycle-off majors pay it too
+(splay-real's last, 112.9 ms, has 10.1 ms of engine).
+
+What the exemplars do (each releases freed pages outside the pause that ends marking):
+- V8 (main 8bc5c682): freed pages go into a memory pool (MemoryAllocator::Free with kPool or
+  kDelayThenPool, src/heap/memory-allocator.cc:368-407); a delayed task releases the pooled pages
+  older than its epoch, 8 s after (memory_pool_timeout, src/flags/flag-definitions.h:2860-2867;
+  MemoryPool::Config, src/heap/memory-pool.h:82-87; the task, src/heap/memory-pool.cc:446-529),
+  on a worker thread, or with --single-threaded on the isolate's task runner between tasks
+  (:504-510). A collection that reduces memory releases the pool at once
+  (ReleasePooledChunksImmediately, src/heap/heap.cc:1118-1121), and memory pressure or a last
+  resort releases everything (:1260-1268).
+- SpiderMonkey (main 98bddef2): the GC's Decommit state decommits free arenas and chunks, on a
+  helper thread, or without one on the main thread in that slice (GCRuntime::startDecommit,
+  js/src/gc/GC.cpp:2302-2357; BackgroundDecommitTask, :2359-2390).
+- JSC: bmalloc's scavenger thread returns free memory in the background (to cite at the pin).
+
+A probe that pools every page beyond the cap (no release outside collections that reduce
+memory; non-LTO, CPU 3): the same final pause, 14.6 ms with the release, is 4.1 ms (the engine's
+sweep work 11.0 ms -> 0.66 ms); what is left is the sweep's freeing (2.45 ms) and the marking.
+
+e50f5725 (p2-w6-s5-wip, an agent's; on main cccf7545), approved as planned (V8's pool):
+1. With pacing, a collection no longer gives the spare pages beyond the cap back in its pause
+   (Heap::trim_spare_pages): they stay in the spare pool, where allocation takes pages first, and
+   count in the heap's committed memory only up to the cap (Heap::pool_cap, committed_bytes), so
+   that pacing and the memory reducer see the heap as before.
+2. A collection that reduces memory gives them back at once, as before and as V8's
+   ReleasePooledChunksImmediately.
+3. The others go back 8 s after the pool first passed the cap (POOL_TIMEOUT, V8's
+   memory_pool_timeout), in the memory reducer's timer (Heap::release_pool from
+   memory_reducer_timer), whose deadline (Engine::memory_reducer_deadline) names the pool's when
+   it comes first; the reducer's own timer then runs at its own deadline alone (an earlier run
+   would sample the allocation and could put the reducer off). A host that never runs the timer
+   keeps the pages for reuse.
+4. Without pacing (the unit tests, TRUST_JS_GC_PACING=0, the counts), collections give the pages
+   back as they end, as before.
+5. TRust's page actor runs the timer between tasks from the engine's deadline
+   (trust_js_backend.rs:5108-5118, run_memory_reducer at 30051-30068: it shortens its wait to
+   memory_reducer_deadline and calls run_memory_reducer when due), so the pool's deadline wakes
+   it; the runtime's event loop does the same (trust-js-runtime's run_to_completion).
+6. Tests: spare_pages_beyond_the_cap_wait_in_a_pool_for_the_reducers_timer (gc_core); the
+   reducer's tests read the reducer's own deadline (MemoryReducer::deadline), the engine's being
+   the pool's when it comes first. DIAGNOSTICS.md and the Engine's reducer API describe the pool.
+
+Peak RSS (MB; CPU 5, one run each in each of two windows, 06:42 and 07:07; peak RSS does not
+depend on the other load): main a3fd64da with the cycle off, step 4 (5504ace9) with the cycle on,
+step 5 (6d268af5) with the cycle on and off:
+
+| workload | main, off | step 4, on | step 5, on | step 5, off |
+| --- | --- | --- | --- | --- |
+| TypeScript | 693 | 711, 714 | 724, 711 | 692, 695 |
+| Splay | 126 | 124, 124 | 125, 125 | 126, 126 |
+| SplayLatency's driver | 492 | 536, 537 | 512, 541 | 493, 494 |
+| sustained allocation | 56 | 54, 54 | 55, 55 | 57, 57 |
+
+The pool leaves the peaks within 1-2% of step 4's, either way: its pages were resident at the
+peak already, and their release only lowered the memory held after it, which the reducer's timer
+does in idle time 8 s on.
+
+Pauses (fat LTO, TRUST_JS_GC_LOG=1, every workload once, CPU 5 under the timing hold, 07:07-07:10,
+other load 2.5-3.0 cores (a game client and the desktop); step 4 = 5504ace9 and step 5 = 6d268af5,
+the same engine but for step 5, with the cycle on; runs/w6s4i-on, w6s5b-on, w6s5b-off):
+- SplayLatency's driver's final pauses, step 4 -> step 5: 0.41, 0.74, 11.99, 10.29 ms -> 0.49,
+  0.76, 2.36, 2.63 ms: its two late finals lose the pages' release (2,228 pages in the probe's
+  run); its cycle-off majors (step 5 off against main off in the window before, 06:42) 65.5 ->
+  58.2 ms at the largest.
+- Every other final pause within 0.2 ms of step 4's (TypeScript 3.22 -> 3.37, chai 3.23 -> 3.39,
+  EarleyBoyer 1.74 -> 1.74, Gameboy 1.16 -> 1.17, PdfJS 1.19 -> 1.19, Splay 0.32 -> 0.34,
+  sustained allocation 1.03 -> 1.03 ms): their pools stayed under the cap or their trims were
+  small.
+- The largest pauses with the cycle on, step 5: TypeScript's start 1.34 / slice 1.01 / final 3.37
+  ms; SplayLatency's driver's 0.86 / 0.46 / 2.63 ms; Splay's 0.44 / 0.37 / 0.34 ms; chai's 2.00 /
+  0.12 / 3.39 ms; sustained allocation's 0.21 / 1.97 / 1.03 ms (its 1.97 ms slice is one array's
+  whole block, the large-block item after step 4).
+- The starts, with V8's start (step 4's 5504ace9): TypeScript 1.34 ms (begin 0.17, roots 0.85,
+  side 0.28), chai 2.00 (roots 1.56, side 0.38), PdfJS 0.72, Gameboy 0.44, EarleyBoyer 0.48,
+  SplayLatency's driver 0.86 (begin 0.58: clearing a large heap's marks), sustained allocation
+  0.21 ms.
+
+Counts (fat LTO, user-mode instructions, CPUs 10-13, setarch -R, pacing off, median of 3; chai's
+median of 3 separately; against main cccf7545's engine; impl/counts-e50f5725.txt,
+impl/nogc-counts-e50f5725.txt, impl/counts-e50f5725-chai3.txt): without pacing the pool does not
+form, so the counts see code that moved only: TypeScript +0.02% (-0.026% without collections),
+chai +0.014%, Djot +0.01%, every other workload within 0.01%.
+
+Checks at e50f5725: cargo fmt --all -- --check clean; lib suite by default 2,830/2,830 (381 s) and
+under force 2,830/2,830 (960 s); clippy -D warnings in the three configurations; the Test262 subset
+under force, stress 100 (every 2nd major) and verification 2,603/2,603 in both tiers (159 s,
+142 s); under force and verification without stress at small budgets 2,603/2,603 in both tiers
+(31 s, 139 s); zombie x86-64: clippy x3 clean, lib 2,610/2,610 (325 s); TypeScript with the cycle on (fat LTO, pacing on, so the pool forms),
+8 runs on CPUs 10-11: no crash.
