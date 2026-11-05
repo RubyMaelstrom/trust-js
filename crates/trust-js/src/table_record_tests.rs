@@ -502,7 +502,11 @@ fn a_cycles_final_pause_reports_what_was_written_during_the_cycle_only() {
     assert_eq!(last.kind, Some(CollectionKind::Major));
     assert!(listed(written, &last.side_slot_owners), "{last:?}");
     assert!(!listed(clean, &last.side_slot_owners), "{last:?}");
-    assert_eq!(entries_of(map, &last.weak_entries), 1, "the entry written: {last:?}");
+    assert_eq!(
+        entries_of(map, &last.weak_entries),
+        1,
+        "the entry written: {last:?}"
+    );
 }
 
 /// W6 step 2b: the final pause's closure check (heap verification) panics on a side-slot write

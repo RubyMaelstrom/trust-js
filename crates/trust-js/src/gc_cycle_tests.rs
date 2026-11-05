@@ -88,7 +88,10 @@ fn a_cycle_keeps_what_the_program_reaches_through_its_slices_in_every_tier() {
         assert_eq!(result, "true", "{tier:?}");
         // An explicit collection finishes the cycle (its final pause) and keeps the graph.
         engine.interp.gc_collect();
-        assert!(!cycle_running(&engine), "{tier:?}: the final pause ends the cycle");
+        assert!(
+            !cycle_running(&engine),
+            "{tier:?}: the final pause ends the cycle"
+        );
         let result = eval(
             &mut engine,
             r#"
@@ -136,7 +139,10 @@ fn a_cycle_finishes_once_its_worklist_empties() {
         &mut engine,
         "let n = 0; for (let i = 0; i < 100000 && n < 1e9; i++) n += keep[i % 500].a[0]; n > 0",
     );
-    assert!(!cycle_running(&engine), "the cycle's final pause ran on its own");
+    assert!(
+        !cycle_running(&engine),
+        "the cycle's final pause ran on its own"
+    );
     assert_eq!(
         engine.interp.gc_heap.core.borrow().collections(),
         collections + 1
@@ -236,12 +242,20 @@ fn an_explicit_collection_during_a_cycle_frees_what_died_after_the_cycle_marked_
     assert!(engine.interp.gc_start_cycle());
     #[inline(never)]
     fn marked(engine: &Engine, address: crate::gc_test::HiddenAddress) -> bool {
-        engine.interp.gc_heap.core.borrow().cell_age(address.get() as u64)
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow()
+            .cell_age(address.get() as u64)
             == Some(crate::gc_core::CellAge::Old)
     }
     let mut slices = 0;
     while !marked(&engine, address) {
-        assert!(engine.interp.gc_slice(), "the cycle runs until the object is marked");
+        assert!(
+            engine.interp.gc_slice(),
+            "the cycle runs until the object is marked"
+        );
         slices += 1;
         assert!(slices < 1_000_000);
     }
@@ -250,7 +264,10 @@ fn an_explicit_collection_during_a_cycle_frees_what_died_after_the_cycle_marked_
     assert!(cycle_running(&engine));
     engine.interp.gc_collect();
     assert!(!cycle_running(&engine));
-    assert!(!crate::gc_test::alive(&*weak), "the precise collection freed it");
+    assert!(
+        !crate::gc_test::alive(&*weak),
+        "the precise collection freed it"
+    );
     assert_eq!(eval(&mut engine, "bulk.length"), "30000");
 }
 
@@ -267,7 +284,12 @@ fn hidden_address(weak: &crate::value::WeakGc) -> crate::gc_test::HiddenAddress 
 /// Whether the running cycle has marked the cell at `address`.
 #[inline(never)]
 fn marked(engine: &Engine, address: crate::gc_test::HiddenAddress) -> bool {
-    engine.interp.gc_heap.core.borrow().cell_age(address.get() as u64)
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow()
+        .cell_age(address.get() as u64)
         == Some(crate::gc_core::CellAge::Old)
 }
 
@@ -275,7 +297,10 @@ fn marked(engine: &Engine, address: crate::gc_test::HiddenAddress) -> bool {
 fn slice_until_marked(engine: &mut Engine, address: crate::gc_test::HiddenAddress, what: &str) {
     let mut slices = 0;
     while !marked(engine, address) {
-        assert!(engine.interp.gc_slice(), "{what}: the cycle runs until it is marked");
+        assert!(
+            engine.interp.gc_slice(),
+            "{what}: the cycle runs until it is marked"
+        );
         slices += 1;
         assert!(slices < 1_000_000, "{what}: never marked");
     }
@@ -287,8 +312,7 @@ fn slice_until_marked(engine: &mut Engine, address: crate::gc_test::HiddenAddres
 /// old ones, are the final pause's, from the cycle's records, and survive it. The final pause
 /// alone ends the cycle (an explicit minor request), so no collection after it hides a miss.
 #[test]
-fn a_weak_maps_entries_are_discovered_in_the_slices_and_merged_at_the_final_pause_in_every_tier()
-{
+fn a_weak_maps_entries_are_discovered_in_the_slices_and_merged_at_the_final_pause_in_every_tier() {
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = cycling_engine(tier);
         eval(
@@ -316,7 +340,10 @@ fn a_weak_maps_entries_are_discovered_in_the_slices_and_merged_at_the_final_paus
         eval(&mut engine, "probe = null; 0");
         assert!(engine.interp.gc_start_cycle(), "{tier:?}");
         slice_until_marked(&mut engine, probe, "the first entry's value");
-        assert!(cycle_running(&engine), "{tier:?}: the chain keeps the cycle marking");
+        assert!(
+            cycle_running(&engine),
+            "{tier:?}: the chain keeps the cycle marking"
+        );
         eval(
             &mut engine,
             r#"
@@ -329,7 +356,10 @@ fn a_weak_maps_entries_are_discovered_in_the_slices_and_merged_at_the_final_paus
             true
             "#,
         );
-        assert!(cycle_running(&engine), "{tier:?}: the program ran within the cycle");
+        assert!(
+            cycle_running(&engine),
+            "{tier:?}: the program ran within the cycle"
+        );
         engine.interp.gc_collect_minor();
         assert!(!cycle_running(&engine), "{tier:?}");
         let result = eval(
@@ -382,7 +412,10 @@ fn a_promise_reaction_added_during_a_cycle_survives_its_final_pause_in_every_tie
         eval(&mut engine, "first = null; 0");
         assert!(engine.interp.gc_start_cycle(), "{tier:?}");
         slice_until_marked(&mut engine, first, "the first reaction");
-        assert!(cycle_running(&engine), "{tier:?}: the chain keeps the cycle marking");
+        assert!(
+            cycle_running(&engine),
+            "{tier:?}: the chain keeps the cycle marking"
+        );
         eval(
             &mut engine,
             r#"
@@ -393,7 +426,10 @@ fn a_promise_reaction_added_during_a_cycle_survives_its_final_pause_in_every_tie
             true
             "#,
         );
-        assert!(cycle_running(&engine), "{tier:?}: the program ran within the cycle");
+        assert!(
+            cycle_running(&engine),
+            "{tier:?}: the program ran within the cycle"
+        );
         engine.interp.gc_collect_minor();
         assert!(!cycle_running(&engine), "{tier:?}");
         assert_eq!(
@@ -401,7 +437,11 @@ fn a_promise_reaction_added_during_a_cycle_survives_its_final_pause_in_every_tie
             "0",
             "{tier:?}: the reactions run"
         );
-        assert_eq!(eval(&mut engine, "counted + ':' + result"), "20000:42", "{tier:?}");
+        assert_eq!(
+            eval(&mut engine, "counted + ':' + result"),
+            "20000:42",
+            "{tier:?}"
+        );
     }
 }
 
@@ -436,9 +476,15 @@ fn a_realm_groups_template_map_gains_an_entry_during_a_cycle_in_every_tier() {
         eval(&mut engine, "template = null; 0");
         assert!(engine.interp.gc_start_cycle(), "{tier:?}");
         slice_until_marked(&mut engine, template, "the first template");
-        assert!(cycle_running(&engine), "{tier:?}: the chain keeps the cycle marking");
+        assert!(
+            cycle_running(&engine),
+            "{tier:?}: the chain keeps the cycle marking"
+        );
         eval(&mut engine, "second(); 0");
-        assert!(cycle_running(&engine), "{tier:?}: the program ran within the cycle");
+        assert!(
+            cycle_running(&engine),
+            "{tier:?}: the program ran within the cycle"
+        );
         engine.interp.gc_collect_minor();
         assert!(!cycle_running(&engine), "{tier:?}");
         let result = eval(

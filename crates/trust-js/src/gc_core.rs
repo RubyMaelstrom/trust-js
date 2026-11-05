@@ -1250,7 +1250,11 @@ impl PageMeta {
         self.take_card_cells::<true>(cells);
         // Both walks queue the cells in address order.
         let taken = &cells[queued..];
-        if !taken.iter().map(|work| work.cell).eq(expected.iter().copied()) {
+        if !taken
+            .iter()
+            .map(|work| work.cell)
+            .eq(expected.iter().copied())
+        {
             let missing = expected
                 .iter()
                 .find(|&&cell| !taken.iter().any(|work| work.cell == cell));
@@ -2218,9 +2222,10 @@ impl Heap {
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every)
             || self.bytes_due(0)
             || self.control.external.due.get()
-            || self.cycle.as_ref().is_some_and(|cycle| {
-                cycle.complete || self.incremental == IncrementalMode::Force
-            })
+            || self
+                .cycle
+                .as_ref()
+                .is_some_and(|cycle| cycle.complete || self.incremental == IncrementalMode::Force)
     }
 
     /// W6: see [`IncrementalMode`]; it takes effect at the next major collection the heap asks
@@ -4097,10 +4102,7 @@ impl Heap {
                     // The slice's client lives for this slice alone: the entries of the weak
                     // collections it marked wait in the marker from here.
                     self.add_discovered_edges(m, client);
-                    return (
-                        m.worklist.is_empty() && m.ready.is_empty(),
-                        traced_bytes,
-                    );
+                    return (m.worklist.is_empty() && m.ready.is_empty(), traced_bytes);
                 }
             }
             if let Some(edge) = m.ready.pop() {
@@ -10404,9 +10406,17 @@ mod tests {
         }
         assert!(fx.heap.cycle.as_ref().is_some_and(|cycle| cycle.complete));
         let age = |heap: &Heap, cell: usize| heap.cell_age(cell as u64);
-        assert_eq!(age(&fx.heap, slot_value), Some(CellAge::Old), "fired in the cycle");
+        assert_eq!(
+            age(&fx.heap, slot_value),
+            Some(CellAge::Old),
+            "fired in the cycle"
+        );
         assert_eq!(client.reported.get(), 1, "the entry was discovered once");
-        assert_eq!(age(&fx.heap, value), Some(CellAge::Young), "it waits for its key");
+        assert_eq!(
+            age(&fx.heap, value),
+            Some(CellAge::Young),
+            "it waits for its key"
+        );
         let roots = [
             tagged(owner as *const u8),
             tagged(collection as *const u8),
@@ -10416,9 +10426,14 @@ mod tests {
             roots: &roots,
             edges: &no_edges,
         };
-        assert!(fx.heap.start_marking(false, &final_client, CollectionKind::Major));
+        assert!(fx
+            .heap
+            .start_marking(false, &final_client, CollectionKind::Major));
         assert!(fx.heap.cycle.is_none(), "the final pause ended the cycle");
-        assert!(fx.heap.dead_cells(fx.leaf).is_empty(), "every cell is reached");
+        assert!(
+            fx.heap.dead_cells(fx.leaf).is_empty(),
+            "every cell is reached"
+        );
         fx.heap.finish_collection(&[]);
         assert_eq!(fx.live(), 5);
     }
@@ -10430,7 +10445,10 @@ mod tests {
         let (mut fx, _chain) = cycle_fixture(20_000);
         fx.heap.set_nursery_bytes(Some(64 << 10));
         assert!(start_cycle(&mut fx));
-        assert!(!fx.heap.cycle.as_ref().unwrap().complete, "a first slice marks part of the chain");
+        assert!(
+            !fx.heap.cycle.as_ref().unwrap().complete,
+            "a first slice marks part of the chain"
+        );
         for _ in 0..10 * (64 << 10) / 16 {
             fx.heap.alloc(fx.node, 16);
         }
@@ -10463,7 +10481,8 @@ mod tests {
         let (mut fx, _chain) = cycle_fixture(20_000);
         fx.heap.set_heap_growth(1 << 20, 100);
         // A maximum 2 MB past the budget: a margin of 1 MB.
-        fx.heap.set_max_heap_bytes(fx.heap.trigger_bytes + (2 << 20));
+        fx.heap
+            .set_max_heap_bytes(fx.heap.trigger_bytes + (2 << 20));
         assert_eq!(fx.heap.cycle_margin(), 1 << 20);
         assert!(start_cycle(&mut fx));
         assert_eq!(fx.heap.due_work(None, true, false), DueWork::Slice);
@@ -10498,10 +10517,16 @@ mod tests {
         assert!(fx.heap.slice(&NoClient).is_some());
         fx.collect();
         assert!(fx.heap.cycle.is_none());
-        assert!(fx.heap.owns_cell(young as usize, fx.carded), "the stored cell survives");
+        assert!(
+            fx.heap.owns_cell(young as usize, fx.carded),
+            "the stored cell survives"
+        );
         assert_eq!(fx.heap.cell_age(young as u64), Some(CellAge::Old));
         for page in fx.heap.pages.iter().flatten() {
-            assert!((0..page.cells).all(|i| !page.card_set(i)), "a card is set after the cycle");
+            assert!(
+                (0..page.cells).all(|i| !page.card_set(i)),
+                "a card is set after the cycle"
+            );
         }
         // The chain below the head, marked before the store cut it off, floated through this
         // cycle; the next marking frees it.
@@ -10541,7 +10566,11 @@ mod tests {
             "the preclean marked the stored cell"
         );
         fx.collect();
-        assert_eq!(fx.heap.stats().last_card_cells, 0, "the final pause rescanned no card");
+        assert_eq!(
+            fx.heap.stats().last_card_cells,
+            0,
+            "the final pause rescanned no card"
+        );
         assert!(fx.heap.owns_cell(young as usize, fx.carded));
     }
 
@@ -10593,11 +10622,22 @@ mod tests {
         );
         let mut cycle = fx.heap.cycle.take().unwrap();
         cycle.complete = false;
-        assert!(fx.heap.preclean(&mut cycle) >= 1, "the preclean found the written cell");
-        assert!(cycle.marker.worklist.iter().any(|work| work.cell == fresh as usize));
+        assert!(
+            fx.heap.preclean(&mut cycle) >= 1,
+            "the preclean found the written cell"
+        );
+        assert!(cycle
+            .marker
+            .worklist
+            .iter()
+            .any(|work| work.cell == fresh as usize));
         fx.heap.cycle = Some(cycle);
         slice_to_completion(&mut fx);
-        assert_eq!(fx.heap.cell_age(young as u64), Some(CellAge::Old), "marked by the rescan");
+        assert_eq!(
+            fx.heap.cell_age(young as u64),
+            Some(CellAge::Old),
+            "marked by the rescan"
+        );
     }
 
     /// The fix's verification (debug builds): a cycle's take of the cards with cells allocated
@@ -10640,7 +10680,11 @@ mod tests {
             .copied()
             .filter(|&cell| fx.heap.cell_age(cell as u64) == Some(CellAge::Old))
             .collect();
-        assert!(traced.len() >= PRECLEAN_DONE_CELLS, "{} traced", traced.len());
+        assert!(
+            traced.len() >= PRECLEAN_DONE_CELLS,
+            "{} traced",
+            traced.len()
+        );
         assert!(!fx.heap.cycle.as_ref().unwrap().complete);
         for &cell in &traced {
             // SAFETY: a live carded cell of this heap.
@@ -10648,7 +10692,10 @@ mod tests {
         }
         slice_to_completion(&mut fx);
         let cycle = fx.heap.cycle.as_ref().unwrap();
-        assert_eq!(cycle.precleans, 2, "one that found the written cells, one that found none");
+        assert_eq!(
+            cycle.precleans, 2,
+            "one that found the written cells, one that found none"
+        );
         // Their cards name them and the cells traced since that start in the last card.
         let per_card = (1 << CARD_SHIFT) / 16;
         assert!(
@@ -10660,7 +10707,9 @@ mod tests {
         assert_eq!(cycle.last_precleaned, 0);
         fx.collect();
         assert_eq!(fx.heap.stats().last_card_cells, 0);
-        assert!(chain.iter().all(|&cell| fx.heap.owns_cell(cell as usize, fx.carded)));
+        assert!(chain
+            .iter()
+            .all(|&cell| fx.heap.owns_cell(cell as usize, fx.carded)));
     }
 
     /// W6, design 11: a store into a traced cell that set no card is caught by the cycle's
@@ -10690,7 +10739,11 @@ mod tests {
         set_word(lost, 0, 0);
         fx.roots[1] = tagged(kept);
         slice_to_completion(&mut fx);
-        assert_eq!(fx.heap.cell_age(kept as u64), Some(CellAge::Young), "white until reached");
+        assert_eq!(
+            fx.heap.cell_age(kept as u64),
+            Some(CellAge::Young),
+            "white until reached"
+        );
         fx.collect();
         assert!(fx.heap.owns_cell(kept as usize, fx.node));
         assert!(!fx.heap.owns_cell(lost as usize, fx.node));

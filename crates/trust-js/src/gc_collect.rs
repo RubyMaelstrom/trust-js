@@ -174,11 +174,13 @@ fn gc_pacing_enabled() -> bool {
 /// collection marks in one pause.
 fn gc_incremental() -> crate::gc_core::IncrementalMode {
     static MODE: std::sync::OnceLock<crate::gc_core::IncrementalMode> = std::sync::OnceLock::new();
-    *MODE.get_or_init(|| match std::env::var("TRUST_JS_GC_INCREMENTAL").as_deref() {
-        Ok("1" | "on") => crate::gc_core::IncrementalMode::On,
-        Ok("force") => crate::gc_core::IncrementalMode::Force,
-        _ => crate::gc_core::IncrementalMode::Off,
-    })
+    *MODE.get_or_init(
+        || match std::env::var("TRUST_JS_GC_INCREMENTAL").as_deref() {
+            Ok("1" | "on") => crate::gc_core::IncrementalMode::On,
+            Ok("force") => crate::gc_core::IncrementalMode::Force,
+            _ => crate::gc_core::IncrementalMode::Off,
+        },
+    )
 }
 
 /// `TRUST_JS_GC_LOG=1` (diagnostic): log every collection, with its phases' times.
@@ -853,7 +855,10 @@ impl Marking<'_> {
                     check("a Realm group with a marked member", word);
                 }
                 for &word in self.templates.get(&(index, key)).into_iter().flatten() {
-                    check("the template map of a Realm group with a marked member", word);
+                    check(
+                        "the template map of a Realm group with a marked member",
+                        word,
+                    );
                 }
             }
         }
@@ -1378,8 +1383,8 @@ impl Interp {
         // while one runs the heap's own work is a slice; a requested major collection, or an
         // explicit minor one, is the cycle's final pause.
         let heap_choice = kind.is_none() && pending.is_none();
-        let explicit_minor = matches!(cause, crate::value::GcCause::Explicit)
-            && kind == Some(CollectionKind::Minor);
+        let explicit_minor =
+            matches!(cause, crate::value::GcCause::Explicit) && kind == Some(CollectionKind::Minor);
         let work = match heap.core.try_borrow_mut() {
             Ok(core) => core.due_work(requested, heap_choice, explicit_minor),
             Err(_) => {
@@ -2053,7 +2058,8 @@ impl Interp {
                     if heap.cell_age(key) != Some(CellAge::Old) {
                         continue;
                     }
-                    let age = value_word(value).and_then(|value| Some((value, heap.cell_age(value)?)));
+                    let age =
+                        value_word(value).and_then(|value| Some((value, heap.cell_age(value)?)));
                     if let Some((value, age @ (CellAge::Young | CellAge::Dead))) = age {
                         panic!(
                             "marking cycle: weak collection {owner:#x}: the entry under marked \
