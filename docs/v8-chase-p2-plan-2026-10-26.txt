@@ -14663,3 +14663,180 @@ CHECKS
 The release gate at c50a0b4e (the coordinator's; target/p2/compact/gate-c50a0b4e.txt, base the
 W2g gate of 634ca6c7): the fixtures' masked output as the base's; difftest 138 agree, 12 skipped
 (budget); Test262 at --tier=jit threshold 8, 53,575 of 53,575 and identical to the base's report.
+
+### W6 step 4: the schedule (record, 2026-11-05)
+
+49928c01, 0e95a5c4, 7b312b1d, 5504ace9 (p2-w6-s4-fmt, an agent's; worktree target/p2/w6-impl-wt), on main
+a3fd64da (the Proxy series and the formatting commit), landed on main over 2e99ccba as 2af3bfee,
+9dda3c1a, 565a5929 and 20d51071: the code is 5504ace9's plus compact templates' step 1 (c50a0b4e),
+line for line, and that combined tree's ARM64 lib suite passed by default and under
+TRUST_JS_GC_INCREMENTAL=force (2,829 passed each, the formerly quadratic test included) before main
+moved. With TRUST_JS_GC_INCREMENTAL (off by default), V8's schedule for
+a marking cycle:
+- The start, at V8's soft limit: a minor collection whose sweep leaves the room below the byte
+  budget at one nursery's budget or less makes a major collection due, which starts a cycle (V8
+  starts marking once the room below its old generation's limit is a young generation's capacity
+  or less, src/heap/heap.cc:5620-5671; Heap::major_due_bytes). Without incremental marking, the
+  budget as before.
+- The floor: a major collection the heap asks for marks in one pause while the heap holds 8 MB
+  or less, in release builds, V8's activation threshold (8 MB in release builds and 0 in debug
+  builds, src/heap/incremental-marking.cc:62-68, 135-138; MIN_CYCLE_HEAP_BYTES); the forced mode
+  (verification's) has none.
+- A slice's work: the bytes behind the larger of two expectations and at least 64 KB, V8's step
+  when marking makes no progress (Heap::slice_bytes): V8's time schedule, the bytes the cycle
+  started with marked over 500 ms (src/heap/base/incremental-marking-schedule.h:40-56,
+  .cc:99-130), and an allocation schedule, those bytes marked once the cycle has allocated half
+  its room before the margin (design 4), so that it ends before the margin when the program
+  allocates fast. Slices come every 64 KB allocated, as before.
+- Its time: at most 1 ms, V8's step from a task (src/heap/incremental-marking.cc:56-60): the
+  drain reads the clock every 128 cells it traces and every 128 conditional edges it fires
+  (SLICE_CLOCK_CELLS; V8's marking reads it every 128 objects, src/heap/mark-compact.cc:2296,
+  2360-2365). A preclean's pass over the pages stops at the slice's deadline too, read every 16
+  pages, and the next slice resumes it (Cycle::preclean_page).
+- Pacing: a major collection's speed is its marked bytes over its cycle's whole marking time,
+  the slices' and the final pause's (Pacing::cycle_marked), V8's combined speed
+  (OldGenerationSpeedInBytesPerMillisecond, src/heap/gc-tracer.cc:1359-1389); the cycle's slices
+  are timed whenever the heap paces (Heap::cycle_clock). Under TRUST_JS_GC_INCREMENTAL=force, the
+  final pause's alone: forced slices of a few cells, each with a preclean and checks, time the
+  verification, and made the memory reducer find the allocation rate high (its older test,
+  the_memory_reducer_collects_a_quiet_heap_after_a_major_collection_left_it_large, re-armed
+  instead of collecting under force).
+- The memory reducer starts a cycle instead of collecting (the owner's decision 7; V8's starts
+  incremental marking, src/heap/memory-reducer.cc:92-105); its final pause reduces memory as the
+  collection did.
+- Idle slices: Engine::advance_incremental_marking runs a slice, or the final pause once nothing
+  is left (V8's incremental marking job, src/heap/incremental-marking-job.cc:80-137, each task a
+  step), and Engine::incremental_marking_running says whether to. The runtime's event loop calls
+  it while it waits for a timer or a task, beside the memory reducer (trust-js-runtime's
+  run_to_completion).
+- The GC log's line for a cycle's start gives the heap's phases (begin, roots, stack, side, drain).
+- DIAGNOSTICS.md describes the start, the floor, the schedule, the idle slices and the start
+  line's phases.
+
+Where the build differs from the design:
+- Decision 7 had the engine report the cycle's next slice deadline beside the memory reducer's,
+  for the runtime's loop to run a slice when due. Built without a deadline: while a cycle runs its
+  next step is due at once, as V8's job posts each step's task without a delay and posts the next
+  after each step (src/heap/incremental-marking-job.cc:53-70, 127-135). The loop runs slices back
+  to back while no timer is due, each pass first running whatever became runnable.
+- Design 5 precleans once the worklist empties; with the 1 ms cap a pass over the pages cannot
+  always finish in one slice (TypeScript's precleans take hundreds of thousands of cells), so it
+  stops at the deadline and the next slice resumes it from the page where it stopped; the cycle's
+  marking is complete only once a whole pass found no written cell.
+- The drain's clock also counts the conditional edges it fires: a side-slot owner's slots can
+  take long to trace.
+- Under TRUST_JS_GC_INCREMENTAL=force the combined speed counts the final pause alone (the lib
+  suite under force found the reducer re-arming instead of collecting); two tests that assumed
+  one-pause collections changed: the reducer's older test lets idle steps finish its cycles, and
+  replaced_arrays_are_collected_as_their_elements_grow pins incremental marking off (a cycle that
+  starts at the soft limit takes the element blocks' charges toward its margin, and its count of
+  collections, 8 under force, fell below the test's 10).
+
+Commits after the schedule (each its own, for the coordinator's decisions):
+- 0e95a5c4: the allocation schedule counts the cycle's own allocation (approved by the coordinator).
+- 7b312b1d: a forced slice precleans a part of a pass (approved), FORCED_PRECLEAN_PAGES (16) pages that the
+  next slices resume, instead of a whole pass: verification's forced precleans (7052d909)
+  re-traced a cell the program writes at every safepoint at every slice, and a growing array's
+  owner traces all its words, so the lib suite's live_object_limit_error_handler_can_allocate
+  ran over 30 minutes under force (220 s without the forced precleans; 623 s with 16 pages, 250
+  s with 1). Without the fix's flush, the 16-page passes catch the unfixed preclean in the same 4
+  cycle tests and 69 Test262 tests at small budgets (75 with whole passes, 37 with 1 page).
+
+The allocation schedule's estimate (0e95a5c4): the allocation schedule asked for the bytes at the
+cycle's start, marked by half its room; with white allocation the cycle's survivors are marking
+work too, and V8's estimate leaves its young generation out (its TODO to count it,
+src/heap/incremental-marking.cc:686-687), while a cycle here runs no minor collection, so all
+its allocation is of that kind. On CPU 5 under the hold: Splay's final pause 11.54 ms (10.62 ms
+of drain, the cycle forced at its margin after 29.7 MB) became 0.38 ms (complete after 14.6 MB);
+TypeScript's largest final 26.30 ms (forced after 55.5 MB) 7.64 ms (complete; 3.22 ms of it the
+sweep's free, step 5's); SplayLatency's driver's first final 7.66 ms (forced) 0.43 ms.
+
+The cycle's start, V8's (5504ace9; the coordinator's decision on a fork): design 6 had the
+start clear the marks and cards, mark the roots and the native stack, register the side tables'
+edges and run a first slice. V8's start (StartMarkingMajor, src/heap/incremental-marking.cc:
+247-324) marks the roots without the stack (MarkRoots, :221-228, SkipRoot::kStack) and runs no
+step: its first step is the job's task (:320-323). SpiderMonkey marks the stack as it starts
+(traceRuntimeCommon, js/src/gc/RootMarking.cpp:314-331, from beginMarkPhase, js/src/gc/GC.cpp:
+3350, 3439) because its snapshot-at-the-beginning barrier needs it; JSC scans it at every stop
+(the "Cs" constraint, heap/Heap.cpp:2378-2427). TRust's barrier is V8's kind, the final pause
+marking every root and the stack again, so the start now marks the roots alone and runs no slice,
+and no longer zeroes the stack below its frames (which served the scan). On CPU 5 the stack and
+the first slice had been 10-34% of every start, 0.10-0.35 ms:
+
+| workload | start (ms) | stack | first slice |
+| --- | --- | --- | --- |
+| TypeScript | 1.76 | 0.12 | 0.06 |
+| chai | 2.34 | 0.15 | 0.11 |
+| PdfJS | 1.16 | 0.21 | 0.08 |
+| Gameboy | 1.02 | 0.09 | 0.26 |
+| EarleyBoyer | 0.91 | 0.07 | 0.07 |
+| SplayLatency's driver | 1.17 | 0.05 | 0.07 |
+
+Sustained allocation's 2.80 ms start was its first slice's 2.57 ms, one array's whole block (V8
+scans large arrays in chunks, MarkingProgressTracker, src/heap/marking-visitor-inl.h:618-690),
+which moves to the next slice: the large blocks are measured after step 4 (the design's order).
+Two tests that took the start's slice for granted run one or two slices first, and
+the_memory_reducer_collects_a_quiet_heap_after_a_major_collection_left_it_large lets the idle
+steps finish the cycle the reducer starts under TRUST_JS_GC_INCREMENTAL (in 49928c01, the commit that
+makes the reducer start one).
+
+Tests: a_slice_stops_at_its_deadline, a_preclean_pass_resumes_in_the_next_slice_after_its_deadline,
+a_slice_asks_the_bytes_behind_its_allocation_schedule,
+a_cycle_starts_once_the_room_below_the_budget_is_a_nurserys_budget,
+a_heap_below_the_activation_threshold_marks_in_one_pause (gc_core);
+a_cycles_major_speed_counts_its_slices_marking_time (gc_pacing);
+the_memory_reducer_starts_a_cycle_that_idle_steps_finish (gc_pacing_tests).
+
+Counts (fat LTO, user-mode instructions, CPUs 10-13, setarch -R, pacing off, median of 3; chai's
+median of 3 separately; against main a3fd64da's engine; impl/counts-5504ace9.txt,
+impl/nogc-counts-5504ace9.txt, impl/counts-5504ace9-chai3.txt): Vue +0.06% (+0.065% without
+collections: the mutator's code moved), Gameboy -0.04%, TypeScript -0.01% (-0.016% without
+collections), chai +0.011%, every other workload within 0.01%. Before the rebase onto the Proxy
+series the same series counted Vue -0.07% and EarleyBoyer +0.15% (-0.0001% without collections:
+its collections diverged from a one-object conservative difference at the first minor, 8 majors
+against 7); Vue moves 0.06-0.07% either way with code that moves.
+
+Pauses (fat LTO 91944e3b for the cycle off, 45b97824 for step 4 before its start commit and
+40364096 for step 4 without 0e95a5c4; TRUST_JS_GC_INCREMENTAL=1, TRUST_JS_GC_LOG=1, every workload once, CPU 5 (X925) under the
+timing hold, 03:56-04:00, other load 3.1-4.5 cores in decay from the builds before; the
+largest pause per kind in ms, with its count; runs/w6v-off, w6s4b-on, w6s4a-on):
+
+| workload | cycle off: largest major (one pause) | step 4: starts | slices (max; p99) | finals | without 0e95a5c4: finals |
+| --- | --- | --- | --- | --- | --- |
+| sa | 1 (5.52) | 1 (2.80) | 129 (1.35; 0.91) | 1 (1.27) | 1 (1.25) |
+| chai | 1 (10.54) | 1 (2.34) | 23 (0.10; 0.10) | 1 (2.72) | 1 (3.80) |
+| earley-boyer | 1 (3.83) | 2 (0.91) | 153 (0.22; 0.21) | 2 (1.72) | 2 (2.43) |
+| splay | 2 (38.08) | 2 (0.44) | 271 (0.55; 0.31) | 1 (0.38) | 1 (11.54) |
+| pdfjs | 1 (5.50) | 1 (1.16) | 38 (0.40; 0.40) | 1 (0.95) | 1 (1.17) |
+| gbemu | 1 (2.55) | 1 (1.02) | 21 (0.54; 0.54) | 1 (1.40) | 1 (1.68) |
+| zlib | 1 (0.68) | 0 | 0 | 0 | 0 |
+| typescript | 3 (331.93) | 3 (1.76) | 847 (1.08; 1.05) | 3 (7.64) | 3 (26.30) |
+| splay-real | 4 (112.85) | 4 (1.17) | 1172 (1.02; 1.00) | 4 (16.69) | 4 (16.98) |
+
+The other workloads' heaps stay at or below the 8 MB activation floor: no cycle, and no major in
+several. Minor collections are the cycle's business only in that none runs during it: their
+largest are W6's neither way (TypeScript 93.5 ms with the cycle off, 66.9 ms with step 4;
+SplayLatency's driver 31.6 and 22.9 ms; Splay 21.8 and 20.0 ms). The slices keep to the 1 ms cap but where one cell's trace is long (sustained
+allocation's 1.35 ms; its start's first slice 2.57 ms, one array's whole block). The largest
+finals left are the sweep's: SplayLatency's driver's 16.69 and 15.09 ms are 14.3 and 12.3 ms of
+the engine's sweep work and 1.7 ms of freeing (marking 0.38 ms), TypeScript's 7.64 ms has 3.22 ms
+of freeing and 1.38 ms of roots: step 5's. SplayLatency's driver's scores, one run each: 3541 with
+the cycle off, 7114 with step 4, 7125 without 0e95a5c4 (the exit's session is the coordinator's).
+Wall time and peak RSS stay with the cycle off's (TypeScript 15.09 s and 711 MB against 17.75 s and
+715 MB; splay-real 2.23 s and 526 MB against 2.31 s and 492 MB).
+
+Checks at 5504ace9: cargo fmt --all -- --check clean at each of the four commits; lib suite by
+default 2,829/2,829 (458 s); under force 2,828 of 2,829 (1,158 s), the one failure
+payload_cell_tests::a_long_string_held_only_by_a_property_lives_and_dies_with_it (one large
+cell more than expected after two collections in the bytecode tier, a conservative retention:
+it passed 37 reruns, 32 of them 8 at a time under force; a conservative-scan flake candidate,
+with a_thread_local_is_not_a_root, 1 in 20 on a step 4 build); clippy -D warnings in the three
+configurations; the Test262 subset under force, stress 100 (every 2nd major) and verification
+2,603/2,603 in both tiers (77 s, 141 s); under force and verification without stress at small
+budgets 2,603/2,603 in both tiers (30 s, 138 s); zombie x86-64: clippy x3 clean, lib 2,609/2,609 (294 s); TypeScript with the cycle on
+(fat LTO), 8 runs on CPUs 10-11: no crash.
+For the TRust port (P2's stage end): TRust's page actor runs its own event loop, which calls the
+memory reducer's timer (trust_js_backend.rs:5115, 30051-30068) but not
+Engine::advance_incremental_marking, so on TRust a cycle that starts while a page is idle (the
+reducer's) advances only by allocation and task boundaries; the actor's loop should run slices
+when idle, as trust-js-runtime's loop now does.
