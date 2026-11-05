@@ -8010,9 +8010,65 @@ impl Interp {
             .try_borrow_mut()
             .is_ok_and(|mut core| core.memory_reducer_timer(now, can_start));
         if start {
-            self.collect_garbage_for_host();
+            // W6 step 4: with incremental marking the reducer starts a marking cycle, which the
+            // host's idle time advances to its final pause (`advance_incremental_marking`), as
+            // V8's reducer starts incremental marking (src/heap/memory-reducer.cc:92-105). The
+            // final pause reduces memory, as the collection did.
+            let cycles = self
+                .gc_heap
+                .core
+                .try_borrow()
+                .is_ok_and(|core| core.incremental() != crate::gc_core::IncrementalMode::Off);
+            if !cycles || !self.gc_start_cycle_for_host() {
+                self.collect_garbage_for_host();
+            }
         }
         start
+    }
+
+    /// W6 step 4: start a marking cycle for the host, its memory reducer's, unless one runs
+    /// already. Whether one runs now.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(always)]
+    fn gc_start_cycle_for_host(&mut self) -> bool {
+        if self.incremental_marking_running() {
+            return true;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
+        self.activate_gc_heap();
+        let outcome = self.with_access(|current| {
+            let heap = current.gc_heap.clone();
+            current.gc_heap_start_cycle(&heap, crate::value::GcCause::TaskBoundary)
+        });
+        outcome == crate::agent_control::CollectionOutcome::Marked
+    }
+
+    /// W6 step 4: whether a marking cycle is running (`Engine::incremental_marking_running`).
+    pub fn incremental_marking_running(&self) -> bool {
+        self.gc_heap
+            .core
+            .try_borrow()
+            .is_ok_and(|core| core.cycle_running())
+    }
+
+    /// W6 step 4: advance the running marking cycle by a slice, or end it with its final pause
+    /// once nothing is left to mark (`Engine::advance_incremental_marking`). Outside JS execution
+    /// and GC suppression only. Whether a cycle was running.
+    #[inline(always)]
+    pub fn advance_incremental_marking(&mut self) -> bool {
+        let agent = &self.gc_heap.agent;
+        if agent.suppressed.get() != 0
+            || agent.execution_depth.get() != 0
+            || !self.incremental_marking_running()
+        {
+            return false;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        crate::gc_core::scrub_stack(crate::gc_core::ENTRY_SCRUB_BYTES);
+        self.activate_gc_heap();
+        self.gc_collect_with_cause(crate::value::GcCause::TaskBoundary, None);
+        true
     }
 
     /// `Engine::notify_possible_garbage`.

@@ -211,9 +211,16 @@ pub(crate) struct Pacing {
     allocation: Events,
     old_allocation: Events,
     /// The collections' speeds over their pauses: a minor collection's in the young bytes it
-    /// processed, a major one's in the bytes it marked.
+    /// processed, a major one's in the bytes it marked, over its marking cycle's whole marking
+    /// time (W6 step 4: [`Pacing::cycle_marking`]).
     minor_speed: Events,
     major_speed: Events,
+    /// W6 step 4: the marking time of the current major collection's cycle before its final
+    /// pause, its slices', which its speed counts with the pause's: V8 combines the incremental
+    /// steps' speed with the final pause's (`OldGenerationSpeedInBytesPerMillisecond`,
+    /// src/heap/gc-tracer.cc:1359-1389). Over the final pause alone the speed would be tens of
+    /// times the marking's, and the growing factor would fall toward its minimum.
+    cycle_marking: Duration,
     /// The collection in progress reduces memory (the memory reducer's).
     reduce_memory: bool,
     pub(crate) reducer: MemoryReducer,
@@ -236,6 +243,7 @@ impl Pacing {
             old_allocation: Events::default(),
             minor_speed: Events::default(),
             major_speed: Events::default(),
+            cycle_marking: Duration::ZERO,
             reduce_memory: false,
             reducer: MemoryReducer::default(),
         }
@@ -305,6 +313,12 @@ impl Pacing {
         self.mutator = self.since_sample(now, allocated);
     }
 
+    /// W6 step 4: the major collection that `start` began is the final pause of a marking cycle
+    /// whose slices marked for `time` before it ([`Pacing::cycle_marking`]).
+    pub(crate) fn cycle_marked(&mut self, time: Duration) {
+        self.cycle_marking = time;
+    }
+
     /// The collection that `start` began ends at `now`, having marked `marked` bytes (a minor
     /// collection's are the bytes it promoted). For a major one, returns the factor by which
     /// the heap may grow until the next, at most V8's for the heap's maximum (the caller applies
@@ -328,8 +342,9 @@ impl Pacing {
             self.old_allocation.push(bytes, time);
         }
         let reduce = std::mem::take(&mut self.reduce_memory);
+        let cycle_marking = std::mem::take(&mut self.cycle_marking);
         let factor = if major {
-            self.major_speed.push(marked, pause);
+            self.major_speed.push(marked, pause + cycle_marking);
             self.dynamic_growth.then(|| {
                 if reduce {
                     MIN_GROWING_FACTOR
@@ -587,6 +602,26 @@ mod tests {
     use super::*;
 
     const MB: usize = 1 << 20;
+
+    /// W6 step 4: a major collection that ends a marking cycle counts its slices' marking time in
+    /// its speed with the final pause's, as V8 combines the incremental steps' speed with the
+    /// final pause's; the next major collection, in one pause, counts its own pause alone.
+    #[test]
+    fn a_cycles_major_speed_counts_its_slices_marking_time() {
+        let mut pacing = Pacing::new(Some(MIN_NURSERY_BYTES), false);
+        let start = Instant::now();
+        pacing.start(start, 0);
+        pacing.cycle_marked(Duration::from_millis(9));
+        pacing.end(start + Duration::from_millis(1), true, 10 * MB);
+        // 10 MB over 10 ms: 1 MB a millisecond, not the final pause's 10 MB a millisecond.
+        let speed = pacing.major_speed.speed(NOTHING, None).expect("a speed");
+        assert!((speed - MB as f64).abs() < 1.0, "{speed}");
+        pacing.start(start + Duration::from_millis(2), 0);
+        pacing.end(start + Duration::from_millis(12), true, 10 * MB);
+        // Another 10 MB over 10 ms, the one-pause collection's own.
+        let speed = pacing.major_speed.speed(NOTHING, None).expect("a speed");
+        assert!((speed - MB as f64).abs() < 1.0, "{speed}");
+    }
 
     #[test]
     fn growing_factor_follows_v8s_mutator_utilization_target() {

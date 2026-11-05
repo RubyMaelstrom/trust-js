@@ -89,6 +89,9 @@ fn the_memory_reducer_collects_a_quiet_heap_after_a_major_collection_left_it_lar
     let held = committed(&engine);
     let (all, minor) = engine.unstable_gc_collection_counts();
     assert!(engine.interp.run_memory_reducer(deadline));
+    // With incremental marking the reducer starts a cycle (W6 step 4), which the host's idle
+    // steps finish: its final pause is the one major collection.
+    while engine.interp.advance_incremental_marking() {}
     let (all_after, minor_after) = engine.unstable_gc_collection_counts();
     assert_eq!(
         (all_after - all, minor_after - minor),
@@ -107,9 +110,60 @@ fn the_memory_reducer_collects_a_quiet_heap_after_a_major_collection_left_it_lar
         .memory_reducer_deadline()
         .expect("a second run is due");
     assert!(engine.interp.run_memory_reducer(next));
+    while engine.interp.advance_incremental_marking() {}
     assert_eq!(MAX_GCS, 2);
     assert!(matches!(reducer(&engine), MemoryReducer::Done { .. }));
     assert_eq!(engine.interp.memory_reducer_deadline(), None);
+}
+
+/// W6 step 4: with incremental marking the memory reducer starts a marking cycle instead of a
+/// collection, as V8's starts incremental marking, and the host's idle steps
+/// (`Engine::advance_incremental_marking`) take the cycle to its final pause, which gives the
+/// memory back as the reducer's collection does.
+#[test]
+fn the_memory_reducer_starts_a_cycle_that_idle_steps_finish() {
+    let mut engine = engine();
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_incremental(crate::gc_core::IncrementalMode::On);
+    eval(
+        &mut engine,
+        "globalThis.big = []; for (let i = 0; i < 200000; i++) big.push({ i, s: 'x' + i });",
+    );
+    engine.interp.collect_garbage_for_host();
+    let deadline = engine
+        .interp
+        .memory_reducer_deadline()
+        .expect("the reducer waits");
+    eval(&mut engine, "big = null;");
+    let held = committed(&engine);
+    let counts = engine.unstable_gc_collection_counts();
+    assert!(engine.interp.run_memory_reducer(deadline));
+    assert!(engine.interp.incremental_marking_running(), "a cycle marks");
+    assert_eq!(
+        engine.unstable_gc_collection_counts(),
+        counts,
+        "no collection yet"
+    );
+    let mut steps = 0;
+    while engine.interp.advance_incremental_marking() {
+        steps += 1;
+        assert!(steps < 1_000_000, "the idle steps finish the cycle");
+    }
+    let (all, minor) = engine.unstable_gc_collection_counts();
+    assert_eq!(
+        (all - counts.0, minor - counts.1),
+        (1, 0),
+        "the cycle's final pause"
+    );
+    assert!(
+        committed(&engine) * 4 < held,
+        "{} of {held} bytes held",
+        committed(&engine)
+    );
 }
 
 #[test]

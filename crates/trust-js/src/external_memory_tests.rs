@@ -116,6 +116,15 @@ fn replaced_arrays_are_collected_as_their_elements_grow() {
         ),
     ] {
         let mut engine = engine();
+        // The collections the element blocks' charges bring, each in one pause: with
+        // TRUST_JS_GC_INCREMENTAL a marking cycle that starts at the soft limit takes the
+        // charges toward its margin instead, and none of its slices counts (W6 step 4).
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow_mut()
+            .set_incremental(crate::gc_core::IncrementalMode::Off);
         let (collections, _) = state(&engine);
         assert_eq!(eval(&mut engine, source), expected, "{source}");
         let (after, _) = state(&engine);

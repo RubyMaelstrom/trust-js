@@ -75,10 +75,19 @@ const POISON: u64 = 0xdddd_dddd_dddd_dddd;
 /// W6: a marking cycle's next slice falls due once this many bytes were allocated since its
 /// last one ended (V8's young-generation step, src/heap/incremental-marking.cc:53-54).
 const SLICE_BYTES: usize = 64 << 10;
-/// W6 step 2's provisional slice budget, until the schedule (step 4): a slice traces this many
-/// times the bytes allocated since the last one, and at least [`SLICE_BYTES`] (the step V8 asks
-/// for when marking makes no progress, src/heap/base/incremental-marking-schedule.h:48-56).
-const SLICE_MARK_FACTOR: usize = 4;
+/// W6 step 4: the wall time V8's schedule expects a cycle's marking to take: a slice marks at
+/// least the bytes due by now at that pace (src/heap/base/incremental-marking-schedule.h:40-46,
+/// .cc:99-130).
+const CYCLE_MARKING_TIME: std::time::Duration = std::time::Duration::from_millis(500);
+/// W6 step 4: the longest a slice marks: V8's step from a task (src/heap/incremental-marking.cc:
+/// 56-60).
+const SLICE_MAX_TIME: std::time::Duration = std::time::Duration::from_millis(1);
+/// W6 step 4: a slice reads the clock every this many cells it traces, and every this many
+/// conditional edges it fires: V8's marking reads it every 128 objects
+/// (src/heap/mark-compact.cc:2296, 2360-2365).
+const SLICE_CLOCK_CELLS: usize = 128;
+/// W6 step 4: a preclean pass checks its slice's time every this many pages it takes.
+const PRECLEAN_CLOCK_PAGES: usize = 16;
 /// W6: the cells a slice traces under [`IncrementalMode::Force`].
 const FORCED_SLICE_CELLS: usize = 4;
 /// W6: the floor of V8's overshoot margin, past which a cycle's allocation forces its final
@@ -90,6 +99,11 @@ const MIN_CYCLE_MARGIN: usize = 32 << 20;
 /// final pause follows once the worklist runs out after it (design 5: about 0.5 ms of the final
 /// pause's rescan, at the 67-78 ns a cell of TypeScript's rescans).
 const PRECLEAN_DONE_CELLS: usize = 7_000;
+/// W6 step 4: the heap's size at or below which a major collection the heap asks for still marks
+/// in one pause, about 4 ms of marking: V8's activation threshold for incremental marking, 8 MB
+/// in release builds and 0 in debug builds (src/heap/incremental-marking.cc:62-68, 135-138), so
+/// that the engine's tests cycle at their small heaps.
+const MIN_CYCLE_HEAP_BYTES: usize = if cfg!(debug_assertions) { 0 } else { 8 << 20 };
 /// W6 step 3: the bytes a last preclean round may trace (see [`PRECLEAN_DONE_CELLS`]): about
 /// 0.5 ms of marking. A round's few cells can reach far: Splay's rotations move subtrees the
 /// marker has not reached under nodes it has, and the next round finds them.
@@ -892,8 +906,8 @@ pub(crate) enum DueWork {
 /// What a slice may trace ([`Heap::drain_within`]).
 #[derive(Clone, Copy)]
 enum SliceBudget {
-    /// Until it has traced cells of this many bytes.
-    Bytes(usize),
+    /// Until it has traced cells of this many bytes, or its deadline passes.
+    Bytes(usize, std::time::Instant),
     /// This many cells ([`IncrementalMode::Force`]).
     Cells(usize),
     /// Everything: the final pause's drain.
@@ -1581,17 +1595,23 @@ struct Cycle {
     /// `Heap::allocated_bytes` as the cycle started, and as its last slice ended.
     allocated_at_start: usize,
     allocated_at_slice: usize,
-    /// The slices run so far (the start's among them), and their time while phases are timed.
+    /// The slices run so far (the start's among them), and their time while phases are timed or
+    /// the heap paces its growth (step 4: the major collection's speed counts it).
     slices: u32,
     slice_nanos: u64,
     /// The bytes of the cells the last slice traced (its work, [`Heap::drain_within`]).
     last_traced: usize,
     /// Precleaning (step 3, [`Heap::preclean`]): the precleans so far, the marked cells their
-    /// cards named in all and in the last, and the bytes traced since the last.
+    /// cards named in all and in the last, and the bytes traced since the last. A preclean's
+    /// pass over the pages may span slices (step 4: a slice's time is capped): the page it
+    /// resumes at while it does.
     precleans: u32,
     precleaned: usize,
     last_precleaned: usize,
     round_traced: usize,
+    preclean_page: Option<usize>,
+    /// When the cycle started, for its schedule (step 4).
+    started: std::time::Instant,
     /// The worklist ran out after the last preclean: the final pause is due.
     complete: bool,
 }
@@ -1884,6 +1904,12 @@ pub(crate) struct Heap {
     incremental: IncrementalMode,
     /// W6: the marking cycle running, between its start and its final pause ([`Cycle`]).
     cycle: Option<Box<Cycle>>,
+    /// W6 step 4 (tests): [`MIN_CYCLE_HEAP_BYTES`] instead of its build's value, and whether a
+    /// slice's time is capped ([`SLICE_MAX_TIME`]; the cycle tests count cells instead).
+    #[cfg(test)]
+    min_cycle_heap_bytes: Option<usize>,
+    #[cfg(test)]
+    uncapped_slices: bool,
     #[cfg(test)]
     retention_tracing: bool,
     /// The last traced collection's mark sources, by cell start.
@@ -1956,6 +1982,10 @@ impl Heap {
             incremental: IncrementalMode::Off,
             cycle: None,
             #[cfg(test)]
+            min_cycle_heap_bytes: None,
+            #[cfg(test)]
+            uncapped_slices: false,
+            #[cfg(test)]
             retention_tracing: false,
             #[cfg(test)]
             last_parents: FastMap::default(),
@@ -1996,6 +2026,12 @@ impl Heap {
     #[inline]
     fn phase_clock(&self) -> Option<std::time::Instant> {
         self.phase_timing.then(std::time::Instant::now)
+    }
+
+    /// W6 step 4: the clock of a cycle's start or slice, read while phases are timed or the heap
+    /// paces its growth, whose major collections' speed counts the slices' time.
+    fn cycle_clock(&self) -> Option<std::time::Instant> {
+        (self.phase_timing || self.pacing.is_some()).then(std::time::Instant::now)
     }
 
     /// Record `phase` as having run since `started` (from [`Heap::phase_clock`]), and restart
@@ -2240,6 +2276,11 @@ impl Heap {
         self.cycle.is_some()
     }
 
+    /// W6: whether the heap's own major collections mark in cycles ([`Heap::set_incremental`]).
+    pub(crate) fn incremental(&self) -> IncrementalMode {
+        self.incremental
+    }
+
     /// W6: the running cycle's progress (the GC log's slice lines).
     pub(crate) fn cycle_progress(&self) -> Option<CycleProgress> {
         self.cycle.as_ref().map(|cycle| CycleProgress {
@@ -2308,17 +2349,67 @@ impl Heap {
             };
         }
         // An embedder's request for a major collection (`Heap::request_major`) is one: the
-        // boundary it collects at expects the graph it released gone after it.
+        // boundary it collects at expects the graph it released gone after it. A heap at or
+        // below V8's activation threshold marks in one pause (step 4).
         match requested.unwrap_or_else(|| self.due_kind()) {
             CollectionKind::Major
                 if heap_choice
                     && !self.major_requested
-                    && self.incremental != IncrementalMode::Off =>
+                    && self.incremental != IncrementalMode::Off
+                    && self.cycle_heap_size_reached() =>
             {
                 DueWork::StartCycle
             }
             kind => DueWork::Collect(kind),
         }
+    }
+
+    /// W6 step 4: whether the heap, with the external bytes still charged, holds more than
+    /// [`MIN_CYCLE_HEAP_BYTES`], or the cycles are forced: whether a major collection the heap
+    /// asks for may mark in a cycle.
+    #[cold]
+    #[inline(never)]
+    fn cycle_heap_size_reached(&self) -> bool {
+        #[cfg(test)]
+        let floor = self.min_cycle_heap_bytes.unwrap_or(MIN_CYCLE_HEAP_BYTES);
+        #[cfg(not(test))]
+        let floor = MIN_CYCLE_HEAP_BYTES;
+        self.incremental == IncrementalMode::Force
+            || self
+                .allocated_bytes
+                .saturating_add(self.control.external.live.get())
+                > floor
+    }
+
+    /// W6 step 4: the size past which a minor collection's sweep makes a major collection due:
+    /// the byte budget, or with incremental marking V8's soft limit, one nursery's budget below
+    /// it, so that the cycle marks while the program allocates the rest (V8 starts marking once
+    /// the room below its limit is a young generation's capacity or less,
+    /// src/heap/heap.cc:5620-5671). A soft limit at or below [`MIN_CYCLE_HEAP_BYTES`] stays the
+    /// budget: its major collection marks in one pause.
+    #[inline(never)]
+    fn major_due_bytes(&self) -> usize {
+        if self.incremental == IncrementalMode::Off {
+            return self.trigger_bytes;
+        }
+        #[cfg(test)]
+        let floor = self.min_cycle_heap_bytes.unwrap_or(MIN_CYCLE_HEAP_BYTES);
+        #[cfg(not(test))]
+        let floor = MIN_CYCLE_HEAP_BYTES;
+        let soft = self
+            .trigger_bytes
+            .saturating_sub(self.nursery_bytes.unwrap_or(0));
+        if soft > floor {
+            soft
+        } else {
+            self.trigger_bytes
+        }
+    }
+
+    /// W6 step 4 (tests): [`MIN_CYCLE_HEAP_BYTES`] for this heap.
+    #[cfg(test)]
+    pub(crate) fn set_min_cycle_heap_bytes(&mut self, bytes: usize) {
+        self.min_cycle_heap_bytes = Some(bytes);
     }
 
     /// The heap's control block, shared with the containers that charge external bytes to it
@@ -3785,7 +3876,10 @@ impl Heap {
             !self.control.collecting.replace(true),
             "re-entrant GC collection"
         );
-        let started = self.phase_clock();
+        let started = self.cycle_clock();
+        // The start's phases, for the GC log's start line (`TRUST_JS_GC_LOG`).
+        self.stats.last_phase_nanos = [0; PHASES];
+        let mut clock = self.phase_clock();
         // One marking from here to the final pause: a cell made from now on is young at the next.
         self.control.markings.set(self.control.markings.get() + 1);
         self.update_fast_alloc();
@@ -3808,17 +3902,20 @@ impl Heap {
         if native_roots {
             scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
         }
+        self.phase_done(Phase::Begin, &mut clock);
         let mut m = Marker::default();
         #[cfg(test)]
         {
             m.parents = self.retention_tracing.then(FastMap::default);
         }
         client.roots(&mut |word| self.mark_word(word, &mut m));
+        self.phase_done(Phase::Roots, &mut clock);
         if native_roots {
             #[cfg(not(target_arch = "wasm32"))]
             scrub_stack(BEGIN_MARKING_SCRUB_BYTES);
             self.mark_native_stack(&mut m);
         }
+        self.phase_done(Phase::Stack, &mut clock);
         #[cfg(test)]
         {
             m.source = MarkSource::Root;
@@ -3828,6 +3925,7 @@ impl Heap {
         // collections come as owners, whose entries the slices discover.
         self.add_source_edges(&mut m, client);
         self.add_side_slot_owners(&mut m, client);
+        self.phase_done(Phase::Side, &mut clock);
         let allocated = self.allocated_bytes;
         let mut cycle = Box::new(Cycle {
             marker: m,
@@ -3840,9 +3938,12 @@ impl Heap {
             precleaned: 0,
             last_precleaned: 0,
             round_traced: 0,
+            preclean_page: None,
+            started: std::time::Instant::now(),
             complete: false,
         });
         self.run_slice(&mut cycle, client, started);
+        self.phase_done(Phase::Drain, &mut clock);
         self.cycle = Some(cycle);
         self.control.collecting.set(false);
         self.update_fast_alloc();
@@ -3868,7 +3969,7 @@ impl Heap {
             !self.control.collecting.replace(true),
             "re-entrant GC collection"
         );
-        let started = self.phase_clock();
+        let started = self.cycle_clock();
         self.update_fast_alloc();
         self.control.pending_collect.set(false);
         self.allocs_since_gc = 0;
@@ -3890,28 +3991,44 @@ impl Heap {
         client: &dyn MarkClient,
         started: Option<std::time::Instant>,
     ) {
-        let budget = match self.incremental {
-            IncrementalMode::Force => SliceBudget::Cells(FORCED_SLICE_CELLS),
-            IncrementalMode::On | IncrementalMode::Off => SliceBudget::Bytes(
-                self.allocated_bytes
-                    .saturating_sub(cycle.allocated_at_slice)
-                    .saturating_mul(SLICE_MARK_FACTOR)
-                    .max(SLICE_BYTES),
-            ),
+        let (budget, deadline) = match self.incremental {
+            IncrementalMode::Force => (SliceBudget::Cells(FORCED_SLICE_CELLS), None),
+            IncrementalMode::On | IncrementalMode::Off => {
+                #[cfg(test)]
+                let cap = if self.uncapped_slices {
+                    std::time::Duration::from_secs(3600)
+                } else {
+                    SLICE_MAX_TIME
+                };
+                #[cfg(not(test))]
+                let cap = SLICE_MAX_TIME;
+                let deadline = std::time::Instant::now() + cap;
+                (
+                    SliceBudget::Bytes(self.slice_bytes(cycle), deadline),
+                    Some(deadline),
+                )
+            }
         };
         let (out_of_work, traced) = self.drain_within(&mut cycle.marker, client, budget);
         cycle.last_traced = traced;
         cycle.round_traced = cycle.round_traced.saturating_add(traced);
         // Once the worklist runs out, a preclean, until a round (a preclean and the drain of what
         // it found) is small: then the final pause.
-        let small_round = cycle.precleans > 0
-            && cycle.last_precleaned < PRECLEAN_DONE_CELLS
-            && cycle.round_traced < PRECLEAN_DONE_BYTES;
-        cycle.complete = out_of_work && (small_round || self.preclean(cycle) == 0);
-        // Verification's mode (design 11) precleans at every slice's end too, so that precleaning
-        // runs as often as slicing, in every state of the marking and of the allocation cursors.
-        if !out_of_work && self.incremental == IncrementalMode::Force {
-            self.preclean(cycle);
+        if out_of_work {
+            cycle.complete = match cycle.preclean_page {
+                Some(page) => self.preclean_pages(cycle, page, deadline),
+                None => {
+                    let small_round = cycle.precleans > 0
+                        && cycle.last_precleaned < PRECLEAN_DONE_CELLS
+                        && cycle.round_traced < PRECLEAN_DONE_BYTES;
+                    small_round || self.preclean(cycle, deadline)
+                }
+            };
+        } else if self.incremental == IncrementalMode::Force {
+            // Verification's mode (design 11) precleans at every slice's end too, so that
+            // precleaning runs as often as slicing, in every state of the marking and of the
+            // allocation cursors (its slices have no deadline: the pass completes).
+            self.preclean(cycle, deadline);
         }
         cycle.slices += 1;
         cycle.allocated_at_slice = self.allocated_bytes;
@@ -3939,24 +4056,87 @@ impl Heap {
     /// so that the final pause rescans only the cells written after the cycle's last preclean, as
     /// JSC rescans the cells its barrier re-greyed at each of its marking's stops. Not on a
     /// timer: a program's hot cells would be rescanned at every preclean. It starts a round,
-    /// whose drain `run_slice` counts. The cells found.
-    fn preclean(&mut self, cycle: &mut Cycle) -> usize {
+    /// whose drain `run_slice` counts, with a pass over the pages ([`Heap::preclean_pages`]).
+    /// Whether the cycle's marking is complete.
+    fn preclean(&mut self, cycle: &mut Cycle, deadline: Option<std::time::Instant>) -> bool {
+        cycle.precleans += 1;
+        cycle.last_precleaned = 0;
+        cycle.round_traced = 0;
+        self.preclean_pages(cycle, 0, deadline)
+    }
+
+    /// W6 step 4: the pass of the cycle's preclean over the pages from `first`, taking their
+    /// cards until `deadline`; it resumes in the next slice when the deadline passes (a slice's
+    /// time is capped, and a pass can take hundreds of thousands of cells). Whether the cycle's
+    /// marking is complete: the pass found no written cell.
+    fn preclean_pages(
+        &mut self,
+        cycle: &mut Cycle,
+        first: usize,
+        deadline: Option<std::time::Instant>,
+    ) -> bool {
         // A young page's walk over its marked cells stops at its `next_unused`, which the
         // allocation cursors bring up to date only when flushed (as a collection starts): flushed
         // first, a cell allocated since, traced and then written, is not left out with its card
-        // cleared.
+        // cleared. A pass the next slice resumes flushes again.
         self.flush_cursors();
-        let found = self.take_cycle_card_cells(&mut cycle.marker);
-        cycle.precleans += 1;
+        let verifies = self.verifies();
+        let m = &mut cycle.marker;
+        let queued = m.worklist.len();
+        let mut next = None;
+        for index in first..self.pages.len() {
+            if deadline.is_some_and(|deadline| {
+                index > first
+                    && (index - first).is_multiple_of(PRECLEAN_CLOCK_PAGES)
+                    && std::time::Instant::now() >= deadline
+            }) {
+                next = Some(index);
+                break;
+            }
+            if let Some(page) = self.pages[index].as_mut() {
+                if verifies {
+                    page.take_card_cells_checked(&mut m.worklist);
+                } else {
+                    page.take_card_cells::<true>(&mut m.worklist);
+                }
+            }
+        }
+        let found = m.worklist.len() - queued;
         cycle.precleaned += found;
-        cycle.last_precleaned = found;
-        cycle.round_traced = 0;
-        found
+        cycle.last_precleaned += found;
+        cycle.preclean_page = next;
+        next.is_none() && cycle.last_precleaned == 0
+    }
+
+    /// W6 step 4: the bytes a slice of `cycle` traces at most, before its 1 ms cap: what V8's
+    /// schedule asks, the bytes behind the larger of two expectations, and at least [`SLICE_BYTES`]
+    /// (V8's step when marking makes no progress, src/heap/base/incremental-marking-schedule.cc:
+    /// 99-130). The heap's bytes at the cycle's start stand for what it marks, as V8's old
+    /// generation size does. By time: V8's, those bytes marked over 500 ms. By allocation: those
+    /// bytes marked once the cycle has allocated half the room it has before the margin forces its
+    /// final pause, so that it finishes before the margin while the program allocates fast.
+    #[inline(never)]
+    fn slice_bytes(&self, cycle: &Cycle) -> usize {
+        let estimate = cycle.allocated_at_start as f64;
+        let elapsed = cycle.started.elapsed().as_secs_f64();
+        let by_time = estimate * (elapsed / CYCLE_MARKING_TIME.as_secs_f64()).min(1.0);
+        let room = self
+            .trigger_bytes
+            .saturating_add(self.cycle_margin())
+            .saturating_sub(cycle.allocated_at_start)
+            .max(1) as f64;
+        let allocated = self
+            .allocated_bytes
+            .saturating_sub(cycle.allocated_at_start) as f64;
+        let by_allocation = estimate * (allocated / (room / 2.0)).min(1.0);
+        let behind = (by_time.max(by_allocation) as usize).saturating_sub(self.marked_bytes);
+        behind.max(SLICE_BYTES)
     }
 
     /// W6: queue for full traces every marked cell of the heap that starts in a set card, and
-    /// clear the cards (a cycle's preclean and its final pause): the number queued. With heap
-    /// verification, each page's take is checked against a walk over its every cell.
+    /// clear the cards (a cycle's final pause; a preclean takes them a pass at a time,
+    /// [`Heap::preclean_pages`]): the number queued. With heap verification, each page's take is
+    /// checked against a walk over its marks.
     fn take_cycle_card_cells(&mut self, m: &mut Marker) -> usize {
         let queued = m.worklist.len();
         let verifies = self.verifies();
@@ -4007,8 +4187,15 @@ impl Heap {
         if self.pacing.is_some() {
             self.committed_at_mark = self.committed_bytes();
             let allocated = self.allocated_bytes.saturating_sub(self.swept_bytes);
+            // The slices' time counts in the major collection's speed (step 4), but not under
+            // `Force`, whose slices of a few cells, each with a preclean and checks, time the
+            // verification rather than the marking.
+            let forced = self.incremental == IncrementalMode::Force;
             if let Some(pacing) = &mut self.pacing {
                 pacing.start(std::time::Instant::now(), allocated);
+                if !forced {
+                    pacing.cycle_marked(std::time::Duration::from_nanos(cycle.slice_nanos));
+                }
             }
         }
         let mut m = cycle.marker;
@@ -4043,6 +4230,7 @@ impl Heap {
         // marked already still costs its trace.
         let mut traced_bytes = 0usize;
         let mut traced = 0usize;
+        let mut fired = 0usize;
         let mut ahead = [TraceWork {
             cell: 0,
             desc: DescId(0),
@@ -4085,9 +4273,11 @@ impl Heap {
                 }
                 traced += 1;
                 let spent = match budget {
-                    SliceBudget::Bytes(bytes) => {
+                    SliceBudget::Bytes(bytes, deadline) => {
                         traced_bytes += self.cell_bytes(cell);
                         traced_bytes >= bytes
+                            || (traced.is_multiple_of(SLICE_CLOCK_CELLS)
+                                && std::time::Instant::now() >= deadline)
                     }
                     SliceBudget::Cells(cells) => {
                         traced_bytes += self.cell_bytes(cell);
@@ -4107,6 +4297,17 @@ impl Heap {
             }
             if let Some(edge) = m.ready.pop() {
                 self.try_fire(edge, m, client);
+                // A side-slot owner's slots can take long to trace: the deadline counts the
+                // edges fired as it counts the cells traced (step 4).
+                fired += 1;
+                if let SliceBudget::Bytes(_, deadline) = budget {
+                    if fired.is_multiple_of(SLICE_CLOCK_CELLS)
+                        && std::time::Instant::now() >= deadline
+                    {
+                        self.add_discovered_edges(m, client);
+                        return (false, traced_bytes);
+                    }
+                }
                 continue;
             }
             // Out of work: the entries of the weak collections marked since (step 2b), whose
@@ -4378,8 +4579,9 @@ impl Heap {
                 };
             }
             // The old cells, live or not, and the payloads still charged have passed the byte
-            // budget: a major collection is due, at the next safepoint.
-            CollectionKind::Minor => self.major_due |= size > self.trigger_bytes,
+            // budget, or with incremental marking its soft limit: a major collection is due, at
+            // the next safepoint.
+            CollectionKind::Minor => self.major_due |= size > self.major_due_bytes(),
         }
         // The next external budget. A collection the external charges made due, whose sweep
         // released less than a quarter of what was charged since the last one, found those bytes
@@ -10300,6 +10502,8 @@ mod tests {
         let mut fx = Fixture::new();
         fx.heap.set_collect_on_alloc(false);
         fx.heap.set_incremental(IncrementalMode::On);
+        // The tests count the cells a slice traces: no slice stops at its time cap.
+        fx.heap.uncapped_slices = true;
         let mut chain = Vec::new();
         let mut next = 0;
         for i in 0..n {
@@ -10436,6 +10640,154 @@ mod tests {
         );
         fx.heap.finish_collection(&[]);
         assert_eq!(fx.live(), 5);
+    }
+
+    /// W6 step 4: a slice's drain stops at its deadline, which it reads every
+    /// `SLICE_CLOCK_CELLS` cells, whatever bytes its schedule asked.
+    #[test]
+    fn a_slice_stops_at_its_deadline() {
+        let (mut fx, _chain) = cycle_fixture(20_000);
+        assert!(start_cycle(&mut fx));
+        let mut cycle = fx.heap.cycle.take().unwrap();
+        let before = fx.heap.marked_bytes;
+        let budget = SliceBudget::Bytes(usize::MAX, std::time::Instant::now());
+        let (out_of_work, traced) = fx.heap.drain_within(&mut cycle.marker, &NoClient, budget);
+        assert!(!out_of_work);
+        assert_eq!(
+            traced,
+            SLICE_CLOCK_CELLS * 16,
+            "one clock's cells, of 16 bytes"
+        );
+        assert!(fx.heap.marked_bytes > before);
+        fx.heap.cycle = Some(cycle);
+    }
+
+    /// W6 step 4: a preclean's pass over the pages stops at its slice's deadline, which it reads
+    /// every `PRECLEAN_CLOCK_PAGES` pages, and the next slice resumes it where it stopped; the
+    /// cycle's marking is complete only once a whole pass found no written cell.
+    #[test]
+    fn a_preclean_pass_resumes_in_the_next_slice_after_its_deadline() {
+        let (mut fx, chain) = cycle_fixture(PRECLEAN_CLOCK_PAGES as u64 * 6_000);
+        assert!(start_cycle(&mut fx));
+        slice_to_completion(&mut fx);
+        let pages = fx.heap.pages.len();
+        assert!(pages > PRECLEAN_CLOCK_PAGES, "{pages} pages");
+        // Every chain cell written: every page has cards set.
+        for &cell in &chain {
+            // SAFETY: a live carded cell of this heap.
+            unsafe { card_mark(cell) };
+        }
+        let mut cycle = fx.heap.cycle.take().unwrap();
+        cycle.complete = false;
+        let precleans = cycle.precleans;
+        let past = Some(std::time::Instant::now());
+        assert!(
+            !fx.heap.preclean(&mut cycle, past),
+            "the pass stopped early"
+        );
+        assert_eq!(cycle.preclean_page, Some(PRECLEAN_CLOCK_PAGES));
+        let first = cycle.last_precleaned;
+        assert!(first > 0 && first < chain.len(), "{first}");
+        assert!(!fx
+            .heap
+            .preclean_pages(&mut cycle, PRECLEAN_CLOCK_PAGES, None));
+        assert_eq!(cycle.preclean_page, None, "the pass ended");
+        assert_eq!(cycle.precleans, precleans + 1, "one pass, in two parts");
+        assert_eq!(
+            cycle.last_precleaned,
+            chain.len(),
+            "every written cell, once"
+        );
+        fx.heap.cycle = Some(cycle);
+    }
+
+    /// W6 step 4: a slice asks the bytes behind the larger of V8's time schedule and the
+    /// allocation schedule, and at least `SLICE_BYTES`: here none behind by time (the cycle
+    /// started now), and by allocation half the estimate once a quarter of the room is allocated.
+    #[test]
+    fn a_slice_asks_the_bytes_behind_its_allocation_schedule() {
+        let (mut fx, _chain) = cycle_fixture(1_000);
+        assert!(start_cycle(&mut fx));
+        let mut cycle = fx.heap.cycle.take().unwrap();
+        cycle.started = std::time::Instant::now();
+        fx.heap.trigger_bytes = 64 << 20;
+        cycle.allocated_at_start = 32 << 20;
+        let room = (64 << 20) + fx.heap.cycle_margin() - (32 << 20);
+        fx.heap.allocated_bytes = cycle.allocated_at_start + room / 4;
+        fx.heap.marked_bytes = 1 << 20;
+        let asked = fx.heap.slice_bytes(&cycle);
+        // Half the room allocated would be all 32 MB marked; a quarter, 16 MB, 15 MB behind.
+        let expected = (16 << 20) - (1 << 20);
+        assert!(asked.abs_diff(expected) < 1 << 10, "{asked} for {expected}");
+        fx.heap.allocated_bytes = cycle.allocated_at_start;
+        assert_eq!(
+            fx.heap.slice_bytes(&cycle),
+            SLICE_BYTES,
+            "nothing behind: V8's step"
+        );
+        fx.heap.cycle = Some(cycle);
+    }
+
+    /// A heap with a nursery whose minor collections have filled its old generation to `old`
+    /// bytes of rooted cells (no pacing, a budget of `budget` bytes, a nursery of `nursery`).
+    fn soft_limit_fixture(old: usize, budget: usize, nursery: usize) -> Fixture {
+        let mut fx = Fixture::new();
+        fx.heap.set_collect_on_alloc(false);
+        fx.heap.set_nursery_bytes(Some(nursery));
+        fx.heap.set_heap_growth(budget, 100);
+        let mut next = 0;
+        for _ in 0..old / 16 {
+            let p = fx.heap.alloc(fx.node, 16);
+            set_word(p, 0, next);
+            next = tagged(p);
+        }
+        fx.roots[0] = next;
+        fx.collect_minor();
+        fx
+    }
+
+    /// W6 step 4: with incremental marking, a minor collection whose sweep leaves the heap within
+    /// one nursery's budget of the byte budget makes a major collection due, which starts a cycle
+    /// (V8's soft limit); without, the heap waits for the budget.
+    #[test]
+    fn a_cycle_starts_once_the_room_below_the_budget_is_a_nurserys_budget() {
+        let (budget, nursery) = (4 << 20, 1 << 20);
+        for (mode, starts) in [(IncrementalMode::On, true), (IncrementalMode::Off, false)] {
+            let mut fx = soft_limit_fixture(budget - (nursery / 2), budget, nursery);
+            fx.heap.set_incremental(mode);
+            fx.heap.set_min_cycle_heap_bytes(0);
+            // A minor collection measures the heap against the limit as it sweeps.
+            fx.collect_minor();
+            assert!(
+                fx.heap.stats().live_bytes < budget,
+                "{mode:?}: below the budget"
+            );
+            assert_eq!(fx.heap.major_due, starts, "{mode:?}");
+            let expected = if starts {
+                DueWork::StartCycle
+            } else {
+                DueWork::Collect(CollectionKind::Minor)
+            };
+            assert_eq!(fx.heap.due_work(None, true, false), expected, "{mode:?}");
+        }
+    }
+
+    /// W6 step 4: a heap at or below V8's activation threshold marks its own major collections in
+    /// one pause, incremental marking on or not, unless the cycles are forced.
+    #[test]
+    fn a_heap_below_the_activation_threshold_marks_in_one_pause() {
+        let (budget, nursery) = (4 << 20, 1 << 20);
+        for (mode, work) in [
+            (IncrementalMode::On, DueWork::Collect(CollectionKind::Major)),
+            (IncrementalMode::Force, DueWork::StartCycle),
+        ] {
+            let mut fx = soft_limit_fixture(budget + nursery, budget, nursery);
+            fx.heap.set_incremental(mode);
+            fx.heap.set_min_cycle_heap_bytes(64 << 20);
+            fx.collect_minor();
+            assert!(fx.heap.major_due, "{mode:?}: past the budget");
+            assert_eq!(fx.heap.due_work(None, true, false), work, "{mode:?}");
+        }
     }
 
     /// W6: while a cycle marks, allocation past the nursery's budget brings a slice, not a minor
@@ -10623,7 +10975,7 @@ mod tests {
         let mut cycle = fx.heap.cycle.take().unwrap();
         cycle.complete = false;
         assert!(
-            fx.heap.preclean(&mut cycle) >= 1,
+            !fx.heap.preclean(&mut cycle, None),
             "the preclean found the written cell"
         );
         assert!(cycle

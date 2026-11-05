@@ -1852,6 +1852,23 @@ impl Engine {
         self.interp.run_memory_reducer(now)
     }
 
+    /// Whether a marking cycle is running (`TRUST_JS_GC_INCREMENTAL`), whose marking the host's
+    /// idle time can advance with [`Engine::advance_incremental_marking`].
+    pub fn incremental_marking_running(&self) -> bool {
+        self.interp.incremental_marking_running()
+    }
+
+    /// Advance the running marking cycle by a slice of at most a millisecond, or end it with its
+    /// final pause once nothing is left to mark, between tasks: V8's incremental marking job
+    /// posts a task for each such step to its embedder's task runner, which runs them while the
+    /// event loop waits (src/heap/incremental-marking-job.cc:80-137). Returns whether a cycle was
+    /// running. Inlined: the stack below the host's frame is zeroed first (see
+    /// `Interp::gc_collect`).
+    #[inline(always)]
+    pub fn advance_incremental_marking(&mut self) -> bool {
+        self.interp.advance_incremental_marking()
+    }
+
     /// Tell the memory reducer that much of the heap may just have become garbage, as V8's
     /// embedders do when a document or frame goes away: unless it waits already, it collects
     /// 8 s later if the program is quiet then.

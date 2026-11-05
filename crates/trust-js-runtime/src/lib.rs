@@ -514,6 +514,17 @@ impl Runtime {
                     continue;
                 }
             }
+            // A marking cycle (TRUST_JS_GC_INCREMENTAL) advances meanwhile, a slice of at most a
+            // millisecond at a time, as V8's incremental marking job's tasks run while Node's
+            // loop waits; each pass through the loop first runs whatever became runnable.
+            if self.engine.incremental_marking_running() {
+                let next = self.next_timer_deadline().into_iter().chain(reducer).min();
+                if next.is_none_or(|deadline| deadline > Instant::now())
+                    && self.engine.advance_incremental_marking()
+                {
+                    continue;
+                }
+            }
             let reducer = reducer.filter(|due| *due > now);
             match self.next_timer_deadline().into_iter().chain(reducer).min() {
                 Some(deadline) => {

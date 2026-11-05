@@ -1547,7 +1547,7 @@ impl Interp {
     /// collection is.
     #[cold]
     #[inline(never)]
-    fn gc_heap_start_cycle(
+    pub(super) fn gc_heap_start_cycle(
         &mut self,
         heap: &crate::value::GcHeap,
         cause: crate::value::GcCause,
@@ -1631,14 +1631,22 @@ impl Interp {
         let Some(progress) = core.cycle_progress() else {
             return;
         };
-        // The start's marking is the cycle's so far.
-        let marked = if phase == "start" {
-            progress.marked
+        // The start's marking is the cycle's so far; its line adds the heap's phases (the rest of
+        // its pause is the engine's: the client, the stack's scrubbing, the records).
+        let (marked, phases) = if phase == "start" {
+            let stats = core.stats();
+            let phases = crate::gc_core::Phase::NAMES
+                .iter()
+                .zip(stats.last_phase_nanos)
+                .take(5)
+                .map(|(name, nanos)| format!(" {name}={:.0}", nanos as f64 / 1000.0))
+                .collect::<String>();
+            (progress.marked, phases)
         } else {
-            marked
+            (marked, String::new())
         };
         eprintln!(
-            "[gc-slice] phase={phase} cause={cause:?} n={} traced={} marked={marked} cycle_marked={} worklist={} cycle_alloc={} precleans={} precleaned={} complete={} us: pause={pause:.0}",
+            "[gc-slice] phase={phase} cause={cause:?} n={} traced={} marked={marked} cycle_marked={} worklist={} cycle_alloc={} precleans={} precleaned={} complete={} us: pause={pause:.0}{phases}",
             progress.slices,
             progress.traced,
             progress.marked,
