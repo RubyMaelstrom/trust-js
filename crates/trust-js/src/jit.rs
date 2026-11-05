@@ -13062,13 +13062,15 @@ fn emit_set_prop_inline(
 /// coercion or content compares*, in machine code. Both-number pairs FCMP (IEEE: unordered is
 /// unequal); loose nullish operands resolve by the other side's tag; same-tag Bools compare
 /// payloads; same-tag Sym/Obj compare identity; same-tag Strs compare identity, then length (a
-/// length mismatch is a definitive "not equal"; equal lengths fall to the helper's content
+/// length mismatch is a definitive "not equal"; equal lengths fall to the slow path's content
 /// compare); strict different-tag pairs are unequal outright. Everything else — BigInt pairs,
 /// coercing mixed-type pairs, a loose nullish-vs-object compare on a non-ordinary object
-/// (`ic_plain` off — which includes the `[[IsHTMLDDA]]` object) — takes the helper. Every guard
-/// branches to `slow` before any state is written. With `branch`, the result drives a fused
-/// `JumpIfFalse` directly (no Bool materializes); otherwise the Bool pushes in place of the
-/// operands.
+/// (`ic_plain` off — which includes the `[[IsHTMLDDA]]` object) — takes the slow path: the
+/// shared [`SharedStub::Equal`] stub, which compares two Strings' keys or contents itself and
+/// calls the checked helper for the rest (the helper itself where the compiler emits no shared
+/// stubs, and at a string accumulation's start). Every guard branches to `slow` before any
+/// state is written. With `branch`, the result drives a fused `JumpIfFalse` directly (no Bool
+/// materializes); otherwise the Bool pushes in place of the operands.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13240,7 +13242,7 @@ fn emit_eq_inline(
     a.b(l_false);
     a.bind(l_ptr_same);
     a.b(l_true);
-    // Str: identity → equal; different lengths → unequal; same length → helper (content).
+    // Str: identity → equal; different lengths → unequal; same length → the slow path (content).
     a.bind(l_str);
     emit_exec_word_load(a, 12, 20, -16);
     emit_exec_payload(a, 12, 12);
@@ -13302,17 +13304,26 @@ fn emit_eq_inline(
         }
     }
     a.bind(slow);
-    if strict {
-        emit_op_helper(a, H_STRICT_EQ, pc, l_unwind);
+    if a.stubs_ok() && shared_stubs_enabled() && a.string_accumulation(pc).is_none() {
+        // The stub takes the operands from the stack again (x12 and x13 hold payloads on some
+        // paths here). V8's Sparkplug calls its compare builtins for what it does not decide in
+        // line (baseline-compiler.cc, VISIT_TYPED_COMPARE_OPERATION), JSC's Baseline
+        // operationCompareStrictEq after its constant and Int32 paths (JITOpcodes.cpp,
+        // compileOpStrictEq).
+        emit_equal_call(a, pc, l_unwind, strict, negate, branch, false);
     } else {
-        emit_exec(a, pc, l_unwind);
-    }
-    if let Some(target) = branch {
-        // Both equality helpers always push a Bool. Consume it directly instead of calling
-        // ToBoolean through a second helper.
-        a.ldurb(1, 20, -8);
-        a.sub_imm(20, 20, 8);
-        a.cbz(1, false, target);
+        if strict {
+            emit_op_helper(a, H_STRICT_EQ, pc, l_unwind);
+        } else {
+            emit_exec(a, pc, l_unwind);
+        }
+        if let Some(target) = branch {
+            // Both equality helpers always push a Bool. Consume it directly instead of calling
+            // ToBoolean through a second helper.
+            a.ldurb(1, 20, -8);
+            a.sub_imm(20, 20, 8);
+            a.cbz(1, false, target);
+        }
     }
     a.bind(done);
 }
@@ -13480,12 +13491,13 @@ fn emit_equal_site(
     a.bind(done);
 }
 
-/// A compact equality's call of the shared [`SharedStub::Equal`] stub, with w1 = the site's
-/// pc: the stub compares the two operands on the stack (`tagged`: whose words the site left in
-/// x12 and x13, not two Numbers), calls the checked helper itself for what it cannot decide, and
-/// returns the operation's Boolean pushed or, with `branch`, in w9 for the branch. V8's Sparkplug
-/// calls its compare builtins for every comparison (baseline-compiler.cc, VisitTestEqualStrict),
-/// SpiderMonkey's Baseline its site's IC (BaselineCodeGen.cpp, emitCompare).
+/// An equality's call of the shared [`SharedStub::Equal`] stub (a compact site's, and the slow
+/// path of [`emit_eq_inline`]), with w1 = the site's pc: the stub compares the two operands on
+/// the stack (`tagged`: whose words the site left in x12 and x13, not two Numbers), calls the
+/// checked helper itself for what it cannot decide, and returns the operation's Boolean pushed
+/// or, with `branch`, in w9 for the branch. V8's Sparkplug calls its compare builtins for every
+/// comparison (baseline-compiler.cc, VisitTestEqualStrict), SpiderMonkey's Baseline its site's
+/// IC (BaselineCodeGen.cpp, emitCompare).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -13519,16 +13531,17 @@ fn emit_equal_call(
     }
 }
 
-/// The shared stub of compact equality sites (see [`emit_equal_site`]), for one (strict, negate)
-/// pair and result form: the work of [`emit_eq_inline`], once per process. Two Numbers compare
-/// with FCMP; one word is the same value (but the canonical NaN); two Strings compare by their
-/// keys when both carry one (one key a text, `lstr::KEY_MARK`), else by length, else by content
-/// when both are flat buffers of one width and at most 64 bytes; a strict pair of other words
-/// of different tags, or of Objects, Symbols or Booleans, is unequal; a loose pair of
-/// `undefined` and `null` is equal, and either is unequal to any other value but an
-/// [[IsHTMLDDA]] Object, which `ic_plain` rules out. The rest (BigInts, longer or mixed-width
-/// String contents, loose coercions) calls the checked helper with the site's pc in w1, as the
-/// in-line template's slow path does. Clobbers x0-x17, d0, d1 and NZCV.
+/// The shared stub of compact equality sites (see [`emit_equal_site`]) and of the in-line
+/// template's slow path, for one (strict, negate) pair and result form: the work of
+/// [`emit_eq_inline`] and more, once per process. Two Numbers compare with FCMP; one word is the
+/// same value (but the canonical NaN); two Strings compare by their keys when both carry one
+/// (one key a text, `lstr::KEY_MARK`), else by length, else by content when both are flat
+/// buffers of one width and at most 64 bytes; a strict pair of other words of different tags,
+/// or of Objects, Symbols or Booleans, is unequal; a loose pair of `undefined` and `null` is
+/// equal, and either is unequal to any other value but an [[IsHTMLDDA]] Object, which
+/// `ic_plain` rules out. The rest (BigInts, longer or mixed-width String contents, loose
+/// coercions) calls the checked helper with the site's pc in w1. Clobbers x0-x17, d0, d1 and
+/// NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")

@@ -3,9 +3,10 @@
 //! (`bytecode::literal_truthiness`); a first-stage site outside loops tests a constant right
 //! operand in line (`jit::emit_eq_constant`) and calls a shared stub for the rest
 //! (`jit::emit_equal_stub`, `jit::emit_not_stub`), which calls the checked helper itself for
-//! what it cannot decide. Every function here compiles at its first call, so each runs as
-//! first-stage native code at `Tier::Jit`; the tree-walker, which keeps the source's evaluation
-//! order, gives the expected results.
+//! what it cannot decide. In loop bodies, sites keep the in-line template (`jit::emit_eq_inline`),
+//! whose slow path calls the same stub. Every function here compiles at its first call, so each
+//! runs as first-stage native code at `Tier::Jit`; the tree-walker, which keeps the source's
+//! evaluation order, gives the expected results.
 
 use crate::bytecode::{Chunk, Op, Tier};
 use crate::{Completion, Engine};
@@ -115,6 +116,67 @@ fn equality_and_not_agree_with_the_tree_walker() {
     assert!(expected.lines().count() > 300, "the matrix ran");
     for tier in [Tier::Bytecode, Tier::Jit] {
         let actual = eval(&mut engine(tier), MATRIX);
+        let differ: Vec<usize> = expected
+            .lines()
+            .zip(actual.lines())
+            .enumerate()
+            .filter_map(|(line, (want, got))| (got != want).then_some(line))
+            .collect();
+        assert!(differ.is_empty(), "{tier:?}: lines {differ:?} differ");
+        assert_eq!(actual, expected, "{tier:?}");
+    }
+}
+
+/// Equality in loop bodies, whose sites keep the in-line template (`jit::emit_eq_inline`): what
+/// it leaves undecided (two Strings of one length, BigInts, loose coercions) takes its slow path,
+/// the shared Equal stub, which compares two Strings itself and calls the checked helper for the
+/// rest. Pairs of one length: equal and unequal contents, flat and view, one- and two-byte,
+/// keyed and not, short and past the stub's 64 bytes; as values, branches and negated branches,
+/// against a constant too, and a loose comparison whose coercion throws.
+const LOOP_MATRIX: &str = r#"
+var long = "";
+for (var i = 0; i < 300; i++) long += String.fromCharCode(97 + (i % 26));
+var mid = long.substring(0, 40);
+var keyed = Object.keys({ abc: 1, abd: 2, length: 3 });
+var pairs = [
+  ["abc", "ab".concat("c")], ["abc", "abd"], ["abc", keyed[0]], [keyed[0], keyed[1]],
+  ["été", "ét".concat("é")], ["été", "étè"], ["aāc", "aā".concat("c")],
+  ["aāc", "abc"], ["Ābc", "abc"], [mid, long.substring(0, 39).concat(mid.charAt(39))],
+  [mid, long.substring(1, 41)], [long, long.substring(0, 299) + long.charAt(299)],
+  [long, long.substring(0, 299) + "x"], [long.substring(1), long.substring(1, 300)],
+  ["length", "lengtH"], ["", "".concat("")], ["a", "b"], ["0", 0], ["1", 1], ["abc", 1],
+  [0n, 0n], [1n << 70n, (1n << 70n) + 0n], [1n << 70n, 1n << 71n], [1n, 1], [1n, "1"],
+  [null, undefined], [null, 0], [undefined, ""], [{}, {}], [new String("abc"), "abc"],
+  [{ valueOf() { return 1; } }, 1], [true, 1], [false, ""], [NaN, NaN], [0, -0],
+  [Symbol.iterator, Symbol.iterator], [Symbol("s"), Symbol("s")],
+];
+var xs = [], ys = [];
+for (var p of pairs) { xs.push(p[0], p[1], p[0]); ys.push(p[1], p[0], p[0]); }
+var ops = ["===", "!==", "==", "!="];
+var lines = [];
+for (var op of ops) {
+  var forms = [
+    "var r = ''; for (var i = 0; i < xs.length; i++) r += (xs[i] " + op + " ys[i]) + ','; return r;",
+    "var r = ''; for (var i = 0; i < xs.length; i++) { if (xs[i] " + op + " ys[i]) r += '1'; else r += '0'; } return r;",
+    "var r = ''; for (var i = 0; i < xs.length; i++) { if (!(xs[i] " + op + " ys[i])) r += '1'; else r += '0'; } return r;",
+    "var r = ''; for (var i = 0; i < xs.length; i++) r += (xs[i] " + op + " ys[i]) ? 'y' : 'n'; return r;",
+    "var r = ''; for (var i = 0; i < xs.length; i++) r += (xs[i] " + op + " 'abc') + (xs[i] " + op + " 'été' ? 'y' : 'n'); return r;",
+  ];
+  for (var body of forms) lines.push(new Function("xs", "ys", body)(xs, ys));
+}
+var thrower = { valueOf() { throw new Error("boom"); } };
+var throwing = new Function("xs",
+  "var r = ''; for (var i = 0; i < xs.length; i++) { try { r += (xs[i] == 1) ? 'y' : 'n'; } catch (e) { r += e.message; } } return r;");
+lines.push(throwing([1, thrower, "1", thrower, 2]));
+lines.join("\n");
+"#;
+
+#[test]
+fn equality_in_loops_agrees_with_the_tree_walker() {
+    let expected = eval(&mut engine(Tier::Interp), LOOP_MATRIX);
+    assert_eq!(expected.lines().count(), 21, "the matrix ran: {expected}");
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let actual = eval(&mut engine(tier), LOOP_MATRIX);
         let differ: Vec<usize> = expected
             .lines()
             .zip(actual.lines())
