@@ -4111,10 +4111,13 @@ impl Heap {
     /// W6 step 4: the bytes a slice of `cycle` traces at most, before its 1 ms cap: what V8's
     /// schedule asks, the bytes behind the larger of two expectations, and at least [`SLICE_BYTES`]
     /// (V8's step when marking makes no progress, src/heap/base/incremental-marking-schedule.cc:
-    /// 99-130). The heap's bytes at the cycle's start stand for what it marks, as V8's old
-    /// generation size does. By time: V8's, those bytes marked over 500 ms. By allocation: those
-    /// bytes marked once the cycle has allocated half the room it has before the margin forces its
-    /// final pause, so that it finishes before the margin while the program allocates fast.
+    /// 99-130). By time: V8's, the heap's bytes at the cycle's start (as V8's old generation
+    /// size) marked over 500 ms. By allocation: those bytes and the cycle's own allocation marked
+    /// once the cycle has allocated half the room it has before the margin forces its final
+    /// pause, so that it finishes before the margin while the program allocates fast: the cells a
+    /// cycle allocates are white, and those that survive are its marking too (Splay's), which
+    /// V8's estimate leaves out for its young generation (its TODO, src/heap/incremental-
+    /// marking.cc:686-687).
     #[inline(never)]
     fn slice_bytes(&self, cycle: &Cycle) -> usize {
         let estimate = cycle.allocated_at_start as f64;
@@ -4128,7 +4131,7 @@ impl Heap {
         let allocated = self
             .allocated_bytes
             .saturating_sub(cycle.allocated_at_start) as f64;
-        let by_allocation = estimate * (allocated / (room / 2.0)).min(1.0);
+        let by_allocation = (estimate + allocated) * (allocated / (room / 2.0)).min(1.0);
         let behind = (by_time.max(by_allocation) as usize).saturating_sub(self.marked_bytes);
         behind.max(SLICE_BYTES)
     }
@@ -10703,7 +10706,8 @@ mod tests {
 
     /// W6 step 4: a slice asks the bytes behind the larger of V8's time schedule and the
     /// allocation schedule, and at least `SLICE_BYTES`: here none behind by time (the cycle
-    /// started now), and by allocation half the estimate once a quarter of the room is allocated.
+    /// started now), and by allocation half of the starting bytes and the cycle's allocation
+    /// once a quarter of the room is allocated.
     #[test]
     fn a_slice_asks_the_bytes_behind_its_allocation_schedule() {
         let (mut fx, _chain) = cycle_fixture(1_000);
@@ -10716,8 +10720,9 @@ mod tests {
         fx.heap.allocated_bytes = cycle.allocated_at_start + room / 4;
         fx.heap.marked_bytes = 1 << 20;
         let asked = fx.heap.slice_bytes(&cycle);
-        // Half the room allocated would be all 32 MB marked; a quarter, 16 MB, 15 MB behind.
-        let expected = (16 << 20) - (1 << 20);
+        // Half the room allocated would be all 32 MB marked with the cycle's allocation; a
+        // quarter, half of the 32 MB and the quarter's bytes, less the 1 MB marked.
+        let expected = ((32 << 20) + room / 4) / 2 - (1 << 20);
         assert!(asked.abs_diff(expected) < 1 << 10, "{asked} for {expected}");
         fx.heap.allocated_bytes = cycle.allocated_at_start;
         assert_eq!(
