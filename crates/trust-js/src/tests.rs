@@ -22893,7 +22893,14 @@ fn cross_realm_calls_keep_shared_intrinsic_tables_exact_across_collections() {
             ok + "/" + total
         "#;
         assert_eq!(run_in(&mut engine, setup), "80/80", "{tier:?}");
-        assert_eq!(run_in(&mut engine, "$262.gc(); 'collected'"), "collected");
+        // The reclamation is asserted after a host collection, run with no JavaScript frame on
+        // the native stack. The stack is scanned conservatively (Decision 0): a collection
+        // that JavaScript requests runs under the frames of its call, whose unwritten slots can
+        // hold stale cell addresses, which retain falsely (never unsoundly) whatever they name.
+        // V8's tests assert collection with conservative stack scanning off
+        // (DisableConservativeStackScanningScopeForTesting), Oilpan's with no heap pointers on
+        // the stack (StackState::kNoHeapPointers).
+        engine.interp.gc_collect();
         assert_eq!(
             run_in(
                 &mut engine,
