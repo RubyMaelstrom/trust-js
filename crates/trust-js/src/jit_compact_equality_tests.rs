@@ -80,6 +80,10 @@ for (var op of ops) {
 fns.push(function (x) { return !x; });
 fns.push(function (x) { if (!x) return 1; return 0; });
 fns.push(function (x) { return !!x; });
+fns.push(function (x) { return x && 1; });
+fns.push(function (x) { return x || 2; });
+fns.push(function (x) { if (x) return 1; return 0; });
+fns.push(function (x) { return x ?? 3; });
 var lines = [];
 for (var fn of fns) {
   var line = "";

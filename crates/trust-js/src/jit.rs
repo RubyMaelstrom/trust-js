@@ -5438,7 +5438,7 @@ fn compile_entry(
                 && a.string_accumulation(pc as u32).is_none()
             {
                 if let Some((target, after)) = fused_branch(pc + 1) {
-                    emit_not_site(&mut a, pc as u32, Some(target));
+                    emit_not_site(&mut a, Some(target));
                     if let Some(after) = after {
                         a.b(after);
                     }
@@ -5671,7 +5671,15 @@ fn compile_entry(
                 a.cbz(9, false, pc_labels[*t as usize]);
                 a.b(done);
                 a.bind(slow);
-                emit_cond(&mut a, COND_POP_TRUTHY, l_unwind);
+                if compact_templates(&a) {
+                    // Any other value's ToBoolean in the shared stub, as JSC's Baseline keeps
+                    // op_jfalse's Boolean test in line and calls a thunk for the rest
+                    // (JITOpcodes.cpp, emit_op_jfalse, valueIsFalseyGenerator).
+                    let stub = a.shared_stub(SharedStub::ToBoolean(ToBooleanForm::Pop).key());
+                    a.bl_label(stub);
+                } else {
+                    emit_cond(&mut a, COND_POP_TRUTHY, l_unwind);
+                }
                 a.cbz(1, false, pc_labels[*t as usize]);
                 a.bind(done);
             }
@@ -12419,7 +12427,8 @@ fn emit_instanceof_inline(
 /// at the receiver Object and the incoming value at sp-16. A hit leaves x12 at its IcState and
 /// x13 holding the current entries length and x7 at a replacement layout cell (zero keeps the
 /// current prediction), then branches to `commit`; a miss has no side effects. Clobbers x7, x9
-/// and x12..x17 only.
+/// and x12..x17 only. The site's key word is `name`'s, or with `name` None x6's, in the shared
+/// [`SharedStub::PropWrite`] stub, whose way count is x5 (which the record's growth keeps).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -12427,7 +12436,7 @@ fn emit_instanceof_inline(
 fn emit_prop_create_probe(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
-    name: &str,
+    name: Option<&str>,
     miss: usize,
     commit: usize,
 ) {
@@ -12504,8 +12513,13 @@ fn emit_prop_create_probe(
     a.bind(plain_key);
     a.ldr_imm(16, 16, layout.layout_keys_ptr as u32);
     a.ldr_x_lsl3(17, 16, 13);
-    a.mov_imm64(14, crate::atom::PropKey::from_text(name).word());
-    a.cmp_reg_x(17, 14);
+    match name {
+        Some(name) => {
+            a.mov_imm64(14, crate::atom::PropKey::from_text(name).word());
+            a.cmp_reg_x(17, 14);
+        }
+        None => a.cmp_reg_x(17, 6),
+    }
     a.b_cond(C_NE, transition_layout);
     a.b(key_ready);
     a.bind(transition_layout);
@@ -12541,10 +12555,16 @@ fn emit_prop_create_probe(
     a.stp_off(10, 11, 16);
     a.stp_off(12, 13, 32);
     a.str_imm(30, 31, 48);
+    if name.is_none() {
+        a.str_imm(5, 31, 56);
+    }
     a.mov(0, 10);
     a.mov(1, 13);
     a.ldr_imm(16, 21, (H_GROW_NAMED_RECORD * 8) as u32);
     a.blr(16);
+    if name.is_none() {
+        a.ldr_imm(5, 31, 56);
+    }
     a.ldr_imm(30, 31, 48);
     a.ldp_off(12, 13, 32);
     a.ldp_off(10, 11, 16);
@@ -12605,6 +12625,191 @@ fn debug_assert_object_in_cell_card(layout: &crate::value::JitLayout) {
     );
 }
 
+/// Whether a named store's site may create its property through a creation way: not an index's
+/// name, `length` or `prototype`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn store_may_create(name: &str) -> bool {
+    !name.is_empty()
+        && !name.as_bytes()[0].is_ascii_digit()
+        && name != "length"
+        && name != "prototype"
+}
+
+/// A compact named store's options (see [`SharedStub::PropWrite`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct PropWriteFlags {
+    /// The receiver is the operand under the value (`[x20 - 16]`), not `this` or a local.
+    stack: bool,
+    /// The store is an expression (`Op::SetProp`): the value replaces the receiver operand.
+    keep: bool,
+    /// The site may create the property (a name that is no index, `length` or `prototype`):
+    /// the creation ways' probe, with the site's key word in x6.
+    create: bool,
+}
+
+/// A first-stage named store outside loops whose cache was empty when its code was compiled
+/// (see [`emit_set_prop_inline`]): the receiver's load and object-tag test stay in line, with
+/// the cache's address in x8 and, for a store that may create the property, the site's key word
+/// in x6 (an atom's address, which lives as long as the heap the code belongs to); the shared
+/// [`SharedStub::PropWrite`] stub does the rest, and a decline takes the helper's stub call, as
+/// the in-line template's slow path does. V8's Sparkplug calls a builtin for a named store
+/// (StoreICBaseline), SpiderMonkey's Baseline its site's IC stub.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_prop_write_site(
+    a: &mut asm::Asm,
+    cache_ptr: usize,
+    name: &str,
+    pc: u32,
+    l_unwind: usize,
+    recv: PropRecv,
+    flags: PropWriteFlags,
+) {
+    let slow = a.new_label();
+    let done = a.new_label();
+    match recv {
+        PropRecv::Stack => emit_exec_word_load(a, 9, 20, -16),
+        PropRecv::This => emit_exec_word_load(a, 9, 19, 48), // ctx.this_word
+        PropRecv::Slot(off) => emit_exec_word_load(a, 9, 22, off as i32),
+    }
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
+    emit_exec_payload(a, 9, 10);
+    a.mov_imm64(8, cache_ptr as u64);
+    if flags.create {
+        a.mov_imm64(6, crate::atom::PropKey::from_text(name).word());
+    }
+    let stub = a.shared_stub(SharedStub::PropWrite(flags).key());
+    a.bl_label(stub);
+    a.cbnz(9, false, done);
+    a.bind(slow);
+    emit_op_helper(a, H_SET_PROP, pc, l_unwind);
+    a.bind(done);
+}
+
+/// The compact named store's shared stub (see [`SharedStub::PropWrite`]): the work a first-stage
+/// store site carried in line (see [`emit_set_prop_inline`]), once per process. x10 = the
+/// receiver Object, x8 = the site's first `IcState` cell, x6 = the site's key word (`create`).
+/// The receiver's exotic kind and `ic_plain` byte, each way's own-data update (its receiver
+/// shape and slot bound; a filled way proves the property writable) or creation transition
+/// (`emit_prop_create_probe`: the prototype, the epoch, extensibility, the map's room, the
+/// record grown when the new slot lacks it), the value's store, the write barrier's card mark
+/// and, for a creation, the layout, the shape and the length; then the operands' pops. Returns
+/// w9 = 1 when stored, 0 for the site's helper with nothing written. Clobbers x5, x7, x9 and
+/// x11-x17.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_prop_write_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, flags: PropWriteFlags) {
+    use crate::bytecode::{
+        IC_CREATE, IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
+    };
+    let PropWriteFlags {
+        stack,
+        keep,
+        create,
+    } = flags;
+    debug_assert!(!keep || stack);
+    let sh = (layout.obj_props + layout.props_shape) as u32;
+    let miss = a.new_label();
+    let commit = a.new_label();
+    let create_commit = a.new_label();
+    if keep {
+        // Never admit TDZ/property-only words as a JavaScript result.
+        emit_exec_word_load(a, 16, 20, -8);
+        emit_exec_kind(a, 16, 9, 14, miss);
+        a.cmp_imm_w(9, 1);
+        a.b_cond(C_EQ, miss);
+    }
+    a.add_imm(11, 10, layout.obj_from_cell as u32);
+    a.ldrb_imm(9, 11, layout.obj_kind as u32);
+    guard_exotic_ordinary(a, layout, 9, 9, miss);
+    a.ldrb_imm(9, 11, layout.obj_flags as u32);
+    a.tbz(9, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
+    // The ways, x5 left, x8 the cursor.
+    let way = a.new_label();
+    let next = a.new_label();
+    a.movz(5, crate::bytecode::PROP_IC_WAYS as u32, 0);
+    a.bind(way);
+    a.mov(12, 8);
+    if create {
+        let update = a.new_label();
+        a.ldrb_imm(9, 12, IC_OFF_DEPTH);
+        a.cmp_imm_w(9, IC_CREATE as u32);
+        a.b_cond(C_NE, update);
+        emit_prop_create_probe(a, layout, None, next, create_commit);
+        a.bind(update);
+    }
+    a.ldrb_imm(9, 12, IC_OFF_DEPTH);
+    a.cbnz(9, false, next);
+    a.ldr_w_imm(13, 12, IC_OFF_SLOT);
+    a.ldr_w_imm(14, 12, IC_OFF_RECV_SHAPE);
+    a.ldr_w_imm(9, 11, sh);
+    a.cmp_reg_w(9, 14);
+    a.b_cond(C_NE, next);
+    named_len(a, layout, 16, 11);
+    a.cmp_reg_x(13, 16);
+    a.b_cond(C_HS, next);
+    a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+    slot_addr_loc(a, layout, 15, 11, 14);
+    a.b(commit);
+    a.bind(next);
+    let ic_stride = std::mem::size_of::<std::cell::Cell<crate::bytecode::IcState>>();
+    a.add_imm(8, 8, ic_stride as u32);
+    a.sub_imm(5, 5, 1);
+    a.cbnz(5, false, way);
+    a.bind(miss);
+    a.movz(9, 0, 0);
+    a.ret();
+    // The operands' pops: the value replaces a receiver operand for an expression's result.
+    let pop = |a: &mut asm::Asm| {
+        if stack {
+            if keep {
+                emit_exec_word_store(a, 16, 20, -16);
+                a.sub_imm(20, 20, 8);
+            } else {
+                a.sub_imm(20, 20, 16);
+            }
+        } else {
+            a.sub_imm(20, 20, 8);
+        }
+        a.movz(9, 1, 0);
+        a.ret();
+    };
+    a.bind(commit);
+    emit_exec_word_load(a, 16, 20, -8);
+    a.stur(16, 15, 0);
+    emit_card_mark(a, 10, 9, 17);
+    pop(a);
+    if create {
+        a.bind(create_commit);
+        let layout_installed = a.new_label();
+        a.cbz(7, true, layout_installed);
+        a.str_imm(7, 11, (layout.obj_props + layout.props_layout) as u32);
+        a.bind(layout_installed);
+        a.ldrh_imm(14, 12, crate::bytecode::IC_OFF_LOC);
+        slot_addr_loc(a, layout, 15, 11, 14);
+        emit_exec_word_load(a, 16, 20, -8);
+        a.stur(16, 15, 0);
+        emit_card_mark(a, 10, 9, 17);
+        a.ldr_w_imm(14, 12, IC_OFF_HOLDER_SHAPE);
+        a.str_w_imm(14, 11, sh);
+        a.add_imm(13, 13, 1);
+        named_set_len(a, layout, 13, 11);
+        pop(a);
+    }
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -12626,6 +12831,28 @@ fn emit_set_prop_inline(
 ) {
     debug_assert!(!keep || matches!(recv, PropRecv::Stack));
     use crate::bytecode::{IC_OFF_DEPTH, IC_OFF_RECV_SHAPE, IC_OFF_SLOT};
+    // A store outside loops whose cache was empty when its code was compiled (every store of a
+    // function's first native code, compiled at its first bytecode run): the compact form, whose
+    // shared stub carries the ways, the commit and the card mark (see `emit_prop_write_site`).
+    // As for the reads, a site whose bytecode runs filled its cache keeps the in-line template.
+    let cold = cache_ptr != 0
+        && (0..crate::bytecode::PROP_IC_WAYS).all(|way| {
+            // SAFETY: a site's ways are consecutive cells of its chunk's cache table, which
+            // outlives the compile.
+            let way = unsafe {
+                (*(cache_ptr as *const std::cell::Cell<crate::bytecode::IcState>).add(way)).get()
+            };
+            way.depth == crate::bytecode::IC_EMPTY
+        });
+    if cold && a.stubs_ok() && use_shared_stub(a) {
+        let flags = PropWriteFlags {
+            stack: matches!(recv, PropRecv::Stack),
+            keep,
+            create: store_may_create(name),
+        };
+        emit_prop_write_site(a, cache_ptr, name, pc, l_unwind, recv, flags);
+        return;
+    }
     let obj_off = layout.obj_from_cell as u32;
     let ex = layout.obj_kind as u32;
     let sh = (layout.obj_props + layout.props_shape) as u32;
@@ -12670,10 +12897,7 @@ fn emit_set_prop_inline(
     // Creation IC: constructors repeatedly assign a named field to a fresh receiver whose map
     // lacks it (see `emit_prop_create_probe`). Its ways share the site's cells with ordinary
     // update ways; the single way loop below dispatches on each way's kind.
-    let create_ok = !name.is_empty()
-        && !name.as_bytes()[0].is_ascii_digit()
-        && name != "length"
-        && name != "prototype";
+    let create_ok = store_may_create(name);
     let create_commit = a.new_label();
     // 3-8 per way (sites allocate PROP_IC_WAYS consecutive cells; the Rust fast path probes
     // all of them, so the template must too or a rotating store site helper-calls forever):
@@ -12721,7 +12945,7 @@ fn emit_set_prop_inline(
             a.ldrb_imm(9, 12, IC_OFF_DEPTH);
             a.cmp_imm_w(9, IC_CREATE as u32);
             a.b_cond(C_NE, update_way);
-            emit_prop_create_probe(a, layout, name, l_way_next, create_commit);
+            emit_prop_create_probe(a, layout, Some(name), l_way_next, create_commit);
             a.bind(update_way);
         }
         way(a, 0, l_way_next);
@@ -13069,7 +13293,7 @@ fn emit_eq_inline(
 ))]
 fn emit_not_inline(a: &mut asm::Asm, layout: &crate::value::JitLayout, pc: u32, l_unwind: usize) {
     if compact_templates(a) && a.string_accumulation(pc).is_none() {
-        emit_not_site(a, pc, None);
+        emit_not_site(a, None);
         return;
     }
     let len_off = crate::lstr::LEN_OFF as u32;
@@ -13490,38 +13714,70 @@ fn emit_equal_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, flags: Eq
     a.ret();
 }
 
-/// A compact `!` site (see [`compact_templates`]): w1 = the site's pc and a call to the shared
-/// [`SharedStub::Not`] stub, which returns the negated ToBoolean pushed in place of the operand
-/// or, with `branch` (a fused `JumpIfFalse`'s target), in w9 for the branch. V8's Sparkplug calls
-/// ToBooleanForBaselineJump for `!` (baseline-compiler.cc, VisitToBooleanLogicalNot),
-/// SpiderMonkey's Baseline its ToBool IC (BaselineCodeGen.cpp, emit_Not).
+/// What a compact ToBoolean site does with its operand and the Boolean (see
+/// [`SharedStub::ToBoolean`]).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_not_site(a: &mut asm::Asm, pc: u32, branch: Option<usize>) {
-    a.movz(1, pc, 0);
-    let stub = a.shared_stub(
-        SharedStub::Not {
-            push: branch.is_none(),
-        }
-        .key(),
-    );
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToBooleanForm {
+    /// `!`: the negated Boolean replaces the operand.
+    Not,
+    /// `!` feeding a JumpIfFalse: the operand popped, w1 = the negated Boolean.
+    NotBranch,
+    /// A short-circuit branch (`&&`, `||`): the operand kept, w1 = its Boolean.
+    Peek,
+    /// JumpIfFalse past its in-line Boolean test: the operand popped, w1 = its Boolean.
+    Pop,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl ToBooleanForm {
+    const ALL: [ToBooleanForm; 4] = [
+        ToBooleanForm::Not,
+        ToBooleanForm::NotBranch,
+        ToBooleanForm::Peek,
+        ToBooleanForm::Pop,
+    ];
+}
+
+/// A compact `!` site (see [`compact_templates`]): a call to the shared [`SharedStub::ToBoolean`]
+/// stub, which returns the negated ToBoolean in place of the operand or, with `branch` (a fused
+/// `JumpIfFalse`'s target), in w1 for the branch. V8's Sparkplug calls ToBooleanForBaselineJump
+/// for `!` (baseline-compiler.cc, VisitToBooleanLogicalNot), SpiderMonkey's Baseline its ToBool
+/// IC (BaselineCodeGen.cpp, emit_Not).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_not_site(a: &mut asm::Asm, branch: Option<usize>) {
+    let form = if branch.is_some() {
+        ToBooleanForm::NotBranch
+    } else {
+        ToBooleanForm::Not
+    };
+    let stub = a.shared_stub(SharedStub::ToBoolean(form).key());
     a.bl_label(stub);
     if let Some(target) = branch {
-        a.cbz(9, false, target);
+        // JumpIfFalse jumps when `!x` is false.
+        a.cbz(1, false, target);
     }
 }
 
-/// The shared stub of compact `!` sites (see [`emit_not_site`]): [`emit_not_inline`]'s work,
-/// once per process. A BigInt's ToBoolean takes the generic helper with the site's pc in w1;
-/// ToBoolean neither throws nor allocates, so that call needs neither a flag test nor a poll.
-/// Clobbers x0-x17, d0 and NZCV.
+/// The shared stub of compact ToBoolean sites, `!` (see [`emit_not_site`]) and the branches on
+/// a value's truthiness (see [`emit_peek_cond_inline`], JumpIfFalse): [`emit_not_inline`]'s and
+/// [`emit_peek_cond_inline`]'s work, once per process. A BigInt's ToBoolean, and an Object's that
+/// may be [[IsHTMLDDA]], take the condition helper (COND_PEEK_TRUTHY), which neither throws nor
+/// allocates, so its call needs neither a flag test nor a poll. Clobbers x0-x17, d0 and NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_not_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, push: bool) {
+fn emit_to_boolean_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, form: ToBooleanForm) {
     use crate::value::{PACK_BOOL, PACK_OBJ, PACK_STR, PACK_SYM};
     let tagged = a.new_label();
     let boolean = a.new_label();
@@ -13531,12 +13787,12 @@ fn emit_not_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, push: bool)
     let result = a.new_label();
     let slow = a.new_label();
     a.ldur(12, 20, -8);
-    // A Number is falsy when it is a zero (FCMP equal) or NaN, which compares unordered like
+    // A Number is truthy unless it is a zero (FCMP equal) or NaN, which compares unordered like
     // every tagged word.
     a.fmov_d_x(0, 12);
     a.fcmp_zero(0);
     a.b_cond(C_VS, tagged);
-    a.cset_w(9, C_EQ);
+    a.cset_w(1, C_NE);
     a.b(result);
     a.bind(tagged);
     a.lsr_imm(10, 12, 48);
@@ -13561,43 +13817,46 @@ fn emit_not_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, push: bool)
     a.ldrb_imm(11, 11, layout.obj_flags as u32);
     a.tbz(11, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
     a.bind(truthy);
-    a.movz(9, 0, 0);
+    a.movz(1, 1, 0);
     a.b(result);
     a.bind(boolean);
-    let one = asm::logical_imm_w(1).unwrap();
-    a.logic_imm_w(0, 9, 12, one);
-    a.logic_imm_w(2, 9, 9, one);
+    a.logic_imm_w(0, 1, 12, asm::logical_imm_w(1).unwrap());
     a.b(result);
     a.bind(string);
     emit_exec_payload(a, 12, 11);
     a.ldr_w_imm(11, 11, crate::lstr::LEN_OFF as u32);
     a.cmp_imm_w(11, 0);
-    a.cset_w(9, C_EQ);
+    a.cset_w(1, C_NE);
     a.b(result);
     a.bind(falsy);
-    a.movz(9, 1, 0);
+    a.movz(1, 0, 0);
+    // w1 = ToBoolean of the operand.
     a.bind(result);
-    if push {
-        a.mov_imm64(10, PACK_BOOL);
-        a.logic_x(1, 10, 10, 9);
-        a.stur(10, 20, -8);
-    } else {
-        a.sub_imm(20, 20, 8);
+    match form {
+        ToBooleanForm::Not => {
+            a.logic_imm_w(2, 1, 1, asm::logical_imm_w(1).unwrap());
+            a.mov_imm64(10, PACK_BOOL);
+            a.logic_x(1, 10, 10, 1);
+            a.stur(10, 20, -8);
+        }
+        ToBooleanForm::NotBranch => {
+            a.logic_imm_w(2, 1, 1, asm::logical_imm_w(1).unwrap());
+            a.sub_imm(20, 20, 8);
+        }
+        ToBooleanForm::Peek => {}
+        ToBooleanForm::Pop => a.sub_imm(20, 20, 8),
     }
     a.ret();
+    // The condition helper's ToBoolean of the operand it leaves in place; x20 is callee-saved.
     a.bind(slow);
     a.stp_pre(29, 30, -16);
     a.mov(0, 19);
+    a.movz(1, COND_PEEK_TRUTHY, 0);
     a.mov(2, 20);
-    a.ldr_imm(16, 21, (H_EXEC * 8) as u32);
+    a.ldr_imm(16, 21, (H_COND * 8) as u32);
     a.blr(16);
-    a.mov(20, 0);
-    if !push {
-        a.ldurb(9, 20, -8);
-        a.sub_imm(20, 20, 8);
-    }
     a.ldp_post(29, 30, 16);
-    a.ret();
+    a.b(result);
 }
 
 /// An equality's right operand when the operation before it pushes a constant that a compact
@@ -14330,14 +14589,25 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     Equal(EqualFlags),
-    /// [`emit_not_stub`], a compact `!` site (see [`emit_not_site`]): the operand at
-    /// `[x20 - 8]`, w1 = the site's pc → with `push`, the operation's Boolean in its place;
-    /// without, w9 = the result, 0 or 1, with the operand popped. It cannot throw.
+    /// [`emit_to_boolean_stub`], a compact ToBoolean site (`!`, see [`emit_not_site`]; a branch on
+    /// a value's truthiness): the operand at `[x20 - 8]` → as `form` says, the negated Boolean in
+    /// its place, or w1 = the Boolean (negated for `!`'s branch) with the operand popped or kept.
+    /// It cannot throw.
     #[cfg(all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
-    Not { push: bool },
+    ToBoolean(ToBooleanForm),
+    /// [`emit_prop_write_stub`], a first-stage named store outside loops whose cache was empty
+    /// when it was compiled (see [`emit_prop_write_site`]): x10 = the receiver Object, x8 = the
+    /// site's first `IcState` cell, x6 = the site's key word when `create`, the value at
+    /// `[x20 - 8]` → w9 = 1 when stored (the operands popped as the form pops them), 0 for the
+    /// site's helper call with nothing written.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    PropWrite(PropWriteFlags),
     /// [`emit_call_ways`], a call site's probe after way 0's identity misses: its inputs →
     /// w9 = hit, with x12/x15 set as at the primary hit label.
     #[cfg(all(
@@ -14500,7 +14770,8 @@ impl SharedStub {
     const ELEM_STORE: u32 = 0xe00;
     const PROP_READ: u32 = 0xf00;
     const EQUAL: u32 = 0x1000;
-    const NOT: u32 = 0x1100;
+    const TO_BOOLEAN: u32 = 0x1100;
+    const PROP_WRITE: u32 = 0x1200;
 
     fn key(self) -> u32 {
         match self {
@@ -14550,7 +14821,17 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::Not { push } => Self::NOT | u32::from(push),
+            SharedStub::ToBoolean(form) => Self::TO_BOOLEAN | form as u32,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::PropWrite(flags) => {
+                Self::PROP_WRITE
+                    | u32::from(flags.stack)
+                    | u32::from(flags.keep) << 1
+                    | u32::from(flags.create) << 2
+            }
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14670,7 +14951,16 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            Self::NOT => SharedStub::Not { push: key & 1 != 0 },
+            Self::TO_BOOLEAN => SharedStub::ToBoolean(ToBooleanForm::ALL[(key & 3) as usize]),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::PROP_WRITE => SharedStub::PropWrite(PropWriteFlags {
+                stack: key & 1 != 0,
+                keep: key & 2 != 0,
+                create: key & 4 != 0,
+            }),
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -14782,7 +15072,15 @@ impl SharedStub {
                     ("tagged", flags.tagged),
                 ],
             ),
-            SharedStub::Not { push } => named("Not", &[("push", push)]),
+            SharedStub::ToBoolean(form) => format!("Stub:ToBoolean({form:?})"),
+            SharedStub::PropWrite(flags) => named(
+                "PropWrite",
+                &[
+                    ("stack", flags.stack),
+                    ("keep", flags.keep),
+                    ("create", flags.create),
+                ],
+            ),
             SharedStub::CallSecondary => named("CallSecondary", &[]),
             SharedStub::DirectCall { argc, with_this } => format!(
                 "Stub:DirectCall(argc={argc}{})",
@@ -14944,7 +15242,12 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::Not { push } => emit_not_stub(a, layout, push),
+            SharedStub::ToBoolean(form) => emit_to_boolean_stub(a, layout, form),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::PropWrite(flags) => emit_prop_write_stub(a, layout, flags),
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -21271,6 +21574,26 @@ fn emit_peek_cond_inline(
     not_nullish: bool,
     l_unwind: usize,
 ) {
+    if !not_nullish && compact_templates(a) {
+        // A Boolean in line, any other value in the shared ToBoolean stub (w1 = the Boolean,
+        // the operand kept), as JSC's Baseline tests a Boolean in line before its thunk
+        // (JITOpcodes.cpp, emit_op_jtrue) and V8's Sparkplug its static roots before
+        // ToBooleanForBaselineJump (baseline-compiler.cc, JumpIfToBoolean).
+        let call = a.new_label();
+        let done = a.new_label();
+        emit_exec_word_load(a, 9, 20, -8);
+        a.mov_imm64(10, crate::value::PACK_BOOL);
+        a.logic_x(2, 10, 9, 10); // eor: a Boolean's payload, 0 or 1; any other word is larger
+        a.cmp_imm_x(10, 1);
+        a.b_cond(C_HI, call);
+        a.mov_w(1, 10);
+        a.b(done);
+        a.bind(call);
+        let stub = a.shared_stub(SharedStub::ToBoolean(ToBooleanForm::Peek).key());
+        a.bl_label(stub);
+        a.bind(done);
+        return;
+    }
     let done = a.new_label();
     let l_false = a.new_label();
     emit_exec_word_load(a, 12, 20, -8);
