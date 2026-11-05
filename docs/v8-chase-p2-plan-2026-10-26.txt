@@ -14940,3 +14940,51 @@ under force, stress 100 (every 2nd major) and verification 2,603/2,603 in both t
 142 s); under force and verification without stress at small budgets 2,603/2,603 in both tiers
 (31 s, 139 s); zombie x86-64: clippy x3 clean, lib 2,610/2,610 (325 s); TypeScript with the cycle on (fat LTO, pacing on, so the pool forms),
 8 runs on CPUs 10-11: no crash.
+
+### W6's exit, timed (record, 2026-11-05)
+
+Main e50f5725's engine (fat LTO, target/p2/lto/e50f5725; main 867ac484), incremental marking off
+(the default) and on (TRUST_JS_GC_INCREMENTAL=1), pinned to CPU 5 under the timing hold, rounds
+rotating, the other load 1.8-2.3 cores (the desktop and a game); target/p2/w6-exit (session.sh,
+engine.jsonl, pauses-off.md, pauses-on.md).
+
+Octane (median of 10; higher is better): SplayLatency 4,177 off, 8,529 on (+104%); Splay 4,359 and
+4,474 (+2.6%); the score 4,142 and 4,337 (+4.7%); every other benchmark within 0.5%; peak RSS +1.2%.
+Web Tooling (one round): geomean 1.43 either way, peak RSS +5.3% (3.73 to 3.92 GB). The fixtures
+(median of 10, against Node limited to Sparkplug): Vue 207 and 206 ms (113.5), React 31 and 31.5
+(16), Djot 91 and 90.5 (39); their peak RSS +1-3% on. The sustained allocation workload's peak RSS
+-2.6% on.
+
+The largest pauses (ms), every workload once with TRUST_JS_GC_LOG=1 at the default pacing:
+
+| workload | off: major | on: start | on: slice (p99) | on: final |
+| --- | --- | --- | --- | --- |
+| TypeScript | 271.07 | 1.32 | 1.03 (0.62) | 3.57 |
+| splay-real (SplayLatency's driver) | 58.54 | 0.88 | 0.56 (0.30) | 2.63 |
+| Splay | 32.03 | 0.36 | 0.26 (0.18) | 0.34 |
+| chai | 5.49 | 1.96 | 0.12 (0.12) | 3.27 |
+| sustained allocation | 5.10 | 0.20 | 1.98 (1.34) | 1.14 |
+| EarleyBoyer | 3.74 | 0.48 | 0.24 (0.21) | 1.70 |
+| PdfJS | 2.72 | 0.75 | 0.20 (0.20) | 1.20 |
+| Gameboy | 2.48 | 0.44 | 0.31 (0.31) | 1.19 |
+
+The only major collection left in one pause with the cycle on is zlib's 0.59 ms (ArrayBuffer
+pressure, a collection that wants marking now). Minor collections are not W6's: TypeScript's up to
+38.6 ms, splay-real's 17.6 ms, Splay's 17.0 ms.
+
+Against the exit (proposed in W6's design, the owner's numbers):
+- SplayLatency >= 6,446, median of 10: 8,529. Met.
+- No pause of a major collection, a slice or a final pause above 5 ms on the fixtures, chai, the
+  sustained workload and Octane: the largest is TypeScript's 3.57 ms final pause. Met.
+- Slices at most 1 ms but for the one that starts a cycle: the sustained allocation workload's
+  1.98 ms (one array's whole block) and TypeScript's 1.03 ms are over. Large blocks traced in
+  chunks across slices, as V8's MarkingProgressTracker does, are being built (the W6 agent's step 6
+  item, with the forks decided as recommended: V8's 128 KiB chunks, a card take restarting a block
+  as JSC rescans a re-greyed cell, V8's accounting); sa's slices are re-measured with it.
+- No workload slower beyond noise in instructions at pacing off: each step's counts within noise.
+  Met.
+- Test262 identical; the lib suite and Test262 under GC stress with TRUST_JS_GC_INCREMENTAL=force
+  and TRUST_JS_GC_VERIFY: per step; the stage end's full runs (with the force-and-verification run
+  at small budgets, no stress) follow the chunking and the default-on commit.
+- Peak RSS reported: above.
+Then the cycle on by default (TRUST_JS_GC_INCREMENTAL=0 to turn it off).
