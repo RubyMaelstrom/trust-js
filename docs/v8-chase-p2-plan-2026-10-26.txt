@@ -14945,8 +14945,11 @@ under force, stress 100 (every 2nd major) and verification 2,603/2,603 in both t
 
 Main e50f5725's engine (fat LTO, target/p2/lto/e50f5725; main 867ac484), incremental marking off
 (the default) and on (TRUST_JS_GC_INCREMENTAL=1), pinned to CPU 5 under the timing hold, rounds
-rotating, the other load 1.8-2.3 cores (the desktop and a game); target/p2/w6-exit (session.sh,
-engine.jsonl, pauses-off.md, pauses-on.md).
+rotating, the other load a median 2.0-2.3 cores a run (the desktop, a game, and between about
+08:05 and 08:30 another agent's single-threaded profiles on CPU 14, started without the hold
+check; one cycle-off Octane round at 6.0); target/p2/w6-exit (session.sh, engine.jsonl,
+pauses-off.md, pauses-on.md). SplayLatency on lay between 8,425 and 8,661 in all ten rounds (off
+3,775-4,839), so the overlap does not bear on the verdict.
 
 Octane (median of 10; higher is better): SplayLatency 4,177 off, 8,529 on (+104%); Splay 4,359 and
 4,474 (+2.6%); the score 4,142 and 4,337 (+4.7%); every other benchmark within 0.5%; peak RSS +1.2%.
