@@ -15689,3 +15689,340 @@ WHAT FOLLOWS
   doubled per retry); a chain would count its bails and its chunk recompile once without the
   stale state. A design note first.
 
+
+### Today's in-line templates: two slow paths through shared stubs (record, 2026-11-05)
+
+The coordinator's item (B), from the tier-up measurement: two weaknesses of today's in-line
+templates (second stages, loop bodies) that the compact first stage does not share, each its
+own commit on p2-fallbacks, from main ce9a19e3:
+
+- cb2bf331, the equality's slow path. emit_eq_inline decides Numbers, nullish operands,
+  Booleans, identities and Strings of different lengths in line and sent the rest to the
+  checked helper: two Strings of one length, BigInts, loose coercions. Its slow path now calls
+  step 2's shared Equal stub (emit_equal_call, the operands reloaded from the stack: x12 and
+  x13 hold payloads on some of the template's paths), which compares two Strings by their keys
+  or, flat and of one width, their contents up to 64 bytes, and calls the helper itself for the
+  rest; where the compiler emits no shared stubs, and at a string accumulation's start, the
+  helper stays. V8's Sparkplug calls its compare builtins for what it does not decide in line
+  (baseline-compiler.cc, VISIT_TYPED_COMPARE_OPERATION); JSC's Baseline calls
+  operationCompareStrictEq after its constant and Int32 paths (JITOpcodes.cpp,
+  compileOpStrictEq).
+- 879082db, a baked read's miss. A named read whose cache held one shape when its code was
+  made (a second stage's seeded caches, code compiled after bytecode runs warmed them) bakes
+  that state (jit_cache_preferred), and its miss went straight to the checked helper even when
+  the cache had since taken the receiver's shape (PROPSTAT's "data cached (other template
+  guard)"). The miss now calls step 1's PropRead stub (x8 the cache; x9 and x10 the receiver as
+  a compact site leaves them; the way loop, the landings and the commit), and only a miss there
+  takes the helper: MOV, BL, CBNZ and B at the site, as the coordinator asked rather than the
+  probe's PropWays call with the template's landings. A key-checked way (an Array holder) stays
+  the helper's, the stub carrying no key word; a polymorphic site's baked probes keep their way
+  loop. JSC's Baseline runs its site's data IC handler over every case the cache holds before
+  its slow path (JITPropertyAccess.cpp, emit_op_get_by_id, generateDataICFastPath);
+  SpiderMonkey's Baseline stubs end each failure path in the jump to the chain's next stub
+  (BaselineCacheIRCompiler.cpp, EmitStubGuardFailure).
+
+Tests: jit::compact_equality_tests::equality_in_loops_agrees_with_the_tree_walker (equality in
+loop bodies over pairs of one length: equal and unequal contents, flat and view, one- and
+two-byte, keyed, past 64 bytes, BigInts, coercions; values, branches, negated branches,
+constants, a throwing coercion; against the tree-walker), which fails with the stub call's
+negate flipped; jit::baked_read_tests (each read form warmed on one receiver class on the
+bytecode VM, then read on two more: one checked read a class, the rest native), which fails
+without 879082db (30 checked reads for 30).
+
+MEASURED
+
+Code bytes (TRUST_JS_JIT_MAP=1, opbytes.py; bytes-fb/):
+
+| fixture | main | equality (cb2bf331) | both (879082db) | the read's change |
+| --- | --- | --- | --- | --- |
+| Djot | 2,842,304 | 2,840,764 (-0.05%) | 2,857,720 | +16,956 (+0.60%) |
+| React | 283,564 | 283,216 (-0.12%) | 284,024 | +808 (+0.29%) |
+| Vue | 503,192 | 503,052 (-0.03%) | 505,052 | +2,000 (+0.40%) |
+
+By span (span-diff.py): the equality's changes are equality ops' spans (and the region heads
+holding them, a fused sequence's code sitting in its head's span) and 22 chunks' tails (the
+Equal stubs' veneers, +528); the read's are read sites (+13,916), heads holding them and 41
+chunks' tails (the new stub's veneers, +1,392). Nothing else moves. The probe's PropWays form
+cost Djot +29,960 (+1.05%).
+
+Instruction counts (fat LTO, CPUs 10-13, setarch -R, pacing off; fixtures median of 3, chai one
+run, Octane fixed 5 runs median of 3; counts/fb.txt, one session):
+
+| workload | main | equality | both | the read's change |
+| --- | --- | --- | --- | --- |
+| React | 310,304,186 | -0.26% | -0.25% | +0.01% |
+| Vue | 1,423,833,857 | -0.61% | -0.61% | +0.00% |
+| Djot | 611,260,958 | -0.61% | -0.56% | +0.05% |
+| chai | 73,140,898,411 | -0.04% | -0.04% | +0.00% |
+| Richards | 131,905,262 | -0.01% | +0.08% | +0.09% |
+| DeltaBlue | 257,772,028 | -0.01% | -0.60% | -0.59% |
+| Crypto | 724,297,647 | +0.00% | -0.20% | -0.20% |
+| RayTrace | 991,483,096 | +0.00% | +0.02% | +0.02% |
+| EarleyBoyer | 3,184,559,523 | -0.50% | -0.49% | +0.01% |
+| RegExp | 2,673,750,407 | +0.00% | +0.02% | +0.02% |
+| Splay | 1,405,163,417 | +0.00% | +0.01% | +0.01% |
+| NavierStokes | 450,993,114 | -0.00% | +0.00% | +0.00% |
+| PdfJS | 7,195,973,245 | -2.41% | -2.36% | +0.05% |
+| Mandreel | 61,598,946,231 | +0.00% | +0.00% | +0.00% |
+| GBEmu | 20,613,415,251 | +0.00% | -9.05% | -9.05% |
+| CodeLoad | 479,374,169 | +0.00% | +0.00% | +0.00% |
+| Box2D | 4,331,800,353 | -0.01% | -0.86% | -0.85% |
+| zlib | 134,531,294,221 | -0.00% | -0.00% | -0.00% |
+| TypeScript | 58,476,933,420 | -0.04% | -0.45% | -0.41% |
+
+No workload is slower than main by more than 0.08% (Richards). Helper traffic (diag/fb-*,
+TRUST_JS_JIT_OPSTAT and PROPSTAT, main to both): GBEmu's "data cached (other template guard)"
+reads 13,108,114 to 4,562,676 (the rest are operator chains' bails, see the tier-up design
+note); PdfJS's `==` helper calls 332,166 to 33,464; DeltaBlue's guard misses 9,180 to 25;
+Box2D's 246,345 to 64,402.
+
+TRust's pages (TRust 78435d0's trust-browser-replay on each commit, from exports, one session;
+trust/page-metrics.sh, CPU 5, while counts ran on CPUs 10-13; trust/metrics-fb.tsv): a page's
+machine code and compile time, (s5 - s1) / 4 of the cumulative metrics.
+
+| page, variant | machine code a page, main | equality | both | compile a page, main | equality | both |
+| --- | --- | --- | --- | --- | --- | --- |
+| event-loop, t8 | 979,643 | 979,333 (-0.0%) | 980,004 (+0.0%) | 14.3 ms | 14.2 ms | 14.4 ms |
+| event-loop, t1a2 | 3,750,152 | 3,749,282 (-0.0%) | 3,759,192 (+0.2%) | 40.2 ms | 40.3 ms | 40.2 ms |
+| Vue TodoMVC, t8 | 7,631,439 | 7,628,182 (-0.0%) | 7,648,167 (+0.2%) | 103.3 ms | 103.1 ms | 105.2 ms |
+| Vue TodoMVC, t1a2 | 10,316,628 | 10,312,176 (-0.0%) | 10,363,654 (+0.5%) | 129.4 ms | 126.5 ms | 129.8 ms |
+
+The pages' first-stage code compiles before its caches see anything at t8, so it bakes little;
+at t1a2 the bytecode runs warm the caches first and more reads bake a state (and now carry the
+fallback). The compile times are single runs.
+
+CHECKS
+
+- Lib suite (embed), ARM64, 879082db: 2,835 passed, 9 ignored (fb/lib.log).
+- x86-64 (zombie), each commit's export: clippy clean in the three configurations, lib suite
+  2,613 passed, 9 ignored (zombie/zombie-fb1.txt, zombie-fb2.txt). Both changes are ARM64 code.
+- ARM64 clippy clean in the three configurations on each commit (fb/clippy-*); cargo fmt clean.
+- Gates (gate-v2.sh, STAGES="rel fixtures difftest t262", BASE w2g's rest gate), each commit on
+  a clean tree: release builds; Vue, React and Djot masked outputs the base's; difftest 138
+  agree, 12 skipped (budget); Test262 at --tier=jit threshold 8 100.0% (53,575/53,575), the
+  report identical to the base's (gate-cb2bf331.txt, gate-879082db.txt).
+- tests/eq-semantics.js (834 results), store-semantics.js (421) and the new read-semantics.js
+  (38: own, inherited, absent and swapped-prototype reads, accessors redefined under the read,
+  Arrays, primitives, `prototype`, a Proxy, frozen and null-prototype receivers, each form
+  warmed on one class first) agree across --tier=interp, --tier=jit, threshold 1, and threshold
+  1 with TRUST_JS_JIT_ADMIT_RUNS=20, whose native code bakes the warm states (fb/).
+
+(Landed on main by fast-forward: cb2bf331 and 879082db, an agent's, on main ce9a19e3.)
+
+### Tier-up of hot first-stage code: design note (2026-11-05)
+
+The coordinator's item (C): before building the tier-up, explain the costs the probes found
+(Splay's string concatenation through its helper, RayTrace's constructor forwarder, chai), and
+design the way back from a stale baked shape in operator chains, with the tier-up at the last
+checkpoint. Probes (not for landing): p2-tierup-probe 42f32e46, -probe2 f309b791, -probe3
+2c5b3943 (record "Compact baseline templates: tier-up of hot first-stage code, measured before
+building"), and two over the fallbacks: -probe4 4fe6d5c7 (call counts in the constructor
+forwarder, TRUST_JS_PROBE_COUNTS; a record filter, TRUST_JS_PROBE_RECFILTER) and -probe5
+d293f04f (tier-up only at a checkpoint whose feedback is unchanged, TRUST_JS_TIERUP_STABLE).
+
+SUMMARY
+
+Three things stand between the tier-up and a net win, and two of them cost main today:
+
+1. A recompiled chunk's feedback records go through its transformed vector's map on every call
+   (FeedbackVector::record, `through`): Splay's String + String helper records each call, chai's
+   element helper each miss. A local record word per transformed pc, forwarding only new bits,
+   takes Splay's cost from +0.96% to +0.25% and chai's from +0.76% to +0.51% (probe5's counts).
+2. RayTrace's Class.create constructor, one function for all its classes, reads `initialize`
+   through a megamorphic site; after it tiers up, the forwarder probes more ways a call. The
+   forwarder's paths and their counts are identical with and without the tier-up.
+3. Operator chains bake their reads' states and have no way back when one goes stale: every
+   execution then replays the chain's ops through the generic helper. With both fallbacks, GBEmu
+   still bails 4.6M times a run, and disabling property chains (TRUST_JS_JIT_NO_PROP_CHAIN=1)
+   runs it 19.2% faster (Box2D 1.2%), while Richards, whose chains hold, would lose 0.6%. JSC
+   counts exits and reoptimizes, SpiderMonkey counts bailouts and invalidates; so should we.
+
+Proposed order: (C1) the chains' way back, which helps main's second stages now (GBEmu,
+Box2D) and which the tier-up needs (more second stages carry more chains); then steps 4-5 of the
+compact series; then (C2) the record filter and (C3) the tier-up at the last checkpoint on stable
+feedback, measured again over C1. Each its own commit, measured against main. C2 is small; C3 is
+probe2's function and the second-stage flag, once C1's slot and request exist.
+
+WHAT THE EXEMPLARS DO
+
+- When to tier up. JSC: Baseline to DFG at thresholdForOptimizeAfterWarmUp 1000 execution-counter
+  units (OptionsList.h; calls and loop iterations), scaled by the code block's size
+  (CodeBlock::optimizationThresholdScalingFactor: large blocks later, some never) and doubled per
+  reoptimization (adjustedCounterValue, CodeBlock.cpp). SpiderMonkey: Baseline to Ion at
+  normalIonWarmUpThreshold 1500, trial inlining at 500 (JitOptions.cpp). V8: Maglev at
+  invocation_count_for_maglev 400 (1000 on Android), TurboFan at 3000, and never sooner than
+  minimum_invocations_after_ic_update 500 after an IC changed: "How long to minimally wait after
+  IC update before tier up" (flag-definitions.h). Our checkpoints come at about 100, 500, 2,100
+  and 8,500 native runs; the last is past every exemplar's threshold.
+- Who profiles. The lower tiers do: JSC's Baseline code writes its value profiles at each site
+  (JITPropertyAccess.cpp, emit_op_get_by_id: emitValueProfilingSite), which the DFG reads when
+  it compiles.
+- A failed speculation. JSC counts its optimized code's OSR exits; past
+  exitCountThresholdForReoptimization (osrExitCountForReoptimization 100, 5 from a loop, times
+  the code type's multiplier, doubled per retry: adjustedExitCountThreshold) the code block is
+  reoptimized with the exits' profile (CodeBlock::shouldReoptimizeNow, CodeBlock.cpp;
+  OptionsList.h). SpiderMonkey: "Number of bailouts without invalidation before we set
+  JSScript::hadFrequentBailouts and invalidate", frequentBailoutThreshold 10
+  (JitOptions.cpp). V8 deoptimizes to its baseline tiers and reoptimizes later on the updated
+  feedback.
+
+1. SPLAY AND CHAI: RECORDS THROUGH THE TRANSFORMED MAP
+
+A recompiled chunk's feedback vector is transformed (FeedbackVector::transformed, W4 step 7):
+every record() goes through its RecordMap to the first-stage chunk's vector (map.target(pc),
+that chunk, its vector, its record word: dependent loads and bounds checks), so a later
+recompile sees the second stage's misses too. In the first stage a record is one load, an OR
+and a compare. Two helpers record on paths that run every time:
+
+- jit_add_strings (String + String after the template's tag guards) records the site's String
+  operands and result on each call. Splay's GeneratePayloadTree concatenates
+  `'String for key ' + tag + ' in leaf node'` for every leaf; after it tiers up, jit_add_strings
+  takes 214 to 521 samples of 20K instructions (prof/splay-*), its hot instructions the map's
+  loop (the record word's ORR and CMP after the vector's load, the back edge through `through`).
+  The bytecode of both stages is the same 28 operations (TRUST_JS_JIT_DUMP).
+- get_computed_element's record_element_miss records every element read outside the in-line
+  set. chai's stringDistance reads `memo[strA.length][strB.length]` of holes and past the end
+  (its Levenshtein memo, run for every "Did you mean" suggestion its proxy getter makes); after
+  it tiers up, get_computed_element takes 3,617 more samples of 200K instructions (723M; the
+  same map loop at its record).
+
+Design: the transformed vector keeps its own record word per pc (the `record` it leaves unused
+today) and forwards a record only when it adds bits. A record is an OR and nothing clears a
+record word (FeedbackVector::record is their only writer), so a forwarded bit stays in the
+baseline's word, and later recompiles see what they see today. The filter (probe5's
+TRUST_JS_PROBE_RECFILTER; counts/probe5-*.txt, the usual counts, tier-up at 8,500 over the
+fallbacks): Splay +0.96% to +0.25%, chai +0.76% to +0.51%, Djot +0.31% to +0.23%; nothing else
+moves by more than 0.04%.
+
+chai's remaining half: its assertion helpers' second stages (`flag`, the proxy getter,
+`isProxyEnabled`, `Assertion`: +1,099, +1,488, +428 and +455 samples) are slower than their
+compact first stages, and set_computed_element's named inserts grow (+565); stringDistance
+itself costs the same in both stages (58,882 samples with its stubs against 57,500). Those
+helpers' caches change as chai's proxies see new properties: V8's
+minimum_invocations_after_ic_update case. Probe5 tiers up only at a checkpoint whose feedback
+fingerprint is unchanged since the one before (the suppressed branch): chai +0.23%, Splay
+-0.00%, Djot -0.07% (section 4's table).
+
+2. RAYTRACE: THE CONSTRUCTOR FORWARDER
+
+RayTrace's classes come from Class.create, whose constructor `function() {
+this.initialize.apply(this, arguments); }` is one function for every class: one chunk, one
+`initialize` read site and one forwarder-runtime cache for all of them.
+construct_arguments_apply_forwarder elides the forwarding (and, for a field-list initializer,
+the initializer itself) through that chunk's caches. Probe4's counts are the same with the
+tier-up at 8,500 and without (332,643 calls: 273,119 elided initializers, 59,524 initializer
+calls; the forwarder-runtime cache hit 154,004 times and re-derived 178,639, as classes take
+turns in it). After the tier-up the calls run on the second stage's chunk (324,323 of them), and
+the forwarder's instructions rise 8.5% (1,427 to 1,548 samples of 20K): the samples that grow
+are in its inlined cache probe (try_ic_get's per-way shape tests and borrow releases), so a call
+probes more ways of that site, which more classes share than it has ways. The rest of RayTrace's
++0.53% is its five recompiles. The forwarder-runtime cache's thrash (178,639 re-derivations in
+332,643 calls) is main's too: a per-class entry would serve every class without the tier-up.
+
+3. THE WAY BACK FROM A STALE BAKED SHAPE IN OPERATOR CHAINS
+
+build_chain bakes a read's single cached state into its chain (ChainOp::LoadProp,
+jit_cache_preferred). A guard failure bails: the chain spills and replays its remaining ops
+through the generic helper, one call an op (emit_chain_marked's ladder). Nothing counts it, so
+once the state is stale (a receiver class added later, a receiver whose shape moved on) every
+execution pays two to four helper calls. On the fallbacks' build (879082db):
+
+- GBEmu: 4,562,676 "data cached (other template guard)" reads a run, all chains'
+  (`parentObj.LCDTicks < k`: a GetPropLocal, a Const and a Lt each through jit_exec); with
+  property chains off, those and 13.8M more helper ops go (OPSTAT: Const 3.8M, GetPropLocal
+  2.4M, GetPropThis 2.2M, Lt 1.6M, Gt 0.9M, Add 0.8M, BitAnd 0.7M ...).
+- TRUST_JS_JIT_NO_PROP_CHAIN=1 against the same build (one run each, CPU 15; diag/nochain.txt):
+  GBEmu -19.23%, Box2D -1.20%, DeltaBlue -0.09%, Djot -0.07%; Richards +0.62%, Crypto +0.10%,
+  TypeScript +0.07%; the rest within 0.02%. The chains are worth keeping where they hold.
+
+Design, after JSC's exit counting and SpiderMonkey's frequent-bailout invalidation:
+
+- Count where the failure shows: a native read that reaches its helper and finds its site's
+  cache holding the receiver's shape is a stale bake (PROPSTAT's "data cached (other template
+  guard)"; with property chains off GBEmu has none). The JIT's property helpers (the chain's
+  replay reaches the generic one) bump a per-chunk counter when their cache lookup hits a data
+  way: no machine code changes, and with both fallbacks only a chain's replay gets there.
+- Past 100 such hits a chunk (JSC's osrExitCountForReoptimization; SpiderMonkey uses 10
+  bailouts), the chunk asks for one reoptimization: it re-arms its inline checkpoint, so the
+  function's next call through the call helper recompiles it (compile_with_inlines from the
+  current caches, the chunk's plan re-planned) with property chains off for that chunk
+  (SpiderMonkey's hadFrequentBailouts: the recompile stops the speculation that failed). Its
+  reads are today's template with the fallback, which a moved shape does not defeat.
+- The new chunk goes into a third set-once slot (FunctionRuntime::code3, preferred by
+  execution_code_for over code2 and code), with the call caches' epoch: a slot is never
+  replaced, so raw `*const Rc<Chunk>` cache entries and running frames' leases stay valid, as
+  for code2 today. One reoptimization a function: a second request is ignored, as JSC's retry
+  counter and SpiderMonkey's invalidation limits bound theirs.
+- A frame already running the bailing code keeps it to its end: the reoptimization serves
+  later calls (no on-stack replacement into the new chunk). GBEmu's bailing chains are in second
+  stages called again and again: its scanline handlers (LINECONTROL's `function (parentObj) {
+  if (parentObj.LCDTicks < 80) ...`, gbemu-part2.js:5988) and executeIteration (5732), which
+  run() calls each time (5703, 5712).
+- Expected: GBEmu most of the 19.2% and Box2D its 1.2%, Richards keeping its chains (they do not
+  fail); measured against main as its own commit.
+
+4. THE TIER-UP AT THE LAST CHECKPOINT
+
+At the checkpoint at or past 8,500 native runs whose plan is empty (or whose feedback is
+unchanged), a first-stage chunk recompiles once: compile_with_inlines with an empty plan, the
+second-stage flag set for a seeded recompile, installed as code2, the epoch moved (probe2's
+probe_tier_up). Census at 8,500 (tierup/census-at8500): Vue 12, React 2, Djot 3, chai 44,
+Richards 1, DeltaBlue 3, Crypto 2, RayTrace 5, EarleyBoyer 6, RegExp 2, Splay 2, NavierStokes 0,
+PdfJS 13, Mandreel 25, GBEmu 36, CodeLoad 0, Box2D 35, zlib 2, TypeScript 89 functions; on
+stable feedback only (tierup/census-at8500s) Vue 9, React 2, Djot 0, chai 9, Richards 1,
+DeltaBlue 3, Crypto 1, RayTrace 5, EarleyBoyer 2, RegExp 2, Splay 1, PdfJS 7, Mandreel 9, GBEmu
+35, Box2D 29, zlib 2, TypeScript 44. No later inline plan is lost at the last checkpoint, and
+the recompiles are fewest.
+
+Over the fallbacks (probe5, d293f04f: 879082db and the probes; counts/probe5-*.txt, against its
+own no-tier-up run):
+
+| workload | at 8,500 | with the filter | and on stable feedback | the same at 2,100 |
+| --- | --- | --- | --- | --- |
+| React | -4.70% | -4.70% | -4.69% | -4.80% |
+| Vue | +0.01% | -0.03% | +0.10% | +0.05% |
+| Djot | +0.31% | +0.23% | -0.07% | -0.01% |
+| chai | +0.76% | +0.51% | +0.23% | +0.22% |
+| Richards | -0.21% | -0.20% | -0.19% | -0.26% |
+| DeltaBlue | +0.24% | +0.24% | +0.25% | -0.11% |
+| Crypto | +0.08% | +0.08% | +0.03% | +0.06% |
+| RayTrace | +0.52% | +0.51% | +0.51% | +0.30% |
+| EarleyBoyer | -0.08% | -0.08% | -0.31% | -0.20% |
+| RegExp | -0.88% | -0.88% | -0.88% | -0.90% |
+| Splay | +0.96% | +0.25% | -0.00% | +0.27% |
+| NavierStokes | +0.00% | +0.00% | +0.00% | +0.00% |
+| PdfJS | -0.27% | -0.28% | -0.27% | -0.33% |
+| Mandreel | +0.11% | +0.11% | +0.03% | +0.03% |
+| GBEmu | -0.15% | -0.15% | -0.15% | +1.47% |
+| CodeLoad | +0.00% | +0.01% | +0.01% | +0.01% |
+| Box2D | +0.01% | +0.01% | +0.93% | +0.72% |
+| zlib | +0.01% | +0.01% | +0.01% | +0.01% |
+| TypeScript | -1.60% | -1.63% | -1.45% | -1.61% |
+
+The fallbacks took PdfJS's +5.6% and GBEmu's +1.1% away (the record "measured before
+building"). The filter and the stable rule take Splay's, chai's and Djot's; what is left is the
+chains' (Box2D's +0.93% when other functions tier up, GBEmu's +1.47% at 2,100: more second
+stages, more chains that go stale), RayTrace's forwarder and DeltaBlue's +0.25% (three
+functions, not yet looked at). So the tier-up comes after C1, and is measured again then.
+
+EarleyBoyer's sc_Pair, step 3's cost, does not come back with the tier-up: its in-line creation
+stores cost what the stub calls did (sc_Pair and PropWrite(create) 1,313 samples, sc_Pair alone
+1,270 after it); the veneer paid it.
+
+STEPS
+
+C1 the chains' way back (the counter at the property helpers' cached hits, the request, code3,
+property chains off on reoptimization; tests: a chain whose read's shape moves on reoptimizes
+once and its reads stay native; one that holds keeps its chain). Then steps 4-5 (calls,
+LoadLocal). Then C2 the record filter, and C3 the tier-up at the last checkpoint on stable
+feedback, re-measured over C1. Each measured against main as the series' steps were (bytes,
+counts, TRust's pages, the gate).
+
+Decided (the coordinator's, 2026-11-05, as the note recommends): C1 first, the stale operator
+chains counted per chunk in the property helpers (no machine-code change) and, past JSC's 100
+exits, the function recompiled once with property chains off into a third set-once code slot,
+the call caches' epoch bumped (JSC's exit counting and CodeBlock::shouldReoptimizeNow,
+SpiderMonkey's bailout counting); its own commit against main. Then compact templates' steps 4
+and 5, then C2 (a recompiled chunk's records forwarded only when they add bits) and C3 (the
+tier-up at the last checkpoint, with V8's rule of waiting until feedback is stable), re-measured
+on top of C1.
