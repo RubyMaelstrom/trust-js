@@ -57,3 +57,47 @@ fn first_stages_leave_acyclic_spans_to_second_stages() {
         "the second stage runs pick's acyclic span"
     );
 }
+
+/// Register regions entered so far on this thread that were loops (every region's entry records
+/// one execution, an acyclic one's also guarded event 0).
+fn loop_entries() -> u64 {
+    super::executed_regions() - super::guarded_regions()[0]
+}
+
+#[test]
+fn second_stages_leave_out_regions_whose_code_has_not_run() {
+    // `g`'s loop runs only for a large `x`: none had come when its second stage was compiled
+    // (`leaf` spliced, at the first inline checkpoint), so that stage has no region for the loop,
+    // whose `o.b` read never filled its cache. Its first stage has the loop region (tier 1 keeps
+    // first stages' loops), entered once a large `x` comes before the recompile.
+    let setup = r#"
+        function leaf(x) { return x * 3; }
+        function g(o, x) {
+            var s = o.a;
+            if (x > 1000) { for (var i = 0; i < 4; i++) { s = s + o.b * i; } }
+            return s + leaf(o.c);
+        }
+        var o = { a: 1, b: 2, c: 3 };
+        function run(n, x) { var t = 0; for (var r = 0; r < n; r++) t += g(o, x); return t; }
+        "ready"
+    "#;
+    let mut reference = Engine::new();
+    reference.set_tier(Tier::Interp);
+    evaluate(&mut reference, setup);
+    let small = evaluate(&mut reference, "run(300, 1)");
+    let large = evaluate(&mut reference, "run(20, 5000)");
+
+    let mut jit = Engine::new();
+    jit.set_tier(Tier::Jit);
+    jit.set_tier_threshold(0);
+    evaluate(&mut jit, setup);
+    // Past the first inline checkpoint with a small `x`: `g`'s second stage is compiled.
+    assert_eq!(evaluate(&mut jit, "run(300, 1)"), small);
+    let before = loop_entries();
+    assert_eq!(evaluate(&mut jit, "run(20, 5000)"), large);
+    let entered = loop_entries() - before;
+    // `run`'s own loop is entered once a call: anything beyond it would be `g`'s loop.
+    if std::env::var_os("TRUST_JS_JIT_UNRUN_REGIONS").is_none() {
+        assert!(entered <= 1, "g's loop ran as a region {entered} times");
+    }
+}

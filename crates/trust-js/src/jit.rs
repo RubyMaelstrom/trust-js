@@ -4937,6 +4937,41 @@ fn test_first_stage_spans_on() -> bool {
     }
 }
 
+/// Tier 1's step (b): whether a register region's operations ran before its second stage was
+/// compiled, by the caches the second stage seeds from the stages that ran (`compile_with_inlines`:
+/// a named read's ways, a call site's targets). A span holding neither carries no evidence and
+/// counts as run; stores, updates, values and elements are no evidence (their seeds are cleared, or
+/// their in-line paths record nothing).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn span_ran(chunk: &Chunk, ranges: &[(usize, usize)]) -> bool {
+    use crate::feedback::{CallState, SiteView};
+    let ops = chunk.jit_ops();
+    let mut evidence = false;
+    for &(start, end) in ranges {
+        for pc in start..end {
+            match chunk.feedback_view(pc) {
+                SiteView::Named(view) if !crate::bytecode::writes_property(&ops[pc]) => {
+                    if view.generic || view.ways.iter().any(Option::is_some) {
+                        return true;
+                    }
+                    evidence = true;
+                }
+                SiteView::Call(view) => {
+                    if view.state != CallState::Empty {
+                        return true;
+                    }
+                    evidence = true;
+                }
+                _ => {}
+            }
+        }
+    }
+    !evidence
+}
+
 /// The operations a function's optional register regions may cover in all (`compile_entry`).
 #[cfg(all(
     target_arch = "aarch64",
@@ -4977,6 +5012,17 @@ fn compile_entry(
         || borrowed_entry
         || env_flag!("TRUST_JS_JIT_FIRST_STAGE_SPANS")
         || test_first_stage_spans_on();
+    // Tier 1's step (b): a second stage emits a register region only where its operations ran
+    // before the recompile (`span_ran`), as Maglev, Warp and the DFG turn code without feedback
+    // into an exit. A first stage compiles before any native run and keeps its loops' regions.
+    // TRUST_JS_JIT_UNRUN_REGIONS=1 keeps the regions of spans that have not run; without seeds
+    // (TRUST_JS_JIT_NO_CACHE_SEED) a second stage's caches hold no evidence and keep them too.
+    let region_ran = |ranges: &[(usize, usize)]| {
+        !chunk.jit_second_stage()
+            || env_flag!("TRUST_JS_JIT_UNRUN_REGIONS")
+            || env_flag!("TRUST_JS_JIT_NO_CACHE_SEED")
+            || span_ran(chunk, ranges)
+    };
     if !borrowed_entry && ops.iter().any(|op| matches!(op, Op::FragmentExit(_))) {
         return None; // exact outer completion belongs to the borrowed AST/VM driver
     }
@@ -5340,25 +5386,27 @@ fn compile_entry(
                         region_covered[start..end].fill(true);
                     }
                     let checkpoint = a.checkpoint();
-                    let emission = (plan.ops() <= REGION_OPS_BUDGET - region_ops).then(|| {
-                        regions::emit(
-                            &mut a,
-                            chunk,
-                            &cfg,
-                            layout,
-                            ilayout,
-                            &plan,
-                            &pc_labels,
-                            &source_targets,
-                            &mut stronger_header_cache,
-                            fast,
-                            array_intrinsics_on,
-                            function_call_intrinsic_on,
-                            l_unwind,
-                            l_direct_finish,
-                            entry_kind,
-                        )
-                    });
+                    let ran = region_ran(plan.ranges());
+                    let emission =
+                        (ran && plan.ops() <= REGION_OPS_BUDGET - region_ops).then(|| {
+                            regions::emit(
+                                &mut a,
+                                chunk,
+                                &cfg,
+                                layout,
+                                ilayout,
+                                &plan,
+                                &pc_labels,
+                                &source_targets,
+                                &mut stronger_header_cache,
+                                fast,
+                                array_intrinsics_on,
+                                function_call_intrinsic_on,
+                                l_unwind,
+                                l_direct_finish,
+                                entry_kind,
+                            )
+                        });
                     match emission {
                         Some(emission) if emission.profitable() => {
                             region_ops += plan.ops();
@@ -5384,10 +5432,16 @@ fn compile_entry(
                         }
                         None => {
                             if env_flag!("TRUST_JS_JIT_REGIONLOG") {
-                                eprintln!(
-                                    "[jit-region] head {pc}: retained baseline ({} ops past the region budget)",
-                                    plan.ops()
-                                );
+                                if ran {
+                                    eprintln!(
+                                        "[jit-region] head {pc}: retained baseline ({} ops past the region budget)",
+                                        plan.ops()
+                                    );
+                                } else {
+                                    eprintln!(
+                                        "[jit-region] head {pc}: retained baseline (its operations have not run)"
+                                    );
+                                }
                             }
                         }
                     }
@@ -5405,7 +5459,8 @@ fn compile_entry(
                     region_covered[start..end].fill(true);
                 }
                 let checkpoint = a.checkpoint();
-                let emission = (plan.ops() <= REGION_OPS_BUDGET - region_ops).then(|| {
+                let ran = region_ran(plan.ranges());
+                let emission = (ran && plan.ops() <= REGION_OPS_BUDGET - region_ops).then(|| {
                     regions::emit(
                         &mut a,
                         chunk,
@@ -5451,10 +5506,16 @@ fn compile_entry(
                     }
                     None => {
                         if env_flag!("TRUST_JS_JIT_REGIONLOG") {
-                            eprintln!(
-                                "[jit-region] head {pc}: retained baseline ({} ops past the region budget)",
-                                plan.ops()
-                            );
+                            if ran {
+                                eprintln!(
+                                    "[jit-region] head {pc}: retained baseline ({} ops past the region budget)",
+                                    plan.ops()
+                                );
+                            } else {
+                                eprintln!(
+                                    "[jit-region] head {pc}: retained baseline (its operations have not run)"
+                                );
+                            }
                         }
                     }
                 }

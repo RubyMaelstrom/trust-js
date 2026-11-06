@@ -113,6 +113,10 @@ comment/example in the same change.
   default a function's first native compile has loop regions but no acyclic spans: those come
   with its second stage, the inline recompile of a function that has run (a borrowed frame's
   compile, a loop transfer or a resumable body, keeps them).
+- `TRUST_JS_JIT_UNRUN_REGIONS=1` gives second stages the register regions of spans that had not run
+  when they were compiled. By default a second stage emits a region only where a named read's
+  cache or a call site's targets, seeded from the stage that ran, show its operations ran (a span
+  with neither keeps its region).
 - `TRUST_JS_JIT_NO_INT_REGS=1` keeps every int32 result of a register region (bitwise operators,
   shifts, `Math.imul`) in a floating-point register instead of leaving it in an integer
   register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).
