@@ -18331,3 +18331,16 @@ b327786b's, measured in W6's records.
 W6's checklist (target/p2/w6/impl/step6-checklist.txt) gains TRust's three replay pages and its
 spike with the cycle on (release, and a debug-assertions build with TRUST_JS_GC_VERIFY=1), and
 the lib suite with pacing on, whose result compares against a tree with the cycle off.
+
+### The owner's answers: per-callee code pickup in P2, the compact templates' exit (2026-11-06)
+
+The owner, 2026-11-06: "Both of these decisions are approved."
+1. A function's new code picked up per callee (the design note above, A2: the old chunk's retry
+   gate as a standing request, V8's tiering request on TRust's per-site caches) comes into P2,
+   out of what Decision 27 carried to Phase 3. The global call-cache epoch stays for reclaiming
+   freed code only. Gameboy's admission budget needs its own renewal, as the note says. With it,
+   C3 (the tier-up of hot first-stage code, zlib's way back from tier 1 (a)'s +0.30%) and tier 1's
+   step (c) follow.
+2. The compact templates' exit is accepted as it stands: machine code -32.3%, elapsed time -4.7%,
+   and no workload slower beyond 0.2% in instructions, with template bytes -31.3% against the
+   40% line, the second stage's in-line templates, kept by the design, being 47% of what remains.
