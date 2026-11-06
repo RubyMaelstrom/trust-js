@@ -17788,3 +17788,396 @@ invalidation the owner's Decision 27 carried to Phase 3, so it waits on the owne
 coordinator recommends A2 in P2: on main it would remove most of the call caches' refills (about
 0.84% of Djot, the phase exit's remaining gap, by the probe's estimate), and it unblocks C3 and the
 approved tier 1 (region code only where a function has run), both of which arrive by recompile.
+
+### Incremental marking crashes TRust's pages; its default reverted (record, 2026-11-06)
+
+Found by the compact agent while it measured tier 1 on TRust's pages: TRust 78435d0's offline
+replays on main 7dc412c8 (incremental marking on by default since b327786b) crash two of the three
+pages. dom-reconcile aborts in jit_call with "a live weak target belongs to a known Agent heap"
+(value.rs:5455); Vue TodoMVC segfaults with nothing on stderr; event-loop runs. Both crashing pages
+run with TRUST_JS_GC_INCREMENTAL=0 and on 702bc80c (before default-on). Neither the lib suite nor
+Test262 (both run with the cycle on and under force) caught it, and W6's checks did not run TRust's
+pages, which hold several Agent heaps in one process (target/p2/compact/census/pages/main7dc-*.err).
+75f875b0 reverts b327786b, so incremental marking is off by default again (TRUST_JS_GC_INCREMENTAL=1
+turns it on; every part of the cycle stays); the GC test groups (gc_cycle, gc_core, external_memory,
+gc_pacing: 146) pass. The W6 agent debugs it; default-on returns with the fix, a multi-Agent
+regression test with a cycle open across agent switches and weak targets, and TRust's three replay
+pages and spike with the cycle on in W6's checklist. Nothing with the cycle on by default was
+pushed (origin/main 9deaece0).
+
+### Two small fixes: CALLSTAT=2's shared stubs, the snapshot test's cache (record, 2026-11-06)
+
+f9964bdb and 7e2d4153 (an agent's, p2-callstat-fix on main 7dc412c8), landed over 75f875b0 as
+4e105bb1 and c26544b5. call_paths_enabled reads TRUST_JS_JIT_CALLSTAT on its first use, where it
+was set only at the first JIT entry, after the first compile had assembled shared stubs without
+their counters (direct calls counted: chai 23.59M to 25.88M, Vue 0.34M to 0.90M, Mandreel 0.86M to
+8.29M). snapshot::tests::static_decode_validates_bodies_once_per_process retries at a fresh address
+when other tests evicted its snapshot from the process-wide 16-entry list between its two decodes
+(test builds count the evictions); the snapshot module passed 20 of 20 extra runs. Checks at
+7e2d4153: lib 2,848 passed; clippy x3 and rustfmt clean; the gate's fixtures and difftest as the
+base's; Test262 53,573 of 53,575, the two "no progress" timeouts of a saturated machine
+(staging/sm/extensions/recursion.js, staging/sm/regress/regress-610026.js) passing on rerun. On main
+after the revert: the snapshot and call-path tests (46) pass, rustfmt clean.
+
+### Tier 1: region code only where a function has run (design note, 2026-11-06)
+
+The owner's answer of 2026-11-05 (item 2) put tier 1 in P2: cheaper compiles, from the compact
+templates (landed) and from region code only where a function has run, "a recompile when hot".
+This note brings the census first: how much of the first stage is region code, on the fixtures and
+on TRust's pages, and how much of it runs. Then it gives the exemplars' answer and a design that
+assumes A2's per-callee pickup ("A function's new code picked up per callee"), with the cost if
+the epoch stays instead.
+
+Measured with a probe, p2-tier1-census (not for landing), from main 7dc412c8:
+- e35d2c57, TRUST_JS_REGION_CENSUS=1: every native compile counts its entries and every published
+  register region counts its entries in generated code (leaked counters). Both are printed at exit
+  with the function's origin, the stage, the region's kind, its head pc, operations and bytes.
+  The bytes are the region's own emission, its increment left out.
+- 39b0ad49, for the counts: TRUST_JS_PROBE_HOT_ORIGINS names a list of functions, and the first
+  stages of all other functions compile without acyclic regions (TRUST_JS_PROBE_DEFER=acyclic) or
+  without any register region (=all). Second stages, borrowed frames (loop transfers, resumable
+  bodies) and origin 0+0 keep theirs. The lists: a census run's functions with 100 or more native
+  entries (an oracle, which knows each function's future), its functions with a second stage
+  (another oracle), and none (every first stage: a design as it would be built).
+Data and scripts are in target/p2/compact/census (runs/, pages/, hot/, second/, none/) and
+target/p2/compact/scripts (census-*.py, census-runs.sh, census-pages.sh, oracle-*.sh).
+
+SUMMARY
+
+1. Region code is 21-50% of a first stage: Vue 30%, React 47%, Djot 28%, chai 29%, and on TRust's
+   pages 25-30%. It is less of the whole than the plan assumed. Djot's region code in both stages
+   is 24% of its 2.70 MB; the plan's 2.30 of 3.96 MB was the JIT map's attribution before 07d3ad33.
+2. Almost every acyclic span runs. Spans start where calls go (pc 0), and fewer than 6% of
+   acyclic bytes are never entered, 13% in TypeScript. What never runs is loops: 19-48% of loop
+   bytes in eight workloads. What runs little is cold functions: most of chai's region code
+   (823 KB of 1.16 MB), and 92% of the event-loop page's.
+3. The exemplars' baselines emit no optimized code. Hot code tiers up by counted calls and loop
+   iterations, loops enter the optimized code by OSR, and the optimizing tiers compile only what
+   ran: code without feedback becomes an exit.
+4. Measured before building (oracle counts):
+   - Acyclic spans out of every first stage: every workload gains but zlib (+0.30%). Djot -2.00%,
+     React -1.52%, Splay -1.09%, Richards -0.90%, DeltaBlue -0.82%, CodeLoad -0.72%.
+   - This needs no recompile and no publication: second stages keep their spans.
+   - Bytes: Djot 5.7% of its code, chai 17.2%, the pages 4.8-9.9% at t8.
+5. A recompile when hot, as the plan put it, costs more than it saves on the benchmarks.
+   - It recompiles whole functions at about 30 instructions a byte: Djot's 32 hot functions without
+     a second stage are 1.3% of its run.
+   - If the epoch stays, its publications refill the process: chai about 0.54%, Djot 0.75%.
+   - The pages' cold code would gain from it: the event-loop page's 197 KB of cold-function
+     regions. Item 4 takes the acyclic part of that (89 KB) without a recompile, and the loop part
+     waits for item 6.
+6. Loops are where the rest is: with loop regions out of first stages as well, five workloads gain
+   2.2-2.7% in all. Loops are also where calls do not predict heat. Deferring loop regions costs zlib 42% and Gameboy 4.0%: those need back-edge counts and
+   OSR, as in the exemplars. That step publishes, and it should follow A2.
+7. Proposed:
+   - (a) First stages without acyclic spans.
+   - (b) Second stages' regions only where their spans ran (TypeScript's second stages hold 2.24 MB
+     never entered).
+   - (c) Then loops by back edges with OSR, after A2.
+8. On the way: main crashes TRust's dom-reconcile and Vue TodoMVC pages with incremental marking on
+   (the end of this note).
+
+1. THE CENSUS
+
+Main's code (the probe without its switch emits the same code), one run each, pacing off. A
+first stage is a function's first native compile (code), a second stage its inline recompile or
+C1's (code2, code3). Regions are the register regions of jit_regions.rs, acyclic spans and loops,
+as published; chains and scans are jit.rs's whole-loop lowerings (their entries not counted).
+
+| workload | first-stage compiles (borrowed frames included) | first-stage bytes | region bytes | share | acyclic | loop | chains, scans | second stages | their bytes |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 54 | 208,196 | 63,320 | 30.4% | 20,120 | 43,200 | 0 | 10 | 255,236 |
+| React | 10 | 233,972 | 111,092 | 47.5% | 25,304 | 85,788 | 0 | 2 | 34,152 |
+| Djot | 127 | 1,285,728 | 359,592 | 28.0% | 160,880 | 198,712 | 0 | 36 | 1,422,844 |
+| chai | 870 | 4,024,040 | 1,159,704 | 28.8% | 964,000 | 191,204 | 4,500 | 64 | 1,450,000 |
+| Richards | 25 | 81,996 | 19,804 | 24.2% | 14,732 | 5,072 | 0 | 6 | 188,332 |
+| DeltaBlue | 72 | 611,888 | 276,076 | 45.1% | 27,340 | 248,736 | 0 | 22 | 862,012 |
+| Crypto | 66 | 1,059,400 | 411,876 | 38.9% | 106,932 | 271,788 | 33,156 | 4 | 233,228 |
+| RayTrace | 39 | 396,124 | 180,224 | 45.5% | 48,716 | 131,508 | 0 | 11 | 756,000 |
+| EarleyBoyer | 63 | 794,616 | 344,252 | 43.3% | 65,208 | 279,044 | 0 | 20 | 890,828 |
+| RegExp | 22 | 4,931,860 | 2,060,720 | 41.8% | 600 | 2,060,120 | 0 | 0 | 0 |
+| Splay | 20 | 197,180 | 83,364 | 42.3% | 11,764 | 71,600 | 0 | 5 | 342,804 |
+| NavierStokes | 19 | 349,952 | 171,004 | 48.9% | 27,204 | 72,104 | 71,696 | 0 | 0 |
+| PdfJS | 219 | 4,674,276 | 2,062,740 | 44.1% | 278,888 | 1,755,512 | 28,340 | 19 | 1,069,384 |
+| Mandreel | 148 | 16,711,580 | 5,349,324 | 32.0% | 1,150,068 | 4,199,256 | 0 | 10 | 754,672 |
+| Gameboy | 313 | 3,664,272 | 1,304,240 | 35.6% | 388,808 | 896,460 | 18,972 | 129 | 3,806,684 |
+| CodeLoad | 52 | 547,232 | 275,528 | 50.3% | 26,068 | 248,316 | 1,144 | 0 | 0 |
+| Box2D | 248 | 5,426,208 | 2,531,936 | 46.7% | 488,164 | 2,043,060 | 712 | 52 | 3,608,672 |
+| zlib | 48 | 7,292,664 | 1,556,780 | 21.3% | 165,756 | 1,391,024 | 0 | 0 | 0 |
+| TypeScript | 651 | 9,700,256 | 3,714,736 | 38.3% | 645,804 | 3,068,932 | 0 | 289 | 24,505,500 |
+
+Region code is 21-50% of a first stage, and less of the whole than the plan assumed. Djot's region
+code in both stages is 0.65 MB of 2.70 MB (24%); TRUST_JS_JIT_MAP's spans (opbytes.py) give the
+same 648,028 bytes. The plan's "2.30 of 3.96 MB" (main a31509fe's census) counted the template
+code after each region as region code: the JIT map's region mark ran on until 07d3ad33 ended it.
+
+How much of it runs. The region's entries are counted after its entry guards; the function's are
+native entries (hot: 100 or more, about the first inline checkpoint). Borrowed frames are the
+tree-walker's loop transfers and resumable bodies, whose entries are not counted:
+
+| workload | acyclic: never entered | entered, cold function | entered, hot function | loop: never entered | entered, cold function | entered, hot function | borrowed frames: entered / never |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 0 | 5,904 | 14,216 | 0 | 16,652 | 14,972 | 11,576 / 0 |
+| React | 0 | 432 | 1,292 | 0 | 62,652 | 1,956 | 44,760 / 0 |
+| Djot | 4,084 | 43,256 | 107,296 | 54,856 | 51,176 | 67,416 | 20,992 / 10,516 |
+| chai | 0 | 765,468 | 178,660 | 2,088 | 57,272 | 105,200 | 34,420 / 12,096 |
+| Richards | 0 | 7,160 | 7,572 | 0 | 1,324 | 3,748 | 0 / 0 |
+| DeltaBlue | 0 | 7,780 | 10,124 | 32,280 | 113,872 | 28,456 | 55,152 / 28,412 |
+| Crypto | 0 | 59,552 | 7,388 | 22,224 | 128,736 | 13,260 | 97,428 / 50,132 |
+| RayTrace | 0 | 8,956 | 35,516 | 6,808 | 7,144 | 109,420 | 11,324 / 1,056 |
+| EarleyBoyer | 0 | 20,616 | 28,772 | 18,408 | 149,196 | 51,492 | 73,524 / 2,244 |
+| RegExp | 0 | 0 | 600 | 0 | 1,218,544 | 26,192 | 645,336 / 170,048 |
+| Splay | 0 | 0 | 10,144 | 0 | 20,516 | 20,148 | 30,936 / 1,620 |
+| NavierStokes | 0 | 5,840 | 2,196 | 27,536 | 33,216 | 0 | 26,292 / 4,228 |
+| PdfJS | 7,784 | 149,636 | 55,580 | 641,332 | 467,080 | 100,088 | 396,032 / 216,868 |
+| Mandreel | 56,704 | 399,576 | 460,128 | 1,403,868 | 842,432 | 584,828 | 935,656 / 666,132 |
+| Gameboy | 3,988 | 112,652 | 208,120 | 214,360 | 241,928 | 174,036 | 215,368 / 114,816 |
+| CodeLoad | 0 | 26,068 | 0 | 120,060 | 128,256 | 0 | 0 / 0 |
+| Box2D | 25,344 | 43,628 | 228,424 | 222,876 | 811,696 | 370,084 | 619,648 / 209,524 |
+| zlib | 688 | 3,184 | 69,964 | 316,268 | 47,208 | 511,332 | 422,128 / 186,008 |
+| TypeScript | 83,144 | 133,676 | 412,744 | 589,348 | 353,576 | 1,903,588 | 144,892 / 93,768 |
+
+- Nearly every acyclic span runs. A function's first span starts at pc 0 (React's arrow helpers:
+  entries equal to the function's, 219,992), and never-entered spans are under 6% of acyclic bytes
+  except TypeScript's 12.9%.
+- Loops are what never runs: 19-48% of loop bytes in Djot (27.6%), NavierStokes, PdfJS,
+  Mandreel, Gameboy, CodeLoad, zlib and TypeScript.
+- A cold function's loop can be hot. React's reducerBatch runs its first call in the tree-walker
+  and moves into a borrowed frame at its loop (the first loop transfer). Its own compile is then
+  entered once, and its inner loop region at pc 16 is entered 2,000 times: a function cold by
+  calls and hot by iterations. RegExp's generated blocks are entered 23-29 times, each with loops.
+
+What a recompile when hot would trade, by bytes. The cold functions' region bytes would not be
+compiled. Each hot function with regions and no second stage today would be compiled again, all of
+it (the functions with a second stage are recompiled anyway). The functions with deferred regions
+would wait for their recompile:
+
+| workload | all code | cold functions' regions | hot functions to recompile | their first stages | balance | the same, acyclic spans only: saved, recompiled, balance |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 463,432 | 22,556 | 8 | 23,408 | -852 | 5,904, 18,312, -12,408 |
+| React | 268,124 | 63,084 | 2 | 2,896 | +60,188 | 432, 2,896, -2,464 |
+| Djot | 2,708,572 | 111,832 | 32 | 262,196 | -150,364 | 43,256, 257,080, -213,824 |
+| chai | 5,474,040 | 822,740 | 117 | 511,516 | +311,224 | 765,468, 443,128, +322,340 |
+| Richards | 270,328 | 8,484 | 2 | 5,944 | +2,540 | 7,160, 5,944, +1,216 |
+| DeltaBlue | 1,473,900 | 153,932 | 6 | 21,296 | +132,636 | 7,780, 21,296, -13,516 |
+| Crypto | 1,292,628 | 210,512 | 6 | 21,108 | +189,404 | 59,552, 15,000, +44,552 |
+| RayTrace | 1,152,124 | 22,908 | 10 | 29,736 | -6,828 | 8,956, 29,736, -20,780 |
+| EarleyBoyer | 1,685,444 | 181,968 | 7 | 49,172 | +132,796 | 20,616, 36,780, -16,164 |
+| RegExp | 4,931,860 | 1,218,544 | 2 | 55,996 | +1,162,548 | 0, 5,508, -5,508 |
+| Splay | 539,984 | 20,516 | 3 | 13,584 | +6,932 | 0, 13,584, -13,584 |
+| NavierStokes | 349,952 | 66,592 | 3 | 41,316 | +25,276 | 5,840, 41,316, -35,476 |
+| PdfJS | 5,743,660 | 1,007,140 | 39 | 446,068 | +561,072 | 157,420, 379,076, -221,656 |
+| Mandreel | 17,466,252 | 2,479,068 | 44 | 2,547,852 | -68,784 | 420,404, 2,414,708, -1,994,304 |
+| Gameboy | 7,470,956 | 405,064 | 72 | 640,276 | -235,212 | 116,640, 545,548, -428,908 |
+| CodeLoad | 547,232 | 274,384 | 0 | 0 | +274,384 | 26,068, 0, +26,068 |
+| Box2D | 9,034,880 | 1,019,888 | 64 | 655,272 | +364,616 | 43,628, 330,608, -286,980 |
+| zlib | 7,292,664 | 53,408 | 17 | 4,727,116 | -4,673,708 | 3,184, 3,869,096, -3,865,912 |
+| TypeScript | 34,205,756 | 556,484 | 106 | 666,400 | -109,916 | 135,032, 493,752, -358,720 |
+
+The cold functions hold chai's region code (823 KB of its 1.16 MB) and RegExp's (1.22 of 2.06 MB,
+all loops). Elsewhere a recompile at the first checkpoint compiles about as much as it saves, or
+more: zlib's 17 hot functions are 4.7 MB of first stage. Most of the deferrable loop bytes are in
+functions that are cold by calls and hot by iterations (React, RegExp), which only a back-edge
+count would see.
+
+TRust's pages. TRust 78435d0's replay on the census engine, one page each (--warmups 0
+--samples 1), at the default threshold (t8) and at t1a2 (threshold 1, admission after two runs);
+census/pages:
+
+| page | first-stage compiles | first-stage bytes | region bytes | share | cold functions' regions | hot functions to recompile | their first stages | balance |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| event-loop, t8 | 104 | 798,860 | 213,068 | 26.7% | 197,056 | 0 | 0 | +197,056 (22% of its 897,892) |
+| dom-reconcile, t8 | 173 | 1,203,364 | 301,612 | 25.1% | 65,528 | 1 | 7,980 | +57,548 (3.2% of 1,813,828) |
+| Vue TodoMVC, t8 | 576 | 4,251,960 | 1,264,872 | 29.7% | 435,156 | 45 | 196,452 | +238,704 (3.4% of 7,032,208) |
+| event-loop, t1a2 | 253 | 3,404,452 | 1,028,120 | 30.2% | 738,892 | 0 | 0 | +738,892 (21% of 3,503,488) |
+| dom-reconcile, t1a2 | 277 | 2,977,704 | 806,740 | 27.1% | 428,900 | 1 | 19,292 | +409,608 (11% of 3,624,904) |
+| Vue TodoMVC, t1a2 | 757 | 6,547,580 | 1,903,972 | 29.1% | 873,584 | 46 | 252,380 | +621,204 (6.5% of 9,591,464) |
+
+On a page most functions stay cold: the event-loop page's platform code keeps 92% of its region
+bytes in functions under 100 entries and recompiles none; at t1a2, where the threshold drop
+compiles three times the code, cold functions hold 739 KB of its 1.03 MB of region code. Of the
+pages' first-stage loop bytes, 24-32% are never entered (t8). The dom-reconcile and Vue TodoMVC
+runs are with TRUST_JS_GC_INCREMENTAL=0: with incremental marking on, main's default, both pages
+crash (see the end of this note).
+
+2. WHAT THE EXEMPLARS DO
+
+- Their baselines emit no optimized code. Sparkplug calls a builtin for each operation with
+  feedback; a binary operation calls `<Name>_Generic_Baseline`, and its in-line Smi forms sit
+  behind read-only flags (VISIT_TYPED_BINARY_OPERATION, baseline/baseline-compiler.cc:1269-1316).
+  SpiderMonkey's Baseline calls the site's IC for arithmetic, comparisons and property access
+  (emitBinaryArith: emitNextIC, jit/BaselineCodeGen.cpp:3035-3077). JSC's Baseline is a template
+  JIT over its data ICs. None keeps a value in a register from one operation to the next, and none
+  compiles a loop or a straight-line span as a unit. Register allocation over a function's
+  control flow is Maglev's and TurboFan's, Ion's, and the DFG's and FTL's.
+- Hot code tiers up by counted execution, and loop iterations count as calls do:
+  - V8's interrupt budget is charged at each Return, by the bytecode the call ran
+    (VisitReturn's profiling weight, baseline-compiler.cc:2905-2912), and at each JumpLoop
+    (UpdateInterruptBudgetAndJumpToLabel, 2665-2671).
+  - SpiderMonkey's warm-up counter is bumped in the prologue and at each LoopHead
+    (emitWarmUpCounterIncrement, BaselineCodeGen.cpp:1665-1700, called at 7087 and from
+    emit_LoopHead, 2590-2600).
+  - JSC's execution counter is charged at op_enter and at each loop_hint
+    (jit/JITOpcodes.cpp:1397, 1617-1619).
+- A long-running loop enters the optimized code where it is, by OSR:
+  - Sparkplug's JumpLoop checks the feedback vector's OSR urgency (baseline-compiler.cc:2640-2700).
+    The TieringManager arms it once it has decided to tier up and the frame is still in a lower
+    tier: "OSR kicks in only once we've previously decided to tier up, but we are still in a
+    lower-tier frame (this implies a long-running loop)" (TieringManager::MaybeOptimizeFrame,
+    execution/tiering-manager.cc:339-401).
+  - SpiderMonkey's LoopHead compiles and enters Ion through IonCompileScriptForBaselineOSR
+    (BaselineCodeGen.cpp:1755-1790).
+  - JSC's loop_hint slow path calls operationOptimize and jumps to the OSR entry it returns
+    (emitSlow_op_loop_hint, JITOpcodes.cpp:1622-1646).
+- The optimizing tiers compile only what ran. Code with no feedback becomes an exit:
+  - Maglev deopts unconditionally on a site whose hint is None (VisitUnaryOperation's
+    kInsufficientTypeFeedbackForBinaryOperation, maglev/maglev-graph-builder.cc:1680-1686, and
+    the same for binary operations, compares and named access at 2071, 2167, 2415, 3238).
+  - Warp turns an IC with no stub into a bailout that always fires
+    (WarpBuilder::buildBailoutForColdIC: MBail with BailoutKind::FirstExecution,
+    jit/WarpBuilder.cpp:4185-4190).
+  - The DFG gives up on a node with no prediction: "We have no information about what values
+    this node generates. Give up on executing this code, since we're likely to do more damage
+    than good" (getPrediction's ForceOSRExit, dfg/DFGByteCodeParser.cpp:1323-1332).
+V8, SpiderMonkey and WebKit main were fetched 2026-11-05 and 2026-11-06
+(target/p2/compact/exemplar-src: fetch-2026-11-05, fetch-2026-11-06, -06c; sm/ and jsc/ from
+2026-11-04).
+
+3. THE ORACLES, MEASURED BEFORE BUILDING
+
+Instructions (fat LTO 39b0ad49, CPUs 10-13, setarch -R, pacing off, median of 3, chai one run, each
+mode through env(1); counts/oracle.txt, oracle2.txt, oracle3.txt), against the same binary with no
+list ("off": main's behaviour). Each column takes register regions out of a set of first stages:
+- cold: the functions the census found under 100 native entries;
+- no second stage: the functions the census gave no second stage, hot or cold;
+- every first stage: no oracle, the design as it would be built.
+
+| workload | off | cold: no acyclic spans | no regions | no second stage: no acyclic spans | no regions | every first stage: no acyclic spans | no regions |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| Vue | 1,399,533,169 | -0.02% | -0.02% | -0.18% | -0.11% | -0.25% | -0.19% |
+| React | 297,912,476 | -0.03% | -0.66% | -1.50% | -2.14% | -1.52% | -2.15% |
+| Djot | 603,599,988 | -0.56% | -0.93% | -1.29% | -1.41% | -2.00% | -2.67% |
+| chai | 72,652,918,932 | -0.03% | -0.05% | -0.12% | -0.29% | -0.13% | -0.27% |
+| Richards | 132,491,908 | -0.39% | -0.45% | -0.54% | -0.59% | -0.90% | -1.03% |
+| DeltaBlue | 256,228,596 | -0.26% | -1.47% | -0.46% | -1.69% | -0.82% | -2.18% |
+| Crypto | 716,565,096 | -0.52% | -0.72% | -0.59% | -0.72% | -0.66% | -0.88% |
+| RayTrace | 991,404,100 | -0.07% | -0.11% | -0.17% | -0.21% | -0.33% | -0.60% |
+| EarleyBoyer | 3,054,877,922 | -0.07% | -0.08% | +0.01% | -0.10% | -0.06% | -0.21% |
+| RegExp | 2,671,484,809 | -0.03% | -0.86% | -0.06% | +0.30% | -0.06% | +0.30% |
+| Splay | 1,167,445,352 | -0.03% | -0.06% | -1.08% | -1.10% | -1.09% | -1.16% |
+| NavierStokes | 441,174,903 | -0.12% | -2.10% | -0.21% | -2.19% | -0.21% | -2.19% |
+| PdfJS | 6,907,634,155 | -0.03% | +2.55% | -0.52% | +1.77% | -0.37% | +1.66% |
+| Mandreel | 61,207,169,459 | -0.04% | +0.62% | -0.23% | +1.20% | -0.24% | +1.18% |
+| Gameboy | 14,924,207,885 | -0.05% | +3.98% | -0.05% | +4.13% | -0.11% | +4.00% |
+| CodeLoad | 480,290,945 | -0.72% | -2.31% | -0.72% | -2.31% | -0.72% | -2.31% |
+| Box2D | 4,196,485,692 | -0.08% | -0.69% | -0.01% | +0.50% | -0.30% | -0.15% |
+| zlib | 133,595,568,950 | -0.00% | +0.03% | +0.30% | +42.16% | +0.30% | +42.16% |
+| TypeScript | 56,907,412,639 | +0.03% | -0.03% | -0.19% | -0.08% | -0.30% | -0.41% |
+
+The probe keeps the regions of origin 0+0 (a few chunks in each benchmark, the pages' whole platform
+code), so the counts leave those as they are.
+- Acyclic spans out of every first stage: every workload gains but zlib (+0.30%). Djot -2.00%,
+  Splay -1.09%, React -1.52%, Richards -0.90%, DeltaBlue -0.82%, CodeLoad -0.72%, Crypto -0.66%.
+  The functions that never get a second stage are better off without theirs too (the middle
+  pair). The gains the plan's region table credits to acyclic spans (Richards 4.6%, Gameboy 2.9%,
+  with regions off everywhere) are second stages': those keep their spans here.
+- Loop regions out of first stages gain more where they run little (NavierStokes, CodeLoad,
+  DeltaBlue, React, Djot: 2.2-2.7% in all) and lose where a loop runs hot in a function without a
+  second stage (zlib +42%, Gameboy +4.0%, PdfJS +1.7%, Mandreel +1.2%), which calls do not
+  predict (the cold oracle loses there too).
+
+4. WHAT THE ORACLE LEAVES OUT
+
+The oracle knows each function's future. A design that defers regions until a function is hot pays
+three costs the oracle does not:
+a. The recompile. A recompile at the first checkpoint compiles the whole function again, about 30
+   instructions a byte, bytecode and native code. C3's split: Djot's three tier-ups cost 873,258
+   instructions for 24,980 bytes, React's two 352,393 for 15,712. The hot functions with regions and
+   no second stage today, at that rate: Djot's 32 (262,196 bytes) 1.3%, Box2D 0.47%, NavierStokes
+   0.28%, DeltaBlue 0.25%, PdfJS 0.19%, Richards 0.13%, Gameboy 0.13%, Mandreel 0.12%, zlib 0.11%,
+   the rest under 0.1%. On Djot that is more than the cold oracle's gain (-0.93%).
+b. The wait. A hot function runs its first hundred calls without the regions it would have had.
+c. The publication. With A2, a recompile refills its own callers' ways, about one. If the epoch
+   stays, each publication refills every way in the process. The per-callee note's refills a
+   publication, at its instructions a refill: chai's 117 publications cost about 0.54% (350 ways at
+   9.5K), Djot's 32 about 0.75% (103 ways at 1.4K), Box2D's 64 0.15%, PdfJS's 39 0.14%,
+   TypeScript's 106 0.05-0.09%, DeltaBlue's 6 0.06%, Vue's 8 0.04%. The other pages and workers of
+   the process refill too.
+
+5. THE DESIGN
+
+a. Acyclic spans leave the first stage. A function's first native compile emits its templates and
+   its loops' regions, and no acyclic span. Its acyclic spans come with its second stage: an inline
+   recompile, C1's recompile, or C3's tier-up when it lands, where the exemplars put register
+   allocation. This needs no recompile and no publication of its own.
+   - Measured as built (every first stage, no list): Vue -0.25%, React -1.52%, Djot -2.00%, chai
+     -0.13%, Richards -0.90%, DeltaBlue -0.82%, Crypto -0.66%, RayTrace -0.33%, Splay -1.09%,
+     CodeLoad -0.72%, PdfJS -0.37%, Box2D -0.30%, TypeScript -0.30%, Mandreel -0.24%,
+     NavierStokes -0.21%, Gameboy -0.11%, RegExp and EarleyBoyer -0.06%, zlib +0.30%.
+   - zlib's loss is a hot function that never gets a second stage. Its two spans start at pc 0 and
+     run on each of its 2,177,994 calls (origin 124312+1555; its inline plan stays empty). Hot
+     first-stage code of that kind is what C3's tier-up recompiles (at 8,500 runs, on stable call
+     targets), and its second stage would have the spans back. Without C3, a later checkpoint could
+     recompile a hot function for its spans alone. Step 1 measures zlib with C3 and without it.
+   - Even functions that never get a second stage run faster without their acyclic spans (the
+     second oracle: React -1.50%, Djot -1.29%, Splay -1.08%, Crypto -0.59%, Richards -0.54%,
+     PdfJS -0.52%), so not recompiling for them loses nothing. The exceptions are zlib (+0.30%)
+     and EarleyBoyer (+0.01%).
+   - Bytes (section 1): first-stage acyclic spans are Djot's 5.7% of all code, chai's 17.2%,
+     Vue's 4.3%; on the pages at t8, the event-loop page's 9.9%, dom-reconcile's 7.8% and Vue
+     TodoMVC's 4.8% (7.7%, 8.2% and 6.1% at t1a2).
+b. Only spans that ran. A second stage emits a region only where its operations have run: their
+   sites' caches filled, or their record words set. This is how Maglev, Warp and the DFG turn code
+   that never ran into an exit (section 2). Second stages' regions never entered today: TypeScript
+   2.24 MB (32.5% of its second stages' region bytes), Gameboy 361 KB (29.7%), PdfJS 194 KB
+   (47.8%), Box2D 144 KB (13.3%), Djot 67 KB (24.4%), Vue 27 KB (58.8%).
+c. Loops, by their back edges. Taking loop regions out of first stages is worth more: NavierStokes
+   -2.1%, CodeLoad -2.3%, DeltaBlue -1.5 to -1.7%, React -0.7 to -2.1%, Djot -0.9 to -1.4%,
+   Splay -1.1%. It loses in two places:
+   - where a function cold by calls runs a hot loop (Gameboy +4.0%, PdfJS +1.8 to +2.6%, Mandreel
+     +0.6 to +1.2%);
+   - where a hot function gets no second stage (zlib +42%).
+   A loop's own evidence has to decide, as in all three exemplars:
+   - First-stage loops count their back edges into the function's budget. The tree-walker
+     already charges back edges to the same budget (FunctionRuntime::tier_budget_spent).
+   - Past the budget, the function recompiles with the loop's region.
+   - The running frame enters the region at the loop head by OSR, or the next call does. A region
+     is already entered from the frame's canonical state at its head. OSR also needs the new chunk
+     to map the first stage's frame: its slots and the loop head's pc. C3's recompiles already
+     carry a record map from their pcs to the first stage's; whether the slots match is to be
+     checked.
+   That recompile is a publication, and it gets its own design note after (a) and (b) are
+   measured.
+d. A2 or the epoch. Steps (a) and (b) publish nothing that is not published today, so they cost
+   the same either way. Step (c)'s recompiles do publish. With A2, each refills its callers' ways,
+   about one. With the epoch, each refills every way in the process, at 4c's rates: about 0.14M
+   instructions a publication on Djot and 3.3M on chai. Step (c) therefore follows A2.
+
+6. STEPS
+
+1. (a), its own commit against main: first stages without acyclic spans. Measured as the compact
+   series was: counts, bytes, TRust's pages (their compile time in a quiet window), and the gate.
+   The expected counts are the "every first stage" column.
+2. (b): second stages' regions only where their spans ran. Measured the same way. The bytes are the
+   census's never-entered second-stage regions.
+3. (c): a design note after A2: back-edge budgets in first-stage loops, the recompile, and OSR at
+   the loop head.
+
+A FINDING ON THE WAY: TRUST'S PAGES CRASH WITH INCREMENTAL MARKING ON
+
+TRust 78435d0's trust-browser-replay on main 7dc412c8 (target/p2/compact/trust/main7dc-replay, one
+page, CPU 15) crashes on two of the three pages with incremental marking on, which is main's
+default since W6 step 6:
+- dom-reconcile aborts. jit_call, which cannot unwind, reaches value.rs:5455's expect: "a live
+  weak target belongs to a known Agent heap". Exit 134.
+- Vue TodoMVC dies of SIGSEGV with nothing on stderr. Exit 139.
+- The event-loop page runs.
+With TRUST_JS_GC_INCREMENTAL=0 both pages run, and so does 702bc80c's replay, from before W6 step 6
+(b327786b) turned incremental marking on. The census engine (e35d2c57, main's code without its
+switch) crashes the same way. Logs: census/pages/main7dc-*.err, dr-noenv.err, dr-noinc.err.
+
+Decided (the coordinator's, 2026-11-06): (a) first, first stages without acyclic spans, its own step
+against main (zlib's +0.30%, one hot function that never gets a second stage, reported to the owner
+as a small cost in a net-improving step; C3 would give its spans back); then (b) second stages
+emitting regions only where the code ran; (c), loops by back edges with OSR, after A2 (the owner's
+decision on the per-callee pickup pending).
