@@ -4352,6 +4352,10 @@ mod edge_tests;
 mod effect_tests;
 
 #[cfg(test)]
+#[path = "jit_region_stage_tests.rs"]
+mod stage_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

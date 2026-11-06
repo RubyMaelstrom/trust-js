@@ -237,6 +237,7 @@ fn scalar_state_second_guard_miss_keeps_clean_prefix_and_exact_effect_order() {
 
 #[test]
 fn scalar_state_boolean_dup_store_phi_and_effects_never_use_numeric_payloads() {
+    crate::jit::test_first_stage_spans();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = warmed(
             tier,
@@ -342,6 +343,7 @@ fn scalar_state_inline_success_carries_clean_prefix_and_distinct_duplicates() {
 
 #[test]
 fn scalar_state_private_homes_survive_unary_and_key_conversion_observers() {
+    crate::jit::test_first_stage_spans();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = warmed(
             tier,

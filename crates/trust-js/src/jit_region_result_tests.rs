@@ -36,6 +36,7 @@ fn engine(tier: Tier, warmup: &str) -> Engine {
 
 #[test]
 fn getter_cache_regions_keep_post_effect_guards_and_native_continuation() {
+    crate::jit::test_first_stage_spans();
     let mut engine = engine(
         Tier::Jit,
         r#"
@@ -81,6 +82,7 @@ fn getter_cache_regions_keep_post_effect_guards_and_native_continuation() {
 
 #[test]
 fn region_results_preserve_inherited_negative_array_and_string_native_capabilities() {
+    crate::jit::test_first_stage_spans();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(
             tier,
@@ -144,6 +146,7 @@ fn region_results_preserve_inherited_negative_array_and_string_native_capabiliti
 
 #[test]
 fn region_results_cold_feedback_keeps_baseline_native_property_continuation() {
+    crate::jit::test_first_stage_spans();
     let mut engine = engine(Tier::Jit, "var cold={value:7};");
     let before = PROPERTY_PATHS.with(std::cell::Cell::get);
     assert_eq!(
@@ -261,6 +264,7 @@ fn region_results_warmed_own_reads_keep_borrowing_and_receiver_guard_reuse() {
 
 #[test]
 fn region_results_post_effect_guard_never_replays_getter_coercion_or_throw() {
+    crate::jit::test_first_stage_spans();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(
             tier,
@@ -325,6 +329,7 @@ fn region_results_post_effect_guard_never_replays_getter_coercion_or_throw() {
 
 #[test]
 fn region_results_ssa_phi_demand_is_not_an_entry_type_proof() {
+    crate::jit::test_first_stage_spans();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(
             tier,
@@ -375,6 +380,7 @@ fn region_results_ssa_phi_demand_is_not_an_entry_type_proof() {
 
 #[test]
 fn region_results_calls_keep_scalar_prefix_and_last_owner_across_collection() {
+    crate::jit::test_first_stage_spans();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(
             tier,

@@ -159,6 +159,7 @@ fn check(source: &str, expected: &str, fused: bool) {
 
 #[test]
 fn region_predicates_numeric_unordered_zero_and_escaping_booleans() {
+    crate::jit::test_first_stage_spans();
     check(
         r#"
         function compare(a,b){var s=0;if(a===b)s|=1;if(a!==b)s|=2;
@@ -204,6 +205,7 @@ fn region_predicates_generic_equality_and_coercion_order() {
 
 #[test]
 fn region_predicates_checked_reads_never_replay_on_miss_or_throw() {
+    crate::jit::test_first_stage_spans();
     check(
         r#"
         var trace=[],token={};
@@ -243,6 +245,7 @@ fn region_predicates_truthiness_nullish_and_last_owners() {
 
 #[test]
 fn region_predicates_native_peeks_do_not_call_condition_helper() {
+    crate::jit::test_first_stage_spans();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
@@ -281,6 +284,7 @@ fn region_predicates_native_peeks_do_not_call_condition_helper() {
 
 #[test]
 fn region_predicates_boolean_numeric_consumers_and_join_owners() {
+    crate::jit::test_first_stage_spans();
     check(
         r#"
         function consume(a,b,k){var x=a+0,y=b+0,p,q;
@@ -312,6 +316,7 @@ fn region_predicates_boolean_numeric_consumers_and_join_owners() {
 
 #[test]
 fn region_predicates_reused_chains_keep_committed_effects_and_tagged_local_writes() {
+    crate::jit::test_first_stage_spans();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         // A property chain is admitted from monomorphic bytecode feedback. Warm

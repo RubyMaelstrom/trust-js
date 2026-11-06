@@ -396,6 +396,8 @@ fn property_reads_and_writes_receive_every_kind_of_this() {
 /// `this` throws on the store or the read.
 #[test]
 fn numeric_chains_receive_every_kind_of_this() {
+    // Some of its `this` chains compile inside acyclic spans (regions build chains too).
+    crate::jit::test_first_stage_spans();
     let source = format!(
         "{KIND}
         var FLAG = 2;

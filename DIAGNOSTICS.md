@@ -109,6 +109,10 @@ comment/example in the same change.
   the same for the fused name/element access (the sites then keep only the name probe shared).
   Compiled applications such as DOOM's emulator are bound by instruction fetch: shared stubs
   cost a call and return per access and save more in instruction cache misses.
+- `TRUST_JS_JIT_FIRST_STAGE_SPANS=1` gives first stages their acyclic register regions back. By
+  default a function's first native compile has loop regions but no acyclic spans: those come
+  with its second stage, the inline recompile of a function that has run (a borrowed frame's
+  compile, a loop transfer or a resumable body, keeps them).
 - `TRUST_JS_JIT_NO_INT_REGS=1` keeps every int32 result of a register region (bitwise operators,
   shifts, `Math.imul`) in a floating-point register instead of leaving it in an integer
   register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).

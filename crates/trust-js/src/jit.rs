@@ -4906,6 +4906,37 @@ pub fn compile(
     )
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Set by [`test_first_stage_spans`]: this thread's compiles give first stages their acyclic
+    /// spans, as before tier 1's step (a).
+    static TEST_FIRST_STAGE_SPANS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// For tests of the acyclic regions' lowering, which compile the functions they check as first
+/// stages: this thread's first stages keep their acyclic spans (tier 1's step (a) leaves them to
+/// second stages). The tests check the lowering, not where it runs.
+#[cfg(test)]
+pub(crate) fn test_first_stage_spans() {
+    TEST_FIRST_STAGE_SPANS.with(|on| on.set(true));
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[inline(always)]
+fn test_first_stage_spans_on() -> bool {
+    #[cfg(test)]
+    {
+        TEST_FIRST_STAGE_SPANS.with(std::cell::Cell::get)
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// The operations a function's optional register regions may cover in all (`compile_entry`).
 #[cfg(all(
     target_arch = "aarch64",
@@ -4933,6 +4964,19 @@ fn compile_entry(
         return None; // op index must fit one movz
     }
     let borrowed_entry = entry_kind == NativeEntryKind::BorrowedFrame;
+    // Tier 1's step (a): a first stage (a function's first native compile, which runs at its first
+    // bytecode run, before it has run natively) compiles no acyclic register region. Its spans come
+    // with its second stage, the inline recompile of a function that has run, as V8's, SpiderMonkey's
+    // and JSC's baselines emit no optimized code and leave register allocation to the tiers that
+    // compile hot code. Measured before building (the plan's tier 1 design note): every workload
+    // runs fewer instructions without first stages' spans but zlib, whose one hot function never
+    // gets a second stage. Loop regions stay: a loop's heat is its back edges, which a first stage
+    // does not count yet. A borrowed frame's compile (a loop transfer from the tree-walker, a
+    // resumable body) keeps its spans. TRUST_JS_JIT_FIRST_STAGE_SPANS=1 keeps them everywhere.
+    let acyclic_regions = chunk.jit_second_stage()
+        || borrowed_entry
+        || env_flag!("TRUST_JS_JIT_FIRST_STAGE_SPANS")
+        || test_first_stage_spans_on();
     if !borrowed_entry && ops.iter().any(|op| matches!(op, Op::FragmentExit(_))) {
         return None; // exact outer completion belongs to the borrowed AST/VM driver
     }
@@ -5352,6 +5396,7 @@ fn compile_entry(
         }
         if fast & 32768 != 0
             && layout.valid
+            && acyclic_regions
             && !region_covered[pc]
             && region_ops < REGION_OPS_BUDGET
         {
