@@ -15664,15 +15664,26 @@ impl Interp {
         if epoch == u32::MAX {
             return CachedCall::Miss;
         }
+        // A way whose chunk a newer one superseded takes its function's current code first
+        // (per-callee pickup, `Chunk::supersede`); one that cannot yet misses, and an overflow
+        // entry's misses for the caller's fill.
         for e in &site.entries {
             let p = e.as_ptr();
             unsafe {
                 if (*p).callee == key && (*p).global_env == genv && (*p).epoch == epoch {
+                    if crate::bytecode::entry_superseded(p)
+                        && !crate::bytecode::refill_superseded(e)
+                    {
+                        return CachedCall::Miss;
+                    }
                     return CachedCall::Entry(p);
                 }
             }
         }
         if let Some(entry) = self.call_overflow.lookup_entry(key, genv, epoch) {
+            if unsafe { crate::bytecode::entry_superseded(entry) } {
+                return CachedCall::Miss;
+            }
             return CachedCall::Entry(entry);
         }
         {
@@ -15716,6 +15727,11 @@ impl Interp {
                     let p = e.as_ptr();
                     unsafe {
                         if (*p).func == fp && (*p).global_env == genv && (*p).epoch == epoch {
+                            if crate::bytecode::entry_superseded(p)
+                                && !crate::bytecode::refill_superseded(e)
+                            {
+                                return CachedCall::Miss;
+                            }
                             found = Some(*p);
                             break;
                         }
@@ -15784,13 +15800,16 @@ impl Interp {
     }
 
     /// Whether a preparation still describes the entry [`Interp::call_jit_cached`] would take:
-    /// the global call-cache epoch (recompiles, invalidations) and the active realm are
-    /// unchanged. Callee identity is fixed by the preparation's owner.
+    /// the global call-cache epoch (reclaimed code, invalidations) and the active realm are
+    /// unchanged, and no newer chunk of the callee superseded the prepared one. Callee identity
+    /// is fixed by the preparation's owner.
     #[inline]
     pub(crate) fn prepared_call_current(&self, prepared: &PreparedCall) -> bool {
         prepared.ic.epoch
             == crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
             && prepared.ic.global_env == Env::as_ptr(&self.global_env) as usize
+            // SAFETY: the entry's epoch is the live one, so its chunk is alive.
+            && !unsafe { crate::bytecode::entry_superseded(&prepared.ic) }
     }
 
     /// One call through a current [`PreparedCall`], with exactly the effects of the
@@ -16052,7 +16071,12 @@ impl Interp {
         let key = Gc::as_ptr(&object) as usize;
         let global_env = Env::as_ptr(&self.global_env) as usize;
         let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
-        if let Some(entry) = self.call_overflow.lookup_entry(key, global_env, epoch) {
+        if let Some(entry) = self
+            .call_overflow
+            .lookup_entry(key, global_env, epoch)
+            // A superseded chunk's entry misses: the guarded call below refills it.
+            .filter(|&entry| !unsafe { crate::bytecode::entry_superseded(entry) })
+        {
             // SAFETY: a live entry, copied before anything re-entrant runs (the callee may
             // refill the table).
             let ic = unsafe { entry.read() };
@@ -16344,9 +16368,10 @@ impl Interp {
     }
 
     /// Bounded, feedback-adaptive second-stage compile of a hot chunk's function with its callees
-    /// spliced inline. On success the new chunk lands in `FunctionRuntime::code2` and the global call-IC
-    /// epoch bumps, so every cached caller re-resolves and picks it up; the old chunk stays
-    /// alive (and correct) beneath any pointers already handed out.
+    /// spliced inline. On success the new chunk lands in `FunctionRuntime::code2` and supersedes
+    /// the chunk it replaces, so that chunk's cached callers pick it up at their next call
+    /// (`FunctionRuntime::publish`); the old chunk stays alive (and correct) beneath any pointers
+    /// already handed out.
     pub(crate) fn try_inline_recompile(
         &mut self,
         func: *const crate::ast::Function,
@@ -16376,7 +16401,7 @@ impl Interp {
         let func = unsafe { &*func };
         let runtime = func.runtime();
         if runtime.code2.get().is_some() {
-            chunk.inline_retry_at.set(0);
+            chunk.set_inline_retry_at(0);
             crate::jit::perf_inline_suppressed();
             return;
         }
@@ -16409,9 +16434,8 @@ impl Interp {
                     head.replace('\n', " ")
                 );
             }
-            let _ = runtime.code2.set(Some(chunk2));
-            chunk.inline_retry_at.set(0);
-            crate::bytecode::invalidate_call_caches();
+            runtime.publish(&runtime.code2, chunk2, genv);
+            chunk.set_inline_retry_at(0);
         } else {
             crate::jit::perf_inline_failure();
         }
@@ -16420,8 +16444,8 @@ impl Interp {
     /// The one recompile of a function whose chunk asked for it (see `Chunk::note_chain_replay`):
     /// from its first-stage chunk's caches and a fresh inline plan, as the inline recompile is,
     /// but building no property chains. It lands in `FunctionRuntime::code3` when the function
-    /// has a second stage (the bailing chunk, mostly), else in `code2`, and moves the call
-    /// caches' epoch as a landed second stage does; frames already running the bailing chunk
+    /// has a second stage (the bailing chunk, mostly), else in `code2`, and supersedes the chunk
+    /// it replaces as a landed second stage does; frames already running the bailing chunk
     /// finish in it. One a function: the request is made once a chunk (at
     /// [`crate::bytecode::STALE_CHAIN_REPLAYS`]), and each slot is set once. Whether it landed:
     /// a declined one (another Realm's call, a recompile already made, a compile that failed)
@@ -16463,13 +16487,13 @@ impl Interp {
         else {
             return decline("the compile failed");
         };
-        let _ = if second_stage {
-            runtime.code3.set(Some(chunk3))
+        let slot = if second_stage {
+            &runtime.code3
         } else {
-            runtime.code2.set(Some(chunk3))
+            &runtime.code2
         };
-        chunk.inline_retry_at.set(0);
-        crate::bytecode::invalidate_call_caches();
+        runtime.publish(slot, chunk3, genv);
+        chunk.set_inline_retry_at(0);
         if let Some(started) = started {
             let src = func.source.as_deref().unwrap_or("<no source>");
             let head: String = src.chars().take(60).collect();
@@ -16817,12 +16841,15 @@ impl Interp {
         // already known to be a same-realm ordinary user constructor. Probe it before classifying
         // natives: hot `new C()` sites otherwise borrow C and look up `.prototype` twice per
         // allocation (once to ask whether C is native, then again for the live instance proto).
+        // A superseded chunk's entry misses (per-callee pickup): the fill below refills both
+        // caches with the constructor's current code.
         let cached_site = site
             .map(|(chunk, cache)| chunk.construct_cache(cache))
             .filter(|entry| {
                 entry.call.callee == key
                     && entry.call.epoch == epoch
                     && entry.call.global_env == genv
+                    && !unsafe { crate::bytecode::entry_superseded(&entry.call) }
             });
         // Native constructors do not need an ordinary instance or a JS activation: they build
         // their result in the native body. Keep them on the same read-only argument-window
@@ -16875,7 +16902,8 @@ impl Interp {
                 Some(entry)
                     if entry.pin.as_ptr() == Gc::as_ptr(o)
                         && entry.call.epoch == epoch
-                        && entry.call.global_env == genv =>
+                        && entry.call.global_env == genv
+                        && !unsafe { crate::bytecode::entry_superseded(&entry.call) } =>
                 {
                     (
                         entry.call,
@@ -17212,6 +17240,13 @@ impl Interp {
         if chunk.has_tail_calls() || chunk.prepared_entry {
             return None;
         }
+        // The entry below records the epoch after any move this makes (another Realm's
+        // superseded chunk).
+        let epoch = if crate::bytecode::note_selected(chunk) {
+            crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
+        } else {
+            epoch
+        };
         // A constructor that needs an activation, a rest Array or an arguments value makes them
         // in its prologue (`bytecode::jit_frame_setup`), whichever entry runs it.
         let (n_params, n_slots) = chunk.jit_frame();
@@ -17349,12 +17384,17 @@ impl Interp {
         // instead of growing the pin list without bound.
         if let Some((cs, pins)) = site {
             let key = Gc::as_ptr(o) as usize;
+            // The chunk goes into the cache, which records the epoch after any move this makes
+            // (another Realm's superseded chunk).
+            crate::bytecode::note_selected(chunk);
             let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
             // A megamorphic site keeps its ways: the callee goes to the overflow table, which
-            // pins it, and never into the chunk's pins, while the site's budget for the epoch
-            // lasts (`CALL_SITE_OVERFLOW_ADMISSIONS`); past it, nothing is recorded.
+            // pins it, and never into the chunk's pins, while the site's budget for its window
+            // lasts (`CALL_SITE_OVERFLOW_ADMISSIONS`); past it, nothing is recorded. An entry
+            // the table holds for the callee already (stale, or its chunk superseded) refills.
             let refused = cs.refuses(key, epoch);
-            let megamorphic = refused && cs.admits_overflow(epoch);
+            let megamorphic =
+                refused && (self.call_overflow.holds(key) || cs.admits_overflow(epoch));
             let mut p = pins.borrow_mut();
             if megamorphic || !refused && (p.len() < 4096 || p.contains_key(&key)) {
                 if !megamorphic {

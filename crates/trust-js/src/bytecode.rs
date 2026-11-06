@@ -1026,8 +1026,9 @@ pub struct CallIc {
     /// `Rc::as_ptr` of the callee's `ast::Function` (alive while the callee object is: `call`
     /// is never reassigned) — the inline-recompile trigger needs the AST.
     pub func: *const crate::ast::Function,
-    /// [`CALL_IC_EPOCH`] at fill time; a mismatch forces a re-fill (so a fresh second-stage
-    /// compile of the callee replaces the cached chunk/code pointers).
+    /// [`CALL_IC_EPOCH`] at fill time; a mismatch forces a re-fill (so reclaimed code and a
+    /// dropped function runtime are never entered). A callee's new code supersedes the chunk
+    /// this entry holds instead ([`Chunk::supersede`]).
     pub epoch: u32,
     /// `Rc::as_ptr` of the callee's chunk — what `ctx.chunk` holds (the direct-call sequence
     /// swaps it in without the RcBox-offset arithmetic a `*const Rc<Chunk>` deref would need).
@@ -1219,11 +1220,106 @@ pub struct InlineTarget {
     pub check_this: bool,
 }
 
-/// Invalidated before native code is reclaimed and when a function gains its
-/// second-stage compile. A raw call/construct/overflow probe matches only an entry of the
-/// current value, and no cache records the exhausted value (u32::MAX), so stale
-/// executable/landing pointers are never read.
+/// Invalidated before native code is reclaimed, before a function's runtime (whose chunk slots
+/// the entries address) drops and when a dead global environment's pin goes. A raw
+/// call/construct/overflow probe matches only an entry of the current value, and no cache
+/// records the exhausted value (u32::MAX), so stale executable/landing pointers are never read.
+/// A function's new code does not move it: the chunk it replaces is superseded (see
+/// [`Chunk::supersede`]), and only that chunk's callers refill.
 pub static CALL_IC_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// A call cache's fill selected `chunk`, the running Realm's current code of its function. A
+/// chunk superseded there is another Realm's replaced code (a second stage planned in the
+/// publishing Realm, `Chunk::inline_realm_compatible`, leaves the others on the chunk it
+/// replaced): it is current again, and the epoch moves so that the publishing Realm's callers
+/// find their new code, as each publication did before per-callee pickup. Once a chunk at most,
+/// and never in a program with one Realm.
+/// Whether the epoch moved.
+#[inline]
+pub(crate) fn note_selected(chunk: &Chunk) -> bool {
+    if !chunk.superseded() {
+        return false;
+    }
+    chunk.unsupersede();
+    #[cfg(feature = "architecture-diagnostics")]
+    call_cache_diagnostics::realm_fallback();
+    if std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
+        eprintln!("[tier] another Realm still runs a superseded chunk: current again, epoch moved");
+    }
+    invalidate_call_caches();
+    true
+}
+
+/// Whether `ic`, an entry its probe matched, runs a chunk that a newer one superseded
+/// ([`Chunk::supersede`]): the caller refills it with its function's current code instead.
+///
+/// # Safety
+/// `ic` matched the live epoch, so a user entry's chunk is alive (a native's is null).
+#[inline(always)]
+pub(crate) unsafe fn entry_superseded(ic: *const CallIc) -> bool {
+    let chunk = unsafe { (*ic).chunk_raw };
+    !chunk.is_null() && unsafe { (*chunk).superseded() }
+}
+
+/// Refill `way`, whose chunk a newer one superseded and whose probe matched (so its epoch and
+/// Realm are the live ones), with its function's current code in that Realm: the chunk fields
+/// that [`Interp::call_jit_fast`] would record for the same callee, whose identity and every
+/// proof about it stay. A code-keyed probe then finds the new code too, which a fill under the
+/// live closure's identity would leave behind. `false` leaves the way as it was: the current code
+/// has no entry a way can hold yet (not compiled, a prepared or resumable body), or the Realm
+/// still selects the superseded chunk, which [`note_selected`] made current again.
+///
+/// # Safety
+/// The way's probe matched the live epoch and the active Realm, with its callee (or another
+/// closure of its function) live: the way's function and its runtime's slots are alive.
+#[cold]
+#[inline(never)]
+pub(crate) unsafe fn refill_superseded(way: &std::cell::Cell<CallIc>) -> bool {
+    let mut ic = way.get();
+    // SAFETY: the site pins the function, and its live closure keeps it.
+    let func = unsafe { &*ic.func };
+    let runtime = func.runtime();
+    let Some(Some(chunk)) = runtime.execution_code_for(ic.global_env) else {
+        return false;
+    };
+    if std::ptr::eq(Rc::as_ptr(chunk), ic.chunk_raw) {
+        note_selected(chunk);
+        return false;
+    }
+    let Some(Some(code)) = chunk.jit.get() else {
+        return false;
+    };
+    let (n_params, n_slots) = chunk.jit_frame();
+    if chunk.prepared_entry
+        || chunk.jit_is_resumable()
+        || n_params > u16::MAX as usize
+        || n_slots > u16::MAX as usize
+    {
+        return false;
+    }
+    ic.chunk = chunk as *const Rc<Chunk>;
+    ic.code = Rc::as_ptr(&code);
+    ic.uses_this = chunk.needs_frame_this();
+    ic.n_params = n_params as u16;
+    ic.n_slots = n_slots as u16;
+    ic.direct = chunk.jit_direct_flags(&code)
+        | (((chunk.inline_attempted.get() || runtime.code2.get().is_some()) as u8) << 2)
+        | (ic.direct & CALL_IC_LEXICAL_THIS);
+    ic.chunk_raw = Rc::as_ptr(chunk);
+    ic.code_mem = code.mem_ptr();
+    ic.pc_offs_ptr = code.pc_offsets_ptr();
+    way.set(ic);
+    #[cfg(feature = "architecture-diagnostics")]
+    call_cache_diagnostics::in_place_refill();
+    true
+}
+
+/// Whether publications move [`CALL_IC_EPOCH`] as before per-callee pickup
+/// (`TRUST_JS_JIT_PUBLISH_EPOCH=1`, a diagnostic): every call site then re-resolves at each new
+/// code a function gets, and no chunk is superseded.
+pub(crate) fn publish_epoch() -> bool {
+    env_flag!("TRUST_JS_JIT_PUBLISH_EPOCH")
+}
 #[cfg(feature = "architecture-diagnostics")]
 #[path = "call_cache_diagnostics.rs"]
 pub(crate) mod call_cache_diagnostics;
@@ -1371,10 +1467,12 @@ pub struct CallSite {
     /// [`CALL_SITE_MEGAMORPHIC_EVICTIONS`], where the site is megamorphic for good (see
     /// [`CallSite::fill`]).
     evictions: std::cell::Cell<u8>,
-    /// The callees a megamorphic site has put in the overflow table in the epoch
-    /// `counted_epoch`, up to [`CALL_SITE_OVERFLOW_ADMISSIONS`] (see
-    /// [`CallSite::admits_overflow`]).
+    /// The callees a megamorphic site has put in the overflow table in its current window, up
+    /// to [`CALL_SITE_OVERFLOW_ADMISSIONS`] (see [`CallSite::admits_overflow`]).
     admissions: std::cell::Cell<u8>,
+    /// The calls a megamorphic site has made through the full guards, its admissions spent, for
+    /// want of an entry, since its window began, up to [`CALL_SITE_OVERFLOW_RENEWAL`].
+    declined: std::cell::Cell<u16>,
     /// The [`CALL_IC_EPOCH`] whose events `evictions` counts, and `admissions` once the site is
     /// megamorphic.
     counted_epoch: std::cell::Cell<u32>,
@@ -1393,7 +1491,7 @@ pub struct CallSite {
 /// count starts again with each epoch.
 pub(crate) const CALL_SITE_MEGAMORPHIC_EVICTIONS: u8 = 4;
 
-/// The callees a megamorphic call site may put in the engine-wide overflow table in one epoch
+/// The callees a megamorphic call site may put in the engine-wide overflow table in one window
 /// (W3's item 7): an eighth of the smallest table. Its other callees still run, through the full
 /// guards, but get no entry: past its ways and this many more, a site meets callees that seldom
 /// repeat (a fresh closure on each call), whose entries would each cost a pin and an insertion
@@ -1402,8 +1500,32 @@ pub(crate) const CALL_SITE_MEGAMORPHIC_EVICTIONS: u8 = 4;
 /// JavaScriptCore links at most eight callees a site, then calls virtually
 /// (Source/JavaScriptCore/bytecode/Repatch.cpp:171-184); V8 caches no target at a megamorphic
 /// slot. TRust's call without an entry takes the full guards, so a site keeps a budget rather
-/// than none, and a large one: Djot's busiest polymorphic site calls 28 functions.
+/// than none, and a large one: Djot's busiest polymorphic site calls 28 functions. A callee whose
+/// entry the table holds already (one a fill found stale or superseded) refills it without an
+/// admission. The window renews after [`CALL_SITE_OVERFLOW_RENEWAL`] calls without an entry, and
+/// when the epoch moves, which stales every entry.
 pub(crate) const CALL_SITE_OVERFLOW_ADMISSIONS: u8 = 64;
+
+/// The calls a megamorphic site makes through the full guards for want of an entry, its
+/// admissions spent, before its window renews (see [`CALL_SITE_OVERFLOW_ADMISSIONS`]): a site
+/// whose callees keep repeating (an opcode table's handlers) gets entries for them in later
+/// windows, while one meeting a fresh callee on each call admits at most one in seventeen.
+/// Before per-callee pickup, each publication of a function's new code renewed every site's
+/// window with the epoch, an accident of the global epoch that the exemplars do not share.
+pub(crate) const CALL_SITE_OVERFLOW_RENEWAL: u16 = 1024;
+
+/// [`CALL_SITE_OVERFLOW_RENEWAL`], or `TRUST_JS_JIT_OVERFLOW_RENEWAL=<n>`'s (a diagnostic).
+#[inline]
+fn overflow_renewal() -> u16 {
+    static VALUE: std::sync::OnceLock<u16> = std::sync::OnceLock::new();
+    *VALUE.get_or_init(|| {
+        std::env::var("TRUST_JS_JIT_OVERFLOW_RENEWAL")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .filter(|&renewal: &u16| renewal != 0)
+            .unwrap_or(CALL_SITE_OVERFLOW_RENEWAL)
+    })
+}
 const _: () =
     assert!(CALL_SITE_OVERFLOW_ADMISSIONS as usize == CALL_OVERFLOW_SETS * CALL_OVERFLOW_WAYS / 8);
 
@@ -1426,6 +1548,7 @@ impl CallSite {
             code_hint: std::cell::Cell::new(0),
             evictions: std::cell::Cell::new(0),
             admissions: std::cell::Cell::new(0),
+            declined: std::cell::Cell::new(0),
             counted_epoch: std::cell::Cell::new(0),
         }
     }
@@ -1446,17 +1569,28 @@ impl CallSite {
     }
     /// Whether this megamorphic site may put one more callee it [refuses](CallSite::refuses)
     /// in the overflow table in `epoch`, which then counts it (see
-    /// [`CALL_SITE_OVERFLOW_ADMISSIONS`]).
+    /// [`CALL_SITE_OVERFLOW_ADMISSIONS`]); a refusal counts toward the window's renewal.
     pub fn admits_overflow(&self, epoch: u32) -> bool {
         if self.counted_epoch.get() != epoch {
             self.counted_epoch.set(epoch);
             self.admissions.set(0);
+            self.declined.set(0);
         }
         let admitted = self.admissions.get();
-        if admitted >= CALL_SITE_OVERFLOW_ADMISSIONS {
+        if admitted < CALL_SITE_OVERFLOW_ADMISSIONS {
+            self.admissions.set(admitted + 1);
+            return true;
+        }
+        let declined = self.declined.get() + 1;
+        if declined < overflow_renewal() {
+            self.declined.set(declined);
             return false;
         }
-        self.admissions.set(admitted + 1);
+        // A new window, which this admission begins.
+        #[cfg(feature = "architecture-diagnostics")]
+        call_cache_diagnostics::overflow_renewal();
+        self.declined.set(0);
+        self.admissions.set(1);
         true
     }
     /// Record `ic`, replacing an existing way for the same callee (epoch or realm refills must
@@ -2043,6 +2177,17 @@ impl CallOverflow {
         // SAFETY: the entry is live in this table for the duration of the copy.
         self.lookup_entry(key, global_env, epoch)
             .map(|entry| unsafe { *entry })
+    }
+
+    /// Whether the table holds an entry for the callee `key`, at any epoch or Realm: a fill
+    /// for it replaces that entry rather than taking another way (see `insert_entry`).
+    pub(crate) fn holds(&self, key: usize) -> bool {
+        self.sets.as_ref().is_some_and(|sets| {
+            sets[Self::set_index(key, self.hash_shift)]
+                .entries
+                .iter()
+                .any(|entry| entry.call.callee == key)
+        })
     }
 
     /// The address of the entry for `key` in `global_env` at `epoch`, valid until the table
@@ -3390,6 +3535,11 @@ pub struct Chunk {
     pub(crate) inline_retry_at: std::cell::Cell<u32>,
     inline_checks: std::cell::Cell<u8>,
     inline_feedback: std::cell::Cell<u64>,
+    /// A newer chunk of the function replaced this one where it was published (per-callee
+    /// pickup): the retry word holds 1, a standing request that sends every direct entry to
+    /// the call helper, which refills the entry's way with the function's current code, and
+    /// this keeps the word the chunk had. `None` while the chunk is its Realms' current code.
+    superseded: std::cell::Cell<Option<u32>>,
     /// Whether this chunk's native code may hold an operator chain with a property read or
     /// store (`jit::build_chain`'s `LoadProp` and `StoreProp`), whose bail replays them through
     /// the generic helper: only then does [`Chunk::note_chain_replay`] count.
@@ -3678,6 +3828,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             inline_retry_at: _,
             inline_checks: _,
             inline_feedback: _,
+            superseded: _,
             property_chains: _,
             no_property_chains: _,
             stale_chain_replays: _,
@@ -8697,6 +8848,9 @@ thread_local! {
 #[path = "call_feedback_tests.rs"]
 mod call_feedback_tests;
 #[cfg(test)]
+#[path = "callee_pickup_tests.rs"]
+mod callee_pickup_tests;
+#[cfg(test)]
 #[path = "function_tiering_tests.rs"]
 mod function_tiering_tests;
 #[cfg(test)]
@@ -9950,6 +10104,7 @@ fn finish_chunk(
         inline_retry_at: std::cell::Cell::new(inline_recompile_at()),
         inline_checks: std::cell::Cell::new(0),
         inline_feedback: std::cell::Cell::new(0),
+        superseded: std::cell::Cell::new(None),
         property_chains: std::cell::Cell::new(false),
         no_property_chains: std::cell::Cell::new(false),
         stale_chain_replays: std::cell::Cell::new(0),
@@ -11898,6 +12053,7 @@ impl Compiler {
                 code_hint: std::cell::Cell::new(0),
                 evictions: std::cell::Cell::new(evictions.0),
                 admissions: std::cell::Cell::new(0),
+                declined: std::cell::Cell::new(0),
                 counted_epoch: std::cell::Cell::new(evictions.1),
             }
         } else {
@@ -24118,9 +24274,48 @@ impl Chunk {
     pub(crate) fn jit_inline_retry_at_off(&self) -> usize {
         &self.inline_retry_at as *const _ as usize - self as *const Chunk as usize
     }
+    /// Whether the chunk's next inline checkpoint is due at `runs`. A superseded chunk's word is
+    /// a standing request for its callers' refills, not a checkpoint: none is ever due.
     pub(crate) fn inline_retry_due(&self, runs: u32) -> bool {
         let at = self.inline_retry_at.get();
-        at != 0 && runs >= at
+        at != 0 && runs >= at && self.superseded.get().is_none()
+    }
+    /// Set the chunk's next inline checkpoint (0: none). A superseded chunk keeps it for the
+    /// time it is current again (see [`Chunk::unsupersede`]).
+    pub(crate) fn set_inline_retry_at(&self, at: u32) {
+        if self.superseded.get().is_some() {
+            self.superseded.set(Some(at));
+        } else {
+            self.inline_retry_at.set(at);
+        }
+    }
+    /// Whether a newer chunk of the function replaced this one (see [`Chunk::supersede`]).
+    #[inline(always)]
+    pub(crate) fn superseded(&self) -> bool {
+        self.superseded.get().is_some()
+    }
+    /// A newer chunk of the function replaced this one in the Realm that published it, as a
+    /// tiering request redirects V8's next call of a function (SetTieringRequest,
+    /// src/sandbox/js-dispatch-table.h:267-271): this chunk's retry word becomes 1, so every
+    /// direct entry into it takes the call helper (its gate, `jit::emit_direct_sequence`, sees
+    /// the checkpoint due), which refills the entry's way with the function's current code
+    /// (`execution_code_for`), and Rust's probes miss on its ways. No other call site
+    /// re-resolves, and the call caches' epoch stays where it is. Frames running this chunk
+    /// finish in it, and a caller that still enters it runs valid code: the chunk lives in its
+    /// set-once slot as long as its function's runtime.
+    pub(crate) fn supersede(&self) {
+        if self.superseded.get().is_none() {
+            self.superseded.set(Some(self.inline_retry_at.replace(1)));
+            #[cfg(feature = "architecture-diagnostics")]
+            call_cache_diagnostics::supersede();
+        }
+    }
+    /// The chunk is a Realm's current code again (see [`note_selected`]): its direct entries
+    /// count toward the checkpoint it had.
+    pub(crate) fn unsupersede(&self) {
+        if let Some(at) = self.superseded.take() {
+            self.inline_retry_at.set(at);
+        }
     }
     /// A property operation that a chain's bail replays through the generic helper
     /// (`jit_exec_inner`), counted when its site's cache holds the receiver's shape as a data
@@ -24161,8 +24356,7 @@ impl Chunk {
         // Once a chunk: whatever the recompile's outcome, the chunk does not ask again.
         if replays == STALE_CHAIN_REPLAYS && !env_flag!("TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE") {
             self.reoptimize.set(true);
-            self.inline_retry_at
-                .set(self.jit_runs.get().saturating_add(1).max(1));
+            self.set_inline_retry_at(self.jit_runs.get().saturating_add(1).max(1));
         }
     }
     /// The replays [`Chunk::note_chain_replay`] counted.
@@ -24176,7 +24370,7 @@ impl Chunk {
         use std::hash::{Hash, Hasher};
         let checks = self.inline_checks.get().saturating_add(1);
         self.inline_checks.set(checks);
-        self.inline_retry_at.set(if checks >= 4 {
+        self.set_inline_retry_at(if checks >= 4 {
             0
         } else {
             self.jit_runs.get().saturating_add(
@@ -24185,6 +24379,8 @@ impl Chunk {
                     .saturating_mul(4u32.pow(checks as u32)),
             )
         });
+        // No epoch: a way's refill after a fencing move changes nothing the planner reads, and a
+        // callee's new code changes the way's `chunk_raw` (per-callee pickup).
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
         for site in &self.call_caches {
             for entry in &site.entries {
@@ -24193,7 +24389,6 @@ impl Chunk {
                 ic.func.hash(&mut fingerprint);
                 ic.chunk_raw.hash(&mut fingerprint);
                 ic.env.hash(&mut fingerprint);
-                ic.epoch.hash(&mut fingerprint);
             }
         }
         let next = fingerprint.finish();
@@ -26119,6 +26314,23 @@ unsafe fn jit_call_hit_inner(
         return jit_call_hit_native(
             ctx, sp, argc, with_this, native, intrinsic, signature, entry,
         );
+    }
+    // A newer chunk of the callee superseded the way's (per-callee pickup): its direct entry
+    // came here through the retry gate. The way takes the function's current code, and this
+    // call runs it; while the current code has no entry a way can hold, the generic call runs
+    // it (`Interp::resolve_cached_call_entry` misses on the way).
+    if entry_superseded(entry.as_ptr()) && !refill_superseded(entry) {
+        note_call_path(CallPath::Superseded);
+        if ctx.callstat_enabled {
+            jit_callstat(i, ctx, &entry.get(), argc, with_this, sp);
+        }
+        return match jit_call_inner(ctx, pc, &mut sp) {
+            Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
+            Err(ab) => {
+                ctx.throw_at(pc, ab);
+                crate::jit::SpFlag { sp, flag: 1 }
+            }
+        };
     }
     let mut ic = entry.get();
     // A code-keyed probe hit (see `jit::emit_call_code_probe`) matched another closure of this
@@ -28159,7 +28371,8 @@ unsafe fn jit_call_inner(
                         let epoch = CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
                         // A megamorphic site keeps its ways (see `Interp::call_jit_fast`).
                         let refused = site.refuses(key, epoch);
-                        let megamorphic = refused && site.admits_overflow(epoch);
+                        let megamorphic =
+                            refused && (i.call_overflow.holds(key) || site.admits_overflow(epoch));
                         let mut p = chunk.call_pins.borrow_mut();
                         if megamorphic || !refused && (p.len() < 4096 || p.contains_key(&key)) {
                             if !megamorphic {
@@ -28527,9 +28740,12 @@ pub(crate) enum CallPath {
     Cached,
     /// `Interp::call`, the uncached dispatcher.
     Uncached,
+    /// A superseded chunk's way through the call-hit helper whose function's current code has
+    /// no entry yet, run by the generic call (`Chunk::supersede`).
+    Superseded,
 }
 
-const CALL_PATH_NAMES: [&str; 8] = [
+const CALL_PATH_NAMES: [&str; 9] = [
     "direct sequence",
     "call-hit helper, user callee",
     "call-hit helper, native without the boundary",
@@ -28538,11 +28754,12 @@ const CALL_PATH_NAMES: [&str; 8] = [
     "intrinsic helper",
     "cached call (Rust callers, generic helper)",
     "Interp::call",
+    "call-hit helper, superseded chunk, generic call",
 ];
 
 /// The [`CallPath`] counts, global so that generated code can count the direct sequence.
-pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 8] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 8];
+pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 9] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
 
 /// Whether `TRUST_JS_JIT_CALLSTAT=2` counts call paths. Only builds with the
 /// `architecture-diagnostics` feature count them: elsewhere this is a constant false, and the
@@ -28716,6 +28933,9 @@ unsafe fn jit_callstat(
             break 'r "gate: frame pool empty";
         }
         let callee = &*ic.chunk_raw;
+        if callee.superseded() {
+            break 'r "gate: callee's chunk superseded (refill)";
+        }
         let retry_at = callee.inline_retry_at.get();
         if retry_at != 0 && callee.jit_runs.get().wrapping_add(1) >= retry_at {
             break 'r "gate: inline retry due";

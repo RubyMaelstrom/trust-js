@@ -117,6 +117,13 @@ comment/example in the same change.
   when they were compiled. By default a second stage emits a region only where a named read's
   cache or a call site's targets, seeded from the stage that ran, show its operations ran (a span
   with neither keeps its region).
+- `TRUST_JS_JIT_PUBLISH_EPOCH=1` moves the call caches' process-wide epoch at each new code a
+  function gets (an inline recompile, a recompile without property chains), so that every call
+  site re-resolves, as before per-callee pickup. By default the new code supersedes the chunk it
+  replaces, and only that chunk's callers refill their ways.
+- `TRUST_JS_JIT_OVERFLOW_RENEWAL=<n>` renews a megamorphic call site's admissions to the call
+  caches' overflow table after `n` of its calls went through the full guards for want of an entry
+  (1 to 65535; by default 1024, `CALL_SITE_OVERFLOW_RENEWAL`).
 - `TRUST_JS_JIT_NO_INT_REGS=1` keeps every int32 result of a register region (bitwise operators,
   shifts, `Math.imul`) in a floating-point register instead of leaving it in an integer
   register for the next operator, comparison or branch (`Operand::Int` in `jit_regions.rs`).

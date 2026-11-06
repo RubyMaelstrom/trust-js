@@ -5,7 +5,7 @@ use crate::value::Value;
 use crate::value::ValueView;
 use std::{cell::Cell, panic::Location, sync::atomic::Ordering::Relaxed};
 
-thread_local! { static COUNTS: Cell<[u64; 9]> = const { Cell::new([0; 9]) }; }
+thread_local! { static COUNTS: Cell<[u64; 14]> = const { Cell::new([0; 14]) }; }
 fn add(index: usize) {
     COUNTS.with(|counts| {
         let mut c = counts.get();
@@ -27,14 +27,33 @@ pub(super) fn invalidate() {
 }
 pub(super) fn fill(site: &CallSite, incoming: CallIc) {
     add(3);
-    if site
+    let same_callee = site
         .entries
         .iter()
         .map(Cell::get)
-        .any(|old| old.callee == incoming.callee && old.callee != 0 && old.epoch != incoming.epoch)
-    {
-        add(4);
+        .find(|old| old.callee == incoming.callee && old.callee != 0);
+    match same_callee {
+        Some(old) if old.epoch != incoming.epoch => add(4),
+        // A refill in the same epoch with other code: a superseded chunk's way.
+        Some(old) if old.chunk_raw != incoming.chunk_raw => add(9),
+        _ => {}
     }
+}
+/// A chunk was superseded (see `Chunk::supersede`).
+pub(super) fn supersede() {
+    add(10);
+}
+/// Another Realm still selected a superseded chunk (see `bytecode::note_selected`).
+pub(super) fn realm_fallback() {
+    add(11);
+}
+/// A megamorphic site's overflow admissions renewed (see `CALL_SITE_OVERFLOW_RENEWAL`).
+pub(super) fn overflow_renewal() {
+    add(12);
+}
+/// A superseded chunk's way took its function's current code (see `refill_superseded`).
+pub(super) fn in_place_refill() {
+    add(13);
 }
 /// A call site went megamorphic (see `CallSite::megamorphic`).
 pub(super) fn megamorphic() {
@@ -60,5 +79,5 @@ pub(crate) fn probe(site: &CallSite, callee: &Value) {
 }
 pub(crate) fn report() {
     let c = COUNTS.with(Cell::get);
-    eprintln!("[call-cache-diagnostic] {{\"scope\":\"cumulative thread\",\"native_retirements\":{},\"inline_publications\":{},\"other_invalidations\":{},\"fills\":{},\"same_callee_stale_refills\":{},\"checked_probes\":{},\"same_callee_current_probes\":{},\"same_callee_stale_probes\":{},\"megamorphic_sites\":{},\"process_epoch\":{}}}",c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],CALL_IC_EPOCH.load(Relaxed));
+    eprintln!("[call-cache-diagnostic] {{\"scope\":\"cumulative thread\",\"native_retirements\":{},\"inline_publications\":{},\"other_invalidations\":{},\"fills\":{},\"same_callee_stale_refills\":{},\"checked_probes\":{},\"same_callee_current_probes\":{},\"same_callee_stale_probes\":{},\"megamorphic_sites\":{},\"same_epoch_new_code_refills\":{},\"supersessions\":{},\"realm_fallbacks\":{},\"overflow_renewals\":{},\"in_place_refills\":{},\"process_epoch\":{}}}",c[0],c[1],c[2],c[3],c[4],c[5],c[6],c[7],c[8],c[9],c[10],c[11],c[12],c[13],CALL_IC_EPOCH.load(Relaxed));
 }

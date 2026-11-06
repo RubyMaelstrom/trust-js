@@ -10976,8 +10976,9 @@ fn emit_direct_sequence(
     // Byte offset of `Chunk::inline_attempted` (computed by the caller from its own chunk —
     // same monomorphized layout as the callee's): a call requires the callee's one-shot
     // recompile to have happened (or been attempted), else it keeps taking H_CALL_HIT, which
-    // is what bumps jit_runs toward the trigger. A landed code2 bumps the epoch and refills
-    // the site with the new chunk anyway.
+    // is what bumps jit_runs toward the trigger. A landed code2 supersedes the chunk it
+    // replaces, whose retry word then sends every entry to H_CALL_HIT, which refills the way
+    // with the new chunk (`Chunk::supersede`).
     attempted_off: usize,
     runs_off: usize,
     retry_off: usize,
@@ -11072,7 +11073,9 @@ fn emit_direct_sequence(
     // Late feedback can make a previously empty inline plan useful. Count only direct
     // entries with a pending retry; on the threshold call the helper owns the increment.
     // This gate runs after every other fallback check, before committing any call state: a
-    // construct's allocation, below, can still decline, and then takes the count back.
+    // construct's allocation, below, can still decline, and then takes the count back. A
+    // superseded chunk's word is 1, so every entry into it takes the helper, which refills the
+    // way with the function's current code (`Chunk::supersede`).
     let retry_done = a.new_label();
     a.ldr_w_imm(5, 4, retry_off as u32);
     a.cbz(5, false, retry_done);

@@ -92,6 +92,38 @@ impl FunctionRuntime {
         }
     }
 
+    /// Put `chunk`, a newer compile of the function, in `slot` (`code2` or `code3`, each set
+    /// once), and supersede the chunk it replaces as the current code of the Realm whose global
+    /// environment is `genv`, the publishing call's (see [`Chunk::supersede`]): that chunk's
+    /// callers refill at their next entry, and no other call site re-resolves. Callers in other
+    /// Realms that still select the replaced chunk make it current again at their next fill
+    /// (`bytecode::note_selected`). Whether `slot` took the chunk.
+    pub(crate) fn publish(
+        &self,
+        slot: &OnceCell<Option<Rc<Chunk>>>,
+        chunk: Rc<Chunk>,
+        genv: usize,
+    ) -> bool {
+        let replaced = self
+            .execution_code_for(genv)
+            .and_then(Option::as_ref)
+            .cloned();
+        if slot.set(Some(chunk)).is_err() {
+            return false;
+        }
+        let current = self.execution_code_for(genv).and_then(Option::as_ref);
+        if let Some(replaced) = replaced {
+            if current.is_none_or(|current| !Rc::ptr_eq(current, &replaced)) {
+                if crate::bytecode::publish_epoch() {
+                    crate::bytecode::invalidate_call_caches();
+                } else {
+                    replaced.supersede();
+                }
+            }
+        }
+        true
+    }
+
     #[cfg(test)]
     pub(crate) fn execution_code(&self) -> Option<&Option<Rc<Chunk>>> {
         self.code3
