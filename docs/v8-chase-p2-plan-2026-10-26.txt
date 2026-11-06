@@ -18344,3 +18344,267 @@ The owner, 2026-11-06: "Both of these decisions are approved."
 2. The compact templates' exit is accepted as it stands: machine code -32.3%, elapsed time -4.7%,
    and no workload slower beyond 0.2% in instructions, with template bytes -31.3% against the
    40% line, the second stage's in-line templates, kept by the design, being 47% of what remains.
+
+### Tier 1's steps (a) and (b) landed (record, 2026-11-06)
+
+The tier 1 design note's steps (a) and (b), an agent's, by cherry-pick: a8d07b73 (a) as
+e9414b6c and 2b9008c0 (b) as 0fa29002 on main 30c24090, checked as 065b9931 and eed7110f on
+02e54705, which differs from 30c24090 in the records only (the diff of diffs against the agent's
+base de3a6b56 identical; main's commits since touch the collector's cycle start and the records).
+Approved with them (the coordinator's): the fourteen tests of the acyclic regions' lowering opt
+in to first stages' spans on their own thread (jit::test_first_stage_spans, test builds only):
+they check the lowering, not where it runs; step (a)'s own test checks where it runs, and
+Test262 with second stages early (TRUST_JS_INLINE_AT=1) runs the spans in second stages.
+
+Together, against main de3a6b56 (instructions, fat LTO, the agent's sessions): Djot about -2.2%,
+React -1.57%, Richards -0.93%, Splay -0.87%, DeltaBlue -0.85%, CodeLoad -0.76%, Crypto -0.66%,
+the rest -0.03% to -0.33% but zlib +0.30%, the one hot function that never gets a second stage
+(the design note's expected cost; C3, the tier-up of hot first-stage code, gives its spans back).
+Code: Djot -7.1%, Vue -4.7%, React -0.7%. TRust's pages: machine code a page -4.8% to -10.0% at
+threshold 8 and compile time a page -16% to -24% (event-loop 13.6 -> 10.4 ms, Vue TodoMVC 98.8 ->
+82.6 ms); the spike the same within noise.
+
+The combined tree's checks: eed7110f, the tree landed but for the records (target/p2/land-t1):
+- the gate (STAGES="lib rel fixtures difftest t262", BASE compact's gate-c50a0b4e): the lib suite
+  2,851 passed and 1 failed, payload_cell_tests::a_long_string_held_only_by_a_property_lives_and_dies_with_it
+  (the known flake: one large cell more than expected in the bytecode tier, a stale stack word
+  the conservative scan keeps; it passes 5 of 5 alone); with pacing on 2,851 passed and 1 failed, the known
+  replaced_arrays_are_collected_as_their_elements_grow (replaced_maps_are_collected_as_their_tables_grow
+  passes: the cycle is off by default); the fixtures' masked outputs the base's; difftest 138
+  agree, 12 skipped (budget); Test262 at threshold 8 53,575/53,575, identical to the base's report.
+- zombie (x86-64; tier 1 changes no x86-64 code but the tests' opt-in): clippy in three
+  configurations clean; the lib suite 2,626 passed and 1 failed, the same flake, which passes 5 of
+  5 alone there too.
+
+### Tier 1 (a): first stages without acyclic spans (record, 2026-11-06)
+
+a8d07b73 on p2-tier1a, from main de3a6b56 (an agent's): the tier 1 design note's step (a), as
+decided. It was measured as 594407dd, the same code without the tests' opt-in below, kept on
+p2-measured-594407dd.
+- A function's first native compile emits its templates and its loops' regions, and no acyclic
+  register region.
+- Its spans come with its second stage, the inline recompile of a function that has run (a chunk
+  compile_with_inlines spliced into: Chunk::jit_second_stage, the same test that picks the
+  in-line templates).
+- A borrowed frame's compile keeps its spans: a loop transfer from the tree-walker, or a resumable
+  body. The oracle that measured the step kept them too.
+- C1's recompile with an empty plan is not a second stage by that test. It keeps the first stage's
+  compact templates and now its lack of spans, as measured.
+- TRUST_JS_JIT_FIRST_STAGE_SPANS=1 gives first stages their spans back (DIAGNOSTICS.md).
+- Nothing changes on x86-64, whose JIT has no register regions.
+
+Test: regions::stage_tests::first_stages_leave_acyclic_spans_to_second_stages. A function whose
+whole body is one acyclic span (`pick`, 25 operations in its first stage, 35 in its second with
+`leaf` spliced) runs its span in none of its first twenty native calls, and runs it in its second
+stage after the first inline checkpoint. It fails when first stages keep their spans.
+
+Fourteen tests of the acyclic regions' lowering compile the functions they check as first stages
+and assert that the spans run: five predicate tests, six result tests, two scalar-state tests and
+this_tests::numeric_chains_receive_every_kind_of_this, whose count of `this` chains includes those
+built inside spans. Each now calls jit::test_first_stage_spans() first, a test-only flag on its own
+thread that gives its first stages their spans. They test the lowering, not where it runs.
+rooting_holds_under_gc_stress, which runs this_tests in a child, passes with them.
+
+MEASURED
+
+Code bytes (TRUST_JS_JIT_MAP=1, opbytes.py; bytes-t1a/, the fat-LTO binaries below):
+
+| fixture | main de3a6b56 | (a) | change | region spans |
+| --- | --- | --- | --- | --- |
+| Djot | 2,700,068 | 2,544,864 | -5.7% | 648,024 -> 490,120 |
+| Vue | 461,080 | 440,832 | -4.4% | 111,696 -> 91,036 |
+| React | 267,188 | 265,400 | -0.7% | 127,200 -> 125,316 |
+
+The templates are nearly unchanged (Djot 2,036,672 -> 2,039,372): what goes is the spans' own code.
+
+Instructions (fat LTO, lto/t1a-de3a6b56 and lto/t1a-594407dd in one session, CPUs 10-13, setarch
+-R, pacing off, median of 3, chai one run, every run through env(1); counts/t1a.txt; incremental
+marking off, main's default again since 75f875b0):
+
+| workload | main | (a) | change | the oracle's "every first stage" |
+| --- | --- | --- | --- | --- |
+| Vue | 1,400,099,464 | 1,396,137,924 | -0.28% | -0.25% |
+| React | 297,894,040 | 293,205,440 | -1.57% | -1.52% |
+| Djot | 603,455,056 | 591,347,261 | -2.01% | -2.00% |
+| chai | 72,654,516,543 | 72,569,594,120 | -0.12% | -0.13% |
+| Richards | 132,468,349 | 131,233,039 | -0.93% | -0.90% |
+| DeltaBlue | 256,156,047 | 253,971,933 | -0.85% | -0.82% |
+| Crypto | 716,476,859 | 711,740,530 | -0.66% | -0.66% |
+| RayTrace | 991,352,973 | 988,090,618 | -0.33% | -0.33% |
+| EarleyBoyer | 3,094,550,407 | 3,090,090,893 | -0.14% | -0.06% |
+| RegExp | 2,671,312,563 | 2,669,881,723 | -0.05% | -0.06% |
+| Splay | 1,378,358,510 | 1,366,407,261 | -0.87% | -1.09% |
+| NavierStokes | 441,145,737 | 440,208,108 | -0.21% | -0.21% |
+| PdfJS | 6,889,879,296 | 6,868,815,335 | -0.31% | -0.37% |
+| Mandreel | 61,206,222,472 | 61,059,346,976 | -0.24% | -0.24% |
+| Gameboy | 14,921,952,939 | 14,902,831,707 | -0.13% | -0.11% |
+| CodeLoad | 480,260,380 | 476,632,974 | -0.76% | -0.72% |
+| Box2D | 4,196,352,803 | 4,183,791,550 | -0.30% | -0.30% |
+| zlib | 133,595,055,937 | 133,999,196,434 | +0.30% | +0.30% |
+| TypeScript | 57,734,733,758 | 57,675,770,952 | -0.10% | -0.30% |
+
+The step does what the oracle measured, on the cycle-off main. Djot runs 2.0% fewer instructions,
+React 1.6%. zlib's +0.30% is the one hot function that never gets a second stage (the design note;
+C3 would give its spans back).
+
+TRust's pages (TRust 78435d0's trust-browser-replay on de3a6b56 and on 594407dd, from exports;
+t1a/now: one and five pages under TRUST_JS_PERF_METRICS, a page's share (s5 - s1) / 4, CPU 14).
+Every run of the three pages exits 0 on both builds. Machine code a page:
+
+| page | main | (a) | change | compiles a page |
+| --- | --- | --- | --- | --- |
+| event-loop, t8 | 893,682 | 804,220 | -10.0% | 105 |
+| dom-reconcile, t8 | 1,805,539 | 1,663,853 | -7.8% | 214 |
+| Vue TodoMVC, t8 | 7,004,734 | 6,666,258 | -4.8% | 700 |
+| event-loop, t1a2 | 3,493,015 | 3,223,723 | -7.7% | 254 |
+| dom-reconcile, t1a2 | 3,612,279 | 3,314,435 | -8.2% | 320 |
+| Vue TodoMVC, t1a2 | 9,561,088 | 8,973,384 | -6.1% | 887 |
+
+As the census predicted (the design note's 9.9%, 7.8% and 4.8% at t8). The same functions compile;
+their first stages are smaller.
+
+Compile time a page, in a quiet window (load under 2), CPU 5, (s5 - s1) / 4 of
+TRUST_JS_PERF_METRICS's jit_compile_seconds, one session (trust/metrics-t1a.tsv,
+page-metrics-t1a.sh):
+
+| page | main | (a) | change |
+| --- | --- | --- | --- |
+| event-loop, t8 | 13.6 ms | 10.4 ms | -23.7% |
+| dom-reconcile, t8 | 26.3 ms | 21.3 ms | -19.2% |
+| Vue TodoMVC, t8 | 98.8 ms | 82.6 ms | -16.4% |
+| event-loop, t1a2 | 39.8 ms | 32.1 ms | -19.2% |
+| dom-reconcile, t1a2 | 44.8 ms | 37.1 ms | -17.2% |
+| Vue TodoMVC, t1a2 | 124.1 ms | 107.5 ms | -13.4% |
+
+The compile time falls two to three times as far as the bytes: an acyclic span costs more to
+compile than its share of the code (its SSA copy, the region IR's passes).
+
+The spike (TRust's trust-js-spike, Octane's eight at TRust's threshold 0), two rounds rotating on
+CPU 5 in the same window: main 3637 and 3649, (a) 3650 and 3643. That is the same within noise
+(t1a/spike-*.log). The pages' native compiles under TRUST_JS_TIER_LOG are the same on both builds:
+event-loop 102, dom-reconcile 208, Vue TodoMVC 686 (t1a/tier-*.err).
+
+CHECKS
+
+- 594407dd, the measured code. Its non-test code is a8d07b73's: the tests' opt-in reads false
+  outside test builds.
+  - The ARM64 lib suite (embed): 2,834 passed and 15 failed, 9 ignored. The 15 were fourteen
+    tests of the acyclic regions' lowering, which compile the functions they check as first
+    stages, and rooting_holds_under_gc_stress, which runs one of them in its child.
+  - clippy -D warnings in the three configurations: clean.
+  - The semantics programs (tests/tdz-, call-, eq-, store-, read-semantics.js) at the JIT tier,
+    warm (threshold 1, TRUST_JS_JIT_ADMIT_RUNS=20), with TRUST_JS_INLINE_AT=1, and with both: the
+    tree-walker's output in every one.
+  - The gate (gate-v2.sh, STAGES="rel fixtures difftest t262", BASE w2g's rest gate), clean tree:
+    the fixtures' masked outputs the base's; difftest 138 agree, 12 skipped (budget); Test262 at
+    threshold 8 53,575/53,575, the report identical to the base's (gate-594407dd.txt).
+  - Test262 again with the checkpoints at 1, 5, 21 and 85 runs (TRUST_JS_INLINE_AT=1, so second
+    stages come early): 53,575/53,575.
+- a8d07b73 (594407dd and the fourteen tests' opt-in):
+  - The lib suite: 2,848 passed and 1 failed, 9 ignored. The failure was
+    gc_scan_spike::spike_scan_cost_is_linear_and_small, the known wall-clock bound under load;
+    it passes 3 of 3 alone.
+  - clippy in the three configurations: clean. cargo fmt: clean.
+- x86-64: no change (the JIT has no register regions there). Not run on zombie.
+
+### Tier 1 (b): second stages' regions only where their operations ran (record, 2026-11-06)
+
+2b9008c0 on p2-tier1b, from (a)'s a8d07b73 (an agent's): the tier 1 design note's step (b).
+- A second stage is compiled from the caches its first stage filled. compile_with_inlines seeds a
+  named read's ways and a call site's targets, and a spliced callee's sites from the callee's own
+  chunk.
+- It now emits a register region (a loop or an acyclic span) only where those caches show that the
+  region's operations ran before the recompile. A span holding a seeded read or call that is still
+  empty never ran, and keeps its templates (jit::span_ran).
+- Maglev, Warp and the DFG treat code without feedback the same way, as an exit: Maglev's
+  insufficient-feedback deopt, Warp's FirstExecution bailout, the DFG's ForceOSRExit.
+- A span holding no such site carries no evidence and keeps its region. Stores, updates, values
+  and elements are no evidence: their seeds are cleared, or their in-line paths record nothing.
+- First stages compile before any native run and keep their loops' regions.
+- TRUST_JS_JIT_UNRUN_REGIONS=1 keeps the regions of spans that have not run (DIAGNOSTICS.md).
+  Without seeds (TRUST_JS_JIT_NO_CACHE_SEED), the caches hold no evidence, and second stages keep
+  every region.
+
+Test: regions::stage_tests::second_stages_leave_out_regions_whose_code_has_not_run. A loop that ran
+in none of its function's calls before the second stage runs as templates in that stage. The test
+fails when second stages keep unrun regions: the loop then ran as a region 21 times.
+
+MEASURED
+
+Code bytes (TRUST_JS_JIT_MAP=1, opbytes.py; bytes-t1b/):
+
+| fixture | (a) | (b) | change | region spans |
+| --- | --- | --- | --- | --- |
+| Djot | 2,544,860 | 2,508,516 | -1.4% | 490,120 -> 452,228 |
+| Vue | 440,832 | 439,472 | -0.3% | 91,036 -> 89,640 |
+| React | 265,400 | 265,400 | 0 | 125,316 |
+
+The caches see part of what the census found never entered: Djot's second stages lose 38 KB of
+their 67 KB, and Vue's 1.4 KB of 27 KB. The rest ran before the recompile but not after, or holds
+no seeded read or call.
+
+Instructions (fat LTO, (a)'s lto/t1a-594407dd against lto/t1b-2b9008c0 in one session, CPUs
+10-13, setarch -R, pacing off, median of 3, chai one run, every run through env(1);
+counts/t1b.txt):
+
+| workload | (a) | (b) | change |
+| --- | --- | --- | --- |
+| Vue | 1,396,164,307 | 1,396,242,947 | +0.01% |
+| React | 293,201,332 | 293,199,218 | -0.00% |
+| Djot | 591,325,410 | 590,080,601 | -0.21% |
+| chai | 72,574,056,173 | 72,552,579,772 | -0.03% |
+| Richards | 131,230,662 | 131,229,572 | -0.00% |
+| DeltaBlue | 253,969,939 | 253,962,526 | -0.00% |
+| Crypto | 711,753,431 | 711,718,439 | -0.00% |
+| RayTrace | 988,086,967 | 988,085,485 | -0.00% |
+| EarleyBoyer | 3,090,090,034 | 3,089,808,370 | -0.01% |
+| RegExp | 2,669,863,156 | 2,669,845,042 | -0.00% |
+| Splay | 1,366,408,380 | 1,366,403,794 | -0.00% |
+| NavierStokes | 440,199,346 | 440,195,975 | -0.00% |
+| PdfJS | 6,868,803,216 | 6,867,475,989 | -0.02% |
+| Mandreel | 61,059,361,331 | 61,058,623,230 | -0.00% |
+| Gameboy | 14,902,891,090 | 14,904,306,619 | +0.01% |
+| CodeLoad | 476,626,971 | 476,612,885 | -0.00% |
+| Box2D | 4,183,781,338 | 4,184,140,327 | +0.01% |
+| zlib | 133,999,204,400 | 133,999,129,540 | -0.00% |
+| TypeScript | 57,674,863,318 | 57,663,268,481 | -0.02% |
+
+(b) is a compile saving. Djot runs 0.21% fewer instructions, with 38 KB less second-stage code to
+compile. Nothing slows by more than 0.01%, so where the caches called a span unrun, it did not run
+hot after the recompile.
+
+TRust's pages (TRust 78435d0's replay on 594407dd and on 2b9008c0, from exports; t1a/now, as for
+(a)). Every run of the three pages exits 0 on both builds. Machine code a page:
+
+| page | (a) | (b) | change |
+| --- | --- | --- | --- |
+| event-loop, t8 | 804,220 | 804,218 | -0.0% |
+| dom-reconcile, t8 | 1,663,853 | 1,663,851 | -0.0% |
+| Vue TodoMVC, t8 | 6,666,258 | 6,591,025 | -1.1% |
+| event-loop, t1a2 | 3,223,723 | 3,223,712 | -0.0% |
+| dom-reconcile, t1a2 | 3,314,435 | 3,314,442 | +0.0% |
+| Vue TodoMVC, t1a2 | 8,973,384 | 8,884,698 | -1.0% |
+
+The event-loop and dom-reconcile pages' second stages (one and 41) keep all their regions. Vue
+TodoMVC's 124 lose 75 KB a page.
+
+Compile time a page, quiet window, CPU 5, one session (trust/metrics-t1b.tsv): event-loop 10.2 ->
+10.2 ms (t8) and 32.3 -> 32.0 (t1a2); dom-reconcile 21.0 -> 21.5 and 37.0 -> 37.4; Vue TodoMVC 82.3
+-> 83.0 and 108.3 -> 107.2. All are within a session's noise of 1-2%; the bytes are the measure here.
+
+The spike, four rounds rotating on CPU 5 (t1b/spike-*.log): (a) 3654, 3632, 3653, 3649; (b) 3652,
+3577, 3650, 3644. (b)'s 3577 is one Splay outlier, 3744 against its other runs' 4,392-4,401 (that
+run's peak RSS 797 MB against about 709 MB): the same within noise.
+
+CHECKS
+
+- The ARM64 lib suite (embed): 2,850 passed, 9 ignored.
+- clippy -D warnings in the three configurations: clean. cargo fmt: clean.
+- The semantics programs at the JIT tier, warm, with TRUST_JS_INLINE_AT=1, and with both: the
+  tree-walker's output in every one.
+- The gate (STAGES="rel fixtures difftest t262", BASE w2g's rest gate), clean tree: the fixtures'
+  masked outputs the base's; difftest 138 agree, 12 skipped; Test262 at threshold 8 53,575/53,575,
+  the report identical to the base's (gate-2b9008c0.txt).
+- Test262 with TRUST_JS_INLINE_AT=1 (second stages at 1-85 runs, compiled from younger caches):
+  53,575/53,575.
+- x86-64: no change (no register regions there).
