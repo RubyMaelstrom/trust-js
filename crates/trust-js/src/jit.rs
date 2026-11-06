@@ -2212,6 +2212,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::value::jit_grow_named_record as *const () as usize,
         crate::object_fuse::jit_string_call_fill as *const () as usize,
         crate::object_fuse::jit_string_read as *const () as usize,
+        crate::bytecode::jit_native_light as *const () as usize,
     ]
 }
 
@@ -2326,7 +2327,10 @@ pub const H_STRING_CALL_FILL: usize = 35;
 /// intrinsic, sp)` → the operand top after it; it never throws and allocates nothing.
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub const H_STRING_READ: usize = 36;
-pub const N_HELPERS: usize = 37;
+/// A light native's fast entry from the call-hit form's shared stub (`bytecode::jit_native_light`;
+/// see [`emit_call_hit_stub`]).
+pub const H_NATIVE_LIGHT: usize = 37;
+pub const N_HELPERS: usize = 38;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2369,6 +2373,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "grow_named_record",
     "string_call_fill",
     "string_read",
+    "native_light",
 ];
 
 #[inline]
@@ -2532,6 +2537,11 @@ mod shared_stub_tests {
                     keys.push(SharedStub::DirectCall { argc, with_this }.key());
                 }
                 keys.push(SharedStub::DirectConstruct { argc }.key());
+            }
+            for argc in 0..=NATIVE_STUB_MAX_ARGC as u8 {
+                for with_this in [false, true] {
+                    keys.push(SharedStub::CallHit { argc, with_this }.key());
+                }
             }
         }
         for &key in &keys {
@@ -2808,6 +2818,7 @@ mod layout_asserts {
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, pc_offs_ptr) == 80);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, native) == 88);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, intrinsic) == 96);
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, native_stub) == 97);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, realm) == 104);
         const _: () =
             assert!(std::mem::size_of::<std::cell::Cell<crate::bytecode::CallIc>>() == 112);
@@ -6620,6 +6631,13 @@ mod call_epoch_tests;
 ))]
 #[path = "native_array_local_tests.rs"]
 mod native_array_local_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_native_stub_tests.rs"]
+mod native_stub_tests;
 #[cfg(test)]
 #[path = "jit_numeric_array_tests.rs"]
 mod numeric_array_tests;
@@ -9499,7 +9517,27 @@ fn emit_call_inline_marked(
             // hit's tagged index still names its primary way in the low bits.
             a.cmp_imm_w(15, crate::bytecode::CALL_IC_WAYS as u32);
             a.b_cond(C_EQ, slow);
-            if compact {
+            if call_hit_stub_supported(ilayout, *argc as usize) {
+                // The call-hit form's shared stub, which runs a light native through its fast
+                // entry and calls the call-hit helper otherwise (`emit_call_hit_stub`).
+                a.movz(1, pc as u32, 0);
+                a.add_shifted(1, 1, 15, 16);
+                let stub = a.shared_stub(
+                    SharedStub::CallHit {
+                        argc: *argc as u8,
+                        with_this,
+                    }
+                    .key(),
+                );
+                a.bl_label(stub);
+                a.cbz(1, false, done);
+                a.b(l_unwind);
+                // Never executed: the stub reads the call's position two instructions past its
+                // return address (see `DirectCallSite::AfterReturn`). Neither branch above
+                // widens: `done` is bound a few instructions on, past the probe's and the generic
+                // call's forms.
+                a.word(chunk.call_position(*c));
+            } else if compact {
                 // x1 = pc | way << 16, which the shared helper stub passes on.
                 a.movz(1, pc as u32, 0);
                 a.add_shifted(1, 1, 15, 16);
@@ -10742,6 +10780,147 @@ fn emit_intrinsic_stub_call(
     a.cmp_imm_w(9, INTRINSIC_DECLINED);
     a.b_cond(C_EQ, hit_slow);
     a.b(l_unwind);
+}
+
+/// The most arguments a call site's call-hit form takes to its shared stub ([`emit_call_hit_stub`],
+/// whose operand tests are unrolled for its arity); a site with more keeps the call-hit helper's
+/// call in line.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const NATIVE_STUB_MAX_ARGC: usize = 8;
+
+/// Whether a call site of `argc` arguments takes its call-hit form to the shared stub
+/// [`emit_call_hit_stub`]: shared stubs on, an arity the stub unrolls, and the construct state's
+/// words where the stub's loads reach them.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn call_hit_stub_supported(il: &crate::interpreter::InterpLayout, argc: usize) -> bool {
+    shared_stubs_enabled()
+        && argc <= NATIVE_STUB_MAX_ARGC
+        && il.valid
+        && il.new_target.is_multiple_of(8)
+        && il.new_target / 8 < 4096
+        && !env_flag!("TRUST_JS_JIT_NO_NATIVE_STUB")
+}
+
+/// The call-hit form's shared stub (candidate 2 (a), the light classes): entered at a call site's
+/// call-cache hit that the direct sequence declined, with x1 = the site's pc | way << 16, x12 = the
+/// hit way and x20 = the operand top. The way's stub kind (`bytecode::native_stub_kind`, chosen
+/// from the native's class when the way was filled) names a light class's operand test
+/// (`bytecode::native_operands`, made here in line: none, every argument a Number, every argument
+/// a primitive, or the receiver and every argument primitives) and whether the class reads the
+/// construct state. A native whose operands pass, and for such a class on a caller that is not
+/// constructing (`constructing` clear, `new_target` Undefined), runs through its fast entry
+/// (`bytecode::jit_native_light`) without the call-hit helper's decode of the call, as
+/// SpiderMonkey's Baseline call IC calls a native from a stub (emitCallNativeShared,
+/// BaselineCacheIRCompiler.cpp:2946) and JSC's call link enters a host function's thunk
+/// (nativeForGenerator, ThunkGenerators.cpp:431). Anything else calls the call-hit helper, as the
+/// site did before. Either way the stub returns x20 = the new operand top and x1 = the flag
+/// (nonzero: threw). The native's errors record the call's position, which the site places two
+/// instructions past the return address (`DirectCallSite::AfterReturn`). Process-wide: the stub
+/// reads the way, the operands and the interpreter through ctx, with no heap or thread address.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_call_hit_stub(
+    a: &mut asm::Asm,
+    il: &crate::interpreter::InterpLayout,
+    argc: usize,
+    with_this: bool,
+) {
+    use crate::bytecode::{
+        CallIc, NATIVE_STUB_CONSTRUCT_STATE, NATIVE_STUB_LIGHT, NATIVE_STUB_TEST_NUMBERS,
+        NATIVE_STUB_TEST_PRIMITIVE_ARGS, NATIVE_STUB_TEST_PRIMITIVE_OPERANDS,
+    };
+    use std::mem::offset_of;
+    debug_assert!(argc <= NATIVE_STUB_MAX_ARGC);
+    const _: () = assert!(
+        NATIVE_STUB_LIGHT == 1 << 7
+            && NATIVE_STUB_CONSTRUCT_STATE == 1 << 2
+            && NATIVE_STUB_TEST_NUMBERS == 1
+            && NATIVE_STUB_TEST_PRIMITIVE_ARGS == 2
+            && NATIVE_STUB_TEST_PRIMITIVE_OPERANDS == 3
+    );
+    let helper = a.new_label();
+    let numbers = a.new_label();
+    let primitives = a.new_label();
+    let primitive_args = a.new_label();
+    let construct_state = a.new_label();
+    let call = a.new_label();
+    // w13 = the way's stub kind (`bytecode::native_stub_kind`), chosen when the way was filled:
+    // a user callee's and a boundary native's is zero. x1, the helper's argument, stays as the
+    // site set it until the native's call.
+    a.ldrb_imm(13, 12, offset_of!(CallIc, native_stub) as u32);
+    a.tbz(13, 7, helper);
+    a.tbnz(13, 1, primitives);
+    a.tbz(13, 0, construct_state);
+    // The arguments are at [x20 - 8 * argc, x20), the callee under them and a receiver under it.
+    let argument = |k: usize| -(8 * (argc - k) as i32);
+    let primitive = |a: &mut asm::Asm| {
+        // An Object's tag and the property-only ones above it are the largest words; every
+        // primitive's (Numbers canonical) is below.
+        a.mov_imm64(16, crate::value::PACK_OBJ);
+        a.cmp_reg_x(9, 16);
+        a.b_cond(C_HS, helper);
+    };
+    a.bind(numbers);
+    for k in 0..argc {
+        emit_exec_word_load(a, 9, 20, argument(k));
+        emit_exec_number_guard(a, 9, 0, 16, helper);
+    }
+    a.b(construct_state);
+    a.bind(primitives);
+    a.tbz(13, 0, primitive_args);
+    if with_this {
+        emit_exec_word_load(a, 9, 20, -(8 * (argc + 2) as i32));
+        primitive(a);
+    }
+    a.bind(primitive_args);
+    for k in 0..argc {
+        emit_exec_word_load(a, 9, 20, argument(k));
+        primitive(a);
+    }
+    // A class that holds constructors runs with a call's construct state, which an ordinary
+    // caller holds already; a constructing caller's is saved and cleared around it by the helper.
+    a.bind(construct_state);
+    a.tbz(13, 2, call);
+    a.ldr_imm(14, 19, 72); // ctx.interp
+    let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
+    a.ldrb_imm(9, construct_base, construct_offset);
+    a.cbnz(9, false, helper);
+    a.ldr_imm(9, 14, il.new_target as u32);
+    a.mov_imm64(16, crate::value::PACK_UNDEFINED);
+    a.cmp_reg_x(9, 16);
+    a.b_cond(C_NE, helper);
+    // The fast entry: (ctx, pc | way << 16, top, argc | receiver << 8 | position << 32, way).
+    a.bind(call);
+    a.ldr_w_imm(5, 30, 8);
+    a.mov(0, 19);
+    a.mov(2, 20);
+    a.movz(3, (argc | usize::from(with_this) << 8) as u32, 0);
+    a.add_shifted(3, 3, 5, 32);
+    a.mov(4, 12);
+    a.ldr_imm(16, 21, (H_NATIVE_LIGHT * 8) as u32);
+    a.stp_pre(29, 30, -16);
+    a.blr(16);
+    a.ldp_post(29, 30, 16);
+    a.mov(20, 0);
+    a.ret();
+    // The call-hit helper, as the site called it before (see `SharedStub::Helper`).
+    a.bind(helper);
+    a.mov(0, 19);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (H_CALL_HIT * 8) as u32);
+    a.stp_pre(29, 30, -16);
+    a.blr(16);
+    a.ldp_post(29, 30, 16);
+    a.mov(20, 0);
+    a.ret();
 }
 
 /// Compare the call-cache way at x12 with the callee (x10 = its identity, w15 = the live epoch,
@@ -15379,6 +15558,16 @@ enum SharedStub {
         function_call: bool,
         discard: bool,
     },
+    /// [`emit_call_hit_stub`], a call site's call-hit form (its hit declined the direct sequence),
+    /// with x1 = the site's pc | way << 16 and x12 = the hit way: a native of a light class with
+    /// light operands runs through its fast entry (`bytecode::jit_native_light`), anything else
+    /// through the call-hit helper → x20 = the new top, x1 = the flag (nonzero: threw). The site
+    /// places its call's position two instructions past the return address.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    CallHit { argc: u8, with_this: bool },
     /// [`typed_array::emit_access`]: x11 = a typed array Object, x9 = its exact unsigned index
     /// (and d1 the Number to store) → w13 = 1 once the element is read (x12 = packed Number,
     /// d1 = value) or written, 0 when the access is declined before anything is written.
@@ -15499,6 +15688,7 @@ impl SharedStub {
     const PROP_WRITE: u32 = 0x1200;
     const INTRINSIC_CALL: u32 = 0x1300;
     const STRING_CALL: u32 = 0x1400;
+    const CALL_HIT: u32 = 0x1500;
 
     fn key(self) -> u32 {
         match self {
@@ -15619,6 +15809,14 @@ impl SharedStub {
                     | u32::from(array) << 4
                     | u32::from(function_call) << 5
                     | u32::from(discard) << 6
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::CallHit { argc, with_this } => {
+                debug_assert!(usize::from(argc) <= NATIVE_STUB_MAX_ARGC);
+                Self::CALL_HIT | u32::from(argc) | u32::from(with_this) << 7
             }
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
             SharedStub::ElemStore => Self::ELEM_STORE,
@@ -15767,6 +15965,14 @@ impl SharedStub {
                 function_call: key & 0x20 != 0,
                 discard: key & 0x40 != 0,
             },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::CALL_HIT => SharedStub::CallHit {
+                argc: (key & 0x7f) as u8,
+                with_this: key & 0x80 != 0,
+            },
             Self::TYPED_ELEMENT => SharedStub::TypedElement {
                 write: key & 1 != 0,
             },
@@ -15885,6 +16091,10 @@ impl SharedStub {
                     format!("Stub:IntrinsicCall(argc={argc},{})", set.join(","))
                 }
             }
+            SharedStub::CallHit { argc, with_this } => format!(
+                "Stub:CallHit(argc={argc}{})",
+                if with_this { ",with_this" } else { "" }
+            ),
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
             SharedStub::ElemStore => named("ElemStore", &[]),
             SharedStub::NameElement { write, resolved } => {
@@ -16100,6 +16310,16 @@ impl SharedStub {
                 function_call,
                 discard,
             } => emit_intrinsic_call_stub(a, layout, argc, array, function_call, discard),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::CallHit { argc, with_this } => {
+                let ilayout = context
+                    .ilayout
+                    .expect("call stubs are requested only by chunk compilation");
+                emit_call_hit_stub(a, ilayout, usize::from(argc), with_this);
+            }
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")

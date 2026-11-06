@@ -1050,6 +1050,9 @@ pub struct CallIc {
     /// light, operand-only and numeric-only classes); 0 = none. The native's realm setup
     /// declared it (see `builtins::builtin`).
     pub intrinsic: u8,
+    /// How the call-hit form's shared stub runs a native entry (see [`native_stub_kind`]), chosen
+    /// from its class when the way is filled; 0 = the call-hit helper (every user entry).
+    pub native_stub: u8,
     /// A native entry's builtin id (see `builtins::builtin`; 0 for a user function): the
     /// target's identity as V8's call feedback carries it, a builtin's `Builtin` id, on which
     /// the optimizing tiers key their reductions (W4's call-target feedback).
@@ -1186,6 +1189,7 @@ impl CallIc {
         pc_offs_ptr: std::ptr::null(),
         native: 0,
         intrinsic: 0,
+        native_stub: 0,
         builtin: 0,
         realm: 0,
     };
@@ -26557,6 +26561,132 @@ unsafe fn jit_call_hit_inner(
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Natives [`jit_native_light`] ran, for tests.
+    pub(crate) static TEST_NATIVE_STUB_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// A native's fast entry from generated code (candidate 2 (a)): the call-hit form's shared stub
+/// (`jit::emit_call_hit_stub`) proved, at a call site's call-cache hit, that the way holds a
+/// native of a light class, that the operands are ones its class runs no author code for
+/// ([`native_operands`], made in line by the stub's tests) and that the caller is not
+/// constructing. The native then runs on the caller's window, as [`jit_call_hit_native`] runs
+/// it through [`Interp::call_native_light`], without the call-hit helper's decode of the call:
+/// it reaches no safepoint, runs no author code and leaves no tail call, so the window, the
+/// record's operands, which the collector scans whole, needs no root of its own. `pc` is the
+/// site's `pc | way << 16`, as the call-hit helper takes it; `form` packs the argument count
+/// (bits 0-7), whether a receiver is under the callee (bit 8) and the call's position (bits
+/// 32-63), which the native's errors record; `way` is the hit way. A chunk whose detailed
+/// profile was turned on after its code was made takes the call-hit helper.
+///
+/// # Safety
+/// As [`jit_call_hit`], with the stub's proofs above.
+pub(crate) unsafe extern "C" fn jit_native_light(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+    form: u64,
+    way: *const CallIc,
+) -> crate::jit::SpFlag {
+    // The diagnostics and a detailed profile leave the fast path, so that it keeps a small frame.
+    if unsafe {
+        (*ctx).opstat_enabled
+            || (*ctx).callstat_enabled
+            || (*(*ctx).chunk).feedback.detailed_enabled()
+    } {
+        return unsafe { jit_native_light_observed(ctx, pc, sp, form, way) };
+    }
+    unsafe { native_light_call(&mut *ctx, sp, form, way) }
+}
+
+/// [`jit_native_light`] with its diagnostics (TRUST_JS_JIT_OPSTAT, CALLSTAT and NATIVESTAT
+/// count it as the call-hit helper counts a native entry), or, for a chunk whose detailed
+/// profile was turned on after its code was made, the call-hit helper itself.
+///
+/// # Safety
+/// As [`jit_native_light`].
+#[cold]
+#[inline(never)]
+unsafe fn jit_native_light_observed(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+    form: u64,
+    way: *const CallIc,
+) -> crate::jit::SpFlag {
+    if unsafe { (*(*ctx).chunk).feedback.detailed_enabled() } {
+        return unsafe { jit_call_hit(ctx, pc, sp) };
+    }
+    let ctx = unsafe { &mut *ctx };
+    unsafe { jit_opstat(ctx, pc & 0xFFFF) };
+    if ctx.callstat_enabled {
+        let i = unsafe { &mut *ctx.interp };
+        let argc = (form & 0xff) as usize;
+        unsafe { jit_callstat(i, ctx, &*way, argc, form & 0x100 != 0, sp) };
+    }
+    unsafe { native_light_call(ctx, sp, form, way) }
+}
+
+/// [`jit_native_light`]'s call of the way's native on the caller's window.
+///
+/// # Safety
+/// As [`jit_native_light`].
+#[inline(always)]
+unsafe fn native_light_call(
+    ctx: &mut crate::jit::JitCtx,
+    sp: *mut Value,
+    form: u64,
+    way: *const CallIc,
+) -> crate::jit::SpFlag {
+    let argc = (form & 0xff) as usize;
+    let with_this = form & 0x100 != 0;
+    let position = (form >> 32) as u32;
+    let i = unsafe { &mut *ctx.interp };
+    note_call_path(CallPath::NativeStub);
+    #[cfg(test)]
+    {
+        TEST_NATIVE_STUB_CALLS.with(|count| count.set(count.get() + 1));
+        crate::interpreter::TEST_LIGHT_NATIVE_CALLS.with(|count| count.set(count.get() + 1));
+    }
+    let args = unsafe { sp.sub(argc) };
+    let undefined = Value::Undefined;
+    let this_slot: *const Value = if with_this {
+        unsafe { sp.sub(argc + 2) }
+    } else {
+        &raw const undefined
+    };
+    // SAFETY: the way's native word is the builtin's `NativeFn`, which the fill recorded from
+    // `ObjectKind::Native` (a scoped native's class is none, so the stub declined it).
+    let native: crate::value::NativeFn = unsafe { std::mem::transmute((*way).native as *const ()) };
+    // SAFETY: the window is initialized operand words that outlive the call.
+    let result = explicit_call(i, position, |i| unsafe {
+        crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
+            native(i, *this_slot, arguments)
+        })
+    });
+    // The native's loans are finished; this owning caller retires the operand window.
+    let mut sp = unsafe { args.sub(1) };
+    if with_this {
+        sp = unsafe { sp.sub(1) };
+    }
+    match result {
+        Ok(value) => {
+            unsafe { sp.write(value) };
+            crate::jit::SpFlag {
+                sp: unsafe { sp.add(1) },
+                flag: 0,
+            }
+        }
+        Err(error) => {
+            ctx.error = Some(Abrupt::Throw(error));
+            crate::jit::SpFlag { sp, flag: 1 }
+        }
+    }
+}
+
 /// [`jit_call_hit_inner`]'s native-entry arm: the emitted probe proved the callee is the
 /// way's bare native `native` (identity, epoch and realm). Loan the receiver/argument window
 /// through the complete boundary, then let this owning caller retire those operands.
@@ -26728,6 +26858,56 @@ pub(crate) unsafe fn native_operands(
         INTRINSIC_REFLECT_GET..=INTRINSIC_REFLECT_SET => NativeOperands::Reflect,
         _ => NativeOperands::Boundary,
     }
+}
+
+/// [`native_stub_kind`]'s bit for a native the stub runs on the caller's window (a light class);
+/// the low bits name the operand test (`NATIVE_STUB_TEST_*`).
+pub(crate) const NATIVE_STUB_LIGHT: u8 = 0x80;
+/// [`native_stub_kind`]'s bit for a class that holds constructors called as functions, whose
+/// natives read the construct state: the stub runs them only for a caller that is not
+/// constructing.
+pub(crate) const NATIVE_STUB_CONSTRUCT_STATE: u8 = 0x04;
+/// [`native_stub_kind`]'s operand tests, as [`native_operands`] makes them: none; every
+/// argument a Number; every argument a primitive; the receiver and every argument primitives.
+pub(crate) const NATIVE_STUB_TEST_NONE: u8 = 0;
+pub(crate) const NATIVE_STUB_TEST_NUMBERS: u8 = 1;
+pub(crate) const NATIVE_STUB_TEST_PRIMITIVE_ARGS: u8 = 2;
+pub(crate) const NATIVE_STUB_TEST_PRIMITIVE_OPERANDS: u8 = 3;
+
+/// How the call-hit form's shared stub (`jit::emit_call_hit_stub`) runs a native entry of class
+/// `class`, which the way records when it is filled ([`CallIc::native_stub`]), as
+/// SpiderMonkey's call IC picks its native stub when it attaches: 0, through the call-hit
+/// helper (no light class; DataView's accessors and Reflect's natives, which the helper answers
+/// on their operands); else [`NATIVE_STUB_LIGHT`] with the class's operand test in the low bits
+/// and [`NATIVE_STUB_CONSTRUCT_STATE`] for the light class (Boolean) and the primitive-argument
+/// class (Number, String), which hold the constructors. The other classes' natives are no
+/// constructors and read no construct state (the call-hit helper runs the operand-only class's
+/// without clearing it, too). `stub_kinds_agree_with_native_operands` keeps this in step with
+/// [`native_operands`].
+pub(crate) const fn native_stub_kind(class: u8) -> u8 {
+    let test = match class {
+        INTRINSIC_OPERAND_ONLY
+        | INTRINSIC_LIGHT
+        | INTRINSIC_ARRAY_IS_ARRAY
+        | INTRINSIC_OBJECT_IS => NATIVE_STUB_TEST_NONE,
+        INTRINSIC_NUMERIC_ONLY
+        | INTRINSIC_MATH_SQRT
+        | INTRINSIC_MATH_FIRST..=INTRINSIC_MATH_LAST => NATIVE_STUB_TEST_NUMBERS,
+        INTRINSIC_LIGHT_PRIMITIVE_ARGS | INTRINSIC_IS_NAN | INTRINSIC_FROM_CHAR_CODE => {
+            NATIVE_STUB_TEST_PRIMITIVE_ARGS
+        }
+        INTRINSIC_LIGHT_PRIMITIVE
+        | INTRINSIC_CHAR_AT
+        | INTRINSIC_CHAR_CODE_AT
+        | INTRINSIC_CODE_POINT_AT
+        | INTRINSIC_STRING_SLICE => NATIVE_STUB_TEST_PRIMITIVE_OPERANDS,
+        _ => return 0,
+    };
+    let construct_state = match class {
+        INTRINSIC_LIGHT | INTRINSIC_LIGHT_PRIMITIVE_ARGS => NATIVE_STUB_CONSTRUCT_STATE,
+        _ => 0,
+    };
+    NATIVE_STUB_LIGHT | construct_state | test
 }
 
 /// Whether [`native_operands`] runs a native of class `intrinsic` on these operands without the
@@ -28576,6 +28756,19 @@ unsafe fn jit_call_inner(
                                 i.global_env_pins.push(g);
                             }
                             let (builtin, class) = crate::builtins::builtin(native);
+                            // The class its realm's setup declared, and its builtin id, in one
+                            // lookup (W3's item 7). A scoped native has another signature: no
+                            // class.
+                            let class = engine_native.map_or(0, |_| class);
+                            let native_stub = native_stub_kind(class);
+                            // A light class whose natives the stub runs without clearing the
+                            // construct state holds no constructor (see `native_stub_kind`).
+                            debug_assert!(
+                                native_stub & (NATIVE_STUB_LIGHT | NATIVE_STUB_CONSTRUCT_STATE)
+                                    != NATIVE_STUB_LIGHT
+                                    || !o.borrow().is_constructor(),
+                                "a constructor in a class that reads no construct state"
+                            );
                             let ic = CallIc {
                                 callee: key,
                                 env: std::ptr::null(),
@@ -28593,10 +28786,8 @@ unsafe fn jit_call_inner(
                                 code_mem: std::ptr::null(),
                                 pc_offs_ptr: std::ptr::null(),
                                 native,
-                                // The class its realm's setup declared, and its builtin id,
-                                // in one lookup (W3's item 7). A scoped native has another
-                                // signature: no class.
-                                intrinsic: engine_native.map_or(0, |_| class),
+                                intrinsic: class,
+                                native_stub,
                                 builtin,
                                 realm: 0,
                             };
@@ -28931,9 +29122,11 @@ pub(crate) enum CallPath {
     /// A superseded chunk's way through the call-hit helper whose function's current code has
     /// no entry yet, run by the generic call (`Chunk::supersede`).
     Superseded,
+    /// A light native through the native-call stub's fast entry (`jit_native_light`).
+    NativeStub,
 }
 
-const CALL_PATH_NAMES: [&str; 9] = [
+const CALL_PATH_NAMES: [&str; 10] = [
     "direct sequence",
     "call-hit helper, user callee",
     "call-hit helper, native without the boundary",
@@ -28943,11 +29136,12 @@ const CALL_PATH_NAMES: [&str; 9] = [
     "cached call (Rust callers, generic helper)",
     "Interp::call",
     "call-hit helper, superseded chunk, generic call",
+    "native-call stub, light native",
 ];
 
 /// The [`CallPath`] counts, global so that generated code can count the direct sequence.
-pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 9] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 9];
+pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 10] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
 
 /// Whether `TRUST_JS_JIT_CALLSTAT=2` counts call paths. Only builds with the
 /// `architecture-diagnostics` feature count them: elsewhere this is a constant false, and the
