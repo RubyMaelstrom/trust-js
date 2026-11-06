@@ -2250,7 +2250,7 @@ pub enum ObjectKind {
     /// (`native_typed_array::NativeTypedArray`). Its clear `ic_plain` keeps the property caches
     /// off it: its integer-indexed elements are exotic.
     TypedArray(crate::gc_storage::PayloadBox<crate::native_typed_array::NativeTypedArray>) = 1,
-    Native(NativeFn) = 2,
+    Native(NativeFn) = KIND_NATIVE_TAG,
     /// A native function carrying captured state (see [`NativeClosure`]).
     NativeData(crate::gc_storage::SharedPayload<Rc<NativeCallable>>) = 3,
     /// An interpreted function: its AST plus the lexical environment it closed over.
@@ -2323,7 +2323,7 @@ pub enum ObjectKind {
     /// An `arguments` exotic object; a mapped one's ParameterMap, while it maps an index, in a
     /// storage block it reports (`interpreter::ParameterMap`).
     Arguments(Option<crate::gc_storage::StorageBox<crate::interpreter::ParameterMap>>) = 27,
-    ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>) = 28,
+    ArrayIterator(crate::gc_storage::PayloadBox<ArrayIteratorState>) = KIND_ARRAY_ITERATOR_TAG,
     StringIterator(crate::gc_storage::PayloadBox<StringIteratorState>) = 29,
     /// ECMA-262 CreateMapIterator's and CreateSetIterator's private state: the collection and a
     /// live cursor over it, which its collection's deletions and clears keep in place.
@@ -2342,6 +2342,8 @@ pub enum ObjectKind {
 pub(crate) const CALLABLE_USER_TAG: u8 = 4;
 /// The first callable's tag: callables are [`KIND_CALLABLE_FIRST`] ..= [`KIND_EXOTIC_NONE_LAST`].
 pub(crate) const KIND_CALLABLE_FIRST: u8 = 2;
+/// [`ObjectKind::Native`]'s tag, the first callable's (the `for…of` step templates compare it).
+pub(crate) const KIND_NATIVE_TAG: u8 = KIND_CALLABLE_FIRST;
 /// The last tag of the kinds that carry no exotic internal state (plain objects, typed arrays'
 /// views and the callables): the former `ObjectKind::ExoticNone`.
 pub(crate) const KIND_EXOTIC_NONE_LAST: u8 = 14;
@@ -2356,6 +2358,8 @@ pub(crate) const KIND_TYPED_ARRAY_TAG: u8 = 1;
 /// [`ObjectKind::Array`]'s tag, the first after the ordinary kinds' (the element templates admit
 /// both with one compare).
 pub(crate) const KIND_ARRAY_TAG: u8 = KIND_ORDINARY_LAST + 1;
+/// [`ObjectKind::ArrayIterator`]'s tag (ARM64's `for…of` step template compares it).
+pub(crate) const KIND_ARRAY_ITERATOR_TAG: u8 = 28;
 /// [`ObjectKind::Proxy`]'s tag, the one with bit [`KIND_PROXY_BIT`] set: every other kind's is
 /// below 32, so the in-line `instanceof` walk tells a proxy, whose [[GetPrototypeOf]] is a trap,
 /// by one bit test at each holder. A new kind takes a tag below 32 (or, if its

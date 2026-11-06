@@ -79,6 +79,11 @@ comment/example in the same change.
   by 10-18% in paired runs.
 - `TRUST_JS_JIT_NO_JSCVT=1` makes ARM64 code use the portable guarded ToInt32 sequence even
   when the CPU implements FEAT_JSCVT (`fjcvtzs`).
+- `TRUST_JS_FOR_OF_STEP=helper` compiles every synchronous `for…of` step to the one iteration
+  operation whose helper steps the loop in Rust, instead of calling a `next` method that is not a
+  built-in function through a call cache and reading its result's `done` and `value` through
+  property caches; `TRUST_JS_JIT_NO_ITER_STEP=1` keeps ARM64's in-line Array step out of
+  generated code. Both are ablations with the same behavior.
 - `TRUST_JS_TAIL_CALL_DEPTH=N` sets the execution-context depth below which a strict
   tail call runs as an ordinary call (default 1024); at or past it the call is staged as a
   proper tail call, so unbounded tail recursion stays bounded. `0` stages every tail call.

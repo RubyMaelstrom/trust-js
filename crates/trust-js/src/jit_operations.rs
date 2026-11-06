@@ -974,11 +974,40 @@ pub(super) fn emit(
         Op::GetElem | Op::GetElemLocal(_) => {
             emit_op_helper(a, H_GET_ELEM, pc as u32, unwind);
         }
+        Op::IterStepL(iterator, next) if iter_step_inlinable(layout) => {
+            emit_array_iter_step(a, layout, *iterator, *next, pc as u32, unwind);
+        }
         Op::DestructureArr(_)
         | Op::TryArrayBinding(..)
         | Op::ArrayBindingStep(..)
         | Op::IterStepL(..) => {
             emit_op_helper(a, H_ITERATION, pc as u32, unwind);
+        }
+        Op::IterNextBuiltin(next) if layout.valid => {
+            // Bool(the slot holds an Object whose kind is ObjectKind::Native).
+            let other = a.new_label();
+            let done = a.new_label();
+            emit_next_builtin_test(a, layout, *next, other);
+            a.cset_w(11, C_EQ);
+            a.b(done);
+            a.bind(other);
+            a.movz(11, 0, 0);
+            a.bind(done);
+            a.mov_imm64(9, crate::value::PACK_BOOL);
+            a.logic_x(1, 9, 9, 11);
+            emit_exec_word_store(a, 9, 20, 0);
+            a.add_imm(20, 20, 8);
+        }
+        Op::RequireIterResult => {
+            // An Object passes; anything else throws in the checked operation.
+            let slow = a.new_label();
+            let done = a.new_label();
+            emit_exec_word_load(a, 9, 20, -8);
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, slow);
+            a.b(done);
+            a.bind(slow);
+            emit_exec(a, pc as u32, unwind);
+            a.bind(done);
         }
         // Decision 20e's elided `arguments` and rest reads: in a fresh frame the slot holds
         // Undefined and the actual arguments are the record's (`JitCtx::argc`, `JitCtx::args`).
@@ -1011,6 +1040,158 @@ pub(super) fn emit(
         _ => return false,
     }
     true
+}
+
+/// [`Op::IterNextBuiltin`]'s test of the `next` method in slot `next`: branches to `other` unless
+/// it is an Object, and leaves x9 its object and the flags EQ exactly for a built-in function
+/// (`ObjectKind::Native`). Clobbers x9 and x10.
+fn emit_next_builtin_test(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    next: u16,
+    other: usize,
+) {
+    emit_exec_word_load(a, 9, 22, i32::from(next) * 8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, other);
+    emit_exec_payload(a, 9, 9);
+    a.add_imm(9, 9, layout.obj_from_cell as u32);
+    a.ldrb_imm(10, 9, layout.obj_kind as u32);
+    a.cmp_imm_w(10, u32::from(crate::value::KIND_NATIVE_TAG));
+}
+
+/// `IterNextBuiltin; JumpIfFalse(generic)`, the step's dispatch, fused: branch to `generic`
+/// unless the `next` method in slot `next` is a built-in function; the Bool never materializes.
+pub(super) fn emit_next_builtin_branch(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    next: u16,
+    generic: usize,
+) {
+    emit_next_builtin_test(a, layout, next, generic);
+    a.b_cond(C_NE, generic);
+}
+
+/// Whether [`emit_array_iter_step`] applies: the element read's offsets hold, a native callable's
+/// payload is its behaviour (the call probe's check), and intrinsic steps are on
+/// (`TRUST_JS_ITERATOR_RESULTS=0` turns them off, as in
+/// [`crate::interpreter::Interp::try_intrinsic_iterator_step`]);
+/// `TRUST_JS_JIT_NO_ITER_STEP=1` keeps every step in the helper.
+pub(super) fn iter_step_inlinable(layout: &crate::value::JitLayout) -> bool {
+    get_elem_inlinable(layout)
+        && layout.call_probe_valid
+        && env_value!("TRUST_JS_ITERATOR_RESULTS") != Some("0")
+        && !env_flag!("TRUST_JS_JIT_NO_ITER_STEP")
+}
+
+/// [`Op::IterStepL`] for an Array, in line: the slot `next` holds %ArrayIteratorPrototype%.next
+/// (an `ObjectKind::Native` with its behaviour, the test `intrinsic_iterator_step` makes), the
+/// slot `iterator` an Array Iterator over values whose target is an ordinary Array, and the
+/// element at the iterator's index is present below the element words' used length: the step
+/// pushes the element and `true` and advances the index, as %ArrayIteratorPrototype%.next does
+/// (ECMA-262 e28783d5, spec.html:42038-42070) with no code to run: an ordinary Array's length is
+/// a data property and the Get of an own data element calls nothing, so advancing the index
+/// first, as the algorithm does, is unobservable. JSC's Baseline steps a fast
+/// array in line the same way (jit/JITCall.cpp:511-697, emit_op_iterator_next). Everything else
+/// (another `next`, keys or entries, a typed array, an exhausted iterator, a hole, the index at
+/// or past the used words, where the length decides) takes the helper's step, unchanged; no
+/// guard writes before the commit. The index is a plain integer: its store needs no barrier.
+pub(super) fn emit_array_iter_step(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    iterator: u16,
+    next: u16,
+    pc: u32,
+    unwind: usize,
+) {
+    let slow = a.new_label();
+    let done = a.new_label();
+    emit_next_builtin_test(a, layout, next, slow);
+    a.b_cond(C_NE, slow);
+    emit_array_step_body(a, layout, iterator, slow);
+    a.mov_imm64(9, crate::value::PACK_BOOL | 1);
+    emit_exec_word_store(a, 9, 20, 8);
+    a.add_imm(20, 20, 16);
+    a.b(done);
+    a.bind(slow);
+    emit_op_helper(a, H_ITERATION, pc, unwind);
+    a.bind(done);
+}
+
+/// A whole `for…of` step fused (`Compiler::emit_for_of_step`): `IterNextBuiltin; JumpIfFalse
+/// (generic); IterStepL` at `step_pc`, then the `JumpIfFalse(exit); Jump(body)` the caller
+/// emits after this. A `next` that is not a built-in function branches to `generic`; an Array's
+/// step in line pushes its element and branches to `body`, as the two would; any other built-in
+/// `next` takes the helper's step, whose value and Bool fall through to the two.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_for_of_step(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    iterator: u16,
+    next: u16,
+    step_pc: u32,
+    unwind: usize,
+    generic: usize,
+    body: usize,
+) {
+    let helper = a.new_label();
+    emit_next_builtin_test(a, layout, next, generic);
+    a.b_cond(C_NE, generic);
+    if iter_step_inlinable(layout) {
+        emit_array_step_body(a, layout, iterator, helper);
+        a.add_imm(20, 20, 8);
+        a.b(body);
+    }
+    a.bind(helper);
+    emit_op_helper(a, H_ITERATION, step_pc, unwind);
+}
+
+/// The Array step after [`emit_next_builtin_test`] passed (x9: the `next` method's object, a
+/// built-in function): branches to `miss` unless its behaviour is %ArrayIteratorPrototype%.next
+/// and the step yields an element in line (see [`emit_array_iter_step`]), which it stores at
+/// x20's free word, advancing the iterator; the caller completes the push.
+fn emit_array_step_body(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    iterator: u16,
+    miss: usize,
+) {
+    use crate::value::ArrayIteratorState;
+    use std::mem::offset_of;
+    let kind = layout.obj_kind as u32;
+    a.ldr_imm(10, 9, kind + 8);
+    a.mov_imm64(11, crate::builtins::ARRAY_ITER_NEXT as usize as u64);
+    a.cmp_reg_x(10, 11);
+    a.b_cond(C_NE, miss);
+    // The iterator: an Array Iterator (x12 = its state) over values.
+    emit_exec_word_load(a, 9, 22, i32::from(iterator) * 8);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, miss);
+    emit_exec_payload(a, 9, 9);
+    a.add_imm(9, 9, layout.obj_from_cell as u32);
+    a.ldrb_imm(10, 9, kind);
+    a.cmp_imm_w(10, u32::from(crate::value::KIND_ARRAY_ITERATOR_TAG));
+    a.b_cond(C_NE, miss);
+    a.ldr_imm(12, 9, kind + 8);
+    a.ldrb_imm(10, 12, offset_of!(ArrayIteratorState, kind) as u32);
+    a.cbnz(10, false, miss);
+    // Its target (x11): an ordinary Array, whose element words hold its plain data elements.
+    // An exhausted iterator's target is Undefined.
+    a.ldr_imm(9, 12, offset_of!(ArrayIteratorState, target) as u32);
+    emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, miss);
+    emit_exec_payload(a, 9, 9);
+    a.add_imm(11, 9, layout.obj_from_cell as u32);
+    a.ldrb_imm(10, 11, kind);
+    a.cmp_imm_w(10, u32::from(layout.exotic_array_tag));
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(10, 11, layout.obj_flags as u32);
+    a.tbz(10, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
+    // The element at the index (x13): a present word below the used length, which an Array's
+    // length is at least.
+    a.ldr_imm(13, 12, offset_of!(ArrayIteratorState, index) as u32);
+    emit_word_read(a, layout, 11, 13, 10, miss);
+    // --- commit ---
+    a.add_imm(13, 13, 1);
+    a.str_imm(13, 12, offset_of!(ArrayIteratorState, index) as u32);
+    emit_exec_word_store(a, 10, 20, 0);
 }
 
 /// Whether the elided value's slot, at `slot`, still holds the fresh frame's Undefined (x9 and

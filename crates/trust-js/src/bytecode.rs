@@ -2987,6 +2987,16 @@ pub enum Op {
     /// `n_params + k` for an in-range index, undefined past the end while no prototype has
     /// index keys, and the exact Array, materialized into the slot, for any other key.
     RestElem(u16),
+    /// Whether the `next` method in the slot is a built-in function (`ObjectKind::Native`):
+    /// pushes a Bool. A `for…of` step takes [`Op::IterStepL`] for a built-in `next`, whose
+    /// intrinsic Array, String, Map and Set steps run without a call, and the generic sequence
+    /// for any other (`CallWithThis`, [`Op::RequireIterResult`], `GetProp` of "done" and
+    /// "value", each with its own cache), as V8 and SpiderMonkey lower the step to their
+    /// bytecode. Both are ForIn/OfBodyEvaluation's step 6 (ECMA-262 e28783d5, spec.html:23038).
+    IterNextBuiltin(u16),
+    /// ForIn/OfBodyEvaluation step 6.c: throws a *TypeError* unless the top of the stack (the
+    /// `next` call's result, kept) is an Object.
+    RequireIterResult,
 }
 
 /// An active `try` region on the VM's handler stack.
@@ -10458,6 +10468,8 @@ fn inline_capability(op: &Op) -> InlineCapability {
         | Op::ForInKeys
         | Op::ForInStepL(..)
         | Op::IterStepL(..)
+        | Op::IterNextBuiltin(_)
+        | Op::RequireIterResult
         | Op::IterCloseL(_)
         | Op::DestructureGuard
         | Op::DestructureArr(_)
@@ -11228,6 +11240,7 @@ fn op_mentions_slot(op: &Op, slot: u16) -> bool {
         | Op::ToPropKeyLocal(a)
         | Op::IterCloseL(a)
         | Op::IterAbortL(a)
+        | Op::IterNextBuiltin(a)
         | Op::DestructureArr(a)
         | Op::ObjectRest(a)
         | Op::CallSpread(a, _)
@@ -12908,6 +12921,52 @@ impl Compiler {
         if let Some(name) = name {
             self.call_names.record(pc, name);
         }
+    }
+
+    /// One synchronous `for…of` step, ForIn/OfBodyEvaluation's step 6 (ECMA-262 e28783d5,
+    /// spec.html:23038-23043), against the iterator and `next` method in the two slots. Leaves
+    /// the next value on the stack at the end of the emitted code, where the body starts, and
+    /// returns the jumps taken at exhaustion, which leave a placeholder for the exit's `Pop`.
+    ///
+    /// A built-in `next` steps through [`Op::IterStepL`], the intrinsic Array, String, Map and
+    /// Set steps without a call (generated code steps an Array in line, as JSC's
+    /// op_iterator_next steps a fast array: jit/JITCall.cpp:511-697). Any other `next` takes
+    /// the generic sequence, as V8 (src/interpreter/bytecode-generator.cc:3138-3153,
+    /// 7685-7700) and SpiderMonkey (frontend/ForOfEmitter.cpp:145-175,
+    /// BytecodeEmitter.cpp:2945-2975) emit it: Call(next, iterator) through a call cache, the
+    /// Object check, then Get(result, "done") and Get(result, "value") through property
+    /// caches. None of it runs inside the body's handler: an abrupt step does not close the
+    /// iterator. `TRUST_JS_FOR_OF_STEP=helper` keeps every step in `IterStepL`.
+    fn emit_for_of_step(&mut self, iter_s: u16, next_s: u16) -> Vec<usize> {
+        static GENERIC: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if !*GENERIC
+            .get_or_init(|| std::env::var("TRUST_JS_FOR_OF_STEP").as_deref() != Ok("helper"))
+        {
+            self.emit(Op::IterStepL(iter_s, next_s));
+            return vec![self.emit(Op::JumpIfFalse(0))];
+        }
+        self.emit(Op::IterNextBuiltin(next_s));
+        let generic = self.emit(Op::JumpIfFalse(0));
+        self.emit(Op::IterStepL(iter_s, next_s));
+        let mut exits = vec![self.emit(Op::JumpIfFalse(0))];
+        let to_body = self.emit(Op::Jump(0));
+        self.patch(generic);
+        self.emit(Op::LoadLocal(iter_s));
+        self.emit(Op::LoadLocal(next_s));
+        let call = self.new_call_cache();
+        self.emit(Op::CallWithThis(0, call));
+        self.emit(Op::RequireIterResult);
+        self.emit(Op::Dup);
+        let done = self.property_name_idx("done");
+        let cache = self.new_cache(done);
+        self.emit(Op::GetProp(done, cache));
+        self.emit(Op::Not);
+        exits.push(self.emit(Op::JumpIfFalse(0)));
+        let value = self.property_name_idx("value");
+        let cache = self.new_cache(value);
+        self.emit(Op::GetProp(value, cache));
+        self.patch(to_body);
+        exits
     }
 
     /// Evaluate a call's Reference, retaining its receiver alongside GetValue's result when
@@ -14731,14 +14790,14 @@ impl Compiler {
                     self.fragment_seed_slots = vec![iter_s, next_s];
                 }
                 let loop_head = self.ops.len();
-                if let Some(from_sync_s) = async_from_sync_s {
+                let exits = if let Some(from_sync_s) = async_from_sync_s {
                     let done_s = self.fresh_slot("%async-step-done%");
                     self.emit(Op::AsyncIterStepL(iter_s, next_s, from_sync_s, done_s));
                     self.emit(Op::AsyncIterResumeL(from_sync_s, done_s));
+                    vec![self.emit(Op::JumpIfFalse(0))]
                 } else {
-                    self.emit(Op::IterStepL(iter_s, next_s));
-                }
-                let jexit = self.emit(Op::JumpIfFalse(0));
+                    self.emit_for_of_step(iter_s, next_s)
+                };
                 // ForIn/OfBodyEvaluation includes every form of BindingInitialization and
                 // assignment in the status whose abrupt completion closes the iterator. Push the
                 // body handler before even the identifier stores: a strict unresolved assignment
@@ -14867,9 +14926,12 @@ impl Compiler {
                         _ => unreachable!(),
                     }
                 }
-                // Exhaustion lands here (the step's bool was false): drop the undefined
-                // placeholder the step pushed; no close on a completed iterator.
-                self.patch(jexit);
+                // Exhaustion lands here (the step's bool was false, or the generic step's done
+                // was true): drop the placeholder the step left (undefined, or the generic
+                // step's result object); no close on a completed iterator.
+                for jexit in exits {
+                    self.patch(jexit);
+                }
                 self.emit(Op::Pop);
                 // Breaks jump here too — their cleanup (pop handler + close) ran at the site.
                 let after = self.ops.len() as u32;
@@ -21275,8 +21337,65 @@ fn run_vm_inner(
             Op::PopHandler => {
                 handlers.pop();
             }
+            Op::IterNextBuiltin(_) | Op::RequireIterResult => {
+                vm_for_of_step_operation(i, op, stack, slots)?
+            }
         }
     }
+}
+
+/// [`Op::IterNextBuiltin`] and [`Op::RequireIterResult`] for generated code's exact-PC executor
+/// ([`jit_exec`]), out of its dispatch as the VM's are.
+///
+/// # Safety
+/// `sp` is the live operand stack's free word, as `jit_exec_inner`'s.
+#[inline(never)]
+unsafe fn jit_for_of_step_operation(
+    i: &mut Interp,
+    op: Op,
+    sp: &mut *mut Value,
+    slots: &[std::cell::Cell<Value>],
+) -> Result<(), Abrupt> {
+    match op {
+        Op::IterNextBuiltin(next) => unsafe {
+            sp.write(Value::Bool(next_is_builtin(&slots[next as usize].get())));
+            *sp = sp.add(1);
+        },
+        Op::RequireIterResult => {
+            if !matches!(unsafe { (*sp.sub(1)).view() }, ValueView::Obj(_)) {
+                return Err(iter_result_type_error(i));
+            }
+        }
+        _ => unreachable!("not a for-of step operation"),
+    }
+    Ok(())
+}
+
+/// [`Op::IterNextBuiltin`] and [`Op::RequireIterResult`] in the bytecode VM, out of its loop:
+/// as two arms of the loop's own they changed how the loop was compiled (fat LTO dropped 6.4 KB
+/// of it), which cost the VM 0.4-0.8% of its instructions on code that never runs them.
+#[inline(never)]
+fn vm_for_of_step_operation(
+    i: &mut Interp,
+    op: Op,
+    stack: &mut ValueStack,
+    slots: &[std::cell::Cell<Value>],
+) -> Result<(), Abrupt> {
+    match op {
+        Op::IterNextBuiltin(next) => {
+            stack.push(Value::Bool(next_is_builtin(&slots[next as usize].get())));
+        }
+        Op::RequireIterResult => {
+            if !matches!(
+                stack.last().expect("vm stack underflow").view(),
+                ValueView::Obj(_)
+            ) {
+                return Err(iter_result_type_error(i));
+            }
+        }
+        _ => unreachable!("not a for-of step operation"),
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -24736,6 +24855,8 @@ impl Chunk {
             Op::ForInKeys => (1, 1),
             Op::ForInStepL(..) => (0, 2),
             Op::IterStepL(..) => (0, 2),
+            Op::IterNextBuiltin(_) => (0, 1),
+            Op::RequireIterResult => (1, 1),
             Op::IterCloseL(_) => (0, 0),
             Op::IterAbortL(_) => (1, 0),
             Op::DestructureStepL(..) | Op::DestructureRestL(..) => (0, 1),
@@ -26996,6 +27117,20 @@ fn open_array_binding(
     Ok(matched)
 }
 
+/// [`Op::IterNextBuiltin`]: whether a `for…of` loop's `next` method is a built-in function, whose
+/// steps [`Op::IterStepL`] takes (the intrinsic ones without a call).
+pub(crate) fn next_is_builtin(next: &Value) -> bool {
+    next.as_obj()
+        .is_some_and(|object| matches!(object.borrow().kind, crate::value::ObjectKind::Native(_)))
+}
+
+/// [`Op::RequireIterResult`]'s TypeError (ForIn/OfBodyEvaluation step 6.c).
+#[cold]
+#[inline(never)]
+fn iter_result_type_error(i: &mut Interp) -> Abrupt {
+    i.throw("TypeError", "iterator result is not an object")
+}
+
 /// Dedicated iterator-protocol entry for array destructuring and `for…of` steps: the same
 /// operations as `jit_exec`, without the generic decoder in front of their intrinsic
 /// Array/Map/Set fast paths.
@@ -27046,6 +27181,8 @@ pub(crate) unsafe extern "C" fn jit_iteration(
                 .map(|value| push(&mut sp, value))
         }
         Op::IterStepL(iterator, next) => {
+            #[cfg(test)]
+            TEST_JIT_ITER_STEP_HELPERS.with(|count| count.set(count.get() + 1));
             let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
             let iterator = slots.read_value(iterator as usize);
             let next = slots.read_value(next as usize);
@@ -27084,6 +27221,10 @@ thread_local! {
     };
     /// `Op::TailDeep` operations that reached the exact-PC helper.
     pub(crate) static TEST_JIT_TAIL_DEEP_HELPERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    /// `Op::IterStepL` steps that reached the iteration helper.
+    pub(crate) static TEST_JIT_ITER_STEP_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     pub(crate) static TEST_JIT_TO_STR_HELPERS: std::cell::Cell<usize> = const {
@@ -30344,6 +30485,9 @@ unsafe fn jit_exec_inner(
                     push!(Value::Bool(false));
                 }
             }
+        }
+        Op::IterNextBuiltin(_) | Op::RequireIterResult => {
+            jit_for_of_step_operation(i, chunk.ops[pc as usize], sp, slots)?
         }
         Op::IterCloseL(s) => {
             let it = slots.read_value(s as usize);

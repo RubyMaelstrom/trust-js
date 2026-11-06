@@ -10792,6 +10792,11 @@ pub(crate) fn async_iterator_key(i: &Interp) -> Option<Rc<str>> {
     well_known_key(i, "asyncIterator")
 }
 
+/// %ArrayIteratorPrototype%.next's behaviour, which ARM64's `for…of` step template compares with
+/// a built-in `next`'s (as [`intrinsic_iterator_step`] does) before stepping an Array in line.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const ARRAY_ITER_NEXT: NativeFn = array_iter_next;
+
 fn array_iter_next(i: &mut Interp, this: Value, _args: &[Value]) -> Result<Value, Value> {
     let step = array_iter_step(i, this)?;
     Ok(materialize_iterator_step(i, step))

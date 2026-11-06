@@ -312,3 +312,137 @@ fn array_for_of_steps_keep_holes_getters_growth_and_close() {
         );
     }
 }
+
+#[test]
+fn for_of_generic_steps_keep_getter_order_abrupt_steps_and_close() {
+    // A `next` that is not a built-in takes the generic step (Call, the Object check, Get "done",
+    // Get "value"; ForIn/OfBodyEvaluation step 6), a built-in one IterStepL, whose ARM64 template
+    // steps an Array in line. Expected values from Node v24.
+    let source = r#"
+    (function(){
+        var log=[],r=[];
+        function source(results,close){
+            var i=0;
+            var it={next:function(){log.push('next'+arguments.length+(this===it));return results[i++]}};
+            if(close)it.return=function(){log.push('return');return close===1?{}:5};
+            return {[Symbol.iterator]:function(){return it}};
+        }
+        function each(iterable){var o=[];for(const x of iterable)o.push(x);return o.join(',')}
+        function attempt(f){try{return f()}catch(e){return (typeof e==='object'?e.constructor.name:'thrown:'+e)}}
+        // getter order and laziness of value at done
+        var res={get done(){log.push('done');return false},get value(){log.push('value');return 1}};
+        var end={get done(){log.push('done');return true},get value(){log.push('value!');return 2}};
+        r.push(each(source([res,res,end])),log.splice(0).join());
+        // done truthiness
+        r.push(each(source([{done:0,value:'a'},{done:'',value:'b'},{done:null,value:'c'},{done:undefined,value:'d'},{done:NaN,value:'e'},{value:'f'},{done:1,value:'g'}])));
+        r.push(each(source([{done:'x',value:'h'}])),each(source([{done:{},value:'i'}])));
+        log.length=0;
+        // non-object results, abrupt steps: no close
+        r.push(attempt(()=>each(source([5],1))),attempt(()=>each(source([undefined],1))),attempt(()=>each(source(['s'],1))),log.splice(0).join());
+        var thrower={next(){throw 'n'},return(){log.push('return')}};
+        r.push(attempt(()=>each({[Symbol.iterator]:()=>thrower})),log.splice(0).join());
+        r.push(attempt(()=>each(source([{get done(){throw 'd'}}],1))),attempt(()=>each(source([{done:false,get value(){throw 'v'}}],1))),log.splice(0).join());
+        r.push(attempt(()=>each({[Symbol.iterator]:()=>({next:3,return(){log.push('return')}})})),log.splice(0).join());
+        // body abrupt: close
+        r.push(attempt(()=>{for(const x of source([{value:1,done:false}],1))throw 'b'}),log.splice(0).join());
+        r.push(attempt(()=>{for(const x of source([{value:1,done:false}],2))throw 'b2'}),log.splice(0).join());
+        r.push(attempt(()=>{for(const x of source([{value:1,done:false}],2))break}),log.splice(0).join());
+        r.push(attempt(()=>{for(const x of source([{value:1,done:false}],1))return 'ret'}),log.splice(0).join());
+        // captured next, proxy results
+        var count=0,cap={next(){count++;cap.next=function(){throw 'replaced'};return count<3?{value:count,done:false}:{done:true}}};
+        r.push(each({[Symbol.iterator]:()=>cap}));
+        var proxied=new Proxy({done:false,value:9},{get(t,k){log.push('get:'+String(k));return t[k]}});
+        var once=0;r.push(each({[Symbol.iterator]:()=>({next(){return once++?{done:true}:proxied}})}),log.splice(0).join());
+        // one site, several iterator kinds
+        function* gen(n){for(var k=0;k<n;k++)yield k}
+        var kinds=[[1,2],source([{value:'u',done:false},{done:true}]),gen(2),'xy',new Set([7]),new Map([[1,2]]).keys(),[3]];
+        r.push(kinds.map(each).join(';'),log.splice(0).join());
+        // generators close on break; return() through a user iterator inside a generator
+        var g=gen(5);for(const x of g)if(x===1)break;r.push(JSON.stringify(g.next()));
+        function* wrap(it){for(const x of it)yield x}
+        var w=wrap(source([{value:1,done:false},{value:2,done:false}],1));
+        r.push(w.next().value,JSON.stringify(w.return(8)),log.splice(0).join());
+        // continue and nested loops
+        var out=[];outer:for(const a of source([{value:1,done:false},{value:2,done:false},{done:true}]))for(const b of [10,20]){if(b===20)continue outer;out.push(a+b)}
+        r.push(out.join(),log.splice(0).join());
+        // the array step: exhausted iterators, holes, prototype elements, truncation, growth, frozen arrays
+        var ex=[1,2].values();each({[Symbol.iterator]:()=>ex});r.push(each({[Symbol.iterator]:()=>ex})+'empty');
+        r.push(each([1,,3]),each(Object.freeze([4,5])));
+        Array.prototype[1]='P';r.push(each([1,,3]));delete Array.prototype[1];
+        var t=[1,2,3,4];r.push((function(){var o=[];for(const x of t){o.push(x);t.length=1}return o.join()})());
+        var gr=[1];r.push((function(){var o=[];for(const x of gr){o.push(x);if(gr.length<4)gr.push(x+1)}return o.join()})());
+        var AIP=Object.getPrototypeOf([].values()),saved=AIP.next;
+        r.push((function(){var o=[];for(const x of [1,2,3]){o.push(x);AIP.next=function(){throw 'late'}}AIP.next=saved;return o.join()})());
+        AIP.next=function(){var s=saved.call(this);if(!s.done)s.value='m'+s.value;return s};r.push(each([1,2]));AIP.next=saved;
+        return r.join('|');
+    })()
+    "#;
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(&mut engine, source),
+            "1,1|next0true,done,value,next0true,done,value,next0true,done|a,b,c,d,e,f|||\
+             TypeError|TypeError|TypeError|next0true,next0true,next0true|thrown:n||thrown:d|\
+             thrown:v|next0true,next0true|TypeError||thrown:b|next0true,return|thrown:b2|\
+             next0true,return|TypeError|next0true,return|ret|next0true,return|1,2|9|\
+             get:done,get:value|1,2;u;0,1;x,y;7;1;3|next0true,next0true|{\"done\":true}|1|\
+             {\"value\":8,\"done\":true}|next0true,return|11,12|next0true,next0true,next0true|\
+             empty|1,,3|4,5|1,P,3|1|1,2,3,4|1,2,3|m1,m2",
+            "{tier:?}"
+        );
+    }
+}
+
+#[test]
+fn for_of_steps_arrays_in_line_and_never_step_user_iterators_in_the_helper() {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    eval(
+        &mut engine,
+        "function sum(it){var s=0;for(const x of it)s+=x;return s}
+         var a=[];for(var k=0;k<100;k++)a.push(k);
+         function user(n){var i=0;return {[Symbol.iterator](){return this},
+             next(){return i<n?{value:i++,done:false}:{done:true}}}}",
+    );
+    let helpers = || crate::bytecode::TEST_JIT_ITER_STEP_HELPERS.with(std::cell::Cell::get);
+    let before = helpers();
+    assert_eq!(eval(&mut engine, "sum(a)"), "4950");
+    let arrays = helpers() - before;
+    assert_eq!(eval(&mut engine, "sum(user(100))"), "4950");
+    let users = helpers() - before - arrays;
+    // Only the exhausting step leaves the in-line template, whose miss is the helper's step.
+    if cfg!(all(
+        target_arch = "aarch64",
+        any(
+            target_os = "macos",
+            target_os = "linux",
+            target_os = "windows"
+        )
+    )) {
+        assert_eq!(arrays, 1);
+    }
+    assert_eq!(users, 0);
+}
+
+#[test]
+fn for_of_steps_in_loop_fragments_and_transferred_frames() {
+    // Top-level loops leave the tree-walker after their backedge budget for a compiled fragment;
+    // the step's slots arrive seeded.
+    let source = "var closed=0,s=0,n=0;
+        function user(n){var i=0;return {[Symbol.iterator](){return this},
+            next(){return i<n?{value:i++,done:false}:{done:true}},return(){closed++;return {}}}}
+        for(const x of user(1000))s+=x;
+        var a=[];for(var k=0;k<1000;k++)a.push(k);
+        for(const x of a)n+=x;
+        for(const x of user(1000))if(x===600)break;
+        try{for(const x of user(1000))if(x===700)throw 0}catch(e){}
+        s+'|'+n+'|'+closed";
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        assert_eq!(eval(&mut engine, source), "499500|499500|2", "{tier:?}");
+    }
+}

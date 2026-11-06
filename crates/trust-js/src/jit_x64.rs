@@ -1145,6 +1145,33 @@ pub(super) fn compile_entry(
                 a.jcc(0x85, pcs[*target as usize]);
                 a.bind(nullish);
             }
+            Op::IterNextBuiltin(slot) if layout.valid => {
+                // Bool(the slot holds an Object whose kind is ObjectKind::Native), as ARM64's
+                // template (`jit::operations`).
+                let other = a.label();
+                let done = a.label();
+                receiver_cell(&mut a, PropRecv::Slot(*slot), other);
+                a.nr_load8(CX, R10, layout.obj_from_cell + layout.obj_kind);
+                a.bytes(&[0x31, 0xd2]); // xor edx,edx
+                a.bytes(&[0x83, 0xf9, crate::value::KIND_NATIVE_TAG]); // cmp ecx,imm8
+                a.bytes(&[0x0f, 0x94, 0xc2]); // sete dl
+                a.jmp(done);
+                a.bind(other);
+                a.bytes(&[0x31, 0xd2]); // xor edx,edx
+                a.bind(done);
+                a.mov_word_imm(PACK_BOOL);
+                a.bytes(&[0x48, 0x09, 0xd0]); // or rax,rdx
+                a.store_word_r13(0);
+                a.add_sp(SLOT_BYTES as i8);
+            }
+            Op::RequireIterResult => {
+                // An Object passes; anything else throws in the checked operation.
+                let done = a.label();
+                a.cmp_tag_r13(-SLOT_BYTES, (PACK_OBJ >> 48) as u16);
+                a.jcc(EQ, done);
+                a.helper_spflag(H_EXEC, pc as u32, unwind);
+                a.bind(done);
+            }
             Op::Not => {
                 let slow = a.label();
                 let done = a.label();

@@ -5815,6 +5815,43 @@ fn compile_entry(
                 continue;
             }
         }
+        // A `for…of` step (`Compiler::emit_for_of_step`): its dispatch branches on the `next`
+        // method's kind without a Bool, and an Array's step in line goes straight to the body
+        // with its element; the JumpIfFalse(exit) and Jump(body) after it still follow the
+        // helper's step.
+        if layout.valid && !chunk.jit_detailed_feedback_enabled() {
+            if let (Op::IterNextBuiltin(next), Some(Op::JumpIfFalse(generic))) =
+                (op, ops.get(pc + 1))
+            {
+                if !targeted[pc + 1] {
+                    let generic = pc_labels[*generic as usize];
+                    match (ops.get(pc + 2), ops.get(pc + 3), ops.get(pc + 4)) {
+                        (
+                            Some(Op::IterStepL(iterator, step_next)),
+                            Some(Op::JumpIfFalse(_)),
+                            Some(Op::Jump(body)),
+                        ) if step_next == next && !targeted[pc + 2] => {
+                            operations::emit_for_of_step(
+                                &mut a,
+                                layout,
+                                *iterator,
+                                *next,
+                                pc as u32 + 2,
+                                l_unwind,
+                                generic,
+                                pc_labels[*body as usize],
+                            );
+                            skip = 2;
+                        }
+                        _ => {
+                            operations::emit_next_builtin_branch(&mut a, layout, *next, generic);
+                            skip = 1;
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
         if operations::emit(
             &mut a,
             chunk,
