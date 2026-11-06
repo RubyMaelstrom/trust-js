@@ -19404,3 +19404,502 @@ On 2a86b12b, the final head, unless noted (target/p2/w6-fix/ext):
   (186 s).
 - zombie (x86-64), on b8148f15 and on 2a86b12b: clippy in three configurations clean; lib 2,630
   passed, 0 failed.
+
+### Djot's gap, step 1: for-of steps in generated code (record, 2026-11-06)
+
+Landed on main 10335559 by cherry-pick: d2620672 as 88fac1d9 (an agent's; checked as 1776f121
+on 6725b6d6, whose code differs from 10335559's in one test file, callee_pickup_tests.rs). Taken
+with it (the coordinator's): the micro-benchmarks' costs for built-in steps that are not an
+Array's (a Map +1.2%, a Set +3.6%, a String +3.4%, a generator +0.6%: the dispatch's 17
+instructions or so before the helper; x86-64's Array +3.4%), small costs reported in a
+net-improving step, the fixtures and Octane within +-0.02% outside its gains. The combined
+tree's checks (1776f121: A2 and the W6 series below it; target/p2/land-djot1):
+- the gate (STAGES="lib rel fixtures difftest t262", BASE land-t1/gate-eed7110f): the lib suite
+  2,862 passed and 3 failed under a load of 20-40 (two TRust builds and two agents' gates
+  beside it), all three on the load-sensitive list and passing 3 of 3 alone:
+  gc_scan_spike::spike_scan_cost_is_linear_and_small, jit::poll_tests::a_cyclic_list_walk_stops_
+  for_cancellation_and_deadlines, gc_pacing_tests::the_memory_reducer_starts_a_cycle_that_idle_
+  steps_finish; with pacing on 2,865 passed, 0 failed; the fixtures' masked outputs the base's;
+  difftest 138 agree, 12 skipped (budget); Test262 at threshold 8 53,575/53,575, identical.
+- under TRUST_JS_GC_INCREMENTAL=force: 2,864 passed, 1 failed, gc_scan_spike's (3 of 3 alone,
+  under force too).
+- zombie (x86-64): clippy in three configurations clean; the lib suite 2,640 passed, 0 failed.
+- TRust 78435d0 built against 1776f121, release and with debug assertions (the cycle on by
+  default): the three pages complete and valid, each page's output the same as main's with the
+  cycle off; the spike exits 0 in both (release 1,804 slices, debug with TRUST_JS_GC_VERIFY=1 287).
+
+(The agent's record, "Djot's gap, step 1: for-of steps in generated code (2026-11-06)":)
+
+d2620672 on main ea6fd916 (branch p2-djot-s1-ea6, worktree target/p2/djot-gap/impl-wt): 784f0467
+rebased, the same patch-id, applied without conflicts over tier 1 (a) and (b). Measured and gated
+on ea6fd916; first built and gated as 784f0467 on 8a9dc747.
+
+WHAT CHANGED
+
+A synchronous for-of step is ForIn/OfBodyEvaluation's step 6 (ECMA-262 e28783d5,
+spec.html:23038-23043). The bytecode compiler (Compiler::emit_for_of_step) emits it in two forms;
+IterNextBuiltin, a new operation, chooses one at each step by whether the loop's next method is a
+built-in function (ObjectKind::Native):
+
+- A built-in next steps through IterStepL, as every step did before: the intrinsic Array, String,
+  Map and Set steps run without a call, other built-ins (generators among them) are called from
+  Rust. This keeps the plan's (c): the helper stays for the rest.
+- Any other next takes the generic sequence V8 and SpiderMonkey emit:
+  - V8: src/interpreter/bytecode-generator.cc:3138-3153, 7685-7700.
+  - SpiderMonkey: frontend/ForOfEmitter.cpp:145-175, BytecodeEmitter.cpp:2945-2975.
+  - The sequence:
+    - LoadLocal iterator, LoadLocal next, CallWithThis(0) with its own call cache (the
+      direct-call sequence in generated code);
+    - RequireIterResult (new: step 6.c's TypeError; an Object tag test in generated code);
+    - Dup, GetProp "done" with its own property cache, Not, JumpIfFalse(exit);
+    - GetProp "value" with its own property cache, then the body.
+- As before, none of it runs inside the body's handler, so an abrupt step closes nothing; the
+  body's handler and the IteratorClose pads are unchanged.
+
+ARM64 fuses the dispatch with the step (jit.rs; jit_operations.rs emit_for_of_step):
+
+- A next that is not a built-in branches to the generic sequence.
+- An Array steps in line, as JSC's Baseline steps a fast array (jit/JITCall.cpp:511-697,
+  emit_op_iterator_next). The template checks:
+  - next's behaviour is %ArrayIteratorPrototype%.next (the identity test that
+    try_intrinsic_iterator_step makes);
+  - the iterator is an Array Iterator over values on an ordinary Array (ic_plain);
+  - the element at its index is present below the used words.
+  It advances the index (an integer: no barrier) and goes to the body with the element.
+- %ArrayIteratorPrototype%.next (spec.html:42038-42070) runs no code on this path: an ordinary
+  Array's length is a data property and an own data element's Get calls nothing, so reading
+  the element before advancing the index is unobservable.
+- Anything else, exhaustion included (it reads the length and clears the target), takes the
+  helper's step unchanged.
+
+The unfixed operations have templates of their own, for regions and other layouts. x86-64 has
+templates for IterNextBuiltin and RequireIterResult and keeps IterStepL in its exec helper (it has
+no in-line element reads).
+
+A correction to the census's plan: the Array step relies on the next method's identity, not on a
+protector. ArrayIterationProof (the protector) is GetIter's and IteratorClose's: it decides which
+next the loop gets.
+
+The VM and the exact-PC executor run the two new operations out of their dispatch
+(vm_for_of_step_operation, jit_for_of_step_operation, #[inline(never)]). As two arms of
+run_vm_inner's match they changed how fat LTO compiled the loop: 6.4 KB smaller, the same 223 call
+targets, 1,607 fewer instructions, and the bytecode tier 0.4-0.8% slower on code that never runs
+them (counts at --tier=bytecode: Richards +0.76%, DeltaBlue +0.66%, sa +0.55%; sa +0.14% at
+--tier=jit). Bisected:
+- the arms alone (no lowering, no JIT change) reproduce it;
+- the arms last in the match, and the operations last in Op, do not help;
+- out of line, the loop is back to 123,696 bytes (main 124,060), and the bytecode tier to
+  Richards +0.08%, DeltaBlue +0.14%, sa +0.04%.
+
+Ablations (DIAGNOSTICS.md):
+- TRUST_JS_FOR_OF_STEP=helper keeps every step in IterStepL;
+- TRUST_JS_JIT_NO_ITER_STEP=1 keeps the Array step in the helper.
+
+Tests (iterator_result_tests.rs), with Node v24's answers, in the tree-walker, the VM and the JIT:
+- the generic step: getter order and value's laziness at done, done's truthiness, non-Object
+  results, abrupt next, done and value (none closes), body throws and returns, breaks (a close
+  whose result is not an Object), a captured next, Proxy results;
+- one site seeing seven kinds of iterator, generators around both forms, labeled continue;
+- the Array step's edges: an exhausted iterator, holes, prototype elements, truncation, growth,
+  frozen arrays, next replaced mid-loop and replaced before;
+- the Array step in line (only the exhausting step reaches the helper), user iterators never in
+  the helper;
+- top-level loops in compiled fragments, closing.
+
+MEASURED
+
+On d2620672 against main ea6fd916 itself (fat LTO, instructions:u, CPUs 10-13, pacing off;
+target/p2/djot-gap/counts/s1-ea6; main's from the W6 ledger fix's run of the same binary,
+target/p2/w6-fix/ext/counts/main-ea6):
+
+| workload | main | step 1 | change |
+| --- | --- | --- | --- |
+| Djot | 588.74M | 560.81M | -4.75% |
+| Vue | 1,394.6M | 1,385.9M | -0.62% |
+| PdfJS | 6,866.4M | 6,853.1M | -0.19% |
+| sa | 1,749.7M | 1,751.3M | +0.09% |
+| React, chai, the rest of Octane | | | within +-0.02% |
+
+- Splay is +0.00% here; it was -0.26% against 8a9dc747.
+- Djot's pieces (TRUST_JS_FOR_OF_STEP=helper and TRUST_JS_JIT_NO_ITER_STEP=1 on the one binary):
+  the generic sequence -2.73%, the in-line Array step -1.84%, both -4.74%. These are counted with
+  environments of equal length: an unread 27-character variable on the plain runs, main's and
+  step 1's. A same-binary toggle can move counts through the stack scan's view of the
+  environment; two runs each agreed within 0.01%.
+- Djot's IterStepL helper operations (TRUST_JS_JIT_OPSTAT=1): 44,986 to 2,579.
+  - The same totals on 8a9dc747 and 784f0467: the rebase changed nothing.
+  - The first draft's 44,598 and 1,522 summed only the sites that TRUST_JS_JIT_OPSTAT=2 prints,
+    its top 24.
+  - What remains is each loop's exhausting step. A build printing every site (the print limit
+    raised; counts/s1-ea6/opstat-all-*.txt) shows 9 sites. Each sends the helper fewer steps
+    than it runs: at the top site 1,522 of 9,524; at the five smallest exactly half (loops over
+    one element: its step in line, the exhausting step in the helper).
+
+Micro-benchmarks (the scratch m-*.js, instructions, the whole run; ARM64 one run, x86-64 zombie's
+median of 3; on ea6fd916, as before the rebase but for the generator's x86-64 +0.9%):
+
+| loop | ARM64 | x86-64 |
+| --- | --- | --- |
+| an Array | -73.4% | +3.4% |
+| a user iterator | -70.9% | -19.2% |
+| a closure's iterator | -71.0% | -19.1% |
+| a generator | +0.6% | +0.5% |
+| a Map | +1.2% | +1.4% |
+| a Set | +3.6% | +3.6% |
+| a String | +3.4% | +2.9% |
+
+- A built-in step that is not an Array's pays the dispatch, about 17 instructions on ARM64, before
+  its helper.
+- x86-64 has no in-line Array step, so its Array loop pays the dispatch too.
+
+x86-64 fixtures (zombie, fat LTO, median of 3; target/p2/djot-gap/zombie-count-ea6.txt): Djot
+-0.60%, Vue -0.14%, React -0.24% (before the rebase: -0.58%, -0.16%, -0.25%).
+
+Timing (target/p2/djot-gap/timing-s1-d2620672; scripts/timing-session.sh):
+- Fat LTO, the fixture at --tier=jit, 10 rounds rotating (bench.py), CPU 5 (Cortex-X925).
+- Under the timing hold, once the compact agent's builds had ended (load 1.7).
+- Elapsed ms, the fixture's own clock:
+
+| engine | runs (ms) | median | against node-sp |
+| --- | --- | --- | --- |
+| main ea6fd916 | 86 x8, 87 x2 | 86 | 2.21x |
+| step 1 d2620672 | 82 x5, 83 x4, 84 | 82.5 | 2.12x |
+| node-sp (Node v24.22.2, Sparkplug only) | 38-40 | 39 | 1 |
+
+- Step 1 takes 4.1% off main's time.
+
+The steady state, from the 10-, 20- and 40-pass variants (three runs each per engine, CPU 13):
+
+| passes | main (ms) | step 1 (ms) | change |
+| --- | --- | --- | --- |
+| 10 | 189-191 | 180-181 | -4.7% |
+| 20 | 346-350 | 330 | -5.2% |
+| 40 | 651-656 | 615-624 | -5.4% |
+
+- A pass between 20 and 40 costs 15.3 ms on main and 14.45 ms on step 1: -5.6%.
+
+GATE
+
+On d2620672 (target/p2/djot-gap/gate-s1-d2620672, s1-ea6-gate.sh):
+- fmt, and clippy in five configurations plus the workspace: clean.
+- rustdoc fails with 13 errors, the same 13 on main ea6fd916, in the same files (rustdoc-diff-ea6.txt
+  empty). The step touches none of them.
+- STAGES="rel fixtures difftest t262" against the tier 1 landing gate (land-t1/gate-eed7110f, main's
+  code):
+  - Vue, React and Djot give the same masked output as the base;
+  - difftest: 138 agree, 12 skipped (budget);
+  - Test262 at jit threshold 8: 53,575/53,575, identical to the base's report.
+- Test262's iteration suites in bytecode-0, jit-0, jit-8 and interp-8: 3,555 files each, all
+  passing, each report identical to main ea6fd916's (main's runner built in main-wt). Covered:
+  - language/statements/for-of and for-await-of, language/statements/generators,
+    language/expressions/yield, assignment/destructuring, for-in;
+  - built-ins/ArrayIteratorPrototype, Array/prototype/values, keys, entries and @@iterator,
+    Array/from;
+  - built-ins/StringIteratorPrototype, MapIteratorPrototype, SetIteratorPrototype,
+    GeneratorPrototype, Iterator;
+  - class/elements/syntax, annexB for-in.
+- lib (embed): 2,854 passed, 1 failed at a load of 40-47:
+  gc_pacing_tests::the_memory_reducer_starts_a_cycle_that_idle_steps_finish, one of the three
+  timing tests that failed under load in the first gate (it passes alone: the agent's first rerun,
+  97.5 s; the coordinator's on the combined tree's test binary, 3 of 3).
+- lib with pacing on: 2,854 passed, 1 failed:
+  external_memory_tests::replaced_arrays_are_collected_as_their_elements_grow. It is main
+  ea6fd916's known failure, which the W6 ledger series' 78191080 fixes.
+- zombie (x86-64): clippy in three configurations clean; lib 2,630 passed, 0 failed.
+
+First gated as 784f0467 on 8a9dc747, with the same results but for the load-hit tests (three then).
+
+### Djot's gap, candidate 4: the scanning loops (design note, 2026-11-06)
+
+Decided (the coordinator's, under the owner's approval of design questions as recommended):
+fork 1 (a), String.prototype's ObjectFuse, two-level as SpiderMonkey's (vm/ObjectFuse.h's SMDOC;
+CacheIR's GuardObjectFuseProperty, which Warp turns into an invalidation dependency), with
+SpiderMonkey's semantics: a generation bumped by a tracked property's removal, and per-property
+states in which any write to a constant property, of the same value too, makes it not constant;
+define and delete covered; no hook in [[SetPrototypeOf]], since an own property of
+String.prototype shadows everything above it and a primitive owns only indices and length.
+Tests for every kind of write (assignment of the same and of another value, defineProperty as
+data, accessor and attributes only, delete, a polyfill replacing one method while the others stay
+fused, a property made non-writable, another Realm's String.prototype independent). Fork 2: the
+fusion in the JIT at GetMethod + argument + CallWithThis(1) when the call IC holds the intrinsic,
+a failed guard running the unfused templates. Fork 3: the region's register operands and facts.
+Steps 1-4 as proposed, each measured before the next (counts, code bytes, Djot's elapsed time
+against node-sp under the hold, TRust's three pages and the spike).
+
+On main e3322606 (A2 landed) with Djot step 1 measured on its own binary (d2620672, on ea6fd916);
+TRust JS citations at e3322606 (worktree target/p2/djot-gap/c4-wt).
+
+THE LOOPS
+
+Djot's block parser scans its subject with two methods (benchmarks/fixtures/djot.js, the bundle's
+offsets 17658 and 17795):
+
+  skipSpace(){const t=this.subject;let e=this.pos;for(;32===(s=t.codePointAt(e))||9===s;)e++;
+    var s;this.indent=e-this.startline,this.pos=e}
+  getEol(){const t=this.subject;let e=this.pos;for(;10!==(s=t.codePointAt(e))&&13!==s;)e++;
+    var s;this.starteol=e,13===t.codePointAt(e)&&10===t.codePointAt(e+1)?this.endeol=e+1:
+    this.endeol=e}
+
+getEol runs once a line and scans it to its end; skipSpace runs several times a line and usually
+scans nothing.
+
+SIZE
+
+On step 1 (d2620672, fat LTO, instructions:u, pacing off; target/p2/djot-gap/c4):
+- Djot's steady state (the 40-pass variant): getEol's chunk 10.70% of the instructions, skipSpace's
+  0.73% (perf record with TRUST_JS_PERF_MAP=1; size/p40-s1-symbols.txt).
+- getEol, copied verbatim with a function driver over 1,000 lines, 200 and 400 times
+  (micro/f-geteol-*): 227 instructions a character (226.5 over 20-character lines, 228.4 over 80),
+  and 1,443 a call for an empty line, the driver's loop included.
+- skipSpace, the same way (micro/f-skip-*): 976 instructions a call with no space to skip, of
+  them 754 above the driver's loop, and 218 more for each space. By SPE, a call without a space
+  spends about 365 instructions in skipSpace's own chunk (one evaluation of the loop's condition,
+  this.subject and this.pos, the two stores) and the rest in the call and return, the caller's
+  template and the shared stubs (candidate 5's).
+
+Where a character's instructions go (SPE, one operation in 1,024, getEol's second-stage chunk on
+the 80-character micro; dump/geteol2-spe-hot.txt). The loop is one register region; 95% of the
+samples are in the chunk, about 194 instructions an iteration:
+
+| part (the region's marks) | instructions an iteration |
+| --- | ---: |
+| GetMethod "codePointAt" (attributed to the LoadLocal before it) | 45.6 |
+| the call template: callee identity, intrinsic dispatch, string and Number guards, the code point read | 57.0 |
+| the region's glue around the call (the index's push, the result's classification) | 16.5 |
+| the two StrictNotEq | 44.5 |
+| JumpIfFalse and JumpIfFalsePeek | 19.5 |
+| the back edge (Jump) | 4.9 |
+| e++ (UpdateLocal), Pop, helper marks | 5.3 |
+
+What one character pays for (the hot listing):
+- GetMethod: the receiver's tag decoded (about 15 instructions of compares), ctx.interp and the
+  active Realm's String.prototype loaded, its kind byte, its IC_PLAIN flag and its shape compared
+  with the site's, the slot's bounds and its word loaded, the method pushed.
+- The call: the callee word untagged and compared with the call IC's, the IC's epoch against
+  the live one, the intrinsic's id dispatched, the receiver's String tag and the index's Number
+  checked again, then the code point template (an exact index, the length, the buffer's form: the
+  micro's subject is a view of a flat buffer).
+- t and e live in registers (d9, d8), but the templates take their operands on the operand stack:
+  each iteration stores t and e there and reads them back.
+- Each StrictNotEq tests the tags of a code point the code just produced as a Number.
+
+TRUST JS NOW
+
+- The method read: jit.rs emit_prop_load_inline, with emit_packed_probe_receiver (a primitive's
+  wrapper prototype from the active Realm, through ctx.interp: emit_load_active_proto). The
+  probe's facts are the site cache's (IcState: shape, depth, slot), checked at each read.
+- An assignment to String.prototype.codePointAt keeps the prototype's shape: the probe reloads the
+  slot every time, and the call IC compares the callee with the one it recorded.
+- The call: the call IC proves the callee is the codePointAt native, and the intrinsic dispatch
+  runs emit_code_point_template (jit.rs, W3's item 2c).
+- Writes to String.prototype already reach Rust: a String wrapper is kind 23, past
+  KIND_ORDINARY_LAST (19; value.rs:2314, 2352), and the JIT's named stores admit ordinary kinds
+  only (guard_exotic_ordinary in the store stub, jit.rs:13185-13187, and in the inline store,
+  13344).
+- Infrastructure to build on:
+  - shapes, with FLAG_IC_PLAIN and FLAG_PROTO (a marked prototype);
+  - PROTO_EPOCH (value.rs), bumped by structural changes of marked prototypes, for the creation
+    caches;
+  - CALL_IC_EPOCH for the call caches;
+  - the dependency registry (dependency.rs, W4 step 10): JSC-style watchpoint sets, the first one
+    a prototype's shape (Props::note_structural fires it). Its consumer is the speculative tier,
+    which baseline chunks are not: a chunk has no invalidation point to leave at once.
+
+WHAT THE EXEMPLARS DO
+
+Current source: V8 41b0e42f (2026-11-05), SpiderMonkey (firefox) fa1e90ea (2026-11-05), WebKit
+ab234b60 (2026-11-06); the files in target/p2/djot-gap/c4-src and exemplar-src. None has a
+protector for String.prototype's methods as such. Each baseline guards the method's read at every
+access, and each optimizing tier makes the method a constant through dependencies.
+
+V8 (src/ paths):
+- Sparkplug's named load calls a LoadIC builtin; Sparkplug+ (shipped) patches a site to a builtin
+  for its handler, but a string receiver's site becomes LoadICGenericBaseline: the handler of a
+  primitive receiver carries DoAccessCheckOnLookupStartObject (ic/handler-configuration.cc:41-62;
+  objects/feedback-vector.cc:925-943; ic/ic.cc:856-873, 1015-1019).
+- The feedback map is the string's own (every string map unstable), the holder String.prototype,
+  the handler LoadFromPrototype with the method as a weak constant and String.prototype's
+  prototype validity cell (ic/ic.cc:1422-1447; ic/handler-configuration.cc:119-149;
+  objects/map.cc:2574-2639).
+- Each access: the map compared, the cell loaded and compared with cleared, the cell's native
+  context compared with the current one, the constant dereferenced (ic/accessor-assembler.cc:
+  86-97, 1284-1293, 1309-1343, 1410-1443).
+- The cell is invalidated lazily (its value set to cleared, objects/js-objects.cc:5398-5406) at
+  any map change of String.prototype or a prototype above it (js-objects.cc:3302-3306,
+  5436-5470), and when an assignment turns the method's const field mutable
+  (objects/map-updater.cc:1272-1273).
+- The call goes through a call builtin to the codePointAt builtin (Torque,
+  builtins/builtins-string.tq:192-207): no in-line read in Sparkplug.
+- TurboFan and Maglev: stable-map and field-constness dependencies fold the load to a constant
+  (compiler/compilation-dependencies.cc:1548-1570, compiler/access-info.cc:763-768) and inline
+  codePointAt (compiler/js-call-reducer.cc:7720-7750; maglev/maglev-reducer-inl.h:6868-6915).
+- V8's protectors cover String's @@iterator, @@replace/@@split/@@matchAll, length overflow and
+  ToPrimitive (execution/protectors.h:49-103), no method.
+
+SpiderMonkey (js/src paths):
+- The GetProp IC for a string (jit/CacheIR.cpp tryAttachPrimitive, 2647-2714): a tag test
+  (GuardNonDoubleType), String.prototype as a stub constant, then, in its Specialized mode and
+  with String.prototype's ObjectFuse, GuardObjectFuseProperty and the method returned as the
+  stub's constant (2278-2295, 2341-2384). The fallback is a shape guard on String.prototype and
+  the slot's load (2405, 914).
+- The fuse check in the Baseline stub: the fuse's word "no constant property invalidated" loaded
+  and compared with 0; otherwise its generation and the property's state bits
+  (jit/CacheIRCompiler.cpp:11880-11957).
+- The call IC (tryAttachStringChar, CacheIR.cpp:8275-8369): the callee's identity
+  (GuardSpecificFunction), a string this, an Int32 index, then LoadStringCodePointResult in line
+  in the stub (CacheIRCompiler.cpp:4926-4975; MacroAssembler.cpp:1769-1863). The native is never
+  called.
+- The ObjectFuse (vm/ObjectFuse.cpp): built-in prototypes have one (vm/GlobalObject.cpp:436-444).
+  Watchtower hooks see assignments (vm/NativeObject.cpp:2486), defineProperty (1455), delete
+  (vm/Shape.cpp:872) and prototype changes (1153). A write to a Constant property, even of the
+  same value, marks it NotConstant, sets invalidatedConstantProperty and invalidates the dependent
+  Ion code (ObjectFuse.cpp:114-137); structural changes bump the generation (139-175). Store ICs
+  optimize only NotConstant properties (the note at ObjectFuse.cpp:121-123).
+- Warp: the fuse a compile dependency, the method a constant, codePointAt inlined as MCodePointAt
+  (jit/WarpCacheIRTranspiler.cpp:516-522, 1776-1781, 2806-2830).
+
+JavaScriptCore (Source/JavaScriptCore paths):
+- Baseline get_by_id (jit/JITPropertyAccess.cpp:548-583; jit/JITInlineCacheGenerator.cpp:
+  162-168): the base's structure ID compared (one string structure a VM, runtime/VM.cpp:344),
+  then the holder and offset from the IC and the slot loaded.
+- StringPrototype's condition (Presence of codePointAt) is a watchpoint on its structure, adaptive
+  (re-armed while the property is present), which resets the IC when it fires
+  (bytecode/InlineCacheCompiler.cpp:3135-3143; bytecode/PropertyCondition.cpp:109-127, 366-369;
+  bytecode/PropertyInlineCacheClearingWatchpoint.cpp:61-79). An assignment keeps the structure:
+  the IC loads the new value and the call IC misses on the callee's identity.
+- The call: a call IC (the callee's identity) to a codePointAt thunk: a String this that is no
+  rope, an Int32 index in bounds, the unit, surrogates (jit/ThunkGenerators.cpp:893-934).
+- DFG and FTL: the Presence promoted to a watched Equivalence, the method a constant, the
+  StringCodePointAt node in line (dfg/DFGByteCodeParser.cpp:3780-3796, 7175-7177).
+- JSGlobalObject's stringPrototypeChainIsSane set is about indexed properties
+  (runtime/JSGlobalObject.cpp:3340-3342), not methods.
+
+| engine | baseline: the method's read | baseline: the call | what invalidates |
+| --- | --- | --- | --- |
+| V8 | a builtin call: the string's map, String.prototype's validity cell and native context, the constant | builtins: feedback, the codePointAt builtin | the cell, lazily: a map change of String.prototype or above, a const field made mutable |
+| SpiderMonkey | an IC stub: the tag, String.prototype's fuse word, the constant | an IC stub: the callee's identity, the tags, the code point in line | Watchtower: any write to a constant property, define, delete, a prototype change |
+| JSC | the IC: the string structure, the slot | a call IC to a code point thunk | structure watchpoints; an assignment shows at the call IC |
+| TRust JS now | in line: the tag decoded, the Realm's String.prototype, its kind, flag and shape, the slot | in line: the callee's identity and epoch, the intrinsic dispatch, the tags, the code point | the shape (structural changes); the identity (assignments) |
+
+TRUST JS AGAINST THEM
+
+- TRust JS's read checks String.prototype's own state at each access, which none of the three
+  does: they hold it by a cell (V8), a fuse word (SpiderMonkey) or watchpoints (JSC).
+- Its call already reads the code point in line, as SpiderMonkey's Baseline does; JSC calls a
+  thunk and V8 a builtin.
+- The cost is in the read's checks (45.6 instructions) and in the call's identity check, epoch,
+  dispatch and repeated tag tests (57.0), and in the operand stack between ops whose values the
+  region holds in registers.
+
+THE FORKS
+
+Fork 1, the guard on the method:
+- (a) SpiderMonkey's ObjectFuse: String.prototype gets a fuse, a word that stays 0 while none of
+  its tracked properties (its built-in methods) has been written, and a state per property. Every
+  write to String.prototype (assignment, defineProperty, delete) goes through Rust already; the
+  hook there marks the property and sets the word. A site checks the tag and the word (one load
+  from the active Realm, one compare), and then knows the method is the one it implements.
+  - Only String.prototype's own property matters. A primitive string's own properties are its
+    indices and length, so a method name is never one of them, and String.prototype's
+    [[SetPrototypeOf]] cannot change what its own property holds.
+  - As now, the active Realm's String.prototype is the one read: the code point is the same
+    whichever Realm's codePointAt runs it, and only the slow paths can throw.
+- (b) V8's validity cell: a cell per prototype's shape, cleared at any shape change and when an
+  assignment changes a constant field's constness. TRust's shapes are ids without cells, and its
+  fields have no constness.
+- (c) JSC's watchpoints: the dependency registry has the sets, but a baseline chunk cannot leave
+  at once when one fires (no invalidation points), so a site would still check something, and an
+  assignment keeps the shape: the read would still load the slot, and the call compare identity.
+- (d) Keep today's re-validation and only trim it (the tag decode, the shape check).
+
+Recommendation: (a), SpiderMonkey's. It is the one exemplar baseline that does this exact case
+in one word, and its invalidation fits where TRust's writes to String.prototype already go. Two
+levels, as SpiderMonkey's: the word for the fast path, and the property's own state when the word
+is set, so that a polyfill replacing one method keeps the others fast.
+
+Decided (the coordinator's, 2026-11-07): all three forks as recommended. Fork 1 matches
+SpiderMonkey's semantics (vm/ObjectFuse.h's SMDOC and ObjectFuse.cpp; vm/Watchtower.cpp;
+vm/NativeObject.cpp at fa1e90ea), not a simplification of them:
+- State per property (two bits): Untracked, Constant (generated code may rely on it), NotConstant
+  (written after it was Constant). Marking a property Constant is the JIT's, as SpiderMonkey's
+  tryOptimizeConstantProperty (ObjectFuse.cpp:91-110): Untracked becomes Constant, NotConstant
+  stays refused.
+- A value change (ObjectFuse::handlePropertyValueChange, ObjectFuse.cpp:114-137; called before
+  the same-value check, Watchtower.cpp:755-764): Untracked becomes Constant, Constant becomes
+  NotConstant and sets the word, NotConstant stays. It is every write of the value, the same
+  value included, and every defineProperty that is not redundant: SpiderMonkey's define of a data
+  property calls it after changing the flags (NativeObject.cpp:1449-1457), so a define that only
+  makes the method non-writable counts too. A redundant define changes nothing
+  (DefinePropertyIsRedundant, NativeObject.cpp:1569-1626, 1741-1747). An accessor in place of the
+  method, or a new getter, is a value change.
+- Freezing and sealing change flags only (NativeObject::freezeOrSealProperties, Shape.cpp:
+  1031-1060; Watchtower's watchPropertyFlagsChange and watchFreezeOrSeal leave the fuse alone,
+  Watchtower.cpp:703-735, 829-847): String.prototype frozen keeps its methods fused, as a hardened
+  (SES) environment's intrinsics need.
+- Removing a tracked property bumps the generation and sets the word
+  (ObjectFuse::handlePropertyRemove, ObjectFuse.cpp:139-160). TRust's maps close the gap a removal
+  leaves (Props::remove_key), so the states after it move down with their properties; the bumped
+  generation fails every guard that named a slot.
+- The other generation bumps SpiderMonkey lists (shape teleporting's shadowing and proto
+  mutation, the global lexical environment, object swapping) do not apply: TRust has no shape
+  teleporting, and the fuse's object is String.prototype.
+- No [[SetPrototypeOf]] hook. A primitive string's own properties are its indices and length
+  (String exotic objects' [[GetOwnProperty]], ECMA-262 StringGetOwnProperty), so a method's name
+  is never one of them, and the lookup's first hop is String.prototype. String.prototype's own
+  property shadows everything above it; changing String.prototype's [[Prototype]] cannot change
+  what that own property holds. Removing it is a removal, which the fuse sees.
+- The site's guard (SpiderMonkey's GuardObjectFuseProperty, jit/CacheIRCompiler.cpp:11880-11957):
+  the word is 0, or the generation is the one recorded when the site was compiled and the
+  property's NotConstant bit is clear.
+
+Fork 2, where the fused step is chosen:
+- (a) In the JIT, at GetMethod "codePointAt" followed by its argument and CallWithThis(1), when
+  the call IC holds the codePointAt intrinsic (in a first stage, by the name, still guarded). A
+  failed guard runs the unfused templates. This is what SpiderMonkey's IC stubs do for
+  primitive receivers; JSC's thunk and V8's optimizing tiers choose at the call too.
+- (b) A bytecode op from the compiler: it cannot know the receiver is a string.
+
+Recommendation: (a).
+
+Fork 3, the loop's values in registers: no exemplar baseline does it (their optimizing tiers
+do). In the region, the fused step reads t and e from their registers, leaves s in one with a
+Number fact (a code point, or undefined past the end, which keeps the boxed form), and the two
+StrictNotEq against constants compare it without tag tests and branch on the flags. This is the
+plan's second half.
+
+PLAN
+
+1. The fuse. A word per Realm next to string_proto in InterpLayout, with a state per tracked
+   property (String.prototype's built-in methods). The hooks: the Rust paths that write, define
+   or delete a property of a Realm's String.prototype; any define of a tracked property counts as
+   a write, attributes alone included. Tests, in every tier: each kind of write, a write of the
+   same value, a getter in place of the method, freezing, another Realm's String.prototype, an
+   unrelated method replaced (the others stay fast), a String object and other primitives as
+   receivers.
+2. ARM64 templates: the fused step for codePointAt. The guards: a primitive string receiver, the
+   site's fuse being the active Realm's, the fuse's word (then the property's state), a Number
+   index; the code point template as now; any miss takes the existing sequence. Then charCodeAt
+   and charAt, which tokenizers use (Web Tooling's acorn, esprima and the others).
+   - A site's data (chunk-owned, as a call cache's way): the fuse it was validated in and its
+     guard data. A chunk runs in whichever Realm is active, and the probe reads the active Realm's
+     prototype, so the step compares the active Realm's fuse with the site's.
+   - The fill, in the slow path: the active Realm's String.prototype holds its own codePointAt
+     as a data property, and that value is the Realm's built-in; then try_optimize_constant. The
+     value must be checked as the site fills: a property replaced while Untracked becomes
+     Constant with the new value (SpiderMonkey's handlePropertyValueChange), and a SpiderMonkey
+     stub returns the value it recorded, where this step runs the built-in's algorithm.
+3. The region: the fused step on register operands, and the Number fact for its result.
+4. x86-64 runs GetMethod through its helper (jit_x64.rs:1265) and has no in-line read: there the
+   fused guard would skip that helper and the call's and call the intrinsic's. A later step.
+
+EXPECTED SIZE
+
+From the SPE breakdown, a character in getEol would go from about 194 instructions to about 45:
+- the read, the call and their glue, 119, to about 25: the tag, the word, the index, the read;
+- the two StrictNotEq, 44.5, to about 6;
+- the branches, 19.5, to about 4;
+- the back edge and e++, about 7, unchanged.
+
+getEol is 10.70% of the steady state's instructions, so that would be about 8% of them. skipSpace
+would lose about 150 of its 750 instructions a call; its call and return are candidate 5's.
+Elapsed time: measured per step; Djot needs about 5% more to reach 77 ms.
