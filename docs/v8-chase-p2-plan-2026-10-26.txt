@@ -18971,3 +18971,436 @@ C. The in-line templates' class.
 3. (b) the three templates; tests: each template's hit and miss, ToString's order on an object
    receiver (the miss), substring's argument clamping. Measured as step 1, and Djot's elapsed time
    against node-sp in a quiet window under the HOLD protocol (the phase exit: 77 ms or less).
+
+### W6 step 6's default on again: the external ledger's charges bring a cycle's slices (record, 2026-11-06)
+
+Landed on main e3322606 by cherry-pick: 15c1d9ee as b54d9247, 78191080 as 3fff8b63, 2a86b12b as
+34b3eefc (the diff of diffs identical but for a DIAGNOSTICS.md hunk's line offset: A2 added lines
+above it). With it incremental marking is on by default again, W6's exit complete. The series is
+an agent's; its record follows, its checks on ea6fd916. The combined tree's checks (34b3eefc, A2
+with the cycle on by default; target/p2/land-w6x):
+- the lib suite by default (the cycle on): 2,861 passed, 1 failed under a load of 40 and more
+  (1,252 s against the usual 390): jit::poll_tests::a_cyclic_list_walk_stops_for_cancellation_and_deadlines,
+  whose canceller thread cancels after 20 ms; the cancel reached the function's entry poll before
+  the loop ran (calls [0, 1, 0]), a race of the test under load; it passes 3 of 3 alone.
+- with pacing on: 2,862 passed, 0 failed.
+- under TRUST_JS_GC_INCREMENTAL=force: 2,861 passed, 1 failed:
+  bytecode::callee_pickup_tests::a_callers_way_picks_up_its_callees_new_code_and_no_other_site_refills
+  (A2's): its bystander's way refilled once (its epoch 1148 to 1149). The call-cache epoch is
+  process-wide (CALL_IC_EPOCH), and the suite's other tests move it when their collections free
+  code (its fences), more often under force. The test retries a run whose epoch moved, but reads
+  its start after the setup filled the bystander's way: a move between the two refills that way
+  and passes the retry's check. It passes 3 of 3 alone under force; the test's window is A2's
+  agent's to close.
+- zombie (x86-64): clippy in three configurations clean; the lib suite 2,637 passed, 0 failed.
+- TRust 78435d0 built against 34b3eefc (release; and with debug assertions): the three pages
+  complete and valid, each page's output the same as main's with the cycle off (bytes, sha256,
+  checksum), by default (dom-reconcile a cycle of 130 slices, Vue TodoMVC 112, event-loop none),
+  and with TRUST_JS_GC_VERIFY=1 under TRUST_JS_GC_INCREMENTAL=1 and force; the spike exits 0 in
+  each (release 1,758 slices in 8 cycles; debug under 1, 351; under force 957,236).
+
+The agent's record ("W6 step 6's default on, held on a pacing-on test: the external ledger's
+charges brought no slice"):
+
+Commits on main ea6fd916 (branch p2-w6-extfix2, worktree target/p2/w6-fix/wt):
+- 15c1d9ee W6: the external ledger's charges bring a cycle's slices
+- 78191080 Tests: the replaced-arrays test bounds its collections by the nursery's budget
+- 2a86b12b W6 step 6: incremental marking on by default again (e72e2168 re-applied; the same
+  patch-id)
+
+The engine's code at 2a86b12b is b8148f15's, the first head's (p2-w6-extfix): they differ in two
+comments and the arrays test. TRust's pages and the fat-LTO counts ran on b8148f15.
+
+THE FAILURE
+
+external_memory_tests::replaced_maps_are_collected_as_their_tables_grow, with pacing on and the
+cycle on (e72e2168): "48513024 external bytes still charged after 30 replaced Maps" (the bound is
+40 MB). It passes with the cycle off. It passed at d74d9c0b, where the cycle was off by default.
+
+WHERE THE 48.5 MB IS
+
+From the GC log (target/p2/w6-fix/extmem/maps-pacing-on.err, e72e2168, the test build):
+- The loop charges about 6 MB of tables to the ledger per Map, and allocates about 192 bytes of
+  cells.
+- A cycle is open at the loop's end. Its start is the log's last event, after a minor collection
+  that left 30.4 MB charged, past pacing's soft limit (the budget less the nursery's: 23.9 MB).
+- None of the run's four cycles ran a slice: each ended with slices=1, its start. Only cells
+  brought slices (one per 64 KiB), and each cycle allocated 576 to 1,152 bytes of cells.
+- The 48.5 MB is the Map being filled and the Maps replaced since the last major's sweep, which
+  left 15.2 MB charged. The minors freed none of them: each Map was live at a minor and was
+  promoted.
+
+The margin and pacing's budget:
+- The budget is 25.9 MB, pacing's (V8's) limit after the last major: the 15.4 MB it kept, cells
+  and ledger, plus V8's minimum step of 8 MiB, plus the nursery's 2 MiB (25,921,968 exactly).
+- The margin is min(max(budget / 2, 32 MB), (maximum - budget) / 2): 32 MB, V8's
+  kMarginForSmallHeaps.
+- The margin counts the cells (0.24 MB) and the bytes charged (cycle_overshot). The final pause
+  was due at 57.9 MB, 9.4 MB above the loop's end.
+
+With fixed budgets, the unit tests' default, the test passed by the loop's phase alone:
+- the cycles ran no slice either, and the minors saw up to 53.9 MB charged;
+- the loop happened to end just after a final pause.
+
+The bound in general, before the fix:
+- During a cycle, only the margin bounded the charges.
+- Payloads that charge the ledger: Map and Set tables, bound arguments, stack traces, internal
+  slots.
+- A program that allocates mostly such payloads kept its garbage until cells and charges passed
+  the budget plus the margin: at least 32 MB over the budget.
+- A program that stopped short of that kept its garbage until other allocation, or the host's
+  idle advances, finished the cycle.
+
+V8, IN CURRENT SOURCE
+
+v8/v8 41b0e42f (main, 2026-11-05; target/p2/w6-fix/v8-src), with 13.6 (Node v24.22.2's deps/v8)
+where it differs.
+
+The ledger's payloads are V8 heap objects:
+- A Map's or Set's table is an OrderedHashTable, a FixedArray (src/objects/ordered-hash-table.h:67;
+  the collection's table, js-collection.h:24-27). It grows by allocating a new table
+  (ordered-hash-table.cc:283-288).
+- A bound function's arguments are a FixedArray (js-function.h:63-81). A stack trace's frames and
+  internal slots are heap objects too.
+- An object larger than half a page (128 KB: globals.h:770, build_config.h:80) is a large object
+  of the old generation.
+
+Their allocation steps marking:
+- While marking, allocation observers step it every 64 KB of young allocation and every 256 KB of
+  old (src/heap/incremental-marking.cc:54-55, 91-96).
+- The observers watch every space, the large-object spaces among them (incremental-marking.cc:
+  319-320; heap-allocator.cc:386-400).
+- Each step marks the schedule's bytes within 5 ms (incremental-marking.cc:59-60, 723-745).
+- A large object's allocation checks the margin first: past it the allocation fails and the heap
+  collects, which finishes the cycle (large-spaces.cc:105-147; heap.cc:5490-5493).
+
+External memory proper (Heap::UpdateExternalMemory, heap.cc:6959-7012):
+- Its sources: ArrayBuffers and the embedders' ExternalMemoryAccounter (api.cc:12689-12697,
+  9935-9948).
+- It counts in the global size (heap.cc:5315-5318), so toward the global limit and the global
+  margin.
+- Every 128 KB of growth past the last check (heap-controller.h:219, heap-controller.cc:482-490):
+  - with no cycle running, the start check (StartIncrementalMarkingIfAllocationLimitIsReached,
+    heap.cc:1924-1962). Its limits (heap.cc:5592-5717): a soft limit, room below the old or global
+    limit no larger than the new space's capacity, schedules the marking task; a hard limit, no
+    room, starts marking now;
+  - with a cycle running and its large margin passed (AllocationLimitOvershotByLargeMargin,
+    heap.cc:5346-5377; the margins, heap-controller.h:158-187), a collection, which finishes it.
+- Before both, at the heap's limit (ReachedHeapLimit): collections with retries, the last
+  resort's (heap.cc:6993-6995, 1310-1345).
+- No marking step comes from external memory in current V8.
+
+The soft and hard limits:
+- Current source has no ReportExternalMemoryPressure.
+- Its successor in 13.6, Heap::HandleExternalMemoryInterrupt (heap.cc:1424-1475, called from
+  api.cc:9690-9716), had them:
+  - past the hard limit (the low since the last mark-compact plus half the maximum old
+    generation, heap.h:612-615): a full collection that reduces memory, finishing a running cycle;
+  - past the soft limit (that low plus 64 MB, heap.h:228, v8-internal.h:1014): start marking, or
+    with a cycle running AdvanceAndFinalizeIfNecessary, a marking step per 128 KB interrupt that
+    finishes a complete cycle.
+- 13.6's flag external_memory_accounted_in_global_limit (off there, flag-definitions.h:2251-2253)
+  is current main's only behaviour.
+- The limits are still defined (heap.cc:1371-1383), but nothing in heap.cc or api.cc reads them.
+  AdvanceAndFinalizeIfNecessary has no caller in the files read.
+
+The critical path:
+- A critical memory-pressure notification collects at once (CheckMemoryPressure,
+  CollectGarbageOnMemoryPressure: heap.cc:3977-4028), finishing a running cycle.
+- A moderate one starts marking only if none runs (heap.cc:3990-3996).
+
+The memory reducer neither advances nor finishes a running cycle:
+- Its timer may start a collection only while marking is stopped (memory-reducer.cc:84-87).
+- Otherwise it waits another delay (196-218), and a mark-compact restarts the wait (219-222).
+- The limit-based reducer returns while marking, and the mark-compact reschedules it (313-322).
+- It samples the external counter (64-67), but its low-rate test reads only the young, old and
+  embedder rates (heap.cc:3473-3503). The tables, being heap objects, count in those.
+
+ArrayBuffers with a running cycle:
+- Their backing stores are external memory as above (array-buffer-sweeper.cc:386, 397-400,
+  454-466): they count toward the global margin and step nothing.
+- While a cycle marks, no young collection runs for them (heap.cc:2834-2845).
+- A failed backing-store allocation collects with retries (heap.cc:2850-2853).
+
+TRUST JS AGAINST V8, AND THE FIX
+
+TRust JS's schedule let the ledger's bytes overshoot beyond V8's policy:
+- The ledger counted toward a cycle's margin (cycle_limit, as V8's large-margin check), but
+  brought no slice.
+- V8's allocation of the same payloads steps marking.
+- This is not a design fork: the fix does what V8 does.
+
+15c1d9ee: during a cycle, the bytes charged since the last slice count with the cells allocated
+since it toward the next slice (SLICE_BYTES, 64 KiB):
+- A charge past the ledger's slice_limit sets slice_due, and the poll words' heap bit, at once
+  (Control::charge_external).
+- The cells' threshold (cycle_slice_bytes) counts the charges a refresh saw. poll_due reads only
+  stored thresholds, so the heap bit stays its mirror.
+- Each part brings the slice by itself. Together, through the last refresh's thresholds, slices
+  come at most 2 x SLICE_BYTES apart.
+- The slice's budget (slice_bytes) counts the charges since the cycle's start with its cells
+  toward half the room before the margin. The bytes charged at the start take their part of the
+  room, as the margin counts them. The marking target stays the cells' bytes (marked_bytes).
+
+One step serves cells and charges: the cells' 64 KiB, V8's young step. V8 steps old and large
+allocations every 256 KB, so here a table larger than 128 KB brings slices about four times as
+often as in V8. This follows the cells' existing single step.
+
+After the fix, the new test's loop (below; Map by Map, the bytes charged after each):
+
+| sizing | most charged | at the end | collections | the last cycle's slices |
+| --- | --- | --- | --- | --- |
+| fixed budgets | 13.9 MB | 6.9 MB | 66 | 6 |
+| V8's (pacing) | 27.7 MB | 20.8 MB | 41-43 | 6-7 |
+
+The original test passes with pacing on, its cycles marking in 6 or 7 slices
+(target/p2/w6-fix/extmem/fix1).
+
+Its 40 MB is not a one-pause expectation. With the slices driven as V8 drives marking, it holds in
+both sizings with 12 to 26 MB to spare, so it stays.
+
+Here pacing's budget is the bytes a major keeps (7.3 MB), plus V8's minimum step of 8 MiB, plus the
+nursery's 2 MiB: 17.8 MB. The growing factor stays at its least, 1.1, because its allocation rate
+counts promoted cells, a few hundred bytes per minor. V8's factor reads its old generation's
+allocation rate (heap-controller.cc:245-252), and its global limit adds external memory at a factor
+of its own (307-314).
+
+Tests:
+- external_memory_tests.rs, replaced_maps_are_collected_as_their_tables_grow_while_cycles_mark:
+  - the loop with the cycle on (IncrementalMode::On), with fixed budgets and with V8's sizing;
+  - one eval per Map, and after each, under 40 MB charged;
+  - at least 10 collections, and the last cycle ran more slices than its start.
+  - Without the fix: "48513024 external bytes still charged after 18 replaced Maps" with fixed
+    budgets, and after 13 with V8's sizing.
+- gc_core.rs:
+  - a_cycles_external_charges_bring_its_slices: charges alone, a release, a slice's reset, cells
+    and charges together;
+  - a_slice_asks_the_bytes_behind_its_schedule_for_the_charges_too.
+  - external_charges_past_the_margin_make_a_cycles_final_pause_due now expects a slice for a
+    charge within the margin.
+
+THE ARRAYS TEST (78191080, as approved)
+
+replaced_arrays_are_collected_as_their_elements_grow pins the cycle off, so it does not depend on
+W6:
+- It failed with pacing on, here and on main: 8a9dc747, and the tier 1 landing gate's eed7110f.
+- Its pattern 1 ran 8 collections against its bound of 10.
+
+Each pattern on the release CLI (e72e2168, TRUST_JS_GC_INCREMENTAL=0;
+target/p2/w6-fix/extmem/arrays):
+
+| pattern | fixed budgets: collections, most held | V8's sizing: collections, most held |
+| --- | --- | --- |
+| 40 x new Array(100000).fill(i) | 14, 9.0 MB | 8, 6.6 MB |
+| 40 chained map over 100,000 | 51, 9.1 MB | 11, 15.4 MB |
+| 400 arrays grown by push to 10,000 | 62, 8.4 MB | 32, 7.4 MB |
+
+- ">= 10 collections" was a fixed-budget expectation. A fixed 2 MiB nursery collects about every
+  2 MB of elements.
+- Under V8's sizing the nursery grows from 2 MiB toward 32 MiB, since each minor finds the live
+  array's 800 KB surviving. Pattern 1 collects about every 4 MB.
+- "held < 48 MB" holds in both sizings: the replaced arrays do not pile up. That is the property.
+
+The test now:
+- runs each pattern in four evaluations and samples the nursery's budget between them;
+- asks at least 32 MB / (the largest budget + 800 KB) - 1 collections. At most a budget and an
+  array are allocated between two collections, before the first and after the last. That is 10
+  with the fixed 2 MiB nursery, as before;
+- keeps "held < 48 MB".
+
+The test's engine (collections; the largest nursery; the bound; cells held at the end):
+
+| pattern | fixed budgets | V8's sizing |
+| --- | --- | --- |
+| fill | 14; 2 MiB; 10; 2.6 MB | 8; 4 MiB; 5; 7.4 MB |
+| map | 51; 2 MiB; 10; 6.7 MB | 12; 16 MiB; 0; 21.9 MB |
+| push | 62; 2 MiB; 10; 6.4 MB | 33; 8 MiB; 2; 8.7 MB |
+
+Under V8's sizing the map pattern's bound is empty: its nursery reaches 16 MiB, half its elements.
+A regression that stopped counting elements would still fail the fill and push patterns (bounds
+5 and 2), and all three with fixed budgets.
+
+OBSERVATIONS (not changed)
+
+- The memory reducer. Engine::run_memory_reducer's can_start ignores a running cycle:
+  - with one running, the reducer's start (Run) takes that cycle as its collection, because
+    gc_start_cycle_for_host returns true when one runs;
+  - that cycle's final pause then reduces memory.
+  - V8's reducer waits instead (above). Passing can_start && !cycle_running would match it.
+- ArrayBuffer data (BufferPressure) is outside a cycle's margin, which counts the cells and the
+  ledger:
+  - 64 MiB of new buffer data since the last major asks a major collection;
+  - with a cycle running, that is its final pause at once.
+  - V8 counts the buffers in the global size, toward the global margin.
+- Two more of pacing's inputs see cells only: the memory reducer's low-rate test (Pacing::sample)
+  and the growing factor's old-generation allocation rate. In V8 the ledger's payloads are heap
+  allocation, so both count them. A program that allocates mostly such payloads looks quiet to
+  both here. The same question as the slices': a design question for later.
+
+The coordinator's dispositions: the memory reducer waiting while a cycle marks, as V8's does,
+goes to the phase-end follow-ups; the ledger in pacing's growth factor and low-rate test is a
+design question for later; the ArrayBuffer data outside the cycle's margin is noted.
+
+MEASURED
+
+Fat LTO, instructions:u, one run each on CPUs 10-13 (Cortex-A725), TRUST_JS_GC_PACING=0
+(counts.sh's setting; target/p2/w6-fix/ext/counts). The runs were taken at a load of 30-45. With
+the cycle on, a count can move with timing: a slice stops at 1 ms, and the schedule has a term by
+time. Each engine ran through the same script and invocation. Engines:
+- 98beff0c: main ea6fd916 with default on and no fix (e72e2168 re-applied);
+- b8148f15: the fix with default on, 2a86b12b's engine code;
+- main ea6fd916: the cycle off by default.
+
+The fix's own cost (98beff0c against b8148f15), Map/Set-heavy workloads first. The micros are
+target/p2/w6-fix/ext/micro: the replaced-Maps loop of the test (m-maps), the same with Sets
+(m-sets), and 300,000 small Maps and Sets, 2,000 kept at a time (m-small). "-off" runs them with
+TRUST_JS_GC_INCREMENTAL=0.
+
+| workload | no fix | fix | change |
+| --- | ---: | ---: | ---: |
+| m-maps | 2,380,173,985 | 2,513,404,551 | +5.60% |
+| m-sets | 2,487,776,748 | 2,621,932,552 | +5.39% |
+| m-small | 5,891,205,500 | 5,894,059,291 | +0.05% |
+| m-maps-off | 2,496,740,980 | 2,460,793,581 | -1.44% |
+| m-sets-off | 2,604,305,791 | 2,568,399,093 | -1.38% |
+| m-small-off | 5,888,757,111 | 5,891,265,228 | +0.04% |
+| Vue | 1,394,899,988 | 1,395,239,724 | +0.02% |
+| chai | 72,556,732,891 | 72,570,408,854 | +0.02% |
+| React | 291,867,716 | 291,872,656 | +0.00% |
+| Djot | 588,698,312 | 588,761,910 | +0.01% |
+| PdfJS | 6,883,730,620 | 6,876,092,589 | -0.11% |
+| TypeScript | 56,761,207,764 | 56,740,471,072 | -0.04% |
+| sustained allocation and the other 13 of Octane | | | within +-0.02% |
+
+- m-maps and m-sets repeat: three more runs of each engine on the quiet machine (CPUs 0-3, also
+  Cortex-A725) came within 0.001% of the table's counts.
+- m-maps and m-sets: the fix collects as main does. The CLI's GC log, with the same setting:
+
+| engine | majors | cycles | slices | minors | most charged at a collection |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| main ea6fd916 (off) | 28 | 0 | 0 | 58 | 9.6 MB |
+| no fix | 4 | 4 | 0 | 15 | 26.1 MB |
+| fix | 27 | 27 | 108 | 57 | 13.9 MB |
+
+  The +5.6% is the work of those collections: without the fix, the cycles waited for their margin
+  and collected 4 times. Against main the fix runs m-maps and m-sets in 0.67% and 0.68% more
+  instructions.
+- Off, the -1.4% is code, not work: the same collections, the GC logs equal but for times.
+  - Fat LTO now inlines ExternalCharge::settle into OrderedCollection::insert.
+  - In the no-fix binary, settle was a function of its own: 1.8% of the run's instructions
+    (perf, instructions:u samples).
+- The charge path itself runs only when a table's bytes change (ExternalCharge::settle returns
+  early otherwise): one compare more there, and nothing while no cycle runs.
+- The Web Tooling Benchmark: its CLI bundle, 18 tools, 20 samples each (deterministic in its
+  work, its suite.js:8-16). The first pair, under load: no fix 3,126.26G, fix 3,132.98G, +0.21%.
+  Two more pairs on the quiet machine (ext/wtb-rerun):
+
+| engine | runs | median | spread |
+| --- | --- | --- | --- |
+| main ea6fd916 (the cycle off) | 3,127.23G, 3,137.26G, 3,129.88G | 3,129.88G | 0.32% |
+| no fix | 3,126.26G, 3,130.98G, 3,127.91G | 3,127.91G | 0.15% |
+| fix | 3,132.98G, 3,127.02G, 3,129.70G | 3,129.70G | 0.19% |
+
+  - The fix's median is +0.06% against the no-fix build's and -0.01% against main's: within each
+    engine's own spread.
+  - The first pair's +0.21% was that spread. A perf record pair, a fourth run, counted the fix
+    -0.19%.
+  - The spread is not the cycle's: main, with the cycle off, varies the most (0.32%).
+
+The Web Tooling Benchmark's GC logs, both engines, pacing off as for the counts (ext/wtb-gclog,
+heapstats.py):
+
+| over the whole run | no fix | fix |
+| --- | --- | --- |
+| collections | 35,978: 90 majors (all cycles), 35,888 minors | 35,962: 89 majors, 35,873 minors |
+| slices | 17,954 | 18,083 |
+| bytes at the collections: median, p90, peak | 499.4, 730.8, 1,652.5 MB | 482.8, 684.0, 1,533.9 MB |
+| pages at the collections: median, p90, peak | 9,098, 13,037, 24,878 | 8,281, 12,154, 23,195 |
+| a major's live bytes after: median (peak) | 297.0 (834.0) MB | 309.6 (773.0) MB |
+| the ledger's bytes at the collections: median (peak) | 0.4 (26.8) MB | 0.4 (28.1) MB |
+
+- The last minor's 677.9 MB against 471.0 MB is where each run stopped in its cycle:
+  - both last majors kept 341 MB (341.9 and 340.6 MB, budgets 695.0 and 690.4 MB);
+  - the fix's run ended 1,949 minors after its last major, the no-fix run's 722 after.
+- Over the whole run the fix's heap is the smaller one: 3% at the median collection, 7% at the
+  peak, and 9% fewer pages at the median.
+- The ledger is a small part of this heap: 0.4 MB charged at the median collection. So the fix
+  moves the schedule little: 128 more slices (0.7%), one major fewer.
+- So the first pair's +0.21% came from neither a larger heap nor more collections. Repeated, it is
+  +0.06%, within the runs' spread (above).
+
+Default on, as it lands on today's main (main ea6fd916 against b8148f15), the 19 and sustained
+allocation:
+
+| workload | main ea6fd916 | 2a86b12b's engine | change |
+| --- | ---: | ---: | ---: |
+| Splay | 1,365,047,731 | 1,153,931,429 | -15.47% |
+| TypeScript | 57,661,613,517 | 56,740,471,072 | -1.60% |
+| sustained allocation | 1,749,725,605 | 1,722,933,817 | -1.53% |
+| EarleyBoyer | 3,088,444,112 | 3,048,909,501 | -1.28% |
+| PdfJS | 6,866,409,634 | 6,876,092,589 | +0.14% |
+| Vue | 1,394,615,122 | 1,395,239,724 | +0.04% |
+| the other 14 | | | within +-0.02% |
+
+- W6's step 6, against e50f5725: Splay -16.28%, TypeScript -1.47%, EarleyBoyer -1.36%, PdfJS
+  +0.37%, Gameboy +0.12%. Gameboy is now +0.01%.
+- The micros against main: m-maps +0.67%, m-sets +0.68%, m-small +0.09%.
+
+Sustained allocation's slices with the cycle on, as in W6's exit table: fat LTO,
+TRUST_JS_GC_LOG=1, TRUST_JS_GC_INCREMENTAL=1, the CLI's pacing, CPU 5 under the hold on a quiet
+machine (load 0.9), 10 runs each, interleaved (ext/sa-slices.sh, sa-slices.py; ext/runs/sa-*):
+
+| engine | slices a run | largest but the start's, median (max) | slices > 1.05 ms | p99 | final pause, median (max) | start, median (max) |
+| --- | --- | --- | --- | --- | --- | --- |
+| no fix (98beff0c) | 141-142 | 1.05 (1.07) ms | 7 | 1.00 ms | 1.16 (1.27) ms | 0.26 (0.27) ms |
+| fix (b8148f15) | 141-142 | 1.03 (1.06) ms | 4 | 1.00 ms | 1.13 (1.29) ms | 0.22 (0.28) ms |
+
+- Sustained allocation charges the ledger nothing: external=0 at every collection. Its slices and
+  final pause are the same with the fix, within the runs' spread.
+- W6's step 6 measured 1.03 (1.05) ms and a final pause of 1.03 ms on 3d6d4f60.
+
+TRUST'S PAGES AND SPIKE WITH THE CYCLE ON
+
+TRust 78435d0 built against b8148f15 by its path dependency: the release build dir and the
+debug-assertions build dir of the crash fix's checks, rebuilt in place (rebuild-trust.sh). One page
+per run (--warmups 0 --samples 1), under load. No timing claims. (target/p2/w6-fix/ext/pages,
+trust-checks.sh)
+
+| build | dom-reconcile | Vue TodoMVC | event-loop | spike |
+| --- | --- | --- | --- | --- |
+| release, on by default, no environment | valid (a cycle of 130 slices) | valid (113 slices) | valid (no cycle: below 8 MiB) | exit 0: 1,675 slices, 8 cycles among 10 majors |
+| debug assertions, TRUST_JS_GC_INCREMENTAL=1, TRUST_JS_GC_VERIFY=1 | valid (60 slices) | valid (60) | valid (61) | exit 0: 360 slices, 6 cycles among 8 majors |
+| debug assertions, TRUST_JS_GC_INCREMENTAL=force, TRUST_JS_GC_VERIFY=1 | valid (17,700 slices) | valid (17,657) | valid (17,602) | exit 0 in 743 s: 934,641 slices, 10 cycles among 12 majors |
+
+- Each page's JSON matches main's with the cycle off (the crash fix's mainoff-*.json): the same
+  output bytes, sha256 and replay checksum.
+- The spike ends at the same 18,899 live objects.
+- e72e2168's release build, before this fix, ran 132 and 112 slices on the two pages, and the
+  spike 2,082 slices in 9 cycles among 11 majors.
+
+GATE
+
+On 2a86b12b, the final head, unless noted (target/p2/w6-fix/ext):
+- fmt, and clippy in five configurations plus the workspace: clean.
+- lib (embed), on by default: 2,854 passed, 1 failed (main eed7110f's 2,852 tests and the 3 new):
+  gc_pacing_tests::the_nursery_grows_while_new_objects_survive, under a load of 30-45. Rerun alone
+  on the gate's test binary, under the same load, it passed 3 times of 3 (103-133 s).
+  - The test asks pacing's nursery to grow while 400,000 objects survive, but the nursery
+    returns to its least below V8's low allocation throughput (1 MB/s, Pacing::resize_nursery).
+    At this load the debug build's allocation can fall below that.
+  - The program charges the ledger nothing, so the fix leaves its schedule as it was.
+- lib with pacing on: 2,855 passed, 0 failed. The phase's pacing-on runs now have no known
+  failure.
+- lib under TRUST_JS_GC_INCREMENTAL=force (the unit tests verify every collection): 2,855 passed,
+  0 failed, in 1,277 s, under load.
+- STAGES="rel fixtures difftest t262" against the tier 1 landing gate (land-t1/gate-eed7110f, main's
+  code; ext/gate-2a86b12b.txt):
+  - Vue, React and Djot give the same masked output as the base;
+  - difftest: 138 agree, 12 skipped (budget), seeds 7..157;
+  - Test262 at jit threshold 8: 53,575/53,575, identical to the base's report.
+- Test262's step subset (paths-s2.txt) under force with heap verification at small budgets
+  (STRESS=0 TRUST_JS_GC_NURSERY_BYTES=0 TRUST_JS_GC_MIN_HEAP_BYTES=1 TRUST_JS_GC_PACING=0), on a
+  dev-profile runner: 2,603/2,603 in the default tier (86 s), and 2,603/2,603 at jit threshold 0
+  (186 s).
+- zombie (x86-64), on b8148f15 and on 2a86b12b: clippy in three configurations clean; lib 2,630
+  passed, 0 failed.
