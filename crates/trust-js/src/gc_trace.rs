@@ -504,6 +504,7 @@ impl GcTrace for crate::interpreter::RealmState {
             array_proto,
             array_ctor,
             string_proto,
+            string_proto_fuse: _,
             number_proto,
             boolean_proto,
             symbol_proto,

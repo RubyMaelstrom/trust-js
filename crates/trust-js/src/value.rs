@@ -9832,6 +9832,68 @@ impl Props {
         self.set_proto_flag(true);
     }
 
+    /// A marked prototype wrote the value of its named property at `slot`: report it to the
+    /// object's fuse, if it has one (`crate::object_fuse`). Out of line, as the other reports
+    /// are, so that the write paths keep one flag test.
+    #[cold]
+    #[inline(never)]
+    fn note_fused_value_write(&self, slot: usize) {
+        if self
+            .entries
+            .keys()
+            .get(slot)
+            .is_some_and(|key| key.as_index().is_none())
+        {
+            crate::object_fuse::note_value_change(self as *const Self as usize, slot);
+        }
+    }
+
+    /// A marked prototype removes its named property at `slot`.
+    #[cold]
+    #[inline(never)]
+    fn note_fused_remove(&self, slot: usize) {
+        crate::object_fuse::note_remove(self as *const Self as usize, slot);
+    }
+
+    /// A marked prototype removes every property (`Props::clear`, which only tests call).
+    #[cfg(test)]
+    #[cold]
+    #[inline(never)]
+    fn note_fused_clear(&self) {
+        crate::object_fuse::note_clear(self as *const Self as usize);
+    }
+
+    /// A marked prototype's named property at `slot` is redefined as `next`: report it to the
+    /// object's fuse, if it has one (`crate::object_fuse`), with whether the define changed
+    /// nothing (SpiderMonkey's DefinePropertyIsRedundant) and whether it kept the value (or the
+    /// accessors) and changed only attributes.
+    #[cold]
+    #[inline(never)]
+    fn note_fused_redefine(&self, slot: usize, next: &Property) {
+        let Some(old) = self.property_at(slot) else {
+            return;
+        };
+        let same_value = match (old.accessor(), next.accessor()) {
+            (false, false) => crate::builtins::same_value_pub(&old.value(), &next.value()),
+            (true, true) => {
+                let same = |a: Option<&Value>, b: Option<&Value>| match (a, b) {
+                    (Some(a), Some(b)) => crate::builtins::same_value_pub(a, b),
+                    (None, None) => true,
+                    _ => false,
+                };
+                same(old.getter(), next.getter()) && same(old.setter(), next.setter())
+            }
+            _ => false,
+        };
+        let redundant = same_value && old.attrs() == next.attrs();
+        crate::object_fuse::note_redefine(
+            self as *const Self as usize,
+            slot,
+            redundant,
+            same_value,
+        );
+    }
+
     /// Bump the creation-IC epoch if this object is a marked prototype (called by every
     /// structural mutation), and fire the dependency registry's sets on it (W4 step 10).
     #[inline]
@@ -10523,6 +10585,9 @@ impl Props {
         }
         match self.find_text(text) {
             Some(i) => {
+                if self.proto_flag() {
+                    self.note_fused_value_write(i);
+                }
                 self.entries.slot(i).set_value(v);
                 true
             }
@@ -10534,6 +10599,9 @@ impl Props {
     /// writable data descriptor there.
     pub(crate) fn set_value_at(&mut self, slot: usize, v: Value) -> bool {
         if slot < self.entries.len() {
+            if self.proto_flag() {
+                self.note_fused_value_write(slot);
+            }
             self.entries.slot(slot).set_value(v);
             true
         } else {
@@ -10690,6 +10758,9 @@ impl Props {
     #[cfg(test)]
     pub(crate) fn clear(&mut self) {
         self.note_structural();
+        if self.proto_flag() {
+            self.note_fused_clear();
+        }
         self.entries.clear();
         self.elems.clear();
         self.entries.len_slot.set(SlotMemo::NONE);
@@ -10845,6 +10916,9 @@ impl Props {
             self.set_has_far(true);
         }
         if let Some(i) = self.find(key) {
+            if self.proto_flag() && key.as_index().is_none() {
+                self.note_fused_redefine(i, &prop);
+            }
             // A whole-descriptor replacement that changes the key's attributes cannot stay on a
             // shape that records the old ones: it takes the attribute-change transition (W2d
             // step 2). Array element entries are exempt exactly as in `remove` — their shape
@@ -10978,6 +11052,10 @@ impl Props {
         // An index key found in the named entries is one `has_far` records (see `find`).
         let removed_far = key.as_index().is_some();
         self.note_structural();
+        // An index key is no fused property, but the later slots move down all the same.
+        if self.proto_flag() {
+            self.note_fused_remove(i);
+        }
         self.entries.remove(i);
         // Slots shifted — deopt to a fresh shape id (see remove_indices_from). Array maps skip
         // this for ELEMENT keys: their shape tracks named keys only, and array entry slots are

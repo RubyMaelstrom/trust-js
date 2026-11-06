@@ -195,6 +195,11 @@ mod native_typed_array;
 mod numbering;
 #[cfg(test)]
 mod object_alloc_bench;
+/// The ObjectFuse (Djot's gap, candidate 4): the properties generated code may treat as constant,
+/// String.prototype's methods first.
+mod object_fuse;
+#[cfg(test)]
+mod object_fuse_tests;
 #[cfg(test)]
 mod object_literal_jit_tests;
 mod ordered_collection;

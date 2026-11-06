@@ -2237,12 +2237,18 @@ fn set_integrity_level(i: &mut Interp, obj: &Value, freeze: bool) -> Result<bool
         let ok = if let Some((t, h)) = &proxy {
             ab(proxy_define_property_record(i, t, h, &key, &desc))?
         } else {
-            ab(define_own_property_partial(
-                i,
-                &obj.as_obj().unwrap(),
-                &key,
-                &desc,
-            ))?
+            // Freezing and sealing change attributes only, which leaves a fused object's
+            // constant properties as they were (SpiderMonkey's freezeOrSealProperties; see
+            // `crate::object_fuse`): a define that changes only attributes is a flags change
+            // here, not a value change as Object.defineProperty's is.
+            let object = obj.as_obj().unwrap();
+            let props = {
+                let body = object.borrow();
+                &body.props as *const _ as usize
+            };
+            ab(crate::object_fuse::with_flags_only(props, || {
+                define_own_property_partial(i, &object, &key, &desc)
+            }))?
         };
         if !ok {
             return Err(i.make_error("TypeError", "could not set the object's integrity level"));

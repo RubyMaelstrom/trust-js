@@ -2262,6 +2262,8 @@ impl Interp {
             array_proto,
             array_ctor,
             string_proto,
+            string_proto_fuse: _,
+            string_proto_fuse_ptr: _,
             number_proto,
             boolean_proto,
             symbol_proto,

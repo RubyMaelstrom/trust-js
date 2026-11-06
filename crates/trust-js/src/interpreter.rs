@@ -4565,6 +4565,9 @@ pub(crate) struct InterpLayout {
     /// `string_proto` (a `Gc`: one stored cell address): the GetMethod template resolves
     /// string-primitive receivers against the ACTIVE realm's String.prototype through this.
     pub string_proto: usize,
+    /// `string_proto_fuse_ptr`: the active Realm's String.prototype fuse, which the fused
+    /// String method steps test (`crate::object_fuse`).
+    pub string_proto_fuse: usize,
     /// `number_proto` / `boolean_proto`: Number/Boolean-primitive receivers in the
     /// non-consuming property-load forms resolve against the ACTIVE realm's wrapper
     /// prototypes through these (both fields are realm-swapped with `string_proto`).
@@ -4647,6 +4650,7 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         fp_len_word: fp.1,
         fp_cap_word: fp.2,
         string_proto: off(&i.string_proto as *const _ as usize),
+        string_proto_fuse: off(&i.string_proto_fuse_ptr as *const _ as usize),
         number_proto: off(&i.number_proto as *const _ as usize),
         boolean_proto: off(&i.boolean_proto as *const _ as usize),
         function_proto: off(&i.function_proto as *const _ as usize),
@@ -4692,6 +4696,12 @@ pub struct Interp {
     /// properties so cross-realm fast paths can prove the constructor's actual realm identity.
     pub(crate) array_ctor: Option<Gc>,
     pub(crate) string_proto: Gc,
+    /// The active Realm's String.prototype fuse (`crate::object_fuse`), swapped with
+    /// `string_proto`; `string_proto_fuse_ptr` is its address, which generated code reads
+    /// through ctx.interp (`InterpLayout::string_proto_fuse`). `None` (and 0) while the Realm's
+    /// built-ins are being installed.
+    pub(crate) string_proto_fuse: Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>,
+    pub(crate) string_proto_fuse_ptr: usize,
     pub(crate) number_proto: Gc,
     pub(crate) boolean_proto: Gc,
     pub(crate) symbol_proto: Gc,
@@ -5167,6 +5177,8 @@ interp_memory_inventory! {
     array_proto => "measured",
     array_ctor => "measured",
     string_proto => "measured",
+    string_proto_fuse => "external",
+    string_proto_fuse_ptr => "non_owning",
     number_proto => "measured",
     boolean_proto => "measured",
     symbol_proto => "measured",
@@ -5317,7 +5329,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 140);
+    assert_eq!(names.len(), 142);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6095,6 +6107,7 @@ pub struct RealmState {
     pub array_proto: Gc,
     pub array_ctor: Option<Gc>,
     pub string_proto: Gc,
+    pub(crate) string_proto_fuse: Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>,
     pub number_proto: Gc,
     pub boolean_proto: Gc,
     pub symbol_proto: Gc,
@@ -6152,6 +6165,7 @@ impl Interp {
             array_proto: self.array_proto,
             array_ctor: self.array_ctor,
             string_proto: self.string_proto,
+            string_proto_fuse: self.string_proto_fuse.clone(),
             number_proto: self.number_proto,
             boolean_proto: self.boolean_proto,
             symbol_proto: self.symbol_proto,
@@ -6172,6 +6186,7 @@ impl Interp {
         self.array_proto = r.array_proto;
         self.array_ctor = r.array_ctor;
         self.string_proto = r.string_proto;
+        self.set_string_proto_fuse(r.string_proto_fuse.clone());
         self.number_proto = r.number_proto;
         self.boolean_proto = r.boolean_proto;
         self.symbol_proto = r.symbol_proto;
@@ -6200,6 +6215,9 @@ impl Interp {
         std::mem::swap(&mut self.array_proto, &mut saved.array_proto);
         std::mem::swap(&mut self.array_ctor, &mut saved.array_ctor);
         std::mem::swap(&mut self.string_proto, &mut saved.string_proto);
+        let fuse = saved.string_proto_fuse.take();
+        saved.string_proto_fuse = self.string_proto_fuse.take();
+        self.set_string_proto_fuse(fuse);
         std::mem::swap(&mut self.number_proto, &mut saved.number_proto);
         std::mem::swap(&mut self.boolean_proto, &mut saved.boolean_proto);
         std::mem::swap(&mut self.symbol_proto, &mut saved.symbol_proto);
@@ -6405,7 +6423,9 @@ impl Interp {
         self.error_protos = Default::default();
         self.extra_protos = Default::default();
         self.eval_fn = None;
+        self.set_string_proto_fuse(None);
         crate::builtins::install(self);
+        self.install_string_proto_fuse();
         // Top-level `this` is the new global.
         let g = Value::Obj(self.global);
         self.global_env
@@ -6496,6 +6516,33 @@ impl Interp {
     }
 }
 
+impl Interp {
+    /// Make the active Realm's String.prototype fuse (`crate::object_fuse`), once its built-ins
+    /// are installed: the prototype is marked, so that its map reports its writes, and the fuse
+    /// is registered by that map's address.
+    pub(crate) fn install_string_proto_fuse(&mut self) {
+        let proto = self.string_proto;
+        let fuse = {
+            let body = proto.borrow();
+            body.props.mark_proto();
+            crate::object_fuse::ObjectFuse::new_registered(&body.props as *const _ as usize)
+        };
+        self.set_string_proto_fuse(Some(fuse));
+    }
+
+    /// Install `fuse` as the active Realm's String.prototype fuse, and its address for generated
+    /// code.
+    pub(crate) fn set_string_proto_fuse(
+        &mut self,
+        fuse: Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>,
+    ) {
+        self.string_proto_fuse_ptr = fuse
+            .as_ref()
+            .map_or(0, |fuse| std::sync::Arc::as_ptr(fuse) as usize);
+        self.string_proto_fuse = fuse;
+    }
+}
+
 impl RealmState {
     pub(crate) fn snapshot_clone(&self) -> RealmState {
         RealmState {
@@ -6508,6 +6555,7 @@ impl RealmState {
             array_proto: self.array_proto,
             array_ctor: self.array_ctor,
             string_proto: self.string_proto,
+            string_proto_fuse: self.string_proto_fuse.clone(),
             number_proto: self.number_proto,
             boolean_proto: self.boolean_proto,
             symbol_proto: self.symbol_proto,
@@ -6876,6 +6924,8 @@ impl Interp {
             array_proto,
             array_ctor: None,
             string_proto,
+            string_proto_fuse: None,
+            string_proto_fuse_ptr: 0,
             number_proto,
             boolean_proto,
             symbol_proto,
@@ -7021,6 +7071,7 @@ impl Interp {
             },
         };
         crate::builtins::install(&mut interp);
+        interp.install_string_proto_fuse();
         // `this` at the top level is the global object (sloppy mode).
         let g = Value::Obj(interp.global);
         interp
@@ -13955,6 +14006,8 @@ impl Interp {
             array_proto: _,
             array_ctor: _,
             string_proto: _,
+            string_proto_fuse: _,
+            string_proto_fuse_ptr: _,
             number_proto: _,
             boolean_proto: _,
             symbol_proto: _,
