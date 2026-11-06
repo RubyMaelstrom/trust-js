@@ -85,8 +85,10 @@ const LEAF: &str = r#"
 ))]
 fn a_callers_way_picks_up_its_callees_new_code_and_no_other_site_refills() {
     // CALL_IC_EPOCH is process-wide: a test beside this one that drops a function's runtime or
-    // reclaims code moves it, and every way refills. Check a run that ended at its start's epoch.
+    // reclaims code moves it, and every way refills. Check a run that ended at its start's epoch,
+    // read before the setup fills the bystander's way.
     for attempt in 0..200 {
+        let start = CALL_IC_EPOCH.load(Relaxed);
         let mut engine = engine();
         eval(&mut engine, LEAF);
         let i = &mut *engine.interp;
@@ -99,7 +101,6 @@ fn a_callers_way_picks_up_its_callees_new_code_and_no_other_site_refills() {
         let caller_chunk = stages(&caller).0;
         let bystander_chunk = stages(&bystander).0;
         let before = way(&bystander_chunk, other_key).expect("bystander's way");
-        let start = CALL_IC_EPOCH.load(Relaxed);
         // leaf's checkpoint (`inline_recompile_at` runs) publishes its second stage, which
         // splices sq; the caller's later calls take it.
         let mut runs = 0;
@@ -337,16 +338,26 @@ fn a_megamorphic_site_keeps_its_overflow_entries() {
         eval(&mut engine, "wide(240)");
         runs += 1;
     }
-    for _ in 0..4 {
-        eval(&mut engine, "wide(240)");
-    }
+    // CALL_IC_EPOCH is process-wide: a test running beside this one that recompiles a chunk or
+    // drops its runtime moves it, which stales every way and overflow entry until calls refill
+    // them. The entries are checked as runs that ended at the epoch they started at left them.
+    let mut attempts = 0;
+    let epoch = loop {
+        let epoch = CALL_IC_EPOCH.load(Relaxed);
+        for _ in 0..4 {
+            eval(&mut engine, "wide(240)");
+        }
+        attempts += 1;
+        if CALL_IC_EPOCH.load(Relaxed) == epoch || attempts == 200 {
+            break epoch;
+        }
+    };
     let (_, wide) = function(&mut engine.interp, "wide");
     let chunk = stages(&wide).0;
     let site = (0..chunk.call_caches.len())
         .find(|&site| chunk.call_caches[site].megamorphic())
         .expect("wide's megamorphic site");
     let genv = Env::as_ptr(&engine.interp.global_env) as usize;
-    let epoch = CALL_IC_EPOCH.load(Relaxed);
     let mut in_overflow = 0;
     for (q, (key, func)) in callees.iter().enumerate() {
         let (first, second) = stages(func);
