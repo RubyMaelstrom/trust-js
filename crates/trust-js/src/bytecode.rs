@@ -28494,9 +28494,6 @@ fn jit_propstat(
 pub(crate) fn jit_callstat_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        if std::env::var("TRUST_JS_JIT_CALLSTAT").as_deref() == Ok("2") {
-            CALL_PATHS_ON.store(true, std::sync::atomic::Ordering::Relaxed);
-        }
         std::env::var_os("TRUST_JS_JIT_CALLSTAT").is_some()
             || std::env::var_os("TRUST_JS_JIT_NATIVESTAT").is_some()
     })
@@ -28546,15 +28543,19 @@ const CALL_PATH_NAMES: [&str; 8] = [
 /// The [`CallPath`] counts, global so that generated code can count the direct sequence.
 pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 8] =
     [const { std::sync::atomic::AtomicU64::new(0) }; 8];
-static CALL_PATHS_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether `TRUST_JS_JIT_CALLSTAT=2` counts call paths (set as the JIT reads its switches).
-/// Only builds with the `architecture-diagnostics` feature count them: elsewhere this is a
-/// constant false, and the call paths' counting folds away.
+/// Whether `TRUST_JS_JIT_CALLSTAT=2` counts call paths. Only builds with the
+/// `architecture-diagnostics` feature count them: elsewhere this is a constant false, and the
+/// call paths' counting folds away. The switch is read at its first use, which may be the first
+/// emission: the shared stubs that the process's first compile assembles, before any JIT entry
+/// reads [`jit_callstat_enabled`], count their direct sequences too.
 #[inline(always)]
 pub(crate) fn call_paths_enabled() -> bool {
-    cfg!(feature = "architecture-diagnostics")
-        && CALL_PATHS_ON.load(std::sync::atomic::Ordering::Relaxed)
+    if !cfg!(feature = "architecture-diagnostics") {
+        return false;
+    }
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("TRUST_JS_JIT_CALLSTAT").as_deref() == Ok("2"))
 }
 
 /// Count one call by `path` (see [`CallPath`]); prints the counts as the thread exits.
