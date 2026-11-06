@@ -18181,3 +18181,153 @@ against main (zlib's +0.30%, one hot function that never gets a second stage, re
 as a small cost in a net-improving step; C3 would give its spans back); then (b) second stages
 emitting regions only where the code ran; (c), loops by back edges with OSR, after A2 (the owner's
 decision on the per-callee pickup pending).
+
+### Incremental marking's crash on TRust's pages: a cycle's start dropped the weak collections it discovered (record, 2026-11-06)
+
+Landed: 29b02714 as ab116a1b on main de3a6b56, the fix and its tests (the cycle stays off by
+default, 75f875b0). Held: e72e2168 (on by default again, re-applying b327786b), on one of its
+gate's pacing-on failures (below, GATE): with pacing on, the configuration every embedder runs,
+replaced_maps_are_collected_as_their_tables_grow fails with the cycle on (48,513,024 external
+bytes still charged after 30 replaced Maps, against the test's 40 MB) and passes with it off
+(the gate's own test binary with TRUST_JS_GC_INCREMENTAL=0). It passed with pacing on at
+d74d9c0b (gates/val-d74d9c0b), and its first failure with pacing on is on a default-on tree
+(81705a97, Djot step 1's gate). W6's stage-end list never ran the lib suite with pacing on. Where
+those bytes are, what bounds a cycle's overshoot of external bytes, and what V8 does with external
+memory while it marks come before default-on.
+
+Commits (branch p2-w6-incfix on main c26544b5, worktree target/p2/w6-fix/wt):
+- 29b02714 W6: a cycle's start registers the weak collections it discovered (main ab116a1b)
+- e72e2168 W6 step 6: incremental marking on by default again (re-applies b327786b; held)
+
+THE CRASH
+
+With incremental marking on, TRust 78435d0's replays crashed two of three pages on main
+(the compact agent's runs; target/p2/compact/census/pages/main7dc-*.err). Reproduced with the
+pure-main replay (target/p2/w6-fix/repro):
+- dom-reconcile panics in jit_call ("a live weak target belongs to a known Agent heap", value.rs:5455).
+  With TRUST_JS_GC_LOG=1 the same run instead throws "row.classList.toggle is not a function".
+- Vue TodoMVC segfaults (the compact agent's run) or panics in Props::slot_of_key (an index of
+  4.0e18 in an empty map: mine), reading a freed object's properties.
+- event-loop runs: in a release build its heap stays below the cycle's 8 MiB, so no cycle starts.
+  A debug build runs one there, and it fails as the others do.
+- All three run with TRUST_JS_GC_INCREMENTAL=0.
+- It is not the JIT: the tree-walker fails too (TRUST_JS_TIER=interp: "cannot set property 'key'
+  of undefined", from row.dataset).
+
+A TRust build with debug assertions (target/p2/w6-fix/trust, TRUST_JS_GC_VERIFY=1,
+TRUST_JS_GC_INCREMENTAL=1) stops all three pages and the spike at the final pause's verification:
+
+  marking cycle: weak collection 0x…: the entry under marked key 0x… holds an unmarked (Young)
+  value 0x… after the final pause: a write its records missed
+
+THE CAUSE
+
+TRust keeps the internal slots of DOM wrappers in WeakMaps: js_platform.js's internalsFor, which
+holds dataset, classList and the rest. The host roots those WeakMaps through embedder handles
+(__platform_slots: HostState.platform_internals and the like).
+
+A rooted weak collection is marked by the cycle's start, while it marks the roots (gc_core.rs
+start_cycle). Then add_side_slot_owners fires the collection's side-slot owner edge at once
+(try_fire: the owner is marked), with the start's client (Purpose::CycleStart). That client's
+trace_side_slots discovers the collection (step 2b) in its own list.
+
+A slice calls add_discovered_edges before its client goes. The start never did, and its client
+was dropped with the list. So the collection's entries at the cycle's start were never registered
+as ephemerons. The final pause reports only the entries written during the cycle, so it freed
+every value that only an older entry held (DOM wrappers' internal-slot records). Their keys lived
+on and read freed objects: the crash.
+
+Only a collection already marked when the start registers the owners is affected. One the slices
+reach is discovered by the slice's client, which reports it. The engine's tests kept their
+WeakMaps in globals, which only slices trace. The final pause's verification would have named it
+(above), but no test rooted a weak collection, and TRust's pages were not in W6's checks.
+
+The other per-client state of the start survives:
+- the Realm groups it activated (cycle_realms, saved);
+- the homes, side slots and host graphs it traced, whose words it marks into the marker.
+
+V8 has no such window (13.6, Node v24.22.2's deps/v8):
+- Its start only marks the roots (src/heap/incremental-marking.cc:214-236, MarkRoots).
+- An ephemeron table's entries are taken when the marking visitor visits the table
+  (src/heap/marking-visitor-inl.h:641-690, VisitEphemeronHashTable). Entries with an unmarked key
+  go to the weak-objects worklist, which persists across the steps (next_ephemerons_local).
+- No per-step state is dropped. TRust JS's start fires the owner edges itself, so it must hand
+  over what it discovered, as its slices do.
+
+THE FIX
+
+start_cycle registers the entries its client discovered, as a slice does (add_discovered_edges
+after add_side_slot_owners). They wait in the marker and fire in the slices as their keys are
+marked.
+
+Tests (gc_cycle_tests.rs), each failing without the fix:
+- a_weak_collection_marked_at_a_cycles_start_keeps_its_entries_in_every_tier: a WeakMap and a
+  WeakSet rooted by an embedder handle (Ctx::handle), in every tier, through the cycle's own final
+  pause (an explicit minor request, which collects no further). Without the fix it fails with the
+  verifier's panic above.
+- cycles_open_across_agent_switches_keep_each_heaps_weak_entries: two Agents on one thread, each
+  with such a rooted collection. Each runs while the other's cycle is open, then both cycles are
+  open. Afterwards the entries' values serve as WeakRef, FinalizationRegistry and WeakMap targets
+  (observe_weak_target's heap lookup). Without the fix the test process aborts.
+
+Single heap; not multi-Agent: one heap reproduces it, with no Agent switch. The second test covers
+the switches the coordinator asked about.
+
+TRUST'S PAGES WITH THE CYCLE ON
+
+TRust 78435d0 built against each engine by its path dependency (target/p2/w6-fix/build-trust.sh,
+rebuild-trust.sh); one page per run (--warmups 0 --samples 1), CPU load 20-60. No timing claims:
+scores and times are taken under load.
+
+| build | dom-reconcile | Vue TodoMVC | event-loop | spike |
+| --- | --- | --- | --- | --- |
+| main 7dc412c8, release, on by default (compact's main7dc-replay) | aborts in jit_call: "a live weak target belongs to a known Agent heap" | panics in Props::slot_of_key (an index of 4.0e18; the compact agent's run segfaulted) | valid (no cycle: in a release build the heap stays below 8 MiB) | not built |
+| main c26544b5, debug assertions, TRUST_JS_GC_INCREMENTAL=1, TRUST_JS_GC_VERIFY=1 | the verifier's panic | the verifier's panic | the verifier's panic (after 60 slices) | the verifier's panic (after 41 slices) |
+| fix 29b02714, debug assertions, TRUST_JS_GC_INCREMENTAL=1, TRUST_JS_GC_VERIFY=1 | valid (a cycle of 60 slices) | valid (60 slices) | valid (60 slices) | exit 0: 320 slices, 8 majors |
+| fix 29b02714, debug assertions, TRUST_JS_GC_INCREMENTAL=force, TRUST_JS_GC_VERIFY=1 | valid | valid | valid | exit 0: 663,022 slices, 11 majors |
+| head e72e2168, release, on by default, no environment | valid (a cycle of 132 slices) | valid (112 slices) | valid (no cycle: below 8 MiB) | exit 0: 2,082 slices, 9 cycles among 11 majors |
+
+The verifier's panic, in all three pages and the spike:
+
+  marking cycle: weak collection 0x…: the entry under marked key 0x… holds an unmarked (Young)
+  value 0x… after the final pause: a write its records missed
+
+Each valid page's JSON matches main's with the cycle off (main7dc-replay with
+TRUST_JS_GC_INCREMENTAL=0; target/p2/w6-fix/pages), for the debug and the release build alike:
+- dom-reconcile: 375,497 bytes, sha256 4d0fbaff5bc0fb96…, checksum 960:49:126386880;
+- Vue TodoMVC: 3,457 bytes, 707484f1544b1cbb…, 100:100:100;
+- event-loop: 653 bytes, 2b78a38b4813cf3d…, its seven-event sequence.
+
+The spike ends at the same 18,899 live objects in every build and mode (main's debug build with
+the cycle off; the head's release build with it on, and off).
+
+GATE
+
+On e72e2168, the default-on head (target/p2/w6-fix; gate-e72e2168-lib.txt, fix-checks.txt,
+gate-e72e2168.txt):
+- fmt, and clippy in five configurations plus the workspace: clean.
+- lib (embed), on by default: 2,850 passed, 0 failed (main's 2,848 and the two new tests).
+- lib with pacing on: two external_memory tests fail; the rest pass.
+  - replaced_arrays_are_collected_as_their_elements_grow: the known one, failing with pacing on in
+    every gate since 10-29 at least (it pins IncrementalMode::Off, and fails with the cycle off).
+  - replaced_maps_are_collected_as_their_tables_grow: new with the cycle on by default (above).
+    8a9dc747, where it fails the same way, has the cycle on by default too.
+- lib under TRUST_JS_GC_INCREMENTAL=force (the unit tests verify every collection): 2,850 passed, 0
+  failed, in 931 s.
+- STAGES="rel fixtures difftest t262" against compact's gate-c50a0b4e:
+  - Vue, React and Djot give the same masked output as the base;
+  - difftest: 138 agree;
+  - Test262 at jit threshold 8: 53,575/53,575, identical to the base's report.
+- Test262's step subset (target/p2/w6/impl/t262stress/paths-s2.txt: WeakMap, WeakSet, WeakRef,
+  FinalizationRegistry, Map, Set, Proxy, Promise and five more) under force with heap
+  verification at small budgets (STRESS=0 TRUST_JS_GC_NURSERY_BYTES=0 TRUST_JS_GC_MIN_HEAP_BYTES=1
+  TRUST_JS_GC_PACING=0), on a dev-profile runner: 2,603/2,603 in the default tier, and 2,603/2,603
+  at jit threshold 0.
+- zombie (x86-64): clippy in three configurations clean; lib 2,627 passed, 0 failed.
+
+Not measured: counts and timing. The fix adds one call per cycle start. Default-on's costs are
+b327786b's, measured in W6's records.
+
+W6's checklist (target/p2/w6/impl/step6-checklist.txt) gains TRust's three replay pages and its
+spike with the cycle on (release, and a debug-assertions build with TRUST_JS_GC_VERIFY=1), and
+the lib suite with pacing on, whose result compares against a tree with the cycle off.
