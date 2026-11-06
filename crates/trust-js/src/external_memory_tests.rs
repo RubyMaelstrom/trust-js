@@ -149,29 +149,38 @@ fn collected_owners_release_their_charges() {
 /// nursery as cells do, so replacing one large Array, however few cells it takes, collects.
 /// Each pattern allocated gigabytes before any collection when element storage lived in the
 /// Rust heap uncounted: `new Array(n).fill(v)`, a chain of `map`, and arrays grown by `push`.
+///
+/// Each pattern makes at least 32 MB of elements, in four evaluations, with at most one array
+/// of 800 KB live: a collection comes at least once per nursery's budget of them, however the
+/// nursery is sized (V8's sizing, `gc_pacing`, grows it while its objects survive: each minor
+/// collection promotes the live array), and the replaced arrays do not pile up.
 #[test]
 fn replaced_arrays_are_collected_as_their_elements_grow() {
-    for (source, expected) in [
+    // The elements each pattern makes at least, and the most one array holds.
+    const ELEMENT_BYTES: usize = 40 * 100_000 * 8;
+    const ARRAY_BYTES: usize = 100_000 * 8;
+    for (setup, step, result, expected) in [
         (
-            "var keep, n = 0;
-             for (var i = 0; i < 40; i++) { keep = new Array(100000).fill(i); n += keep.length; }
-             n",
+            "var keep, n = 0; 0",
+            "for (var i = 0; i < 10; i++) { keep = new Array(100000).fill(i); n += keep.length; } 0",
+            "n",
             "4000000",
         ),
         (
-            "var a = Array.from({length: 100000}, (_, i) => i);
-             for (var i = 0; i < 40; i++) a = a.map(x => x + 1);
-             a[0]",
+            "var a = Array.from({length: 100000}, (_, i) => i); 0",
+            "for (var i = 0; i < 10; i++) a = a.map(x => x + 1); 0",
+            "a[0]",
             "40",
         ),
         (
-            "var s = 0;
-             for (var i = 0; i < 400; i++) {
+            "var s = 0; 0",
+            "for (var i = 0; i < 100; i++) {
                var a = [];
                for (var j = 0; j < 10000; j++) a.push(j * 0.5);
                s += a.length;
              }
-             s",
+             0",
+            "s",
             "4000000",
         ),
     ] {
@@ -185,18 +194,35 @@ fn replaced_arrays_are_collected_as_their_elements_grow() {
             .core
             .borrow_mut()
             .set_incremental(crate::gc_core::IncrementalMode::Off);
+        // The budget the elements spend: the nursery's, or without one the byte budget.
+        let budget = |engine: &Engine| {
+            let core = engine.interp.gc_heap.core.borrow();
+            core.nursery_budget()
+                .unwrap_or_else(|| core.stats().trigger_bytes)
+        };
         let (collections, _) = state(&engine);
-        assert_eq!(eval(&mut engine, source), expected, "{source}");
+        assert_eq!(eval(&mut engine, setup), "0", "{setup}");
+        // The largest budget the evaluations ran with, sampled between them.
+        let mut largest = budget(&engine);
+        for _ in 0..4 {
+            assert_eq!(eval(&mut engine, step), "0", "{step}");
+            largest = largest.max(budget(&engine));
+        }
+        assert_eq!(eval(&mut engine, result), expected, "{step}");
         let (after, _) = state(&engine);
+        // At most a budget and an array are allocated between two collections, before the
+        // first and after the last: 10 at least with a fixed nursery of 2 MiB.
+        let least = (ELEMENT_BYTES / (largest + ARRAY_BYTES)).saturating_sub(1) as u64;
         assert!(
-            after - collections >= 10,
-            "only {} collections while replacing about 64 MB of elements:\n{source}",
+            after - collections >= least,
+            "only {} collections while making 32 MB of elements with budgets of {largest} bytes \
+             at most (at least {least}):\n{step}",
             after - collections
         );
         let held = engine.interp.gc_heap.core.borrow().stats().live_bytes;
         assert!(
             held < 48 << 20,
-            "{held} bytes of cells held after replacing arrays:\n{source}"
+            "{held} bytes of cells held after replacing arrays:\n{step}"
         );
     }
 }
