@@ -1735,6 +1735,14 @@ struct Cycle {
     /// `Heap::allocated_bytes` as the cycle started, and as its last slice ended.
     allocated_at_start: usize,
     allocated_at_slice: usize,
+    /// The external ledger's charges (`ExternalBytes::since`, which only a sweep resets) as the
+    /// cycle started and as its last slice ended, and its live bytes at the start: the ledger's
+    /// payloads (Map and Set tables, bound arguments, stack traces, internal slots) are V8 heap
+    /// objects in V8, whose allocation drives its marking, so their charges are the cycle's
+    /// allocation too.
+    external_at_start: usize,
+    external_at_slice: usize,
+    external_live_at_start: usize,
     /// The slices run so far (the start counting as one), and their time while phases are timed
     /// or the heap paces its growth (step 4: the major collection's speed counts it).
     slices: u32,
@@ -2054,6 +2062,12 @@ pub(crate) struct Heap {
     /// words' heap bit is recomputed (an external charge past its own limit sets the external
     /// `due` instead, [`Control::charge_external`]).
     cycle_overshoot_bytes: usize,
+    /// W6: while a cycle marks, the allocated bytes past which its next slice is due with the
+    /// external bytes charged since its last one at the last refresh ([`Heap::refresh_due`]):
+    /// `poll_due`'s view of the slice's allocation, which changes only where the poll words'
+    /// heap bit is recomputed (a charge past the ledger's own `slice_limit` sets its
+    /// `slice_due` instead, [`Control::charge_external`]).
+    cycle_slice_bytes: usize,
     stats: GcStats,
     /// Time the phases of each collection into `stats.last_phase_nanos` (diagnostics).
     phase_timing: bool,
@@ -2140,6 +2154,7 @@ impl Heap {
             allocated_count: None,
             due_check_bytes: DEFAULT_MIN_TRIGGER,
             cycle_overshoot_bytes: usize::MAX,
+            cycle_slice_bytes: usize::MAX,
             stats: GcStats::default(),
             phase_timing: false,
             incremental: IncrementalMode::Off,
@@ -2456,6 +2471,7 @@ impl Heap {
             || (self.stress_every > 0 && self.allocs_since_gc >= self.stress_every)
             || self.bytes_due(0)
             || self.control.external.due.get()
+            || self.control.external.slice_due.get()
             || self
                 .cycle
                 .as_ref()
@@ -2646,12 +2662,11 @@ impl Heap {
     /// Whether the allocated bytes make a collection due, once `upcoming` more are allocated.
     fn bytes_due(&self, upcoming: usize) -> bool {
         let allocated = self.allocated_bytes.saturating_add(upcoming);
-        if let Some(cycle) = &self.cycle {
+        if self.cycle.is_some() {
             // No minor collection runs while a cycle marks (V8's rule, design 2): the nursery's
-            // budget waits, and allocation brings the next slice instead, or past the margin the
-            // final pause.
-            return allocated.saturating_sub(cycle.allocated_at_slice) > SLICE_BYTES
-                || allocated > self.cycle_overshoot_bytes;
+            // budget waits, and allocation brings the next slice instead (with the external
+            // ledger's charges, `cycle_slice_bytes`), or past the margin the final pause.
+            return allocated > self.cycle_slice_bytes || allocated > self.cycle_overshoot_bytes;
         }
         match self.nursery_bytes {
             Some(nursery) => self.major_due || allocated.saturating_sub(self.swept_bytes) > nursery,
@@ -2802,15 +2817,32 @@ impl Heap {
         // by: the allocated bytes past which it is passed with the external bytes charged now,
         // and the external bytes past which it is passed with the bytes allocated now (step 6).
         let external = &self.control.external;
-        if self.cycle.is_some() {
+        if let Some(cycle) = &self.cycle {
             let limit = self.trigger_bytes.saturating_add(self.cycle_margin());
             self.cycle_overshoot_bytes = limit.saturating_sub(external.live.get());
             external
                 .cycle_limit
                 .set(Some(limit.saturating_sub(self.allocated_bytes)));
+            // The next slice is due once the cells allocated and the external bytes charged
+            // since the last one pass `SLICE_BYTES` together: in the same two parts.
+            let allocated = self
+                .allocated_bytes
+                .saturating_sub(cycle.allocated_at_slice);
+            let charged = external.since.get().saturating_sub(cycle.external_at_slice);
+            self.cycle_slice_bytes = cycle
+                .allocated_at_slice
+                .saturating_add(SLICE_BYTES.saturating_sub(charged));
+            external.slice_limit.set(Some(
+                cycle
+                    .external_at_slice
+                    .saturating_add(SLICE_BYTES.saturating_sub(allocated)),
+            ));
         } else {
             self.cycle_overshoot_bytes = usize::MAX;
+            self.cycle_slice_bytes = usize::MAX;
             external.cycle_limit.set(None);
+            external.slice_limit.set(None);
+            external.slice_due.set(false);
         }
         let due = self.collection_due();
         let over = self.over_live_limit();
@@ -2818,12 +2850,9 @@ impl Heap {
             usize::MAX
         } else if self.stress_every > 0 {
             self.allocated_bytes
-        } else if let Some(cycle) = &self.cycle {
+        } else if self.cycle.is_some() {
             // The next slice, or the margin's final pause if it comes first.
-            cycle
-                .allocated_at_slice
-                .saturating_add(SLICE_BYTES)
-                .min(self.cycle_overshoot_bytes)
+            self.cycle_slice_bytes.min(self.cycle_overshoot_bytes)
         } else {
             match self.nursery_bytes {
                 Some(nursery) => self.swept_bytes.saturating_add(nursery),
@@ -4157,10 +4186,14 @@ impl Heap {
         self.add_discovered_edges(&mut m, client);
         self.phase_done(Phase::Side, &mut clock);
         let allocated = self.allocated_bytes;
+        let external = &self.control.external;
         self.cycle = Some(Box::new(Cycle {
             marker: m,
             allocated_at_start: allocated,
             allocated_at_slice: allocated,
+            external_at_start: external.since.get(),
+            external_at_slice: external.since.get(),
+            external_live_at_start: external.live.get(),
             // The start counts among the cycle's pauses before its final one, and its time among
             // their marking time (the major collection's speed counts it, step 4).
             slices: 1,
@@ -4274,6 +4307,8 @@ impl Heap {
         }
         cycle.slices += 1;
         cycle.allocated_at_slice = self.allocated_bytes;
+        cycle.external_at_slice = self.control.external.since.get();
+        self.control.external.slice_due.set(false);
         // The check walks the heap: after every slice of an ordinary cycle, but under `Force`,
         // whose slices are a few cells at every safepoint (as the tests' cell budgets', step 6),
         // after its first 64 slices, then every 64th, as the worklist runs out and at the final
@@ -4377,6 +4412,11 @@ impl Heap {
     /// cycle allocates are white, and those that survive are its marking too (Splay's), which
     /// V8's estimate leaves out for its young generation (its TODO, src/heap/incremental-
     /// marking.cc:686-687).
+    ///
+    /// The external ledger's charges count with the cells toward that half
+    /// (`Cycle::external_at_start`), and the bytes it held at the start take their part of the
+    /// room, as the margin counts them (`cycle_overshot`): its payloads are V8 heap objects in
+    /// V8. The marking stays the cells' (the bytes `marked_bytes` counts).
     #[inline(never)]
     fn slice_bytes(&self, cycle: &Cycle) -> usize {
         let estimate = cycle.allocated_at_start as f64;
@@ -4386,11 +4426,19 @@ impl Heap {
             .trigger_bytes
             .saturating_add(self.cycle_margin())
             .saturating_sub(cycle.allocated_at_start)
+            .saturating_sub(cycle.external_live_at_start)
             .max(1) as f64;
-        let allocated = self
+        let cells = self
             .allocated_bytes
-            .saturating_sub(cycle.allocated_at_start) as f64;
-        let by_allocation = (estimate + allocated) * (allocated / (room / 2.0)).min(1.0);
+            .saturating_sub(cycle.allocated_at_start);
+        let charged = self
+            .control
+            .external
+            .since
+            .get()
+            .saturating_sub(cycle.external_at_start);
+        let progress = (cells.saturating_add(charged) as f64 / (room / 2.0)).min(1.0);
+        let by_allocation = (estimate + cells as f64) * progress;
         let behind = (by_time.max(by_allocation) as usize).saturating_sub(self.marked_bytes);
         behind.max(SLICE_BYTES)
     }
@@ -5796,6 +5844,13 @@ struct ExternalBytes {
     /// re-checks the margin as external memory grows (Heap::UpdateExternalMemory,
     /// src/heap/heap.cc:6967-7020).
     cycle_limit: Cell<Option<usize>>,
+    /// W6: while a cycle marks, the `since` bytes past which its next slice is due, with the
+    /// bytes allocated since its last one ([`Heap::refresh_due`]): its charges bring the slices,
+    /// as V8's allocation observers step marking every 64 KB a program allocates in its young
+    /// generation and 256 KB in its old (src/heap/incremental-marking.cc:54-55, 91-96).
+    slice_limit: Cell<Option<usize>>,
+    /// A charge passed `slice_limit`: the next safepoint slices. Cleared by every slice and sweep.
+    slice_due: Cell<bool>,
 }
 
 impl Control {
@@ -5824,6 +5879,14 @@ impl Control {
         let over = (budget != 0 && since > budget)
             || external.cycle_limit.get().is_some_and(|limit| live > limit);
         if over && !external.due.replace(true) {
+            self.poll_words.publish(true);
+        }
+        if external
+            .slice_limit
+            .get()
+            .is_some_and(|limit| since > limit)
+            && !external.slice_due.replace(true)
+        {
             self.poll_words.publish(true);
         }
     }
@@ -11299,7 +11362,13 @@ mod tests {
         let control = fx.heap.control();
         control.charge_external(room / 2);
         assert!(fx.heap.poll_bit_agrees());
-        assert!(!fx.heap.poll_due(), "within the margin");
+        // Within the margin the charges bring a slice, not the final pause
+        // (`a_cycles_external_charges_bring_its_slices`).
+        assert_eq!(
+            fx.heap.due_work(None, true, false),
+            DueWork::Slice,
+            "within the margin"
+        );
         control.charge_external(room - room / 2 + 1);
         assert!(
             fx.heap.poll_bit_agrees(),
@@ -11335,6 +11404,100 @@ mod tests {
         fx.collect();
         assert!(fx.heap.cycle.is_none());
         assert!(fx.heap.poll_bit_agrees());
+    }
+
+    /// W6: the external ledger's charges during a cycle bring its slices, as cells do (its
+    /// payloads, Map and Set tables among them, are V8 heap objects, whose allocation steps V8's
+    /// marking, src/heap/incremental-marking.cc:54-55, 91-96): past `SLICE_BYTES` charged since
+    /// the last slice, the poll words' heap bit is set at once and the safepoint slices; each
+    /// slice starts the count again. Cells and charges together bring it too, through the
+    /// thresholds of the last refresh (`Heap::refresh_due`).
+    #[test]
+    fn a_cycles_external_charges_bring_its_slices() {
+        let (mut fx, _chain) = cycle_fixture(20_000);
+        assert!(start_cycle(&mut fx));
+        let control = fx.heap.control();
+        assert!(!fx.heap.poll_due(), "no slice due at the start");
+        control.charge_external(SLICE_BYTES / 2);
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(!fx.heap.poll_due(), "half a slice's bytes charged");
+        control.charge_external(SLICE_BYTES / 2 + 1);
+        assert!(
+            fx.heap.poll_bit_agrees(),
+            "the charge past the slice's bytes published it"
+        );
+        assert!(fx.heap.poll_due());
+        assert_eq!(fx.heap.due_work(None, true, false), DueWork::Slice);
+        // A release takes nothing back: the bytes were allocated.
+        control.release_external(SLICE_BYTES);
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(fx.heap.poll_due());
+        assert!(fx.heap.slice(&NoClient).is_some());
+        assert!(
+            !fx.heap.cycle.as_ref().unwrap().complete,
+            "a slice marks part of the chain"
+        );
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(!fx.heap.poll_due(), "the slice starts the count again");
+        // Half a slice's bytes of cells (their cursor flushed, which counts them), then half of
+        // charges: neither passes its own threshold, and the refresh that sees both makes the
+        // slice due.
+        for _ in 0..SLICE_BYTES / 2 / 16 {
+            fx.heap.alloc(fx.node, 16);
+        }
+        fx.heap.flush_cursors();
+        control.charge_external(SLICE_BYTES / 2 + 1);
+        assert!(fx.heap.poll_bit_agrees());
+        fx.heap.set_incremental(IncrementalMode::On);
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(fx.heap.poll_due(), "cells and charges together");
+        assert_eq!(fx.heap.due_work(None, true, false), DueWork::Slice);
+        assert!(fx.heap.slice(&NoClient).is_some());
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(!fx.heap.poll_due());
+        // Once a refresh has seen the charges since the slice, the cells' threshold is the rest
+        // of the slice's bytes.
+        control.charge_external(SLICE_BYTES / 2);
+        fx.heap.set_incremental(IncrementalMode::On);
+        assert!(!fx.heap.poll_due());
+        for _ in 0..SLICE_BYTES / 2 / 16 + 1 {
+            fx.heap.alloc(fx.node, 16);
+        }
+        fx.heap.flush_cursors();
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(
+            fx.heap.poll_due(),
+            "cells past the rest of the slice's bytes"
+        );
+        fx.collect();
+        assert!(fx.heap.cycle.is_none());
+        assert!(fx.heap.poll_bit_agrees());
+        assert!(!fx.heap.poll_due(), "no slice is due after the cycle");
+    }
+
+    /// W6: the external bytes charged during a cycle count toward its slices' allocation
+    /// schedule as its cells do, and those charged at its start take their part of the room
+    /// before the margin: a quarter of the room charged asks half the starting bytes, less those
+    /// marked.
+    #[test]
+    fn a_slice_asks_the_bytes_behind_its_schedule_for_the_charges_too() {
+        let (mut fx, _chain) = cycle_fixture(1_000);
+        assert!(start_cycle(&mut fx));
+        let mut cycle = fx.heap.cycle.take().unwrap();
+        cycle.started = std::time::Instant::now();
+        fx.heap.trigger_bytes = 64 << 20;
+        cycle.allocated_at_start = 32 << 20;
+        fx.heap.allocated_bytes = cycle.allocated_at_start;
+        cycle.external_live_at_start = 8 << 20;
+        let room = (64 << 20) + fx.heap.cycle_margin() - (32 << 20) - (8 << 20);
+        fx.heap.control().charge_external(room / 4);
+        fx.heap.marked_bytes = 1 << 20;
+        let asked = fx.heap.slice_bytes(&cycle);
+        // No cells allocated: a quarter of the room charged is half the 32 MB, less the 1 MB
+        // marked.
+        let expected = (32 << 20) / 2 - (1 << 20);
+        assert!(asked.abs_diff(expected) < 1 << 10, "{asked} for {expected}");
+        fx.heap.cycle = Some(cycle);
     }
 
     /// W6: a cell stored into a traced (black) cell after its trace survives the cycle when the

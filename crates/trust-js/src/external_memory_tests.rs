@@ -56,6 +56,66 @@ fn replaced_maps_are_collected_as_their_tables_grow() {
     );
 }
 
+/// W6: with marking cycles, the replaced Maps' tables are charged while a cycle marks, and the
+/// charges bring its slices, as the tables' allocation steps V8's marking (they are V8 heap
+/// objects there, src/heap/incremental-marking.cc:54-55, 91-96): each cycle marks in a few
+/// slices and its final pause frees the Maps it found dead, well before V8's margin over the
+/// byte budget (at least 32 MB) would force it. Before the charges counted, no slice ran (the
+/// loop allocates a few hundred bytes of cells per Map), every cycle ended at its margin, and
+/// up to the budget and the margin's bytes stayed charged (48.5 MB at the loop's end with V8's
+/// sizing, 54 MB at a minor collection with fixed budgets). Checked after each Map, with fixed
+/// budgets and with V8's sizing (`gc_pacing`).
+#[test]
+fn replaced_maps_are_collected_as_their_tables_grow_while_cycles_mark() {
+    for pacing in [false, true] {
+        let mut engine = engine();
+        // `TRUST_JS_GC_PACING=1` gives every engine V8's sizing.
+        let pacing = {
+            let mut core = engine.interp.gc_heap.core.borrow_mut();
+            core.set_incremental(crate::gc_core::IncrementalMode::On);
+            if pacing {
+                core.enable_pacing(true);
+            }
+            core.memory_reducer().is_some()
+        };
+        let (collections, _) = state(&engine);
+        eval(&mut engine, "var m, n = 0; 0");
+        let mut most = 0;
+        for i in 0..30 {
+            eval(
+                &mut engine,
+                "m = new Map(); for (var j = 0; j < 100000; j++) m.set(j, j); n += m.size; 0",
+            );
+            let (_, external) = state(&engine);
+            most = most.max(external);
+            assert!(
+                external < 40 << 20,
+                "pacing {pacing}: {external} external bytes still charged after {} replaced Maps",
+                i + 1
+            );
+        }
+        assert_eq!(eval(&mut engine, "n"), "3000000");
+        let (after, _) = state(&engine);
+        assert!(
+            after - collections >= 10,
+            "pacing {pacing}: only {} collections for 30 replaced 6 MB Maps",
+            after - collections
+        );
+        let slices = engine
+            .interp
+            .gc_heap
+            .core
+            .borrow()
+            .stats()
+            .last_cycle_slices;
+        assert!(
+            slices > 1,
+            "pacing {pacing}: the last cycle ran {slices} slices (its start alone: no charge \
+             brought a slice); most charged after a Map: {most}"
+        );
+    }
+}
+
 /// The ledger releases what its containers charged: a Map, a bound function with many
 /// arguments and an error's stack trace charge their payloads, and once their owners are
 /// collected the charge returns to where it was.
