@@ -181,9 +181,11 @@ comment/example in the same change.
   clearing weak handles and weak cells; `tables`: evicting the dead from the engine's tables;
   `after`: the Agent's bookkeeping after the sweep), then the cells finalized, by kind, and
   the time their finalizers took (`fin:<kind>=count fin_us:<kind>=microseconds`).
-- `TRUST_JS_GC_INCREMENTAL=1` (W6, off by default) marks the major collections the heap asks for
-  on its own (its byte budget, a stress interval, the memory reducer) in a cycle between whose
-  slices the program runs, once the heap holds more than 8 MiB (in release builds): a minor
+- `TRUST_JS_GC_INCREMENTAL=0` turns off incremental marking (W6), which is on by default but in
+  wasm32 builds (a slice's time needs a clock): every major collection then marks in one pause.
+  With it on, the heap marks the major collections it asks for on its own (its byte budget, a
+  stress interval, the memory reducer) in a cycle between whose slices the program runs, once
+  the heap holds more than 8 MiB (in release builds): a minor
   collection that leaves the room below the byte budget at one nursery's budget or less starts
   it (V8's soft limit). The cycle's start marks the roots, but not the native stack, which the
   final pause scans (V8's start), and each slice traces part of what they reach, with the

@@ -168,17 +168,19 @@ fn gc_pacing_enabled() -> bool {
     })
 }
 
-/// `TRUST_JS_GC_INCREMENTAL` (W6): `1` (or `on`) marks the major collections the heap asks for
-/// on its own in cycles of slices between which the program runs; `force` does so with slices
-/// of a few cells at every safepoint (verification's mode); unset or anything else, every major
-/// collection marks in one pause.
+/// `TRUST_JS_GC_INCREMENTAL` (W6): on by default, the heap marks the major collections it asks
+/// for on its own in cycles of slices between which the program runs; `0` (or `off`) marks
+/// every major collection in one pause; `force` makes the slices a few cells at every safepoint
+/// (verification's mode). A wasm32 build keeps it off: a slice's time needs a clock, which
+/// wasm32-unknown-unknown lacks (as pacing does, `gc_pacing_enabled`).
 fn gc_incremental() -> crate::gc_core::IncrementalMode {
     static MODE: std::sync::OnceLock<crate::gc_core::IncrementalMode> = std::sync::OnceLock::new();
     *MODE.get_or_init(
         || match std::env::var("TRUST_JS_GC_INCREMENTAL").as_deref() {
-            Ok("1" | "on") => crate::gc_core::IncrementalMode::On,
+            Ok("0" | "off") => crate::gc_core::IncrementalMode::Off,
             Ok("force") => crate::gc_core::IncrementalMode::Force,
-            _ => crate::gc_core::IncrementalMode::Off,
+            _ if cfg!(target_arch = "wasm32") => crate::gc_core::IncrementalMode::Off,
+            _ => crate::gc_core::IncrementalMode::On,
         },
     )
 }
