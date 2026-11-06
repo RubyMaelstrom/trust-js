@@ -17341,3 +17341,450 @@ from generated code, includes, indexOf and substring in line as codePointAt is; 
 Vue's candidate 4 too) first, each its own step against main; then 4 (the scanning loops: a
 String.prototype methods protector, the loop's values in registers); then 3 (RegExp exec's runtime,
 measured piece by piece first). 5 and 6 after, measured.
+
+### A function's new code picked up per callee, not through the global call-cache epoch (design note, 2026-11-06)
+
+The coordinator's item after C3's findings: chai's C3 cost turned out to be the epoch's refills, not
+its templates. This note designs how a function's new code can reach its callers without moving
+CALL_IC_EPOCH. Nothing here is implemented: the owner decides whether it comes into P2. It is the
+per-callee invalidation that Decision 27 carried to Phase 3 ("Carried to Phase 3", exit sites with
+recompilation: "Each record moves the call caches' global epoch, so every call site in the program
+re-resolves. The exemplars reach only the discarded code's callers").
+
+How it was measured: a probe, p2-callee-probe 142d638c (not for landing). It is C3 rebased onto
+main d5cb81ff (a7dda08d), plus the split's two modes from p2-c3-probe2 (bcae12f8, 96e0ef42), plus
+diagnostics in builds with architecture-diagnostics (7e70950a, 142d638c). The diagnostics count
+the direct sequences by form and record why each epoch move happened, with the refills each move
+made. The probe ran in three modes: the tier-up off (main's behaviour), C3, and C3's epoch move
+alone. Event counts come from one run each (target/p2/compact/callee/runs2). Instructions come from
+the split's fat-LTO binary c9485a31 (counts/c3probe2.txt; counts/callee-epoch.txt for the
+workloads the split left out).
+
+Main's own direct-call count has a gap. TRUST_JS_JIT_CALLSTAT=2's direct count misses every shared
+stub assembled before the first JIT entry reads the switch. The probe reads the switch first.
+Main's count would leave out chai's 2.26M accessor and trap entries, and all but 3,598 of
+Mandreel's 7.43M stub calls.
+
+SUMMARY
+
+1. Today every new code a function gets moves the epoch. An inline recompile, C1's recompile and
+   C3's tier-up each put a chunk in a set-once slot and then move the epoch. The epoch is a process
+   static, so every way in the process misses once and refills through Rust, in every heap. The
+   old chunk stays valid, and only the function's own callers have new code to find.
+   - On main, 99% of the refills after those moves fill the way with the code it already had:
+     chai 23,464 of 23,545, TypeScript 64,653 of 65,182, Djot 3,700 of 3,735.
+   - Each publication refills chai 350 ways, TypeScript 212 and Djot 103. About one of them finds
+     new code.
+   - Every move on main is such a publication except the FunctionRuntime drops (zlib's 31,
+     CodeLoad's 39 and one of Gameboy's).
+2. Estimated cost on main: the old code's refills times what a refill cost when C3's moves ran
+   alone. That is chai 0.31%, Djot 0.84%, DeltaBlue 0.25%, TypeScript 0.13-0.25% and Box2D 0.15%.
+   C3 would lose the epoch's share of its cost: chai +0.36%, Djot +0.15%, DeltaBlue +0.11%.
+3. The exemplars reach only the callers. V8 and SpiderMonkey read the callee's current entry on
+   every call. JSC relinks the replaced code block's incoming calls.
+4. Three forms fit here:
+   - (A1) A generation compare in the direct sequence: +2 instructions a call and +4 a
+     construct. That is React +0.31%, EarleyBoyer +0.28%, Richards +0.16% and DeltaBlue +0.09% on
+     main.
+   - (A2) The old chunk's own request word. Both direct sequences already read this word at their
+     retry gate. A replaced chunk asks every direct entry for the helper, which refills the way
+     with the function's current code. It adds no instruction to the direct path and changes no
+     template or stub.
+   - (B) JSC's incoming lists. They add no instruction to the direct path, but every user-code
+     fill must register, and chunk drops must clean up in both directions.
+5. Proposed: A2. The epoch stays for what it fences: reclaimed code, dropped FunctionRuntimes,
+   dead global environments, exhaustion and P3's watchpoints. It is also A2's fallback when
+   another Realm still selects the old chunk. B remains the form for P3 if its invalidations,
+   which concern incorrect code rather than old code, want exact unlinking: W4's dependency
+   registry is its home.
+6. Two side effects must be designed in, not assumed:
+   - The planner's fingerprint hashes the epoch.
+   - A call site's megamorphic and overflow-admission counts restart with each move. Gameboy's
+     opcode dispatch depends on that restart: C3's 36 moves alone took 0.40% off its count, which
+     is all of C3's Gameboy gain.
+7. Open for C3: would the second stage win? Djot's three tier-ups gain nothing.
+
+1. WHAT THE EPOCH DOES TODAY
+
+CALL_IC_EPOCH (bytecode.rs:1222-1226) is recorded by every way at fill (CallIc::epoch). Every probe
+compares it before trusting the way's raw pointers:
+- In machine code: the call template's way 0 (emit_call_identity_way, jit.rs:10410); the shared
+  CallSecondary stub's other ways, its code-keyed way and its overflow probe (emit_call_ways,
+  10434); the construct probe (emit_direct_construct, 11466); and the property helper stub's
+  getter, Proxy trap and setter calls (emit_get_prop_getter, emit_get_prop_trap and
+  emit_set_prop_setter, 7883-8483).
+- In Rust: Interp::resolve_cached_call_entry (interpreter.rs:15649), from which call_jit_cached
+  serves Rust callers.
+A hit enters the way's code through the direct sequence (emit_direct_sequence, jit.rs:10864), either
+in line or through the process-wide DirectCall and DirectConstruct stubs. x86-64 has no direct
+sequence: its calls go through the call helper.
+
+It moves for two reasons:
+- To fence pointers that are about to dangle. This is correctness. The moves are:
+  - executable code reclaimed (Retirement::finish, jit_cache.rs:204);
+  - a FunctionRuntime dropped, because code-keyed ways hold the addresses of its slots
+    (function_runtime.rs:114);
+  - a dead global environment's pin (interpreter.rs:14113);
+  - P3's watchpoint sets (dependency.rs:87), whose only consumers today are tests.
+  Exhaustion (u32::MAX) disables the raw caches for good.
+- To publish new code. This is performance only. The moves are:
+  - an inline recompile (code2, interpreter.rs:16412-16414);
+  - C1's recompile (code3, or code2 for a function without a second stage; 16472);
+  - C3's tier-up (code2, at the same point on p2-c2).
+  A slot is set once and never replaced, and frames running the old chunk keep their lease. A way
+  that keeps the old chunk therefore runs valid code. The move only makes callers re-resolve
+  FunctionRuntime::execution_code_for (function_runtime.rs:84) so that they find the new chunk.
+  The parked exit-site recompiles of region admission's step 3 moved it the same way.
+
+Two other things read the epoch:
+- The inline planner's fingerprint hashes each way's epoch (advance_inline_feedback,
+  bytecode.rs:24196). Any move anywhere therefore changes every chunk's fingerprint once its ways
+  refill. C3's call-target rule leaves the epoch out for that reason.
+- A call site counts its megamorphic evictions, and its admissions to the overflow table, per epoch
+  (counted_epoch, bytecode.rs:1380). CALL_SITE_MEGAMORPHIC_EVICTIONS says "the count starts again
+  with each epoch", and an overflow admission budget of 64 is renewed with each move.
+
+On main (the probe's tier-up-off mode), a refill is a fill that found a way for the same callee at
+an older epoch. Refills are sorted by the moves in between:
+- old code: every move in between was a publication, and the way gets the code it had;
+- new code: the way gets new code;
+- kept: a fencing move came in between.
+
+| workload | publications: inline, C1 | fencing moves | fills | refills | old code | new code | kept | old code a publication |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| chai | 67, 0 | 0 | 72,259 | 23,545 | 23,464 | 81 | 0 | 350 |
+| TypeScript | 293, 12 | 0 | 71,654 | 65,182 | 64,653 | 529 | 0 | 212 |
+| PdfJS | 18, 1 | 0 | 5,184 | 4,004 | 3,979 | 25 | 0 | 209 |
+| Djot | 36, 0 | 0 | 4,705 | 3,735 | 3,700 | 35 | 0 | 103 |
+| Box2D | 59, 3 | 0 | 7,240 | 6,281 | 6,208 | 73 | 0 | 100 |
+| Mandreel | 16, 0 | 0 | 1,371 | 998 | 983 | 15 | 0 | 61 |
+| Vue | 10, 0 | 0 | 1,372 | 550 | 534 | 16 | 0 | 53 |
+| RayTrace | 11, 0 | 0 | 563 | 466 | 449 | 17 | 0 | 41 |
+| Gameboy | 87, 46 | 1 | 6,436 | 5,257 | 5,020 | 67 | 170 | 38 |
+| Crypto | 4, 0 | 0 | 213 | 111 | 105 | 6 | 0 | 26 |
+| DeltaBlue | 23, 0 | 0 | 750 | 560 | 537 | 23 | 0 | 23 |
+| EarleyBoyer | 20, 0 | 0 | 521 | 291 | 239 | 52 | 0 | 12 |
+| Richards | 8, 0 | 0 | 97 | 70 | 64 | 6 | 0 | 8 |
+| Splay | 8, 0 | 0 | 86 | 55 | 49 | 6 | 0 | 6 |
+| React | 2, 0 | 0 | 24 | 3 | 1 | 2 | 0 | 0.5 |
+| CodeLoad | 0 | 39 | 129 | 11 | 0 | 0 | 11 | - |
+| zlib | 0 | 31 | 72 | 0 | 0 | 0 | 0 | - |
+| RegExp, NavierStokes | 0 | 0 | 1,242, 11 | 0 | 0 | 0 | 0 | - |
+
+So most of the call caches' fill traffic is refills after publications: 91% of TypeScript's fills,
+79% of Djot's, 87% of Box2D's. About one way a publication finds new code. The census's 68 moves
+for chai and 305 for TypeScript (C3's record, without the tier-up) are these publications. One
+more difference: the epoch is a process static. In TRust, one page's or worker's recompiles make
+every other page's caches refill too.
+
+2. WHAT THE EXEMPLARS DO
+
+- V8 keeps a function's current code in its dispatch-table entry. In its own words: "The
+  entrypoint will always point to the current code of the function, thereby enabling seamless
+  tiering" (src/sandbox/js-dispatch-table.h:28-31).
+  - A call loads the function's dispatch handle, then the entry's entrypoint and parameter count:
+    four loads and two address operations (MacroAssembler::CallJSFunction,
+    src/codegen/arm64/macro-assembler-arm64.cc:2500-2510;
+    LoadEntrypointAndParameterCountFromJSDispatchTable, 4169-4182).
+  - A tier-up writes the entry (JSFunction::UpdateCodeImpl's SetCode,
+    src/objects/js-function-inl.h:140-161).
+  - Marking a function for tiering also goes through the entry: "Execute a tiering builtin
+    instead of the actual code. Leaves the Code pointer untouched and changes only the
+    entrypoint" (SetTieringRequest, js-dispatch-table.h:267-271).
+- SpiderMonkey loads the callee script's jitCodeRaw on every call, with two dependent loads
+  (MacroAssembler::loadJitCodeRaw, js/src/jit/MacroAssembler.cpp:4265-4276).
+  - Baseline's call stubs do it (BaselineCacheIRCompiler::emitCallScriptedFunctionShared,
+    jit/BaselineCacheIRCompiler.cpp:3352-3400).
+  - So does Ion, even for a call to a known target (CodeGenerator::visitCallKnown,
+    jit/CodeGenerator.cpp:7342).
+  - Installing or discarding Ion code updates jitCodeRaw (JSScript::updateJitCodeRaw,
+    vm/JSScript.cpp:3481-3505, from JitScript::setIonScriptImpl, jit/JitScript.cpp:695-713).
+- JSC caches the callee and its code at the call site, as TRust does, and relinks only the replaced
+  code's callers.
+  - A monomorphic link registers its call site in the callee CodeBlock's incoming list
+    (linkMonomorphicCall, bytecode/Repatch.cpp:84-107, linkIncomingCall at 102). The list is
+    m_incomingCalls, an intrusive SentinelLinkedList (CodeBlock.h:980).
+  - Installing new code walks the old block's list (ScriptExecutable::installCode,
+    runtime/ScriptExecutable.cpp:213-214; CodeBlock::unlinkOrUpgradeIncomingCalls,
+    bytecode/CodeBlock.cpp:2228-2239). A monomorphic link to the old block is upgraded in place
+    to the new block's entry and joins the new block's list ("Upgrading Monomorphic DataIC with
+    newCodeBlock", CallLinkInfo::unlinkOrUpgradeImpl, bytecode/CallLinkInfo.cpp:98-128). Any
+    other link is unlinked.
+  - Jettison and the block's destruction unlink the block's links (CodeBlock.cpp:2434, 940-948).
+    A call site's destruction takes it off its list (~CallLinkInfoBase, CallLinkInfoBase.h:110-114).
+    The collector unlinks links to dead callees (CallLinkInfo::reconcileWeakReferencesAtGCEnd,
+    CallLinkInfo.cpp:174).
+
+None of the three reaches call sites that do not call the function.
+
+One difference matters here: whose "current code" it is. V8's dispatch handle belongs to a
+closure's feedback cell, and SpiderMonkey's script belongs to one realm, so their current code is
+per realm. TRust's FunctionRuntime is per heap and shared by Realms. A second stage with splices
+belongs to its planning Realm (Chunk::inline_realm_compatible, bytecode.rs), so the current code
+depends on the caller's Realm (execution_code_for(genv)). C3's publications are realm-neutral
+(their plan is empty). Inline recompiles belong to their planning Realm, and so do C1's when their
+plan splices.
+
+V8, SpiderMonkey and WebKit main were fetched 2026-11-05 and 2026-11-06
+(target/p2/compact/exemplar-src/fetch-2026-11-05, -06b).
+
+3. THE CANDIDATES
+
+A1. A generation in the sequence (V8's and SpiderMonkey's read of the callee, as a check)
+- Each chunk carries its function's code generation. A publication bumps it in each of the
+  function's chunks (at most four).
+- A way records the generation at fill, in CallIc's free word at 60, so the stride does not
+  change.
+- The [[Call]] sequence compares the two where it now tests the callee's inline-attempt byte
+  (jit.rs:10945). A fill before the attempt records a generation that cannot match, so the
+  attempt's one refill replaces the byte's test. The construct form adds the compare.
+- Cost: +2 instructions a call (LDR, LDR, CMP, B.NE in place of LDRB, CBZ) and +4 a construct.
+  That is +8 bytes in each in-line call sequence and +16 bytes in each in-line construct
+  sequence. The shared stubs (DirectCall, DirectConstruct, and the property helper stub's accessor
+  and trap calls) change once a process.
+- Realms: a caller in another Realm refills to the old chunk at the new generation and then stays
+  direct.
+
+A2. The old chunk's request word (V8's tiering request, on the replaced code)
+- Both direct sequences already read a word of the callee's chunk on every entry: the retry gate
+  (jit.rs:10966-10978). The gate runs after every other fallback check and before any mutation.
+  It sends the entry to the helper when the chunk's inline checkpoint is due (inline_retry_at is
+  nonzero and the runs reach it).
+- A publication marks the replaced chunk superseded and sets its word to 1, so every direct entry
+  into it takes the helper (runs + 1 >= 1, and its run count stops there).
+- The call-hit helper and the Op::New helper find the way's chunk superseded. They refill the way
+  from execution_code_for and then make the call. resolve_cached_call_entry treats a superseded
+  chunk as a miss for Rust callers. On x86-64, whose calls all go through the helper, A2 is this
+  Rust check alone.
+- No instruction is added to the direct path, and no template or stub changes. The in-line call
+  and construct sequences, the DirectCall and DirectConstruct stubs and the accessor and trap calls
+  all reach the gate already.
+- Rust's inline machinery must leave a superseded chunk's word alone. Today
+  try_inline_recompile's suppressed branch clears it once a second stage exists
+  (interpreter.rs:16378-16382).
+- A caller that misses the check runs the old chunk, which is valid. Correctness never depends on
+  the word.
+- Realms: when a caller's Realm still selects the superseded chunk (a second stage that another
+  Realm planned), the helper un-supersedes it and moves the global epoch. That is today's
+  behaviour, once for that chunk. A program with one Realm never takes this path.
+- Like V8's request, A2 is a per-function word on the call path that redirects the next call. The
+  difference is that TRust's callers cache the code, so the redirect also refills the caller's way.
+
+B. JSC's incoming lists
+- At fill, each way that holds a user chunk registers in that chunk's incoming list. The fill
+  paths are CallSite::fill and store, the overflow table, and the construct, trap and callback
+  caches. A way leaves the list when it is overwritten or refilled with another chunk.
+- A publication walks the old chunk's list. A way whose Realm selects the new chunk is rewritten
+  in place (chunk, chunk_raw, code, code_mem, pc_offs_ptr, n_slots and the direct flags) and moves
+  to the new chunk's list. The other ways stay where they are.
+- Nothing is added to the direct path, the callers never refill (so A2's new-code refills are
+  saved too: chai 81, TypeScript 529), and Realms are handled exactly.
+- A way is already rewritten today while frames that entered through it run: refills happen during
+  calls, and call_jit_cached "runs from a copy". So the walk brings no new hazard into machine code.
+- GC safety of the lists:
+  - The lists hold the addresses of ways in chunk-owned call-cache arrays, which are boxed for the
+    chunk's life. They are not GC cells, so there is nothing to trace or root and no barrier for
+    W6's marking. They keep no chunk or callee alive: callee identity stays with the way's weak
+    pin, and conservative scanning never sees them.
+  - The hazards are drops, in both directions, as JSC's ~CodeBlock explains (CodeBlock.cpp:940-948).
+    A caller chunk that dies first must take its ways off their callees' lists (JSC's
+    ~CallLinkInfoBase). A callee chunk that dies first must empty its list first, so that no way
+    later tries to leave a freed list. Today FunctionRuntime::drop's epoch move fences those ways.
+  - Chunks die by Rc release, and a collection's sweep can start that, so the walks must allocate
+    nothing and run no JS.
+  - CallIc is Copy and gets copied, so the lists must name ways by address, not by a link stored
+    inside the entry. Removal then needs an index per way or a search.
+  - Chunks are !Sync, and the lists follow the caches' Cell discipline.
+- Cost: a registration at each user-code fill (72,259 fills in chai, 71,654 in TypeScript), a list
+  per chunk and an index per way. Every fill path must register. A missed registration only costs
+  speed while the lists serve publications. If the lists replaced the epoch for reclaimed or
+  invalidated code, a missed registration would be a correctness hole.
+
+What stays on the epoch in all three forms: the fencing moves (reclaimed code, FunctionRuntime
+drops, dead global environments' pins, exhaustion) and, until P3 decides, its watchpoints. For A2
+it is also the multi-Realm fallback. On main that leaves zlib's 31 moves, CodeLoad's 39 and one of
+Gameboy's. Every other workload goes to none.
+
+Why A2 over B, beyond its size:
+- The direct path costs the same in both.
+- The refills A2 keeps (the new-code ones) are under 1% of today's refills.
+- A2 adds nothing to fills and keeps no lists that two kinds of drop must maintain.
+- A missed check costs the same in both, as long as the lists serve only publications.
+- B is exact about Realms, but A2's fallback costs one move per chunk that another Realm still
+  selects, and none in single-Realm programs.
+- Both are grounded in an exemplar. A2 is V8's device on TRust's per-site caches. B is JSC's, and
+  JSC's call caching is the closest to TRust's.
+- Neither form makes the word or the lists a fence for incorrect code. P3's invalidations stay on
+  the epoch until P3 designs them, where JSC's jettison form (B) is the natural one, as "Carried to
+  Phase 3" already says.
+
+4. THE COST ON HOT DIRECT CALLS
+
+Direct entries on main, by form (the probe's tier-up-off mode), and A1's added instructions against
+main's counts (counts/c3c.txt). A2 and B add none.
+
+| workload | direct calls: in line | shared stub | accessor or trap | direct constructs: in line | shared stub | instructions a direct entry | A1 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| React | 452,456 | 0 | 0 | 0 | 0 | 656 | +0.31% |
+| DeltaBlue | 90,214 | 9,251 | 0 | 397 | 4,091 | 2,452 | +0.09% |
+| Richards | 85,883 | 20,596 | 0 | 0 | 20 | 1,231 | +0.16% |
+| EarleyBoyer | 1,094,694 | 671,136 | 0 | 73,206 | 1,243,581 | 1,006 | +0.28% |
+| Vue | 14,340 | 323,232 | 565,128 | 0 | 0 | 1,550 | +0.13% |
+| Splay | 20,949 | 529,870 | 0 | 8,289 | 18,073 | 2,418 | +0.09% |
+| TypeScript | 2,656,045 | 14,662,156 | 0 | 384,395 | 1,395,831 | 3,028 | +0.07% |
+| chai | 210,970 | 23,407,450 | 2,262,960 | 0 | 350 | 2,808 | +0.07% |
+| Box2D | 590,401 | 354,197 | 156,498 | 0 | 0 | 3,811 | +0.05% |
+| Djot | 67,746 | 68,913 | 0 | 0 | 518 | 4,394 | +0.05% |
+| Gameboy | 2,833,564 | 522,688 | 0 | 0 | 0 | 4,446 | +0.05% |
+| RegExp | 518,034 | 13,344 | 0 | 0 | 0 | 5,024 | +0.04% |
+| PdfJS | 1,100,413 | 94,904 | 7 | 0 | 2,813 | 5,758 | +0.04% |
+| RayTrace | 141,501 | 7,361 | 0 | 0 | 0 | 6,651 | +0.03% |
+| Mandreel | 856,395 | 7,431,049 | 0 | 0 | 0 | 7,385 | +0.03% |
+| Crypto | 34,698 | 16,820 | 0 | 0 | 388 | 13,777 | +0.02% |
+| zlib | 2,198,187 | 20,971 | 0 | 0 | 1 | 60,201 | +0.00% |
+| NavierStokes | 124 | 46 | 0 | 0 | 0 | 2,587,071 | +0.00% |
+| CodeLoad | 0 | 0 | 0 | 0 | 124 | 3,862,133 | +0.00% |
+
+A1's numbers are exact for instructions: its compare runs once per direct entry. They are for its
+cheapest form, which folds the inline-attempt test into the generation. Checked beside that test,
+A1 costs twice as much, and every call the gates send to the helper pays it as well (up to the
+call-hit helper's count: 869 calls in React, 1,462 in Richards, 5,112 in DeltaBlue). On React, a
+direct call comes every 656 instructions, so V8's and SpiderMonkey's form costs what their extra
+load costs. A2 needs no extra load because TRust's direct sequence already reads the callee's chunk
+at the retry gate.
+
+5. WHAT IT BUYS
+
+On main today. The estimate is the old-code refills times what a refill cost when C3's moves ran
+alone: the epoch-alone mode's instructions over its added refills. Where that mode also changed
+compiles, an epoch move's cost is not its refills (see 6), so those rows use 1.2K instructions a
+refill. 1.2K is the median of the workloads whose compiles did not change: Djot 1,368, DeltaBlue
+1,178, Box2D 1,007, Vue 1,220, RayTrace 1,293, Richards 1,524, Crypto 850, Splay 1,071. chai keeps
+its own 9,543, because its refills are Proxy reads through Rust (C3's findings: the extra Proxy
+reads, GetProp and CallWithThis helper calls all go with the epoch).
+
+| workload | old-code refills | instructions a refill | estimated saving | of main |
+| --- | --- | --- | --- | --- |
+| Djot | 3,700 | 1,368 | 5.1M | 0.84% |
+| chai | 23,464 | 9,543 | 224M | 0.31% |
+| DeltaBlue | 537 | 1,178 | 0.63M | 0.25% |
+| TypeScript | 64,653 | 2,191 (1.2K) | 142M (78M) | 0.25% (0.13%) |
+| Box2D | 6,208 | 1,007 | 6.3M | 0.15% |
+| PdfJS | 3,979 | 1.2K (its own 8,503) | 4.8M | 0.07% |
+| Richards | 64 | 1,524 | 0.10M | 0.07% |
+| RayTrace | 449 | 1,293 | 0.58M | 0.06% |
+| Vue | 534 | 1,220 | 0.65M | 0.05% |
+| Gameboy | 5,020 | 1.2K | 6.0M | 0.04%, but see 6c |
+| EarleyBoyer, Crypto, Mandreel, Splay, React | 239, 105, 983, 49, 1 | 1.2K | | under 0.02% |
+
+These are estimates, not measurements. Main's moves come earlier than C3's, so each refills fewer
+ways: Djot 103 per move against 210 for C3's. The estimate scales by refills, not by moves. The
+implementation must measure the saving itself. Djot's 0.84% matters most, because Djot is the phase
+exit's remaining gap.
+
+For C3. The split (counts/c3probe2.txt; counts/callee-epoch.txt for the rest) takes the epoch's
+share off C3's cost:
+- chai +0.46% to +0.11%, Djot +0.31% to +0.16%, DeltaBlue +0.23% to +0.12%;
+- React -4.89% to -5.00%, RayTrace -0.50% to -0.52%, Richards -0.22% (unchanged);
+- against main's C3 counts (counts/c3c.txt, a different pair of binaries, so approximate): Vue
+  -0.04% to -0.14%, TypeScript -1.70% to -1.78%, PdfJS -0.35% to -0.63%, EarleyBoyer -0.12% to
+  -0.23%, Box2D +0.10% to +0.01%, Mandreel +0.10% (unchanged);
+- Gameboy -0.32% to about +0.08%: its gain is the epoch's (6c).
+That puts every workload inside the 0.2% bound. Djot still pays +0.16% for second stages that gain
+nothing (7). C3's own moves refill chai 33,397 ways, of which 108 find the tiered-up code; DeltaBlue
+235, of which 15; Djot 632, of which 12.
+
+For P2's tier 1. Tier 1 ("region code only where a function has run", approved 2026-11-05) adds
+the region spans by a recompile when hot. Each of those is a publication. Today each costs a
+refill of every way that its function's callers did not need: 350 ways in chai, 212 in TypeScript,
+103 in Djot and 100 in Box2D (section 1). At about 1.2K instructions a refill (chai 9.5K), that is
+0.12M to 3.3M instructions a recompile, however small the function, and the other pages and
+workers of the process refill their ways too. With per-callee pickup a recompile refills its own
+callers' ways, about one. Tier 1's recompiles are then bounded by their compile cost alone, as the
+exemplars' tier-ups are.
+
+For Phase 3. This removes the second of the two reasons region admission's step 3 cost three times
+what it saved: "Each record moves the call caches' global epoch" (Decision 27, "Carried to
+Phase 3"). The first reason, recompiling code that has barely warmed up, stays with P3's
+speculative tier.
+
+6. SIDE EFFECTS THE DESIGN MUST HANDLE
+
+A move does more than refill. The epoch-alone mode's other effects went both ways.
+
+a. The planner's fingerprint. Every move changes every chunk's fingerprint, so the planner reruns
+   at their next checkpoints. EarleyBoyer's three extra moves cost +3.4M (0.11%) with only 34 more
+   refills, and its log shows two more empty plans. With per-callee pickup the fingerprint drops
+   the epoch: chunk_raw already moves when a callee gets new code. C3's call-target rule then
+   becomes the same as the fingerprint's.
+b. What compiles read. Plans and templates read the ways' state. After React's two extra moves, one
+   recompile spliced a larger body (101 operations and 17,984 bytes, against 77 and 12,444). That
+   cost +0.33M, 0.11%, with three refills. Djot, DeltaBlue and Gameboy each had compiles that came
+   out a few bytes different.
+c. The eviction and admission windows. A site's megamorphic evictions and overflow admissions
+   (64 an epoch, CALL_SITE_OVERFLOW_ADMISSIONS) restart with each move.
+   - Gameboy's executeIteration (gbemu-part2.js:5732) calls through tables of hundreds of
+     handlers: `this.memoryReader[this.programCounter](...)` (5751) and
+     `this.OPCODE[opcodeToExecute](this)` (5762). Gameboy has three megamorphic sites, and each
+     move renews their budget.
+   - C3's 36 moves alone sent 72,147 fewer of the calls at two of executeIteration's sites through
+     the call helper (pcs 216 and 68: 204,390 and 45,969 CallWithThis helper operations, against
+     137,213 and 40,999; 67,536 fewer in all; callee/gb). That took 0.40% off Gameboy's count.
+   - With per-callee pickup, Gameboy's epoch moves once a run. The budget then needs a renewal of
+     its own: by the site's own misses, or a megamorphic path in machine code that reads the
+     callee's current code, as the exemplars' generic calls do (V8's CallJSFunction for any
+     function; SpiderMonkey's loadJitCodeRaw).
+   - Megamorphic sites today: chai 7, TypeScript 9, Djot 5, Gameboy 3. Longer windows can make
+     more of them. V8, SpiderMonkey and JSC do not reset their counts when another function tiers
+     up.
+   - Measure these sites and Gameboy with the implementation.
+
+7. OPEN FOR C3: WOULD THE SECOND STAGE WIN?
+
+Djot's three tier-ups (addMatch, a RegExp exec wrapper and skipSpace) run no faster in line than
+compact (+0.10M), so whatever triggers them pays their recompiles (+0.14%) for nothing. React's
+two gain 4.9%.
+
+In V8 the answer is feedback-driven. V8 waits for stable feedback
+(minimum_invocations_after_ic_update), and its optimizing tiers gain by speculating on that
+feedback: Maglev's benefit comes from speculation, not from re-emitting the same operations.
+
+Here a first-stage chunk and its second stage differ mostly in baked IC state. The in-line
+templates bake each site's one cached state (a shape and slot, a call target, an intrinsic), where
+the compact first stage reaches that state through a shared stub. So the question can be answered
+from the chunk's caches before the recompile: how many of its executed sites hold a state the
+in-line templates would bake. Sites that are megamorphic, uncached or native-bound (RegExp exec)
+gain nothing.
+
+Proposed measurement for C3's next step: the cache states at Djot's three sites and React's two,
+to see whether such a count separates them.
+
+8. STEPS, IF IT COMES INTO P2
+
+1. A2 against main, its own commit:
+   - The superseded state: a Rust flag, plus the retry word as the standing request. It is set at
+     each publication (inline recompile, C1, and C3 once it lands) on the chunk the new one
+     replaces in the Realms it serves.
+   - The redirect in the call-hit helper, the Op::New helper and resolve_cached_call_entry.
+   - The multi-Realm fallback.
+   - The fingerprint without the epoch (6a).
+   - The windows re-keyed off the epoch (6c).
+   - Tests:
+     - a caller of a recompiled function enters the new chunk at its next call, while another
+       site's way keeps its epoch and does not refill;
+     - a construct site picks up a constructor's new code;
+     - a caller in another Realm keeps the old chunk and stays direct after one fallback;
+     - a frame running the replaced chunk finishes in it;
+     - Rust callers (a forEach callback, a Proxy trap through Rust) pick up new code;
+     - a megamorphic dispatch site keeps its overflow entries.
+2. Measured against main as the compact series was: counts, with Djot, chai, DeltaBlue, TypeScript
+   and Gameboy against the estimates; fills, refills and megamorphic sites from the probe's
+   diagnostics; bytes (no change expected); TRust's pages; the gate; and x86-64's checks on
+   zombie.
+3. C3 re-measured on top, with item 7 answered first.
+
+Status (2026-11-06): the design is ready; its implementation in P2 pulls forward the per-callee
+invalidation the owner's Decision 27 carried to Phase 3, so it waits on the owner's answer. The
+coordinator recommends A2 in P2: on main it would remove most of the call caches' refills (about
+0.84% of Djot, the phase exit's remaining gap, by the probe's estimate), and it unblocks C3 and the
+approved tier 1 (region code only where a function has run), both of which arrive by recompile.
