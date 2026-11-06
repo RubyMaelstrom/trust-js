@@ -530,9 +530,17 @@ fn remember_validated_static_snapshot(bytes: &'static [u8]) {
     }
     if validated.len() == MAX_VALIDATED_STATIC_SNAPSHOTS {
         validated.remove(0);
+        #[cfg(test)]
+        STATIC_SNAPSHOT_EVICTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     validated.push(key);
 }
+
+/// Entries [`remember_validated_static_snapshot`] has forgotten past the bound, in this process:
+/// tests running beside a test of the list can push its entry out.
+#[cfg(test)]
+static STATIC_SNAPSHOT_EVICTIONS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 
 // ---- Vec / Option helpers (monomorphized by hand to keep the reader borrow simple) ------------
 
@@ -2442,23 +2450,35 @@ mod tests {
 
     #[test]
     fn static_decode_validates_bodies_once_per_process() {
-        let bytes = leak(&crate::compile_snapshot(NESTED).unwrap());
-        let before = validated_bodies();
-        let first = decode_static(bytes).unwrap();
-        let validated = validated_bodies() - before;
-        // Every function of the snapshot, nested ones included, exactly once.
-        let functions = format!("{:?}", decode(bytes).unwrap())
+        use std::sync::atomic::Ordering::Relaxed;
+        let source = crate::compile_snapshot(NESTED).unwrap();
+        let functions = format!("{:?}", decode(&source).unwrap())
             .matches("Function {")
             .count();
-        assert_eq!(validated, functions);
         assert!(functions >= 10, "{functions}");
-        let second = decode_static(bytes).unwrap();
-        assert_eq!(validated_bodies() - before, validated, "already validated");
-        assert_eq!(format!("{first:?}"), format!("{second:?}"));
-        // The same content at another address is validated again.
-        let copy = leak(bytes);
-        decode_static(copy).unwrap();
-        assert_eq!(validated_bodies() - before, 2 * validated);
+        // The list of validated snapshots is the process's, and bounded: tests decoding other
+        // static snapshots meanwhile can push this one's entry out, and then its next decode
+        // validates it again, as it should. So try again, at a fresh address, until no entry was
+        // forgotten between the two decodes.
+        for attempt in 0.. {
+            let bytes = leak(&source);
+            let evictions = super::STATIC_SNAPSHOT_EVICTIONS.load(Relaxed);
+            let before = validated_bodies();
+            let first = decode_static(bytes).unwrap();
+            // Every function of the snapshot, nested ones included, exactly once.
+            assert_eq!(validated_bodies() - before, functions);
+            let second = decode_static(bytes).unwrap();
+            if super::STATIC_SNAPSHOT_EVICTIONS.load(Relaxed) != evictions && attempt < 99 {
+                continue;
+            }
+            assert_eq!(validated_bodies() - before, functions, "already validated");
+            assert_eq!(format!("{first:?}"), format!("{second:?}"));
+            // The same content at another address is validated again.
+            let copy = leak(bytes);
+            decode_static(copy).unwrap();
+            assert_eq!(validated_bodies() - before, 2 * functions);
+            break;
+        }
     }
 
     #[test]
