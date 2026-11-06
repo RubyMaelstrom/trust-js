@@ -18608,3 +18608,366 @@ CHECKS
 - Test262 with TRUST_JS_INLINE_AT=1 (second stages at 1-85 runs, compiled from younger caches):
   53,575/53,575.
 - x86-64: no change (no register regions there).
+
+### Per-callee code pickup (A2): a function's new code supersedes the chunk it replaces (record, 2026-11-06)
+
+Landed by fast-forward: main ea6fd916 to 9747c2df (an agent's; gated on its own tree, below).
+Decided (the coordinator's): EarleyBoyer's +0.38% is reported and taken with the series, a
+net gain elsewhere (Djot -1.37%, Gameboy -1.23%, chai -0.35%, TypeScript -0.27%). Its cause is
+the planner's: it splices only the closure a way names, and a way keeps the first closure of a
+function it saw, while EarleyBoyer's parser makes its helpers afresh for each parse; main's epoch
+moves refilled those ways by accident. Its fix is the exemplars' closure-call inlining, its own
+step after candidate 2: the inlined callee guarded by its code, not its identity (JSC's
+GetExecutable and CheckIsConstant, dfg/DFGByteCodeParser.cpp:1942-1951; V8's call feedback
+widens from a JSFunction to its FeedbackCell for closures of one creation site, which TurboFan
+inlines behind a closure check; SpiderMonkey's Warp guards the callee's script,
+GuardFunctionScript). Not the probe's refresh of every way at each major collection: that moves
+the epoch (or a per-heap one) for what the exemplars do with code identity.
+
+The design note's A2 ("### A function's new code picked up per callee, not through the global
+call-cache epoch", 7dc412c8), approved by the owner 2026-11-06 with Gameboy's admission budget
+given a renewal of its own. One commit, p2-a2 9747c2df on main ea6fd916 (worktree
+target/p2/compact/a2-wt). Measured against main ea6fd916 (fat LTO, lto/a2-main-ea6fd916 and
+lto/a2-9747c2df); event counts from architecture-diagnostics builds (a2/ev2, a2/events-table.md).
+
+WHAT CHANGED
+
+- A publication (the inline recompile; C1's recompile without property chains; C3's tier-up when it
+  lands) puts the new chunk in its set-once slot through FunctionRuntime::publish, which
+  supersedes the chunk it replaces as the publishing Realm's current code (Chunk::supersede): the
+  replaced chunk's retry word becomes 1, a standing request, so every direct entry into it takes
+  the call-hit helper (its retry gate sees the checkpoint due); the chunk keeps the word it had for
+  the time it is current again. No epoch move: no other call site re-resolves, in this heap or any
+  other. V8's tiering request is the same device on a function's dispatch entry
+  (SetTieringRequest, src/sandbox/js-dispatch-table.h:267-271); TRust's callers cache the code,
+  so the redirect also refills the caller's way.
+- The call-hit helper refills a superseded way in place with the function's current code in the
+  way's Realm (bytecode::refill_superseded): the chunk fields Interp::call_jit_fast would record
+  for the same callee, whose identity and proofs stay. A code-keyed way (another closure of the
+  function) is refilled too, which a fill under the live closure's identity would leave behind.
+  While the current code has no entry yet (not compiled), the generic call runs it.
+- Rust's probes (resolve_cached_call_entry: the identity ways, the code-sharing retry, the
+  overflow table) refill a superseded way or miss; a prepared call is stale once its chunk is
+  superseded; call_compiled_target and the construct caches miss on a superseded chunk and refill.
+- The multi-Realm fallback (bytecode::note_selected): a fill whose Realm still selects a
+  superseded chunk (a second stage planned in another Realm) makes it current again and moves the
+  epoch, so the publishing Realm's callers find the new chunk, as every publication did before.
+  Once a chunk at most; none in any of the 19 workloads or TRust's three pages.
+- The planner's fingerprint no longer hashes the epoch (note 6a).
+- The overflow admissions (note 6c): an entry the table holds for a callee (stale or superseded)
+  refills without an admission, and a megamorphic site's window renews after
+  CALL_SITE_OVERFLOW_RENEWAL (1024) of its calls went through the full guards for want of an
+  entry, as well as at an epoch move.
+- Diagnostics: TRUST_JS_JIT_PUBLISH_EPOCH=1 moves the epoch at publications as before (no chunk
+  is superseded); TRUST_JS_JIT_OVERFLOW_RENEWAL=<n>; architecture-diagnostics builds count
+  supersessions, in-place refills, Realm fallbacks and renewals; CALLSTAT=2 counts the helper's
+  generic calls for a superseded way.
+- Tests (bytecode::callee_pickup_tests, 7); six fail with TRUST_JS_JIT_PUBLISH_EPOCH=1.
+
+COUNTS (fat LTO, the fixtures and Octane at a fixed 5 runs, median of 3, chai one run; CPUs 10-13,
+setarch -R, pacing off; counts/a2-9747c2df.txt)
+
+| workload | main ea6fd916 | A2 9747c2df | change |
+| --- | --- | --- | --- |
+| vue | 1,395,955,246 | 1,394,522,256 | -0.10% |
+| react | 293,200,344 | 293,174,551 | -0.01% |
+| djot | 590,109,174 | 582,044,160 | -1.37% |
+| chai | 72,560,146,537 | 72,302,741,453 | -0.35% |
+| richards | 131,229,148 | 131,176,890 | -0.04% |
+| deltablue | 253,957,978 | 253,302,790 | -0.26% |
+| crypto | 711,718,136 | 711,629,780 | -0.01% |
+| raytrace | 988,080,681 | 987,942,900 | -0.01% |
+| earley-boyer | 3,089,812,743 | 3,101,608,771 | +0.38% |
+| regexp | 2,669,805,731 | 2,671,923,765 | +0.08% |
+| splay | 1,366,409,548 | 1,366,360,816 | -0.00% |
+| navier-stokes | 440,203,112 | 440,213,347 | +0.00% |
+| pdfjs | 6,867,608,068 | 6,862,670,231 | -0.07% |
+| mandreel | 61,058,267,872 | 61,057,701,153 | -0.00% |
+| gbemu | 14,904,325,018 | 14,720,849,965 | -1.23% |
+| code-load | 476,614,755 | 476,604,715 | -0.00% |
+| box2d | 4,184,291,156 | 4,177,480,850 | -0.16% |
+| zlib | 133,999,094,537 | 133,998,868,047 | -0.00% |
+| typescript | 57,662,755,861 | 57,504,329,225 | -0.27% |
+
+Against the note's estimates: Djot -1.37% (estimated -0.84%), chai -0.35% (-0.31%), DeltaBlue
+-0.26% (-0.25%), TypeScript -0.27% (-0.13% to -0.25%), Box2D -0.16% (-0.15%), Vue -0.10% (-0.05%).
+
+Same binary (lto/a2-9747c2df), the epoch moved at publications as before or not: the counts
+script's invocation with TRUST_JS_JIT_PUBLISH_EPOCH=1 against an unread variable of the same
+length (counts/a2-toggle-epoch.txt). The environment's layout alone moves some counts: DeltaBlue on
+the same binary counts 251.95M or 253.30M by how the variables are passed (the conservative stack
+scan sees other words), so toggles keep the environment's length. Supersession against the epoch:
+Djot -1.15%, chai -0.34%, DeltaBlue -0.23%, Box2D -0.19%, Vue -0.16%, Richards -0.04%, RegExp
+0.00% (no publication), TypeScript -0.29%; EarleyBoyer +0.35%, Gameboy +0.04%, PdfJS +0.04%.
+Gameboy's -1.23% against main is the admission window's.
+
+EVENTS (architecture-diagnostics builds, one run each; a2/events-table.md)
+
+| workload | fills main / A2 | refills main (stale) / A2 (in place) | publications | refills a publication |
+| --- | --- | --- | --- | --- |
+| chai | 72,238 / 18,883 | 23,553 / 82 | 67 / 66 | 352 / 1.2 |
+| TypeScript | 71,655 / 2,775 | 65,183 / 544 | 305 / 306 | 214 / 1.8 |
+| Djot | 4,705 / 343 | 3,735 / 46 | 36 / 36 | 104 / 1.3 |
+| Box2D | 7,240 / 527 | 6,281 / 71 | 62 / 58 | 101 / 1.2 |
+| PdfJS | 5,184 / 673 | 4,004 / 30 | 19 / 19 | 211 / 1.6 |
+| Gameboy | 6,389 / 618 | 5,216 / 65 (+160 after its one fencing move) | 134 / 133 | 39 / 0.5 |
+| DeltaBlue | 750 / 172 | 560 / 23 | 23 / 23 | 24 / 1.0 |
+| Vue | 1,372 / 805 | 550 / 18 | 10 / 10 | 55 / 1.8 |
+| EarleyBoyer | 521 / 121 | 291 / 62 | 20 / 20 | 15 / 3.1 |
+| Mandreel | 1,371 / 373 | 998 / 15 | 16 / 16 | 62 / 0.9 |
+
+The epoch moves only to fence: CodeLoad 39 and zlib 31 (dropped runtimes), Gameboy 1. No Realm
+fallback in the 19 or TRust's three pages. Megamorphic sites: Gameboy 3 to 5, TypeScript 9 to 11
+(the eviction windows now span the run, as the exemplars' megamorphic states do), others as on
+main.
+
+GAMEBOY. Its dispatch sites' calls through the generic helper: main 254,861, A2 22,966; direct
+entries 3,356,142 to 3,588,254. The renewal matters: with no renewal (TRUST_JS_JIT_OVERFLOW_RENEWAL
+=65535) the helper takes 80,566; renewals after 64, 256 or 1,024 refusals all renew once and take
+about 22,950 (4,096: 24,432). An entry the table holds refills without an admission, so its
+callees' new code costs no budget (a2/events-gb-renewal.md).
+
+EARLEYBOYER. Three of its second stages plan smaller on A2: loop1's (360 operations, 95 KB on main;
+103, 16 KB on A2), sc_loop1_75's (367 to 235) and conf_set_union's (118 to 77), with the same plans
+elsewhere (a2/eb). Their sites call closures made afresh for each parse (the parser's helpers),
+and a way keeps the first closure it saw: a code-keyed hit (another closure of the function) does
+not refill it. Main's publications moved the epoch, those sites refilled with the parse's live
+closures, and the planner, which splices what a way names, spliced them; on A2 it finds the way's
+callee dead ("dead callee") or not the one the site calls. Refreshing every way at each major
+collection (a probe, p2-a2-probe 47ec4cd5, TRUST_JS_PROBE_MAJOR_EPOCH, same binary, equal-length
+toggle; counts/a2-toggle-major.txt): EarleyBoyer -0.59%, PdfJS -0.13%, Gameboy -0.05%, chai
++0.02%, TypeScript +0.06%, the others within 0.01%. Emptying only the ways whose callee died (a
+probe, p2-a2-relink f6eef556) leaves EarleyBoyer where it is (-0.07%, across builds), presumably
+because closures of earlier parses are still alive when the planner runs. JSC inlines a closure
+call by checking the callee's executable, not its identity (GetExecutable and CheckIsConstant,
+dfg/DFGByteCodeParser.cpp:1942-1951).
+
+BYTES. Djot 2,508,528 to 2,418,484 (-3.6%), Vue 439,468 to 411,600 (-6.3%), React unchanged:
+second stages plan with the ways as they stand rather than just refilled (bytes-a2-9747c2df.txt).
+
+TRUST (78435d0, three pages, (s5 - s1) / 4 a page, CPU 5): machine code event-loop 804,220 both,
+dom-reconcile 1,663,859 to 1,663,863, Vue TodoMVC 6,591,023 to 6,464,813 (-1.9%); compile time
+10.90 to 10.89 ms, 21.89 to 21.72 ms, 85.58 to 82.12 ms (-4.0%). All pages exit 0; no Realm
+fallback. Spike (CPU 5, alternating): 08:05, main 3630 and 3636, A2 3633 and 3553; 21:17, three
+rounds, main 3568, 3653, 3653, A2 3648, 3643, 3580 (the low rounds of both builds with about 790 MB
+maxrss against about 710 MB: a collection's timing in Splay). The first session's A2 rounds took
+a second longer in the benchmark loop (22.5 and 22.7 s against 21.5); the second's did not (21.45,
+21.43, 21.67 s against 21.70, 21.42, 21.48). The second session ran beside counts on CPUs 10-13
+(load about 3).
+
+CHECKS. Lib suite 2,859 passed (7 new); clippy in three configurations; rustfmt; the gate:
+fixtures as the base, difftest 138 agree, Test262 53,575/53,575 identical to main's report, and
+with TRUST_JS_INLINE_AT=1 53,575/53,575; the semantics programs equal across tiers. Zombie
+(x86-64): clippy x3 clean, lib 2,634 passed, the pickup tests pass.
+
+### A native's fast entry from generated code; includes, indexOf and substring in line (design note, 2026-11-06)
+
+Decided (the coordinator's, under the owner's approval of design questions as recommended,
+2026-11-04): A1 (the class test and the native's call in a machine-code stub, as SpiderMonkey's
+and JSC's), B2 (the boundary keeps depth, the construct state, call_site, the pending tail and
+the Agent restore, and drops the two interrupt polls and the safepoint at a native's entry, as
+all three exemplars do, with the proposed tests that a deadline interrupts and an allocating
+native's loop collects at its back edge), C1 (template ids of their own for includes, indexOf
+and substring, as codePointAt's and charCodeAt's). Steps 1-3 as proposed, each measured before
+the next.
+
+Djot's candidate 2 in the coordinator's decided order (plan, "### Djot's gap, by where its time
+goes", CANDIDATES 2 and "Decided"), which also serves Vue's candidate 4 (plan, "### Vue's native
+calls, measured"). Nothing here is implemented. Census and microbenchmarks ran on the fat-LTO build
+of tier 1 (b) (target/p2/compact/lto/t1b-2b9008c0), whose JIT is main ea6fd916's; the exemplars'
+sources were fetched 2026-11-06 06:42Z (target/p2/compact/exemplar-src/fetch-2026-11-06d). Data:
+target/p2/compact/c2/ (census-notes.txt, natstat/, natc.js, natb.js, per-iter-*.txt, split-*.txt).
+
+SUMMARY
+
+1. A native callee declines the direct-call sequence at its first gate and takes the call-hit
+   helper (H_CALL_HIT), which decodes the call op, reads the way and either runs the native on the
+   caller's window (the light classes: no author code for these operands) or through the
+   native-call boundary (call_native_committed_with). Measured an iteration: a light native
+   costs the helper about 160 instructions (Number.isInteger: 410 an iteration, the helper 39%);
+   a boundary native about 75 in the helper and about 230 in the boundary (Object.getPrototypeOf:
+   677 an iteration). The in-line template class (codePointAt) costs 236 an iteration in all.
+2. Census (NATIVESTAT=1, H_CALL_HIT's native entries):
+   - Djot: 62,805 native entries. Light (String's primitive class): includes 13,002,
+     substring 11,043, trim 172, slice 69. Boundary: exec 27,246, test 5,011, keys 2,498,
+     replace 2,110, assign 1,376, splice 152, split 69, join 57.
+   - Vue: 386,430 native entries: WeakMap's and Map's get 245,079 (operand-only), Reflect.get
+     78,629, Reflect.set 23,763 and Reflect.has 10,724 (answered on their operands), parseInt
+     13,452 and Number 12,085 (light primitive-argument class), and 2,700 others.
+   - React: none (869 helper entries, all user callees in warm-up).
+3. What a direct entry removes, estimated from the split (a stub of about 45 instructions for a
+   light native, about 105 with a lean boundary):
+   - a light native: about 115 of the helper's 160. Djot's 24,286 light calls: 2.8M.
+   - a boundary native: about 55 of the helper's 75 if the boundary stays whole (fork B1), about
+     200 of its 305 if the boundary keeps only what re-entry needs (B2). Djot's 38,519 boundary
+     calls: 2.1M (B1) or 7.7M (B2).
+   - part (b), the generic native's own prologue for includes (ToString of the receiver, IsRegExp,
+     position clamping: about 170) and substring (argument conversion: about 95): 3.2M for Djot's
+     24,045 calls.
+   Djot (582M on A2): 0.8% (B1) to 1.8% (B2) for (a), 0.55% for (b). Vue (1.39G): about 44M
+   (3.2%) for (a), nearly all light.
+4. The exemplars enter a native or builtin from baseline code with a frame record (the GC's and
+   stack walker's view), an exception test, and a Realm switch only for a cross-Realm callee. None
+   polls interrupts, counts depth or makes a safepoint at the native's entry; a native that recurses
+   checks its own stack.
+5. Proposed: (a) a process-wide native-call stub entered at a native way's hit, which tests the
+   class's operand conditions in line and enters the native through one generic extern "C" shim,
+   with a lean boundary for natives that can run author code; (b) includes, indexOf and substring
+   as call templates with typed helpers, as codePointAt is. Forks in section 4.
+
+1. THE CENSUS
+
+Instructions an iteration (one call an iteration; 1.2M minus 200k iterations over 1M; CPU 12,
+setarch -R, pacing off):
+
+| loop body | path | an iteration |
+| --- | --- | --- |
+| `c += s.length` (no call) | - | 109 |
+| `s.codePointAt(i & 31)` | in-line template | 236 |
+| `Number.isInteger(i)` | helper, light | 410 |
+| `s.indexOf('lazy')` | helper, light | 648 |
+| `Object.getPrototypeOf(o)` | helper, boundary | 677 |
+| `s.includes('lazy')` | helper, light | 701 |
+| `o.valueOf()` | helper, boundary | 708 |
+| `Object.isFrozen(o)` | helper, boundary | 718 |
+| `s.substring(4, 9)` | helper, light | 743 |
+| `o.hasOwnProperty('a')` | helper, boundary | 840 |
+| `arr.indexOf(2)` | helper, boundary | 926 |
+| `re.test(s)` | helper, boundary | 1,276 |
+| `Object.keys(o)` | helper, boundary | 1,790 |
+| `re.exec(s)` | helper, boundary | 2,500 |
+
+The split (perf record -e instructions:u; per iteration):
+- Number.isInteger: jit_call_hit 39% (160: the shared helper stub, explicit_call's position,
+  the op decode, the way's read, the class match and operand test, the construct state, the
+  result), the native 3% (11), generated code the rest.
+- Object.getPrototypeOf: jit_call_hit 11% (75), with_borrowed_values' closure (the boundary's
+  body: depth, stack checkpoint, safepoint, construct state, interrupt polls) 13% (87),
+  RuntimeInterrupt::current_reason 12% (81), call_native_committed_with's inner closure 4% (25),
+  activate_agent (with_host_callback's restore) 4% (24), run_pending_tail 2% (14), the native
+  6% (39).
+- includes: jit_call_hit 21% (148); the native about 40% (280: its closure 93, Units::index_of 92,
+  arg_is_regexp 50, memcmpeq 18, this_string 17, str_clamp_pos 9).
+- substring: jit_call_hit 26% (195); the native: alloc_string_cell 112, its closure 58,
+  slice_units 42, from_units_at_width 23, arg_to_number 23, this_string 14.
+
+2. WHAT THE EXEMPLARS DO
+
+- SpiderMonkey. CallIRGenerator::tryAttachCallNative (CacheIR.cpp:14140) tries the inlinable
+  natives first, then guards the callee's identity and emits callNativeFunction.
+  BaselineCacheIRCompiler::emitCallNativeShared (BaselineCacheIRCompiler.cpp:2946-3058):
+  - keeps: a stub frame and a native exit frame (callee, argc, frame descriptor, return address and
+    frame pointer; enterFakeExitFrameForNative), which the GC and stack walks read; the arguments
+    as vp (callee/result, this, args); the exception test (branchIfFalseBool to the exception
+    label); a Realm switch only when the callee is in another Realm (isSameRealm);
+  - drops: everything else. No interrupt check, no depth count, no stack check: a native that may
+    recurse checks its own recursion limit.
+  - In line: tryAttachStringIncludes (8446), tryAttachStringIndexOf (8477), the substring kernel
+    (8107), codePointAt (8375), Object.keys (10364): guards on the callee, a string `this` and a
+    string argument, then a typed VM call (CacheIRCompiler.cpp:5054, 5071: AutoCallVM of
+    js::StringIncludes / js::StringIndexOf), with an exit frame and no JSNative vp.
+- JavaScriptCore. A monomorphic call link caches the callee and its entry
+  (linkMonomorphicCall, Repatch.cpp:84-107); a host function's entry is the native thunk
+  (nativeForGenerator, ThunkGenerators.cpp:431-509). The caller lays down a JS call frame; the
+  thunk stores it as vm.topCallFrame, calls the host function with its global object, and tests
+  vm.exception. No interrupt or stack check in the thunk.
+- V8. Sparkplug calls the Call builtin through a feedback-collecting trampoline
+  (BaselineCompiler::BuildCall, baseline-compiler.cc:1717; CallReceiver, builtins-call-gen.cc:
+  529-562), which enters the function's code (Generate_CallFunction, builtins-arm64.cc:2944-3023).
+  String.prototype.includes and substring are Torque `javascript builtin`s (string-includes.tq:10,
+  string-substring.tq:8): generated code on the JS calling convention, no C++ transition. A C++
+  builtin goes through an adaptor and an exit frame (Generate_Adaptor, builtins-arm64.cc:54;
+  BuiltinExitFrame, frames.h:948).
+
+What all three keep: a frame record (GC and stack walks), the exception test, the callee's Realm.
+What all three drop at a native's entry: interrupt polls, depth counting, safepoints. Re-entry
+into JavaScript goes through the ordinary call path, whose callee checks the stack.
+
+3. THE DESIGN
+
+(a) The native-call stub.
+- Entry. The call template's hit path tests the way's `native` word where a native now declines
+  the direct sequence's static gates, and calls a process-wide shared stub, NativeCall{argc,
+  with_this}, as the DirectCall stub is entered. The stub reads the way (x12) and the operands
+  (x20): no immediates; ctx.interp for the interpreter's words (no heap or thread address, per
+  "JIT shared stubs are process-wide").
+- The light classes in line. The class byte (`CallIc::intrinsic`) selects the operand test that
+  `native_operands` makes in Rust today (primitive receiver and arguments, Numbers, the
+  operand-only collections); a pass enters the native through `jit_native_light` (below), and a
+  fail returns to the H_CALL_HIT form, unchanged.
+- The shim. One extern "C" function, `jit_native_entry(interp, native, this_slot, args, argc,
+  out) -> u32`, calls the way's NativeFn at its Rust signature, writes the result word or places
+  the error (`ctx.error`) and returns the flag. The stub retires the operands and pushes the
+  result, as the helper does.
+- The GC's view. The receiver, callee and arguments are the record's operands, which the collector
+  scans whole while the record runs (jit::JitFrame); a call is a full frame effect, so a register
+  region writes its values back before it (jit_regions.rs, frame_effect). The stub holds no Value
+  in a register across the native. Nothing new to root; the native's own allocations follow the
+  heap-held-value rule as today.
+- Exceptions. As the helper: Err(value) becomes ctx.error and flag 1, and the site unwinds. The
+  call's position goes into interp.call_site around the call (explicit_call's job today), read
+  from the site as the DirectCall stub reads it (DirectCallSite::AfterReturn).
+- The construct state. A native reads `constructing` and `new_target`; the stub enters only when
+  the caller is not constructing and new.target is Undefined (the ordinary case, which the light
+  path already tests), else the helper.
+- The stack. The stub takes the direct sequence's depth gate (depth below direct_call_depth),
+  which leaves the stack headroom the direct calls rely on; deeper calls take the helper and its
+  stack growth.
+- Re-entry (boundary natives: replace with a function argument, ToString's getters, Proxy traps):
+  the native may run author code, so the stub enters through `jit_native_boundary`, which keeps
+  what re-entry needs: depth (so nested calls count and the stack checkpoint fires), the construct
+  state, interp.call_site, the pending tail (Function.prototype.call/apply hand their callee back
+  through it), and the Agent restore where a native can switch Agents (with_host_callback). What it
+  drops is fork B.
+- Realms. The way proved the native same-Realm at fill (native_call_in_current_realm), as
+  SpiderMonkey's isSameRealm; no switch.
+- x86-64 has no direct sequence and keeps its calls on the generic helper; (a) is ARM64's, and
+  the lean boundary of fork B serves both through the Rust helpers.
+
+(b) includes, indexOf and substring in line.
+- Three template classes beside codePointAt's: the call template tests the way's class, then a
+  String receiver and a String argument (includes, indexOf with one argument) or Number arguments
+  (substring), and calls a typed helper: `jit_string_includes(recv, search) -> bool`,
+  `jit_string_index_of(recv, search) -> i32`, `jit_string_substring(interp, recv, start, end) ->
+  word`. A miss takes the native-call stub. SpiderMonkey's attachments are the model (the guards,
+  then a typed VM function); V8's are Torque builtins.
+- The search helpers read two immutable string cells: no allocation, no author code, no
+  boundary. substring allocates its result in the running heap (allocation does not collect in
+  TRust; the next safepoint does).
+- The classes: today these natives carry INTRINSIC_LIGHT_PRIMITIVE; the template ids replace it
+  for the three, and their templates' misses keep the light test (fork C).
+
+4. FORKS
+
+A. Where the class test and the call live.
+   A1. In the stub (machine code), with one extern "C" shim per native signature (proposed).
+   A2. A leaner Rust helper only (H_CALL_NATIVE, the way's address passed in, no op decode).
+   SpiderMonkey and JSC call the native from a stub built in machine code; V8's builtins are
+   generated code. A1 removes the most (the helper's prologue, the Rust class match); A2 is
+   smaller. Recommendation: A1.
+B. What the boundary keeps for natives that can run author code.
+   B1. Everything it does now, minus the decode (the shim calls call_native_committed_with).
+   B2. What re-entry needs (depth, construct state, call_site, pending tail, the Agent restore for
+       natives that can switch Agents); drop the two interrupt polls and the safepoint: the JIT's
+       own polls at entries and back edges remain (jit::emit_interrupt_poll), as V8, SpiderMonkey
+       and JSC poll in JavaScript code only.
+   Recommendation: B2, with the dropped polls' tests (a deadline interrupts a loop of native calls
+   at its back edge; an allocating native's loop collects at its back edge).
+C. The in-line templates' class.
+   C1. New template ids for includes, indexOf and substring; their misses run the light test in
+       the stub (proposed).
+   C2. Keep the light class and test for the three natives by builtin id in the stub.
+   Recommendation: C1, as codePointAt and charCodeAt have their own ids.
+
+5. STEPS
+
+1. (a) for the light classes: the stub, the shim, the depth gate; tests: a light native at a
+   site runs without the helper (a counter), its operands' non-light shapes take the helper, a
+   throw unwinds with the call's position, a constructing caller takes the helper. Measured: the
+   19 counts (Djot, Vue specifically), code bytes, TRust's three pages and the spike.
+2. (a) for the boundary natives (fork B's answer); tests: replace's function argument, a Proxy
+   trap and a getter re-enter; a tail call through Function.prototype.call; the interrupt and
+   collection tests of B2. Measured as step 1.
+3. (b) the three templates; tests: each template's hit and miss, ToString's order on an object
+   receiver (the miss), substring's argument clamping. Measured as step 1, and Djot's elapsed time
+   against node-sp in a quiet window under the HOLD protocol (the phase exit: 77 ms or less).
