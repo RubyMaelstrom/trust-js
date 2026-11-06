@@ -16860,3 +16860,260 @@ mutation proofs) and c2b046a7 (132 GC tests in the three modes, the fix-undone p
 clippy x3). Round 2's b465cedf, the same but for mark_object's recorded path, passed the same
 stress runs (the full lib under stress: 2,834 ok and the temporal_records test; the stress list
 663/664; the wide subset 15,207/15,209 and 15,209/15,209 in both tiers).
+
+### The tier-up's C2 and C3: the record filter, and hot first-stage code recompiled on stable feedback (record, 2026-11-05)
+
+C2 landed on main over 3d2894b7 as 043948a1 (580b8e19's code plus W6's step 6, line for line; that
+combined tree's ARM64 lib suite passed, 2,848 passed, 9 ignored, before main moved). C3 (702bc80c)
+held, the coordinator's decision (2026-11-06): it costs Djot +0.26%, chai +0.41% and DeltaBlue
++0.25% beyond the 0.2% bound, and Djot is the phase exit's remaining gap; chai's cost first, as a
+template fix (its second stages lose to its compact first stages in the proxy getter and the
+direct-call stub), DeltaBlue's getters measured, then C3 re-measured, with V8's work-weighted
+budget as the trigger's alternative if Djot's late tier-ups still cost.
+
+
+580b8e19 (C2) and 702bc80c (C3) on p2-c2, from main 670b8d7a: the tier-up design note's last two
+items, as decided ("C2 (a recompiled chunk's records forwarded only when they add bits) and C3
+(the tier-up at the last checkpoint, with V8's rule of waiting until feedback is stable),
+re-measured on top of C1").
+
+C2, THE RECORD FILTER (580b8e19)
+
+A transformed chunk's feedback vector (an inlined or recompiled chunk's, W4 step 7) sent every
+record through its record map to the baseline site: the map's target, that chunk, its vector,
+its record word, on every miss its helpers record, though the baseline's word already held the
+bits (the note's part 1: Splay's String + String helper records each call, chai's element
+helper each miss outside its in-line set). The transformed vector now keeps, in its own record
+words (which it left unused), the bits it has forwarded for each operation, and forwards a
+record only when it adds one (FeedbackVector::record). Nothing clears a record word (record is
+their only writer), so a forwarded bit stays at the baseline site and a later recompile there
+reads the same record; a record that adds nothing costs the first stage's load and compare. A
+transformed chunk still reads no record of its own (record_word), its records being its baseline
+sites'. No machine code changes.
+
+Test: feedback_record_tests::a_transformed_site_forwards_each_new_bit_to_its_baseline_site (a
+second stage's spliced Add misses on Strings three times, then on Booleans: both reach add's own
+site); it fails when Boolean records are kept from the map.
+
+C3, THE TIER-UP (702bc80c)
+
+A first-stage chunk takes the compact templates outside loops, and only an inline recompile (a
+non-empty inline plan at one of its four checkpoints, at about 100, 500, 2,100 and 8,500 native
+runs) gave its function a second stage with the in-line templates: hot code with nothing to
+splice ran on its compact first stage for good. At its last checkpoint, a first-stage chunk with
+nothing to splice whose call caches hold the targets they held at the checkpoint before, and
+whose function has no second stage, now recompiles once from its caches as a second stage
+(Interp::tier_up; bytecode::compile_tier_up: compile_with_inlines with an empty plan,
+Chunk::second_stage set before publication, now a Cell), installed as FunctionRuntime::code2
+with the call caches' epoch moved, as a landed inline recompile is. Its records go through its
+transformed vector to the first stage's sites, filtered by C2. Another Realm's call declines it.
+So do a first stage that keeps the in-line templates (jit::compact_first_stage: x86-64's, or
+ARM64's without shared stubs), which has nothing to leave, and a chunk whose constructions the
+arguments-apply forwarder runs from its caches (construct_arguments_apply_forwarder: RayTrace's
+Class.create constructor), whose native code the constructions do not run.
+TRUST_JS_JIT_NO_TIER_UP=1 turns it off; TRUST_JS_TIER_LOG=1 reports each tier-up with its runs
+and bytecode compile time (DIAGNOSTICS.md).
+
+The stable feedback is the call caches' targets (each entry's callee, function and environment;
+Chunk::call_targets), taken at each checkpoint beside the inline planner's fingerprint, which
+also hashes each entry's epoch and code. Those move whenever any recompile in the process moves
+the call caches' epoch (the epoch is a process static) or a callee gets new code: with the
+planner's fingerprint, one function's recompile held the others back, and the first version of
+this commit (df673e2e) failed its own test on x86-64, where the lib suite's concurrent tests
+moved the epoch between the test's checkpoints. The probe's "stable feedback" column in the
+design note (probe5) used that fingerprint, so it measured an epoch-dependent selection.
+
+V8 waits for stable feedback before it optimizes (flag-definitions.h,
+minimum_invocations_after_ic_update 500: "How long to minimally wait after IC update before tier
+up"; Maglev at invocation_count_for_maglev 400, TurboFan at 3000); JSC's Baseline goes to the DFG
+at thresholdForOptimizeAfterWarmUp 1000 (OptionsList.h) and SpiderMonkey's to Ion at
+normalIonWarmUpThreshold 1500 (JitOptions.cpp): all before our last checkpoint.
+
+Tests: jit::tier_up_tests (a function calling one native from a loop tiers up at its last
+checkpoint, as a second stage whose records map to its first stage's sites, and its calls run
+it; so does one whose cache refilled with its one target after the epoch moved between its last
+two checkpoints, which fails when the tier-up reads only the planner's fingerprint; one whose call
+site took a second callee between those checkpoints stays on its first stage, which fails when
+the tier-up also takes a changed checkpoint's empty plan; a Prototype.js-style constructor the
+forwarder runs stays on its first stage while the function constructing with it tiers up, which
+fails without the forwarder's decline). On x86-64 the tests find no tier-up, as they should.
+
+THE FIRST VERSION AND A PROBE
+
+bf862cec (C3 without its two declines) was measured first (counts/c3.txt with C2 and main in one
+session, c3/census.txt). On ARM64 it took React 4.92%, TypeScript 1.67%, RegExp 0.96%, PdfJS
+0.35% and Gameboy 0.32% off and cost RayTrace +0.50%, chai +0.41%, DeltaBlue +0.25% and Djot
++0.24%. On x86-64 (zombie, fat LTO, CPU 2, zombie/counts-c3b.txt) it cost React +0.55% and
+chai +0.87% (Crypto -0.40%, NavierStokes -0.30%, zlib -0.30%, Mandreel -0.28%): x86-64's first
+stage keeps the in-line templates, and the tier-up only recompiled them. A probe (p2-c3-probe 6ca21746,
+not for landing) measured, in one binary and one session, the tier-up off, on, without
+forwarder chunks (TRUST_JS_PROBE_TIERUP_FWD), also asking every property cache to hold its
+ways between the checkpoints (TRUST_JS_PROBE_TIERUP_PROPS: V8's IC-update rule over the property
+ICs too), and both (counts/c3probe.txt; every column but "on" ran through env(1), which costs
+about 1.37M instructions a run, so "on" reads that much low):
+
+| workload | off | fwd | props | both |
+| --- | --- | --- | --- | --- |
+| React | 297,950,002 | -4.88% | -4.88% | -4.88% |
+| Vue | 1,399,675,967 | -0.04% | -0.04% | -0.04% |
+| Djot | 604,658,090 | +0.31% | +0.31% | +0.32% |
+| chai | 72,646,586,691 | +0.45% | +0.46% | +0.43% |
+| Richards | 132,595,915 | -0.21% | -0.21% | -0.20% |
+| DeltaBlue | 256,612,781 | +0.24% | +0.24% | +0.25% |
+| Crypto | 716,563,870 | +0.08% | +0.08% | +0.08% |
+| RayTrace | 991,837,106 | -0.50% | +0.51% | -0.49% |
+| EarleyBoyer | 3,102,502,377 | -0.13% | -0.12% | -0.12% |
+| RegExp | 2,671,474,345 | -0.98% | -0.98% | -0.98% |
+| Splay | 1,396,809,157 | +0.02% | +0.02% | +0.02% |
+| NavierStokes | 441,159,349 | +0.00% | -0.00% | +0.00% |
+| PdfJS | 6,905,060,088 | -0.42% | -0.42% | -0.42% |
+| Mandreel | 61,207,137,228 | +0.10% | +0.10% | +0.10% |
+| Gameboy | 14,925,211,802 | -0.32% | -0.14% | -0.14% |
+| CodeLoad | 480,263,500 | +0.00% | +0.00% | +0.01% |
+| Box2D | 4,200,936,720 | +0.10% | +0.15% | +0.15% |
+| zlib | 133,595,168,740 | +0.01% | +0.01% | +0.01% |
+| TypeScript | 57,826,581,314 | -1.66% | -1.65% | -1.65% |
+
+The forwarder's tier-up alone cost RayTrace a full point: the Class.create constructor, one
+chunk for every class, whose constructions construct_arguments_apply_forwarder runs from the
+chunk's caches (the design note's part 2), went to its second stage, while the four other
+tier-ups (subtract, IntersectionInfo's initialize, two Color operations) gain 0.5%. The property
+rule changes nothing that matters: the four workloads' stable property caches are not what costs
+them. So 702bc80c declines the forwarder's chunk and a first stage with in-line templates, and
+keeps the call-target rule.
+
+What remains past the bound is Djot (+0.31%), DeltaBlue (+0.24%) and chai (+0.45%), from three,
+three and 38 tier-ups:
+- Djot's three (addMatch, a RegExp exec wrapper, skipSpace) compile 0.7 ms of native code
+  (JIT compile 0.0451 to 0.0458 s), about 3M instructions of its 604M: the run ends before the
+  second stages pay it back. DeltaBlue's three are one-line getters (`return this.elms.length`, a
+  direction test) in a 257M run; their recompiles and the three epoch moves' cache refills
+  (profile: Stub:CallSecondary, build_chain, the emitter) are the cost.
+- chai's 38 (profile, the same binary with and without, c3/prof/chai-*): stringDistance's second
+  stage comes out about even (its own code +2.64G instructions; the compact stubs it no longer
+  calls -5.93G; the in-line paths' stubs and helpers, Intrinsics2, MinMax, Equal and
+  get_computed_element, +3.11G), and the loss is in the proxy getter (+0.66G) and the direct
+  calls' stub (+0.65G): its assertion helpers' second stages are slower than their compact first
+  stages, as the design note's part 1 found.
+
+MEASURED
+
+Code bytes (TRUST_JS_JIT_MAP=1, opbytes.py; bytes-c3c/, fat LTO: main's code from
+lto/s5-b57534d0):
+
+| fixture | main | C2 | C3 | C3's chunks |
+| --- | --- | --- | --- | --- |
+| Djot | 2,700,060 | 2,700,064 | 2,725,040 (+0.93%) | 163 -> 166 |
+| React | 267,188 | 267,188 | 282,900 (+5.88%) | 12 -> 14 |
+| Vue | 461,080 | 461,080 | 476,208 (+3.28%) | 64 -> 76 |
+
+C2 changes no machine code. C3's added bytes are its tier-ups' second stages.
+
+Instructions (fat LTO, lto/s5-b57534d0, lto/c2-580b8e19 and lto/c3c-702bc80c in one session,
+CPUs 10-13, setarch -R, pacing off, median of 3; counts/c3c.txt):
+
+| workload | main | C2 | C3 | C2 | C3 | C3 against C2 |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 1,398,818,999 | 1,400,007,473 | 1,398,294,021 | +0.08% | -0.04% | -0.12% |
+| React | 296,613,783 | 296,576,220 | 282,029,686 | -0.01% | -4.92% | -4.90% |
+| Djot | 602,813,372 | 602,270,639 | 604,387,808 | -0.09% | +0.26% | +0.35% |
+| chai | 72,678,350,882 | 72,663,399,601 | 72,975,071,160 | -0.02% | +0.41% | +0.43% |
+| Richards | 131,107,867 | 131,114,529 | 130,850,397 | +0.01% | -0.20% | -0.20% |
+| DeltaBlue | 254,851,457 | 254,850,730 | 255,491,802 | -0.00% | +0.25% | +0.25% |
+| Crypto | 715,119,469 | 715,116,680 | 715,678,826 | -0.00% | +0.08% | +0.08% |
+| RayTrace | 990,110,245 | 989,985,119 | 985,086,131 | -0.01% | -0.51% | -0.49% |
+| EarleyBoyer | 3,100,978,069 | 3,100,944,958 | 3,097,108,404 | -0.00% | -0.12% | -0.12% |
+| RegExp | 2,669,506,135 | 2,669,476,397 | 2,643,754,683 | -0.00% | -0.96% | -0.96% |
+| Splay | 1,395,839,026 | 1,395,307,309 | 1,395,582,650 | -0.04% | -0.02% | +0.02% |
+| NavierStokes | 439,802,048 | 439,806,244 | 439,796,743 | +0.00% | -0.00% | -0.00% |
+| PdfJS | 6,898,336,077 | 6,890,763,715 | 6,874,286,216 | -0.11% | -0.35% | -0.24% |
+| Mandreel | 61,204,752,051 | 61,205,929,315 | 61,264,854,889 | +0.00% | +0.10% | +0.10% |
+| Gameboy | 14,921,939,092 | 14,921,900,625 | 14,873,649,710 | -0.00% | -0.32% | -0.32% |
+| CodeLoad | 478,904,457 | 478,919,435 | 478,934,438 | +0.00% | +0.01% | +0.00% |
+| Box2D | 4,195,880,390 | 4,195,870,986 | 4,200,184,576 | -0.00% | +0.10% | +0.10% |
+| zlib | 133,596,068,288 | 133,593,726,323 | 133,606,254,831 | -0.00% | +0.01% | +0.01% |
+| TypeScript | 57,824,238,776 | 57,811,493,867 | 56,839,199,928 | -0.02% | -1.70% | -1.68% |
+
+C2 moves no workload past 0.11% (PdfJS -0.11%, Vue +0.08%, which is its binary's layout: C2
+changes no machine code there). C3 takes React 4.9%, TypeScript 1.7%, RegExp 1.0%, RayTrace
+0.5%, PdfJS 0.35% and Gameboy 0.3% off, and three workloads stay past the 0.2% bound: chai
++0.41%, Djot +0.26%, DeltaBlue +0.25% (see the first version's section).
+
+x86-64 (zombie, fat LTO, CPU 2, setarch -R, pacing off; zombie/counts-c3c.txt, main against
+C2 and C3, which tiers nothing up there): Vue -0.01%, React -0.00%, Djot -0.09%, chai +0.00%,
+Richards -0.01%, DeltaBlue +0.00%, Crypto -0.40%, RayTrace -0.13%, EarleyBoyer -0.49%, RegExp
+-0.08%, Splay -0.05%, NavierStokes -0.30%, PdfJS -0.12%, Mandreel -0.29%, Gameboy +0.00%,
+CodeLoad -0.00%, Box2D -0.27%, zlib -0.30%, TypeScript -0.14%: the record filter's, as x86-64's
+second stages record through their maps more often than ARM64's.
+
+CENSUS
+
+The tier-ups (TRUST_JS_TIER_LOG; c3/census-c.txt, CPU 14, one run each), and
+TRUST_JS_PERF_METRICS's compiles, JIT and bytecode compile time and call-cache epoch with the
+tier-up and with TRUST_JS_JIT_NO_TIER_UP=1 (the times are wall-clock: the first version's census
+ran beside the gate and read TypeScript's JIT compile as 0.455 -> 0.988 s):
+
+| workload | tier-ups | their bytecode compile, ms | compiles | JIT compile, ms | bytecode compile, ms | epoch |
+| --- | --- | --- | --- | --- | --- | --- |
+| Vue | 12 | 0.250 | 64 -> 76 | 11.6 -> 12.7 | 2.3 -> 2.7 | 10 -> 22 |
+| React | 2 | 0.044 | 12 -> 14 | 4.8 -> 5.1 | 0.5 -> 0.6 | 2 -> 4 |
+| Djot | 3 | 0.099 | 163 -> 166 | 45.5 -> 46.4 | 9.8 -> 9.8 | 36 -> 39 |
+| chai | 38 | 1.988 | 934 -> 972 | 129.8 -> 136.6 | 31.1 -> 33.4 | 68 -> 106 |
+| Richards | 1 | 0.018 | 31 -> 32 | 5.6 -> 5.8 | 1.2 -> 1.2 | 8 -> 9 |
+| DeltaBlue | 3 | 0.074 | 94 -> 97 | 21.3 -> 22.5 | 3.5 -> 3.6 | 23 -> 26 |
+| Crypto | 2 | 0.075 | 70 -> 72 | 24.0 -> 23.7 | 2.4 -> 2.5 | 4 -> 6 |
+| RayTrace | 4 | 0.144 | 50 -> 54 | 17.3 -> 17.1 | 2.4 -> 2.5 | 11 -> 15 |
+| EarleyBoyer | 3 | 0.076 | 83 -> 86 | 26.4 -> 26.7 | 4.0 -> 4.2 | 20 -> 23 |
+| RegExp | 2 | 0.072 | 22 -> 24 | 33.3 -> 34.6 | 3.2 -> 3.3 | 0 -> 2 |
+| Splay | 2 | 0.068 | 25 -> 27 | 9.4 -> 9.6 | 1.3 -> 1.4 | 8 -> 10 |
+| NavierStokes | 0 | 0.000 | 19 -> 19 | 7.1 -> 7.1 | 0.6 -> 0.6 | 0 -> 0 |
+| PdfJS | 12 | 0.432 | 238 -> 250 | 78.6 -> 80.9 | 10.1 -> 10.5 | 19 -> 31 |
+| Mandreel | 23 | 3.963 | 158 -> 181 | 204.6 -> 223.9 | 30.2 -> 34.3 | 16 -> 39 |
+| Gameboy | 36 | 0.914 | 442 -> 478 | 106.0 -> 111.0 | 15.9 -> 16.5 | 134 -> 170 |
+| CodeLoad | 0 | 0.000 | 52 -> 52 | 12.4 -> 12.2 | 1.6 -> 1.6 | 39 -> 39 |
+| Box2D | 34 | 1.048 | 300 -> 334 | 113.0 -> 120.7 | 16.6 -> 17.9 | 62 -> 96 |
+| zlib | 2 | 0.656 | 48 -> 50 | 113.7 -> 117.4 | 49.6 -> 50.3 | 31 -> 33 |
+| TypeScript | 87 | 3.592 | 940 -> 1,030 | 454.9 -> 468.3 | 89.0 -> 93.4 | 305 -> 395 |
+
+RayTrace's tier-ups are four now (the forwarder's chunk declined). The functions: Djot's
+addMatch, a RegExp exec wrapper and skipSpace; React's two (its TodoMVC reducer's `(todo) =>
+(todo.id === action.payload.id ? ...)` maps); DeltaBlue's one-line getter `return
+this.elms.length` and two direction tests; chai's 38 assertion and proxy helpers (proxyGetter, flag, stringDistance,
+isProxyEnabled, proxify, Assertion, transferFlags, propertyGetter, ...); TypeScript's 87 parser
+and scanner functions (setTokenInfo, TokenInfo, LexIsIdentifierStartChar, ...).
+
+PAGES
+
+TRust's pages (TRust 78435d0's trust-browser-replay on b57534d0, main's code (trust/s5-replay),
+and on 702bc80c, from exports, in one session in a quiet window; trust/page-metrics.sh, CPU 5;
+trust/metrics-c3c.tsv; a page's machine code and compile time, (s5 - s1) / 4):
+
+| page, variant | machine code a page, main | C3 | change | compile a page, main | C3 | change |
+| --- | --- | --- | --- | --- | --- | --- |
+| event-loop, t8 | 893,682 | 893,684 | +0.0% | 13.5 ms | 13.4 ms | -0.8% |
+| Vue TodoMVC, t8 | 7,004,723 | 7,013,241 | +0.1% | 98.4 ms | 100.4 ms | +2.0% |
+| event-loop, t1a2 | 3,493,017 | 3,493,017 | +0.0% | 41.0 ms | 40.3 ms | -1.7% |
+| Vue TodoMVC, t1a2 | 9,561,088 | 9,569,626 | +0.1% | 131.8 ms | 126.5 ms | -4.1% |
+
+Over five pages (TRUST_JS_TIER_LOG): the event-loop page tiers nothing up at either threshold
+(5 inline recompiles); Vue TodoMVC tiers up 40 functions at each (8 a page, beside 660 and 685
+inline recompiles): 8.5K bytes of code a page. The compile times move within these sessions'
+noise (a single session each).
+
+
+CHECKS
+
+- C2 (580b8e19): the ARM64 lib suite (embed), 2,842 passed, 9 ignored; the gate (gate-v2.sh,
+  STAGES="rel fixtures difftest t262", BASE w2g's rest gate), clean tree: the fixtures' masked
+  outputs the base's, difftest 138 agree and 12 skipped (budget), Test262 at threshold 8
+  53,575/53,575, the report identical to the base's (gate-580b8e19.txt); Test262 again with the
+  checkpoints at 1, 5, 21 and 85 runs (TRUST_JS_INLINE_AT=1, its runner): 53,575/53,575.
+- C3 (702bc80c): the ARM64 lib suite, 2,846 passed, 9 ignored; clippy -D warnings in the three
+  configurations clean; cargo fmt clean; the gate, clean tree: the same results, the report
+  identical to the base's (gate-702bc80c.txt); Test262 with TRUST_JS_INLINE_AT=1, where tier-ups
+  come at 85 runs: 53,575/53,575; tests/tdz-, call-, eq-, store- and read-semantics.js at the JIT
+  tier, warm (threshold 1, TRUST_JS_JIT_ADMIT_RUNS=20), with TRUST_JS_INLINE_AT=1, and with both:
+  the tree-walker's output in every one.
+- x86-64 (zombie): C3's lib suite 2,623 passed, 9 ignored, clippy clean in the three
+  configurations (zombie-c3c.txt); bf862cec's had failed its epoch-sensitive test there, the
+  reason for the call-target rule.
