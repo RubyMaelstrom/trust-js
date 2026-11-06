@@ -952,8 +952,7 @@ pub(crate) enum CollectionKind {
 }
 
 /// W6: whether a major collection the heap asks for marks in a cycle of slices between which the
-/// program runs (`TRUST_JS_GC_INCREMENTAL`; [`Heap::set_incremental`]). A heap starts `Off`; the
-/// engine's heaps take the variable's mode, `On` by default (`gc_collect::configure_heap`).
+/// program runs (`TRUST_JS_GC_INCREMENTAL`; [`Heap::set_incremental`]).
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum IncrementalMode {
     /// Every major collection marks in one pause.
