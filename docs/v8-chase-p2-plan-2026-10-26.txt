@@ -17117,3 +17117,227 @@ CHECKS
 - x86-64 (zombie): C3's lib suite 2,623 passed, 9 ignored, clippy clean in the three
   configurations (zombie-c3c.txt); bf862cec's had failed its epoch-sensitive test there, the
   reason for the call-target rule.
+
+### Djot's gap, by where its time goes (census, 2026-11-06)
+
+Timing (target/p2/djot-gap/timing: bench.py, main 3d2894b7's engine, fat LTO from
+target/p2/lto/3d2894b7, pinned to CPU 5 under the timing hold at 01:04, 10 rounds rotating, the
+other load 0.5-1.4 cores; Node v24.22.2 limited to Sparkplug, node-sp, as before):
+
+| Djot at --tier=jit | TRust | node-sp | TRust / node-sp |
+| --- | --- | --- | --- |
+| the fixture's elapsed_ms, median (range) | 87.5 (86-88) | 38.5 (38-39) | 2.27x |
+| wall, median | 0.15 s | 0.11 s | |
+| peak RSS | 33 MB | 59 MB | |
+
+At W6's exit (e50f5725) it was 91 against 39 (2.33x). The phase exit asks 77 ms: -12%.
+
+THE WINDOW AND THE STEADY STATE
+
+elapsed_ms times 10 passes after one warm-up parse. Variants with 20 and 40 passes (CPU 13, three
+runs each; target/p2/djot-gap/variants): TRust 190, 346, 660 ms, so a pass at the steady state
+takes 15.7 ms and the first 10 passes carry 33 ms more (17% of the window: compiles, tier-ups,
+first runs); node-sp 77, 142, 276 ms, 6.7 ms a pass and 10 ms more. The steady passes are 2.34x
+node-sp's, the window 2.47x (both at CPU 13): the gap is mostly in the steady state.
+
+WHERE THE TIME GOES
+
+Cycles (perf, user, CPU 13, TRUST_JS_PERF_MAP=1 naming generated code; census/buckets.py): the
+window is the 10-pass fixture recorded from 112 ms on (its warm-up and startup left out); the
+steady state the 40-pass variant from 400 ms on. Shares of each:
+
+| bucket | the window | the steady state |
+| --- | --- | --- |
+| generated code: JS chunks | 37.2% | 45.3% |
+| generated code: shared stubs | 10.8% | 12.3% |
+| generated code: RegExp programs | 0.3% | 0.4% |
+| the native compiler | 5.5% | 0.4% |
+| lexing, parsing, bytecode | 1.4% | 0.0% |
+| calls and frames (Rust) | 6.0% | 5.8% |
+| RegExp exec around the match (Rust) | 5.3% | 5.9% |
+| property helpers (Rust) | 4.5% | 5.1% |
+| strings | 4.3% | 4.2% |
+| the iteration protocol | 3.3% | 3.5% |
+| allocation (cells, blocks, libc) | 6.1% | 3.5% |
+| GC | 2.5% | 2.1% |
+| arrays and elements | 1.9% | 2.0% |
+| closures and code objects | 1.9% | 1.3% |
+| the tree-walker | 0.5% | 0.6% |
+| the rest | 7.5% | 6.4% |
+
+(The window's last milliseconds include the process's teardown, dropping the parsed functions,
+0.7%; elapsed_ms does not.)
+
+SPE (CPU 13, one operation in about 1,024, the steady state; census/steady-samples.txt,
+target/p2/compact/opsamples.py with TRUST_JS_JIT_MAP=1): 19.2% of operations in templates, 17.1%
+in register regions, 63.7% outside chunks (stubs, Rust, libc). By operation: StrictEq 2.3% of all
+operations, CallWithThis 2.2%, ReturnUndef 2.0%, GetProp 1.4%, GetPropLocal 1.4%, GetMethod 1.2%;
+the call and return templates (CallWithThis, Call, ReturnUndef, Return, New) 5.1% and the call
+stubs 3.1%. 69.9% of the template bytes are in sites never sampled.
+
+Per function, against node-sp (the steady state, ms a pass at CPU 13: TRust's time in the
+function's chunk, which excludes the stubs and Rust it calls; node-sp's self time from
+--cpu-prof at 50 us, which includes the builtins it calls; census/nodeprof.py):
+
+| function | TRust | node-sp | ratio |
+| --- | --- | --- | --- |
+| next (the block parser's event iterator, 19562) | 1.34 | 0.82 | 1.6x |
+| getEol (17744) | 0.85 | 0.49 | 1.8x |
+| feed (the inline parser, 49219) | 0.72 | 0.44 | 1.6x |
+| renderAstNodeDefault (35326) | 0.37 | 0.11 | 3.4x |
+| w (the event handler, 79530) | 0.33 | 0.24 | 1.4x |
+| getInlineMatches (16957) | 0.31 | 0.10 | 3.2x |
+| find (16706) | 0.24 | 0.06 | 3.9x |
+| skipSpace (17607) | 0.17 | 0.03 | 6.5x |
+
+TRust spends 7.1 ms a pass in its chunks, 1.9 in stubs and 6.8 in Rust and libc; node-sp 5.2 in
+djot.js's functions, the builtins they call included, and 1.5 elsewhere (its GC 0.24).
+
+getEol's loop, `for(;10!==(s=t.codePointAt(e))&&13!==s;)e++`, is one register region of 4,460
+bytes holding 97.7% of the chunk's samples, spread evenly over about 190 instructions: about 180
+instructions a character. Each iteration re-derives `codePointAt` from the string's prototype
+(the tag dispatch, the realm's String.prototype, its shape and slot: about 50 instructions)
+before the inline codePointAt, moves values through the operand stack in memory, and tests tags
+at each StrictEq. A function's return costs too: ReturnUndef's epilogue restores d8-d15 and
+x19-x22 and returns its frame to the pool.
+
+THE JIT'S MISSES (whole run, 11 parses; census/djot-*.txt)
+
+- TRUST_JS_JIT_OPSTAT=2: 44,551 for-of steps reach the iteration helper (IterStepL at six sites),
+  CallWithThis about 50,000 helper calls, GetElem 12,994 at one site.
+- TRUST_JS_JIT_CALLSTAT=1: 62,805 calls reach the call-hit helper as native entries; 6,695 in
+  warm-up (the callee's inline attempt pending).
+- TRUST_JS_JIT_NATIVESTAT=1: exec 27,246, includes 13,002, substring 11,043, test 5,011, keys
+  2,498, replace 2,110, assign 1,376, trim 172, splice 152, slice 69, split 69, join 57.
+- TRUST_JS_JIT_PROPSTAT=2: few reads leave the caches: shape churn at "tag" (437), "children"
+  (189) and a few dozen others.
+
+COMPILE, THE TREE-WALKER, REGEX AND GC
+
+- Compile (TRUST_JS_PERF_METRICS=1, the whole run, its counters' own overhead included: elapsed
+  212 ms): 163 native compiles in 45.4 ms, 2.70 MB of code (16.6 KB a function, the largest
+  132 KB), 106 inline attempts and 36 inlined; bytecode 9.6 ms, parsing 7.5 ms, lexing 5.4 ms. In
+  the window the compilers are 6.9% of the cycles (about 6 ms at CPU 5); in the steady state
+  0.4%. The known items: the tier threshold (t1a2, -9.5%) waits for TRust's page reuse, acyclic
+  regions cost 2.1% (the compact agent's "regions only where a function has run"), C3's tier-up
+  costs +0.26%.
+- The tree-walker (a function's first 8 calls): 1.0% of the whole run (Interp::eval 0.62%,
+  exec_stmt 0.12%, the rest under 0.1% each) and 0.5% of the window.
+- Regex: the matching runs in native programs (Djot's patterns are sticky with indices, `yd`,
+  RegExp:/.../dy in perf's map) and takes 0.3-0.4%; exec's runtime around the match takes
+  5.3-5.9% (regexp_builtin_exec 0.83% itself, 4.9% with what it calls; regexp_exec_text_shared
+  0.75%; regexp_exec 0.59%; the lastIndex slot 0.41%; the match array 0.31%). Djot's find
+  (32659) sets lastIndex, takes a substring when it has an end, execs, then destructures each
+  r.indices pair and takes a substring per capture.
+- GC: 2.1-2.5%: 9 collections (8 minor, 1 major), 6.6 ms of pauses in the instrumented run.
+
+CANDIDATES
+
+Sizes are shares of the steady state's cycles (a pass is about 7.3 ms at CPU 5), the overhead
+the candidate removes, not the work it keeps.
+
+1. for-of steps in generated code. Size: the iteration machinery 2.9% itself (jit_iteration,
+   Interp::iterator_step, try_intrinsic_iterator_step, inert_iterator_step,
+   iterator_result_value's string-keyed reads of done and value), plus the Rust-to-JS call of
+   each user iterator's next(): about 3-4.5% in all. IterStepL always calls the helper
+   (H_ITERATION, jit_operations.rs:977-982; jit_iteration, bytecode.rs:26790), whose step runs
+   the intrinsic array/Map/Set paths in Rust or calls next() from Rust and reads done and value
+   by name (eval.rs:2045-2075). Djot's parse is a for-of over the block parser's event iterator
+   (next at 19562, 65% of the steady state's cycles beneath that helper).
+   - V8: for-of is bytecode: CallProperty next with a CallIC, then LoadNamedProperty done and
+     value with LoadICs (src/interpreter/bytecode-generator.cc:3138-3153, 7685-7700), which
+     Sparkplug compiles to calls of the Call and LoadIC baseline builtins
+     (src/baseline/baseline-compiler.cc:1317-1330, 942-946); an array's next is the
+     ArrayIteratorPrototypeNext builtin (src/builtins/builtins-array-gen.cc:1382).
+   - SpiderMonkey: emitIteratorNext calls next and checks the result, then GetProp done and
+     value (frontend/ForOfEmitter.cpp:145-175, BytecodeEmitter.cpp:2945-2975), each an IC in its
+     baseline tier; packed arrays skip the protocol where OptimizeGetIterator holds (vm/Opcodes.h
+     around 1451, jit/CacheIR.cpp:17263-17293).
+   - JSC: op_iterator_next in the baseline JIT loads a fast array's or string's next element in
+     line and otherwise calls next through its call IC and reads done and value through GetById
+     caches (jit/JITCall.cpp:511-697).
+   - Plan: (a) an array whose %ArrayIteratorPrototype%.next is intact steps in line (JSC's
+     FastArray path), under the protector try_intrinsic_iterator_step already relies on; (b) a
+     user iterator's next() goes through the direct-call sequence, and done and value through
+     the property caches, as V8, SpiderMonkey and JSC do; (c) the helper stays for the rest
+     (generators, Map and Set iterators first measured).
+2. Calls to natives from generated code. Size: the boundary 1.4% itself (with_borrowed_values,
+   call_native_committed_with, the agent's activation) plus most of jit_call_hit's 1.9%, for
+   62,805 calls a run; the natives' own work is larger (exec 4.9% with what it calls, includes
+   1.2%, substring 0.7%). A native callee declines the direct-call sequence at its first gate and
+   takes the H_CALL_HIT helper, which decodes the op, consults the call IC and enters the native
+   through the committed-call path (bytecode.rs:26071; jit.rs:9088-9213 for the intrinsics that
+   do stay in line: charCodeAt and codePointAt, Array.isArray, push).
+   - V8: these are JS-callable builtins that the call IC reaches without a C++ transition:
+     StringPrototypeIncludes (src/builtins/string-includes.tq:10), StringPrototypeSubstring
+     (string-substring.tq:8), RegExpPrototypeExec (regexp-exec.tq:31).
+   - SpiderMonkey: CacheIR attaches includes, indexOf, codePointAt and the substring kernel in
+     line (jit/CacheIR.cpp:8446-8475, 8477, 8375, 8107), Object.keys (10364), and calls any
+     other native through a small exit frame (jit/BaselineCacheIRCompiler.cpp:2946,
+     emitCallNativeShared).
+   - JSC: host functions are entered through a native-call thunk from the call IC
+     (jit/ThunkGenerators.cpp:431-518, nativeForGenerator and nativeCallGenerator).
+   - Plan: (a) a native-call stub that enters a native's fast entry directly from the template
+     (receiver and arguments where the template has them), keeping H_CALL_HIT for the rest;
+     (b) includes, indexOf and substring in line where their operands allow, as codePointAt is.
+3. RegExp exec's runtime. Size: 5.9%, around a match that takes 0.4%. Djot's 27,246 execs a run
+   are sticky with indices.
+   - V8: RegExpPrototypeExec builds the result from the match info in CSA
+     (src/builtins/builtins-regexp-gen.cc:198, ConstructNewResultFromMatchInfo); indices go
+     through a runtime call (src/runtime/runtime-regexp.cc:1020, Runtime_RegExpBuildIndices).
+   - SpiderMonkey: exec is self-hosted, and its intrinsic exec runs a JIT stub that matches and
+     builds the result (jit/CacheIR.cpp:7858-7944, GetOrCreateRegExpStub).
+   - JSC: the matches array and its indices are built in C++ right after the match
+     (runtime/RegExpMatchesArray.h:111-125; RegExpMatchesArray.cpp:92,
+     createRegExpMatchesArrayWithGroupsOrIndices).
+   - Plan: measure exec's fixed path piece by piece (argument and lastIndex handling, the legacy
+     statics, the result's shape and the indices arrays), then cut what the exemplars skip: a
+     result template with a cached shape, indices built with the result, no copy of the subject.
+4. Generated code in Djot's scanning loops. Size: getEol and skipSpace are 6.6% of the steady
+   state, 1.8x and 6.5x node-sp's time; their loops run about 180 instructions a character.
+   - V8: Sparkplug's load of codePointAt goes to the LoadIC builtin, whose monomorphic handler
+     for a string receiver checks the String map and the prototype chain's validity cell; the
+     call goes to the builtin through the CallIC (baseline-compiler.cc:942-946, 1317-1330).
+   - SpiderMonkey: CacheIR guards the receiver is a string and reads String.prototype's slot
+     (GetPropIRGenerator::tryAttachPrimitive, jit/CacheIR.cpp:2647), and codePointAt itself is
+     in line (8375).
+   - JSC: get_by_id's baseline inline cache (jit/JITPropertyAccess.cpp:548) holds the string's
+     prototype access once repatched.
+   - Plan: GetMethod of a String.prototype native on a string receiver checked once against a
+     protector of String.prototype's methods, fused with the in-line codePointAt; then the
+     region's loop-carried values (t, e, s) kept in registers through the loop.
+5. Calls and returns between JS functions. Size: the call and return templates are 5.1% of the
+   steady state's operations and the call stubs 3.1%; ReturnUndef alone 2.0% (174 sites, 492
+   bytes each). The epilogue restores d8-d15 in chunks whose regions use them, x19-x22, the frame
+   pool and the context's slots. Plan: measure a call and a return in instructions against
+   Sparkplug's (its frame is a push of the interpreter frame's registers and a stack check),
+   then cut what a callee does not need (the FP saves of registers it does not write, the pool's
+   bookkeeping).
+6. String concatenation in the renderer. Size: about 2.3% (jit_add_strings, the in-place append,
+   new flat strings), renderAstNodeDefault at 3.4x node-sp.
+   - V8: StringAdd makes a ConsString for results of 13 characters or more
+     (src/builtins/builtins-string-gen.cc:484-530; src/objects/string.h:1003-1029), and a
+     substring of 13 or more a SlicedString (string.h:1115-1130).
+   - SpiderMonkey: JSRope and dependent strings (vm/StringType.h).
+   - JSC: JSRopeString (runtime/JSString.h).
+   - Plan: measure the renderer's patterns first (an accumulator `e+=`, template literals); only
+     then choose between ropes and the in-place append TRust has.
+7. Smaller: computed-key method calls (the get_method_elem helper, 2.6% with what it calls),
+   `new` through the helper (2.3% with what it calls; Djot makes an InlineParser for each
+   paragraph and table cell), a RegExp object for each evaluation of a literal (0.6%; V8 clones a
+   boilerplate, src/builtins/builtins-constructor-gen.cc:440).
+
+Not candidates: the tree-walker (1% of the whole run) and GC (2.1-2.5%, its pauses W6's).
+
+The order I'd take them in: 1 and 2 first, which are about calls leaving generated code and
+together take roughly 6-8% of the steady state; then 4, which is 6.6% of the steady state in two
+small functions and the pattern behind several more; 3 once exec is measured piece by piece. The
+phase exit needs -12% of the window.
+
+Decided (the coordinator's, 2026-11-06): candidates 1 (for-of steps in generated code: arrays
+stepped in line under the existing protector, user iterators' next() through the direct-call
+sequence and done/value through the property caches) and 2 (a native's fast entry entered directly
+from generated code, includes, indexOf and substring in line as codePointAt is; one change serves
+Vue's candidate 4 too) first, each its own step against main; then 4 (the scanning loops: a
+String.prototype methods protector, the loop's values in registers); then 3 (RegExp exec's runtime,
+measured piece by piece first). 5 and 6 after, measured.
