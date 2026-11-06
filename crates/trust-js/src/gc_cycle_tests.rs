@@ -742,3 +742,154 @@ fn a_maps_tables_grown_past_a_cycles_margin_bring_its_final_pause() {
     assert!(!cycle_running(&engine), "the margin's final pause ran");
     assert!(engine.interp.gc_heap.core.borrow().collections() > collections);
 }
+
+/// The weak collection held by an embedder's handle (`Ctx::handle`), as TRust keeps its platform
+/// slots' WeakMaps: a root, so the cycle's start marks it and fires its side-slot owner edge with
+/// the start's client, which discovers the collection (step 2b). The values that only its entries
+/// hold must survive the cycle's own final pause (an explicit minor request, which collects no
+/// further), whatever the program writes meanwhile.
+#[cfg(feature = "embed")]
+fn rooted_weak_collection_fixture(engine: &mut Engine) -> crate::embed::Handle {
+    eval(
+        engine,
+        r#"
+        var keys = [], wm = new WeakMap(), ws = new WeakSet();
+        for (let i = 0; i < 64; i++) {
+            const k = { i };
+            keys.push(k);
+            wm.set(k, { v: i, kids: [i, i + 1] });
+            ws.add(k);
+        }
+        var probe = wm.get(keys[7]);
+        true
+        "#,
+    );
+    engine.scope(|cx| {
+        let global = cx.global_this();
+        let map = cx.member_get(&global, "wm").expect("the fixture's WeakMap");
+        cx.handle(&map).expect("a handle to the WeakMap")
+    })
+}
+
+/// Whether the rooted fixture's entries are all intact (`rooted_weak_collection_fixture`).
+#[cfg(feature = "embed")]
+fn rooted_weak_collection_intact(engine: &mut Engine) -> String {
+    eval(
+        engine,
+        r#"
+        let ok = keys.length === 64;
+        for (let i = 0; i < 64; i++) {
+            const entry = wm.get(keys[i]);
+            ok = ok && entry !== undefined && entry.v === i && entry.kids[1] === i + 1;
+            ok = ok && ws.has(keys[i]);
+        }
+        ok
+        "#,
+    )
+}
+
+/// A weak collection that the cycle's start marks (a root) keeps its entries' values through the
+/// cycle: the start registers the entries its client discovered, as each slice does. Before, the
+/// start's client was dropped with its discoveries, and the final pause freed every value only the
+/// entries held (TRust's pages: DOM wrappers' internal-slot records gone, `classList.toggle is not
+/// a function`, a dead key reaching `observe_weak_target`).
+#[cfg(feature = "embed")]
+#[test]
+fn a_weak_collection_marked_at_a_cycles_start_keeps_its_entries_in_every_tier() {
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = cycling_engine(tier);
+        let handle = rooted_weak_collection_fixture(&mut engine);
+        let weak = weak_global(&mut engine, "probe");
+        eval(&mut engine, "probe = null; 0");
+        assert!(engine.interp.gc_start_cycle(), "{tier:?}");
+        engine.interp.gc_slice_to_completion();
+        engine.interp.gc_collect_minor();
+        assert!(
+            !cycle_running(&engine),
+            "{tier:?}: the final pause ended it"
+        );
+        assert!(
+            crate::gc_test::alive(&*weak),
+            "{tier:?}: an entry's value survives the cycle that marked its rooted WeakMap at its start"
+        );
+        assert_eq!(
+            rooted_weak_collection_intact(&mut engine),
+            "true",
+            "{tier:?}"
+        );
+        drop(handle);
+    }
+}
+
+/// Two Agents on one thread, each with a weak collection its embedder roots, switching while a
+/// cycle is open in one and then in both: each heap's cycle keeps its own entries' values, and the
+/// survivors serve as weak targets afterwards (WeakRef, FinalizationRegistry, WeakMap keys), whose
+/// registration looks up their heap (`observe_weak_target`). Every direct call into an engine's
+/// interpreter first makes its Agent the active one, as the engine's own entries do.
+#[cfg(feature = "embed")]
+#[test]
+fn cycles_open_across_agent_switches_keep_each_heaps_weak_entries() {
+    fn on(engine: &mut Engine) -> &mut Engine {
+        engine.interp.activate_gc_heap();
+        engine
+    }
+    let mut first = cycling_engine(Tier::Jit);
+    let mut second = cycling_engine(Tier::Bytecode);
+    let first_handle = rooted_weak_collection_fixture(on(&mut first));
+    let first_probe = weak_global(on(&mut first), "probe");
+    let second_handle = rooted_weak_collection_fixture(on(&mut second));
+    let second_probe = weak_global(on(&mut second), "probe");
+    eval(&mut first, "probe = null; 0");
+    eval(&mut second, "probe = null; 0");
+    let churn = r#"
+        var churned = [];
+        for (let i = 0; i < 2000; i++) churned.push({ i, s: 'x' + i });
+        for (let i = 0; i < 64; i += 3) wm.set(keys[i], { v: i, kids: [i, i + 1], again: true });
+        churned.length
+    "#;
+    // The first heap's cycle opens, and the second Agent runs: an Agent's cycle advances at its own
+    // safepoints alone. Then the second's opens too, and each runs while the other's is open.
+    assert!(on(&mut first).interp.gc_start_cycle());
+    assert_eq!(eval(&mut second, churn), "2000");
+    assert!(
+        cycle_running(&first),
+        "the other Agent's run leaves the cycle open"
+    );
+    assert!(on(&mut second).interp.gc_start_cycle());
+    assert_eq!(eval(&mut first, churn), "2000");
+    assert!(
+        cycle_running(&second),
+        "the other Agent's run leaves the cycle open"
+    );
+    assert_eq!(eval(&mut second, churn), "2000");
+    // Each cycle ends with its own final pause (an explicit minor request), unless its own run
+    // finished it already.
+    for engine in [&mut first, &mut second] {
+        let engine = on(engine);
+        if cycle_running(engine) {
+            engine.interp.gc_slice_to_completion();
+            engine.interp.gc_collect_minor();
+        }
+        assert!(!cycle_running(engine));
+    }
+    for (engine, probe) in [(&mut first, &first_probe), (&mut second, &second_probe)] {
+        let engine = on(engine);
+        assert!(
+            crate::gc_test::alive(&**probe),
+            "an entry's value survives its heap's cycle"
+        );
+        assert_eq!(rooted_weak_collection_intact(engine), "true");
+        let weak_targets = r#"
+            var refs = [], registry = new FinalizationRegistry(() => {}), keyed = new WeakMap();
+            for (let i = 0; i < 64; i++) {
+                const value = wm.get(keys[i]);
+                refs.push(new WeakRef(value));
+                registry.register(value, i);
+                keyed.set(value, i);
+            }
+            refs.every((ref, i) => ref.deref() === wm.get(keys[i]) && keyed.get(ref.deref()) === i)
+        "#;
+        assert_eq!(eval(engine, weak_targets), "true");
+    }
+    drop((first_handle, second_handle));
+}

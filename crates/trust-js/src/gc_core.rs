@@ -4149,6 +4149,12 @@ impl Heap {
         // collections come as owners, whose entries the slices discover.
         self.add_source_edges(&mut m, client);
         self.add_side_slot_owners(&mut m, client);
+        // An owner the start marked (a root, such as a weak collection an embedder's handle
+        // holds, or an edge's value) had its edge fire just now, with this client: the weak
+        // collections among them were discovered here, and their entries wait in the marker
+        // from here, as a slice's do when its client goes. Dropped with the client, they were
+        // never registered, and the final pause freed the values only those entries held.
+        self.add_discovered_edges(&mut m, client);
         self.phase_done(Phase::Side, &mut clock);
         let allocated = self.allocated_bytes;
         self.cycle = Some(Box::new(Cycle {
