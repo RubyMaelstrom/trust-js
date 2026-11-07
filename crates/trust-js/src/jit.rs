@@ -9877,12 +9877,39 @@ fn emit_code_point_template(a: &mut asm::Asm, helper: usize, done: usize) {
     emit_string_read(
         a,
         StringRead::CodePoint,
-        -24,
+        ReadReceiver::Stack(-24),
         ReadResult::Stack { pop: 16 },
         helper,
         done,
         ReadCommit::CallTemplate,
     );
+}
+
+/// Where [`emit_string_read`]'s String receiver is.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, Debug)]
+enum ReadReceiver {
+    /// The operand at `[x20 + offset]`.
+    Stack(i32),
+    /// The word in d`reg` (a region's tagged home or operand register).
+    Register(u32),
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl ReadReceiver {
+    /// x`dst` = the receiver's word.
+    fn load(self, a: &mut asm::Asm, dst: u32) {
+        match self {
+            ReadReceiver::Stack(offset) => emit_exec_word_load(a, dst, 20, offset),
+            ReadReceiver::Register(reg) => a.fmov_x_d(dst, reg),
+        }
+    }
 }
 
 /// Where [`emit_string_read`] puts its result.
@@ -9947,7 +9974,7 @@ fn emit_read_commit_event(a: &mut asm::Asm, commit: ReadCommit) {
     let _ = (a, commit);
 }
 
-/// For the String at `[x20 + receiver]` and a Number index in d0, CodePointAt(S, index)'s code
+/// For the String `receiver` and a Number index in d0, CodePointAt(S, index)'s code
 /// point or (`read`) the code unit there: an exact unsigned index below the length reads the
 /// string's storage, a flat one- or two-byte buffer or a view of one at its owner's width
 /// (`crate::lstr`). A unit is its own code point, but a two-byte leading surrogate followed,
@@ -9963,7 +9990,7 @@ fn emit_read_commit_event(a: &mut asm::Asm, commit: ReadCommit) {
 fn emit_string_read(
     a: &mut asm::Asm,
     read: StringRead,
-    receiver: i32,
+    receiver: ReadReceiver,
     result: ReadResult,
     helper: usize,
     done: usize,
@@ -9980,7 +10007,7 @@ fn emit_string_read(
     a.ucvtf_d_w(1, 9);
     a.fcmp(0, 1);
     a.b_cond(C_NE, helper);
-    emit_exec_word_load(a, 11, 20, receiver);
+    receiver.load(a, 11);
     emit_exec_payload(a, 11, 11);
     a.ldr_w_imm(13, 11, LEN_OFF as u32);
     a.cmp_reg_x(9, 13);
@@ -10030,21 +10057,27 @@ fn emit_string_read(
     }
     a.bind(unit);
     // ---- commit: the Number (a code point or unit is never NaN) ----
-    match result {
-        ReadResult::Stack { pop } => {
+    match (result, receiver) {
+        (ReadResult::Stack { pop }, ReadReceiver::Stack(receiver)) => {
             a.ucvtf_d_w(0, 17);
             a.stur_d(0, 20, receiver);
             if pop != 0 {
                 a.sub_imm(20, 20, pop);
             }
         }
-        ReadResult::Register(reg) => a.ucvtf_d_w(reg, 17),
+        (ReadResult::Stack { .. }, ReadReceiver::Register(_)) => {
+            unreachable!("a result over the receiver's slot needs one")
+        }
+        (ReadResult::Register(reg), _) => a.ucvtf_d_w(reg, 17),
     }
     emit_read_commit_event(a, commit);
     a.b(done);
     a.bind(undefined);
     match (result, read) {
         (ReadResult::Stack { pop }, _) => {
+            let ReadReceiver::Stack(receiver) = receiver else {
+                unreachable!("a result over the receiver's slot needs one")
+            };
             a.mov_imm64(
                 9,
                 match read {

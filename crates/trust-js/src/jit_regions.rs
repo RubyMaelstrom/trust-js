@@ -3108,9 +3108,28 @@ pub(super) fn emit(
                     let call = string_call.unwrap();
                     own_facts.clear();
                     saved_work += 6; // the call's operand traffic and its dispatch
-                    materialize(a, &stack, physical);
-                    physical = depth;
-                    stack.fill(Operand::Canonical);
+                                     // A receiver in a register (a tagged home's view, a borrowed property
+                                     // value) above canonical operands stays there on the fast path; the slow
+                                     // path publishes it. Any other stack is published first, for both paths.
+                    let before = stack.clone();
+                    let before_physical = physical;
+                    let canonical_prefix = stack[..depth - 1]
+                        .iter()
+                        .all(|operand| matches!(operand, Operand::Canonical))
+                        && physical + 1 == depth;
+                    let receiver = match stack[depth - 1] {
+                        Operand::Borrowed(home) if canonical_prefix => ReadReceiver::Register(home),
+                        Operand::BorrowedValue if canonical_prefix => {
+                            ReadReceiver::Register(16 + depth as u32 - 1)
+                        }
+                        _ => {
+                            materialize(a, &stack, physical);
+                            physical = depth;
+                            stack.fill(Operand::Canonical);
+                            ReadReceiver::Stack(-8)
+                        }
+                    };
+                    let unpublished = matches!(receiver, ReadReceiver::Register(_));
                     let local = call.index.local_slot().map(|slot| {
                         if let Some(home) = plan.reg(slot) {
                             string_calls::LocalSource::Number(home)
@@ -3130,9 +3149,16 @@ pub(super) fn emit(
                     let join = a.new_label();
                     let result = 16 + depth as u32 - 1;
                     string_calls::emit_region_step(
-                        a, chunk, ilayout, pc, &call, local, result, slow, join,
+                        a, chunk, ilayout, pc, &call, local, receiver, result, slow, join,
                     );
                     a.bind(slow);
+                    // The slow path runs once per site's fill and for refused sites: its
+                    // templates take their shared stubs, as code outside loops does.
+                    let hot = a.hot();
+                    a.set_hot(false);
+                    if unpublished {
+                        materialize(a, &before, before_physical);
+                    }
                     string_calls::emit_region_fill(a, chunk, ilayout, pc, &call);
                     if let Some(slot) = call.index.local_slot() {
                         plan.flush_local(a, slot);
@@ -3151,6 +3177,7 @@ pub(super) fn emit(
                             direct_finish,
                         );
                     }
+                    a.set_hot(hot);
                     let resume = a.new_label();
                     bails.push((
                         resume,
@@ -3162,6 +3189,10 @@ pub(super) fn emit(
                     result_misses.push(resume);
                     emit_exec_word_load(a, 9, 20, -8);
                     emit_exec_number_guard(a, 9, result, 10, resume);
+                    if unpublished {
+                        // The fast path's operand stack never held the receiver.
+                        a.sub_imm(20, 20, 8);
+                    }
                     a.bind(join);
                     stack.pop();
                     stack.push(Operand::temporary(ScalarKind::Number));

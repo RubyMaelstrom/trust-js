@@ -231,6 +231,7 @@ fn emit_body(
         a,
         fuse_off,
         intrinsic,
+        ReadReceiver::Stack(-8),
         ReadResult::Stack { pop: 0 },
         fill,
         miss,
@@ -256,16 +257,18 @@ fn emit_body(
     a.b(miss);
 }
 
-/// The step's guards, then its read into `result`, with the receiver at `[x20 - 8]`, x12 = the
-/// site and d0 = the index (a Number): a primitive String receiver, the site's fuse being the
+/// The step's guards, then its read into `result`, with `receiver`, x12 = the site and d0 = the
+/// index (a Number): a primitive String receiver, the site's fuse being the
 /// active Realm's, and the fuse's word or else the recorded generation and the method's
 /// NotConstant bit clear. A site naming another fuse or generation branches to `fill` (x13 = the
 /// site's fuse, x10 = the active Realm's); any other miss, to `miss`, with nothing written. The
 /// read branches to `done`. Clobbers x9..x11, x13, x14, x16, x17 and d1.
+#[allow(clippy::too_many_arguments)]
 fn emit_guarded_read(
     a: &mut asm::Asm,
     fuse_off: usize,
     intrinsic: u8,
+    receiver: ReadReceiver,
     result: ReadResult,
     fill: usize,
     miss: usize,
@@ -274,7 +277,7 @@ fn emit_guarded_read(
     let constant = a.new_label();
     let read = a.new_label();
     // A primitive String receiver.
-    emit_exec_word_load(a, 9, 20, -8);
+    receiver.load(a, 9);
     emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, miss);
     // x13 = the site's fuse, x10 = the active Realm's.
     a.ldr_imm(13, 12, StringCallSite::FUSE_OFF as u32);
@@ -291,7 +294,7 @@ fn emit_guarded_read(
         crate::bytecode::INTRINSIC_CHAR_CODE_AT => StringRead::CodeUnit,
         _ => unreachable!("a fused call's method has a read"),
     };
-    emit_string_read(a, kind, -8, result, miss, done, ReadCommit::Fused);
+    emit_string_read(a, kind, receiver, result, miss, done, ReadCommit::Fused);
     // Else the generation the site recorded, and the method's NotConstant bit clear. Another
     // generation (a tracked property was removed) refills the site.
     a.bind(constant);
@@ -363,9 +366,9 @@ impl Index {
     }
 }
 
-/// The fused step of `plan` in a register region (step 3), its receiver canonical at
-/// `[x20 - 8]` and its index local read from `local`: the code point or unit in d`result` (a
-/// Number), then a branch to `done`; any miss, a code point past the end (undefined) included,
+/// The fused step of `plan` in a register region (step 3), its receiver `receiver` (canonical at
+/// `[x20 - 8]`, or a word in a register) and its index local read from `local`: the code point or
+/// unit in d`result` (a Number), then a branch to `done`; any miss, a code point past the end (undefined) included,
 /// branches to `slow` with nothing written, where the region runs its unfused operations
 /// ([`emit_region_fill`] first). Clobbers x9..x17, d0 and d1; keeps the region's registers.
 pub(super) fn emit_region_step(
@@ -375,6 +378,7 @@ pub(super) fn emit_region_step(
     pc: usize,
     plan: &Plan,
     local: Option<LocalSource>,
+    receiver: ReadReceiver,
     result: u32,
     slow: usize,
     done: usize,
@@ -388,6 +392,7 @@ pub(super) fn emit_region_step(
         a,
         ilayout.string_proto_fuse,
         plan.intrinsic,
+        receiver,
         ReadResult::Register(result),
         slow,
         slow,
