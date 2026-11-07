@@ -20418,3 +20418,457 @@ makes as LoadIC_Baseline calls and SpiderMonkey's Baseline as its sites' shared 
 are polymorphic. No stub defect; about 5.3% of the steady state's cycles. Cheaper would mean baking
 hot monomorphic non-loop sites in line: a second-stage or tier question, after candidate 2 and the
 matcher entry.
+
+### Candidate 2, step 1: a light native's fast entry from generated code (record, 2026-11-07)
+
+The design note's (a) for the light classes ("### A native's fast entry from generated code;
+includes, indexOf and substring in line", decided A1, B2, C1). Lands as ae0dee7f on main bfb58035,
+the first of three commits (with step 2's 51308858 and the trims' dad9d67f); measured as dc40ded6
+on main 63eb71df (fat LTO lto/main-63eb71df), the same patch but for its helper index (37 after
+candidate 4's H_STRING_READ; the call-hit stub's key is 0x1500, after Stub:StringCall). Earlier
+measurements of the same change: on main e3322606 as 9474fdd8 (p2-c2-native-e332), on 6725b6d6 as
+37a23690 (p2-c2-native-w6) and on 87a05b21 as 28a9dfb6 (p2-c2-native-87); its A2 test fix landed
+on its own as 10335559.
+
+WHAT CHANGED
+
+- A call site's call-hit form (its call-cache hit declined the direct sequence) calls a
+  process-wide shared stub, SharedStub::CallHit, one for each arity up to eight and receiver form
+  (jit::emit_call_hit_stub). The way records a stub kind (CallIc::native_stub, in padding at
+  offset 97), chosen from the native's class when the way is filled (bytecode::native_stub_kind),
+  as SpiderMonkey's call IC picks its native stub when it attaches: the class's operand test as
+  bytecode::native_operands makes it (none: the operand-only collections' methods, the light
+  class, Array.isArray, Object.is; every argument a Number: numeric-only and Math's; every
+  argument a primitive: parseInt's class, isNaN, fromCharCode; the receiver and every argument
+  primitives: String's primitive class and its templates' natives), and whether the class holds
+  constructors (the light class: Boolean; the primitive-argument class: Number and String), whose
+  natives read the construct state. The stub reads the kind (two instructions to the helper for
+  anything else), makes the test in line and, for a constructor's class, checks that the caller
+  is not constructing, then enters the native through one extern "C" fast entry,
+  bytecode::jit_native_light, with no decode of the call. The native's errors record the call's
+  position, which the site places two instructions past the return address. Anything else (a
+  user callee, a native of no light class, DataView's and Reflect's natives, operands the test
+  refuses, a constructing caller of a constructor's class) calls the call-hit helper as before.
+  The fill asserts that no constructor is in a class the stub runs without its construct state.
+- The site: `bl` to the stub, `cbz` to the join, `b` to the unwind, the position word: six words
+  (compact code's helper form was five, the in-line form nine).
+- No depth gate (the note's step 1 listed one): the light classes' natives run no author code,
+  and the helper's light path (Interp::call_native_light) runs them on the caller's stack with no
+  depth count or stack growth, as SpiderMonkey's, JSC's and V8's native entries do (a native that
+  recurses checks its own stack). The gate belongs to step 2's boundary natives.
+- TRUST_JS_JIT_NO_NATIVE_STUB=1 keeps the call-hit helper's call (DIAGNOSTICS.md).
+- Tests (jit::native_stub_tests, 6).
+
+COUNTS (fat LTO, the fixtures and Octane at a fixed 5 runs, median of 3, chai one run; CPUs 10-13,
+setarch -R, pacing off). With incremental marking off (TRUST_JS_GC_INCREMENTAL=0, which repeats to
+0.001%; counts/c2s1-incoff-dc40ded6.txt):
+
+| workload | main 63eb71df | step 1 dc40ded6 | change |
+| --- | --- | --- | --- |
+| vue | 1,386,170,549 | 1,371,133,158 | -1.08% |
+| react | 293,273,739 | 293,314,977 | +0.01% |
+| djot | 553,626,352 | 551,974,362 | -0.30% |
+| chai | 72,324,320,497 | 72,276,393,369 | -0.07% |
+| richards | 131,233,200 | 131,273,530 | +0.03% |
+| deltablue | 253,500,383 | 253,656,793 | +0.06% |
+| crypto | 710,128,976 | 709,945,089 | -0.03% |
+| raytrace | 988,084,420 | 986,237,205 | -0.19% |
+| earley-boyer | 3,101,227,094 | 3,083,615,906 | -0.57% |
+| regexp | 2,674,172,056 | 2,672,908,547 | -0.05% |
+| splay | 1,366,453,343 | 1,365,842,164 | -0.04% |
+| navier-stokes | 440,189,902 | 440,263,256 | +0.02% |
+| pdfjs | 6,849,435,801 | 6,830,349,503 | -0.28% |
+| mandreel | 61,059,873,386 | 61,036,467,172 | -0.04% |
+| gbemu | 14,716,935,327 | 14,710,689,905 | -0.04% |
+| code-load | 476,753,508 | 476,795,091 | +0.01% |
+| box2d | 4,178,627,288 | 4,123,589,874 | -1.32% |
+| zlib | 134,000,165,705 | 134,000,177,158 | +0.00% |
+| typescript | 57,465,635,069 | 57,374,190,310 | -0.16% |
+
+With it on, the default (env X=1; counts/c2s1-dc40ded6.txt):
+
+| workload | main 63eb71df | step 1 dc40ded6 | change |
+| --- | --- | --- | --- |
+| vue | 1,386,135,538 | 1,371,109,557 | -1.08% |
+| react | 293,262,196 | 293,306,194 | +0.02% |
+| djot | 553,582,045 | 551,935,509 | -0.30% |
+| chai | 72,331,990,636 | 72,342,047,947 | +0.01% |
+| richards | 131,224,939 | 131,260,614 | +0.03% |
+| deltablue | 253,481,386 | 253,642,205 | +0.06% |
+| crypto | 710,112,564 | 709,926,984 | -0.03% |
+| raytrace | 988,069,085 | 986,216,973 | -0.19% |
+| earley-boyer | 3,065,580,825 | 3,045,079,976 | -0.67% |
+| regexp | 2,674,145,378 | 2,672,876,808 | -0.05% |
+| splay | 1,155,411,131 | 1,153,813,762 | -0.14% |
+| navier-stokes | 440,179,358 | 440,248,128 | +0.02% |
+| pdfjs | 6,860,973,100 | 6,850,029,689 | -0.16% |
+| mandreel | 61,060,233,321 | 61,035,902,711 | -0.04% |
+| gbemu | 14,736,006,018 | 14,728,467,803 | -0.05% |
+| code-load | 476,738,680 | 476,767,322 | +0.01% |
+| box2d | 4,178,560,911 | 4,123,526,622 | -1.32% |
+| zlib | 134,000,161,905 | 134,000,195,444 | +0.00% |
+| typescript | 56,664,288,088 | 56,540,757,807 | -0.22% |
+
+THE STUB ALONE (the step's binary, TRUST_JS_JIT_NO_NATIVE_STUB=1 against TRUST_JS_JIT_NO_NATIVE_STUX
+=1, equal lengths, so the code differs only in the call-hit sites' form; counts/c2s1-toggle-
+28a9dfb6.txt): Vue -1.11%, Box2D -1.30%, Djot -0.32%, TypeScript -0.22%, Gameboy -0.07%, RegExp
+-0.05%, Mandreel -0.04%, Crypto -0.03%, chai -0.01%; DeltaBlue +0.06%, EarleyBoyer +0.06%,
+Richards +0.03%, PdfJS and NavierStokes +0.02%, RayTrace, React and CodeLoad +0.01%, Splay
+-0.01%, zlib 0.00%. The small positives are below what their call-hit traffic can carry
+(CALLSTAT=2: DeltaBlue 5,226 calls in all, Richards 1,515, EarleyBoyer 21,954, RayTrace 14,215,
+Splay 10,353, at +5 to +7 an unserved call).
+
+THE NOISE. With incremental marking on (the default since 6725b6d6) one binary's counts move from
+run to run: a slice's budget follows the wall clock (gc_core.rs slice_bytes: the cycle's elapsed
+time against CYCLE_MARKING_TIME; SLICE_MAX_TIME's deadline; the preclean's deadline checks), so
+the marking each slice does, the number of slices and the final pause's place move with timing.
+Five runs of the step's binary (counts/c2s1-noise-28a9dfb6.txt): EarleyBoyer spread 8.0M (0.26%,
+in two clusters), Splay 0.29M (0.025%, two clusters), PdfJS 0.10M; with TRUST_JS_GC_INCREMENTAL=0
+(against an equal-length dummy) 0.001% each. The medians of three can land in different clusters,
+which is how the same toggle moved by about 0.2% between builds (on 6725b6d6: Splay +0.15%, PdfJS
+-0.20%; here -0.01% and +0.02%). Apart from that, two binaries differ by more than the stub in
+two workloads, with marking off too (counts/c2s1-incoff-28a9dfb6.txt, three runs each, spread
+0.001%): EarleyBoyer main 3,101.52M against the step's 3,081.59M (-0.64%) and RayTrace 987.98M
+against 986.15M (-0.19%), where the stub itself, toggled on the step's binary with marking off,
+is -0.02% (3,082.14M to 3,081.62M) and +0.01% (986.02M to 986.17M). The cause of that binary
+difference is not established. For attributing a JIT change, counts with TRUST_JS_GC_INCREMENTAL
+=0 repeat to 0.001%.
+
+CALL PATHS (architecture-diagnostics builds of e3322606 and 9474fdd8, TRUST_JS_JIT_CALLSTAT=2, one
+run each; c2/diag-s1): Vue's 271,372 light calls (Map's and WeakMap's get, parseInt, Number) and
+Djot's 24,391 (includes, substring, trim, slice) all take the stub; RegExp's 32,728 and chai's
+290,905 too. What stays on the call-hit helper: the boundary natives (Djot 38,989, RegExp 726,078,
+chai 6,232,554, Vue 2,018) and Reflect's get, has and set, which the helper answers on the
+operands (Vue 113,142; chai 4,428,967: Reflect.has 2.32M and Reflect.get 2.32M by NATIVESTAT).
+
+AN ITERATION (one call a loop iteration, (1.2M - 200k) / 1M, CPU 16; c2/per-iter-s1-28a9dfb6.txt,
+per-iter-b-s1-28a9dfb6.txt): Number.isInteger 413 to 339, Map.get 652 to 593, WeakMap.get 437 to
+379, includes 703 to 612, substring 745 to 653, parseInt 579 to 499: 58 to 92 an iteration, where
+the note estimated about 115 of the helper's 160. The stub's path is the site (4 instructions),
+the stub (8 to 30 by kind and arity) and the fast entry (about 40: its frame, the diagnostics'
+three tests, the call's position, the result), about 60 to 75 in all, against the helper's 120 to
+160 with the site's in-line call. A boundary native pays the stub's way to the helper:
+Object.getPrototypeOf 679 to 686, Array.prototype.indexOf 928 to 935, valueOf 710 to 717 (+7).
+An earlier form that tested the class in the stub against four 64-bit sets (c04a4980, not kept)
+paid about 20 more for every helper call: RegExp +0.53%, chai +0.31% (counts/c2s1-c04a4980.txt).
+
+BYTES (bytes-c2s1-28a9dfb6.txt): Djot 2,444,508 to 2,442,076, Vue 425,560 to 425,112, React
+265,400 to 265,020 (-0.1% each: the in-line form's helper call moves into the stub).
+
+CHECKS on 28a9dfb6. Lib suite 2,871 passed (6 new); clippy in three configurations; rustfmt;
+the gate: fixtures as the base, difftest 138 agree, Test262 53,575/53,575 identical to the base's
+report. Zombie (x86-64): clippy x3 clean, lib 2,640 passed.
+
+TRUST (78435d0; one HOLD session 06:48-07:19, CPUs 5-9, 13 and 15-19 uncapped throughout,
+c2/session-63eb71df). Pages, a page's (s5 - s1) / 4 on CPU 5: event-loop 859,874 B and 10.75 ms
+(main) against 860,539 B and 11.00 ms (step 1); dom-reconcile 1,758,163 B, 22.46 ms against
+1,757,596 B, 22.49 ms; Vue TodoMVC 6,571,084 B, 82.29 ms against 6,568,430 B, 82.73 ms; all exit
+0. Spike (CPU 5, three rounds alternating): main 3620, 3624, 3628; step 1 3615, 3628, 3627.
+
+### Candidate 2, step 2: the lean boundary's fast entry, and Reflect's (record, 2026-11-07)
+
+The design note's (a) for the natives that may run author code ("### A native's fast entry from
+generated code; includes, indexOf and substring in line", decided A1, B2, C1; B2 revised below),
+with Reflect.get, has and set's own kind (decided 2026-11-07). Lands as 51308858 on step 1's
+ae0dee7f (main bfb58035) (691c6f30 before a test-only amendment: the deadline test arms its
+deadline inside the loop); measured as cde9bc81 on dc40ded6 (main 63eb71df), the same patch but for
+its helper indices (38-40).
+
+WHAT CHANGED
+
+- The call-hit stub enters every engine native without the call-hit helper's decode of the
+  call. Two stub kinds join the light ones (bytecode::native_stub_kind, chosen at fill):
+  Reflect.get, has and set (bytecode::jit_native_reflect: answered on the operands as the helper
+  answers them, Interp::reflect_resolved, else through the lean boundary), and the boundary's
+  (bytecode::jit_native_boundary), for every other native of no light class and for a light
+  class's native whose operands the stub's test refuses. Reflect.apply (its operand-only path)
+  and DataView's accessors (light for some operands) keep the helper, as do user callees and
+  scoped natives. V8's ReflectGet and ReflectHas are Torque javascript builtins
+  (src/builtins/reflect.tq, calling GetPropertyWithReceiver and HasProperty) that Baseline code
+  enters without a C++ boundary.
+- A light class that holds constructors, on a constructing caller (the stub's machine-code test of
+  the construct state), enters through bytecode::jit_native_light_construct, which saves and
+  clears the construct state around the native, as the helper's light path does, where step 1
+  sent it to the helper: a constructing caller's Number, String and Boolean stay light. (A first
+  form that moved the test into that entry for every call of those classes cost Number.isInteger
+  and parseInt 11 and 12 instructions a call, e1209d0a, not kept.)
+- The lean boundary, Interp::call_native_lean (B2 revised): it keeps the depth and its stack
+  checkpoint (nested calls count; a deep recursion through natives reports its RangeError), the
+  construct state, the Agent restore (with_host_callback), the pending tail a native leaves, and
+  the interrupt poll after the native; it drops the poll before the native and the safepoint at
+  its entry. The call-hit helper's boundary arm and the generic helper's fill take it on both
+  architectures.
+- Tests (jit::native_stub_tests, 12 now; jit::poll_tests, 2 new, ARM64: a loop of an allocating
+  native's calls collects at its back edge; a deadline the loop arms through a test native after
+  its third Object.keys call stops it, so a loaded machine cannot pass the deadline before the
+  loop's first native call, as the coordinator found the first version could). Candidate 4's fused
+  String calls (63eb71df) come ahead of the call: a codePointAt site whose fuse step misses (a
+  String object receiver, a String index) runs the unfused templates and the call, whose native
+  the stub enters through the lean boundary or the light entry
+  (fused_string_sites_that_miss_their_fuse_take_the_stub).
+
+B2 REVISED (decided 2026-11-07). The note's B2 dropped both interrupt polls, as V8, SpiderMonkey
+and JSC poll in JavaScript code only. Their natives, though, carry a termination out themselves:
+V8's as the isolate's termination exception, an uncatchable pending exception that CEntry's
+check of the exception sentinel after every C++ builtin propagates; SpiderMonkey's as a false
+return with no pending exception (uncatchable); JSC's as its TerminationException. TRust's
+NativeFn returns Result<Value, Value>, so an interruption inside a native (a callback's, a nested
+evaluation's, an Atomics.wait a cancellation woke) leaves it as its result or a catchable throw,
+and the poll after the native is what turns it back into the interruption. Without it three tests
+fail: host_interruption_wakes_a_blocked_atomics_wait, interruption_stops_an_endless_microtask_
+chain and a_handle_swap_moves_shadow_realm_interpreters_too ("realm.evaluate('for (;;) {}') threw
+: undefined"). Its cost when nothing is armed: an atomic load and a branch
+(RuntimeInterrupt::current_reason reads the state word; a deadline armed adds the clock). Natives
+carrying the interruption in their error type, the exemplars' way, is left for later as a
+refactor of NativeFn.
+
+X86-64. A known difference: x86-64's generic call helper's cached calls (Interp::call_jit_cached
+-> call_native_entry, which Rust callers share) keep the whole boundary; extending B2 there needs
+a variant of call_jit_cached for generated code only. x86-64 is the secondary platform and is not
+measured; the two B2 poll tests are ARM64's.
+
+AN ITERATION (one call a loop iteration, (1.2M - 200k) / 1M, CPU 16; c2/per-iter-s2-e1b1c154.txt,
+per-iter-b-s2-e1b1c154.txt; step 1 to step 2, main's in brackets): Object.getPrototypeOf 686 to 577
+(679), Array.prototype.indexOf 935 to 826 (928), valueOf 717 to 607 (710), Object.keys 1,799 to
+1,689, Array.prototype.join 3,287 to 3,177: 110 an iteration for a native through the lean
+boundary, where the note estimated about 200 of the boundary's 305 for B2 (the post-native poll,
+the depth and stack checkpoint, the construct state, the Agent restore and the pending tail's
+check remain, and the fast entry's own frame). Reflect.get 695 to 623, Reflect.has 665 to 593
+(-72, keys that carry their key). The light natives as step 1 (Number.isInteger 339 to 340,
+parseInt 499 to 500).
+
+COUNTS against step 1 (fat LTO, the fixtures and Octane at a fixed 5 runs, median of 3, chai one
+run; CPUs 10-13, setarch -R, pacing off). Incremental marking off (TRUST_JS_GC_INCREMENTAL=0;
+counts/c2s2-incoff-cde9bc81.txt):
+
+| workload | step 1 dc40ded6 | step 2 cde9bc81 | change |
+| --- | --- | --- | --- |
+| vue | 1,371,120,904 | 1,362,616,053 | -0.62% |
+| react | 293,314,167 | 293,323,694 | +0.00% |
+| djot | 551,945,192 | 547,451,754 | -0.81% |
+| chai | 72,332,550,663 | 71,363,522,456 | -1.34% |
+| richards | 131,270,666 | 131,271,283 | +0.00% |
+| deltablue | 253,656,449 | 253,669,303 | +0.01% |
+| crypto | 709,965,256 | 709,932,129 | -0.00% |
+| raytrace | 986,237,649 | 984,965,983 | -0.13% |
+| earley-boyer | 3,083,616,039 | 3,101,097,850 | +0.57% |
+| regexp | 2,672,900,910 | 2,587,527,672 | -3.19% |
+| splay | 1,365,843,317 | 1,365,806,738 | -0.00% |
+| navier-stokes | 440,259,226 | 440,266,233 | +0.00% |
+| pdfjs | 6,830,996,820 | 6,815,933,978 | -0.22% |
+| mandreel | 61,035,846,848 | 61,014,138,453 | -0.04% |
+| gbemu | 14,710,651,963 | 14,709,869,797 | -0.01% |
+| code-load | 476,784,287 | 476,752,506 | -0.01% |
+| box2d | 4,123,580,939 | 4,123,994,658 | +0.01% |
+| zlib | 134,000,185,729 | 134,000,218,520 | +0.00% |
+| typescript | 57,374,754,968 | 57,379,707,353 | +0.01% |
+
+On, the default (env X=1; counts/c2s2-cde9bc81.txt; TypeScript's three runs of step 2 spread by
+0.3% with marking on):
+
+| workload | step 1 dc40ded6 | step 2 cde9bc81 | change |
+| --- | --- | --- | --- |
+| vue | 1,371,106,044 | 1,362,587,983 | -0.62% |
+| react | 293,305,561 | 293,312,087 | +0.00% |
+| djot | 551,935,740 | 547,381,429 | -0.83% |
+| chai | 72,339,725,637 | 71,370,581,803 | -1.34% |
+| richards | 131,260,799 | 131,261,937 | +0.00% |
+| deltablue | 253,642,360 | 253,648,518 | +0.00% |
+| crypto | 709,930,722 | 709,912,827 | -0.00% |
+| raytrace | 986,218,125 | 984,948,559 | -0.13% |
+| earley-boyer | 3,045,087,421 | 3,066,838,161 | +0.71% |
+| regexp | 2,672,866,134 | 2,587,491,687 | -3.19% |
+| splay | 1,153,813,146 | 1,153,778,685 | -0.00% |
+| navier-stokes | 440,251,894 | 440,256,661 | +0.00% |
+| pdfjs | 6,849,629,582 | 6,828,538,781 | -0.31% |
+| mandreel | 61,036,481,960 | 61,013,879,328 | -0.04% |
+| gbemu | 14,728,478,916 | 14,728,594,421 | +0.00% |
+| code-load | 476,769,655 | 476,734,643 | -0.01% |
+| box2d | 4,123,540,850 | 4,123,955,923 | +0.01% |
+| zlib | 134,000,206,622 | 134,000,184,114 | -0.00% |
+| typescript | 56,583,820,601 | 56,548,517,669 | -0.06% |
+
+EarleyBoyer's +0.57% (+0.71% with marking on) is the binaries' layout, as against main in step 1's
+record: step 2's binary counts 3,101.1M with marking off, main's 3,101.2M, step 1's 3,083.6M.
+
+THE STUB ALONE (step 2's binary, TRUST_JS_JIT_NO_NATIVE_STUB=1 against TRUST_JS_JIT_NO_NATIVE_STUX
+=1, marking off; counts/c2s2-toggle-incoff-cde9bc81.txt): steps 1 and 2's stub against the call-hit
+helper, whose boundary arm takes the lean boundary too, so the lean boundary's own gain is outside
+it (RegExp -2.19% here, -3.19% against step 1):
+
+| workload | the stub off | the stub on (steps 1 and 2) | change |
+| --- | --- | --- | --- |
+| vue | 1,386,515,465 | 1,362,635,494 | -1.72% |
+| react | 293,298,628 | 293,340,079 | +0.01% |
+| djot | 552,205,382 | 547,458,246 | -0.86% |
+| chai | 72,112,225,765 | 71,376,625,803 | -1.02% |
+| richards | 131,254,628 | 131,294,934 | +0.03% |
+| deltablue | 253,522,524 | 253,692,830 | +0.07% |
+| crypto | 710,167,052 | 709,948,490 | -0.03% |
+| raytrace | 985,665,454 | 984,994,797 | -0.07% |
+| earley-boyer | 3,099,711,247 | 3,101,135,322 | +0.05% |
+| regexp | 2,645,540,466 | 2,587,543,437 | -2.19% |
+| splay | 1,366,457,669 | 1,365,834,419 | -0.05% |
+| navier-stokes | 440,209,734 | 440,284,713 | +0.02% |
+| pdfjs | 6,845,391,924 | 6,816,071,472 | -0.43% |
+| mandreel | 61,052,610,773 | 61,014,199,498 | -0.06% |
+| gbemu | 14,719,916,761 | 14,709,944,231 | -0.07% |
+| code-load | 476,743,595 | 476,780,934 | +0.01% |
+| box2d | 4,178,189,343 | 4,124,079,481 | -1.30% |
+| zlib | 134,000,092,764 | 134,000,215,434 | +0.00% |
+| typescript | 57,459,476,153 | 57,380,157,710 | -0.14% |
+
+CALL PATHS (architecture-diagnostics build of cde9bc81, TRUST_JS_JIT_CALLSTAT=2; c2/diag-s2b): every
+native at a call-hit form takes the stub. Vue: light 271,372, Reflect's 113,142, the lean boundary
+2,018; Djot: light 24,391, the lean boundary 38,989; RegExp: light 32,728, the lean boundary 726,078;
+chai: light 290,905, the lean boundary 6,016,802, Reflect's 4,644,462. The call-hit helper keeps the
+user callees (Vue 3,392, Djot 7,549, chai 24,754).
+
+BYTES (bytes-c2s2-cde9bc81.txt): Djot 2,447,868 to 2,447,864; Vue and React unchanged.
+
+TRUST (78435d0; the HOLD session 06:48-07:19, uncapped throughout; c2/session-63eb71df). Pages:
+event-loop 860,539 B and 11.32 ms (step 1) against 860,539 B and 10.70 ms (step 2); dom-reconcile
+1,757,598 B, 22.43 ms against 1,757,595 B, 22.59 ms; Vue TodoMVC 6,568,432 B, 82.32 ms against
+6,568,427 B, 82.19 ms; all exit 0. Spike, three rounds alternating: step 1 3626, 3626, 3623; step 2
+3578, 3631, 3582, the low two in Richards (1474 and 1532 against about 1650), which makes no native
+call. Eight more rounds, uncapped (07:16-07:19, c2/session-63eb71df/spike-extra): step 2 3618, 3619,
+3625, 3628; step 1 3596 (Richards 1548), 3615, 3620, 3612. Medians over all rounds: step 1 3620,
+step 2 3619.
+
+DJOT'S STEADY STATE (target/p2/djot-gap/variants, --tier=jit, CPU 13, three runs each, median ms;
+c2/session-63eb71df/variants.txt): djot-p20: main 63eb71df 319, step 1 316, step 2 314, node-sp
+142 (2.25x to 2.21x); djot-p40: 599, 598, 590, node-sp 276 (2.17x to 2.14x). The series takes
+about 1.5% off. (Main 63eb71df lacks candidate 4's steps 3, 4 and 3d, at p40 573-575 ms on the same
+core.)
+
+CHECKS on cde9bc81. Lib suite 2,895 passed; clippy in three configurations; rustfmt; the gate:
+fixtures as the base, difftest 138 agree, Test262 53,575/53,575 identical to the base's report.
+Zombie (x86-64): clippy x3 clean, lib 2,656 passed.
+
+### Native boundaries' trims: no tail call, no interrupt, no Agent switch tested in line (record, 2026-11-07)
+
+Candidate 2's third commit (decided 2026-11-07 as its own commit after the series): p2-c2-native
+dad9d67f on step 2 51308858 (d9ea000d before step 2's test-only amendment), measured as dfd4871f
+on step 2 cde9bc81 (main 63eb71df), the same patch.
+
+WHAT CHANGED
+
+- run_pending_tail, for a tail call a native leaves: the lean boundary (Interp::call_native_lean)
+  and the whole one (call_native_committed_with) test pending_tail in line and call it only for one.
+- RuntimeInterrupt::current_reason, the poll after a native: the clear state (nothing requested,
+  nothing armed) returns in line; the reasons are out of line (reason_of).
+- activate_agent, with_host_callback's restore: the active Agent's tag compares in line; the switch
+  to another Agent is out of line (activate_other_agent).
+Nothing a boundary keeps changes (B2 revised). The three were about 2% of Djot's steady-state cycles
+in the W6 agent's profile (run_pending_tail 0.60%, current_reason 0.76% for its two polls,
+activate_agent).
+
+AN ITERATION (c2/per-iter-trims-dfd4871f.txt, step 2 to the trims): Object.getPrototypeOf 577 to
+503, Array.prototype.indexOf 825 to 752, valueOf 607 to 533, Object.keys 1,689 to 1,616,
+Array.prototype.join 3,177 to 3,103: 74 an iteration for a native through the lean boundary
+(estimated 20 to 30). Reflect's answers on the operands and the light natives are unchanged. A
+boundary native's call over the series: main 679, step 1 686, step 2 576, the trims 503.
+
+COUNTS against step 2, incremental marking off (counts/c2tr-incoff-dfd4871f.txt):
+
+| workload | step 2 cde9bc81 | trims dfd4871f | change |
+| --- | --- | --- | --- |
+| vue | 1,362,609,901 | 1,357,257,201 | -0.39% |
+| react | 293,322,387 | 293,315,465 | -0.00% |
+| djot | 547,444,958 | 544,447,816 | -0.55% |
+| chai | 71,371,260,525 | 70,850,190,640 | -0.73% |
+| richards | 131,276,161 | 131,270,360 | -0.00% |
+| deltablue | 253,667,522 | 253,428,567 | -0.09% |
+| crypto | 709,928,253 | 709,868,998 | -0.01% |
+| raytrace | 984,969,255 | 984,160,721 | -0.08% |
+| earley-boyer | 3,101,095,544 | 3,083,492,921 | -0.57% |
+| regexp | 2,587,537,769 | 2,537,478,453 | -1.93% |
+| splay | 1,365,805,376 | 1,366,067,696 | +0.02% |
+| navier-stokes | 440,265,167 | 440,261,543 | -0.00% |
+| pdfjs | 6,815,914,549 | 6,802,609,206 | -0.20% |
+| mandreel | 61,014,827,068 | 60,999,375,678 | -0.03% |
+| gbemu | 14,709,903,871 | 14,714,216,810 | +0.03% |
+| code-load | 476,773,469 | 476,671,671 | -0.02% |
+| box2d | 4,123,997,730 | 4,121,941,453 | -0.05% |
+| zlib | 134,000,218,017 | 134,000,295,749 | +0.00% |
+| typescript | 57,379,699,787 | 57,339,364,900 | -0.07% |
+
+On (counts/c2tr-dfd4871f.txt):
+
+| workload | step 2 cde9bc81 | trims dfd4871f | change |
+| --- | --- | --- | --- |
+| vue | 1,362,596,147 | 1,357,238,128 | -0.39% |
+| react | 293,309,901 | 293,304,981 | -0.00% |
+| djot | 547,394,982 | 544,433,236 | -0.54% |
+| chai | 71,368,900,142 | 70,843,956,482 | -0.74% |
+| richards | 131,264,188 | 131,258,826 | -0.00% |
+| deltablue | 253,650,167 | 253,409,943 | -0.09% |
+| crypto | 709,908,048 | 709,865,410 | -0.01% |
+| raytrace | 984,952,842 | 984,142,322 | -0.08% |
+| earley-boyer | 3,066,838,310 | 3,043,601,518 | -0.76% |
+| regexp | 2,587,506,204 | 2,537,455,868 | -1.93% |
+| splay | 1,153,777,281 | 1,154,737,604 | +0.08% |
+| navier-stokes | 440,263,921 | 440,253,274 | -0.00% |
+| pdfjs | 6,828,464,306 | 6,827,443,651 | -0.01% |
+| mandreel | 61,013,893,674 | 60,999,260,956 | -0.02% |
+| gbemu | 14,728,625,629 | 14,728,018,540 | -0.00% |
+| code-load | 476,745,500 | 476,653,895 | -0.02% |
+| box2d | 4,123,941,009 | 4,121,884,472 | -0.05% |
+| zlib | 134,000,202,355 | 134,000,252,515 | +0.00% |
+| typescript | 56,478,261,309 | 56,415,077,874 | -0.11% |
+
+EarleyBoyer's -0.57% (marking off) returns it to step 1's binary level (3,083.5M against 3,083.6M):
+the layout flip of the series' records, not the trims, which no switch can toggle at run time.
+
+CHECKS on dfd4871f: lib suite 2,895 passed; clippy in three configurations; zombie (x86-64): clippy
+x3, lib 2,656 passed. (48c5ecca, the first form, put a second #[inline] on activate_agent; clippy
+refused it.)
+
+LANDING (the series on main bfb58035: ae0dee7f, 51308858, dad9d67f; 2026-11-07)
+
+Step 2's test amendment (51308858; 691c6f30 before it): the deadline test armed its deadline before
+the evaluation, so a loaded machine could pass it before the loop's first native call, and the
+function's entry poll stopped the loop (the coordinator's find). The loop now arms it through a
+test native (armDeadline, as tests.rs's) after its third Object.keys call. Under load (12 busy
+loops on CPUs 0-3, the tests pinned there): jit::poll_tests 13 of 13 in three rounds (four
+threads), native_stub 12 of 12 in three rounds, the deadline test alone 10 of 10. The module is
+cfg(test): the release code is d9ea000d's, which the session below measured.
+
+CHECKS on dad9d67f (gate-land-dad9d67f; base land-t1/gate-eed7110f): rustfmt; clippy in six
+configurations; rustdoc 0 lines (the base's 13 errors, fixed by bfb58035); lib 2,899 passed, with
+pacing on 2,899, under TRUST_JS_GC_INCREMENTAL=force 2,899; doctests 11; the downstream crates;
+GC stress 1: native_stub 12, proxy_trap 8, reflect 28, interrupt 30, callee_pickup 7, poll_tests
+12 of 13: loop_only_code_collects_every_iteration_at_stress_1 fails under TRUST_JS_GC_STRESS=1 on
+main bfb58035 too (c2/t21, main's own test binary: 10 of 11), with the same census (wide, helper-end
+polls off: 197 of its 200 loop polls collect, the test asks 198); the release builds; fixtures vue,
+react and djot as the base's; difftest 138 agree, 12 skipped; dumps; Test262 at jit threshold 8:
+53,573 of 53,575 in the gate's run, with two timeouts (staging/sm/extensions/recursion.js and
+staging/sm/regress/regress-610026.js: 60 s without a result, while a debug build of main's test
+binary ran beside it). Not reproduced: alone 4.1 s and 6.3 s, Test262's staging directory with
+eight workers 1,483 of 1,483, and the stage rerun on its own (gate-land-dad9d67f-t262b) 53,575
+of 53,575, identical to the base's report. Zombie (x86-64): clippy in three configurations, lib
+2,660 passed.
+
+SESSION (one HOLD, 09:03-09:16; every timed part uncapped: 0 capped seconds on CPUs 5-9, 13,
+15-19; c2/landing-d9ea000d): main bfb58035 (lto/main-bfb58035) against the head (d9ea000d's build,
+lto/c2land-d9ea000d).
+
+| Djot (--tier=jit, CPU 13, ms) | main | head | node-sp | head/main | head/node-sp |
+| --- | --- | --- | --- | --- | --- |
+| p20 | 306 (303-308) | 295 (294-296) | 142 | -3.6% | 2.08x (main 2.15x) |
+| p40 | 575 (568-579) | 561 (557-566) | 276 | -2.4% | 2.03x (main 2.08x) |
+
+TRust 78435d0's pages (machine code, compile time; all 24 runs exit 0): event-loop t8 858,283 B,
+10.8 ms against 858,946 B, 11.1 ms; t1a2 3,377,695 B, 34.5 ms against 3,378,110 B, 34.0 ms;
+dom-reconcile t8 1,758,174 B, 22.4 ms against 1,757,619 B, 22.2 ms; t1a2 3,474,297 B, 38.8 ms
+against 3,473,489 B, 38.7 ms; Vue TodoMVC t8 6,563,101 B, 82.7 ms against 6,560,449 B, 83.0 ms;
+t1a2 8,933,835 B, 109.2 ms against 8,931,795 B, 108.6 ms. Spike on CPU 5, three rounds
+alternating: scores 3643, 3650, 3639 against 3636, 3650, 3653 (medians 3643, 3650).
+
+The spike's event loop took 22.48 s on main and 21.51 s on the head in all three rounds. The
+second is the suite's: js-engine-benchmark/run.js:250 measures a benchmark for another second
+when its measured second ran fewer than 32 iterations, and RayTrace runs at that line (1000/31 =
+32.26 ms an iteration). In all 26 spike runs of this session and the 63eb71df one, every run with
+a RayTrace score of 2297 or more took 21.5 s and every one of 2295 or less 22.5 s. The head's
+RayTrace is 2303 (2299-2306) against main's 2281 (2272-2283), as step 2's was 2299 against step
+1's 2283 on 63eb71df: the bimodal event loop of the 63eb71df session is this threshold.
