@@ -505,6 +505,7 @@ impl GcTrace for crate::interpreter::RealmState {
             array_ctor,
             string_proto,
             string_proto_fuse: _,
+            regexp_statics,
             number_proto,
             boolean_proto,
             symbol_proto,
@@ -529,6 +530,10 @@ impl GcTrace for crate::interpreter::RealmState {
         error_protos.trace_gc(sink);
         eval_fn.trace_gc(sink);
         extra_protos.trace_gc(sink);
+        // The Realm's pending legacy-statics match holds its subject (the program is Rust-owned).
+        if let Some(last) = regexp_statics.borrow().as_ref() {
+            last.input.trace_gc(sink);
+        }
     }
 }
 

@@ -473,24 +473,6 @@ pub(super) fn set_last_index_at_slot(object: &Gc, n: f64) {
     body.props.set_value_at(LAST_INDEX_SLOT, Value::Num(n));
 }
 
-/// The running Realm's %RegExp%, whose legacy static properties a successful match updates.
-/// The RegExp protector's pins, whatever the epoch, are the running Realm's (another Realm's
-/// entry invalidates them), and its `constructor` member was %RegExp%. Without pins the proof is
-/// established, and where it fails the intrinsic is looked up.
-pub(super) fn realm_regexp_constructor(i: &Interp) -> Option<Gc> {
-    let constructor =
-        |pins: &RegexpPins| pins.members[RegexpMember::Constructor as usize].upgrade();
-    let pinned = i
-        .regexp_protector
-        .borrow()
-        .pins
-        .as_deref()
-        .and_then(constructor);
-    pinned
-        .or_else(|| with_regexp_proof(i, |_, pins, _| constructor(pins)))
-        .or_else(|| i.extra_protos.get("%RegExpCtor%").copied())
-}
-
 /// Read the engine-owned flags of a RegExp without dispatching the `flags` getter, when the
 /// observable `RegExp.prototype.flags` string is provably canonical (see [`intrinsic_regexp`]).
 /// `None` keeps the generic getter with its observable Gets (a user-overridden `flags`, a
@@ -840,7 +822,7 @@ fn regexp_legacy_brand(i: &mut Interp, this: &Value) -> Result<Gc, Value> {
 fn regexp_legacy_get(i: &mut Interp, this: &Value, slot: &str) -> Result<Value, Value> {
     let c = regexp_legacy_brand(i, this)?;
     // Materialize the deferred last-match state (if any) before reading.
-    super::flush_regexp_legacy(i);
+    super::flush_regexp_legacy(i, &c);
     let v = c.borrow().internal_slots().get(slot).map(|p| p.value());
     Ok(v.unwrap_or_else(|| Value::lstr("")))
 }
@@ -872,7 +854,7 @@ fn lg_set_input(i: &mut Interp, this: Value, a: &[Value]) -> Result<Value, Value
     let v = ab(i.to_string(&arg(a, 0)))?;
     let c = regexp_legacy_brand(i, &this)?;
     // Materialize any deferred match first so this write isn't later clobbered by its flush.
-    super::flush_regexp_legacy(i);
+    super::flush_regexp_legacy(i, &c);
     c.borrow_mut().internal_slots_mut().insert(
         "#\u{0}legacy_input",
         Property::data(Value::Str(v), true, false, false),
@@ -1044,7 +1026,8 @@ pub(super) fn re_sym_match_discard_direct(
             break;
         }
         let empty = i
-            .regexp_last
+            .regexp_statics
+            .borrow()
             .as_ref()
             .and_then(|last| last.caps.first().copied().flatten())
             .is_some_and(|(start, end)| start == end);
@@ -1121,7 +1104,8 @@ pub(super) fn re_sym_replace_discard_direct(
             break;
         }
         let empty = i
-            .regexp_last
+            .regexp_statics
+            .borrow()
             .as_ref()
             .and_then(|last| last.caps.first().copied().flatten())
             .is_some_and(|(start, end)| start == end);
@@ -1226,7 +1210,8 @@ fn re_sym_replace_impl(
                         break;
                     }
                     let empty = i
-                        .regexp_last
+                        .regexp_statics
+                        .borrow()
                         .as_ref()
                         .and_then(|last| last.caps.first().copied().flatten())
                         .is_some_and(|(start, end)| start == end);

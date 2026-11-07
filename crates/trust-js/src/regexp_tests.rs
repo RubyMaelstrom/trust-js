@@ -1508,3 +1508,47 @@ fn unicode_sets_classes_keep_lone_surrogates_and_fold_their_operands() {
         "11111110101|0010111110001000000|0011101|0110",
     );
 }
+
+/// A Realm's legacy statics record the compiled program and the search start (see
+/// `RegexpLastMatch::lazy_captures`), not the RegExp object: Annex B's `compile()` re-points the
+/// object between a match and a read of `RegExp.$1`, and the read still gives that match's
+/// captures and contexts, for a plain, a global (from its `lastIndex`), a sticky and a Unicode
+/// pattern, and two programs that take turns. node gives the same.
+#[test]
+fn legacy_statics_read_after_compile_are_the_matchs() {
+    check(
+        r#"
+        function run() {
+            var r = [];
+            var re = /(a)(b)?/;
+            re.exec('xab');
+            re.compile('(z)');
+            r.push([RegExp.$1, RegExp.$2, RegExp.lastMatch, RegExp.leftContext,
+                RegExp.rightContext, RegExp.lastParen, RegExp.input].join(','));
+            var g = /(\d)(\w)/g;
+            g.lastIndex = 2;
+            g.exec('1a2b3c');
+            g.compile('q', 'g');
+            r.push([RegExp.$1, RegExp.$2, RegExp.lastMatch, RegExp.leftContext,
+                RegExp.rightContext, g.lastIndex].join(','));
+            var y = /(b+)/y;
+            y.lastIndex = 1;
+            y.exec('abbc');
+            y.compile('(c)', 'y');
+            r.push([RegExp.$1, RegExp.lastMatch, RegExp.leftContext].join(','));
+            var p = /(p)/, q = /(q)/;
+            for (var k = 0; k < 5; k++) { p.exec('-p'); q.exec('--q'); }
+            r.push([RegExp.$1, RegExp.leftContext].join(','));
+            p.exec('-p');
+            r.push([RegExp.$1, RegExp.leftContext].join(','));
+            var u = /(\u{1F600})(x)/u;
+            u.exec('a\u{1F600}x');
+            u.compile('y', 'u');
+            r.push([RegExp.$1.length, RegExp.$2, RegExp.leftContext].join(','));
+            return r.join('|');
+        }
+        run()
+        "#,
+        "a,b,ab,x,,b,xab|2,b,2b,1a,3c,0|bb,bb,a|q,--|p,-|2,x,a",
+    );
+}

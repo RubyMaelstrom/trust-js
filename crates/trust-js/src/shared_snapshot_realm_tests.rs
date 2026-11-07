@@ -490,6 +490,105 @@ fn a_dropped_realm_that_ran_shared_unresolvable_lookups_is_collected() {
     }
 }
 
+/// Every switch of the active Realm carries its legacy RegExp statics record
+/// (`Interp::regexp_statics`, shared with the Realm's state in the registry): a snapshot's restore
+/// (`in_realm`'s `Interp::restore_realm`), a swap with a Realm's snapshot (`Interp::swap_realm`, an
+/// embedder's entry and exit), `Interp::with_realm_snapshot` (`Interp::eval_in_realm` and a call of
+/// another Realm's function). Each Realm's accessors read the last match its own code made,
+/// whichever Realm matched last.
+#[test]
+fn every_realm_switch_carries_its_legacy_regexp_statics() {
+    for tier in TIERS {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        assert_eq!(eval_string(it, "/(m)(n)?/.exec('am'); RegExp.$1"), "m");
+        let child = it.create_realm();
+        let key = child
+            .as_obj()
+            .map(|global| crate::value::Gc::as_ptr(&global) as usize)
+            .unwrap();
+        let main_record = it.regexp_statics.clone();
+        let child_record = it.realms[&key].regexp_statics.clone();
+        assert!(
+            !Rc::ptr_eq(&main_record, &child_record),
+            "{tier:?}: a Realm has a record of its own"
+        );
+        // A snapshot's restore.
+        let child_statics = in_realm(it, &child, |it| {
+            assert!(
+                Rc::ptr_eq(&it.regexp_statics, &child_record),
+                "{tier:?}: restored the child's"
+            );
+            eval_string(it, "/(c)/.exec('xc'); RegExp.$1 + RegExp.leftContext")
+        });
+        assert_eq!(child_statics, "cx", "{tier:?}");
+        assert!(
+            Rc::ptr_eq(&it.regexp_statics, &main_record),
+            "{tier:?}: restored main's"
+        );
+        assert_eq!(
+            eval_string(it, "RegExp.$1 + RegExp.lastMatch + RegExp.leftContext"),
+            "mma",
+            "{tier:?}"
+        );
+        // A swap with the child's snapshot, in and out.
+        let mut saved = it.realms[&key].snapshot_clone();
+        it.swap_realm(&mut saved);
+        assert!(
+            Rc::ptr_eq(&it.regexp_statics, &child_record),
+            "{tier:?}: entered"
+        );
+        assert_eq!(
+            eval_string(it, "RegExp.lastMatch + RegExp.leftContext"),
+            "cx",
+            "{tier:?}"
+        );
+        assert_eq!(
+            eval_string(it, "/(d)(e)/.exec('de!'); RegExp.$2"),
+            "e",
+            "{tier:?}"
+        );
+        it.swap_realm(&mut saved);
+        assert!(
+            Rc::ptr_eq(&it.regexp_statics, &main_record),
+            "{tier:?}: left"
+        );
+        assert!(Rc::ptr_eq(&saved.regexp_statics, &child_record));
+        // with_realm_snapshot: a Script in the child, and main's call of the child's function.
+        let read =
+            |it: &mut Interp, realm: &Value, source: &str| match it.eval_in_realm(realm, source) {
+                Ok(value) => render(it, &value),
+                Err(_) => panic!("{source:.40} completed abruptly"),
+            };
+        assert_eq!(
+            read(it, &child, "RegExp.$1 + RegExp.$2 + RegExp.rightContext"),
+            "de!",
+            "{tier:?}"
+        );
+        let child_match = it
+            .eval_in_realm(
+                &child,
+                "(function () { /(k)/.exec('-k'); return RegExp.$1 + RegExp.leftContext; })",
+            )
+            .ok()
+            .expect("the child's function");
+        set_global(it, "childMatch", child_match);
+        assert_eq!(
+            eval_string(
+                it,
+                "var seen = ''; for (var i = 0; i < 20; i++) seen = childMatch(); \
+                 seen + '|' + RegExp.$1 + RegExp.lastMatch"
+            ),
+            "k-|mm",
+            "{tier:?}"
+        );
+        assert_eq!(read(it, &child, "RegExp.lastMatch"), "k", "{tier:?}");
+        assert!(Rc::ptr_eq(&it.realms[&key].regexp_statics, &child_record));
+        assert!(Rc::ptr_eq(&it.regexp_statics, &main_record));
+    }
+}
+
 /// The legacy `RegExp.$1` statics are recorded lazily against the matching Realm's %RegExp%.
 /// That pending record must not keep the Realm alive: a dropped Realm whose code ran the last
 /// regular expression is collected, and the statics of live Realms are unaffected.

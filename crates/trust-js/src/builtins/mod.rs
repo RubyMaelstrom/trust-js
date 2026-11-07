@@ -2709,7 +2709,7 @@ fn regexp_builtin_exec(
             if use_last {
                 set_last(i, end)?;
             }
-            update_regexp_legacy_statics(i, &re, &caps, &input);
+            update_regexp_legacy_statics_lazy(i, &re, (start, end), last_units, &input);
             let groups = regexp_groups(i, &re, &caps, &input);
             // `indices` (the `d` flag): [start, end] pairs per capture (undefined if unmatched),
             // plus a null-prototype `groups` of the same for named captures.
@@ -3007,46 +3007,40 @@ pub(crate) fn vm_discard_call(
     Ok(None)
 }
 
-/// Refresh the %RegExp% constructor's legacy static state after a successful RegExpBuiltinExec.
-/// Record a successful match for the legacy `RegExp.$1`-style statics — deferred: the 14 strings
-/// (including full left/right-context copies of the subject) only materialize when one of the
-/// accessors actually reads them (`flush_regexp_legacy`). A pending match for a *different*
-/// realm's constructor flushes first so its statics aren't lost.
+/// Record a successful match, with its spans, for the running Realm's legacy `RegExp.$1`-style
+/// statics: deferred, as the 14 strings (the left and right contexts included) only materialize
+/// when one of the Realm's accessors reads them (`flush_regexp_legacy`). The record is the
+/// running Realm's own ([`crate::interpreter::RealmRegexpStatics`]), found without a lookup.
 fn update_regexp_legacy_statics(
     i: &mut Interp,
     re: &crate::regex::Regex,
     caps: &[Option<(usize, usize)>],
     input: &crate::lstr::LStr,
 ) {
-    let Some(ctor) = regexp::realm_regexp_constructor(i) else {
-        return;
-    };
-    if let Some(prev) = &i.regexp_last {
-        if prev.ctor.as_ptr() != Gc::as_ptr(&ctor) {
-            flush_regexp_legacy(i);
+    let mut record = i.regexp_statics.borrow_mut();
+    match record.as_mut() {
+        Some(previous) => {
+            previous.input = *input;
+            previous.caps.clear();
+            previous.caps.extend_from_slice(caps);
+            previous.ngroups = re.ngroups;
+            previous.lazy_captures = None;
+        }
+        None => {
+            *record = Some(crate::interpreter::RegexpLastMatch {
+                input: *input,
+                caps: caps.to_vec(),
+                ngroups: re.ngroups,
+                lazy_captures: None,
+            })
         }
     }
-    if let Some(previous) = i
-        .regexp_last
-        .as_mut()
-        .filter(|previous| previous.ctor.as_ptr() == Gc::as_ptr(&ctor))
-    {
-        previous.input = *input;
-        previous.caps.clear();
-        previous.caps.extend_from_slice(caps);
-        previous.ngroups = re.ngroups;
-        previous.lazy_captures = None;
-        return;
-    }
-    i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
-        ctor: Gc::downgrade(&ctor),
-        input: *input,
-        caps: caps.to_vec(),
-        ngroups: re.ngroups,
-        lazy_captures: None,
-    });
 }
 
+/// [`update_regexp_legacy_statics`] by the whole match alone: the record keeps the compiled
+/// program and the search start, from which a read recomputes the captures, as SpiderMonkey's lazy
+/// RegExpStatics and JSC's RegExpCachedResult re-execute. The program already recorded is not
+/// cloned again.
 fn update_regexp_legacy_statics_lazy(
     i: &mut Interp,
     re: &Rc<crate::regex::Regex>,
@@ -3054,43 +3048,33 @@ fn update_regexp_legacy_statics_lazy(
     search_start: usize,
     input: &crate::lstr::LStr,
 ) {
-    let Some(ctor) = regexp::realm_regexp_constructor(i) else {
-        return;
-    };
-    if let Some(prev) = &i.regexp_last {
-        if prev.ctor.as_ptr() != Gc::as_ptr(&ctor) {
-            flush_regexp_legacy(i);
+    let mut record = i.regexp_statics.borrow_mut();
+    match record.as_mut() {
+        Some(previous) => {
+            previous.input = *input;
+            previous.caps.clear();
+            previous.caps.push(Some(whole));
+            previous.ngroups = re.ngroups;
+            match &mut previous.lazy_captures {
+                Some((program, start)) if Rc::ptr_eq(program, re) => *start = search_start,
+                lazy => *lazy = Some((re.clone(), search_start)),
+            }
+        }
+        None => {
+            *record = Some(crate::interpreter::RegexpLastMatch {
+                input: *input,
+                caps: vec![Some(whole)],
+                ngroups: re.ngroups,
+                lazy_captures: Some((re.clone(), search_start)),
+            })
         }
     }
-    if let Some(previous) = i
-        .regexp_last
-        .as_mut()
-        .filter(|previous| previous.ctor.as_ptr() == Gc::as_ptr(&ctor))
-    {
-        previous.input = *input;
-        previous.caps.clear();
-        previous.caps.push(Some(whole));
-        previous.ngroups = re.ngroups;
-        previous.lazy_captures = Some((re.clone(), search_start));
-        return;
-    }
-    i.regexp_last = Some(crate::interpreter::RegexpLastMatch {
-        ctor: Gc::downgrade(&ctor),
-        input: *input,
-        caps: vec![Some(whole)],
-        ngroups: re.ngroups,
-        lazy_captures: Some((re.clone(), search_start)),
-    });
 }
 
-/// Materialize the pending legacy-statics match (if any) into its constructor's internal slots.
-/// Called by the `RegExp.$1`/`lastMatch`/… accessors before they read.
-pub(super) fn flush_regexp_legacy(i: &mut Interp) {
-    let Some(mut m) = i.regexp_last.take() else {
-        return;
-    };
-    // The constructor's Realm was collected: nothing can observe its statics.
-    let Some(ctor) = m.ctor.upgrade() else {
+/// Materialize the running Realm's pending legacy-statics match (if any) into `ctor`, its
+/// %RegExp%, which the `RegExp.$1`/`lastMatch`/… accessors have brand-checked before they read.
+pub(super) fn flush_regexp_legacy(i: &mut Interp, ctor: &Gc) {
+    let Some(mut m) = i.regexp_statics.borrow_mut().take() else {
         return;
     };
     if let Some((re, start)) = m.lazy_captures.take() {
@@ -3100,7 +3084,7 @@ pub(super) fn flush_regexp_legacy(i: &mut Interp) {
             m.caps.extend_from_slice(&captures);
         }
     }
-    let (caps, input, ctor) = (&m.caps, &m.input, &ctor);
+    let (caps, input) = (&m.caps, &m.input);
     let put = |k: &'static str, v: crate::lstr::LStr| {
         ctor.borrow_mut()
             .internal_slots_mut()

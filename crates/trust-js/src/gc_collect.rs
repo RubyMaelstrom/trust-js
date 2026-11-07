@@ -2300,7 +2300,7 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             regexp_protector: _, // weak pins
-            regexp_last,
+            regexp_statics,
             depth: _,
             direct_call_depth: _,
             proxy_forward_depth: _,
@@ -2435,7 +2435,9 @@ impl Interp {
         if let Some(symbol) = iterator_sym {
             sink.word(crate::value::symbol_identity(symbol) as u64);
         }
-        if let Some(last) = regexp_last {
+        // The active Realm's pending legacy-statics match (each saved Realm's travels in its
+        // RealmState, traced with it).
+        if let Some(last) = regexp_statics.borrow().as_ref() {
             last.input.trace_gc(sink);
         }
         code_frames.trace_gc(sink);

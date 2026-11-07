@@ -1616,20 +1616,28 @@ pub(crate) enum StrUnits<'a> {
     Units(&'a [u16]),
 }
 
-/// Raw state of the last successful regex match, deferred for the legacy `RegExp.$1` statics.
-/// `ctor` is the %RegExp% constructor the statics belong to (the realm active at match time).
-/// It is weak: a pending match must not keep that constructor's Realm alive, and once the
-/// Realm is gone its statics can no longer be observed.
+/// Raw state of a Realm's last successful regex match, deferred for its legacy `RegExp.$1`
+/// statics: the 14 strings materialize into that Realm's %RegExp% only when one of its accessors
+/// reads them (`builtins::flush_regexp_legacy`).
 #[derive(Clone)]
 pub(crate) struct RegexpLastMatch {
-    pub ctor: crate::value::WeakGc,
     pub input: crate::lstr::LStr,
+    /// The match's spans, or only the whole match while `lazy_captures` is set.
     pub caps: Vec<Option<(usize, usize)>>,
     pub ngroups: usize,
-    /// Dead-result regexp operations record only the whole match and defer capture extraction
-    /// until a legacy `RegExp.$1`-style accessor actually observes it.
+    /// The compiled program and the search start, from which a read recomputes the captures (as
+    /// SpiderMonkey's lazy RegExpStatics and JSC's RegExpCachedResult re-execute): the program,
+    /// not the RegExp object, which Annex B's `compile()` can re-point between the match and the
+    /// read.
     pub lazy_captures: Option<(Rc<crate::regex::Regex>, usize)>,
 }
+
+/// A Realm's legacy RegExp statics record ([`RegexpLastMatch`], `None` before its first match),
+/// shared by the Realm's state in the registry and, while the Realm runs, by the Interp, so that
+/// every switch of the active Realm carries it (snapshot, restore and swap), as V8 keeps the last
+/// match info in the native context, SpiderMonkey its RegExpStatics with the global and JSC its
+/// RegExpGlobalData in the global object.
+pub(crate) type RealmRegexpStatics = Rc<RefCell<Option<RegexpLastMatch>>>;
 
 /// One scope's bindings: their names with their attributes ([`Names`]) and, slot for slot, their
 /// values, one word each (`Value::Empty` while a binding is in its temporal dead zone), in the
@@ -4817,10 +4825,10 @@ pub struct Interp {
     /// The RegExp protector (see [`crate::builtins::RegexpProof`]): the current Realm's RegExp
     /// algorithms read the intrinsic methods, flag getters and species.
     pub(crate) regexp_protector: RefCell<crate::builtins::RegexpProof>,
-    /// The last successful `exec` match, kept raw for the legacy `RegExp.$1`-style statics:
-    /// the 14 strings materialize into the constructor's internal slots only when an accessor
-    /// actually reads them (see `builtins::flush_regexp_legacy`), not on every match.
-    pub(crate) regexp_last: Option<RegexpLastMatch>,
+    /// The active Realm's last successful match, kept raw for its legacy `RegExp.$1`-style
+    /// statics ([`RealmRegexpStatics`]): the 14 strings materialize into its constructor's internal
+    /// slots only when an accessor actually reads them (see `builtins::flush_regexp_legacy`).
+    pub(crate) regexp_statics: RealmRegexpStatics,
     /// Live ECMAScript execution depth. Native builds use it to decide when direct JIT calls must
     /// return to a stack-growth checkpoint; it is bookkeeping, not a language-visible budget.
     pub(crate) depth: u32,
@@ -5215,7 +5223,7 @@ interp_memory_inventory! {
     jit_layout => "non_owning",
     interp_layout => "non_owning",
     regexp_protector => "non_owning",
-    regexp_last => "measured",
+    regexp_statics => "measured",
     depth => "non_owning",
     direct_call_depth => "non_owning",
     proxy_forward_depth => "non_owning",
@@ -6108,6 +6116,7 @@ pub struct RealmState {
     pub array_ctor: Option<Gc>,
     pub string_proto: Gc,
     pub(crate) string_proto_fuse: Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>,
+    pub(crate) regexp_statics: RealmRegexpStatics,
     pub number_proto: Gc,
     pub boolean_proto: Gc,
     pub symbol_proto: Gc,
@@ -6166,6 +6175,7 @@ impl Interp {
             array_ctor: self.array_ctor,
             string_proto: self.string_proto,
             string_proto_fuse: self.string_proto_fuse.clone(),
+            regexp_statics: self.regexp_statics.clone(),
             number_proto: self.number_proto,
             boolean_proto: self.boolean_proto,
             symbol_proto: self.symbol_proto,
@@ -6187,6 +6197,7 @@ impl Interp {
         self.array_ctor = r.array_ctor;
         self.string_proto = r.string_proto;
         self.set_string_proto_fuse(r.string_proto_fuse.clone());
+        self.regexp_statics = r.regexp_statics.clone();
         self.number_proto = r.number_proto;
         self.boolean_proto = r.boolean_proto;
         self.symbol_proto = r.symbol_proto;
@@ -6218,6 +6229,7 @@ impl Interp {
         let fuse = saved.string_proto_fuse.take();
         saved.string_proto_fuse = self.string_proto_fuse.take();
         self.set_string_proto_fuse(fuse);
+        std::mem::swap(&mut self.regexp_statics, &mut saved.regexp_statics);
         std::mem::swap(&mut self.number_proto, &mut saved.number_proto);
         std::mem::swap(&mut self.boolean_proto, &mut saved.boolean_proto);
         std::mem::swap(&mut self.symbol_proto, &mut saved.symbol_proto);
@@ -6424,6 +6436,7 @@ impl Interp {
         self.extra_protos = Default::default();
         self.eval_fn = None;
         self.set_string_proto_fuse(None);
+        self.regexp_statics = Default::default();
         crate::builtins::install(self);
         self.install_string_proto_fuse();
         // Top-level `this` is the new global.
@@ -6556,6 +6569,7 @@ impl RealmState {
             array_ctor: self.array_ctor,
             string_proto: self.string_proto,
             string_proto_fuse: self.string_proto_fuse.clone(),
+            regexp_statics: self.regexp_statics.clone(),
             number_proto: self.number_proto,
             boolean_proto: self.boolean_proto,
             symbol_proto: self.symbol_proto,
@@ -7003,7 +7017,7 @@ impl Interp {
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
             regexp_protector: RefCell::default(),
-            regexp_last: None,
+            regexp_statics: Default::default(),
             weak_collections: Default::default(),
             extra_protos: Default::default(),
             can_block: true,
@@ -14039,7 +14053,7 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             regexp_protector: _,
-            regexp_last: _,
+            regexp_statics: _,
             depth: _,
             direct_call_depth: _,
             proxy_forward_depth: _,

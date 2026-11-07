@@ -1514,7 +1514,7 @@ fn scan_realm(
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
 
-    if let Some(last) = &interp.regexp_last {
+    if let Some(last) = interp.regexp_statics.borrow().as_ref() {
         totals.interpreter_side_tables.add(
             last.caps
                 .capacity()
