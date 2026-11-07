@@ -271,6 +271,45 @@ fn an_explicit_collection_during_a_cycle_frees_what_died_after_the_cycle_marked_
     assert_eq!(eval(&mut engine, "bulk.length"), "30000");
 }
 
+/// A test's precise collection (`Interp::gc_collect_precise_for_test`) while a cycle marks
+/// finishes the cycle first, then marks from the roots alone: an object the cycle marked before
+/// the program dropped it is freed, as an explicit collection frees it (above). With incremental
+/// marking on by default, a stress major's cycle can run as such a collection comes
+/// (`reentry_rooting_tests`' `retired`, under `TRUST_JS_GC_STRESS=1`).
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_precise_test_collection_during_a_cycle_frees_what_died_after_the_cycle_marked_it() {
+    let mut engine = cycling_engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        r#"
+        var bulk = [];
+        for (let i = 0; i < 30000; i++) bulk.push({ i });
+        var dropped = { kids: [1, 2, 3] };
+        true
+        "#,
+    );
+    let weak = weak_global(&mut engine, "dropped");
+    let address = hidden_address(&weak);
+    assert!(engine.interp.gc_start_cycle());
+    slice_until_marked(&mut engine, address, "the dropped object");
+    assert!(cycle_running(&engine), "the bulk keeps the worklist busy");
+    eval(&mut engine, "dropped = null; 0");
+    assert!(cycle_running(&engine));
+    engine
+        .interp
+        .gc_collect_precise_for_test(crate::gc_core::CollectionKind::Major);
+    assert!(!cycle_running(&engine));
+    assert!(
+        !crate::gc_test::alive(&*weak),
+        "the precise collection freed it"
+    );
+    assert_eq!(eval(&mut engine, "bulk.length"), "30000");
+}
+
 /// The address of the object a weak handle names, kept complemented (a plain address in a test's
 /// frame would keep the object alive).
 fn hidden_address(weak: &crate::value::WeakGc) -> crate::gc_test::HiddenAddress {
