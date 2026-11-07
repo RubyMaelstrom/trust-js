@@ -79,7 +79,9 @@ const EXPLICIT_SCRUB_BYTES: usize = if cfg!(debug_assertions) {
 };
 
 /// `TRUST_JS_GC_STRESS=N`: collect at the first safepoint after every N cell allocations
-/// (N = 1: at every safepoint that follows an allocation), and poll at every call.
+/// (N = 1: at every safepoint that follows an allocation), and poll at every call. While a
+/// marking cycle runs, that collection is the cycle's final pause, not a slice
+/// (`gc_core::Heap::due_work`), unless `TRUST_JS_GC_INCREMENTAL=force`.
 pub(crate) fn gc_stress() -> usize {
     static STRESS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *STRESS.get_or_init(|| {

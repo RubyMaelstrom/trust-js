@@ -296,6 +296,10 @@ comment/example in the same change.
   polls at every call (N=1 finds unrooted values; run each test in its own process, since a
   use-after-free can take down the whole run). Its collections are minor but for every Mth,
   which is major (`TRUST_JS_GC_STRESS_MAJOR=M`, 8 by default; 1 makes every one major). With
+  incremental marking on, a major one may start a marking cycle (in release builds once the
+  heap holds more than 8 MiB), and the next one is that cycle's final pause, as V8's,
+  SpiderMonkey's and JSC's stress collections are whole ones (`TRUST_JS_GC_INCREMENTAL=force`
+  keeps the cycle's slices). With
   `TRUST_JS_GC_VERIFY=1`, a debug build under stress also verifies the heap at every
   safepoint.
 - `TRUST_JS_GC_VERIFY=1` verifies the heap at every collection, minor or major, in a debug

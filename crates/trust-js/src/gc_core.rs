@@ -961,10 +961,12 @@ pub(crate) enum IncrementalMode {
     Off,
     /// A major collection the heap asks for on its own (its byte budget, the stress interval)
     /// starts a cycle; a requested one (explicit, the live-object ceiling, buffer pressure)
-    /// still marks in one pause, and finishes a running cycle.
+    /// still marks in one pause, and finishes a running cycle, as the stress interval's next
+    /// collection does ([`Heap::due_work`]).
     On,
     /// As `On`, with slices of a few cells each at every safepoint while a cycle marks, each
-    /// ending with a preclean (verification's mode, design 11).
+    /// ending with a preclean (verification's mode, design 11), the stress interval's
+    /// collections among them.
     Force,
 }
 
@@ -2569,8 +2571,18 @@ impl Heap {
     /// ([`Heap::due_kind`]), whose major collection starts a cycle when incremental marking is on
     /// and nothing asked for a kind (`heap_choice`). While a cycle marks: its final pause for a
     /// major request, an explicit minor one (V8 collects fully for a young-generation request
-    /// while it marks, src/heap/heap.cc:588-591), a deferred major request, a worklist that ran
-    /// out or a margin passed; a slice otherwise.
+    /// while it marks, src/heap/heap.cc:588-591), the stress interval's collection, a deferred
+    /// major request, a worklist that ran out or a margin passed; a slice otherwise.
+    ///
+    /// A stress collection is a whole one in V8, SpiderMonkey and JSC: V8's allocation timeout
+    /// (`--gc-interval`) fails an allocation (src/heap/heap-allocator.cc:488-497), and the
+    /// collection that follows while it marks is the full one above; SpiderMonkey's Alloc zeal
+    /// collects non-incrementally, resetting an incremental collection that runs
+    /// (js/src/gc/GC.cpp:5835-5885, 5420-5426, 4780-4794); JSC's `slowPathAllocsBetweenGCs`
+    /// collects fully and synchronously (heap/LocalAllocator.cpp:273-289). A slice there would
+    /// leave the safepoint uncollected and its young cells in place, where the stress interval
+    /// exists to collect them. Forced cycles (verification's mode) keep their slices, as
+    /// SpiderMonkey's incremental zeal modes take precedence over its Alloc one.
     #[inline(never)]
     pub(crate) fn due_work(
         &self,
@@ -2579,8 +2591,12 @@ impl Heap {
         explicit_minor: bool,
     ) -> DueWork {
         if let Some(cycle) = &self.cycle {
+            let stress_due = self.stress_every > 0
+                && self.allocs_since_gc >= self.stress_every
+                && self.incremental != IncrementalMode::Force;
             let finalize = requested == Some(CollectionKind::Major)
                 || explicit_minor
+                || stress_due
                 || self.major_due
                 || cycle.complete
                 || self.cycle_overshot(0);
@@ -11312,6 +11328,46 @@ mod tests {
         fx.collect();
         assert_eq!(fx.heap.minor_collections(), minors);
         assert!(fx.heap.cycle.is_none());
+    }
+
+    /// While a cycle marks, the collection the stress interval makes due is its final pause, not
+    /// a slice, as V8's, SpiderMonkey's and JSC's stress collections are whole ones
+    /// ([`Heap::due_work`]): with incremental marking on, or turned off since the cycle started
+    /// (a test's stress setting after `TRUST_JS_GC_STRESS` and the default mode started one).
+    /// Forced cycles, verification's mode, keep their slices.
+    #[test]
+    fn the_stress_intervals_collection_is_a_running_cycles_final_pause() {
+        for (mode, work) in [
+            (IncrementalMode::On, DueWork::Collect(CollectionKind::Major)),
+            (
+                IncrementalMode::Off,
+                DueWork::Collect(CollectionKind::Major),
+            ),
+            (IncrementalMode::Force, DueWork::Slice),
+        ] {
+            let (mut fx, _chain) = cycle_fixture(20_000);
+            // The interval counts the chain's cells as it is set, before the start resets its
+            // count: no cell counts toward it after the start.
+            fx.heap.set_stress_every(1);
+            assert!(start_cycle(&mut fx));
+            assert!(
+                !fx.heap.cycle.as_ref().unwrap().complete,
+                "{mode:?}: a first slice marks part of the chain"
+            );
+            fx.heap.set_incremental(mode);
+            assert_eq!(
+                fx.heap.due_work(None, true, false),
+                DueWork::Slice,
+                "{mode:?}: no cell since the start, so no stress collection"
+            );
+            fx.heap.alloc(fx.node, 16);
+            assert!(fx.heap.collection_due(), "{mode:?}");
+            assert_eq!(fx.heap.due_work(None, true, false), work, "{mode:?}");
+            if work == DueWork::Collect(CollectionKind::Major) {
+                fx.collect();
+                assert!(fx.heap.cycle.is_none(), "{mode:?}");
+            }
+        }
     }
 
     /// W6: allocation past V8's overshoot margin over the budget forces the final pause.

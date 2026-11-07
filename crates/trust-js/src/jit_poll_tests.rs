@@ -172,6 +172,55 @@ fn loop_only_code_collects_every_iteration_at_stress_1() {
     }
 }
 
+/// (1b) A marking cycle that runs when a stress-1 loop starts ends at the first poll the stress
+/// interval makes due, whose collection is the cycle's final pause (V8's, SpiderMonkey's and
+/// JSC's stress collections are whole ones, `gc_core::Heap::due_work`), and every poll after it
+/// collects too. `TRUST_JS_GC_STRESS=1` with incremental marking on by default starts such a
+/// cycle in (1)'s warm-up, before `stress` turns incremental marking off; its slices took
+/// `wide`'s entry poll and first three loop polls there (helper-end polls off), whose loop
+/// polls collected 197 times of 200. Here the heap runs no stress collection before the cycle,
+/// which the test starts, whatever the environment says.
+#[test]
+fn a_cycle_running_as_a_stress_loop_starts_ends_at_its_first_poll() {
+    const N: u64 = 200;
+    let census = without_end_polls(|| {
+        let mut engine = engine();
+        {
+            let mut core = engine.interp.gc_heap.core.borrow_mut();
+            core.set_stress_every(0);
+            core.set_incremental(crate::gc_core::IncrementalMode::On);
+        }
+        assert_eq!(
+            eval(
+                &mut engine,
+                "function wide(n) { var sum = 0, row = null; for (var i = 0; i < n; i++) { \
+                 row = [{v: i}, i, i, i, i, i, i, i, i, i, i, i, i, i, i, i]; sum += row[0].v; } \
+                 return sum; } wide(3)"
+            ),
+            "3"
+        );
+        assert_native(&mut engine, &["wide"]);
+        assert!(engine.interp.gc_start_cycle(), "a cycle starts");
+        stress(&engine.interp, 1);
+        let entries = executed_regions();
+        let (result, census) = measured(&mut engine, &format!("wide({N});"));
+        assert_eq!(result, (N * (N - 1) / 2).to_string());
+        assert_eq!(
+            executed_regions() - entries,
+            0,
+            "wide runs in baseline code"
+        );
+        assert_poll_bit(&engine.interp);
+        assert!(!engine.interp.gc_heap.core.borrow().cycle_running());
+        census
+    });
+    assert_eq!(census.calls[LOOP], N, "{census:?}");
+    assert_eq!(
+        census.collections, census.calls,
+        "every poll that took its slow path collected, the first one the cycle's final pause"
+    );
+}
+
 /// (2) Call-only code at stress 1: loop-free recursion through direct calls (on x86-64 through
 /// the checked call helper). With helper-end polls off, the object each level allocates is
 /// collected at the next callee's entry poll, the direct call's safepoint; with them on, where
