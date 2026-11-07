@@ -20980,3 +20980,131 @@ Cuts so far (worktree c3-wt4, branch p2-c3-entry, on d029ec80):
   attributes in the Agent's transition table and the [[Prototype]] is the object's own field, so
   every Realm's RegExps share it (the protector keeps instance_shape across invalidation for the
   same reason).
+
+### TRust: the engine's incremental marking steps in the page actor's and workers' idle time (record, 2026-11-07)
+
+Landed in TRust's main by fast-forward, 78435d0 to 8bd6b3f (local, unpushed; the coordinator's, as
+the engine handoff's port; an agent's change). TRust needs no other port for P2's final engine: its
+builds on 30b266ee, whose crates tree main 447af048 has, compile and pass as below. The agent's record:
+
+1. THE CHANGE
+TRust 8bd6b3f, branch p2-idle-marking (from TRust main 78435d0; worktree target/p2/djot-gap/trust-idle),
+src/trust_js_backend.rs +33. advance_idle_marking() takes one Engine::advance_incremental_marking step
+(a slice of at most a millisecond, or the cycle's final pause) where the actor would otherwise wait:
+in the page actor's idle path beside the memory reducer (inside `if !defer_task_gc`, so never during an
+input burst) and in each worker's loop. While a cycle still runs, `wait` becomes zero and the timeout a
+maintenance wake (Wake::Maintenance, WorkerTask::Checkpoint): the loop takes whatever work arrived, and
+then the next step. The engine's step itself refuses inside JS execution or GC suppression.
+
+2. GROUNDING (V8 c8b709085e, files in target/p2/w6/src/v8)
+- The incremental marking job's runner is the foreground task runner at TaskPriority::kUserVisible
+  (src/heap/incremental-marking-job.cc:46-51).
+- ScheduleTask posts the task, non-nestable when the platform allows, without delay
+  (incremental-marking-job.cc:53-78; PostNonNestableTask 67, PostTask 69).
+- Task::RunInternal calls AdvanceAndFinalizeIfComplete (128) and posts the next task while major
+  marking continues (134) (incremental-marking-job.cc:80-137).
+- A task's step is 1 ms (kMaxStepSizeOnTask, src/heap/incremental-marking.cc:56).
+- Each worker isolate has its own heap and so its own job.
+
+3. THE DIFFERENCE FROM V8
+V8's step is a user-visible-priority task that interleaves with the other tasks. TRust's step runs only
+when the actor's queues are empty, and not during an input burst (defer_task_gc, as the memory
+reducer). A page that never idles behaves as before the change: allocation-driven slices and the
+cycle's final pause advance its cycles.
+
+4. WHAT THE REPLAY HARNESS AND THE SPIKE MEASURE: A PAGE THAT NEVER IDLES (idle-checks.txt)
+Neither runs the resident actor. trust-browser-replay calls trust::js::transform, a one-shot document
+run that advances its task sources back to back in virtual time until they are quiescent;
+trust-js-spike calls run_benchmark, a one-shot loop that dispatches each timer at once
+(nextDeadline). Neither ever waits, so the step never runs: they show a page that never idles.
+TRust 8bd6b3f against 78435d0, release on engine bf4003c8 and debug-assertions on 77d2c414 (the same
+engine code), as trust-checks.sh runs them:
+- The three pages complete, valid and with main-off's output on both sides, in release, dbg-1 and
+  dbg-force (TRUST_JS_GC_VERIFY=1 under TRUST_JS_GC_INCREMENTAL=1 and =force).
+- Their slices are the same on both sides: release dom-reconcile 130 (all allocation), Vue 112 (63
+  allocation, 49 the engine's own task-boundary collections), event-loop 0; dbg-1 60 each; dbg-force
+  17639-17657 (allocation).
+- The spike passes on both sides: release scores 3576 and 3566 (single unheld runs), 8 cycle majors
+  each; dbg-1 988 and 1424, dbg-force 703 and 901 (loaded machine). Every slice is allocation-driven
+  but 1-3 of the engine's task-boundary ones.
+
+5. THE IDLE STEP IN THE RESIDENT ACTOR: TRUST-HEADLESS (headless-checks.txt, headless/)
+trust-headless drives the shared BrowserController and so the resident page actor, in real time.
+Binaries on engine 30b266ee (E1/E2 on the hardening series e49d4433 on candidate 2 dad9d67f, the
+expected final tree): fidle = TRust 8bd6b3f, fbase = 78435d0. Pages from site/: the three replay
+pages (Vue's js and css beside them) with --settle 12, so the actor sits idle past the memory
+reducer's 8 s; the spike's run.js as a page (spike.html), which in a window yields between its steps
+with setTimeout(RunStep, 25) (run.js:148), each timer's lateness recorded; and latency.html, a kept
+400,000-object list and then a 25 ms timer chain of 640 ticks (16 s), each tick's lateness recorded.
+The accounting (gc-cycles.py) classes a slice or final pause as allocation, the engine's task
+boundary ([gc-task] follows), the reducer's start (a TaskBoundary start), or an idle step (the other
+TaskBoundary slices); a final pause after an idle step that completed the marking is idle-done (the
+actor loop's next small allocation takes it while the actor is idle).
+- Every page's text is the same on both sides in release, dbg-1 and dbg-force: dom-reconcile
+  aea5c013e75c, Vue 75c5617cff93, event-loop 60feabeb3468. No JS errors and no panics, with heap
+  verification on in the dbg runs.
+- Vue, release. fidle: 3 cycles, the memory reducer's two finished idle: 141 steps, 19.8 ms, the
+  longest 0.88 ms; their final pauses 14.5 ms, the longest 11.3 ms; per cycle 11.5 ms of marking in
+  idle time against 6.4 ms in script time; the heap ends at 6.10 MB, 19,410 objects. fbase: the
+  reducer's cycle starts (one 3.3 ms slice) and stays open until exit, and the heap stays at
+  11.9 MB, 39,320 objects. dbg-1 the same on Vue and event-loop (2 of 3 cycles finished idle on
+  fidle; a cycle open at exit on fbase). dbg-force: fidle's idle steps run between the forced
+  allocation slices (Vue 378, event-loop 544), fbase has none.
+- Without the step a reducer-started cycle never finishes while the page is idle. Before e49d4433
+  the reducer took a running cycle as its own (gc_start_cycle_for_host returned true while one ran)
+  and did not advance it either, so fbase's open cycle predates that change; with e49d4433 the
+  reducer also starts no other while it is open. The step is the embedder's half of V8's
+  IncrementalMarkingJob, which every V8 embedder runs through its task runner.
+- dom-reconcile: one allocation-driven cycle on both sides; no step runs.
+- The spike page, release: no step runs on either side. Its cycles start and finish inside run.js's
+  long steps, so no cycle runs in a 25 ms gap.
+- The latency page, release (unheld): fidle 1,384 idle steps between the ticks, the longest
+  1.88 ms; the reducer's two cycles finished idle; lateness mean 1.24 ms, p99 2.00, max 2.60. fbase
+  no steps, a cycle open at exit; lateness mean 1.36, p99 2.60, max 3.30.
+- The latency page under debug assertions: dbg-1 fidle 195 steps (5.4 s: verification after every
+  slice of a 40 MB heap makes a step up to 73 ms), 2 cycles finished idle, fbase a cycle open at
+  exit; both finish with no JS errors or panics. dbg-force: each tick outlasts its 25 ms (forced
+  slices with verification), so the next timer is due when it ends and no step runs; fidle finishes
+  (no JS errors), fbase's dump comes at a 30 s settle mid-run (no JS errors or panics up to there).
+- The dbg-force spike page does not finish on either side: a run.js step under forced marking with
+  verification after every slice (a 95 MB heap) outlasts the 180 s settle, and the dump comes then
+  (fbase after Splay, step 27). No JS errors or panics up to there; no idle step runs (the 25 ms gaps
+  go to the actor's task-boundary and render work). fidle's run is not counted: it was paused (SIGSTOP)
+  through another agent's timing session, and headless took the pause as its settle and dumped at
+  step 25; its rerun was stopped for this record's timing session.
+
+6. RELEASE TIMING (headless-timing.txt, headless-timing/cycles.txt)
+Held session 09:51:48-09:58:41, after the machine went quiet (load 1.32) and CPUs 5-9 ran uncapped
+for 60 s; trust-headless pinned to the X925 cores 5-9 (it runs several threads); CPUs 5-9 0 of 393 s
+capped (valid). 5 alternating rounds, each the spike page then the latency page, fidle then fbase.
+- Spike page score: fidle 3629, 3634, 3633, 3636, 3641 (median 3634); fbase 3661, 3615, 3646, 3646,
+  3642 (median 3646): -0.3% at the median, inside fbase's own 46-point spread; no change beyond
+  noise. Its timers' lateness is the same (mean 1.40-1.54 ms against 1.36-1.59). Steps ran in 2 of
+  fidle's 5 runs, 58 each (4.6 ms, the longest 0.21 ms) after a reducer start; its 8-11 cycles finish
+  in script time on both sides (35.8-47.2 ms of marking per cycle).
+- Latency page, per run. fidle: in idle time 1,371-1,389 steps (104-107 ms, the longest 0.85-1.30 ms)
+  and the final pauses of the 2-3 cycles they finished (7.2-7.3 ms, the longest 3.42 ms); in the
+  actor's busy time 319 allocation slices (27.4-27.9 ms), 831 of the engine's task-boundary slices
+  (31.9 ms) and 1-2 final pauses (1.9-3.9 ms): 61-64 ms. fbase: no steps; in busy time 367-368
+  allocation slices (77.3-79.2 ms), 835-837 task-boundary slices (71.4-73.2 ms) and 3 final pauses
+  (8.5-8.7 ms): 157-161 ms, and a fourth cycle open at exit (26 slices). The step moves about 60% of
+  the page's marking out of its busy time. (The reducer's 2 start slices, about 5 ms, run in the
+  idle path on both sides.)
+- Latency page lateness: fidle mean 1.34, 1.31, 1.29, 1.33, 1.31 ms (median 1.31), p99 median 2.3,
+  max median 3.6; fbase mean 1.43, 1.38, 1.39, 1.42, 1.39 (median 1.39), p99 median 2.5, max median
+  3.6 (one 7.1). The steps yield: a task that comes due while they run waits no longer than without
+  them, slightly less (less marking in the actor's busy time).
+- Neither the replay harness nor trust-headless reports input latency; the latency page's timer
+  lateness stands for it. A step is at most a millisecond-scale slice (the longest seen 1.30 ms
+  held, 1.88 ms unheld) or an idle-finished final pause (up to 3.42 ms held on the latency page,
+  11.3 ms on Vue's 11.9 MB heap), and the loop takes ready work before the next step.
+
+7. STATE
+- TRust 8bd6b3f on branch p2-idle-marking (from 78435d0); lands in TRust's main with the engine
+  handoff (coordinator, 2026-11-07).
+- Its binaries for these measurements were built on engine 30b266ee, whose crates tree is main's
+  after E1/E2 landed (git rev-parse HEAD:crates: 4c86bc3073af0b85ba7ab5f33c402afb1bd95744 on 30b266ee
+  and on main 447af048).
+- Scripts: rebuild-all.sh (the binaries: TRust's sources touched, since an export's older mtimes
+  can leave a stale TRust crate), headless-checks.sh, headless-timing.sh, gc-cycles.py,
+  idle-runs.py; idle-checks.sh for section 4.
