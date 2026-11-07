@@ -421,30 +421,40 @@ pub(crate) enum Captures {
 }
 
 impl Captures {
+    /// The spans of a match's `groups + 1` slot pairs. In line in the matcher's projection: the
+    /// common few groups fill the inline array where the result is built, and only the rare
+    /// program of more groups than [`INLINE_CAPTURES`] takes the out-of-line heap path (whose
+    /// allocation would otherwise make every call save and restore the callee-saved registers).
+    #[inline]
     fn from_slots(slots: &[Option<usize>], groups: usize) -> Self {
         let len = groups + 1;
-        if len <= INLINE_CAPTURES {
-            let mut inline = [None; INLINE_CAPTURES];
-            for (group, span) in inline[..len].iter_mut().enumerate() {
-                *span = match (slots[2 * group], slots[2 * group + 1]) {
-                    (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
-                    _ => None,
-                };
-            }
-            Captures::Inline {
-                len: len as u8,
-                spans: inline,
-            }
-        } else {
-            let mut spans = Vec::with_capacity(len);
-            for group in 0..len {
-                spans.push(match (slots[2 * group], slots[2 * group + 1]) {
-                    (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
-                    _ => None,
-                });
-            }
-            Captures::Heap(spans.into_boxed_slice())
+        if len > INLINE_CAPTURES {
+            return Self::from_slots_heap(slots, len);
         }
+        let mut inline = [None; INLINE_CAPTURES];
+        for (group, span) in inline[..len].iter_mut().enumerate() {
+            *span = match (slots[2 * group], slots[2 * group + 1]) {
+                (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+                _ => None,
+            };
+        }
+        Captures::Inline {
+            len: len as u8,
+            spans: inline,
+        }
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn from_slots_heap(slots: &[Option<usize>], len: usize) -> Self {
+        let mut spans = Vec::with_capacity(len);
+        for group in 0..len {
+            spans.push(match (slots[2 * group], slots[2 * group + 1]) {
+                (Some(a), Some(b)) => Some((a.min(b), a.max(b))),
+                _ => None,
+            });
+        }
+        Captures::Heap(spans.into_boxed_slice())
     }
 
     fn one(span: (usize, usize)) -> Self {
