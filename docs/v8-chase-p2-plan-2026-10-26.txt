@@ -19903,3 +19903,51 @@ From the SPE breakdown, a character in getEol would go from about 194 instructio
 getEol is 10.70% of the steady state's instructions, so that would be about 8% of them. skipSpace
 would lose about 150 of its 750 instructions a call; its call and return are candidate 5's.
 Elapsed time: measured per step; Djot needs about 5% more to reach 77 ms.
+
+### Djot's candidate 4, steps 1 and 2: String.prototype's fuse, codePointAt and charCodeAt fused (record, 2026-11-07)
+
+Landed by fast-forward on main 87a05b21 (an agent's): 29a5dbac (String.prototype's ObjectFuse:
+which of its methods generated code may treat as constant), 46229f9b (step 2a: GetMethod
+"codePointAt", its index and CallWithThis(1) as one step in the ARM64 templates, in line in loops
+and through a process-wide shared stub elsewhere), 4abc8062 (step 2b: charCodeAt too; the code
+unit, NaN past the end, for any string form). The agent's working note, with the details below,
+is target/p2/djot-gap/c4/design-note.txt.
+
+Two bugs found in step 1 while step 2 was written, latent while nothing read the fuse, fixed in
+29a5dbac with tests:
+- Interp::swap_realm (an embedder's Realm entry and exit, with_realm_snapshot) swapped
+  string_proto but not its fuse: a site could have checked another Realm's fuse. The fuse and its
+  address now swap together (every_realm_switch_carries_the_string_prototypes_fuse).
+- A property's removal moves the later slots down in TRust, where SpiderMonkey's slots stay put:
+  removing an untracked property before a constant one moved the constant's slot without a new
+  generation, and remove_key skipped the hook for index keys among the named entries, so a site's
+  (index, mask) could name the wrong state bits. handle_remove now bumps the generation whenever a
+  tracked state sits at or after the removed slot, and remove_key reports every removal (tests: an
+  earlier property's removal, an index key's).
+
+A site's data is its chunk's (the fuse's address, generation, index, mask, and a Weak pin so that
+no later fuse takes the address); the fill runs in the slow path (H_STRING_CALL_FILL), and a
+refused site stores the address with bit 0 set and stops asking until a new generation. The step is
+chosen when the call cache holds the native or nothing (the VM fills no native call-cache
+entries; a fused first stage leaves the cache empty for the second stage). charAt waits for a path
+from generated code to the single-unit strings (V8's single_character_string_table through its
+roots, SpiderMonkey's StaticStrings, JSC's vm.smallStrings; in TRust through ctx.interp).
+
+Measured (the series head against main 87a05b21; fat LTO; the agent's checks/):
+- instructions: Djot -0.13%, Crypto -0.22%, TypeScript +0.19%, RegExp +0.08%, DeltaBlue +0.05%, the
+  rest within +-0.04%. TypeScript's is layout: on one binary the fused calls save it 0.19% and
+  Crypto 0.24% (a switch, environments of equal length), and that binary with them off counts
+  +0.15% against main.
+- code: Vue 425,552 (-8), React unchanged, Djot 2,450,304 (+5,792).
+- Djot's elapsed time (the hold, CPU 5, 10 rounds, medians): main 79 ms, the series 78 ms,
+  node-sp 38.5 ms. Djot's loops run in register regions, which these steps' templates do not
+  reach: step 3 carries the loops' gain.
+
+Checks: the gate on b4389c75 (the head's code but for cfg(test) attributes of five test-only
+functions and a test helper removed; the fat-LTO .text identical): rustfmt; the lib suite 2,881
+passed, with pacing on 2,881; the fixtures as the base; difftest 138 agree; Test262 53,575/53,575,
+identical. On 4abc8062: clippy in five configurations and the workspace clean; the lib suite with
+pacing on 2,881 passed, by default the memory-reducer pair failed at a load of 50 and passes alone.
+zombie: on b4389c75 the lib suite 2,656 passed and clippy x3 clean; on 4abc8062 clippy x3 clean
+(the coordinator's). TRust (b4389c75): the three pages valid and as main's with the cycle off, in
+release and with debug assertions (verification, the cycle at 1 and forced); the spikes exit 0.
