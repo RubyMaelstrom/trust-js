@@ -11,13 +11,20 @@ use std::time::{Duration, Instant};
 use crate::gc_pacing::{MemoryReducer, LONG_DELAY, MAX_GCS, START_DELAY};
 use crate::{Completion, Engine};
 
-/// An engine whose heap follows V8's sizing policy and runs no stress collections.
+/// An engine whose heap follows V8's sizing policy and runs no stress collections, and does not
+/// verify its heap. Verification, on in the engine's unit tests, walks the whole heap at every
+/// collection and after every slice of a marking cycle: the collections' measured speeds, which
+/// the policy reads, then counted those walks (a 28 MB cycle's 470 slices took 144 s in a debug
+/// build, 15 ms each at its start and 555 ms at its end), and on a loaded or thermally capped
+/// machine the policy's verdicts turned (the reducer saw a 117 B/ms collector, the nursery a
+/// program allocating under 1 MB/s). The heap's integrity has its own tests.
 fn engine() -> Engine {
     let engine = Engine::new();
     {
         let mut core = engine.interp.gc_heap.core.borrow_mut();
         core.set_stress_every(0);
         core.enable_pacing(true);
+        core.set_heap_verification(false);
     }
     engine
 }
