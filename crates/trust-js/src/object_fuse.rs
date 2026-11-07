@@ -35,11 +35,17 @@
 //! everything above it: changing String.prototype's [[Prototype]] cannot change what that property
 //! holds. Removing the property is a removal, which the fuse sees.
 
-// Generated code is the fuse's consumer (candidate 4's next step); until it lands, the tests read
-// the guard's pieces.
-#![cfg_attr(not(test), allow(dead_code))]
+// Generated code is the fuse's consumer, the ARM64 JIT's fused String method calls
+// (`jit::string_calls`); elsewhere only the tests read the guard's pieces.
+#![cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 
@@ -140,13 +146,15 @@ impl ObjectFuse {
         states[index] = (states[index] & !(STATE_MASK << shift)) | ((state as u32) << shift);
     }
 
-    /// The state of the property at `slot`.
+    /// The state of the property at `slot` (tests).
+    #[cfg(test)]
     pub(crate) fn state(&self, slot: usize) -> PropertyState {
         Self::state_in(&self.lock(), slot)
     }
 
     /// Whether a guard's fast path holds: no Constant property was invalidated and the generation
-    /// never moved.
+    /// never moved (tests; generated code reads the word at [`ObjectFuse::INVALIDATED_OFF`]).
+    #[cfg(test)]
     pub(crate) fn intact(&self) -> bool {
         self.invalidated.load(Ordering::Relaxed) == 0
     }
@@ -189,8 +197,9 @@ impl ObjectFuse {
     }
 
     /// The guard of a site that recorded `data` (SpiderMonkey's GuardObjectFuseProperty, which
-    /// generated code repeats): the fast word, or the recorded generation with the property's
-    /// NotConstant bit clear.
+    /// generated code repeats, `jit::string_calls`): the fast word, or the recorded generation with
+    /// the property's NotConstant bit clear (tests).
+    #[cfg(test)]
     pub(crate) fn guard(&self, data: GuardData) -> bool {
         if self.intact() {
             return true;
@@ -239,7 +248,8 @@ impl ObjectFuse {
         }
     }
 
-    /// Every property is removed.
+    /// Every property is removed (`Props::clear`, which only tests call).
+    #[cfg(test)]
     pub(crate) fn handle_clear(&self) {
         let mut states = self.lock();
         if states.iter().any(|&word| word != 0) {
@@ -390,7 +400,9 @@ fn remove_slow(props: usize, slot: usize) {
     }
 }
 
-/// A marked prototype's map at `props` removed every property.
+/// A marked prototype's map at `props` removed every property (`Props::clear`, which only tests
+/// call).
+#[cfg(test)]
 #[inline]
 pub(crate) fn note_clear(props: usize) {
     if may_have_fuse(props) {
@@ -398,4 +410,130 @@ pub(crate) fn note_clear(props: usize) {
             fuse.handle_clear();
         }
     }
+}
+
+/// A fused String method call's site (Djot's gap, candidate 4, step 2: `str.codePointAt(i)`
+/// compiled as one step, `jit::string_calls`): the fuse it was validated against and the guard
+/// data it relies on, which generated code reads at the offsets below (SpiderMonkey's
+/// GuardObjectFuseProperty's operands, which its stub holds). Owned by its chunk
+/// (`Chunk::jit_string_call_site`), as a call cache's way is. A chunk runs in whichever Realm is
+/// active, so the step compares the active Realm's fuse with the site's, and a site validated in
+/// another Realm, or never, takes the fill ([`StringCallSite::fill`]).
+#[repr(C)]
+pub(crate) struct StringCallSite {
+    /// The address of the fuse the site was validated against, or that address | 1 when the
+    /// method cannot be relied on there (the step then runs the unfused templates without asking
+    /// again); 1 before the first fill, which no fuse's address matches.
+    fuse: Cell<usize>,
+    generation: Cell<u32>,
+    index: Cell<u32>,
+    mask: Cell<u32>,
+    /// The method's call-cache class (`bytecode::INTRINSIC_CODE_POINT_AT`).
+    intrinsic: u8,
+    /// Keeps the validated fuse's allocation, so that no later fuse takes its address while the
+    /// site names it.
+    pin: RefCell<Weak<ObjectFuse>>,
+}
+
+impl StringCallSite {
+    /// The offsets generated code reads: the validated fuse's address, then the guard data.
+    pub(crate) const FUSE_OFF: usize = std::mem::offset_of!(StringCallSite, fuse);
+    pub(crate) const GENERATION_OFF: usize = std::mem::offset_of!(StringCallSite, generation);
+    pub(crate) const INDEX_OFF: usize = std::mem::offset_of!(StringCallSite, index);
+    pub(crate) const MASK_OFF: usize = std::mem::offset_of!(StringCallSite, mask);
+
+    pub(crate) fn new(intrinsic: u8) -> Self {
+        Self {
+            fuse: Cell::new(1),
+            generation: Cell::new(0),
+            index: Cell::new(0),
+            mask: Cell::new(0),
+            intrinsic,
+            pin: RefCell::new(Weak::new()),
+        }
+    }
+
+    /// The method a site of call-cache class `intrinsic` calls.
+    pub(crate) fn method_name(intrinsic: u8) -> Option<&'static str> {
+        match intrinsic {
+            crate::bytecode::INTRINSIC_CODE_POINT_AT => Some("codePointAt"),
+            _ => None,
+        }
+    }
+
+    /// The step's fill, from its slow path: the site relies on the active Realm's
+    /// String.prototype's own method when that is a data property holding a native of the
+    /// site's class, which the property becoming Constant then keeps
+    /// ([`ObjectFuse::try_optimize_constant`]); otherwise the site is refused in that Realm.
+    /// The value is checked as the site fills: a method replaced while Untracked is Constant with
+    /// its new value (SpiderMonkey's handlePropertyValueChange), and where a SpiderMonkey stub
+    /// returns the value it recorded, the step runs the native's algorithm. Any Realm's native of
+    /// the class will do: for a primitive String receiver and a Number index, the methods the
+    /// classes name read nothing of their Realm. Whether the site now holds.
+    pub(crate) fn fill(&self, interp: &crate::interpreter::Interp) -> bool {
+        let Some(fuse) = interp.string_proto_fuse.as_ref() else {
+            return false;
+        };
+        let address = Arc::as_ptr(fuse) as usize;
+        *self.pin.borrow_mut() = Arc::downgrade(fuse);
+        match Self::relied_on(interp, fuse, self.intrinsic) {
+            Some(data) => {
+                self.generation.set(data.generation);
+                self.index.set(data.index);
+                self.mask.set(data.mask);
+                self.fuse.set(address);
+                true
+            }
+            None => {
+                self.fuse.set(address | 1);
+                false
+            }
+        }
+    }
+
+    fn relied_on(
+        interp: &crate::interpreter::Interp,
+        fuse: &ObjectFuse,
+        intrinsic: u8,
+    ) -> Option<GuardData> {
+        let name = Self::method_name(intrinsic)?;
+        let proto = interp.string_proto.borrow();
+        let slot = proto.props.slot_of(name)?;
+        let property = proto.props.property_at(slot)?;
+        if property.accessor() {
+            return None;
+        }
+        let crate::value::ValueView::Obj(function) = property.value().view() else {
+            return None;
+        };
+        let native = match &function.borrow().kind {
+            crate::value::ObjectKind::Native(native) => *native as usize,
+            _ => return None,
+        };
+        if crate::builtins::builtin(native).1 != intrinsic {
+            return None;
+        }
+        fuse.try_optimize_constant(slot)
+    }
+}
+
+/// The fused String method step's fill (see [`StringCallSite::fill`]), called from its slow path
+/// with the site's address; 1 when the site now holds, else 0. It runs no author code and
+/// allocates nothing the collector sees.
+///
+/// # Safety
+/// `ctx` is the running code's context and `site` a chunk's live site.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) unsafe extern "C" fn jit_string_call_fill(
+    ctx: *mut crate::jit::JitCtx,
+    site: *const StringCallSite,
+) -> u32 {
+    let interp = unsafe { &*(*ctx).interp };
+    u32::from(unsafe { &*site }.fill(interp))
 }

@@ -3477,6 +3477,11 @@ pub struct Chunk {
     regexp_literals: Vec<std::cell::OnceCell<Rc<crate::regex::Regex>>>,
     /// One [`CallSite`] per `Call`/`CallWithThis` site (the JIT→JIT fast call's callee cache).
     call_caches: Vec<CallSite>,
+    /// The fused String method calls' sites (`jit::string_calls`), by the pc of their
+    /// `GetMethod`, made as code first fuses a call there. Boxed, so that the address code embeds
+    /// stays put, and kept for the chunk's life, as its call caches are: any of its code may
+    /// embed one.
+    string_call_sites: std::cell::RefCell<Vec<(u32, Box<crate::object_fuse::StringCallSite>)>>,
     /// The getter call caches of the chunk's property reads (see [`AccessorTable`]), and the
     /// table as machine code reads it (null before the first).
     getter_table: std::cell::RefCell<Option<Box<AccessorTable>>>,
@@ -3808,6 +3813,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             arguments_forwarder_runtime: _,
             regexp_literals: _,
             call_caches: _,
+            string_call_sites: _, // a fuse's address and a Weak of it: no cells
             getter_table: _,
             getter_table_raw: _,
             setter_table: _,
@@ -4186,6 +4192,12 @@ impl Chunk {
                 std::cell::OnceCell<Rc<crate::regex::Regex>>
             ))
             .saturating_add(vec_bytes!(call_caches, CallSite))
+            .saturating_add({
+                let sites = self.string_call_sites.borrow();
+                sites.capacity()
+                    * std::mem::size_of::<(u32, Box<crate::object_fuse::StringCallSite>)>()
+                    + sites.len() * std::mem::size_of::<crate::object_fuse::StringCallSite>()
+            })
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(
                 self.construct_pins.len()
@@ -10082,6 +10094,7 @@ fn finish_chunk(
         arguments_forwarder_runtime: std::cell::RefCell::new(None),
         regexp_literals: (0..op_count).map(|_| std::cell::OnceCell::new()).collect(),
         call_caches: c.call_caches,
+        string_call_sites: std::cell::RefCell::new(Vec::new()),
         getter_table: std::cell::RefCell::new(None),
         getter_table_raw: std::cell::Cell::new(std::ptr::null()),
         setter_table: std::cell::RefCell::new(None),
@@ -23227,6 +23240,40 @@ impl Chunk {
     /// outlives its JIT code).
     pub(crate) fn jit_call_cache_ptr(&self, idx: u32) -> usize {
         self.call_caches[idx as usize].entries.as_ptr() as usize
+    }
+    /// Whether call site `idx` may finish its calls of the native of call-cache class
+    /// `intrinsic` in a fused step (`jit::string_calls`): a way holds that native, or no way holds
+    /// anything and the site is not megamorphic. The VM fills no native entry, and a fused call
+    /// fills none, so a site whose calls have only run there or fused names no callee.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_call_site_admits(&self, idx: u32, intrinsic: u8) -> bool {
+        let site = &self.call_caches[idx as usize];
+        let mut filled = false;
+        for way in site.entries.iter() {
+            let entry = way.get();
+            if entry.callee == 0 {
+                continue;
+            }
+            if entry.native != 0 && entry.intrinsic == intrinsic {
+                return true;
+            }
+            filled = true;
+        }
+        !filled && !site.megamorphic()
+    }
+    /// The address of the fused String method call site of the `GetMethod` at `pc` (see
+    /// [`crate::object_fuse::StringCallSite`]), made on the first request: the first stage's code
+    /// and the second's share it.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_string_call_site(&self, pc: u32, intrinsic: u8) -> usize {
+        let mut sites = self.string_call_sites.borrow_mut();
+        if let Some((_, site)) = sites.iter().find(|(at, _)| *at == pc) {
+            return &**site as *const crate::object_fuse::StringCallSite as usize;
+        }
+        let site = Box::new(crate::object_fuse::StringCallSite::new(intrinsic));
+        let address = &*site as *const crate::object_fuse::StringCallSite as usize;
+        sites.push((pc, site));
+        address
     }
     /// The stable address of construct site `idx`'s `Cell<ConstructSite>` (the same contract:
     /// `construct_caches` is fixed once compilation finishes).

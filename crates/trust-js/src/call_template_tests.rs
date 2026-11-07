@@ -336,9 +336,12 @@ fn call_templates_finish_compiled_calls() {
         hot(50);
     "#,
     );
+    // `point`'s codePointAt runs in the fused String method step, which finishes the call as the
+    // template would (`jit::string_calls`); the loop's, whose index is `q % 5`, in the template.
     let counts = || {
         (
-            crate::jit::TEST_CALL_TEMPLATES.with(std::cell::Cell::get),
+            crate::jit::TEST_CALL_TEMPLATES.with(std::cell::Cell::get)
+                + crate::jit::test_fused_string_calls(),
             crate::jit::TEST_FAST_MATH_INTRINSICS.with(std::cell::Cell::get),
             crate::bytecode::TEST_JIT_SLICE1_INTRINSICS.with(std::cell::Cell::get),
         )

@@ -391,6 +391,32 @@ mod operations;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_string_calls.rs"]
+mod string_calls;
+
+/// Fused String method calls finished on this thread (`string_calls`; 0 on other targets).
+#[cfg(test)]
+pub(crate) fn test_fused_string_calls() -> usize {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        string_calls::fused_calls()
+    }
+    #[cfg(not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )))]
+    {
+        0
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_exec_values.rs"]
 mod exec_values;
 #[cfg(all(
@@ -2183,6 +2209,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_construct_this as *const () as usize,
         crate::bytecode::jit_frame_setup as *const () as usize,
         crate::value::jit_grow_named_record as *const () as usize,
+        crate::object_fuse::jit_string_call_fill as *const () as usize,
     ]
 }
 
@@ -2290,7 +2317,10 @@ pub const H_CONSTRUCT_THIS: usize = 32;
 pub const H_FRAME_SETUP: usize = 33;
 /// The creation commit's record growth (W2d step 3): `value::jit_grow_named_record`.
 pub const H_GROW_NAMED_RECORD: usize = 34;
-pub const N_HELPERS: usize = 35;
+/// A fused String method call's fill (`string_calls`, `object_fuse::jit_string_call_fill`):
+/// `(ctx, site)` → 1 when the site now holds. It runs no author code and never throws.
+pub const H_STRING_CALL_FILL: usize = 35;
+pub const N_HELPERS: usize = 36;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2331,6 +2361,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "construct_this",
     "frame_setup",
     "grow_named_record",
+    "string_call_fill",
 ];
 
 #[inline]
@@ -5850,6 +5881,20 @@ fn compile_entry(
                     }
                     continue;
                 }
+            }
+        }
+        // A fused String method call (`string_calls`): its step comes ahead of the GetMethod's
+        // template, and any miss continues with the unfused templates from there.
+        if layout.valid && ilayout.valid {
+            if let Some(plan) = string_calls::Plan::at(chunk, ops, pc, &targeted, fast) {
+                string_calls::emit_site(
+                    &mut a,
+                    chunk,
+                    ilayout,
+                    pc,
+                    &plan,
+                    pc_labels[plan.call_pc + 1],
+                );
             }
         }
         if operations::emit(
@@ -9822,19 +9867,72 @@ fn emit_object_is_template(a: &mut asm::Asm, hit_slow: usize, done: usize) {
 
 /// String#codePointAt(index) in line (ECMA-262 String.prototype.codePointAt and CodePointAt,
 /// spec.html:36270 and :16721 at e28783d5) once the template's guards hold: a String receiver
-/// three words below the top and a Number index in d0 (W3's item 2c). An exact unsigned index
-/// below the length reads the string's storage, a flat one- or two-byte buffer or a view of one
-/// at its owner's width (`crate::lstr`): a one-byte unit is its code point; a two-byte leading
-/// surrogate followed, within the string, by a trailing one combines with it
-/// (UTF16SurrogatePairToCodePoint), and any other unit, a lone surrogate included, is its own
-/// code point. An index at or past the length answers undefined. A fractional, negative or NaN
-/// index branches to `helper` with nothing written. Clobbers x9, x11, x13, x14, x16, x17 and
-/// d1; preserves x10, x12 and x15.
+/// three words below the top and a Number index in d0 (W3's item 2c). See
+/// [`emit_code_point_read`].
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_code_point_template(a: &mut asm::Asm, helper: usize, done: usize) {
+    emit_code_point_read(a, -24, 16, helper, done, ReadCommit::CallTemplate);
+}
+
+/// Which test counter a string read's commit counts (tests only; nothing in other builds).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+enum ReadCommit {
+    /// Item 2c's call templates (`TEST_CALL_TEMPLATES`).
+    CallTemplate,
+    /// A fused String method call (`string_calls`).
+    Fused,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_read_commit_event(a: &mut asm::Asm, commit: ReadCommit) {
+    #[cfg(test)]
+    match commit {
+        ReadCommit::CallTemplate => {
+            regions::emit_lowering_event(a, record_call_template as *const () as u64)
+        }
+        // A fused call's commit may be a shared stub's, which keeps the site's return address
+        // in x30 alone: the event's call must not lose it.
+        ReadCommit::Fused => {
+            a.stp_pre(29, 30, -16);
+            regions::emit_lowering_event(a, string_calls::record_fused_call as *const () as u64);
+            a.ldp_post(29, 30, 16);
+        }
+    }
+    #[cfg(not(test))]
+    let _ = (a, commit);
+}
+
+/// CodePointAt(S, index) for the String at `[x20 + receiver]` and a Number index in d0: an exact
+/// unsigned index below the length reads the string's storage, a flat one- or two-byte buffer or
+/// a view of one at its owner's width (`crate::lstr`): a one-byte unit is its code point; a
+/// two-byte leading surrogate followed, within the string, by a trailing one combines with it
+/// (UTF16SurrogatePairToCodePoint), and any other unit, a lone surrogate included, is its own
+/// code point. An index at or past the length answers undefined. The result replaces the
+/// receiver, `pop` bytes are popped above it, and the code branches to `done`. A fractional,
+/// negative or NaN index branches to `helper` with nothing written. Clobbers x9, x11, x13, x14,
+/// x16, x17 and d1; preserves x10, x12 and x15.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_code_point_read(
+    a: &mut asm::Asm,
+    receiver: i32,
+    pop: u32,
+    helper: usize,
+    done: usize,
+    commit: ReadCommit,
+) {
     use crate::lstr::{CAP_OFF, DATA_OFF, LEN_OFF, VIEW_CAP, VIEW_OFFSET_OFF, VIEW_OWNER_OFF};
     let undefined = a.new_label();
     let view_one_byte = a.new_label();
@@ -9846,7 +9944,7 @@ fn emit_code_point_template(a: &mut asm::Asm, helper: usize, done: usize) {
     a.ucvtf_d_w(1, 9);
     a.fcmp(0, 1);
     a.b_cond(C_NE, helper);
-    emit_exec_word_load(a, 11, 20, -24);
+    emit_exec_word_load(a, 11, 20, receiver);
     emit_exec_payload(a, 11, 11);
     a.ldr_w_imm(13, 11, LEN_OFF as u32);
     a.cmp_reg_x(9, 13);
@@ -9895,17 +9993,19 @@ fn emit_code_point_template(a: &mut asm::Asm, helper: usize, done: usize) {
     a.bind(unit);
     // ---- commit: the Number over the receiver slot (a code point is never NaN) ----
     a.ucvtf_d_w(0, 17);
-    a.stur_d(0, 20, -24);
-    a.sub_imm(20, 20, 16);
-    #[cfg(test)]
-    regions::emit_lowering_event(a, record_call_template as *const () as u64);
+    a.stur_d(0, 20, receiver);
+    if pop != 0 {
+        a.sub_imm(20, 20, pop);
+    }
+    emit_read_commit_event(a, commit);
     a.b(done);
     a.bind(undefined);
     a.mov_imm64(9, crate::value::PACK_UNDEFINED);
-    emit_exec_word_store(a, 9, 20, -24);
-    a.sub_imm(20, 20, 16);
-    #[cfg(test)]
-    regions::emit_lowering_event(a, record_call_template as *const () as u64);
+    emit_exec_word_store(a, 9, 20, receiver);
+    if pop != 0 {
+        a.sub_imm(20, 20, pop);
+    }
+    emit_read_commit_event(a, commit);
     a.b(done);
 }
 
@@ -15193,6 +15293,14 @@ enum SharedStub {
     /// x15 with w14 used, takes the operand at `[x20 - 8]` → w13 = 1 once it is stored, 0 when
     /// the store is declined before anything is written.
     ElemStore,
+    /// [`string_calls::emit_stub`], a fused String method call outside loops (its method's
+    /// call-cache class `intrinsic`): x12 = the site, d0 = the index (a Number), the receiver at
+    /// `[x20 - 8]` → w9 = 0 once the result replaced the receiver, 1 when nothing was written.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    StringCall { intrinsic: u8 },
 }
 
 /// Status codes of the shared direct-call stub, in w8. The common completion is zero, so a site
@@ -15289,6 +15397,7 @@ impl SharedStub {
     const TO_BOOLEAN: u32 = 0x1100;
     const PROP_WRITE: u32 = 0x1200;
     const INTRINSIC_CALL: u32 = 0x1300;
+    const STRING_CALL: u32 = 0x1400;
 
     fn key(self) -> u32 {
         match self {
@@ -15412,6 +15521,11 @@ impl SharedStub {
             }
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
             SharedStub::ElemStore => Self::ELEM_STORE,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::StringCall { intrinsic } => Self::STRING_CALL | u32::from(intrinsic),
             SharedStub::NameElement { write, resolved } => {
                 Self::NAME_ELEMENT | u32::from(write) | u32::from(resolved) << 1
             }
@@ -15560,6 +15674,13 @@ impl SharedStub {
                 resolved: key & 2 != 0,
             },
             Self::ELEM_STORE => SharedStub::ElemStore,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::STRING_CALL => SharedStub::StringCall {
+                intrinsic: (key & 0xff) as u8,
+            },
             _ => unreachable!("shared stub keys are produced by SharedStub::key"),
         }
     }
@@ -15668,6 +15789,14 @@ impl SharedStub {
             SharedStub::NameElement { write, resolved } => {
                 named("NameElement", &[("write", write), ("resolved", resolved)])
             }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::StringCall { intrinsic } => format!(
+                "Stub:StringCall({})",
+                crate::object_fuse::StringCallSite::method_name(intrinsic).unwrap_or("?")
+            ),
         }
     }
 
@@ -15791,6 +15920,13 @@ impl SharedStub {
                 a.bind(declined);
                 a.movz(13, 0, 0);
                 a.ret();
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::StringCall { intrinsic } => {
+                string_calls::emit_stub(a, context.ilayout, intrinsic);
             }
             #[cfg(all(
                 target_arch = "aarch64",
