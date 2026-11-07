@@ -2577,13 +2577,15 @@ fn to_length_val(i: &mut Interp, v: &Value) -> Result<usize, Value> {
 }
 
 /// The arrays RegExpBuiltinExec returns, by the named properties each gains after ArrayCreate's
-/// `length`, in their creation order: a match array's (ECMA-262 §22.2.7.2 steps 22-34) and the
-/// `d` flag's indices array's (MakeMatchIndicesIndexPairArray, §22.2.7.8 step 7).
+/// `length`, in their creation order: a match array's (ECMA-262 §22.2.7.2 steps 22-34), the `d`
+/// flag's indices array's (MakeMatchIndicesIndexPairArray, §22.2.7.8 step 7) and each of its
+/// [start, end] pairs (GetMatchIndexPair, §22.2.7.7: CreateArrayFromList, no named property).
 #[derive(Clone, Copy)]
 enum RegexpArray {
     Match,
     MatchWithIndices,
     Indices,
+    Pair,
 }
 
 impl RegexpArray {
@@ -2592,24 +2594,28 @@ impl RegexpArray {
             Self::Match => &["index", "input", "groups"],
             Self::MatchWithIndices => &["index", "input", "groups", "indices"],
             Self::Indices => &["groups"],
+            Self::Pair => &[],
         }
     }
 }
 
 /// An array of `items` that gains `kind`'s named data properties (CreateDataPropertyOrThrow:
-/// writable, enumerable, configurable) with the values `named`. Every array of a kind has the
-/// same named keys, so they share one key layout and shape (`Interp::regexp_array_maps`), as
-/// V8's match arrays share one map, instead of each copying the array `length` layout into a
-/// new one as it gains a key.
+/// writable, enumerable, configurable) with the values `named`, its [[Prototype]] the running
+/// Realm's %Array.prototype% (`array_proto`). Every array of a kind has the same named keys, so
+/// they share one key layout and shape (`Interp::regexp_array_maps`, keys and shape only, so one
+/// per Agent serves every Realm), as V8's match arrays share one map, instead of each copying the
+/// array `length` layout into a new one as it gains a key, or for a pair, looking up the array
+/// `length` shape and layout again (`Props::init_packed_array`).
 fn regexp_array(
-    i: &mut Interp,
+    maps: &[std::cell::OnceCell<Props>; 4],
+    array_proto: Gc,
     kind: RegexpArray,
     items: impl ExactSizeIterator<Item = Value>,
     named: &[Value],
 ) -> Value {
     let keys = kind.keys();
     debug_assert_eq!(keys.len(), named.len());
-    let map = i.regexp_array_maps[kind as usize].get_or_init(|| {
+    let map = maps[kind as usize].get_or_init(|| {
         // The class holding `length` and the kind's keys, as V8 keeps a match array's index,
         // input and groups in-object (W2d step 3).
         let mut map = Props::empty_array_in_class(crate::value::class_for(1 + keys.len()));
@@ -2619,7 +2625,7 @@ fn regexp_array(
         map
     });
     Value::Obj(Object::new_built(
-        Some(i.array_proto),
+        Some(array_proto),
         ObjectKind::Array,
         map.class(),
         |props| props.init_array_from_template(map, items, named.iter().copied()),
@@ -2713,19 +2719,16 @@ fn regexp_builtin_exec(
             let groups = regexp_groups(i, &re, &caps, &input);
             // `indices` (the `d` flag): [start, end] pairs per capture (undefined if unmatched),
             // plus a null-prototype `groups` of the same for named captures.
+            let (maps, array_proto) = (&i.regexp_array_maps, i.array_proto);
             let indices = if re.has_indices {
-                let array_proto = i.array_proto;
                 let pair = |span: Option<(usize, usize)>| match span {
-                    Some((a, b)) => Value::Obj(Object::new_built(
-                        Some(array_proto),
-                        ObjectKind::Array,
-                        0,
-                        |props| {
-                            props.init_packed_array(
-                                [Value::Num(a as f64), Value::Num(b as f64)].into_iter(),
-                            )
-                        },
-                    )),
+                    Some((a, b)) => regexp_array(
+                        maps,
+                        array_proto,
+                        RegexpArray::Pair,
+                        [Value::Num(a as f64), Value::Num(b as f64)].into_iter(),
+                        &[],
+                    ),
                     None => Value::Undefined,
                 };
                 let igroups = if re.names.is_empty() {
@@ -2749,7 +2752,13 @@ fn regexp_builtin_exec(
                     Value::Obj(g)
                 };
                 let pairs = caps.iter().map(|&span| pair(span));
-                Some(regexp_array(i, RegexpArray::Indices, pairs, &[igroups]))
+                Some(regexp_array(
+                    maps,
+                    array_proto,
+                    RegexpArray::Indices,
+                    pairs,
+                    &[igroups],
+                ))
             } else {
                 None
             };
@@ -2762,12 +2771,19 @@ fn regexp_builtin_exec(
             let subject = Value::Str(input);
             Ok(match indices {
                 Some(indices) => regexp_array(
-                    i,
+                    maps,
+                    array_proto,
                     RegexpArray::MatchWithIndices,
                     items,
                     &[index, subject, groups, indices],
                 ),
-                None => regexp_array(i, RegexpArray::Match, items, &[index, subject, groups]),
+                None => regexp_array(
+                    maps,
+                    array_proto,
+                    RegexpArray::Match,
+                    items,
+                    &[index, subject, groups],
+                ),
             })
         }
     }

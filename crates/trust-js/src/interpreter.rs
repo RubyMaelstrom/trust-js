@@ -4774,7 +4774,7 @@ pub struct Interp {
     /// `builtins::RegexpArray`: an empty array's map with the named keys a match array gains,
     /// built by ordinary insertion on first use. Keys and shape only, like `descriptor_maps`;
     /// every match array is fresh and takes the active Realm's %Array.prototype%.
-    pub(crate) regexp_array_maps: [std::cell::OnceCell<Props>; 3],
+    pub(crate) regexp_array_maps: [std::cell::OnceCell<Props>; 4],
     pub(crate) computed_reads: crate::bytecode::ComputedReadCache,
     /// Quiescent source-scoped loop plans; executing plans have only weak cache entries.
     pub(crate) fragment_cache: crate::bytecode::fragment_cache::Cache,
