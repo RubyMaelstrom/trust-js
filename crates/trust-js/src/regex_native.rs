@@ -442,7 +442,10 @@ pub(super) const TIER_UP_LENGTH: usize = 1000;
 /// once over a subject of [`TIER_UP_LENGTH`] units or more.
 #[inline]
 pub(super) fn note_execution(re: &Regex, width: Width, len: usize) {
-    if re.tier_up_at == 0 {
+    // Once the width's compilation is decided (its code, or a decline), an execution has nothing
+    // to count: V8 ticks a pattern toward tier-up only while its bytecode runs
+    // (src/regexp/regexp.cc:842-862), so a compiled pattern's executions write nothing here.
+    if re.tier_up_at == 0 || re.native.codes[width.index()].get().is_some() {
         return;
     }
     let ticks = re.tier_ticks.get().saturating_add(1);
@@ -450,9 +453,7 @@ pub(super) fn note_execution(re: &Regex, width: Width, len: usize) {
     if ticks < re.tier_up_at && len < TIER_UP_LENGTH {
         return;
     }
-    if re.native.codes[width.index()].get().is_none() {
-        tier_up(re, width);
-    }
+    tier_up(re, width);
 }
 
 /// Compile `re` for `width`, once: out of line, so that executions pay only the tests above.

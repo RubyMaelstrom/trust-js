@@ -528,6 +528,8 @@ pub struct Regex {
     /// cells add no allocation to cold patterns; the native tier compiles a width on its first use
     /// once the pattern is hot (see [`native::note_execution`]).
     tier_ticks: Cell<u32>,
+    /// The storage of the subjects seen, for the tier's tests.
+    #[cfg(test)]
     subject_shapes: Cell<u8>,
     tier_up_at: u32,
     /// The native tier's code, by subject width.
@@ -1996,6 +1998,7 @@ impl Regex {
             lead_run,
             case_closed,
             tier_ticks: Cell::new(0),
+            #[cfg(test)]
             subject_shapes: Cell::new(0),
             tier_up_at: regexp_tier_up_threshold(),
             native: Default::default(),
@@ -2084,6 +2087,7 @@ impl Regex {
         if regexp_census_enabled() {
             self.census_start(storage);
         }
+        #[cfg(test)]
         self.subject_shapes.set(self.subject_shapes.get() | storage);
         let width = if storage == SUBJECT_ONE_BYTE {
             native::Width::One
