@@ -1507,7 +1507,7 @@ impl<'s> Ctx<'s> {
     /// initialized. The rules only accumulate: `false` leaves an installed rule in place.
     ///
     /// `immutable_prototype` makes the object an immutable-prototype exotic object (ECMA-262
-    /// #sec-set-immutable-prototype); `always_extensible` makes its [[PreventExtensions]] return
+    /// #sec-set-immutable-prototype); `always_extensible` makes its \[\[PreventExtensions\]\] return
     /// false, as HTML #windowproxy-preventextensions requires. Property descriptors and Proxy
     /// invariant checks are unaffected, and the rules live in internal slots, so author strings
     /// and copied properties cannot address them. Returns false, changing nothing, for a

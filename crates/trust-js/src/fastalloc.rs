@@ -6,7 +6,7 @@
 //! and strings are GC cells in pages of their own). On macOS in particular, `malloc`/`free`
 //! pairs dominate parser-shaped profiles.
 //!
-//! This allocator sits in front of [`std::alloc::System`]: small blocks (≤ [`MAX_CLASS`] bytes,
+//! This allocator sits in front of [`std::alloc::System`]: small blocks (≤ `MAX_CLASS` bytes,
 //! alignment ≤ 16) are rounded up to a 16-byte size class and served from a per-thread
 //! INTRUSIVE free list — a freed block's first word points at the next free block, so the
 //! allocator itself never allocates (re-entrancy is what a `Vec`-backed cache dies on).

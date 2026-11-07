@@ -1,6 +1,6 @@
 //! Side-effect-free OrdinaryGet resolution, followed by the actual Call boundary.
 //!
-//! ECMA-262 e28783d5, https://tc39.es/ecma262/#sec-ordinaryget: a cached layout
+//! ECMA-262 e28783d5, <https://tc39.es/ecma262/#sec-ordinaryget>: a cached layout
 //! never caches a getter's identity or result. Read its live descriptor, root the
 //! selected getter, release every object/cache borrow, then Call with the original
 //! receiver. Reentrant mutation or collection cannot invalidate that owned snapshot.

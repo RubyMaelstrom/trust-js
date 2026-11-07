@@ -4,10 +4,10 @@
 //! tc39/test262 conformance suite drives language work (see `crates/test262-runner`).
 //!
 //! ## Shape
-//! - [`lexer`] tokenizes, [`parser`] builds the [`ast`], [`interpreter`] + `eval` walk it.
-//! - [`value`] is the prototype-based object model: `RefCell<Object>` cells on a mark-sweep heap
+//! - `lexer` tokenizes, `parser` builds the `ast`, `interpreter` + `eval` walk it.
+//! - `value` is the prototype-based object model: `RefCell<Object>` cells on a mark-sweep heap
 //!   (conservative only for the native stack), with bounded live-object pressure.
-//! - [`builtins`] installs the realm (`globalThis`, `Object`/`Array`/`Function`/`Math`, the error
+//! - `builtins` installs the realm (`globalThis`, `Object`/`Array`/`Function`/`Math`, the error
 //!   constructors, global functions).
 //!
 //! ## Public API
@@ -564,7 +564,7 @@ fn parse_host_script_from(
 }
 
 /// Parse-only Source Text Module information for host graph algorithms: ECMA-262 ParseModule's
-/// [[RequestedModules]] and [[HasTLA]]. A Service Worker's "is async module" check, for one,
+/// \[\[RequestedModules\]\] and \[\[HasTLA\]\]. A Service Worker's "is async module" check, for one,
 /// inspects the whole graph before any author code runs.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ModuleInspection {

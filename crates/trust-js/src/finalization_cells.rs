@@ -3,7 +3,7 @@
 //! ECMA-262 §26.2.3.2–3 requires unregister to remove every cell with a SameValue token;
 //! §9.12 permits cleanup to choose *any* cleared cell and requires removing it before calling
 //! user code. Neither operation requires preserving a physical registration-order vector.
-//! https://tc39.es/ecma262/#sec-cleanup-finalization-registry
+//! <https://tc39.es/ecma262/#sec-cleanup-finalization-registry>
 //!
 //! Cells live in a dense vector. Intrusive lists index cells by weak target and unregister-token
 //! identity and link cleared cells into a ready queue. Removing a cell updates at most six neighbours
