@@ -1711,20 +1711,20 @@ impl Interp {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     pub(crate) fn gc_collect_precise_for_test(&mut self, kind: CollectionKind) {
-        // A major one that finds a marking cycle running finishes it first: the cycle's final
-        // pause keeps what the cycle marked before it died, and the precise collection that
-        // follows marks afresh and frees it, as V8's PreciseCollectAllGarbage finalizes
-        // incremental marking before its full collection (src/heap/heap.cc:1365-1370) and as
-        // `gc_heap_collect_explicit` collects twice. Under TRUST_JS_GC_STRESS=1 a cycle is
-        // usually running when a test retires its roots.
-        if kind == CollectionKind::Major
-            && self
-                .gc_heap
-                .core
-                .try_borrow()
-                .is_ok_and(|core| core.cycle_running())
+        // A running marking cycle is finished first, whatever kind the caller asks for. For a
+        // major one: the cycle's final pause keeps what the cycle marked before it died, and the
+        // precise collection that follows marks afresh and frees it, as V8's
+        // PreciseCollectAllGarbage finalizes incremental marking before its full collection
+        // (src/heap/heap.cc:1365-1370) and as `gc_heap_collect_explicit` collects twice. For a
+        // minor one: no minor collection runs while a cycle marks (`Heap::start_marking`).
+        // Under TRUST_JS_GC_STRESS=1 a stress major's cycle can be running as a test asks.
+        if self
+            .gc_heap
+            .core
+            .try_borrow()
+            .is_ok_and(|core| core.cycle_running())
         {
-            self.gc_heap_collect(crate::value::GcCause::Explicit, Some(kind));
+            self.gc_heap_collect(crate::value::GcCause::Explicit, Some(CollectionKind::Major));
         }
         let heap = self.gc_heap.clone();
         self.gc_evict_young_cache_keys();

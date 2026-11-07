@@ -310,6 +310,29 @@ fn a_precise_test_collection_during_a_cycle_frees_what_died_after_the_cycle_mark
     assert_eq!(eval(&mut engine, "bulk.length"), "30000");
 }
 
+/// A minor precise test collection while a cycle marks finishes the cycle first, as a major one
+/// does (above): no minor collection runs while a cycle marks (`Heap::start_marking`), and under
+/// `TRUST_JS_GC_STRESS=1` a stress major's cycle can be running as a test asks for one.
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_minor_precise_test_collection_during_a_cycle_finishes_the_cycle_first() {
+    let mut engine = cycling_engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "var bulk = []; for (let i = 0; i < 30000; i++) bulk.push({ i }); true",
+    );
+    assert!(engine.interp.gc_start_cycle());
+    assert!(cycle_running(&engine));
+    engine
+        .interp
+        .gc_collect_precise_for_test(crate::gc_core::CollectionKind::Minor);
+    assert!(!cycle_running(&engine), "the cycle finished");
+    assert_eq!(eval(&mut engine, "bulk.length"), "30000");
+}
+
 /// The address of the object a weak handle names, kept complemented (a plain address in a test's
 /// frame would keep the object alive).
 fn hidden_address(weak: &crate::value::WeakGc) -> crate::gc_test::HiddenAddress {
