@@ -20255,3 +20255,166 @@ under TRUST_JS_GC_INCREMENTAL=force 2,883; the fixtures as the base; difftest 13
 clean. TRust: through candidate 3's series ac414fd3, which carries this commit: the three pages
 valid and as main's with the cycle off, in release and with debug assertions (the cycle at 1 and
 forced); the spikes exit 0.
+
+### Djot's candidate 3, steps 1 and 3: RegExp exec's legacy statics per Realm, the captures in place, the index pairs from a template (record, 2026-11-07)
+
+Landed by fast-forward on main e0731972 (an agent's): 636140a5 (step 1a: the legacy statics' record
+per Realm, recorded lazily by exec, the compiled program rather than the RegExp object; the
+per-match lookup of %RegExp% through the protector's pins is gone), d008edcf (step 1b:
+Captures::from_slots in line, its heap path out of line), d029ec80 (step 3: each [start, end]
+pair of `indices` from a pre-shaped Pair template). Step 2 (one borrow for the program and the
+lastIndex slot) was dropped: it would have added code. Step 4 (the match array from an image) was
+sized and not taken (below). The agent's note is target/p2/djot-gap/c3/design-note.txt.
+
+Measured (fat LTO; the series head against main 9c2af9af's code): instructions RegExp (Octane)
+-1.32%, Djot -0.35%, GBEmu -0.05%, Splay +0.21% (layout: it runs no RegExp work, and 3d's one-binary
+A/B moved it -0.23%), the rest within +-0.02%; code bytes the same within 4. A match costs 78-81
+instructions less, an indices pair 44 less, an exec of Djot's specials pattern 124 less; misses do
+not move. Djot's elapsed time (06:42:56, CPUs 5 and 13 uncapped for all 16 s): the fixture 75 ms
+against main's 76, node-sp 38.5 (1.95x). Djot's steady state, against node-sp (median of 3, CPU 13):
+
+| run | main (9c2af9af's code) | the series | node-sp | the series / node-sp |
+| --- | ---: | ---: | ---: | ---: |
+| 10 passes | 165 ms | 166 | 76 | 2.17x |
+| 20 passes | 303 | 304 | 143 | 2.12x |
+| 40 passes | 573 | 574 | 275 | 2.09x |
+| a steady pass, (40 - 20) / 20 | 13.5 | 13.5 | 6.6 | 2.05x |
+
+The exit is the fixture's (2x node-sp), met; the steady state is about 2.05x a pass. Where a steady
+pass goes in cycles (CPU 13, 400 ms on; census/buckets.py): the JS chunks 44.0%, stubs 12.3%
+(property stubs about 5.3%, call stubs 3.1%), RegExp's runtime 8.2%, calls and frames 5.9%
+(jit_call_hit 3.06%: candidate 2's boundary), strings 4.4%, properties 4.2%, allocation 4.2%, arrays
+2.1%, other 6.8%. By function against node-sp's self time a pass: next 1.0x, feed 1.9x,
+renderAstNodeDefault 3.5x (string building, candidate 6), getInlineMatches 2.2x, find 2.1x; getEol is
+now faster than node-sp's.
+
+Checks: the gate on ac414fd3 (c3/checks/gate-ac414fd3.txt; its engine source is d029ec80's):
+rustfmt; clippy in five configurations and the workspace clean; the lib suite 2,885 passed, with
+pacing on 2,885, under TRUST_JS_GC_INCREMENTAL=force 2,883 and two load failures (the scan spike's
+wall-clock bound, 1,152 ms, and the watchdog burst's 50 ms idle time, at a load of about 24; each
+passes alone, 5 of 5, on the gate's binary; neither is in the series, and the coordinator's
+hardening series fixes both); the fixtures as the base; difftest 138 agree; Test262 53,575/53,575,
+identical. Test262's RegExp, String match/matchAll/replace/replaceAll/search/split, annexB RegExp and
+regexp-literal directories (2,518 tests) 100% under GC stress (TRUST_JS_GC_STRESS=200, every
+collection major) and under INCREMENTAL=force, on the jit and bytecode tiers. The churn repro (the
+statics read while Realms switch): 0 bad of 14,000 reads on every tier under GC_STRESS=50
+STRESS_MAJOR=1 and under force. zombie: clippy x3 clean, the lib suite 2,660 passed. TRust: the
+three pages valid and as main's with the cycle off, in release and with debug assertions (the cycle
+at 1 and forced); the spikes pass (release 3,628).
+
+The agent's note from step 1 on:
+
+STEP 1 AS BUILT (worktree target/p2/djot-gap/c3-wt, branch p2-c3-step1, on main 63eb71df)
+
+- The record is per Realm (interpreter.rs, RealmRegexpStatics: an Rc<RefCell<Option<
+  RegexpLastMatch>>> in RealmState and in the Interp): snapshot_realm, snapshot_clone,
+  restore_realm and swap_realm carry it and create_realm gives a new Realm its own, so a Realm's
+  accessors read the last match its own code made without the cross-Realm flush the single
+  Interp-level record keyed by its %RegExp% needed. RealmState's exhaustive GC destructure and the
+  Interp's trace the pending subject; the program is Rust-owned.
+- regexp_builtin_exec records lazily (update_regexp_legacy_statics_lazy): the subject, the whole
+  match, the compiled program (not re-cloned when unchanged) and the search start; a read
+  re-executes from there (flush_regexp_legacy, now given the accessor's brand-checked %RegExp%).
+  regexp::realm_regexp_constructor, the protector-pin lookup each match made, is gone.
+- Tests: regexp_tests::legacy_statics_read_after_compile_are_the_matchs (a plain, a global from
+  its lastIndex, a sticky and a Unicode pattern each compile()d between the match and the read,
+  and two programs taking turns; node's answers, on every tier);
+  shared_snapshot_realm_tests::every_realm_switch_carries_its_legacy_regexp_statics (restore,
+  swap in and out, eval_in_realm's with_realm_snapshot and main's calls of another Realm's
+  function, on every tier).
+- Lib (embed) on 714b817d: 2,883 passed (main's 2,881 and the two new tests; the dropped-Realm GC
+  test, a_dropped_realm_that_ran_the_last_regexp_is_collected, passes).
+
+MORE PIECES (main 63eb71df, micro/q-v7, q-v8, sp-*; checks/micros.sh)
+
+| variant | instructions |
+| --- | ---: |
+| v7: /([a-z])([a-z]*)/y matching, `.index` | 2,483 an iteration |
+| v8: the same with `d`, `.index` alone | 4,077 an iteration |
+| Djot's specials scan, a /g class over a 2,000-unit subject, specials every 6 units, two-byte | 1,921 an exec |
+| the same, every 30 units | 1,953 an exec |
+| the same, one-byte | 1,918 an exec |
+
+Two captures cost 316 (v7 - v3) and building their indices 1,594 (v8 - v7): an indices array and
+three pairs, of which allocation (alloc_empty, alloc_block) is about half, init_packed_array about
+90 a pair and the pairs' array `length` shape and layout lookups (array_length_shape,
+array_length_layout) about 65 a pair. The specials scan costs the same with specials every 6 or 30
+units and on either width: its cost is exec's fixed path, not the scan, so steps 1-3 apply to
+Djot's 10,600 specials execs a run.
+
+STEP 1 MEASURED (fat LTO on 63eb71df: 1a 67271fc4, 1b 714b817d; checks/micros-*.txt,
+counts-cmp-*.txt)
+
+| micro (instructions) | main | 1a | 1b |
+| --- | ---: | ---: | ---: |
+| v2 miss | 1,104 | 1,105 | 1,105 |
+| v3 match | 2,167 | 2,100 | 2,089 |
+| v4 `d`, two captures, indices read | 4,420 | 4,350 | 4,339 |
+| v6 test() | 1,578 | 1,530 | 1,530 |
+| Djot's specials scan, an exec (gap 6, two-byte) | 1,921 | 1,855 | 1,797 |
+| the same, gap 30 | 1,953 | 1,887 | 1,830 |
+| the same, one-byte | 1,918 | 1,851 | 1,792 |
+
+1a saves 67-70 a match (the census priced the statics at 112-138; the lazy record's own update
+costs the rest: the record's borrow, the subject, the whole match, the program's identity test)
+and 48 a test(), whose lazy path no longer looks up the constructor; misses do not move. 1b saves
+11 on the sticky pattern and 57-59 on the specials' single-element path, whose projection now
+builds the Captures in place.
+
+Counts against main: RegExp (Octane) -1.32% (1a -1.28%), Djot -0.29% (1a -0.15%, 1b -0.14%),
+Splay -0.06%, GBEmu -0.03%; Chai +0.12%, PdfJS +0.11% and TypeScript +0.08% are layout (PdfJS's
+profile has no RegExp symbol above 0.04%, on main or on step 1); sustained allocation's -0.49%
+repeats the step 3-4 series' and is main's run. Code bytes unchanged. The churn repro
+(churn/statics-churn.js: execs over fresh subjects only the record keeps, 6,829 results held, the
+statics read after collections) gives 0 mismatches on every tier under TRUST_JS_GC_STRESS=50 (every
+4th collection major) and under TRUST_JS_GC_INCREMENTAL=force.
+Chai's +0.12% and TypeScript's +0.08% checked as the coordinator asked: on Chai the named exec-path
+symbols (regexp_builtin_exec, the statics updates, flush_regexp_legacy, Captures) are 0.01% or
+less each and its RegExp work as a whole moves 0.83% -> 0.87% (about 1 sigma at 72k samples);
+TypeScript's RegExp symbols are 0.010% on both. A replace/test micro (micro/rt.js: replace /g with
+a string, with a function, over many \w+ matches; test() anchored and over long text) is 1.0-5.2%
+cheaper on step 1 on every variant: layout.
+
+STEP 3 MEASURED (f3a3c544 on 1b): v4 4,339 -> 4,206 and v5 4,571 -> 4,438 (-133, about 44 a pair),
+the rest within 1. Counts against 1b: Djot -0.04%, PdfJS -0.12% and TypeScript +0.05% (layout:
+neither runs RegExp work), the rest within 0.02%. The series head against main: RegExp -1.31%,
+Djot -0.33%, TypeScript +0.13% and Chai +0.10% (layout), the rest within 0.07%; code bytes
+unchanged.
+
+STEP 4, THE MATCH-ARRAY IMAGE: SIZED, NOT TAKEN (the coordinator, 2026-11-07)
+
+Where a match array's ~200 instructions go (step 1's exec-against-test() profile on the sticky
+micro, an array a match):
+
+| piece | instructions | an image avoids |
+| --- | ---: | --- |
+| regexp_array, init_array_from_template, extend_fresh | about 67 | most of it |
+| alloc_empty (the cell, through the page's free bitmap, about 30 of it) | 40-70 | the struct building only |
+| alloc_block (the separate element block) | 53-65 | none |
+
+An image of the whole body (fork 3(a)'s form, memcpy and patch) removes the generic map's
+defaults, the template's checks, extend_fresh's branch and the Object built on the stack and moved:
+about 50 a match array, about 0.7M of Djot's instructions a run (-0.14%). The exemplars' cheapness
+is mostly the allocation: V8's AllocateUninitializedJSArrayWithElements allocates the JSArray and
+its FixedArray as one bump allocation (builtins-regexp-gen.cc:56-145), SpiderMonkey's
+NewDenseFullyAllocatedArrayWithShape keeps the elements in the object (fixed elements), both from
+nursery bump allocation. One allocation for a small array's cell and its elements would save about
+110 a match array, and every small array literal, split and match result with it: an object-model
+change to DenseStorage/Words (a block inside its cell, moved out on growth), carried to the owner as
+a P3 item. An image on today's two allocations would be rewritten by it: throwaway unsafe code for
+-0.14% of Djot. Candidate 3 is steps 1 and 3.
+
+THE PROPERTY-STUB CENSUS (the coordinator's (3); no proposal)
+
+SPE branch samples (branch_filter=1, -c 256) of djot-p40 from 400 ms, CPU 13, on ac414fd3; a branch
+from a chunk into a Stub:Prop* range is a stub entry, its call site mapped by TRUST_JS_JIT_MAP
+(props/propstub-report.txt, propstub-report.py). Of 1,556 sampled entries, PropRead 1,038 (67%),
+PropWays, the way-loop form for polymorphic sites, 330 (21%), PropWrite 188 (12%). The sites are
+many and flat (the largest 40 hold 12-58 samples each): `this.matches`, for-of's `value` and
+`done`, `length` at four sites of next and others, `push`, `exec`, `.index`, the block parser's
+`startline`, `pos` and `subject`, `lastIndex` writes, `renderAstNode`. They are the first-stage
+named reads and writes outside loops (emit_prop_read_site, jit.rs:7455-7470), which V8's Sparkplug
+makes as LoadIC_Baseline calls and SpiderMonkey's Baseline as its sites' shared IC stubs; a fifth
+are polymorphic. No stub defect; about 5.3% of the steady state's cycles. Cheaper would mean baking
+hot monomorphic non-loop sites in line: a second-stage or tier question, after candidate 2 and the
+matcher entry.
