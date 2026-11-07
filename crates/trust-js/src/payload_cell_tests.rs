@@ -400,9 +400,21 @@ fn dead_strings_are_reclaimed() {
 
 /// A string over 4 KiB is a large cell, allocated outside the heap's pages: one held only by an
 /// object's property (a precise edge from a small cell to a large one) keeps its contents across
-/// collections, and is reclaimed once the property lets it go.
+/// collections, and is reclaimed once the property lets it go. The collections that count large
+/// cells are precise (no native stack): a stale or look-alike word in a Rust frame or a register
+/// could otherwise keep `repeat`'s intermediate string or the reclaimed one (2 large cells against
+/// 1, 2026-11-07, once in a gate's lib run).
 #[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 fn a_long_string_held_only_by_a_property_lives_and_dies_with_it() {
+    fn collect(engine: &mut Engine) {
+        engine
+            .interp
+            .gc_collect_precise_for_test(crate::gc_core::CollectionKind::Major);
+    }
     fn large_cells(engine: &Engine) -> usize {
         engine.interp.gc_heap.core.borrow().large_cells()
     }
@@ -411,16 +423,15 @@ fn a_long_string_held_only_by_a_property_lives_and_dies_with_it() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         eval(&mut engine, "true");
-        crate::gc_core::scrub_stack(64 << 10);
-        engine.interp.gc_collect();
+        collect(&mut engine);
         let before = large_cells(&engine);
         eval(
             &mut engine,
             "var holder = {}; (function () { holder.text = 'ab'.repeat(5000) + 'c'; })(); true",
         );
-        engine.interp.gc_collect();
+        collect(&mut engine);
         eval(&mut engine, "true");
-        engine.interp.gc_collect();
+        collect(&mut engine);
         assert_eq!(large_cells(&engine), before + 1, "{tier:?}");
         let result = eval(
             &mut engine,
@@ -432,11 +443,7 @@ fn a_long_string_held_only_by_a_property_lives_and_dies_with_it() {
         );
         assert_eq!(result, "10001,abab,abc,10000,98", "{tier:?}");
         eval(&mut engine, "text = undefined; holder.text = 0; true");
-        // The evaluations' frames are popped, but the collection's frames built over them may
-        // leave slots unwritten, and the conservative scan takes a stale address of the string
-        // there for a root: zero them first, as an entry point does (`ENTRY_SCRUB_BYTES`).
-        crate::gc_core::scrub_stack(64 << 10);
-        engine.interp.gc_collect();
+        collect(&mut engine);
         assert_eq!(
             large_cells(&engine),
             before,
