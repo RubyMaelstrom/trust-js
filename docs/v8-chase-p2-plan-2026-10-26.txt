@@ -687,6 +687,50 @@ Work P2 tried or found that belongs with Phase 3's speculative tier (docs/v8-cha
   W2f's census did not count: the next attempt counts barrier executions and the card cells
   actually written first, and evaluates JSC's cell state first.
 
+Added at P2's exit (2026-11-07). The items' records, where they have one, are under "Stage
+records"; the candidate 2 agent's handoff (target/p2/compact/p3-handoff-c2-draft.txt) has where
+each of its items stands:
+- C3 on A2: hot first-stage code recompiled once as a second stage on stable feedback, zlib's way
+  back from tier 1 (a)'s +0.30%. The owner's answer of 2026-11-06 had it and tier 1's step (c)
+  follow A2; the phase's exit was met without either, and both carry over. Branch p2-c3-a2
+  c7216a7f (a7dda08d cherry-picked onto A2's 9747c2df, the conflicts resolved, unbuilt). To resume:
+  rebase onto main, build, its tier-up and feedback-record tests, the counts against main (before
+  A2, chai's cost was the epoch refills each tier-up made, which A2 removes).
+- Tier 1's step (c): loops by back edges with OSR (target/p2/compact/design-tier1-draft.txt,
+  section 5c). Deferring loop regions costs zlib 42% and Gameboy 4.0% in tier 1's census, which
+  back-edge counts address. It publishes code, so it follows A2 (landed); it needs its own design
+  note.
+- Closure-call inlining by the callee's code (EarleyBoyer's +0.38% from A2, taken with A2): a way
+  keeps the first closure it saw, and EarleyBoyer's parser makes its helpers afresh each parse.
+  The direction decided: inline behind a check of the callee's code, not its identity (JSC's
+  GetExecutable and CheckIsConstant; V8's FeedbackCell for closures of one creation site, behind
+  CheckClosure; SpiderMonkey's GuardFunctionScript), checked in current source when designed. The
+  probes p2-a2-probe 47ec4cd5 and p2-a2-relink f6eef556 are not the fix.
+- Candidate 2's step 3: includes, indexOf and substring as call templates with typed helpers (the
+  plan in target/p2/compact/c2/step3-plan.txt; the note's estimate 0.55% of Djot's instructions).
+- The lean native boundary on x86-64's cached calls: Interp::call_jit_cached, which Rust callers
+  share, keeps the whole boundary there; generated code needs a variant of its own.
+- An interruption in a native's error type, as V8's termination exception, SpiderMonkey's
+  uncatchable false return and JSC's TerminationException carry it: a refactor of NativeFn that
+  would retire the post-native poll (B2 revised's option (b)).
+- Property stubs: the first stage's named reads and writes outside loops call shared stubs, as
+  Sparkplug's LoadIC_Baseline and SpiderMonkey Baseline's IC stubs do; about 5.3% of Djot's steady
+  state, with no stub defect (the property-stub census). Baking hot monomorphic sites in line is a
+  second-stage or tier question.
+- String building: Djot's renderAstNodeDefault takes 3.5x node-sp's self time a steady pass
+  (candidate 6, not started).
+- A small array's elements in its cell (SpiderMonkey's fixed elements; V8's
+  NewDenseFullyAllocatedArrayWithShape): one allocation for every small array literal, split and
+  match result, about 110 instructions a match array on Djot; an object-model change to
+  DenseStorage/Words (a block inside the cell, moved out on growth).
+- The owner's call, not a plan item: the RegExp legacy features proposal's
+  [[LegacyFeaturesEnabled]]. TRust keeps the default builds' behaviour of V8, JSC and
+  SpiderMonkey: every match updates the running Realm's record.
+- Measuring: with incremental marking on, instruction counts move from run to run (a slice's
+  budget follows the wall clock: EarleyBoyer 0.26% across five runs of one binary, against 0.001%
+  with TRUST_JS_GC_INCREMENTAL=0). Attribute a JIT change with marking off as well, and with a
+  same-binary toggle whose environments have equal lengths.
+
 ## Stage records
 
 Each stage's design note, written before its code, then its gates and exit measurement.
@@ -21214,3 +21258,99 @@ stress filters before it lands (a suggestion for the owner, not a gate).
   target/p2/timing/final-04b65efb (engine shell and runtime CLI) and target/p2/p2-exit/trust-final2
   (TRust 8bd6b3f on engine 04b65efb); the fixtures' output, the elapsed time masked, is the same as
   447af048's binaries'. The session's record follows.
+
+### P2's exit: the phase-exit timing session, each fixture within 2x of node-sp (record, 2026-11-07)
+
+The phase's exit (each fixture within 2x of Node limited to Sparkplug, measured in the same
+session; Decision 2) is met on main 04b65efb: Vue 1.82x, React 1.88x, Djot 1.87x, from 3.46x,
+3.44x and 3.67x at P2's base.
+
+THE SESSION (target/p2/p2-exit/session; session.sh under run-session.sh; the tables:
+p2-exit/report.py session, in p2-exit/session-report.txt)
+- base: P2's base 73e328fa (target/p2/timing/base, the close-out's engine); final: main 04b65efb
+  (target/p2/timing/final-04b65efb). Fat-LTO release builds from git-archive exports in fresh
+  target dirs, rustc 1.99.1; fresh copies of every binary made together (session/bins.sha256).
+  Node v24.22.2 in full, limited to Sparkplug (node-sp, --max-opt=1, the yardstick) and limited to
+  Maglev (node-mg, --max-opt=2). Engine runs pinned to CPU 5 (an X925 core), one job at a time,
+  rounds rotating the order. TRust's replays and Octane through TRust's spike on the X925 cores:
+  base TRust 78435d0 on engine bc0a7716 (target/p2/timing/trust-now), final TRust 8bd6b3f on
+  04b65efb (target/p2/p2-exit/trust-final2).
+- Conditions: the HOLD from 13:27:41 to 15:18:59; the machine quiet at the start (0.73 cores
+  busy over 30 s). Each phase waited until its CPUs had run uncapped for 60 s, and no phase had a
+  capped second (CPUs 5-9 and 15-19 logged each second: fixtures 26 s, calls 23, Octane 858,
+  replays 169, spike 93, ARES-6 2,434, Web Tooling 1,990), so every elapsed time counts. The other
+  load per run stayed under 1 core on Octane, ARES-6 and Web Tooling, and reached 2.10 cores on
+  the fixtures (one of React's Node runs) and 3.59 on one of empty's 10 ms runs.
+- Every engine run exited 0. The fixtures' outputs agree across engines. ARES-6's and Web
+  Tooling's digests differ between base and final only by the GC log's lines (TRUST_JS_GC_LOG on
+  the engines' runs): with those lines and the numbers masked, ARES-6's output is the same on
+  base, final and Node, and Web Tooling's on base and final (Node's differs in number padding).
+
+1. THE EXIT (ms, median of 5 rounds)
+
+| fixture | base | final | node | node-sp | node-mg | P2 | final / node-sp | base / node-sp |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Vue | 387 | 204 | 108 | 112 | 49 | -47.3% | 1.82x | 3.46x |
+| React | 55 | 30 | 17 | 16 | 12 | -45.5% | 1.88x | 3.44x |
+| Djot | 143 | 73 | 49 | 39 | 36 | -49.0% | 1.87x | 3.67x |
+
+The rounds' spreads: final Vue 203-206, React 29-30, Djot 73-75; node-sp 111-114, 16, 38-39; the
+worst pairing, Djot's 75 against 38, is 1.97x. Against node-mg: 4.16x, 2.50x, 2.03x. The
+sustained allocation workload: at the jit tier 0.522 -> 0.246 s (-52.8%, 1.21x node-sp), at the
+bytecode tier 0.730 -> 0.587 s (-19.6%, 2.90x); the empty script 10 ms on both sides (Node 38-41).
+
+2. THE STANDING COMPARISONS (final against base)
+- Octane 2 (median of 3): Score 2,792 -> 4,589 (+64.4%), every benchmark faster: RegExp +480.7%
+  (348 -> 2,021), NavierStokes +256.3%, SplayLatency +124.7%, PdfJS +97.2%, Gameboy +93.9%, Splay
+  +85.5%, EarleyBoyer +84.2%, Box2D +84.0%, Typescript +40.8%, zlib +37.4%, DeltaBlue +21.0%,
+  Crypto +18.4%, Mandreel +13.2%, Richards +10.9%, MandreelLatency +8.4%, RayTrace +7.1%,
+  CodeLoad +2.6%. Ahead of node-sp: Crypto, NavierStokes, SplayLatency, Splay, Richards,
+  DeltaBlue; behind it by 1.13-1.93x: Box2D, MandreelLatency, Gameboy, Mandreel, RayTrace,
+  EarleyBoyer, Typescript, RegExp; zlib 15.75x (its asm.js scores 59.3-59.4 thousand in all three
+  Node configurations alike). Node's PdfJS and CodeLoad fail under the harness (PDFJS.getPdf,
+  MockElement), so Node has no Score.
+- Web Tooling (one run): geomean 0.71 -> 1.55 runs/s (+118.3%), every tool faster, from +52.3%
+  (prepack) to +602.9% (source-map; coffeescript +595.2%). Against node-sp the geomean is 2.26x
+  (4.93x at the base): within 2x acorn, buble, chai, espree, esprima and source-map; the farthest
+  jshint 3.41x, coffeescript 3.38x, babylon 3.31x.
+- ARES-6 (one run): summary 319.1 -> 221.7 ms (-30.5%; 2.90x node-sp, from 4.18x), every line
+  faster (-17.6% to -37.8%); ML 1.69-1.72x node-sp, Babylon's steady state 1.90x, Air's steady
+  state the farthest at 5.60x.
+- The call microbenchmarks (median of 3): every case faster, from -19.6% (method-call) to -95.3%
+  (array-shift-queue-holey). Against node-sp: rest-params 0.68x, arguments-object 0.70x, the
+  shift queues 0.81-0.83x, constructor 1.11x, method-call 1.18x, class-and-getter 1.26x,
+  closure-call 1.27x, direct-call 1.48x, recursion-fib27 1.65x, array-push-pop 1.88x,
+  function-call-apply 2.81x, spread-call 3.78x. Past W3's call-table lines (Decision 10:
+  recursion within 1.6x, the direct, method, closure and constructor calls within 1.25x,
+  arguments, rest, call/apply, spread and the getter within 2x): direct-call, closure-call,
+  recursion, function-call-apply and spread-call.
+- Peak RSS (median): the fixtures 10-21% smaller (Vue 26 -> 24 MB, React 20 -> 17, Djot 40 -> 32),
+  the sustained allocation workload -44.6% (102 -> 57 MB), Octane -19.5% (2,578 -> 2,075 MB), Web
+  Tooling -20.7% (4,898 -> 3,882 MB); ARES-6 +12.6% (509 -> 573 MB, one run each; node-sp 302 MB).
+  P2's stage records saw ARES-6's peak between 519 and 701 MB. Reported, not bounded (W6's note;
+  the owner's of 2026-10-24: the RSS bounds were proxies).
+- The collector (TRUST_JS_GC_LOG; mark, sweep and engine time summed, as the earlier records sum
+  them): ARES-6's minor collections 6,823 in 79.8 s -> 2,627 in 33.9 s, its majors 102 in 3.26 s
+  -> 87 in 0.95 s, plus 0.86 s in their cycles' 9,072 slices (pauses); Web Tooling's minors 5,066
+  in 128.6 s -> 2,329 in 37.9 s, majors 46 in 17.66 s -> 30 in 1.48 s plus 5.00 s in 6,245 slices.
+- TRust's offline replays (engine time, median of 30 samples): dom-reconcile 1,722.8 -> 1,256.8 ms
+  (-27.1%), Speedometer's Vue TodoMVC 562.5 -> 440.5 ms (-21.7%), event-loop 19.5 -> 17.7 ms
+  (-9.1%); every sample complete and valid, the outputs the same on both sides. Octane through
+  TRust's spike: 2,472 and 2,431 -> 3,635 and 3,506 (+45.6% at the median), 28.0 s -> 21.9 and
+  23.0 s, peak RSS about 1,220 -> 750 MB.
+
+3. WHAT P2 LEAVES
+Added to "Carried to Phase 3" (above): C3 on A2 and tier 1's step (c), which the owner's answer of
+2026-11-06 had following A2 and the exit did not need; closure-call inlining by the callee's code;
+candidate 2's step 3; x86-64's lean native boundary on cached calls; an interruption in a native's
+error type; property stubs; string building; a small array's elements in its cell; the measuring
+note on counts with marking on. Reported with their series: C4's steps 3-4, Vue +0.15% and chai
+and DeltaBlue +0.10% (instructions; DeltaBlue's and most of Vue's the binary's layout); A2,
+EarleyBoyer +0.38%; tier 1 (a), zlib +0.30%. From the phase-end gate (its record): GC stress 1
+with whole stress collections makes agent_control_tests' churn test outlast an hour under heap
+verification (2,708 s before 0ac66a33); its rerun with a longer limit follows this session.
+
+4. STATE
+- trust-js main: 04b65efb's code with this record (local; origin/main 9deaece0, unpushed since).
+- TRust main 8bd6b3f (local; origin/main 78435d0): the idle-time marking step, as its record says.
+- The session's binaries, outputs and caps log stay in target/p2/p2-exit/session.
