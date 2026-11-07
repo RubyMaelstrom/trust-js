@@ -2341,6 +2341,65 @@ fn emit_name_element_fallback(
     a.mark_pop();
 }
 
+/// The scalar kinds of the canonical operands each of a block's in-region predecessors leaves on
+/// its edge into the block (getEol's `&&`: the first comparison's peeked Boolean and the
+/// second's, at the loop test's `JumpIfFalse`). A block whose every CFG predecessor recorded its
+/// edge before the block is emitted (forward edges only: a loop header's back edge comes later,
+/// and the region's entry is no recorded edge) starts with the kinds they all agree on, as clean
+/// canonical operands, so that its branch tests a Boolean's bit instead of ToBoolean's tag
+/// dispatch on the word. An edge some site does not record leaves the block without facts.
+#[derive(Default)]
+struct EntryKinds {
+    edges: crate::fasthash::FastMap<u32, (Vec<u32>, Vec<Option<ScalarKind>>)>,
+}
+
+impl EntryKinds {
+    /// The edge from the block holding `from` (its branch, or its last operation) into the block
+    /// at `target`, with the operands `stack` (canonical, as the edge publishes them).
+    fn record(&mut self, cfg: &Cfg, from: usize, target: usize, stack: &[Operand]) {
+        let (Some(source), Some(block)) = (cfg.block_at(from), cfg.block_at(target)) else {
+            return;
+        };
+        if cfg.blocks()[block.0 as usize].start != target {
+            return;
+        }
+        let kinds = stack.iter().map(|operand| operand.kind());
+        match self.edges.get_mut(&block.0) {
+            None => {
+                self.edges
+                    .insert(block.0, (vec![source.0], kinds.collect()));
+            }
+            Some((sources, known)) => {
+                sources.push(source.0);
+                if known.len() != stack.len() {
+                    known.iter_mut().for_each(|kind| *kind = None);
+                } else {
+                    for (known, kind) in known.iter_mut().zip(kinds) {
+                        if *known != kind {
+                            *known = None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// The kinds the block at `start` begins with, when every one of its predecessors recorded
+    /// exactly one edge into it and the stack has `depth` operands.
+    fn take(&mut self, cfg: &Cfg, start: usize, depth: usize) -> Option<Vec<Option<ScalarKind>>> {
+        let block = cfg.block_at(start)?;
+        let (mut sources, kinds) = self.edges.remove(&block.0)?;
+        let mut predecessors: Vec<u32> = cfg.blocks()[block.0 as usize]
+            .predecessors
+            .iter()
+            .map(|id| id.0)
+            .collect();
+        sources.sort_unstable();
+        predecessors.sort_unstable();
+        (sources == predecessors && kinds.len() == depth).then_some(kinds)
+    }
+}
+
 /// Route only edges whose operand owners are already canonical. Internal forward
 /// edges need no stub; backedges retain the poll and external exits retain local
 /// publication. This does not apply to the unique InlineGuard success edge, which
@@ -2510,6 +2569,7 @@ pub(super) fn emit(
     // The Number facts of a block's locals that its fall-through successor inherits, when that
     // successor has no other predecessor (see the block's end).
     let mut carried_numbers: Option<(usize, crate::fasthash::FastSet<u16>)> = None;
+    let mut entry_kinds = EntryKinds::default();
     for (block_index, &(start, end)) in plan.blocks.iter().enumerate() {
         let physical_next = plan.blocks.get(block_index + 1).map(|&(next, _)| next);
         a.bind(labels[&start]);
@@ -2529,11 +2589,16 @@ pub(super) fn emit(
                 (stack, physical, facts)
             } else {
                 let depth = cfg.stack_depth_at(start).unwrap();
-                (
-                    vec![Operand::Canonical; depth],
-                    depth,
-                    OwnReadFacts::default(),
-                )
+                let mut stack = vec![Operand::Canonical; depth];
+                if let Some(kinds) = entry_kinds.take(cfg, start, depth) {
+                    // The operand register bank has sixteen registers (`Operand::clean`).
+                    for (index, kind) in kinds.into_iter().enumerate().take(16) {
+                        if let Some(kind) = kind {
+                            stack[index] = Operand::clean(kind, index, false);
+                        }
+                    }
+                }
+                (stack, depth, OwnReadFacts::default())
             };
         let mut consumed = 0;
         // A pending `LoadName`: its pc, the fused site's plan and the canonical stack below it.
@@ -2633,6 +2698,7 @@ pub(super) fn emit(
                         own_facts.clear();
                         materialize(a, &stack, physical);
                         physical = stack.len();
+                        entry_kinds.record(cfg, pc + 3, *target as usize, &stack);
                         stack.fill(Operand::Canonical);
                         plan.flush_local(a, *lhs);
                         plan.flush_local(a, *rhs);
@@ -3648,6 +3714,12 @@ pub(super) fn emit(
                     let branch = if pc + 1 < end {
                         match ops[pc + 1] {
                             Op::JumpIfFalse(target) => {
+                                entry_kinds.record(
+                                    cfg,
+                                    pc + 1,
+                                    target as usize,
+                                    &before[..depth - 2],
+                                );
                                 let edge = edges.target(a, pc + 1, target as usize);
                                 Some(edge)
                             }
@@ -3773,6 +3845,7 @@ pub(super) fn emit(
                                 Some(domain) => emit_int_compare(a, domain, operands),
                                 None => a.fcmp(left, right),
                             }
+                            entry_kinds.record(cfg, pc + 1, *target as usize, &stack);
                             let edge = edges.target(a, pc + 1, *target as usize);
                             a.b_cond(cond ^ 1, edge);
                             physical = stack.len();
@@ -3854,10 +3927,12 @@ pub(super) fn emit(
                 Op::Jump(target) => {
                     own_facts.clear();
                     materialize(a, &stack, physical);
+                    entry_kinds.record(cfg, pc, target as usize, &stack);
                     edges.transfer(a, pc, target as usize, physical_next);
                 }
                 Op::JumpIfFalse(target) => {
                     own_facts.clear();
+                    entry_kinds.record(cfg, pc, target as usize, &stack[..depth - 1]);
                     if stack[depth - 1].kind() == Some(ScalarKind::Boolean) {
                         scalar_register(a, &mut stack, physical, depth - 1);
                         stack.pop();
@@ -3902,6 +3977,7 @@ pub(super) fn emit(
                         scalar_register(a, &mut stack, physical, depth - 1);
                     }
                     materialize(a, &stack, physical);
+                    entry_kinds.record(cfg, pc, target as usize, &stack);
                     // Preserve the ordinary native truthiness/nullish template. ToBoolean
                     // has no author effects, so private homes need no spill or reload.
                     let edge = edges.target(a, pc, target as usize);
@@ -4090,6 +4166,7 @@ pub(super) fn emit(
             Op::Jump(_) | Op::Return | Op::ReturnBare | Op::ReturnUndef | Op::Throw
         ) {
             materialize(a, &stack, physical);
+            entry_kinds.record(cfg, end - 1, end, &stack);
             // ECMA-262 If/Logical/Conditional Evaluation: same selected value,
             // owners and completion, with no extra control-flow-only trampoline.
             edges.transfer(a, end - 1, end, physical_next);

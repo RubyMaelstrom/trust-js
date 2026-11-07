@@ -427,3 +427,56 @@ fn fused_calls_in_register_regions_answer_as_the_call_does() {
     );
     assert_eq!(answers[0], "3,0|2|3|2");
 }
+
+/// Step 3d: a loop test's `&&` or `||` meets its two operands' values at one branch; when both
+/// edges carry a Boolean, the region's branch tests the Boolean's bit. Joins where an edge carries
+/// anything else (a peeked operand that is an object, a Number or undefined) keep ToBoolean, and
+/// every answer matches the other tiers'.
+#[test]
+fn boolean_joins_in_region_loop_tests_answer_as_the_other_tiers() {
+    let source = r#"
+        function eol(t, e) {
+            for (; 10 !== (s = t.codePointAt(e)) && 13 !== s;) e++;
+            var s;
+            return e;
+        }
+        function skip(t, e) {
+            for (; 32 === (s = t.codePointAt(e)) || 9 === s;) e++;
+            var s;
+            return e;
+        }
+        function mixed(list) {
+            var i = 0, n = 0;
+            while (list[i] && i < 10) { n += typeof list[i] === 'object' ? 2 : 1; i++; }
+            return n;
+        }
+        function counted(list) {
+            var i = 0, n = 0;
+            while (i < list.length && list[i] !== 0) { n += list[i]; i++; }
+            return n;
+        }
+        function either(a, b) {
+            var n = 0;
+            for (var i = 0; i < 40; i++) if ((i % 3 === 0) || (i % 5 === 0)) n++;
+            return n + (a || b) + (a && b);
+        }
+        var text = 'ab \tcd\r\nef  \t\tgh\n'.repeat(8), out = [];
+        for (var round = 0; round < 40; round++) {
+            out = [];
+            for (var at = 0; at < 20; at++) out.push(eol(text, at), skip(text, at));
+            out.push(mixed([1, {}, 'x', 2, [], 0, 3]), mixed([{}, {}, {}]), mixed([0]));
+            out.push(counted([3, 4, 5, 0, 6]), counted([1, 2]), counted([]));
+            out.push(either(0, 7), either(5, 0), either(2, 3));
+        }
+        out.join()
+    "#;
+    let mut answers = Vec::new();
+    for tier in TIERS {
+        let mut engine = engine(tier);
+        answers.push(eval(&mut engine, source));
+    }
+    assert!(
+        answers.windows(2).all(|pair| pair[0] == pair[1]),
+        "{answers:#?}"
+    );
+}
