@@ -20872,3 +20872,38 @@ when its measured second ran fewer than 32 iterations, and RayTrace runs at that
 a RayTrace score of 2297 or more took 21.5 s and every one of 2295 or less 22.5 s. The head's
 RayTrace is 2303 (2299-2306) against main's 2281 (2272-2283), as step 2's was 2299 against step
 1's 2283 on 63eb71df: the bimodal event loop of the 63eb71df session is this threshold.
+
+### Phase-end follow-ups: load-sensitive tests hardened, the memory reducer waits while a cycle marks (record, 2026-11-07)
+
+Landed on main 1a3e5823 (the coordinator's; cherry-picked, the patches identical to e49d4433's on
+dad9d67f, whose tree was tested): 8c8402ea (five tests stop depending on their thread getting a
+core in time: the watchdog's burst test idles 2 s, not 50 ms; the long string's test zeroes the
+stack below before its counting collections, as an entry point does; the cyclic walk's
+interruption test retries up to five attempts when the interruption comes before the walk; the
+execution-deadline abort test arms its deadline inside the try, through armDeadline; the scan-cost
+spike is a cost measurement, --ignored, as watchdog_costs is), abfd34b7 (the pacing tests' engines
+do not verify their heaps), bf4f6a8e (the memory reducer waits while a marking cycle runs: V8's
+timer can start incremental marking only while marking is stopped, src/heap/memory-reducer.cc:86-87,
+and otherwise waits its long delay again; Engine::run_memory_reducer took a running cycle as its own
+start and counted it as one of its collections; W6 step 6's observation, the coordinator's
+phase-end follow-up; test a_reducer_timer_while_a_cycle_marks_waits).
+
+The pacing tests' failures under load: heap verification, on in the engine's unit tests, walks the
+whole heap at every collection and after every slice of a marking cycle, and pacing reads the
+collections' measured speeds. In the reducer's quiet-heap test a 28 MB cycle's 470 slices took
+144 s of the test's 161 s in a debug build (each slice tracing about 64 KB, its pause 15 ms at the
+cycle's start and 555 ms at its end), the measured collector fell to about 117 B/ms, and on a loaded
+or thermally capped machine the reducer's quiet verdict (which needs over 142 B/ms against the
+1 B/ms floor) and the nursery's growth (a program allocating under 1 MB/s) turned. Release builds
+never verify: not an engine issue. Without verification the reducer's test takes 21 s under load.
+
+Checks: on 7a7c7810 (the same three patches on 2aedc0e9): rustfmt; clippy in five configurations
+and the workspace clean; the lib suite 2,882 passed, with pacing on 2,882 (10 ignored, the scan
+spike now one); zombie: clippy x3 clean, the lib suite 2,657 passed. Under synthetic load (12 busy
+loops on CPUs 0-3, the tests pinned there): the seven tests alone and in three loaded rounds all
+pass. On the tree with candidate 2 (dad9d67f and the series): poll_tests 13, gc_pacing_tests 6,
+interrupt 9, payload_cell 11 and the deadline test pass alone and loaded.
+
+Still open: loop_only_code_collects_every_iteration_at_stress_1 fails under TRUST_JS_GC_STRESS=1 on
+main bfb58035 (197 of 200 loop polls collect; the test asks 198), found by candidate 2's landing
+gate's stress stage, which the series before it did not run; bisected next.
