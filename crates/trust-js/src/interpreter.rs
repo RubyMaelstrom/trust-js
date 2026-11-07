@@ -16351,7 +16351,8 @@ impl Interp {
                 };
                 self.constructing = saved_ctor;
                 self.new_target = saved_nt;
-                while result.is_ok() {
+                // A native seldom leaves a tail call: test for one in line.
+                while result.is_ok() && self.pending_tail.is_some() {
                     match self.run_pending_tail(true) {
                         Some(next) => result = next,
                         None => break,
@@ -16415,7 +16416,8 @@ impl Interp {
                 };
                 self.constructing = saved_ctor;
                 self.new_target = saved_nt;
-                while result.is_ok() {
+                // A native seldom leaves a tail call: test for one in line.
+                while result.is_ok() && self.pending_tail.is_some() {
                     match self.run_pending_tail(true) {
                         Some(next) => result = next,
                         None => break,

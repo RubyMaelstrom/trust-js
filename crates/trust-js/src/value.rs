@@ -5764,6 +5764,18 @@ pub(crate) fn remember_code_edges(value: &dyn crate::gc_trace::GcTrace) {
 #[inline]
 pub(crate) fn activate_agent(heap: &GcHeap, symbols: &SymbolAgent) {
     let next = (Rc::as_ptr(heap) as usize, Rc::as_ptr(symbols) as usize);
+    // Nearly every activation finds its Agent active already (a native's return, a callback's
+    // end): that test stays in line, the switch out of line.
+    if ACTIVE_AGENT_TAG.with(|tag| tag.get() == next) {
+        return;
+    }
+    activate_other_agent(heap, symbols, next);
+}
+
+/// [`activate_agent`]'s switch to an Agent that is not the active one.
+#[cold]
+#[inline(never)]
+fn activate_other_agent(heap: &GcHeap, symbols: &SymbolAgent, next: (usize, usize)) {
     ACTIVE_AGENT_TAG.with(|tag| {
         if tag.get() == next {
             return;

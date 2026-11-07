@@ -248,11 +248,21 @@ impl RuntimeInterrupt {
 
     /// The currently active reason, in host-control priority order. An armed deadline counts
     /// from the moment it passes, whether or not the watchdog has seen it yet.
+    #[inline]
     pub fn current_reason(&self) -> Option<InterruptReason> {
+        // Nothing requested and nothing armed, the state every poll after a native finds: that
+        // test stays in line, the reasons out of line.
         let state = self.shared.state.load(Ordering::Acquire);
         if state == 0 {
             return None;
         }
+        self.reason_of(state)
+    }
+
+    /// [`RuntimeInterrupt::current_reason`] for a state with something requested or armed.
+    #[cold]
+    #[inline(never)]
+    fn reason_of(&self, state: u8) -> Option<InterruptReason> {
         if state & CANCELLED != 0 {
             return Some(InterruptReason::Cancelled);
         }
