@@ -1573,10 +1573,12 @@ fn syntax_error_is_parse_phase() {
 fn execution_deadlines_abort_without_running_catch_or_finally_on_every_tier() {
     // HTML §8.1.4.5 "Killing scripts": abort empties the execution-context stack without the
     // normal language mechanisms, including `finally`. Keep the declarations outside the try so
-    // the same realm can prove neither author handler observed the host control completion.
+    // the same realm can prove neither author handler observed the host control completion. The
+    // deadline is armed inside the try (`armDeadline`): armed before the evaluation, it could
+    // expire before the first statement under load, and `caught` would never be declared.
     let source = r#"
         var caught = 0, finalized = 0;
-        function spin() { while (true) {} }
+        function spin() { armDeadline(); while (true) {} }
         try { spin(); }
         catch (error) { caught = 1; }
         finally { finalized = 1; }
@@ -1591,9 +1593,7 @@ fn execution_deadlines_abort_without_running_catch_or_finally_on_every_tier() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         let interrupt = engine.interrupt_handle();
-        interrupt.set_deadline(Some(
-            std::time::Instant::now() + std::time::Duration::from_millis(20),
-        ));
+        define_arm_deadline(&mut engine);
         let started = std::time::Instant::now();
         match engine
             .eval_interruptible(source, false)

@@ -227,7 +227,12 @@ fn spike_stacker_segment_is_invisible_to_main_stack_scan() {
     );
 }
 
+/// What a conservative scan costs (`--ignored`, in a release build, on a quiet machine): 100
+/// scans of 1 MiB, recorded for the S0 report. A wall-clock bound in the engine's debug unit
+/// tests measured the machine instead: the gate's suites, or a thermally capped core, slowed the
+/// scans past it (2026-11-07: the fastest of 100 took 35 ms on a capped A725 core under load).
 #[test]
+#[ignore]
 fn spike_scan_cost_is_linear_and_small() {
     let arena = Arena::new();
     let buf = vec![0u64; 128 * 1024]; // 1 MiB of stack-like words

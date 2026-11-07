@@ -411,6 +411,7 @@ fn a_long_string_held_only_by_a_property_lives_and_dies_with_it() {
         engine.set_tier(tier);
         engine.set_tier_threshold(0);
         eval(&mut engine, "true");
+        crate::gc_core::scrub_stack(64 << 10);
         engine.interp.gc_collect();
         let before = large_cells(&engine);
         eval(
@@ -431,6 +432,10 @@ fn a_long_string_held_only_by_a_property_lives_and_dies_with_it() {
         );
         assert_eq!(result, "10001,abab,abc,10000,98", "{tier:?}");
         eval(&mut engine, "text = undefined; holder.text = 0; true");
+        // The evaluations' frames are popped, but the collection's frames built over them may
+        // leave slots unwritten, and the conservative scan takes a stale address of the string
+        // there for a root: zero them first, as an entry point does (`ENTRY_SCRUB_BYTES`).
+        crate::gc_core::scrub_stack(64 << 10);
         engine.interp.gc_collect();
         assert_eq!(
             large_cells(&engine),

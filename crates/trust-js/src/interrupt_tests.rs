@@ -273,10 +273,12 @@ fn watchdog(idle: Duration) -> &'static Watchdog {
 /// The watchdog's lifecycle (Decision 18): no thread before a deadline is armed; the first
 /// starts one, which serves a burst of armings and clearings (TRust's around each URLPattern
 /// match) and the expiries that follow; it exits once nothing has been armed for its idle
-/// time, and the next deadline starts a fresh one.
+/// time, and the next deadline starts a fresh one. The idle time is long enough that this
+/// thread waiting for a core under load (a gate's suites) cannot pass it mid-burst: at 50 ms
+/// it did, and a second thread started.
 #[test]
 fn the_watchdog_thread_serves_a_burst_and_exits_when_idle() {
-    let dog = watchdog(Duration::from_millis(50));
+    let dog = watchdog(Duration::from_secs(2));
     assert_eq!(dog.threads(), (false, 0), "no thread before a deadline");
     let interrupt = RuntimeInterrupt::with_watchdog(dog);
     let word = word();

@@ -811,57 +811,76 @@ fn a_cyclic_list_walk_stops_for_cancellation_and_deadlines() {
         var ring = {link: null};
         ring.link = ring;
     "#;
+    // Under load the interruption can come before the walk starts (this thread waiting for a
+    // core past the canceller's 20 ms, or the deadline's): an entry poll then reports it. Every
+    // attempt must stop for the right reason; the loop's own report must come in one of five.
     for deadline in [false, true] {
-        let mut engine = engine();
-        eval(&mut engine, SOURCE);
-        assert_native(&mut engine, &["last"]);
-        let interrupt = engine.interrupt_handle();
-        let canceller = (!deadline).then(|| {
-            let interrupt = interrupt.clone();
-            std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                interrupt.cancel();
-            })
-        });
-        if deadline {
-            interrupt.set_deadline(Some(
-                std::time::Instant::now() + std::time::Duration::from_millis(20),
-            ));
+        let mut reported = false;
+        for attempt in 0..5 {
+            if attempt_cyclic_walk(SOURCE, deadline) {
+                reported = true;
+                break;
+            }
+            eprintln!(
+                "cyclic walk, deadline {deadline}: attempt {attempt} stopped before the loop"
+            );
         }
-        take_poll_census();
-        let started = std::time::Instant::now();
-        let outcome = engine
-            .eval_interruptible("last(ring);", false)
-            .expect("parses");
-        let census = take_poll_census();
-        if let Some(canceller) = canceller {
-            canceller.join().expect("canceller");
-        }
-        eprintln!("cyclic walk, deadline {deadline}: {census:?}");
-        let expected = if deadline {
-            crate::InterruptReason::DeadlineExceeded
-        } else {
-            crate::InterruptReason::Cancelled
-        };
         assert!(
-            matches!(outcome, crate::ExecutionOutcome::Interrupted { reason } if reason == expected),
-            "deadline {deadline}"
-        );
-        assert!(
-            started.elapsed() < std::time::Duration::from_secs(20),
-            "deadline {deadline}: {:?}",
-            started.elapsed()
-        );
-        #[cfg(target_arch = "aarch64")]
-        assert!(
-            census.calls[LOOP] >= 1,
-            "the loop header reported it: {census:?}"
-        );
-        assert!(
-            census.calls.iter().sum::<u64>() >= 1,
-            "a poll reported it: {census:?}"
+            reported,
+            "deadline {deadline}: the loop's poll reported it in no attempt"
         );
     }
+}
+
+/// One attempt of [`a_cyclic_list_walk_stops_for_cancellation_and_deadlines`]: whether the
+/// interruption was reported where the test expects it (on ARM64, the loop header's poll).
+fn attempt_cyclic_walk(source: &str, deadline: bool) -> bool {
+    let mut engine = engine();
+    eval(&mut engine, source);
+    assert_native(&mut engine, &["last"]);
+    let interrupt = engine.interrupt_handle();
+    let canceller = (!deadline).then(|| {
+        let interrupt = interrupt.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            interrupt.cancel();
+        })
+    });
+    if deadline {
+        interrupt.set_deadline(Some(
+            std::time::Instant::now() + std::time::Duration::from_millis(20),
+        ));
+    }
+    take_poll_census();
+    let started = std::time::Instant::now();
+    let outcome = engine
+        .eval_interruptible("last(ring);", false)
+        .expect("parses");
+    let census = take_poll_census();
+    if let Some(canceller) = canceller {
+        canceller.join().expect("canceller");
+    }
+    eprintln!("cyclic walk, deadline {deadline}: {census:?}");
+    let expected = if deadline {
+        crate::InterruptReason::DeadlineExceeded
+    } else {
+        crate::InterruptReason::Cancelled
+    };
+    assert!(
+        matches!(outcome, crate::ExecutionOutcome::Interrupted { reason } if reason == expected),
+        "deadline {deadline}"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(20),
+        "deadline {deadline}: {:?}",
+        started.elapsed()
+    );
+    assert!(
+        census.calls.iter().sum::<u64>() >= 1,
+        "a poll reported it: {census:?}"
+    );
+    // On ARM64, the loop header reported it.
+    cfg!(not(target_arch = "aarch64")) || census.calls[LOOP] >= 1
 }
 
 /// Natives the lean boundary ran so far on this thread (candidate 2's fork B2).
