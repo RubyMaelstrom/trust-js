@@ -21108,3 +21108,109 @@ capped (valid). 5 alternating rounds, each the spike page then the latency page,
 - Scripts: rebuild-all.sh (the binaries: TRust's sources touched, since an export's older mtimes
   can leave a stale TRust crate), headless-checks.sh, headless-timing.sh, gc-cycles.py,
   idle-runs.py; idle-checks.sh for section 4.
+
+### P2's phase-end gate: the full gate on 447af048, its three failures and their fixes (record, 2026-11-07)
+
+Landed on main: 0577859d (the coordinator's), then by fast-forward 0577859d..04b65efb (an agent's,
+branch p2-stress-poll: 0ac66a33, 8f4bd9a3, 04b65efb). This closes the item "Phase-end follow-ups"
+left open (the stress-1 poll test, bisected below).
+
+1. THE GATE (Decision 8: the tests in full at a major phase's end)
+target/p2/p2-exit/final-gate.sh 447af048 in its own worktree (target/p2/p2-exit/wt), gate-v2's every
+stage one per invocation, then GC stress 1 over P2's changed areas (18 filters) and the lib suite
+under TRUST_JS_GC_INCREMENTAL=force; outputs in target/p2/p2-exit/gate-447af048/, summary
+gate-447af048.txt; ended 2026-11-07 11:23:09, the tree clean.
+- rustfmt clean; clippy clean in the five configurations and the workspace.
+- rustdoc exit 0 with no diagnostics. The gate's "differ" is the base's 13 errors gone (the crate
+  docs' links to private modules, which failed at the base).
+- The lib suite (embed): 2,900 passed, 1 failed (payload_cell_tests::
+  a_long_string_held_only_by_a_property_lives_and_dies_with_it, a.), 10 ignored, 471 s; with pacing
+  on 2,901 passed, 0 failed. Doctests 11 passed, 1 ignored.
+- Downstream crates with heap verification, all passing: trust-js-host 37, trust-js-timers 6,
+  trust-js-fs 0, trust-js-web 64 (1 ignored), trust-js-node 47, trust-js-runtime 185 (1 ignored).
+- GC stress 1: 16 of 18 filters pass. poll_tests 12 of 13 (c.), reentry_rooting 3 of 13 (b.).
+- Release builds; the fixtures (Vue, React, Djot) exit 0 with the base's masked output (65b1faf9,
+  05a89273, 9cad1fec); difftest 138 agree, 12 skipped (budget) across seeds 7..157.
+- The JIT code dumps (plain, chunk stubs, inline stubs): every chunk's summary differs from the
+  base's, as P2's code generators changed them (Vue 64 chunks, React 12, Djot 163). Vue's "0
+  chunks" in the summary is diff reading its summary file as binary; with diff -a all 64 differ.
+- Test262 in full at --tier=jit threshold 8: 53,575 of 53,575 (100%), the report the same as the
+  base's.
+- The lib suite under TRUST_JS_GC_INCREMENTAL=force: 2,901 passed, 0 failed (958 s).
+
+2. THE THREE FAILURES
+a. The long string's test (the lib suite, once). It counted large cells after explicit
+   collections, whose conservative scan a stale or look-alike word in a Rust frame or register can
+   satisfy: 2 against 1, the explicit collection's own 1 MiB scrub notwithstanding. 0577859d counts
+   after precise collections (the subject is the property's precise edge) and drops the scrubs
+   8c8402ea added; gated as the precise helper is (aarch64 and x86-64 on macOS, Linux, Windows).
+b. reentry_rooting_tests under stress 1, 10 of 13 ("completed/abrupt worklists must unregister
+   their roots"; with TRUST_JS_GC_INCREMENTAL=0 all 13 passed). With a stress major's cycle
+   running, the precise test helper's mark was that cycle's final pause, which keeps what the
+   cycle marked before the test retired its roots. 0577859d: a major precise test collection
+   finishes a running cycle first, as V8's PreciseCollectAllGarbage finalizes incremental marking
+   before its full collection (src/heap/heap.cc:1365-1370) and as gc_heap_collect_explicit collects
+   twice; 13 of 13 under stress 1, also under force. 8f4bd9a3 makes the case a test that needs no
+   environment variable (gc_cycle_tests' a_precise_test_collection_during_a_cycle_frees_what_died_
+   after_the_cycle_marked_it). 04b65efb finishes a running cycle for a minor precise test
+   collection too: no minor collection runs while a cycle marks (Heap::start_marking's debug
+   assertion, gc_core.rs:3711), which agent_control_tests, fixed_activation_tests,
+   property_layout_cell_tests, packed_storage_tests, json and scope_tests could reach under stress
+   (test a_minor_precise_test_collection_during_a_cycle_finishes_the_cycle_first, which panicked at
+   that assertion before the change).
+c. poll_tests' loop_only_code_collects_every_iteration_at_stress_1 under stress 1: 197 of 200 loop
+   polls collected; the test asks 198. Bisected on main's first-parent history: the first bad
+   commit is 34b3eefc (W6 step 6, incremental marking on by default again), its parent 3fff8b63
+   good. Since 34b3eefc a stress major the heap chooses (every eighth stress collection) starts a
+   cycle, and while it ran the stress interval's next collections were the cycle's slices: the
+   safepoint collected nothing and its young cells stayed. The test's warm-up started such a cycle
+   before the test turned incremental marking off (which stops new cycles only), and its slices
+   took wide's entry poll and first three loop polls. V8, SpiderMonkey and JSC make a stress
+   collection a whole one: V8's allocation timeout (--gc-interval) fails an allocation, and the
+   collection for it while V8 marks is the full one; SpiderMonkey's Alloc zeal collects
+   non-incrementally, resetting an incremental collection that runs; JSC's slowPathAllocsBetweenGCs
+   collects fully and synchronously (the citations in Heap::due_work's doc comment). 0ac66a33: the
+   stress interval's collection during a cycle is the cycle's final pause, with incremental marking
+   on or turned off since the cycle started; forced cycles (verification's mode) keep their slices,
+   as SpiderMonkey's incremental zeal modes take precedence over its Alloc one. Tests: gc_core's
+   the_stress_intervals_collection_is_a_running_cycles_final_pause and poll_tests'
+   a_cycle_running_as_a_stress_loop_starts_ends_at_its_first_poll, which fail without the change.
+   Release builds: the stress interval is 0 unless TRUST_JS_GC_STRESS is set, so due_work's new
+   term never fires there; the exit session's binaries are rebuilt on 04b65efb anyway, as its code
+   changed.
+
+Why the phase end found b. and c.: 34b3eefc's landing checks (lib by default, with pacing, under
+force, zombie, TRust) ran no GC stress; candidate 2's landing gate ran poll_tests under stress and
+found c. there, and the phase-end gate's stress stage found b. A stress-mode regression stays
+invisible to the default suites; for P3, a change to when cycles run is one to put through the GC
+stress filters before it lands (a suggestion for the owner, not a gate).
+
+3. CHECKS ON THE SERIES (the agent's)
+- On 8f4bd9a3: the lib suite 2,904 passed; clippy clean; zombie (x86-64) the lib suite 2,665
+  passed; under force the eight affected filters pass; under stress 1 poll_tests 14, gc_cycle_tests
+  15, gc_core 113 and reentry_rooting 13 pass.
+- On 04b65efb: the lib suite 2,905 passed, 0 failed, 10 ignored; clippy clean; zombie clippy clean
+  in three configurations, the lib suite 2,666 passed, 0 failed; both precise-during-a-cycle tests
+  pass plain, under stress 1 and under force; under stress 1 minor_collection 36 and
+  payload_cell_tests 11 pass.
+- On 04b65efb under stress 1, the minor precise helper's callers beyond the gate's filters:
+  scope_tests 24 passed (740 s), fixed_activation_tests 5 (147 s), property_layout_cell_tests 11,
+  packed_storage_tests 3 and json 6; agent_control_tests 36 of 37 passed and none failed when the
+  filter's 3,600 s limit stopped it. Its last test, agent_collections_finish_inside_child_and_
+  grandchild_loops_all_tiers (churn(30000) six times: three tiers, with and without a grandchild
+  realm), was still running at 100% CPU, in the jit run's collections and the heap verifier
+  (perf). On 447af048, without 0ac66a33, it passes alone in 2,708 s (on a CPU of its own; the
+  04b65efb run shared its CPUs with the filter's other tests and the callers above).
+- That cost is the fix's, in debug test builds under stress only. A stress safepoint during a
+  cycle now collects, and each collection verifies the heap, where a slice did less: scope_tests'
+  slowest test takes 705 s against 558 s on 447af048 and 789 s on 3fff8b63, before cycles ran
+  under stress. Release builds never verify and leave the stress interval at 0. The slow test's
+  rerun with a longer limit follows the exit session.
+- The bisection's steps and censuses: target/p2/compact/c2/bisect/ (373 commits of main's
+  first-parent history); the stress runs' logs and binaries: target/p2/compact/c2/stress/.
+
+4. STATE
+- main 04b65efb (local; origin/main 9deaece0). The exit session's binaries are built on it:
+  target/p2/timing/final-04b65efb (engine shell and runtime CLI) and target/p2/p2-exit/trust-final2
+  (TRust 8bd6b3f on engine 04b65efb); the fixtures' output, the elapsed time masked, is the same as
+  447af048's binaries'. The session's record follows.
