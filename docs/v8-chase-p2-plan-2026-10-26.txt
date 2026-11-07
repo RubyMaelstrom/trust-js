@@ -20907,3 +20907,76 @@ interrupt 9, payload_cell 11 and the deadline test pass alone and loaded.
 Still open: loop_only_code_collects_every_iteration_at_stress_1 fails under TRUST_JS_GC_STRESS=1 on
 main bfb58035 (197 of 200 loop polls collect; the test asks 198), found by candidate 2's landing
 gate's stress stage, which the series before it did not run; bisected next.
+
+### Djot's candidate 3, the matcher's per-exec entry: lastIndex's shape compare and the tier ticks (record, 2026-11-07)
+
+Landed on main 72828fda (an agent's; cherry-picked, the patches identical to 7fa7c503/77d2c414,
+which were gated, and to 9ac971c2/30b266ee on the hardening series, whose crates tree,
+4c86bc30, is main's now): b288f4fd (E1: exec's lastIndex read compares the receiver with
+RegExpAlloc's shape kept in the Interp, without the protector's RefCell borrow and the environment
+flag; the shape is the Agent's, every Realm's RegExps share it), 41a27786 (E2: the tier-up ticks
+and the subject-storage feedback stop once a width's compilation is decided, as V8 ticks only
+while the bytecode runs).
+
+Measured (fat LTO; on candidate 2's tree, d9ea000d's release code): 23 instructions less an exec
+(the pieces' micros v2-v5 and Djot's specials); instructions RegExp (Octane) -0.74%, Djot -0.14%,
+the rest within +-0.03% (on candidate 3's series: RegExp -0.70%, Splay -0.18%, Djot -0.14%,
+TypeScript +0.06%, the size of the shifts the series' own RegExp-only steps gave it); JIT code bytes
+of Vue, React and Djot identical.
+
+Checks: the gate on 77d2c414 (c3/checks/gate-77d2c414): rustfmt; clippy in five configurations and
+the workspace clean; the lib suite 2,887 passed, with pacing on 2,887; under
+TRUST_JS_GC_INCREMENTAL=force 2,886 and the nursery's growth test, a load failure the hardening
+series' a7b61b16 fixes (5 of 5 alone under force, 3 of 3 plain); the release builds; the fixtures as
+the base; difftest 138 agree; Test262 53,575/53,575, identical. zombie: clippy x3 clean, the lib
+suite 2,662 passed. On the tree with candidate 2 (e757b18e): the RegExp tests 91, candidate 2's
+stub, poll and fusion tests 33, all of them under force 115.
+
+The agent's census:
+
+THE MATCHER'S PER-EXEC ENTRY (census, 2026-11-07; the coordinator's (2): counted against V8's
+RegExpExecInternal, JSC's execInline the second reference)
+
+SPE on the series head ac414fd3 (arm_spe_0, one operation in 1,024, the 300,000-iteration run less
+the 100,000 one; entry/spe-*), operations sampled an exec. SPE takes about half the operations
+perf's instruction count gives (the sampler drops what arrives while it records), so the column
+is a proportion, not a count:
+
+| piece | miss (v2) | match (v3) | specials |
+| --- | ---: | ---: | ---: |
+| the native call (jit_call_hit, with_borrowed_values, call_native_committed_with, current_reason, activate_agent, run_pending_tail): candidate 2's | 140 | 153 | 213 |
+| regexp_exec (the receiver's matcher, its Rc clone, the subject's view) | 17 | 19 | 23 |
+| slot_last_index (lastIndex at its slot) | 35 | 38 | 50 |
+| regexp_builtin_exec's own code (lastIndex's coercion, the matcher's Option, set_last, the bounds) | 39 | 75 | 99 |
+| regexp_exec_text_shared (exec_at, note_execution, the filters, the scratch, code_for) | 35 | 64 | 72 |
+| native::run (NativeCtx, the entry, the status, the slots' unpack and reset) | | 48 | |
+| the single-element path (find_single, next_start) | | | 123 |
+| the native program | | 24 | |
+
+What V8 does for the same steps (builtins-regexp-gen.cc; regexp.tq): the fast path's test is one
+map compare and a positive-Smi lastIndex (IsFastRegExpNoPrototype, :1166-1191), lastIndex a field
+load (:149-155); RegExpExecInternal (:752-1100) checks lastIndex against the length, unpacks the
+string (ToDirect), dispatches on the data's type tag, runs two quick reject filters (a mask over
+four characters and a start-character bitset, :826-889), loads the code for the encoding and calls
+it with nine arguments (:982-1040), about 70-90 instructions around the irregexp code. JSC's
+execInline (runtime/RegExpObjectInlines.h:214-250) reads lastIndex as a UInt32 (:188-206) and calls
+RegExp::matchInline with the RegExp's own ovector.
+
+What TRust does that they do not, found so far:
+- slot_last_index's main path is about 50 instructions of 141 (the env flag's OnceLock, the
+  protector's RefCell, the object's borrow, the slot's cell-or-record branch, the NaN-box decode).
+- note_execution stores a tier tick and the subject's storage on every exec, even once the width's
+  code exists; V8 ticks only while the bytecode runs (src/regexp/regexp.cc:842-862).
+- The diagnostics gates (the census, the profile, the native verifier) are separate OnceLock
+  acquire loads, three to five an exec.
+
+Cuts so far (worktree c3-wt4, branch p2-c3-entry, on d029ec80):
+- E1 d54945b6: alloc_shape reads RegExpAlloc's shape from an Interp copy, one compare.
+- E2 6f79a17a: the tier ticks and the storage feedback stop once a width is decided.
+- E1 recommitted as b6b62fd1 (the same code as d54945b6, with the tests the coordinator asked
+  for: regexps_of_every_realm_share_the_shape_execs_lastindex_read_compares and
+  exec_reads_lastindex_at_its_slot_only_when_it_is_a_plain_number) and E2 as bf4003c8. The Interp's
+  copy of RegExpAlloc's shape does not travel with Realm switches: a shape records keys and
+  attributes in the Agent's transition table and the [[Prototype]] is the object's own field, so
+  every Realm's RegExps share it (the protector keeps instance_shape across invalidation for the
+  same reason).
