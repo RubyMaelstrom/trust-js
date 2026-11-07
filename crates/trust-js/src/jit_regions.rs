@@ -3041,7 +3041,105 @@ pub(super) fn emit(
                 bail.2 = pre.clone();
             }
             let depth = stack.len();
+            // A fused String method call (`string_calls`, step 3): a receiver that may be a
+            // String, outside a pure name/element window, in one block.
+            let string_call = match ops[pc] {
+                Op::GetMethod(..)
+                    if !parameter_aliases
+                        && fusing.is_none()
+                        && layout.valid
+                        && ilayout.valid
+                        && stack.last().is_some_and(|receiver| {
+                            matches!(
+                                receiver,
+                                Operand::Canonical | Operand::Borrowed(_) | Operand::BorrowedValue
+                            )
+                        }) =>
+                {
+                    // A string accumulation's operations keep their own protocol, and nothing
+                    // lands between the fused operations.
+                    string_calls::Plan::at(chunk, ops, pc, source_targets, fast).filter(|call| {
+                        call.call_pc < end
+                            && (pc..=call.call_pc)
+                                .all(|at| a.string_accumulation(at as u32).is_none())
+                            && (pc + 1..=call.call_pc).all(|at| {
+                                !tdz_array_continuations.contains_key(&at)
+                                    && !tdz_array_skips.contains(&at)
+                            })
+                    })
+                }
+                _ => None,
+            };
             match ops[pc] {
+                Op::GetMethod(..) if string_call.is_some() => {
+                    // Both paths start from canonical operands, where the slow one runs the
+                    // unfused templates. The fused one leaves the code point or unit in the
+                    // receiver's register as a Number; the slow one, the call's result, which a
+                    // Number joins and anything else (undefined past the end, a replaced
+                    // method's value) resumes after the call: a failed guard runs the unfused
+                    // operations, and a refused site costs what the call did.
+                    let call = string_call.unwrap();
+                    own_facts.clear();
+                    saved_work += 6; // the call's operand traffic and its dispatch
+                    materialize(a, &stack, physical);
+                    physical = depth;
+                    stack.fill(Operand::Canonical);
+                    let local = call.index.local_slot().map(|slot| {
+                        if let Some(home) = plan.reg(slot) {
+                            string_calls::LocalSource::Number(home)
+                        } else if numeric_locals.contains(&slot) {
+                            match plan.tagged_reg(slot) {
+                                Some(home) => string_calls::LocalSource::Number(home),
+                                None => string_calls::LocalSource::NumberSlot(u32::from(slot) * 8),
+                            }
+                        } else {
+                            match plan.tagged_reg(slot) {
+                                Some(home) => string_calls::LocalSource::Word(home),
+                                None => string_calls::LocalSource::WordSlot(u32::from(slot) * 8),
+                            }
+                        }
+                    });
+                    let slow = a.new_label();
+                    let join = a.new_label();
+                    let result = 16 + depth as u32 - 1;
+                    string_calls::emit_region_step(
+                        a, chunk, ilayout, pc, &call, local, result, slow, join,
+                    );
+                    a.bind(slow);
+                    string_calls::emit_region_fill(a, chunk, ilayout, pc, &call);
+                    if let Some(slot) = call.index.local_slot() {
+                        plan.flush_local(a, slot);
+                    }
+                    for at in pc..=call.call_pc {
+                        emit_effect(
+                            a,
+                            chunk,
+                            layout,
+                            ilayout,
+                            at,
+                            fast,
+                            array_intrinsics_on,
+                            function_call_intrinsic_on,
+                            private_unwind,
+                            direct_finish,
+                        );
+                    }
+                    let resume = a.new_label();
+                    bails.push((
+                        resume,
+                        call.call_pc + 1,
+                        vec![Operand::Canonical; depth],
+                        depth,
+                        true,
+                    ));
+                    result_misses.push(resume);
+                    emit_exec_word_load(a, 9, 20, -8);
+                    emit_exec_number_guard(a, 9, result, 10, resume);
+                    a.bind(join);
+                    stack.pop();
+                    stack.push(Operand::temporary(ScalarKind::Number));
+                    consumed = call.call_pc - pc;
+                }
                 Op::InlineGuard(target, mismatch) => {
                     // GetValue/argument evaluation already happened. A failed guard resumes
                     // at the original call-alternative PC with those exact captured owners;

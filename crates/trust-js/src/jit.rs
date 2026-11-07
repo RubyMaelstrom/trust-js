@@ -9878,11 +9878,25 @@ fn emit_code_point_template(a: &mut asm::Asm, helper: usize, done: usize) {
         a,
         StringRead::CodePoint,
         -24,
-        16,
+        ReadResult::Stack { pop: 16 },
         helper,
         done,
         ReadCommit::CallTemplate,
     );
+}
+
+/// Where [`emit_string_read`] puts its result.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+enum ReadResult {
+    /// Over the receiver's slot, `pop` bytes popped above it.
+    Stack { pop: u32 },
+    /// A Number in the register (neither d0 nor d1); a code point past the end, undefined, is
+    /// no Number and branches to the read's `helper`.
+    Register(u32),
 }
 
 /// What [`emit_string_read`] answers for an index.
@@ -9938,10 +9952,10 @@ fn emit_read_commit_event(a: &mut asm::Asm, commit: ReadCommit) {
 /// string's storage, a flat one- or two-byte buffer or a view of one at its owner's width
 /// (`crate::lstr`). A unit is its own code point, but a two-byte leading surrogate followed,
 /// within the string, by a trailing one combines with it (UTF16SurrogatePairToCodePoint). An index
-/// at or past the length answers undefined for a code point and NaN for a unit. The result
-/// replaces the receiver, `pop` bytes are popped above it, and the code branches to `done`. A
-/// fractional, negative or NaN index branches to `helper` with nothing written. Clobbers x9, x11,
-/// x13, x14, x16, x17 and d1; preserves x10, x12 and x15.
+/// at or past the length answers undefined for a code point and NaN for a unit. The result goes
+/// where `result` says, and the code branches to `done`. A fractional, negative or NaN index
+/// branches to `helper` with nothing written. Clobbers x9, x11, x13, x14, x16, x17 and d1;
+/// preserves x10, x12 and x15.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -9950,7 +9964,7 @@ fn emit_string_read(
     a: &mut asm::Asm,
     read: StringRead,
     receiver: i32,
-    pop: u32,
+    result: ReadResult,
     helper: usize,
     done: usize,
     commit: ReadCommit,
@@ -10015,25 +10029,42 @@ fn emit_string_read(
         a.add_imm(17, 17, 0x10000);
     }
     a.bind(unit);
-    // ---- commit: the Number over the receiver slot (a code point or unit is never NaN) ----
-    a.ucvtf_d_w(0, 17);
-    a.stur_d(0, 20, receiver);
-    if pop != 0 {
-        a.sub_imm(20, 20, pop);
+    // ---- commit: the Number (a code point or unit is never NaN) ----
+    match result {
+        ReadResult::Stack { pop } => {
+            a.ucvtf_d_w(0, 17);
+            a.stur_d(0, 20, receiver);
+            if pop != 0 {
+                a.sub_imm(20, 20, pop);
+            }
+        }
+        ReadResult::Register(reg) => a.ucvtf_d_w(reg, 17),
     }
     emit_read_commit_event(a, commit);
     a.b(done);
     a.bind(undefined);
-    a.mov_imm64(
-        9,
-        match read {
-            StringRead::CodePoint => crate::value::PACK_UNDEFINED,
-            StringRead::CodeUnit => crate::value::PACK_CANON_NAN,
-        },
-    );
-    emit_exec_word_store(a, 9, 20, receiver);
-    if pop != 0 {
-        a.sub_imm(20, 20, pop);
+    match (result, read) {
+        (ReadResult::Stack { pop }, _) => {
+            a.mov_imm64(
+                9,
+                match read {
+                    StringRead::CodePoint => crate::value::PACK_UNDEFINED,
+                    StringRead::CodeUnit => crate::value::PACK_CANON_NAN,
+                },
+            );
+            emit_exec_word_store(a, 9, 20, receiver);
+            if pop != 0 {
+                a.sub_imm(20, 20, pop);
+            }
+        }
+        (ReadResult::Register(_), StringRead::CodePoint) => {
+            a.b(helper);
+            return;
+        }
+        (ReadResult::Register(reg), StringRead::CodeUnit) => {
+            a.mov_imm64(9, crate::value::PACK_CANON_NAN);
+            a.fmov_d_x(reg, 9);
+        }
     }
     emit_read_commit_event(a, commit);
     a.b(done);

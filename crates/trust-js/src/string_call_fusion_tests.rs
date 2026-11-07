@@ -349,3 +349,80 @@ fn receivers_other_than_primitive_strings_take_the_call() {
         }
     }
 }
+
+/// Step 3: in a register region (Djot's getEol and skipSpace loops, whose region the compiler
+/// keeps), the fused call reads its index from the loop's registers and leaves a Number for the
+/// comparisons after it. Every miss runs the region's unfused operations: a code point past the
+/// end, a String object, an index that is not a Number, a replaced method returning a Number
+/// (joining the fast path's Number) and one returning something else (resuming after the call).
+#[test]
+fn fused_calls_in_register_regions_answer_as_the_call_does() {
+    let source = r#"
+        function eol(t, e) {
+            for (; 10 !== (s = t.codePointAt(e)) && 13 !== s;) e++;
+            var s;
+            return e;
+        }
+        function skip(t, e) {
+            for (; 32 === (s = t.codePointAt(e)) || 9 === s;) e++;
+            var s;
+            return e;
+        }
+        function units(t, e) {
+            var n = 0;
+            for (; t.charCodeAt(e + 1) !== 10; e++) n = (n * 31 + t.charCodeAt(e)) | 0;
+            return n;
+        }
+        var line = 'abc def\tghié😀z\n', text = line.repeat(20);
+        var out = [];
+        for (var round = 0; round < 30; round++) {
+            out = [];
+            for (var at = 0; at < text.length; at += line.length) {
+                out.push(eol(text, at), skip(text, at + 3), units(text, at));
+            }
+        }
+        // Misses inside the warm loops: past the end (skip's), a String object, a String index.
+        out.push(eol('ab\n', 0), skip('  ', 0), eol(new String('a\nb'), 0), eol('ab\ncd', '1'));
+        out.join()
+    "#;
+    let mut answers = Vec::new();
+    for tier in TIERS {
+        let mut engine = engine(tier);
+        let (fused, answer) = fused_in(&mut engine, source);
+        if fuses(tier) {
+            assert!(fused >= 10_000, "{fused} fused calls");
+        }
+        answers.push(answer);
+    }
+    assert!(
+        answers.windows(2).all(|pair| pair[0] == pair[1]),
+        "{answers:#?}"
+    );
+    // After the regions compiled: a replaced method returning a Number joins the loop's Number,
+    // one returning a String resumes after the call, and the original fuses again only in a new
+    // Realm's sites (the method stays NotConstant here).
+    let after = r#"
+        var original = String.prototype.codePointAt;
+        String.prototype.codePointAt = function (i) { return original.call(this, i) === 100 ? 10 : 0; };
+        var replaced = [eol('abcdef', 0), skip('abc', 0)];
+        String.prototype.codePointAt = function (i) { return i < 2 ? 'x' : 10; };
+        var strings = [eol('abcdef', 0)];
+        String.prototype.codePointAt = original;
+        [replaced, strings, eol('abc\n', 0), skip('  x', 0)].join('|')
+    "#;
+    let mut answers = Vec::new();
+    for tier in TIERS {
+        let mut engine = engine(tier);
+        eval(&mut engine, source);
+        let (fused, answer) = fused_in(&mut engine, after);
+        if fuses(tier) {
+            assert_eq!(fused, 0, "the method stays NotConstant");
+        }
+        answers.push(answer);
+    }
+    assert!(
+        answers.windows(2).all(|pair| pair[0] == pair[1]),
+        "{answers:#?}"
+    );
+    assert_eq!(answers[0], "3,0|2|3|2");
+}
