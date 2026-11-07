@@ -7,7 +7,7 @@
 use super::{
     JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_CALL_SPREAD, H_COMPLETE, H_COND, H_EXEC,
     H_FRAME_SETUP, H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER,
-    H_PUSH_HANDLER, H_SET_PROP, H_SLICE_OP, H_UNWIND,
+    H_PUSH_HANDLER, H_SET_PROP, H_SLICE_OP, H_STRING_CALL_FILL, H_STRING_READ, H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -203,6 +203,23 @@ impl Asm {
     fn guard_execution_tag(&mut self, slow: usize) {
         self.cmp_eax((crate::value::PACK_LAZY_PROTO >> 48) as u32);
         self.jcc(0x83, slow);
+    }
+    /// Branch to `slow` unless the frame slot at `[r15 + disp]` holds a Number.
+    fn guard_number_r15(&mut self, disp: i32, slow: usize) {
+        self.load_tag_r15(disp);
+        self.number_tag_guard(slow);
+    }
+    /// Branch to `slow` unless eax, a word's tag, is a Number's (raw f64 bits: below the first
+    /// tag, or a negative value's below the high tags; the canonical NaN is a Number).
+    fn number_tag_guard(&mut self, slow: usize) {
+        let number = self.label();
+        self.cmp_eax(0x7ff9);
+        self.jcc(0x82, number);
+        self.cmp_eax(0x7fff);
+        self.jcc(0x86, slow);
+        self.cmp_eax(0xfff9);
+        self.jcc(0x83, slow);
+        self.bind(number);
     }
     fn guard_number_r13(&mut self, disp: i32, slow: usize) {
         self.load_tag_r13(disp);
@@ -852,6 +869,24 @@ pub(super) fn compile_entry(
     let ret_ok = a.label();
     let ret_throw = a.label();
     let mut interrupt_targets = vec![false; ops.len()];
+    // What a fused String method call (`string_calls`) may not span: branch targets and string
+    // accumulations' operations.
+    let mut fusion_targets = vec![false; ops.len() + 1];
+    for (pc, op) in ops.iter().enumerate() {
+        if let Op::Jump(target)
+        | Op::AbruptJump(target, _)
+        | Op::JumpIfFalse(target)
+        | Op::JumpIfFalsePeek(target)
+        | Op::JumpIfTruePeek(target)
+        | Op::JumpIfNotNullishPeek(target) = op
+        {
+            fusion_targets[*target as usize] = true;
+        }
+        if let Some(plan) = crate::bytecode::string_accumulation::Plan::at(chunk, pc) {
+            let end = plan.end.min(ops.len());
+            fusion_targets[pc..end].fill(true);
+        }
+    }
     for (pc, op) in ops.iter().enumerate() {
         match op {
             Op::Jump(target)
@@ -995,6 +1030,20 @@ pub(super) fn compile_entry(
             a.helper_end_poll(unwind); // the committed exit ends in the explicit poll
             a.jmp(pcs[plan.end]);
             a.bind(ordinary);
+        }
+        // A fused String method call: its step comes ahead of the GetMethod's helper, and any
+        // miss continues with the unfused operations from there.
+        if let Some(plan) = super::string_calls::Plan::at(chunk, ops, pc, &fusion_targets, u32::MAX)
+        {
+            emit_string_call(
+                &mut a,
+                chunk,
+                ilayout,
+                interp_offset,
+                pc,
+                &plan,
+                pcs[plan.call_pc + 1],
+            );
         }
         if names::emit_op(&mut a, chunk, layout, ilayout, op, pc as u32, unwind) {
             continue;
@@ -1481,6 +1530,124 @@ pub(super) fn compile_entry(
         executable,
         referenced: std::cell::Cell::new(0),
     })
+}
+
+/// A fused String method call's step at its `GetMethod` (Djot's gap, candidate 4, step 4; see
+/// `jit::string_calls`): the receiver at `[r13 - 8]` a primitive String, the site's fuse the
+/// active Realm's, the fuse's word or else the recorded generation and the method's NotConstant
+/// bit clear, and the index (a local holding a Number, a constant, or a local plus or minus an
+/// integer constant) pushed; then the read helper's answer replaces the receiver and the code
+/// continues at `after`, past the call. Any miss runs the unfused operations from the
+/// `GetMethod` with nothing changed; the fill, as ARM64's, is the slow path's call.
+fn emit_string_call(
+    a: &mut Asm,
+    chunk: &Chunk,
+    ilayout: &crate::interpreter::InterpLayout,
+    interp_offset: i32,
+    pc: usize,
+    plan: &super::string_calls::Plan,
+    after: usize,
+) {
+    use super::string_calls::Index;
+    use crate::object_fuse::{ObjectFuse, StringCallSite};
+    let unfused = a.label();
+    let fill = a.label();
+    let constant = a.label();
+    let read = a.label();
+    // A primitive String receiver.
+    a.load_tag_r13(-SLOT_BYTES);
+    a.cmp_eax((crate::value::PACK_STR >> 48) as u32);
+    a.jcc(NE, unfused);
+    // r8 = the site (the chunk's, which owns this code), r9 = its fuse, r10 = the active Realm's.
+    a.nr_imm(
+        R8,
+        chunk.jit_string_call_site(pc as u32, plan.intrinsic) as u64,
+    );
+    a.nr_load(R9, R8, StringCallSite::FUSE_OFF);
+    a.nr_mem(true, &[0x8b], R10, CTX, interp_offset);
+    a.nr_load(R10, R10, ilayout.string_proto_fuse);
+    a.nr_cmp(R9, R10);
+    a.jcc(NE, fill);
+    // The fuse's word: 0 while no Constant property was written or removed.
+    a.nr_load32(R11, R9, ObjectFuse::INVALIDATED_OFF);
+    a.nr_test(R11);
+    a.jcc(NE, constant);
+    a.bind(read);
+    // The index, pushed: a Number, which the read helper takes as it is.
+    match plan.index {
+        Index::Local(local) => {
+            a.guard_number_r15(local as i32, unfused);
+            a.load_word_r15(local as i32);
+            a.store_word_r13(0);
+        }
+        Index::Number(bits) => {
+            a.mov_word_imm(bits);
+            a.store_word_r13(0);
+        }
+        Index::Offset { local, bits, sub } => {
+            a.guard_number_r15(local as i32, unfused);
+            a.bytes(&[0xf2, 0x41, 0x0f, 0x10, 0x87]); // movsd xmm0, [r15+disp32]
+            a.bytes(&(local as i32).to_le_bytes());
+            a.mov_word_imm(bits);
+            a.bytes(&[0x66, 0x48, 0x0f, 0x6e, 0xc8]); // movq xmm1, rax
+            a.bytes(&[0xf2, 0x0f, if sub { 0x5c } else { 0x58 }, 0xc1]); // subsd/addsd xmm0, xmm1
+            a.bytes(&[0xf2, 0x41, 0x0f, 0x11, 0x85]); // movsd [r13+disp32], xmm0
+            a.bytes(&0i32.to_le_bytes());
+        }
+    }
+    a.add_sp(SLOT_BYTES as i8);
+    a.call_helper_pair(H_STRING_READ, u32::from(plan.intrinsic));
+    a.bytes(&[0x49, 0x89, 0xc5]); // r13 = rax (new sp)
+    a.jmp(after);
+    // Else the generation the site recorded, and the method's NotConstant bit clear. Another
+    // generation (a tracked property was removed) refills the site.
+    a.bind(constant);
+    a.nr_load32(R11, R9, ObjectFuse::GENERATION_OFF);
+    a.nr_mem(
+        false,
+        &[0x3b],
+        R11,
+        R8,
+        StringCallSite::GENERATION_OFF as i32,
+    ); // cmp r11d, [r8+]
+    a.jcc(NE, fill);
+    a.nr_load(R11, R9, ObjectFuse::WORDS_OFF);
+    a.nr_load32(AX, R8, StringCallSite::INDEX_OFF);
+    a.nr_shift(false, AX, 2);
+    a.nr_reg(0x01, R11, AX); // add r11, rax
+    a.nr_load32(R11, R11, 0);
+    a.nr_mem(false, &[0x23], R11, R8, StringCallSite::MASK_OFF as i32); // and r11d, [r8+]
+    a.jcc(EQ, read);
+    a.jmp(unfused);
+    // The fill: none while the Realm has no fuse, and none for a site refused in this Realm
+    // (its fuse's address | 1). This call runs unfused.
+    a.bind(fill);
+    a.nr_test(R10);
+    a.jcc(EQ, unfused);
+    a.nr_lea(AX, R9, -1);
+    a.nr_cmp(AX, R10);
+    a.jcc(EQ, unfused);
+    emit_fill_call(a);
+    a.bind(unfused);
+}
+
+/// `object_fuse::jit_string_call_fill(ctx, site)` with r8 = the site, through the helper table.
+#[cfg(not(target_os = "windows"))]
+fn emit_fill_call(a: &mut Asm) {
+    a.bytes(&[0x4c, 0x89, 0xe7]); // mov rdi, r12
+    a.bytes(&[0x4c, 0x89, 0xc6]); // mov rsi, r8
+    a.bytes(&[0x41, 0xff, 0x96]); // call [r14+disp32]
+    a.bytes(&((H_STRING_CALL_FILL * 8) as i32).to_le_bytes());
+}
+
+#[cfg(target_os = "windows")]
+fn emit_fill_call(a: &mut Asm) {
+    a.bytes(&[0x48, 0x83, 0xec, 0x20]); // Win64 shadow space
+    a.bytes(&[0x4c, 0x89, 0xe1]); // mov rcx, r12
+    a.bytes(&[0x4c, 0x89, 0xc2]); // mov rdx, r8
+    a.bytes(&[0x41, 0xff, 0x96]); // call [r14+disp32]
+    a.bytes(&((H_STRING_CALL_FILL * 8) as i32).to_le_bytes());
+    a.bytes(&[0x48, 0x83, 0xc4, 0x20]);
 }
 
 #[cfg(test)]

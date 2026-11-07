@@ -21,25 +21,7 @@
 //! String.prototype.codePointAt (spec.html:36270) and CodePointAt (:16721),
 //! String.prototype.charCodeAt (:36250).
 
-use super::*;
-use crate::bytecode::Op;
-use crate::object_fuse::{ObjectFuse, StringCallSite};
-
-#[cfg(test)]
-thread_local! {
-    /// Fused calls finished, for tests.
-    static FUSED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-pub(super) fn fused_calls() -> usize {
-    FUSED_CALLS.with(std::cell::Cell::get)
-}
-
-#[cfg(test)]
-pub(super) extern "C" fn record_fused_call() {
-    FUSED_CALLS.with(|count| count.set(count.get() + 1));
-}
+use crate::bytecode::{Chunk, Op};
 
 /// The index operand a fused call computes.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -133,229 +115,6 @@ impl Plan {
     }
 }
 
-/// d0 = the index, or a branch to `miss` when its local holds no Number. Clobbers x9, x16 and d1.
-fn emit_index(a: &mut asm::Asm, index: Index, miss: usize) {
-    match index {
-        Index::Local(local) => {
-            emit_exec_word_load(a, 9, 22, local as i32);
-            emit_exec_number_guard(a, 9, 0, 16, miss);
-        }
-        Index::Number(bits) => {
-            a.mov_imm64(9, bits);
-            a.fmov_d_x(0, 9);
-        }
-        Index::Offset { local, bits, sub } => {
-            emit_exec_word_load(a, 9, 22, local as i32);
-            emit_exec_number_guard(a, 9, 0, 16, miss);
-            a.mov_imm64(9, bits);
-            a.fmov_d_x(1, 9);
-            a.f_arith(u32::from(sub), 0, 0, 1);
-        }
-    }
-}
-
-/// The fused step at the `GetMethod` of `plan`, ahead of its unfused templates; `after` is the
-/// label past the call.
-pub(super) fn emit_site(
-    a: &mut asm::Asm,
-    chunk: &Chunk,
-    ilayout: &crate::interpreter::InterpLayout,
-    pc: usize,
-    plan: &Plan,
-    after: usize,
-) {
-    let unfused = a.new_label();
-    let site = chunk.jit_string_call_site(pc as u32, plan.intrinsic);
-    emit_index(a, plan.index, unfused);
-    // The site is the chunk's, which owns this code: its address may be embedded here.
-    a.mov_imm64(12, site as u64);
-    if use_shared_stub(a) {
-        let stub = a.shared_stub(
-            SharedStub::StringCall {
-                intrinsic: plan.intrinsic,
-            }
-            .key(),
-        );
-        a.bl_label(stub);
-        a.cbnz(9, false, unfused);
-        a.b(after);
-    } else {
-        emit_body(
-            a,
-            ilayout.string_proto_fuse,
-            plan.intrinsic,
-            false,
-            unfused,
-            after,
-        );
-    }
-    a.bind(unfused);
-}
-
-/// The shared stub of [`SharedStub::StringCall`]. Process-wide: it reads the site from x12 and
-/// the active Realm's fuse through ctx.interp, and embeds no address.
-pub(super) fn emit_stub(
-    a: &mut asm::Asm,
-    ilayout: Option<&crate::interpreter::InterpLayout>,
-    intrinsic: u8,
-) {
-    let miss = a.new_label();
-    let done = a.new_label();
-    match ilayout.filter(|ilayout| ilayout.valid) {
-        Some(ilayout) => emit_body(a, ilayout.string_proto_fuse, intrinsic, true, miss, done),
-        None => a.b(miss),
-    }
-    a.bind(done);
-    a.movz(9, 0, 0);
-    a.ret();
-    a.bind(miss);
-    a.movz(9, 1, 0);
-    a.ret();
-}
-
-/// The step's guards and read, the receiver at `[x20 - 8]`, x12 = the site and d0 = the index (a
-/// Number): the result replaces the receiver and the code branches to `done`, or it branches to
-/// `miss` with nothing written. `fuse_off` is `InterpLayout::string_proto_fuse`. The fill is a
-/// call: in a stub (`stub`), whose fast path keeps the site's return address in x30 alone, it
-/// keeps x30 in a frame around it. Clobbers x0..x17, x30 on the fill, d0 and d1.
-fn emit_body(
-    a: &mut asm::Asm,
-    fuse_off: usize,
-    intrinsic: u8,
-    stub: bool,
-    miss: usize,
-    done: usize,
-) {
-    let fill = a.new_label();
-    emit_guarded_read(
-        a,
-        fuse_off,
-        intrinsic,
-        ReadReceiver::Stack(-8),
-        ReadResult::Stack { pop: 0 },
-        fill,
-        miss,
-        done,
-    );
-    // The fill: none while the Realm has no fuse (its built-ins are being installed), and none
-    // for a site refused in this Realm (its fuse's address | 1). This call runs unfused.
-    a.bind(fill);
-    a.cbz(10, true, miss);
-    a.sub_imm(16, 13, 1);
-    a.cmp_reg_x(16, 10);
-    a.b_cond(C_EQ, miss);
-    if stub {
-        a.stp_pre(29, 30, -16);
-    }
-    a.mov(0, 19);
-    a.mov(1, 12);
-    a.ldr_imm(16, 21, (H_STRING_CALL_FILL * 8) as u32);
-    a.blr(16);
-    if stub {
-        a.ldp_post(29, 30, 16);
-    }
-    a.b(miss);
-}
-
-/// The step's guards, then its read into `result`, with `receiver`, x12 = the site and d0 = the
-/// index (a Number): a primitive String receiver, the site's fuse being the
-/// active Realm's, and the fuse's word or else the recorded generation and the method's
-/// NotConstant bit clear. A site naming another fuse or generation branches to `fill` (x13 = the
-/// site's fuse, x10 = the active Realm's); any other miss, to `miss`, with nothing written. The
-/// read branches to `done`. Clobbers x9..x11, x13, x14, x16, x17 and d1.
-#[allow(clippy::too_many_arguments)]
-fn emit_guarded_read(
-    a: &mut asm::Asm,
-    fuse_off: usize,
-    intrinsic: u8,
-    receiver: ReadReceiver,
-    result: ReadResult,
-    fill: usize,
-    miss: usize,
-    done: usize,
-) {
-    let constant = a.new_label();
-    let read = a.new_label();
-    // A primitive String receiver.
-    receiver.load(a, 9);
-    emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, miss);
-    // x13 = the site's fuse, x10 = the active Realm's.
-    a.ldr_imm(13, 12, StringCallSite::FUSE_OFF as u32);
-    a.ldr_imm(10, 19, 72); // ctx.interp
-    a.ldr_imm(10, 10, fuse_off as u32);
-    a.cmp_reg_x(13, 10);
-    a.b_cond(C_NE, fill);
-    // The fuse's word: 0 while no Constant property was written or removed.
-    a.ldr_w_imm(14, 13, ObjectFuse::INVALIDATED_OFF as u32);
-    a.cbnz(14, false, constant);
-    a.bind(read);
-    let kind = match intrinsic {
-        crate::bytecode::INTRINSIC_CODE_POINT_AT => StringRead::CodePoint,
-        crate::bytecode::INTRINSIC_CHAR_CODE_AT => StringRead::CodeUnit,
-        _ => unreachable!("a fused call's method has a read"),
-    };
-    emit_string_read(a, kind, receiver, result, miss, done, ReadCommit::Fused);
-    // Else the generation the site recorded, and the method's NotConstant bit clear. Another
-    // generation (a tracked property was removed) refills the site.
-    a.bind(constant);
-    a.ldr_w_imm(14, 13, ObjectFuse::GENERATION_OFF as u32);
-    a.ldr_w_imm(16, 12, StringCallSite::GENERATION_OFF as u32);
-    a.cmp_reg_w(14, 16);
-    a.b_cond(C_NE, fill);
-    a.ldr_imm(14, 13, ObjectFuse::WORDS_OFF as u32);
-    a.ldr_w_imm(16, 12, StringCallSite::INDEX_OFF as u32);
-    a.add_shifted(14, 14, 16, 2);
-    a.ldr_w_imm(14, 14, 0);
-    a.ldr_w_imm(16, 12, StringCallSite::MASK_OFF as u32);
-    a.logic_w(0, 14, 14, 16);
-    a.cbz(14, false, read);
-    a.b(miss);
-}
-
-/// Where a register region's fused call finds the local its index reads (step 3).
-#[derive(Clone, Copy, Debug)]
-pub(super) enum LocalSource {
-    /// A Number in d`reg` (a numeric home).
-    Number(u32),
-    /// A Number word in the frame slot at `[x22 + offset]` (one a store proved).
-    NumberSlot(u32),
-    /// A word in d`reg` (a tagged home), which must be a Number.
-    Word(u32),
-    /// A word in the frame slot at `[x22 + offset]`, which must be a Number.
-    WordSlot(u32),
-}
-
-/// d0 = the index of `index` in a register region, its local read from `local`, or a branch to
-/// `miss`. Clobbers x9, x16 and d1.
-fn emit_region_index(a: &mut asm::Asm, index: Index, local: Option<LocalSource>, miss: usize) {
-    let load = |a: &mut asm::Asm, local: Option<LocalSource>| match local {
-        Some(LocalSource::Number(reg)) => a.fmov_d_d(0, reg),
-        Some(LocalSource::NumberSlot(offset)) => a.ldr_d_imm(0, 22, offset),
-        Some(LocalSource::Word(reg)) => {
-            a.fmov_x_d(9, reg);
-            emit_exec_number_guard(a, 9, 0, 16, miss);
-        }
-        Some(LocalSource::WordSlot(offset)) => {
-            emit_exec_word_load(a, 9, 22, offset as i32);
-            emit_exec_number_guard(a, 9, 0, 16, miss);
-        }
-        None => unreachable!("a local index has its source"),
-    };
-    match index {
-        Index::Local(_) => load(a, local),
-        Index::Number(bits) => {
-            a.mov_imm64(9, bits);
-            a.fmov_d_x(0, 9);
-        }
-        Index::Offset { bits, sub, .. } => {
-            load(a, local);
-            a.mov_imm64(9, bits);
-            a.fmov_d_x(1, 9);
-            a.f_arith(u32::from(sub), 0, 0, 1);
-        }
-    }
-}
-
 impl Index {
     /// The frame slot the index reads, if any.
     pub(super) fn local_slot(self) -> Option<u16> {
@@ -366,76 +125,333 @@ impl Index {
     }
 }
 
-/// The fused step of `plan` in a register region (step 3), its receiver `receiver` (canonical at
-/// `[x20 - 8]`, or a word in a register) and its index local read from `local`: the code point or
-/// unit in d`result` (a Number), then a branch to `done`; any miss, a code point past the end (undefined) included,
-/// branches to `slow` with nothing written, where the region runs its unfused operations
-/// ([`emit_region_fill`] first). Clobbers x9..x17, d0 and d1; keeps the region's registers.
-pub(super) fn emit_region_step(
-    a: &mut asm::Asm,
-    chunk: &Chunk,
-    ilayout: &crate::interpreter::InterpLayout,
-    pc: usize,
-    plan: &Plan,
-    local: Option<LocalSource>,
-    receiver: ReadReceiver,
-    result: u32,
-    slow: usize,
-    done: usize,
-) {
-    emit_region_index(a, plan.index, local, slow);
-    a.mov_imm64(
-        12,
-        chunk.jit_string_call_site(pc as u32, plan.intrinsic) as u64,
-    );
-    emit_guarded_read(
-        a,
-        ilayout.string_proto_fuse,
-        plan.intrinsic,
-        receiver,
-        ReadResult::Register(result),
-        slow,
-        slow,
-        done,
-    );
-}
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(super) use arm64::*;
 
-/// The fill a region's fused call asks for on its slow path, before the unfused operations: as
-/// the templates' ([`emit_body`]), for a site naming another fuse or generation, but not one
-/// refused in this Realm, nor while the Realm has no fuse. The region's operands are canonical
-/// and its homes are callee-saved (d8..d15), so the call loses nothing. Clobbers x0..x17, x30
-/// and the caller-saved floating-point registers.
-pub(super) fn emit_region_fill(
-    a: &mut asm::Asm,
-    chunk: &Chunk,
-    ilayout: &crate::interpreter::InterpLayout,
-    pc: usize,
-    plan: &Plan,
-) {
-    let skip = a.new_label();
-    let fill = a.new_label();
-    a.mov_imm64(
-        12,
-        chunk.jit_string_call_site(pc as u32, plan.intrinsic) as u64,
-    );
-    a.ldr_imm(13, 12, StringCallSite::FUSE_OFF as u32);
-    a.ldr_imm(10, 19, 72); // ctx.interp
-    a.ldr_imm(10, 10, ilayout.string_proto_fuse as u32);
-    a.cbz(10, true, skip);
-    a.cmp_reg_x(13, 10);
-    a.b_cond(C_NE, fill);
-    // The site's fuse is the active Realm's: another generation asks for a fill too.
-    a.ldr_w_imm(14, 13, ObjectFuse::GENERATION_OFF as u32);
-    a.ldr_w_imm(16, 12, StringCallSite::GENERATION_OFF as u32);
-    a.cmp_reg_w(14, 16);
-    a.b_cond(C_EQ, skip);
-    a.bind(fill);
-    a.sub_imm(16, 13, 1);
-    a.cmp_reg_x(16, 10);
-    a.b_cond(C_EQ, skip);
-    a.mov(0, 19);
-    a.mov(1, 12);
-    a.ldr_imm(16, 21, (H_STRING_CALL_FILL * 8) as u32);
-    a.blr(16);
-    a.bind(skip);
+/// ARM64's emission of the fused step: the templates' (in line, or the shared stub) and the
+/// register regions'.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod arm64 {
+    use super::super::*;
+    use super::*;
+    use crate::object_fuse::{ObjectFuse, StringCallSite};
+
+    #[cfg(test)]
+    thread_local! {
+        /// Fused calls finished, for tests.
+        static FUSED_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fused_calls() -> usize {
+        FUSED_CALLS.with(std::cell::Cell::get)
+    }
+
+    #[cfg(test)]
+    pub(crate) extern "C" fn record_fused_call() {
+        FUSED_CALLS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// d0 = the index, or a branch to `miss` when its local holds no Number. Clobbers x9, x16 and d1.
+    fn emit_index(a: &mut asm::Asm, index: Index, miss: usize) {
+        match index {
+            Index::Local(local) => {
+                emit_exec_word_load(a, 9, 22, local as i32);
+                emit_exec_number_guard(a, 9, 0, 16, miss);
+            }
+            Index::Number(bits) => {
+                a.mov_imm64(9, bits);
+                a.fmov_d_x(0, 9);
+            }
+            Index::Offset { local, bits, sub } => {
+                emit_exec_word_load(a, 9, 22, local as i32);
+                emit_exec_number_guard(a, 9, 0, 16, miss);
+                a.mov_imm64(9, bits);
+                a.fmov_d_x(1, 9);
+                a.f_arith(u32::from(sub), 0, 0, 1);
+            }
+        }
+    }
+
+    /// The fused step at the `GetMethod` of `plan`, ahead of its unfused templates; `after` is the
+    /// label past the call.
+    pub(crate) fn emit_site(
+        a: &mut asm::Asm,
+        chunk: &Chunk,
+        ilayout: &crate::interpreter::InterpLayout,
+        pc: usize,
+        plan: &Plan,
+        after: usize,
+    ) {
+        let unfused = a.new_label();
+        let site = chunk.jit_string_call_site(pc as u32, plan.intrinsic);
+        emit_index(a, plan.index, unfused);
+        // The site is the chunk's, which owns this code: its address may be embedded here.
+        a.mov_imm64(12, site as u64);
+        if use_shared_stub(a) {
+            let stub = a.shared_stub(
+                SharedStub::StringCall {
+                    intrinsic: plan.intrinsic,
+                }
+                .key(),
+            );
+            a.bl_label(stub);
+            a.cbnz(9, false, unfused);
+            a.b(after);
+        } else {
+            emit_body(
+                a,
+                ilayout.string_proto_fuse,
+                plan.intrinsic,
+                false,
+                unfused,
+                after,
+            );
+        }
+        a.bind(unfused);
+    }
+
+    /// The shared stub of [`SharedStub::StringCall`]. Process-wide: it reads the site from x12 and
+    /// the active Realm's fuse through ctx.interp, and embeds no address.
+    pub(crate) fn emit_stub(
+        a: &mut asm::Asm,
+        ilayout: Option<&crate::interpreter::InterpLayout>,
+        intrinsic: u8,
+    ) {
+        let miss = a.new_label();
+        let done = a.new_label();
+        match ilayout.filter(|ilayout| ilayout.valid) {
+            Some(ilayout) => emit_body(a, ilayout.string_proto_fuse, intrinsic, true, miss, done),
+            None => a.b(miss),
+        }
+        a.bind(done);
+        a.movz(9, 0, 0);
+        a.ret();
+        a.bind(miss);
+        a.movz(9, 1, 0);
+        a.ret();
+    }
+
+    /// The step's guards and read, the receiver at `[x20 - 8]`, x12 = the site and d0 = the index (a
+    /// Number): the result replaces the receiver and the code branches to `done`, or it branches to
+    /// `miss` with nothing written. `fuse_off` is `InterpLayout::string_proto_fuse`. The fill is a
+    /// call: in a stub (`stub`), whose fast path keeps the site's return address in x30 alone, it
+    /// keeps x30 in a frame around it. Clobbers x0..x17, x30 on the fill, d0 and d1.
+    fn emit_body(
+        a: &mut asm::Asm,
+        fuse_off: usize,
+        intrinsic: u8,
+        stub: bool,
+        miss: usize,
+        done: usize,
+    ) {
+        let fill = a.new_label();
+        emit_guarded_read(
+            a,
+            fuse_off,
+            intrinsic,
+            ReadReceiver::Stack(-8),
+            ReadResult::Stack { pop: 0 },
+            fill,
+            miss,
+            done,
+        );
+        // The fill: none while the Realm has no fuse (its built-ins are being installed), and none
+        // for a site refused in this Realm (its fuse's address | 1). This call runs unfused.
+        a.bind(fill);
+        a.cbz(10, true, miss);
+        a.sub_imm(16, 13, 1);
+        a.cmp_reg_x(16, 10);
+        a.b_cond(C_EQ, miss);
+        if stub {
+            a.stp_pre(29, 30, -16);
+        }
+        a.mov(0, 19);
+        a.mov(1, 12);
+        a.ldr_imm(16, 21, (H_STRING_CALL_FILL * 8) as u32);
+        a.blr(16);
+        if stub {
+            a.ldp_post(29, 30, 16);
+        }
+        a.b(miss);
+    }
+
+    /// The step's guards, then its read into `result`, with `receiver`, x12 = the site and d0 = the
+    /// index (a Number): a primitive String receiver, the site's fuse being the
+    /// active Realm's, and the fuse's word or else the recorded generation and the method's
+    /// NotConstant bit clear. A site naming another fuse or generation branches to `fill` (x13 = the
+    /// site's fuse, x10 = the active Realm's); any other miss, to `miss`, with nothing written. The
+    /// read branches to `done`. Clobbers x9..x11, x13, x14, x16, x17 and d1.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_guarded_read(
+        a: &mut asm::Asm,
+        fuse_off: usize,
+        intrinsic: u8,
+        receiver: ReadReceiver,
+        result: ReadResult,
+        fill: usize,
+        miss: usize,
+        done: usize,
+    ) {
+        let constant = a.new_label();
+        let read = a.new_label();
+        // A primitive String receiver.
+        receiver.load(a, 9);
+        emit_exec_tag_guard(a, 9, crate::value::PACK_STR, 16, miss);
+        // x13 = the site's fuse, x10 = the active Realm's.
+        a.ldr_imm(13, 12, StringCallSite::FUSE_OFF as u32);
+        a.ldr_imm(10, 19, 72); // ctx.interp
+        a.ldr_imm(10, 10, fuse_off as u32);
+        a.cmp_reg_x(13, 10);
+        a.b_cond(C_NE, fill);
+        // The fuse's word: 0 while no Constant property was written or removed.
+        a.ldr_w_imm(14, 13, ObjectFuse::INVALIDATED_OFF as u32);
+        a.cbnz(14, false, constant);
+        a.bind(read);
+        let kind = match intrinsic {
+            crate::bytecode::INTRINSIC_CODE_POINT_AT => StringRead::CodePoint,
+            crate::bytecode::INTRINSIC_CHAR_CODE_AT => StringRead::CodeUnit,
+            _ => unreachable!("a fused call's method has a read"),
+        };
+        emit_string_read(a, kind, receiver, result, miss, done, ReadCommit::Fused);
+        // Else the generation the site recorded, and the method's NotConstant bit clear. Another
+        // generation (a tracked property was removed) refills the site.
+        a.bind(constant);
+        a.ldr_w_imm(14, 13, ObjectFuse::GENERATION_OFF as u32);
+        a.ldr_w_imm(16, 12, StringCallSite::GENERATION_OFF as u32);
+        a.cmp_reg_w(14, 16);
+        a.b_cond(C_NE, fill);
+        a.ldr_imm(14, 13, ObjectFuse::WORDS_OFF as u32);
+        a.ldr_w_imm(16, 12, StringCallSite::INDEX_OFF as u32);
+        a.add_shifted(14, 14, 16, 2);
+        a.ldr_w_imm(14, 14, 0);
+        a.ldr_w_imm(16, 12, StringCallSite::MASK_OFF as u32);
+        a.logic_w(0, 14, 14, 16);
+        a.cbz(14, false, read);
+        a.b(miss);
+    }
+
+    /// Where a register region's fused call finds the local its index reads (step 3).
+    #[derive(Clone, Copy, Debug)]
+    pub(crate) enum LocalSource {
+        /// A Number in d`reg` (a numeric home).
+        Number(u32),
+        /// A Number word in the frame slot at `[x22 + offset]` (one a store proved).
+        NumberSlot(u32),
+        /// A word in d`reg` (a tagged home), which must be a Number.
+        Word(u32),
+        /// A word in the frame slot at `[x22 + offset]`, which must be a Number.
+        WordSlot(u32),
+    }
+
+    /// d0 = the index of `index` in a register region, its local read from `local`, or a branch to
+    /// `miss`. Clobbers x9, x16 and d1.
+    fn emit_region_index(a: &mut asm::Asm, index: Index, local: Option<LocalSource>, miss: usize) {
+        let load = |a: &mut asm::Asm, local: Option<LocalSource>| match local {
+            Some(LocalSource::Number(reg)) => a.fmov_d_d(0, reg),
+            Some(LocalSource::NumberSlot(offset)) => a.ldr_d_imm(0, 22, offset),
+            Some(LocalSource::Word(reg)) => {
+                a.fmov_x_d(9, reg);
+                emit_exec_number_guard(a, 9, 0, 16, miss);
+            }
+            Some(LocalSource::WordSlot(offset)) => {
+                emit_exec_word_load(a, 9, 22, offset as i32);
+                emit_exec_number_guard(a, 9, 0, 16, miss);
+            }
+            None => unreachable!("a local index has its source"),
+        };
+        match index {
+            Index::Local(_) => load(a, local),
+            Index::Number(bits) => {
+                a.mov_imm64(9, bits);
+                a.fmov_d_x(0, 9);
+            }
+            Index::Offset { bits, sub, .. } => {
+                load(a, local);
+                a.mov_imm64(9, bits);
+                a.fmov_d_x(1, 9);
+                a.f_arith(u32::from(sub), 0, 0, 1);
+            }
+        }
+    }
+
+    /// The fused step of `plan` in a register region (step 3), its receiver `receiver` (canonical at
+    /// `[x20 - 8]`, or a word in a register) and its index local read from `local`: the code point or
+    /// unit in d`result` (a Number), then a branch to `done`; any miss, a code point past the end (undefined) included,
+    /// branches to `slow` with nothing written, where the region runs its unfused operations
+    /// ([`emit_region_fill`] first). Clobbers x9..x17, d0 and d1; keeps the region's registers.
+    pub(crate) fn emit_region_step(
+        a: &mut asm::Asm,
+        chunk: &Chunk,
+        ilayout: &crate::interpreter::InterpLayout,
+        pc: usize,
+        plan: &Plan,
+        local: Option<LocalSource>,
+        receiver: ReadReceiver,
+        result: u32,
+        slow: usize,
+        done: usize,
+    ) {
+        emit_region_index(a, plan.index, local, slow);
+        a.mov_imm64(
+            12,
+            chunk.jit_string_call_site(pc as u32, plan.intrinsic) as u64,
+        );
+        emit_guarded_read(
+            a,
+            ilayout.string_proto_fuse,
+            plan.intrinsic,
+            receiver,
+            ReadResult::Register(result),
+            slow,
+            slow,
+            done,
+        );
+    }
+
+    /// The fill a region's fused call asks for on its slow path, before the unfused operations: as
+    /// the templates' ([`emit_body`]), for a site naming another fuse or generation, but not one
+    /// refused in this Realm, nor while the Realm has no fuse. The region's operands are canonical
+    /// and its homes are callee-saved (d8..d15), so the call loses nothing. Clobbers x0..x17, x30
+    /// and the caller-saved floating-point registers.
+    pub(crate) fn emit_region_fill(
+        a: &mut asm::Asm,
+        chunk: &Chunk,
+        ilayout: &crate::interpreter::InterpLayout,
+        pc: usize,
+        plan: &Plan,
+    ) {
+        let skip = a.new_label();
+        let fill = a.new_label();
+        a.mov_imm64(
+            12,
+            chunk.jit_string_call_site(pc as u32, plan.intrinsic) as u64,
+        );
+        a.ldr_imm(13, 12, StringCallSite::FUSE_OFF as u32);
+        a.ldr_imm(10, 19, 72); // ctx.interp
+        a.ldr_imm(10, 10, ilayout.string_proto_fuse as u32);
+        a.cbz(10, true, skip);
+        a.cmp_reg_x(13, 10);
+        a.b_cond(C_NE, fill);
+        // The site's fuse is the active Realm's: another generation asks for a fill too.
+        a.ldr_w_imm(14, 13, ObjectFuse::GENERATION_OFF as u32);
+        a.ldr_w_imm(16, 12, StringCallSite::GENERATION_OFF as u32);
+        a.cmp_reg_w(14, 16);
+        a.b_cond(C_EQ, skip);
+        a.bind(fill);
+        a.sub_imm(16, 13, 1);
+        a.cmp_reg_x(16, 10);
+        a.b_cond(C_EQ, skip);
+        a.mov(0, 19);
+        a.mov(1, 12);
+        a.ldr_imm(16, 21, (H_STRING_CALL_FILL * 8) as u32);
+        a.blr(16);
+        a.bind(skip);
+    }
 }

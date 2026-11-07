@@ -388,13 +388,14 @@ pub(crate) fn test_tdz_effect_paths() -> [u64; 5] {
 mod operations;
 
 #[cfg(all(
-    target_arch = "aarch64",
+    any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[path = "jit_string_calls.rs"]
 mod string_calls;
 
-/// Fused String method calls finished on this thread (`string_calls`; 0 on other targets).
+/// Fused String method calls finished on this thread (`string_calls`: ARM64's steps, x86-64's
+/// reads).
 #[cfg(test)]
 pub(crate) fn test_fused_string_calls() -> usize {
     #[cfg(all(
@@ -409,7 +410,7 @@ pub(crate) fn test_fused_string_calls() -> usize {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     )))]
     {
-        0
+        crate::object_fuse::TEST_X64_FUSED_READS.with(std::cell::Cell::get)
     }
 }
 
@@ -2210,6 +2211,7 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::bytecode::jit_frame_setup as *const () as usize,
         crate::value::jit_grow_named_record as *const () as usize,
         crate::object_fuse::jit_string_call_fill as *const () as usize,
+        crate::object_fuse::jit_string_read as *const () as usize,
     ]
 }
 
@@ -2320,7 +2322,11 @@ pub const H_GROW_NAMED_RECORD: usize = 34;
 /// A fused String method call's fill (`string_calls`, `object_fuse::jit_string_call_fill`):
 /// `(ctx, site)` → 1 when the site now holds. It runs no author code and never throws.
 pub const H_STRING_CALL_FILL: usize = 35;
-pub const N_HELPERS: usize = 36;
+/// x86-64's read of a fused String method call (`object_fuse::jit_string_read`): `(ctx,
+/// intrinsic, sp)` → the operand top after it; it never throws and allocates nothing.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub const H_STRING_READ: usize = 36;
+pub const N_HELPERS: usize = 37;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2362,6 +2368,7 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "frame_setup",
     "grow_named_record",
     "string_call_fill",
+    "string_read",
 ];
 
 #[inline]

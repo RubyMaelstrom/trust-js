@@ -539,3 +539,54 @@ pub(crate) unsafe extern "C" fn jit_string_call_fill(
     let interp = unsafe { &*(*ctx).interp };
     u32::from(unsafe { &*site }.fill(interp))
 }
+
+#[cfg(test)]
+thread_local! {
+    /// Fused calls x86-64's read finished (`jit_string_read`), for tests.
+    pub(crate) static TEST_X64_FUSED_READS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// x86-64's read of a fused String method call (`jit::string_calls`, step 4): with the call's
+/// receiver and index on top of the operand stack, a primitive String and a Number that the
+/// step's guards proved, the method's answer replaces them, String.prototype.codePointAt's or
+/// charCodeAt's (`packed`, the call-cache class): ToIntegerOrInfinity of the Number, then the
+/// code point (undefined past the end) or unit (NaN past the end). It runs no author code,
+/// allocates nothing and cannot throw.
+///
+/// # Safety
+/// `ctx` is the running code's context and `sp` its operand top, with the two operands below it.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) unsafe extern "C" fn jit_string_read(
+    ctx: *mut crate::jit::JitCtx,
+    packed: u32,
+    sp: *mut crate::value::Value,
+) -> crate::jit::SpFlag {
+    use crate::value::{Value, ValueView};
+    let interp = unsafe { &mut *(*ctx).interp };
+    let base = unsafe { sp.sub(2) };
+    let (receiver, index) = unsafe { (*base, *base.add(1)) };
+    let (ValueView::Str(string), ValueView::Num(n)) = (receiver.view(), index.view()) else {
+        unreachable!("the fused step's receiver and index guards")
+    };
+    let position = if n.is_nan() { 0.0 } else { n.trunc() };
+    let at = (position >= 0.0 && position.is_finite()).then_some(position as usize);
+    let value = match packed as u8 {
+        crate::bytecode::INTRINSIC_CODE_POINT_AT => at
+            .and_then(|at| interp.code_point_at(&string, at))
+            .map_or(Value::Undefined, |point| Value::Num(f64::from(point))),
+        crate::bytecode::INTRINSIC_CHAR_CODE_AT => Value::Num(
+            at.and_then(|at| interp.unit_at(&string, at))
+                .map_or(f64::NAN, f64::from),
+        ),
+        _ => unreachable!("a fused call's method has a read"),
+    };
+    #[cfg(test)]
+    TEST_X64_FUSED_READS.with(|count| count.set(count.get() + 1));
+    // The operands' words own nothing (the collector traces the stack): the answer replaces
+    // them.
+    unsafe { base.write(value) };
+    crate::jit::SpFlag {
+        sp: unsafe { base.add(1) },
+        flag: 0,
+    }
+}

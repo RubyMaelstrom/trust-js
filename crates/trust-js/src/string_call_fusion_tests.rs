@@ -2,7 +2,8 @@
 //! ARM64 JIT finishes in one step answers as the call does, for every index form it reads and
 //! every kind of string, and every write to the method, its removal, another Realm's method and
 //! other receivers send the call back to the unfused templates. Each answer is checked in every
-//! tier; the counts of fused calls, on ARM64 only, show which calls the step finished.
+//! tier; the counts of fused calls (ARM64's steps, x86-64's reads) show which calls the step
+//! finished.
 use crate::bytecode::Tier;
 use crate::{Completion, Engine};
 
@@ -22,11 +23,11 @@ fn engine(tier: Tier) -> Engine {
 
 const TIERS: [Tier; 3] = [Tier::Interp, Tier::Bytecode, Tier::Jit];
 
-/// Whether this build fuses calls (the ARM64 JIT).
+/// Whether this build fuses calls (the ARM64 and x86-64 JITs).
 fn fuses(tier: Tier) -> bool {
     tier == Tier::Jit
         && cfg!(all(
-            target_arch = "aarch64",
+            any(target_arch = "aarch64", target_arch = "x86_64"),
             any(
                 target_os = "macos",
                 target_os = "linux",
