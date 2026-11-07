@@ -8067,12 +8067,19 @@ impl Interp {
     }
 
     /// Run the memory reducer's timer at `now` (`Engine::run_memory_reducer`): a collection can
-    /// start outside JS execution and GC suppression only. Returns whether it collected.
+    /// start outside JS execution and GC suppression only, and while no marking cycle runs: V8's
+    /// timer can start incremental marking only while marking is stopped
+    /// (src/heap/memory-reducer.cc:86-87, `IsStopped() && CanAndShouldBeStarted()`), and otherwise
+    /// waits its long delay again (Step's kWait on kTimer), as `gc_pacing::MemoryReducer::timer`
+    /// does when it cannot start. A running cycle stays the program's. Returns whether it
+    /// collected.
     #[cfg(not(target_arch = "wasm32"))]
     #[inline(always)]
     pub fn run_memory_reducer(&mut self, now: std::time::Instant) -> bool {
         let agent = &self.gc_heap.agent;
-        let can_start = agent.suppressed.get() == 0 && agent.execution_depth.get() == 0;
+        let can_start = agent.suppressed.get() == 0
+            && agent.execution_depth.get() == 0
+            && !self.incremental_marking_running();
         let start = self
             .gc_heap
             .core
@@ -8095,8 +8102,14 @@ impl Interp {
         start
     }
 
-    /// W6 step 4: start a marking cycle for the host, its memory reducer's, unless one runs
-    /// already. Whether one runs now.
+    /// Tests: start a marking cycle as the memory reducer's start does (none may be running).
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    pub(crate) fn test_start_cycle_for_host(&mut self) -> bool {
+        self.gc_start_cycle_for_host()
+    }
+
+    /// W6 step 4: start a marking cycle for the host, its memory reducer's (whose timer starts
+    /// none while one runs), unless one runs already. Whether one runs now.
     #[cfg(not(target_arch = "wasm32"))]
     fn gc_start_cycle_for_host(&mut self) -> bool {
         if self.incremental_marking_running() {

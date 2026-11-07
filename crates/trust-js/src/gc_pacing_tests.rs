@@ -170,6 +170,51 @@ fn the_memory_reducer_starts_a_cycle_that_idle_steps_finish() {
     );
 }
 
+/// V8's reducer waits while incremental marking runs (src/heap/memory-reducer.cc:86-87: its
+/// timer can start a GC only while marking is stopped): a timer that finds a cycle marking
+/// collects nothing, puts its collection off by its long delay, and leaves the cycle running, the
+/// program's; the cycle's final pause then rearms the reducer as any major collection does.
+#[test]
+fn a_reducer_timer_while_a_cycle_marks_waits() {
+    let mut engine = engine();
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_incremental(crate::gc_core::IncrementalMode::On);
+    eval(
+        &mut engine,
+        "globalThis.big = []; for (let i = 0; i < 200000; i++) big.push({ i, s: 'x' + i });",
+    );
+    engine.interp.collect_garbage_for_host();
+    let deadline = reducer_deadline(&engine).expect("the reducer waits");
+    eval(&mut engine, "big = null;");
+    assert!(engine.interp.test_start_cycle_for_host(), "a cycle marks");
+    let counts = engine.unstable_gc_collection_counts();
+    assert!(!engine.interp.run_memory_reducer(deadline), "no collection");
+    assert!(
+        engine.interp.incremental_marking_running(),
+        "the cycle runs on"
+    );
+    assert_eq!(engine.unstable_gc_collection_counts(), counts);
+    assert!(
+        matches!(
+            reducer(&engine),
+            MemoryReducer::Wait { started_gcs: 0, next_gc_start, .. }
+                if next_gc_start == deadline + LONG_DELAY
+        ),
+        "{:?}",
+        reducer(&engine)
+    );
+    // The cycle's final pause is a major collection: the reducer waits from there.
+    while engine.interp.advance_incremental_marking() {}
+    let (all, _) = engine.unstable_gc_collection_counts();
+    assert_eq!(all, counts.0 + 1, "the cycle's final pause");
+    let rearmed = reducer_deadline(&engine).expect("the reducer waits again");
+    assert!(rearmed >= Instant::now() + LONG_DELAY - Duration::from_secs(1));
+}
+
 #[test]
 fn possible_garbage_and_growth_past_bootstrap_start_the_reducer() {
     let mut engine = engine();
