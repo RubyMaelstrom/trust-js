@@ -21354,3 +21354,36 @@ verification (2,708 s before 0ac66a33); its rerun with a longer limit follows th
 - trust-js main: 04b65efb's code with this record (local; origin/main 9deaece0, unpushed since).
 - TRust main 8bd6b3f (local; origin/main 78435d0): the idle-time marking step, as its record says.
 - The session's binaries, outputs and caps log stay in target/p2/p2-exit/session.
+
+### P2's phase-end gate: the churn test under GC stress, rerun and compared (record, 2026-11-07)
+
+This closes the item the gate's and the exit's records leave open: agent_control_tests' churn test
+(agent_collections_finish_inside_child_and_grandchild_loops_all_tiers) under GC stress 1 outlasted
+its filter's hour on 04b65efb. It passes, and on main it takes 9.1% less time than before marking
+cycles ran under stress.
+
+- The rerun: alone on 04b65efb's test binary under TRUST_JS_GC_STRESS=1, heap verification on (the
+  unit tests' default), on an A725 core (CPU 4) at nice 19 with a 3-hour limit: 1 passed, 0 failed,
+  in 7,908 s (user CPU 7,905 s). Another core type, its caps unlogged: its time is not compared.
+- The comparison: the test on three revisions at once, each alone on an X925 core (CPUs 6, 7 and
+  8), the cores' caps logged each second (uncapped.sh), none capped:
+
+| revision | a stress collection while a cycle marks | time | against main |
+| --- | --- | ---: | ---: |
+| 3fff8b63 (34b3eefc's parent) | no cycles: incremental marking off by default | 4,538 s | 1.10x |
+| 447af048 (the gate's) | one of the cycle's slices | 2,701 s | 0.65x |
+| 04b65efb (main) | the cycle's final pause (0ac66a33) | 4,127 s | 1.00x |
+
+- Main takes 52.8% longer than the gate's revision (0ac66a33, with 0577859d's and 04b65efb's
+  precise test collections, which finish a running cycle first) and 9.1% less than 3fff8b63. The
+  slowest of scope_tests showed the same pattern (the gate's record: 705 s with the fix, 558 s
+  without, 789 s on 3fff8b63). 447af048's speed was the defect's: a stress collection during a
+  cycle was one of its slices and collected nothing. 447af048's earlier 2,708 s (CPU 9) agrees with
+  this run's 2,701 s; the A725 took 1.92x the X925's time (its caps unlogged).
+- The gate's 18 stress filters do not include agent_control_tests. A stress run of that filter
+  needs more than 4,127 s for this test alone, on an uncapped X925 core.
+
+STATE
+- The runs: target/p2/compact/c2/stress/cmp/ (agent-long.sh and agent-long.out; trio.sh, trio.txt
+  and trio/, with the caps log); the test binaries in target/p2/compact/c2/stress/deps.
+- trust-js main: this record on 5dec984c (local; origin/main 9deaece0, unpushed since).
