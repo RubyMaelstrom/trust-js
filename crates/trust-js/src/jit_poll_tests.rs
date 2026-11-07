@@ -863,3 +863,98 @@ fn a_cyclic_list_walk_stops_for_cancellation_and_deadlines() {
         );
     }
 }
+
+/// Natives the lean boundary ran so far on this thread (candidate 2's fork B2).
+#[cfg(target_arch = "aarch64")]
+fn lean_boundary_calls() -> usize {
+    crate::interpreter::TEST_LEAN_BOUNDARY_CALLS.with(std::cell::Cell::get)
+}
+
+/// Candidate 2's lean boundary (fork B2) makes no safepoint at a native's entry: a loop of an
+/// allocating native's calls (Object.keys makes an array each) collects at its back edge, with no
+/// helper-end polls compiled to collect after the calls. ARM64's: its call-hit stub enters the
+/// natives through the lean boundary, where x86-64's generic call helper keeps the whole one for
+/// its cached calls.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn an_allocating_natives_loop_collects_at_its_back_edge() {
+    const SOURCE: &str = r#"
+        var o = {a: 1, b: 2};
+        function keys(n) { var t = 0; for (var i = 0; i < n; i++) t += Object.keys(o).length; return t; }
+        keys(3);
+    "#;
+    without_end_polls(|| {
+        let mut engine = engine();
+        assert_eq!(eval(&mut engine, SOURCE), "6");
+        assert_eq!(eval(&mut engine, "keys(20)"), "40");
+        assert_native(&mut engine, &["keys"]);
+        stress(&engine.interp, 16);
+        let before = (collections(&engine.interp), lean_boundary_calls());
+        let (result, census) = measured(&mut engine, "keys(2000)");
+        stress(&engine.interp, 0);
+        assert_eq!(result, "4000");
+        assert!(
+            lean_boundary_calls() - before.1 >= 2000,
+            "Object.keys through the lean boundary"
+        );
+        assert!(
+            census.collections[LOOP] > 0,
+            "the back edge collects: {census:?}"
+        );
+        assert_eq!(census.calls[END], 0, "no helper-end polls: {census:?}");
+        assert!(collections(&engine.interp) > before.0);
+    });
+}
+
+/// `armDeadline()`: this engine's execution deadline, 20 ms ahead, armed from inside the loop it
+/// should stop (as tests.rs's `armDeadline`): armed before the evaluation, a slow or loaded machine
+/// could pass it before the loop made its first native call.
+#[cfg(target_arch = "aarch64")]
+fn arm_deadline(i: &mut Interp, _this: Value, _args: &[Value]) -> Result<Value, Value> {
+    i.runtime_interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(20),
+    ));
+    Ok(Value::Undefined)
+}
+
+/// Candidate 2's lean boundary (fork B2) polls no interrupt before a native: a deadline stops a
+/// loop of native calls at its back edge (or at the poll after a native that it ends during).
+/// ARM64's, as the collection test above. The loop arms the deadline after its first native calls.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn a_deadline_interrupts_a_loop_of_native_calls_at_its_back_edge() {
+    let mut engine = engine();
+    let global = engine.interp.global;
+    engine
+        .interp
+        .def_method(&global, "armDeadline", 0, arm_deadline);
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var o = {a: 1}, arm = false; \
+             function spin(n) { var t = 0; for (var i = 0; i !== n; i++) { t += Object.keys(o).length; if (arm && i === 2) armDeadline(); } return t; } \
+             spin(3)"
+        ),
+        "3"
+    );
+    assert_native(&mut engine, &["spin"]);
+    let before = lean_boundary_calls();
+    let started = std::time::Instant::now();
+    let result = engine
+        .eval_interruptible("arm = true; spin(-1)", false)
+        .expect("parse");
+    assert!(
+        matches!(
+            result,
+            crate::ExecutionOutcome::Interrupted {
+                reason: crate::InterruptReason::DeadlineExceeded
+            }
+        ),
+        "the loop ran past its deadline"
+    );
+    assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    assert!(
+        lean_boundary_calls() - before >= 3,
+        "Object.keys and armDeadline through the lean boundary before the deadline"
+    );
+}

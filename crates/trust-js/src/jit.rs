@@ -2213,6 +2213,9 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
         crate::object_fuse::jit_string_call_fill as *const () as usize,
         crate::object_fuse::jit_string_read as *const () as usize,
         crate::bytecode::jit_native_light as *const () as usize,
+        crate::bytecode::jit_native_boundary as *const () as usize,
+        crate::bytecode::jit_native_reflect as *const () as usize,
+        crate::bytecode::jit_native_light_construct as *const () as usize,
     ]
 }
 
@@ -2330,7 +2333,15 @@ pub const H_STRING_READ: usize = 36;
 /// A light native's fast entry from the call-hit form's shared stub (`bytecode::jit_native_light`;
 /// see [`emit_call_hit_stub`]).
 pub const H_NATIVE_LIGHT: usize = 37;
-pub const N_HELPERS: usize = 38;
+/// A native's fast entry through the lean boundary, from the same stub
+/// (`bytecode::jit_native_boundary`).
+pub const H_NATIVE_BOUNDARY: usize = 38;
+/// Reflect.get, has and set's fast entry, from the same stub (`bytecode::jit_native_reflect`).
+pub const H_NATIVE_REFLECT: usize = 39;
+/// A light native's fast entry for a class that holds constructors, which keeps a call's
+/// construct state, from the same stub (`bytecode::jit_native_light_construct`).
+pub const H_NATIVE_LIGHT_CONSTRUCT: usize = 40;
+pub const N_HELPERS: usize = 41;
 
 /// Stable diagnostic identities for the generated helper ABI. These labels are part of the
 /// profile vocabulary; they intentionally do not expose helper addresses or Rust symbol names.
@@ -2374,6 +2385,9 @@ pub(crate) const HELPER_NAMES: [&str; N_HELPERS] = [
     "string_call_fill",
     "string_read",
     "native_light",
+    "native_boundary",
+    "native_reflect",
+    "native_light_construct",
 ];
 
 #[inline]
@@ -10807,20 +10821,24 @@ fn call_hit_stub_supported(il: &crate::interpreter::InterpLayout, argc: usize) -
         && !env_flag!("TRUST_JS_JIT_NO_NATIVE_STUB")
 }
 
-/// The call-hit form's shared stub (candidate 2 (a), the light classes): entered at a call site's
-/// call-cache hit that the direct sequence declined, with x1 = the site's pc | way << 16, x12 = the
-/// hit way and x20 = the operand top. The way's stub kind (`bytecode::native_stub_kind`, chosen
-/// from the native's class when the way was filled) names a light class's operand test
+/// The call-hit form's shared stub (candidate 2 (a)): entered at a call site's call-cache hit that
+/// the direct sequence declined, with x1 = the site's pc | way << 16, x12 = the hit way and x20 =
+/// the operand top. The way's stub kind (`bytecode::native_stub_kind`, chosen from the native's
+/// class when the way was filled) names how the native runs. A light class's operand test
 /// (`bytecode::native_operands`, made here in line: none, every argument a Number, every argument
-/// a primitive, or the receiver and every argument primitives) and whether the class reads the
-/// construct state. A native whose operands pass, and for such a class on a caller that is not
-/// constructing (`constructing` clear, `new_target` Undefined), runs through its fast entry
-/// (`bytecode::jit_native_light`) without the call-hit helper's decode of the call, as
-/// SpiderMonkey's Baseline call IC calls a native from a stub (emitCallNativeShared,
-/// BaselineCacheIRCompiler.cpp:2946) and JSC's call link enters a host function's thunk
-/// (nativeForGenerator, ThunkGenerators.cpp:431). Anything else calls the call-hit helper, as the
-/// site did before. Either way the stub returns x20 = the new operand top and x1 = the flag
-/// (nonzero: threw). The native's errors record the call's position, which the site places two
+/// a primitive, or the receiver and every argument primitives) passed: the native runs on the
+/// caller's window (`bytecode::jit_native_light`; for a class that holds constructors and a
+/// constructing caller, `constructing` set or `new_target` not Undefined,
+/// `bytecode::jit_native_light_construct`, which keeps a call's construct state). Refused, and
+/// for every native that may run author code: through the lean boundary
+/// (`bytecode::jit_native_boundary`, fork B2). Reflect.get, has and set: answered on the operands
+/// or through the lean boundary (`bytecode::jit_native_reflect`). Each without the call-hit
+/// helper's decode of the call, as SpiderMonkey's Baseline call IC calls a native from a stub
+/// (emitCallNativeShared, BaselineCacheIRCompiler.cpp:2946) and JSC's call link enters a host
+/// function's thunk (nativeForGenerator, ThunkGenerators.cpp:431). A user callee, a scoped
+/// native, Reflect.apply and DataView's accessors call the call-hit helper, as the site did
+/// before. Either way the stub returns x20 = the new operand top and x1 = the flag (nonzero:
+/// threw). A native's errors record the call's position, which the site places two
 /// instructions past the return address (`DirectCallSite::AfterReturn`). Process-wide: the stub
 /// reads the way, the operands and the interpreter through ctx, with no heap or thread address.
 #[cfg(all(
@@ -10834,44 +10852,48 @@ fn emit_call_hit_stub(
     with_this: bool,
 ) {
     use crate::bytecode::{
-        CallIc, NATIVE_STUB_CONSTRUCT_STATE, NATIVE_STUB_LIGHT, NATIVE_STUB_TEST_NUMBERS,
-        NATIVE_STUB_TEST_PRIMITIVE_ARGS, NATIVE_STUB_TEST_PRIMITIVE_OPERANDS,
+        CallIc, NATIVE_STUB_BOUNDARY, NATIVE_STUB_CONSTRUCT_STATE, NATIVE_STUB_LIGHT,
+        NATIVE_STUB_REFLECT, NATIVE_STUB_TEST_NUMBERS, NATIVE_STUB_TEST_PRIMITIVE_ARGS,
+        NATIVE_STUB_TEST_PRIMITIVE_OPERANDS,
     };
     use std::mem::offset_of;
     debug_assert!(argc <= NATIVE_STUB_MAX_ARGC);
     const _: () = assert!(
         NATIVE_STUB_LIGHT == 1 << 7
+            && NATIVE_STUB_BOUNDARY == 1 << 6
+            && NATIVE_STUB_REFLECT == 1 << 5
             && NATIVE_STUB_CONSTRUCT_STATE == 1 << 2
             && NATIVE_STUB_TEST_NUMBERS == 1
             && NATIVE_STUB_TEST_PRIMITIVE_ARGS == 2
             && NATIVE_STUB_TEST_PRIMITIVE_OPERANDS == 3
     );
     let helper = a.new_label();
-    let numbers = a.new_label();
+    let boundary = a.new_label();
+    let not_light = a.new_label();
     let primitives = a.new_label();
     let primitive_args = a.new_label();
     let construct_state = a.new_label();
-    let call = a.new_label();
+    let enter = a.new_label();
     // w13 = the way's stub kind (`bytecode::native_stub_kind`), chosen when the way was filled:
-    // a user callee's and a boundary native's is zero. x1, the helper's argument, stays as the
-    // site set it until the native's call.
+    // a user callee's is zero. x1, the helper's argument, stays as the site set it until the
+    // native's call.
     a.ldrb_imm(13, 12, offset_of!(CallIc, native_stub) as u32);
-    a.tbz(13, 7, helper);
+    a.tbz(13, 7, not_light);
     a.tbnz(13, 1, primitives);
     a.tbz(13, 0, construct_state);
     // The arguments are at [x20 - 8 * argc, x20), the callee under them and a receiver under it.
+    // Operands the test refuses take the native through the lean boundary.
     let argument = |k: usize| -(8 * (argc - k) as i32);
     let primitive = |a: &mut asm::Asm| {
         // An Object's tag and the property-only ones above it are the largest words; every
         // primitive's (Numbers canonical) is below.
         a.mov_imm64(16, crate::value::PACK_OBJ);
         a.cmp_reg_x(9, 16);
-        a.b_cond(C_HS, helper);
+        a.b_cond(C_HS, boundary);
     };
-    a.bind(numbers);
     for k in 0..argc {
         emit_exec_word_load(a, 9, 20, argument(k));
-        emit_exec_number_guard(a, 9, 0, 16, helper);
+        emit_exec_number_guard(a, 9, 0, 16, boundary);
     }
     a.b(construct_state);
     a.bind(primitives);
@@ -10886,31 +10908,48 @@ fn emit_call_hit_stub(
         primitive(a);
     }
     // A class that holds constructors runs with a call's construct state, which an ordinary
-    // caller holds already; a constructing caller's is saved and cleared around it by the helper.
+    // caller holds already; a constructing caller enters through the entry that saves and clears
+    // it around the native.
     a.bind(construct_state);
-    a.tbz(13, 2, call);
+    let light = a.new_label();
+    let construct_entry = a.new_label();
+    a.tbz(13, 2, light);
     a.ldr_imm(14, 19, 72); // ctx.interp
     let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
     a.ldrb_imm(9, construct_base, construct_offset);
-    a.cbnz(9, false, helper);
+    a.cbnz(9, false, construct_entry);
     a.ldr_imm(9, 14, il.new_target as u32);
     a.mov_imm64(16, crate::value::PACK_UNDEFINED);
     a.cmp_reg_x(9, 16);
-    a.b_cond(C_NE, helper);
-    // The fast entry: (ctx, pc | way << 16, top, argc | receiver << 8 | position << 32, way).
-    a.bind(call);
+    a.b_cond(C_NE, construct_entry);
+    a.bind(light);
+    a.ldr_imm(16, 21, (H_NATIVE_LIGHT * 8) as u32);
+    // A fast entry, x16: (ctx, pc | way << 16, top, argc | receiver << 8 | position << 32, way).
+    a.bind(enter);
     a.ldr_w_imm(5, 30, 8);
     a.mov(0, 19);
     a.mov(2, 20);
     a.movz(3, (argc | usize::from(with_this) << 8) as u32, 0);
     a.add_shifted(3, 3, 5, 32);
     a.mov(4, 12);
-    a.ldr_imm(16, 21, (H_NATIVE_LIGHT * 8) as u32);
     a.stp_pre(29, 30, -16);
     a.blr(16);
     a.ldp_post(29, 30, 16);
     a.mov(20, 0);
     a.ret();
+    // A native that may run author code, or Reflect's three; anything else (a user callee, a
+    // scoped native, Reflect.apply, DataView's accessors) takes the helper.
+    a.bind(construct_entry);
+    a.ldr_imm(16, 21, (H_NATIVE_LIGHT_CONSTRUCT * 8) as u32);
+    a.b(enter);
+    a.bind(not_light);
+    a.tbnz(13, 6, boundary);
+    a.tbz(13, 5, helper);
+    a.ldr_imm(16, 21, (H_NATIVE_REFLECT * 8) as u32);
+    a.b(enter);
+    a.bind(boundary);
+    a.ldr_imm(16, 21, (H_NATIVE_BOUNDARY * 8) as u32);
+    a.b(enter);
     // The call-hit helper, as the site called it before (see `SharedStub::Helper`).
     a.bind(helper);
     a.mov(0, 19);

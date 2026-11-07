@@ -26567,6 +26567,19 @@ thread_local! {
     pub(crate) static TEST_NATIVE_STUB_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// Natives [`jit_native_boundary`] and [`jit_native_reflect`] ran, for tests.
+    pub(crate) static TEST_NATIVE_BOUNDARY_STUB_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Which fast entry the call-hit stub entered (see [`jit_native_light`]).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NativeStubEntry {
+    Light,
+    LightConstruct,
+    Boundary,
+    Reflect,
 }
 
 /// A native's fast entry from generated code (candidate 2 (a)): the call-hit form's shared stub
@@ -26591,31 +26604,101 @@ pub(crate) unsafe extern "C" fn jit_native_light(
     form: u64,
     way: *const CallIc,
 ) -> crate::jit::SpFlag {
-    // The diagnostics and a detailed profile leave the fast path, so that it keeps a small frame.
-    if unsafe {
-        (*ctx).opstat_enabled
-            || (*ctx).callstat_enabled
-            || (*(*ctx).chunk).feedback.detailed_enabled()
-    } {
-        return unsafe { jit_native_light_observed(ctx, pc, sp, form, way) };
-    }
-    unsafe { native_light_call(&mut *ctx, sp, form, way) }
+    unsafe { native_stub_entry(ctx, pc, sp, form, way, NativeStubEntry::Light) }
 }
 
-/// [`jit_native_light`] with its diagnostics (TRUST_JS_JIT_OPSTAT, CALLSTAT and NATIVESTAT
-/// count it as the call-hit helper counts a native entry), or, for a chunk whose detailed
-/// profile was turned on after its code was made, the call-hit helper itself.
+/// [`jit_native_light`] for a class that holds constructors called as functions
+/// ([`NATIVE_STUB_CONSTRUCT_STATE`]), whose natives read the construct state, on a constructing
+/// caller (the stub tests the construct state in line): it is saved and cleared around the
+/// native, as [`Interp::call_native_light`] does. Arguments as [`jit_native_light`]'s.
 ///
 /// # Safety
-/// As [`jit_native_light`].
-#[cold]
-#[inline(never)]
-unsafe fn jit_native_light_observed(
+/// As [`jit_native_light`], but for the caller's construct state.
+pub(crate) unsafe extern "C" fn jit_native_light_construct(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
     sp: *mut Value,
     form: u64,
     way: *const CallIc,
+) -> crate::jit::SpFlag {
+    unsafe { native_stub_entry(ctx, pc, sp, form, way, NativeStubEntry::LightConstruct) }
+}
+
+/// The fast entry of a native that may run author code (candidate 2 (a), step 2): every native
+/// of no light class but Reflect's and those the call-hit helper keeps (Reflect.apply's, DataView's
+/// accessors), and a light class's native whose operands or caller its stub test refused. It runs
+/// through the lean boundary ([`Interp::call_native_lean`], fork B2), without the call-hit
+/// helper's decode of the call. Arguments as [`jit_native_light`]'s.
+///
+/// # Safety
+/// As [`jit_call_hit`]; the way holds an engine native.
+pub(crate) unsafe extern "C" fn jit_native_boundary(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+    form: u64,
+    way: *const CallIc,
+) -> crate::jit::SpFlag {
+    unsafe { native_stub_entry(ctx, pc, sp, form, way, NativeStubEntry::Boundary) }
+}
+
+/// Reflect.get, has and set's fast entry: answered on the operands when the resolution runs no
+/// author code ([`Interp::reflect_resolved`], as the call-hit helper answers them), else through
+/// the lean boundary, as V8's ReflectGet and ReflectHas are Torque javascript builtins
+/// (src/builtins/reflect.tq) that Baseline code enters without a C++ boundary. Arguments as
+/// [`jit_native_light`]'s.
+///
+/// # Safety
+/// As [`jit_native_boundary`]; the way's class is one of Reflect's three.
+pub(crate) unsafe extern "C" fn jit_native_reflect(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+    form: u64,
+    way: *const CallIc,
+) -> crate::jit::SpFlag {
+    unsafe { native_stub_entry(ctx, pc, sp, form, way, NativeStubEntry::Reflect) }
+}
+
+/// The stub's fast entries: the diagnostics and a detailed profile leave the fast path, so that
+/// it keeps a small frame.
+///
+/// # Safety
+/// As the entries'.
+#[inline(always)]
+unsafe fn native_stub_entry(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+    form: u64,
+    way: *const CallIc,
+    entry: NativeStubEntry,
+) -> crate::jit::SpFlag {
+    if unsafe {
+        (*ctx).opstat_enabled
+            || (*ctx).callstat_enabled
+            || (*(*ctx).chunk).feedback.detailed_enabled()
+    } {
+        return unsafe { native_stub_observed(ctx, pc, sp, form, way, entry) };
+    }
+    unsafe { native_stub_call(&mut *ctx, sp, form, way, entry) }
+}
+
+/// A fast entry with its diagnostics (TRUST_JS_JIT_OPSTAT, CALLSTAT and NATIVESTAT count it as
+/// the call-hit helper counts a native entry), or, for a chunk whose detailed profile was turned
+/// on after its code was made, the call-hit helper itself.
+///
+/// # Safety
+/// As the entries'.
+#[cold]
+#[inline(never)]
+unsafe fn native_stub_observed(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+    form: u64,
+    way: *const CallIc,
+    entry: NativeStubEntry,
 ) -> crate::jit::SpFlag {
     if unsafe { (*(*ctx).chunk).feedback.detailed_enabled() } {
         return unsafe { jit_call_hit(ctx, pc, sp) };
@@ -26627,30 +26710,28 @@ unsafe fn jit_native_light_observed(
         let argc = (form & 0xff) as usize;
         unsafe { jit_callstat(i, ctx, &*way, argc, form & 0x100 != 0, sp) };
     }
-    unsafe { native_light_call(ctx, sp, form, way) }
+    unsafe { native_stub_call(ctx, sp, form, way, entry) }
 }
 
-/// [`jit_native_light`]'s call of the way's native on the caller's window.
+/// A fast entry's call of the way's native on the caller's window: on it directly (`Light`;
+/// `LightConstruct` with a call's construct state), through the lean boundary (`Boundary`), or
+/// Reflect's answer on the operands and the lean boundary otherwise (`Reflect`); then the
+/// operands' retirement and the result or the error.
 ///
 /// # Safety
-/// As [`jit_native_light`].
+/// As the entries'.
 #[inline(always)]
-unsafe fn native_light_call(
+unsafe fn native_stub_call(
     ctx: &mut crate::jit::JitCtx,
     sp: *mut Value,
     form: u64,
     way: *const CallIc,
+    entry: NativeStubEntry,
 ) -> crate::jit::SpFlag {
     let argc = (form & 0xff) as usize;
     let with_this = form & 0x100 != 0;
     let position = (form >> 32) as u32;
     let i = unsafe { &mut *ctx.interp };
-    note_call_path(CallPath::NativeStub);
-    #[cfg(test)]
-    {
-        TEST_NATIVE_STUB_CALLS.with(|count| count.set(count.get() + 1));
-        crate::interpreter::TEST_LIGHT_NATIVE_CALLS.with(|count| count.set(count.get() + 1));
-    }
     let args = unsafe { sp.sub(argc) };
     let undefined = Value::Undefined;
     let this_slot: *const Value = if with_this {
@@ -26659,14 +26740,65 @@ unsafe fn native_light_call(
         &raw const undefined
     };
     // SAFETY: the way's native word is the builtin's `NativeFn`, which the fill recorded from
-    // `ObjectKind::Native` (a scoped native's class is none, so the stub declined it).
-    let native: crate::value::NativeFn = unsafe { std::mem::transmute((*way).native as *const ()) };
-    // SAFETY: the window is initialized operand words that outlive the call.
-    let result = explicit_call(i, position, |i| unsafe {
-        crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
-            native(i, *this_slot, arguments)
-        })
-    });
+    // `ObjectKind::Native` (a scoped native's stub kind is the helper's).
+    let address = unsafe { (*way).native };
+    let native: crate::value::NativeFn = unsafe { std::mem::transmute(address as *const ()) };
+    let result = match entry {
+        NativeStubEntry::Light | NativeStubEntry::LightConstruct => {
+            note_call_path(CallPath::NativeStub);
+            #[cfg(test)]
+            {
+                TEST_NATIVE_STUB_CALLS.with(|count| count.set(count.get() + 1));
+                crate::interpreter::TEST_LIGHT_NATIVE_CALLS
+                    .with(|count| count.set(count.get() + 1));
+            }
+            // The native runs with a call's construct state: not constructing, new.target
+            // Undefined. An ordinary caller holds it already; a constructing caller's is saved,
+            // cleared and restored around the call.
+            let saved = (entry == NativeStubEntry::LightConstruct
+                && (i.constructing || !matches!(i.new_target.view(), ValueView::Undefined)))
+            .then(|| {
+                (
+                    std::mem::replace(&mut i.constructing, false),
+                    std::mem::replace(&mut i.new_target, Value::Undefined),
+                )
+            });
+            // SAFETY: the window is initialized operand words that outlive the call.
+            let result = explicit_call(i, position, |i| unsafe {
+                crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
+                    native(i, *this_slot, arguments)
+                })
+            })
+            .map_err(Abrupt::Throw);
+            if let Some((constructing, new_target)) = saved {
+                i.constructing = constructing;
+                i.new_target = new_target;
+            }
+            result
+        }
+        NativeStubEntry::Boundary => {
+            note_call_path(CallPath::NativeStubBoundary);
+            #[cfg(test)]
+            TEST_NATIVE_BOUNDARY_STUB_CALLS.with(|count| count.set(count.get() + 1));
+            // SAFETY: as above; the record's operands root the window through re-entry.
+            explicit_call(i, position, |i| unsafe {
+                i.call_native_lean(address, this_slot, args, argc, native)
+            })
+        }
+        NativeStubEntry::Reflect => {
+            note_call_path(CallPath::NativeStubReflect);
+            #[cfg(test)]
+            TEST_NATIVE_BOUNDARY_STUB_CALLS.with(|count| count.set(count.get() + 1));
+            let intrinsic = unsafe { (*way).intrinsic };
+            // SAFETY: as above.
+            explicit_call(i, position, |i| unsafe {
+                match i.reflect_resolved(intrinsic, args, argc) {
+                    Some(value) => Ok(value),
+                    None => i.call_native_lean(address, this_slot, args, argc, native),
+                }
+            })
+        }
+    };
     // The native's loans are finished; this owning caller retires the operand window.
     let mut sp = unsafe { args.sub(1) };
     if with_this {
@@ -26681,7 +26813,7 @@ unsafe fn native_light_call(
             }
         }
         Err(error) => {
-            ctx.error = Some(Abrupt::Throw(error));
+            ctx.error = Some(error);
             crate::jit::SpFlag { sp, flag: 1 }
         }
     }
@@ -26689,7 +26821,9 @@ unsafe fn native_light_call(
 
 /// [`jit_call_hit_inner`]'s native-entry arm: the emitted probe proved the callee is the
 /// way's bare native `native` (identity, epoch and realm). Loan the receiver/argument window
-/// through the complete boundary, then let this owning caller retire those operands.
+/// to the native, on it directly for a light class's operands and through the lean boundary
+/// otherwise (a scoped native through the whole one), then let this owning caller retire those
+/// operands.
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 unsafe fn jit_call_hit_native(
@@ -26763,8 +26897,9 @@ unsafe fn jit_call_hit_native(
                     r
                 }
                 None => {
+                    // The lean boundary (fork B2), as the stub's fast entry takes it.
                     note_call_path(CallPath::NativeBoundary);
-                    i.call_native_committed(nf, this_slot, args_ptr, argc)
+                    i.call_native_lean(native, this_slot, args_ptr, argc, nf)
                 }
             }
         }
@@ -26863,6 +26998,12 @@ pub(crate) unsafe fn native_operands(
 /// [`native_stub_kind`]'s bit for a native the stub runs on the caller's window (a light class);
 /// the low bits name the operand test (`NATIVE_STUB_TEST_*`).
 pub(crate) const NATIVE_STUB_LIGHT: u8 = 0x80;
+/// [`native_stub_kind`]'s kind for a native that may run author code: the stub enters it through
+/// the lean boundary ([`jit_native_boundary`]). A light kind whose test refuses the operands or
+/// the caller goes there too.
+pub(crate) const NATIVE_STUB_BOUNDARY: u8 = 0x40;
+/// [`native_stub_kind`]'s kind for Reflect.get, has and set ([`jit_native_reflect`]).
+pub(crate) const NATIVE_STUB_REFLECT: u8 = 0x20;
 /// [`native_stub_kind`]'s bit for a class that holds constructors called as functions, whose
 /// natives read the construct state: the stub runs them only for a caller that is not
 /// constructing.
@@ -26874,16 +27015,17 @@ pub(crate) const NATIVE_STUB_TEST_NUMBERS: u8 = 1;
 pub(crate) const NATIVE_STUB_TEST_PRIMITIVE_ARGS: u8 = 2;
 pub(crate) const NATIVE_STUB_TEST_PRIMITIVE_OPERANDS: u8 = 3;
 
-/// How the call-hit form's shared stub (`jit::emit_call_hit_stub`) runs a native entry of class
-/// `class`, which the way records when it is filled ([`CallIc::native_stub`]), as
-/// SpiderMonkey's call IC picks its native stub when it attaches: 0, through the call-hit
-/// helper (no light class; DataView's accessors and Reflect's natives, which the helper answers
-/// on their operands); else [`NATIVE_STUB_LIGHT`] with the class's operand test in the low bits
-/// and [`NATIVE_STUB_CONSTRUCT_STATE`] for the light class (Boolean) and the primitive-argument
-/// class (Number, String), which hold the constructors. The other classes' natives are no
-/// constructors and read no construct state (the call-hit helper runs the operand-only class's
-/// without clearing it, too). `stub_kinds_agree_with_native_operands` keeps this in step with
-/// [`native_operands`].
+/// How the call-hit form's shared stub (`jit::emit_call_hit_stub`) runs an engine native of
+/// class `class`, which the way records when it is filled ([`CallIc::native_stub`]), as
+/// SpiderMonkey's call IC picks its native stub when it attaches: [`NATIVE_STUB_LIGHT`] with the
+/// class's operand test in the low bits and [`NATIVE_STUB_CONSTRUCT_STATE`] for the light class
+/// (Boolean) and the primitive-argument class (Number, String), which hold the constructors (the
+/// other classes' natives are no constructors and read no construct state; the call-hit helper
+/// runs the operand-only class's without clearing it, too); [`NATIVE_STUB_REFLECT`] for
+/// Reflect.get, has and set; 0, through the call-hit helper, for Reflect.apply (its operand-only
+/// path) and DataView's accessors (light for some operands); [`NATIVE_STUB_BOUNDARY`] for every
+/// other native. A user callee's and a scoped native's kind is 0.
+/// `stub_kinds_agree_with_native_operands` keeps this in step with [`native_operands`].
 pub(crate) const fn native_stub_kind(class: u8) -> u8 {
     let test = match class {
         INTRINSIC_OPERAND_ONLY
@@ -26901,7 +27043,9 @@ pub(crate) const fn native_stub_kind(class: u8) -> u8 {
         | INTRINSIC_CHAR_CODE_AT
         | INTRINSIC_CODE_POINT_AT
         | INTRINSIC_STRING_SLICE => NATIVE_STUB_TEST_PRIMITIVE_OPERANDS,
-        _ => return 0,
+        INTRINSIC_REFLECT_GET..=INTRINSIC_REFLECT_SET => return NATIVE_STUB_REFLECT,
+        INTRINSIC_REFLECT_APPLY | INTRINSIC_DATAVIEW_GET | INTRINSIC_DATAVIEW_SET => return 0,
+        _ => return NATIVE_STUB_BOUNDARY,
     };
     let construct_state = match class {
         INTRINSIC_LIGHT | INTRINSIC_LIGHT_PRIMITIVE_ARGS => NATIVE_STUB_CONSTRUCT_STATE,
@@ -28760,7 +28904,7 @@ unsafe fn jit_call_inner(
                             // lookup (W3's item 7). A scoped native has another signature: no
                             // class.
                             let class = engine_native.map_or(0, |_| class);
-                            let native_stub = native_stub_kind(class);
+                            let native_stub = engine_native.map_or(0, |_| native_stub_kind(class));
                             // A light class whose natives the stub runs without clearing the
                             // construct state holds no constructor (see `native_stub_kind`).
                             debug_assert!(
@@ -28806,9 +28950,9 @@ unsafe fn jit_call_inner(
                     } else {
                         &raw mut *undef2 as *const Value
                     };
-                    let r = i.call_native_address_committed(
-                        native, signature, this_slot2, args_ptr, argc,
-                    );
+                    // Generated code's native call: the lean boundary (fork B2).
+                    let r =
+                        i.call_native_address_lean(native, signature, this_slot2, args_ptr, argc);
                     // All argument/receiver loans ended; retire this caller's operand window.
                     *sp = args_ptr.sub(1);
                     if with_this {
@@ -29124,9 +29268,13 @@ pub(crate) enum CallPath {
     Superseded,
     /// A light native through the native-call stub's fast entry (`jit_native_light`).
     NativeStub,
+    /// A native through the native-call stub and the lean boundary (`jit_native_boundary`).
+    NativeStubBoundary,
+    /// Reflect.get, has or set through the native-call stub (`jit_native_reflect`).
+    NativeStubReflect,
 }
 
-const CALL_PATH_NAMES: [&str; 10] = [
+const CALL_PATH_NAMES: [&str; 12] = [
     "direct sequence",
     "call-hit helper, user callee",
     "call-hit helper, native without the boundary",
@@ -29137,11 +29285,13 @@ const CALL_PATH_NAMES: [&str; 10] = [
     "Interp::call",
     "call-hit helper, superseded chunk, generic call",
     "native-call stub, light native",
+    "native-call stub, native through the lean boundary",
+    "native-call stub, Reflect's",
 ];
 
 /// The [`CallPath`] counts, global so that generated code can count the direct sequence.
-pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 10] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 10];
+pub(crate) static CALL_PATHS: [std::sync::atomic::AtomicU64; 12] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 12];
 
 /// Whether `TRUST_JS_JIT_CALLSTAT=2` counts call paths. Only builds with the
 /// `architecture-diagnostics` feature count them: elsewhere this is a constant false, and the

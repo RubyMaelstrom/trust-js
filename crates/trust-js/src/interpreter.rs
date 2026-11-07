@@ -1405,6 +1405,10 @@ thread_local! {
     pub(crate) static TEST_COMPILED_TARGET_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// Natives [`Interp::call_native_lean`] ran (candidate 2's fork B2), for tests.
+    pub(crate) static TEST_LEAN_BOUNDARY_CALLS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
 }
 
 impl Interp {
@@ -16357,6 +16361,94 @@ impl Interp {
                 result
             })
         }
+    }
+
+    /// The lean native-call boundary (candidate 2 (a), fork B2), for natives that the JIT's
+    /// call-hit stub and its call helpers enter: what re-entry needs and no more. It keeps the
+    /// depth and its stack checkpoint (nested calls count, and a deep recursion through natives
+    /// reports its RangeError), the construct state, the Agent restore (`with_host_callback`), the
+    /// pending tail a native leaves, and the interrupt poll after the native: a `NativeFn` returns
+    /// a Value, so an interruption inside it (a callback's, a nested evaluation's, a blocking wait
+    /// that a cancellation woke) leaves it as its result or a catchable throw, which the poll turns
+    /// back into the interruption (V8's, SpiderMonkey's and JSC's natives carry a termination out
+    /// themselves). Unlike [`Interp::call_native_committed_with`] it does not poll before the
+    /// native or make a safepoint at its entry: generated code polls at function entries and loop
+    /// back edges and makes a safepoint after every call (`jit::emit_helper_end_poll`), as V8,
+    /// SpiderMonkey and JSC poll in JavaScript code only. The caller places `call_site`.
+    ///
+    /// # Safety
+    /// As [`Interp::call_native_committed_with`].
+    pub(crate) unsafe fn call_native_lean(
+        &mut self,
+        address: usize,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+        invoke: impl FnOnce(&mut Self, Value, &[Value]) -> Result<Value, Value>,
+    ) -> Result<Value, Abrupt> {
+        #[cfg(test)]
+        TEST_LEAN_BOUNDARY_CALLS.with(|count| count.set(count.get() + 1));
+        // SAFETY: as `call_native_committed_with`'s.
+        unsafe {
+            crate::execution_storage::with_borrowed_values(args, argc, |arguments| {
+                self.depth += 1;
+                if execution_stack_exhausted(self.depth) {
+                    self.depth -= 1;
+                    return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+                }
+                let saved_ctor = std::mem::replace(&mut self.constructing, false);
+                let saved_nt = std::mem::replace(&mut self.new_target, Value::Undefined);
+                let native_result = with_execution_stack(self.depth, || {
+                    let perf_started = crate::jit::perf_stage_start();
+                    let result =
+                        self.with_host_callback(|interp| invoke(interp, *this_slot, arguments));
+                    crate::jit::perf_native_end(
+                        perf_started,
+                        result.is_ok(),
+                        crate::jit::NativeLabelSrc::Addr(address),
+                    );
+                    result
+                });
+                let mut result = match self.interrupt_poll_force() {
+                    Ok(()) => native_result.map_err(Abrupt::Throw),
+                    Err(interrupt) => Err(interrupt),
+                };
+                self.constructing = saved_ctor;
+                self.new_target = saved_nt;
+                while result.is_ok() {
+                    match self.run_pending_tail(true) {
+                        Some(next) => result = next,
+                        None => break,
+                    }
+                }
+                self.depth -= 1;
+                result
+            })
+        }
+    }
+
+    /// [`Interp::call_native_address_committed`] for the JIT's generic call helper: an engine
+    /// native through the lean boundary ([`Interp::call_native_lean`]); a scoped native keeps the
+    /// whole one.
+    ///
+    /// # Safety
+    /// As [`Interp::call_native_address_committed`].
+    pub(crate) unsafe fn call_native_address_lean(
+        &mut self,
+        native: usize,
+        signature: u8,
+        this_slot: *const Value,
+        args: *const Value,
+        argc: usize,
+    ) -> Result<Value, Abrupt> {
+        if signature & crate::bytecode::CALL_IC_SCOPED_NATIVE != 0 {
+            return unsafe {
+                self.call_native_address_committed(native, signature, this_slot, args, argc)
+            };
+        }
+        // SAFETY: without the scoped bit the address is an engine NativeFn.
+        let function: crate::value::NativeFn = unsafe { std::mem::transmute(native as *const ()) };
+        unsafe { self.call_native_lean(native, this_slot, args, argc, function) }
     }
 
     /// [`Interp::call_jit_cached`]'s committed tail, split out so the asm call thunk can enter

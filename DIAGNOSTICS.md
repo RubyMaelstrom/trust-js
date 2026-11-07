@@ -123,9 +123,12 @@ comment/example in the same change.
   cache or a call site's targets, seeded from the stage that ran, show its operations ran (a span
   with neither keeps its region).
 - `TRUST_JS_JIT_NO_NATIVE_STUB=1` keeps a call site's call-hit form on the call-hit helper. By
-  default (ARM64, shared stubs on, at most eight arguments) the form calls a shared stub that runs
-  a native of a light class on light operands (`bytecode::native_operands`) through its fast
-  entry, `bytecode::jit_native_light`, without the helper's decode of the call.
+  default (ARM64, shared stubs on, at most eight arguments) the form calls a shared stub that
+  enters a native without the helper's decode of the call: one of a light class on light operands
+  (`bytecode::native_operands`) on the caller's window (`bytecode::jit_native_light`), Reflect.get,
+  has and set answered on their operands (`bytecode::jit_native_reflect`), and any other engine
+  native through the lean native-call boundary (`bytecode::jit_native_boundary`), which polls no
+  interrupt and makes no safepoint around the native (generated code's polls do).
 - `TRUST_JS_JIT_PUBLISH_EPOCH=1` moves the call caches' process-wide epoch at each new code a
   function gets (an inline recompile, a recompile without property chains), so that every call
   site re-resolves, as before per-callee pickup. By default the new code supersedes the chunk it
