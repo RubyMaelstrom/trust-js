@@ -1,14 +1,15 @@
-//! Fused String method calls (Djot's gap, candidate 4, step 2): `str.codePointAt(i)`, its
-//! `GetMethod`, its index and its `CallWithThis(1)`, as one step while the active Realm's
-//! String.prototype still holds the native the call names (the design note's fork 2, decided:
-//! SpiderMonkey's Baseline attaches such a stub at the call for a primitive receiver, and JSC's
-//! thunk and V8's optimizing tiers choose at the call too). The guard is String.prototype's fuse
-//! (`crate::object_fuse`, SpiderMonkey's GuardObjectFuseProperty): a primitive String receiver,
-//! the site's fuse being the active Realm's, the fuse's word or else the method's own state, and
-//! a Number index. Any miss runs the unfused templates from the `GetMethod`, which nothing the
-//! step did has changed: the index operations it reads ahead (a local, a Number constant, a
-//! local plus or minus a Number constant) run no author code and cannot throw while the local
-//! holds a Number, and the step reads the local only to test that.
+//! Fused String method calls (Djot's gap, candidate 4, step 2): `str.codePointAt(i)` and
+//! `str.charCodeAt(i)`, the `GetMethod`, its index and its `CallWithThis(1)`, as one step while
+//! the active Realm's String.prototype still holds the native the call names (the design note's
+//! fork 2, decided: SpiderMonkey's Baseline attaches such a stub at the call for a primitive
+//! receiver, and JSC's thunk and V8's optimizing tiers choose at the call too). The guard is
+//! String.prototype's fuse (`crate::object_fuse`, SpiderMonkey's GuardObjectFuseProperty): a
+//! primitive String receiver, the site's fuse being the active Realm's, the fuse's word or else the
+//! method's own state, and a Number index. Any miss runs the unfused templates from the
+//! `GetMethod`, which nothing the step did has changed: the index operations it reads ahead (a
+//! local, an exact unsigned Number constant, a local plus or minus an integer constant) run no
+//! author code and cannot throw while the local holds a Number, and the step reads the local only
+//! to test that.
 //!
 //! The step is chosen where the call's cache holds the native, or holds nothing (the VM fills
 //! no native entry, and a fused call fills none). In a loop the step is in line; elsewhere the
@@ -17,7 +18,8 @@
 //!
 //! ECMA-262 e28783d5: EvaluateCall's GetValue of the member reference (a primitive String base's
 //! lookup starts at its prototype: a String's own properties are its indices and `length`),
-//! String.prototype.codePointAt (spec.html:36270) and CodePointAt (:16721).
+//! String.prototype.codePointAt (spec.html:36270) and CodePointAt (:16721),
+//! String.prototype.charCodeAt (:36250).
 
 use super::*;
 use crate::bytecode::Op;
@@ -79,6 +81,7 @@ impl Plan {
         }
         let intrinsic = match chunk.jit_name(name) {
             "codePointAt" => crate::bytecode::INTRINSIC_CODE_POINT_AT,
+            "charCodeAt" => crate::bytecode::INTRINSIC_CHAR_CODE_AT,
             _ => return None,
         };
         let local = |slot: u16| {
@@ -239,12 +242,12 @@ fn emit_body(
     a.ldr_w_imm(14, 13, ObjectFuse::INVALIDATED_OFF as u32);
     a.cbnz(14, false, constant);
     a.bind(read);
-    match intrinsic {
-        crate::bytecode::INTRINSIC_CODE_POINT_AT => {
-            emit_code_point_read(a, -8, 0, miss, done, ReadCommit::Fused)
-        }
+    let kind = match intrinsic {
+        crate::bytecode::INTRINSIC_CODE_POINT_AT => StringRead::CodePoint,
+        crate::bytecode::INTRINSIC_CHAR_CODE_AT => StringRead::CodeUnit,
         _ => unreachable!("a fused call's method has a read"),
-    }
+    };
+    emit_string_read(a, kind, -8, 0, miss, done, ReadCommit::Fused);
     // Else the generation the site recorded, and the method's NotConstant bit clear. Another
     // generation (a tracked property was removed) refills the site.
     a.bind(constant);

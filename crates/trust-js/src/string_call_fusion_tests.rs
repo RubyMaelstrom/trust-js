@@ -100,6 +100,69 @@ fn fused_code_point_calls_answer_every_index_form_as_the_call_does() {
     assert!(answers[0].starts_with("97,98,"), "{}", answers[0]);
 }
 
+/// charCodeAt's fused calls: its unit, NaN past the end, and no pair combined, for every index
+/// form; a write to it sends its calls back to the call and leaves codePointAt's fused.
+#[test]
+fn fused_char_code_at_calls_answer_as_the_call_does() {
+    let source = r#"
+        function local(s, i) { return s.charCodeAt(i); }
+        function constant(s) { return s.charCodeAt(1); }
+        function plus(s, i) { return s.charCodeAt(i + 1); }
+        function minus(s, i) { return s.charCodeAt(i - 1); }
+        function scan(s) {
+            var t = 0;
+            for (var i = -1; i < s.length + 2; i++) {
+                try {
+                    var c = s.charCodeAt(i);
+                    t = (t * 31 + (c !== c ? 7 : c)) | 0;
+                } catch (e) {
+                    t = -1;
+                }
+            }
+            return t;
+        }
+        var one = 'abc', two = 'A\uD83D\uDE00\uD800z\uDC00\u00e9';
+        var view = ('x'.repeat(40) + two + 'tail').slice(40, 40 + two.length);
+        var indices = [0, 1, 2, 3, 6, 7, 8, -1, 1.5, -0, NaN, 2 ** 32, '1', null];
+        var out;
+        for (var round = 0; round < 3; round++) {
+            out = [];
+            for (var s of [one, two, view]) {
+                for (var i of indices) out.push(local(s, i), plus(s, i), minus(s, i));
+                out.push(constant(s), scan(s));
+            }
+        }
+        out.join()
+    "#;
+    let mut answers = Vec::new();
+    for tier in TIERS {
+        let mut engine = engine(tier);
+        let (fused, answer) = fused_in(&mut engine, source);
+        if fuses(tier) {
+            assert!(fused >= 200, "{fused} fused calls");
+        }
+        answers.push(answer);
+    }
+    assert!(
+        answers.windows(2).all(|pair| pair[0] == pair[1]),
+        "{answers:#?}"
+    );
+    assert!(answers[0].starts_with("97,98,NaN,"), "{}", answers[0]);
+    for tier in TIERS {
+        let mut engine = engine(tier);
+        let warm = "function unit(s, i) { return s.charCodeAt(i); } \
+                    function point(s, i) { return s.codePointAt(i); } \
+                    for (var w = 0; w < 60; w++) { unit('ab', 1); point('ab', 1); } \
+                    String.prototype.charCodeAt = function (i) { return 'u' + i; };";
+        eval(&mut engine, warm);
+        let (fused, answer) = fused_in(&mut engine, "unit('ab', 1) + ',' + point('ab', 1)");
+        assert_eq!(answer, "u1,98", "{tier:?}");
+        if fuses(tier) {
+            assert_eq!(fused, 1, "{tier:?}: codePointAt's call stays fused");
+        }
+    }
+}
+
 /// A call outside a loop (`cp`, the shared stub's) and two in one (`scan`, in line: the region
 /// compiler keeps a loop with a `try` whole), warmed; `both` answers for the three.
 const WARM: &str = r#"

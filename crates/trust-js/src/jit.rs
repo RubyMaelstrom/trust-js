@@ -9874,7 +9874,28 @@ fn emit_object_is_template(a: &mut asm::Asm, hit_slow: usize, done: usize) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_code_point_template(a: &mut asm::Asm, helper: usize, done: usize) {
-    emit_code_point_read(a, -24, 16, helper, done, ReadCommit::CallTemplate);
+    emit_string_read(
+        a,
+        StringRead::CodePoint,
+        -24,
+        16,
+        helper,
+        done,
+        ReadCommit::CallTemplate,
+    );
+}
+
+/// What [`emit_string_read`] answers for an index.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StringRead {
+    /// String.prototype.codePointAt's: the code point there, or undefined past the end.
+    CodePoint,
+    /// String.prototype.charCodeAt's: the UTF-16 unit there, or NaN past the end.
+    CodeUnit,
 }
 
 /// Which test counter a string read's commit counts (tests only; nothing in other builds).
@@ -9912,21 +9933,22 @@ fn emit_read_commit_event(a: &mut asm::Asm, commit: ReadCommit) {
     let _ = (a, commit);
 }
 
-/// CodePointAt(S, index) for the String at `[x20 + receiver]` and a Number index in d0: an exact
-/// unsigned index below the length reads the string's storage, a flat one- or two-byte buffer or
-/// a view of one at its owner's width (`crate::lstr`): a one-byte unit is its code point; a
-/// two-byte leading surrogate followed, within the string, by a trailing one combines with it
-/// (UTF16SurrogatePairToCodePoint), and any other unit, a lone surrogate included, is its own
-/// code point. An index at or past the length answers undefined. The result replaces the
-/// receiver, `pop` bytes are popped above it, and the code branches to `done`. A fractional,
-/// negative or NaN index branches to `helper` with nothing written. Clobbers x9, x11, x13, x14,
-/// x16, x17 and d1; preserves x10, x12 and x15.
+/// For the String at `[x20 + receiver]` and a Number index in d0, CodePointAt(S, index)'s code
+/// point or (`read`) the code unit there: an exact unsigned index below the length reads the
+/// string's storage, a flat one- or two-byte buffer or a view of one at its owner's width
+/// (`crate::lstr`). A unit is its own code point, but a two-byte leading surrogate followed,
+/// within the string, by a trailing one combines with it (UTF16SurrogatePairToCodePoint). An index
+/// at or past the length answers undefined for a code point and NaN for a unit. The result
+/// replaces the receiver, `pop` bytes are popped above it, and the code branches to `done`. A
+/// fractional, negative or NaN index branches to `helper` with nothing written. Clobbers x9, x11,
+/// x13, x14, x16, x17 and d1; preserves x10, x12 and x15.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_code_point_read(
+fn emit_string_read(
     a: &mut asm::Asm,
+    read: StringRead,
     receiver: i32,
     pop: u32,
     helper: usize,
@@ -9975,23 +9997,25 @@ fn emit_code_point_read(
     a.b(unit);
     a.bind(two_byte);
     a.ldrh_lsl1(17, 16, 9);
-    a.lsr_imm_w(14, 17, 10);
-    a.cmp_imm_w(14, 0xD800 >> 10); // a leading surrogate
-    a.b_cond(C_NE, unit);
-    a.add_imm(9, 9, 1);
-    a.cmp_reg_x(9, 13);
-    a.b_cond(C_HS, unit); // the string's last unit
-    a.ldrh_lsl1(14, 16, 9);
-    a.lsr_imm_w(11, 14, 10);
-    a.cmp_imm_w(11, 0xDC00 >> 10); // followed by a trailing surrogate
-    a.b_cond(C_NE, unit);
-    // (lead - 0xD800) × 0x400 + (trail - 0xDC00) + 0x10000
-    a.ubfx(17, 17, 0, 10);
-    a.ubfx(14, 14, 0, 10);
-    a.add_shifted(17, 14, 17, 10);
-    a.add_imm(17, 17, 0x10000);
+    if read == StringRead::CodePoint {
+        a.lsr_imm_w(14, 17, 10);
+        a.cmp_imm_w(14, 0xD800 >> 10); // a leading surrogate
+        a.b_cond(C_NE, unit);
+        a.add_imm(9, 9, 1);
+        a.cmp_reg_x(9, 13);
+        a.b_cond(C_HS, unit); // the string's last unit
+        a.ldrh_lsl1(14, 16, 9);
+        a.lsr_imm_w(11, 14, 10);
+        a.cmp_imm_w(11, 0xDC00 >> 10); // followed by a trailing surrogate
+        a.b_cond(C_NE, unit);
+        // (lead - 0xD800) × 0x400 + (trail - 0xDC00) + 0x10000
+        a.ubfx(17, 17, 0, 10);
+        a.ubfx(14, 14, 0, 10);
+        a.add_shifted(17, 14, 17, 10);
+        a.add_imm(17, 17, 0x10000);
+    }
     a.bind(unit);
-    // ---- commit: the Number over the receiver slot (a code point is never NaN) ----
+    // ---- commit: the Number over the receiver slot (a code point or unit is never NaN) ----
     a.ucvtf_d_w(0, 17);
     a.stur_d(0, 20, receiver);
     if pop != 0 {
@@ -10000,7 +10024,13 @@ fn emit_code_point_read(
     emit_read_commit_event(a, commit);
     a.b(done);
     a.bind(undefined);
-    a.mov_imm64(9, crate::value::PACK_UNDEFINED);
+    a.mov_imm64(
+        9,
+        match read {
+            StringRead::CodePoint => crate::value::PACK_UNDEFINED,
+            StringRead::CodeUnit => crate::value::PACK_CANON_NAN,
+        },
+    );
     emit_exec_word_store(a, 9, 20, receiver);
     if pop != 0 {
         a.sub_imm(20, 20, pop);

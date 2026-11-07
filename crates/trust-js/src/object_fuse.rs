@@ -428,7 +428,8 @@ pub(crate) struct StringCallSite {
     generation: Cell<u32>,
     index: Cell<u32>,
     mask: Cell<u32>,
-    /// The method's call-cache class (`bytecode::INTRINSIC_CODE_POINT_AT`).
+    /// The method's call-cache class (`bytecode::INTRINSIC_CODE_POINT_AT`,
+    /// `bytecode::INTRINSIC_CHAR_CODE_AT`).
     intrinsic: u8,
     /// Keeps the validated fuse's allocation, so that no later fuse takes its address while the
     /// site names it.
@@ -457,6 +458,7 @@ impl StringCallSite {
     pub(crate) fn method_name(intrinsic: u8) -> Option<&'static str> {
         match intrinsic {
             crate::bytecode::INTRINSIC_CODE_POINT_AT => Some("codePointAt"),
+            crate::bytecode::INTRINSIC_CHAR_CODE_AT => Some("charCodeAt"),
             _ => None,
         }
     }
