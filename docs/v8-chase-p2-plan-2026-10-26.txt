@@ -19951,3 +19951,281 @@ pacing on 2,881 passed, by default the memory-reducer pair failed at a load of 5
 zombie: on b4389c75 the lib suite 2,656 passed and clippy x3 clean; on 4abc8062 clippy x3 clean
 (the coordinator's). TRust (b4389c75): the three pages valid and as main's with the cycle off, in
 release and with debug assertions (verification, the cycle at 1 and forced); the spikes exit 0.
+
+### Djot's candidate 4, steps 3 and 4: the fused calls in register regions, and x86-64 (record, 2026-11-07)
+
+Landed by fast-forward on main 63eb71df (an agent's): 2c22a51e (step 3a: a register region fuses
+the String method calls the templates fuse; the index from the loop's registers, the code point or
+unit left as a Number in the receiver's register), 258d45bc (step 3b: `Dup; StoreLocal` of a
+Number keeps it in its register, and a block reached only by its predecessor's fall-through starts
+with that predecessor's Number facts), b7a67187 (step 3c: a receiver in a register stays there on
+the fast path; the slow path's templates go through their shared stubs), 0b03c40e (step 4: x86-64
+checks step 2's guards in line and reads through one helper, H_STRING_READ, where it ran
+GetMethod's and the call's helpers). The agent's working note is target/p2/djot-gap/c4/design-note.txt.
+
+Measured (the series head against main 63eb71df; fat LTO; the agent's checks/):
+- instructions (ARM64): Djot -4.96%, PdfJS -2.42%, TypeScript -1.26%, sustained allocation -0.49%,
+  GBEmu -0.48%, Mandreel -0.15%; Vue +0.15%, Chai +0.10%, DeltaBlue +0.10%; the rest within
+  +-0.07%. Step 4 changes no ARM64 code (getEol's chunk differs from 3c's only in embedded site
+  addresses and in JitCtx offsets past the helper table, which gained an entry): its ARM64 moves
+  are layout (Vue +0.11%, PdfJS -0.17%, TypeScript -0.09%). DeltaBlue's is layout: on one binary,
+  the fused calls switched off and on, +0.003%.
+- instructions (x86-64, zombie, step 4 against 3c): Djot -11.1%, TypeScript -2.42%, PdfJS -2.37%;
+  getEol's micro-benchmark -54.3%, skipSpace's -36.9%.
+- code: Djot 2,434,164 (-16,144); Vue and React unchanged.
+- Djot's elapsed time (the hold, CPU 5, 10 rounds, medians; 06:00, CPUs 5 and 13 uncapped for
+  all 19 s, load 0.75): main 79 ms (2.03x node-sp), the series 76 ms (1.95x), node-sp 39 ms.
+  Djot's exit line, 2x node-sp, is met. Step 3d (next) 76 ms. The steady-state variants (median
+  of 3, CPU 13): 10 passes main 175 ms, the series 168; 20 passes 319, 308; 40 passes 601, 575.
+
+The thermal caps: Crystal's thermal daemon (thermald --gb10) caps cpufreq's scaling_max_freq (in
+its state 3 the X925 cores run at 1.378 of 3.9 GHz, the A725 cores at 338 of 2,808 MHz) and under
+load cycles states every ~30 s. A session at 04:42 ran in state 2 (83 C) and read 2.03x node-sp
+for the head; it is void. Every timing session now waits until its CPUs have run uncapped for
+60 s, logs the caps each second and voids itself on any capped second
+(target/p2/timing/uncapped.sh). The daemon's journal shows the 01:41 session (steps 1-2's record
+above) and the 02:42 one (step 3c alone: 76 ms against node-sp's 38.5, 1.97x) in state 0 (57 C,
+the GPU idle). The daily heat source is the owner's 03:00 GPU wallpaper batch.
+
+Checks: the gate on 0b03c40e (c4/checks/gate-0b03c40e.txt): rustfmt; clippy in five
+configurations and the workspace clean; the lib suite under TRUST_JS_GC_INCREMENTAL=force 2,882
+passed; by default 2,880 passed, the memory-reducer pair failing at a load of 50-60, and with
+pacing on 2,880 passed, the reducer's quiet-heap test and the execution-deadline abort test failing
+at a load of 40-60 (each pair passes alone: the default's at 05:12, pacing on's at 06:00 on the
+gate's binary); the fixtures as the base; difftest 138 agree; Test262 53,573/53,575,
+staging/sm/extensions/recursion.js and staging/sm/regress/regress-610026.js timing out (no
+progress) at a load of 20-50 beside three LTO builds (both pass alone with the gate's runner).
+TRust (0b03c40e): the three pages valid and as main's with the cycle off, in release
+and with debug assertions (verification, the cycle at 1 and forced); the spikes exit 0 (the forced
+one's exit code lost to a paused script, its run complete: score printed, no panics). zombie: on
+4c152a69 (the same crates tree) the lib suite 2,657 passed and clippy x3 clean.
+
+### Djot's gap, candidate 3: RegExp exec's runtime, measured piece by piece (census and forks, 2026-11-07)
+
+On main 63eb71df (fat LTO, target/p2/lto/63eb71df, identical to 4abc8062's binary), instructions:u
+at CPU 14 with TRUST_JS_GC_PACING=0; micro-benchmarks in target/p2/djot-gap/c3/micro, Djot's own
+profiles in c3/census. Exemplar sources (target/p2/djot-gap/c3/src, data only; PINS.txt), each file
+fetched from raw.githubusercontent.com at its pin: V8 main 41b0e42f (2026-11-05, the W6 pin; c3/src/v8),
+SpiderMonkey firefox fa1e90ea, WebKit ab234b60.
+
+THE CALLS
+
+Djot's exec calls (27,246 a run, TRUST_JS_JIT_NATIVESTAT=1) are of two kinds (TRUST_JS_REGEXP_PROF=2,
+census/djot-prof2.err):
+
+| kind | executions a run | matched | result |
+| --- | ---: | ---: | --- |
+| `find`'s patterns, `new RegExp(src, "yd")` | 16,610 | 4,092 (3,652 without captures) | null, or an array with `indices` |
+| the inline parser's specials scan, `/[\r\n"'()*+.:<=[\\\]^_\`${}~-]/g`, and two more /g | about 10,600 | nearly all | an array of one unit, no captures |
+
+find (benchmarks/fixtures/djot.js, module 481):
+
+  find(t, e, s, n) { e.lastIndex = s; i = n !== undefined ? t.substring(0, n + 1) : t;
+    const r = e.exec(i); if (r !== null) { const t = []; if (r.indices.length > 1)
+    for (let e = 1; e < r.indices.length; e++) { const [s, n] = r.indices[e];
+    t.push(i.substring(s, n)) } return { startpos: r.indices[0][0], endpos: r.indices[0][1] - 1,
+    captures: t } } return null }
+
+The specials pattern runs on two-byte subjects (all 10,472 of its executions) through the
+matcher's single-element path in Rust (Regex::find_single, next_start::<&[u16]>), not native code.
+
+THE PIECES
+
+Each variant runs one sticky pattern in a loop of 100,000 and 300,000 iterations over a subject
+it matches at every third unit; the regexps and the subject are arguments (micro/pieces2.js), and
+the difference of the two counts over 200,000 prices an iteration:
+
+| variant | instructions an iteration | the piece it adds |
+| --- | ---: | --- |
+| v0: the loop | 95 | |
+| v1: `re.lastIndex = pos` | 168 | the lastIndex store, 73 |
+| v2: `re.exec(subject)` missing | 1,104 | an exec that fails, 936 |
+| v3: `re.exec(subject).index` matching | 2,167 | a match's result, 1,063 more |
+| v4: with `d` and two captures, `r.indices[1][1] - r.indices[1][0]` | 4,420 | two captures, the indices and their reads, 2,253 more |
+| v5: v4 destructuring `const [s, e] = r.indices[1]` | 4,652 | destructuring a pair, 232 more |
+| v6: `re.test(subject)` matching | 1,578 | |
+
+Where an exec goes (perf record, instructions:u at 100,000, TRUST_JS_PERF_MAP and TRUST_JS_JIT_MAP;
+instructions an iteration):
+
+| | miss (v2) | match (v3) | match, `d`, 2 captures (v4) |
+| --- | ---: | ---: | ---: |
+| the native call: jit_call_hit, call_native_committed_with (with its two interrupt polls, RuntimeInterrupt::current_reason out of line), with_borrowed_values, activate_agent | 272 | 300 | 303 |
+| the call's templates (GetMethod, CallWithThis, the call stubs) | about 190 | about 110 | about 110 |
+| regexp_exec and regexp_builtin_exec (arguments, flags, lastIndex's handling) | 146 | 317 | 436 |
+| lastIndex read at its slot (slot_last_index) | 42 | 50 | 55 |
+| the matcher's entry: regexp_exec_text_shared (exec_at, exec_impl_with, native::run's setup) | 45 | 140 | 137 |
+| the match itself (the native program, regex::native::run) | small | 80 | 139 |
+| Captures::from_slots | | 94 | 108 |
+| the legacy statics (update_regexp_legacy_statics, realm_regexp_constructor) | | 138 | 112 |
+| the match array (regexp_array, alloc_empty, alloc_block, the match string) | | 430 | |
+| the indices and the captures (pair arrays: alloc_empty, alloc_block, init_packed_array, array_length_shape and _layout; capture strings: unit_lstr, alloc_string_cell) | | | about 1,900 |
+| reading the result (`.index`, `.indices`, element reads) | | about 110 | about 450 |
+
+A correction to the first draft: the interrupt polls are the native call's, not the matcher's.
+call_native_committed_with polls RuntimeInterrupt::current_reason before and after every native
+(interpreter.rs:16314, :16327), about 16 instructions each; the matcher polls only on long scans
+(regex.rs:2202, :2480). They belong to candidate 2's boundary.
+
+In Djot's steady state (the 40-pass variant from its start, instructions:u at 20,000,
+census/djot-p40-ins.txt): exec's runtime in Rust is 2.93% of the instructions (regexp_builtin_exec
+0.84%, regexp_exec 0.46%, regexp_exec_text_shared 0.43%, regexp_array 0.30%, slot_last_index 0.27%,
+the statics 0.27%, from_slots 0.16%, the rest 0.20%), its allocations a share of alloc_empty's
+1.01% and alloc_string_cell's 0.85%; the matching 1.91%, of which the specials scan's
+single-element path on two-byte subjects is about 0.9% (next_start::<&[u16]> 0.47%, find_single
+0.19%, first_matches 0.12%, CharClass::matches_raw2 0.11%) and the native programs under 0.4%.
+In cycles (the census) exec's runtime around the match was 5.3-5.9%: allocation-heavy code runs
+more cycles an instruction.
+
+Sized by kind, a run's exec runtime in instructions (the call excluded): find's misses about
+12,500 x 500, find's matches about 3,650 x 1,800 (one pair) and 440 x 3,400 (captures), the
+specials' matches about 10,600 x 1,200.
+
+THE EXEMPLARS, PIECE BY PIECE
+
+- The entry. V8: RegExpPrototypeExec is a JS builtin the call IC enters with no C++ transition
+  (src/builtins/regexp-exec.tq:31-43); its fast path is one map compare against the RegExp
+  function's initial map and a positive-Smi lastIndex (builtins-regexp-gen.cc:1166-1191,
+  IsFastRegExpNoPrototype). SpiderMonkey: exec is self-hosted and its matcher is a JIT stub
+  (jit/CodeGenerator.cpp:2953-3290, GenerateRegExpMatchStubShared). JSC: exec is C++
+  (runtime/RegExpObjectInlines.h:214-250, RegExpObject::execInline) reached through the host
+  function thunk.
+- lastIndex. V8 loads and stores the in-object field (builtins-regexp-gen.cc:149-168,
+  FastLoadLastIndexBeforeSmiCheck, FastStoreLastIndex; regexp.tq:339-366). JSC keeps it in the
+  RegExpObject and reads it as a UInt32 (RegExpObjectInlines.h:188-206). SpiderMonkey's stub
+  loads it from the RegExpObject's slot (CodeGenerator.cpp:3013, loadRegExpLastIndex).
+- The match registers. V8 matches into a per-isolate static offsets vector, taken and returned
+  around each exec (builtins-regexp-gen.cc:536-618, LoadOrAllocateRegExpResultVector and
+  FreeRegExpResultVector), and copies
+  it into the native context's RegExpMatchInfo (:653-692). SpiderMonkey's stub keeps the
+  MatchPairs in its caller's frame (CodeGenerator.cpp:2364-2405). JSC matches into the RegExp's
+  own ovector (RegExpMatchesArray.h:112, ovectorSpan).
+- The legacy statics. V8: the RegExpMatchInfo in the running native context is the record; each
+  match writes its subject and registers there (builtins-regexp-gen.cc:621-692,
+  PrepareMatchInfo, InitializeMatchInfoFromRegisters), and the statics' strings are made when
+  read. SpiderMonkey: the C++ path copies the pairs (builtin/RegExp.cpp:349-368;
+  vm/RegExpStatics.h:288-296, updateFromMatchPairs); the JIT stub records lazily, the source,
+  flags, input and lastIndex with pendingLazyEvaluation, skipping the pointer stores when the
+  source and input are unchanged (CodeGenerator.cpp:2265-2349, UpdateRegExpStatics), and a read
+  re-executes (RegExpStatics.h:21-43, executeLazy). JSC: recordMatch stores the regexp, the input
+  and the match's start and end in the global object's RegExpGlobalData
+  (runtime/RegExpGlobalDataInlines.h:92-96; RegExpObjectInlines.h:248), and a read re-runs the
+  match (RegExpCachedResult.h:42-79, RegExpCachedResult.cpp:49, lastResult). All three find the
+  record from the running realm (V8's native context slot, SpiderMonkey's global, JSC's global
+  object) without looking up the constructor.
+- The match array. V8 allocates it uninitialized from the native context's result map, the
+  elements with it (builtins-regexp-gen.cc:56-145, AllocateRegExpResult,
+  AllocateUninitializedJSArrayWithElements), index, input and groups in-object, then stores
+  SubStrings (:323-380). SpiderMonkey: one dense array of the realm's cached match-result shape,
+  fully allocated, elements initialized in place as dependent strings (builtin/RegExp.cpp:92-148,
+  NewDenseFullyAllocatedArrayWithShape). JSC: an uninitialized butterfly and cell of the global
+  object's matches-array structure, out-of-line properties written directly
+  (RegExpMatchesArray.h:59-106).
+- The indices. V8: a runtime call after the result (builtins-regexp-gen.cc:500-505,
+  Runtime_RegExpBuildIndices, runtime-regexp.cc:1037-1048), which allocates a FixedArray(2) and a
+  JSArray for each pair (src/objects/js-regexp.cc:20-58). SpiderMonkey: an array of a cached
+  indices shape, each pair NewDenseFullyAllocatedArray(cx, 2) initialized in place
+  (builtin/RegExp.cpp:150-200); its JIT stub does not build indices or groups at all and goes
+  out of line for them (CodeGenerator.cpp:3025-3036). JSC: the indices array of its structure,
+  each pair through tryConstructArrayPair, under one GCDeferralContext
+  (RegExpMatchesArray.cpp:92-200).
+
+WHAT TRUST DOES THAT THEY DO NOT
+
+1. The statics: each match finds the running Realm's %RegExp% through the RegExp protector's
+   pins (regexp::realm_regexp_constructor: a RefCell borrow, the pins, a Weak upgrade), compares
+   it with the record's, and copies the spans into Interp::regexp_last's Vec: 112-138 a match.
+   The record could be keyed by the running Realm as the exemplars key it (the global object,
+   which swap_realm exchanges, is at hand) and resolve the constructor when an accessor reads it.
+2. The spans travel three times: the native slots into the scratch's caps (native::run), the
+   caps into a Captures (from_slots, 94-108), the Captures into the statics' Vec; V8 copies its
+   registers once (into the match info) and builds the result from there, JSC builds from the
+   ovector directly.
+3. lastIndex: slot_last_index reads the protector's instance shape under a RefCell borrow and an
+   environment flag, borrows the object, compares its shape, and tests the slot's Number for
+   writable, finite, non-negative and integral (42-55); regexp_program clones the matcher's Rc
+   (regexp_exec). V8's fast path is a map compare and a Smi test.
+4. The result's arrays go through the generic object path: a cell (alloc_empty) and an element
+   block (alloc_block) each, and for a pair the array `length` shape and layout looked up again
+   (array_length_shape, array_length_layout: two thread-local heap lookups, a RefCell borrow and
+   an Rc clone). The match arrays already share a template map (regexp_array_maps); the pairs and
+   the result's cell do not. The exemplars allocate each from a fixed map, shape or structure in
+   one or two bump allocations and fill it in place.
+5. The call: the native call boundary (about 270 with its two interrupt polls) and the call
+   templates (110-190) are candidate 2's (a native's fast entry from generated code); exec is its
+   biggest client.
+6. The specials scan: a single-element program over a two-byte subject scans in Rust
+   (find_single, next_start::<&[u16]>, about 0.9% of Djot's instructions). V8 tiers every
+   pattern up from its bytecode to irregexp's native code (src/regexp/regexp.cc:842-862), whose
+   scan for a class is machine code; TRust's single-element path never takes native code.
+
+THE FORKS (for the coordinator, with a recommendation each)
+
+Fork 1. Where exec's fast path runs.
+  (a) In Rust, entered through candidate 2's native fast entry: JSC's model (execInline, C++,
+      through the host function thunk), with the pieces below cut in Rust.
+  (b) In generated code: a stub that reads lastIndex, runs the native program and builds the
+      result (SpiderMonkey's RegExpMatcher stub; V8's CSA builtin).
+  Recommendation: (a). Djot's `find` patterns all carry `d`: SpiderMonkey's stub goes out of
+  line for exactly these (CodeGenerator.cpp:3025-3036) and V8 builds their indices in C++ through
+  a runtime call, so the exemplar of a stub does not stub this case. What the exemplars keep fast
+  (lastIndex as a field, registers in a reused buffer, results from fixed shapes, the statics
+  as a cheap record) Rust can do; what a stub adds beyond them is the call boundary, which
+  candidate 2 removes for every native. (b) stays open for the specials-style /g exec without
+  `d` once (a) is measured.
+
+Fork 2. The legacy statics.
+  (a) V8's: record the subject and the spans in the running Realm's record at every match.
+  (b) SpiderMonkey's JIT path and JSC's: record the regexp, the subject and the search start (and
+      the whole match), and recompute the captures when a static is read; SpiderMonkey skips the
+      record's pointer stores when nothing changed.
+  Recommendation: (b), the record keyed by the running Realm's global, the constructor found when
+  an accessor reads. TRust already has (b)'s form (update_regexp_legacy_statics_lazy and
+  flush_regexp_legacy's re-execution) for dead-result operations; (a) is V8's because its
+  registers already sit in the match info that its result builder reads, and TRust's do not.
+
+Fork 3. The result's arrays.
+  (a) A pre-shaped image per kind (match, match with indices, indices, and the pair), kept per
+      Agent beside regexp_array_maps: one cell and one element block each, the shape, layout and
+      named slots written from the image (JSC's tryCreateUninitializedRegExpMatchesArray and
+      tryConstructArrayPair, SpiderMonkey's cached shapes, V8's result maps).
+  (b) Leave regexp_builtin_exec's arrays to the generic Object::new_built and make the generic
+      allocation cheaper.
+  Recommendation: (a), measured per kind. (b) is the allocator's own work across all objects,
+  beyond this candidate; (a) is what all three do for these four kinds regardless of their
+  allocators' speed.
+
+Not forks (each the exemplars' only form): the spans copied once, from the matcher's slots
+straight into the result and the record (2); lastIndex read as V8 and JSC read it, a shape
+compare and the slot's word, and the matcher reached without cloning its Rc (3); the interrupt
+polls left to the matcher's long scans and to candidate 2's boundary.
+
+PLAN (each step measured against main on its own, counts, code bytes and timing as candidate 4's)
+
+- Step 1: the statics by the running Realm, recorded lazily (fork 2), and the spans copied once:
+  about 200-250 instructions a match.
+- Step 2: lastIndex at its slot as V8 reads it, and the matcher without the Rc clone: about
+  50-100 an exec, misses included.
+- Step 3: the four array kinds from their images (fork 3): about 100 a pair and some of the match
+  array's 430.
+- Then, measured: the specials' single-element scan over two-byte subjects (6), and whether a
+  stub for plain /g exec (fork 1's (b)) still pays once candidate 2's entry is in.
+
+EXPECTED SIZE
+
+Steps 1-3 cut about a third to a half of exec's runtime: of Djot's steady state, about 1.0-1.5% of
+the instructions and, with the allocations' cycles, perhaps 1.5-2.5% of the time. The call
+boundary (candidate 2) and the specials scan (about 0.9%) come on top.
+
+DECIDED (the coordinator, 2026-11-07, under the owner's standing approval): forks 1(a), 2(b) and
+3(a); fork 1(b), a stub for plain /g exec without `d`, stays open until (a) and candidate 2's entry
+are measured. Conditions: the lazy record holds what re-execution needs in immutable form (the
+compiled program, not the RegExp object, which Annex B's compile() re-points; tested); the
+per-Realm record travels with every Realm switch (tested like the string fuse's); today's
+legacy-statics behaviour is kept (every match updates the running Realm's record, as V8, JSC and
+SpiderMonkey's default builds do: TRust has no [[LegacyFeaturesEnabled]], and Test262's 24
+legacy-regexp tests check only the accessors' receivers); the record is traced; the images (step
+3) follow the running Realm's %Array.prototype%, fill in place with every slot GC-safe before the
+next allocation, and keep W6's allocation-colour and barrier rule; steps 1 and 3 are checked with
+Test262 under GC stress and under TRUST_JS_GC_INCREMENTAL=force and a churn repro that holds
+results across many execs.
