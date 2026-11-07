@@ -2507,6 +2507,9 @@ pub(super) fn emit(
     a.b(labels[&plan.head]);
     let ops = chunk.jit_ops();
     let mut carried: Option<(usize, Vec<Operand>, usize, OwnReadFacts)> = None;
+    // The Number facts of a block's locals that its fall-through successor inherits, when that
+    // successor has no other predecessor (see the block's end).
+    let mut carried_numbers: Option<(usize, crate::fasthash::FastSet<u16>)> = None;
     for (block_index, &(start, end)) in plan.blocks.iter().enumerate() {
         let physical_next = plan.blocks.get(block_index + 1).map(|&(next, _)| next);
         a.bind(labels[&start]);
@@ -2539,7 +2542,10 @@ pub(super) fn emit(
         // from SSA demand or a different predecessor/OSR entry. CaptureScan keeps
         // author-visible bindings out of fresh-frame slots. Borrowed activation aliases
         // invalidate these facts through their full observer barrier.
-        let mut numeric_locals = crate::fasthash::FastSet::default();
+        let mut numeric_locals = match carried_numbers.take() {
+            Some((target, numbers)) if target == start => numbers,
+            _ => crate::fasthash::FastSet::default(),
+        };
         for pc in start..end {
             if let Some(labels) = tdz_array_continuations.get(&pc) {
                 for &label in labels {
@@ -2664,6 +2670,27 @@ pub(super) fn emit(
                     }
                 }
                 if fast & (8 | 16 | 64) == (8 | 16 | 64) {
+                    if let Some(slot) = local_store_pair(ops, pc, source_targets)
+                        .filter(|slot| plan.reg(*slot).is_none())
+                        .filter(|_| matches!(ops[pc], Op::Dup))
+                        .filter(|_| stack.last().is_some_and(|value| value.numeric()))
+                    {
+                        // `Dup; StoreLocal` of a Number (a fused String method call's result,
+                        // say): a Number is never Empty and owns nothing, so the store needs
+                        // neither the TDZ test nor the operands' publication, and the value
+                        // stays the operand, in its register. A tagged home mirrors the slot.
+                        own_facts.clear();
+                        let index = stack.len() - 1;
+                        scalar_register(a, &mut stack, physical, index);
+                        emit_exec_number_store(a, 16 + index as u32, 22, slot as i32 * 8, 9);
+                        if let Some(home) = plan.tagged_reg(slot) {
+                            a.ldr_d_imm(home, 22, slot as u32 * 8);
+                        }
+                        numeric_locals.insert(slot);
+                        saved_work += 3;
+                        consumed = 1;
+                        continue;
+                    }
                     if let Some(slot) = local_store_pair(ops, pc, source_targets)
                         .filter(|slot| plan.reg(*slot).is_none())
                     {
@@ -4006,6 +4033,23 @@ pub(super) fn emit(
                 let block = &cfg.blocks()[next.0 as usize];
                 block.predecessors.len() == 1 && cfg.dominates(cfg.block_at(start).unwrap(), next)
             });
+        // A successor reached only by this block's fall-through starts with the facts its locals
+        // had here: established by stores this block executed, they hold on the only edge in,
+        // as on a guard's success edge (`carried` below). A branch's test runs no author code.
+        let sole_fallthrough = !matches!(
+            ops[end - 1],
+            Op::Jump(_) | Op::Return | Op::ReturnBare | Op::ReturnUndef | Op::Throw
+        ) && plan
+            .blocks
+            .get(block_index + 1)
+            .is_some_and(|(next, _)| *next == end)
+            && cfg.block_at(end).is_some_and(|next| {
+                cfg.blocks()[next.0 as usize].predecessors.len() == 1
+                    && cfg.dominates(cfg.block_at(start).unwrap(), next)
+            });
+        if sole_fallthrough && !numeric_locals.is_empty() {
+            carried_numbers = Some((end, std::mem::take(&mut numeric_locals)));
+        }
         if guarded_fallthrough {
             // A unique dominated success edge retains the same virtual owner map. All
             // independent entries still target the separate baseline labels below.
