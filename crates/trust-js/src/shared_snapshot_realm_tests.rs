@@ -589,6 +589,96 @@ fn every_realm_switch_carries_its_legacy_regexp_statics() {
     }
 }
 
+/// RegExpAlloc's shape, which exec's fast `lastIndex` read compares a receiver with
+/// (`Interp::regexp_instance_shape`), is the Agent's, not a Realm's: a shape records keys and
+/// attributes, and the [[Prototype]] is the object's own. A RegExp made in another Realm has that
+/// shape and reads `lastIndex` at its slot, whichever Realm runs, before and after a snapshot's
+/// restore and a swap with a Realm's snapshot.
+#[test]
+fn regexps_of_every_realm_share_the_shape_execs_lastindex_read_compares() {
+    for tier in TIERS {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        let shape_of = |it: &mut Interp, name: &str| {
+            let global = Value::Obj(it.global);
+            match it.get_member_key(&global, name) {
+                Ok(value) => value.as_obj().expect("a RegExp").borrow().props.shape(),
+                Err(_) => panic!("no global {name}"),
+            }
+        };
+        assert_eq!(
+            eval_string(
+                it,
+                "var mine = /a/y; mine.lastIndex = 2; mine.exec('xxa').index + ':' + mine.lastIndex"
+            ),
+            "2:3",
+            "{tier:?}"
+        );
+        let shape = it.regexp_instance_shape.get();
+        assert_ne!(shape, crate::value::SHAPE_UNCACHEABLE, "{tier:?}");
+        assert_eq!(shape_of(it, "mine"), shape, "{tier:?}");
+        let child = it.create_realm();
+        let theirs = it
+            .eval_in_realm(&child, "var theirs = /b/g; theirs.lastIndex = 1; theirs")
+            .ok()
+            .expect("the child's RegExp");
+        assert_eq!(
+            theirs.as_obj().unwrap().borrow().props.shape(),
+            shape,
+            "{tier:?}"
+        );
+        set_global(it, "theirs", theirs);
+        let mine = it
+            .get_member_key(&Value::Obj(it.global), "mine")
+            .ok()
+            .unwrap();
+        // Main runs the child's RegExp.
+        assert_eq!(
+            eval_string(
+                it,
+                "theirs.lastIndex = 2; var m = theirs.exec('abbb'); m.index + ':' + theirs.lastIndex"
+            ),
+            "2:3",
+            "{tier:?}"
+        );
+        // The child, by a snapshot's restore, runs main's.
+        let in_child = in_realm(it, &child, |it| {
+            set_global(it, "mine", mine);
+            eval_string(
+                it,
+                "mine.lastIndex = 1; var m = mine.exec('aaa'); m.index + ':' + mine.lastIndex",
+            )
+        });
+        assert_eq!(in_child, "1:2", "{tier:?}");
+        // A swap with the child's snapshot, then back: both RegExps still read at their slot.
+        let key = child
+            .as_obj()
+            .map(|global| crate::value::Gc::as_ptr(&global) as usize)
+            .unwrap();
+        let mut saved = it.realms[&key].snapshot_clone();
+        it.swap_realm(&mut saved);
+        assert_eq!(it.regexp_instance_shape.get(), shape, "{tier:?}");
+        assert_eq!(
+            eval_string(
+                it,
+                "theirs.lastIndex = 3; var m = theirs.exec('abbb'); m.index + ':' + theirs.lastIndex"
+            ),
+            "3:4",
+            "{tier:?}"
+        );
+        it.swap_realm(&mut saved);
+        assert_eq!(
+            eval_string(
+                it,
+                "mine.lastIndex = 0; mine.exec('a').index + ':' + mine.lastIndex"
+            ),
+            "0:1",
+            "{tier:?}"
+        );
+    }
+}
+
 /// The legacy `RegExp.$1` statics are recorded lazily against the matching Realm's %RegExp%.
 /// That pending record must not keep the Realm alive: a dropped Realm whose code ran the last
 /// regular expression is collected, and the statics of live Realms are unaffected.

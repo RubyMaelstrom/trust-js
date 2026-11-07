@@ -425,11 +425,13 @@ const LAST_INDEX_SLOT: usize = 0;
 
 /// The shape RegExpAlloc gives every RegExp, whose only own property is `lastIndex`, a writable
 /// data property, at [`LAST_INDEX_SLOT`]; `None` before one is known, or under
-/// `TRUST_JS_REGEXP_NO_PROTECTOR=1` (see [`with_regexp_proof`]).
+/// `TRUST_JS_REGEXP_NO_PROTECTOR=1` (see [`with_regexp_proof`]). Read from the Interp's copy
+/// (`Interp::regexp_instance_shape`), not under the protector's borrow: exec reads it for every
+/// `lastIndex`.
+#[inline]
 fn alloc_shape(i: &Interp) -> Option<u32> {
-    let shape = i.regexp_protector.borrow().instance_shape;
-    (crate::value::is_cacheable_shape(shape) && !env_flag!("TRUST_JS_REGEXP_NO_PROTECTOR"))
-        .then_some(shape)
+    let shape = i.regexp_instance_shape.get();
+    (shape != crate::value::SHAPE_UNCACHEABLE).then_some(shape)
 }
 
 /// Whether `object` has the shape RegExpAlloc gives every RegExp ([`alloc_shape`]).

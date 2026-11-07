@@ -5633,6 +5633,9 @@ impl Interp {
         self.regexp_protector
             .borrow_mut()
             .note_instance_shape(shape);
+        if crate::value::is_cacheable_shape(shape) && !env_flag!("TRUST_JS_REGEXP_NO_PROTECTOR") {
+            self.regexp_instance_shape.set(shape);
+        }
         Value::Obj(obj)
     }
 

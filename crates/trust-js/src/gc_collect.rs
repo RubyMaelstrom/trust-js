@@ -2300,6 +2300,7 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             regexp_protector: _, // weak pins
+            regexp_instance_shape: _,
             regexp_statics,
             depth: _,
             direct_call_depth: _,

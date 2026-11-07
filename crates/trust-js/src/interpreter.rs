@@ -4829,6 +4829,12 @@ pub struct Interp {
     /// The RegExp protector (see [`crate::builtins::RegexpProof`]): the current Realm's RegExp
     /// algorithms read the intrinsic methods, flag getters and species.
     pub(crate) regexp_protector: RefCell<crate::builtins::RegexpProof>,
+    /// The shape RegExpAlloc gives every RegExp (the protector's `instance_shape`, noted with
+    /// it in `make_regexp_object`), or [`crate::value::SHAPE_UNCACHEABLE`] before one is known or
+    /// under `TRUST_JS_REGEXP_NO_PROTECTOR=1`: what exec's `lastIndex` read compares a receiver's
+    /// shape with, without the protector's borrow, as V8's fast path compares the map with the
+    /// RegExp function's initial map (builtins-regexp-gen.cc:1166-1191).
+    pub(crate) regexp_instance_shape: std::cell::Cell<u32>,
     /// The active Realm's last successful match, kept raw for its legacy `RegExp.$1`-style
     /// statics ([`RealmRegexpStatics`]): the 14 strings materialize into its constructor's internal
     /// slots only when an accessor actually reads them (see `builtins::flush_regexp_legacy`).
@@ -5227,6 +5233,7 @@ interp_memory_inventory! {
     jit_layout => "non_owning",
     interp_layout => "non_owning",
     regexp_protector => "non_owning",
+    regexp_instance_shape => "non_owning",
     regexp_statics => "measured",
     depth => "non_owning",
     direct_call_depth => "non_owning",
@@ -5341,7 +5348,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 142);
+    assert_eq!(names.len(), 143);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -7021,6 +7028,7 @@ impl Interp {
             jit_layout: std::cell::OnceCell::new(),
             interp_layout: std::cell::Cell::new(InterpLayout::default()),
             regexp_protector: RefCell::default(),
+            regexp_instance_shape: std::cell::Cell::new(crate::value::SHAPE_UNCACHEABLE),
             regexp_statics: Default::default(),
             weak_collections: Default::default(),
             extra_protos: Default::default(),
@@ -14070,6 +14078,7 @@ impl Interp {
             jit_layout: _,
             interp_layout: _,
             regexp_protector: _,
+            regexp_instance_shape: _,
             regexp_statics: _,
             depth: _,
             direct_call_depth: _,

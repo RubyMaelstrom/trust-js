@@ -1552,3 +1552,41 @@ fn legacy_statics_read_after_compile_are_the_matchs() {
         "a,b,ab,x,,b,xab|2,b,2b,1a,3c,0|bb,bb,a|q,--|p,-|2,x,a",
     );
 }
+
+/// exec's fast `lastIndex` read (RegExpAlloc's shape and a plain Number at its slot) misses
+/// whenever the slot's property is not a plain writable integral Number: a non-writable
+/// `lastIndex` (exec's write then throws, whether it matched or not), a frozen RegExp, and the
+/// values ToLength coerces (a fraction, a negative, NaN, a String, an object, 2**53, Infinity).
+/// `lastIndex` is non-configurable, so it can never become an accessor. node gives the same.
+#[test]
+fn exec_reads_lastindex_at_its_slot_only_when_it_is_a_plain_number() {
+    check(
+        r#"
+        function run() {
+            var r = [];
+            function attempt(f) { try { return String(f()); } catch (e) { return e.name; } }
+            var y = /b/y; Object.defineProperty(y, 'lastIndex', { value: 1, writable: false });
+            r.push(attempt(function () { return y.exec('ab').index; }), y.lastIndex);
+            var ym = /z/y; Object.defineProperty(ym, 'lastIndex', { value: 1, writable: false });
+            r.push(attempt(function () { return ym.exec('ab'); }), ym.lastIndex);
+            var acc = /a/g;
+            r.push(attempt(function () {
+                Object.defineProperty(acc, 'lastIndex', { get: function () { return 0; } });
+                return 'redefined';
+            }));
+            acc.lastIndex = 1; r.push(acc.exec('aa').index, acc.lastIndex);
+            var g = /a/g, vals = [1.5, -1, NaN, '1', { valueOf: function () { return 1; } }, 2 ** 53, Infinity];
+            for (var k = 0; k < vals.length; k++) {
+                g.lastIndex = vals[k];
+                var m = g.exec('aaa');
+                r.push(m ? m.index + ':' + g.lastIndex : 'null:' + g.lastIndex);
+            }
+            var frozen = Object.freeze(/a/y);
+            r.push(attempt(function () { return frozen.exec('a'); }));
+            return r.join(';');
+        }
+        run()
+        "#,
+        "TypeError;1;TypeError;1;TypeError;1;2;1:2;0:1;0:1;1:2;1:2;null:0;null:0;TypeError",
+    );
+}
