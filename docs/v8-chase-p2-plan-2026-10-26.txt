@@ -20229,3 +20229,29 @@ legacy-regexp tests check only the accessors' receivers); the record is traced; 
 next allocation, and keep W6's allocation-colour and barrier rule; steps 1 and 3 are checked with
 Test262 under GC stress and under TRUST_JS_GC_INCREMENTAL=force and a churn repro that holds
 results across many execs.
+
+### Djot's candidate 4, step 3d: a Boolean at a join (record, 2026-11-07)
+
+Landed by fast-forward on main 2aedc0e9 (an agent's): 9c2af9af (30d5558a rebased onto the record,
+its patch byte-identical): a loop test's `&&` or `||` (getEol's `10 !== s && 13 !== s`,
+skipSpace's `32 === s || 9 === s`) meets its operands' values at one branch; each in-region edge
+now records the scalar kinds of the operands it publishes, a block whose every predecessor
+recorded exactly one edge before it is emitted starts with the kinds they agree on, and its branch
+tests the Boolean's bit where it ran ToBoolean's tag dispatch.
+
+Measured (fat LTO; the agent's checks/): instructions against the series head 0b03c40e Djot
+-0.45%, TypeScript -0.28%; on one binary with the facts switched off and on (d0618f25, a
+measurement-only switch, environments of equal length) Djot -0.48%, TypeScript -0.25%, PdfJS
+-0.05%, DeltaBlue +0.02%: the counts' PdfJS +0.14% and Splay -0.23% against the head were layout.
+getEol's micro-benchmark -10.7% (about 109 to 97 instructions a character; main 239). Code: Djot
+-5,556 bytes, React -2,160, PdfJS -8,692. Djot's elapsed time in the 06:00 session (uncapped
+throughout): 76 ms, as the series head's; the 40-pass variant 581 ms against the head's 575
+(runs 581, 570, 581: within the variants' noise).
+
+Checks: the gate on 30d5558a (c4/checks/gate-30d5558a.txt, the same crates tree): rustfmt; clippy
+in five configurations and the workspace clean; the lib suite 2,883 passed, with pacing on 2,883,
+under TRUST_JS_GC_INCREMENTAL=force 2,883; the fixtures as the base; difftest 138 agree; Test262
+53,575/53,575, identical to the base's. zombie (30d5558a): the lib suite 2,658 passed, clippy x3
+clean. TRust: through candidate 3's series ac414fd3, which carries this commit: the three pages
+valid and as main's with the cycle off, in release and with debug assertions (the cycle at 1 and
+forced); the spikes exit 0.
