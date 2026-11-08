@@ -624,7 +624,11 @@ When: at the second stage's checkpoints (about 100, 500, 2,100 and 8,500 native 
 tier on, the second stage is built at the first checkpoint whose feedback fingerprint (named ways
 and generic marks, call ways and megamorphic states, value and element records) equals the
 previous checkpoint's, V8's settled-feedback rule (P2's probe5, TRUST_JS_TIERUP_STABLE, is the
-precedent), or at the first checkpoint under TRUST_JS_OPT_EAGER=1.
+precedent), or at the first checkpoint under TRUST_JS_OPT_EAGER=1. A function whose inline plan
+is empty gets a chunk of its own all the same when the tier is on (compile_with_inlines with the
+empty plan, seeded and record-mapped from the first stage), published only if the tier accepts it:
+Maglev compiles a hot function whether or not it inlines, and the hottest leaf loops have nothing
+to splice (2026-11-08).
 
 The front end:
 - Inputs, immutable during the compile: the chunk's operations (Chunk::jit_ops, the list its code
