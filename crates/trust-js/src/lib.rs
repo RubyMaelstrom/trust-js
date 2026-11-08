@@ -202,6 +202,8 @@ mod object_fuse;
 mod object_fuse_tests;
 #[cfg(test)]
 mod object_literal_jit_tests;
+/// The optimizing tier (P3): the plan's speculative mid tier, off by default (TRUST_JS_OPT).
+mod opt;
 mod ordered_collection;
 #[cfg(test)]
 mod ordered_collection_tests;
