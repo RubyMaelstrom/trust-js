@@ -40,6 +40,7 @@ use crate::opt::regalloc::{self, Allocation, Home};
 // Condition codes.
 const EQ: u32 = 0;
 const NE: u32 = 1;
+const LO: u32 = 3;
 const MI: u32 = 4;
 const VS: u32 = 6;
 const HI: u32 = 8;
@@ -192,11 +193,6 @@ fn check_graph(chunk: &Chunk, graph: &Graph, cfg: &crate::jit_ir::Cfg) -> Result
                         "a shape check without proving shapes",
                     ));
                 }
-                NodeOp::LoadField { slot, .. } | NodeOp::StoreField { slot, .. }
-                    if slot >= 4096 =>
-                {
-                    return Err(Refusal::at(node.pc as usize, "a field past slot 4,095"));
-                }
                 _ => {}
             }
             if let Some(state) = node.state {
@@ -313,6 +309,15 @@ enum Cold {
         node: NodeIx,
         resume: usize,
         throw: usize,
+    },
+    /// ToBoolean of a BigInt or of an object that may be [[IsHTMLDDA]]: the word in `word`, the
+    /// Boolean to `dst`.
+    ToBoolean {
+        label: usize,
+        node: NodeIx,
+        word: u32,
+        dst: u32,
+        resume: usize,
     },
     /// The moves of an edge into a merge from a block with two successors.
     Edge {
@@ -570,6 +575,13 @@ impl<'a> Gen<'a> {
 
 /// The runtime's `%` on Numbers (ECMA-262 Number::remainder: the C library's fmod, the result
 /// taking the dividend's sign), which F64Mod calls.
+/// ToBoolean's slow path (`lower_to_boolean`: a BigInt, an object that may be [[IsHTMLDDA]]): the
+/// interpreter's ToBoolean, which runs no JavaScript and does not collect.
+unsafe extern "C" fn to_boolean(ctx: *mut JitCtx, word: u64) -> u64 {
+    let i = unsafe { &*(*ctx).interp };
+    u64::from(i.to_boolean(&unsafe { crate::value::Value::from_bits(word) }))
+}
+
 extern "C" fn f64_remainder(dividend: f64, divisor: f64) -> f64 {
     dividend % divisor
 }
@@ -812,17 +824,13 @@ impl Gen<'_> {
         }
     }
 
-    /// The Object of the cell in `cell` into `obj`, and a trap unless its named entries reach
-    /// `slot` (below 4,096, `check_graph`): the shape proved they do, and a trap stays where that
-    /// proof stands in for a check (the plan's Risks: hardening). Clobbers x30 and the flags.
-    fn field_object(&mut self, cell: u32, obj: u32, slot: u32) {
-        debug_assert!(slot < 4096);
-        let layout = self.layout;
-        self.a.add_imm(obj, cell, layout.obj_from_cell as u32);
-        self.a
-            .ldr_w_imm(X30, obj, (layout.obj_props + layout.props_len) as u32);
-        self.a.cmp_imm_w(X30, slot);
-        self.a.b_cond(LS, self.l_trap);
+    /// The Object of the cell in `cell` into `obj`. No bound check follows: the shape the field's
+    /// CheckShape proved fixes the key set and the capacity class, and shape ids are never reused
+    /// (property_shapes.rs), as V8, SpiderMonkey and JSC rely on after a map check; the
+    /// baseline's check guards a stale cache, which a live-checked constant shape is not (the
+    /// plan's Stage 1 record, "Shapes").
+    fn field_object(&mut self, cell: u32, obj: u32) {
+        self.a.add_imm(obj, cell, self.layout.obj_from_cell as u32);
     }
 
     /// The address base of a field whose location word is `location`, and the offset from it:
@@ -1025,6 +1033,11 @@ impl Gen<'_> {
                     self.gp_done(n, x);
                 }
             }
+            NodeOp::ToBoolean => {
+                if !unused {
+                    self.lower_to_boolean(n);
+                }
+            }
             NodeOp::I32Add | NodeOp::I32Sub => {
                 let site = self.check_exit(n)?;
                 let a = self.gp(input(0), X16);
@@ -1191,24 +1204,26 @@ impl Gen<'_> {
                     self.gp_done(n, w);
                 }
             }
-            NodeOp::LoadField { location, slot } => {
+            NodeOp::LoadField { location, .. } => {
                 if !unused {
                     let cell = self.gp(input(0), X16);
-                    self.field_object(cell, X17, *slot);
+                    self.field_object(cell, X17);
                     let (base, offset) = self.field_base(X17, *location);
                     let dst = self.gp_dst(n);
                     self.a.ldr_imm(dst, base, offset);
                     self.gp_done(n, dst);
                 }
             }
-            NodeOp::StoreField { location, slot } => {
+            NodeOp::StoreField { location, .. } => {
                 let cell = self.gp(input(0), X16);
                 let value = self.gp(input(1), X17);
-                self.field_object(cell, X9, *slot);
+                self.field_object(cell, X9);
                 let (base, offset) = self.field_base(X9, *location);
                 self.a.str_imm(value, base, offset);
                 if !self.scalar_word(input(1)) {
-                    // The cell's card, as the baseline's stores mark it (`emit_card_mark`).
+                    // The receiver's card, after the store and before any safepoint, as the
+                    // baseline's store marks it (`emit_card_mark`, `emit_set_prop_inline`): a
+                    // minor collection then finds an old object's edge to a young value.
                     emit_card_mark(&mut self.a, cell, X9, X30);
                 }
             }
@@ -1533,6 +1548,25 @@ impl Gen<'_> {
                     resume,
                     throw,
                 } => self.emit_poll_slow(label, node, resume, throw),
+                Cold::ToBoolean {
+                    label,
+                    node,
+                    word,
+                    dst,
+                    resume,
+                } => {
+                    self.a.bind(label);
+                    let saved = self.save_live_caller_saved(node);
+                    // The word first: it may be in x0.
+                    self.a.mov(1, word);
+                    self.a.mov(0, 19);
+                    self.a.mov_imm64(X16, to_boolean as *const () as u64);
+                    self.a.blr(X16);
+                    self.a.mov_w(X9, 0);
+                    self.restore_live_caller_saved(&saved);
+                    self.a.mov_w(dst, X9);
+                    self.a.b(resume);
+                }
             }
         }
         // One `bl` per exit: its return address names the exit.
@@ -1545,10 +1579,10 @@ impl Gen<'_> {
         Ok(())
     }
 
-    /// A poll's slow path: the caller-saved registers that hold live values saved on the native
-    /// stack (where the collector scans them), `H_INTERRUPT` called as the first stage's loop
-    /// poll calls it, the registers restored, and a throw taken to `throw`.
-    fn emit_poll_slow(&mut self, label: usize, node: NodeIx, resume: usize, throw: usize) {
+    /// Save on the native stack, where the collector scans it, each caller-saved register that
+    /// holds a value live at `node`, for a call from a node that is no effect (a slow path the
+    /// allocator did not see as a call). Returns what `restore_live_caller_saved` restores.
+    fn save_live_caller_saved(&mut self, node: NodeIx) -> (Vec<(bool, u32)>, u32) {
         let file = &regalloc::ARM64;
         let live: Vec<(bool, u32)> = self
             .alloc
@@ -1561,23 +1595,43 @@ impl Gen<'_> {
             })
             .collect();
         let size = (8 * live.len() as u32).next_multiple_of(16);
+        if size > 0 {
+            self.a.sub_imm(31, 31, size);
+        }
+        for (k, &(fp, r)) in live.iter().enumerate() {
+            if fp {
+                self.a.str_d_imm(r, 31, 8 * k as u32);
+            } else {
+                self.a.str_imm(r, 31, 8 * k as u32);
+            }
+        }
+        (live, size)
+    }
+
+    fn restore_live_caller_saved(&mut self, (live, size): &(Vec<(bool, u32)>, u32)) {
+        for (k, &(fp, r)) in live.iter().enumerate() {
+            if fp {
+                self.a.ldr_d_imm(r, 31, 8 * k as u32);
+            } else {
+                self.a.ldr_imm(r, 31, 8 * k as u32);
+            }
+        }
+        if *size > 0 {
+            self.a.add_imm(31, 31, *size);
+        }
+    }
+
+    /// A poll's slow path: the live caller-saved registers saved, `H_INTERRUPT` called as the
+    /// first stage's loop poll calls it, the registers restored, and a throw taken to `throw`.
+    fn emit_poll_slow(&mut self, label: usize, node: NodeIx, resume: usize, throw: usize) {
         let depth = self
             .graph
             .state(self.graph.node(node).state.expect("checked"))
             .stack
             .len() as u32;
+        self.a.bind(label);
+        let saved = self.save_live_caller_saved(node);
         let a = &mut self.a;
-        a.bind(label);
-        if size > 0 {
-            a.sub_imm(31, 31, size);
-        }
-        for (k, &(fp, r)) in live.iter().enumerate() {
-            if fp {
-                a.str_d_imm(r, 31, 8 * k as u32);
-            } else {
-                a.str_imm(r, 31, 8 * k as u32);
-            }
-        }
         a.ldr_imm(20, 19, std::mem::offset_of!(JitCtx, stack_base) as u32);
         a.add_imm(20, 20, 8 * depth);
         a.mov(0, 19);
@@ -1587,18 +1641,82 @@ impl Gen<'_> {
         a.blr(X16);
         a.mov(20, 0);
         a.mov_w(X9, 1);
-        for (k, &(fp, r)) in live.iter().enumerate() {
-            if fp {
-                a.ldr_d_imm(r, 31, 8 * k as u32);
-            } else {
-                a.ldr_imm(r, 31, 8 * k as u32);
-            }
-        }
-        if size > 0 {
-            a.add_imm(31, 31, size);
-        }
-        a.cbnz(X9, false, throw);
-        a.b(resume);
+        self.restore_live_caller_saved(&saved);
+        self.a.cbnz(X9, false, throw);
+        self.a.b(resume);
+    }
+
+    /// ToBoolean (ECMA-262 §7.1.2) of the word in line, as the baseline's ToBoolean stub tests
+    /// it (`emit_to_boolean_stub`): a Boolean's payload; a Number unless ±0 or NaN; false for
+    /// undefined, null and the Empty sentinel; a String unless empty; true for a Symbol and for
+    /// an IC-plain object, which cannot be [[IsHTMLDDA]]. A BigInt and any other object take
+    /// `to_boolean` out of line, which runs no JavaScript and does not collect.
+    fn lower_to_boolean(&mut self, n: NodeIx) {
+        use crate::value::{PACK_BOOL, PACK_OBJ, PACK_STR, PACK_SYM};
+        let word = self.gp(self.graph.node(n).inputs[0], X16);
+        let w = self.gp_dst(n);
+        let not_bool = self.a.new_label();
+        let tagged = self.a.new_label();
+        let string = self.a.new_label();
+        let truthy = self.a.new_label();
+        let falsy = self.a.new_label();
+        let slow = self.a.new_label();
+        let done = self.a.new_label();
+        let a = &mut self.a;
+        // A Boolean's word EOR its tag is its payload, 0 or 1; every other word is larger.
+        a.movz(X17, (PACK_BOOL >> 48) as u32, 3);
+        a.logic_x(2, X17, word, X17);
+        a.cmp_imm_x(X17, 1);
+        a.b_cond(HI, not_bool);
+        a.mov_w(w, X17);
+        a.b(done);
+        a.bind(not_bool);
+        // A Number compares with zero; NaN and every tag compare unordered.
+        a.fmov_d_x(D31, word);
+        a.fcmp_zero(D31);
+        a.b_cond(VS, tagged);
+        a.cset_w(w, NE);
+        a.b(done);
+        a.bind(tagged);
+        a.lsr_imm(X17, word, 48);
+        // Below the Boolean tag: the canonical NaN, undefined, the Empty sentinel and null.
+        a.movz(X30, (PACK_BOOL >> 48) as u32, 0);
+        a.cmp_reg_w(X17, X30);
+        a.b_cond(LO, falsy);
+        a.movz(X30, (PACK_STR >> 48) as u32, 0);
+        a.cmp_reg_w(X17, X30);
+        a.b_cond(EQ, string);
+        a.b_cond(LO, slow); // a BigInt
+        a.movz(X30, (PACK_SYM >> 48) as u32, 0);
+        a.cmp_reg_w(X17, X30);
+        a.b_cond(EQ, truthy);
+        a.movz(X30, (PACK_OBJ >> 48) as u32, 0);
+        a.cmp_reg_w(X17, X30);
+        a.b_cond(NE, slow);
+        a.ubfx(X30, word, 0, 48);
+        a.add_imm(X30, X30, self.layout.obj_from_cell as u32);
+        a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+        a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+        a.bind(truthy);
+        a.movz(w, 1, 0);
+        a.b(done);
+        a.bind(string);
+        a.ubfx(X30, word, 0, 48);
+        a.ldr_w_imm(X30, X30, crate::lstr::LEN_OFF as u32);
+        a.cmp_imm_w(X30, 0);
+        a.cset_w(w, NE);
+        a.b(done);
+        a.bind(falsy);
+        a.movz(w, 0, 0);
+        a.bind(done);
+        self.cold.push(Cold::ToBoolean {
+            label: slow,
+            node: n,
+            word,
+            dst: w,
+            resume: done,
+        });
+        self.gp_done(n, w);
     }
 
     /// The code's exit stub (see `opt::exit`): save x0-x29 and d0-d31, call the deoptimizer with

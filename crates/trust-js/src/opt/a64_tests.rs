@@ -1775,6 +1775,117 @@ fn every_pure_operation_computes_as_the_language_does() {
 }
 
 #[test]
+fn to_boolean_answers_as_the_language_does_for_every_kind_of_word() {
+    let mut engine = fixture(
+        "function truthy(a, b) { return a + b; } truthy(1, 2);\n\
+         function pick(a, b) { return a + b; } pick(1, 2);",
+    );
+    // `!!a`.
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let t = b.node(entry, NodeOp::ToBoolean, &[x], Rep::Bool, 2);
+    let boxed = b.node(entry, NodeOp::BoolToTagged, &[t], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    install(&mut engine, "truthy", &b.g, Options::default());
+    for word in [
+        "0",
+        "-0",
+        "NaN",
+        "1",
+        "-1.5",
+        "Infinity",
+        "''",
+        "'a'",
+        "null",
+        "undefined",
+        "true",
+        "false",
+        "({})",
+        "[]",
+        "Symbol()",
+        "0n",
+        "1n",
+        "-1n",
+        "(function () {})",
+        "new Boolean(false)",
+        "Object(0n)",
+    ] {
+        assert_eq!(
+            eval(&mut engine, &format!("truthy({word}, 0)")),
+            eval(&mut engine, &format!("!!({word})")),
+            "ToBoolean({word})"
+        );
+    }
+    // `a ? b + 1 : b - 1`, with b held in a caller-saved register across ToBoolean's slow path
+    // (a BigInt, or an object that is not IC-plain, calls the interpreter's ToBoolean).
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let then_block = b.block(2, false);
+    let else_block = b.block(2, false);
+    let merge = b.block(3, false);
+    b.edge(entry, then_block);
+    b.edge(entry, else_block);
+    b.edge(then_block, merge);
+    b.edge(else_block, merge);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let fy = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[y],
+        Rep::F64,
+        2,
+        at,
+        ExitReason::NotNumber,
+    );
+    let one = b.node(entry, NodeOp::ConstF64(1f64.to_bits()), &[], Rep::F64, 2);
+    let t = b.node(entry, NodeOp::ToBoolean, &[x], Rep::Bool, 2);
+    b.node(
+        entry,
+        NodeOp::Branch {
+            then_block,
+            else_block,
+        },
+        &[t],
+        Rep::None,
+        2,
+    );
+    let plus = b.node(then_block, NodeOp::F64Add, &[fy, one], Rep::F64, 2);
+    let boxed_plus = b.node(then_block, NodeOp::F64ToTagged, &[plus], Rep::Tagged, 2);
+    b.node(then_block, NodeOp::Jump(merge), &[], Rep::None, 2);
+    let minus = b.node(else_block, NodeOp::F64Sub, &[fy, one], Rep::F64, 2);
+    let boxed_minus = b.node(else_block, NodeOp::F64ToTagged, &[minus], Rep::Tagged, 2);
+    b.node(else_block, NodeOp::Jump(merge), &[], Rep::None, 2);
+    let r = b.node(
+        merge,
+        NodeOp::Phi,
+        &[boxed_plus, boxed_minus],
+        Rep::Tagged,
+        3,
+    );
+    b.node(merge, NodeOp::Return, &[r], Rep::None, 3);
+    install(&mut engine, "pick", &b.g, Options::default());
+    for (word, expected) in [
+        ("0n", "4"),
+        ("2n", "6"),
+        ("Object(0n)", "6"),
+        ("''", "4"),
+        ("'s'", "6"),
+        ("NaN", "4"),
+        ("null", "4"),
+        ("({})", "6"),
+    ] {
+        assert_eq!(
+            eval(&mut engine, &format!("pick({word}, 5)")),
+            expected,
+            "{word}"
+        );
+    }
+}
+
+#[test]
 fn object_boolean_and_identity_checks_exit_on_other_words() {
     let mut engine = fixture(
         "function isobj(a, b) { return a + b; } isobj(1, 2);\n\
