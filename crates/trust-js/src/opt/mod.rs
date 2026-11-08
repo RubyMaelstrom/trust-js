@@ -20,6 +20,7 @@
 
 pub(crate) mod build;
 pub(crate) mod ir;
+pub(crate) mod regalloc;
 pub(crate) mod snapshot;
 pub(crate) mod verify;
 
