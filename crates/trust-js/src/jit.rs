@@ -5042,6 +5042,252 @@ fn span_ran(chunk: &Chunk, ranges: &[(usize, usize)]) -> bool {
 ))]
 const REGION_OPS_BUDGET: usize = 4096;
 
+/// The native frame's header (contracts 1.1-1.3): fp/lr [0], x19..x22 [16, 32], the saved caller
+/// strictness [48], d8..d15 [64..128] (16-byte alignment). A chunk whose code writes none of
+/// d8..d15 drops their save and the frame's top half (`skip_unused_callee_saved_fp`).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const FRAME_SIZE: i32 = 128;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const DSAVE: i32 = 64;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const STRICT_SAVE: u32 = 48;
+// `skip_unused_callee_saved_fp` rewrites these words in place: each pair is one instruction.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const _: () = assert!(FRAME_SIZE <= 512 && DSAVE + 48 <= 504);
+
+/// What a code object adds to the native frame below its header: nothing for the first stage;
+/// the optimizing tier's spill slots and saves of the callee-saved registers x23..x28 it uses
+/// (P3 stage 1, `opt::a64`). Every epilogue restores those registers and pops the area before it
+/// reads the header, so the entry contract of contracts 5.4 holds by construction for both.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct EntryFrame {
+    /// The area's bytes (a multiple of 16, below 4,096), between the header and `sp`.
+    extra: u32,
+    /// The callee-saved registers the code writes, in pairs where it can, each with its byte
+    /// offset in the area.
+    saves: Vec<(u32, Option<u32>, u32)>,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl EntryFrame {
+    /// Make the area: emitted once the header is written and before anything can leave through
+    /// an epilogue (the entry poll's and the frame setup's throws).
+    fn emit_push(&self, a: &mut asm::Asm) {
+        if self.extra == 0 {
+            return;
+        }
+        debug_assert!(self.extra.is_multiple_of(16) && self.extra < 4096);
+        a.sub_imm(31, 31, self.extra);
+        for &(first, second, offset) in &self.saves {
+            match second {
+                Some(second) => a.stp_off(first, second, offset as i32),
+                None => a.str_imm(first, 31, offset),
+            }
+        }
+    }
+
+    /// Restore the saved registers and pop the area: the start of every epilogue, which then
+    /// reads the header at `sp`.
+    fn emit_pop(&self, a: &mut asm::Asm) {
+        if self.extra == 0 {
+            return;
+        }
+        for &(first, second, offset) in &self.saves {
+            match second {
+                Some(second) => a.ldp_off(first, second, offset as i32),
+                None => a.ldr_imm(first, 31, offset),
+            }
+        }
+        a.add_imm(31, 31, self.extra);
+    }
+}
+
+/// The entry of fresh-frame and borrowed-frame code, shared by the first stage and the optimizing
+/// tier (contracts 1.1 and 5.4): the frame's header, the context registers (x19 the context, x21
+/// the helper table, x20 the operand top, x22 the slots), the actual arguments a body that needs
+/// them keeps (both conventions: bit 31 of w1), the strictness save, `frame`'s area, the entry
+/// poll and the frame setup; a borrowed frame dispatches to its resume pc instead of the last
+/// two. A throw from the poll or the setup goes to `l_unwind`. Returns the label of the d8..d15
+/// save group, which `skip_unused_callee_saved_fp` patches.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_entry_prologue(
+    a: &mut asm::Asm,
+    chunk: &Chunk,
+    borrowed_entry: bool,
+    frame: &EntryFrame,
+    l_unwind: usize,
+) -> usize {
+    a.stp_pre(29, 30, -FRAME_SIZE);
+    a.stp_off(19, 20, 16);
+    a.stp_off(21, 22, 32);
+    // d8..d15, AAPCS64's callee-saved FP registers. Words 3..7 of every chunk: when the finished
+    // code writes none of them, the first save becomes a branch over the four (see below).
+    let l_dsave = a.new_label();
+    a.bind(l_dsave);
+    a.stp_d_off(8, 9, DSAVE);
+    a.stp_d_off(10, 11, DSAVE + 16);
+    a.stp_d_off(12, 13, DSAVE + 32);
+    a.stp_d_off(14, 15, DSAVE + 48);
+    a.mov(19, 0); // ctx
+    a.ldr_imm(21, 19, 0); // helpers table
+    a.ldr_imm(20, 19, if borrowed_entry { 16 } else { 8 }); // live top or empty stack
+    a.ldr_imm(22, 19, 24); // local slots base
+
+    // The actual arguments (W3 item 3, Decision 20d): a body that builds its environment, a
+    // rest parameter or an arguments value keeps their count and address in its record. The
+    // call sequence passes the count in w1, its arguments the caller's top words under x20
+    // (saved at [sp, #24] above); a Rust entry passes the count with bit 31 set and the address
+    // in x2 (`entry_argc`). Taken before anything can clobber w1 and x2.
+    if !borrowed_entry && chunk.jit_frame_args_needed() {
+        const _: () = assert!(CTX_ARGC_OFF <= 504, "one STP stores the count and address");
+        let have = a.new_label();
+        a.lsr_imm_w(9, 1, 31);
+        a.cbnz(9, false, have);
+        a.ldr_imm(2, 31, 24); // the caller's operand top
+        a.lsl_imm(9, 1, 3);
+        a.sub_reg(2, 2, 9); // the arguments' address
+        a.bind(have);
+        a.logic_imm_w(0, 1, 1, asm::logical_imm_w(0x7fff_ffff).unwrap());
+        a.stp_base(1, 2, 19, CTX_ARGC_OFF as i32);
+        if let Some(slot) = chunk.jit_arguments_count_slot() {
+            // A body that reads only `arguments.length` keeps the count, a Number, in its slot.
+            a.ucvtf_d_w(0, 1);
+            a.str_d_imm(0, 22, u32::from(slot) * 8);
+        }
+    }
+
+    // ECMA-262 Strict Mode Code / PutValue: semantic helpers must see THIS body's lexical
+    // mode, including cached calls and direct shared-context calls. Save on the native frame,
+    // not JitCtx (which direct callees share), and restore on both normal and throwing exits.
+    // The record points at the interpreter's flag (`JitCtx::strict_flag`).
+    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
+    a.ldrb_imm(9, 16, 0);
+    a.strb_imm(9, 31, STRICT_SAVE);
+    if !borrowed_entry {
+        a.movz(9, u32::from(chunk.jit_is_strict()), 0);
+        a.strb_imm(9, 16, 0);
+    }
+    frame.emit_push(a);
+    // Function entry is a safepoint, like a loop back-edge: allocation pressure and host
+    // interruption are observed here, through the poll word. Code that never takes a back-edge
+    // (loop-free recursion makes billions of calls) must still be interruptible, since a user
+    // agent may abort a running script at any time (HTML §8.1.4.5). The frame is fully
+    // established and the operand stack empty, so the helper sees every owned root. A direct
+    // call `blr`s to the code start: this is its safepoint too.
+    if !borrowed_entry {
+        emit_interrupt_poll(a, POLL_ENTRY, l_unwind);
+    }
+    if !borrowed_entry && chunk.jit_frame_setup_needed() {
+        let done = a.new_label();
+        if let Some(activation) = chunk.jit_inline_activation() {
+            // W3 item 3's step 7 (W2e's first use): an activation that is only its record is
+            // made in line, its captured parameters and `this` copied before the next
+            // safepoint (no barrier: the record is young); the frame setup helper below is its
+            // slow path. No poll follows (W2e's design 1): a due collection fails the in-line
+            // check, and the helper's call ends in the poll.
+            let slow = a.new_label();
+            alloc::emit_inline_activation(a, &activation, slow);
+            emit_prologue_copies(a, chunk, false);
+            #[cfg(test)]
+            names::record_inline_activation(a);
+            a.b(done);
+            a.bind(slow);
+        }
+        // FunctionDeclarationInstantiation's environment, rest Array and arguments object, made
+        // by the callee itself as V8's first bytecode, CreateFunctionContext, makes its context
+        // (Decision 20a): `bytecode::jit_frame_setup`, whose call ends in the explicit poll.
+        emit_op_helper(a, H_FRAME_SETUP, 0, l_unwind);
+        emit_prologue_copies(a, chunk, true);
+        a.bind(done);
+    }
+    if borrowed_entry {
+        // The Rust entry validates the bytecode PC and its settled stack before dispatch.
+        a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, resume_pc) as u32);
+        a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, pc_offsets) as u32);
+        a.lsl_imm(9, 9, 2);
+        a.add_shifted(9, 10, 9, 0);
+        a.ldr_w_imm(9, 9, 0);
+        a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, code_base) as u32);
+        a.add_shifted(9, 10, 9, 0);
+        a.br(9);
+    }
+    l_dsave
+}
+
+/// The two epilogues at `l_ret_ok` and `l_ret_throw`, shared by the first stage and the
+/// optimizing tier (contracts 1.2 and 5.4): `frame`'s area popped, `ctx.final_sp` = x20, the
+/// caller's strictness restored, w0 = 1 or 0, the callee-saved registers restored and the frame
+/// popped. Returns the labels of their d8..d15 restore groups, which
+/// `skip_unused_callee_saved_fp` patches.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_entry_epilogues(
+    a: &mut asm::Asm,
+    frame: &EntryFrame,
+    l_ret_ok: usize,
+    l_ret_throw: usize,
+) -> (usize, usize) {
+    a.bind(l_ret_ok);
+    frame.emit_pop(a);
+    a.str_imm(20, 19, 16); // ctx.final_sp = sp
+    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
+    a.ldrb_imm(9, 31, STRICT_SAVE);
+    a.strb_imm(9, 16, 0);
+    a.movz(0, 1, 0);
+    let l_drestore_ok = a.new_label();
+    a.bind(l_drestore_ok);
+    a.ldp_d_restore(8, 9, DSAVE);
+    a.ldp_d_restore(10, 11, DSAVE + 16);
+    a.ldp_d_restore(12, 13, DSAVE + 32);
+    a.ldp_d_restore(14, 15, DSAVE + 48);
+    a.ldp_off(21, 22, 32);
+    a.ldp_off(19, 20, 16);
+    a.ldp_post(29, 30, FRAME_SIZE);
+    a.ret();
+    a.bind(l_ret_throw);
+    frame.emit_pop(a);
+    a.str_imm(20, 19, 16);
+    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
+    a.ldrb_imm(9, 31, STRICT_SAVE);
+    a.strb_imm(9, 16, 0);
+    a.movz(0, 0, 0);
+    let l_drestore_throw = a.new_label();
+    a.bind(l_drestore_throw);
+    a.ldp_d_restore(8, 9, DSAVE);
+    a.ldp_d_restore(10, 11, DSAVE + 16);
+    a.ldp_d_restore(12, 13, DSAVE + 32);
+    a.ldp_d_restore(14, 15, DSAVE + 48);
+    a.ldp_off(21, 22, 32);
+    a.ldp_off(19, 20, 16);
+    a.ldp_post(29, 30, FRAME_SIZE);
+    a.ret();
+    (l_drestore_ok, l_drestore_throw)
+}
+
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -5182,107 +5428,13 @@ fn compile_entry(
     let l_direct_finish = a.new_label();
 
     // ---- prologue ----
-    // Frame: fp/lr [0], x19..x22 [16, 32], the saved caller strictness [48], d8..d15 [64..128]
-    // (16-byte alignment). A chunk whose code writes none of d8..d15 drops their save and the
-    // frame's top half (`skip_unused_callee_saved_fp`).
-    const FRAME_SIZE: i32 = 128;
-    const DSAVE: i32 = 64;
-    const STRICT_SAVE: u32 = 48;
-    // `skip_unused_callee_saved_fp` rewrites these words in place: each pair is one instruction.
-    const _: () = assert!(FRAME_SIZE <= 512 && DSAVE + 48 <= 504);
-    a.stp_pre(29, 30, -FRAME_SIZE);
-    a.stp_off(19, 20, 16);
-    a.stp_off(21, 22, 32);
-    // d8..d15, AAPCS64's callee-saved FP registers. Words 3..7 of every chunk: when the finished
-    // code writes none of them, the first save becomes a branch over the four (see below).
-    let l_dsave = a.new_label();
-    a.bind(l_dsave);
-    a.stp_d_off(8, 9, DSAVE);
-    a.stp_d_off(10, 11, DSAVE + 16);
-    a.stp_d_off(12, 13, DSAVE + 32);
-    a.stp_d_off(14, 15, DSAVE + 48);
-    a.mov(19, 0); // ctx
-    a.ldr_imm(21, 19, 0); // helpers table
-    a.ldr_imm(20, 19, if borrowed_entry { 16 } else { 8 }); // live top or empty stack
-    a.ldr_imm(22, 19, 24); // local slots base
-
-    // The actual arguments (W3 item 3, Decision 20d): a body that builds its environment, a
-    // rest parameter or an arguments value keeps their count and address in its record. The
-    // call sequence passes the count in w1, its arguments the caller's top words under x20
-    // (saved at [sp, #24] above); a Rust entry passes the count with bit 31 set and the address
-    // in x2 (`entry_argc`). Taken before anything can clobber w1 and x2.
-    if !borrowed_entry && chunk.jit_frame_args_needed() {
-        const _: () = assert!(CTX_ARGC_OFF <= 504, "one STP stores the count and address");
-        let have = a.new_label();
-        a.lsr_imm_w(9, 1, 31);
-        a.cbnz(9, false, have);
-        a.ldr_imm(2, 31, 24); // the caller's operand top
-        a.lsl_imm(9, 1, 3);
-        a.sub_reg(2, 2, 9); // the arguments' address
-        a.bind(have);
-        a.logic_imm_w(0, 1, 1, asm::logical_imm_w(0x7fff_ffff).unwrap());
-        a.stp_base(1, 2, 19, CTX_ARGC_OFF as i32);
-        if let Some(slot) = chunk.jit_arguments_count_slot() {
-            // A body that reads only `arguments.length` keeps the count, a Number, in its slot.
-            a.ucvtf_d_w(0, 1);
-            a.str_d_imm(0, 22, u32::from(slot) * 8);
-        }
-    }
-
-    // ECMA-262 Strict Mode Code / PutValue: semantic helpers must see THIS body's lexical
-    // mode, including cached calls and direct shared-context calls. Save on the native frame,
-    // not JitCtx (which direct callees share), and restore on both normal and throwing exits.
-    // The record points at the interpreter's flag (`JitCtx::strict_flag`).
-    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
-    a.ldrb_imm(9, 16, 0);
-    a.strb_imm(9, 31, STRICT_SAVE);
-    if !borrowed_entry {
-        a.movz(9, u32::from(chunk.jit_is_strict()), 0);
-        a.strb_imm(9, 16, 0);
-    }
-    // Function entry is a safepoint, like a loop back-edge: allocation pressure and host
-    // interruption are observed here, through the poll word. Code that never takes a back-edge
-    // (loop-free recursion makes billions of calls) must still be interruptible, since a user
-    // agent may abort a running script at any time (HTML §8.1.4.5). The frame is fully
-    // established and the operand stack empty, so the helper sees every owned root. A direct
-    // call `blr`s to the code start: this is its safepoint too.
-    if !borrowed_entry {
-        emit_interrupt_poll(&mut a, POLL_ENTRY, l_unwind);
-    }
-    if !borrowed_entry && chunk.jit_frame_setup_needed() {
-        let done = a.new_label();
-        if let Some(activation) = chunk.jit_inline_activation() {
-            // W3 item 3's step 7 (W2e's first use): an activation that is only its record is
-            // made in line, its captured parameters and `this` copied before the next
-            // safepoint (no barrier: the record is young); the frame setup helper below is its
-            // slow path. No poll follows (W2e's design 1): a due collection fails the in-line
-            // check, and the helper's call ends in the poll.
-            let slow = a.new_label();
-            alloc::emit_inline_activation(&mut a, &activation, slow);
-            emit_prologue_copies(&mut a, chunk, false);
-            #[cfg(test)]
-            names::record_inline_activation(&mut a);
-            a.b(done);
-            a.bind(slow);
-        }
-        // FunctionDeclarationInstantiation's environment, rest Array and arguments object, made
-        // by the callee itself as V8's first bytecode, CreateFunctionContext, makes its context
-        // (Decision 20a): `bytecode::jit_frame_setup`, whose call ends in the explicit poll.
-        emit_op_helper(&mut a, H_FRAME_SETUP, 0, l_unwind);
-        emit_prologue_copies(&mut a, chunk, true);
-        a.bind(done);
-    }
-    if borrowed_entry {
-        // The Rust entry validates the bytecode PC and its settled stack before dispatch.
-        a.ldr_imm(9, 19, std::mem::offset_of!(JitCtx, resume_pc) as u32);
-        a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, pc_offsets) as u32);
-        a.lsl_imm(9, 9, 2);
-        a.add_shifted(9, 10, 9, 0);
-        a.ldr_w_imm(9, 9, 0);
-        a.ldr_imm(10, 19, std::mem::offset_of!(JitCtx, code_base) as u32);
-        a.add_shifted(9, 10, 9, 0);
-        a.br(9);
-    }
+    let l_dsave = emit_entry_prologue(
+        &mut a,
+        chunk,
+        borrowed_entry,
+        &EntryFrame::default(),
+        l_unwind,
+    );
 
     // Branch/catch targets: a fused compare+branch may only swallow a following JumpIfFalse if
     // nothing can land on the branch op itself.
@@ -6247,38 +6399,8 @@ fn compile_entry(
     a.br(0);
 
     // ---- epilogues ----
-    a.bind(l_ret_ok);
-    a.str_imm(20, 19, 16); // ctx.final_sp = sp
-    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
-    a.ldrb_imm(9, 31, STRICT_SAVE);
-    a.strb_imm(9, 16, 0);
-    a.movz(0, 1, 0);
-    let l_drestore_ok = a.new_label();
-    a.bind(l_drestore_ok);
-    a.ldp_d_restore(8, 9, DSAVE);
-    a.ldp_d_restore(10, 11, DSAVE + 16);
-    a.ldp_d_restore(12, 13, DSAVE + 32);
-    a.ldp_d_restore(14, 15, DSAVE + 48);
-    a.ldp_off(21, 22, 32);
-    a.ldp_off(19, 20, 16);
-    a.ldp_post(29, 30, FRAME_SIZE);
-    a.ret();
-    a.bind(l_ret_throw);
-    a.str_imm(20, 19, 16);
-    a.ldr_imm(16, 19, STRICT_FLAG_OFF);
-    a.ldrb_imm(9, 31, STRICT_SAVE);
-    a.strb_imm(9, 16, 0);
-    a.movz(0, 0, 0);
-    let l_drestore_throw = a.new_label();
-    a.bind(l_drestore_throw);
-    a.ldp_d_restore(8, 9, DSAVE);
-    a.ldp_d_restore(10, 11, DSAVE + 16);
-    a.ldp_d_restore(12, 13, DSAVE + 32);
-    a.ldp_d_restore(14, 15, DSAVE + 48);
-    a.ldp_off(21, 22, 32);
-    a.ldp_off(19, 20, 16);
-    a.ldp_post(29, 30, FRAME_SIZE);
-    a.ret();
+    let (l_drestore_ok, l_drestore_throw) =
+        emit_entry_epilogues(&mut a, &EntryFrame::default(), l_ret_ok, l_ret_throw);
 
     // ---- shared out-of-line stubs requested by this chunk's sites ----
     a.set_hot(false);
