@@ -19,6 +19,7 @@
 #![cfg_attr(not(test), allow(dead_code))]
 
 pub(crate) mod build;
+pub(crate) mod exit;
 pub(crate) mod ir;
 pub(crate) mod regalloc;
 pub(crate) mod snapshot;

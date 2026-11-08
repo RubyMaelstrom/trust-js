@@ -25551,6 +25551,133 @@ unsafe fn jit_vm_operation(
     }
 }
 
+/// The handler record the push operation at `push_pc` made at operand depth `stack_depth`
+/// ([`jit_push_handler`]'s record): the optimizing tier pushes none, and its exits rebuild the
+/// records active at their pc from their frame state.
+pub(crate) fn pushed_handler(chunk: &Chunk, push_pc: usize, stack_depth: usize) -> Handler {
+    let target = match chunk.jit_ops()[push_pc] {
+        Op::PushHandler(t) => HandlerTarget::Catch {
+            throw_pc: t as usize,
+        },
+        Op::PushFinally(t, r, b, s, j) => HandlerTarget::Finally {
+            throw_pc: t as usize,
+            return_pc: r as usize,
+            bare_return_pc: b as usize,
+            resume_return_pc: s as usize,
+            jump_pc: j as usize,
+        },
+        Op::PushIterator(t, r, b, s) => HandlerTarget::Iterator {
+            throw_pc: t as usize,
+            return_pc: r as usize,
+            bare_return_pc: b as usize,
+            resume_return_pc: s as usize,
+        },
+        _ => unreachable!("a handler record names its push operation"),
+    };
+    Handler {
+        target,
+        stack_depth,
+    }
+}
+
+/// Run the chunk of the fresh native frame `ctx` in the VM from `pc` to its completion, on the
+/// frame's state as an exit of the optimizing tier rebuilt it (P3 stage 1, `opt::exit`;
+/// contracts 3): the slots in place, the `depth` operand words at `ctx.stack_base` the
+/// VM's operand stack, `ctx.handlers` the records active at `pc`, and `pending` a throw the VM
+/// routes before its first step. Modeled on [`jit_vm_operation`], whose activation the bridge
+/// operations already share (env, cap_env, references, disposal frames and class states), and
+/// on [`run_inner`]: the elided rest Array and arguments value are made as its entry makes them
+/// (contracts 3.2), the completion is mapped as it maps it, and a [`VmTiering`] lets a hot loop
+/// move to borrowed-frame code. The frame's record, its `code_base` (the optimized code, which
+/// the run returns into) and its caller's bookkeeping stay as they are.
+///
+/// # Safety
+/// `ctx` is a live fresh-frame record of its chunk (no borrowed continuation) whose slots and
+/// `depth` operand words hold complete execution words and whose prologue kept the actual
+/// arguments when the chunk elides its rest Array or arguments object.
+///
+/// [`VmTiering`]: crate::tiering::VmTiering
+pub(crate) unsafe fn run_native_frame_in_vm(
+    ctx: &mut crate::jit::JitCtx,
+    pc: usize,
+    depth: usize,
+    pending: Option<Value>,
+) -> Result<Value, Abrupt> {
+    debug_assert!(ctx.resume_activation.is_null(), "a fresh frame's exit");
+    let chunk = &*ctx.chunk;
+    let i = &mut *ctx.interp;
+    let slots = std::slice::from_raw_parts(ctx.slots, ctx.n_slots);
+    // The VM's entries fill an elided rest or arguments slot; a fresh native frame leaves it
+    // Undefined until a read materializes the object into it (`frame_arguments`).
+    if let Some(rest) = chunk.rest_slot.filter(|_| chunk.rest_elided) {
+        if slots[rest as usize].get().is_undefined() {
+            let arguments = frame_arguments(ctx);
+            let values = arguments.get(chunk.n_params..).unwrap_or(&[]).to_vec();
+            slots.write_value(rest as usize, i.make_array(values));
+        }
+    }
+    if let Some(slot) = chunk
+        .arguments_slot
+        .filter(|_| chunk.lazy_arguments && !chunk.arguments_count)
+    {
+        if slots[slot as usize].get().is_undefined() {
+            let values = frame_arguments(ctx).to_vec();
+            slots.write_value(slot as usize, i.make_array(values));
+        }
+    }
+    ensure_native_activation(ctx);
+    let this = ctx.this_value();
+    let activation = ctx
+        .activation
+        .as_mut()
+        .expect("native activation initialized");
+    debug_assert!(activation.stack.is_empty());
+    activation.stack.reserve(depth);
+    std::ptr::copy_nonoverlapping(ctx.stack_base, activation.stack.as_mut_ptr(), depth);
+    activation.stack.set_len(depth);
+    let mut next = pc;
+    let mut tiering = crate::tiering::VmTiering::hot();
+    let result = drive_vm(
+        i,
+        chunk,
+        &mut activation.env,
+        &activation.cap_env,
+        &mut activation.references,
+        slots,
+        &mut activation.stack,
+        &mut next,
+        &this,
+        &mut ctx.handlers,
+        &mut activation.disposal_frames,
+        &mut activation.class_states,
+        pending.map(PendingCompletion::Throw),
+        false,
+        Some(&mut tiering),
+    );
+    activation.stack.clear();
+    ctx.env_raw = Env::as_ptr(&activation.env) as *const u8;
+    ctx.env_parent_raw = activation
+        .env
+        .borrow()
+        .parent
+        .as_ref()
+        .map_or(std::ptr::null(), |parent| Env::as_ptr(parent) as *const u8);
+    ctx.handlers.clear();
+    match result? {
+        VmStep::Done(v) | VmStep::Return(v) | VmStep::ResumeReturn(v) => Ok(v),
+        VmStep::BareReturn => Ok(Value::Undefined),
+        VmStep::AbruptJump { .. } => unreachable!("drive_vm consumes loop completions"),
+        VmStep::FragmentExit(..) => unreachable!("a fresh frame runs no AST fragment"),
+        VmStep::Await(_)
+        | VmStep::AsyncClose { .. }
+        | VmStep::Dispose { .. }
+        | VmStep::Yield(_)
+        | VmStep::YieldStar(_) => {
+            unreachable!("the optimizing tier compiles no suspending chunk")
+        }
+    }
+}
+
 /// Private-name operations from machine code, without the generic operation decoder. The
 /// Private Name resolves from the running environment: a materialized activation's (which
 /// follows the block/class scopes its bridge operations push), else the frame's.

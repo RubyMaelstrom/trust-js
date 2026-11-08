@@ -4735,6 +4735,12 @@ pub struct Interp {
     pub(crate) ast_tick: u32,
     /// Current strict-mode flag (pushed/popped around function bodies).
     pub(crate) strict: bool,
+    /// The optimizing tier's forced-exit gate (TRUST_JS_OPT_EXIT_EVERY, `opt::exit`): every
+    /// check of code compiled with the gate decrements the countdown, generated code reaching
+    /// it through `JitCtx::interp`, and exits when it reaches zero; the exit starts it again from
+    /// the period. Both 0 while the gate is off.
+    pub(crate) opt_exit_countdown: u32,
+    pub(crate) opt_exit_every: u32,
     /// Execution tier (env `TRUST_JS_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
     /// default; `Interp` is the reference tree-walker, opt-in via `TRUST_JS_TIER=interp`.
     pub(crate) tier: crate::bytecode::Tier,
@@ -5207,6 +5213,8 @@ interp_memory_inventory! {
     poll => "external",
     ast_tick => "non_owning",
     strict => "non_owning",
+    opt_exit_countdown => "non_owning",
+    opt_exit_every => "non_owning",
     tier => "non_owning",
     tier_threshold => "non_owning",
     jit_admit_runs => "non_owning",
@@ -6961,6 +6969,8 @@ impl Interp {
             poll,
             ast_tick: 0,
             strict: false,
+            opt_exit_countdown: crate::opt::exit_every(),
+            opt_exit_every: crate::opt::exit_every(),
             depth: 0,
             direct_call_depth: MAX_DIRECT_CALL_DEPTH,
             proxy_forward_depth: 0,
@@ -14057,6 +14067,8 @@ impl Interp {
             poll: _,
             ast_tick: _,
             strict: _,
+            opt_exit_countdown: _,
+            opt_exit_every: _,
             tier: _,
             tier_threshold: _,
             jit_admit_runs: _,

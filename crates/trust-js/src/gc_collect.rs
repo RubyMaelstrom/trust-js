@@ -2291,6 +2291,8 @@ impl Interp {
             poll: _,
             ast_tick: _,
             strict: _,
+            opt_exit_countdown: _,
+            opt_exit_every: _,
             tier: _,
             tier_threshold: _,
             jit_admit_runs: _,

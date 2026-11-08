@@ -1814,6 +1814,8 @@ impl Drop for JitCode {
         );
         // Unload profiler symbols before the executable mapping is released.
         profiler::unregister(self.mem);
+        // The optimizing tier's exit table goes with its code (`opt::exit`; none otherwise).
+        crate::opt::exit::release(self.mem);
     }
 }
 
