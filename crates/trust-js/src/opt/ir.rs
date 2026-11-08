@@ -133,6 +133,12 @@ pub(crate) enum NodeOp {
     F64ToTagged,
     I32ToTagged,
     BoolToTagged,
+    /// Tagged -> Bool: ECMAScript ToBoolean (§7.1.2) of the word, false for undefined, null,
+    /// false, +0, -0, NaN, the empty String, 0n and the [[IsHTMLDDA]] object and true for every
+    /// other value. It runs no JavaScript, does not collect and cannot fail: the builder branches
+    /// on it, and lowers `!` through it, where the value is not proven a Boolean (CheckBoolean
+    /// would exit on every other value, as `if (object)` has one).
+    ToBoolean,
 
     // Arithmetic. The I32 forms with a state exit on overflow (Mul also on a -0 result).
     I32Add,
