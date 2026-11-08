@@ -1,4 +1,4 @@
-# Phase 3 plan: the speculative optimizing tier (2026-11-08; proposed, for the owner's decisions)
+# Phase 3 plan: the speculative optimizing tier (2026-11-08; the owner's decisions of 2026-11-08)
 
 Program: [docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt). Phase 2's
 plan and record, whose "Carried to Phase 3" is this plan's starting list:
@@ -36,7 +36,7 @@ comparisons are full Octane 2, Web Tooling, ARES-6 and the call microbenchmarks.
 
 The yardstick is Node limited to Maglev (node-mg, `--max-opt=2`), V8's speculative mid tier,
 measured in the same session; full Node and Node limited to Sparkplug alongside. Phase exit
-(proposed, Decision 1): each fixture within 2x of node-mg in its measured pass and in steady
+(Decision 1): each fixture within 2x of node-mg in its measured pass and in steady
 state, and Octane's geomean within 2x of node-mg.
 
 ## Where we start
@@ -468,7 +468,10 @@ and full Node and node-sp alongside, plus:
 - Instruction counts follow P2's rules (fat LTO, the series' own base, and for a JIT change
   TRUST_JS_GC_INCREMENTAL=0 beside the default; P2's measuring note in "Carried to Phase 3").
 
-## Decisions for the owner (proposed)
+## Decisions (the owner's, 2026-11-08)
+
+The owner approved the plan as proposed ("Go ahead, this is approved, let's get started on P3."):
+the seven decisions below stand as written, each with its recommended option.
 
 1. The phase exit. Recommended: each fixture within 2x of node-mg in its measured pass and in steady
    state, and Octane's geomean over the 15 benchmarks Node runs within 2x of node-mg, in one
