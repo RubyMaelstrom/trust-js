@@ -36,6 +36,28 @@ pub(super) fn register(chunk: &Chunk, memory: *mut u8, length: usize) {
     });
 }
 
+/// Register the optimizing tier's code for `chunk` (P3 stage 1, `opt::a64`): named as V8 names
+/// Maglev's code, `JS:+<name> <url>:<line>:<column>` (`+` is V8's marker for Maglev,
+/// `CodeKindToMarker`), the first stage's name with its marker replaced.
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(super) fn register_optimized(chunk: &Chunk, memory: *mut u8, length: usize) {
+    #[cfg(all(target_os = "linux", target_env = "gnu"))]
+    native::register(chunk, memory, length);
+    perf_map_code(memory, length, || match &chunk.perf_map_label {
+        Some(label) => optimized_label(label),
+        None => optimized_label(&chunk_label(None, chunk.jit_slot_names())),
+    });
+}
+
+/// A chunk's perf map name for the optimizing tier's code: `JS:+` in place of the first stage's
+/// `JS:^`.
+pub(crate) fn optimized_label(label: &str) -> String {
+    match label.strip_prefix("JS:^") {
+        Some(rest) => format!("JS:+{rest}"),
+        None => format!("JS:+{label}"),
+    }
+}
+
 pub(super) fn unregister(memory: *mut u8) {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     native::unregister(memory);

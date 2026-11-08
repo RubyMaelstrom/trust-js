@@ -387,6 +387,16 @@ pub(crate) fn test_tdz_effect_paths() -> [u64; 5] {
 #[path = "jit_operations.rs"]
 mod operations;
 
+/// The optimizing tier's ARM64 code generator (P3 stage 1): a child of this module, as the regions
+/// and the operation emitters are, since it emits through their encoder, templates and frame
+/// (`opt::a64` names it).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "opt/a64.rs"]
+pub(crate) mod opt_a64;
+
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -3536,8 +3546,8 @@ mod asm {
         pub fn stp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
             self.pair(STP_D, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
-        /// ldp dt1, dt2, [sp, #imm] (test event helpers' reloads of d16..d31)
-        #[cfg(test)]
+        /// ldp dt1, dt2, [sp, #imm] (test event helpers' reloads of d16..d31; the optimizing
+        /// tier's poll reloads of caller-saved FP registers)
         pub fn ldp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
             self.pair(LDP_D, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
@@ -3779,6 +3789,26 @@ mod asm {
         /// subs wd, wn, wm (sets flags)
         pub fn subs_reg_w(&mut self, rd: u32, rn: u32, rm: u32) {
             self.emit(0x6B00_0000 | (rm << 16) | (rn << 5) | rd);
+        }
+        /// adds wd, wn, wm (sets flags; V on i32 overflow)
+        pub fn adds_reg_w(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x2B00_0000 | (rm << 16) | (rn << 5) | rd);
+        }
+        /// smull xd, wn, wm (SMADDL xd, wn, wm, xzr: the exact 64-bit product of two int32s)
+        pub fn smull(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x9B20_7C00 | (rm << 16) | (rn << 5) | rd);
+        }
+        /// cmp xn, wm, sxtw (SUBS xzr, xn, wm, SXTW): equal exactly when xn is wm sign-extended,
+        /// that is when a 64-bit product fits an int32
+        pub fn cmp_sxtw(&mut self, rn: u32, rm: u32) {
+            self.emit(0xEB20_C000 | (rm << 16) | (rn << 5) | 31);
+        }
+        /// brk #imm16: a trap where no execution may arrive
+        pub fn brk(&mut self, imm16: u32) {
+            if imm16 > 0xFFFF {
+                return self.bad("a BRK immediate past 16 bits");
+            }
+            self.emit(0xD420_0000 | (imm16 << 5));
         }
         /// subs wd, wn, #imm (sets flags; V on i32 overflow; any immediate, see `flags`)
         #[inline]
@@ -4451,7 +4481,6 @@ mod asm {
         fp: true,
         counted: true,
     };
-    #[cfg(test)]
     const LDP_D: Pair = Pair {
         offset: 0x6D40_0000,
         load: true,
@@ -5044,6 +5073,46 @@ fn span_ran(chunk: &Chunk, ranges: &[(usize, usize)]) -> bool {
 ))]
 const REGION_OPS_BUDGET: usize = 4096;
 
+/// The templates' feature mask for `chunk` (`TRUST_JS_JIT_FAST`, every feature by default),
+/// which the first stage and the optimizing tier's effects share.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn template_mask(chunk: &Chunk) -> u32 {
+    let mut fast: u32 = env_value!("TRUST_JS_JIT_FAST")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(u32::MAX);
+    if chunk.jit_detailed_feedback_enabled() {
+        // Detailed arithmetic observation runs in the exact-PC helper. Keep ordinary builds on
+        // their inline and register-region paths; profile-enabled chunks route numeric/update
+        // templates, fusions, and chains through the helper so successful JIT operations cannot
+        // disappear. The broader name/property bits also cover non-update operations, but this
+        // diagnostic-only mode favors complete attribution over profiling throughput.
+        // Route all element templates through the exact-PC helper as well: GetElem (1024),
+        // SetElemDrop (2048), and SetElem (4096) otherwise perform the operation without a
+        // semantic trace. Register/region/property fusions are disabled for the same reason.
+        // Branch templates and compare/loop fusions are routed through exact-PC observation
+        // helpers (`compile_entry`) so optimized execution cannot disappear from branch/back-edge
+        // counts.
+        fast &= !(1
+            | 2
+            | 4
+            | 32
+            | 1024
+            | 2048
+            | 4096
+            | 8192
+            | 16384
+            | 32768
+            | 65536
+            | 524288
+            | (1 << 20)
+            | (1 << 21));
+    }
+    fast
+}
+
 /// The native frame's header (contracts 1.1-1.3): fp/lr [0], x19..x22 [16, 32], the saved caller
 /// strictness [48], d8..d15 [64..128] (16-byte alignment). A chunk whose code writes none of
 /// d8..d15 drops their save and the frame's top half (`skip_unused_callee_saved_fp`).
@@ -5370,35 +5439,7 @@ fn compile_entry(
     // the call as it was: its resume point and step, the handlers it borrowed from the VM, and
     // `ret`, which is vacant at every call (a borrowed frame's returns are slice exits, and the
     // finish stub's fallback leaves it vacant again).
-    let mut fast: u32 = env_value!("TRUST_JS_JIT_FAST")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(u32::MAX);
-    if chunk.jit_detailed_feedback_enabled() {
-        // Detailed arithmetic observation runs in the exact-PC helper. Keep ordinary builds on
-        // their inline and register-region paths; profile-enabled chunks route numeric/update
-        // templates, fusions, and chains through the helper so successful JIT operations cannot
-        // disappear. The broader name/property bits also cover non-update operations, but this
-        // diagnostic-only mode favors complete attribution over profiling throughput.
-        // Route all element templates through the exact-PC helper as well: GetElem (1024),
-        // SetElemDrop (2048), and SetElem (4096) otherwise perform the operation without a
-        // semantic trace. Register/region/property fusions are disabled for the same reason.
-        // Branch templates and compare/loop fusions are routed through exact-PC observation
-        // helpers below so optimized execution cannot disappear from branch/back-edge counts.
-        fast &= !(1
-            | 2
-            | 4
-            | 32
-            | 1024
-            | 2048
-            | 4096
-            | 8192
-            | 16384
-            | 32768
-            | 65536
-            | 524288
-            | (1 << 20)
-            | (1 << 21));
-    }
+    let fast = template_mask(chunk);
     let array_intrinsics_on = !env_flag!("TRUST_JS_JIT_NO_ARRAY_INTRINSICS");
     let function_call_intrinsic_on = !env_flag!("TRUST_JS_JIT_NO_FUNCTION_CALL_INTRINSIC");
     // Direct shared-ctx calls, on by default like every other emitter feature (mask bit 20 off

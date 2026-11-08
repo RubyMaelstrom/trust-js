@@ -18,6 +18,12 @@
 //! x86-64 builds none of the back end until the plan's stage 6.
 #![cfg_attr(not(test), allow(dead_code))]
 
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[cfg_attr(not(test), allow(unused_imports))]
+pub(crate) use crate::jit::opt_a64 as a64;
 pub(crate) mod build;
 pub(crate) mod exit;
 pub(crate) mod ir;
