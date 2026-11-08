@@ -688,6 +688,18 @@ The back end:
   The code stays protected meanwhile: its record's code_base names it.
 - A throw with no handler at its pc leaves through the throw epilogue (ctx.error is set by the
   helper); with one, it exits as above.
+- Repeated exits: past 100 exits of one compiled code (point 12's JSC rule at R = 0), new entries
+  stop using it and the chunk takes the template JIT's code, compiled then if it has none; running
+  activations finish in the tier's code, which stays alive until none runs it. Stage 1 does not
+  recompile: the exit profile and reoptimization are stage 2's. This keeps an exit loop from making
+  the tier slower than the code it replaces.
+- Shapes (review of the front end, 2026-11-08): CheckShape proves what the baseline's own-data
+  probe proves (an object word, an ordinary kind, which excludes Arrays, whose element entries
+  take slots without a shape transition, the IC-plain flag, the shape). A field access after it
+  needs no bound check: shape ids are never reused and fix the key set and the capacity class
+  (property_shapes.rs), which is what V8, SpiderMonkey and JSC rely on after a map check (the
+  baseline's check guards a stale cache, which the tier's live-checked constants are not).
+  StoreField card-marks the receiver's cell as the baseline's store does.
 
 Switches (DIAGNOSTICS.md): TRUST_JS_OPT=1 turns the tier on (off by default until a stage exit
 measures a net win); TRUST_JS_OPT_LOG=1 logs compiles, refusals with their reasons, exits and
