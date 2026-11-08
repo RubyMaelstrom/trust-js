@@ -1181,6 +1181,767 @@ fn the_arguments_count_and_an_elided_rest_reach_the_code_and_the_vm() {
     assert_eq!(eval(&mut engine, "rl(1, 2, 3, 4)"), "4");
 }
 
+/// `viaLeaf(x)` after its second stage spliced `leaf(y) { return y + 1; }` in: LoadNameForCall at
+/// pc 0 (the receiver, then the callee), LoadLocal 0, InlineGuard at pc 2, the splice (StoreLocal
+/// 1, StoreLocal 2, Pop, LoadLocal 1, Const 1, Add at pc 8, ...) and the generic call at pc 13. The free name is an effect, the
+/// callee is checked as InlineGuard checks it, and the splice's Add is speculated on Numbers.
+fn via_leaf() -> Graph {
+    let mut b = Build::new(3);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let at_name = b.state(0, &[], &[], &[]);
+    let name = b.exiting(
+        entry,
+        NodeOp::Effect {
+            pc: 0,
+            pops: 0,
+            pushes: 2,
+        },
+        &[],
+        Rep::None,
+        0,
+        at_name,
+        ExitReason::Forced,
+    );
+    // The receiver, then the callee, which InlineGuard reads argc + 1 words deep.
+    let this = b.node(entry, NodeOp::Projection(0), &[name], Rep::Tagged, 0);
+    let callee = b.node(entry, NodeOp::Projection(1), &[name], Rep::Tagged, 0);
+    let at_guard = b.state(2, &[this, callee, x], &[], &[]);
+    b.exiting(
+        entry,
+        NodeOp::CheckCallee { target: 0 },
+        &[callee],
+        Rep::None,
+        2,
+        at_guard,
+        ExitReason::WrongCallee,
+    );
+    let one = b.node(entry, NodeOp::ConstF64(1f64.to_bits()), &[], Rep::F64, 7);
+    // The splice stored the argument and the callee; it popped the receiver.
+    let at_add = b.state(8, &[x, one], &[(1, x), (2, callee)], &[]);
+    let fx = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[x],
+        Rep::F64,
+        8,
+        at_add,
+        ExitReason::NotNumber,
+    );
+    let sum = b.node(entry, NodeOp::F64Add, &[fx, one], Rep::F64, 8);
+    let boxed = b.node(entry, NodeOp::F64ToTagged, &[sum], Rep::Tagged, 8);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 14);
+    b.g
+}
+
+#[test]
+fn a_spliced_callees_guard_exits_when_the_callee_changes() {
+    let mut engine = fixture(
+        "function leaf(y) { return y + 1; }\n\
+         function viaLeaf(x) { return leaf(x); }",
+    );
+    engine.set_tier(Tier::Jit);
+    eval(&mut engine, "for (var k = 0; k < 20; k++) viaLeaf(k);");
+    let primary = chunk_of(&mut engine, "viaLeaf");
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var("viaLeaf", &env).ok().unwrap();
+    let object = value.as_obj().unwrap();
+    let (func, realm) = {
+        let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+            panic!("an author function")
+        };
+        (user.func.clone(), user.realm)
+    };
+    let plan = crate::bytecode::plan_inlines(&primary, &func, realm, &env);
+    assert!(!plan.is_empty(), "leaf is spliced");
+    let inlined = crate::bytecode::compile_with_inlines(&func, &plan, &primary).unwrap();
+    assert!(matches!(inlined.jit_ops()[2], Op::InlineGuard(0, 13)));
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
+    let code =
+        crate::opt::a64::compile_with(&inlined, &via_leaf(), &layout, &ilayout, Options::default())
+            .unwrap();
+    inlined.jit.begin_compile().unwrap().commit(Some(code));
+    assert!(func.runtime().code2.set(Some(inlined)).is_ok());
+    exits();
+    assert_eq!(eval(&mut engine, "viaLeaf(41)"), "42");
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, "viaLeaf('a')"), "a1");
+    assert_eq!(
+        eval(
+            &mut engine,
+            "leaf = function (y) { return y * 10; }; viaLeaf(4)"
+        ),
+        "40"
+    );
+    assert_eq!(
+        exits(),
+        vec![(8, ExitReason::NotNumber), (2, ExitReason::WrongCallee)]
+    );
+}
+
+#[test]
+fn an_effect_closes_over_the_activation_the_prologue_made() {
+    // `cap(a)` (MakeClosure at pc 0, Return): the prologue makes the activation with the
+    // captured parameter copied in, and the closure the effect makes reads it.
+    let mut engine = fixture("function cap(a) { return function () { return a; }; } cap(1);");
+    let mut b = Build::new(1);
+    let entry = b.block(0, false);
+    let at = b.state(0, &[], &[], &[]);
+    let make = b.exiting(
+        entry,
+        NodeOp::Effect {
+            pc: 0,
+            pops: 0,
+            pushes: 1,
+        },
+        &[],
+        Rep::None,
+        0,
+        at,
+        ExitReason::Forced,
+    );
+    let closure = b.node(entry, NodeOp::Projection(0), &[make], Rep::Tagged, 0);
+    b.node(entry, NodeOp::Return, &[closure], Rep::None, 1);
+    install(&mut engine, "cap", &b.g, Options::default());
+    assert_eq!(eval(&mut engine, "cap(5)()"), "5");
+    assert_eq!(
+        eval(&mut engine, "var f = cap('s'), g = cap(2); f() + g()"),
+        "s2"
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            "function dc(n) { var t = 0; for (var i = 0; i < n; i++) t += cap(i)(); return t; } dc(100)"
+        ),
+        "4950"
+    );
+}
+
+#[test]
+fn an_effect_runs_with_the_bodys_strictness_and_the_callers_returns() {
+    // `strictset()` ('use strict'; Const 1, StoreNameCached at pc 1, Const 2, Return).
+    let mut engine = fixture(
+        "function strictset() { 'use strict'; undeclared_x = 1; return 2; }\n\
+         try { strictset(); } catch (e) {}",
+    );
+    let mut b = Build::new(0);
+    let entry = b.block(0, false);
+    let one = b.node(entry, NodeOp::ConstTagged(num(1.0)), &[], Rep::Tagged, 0);
+    let at = b.state(1, &[one], &[], &[]);
+    b.exiting(
+        entry,
+        NodeOp::Effect {
+            pc: 1,
+            pops: 1,
+            pushes: 0,
+        },
+        &[one],
+        Rep::None,
+        1,
+        at,
+        ExitReason::Forced,
+    );
+    let two = b.node(entry, NodeOp::ConstTagged(num(2.0)), &[], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[two], Rep::None, 3);
+    install(&mut engine, "strictset", &b.g, Options::default());
+    assert_eq!(
+        eval(
+            &mut engine,
+            "try { strictset(); 'stored' } catch (e) { e.name }"
+        ),
+        "ReferenceError"
+    );
+    assert_eq!(eval(&mut engine, "typeof undeclared_x"), "undefined");
+    assert_eq!(eval(&mut engine, "sloppy_y = 3; sloppy_y"), "3");
+}
+
+#[test]
+fn lazy_arguments_reach_the_vm_as_its_entry_makes_them() {
+    // `la()` (Const 1, ArgElem at pc 1, Return) reads `arguments[1]`, whose object the body
+    // elides: an exit before the read gives the VM the plain Array of the arguments its entry
+    // would make, and the effect's template reads the arguments in place.
+    let source = "function la() { return arguments[1]; } la(1, 2);";
+    let mut engine = fixture(source);
+    let mut b = Build::new(1);
+    let entry = b.block(0, false);
+    let at = b.state(0, &[], &[], &[]);
+    b.exiting(
+        entry,
+        NodeOp::Exit(ExitReason::Unsupported),
+        &[],
+        Rep::None,
+        0,
+        at,
+        ExitReason::Unsupported,
+    );
+    install(&mut engine, "la", &b.g, Options::default());
+    assert_eq!(eval(&mut engine, "la(7, 8, 9)"), "8");
+    assert_eq!(eval(&mut engine, "la(7)"), "undefined");
+    let mut engine = fixture(source);
+    let mut b = Build::new(1);
+    let entry = b.block(0, false);
+    let one = b.node(entry, NodeOp::ConstTagged(num(1.0)), &[], Rep::Tagged, 0);
+    let at = b.state(1, &[one], &[], &[]);
+    let read = b.exiting(
+        entry,
+        NodeOp::Effect {
+            pc: 1,
+            pops: 1,
+            pushes: 1,
+        },
+        &[one],
+        Rep::None,
+        1,
+        at,
+        ExitReason::Forced,
+    );
+    let r = b.node(entry, NodeOp::Projection(0), &[read], Rep::Tagged, 1);
+    b.node(entry, NodeOp::Return, &[r], Rep::None, 2);
+    install(&mut engine, "la", &b.g, Options::default());
+    assert_eq!(eval(&mut engine, "la(7, 8, 9)"), "8");
+    assert_eq!(
+        eval(
+            &mut engine,
+            "function d(n) { var t = 0; for (var i = 0; i < n; i++) t += la(i, i + 1); return t; } d(10)"
+        ),
+        "55"
+    );
+}
+
+#[test]
+fn this_is_the_receiver_the_caller_bound() {
+    // `me()` (LoadThis, Return).
+    let mut engine = fixture("function me() { return this; } me();");
+    let mut b = Build::new(0);
+    let entry = b.block(0, false);
+    let this = b.node(entry, NodeOp::This, &[], Rep::Tagged, 0);
+    b.node(entry, NodeOp::Return, &[this], Rep::None, 1);
+    install(&mut engine, "me", &b.g, Options::default());
+    assert_eq!(eval(&mut engine, "var o = {me: me}; o.me() === o"), "true");
+    assert_eq!(eval(&mut engine, "typeof me.call(5)"), "object");
+    assert_eq!(eval(&mut engine, "me() === globalThis"), "true");
+}
+
+/// `tl(n)`: `count`'s loop inside a try (PushHandler(23) at pc 0, the header at 7, the Add at 13,
+/// the increment at 17, the exit at 19, the catch pad at 23): every state inside the loop holds
+/// the handler pushed at pc 0 at depth 0. With `spin`, the loop only counts to `n` in an f64.
+fn try_loop(spin: bool) -> Graph {
+    let mut b = Build::new(4);
+    let entry = b.block(0, false);
+    let header = b.block(7, true);
+    let body = b.block(11, false);
+    let exit = b.block(19, false);
+    b.edge(entry, header);
+    b.edge(header, body);
+    b.edge(header, exit);
+    b.edge(body, header);
+    let handler = [(0u32, 0u32)];
+    let n = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let at_entry = b.state(0, &[], &[], &[]);
+    let fn_ = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[n],
+        Rep::F64,
+        0,
+        at_entry,
+        ExitReason::NotNumber,
+    );
+    if spin {
+        let k0 = b.node(entry, NodeOp::ConstF64(0), &[], Rep::F64, 0);
+        b.node(entry, NodeOp::Jump(header), &[], Rep::None, 6);
+        let k = b.node(header, NodeOp::Phi, &[k0], Rep::F64, 7);
+        let at_header = b.state(7, &[], &[], &handler);
+        b.exiting(
+            header,
+            NodeOp::Poll,
+            &[],
+            Rep::None,
+            7,
+            at_header,
+            ExitReason::Throw,
+        );
+        let lt = b.node(header, NodeOp::F64Cmp(Cond::Lt), &[k, fn_], Rep::Bool, 9);
+        b.node(
+            header,
+            NodeOp::Branch {
+                then_block: body,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            10,
+        );
+        let one = b.node(body, NodeOp::ConstF64(1f64.to_bits()), &[], Rep::F64, 17);
+        let k2 = b.node(body, NodeOp::F64Add, &[k, one], Rep::F64, 17);
+        b.node(body, NodeOp::Jump(header), &[], Rep::None, 18);
+        b.g.node_mut(k).inputs.push(k2);
+        let boxed = b.node(exit, NodeOp::F64ToTagged, &[k], Rep::Tagged, 19);
+        b.node(exit, NodeOp::Return, &[boxed], Rep::None, 20);
+        return b.g;
+    }
+    let in_ = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[fn_],
+        Rep::I32,
+        0,
+        at_entry,
+        ExitReason::NotInt32,
+    );
+    let zero = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+    b.node(entry, NodeOp::Jump(header), &[], Rep::None, 6);
+    let i = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 7);
+    let s = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 7);
+    let at_header = b.state(7, &[], &[(1, s), (2, i)], &handler);
+    b.exiting(
+        header,
+        NodeOp::Poll,
+        &[],
+        Rep::None,
+        7,
+        at_header,
+        ExitReason::Throw,
+    );
+    let lt = b.node(header, NodeOp::I32Cmp(Cond::Lt), &[i, in_], Rep::Bool, 9);
+    b.node(
+        header,
+        NodeOp::Branch {
+            then_block: body,
+            else_block: exit,
+        },
+        &[lt],
+        Rep::None,
+        10,
+    );
+    let at_add = b.state(13, &[s, i], &[(1, s), (2, i)], &handler);
+    let s2 = b.exiting(
+        body,
+        NodeOp::I32Add,
+        &[s, i],
+        Rep::I32,
+        13,
+        at_add,
+        ExitReason::Overflow,
+    );
+    let one = b.node(body, NodeOp::ConstI32(1), &[], Rep::I32, 17);
+    let at_inc = b.state(17, &[], &[(1, s2), (2, i)], &handler);
+    let i2 = b.exiting(
+        body,
+        NodeOp::I32Add,
+        &[i, one],
+        Rep::I32,
+        17,
+        at_inc,
+        ExitReason::Overflow,
+    );
+    b.node(body, NodeOp::Jump(header), &[], Rep::None, 18);
+    b.g.node_mut(i).inputs.push(i2);
+    b.g.node_mut(s).inputs.push(s2);
+    let boxed = b.node(exit, NodeOp::I32ToTagged, &[s], Rep::Tagged, 19);
+    b.node(exit, NodeOp::Return, &[boxed], Rep::None, 20);
+    b.g
+}
+
+const TRY_LOOP: &str =
+    "function tl(n) { try { let s = 0; for (let i = 0; i < n; i++) { s = s + i; } \
+                        return s; } catch (e) { return 'caught'; } } tl(3);";
+
+#[test]
+fn exits_inside_a_try_rebuild_its_handler_for_the_vm() {
+    let mut engine = fixture(TRY_LOOP);
+    install(&mut engine, "tl", &try_loop(false), Options::default());
+    exits();
+    assert_eq!(eval(&mut engine, "tl(10)"), "45");
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, "tl(100000)"), "4999950000");
+    assert_eq!(eval(&mut engine, "tl('5')"), "10");
+    assert_eq!(
+        exits(),
+        vec![(13, ExitReason::Overflow), (0, ExitReason::NotNumber)]
+    );
+    // Forced exits inside the try, every third check.
+    let mut engine = fixture(TRY_LOOP);
+    install(
+        &mut engine,
+        "tl",
+        &try_loop(false),
+        Options { forced_exits: true },
+    );
+    engine.interp.opt_exit_every = 3;
+    engine.interp.opt_exit_countdown = 3;
+    for n in [4, 9, 30] {
+        assert_eq!(
+            eval(&mut engine, &format!("tl({n})")),
+            (n * (n - 1) / 2).to_string()
+        );
+    }
+}
+
+#[test]
+fn a_host_interruption_at_a_poll_leaves_through_the_handlers_region() {
+    let mut engine = fixture(TRY_LOOP);
+    install(&mut engine, "tl", &try_loop(true), Options::default());
+    assert_eq!(eval(&mut engine, "tl(1000)"), "1000");
+    exits();
+    let interrupt = engine.interrupt_handle();
+    interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(100),
+    ));
+    let outcome = engine.eval_interruptible("tl(3e9)", false).unwrap();
+    interrupt.set_deadline(None);
+    assert!(
+        matches!(outcome, crate::ExecutionOutcome::Interrupted { .. }),
+        "the interruption is no throw the catch takes"
+    );
+    assert_eq!(exits(), vec![(7, ExitReason::Throw)]);
+    assert_eq!(eval(&mut engine, "tl(10)"), "10");
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Operands {
+    Tagged,
+    F64,
+    I32,
+}
+
+/// `opK(a, b)` (`return a + b`, so that an exit computes a + b): `op` over the operands as
+/// `operands` checks them, its result boxed.
+fn op_graph(op: NodeOp, operands: Operands, unary: bool, out: Rep) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let check = |b: &mut Build, v| match operands {
+        Operands::Tagged => v,
+        Operands::F64 => b.exiting(
+            entry,
+            NodeOp::CheckNumber,
+            &[v],
+            Rep::F64,
+            2,
+            at,
+            ExitReason::NotNumber,
+        ),
+        Operands::I32 => {
+            let f = b.exiting(
+                entry,
+                NodeOp::CheckNumber,
+                &[v],
+                Rep::F64,
+                2,
+                at,
+                ExitReason::NotNumber,
+            );
+            b.exiting(
+                entry,
+                NodeOp::CheckInt32,
+                &[f],
+                Rep::I32,
+                2,
+                at,
+                ExitReason::NotInt32,
+            )
+        }
+    };
+    let a = check(&mut b, x);
+    let c = check(&mut b, y);
+    let inputs: Vec<NodeIx> = if unary { vec![a] } else { vec![a, c] };
+    let (op, out) = match op {
+        // `!(a < b)`: a comparison's Bool negated.
+        NodeOp::BoolNot => {
+            let lt = b.node(entry, NodeOp::F64Cmp(Cond::Lt), &inputs, Rep::Bool, 2);
+            let r = b.node(entry, NodeOp::BoolNot, &[lt], Rep::Bool, 2);
+            let boxed = b.node(entry, NodeOp::BoolToTagged, &[r], Rep::Tagged, 2);
+            b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+            return b.g;
+        }
+        op => (op, out),
+    };
+    let r = if op.can_exit() {
+        b.exiting(entry, op, &inputs, out, 2, at, ExitReason::Overflow)
+    } else {
+        b.node(entry, op, &inputs, out, 2)
+    };
+    let boxed = match out {
+        Rep::I32 => b.node(entry, NodeOp::I32ToTagged, &[r], Rep::Tagged, 2),
+        Rep::F64 => b.node(entry, NodeOp::F64ToTagged, &[r], Rep::Tagged, 2),
+        Rep::Bool => b.node(entry, NodeOp::BoolToTagged, &[r], Rep::Tagged, 2),
+        _ => r,
+    };
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    b.g
+}
+
+#[test]
+fn every_pure_operation_computes_as_the_language_does() {
+    use Operands::{F64, I32};
+    let cases: Vec<(NodeOp, Operands, bool, Rep, &str)> = vec![
+        (NodeOp::I32And, I32, false, Rep::I32, "a & b"),
+        (NodeOp::I32Or, I32, false, Rep::I32, "a | b"),
+        (NodeOp::I32Xor, I32, false, Rep::I32, "a ^ b"),
+        (NodeOp::I32Shl, I32, false, Rep::I32, "a << b"),
+        (NodeOp::I32Sar, I32, false, Rep::I32, "a >> b"),
+        (NodeOp::I32Not, I32, true, Rep::I32, "~a"),
+        (NodeOp::I32Sub, I32, false, Rep::I32, "a - b"),
+        (NodeOp::I32ToF64, I32, true, Rep::F64, "a"),
+        (NodeOp::F64Sub, F64, false, Rep::F64, "a - b"),
+        (NodeOp::F64Mul, F64, false, Rep::F64, "a * b"),
+        (NodeOp::F64Div, F64, false, Rep::F64, "a / b"),
+        (NodeOp::F64Mod, F64, false, Rep::F64, "a % b"),
+        (NodeOp::F64Neg, F64, true, Rep::F64, "-a"),
+        (NodeOp::I32Cmp(Cond::Lt), I32, false, Rep::Bool, "a < b"),
+        (NodeOp::I32Cmp(Cond::Le), I32, false, Rep::Bool, "a <= b"),
+        (NodeOp::I32Cmp(Cond::Gt), I32, false, Rep::Bool, "a > b"),
+        (NodeOp::I32Cmp(Cond::Ge), I32, false, Rep::Bool, "a >= b"),
+        (NodeOp::I32Cmp(Cond::Eq), I32, false, Rep::Bool, "a == b"),
+        (NodeOp::I32Cmp(Cond::Ne), I32, false, Rep::Bool, "a != b"),
+        (NodeOp::F64Cmp(Cond::Lt), F64, false, Rep::Bool, "a < b"),
+        (NodeOp::F64Cmp(Cond::Le), F64, false, Rep::Bool, "a <= b"),
+        (NodeOp::F64Cmp(Cond::Gt), F64, false, Rep::Bool, "a > b"),
+        (NodeOp::F64Cmp(Cond::Ge), F64, false, Rep::Bool, "a >= b"),
+        (NodeOp::F64Cmp(Cond::Eq), F64, false, Rep::Bool, "a == b"),
+        (NodeOp::F64Cmp(Cond::Ne), F64, false, Rep::Bool, "a != b"),
+        (NodeOp::BoolNot, F64, false, Rep::Bool, "!(a < b)"),
+    ];
+    let ints = [
+        (0, 0),
+        (7, 3),
+        (-7, 3),
+        (2147483647, 31),
+        (-2147483648, 1),
+        (-1, 33),
+        (12345, -2),
+        (5, 5),
+    ];
+    let floats = [
+        "0, 0",
+        "1.5, 0.25",
+        "-0, 0",
+        "NaN, 1",
+        "1, NaN",
+        "Infinity, -Infinity",
+        "-7.5, 2",
+        "7.5, -2",
+        "1e308, 10",
+        "3, 3",
+    ];
+    let source: String = (0..cases.len())
+        .map(|k| format!("function op{k}(a, b) {{ return a + b; }} op{k}(1, 2);\n"))
+        .collect();
+    let mut engine = fixture(&source);
+    for (k, &(ref op, operands, unary, out, expression)) in cases.iter().enumerate() {
+        let graph = op_graph(op.clone(), operands, unary, out);
+        install(&mut engine, &format!("op{k}"), &graph, Options::default());
+        let inputs: Vec<String> = match operands {
+            I32 => ints.iter().map(|(a, b)| format!("{a}, {b}")).collect(),
+            _ => floats.iter().map(|s| s.to_string()).collect(),
+        };
+        for input in inputs {
+            let (a, b) = input.split_once(", ").unwrap();
+            let expected = eval(
+                &mut engine,
+                &format!("(function (a, b) {{ return {expression}; }})({a}, {b})"),
+            );
+            exits();
+            let got = eval(&mut engine, &format!("op{k}({input})"));
+            let exited = !exits().is_empty();
+            if exited {
+                // Only the int32 subtraction exits (on overflow): the VM adds as the bytecode does.
+                assert_eq!(*op, NodeOp::I32Sub, "{op:?}({input}) exited");
+                let sum = eval(&mut engine, &format!("({a}) + ({b})"));
+                assert_eq!(got, sum, "{op:?}({input})");
+            } else {
+                assert_eq!(got, expected, "{op:?}({input}) as {expression}");
+            }
+        }
+    }
+    // >>> fits an int32 unless the result passes 2^31 - 1, where it exits.
+    let mut engine = fixture("function ushr(a, b) { return a + b; } ushr(1, 2);");
+    install(
+        &mut engine,
+        "ushr",
+        &op_graph(NodeOp::I32UShr, I32, false, Rep::I32),
+        Options::default(),
+    );
+    exits();
+    assert_eq!(eval(&mut engine, "ushr(-8, 1)"), "2147483644");
+    assert_eq!(eval(&mut engine, "ushr(-8, 33)"), "2147483644");
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, "ushr(-8, 0)"), "-8");
+    assert_eq!(exits(), vec![(2, ExitReason::Overflow)]);
+}
+
+#[test]
+fn object_boolean_and_identity_checks_exit_on_other_words() {
+    let mut engine = fixture(
+        "function isobj(a, b) { return a + b; } isobj(1, 2);\n\
+         function isbool(a, b) { return a + b; } isbool(1, 2);\n\
+         function same(a, b) { return a + b; } same(1, 2);",
+    );
+    // `a` checked an object, returned.
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    b.exiting(
+        entry,
+        NodeOp::CheckObject,
+        &[x],
+        Rep::Cell,
+        2,
+        at,
+        ExitReason::NotObject,
+    );
+    b.node(entry, NodeOp::Return, &[x], Rep::None, 3);
+    install(&mut engine, "isobj", &b.g, Options::default());
+    // `a` checked a Boolean, negated.
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let bx = b.exiting(
+        entry,
+        NodeOp::CheckBoolean,
+        &[x],
+        Rep::Bool,
+        2,
+        at,
+        ExitReason::NotBoolean,
+    );
+    let not = b.node(entry, NodeOp::BoolNot, &[bx], Rep::Bool, 2);
+    let boxed = b.node(entry, NodeOp::BoolToTagged, &[not], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    install(&mut engine, "isbool", &b.g, Options::default());
+    // Word identity, as `===` answers it on objects and Booleans.
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let same = b.node(entry, NodeOp::TaggedSame, &[x, y], Rep::Bool, 2);
+    let boxed = b.node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    install(&mut engine, "same", &b.g, Options::default());
+    exits();
+    assert_eq!(eval(&mut engine, "var o = {}; isobj(o, 1) === o"), "true");
+    assert_eq!(
+        eval(&mut engine, "typeof isobj(function () {}, 1)"),
+        "function"
+    );
+    assert_eq!(eval(&mut engine, "isbool(true, 0)"), "false");
+    assert_eq!(eval(&mut engine, "isbool(false, 0)"), "true");
+    assert_eq!(eval(&mut engine, "same(o, o)"), "true");
+    assert_eq!(eval(&mut engine, "same(o, {})"), "false");
+    assert_eq!(eval(&mut engine, "same(true, true)"), "true");
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, "isobj(1, 2)"), "3");
+    assert_eq!(eval(&mut engine, "isobj('s', 2)"), "s2");
+    assert_eq!(eval(&mut engine, "isbool(1, 2)"), "3");
+    assert_eq!(eval(&mut engine, "isbool(null, 2)"), "2");
+    assert_eq!(
+        exits(),
+        vec![
+            (2, ExitReason::NotObject),
+            (2, ExitReason::NotObject),
+            (2, ExitReason::NotBoolean),
+            (2, ExitReason::NotBoolean)
+        ]
+    );
+}
+
+#[test]
+fn slots_flush_to_the_frame_and_reload_from_it() {
+    // `add`: the doubled first operand stored to its slot, then an exit to pc 0, where the VM
+    // reads the slot: 2a + b.
+    let mut engine = fixture(ADD);
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let at = b.state(0, &[], &[], &[]);
+    let fx = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[x],
+        Rep::F64,
+        0,
+        at,
+        ExitReason::NotNumber,
+    );
+    let twice = b.node(entry, NodeOp::F64Add, &[fx, fx], Rep::F64, 0);
+    let boxed = b.node(entry, NodeOp::F64ToTagged, &[twice], Rep::Tagged, 0);
+    b.node(entry, NodeOp::StoreSlot(0), &[boxed], Rep::None, 0);
+    b.exiting(
+        entry,
+        NodeOp::Exit(ExitReason::Unsupported),
+        &[],
+        Rep::None,
+        0,
+        at,
+        ExitReason::Unsupported,
+    );
+    install(&mut engine, "add", &b.g, Options::default());
+    assert_eq!(eval(&mut engine, "add(5, 1)"), "11");
+    assert_eq!(eval(&mut engine, "add(0.25, 'x')"), "0.5x");
+    // `callf`: a constant stored to x's slot before the call, which the call's effect leaves
+    // alone, and reloaded after it: f(x) + 100.
+    let mut engine =
+        fixture("function callf(f, x) { return f(x) + 1; } callf(function (y) { return y; }, 1);");
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let f = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let x = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let hundred = b.node(entry, NodeOp::ConstTagged(num(100.0)), &[], Rep::Tagged, 0);
+    b.node(entry, NodeOp::StoreSlot(1), &[hundred], Rep::None, 0);
+    let at_call = b.state(2, &[f, x], &[], &[]);
+    let call = b.exiting(
+        entry,
+        NodeOp::Effect {
+            pc: 2,
+            pops: 2,
+            pushes: 1,
+        },
+        &[f, x],
+        Rep::None,
+        2,
+        at_call,
+        ExitReason::Forced,
+    );
+    let r = b.node(entry, NodeOp::Projection(0), &[call], Rep::Tagged, 2);
+    let reloaded = b.node(entry, NodeOp::FrameSlot(1), &[], Rep::Tagged, 3);
+    let one = b.node(entry, NodeOp::ConstF64(1f64.to_bits()), &[], Rep::F64, 3);
+    let at_add = b.state(4, &[r, one], &[], &[]);
+    let fr = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[r],
+        Rep::F64,
+        4,
+        at_add,
+        ExitReason::NotNumber,
+    );
+    let fh = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[reloaded],
+        Rep::F64,
+        4,
+        at_add,
+        ExitReason::NotNumber,
+    );
+    let sum = b.node(entry, NodeOp::F64Add, &[fr, fh], Rep::F64, 4);
+    let boxed = b.node(entry, NodeOp::F64ToTagged, &[sum], Rep::Tagged, 4);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 5);
+    install(&mut engine, "callf", &b.g, Options::default());
+    assert_eq!(
+        eval(&mut engine, "callf(function (y) { return y * 3; }, 7)"),
+        "121"
+    );
+}
+
 #[test]
 fn the_perf_map_names_the_code_as_v8_names_maglevs() {
     let capture = crate::jit::profiler::PerfMapCapture::start("opt-a64");
