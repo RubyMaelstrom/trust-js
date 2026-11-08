@@ -18,7 +18,13 @@
 //! x86-64 builds none of the back end until the plan's stage 6.
 #![cfg_attr(not(test), allow(dead_code))]
 
+pub(crate) mod build;
 pub(crate) mod ir;
+pub(crate) mod snapshot;
+pub(crate) mod verify;
+
+#[cfg(test)]
+mod build_tests;
 
 /// TRUST_JS_OPT: the tier is off unless set to a value other than `0` (the plan's Stage 1: off
 /// by default until a stage exit measures a net win).
