@@ -892,6 +892,32 @@ fn the_fingerprint_holds_while_feedback_settles_and_moves_with_a_new_way() {
 }
 
 #[test]
+fn a_second_stages_fingerprint_moves_with_its_baseline_sites_records() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function add(a, b) { return a + b; }
+         function caller(x) { return add(x, 1); }
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(i); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    let settled = fingerprint(&transformed);
+    eval(&mut engine, "drive(150);");
+    assert_eq!(fingerprint(&transformed), settled, "the same values again");
+    // The spliced Add's record is `add`'s first stage's, which a String miss fills; the second
+    // stage's own record never changes.
+    eval(&mut engine, "add('a', 'b');");
+    assert_ne!(
+        fingerprint(&transformed),
+        settled,
+        "a String at the spliced Add's baseline site"
+    );
+}
+
+#[test]
 fn the_verifier_rejects_broken_graphs() {
     let mut engine = engine(Tier::Jit);
     eval(

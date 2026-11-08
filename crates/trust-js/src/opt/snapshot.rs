@@ -15,7 +15,7 @@
 //! and element records are no evidence, since in-line hits record nothing (rule U).
 
 use crate::bytecode::{Chunk, Op};
-use crate::feedback::{self, CallState, NamedView, SiteView, ValuesView};
+use crate::feedback::{self, CallState, NamedView, RecordMap, SiteView, ValuesView};
 
 /// Whether a pc's feedback shows that its operation ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,10 +43,7 @@ impl Snapshot {
         let mut views = Vec::with_capacity(ops.len());
         let mut ran = Vec::with_capacity(ops.len());
         for (pc, op) in ops.iter().enumerate() {
-            let mut view = feedback::read(chunk, pc);
-            if let Some((baseline, baseline_pc)) = map.and_then(|map| map.target(pc)) {
-                view = with_baseline_records(view, feedback::read(baseline, baseline_pc));
-            }
+            let view = view(chunk, map, pc);
             ran.push(evidence(chunk, op, &view));
             views.push(view);
         }
@@ -86,6 +83,18 @@ impl Snapshot {
             SiteView::Named(named) | SiteView::NamedUpdate(named, _) => Some(named),
             _ => None,
         }
+    }
+}
+
+/// The view of `pc` the tier reads: the chunk's own, with a transformed chunk's value and element
+/// records its baseline site's (`map` is the chunk's record map).
+fn view(chunk: &Chunk, map: Option<&RecordMap>, pc: usize) -> SiteView {
+    let own = feedback::read(chunk, pc);
+    match map.and_then(|map| map.target(pc)) {
+        Some((baseline, baseline_pc)) => {
+            with_baseline_records(own, feedback::read(baseline, baseline_pc))
+        }
+        None => own,
     }
 }
 
@@ -133,15 +142,17 @@ fn is_length_read(chunk: &Chunk, op: &Op) -> bool {
 
 /// The feedback fingerprint the settled-feedback rule compares between a chunk's checkpoints (the
 /// Stage 1 record's "When", V8's wait for a quiet IC): its named sites' ways and generic marks, its
-/// call sites' ways and megamorphic states, and its value and element records. A call way's epoch
-/// (`CallTarget::current`) is left out: an epoch moved by another function's code changes no
-/// feedback of this one.
+/// call sites' ways and megamorphic states, and its value and element records, read as the
+/// snapshot reads them (a transformed chunk's records are its baseline sites', which its misses
+/// go on filling; its own never change). A call way's epoch (`CallTarget::current`) is left out:
+/// an epoch moved by another function's code changes no feedback of this one.
 pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
     use std::hash::Hasher;
     let mut hash = crate::fasthash::FxHasher::default();
+    let map = chunk.feedback_vector().record_map();
     for pc in 0..chunk.jit_ops().len() {
         hash.write_usize(pc);
-        match feedback::read(chunk, pc) {
+        match view(chunk, map, pc) {
             SiteView::Named(named) => hash_named(&mut hash, &named),
             SiteView::NamedUpdate(named, values) => {
                 hash_named(&mut hash, &named);
