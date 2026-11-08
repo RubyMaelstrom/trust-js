@@ -121,8 +121,10 @@ pub(crate) enum NodeOp {
     CheckShape(Vec<u32>),
     /// Tagged -> Bool.
     CheckBoolean,
-    /// A spliced callee's guard (InlineGuard): inputs the callee word (Tagged); the expected
-    /// callee cell and the planning Realm's global environment are the chunk's InlineTarget.
+    /// A spliced callee's guard (InlineGuard): inputs the callee word (Tagged), then, when the
+    /// InlineTarget's `check_this` is set, the receiver word (Tagged), which must be an object;
+    /// the expected callee cell, its closure environment and the planning Realm's global
+    /// environment are the chunk's InlineTarget.
     CheckCallee {
         target: u32,
     },
@@ -169,7 +171,9 @@ pub(crate) enum NodeOp {
     BoolNot,
 
     // Memory.
-    /// Cell -> Tagged: the property at the way's location and slot (IcState::loc).
+    /// Cell -> Tagged: the property at the way's location and slot (IcState::loc). The slot holds
+    /// a data property's word, never a property-only one: a read keyed `prototype`, whose slot
+    /// can hold a function's deferred prototype (value.rs's PACK_LAZY_PROTO), stays an effect.
     LoadField {
         location: u16,
         slot: u32,
@@ -183,6 +187,15 @@ pub(crate) enum NodeOp {
     /// (Tagged): writes the slot to the frame (a flush the builder places before effects and
     /// before exits that need the frame current).
     StoreSlot(u16),
+
+    // Safepoints.
+    /// A loop header's interrupt and collection poll, the first node of every loop header's
+    /// body (after its phis), where the first stage polls at a backward branch's target. Its
+    /// slow path may collect (the back end keeps the live values where the collector scans
+    /// them); a throw from it (the live-object limit's RangeError) exits with its state when
+    /// the state has a handler, and otherwise leaves the function throwing. Not effectful: it
+    /// writes nothing a later node reads.
+    Poll,
 
     // Effects.
     /// The baseline template of the operation at `pc`, on the canonical frame: inputs are the
@@ -231,6 +244,7 @@ impl NodeOp {
                 | NodeOp::I32Sub
                 | NodeOp::I32Mul
                 | NodeOp::I32UShr
+                | NodeOp::Poll
                 | NodeOp::Effect { .. }
                 | NodeOp::Exit(_)
         )
