@@ -1,0 +1,556 @@
+# Phase 3 plan: the speculative optimizing tier (2026-11-08; proposed, for the owner's decisions)
+
+Program: [docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt). Phase 2's
+plan and record, whose "Carried to Phase 3" is this plan's starting list:
+[docs/v8-chase-p2-plan-2026-10-26.txt](/big/Code/trust-js/docs/v8-chase-p2-plan-2026-10-26.txt).
+Citations are to TRust at main 1ca9b3e1, and to V8 63481c19, SpiderMonkey (Firefox) b42441b0 and
+JSC (WebKit) 3f5092b0, the three engines' main branches of 2026-11-07 and 08, checked out sparsely
+under target/p3/exemplars. Two surveys back this plan and hold the citations it summarizes:
+target/p3/survey/code-survey.txt (the code P3 starts from, every claim at 1ca9b3e1) and
+target/p3/exemplars/exemplar-survey.txt (thirteen design forks: each engine's mechanism and stated
+reason, whether the reason applies to TRust, and the match). This plan is the design record P3
+needs before code, as P1's and P2's were; each stage adds its own design note.
+
+## Goal
+
+The program defines P3 as "Speculative optimizing tier: inlining, type speculation with deopt,
+global load elimination, escape analysis/allocation sinking, range analysis. Reuse Pilot A-C/R1
+guard infrastructure (class shapes, landing, region facts) as the proof layer." This plan builds
+that tier the way V8 built Maglev: a whole-function speculative compiler directly above the
+template JIT, fast enough to compile on the main thread, that inlines, speculates from feedback,
+deoptimizes eagerly and lazily, and removes redundant checks, loads and allocations while it
+builds its graph. On this machine that tier, not TurboFan, is where V8's lead comes from (below).
+The proof layer carries over: shapes as proofs (P2's W4 step 9) become the tier's shape checks and
+dependencies, the regions' landing generalizes into the tier's exits, and region facts become the
+known facts its builder keeps per value.
+
+The passes the exemplars run only in their top tiers (function-wide value numbering with alias
+analysis, loop-invariant code motion, range analysis with bounds-check elimination, general
+allocation sinking) go to a top tier on the same front end, after this one (Decision 2): the
+exemplars' mid tiers (Maglev, the DFG) leave them out for compile time, and pinned to one CPU Node's
+top tier loses to its mid tier on the fixtures, Web Tooling and ARES-6.
+
+Acceptance surface, unchanged (the program's Decision 1): the Vue, React and Djot fixtures and
+TRust's Speedometer replays against Node on Crystal (ARM64), x64 on zombie secondary; the standing
+comparisons are full Octane 2, Web Tooling, ARES-6 and the call microbenchmarks.
+
+The yardstick is Node limited to Maglev (node-mg, `--max-opt=2`), V8's speculative mid tier,
+measured in the same session; full Node and Node limited to Sparkplug alongside. Phase exit
+(proposed, Decision 1): each fixture within 2x of node-mg in its measured pass and in steady
+state, and Octane's geomean within 2x of node-mg.
+
+## Where we start
+
+### Measured starting point
+
+P2's exit session (2026-11-07 13:28-15:19, Crystal, every phase uncapped; P2's record "P2's exit:
+the phase-exit timing session"; tables in target/p2/p2-exit/session-report.txt) measured main's
+code: main has moved since only by records (04b65efb -> 1ca9b3e1). Engine runs pinned to CPU 5;
+Node v24.22.2 in full, limited to Sparkplug (node-sp, `--max-opt=1`) and limited to Maglev
+(node-mg, `--max-opt=2`); fixtures median of 5 rounds, calls and Octane median of 3, Web Tooling
+and ARES-6 one run each. "Gap" is how many times TRust's time is Node's (or Node's score or rate
+TRust's); the last column is node-sp's time over node-mg's.
+
+| Workload | TRust | Node | node-sp | node-mg | gap: Node | gap: node-mg | Maglev over Sparkplug |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Vue fixture (ms) | 204 | 108 | 112 | 49 | 1.89x | 4.16x | 2.29x |
+| React fixture (ms) | 30 | 17 | 16 | 12 | 1.76x | 2.50x | 1.33x |
+| Djot fixture (ms) | 73 | 49 | 39 | 36 | 1.49x | 2.03x | 1.08x |
+| Sustained allocation, JIT (s) | 0.246 | 0.154 | 0.203 | 0.140 | 1.60x | 1.76x | 1.45x |
+| Octane 2, geomean of the 15 Node runs | 4,132 | 25,748 | 4,338 | 20,091 | 6.23x | 4.86x | 4.63x |
+| Web Tooling geomean (runs/s) | 1.55 | 8.85 | 3.50 | 9.68 | 5.71x | 6.25x | 2.77x |
+| ARES-6 summary (ms) | 221.7 | 31.6 | 76.4 | 29.0 | 7.02x | 7.64x | 2.63x |
+
+Octane by benchmark (score; gap to node-mg): Richards 1,670 (7.56x), DeltaBlue 1,613 (11.17x),
+Crypto 8,849 (1.79x), RayTrace 2,481 (10.32x), EarleyBoyer 3,652 (7.32x), RegExp 2,021 (3.24x),
+Splay 4,735 (1.95x), SplayLatency 8,820 (0.46x), NavierStokes 10,579 (1.53x), Mandreel 1,187
+(11.97x), MandreelLatency 6,895 (4.63x), Gameboy 6,706 (6.97x), Box2D 4,153 (12.35x), zlib 3,773
+(15.72x; asm.js, which V8 runs as WebAssembly in every configuration), Typescript 10,542 (5.27x);
+without zlib the geomean gap is 4.47x. Web Tooling's tools trail node-mg by 3.55x (buble) to 18.53x
+(babylon); ARES-6's steady states by 12.1x (Basic) to 14.8x (Air, Babylon), ML's by 10.2x.
+
+The call microbenchmarks (ms; gap to node-mg): direct-call 161 (3.35x), method-call 193 (4.20x),
+closure-call 150 (3.26x), constructor 65 (5.00x), class-and-getter 88 (5.87x), recursion-fib27 20
+(5.00x), arguments-object 36 (2.12x), rest-params 36 (2.40x), function-call-apply 228 (6.33x),
+spread-call 133 (6.05x), array-push-pop 530 (10.19x); the shift queues 1.16-1.17x. Full Node,
+which inlines the callee and folds the loop, runs the method, closure, getter, arguments and rest
+cases in 1-6 ms.
+
+Pinned to one CPU, Node's background compiler threads share that CPU, and full Node is slower than
+node-mg on the fixtures, Web Tooling and ARES-6 (TurboFan over Maglev: 0.91x on Web Tooling's
+geomean, 0.92x on ARES-6's summary); only Octane's long kernels gain from TurboFan (its geomean
+1.28x over node-mg). Most of V8's lead on this machine is Maglev's: over Sparkplug, Maglev gains
+4.63x on Octane's geomean, 2.77x on Web Tooling, 2.63x on ARES-6 and 2.29x on Vue.
+
+### Steady state and attribution (2026-11-08, target/p3/attrib)
+
+The fixtures time one short pass after a warm-up, so each engine's tier-ups fall inside it. With
+the timed work repeated nine more times and each pass timed (target/p3/attrib/fx2; three process
+runs each of main's engine and node-mg, CPU 5, uncapped):
+
+| Fixture | TRust measured | TRust steady | node-mg measured | node-mg steady | gap measured | gap steady |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Vue (ms a pass) | 203-206 | 114-121 | 48-50 | 31-33 | 4.2x | 3.6x |
+| React | 30 | 27-28 | 12-13 | 8 (7-10) | 2.4x | 3.4x |
+| Djot (10 parses) | 73-75 | 50-57 | 35 | 11.5 (9-21) | 2.1x | 4.4x |
+
+In steady state node-mg leads all three fixtures by 3.4-4.4x. V8's Maglev compiles fall inside the
+measured passes (Djot's first pass takes 35 ms, the passes after it 11.5), which narrows the
+measured gap on React and Djot; on Vue TRust's own warm-up is the larger (206 ms against 116), so
+the measured gap is the wider there.
+
+Flat cycle profiles of the same steady-state work (target/p3/attrib/fx; perf record -e cycles:u,
+symbols grouped by name patterns in categorize.py, so the groups are approximate; ms of counted
+cycles; identical work on both engines, three runs each):
+
+| ms (3 runs) | Vue TRust | Vue node-mg | React TRust | React node-mg | Djot TRust | Djot node-mg |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| generated code | 1,183 | 178 | 531 | 75 | 774 | 112 |
+| property access | 915 | 552 | 210 | 13 | 201 | 56 |
+| calls and boundaries | 604 | 27 | 35 | 26 | 161 | 16 |
+| other stubs | 113 | 0 | 3 | 0 | 37 | 0 |
+| runtime helpers | 257 | 2 | 11 | 1 | 68 | 3 |
+| allocation | 111 | 7 | 27 | 4 | 74 | 20 |
+| arrays | 88 | 55 | 5 | 124 | 32 | 32 |
+| collections, Proxy, Reflect | 250 | 82 | 1 | 0 | 11 | 0 |
+| strings, RegExp | 69 | 33 | 13 | 8 | 192 | 98 |
+| other builtins | 145 | 37 | 1 | 3 | 24 | 16 |
+| GC | 77 | 21 | 14 | 13 | 81 | 29 |
+| compile | 8 | 18 | 3 | 9 | 38 | 71 |
+| startup, parse | 24 | 83 | 2 | 68 | 23 | 90 |
+| libc, other | 204 | 95 | 23 | 40 | 88 | 97 |
+| total | 4,047 | 1,189 | 881 | 385 | 1,804 | 639 |
+
+React's node-mg arrays row is V8's Array.prototype.map builtin (124 ms), whose loop TRust runs in
+its generated code. Calls and boundaries are the entry paths (jit_exec, call_jit_*), the
+direct-call and call stubs and the native boundary; runtime helpers are the VM operations, bridges
+and handler pushes generated code calls.
+
+What the numbers say: the rows a speculative tier changes (the generated code's own cost, property
+access in line, calls by inlining, the stubs and helpers that inlined operations replace,
+allocation in line and elided) make up 85% of the difference on Vue, 95% on Djot and more than all
+of it on React, where Node's start-up (68 ms of these runs) offsets the rest. Vue's property access
+and collections are partly V8's own runtime work under Vue's Proxy traps (megamorphic loads,
+LookupIterator, WeakMap lookups), which no tier removes on either side.
+
+### The code (survey of main 1ca9b3e1)
+
+The full survey, every claim cited at 1ca9b3e1, is target/p3/survey/code-survey.txt (sections 1-9
+and a table of the deliverables). What the tier is built on:
+
+Tiers. A function starts on the tree-walker, which has no pcs and no feedback; after 8 calls or
+128 tree-walked back edges (scaled by source size) it compiles to bytecode, and its first bytecode
+run compiles its native first stage (compact templates outside loops, loop register regions), so
+the VM runs almost none of an ordinary function. At about 100, 500, 2,100 and 8,500 native runs a
+function may recompile once as a second stage: a new chunk compiled from the AST with up to four
+callees a site spliced in behind closure-identity and Realm guards, with acyclic spans and regions
+where their operations ran. C1 recompiles once more without property chains. Every compile is
+synchronous on the calling thread. A call site finds its callee's code through its own call-cache
+way; A2 sends entries into a superseded chunk to a helper that refills the way in place. Code is
+discarded only by the code cache's CLOCK sweep (128 MiB budget), never because a speculation failed.
+
+Speculation and its exits. Regions (ARM64 only) are register-allocated copies of loops and acyclic
+spans inside the function's one code object. Their SSA (jit_ir.rs's RegionIr: block parameters for
+every local and stack slot, a verifier, Rep tags nobody reads) serves planning; the emitter re-walks
+the bytecode with an abstract operand stack. They speculate on Number-ness, on int32-ness for
+bitwise operators, on receiver shapes from the live inline caches and on callee identity, never on
+W4's records. A failed guard materializes the virtual operand stack and the numeric homes into the
+canonical frame and branches to the baseline template of the same pc in the same code: that is all
+the deoptimization the tree has. deopt.rs (CopySlot recipes, root maps) is metadata only tests use.
+Nothing counts bails; no code is patched after it is mapped; there is no lazy deoptimization, and
+running frames finish in the code they started in.
+
+Feedback. W4's always-on records (value classes per arithmetic and comparison pc, element facts,
+named ways with a generic mark, call targets with a megamorphic state) and its typed read API
+(feedback_read.rs) exist for this tier: "The speculative tier is the API's consumer". The
+dependency registry (dependency.rs: watchpoint sets for prototype shapes and the Array elements
+protector, desired watchpoints checked at install) is attached to no code. Allocation sites have
+images and templates but no counts or survival (W4 step 8, moved to P3).
+
+Values, frames and the collector. Values are NaN-boxed words; a Number is its f64 bits, and there
+is no int32 value representation (int32 exists only inside regions and chains). Locals and operands
+live in pooled frame records on the Rust heap (the canonical frame: x19 the context, x20 the operand
+top, x22 the slots), not on the native stack; native frames are found through activation records
+(no frame-pointer chain, no unwind tables; helpers are extern "C", and release builds abort on
+panic). The collector is non-moving mark-sweep with sticky marks and scans the native stack, the
+callee-saved registers and the frame records conservatively, resolving interior pointers through
+its page table, so generated code needs no stack maps and a raw pointer in a register or a spill
+slot is a root. The write barrier is an unconditional card mark; in-line allocation takes cells
+from bitmap cursors, without zeroing and with no barrier needed before the next safepoint. Code
+polls at entry, at back edges and after allocating helpers.
+
+Backends. ARM64: an encoder of 118 instructions with labels, relaxation and Decision 23's
+legalizer for any offset; 41 helpers with a (ctx, pc, sp) ABI on the canonical frame; 22
+process-wide shared stub families; direct JIT-to-JIT calls through call-cache ways. x86-64 is much
+thinner: no regions, chains, in-line f64 arithmetic, shared stubs or direct calls, and every call
+goes through Rust. Code memory is one W^X mapping per chunk, written once. Native code exists on
+Linux, macOS and Windows.
+
+What P3 has to build, against what it can reuse (survey section 8):
+
+| P3 deliverable | exists | missing |
+| --- | --- | --- |
+| SSA over whole functions | a whole-function CFG with dominators, loops and handler/OSR roots; bounded region SSA | SSA for whole functions with exception edges; representation selection; lowering from an IR |
+| speculation, eager deopt | region guards that land in the same code | a separate optimized code object whose exits land in baseline code or the VM at any pc; run-time deopt metadata |
+| lazy deopt | the dependency registry; activation records | any link from the registry to code; any validity check in running code |
+| inlining with frame states | AST splicing behind identity guards; Error.stack from inline positions | callee frame reconstruction; code-keyed guards; `new`, closures, handlers |
+| GVN, load elimination, LICM | local guard and load reuse in effect-free spans; loop-chain preambles | function-wide value numbering; a heap alias model |
+| escape analysis | in-line allocation; literal images | virtual objects; materialization at deopt; allocation counts |
+| range analysis | loop chains' crude integer ranges | a range lattice; bounds-check elimination; int32 arithmetic with overflow checks |
+| OSR at loop headers | VM-to-native entry into borrowed frames | native-to-native OSR; back-edge counts in native code |
+| register allocation | fixed homes in regions | liveness, spilling, edge moves, a whole-function allocator |
+
+### What the exemplars do (survey of their main branches, 2026-11-07 and 08)
+
+Each fork's mechanisms, citations and stated reasons are in the exemplar survey. Its summary:
+
+| Fork | V8 | SpiderMonkey | JSC | Match for TRust |
+| --- | --- | --- | --- | --- |
+| Tiers | Ignition, Sparkplug (8), Maglev (400), TurboFan (16,000 with Maglev on) | interpreters, Baseline (100), one optimizing tier, Ion (1,500), off-thread only with more than one CPU | LLInt, Baseline (500), DFG (1,000 x size x 2^R), FTL (64,000) | one fast whole-function tier, compiled once; a top tier later on its front end (V8, JSC) |
+| IR, graph | Maglev: CFG SSA built in one pass with known facts; sea of nodes being replaced | MIR, CFG SSA; WarpBuilder in one pass; resume points | DFG: CPS, SSA in the FTL | Maglev's builder on TRust's CFG IR; never-run sites exit |
+| Feedback | FeedbackVector, hint lattices, AllocationSites, read through the broker | CacheIR stub chains transpiled | ICs plus value, array and arith profiles and exit flags, read as status objects | a per-site status from IC state and side records; exit flags veto; immutable (JSC, V8) |
+| Deopt | eager and lazy; translations; into Ignition; lazy by rewriting return pcs | snapshots and recover instructions; into the Baseline Interpreter; lazy by patching OSI points | an event stream; exits built on first use; into Baseline, the LLInt as fallback | into template code at a bytecode boundary, the VM as fallback (JSC); one-instruction exits (V8) |
+| Invalidation | 21 dependency kinds, DependentCode, 22 protectors, re-checked at commit | guards, fuses, ObjectFuse, link-time dependencies, OSI | watchpoints, adaptive conditions, jettison, invalidation points | JSC's watchpoints and invalidation points; SpiderMonkey's test for which facts qualify |
+| Stack maps | precise (moving GC) | precise (moving GC) | none: conservative scanning, non-moving heap | JSC's: no maps; barriers with elision, code liveness, weak references, hygiene |
+| Inlining | Maglev depth 1, 100 bytes, frequency 0.95; closures by FeedbackCell | trial inlining, 140 bytes, monomorphic; closures by script | DFG 80, FTL 170, plans of 2,500 and 12,000; closures by executable | Maglev's budgets; closures by code (all three) |
+| Escape analysis | Maglev's elision on by default; TurboFan's analysis; materialized at deopt | scalar replacement, recover instructions | allocation sinking in the FTL only | Maglev's elision plus a materialize-object recipe |
+| OSR, reoptimization | OSR into Maglev; each eager deopt invalidates; per-site speculation bits | one OSR pc a compile; bailout kinds, 10 and 50 | DFG multi-entry; 100 x 2^R exits; site flags | JSC's: loop headers as entries; exit flags with 2^R backoff; SpiderMonkey's cause tags |
+| Range analysis | the typer; Maglev's only under Turbolev | beta-node range analysis | FTL only | none in the mid tier; the top tier's |
+| Redundancy | Maglev's known facts and CSE; no LICM | alias analysis, GVN, LICM | clobberize; local CSE (DFG); global CSE and LICM (FTL) | Maglev's known facts over JSC-style read/write sets; GVN and LICM later |
+| Register allocation | Maglev's one forward pass; TurboFan's linear scan | backtracking; a simple allocator behind a pref | the DFG's per block; Air's greedy | Maglev's one pass |
+| Background compilation | Maglev on 2 threads, TurboFan on 4; the heap broker | a main-thread snapshot, an off-thread build | every tier concurrent; Desired* sets validated | SpiderMonkey's snapshot and JSC's validation now; threads later |
+
+Three of their reasons decide most of the design for TRust:
+- Compile time on short runs. V8 added Maglev for code that spends "a lot of time in functions that
+  don't get hot enough to be optimized by TurboFan" (its Maglev post, on Speedometer), and JSC
+  keeps the DFG because tuning it for long-running code "would hurt short-running programs where
+  the DFG's compile time played a larger role in total run-time than the quality of the code".
+  TRust's fixtures run 30-200 ms, and TRust compiles on the main thread.
+- The heap. TRust's collector is JSC's design point (non-moving, sticky marks, conservative stack
+  scanning), under which "compilers don't have to worry about how to report pointers to the
+  collector" (JSC). V8's and SpiderMonkey's precise maps exist because their collectors move
+  objects ("GC things cannot move" was SpiderMonkey's reason to leave conservative scanning).
+- Write-once code. TRust's code memory is written once and then mapped read-execute, and its native
+  frames keep no frame-pointer chain. JSC's linked DFG and SpiderMonkey patch code to reach frames
+  of invalidated code, and V8 rewrites return addresses it finds by walking frames. JSC's unlinked
+  DFG tests a validity byte at each invalidation point instead (`branchTest8` on
+  JITData::offsetOfIsInvalidated, dfg/DFGSpeculativeJIT.cpp:609) and reaches its exits through a
+  jump table of data (dfg/DFGJITCode.h:156-166); both work with write-once code.
+
+## Design: the tier
+
+1. Its place among the tiers. Functions keep starting on the tree-walker, and their first stage
+   (the template JIT) still compiles at the first bytecode run after 8 calls, as V8 compiles
+   Sparkplug at 8. The tier then compiles a hot function once, whole, with its inlined callees, in
+   place of the second stage: a function the tier compiles gets no second stage, and a function it
+   refuses (an operation it does not handle yet, a size limit) keeps today's second stage until
+   the tier covers it. Whether second stages, their AST splicing and C1 are retired is decided at
+   the phase's end on the measurements (Decision 3).
+
+2. When it compiles. As V8 counts: a budget of executed work, not calls (V8's budget is invocations
+   times bytecode length, drawn down at back edges and returns; TM:187-195 in the survey), so loops
+   and long functions tier sooner per call; the first stage counts its back edges for it (tier 1's
+   step (c)). At Maglev's threshold (400 invocation-equivalents), and only once the function's
+   feedback has settled: V8 waits 500 invocations after any IC change
+   (minimum_invocations_after_ic_update), JSC until 75% of its value profiles are live
+   (CodeBlock.cpp:3020-3089). Compiled once; recompiled only after an invalidation or repeated
+   exits (point 12). This replaces the four inline checkpoints, since no exemplar recompiles a tier
+   on a schedule. Stage 1's note calibrates the numbers by measurement.
+
+3. The front end. At compile start the tier reads every site of the function and of its inlining
+   candidates through W4's read API into an immutable per-compile summary (V8's ProcessedFeedback,
+   JSC's status objects, SpiderMonkey's WarpSnapshot); the builder then reads only that summary and
+   the immutable bytecode (point 13). It builds from the function's first-stage chunk, so pcs,
+   feedback sites and the exits' resume points coincide. One forward pass over the bytecode
+   interprets the canonical frame (locals and operand stack) abstractly, as MaglevGraphBuilder
+   interprets Ignition's registers and WarpBuilder the bytecode stack; loop phis come from a
+   liveness and loop-assignment prepass (jit_ir.rs's Cfg, live_entry_locals). Each value carries
+   known facts (possible shapes, representation, properties loaded under an effect epoch; Maglev's
+   KnownNodeAspects), so the builder never emits a check or a load it has proven. A site with no
+   feedback becomes an unconditional exit that ends its block (Maglev, Warp, the DFG), which gives
+   the tier the regions' scope -- only code that ran is compiled -- without region boundaries.
+
+4. The IR. A CFG of basic blocks of SSA values (all three engines; V8 left the sea of nodes over
+   cache misses, compile time and hidden loops, reasons that are properties of the IR), on
+   jit_ir's blocks, dominators and loops. Values have representations (the tagged word, f64,
+   int32, bool, a cell pointer), and checks are explicit nodes (shape, Number, exact int32, bounds,
+   callee identity or code). Each check carries the frame state of its eager exit, and each
+   effectful node the frame state after it, at the next bytecode (SpiderMonkey's resume-point rule:
+   nodes without side effects need no state). A frame state is the bytecode pc, the IR value of
+   each live local and operand slot, the handler nesting at the pc and the parent state of an
+   inlined frame. Each node declares the abstract heaps it reads and writes (JSC's clobberize over
+   a small hierarchy: named properties by key, elements, array lengths, the frame, everything),
+   which known facts, barrier elision and invalidation points all need. Numbers stay NaN-boxed f64
+   words outside the tier (Decision 5): int32 is a representation inside it, checked on load with
+   FJCVTZS where the CPU has FEAT_JSCVT (one instruction that converts with JavaScript's semantics
+   and sets the Z flag when the result is exact) and boxed with SCVTF on the way out.
+
+5. Speculation, per site (JSC's status model; V8's in substance). Named access: one shape gives a
+   shape check and a direct load or store by slot; up to four shapes, an in-line shape dispatch;
+   megamorphic or mostly slow, the generic path (the engine's stub cache); never run, an exit.
+   Prototype-chain reads: the holder's shape through a dependency (point 7) where SpiderMonkey's
+   test passes, a guard per level otherwise. Elements: the element record's facts as kind checks,
+   with the bounds checks kept (a mid tier runs no range analysis). Arithmetic and comparisons: rule
+   U's value classes choose int32 with overflow checks or f64. Calls: a monomorphic target's
+   identity, or its code for closures of one function (point 8), with a direct call or inlining;
+   natives by builtin id, as in-line operations or through their fast entries; megamorphic sites,
+   the generic call. A site whose exit flag is set (point 12) does not speculate (JSC: "We typically
+   use the presence of an exit flag as an excuse not to speculate at all for that bytecode").
+
+6. Exits (eager deoptimization). A failed check is one instruction into a shared entry (V8's form: a
+   `bl` to a shared label, the exit's index taken from the return address), which saves every
+   register and calls the Rust deoptimizer. The recipe is representation-aware, as V8's
+   translations are (a register or spill slot holding a tagged word, f64, int32 or bool; a
+   constant; captured and duplicated objects for escape analysis, point 9), delta-coded or shared as
+   V8 and SpiderMonkey do. The deoptimizer boxes values, materializes captured objects (a fresh box
+   for each mutable number, as V8 does), records the exit in the exit profile and the failing
+   value's class in the value record (JSC's exits write the profiles), and rebuilds one canonical
+   frame per function, inlined ones included. The innermost frame resumes in its function's
+   first-stage code at the exit's bytecode boundary through that code's per-pc table (JSC's target,
+   through its jitCodeMap; TRust's region bails already land in baseline code at a pc), or in the VM
+   when that function has no first-stage code (evicted, or never compiled; JSC's LLInt fallback).
+   Outer frames resume after their call op with the inner frame's completion, a value or an
+   exception (V8 resumes them at the next bytecode); each frame runs to its completion through a
+   real call, as SpiderMonkey pushes its rebuilt frames, and the outermost completion returns from
+   the optimized activation to its caller. SpiderMonkey's alternative, resuming in its interpreter,
+   rests on its baseline code then needing no per-pc table; TRust's first stage keeps that table
+   for its unwinder anyway, and resuming in compiled code keeps the rest of the activation fast.
+
+7. Dependencies and lazy deoptimization. The builder records each fact it relies on without a check
+   (stable prototype shapes, the Array elements protector, String.prototype's ObjectFuse, constant
+   globals) as desired watchpoints (dependency.rs, attached to no code today); install re-validates
+   them at the end of the compile (V8's commit, JSC's plan finalization) and attaches the code's
+   dependencies. A firing marks the code invalid in a validity word of its own data, unlinks it for
+   new calls (the function falls back to its first stage, as V8 resets the dispatch entry and JSC
+   jettisons), and running frames exit at their next invalidation point. An invalidation point
+   follows every node whose effects can fire a dependency: a load of the validity word and a branch
+   to that point's exit, at the next bytecode boundary (JSC's unlinked DFG). The exemplars split
+   here, and TRust's constraints decide: JSC's linked DFG patches a jump at each point and
+   SpiderMonkey patches its post-call OSI points, which TRust's write-once code rules out; V8
+   rewrites the return address of each frame of marked code, which here would need every call out of
+   optimized code to record where its return address lies (as V8's exit frames do), a lazy exit per
+   call site, and V8's rule against operations that can exit both eagerly and lazily, because such
+   an exit lands mid-bytecode. Exiting at the next bytecode boundary is JSC's argument ("letting the
+   remaining effects of the current bytecode instruction finish executing in optimized code and then
+   triggering an OSR exit right before the start of the next bytecode instruction"); the price is a
+   load and a branch per invalidation point, next to the call or effect it follows. SpiderMonkey's
+   test decides which guards become dependencies: facts that are rarely popped and cheaply detected
+   (doc/how-we-optimize.md:37). References from code to cells are weak, and code whose referenced
+   cell dies is jettisoned (JSC; TRust's call pins are weak today); code an activation runs stays
+   alive (running_code).
+
+8. Inlining. In the builder, as all three do it: the callee's bytecode is built into the caller's
+   graph with its own frame-state chain, so exits rebuild its frame. Maglev's policy: depth 1,
+   callees up to 100 bytecode bytes with 920 cumulative, small callees (up to 27 bytes) to depth 10,
+   call frequency at least 0.95 of the caller's invocations (which needs the per-site call count W3
+   parked), no recursion; and Maglev's polymorphic loads whose arms call constant functions inline
+   those. Closures by code, the direction decided in P2: the call cache gains a "same code, other
+   closure" state, as V8's FeedbackCell, SpiderMonkey's GuardFunctionScript and JSC's despecified
+   executable do, and the guard checks the callee's function literal, with the closure's environment
+   a value. SpiderMonkey's per-call-site callee feedback (trial inlining) waits until spliced
+   callees' shared caches are measured going polymorphic.
+
+9. The mid tier's forms of the program's optimizations. Check and load elimination by known facts
+   during the build (Maglev), cleared by the read/write sets and merged at joins; Maglev's CSE; phi
+   untagging and truncation to int32 where every use truncates; escape analysis as Maglev runs it by
+   default (maglev_escape_analysis): an allocation whose only uses are frame states and stores into
+   other elided allocations is not made, and the exits materialize it (its shape and field sources;
+   nested and duplicated objects by id), for which deopt.rs's CopySlot-only recipes gain that kind.
+   Function-wide value numbering with alias analysis, LICM, range analysis and general allocation
+   sinking are the top tier's (Decision 2).
+
+10. Registers and code. Maglev's allocator: one forward pass over the scheduled blocks, with live
+    ranges and next uses computed first, a value spilled at its definition (one slot), and the
+    register with the farthest next use evicted. The collector scans the native stack and the
+    callee-saved registers conservatively and resolves interior pointers, so spill slots and
+    registers need no maps (JSC); the shared exit entry saves every register, so eager recipes may
+    name registers, and the inputs of lazy exits are spilled at calls, as Maglev spills them. Code
+    generation uses the ARM64 encoder and Decision 23's legalizer; operations the tier does not
+    lower call the register-ABI operations of jit_operations.rs, or exit.
+
+11. Calls, exceptions, polls and the collector. Calls out use the direct-call path through
+    call-cache ways and A2's pickup, natives the lean boundary and their fast entries. A throw
+    inside optimized code exits to the first stage at the throwing bytecode with the exception
+    pending, where the first stage's handlers run (SpiderMonkey compiles no catch blocks; JSC exits
+    on exceptions); compiled handlers wait for a measured need. Entry and back edges poll as the
+    baseline does. Write barriers are elided for cells allocated since the last point that can
+    collect (JSC's epoch analysis, which needs the per-node "may collect" fact; TRust's in-line
+    allocation already needs no barrier before the next safepoint) and are card marks otherwise.
+    JSC's other obligations carry over: code on the stack stays alive, references from code are
+    weak, interior pointers resolve, and stack hygiene keeps dead spill slots from retaining
+    garbage. Shared stubs keep the rule that they build in no per-heap or per-thread address.
+
+12. OSR and reoptimization. OSR entry as JSC's DFG enters: each loop header of the whole-function
+    graph is an entry; the live values are read from the canonical frame and checked against the
+    speculated types at entry, and entry is declined (the frame stays in the baseline) when they
+    disagree; the first stage's back-edge counts (point 2) trigger it, from first-stage frames and
+    from the VM's borrowed frames. Separate per-loop entries (V8, JSC's FTL) are a top tier's.
+    Reoptimization as JSC's exit profile: exits counted per compiled function; past 100 x 2^R
+    (5 x 2^R when the exited frame then loops hot) the code is discarded, each exit taken is
+    recorded as a flag at its bytecode site and kind, the next compile declines those speculations,
+    and the warm-up before it doubles. SpiderMonkey's cause tags mark guards an optimization
+    invented, and their exits set a per-function "not again" flag. Optimization is never disabled
+    for good (JSC, V8). The pieces of P2's parked branch p2-region-s3 (per-site counters on the bail
+    path, the exit profile, discarded code kept until no activation runs it) carry into this.
+
+13. Compiled on the main thread, built for threads. On one CPU background compilation cannot help
+    (SpiderMonkey turns off-thread Ion off there: "Require cpuCount > 1", jit/Ion.cpp:2114-2115).
+    The tier compiles synchronously from its immutable snapshot (point 3), records every assumption
+    as a dependency and validates them at install (JSC's Desired* sets), so compiler threads can be
+    added later under JSC's rules (plans as roots, compiler threads stopped during a collection)
+    without rebuilding the front end, as SpiderMonkey had to when IonBuilder's reliance on global
+    type data kept its building on the main thread.
+
+14. Targets. The snapshot, builder, IR, passes, recipes and deoptimizer are target-neutral; the
+    lowering, register file, exits and entry and resume stubs are per target. ARM64 first; x86-64
+    follows (Decision 6).
+
+## Stages
+
+Each stage: a design note before code with its exit, agreed with the owner where it sets numbers
+(as P2's Decision 2), its own commit series landed on main once validated, and its exit measured on
+main.
+
+0. Tools and contracts. The tier's switches, documented in DIAGNOSTICS.md: a log of compiles,
+   refusals, exits and reoptimizations (as V8's --trace-opt and --trace-deopt); the eager and
+   forced-exit modes (Gates). A census of what the tier must compile: the operations of the hot
+   functions on the fixtures and suites, by share of time, which orders stage 2's coverage.
+1. The skeleton on ARM64. Snapshot, builder, IR with its verifier, register allocator and code
+   generator for a core set (constants, locals, int32 and f64 arithmetic, comparisons and branches,
+   loops, named loads and stores by shape, calls through the existing paths, returns), the generic
+   path for the rest through operation helpers, eager exits into the first stage and the VM,
+   publication through A2, the work budget. Functions with operations outside the set are refused.
+2. Coverage. Elements, allocation in line (literals, constructors), closures, strings through
+   helpers, natives through their entries, exceptions by exit, `arguments` and rest elided where
+   proven, getters and setters as calls; dependencies with invalidation points; the exit profile
+   and reoptimization.
+3. Inlining, with frame-state chains, Maglev's policy, closures by code and per-site call counts.
+4. Known facts, CSE, untagging and truncation, escape analysis with materialization.
+5. OSR at loop headers.
+6. x86-64 (Decision 6).
+7. The phase's end: the second stage's fate (Decision 3), the phase-end gate, the exit session.
+
+Alongside, as P2's independent items were, when a stage's builds and timing leave room: the
+carried items below that do not touch the tier.
+
+## Gates
+
+P2's rules hold (its Decision 8: tests are a diagnostic tool, run in full at a major phase's end or
+after a large change to what they measure). An optimizing tier adds what the exemplars run their
+own tiers under, because a speculation that never fails in the default configuration is an exit
+path that never runs:
+- The tier eager: every function the tier accepts compiled at its first opportunity, so Test262 and
+  the lib suite run their code through it (V8's --stress-maglev, "a very low interrupt budget for
+  maglev"; SpiderMonkey's eager Ion compilation, a warm-up threshold of 0,
+  jit/JitOptions.cpp:448-451; JSC's forceEagerCompilation).
+- Exits forced: a mode that fails a check every Nth time one is passed, so every exit's frame
+  reconstruction and materialization runs (V8's --deopt-every-n-times, "deoptimize every n times a
+  deopt point is passed"; SpiderMonkey's bailAfter counter, jit/JitRuntime.h:216-224).
+- difftest across the tiers with the new tier in its matrix, and its corpus seeded with the
+  speculation-heavy shapes (polymorphic sites, int32 overflow, holes, prototype changes during a
+  loop, getters installed late, closures of one function).
+- GC stress over the tier's suites when the tier or its contract with the collector changes (stack
+  scanning, barriers, allocation in line).
+Test262 in full at --tier=jit with the tier eager and with exits forced joins the phase-end list;
+each stage's design note says which of these its steps run before landing.
+
+## Measurement
+
+P2's session, unchanged in method (P2's "Measurement"; target/p2/p2-exit/session.sh and
+report.py; uncapped clocks through target/p2/timing/uncapped.sh), with node-mg as the yardstick
+and full Node and node-sp alongside, plus:
+- The fixtures' steady state: each fixture's timed work repeated nine more times, each pass timed
+  (target/p3/attrib/fx2), the median of passes 2-10 reported beside the measured pass.
+- The tier's own costs: compile time (in ms and as a share of the run), code bytes, exits by reason
+  and site, reoptimizations, and functions refused and why, from the stage 0 log.
+- Attribution: flat profiles of both engines on the same work (target/p3/attrib/categorize.py) at
+  each stage's exit.
+- Instruction counts follow P2's rules (fat LTO, the series' own base, and for a JIT change
+  TRUST_JS_GC_INCREMENTAL=0 beside the default; P2's measuring note in "Carried to Phase 3").
+
+## Decisions for the owner (proposed)
+
+1. The phase exit. Recommended: each fixture within 2x of node-mg in its measured pass and in steady
+   state, and Octane's geomean over the 15 benchmarks Node runs within 2x of node-mg, in one
+   session; Web Tooling, ARES-6, the calls, full Node, TRust's replays, peak RSS and compile time
+   reported. From today that needs Vue 2.08x faster in its measured pass and 1.81x in steady state,
+   React 1.25x and 1.72x, Djot 1.01x and 2.22x, and Octane 2.43x (2.24x without zlib, whose asm.js
+   V8 runs as WebAssembly). The alternative, in P2's form: the fixtures' measured passes only. Stage
+   notes propose their own exits for agreement, as in P2.
+2. Scope. Recommended: P3 builds the mid tier and its forms of the program's optimizations (point
+   9). The top tier (function-wide value numbering and load elimination with alias analysis,
+   LICM, range analysis with bounds-check elimination, general allocation sinking, per-loop OSR
+   compiles, polymorphic call inlining, a greedy register allocator) is planned at P3's exit, on
+   the mid tier's front end and its measurements. The alternative: the top tier as P3's second
+   half.
+3. The second stage. The tier replaces it for the functions it compiles, second stages remain for
+   functions it refuses, and at the phase's end they are retired or kept on the measurements. C3
+   on A2 is not landed, since compiling once on settled feedback is the tier's own policy (point
+   2); tier 1's step (c) becomes the tier's work budget and OSR trigger (points 2 and 12).
+4. The design forks as the exemplar survey matches them: points 2-13. The standing approval ("as
+   recommended as long as they aren't simply to make implementation simpler") covers them unless
+   the owner says otherwise; none rests on ease. Point 7 is the one where the exemplars split and
+   TRust's write-once code and frames decide: invalidation points that test a validity word (JSC's
+   unlinked DFG) over V8's return-address rewriting, at a load and a branch per point.
+5. Values. Numbers stay NaN-boxed f64 words, with int32 a representation inside the tier. All three
+   exemplars have an int32 value tag (V8's Smis, SpiderMonkey's and JSC's int32 tags); one would
+   change every tier, the object model and the embedding, so it is not proposed for P3, and the
+   owner may want it considered on its own.
+6. x86-64. Recommended: the tier's x86-64 lowering as P3's last tier stage, so the two backends do
+   not diverge further (x86-64 has no regions, chains, direct calls or shared stubs today); the
+   alternative is after P3. Until then x86-64 keeps passing its suites on zombie with the first and
+   second stages.
+7. Gates: the eager and forced-exit modes join the phase-end gate, with Test262 in full under both,
+   and difftest's matrix gains the tier.
+
+## Non-goals
+
+The top tier (Decision 2); compiler threads (point 13 keeps the way open); an int32 value tag
+(Decision 5); moving or compacting collection; concurrent marking; startup snapshots (P4);
+Speedometer acceptance beyond the replays.
+
+## Risks
+
+- Exits: every exit must rebuild exact frames (handlers, environments, `this`, new.target, arguments
+  objects, TDZ state); the forced-exit mode, difftest and Test262 with the tier eager guard them.
+- Effects: getters, setters, Proxy traps, valueOf and toString and every other re-entry make most
+  operations effectful; a wrong read/write set is a miscompile, and a missing invalidation point a
+  stale speculation. The sets start conservative and narrow only with tests.
+- The collector: optimized code keeps raw pointers in registers and spill slots, which the
+  conservative scan covers, but barrier elision and incremental marking's invariants must hold
+  across every allocation and safepoint; GC stress and TRUST_JS_GC_VERIFY run over the tier's
+  suites.
+- Compile time: the tier compiles on the main thread inside 30-200 ms fixtures. Maglev's speed is
+  the reference (by V8's own figures 10-20x slower than Sparkplug and 10-100x faster than
+  TurboFan), measured at each stage.
+- Hardening: generated code runs outside Rust's checks. Bounds checks stay (no range analysis), and
+  where a later proof removes one, a trap remains (V8's turbo_typer_hardening).
+- Scale: this is the program's largest phase. The second stage remains the fallback until the tier
+  covers its functions, and each stage lands on main as validated.
+
+## Carried from Phase 2
+
+Each item of P2's "Carried to Phase 3", and where it goes:
+- Exit sites with recompilation (P2's Decision 27): point 12; branch p2-region-s3's pieces carry.
+- A filtering write barrier: independent, census first as recorded; the tier's barrier elision
+  changes how many barriers run, so the census follows stage 2.
+- C3 on A2: not landed (Decision 3); branch p2-c3-a2 is kept until the tier's policy lands.
+- Tier 1's step (c): the tier's work budget and OSR (points 2 and 12).
+- Closure-call inlining by the callee's code: point 8.
+- Candidate 2's step 3 (includes, indexOf and substring as call templates): independent; the tier's
+  builtin lowering reuses its typed helpers.
+- The lean native boundary on x86-64's cached calls: independent.
+- An interruption in a native's error type: independent; the tier's native calls gain from it (the
+  post-native poll).
+- Property stubs in the first stage: independent.
+- String building (candidate 6): independent.
+- A small array's elements in its cell: independent, an object-model item; the tier's in-line
+  allocation and escape analysis use the layout it settles.
+- W4 step 8 (allocation-site counts and survival): with escape analysis (stage 4), which decides
+  from them what to elide.
+- The RegExp legacy features proposal's [[LegacyFeaturesEnabled]]: the owner's call, unchanged.
+- The measuring note on instruction counts with marking on: Measurement.
+
+## Stage records
+
+Each stage's design note, written before its code, then its gates and exit measurement.
