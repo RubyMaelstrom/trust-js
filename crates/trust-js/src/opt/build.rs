@@ -233,8 +233,6 @@ fn int32_hint(values: &ValuesView) -> bool {
 /// by normal edges, in reverse postorder, their dominators and natural loops.
 struct Flow {
     rpo: Vec<BlockId>,
-    /// Each Cfg block's index in `rpo` ([`UNREACHED`] for a block the entry does not reach).
-    order: Vec<u32>,
     /// The loop each Cfg block heads, an index into `loops`.
     heads: Vec<Option<usize>>,
     loops: Vec<Loop>,
@@ -277,6 +275,7 @@ impl Flow {
         }
         post.reverse();
         let rpo = post;
+        // Each Cfg block's index in `rpo` (UNREACHED for a block the entry does not reach).
         let mut order = vec![UNREACHED; blocks.len()];
         for (index, id) in rpo.iter().enumerate() {
             order[ix(*id)] = index as u32;
@@ -377,12 +376,7 @@ impl Flow {
             heads[ix(rpo[header])] = Some(loops.len());
             loops.push(found);
         }
-        Ok(Flow {
-            rpo,
-            order,
-            heads,
-            loops,
-        })
+        Ok(Flow { rpo, heads, loops })
     }
 }
 
