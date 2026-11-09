@@ -1242,57 +1242,34 @@ mod sys {
     }
 }
 
-#[cfg(all(target_arch = "x86_64", target_os = "linux"))]
+/// Linux: a mapping of its own per code object (`alloc_exec`), and the code region's reservation,
+/// commits and decommits (`jit_code_region.rs`), as SpiderMonkey's ReserveProcessExecutableMemory,
+/// CommitPages and DecommitPages do them (jit/ProcessExecutableMemory.cpp:465-614).
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    target_os = "linux"
+))]
 mod sys {
-    extern "C" {
-        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-        fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
-        fn munmap(addr: *mut u8, len: usize) -> i32;
-    }
-    const PROT_READ: i32 = 1;
-    const PROT_WRITE: i32 = 2;
-    const PROT_EXEC: i32 = 4;
-    const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
-
-    pub unsafe fn alloc_exec(src: *const u8, len: usize) -> *mut u8 {
-        let mem = mmap(
-            std::ptr::null_mut(),
-            len,
-            PROT_READ | PROT_WRITE,
-            MAP_PRIVATE_ANON,
-            -1,
-            0,
-        );
-        if mem as isize == -1 {
-            return std::ptr::null_mut();
-        }
-        std::ptr::copy_nonoverlapping(src, mem, len);
-        if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 {
-            munmap(mem, len);
-            return std::ptr::null_mut();
-        }
-        mem
-    }
-
-    pub unsafe fn free_exec(mem: *mut u8, len: usize) {
-        munmap(mem, len);
-    }
-}
-
-#[cfg(all(target_arch = "aarch64", target_os = "linux"))]
-mod sys {
+    #[cfg(target_arch = "aarch64")]
     use core::arch::asm;
 
     extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         fn mprotect(addr: *mut u8, len: usize, prot: i32) -> i32;
         fn munmap(addr: *mut u8, len: usize) -> i32;
+        fn sysconf(name: i32) -> i64;
     }
+    const PROT_NONE: i32 = 0;
     const PROT_READ: i32 = 1;
     const PROT_WRITE: i32 = 2;
     const PROT_EXEC: i32 = 4;
     const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+    const MAP_FIXED: i32 = 0x10;
+    const MAP_NORESERVE: i32 = 0x4000;
+    /// glibc's and musl's `_SC_PAGESIZE`.
+    const SC_PAGESIZE: i32 = 30;
 
+    #[cfg(target_arch = "aarch64")]
     unsafe fn flush_icache(start: *mut u8, len: usize) {
         let ctr: usize;
         asm!("mrs {ctr}, ctr_el0", ctr = out(reg) ctr, options(nostack, preserves_flags));
@@ -1313,6 +1290,19 @@ mod sys {
         asm!("dsb ish", "isb", options(nostack, preserves_flags));
     }
 
+    /// x86-64's instruction fetches see the stores before them.
+    #[cfg(target_arch = "x86_64")]
+    unsafe fn flush_icache(_start: *mut u8, _len: usize) {}
+
+    /// Copy `len` bytes of code from `src` to the writable pages at `mem`, flush them to the
+    /// instruction side, and make the pages readable and executable, no longer writable. False
+    /// when the system refuses the protection.
+    pub unsafe fn publish(mem: *mut u8, src: *const u8, len: usize) -> bool {
+        std::ptr::copy_nonoverlapping(src, mem, len);
+        flush_icache(mem, len);
+        mprotect(mem, len, PROT_READ | PROT_EXEC) == 0
+    }
+
     pub unsafe fn alloc_exec(src: *const u8, len: usize) -> *mut u8 {
         let mem = mmap(
             std::ptr::null_mut(),
@@ -1325,9 +1315,7 @@ mod sys {
         if mem as isize == -1 {
             return std::ptr::null_mut();
         }
-        std::ptr::copy_nonoverlapping(src, mem, len);
-        flush_icache(mem, len);
-        if mprotect(mem, len, PROT_READ | PROT_EXEC) != 0 {
+        if !publish(mem, src, len) {
             munmap(mem, len);
             return std::ptr::null_mut();
         }
@@ -1337,13 +1325,87 @@ mod sys {
     pub unsafe fn free_exec(mem: *mut u8, len: usize) {
         munmap(mem, len);
     }
+
+    /// The system's page size.
+    pub fn page_size() -> usize {
+        // SAFETY: sysconf has no preconditions.
+        let size = unsafe { sysconf(SC_PAGESIZE) };
+        usize::try_from(size)
+            .ok()
+            .filter(|size| size.is_power_of_two())
+            .unwrap_or(4096)
+    }
+
+    /// `len` bytes of addresses, a multiple of the page size, with no access and no memory
+    /// behind them; null when the system refuses (an address-space limit).
+    pub unsafe fn reserve(len: usize) -> *mut u8 {
+        let mem = mmap(
+            std::ptr::null_mut(),
+            len,
+            PROT_NONE,
+            MAP_PRIVATE_ANON | MAP_NORESERVE,
+            -1,
+            0,
+        );
+        if mem as isize == -1 {
+            std::ptr::null_mut()
+        } else {
+            mem
+        }
+    }
+
+    /// Back the reserved pages `mem..mem + len` with new zeroed memory, readable and writable: a
+    /// fixed mapping over them. False when the system refuses, after which the range may be in
+    /// any state (a kernel that unmaps before it maps can leave it unmapped).
+    pub unsafe fn commit(mem: *mut u8, len: usize) -> bool {
+        mmap(
+            mem,
+            len,
+            PROT_READ | PROT_WRITE,
+            MAP_PRIVATE_ANON | MAP_FIXED,
+            -1,
+            0,
+        ) == mem
+    }
+
+    /// Free the memory behind the pages `mem..mem + len` and keep their addresses reserved,
+    /// with no access: a fixed no-access mapping over them, which (no reserve, as the
+    /// reservation's) merges with its no-access neighbours. False when the system refuses, as
+    /// [`commit`].
+    pub unsafe fn decommit(mem: *mut u8, len: usize) -> bool {
+        mmap(
+            mem,
+            len,
+            PROT_NONE,
+            MAP_PRIVATE_ANON | MAP_FIXED | MAP_NORESERVE,
+            -1,
+            0,
+        ) == mem
+    }
 }
 
+/// Windows: a reservation and commit of its own per code object (`alloc_exec`), and the code
+/// region's reservation, commits and decommits (`jit_code_region.rs`).
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
     target_os = "windows"
 ))]
 mod sys {
+    /// SYSTEM_INFO.
+    #[repr(C)]
+    struct SystemInfo {
+        _oem_id: u32,
+        page_size: u32,
+        _minimum_application_address: *mut u8,
+        _maximum_application_address: *mut u8,
+        _active_processor_mask: usize,
+        _number_of_processors: u32,
+        _processor_type: u32,
+        _allocation_granularity: u32,
+        _processor_level: u16,
+        _processor_revision: u16,
+    }
+
     #[link(name = "kernel32")]
     extern "system" {
         fn VirtualAlloc(addr: *mut u8, len: usize, kind: u32, protect: u32) -> *mut u8;
@@ -1351,27 +1413,37 @@ mod sys {
         fn VirtualFree(addr: *mut u8, len: usize, kind: u32) -> i32;
         fn FlushInstructionCache(process: *mut u8, addr: *const u8, len: usize) -> i32;
         fn GetCurrentProcess() -> *mut u8;
+        fn GetSystemInfo(info: *mut SystemInfo);
     }
-    const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_DECOMMIT: u32 = 0x4000;
     const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_NOACCESS: u32 = 0x01;
     const PAGE_READWRITE: u32 = 0x04;
     const PAGE_EXECUTE_READ: u32 = 0x20;
+
+    /// Copy `len` bytes of code from `src` to the writable pages at `mem`, make the pages
+    /// readable and executable, no longer writable, and flush them to the instruction side.
+    /// False when the system refuses.
+    pub unsafe fn publish(mem: *mut u8, src: *const u8, len: usize) -> bool {
+        std::ptr::copy_nonoverlapping(src, mem, len);
+        let mut old = 0;
+        VirtualProtect(mem, len, PAGE_EXECUTE_READ, &mut old) != 0
+            && FlushInstructionCache(GetCurrentProcess(), mem, len) != 0
+    }
 
     pub unsafe fn alloc_exec(src: *const u8, len: usize) -> *mut u8 {
         let mem = VirtualAlloc(
             std::ptr::null_mut(),
             len,
-            MEM_COMMIT_RESERVE,
+            MEM_COMMIT | MEM_RESERVE,
             PAGE_READWRITE,
         );
         if mem.is_null() {
             return mem;
         }
-        std::ptr::copy_nonoverlapping(src, mem, len);
-        let mut old = 0;
-        if VirtualProtect(mem, len, PAGE_EXECUTE_READ, &mut old) == 0
-            || FlushInstructionCache(GetCurrentProcess(), mem, len) == 0
-        {
+        if !publish(mem, src, len) {
             VirtualFree(mem, 0, MEM_RELEASE);
             return std::ptr::null_mut();
         }
@@ -1380,6 +1452,72 @@ mod sys {
 
     pub unsafe fn free_exec(mem: *mut u8, _len: usize) {
         VirtualFree(mem, 0, MEM_RELEASE);
+    }
+
+    /// The system's page size.
+    pub fn page_size() -> usize {
+        // SAFETY: SYSTEM_INFO is plain data, which GetSystemInfo fills.
+        let info = unsafe {
+            let mut info = std::mem::zeroed::<SystemInfo>();
+            GetSystemInfo(&mut info);
+            info
+        };
+        Some(info.page_size as usize)
+            .filter(|size| size.is_power_of_two())
+            .unwrap_or(4096)
+    }
+
+    /// `len` bytes of addresses, a multiple of the page size, reserved with no access and
+    /// nothing committed; null when the system refuses.
+    pub unsafe fn reserve(len: usize) -> *mut u8 {
+        VirtualAlloc(std::ptr::null_mut(), len, MEM_RESERVE, PAGE_NOACCESS)
+    }
+
+    /// Commit the reserved pages `mem..mem + len`, zeroed, readable and writable. False when
+    /// the system refuses, which leaves them reserved.
+    pub unsafe fn commit(mem: *mut u8, len: usize) -> bool {
+        VirtualAlloc(mem, len, MEM_COMMIT, PAGE_READWRITE) == mem
+    }
+
+    /// Decommit the pages `mem..mem + len`, which stay reserved with no access. False when the
+    /// system refuses.
+    pub unsafe fn decommit(mem: *mut u8, len: usize) -> bool {
+        VirtualFree(mem, len, MEM_DECOMMIT) != 0
+    }
+}
+
+/// The process's code region (Linux and Windows): see `jit_code_region.rs`.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_code_region.rs"]
+mod code_region;
+
+/// No code region: macOS keeps its MAP_JIT mapping per object (its JIT write protection and
+/// MAP_JIT's rules would make a region another design), and other targets have no native code.
+#[cfg(not(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "linux", target_os = "windows")
+)))]
+mod code_region {
+    /// No region exists here, so no value.
+    pub(crate) enum CodeRegion {}
+
+    impl CodeRegion {
+        pub(crate) fn allocate(&self, _code: &[u8]) -> Option<*mut u8> {
+            match *self {}
+        }
+
+        /// # Safety
+        /// As the region's.
+        pub(crate) unsafe fn free(&self, _mem: *mut u8, _len: usize) {
+            match *self {}
+        }
+    }
+
+    pub(crate) fn process_region() -> Option<&'static CodeRegion> {
+        None
     }
 }
 
@@ -1709,11 +1847,24 @@ mod executable_code_budget_tests {
 pub(crate) struct ExecutableBuffer {
     mem: *mut u8,
     len: usize,
+    /// The code region whose pages hold the code, or `None` for a mapping of its own (macOS, or
+    /// the region could not take it): where the drop gives the memory back.
+    region: Option<&'static code_region::CodeRegion>,
     _reservation: ExecutableCodeReservation<'static>,
 }
 
 impl ExecutableBuffer {
+    /// `bytes` as code: in the process's code region on Linux and Windows, else (or when the
+    /// region cannot take them) in a mapping of its own.
     pub(crate) fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        Self::from_bytes_in(bytes, code_region::process_region())
+    }
+
+    /// `bytes` as code in `region`'s pages, else in a mapping of its own.
+    fn from_bytes_in(
+        bytes: &[u8],
+        region: Option<&'static code_region::CodeRegion>,
+    ) -> Option<Self> {
         if bytes.is_empty() {
             return None;
         }
@@ -1731,13 +1882,21 @@ impl ExecutableBuffer {
             )
         ))]
         {
-            let mem = unsafe { sys::alloc_exec(bytes.as_ptr(), bytes.len()) };
+            let placed = region.and_then(|region| Some((region.allocate(bytes)?, region)));
+            let (mem, region) = match placed {
+                Some((mem, region)) => (mem, Some(region)),
+                None => (
+                    unsafe { sys::alloc_exec(bytes.as_ptr(), bytes.len()) },
+                    None,
+                ),
+            };
             if mem.is_null() {
                 return None;
             }
             Some(Self {
                 mem,
                 len: bytes.len(),
+                region,
                 _reservation: reservation,
             })
         }
@@ -1752,7 +1911,7 @@ impl ExecutableBuffer {
             )
         )))]
         {
-            let _ = (bytes, reservation);
+            let _ = (bytes, reservation, region);
             None
         }
     }
@@ -1779,7 +1938,10 @@ impl Drop for ExecutableBuffer {
             )
         ))]
         unsafe {
-            sys::free_exec(self.mem, self.len);
+            match self.region {
+                Some(region) => region.free(self.mem, self.len),
+                None => sys::free_exec(self.mem, self.len),
+            }
         }
     }
 }
