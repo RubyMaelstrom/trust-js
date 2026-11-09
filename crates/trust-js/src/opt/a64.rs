@@ -43,6 +43,7 @@ const NE: u32 = 1;
 const LO: u32 = 3;
 const MI: u32 = 4;
 const VS: u32 = 6;
+const VC: u32 = 7;
 const HI: u32 = 8;
 const LS: u32 = 9;
 const GE: u32 = 10;
@@ -63,6 +64,9 @@ const D31: u32 = 31;
 pub(crate) struct Options {
     /// The forced-exit gate's countdown at every check and effect (TRUST_JS_OPT_EXIT_EVERY).
     pub(crate) forced_exits: bool,
+    /// The sequences for a core without FEAT_JSCVT where it has it (tests; the switch
+    /// TRUST_JS_JIT_NO_JSCVT does the same for a process through jscvt_available).
+    pub(crate) no_jscvt: bool,
 }
 
 impl Options {
@@ -70,6 +74,7 @@ impl Options {
     pub(crate) fn from_env() -> Self {
         Options {
             forced_exits: crate::opt::exit_every() > 0,
+            no_jscvt: false,
         }
     }
 }
@@ -305,6 +310,14 @@ enum Cold {
         label: usize,
         word: u32,
         exit: usize,
+        resume: usize,
+    },
+    /// TruncateToInt32 without FEAT_JSCVT, when the conversion to 64 bits saturated: |x| is 2^63
+    /// or more, or infinite. The low word of ToInt32 into `dst` from the f64 in `d`.
+    Truncate {
+        label: usize,
+        d: u32,
+        dst: u32,
         resume: usize,
     },
     /// A poll's slow path.
@@ -704,6 +717,11 @@ impl Gen<'_> {
     }
 
     /// Where `n` writes its x value: its home register, or x9 for a spill slot or no home.
+    /// Whether to use FJCVTZS (ToInt32 itself, FEAT_JSCVT).
+    fn jscvt(&self) -> bool {
+        jscvt_available() && !self.options.no_jscvt
+    }
+
     fn gp_dst(&self, n: NodeIx) -> u32 {
         match self.home(n) {
             Home::Gp(r) => u32::from(r),
@@ -910,7 +928,7 @@ impl Gen<'_> {
                 let site = self.check_exit(n)?;
                 let d = self.fp(input(0), D31);
                 let w = self.gp_dst(n);
-                if jscvt_available() {
+                if self.jscvt() {
                     // Z is set exactly when the conversion is exact and the input is not -0
                     // (FEAT_JSCVT; FPToFixedJS clears Z for -0).
                     self.a.fjcvtzs_w_d(w, d);
@@ -1009,6 +1027,36 @@ impl Gen<'_> {
                     self.fp_done(n, d);
                 }
             }
+            NodeOp::TruncateToInt32 => {
+                if !unused {
+                    let d = self.fp(input(0), D31);
+                    let w = self.gp_dst(n);
+                    if self.jscvt() {
+                        // ToInt32 itself (FEAT_JSCVT), as V8's TruncateDoubleToI uses it.
+                        self.a.fjcvtzs_w_d(w, d);
+                    } else {
+                        // Below 2^63 the conversion to 64 bits is exact and its low word is
+                        // ToInt32 (NaN converts to 0). INT64_MIN and INT64_MAX mean it saturated,
+                        // which subtracting or adding 1 detects as signed overflow (V8's
+                        // TryConvertDoubleToInt64); the cold path computes the low word then.
+                        let saturated = self.a.new_label();
+                        let resume = self.a.new_label();
+                        self.a.fcvtzs_x_d(w, d);
+                        self.a.cmp_imm_x(w, 1);
+                        self.a.ccmn_imm_x(w, 1, 0b0001, VC);
+                        self.a.b_cond(VS, saturated);
+                        self.a.mov_w(w, w);
+                        self.a.bind(resume);
+                        self.cold.push(Cold::Truncate {
+                            label: saturated,
+                            d,
+                            dst: w,
+                            resume,
+                        });
+                    }
+                    self.gp_done(n, w);
+                }
+            }
             NodeOp::F64ToTagged => {
                 if !unused {
                     let d = self.fp(input(0), D31);
@@ -1105,6 +1153,16 @@ impl Gen<'_> {
                 self.a.shift_w(1, w, a, b);
                 self.a.tbnz(w, 31, site); // past int32
                 self.gp_done(n, w);
+            }
+            NodeOp::I32UShrToF64 => {
+                if !unused {
+                    let a = self.gp(input(0), X16);
+                    let b = self.gp(input(1), X17);
+                    self.a.shift_w(1, X16, a, b);
+                    let d = self.fp_dst(n);
+                    self.a.ucvtf_d_w(d, X16);
+                    self.fp_done(n, d);
+                }
             }
             NodeOp::I32Not => {
                 if !unused {
@@ -1536,6 +1594,34 @@ impl Gen<'_> {
                     self.a.mov_imm64(X17, crate::value::PACK_CANON_NAN);
                     self.a.cmp_reg_x(word, X17);
                     self.a.b_cond(NE, exit);
+                    self.a.b(resume);
+                }
+                Cold::Truncate {
+                    label,
+                    d,
+                    dst,
+                    resume,
+                } => {
+                    // |x| >= 2^63, so its exponent's shift e - 1075 is at least 11: the implicit
+                    // bit and every bit above the mantissa's land at bit 63 or above, and the low
+                    // word of the bits shifted by it is that of |x| (zero from a shift of 32 up,
+                    // 2^84 and the infinities among them); the sign negates it modulo 2^32.
+                    let zero = self.a.new_label();
+                    let positive = self.a.new_label();
+                    self.a.bind(label);
+                    self.a.fmov_x_d(X16, d);
+                    self.a.ubfx(X17, X16, 52, 11);
+                    self.a.sub_imm(X17, X17, 1075);
+                    self.a.cmp_imm_x(X17, 32);
+                    self.a.b_cond(GE, zero);
+                    self.a.lsl_reg(X30, X16, X17);
+                    self.a.tbz(X16, 63, positive);
+                    self.a.neg_w(X30, X30);
+                    self.a.bind(positive);
+                    self.a.mov_w(dst, X30);
+                    self.a.b(resume);
+                    self.a.bind(zero);
+                    self.a.mov_w(dst, 31);
                     self.a.b(resume);
                 }
                 Cold::Jump { label, target } => {

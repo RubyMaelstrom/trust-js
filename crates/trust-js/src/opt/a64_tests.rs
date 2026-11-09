@@ -334,6 +334,144 @@ fn int32_arithmetic_exits_on_overflow_fractions_and_minus_zero() {
     assert_eq!(exits().len(), 3);
 }
 
+/// `f(a, b)` (LoadLocal 0, LoadLocal 1, a bitwise operation at pc 2, Return) on Numbers: both
+/// words checked at the operation's pc and truncated to their ToInt32, then `op`: an int32 boxed
+/// for `I32Or`, the uint32 Number for `I32UShrToF64`.
+fn truncated(op: NodeOp) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at_op = b.state(2, &[x, y], &[], &[]);
+    let int = |b: &mut Build, v| {
+        let f = b.exiting(
+            entry,
+            NodeOp::CheckNumber,
+            &[v],
+            Rep::F64,
+            2,
+            at_op,
+            ExitReason::NotNumber,
+        );
+        b.node(entry, NodeOp::TruncateToInt32, &[f], Rep::I32, 2)
+    };
+    let ix = int(&mut b, x);
+    let iy = int(&mut b, y);
+    let boxed = if op == NodeOp::I32UShrToF64 {
+        let result = b.node(entry, op, &[ix, iy], Rep::F64, 2);
+        b.node(entry, NodeOp::F64ToTagged, &[result], Rep::Tagged, 2)
+    } else {
+        let result = b.node(entry, op, &[ix, iy], Rep::I32, 2);
+        b.node(entry, NodeOp::I32ToTagged, &[result], Rep::Tagged, 2)
+    };
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    b.g
+}
+
+/// JavaScript source for `x`, which parses back to it.
+fn js_number(x: f64) -> String {
+    if x.is_nan() {
+        "NaN".into()
+    } else if x.is_infinite() {
+        if x > 0.0 { "Infinity" } else { "-Infinity" }.into()
+    } else if x == 0.0 && x.is_sign_negative() {
+        "-0".into()
+    } else {
+        format!("({x:?})")
+    }
+}
+
+#[test]
+fn truncation_is_to_int32_with_and_without_fjcvtzs() {
+    let two = |e: i32| 2f64.powi(e);
+    // In the int32 range and past it; fractions, -0, NaN and the infinities; past 2^63, where
+    // a conversion to 64 bits saturates and the low word comes from the mantissa (-2^63
+    // converts exactly to INT64_MIN, which reads as saturated); 2^84 and above, whose low word
+    // is zero.
+    let values = [
+        0.0,
+        -0.0,
+        1.0,
+        -1.0,
+        1.9,
+        -1.9,
+        0.5,
+        two(31) - 1.0,
+        -two(31),
+        two(31),
+        -two(31) - 1.0,
+        two(32) - 1.0,
+        two(32),
+        two(32) + 1.5,
+        1e10,
+        -1e10,
+        two(53),
+        two(53) + 2.0,
+        1e18,
+        two(63),
+        -two(63),
+        two(63) + two(11),
+        -two(63) - two(11),
+        two(64) + two(12),
+        two(63) + two(62),
+        two(83) + two(31),
+        -two(83) - two(31),
+        two(84),
+        1e20,
+        -1e20,
+        1e300,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        5e-324,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    for no_jscvt in [false, true] {
+        let mut engine = fixture(
+            "function or(a, b) { return a | b; } or(1, 2);
+             function ushr(a, b) { return a >>> b; } ushr(1, 2);",
+        );
+        for (name, op) in [("or", Op::BitOr), ("ushr", Op::UShr)] {
+            let chunk = chunk_of(&mut engine, name);
+            assert_eq!(chunk.jit_ops()[2], op, "{name}: {:?}", chunk.jit_ops());
+        }
+        let options = Options {
+            no_jscvt,
+            ..Options::default()
+        };
+        install(&mut engine, "or", &truncated(NodeOp::I32Or), options);
+        install(
+            &mut engine,
+            "ushr",
+            &truncated(NodeOp::I32UShrToF64),
+            options,
+        );
+        exits();
+        for x in values {
+            let source = js_number(x);
+            let int = crate::eval::to_int32(x);
+            let context = format!("{source} without FJCVTZS: {no_jscvt}");
+            assert_eq!(
+                eval(&mut engine, &format!("or({source}, 0)")),
+                int.to_string(),
+                "{context}"
+            );
+            assert_eq!(
+                eval(&mut engine, &format!("ushr({source}, 0)")),
+                (int as u32).to_string(),
+                "{context}"
+            );
+        }
+        assert_eq!(eval(&mut engine, "or(-1.5, 2147483648)"), "-1");
+        assert_eq!(eval(&mut engine, "ushr(-1, 28)"), "15");
+        assert_eq!(eval(&mut engine, "ushr(-1.5, 32)"), "4294967295");
+        assert!(exits().is_empty(), "Numbers never exit");
+        assert_eq!(eval(&mut engine, "or('3', 4)"), "7");
+        assert_eq!(exits(), vec![(2, ExitReason::NotNumber)]);
+    }
+}
+
 /// `getx(o)` (GetPropLocal 0 at pc 0, Return): the receiver's shape checked against its site's
 /// way, the field loaded where the way's location word says.
 fn getx(chunk: &Chunk) -> Graph {
@@ -1072,7 +1210,10 @@ fn forced_exits_resume_checks_and_effects_in_the_vm() {
         &mut engine,
         "count",
         &count(),
-        Options { forced_exits: true },
+        Options {
+            forced_exits: true,
+            ..Options::default()
+        },
     );
     engine.interp.opt_exit_every = 7;
     engine.interp.opt_exit_countdown = 7;
@@ -1100,7 +1241,10 @@ fn forced_exits_resume_checks_and_effects_in_the_vm() {
         &mut engine,
         "callf",
         &callf(),
-        Options { forced_exits: true },
+        Options {
+            forced_exits: true,
+            ..Options::default()
+        },
     );
     engine.interp.opt_exit_every = 2;
     engine.interp.opt_exit_countdown = 2;
@@ -1576,7 +1720,10 @@ fn exits_inside_a_try_rebuild_its_handler_for_the_vm() {
         &mut engine,
         "tl",
         &try_loop(false),
-        Options { forced_exits: true },
+        Options {
+            forced_exits: true,
+            ..Options::default()
+        },
     );
     engine.interp.opt_exit_every = 3;
     engine.interp.opt_exit_countdown = 3;

@@ -65,6 +65,13 @@ const PROGRAMS: &[&str] = &[
     // for-of over an Array.
     "function total(a) { let s = 0; for (const v of a) s += v; return s; }\n\
      const arr = [1, 2, 3, 4, 5]; let t = 0; for (let k = 0; k < 3000; k++) t += total(arr); t",
+    // ToInt32 of doubles: products and sums past the int32 range, fractions, NaN, the
+    // infinities, 2^63 and past it, and `>>>`'s uint32 results.
+    "function mix(a, b) { return ((a * b) & 0xffff) ^ ((a + 0.5) | 0) ^ ~(b * 1.5) ^ \
+     ((a * 65536 * 65536) >>> 0) ^ (b >>> (a & 31)); }\n\
+     const vals = [0, -0, 1.5, -1.5, 2147483648, -2147483649, 4294967296.5, 9007199254740992, \
+     1e20, -1e20, 9223372036854777856, Infinity, -Infinity, NaN, 1e300];\n\
+     let t = 0; for (let k = 0; k < 3000; k++) t = (t + mix(vals[k % vals.length], k)) % 1000003; t",
     // A shape change after the feedback settles.
     "function getx(o) { return o.x; }\n\
      let t = 0; for (let k = 0; k < 3000; k++) t += getx(k < 2500 ? {x: k} : {y: 0, x: -k}); t",

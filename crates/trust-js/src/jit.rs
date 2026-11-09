@@ -3641,6 +3641,22 @@ mod asm {
         pub fn lsr_reg(&mut self, rd: u32, rn: u32, rm: u32) {
             self.emit(0x9AC0_2400 | (rm << 16) | (rn << 5) | rd);
         }
+        /// lslv xd, xn, xm (64-bit logical variable shift; the amount is xm mod 64).
+        pub fn lsl_reg(&mut self, rd: u32, rn: u32, rm: u32) {
+            self.emit(0x9AC0_2000 | (rm << 16) | (rn << 5) | rd);
+        }
+        /// neg wd, wm (SUB wd, wzr, wm; zero-extends into the x register)
+        pub fn neg_w(&mut self, rd: u32, rm: u32) {
+            self.emit(0x4B00_03E0 | (rm << 16) | rd);
+        }
+        /// ccmn xn, #imm5, #nzcv, cond: the flags of xn + imm5 when `cond` holds, else `nzcv`
+        /// (CCMN immediate, 64-bit).
+        pub fn ccmn_imm_x(&mut self, rn: u32, imm5: u32, nzcv: u32, cond: u32) {
+            if imm5 >= 32 || nzcv >= 16 || cond >= 16 {
+                return self.bad("a ccmn operand out of range");
+            }
+            self.emit(0xBA40_0800 | (imm5 << 16) | (cond << 12) | (rn << 5) | nzcv);
+        }
         /// lsl xd, xn, #shift (UBFM alias)
         #[inline]
         pub fn lsl_imm(&mut self, rd: u32, rn: u32, shift: u32) {

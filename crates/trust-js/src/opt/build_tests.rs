@@ -253,7 +253,7 @@ fn int32_records_choose_int32_arithmetic_with_overflow_exits() {
 }
 
 #[test]
-fn bitwise_operators_are_int32_and_an_unsigned_shift_by_zero_stays_generic() {
+fn bitwise_operators_truncate_their_operands_and_an_unsigned_shift_by_zero_is_an_f64() {
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
@@ -262,21 +262,58 @@ fn bitwise_operators_are_int32_and_an_unsigned_shift_by_zero_stays_generic() {
     );
     let (chunk, graph) = graph_of(&mut engine, "bits");
     let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
     assert_eq!(count(&graph, |op| *op == NodeOp::I32Or), 1, "{text}");
     assert_eq!(count(&graph, |op| *op == NodeOp::I32UShr), 1, "{text}");
     // Two proven int32s add as int32s, with an overflow exit.
     let add = nodes(&graph, |op| *op == NodeOp::I32Add);
     assert_eq!(add.len(), 1, "{text}");
     assert_eq!(add[0].reason, Some(ExitReason::Overflow), "{text}");
-    // `a`'s int32 check is made once, for its first use.
-    assert_eq!(count(&graph, |op| *op == NodeOp::CheckInt32), 2, "{text}");
-    // `>>> 0` can leave the int32 range: the generic operation.
-    let effects = nodes(&graph, is_effect);
-    assert_eq!(effects.len(), 1, "{text}");
-    assert!(
-        matches!(chunk.jit_ops()[effects[0].pc as usize], Op::UShr),
+    // Each word is checked a Number and truncated once, `a`'s for its first use: ToInt32 needs
+    // no exact int32.
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 2, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::TruncateToInt32),
+        2,
         "{text}"
     );
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckInt32), 0, "{text}");
+    // `>>> 0` can leave the int32 range: its uint32 is an f64, which the last Add takes as one.
+    let ushr = nodes(&graph, |op| *op == NodeOp::I32UShrToF64);
+    assert_eq!(ushr.len(), 1, "{text}");
+    assert_eq!(ushr[0].reason, None, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64Add), 1, "{text}");
+}
+
+#[test]
+fn an_f64_that_arithmetic_made_is_truncated_for_a_bitwise_operation() {
+    // The first stage's in-line hits record no int32 hint, so the products are f64s; stage 1 sent
+    // their `&` and `~` to the effect path.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function lo(a, b) { return (a * b) & 0xffff; }
+         function inv(a) { return ~(a * 1.5); }
+         for (var i = 0; i < 20; i++) { lo(i + 0.5, 3); inv(i); }",
+    );
+    for (name, op) in [("lo", NodeOp::I32And), ("inv", NodeOp::I32Not)] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        let truncations: Vec<NodeIx> = (0..graph.nodes.len() as u32)
+            .map(NodeIx)
+            .filter(|&ix| graph.node(ix).op == NodeOp::TruncateToInt32)
+            .collect();
+        assert_eq!(truncations.len(), 1, "{name}: {text}");
+        let product = graph.node(graph.node(truncations[0]).inputs[0]);
+        assert_eq!(product.op, NodeOp::F64Mul, "{name}: {text}");
+        let result = nodes(&graph, |node| *node == op);
+        assert_eq!(result.len(), 1, "{name}: {text}");
+        assert!(
+            result[0].inputs.contains(&truncations[0]),
+            "{name}: the operation takes the truncation: {text}"
+        );
+    }
 }
 
 #[test]

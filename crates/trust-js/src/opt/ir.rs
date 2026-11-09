@@ -161,6 +161,9 @@ pub(crate) enum NodeOp {
 
     // Conversions (no exit).
     I32ToF64,
+    /// F64 -> I32: ECMAScript ToInt32 (§7.1.6), modulo 2^32, 0 for NaN and the infinities: the
+    /// operands of the bitwise operations (Maglev's TruncateFloat64ToInt32).
+    TruncateToInt32,
     /// NaN canonicalized, as emit_exec_number_store does.
     F64ToTagged,
     I32ToTagged,
@@ -183,6 +186,9 @@ pub(crate) enum NodeOp {
     I32Sar,
     /// `>>>`: exits when the result does not fit an int32.
     I32UShr,
+    /// `>>>` -> F64: the uint32 result as a Number, where it may not fit an int32 (Maglev's
+    /// Int32ShiftRightLogical "returns a Uint32").
+    I32UShrToF64,
     I32Not,
     F64Add,
     F64Sub,

@@ -537,6 +537,9 @@ struct State {
     forms: FastMap<NodeIx, Forms>,
     /// ToBoolean of a value.
     truth: FastMap<NodeIx, NodeIx>,
+    /// ToInt32 of an f64 value (its TruncateToInt32), which is no form of it: forms hold one
+    /// value, and the truncation is another unless the f64 is an int32.
+    truncated: FastMap<NodeIx, NodeIx>,
     /// Heap facts of the current effect epoch: an object word's possible shapes...
     shapes: FastMap<NodeIx, Vec<u32>>,
     /// ...and the word at a location of an object word, loaded or stored.
@@ -582,6 +585,15 @@ fn meet(preds: &[(BlockIx, State)]) -> State {
         })
         .map(|(&value, &truth)| (value, truth))
         .collect();
+    let truncated = first
+        .truncated
+        .iter()
+        .filter(|(value, int)| {
+            rest.iter()
+                .all(|(_, state)| state.truncated.get(value) == Some(int))
+        })
+        .map(|(&value, &int)| (value, int))
+        .collect();
     let shapes = first
         .shapes
         .iter()
@@ -609,6 +621,7 @@ fn meet(preds: &[(BlockIx, State)]) -> State {
     State {
         forms,
         truth,
+        truncated,
         shapes,
         fields,
         ..State::default()
@@ -1052,6 +1065,38 @@ impl<'a> Builder<'a> {
         Some(int)
     }
 
+    /// ToInt32 of `value` (ECMA-262 §7.1.6) as an int32, as Maglev's GetTruncatedInt32ForToNumber
+    /// gives it: a proven int32 as it is, a constant folded, an f64 truncated, a word checked a
+    /// Number and truncated; None for a value that is never a Number.
+    fn truncated_int32(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        value: NodeIx,
+    ) -> Option<NodeIx> {
+        if let Some(int) = self.forms(st, value).i32 {
+            return Some(int);
+        }
+        if let Some(word) = self.constant(value) {
+            let int = crate::eval::to_int32(number_word(word)?);
+            return Some(self.hoist(Hoisted::I32(int)));
+        }
+        let number = match self.rep(value) {
+            Rep::F64 => value,
+            Rep::Tagged => self.number(st, cx, value)?,
+            _ => return None,
+        };
+        if let Some(int) = self.forms(st, number).i32 {
+            return Some(int);
+        }
+        if let Some(&int) = st.truncated.get(&number) {
+            return Some(int);
+        }
+        let int = self.add(NodeOp::TruncateToInt32, &[number], Rep::I32, cx.pc);
+        st.truncated.insert(number, int);
+        Some(int)
+    }
+
     /// ToBoolean of `value`, as a Bool.
     fn truth(&mut self, st: &mut State, value: NodeIx, pc: usize) -> NodeIx {
         if let Some(boolean) = self.forms(st, value).boolean {
@@ -1205,6 +1250,10 @@ impl<'a> Builder<'a> {
             live.contains(value) || forms.members().any(|m| live.contains(&m))
         });
         st.truth.retain(|value, _| live.contains(value));
+        // An f64 is reached through its value's forms (a slot holds the word).
+        let forms = &st.forms;
+        st.truncated
+            .retain(|value, _| live.contains(value) || forms.contains_key(value));
         st.shapes.retain(|word, _| live.contains(word));
         st.fields.retain(|(word, _), _| live.contains(word));
     }
@@ -1438,6 +1487,7 @@ impl<'a> Builder<'a> {
             handlers,
             forms: met.forms,
             truth: met.truth,
+            truncated: met.truncated,
             ..State::default()
         };
         let poll = self.frame_state(pc, &st);
@@ -1807,32 +1857,28 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// The bitwise operators on int32s: a proven int32 or a word checked as one. An f64 that
-    /// arithmetic made takes the generic operation (ToInt32 truncates it, which a check would
-    /// fail), and so does `>>>` unless its count is a constant whose low five bits are not all
-    /// zero (otherwise the result can leave the int32 range).
+    /// The bitwise operators on their operands' ToInt32 (ECMA-262 §7.1.6), each a Number
+    /// truncated in line (Maglev's GetTruncatedInt32ForToNumber). `>>>` gives an int32 when its
+    /// count is a constant whose low five bits are not all zero, and otherwise its uint32 result
+    /// as an f64, as Maglev's Int32ShiftRightLogical gives a Uint32.
     fn bitwise(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
         let Some(values) = self.snapshot.values(pc) else {
             return self.effect(pc, st);
         };
         let len = st.stack.len();
         let (a, b) = (st.stack[len - 2], st.stack[len - 1]);
-        let fits = op != Op::UShr
-            || self
-                .constant(b)
-                .and_then(number_word)
-                .and_then(exact_i32)
-                .is_some_and(|count| count & 31 != 0);
         if (values.operand0 | values.operand1) & !NUMBER != 0
-            || !self.int32_operand(st, a)
-            || !self.int32_operand(st, b)
-            || !fits
+            || !self.numeric(a)
+            || !self.numeric(b)
         {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
-        let (Some(x), Some(y)) = (self.int32(st, &mut cx, a), self.int32(st, &mut cx, b)) else {
-            return Err(Refusal::at(pc, "an int32 operand without an int32 form"));
+        let (Some(x), Some(y)) = (
+            self.truncated_int32(st, &mut cx, a),
+            self.truncated_int32(st, &mut cx, b),
+        ) else {
+            return Err(Refusal::at(pc, "a Number operand without its ToInt32"));
         };
         let node = match op {
             Op::BitAnd => NodeOp::I32And,
@@ -1843,8 +1889,17 @@ impl<'a> Builder<'a> {
             _ => NodeOp::I32UShr,
         };
         let result = if node == NodeOp::I32UShr {
-            let state = self.before(&mut cx, st);
-            self.add_exit(node, &[x, y], Rep::I32, pc, state, ExitReason::Overflow)
+            let fits = self
+                .constant(b)
+                .and_then(number_word)
+                .is_some_and(|count| crate::eval::to_int32(count) & 31 != 0);
+            if fits {
+                // The result is below 2^31: the exit never runs.
+                let state = self.before(&mut cx, st);
+                self.add_exit(node, &[x, y], Rep::I32, pc, state, ExitReason::Overflow)
+            } else {
+                self.add(NodeOp::I32UShrToF64, &[x, y], Rep::F64, pc)
+            }
         } else {
             self.add(node, &[x, y], Rep::I32, pc)
         };
@@ -1860,18 +1915,14 @@ impl<'a> Builder<'a> {
         };
         let len = st.stack.len();
         let value = st.stack[len - 1];
-        let usable = match op {
-            Op::BitNot => self.int32_operand(st, value),
-            _ => self.numeric(value),
-        };
-        if values.operand0 & !NUMBER != 0 || !usable {
+        if values.operand0 & !NUMBER != 0 || !self.numeric(value) {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
         let result = match op {
             Op::BitNot => {
-                let Some(x) = self.int32(st, &mut cx, value) else {
-                    return Err(Refusal::at(pc, "an int32 operand without an int32 form"));
+                let Some(x) = self.truncated_int32(st, &mut cx, value) else {
+                    return Err(Refusal::at(pc, "a Number operand without its ToInt32"));
                 };
                 self.add(NodeOp::I32Not, &[x], Rep::I32, pc)
             }
