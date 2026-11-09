@@ -47,6 +47,9 @@ pub(crate) enum Class {
 pub(crate) fn class_of(rep: Rep) -> Option<Class> {
     match rep {
         Rep::Tagged | Rep::I32 | Rep::Bool | Rep::Cell => Some(Class::Gp),
+        // An address (P3 stage 2 step 2): in an x register like a cell, and a root only through
+        // the owner's cell, which the node that reads the address also takes (Rep::Ptr).
+        Rep::Ptr => Some(Class::Gp),
         Rep::F64 => Some(Class::Fp),
         Rep::None => None,
     }

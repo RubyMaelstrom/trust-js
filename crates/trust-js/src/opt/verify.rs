@@ -13,7 +13,9 @@
 //! - every node that can exit has a frame state and a reason (an Exit carries its own), and every
 //!   state describes its pc's frame: one source per slot of the chunk, the stack analysis's
 //!   depth at the pc, handler records the chunk pushes at their depth, and values of a
-//!   representation an exit can box, available at the node that exits.
+//!   representation an exit can box, available at the node that exits;
+//! - an address (Rep::Ptr) is never a phi's or a frame state's value, so no block edge or exit
+//!   recipe carries one; the signatures let only element nodes take one.
 
 use super::ir::{BlockIx, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource};
 use crate::bytecode::{Chunk, Op};
@@ -363,6 +365,11 @@ fn representations(
         NodeOp::Phi => {
             if node.rep == Rep::None {
                 return Err("a phi without a representation".into());
+            }
+            if node.rep == Rep::Ptr {
+                // An address dies with its effect epoch: a back edge would carry it across its
+                // loop header's poll, a safepoint (ir.rs, Rep::Ptr).
+                return Err("a phi of addresses".into());
             }
             if node.inputs.len() != graph.block(node.block).preds.len() {
                 return Err(format!(

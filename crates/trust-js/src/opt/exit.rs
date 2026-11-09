@@ -227,6 +227,7 @@ unsafe fn read(saved: *const u64, source: Source) -> crate::value::Value {
             Rep::I32 => Value::Num(f64::from(bits as u32 as i32)),
             Rep::Bool => Value::Bool(bits & 1 != 0),
             Rep::Cell => unsafe { Value::from_bits(crate::value::PACK_OBJ | bits) },
+            Rep::Ptr => unreachable!("a frame state holds no address (verify.rs)"),
             Rep::None => unreachable!("a frame state holds values"),
         }
     };

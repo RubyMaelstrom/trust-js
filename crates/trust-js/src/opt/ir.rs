@@ -51,6 +51,14 @@ pub(crate) enum Rep {
     Bool,
     /// An object's payload pointer, proven by a check, in an x register.
     Cell,
+    /// An untagged address inside an object's storage (P3 stage 2 step 2): an element block's
+    /// first word, a typed array's view record or its data, in an x register. Only element nodes
+    /// take one, each with its owner's cell, which keeps the storage alive while the address is
+    /// used (Warp's keep-alive: a storage block a frame names keeps its memory, not its owner or
+    /// the values it holds, gc_storage.rs); no frame state, phi or exit recipe holds one, so an
+    /// address never crosses a block edge, and its heap fact ends at the next effect, so it never
+    /// crosses a safepoint either.
+    Ptr,
     /// No value: stores, flushes, terminators.
     None,
 }
@@ -106,6 +114,26 @@ pub(crate) enum ExitReason {
     Throw,
     /// TRUST_JS_OPT_EXIT_EVERY.
     Forced,
+    // The element accesses' reasons (P3 stage 2 step 2), as Maglev's deopts name them.
+    /// An element access's receiver is not of the elements kind its check expected (another
+    /// object kind, or IC_PLAIN clear), or a write meets frozen elements or a receiver the
+    /// in-line append does not take (V8's kWrongMap).
+    #[expect(dead_code, reason = "the element checks build it (step 2's (b))")]
+    WrongElements,
+    /// An element index at or past the used words, or a negative one (V8's kOutOfBounds).
+    #[expect(dead_code, reason = "the element checks build it (step 2's (b))")]
+    OutOfBounds,
+    /// A hole where the record saw none, or one the cold path cannot prove reads undefined
+    /// (V8's kHole).
+    #[expect(dead_code, reason = "the element checks build it (step 2's (b))")]
+    Hole,
+    /// A typed array whose buffer is detached, shrunk below the view or borrowed by Rust (V8's
+    /// kArrayBufferWasDetached).
+    #[expect(dead_code, reason = "the typed-array checks build it (step 2's (e))")]
+    Detached,
+    /// An append whose growth failed (V8's kCouldNotGrowElements).
+    #[expect(dead_code, reason = "the appends build it (step 2's (d))")]
+    CouldNotGrow,
 }
 
 /// What a node does. Inputs are in [`Node::inputs`] in the order each variant names.

@@ -965,6 +965,8 @@ impl<'a> Builder<'a> {
             Rep::I32 => forms.i32 = Some(value),
             Rep::Bool => forms.boolean = Some(value),
             Rep::Cell => forms.cell = Some(value),
+            // An address is no form of a value: it names storage the value's object owns.
+            Rep::Ptr => {}
             Rep::None => {}
         }
         forms

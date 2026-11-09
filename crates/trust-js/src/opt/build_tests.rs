@@ -1378,3 +1378,53 @@ fn exit_sites_key_where_every_compile_of_the_site_finds_them() {
     assert!(snapshot.declines(add, ExitReason::NotNumber));
     assert!(!snapshot.declines(get, ExitReason::WrongShape));
 }
+
+#[test]
+fn the_verifier_keeps_addresses_out_of_phis() {
+    // An address dies with its effect epoch: a loop's back edge would carry it across the poll.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function sum(n) { var s = 0; for (var i = 0; i < n; i++) s += i; return s; }
+         for (var k = 0; k < 20; k++) sum(10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "sum");
+    let phi = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.phis.iter())
+        .copied()
+        .next()
+        .expect("a loop phi");
+    let mut broken = graph.clone();
+    broken.nodes[phi.index()].rep = Rep::Ptr;
+    let error = verify(&broken, &chunk).expect_err("a phi of addresses");
+    assert!(error.contains("a phi of addresses"), "{error}");
+}
+
+#[test]
+fn the_snapshot_reads_element_records() {
+    // The VM records every element access before it runs it (feedback-schema.txt 5.2): the
+    // receiver's family, the key's kind and an Array's facts.
+    use crate::feedback::{ELEM_ARRAY, ELEM_HOLEY, ELEM_KEY_INDEX, ELEM_OUT_OF_BOUNDS};
+    let mut engine = engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "function get(a, i) { return a[i]; } var holes = [1, , 3];
+         for (var k = 0; k < 20; k++) { get([1, 2], 0); get(holes, 1); get([1], 5); }",
+    );
+    let chunk = chunk_of(&mut engine, "get");
+    let snapshot = Snapshot::take(&chunk);
+    let pc = pc_of(&chunk, |op| matches!(op, Op::GetElemLocal(_)));
+    let view = snapshot.element(pc).expect("an element site's view");
+    assert_eq!(view.recorded_receivers, ELEM_ARRAY);
+    assert_eq!(view.recorded_keys, ELEM_KEY_INDEX);
+    assert_eq!(
+        view.facts & (ELEM_HOLEY | ELEM_OUT_OF_BOUNDS),
+        ELEM_HOLEY | ELEM_OUT_OF_BOUNDS
+    );
+    assert!(!view.generic);
+    assert!(snapshot.values(pc).is_none() && snapshot.named(pc).is_none());
+    let ret = pc_of(&chunk, |op| matches!(op, Op::Return));
+    assert!(snapshot.element(ret).is_none());
+}

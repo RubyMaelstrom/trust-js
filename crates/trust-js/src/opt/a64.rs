@@ -713,6 +713,7 @@ impl Gen<'_> {
                 self.a.logic_x(1, scratch, X30, c);
                 scratch
             }
+            Rep::Ptr => unreachable!("a frame state holds no address (verify.rs)"),
             Rep::None => unreachable!("a frame state holds values"),
         }
     }
