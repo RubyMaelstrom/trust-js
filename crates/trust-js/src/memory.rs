@@ -1433,6 +1433,16 @@ fn scan_realm(
             .engine_caches
             .make_lower_bound("opaque standard-library HashMap bucket storage");
     }
+    // The optimizing tier's retired codes, alive while activations run them.
+    for code in &interp.opt_retired {
+        visitor.jit_code(code);
+    }
+    totals.engine_caches.add(
+        interp
+            .opt_retired
+            .capacity()
+            .saturating_mul(size_of::<Rc<crate::jit::JitCode>>()),
+    );
     totals.engine_caches.add(
         interp
             .vm_pool

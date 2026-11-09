@@ -53,6 +53,21 @@ comment/example in the same change.
   reason (calls, loop budget or loop transfer).
 - `TRUST_JS_INLINE_AT=N` changes the speculative inline recompile threshold (default:
   100 machine-code runs); zero disables inlining.
+- `TRUST_JS_OPT=1` turns on the speculative optimizing tier (ARM64 only; off by default until a
+  stage exit measures a net win; docs/v8-chase-p3-plan-2026-11-08.txt, "Stage 1"). At the second
+  stage's checkpoints (about 100, 500, 2,100 and 8,500 native runs), once a function's feedback
+  fingerprint equals its previous checkpoint's, the second stage is built as without the tier,
+  a function with nothing to splice getting its own chunk again, and the tier generates its
+  native code in place of the template JIT: a refused second stage keeps the template JIT's
+  code, and a refused chunk with nothing spliced is dropped, the function keeping its first
+  stage. A failed speculation exits to the bytecode VM, which finishes the call; after 100
+  exits of one code object, new entries take the template JIT's code. Under
+  `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, without waiting for the
+  feedback to settle (the eager gate: V8's `--stress-maglev`). `TRUST_JS_OPT_EXIT_EVERY=N`
+  compiles every check and effect of the tier's code with a countdown that exits at every Nth
+  one (the forced-exit gate: V8's `--deopt-every-n-times`); forced exits are not counted
+  against the 100. `TRUST_JS_OPT_LOG=1` prints one stderr line per compile (with its time),
+  refusal (with its reason and pc), exit (with its pc, reason and kind) and fallback.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at

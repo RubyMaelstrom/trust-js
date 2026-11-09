@@ -25554,6 +25554,10 @@ unsafe fn jit_vm_operation(
 /// The handler record the push operation at `push_pc` made at operand depth `stack_depth`
 /// ([`jit_push_handler`]'s record): the optimizing tier pushes none, and its exits rebuild the
 /// records active at their pc from their frame state.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) fn pushed_handler(chunk: &Chunk, push_pc: usize, stack_depth: usize) -> Handler {
     let target = match chunk.jit_ops()[push_pc] {
         Op::PushHandler(t) => HandlerTarget::Catch {
@@ -25597,6 +25601,10 @@ pub(crate) fn pushed_handler(chunk: &Chunk, push_pc: usize, stack_depth: usize) 
 /// arguments when the chunk elides its rest Array or arguments object.
 ///
 /// [`VmTiering`]: crate::tiering::VmTiering
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) unsafe fn run_native_frame_in_vm(
     ctx: &mut crate::jit::JitCtx,
     pc: usize,

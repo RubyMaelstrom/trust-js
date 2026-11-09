@@ -1854,6 +1854,7 @@ impl JitCode {
             )
             .saturating_add(self.resume_depths.capacity() * std::mem::size_of::<Option<usize>>())
             .saturating_add(self.osr_entry_depths.capacity() * std::mem::size_of::<Option<usize>>())
+            .saturating_add(crate::opt::exit::table_bytes(self.mem))
     }
 
     /// The machine-code entry address (for CallIc fills — the direct-call sequence branches

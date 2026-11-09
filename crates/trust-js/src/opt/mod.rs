@@ -3,7 +3,9 @@
 //!
 //! Stage 1 makes the tier the code generator of second-stage chunks on ARM64 under TRUST_JS_OPT=1:
 //! where the tier accepts the chunk the second stage built (its hot callees spliced in, seeded from
-//! the first stage), it generates that chunk's native code in place of the template JIT.
+//! the first stage), it generates that chunk's native code in place of the template JIT. A hot
+//! function with nothing to splice gets such a chunk too, published only if the tier accepts it
+//! (`Interp::try_inline_recompile`, at the checkpoints the settled-feedback rule picks).
 //!
 //! The pipeline, by module:
 //! - `snapshot`: the immutable per-compile summary of the chunk's feedback (one view per pc), and
@@ -14,50 +16,122 @@
 //! - `regalloc` and `a64`: registers and ARM64 code, the effects through the baseline templates,
 //!   the exits;
 //! - `exit`: the recipes and the deoptimizer that rebuilds the canonical frame and resumes the
-//!   chunk in the VM.
-//! x86-64 builds none of the back end until the plan's stage 6.
-#![cfg_attr(not(test), allow(dead_code))]
+//!   chunk in the VM;
+//! - `driver`: the switches, the settled-feedback rule, the pipeline's run and the fall-back from
+//!   code that exits too often.
+//!
+//! x86-64 builds none of the back end until the plan's stage 6: there the tier is off, and the
+//! front end is built only for its tests.
 
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-#[cfg_attr(not(test), allow(unused_imports))]
 pub(crate) use crate::jit::opt_a64 as a64;
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
 pub(crate) mod build;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod driver;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) mod exit;
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
 pub(crate) mod ir;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 pub(crate) mod regalloc;
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
 pub(crate) mod snapshot;
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
 pub(crate) mod verify;
 
 #[cfg(test)]
 mod build_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod tier_tests;
 
-/// TRUST_JS_OPT: the tier is off unless set to a value other than `0` (the plan's Stage 1: off
-/// by default until a stage exit measures a net win).
-pub(crate) fn enabled() -> bool {
-    matches!(env_value!("TRUST_JS_OPT"), Some(v) if v != "0")
-}
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) use driver::*;
+#[cfg(not(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+)))]
+pub(crate) use off::*;
 
-/// TRUST_JS_OPT_LOG: one stderr line per compile, refusal (with its reason and pc), exit and
-/// compile time.
-pub(crate) fn log_enabled() -> bool {
-    env_flag!("TRUST_JS_OPT_LOG")
-}
+/// The tier where it has no back end (x86-64 until the plan's stage 6): off, whatever TRUST_JS_OPT
+/// says, so that no checkpoint reaches it, no exit countdown runs and no code has exits.
+#[cfg(not(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+)))]
+mod off {
+    use crate::bytecode::Chunk;
+    use crate::interpreter::Interp;
 
-/// TRUST_JS_OPT_EAGER: compile at the first checkpoint, without waiting for settled feedback (the
-/// eager gate; V8's --stress-maglev, SpiderMonkey's eager Ion compilation).
-pub(crate) fn eager() -> bool {
-    env_flag!("TRUST_JS_OPT_EAGER")
-}
+    pub(crate) fn enabled() -> bool {
+        false
+    }
 
-/// TRUST_JS_OPT_EXIT_EVERY=N: fail every Nth check passed (the forced-exit gate; V8's
-/// --deopt-every-n-times, SpiderMonkey's bailAfter). 0 or unset: off.
-pub(crate) fn exit_every() -> u32 {
-    env_value!("TRUST_JS_OPT_EXIT_EVERY")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0)
+    pub(crate) fn exit_every() -> u32 {
+        0
+    }
+
+    pub(crate) fn settled(_: &Chunk) -> bool {
+        false
+    }
+
+    pub(crate) fn forget(_: &Chunk) {}
+
+    pub(crate) fn compile_into(_: &mut Interp, _: &Chunk) -> bool {
+        false
+    }
+
+    /// No code has an exit table.
+    pub(crate) mod exit {
+        pub(crate) fn release(_: *const u8) {}
+
+        pub(crate) fn table_bytes(_: *const u8) -> usize {
+            0
+        }
+    }
 }
 
 #[cfg(test)]

@@ -79,6 +79,35 @@ impl NativeCodeSlot {
         result
     }
 
+    /// Replace the slot's resident code with `code` (`None`: the slot becomes unavailable, and
+    /// the bytecode VM runs its chunk), keeping its registration; returns the code it held, which
+    /// activations may still be running. The optimizing tier's fallback after repeated exits
+    /// (`opt::fall_back`): the caller moves the call caches' epoch, so that no way enters the old
+    /// code again, and keeps that code alive until no activation runs it. Nothing happens to a
+    /// slot that holds no resident code.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn replace_resident(&self, code: Option<Rc<JitCode>>) -> Option<Rc<JitCode>> {
+        let state = self.state.get()?;
+        let mut contents = state.code.borrow_mut();
+        if !matches!(*contents, CodeState::Resident(_)) {
+            return None;
+        }
+        let next = match code {
+            Some(code) => {
+                code.referenced.set(1);
+                CodeState::Resident(code)
+            }
+            None => CodeState::Unavailable,
+        };
+        let CodeState::Resident(old) = std::mem::replace(&mut *contents, next) else {
+            unreachable!("checked: resident")
+        };
+        Some(old)
+    }
+
     /// No compile was ever attempted for this slot (nothing resident, pending or reclaimed).
     pub(crate) fn untried(&self) -> bool {
         self.state.get().is_none()

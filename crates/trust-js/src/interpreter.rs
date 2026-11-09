@@ -4738,9 +4738,27 @@ pub struct Interp {
     /// The optimizing tier's forced-exit gate (TRUST_JS_OPT_EXIT_EVERY, `opt::exit`): every
     /// check of code compiled with the gate decrements the countdown, generated code reaching
     /// it through `JitCtx::interp`, and exits when it reaches zero; the exit starts it again from
-    /// the period. Both 0 while the gate is off.
+    /// the period. Both 0 while the gate is off, and where the tier has no back end (x86-64
+    /// until the plan's stage 6), which reads neither.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(dead_code, reason = "only the tier's back end reads the gate")
+    )]
     pub(crate) opt_exit_countdown: u32,
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(dead_code, reason = "only the tier's back end reads the gate")
+    )]
     pub(crate) opt_exit_every: u32,
+    /// The optimizing tier's codes that repeated exits retired (`opt::fall_back`): no entry takes
+    /// them any more, and each stays until no activation runs it (`opt::release_retired`).
+    pub(crate) opt_retired: Vec<Rc<crate::jit::JitCode>>,
     /// Execution tier (env `TRUST_JS_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
     /// default; `Interp` is the reference tree-walker, opt-in via `TRUST_JS_TIER=interp`.
     pub(crate) tier: crate::bytecode::Tier,
@@ -5215,6 +5233,7 @@ interp_memory_inventory! {
     strict => "non_owning",
     opt_exit_countdown => "non_owning",
     opt_exit_every => "non_owning",
+    opt_retired => "measured",
     tier => "non_owning",
     tier_threshold => "non_owning",
     jit_admit_runs => "non_owning",
@@ -5356,7 +5375,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 145);
+    assert_eq!(names.len(), 146);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6971,6 +6990,7 @@ impl Interp {
             strict: false,
             opt_exit_countdown: crate::opt::exit_every(),
             opt_exit_every: crate::opt::exit_every(),
+            opt_retired: Vec::new(),
             depth: 0,
             direct_call_depth: MAX_DIRECT_CALL_DEPTH,
             proxy_forward_depth: 0,
@@ -14069,6 +14089,7 @@ impl Interp {
             strict: _,
             opt_exit_countdown: _,
             opt_exit_every: _,
+            opt_retired: _,
             tier: _,
             tier_threshold: _,
             jit_admit_runs: _,
@@ -16587,7 +16608,11 @@ impl Interp {
         {
             return;
         }
-        if !chunk.advance_inline_feedback() {
+        // With the optimizing tier on (P3 stage 1), the checkpoints advance as ever, but the
+        // tier's settled-feedback rule below decides when the second stage is built, in place of
+        // the planner's test for changed call feedback.
+        let tier = crate::opt::enabled();
+        if !chunk.advance_inline_feedback() && !tier {
             crate::jit::perf_inline_suppressed();
             return;
         }
@@ -16597,6 +16622,9 @@ impl Interp {
         let runtime = func.runtime();
         if runtime.code2.get().is_some() {
             chunk.set_inline_retry_at(0);
+            if tier {
+                crate::opt::forget(chunk);
+            }
             crate::jit::perf_inline_suppressed();
             return;
         }
@@ -16607,6 +16635,14 @@ impl Interp {
             crate::jit::perf_inline_suppressed();
             return;
         }
+        if tier && !crate::opt::settled(chunk) {
+            // The feedback changed since the previous checkpoint: wait for the next one, past
+            // the last of which the tier waits no more.
+            if chunk.inline_retry_at.get() == 0 {
+                crate::opt::forget(chunk);
+            }
+            return;
+        }
         let plan = crate::bytecode::plan_inlines(chunk, func, realm, &self.global_env);
         if plan.is_empty() {
             crate::jit::perf_inline_empty_plan();
@@ -16615,10 +16651,26 @@ impl Interp {
                 let head: String = src.chars().take(60).collect();
                 eprintln!("[tier] inline: empty plan for: {}", head.replace('\n', " "));
             }
-            return;
+            // The tier compiles a hot function whether or not it splices anything, as Maglev
+            // does: its own chunk again, seeded and record-mapped from this one.
+            if !tier {
+                return;
+            }
+        } else {
+            crate::jit::perf_inline_plan_sites(plan.len());
         }
-        crate::jit::perf_inline_plan_sites(plan.len());
         if let Some(chunk2) = crate::bytecode::compile_with_inlines(func, &plan, chunk) {
+            if tier {
+                crate::opt::forget(chunk);
+                // The tier generates the native code of the chunk this publishes. A chunk with
+                // nothing spliced is published only if the tier accepts it: refused, the
+                // function keeps its first stage; a refused second stage keeps today's code,
+                // the template JIT's, made at its first native entry.
+                if !crate::opt::compile_into(self, &chunk2) && plan.is_empty() {
+                    chunk.set_inline_retry_at(0);
+                    return;
+                }
+            }
             crate::jit::perf_inline_success();
             if std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
                 let src = func.source.as_deref().unwrap_or("<no source>");

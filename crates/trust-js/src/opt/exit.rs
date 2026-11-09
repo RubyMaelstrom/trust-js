@@ -23,6 +23,10 @@
 //! TRUST_JS_OPT_EXIT_EVERY (the forced-exit gate): when it is compiled in, every check first
 //! decrements `Interp::opt_exit_countdown` and exits when it reaches zero; the deoptimizer then
 //! counts the exit as forced and starts the countdown again from `Interp::opt_exit_every`.
+//!
+//! Repeated exits: a table counts its code's exits, forced ones left out, and at
+//! `opt::EXIT_LIMIT` the deoptimizer has new entries take the template JIT's code instead
+//! (`opt::fall_back`).
 
 use super::ir::{ExitReason, Rep};
 
@@ -78,6 +82,8 @@ pub(crate) struct ExitTable {
     pub(crate) exits: Vec<ExitRecord>,
     /// The function's name, for the log.
     pub(crate) name: Box<str>,
+    /// The exits taken so far, forced ones left out (`opt::fall_back` at `opt::EXIT_LIMIT`).
+    pub(crate) taken: std::cell::Cell<u32>,
 }
 
 /// The save area the exit stub makes (ARM64): x0..x29 at words 0..29, d0..d31 at words 30..61;
@@ -140,6 +146,21 @@ pub(crate) fn register(code_base: usize, table: Box<ExitTable>) {
             .live
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+}
+
+/// The heap bytes of the exit table of the code at `code_base`, if it has one (the memory census,
+/// `JitCode::retained_heap_metadata_bytes`; one atomic load for code without one).
+pub(crate) fn table_bytes(code_base: *const u8) -> usize {
+    let registry = registry();
+    if registry.live.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return 0;
+    }
+    registry
+        .tables
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(code_base as usize))
+        .map_or(0, |table| table.retained_bytes())
 }
 
 /// Free the exit table of the code at `code_base`, if it has one (every code object's drop
@@ -269,6 +290,16 @@ pub(crate) unsafe extern "C" fn deoptimize(
             }
         },
     };
+    if reason != ExitReason::Forced {
+        // Repeated exits: at the limit, new entries stop using this code (`opt::fall_back`);
+        // this activation finishes in it, as any other running it does. The frame holds every
+        // value by now, so the fallback's compile may allocate.
+        let taken = table.taken.get().saturating_add(1);
+        table.taken.set(taken);
+        if taken == super::EXIT_LIMIT {
+            super::fall_back(i, chunk);
+        }
+    }
     ctx.handlers.clear();
     ctx.handlers
         .extend(exit.handlers.iter().map(|&(push_pc, depth)| {

@@ -537,16 +537,6 @@ impl<'a> Gen<'a> {
         let mem = executable.as_ptr() as *mut u8;
         let len = executable.len();
         table.code_base = mem as usize;
-        if crate::opt::log_enabled() {
-            eprintln!(
-                "[opt] code {}: {} nodes, {} bytes, {} exits, {} spill bytes",
-                table.name,
-                self.graph.nodes.len(),
-                words.len() * 4,
-                table.exits.len(),
-                self.alloc.spill_bytes
-            );
-        }
         crate::opt::exit::register(mem as usize, table);
         let code = JitCode {
             entry_kind: NativeEntryKind::FreshFrame,
