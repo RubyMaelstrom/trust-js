@@ -1086,3 +1086,96 @@ them where it held 2.4%), with 298 discards and 261 recompiles; the fixtures' is
 React 100%, Djot 91.6%; their steady state 83.8%, 100%, 93.8%), Vue's rest a second stage the tier
 refuses for `finally` (8.3% of its samples, 14.6% in the steady state). Stage 1's 46.9% came from
 the old join; step 5 measures the bar by time on the fat-LTO engine.
+
+Step 4, free names in line (design, 2026-11-09; input target/p3/stage2/names-input.txt, which
+cites the code and the exemplars line by line, and its census, target/p3/stage2/names-census).
+Every name operation is an effect in the tier. In Octane's tier code free names ran 1.91 G times,
+of two classes: global-object properties (Mandreel 99.7% of its name executions: its heap views and
+functions are script-level declarations) and static addresses, the bytecode compiler's hops and
+slot (zlib 100%: its asm.js module's own variables); the cache's dynamic modes are 0.2%, stores
+and updates 4.2% of a benchmark's on average, typeof of a name none. Codes whole once names and
+step 2's elements are lowered: 56.1% of Octane's second-stage time (zlib 100%, Mandreel 99.9%),
+against 4.6% today and 9.7% with names alone. Per class, the exemplars' form:
+- Static addresses (closure variables; LoadName, LoadNameForCall, LoadNameIn and their caps,
+  LoadCap, StoreCap and UpdateCap, at hops 0): the running record (ctx.env_raw, hoisted when the
+  chunk has no scope operation), a parent load per hop, the slot; no guard, as V8's context
+  slots, SpiderMonkey's GetAliasedVar and JSC's GetClosureVar. A splice's reads start from its
+  pinned [[Environment]], the hops folded into the holder at the compile (JSC's SkipScope on a
+  constant base). A lexical binding's word is checked not empty, exiting with a new reason, Tdz,
+  as SpiderMonkey's LexicalCheck and JSC's CheckNotEmpty do (V8 throws in place, which needs a
+  throwing check node the tier lacks); once checked, a (record, slot) is initialized for the rest
+  of the function. Facts: parent links are value facts within an activation (the one later write,
+  class evaluation re-parenting its fresh outer record, eval.rs:6148-6150, happens after its
+  heritage and keys ran, when no running activation's chain holds that record; a test pins it); a
+  const binding's value is a value fact once initialized (V8's loaded_context_constants_); let and
+  var values are heap facts, reloaded after an effect, as all three reload mutable slots.
+  Stores and updates at a static address are nodes: the old word's TDZ check for a lexical, the
+  store, the record's card unless the value is a Number (the template's emit_cap_store), as
+  Maglev's StoreContextSlot, SpiderMonkey's SetAliasedVar and JSC's PutClosureVar.
+- Global-object properties (static globals and the running global environment whose cache is in
+  global-object mode): SpiderMonkey's GetGName, a run-time generation guard and the slot's load
+  (jit/CacheIR.cpp:3467-3482). TRust's global object changes shape at every addition, so the
+  cache's shape proof as an exit guard would exit every reading code after any later global
+  appears, where V8 (a cell per property), SpiderMonkey and JSC (GlobalVar addresses) leave
+  additions alone. The step adds SpiderMonkey's counter (vm/GlobalObject.h:226-232): a per-realm
+  epoch that moves when a property of the realm's global object is removed (removal closes the
+  gap and moves later slots, value.rs:11004-11115), turns from data to accessor or back, or is
+  shadowed by a later script's lexical declaration (vm/EnvironmentObject.cpp:3891-3895), and when
+  the global object stops being ordinary and IC_PLAIN if anything can do that. Additions append
+  slots, so a slot found at the compile stays the name's while the epoch holds. The compile
+  resolves the name again in the realm's global object (data property, no global lexical of that
+  name, the slot's location, the epoch); the code checks the realm (ctx.genv, the template's
+  identity test; a value fact per activation, implied in a splice past its InlineGuard), the
+  epoch (a heap fact: an effect makes it be tested again, as a call does SpiderMonkey's movable
+  guard), and loads the slot (a heap fact per location). Generated code reads the epoch through a
+  field it already reaches (ctx.genv, the global object, ctx.interp), or through its address only
+  after the realm check proved that realm; no shared stub holds it. A failed check exits with a
+  new reason, WrongName, kind-bound as WrongShape is.
+- Script-level let and const (a static global whose cache is in scope mode on the global
+  environment): the binding read unguarded and without a TDZ test, as SpiderMonkey reads the
+  global lexical environment (CacheIR.cpp:3456-3466; the cache fills only initialized bindings,
+  and such a binding never returns to its TDZ), if the global declarative record only appends and
+  keeps its slots in place; otherwise under the cache's own proof. No workload ran one hot.
+- LoadNameForCall's `this` is the constant undefined (the `with` case never reaches the tier), as
+  all three call a free name with an undefined receiver.
+- The rest stays an effect: the cache's scope, depth-1, layout and deep modes (V8's and JSC's
+  generic forms: their proofs test a fresh activation's identity, which as exit guards would exit
+  where the template refills in place), global stores and updates (0.8% of Octane's name
+  executions; later SpiderMonkey's shape-guarded store), typeof, deletes, References.
+- Evidence: an empty cache is evidence that a site never ran, so a block whose sites all never
+  ran exits (NeverRan), as V8 deopts, SpiderMonkey bails out and JSC exits at a site without
+  feedback; a refused fill leaves a mark no probe matches, so that an uncacheable site is not
+  taken for an unrun one, and a deep cache is seeded with the mark. The snapshot gains a view of
+  each name site, and the feedback fingerprint hashes the sites' classes.
+- The exit profile: WrongName declines to rebuilding the check where the proof differs from the
+  discarded code's (the epoch moved, the cache refilled; the profile keeps the epoch's low byte
+  as it keeps WrongShape's shapes), else the effect; Tdz declines to the effect, whose template
+  throws in place (SpiderMonkey keeps its checks after such a bailout). The declined mask widens
+  past 16 reasons (step 2 adds five). The loop prepass learns the lowered forms, so a loop whose
+  only names are lowered has no effects.
+- Departures, each for a missing precondition: (1) no name folds to a constant (V8's constant
+  cells and context cells, SpiderMonkey's ObjectFuse constants, JSC's watched variables), which
+  needs dependencies with invalidation points; (2) a let that is never reassigned is reloaded
+  after an effect, where V8's parser marks it unassigned, which needs a maybe-assigned flag per
+  planned binding; (3) no fact survives a loop header (Maglev's loop effects), a builder-wide
+  change that step 5's measurement weighs against the second stage's preloaded loop names; (4)
+  the dynamic modes and global stores stay effects (above); (5) TDZ by exit, not V8's in-place
+  throw.
+- Order: (a) the reasons, the wider mask, the name view, the refused-fill mark and the evidence;
+  (b) static loads, own and spliced, with their facts; (c) static stores and updates; (d) the
+  epoch in the runtime, then global reads; (e) script-level lexicals; (f) the loop prepass and
+  the declines.
+- Tests: the builder's graphs (a static read at hops 0, 1 and 2 without guards; a lexical checked
+  once per record; a const kept across a call, a var reloaded after one; LoadNameForCall's
+  undefined; a splice's reads from its pinned environment; a global read checked once per effect
+  epoch; the effect forms; an empty cache as NeverRan; each decline). End to end with the tier
+  eager, with exits forced and with TRUST_JS_OPT_EXIT_LIMIT=1: a closure reading an outer let
+  before and after its initialization (the ReferenceError at the right pc, inside try and
+  without); a const and a var read in a loop whose callee assigns the var; a static store of an
+  object into an old record under GC stress and verification (the card); a class whose heritage
+  makes and calls a closure that reads outer variables; a global read in a hot loop while another
+  function adds globals (no exit), deletes one (WrongName, then a recompile that reads the new
+  slot), redefines one as an accessor, and while a later script declares a lexical shadowing a
+  configurable global; a function of another realm reading its own globals; typed arrays bound to
+  a global and to a module variable, with step 2; sites that first run after the compile; the
+  difftest corpus seeded with the same.
