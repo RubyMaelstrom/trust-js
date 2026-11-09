@@ -2498,6 +2498,36 @@ struct ElemSite {
     arrays: bool,
 }
 
+/// The exit reasons whose flag at an element load sends it to the generic access: its receiver's
+/// object and elements checks and its key's Number and index checks. Hole and OutOfBounds widen
+/// its reads instead (`flagged_reads`).
+const LOAD_DECLINES: &[ExitReason] = &[
+    ExitReason::WrongElements,
+    ExitReason::NotObject,
+    ExitReason::NotNumber,
+    ExitReason::NotInt32,
+];
+/// A store's: a load's, and its writes past the used words, into holes, and growth.
+const STORE_DECLINES: &[ExitReason] = &[
+    ExitReason::WrongElements,
+    ExitReason::NotObject,
+    ExitReason::NotNumber,
+    ExitReason::NotInt32,
+    ExitReason::OutOfBounds,
+    ExitReason::Hole,
+    ExitReason::CouldNotGrow,
+];
+/// An update's: a load's, its read's hole and bounds (the write after it would exit at a hole
+/// the read took as undefined); Overflow takes f64 arithmetic instead.
+const UPDATE_DECLINES: &[ExitReason] = &[
+    ExitReason::WrongElements,
+    ExitReason::NotObject,
+    ExitReason::NotNumber,
+    ExitReason::NotInt32,
+    ExitReason::OutOfBounds,
+    ExitReason::Hole,
+];
+
 /// The element index a constant key names: an int32 Number, -0 being index 0.
 fn const_index(word: u64) -> Option<i32> {
     let x = number_word(word)?;
@@ -2548,6 +2578,37 @@ impl Builder<'_> {
             reads,
             arrays: receivers & ELEM_ARRAY != 0,
         })
+    }
+
+    /// Whether the exit profile flagged at the element site at `pc` one of `reasons`, whose
+    /// check no in-line form of the site goes without (the receiver's, the key's, a write's
+    /// bounds and growth): the generic access, as JSC's parser gives up an array access at its
+    /// BadIndexingType and OutOfBounds exit sites (DFGByteCodeParser.cpp:3208-3211, 13830-13835).
+    /// The first flagged reason is listed.
+    fn declines_element(&mut self, pc: usize, reasons: &[ExitReason]) -> bool {
+        reasons
+            .iter()
+            .any(|&reason| self.declined(pc, reason, "the generic access"))
+    }
+
+    /// A load's handling of holes and of indices past the used words, widened where the exit
+    /// profile flagged them, as JSC widens an array access's mode through the ArrayProfile its
+    /// exits update (getArrayMode, DFGByteCodeParser.cpp:1346-1360; ArrayMode::refine turns an
+    /// in-bounds mode out-of-bounds at a hole-load exit site, DFGArrayMode.cpp:202-330): an
+    /// OutOfBounds flag reads past the used words, a Hole flag reads holes, each undefined under
+    /// the prototype proof, which any receiver of element words can meet.
+    fn flagged_reads(&mut self, pc: usize, reads: Reads) -> Reads {
+        let past = reads != Reads::PastUsed
+            && self.declined(pc, ExitReason::OutOfBounds, "the read past the used words");
+        let holes = reads == Reads::InBounds
+            && self.declined(pc, ExitReason::Hole, "the hole read as undefined");
+        if past {
+            Reads::PastUsed
+        } else if holes {
+            Reads::Holes
+        } else {
+            reads
+        }
     }
 
     /// Whether a lowered element access can take `receiver` and `key`: a word that may be an
@@ -2755,15 +2816,16 @@ impl Builder<'_> {
     /// loaded once per effect epoch, the key as an int32 index, an unsigned bounds check and the
     /// word with its hole test. The word is checked at each use, as Warp unboxes it per use.
     fn element_load(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
-        let Some(site) = self.element_site(pc) else {
+        let Some(mut site) = self.element_site(pc) else {
             return self.effect(pc, st);
         };
         let len = st.stack.len();
         let key = st.stack[len - 1];
         let receiver = self.receiver(recv, st, 1, pc);
-        if !self.element_operands(receiver, key) {
+        if !self.element_operands(receiver, key) || self.declines_element(pc, LOAD_DECLINES) {
             return self.effect(pc, st);
         }
+        site.reads = self.flagged_reads(pc, site.reads);
         let mut cx = Before::new(pc);
         let cell = self.elements_cell(st, &mut cx, receiver, site.kind);
         let index = self.element_index(st, &mut cx, key);
@@ -2815,7 +2877,7 @@ impl Builder<'_> {
         let len = st.stack.len();
         let (key, value) = (st.stack[len - 2], st.stack[len - 1]);
         let receiver = self.receiver(recv, st, 2, pc);
-        if !self.element_operands(receiver, key) {
+        if !self.element_operands(receiver, key) || self.declines_element(pc, STORE_DECLINES) {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
@@ -2869,7 +2931,10 @@ impl Builder<'_> {
         };
         let len = st.stack.len();
         let (receiver, key) = (st.stack[len - 2], st.stack[len - 1]);
-        if values.operand0 & !NUMBER != 0 || !self.element_operands(receiver, key) {
+        if values.operand0 & !NUMBER != 0
+            || !self.element_operands(receiver, key)
+            || self.declines_element(pc, UPDATE_DECLINES)
+        {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
@@ -2880,7 +2945,10 @@ impl Builder<'_> {
             kind,
             UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
         );
-        let int = self.known_int32(st, old) || (int32_hint(&values) && self.int32_operand(st, old));
+        // Overflow flagged: f64 even on a proven int32 (step 3's makeSafe rule).
+        let int = (self.known_int32(st, old)
+            || (int32_hint(&values) && self.int32_operand(st, old)))
+            && !self.declined(pc, ExitReason::Overflow, "f64 arithmetic");
         let (number, new) = match int.then(|| self.int32(st, &mut cx, old)).flatten() {
             Some(x) => {
                 let one = self.hoist(Hoisted::I32(1));
@@ -2962,7 +3030,10 @@ impl Builder<'_> {
     /// first slot's word, a heap fact that an append and an effect end.
     fn array_length(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
         let receiver = self.receiver(recv, st, 0, pc);
-        if self.rep(receiver) != Rep::Tagged || self.constant(receiver).is_some() {
+        if self.rep(receiver) != Rep::Tagged
+            || self.constant(receiver).is_some()
+            || self.declines_element(pc, &[ExitReason::WrongElements, ExitReason::NotObject])
+        {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
@@ -2998,6 +3069,7 @@ impl Builder<'_> {
             || self.constant(base).is_some()
             || !(proven || checked)
             || !self.lowered_load_follows(pc)
+            || self.declines_element(pc, &[ExitReason::NotObject, ExitReason::NotNumber])
         {
             return self.effect(pc, st);
         }

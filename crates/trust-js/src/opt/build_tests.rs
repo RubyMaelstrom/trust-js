@@ -1841,3 +1841,123 @@ fn element_sites_the_words_do_not_serve_stay_effects() {
         assert!(count(&graph, is_effect) >= 1, "{name}: {text}");
     }
 }
+
+/// The graph of `name` (an element site at its one `site` operation) with `reason` flagged
+/// there, after its unflagged graph passed `before`.
+fn flagged_element_graph(
+    engine: &mut Engine,
+    name: &str,
+    site: impl Fn(&Op) -> bool,
+    reason: ExitReason,
+    before: impl Fn(&Graph) -> bool,
+) -> (Rc<Chunk>, usize, Graph) {
+    let (chunk, graph) = graph_of(engine, name);
+    let pc = pc_of(&chunk, &site);
+    assert!(before(&graph), "{name} unflagged: {}", dump(&graph, &chunk));
+    assert!(graph.declines.is_empty(), "{name}");
+    flag(&chunk, pc, reason, false, 0);
+    let graph = graph_for(&chunk, name);
+    (chunk, pc, graph)
+}
+
+#[test]
+fn flagged_holes_and_reads_past_used_widen_an_element_load() {
+    // JSC widens an array access's mode through the profile its exits update (getArrayMode,
+    // DFGByteCodeParser.cpp:1346-1360): a Hole flag reads holes, an OutOfBounds flag past the
+    // used words, each undefined under the prototype proof.
+    let source = "function get(a, i) { return a[i]; } function past(a, i) { return a[i]; }
+         for (var k = 0; k < 20; k++) { get([1, 2], 1); past([1, 2], 0); }";
+    let is_get = |op: &Op| matches!(op, Op::GetElemLocal(_));
+    let exits_on_holes = |graph: &Graph| {
+        count(graph, |op| *op == NodeOp::LoadElement(Holes::Exit)) == 1
+            && count(graph, |op| *op == NodeOp::CheckBounds) == 1
+    };
+    for (name, reason, form, load) in [
+        (
+            "get",
+            ExitReason::Hole,
+            "the hole read as undefined",
+            NodeOp::LoadElement(Holes::Undefined),
+        ),
+        (
+            "past",
+            ExitReason::OutOfBounds,
+            "the read past the used words",
+            NodeOp::LoadElementOrUndefined,
+        ),
+    ] {
+        let mut engine = vm_engine(source);
+        let (chunk, pc, graph) =
+            flagged_element_graph(&mut engine, name, is_get, reason, exits_on_holes);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        assert_eq!(count(&graph, |op| *op == load), 1, "{name}: {text}");
+        assert_eq!(declines(&graph), [(pc, reason)], "{name}: {text}");
+        assert_eq!(graph.declines[0].form, form, "{name}");
+    }
+}
+
+#[test]
+fn flagged_element_checks_take_the_generic_access() {
+    // A receiver, key, bound or growth the site's checks refuted: the effect (JSC's parser gives
+    // an array access up at its BadIndexingType and OutOfBounds exit sites).
+    let source = "function get(a, i) { return a[i]; } function put(a, i, v) { a[i] = v; }
+         function inc(a, i) { a[i]++; } function len(a) { return a.length; }
+         function add(a, i, v) { a[i] += v; }
+         for (var k = 0; k < 20; k++) {
+           get([1, 2], 1); put([1, 2], 1, k); inc([1, 2], 0); len([1]); add([1, 2], 0, 1);
+         }";
+    let get = |op: &Op| matches!(op, Op::GetElemLocal(_));
+    let put = |op: &Op| matches!(op, Op::SetElemLocalDrop(_));
+    let inc = |op: &Op| matches!(op, Op::UpdateElem(_));
+    let len = |op: &Op| matches!(op, Op::GetPropLocal(..));
+    let to_key = |op: &Op| matches!(op, Op::ToPropKeyLocal(_));
+    let loads = |graph: &Graph| count(graph, |op| matches!(op, NodeOp::LoadElement(_))) == 1;
+    let stores = |graph: &Graph| count(graph, |op| matches!(op, NodeOp::StoreElement(_))) == 1;
+    let lengths = |graph: &Graph| count(graph, |op| *op == NodeOp::LoadArrayLength) == 1;
+    let cases: [(
+        &str,
+        &dyn Fn(&Op) -> bool,
+        ExitReason,
+        &dyn Fn(&Graph) -> bool,
+    ); 14] = [
+        ("get", &get, ExitReason::WrongElements, &loads),
+        ("get", &get, ExitReason::NotObject, &loads),
+        ("get", &get, ExitReason::NotNumber, &loads),
+        ("get", &get, ExitReason::NotInt32, &loads),
+        ("put", &put, ExitReason::WrongElements, &stores),
+        ("put", &put, ExitReason::OutOfBounds, &stores),
+        ("put", &put, ExitReason::Hole, &stores),
+        // The last reason, whose bit a 16-bit mask lacked (it aliased NotNumber's).
+        ("put", &put, ExitReason::CouldNotGrow, &stores),
+        ("inc", &inc, ExitReason::Hole, &stores),
+        ("inc", &inc, ExitReason::OutOfBounds, &stores),
+        ("inc", &inc, ExitReason::WrongElements, &stores),
+        ("len", &len, ExitReason::WrongElements, &lengths),
+        ("len", &len, ExitReason::NotObject, &lengths),
+        ("add", &to_key, ExitReason::NotObject, &loads),
+    ];
+    for (name, site, reason, before) in cases {
+        let mut engine = vm_engine(source);
+        let (chunk, pc, graph) = flagged_element_graph(&mut engine, name, site, reason, before);
+        let text = dump(&graph, &chunk);
+        assert!(
+            nodes(&graph, is_effect)
+                .iter()
+                .any(|node| node.pc as usize == pc),
+            "{name} {reason:?}: {text}"
+        );
+        assert_eq!(
+            declines(&graph),
+            [(pc, reason)],
+            "{name} {reason:?}: {text}"
+        );
+        assert_eq!(graph.declines[0].form, "the generic access", "{name}");
+        // The flag is no other reason's.
+        let snapshot = Snapshot::take(&chunk);
+        assert!(
+            !snapshot.declines(pc, ExitReason::NotNumber) || reason == ExitReason::NotNumber,
+            "{name} {reason:?}"
+        );
+    }
+}

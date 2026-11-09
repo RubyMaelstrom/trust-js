@@ -45,8 +45,12 @@ pub(crate) struct Snapshot {
     ran: Box<[Ran]>,
     /// Each pc's declined reasons (bits by discriminant) and, for WrongShape, the most shapes a
     /// discarded check there expected; empty where no chunk the compile reads has exit sites.
-    declined: Box<[(u16, u8)]>,
+    declined: Box<[(u32, u8)]>,
 }
+
+// Every reason has its bit in a declined mask: the discriminants run from 0 to the last reason's
+// (ExitReason's last variant), which the mask's width bounds.
+const _: () = assert!((ExitReason::CouldNotGrow as u32) < u32::BITS);
 
 impl Snapshot {
     /// The feedback of every operation of `chunk` (its `jit_ops`), as it stands now.
@@ -125,7 +129,7 @@ impl Snapshot {
 }
 
 /// A reason's bit in a declined mask.
-fn bit(reason: ExitReason) -> u16 {
+fn bit(reason: ExitReason) -> u32 {
     1 << reason as u8
 }
 
@@ -138,17 +142,17 @@ fn kind_bound(reason: u8) -> bool {
 
 /// The exit profile's declined reasons per pc of `chunk` (see the module's doc): empty unless the
 /// chunk or a baseline chunk its map names holds exit sites.
-fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u16, u8)]> {
+fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u32, u8)]> {
     let has_sites = |chunk: &Chunk| ChunkProfile::get(chunk).is_some_and(ChunkProfile::has_sites);
     let own = ChunkProfile::get(chunk).filter(|profile| profile.has_sites());
     let baselines = map.is_some_and(|map| map.targets().iter().any(|target| has_sites(target)));
     if own.is_none() && !baselines {
         return Box::new([]);
     }
-    let mut declined = vec![(0u16, 0u8); len];
+    let mut declined = vec![(0u32, 0u8); len];
     for (pc, (reasons, ways)) in declined.iter_mut().enumerate() {
         let mut add = |reason: u8, shapes: u8| {
-            *reasons |= 1 << reason;
+            *reasons |= 1u32 << reason;
             if reason == ExitReason::WrongShape as u8 {
                 *ways = (*ways).max(shapes);
             }

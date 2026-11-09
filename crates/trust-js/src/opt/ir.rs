@@ -187,6 +187,8 @@ pub(crate) enum ExitReason {
     Detached,
     /// An append whose growth failed (V8's kCouldNotGrowElements).
     CouldNotGrow,
+    // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
+    // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
 
 /// What a node does. Inputs are in [`Node::inputs`] in the order each variant names.
