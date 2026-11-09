@@ -9718,6 +9718,10 @@ fn jit_numeric_packed_overwrites_stay_in_native_code() {
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn jit_small_packed_array_reads_and_writes_stay_native() {
+    // The template JIT's element code and helpers, with the tier off: the tier's second stage
+    // copies a shared block in its own store (P3 stage 2 step 2), which calls no helper.
+    #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+    crate::opt::TestSwitches::default().set();
     let mut engine = Engine::new();
     engine.interp.tier = crate::bytecode::Tier::Jit;
     engine.interp.tier_threshold = 0;

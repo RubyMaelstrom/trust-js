@@ -2617,8 +2617,14 @@ impl Builder<'_> {
         };
         let typed = if receivers & ELEM_TYPED_ARRAY == 0 {
             Typed::None
+        } else if view.recorded_receivers & ELEM_TYPED_ARRAY != 0 && view.typed_kinds == 0 {
+            // Its typed arrays were views the native code declines (BigInt or Float16 elements,
+            // a shared or too long buffer), which the stub would decline at every access: the
+            // generic access, as Maglev leaves BigInt and Float16 elements to it
+            // (TryBuildElementAccessOnTypedArray, maglev-graph-builder.cc:5059-5063).
+            return None;
         } else if receivers == ELEM_TYPED_ARRAY {
-            // The one kind the VM and the misses saw, if they saw one.
+            // The one kind the VM and the misses saw, or the stub for more than one.
             let mut kinds = TypedKind::ALL.into_iter().filter(|&kind| {
                 view.typed_kinds & crate::feedback::elem_typed_kind(kind as u8) != 0
             });

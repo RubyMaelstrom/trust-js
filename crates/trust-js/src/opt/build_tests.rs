@@ -1821,18 +1821,21 @@ fn an_element_update_reads_adds_and_writes_back() {
 
 #[test]
 fn element_sites_the_words_do_not_serve_stay_effects() {
-    // Strings, arguments objects, a generic site, and typed arrays whose stores take values that
-    // are no Numbers (a typed array converts them first, which may run code).
+    // Strings, arguments objects, a generic site, typed arrays whose stores take values that are
+    // no Numbers (a typed array converts them first, which may run code), and typed arrays the
+    // native code declines (BigInt elements), whose record holds no kind.
     let mut engine = vm_engine(
         "function str(s, i) { return s[i]; } function store(t, i) { t[i] = 's'; }
          function args(x, i) { return x[i]; } function generic(o, k) { return o[k]; }
+         function big(t, i) { return t[i]; } function bigs(t, i) { return t[i]; }
          function argsof() { return arguments; } var u8 = new Uint8Array(4);
-         var list = argsof(1, 2);
+         var list = argsof(1, 2), b64 = new BigInt64Array(4);
          for (var k = 0; k < 20; k++) {
-           str('abc', 1); store(u8, 1); args(list, 1); generic({a: 1}, 'a');
+           str('abc', 1); store(u8, 1); args(list, 1); generic({a: 1}, 'a'); big(b64, 1);
+           bigs(k % 2 ? b64 : [1, 2], 1);
          }",
     );
-    for name in ["str", "store", "args", "generic"] {
+    for name in ["str", "store", "args", "generic", "big", "bigs"] {
         let (chunk, graph) = graph_of(&mut engine, name);
         let text = dump(&graph, &chunk);
         assert_eq!(
