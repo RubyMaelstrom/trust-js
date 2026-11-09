@@ -309,12 +309,13 @@ fn writable_and_executable(region: &CodeRegion) -> bool {
     })
 }
 
-/// MEMORY_BASIC_INFORMATION (64-bit).
+/// MEMORY_BASIC_INFORMATION (64-bit), as gc_core's tests declare it (one signature for
+/// VirtualQuery in the crate).
 #[cfg(target_os = "windows")]
 #[repr(C)]
 struct MemoryBasicInformation {
-    base_address: *mut u8,
-    _allocation_base: *mut u8,
+    base_address: usize,
+    _allocation_base: usize,
     _allocation_protect: u32,
     _partition_id: u16,
     region_size: usize,
@@ -326,7 +327,11 @@ struct MemoryBasicInformation {
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
 extern "system" {
-    fn VirtualQuery(address: *const u8, info: *mut MemoryBasicInformation, len: usize) -> usize;
+    fn VirtualQuery(
+        address: *const std::ffi::c_void,
+        buffer: *mut MemoryBasicInformation,
+        length: usize,
+    ) -> usize;
 }
 
 #[cfg(target_os = "windows")]
@@ -335,7 +340,7 @@ fn query(address: usize) -> MemoryBasicInformation {
     unsafe {
         let mut info = std::mem::zeroed::<MemoryBasicInformation>();
         let written = VirtualQuery(
-            address as *const u8,
+            address as *const std::ffi::c_void,
             &mut info,
             std::mem::size_of::<MemoryBasicInformation>(),
         );
@@ -373,7 +378,7 @@ fn writable_and_executable(region: &CodeRegion) -> bool {
         if info.protect & (PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY) != 0 {
             return true;
         }
-        address = info.base_address as usize + info.region_size;
+        address = info.base_address + info.region_size;
     }
     false
 }
