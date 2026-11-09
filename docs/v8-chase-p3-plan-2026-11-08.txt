@@ -1060,3 +1060,16 @@ and, settled from birth, has no checkpoint). Point 12 on TRust's code:
   finishes in its discarded code while later calls run the new; forced exits recording nothing. The
   gates gain a configuration that cycles reoptimization: the tier eager with
   TRUST_JS_OPT_EXIT_LIMIT=1.
+Step 3 landed (f1c61d77, 2026-11-09). The tier's tests (106) pass with the tier off and on eager,
+the library's suites with the tier off (3,000) and on eager (3,001), and the x86-64 type-check of
+the library and its tests. Choices the implementation made where the design was silent: "ways
+grew" compares the site's own-data way count with the most shapes a discarded check there
+expected; a NeverRan flag at a mapped block start applies at either inline kind (only WrongShape
+and WrongCallee are kind-bound); the warm-up is armed only on chunks with a record map, which every
+chunk the tier compiles has; R grows on an unfixable-only discard too; and the backoff test flips
+int32 overflows under TRUST_JS_OPT_NO_EXIT_PROFILE, since types that flip converge after one
+discard through the feedback or the profile and never reach the doubling. End to end, NotNumber,
+NeverRan, a fifth shape and an uncacheable receiver converge through the feedback alone (the IC
+marks the site generic at an evicting or refused fill); Overflow and WrongCallee need the profile
+in code2's own recompile, and a WrongShape flag keyed on a first stage declined its site in another
+chunk's compile (a stale chain's code3). Untimed; a discard and its recompile move the epoch twice.
