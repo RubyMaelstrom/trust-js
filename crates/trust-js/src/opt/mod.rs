@@ -204,6 +204,29 @@ pub(crate) fn pin_forced_exits_off_for_test() {
     .set();
 }
 
+/// Keep the tier as the environment sets it, its template code counting no loop iterations
+/// toward the checkpoints (TRUST_JS_OPT_NO_LOOP_COUNT), on this thread: for a test whose subject
+/// needs its callees to reach their checkpoints before a caller whose loop calls them (stage 2,
+/// step 8: the caller, which counts each call its loop makes, otherwise reaches its own first).
+/// Called first in the test, as `pin_tier_off_for_test` is.
+#[cfg(test)]
+pub(crate) fn pin_loop_count_off_for_test() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    TestSwitches {
+        on: enabled(),
+        eager: eager(),
+        exit_every: exit_every(),
+        no_reopt: no_reopt(),
+        no_exit_profile: no_exit_profile(),
+        exit_limit: exit_limit_base(),
+        no_loop_count: true,
+    }
+    .set();
+}
+
 #[cfg(test)]
 mod tests {
     use super::ir::*;

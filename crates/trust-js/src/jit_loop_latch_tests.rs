@@ -449,6 +449,9 @@ fn loop_latch_repeated_polls_gc_and_deadline_preserve_local_frame_owner() {
 /// e28783d5).
 #[test]
 fn loop_preambles_pin_enclosing_bindings_at_their_static_addresses() {
+    // Counts the template JIT's rotated-loop entries: with the tier on, the warm-up's loops reach
+    // `sum`'s checkpoints (P3 stage 2, step 8), and the tier's code replaces its rotated loop.
+    crate::opt::pin_tier_off_for_test();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         for threshold in [0, 8] {
             let mut engine = Engine::new();

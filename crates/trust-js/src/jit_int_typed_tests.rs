@@ -78,6 +78,10 @@ fn element_access_through_free_names_matches_in_every_tier() {
 
 #[test]
 fn packed_name_element_reads_and_writes_commit_for_captured_and_global_receivers() {
+    // Counts the template JIT's fused name-element commits in its regions: with the tier on,
+    // the warm-up's loops reach `read`'s and `write`'s checkpoints (P3 stage 2, step 8), and the
+    // tier's code, which has no regions, replaces theirs.
+    crate::opt::pin_tier_off_for_test();
     for captured in [false, true] {
         let mut engine = Engine::new();
         engine.set_tier(Tier::Jit);

@@ -197,6 +197,9 @@ fn a_construct_site_picks_up_its_constructors_new_code() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_frame_running_the_replaced_chunk_finishes_in_it() {
+    // It publishes `long`'s second stage itself: with the tier on, its warm-up's loop iterations
+    // reach the checkpoint that builds one first (P3 stage 2, step 8).
+    crate::opt::pin_tier_off_for_test();
     /// Publish a fresh compile of `long` as its new code, as a recompile would.
     fn republish(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
         let (_, long) = function(i, "long");
@@ -347,6 +350,9 @@ fn entries(chunk: &Chunk) -> usize {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_megamorphic_site_keeps_its_overflow_entries() {
+    // The callees publish their second stages while `wide` runs its first stage, whose site this
+    // reads: `wide`'s loop counts nothing toward its own checkpoints (P3 stage 2, step 8).
+    crate::opt::pin_loop_count_off_for_test();
     let mut engine = engine();
     eval(
         &mut engine,
@@ -436,11 +442,15 @@ fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
     ];
     let mut splices = None;
     for (label, on, eager) in configurations {
+        // The callees' checkpoints come first: `stable`'s loop counts nothing toward its own. With
+        // the counting (P3 stage 2, step 8) it gets six runs for each of a callee's, and its
+        // second stage, built first, splices the four in its ways, which then count no entries.
         #[cfg(target_arch = "aarch64")]
         crate::opt::TestSwitches {
             on,
             eager,
             exit_every: 0,
+            no_loop_count: true,
             ..Default::default()
         }
         .set();

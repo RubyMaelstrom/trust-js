@@ -535,6 +535,10 @@ fn operand_temporaries_survive_helper_end_polls() {
 /// and while the bit stays set its header and end polls call the helper on every iteration.
 #[test]
 fn a_region_loop_completes_when_the_poll_word_makes_it_bail() {
+    // Counts the template JIT's region entries: with the tier on, `regionLoop`'s loop reaches its
+    // checkpoints within its first calls (P3 stage 2, step 8), and the tier's code, which has no
+    // regions, replaces its region.
+    crate::opt::pin_tier_off_for_test();
     const SOURCE: &str = r#"
         function regionLoop(n) {
             var sum = 0, o = null;

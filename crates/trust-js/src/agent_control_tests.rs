@@ -741,6 +741,10 @@ fn agent_nested_public_entry_restores_floors_when_host_catches_unwind() {
 
 #[test]
 fn agent_limit_and_next_threshold_changes_reach_same_warmed_native_parent_poll() {
+    // The parent's first-stage mapping across four calls: with the tier on, its loop's 40,000
+    // iterations reach its checkpoints in the first call (P3 stage 2, step 8), and the tier's
+    // code replaces the mapping at the second or third.
+    crate::opt::pin_tier_off_for_test();
     let _polls = EndPolls::disabled();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);

@@ -307,6 +307,10 @@ fn equality_instanceof_typeof_and_string_length() {
 /// 256 records. Each kind of call must return through the direct sequence on every iteration.
 #[test]
 fn direct_calls_and_frame_teardown() {
+    // Counts the template JIT's direct returns: with the tier on, the callers' loops reach their
+    // checkpoints within a few calls (P3 stage 2, step 8), and the tier's code splices their
+    // callees.
+    crate::opt::pin_tier_off_for_test();
     let source = r#"
         function zero() { return {z: 1}; }
         function one(a) { return a; }

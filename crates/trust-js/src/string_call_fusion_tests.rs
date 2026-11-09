@@ -192,6 +192,9 @@ const WARM: &str = r#"
 /// freezing String.prototype and giving it another prototype leave them fused.
 #[test]
 fn every_write_to_the_method_reaches_its_fused_calls() {
+    // Counts the template JIT's fused String method steps; the tier emits each operation alone,
+    // and the warm-up's loops reach `scan`'s checkpoints (P3 stage 2, step 8).
+    crate::opt::pin_tier_off_for_test();
     // (the write, the answer after it, whether the calls stay fused)
     let cases: &[(&str, &str, bool)] = &[
         (
@@ -269,6 +272,9 @@ fn every_write_to_the_method_reaches_its_fused_calls() {
 /// once, and are fused again.
 #[test]
 fn a_new_generation_refills_the_sites() {
+    // Counts the template JIT's fused String method steps; the tier emits each operation alone,
+    // and the warm-up's loops reach `scan`'s checkpoints (P3 stage 2, step 8).
+    crate::opt::pin_tier_off_for_test();
     for tier in TIERS {
         let mut engine = engine(tier);
         assert_eq!(eval(&mut engine, WARM), "97,97/98", "{tier:?}");
@@ -291,6 +297,9 @@ fn a_new_generation_refills_the_sites() {
 /// fused against that Realm's fuse.
 #[test]
 fn another_realms_string_prototype_is_its_own() {
+    // Counts the template JIT's fused String method steps; the tier emits each operation alone,
+    // and the warm-up's loops reach `scan`'s checkpoints (P3 stage 2, step 8).
+    crate::opt::pin_tier_off_for_test();
     let mut answers = Vec::new();
     for tier in TIERS {
         let mut engine = engine(tier);

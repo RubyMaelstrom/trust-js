@@ -67,6 +67,10 @@ warm.length;
 
 #[test]
 fn a_baked_read_s_miss_probes_the_live_ways_before_the_checked_read() {
+    // Counts the template JIT's baked probes and checked reads: with the tier on, `run`'s loop
+    // reaches its checkpoints within a few calls (P3 stage 2, step 8), and the tier's code
+    // splices the read forms.
+    crate::opt::pin_tier_off_for_test();
     let forms = ["local", "operand", "self", "method"];
     let mut expected = Vec::new();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
