@@ -306,6 +306,9 @@ fn slice_and_code_point_templates_match_the_full_calls() {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 fn call_templates_finish_compiled_calls() {
+    // Counts the calls templates finish, in the tier's effects too; a forced exit hands its
+    // call to the VM.
+    crate::opt::pin_forced_exits_off_for_test();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);

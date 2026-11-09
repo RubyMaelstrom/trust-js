@@ -100,6 +100,8 @@ t;
 
 #[test]
 fn a_stale_chain_recompiles_once_without_property_chains() {
+    // Property chains are the template JIT's code; the tier's second stages build none.
+    crate::opt::pin_tier_off_for_test();
     let mut engine = engine();
     eval(&mut engine, PROGRAM);
     for name in ["local", "self", "store", "held"] {

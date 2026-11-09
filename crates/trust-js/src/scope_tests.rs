@@ -540,7 +540,10 @@ fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
         _ => panic!("compiled caller"),
     };
     let runtime = user.func.runtime();
-    let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
+    // The chunk the calls run: with the optimizing tier on, `through`'s second stage. Its caught
+    // throws exit the tier's code until it falls back, and the fallback moves the call-cache
+    // epoch, which leaves the first stage's entries stale.
+    let chunk = runtime.execution_code().and_then(Option::as_ref).unwrap();
     assert!(chunk.jit.get().is_some_and(|code| code.is_some()));
     let entry = chunk
         .cached_call_for(crate::value::Gc::as_ptr(&callable_object) as usize)

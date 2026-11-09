@@ -278,6 +278,8 @@ fn deferred_prototype_region_own_reads_leave_the_region_once() {
 /// callable), and the prototype is the same object on every later read.
 #[test]
 fn deferred_prototype_region_method_reads_are_not_borrowed() {
+    // Counts the template JIT's loop-region method reads, which the tier's code does not make.
+    crate::opt::pin_tier_off_for_test();
     let source = format!(
         "{FUNCTIONS}
         function callPrototype(F, n) {{

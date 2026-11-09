@@ -16,6 +16,8 @@ fn acyclic_entries() -> u64 {
 
 #[test]
 fn first_stages_leave_acyclic_spans_to_second_stages() {
+    // Counts the template JIT's acyclic spans in a second stage the first checkpoint builds.
+    crate::opt::pin_tier_off_for_test();
     // `pick` is one acyclic span from pc 0 in both stages (its first stage's 25 operations, its
     // second stage's 35 with `leaf` spliced); `run` calls it from a loop.
     let setup = r#"
@@ -66,6 +68,8 @@ fn loop_entries() -> u64 {
 
 #[test]
 fn second_stages_leave_out_regions_whose_code_has_not_run() {
+    // Counts the template JIT's loop regions around a second stage the first checkpoint builds.
+    crate::opt::pin_tier_off_for_test();
     // `g`'s loop runs only for a large `x`: none had come when its second stage was compiled
     // (`leaf` spliced, at the first inline checkpoint), so that stage has no region for the loop,
     // whose `o.b` read never filled its cache. Its first stage has the loop region (tier 1 keeps

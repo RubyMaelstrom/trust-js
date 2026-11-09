@@ -18,8 +18,17 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 /// An engine whose functions compile to bytecode at their first call and run in the VM, which
-/// fills their caches, until a test installs the tier's code and moves to the JIT tier.
+/// fills their caches, until a test installs the tier's code and moves to the JIT tier. The
+/// switches are set whatever the environment's: the tier's driver stays off, so that no
+/// checkpoint replaces the installed code with a second stage, and no exit is forced but the
+/// tests' own (`Interp::opt_exit_every`), so that their exit counts hold.
 fn fixture(source: &str) -> Engine {
+    crate::opt::TestSwitches {
+        on: false,
+        eager: false,
+        exit_every: 0,
+    }
+    .set();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Bytecode);
     engine.set_tier_threshold(0);

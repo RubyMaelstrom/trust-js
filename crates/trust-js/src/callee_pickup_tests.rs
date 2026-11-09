@@ -160,8 +160,10 @@ fn a_construct_site_picks_up_its_constructors_new_code() {
     let (p_key, p) = function(i, "P");
     let (_, make) = function(i, "make");
     let first = stages(&p).0;
+    // With the optimizing tier on, the second stage waits for settled feedback, at most to the
+    // last checkpoint (8,500 constructions).
     let mut runs = 0;
-    while stages(&p).1.is_none() && runs < 100 {
+    while stages(&p).1.is_none() && runs < 200 {
         assert_eq!(eval(&mut engine, "make(50)"), sum(50));
         runs += 1;
     }
@@ -269,9 +271,16 @@ fn rust_callers_pick_up_new_code() {
     );
     let sum: u64 = (0..400u64).map(|k| k * k).sum();
     // One forEach: cb's checkpoint publishes its second stage after its hundredth call, and the
-    // rest of the iteration's calls enter it.
-    assert_eq!(eval(&mut engine, "each()"), sum.to_string());
+    // rest of the iteration's calls enter it. With the optimizing tier on, the second stage
+    // waits for settled feedback (a later checkpoint, by 8,500 calls), which a later forEach
+    // reaches as far into its iteration.
     let (_, cb) = function(&mut engine.interp, "cb");
+    for _ in 0..25 {
+        assert_eq!(eval(&mut engine, "each()"), sum.to_string());
+        if !crate::opt::enabled() || stages(&cb).1.is_some() {
+            break;
+        }
+    }
     let (first, second) = stages(&cb);
     let second = second.expect("cb's second stage");
     assert!(first.superseded());
@@ -280,8 +289,8 @@ fn rust_callers_pick_up_new_code() {
         "the forEach's later calls entered the new chunk ({} runs)",
         second.jit_runs.get()
     );
-    // The trap: its calls through the read's cache, from machine code or from Rust.
-    assert_eq!(eval(&mut engine, "reads(400)"), "3600");
+    // The trap: its calls through the read's cache, from machine code or from Rust, in as many
+    // rounds as its second stage waits for.
     let env = engine.interp.global_env;
     let handler = engine
         .interp
@@ -296,10 +305,19 @@ fn rust_callers_pick_up_new_code() {
     let ValueView::Obj(trap) = trap.view() else {
         panic!("the trap is an object")
     };
-    let ObjectKind::User(user) = &trap.borrow().kind else {
-        panic!("the trap is a user function")
+    let trap = {
+        let ObjectKind::User(user) = &trap.borrow().kind else {
+            panic!("the trap is a user function")
+        };
+        Rc::clone(&user.func)
     };
-    let (first, second) = stages(&user.func);
+    for _ in 0..25 {
+        assert_eq!(eval(&mut engine, "reads(400)"), "3600");
+        if !crate::opt::enabled() || stages(&trap).1.is_some() {
+            break;
+        }
+    }
+    let (first, second) = stages(&trap);
     let second = second.expect("the trap's second stage");
     assert!(first.superseded());
     let runs = entries(&second);

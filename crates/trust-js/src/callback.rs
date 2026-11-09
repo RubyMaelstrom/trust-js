@@ -624,6 +624,9 @@ mod tests {
 
     #[test]
     fn inline_retry_observes_call_feedback_after_early_empty_plan() {
+        // The template pipeline's re-plan at a later checkpoint after an empty plan (the tier
+        // waits for settled feedback instead).
+        crate::opt::pin_tier_off_for_test();
         let mut engine = Engine::new();
         engine.set_tier(Tier::Jit);
         engine.set_tier_threshold(0);
@@ -682,26 +685,40 @@ mod tests {
             ),
             "1000"
         );
-        let env = engine.interp.global_env;
-        let value = engine
-            .interp
-            .get_var("arrowHot", &env)
-            .unwrap_or_else(|_| panic!("arrowHot"));
-        let object_handle = value.as_obj().unwrap();
-        let object = object_handle.borrow();
-        let ObjectKind::User(user) = &object.kind else {
-            panic!("user")
+        // arrowHot's first stage and its second stage.
+        let stages = |engine: &mut Engine| {
+            let env = engine.interp.global_env;
+            let value = engine
+                .interp
+                .get_var("arrowHot", &env)
+                .unwrap_or_else(|_| panic!("arrowHot"));
+            let object_handle = value.as_obj().unwrap();
+            let object = object_handle.borrow();
+            let ObjectKind::User(user) = &object.kind else {
+                panic!("user")
+            };
+            let runtime = user.func.runtime();
+            (
+                runtime.code.get().and_then(Option::clone).unwrap(),
+                runtime.code2.get().and_then(Option::clone),
+            )
         };
-        let runtime = user.func.runtime();
-        let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
+        // With the optimizing tier on, the second stage waits for settled feedback, at most to
+        // the last checkpoint (8,500 native runs).
+        for _ in 0..40 {
+            if !crate::opt::enabled() || stages(&mut engine).1.is_some() {
+                break;
+            }
+            assert_eq!(eval(&mut engine, "driveArrows()"), "1000");
+        }
+        let (chunk, second) = stages(&mut engine);
         if crate::bytecode::inline_recompile_at() == 100 && chunk.jit.get().flatten().is_some() {
-            assert!(user
-                .func
-                .runtime()
-                .code2
-                .get()
-                .and_then(Option::as_ref)
-                .is_some());
+            // The arrow is spliced (with the tier on, a second stage may splice nothing).
+            let second = second.expect("arrowHot's second stage");
+            assert!(second
+                .jit_ops()
+                .iter()
+                .any(|op| matches!(op, crate::bytecode::Op::InlineGuard(..))));
         }
     }
 }

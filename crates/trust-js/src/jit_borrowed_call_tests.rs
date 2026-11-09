@@ -15,8 +15,6 @@ use crate::bytecode::Tier;
 use crate::Engine;
 
 use super::traced_tests::eval;
-#[cfg(target_arch = "aarch64")]
-use super::traced_tests::with_chunk;
 
 /// Where a case's calls run in native code: a non-resumable borrowed frame (a loop fragment or
 /// an OSR'd loop) or a coroutine's slices.
@@ -71,9 +69,7 @@ fn check(case: &Case) {
             };
             assert!(entries > 0, "no borrowed native frame ran: {}", case.source);
             for name in case.direct {
-                let completions = with_chunk(&mut engine, name, |chunk| {
-                    chunk.test_direct_returns.get() + chunk.test_direct_throws.get()
-                });
+                let completions = direct_completions(&mut engine, name);
                 assert!(
                     completions > 0,
                     "{name} never completed through the direct sequence: {}",
@@ -82,6 +78,27 @@ fn check(case: &Case) {
             }
         }
     }
+}
+
+/// The completions of the global function `name` through the direct sequence, into any of its
+/// chunks: with the optimizing tier on, a hot callee's second stage (the tier's chunk, though it
+/// splices nothing) takes the calls its first stage took.
+#[cfg(target_arch = "aarch64")]
+fn direct_completions(engine: &mut Engine, name: &str) -> usize {
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var(name, &env).ok().expect("bound name");
+    let object_handle = value.as_obj().expect("a function object");
+    let object = object_handle.borrow();
+    let crate::value::ObjectKind::User(user) = &object.kind else {
+        panic!("{name} is not a user function")
+    };
+    let runtime = user.func.runtime();
+    [runtime.code.get(), runtime.code2.get(), runtime.code3.get()]
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|chunk| chunk.test_direct_returns.get() + chunk.test_direct_throws.get())
+        .sum()
 }
 
 #[test]

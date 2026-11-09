@@ -50,6 +50,8 @@ fn fused_in(engine: &mut Engine, source: &str) -> (usize, String) {
 /// 2^32), and indices that are not Numbers.
 #[test]
 fn fused_code_point_calls_answer_every_index_form_as_the_call_does() {
+    // Counts the template JIT's fused String method steps; the tier emits each operation alone.
+    crate::opt::pin_tier_off_for_test();
     let source = r#"
         function local(s, i) { return s.codePointAt(i); }
         function constant(s) { return s.codePointAt(1); }
@@ -358,6 +360,9 @@ fn receivers_other_than_primitive_strings_take_the_call() {
 /// (joining the fast path's Number) and one returning something else (resuming after the call).
 #[test]
 fn fused_calls_in_register_regions_answer_as_the_call_does() {
+    // Counts the template JIT's fused String method steps in its register regions; the tier
+    // emits each operation alone and has no regions.
+    crate::opt::pin_tier_off_for_test();
     let source = r#"
         function eol(t, e) {
             for (; 10 !== (s = t.codePointAt(e)) && 13 !== s;) e++;

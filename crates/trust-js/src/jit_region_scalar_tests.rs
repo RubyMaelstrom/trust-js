@@ -305,6 +305,8 @@ fn scalar_state_nan_zero_and_borrowed_owner_replacement_cross_effects() {
 
 #[test]
 fn scalar_state_inline_success_carries_clean_prefix_and_distinct_duplicates() {
+    // Counts the template JIT's register-region events, which the tier's second stages lack.
+    crate::opt::pin_tier_off_for_test();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = warmed(
             tier,

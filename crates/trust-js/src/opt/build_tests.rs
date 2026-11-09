@@ -12,7 +12,20 @@ use crate::{Completion, Engine};
 use std::fmt::Write as _;
 use std::rc::Rc;
 
+/// An engine at `tier` that compiles every function at its first call, with the tier's switches
+/// off whatever the environment's: the graphs are built from the tier-off pipeline's chunks and
+/// feedback, which forced exits would add the VM's records to.
 fn engine(tier: Tier) -> Engine {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    super::TestSwitches {
+        on: false,
+        eager: false,
+        exit_every: 0,
+    }
+    .set();
     let mut engine = Engine::new();
     engine.set_tier(tier);
     engine.set_tier_threshold(0);

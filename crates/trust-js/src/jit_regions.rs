@@ -4647,6 +4647,8 @@ mod tests {
 
     #[test]
     fn guarded_regions_plain_calls_and_acyclic_inline_temporaries() {
+        // Counts the template JIT's guarded-region events, which the tier's second stages lack.
+        crate::opt::pin_tier_off_for_test();
         check_guarded(
             r#"
             function inc(x){return x+1;}
@@ -4667,6 +4669,8 @@ mod tests {
 
     #[test]
     fn guarded_regions_borrow_inherited_method_and_preserve_mutating_arguments() {
+        // Counts the template JIT's guarded-region events, which the tier's second stages lack.
+        crate::opt::pin_tier_off_for_test();
         check_guarded(
             r#"
             function original(x){return this.bias+x;}
@@ -4709,6 +4713,8 @@ mod tests {
 
     #[test]
     fn guarded_regions_preserve_closure_environment_throws_and_owner_replacement() {
+        // Counts the template JIT's guarded-region events, which the tier's second stages lack.
+        crate::opt::pin_tier_off_for_test();
         check_guarded(
             r#"
             function make(k){return function(x){return x+k;};}

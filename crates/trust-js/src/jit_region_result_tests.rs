@@ -603,6 +603,8 @@ fn region_numeric_element_reads_stay_in_registers_and_leave_for_anything_else() 
 /// depth (1,024) still becomes proper tail calls (ECMA-262 PrepareForTailCall).
 #[test]
 fn region_tail_deep_reads_the_depth_in_place_and_keeps_proper_tail_calls() {
+    // Counts the template JIT's register regions; the tier's tail calls exit to the VM.
+    crate::opt::pin_tier_off_for_test();
     let source = r#"
         "use strict";
         var J = 1, le = 2, fe = 3;

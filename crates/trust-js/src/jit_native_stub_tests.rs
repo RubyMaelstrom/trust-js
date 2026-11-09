@@ -167,6 +167,9 @@ function make(n) { var t = ''; for (var i = 0; i < n; i++) t = new Box('5').k; r
 /// (`bytecode::native_stub_kind`).
 #[test]
 fn a_constructing_callers_other_light_natives_take_their_fast_entry() {
+    // Counts the natives the stub runs, from the tier's effects too; a forced exit hands the
+    // rest of its call to the VM.
+    crate::opt::pin_forced_exits_off_for_test();
     let source = r#"
 var m = new Map([['k', 3]]), s = ' the quick fox ';
 function Box(v) {

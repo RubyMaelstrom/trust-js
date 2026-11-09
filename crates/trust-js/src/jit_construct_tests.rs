@@ -168,18 +168,39 @@ fn constructors_run_only_under_new_reach_their_second_stage_compile() {
     if cfg!(target_arch = "aarch64") {
         assert!(direct_constructs() > before, "no direct construction");
     }
-    for name in ["Box", "Plain"] {
-        let constructor = object(&mut engine, name);
+    let second_stage = |engine: &mut Engine, name: &str| {
+        let constructor = object(engine, name);
         let constructor = constructor.borrow();
         let ObjectKind::User(user) = &constructor.kind else {
             panic!("{name} is not a user function")
         };
+        user.func
+            .runtime()
+            .code2
+            .get()
+            .is_some_and(|code| code.is_some())
+    };
+    // With the optimizing tier on, a second stage waits for settled feedback, at most to the
+    // last checkpoint (8,500 native runs): the constructions go on until both are compiled.
+    for _ in 0..40 {
+        if !crate::opt::enabled()
+            || ["Box", "Plain"]
+                .iter()
+                .all(|name| second_stage(&mut engine, name))
+        {
+            break;
+        }
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                "var s = 0; for (var k = 0; k < 400; k++) s += make(k); s"
+            ),
+            "160800"
+        );
+    }
+    for name in ["Box", "Plain"] {
         assert!(
-            user.func
-                .runtime()
-                .code2
-                .get()
-                .is_some_and(|code| code.is_some()),
+            second_stage(&mut engine, name),
             "{name} did not reach its second-stage compile"
         );
     }
@@ -423,6 +444,9 @@ fn constructions_keep_their_instance_across_collections() {
 #[cfg(target_arch = "aarch64")]
 #[test]
 fn hot_new_sites_construct_through_the_direct_sequence() {
+    // Counts the constructions the direct sequence completes, in the tier's effects too; a
+    // forced exit hands its construction to the VM.
+    crate::opt::pin_forced_exits_off_for_test();
     if !run_alone("jit::construct_tests::hot_new_sites_construct_through_the_direct_sequence") {
         return;
     }

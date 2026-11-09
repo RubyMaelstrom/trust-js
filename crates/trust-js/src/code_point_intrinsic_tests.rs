@@ -81,6 +81,9 @@ fn code_point_indices_and_method_replacement_keep_coercion_order() {
     any(target_os = "linux", target_os = "macos", target_os = "windows")
 ))]
 fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
+    // Counts the calls the templates read in line, in the tier's effects too; a forced exit
+    // hands the rest of its call to the VM.
+    crate::opt::pin_forced_exits_off_for_test();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);

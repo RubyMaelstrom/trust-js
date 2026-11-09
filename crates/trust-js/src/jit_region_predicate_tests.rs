@@ -245,6 +245,8 @@ fn region_predicates_truthiness_nullish_and_last_owners() {
 
 #[test]
 fn region_predicates_native_peeks_do_not_call_condition_helper() {
+    // Counts the template JIT's register regions and condition helpers.
+    crate::opt::pin_tier_off_for_test();
     crate::jit::test_first_stage_spans();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);

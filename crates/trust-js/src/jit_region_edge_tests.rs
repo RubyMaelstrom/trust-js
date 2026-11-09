@@ -201,6 +201,8 @@ fn cfg_edges_nested_continue_break_and_finally_preserve_completions() {
 
 #[test]
 fn cfg_edges_inline_success_still_carries_virtual_scalar_owners() {
+    // Counts the template JIT's register-region events, which the tier's second stages lack.
+    crate::opt::pin_tier_off_for_test();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = engine(if tier == Tier::Jit {
             Tier::Bytecode

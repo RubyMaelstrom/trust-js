@@ -418,6 +418,21 @@ fn spliced_reads_call_getters_with_their_inline_positions() {
         assert_eq!(eval(&mut engine, "drive()"), "47850", "{tier:?}");
         #[cfg(target_arch = "aarch64")]
         if tier == Tier::Jit && super::shared_stubs_enabled() {
+            // With the optimizing tier on, the callers' second stages wait for settled feedback,
+            // at most to the last checkpoint (8,500 native runs).
+            for _ in 0..40 {
+                let compiled = ["spliced", "splicedHere", "splicedBad"].map(|caller| {
+                    function_of(&mut engine, caller)
+                        .runtime()
+                        .code2
+                        .get()
+                        .is_some()
+                });
+                if !crate::opt::enabled() || compiled.iter().all(|&second| second) {
+                    break;
+                }
+                assert_eq!(eval(&mut engine, "drive()"), "47850");
+            }
             let returns = |chunk: &crate::bytecode::Chunk| chunk.test_direct_returns.get();
             let throws = |chunk: &crate::bytecode::Chunk| chunk.test_direct_throws.get();
             for (caller, getter, count) in [

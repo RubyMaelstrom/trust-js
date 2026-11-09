@@ -620,6 +620,8 @@ fn sloppy_fragment_aliases_retire_on_collection_and_host_interruption() {
 
 #[test]
 fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
+    // Counts the native runs to the first checkpoint and the second stage it builds there.
+    crate::opt::pin_tier_off_for_test();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(32);
@@ -663,6 +665,8 @@ fn native_callees_of_tree_walker_calls_reach_their_inline_checkpoint() {
 
 #[test]
 fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
+    // Counts each stage's native runs around the second stage the first checkpoint builds.
+    crate::opt::pin_tier_off_for_test();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -794,7 +798,18 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
         i.get_var("hot", &global)
             .unwrap_or_else(|_| panic!("child hot function"))
     });
-    for _ in 0..150 {
+    let second_stage = |callee: &Value| {
+        let callee = callee.as_obj().unwrap();
+        let callee = callee.borrow();
+        let crate::value::ObjectKind::User(user) = &callee.kind else {
+            panic!("child user callee")
+        };
+        user.func.runtime().code2.get().is_some()
+    };
+    // With the optimizing tier on, the second stage waits for settled feedback, at most to the
+    // last checkpoint (8,500 native runs): the calls go on until it is built.
+    let mut calls = 0;
+    while calls < 150 || (crate::opt::enabled() && calls < 9_000 && !second_stage(&callee)) {
         // The parent Realm initiates this generic call. Realm activation must precede
         // both the promotion proof and the selected native body's literal allocation.
         let out = i
@@ -808,6 +823,7 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
             ),
             "true"
         );
+        calls += 1;
     }
     #[cfg(all(
         any(target_arch = "aarch64", target_arch = "x86_64"),

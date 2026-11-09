@@ -54,17 +54,36 @@ fn require_hot_native(engine: &mut Engine, name: &str, inlined: bool) {
                 chunk.inline_attempted.get(),
                 "{name} must cross the hot inline checkpoint"
             );
+            // A splice is an inline guard in the second stage: with the optimizing tier on, the
+            // second stage may be the function's own chunk with nothing spliced.
+            let spliced = function
+                .runtime()
+                .code2
+                .get()
+                .and_then(Option::as_ref)
+                .is_some_and(|second| {
+                    second
+                        .jit_ops()
+                        .iter()
+                        .any(|op| matches!(op, crate::bytecode::Op::InlineGuard(..)))
+                });
             assert_eq!(
-                function
-                    .runtime()
-                    .code2
-                    .get()
-                    .and_then(Option::as_ref)
-                    .is_some(),
-                inlined,
+                spliced, inlined,
                 "{name} must respect the splice context capability"
             );
         }
+    }
+}
+
+/// Evaluate `drive` (which answers `expected`) until the global function `name` has a second
+/// stage: with the optimizing tier on, the second stage waits for settled feedback, at most to
+/// the last checkpoint (8,500 native runs); with it off, the first checkpoint built it.
+fn drive_to_second_stage(engine: &mut Engine, name: &str, drive: &str, expected: &str) {
+    for _ in 0..40 {
+        if !crate::opt::enabled() || function(engine, name).runtime().code2.get().is_some() {
+            return;
+        }
+        assert_eq!(evaluate(engine, drive), expected, "{drive}");
     }
 }
 
@@ -303,6 +322,24 @@ fn spliced_closures_over_non_global_environments_read_live_bindings() {
             }
             var warm = 0;
             for (var j = 0; j < 400; j++) warm += hotDecode();
+            warm;
+        "#
+            ),
+            "8000",
+            "{tier:?}"
+        );
+        if tier == Tier::Jit {
+            drive_to_second_stage(
+                &mut engine,
+                "hotDecode",
+                "var w = 0; for (var j = 0; j < 400; j++) w += hotDecode(); w",
+                "8000",
+            );
+        }
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                r#"
             setTable(['x', 'x', 'x', 'x']);
             var live = hotDecode();
             replaceTable();
@@ -423,6 +460,12 @@ fn small_callees_splice_into_callers_beyond_the_shared_budget() {
             assert!(
                 chunk.jit_ops().len() > 320,
                 "the fixture must exceed the shared budget"
+            );
+            drive_to_second_stage(
+                &mut engine,
+                "bigCaller",
+                "var t = 0; for (var j = 0; j < 400; j++) t += bigCaller(j); t",
+                &expected.to_string(),
             );
             require_hot_native(&mut engine, "bigCaller", true);
         }

@@ -136,6 +136,39 @@ mod off {
     }
 }
 
+/// Pin the tier off on this thread, whatever TRUST_JS_OPT, TRUST_JS_OPT_EAGER and
+/// TRUST_JS_OPT_EXIT_EVERY say, for a test whose subject is the tier-off pipeline: the template
+/// JIT's second stages and their mechanics, or the second stage the first checkpoint builds (the
+/// suite also runs with the tier on, eager and forcing exits; V8's per-variant flags and status
+/// file skips). Called first in the test, before it makes an engine, so that a child process the
+/// test runs itself in pins itself as well. Where the tier has no back end it is off already.
+#[cfg(test)]
+pub(crate) fn pin_tier_off_for_test() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    TestSwitches::default().set();
+}
+
+/// Keep the tier as the environment sets it, without its forced exits (TRUST_JS_OPT_EXIT_EVERY),
+/// on this thread: for a test whose subject holds in the tier's code but which counts work that
+/// generated code completes, some of which a forced exit hands to the VM (V8's status-file skips
+/// of the deopt fuzzer). Called first in the test, as `pin_tier_off_for_test` is.
+#[cfg(test)]
+pub(crate) fn pin_forced_exits_off_for_test() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    TestSwitches {
+        on: enabled(),
+        eager: eager(),
+        exit_every: 0,
+    }
+    .set();
+}
+
 #[cfg(test)]
 mod tests {
     use super::ir::*;
