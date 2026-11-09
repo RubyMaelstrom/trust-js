@@ -898,3 +898,10 @@ Operands the feedback says are not Numbers keep the effect path, as stage 1's. T
 graph for each operand form (an int32, an f64 product, a tagged double, a constant); end-to-end
 values under the tier eager and with exits forced, with and without TRUST_JS_JIT_NO_JSCVT (-0, NaN,
 the infinities, 2^31, -2^31 - 1, 2^53, 2^63, 2^84, a product past 2^53).
+Step 1 landed (b0b31bdf, 2026-11-09). Test262's bitwise and compound-assignment tests (687) pass
+with the tier off, on, eager and forcing exits. Untimed, under perf on one non-LTO build
+(target/p3/stage2/diag-step1): the VM's operation helper holds 0.9% of zlib's samples with the tier
+on (38% before the step) and none of Mandreel's (31%); zlib scores 3,591 with the tier on against
+3,915 off (1,731 against 3,780 before), Mandreel 1,074 against 1,096 (617 against 1,097). In zlib
+the tier's code for a6 and a3 now takes 28% and 16% more samples than their second stages do, and
+a8's hot loop runs in its second stage's loop code with the tier on as off (OSR, stage 5).
