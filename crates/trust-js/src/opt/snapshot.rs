@@ -15,6 +15,12 @@
 //! way or sets the generic or megamorphic mark, and a second stage's seeded caches count. Value
 //! and element records are no evidence, since in-line hits record nothing (rule U).
 //!
+//! A free name's site (stage 2, step 4) has a view of its own ([`NameView`]): its static address,
+//! or its name cache's class, a global property resolved again in the realm's global object as
+//! V8's broker reads a property cell and Warp's oracle a stub. An empty cache is evidence that the
+//! site never ran, and the refused-fill mark (`bytecode::REFUSED_NAME_IC`) that it ran; a static
+//! address is none, since the templates' static reads fill no cache.
+//!
 //! The exit profile (stage 2; `opt::profile`) joins the feedback as each pc's declined reasons:
 //! the chunk's own sites at the pc and those of the baseline site its record map names, a value
 //! or coverage site from any inline kind and a named or call site only from a site of the pc's
@@ -24,8 +30,9 @@
 
 use super::ir::ExitReason;
 use super::profile::ChunkProfile;
-use crate::bytecode::{Chunk, Op};
+use crate::bytecode::{Chunk, NameIc, Op, StaticName};
 use crate::feedback::{self, CallState, NamedView, RecordMap, SiteView, ValuesView};
+use crate::interpreter::Env;
 
 /// Whether a pc's feedback shows that its operation ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,13 +51,49 @@ pub(crate) struct Snapshot {
     views: Box<[SiteView]>,
     ran: Box<[Ran]>,
     /// Each pc's declined reasons (bits by discriminant) and, for WrongShape, the most shapes a
-    /// discarded check there expected; empty where no chunk the compile reads has exit sites.
+    /// discarded check there expected, for WrongName the proof byte a discarded check there
+    /// expected; empty where no chunk the compile reads has exit sites.
     declined: Box<[(u32, u8)]>,
+    /// Each free-name site's view (see [`NameView`]); empty for a chunk without one.
+    names: Box<[NameView]>,
 }
 
 // Every reason has its bit in a declined mask: the discriminants run from 0 to the last reason's
 // (ExitReason's last variant), which the mask's width bounds.
-const _: () = assert!((ExitReason::CouldNotGrow as u32) < u32::BITS);
+const _: () = assert!((ExitReason::Tdz as u32) < u32::BITS);
+
+/// The record a static address counts its hops from (stage 2, step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Base {
+    /// The running environment.
+    Running,
+    /// For a splice's read (`Op::LoadNameIn`): the record its hops reach from the pinned
+    /// [[Environment]], folded at the compile (JSC's SkipScope on a constant base): parent links
+    /// do not change once code can read through them (the plan's Q3).
+    Holder(usize),
+    /// A splice whose pinned function is dead or whose chain is shorter than its hops: its guard
+    /// never passes, and the read stays the effect.
+    Unknown,
+}
+
+/// A free-name operation's site as one compile reads it (stage 2, step 4; the plan's "Step 4"):
+/// LoadName, LoadNameForCall and their splices' forms, StoreNameCached, UpdateNameCached, and a
+/// fixed activation's captured bindings (LoadCap, StoreCap, StoreCapInit, UpdateCap).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NameView {
+    /// No free-name site: another operation, or a captured binding outside a fixed activation.
+    None,
+    /// Decision 21's static address (a captured binding's at hops 0): no guard, as V8's context
+    /// slots, SpiderMonkey's GetAliasedVar and JSC's GetClosureVar read theirs.
+    Static { address: StaticName, base: Base },
+    /// A cache in a mode the tier keeps the effect for (scope, depth-1, layout, deep, a global
+    /// object's property), or a store's or update's that has no static address.
+    Dynamic,
+    /// An empty cache: the site never ran.
+    Empty,
+    /// The refused-fill mark: the site ran, and no fill could cache it.
+    Refused,
+}
 
 impl Snapshot {
     /// The feedback of every operation of `chunk` (its `jit_ops`), as it stands now.
@@ -59,15 +102,26 @@ impl Snapshot {
         let map = chunk.feedback_vector().record_map();
         let mut views = Vec::with_capacity(ops.len());
         let mut ran = Vec::with_capacity(ops.len());
+        let mut names = Vec::new();
         for (pc, op) in ops.iter().enumerate() {
             let view = view(chunk, map, pc);
-            ran.push(evidence(chunk, op, &view));
+            let name = name_view(chunk, op);
+            if name == NameView::None {
+                ran.push(evidence(chunk, op, &view));
+            } else {
+                if names.is_empty() {
+                    names = vec![NameView::None; ops.len()];
+                }
+                ran.push(name_evidence(&name));
+                names[pc] = name;
+            }
             views.push(view);
         }
         Snapshot {
             views: views.into_boxed_slice(),
             ran: ran.into_boxed_slice(),
             declined: declined(chunk, map, ops.len()),
+            names: names.into_boxed_slice(),
         }
     }
 
@@ -83,6 +137,18 @@ impl Snapshot {
         self.declined
             .get(pc)
             .map_or(0, |&(_, ways)| usize::from(ways))
+    }
+
+    /// The view of the free-name site at `pc` ([`NameView::None`] for any other operation).
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the builder lowers static addresses from step 4's (b)"
+        )
+    )]
+    pub(crate) fn name(&self, pc: usize) -> NameView {
+        self.names.get(pc).copied().unwrap_or(NameView::None)
     }
 
     /// The operation count the snapshot covers.
@@ -133,11 +199,13 @@ fn bit(reason: ExitReason) -> u32 {
     1 << reason as u8
 }
 
-/// Whether a reason's sites apply only where the inline kind matches: a named access's shapes
-/// and a call's callees are a site's in its context, as an IC status is, where a value's type or a
-/// block's coverage is the operation's anywhere.
+/// Whether a reason's sites apply only where the inline kind matches: a named access's shapes,
+/// a call's callees and a free name's proof are a site's in its context, as an IC status is,
+/// where a value's type, a binding's TDZ or a block's coverage is the operation's anywhere.
 fn kind_bound(reason: u8) -> bool {
-    reason == ExitReason::WrongShape as u8 || reason == ExitReason::WrongCallee as u8
+    reason == ExitReason::WrongShape as u8
+        || reason == ExitReason::WrongCallee as u8
+        || reason == ExitReason::WrongName as u8
 }
 
 /// The exit profile's declined reasons per pc of `chunk` (see the module's doc): empty unless the
@@ -155,6 +223,9 @@ fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u32, u8
             *reasons |= 1u32 << reason;
             if reason == ExitReason::WrongShape as u8 {
                 *ways = (*ways).max(shapes);
+            } else if reason == ExitReason::WrongName as u8 {
+                // A name site's byte is the proof its discarded check expected, as it is.
+                *ways = shapes;
             }
         };
         // The chunk's own sites, keyed at its pcs: a recompile's where its map names nothing,
@@ -223,6 +294,106 @@ fn evidence(chunk: &Chunk, op: &Op, view: &SiteView) -> Ran {
     }
 }
 
+/// The evidence a free-name site's view gives (see [`Ran`]): none from a static address, which
+/// the templates read without their cache; an empty cache says the site never ran, any other
+/// cache (the refused-fill mark among them) that it ran.
+fn name_evidence(name: &NameView) -> Ran {
+    match name {
+        NameView::None | NameView::Static { .. } => Ran::Unknown,
+        NameView::Empty => Ran::No,
+        NameView::Dynamic | NameView::Refused => Ran::Yes,
+    }
+}
+
+/// The free-name operation `op`'s name and cache, and its splice's inline target.
+fn name_site(op: &Op) -> Option<(u32, u32, Option<u32>)> {
+    Some(match *op {
+        Op::LoadName(name, cache)
+        | Op::LoadNameForCall(name, cache)
+        | Op::StoreNameCached(name, cache)
+        | Op::UpdateNameCached(name, cache, _) => (name, cache, None),
+        Op::LoadNameIn(name, cache, target) | Op::LoadNameForCallIn(name, cache, target) => {
+            (name, cache, Some(target))
+        }
+        _ => return None,
+    })
+}
+
+/// The view of the free-name operation `op` of `chunk` (see [`NameView`]).
+fn name_view(chunk: &Chunk, op: &Op) -> NameView {
+    if let Op::LoadCap(name)
+    | Op::StoreCap(name)
+    | Op::StoreCapInit(name)
+    | Op::UpdateCap(name, _) = *op
+    {
+        // A captured binding of a fixed activation, at its slot of the running record.
+        return match chunk.jit_cap_binding(name) {
+            Some((slot, attrs)) => match u16::try_from(slot) {
+                Ok(slot) => NameView::Static {
+                    address: StaticName {
+                        hops: 0,
+                        slot,
+                        lexical: attrs.lexical(),
+                        mutable: attrs.mutable(),
+                    },
+                    base: Base::Running,
+                },
+                Err(_) => NameView::None,
+            },
+            None => NameView::None,
+        };
+    }
+    let Some((_, cache, target)) = name_site(op) else {
+        return NameView::None;
+    };
+    if let Some(address) = chunk.jit_name_static(cache) {
+        let base = match target {
+            None => Base::Running,
+            Some(target) => holder(chunk, target, address.hops),
+        };
+        return NameView::Static { address, base };
+    }
+    cache_view(&chunk.jit_name_ic(cache))
+}
+
+/// A name cache's class, for a site the tier keeps the effect at.
+fn cache_view(ic: &NameIc) -> NameView {
+    match ic.env {
+        0 => NameView::Empty,
+        crate::bytecode::REFUSED_NAME_IC => NameView::Refused,
+        _ => NameView::Dynamic,
+    }
+}
+
+/// The record `hops` parent links from inline target `target`'s pinned [[Environment]], the
+/// holder a splice's static read folds (see [`Base::Holder`]).
+fn holder(chunk: &Chunk, target: u32, hops: u16) -> Base {
+    let Some(mut record) = chunk.inline_target_env(target) else {
+        return Base::Unknown;
+    };
+    for _ in 0..hops {
+        let Some(parent) = record.try_borrow().ok().and_then(|scope| scope.parent) else {
+            return Base::Unknown;
+        };
+        record = parent;
+    }
+    Base::Holder(Env::as_ptr(&record) as usize)
+}
+
+/// A free-name cache's class for the fingerprint: its mode, which a fill or a refusal moves, and
+/// not its proof, which a global object's every addition moves (a shape).
+fn cache_class(ic: &NameIc) -> u8 {
+    match ic.env {
+        0 => 0,
+        crate::bytecode::REFUSED_NAME_IC => 1,
+        crate::bytecode::FIXED_NAME_IC => 2,
+        crate::bytecode::lexical_cache::DEEP_NAME_IC => 3,
+        env if env & 1 != 0 => 4,
+        env if env & 2 != 0 => 5,
+        _ => 6,
+    }
+}
+
 /// Whether `op` reads a property named `length` (which a String receiver reads without a way).
 fn is_length_read(chunk: &Chunk, op: &Op) -> bool {
     match *op {
@@ -236,16 +407,23 @@ fn is_length_read(chunk: &Chunk, op: &Op) -> bool {
 
 /// The feedback fingerprint the settled-feedback rule compares between a chunk's checkpoints (the
 /// Stage 1 record's "When", V8's wait for a quiet IC): its named sites' ways and generic marks, its
-/// call sites' ways and megamorphic states, and its value and element records, read as the
-/// snapshot reads them (a transformed chunk's records are its baseline sites', which its misses
-/// go on filling; its own never change). A call way's epoch (`CallTarget::current`) is left out:
-/// an epoch moved by another function's code changes no feedback of this one.
+/// call sites' ways and megamorphic states, its value and element records, read as the snapshot
+/// reads them (a transformed chunk's records are its baseline sites', which its misses go on
+/// filling; its own never change), and its free-name caches' classes (stage 2, step 4). A call
+/// way's epoch (`CallTarget::current`) is left out: an epoch moved by another function's code
+/// changes no feedback of this one.
 pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
     use std::hash::Hasher;
     let mut hash = crate::fasthash::FxHasher::default();
     let map = chunk.feedback_vector().record_map();
-    for pc in 0..chunk.jit_ops().len() {
+    for (pc, op) in chunk.jit_ops().iter().enumerate() {
         hash.write_usize(pc);
+        if let Some((_, cache, _)) = name_site(op) {
+            // A static address is the compiler's: its cache is the template's business.
+            if chunk.jit_name_static(cache).is_none() {
+                hash.write_u8(cache_class(&chunk.jit_name_ic(cache)));
+            }
+        }
         match view(chunk, map, pc) {
             SiteView::Named(named) => hash_named(&mut hash, &named),
             SiteView::NamedUpdate(named, values) => {

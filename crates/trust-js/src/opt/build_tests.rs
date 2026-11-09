@@ -2237,3 +2237,155 @@ fn flagged_element_checks_take_the_generic_access() {
         );
     }
 }
+
+// ---- free names (stage 2, step 4) ---------------------------------------------------------------
+
+/// The pcs of `chunk`'s free-name reads of `name` (LoadName and its call and splice forms).
+fn name_reads(chunk: &Chunk, name: &str) -> Vec<usize> {
+    (0..chunk.jit_ops().len())
+        .filter(|&pc| match chunk.jit_ops()[pc] {
+            Op::LoadName(n, _)
+            | Op::LoadNameForCall(n, _)
+            | Op::LoadNameIn(n, _, _)
+            | Op::LoadNameForCallIn(n, _, _) => chunk.jit_name(n) == name,
+            _ => false,
+        })
+        .collect()
+}
+
+/// The name cache of the free-name operation at `pc`.
+fn name_cache(chunk: &Chunk, pc: usize) -> u32 {
+    match chunk.jit_ops()[pc] {
+        Op::LoadName(_, cache)
+        | Op::LoadNameForCall(_, cache)
+        | Op::LoadNameIn(_, cache, _)
+        | Op::LoadNameForCallIn(_, cache, _)
+        | Op::StoreNameCached(_, cache)
+        | Op::UpdateNameCached(_, cache, _) => cache,
+        ref op => panic!("no free-name operation at pc {pc}: {op:?}"),
+    }
+}
+
+#[test]
+fn free_name_sites_have_views_and_their_caches_are_evidence() {
+    // `k` has a static address; `missing` never ran (its cache is empty); `toString` ran and its
+    // fill was refused (the global object's prototype holds it); `Math` ran and filled.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { let k = 3; return function (c) { if (c) { return missing + k; }
+           return Math === toString ? 0 : k; }; }
+         var inner = mk();
+         for (var i = 0; i < 20; i++) inner(false);",
+    );
+    let chunk = chunk_of(&mut engine, "inner");
+    let snapshot = Snapshot::take(&chunk);
+    let [k_read, k_read2] = name_reads(&chunk, "k")[..] else {
+        panic!("two reads of k: {:?}", chunk.jit_ops())
+    };
+    for pc in [k_read, k_read2] {
+        let super::snapshot::NameView::Static { address, base } = snapshot.name(pc) else {
+            panic!("k's static address: {:?}", snapshot.name(pc))
+        };
+        // The closure makes no record of its own: `k`'s record is the running one.
+        assert_eq!(
+            (address.hops, address.lexical, address.mutable),
+            (0, true, true)
+        );
+        assert_eq!(base, super::snapshot::Base::Running);
+        assert_eq!(
+            snapshot.ran(pc),
+            Ran::Unknown,
+            "a static read is no evidence"
+        );
+    }
+    let missing = name_reads(&chunk, "missing")[0];
+    assert_eq!(snapshot.name(missing), super::snapshot::NameView::Empty);
+    assert_eq!(snapshot.ran(missing), Ran::No);
+    let refused = name_reads(&chunk, "toString")[0];
+    assert_eq!(snapshot.name(refused), super::snapshot::NameView::Refused);
+    assert_eq!(snapshot.ran(refused), Ran::Yes);
+    assert_eq!(
+        chunk.jit_name_ic(name_cache(&chunk, refused)).env,
+        crate::bytecode::REFUSED_NAME_IC
+    );
+    let math = name_reads(&chunk, "Math")[0];
+    assert_eq!(snapshot.ran(math), Ran::Yes);
+    assert!(!chunk.jit_name_ic(name_cache(&chunk, math)).unfilled());
+    // The block whose only evidence is the empty cache never ran: an exit at its first pc.
+    let graph = graph_for(&chunk, "inner");
+    let text = dump(&graph, &chunk);
+    let exits = nodes(&graph, |op| *op == NodeOp::Exit(ExitReason::NeverRan));
+    assert_eq!(exits.len(), 1, "{text}");
+    let block_pc = graph.state(exits[0].state.expect("a state")).pc as usize;
+    assert!(block_pc <= missing, "{text}");
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.pc as usize == missing)
+            .all(|node| matches!(node.op, NodeOp::Exit(_))),
+        "nothing of the block is built: {text}"
+    );
+    // A fill moves the fingerprint: the site's class changed.
+    let print = fingerprint(&chunk);
+    eval(&mut engine, "var missing = 1; inner(true);");
+    assert_ne!(fingerprint(&chunk), print);
+    assert_eq!(Snapshot::take(&chunk).ran(missing), Ran::Yes);
+}
+
+#[test]
+fn a_deep_cache_seeds_a_second_stage_with_the_refused_fill_mark() {
+    // A deep chain's descriptor stays with its chunk: the recompile's site starts with the mark,
+    // since it ran, and not empty, which would make its block an exit.
+    let mut engine = engine(Tier::Bytecode);
+    eval(&mut engine, "function readDeep() { return outer; }");
+    let genv = engine.interp.global_env;
+    let value = engine
+        .interp
+        .get_var("readDeep", &genv)
+        .ok()
+        .expect("readDeep");
+    let ValueView::Obj(function) = value.view() else {
+        panic!("a function")
+    };
+    let func = match &function.borrow().kind {
+        ObjectKind::User(user) => user.func.clone(),
+        _ => panic!("an author function"),
+    };
+    let chunk = crate::bytecode::compile(&func).expect("readDeep compiles");
+    let pc = name_reads(&chunk, "outer")[0];
+    let (name, cache) = match chunk.jit_ops()[pc] {
+        Op::LoadName(name, cache) => (name, cache),
+        ref op => panic!("{op:?}"),
+    };
+    // The records live only in this helper frame (the collector scans the stack).
+    crate::gc_test::in_frame(|| {
+        let scope = |parent, key: &str| {
+            let env = crate::interpreter::new_scope(parent);
+            env.borrow_mut().vars.insert(
+                key,
+                crate::interpreter::Binding::data(Value::Num(7.0), true, true),
+            );
+            env
+        };
+        let holder = scope(None, "outer");
+        let middle = scope(Some(holder), "middle");
+        let first = scope(Some(middle), "local");
+        assert!(chunk
+            .load_name_ic(&mut engine.interp, &first, name, cache)
+            .is_ok());
+        assert_eq!(
+            chunk.jit_name_ic(cache).env,
+            crate::bytecode::lexical_cache::DEEP_NAME_IC
+        );
+        let second = crate::bytecode::compile_with_inlines(&func, &Default::default(), &chunk)
+            .expect("the recompile");
+        let pc = name_reads(&second, "outer")[0];
+        assert_eq!(
+            second.jit_name_ic(name_cache(&second, pc)).env,
+            crate::bytecode::REFUSED_NAME_IC
+        );
+        assert_eq!(Snapshot::take(&second).ran(pc), Ran::Yes);
+    });
+}

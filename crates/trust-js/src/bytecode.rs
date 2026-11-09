@@ -289,7 +289,8 @@ pub struct NameIc {
     /// per-call pointer could never hit an exact compare (see `Chunk::name_ic_fill`).
     /// Bit 2 extends depth-1 mode to any fresh activation with the same layout identity
     /// (`layout`). FIXED_NAME_IC instead identifies an indexed slot in the current environment;
-    /// DEEP_NAME_IC points to the separately owned chain-proof descriptor.
+    /// DEEP_NAME_IC points to the separately owned chain-proof descriptor; REFUSED_NAME_IC marks
+    /// a site that ran while every fill refused it.
     pub env: usize,
     /// Scope mode: the resolved binding's slot address. Global: shape<<32|slot. FIXED_NAME_IC:
     /// the slot. `u64` (not `usize`) so the packing is well-defined on 32-bit targets (wasm).
@@ -314,6 +315,20 @@ impl NameIc {
         gen: 0,
         act_gen: 0,
     };
+
+    /// The refused-fill mark ([`REFUSED_NAME_IC`]): the saturated generation as well, which no
+    /// probe takes for a proof.
+    pub(crate) const REFUSED: NameIc = NameIc {
+        env: REFUSED_NAME_IC,
+        gen: u32::MAX,
+        ..NameIc::EMPTY
+    };
+
+    /// Whether the cache holds no resolution: never filled, or every fill refused.
+    #[inline]
+    pub(crate) fn unfilled(&self) -> bool {
+        self.env == 0 || self.env == REFUSED_NAME_IC
+    }
 
     #[inline]
     fn matches_activation(&self, vars: &crate::interpreter::VarMap) -> bool {
@@ -342,6 +357,14 @@ const _: () = assert!(
 /// The sentinel cannot equal a live Scope allocation. TDZ/import/mutability
 /// remain live guards (ECMA-262 declarative GetBindingValue/SetMutableBinding).
 pub(crate) const FIXED_NAME_IC: usize = 8;
+
+/// A site whose fills were all refused (a `with` record, an import, a binding in its TDZ, an
+/// accessor, an uncacheable shape, a slot out of a cache's reach, a deep chain seeded into
+/// another chunk), as against an empty cache, whose site never ran: the evidence the optimizing
+/// tier reads (P3 stage 2 step 4), as V8, SpiderMonkey and JSC exit at a site without feedback.
+/// No probe matches it (no scope allocation is at 16, its tag bits name no mode, its generation
+/// is saturated), and the next fill overwrites it.
+pub(crate) const REFUSED_NAME_IC: usize = 16;
 
 fn layout_name_ics_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
@@ -9014,8 +9037,9 @@ fn name_cache_seeds(chunk: &Chunk) -> Vec<NameSeed> {
             let mut state = chunk.name_caches[cache].get();
             if state.env == lexical_cache::DEEP_NAME_IC {
                 // Descriptor ownership does not cross Chunk boundaries when seeding inline
-                // recompilations. The new chunk builds its own chain on its first execution.
-                state = NameIc::EMPTY;
+                // recompilations. The new chunk builds its own chain on its first execution;
+                // until then the site holds the refused-fill mark, since it ran.
+                state = NameIc::REFUSED;
             }
             Some((
                 chunk.names[name as usize].clone(),
@@ -23519,13 +23543,11 @@ impl Chunk {
         }
         None
     }
-    /// Depth-0 cache fill: the name resolves directly in `env` as a plain initialized binding —
-    /// no `with` object on the scope, no live import redirect, and for a site that writes
-    /// (`store`: StoreNameCached, UpdateNameCached) a mutable binding, so that hits check only
-    /// TDZ: a binding's attributes change only with its record's names, which every proof covers.
-    /// When `env` *is* the global scope and misses, an own data property of the ordinary global
-    /// object fills the global mode instead. Returns the value on success; `None` = not cacheable
-    /// at this site (the caller runs the interpreter's full walk, uncached).
+    /// The name cache `cache` as it stands (P3's snapshot reads its mode and its proof).
+    pub(crate) fn jit_name_ic(&self, cache: u32) -> NameIc {
+        self.name_caches[cache as usize].get()
+    }
+
     /// Decision 21: the static address of the free-name read at name cache `cache`, if it has
     /// one (see `StaticName`).
     pub(crate) fn jit_name_static(&self, cache: u32) -> Option<StaticName> {
@@ -23601,7 +23623,7 @@ impl Chunk {
     /// it instead of taking the site's static address (x86-64's stores), as a static read does.
     #[inline]
     pub(crate) fn fill_static_store_cache(&self, i: &Interp, env: &Env, n: u32, c: u32) {
-        if self.name_caches[c as usize].get().env == 0 {
+        if self.name_caches[c as usize].get().unfilled() {
             let _ = self.name_ic_fill(i, env, n, c, true);
         }
     }
@@ -23656,7 +23678,7 @@ impl Chunk {
             }
             binding.value()
         };
-        if self.name_caches[c as usize].get().env == 0 {
+        if self.name_caches[c as usize].get().unfilled() {
             let _ = self.name_ic_fill(i, env, n, c, false);
         }
         #[cfg(test)]
@@ -23664,7 +23686,33 @@ impl Chunk {
         Some(value)
     }
 
+    /// Depth-0 cache fill: the name resolves directly in `env` as a plain initialized binding —
+    /// no `with` object on the scope, no live import redirect, and for a site that writes
+    /// (`store`: StoreNameCached, UpdateNameCached) a mutable binding, so that hits check only
+    /// TDZ: a binding's attributes change only with its record's names, which every proof covers.
+    /// When `env` *is* the global scope and misses, an own data property of the ordinary global
+    /// object fills the global mode instead. Returns the value on success; `None` = not cacheable
+    /// at this site (the caller runs the interpreter's full walk, uncached), which leaves the
+    /// refused-fill mark in an empty cache.
     pub(crate) fn name_ic_fill(
+        &self,
+        i: &Interp,
+        env: &Env,
+        n: u32,
+        c: u32,
+        store: bool,
+    ) -> Option<Value> {
+        let filled = self.name_ic_fill_resolution(i, env, n, c, store);
+        if filled.is_none() && self.name_caches[c as usize].get().env == 0 {
+            // The site ran, and nothing cacheable resolved it: the mark tells it from a site
+            // that never ran (see `REFUSED_NAME_IC`).
+            self.name_caches[c as usize].set(NameIc::REFUSED);
+        }
+        filled
+    }
+
+    /// [`Chunk::name_ic_fill`]'s resolution, which leaves a refused site's cache as it was.
+    fn name_ic_fill_resolution(
         &self,
         i: &Interp,
         env: &Env,

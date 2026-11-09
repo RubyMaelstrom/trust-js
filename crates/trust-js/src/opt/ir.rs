@@ -237,6 +237,15 @@ pub(crate) enum ExitReason {
     Detached,
     /// An append whose growth failed (V8's kCouldNotGrowElements).
     CouldNotGrow,
+    // The free names' reasons (P3 stage 2 step 4).
+    /// A free name's proof failed: the realm's global environment or object is not the
+    /// compile's, the global property epoch moved, or the global declarative record changed.
+    /// Kind-bound, as WrongShape is: an IC's status.
+    WrongName,
+    /// A lexical binding read or written in its temporal dead zone: the VM runs the operation
+    /// again and throws its ReferenceError (SpiderMonkey's LexicalCheck bailout, JSC's
+    /// CheckNotEmpty exit).
+    Tdz,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
