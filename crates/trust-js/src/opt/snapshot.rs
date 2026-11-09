@@ -157,8 +157,9 @@ impl Snapshot {
         Snapshot::take_in(chunk, None)
     }
 
-    /// [`Snapshot::take`], the global names resolved in `realm`'s running realm, the one the
-    /// compile runs in, whose global environment and object its code checks.
+    /// The feedback of every operation of `chunk` (its `jit_ops`), as it stands now, its global
+    /// names resolved in `realm`'s running realm, the one the compile runs in, whose global
+    /// environment and object its code checks (in none, they stay effects).
     pub(crate) fn take_in(chunk: &Chunk, realm: Option<&Interp>) -> Snapshot {
         let ops = chunk.jit_ops();
         let map = chunk.feedback_vector().record_map();
@@ -199,6 +200,12 @@ impl Snapshot {
         self.declined
             .get(pc)
             .map_or(0, |&(_, ways)| usize::from(ways))
+    }
+
+    /// The proof byte a discarded check at `pc` expected, where WrongName is flagged there
+    /// ([`NameView::proof`]).
+    pub(crate) fn discarded_proof(&self, pc: usize) -> u8 {
+        self.declined.get(pc).map_or(0, |&(_, proof)| proof)
     }
 
     /// The view of the free-name site at `pc` ([`NameView::None`] for any other operation).

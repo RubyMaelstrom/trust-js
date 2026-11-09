@@ -3081,3 +3081,199 @@ fn a_script_level_lexical_is_read_under_its_caches_proof_without_a_tdz_test() {
     );
     assert_eq!(count(&graph, |op| *op == NodeOp::GlobalObject), 0, "{text}");
 }
+
+/// The frame slot of `chunk`'s local `name`.
+fn slot_named(chunk: &Chunk, name: &str) -> u16 {
+    chunk
+        .jit_slot_names()
+        .iter()
+        .position(|slot| &**slot == name)
+        .unwrap_or_else(|| panic!("no slot {name}: {:?}", chunk.jit_slot_names())) as u16
+}
+
+/// The one loop header of `graph`, and the pc it starts at.
+fn the_loop(graph: &Graph) -> u32 {
+    let headers: Vec<&BlockData> = graph
+        .blocks
+        .iter()
+        .filter(|block| block.loop_header)
+        .collect();
+    assert_eq!(headers.len(), 1, "one loop");
+    headers[0].first_pc
+}
+
+#[test]
+fn an_am3_loop_whose_names_elements_and_arithmetic_lower_keeps_its_invariant_slots() {
+    // Crypto's am3 (its receivers read once before the loop here): with its element accesses,
+    // its int32 arithmetic and its names lowered, the loop has no effect, which the prepass now
+    // knows, so its invariant slots keep their values through the header: no store before it and
+    // no reload in it, and each receiver's elements check stays where the read before the loop
+    // made it.
+    let mut engine = engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "function am3(a, i, x, w, j, c, n) {
+           var first = a[i] | 0; var w0 = w[j] | 0;
+           var xl = x & 0x3fff, xh = x >> 14;
+           while (--n >= 0) {
+             var l = a[i] & 0x3fff;
+             var h = a[i++] >> 14;
+             var m = xh * l + h * xl;
+             l = xl * l + ((m & 0x3fff) << 14) + w[j] + c;
+             c = (l >> 28) + (m >> 14) + xh * h;
+             w[j++] = l & 0xfffffff;
+           }
+           return c + first + w0;
+         }
+         var A = [], W = [];
+         for (var k = 0; k < 64; k++) { A.push(k * 977 & 0xfffffff); W.push(0); }
+         for (var r = 0; r < 20; r++) am3(A, 0, 12345, W, 0, 0, 32);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "am3");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    let header = the_loop(&graph);
+    for name in ["a", "w", "xl", "xh"] {
+        let slot = slot_named(&chunk, name);
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::StoreSlot(slot)),
+            0,
+            "{name} is stored: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::FrameSlot(slot)),
+            0,
+            "{name} is reloaded: {text}"
+        );
+    }
+    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckElements(_)));
+    assert_eq!(checks.len(), 2, "one a receiver: {text}");
+    assert!(
+        checks.iter().all(|check| check.pc < header),
+        "before the loop: {text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckObject), 2, "{text}");
+}
+
+#[test]
+fn a_loop_whose_only_names_are_lowered_has_no_effect() {
+    let mut engine = engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "function mk() { const k = 3; var scale = 2;
+           return function (n, bias) { var s = 0;
+             for (var i = 0; i < n; i++) s = s + k * scale + bias + i;
+             return s; }; }
+         var f = mk();
+         for (var r = 0; r < 20; r++) f(10, 1);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "f");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    the_loop(&graph);
+    let bias = slot_named(&chunk, "bias");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::FrameSlot(bias)),
+        0,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::StoreSlot(bias)),
+        0,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_flagged_tdz_site_takes_the_effect() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { let x = 1; return function () { return x + 1; }; }
+         var r = mk();
+         for (var i = 0; i < 20; i++) r();",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "r");
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckInitialized), 1);
+    let read = name_reads(&chunk, "x")[0];
+    flag(&chunk, read, ExitReason::Tdz, false, 0);
+    let graph = graph_for(&chunk, "r flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckInitialized),
+        0,
+        "{text}"
+    );
+    assert!(
+        nodes(&graph, is_effect)
+            .iter()
+            .any(|node| node.pc as usize == read),
+        "{text}"
+    );
+    assert_eq!(declines(&graph), [(read, ExitReason::Tdz)], "{text}");
+}
+
+#[test]
+fn a_flagged_global_read_is_checked_again_where_its_proof_moved() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "var g = 5; function r() { return g + 1; } for (var i = 0; i < 20; i++) r();",
+    );
+    let chunk = chunk_of(&mut engine, "r");
+    let read = name_reads(&chunk, "g")[0];
+    let proof = Snapshot::take_in(&chunk, Some(&engine.interp))
+        .name(read)
+        .proof();
+    // A discarded check of another proof (the epoch moved since): checked again, no decline.
+    flag(
+        &chunk,
+        read,
+        ExitReason::WrongName,
+        false,
+        proof.wrapping_add(1),
+    );
+    let graph = graph_in(&engine, &chunk, "r flagged, another proof");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckGlobalEpoch { .. })),
+        1,
+        "{text}"
+    );
+    assert!(graph.declines.is_empty(), "{text}");
+    // Of this proof: the effect.
+    flag(&chunk, read, ExitReason::WrongName, false, proof);
+    let graph = graph_in(&engine, &chunk, "r flagged, its proof");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_global_check), 0, "{text}");
+    assert_eq!(declines(&graph), [(read, ExitReason::WrongName)], "{text}");
+}
+
+#[test]
+fn an_operand_a_lowered_form_cannot_take_exits_where_the_rules_lower_it() {
+    // `'x' * 2` never ran: its record is empty, so the rules lower it (a loop around it would be
+    // free of effects); its constant operand is no Number, so the builder exits there.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function f(c) { var t = 1; if (c) { t = 'x' * 2; } return t; }
+         for (var i = 0; i < 20; i++) f(false);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "f");
+    let text = dump(&graph, &chunk);
+    let mul = pc_of(&chunk, |op| matches!(op, Op::Mul));
+    let exits = nodes(&graph, |op| *op == NodeOp::Exit(ExitReason::NotNumber));
+    assert_eq!(exits.len(), 1, "{text}");
+    assert_eq!(exits[0].pc as usize, mul, "{text}");
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    // Once its NotNumber is flagged, the operation is the effect again.
+    flag(&chunk, mul, ExitReason::NotNumber, false, 0);
+    let graph = graph_for(&chunk, "f flagged");
+    let text = dump(&graph, &chunk);
+    assert!(
+        nodes(&graph, is_effect)
+            .iter()
+            .any(|node| node.pc as usize == mul),
+        "{text}"
+    );
+}

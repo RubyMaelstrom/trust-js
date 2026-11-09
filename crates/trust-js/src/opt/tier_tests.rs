@@ -1750,3 +1750,38 @@ fn script_level_lexicals_read_while_scripts_assign_and_declare_them() {
          t",
     );
 }
+
+#[test]
+fn a_global_site_that_first_runs_after_the_compile_converges_on_its_read() {
+    // Its cache was empty at the compile: its block exits NeverRan when it starts to run, until
+    // the discard; the recompile finds the cache filled and reads the global in line.
+    let chunk = converges(
+        "late",
+        "globalThis.lateG = 5;
+         function late(c) { if (c) { return lateG + 1; } return 0; }
+         let t = 0; for (let k = 0; k < 1000; k++) t += late(false); t",
+        "let u = 0; for (let k = 0; k < 600; k++) u += late(true); u",
+        "late(true) * 10 + late(false)",
+        ExitReason::NeverRan,
+    );
+    let snapshot = super::snapshot::Snapshot::take(&chunk);
+    let read = (0..chunk.jit_ops().len())
+        .find(|&pc| matches!(chunk.jit_ops()[pc], crate::bytecode::Op::LoadName(..)))
+        .expect("lateG's read");
+    assert_eq!(snapshot.ran(read), super::snapshot::Ran::Yes);
+}
+
+#[test]
+fn a_global_whose_proof_keeps_failing_converges_on_the_effect() {
+    // A global another function deletes and adds again every third read: each recompile finds
+    // its proof's byte the discarded code's (the effect) or not (the check again); either way
+    // the results are the VM's, and the discards back off.
+    names_hold(
+        "globalThis.flip = 1;
+         function readFlip() { return typeof flip === 'number' ? flip : -1; }
+         function churn(k) { delete globalThis.flip; globalThis.flip = k; }
+         let t = 0;
+         for (let k = 0; k < 4000; k++) { t += readFlip(); if (k % 3 === 0) churn(k % 5); }
+         t",
+    );
+}

@@ -32,6 +32,12 @@
 //!   only append: the record is the realm's ([`NodeOp::CheckEnvIs`]), its generation the cache's
 //!   ([`NodeOp::CheckEnvGeneration`], a heap fact), and the binding's word at the address the
 //!   proof keeps ([`NodeOp::LoadGlobalLexical`]), with no TDZ test.
+//! - The exit profile (`Rules::name_lowers`, which the loop prepass reads too): a Tdz flag at a
+//!   lexical binding's site takes the effect, whose template throws in place (SpiderMonkey keeps
+//!   its checks pinned after such a bailout); a WrongName flag takes the effect where the site's
+//!   proof is the discarded code's (its byte in the profile, `NameView::proof`), and checks
+//!   again where the epoch moved or the cache refilled since, as V8 and SpiderMonkey recompile
+//!   on what changed.
 //! - Facts ([`Facts`]), as the exemplars' alias rules have them: parent links are value facts
 //!   within an activation (the one later write, class evaluation re-parenting its fresh outer
 //!   record, eval.rs's `eval_class_strict`, happens after its heritage and keys ran, when no
@@ -166,7 +172,79 @@ fn common<'a, K: Copy + Eq + std::hash::Hash + 'a>(
         .collect()
 }
 
+impl Rules<'_> {
+    /// Whether the free-name operation at `pc` lowers (the loop prepass's question, and the
+    /// builder's: see [`Rules`]): a static address reachable in place, unless a Tdz flag sends a
+    /// lexical binding's site to the effect, and for an update a value record of Numbers; a global
+    /// read, unless WrongName is flagged with the site's proof as it is (see the module's doc).
+    pub(super) fn name_lowers(&self, pc: usize) -> bool {
+        let snapshot = self.snapshot;
+        let view = snapshot.name(pc);
+        let reachable = |address: StaticName, base: Base| {
+            usize::from(address.slot) < crate::interpreter::MAX_INLINE_SLOTS
+                && base != Base::Unknown
+        };
+        let tdz = |address: StaticName| address.lexical && snapshot.declines(pc, ExitReason::Tdz);
+        match (self.ops[pc], view) {
+            (
+                Op::LoadName(..)
+                | Op::LoadNameForCall(..)
+                | Op::LoadNameIn(..)
+                | Op::LoadNameForCallIn(..)
+                | Op::LoadCap(_),
+                NameView::Static { address, base },
+            ) => reachable(address, base) && !tdz(address),
+            (
+                Op::LoadName(..)
+                | Op::LoadNameForCall(..)
+                | Op::LoadNameIn(..)
+                | Op::LoadNameForCallIn(..),
+                NameView::Global { .. } | NameView::GlobalLexical { .. },
+            ) => !self.stale_name(pc, &view),
+            (Op::StoreNameCached(..) | Op::StoreCap(_), NameView::Static { address, base }) => {
+                address.mutable && reachable(address, base) && !tdz(address)
+            }
+            (Op::StoreCapInit(_), NameView::Static { address, base }) => reachable(address, base),
+            (Op::UpdateNameCached(..) | Op::UpdateCap(..), NameView::Static { address, base }) => {
+                address.mutable
+                    && reachable(address, base)
+                    && !tdz(address)
+                    && self.numbers(pc, false).is_some()
+                    && !snapshot.declines(pc, ExitReason::NotNumber)
+            }
+            _ => false,
+        }
+    }
+
+    /// WrongName flagged at `pc` where the site's proof is the one the discarded code's check
+    /// expected (its byte, `NameView::proof`): the effect, as JSC's exit flags stop a
+    /// speculation. A proof that differs (the epoch moved, the cache refilled) is checked again.
+    fn stale_name(&self, pc: usize, view: &NameView) -> bool {
+        self.snapshot.declines(pc, ExitReason::WrongName)
+            && self.snapshot.discarded_proof(pc) == view.proof()
+    }
+}
+
 impl Builder<'_> {
+    /// The free-name site at `pc` takes the effect (`Rules::name_lowers`): list the exit
+    /// profile's declines that sent it there.
+    fn name_declines(&mut self, pc: usize) {
+        match self.snapshot.name(pc) {
+            NameView::Static { address, .. } if address.lexical => {
+                self.declined(pc, ExitReason::Tdz, "the effect, which throws in place");
+            }
+            view @ (NameView::Global { .. } | NameView::GlobalLexical { .. })
+                if self.rules().stale_name(pc, &view) =>
+            {
+                self.declined(pc, ExitReason::WrongName, "the effect");
+            }
+            _ => {}
+        }
+        if matches!(self.ops[pc], Op::UpdateNameCached(..) | Op::UpdateCap(..)) {
+            self.declined(pc, ExitReason::NotNumber, "the generic operation");
+        }
+    }
+
     /// The running environment: hoisted where no operation of the chunk moves it.
     fn running_env(&mut self, st: &mut State, pc: usize) -> NodeIx {
         if !self.moves_env {
@@ -307,15 +385,16 @@ impl Builder<'_> {
         init: bool,
         st: &mut State,
     ) -> Result<(), Refusal> {
-        let NameView::Static { address, base } = self.snapshot.name(pc) else {
-            return self.effect(pc, st);
-        };
-        if !address.mutable && !init {
+        if !self.rules().lowers(pc) {
+            self.name_declines(pc);
             return self.effect(pc, st);
         }
-        let Some(record) = self.static_record(st, address, base, pc) else {
-            return self.effect(pc, st);
+        let NameView::Static { address, base } = self.snapshot.name(pc) else {
+            unreachable!("the rules lower only a static address's store")
         };
+        let record = self
+            .static_record(st, address, base, pc)
+            .expect("the rules found the record");
         let key = (record, address.slot);
         let known = matches!(self.ops[pc], Op::StoreCap(_)) && self.chunk.jit_cap_initialized(pc);
         if address.lexical
@@ -358,23 +437,26 @@ impl Builder<'_> {
         kind: UpdKind,
         st: &mut State,
     ) -> Result<(), Refusal> {
-        let NameView::Static { address, base } = self.snapshot.name(pc) else {
-            return self.effect(pc, st);
-        };
-        let Some(values) = self.snapshot.values(pc) else {
-            return self.effect(pc, st);
-        };
-        if !address.mutable || values.operand0 & !NUMBER != 0 {
+        if !self.rules().lowers(pc) {
+            self.name_declines(pc);
             return self.effect(pc, st);
         }
-        let Some(record) = self.static_record(st, address, base, pc) else {
-            return self.effect(pc, st);
+        let NameView::Static { address, base } = self.snapshot.name(pc) else {
+            unreachable!("the rules lower only a static address's update")
         };
+        let values = self
+            .rules()
+            .numbers(pc, false)
+            .expect("the rules found the record's Numbers");
+        let record = self
+            .static_record(st, address, base, pc)
+            .expect("the rules found the record");
         let known = matches!(self.ops[pc], Op::UpdateCap(..)) && self.chunk.jit_cap_initialized(pc);
         let mut cx = Before::new(pc);
         let old = self.binding_value(st, &mut cx, record, address, known);
-        if self.declines_number(pc, st, &[old]) {
-            return self.effect(pc, st);
+        if !self.numeric(old) {
+            // A constant the binding was given here, which is no Number.
+            return self.mismatch(pc, ExitReason::NotNumber, st);
         }
         let increment = matches!(
             kind,
@@ -428,12 +510,16 @@ impl Builder<'_> {
         for_call: bool,
         st: &mut State,
     ) -> Result<(), Refusal> {
+        if !self.rules().lowers(pc) {
+            self.name_declines(pc);
+            return self.effect(pc, st);
+        }
         let mut cx = Before::new(pc);
         let value = match self.snapshot.name(pc) {
             NameView::Static { address, base } => {
-                let Some(record) = self.static_record(st, address, base, pc) else {
-                    return self.effect(pc, st);
-                };
+                let record = self
+                    .static_record(st, address, base, pc)
+                    .expect("the rules found the record");
                 // A captured binding checked earlier in the operation's block (`cap_tdz_known`).
                 let known =
                     matches!(self.ops[pc], Op::LoadCap(_)) && self.chunk.jit_cap_initialized(pc);
@@ -441,7 +527,7 @@ impl Builder<'_> {
             }
             view @ NameView::Global { .. } => self.global_read(st, &mut cx, view),
             view @ NameView::GlobalLexical { .. } => self.global_lexical_read(st, &mut cx, view),
-            _ => return self.effect(pc, st),
+            _ => unreachable!("the rules lower only these views"),
         };
         if for_call {
             let undefined = self.word(PACK_UNDEFINED);

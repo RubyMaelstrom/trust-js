@@ -10,8 +10,10 @@
 //! - Loops: a loop-assignment prepass gives each loop header a phi for every slot a native write
 //!   in the loop assigns and for every operand-stack position. A slot the loop does not assign
 //!   keeps its value through the header when nothing in the loop can be an effect, and is in the
-//!   frame at the header otherwise (an effect leaves every slot in the frame). A header's poll
-//!   opens its body, with the header's state, once a back edge reaches it.
+//!   frame at the header otherwise (an effect leaves every slot in the frame); whether an
+//!   operation can be one is the builder's own choice of its form ([`Rules`], stage 2 step 4),
+//!   which the builder keeps to. A header's poll opens its body, with the header's state, once a
+//!   back edge reaches it.
 //! - Joins: a phi where the predecessors' values differ and one of them is not in the frame.
 //!   Values cross block boundaries as tagged words in stage 1 (untagging phis is stage 4's).
 //! - Known facts per value (Maglev's KnownNodeAspects): its other representations (a word's
@@ -106,7 +108,14 @@ pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Graph, Refusal
         return Err(Refusal::whole("a frame over the record's 256 words"));
     }
     let initialized = cfg.initialized_reads(ops, true);
-    let flow = Flow::new(chunk, &cfg, &initialized)?;
+    let rules = Rules {
+        chunk,
+        ops,
+        snapshot,
+        cfg: &cfg,
+        initialized: &initialized,
+    };
+    let flow = Flow::new(chunk, &cfg, &rules)?;
     Builder::new(chunk, snapshot, &cfg, &flow, &initialized).run()
 }
 
@@ -165,38 +174,295 @@ fn const_word(chunk: &Chunk, k: u32) -> Option<u64> {
     }
 }
 
-/// Whether the operation at `pc` always lowers without an effect (the loop prepass's question).
-fn never_effect(chunk: &Chunk, initialized: &InitializedReads, pc: usize) -> bool {
-    match chunk.jit_ops()[pc] {
-        Op::Const(k) => const_word(chunk, k).is_some(),
-        Op::LoadLocal(_) => initialized.contains(pc),
-        Op::Undef
-        | Op::Dup
-        | Op::Dup2
-        | Op::Pop
-        | Op::StoreLocal(_)
-        | Op::Tdz(_)
-        | Op::ResetSlots(..)
-        | Op::LoadThis
-        | Op::Void
-        | Op::Not
-        | Op::Jump(_)
-        | Op::JumpIfFalse(_)
-        | Op::JumpIfFalsePeek(_)
-        | Op::JumpIfTruePeek(_)
-        | Op::JumpIfNotNullishPeek(_)
-        | Op::InlineGuard(..)
-        | Op::PushHandler(_)
-        | Op::PushIterator(..)
-        | Op::PopHandler
-        | Op::Return
-        | Op::ReturnBare
-        | Op::ReturnUndef
-        | Op::Throw
-        | Op::TailCall(..)
-        | Op::IterAbortL(_)
-        | Op::IterAbortIfNotDoneL(..) => true,
-        _ => false,
+/// The builder's choice between an operation's lowered form and the effect, made from the chunk
+/// and the snapshot alone (P3 stage 2 step 4's (f)): the loop prepass (`Flow::new`) reads it
+/// before any value exists, and the builder takes the effect only where it says so, which debug
+/// builds check (`Builder::effect`). Where a value's facts rule out a lowered form the rules chose
+/// (a constant, an unboxed value of another kind), the builder exits at the operation instead
+/// (`Builder::mismatch`), whose exit flags the site for its recompile, so that a loop the prepass
+/// found free of effects stays free of them, as Maglev's loop effects and JSC's clobberize rules
+/// each come from one source. A release build refuses a disagreement at the loop's back edge.
+#[derive(Clone, Copy)]
+struct Rules<'a> {
+    chunk: &'a Chunk,
+    ops: &'a [Op],
+    snapshot: &'a Snapshot,
+    cfg: &'a Cfg,
+    initialized: &'a InitializedReads,
+}
+
+impl Rules<'_> {
+    /// A named site's own data ways (one shape, or up to four sharing their location and slot),
+    /// None where the site takes the generic operation: a generic mark, another kind of way, ways
+    /// at different locations, no way, a way of a primitive's (its receiver shape is a wrapper
+    /// prototype's, which a CheckShape of the receiver word never passes for the primitive), or
+    /// a store site without its writability proof. A `prototype` property may hold a function's
+    /// deferred prototype, which only the checked operation materializes.
+    fn own_data_ways(&self, pc: usize, name: u32, store: bool) -> Option<Ways> {
+        if self.chunk.jit_name(name) == "prototype" {
+            return None;
+        }
+        let named = self.snapshot.named(pc)?;
+        if named.generic || (store && !named.writable) {
+            return None;
+        }
+        let mut shapes = Vec::new();
+        let mut at = None;
+        for way in named.filled() {
+            let own = way.kind == NamedWayKind::Data
+                && way.primitive == 0
+                && way.depth == 0
+                && way.receiver_shape == way.holder_shape
+                && crate::value::is_cacheable_shape(way.receiver_shape)
+                && way.location != 0
+                && way.slot < MAX_FIELD_SLOT;
+            if !own || at.is_some_and(|at| at != (way.location, way.slot)) {
+                return None;
+            }
+            at = Some((way.location, way.slot));
+            if !shapes.contains(&way.receiver_shape) {
+                shapes.push(way.receiver_shape);
+            }
+        }
+        let (location, slot) = at?;
+        Some(Ways {
+            shapes,
+            location,
+            slot,
+        })
+    }
+
+    /// The element site at `pc` lowered on element words, or None for the generic access (an
+    /// effect): a generic mark, a key that is no index, or receivers by rule R (the record's where
+    /// it holds any, else the in-line set's) other than Arrays and ordinary objects.
+    fn element_site(&self, pc: usize) -> Option<ElemSite> {
+        use crate::feedback::{
+            ELEM_ARRAY, ELEM_HOLEY, ELEM_KEY_INDEX, ELEM_ORDINARY, ELEM_OUT_OF_BOUNDS,
+            ELEM_TYPED_ARRAY,
+        };
+        let view = self.snapshot.element(pc)?;
+        if view.generic || view.recorded_keys & !ELEM_KEY_INDEX != 0 {
+            return None;
+        }
+        let receivers = if view.recorded_receivers != 0 {
+            view.recorded_receivers
+        } else {
+            ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY
+        };
+        if receivers & !(ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY) != 0 {
+            return None;
+        }
+        let kind = if receivers & ELEM_ORDINARY == 0 {
+            ElemKind::Array
+        } else {
+            ElemKind::Words
+        };
+        let typed = if receivers & ELEM_TYPED_ARRAY == 0 {
+            Typed::None
+        } else if view.recorded_receivers & ELEM_TYPED_ARRAY != 0 && view.typed_kinds == 0 {
+            // Its typed arrays were views the native code declines (BigInt or Float16 elements,
+            // a shared or too long buffer), which the stub would decline at every access: the
+            // generic access, as Maglev leaves BigInt and Float16 elements to it
+            // (TryBuildElementAccessOnTypedArray, maglev-graph-builder.cc:5059-5063).
+            return None;
+        } else if receivers == ELEM_TYPED_ARRAY {
+            // The one kind the VM and the misses saw, or the stub for more than one.
+            let mut kinds = TypedKind::ALL.into_iter().filter(|&kind| {
+                view.typed_kinds & crate::feedback::elem_typed_kind(kind as u8) != 0
+            });
+            Typed::Only(kinds.next().filter(|_| kinds.next().is_none()))
+        } else {
+            Typed::Mixed
+        };
+        let reads = if view.facts & ELEM_OUT_OF_BOUNDS != 0 {
+            Reads::PastUsed
+        } else if view.facts & ELEM_HOLEY != 0 {
+            Reads::Holes
+        } else {
+            Reads::InBounds
+        };
+        Some(ElemSite {
+            kind,
+            reads,
+            arrays: receivers & ELEM_ARRAY != 0,
+            typed,
+        })
+    }
+
+    /// Whether the named load of `name` at `pc` reads Arrays' `length`: its ways all the Array's
+    /// key-checked first slot, which own_data_ways refuses (an Array's `length` is its slot 0:
+    /// value.rs length_property), and no generic mark.
+    fn array_length_site(&self, pc: usize, name: u32) -> bool {
+        if self.chunk.jit_name(name) != "length" {
+            return false;
+        }
+        let Some(named) = self.snapshot.named(pc) else {
+            return false;
+        };
+        !named.generic
+            && named.filled().next().is_some()
+            && named.filled().all(|way| {
+                way.kind == NamedWayKind::KeyChecked
+                    && way.depth == 0
+                    && way.slot == 0
+                    && way.primitive == 0
+            })
+    }
+
+    /// Whether the first element load after `pc` in its block (a compound assignment's GetElem)
+    /// is lowered on element words.
+    fn lowered_load_follows(&self, pc: usize) -> bool {
+        let Some(block) = self.cfg.block_at(pc) else {
+            return false;
+        };
+        let end = self.cfg.blocks()[ix(block)].end;
+        (pc + 1..end)
+            .find(|&next| matches!(self.ops[next], Op::GetElem | Op::GetElemLocal(_)))
+            .is_some_and(|next| self.element_site(next).is_some())
+    }
+
+    /// Whether the operation at `pc` lowers without an effect whatever its operands' facts (the
+    /// loop prepass's question).
+    fn lowers(&self, pc: usize) -> bool {
+        let snapshot = self.snapshot;
+        let flagged =
+            |reasons: &[ExitReason]| reasons.iter().any(|&reason| snapshot.declines(pc, reason));
+        match self.ops[pc] {
+            Op::Const(k) => const_word(self.chunk, k).is_some(),
+            Op::LoadLocal(_) => self.initialized.contains(pc),
+            Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::Lt
+            | Op::Gt
+            | Op::Le
+            | Op::Ge => self.numbers(pc, true).is_some() && !flagged(&[ExitReason::NotNumber]),
+            Op::Neg | Op::Plus | Op::BitNot | Op::UpdateLocal(..) => {
+                self.numbers(pc, false).is_some() && !flagged(&[ExitReason::NotNumber])
+            }
+            Op::GetProp(name, _) | Op::GetPropThis(name, _) | Op::GetPropLocal(_, name, _)
+                if self.array_length_site(pc, name) =>
+            {
+                !flagged(&[ExitReason::WrongElements, ExitReason::NotObject])
+            }
+            Op::GetProp(name, _)
+            | Op::GetMethod(name, _)
+            | Op::GetPropThis(name, _)
+            | Op::GetPropLocal(_, name, _) => self
+                .own_data_ways(pc, name, false)
+                .is_some_and(|ways| !self.stale_ways(pc, &ways)),
+            Op::SetProp(name, _)
+            | Op::SetPropDrop(name, _)
+            | Op::SetPropThisDrop(name, _)
+            | Op::SetPropLocalDrop(_, name, _) => self
+                .own_data_ways(pc, name, true)
+                .is_some_and(|ways| !self.stale_ways(pc, &ways)),
+            Op::GetElem | Op::GetElemLocal(_) => self.element_site(pc).is_some_and(|site| {
+                !flagged(LOAD_DECLINES)
+                    && match site.typed {
+                        Typed::None => true,
+                        Typed::Only(Some(_)) => !flagged(&[ExitReason::Detached]),
+                        Typed::Only(None) | Typed::Mixed => !flagged(TYPED_DECLINES),
+                    }
+            }),
+            Op::SetElem | Op::SetElemDrop | Op::SetElemLocal(_) | Op::SetElemLocalDrop(_) => {
+                self.element_site(pc).is_some_and(|site| {
+                    !flagged(STORE_DECLINES)
+                        && (site.typed == Typed::None || !flagged(TYPED_DECLINES))
+                        && (!matches!(site.typed, Typed::Only(_))
+                            || self.store_value_may_be_number(pc))
+                })
+            }
+            Op::UpdateElem(_) => self.numbers(pc, false).is_some() && !flagged(UPDATE_DECLINES),
+            Op::ToPropKey | Op::ToPropKeyLocal(_) => {
+                self.lowered_load_follows(pc)
+                    && !flagged(&[ExitReason::NotObject, ExitReason::NotNumber])
+            }
+            Op::LoadName(..)
+            | Op::LoadNameForCall(..)
+            | Op::LoadNameIn(..)
+            | Op::LoadNameForCallIn(..)
+            | Op::LoadCap(_)
+            | Op::StoreNameCached(..)
+            | Op::StoreCap(_)
+            | Op::StoreCapInit(_)
+            | Op::UpdateNameCached(..)
+            | Op::UpdateCap(..) => self.name_lowers(pc),
+            Op::Undef
+            | Op::Dup
+            | Op::Dup2
+            | Op::Pop
+            | Op::StoreLocal(_)
+            | Op::Tdz(_)
+            | Op::ResetSlots(..)
+            | Op::LoadThis
+            | Op::Void
+            | Op::Not
+            | Op::Jump(_)
+            | Op::JumpIfFalse(_)
+            | Op::JumpIfFalsePeek(_)
+            | Op::JumpIfTruePeek(_)
+            | Op::JumpIfNotNullishPeek(_)
+            | Op::InlineGuard(..)
+            | Op::PushHandler(_)
+            | Op::PushIterator(..)
+            | Op::PopHandler
+            | Op::Return
+            | Op::ReturnBare
+            | Op::ReturnUndef
+            | Op::Throw
+            | Op::TailCall(..)
+            | Op::IterAbortL(_)
+            | Op::IterAbortIfNotDoneL(..) => true,
+            _ => false,
+        }
+    }
+
+    /// The value record of an arithmetic, bitwise, relational, unary or update operation at
+    /// `pc` (`two`: both operands' roles), where it saw Numbers only: the operation's Number path.
+    fn numbers(&self, pc: usize, two: bool) -> Option<ValuesView> {
+        let values = self.snapshot.values(pc)?;
+        let roles = if two {
+            values.operand0 | values.operand1
+        } else {
+            values.operand0
+        };
+        (roles & !NUMBER == 0).then_some(values)
+    }
+
+    /// Whether the value the element store at `pc` takes may be a Number: not a constant that
+    /// is none, which the operation before the store pushes in its block (`t[i] = 's'`), where a
+    /// typed array's store takes the effect, its conversion being the operation's.
+    fn store_value_may_be_number(&self, pc: usize) -> bool {
+        let starts_block = self
+            .cfg
+            .block_at(pc)
+            .is_none_or(|block| self.cfg.blocks()[ix(block)].start == pc);
+        if pc == 0 || starts_block {
+            return true;
+        }
+        match self.ops[pc - 1] {
+            Op::Const(k) => {
+                const_word(self.chunk, k).is_none_or(|word| number_word(word).is_some())
+            }
+            Op::Undef => false,
+            _ => true,
+        }
+    }
+
+    /// WrongShape flagged at `pc` where the site's ways did not grow since a discarded check
+    /// there (see `Builder::stale_ways`).
+    fn stale_ways(&self, pc: usize, ways: &Ways) -> bool {
+        self.snapshot.declines(pc, ExitReason::WrongShape)
+            && ways.shapes.len() <= self.snapshot.discarded_ways(pc)
     }
 }
 
@@ -260,7 +526,7 @@ struct Loop {
 }
 
 impl Flow {
-    fn new(chunk: &Chunk, cfg: &Cfg, initialized: &InitializedReads) -> Result<Flow, Refusal> {
+    fn new(chunk: &Chunk, cfg: &Cfg, rules: &Rules) -> Result<Flow, Refusal> {
         let blocks = cfg.blocks();
         let ops = chunk.jit_ops();
         let (_, n_slots) = chunk.jit_frame();
@@ -380,7 +646,7 @@ impl Flow {
                             *written = true;
                         }
                     }
-                    if !never_effect(chunk, initialized, pc) {
+                    if !rules.lowers(pc) {
                         found.effects = true;
                     }
                 }
@@ -825,6 +1091,8 @@ struct Builder<'a> {
     hoisted_nodes: Vec<NodeIx>,
     /// Whether an operation of the chunk moves its running environment (`names::moves_env`).
     moves_env: bool,
+    /// Set where an operation's lowering ended its block with an exit (`mismatch`).
+    ended: bool,
 }
 
 impl<'a> Builder<'a> {
@@ -854,6 +1122,18 @@ impl<'a> Builder<'a> {
             hoisted: FastMap::default(),
             hoisted_nodes: Vec::new(),
             moves_env: chunk.jit_ops().iter().any(names::moves_env),
+            ended: false,
+        }
+    }
+
+    /// The rules the loop prepass read (see [`Rules`]).
+    fn rules(&self) -> Rules<'a> {
+        Rules {
+            chunk: self.chunk,
+            ops: self.ops,
+            snapshot: self.snapshot,
+            cfg: self.cfg,
+            initialized: self.initialized,
         }
     }
 
@@ -1966,11 +2246,32 @@ impl<'a> Builder<'a> {
             }
             _ => self.effect(pc, st)?,
         }
-        Ok(true)
+        // An exit in place of the operation (`mismatch`) ended the block.
+        Ok(!std::mem::take(&mut self.ended))
+    }
+
+    /// The operation at `pc`, whose lowered form the rules chose, cannot take it for its
+    /// operands (a value whose facts rule it out: a constant, an unboxed value of another kind):
+    /// an exit at the operation with `reason`, which flags the site for its recompile, where the
+    /// rules say the operation lowers, so that the loop prepass's reading holds (see [`Rules`]);
+    /// the effect where they do not.
+    fn mismatch(&mut self, pc: usize, reason: ExitReason, st: &mut State) -> Result<(), Refusal> {
+        if !self.rules().lowers(pc) {
+            return self.effect(pc, st);
+        }
+        self.exit(pc, reason, std::mem::take(st));
+        self.ended = true;
+        Ok(())
     }
 
     /// The operation at `pc` as its baseline template on the canonical frame.
     fn effect(&mut self, pc: usize, st: &mut State) -> Result<(), Refusal> {
+        // The loop prepass took no operation the rules lower for an effect (see `Rules`).
+        debug_assert!(
+            !self.rules().lowers(pc),
+            "the rules lower pc {pc} ({:?}), which the builder made an effect",
+            self.ops[pc]
+        );
         let (pops, pushes) = self
             .chunk
             .jit_stack_effect(pc)
@@ -2033,16 +2334,15 @@ impl<'a> Builder<'a> {
     /// the hint, its int32 products leaving the range too often); the generic operation where a
     /// role saw a value that is not a Number.
     fn arithmetic(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
-        let Some(values) = self.snapshot.values(pc) else {
+        let Some(values) = self.rules().numbers(pc, true) else {
             return self.effect(pc, st);
         };
         let len = st.stack.len();
         let (a, b) = (st.stack[len - 2], st.stack[len - 1]);
-        if (values.operand0 | values.operand1) & !NUMBER != 0
-            || !self.numeric(a)
-            || !self.numeric(b)
-            || self.declines_number(pc, st, &[a, b])
-        {
+        if !self.numeric(a) || !self.numeric(b) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
+        }
+        if self.declines_number(pc, st, &[a, b]) {
             return self.effect(pc, st);
         }
         let proven = self.known_int32(st, a) && self.known_int32(st, b);
@@ -2093,16 +2393,15 @@ impl<'a> Builder<'a> {
     /// count is a constant whose low five bits are not all zero, and otherwise its uint32 result
     /// as an f64, as Maglev's Int32ShiftRightLogical gives a Uint32.
     fn bitwise(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
-        let Some(values) = self.snapshot.values(pc) else {
+        if self.rules().numbers(pc, true).is_none() {
             return self.effect(pc, st);
-        };
+        }
         let len = st.stack.len();
         let (a, b) = (st.stack[len - 2], st.stack[len - 1]);
-        if (values.operand0 | values.operand1) & !NUMBER != 0
-            || !self.numeric(a)
-            || !self.numeric(b)
-            || self.declines_number(pc, st, &[a, b])
-        {
+        if !self.numeric(a) || !self.numeric(b) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
+        }
+        if self.declines_number(pc, st, &[a, b]) {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
@@ -2143,15 +2442,15 @@ impl<'a> Builder<'a> {
 
     /// Neg, Plus (ToNumber) and BitNot on Numbers.
     fn unary(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
-        let Some(values) = self.snapshot.values(pc) else {
+        if self.rules().numbers(pc, false).is_none() {
             return self.effect(pc, st);
-        };
+        }
         let len = st.stack.len();
         let value = st.stack[len - 1];
-        if values.operand0 & !NUMBER != 0
-            || !self.numeric(value)
-            || self.declines_number(pc, st, &[value])
-        {
+        if !self.numeric(value) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
+        }
+        if self.declines_number(pc, st, &[value]) {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
@@ -2183,16 +2482,15 @@ impl<'a> Builder<'a> {
     /// Lt, Gt, Le and Ge on Numbers (rule U's in-line set), int32 where both are proven or the
     /// hint says so.
     fn relational(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
-        let Some(values) = self.snapshot.values(pc) else {
+        let Some(values) = self.rules().numbers(pc, true) else {
             return self.effect(pc, st);
         };
         let len = st.stack.len();
         let (a, b) = (st.stack[len - 2], st.stack[len - 1]);
-        if (values.operand0 | values.operand1) & !NUMBER != 0
-            || !self.numeric(a)
-            || !self.numeric(b)
-            || self.declines_number(pc, st, &[a, b])
-        {
+        if !self.numeric(a) || !self.numeric(b) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
+        }
+        if self.declines_number(pc, st, &[a, b]) {
             return self.effect(pc, st);
         }
         let cond = match op {
@@ -2277,14 +2575,14 @@ impl<'a> Builder<'a> {
         kind: UpdKind,
         st: &mut State,
     ) -> Result<(), Refusal> {
-        let Some(values) = self.snapshot.values(pc) else {
+        let Some(values) = self.rules().numbers(pc, false) else {
             return self.effect(pc, st);
         };
-        if values.operand0 & !NUMBER != 0 {
-            return self.effect(pc, st);
-        }
         let old = self.read_slot(st, slot, pc);
-        if !self.numeric(old) || self.declines_number(pc, st, &[old]) {
+        if !self.numeric(old) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
+        }
+        if self.declines_number(pc, st, &[old]) {
             return self.effect(pc, st);
         }
         let increment = matches!(
@@ -2336,37 +2634,7 @@ impl<'a> Builder<'a> {
     /// a store site without its writability proof. A `prototype` property may hold a function's
     /// deferred prototype, which only the checked operation materializes.
     fn own_data_ways(&self, pc: usize, name: u32, store: bool) -> Option<Ways> {
-        if self.chunk.jit_name(name) == "prototype" {
-            return None;
-        }
-        let named = self.snapshot.named(pc)?;
-        if named.generic || (store && !named.writable) {
-            return None;
-        }
-        let mut shapes = Vec::new();
-        let mut at = None;
-        for way in named.filled() {
-            let own = way.kind == NamedWayKind::Data
-                && way.primitive == 0
-                && way.depth == 0
-                && way.receiver_shape == way.holder_shape
-                && crate::value::is_cacheable_shape(way.receiver_shape)
-                && way.location != 0
-                && way.slot < MAX_FIELD_SLOT;
-            if !own || at.is_some_and(|at| at != (way.location, way.slot)) {
-                return None;
-            }
-            at = Some((way.location, way.slot));
-            if !shapes.contains(&way.receiver_shape) {
-                shapes.push(way.receiver_shape);
-            }
-        }
-        let (location, slot) = at?;
-        Some(Ways {
-            shapes,
-            location,
-            slot,
-        })
+        self.rules().own_data_ways(pc, name, store)
     }
 
     /// WrongShape flagged at `pc` where the site's ways did not grow since a discarded check
@@ -2374,8 +2642,7 @@ impl<'a> Builder<'a> {
     /// being an IC in its optimized code. Ways that grew are checked again, as V8 and
     /// SpiderMonkey recompile on what their ICs learned.
     fn stale_ways(&mut self, pc: usize, ways: &Ways) -> bool {
-        self.snapshot.declines(pc, ExitReason::WrongShape)
-            && ways.shapes.len() <= self.snapshot.discarded_ways(pc)
+        self.rules().stale_ways(pc, ways)
             && self.declined(pc, ExitReason::WrongShape, "the generic access")
     }
 
@@ -2631,57 +2898,7 @@ impl Builder<'_> {
     /// effect): a generic mark, a key that is no index, or receivers by rule R (the record's where
     /// it holds any, else the in-line set's) other than Arrays and ordinary objects.
     fn element_site(&self, pc: usize) -> Option<ElemSite> {
-        use crate::feedback::{
-            ELEM_ARRAY, ELEM_HOLEY, ELEM_KEY_INDEX, ELEM_ORDINARY, ELEM_OUT_OF_BOUNDS,
-            ELEM_TYPED_ARRAY,
-        };
-        let view = self.snapshot.element(pc)?;
-        if view.generic || view.recorded_keys & !ELEM_KEY_INDEX != 0 {
-            return None;
-        }
-        let receivers = if view.recorded_receivers != 0 {
-            view.recorded_receivers
-        } else {
-            ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY
-        };
-        if receivers & !(ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY) != 0 {
-            return None;
-        }
-        let kind = if receivers & ELEM_ORDINARY == 0 {
-            ElemKind::Array
-        } else {
-            ElemKind::Words
-        };
-        let typed = if receivers & ELEM_TYPED_ARRAY == 0 {
-            Typed::None
-        } else if view.recorded_receivers & ELEM_TYPED_ARRAY != 0 && view.typed_kinds == 0 {
-            // Its typed arrays were views the native code declines (BigInt or Float16 elements,
-            // a shared or too long buffer), which the stub would decline at every access: the
-            // generic access, as Maglev leaves BigInt and Float16 elements to it
-            // (TryBuildElementAccessOnTypedArray, maglev-graph-builder.cc:5059-5063).
-            return None;
-        } else if receivers == ELEM_TYPED_ARRAY {
-            // The one kind the VM and the misses saw, or the stub for more than one.
-            let mut kinds = TypedKind::ALL.into_iter().filter(|&kind| {
-                view.typed_kinds & crate::feedback::elem_typed_kind(kind as u8) != 0
-            });
-            Typed::Only(kinds.next().filter(|_| kinds.next().is_none()))
-        } else {
-            Typed::Mixed
-        };
-        let reads = if view.facts & ELEM_OUT_OF_BOUNDS != 0 {
-            Reads::PastUsed
-        } else if view.facts & ELEM_HOLEY != 0 {
-            Reads::Holes
-        } else {
-            Reads::InBounds
-        };
-        Some(ElemSite {
-            kind,
-            reads,
-            arrays: receivers & ELEM_ARRAY != 0,
-            typed,
-        })
+        self.rules().element_site(pc)
     }
 
     /// Whether the exit profile flagged at the element site at `pc` one of `reasons`, whose
@@ -2941,8 +3158,11 @@ impl Builder<'_> {
         let len = st.stack.len();
         let key = st.stack[len - 1];
         let receiver = self.receiver(recv, st, 1, pc);
-        if !self.element_operands(receiver, key) || self.declines_element(pc, LOAD_DECLINES) {
+        if self.declines_element(pc, LOAD_DECLINES) {
             return self.effect(pc, st);
+        }
+        if !self.element_operands(receiver, key) {
+            return self.mismatch(pc, ExitReason::WrongElements, st);
         }
         let mut past_length = false;
         match site.typed {
@@ -3044,17 +3264,19 @@ impl Builder<'_> {
         let len = st.stack.len();
         let (key, value) = (st.stack[len - 2], st.stack[len - 1]);
         let receiver = self.receiver(recv, st, 2, pc);
-        if !self.element_operands(receiver, key)
-            || self.declines_element(pc, STORE_DECLINES)
+        if self.declines_element(pc, STORE_DECLINES)
             || (site.typed != Typed::None && self.declines_element(pc, TYPED_DECLINES))
         {
             return self.effect(pc, st);
+        }
+        if !self.element_operands(receiver, key) {
+            return self.mismatch(pc, ExitReason::WrongElements, st);
         }
         if !self.numeric(value) {
             // A typed array takes a Number in line (its store converts any other value first,
             // which may run code): the words alone, where the site saw others.
             match site.typed {
-                Typed::Only(_) => return self.effect(pc, st),
+                Typed::Only(_) => return self.mismatch(pc, ExitReason::NotNumber, st),
                 Typed::Mixed => site.typed = Typed::None,
                 Typed::None => {}
             }
@@ -3384,16 +3606,16 @@ impl Builder<'_> {
     /// or taken with an overflow exit, and the result written back to the element the read proved
     /// present. Every exit precedes the write, at the operation, which the VM then runs whole.
     fn update_element(&mut self, pc: usize, kind: UpdKind, st: &mut State) -> Result<(), Refusal> {
-        let Some(values) = self.snapshot.values(pc) else {
+        let Some(values) = self.rules().numbers(pc, false) else {
             return self.effect(pc, st);
         };
         let len = st.stack.len();
         let (receiver, key) = (st.stack[len - 2], st.stack[len - 1]);
-        if values.operand0 & !NUMBER != 0
-            || !self.element_operands(receiver, key)
-            || self.declines_element(pc, UPDATE_DECLINES)
-        {
+        if self.declines_element(pc, UPDATE_DECLINES) {
             return self.effect(pc, st);
+        }
+        if !self.element_operands(receiver, key) {
+            return self.mismatch(pc, ExitReason::WrongElements, st);
         }
         let mut cx = Before::new(pc);
         let cell = self.elements_cell(st, &mut cx, receiver, ElemKind::Words);
@@ -3467,20 +3689,7 @@ impl Builder<'_> {
     /// key-checked first slot, which own_data_ways refuses (an Array's `length` is its slot 0:
     /// value.rs length_property), and no generic mark.
     fn array_length_site(&self, pc: usize, name: u32) -> bool {
-        if self.chunk.jit_name(name) != "length" {
-            return false;
-        }
-        let Some(named) = self.snapshot.named(pc) else {
-            return false;
-        };
-        !named.generic
-            && named.filled().next().is_some()
-            && named.filled().all(|way| {
-                way.kind == NamedWayKind::KeyChecked
-                    && way.depth == 0
-                    && way.slot == 0
-                    && way.primitive == 0
-            })
+        self.rules().array_length_site(pc, name)
     }
 
     /// GetProp, GetPropThis and GetPropLocal of an Array's `length` (`array_length_site`): the
@@ -3488,11 +3697,11 @@ impl Builder<'_> {
     /// first slot's word, a heap fact that an append and an effect end.
     fn array_length(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
         let receiver = self.receiver(recv, st, 0, pc);
-        if self.rep(receiver) != Rep::Tagged
-            || self.constant(receiver).is_some()
-            || self.declines_element(pc, &[ExitReason::WrongElements, ExitReason::NotObject])
-        {
+        if self.declines_element(pc, &[ExitReason::WrongElements, ExitReason::NotObject]) {
             return self.effect(pc, st);
+        }
+        if self.rep(receiver) != Rep::Tagged || self.constant(receiver).is_some() {
+            return self.mismatch(pc, ExitReason::WrongElements, st);
         }
         let mut cx = Before::new(pc);
         let cell = self.elements_cell(st, &mut cx, receiver, ElemKind::Array);
@@ -3523,13 +3732,16 @@ impl Builder<'_> {
         let base = self.receiver(recv, st, 1, pc);
         let proven = self.known_number(st, key);
         let checked = !proven && self.rep(key) == Rep::Tagged && self.constant(key).is_none();
-        if self.rep(base) != Rep::Tagged
-            || self.constant(base).is_some()
-            || !(proven || checked)
-            || !self.lowered_load_follows(pc)
+        if !self.lowered_load_follows(pc)
             || self.declines_element(pc, &[ExitReason::NotObject, ExitReason::NotNumber])
         {
             return self.effect(pc, st);
+        }
+        if self.rep(base) != Rep::Tagged || self.constant(base).is_some() {
+            return self.mismatch(pc, ExitReason::NotObject, st);
+        }
+        if !(proven || checked) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
         }
         let mut cx = Before::new(pc);
         if self.forms(st, base).cell.is_none() {
@@ -3553,12 +3765,6 @@ impl Builder<'_> {
     /// Whether the first element load after `pc` in its block (a compound assignment's GetElem)
     /// is lowered on element words.
     fn lowered_load_follows(&self, pc: usize) -> bool {
-        let Some(block) = self.cfg.block_at(pc) else {
-            return false;
-        };
-        let end = self.cfg.blocks()[ix(block)].end;
-        (pc + 1..end)
-            .find(|&next| matches!(self.ops[next], Op::GetElem | Op::GetElemLocal(_)))
-            .is_some_and(|next| self.element_site(next).is_some())
+        self.rules().lowered_load_follows(pc)
     }
 }
