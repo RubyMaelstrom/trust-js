@@ -2154,3 +2154,138 @@ fn a_poll_interrupted_with_untagged_phis_in_its_state_leaves_and_the_code_runs_a
     );
     assert_eq!(eval(&mut engine, "spin(10) + spin(3)"), expected[1]);
 }
+
+/// Richards' Scheduler.prototype.schedule in small (stage 2, step 8): a function entered once a
+/// run, with the run's loop inside.
+const ENTERED_ONCE: &str = "function step(x) { return (x * 7 + 1) % 1009; }\n\
+     function drive(n) { let x = 0; for (let i = 0; i < n; i++) x = step(x); return x; }";
+
+#[test]
+fn a_function_entered_a_few_times_with_a_long_loop_gets_the_tiers_code_by_its_third_entry() {
+    // Its loop's iterations count toward the second stage's checkpoints: the first entry's loop
+    // reaches the first checkpoint (100 runs), which the second entry takes and waits at (the
+    // settled-feedback rule has no earlier fingerprint there), and its loop the second (500),
+    // which the third entry takes and compiles at; the fourth runs the tier's code. With the
+    // counting off, the four entries count four runs: no checkpoint, the first stage kept.
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, ENTERED_ONCE);
+        [eval(&mut vm, "drive(5000)"), eval(&mut vm, "drive(10)")]
+    };
+    for counting in [true, false] {
+        TestSwitches {
+            on: true,
+            no_loop_count: !counting,
+            ..Default::default()
+        }
+        .set();
+        let mut engine = jit_engine();
+        eval(&mut engine, ENTERED_ONCE);
+        compiled();
+        super::TEST_WAITS.with(|waits| waits.borrow_mut().clear());
+        let mut compiled_at = None;
+        for entry in 1..=4 {
+            assert_eq!(
+                eval(&mut engine, "drive(5000)"),
+                expected[0],
+                "entry {entry}"
+            );
+            if compiled_at.is_none() && second_stage(&mut engine, "drive").is_some() {
+                compiled_at = Some(entry);
+            }
+        }
+        let first = first_stage(&mut engine, "drive");
+        let waits: Vec<u8> = super::TEST_WAITS.with(|waits| {
+            waits
+                .borrow()
+                .iter()
+                .filter(|&&(chunk, _)| chunk == address(&first))
+                .map(|&(_, checkpoint)| checkpoint)
+                .collect()
+        });
+        if !counting {
+            assert_eq!(compiled_at, None, "counting off: no checkpoint");
+            assert_eq!(first.jit_runs.get(), 4, "the entries alone");
+            assert!(waits.is_empty());
+            continue;
+        }
+        assert_eq!(compiled_at, Some(3), "compiled at the third entry");
+        assert_eq!(waits, vec![1], "waited at the first checkpoint");
+        let chunk = second_stage(&mut engine, "drive").expect("drive's second stage");
+        assert!(
+            compiled().contains(&address(&chunk)),
+            "the tier compiled it"
+        );
+        let code = chunk.jit.get().flatten().expect("resident");
+        assert!(is_tier_code(&code));
+        code.referenced.set(0);
+        assert_eq!(eval(&mut engine, "drive(10)"), expected[1]);
+        assert!(code.referenced.get() != 0, "the tier's code runs");
+    }
+}
+
+#[test]
+fn a_discards_warm_up_reaches_its_recompile_through_a_loops_iterations() {
+    // The discarded code's fallback, the template JIT's, counts its loop's iterations toward the
+    // warm-up's first checkpoint (200 native runs at R = 1): the entry after a long loop takes
+    // it and recompiles, where entries alone, the counting off, need 200.
+    const SOURCE: &str = "function f(a, n) { let s = 0; for (let i = 0; i < n; i++) s = s + a; \
+                          return s; }";
+    for counting in [true, false] {
+        TestSwitches {
+            no_loop_count: !counting,
+            ..eager()
+        }
+        .set();
+        let mut engine = jit_engine();
+        eval(&mut engine, SOURCE);
+        compiled();
+        exits();
+        discarded();
+        assert_eq!(
+            eval(
+                &mut engine,
+                "let t = 0; for (let k = 0; k < 1000; k++) t += f(1, 3); t"
+            ),
+            "3000"
+        );
+        let chunk = second_stage(&mut engine, "f").expect("f's second stage");
+        assert!(compiled().contains(&address(&chunk)));
+        let optimized = chunk.jit.get().flatten().expect("resident");
+        assert!(is_tier_code(&optimized));
+        // A string fails its Number check: each call exits once, and the 100th discards it.
+        assert_eq!(
+            eval(
+                &mut engine,
+                "let u = ''; for (let k = 0; k < 100; k++) u = f('x', 1); u"
+            ),
+            "0x"
+        );
+        assert_eq!(exits().len(), super::EXIT_LIMIT as usize);
+        assert_eq!(discarded(), vec![optimized.mem_ptr() as usize]);
+        assert!(super::reoptimizing(&chunk), "the warm-up is armed");
+        assert!(compiled().is_empty());
+        assert_eq!(eval(&mut engine, "f(2, 10000)"), "20000");
+        assert_eq!(eval(&mut engine, "f(3, 10000)"), "30000");
+        if counting {
+            assert!(
+                compiled().contains(&address(&chunk)),
+                "the recompile, at the second entry"
+            );
+            assert!(!super::reoptimizing(&chunk), "the warm-up ended");
+            let now = chunk.jit.get().flatten().expect("resident");
+            assert!(is_tier_code(&now), "the recompile is resident");
+            now.referenced.set(0);
+            assert_eq!(eval(&mut engine, "f('a', 2) + f(1, 2)"), "0aa2");
+            assert!(now.referenced.get() != 0, "the recompile runs");
+            assert!(exits().is_empty(), "declining the add, it exits no more");
+        } else {
+            assert!(compiled().is_empty(), "no recompile after two entries");
+            assert!(super::reoptimizing(&chunk), "the warm-up waits");
+        }
+        drop(optimized);
+        super::release_retired(&mut engine.interp);
+    }
+}

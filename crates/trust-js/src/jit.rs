@@ -300,6 +300,14 @@ pub(crate) mod rooting_tests;
 mod poll_tests;
 
 #[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_loop_count_tests.rs"]
+mod loop_count_tests;
+
+#[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -21415,6 +21423,15 @@ fn emit_linked_scan_region(
     a.ldr_imm(9, 22, plan.next_off);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 10, plain_h);
     emit_exec_payload(a, 9, 3);
+    #[cfg(test)]
+    {
+        // Runtime evidence of the scan's entry (tests; release code has no observer): x3, the
+        // first node, is kept across the call, which runs no JS and collects nothing.
+        a.stp_pre(3, 30, -16);
+        a.mov_imm64(16, record_linked_scan_entry as *const () as u64);
+        a.blr(16);
+        a.ldp_post(3, 30, 16);
+    }
 
     a.mov(0, 3); // borrowed current node
     a.movz(8, 0, 0); // no successful assignment yet
@@ -21461,11 +21478,18 @@ fn emit_linked_scan_region(
 #[cfg(all(test, target_arch = "aarch64"))]
 thread_local! {
     static TEST_NUMERIC_REGION_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Linked scans entered on this thread (their first node an Object), tests only.
+    static TEST_LINKED_SCAN_ENTRIES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(all(test, target_arch = "aarch64"))]
 extern "C" fn record_numeric_region_entry() {
     TEST_NUMERIC_REGION_ENTRIES.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+extern "C" fn record_linked_scan_entry() {
+    TEST_LINKED_SCAN_ENTRIES.with(|count| count.set(count.get() + 1));
 }
 
 /// Emit the loop chain for `plan`. Returns the label for the plain fallback of the head op —
