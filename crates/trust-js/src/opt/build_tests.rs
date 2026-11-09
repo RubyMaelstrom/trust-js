@@ -445,14 +445,19 @@ fn a_loop_at_the_entry_gets_an_entry_block() {
     let text = dump(&graph, &chunk);
     let entry = graph.block(graph.entry.expect("an entry"));
     assert!(entry.preds.is_empty(), "{text}");
-    // The entry block holds the hoisted constants and the phis' entry inputs, and jumps.
-    assert!(
-        entry
-            .body
-            .iter()
-            .all(|&node| graph.node(node).state.is_none()),
-        "{text}"
-    );
+    // The entry block holds the hoisted constants and the phis' entry inputs, the check of the
+    // parameter `n` entering the loop's F64 phi (stage 2 step 6), which exits at the loop's pc
+    // 0, and jumps.
+    let exits: Vec<&Node> = entry
+        .body
+        .iter()
+        .map(|&node| graph.node(node))
+        .filter(|node| node.state.is_some())
+        .collect();
+    assert_eq!(exits.len(), 1, "{text}");
+    assert_eq!(exits[0].op, NodeOp::CheckNumber, "{text}");
+    assert_eq!(exits[0].reason, Some(ExitReason::PhiNotNumber), "{text}");
+    assert_eq!(graph.state(exits[0].state.expect("a state")).pc, 0, "{text}");
     let last = *entry.body.last().expect("a terminator");
     let NodeOp::Jump(header) = graph.node(last).op else {
         panic!("the entry jumps to the loop: {text}")
@@ -3768,4 +3773,171 @@ fn the_verifier_refuses_a_phi_whose_inputs_are_not_its_representation() {
     broken.nodes[i.index()].inputs[0] = graph.node(x).inputs[0];
     let error = verify(&broken, &chunk).expect_err("mixed inputs");
     assert!(error.contains("for a I32 phi"), "{error}");
+}
+
+#[test]
+fn am3s_counters_are_int32_phis_checked_once_on_the_loops_entry() {
+    // n, i, j and c enter am3's loop from its parameters: each is an I32 phi whose entry input
+    // is checked a Number and an int32 at the end of the entry predecessor, exiting at the
+    // header's pc (PhiNotNumber, PhiNotInt32); in the loop no check reads a phi and nothing is
+    // boxed (stage 2 step 6).
+    let mut engine = vm_engine(AM3);
+    let (chunk, graph) = graph_of(&mut engine, "am3");
+    let text = dump(&graph, &chunk);
+    let header_index = graph
+        .blocks
+        .iter()
+        .position(|block| block.loop_header)
+        .expect("the loop");
+    let header = graph.block(BlockIx(header_index as u32));
+    for name in ["n", "i", "j", "c"] {
+        let phi = graph.node(phi_of_slot(&graph, &chunk, name, header.first_pc));
+        assert_eq!(phi.rep, Rep::I32, "{name}: {text}");
+        let (k, _) = header
+            .preds
+            .iter()
+            .enumerate()
+            .find(|(_, pred)| pred.index() < header_index)
+            .expect("an entry edge");
+        let int = graph.node(phi.inputs[k]);
+        assert_eq!(int.op, NodeOp::CheckInt32, "{name}: {text}");
+        assert_eq!(int.reason, Some(ExitReason::PhiNotInt32), "{name}: {text}");
+        let number = graph.node(int.inputs[0]);
+        assert_eq!(number.op, NodeOp::CheckNumber, "{name}: {text}");
+        assert_eq!(number.reason, Some(ExitReason::PhiNotNumber), "{name}: {text}");
+        assert_eq!(
+            graph.node(number.inputs[0]).op,
+            NodeOp::EntrySlot(slot_named(&chunk, name)),
+            "{name}: {text}"
+        );
+        for check in [int, number] {
+            let state = graph.state(check.state.expect("a state"));
+            assert_eq!(state.pc, header.first_pc, "{name}: {text}");
+        }
+    }
+    let latch = header
+        .preds
+        .iter()
+        .map(|pred| pred.index())
+        .max()
+        .expect("a back edge");
+    let is_phi = |node: NodeIx| graph.node(node).op == NodeOp::Phi;
+    for block in &graph.blocks[header_index..=latch] {
+        for &node in &block.body {
+            let node = graph.node(node);
+            match node.op {
+                NodeOp::CheckNumber
+                | NodeOp::CheckInt32
+                | NodeOp::CheckIndex
+                | NodeOp::TruncateToInt32 => {
+                    assert!(!is_phi(node.inputs[0]), "{node:?}: {text}");
+                    let input = graph.node(node.inputs[0]);
+                    assert!(
+                        !matches!(input.op, NodeOp::I32ToF64) || !is_phi(input.inputs[0]),
+                        "{node:?}: {text}"
+                    );
+                }
+                NodeOp::I32ToTagged | NodeOp::F64ToTagged => panic!("a boxing in the loop: {text}"),
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A loop whose phi `i` enters from the parameter `start`, its `+ 1` int32 by the VM's records.
+const COUNT: &str = "function cnt(start, n) { var i = start;
+       for (var k = 0; k < n; k++) i = i + 1; return i; }
+     for (var r = 0; r < 20; r++) cnt(r, 5);";
+
+#[test]
+fn a_flag_at_a_loop_header_declines_its_entry_speculation() {
+    let mut engine = vm_engine(COUNT);
+    let (chunk, graph) = graph_of(&mut engine, "cnt");
+    let text = dump(&graph, &chunk);
+    let header = the_loop(&graph);
+    let i = phi_of_slot(&graph, &chunk, "i", header);
+    assert_eq!(graph.node(i).rep, Rep::I32, "{text}");
+    assert!(graph.declines.is_empty(), "{text}");
+    // PhiNotInt32 at the header: the parameter is checked a Number only, the phi is F64, and
+    // the int32 add checks it at its use (an exit there, never a narrowing of the phi).
+    flag(&chunk, header as usize, ExitReason::PhiNotInt32, false, 0);
+    let graph = graph_for(&chunk, "cnt flagged PhiNotInt32");
+    let text = dump(&graph, &chunk);
+    let i = phi_of_slot(&graph, &chunk, "i", header);
+    assert_eq!(graph.node(i).rep, Rep::F64, "{text}");
+    let reasons = |graph: &Graph, reason| {
+        graph
+            .nodes
+            .iter()
+            .filter(|node| node.reason == Some(reason))
+            .count()
+    };
+    assert_eq!(reasons(&graph, ExitReason::PhiNotNumber), 1, "{text}");
+    assert_eq!(reasons(&graph, ExitReason::PhiNotInt32), 0, "{text}");
+    assert!(
+        nodes(&graph, |op| *op == NodeOp::CheckInt32)
+            .iter()
+            .any(|check| check.inputs == [i]),
+        "the add's check of the phi: {text}"
+    );
+    assert_eq!(
+        declines(&graph),
+        [(header as usize, ExitReason::PhiNotInt32)],
+        "{text}"
+    );
+    assert_eq!(graph.declines[0].form, "an f64 phi");
+    // PhiNotNumber too: no speculation, the phi stays tagged and is checked at its uses.
+    flag(&chunk, header as usize, ExitReason::PhiNotNumber, false, 0);
+    let graph = graph_for(&chunk, "cnt flagged PhiNotNumber");
+    let text = dump(&graph, &chunk);
+    let i = phi_of_slot(&graph, &chunk, "i", header);
+    assert_eq!(graph.node(i).rep, Rep::Tagged, "{text}");
+    assert!(
+        graph.nodes.iter().all(|node| !matches!(
+            node.reason,
+            Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32)
+        )),
+        "{text}"
+    );
+    assert_eq!(
+        declines(&graph),
+        [(header as usize, ExitReason::PhiNotNumber)],
+        "{text}"
+    );
+    assert_eq!(graph.declines[0].form, "a tagged phi");
+}
+
+#[test]
+fn the_verifier_refuses_a_misplaced_speculation() {
+    let mut engine = vm_engine(COUNT);
+    let (chunk, graph) = graph_of(&mut engine, "cnt");
+    let speculation = graph
+        .nodes
+        .iter()
+        .position(|node| node.reason == Some(ExitReason::PhiNotNumber))
+        .expect("the entry's check");
+    let rejects = |what: &str, broken: Graph, expected: &str| {
+        let error = verify(&broken, &chunk).expect_err(what);
+        assert!(error.contains(expected), "{what}: {error}");
+    };
+    // Another pc than the header's.
+    let mut broken = graph.clone();
+    let state = broken.nodes[speculation].state.expect("a state").index();
+    broken.states[state].pc = 0;
+    rejects("another pc", broken, "not its header's");
+    // The reason of the other check.
+    let mut broken = graph.clone();
+    broken.nodes[speculation].reason = Some(ExitReason::PhiNotInt32);
+    rejects("the other reason", broken, "speculation by CheckNumber");
+    // A check that is no speculation after it in its block.
+    let mut broken = graph.clone();
+    let block = broken.nodes[speculation].block;
+    let word = broken.nodes[speculation].inputs[0];
+    let check = broken.new_node(block, NodeOp::CheckNumber, &[word], Rep::F64, 0);
+    broken.nodes[check.index()].state = broken.nodes[speculation].state;
+    broken.nodes[check.index()].reason = Some(ExitReason::NotNumber);
+    let body = &mut broken.blocks[block.index()].body;
+    body.insert(body.len() - 1, check);
+    rejects("a check after it", broken, "before CheckNumber");
+    verify(&graph, &chunk).expect("the graph itself holds");
 }

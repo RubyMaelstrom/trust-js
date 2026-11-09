@@ -16,9 +16,12 @@
 //!   representation an exit can box, available at the node that exits; a slot a state marks
 //!   Dead is dead at its pc (`opt::liveness`, checked in tests and debug builds);
 //! - an address (Rep::Ptr) is never a phi's or a frame state's value, so no block edge or exit
-//!   recipe carries one; the signatures let only element nodes take one.
+//!   recipe carries one; the signatures let only element nodes take one;
+//! - a loop's entry speculation (stage 2 step 6), CheckNumber [PhiNotNumber] or CheckInt32
+//!   [PhiNotInt32], sits at the end of a loop header's entry predecessor, where nothing after it
+//!   exits or has an effect before the jump, and exits at the header's pc with its handlers.
 
-use super::ir::{BlockIx, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource};
+use super::ir::{BlockIx, ExitReason, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource};
 use super::liveness::SlotLiveness;
 use crate::bytecode::{Chunk, Op};
 use crate::jit_ir::Cfg;
@@ -92,6 +95,14 @@ pub(crate) fn verify(graph: &Graph, chunk: &Chunk) -> Result<(), String> {
             }
             if node.reason.is_none() && !matches!(node.op, NodeOp::Exit(_)) {
                 return fail("an exit without a reason");
+            }
+        }
+        if matches!(
+            node.reason,
+            Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32)
+        ) {
+            if let Err(what) = speculation(graph, node, &dom, at.1) {
+                return fail(&what);
             }
         }
         if let Some(state) = node.state {
@@ -292,6 +303,69 @@ impl Dominators {
         }
         a == b
     }
+}
+
+/// Whether a node is a loop's entry speculation (its reason says so).
+fn speculative(node: &Node) -> bool {
+    matches!(
+        node.reason,
+        Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32)
+    )
+}
+
+/// A loop's entry speculation `node`, at `position` among its block's phis and body: its check
+/// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32) at the end of a loop header's entry
+/// predecessor, after which nothing but other speculations exits or has an effect before the jump
+/// to the header, with a state at the header's pc and the header's handlers.
+fn speculation(
+    graph: &Graph,
+    node: &Node,
+    dom: &Dominators,
+    position: usize,
+) -> Result<(), String> {
+    let check = if node.reason == Some(ExitReason::PhiNotNumber) {
+        NodeOp::CheckNumber
+    } else {
+        NodeOp::CheckInt32
+    };
+    if node.op != check {
+        return Err(format!("a phi's speculation by {:?}", node.op));
+    }
+    let block = graph.block(node.block);
+    let [header] = block.succs[..] else {
+        return Err("a phi's speculation on a block of other than one successor".into());
+    };
+    let target = graph.block(header);
+    if !target.loop_header || dom.dominates(header, node.block) {
+        return Err("a phi's speculation off a loop's entry edge".into());
+    }
+    for &later in &block.body[position - block.phis.len() + 1..] {
+        let later = graph.node(later);
+        if later.op.is_terminator() {
+            break;
+        }
+        if !speculative(later) && (later.op.can_exit() || later.op.is_effectful()) {
+            return Err(format!(
+                "a phi's speculation before {:?} in its predecessor",
+                later.op
+            ));
+        }
+    }
+    let state = graph.state(node.state.ok_or("a phi's speculation without a state")?);
+    if state.pc != target.first_pc {
+        return Err(format!(
+            "a phi's speculation exiting at pc {}, not its header's {}",
+            state.pc, target.first_pc
+        ));
+    }
+    let poll = graph
+        .node(target.body[0])
+        .state
+        .map(|poll| &graph.state(poll).handlers);
+    if poll != Some(&state.handlers) {
+        return Err("a phi's speculation with other handlers than its header's".into());
+    }
+    Ok(())
 }
 
 /// The input and output representations of `op` as ir.rs documents them; None for the nodes

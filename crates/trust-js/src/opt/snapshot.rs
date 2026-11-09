@@ -60,7 +60,7 @@ pub(crate) struct Snapshot {
 
 // Every reason has its bit in a declined mask: the discriminants run from 0 to the last reason's
 // (ExitReason's last variant), which the mask's width bounds.
-const _: () = assert!((ExitReason::Tdz as u32) < u32::BITS);
+const _: () = assert!((ExitReason::PhiNotInt32 as u32) < u32::BITS);
 
 /// Where a free-name read's search starts (stage 2, step 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

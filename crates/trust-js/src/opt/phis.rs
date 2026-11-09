@@ -23,8 +23,20 @@
 //!   inputs make an F64 phi whatever its uses, where Maglev keeps such a phi tagged when a use
 //!   wants an int32: its reasons, Smis and HeapNumbers, TRust lacks (Decision 5), and a TRust
 //!   tagged phi is its costliest form (the plan's departure 1).
+//! - A loop's entry edge speculates (stage 2 step 6 (e)): a word without forms (a parameter, a
+//!   reload, a load) that enters a loop header's phi from a predecessor of that one successor,
+//!   where the phi has a numeric use in its loop (CheckNumber of it: Maglev's same-loop use
+//!   hints), votes nothing and takes the phi's representation: CheckNumber, and for an I32 phi
+//!   CheckInt32, at that predecessor's end, exiting with PhiNotNumber or PhiNotInt32 at the
+//!   header's pc with the state that edge leaves. That is Maglev's hoisted untagging of a loop
+//!   phi's entry input (UntagInputWithHoistedUntagging), which Maglev keeps behind a flag "for want
+//!   of feedback to back off" and reaches by peeling its loops: TRust's exit profile is that
+//!   back-off, a flag at the header declining the speculation there, PhiNotInt32 to an F64 phi
+//!   and PhiNotNumber to a tagged one (the plan's departures 2 and 3: the check by default where
+//!   V8 peels; a flag per header, not per phi). No speculation on back edges or at forward joins
+//!   (Maglev's default outside peeled loops; departure 4).
 //! - Inputs of an untagged phi: a boxing's operand, a noted form, a constant of the phi's
-//!   representation, an untagged phi as it is or widened.
+//!   representation, an untagged phi as it is or widened, a speculation's check.
 //! - Uses of an untagged phi: CheckNumber of an I32 phi becomes I32ToF64 of it, and CheckInt32,
 //!   CheckIndex and TruncateToInt32 of that the phi itself; CheckNumber of an F64 phi is the phi;
 //!   ToBoolean becomes I32Cmp(Ne, 0) or F64ToBoolean (Maglev's Int32ToBoolean and
@@ -36,7 +48,9 @@
 //!   the boxings and widenings no use is left of.
 
 use super::build::{Alternatives, PhiNotes};
-use super::ir::{BlockIx, Cond, Graph, NodeIx, NodeOp, Rep, SlotSource, StateIx};
+use super::ir::{
+    BlockIx, Cond, Decline, ExitReason, Graph, NodeIx, NodeOp, Rep, SlotSource, StateIx,
+};
 use super::snapshot::Snapshot;
 use crate::fasthash::FastMap;
 
@@ -79,6 +93,10 @@ enum Source {
     Untagged(NodeIx, Rep),
     /// A Number constant.
     Number(f64),
+    /// A word without forms on a loop's entry edge, checked there for the phi's representation:
+    /// no vote (Undecided), or the vote a flag at the header leaves it (F64 for PhiNotInt32,
+    /// Tagged for PhiNotNumber).
+    Speculative(Kind),
     /// Any other word.
     Tagged,
 }
@@ -92,6 +110,7 @@ impl Source {
                 Some(_) => Kind::I32,
                 None => Kind::F64,
             },
+            Source::Speculative(kind) => kind,
             Source::Tagged => Kind::Tagged,
         }
     }
@@ -113,7 +132,7 @@ fn exact_i32(x: f64) -> Option<i32> {
 
 /// Pick every phi's representation in `graph`, as built from its chunk with `notes`, and rewrite
 /// the phis, their inputs and their uses to match (see the module's doc).
-pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, _snapshot: &Snapshot) {
+pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, snapshot: &Snapshot) {
     let phis: Vec<NodeIx> = graph
         .blocks
         .iter()
@@ -122,8 +141,9 @@ pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, _snapshot: &Snapshot) 
     if phis.is_empty() {
         return;
     }
-    let mut selector = Selector::new(graph, notes);
+    let mut selector = Selector::new(graph, notes, snapshot);
     selector.decide(&phis);
+    selector.declines(&phis);
     let untagged: Vec<NodeIx> = phis
         .iter()
         .copied()
@@ -162,10 +182,19 @@ struct Selector<'g> {
     retags: FastMap<(NodeIx, BlockIx), NodeIx>,
     /// The nodes the rewrites made.
     made: Vec<NodeIx>,
+    snapshot: &'g Snapshot,
+    /// Each loop header's blocks (its natural loop), by header.
+    loops: FastMap<BlockIx, Vec<bool>>,
+    /// The phis' inputs as the builder made them, for the speculations' states.
+    original: FastMap<NodeIx, Vec<NodeIx>>,
+    /// The state each loop header's entry edge leaves, at the header's pc: (header, input).
+    entry_states: FastMap<(BlockIx, usize), StateIx>,
+    /// A speculation's checks at a predecessor's end: (block, word, representation).
+    speculated: FastMap<(BlockIx, NodeIx, Rep), NodeIx>,
 }
 
 impl<'g> Selector<'g> {
-    fn new(graph: &'g mut Graph, notes: &'g PhiNotes) -> Self {
+    fn new(graph: &'g mut Graph, notes: &'g PhiNotes, snapshot: &'g Snapshot) -> Self {
         let n = graph.nodes.len();
         let mut users: Vec<Vec<NodeIx>> = vec![Vec::new(); n];
         let mut position = vec![u32::MAX; n];
@@ -192,6 +221,29 @@ impl<'g> Selector<'g> {
             }
         }
         let blocks = graph.blocks.len();
+        // Each loop header's natural loop: the blocks that reach one of its back edges (from a
+        // block numbered at or after it, the builder's reverse postorder) without passing it.
+        let mut loops = FastMap::default();
+        for (index, block) in graph.blocks.iter().enumerate() {
+            if !block.loop_header {
+                continue;
+            }
+            let mut members = vec![false; blocks];
+            members[index] = true;
+            let mut work: Vec<BlockIx> = block
+                .preds
+                .iter()
+                .copied()
+                .filter(|pred| pred.index() >= index)
+                .collect();
+            while let Some(member) = work.pop() {
+                if std::mem::replace(&mut members[member.index()], true) {
+                    continue;
+                }
+                work.extend(graph.block(member).preds.iter().copied());
+            }
+            loops.insert(BlockIx(index as u32), members);
+        }
         Selector {
             graph,
             notes,
@@ -207,6 +259,11 @@ impl<'g> Selector<'g> {
             removed: vec![false; n],
             retags: FastMap::default(),
             made: Vec::new(),
+            snapshot,
+            loops,
+            original: FastMap::default(),
+            entry_states: FastMap::default(),
+            speculated: FastMap::default(),
         }
     }
 
@@ -246,8 +303,73 @@ impl<'g> Selector<'g> {
             if let Some(x) = number_word(word) {
                 return Source::Number(x);
             }
+            return Source::Tagged;
         }
-        Source::Tagged
+        match self.speculation(phi, k) {
+            Some(kind) => Source::Speculative(kind),
+            None => Source::Tagged,
+        }
+    }
+
+    /// Whether input `k` of `phi`, a word without forms, may speculate: the edge enters a loop
+    /// header from a predecessor outside the loop whose one successor the header is, and the phi
+    /// has a numeric use in its loop (see the module's doc). The vote the header's flags leave
+    /// it: none, F64 under PhiNotInt32, Tagged under PhiNotNumber.
+    fn speculation(&self, phi: NodeIx, k: usize) -> Option<Kind> {
+        let block = self.graph.node(phi).block;
+        let members = self.loops.get(&block)?;
+        let pred = self.graph.block(block).preds[k];
+        if members[pred.index()] || self.graph.block(pred).succs.len() != 1 {
+            return None;
+        }
+        let numeric = self.users[phi.index()].iter().any(|&user| {
+            let user = self.graph.node(user);
+            user.op == NodeOp::CheckNumber && members[user.block.index()]
+        });
+        if !numeric {
+            return None;
+        }
+        let pc = self.graph.block(block).first_pc as usize;
+        Some(if self.snapshot.declines(pc, ExitReason::PhiNotNumber) {
+            Kind::Tagged
+        } else if self.snapshot.declines(pc, ExitReason::PhiNotInt32) {
+            Kind::F64
+        } else {
+            Kind::Undecided
+        })
+    }
+
+    /// List each speculation a flag declined: a loop phi with a speculative input, whose other
+    /// inputs would have made it I32 (PhiNotInt32: an f64 phi) or untagged (PhiNotNumber: a tagged
+    /// phi), once per header and reason, as the builder lists its declines.
+    fn declines(&mut self, phis: &[NodeIx]) {
+        for &phi in phis {
+            let inputs = self.graph.node(phi).inputs.clone();
+            let mut flagged = None;
+            let mut others = Kind::Undecided;
+            for (k, &value) in inputs.iter().enumerate() {
+                match self.source(phi, k, value) {
+                    Source::Speculative(Kind::Tagged) => flagged = Some(ExitReason::PhiNotNumber),
+                    Source::Speculative(Kind::F64) => {
+                        flagged = flagged.or(Some(ExitReason::PhiNotInt32))
+                    }
+                    Source::Speculative(_) => {}
+                    source => others = others.max(source.vote()),
+                }
+            }
+            let (reason, form) = match (flagged, others) {
+                (Some(ExitReason::PhiNotNumber), Kind::I32 | Kind::F64) => {
+                    (ExitReason::PhiNotNumber, "a tagged phi")
+                }
+                (Some(ExitReason::PhiNotInt32), Kind::I32) => (ExitReason::PhiNotInt32, "an f64 phi"),
+                _ => continue,
+            };
+            let pc = self.graph.block(self.graph.node(phi).block).first_pc;
+            let decline = Decline { pc, reason, form };
+            if !self.graph.declines.contains(&decline) {
+                self.graph.declines.push(decline);
+            }
+        }
     }
 
     fn alternatives(&self, phi: NodeIx, k: usize) -> Alternatives {
@@ -333,6 +455,16 @@ impl<'g> Selector<'g> {
 
     /// The inputs of each untagged phi in its representation (see the module's doc).
     fn untag_inputs(&mut self, untagged: &[NodeIx]) {
+        // The inputs as built, which a speculation's state takes in place of the header's phis.
+        for &phi in untagged {
+            let block = self.graph.node(phi).block;
+            for &other in &self.graph.block(block).phis {
+                if !self.original.contains_key(&other) {
+                    self.original
+                        .insert(other, self.graph.node(other).inputs.clone());
+                }
+            }
+        }
         for &phi in untagged {
             let kind = self.kind(phi);
             let rep = kind.rep();
@@ -345,16 +477,19 @@ impl<'g> Selector<'g> {
                     Source::Own => phi,
                     Source::Untagged(node, from) if from == rep => node,
                     Source::Untagged(node, Rep::I32) if rep == Rep::F64 => {
-                        // An f64 form noted beside the int32 serves as it is.
-                        match self.alternatives(phi, k).f64 {
-                            Some(number) => number,
-                            None => self.at_end(pred, NodeOp::I32ToF64, &[node], Rep::F64),
+                        // An f64 form noted beside the int32 serves as it is, and a constant
+                        // widens at the compile.
+                        match (self.alternatives(phi, k).f64, &self.graph.node(node).op) {
+                            (Some(number), _) => number,
+                            (None, &NodeOp::ConstI32(x)) => self.float64(f64::from(x)),
+                            (None, _) => self.at_end(pred, NodeOp::I32ToF64, &[node], Rep::F64),
                         }
                     }
                     Source::Number(x) => match (kind, exact_i32(x)) {
                         (Kind::I32, Some(int)) => self.int32(int),
                         _ => self.float64(x),
                     },
+                    Source::Speculative(_) => self.speculate(block, k, value, rep),
                     source => unreachable!("a {kind:?} phi with the input {source:?}"),
                 };
                 new.push(input);
@@ -363,6 +498,77 @@ impl<'g> Selector<'g> {
             node.inputs = new;
             node.rep = rep;
         }
+    }
+
+    /// The checks of `word`, input `k` of a phi of loop header `header`, at the end of that
+    /// input's predecessor, for a phi of `rep`: CheckNumber [PhiNotNumber], and for an I32 phi
+    /// CheckInt32 [PhiNotInt32], exiting at the header's pc with the state the edge leaves.
+    fn speculate(&mut self, header: BlockIx, k: usize, word: NodeIx, rep: Rep) -> NodeIx {
+        let pred = self.graph.block(header).preds[k];
+        let state = self.entry_state(header, k);
+        let pc = self.graph.block(header).first_pc;
+        let number = match self.speculated.get(&(pred, word, Rep::F64)) {
+            Some(&number) => number,
+            None => {
+                let number = self.at_end(pred, NodeOp::CheckNumber, &[word], Rep::F64);
+                let node = self.graph.node_mut(number);
+                node.pc = pc;
+                node.state = Some(state);
+                node.reason = Some(ExitReason::PhiNotNumber);
+                self.speculated.insert((pred, word, Rep::F64), number);
+                number
+            }
+        };
+        if rep == Rep::F64 {
+            return number;
+        }
+        if let Some(&int) = self.speculated.get(&(pred, word, Rep::I32)) {
+            return int;
+        }
+        let int = self.at_end(pred, NodeOp::CheckInt32, &[number], Rep::I32);
+        let node = self.graph.node_mut(int);
+        node.pc = pc;
+        node.state = Some(state);
+        node.reason = Some(ExitReason::PhiNotInt32);
+        self.speculated.insert((pred, word, Rep::I32), int);
+        int
+    }
+
+    /// The frame state loop header `header`'s entry edge `k` leaves, at the header's pc: its
+    /// poll's state with each of its phis the input the builder gave it on that edge, a boxing's
+    /// operand for a boxing (Maglev's CheckpointedJump frame for a hoisted untagging).
+    fn entry_state(&mut self, header: BlockIx, k: usize) -> StateIx {
+        if let Some(&state) = self.entry_states.get(&(header, k)) {
+            return state;
+        }
+        let poll = self.graph.block(header).body[0];
+        let at = self.graph.node(poll).state.expect("a loop header's poll has a state");
+        let mut frame = self.graph.state(at).clone();
+        let phis = &self.graph.block(header).phis;
+        let edge = |value: NodeIx| -> NodeIx {
+            if !phis.contains(&value) {
+                return value;
+            }
+            let input = self.original[&value][k];
+            match self.graph.node(input).op {
+                NodeOp::I32ToTagged | NodeOp::F64ToTagged => self.graph.node(input).inputs[0],
+                _ => input,
+            }
+        };
+        let slots: Vec<SlotSource> = frame
+            .slots
+            .iter()
+            .map(|&source| match source {
+                SlotSource::Value(value) => SlotSource::Value(edge(value)),
+                other => other,
+            })
+            .collect();
+        let stack: Vec<NodeIx> = frame.stack.iter().map(|&value| edge(value)).collect();
+        frame.slots = slots.into_boxed_slice();
+        frame.stack = stack.into_boxed_slice();
+        let state = self.graph.add_state(frame);
+        self.entry_states.insert((header, k), state);
+        state
     }
 
     /// The uses of each untagged phi in its representation (see the module's doc).

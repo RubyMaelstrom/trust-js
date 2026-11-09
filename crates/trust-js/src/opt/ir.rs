@@ -252,6 +252,13 @@ pub(crate) enum ExitReason {
     /// again and throws its ReferenceError (SpiderMonkey's LexicalCheck bailout, JSC's
     /// CheckNotEmpty exit).
     Tdz,
+    // The untagged phis' reasons (P3 stage 2 step 6): a loop's entry edge's speculation, which
+    // exits at the loop header's pc and which a flag declines at that header.
+    /// A word entering a loop's untagged phi is no Number (Maglev's hoisted untagging's
+    /// CheckedNumberToFloat64).
+    PhiNotNumber,
+    /// A Number entering a loop's I32 phi is no exact int32 (CheckedFloat64ToInt32 there).
+    PhiNotInt32,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }

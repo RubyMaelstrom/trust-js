@@ -1948,3 +1948,153 @@ fn untagged_phis_live_across_collections_beside_words() {
     assert_eq!(eval(&mut engine, again), expected);
     engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
 }
+
+/// A loop whose phi `i` enters from the parameter `start`: an I32 phi (its back edge's `| 0`),
+/// its entry checked a Number and an int32 at the loop's entry (stage 2 step 6).
+const ENTERED: &str = "function entered(start, n) { let i = start;
+       for (let k = 0; k < n; k++) i = (i + 1) | 0; return i; }\n";
+
+/// The representation of the phi of `entered`'s `i` in `graph`.
+fn entered_phi(graph: &super::ir::Graph) -> super::ir::Rep {
+    let header = graph
+        .blocks
+        .iter()
+        .find(|block| block.loop_header)
+        .expect("the loop");
+    let poll = graph.node(header.body[0]);
+    let state = graph.state(poll.state.expect("a poll's state"));
+    // `i` is the function's third slot (start, n, i, k).
+    match state.slots[2] {
+        super::ir::SlotSource::Value(value) if header.phis.contains(&value) => {
+            graph.node(value).rep
+        }
+        other => panic!("i's phi: {other:?}"),
+    }
+}
+
+#[test]
+fn a_loop_entered_with_a_double_where_int32s_were_seen_converges_on_an_f64_phi() {
+    // The entry's CheckInt32 exits at the loop header (PhiNotInt32), whose flag the recompile
+    // declines to an F64 phi, checked a Number only.
+    let source = format!("{ENTERED}let t = 0; for (let r = 0; r < 1000; r++) t = (t + entered(r, 3)) | 0; t");
+    let chunk = converges(
+        "entered",
+        &source,
+        "let u = 0; for (let r = 0; r < 600; r++) u += entered(r + 0.5, 3); u",
+        "entered(1.5, 4) + entered(7, 2) + entered(-0.5, 1)",
+        ExitReason::PhiNotInt32,
+    );
+    let graph = graph_now(&chunk);
+    assert_eq!(entered_phi(&graph), super::ir::Rep::F64);
+    assert!(graph
+        .declines
+        .iter()
+        .any(|decline| decline.reason == ExitReason::PhiNotInt32));
+}
+
+#[test]
+fn a_loop_entered_with_a_string_where_int32s_were_seen_converges_on_a_tagged_phi() {
+    let source = format!("{ENTERED}let t = 0; for (let r = 0; r < 1000; r++) t = (t + entered(r, 3)) | 0; t");
+    let chunk = converges(
+        "entered",
+        &source,
+        "let u = ''; for (let r = 0; r < 600; r++) u = entered('s' + r, 3) + u.slice(0, 20); u",
+        "entered('t', 4) + ':' + entered(7, 2) + entered(2.5, 1)",
+        ExitReason::PhiNotNumber,
+    );
+    // The VM's runs of the exits recorded the strings at `i + 1` and `| 0`, whose generic
+    // operations leave the back edge a word: the feedback alone keeps the phi tagged, as step
+    // 3's NotNumber converges (the flag's own decline: build_tests'
+    // `a_flag_at_a_loop_header_declines_its_entry_speculation`).
+    let graph = graph_now(&chunk);
+    assert_eq!(entered_phi(&graph), super::ir::Rep::Tagged);
+}
+
+#[test]
+fn entry_speculations_back_off_without_an_exit_cycle() {
+    // Int32s enter the loop until it is compiled, then int32s, doubles and strings in turn: the
+    // results hold in the gates' configurations, and with every code discarded at its first exit
+    // the header's two flags (and the VM's records of the exits' runs) settle it after a few
+    // discards, not one per call.
+    let source = format!(
+        "{ENTERED}let t = 0; for (let r = 0; r < 1000; r++) t = (t + entered(r, 3)) | 0;\n\
+         let s = String(t); for (let r = 0; r < 600; r++) {{ const k = r % 3; \
+         s = String(entered(k === 0 ? r : k === 1 ? r + 0.25 : 'x' + r, 3)).slice(0, 4) + \
+         s.slice(0, 30); }} s"
+    );
+    names_hold(&source);
+    let expected = run(Tier::Bytecode, &source);
+    TestSwitches {
+        exit_limit: 1,
+        ..eager()
+    }
+    .set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, &source), expected);
+    let chunk = second_stage(&mut engine, "entered").expect("entered's second stage");
+    assert!(discards(&chunk) <= 3, "{} discards", discards(&chunk));
+}
+
+#[test]
+fn a_counter_passing_2_31_exits_on_overflow_and_converges_on_an_f64_phi() {
+    // The VM's runs record `i++`'s int32s, so the tier adds int32s with an overflow exit and
+    // `i` is an I32 phi; a count past 2^31 - 1 exits there (Overflow), the VM finishes with
+    // 2^31 and more, and after the discard the recompile adds f64s into an F64 phi, exact to
+    // 2^53 as the VM's.
+    const SOURCE: &str = "function count(start, n) { let i = start;
+           for (let k = 0; k < n; k++) i++; return i; }\n\
+         for (let r = 0; r < 50; r++) count(r, 4);";
+    const WARM: &str = "let t = 0; for (let r = 0; r < 600; r++) t += count(r, 4); t";
+    const PAST: &str = "let u = 0; for (let r = 0; r < 600; r++) u += count(2147483600, 100); u";
+    const AFTER: &str = "[count(2147483647, 3), count(9007199254740989, 5), count(-5, 3)].join()";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, SOURCE);
+        [eval(&mut vm, WARM), eval(&mut vm, PAST), eval(&mut vm, AFTER)]
+    };
+    eager().set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Bytecode);
+    engine.set_tier_threshold(0);
+    eval(&mut engine, SOURCE);
+    engine.set_tier(Tier::Jit);
+    compiled();
+    exits();
+    discarded();
+    assert_eq!(eval(&mut engine, WARM), expected[0]);
+    assert!(exits().is_empty(), "the speculation held");
+    let chunk = second_stage(&mut engine, "count").expect("count's second stage");
+    assert!(compiled().contains(&address(&chunk)));
+    let int = graph_now(&chunk);
+    assert!(int.nodes.iter().any(|node| node.op == super::ir::NodeOp::I32Add
+        && node.reason == Some(ExitReason::Overflow)));
+    assert_eq!(
+        int.blocks
+            .iter()
+            .flat_map(|block| block.phis.iter())
+            .filter(|&&phi| int.node(phi).rep == super::ir::Rep::I32)
+            .count(),
+        2,
+        "i and k"
+    );
+    assert_eq!(eval(&mut engine, PAST), expected[1]);
+    let taken = exits();
+    assert!(!taken.is_empty() && taken.iter().all(|&(_, why)| why == ExitReason::Overflow));
+    assert_eq!(discards(&chunk), 1);
+    assert_eq!(eval(&mut engine, AFTER), expected[2]);
+    assert!(exits().is_empty(), "no exit after the recompile");
+    let graph = graph_now(&chunk);
+    let header = graph
+        .blocks
+        .iter()
+        .find(|block| block.loop_header)
+        .expect("the loop");
+    let state = graph.state(graph.node(header.body[0]).state.expect("a state"));
+    let i = match state.slots[2] {
+        super::ir::SlotSource::Value(value) => value,
+        other => panic!("i: {other:?}"),
+    };
+    assert_eq!(graph.node(i).rep, super::ir::Rep::F64);
+}
