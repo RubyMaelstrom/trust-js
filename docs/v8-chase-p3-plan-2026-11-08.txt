@@ -878,6 +878,9 @@ Steps:
    with them boxed and checked each iteration; stage 2's performance bar cannot be met with every
    phi tagged. After step 4, whose loop prepass change it builds on; step 5's session confirms the
    order.
+7. Immediate operands in the back end's arithmetic (added 2026-11-09, below): 12 of am3's
+   instructions per iteration move a constant into a scratch register for its use. Back end only,
+   so it runs beside step 4.
 
 Stage 2's exit (the owner's, 2026-11-09: stage 1's bars carried): stage 1's gates in the tier's
 three configurations; coverage, the tier's code taking at least 80% of the time spent in
@@ -1265,3 +1268,19 @@ behind proofs made once per loop entry. Per the exemplars:
   exits at the poll and at every check with phis in registers and spill slots; a catch reading a
   loop variable; GC stress; Test262's for, while, do-while, update and compound assignment tests in
   the four configurations; the difftest corpus seeded with the same.
+
+Step 7, immediate operands (design, 2026-11-09). The back end rematerializes every constant operand
+into a scratch register at its use (`mov x17, #0x3fff` before `and w4, w3, w17`), where Maglev's
+ARM64 code generator takes an int32 constant as the instruction's immediate when the encoding
+allows (TryGetAddImmediateInt32ConstantInput and TryGetLogicalImmediateInt32ConstantInput,
+src/maglev/arm64/maglev-ir-arm64.cc:30-50, Int32Add and Int32Subtract at 278-306), as Ion's and the
+DFG's ARM64 lowerings do. The tier does the same for its int32 nodes: additions and subtractions,
+with and without the overflow exit, by a 12-bit immediate or one shifted by 12 (a negative constant
+by the opposite operation); AND, OR and XOR by an encodable 32-bit logical immediate; shifts by a
+constant count (masked to 5 bits, as ToInt32's shifts are); comparisons by CMP or CMN immediates;
+a constant that does not encode keeps today's register. F64 constants that FMOV's 8-bit immediate
+encodes take it. The register allocator gives an encodable constant operand no register. Tests: per
+node, constants at each encoding's bounds (0, 4095, 4096, 0xfff000, 0x1000000, -1, -4096,
+INT32_MIN), encodable and unencodable logical immediates (0x3fff, 0xfffffff, 0x12345), shift
+counts 0, 31 and 32 and above, and the overflow exits taken with an immediate operand; Crypto's
+counts again.
