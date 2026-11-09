@@ -857,16 +857,20 @@ full at the stage's end (Gates; P2's Decision 8).
 
 Steps:
 1. ToInt32 in line (below).
-2. Elements in line: loads and stores of dense Arrays and typed arrays as nodes (design before its
-   code, from target/p3/stage2/elements-input.txt).
-3. The exit profile and reoptimization, point 12 (design before its code, from
-   target/p3/stage2/reopt-input.txt).
-4. A measurement: the coverage run and a session of the regressed workloads, which orders what
+2. Elements in line: loads and stores of dense Arrays and typed arrays as nodes, and an Array's
+   length (below; input target/p3/stage2/elements-input.txt).
+3. The exit profile and reoptimization, point 12 (below; input target/p3/stage2/reopt-input.txt).
+4. Free names in line (LoadName and LoadNameForCall from their caches), which stage 1's note put
+   first in stage 2's order and this list first left out (corrected 2026-11-09): zlib's and
+   Mandreel's typed arrays are free names, so step 2 pays there only with them, and with them the
+   census found 29.5% of the hot-function time in functions the tier lowers whole, against 10.4%
+   (design before its code).
+5. A measurement: the coverage run and a session of the regressed workloads, which orders what
    follows: values kept across effects instead of reloaded (React's steady state), a guard miss at
-   a polymorphic call that calls instead of exiting (Richards), and the rest of the list
-   (allocation in line, closures, strings through helpers, natives through their entries,
-   exceptions by exit with the in-place resume, `arguments` and rest elided where proven, getters
-   and setters as calls, dependencies with invalidation points).
+   a polymorphic call that calls instead of exiting at the first compile (Richards), and the rest
+   of the list (allocation in line, closures, strings through helpers, natives through their
+   entries, exceptions by exit with the in-place resume, `arguments` and rest elided where proven,
+   getters and setters as calls, dependencies with invalidation points).
 
 Stage 2's exit (the owner's, 2026-11-09: stage 1's bars carried): stage 1's gates in the tier's
 three configurations; coverage, the tier's code taking at least 80% of the time spent in
@@ -905,6 +909,81 @@ on (38% before the step) and none of Mandreel's (31%); zlib scores 3,591 with th
 3,915 off (1,731 against 3,780 before), Mandreel 1,074 against 1,096 (617 against 1,097). In zlib
 the tier's code for a6 and a3 now takes 28% and 16% more samples than their second stages do, and
 a8's hot loop runs in its second stage's loop code with the tier on as off (OSR, stage 5).
+
+
+Step 2, elements in line (design, 2026-11-09; input target/p3/stage2/elements-input.txt, which cites
+TRust's code and the exemplars line by line and numbers the nodes N1-N16). TRust's element words
+are SpiderMonkey's ObjectElements in layout and meaning (a header before the first word holding
+the initialized length, called used, the capacity and the kind bits; NaN-boxed words; a hole
+word; memory past used uninitialized: word_block.rs, sm/vm/NativeObject.h:197-287), not V8's
+FixedArrays; its shapes say nothing of elements or the prototype; and its element record is
+written by the VM and the helpers, never on the first stage's in-line hits (feedback-schema.txt:
+180-187). So the step takes Maglev's structure, each keyed site built from the snapshot as
+TryBuildElementAccess builds it (src/maglev/maglev-graph-builder.cc:5496-5624), checks as nodes,
+the elements pointer and length as loads, bounds checks kept, in-bounds, hole and grow modes; it
+takes Warp's choices where Maglev's rest on V8's elements kinds, Smis and map transitions: bounds on
+the initialized length, a hole test per element, values unboxed per use (jit/
+WarpCacheIRTranspiler.cpp:2339-2381, 3167-3226); and it does not exit on a case the first stage
+handles in line, since those executions record nothing a snapshot could have refuted. In order:
+- An untagged pointer representation (an elements block, a typed array's view or data), never in
+  a frame state, a phi or an exit, taken only by element nodes, which also take the owner's cell
+  so that it stays alive while its pointer is used (Warp's keep-alive); the exit reasons
+  WrongElements, OutOfBounds, Hole, Detached and CouldNotGrow; the snapshot's element view.
+- Loads from Arrays and ordinary objects: the receiver checked by its kind tag and IC_PLAIN (the
+  template's test; Maglev checks a map), the elements pointer and used length as loads (heap
+  facts per effect epoch), the index (an int32 form as it is; a Number checked an exact integer,
+  -0 taken as 0, Warp's GuardToInt32Index), an unsigned bounds check, and the load with its hole
+  test: an exit (Hole) where the record never saw a hole; undefined where it did and the cold path
+  proves that no element can come from the prototype chain (HAS_FAR clear, the prototype the
+  realm's Array.prototype or Object.prototype, the protector proof as the template reads it),
+  Maglev's ConvertHoleToUndefined under CanTreatHoleAsUndefined (maglev-graph-builder.cc:
+  3993-4008, 5233-5268); a site whose record saw a read past used reads undefined there under the
+  same proof (Maglev's Select under kHandleOOB, 5274-5286; Warp's LoadDenseElementHoleResult). A
+  loaded word is checked at each use (CheckNumber, CheckInt32), as Warp unboxes per use. ToPropKey
+  of a Number is the Number.
+- Stores to existing elements with an int32, f64 or tagged value: in bounds and no hole; the kind
+  bits kept exact in place (a store never exits for a kind change, where V8 transitions the map);
+  a copy-on-write block copied by a pure call (Maglev's EnsureWritableFastElements); FROZEN an
+  exit; for a reference the owner's card and, below a large block's traced length, its dirty bit by
+  a pure call, as Warp's post barrier for large arrays is (jit/VMFunctions.cpp:1054-1076).
+- Appends and hole fills on Arrays, as the template's in-line set does them (jit.rs
+  emit_word_create): the prototype and protector proofs on the cold path, growth by a pure call
+  that exits with CouldNotGrow when it fails (Warp's addDenseElementPure; Maglev's
+  MaybeGrowFastElements), the length updated (Maglev's UpdateJSArrayLength). A site that saw Arrays
+  always compiles this path: appends and hole fills are never recorded.
+- An Array's length (its first named slot) as a load, so that `i < a.length` loops keep their
+  bodies free of effects; UpdateElem and the compound element assignments where the value record
+  says Number.
+- Typed arrays: the view and its length as facts; the data pointer checked attached, writable and
+  unborrowed once per effect epoch (Maglev's CheckTypedArrayValid, TRust having no detaching
+  protector); loads and stores per element kind, step 1's truncation for integer stores and a clamp
+  for Uint8Clamped, the buffer's dirty range kept for embedders as the template keeps it; where the
+  snapshot does not know the kind, the template's TypedElement stub as a call node. A site whose
+  record holds both Arrays and typed arrays, or nothing, dispatches on the kind tag as the template
+  does.
+- Effects stay for generic sites, strings, primitives, arguments objects and exotic receivers, `in`
+  and method elements, and the sites step 3's flags decline.
+Departures from Maglev that TRust's representation forces: the receiver check is a kind tag and
+IC_PLAIN, not a map; representation is per value, not per elements kind, so a load checks each
+word at its use and a store keeps the kind bits; bounds are on the initialized length (Warp's), not
+an Array's length; the prototype and HAS_FAR are read on the cold paths, where V8's map implies
+them; the protector is checked at run time until dependencies exist; feedback has no maps, modes or
+typed-array kinds, so the receiver set picks the form and a kind-tag dispatch serves mixed or empty
+records; the barrier is the owner's card and a large block's dirty bit (JSC's owner barrier, Warp's
+whole-cell edge); a typed array's validity holds per effect epoch; growth and copy-on-write are pure
+calls with no collection at the call (Warp); an index of -0 is index 0 (Warp, Maglev's tagged path);
+an int32 element is f64 bits, so an int32 store is SCVTF and STR D and an int32 use of a load LDR D
+and FJCVTZS. Whether the kind tag and IC_PLAIN can change once JavaScript sees an object decides
+whether the receiver check is a fact across effects (a value fact) or per effect epoch; the step
+verifies it in the code first. Measured at step 5: whether the first stage's in-line paths should
+record (JSC's baseline writes its ArrayProfile at every access; TRust's in-line hits record nothing,
+so a typed array's kind is known only from the VM's runs and the misses). Tests, under the tier
+eager and with exits forced: holes and reads past used with and without the protector, an index
+setter installed on Array.prototype mid-loop, Array subclasses, HAS_FAR arrays, appends across
+capacity and from the empty block, copy-on-write literals, frozen and sealed arrays, -0, 2^31 and
+fractional keys, NaN and -0 into int32 arrays, references into NUMBERS arrays and into arrays over
+64 words under GC stress and TRUST_JS_GC_VERIFY, typed arrays detached or shrunk between calls,
+each typed kind's conversions; difftest's corpus seeded with the same.
 
 Step 3, the exit profile and reoptimization (design, 2026-11-09; input
 target/p3/stage2/reopt-input.txt, which cites the code and the exemplars line by line). Its input
