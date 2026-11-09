@@ -74,19 +74,48 @@ pub(crate) enum Cond {
     Ne,
 }
 
+/// What an element check proves of an object (P3 stage 2 step 2): its kind tag and IC_PLAIN flag.
+/// No write changes either once JavaScript can see the object (every kind is set on a fresh
+/// object, and IC_PLAIN is only ever cleared, at a creation or registration: interpreter.rs's
+/// object_look), so the proof is a value fact, kept across effects as a cell form is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ElemKind {
+    /// Element words: an ordinary kind or an Array (its tag at most KIND_ARRAY_TAG), IC_PLAIN set
+    /// (the element templates' receiver test, jit.rs emit_get_elem_inline).
+    Words,
+    /// An Array, IC_PLAIN set.
+    Array,
+}
+
+impl ElemKind {
+    /// Whether a proof of `self` proves `other` too.
+    pub(crate) fn proves(self, other: ElemKind) -> bool {
+        self == other || (self == ElemKind::Array && other == ElemKind::Words)
+    }
+}
+
+/// What an element load does with a hole word (Maglev's CheckNotHole and ConvertHoleToUndefined,
+/// maglev-graph-builder.cc:5233-5268).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Holes {
+    /// Exits [Hole]: the record saw no hole.
+    Exit,
+    /// Reads undefined where the cold path proves that no element can come from the prototype
+    /// chain (CanTreatHoleAsUndefined, maglev-graph-builder.cc:3993-4008), and exits [Hole]
+    /// otherwise.
+    Undefined,
+}
+
 /// Why a check fails or an exit is taken, for the log, the exit profile (stage 2; keyed by the
 /// reason's discriminant, `opt::profile`) and tests.
-// Only the back end builds the reasons of exits on objects and Booleans and of the forced-exit
-// gate: where the tier has none (x86-64 until the plan's stage 6), nothing builds those three.
+// Only the back end builds the reasons of exits on Booleans and of the forced-exit gate: where
+// the tier has none (x86-64 until the plan's stage 6), nothing builds those two.
 #[cfg_attr(
     not(all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     )),
-    expect(
-        dead_code,
-        reason = "the back end builds NotObject, NotBoolean and Forced"
-    )
+    expect(dead_code, reason = "the back end builds NotBoolean and Forced")
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ExitReason {
@@ -118,14 +147,11 @@ pub(crate) enum ExitReason {
     /// An element access's receiver is not of the elements kind its check expected (another
     /// object kind, or IC_PLAIN clear), or a write meets frozen elements or a receiver the
     /// in-line append does not take (V8's kWrongMap).
-    #[expect(dead_code, reason = "the element checks build it (step 2's (b))")]
     WrongElements,
     /// An element index at or past the used words, or a negative one (V8's kOutOfBounds).
-    #[expect(dead_code, reason = "the element checks build it (step 2's (b))")]
     OutOfBounds,
     /// A hole where the record saw none, or one the cold path cannot prove reads undefined
     /// (V8's kHole).
-    #[expect(dead_code, reason = "the element checks build it (step 2's (b))")]
     Hole,
     /// A typed array whose buffer is detached, shrunk below the view or borrowed by Rust (V8's
     /// kArrayBufferWasDetached).
@@ -163,12 +189,6 @@ pub(crate) enum NodeOp {
     /// F64 -> I32: an exact int32 and not -0.
     CheckInt32,
     /// Tagged -> Cell.
-    // Stage 1's builder checks objects through CheckShape and builds no CheckObject; the verifier
-    // and the back end take one, as the tests do.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "stage 1's builder builds no CheckObject")
-    )]
     CheckObject,
     /// Tagged -> Cell: an object whose shape is one of these (at most four).
     CheckShape(Vec<u32>),
@@ -260,6 +280,33 @@ pub(crate) enum NodeOp {
     /// before exits that need the frame current).
     StoreSlot(u16),
 
+    // Elements (P3 stage 2 step 2): Maglev's element access (TryBuildElementAccess,
+    // maglev-graph-builder.cc:5496-5624) on TRust's element words, which are SpiderMonkey's
+    // ObjectElements (word_block.rs): bounds on the used (initialized) length, a hole test per
+    // element, each word checked at its use, as Warp loads dense elements.
+    /// (Cell): the object's elements are of the kind [WrongElements] (the templates' kind-tag and
+    /// IC_PLAIN test; Maglev's CheckMaps). Its proof is a value fact (ElemKind).
+    CheckElements(ElemKind),
+    /// Cell -> Ptr: the object's element words, its map's pointer, which is never null (an
+    /// object without elements points past the static empty block, whose used length is 0).
+    LoadElements,
+    /// Ptr -> I32: the words' used length (the header's first u32).
+    LoadElementsUsed,
+    /// F64 -> I32: an element index, an exact integer in the int32 range with -0 taken as 0
+    /// (Warp's GuardToInt32Index: "ToPropertyKey(-0) is "0""), [NotInt32] otherwise.
+    CheckIndex,
+    /// (I32 index, I32 length): index < length, unsigned, so that a negative index fails too
+    /// [OutOfBounds] (Maglev's CheckInt32Condition(kUnsignedLessThan)).
+    CheckBounds,
+    /// (Cell, Ptr, I32 index) -> Tagged: the word at an index below the used length, its hole as
+    /// `Holes` says [Hole]. The cell keeps the words alive while their address is used.
+    LoadElement(Holes),
+    /// (Cell, Ptr, I32 index, I32 used) -> Tagged: a read whose record saw indices past the used
+    /// length (Maglev's Select under kHandleOOB, maglev-graph-builder.cc:5274-5286; Warp's
+    /// LoadDenseElementHoleResult): below used, LoadElement(Undefined); at or past it, undefined
+    /// under the same proof, a negative index exiting [OutOfBounds] (Warp's negative-index bail).
+    LoadElementOrUndefined,
+
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's
     /// body (after its phis), where the first stage polls at a backward branch's target. Its
@@ -319,6 +366,11 @@ impl NodeOp {
                 | NodeOp::Poll
                 | NodeOp::Effect { .. }
                 | NodeOp::Exit(_)
+                | NodeOp::CheckElements(_)
+                | NodeOp::CheckIndex
+                | NodeOp::CheckBounds
+                | NodeOp::LoadElement(_)
+                | NodeOp::LoadElementOrUndefined
         )
     }
 

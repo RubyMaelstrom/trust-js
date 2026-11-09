@@ -116,11 +116,6 @@ impl Snapshot {
     /// The element record of an element load or store (P3 stage 2 step 2): a transformed chunk's
     /// is its baseline site's, as values() reads it. An update of an element (UpdateElem) has a
     /// value record instead (feedback-schema.txt 5.2).
-    // The element loads read it first (step 2's (b)).
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the element loads read it (step 2's (b))")
-    )]
     pub(crate) fn element(&self, pc: usize) -> Option<crate::feedback::ElementView> {
         match self.site(pc) {
             SiteView::Element(element) => Some(element),

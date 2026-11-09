@@ -1428,3 +1428,228 @@ fn the_snapshot_reads_element_records() {
     let ret = pc_of(&chunk, |op| matches!(op, Op::Return));
     assert!(snapshot.element(ret).is_none());
 }
+
+/// The VM's engine after `source`: its element records hold what every access saw.
+fn vm_engine(source: &str) -> Engine {
+    let mut engine = engine(Tier::Bytecode);
+    eval(&mut engine, source);
+    engine
+}
+
+#[test]
+fn element_loads_check_the_receiver_and_the_bounds_and_load_the_word() {
+    let mut engine = vm_engine(
+        "function get(a, i) { return a[i]; }
+         for (var k = 0; k < 20; k++) get([1, 2, 3], k % 3);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "get");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    let pc = pc_of(&chunk, |op| matches!(op, Op::GetElemLocal(_)));
+    for (op, reason) in [
+        (NodeOp::CheckObject, ExitReason::NotObject),
+        (
+            NodeOp::CheckElements(ElemKind::Array),
+            ExitReason::WrongElements,
+        ),
+        (NodeOp::CheckNumber, ExitReason::NotNumber),
+        (NodeOp::CheckIndex, ExitReason::NotInt32),
+        (NodeOp::CheckBounds, ExitReason::OutOfBounds),
+        (NodeOp::LoadElement(Holes::Exit), ExitReason::Hole),
+    ] {
+        let found = nodes(&graph, |candidate| *candidate == op);
+        assert_eq!(found.len(), 1, "{op:?}: {text}");
+        assert_eq!(found[0].reason, Some(reason), "{text}");
+        // Every check exits before the load, with its operand (the key) on the stack.
+        let state = graph.state(found[0].state.expect("a check has a state"));
+        assert_eq!((state.pc as usize, state.stack.len()), (pc, 1), "{text}");
+    }
+    assert_eq!(count(&graph, |op| *op == NodeOp::LoadElements), 1, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::LoadElementsUsed),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
+fn an_element_records_facts_choose_what_holes_and_reads_past_used_do() {
+    let mut engine = vm_engine(
+        "function dense(a, i) { return a[i]; } function holey(a, i) { return a[i]; }
+         function past(a, i) { return a[i]; } function mixed(o, i) { return o[i]; }
+         var h = [1, , 3];
+         for (var k = 0; k < 20; k++) {
+           dense([1, 2], 1); holey(h, k % 3); past([1, 2], k % 4); mixed(k % 2 ? [1] : {0: 1}, 0);
+         }",
+    );
+    let shapes = [
+        ("dense", Some(NodeOp::LoadElement(Holes::Exit)), true),
+        ("holey", Some(NodeOp::LoadElement(Holes::Undefined)), true),
+        ("past", Some(NodeOp::LoadElementOrUndefined), false),
+        ("mixed", Some(NodeOp::LoadElement(Holes::Exit)), true),
+    ];
+    for (name, load, bounds) in shapes {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        if let Some(load) = load {
+            assert_eq!(count(&graph, |op| *op == load), 1, "{name}: {text}");
+        }
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::CheckBounds),
+            usize::from(bounds),
+            "{name}: {text}"
+        );
+    }
+    // Ordinary objects among the receivers: element words of either kind.
+    let (chunk, graph) = graph_of(&mut engine, "mixed");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckElements(ElemKind::Words)),
+        1,
+        "{text}"
+    );
+    let past = nodes(&graph, |op| *op == NodeOp::LoadElementOrUndefined);
+    assert!(past.is_empty(), "{text}");
+}
+
+#[test]
+fn elements_and_reads_last_an_effect_epoch_and_kinds_outlive_it() {
+    // `s + 'x'` is the generic Add (its record saw Strings), an effect with no cache, which the
+    // VM's runs give the evidence a call site's would lack (the VM fills no call cache).
+    let mut engine = vm_engine(
+        "function twice(a, i) { return a[i] + a[i] + a[i + 1]; }
+         function around(a, i, s) { var x = a[i]; s = s + 'x'; return x + a[i]; }
+         for (var k = 0; k < 20; k++) { twice([1, 2, 3], 1); around([1, 2], 0, 's'); }",
+    );
+    // One read of a[i], one of a[i + 1]; the words and their used length once.
+    let (chunk, graph) = graph_of(&mut engine, "twice");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    let loads = count(&graph, |op| matches!(op, NodeOp::LoadElement(_)));
+    assert_eq!(loads, 2, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::LoadElements), 1, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::LoadElementsUsed),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckElements(_))),
+        1,
+        "{text}"
+    );
+    // After the effect the words and the element are read again; `a` is reloaded from its slot,
+    // so its checks run again too.
+    let (chunk, graph) = graph_of(&mut engine, "around");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 1, "the Add: {text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::LoadElements), 2, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadElement(_))),
+        2,
+        "{text}"
+    );
+}
+
+#[test]
+fn element_keys_take_their_int32_form_or_a_checked_index() {
+    let mut engine = vm_engine(
+        "function at(a, i) { var j = i | 0; return a[j] + a[0]; }
+         function half(a, x) { return a[x / 2]; }
+         for (var k = 0; k < 20; k++) { at([1, 2], 1); half([1, 2], 2); }",
+    );
+    // `i | 0` is an int32 already, and the constant folds.
+    let (chunk, graph) = graph_of(&mut engine, "at");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckIndex), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadElement(_))),
+        2,
+        "{text}"
+    );
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| node.op == NodeOp::ConstI32(0)));
+    // A quotient is an f64: the index is its CheckIndex.
+    let (chunk, graph) = graph_of(&mut engine, "half");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    let index = nodes(&graph, |op| *op == NodeOp::CheckIndex);
+    assert_eq!(index.len(), 1, "{text}");
+    assert_eq!(graph.node(index[0].inputs[0]).op, NodeOp::F64Div, "{text}");
+}
+
+#[test]
+fn compound_element_assignment_takes_its_number_key_as_it_is() {
+    let mut engine = vm_engine(
+        "function add(a, i, v) { a[i] += v; return a; }
+         function addo(o, i, v) { o.a[i] |= v; return o; }
+         function named(o, k) { o[k] += 1; return o; }
+         for (var k = 0; k < 20; k++) {
+           add([1, 2], 1, 3); addo({a: [1, 2]}, 0, 4); named({x: 1}, 'x');
+         }",
+    );
+    for name in ["add", "addo"] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        let to_key = pc_of(&chunk, |op| {
+            matches!(op, Op::ToPropKey | Op::ToPropKeyLocal(_))
+        });
+        assert!(
+            nodes(&graph, is_effect)
+                .iter()
+                .all(|node| node.pc as usize != to_key),
+            "{name}: {text}"
+        );
+        // The base is checked an object at ToPropKey's pc, whose throw the VM then makes.
+        let check = nodes(&graph, |op| *op == NodeOp::CheckObject);
+        assert_eq!(check.len(), 1, "{name}: {text}");
+        let state = graph.state(check[0].state.expect("a check has a state"));
+        assert_eq!(state.pc as usize, to_key, "{name}: {text}");
+        let load = pc_of(&chunk, |op| matches!(op, Op::GetElem | Op::GetElemLocal(_)));
+        assert!(
+            nodes(&graph, is_effect)
+                .iter()
+                .all(|node| node.pc as usize != load),
+            "{name}: {text}"
+        );
+    }
+    // A String key: the site is generic, and ToPropKey stays the operation.
+    let (chunk, graph) = graph_of(&mut engine, "named");
+    let text = dump(&graph, &chunk);
+    let to_key = pc_of(&chunk, |op| {
+        matches!(op, Op::ToPropKey | Op::ToPropKeyLocal(_))
+    });
+    assert!(
+        nodes(&graph, is_effect)
+            .iter()
+            .any(|node| node.pc as usize == to_key),
+        "{text}"
+    );
+}
+
+#[test]
+fn element_sites_the_words_do_not_serve_stay_effects() {
+    let mut engine = vm_engine(
+        "function str(s, i) { return s[i]; } function typed(t, i) { return t[i]; }
+         function args(x, i) { return x[i]; } function generic(o, k) { return o[k]; }
+         function argsof() { return arguments; } var u8 = new Uint8Array(4);
+         var list = argsof(1, 2);
+         for (var k = 0; k < 20; k++) {
+           str('abc', 1); typed(u8, 1); args(list, 1); generic({a: 1}, 'a');
+         }",
+    );
+    for name in ["str", "typed", "args", "generic"] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(
+            count(&graph, |op| matches!(op, NodeOp::LoadElement(_))),
+            0,
+            "{name}: {text}"
+        );
+        assert!(count(&graph, is_effect) >= 1, "{name}: {text}");
+    }
+}

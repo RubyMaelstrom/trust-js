@@ -48,6 +48,7 @@ use super::ir::{
     BlockData, BlockIx, Cond, Decline, ExitReason, FrameState, Graph, NodeIx, NodeOp, Refusal, Rep,
     SlotSource, StateIx,
 };
+use super::ir::{ElemKind, Holes};
 use super::snapshot::{Ran, Snapshot};
 use crate::bytecode::{Chunk, Op, UpdKind};
 use crate::fasthash::FastMap;
@@ -552,12 +553,35 @@ struct State {
     shapes: FastMap<NodeIx, Vec<u32>>,
     /// ...and the word at a location of an object word, loaded or stored.
     fields: FastMap<(NodeIx, u16), NodeIx>,
+    /// The elements kind an object word is proven to have (P3 stage 2 step 2): a value fact,
+    /// since kind tags and IC_PLAIN never change once JavaScript sees an object (ElemKind).
+    kinds: FastMap<NodeIx, ElemKind>,
+    /// The element index of a Number value (its CheckIndex), which is no form of it: it takes
+    /// -0 to index 0.
+    indices: FastMap<NodeIx, NodeIx>,
+    /// Element heap facts of the current effect epoch: an object word's element words...
+    elements: FastMap<NodeIx, NodeIx>,
+    /// ...their used length...
+    used: FastMap<NodeIx, NodeIx>,
+    /// ...the element read or written at an index of them...
+    loaded: FastMap<(NodeIx, NodeIx), NodeIx>,
+    /// ...and the indices below their used length whose word a load or store proved no hole.
+    present: crate::fasthash::FastSet<(NodeIx, NodeIx)>,
 }
 
 impl State {
     fn clear_heap(&mut self) {
         self.shapes.clear();
         self.fields.clear();
+        self.clear_elements();
+    }
+
+    /// End the element heap facts (an effect, which may run any code).
+    fn clear_elements(&mut self) {
+        self.elements.clear();
+        self.used.clear();
+        self.loaded.clear();
+        self.present.clear();
     }
 
     /// Whether a handler record of a `for…of` body is active (a return there is routed through
@@ -632,6 +656,58 @@ fn meet(preds: &[(BlockIx, State)]) -> State {
         truncated,
         shapes,
         fields,
+        ..meet_elements(first, rest)
+    }
+}
+
+/// The element facts every predecessor's state holds (P3 stage 2 step 2): a kind each proves,
+/// the weaker where they differ (an Array proves its words), and the indices and heap facts all
+/// hold alike.
+fn meet_elements(first: &State, rest: &[(BlockIx, State)]) -> State {
+    fn alike<K: Copy + Eq + std::hash::Hash, V: Copy + Eq>(
+        first: &FastMap<K, V>,
+        rest: &[(BlockIx, State)],
+        of: impl Fn(&State) -> &FastMap<K, V>,
+    ) -> FastMap<K, V> {
+        first
+            .iter()
+            .filter(|(key, value)| {
+                rest.iter()
+                    .all(|(_, state)| of(state).get(key) == Some(value))
+            })
+            .map(|(&key, &value)| (key, value))
+            .collect()
+    }
+    let kinds = first
+        .kinds
+        .iter()
+        .filter_map(|(&word, &kind)| {
+            let mut met = kind;
+            for (_, state) in rest {
+                let other = *state.kinds.get(&word)?;
+                if !other.proves(met) {
+                    met = if met.proves(other) {
+                        other
+                    } else {
+                        return None;
+                    };
+                }
+            }
+            Some((word, met))
+        })
+        .collect();
+    State {
+        kinds,
+        indices: alike(&first.indices, rest, |state| &state.indices),
+        elements: alike(&first.elements, rest, |state| &state.elements),
+        used: alike(&first.used, rest, |state| &state.used),
+        loaded: alike(&first.loaded, rest, |state| &state.loaded),
+        present: first
+            .present
+            .iter()
+            .filter(|site| rest.iter().all(|(_, state)| state.present.contains(site)))
+            .copied()
+            .collect(),
         ..State::default()
     }
 }
@@ -1282,6 +1358,18 @@ impl<'a> Builder<'a> {
             .retain(|value, _| live.contains(value) || forms.contains_key(value));
         st.shapes.retain(|word, _| live.contains(word));
         st.fields.retain(|(word, _), _| live.contains(word));
+        // Element facts (P3 stage 2 step 2): a kind or an element address is an object word's,
+        // and an index a Number's (reached through its value's forms, as a truncation is); a
+        // used length and the element facts are an address's.
+        st.kinds.retain(|word, _| live.contains(word));
+        let forms = &st.forms;
+        st.indices
+            .retain(|value, _| live.contains(value) || forms.contains_key(value));
+        st.elements.retain(|word, _| live.contains(word));
+        let addresses: crate::fasthash::FastSet<NodeIx> = st.elements.values().copied().collect();
+        st.used.retain(|words, _| addresses.contains(words));
+        st.loaded.retain(|(words, _), _| addresses.contains(words));
+        st.present.retain(|(words, _)| addresses.contains(words));
     }
 
     // ---- control flow --------------------------------------------------------------------------
@@ -1514,6 +1602,8 @@ impl<'a> Builder<'a> {
             forms: met.forms,
             truth: met.truth,
             truncated: met.truncated,
+            kinds: met.kinds,
+            indices: met.indices,
             ..State::default()
         };
         let poll = self.frame_state(pc, &st);
@@ -1713,6 +1803,16 @@ impl<'a> Builder<'a> {
             Op::SetPropLocalDrop(slot, name, _) => {
                 let slot = self.slot(pc, slot as usize)?;
                 self.named_store(pc, name, Recv::Slot(slot), false, st)?
+            }
+            Op::GetElem => self.element_load(pc, Recv::Stack, st)?,
+            Op::GetElemLocal(slot) => {
+                let slot = self.slot(pc, slot as usize)?;
+                self.element_load(pc, Recv::Slot(slot), st)?
+            }
+            Op::ToPropKey => self.to_prop_key(pc, Recv::Stack, st)?,
+            Op::ToPropKeyLocal(slot) => {
+                let slot = self.slot(pc, slot as usize)?;
+                self.to_prop_key(pc, Recv::Slot(slot), st)?
             }
             Op::Jump(target) => {
                 self.jump(pc, target as usize, std::mem::take(st))?;
@@ -2341,5 +2441,340 @@ impl<'a> Builder<'a> {
     ) -> Result<NodeIx, Refusal> {
         let inputs = self.guard_inputs(pc, target, st)?;
         Ok(self.add(NodeOp::CalleeMatches { target }, &inputs, Rep::Bool, pc))
+    }
+}
+
+/// What an element load does with a hole and with an index past the used words, by its record's
+/// facts (P3 stage 2 step 2). Only the first stage's helpers take either there, and they record
+/// it, so a fact's absence is evidence as of the snapshot (an Array's facts; an ordinary object's
+/// record holds none).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reads {
+    /// Neither seen: a hole exits [Hole], an index past used [OutOfBounds].
+    InBounds,
+    /// Holes seen (HOLEY): a hole reads undefined under the prototype proof.
+    Holes,
+    /// Reads past the used words seen (OUT_OF_BOUNDS): those and holes read undefined under the
+    /// proof.
+    PastUsed,
+}
+
+/// An element site lowered on element words, as its record chooses (Maglev's
+/// TryBuildElementAccess chooses from its feedback, maglev-graph-builder.cc:5496-5624): the
+/// receivers' check, and what a load does with holes.
+#[derive(Clone, Copy, Debug)]
+struct ElemSite {
+    /// Array where the receivers were Arrays only, Words where ordinary objects were among them.
+    kind: ElemKind,
+    reads: Reads,
+}
+
+/// The element index a constant key names: an int32 Number, -0 being index 0.
+fn const_index(word: u64) -> Option<i32> {
+    let x = number_word(word)?;
+    if x == 0.0 {
+        Some(0)
+    } else {
+        exact_i32(x)
+    }
+}
+
+/// Element accesses (P3 stage 2 step 2; the plan's Stage 2 record, "Step 2"): Maglev's element
+/// access built from the snapshot on TRust's element words, which are SpiderMonkey's
+/// ObjectElements, so with Warp's choices where Maglev's rest on V8's elements kinds.
+impl Builder<'_> {
+    /// The element site at `pc` lowered on element words, or None for the generic access (an
+    /// effect): a generic mark, a key that is no index, or receivers by rule R (the record's where
+    /// it holds any, else the in-line set's) other than Arrays and ordinary objects.
+    fn element_site(&self, pc: usize) -> Option<ElemSite> {
+        use crate::feedback::{
+            ELEM_ARRAY, ELEM_HOLEY, ELEM_KEY_INDEX, ELEM_ORDINARY, ELEM_OUT_OF_BOUNDS,
+            ELEM_TYPED_ARRAY,
+        };
+        let view = self.snapshot.element(pc)?;
+        if view.generic || view.recorded_keys & !ELEM_KEY_INDEX != 0 {
+            return None;
+        }
+        let receivers = if view.recorded_receivers != 0 {
+            view.recorded_receivers
+        } else {
+            ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY
+        };
+        let kind = if receivers == ELEM_ARRAY {
+            ElemKind::Array
+        } else if receivers == ELEM_ORDINARY || receivers == ELEM_ARRAY | ELEM_ORDINARY {
+            ElemKind::Words
+        } else {
+            return None;
+        };
+        let reads = if view.facts & ELEM_OUT_OF_BOUNDS != 0 {
+            Reads::PastUsed
+        } else if view.facts & ELEM_HOLEY != 0 {
+            Reads::Holes
+        } else {
+            Reads::InBounds
+        };
+        Some(ElemSite { kind, reads })
+    }
+
+    /// Whether a lowered element access can take `receiver` and `key`: a word that may be an
+    /// object (no constant, no unboxed value), and a key that may be an index (a Number value, or
+    /// a constant one).
+    fn element_operands(&self, receiver: NodeIx, key: NodeIx) -> bool {
+        self.rep(receiver) == Rep::Tagged
+            && self.constant(receiver).is_none()
+            && match self.constant(key) {
+                Some(word) => const_index(word).is_some(),
+                None => matches!(self.rep(key), Rep::Tagged | Rep::F64 | Rep::I32),
+            }
+    }
+
+    /// The cell of the object `word` names, with elements of `kind`: CheckObject [NotObject] and
+    /// CheckElements [WrongElements] unless the value facts prove them (a CheckShape this epoch
+    /// proves an ordinary kind with IC_PLAIN set, element words).
+    fn elements_cell(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        kind: ElemKind,
+    ) -> NodeIx {
+        let pc = cx.pc;
+        let cell = match self.forms(st, word).cell {
+            Some(cell) => cell,
+            None => {
+                let state = self.before(cx, st);
+                let cell = self.add_exit(
+                    NodeOp::CheckObject,
+                    &[word],
+                    Rep::Cell,
+                    pc,
+                    state,
+                    ExitReason::NotObject,
+                );
+                self.relate(st, word, cell);
+                cell
+            }
+        };
+        let proven = st.kinds.get(&word).is_some_and(|known| known.proves(kind))
+            || (kind == ElemKind::Words && st.shapes.contains_key(&word));
+        if !proven {
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::CheckElements(kind),
+                &[cell],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::WrongElements,
+            );
+            st.kinds.insert(word, kind);
+        }
+        cell
+    }
+
+    /// The element index `key` names, an int32: an int32 form as it is, a constant folded, an
+    /// f64 or a word checked a Number converted by CheckIndex [NotInt32], which takes -0 to index
+    /// 0 as Warp's GuardToInt32Index does (WarpCacheIRTranspiler.cpp:1572-1583); cached per value
+    /// beside the forms, as truncations are. `key` passed `element_operands`.
+    fn element_index(&mut self, st: &mut State, cx: &mut Before, key: NodeIx) -> NodeIx {
+        if let Some(int) = self.forms(st, key).i32 {
+            return int;
+        }
+        if let Some(index) = self.constant(key).and_then(const_index) {
+            return self.hoist(Hoisted::I32(index));
+        }
+        let number = match self.rep(key) {
+            Rep::Tagged => self
+                .number(st, cx, key)
+                .expect("a word that is no constant may be a Number"),
+            _ => key,
+        };
+        if let Some(int) = self.forms(st, number).i32 {
+            return int;
+        }
+        if let Some(&int) = st.indices.get(&number) {
+            return int;
+        }
+        let state = self.before(cx, st);
+        let int = self.add_exit(
+            NodeOp::CheckIndex,
+            &[number],
+            Rep::I32,
+            cx.pc,
+            state,
+            ExitReason::NotInt32,
+        );
+        st.indices.insert(number, int);
+        int
+    }
+
+    /// The element words of the object `word` names (its cell `cell`), loaded once per effect
+    /// epoch: Maglev's BuildLoadElements, a known property until a store kills it
+    /// (maglev-reducer-inl.h:1251-1275).
+    fn elements_of(&mut self, st: &mut State, word: NodeIx, cell: NodeIx, pc: usize) -> NodeIx {
+        if let Some(&words) = st.elements.get(&word) {
+            return words;
+        }
+        let words = self.add(NodeOp::LoadElements, &[cell], Rep::Ptr, pc);
+        st.elements.insert(word, words);
+        words
+    }
+
+    /// The used length of the element words at `words`, loaded once per effect epoch.
+    fn used_of(&mut self, st: &mut State, words: NodeIx, pc: usize) -> NodeIx {
+        if let Some(&used) = st.used.get(&words) {
+            return used;
+        }
+        let used = self.add(NodeOp::LoadElementsUsed, &[words], Rep::I32, pc);
+        st.used.insert(words, used);
+        used
+    }
+
+    /// The element at `index` of the object `word` names (its cell `cell`, whose elements kind
+    /// is proven), read once per effect epoch, with the bounds check and the hole handling that
+    /// `reads` says.
+    fn element_read(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        index: NodeIx,
+        reads: Reads,
+    ) -> NodeIx {
+        let pc = cx.pc;
+        let words = self.elements_of(st, word, cell, pc);
+        if let Some(&value) = st.loaded.get(&(words, index)) {
+            return value;
+        }
+        let value = if st.present.contains(&(words, index)) {
+            // In bounds and no hole, as a load or a store this epoch proved.
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::LoadElement(Holes::Exit),
+                &[cell, words, index],
+                Rep::Tagged,
+                pc,
+                state,
+                ExitReason::Hole,
+            )
+        } else if reads == Reads::PastUsed {
+            let used = self.used_of(st, words, pc);
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::LoadElementOrUndefined,
+                &[cell, words, index, used],
+                Rep::Tagged,
+                pc,
+                state,
+                ExitReason::OutOfBounds,
+            )
+        } else {
+            let used = self.used_of(st, words, pc);
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::CheckBounds,
+                &[index, used],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::OutOfBounds,
+            );
+            let holes = if reads == Reads::Holes {
+                Holes::Undefined
+            } else {
+                Holes::Exit
+            };
+            let value = self.add_exit(
+                NodeOp::LoadElement(holes),
+                &[cell, words, index],
+                Rep::Tagged,
+                pc,
+                state,
+                ExitReason::Hole,
+            );
+            if holes == Holes::Exit {
+                st.present.insert((words, index));
+            }
+            value
+        };
+        st.loaded.insert((words, index), value);
+        value
+    }
+
+    /// GetElem and GetElemLocal on element words (Maglev's element load on a JSArray or JSObject,
+    /// maglev-graph-builder.cc:5213-5290, as Warp loads dense elements, WarpCacheIRTranspiler.cpp:
+    /// 2339-2381): the receiver's kind checked unless proven, its words and their used length
+    /// loaded once per effect epoch, the key as an int32 index, an unsigned bounds check and the
+    /// word with its hole test. The word is checked at each use, as Warp unboxes it per use.
+    fn element_load(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
+        let Some(site) = self.element_site(pc) else {
+            return self.effect(pc, st);
+        };
+        let len = st.stack.len();
+        let key = st.stack[len - 1];
+        let receiver = self.receiver(recv, st, 1, pc);
+        if !self.element_operands(receiver, key) {
+            return self.effect(pc, st);
+        }
+        let mut cx = Before::new(pc);
+        let cell = self.elements_cell(st, &mut cx, receiver, site.kind);
+        let index = self.element_index(st, &mut cx, key);
+        let value = self.element_read(st, &mut cx, receiver, cell, index, site.reads);
+        let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
+        st.stack.truncate(len - pops);
+        st.stack.push(value);
+        Ok(())
+    }
+
+    /// ToPropKey and ToPropKeyLocal (`a[k] op= v`): nothing for a Number key over an object, as
+    /// the template passes a Number on (jit_operations.rs): the base checked an object
+    /// [NotObject], since the operation throws for undefined and null, which the VM then does at
+    /// this pc, and the key a proven Number, or a word checked one [NotNumber] where the element
+    /// load that follows is lowered (its record saw index keys only). Anything else is the
+    /// operation, an effect.
+    fn to_prop_key(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
+        let len = st.stack.len();
+        let key = st.stack[len - 1];
+        let base = self.receiver(recv, st, 1, pc);
+        let proven = self.known_number(st, key);
+        let checked = !proven && self.rep(key) == Rep::Tagged && self.constant(key).is_none();
+        if self.rep(base) != Rep::Tagged
+            || self.constant(base).is_some()
+            || !(proven || checked)
+            || !self.lowered_load_follows(pc)
+        {
+            return self.effect(pc, st);
+        }
+        let mut cx = Before::new(pc);
+        if self.forms(st, base).cell.is_none() {
+            let state = self.before(&mut cx, st);
+            let cell = self.add_exit(
+                NodeOp::CheckObject,
+                &[base],
+                Rep::Cell,
+                pc,
+                state,
+                ExitReason::NotObject,
+            );
+            self.relate(st, base, cell);
+        }
+        if checked {
+            self.number(st, &mut cx, key);
+        }
+        Ok(())
+    }
+
+    /// Whether the first element load after `pc` in its block (a compound assignment's GetElem)
+    /// is lowered on element words.
+    fn lowered_load_follows(&self, pc: usize) -> bool {
+        let Some(block) = self.cfg.block_at(pc) else {
+            return false;
+        };
+        let end = self.cfg.blocks()[ix(block)].end;
+        (pc + 1..end)
+            .find(|&next| matches!(self.ops[next], Op::GetElem | Op::GetElemLocal(_)))
+            .is_some_and(|next| self.element_site(next).is_some())
     }
 }

@@ -3798,6 +3798,13 @@ mod asm {
         pub fn str_d_lsl3(&mut self, rt: u32, rn: u32, rm: u32) {
             self.emit_fp(0xFC20_7800 | (rm << 16) | (rn << 5) | rt);
         }
+        /// The optimizing tier's element accesses (P3 stage 2 step 2) index with a w register,
+        /// zero-extended and scaled (`uxtw`): an int32 value's register guarantees only its low
+        /// 32 bits (opt/a64.rs), which the bounds check compared.
+        /// ldr xt, [xn, wm, uxtw #3]
+        pub fn ldr_x_uxtw3(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0xF860_5800 | (rm << 16) | (rn << 5) | rt);
+        }
         /// adds wd, wn, #imm (sets flags; V on i32 overflow; any immediate, see `flags`)
         #[inline]
         pub fn adds_imm_w(&mut self, rd: u32, rn: u32, imm: u32) {

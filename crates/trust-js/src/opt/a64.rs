@@ -40,6 +40,7 @@ use crate::opt::regalloc::{self, Allocation, Home};
 // Condition codes.
 const EQ: u32 = 0;
 const NE: u32 = 1;
+const HS: u32 = 2;
 const LO: u32 = 3;
 const MI: u32 = 4;
 const VS: u32 = 6;
@@ -110,6 +111,11 @@ pub(crate) fn compile_with(
     let cfg = crate::jit_ir::Cfg::build(chunk)
         .map_err(|_| Refusal::whole("the chunk's stack depths do not settle"))?;
     check_graph(chunk, graph, &cfg)?;
+    if !words_inlinable(layout) && graph.nodes.iter().any(|node| reads_words(&node.op)) {
+        return Err(Refusal::whole(
+            "element words in a layout the code cannot address",
+        ));
+    }
     let alloc = regalloc::allocate(graph, &regalloc::ARM64)?;
     let frame = entry_frame(&alloc)?;
     let mut gen = Gen::new(chunk, graph, alloc, layout, ilayout, cfg, options, frame);
@@ -242,6 +248,18 @@ fn check_graph(chunk: &Chunk, graph: &Graph, cfg: &crate::jit_ir::Cfg) -> Result
     Ok(())
 }
 
+/// Whether a node addresses element words or their header, whose offsets the layout must let
+/// the code reach (`words_inlinable`, the element templates' gate).
+fn reads_words(op: &NodeOp) -> bool {
+    matches!(
+        op,
+        NodeOp::LoadElements
+            | NodeOp::LoadElementsUsed
+            | NodeOp::LoadElement(_)
+            | NodeOp::LoadElementOrUndefined
+    )
+}
+
 /// Whether an operation can run as an effect: its baseline template, or `jit_exec`, runs it on
 /// the canonical frame at its pc (contracts 4.2). Control flow cannot.
 fn effect_supported(op: &Op) -> bool {
@@ -341,6 +359,18 @@ enum Cold {
         label: usize,
         from: BlockIx,
         to: BlockIx,
+    },
+    /// An element read's hole or index past the used words (P3 stage 2 step 2): undefined into
+    /// `dst` where no element can come from the prototype chain of `node`'s receiver
+    /// (`emit_no_inherited_elements`), else `exit`; with `negative`, a negative index in its w
+    /// register takes its exit first.
+    ElementUndefined {
+        label: usize,
+        node: NodeIx,
+        dst: u32,
+        resume: usize,
+        exit: usize,
+        negative: Option<(u32, usize)>,
     },
     /// A branch to a label (an effect's throw into its exit).
     Jump { label: usize, target: usize },
@@ -594,6 +624,15 @@ extern "C" fn f64_remainder(dividend: f64, divisor: f64) -> f64 {
     dividend % divisor
 }
 
+/// The elements protector's proof at the live prototype epoch (`emit_no_inherited_elements`, P3
+/// stage 2 step 2): `Interp::array_prototypes_unshadowed`, which renews a lapsed proof as the
+/// VM's Rust callers renew it (a realm switch or a marked prototype's change lapses it). It runs
+/// no JavaScript, allocates nothing in the heap and does not collect.
+unsafe extern "C" fn renew_elements_protector(ctx: *mut JitCtx) -> u64 {
+    let i = unsafe { &*(*ctx).interp };
+    u64::from(i.array_prototypes_unshadowed())
+}
+
 /// The exit reason a check reports when its node names none.
 fn default_reason(op: &NodeOp) -> ExitReason {
     match op {
@@ -604,6 +643,10 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::I32Add | NodeOp::I32Sub | NodeOp::I32Mul | NodeOp::I32UShr => ExitReason::Overflow,
+        NodeOp::CheckElements(_) => ExitReason::WrongElements,
+        NodeOp::CheckIndex => ExitReason::NotInt32,
+        NodeOp::CheckBounds | NodeOp::LoadElementOrUndefined => ExitReason::OutOfBounds,
+        NodeOp::LoadElement(_) => ExitReason::Hole,
         NodeOp::Exit(reason) => *reason,
         _ => ExitReason::Forced,
     }
@@ -1298,6 +1341,63 @@ impl Gen<'_> {
                 let value = self.boxed(input(0), X16);
                 self.a.str_imm(value, 22, u32::from(*slot) * 8);
             }
+            NodeOp::CheckElements(kind) => {
+                let site = self.check_exit(n)?;
+                let cell = self.gp(input(0), X16);
+                let layout = self.layout;
+                // The kind tag, then IC_PLAIN, as the element templates test a receiver
+                // (`emit_get_elem_inline`): an ordinary kind's or the Array's tag, whose tag
+                // follows them, and no side-table internal method.
+                self.a
+                    .ldrb_imm(X17, cell, (layout.obj_from_cell + layout.obj_kind) as u32);
+                self.a.cmp_imm_w(X17, crate::value::KIND_ARRAY_TAG as u32);
+                let other = if *kind == ElemKind::Array { NE } else { HI };
+                self.a.b_cond(other, site);
+                self.a
+                    .ldrb_imm(X17, cell, (layout.obj_from_cell + layout.obj_flags) as u32);
+                self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
+            }
+            NodeOp::LoadElements => {
+                if !unused {
+                    // The words pointer, never null (`emit_words_base`).
+                    let cell = self.gp(input(0), X16);
+                    let dst = self.gp_dst(n);
+                    let layout = self.layout;
+                    let words = layout.obj_from_cell + layout.obj_props + layout.props_words;
+                    self.a.ldr_imm(dst, cell, words as u32);
+                    self.gp_done(n, dst);
+                }
+            }
+            NodeOp::LoadElementsUsed => {
+                if !unused {
+                    let words = self.gp(input(0), X16);
+                    let dst = self.gp_dst(n);
+                    self.a.ldur_w(dst, words, -(self.layout.words_used as i32));
+                    self.gp_done(n, dst);
+                }
+            }
+            NodeOp::CheckIndex => {
+                let site = self.check_exit(n)?;
+                let d = self.fp(input(0), D31);
+                let w = self.gp_dst(n);
+                // An exact int32 converts back to itself, -0 to +0, which compares equal to it
+                // (the index -0 names is 0), and NaN compares unordered.
+                self.a.fcvtzs_w_d(w, d);
+                self.a.scvtf_d_w(D30, w);
+                self.a.fcmp(D30, d);
+                self.a.b_cond(NE, site);
+                self.gp_done(n, w);
+            }
+            NodeOp::CheckBounds => {
+                let site = self.check_exit(n)?;
+                let index = self.gp(input(0), X16);
+                let length = self.gp(input(1), X17);
+                // Unsigned: a negative index is past every length.
+                self.a.cmp_reg_w(index, length);
+                self.a.b_cond(HS, site);
+            }
+            NodeOp::LoadElement(holes) => self.lower_load_element(n, *holes)?,
+            NodeOp::LoadElementOrUndefined => self.lower_load_element_or_undefined(n)?,
             NodeOp::Poll => {
                 let slow = self.a.new_label();
                 let resume = self.a.new_label();
@@ -1686,6 +1786,23 @@ impl Gen<'_> {
                     self.a.bind(label);
                     self.a.b(target);
                 }
+                Cold::ElementUndefined {
+                    label,
+                    node,
+                    dst,
+                    resume,
+                    exit,
+                    negative,
+                } => {
+                    self.a.bind(label);
+                    if let Some((index, negative_exit)) = negative {
+                        // A negative index names a String key ("-1"), never an element.
+                        self.a.tbnz(index, 31, negative_exit);
+                    }
+                    self.emit_no_inherited_elements(node, false, exit);
+                    self.a.mov_imm64(dst, crate::value::PACK_UNDEFINED);
+                    self.a.b(resume);
+                }
                 Cold::Edge { label, from, to } => {
                     self.a.bind(label);
                     self.emit_moves(from, to)?;
@@ -1892,6 +2009,152 @@ impl Gen<'_> {
         a.ldr_imm(20, 19, std::mem::offset_of!(JitCtx, stack_base) as u32);
         a.cbz(0, false, self.l_ret_throw);
         a.b(self.l_ret_ok);
+    }
+}
+
+/// Element accesses (P3 stage 2 step 2): Maglev's element nodes on TRust's element words (ir.rs).
+impl Gen<'_> {
+    /// A further exit of `n`'s frame state, with `reason`: a node one of whose paths fails for
+    /// another reason than its own (an element read past the used words beside its hole path).
+    fn exit_for(&mut self, n: NodeIx, reason: ExitReason) -> Result<usize, Refusal> {
+        let site = self.exit(n, ExitKind::Check)?;
+        if let Some((_, _, record)) = self.exits.last_mut() {
+            record.reason = reason;
+        }
+        Ok(site)
+    }
+
+    /// LoadElement: the word at the index (below the used length, as a check proved), the index
+    /// register zero-extended (`uxtw`: an int32's register guarantees its low 32 bits only); a
+    /// hole exits, or reads undefined where the cold path proves no element can come from the
+    /// prototype chain.
+    fn lower_load_element(&mut self, n: NodeIx, holes: Holes) -> Result<(), Refusal> {
+        let node = self.graph.node(n);
+        let site = self.check_exit(n)?;
+        let words = self.gp(node.inputs[1], X16);
+        let index = self.gp(node.inputs[2], X17);
+        let dst = self.gp_dst(n);
+        self.a.ldr_x_uxtw3(dst, words, index);
+        self.a.mov_imm64(X30, crate::value::PACK_EMPTY);
+        self.a.cmp_reg_x(dst, X30);
+        match holes {
+            Holes::Exit => self.a.b_cond(EQ, site),
+            Holes::Undefined => {
+                let hole = self.a.new_label();
+                let resume = self.a.new_label();
+                self.a.b_cond(EQ, hole);
+                self.a.bind(resume);
+                self.cold.push(Cold::ElementUndefined {
+                    label: hole,
+                    node: n,
+                    dst,
+                    resume,
+                    exit: site,
+                    negative: None,
+                });
+            }
+        }
+        self.gp_done(n, dst);
+        Ok(())
+    }
+
+    /// LoadElementOrUndefined: an index below the used length reads as LoadElement(Undefined)
+    /// does; at or past it the cold path reads undefined under the same proof, a negative index
+    /// exiting [OutOfBounds] (Warp's LoadDenseElementHoleResult bails on one) and a hole whose
+    /// proof fails [Hole].
+    fn lower_load_element_or_undefined(&mut self, n: NodeIx) -> Result<(), Refusal> {
+        let node = self.graph.node(n);
+        let past = self.check_exit(n)?;
+        let hole_exit = self.exit_for(n, ExitReason::Hole)?;
+        let words = self.gp(node.inputs[1], X16);
+        let index = self.gp(node.inputs[2], X17);
+        let used = self.gp(node.inputs[3], X9);
+        let dst = self.gp_dst(n);
+        let past_used = self.a.new_label();
+        let hole = self.a.new_label();
+        let resume = self.a.new_label();
+        // The used length first: it may share x9 with the destination.
+        self.a.cmp_reg_w(index, used);
+        self.a.b_cond(HS, past_used);
+        self.a.ldr_x_uxtw3(dst, words, index);
+        self.a.mov_imm64(X30, crate::value::PACK_EMPTY);
+        self.a.cmp_reg_x(dst, X30);
+        self.a.b_cond(EQ, hole);
+        self.a.bind(resume);
+        self.cold.push(Cold::ElementUndefined {
+            label: hole,
+            node: n,
+            dst,
+            resume,
+            exit: hole_exit,
+            negative: None,
+        });
+        self.cold.push(Cold::ElementUndefined {
+            label: past_used,
+            node: n,
+            dst,
+            resume,
+            exit: past,
+            negative: Some((index, past)),
+        });
+        self.gp_done(n, dst);
+        Ok(())
+    }
+
+    /// Branch to `fail` unless no element of `node`'s receiver (its cell, the node's first input)
+    /// can come from its prototype chain at an index its words do not hold: no index among its
+    /// named entries (HAS_FAR clear), its prototype the active realm's Array.prototype (or, unless
+    /// `array_only`, Object.prototype), and the elements protector's proof live at the current
+    /// prototype epoch: Maglev's CanTreatHoleAsUndefined (maglev-graph-builder.cc:3993-4008), whose
+    /// prototype maps V8's map check implies and TRust reads here, with the protector read at run
+    /// time until dependencies exist, as the template's append reads it (`emit_word_create`). A
+    /// lapsed proof is renewed by a pure call (`renew_elements_protector`) where the template
+    /// takes its helper. Clobbers the scratch registers.
+    fn emit_no_inherited_elements(&mut self, node: NodeIx, array_only: bool, fail: usize) {
+        use crate::value::FLAG_HAS_FAR;
+        let layout = self.layout;
+        let cell = self.gp(self.graph.node(node).inputs[0], X17);
+        self.a
+            .ldrb_imm(X9, cell, (layout.obj_from_cell + layout.obj_flags) as u32);
+        self.a.tbnz(X9, flag_bit(FLAG_HAS_FAR), fail);
+        self.a
+            .ldr_imm(X9, cell, (layout.obj_from_cell + layout.obj_proto) as u32);
+        self.a
+            .ldr_imm(X16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+        self.a.ldr_imm(X17, X16, INTERP_ARRAY_PROTO as u32);
+        self.a.cmp_reg_x(X9, X17);
+        if array_only {
+            self.a.b_cond(NE, fail);
+        } else {
+            let either = self.a.new_label();
+            self.a.b_cond(EQ, either);
+            self.a.ldr_imm(X17, X16, INTERP_OBJECT_PROTO as u32);
+            self.a.cmp_reg_x(X9, X17);
+            self.a.b_cond(NE, fail);
+            self.a.bind(either);
+        }
+        // The proof is clean at the live epoch (a cached epoch is never u32::MAX, which no proof
+        // accepts), or renewed.
+        let renew = self.a.new_label();
+        let proven = self.a.new_label();
+        self.a.ldrb_imm(X9, X16, INTERP_ELEMS_CLEAN as u32);
+        self.a.cbz(X9, false, renew);
+        self.a.ldr_w_imm(X9, X16, INTERP_ELEMS_EPOCH as u32);
+        self.a
+            .mov_imm64(X17, crate::value::proto_epoch_ptr() as usize as u64);
+        self.a.ldr_w_imm(X17, X17, 0);
+        self.a.cmp_reg_w(X9, X17);
+        self.a.b_cond(EQ, proven);
+        self.a.bind(renew);
+        let saved = self.save_live_caller_saved(node);
+        self.a.mov(0, 19);
+        self.a
+            .mov_imm64(X16, renew_elements_protector as *const () as u64);
+        self.a.blr(X16);
+        self.a.mov_w(X9, 0);
+        self.restore_live_caller_saved(&saved);
+        self.a.cbz(X9, false, fail);
+        self.a.bind(proven);
     }
 }
 

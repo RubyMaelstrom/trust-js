@@ -141,6 +141,39 @@ const PROGRAMS: &[&str] = &[
      let out = ''; for (let k = 0; k < 3000; k++) { const r = run(k); \
      out += typeof r === 'string' ? r[4] : r; }\n\
      out.length + out.slice(0, 40)",
+    // Element reads (P3 stage 2 step 2): ints, doubles, holes, past the used words, an empty
+    // block and new Array(n); -0, negative, fractional, String and past-int32 keys.
+    "function rd(a, i) { return a[i]; }\n\
+     const arrs = [[1, 2, 3], [1.5, , 3.5], [], new Array(4), ['a', 'b'], {0: 'o', 2: 'p'}];\n\
+     const keys = [0, 1, 2, 3, -0, -1, 1.5, '1', 2147483648, 2];\n\
+     let out = ''; for (let k = 0; k < 3000; k++) \
+     out += String(rd(arrs[k % arrs.length], keys[(k >> 2) % keys.length]))[0];\n\
+     out.length + out.slice(0, 64)",
+    // Holes read under the prototype proof, and an index getter installed on Array.prototype
+    // mid-loop, then removed.
+    "function sumHoles(a) { let s = 0; for (let i = 0; i < 6; i++) { const v = a[i]; \
+     s += v === undefined ? 1 : v; } return s; }\n\
+     const h = [1, , 3, , 5, ,];\n\
+     let t = 0; for (let k = 0; k < 3000; k++) { if (k === 1500) \
+     Object.defineProperty(Array.prototype, 3, { get() { return 100; }, configurable: true }); \
+     if (k === 2500) delete Array.prototype[3]; t += sumHoles(h); } t",
+    // Array subclasses, arrays with an index among their named entries, frozen arrays.
+    "class MyArr extends Array {}\n\
+     function pair(a) { return a[0] * 10 + a[1]; }\n\
+     const m = MyArr.from([1, 2]); const f = [3, 4]; \
+     Object.defineProperty(f, 5, { get() { return 9; } }); const z = Object.freeze([5, 6]);\n\
+     let t = 0; for (let k = 0; k < 3000; k++) t += pair(k % 3 === 0 ? m : k % 3 === 1 ? f : z); t",
+    // Crypto's am3 (Octane crypto.js), its digits in two arrays, on a BigInteger-like receiver.
+    "function BI(n, seed) { this.array = []; this.t = n; \
+     for (let i = 0; i < n; i++) this.array.push((i * seed + 12345) & 0xfffffff); }\n\
+     BI.prototype.am = function am3(i, x, w, j, c, n) { var this_array = this.array; \
+     var w_array = w.array; var xl = x & 0x3fff, xh = x >> 14; \
+     while (--n >= 0) { var l = this_array[i] & 0x3fff; var h = this_array[i++] >> 14; \
+     var m = xh * l + h * xl; l = xl * l + ((m & 0x3fff) << 14) + w_array[j] + c; \
+     c = (l >> 28) + (m >> 14) + xh * h; w_array[j++] = l & 0xfffffff; } return c; };\n\
+     const x = new BI(20, 7919); const w = new BI(40, 104729); let c = 0;\n\
+     for (let k = 0; k < 3000; k++) c = (c + x.am(0, (k * 31) & 0xfffffff, w, k % 20, 0, 20)) | 0;\n\
+     c + ':' + w.array.slice(0, 6).join(',')",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {

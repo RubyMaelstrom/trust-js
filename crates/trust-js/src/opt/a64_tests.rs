@@ -2349,3 +2349,252 @@ fn a_discard_whose_template_compile_waits_for_capacity_leaves_the_slot_cold() {
     assert_eq!(crate::opt::exit::table_bytes(now.mem_ptr()), 0);
     assert!(exits().is_empty());
 }
+
+#[test]
+fn element_access_encodings_match_the_assembler() {
+    // `llvm-mc --triple=aarch64 --show-encoding`: the w index register zero-extended and scaled.
+    let cases: [(&str, u32, fn(&mut asm::Asm)); 1] =
+        [("ldr x14, [x15, w9, uxtw #3]", 0xf86959ee, |a| {
+            a.ldr_x_uxtw3(14, 15, 9)
+        })];
+    for (text, word, emit) in cases {
+        let mut a = asm::Asm::new();
+        emit(&mut a);
+        assert_eq!(a.finish(), vec![word], "{text}");
+    }
+}
+
+/// `get(a, i)` (LoadLocal 1, GetElemLocal 0 at pc 1, Return): `a` checked an Array, `i` a Number
+/// and an index, the words and their used length loaded, the bounds checked and the element read
+/// by `load` (LoadElement(_) or LoadElementOrUndefined), which the graph returns.
+const GET: &str = "function get(a, i) { return a[i]; } get([1, 2], 0);";
+
+fn get(load: NodeOp, kind: ElemKind) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let a = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let i = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let at_get = b.state(1, &[i], &[], &[]);
+    let cell = b.exiting(
+        entry,
+        NodeOp::CheckObject,
+        &[a],
+        Rep::Cell,
+        1,
+        at_get,
+        ExitReason::NotObject,
+    );
+    b.exiting(
+        entry,
+        NodeOp::CheckElements(kind),
+        &[cell],
+        Rep::None,
+        1,
+        at_get,
+        ExitReason::WrongElements,
+    );
+    let number = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[i],
+        Rep::F64,
+        1,
+        at_get,
+        ExitReason::NotNumber,
+    );
+    let index = b.exiting(
+        entry,
+        NodeOp::CheckIndex,
+        &[number],
+        Rep::I32,
+        1,
+        at_get,
+        ExitReason::NotInt32,
+    );
+    let words = b.node(entry, NodeOp::LoadElements, &[cell], Rep::Ptr, 1);
+    let used = b.node(entry, NodeOp::LoadElementsUsed, &[words], Rep::I32, 1);
+    let value = if load == NodeOp::LoadElementOrUndefined {
+        b.exiting(
+            entry,
+            load,
+            &[cell, words, index, used],
+            Rep::Tagged,
+            1,
+            at_get,
+            ExitReason::OutOfBounds,
+        )
+    } else {
+        b.exiting(
+            entry,
+            NodeOp::CheckBounds,
+            &[index, used],
+            Rep::None,
+            1,
+            at_get,
+            ExitReason::OutOfBounds,
+        );
+        b.exiting(
+            entry,
+            load,
+            &[cell, words, index],
+            Rep::Tagged,
+            1,
+            at_get,
+            ExitReason::Hole,
+        )
+    };
+    b.node(entry, NodeOp::Return, &[value], Rep::None, 2);
+    b.g
+}
+
+fn reasons() -> Vec<ExitReason> {
+    exits().into_iter().map(|(_, reason)| reason).collect()
+}
+
+#[test]
+fn an_element_read_checks_its_receiver_key_and_bounds_and_exits_on_a_hole() {
+    let mut engine = fixture(GET);
+    install(
+        &mut engine,
+        "get",
+        &get(NodeOp::LoadElement(Holes::Exit), ElemKind::Array),
+        Options::default(),
+    );
+    exits();
+    assert_eq!(eval(&mut engine, "get([1, 2, 3], 1)"), "2");
+    assert_eq!(eval(&mut engine, "get([1.5, 'x', {}], 1)"), "x");
+    assert_eq!(eval(&mut engine, "get([7, 8], -0)"), "7", "-0 is index 0");
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var big = []; for (var k = 0; k < 300; k++) big.push(k); get(big, 299)"
+        ),
+        "299"
+    );
+    assert!(exits().is_empty());
+    // Each failure resumes in the VM at the read, which reads as the language does.
+    for (call, result, reason) in [
+        ("get([1, , 3], 1)", "undefined", ExitReason::Hole),
+        ("get([1, 2], 2)", "undefined", ExitReason::OutOfBounds),
+        ("get([1, 2], -1)", "undefined", ExitReason::OutOfBounds),
+        ("get([1, 2], 1.5)", "undefined", ExitReason::NotInt32),
+        ("get([1, 2], 2147483648)", "undefined", ExitReason::NotInt32),
+        ("get([1, 2], '1')", "2", ExitReason::NotNumber),
+        ("get({0: 5}, 0)", "5", ExitReason::WrongElements),
+        (
+            "get(new Uint8Array([7, 8]), 1)",
+            "8",
+            ExitReason::WrongElements,
+        ),
+        ("get('abc', 1)", "b", ExitReason::NotObject),
+    ] {
+        assert_eq!(eval(&mut engine, call), result, "{call}");
+        assert_eq!(reasons(), vec![reason], "{call}");
+    }
+    // Ordinary objects' words, under the Words check.
+    let mut engine = fixture(GET);
+    install(
+        &mut engine,
+        "get",
+        &get(NodeOp::LoadElement(Holes::Exit), ElemKind::Words),
+        Options::default(),
+    );
+    exits();
+    assert_eq!(eval(&mut engine, "get({0: 'a', 1: 'b'}, 1)"), "b");
+    assert_eq!(eval(&mut engine, "get([4, 5], 0)"), "4");
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, "get(new Proxy([1], {}), 0)"), "1");
+    assert_eq!(reasons(), vec![ExitReason::WrongElements]);
+}
+
+#[test]
+fn a_hole_reads_undefined_while_no_element_can_come_from_the_prototype_chain() {
+    let mut engine = fixture(GET);
+    install(
+        &mut engine,
+        "get",
+        &get(NodeOp::LoadElement(Holes::Undefined), ElemKind::Array),
+        Options::default(),
+    );
+    stress(&engine);
+    exits();
+    assert_eq!(eval(&mut engine, "get([1, , 3], 1)"), "undefined");
+    assert_eq!(eval(&mut engine, "get([1, , 3], 2)"), "3");
+    assert!(exits().is_empty());
+    // A marked prototype's change lapses the protector's proof: the cold path renews it.
+    assert_eq!(
+        eval(
+            &mut engine,
+            "Array.prototype.extra = 1; delete Array.prototype.extra; get([1, , 3], 1)"
+        ),
+        "undefined"
+    );
+    assert!(exits().is_empty(), "the proof was renewed in place");
+    // An index on Array.prototype, an own element among the named entries, or another
+    // prototype: the VM reads it.
+    assert_eq!(
+        eval(
+            &mut engine,
+            "Object.defineProperty(Array.prototype, 1, \
+             { get() { return 'inherited'; }, configurable: true }); get([1, , 3], 1)"
+        ),
+        "inherited"
+    );
+    assert_eq!(reasons(), vec![ExitReason::Hole]);
+    assert_eq!(
+        eval(&mut engine, "delete Array.prototype[1]; get([1, , 3], 1)"),
+        "undefined"
+    );
+    assert!(exits().is_empty());
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var far = [1, , 3]; Object.defineProperty(far, 1, { get() { return 'own'; } }); \
+             get(far, 1)"
+        ),
+        "own"
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            "get(Object.setPrototypeOf([1, , 3], { 1: 'proto' }), 1)"
+        ),
+        "proto"
+    );
+    assert_eq!(reasons(), vec![ExitReason::Hole, ExitReason::Hole]);
+}
+
+#[test]
+fn a_read_past_the_used_words_reads_undefined_and_a_negative_index_exits() {
+    let mut engine = fixture(GET);
+    install(
+        &mut engine,
+        "get",
+        &get(NodeOp::LoadElementOrUndefined, ElemKind::Array),
+        Options::default(),
+    );
+    exits();
+    assert_eq!(eval(&mut engine, "get([1, 2], 1)"), "2");
+    assert_eq!(eval(&mut engine, "get([1, 2], 2)"), "undefined");
+    assert_eq!(eval(&mut engine, "get([1, 2], 2147483647)"), "undefined");
+    assert_eq!(eval(&mut engine, "get([], 0)"), "undefined");
+    assert_eq!(eval(&mut engine, "get(new Array(5), 3)"), "undefined");
+    assert_eq!(eval(&mut engine, "get([1, , 3], 1)"), "undefined");
+    assert!(exits().is_empty());
+    assert_eq!(
+        eval(&mut engine, "var neg = [1]; neg[-1] = 'n'; get(neg, -1)"),
+        "n"
+    );
+    assert_eq!(reasons(), vec![ExitReason::OutOfBounds]);
+    assert_eq!(
+        eval(
+            &mut engine,
+            "Object.defineProperty(Array.prototype, 7, \
+             { get() { return 'seven'; }, configurable: true }); \
+             var r = get([1, 2], 7) + get([1, , 3], 1); delete Array.prototype[7]; r"
+        ),
+        "sevenundefined"
+    );
+    // The proof fails for the hole too, which exits with the hole's reason.
+    assert_eq!(reasons(), vec![ExitReason::OutOfBounds, ExitReason::Hole]);
+}
