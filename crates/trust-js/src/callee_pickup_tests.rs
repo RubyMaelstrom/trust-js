@@ -302,12 +302,23 @@ fn rust_callers_pick_up_new_code() {
     let (first, second) = stages(&user.func);
     let second = second.expect("the trap's second stage");
     assert!(first.superseded());
-    let runs = second.jit_runs.get();
+    let runs = entries(&second);
     assert_eq!(eval(&mut engine, "reads(50)"), "450");
     assert!(
-        second.jit_runs.get() > runs || second.jit_runs.get() >= 100,
+        entries(&second) > runs,
         "the trap's later calls entered the new chunk"
     );
+}
+
+/// The entries into `chunk` its counters see: through Rust and the call helpers (`jit_runs`)
+/// and, on ARM64, through the direct sequence, its direct returns and throws. A second stage is
+/// built settled, so the direct sequence enters it from its first call and counts no run of it.
+fn entries(chunk: &Chunk) -> usize {
+    #[cfg(target_arch = "aarch64")]
+    let direct = chunk.test_direct_returns.get() + chunk.test_direct_throws.get();
+    #[cfg(not(target_arch = "aarch64"))]
+    let direct = 0;
+    chunk.jit_runs.get() as usize + direct
 }
 
 /// A megamorphic site's overflow entries stay through its callees' publications: each callee's

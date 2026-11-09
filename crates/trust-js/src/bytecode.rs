@@ -8921,6 +8921,9 @@ pub(crate) fn compile_with_inlines(
     // body is remapped into fresh slots, never the caller's authoritative bindings.
     let result = compile_inner(func, plan, seed, None, false, hot.prepared_entry, false);
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
+    if let Some(chunk) = &result {
+        chunk.settle_inline_checkpoints();
+    }
     result
 }
 
@@ -24487,6 +24490,17 @@ impl Chunk {
         } else {
             self.inline_retry_at.set(at);
         }
+    }
+    /// A recompile (a second stage, the optimizing tier's chunk of a function with nothing to
+    /// splice, a recompile without property chains) has no inline checkpoint of its own: its
+    /// function's recompile is this chunk, so a first checkpoint would only mark it attempted.
+    /// Settled at once, it takes callers' direct sequences, which wait for the attempt, from its
+    /// first call, as V8's calls enter a function's new code through its dispatch-table entry
+    /// at once; its direct entries count toward no checkpoint. A stale property chain still asks
+    /// for the recompile without chains (`Chunk::note_chain_replay` re-arms the checkpoint).
+    pub(crate) fn settle_inline_checkpoints(&self) {
+        self.inline_attempted.set(true);
+        self.inline_retry_at.set(0);
     }
     /// Whether a newer chunk of the function replaced this one (see [`Chunk::supersede`]).
     #[inline(always)]

@@ -19,6 +19,18 @@ fn function(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::ast::Function
     user.func.clone()
 }
 
+/// The native entries a second stage counted. It is built settled, with no checkpoint to count
+/// toward, so its `jit_runs` counts the entries through Rust and the call helper only; on ARM64
+/// the direct sequence enters it from its first call, and those entries are its direct returns
+/// and throws.
+fn settled_entries(chunk: &crate::bytecode::Chunk) -> u32 {
+    #[cfg(target_arch = "aarch64")]
+    let direct = (chunk.test_direct_returns.get() + chunk.test_direct_throws.get()) as u32;
+    #[cfg(not(target_arch = "aarch64"))]
+    let direct = 0;
+    chunk.jit_runs.get() + direct
+}
+
 fn reset_counts() {
     crate::bytecode::TEST_FUNCTION_OSR_ENTRIES.with(|count| count.set(0));
     crate::bytecode::loop_fragment::TEST_FRAGMENT_ENTRIES.with(|count| count.set(0));
@@ -685,7 +697,7 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
                         if let Some(spliced) =
                             user.func.runtime().code2.get().and_then(Option::as_ref)
                         {
-                            observation.spliced_runs = Some(spliced.jit_runs.get());
+                            observation.spliced_runs = Some(settled_entries(spliced));
                             observation.spliced_native = spliced.jit.get().flatten().is_some();
                             observation.spliced_guard = spliced
                                 .jit_ops()
@@ -729,7 +741,8 @@ fn borrowed_outer_frames_keep_promoting_ordinary_callees_after_ast_warmup() {
                 // compiles it. Both probes occur after compilation and splice publication: all
                 // 201/210 calls so far therefore contain 180/189 actual native entries across
                 // the two versions. This includes first cache fills and the epoch refill after
-                // publication.
+                // publication; the second stage's direct entries are its direct completions
+                // (`settled_entries`).
                 assert_eq!(
                     observations[0].primary_runs.unwrap() + observations[0].spliced_runs.unwrap(),
                     180
