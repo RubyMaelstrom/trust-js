@@ -1317,3 +1317,91 @@ immediate), and zero, which no logical immediate encodes, keeps its register. A 
 constant count of 1 to 31 drops its sign test, which cannot fail. am3's loop, non-LTO, tier on:
 172 instructions per iteration at 3b5e38ec, 158 with step 4's prepass, 146 with immediates;
 Crypto's count with the tier on 977.8M before step 7 and 931.2M after, 715.8M off.
+
+Step 5, the measurement (2026-11-09). One session of main at 954e01e1 (steps 1-4 and 7; fat LTO,
+target/p2/timing/p3s2-954e01e1) with the tier off and on, and stage 1's exit build (p3s1-06e68cf0)
+with the tier off as the base, every phase on CPU 5 with its clocks uncapped (Web Tooling's first
+run, 111 s capped, rerun): target/p3/stage2/session-p3s2-954e01e1, tools/report-s2.py. On
+against off, by the carried bars:
+- Coverage by time (tools/coverage-s2.sh, the jitdump's codes joined to perf's samples): the tier's
+  code takes 82.6% of 21,094 second-stage samples: vue 87.7%, React 100%, Djot 83.5%; steady
+  states 84.9%, 100%, 93.3%; Octane 81.3% (zlib's a8 loop, 7.1% of Octane's second-stage samples,
+  runs in its second stage's loop code: OSR, stage 5). Met. The bar counts second-stage time
+  only: first stages hold 38.4% of Octane's samples and 57.4% of Djot's measured pass, and a
+  function the tier never compiles stays outside it (Richards' schedule, below).
+- Fixtures' measured pass: vue -10.2%, React 0.0%, Djot +6.8%; steady states: vue -4.3%, React
+  0.0%, Djot -9.8%. Calls: none slower by more than 0.6% (direct-call); method-call -8.9%,
+  recursion -10%.
+- Octane: Richards +369% (355 against 1,666; stage 1's session 1,299), Crypto +52% (5,820
+  against 8,854; stage 1's 3,357); every other benchmark faster or within 0.6%: Box2D -26.0%,
+  DeltaBlue -24.6%, Mandreel -23.9% (stage 1 +86%), EarleyBoyer -22.7%, Typescript -13.1%,
+  RayTrace -12.5%, Splay -7.7%, zlib -6.6% (stage 1 +119%), MandreelLatency -6.0%, PdfJS -5.4%,
+  Gameboy -2.8%, NavierStokes -2.7%, RegExp -0.7%, SplayLatency -0.5%, CodeLoad +0.5%. The
+  Score 4,506 against 4,590, 1.8% lower (stage 1 12.0%): not faster.
+- ARES-6 (one run a side): summary -21.1%; worst case and steady state Air -61.8% and -67.7%,
+  Babylon -21.3% and -26.3%, ML -8.3% and -9.7%, Basic +0.7% and -0.5%; first iterations Air
+  +2.4%, Basic +5.8%, Babylon -0.4%, ML -6.9%. Web Tooling (one run a side): every test faster or
+  equal, geomean -13.4%.
+- Compile time: vue 5.3 ms, 2.9% of the measured pass; React 1.3 ms, 4.4%; Djot 11.9 ms, 15.1%
+  (stage 1: 2.3%, 3.8%, 11.9%). Not met.
+- The default configuration against stage 1's exit build: nothing beyond noise (fixtures and
+  steady states 0.0%; calls within 1.6%, but a 1 ms step in the 13 ms holey shift queue; Octane
+  within 2.5%, but Box2D's base spread of 7.1%; one-run ARES-6 and Web Tooling tests within 3.5%,
+  off faster beyond it). ARES-6's and Web Tooling's differing output digests are their GC trace
+  lines; the results agree.
+
+Richards (target/p3/stage2/diag-richards). With the tier on, 71% of the run's cycles are in the
+template's first-stage code of Scheduler.prototype.schedule (richards.js:188), whose one loop runs
+the benchmark's tasks; the tier compiles the functions it calls, never schedule. schedule is
+entered once per run, and the second stage's checkpoints count native entries (100, then 400,
+1,600 and 6,400 more). With the tier off, its second stage (2 sites spliced, 218,804 bytes) is
+built at the first checkpoint, its 100th entry; with the tier on, the settled-feedback rule never
+compiles at a first checkpoint (no earlier fingerprint to equal), so the earliest is the second,
+its 500th entry, which Octane's two seconds of Richards at the tier-on speed never reach. Alone
+in Octane's driver: off 1,665 to 1,673, on 448 to 708, on with TRUST_JS_OPT_EAGER 1,409, off
+without second stages (TRUST_JS_INLINE_AT=1000000) 1,053 to 1,078. And in that state the Cortex-X925
+mispredicts: 400 fixed runs (fixed-400.js, setarch -R, pathology.sh) on an X925 take 3.12G cycles
+with the tier on against 1.24G off, for fewer instructions (6.19G against 7.10G), with 53.2M
+mispredicted branches against 1.4M (66 to 100M with ASLR); front-end stalls 569M cycles against
+165M, instruction-cache refills 40M against 154M. On a Cortex-A725 the same runs take 1.68G
+cycles with the tier on against 2.15G off, 6.0M mispredictions against 4.3M. On the X925, eager:
+1.19G cycles and 5.0M; TRUST_JS_JIT_INLINE_STUBS and TRUST_JS_JIT_CHUNK_STUBS: 1.46G and 11.4M;
+TRUST_JS_JIT_NO_JSCVT: unchanged. SPE (arm_spe_0, branch_filter, period 2048): with the tier off
+and no second stage 961 of 1.19M sampled branches mispredict, no unconditional jump among them;
+with the tier on 15,775 of 600K, 6,494 of them unconditional jumps, and the same branches of
+schedule's first stage (a `tbz` on a constant slot offset, the unconditional `b` after it, two
+more of the same pattern) mispredict on every execution, as do taken branches of the tier's
+code (TaskControlBlock.run's, the tasks' run methods), while their neighbours predict. Not code
+written or mapped in the steady state (no code loads after warm-up, 0.013 s of system time), not
+the codes' data reads, and no 12- to 20-bit address alias or BTB set crowding that the samples
+show; the trigger is open. TaskControlBlock.run's polymorphic `this.task.run(packet)` was
+discarded for WrongCallee and declined at its recompile, so it calls through the shared stubs.
+
+Crypto: 40 fixed runs on an X925, off 786M cycles and 4.94G instructions, on 1,311M and 6.37G
+(+29%: am3's loop, step 6's target) with 7.1M mispredictions against 1.0M; with the stub switches
+1,148M and 1.3M. Djot: its 11.9 ms of compiles (33 functions, 3,440 ops, 5,612 nodes, 299 KB of
+code) take the measured pass to 79 ms against 74, the rest of it 67 ms. vue and React compile at
+the same rate: 2.1 to 2.3 µs a node, 61 to 87 bytes of code an op; self samples put the back end
+at about 40% of the compile, the builder 18%, the allocator 14%, the IR 13%, the settled rule's
+fingerprints 6% and the verifier 4% (diag-compile, coarse).
+
+Order (proposed for the owner's agreement, with the larger regressions above):
+8. Back edges counted toward the checkpoints (new): with the tier on, a first stage's loop back
+   edges count as native runs toward its second stage's checkpoints and a discard's warm-up, as
+   SpiderMonkey's warm-up counter counts entries and loop heads alike
+   (BaselineCompilerCodeGen::emitWarmUpCounterIncrement, jit/BaselineCodeGen.cpp:1679-1712), JSC's
+   execution counter takes 15 an entry and 1 an iteration (runtime/OptionsList.h:376-377), and
+   V8's budget takes a back edge's bytecode distance (InterpreterAssembler::JumpBackward,
+   interpreter/interpreter-assembler.cc:1252-1256). Without OSR the code takes the next entry.
+   The settled-feedback rule stays: V8's own delay after an IC change is 500 invocations' worth
+   of budget (minimum_invocations_after_ic_update), which a loop spends as fast. The tier-off
+   configuration keeps P2's entry counts. This ends step 3's departure "the warm-up counts native
+   entries where JSC also weighs iterations". Expected: Richards near the eager compile's figure.
+6. Untagged phis, as designed (Crypto).
+Then the X925 effect measured again; if it remains (Crypto's 7.1M), a reduced case to find its
+trigger. Then compile time: per-phase times, the back end's code size per op, Djot's discards and
+recompiles; the bar needs Djot's compiles about five times cheaper, or compiling off the main
+thread (point 13), the exemplars' answer and a larger step. Then the rest of the list: values
+kept across effects (React's steady state), the polymorphic call after its decline (Richards'
+TaskControlBlock.run), allocation in line, closures, strings, natives, exceptions, `arguments`
+and rest, getters and setters, dependencies.
