@@ -114,11 +114,13 @@ mod off {
         0
     }
 
-    pub(crate) fn settled(_: &Chunk) -> bool {
+    pub(crate) fn waits(_: &Chunk, _: bool) -> bool {
         false
     }
 
     pub(crate) fn forget(_: &Chunk) {}
+
+    pub(crate) fn note_template(_: &Chunk, _: *mut u8, _: usize) {}
 
     pub(crate) fn compile_into(_: &mut Interp, _: &Chunk) -> bool {
         false

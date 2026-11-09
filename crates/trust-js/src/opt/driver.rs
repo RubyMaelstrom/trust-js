@@ -25,6 +25,8 @@ thread_local! {
     /// The chunks the tier compiled on this thread, and the codes repeated exits retired.
     pub(crate) static TEST_COMPILED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
     pub(crate) static TEST_FELL_BACK: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
+    /// The checkpoints (chunk, number) at which the tier waited for settled feedback.
+    pub(crate) static TEST_WAITS: RefCell<Vec<(usize, u8)>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -51,8 +53,9 @@ pub(crate) fn enabled() -> bool {
     matches!(env_value!("TRUST_JS_OPT"), Some(v) if v != "0")
 }
 
-/// TRUST_JS_OPT_LOG: one stderr line per compile, refusal (with its reason and pc), exit and
-/// compile time.
+/// TRUST_JS_OPT_LOG: one stderr line per compile (its time and code range), refusal (with its
+/// reason and pc), exit, wait for settled feedback, fallback, and template compile of a second
+/// stage (its code range).
 pub(crate) fn log_enabled() -> bool {
     env_flag!("TRUST_JS_OPT_LOG")
 }
@@ -86,10 +89,12 @@ pub(crate) const EXIT_LIMIT: u32 = 100;
 thread_local! {
     /// The feedback fingerprint the last second-stage checkpoint of each chunk recorded while
     /// the tier waits for its feedback to settle, by the chunk's address: an entry goes when the
-    /// chunk's checkpoints end (`forget`). The tier's own state, so that the chunk carries
-    /// nothing for it while the tier is off.
+    /// chunk's checkpoints end, and with the chunk (`forget`). The tier's own state, so that the
+    /// chunk carries nothing for it while the tier is off.
     static SETTLING: RefCell<crate::fasthash::FastMap<usize, u64>> =
         RefCell::new(Default::default());
+    /// Whether `fall_back` is compiling the template JIT's code (`note_template`'s label).
+    static FALLING_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 /// The settled-feedback rule at a second-stage checkpoint of `chunk` (the plan's Stage 1 record,
@@ -103,10 +108,48 @@ pub(crate) fn settled(chunk: &Chunk) -> bool {
     eager() || previous == Some(print)
 }
 
-/// `chunk`'s checkpoints have ended (its second stage was built, or the last one passed).
+/// Whether the tier waits for `chunk`'s next checkpoint (`last`: none follows this one): while
+/// a checkpoint remains and the feedback has not settled (`settled`). The last checkpoint
+/// compiles whatever the fingerprint says, as JSC optimizes after maximumOptimizationDelay
+/// delays whatever its profiles say (CodeBlock::shouldOptimizeNowFromBaseline) and V8 pushes a
+/// tier-up out at an IC change but never cancels it (TieringManager::NotifyICChanged). Logs
+/// each wait and each compile of unsettled feedback under TRUST_JS_OPT_LOG.
+pub(crate) fn waits(chunk: &Chunk, last: bool) -> bool {
+    if settled(chunk) {
+        return false;
+    }
+    if !last {
+        if log_enabled() {
+            eprintln!(
+                "[opt] waiting {} at checkpoint {}: feedback changed",
+                name(chunk),
+                chunk.inline_checkpoints()
+            );
+        }
+        #[cfg(test)]
+        TEST_WAITS.with(|waits| {
+            waits
+                .borrow_mut()
+                .push((chunk as *const Chunk as usize, chunk.inline_checkpoints()))
+        });
+        return true;
+    }
+    if log_enabled() {
+        eprintln!(
+            "[opt] compiling {} at its last checkpoint ({}) with unsettled feedback",
+            name(chunk),
+            chunk.inline_checkpoints()
+        );
+    }
+    false
+}
+
+/// `chunk`'s checkpoints have ended (its second stage was built, the last one passed, or the
+/// chunk drops), or its wait starts afresh.
 pub(crate) fn forget(chunk: &Chunk) {
     let key = chunk as *const Chunk as usize;
-    SETTLING.with(|settling| settling.borrow_mut().remove(&key));
+    // A chunk can drop while the thread's locals are torn down.
+    let _ = SETTLING.try_with(|settling| settling.borrow_mut().remove(&key));
 }
 
 fn name(chunk: &Chunk) -> String {
@@ -169,11 +212,14 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
         Ok((nodes, code)) => {
             if log_enabled() {
                 eprintln!(
-                    "[opt] compiled {} ({} ops, {nodes} nodes, {} bytes) in {:.3} ms",
+                    "[opt] compiled {} ({} ops, {nodes} nodes, {} bytes) in {:.3} ms \
+                     at {:#x} {:#x}",
                     name(chunk),
                     chunk.jit_ops().len(),
                     code.code_bytes(),
-                    elapsed.as_secs_f64() * 1e3
+                    elapsed.as_secs_f64() * 1e3,
+                    code.mem_ptr() as usize,
+                    code.code_bytes()
                 );
             }
             #[cfg(test)]
@@ -217,10 +263,12 @@ pub(crate) fn fall_back(i: &mut Interp, chunk: &Chunk) {
         let layout = crate::interpreter::interp_layout(i);
         i.interp_layout.set(layout);
     }
+    FALLING_BACK.with(|falling| falling.set(true));
     let template = match crate::jit::compile_profiled(chunk, &layout, &i.interp_layout.get()) {
         crate::jit::JitCompileOutcome::Compiled(code) => Some(std::rc::Rc::new(code)),
         _ => None,
     };
+    FALLING_BACK.with(|falling| falling.set(false));
     let compiled = template.is_some();
     if let Some(retired) = chunk.jit.replace_resident(template) {
         #[cfg(test)]
@@ -240,6 +288,29 @@ pub(crate) fn fall_back(i: &mut Interp, chunk: &Chunk) {
         );
     }
     release_retired(i);
+}
+
+/// The template JIT compiled `chunk`'s code at `base`, `len` bytes: under TRUST_JS_OPT_LOG with
+/// the tier on, a second stage's (a chunk with a record map, the tier's own empty-plan chunks
+/// among them) is logged with its code range, as the tier's compiles are, so that a profile's
+/// samples tell the two kinds of second-stage code apart (the perf map names both `JS:^`).
+/// "fallback" is `fall_back`'s compile; "second stage" any other, such as the first native
+/// entry's compile of a second stage the tier refused, or a loop's borrowed-frame code.
+pub(crate) fn note_template(chunk: &Chunk, base: *mut u8, len: usize) {
+    if !log_enabled() || !enabled() || chunk.feedback_vector().record_map().is_none() {
+        return;
+    }
+    let why = if FALLING_BACK.with(std::cell::Cell::get) {
+        "fallback"
+    } else {
+        "second stage"
+    };
+    eprintln!(
+        "[opt] template {:#x} {:#x} {} ({why})",
+        base as usize,
+        len,
+        name(chunk)
+    );
 }
 
 /// Drop the retired codes no activation runs any more.

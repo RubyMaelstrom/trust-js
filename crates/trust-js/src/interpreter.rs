@@ -16616,6 +16616,8 @@ impl Interp {
             crate::jit::perf_inline_suppressed();
             return;
         }
+        // No checkpoint follows this one (the chunk is current, so its word is its schedule's).
+        let last = chunk.inline_retry_at.get() == 0;
         // Alive because the callee object that carried this IC is alive and its `call` field is
         // never reassigned (the same argument that makes the rest of the IC readable).
         let func = unsafe { &*func };
@@ -16632,15 +16634,16 @@ impl Interp {
         // A cached native checkpoint must still describe the active Realm. Borrow its live
         // environment for planning; raw addresses cannot manufacture a lifetime pin.
         if genv != Env::as_ptr(&self.global_env) as usize {
+            if tier && last {
+                crate::opt::forget(chunk);
+            }
             crate::jit::perf_inline_suppressed();
             return;
         }
-        if tier && !crate::opt::settled(chunk) {
-            // The feedback changed since the previous checkpoint: wait for the next one, past
-            // the last of which the tier waits no more.
-            if chunk.inline_retry_at.get() == 0 {
-                crate::opt::forget(chunk);
-            }
+        // The settled-feedback rule: wait while the feedback changes and a checkpoint remains;
+        // the last one compiles whatever the feedback (JSC optimizes after its maximum delays,
+        // and V8 delays a tier-up at an IC change but never cancels it).
+        if tier && crate::opt::waits(chunk, last) {
             return;
         }
         let plan = crate::bytecode::plan_inlines(chunk, func, realm, &self.global_env);
@@ -16684,6 +16687,10 @@ impl Interp {
             runtime.publish(&runtime.code2, chunk2, genv);
             chunk.set_inline_retry_at(0);
         } else {
+            // A later checkpoint may try again, the wait for settled feedback started afresh.
+            if tier {
+                crate::opt::forget(chunk);
+            }
             crate::jit::perf_inline_failure();
         }
     }

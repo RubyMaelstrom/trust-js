@@ -6928,6 +6928,7 @@ fn compile_profiled_with(
     let result = compile();
     if let Some(code) = &result {
         profiler::register(chunk, code.mem, code.len);
+        crate::opt::note_template(chunk, code.mem, code.len);
     }
     if let Some(started) = started {
         let elapsed = started.elapsed();

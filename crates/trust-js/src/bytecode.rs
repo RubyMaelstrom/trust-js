@@ -3589,6 +3589,9 @@ impl Drop for Chunk {
         if self.feedback.census.is_some() {
             self.feedback_census_snapshot();
         }
+        // The optimizing tier's record of the chunk's feedback, if a checkpoint left one: its
+        // key is the chunk's address, which a later chunk may take.
+        crate::opt::forget(self);
     }
 }
 
@@ -24443,6 +24446,11 @@ impl Chunk {
     }
     pub(crate) fn jit_inline_retry_at_off(&self) -> usize {
         &self.inline_retry_at as *const _ as usize - self as *const Chunk as usize
+    }
+    /// The inline checkpoints the chunk has reached (1 to 4 at the adaptive schedule's
+    /// checkpoints; see [`Chunk::advance_inline_feedback`]).
+    pub(crate) fn inline_checkpoints(&self) -> u8 {
+        self.inline_checks.get()
     }
     /// Whether the chunk's next inline checkpoint is due at `runs`. A superseded chunk's word is
     /// a standing request for its callers' refills, not a checkpoint: none is ever due.

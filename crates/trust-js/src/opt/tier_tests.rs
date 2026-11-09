@@ -371,3 +371,74 @@ fn the_settled_feedback_rule_waits_for_an_unchanged_fingerprint() {
     );
     super::forget(&chunk);
 }
+
+/// The first-stage chunk of the global function `name`.
+fn first_stage(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::bytecode::Chunk> {
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var(name, &env).ok().unwrap();
+    let object = value.as_obj().unwrap();
+    let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+        panic!("an author function")
+    };
+    user.func
+        .runtime()
+        .code
+        .get()
+        .and_then(Option::clone)
+        .unwrap()
+}
+
+#[test]
+fn feedback_that_changes_at_every_checkpoint_compiles_at_the_last() {
+    // getx's receivers show a shape new at each checkpoint (native runs 100, 500, 2,100 and
+    // 8,500): the tier waits at the first three and compiles at the fourth, whatever the
+    // fingerprint says.
+    TestSwitches {
+        on: true,
+        eager: false,
+        exit_every: 0,
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    compiled();
+    super::TEST_WAITS.with(|waits| waits.borrow_mut().clear());
+    assert_eq!(
+        eval(
+            &mut engine,
+            "function getx(o) { return o.x; }\n\
+             function receiver(k) { if (k < 300) return {x: k}; \
+             if (k < 1200) return {a: 0, x: k}; if (k < 5000) return {b: 0, x: k}; \
+             return {c: 0, x: k}; }\n\
+             var k = 0, t = 0; for (; k < 2300; k++) t += getx(receiver(k)); t"
+        ),
+        "2643850"
+    );
+    let first = first_stage(&mut engine, "getx");
+    let waits = || {
+        super::TEST_WAITS.with(|waits| {
+            waits
+                .borrow()
+                .iter()
+                .filter(|&&(chunk, _)| chunk == std::rc::Rc::as_ptr(&first) as usize)
+                .map(|&(_, checkpoint)| checkpoint)
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(waits(), vec![1, 2, 3]);
+    assert!(
+        second_stage(&mut engine, "getx").is_none(),
+        "the tier waits"
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            "for (; k < 9000; k++) t += getx(receiver(k)); t"
+        ),
+        "40495500"
+    );
+    let chunk = second_stage(&mut engine, "getx").expect("the last checkpoint compiles");
+    assert!(compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)));
+    assert_eq!(waits(), vec![1, 2, 3], "no wait at the last checkpoint");
+}

@@ -56,18 +56,24 @@ comment/example in the same change.
 - `TRUST_JS_OPT=1` turns on the speculative optimizing tier (ARM64 only; off by default until a
   stage exit measures a net win; docs/v8-chase-p3-plan-2026-11-08.txt, "Stage 1"). At the second
   stage's checkpoints (about 100, 500, 2,100 and 8,500 native runs), once a function's feedback
-  fingerprint equals its previous checkpoint's, the second stage is built as without the tier,
-  a function with nothing to splice getting its own chunk again, and the tier generates its
-  native code in place of the template JIT: a refused second stage keeps the template JIT's
-  code, and a refused chunk with nothing spliced is dropped, the function keeping its first
-  stage. A failed speculation exits to the bytecode VM, which finishes the call; after 100
-  exits of one code object, new entries take the template JIT's code. Under
-  `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, without waiting for the
-  feedback to settle (the eager gate: V8's `--stress-maglev`). `TRUST_JS_OPT_EXIT_EVERY=N`
-  compiles every check and effect of the tier's code with a countdown that exits at every Nth
-  one (the forced-exit gate: V8's `--deopt-every-n-times`); forced exits are not counted
-  against the 100. `TRUST_JS_OPT_LOG=1` prints one stderr line per compile (with its time),
-  refusal (with its reason and pc), exit (with its pc, reason and kind) and fallback.
+  fingerprint equals its previous checkpoint's, or at the last checkpoint whatever it says, the
+  second stage is built as without the tier, a function with nothing to splice getting its own
+  chunk again, and the tier generates its native code in place of the template JIT: a refused
+  second stage keeps the template JIT's code, and a refused chunk with nothing spliced is
+  dropped, the function keeping its first stage. A failed speculation exits to the bytecode VM,
+  which finishes the call; after 100 exits of one code object, new entries take the template
+  JIT's code. Under `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, without
+  waiting for the feedback to settle (the eager gate: V8's `--stress-maglev`).
+  `TRUST_JS_OPT_EXIT_EVERY=N` compiles every check and effect of the tier's code with a
+  countdown that exits at every Nth one (the forced-exit gate: V8's `--deopt-every-n-times`);
+  forced exits are not counted against the 100. `TRUST_JS_OPT_LOG=1` prints one stderr line
+  per compile (with its time and code range, `at <base> <length>` in hex), refusal (with its
+  reason and pc), wait for settled feedback (with the function and checkpoint), compile of
+  unsettled feedback at the last checkpoint, exit (with its pc, reason and kind), and fallback,
+  and one per template JIT compile of a second stage: `[opt] template <base> <length> <name>
+  (second stage|fallback)`, the code of a second stage the tier refused (or of a loop's
+  borrowed-frame entry) or of a fallback. A profile's samples join to these ranges, since the
+  perf map names a second stage's template code `JS:^`, as its first stage's.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at
