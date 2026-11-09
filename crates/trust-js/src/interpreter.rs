@@ -17653,12 +17653,24 @@ impl Interp {
             // pins it, and never into the chunk's pins, while the site's budget for its window
             // lasts (`CALL_SITE_OVERFLOW_ADMISSIONS`); past it, nothing is recorded. An entry
             // the table holds for the callee already (stale, or its chunk superseded) refills.
+            // At any other site, an entry of this epoch and Realm that missed (its chunk
+            // superseded: the callee's new code) refills too, evicting no way: a callee's new
+            // code is not a new callee, so the site's ways and eviction count stay (V8's call
+            // feedback names the target closure, which a tier-up leaves as it was). An entry
+            // the epoch staled fills the ways as ever, measuring the site's callees afresh.
             let refused = cs.refuses(key, epoch);
-            let megamorphic =
-                refused && (self.call_overflow.holds(key) || cs.admits_overflow(epoch));
+            let overflow = if refused {
+                self.call_overflow.holds(key) || cs.admits_overflow(epoch)
+            } else {
+                cs.would_evict(key, epoch)
+                    && self
+                        .call_overflow
+                        .lookup_entry(key, Env::as_ptr(&self.global_env) as usize, epoch)
+                        .is_some()
+            };
             let mut p = pins.borrow_mut();
-            if megamorphic || !refused && (p.len() < 4096 || p.contains_key(&key)) {
-                if !megamorphic {
+            if overflow || !refused && (p.len() < 4096 || p.contains_key(&key)) {
+                if !overflow {
                     p.entry(key).or_insert_with(|| Gc::downgrade(o));
                 }
                 // Pin the active global scope's address too: the cached same-realm proof
@@ -17706,7 +17718,7 @@ impl Interp {
                         builtin: 0,
                         realm,
                     };
-                    if megamorphic {
+                    if overflow {
                         self.call_overflow.insert(ic, Gc::downgrade(o));
                     } else if let Some(evicted) = cs.fill(ic, Some(&func)) {
                         let pin = p.get(&evicted.callee).expect("call entry has an ABA pin");

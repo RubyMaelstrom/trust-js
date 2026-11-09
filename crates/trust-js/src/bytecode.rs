@@ -1582,7 +1582,12 @@ impl CallSite {
     /// which [`CallSite::fill`] refuses: the caller records the callee in the overflow table
     /// instead, and pins it there alone.
     pub fn refuses(&self, callee: usize, epoch: u32) -> bool {
-        self.megamorphic() && !self.entries.iter().any(|e| e.get().callee == callee) && {
+        self.megamorphic() && self.would_evict(callee, epoch)
+    }
+    /// Whether a fill of `callee` at `epoch` would evict a live way: no way holds the callee,
+    /// and the next way round-robin holds another one in this epoch.
+    pub fn would_evict(&self, callee: usize, epoch: u32) -> bool {
+        !self.entries.iter().any(|e| e.get().callee == callee) && {
             let next = self.entries[self.next.get() as usize & 3].get();
             next.callee != 0 && next.epoch == epoch
         }

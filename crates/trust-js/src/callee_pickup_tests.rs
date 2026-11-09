@@ -386,6 +386,103 @@ fn a_megamorphic_site_keeps_its_overflow_entries() {
     );
 }
 
+/// A polymorphic site's callees get new code: a callee in the site's ways refills its way, and
+/// one in the overflow table refills its entry there, evicting no way (a callee's new code is
+/// not a new callee). The site stays polymorphic with its ways, and the caller's own second
+/// stage splices the callees they hold, with the optimizing tier on as with it off.
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
+    // Six callees through four ways: two live in the overflow table. Each calls a helper, so its
+    // checkpoint publishes a second stage (with the tier on, past its settled-feedback wait).
+    let configurations = [
+        ("tier off", false, false),
+        #[cfg(target_arch = "aarch64")]
+        ("tier on", true, false),
+        #[cfg(target_arch = "aarch64")]
+        ("tier eager", true, true),
+    ];
+    let mut splices = None;
+    for (label, on, eager) in configurations {
+        #[cfg(target_arch = "aarch64")]
+        crate::opt::TestSwitches {
+            on,
+            eager,
+            exit_every: 0,
+        }
+        .set();
+        #[cfg(not(target_arch = "aarch64"))]
+        let _ = (on, eager);
+        let mut engine = engine();
+        eval(
+            &mut engine,
+            "function h(a) { return a; }
+             var six = []; for (var q = 0; q < 6; q++) six.push(new Function('a', 'return h(a) * ' + q));
+             function stable(n) { var s = 0; for (var k = 0; k < n; k++) s += six[k % 6](k); return s; }",
+        );
+        let callees: Vec<(usize, Rc<crate::ast::Function>)> = (0..6)
+            .map(|q| {
+                eval(&mut engine, &format!("var probedCallee = six[{q}];"));
+                function(&mut engine.interp, "probedCallee")
+            })
+            .collect();
+        // The callees past the checkpoint that publishes their second stages: the first, or with
+        // the tier on the first whose feedback has settled (8,500 native runs at the latest).
+        for _ in 0..80 {
+            assert_eq!(eval(&mut engine, "stable(400)"), "199070", "{label}");
+            if callees.iter().all(|(_, func)| stages(func).1.is_some()) {
+                break;
+            }
+        }
+        for (q, (_, func)) in callees.iter().enumerate() {
+            let (first, second) = stages(func);
+            assert!(second.is_some(), "{label}: six[{q}]'s second stage");
+            assert!(first.superseded(), "{label}");
+        }
+        let (_, stable) = function(&mut engine.interp, "stable");
+        let chunk = stages(&stable).0;
+        let site = chunk
+            .call_caches
+            .iter()
+            .find(|site| site.entries.iter().any(|way| way.get().callee != 0))
+            .expect("stable's call site");
+        assert!(
+            !site.megamorphic(),
+            "{label}: a callee's new code is no new callee"
+        );
+        let mut held: Vec<usize> = site.entries.iter().map(|way| way.get().callee).collect();
+        held.sort_unstable();
+        held.dedup();
+        assert_eq!(held.len(), 4, "{label}: four callees in the ways");
+        for (q, (key, _)) in callees.iter().enumerate() {
+            assert!(
+                held.contains(key) || engine.interp.call_overflow.holds(*key),
+                "{label}: six[{q}] is cached"
+            );
+        }
+        // `stable` past its own checkpoint: its second stage splices its ways' callees.
+        for _ in 0..40 {
+            eval(&mut engine, "for (var r = 0; r < 250; r++) stable(6);");
+            if stages(&stable).1.is_some() {
+                break;
+            }
+        }
+        let second = stages(&stable)
+            .1
+            .unwrap_or_else(|| panic!("{label}: stable's second stage"));
+        let guards = second
+            .jit_ops()
+            .iter()
+            .filter(|op| matches!(op, Op::InlineGuard(..)))
+            .count();
+        assert!(guards >= 4, "{label}: {guards} splices");
+        assert_eq!(*splices.get_or_insert(guards), guards, "{label}");
+    }
+}
+
 /// A megamorphic site's admissions to the overflow table renew after its refusals, and at an
 /// epoch move.
 #[test]
