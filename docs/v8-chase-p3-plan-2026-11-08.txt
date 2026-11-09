@@ -984,6 +984,25 @@ capacity and from the empty block, copy-on-write literals, frozen and sealed arr
 fractional keys, NaN and -0 into int32 arrays, references into NUMBERS arrays and into arrays over
 64 words under GC stress and TRUST_JS_GC_VERIFY, typed arrays detached or shrunk between calls,
 each typed kind's conversions; difftest's corpus seeded with the same.
+Step 2 landed (9d408d92..9d74051a, 2026-11-09). The library's suites pass with the tier off and on
+eager (3,040 each), the tier's tests off and on after the rebase, Test262's Array, TypedArray,
+TypedArrayConstructors, assignment, compound-assignment, update, property-accessor and arguments
+tests (6,630) in the tier's four configurations with no failure, 18 element tests under GC stress
+and verification, and on x86-64 the type-check and the feedback and element tests (208); the
+difftest corpus is not yet seeded (carried to the stage's gates). Choices and departures: the kind
+proof (tag and IC_PLAIN) is a value fact under a contract the ElemKind doc names, whose one
+exception, an embedder's indexed-property install on an object JS holds, leaves the words empty
+and meets cold paths that test IC_PLAIN again (a test covers it); TRust's typed arrays share one
+kind tag, so a single-kind site also checks the view's kind byte, which V8's per-kind maps imply;
+a single-kind typed read past the length reads undefined in line (Maglev's kHandleOOB), a stub or
+mixed site's and every typed store's past it take the generic access; typed arrays with no native
+kind (BigInt, Float16, shared) take it too, as Maglev's; a site with an empty record branches on
+the kind tag instead of staying an effect; the element record keeps a typed array's kinds in its
+free bits (feedback-schema.txt). Open: the loop prepass is conservative, so loop-invariant
+receivers are checked each iteration; a typed array's length is an accessor left an effect, so
+an `i < t.length` loop starts an epoch each iteration (Maglev's LoadTypedArrayLength); UpdateElem
+seldom sees int32 records (the VM's fast path records nothing); out-of-bounds typed stores are
+generic.
 
 Step 3, the exit profile and reoptimization (design, 2026-11-09; input
 target/p3/stage2/reopt-input.txt, which cites the code and the exemplars line by line). Its input
