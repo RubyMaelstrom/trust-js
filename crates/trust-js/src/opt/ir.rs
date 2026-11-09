@@ -67,11 +67,29 @@ pub(crate) enum Cond {
 }
 
 /// Why a check fails or an exit is taken, for the log, the exit profile (stage 2) and tests.
+// Only the back end builds the reasons of exits on objects and Booleans and of the forced-exit
+// gate: where the tier has none (x86-64 until the plan's stage 6), nothing builds those three.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    expect(
+        dead_code,
+        reason = "the back end builds NotObject, NotBoolean and Forced"
+    )
+)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ExitReason {
     NotNumber,
     NotInt32,
     Overflow,
+    // A check's -0 exits with its node's reason (NotInt32, Overflow), one reason per check, as
+    // Maglev's CheckedTruncateFloat64ToInt32 and Int32MultiplyWithOverflow give theirs.
+    #[expect(
+        dead_code,
+        reason = "-0 exits give their check's reason, as V8's Maglev does"
+    )]
     MinusZero,
     NotObject,
     WrongShape,
@@ -116,10 +134,22 @@ pub(crate) enum NodeOp {
     /// F64 -> I32: an exact int32 and not -0.
     CheckInt32,
     /// Tagged -> Cell.
+    // Stage 1's builder checks objects through CheckShape and builds no CheckObject; the verifier
+    // and the back end take one, as the tests do.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "stage 1's builder builds no CheckObject")
+    )]
     CheckObject,
     /// Tagged -> Cell: an object whose shape is one of these (at most four).
     CheckShape(Vec<u32>),
     /// Tagged -> Bool.
+    // Stage 1's builder branches through ToBoolean and builds no CheckBoolean; the verifier and
+    // the back end take one, as the tests do.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "stage 1's builder builds no CheckBoolean")
+    )]
     CheckBoolean,
     /// A spliced callee's guard (InlineGuard): inputs the callee word (Tagged), then, when the
     /// InlineTarget's `check_this` is set, the receiver word (Tagged), which must be an object;
@@ -281,6 +311,11 @@ pub(crate) enum SlotSource {
     /// A node holds it; the exit writes it.
     Value(NodeIx),
     /// The slot is dead at the pc: the exit leaves it as the frame has it.
+    // Stage 1's builder keeps every slot (Frame or Value); the verifier and the exits take Dead.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "stage 1's builder marks no slot dead")
+    )]
     Dead,
 }
 
