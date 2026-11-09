@@ -916,7 +916,8 @@ impl Gen<'_> {
                 let d = self.fp(input(0), D31);
                 let w = self.gp_dst(n);
                 if jscvt_available() {
-                    // Z is set exactly when the conversion is exact (FEAT_JSCVT).
+                    // Z is set exactly when the conversion is exact and the input is not -0
+                    // (FEAT_JSCVT; FPToFixedJS clears Z for -0).
                     self.a.fjcvtzs_w_d(w, d);
                     self.a.b_cond(NE, site);
                 } else {
@@ -924,13 +925,13 @@ impl Gen<'_> {
                     self.a.scvtf_d_w(D30, w);
                     self.a.fcmp(D30, d);
                     self.a.b_cond(NE, site);
+                    // -0 converts exactly to 0, which is not its value.
+                    let ok = self.a.new_label();
+                    self.a.cbnz(w, false, ok);
+                    self.a.fmov_x_d(X17, d);
+                    self.a.tbnz(X17, 63, site);
+                    self.a.bind(ok);
                 }
-                // -0 converts exactly to 0, which is not its value.
-                let ok = self.a.new_label();
-                self.a.cbnz(w, false, ok);
-                self.a.fmov_x_d(X17, d);
-                self.a.tbnz(X17, 63, site);
-                self.a.bind(ok);
                 self.gp_done(n, w);
             }
             NodeOp::CheckObject => {

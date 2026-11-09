@@ -11,9 +11,9 @@
 //! value whose next use is the farthest gives up its register and is spilled at its definition,
 //! or the new value is when its own next use is farther (Maglev's choice). A home is the value's
 //! for its whole range, so an exit's recipe names one place per value; registers and slots free
-//! again where ranges end. Phis take their
-//! inputs by parallel moves on the edges into their blocks (`a64`). Constants have no home: each
-//! use rematerializes them, and a recipe records them as constants.
+//! again where ranges end. Phis take their inputs by parallel moves on the edges into their blocks
+//! (`a64`). Constants have no home: each use rematerializes them, and a recipe records them as
+//! constants.
 //!
 //! Raw cell pointers and tagged words in callee-saved registers and spill slots are roots: the
 //! collector scans the native stack and the callee-saved registers conservatively and resolves
@@ -152,9 +152,6 @@ impl Bits {
     }
     fn remove(&mut self, i: usize) {
         self.0[i / 64] &= !(1 << (i % 64));
-    }
-    fn contains(&self, i: usize) -> bool {
-        self.0[i / 64] & (1 << (i % 64)) != 0
     }
     fn union(&mut self, other: &Bits) {
         for (a, b) in self.0.iter_mut().zip(&other.0) {

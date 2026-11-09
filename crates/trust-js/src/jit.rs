@@ -3546,8 +3546,8 @@ mod asm {
         pub fn stp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
             self.pair(STP_D, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
-        /// ldp dt1, dt2, [sp, #imm] (test event helpers' reloads of d16..d31; the optimizing
-        /// tier's poll reloads of caller-saved FP registers)
+        /// ldp dt1, dt2, [sp, #imm] (test event helpers' reloads of d16..d31)
+        #[cfg(test)]
         pub fn ldp_d_off(&mut self, rt1: u32, rt2: u32, imm_bytes: i32) {
             self.pair(LDP_D, Index::Offset, rt1, rt2, 31, imm_bytes);
         }
@@ -4481,6 +4481,7 @@ mod asm {
         fp: true,
         counted: true,
     };
+    #[cfg(test)]
     const LDP_D: Pair = Pair {
         offset: 0x6D40_0000,
         load: true,

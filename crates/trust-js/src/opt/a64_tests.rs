@@ -1601,7 +1601,6 @@ fn a_host_interruption_at_a_poll_leaves_through_the_handlers_region() {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Operands {
-    Tagged,
     F64,
     I32,
 }
@@ -1615,7 +1614,6 @@ fn op_graph(op: NodeOp, operands: Operands, unary: bool, out: Rep) -> Graph {
     let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
     let at = b.state(2, &[x, y], &[], &[]);
     let check = |b: &mut Build, v| match operands {
-        Operands::Tagged => v,
         Operands::F64 => b.exiting(
             entry,
             NodeOp::CheckNumber,
