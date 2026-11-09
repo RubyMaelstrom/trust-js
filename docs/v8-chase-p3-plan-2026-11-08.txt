@@ -706,9 +706,29 @@ The back end:
   the tier slower than the code it replaces. Milestone 2's runs (non-LTO, Octane at 5 runs and the
   three fixtures, 2026-11-09): 241 of 905 compiled codes fell back with the tier on (eager: 436 of
   1,345), 97 of GBEMU's 110 and 82 of TypeScript's 354. Their exits: a wrong shape 17,111 (GBEMU
-  and TypeScript, mostly at pc 0), a wrong callee 4,717, a block that never ran 2,259. Whether the
-  shapes change for the program's reasons (a property added after the snapshot) or the engine's is
-  examined before the stage's timing.
+  and TypeScript, mostly at pc 0), a wrong callee 4,717, a block that never ran 2,259. The shapes
+  (2026-11-09, every exit's expected shapes being the ways seeded at the compile): GBEMU's are the
+  program's, receivers the cache had not seen. Each Octane run builds a new emulator core, and from
+  the second run its audio set-up fails, so the core lacks a property the first one added and takes
+  another shape from key 288; V8's maps split there too. Of TypeScript's 5,844, 3,650 are the
+  tier's, named loads on primitive strings and numbers (next point), and the 2,059 others examined
+  the program's (AST nodes that gain a property later, node classes that reach a site later,
+  subclass instances in another capacity class, which V8's per-constructor initial maps share
+  likewise). pdfjs's and box2d's are the program's but for 300 on strings; no shape changed
+  without a key change. The program's cases are stage 2's: the caches after the exits hold the new
+  shapes, four ways or fewer.
+- Primitive receivers (2026-11-09): a named access on a string, number or Boolean fills its way
+  from the wrapper prototype (the way's receiver shape is String.prototype's), so the builder took
+  it for an own-data way of an object and CheckShape exited on every primitive. The exemplars'
+  feedback says what the receiver was: V8's maps are string and HeapNumber maps, which Maglev
+  checks with CheckString or CheckNumber before loading from the prototype as a constant
+  (maglev-graph-builder.cc, TryBuildNamedAccess); JSC's string cells have their structure;
+  SpiderMonkey's CacheIR stub guards the string (GuardToString). So a way filled from a primitive
+  records the primitive's kind (string, number, Boolean, symbol, BigInt) in bits 4-6 of its
+  mid_ok byte, which no probe reads (they test bits 0-3; bit 7 is way 0's generic mark), and the
+  builder keeps such a site an effect: the baseline template handles primitives as the template
+  JIT's code does. Maglev's lowering (a check of the primitive, the prototype's shape and a load
+  from it) is a later stage's.
 - Shapes (review of the front end, 2026-11-08): CheckShape proves what the baseline's own-data
   probe proves (an object word, an ordinary kind, which excludes Arrays, whose element entries
   take slots without a shape transition, the IC-plain flag, the shape). A field access after it
