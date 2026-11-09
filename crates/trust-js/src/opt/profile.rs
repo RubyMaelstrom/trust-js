@@ -80,13 +80,22 @@ impl ChunkProfile {
     }
 
     /// Add the exit site (`pc`, the reason's code, `inlined`), with the shapes its check expected
-    /// for a WrongShape site: whether the site is new.
-    pub(crate) fn add_site(&self, pc: u32, reason: u8, inlined: bool, ways: u8) -> bool {
+    /// for a WrongShape site, the most a discarded check there expected, or, `latest`, the proof's
+    /// byte its check expected for a WrongName site, the last discard's (stage 2, step 4):
+    /// whether the site is new.
+    pub(crate) fn add_site(
+        &self,
+        pc: u32,
+        reason: u8,
+        inlined: bool,
+        ways: u8,
+        latest: bool,
+    ) -> bool {
         let key = key(pc, reason, inlined);
         let mut sites = self.sites.borrow_mut();
         match sites.binary_search_by_key(&key, |&(key, _)| key) {
             Ok(at) => {
-                sites[at].1 = sites[at].1.max(ways);
+                sites[at].1 = if latest { ways } else { sites[at].1.max(ways) };
                 false
             }
             Err(at) => {

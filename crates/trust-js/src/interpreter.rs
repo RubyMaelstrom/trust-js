@@ -19286,6 +19286,15 @@ impl Interp {
             }
         }
         drop(hoist_ops);
+        // A lexical declaration that shadows a (configurable) property of the global object moves
+        // its slot epoch, which compiled reads of the property check (`Props::slot_epoch`;
+        // SpiderMonkey bumps its global generation here, vm/EnvironmentObject.cpp:3891-3895).
+        {
+            let global = self.global.borrow();
+            if lex_names.iter().any(|n| global.props.contains(n.as_str())) {
+                global.props.move_slot_epoch();
+            }
+        }
         // Top-level `let`/`const` are pre-declared in their temporal dead zone.
         self.declare_block_lexicals(body, &self.global_env.clone(), false);
         // Decision 21: the Script's own inner functions' contexts end at this global environment.

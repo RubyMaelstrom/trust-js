@@ -2966,6 +2966,10 @@ impl Object {
     }
     #[inline]
     pub(crate) fn set_ic_plain(&self, plain: bool) {
+        if !plain && self.ic_plain() {
+            // Generated code that relied on an ordinary object checks again (Props::slot_epoch).
+            self.props.move_slot_epoch();
+        }
         self.props.set_flag(FLAG_IC_PLAIN, plain);
     }
     /// IsConstructor ([`FLAG_CONSTRUCTOR`]).
@@ -3054,6 +3058,9 @@ impl Object {
         let cell = self.props.entries.cell as usize;
         // The map takes this cell's capacity class (W2d step 3).
         properties.entries.shape = rebased_shape(&properties.entries, class_for(cell));
+        let epoch = self.props.slot_epoch().max(properties.slot_epoch());
+        properties.entries.epoch.set(epoch);
+        properties.move_slot_epoch();
         self.props = properties;
         // SAFETY: this Object's cell holds `cell` slots after its header.
         unsafe { self.props.entries.attach(cell) };
@@ -3068,8 +3075,10 @@ impl Object {
         self.props.entries.detach();
         let empty = Props::with_entries(NamedEntries {
             shape: empty_shape(class_for(cell)),
+            epoch: Cell::new(self.props.slot_epoch()),
             ..NamedEntries::default()
         });
+        empty.move_slot_epoch();
         empty
             .entries
             .flags
@@ -3087,6 +3096,9 @@ impl Object {
         debug_assert_eq!(props.entries.cell, 0, "a map outside a cell");
         let cell = self.props.entries.cell as usize;
         props.entries.shape = rebased_shape(&props.entries, class_for(cell));
+        let epoch = self.props.slot_epoch().max(props.slot_epoch());
+        props.entries.epoch.set(epoch);
+        props.move_slot_epoch();
         self.props = props;
         // SAFETY: this Object's cell holds `cell` slots after its header.
         unsafe { self.props.entries.attach(cell) };
@@ -4858,6 +4870,18 @@ fn decide_constructed_class(func: &crate::ast::Function, proto: Option<&Gc>) -> 
 /// The offset of an object's first cell slot from its Object, which, after the borrow flag, is
 /// the rest of the cell's header (W2d step 3): generated code addresses the Object.
 pub(crate) const OBJECT_SLOTS_OFF: usize = std::mem::size_of::<Object>();
+
+/// The offset of a map's slot epoch (a `u16`, [`Props::slot_epoch`]) from the map, which the
+/// optimizing tier's global reads load from the realm's global object (P3 stage 2 step 4).
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) const PROPS_EPOCH_OFF: usize =
+    std::mem::offset_of!(Props, entries) + std::mem::offset_of!(NamedEntries, epoch);
 
 /// The location word of slot `slot` of a map that keeps `cell` slots in its object's cell (W2d
 /// step 3, SpiderMonkey's TaggedSlotOffset, vm/NativeObject.h:2010-2019): the slot's byte
@@ -7962,6 +7986,8 @@ struct NamedEntries {
     /// hashed key lookup. Maintained by `insert`; any slot-shifting removal resets it (`remove`
     /// re-memoizes on the next lookup via `length_slot`).
     len_slot: Cell<SlotMemo>,
+    /// The slot epoch (P3 stage 2 step 4; [`Props::slot_epoch`]), in the bytes the memos leave.
+    epoch: Cell<u16>,
 }
 
 impl Default for NamedEntries {
@@ -7975,6 +8001,7 @@ impl Default for NamedEntries {
             flags: Cell::new(OBJECT_FLAGS_INITIAL),
             proto_slot: Cell::new(SlotMemo::NONE),
             len_slot: Cell::new(SlotMemo::NONE),
+            epoch: Cell::new(0),
         }
     }
 }
@@ -7989,6 +8016,7 @@ impl Clone for NamedEntries {
             flags: Cell::new(self.flags.get()),
             proto_slot: Cell::new(self.proto_slot.get()),
             len_slot: Cell::new(self.len_slot.get()),
+            epoch: Cell::new(self.epoch.get()),
             ..NamedEntries::default()
         };
         if self.record.header().is_some() || !self.is_empty() {
@@ -9823,6 +9851,7 @@ impl Props {
             words.set(n, value);
         }
         self.entries.retain(|(key, _)| key.as_index().is_none());
+        self.move_slot_epoch();
         self.entries.len_slot.set(SlotMemo::NONE);
         self.entries.proto_slot.set(SlotMemo::NONE);
         self.entries.set_index(None);
@@ -9969,6 +9998,29 @@ impl Props {
     /// the named entries).
     pub(crate) fn has_packed_elements(&self) -> bool {
         self.elems.has_words()
+    }
+
+    /// The map's slot epoch (P3 stage 2 step 4): it moves when a named property is removed,
+    /// which closes the gap and moves every later slot, when one turns from a data property to
+    /// an accessor or back, when the whole map is replaced, when the object stops being IC_PLAIN,
+    /// and, for a realm's global object, when a script's lexical declaration shadows one of its
+    /// properties (`Interp::run_program_body`); an addition appends a slot and moves nothing. So
+    /// a data property's slot found by its key stays that key's while the epoch holds, which the
+    /// optimizing tier's global reads check (SpiderMonkey's global generation,
+    /// vm/GlobalObject.h:226-232, which deletions, data-accessor changes and shadowing lexicals
+    /// bump). It saturates at `u16::MAX`, which no compile relies on. Every map counts, where
+    /// SpiderMonkey keys its hooks on the global's flag: the bytes are spare, and the count costs
+    /// a removal one add.
+    #[inline]
+    pub(crate) fn slot_epoch(&self) -> u16 {
+        self.entries.epoch.get()
+    }
+
+    /// Move the slot epoch ([`Props::slot_epoch`]).
+    #[inline]
+    pub(crate) fn move_slot_epoch(&self) {
+        let epoch = &self.entries.epoch;
+        epoch.set(epoch.get().saturating_add(1));
     }
 
     /// This map's shape id — the inline cache's structural validation token (see the `shape` field).
@@ -10823,6 +10875,7 @@ impl Props {
             self.note_fused_clear();
         }
         self.entries.clear();
+        self.move_slot_epoch();
         self.elems.clear();
         self.entries.len_slot.set(SlotMemo::NONE);
         self.entries.proto_slot.set(SlotMemo::NONE);
@@ -10980,6 +11033,12 @@ impl Props {
             if self.proto_flag() && key.as_index().is_none() {
                 self.note_fused_redefine(i, &prop);
             }
+            if self
+                .property_at(i)
+                .is_some_and(|old| old.accessor() != prop.accessor())
+            {
+                self.move_slot_epoch();
+            }
             // A whole-descriptor replacement that changes the key's attributes cannot stay on a
             // shape that records the old ones: it takes the attribute-change transition (W2d
             // step 2). Array element entries are exempt exactly as in `remove` — their shape
@@ -11062,6 +11121,7 @@ impl Props {
             return;
         }
         self.entries.retain(|(k, _)| keep(k));
+        self.move_slot_epoch();
         self.entries.len_slot.set(SlotMemo::NONE);
         self.entries.proto_slot.set(SlotMemo::NONE);
         self.entries.set_index(None);
@@ -11118,6 +11178,7 @@ impl Props {
             self.note_fused_remove(i);
         }
         self.entries.remove(i);
+        self.move_slot_epoch();
         // Slots shifted — deopt to a fresh shape id (see remove_indices_from). Array maps skip
         // this for ELEMENT keys: their shape tracks named keys only, and array entry slots are
         // only ever trusted through key-checked ICs (IC_ARR_KEYCHK), which re-verify on hit.

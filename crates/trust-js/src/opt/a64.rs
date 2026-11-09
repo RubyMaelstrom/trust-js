@@ -755,6 +755,9 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
+        NodeOp::CheckEnvIs { .. }
+        | NodeOp::CheckCellIs { .. }
+        | NodeOp::CheckGlobalEpoch { .. } => ExitReason::WrongName,
         NodeOp::I32Add | NodeOp::I32Sub | NodeOp::I32Mul | NodeOp::I32UShr => ExitReason::Overflow,
         NodeOp::CheckElements(_) => ExitReason::WrongElements,
         NodeOp::CheckIndex => ExitReason::NotInt32,
@@ -952,6 +955,12 @@ impl Gen<'_> {
             .iter()
             .map(|&v| self.source(v, state.pc))
             .collect::<Result<Vec<_>, _>>()?;
+        let proof = match node.op {
+            NodeOp::CheckEnvIs { proof, .. }
+            | NodeOp::CheckCellIs { proof, .. }
+            | NodeOp::CheckGlobalEpoch { proof, .. } => proof,
+            _ => 0,
+        };
         let record = ExitRecord {
             pc: state.pc,
             kind,
@@ -960,6 +969,7 @@ impl Gen<'_> {
             stack: stack.into(),
             handlers: state.handlers.clone(),
             shape_check: None,
+            proof,
             count: Cell::new(0),
         };
         let site = self.a.new_label();
@@ -1042,7 +1052,11 @@ impl Gen<'_> {
             | NodeOp::EnvParent
             | NodeOp::LoadBinding { .. }
             | NodeOp::CheckInitialized
-            | NodeOp::StoreBinding { .. } => self.lower_name(n)?,
+            | NodeOp::StoreBinding { .. }
+            | NodeOp::GlobalObject
+            | NodeOp::CheckEnvIs { .. }
+            | NodeOp::CheckCellIs { .. }
+            | NodeOp::CheckGlobalEpoch { .. } => self.lower_name(n)?,
             NodeOp::EntrySlot(slot) | NodeOp::FrameSlot(slot) => {
                 if !unused {
                     let dst = self.gp_dst(n);

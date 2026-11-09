@@ -777,6 +777,8 @@ enum Hoisted {
     Env,
     /// A record known at the compile (a splice's folded holder).
     ConstEnv(u64),
+    /// The running realm's global object, as a cell (stage 2, step 4).
+    GlobalObject,
 }
 
 /// The state an operation's exits share: the frame state before the operation (its operands on
@@ -1007,6 +1009,7 @@ impl<'a> Builder<'a> {
             Hoisted::Entry(slot) => (NodeOp::EntrySlot(slot), Rep::Tagged),
             Hoisted::Env => (NodeOp::Env, Rep::Env),
             Hoisted::ConstEnv(address) => (NodeOp::ConstEnv(address), Rep::Env),
+            Hoisted::GlobalObject => (NodeOp::GlobalObject, Rep::Cell),
         };
         let entry = self.graph.entry.expect("the entry block is made first");
         let node = self.graph.add_node(entry, op, &[], rep, 0);
@@ -1388,6 +1391,10 @@ impl<'a> Builder<'a> {
         }));
         if let Some(&this) = self.hoisted.get(&Hoisted::This) {
             live.insert(this);
+        }
+        // The global object every global read loads its properties from (stage 2, step 4).
+        if let Some(&global) = self.hoisted.get(&Hoisted::GlobalObject) {
+            live.insert(global);
         }
         st.forms.retain(|value, forms| {
             live.contains(value) || forms.members().any(|m| live.contains(&m))

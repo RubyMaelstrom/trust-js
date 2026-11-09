@@ -32,7 +32,7 @@ use super::ir::ExitReason;
 use super::profile::ChunkProfile;
 use crate::bytecode::{Chunk, NameIc, Op, StaticName};
 use crate::feedback::{self, CallState, NamedView, RecordMap, SiteView, ValuesView};
-use crate::interpreter::Env;
+use crate::interpreter::{Env, Interp};
 
 /// Whether a pc's feedback shows that its operation ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,6 +62,17 @@ pub(crate) struct Snapshot {
 // (ExitReason's last variant), which the mask's width bounds.
 const _: () = assert!((ExitReason::Tdz as u32) < u32::BITS);
 
+/// Where a free-name read's search starts (stage 2, step 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Search {
+    /// The record this many parent links from the running environment: the realm's global
+    /// environment for a static global (`Chunk::jit_name_global`), else the running one (0).
+    Running(u16),
+    /// A spliced callee's [[Environment]] (`Op::LoadNameIn`), a compile-time constant while the
+    /// splice's guard holds, which proved the realm too.
+    Pinned,
+}
+
 /// The record a static address counts its hops from (stage 2, step 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Base {
@@ -86,8 +97,21 @@ pub(crate) enum NameView {
     /// Decision 21's static address (a captured binding's at hops 0): no guard, as V8's context
     /// slots, SpiderMonkey's GetAliasedVar and JSC's GetClosureVar read theirs.
     Static { address: StaticName, base: Base },
-    /// A cache in a mode the tier keeps the effect for (scope, depth-1, layout, deep, a global
-    /// object's property), or a store's or update's that has no static address.
+    /// A data property of the realm's global object (the cache in global-object mode on the
+    /// realm's global environment), found again now: its slot and location word
+    /// (`value::location_word`) and the global property epoch (`Props::slot_epoch`); the search's
+    /// environment and the global object the code checks are the realm's (`genv`, and `global`,
+    /// the object's cell). SpiderMonkey's GetGName (jit/CacheIR.cpp:3467-3482).
+    Global {
+        search: Search,
+        genv: usize,
+        global: usize,
+        slot: u32,
+        location: u16,
+        epoch: u16,
+    },
+    /// A cache in a mode the tier keeps the effect for (scope, depth-1, layout, deep, another
+    /// realm's), or a store's or update's that has no static address.
     Dynamic,
     /// An empty cache: the site never ran.
     Empty,
@@ -95,9 +119,29 @@ pub(crate) enum NameView {
     Refused,
 }
 
+impl NameView {
+    /// The byte of the proof a site's checks expect, which a WrongName exit keeps in the exit
+    /// profile as WrongShape's keeps its shapes: a recompile whose proof's byte differs (the
+    /// epoch moved, another realm's cache) checks again (stage 2, step 4).
+    pub(crate) fn proof(&self) -> u8 {
+        match *self {
+            NameView::Global { genv, epoch, .. } => (genv >> 4) as u8 ^ epoch as u8,
+            _ => 0,
+        }
+    }
+}
+
 impl Snapshot {
-    /// The feedback of every operation of `chunk` (its `jit_ops`), as it stands now.
+    /// The feedback of every operation of `chunk` (its `jit_ops`), as it stands now, its global
+    /// names resolved in no realm (they stay effects): the tests' view.
+    #[cfg(test)]
     pub(crate) fn take(chunk: &Chunk) -> Snapshot {
+        Snapshot::take_in(chunk, None)
+    }
+
+    /// [`Snapshot::take`], the global names resolved in `realm`'s running realm, the one the
+    /// compile runs in, whose global environment and object its code checks.
+    pub(crate) fn take_in(chunk: &Chunk, realm: Option<&Interp>) -> Snapshot {
         let ops = chunk.jit_ops();
         let map = chunk.feedback_vector().record_map();
         let mut views = Vec::with_capacity(ops.len());
@@ -105,7 +149,7 @@ impl Snapshot {
         let mut names = Vec::new();
         for (pc, op) in ops.iter().enumerate() {
             let view = view(chunk, map, pc);
-            let name = name_view(chunk, op);
+            let name = name_view(chunk, op, realm);
             if name == NameView::None {
                 ran.push(evidence(chunk, op, &view));
             } else {
@@ -294,7 +338,7 @@ fn name_evidence(name: &NameView) -> Ran {
     match name {
         NameView::None | NameView::Static { .. } => Ran::Unknown,
         NameView::Empty => Ran::No,
-        NameView::Dynamic | NameView::Refused => Ran::Yes,
+        NameView::Global { .. } | NameView::Dynamic | NameView::Refused => Ran::Yes,
     }
 }
 
@@ -312,8 +356,9 @@ fn name_site(op: &Op) -> Option<(u32, u32, Option<u32>)> {
     })
 }
 
-/// The view of the free-name operation `op` of `chunk` (see [`NameView`]).
-fn name_view(chunk: &Chunk, op: &Op) -> NameView {
+/// The view of the free-name operation `op` of `chunk` (see [`NameView`]), its global names
+/// resolved in `realm`'s running realm.
+fn name_view(chunk: &Chunk, op: &Op, realm: Option<&Interp>) -> NameView {
     if let Op::LoadCap(name)
     | Op::StoreCap(name)
     | Op::StoreCapInit(name)
@@ -336,7 +381,7 @@ fn name_view(chunk: &Chunk, op: &Op) -> NameView {
             None => NameView::None,
         };
     }
-    let Some((_, cache, target)) = name_site(op) else {
+    let Some((name, cache, target)) = name_site(op) else {
         return NameView::None;
     };
     if let Some(address) = chunk.jit_name_static(cache) {
@@ -346,7 +391,67 @@ fn name_view(chunk: &Chunk, op: &Op) -> NameView {
         };
         return NameView::Static { address, base };
     }
-    cache_view(&chunk.jit_name_ic(cache))
+    let ic = chunk.jit_name_ic(cache);
+    let read = !matches!(op, Op::StoreNameCached(..) | Op::UpdateNameCached(..));
+    match realm {
+        Some(realm) if read && !ic.unfilled() => {
+            global_view(chunk, realm, name, cache, target, &ic).unwrap_or(NameView::Dynamic)
+        }
+        _ => cache_view(&ic),
+    }
+}
+
+/// A global read's view (see [`NameView::Global`]): its cache in global-object mode on `realm`'s
+/// global environment, the name found again now as a data property of the realm's global object,
+/// ordinary and IC_PLAIN, which no global lexical shadows, at a slot a location word reaches; a
+/// splice's only where its pinned [[Environment]] is that environment and its guard proves the
+/// realm. None otherwise.
+fn global_view(
+    chunk: &Chunk,
+    realm: &Interp,
+    name: u32,
+    cache: u32,
+    target: Option<u32>,
+    ic: &NameIc,
+) -> Option<NameView> {
+    let genv = Env::as_ptr(&realm.global_env) as usize;
+    let search = match target {
+        Some(target) => {
+            let pinned = chunk.inline_target_env(target)?;
+            if Env::as_ptr(&pinned) as usize != genv
+                || chunk.jit_inline_target(target).expected_genv != genv
+            {
+                return None;
+            }
+            Search::Pinned
+        }
+        None => Search::Running(chunk.jit_name_global(cache).unwrap_or(0)),
+    };
+    if ic.env != genv | 1 {
+        return None;
+    }
+    let name = chunk.jit_name(name);
+    let global = realm.global.try_borrow().ok()?;
+    if !global.kind.exotic_is_none() || !global.ic_plain() {
+        return None;
+    }
+    if realm.global_env.try_borrow().ok()?.vars.contains_key(name) {
+        return None;
+    }
+    let slot = global.props.slot_of(name)?;
+    if global.props.property_at(slot)?.accessor() {
+        return None;
+    }
+    let location = global.props.slot_location(slot)?;
+    let epoch = global.props.slot_epoch();
+    (epoch != u16::MAX).then(|| NameView::Global {
+        search,
+        genv,
+        global: crate::value::Gc::as_ptr(&realm.global) as usize,
+        slot: slot as u32,
+        location,
+        epoch,
+    })
 }
 
 /// A name cache's class, for a site the tier keeps the effect at.

@@ -1538,3 +1538,163 @@ fn a_class_whose_heritage_makes_and_calls_a_closure_that_reads_outer_variables()
          let t = 0; for (let k = 0; k < 300; k++) t = (t + outer(k)) % 1000003; t",
     );
 }
+
+/// `name`'s code now, and whether it is the tier's.
+fn tier_code(engine: &mut Engine, name: &str) -> Option<Rc<crate::jit::JitCode>> {
+    let chunk = second_stage(engine, name)?;
+    chunk.jit.get().flatten().filter(|code| is_tier_code(code))
+}
+
+#[test]
+fn a_global_read_in_a_hot_loop_survives_additions_and_exits_once_a_deletion_moves_the_epoch() {
+    // Additions append slots: no exit. A deletion closes its gap and moves the later slots: the
+    // epoch moved, the code exits (WrongName) until its discard, and the recompile reads the new
+    // slots under the new epoch, without exits.
+    const WARM: &str = "globalThis.a = 1; globalThis.b = 2; globalThis.c = 3;
+         function sum(n) { var s = 0; for (var i = 0; i < n; i++) s = s + b + c; return s; }
+         let t = 0; for (let k = 0; k < 1000; k++) t += sum(5); t";
+    const ADD: &str = "for (let k = 0; k < 50; k++) { globalThis['x' + k] = k; t += sum(5); } t";
+    const DELETE: &str = "delete globalThis.a; for (let k = 0; k < 900; k++) t += sum(5); t";
+    const AFTER: &str = "t + sum(7) + b * 100 + c";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [WARM, ADD, DELETE, AFTER].map(|source| eval(&mut vm, source))
+    };
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    exits();
+    discarded();
+    assert_eq!(eval(&mut engine, WARM), expected[0]);
+    let optimized = tier_code(&mut engine, "sum").expect("the tier compiled sum");
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, ADD), expected[1], "additions");
+    assert!(exits().is_empty(), "additions append: no exit");
+    assert_eq!(eval(&mut engine, DELETE), expected[2], "a deletion");
+    let taken = exits();
+    assert_eq!(taken.len(), super::EXIT_LIMIT as usize, "{taken:?}");
+    assert!(
+        taken.iter().all(|&(_, why)| why == ExitReason::WrongName),
+        "{taken:?}"
+    );
+    assert_eq!(discarded(), vec![optimized.mem_ptr() as usize]);
+    let now = tier_code(&mut engine, "sum").expect("the recompile is resident");
+    assert!(!Rc::ptr_eq(&now, &optimized));
+    now.referenced.set(0);
+    assert_eq!(eval(&mut engine, AFTER), expected[3]);
+    assert!(exits().is_empty(), "the recompile reads the new slots");
+    assert!(now.referenced.get() != 0);
+    drop((optimized, now));
+    super::release_retired(&mut engine.interp);
+}
+
+#[test]
+fn global_reads_hold_through_redefinitions_shadowing_lexicals_and_late_sites() {
+    // A property redefined as an accessor and back, a later script's lexical that shadows a
+    // configurable global, and a site that first runs after the compile.
+    names_hold(
+        "globalThis.p = 1; globalThis.q = 2;
+         function read(late) { var r = p + q; if (late) r = r + lateGlobal; return r; }
+         let t = 0; for (let k = 0; k < 600; k++) t += read(false);
+         Object.defineProperty(globalThis, 'p', { get() { return 40; }, configurable: true });
+         for (let k = 0; k < 300; k++) t += read(false);
+         Object.defineProperty(globalThis, 'p', { value: 5, writable: true, configurable: true });
+         for (let k = 0; k < 300; k++) t += read(false);
+         globalThis.lateGlobal = 7;
+         for (let k = 0; k < 300; k++) t += read(true);
+         t",
+    );
+    for switches in [
+        eager(),
+        TestSwitches {
+            exit_limit: 1,
+            ..eager()
+        },
+    ] {
+        switches.set();
+        let mut engine = jit_engine();
+        assert_eq!(
+            eval(
+                &mut engine,
+                "globalThis.s = 3; function shadowed() { return s + 1; }
+                 let u = 0; for (let k = 0; k < 600; k++) u += shadowed(); u"
+            ),
+            "2400"
+        );
+        // A later script's lexical shadows the configurable property: the read sees it.
+        assert_eq!(eval(&mut engine, "let s = 10; shadowed()"), "11");
+        assert_eq!(
+            eval(
+                &mut engine,
+                "let v = 0; for (let k = 0; k < 600; k++) v += shadowed(); v"
+            ),
+            "6600"
+        );
+    }
+}
+
+#[test]
+fn a_function_of_another_realm_reads_its_own_globals() {
+    use crate::realm_inline_guard_tests::{eval_string, in_realm};
+    for switches in [
+        eager(),
+        TestSwitches {
+            exit_every: 7,
+            ..eager()
+        },
+    ] {
+        switches.set();
+        let mut engine = jit_engine();
+        let it = &mut *engine.interp;
+        let other = it.create_realm();
+        eval_string(
+            it,
+            "var own = 1; function reader() { return own; }
+             globalThis.mine = 0; for (var k = 0; k < 600; k++) mine += reader();",
+        );
+        in_realm(it, &other, |it| {
+            eval_string(
+                it,
+                "var own = 100; function reader() { return own; }
+                 var total = 0; for (var k = 0; k < 600; k++) total += reader();",
+            )
+        });
+        let theirs = in_realm(it, &other, |it| eval_string(it, "total"));
+        assert_eq!(theirs, "60000");
+        assert_eq!(eval_string(it, "mine"), "600");
+        // Each realm's reader called from the other: its own realm's global.
+        crate::realm_inline_guard_tests::set_global(it, "otherGlobal", other);
+        assert_eq!(
+            eval_string(
+                it,
+                "var mixed = 0; for (var k = 0; k < 600; k++) mixed += reader() + \
+                 otherGlobal.reader(); mixed"
+            ),
+            "60600"
+        );
+    }
+}
+
+#[test]
+fn typed_arrays_bound_to_a_global_and_to_a_module_variable() {
+    // Mandreel's heap views are globals, zlib's an asm.js module's own variables: the views'
+    // reads and the element accesses on them (step 2).
+    names_hold(
+        "var HEAP32 = new Int32Array(256); var HEAPF64 = new Float64Array(64);
+         function put(i, v) { HEAP32[i & 255] = v | 0; HEAPF64[i & 63] = v * 0.5; }
+         function get(i) { return HEAP32[i & 255] + HEAPF64[(i + 1) & 63]; }
+         function module() {
+           var heap = new Int32Array(128); var u8 = new Uint8Array(heap.buffer);
+           function store(i, v) { heap[i & 127] = v; u8[i & 511] = v & 255; }
+           function load(i) { return heap[i & 127] + u8[(i * 3) & 511]; }
+           return { store: store, load: load };
+         }
+         const m = module();
+         let t = 0;
+         for (let k = 0; k < 3000; k++) { put(k, k * 3); m.store(k, k ^ 0x55);
+           t = (t + get(k) + m.load(k + 1)) % 1000003; }
+         t",
+    );
+}

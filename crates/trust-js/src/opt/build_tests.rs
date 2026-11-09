@@ -1034,7 +1034,14 @@ fn the_verifier_rejects_broken_graphs() {
 /// Flag `reason` at `pc` of `chunk`, as a discard keys an exit there (`opt::profile`): `inlined`
 /// for a site a splice took, `ways` the shapes a WrongShape exit's check expected.
 fn flag(chunk: &Chunk, pc: usize, reason: ExitReason, inlined: bool, ways: u8) {
-    super::profile::ChunkProfile::of(chunk).add_site(pc as u32, reason as u8, inlined, ways);
+    let latest = reason == ExitReason::WrongName;
+    super::profile::ChunkProfile::of(chunk).add_site(
+        pc as u32,
+        reason as u8,
+        inlined,
+        ways,
+        latest,
+    );
 }
 
 fn declines(graph: &Graph) -> Vec<(usize, ExitReason)> {
@@ -2801,4 +2808,230 @@ fn a_store_ends_its_slots_facts_on_every_record() {
         1,
         "{text}"
     );
+}
+
+/// The verified graph of `chunk` with its global names resolved in `engine`'s running realm, as
+/// the driver's compiles take it.
+fn graph_in(engine: &Engine, chunk: &Chunk, name: &str) -> Graph {
+    let snapshot = Snapshot::take_in(chunk, Some(&engine.interp));
+    let graph = build(chunk, &snapshot)
+        .unwrap_or_else(|refusal| panic!("{name}: {refusal:?}\n{:#?}", chunk.jit_ops()));
+    if let Err(error) = verify(&graph, chunk) {
+        panic!("{name}: {error}\n{}", dump(&graph, chunk));
+    }
+    graph
+}
+
+fn is_global_check(op: &NodeOp) -> bool {
+    matches!(
+        op,
+        NodeOp::CheckEnvIs { .. } | NodeOp::CheckCellIs { .. } | NodeOp::CheckGlobalEpoch { .. }
+    )
+}
+
+#[test]
+fn a_global_read_is_checked_once_per_effect_epoch_and_reloaded_after_one() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "var g = 5; function noop() {}
+         function r() { var a = g + g; noop(); return a + g; }
+         for (var i = 0; i < 20; i++) r();",
+    );
+    let chunk = chunk_of(&mut engine, "r");
+    let graph = graph_in(&engine, &chunk, "r");
+    let text = dump(&graph, &chunk);
+    let snapshot = Snapshot::take_in(&chunk, Some(&engine.interp));
+    let read = name_reads(&chunk, "g")[0];
+    let super::snapshot::NameView::Global {
+        location, epoch, ..
+    } = snapshot.name(read)
+    else {
+        panic!("g's global view: {:?}", snapshot.name(read))
+    };
+    assert_eq!(snapshot.ran(read), Ran::Yes);
+    // The realm's environment and object, checked once: value facts.
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckEnvIs { .. })),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckCellIs { .. })),
+        1,
+        "{text}"
+    );
+    // The epoch before the first read and after the call (a heap fact), each WrongName.
+    let epochs = nodes(&graph, |op| matches!(op, NodeOp::CheckGlobalEpoch { .. }));
+    assert_eq!(epochs.len(), 2, "{text}");
+    assert!(
+        epochs.iter().all(|check| check.op
+            == NodeOp::CheckGlobalEpoch {
+                epoch,
+                proof: snapshot.name(read).proof()
+            }
+            && check.reason == Some(ExitReason::WrongName)),
+        "{text}"
+    );
+    // `g`'s slot loaded before the call and after it: one load for `g + g`.
+    let loads = nodes(
+        &graph,
+        |op| matches!(op, NodeOp::LoadField { location: at, .. } if *at == location),
+    );
+    assert_eq!(loads.len(), 2, "{text}");
+    assert!(
+        loads
+            .iter()
+            .all(|load| graph.node(load.inputs[0]).op == NodeOp::GlobalObject),
+        "{text}"
+    );
+    assert_eq!(count(&graph, is_effect), 1, "the call: {text}");
+    // Without the realm, the reads are the effects they were.
+    let graph = graph_for(&chunk, "r without a realm");
+    assert_eq!(count(&graph, is_global_check), 0);
+    assert_eq!(count(&graph, is_effect), 5, "four reads and the call");
+}
+
+#[test]
+fn a_global_called_has_an_undefined_receiver() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function one() { return 1; } function r() { return one(); }
+         for (var i = 0; i < 20; i++) r();",
+    );
+    let chunk = chunk_of(&mut engine, "r");
+    let graph = graph_in(&engine, &chunk, "r");
+    let text = dump(&graph, &chunk);
+    let call = nodes(&graph, is_effect);
+    assert_eq!(call.len(), 1, "{text}");
+    assert_eq!(
+        graph.node(call[0].inputs[0]).op,
+        NodeOp::ConstTagged(PACK_UNDEFINED),
+        "{text}"
+    );
+    assert!(
+        matches!(graph.node(call[0].inputs[1]).op, NodeOp::LoadField { .. }),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_global_the_compile_cannot_prove_stays_the_effect() {
+    // An accessor (its fill refused), a property the global object's prototype holds (refused),
+    // a global store, and a typeof: effects, with no check.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "Object.defineProperty(globalThis, 'acc', { get() { return 2; }, configurable: true });
+         var plain = 1;
+         function r() { plain = acc + valueOf.length; return typeof plain; }
+         for (var i = 0; i < 20; i++) r();",
+    );
+    let chunk = chunk_of(&mut engine, "r");
+    let graph = graph_in(&engine, &chunk, "r");
+    let text = dump(&graph, &chunk);
+    let snapshot = Snapshot::take_in(&chunk, Some(&engine.interp));
+    for name in ["acc", "valueOf"] {
+        assert_eq!(
+            snapshot.name(name_reads(&chunk, name)[0]),
+            super::snapshot::NameView::Refused,
+            "{name}: {text}"
+        );
+    }
+    assert_eq!(count(&graph, is_global_check), 0, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::GlobalObject), 0, "{text}");
+}
+
+#[test]
+fn a_splices_global_read_has_its_guard_for_its_realm() {
+    // `add`'s global read in a splice: the pinned [[Environment]] is the realm's global
+    // environment, which the splice's guard proved, so no environment check; the object's and
+    // the epoch's stay.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "var base = 10;
+         function add(v) { return v + base; }
+         function caller(x) { return add(x); }
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(i); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    let graph = graph_in(&engine, &transformed, "caller's second stage");
+    let text = dump(&graph, &transformed);
+    let Some(&read) = name_reads(&transformed, "base").first() else {
+        panic!("add is spliced: {text}")
+    };
+    let snapshot = Snapshot::take_in(&transformed, Some(&engine.interp));
+    assert!(
+        matches!(
+            snapshot.name(read),
+            super::snapshot::NameView::Global {
+                search: super::snapshot::Search::Pinned,
+                ..
+            }
+        ),
+        "{:?}",
+        snapshot.name(read)
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckEnvIs { .. })),
+        // `add`'s own read, the call's callee, is the caller's static global.
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckCellIs { .. })),
+        1,
+        "{text}"
+    );
+    assert!(
+        nodes(&graph, |op| matches!(op, NodeOp::LoadField { .. }))
+            .iter()
+            .any(|load| load.pc as usize == read),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_global_property_epoch_moves_at_removals_kind_changes_and_shadowing_only() {
+    let mut engine = engine(Tier::Bytecode);
+    let epoch = |engine: &Engine| engine.interp.global.borrow().props.slot_epoch();
+    let start = epoch(&engine);
+    // Additions, value writes and attribute changes of a data property move nothing: a slot found
+    // by its key stays that key's.
+    eval(
+        &mut engine,
+        "globalThis.a = 1; var b = 2; globalThis.a = 3;
+         Object.defineProperty(globalThis, 'a', { enumerable: false });
+         for (var k = 0; k < 20; k++) globalThis['x' + k] = k;",
+    );
+    assert_eq!(epoch(&engine), start);
+    // A removal closes its gap.
+    eval(&mut engine, "delete globalThis.a;");
+    assert_eq!(epoch(&engine), start + 1);
+    // A var's removal fails (non-configurable): nothing moves.
+    eval(&mut engine, "delete globalThis.b;");
+    assert_eq!(epoch(&engine), start + 1);
+    // A data property turned accessor, and back.
+    eval(
+        &mut engine,
+        "Object.defineProperty(globalThis, 'c', { value: 1, configurable: true });
+         Object.defineProperty(globalThis, 'c', { get() { return 1; }, configurable: true });",
+    );
+    assert_eq!(epoch(&engine), start + 2);
+    eval(
+        &mut engine,
+        "Object.defineProperty(globalThis, 'c', { value: 2, configurable: true });",
+    );
+    assert_eq!(epoch(&engine), start + 3);
+    // A later script's lexical that shadows a property; one that shadows none moves nothing.
+    eval(&mut engine, "globalThis.d = 1;");
+    eval(&mut engine, "let d = 2;");
+    assert_eq!(epoch(&engine), start + 4);
+    eval(&mut engine, "let e = 1;");
+    assert_eq!(epoch(&engine), start + 4);
 }

@@ -258,7 +258,8 @@ fn name(chunk: &Chunk) -> String {
 fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
     let started = std::time::Instant::now();
     let compiled = (|| {
-        let snapshot = snapshot::Snapshot::take(chunk);
+        // The global names resolve in the running realm (stage 2, step 4).
+        let snapshot = snapshot::Snapshot::take_in(chunk, Some(&*i));
         let graph = build::build(chunk, &snapshot)?;
         if log_enabled() {
             for decline in &graph.declines {
@@ -294,6 +295,7 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
             return Err(Refusal::whole("no executable capacity"));
         }
         let code = a64::compile(chunk, &graph, &layout, &i.interp_layout.get())?;
+        pin_global_environment(i, &graph);
         Ok((graph.nodes.len(), code))
     })();
     let elapsed = started.elapsed();
@@ -510,13 +512,16 @@ fn flag(chunk: &Chunk, exit: &ExitRecord) {
         ExitReason::WrongShape => exit.shape_check.as_ref().map_or(0, |check| {
             check.shapes.len().min(usize::from(u8::MAX)) as u8
         }),
+        // The proof's byte its check expected (stage 2, step 4).
+        ExitReason::WrongName => exit.proof,
         _ => 0,
     };
     let (at, pc, inlined) = match profile::baseline_site(chunk, exit.pc as usize) {
         Some((baseline, pc, spliced)) => (baseline, pc as u32, spliced),
         None => (chunk, exit.pc, false),
     };
-    let new = ChunkProfile::of(at).add_site(pc, exit.reason as u8, inlined, shapes);
+    let latest = exit.reason == ExitReason::WrongName;
+    let new = ChunkProfile::of(at).add_site(pc, exit.reason as u8, inlined, shapes, latest);
     if new && log_enabled() {
         let key = if std::ptr::eq(at, chunk) {
             "own".to_string()
@@ -588,6 +593,28 @@ pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
         }
     }
     release_retired(i);
+}
+
+/// Keep the running realm's global environment from address reuse while the heap lives, where
+/// `graph`'s code compares a record with it (stage 2, step 4): a global read's code embeds its
+/// address, and another environment at that address would pass its check. As the call caches'
+/// same-realm proof pins it (`Interp::global_env_pins`): a weak pin, which owns no binding.
+fn pin_global_environment(i: &mut Interp, graph: &super::ir::Graph) {
+    use super::ir::NodeOp;
+    let genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
+    let embeds = graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::CheckEnvIs { env, .. } if env as usize == genv));
+    if embeds
+        && !i
+            .global_env_pins
+            .iter()
+            .any(|pin| pin.as_ptr() as usize == genv)
+    {
+        let pin = crate::interpreter::Env::downgrade(&i.global_env);
+        i.global_env_pins.push(pin);
+    }
 }
 
 /// Make `code`, the tier's recompile of `chunk`, the chunk's native code: in place of the

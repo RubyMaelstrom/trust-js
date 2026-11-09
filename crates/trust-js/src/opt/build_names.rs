@@ -19,6 +19,14 @@
 //!   update's arithmetic by its value record, the store, and the record's card unless the word is
 //!   no reference ([`NodeOp::StoreBinding`]), as Maglev's StoreContextSlot, Warp's SetAliasedVar
 //!   and JSC's PutClosureVar.
+//! - A global-object property's read (a static global, or a site in global code, whose cache is
+//!   in global-object mode) is SpiderMonkey's GetGName (jit/CacheIR.cpp:3467-3482): the search's
+//!   environment is the realm's and the global object the compile's ([`NodeOp::CheckEnvIs`],
+//!   [`NodeOp::CheckCellIs`], value facts per activation; a splice's guard proved its realm), the
+//!   global property epoch holds ([`NodeOp::CheckGlobalEpoch`], a heap fact: an effect makes it
+//!   be tested again, as a call does SpiderMonkey's movable guard), and the slot's load
+//!   ([`NodeOp::LoadField`] on the global object, a heap fact per location). Each check exits
+//!   with WrongName.
 //! - Facts ([`Facts`]), as the exemplars' alias rules have them: parent links are value facts
 //!   within an activation (the one later write, class evaluation re-parenting its fresh outer
 //!   record, eval.rs's `eval_class_strict`, happens after its heritage and keys ran, when no
@@ -31,7 +39,7 @@
 use super::*;
 use crate::bytecode::StaticName;
 use crate::fasthash::FastSet;
-use crate::opt::snapshot::{Base, NameView};
+use crate::opt::snapshot::{Base, NameView, Search};
 
 /// Whether `op` can change the running environment (`ctx.env_raw`): the VM's operations that
 /// write it (`run_vm`'s `*env` stores, which `jit_vm_operation` and `jit_scope_op` copy back to
@@ -65,12 +73,17 @@ pub(super) struct Facts {
     constants: FastMap<(NodeIx, u16), NodeIx>,
     /// Heap facts: the values of mutable bindings loaded or stored in this effect epoch.
     values: FastMap<(NodeIx, u16), NodeIx>,
+    /// Value facts: the identity checks passed, by the checked node and the address it is.
+    checked: FastSet<(NodeIx, u64)>,
+    /// A heap fact: the global property epoch checked in this effect epoch.
+    epoch: bool,
 }
 
 impl Facts {
     /// An effect ends the heap facts.
     pub(super) fn clear_heap(&mut self) {
         self.values.clear();
+        self.epoch = false;
     }
 
     /// An operation moved the running environment: the records it reaches are other nodes from
@@ -96,6 +109,13 @@ impl Facts {
                 .collect(),
             constants: common(&first.constants, others().map(|names| &names.constants)),
             values: common(&first.values, others().map(|names| &names.values)),
+            checked: first
+                .checked
+                .iter()
+                .filter(|key| others().all(|names| names.checked.contains(key)))
+                .copied()
+                .collect(),
+            epoch: first.epoch && others().all(|names| names.epoch),
         }
     }
 
@@ -108,6 +128,7 @@ impl Facts {
         }
         Facts {
             values: FastMap::default(),
+            epoch: false,
             ..self.clone()
         }
     }
@@ -387,21 +408,95 @@ impl Builder<'_> {
         for_call: bool,
         st: &mut State,
     ) -> Result<(), Refusal> {
-        let NameView::Static { address, base } = self.snapshot.name(pc) else {
-            return self.effect(pc, st);
-        };
-        let Some(record) = self.static_record(st, address, base, pc) else {
-            return self.effect(pc, st);
-        };
-        // A captured binding checked earlier in the operation's block (`cap_tdz_known`).
-        let known = matches!(self.ops[pc], Op::LoadCap(_)) && self.chunk.jit_cap_initialized(pc);
         let mut cx = Before::new(pc);
-        let value = self.binding_value(st, &mut cx, record, address, known);
+        let value = match self.snapshot.name(pc) {
+            NameView::Static { address, base } => {
+                let Some(record) = self.static_record(st, address, base, pc) else {
+                    return self.effect(pc, st);
+                };
+                // A captured binding checked earlier in the operation's block (`cap_tdz_known`).
+                let known =
+                    matches!(self.ops[pc], Op::LoadCap(_)) && self.chunk.jit_cap_initialized(pc);
+                self.binding_value(st, &mut cx, record, address, known)
+            }
+            view @ NameView::Global { .. } => self.global_read(st, &mut cx, view),
+            _ => return self.effect(pc, st),
+        };
         if for_call {
             let undefined = self.word(PACK_UNDEFINED);
             st.stack.push(undefined);
         }
         st.stack.push(value);
         Ok(())
+    }
+
+    /// An identity check of `value` against `address` [WrongName], unless passed already (a
+    /// value fact).
+    fn check_identity(&mut self, st: &mut State, cx: &mut Before, op: NodeOp, value: NodeIx) {
+        let address = match op {
+            NodeOp::CheckEnvIs { env, .. } => env,
+            NodeOp::CheckCellIs { cell, .. } => cell,
+            _ => unreachable!("an identity check"),
+        };
+        if !st.names.checked.insert((value, address)) {
+            return;
+        }
+        let state = self.before(cx, st);
+        self.add_exit(op, &[value], Rep::None, cx.pc, state, ExitReason::WrongName);
+    }
+
+    /// A global-object property's read (see the module's doc), the site's view `view`.
+    fn global_read(&mut self, st: &mut State, cx: &mut Before, view: NameView) -> NodeIx {
+        let NameView::Global {
+            search,
+            genv,
+            global,
+            slot,
+            location,
+            epoch,
+        } = view
+        else {
+            unreachable!("a global read's view")
+        };
+        let pc = cx.pc;
+        let proof = view.proof();
+        if let Search::Running(hops) = search {
+            let env = self.running_env(st, pc);
+            let record = self.walk(st, env, hops, pc);
+            let check = NodeOp::CheckEnvIs {
+                env: genv as u64,
+                proof,
+            };
+            self.check_identity(st, cx, check, record);
+        }
+        let object = self.hoist(Hoisted::GlobalObject);
+        let check = NodeOp::CheckCellIs {
+            cell: global as u64,
+            proof,
+        };
+        self.check_identity(st, cx, check, object);
+        if !st.names.epoch {
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::CheckGlobalEpoch { epoch, proof },
+                &[object],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::WrongName,
+            );
+            st.names.epoch = true;
+        }
+        if let Some(&value) = st.fields.get(&(object, location)) {
+            return value;
+        }
+        let value = self.add(
+            NodeOp::LoadField { location, slot },
+            &[object],
+            Rep::Tagged,
+            pc,
+        );
+        st.fields.insert((object, location), value);
+        value
     }
 }

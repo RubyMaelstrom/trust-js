@@ -488,6 +488,29 @@ pub(crate) enum NodeOp {
     StoreBinding {
         slot: u16,
     },
+    /// -> Cell: the running realm's global object (`ctx.global_body`, as a cell), which every
+    /// global read of the code loads its property from.
+    GlobalObject,
+    /// (Env): the search's environment is the realm's global environment the compile resolved in
+    /// [WrongName] (the templates' global-mode identity test). `proof` is the site's proof's byte
+    /// (snapshot.rs's NameView::proof), which a WrongName exit keeps in the exit profile.
+    CheckEnvIs {
+        env: u64,
+        proof: u8,
+    },
+    /// (Cell): the global object is the compile's [WrongName], so that its epoch and its slots
+    /// are the realm's whose global environment the search checked.
+    CheckCellIs {
+        cell: u64,
+        proof: u8,
+    },
+    /// (Cell): the global object's slot epoch (`Props::slot_epoch`) is the compile's
+    /// [WrongName]: no property was removed, none turned accessor or back, and no lexical
+    /// declaration shadows one since. SpiderMonkey's GuardGlobalGeneration.
+    CheckGlobalEpoch {
+        epoch: u16,
+        proof: u8,
+    },
 
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's
@@ -542,6 +565,9 @@ impl NodeOp {
                 | NodeOp::CheckBoolean
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CheckInitialized
+                | NodeOp::CheckEnvIs { .. }
+                | NodeOp::CheckCellIs { .. }
+                | NodeOp::CheckGlobalEpoch { .. }
                 | NodeOp::I32Add
                 | NodeOp::I32Sub
                 | NodeOp::I32Mul

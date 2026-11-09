@@ -74,6 +74,42 @@ impl Gen<'_> {
                     emit_card_mark(&mut self.a, record, X9, X30);
                 }
             }
+            NodeOp::GlobalObject => {
+                if !unused {
+                    let dst = self.gp_dst(n);
+                    self.a
+                        .ldr_imm(dst, 19, std::mem::offset_of!(JitCtx, global_body) as u32);
+                    self.a.sub_imm(dst, dst, self.layout.obj_from_cell as u32);
+                    self.gp_done(n, dst);
+                }
+            }
+            NodeOp::CheckEnvIs { env: expected, .. }
+            | NodeOp::CheckCellIs { cell: expected, .. } => {
+                // A record's or a cell's address the compile found, embedded only in this code,
+                // never in a shared stub; the global environment's is pinned against reuse
+                // (`Interp::global_env_pins`) while the heap lives.
+                let site = self.check_exit(n)?;
+                let value = self.gp(node.inputs[0], X16);
+                self.a.mov_imm64(X17, expected);
+                self.a.cmp_reg_x(value, X17);
+                self.a.b_cond(NE, site);
+            }
+            NodeOp::CheckGlobalEpoch { epoch, .. } => {
+                // The epoch through the global object, which the realm's checks proved.
+                let site = self.check_exit(n)?;
+                let cell = self.gp(node.inputs[0], X16);
+                let layout = self.layout;
+                let offset =
+                    layout.obj_from_cell + layout.obj_props + crate::value::PROPS_EPOCH_OFF;
+                self.a.ldrh_imm(X17, cell, offset as u32);
+                if epoch < 4096 {
+                    self.a.cmp_imm_w(X17, u32::from(epoch));
+                } else {
+                    self.a.mov_imm64(X9, u64::from(epoch));
+                    self.a.cmp_reg_w(X17, X9);
+                }
+                self.a.b_cond(NE, site);
+            }
             _ => unreachable!("a free-name node"),
         }
         Ok(())
