@@ -629,12 +629,8 @@ pub(crate) enum SlotSource {
     Frame,
     /// A node holds it; the exit writes it.
     Value(NodeIx),
-    /// The slot is dead at the pc: the exit leaves it as the frame has it.
-    // Stage 1's builder keeps every slot (Frame or Value); the verifier and the exits take Dead.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "stage 1's builder marks no slot dead")
-    )]
+    /// The slot is dead at the pc (stage 2 step 6, `opt::liveness`): the VM writes it before any
+    /// read, so the exit leaves the frame's word as it is.
     Dead,
 }
 

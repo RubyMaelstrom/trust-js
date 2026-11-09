@@ -8,12 +8,14 @@
 //!   are other roots of the Cfg, which the graph never enters: a throw in optimized code exits to
 //!   the VM at the throwing pc, where the VM runs the pad (the plan's point 11).
 //! - Loops: a loop-assignment prepass gives each loop header a phi for every slot a native write
-//!   in the loop assigns and for every operand-stack position. A slot the loop does not assign
-//!   keeps its value through the header when nothing in the loop can be an effect, and is in the
-//!   frame at the header otherwise (an effect leaves every slot in the frame); whether an
-//!   operation can be one is the builder's own choice of its form ([`Rules`], stage 2 step 4),
-//!   which the builder keeps to. A header's poll opens its body, with the header's state, once a
-//!   back edge reaches it.
+//!   in the loop assigns and that is live at the header (stage 2 step 6, `opt::liveness`), and for
+//!   every operand-stack position. A live slot the loop does not assign keeps its value through
+//!   the header when nothing in the loop can be an effect, and is in the frame at the header
+//!   otherwise (an effect leaves every slot in the frame); whether an operation can be one is the
+//!   builder's own choice of its form ([`Rules`], stage 2 step 4), which the builder keeps to. A
+//!   header's poll opens its body, with the header's state, once a back edge reaches it.
+//! - Liveness (stage 2 step 6): a slot dead at a pc is Dead in its frame states, no join merges
+//!   it, no flush writes it, and no value holds it after an effect.
 //! - Joins: a phi where the predecessors' values differ and one of them is not in the frame.
 //!   Values cross block boundaries as tagged words in stage 1 (untagging phis is stage 4's).
 //! - Known facts per value (Maglev's KnownNodeAspects): its other representations (a word's
@@ -51,6 +53,7 @@ use super::ir::{
     SlotSource, StateIx,
 };
 use super::ir::{ElemKind, Holes, Store, TypedKind};
+use super::liveness::SlotLiveness;
 use super::snapshot::{Ran, Snapshot};
 use crate::bytecode::{Chunk, Op, UpdKind};
 use crate::fasthash::FastMap;
@@ -116,7 +119,8 @@ pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Graph, Refusal
         initialized: &initialized,
     };
     let flow = Flow::new(chunk, &cfg, &rules)?;
-    Builder::new(chunk, snapshot, &cfg, &flow, &initialized).run()
+    let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
+    Builder::new(chunk, snapshot, &cfg, &flow, &initialized, &liveness).run()
 }
 
 /// Why stage 1 refuses a chunk holding `op` (the Stage 1 record's list).
@@ -753,6 +757,9 @@ enum Slot {
     Clean(NodeIx),
     /// This node holds the value; the frame's word is stale.
     Dirty(NodeIx),
+    /// The slot is dead (stage 2 step 6, `liveness`): no path reads it before a write, so
+    /// neither a node nor the frame holds a value of it.
+    Dead,
 }
 
 /// A location of the canonical frame a phi merges.
@@ -1076,6 +1083,8 @@ struct Builder<'a> {
     cfg: &'a Cfg,
     flow: &'a Flow,
     initialized: &'a InitializedReads,
+    /// The slots live at each pc (stage 2 step 6).
+    liveness: &'a SlotLiveness,
     n_slots: usize,
     graph: Graph,
     /// The block nodes go to.
@@ -1102,6 +1111,7 @@ impl<'a> Builder<'a> {
         cfg: &'a Cfg,
         flow: &'a Flow,
         initialized: &'a InitializedReads,
+        liveness: &'a SlotLiveness,
     ) -> Self {
         let (_, n_slots) = chunk.jit_frame();
         let blocks = cfg.blocks().len();
@@ -1112,6 +1122,7 @@ impl<'a> Builder<'a> {
             cfg,
             flow,
             initialized,
+            liveness,
             n_slots,
             graph: Graph::new(n_slots),
             cur: BlockIx(0),
@@ -1304,14 +1315,26 @@ impl<'a> Builder<'a> {
         self.hoist(Hoisted::Tagged(word))
     }
 
-    /// The frame state at `pc` as `st` describes it.
+    /// Whether `slot` is live at `pc` (`liveness`).
+    fn live(&self, pc: usize, slot: usize) -> bool {
+        self.liveness.live(pc, slot)
+    }
+
+    /// The frame state at `pc` as `st` describes it, a slot dead there Dead.
     fn frame_state(&mut self, pc: usize, st: &State) -> StateIx {
         let slots = st
             .slots
             .iter()
-            .map(|slot| match *slot {
-                Slot::Dirty(value) => SlotSource::Value(value),
-                _ => SlotSource::Frame,
+            .enumerate()
+            .map(|(slot, held)| {
+                if !self.live(pc, slot) {
+                    return SlotSource::Dead;
+                }
+                debug_assert!(*held != Slot::Dead, "slot {slot} is live at pc {pc}");
+                match *held {
+                    Slot::Dirty(value) => SlotSource::Value(value),
+                    _ => SlotSource::Frame,
+                }
             })
             .collect();
         self.graph.add_state(FrameState {
@@ -1601,6 +1624,9 @@ impl<'a> Builder<'a> {
     fn read_slot(&mut self, st: &mut State, slot: usize, pc: usize) -> NodeIx {
         match st.slots[slot] {
             Slot::Clean(value) | Slot::Dirty(value) => value,
+            // A read makes its slot live (`liveness`), so the state cannot hold it dead; a
+            // bug otherwise, which the frame's stale word would hide.
+            Slot::Dead => unreachable!("a read of slot {slot} at pc {pc}, dead there"),
             // The frame holds the entry value: the entry block's read of it.
             Slot::Entry => {
                 let value = self.hoist(Hoisted::Entry(slot as u16));
@@ -1628,14 +1654,21 @@ impl<'a> Builder<'a> {
             Slot::Frame => {
                 self.add_at_end(block, NodeOp::FrameSlot(slot as u16), &[], Rep::Tagged, pc)
             }
+            // Phis merge live slots only, and a slot live at a successor is live at the end
+            // of each predecessor.
+            Slot::Dead => unreachable!("slot {slot} merged at pc {pc}, dead at an edge into it"),
         };
         st.slots[slot] = Slot::Clean(value);
         value
     }
 
-    /// Write the dirty slots to the frame (before an effect).
+    /// Write the dirty slots live at `pc` to the frame (before an effect there): a dead one is
+    /// read by no one before a write.
     fn flush(&mut self, st: &mut State, pc: usize) {
         for slot in 0..self.n_slots {
+            if !self.live(pc, slot) {
+                continue;
+            }
             if let Slot::Dirty(value) = st.slots[slot] {
                 let word = self.tagged(st, value, pc);
                 self.add(NodeOp::StoreSlot(slot as u16), &[word], Rep::None, pc);
@@ -1667,7 +1700,7 @@ impl<'a> Builder<'a> {
         let mut live: crate::fasthash::FastSet<NodeIx> = st.stack.iter().copied().collect();
         live.extend(st.slots.iter().filter_map(|slot| match *slot {
             Slot::Clean(value) | Slot::Dirty(value) => Some(value),
-            Slot::Entry | Slot::Frame => None,
+            Slot::Entry | Slot::Frame | Slot::Dead => None,
         }));
         if let Some(&this) = self.hoisted.get(&Hoisted::This) {
             live.insert(this);
@@ -1774,6 +1807,8 @@ impl<'a> Builder<'a> {
             let entry_value = matches!(st.slots[slot], Slot::Clean(value)
                 if self.graph.node(value).op == NodeOp::EntrySlot(slot as u16));
             match (header.state.slots[slot], st.slots[slot]) {
+                // Dead at the header: no path from it reads the slot before a write.
+                (Slot::Dead, _) => {}
                 (Slot::Frame, Slot::Dirty(value)) => self.store_at_end(from, slot, value, pc),
                 (Slot::Frame, _) | (Slot::Entry, Slot::Entry) => {}
                 (Slot::Entry, Slot::Clean(_)) if entry_value => {}
@@ -1856,6 +1891,9 @@ impl<'a> Builder<'a> {
         slot: usize,
         pc: usize,
     ) -> (Slot, Option<NodeIx>) {
+        if !self.live(pc, slot) {
+            return (Slot::Dead, None); // no path from the join reads it before a write
+        }
         let first = preds[0].1.slots[slot];
         if preds.iter().all(|(_, st)| st.slots[slot] == first) {
             return (first, None);
@@ -1903,7 +1941,11 @@ impl<'a> Builder<'a> {
         }
         let mut slots = Vec::with_capacity(self.n_slots);
         for slot in 0..self.n_slots {
-            if lp.written[slot] {
+            if !self.live(pc, slot) {
+                // Dead at the header (Maglev's and the DFG's liveness, Ion's EliminatePhis): no
+                // phi, no flush, and any value at a back edge.
+                slots.push(Slot::Dead);
+            } else if lp.written[slot] {
                 let mut values = Vec::with_capacity(preds.len());
                 for (from, st) in preds.iter_mut() {
                     values.push(self.value_at_end(*from, st, Loc::Slot(slot), pc));
@@ -2306,7 +2348,15 @@ impl<'a> Builder<'a> {
             let value = self.add(NodeOp::Projection(result), &[effect], Rep::Tagged, pc);
             st.stack.push(value);
         }
-        st.slots.fill(Slot::Frame);
+        // Every slot live here is in the frame now, the flush's or the template's write; a dead
+        // one holds no value anyone reads.
+        for slot in 0..self.n_slots {
+            st.slots[slot] = if self.live(pc, slot) {
+                Slot::Frame
+            } else {
+                Slot::Dead
+            };
+        }
         st.clear_heap();
         if names::moves_env(&self.ops[pc]) {
             st.names.moved();

@@ -13,11 +13,13 @@
 //! - every node that can exit has a frame state and a reason (an Exit carries its own), and every
 //!   state describes its pc's frame: one source per slot of the chunk, the stack analysis's
 //!   depth at the pc, handler records the chunk pushes at their depth, and values of a
-//!   representation an exit can box, available at the node that exits;
+//!   representation an exit can box, available at the node that exits; a slot a state marks
+//!   Dead is dead at its pc (`opt::liveness`, checked in tests and debug builds);
 //! - an address (Rep::Ptr) is never a phi's or a frame state's value, so no block edge or exit
 //!   recipe carries one; the signatures let only element nodes take one.
 
 use super::ir::{BlockIx, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource};
+use super::liveness::SlotLiveness;
 use crate::bytecode::{Chunk, Op};
 use crate::jit_ir::Cfg;
 
@@ -103,8 +105,11 @@ pub(crate) fn verify(graph: &Graph, chunk: &Chunk) -> Result<(), String> {
             }
         }
     }
+    // The builder's liveness again, where its cost is a test's or a debug build's.
+    let liveness =
+        cfg!(any(test, debug_assertions)).then(|| SlotLiveness::compute(ops, &cfg, n_slots));
     for (index, frame) in graph.states.iter().enumerate() {
-        frame_state(graph, frame, ops, &cfg, n_slots)
+        frame_state(graph, frame, ops, &cfg, n_slots, liveness.as_ref())
             .map_err(|what| format!("frame state {index} (pc {}): {what}", frame.pc))?;
     }
     Ok(())
@@ -531,13 +536,15 @@ fn state_values(frame: &FrameState) -> impl Iterator<Item = NodeIx> + '_ {
 }
 
 /// A frame state against its pc: the slot count, the stack analysis's depth, the handler records
-/// the chunk pushes at their depths, and values an exit can box.
+/// the chunk pushes at their depths, values an exit can box, and Dead slots dead at the pc where
+/// `liveness` is given.
 fn frame_state(
     graph: &Graph,
     frame: &FrameState,
     ops: &[Op],
     cfg: &Cfg,
     n_slots: usize,
+    liveness: Option<&SlotLiveness>,
 ) -> Result<(), String> {
     let pc = frame.pc as usize;
     if pc >= ops.len() {
@@ -560,6 +567,13 @@ fn frame_state(
         match graph.nodes.get(value.index()).map(|node| node.rep) {
             Some(Rep::Tagged | Rep::F64 | Rep::I32 | Rep::Bool) => {}
             rep => return Err(format!("{value:?} of representation {rep:?}")),
+        }
+    }
+    if let Some(liveness) = liveness {
+        if let Some(slot) = (0..n_slots)
+            .find(|&slot| frame.slots[slot] == SlotSource::Dead && liveness.live(pc, slot))
+        {
+            return Err(format!("slot {slot} is Dead where it is live"));
         }
     }
     for &(push, depth) in frame.handlers.iter() {

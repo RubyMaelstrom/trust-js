@@ -1807,3 +1807,20 @@ fn a_global_whose_proof_keeps_failing_converges_on_the_effect() {
          t",
     );
 }
+
+// ---- untagged phis (stage 2, step 6) ------------------------------------------------------------
+
+#[test]
+fn a_catch_reads_a_variable_its_try_overwrites_before_any_other_read() {
+    // `tag` is dead on the try body's normal path after `g(k)` (overwritten, never read), but
+    // live at the call for the catch, which the VM runs on the frame the effect's throw leaves:
+    // the handler keeps it live (the slot liveness's try rule), so the code flushes it there.
+    names_hold(
+        "function g(k) { if (k % 7 === 3) throw new Error('x' + k); return k; }
+         function f(n) { let s = 0;
+           for (let k = 0; k < n; k++) { let tag = k * 2 + 1;
+             try { s += g(k); tag = -1; } catch (e) { s += tag * 1000; } }
+           return s; }
+         let t = 0; for (let r = 0; r < 300; r++) t = (t + f(20)) % 1000003; t",
+    );
+}

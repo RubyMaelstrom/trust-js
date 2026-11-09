@@ -588,9 +588,16 @@ fn effects_flush_dirty_slots_and_read_them_back_from_the_frame() {
     let effect = graph.node(block.body[effect]);
     assert_eq!(effect.reason, Some(ExitReason::Throw), "{text}");
     let state = graph.state(effect.state.expect("an effect has a state"));
+    // `g`, read for the call, is dead there (stage 2 step 6): no flush, and the exit leaves it.
+    let g = slot_named(&chunk, "g") as usize;
+    assert_eq!(state.slots[g], SlotSource::Dead, "{text}");
     assert!(
-        state.slots.iter().all(|slot| *slot == SlotSource::Frame),
-        "the flush left every slot in the frame: {text}"
+        state
+            .slots
+            .iter()
+            .enumerate()
+            .all(|(slot, source)| slot == g || *source == SlotSource::Frame),
+        "the flush left every live slot in the frame: {text}"
     );
     assert_eq!(state.pc, effect.pc, "{text}");
     // After the effect, `o` too is read back and checked again.
@@ -723,23 +730,47 @@ fn branches_on_values_take_to_boolean_and_on_comparisons_take_the_comparison() {
 }
 
 #[test]
-fn a_slot_in_its_temporal_dead_zone_holds_the_marker_in_states() {
+fn a_slot_in_its_temporal_dead_zone_holds_the_marker_in_states_where_it_is_live() {
+    // In `tdz`, `y` is in its temporal dead zone at `x + 1`, but the VM, resumed there, writes it
+    // before any read: the state leaves it Dead (stage 2 step 6). In `tdz2` a read can find the
+    // marker after the check of `c > 1000`: its state holds it.
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
         "function tdz(c) { let x = c; { let y = x + 1; x = y; } return x; }
-         for (var i = 0; i < 20; i++) tdz(i);",
+         function tdz2(c) { let x = c; { if (c > 1000) x = y; let y = x + 1; x = y; } return x; }
+         for (var i = 0; i < 20; i++) { tdz(i); tdz2(i); }",
     );
+    let marked = |graph: &Graph, state: &FrameState| {
+        state
+            .slots
+            .iter()
+            .filter(|slot| {
+                matches!(slot, SlotSource::Value(value)
+                    if graph.node(*value).op == NodeOp::ConstTagged(PACK_EMPTY))
+            })
+            .count()
+    };
     let (chunk, graph) = graph_of(&mut engine, "tdz");
     let text = dump(&graph, &chunk);
     let check = nodes(&graph, |op| *op == NodeOp::CheckNumber);
     assert_eq!(check.len(), 1, "{text}");
     let state = graph.state(check[0].state.expect("a check has a state"));
-    let marked = state.slots.iter().filter(|slot| {
-        matches!(slot, SlotSource::Value(value)
-            if graph.node(*value).op == NodeOp::ConstTagged(PACK_EMPTY))
-    });
-    assert_eq!(marked.count(), 1, "`y` before its declaration runs: {text}");
+    assert_eq!(marked(&graph, state), 0, "{text}");
+    assert_eq!(
+        state.slots[slot_named(&chunk, "y") as usize],
+        SlotSource::Dead,
+        "{text}"
+    );
+    let (chunk, graph) = graph_of(&mut engine, "tdz2");
+    let text = dump(&graph, &chunk);
+    let gt = pc_of(&chunk, |op| matches!(op, Op::Gt));
+    let check = nodes(&graph, |op| *op == NodeOp::CheckNumber)
+        .into_iter()
+        .find(|check| graph.state(check.state.expect("a state")).pc as usize == gt)
+        .unwrap_or_else(|| panic!("the check of `c > 1000`: {text}"));
+    let state = graph.state(check.state.expect("a check has a state"));
+    assert_eq!(marked(&graph, state), 1, "`y` before its declaration runs: {text}");
 }
 
 #[test]
@@ -1026,6 +1057,22 @@ fn the_verifier_rejects_broken_graphs() {
     let mut broken = graph.clone();
     broken.blocks[entry.index()].succs.reverse();
     rejects("swapped successors", broken, "successors");
+    // A slot marked Dead where the liveness says it is live (stage 2 step 6): the builder marks
+    // every other slot so.
+    let mut broken = graph.clone();
+    let (state, slot) = broken
+        .states
+        .iter()
+        .enumerate()
+        .find_map(|(index, state)| {
+            let slot = state.slots.iter().position(|slot| *slot != SlotSource::Dead)?;
+            Some((index, slot))
+        })
+        .expect("a live slot in a state");
+    let mut slots = broken.states[state].slots.to_vec();
+    slots[slot] = SlotSource::Dead;
+    broken.states[state].slots = slots.into_boxed_slice();
+    rejects("a live slot marked Dead", broken, "Dead where it is live");
     verify(&graph, &chunk).expect("the graph itself holds");
 }
 
@@ -1685,6 +1732,38 @@ fn am3_runs_its_loop_without_element_effects() {
         }),
         "{text}"
     );
+}
+
+#[test]
+fn a_loop_has_phis_only_for_the_slots_live_at_its_header() {
+    // am3's `l`, `h` and `m`, declared in its body, are written there before any read: dead at
+    // the header, where neither a phi nor the poll's state holds them (stage 2 step 6). `x`, read
+    // only before the loop, is dead there too.
+    let mut engine = vm_engine(AM3);
+    let (chunk, graph) = graph_of(&mut engine, "am3");
+    let text = dump(&graph, &chunk);
+    let header = graph
+        .blocks
+        .iter()
+        .find(|block| block.loop_header)
+        .expect("the loop");
+    let state = graph.state(graph.node(header.body[0]).state.expect("the poll's state"));
+    let mut carried: Vec<&str> = (0..state.slots.len())
+        .filter(|&slot| {
+            matches!(state.slots[slot], SlotSource::Value(value) if header.phis.contains(&value))
+        })
+        .map(|slot| &*chunk.jit_slot_names()[slot])
+        .collect();
+    carried.sort_unstable();
+    assert_eq!(carried, ["c", "i", "j", "n"], "{text}");
+    assert_eq!(header.phis.len(), 4, "{text}");
+    for name in ["l", "h", "m", "x"] {
+        assert_eq!(
+            state.slots[slot_named(&chunk, name) as usize],
+            SlotSource::Dead,
+            "{name}: {text}"
+        );
+    }
 }
 
 #[test]

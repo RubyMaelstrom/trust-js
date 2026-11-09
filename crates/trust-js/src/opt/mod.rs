@@ -56,6 +56,14 @@ pub(crate) mod exit;
     )
 ))]
 pub(crate) mod ir;
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
+pub(crate) mod liveness;
 // Every chunk carries the record's cell (`Chunk::opt`), wherever the tier has a back end or not.
 pub(crate) mod profile;
 #[cfg(all(
