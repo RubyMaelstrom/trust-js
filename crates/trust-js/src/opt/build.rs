@@ -48,7 +48,7 @@ use super::ir::{
     BlockData, BlockIx, Cond, Decline, ExitReason, FrameState, Graph, NodeIx, NodeOp, Refusal, Rep,
     SlotSource, StateIx,
 };
-use super::ir::{ElemKind, Holes};
+use super::ir::{ElemKind, Holes, Store};
 use super::snapshot::{Ran, Snapshot};
 use crate::bytecode::{Chunk, Op, UpdKind};
 use crate::fasthash::FastMap;
@@ -1809,6 +1809,16 @@ impl<'a> Builder<'a> {
                 let slot = self.slot(pc, slot as usize)?;
                 self.element_load(pc, Recv::Slot(slot), st)?
             }
+            Op::SetElem => self.element_store(pc, Recv::Stack, true, st)?,
+            Op::SetElemDrop => self.element_store(pc, Recv::Stack, false, st)?,
+            Op::SetElemLocal(slot) => {
+                let slot = self.slot(pc, slot as usize)?;
+                self.element_store(pc, Recv::Slot(slot), true, st)?
+            }
+            Op::SetElemLocalDrop(slot) => {
+                let slot = self.slot(pc, slot as usize)?;
+                self.element_store(pc, Recv::Slot(slot), false, st)?
+            }
             Op::ToPropKey => self.to_prop_key(pc, Recv::Stack, st)?,
             Op::ToPropKeyLocal(slot) => {
                 let slot = self.slot(pc, slot as usize)?;
@@ -2609,6 +2619,18 @@ impl Builder<'_> {
         int
     }
 
+    /// The key an element index has in the epoch's element facts: a checked conversion's f64, so
+    /// that CheckIndex and CheckInt32 of one Number name one element (`a[j]` read, then
+    /// `a[j++] = v` written). They agree wherever both pass: CheckInt32 exits on -0, the one
+    /// value they convert apart.
+    fn index_key(&self, index: NodeIx) -> NodeIx {
+        let node = self.graph.node(index);
+        match node.op {
+            NodeOp::CheckIndex | NodeOp::CheckInt32 => node.inputs[0],
+            _ => index,
+        }
+    }
+
     /// The element words of the object `word` names (its cell `cell`), loaded once per effect
     /// epoch: Maglev's BuildLoadElements, a known property until a store kills it
     /// (maglev-reducer-inl.h:1251-1275).
@@ -2645,10 +2667,11 @@ impl Builder<'_> {
     ) -> NodeIx {
         let pc = cx.pc;
         let words = self.elements_of(st, word, cell, pc);
-        if let Some(&value) = st.loaded.get(&(words, index)) {
+        let key = self.index_key(index);
+        if let Some(&value) = st.loaded.get(&(words, key)) {
             return value;
         }
-        let value = if st.present.contains(&(words, index)) {
+        let value = if st.present.contains(&(words, key)) {
             // In bounds and no hole, as a load or a store this epoch proved.
             let state = self.before(cx, st);
             self.add_exit(
@@ -2695,11 +2718,11 @@ impl Builder<'_> {
                 ExitReason::Hole,
             );
             if holes == Holes::Exit {
-                st.present.insert((words, index));
+                st.present.insert((words, key));
             }
             value
         };
-        st.loaded.insert((words, index), value);
+        st.loaded.insert((words, key), value);
         value
     }
 
@@ -2725,6 +2748,84 @@ impl Builder<'_> {
         let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
         st.stack.truncate(len - pops);
         st.stack.push(value);
+        Ok(())
+    }
+
+    /// The representation an element store takes `value` in: its int32 form, its f64 form, a
+    /// constant Number as either, else its word (a Boolean's boxed).
+    fn element_value(&mut self, st: &mut State, value: NodeIx, pc: usize) -> NodeIx {
+        let forms = self.forms(st, value);
+        if let Some(int) = forms.i32 {
+            return int;
+        }
+        if let Some(number) = forms.f64 {
+            return number;
+        }
+        match self.constant(value).and_then(number_word) {
+            Some(x) => match exact_i32(x) {
+                Some(int) => self.hoist(Hoisted::I32(int)),
+                None => self.hoist(Hoisted::F64(x.to_bits())),
+            },
+            None => self.tagged(st, value, pc),
+        }
+    }
+
+    /// SetElem, SetElemDrop, SetElemLocal and SetElemLocalDrop to an existing element of element
+    /// words (Maglev's element store on a JSArray or JSObject, maglev-graph-builder.cc:5346-5461,
+    /// as Warp's StoreDenseElement, WarpCacheIRTranspiler.cpp:3167-3194): the receiver and the
+    /// key as a load takes them, then StoreElement, which checks the bounds and the hole unless
+    /// the epoch proved the element present, keeps the kind bits exact in place, copies a shared
+    /// literal's block, and exits on frozen elements. A store may copy or grow a block, and
+    /// another word may name its object, so every element address and read of the epoch ends
+    /// with it but its own words, whose element it now knows; no store makes a hole, so the
+    /// present elements stay.
+    fn element_store(
+        &mut self,
+        pc: usize,
+        recv: Recv,
+        keep: bool,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let Some(site) = self.element_site(pc) else {
+            return self.effect(pc, st);
+        };
+        let len = st.stack.len();
+        let (key, value) = (st.stack[len - 2], st.stack[len - 1]);
+        let receiver = self.receiver(recv, st, 2, pc);
+        if !self.element_operands(receiver, key) {
+            return self.effect(pc, st);
+        }
+        let mut cx = Before::new(pc);
+        let cell = self.elements_cell(st, &mut cx, receiver, site.kind);
+        let index = self.element_index(st, &mut cx, key);
+        let words = self.elements_of(st, receiver, cell, pc);
+        let stored = self.element_value(st, value, pc);
+        let key = self.index_key(index);
+        let mode = if st.present.contains(&(words, key)) {
+            Store::Present
+        } else {
+            Store::Existing
+        };
+        let state = self.before(&mut cx, st);
+        let after = self.add_exit(
+            NodeOp::StoreElement(mode),
+            &[cell, words, index, stored],
+            Rep::Ptr,
+            pc,
+            state,
+            ExitReason::WrongElements,
+        );
+        st.elements.clear();
+        st.used.clear();
+        st.loaded.clear();
+        st.elements.insert(receiver, after);
+        st.present.insert((after, key));
+        st.loaded.insert((after, key), value);
+        let pops = if matches!(recv, Recv::Stack) { 3 } else { 2 };
+        st.stack.truncate(len - pops);
+        if keep {
+            st.stack.push(value);
+        }
         Ok(())
     }
 

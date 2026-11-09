@@ -3805,6 +3805,14 @@ mod asm {
         pub fn ldr_x_uxtw3(&mut self, rt: u32, rn: u32, rm: u32) {
             self.emit(0xF860_5800 | (rm << 16) | (rn << 5) | rt);
         }
+        /// str xt, [xn, wm, uxtw #3]
+        pub fn str_x_uxtw3(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit(0xF820_5800 | (rm << 16) | (rn << 5) | rt);
+        }
+        /// str dt, [xn, wm, uxtw #3]
+        pub fn str_d_uxtw3(&mut self, rt: u32, rn: u32, rm: u32) {
+            self.emit_fp(0xFC20_5800 | (rm << 16) | (rn << 5) | rt);
+        }
         /// adds wd, wn, #imm (sets flags; V on i32 overflow; any immediate, see `flags`)
         #[inline]
         pub fn adds_imm_w(&mut self, rd: u32, rn: u32, imm: u32) {

@@ -2598,3 +2598,272 @@ fn a_read_past_the_used_words_reads_undefined_and_a_negative_index_exits() {
     // The proof fails for the hole too, which exits with the hole's reason.
     assert_eq!(reasons(), vec![ExitReason::OutOfBounds, ExitReason::Hole]);
 }
+
+/// `set(a, i, v)` (LoadLocal 1, LoadLocal 2, SetElemLocalDrop 0 at pc 2, LoadLocal 0, Return):
+/// `a` checked an Array, `i` an index, and `v` stored as `value` takes it (a word, an int32 or an
+/// f64), under `mode`; with Present, a read of a[i] first proves the element.
+const SET: &str = "function set(a, i, v) { a[i] = v; return a; } set([1, 2], 0, 1);";
+
+#[derive(Clone, Copy, PartialEq)]
+enum Value3 {
+    Word,
+    Int32,
+    F64,
+}
+
+fn set(value: Value3, mode: Store) -> Graph {
+    let mut b = Build::new(3);
+    let entry = b.block(0, false);
+    let a = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let i = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let v = b.node(entry, NodeOp::EntrySlot(2), &[], Rep::Tagged, 0);
+    let at_set = b.state(2, &[i, v], &[], &[]);
+    let check = |b: &mut Build, op: NodeOp, inputs: &[NodeIx], rep: Rep, reason: ExitReason| {
+        b.exiting(entry, op, inputs, rep, 2, at_set, reason)
+    };
+    let cell = check(
+        &mut b,
+        NodeOp::CheckObject,
+        &[a],
+        Rep::Cell,
+        ExitReason::NotObject,
+    );
+    check(
+        &mut b,
+        NodeOp::CheckElements(ElemKind::Array),
+        &[cell],
+        Rep::None,
+        ExitReason::WrongElements,
+    );
+    let fi = check(
+        &mut b,
+        NodeOp::CheckNumber,
+        &[i],
+        Rep::F64,
+        ExitReason::NotNumber,
+    );
+    let index = check(
+        &mut b,
+        NodeOp::CheckIndex,
+        &[fi],
+        Rep::I32,
+        ExitReason::NotInt32,
+    );
+    let stored = match value {
+        Value3::Word => v,
+        Value3::F64 => check(
+            &mut b,
+            NodeOp::CheckNumber,
+            &[v],
+            Rep::F64,
+            ExitReason::NotNumber,
+        ),
+        Value3::Int32 => {
+            let fv = check(
+                &mut b,
+                NodeOp::CheckNumber,
+                &[v],
+                Rep::F64,
+                ExitReason::NotNumber,
+            );
+            check(
+                &mut b,
+                NodeOp::CheckInt32,
+                &[fv],
+                Rep::I32,
+                ExitReason::NotInt32,
+            )
+        }
+    };
+    let words = b.node(entry, NodeOp::LoadElements, &[cell], Rep::Ptr, 2);
+    if mode == Store::Present {
+        let used = b.node(entry, NodeOp::LoadElementsUsed, &[words], Rep::I32, 2);
+        check(
+            &mut b,
+            NodeOp::CheckBounds,
+            &[index, used],
+            Rep::None,
+            ExitReason::OutOfBounds,
+        );
+        check(
+            &mut b,
+            NodeOp::LoadElement(Holes::Exit),
+            &[cell, words, index],
+            Rep::Tagged,
+            ExitReason::Hole,
+        );
+    }
+    check(
+        &mut b,
+        NodeOp::StoreElement(mode),
+        &[cell, words, index, stored],
+        Rep::Ptr,
+        ExitReason::WrongElements,
+    );
+    b.node(entry, NodeOp::Return, &[a], Rep::None, 4);
+    b.g
+}
+
+/// The kind bits of the global `name`'s element words, those a scan computes, and whether a scan
+/// made them exact.
+fn kind_bits(engine: &mut Engine, name: &str) -> (u32, u32, bool) {
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var(name, &env).ok().expect("a global");
+    let object = value.as_obj().expect("an object");
+    let object = object.borrow();
+    let words = object.props.words().expect("element words");
+    (words.kind(), words.computed_kind(), words.scanned())
+}
+
+#[test]
+fn element_stores_write_each_representation_and_keep_the_kind_bits_exact() {
+    use crate::value::word_block::{KIND_INT32, KIND_NUMBERS};
+    for (value, mode) in [
+        (Value3::Word, Store::Existing),
+        (Value3::Int32, Store::Existing),
+        (Value3::F64, Store::Existing),
+        (Value3::Word, Store::Present),
+        (Value3::Int32, Store::Present),
+    ] {
+        let mut engine = fixture(SET);
+        install(&mut engine, "set", &set(value, mode), Options::default());
+        stress(&engine);
+        exits();
+        let label = format!("{:?} {mode:?}", value as u8);
+        // Int32s into int32 words keep INT32.
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var ints = [1, 2, 3]; set(ints, 1, 7); ints.join()"
+            ),
+            "1,7,3",
+            "{label}"
+        );
+        let (kind, computed, _) = kind_bits(&mut engine, "ints");
+        assert_eq!(kind & !computed, 0, "{label}");
+        assert_ne!(kind & KIND_INT32, 0, "{label}");
+        if value != Value3::Int32 {
+            // A fraction and -0 clear INT32 but keep NUMBERS.
+            assert_eq!(
+                eval(
+                    &mut engine,
+                    "set(ints, 0, 2.5); set(ints, 2, -0); ints[0] + ':' + Object.is(ints[2], -0)"
+                ),
+                "2.5:true",
+                "{label}"
+            );
+            let (kind, computed, _) = kind_bits(&mut engine, "ints");
+            assert_eq!(kind & !computed, 0, "{label}");
+            assert_eq!(kind & (KIND_INT32 | KIND_NUMBERS), KIND_NUMBERS, "{label}");
+        }
+        if value == Value3::Word {
+            // A reference clears NUMBERS; the array keeps the object through collections.
+            assert_eq!(
+                eval(
+                    &mut engine,
+                    "var nums = [1.5, 2.5]; set(nums, 1, {tag: 'n'}); \
+                     var junk = []; for (var k = 0; k < 500; k++) junk.push([k]); nums[1].tag"
+                ),
+                "n",
+                "{label}"
+            );
+            let (kind, computed, _) = kind_bits(&mut engine, "nums");
+            assert_eq!(kind & !computed, 0, "{label}");
+            assert_eq!(kind & KIND_NUMBERS, 0, "{label}");
+            assert_eq!(
+                eval(
+                    &mut engine,
+                    "set([1, 2], 0, 'str')[0] + set([1], 0, null)[0]"
+                ),
+                "strnull",
+                "{label}"
+            );
+        }
+        if value == Value3::F64 {
+            assert_eq!(
+                eval(&mut engine, "var nan = set([1], 0, 0 / 0)[0]; nan !== nan"),
+                "true",
+                "{label}"
+            );
+        }
+        assert!(exits().is_empty(), "{label}");
+    }
+}
+
+#[test]
+fn a_store_copies_a_shared_literal_and_exits_where_the_vm_writes() {
+    let mut engine = fixture(SET);
+    install(
+        &mut engine,
+        "set",
+        &set(Value3::Int32, Store::Existing),
+        Options::default(),
+    );
+    stress(&engine);
+    exits();
+    // A constant literal's copies share one block: the write copies it first.
+    assert_eq!(
+        eval(
+            &mut engine,
+            "function lit() { return [1, 2, 3]; } var p = lit(), q = lit(); \
+             set(p, 0, 9); set(p, 2, 8); p.join() + ':' + q.join() + ':' + lit().join()"
+        ),
+        "9,2,8:1,2,3:1,2,3"
+    );
+    // Sealed elements take overwrites.
+    assert_eq!(
+        eval(&mut engine, "set(Object.seal([1, 2]), 0, 5).join()"),
+        "5,2"
+    );
+    assert!(exits().is_empty());
+    for (call, result, reason) in [
+        // Frozen elements take no write (a sloppy function's store does nothing).
+        (
+            "set(Object.freeze([1, 2]), 0, 5).join()",
+            "1,2",
+            ExitReason::WrongElements,
+        ),
+        ("set([1, 2], 2, 3).join()", "1,2,3", ExitReason::OutOfBounds),
+        ("set([1, , 3], 1, 2).join()", "1,2,3", ExitReason::Hole),
+        ("set([1, 2], -1, 3)[-1]", "3", ExitReason::OutOfBounds),
+        ("set([1, 2], 0, 1.5).join()", "1.5,2", ExitReason::NotInt32),
+    ] {
+        assert_eq!(eval(&mut engine, call), result, "{call}");
+        assert_eq!(reasons(), vec![reason], "{call}");
+    }
+}
+
+#[test]
+fn edges_stored_into_large_arrays_mark_their_runs() {
+    // An old array of more than 64 words keeps a remembered record: a minor collection traces
+    // its dirty runs and the words past its traced length only, so an edge stored below that
+    // length must mark its run, or the young value it names dies. A collection every 37 cells
+    // leaves most stored values young (a collection at every allocation would age each one at
+    // the call's safepoint before its store).
+    let mut engine = fixture(SET);
+    install(
+        &mut engine,
+        "set",
+        &set(Value3::Word, Store::Existing),
+        Options::default(),
+    );
+    {
+        let mut core = engine.interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(37);
+        core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    }
+    exits();
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var big = []; for (var k = 0; k < 100; k++) big.push(k % 2 ? {k: k} : k);\n\
+             var junk = []; for (var k = 0; k < 200; k++) junk.push([k]);\n\
+             for (var r = 0; r < 4; r++) for (var k = 0; k < 33; k++) \
+             set(big, k * 3, {tag: 'v' + k + r});\n\
+             junk = []; for (var k = 0; k < 400; k++) junk.push([k]);\n\
+             var ok = 0; for (var k = 0; k < 33; k++) if (big[k * 3].tag === 'v' + k + 3) ok++; ok"
+        ),
+        "33"
+    );
+    assert!(exits().is_empty());
+}

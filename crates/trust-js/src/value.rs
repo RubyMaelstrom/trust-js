@@ -9715,6 +9715,21 @@ impl Props {
         }
     }
 
+    /// The element words' address, a shared literal's block made this map's own first
+    /// (`Words::make_own`): the optimizing tier's element store into a copy-on-write block (P3
+    /// stage 2 step 2, a pure call from generated code under the object's mutable borrow, which
+    /// marked its card for the new block). Allocates and never collects.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn own_words_address(&mut self) -> usize {
+        if let Some(words) = self.elems.words_mut() {
+            words.make_own();
+        }
+        self.elems.words_start().words_address()
+    }
+
     /// Append one plain element as a word, with no decimal key or index-to-field map. Array
     /// exotic validation (length, extensibility and prototype setters) stays at the caller.
     /// ECMA-262 Array [[DefineOwnProperty]] / OrdinarySet, e28783d5.

@@ -174,6 +174,23 @@ const PROGRAMS: &[&str] = &[
      const x = new BI(20, 7919); const w = new BI(40, 104729); let c = 0;\n\
      for (let k = 0; k < 3000; k++) c = (c + x.am(0, (k * 31) & 0xfffffff, w, k % 20, 0, 20)) | 0;\n\
      c + ':' + w.array.slice(0, 6).join(',')",
+    // Element stores: int32s, doubles, -0, NaN, past-int32 Numbers and references into int32,
+    // double and copy-on-write words, frozen and sealed arrays, holes, appends and gaps.
+    "function put(a, i, v) { a[i] = v; return a; }\n\
+     function lit() { return [1, 2, 3, 4]; }\n\
+     const vals = [7, 2.5, -0, NaN, 'w', null, {t: 1}, 2147483648];\n\
+     let out = ''; for (let k = 0; k < 3000; k++) { const s = k % 5; \
+     const a = s === 0 ? lit() : s === 1 ? Object.freeze([1, 2, 3, 4]) : \
+     s === 2 ? Object.seal([1.5, 2, 3, 4]) : s === 3 ? [1, , 3, 4] : [1, 2, 3, 4]; \
+     put(a, k % 6, vals[k % vals.length]); \
+     out += a.length + String(Object.is(a[k % 6], -0) ? 'z' : a[k % 6])[0]; }\n\
+     out.length + out.slice(0, 80) + lit().join()",
+    // References into an array of more than 64 words, read back across collections.
+    "function fill(a, n, k) { for (let i = 0; i < n; i++) a[i] = {k: k, i: i}; return a; }\n\
+     const big = []; for (let i = 0; i < 100; i++) big.push(i * 0.5);\n\
+     let t = 0; for (let k = 0; k < 1000; k++) { fill(big, 100, k); \
+     if (k % 50 === 0) { const junk = []; for (let j = 0; j < 200; j++) junk.push([j]); } \
+     t += big[k % 100].k + big[(k * 7) % 100].i; } t",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {

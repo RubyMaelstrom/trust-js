@@ -270,6 +270,37 @@ impl Words {
         }
     }
 
+    /// [`Words::unshare`] for the optimizing tier's element store into a shared literal's block
+    /// (P3 stage 2 step 2, a pure call from generated code): the private copy that every write in
+    /// place makes first, which allocates a storage block and never collects.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn make_own(&mut self) {
+        self.unshare();
+    }
+
+    /// Mark, in the remembered record of the block whose first word is at `words`, the dirty bit
+    /// of the run holding `index`, for an edge generated code stored there: the optimizing tier's
+    /// element store (P3 stage 2 step 2), as Warp's post barrier for a large array is a pure call
+    /// (jit/VMFunctions.cpp:1054-1076). What [`Words::set`] records through `remember`; a block
+    /// without a record, or an index at or past its traced length, needs nothing.
+    ///
+    /// # Safety
+    /// `words` is a heap block's first word (a map's words pointer, not a shared literal's), and
+    /// `index` lies below its used length.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) unsafe fn remember_edge_at(words: *mut u64, index: usize) {
+        // SAFETY: a block's first word, as the caller says; a `Words` reads nothing when dropped.
+        let mut block = Words(unsafe { NonNull::new_unchecked(words) });
+        // Any reference's word: `remember` records a word that is no Number and no hole.
+        block.remember(index, PACK_OBJ);
+    }
+
     #[inline(never)]
     fn copy_shared(&mut self) {
         let len = self.len();

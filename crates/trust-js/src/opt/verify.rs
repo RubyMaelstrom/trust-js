@@ -344,6 +344,8 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         // The cell first: it keeps the words alive while their address is used.
         NodeOp::LoadElement(_) => (&[Rep::Cell, Rep::Ptr, Rep::I32], Rep::Tagged),
         NodeOp::LoadElementOrUndefined => (&[Rep::Cell, Rep::Ptr, Rep::I32, Rep::I32], Rep::Tagged),
+        // Its value takes one of three representations (`representations`).
+        NodeOp::StoreElement(_) => return None,
         NodeOp::StoreSlot(_) => (TAGGED, Rep::None),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),
@@ -442,6 +444,14 @@ fn representations(
                     node.rep,
                     if check { "check" } else { "test" }
                 ));
+            }
+        }
+        NodeOp::StoreElement(_) => {
+            // The owner's cell, its words, the index, then the value as an int32, an f64 or a
+            // word; the words after the store out.
+            let value = matches!(reps[..], [_, _, _, Rep::I32 | Rep::F64 | Rep::Tagged]);
+            if !value || reps[..3] != [Rep::Cell, Rep::Ptr, Rep::I32] || node.rep != Rep::Ptr {
+                return Err(format!("({reps:?}) -> {:?} for an element store", node.rep));
             }
         }
         op => {

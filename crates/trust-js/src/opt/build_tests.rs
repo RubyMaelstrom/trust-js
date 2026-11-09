@@ -1631,6 +1631,101 @@ fn compound_element_assignment_takes_its_number_key_as_it_is() {
     );
 }
 
+/// Crypto's am3 (Octane crypto.js:108-122), which montReduce's second stage splices, on
+/// BigInteger-like receivers, run by the VM so that its records hold what each access saw.
+const AM3: &str = "function am3(i, x, w, j, c, n) {
+       var this_array = this.array; var w_array = w.array;
+       var xl = x & 0x3fff, xh = x >> 14;
+       while (--n >= 0) {
+         var l = this_array[i] & 0x3fff; var h = this_array[i++] >> 14;
+         var m = xh * l + h * xl; l = xl * l + ((m & 0x3fff) << 14) + w_array[j] + c;
+         c = (l >> 28) + (m >> 14) + xh * h; w_array[j++] = l & 0xfffffff;
+       }
+       return c;
+     }
+     function BI(n) { this.array = []; for (var k = 0; k < n; k++) this.array.push(k * 7919); }
+     BI.prototype.am = am3;
+     var x = new BI(8), w = new BI(16);
+     for (var k = 0; k < 20; k++) x.am(0, 12345, w, k % 8, 0, 8);";
+
+#[test]
+fn am3_runs_its_loop_without_element_effects() {
+    let mut engine = vm_engine(AM3);
+    let (chunk, graph) = graph_of(&mut engine, "am3");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    // this_array[i] once for both of its reads (i, then i before i++), w_array[j] once, and
+    // w_array[j++]'s write proven present by that read: no bounds or hole test.
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadElement(_))),
+        2,
+        "{text}"
+    );
+    let stores = nodes(&graph, |op| matches!(op, NodeOp::StoreElement(_)));
+    assert_eq!(stores.len(), 1, "{text}");
+    assert_eq!(stores[0].op, NodeOp::StoreElement(Store::Present), "{text}");
+    // The digit is an int32: stored as its f64 bits, with no card.
+    assert_eq!(graph.node(stores[0].inputs[3]).rep, Rep::I32, "{text}");
+    // The loop's blocks hold its elements: the loads and the store are in a loop body.
+    let header = graph
+        .blocks
+        .iter()
+        .position(|block| block.loop_header)
+        .expect("the loop");
+    assert!(
+        graph.nodes.iter().all(|node| {
+            !matches!(node.op, NodeOp::StoreElement(_)) || node.block.index() > header
+        }),
+        "{text}"
+    );
+}
+
+#[test]
+fn element_stores_take_the_values_representation_and_end_the_epochs_reads() {
+    let mut engine = vm_engine(
+        "function seti(a, i, v) { a[i] = v | 0; } function setd(a, i, v) { a[i] = v * 0.5; }
+         function setw(a, i, v) { a[i] = v; } function rmw(a, i) { a[i] = a[i] + 1; }
+         function two(a, b, i) { a[i] = 1; return b[i] + a[i]; }
+         for (var k = 0; k < 20; k++) {
+           seti([1, 2], 1, k); setd([1, 2], 0, k); setw([1, 2], 1, 'v' + k); rmw([1, 2], 1);
+           two([1, 2], [3, 4], 0);
+         }",
+    );
+    for (name, mode, rep) in [
+        ("seti", Store::Existing, Rep::I32),
+        ("setd", Store::Existing, Rep::F64),
+        ("setw", Store::Existing, Rep::Tagged),
+        ("rmw", Store::Present, Rep::I32),
+    ] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        let stores = nodes(&graph, |op| matches!(op, NodeOp::StoreElement(_)));
+        assert_eq!(stores.len(), 1, "{name}: {text}");
+        assert_eq!(stores[0].op, NodeOp::StoreElement(mode), "{name}: {text}");
+        assert_eq!(graph.node(stores[0].inputs[3]).rep, rep, "{name}: {text}");
+        assert_eq!(
+            stores[0].reason,
+            Some(ExitReason::WrongElements),
+            "{name}: {text}"
+        );
+        // The store exits before its operation, with its operands on the stack.
+        let state = graph.state(stores[0].state.expect("a store has a state"));
+        let pc = pc_of(&chunk, |op| matches!(op, Op::SetElemLocalDrop(_)));
+        assert_eq!((state.pc as usize, state.stack.len()), (pc, 2), "{text}");
+    }
+    // After a store, another word's words are loaded again (it may name the same object); the
+    // stored element is the value written.
+    let (chunk, graph) = graph_of(&mut engine, "two");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == NodeOp::LoadElements), 2, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadElement(_))),
+        1,
+        "b[i] alone: {text}"
+    );
+}
+
 #[test]
 fn element_sites_the_words_do_not_serve_stay_effects() {
     let mut engine = vm_engine(

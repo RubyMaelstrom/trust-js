@@ -106,6 +106,16 @@ pub(crate) enum Holes {
     Undefined,
 }
 
+/// What an element store knows of the element it writes (P3 stage 2 step 2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum Store {
+    /// Below the used length and no hole, as a load or store of the epoch proved.
+    Present,
+    /// An existing element: an index at or past the used length exits [OutOfBounds], a hole
+    /// [Hole].
+    Existing,
+}
+
 /// Why a check fails or an exit is taken, for the log, the exit profile (stage 2; keyed by the
 /// reason's discriminant, `opt::profile`) and tests.
 // Only the back end builds the reasons of exits on Booleans and of the forced-exit gate: where
@@ -306,6 +316,16 @@ pub(crate) enum NodeOp {
     /// LoadDenseElementHoleResult): below used, LoadElement(Undefined); at or past it, undefined
     /// under the same proof, a negative index exiting [OutOfBounds] (Warp's negative-index bail).
     LoadElementOrUndefined,
+    /// (Cell, Ptr, I32 index, value I32 | F64 | Tagged) -> Ptr: a store to an existing element
+    /// (Maglev's StoreFixedArrayElement and StoreFixedDoubleArrayElement), which keeps the kind
+    /// bits exact in place where V8 transitions the map: an int32 is SCVTF and STR D, kind bits
+    /// untouched while INT32 holds; an f64 its NaN canonicalized (any other NaN reads as a tag)
+    /// and INT32 kept only for an exact int32; any other word clears NUMBERS and INT32 and marks
+    /// the owner's card, and below a large block's traced length its dirty bit by a pure call
+    /// (Warp's post barrier for large arrays). A copy-on-write block is copied by a pure call
+    /// first (Maglev's EnsureWritableFastElements), frozen elements exit [WrongElements]. Its
+    /// output is the object's words after the store: a copy's, or the input's.
+    StoreElement(Store),
 
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's
@@ -371,6 +391,7 @@ impl NodeOp {
                 | NodeOp::CheckBounds
                 | NodeOp::LoadElement(_)
                 | NodeOp::LoadElementOrUndefined
+                | NodeOp::StoreElement(_)
         )
     }
 

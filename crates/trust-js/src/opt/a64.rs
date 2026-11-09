@@ -257,6 +257,7 @@ fn reads_words(op: &NodeOp) -> bool {
             | NodeOp::LoadElementsUsed
             | NodeOp::LoadElement(_)
             | NodeOp::LoadElementOrUndefined
+            | NodeOp::StoreElement(_)
     )
 }
 
@@ -371,6 +372,33 @@ enum Cold {
         resume: usize,
         exit: usize,
         negative: Option<(u32, usize)>,
+    },
+    /// An int32 element store's kind bits when INT32 is clear or the words are unwritable (the
+    /// flags in x9): unwritable words take `unwritable`; otherwise the int32 may replace the word
+    /// that broke a fact, so KIND_SCANNED goes, and the store resumes.
+    ElementKinds {
+        label: usize,
+        out: u32,
+        resume: usize,
+        unwritable: usize,
+    },
+    /// An element store's unwritable words (in `out`): frozen ones exit, a shared literal's
+    /// block is made the object's own by a pure call (`unshare_elements`), whose words `out`
+    /// takes before the store runs again from `retry`.
+    Unwritable {
+        label: usize,
+        node: NodeIx,
+        out: u32,
+        retry: usize,
+        exit: usize,
+    },
+    /// An element store of an edge into words that keep a remembered record: the dirty bit of
+    /// its run by a pure call (`remember_element`), then `resume`.
+    Remember {
+        label: usize,
+        node: NodeIx,
+        out: u32,
+        resume: usize,
     },
     /// A branch to a label (an effect's throw into its exit).
     Jump { label: usize, target: usize },
@@ -633,6 +661,33 @@ unsafe extern "C" fn renew_elements_protector(ctx: *mut JitCtx) -> u64 {
     u64::from(i.array_prototypes_unshadowed())
 }
 
+/// A shared literal's block made the object's own before an element store writes it in place
+/// (P3 stage 2 step 2; Maglev's EnsureWritableFastElements, V8's CopyElementsOnWrite): the
+/// object's mutable borrow, which marks its card for the new block (gc_storage.rs), and
+/// `Props::own_words_address`. It allocates a storage block and never collects (the engine's heap
+/// collects at its safepoints only: value.rs, `new_cell_heap`), and runs no JavaScript. The
+/// object's words after it, or 0 where the object is borrowed, which none is while generated code
+/// runs.
+unsafe extern "C" fn unshare_elements(cell: u64) -> u64 {
+    let word = unsafe { crate::value::Value::from_bits(crate::value::PACK_OBJ | cell) };
+    let Some(object) = word.as_obj() else {
+        return 0;
+    };
+    let Ok(mut object) = object.try_borrow_mut() else {
+        return 0;
+    };
+    object.props.own_words_address() as u64
+}
+
+/// The dirty bit of an edge an element store wrote below a large block's traced length (P3 stage
+/// 2 step 2; Warp's post barrier for large arrays, jit/VMFunctions.cpp:1054-1076):
+/// `Words::remember_edge_at`. Allocates nothing.
+unsafe extern "C" fn remember_element(words: u64, index: u64) {
+    unsafe {
+        crate::value::word_block::Words::remember_edge_at(words as *mut u64, index as u32 as usize)
+    };
+}
+
 /// The exit reason a check reports when its node names none.
 fn default_reason(op: &NodeOp) -> ExitReason {
     match op {
@@ -647,6 +702,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckIndex => ExitReason::NotInt32,
         NodeOp::CheckBounds | NodeOp::LoadElementOrUndefined => ExitReason::OutOfBounds,
         NodeOp::LoadElement(_) => ExitReason::Hole,
+        NodeOp::StoreElement(_) => ExitReason::WrongElements,
         NodeOp::Exit(reason) => *reason,
         _ => ExitReason::Forced,
     }
@@ -1398,6 +1454,7 @@ impl Gen<'_> {
             }
             NodeOp::LoadElement(holes) => self.lower_load_element(n, *holes)?,
             NodeOp::LoadElementOrUndefined => self.lower_load_element_or_undefined(n)?,
+            NodeOp::StoreElement(mode) => self.lower_store_element(n, *mode)?,
             NodeOp::Poll => {
                 let slow = self.a.new_label();
                 let resume = self.a.new_label();
@@ -1803,6 +1860,70 @@ impl Gen<'_> {
                     self.a.mov_imm64(dst, crate::value::PACK_UNDEFINED);
                     self.a.b(resume);
                 }
+                Cold::ElementKinds {
+                    label,
+                    out,
+                    resume,
+                    unwritable,
+                } => {
+                    use crate::value::word_block::{KIND_SCANNED, KIND_UNWRITABLE};
+                    self.a.bind(label);
+                    let imm = |bits| asm::logical_imm_w(bits).expect("a run of kind bits");
+                    self.a.logic_imm_w(0, X17, X9, imm(KIND_UNWRITABLE));
+                    self.a.cbnz(X17, false, unwritable);
+                    self.a.tbz(X9, KIND_SCANNED.trailing_zeros(), resume);
+                    self.a.logic_imm_w(0, X9, X9, imm(!KIND_SCANNED));
+                    self.a.stur_w(X9, out, -(self.layout.words_flags as i32));
+                    self.a.b(resume);
+                }
+                Cold::Unwritable {
+                    label,
+                    node,
+                    out,
+                    retry,
+                    exit,
+                } => {
+                    use crate::value::word_block::KIND_FROZEN;
+                    self.a.bind(label);
+                    // A frozen block takes no write; a shared literal's is copied, then written.
+                    self.a.ldur_w(X9, out, -(self.layout.words_flags as i32));
+                    self.a.tbnz(X9, KIND_FROZEN.trailing_zeros(), exit);
+                    let cell = self.gp(self.graph.node(node).inputs[0], X17);
+                    let saved = self.save_live_caller_saved(node);
+                    self.a.mov(0, cell);
+                    self.a.mov_imm64(X16, unshare_elements as *const () as u64);
+                    self.a.blr(X16);
+                    self.a.mov(X9, 0);
+                    self.restore_live_caller_saved(&saved);
+                    self.a.cbz(X9, true, exit);
+                    self.a.mov(out, X9);
+                    self.a.b(retry);
+                }
+                Cold::Remember {
+                    label,
+                    node,
+                    out,
+                    resume,
+                } => {
+                    self.a.bind(label);
+                    // The arguments through scratch registers, which no home is: either may be
+                    // in x0 or x1.
+                    let index = self.gp(self.graph.node(node).inputs[2], X17);
+                    self.a.mov(X9, out);
+                    if index != X17 {
+                        self.a.mov_w(X17, index);
+                    }
+                    // The words outlive the call where a scratch register holds them (`done`
+                    // spills the store's output from it).
+                    let keep: &[u32] = if out == X16 { &[X16] } else { &[] };
+                    let saved = self.save_live_caller_saved_and(node, keep);
+                    self.a.mov(0, X9);
+                    self.a.mov_w(1, X17);
+                    self.a.mov_imm64(X16, remember_element as *const () as u64);
+                    self.a.blr(X16);
+                    self.restore_live_caller_saved(&saved);
+                    self.a.b(resume);
+                }
                 Cold::Edge { label, from, to } => {
                     self.a.bind(label);
                     self.emit_moves(from, to)?;
@@ -1860,6 +1981,40 @@ impl Gen<'_> {
                 _ => None,
             })
             .collect();
+        let size = (8 * live.len() as u32).next_multiple_of(16);
+        if size > 0 {
+            self.a.sub_imm(31, 31, size);
+        }
+        for (k, &(fp, r)) in live.iter().enumerate() {
+            if fp {
+                self.a.str_d_imm(r, 31, 8 * k as u32);
+            } else {
+                self.a.str_imm(r, 31, 8 * k as u32);
+            }
+        }
+        (live, size)
+    }
+
+    /// [`Gen::save_live_caller_saved`], with the x registers in `scratch` saved too: values of a
+    /// node's own cold path that its call would clobber (an element store's words in x16, which
+    /// its output takes after the call). `restore_live_caller_saved` restores them all.
+    fn save_live_caller_saved_and(
+        &mut self,
+        node: NodeIx,
+        scratch: &[u32],
+    ) -> (Vec<(bool, u32)>, u32) {
+        let file = &regalloc::ARM64;
+        let mut live: Vec<(bool, u32)> = self
+            .alloc
+            .live_at(node)
+            .into_iter()
+            .filter_map(|v| match self.home(v) {
+                Home::Gp(r) if file.gp_caller.contains(&r) => Some((false, u32::from(r))),
+                Home::Fp(r) if file.fp_caller.contains(&r) => Some((true, u32::from(r))),
+                _ => None,
+            })
+            .collect();
+        live.extend(scratch.iter().map(|&r| (false, r)));
         let size = (8 * live.len() as u32).next_multiple_of(16);
         if size > 0 {
             self.a.sub_imm(31, 31, size);
@@ -2099,6 +2254,210 @@ impl Gen<'_> {
         });
         self.gp_done(n, dst);
         Ok(())
+    }
+
+    /// StoreElement (ir.rs): the words in `out` (the output's register, or x16), which a copy of
+    /// a shared literal's block replaces before the store runs again; under Existing the bounds
+    /// and the hole checked first; then the value's store by its representation, every check
+    /// before the first write. The cell, the first input, keeps the words alive, and marks its
+    /// card for an edge.
+    fn lower_store_element(&mut self, n: NodeIx, mode: Store) -> Result<(), Refusal> {
+        use crate::value::word_block::{KIND_INT32, KIND_UNWRITABLE};
+        let node = self.graph.node(n);
+        let &[_, words, index, value] = &node.inputs[..] else {
+            return Err(Refusal::at(node.pc as usize, "an element store's operands"));
+        };
+        let layout = self.layout;
+        let flags = -(layout.words_flags as i32);
+        let wrong = self.check_exit(n)?;
+        let checks = match mode {
+            Store::Existing => Some((
+                self.exit_for(n, ExitReason::OutOfBounds)?,
+                self.exit_for(n, ExitReason::Hole)?,
+            )),
+            Store::Present => None,
+        };
+        let out = match self.home(n) {
+            Home::Gp(r) => u32::from(r),
+            _ => X16,
+        };
+        let input = self.gp(words, X16);
+        if input != out {
+            self.a.mov(out, input);
+        }
+        let retry = self.a.new_label();
+        let unwritable = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.bind(retry);
+        if let Some((past, hole)) = checks {
+            self.a.ldur_w(X9, out, -(layout.words_used as i32));
+            let at = self.gp(index, X17);
+            self.a.cmp_reg_w(at, X9);
+            self.a.b_cond(HS, past);
+            self.a.ldr_x_uxtw3(X9, out, at);
+            self.a.mov_imm64(X30, crate::value::PACK_EMPTY);
+            self.a.cmp_reg_x(X9, X30);
+            self.a.b_cond(EQ, hole);
+        }
+        match self.graph.node(value).rep {
+            Rep::I32 => {
+                // An int32's word is its f64 bits (SCVTF), which keep every kind bit while INT32
+                // holds; the cold path takes the rest (`emit_word_number_kind_unfrozen`'s rule).
+                let kinds = self.a.new_label();
+                let store = self.a.new_label();
+                self.a.ldur_w(X9, out, flags);
+                let int32 = asm::logical_imm_w(KIND_INT32 | KIND_UNWRITABLE)
+                    .expect("INT32, FROZEN and COW are one run of bits");
+                self.a.logic_imm_w(0, X17, X9, int32);
+                self.a.cmp_imm_w(X17, KIND_INT32);
+                self.a.b_cond(NE, kinds);
+                self.a.bind(store);
+                let int = self.gp(value, X9);
+                self.a.scvtf_d_w(D31, int);
+                let at = self.gp(index, X17);
+                self.a.str_d_uxtw3(D31, out, at);
+                self.cold.push(Cold::ElementKinds {
+                    label: kinds,
+                    out,
+                    resume: store,
+                    unwritable,
+                });
+            }
+            Rep::F64 => {
+                let d = self.fp(value, D30);
+                emit_word_number_kind_unfrozen(
+                    &mut self.a,
+                    layout,
+                    out,
+                    d,
+                    X9,
+                    X17,
+                    X30,
+                    D31,
+                    unwritable,
+                );
+                // Its NaN canonicalized, as F64ToTagged boxes it: any other NaN reads as a tag.
+                self.a.fmov_x_d(X9, d);
+                self.a.fcmp(d, d);
+                self.a.movz(X30, 0x7ff8, 3); // PACK_CANON_NAN
+                self.a.csel_x(X9, X30, X9, VS);
+                let at = self.gp(index, X17);
+                self.a.str_x_uxtw3(X9, out, at);
+            }
+            _ => self.lower_store_word(n, out, unwritable, wrong, done),
+        }
+        self.a.bind(done);
+        self.cold.push(Cold::Unwritable {
+            label: unwritable,
+            node: n,
+            out,
+            retry,
+            exit: wrong,
+        });
+        self.gp_done(n, out);
+        Ok(())
+    }
+
+    /// Whether `v`, a word, is never the hole marker (an element store's value would make a
+    /// hole of it, `emit_word_value_guard`): a boxed scalar or a constant other than it.
+    fn never_hole(&self, v: NodeIx) -> bool {
+        match self.graph.node(v).op {
+            NodeOp::ConstTagged(bits) => bits != crate::value::PACK_EMPTY,
+            NodeOp::F64ToTagged | NodeOp::I32ToTagged | NodeOp::BoolToTagged => true,
+            _ => false,
+        }
+    }
+
+    /// StoreElement's store of a word (the value input): a Number takes the f64 store's kind
+    /// rule and its word as it is, any other word clears NUMBERS and INT32, which keeps the kind
+    /// bits exact (the replaced word was no hole and it is none: KIND_SCANNED stays), and, unless
+    /// it is a scalar, marks the owner's card and, below a large block's traced length, its run's
+    /// dirty bit by a pure call; the template's ElemStore (`emit_word_store_body`) declines such a
+    /// block to its helper. The hole marker as the value exits (the template's value guard).
+    fn lower_store_word(
+        &mut self,
+        n: NodeIx,
+        out: u32,
+        unwritable: usize,
+        wrong: usize,
+        done: usize,
+    ) {
+        use crate::value::word_block::{KIND_INT32, KIND_NUMBERS, KIND_UNWRITABLE, REMEMBER_MIN};
+        let node = self.graph.node(n);
+        let (cell, index, value) = (node.inputs[0], node.inputs[2], node.inputs[3]);
+        let layout = self.layout;
+        let flags = -(layout.words_flags as i32);
+        // A Boolean's word or a constant's tag is no Number (value.rs: a word is a Number unless
+        // its bits 48-62 are 0x7ff9 or more).
+        let known_word = match self.graph.node(value).op {
+            NodeOp::ConstTagged(bits) => (bits >> 48) as u16 & 0x7fff >= 0x7ff9,
+            NodeOp::BoolToTagged => true,
+            _ => false,
+        };
+        if !known_word {
+            let number = self.a.new_label();
+            let tagged = self.a.new_label();
+            let reference = self.a.new_label();
+            let word = self.gp(value, X9);
+            // A Number's f64 bits compare ordered; of the NaN patterns only the canonical NaN is
+            // a Number (CheckNumber's test).
+            self.a.fmov_d_x(D30, word);
+            self.a.fcmp(D30, D30);
+            self.a.b_cond(VS, tagged);
+            self.a.bind(number);
+            emit_word_number_kind_unfrozen(
+                &mut self.a,
+                layout,
+                out,
+                D30,
+                X9,
+                X17,
+                X30,
+                D31,
+                unwritable,
+            );
+            self.a.fmov_x_d(X9, D30);
+            let at = self.gp(index, X17);
+            self.a.str_x_uxtw3(X9, out, at);
+            self.a.b(done);
+            self.a.bind(tagged);
+            let word = self.gp(value, X9);
+            self.a.movz(X30, 0x7ff8, 3); // PACK_CANON_NAN
+            self.a.cmp_reg_x(word, X30);
+            self.a.b_cond(EQ, number);
+            self.a.bind(reference);
+        }
+        let word = self.gp(value, X9);
+        if !self.never_hole(value) {
+            emit_word_value_guard(&mut self.a, word, X30, X17, wrong);
+        }
+        let imm = |bits| asm::logical_imm_w(bits).expect("a run of kind bits");
+        self.a.ldur_w(X30, out, flags);
+        self.a.logic_imm_w(0, X17, X30, imm(KIND_UNWRITABLE));
+        self.a.cbnz(X17, false, unwritable);
+        self.a
+            .logic_imm_w(0, X30, X30, imm(!(KIND_NUMBERS | KIND_INT32)));
+        self.a.stur_w(X30, out, flags);
+        let at = self.gp(index, X17);
+        self.a.str_x_uxtw3(word, out, at);
+        if !self.scalar_word(value) {
+            // The owner's card, before any safepoint, as every generated store of a reference
+            // marks it (`emit_card_mark`); a large block's dirty bit after it.
+            let owner = self.gp(cell, X30);
+            emit_card_mark(&mut self.a, owner, X30, X17);
+            let remember = self.a.new_label();
+            self.a.ldur_w(X30, out, -(layout.words_capacity as i32));
+            self.a.ldur_w(X17, out, -(layout.words_shifted as i32));
+            self.a.add_shifted(X30, X30, X17, 0);
+            self.a.cmp_imm_x(X30, REMEMBER_MIN as u32);
+            self.a.b_cond(HI, remember);
+            self.cold.push(Cold::Remember {
+                label: remember,
+                node: n,
+                out,
+                resume: done,
+            });
+        }
     }
 
     /// Branch to `fail` unless no element of `node`'s receiver (its cell, the node's first input)
