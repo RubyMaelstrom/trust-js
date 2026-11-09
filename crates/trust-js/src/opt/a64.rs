@@ -116,6 +116,16 @@ pub(crate) fn compile_with(
             "element words in a layout the code cannot address",
         ));
     }
+    let creates = graph
+        .nodes
+        .iter()
+        .any(|node| node.op == NodeOp::StoreElement(Store::Create));
+    if creates && !define_elem_inlinable(layout) {
+        // The template's in-line append bakes the same offsets in (`emit_word_create`).
+        return Err(Refusal::whole(
+            "an Array's append in a layout the code cannot address",
+        ));
+    }
     let alloc = regalloc::allocate(graph, &regalloc::ARM64)?;
     let frame = entry_frame(&alloc)?;
     let mut gen = Gen::new(chunk, graph, alloc, layout, ilayout, cfg, options, frame);
@@ -400,8 +410,25 @@ enum Cold {
         out: u32,
         resume: usize,
     },
+    /// An Array's hole fill or append (StoreElement(Create)): `emit_element_create`.
+    ElementCreate {
+        label: usize,
+        node: NodeIx,
+        out: u32,
+        done: usize,
+        exits: CreateExits,
+    },
     /// A branch to a label (an effect's throw into its exit).
     Jump { label: usize, target: usize },
+}
+
+/// The exits of an Array's hole fill or append: a receiver, prototype or `length` the in-line
+/// path does not take, a gap past the next word, and growth that failed.
+#[derive(Clone, Copy)]
+struct CreateExits {
+    wrong: usize,
+    gap: usize,
+    grow: usize,
 }
 
 /// A location of a parallel move.
@@ -677,6 +704,36 @@ unsafe extern "C" fn unshare_elements(cell: u64) -> u64 {
         return 0;
     };
     object.props.own_words_address() as u64
+}
+
+/// Room for one more element word of an Array whose in-line append found its words full or the
+/// static empty block (P3 stage 2 step 2; Warp's addDenseElementPure, Maglev's
+/// MaybeGrowFastElements): `Props::grown_words_address` through the object's mutable borrow,
+/// which marks its card for the new block. It allocates a storage block and never collects, and
+/// runs no JavaScript. The object's words after it, or 0 where they cannot grow (the most words
+/// a header counts) or the object is borrowed.
+unsafe extern "C" fn grow_elements(cell: u64) -> u64 {
+    let word = unsafe { crate::value::Value::from_bits(crate::value::PACK_OBJ | cell) };
+    let Some(object) = word.as_obj() else {
+        return 0;
+    };
+    let Ok(mut object) = object.try_borrow_mut() else {
+        return 0;
+    };
+    object
+        .props
+        .grown_words_address()
+        .map_or(0, |words| words as u64)
+}
+
+/// `out` where a call clobbers it: a node's own value, which no save of the live values keeps
+/// (an element store's words), unless a callee-saved register holds it.
+fn caller_saved(out: u32) -> Vec<u32> {
+    if regalloc::ARM64.gp_callee.contains(&(out as u8)) {
+        Vec::new()
+    } else {
+        vec![out]
+    }
 }
 
 /// The dirty bit of an edge an element store wrote below a large block's traced length (P3 stage
@@ -1455,6 +1512,17 @@ impl Gen<'_> {
             NodeOp::LoadElement(holes) => self.lower_load_element(n, *holes)?,
             NodeOp::LoadElementOrUndefined => self.lower_load_element_or_undefined(n)?,
             NodeOp::StoreElement(mode) => self.lower_store_element(n, *mode)?,
+            NodeOp::LoadArrayLength => {
+                if !unused {
+                    // Slot 0, an Array's first entry (`first_slot_addr`).
+                    let cell = self.gp(input(0), X16);
+                    self.a.add_imm(X17, cell, self.layout.obj_from_cell as u32);
+                    first_slot_addr(&mut self.a, self.layout, X17, X17);
+                    let dst = self.gp_dst(n);
+                    self.a.ldr_imm(dst, X17, 0);
+                    self.gp_done(n, dst);
+                }
+            }
             NodeOp::Poll => {
                 let slow = self.a.new_label();
                 let resume = self.a.new_label();
@@ -1856,7 +1924,7 @@ impl Gen<'_> {
                         // A negative index names a String key ("-1"), never an element.
                         self.a.tbnz(index, 31, negative_exit);
                     }
-                    self.emit_no_inherited_elements(node, false, exit);
+                    self.emit_no_inherited_elements(node, false, &[], exit);
                     self.a.mov_imm64(dst, crate::value::PACK_UNDEFINED);
                     self.a.b(resume);
                 }
@@ -1913,16 +1981,26 @@ impl Gen<'_> {
                     if index != X17 {
                         self.a.mov_w(X17, index);
                     }
-                    // The words outlive the call where a scratch register holds them (`done`
-                    // spills the store's output from it).
-                    let keep: &[u32] = if out == X16 { &[X16] } else { &[] };
-                    let saved = self.save_live_caller_saved_and(node, keep);
+                    // The words are the store's output, live after the call wherever a register
+                    // the call clobbers holds them.
+                    let keep = caller_saved(out);
+                    let saved = self.save_live_caller_saved_and(node, &keep);
                     self.a.mov(0, X9);
                     self.a.mov_w(1, X17);
                     self.a.mov_imm64(X16, remember_element as *const () as u64);
                     self.a.blr(X16);
                     self.restore_live_caller_saved(&saved);
                     self.a.b(resume);
+                }
+                Cold::ElementCreate {
+                    label,
+                    node,
+                    out,
+                    done,
+                    exits,
+                } => {
+                    self.a.bind(label);
+                    self.emit_element_create(node, out, done, exits);
                 }
                 Cold::Edge { label, from, to } => {
                     self.a.bind(label);
@@ -2270,24 +2348,42 @@ impl Gen<'_> {
         let layout = self.layout;
         let flags = -(layout.words_flags as i32);
         let wrong = self.check_exit(n)?;
+        let out = match self.home(n) {
+            Home::Gp(r) => u32::from(r),
+            _ => X16,
+        };
+        let retry = self.a.new_label();
+        let unwritable = self.a.new_label();
+        let done = self.a.new_label();
+        // Where an index past the used words, and a hole, go: an exit, or for an Array's store
+        // the hole fill or append.
         let checks = match mode {
             Store::Existing => Some((
                 self.exit_for(n, ExitReason::OutOfBounds)?,
                 self.exit_for(n, ExitReason::Hole)?,
             )),
+            Store::Create => {
+                let create = self.a.new_label();
+                let exits = CreateExits {
+                    wrong,
+                    gap: self.exit_for(n, ExitReason::OutOfBounds)?,
+                    grow: self.exit_for(n, ExitReason::CouldNotGrow)?,
+                };
+                self.cold.push(Cold::ElementCreate {
+                    label: create,
+                    node: n,
+                    out,
+                    done,
+                    exits,
+                });
+                Some((create, create))
+            }
             Store::Present => None,
-        };
-        let out = match self.home(n) {
-            Home::Gp(r) => u32::from(r),
-            _ => X16,
         };
         let input = self.gp(words, X16);
         if input != out {
             self.a.mov(out, input);
         }
-        let retry = self.a.new_label();
-        let unwritable = self.a.new_label();
-        let done = self.a.new_label();
         self.a.bind(retry);
         if let Some((past, hole)) = checks {
             self.a.ldur_w(X9, out, -(layout.words_used as i32));
@@ -2460,6 +2556,228 @@ impl Gen<'_> {
         }
     }
 
+    /// StoreElement(Create)'s cold path, from a hole below the used words or an index at or past
+    /// them, `out` the words: an Array's hole fill or append, as the template's in-line set does
+    /// it (`emit_word_create`, whose checks and commit this follows on the tier's registers), the
+    /// receiver's kind tag tested too (the site may have seen ordinary objects as well). Every
+    /// check precedes the first write but growth, which changes nothing a JavaScript observer
+    /// sees. Then `done`.
+    fn emit_element_create(&mut self, n: NodeIx, out: u32, done: usize, exits: CreateExits) {
+        use crate::value::{FLAG_ELEM_MODE, FLAG_EXTENSIBLE, FLAG_HAS_FAR, FLAG_PROTO};
+        let node = self.graph.node(n);
+        let (cell, index, value) = (node.inputs[0], node.inputs[2], node.inputs[3]);
+        let layout = self.layout;
+        let used = -(layout.words_used as i32);
+        let keep = caller_saved(out);
+        // 1. An extensible Array that is no marked prototype (whose structural changes must move
+        //    the prototype epoch), with no index among its named entries.
+        let c = self.gp(cell, X17);
+        self.a
+            .ldrb_imm(X9, c, (layout.obj_from_cell + layout.obj_kind) as u32);
+        self.a.cmp_imm_w(X9, crate::value::KIND_ARRAY_TAG as u32);
+        self.a.b_cond(NE, exits.wrong);
+        self.a
+            .ldrb_imm(X9, c, (layout.obj_from_cell + layout.obj_flags) as u32);
+        guard_flags(
+            &mut self.a,
+            X9,
+            FLAG_EXTENSIBLE | FLAG_PROTO | FLAG_ELEM_MODE | FLAG_HAS_FAR,
+            FLAG_EXTENSIBLE | FLAG_ELEM_MODE,
+            exits.wrong,
+        );
+        // 2. Its prototype the realm's Array.prototype, and the protector's proof live: no index
+        //    on the chain intercepts the creation (OrdinarySet).
+        self.emit_no_inherited_elements(n, true, &keep, exits.wrong);
+        // 3. A value that would be a hole.
+        if self.graph.node(value).rep == Rep::Tagged && !self.never_hole(value) {
+            let word = self.gp(value, X17);
+            emit_word_value_guard(&mut self.a, word, X30, X9, exits.wrong);
+        }
+        // 4. A hole below the used words, or the next word; past it, a gap of holes.
+        let fill = self.a.new_label();
+        self.a.ldur_w(X9, out, used);
+        let at = self.gp(index, X17);
+        self.a.cmp_reg_w(at, X9);
+        self.a.b_cond(LO, fill);
+        self.a.b_cond(NE, exits.gap);
+        // 5. An append: `length` (slot 0, an Array's first entry, a Number) writable where the
+        //    index reaches it.
+        let below = self.a.new_label();
+        let c = self.gp(cell, X30);
+        self.a.add_imm(X30, c, layout.obj_from_cell as u32);
+        first_slot_addr(&mut self.a, layout, X9, X30);
+        self.a.ldr_d_imm(D31, X9, 0);
+        let at = self.gp(index, X17);
+        self.a.ucvtf_d_w(D30, at);
+        self.a.fcmp(D30, D31);
+        self.a.b_cond(LO, below);
+        // XZR is slot index 0.
+        guard_slot_writable_data(&mut self.a, layout, X30, 31, X9, X17, exits.wrong);
+        self.a.bind(below);
+        // 6. Room for it: a full block, or the static empty one, grows by a pure call.
+        let room = self.a.new_label();
+        self.a.ldur_w(X9, out, used);
+        self.a.ldur_w(X17, out, -(layout.words_capacity as i32));
+        self.a.cmp_reg_w(X9, X17);
+        self.a.b_cond(LO, room);
+        let c = self.gp(cell, X17);
+        let saved = self.save_live_caller_saved(n);
+        self.a.mov(0, c);
+        self.a.mov_imm64(X16, grow_elements as *const () as u64);
+        self.a.blr(X16);
+        self.a.mov(X9, 0);
+        self.restore_live_caller_saved(&saved);
+        self.a.cbz(X9, true, exits.grow);
+        self.a.mov(out, X9);
+        self.a.bind(room);
+        // 7. The commit: the word and the kind bits it keeps (an append keeps NO_HOLES and
+        //    KIND_SCANNED: no cleared fact becomes true), the owner's card for an edge (an append
+        //    lies past the traced length, so no run's bit), the used length, and `length` where
+        //    the index reached it.
+        self.emit_created_word(n, out, false);
+        self.a.ldur_w(X9, out, used);
+        self.a.add_imm(X9, X9, 1);
+        self.a.stur_w(X9, out, used);
+        let kept = self.a.new_label();
+        let c = self.gp(cell, X30);
+        self.a.add_imm(X30, c, layout.obj_from_cell as u32);
+        first_slot_addr(&mut self.a, layout, X17, X30);
+        self.a.ldr_d_imm(D31, X17, 0);
+        let at = self.gp(index, X30);
+        self.a.ucvtf_d_w(D30, at);
+        self.a.fcmp(D30, D31);
+        self.a.b_cond(LO, kept);
+        self.a.ucvtf_d_w(D31, X9);
+        self.a.str_d_imm(D31, X17, 0);
+        self.a.bind(kept);
+        self.a.b(done);
+        // 8. A hole fill, below `length` already: the word, the kind bits it keeps less
+        //    KIND_SCANNED (NO_HOLES may hold again), the card and the run's bit for an edge.
+        self.a.bind(fill);
+        self.emit_created_word(n, out, true);
+        self.a.b(done);
+    }
+
+    /// The commit of an Array's created element (`emit_element_create`): StoreElement's value
+    /// (input 3) written at its index (input 2) of `out`, the kind bits ANDed with those the value
+    /// keeps (and KIND_SCANNED cleared for a hole `fill`), and for a word that is no Number the
+    /// owner's card and, in a hole fill below a large block's traced length, its run's dirty bit
+    /// by a pure call.
+    fn emit_created_word(&mut self, n: NodeIx, out: u32, fill: bool) {
+        use crate::value::word_block::{KIND_INT32, KIND_NUMBERS, KIND_SCANNED, REMEMBER_MIN};
+        let node = self.graph.node(n);
+        let (cell, index, value) = (node.inputs[0], node.inputs[2], node.inputs[3]);
+        let layout = self.layout;
+        let flags = -(layout.words_flags as i32);
+        let imm = |bits| asm::logical_imm_w(bits).expect("a run of kind bits");
+        let rep = self.graph.node(value).rep;
+        if rep == Rep::I32 {
+            // An int32 breaks no kind bit.
+            let int = self.gp(value, X9);
+            self.a.scvtf_d_w(D31, int);
+            let at = self.gp(index, X17);
+            self.a.str_d_uxtw3(D31, out, at);
+            if fill {
+                self.a.ldur_w(X9, out, flags);
+                self.a.logic_imm_w(0, X9, X9, imm(!KIND_SCANNED));
+                self.a.stur_w(X9, out, flags);
+            }
+            return;
+        }
+        // w30 = the kind bits the value keeps: all but INT32 for a Number that is no exact
+        // int32 (bit-identical through an i32), all but NUMBERS and INT32 for any other word.
+        let exact = self.a.new_label();
+        let kinds = self.a.new_label();
+        let d = if rep == Rep::F64 {
+            self.fp(value, D30)
+        } else {
+            let other = self.a.new_label();
+            let number = self.a.new_label();
+            let word = self.gp(value, X9);
+            self.a.fmov_d_x(D30, word);
+            self.a.fcmp(D30, D30);
+            self.a.b_cond(VC, number);
+            self.a.movz(X17, 0x7ff8, 3); // PACK_CANON_NAN, a Number
+            self.a.cmp_reg_x(word, X17);
+            self.a.b_cond(NE, other);
+            self.a.bind(number);
+            self.a.mov_imm64(X30, u64::from(u32::MAX));
+            self.emit_int32_exact(D30, exact);
+            self.a.logic_imm_w(0, X30, X30, imm(!KIND_INT32));
+            self.a.b(kinds);
+            self.a.bind(other);
+            self.a
+                .mov_imm64(X30, u64::from(!(KIND_NUMBERS | KIND_INT32)));
+            self.a.b(kinds);
+            D30
+        };
+        if rep == Rep::F64 {
+            self.a.mov_imm64(X30, u64::from(u32::MAX));
+            self.emit_int32_exact(d, exact);
+            self.a.logic_imm_w(0, X30, X30, imm(!KIND_INT32));
+            self.a.b(kinds);
+        }
+        self.a.bind(exact);
+        self.a.bind(kinds);
+        // The word: an f64's with its NaN canonicalized (any other NaN reads as a tag).
+        let word = if rep == Rep::F64 {
+            self.a.fmov_x_d(X9, d);
+            self.a.fcmp(d, d);
+            self.a.movz(X17, 0x7ff8, 3); // PACK_CANON_NAN
+            self.a.csel_x(X9, X17, X9, VS);
+            X9
+        } else {
+            self.gp(value, X9)
+        };
+        let at = self.gp(index, X17);
+        self.a.str_x_uxtw3(word, out, at);
+        self.a.ldur_w(X17, out, flags);
+        self.a.logic_w(0, X17, X17, X30);
+        if fill {
+            self.a.logic_imm_w(0, X17, X17, imm(!KIND_SCANNED));
+        }
+        self.a.stur_w(X17, out, flags);
+        if rep == Rep::Tagged && !self.scalar_word(value) {
+            // A Number kept NUMBERS: no edge, no card.
+            let number = self.a.new_label();
+            self.a.tbnz(X30, KIND_NUMBERS.trailing_zeros(), number);
+            let owner = self.gp(cell, X9);
+            emit_card_mark(&mut self.a, owner, X9, X17);
+            if fill {
+                // A hole of a large block may lie below its traced length.
+                self.a.ldur_w(X9, out, -(layout.words_capacity as i32));
+                self.a.ldur_w(X17, out, -(layout.words_shifted as i32));
+                self.a.add_shifted(X9, X9, X17, 0);
+                self.a.cmp_imm_x(X9, REMEMBER_MIN as u32);
+                self.a.b_cond(LS, number);
+                let at = self.gp(index, X17);
+                self.a.mov(X9, out);
+                if at != X17 {
+                    self.a.mov_w(X17, at);
+                }
+                let keep = caller_saved(out);
+                let saved = self.save_live_caller_saved_and(n, &keep);
+                self.a.mov(0, X9);
+                self.a.mov_w(1, X17);
+                self.a.mov_imm64(X16, remember_element as *const () as u64);
+                self.a.blr(X16);
+                self.restore_live_caller_saved(&saved);
+            }
+            self.a.bind(number);
+        }
+    }
+
+    /// Branch to `exact` when the f64 in `d` is an exact int32 (bit-identical through an i32, so
+    /// not -0), as `emit_word_number_kind` tests it; clobbers x9, x17 and d31.
+    fn emit_int32_exact(&mut self, d: u32, exact: usize) {
+        self.a.fcvtzs_w_d(X9, d);
+        self.a.scvtf_d_w(D31, X9);
+        self.a.fmov_x_d(X9, D31);
+        self.a.fmov_x_d(X17, d);
+        self.a.cmp_reg_x(X9, X17);
+        self.a.b_cond(EQ, exact);
+    }
+
     /// Branch to `fail` unless no element of `node`'s receiver (its cell, the node's first input)
     /// can come from its prototype chain at an index its words do not hold: no index among its
     /// named entries (HAS_FAR clear), its prototype the active realm's Array.prototype (or, unless
@@ -2468,26 +2786,38 @@ impl Gen<'_> {
     /// prototype maps V8's map check implies and TRust reads here, with the protector read at run
     /// time until dependencies exist, as the template's append reads it (`emit_word_create`). A
     /// lapsed proof is renewed by a pure call (`renew_elements_protector`) where the template
-    /// takes its helper. Clobbers the scratch registers.
-    fn emit_no_inherited_elements(&mut self, node: NodeIx, array_only: bool, fail: usize) {
-        use crate::value::FLAG_HAS_FAR;
+    /// takes its helper. Clobbers x9, x17 and x30 (and, across the call, the caller-saved
+    /// registers but the live ones and `keep`).
+    fn emit_no_inherited_elements(
+        &mut self,
+        node: NodeIx,
+        array_only: bool,
+        keep: &[u32],
+        fail: usize,
+    ) {
+        use crate::value::{FLAG_HAS_FAR, FLAG_IC_PLAIN};
         let layout = self.layout;
         let cell = self.gp(self.graph.node(node).inputs[0], X17);
         self.a
             .ldrb_imm(X9, cell, (layout.obj_from_cell + layout.obj_flags) as u32);
         self.a.tbnz(X9, flag_bit(FLAG_HAS_FAR), fail);
+        // IC_PLAIN again, from the same byte: the element check's proof is a value fact under the
+        // contract that no object JavaScript has seen loses it (ElemKind), and this is where a
+        // breach of it would read undefined for an index a side table answers (a host's indexed
+        // properties installed on an object that was not fresh).
+        self.a.tbz(X9, flag_bit(FLAG_IC_PLAIN), fail);
         self.a
             .ldr_imm(X9, cell, (layout.obj_from_cell + layout.obj_proto) as u32);
         self.a
-            .ldr_imm(X16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
-        self.a.ldr_imm(X17, X16, INTERP_ARRAY_PROTO as u32);
+            .ldr_imm(X30, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+        self.a.ldr_imm(X17, X30, INTERP_ARRAY_PROTO as u32);
         self.a.cmp_reg_x(X9, X17);
         if array_only {
             self.a.b_cond(NE, fail);
         } else {
             let either = self.a.new_label();
             self.a.b_cond(EQ, either);
-            self.a.ldr_imm(X17, X16, INTERP_OBJECT_PROTO as u32);
+            self.a.ldr_imm(X17, X30, INTERP_OBJECT_PROTO as u32);
             self.a.cmp_reg_x(X9, X17);
             self.a.b_cond(NE, fail);
             self.a.bind(either);
@@ -2496,16 +2826,16 @@ impl Gen<'_> {
         // accepts), or renewed.
         let renew = self.a.new_label();
         let proven = self.a.new_label();
-        self.a.ldrb_imm(X9, X16, INTERP_ELEMS_CLEAN as u32);
+        self.a.ldrb_imm(X9, X30, INTERP_ELEMS_CLEAN as u32);
         self.a.cbz(X9, false, renew);
-        self.a.ldr_w_imm(X9, X16, INTERP_ELEMS_EPOCH as u32);
+        self.a.ldr_w_imm(X9, X30, INTERP_ELEMS_EPOCH as u32);
         self.a
             .mov_imm64(X17, crate::value::proto_epoch_ptr() as usize as u64);
         self.a.ldr_w_imm(X17, X17, 0);
         self.a.cmp_reg_w(X9, X17);
         self.a.b_cond(EQ, proven);
         self.a.bind(renew);
-        let saved = self.save_live_caller_saved(node);
+        let saved = self.save_live_caller_saved_and(node, keep);
         self.a.mov(0, 19);
         self.a
             .mov_imm64(X16, renew_elements_protector as *const () as u64);

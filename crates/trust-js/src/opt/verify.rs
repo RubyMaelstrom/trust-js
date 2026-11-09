@@ -346,6 +346,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::LoadElementOrUndefined => (&[Rep::Cell, Rep::Ptr, Rep::I32, Rep::I32], Rep::Tagged),
         // Its value takes one of three representations (`representations`).
         NodeOp::StoreElement(_) => return None,
+        NodeOp::LoadArrayLength => (CELL, Rep::Tagged),
         NodeOp::StoreSlot(_) => (TAGGED, Rep::None),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),

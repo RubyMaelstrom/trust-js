@@ -75,9 +75,18 @@ pub(crate) enum Cond {
 }
 
 /// What an element check proves of an object (P3 stage 2 step 2): its kind tag and IC_PLAIN flag.
-/// No write changes either once JavaScript can see the object (every kind is set on a fresh
-/// object, and IC_PLAIN is only ever cleared, at a creation or registration: interpreter.rs's
-/// object_look), so the proof is a value fact, kept across effects as a cell form is.
+/// No write changes either once JavaScript can see the object, so the proof is a value fact, kept
+/// across effects as a cell form is. The contract it relies on: every kind is set on a fresh
+/// object (install_typed_array and install_array_buffer assert it; errors, arguments, RegExps,
+/// collections, proxies and callables are made with theirs), and IC_PLAIN is only ever cleared,
+/// at a creation or a registration on a fresh object (interpreter.rs's object_look). The one path
+/// that moves a kind onto an existing object, run_constructor_on's native arm (eval.rs, with
+/// move_collection), is unreachable: its callers pass user constructors, and built-in subclass
+/// instances are made by the native constructors (construct_native_dispatch). A host's indexed
+/// properties need a fresh object by their API's contract (install_readonly_indexed_properties),
+/// which the code checks only in part; the cold paths that read undefined for an index the words
+/// lack test IC_PLAIN again, so that a breach exits there rather than reading undefined
+/// (`emit_no_inherited_elements`), the one read such an object's empty words could answer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum ElemKind {
     /// Element words: an ordinary kind or an Array (its tag at most KIND_ARRAY_TAG), IC_PLAIN set
@@ -114,6 +123,15 @@ pub(crate) enum Store {
     /// An existing element: an index at or past the used length exits [OutOfBounds], a hole
     /// [Hole].
     Existing,
+    /// An existing element, or an Array's hole or next word, which the cold path fills or
+    /// appends as the template's in-line set does (jit.rs emit_word_create): an extensible Array
+    /// that is no marked prototype, with no index among its named entries [WrongElements], the
+    /// realm's Array.prototype and the elements protector [WrongElements], a writable `length`
+    /// where the index reaches it [WrongElements], room made by a pure call where there is none
+    /// [CouldNotGrow] (Warp's addDenseElementPure, Maglev's MaybeGrowFastElements), the used
+    /// length and `length` raised (Maglev's UpdateJSArrayLength); a gap past the next word
+    /// [OutOfBounds].
+    Create,
 }
 
 /// Why a check fails or an exit is taken, for the log, the exit profile (stage 2; keyed by the
@@ -168,7 +186,6 @@ pub(crate) enum ExitReason {
     #[expect(dead_code, reason = "the typed-array checks build it (step 2's (e))")]
     Detached,
     /// An append whose growth failed (V8's kCouldNotGrowElements).
-    #[expect(dead_code, reason = "the appends build it (step 2's (d))")]
     CouldNotGrow,
 }
 
@@ -324,8 +341,13 @@ pub(crate) enum NodeOp {
     /// the owner's card, and below a large block's traced length its dirty bit by a pure call
     /// (Warp's post barrier for large arrays). A copy-on-write block is copied by a pure call
     /// first (Maglev's EnsureWritableFastElements), frozen elements exit [WrongElements]. Its
-    /// output is the object's words after the store: a copy's, or the input's.
+    /// output is the object's words after the store: a copy's, a grown block's, or the input's.
     StoreElement(Store),
+    /// Cell -> Tagged: an Array's `length`, its first slot's word, a Number (ArrayCreate defines
+    /// it first and nothing removes it: jit_storage.rs first_slot_addr), under an Array check, so
+    /// that `i < a.length` loops keep their bodies free of effects (Maglev reads a JSArray's
+    /// length as a known property, maglev-reducer-inl.h:1038-1059).
+    LoadArrayLength,
 
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's

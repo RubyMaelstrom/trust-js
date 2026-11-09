@@ -185,6 +185,17 @@ const PROGRAMS: &[&str] = &[
      put(a, k % 6, vals[k % vals.length]); \
      out += a.length + String(Object.is(a[k % 6], -0) ? 'z' : a[k % 6])[0]; }\n\
      out.length + out.slice(0, 80) + lit().join()",
+    // Appends from the empty block and across capacities, hole fills, `i < a.length` loops,
+    // element updates and compound element assignments.
+    "function build(n) { const a = []; for (let i = 0; i < n; i++) a[i] = i * 2; return a; }\n\
+     function holes(n) { const h = new Array(n); for (let i = n - 1; i >= 0; i -= 2) h[i] = i; \
+     return h; }\n\
+     function sum(a) { let s = 0; for (let i = 0; i < a.length; i++) \
+     s += a[i] === undefined ? 1000 : a[i]; return s; }\n\
+     function bump(a) { for (let i = 0; i < a.length; i++) { a[i]++; a[i] += 2; a[i] *= 1.5; } \
+     return a; }\n\
+     let t = 0; for (let k = 0; k < 2000; k++) { const a = bump(build(k % 40)); \
+     const h = holes(k % 12); t += sum(a) + a.length + sum(h); } t",
     // References into an array of more than 64 words, read back across collections.
     "function fill(a, n, k) { for (let i = 0; i < n; i++) a[i] = {k: k, i: i}; return a; }\n\
      const big = []; for (let i = 0; i < 100; i++) big.push(i * 0.5);\n\

@@ -2834,6 +2834,260 @@ fn a_store_copies_a_shared_literal_and_exits_where_the_vm_writes() {
 }
 
 #[test]
+fn an_arrays_store_fills_holes_and_appends_in_line() {
+    use crate::value::word_block::KIND_INT32;
+    for value in [Value3::Word, Value3::Int32, Value3::F64] {
+        let mut engine = fixture(SET);
+        install(
+            &mut engine,
+            "set",
+            &set(value, Store::Create),
+            Options::default(),
+        );
+        stress(&engine);
+        exits();
+        let label = value as u8;
+        for (call, result) in [
+            // Appends, from the static empty block and across capacities.
+            (
+                "var a = []; for (var k = 0; k < 100; k++) set(a, k, k); \
+                 a.length + ':' + a[0] + ':' + a[99]",
+                "100:0:99",
+            ),
+            ("set([1, 2], 2, 3).join()", "1,2,3"),
+            ("set([], 0, 4).join()", "4"),
+            // Holes filled below the used words, and below `length`.
+            ("set([1, , 3], 1, 2).join()", "1,2,3"),
+            (
+                "var h = new Array(5); set(h, 2, 6); h.length + ':' + h[2]",
+                "5:6",
+            ),
+            (
+                "var l = new Array(50); set(l, 0, 7); l.length + ':' + l[0] + ':' + (1 in l)",
+                "50:7:false",
+            ),
+            // A shared literal's exact block grows into a private one.
+            (
+                "function lit() { return [1, 2]; } var p = lit(); set(p, 2, 3); \
+                 p.join() + ':' + lit().join()",
+                "1,2,3:1,2",
+            ),
+        ] {
+            assert_eq!(eval(&mut engine, call), result, "{label}: {call}");
+        }
+        assert!(exits().is_empty(), "{label}");
+        let (kind, computed, _) = kind_bits(&mut engine, "a");
+        assert_eq!(kind & !computed, 0, "{label}");
+        assert_ne!(kind & KIND_INT32, 0, "{label}: int32s appended keep INT32");
+        if value != Value3::Int32 {
+            assert_eq!(
+                eval(&mut engine, "set(a, 100, 0.5); a.length"),
+                "101",
+                "{label}"
+            );
+            let (kind, computed, _) = kind_bits(&mut engine, "a");
+            assert_eq!(kind & !computed, 0, "{label}");
+            assert_eq!(kind & KIND_INT32, 0, "{label}");
+        }
+        if value == Value3::Word {
+            assert_eq!(
+                eval(
+                    &mut engine,
+                    "var o = []; for (var k = 0; k < 40; k++) set(o, k, {k: k}); \
+                     var junk = []; for (var k = 0; k < 300; k++) junk.push([k]); o[39].k"
+                ),
+                "39",
+                "{label}"
+            );
+        }
+        assert!(exits().is_empty(), "{label}");
+        // What the in-line path does not take, the VM does.
+        for (call, result) in [
+            ("set([1, 2], 5, 1).length", "6"),
+            (
+                "Object.isExtensible(set(Object.preventExtensions([1]), 1, 2))",
+                "false",
+            ),
+            ("set(Object.freeze([1, 2]), 2, 3).length", "2"),
+            (
+                "class Sub extends Array {} set(Sub.from([1]), 1, 2).join()",
+                "1,2",
+            ),
+            (
+                "var nl = [1, 2]; Object.defineProperty(nl, 'length', { writable: false }); \
+                 set(nl, 2, 3).length",
+                "2",
+            ),
+            ("set({0: 1}, 1, 2)[1]", "2"),
+        ] {
+            assert_eq!(eval(&mut engine, call), result, "{label}: {call}");
+        }
+        let taken = reasons();
+        assert!(
+            taken.len() == 6
+                && taken[0] == ExitReason::OutOfBounds
+                && taken[1..]
+                    .iter()
+                    .all(|&reason| reason == ExitReason::WrongElements),
+            "{label}: {taken:?}"
+        );
+        // An index setter on Array.prototype intercepts an append (OrdinarySet).
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var seen = 0; Object.defineProperty(Array.prototype, 2, \
+                 { set(v) { seen = v; }, configurable: true }); \
+                 var r = set([1, 2], 2, 9); delete Array.prototype[2]; seen + ':' + r.length"
+            ),
+            "9:2",
+            "{label}"
+        );
+        assert_eq!(reasons(), vec![ExitReason::WrongElements], "{label}");
+    }
+}
+
+/// `rdi(f, o)` (LoadLocal 0, LoadLocal 1, Call(1) at pc 2, Pop, Const 0, GetElemLocal 1 at pc 5,
+/// Return): `o` checked element words before the call, a proof the read past the used words after
+/// it keeps, as a value fact.
+fn rdi(chunk: &Chunk) -> Graph {
+    assert!(
+        matches!(chunk.jit_ops()[5], Op::GetElemLocal(1)),
+        "{:?}",
+        chunk.jit_ops()
+    );
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let f = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let o = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let at_call = b.state(2, &[f, o], &[], &[]);
+    let cell = b.exiting(
+        entry,
+        NodeOp::CheckObject,
+        &[o],
+        Rep::Cell,
+        2,
+        at_call,
+        ExitReason::NotObject,
+    );
+    b.exiting(
+        entry,
+        NodeOp::CheckElements(ElemKind::Words),
+        &[cell],
+        Rep::None,
+        2,
+        at_call,
+        ExitReason::WrongElements,
+    );
+    let call = b.exiting(
+        entry,
+        NodeOp::Effect {
+            pc: 2,
+            pops: 2,
+            pushes: 1,
+        },
+        &[f, o],
+        Rep::None,
+        2,
+        at_call,
+        ExitReason::Throw,
+    );
+    b.node(entry, NodeOp::Projection(0), &[call], Rep::Tagged, 2);
+    let zero = b.node(entry, NodeOp::ConstTagged(num(0.0)), &[], Rep::Tagged, 4);
+    let at_get = b.state(5, &[zero], &[], &[]);
+    let words = b.node(entry, NodeOp::LoadElements, &[cell], Rep::Ptr, 5);
+    let used = b.node(entry, NodeOp::LoadElementsUsed, &[words], Rep::I32, 5);
+    let index = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 5);
+    let value = b.exiting(
+        entry,
+        NodeOp::LoadElementOrUndefined,
+        &[cell, words, index, used],
+        Rep::Tagged,
+        5,
+        at_get,
+        ExitReason::OutOfBounds,
+    );
+    b.node(entry, NodeOp::Return, &[value], Rep::None, 6);
+    b.g
+}
+
+#[test]
+fn a_host_index_put_on_an_object_the_code_proved_is_read_through_its_getter() {
+    // The element check's proof outlives effects under the contract that no object JavaScript
+    // has seen loses IC_PLAIN (ir.rs, ElemKind). A host that installs indexed properties on such
+    // an object breaks it; the read past the used words, the one read its empty words answer,
+    // tests IC_PLAIN again and exits, so its getter runs.
+    let mut engine = fixture("function rdi(f, o) { f(o); return o[0]; } rdi(function () {}, [1]);");
+    let index_onto = engine
+        .interp
+        .make_native("indexOnto", 1, |interp, _, args| {
+            let getter = interp.make_native("at", 1, |_, _, _| Ok(Value::Num(42.0)));
+            interp.install_readonly_indexed_properties(&args[0], 3, Value::Obj(getter))?;
+            Ok(Value::Undefined)
+        });
+    engine.interp.global.borrow_mut().props.insert(
+        "indexOnto",
+        crate::value::Property::data(Value::Obj(index_onto), true, true, true),
+    );
+    let chunk = chunk_of(&mut engine, "rdi");
+    install(&mut engine, "rdi", &rdi(&chunk), Options::default());
+    exits();
+    assert_eq!(eval(&mut engine, "rdi(function () {}, {})"), "undefined");
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, "rdi(indexOnto, {})"), "42");
+    assert_eq!(reasons(), vec![ExitReason::OutOfBounds]);
+}
+
+/// `len(a)` (GetPropLocal 0 `length` at pc 0, Return): `a` checked an Array, its length read.
+fn len() -> Graph {
+    let mut b = Build::new(1);
+    let entry = b.block(0, false);
+    let a = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let at_len = b.state(0, &[], &[], &[]);
+    let cell = b.exiting(
+        entry,
+        NodeOp::CheckObject,
+        &[a],
+        Rep::Cell,
+        0,
+        at_len,
+        ExitReason::NotObject,
+    );
+    b.exiting(
+        entry,
+        NodeOp::CheckElements(ElemKind::Array),
+        &[cell],
+        Rep::None,
+        0,
+        at_len,
+        ExitReason::WrongElements,
+    );
+    let length = b.node(entry, NodeOp::LoadArrayLength, &[cell], Rep::Tagged, 0);
+    b.node(entry, NodeOp::Return, &[length], Rep::None, 1);
+    b.g
+}
+
+#[test]
+fn an_arrays_length_is_its_first_slot() {
+    let mut engine = fixture("function len(a) { return a.length; } len([1]);");
+    install(&mut engine, "len", &len(), Options::default());
+    exits();
+    assert_eq!(eval(&mut engine, "len([1, 2, 3])"), "3");
+    assert_eq!(eval(&mut engine, "len(new Array(50))"), "50");
+    assert_eq!(eval(&mut engine, "var g = [1]; g.length = 7; len(g)"), "7");
+    assert_eq!(
+        eval(&mut engine, "class Sub extends Array {} len(Sub.of(1, 2))"),
+        "2"
+    );
+    assert!(exits().is_empty());
+    assert_eq!(eval(&mut engine, "len({length: 5})"), "5");
+    assert_eq!(eval(&mut engine, "len('four')"), "4");
+    assert_eq!(
+        reasons(),
+        vec![ExitReason::WrongElements, ExitReason::NotObject]
+    );
+}
+
+#[test]
 fn edges_stored_into_large_arrays_mark_their_runs() {
     // An old array of more than 64 words keeps a remembered record: a minor collection traces
     // its dirty runs and the words past its traced length only, so an edge stored below that

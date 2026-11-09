@@ -567,6 +567,8 @@ struct State {
     loaded: FastMap<(NodeIx, NodeIx), NodeIx>,
     /// ...and the indices below their used length whose word a load or store proved no hole.
     present: crate::fasthash::FastSet<(NodeIx, NodeIx)>,
+    /// An Array word's `length`, loaded this effect epoch, which an append ends.
+    lengths: FastMap<NodeIx, NodeIx>,
 }
 
 impl State {
@@ -582,6 +584,7 @@ impl State {
         self.used.clear();
         self.loaded.clear();
         self.present.clear();
+        self.lengths.clear();
     }
 
     /// Whether a handler record of a `for…of` body is active (a return there is routed through
@@ -708,6 +711,7 @@ fn meet_elements(first: &State, rest: &[(BlockIx, State)]) -> State {
             .filter(|site| rest.iter().all(|(_, state)| state.present.contains(site)))
             .copied()
             .collect(),
+        lengths: alike(&first.lengths, rest, |state| &state.lengths),
         ..State::default()
     }
 }
@@ -1370,6 +1374,7 @@ impl<'a> Builder<'a> {
         st.used.retain(|words, _| addresses.contains(words));
         st.loaded.retain(|(words, _), _| addresses.contains(words));
         st.present.retain(|(words, _)| addresses.contains(words));
+        st.lengths.retain(|word, _| live.contains(word));
     }
 
     // ---- control flow --------------------------------------------------------------------------
@@ -1790,6 +1795,16 @@ impl<'a> Builder<'a> {
                 let slot = self.slot(pc, slot as usize)?;
                 self.update_local(pc, slot, kind, st)?
             }
+            Op::GetProp(name, _) if self.array_length_site(pc, name) => {
+                self.array_length(pc, Recv::Stack, st)?
+            }
+            Op::GetPropThis(name, _) if self.array_length_site(pc, name) => {
+                self.array_length(pc, Recv::This, st)?
+            }
+            Op::GetPropLocal(slot, name, _) if self.array_length_site(pc, name) => {
+                let slot = self.slot(pc, slot as usize)?;
+                self.array_length(pc, Recv::Slot(slot), st)?
+            }
             Op::GetProp(name, _) => self.named_load(pc, name, Recv::Stack, false, st)?,
             Op::GetMethod(name, _) => self.named_load(pc, name, Recv::Stack, true, st)?,
             Op::GetPropThis(name, _) => self.named_load(pc, name, Recv::This, false, st)?,
@@ -1819,6 +1834,7 @@ impl<'a> Builder<'a> {
                 let slot = self.slot(pc, slot as usize)?;
                 self.element_store(pc, Recv::Slot(slot), false, st)?
             }
+            Op::UpdateElem(kind) => self.update_element(pc, kind, st)?,
             Op::ToPropKey => self.to_prop_key(pc, Recv::Stack, st)?,
             Op::ToPropKeyLocal(slot) => {
                 let slot = self.slot(pc, slot as usize)?;
@@ -2477,6 +2493,9 @@ struct ElemSite {
     /// Array where the receivers were Arrays only, Words where ordinary objects were among them.
     kind: ElemKind,
     reads: Reads,
+    /// Whether Arrays are among the receivers: a store then fills holes and appends in line,
+    /// whatever the facts, since the first stage does both in line and records neither.
+    arrays: bool,
 }
 
 /// The element index a constant key names: an int32 Number, -0 being index 0.
@@ -2524,7 +2543,11 @@ impl Builder<'_> {
         } else {
             Reads::InBounds
         };
-        Some(ElemSite { kind, reads })
+        Some(ElemSite {
+            kind,
+            reads,
+            arrays: receivers & ELEM_ARRAY != 0,
+        })
     }
 
     /// Whether a lowered element access can take `receiver` and `key`: a word that may be an
@@ -2803,6 +2826,8 @@ impl Builder<'_> {
         let key = self.index_key(index);
         let mode = if st.present.contains(&(words, key)) {
             Store::Present
+        } else if site.arrays {
+            Store::Create
         } else {
             Store::Existing
         };
@@ -2818,6 +2843,10 @@ impl Builder<'_> {
         st.elements.clear();
         st.used.clear();
         st.loaded.clear();
+        if mode == Store::Create {
+            // An append raises an Array's `length`, whichever word names the Array.
+            st.lengths.clear();
+        }
         st.elements.insert(receiver, after);
         st.present.insert((after, key));
         st.loaded.insert((after, key), value);
@@ -2826,6 +2855,130 @@ impl Builder<'_> {
         if keep {
             st.stack.push(value);
         }
+        Ok(())
+    }
+
+    /// UpdateElem (`a[i]++`, `--a[i]`) where its value record says Number: the receiver's element
+    /// words (UpdateElem's record is a value record, which names no receiver), the element read
+    /// with a hole exiting, checked a Number (an int32 where the record's hint says so), one added
+    /// or taken with an overflow exit, and the result written back to the element the read proved
+    /// present. Every exit precedes the write, at the operation, which the VM then runs whole.
+    fn update_element(&mut self, pc: usize, kind: UpdKind, st: &mut State) -> Result<(), Refusal> {
+        let Some(values) = self.snapshot.values(pc) else {
+            return self.effect(pc, st);
+        };
+        let len = st.stack.len();
+        let (receiver, key) = (st.stack[len - 2], st.stack[len - 1]);
+        if values.operand0 & !NUMBER != 0 || !self.element_operands(receiver, key) {
+            return self.effect(pc, st);
+        }
+        let mut cx = Before::new(pc);
+        let cell = self.elements_cell(st, &mut cx, receiver, ElemKind::Words);
+        let index = self.element_index(st, &mut cx, key);
+        let old = self.element_read(st, &mut cx, receiver, cell, index, Reads::InBounds);
+        let increment = matches!(
+            kind,
+            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
+        );
+        let int = self.known_int32(st, old) || (int32_hint(&values) && self.int32_operand(st, old));
+        let (number, new) = match int.then(|| self.int32(st, &mut cx, old)).flatten() {
+            Some(x) => {
+                let one = self.hoist(Hoisted::I32(1));
+                let node = if increment {
+                    NodeOp::I32Add
+                } else {
+                    NodeOp::I32Sub
+                };
+                let state = self.before(&mut cx, st);
+                let new = self.add_exit(node, &[x, one], Rep::I32, pc, state, ExitReason::Overflow);
+                (x, new)
+            }
+            None => {
+                let Some(x) = self.number(st, &mut cx, old) else {
+                    return Err(Refusal::at(pc, "a Number element without an f64 form"));
+                };
+                let one = self.hoist(Hoisted::F64(1f64.to_bits()));
+                let node = if increment {
+                    NodeOp::F64Add
+                } else {
+                    NodeOp::F64Sub
+                };
+                (x, self.add(node, &[x, one], Rep::F64, pc))
+            }
+        };
+        let words = self.elements_of(st, receiver, cell, pc);
+        let key = self.index_key(index);
+        let mode = if st.present.contains(&(words, key)) {
+            Store::Present
+        } else {
+            Store::Existing
+        };
+        let state = self.before(&mut cx, st);
+        let after = self.add_exit(
+            NodeOp::StoreElement(mode),
+            &[cell, words, index, new],
+            Rep::Ptr,
+            pc,
+            state,
+            ExitReason::WrongElements,
+        );
+        st.elements.clear();
+        st.used.clear();
+        st.loaded.clear();
+        st.elements.insert(receiver, after);
+        st.present.insert((after, key));
+        st.loaded.insert((after, key), new);
+        st.stack.truncate(len - 2);
+        match kind {
+            UpdKind::PreInc | UpdKind::PreDec => st.stack.push(new),
+            UpdKind::PostInc | UpdKind::PostDec => st.stack.push(number),
+            UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+        }
+        Ok(())
+    }
+
+    /// Whether the named load of `name` at `pc` reads Arrays' `length`: its ways all the Array's
+    /// key-checked first slot, which own_data_ways refuses (an Array's `length` is its slot 0:
+    /// value.rs length_property), and no generic mark.
+    fn array_length_site(&self, pc: usize, name: u32) -> bool {
+        if self.chunk.jit_name(name) != "length" {
+            return false;
+        }
+        let Some(named) = self.snapshot.named(pc) else {
+            return false;
+        };
+        !named.generic
+            && named.filled().next().is_some()
+            && named.filled().all(|way| {
+                way.kind == NamedWayKind::KeyChecked
+                    && way.depth == 0
+                    && way.slot == 0
+                    && way.primitive == 0
+            })
+    }
+
+    /// GetProp, GetPropThis and GetPropLocal of an Array's `length` (`array_length_site`): the
+    /// receiver checked an Array (CheckObject [NotObject], CheckElements [WrongElements]), then its
+    /// first slot's word, a heap fact that an append and an effect end.
+    fn array_length(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
+        let receiver = self.receiver(recv, st, 0, pc);
+        if self.rep(receiver) != Rep::Tagged || self.constant(receiver).is_some() {
+            return self.effect(pc, st);
+        }
+        let mut cx = Before::new(pc);
+        let cell = self.elements_cell(st, &mut cx, receiver, ElemKind::Array);
+        let length = match st.lengths.get(&receiver) {
+            Some(&length) => length,
+            None => {
+                let length = self.add(NodeOp::LoadArrayLength, &[cell], Rep::Tagged, pc);
+                st.lengths.insert(receiver, length);
+                length
+            }
+        };
+        if matches!(recv, Recv::Stack) {
+            st.stack.pop();
+        }
+        st.stack.push(length);
         Ok(())
     }
 

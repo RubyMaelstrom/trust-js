@@ -281,6 +281,22 @@ impl Words {
         self.unshare();
     }
 
+    /// Room for one more word, as [`Words::push`] makes it when the block is full (a shared
+    /// literal's exact block grows into a private one), for the optimizing tier's in-line append
+    /// (P3 stage 2 step 2, a pure call from generated code: Warp's addDenseElementPure). False,
+    /// with nothing changed, where the block holds the most words a header can count.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn reserve_one(&mut self) -> bool {
+        if self.len() >= MAX_WORDS {
+            return false;
+        }
+        self.reserve(1);
+        true
+    }
+
     /// Mark, in the remembered record of the block whose first word is at `words`, the dirty bit
     /// of the run holding `index`, for an edge generated code stored there: the optimizing tier's
     /// element store (P3 stage 2 step 2), as Warp's post barrier for a large array is a pure call

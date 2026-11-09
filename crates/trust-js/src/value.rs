@@ -9730,6 +9730,22 @@ impl Props {
         self.elems.words_start().words_address()
     }
 
+    /// The element words' address after room for one more word was made (`Words::reserve_one`;
+    /// the static empty block's first block among them): the optimizing tier's in-line append of
+    /// an Array (P3 stage 2 step 2, a pure call from generated code under the object's mutable
+    /// borrow, which marked its card for the new block; Warp's addDenseElementPure). Allocates and
+    /// never collects. The append's caller proved the map no marked prototype, whose first word
+    /// would be a structural change to report (`try_append_element`). None where the words hold
+    /// the most a header can count.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn grown_words_address(&mut self) -> Option<usize> {
+        let words = self.elems.words_start();
+        words.reserve_one().then(|| words.words_address())
+    }
+
     /// Append one plain element as a word, with no decimal key or index-to-field map. Array
     /// exotic validation (length, extensibility and prototype setters) stays at the caller.
     /// ECMA-262 Array [[DefineOwnProperty]] / OrdinarySet, e28783d5.

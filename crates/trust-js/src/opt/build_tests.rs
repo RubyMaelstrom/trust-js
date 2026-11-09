@@ -1691,10 +1691,11 @@ fn element_stores_take_the_values_representation_and_end_the_epochs_reads() {
            two([1, 2], [3, 4], 0);
          }",
     );
+    // An Array site's store fills holes and appends too (Create), unless the element is proven.
     for (name, mode, rep) in [
-        ("seti", Store::Existing, Rep::I32),
-        ("setd", Store::Existing, Rep::F64),
-        ("setw", Store::Existing, Rep::Tagged),
+        ("seti", Store::Create, Rep::I32),
+        ("setd", Store::Create, Rep::F64),
+        ("setw", Store::Create, Rep::Tagged),
         ("rmw", Store::Present, Rep::I32),
     ] {
         let (chunk, graph) = graph_of(&mut engine, name);
@@ -1724,6 +1725,98 @@ fn element_stores_take_the_values_representation_and_end_the_epochs_reads() {
         1,
         "b[i] alone: {text}"
     );
+}
+
+#[test]
+fn array_stores_fill_holes_and_append_in_line() {
+    // Appends and hole fills run in line in the first stage and record nothing, so a site that
+    // saw Arrays always compiles them; a site of ordinary objects alone stores existing elements.
+    let mut engine = vm_engine(
+        "function put(a, i, v) { a[i] = v; } function puto(o, i, v) { o[i] = v; }
+         for (var k = 0; k < 20; k++) { put([1, 2], 1, k); puto({0: 1, 1: 2}, 1, k); }",
+    );
+    for (name, mode) in [("put", Store::Create), ("puto", Store::Existing)] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        let stores = nodes(&graph, |op| matches!(op, NodeOp::StoreElement(_)));
+        assert_eq!(stores.len(), 1, "{name}: {text}");
+        assert_eq!(stores[0].op, NodeOp::StoreElement(mode), "{name}: {text}");
+    }
+}
+
+#[test]
+fn an_arrays_length_is_a_load_that_an_append_ends() {
+    let mut engine = vm_engine(
+        "function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s; }
+         function push(a, x) { var n = a.length; a[a.length] = x; return a.length - n; }
+         for (var k = 0; k < 20; k++) { sum([1, 2, 3]); push([1, 2], k); }",
+    );
+    // `i < a.length` loops keep their bodies free of effects.
+    let (chunk, graph) = graph_of(&mut engine, "sum");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::LoadArrayLength),
+        1,
+        "{text}"
+    );
+    assert!(
+        nodes(&graph, |op| *op == NodeOp::CheckElements(ElemKind::Array))
+            .iter()
+            .all(|node| node.reason == Some(ExitReason::WrongElements)),
+        "{text}"
+    );
+    // Read once for `n` and the key, and again after the append, which ends the first read.
+    let (chunk, graph) = graph_of(&mut engine, "push");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::LoadArrayLength),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::StoreElement(Store::Create)),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
+fn an_element_update_reads_adds_and_writes_back() {
+    let mut engine = vm_engine(
+        "function inc(a, i) { a[i]++; return a; } function pre(a, i) { return ++a[i]; }
+         function post(a, i) { return a[i]--; } function half(a, i) { return a[i]++; }
+         for (var k = 0; k < 20; k++) {
+           inc([1, 2], 1); pre([1, 2], 0); post([3, 4], 1); half([0.5, 1.5], 0);
+         }",
+    );
+    // The VM's numeric update records nothing (its fast path), so no record hints int32: f64
+    // arithmetic, whose store keeps INT32 for an exact int32.
+    for (name, add, rep) in [
+        ("inc", NodeOp::F64Add, Rep::F64),
+        ("pre", NodeOp::F64Add, Rep::F64),
+        ("post", NodeOp::F64Sub, Rep::F64),
+        ("half", NodeOp::F64Add, Rep::F64),
+    ] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        assert_eq!(count(&graph, |op| *op == add), 1, "{name}: {text}");
+        // The read proved the element present: no second bounds or hole test.
+        let stores = nodes(&graph, |op| matches!(op, NodeOp::StoreElement(_)));
+        assert_eq!(stores.len(), 1, "{name}: {text}");
+        assert_eq!(
+            stores[0].op,
+            NodeOp::StoreElement(Store::Present),
+            "{name}: {text}"
+        );
+        assert_eq!(graph.node(stores[0].inputs[3]).rep, rep, "{name}: {text}");
+        let pc = pc_of(&chunk, |op| matches!(op, Op::UpdateElem(_)));
+        let state = graph.state(stores[0].state.expect("a store has a state"));
+        assert_eq!((state.pc as usize, state.stack.len()), (pc, 2), "{text}");
+    }
 }
 
 #[test]
