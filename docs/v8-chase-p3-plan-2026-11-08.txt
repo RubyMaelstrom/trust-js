@@ -841,4 +841,8 @@ Stage 1's exit (proposed, for the owner's agreement):
   microbenchmark slower by more than 2%, Octane's geomean faster, and compile time at most 3% of any
   fixture's measured pass.
 Measured 2026-11-09 (Stage 1's measurements and Why, above): the gates are met; coverage (46.9%) and
-performance are not. The owner's decision on the exit is pending.
+performance are not. The owner's decision (2026-11-09, "Close, carry bars"): Stage 1 closes on its
+gates, with its coverage and performance recorded as measured; the tier stays off by default; the
+same coverage and performance bars become Stage 2's exit, and Stage 2 starts with the three causes:
+elements in line, f64 operands truncated for ToInt32 in line (Maglev's TruncateFloat64ToInt32), and
+point 12's exit profile with reoptimization.
