@@ -62,6 +62,18 @@ impl Gen<'_> {
                 self.a.cmp_reg_x(word, X17);
                 self.a.b_cond(EQ, site);
             }
+            NodeOp::StoreBinding { slot } => {
+                let record = self.gp(node.inputs[0], X16);
+                let value = self.gp(node.inputs[1], X17);
+                self.a
+                    .str_imm(value, record, operations::cap_slot_offset(u32::from(slot)));
+                if !self.scalar_word(node.inputs[1]) {
+                    // The record's card, after the store and before any safepoint, as
+                    // `emit_cap_store` and `Chunk::store_cap_ic` mark it: a minor collection
+                    // then finds an old record's edge to a young value.
+                    emit_card_mark(&mut self.a, record, X9, X30);
+                }
+            }
             _ => unreachable!("a free-name node"),
         }
         Ok(())

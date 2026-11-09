@@ -1888,6 +1888,11 @@ impl<'a> Builder<'a> {
                 self.name_load(pc, false, st)?
             }
             Op::LoadNameForCall(..) | Op::LoadNameForCallIn(..) => self.name_load(pc, true, st)?,
+            Op::StoreNameCached(..) | Op::StoreCap(_) => self.name_store(pc, false, st)?,
+            Op::StoreCapInit(_) => self.name_store(pc, true, st)?,
+            Op::UpdateNameCached(_, _, kind) | Op::UpdateCap(_, kind) => {
+                self.name_update(pc, kind, st)?
+            }
             Op::Jump(target) => {
                 self.jump(pc, target as usize, std::mem::take(st))?;
                 return Ok(false);

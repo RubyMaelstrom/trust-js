@@ -373,6 +373,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::EnvParent => (&[Rep::Env], Rep::Env),
         NodeOp::LoadBinding { .. } => (&[Rep::Env], Rep::Tagged),
         NodeOp::CheckInitialized => (TAGGED, Rep::None),
+        NodeOp::StoreBinding { .. } => (&[Rep::Env, Rep::Tagged], Rep::None),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),
         NodeOp::Return => (TAGGED, Rep::None),

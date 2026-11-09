@@ -481,6 +481,13 @@ pub(crate) enum NodeOp {
     /// (Tagged): exits [Tdz] when the word is the empty one, a binding in its TDZ. Warp's
     /// MLexicalCheck, JSC's CheckNotEmpty.
     CheckInitialized,
+    /// (Env, Tagged): the word stored into the binding at `slot` of the record, a mutable one or
+    /// one being initialized, with the record's card marked unless the word is no reference
+    /// (the templates' `emit_cap_store`). Maglev's StoreContextSlot, Warp's SetAliasedVar, JSC's
+    /// PutClosureVar.
+    StoreBinding {
+        slot: u16,
+    },
 
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's

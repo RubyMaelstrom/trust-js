@@ -2523,11 +2523,12 @@ fn a_free_name_called_has_an_undefined_receiver() {
 #[test]
 fn a_captured_binding_is_read_at_its_activations_slot() {
     // `c` lives in capt's own record (`get` captures it): LoadCap, at hops 0 from the running
-    // environment, its TDZ proven by the initialization before it in its block.
+    // environment, after the call (which ends the initialization's word as a fact), its TDZ
+    // proven by the initialization before it.
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
-        "function capt(n) { let c = n + 1; function get() { return c; } return c * 2 + get(); }
+        "function capt(n) { let c = n + 1; function get() { return c; } return get() + c * 2; }
          for (var i = 0; i < 20; i++) capt(i);",
     );
     let (chunk, graph) = graph_of(&mut engine, "capt");
@@ -2543,6 +2544,11 @@ fn a_captured_binding_is_read_at_its_activations_slot() {
     });
     assert_eq!(loads.len(), 1, "{text}");
     assert_eq!(graph.node(loads[0].inputs[0]).op, NodeOp::Env, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckInitialized),
+        0,
+        "{text}"
+    );
     assert!(
         nodes(&graph, is_effect)
             .iter()
@@ -2601,4 +2607,198 @@ fn a_splices_static_reads_start_from_its_pinned_environments_holder() {
         "{text}"
     );
     assert_eq!(count(&graph, |op| *op == NodeOp::Env), 0, "{text}");
+}
+
+/// The free-name stores and updates of `name` in `chunk` (StoreNameCached, UpdateNameCached).
+fn name_writes(chunk: &Chunk, name: &str) -> Vec<usize> {
+    (0..chunk.jit_ops().len())
+        .filter(|&pc| match chunk.jit_ops()[pc] {
+            Op::StoreNameCached(n, _) | Op::UpdateNameCached(n, _, _) => chunk.jit_name(n) == name,
+            _ => false,
+        })
+        .collect()
+}
+
+#[test]
+fn a_static_store_writes_in_place_and_its_word_is_the_bindings_value() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { var count = 0; var last = null;
+           return function (o) { count = count + 1; last = o; return count; }; }
+         var r = mk();
+         for (var i = 0; i < 20; i++) r({});",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "r");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    let snapshot = Snapshot::take(&chunk);
+    let count_slot = static_address(&snapshot, name_writes(&chunk, "count")[0]).slot;
+    let last_slot = static_address(&snapshot, name_writes(&chunk, "last")[0]).slot;
+    let stores = nodes(&graph, |op| matches!(op, NodeOp::StoreBinding { .. }));
+    assert_eq!(stores.len(), 2, "{text}");
+    // `count`'s new value is the sum's word; the return reads it back from the fact, not the
+    // record.
+    assert_eq!(binding_loads(&graph, count_slot), 1, "{text}");
+    assert_eq!(binding_loads(&graph, last_slot), 0, "{text}");
+    let stored = stores
+        .iter()
+        .find(|node| node.op == NodeOp::StoreBinding { slot: count_slot })
+        .expect("count's store");
+    assert_eq!(
+        graph.node(stored.inputs[1]).op,
+        NodeOp::F64ToTagged,
+        "{text}"
+    );
+    let ret = nodes(&graph, |op| *op == NodeOp::Return)[0];
+    assert_eq!(ret.inputs[0], stored.inputs[1], "{text}");
+}
+
+#[test]
+fn a_lexical_store_tests_the_old_words_tdz_once() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { let x = 0; return function (v) { x = v; x = v + 1; return x; }; }
+         var r = mk();
+         for (var i = 0; i < 20; i++) r(i);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "r");
+    let text = dump(&graph, &chunk);
+    let checks = nodes(&graph, |op| *op == NodeOp::CheckInitialized);
+    assert_eq!(checks.len(), 1, "{text}");
+    // It exits at the first store, its operand on the stack.
+    let first = name_writes(&chunk, "x")[0];
+    let state = graph.state(checks[0].state.expect("a state"));
+    assert_eq!(state.pc as usize, first, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::StoreBinding { .. })),
+        2,
+        "{text}"
+    );
+    // The old word's load for the test, and none for the return.
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadBinding { .. })),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
+fn static_updates_take_int32_or_f64_arithmetic_and_store_in_place() {
+    // The VM's records say int32: int32 adds with overflow exits.
+    let source = "function mk() { var n = 0; return function () { n++; return ++n; }; }
+                  var r = mk();
+                  for (var i = 0; i < 20; i++) r();";
+    let mut vm = engine(Tier::Bytecode);
+    eval(&mut vm, source);
+    let (chunk, graph) = graph_of(&mut vm, "r");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    let adds = nodes(&graph, |op| *op == NodeOp::I32Add);
+    assert_eq!(adds.len(), 2, "{text}");
+    assert!(
+        adds.iter()
+            .all(|add| add.reason == Some(ExitReason::Overflow)),
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::StoreBinding { .. })),
+        2,
+        "{text}"
+    );
+    // The second update reads the first's word: one load.
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadBinding { .. })),
+        1,
+        "{text}"
+    );
+    // The first stage's in-line updates record nothing: f64 arithmetic.
+    let mut jit = engine(Tier::Jit);
+    eval(&mut jit, source);
+    let (chunk, graph) = graph_of(&mut jit, "r");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64Add), 2, "{text}");
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+}
+
+#[test]
+fn captured_bindings_are_initialized_stored_and_updated_in_place() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function capt(n) { let c = n; function get() { return c; } c = c + 1; c++;
+           return get() + c; }
+         for (var i = 0; i < 20; i++) capt(i);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "capt");
+    let text = dump(&graph, &chunk);
+    if !chunk.jit_fixed_activation() {
+        return; // activation plans off: the captured bindings keep their effects
+    }
+    let writes = |which: fn(&Op) -> bool| {
+        (0..chunk.jit_ops().len())
+            .filter(|&pc| which(&chunk.jit_ops()[pc]))
+            .count()
+    };
+    assert_eq!(writes(|op| matches!(op, Op::StoreCapInit(_))), 1, "{text}");
+    assert_eq!(writes(|op| matches!(op, Op::StoreCap(_))), 1, "{text}");
+    assert_eq!(writes(|op| matches!(op, Op::UpdateCap(..))), 1, "{text}");
+    // The initialization ends the TDZ: no test anywhere; the call reloads the binding.
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckInitialized),
+        0,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::StoreBinding { .. })),
+        3,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, is_effect),
+        2,
+        "the closure and the call: {text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadBinding { .. })),
+        1,
+        "the read after the call: {text}"
+    );
+}
+
+#[test]
+fn a_store_ends_its_slots_facts_on_every_record() {
+    // `add`'s splices read `s` from their folded holder, mk's activation, which the caller's own
+    // store reaches from its running environment: the second splice reads `s` again.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { var s = 0; function add(v) { return v + s; }
+           return function (x) { var a = add(1); s = x; return a + add(2); }; }
+         var caller = mk();
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(i); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    let graph = graph_for(&transformed, "caller's second stage");
+    let text = dump(&graph, &transformed);
+    let reads = name_reads(&transformed, "s");
+    if reads.len() != 2 {
+        return; // add was not spliced twice
+    }
+    let snapshot = Snapshot::take(&transformed);
+    let slot = static_address(&snapshot, reads[0]).slot;
+    let from_holder = nodes(&graph, |op| *op == NodeOp::LoadBinding { slot })
+        .into_iter()
+        .filter(|node| matches!(graph.node(node.inputs[0]).op, NodeOp::ConstEnv(_)))
+        .count();
+    assert_eq!(from_holder, 2, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::StoreBinding { slot }),
+        1,
+        "{text}"
+    );
 }

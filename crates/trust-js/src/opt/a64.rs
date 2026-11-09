@@ -1041,7 +1041,8 @@ impl Gen<'_> {
             NodeOp::Env
             | NodeOp::EnvParent
             | NodeOp::LoadBinding { .. }
-            | NodeOp::CheckInitialized => self.lower_name(n)?,
+            | NodeOp::CheckInitialized
+            | NodeOp::StoreBinding { .. } => self.lower_name(n)?,
             NodeOp::EntrySlot(slot) | NodeOp::FrameSlot(slot) => {
                 if !unused {
                     let dst = self.gp_dst(n);

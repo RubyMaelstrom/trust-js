@@ -1358,3 +1358,183 @@ fn an_exit_limit_of_one_cycles_reoptimization_and_results_hold() {
     }
     assert!(compiles > 0);
 }
+
+// ---- free names (stage 2, step 4) ---------------------------------------------------------------
+
+/// `source`'s result under the tier eager, with exits forced at every seventh check, and with
+/// every code discarded at its first exit (TRUST_JS_OPT_EXIT_LIMIT=1), each against the VM's.
+fn names_hold(source: &str) {
+    let expected = run(Tier::Bytecode, source);
+    for (label, switches) in [
+        ("eager", eager()),
+        (
+            "forced exits",
+            TestSwitches {
+                exit_every: 7,
+                ..eager()
+            },
+        ),
+        (
+            "an exit limit of one",
+            TestSwitches {
+                exit_limit: 1,
+                ..eager()
+            },
+        ),
+        (
+            "both",
+            TestSwitches {
+                exit_every: 7,
+                exit_limit: 1,
+                ..eager()
+            },
+        ),
+    ] {
+        compiled();
+        assert_eq!(
+            with_switches(switches, source),
+            expected,
+            "{label}: {source}"
+        );
+        assert!(
+            !compiled().is_empty(),
+            "{label}: the tier compiled none of {source}"
+        );
+    }
+}
+
+#[test]
+fn a_closure_reading_an_outer_let_in_its_tdz_exits_and_the_vm_throws_at_its_read() {
+    // `read`'s code checks `x` initialized; an activation that calls it before `let x` runs
+    // exits there (Tdz), and the VM's run of the read throws its ReferenceError, caught in the
+    // callee's own try, in its caller's, or by no one.
+    const SOURCE: &str = "function mk(early, guard) {
+           function read() { return x + 1; }
+           if (early) {
+             if (guard) { try { return read(); } catch (e) { return e.name; } }
+             return read();
+           }
+           let x = 5;
+           return read();
+         }\n\
+         let t = 0; for (let k = 0; k < 2000; k++) t += mk(false, false); t";
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    assert_eq!(eval(&mut engine, SOURCE), "12000");
+    exits();
+    assert_eq!(
+        eval(&mut engine, "mk(true, true)"),
+        "ReferenceError",
+        "caught in the callee's try"
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let caught = 'none'; try { mk(true, false); } catch (e) { caught = e.name + ': ' + \
+             e.message; } caught"
+        ),
+        "ReferenceError: cannot access 'x' before initialization"
+    );
+    assert!(eval(&mut engine, "mk(true, false)").starts_with("throw ReferenceError"));
+    // One Tdz exit a call, each at the read itself (a splice of `read` into mk's code guards a
+    // closure of another activation, which may exit too: WrongCallee).
+    let taken = exits();
+    let tdz: Vec<u32> = taken
+        .iter()
+        .filter(|&&(_, why)| why == ExitReason::Tdz)
+        .map(|&(pc, _)| pc)
+        .collect();
+    assert_eq!(tdz.len(), 3, "{taken:?}");
+    assert!(tdz.windows(2).all(|pair| pair[0] == pair[1]), "{taken:?}");
+    assert_eq!(
+        eval(&mut engine, "mk(false, false) + mk(false, true)"),
+        "12"
+    );
+    names_hold(SOURCE);
+}
+
+#[test]
+fn a_const_and_a_var_read_in_a_loop_whose_callee_assigns_the_var() {
+    names_hold(
+        "function mk() {
+           const step = 3; var total = 0;
+           function bump(k) { total = total + k; }
+           return function run(n) {
+             let sum = 0;
+             for (let i = 0; i < n; i++) { bump(i); sum = sum + step * i + total; }
+             return sum + total;
+           };
+         }
+         const run = mk();
+         let out = 0; for (let k = 0; k < 600; k++) out = (out + run(k % 17)) % 1000003; out",
+    );
+}
+
+#[test]
+fn static_stores_and_updates_of_closure_variables_hold_their_values() {
+    names_hold(
+        "function counter() {
+           let n = 0; var s = '';
+           return function tick(k) { n++; n += k; s = k % 3 === 0 ? s + 'x' : s; ++n; n--;
+             return n + s.length; };
+         }
+         const tick = counter();
+         let t = 0; for (let k = 0; k < 3000; k++) t = (t + tick(k)) % 1000003; t",
+    );
+}
+
+#[test]
+fn a_static_store_of_an_object_into_an_old_record_marks_its_card() {
+    // `set` stores young objects into mk's activation, which collections promote: a minor
+    // collection finds the edge through the record's card, which heap verification (on in the
+    // engine's tests) checks at every collection.
+    const SOURCE: &str = "function mk() { var held = null;
+           return { set: function (o) { held = o; }, get: function () { return held; } }; }
+         const box = mk();
+         for (let k = 0; k < 1000; k++) box.set({v: k});";
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    eval(&mut engine, SOURCE);
+    assert!(!compiled().is_empty(), "the tier compiled set");
+    {
+        let mut core = engine.interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(1);
+        core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    }
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let sum = 0; for (let k = 0; k < 400; k++) { box.set({v: k, pad: [k, k]});
+               const junk = [{}, {}, {}]; sum += box.get().v + box.get().pad[1] + junk.length; }
+             sum"
+        ),
+        (0..400).map(|k| 2 * k + 3).sum::<i64>().to_string()
+    );
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
+}
+
+#[test]
+fn a_class_whose_heritage_makes_and_calls_a_closure_that_reads_outer_variables() {
+    // The class's outer record is re-parented after its heritage and computed keys ran
+    // (eval.rs's eval_class_strict): a closure the heritage made and called, which reads the
+    // enclosing function's variables, and one that escapes and runs after the class exists,
+    // read what the VM reads (the plan's Q3: parent links are value facts within an
+    // activation).
+    names_hold(
+        "function outer(k) {
+           let base = k; var seen = 0; let later = null;
+           class C extends (function () {
+             const peek = () => base + seen;
+             for (let i = 0; i < 40; i++) seen = seen + peek() % 7;
+             later = () => base * 2 + seen;
+             return Object;
+           })() {
+             [(seen = seen + 1, 'm' + (base % 3))]() { return base + seen; }
+           }
+           return later() + new C()['m' + (k % 3)]() + seen;
+         }
+         let t = 0; for (let k = 0; k < 300; k++) t = (t + outer(k)) % 1000003; t",
+    );
+}

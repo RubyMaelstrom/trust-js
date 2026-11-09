@@ -14,6 +14,11 @@
 //!   Tdz), as SpiderMonkey's LexicalCheck and JSC's CheckNotEmpty: once checked, a (record, slot)
 //!   is initialized for the rest of the function, since a record's binding never returns to its
 //!   TDZ (a loop's fresh bindings are new records, which effects make).
+//! - Stores and updates at a static address (StoreNameCached, UpdateNameCached, StoreCap,
+//!   StoreCapInit, UpdateCap) are nodes: the old word's TDZ test for a lexical binding, an
+//!   update's arithmetic by its value record, the store, and the record's card unless the word is
+//!   no reference ([`NodeOp::StoreBinding`]), as Maglev's StoreContextSlot, Warp's SetAliasedVar
+//!   and JSC's PutClosureVar.
 //! - Facts ([`Facts`]), as the exemplars' alias rules have them: parent links are value facts
 //!   within an activation (the one later write, class evaluation re-parenting its fresh outer
 //!   record, eval.rs's `eval_class_strict`, happens after its heritage and keys ran, when no
@@ -218,6 +223,158 @@ impl Builder<'_> {
             st.names.constants.insert(key, value);
         }
         value
+    }
+
+    /// Store `word` into the binding at `slot` of `record` (a mutable binding, or one being
+    /// initialized), the binding's facts the word's from now on: every record's facts of the slot
+    /// end first, since a splice's holder and a chain from the running environment can name one
+    /// record.
+    fn store_binding(
+        &mut self,
+        st: &mut State,
+        record: NodeIx,
+        address: StaticName,
+        word: NodeIx,
+        pc: usize,
+    ) {
+        self.add(
+            NodeOp::StoreBinding { slot: address.slot },
+            &[record, word],
+            Rep::None,
+            pc,
+        );
+        let key = (record, address.slot);
+        st.names.values.retain(|&(_, slot), _| slot != address.slot);
+        if address.lexical {
+            st.names.initialized.insert(key);
+        }
+        if address.mutable {
+            st.names.values.insert(key, word);
+        } else {
+            st.names.constants.insert(key, word);
+        }
+    }
+
+    /// StoreNameCached at a static address (whose binding is mutable:
+    /// `Compiler::note_static_store`) and StoreCap, the old word's TDZ tested for a lexical
+    /// binding (SetMutableBinding throws in it), and StoreCapInit (`init`: InitializeBinding,
+    /// which ends the TDZ): the incoming word stored in place (see [`NodeOp::StoreBinding`]); any
+    /// other site, a global's among them, stays the effect.
+    pub(super) fn name_store(
+        &mut self,
+        pc: usize,
+        init: bool,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let NameView::Static { address, base } = self.snapshot.name(pc) else {
+            return self.effect(pc, st);
+        };
+        if !address.mutable && !init {
+            return self.effect(pc, st);
+        }
+        let Some(record) = self.static_record(st, address, base, pc) else {
+            return self.effect(pc, st);
+        };
+        let key = (record, address.slot);
+        let known = matches!(self.ops[pc], Op::StoreCap(_)) && self.chunk.jit_cap_initialized(pc);
+        if address.lexical
+            && !init
+            && !known
+            && !st.names.initialized.contains(&key)
+            && !st.names.values.contains_key(&key)
+        {
+            // The old word's TDZ, with the store's operand on the stack.
+            let mut cx = Before::new(pc);
+            let old = self.add(
+                NodeOp::LoadBinding { slot: address.slot },
+                &[record],
+                Rep::Tagged,
+                pc,
+            );
+            let state = self.before(&mut cx, st);
+            self.add_exit(
+                NodeOp::CheckInitialized,
+                &[old],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::Tdz,
+            );
+        }
+        let value = st.stack.pop().expect("the stack analysis saw the operand");
+        let word = self.tagged(st, value, pc);
+        self.store_binding(st, record, address, word, pc);
+        Ok(())
+    }
+
+    /// UpdateNameCached at a static address and UpdateCap (`++` and `--`) on a binding holding a
+    /// Number: its old word (its TDZ tested for a lexical binding), int32 or f64 arithmetic by the
+    /// value record as `update_local`'s, and the new word stored (see [`NodeOp::StoreBinding`]);
+    /// any other site, or a record that saw another kind of value, stays the effect.
+    pub(super) fn name_update(
+        &mut self,
+        pc: usize,
+        kind: UpdKind,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let NameView::Static { address, base } = self.snapshot.name(pc) else {
+            return self.effect(pc, st);
+        };
+        let Some(values) = self.snapshot.values(pc) else {
+            return self.effect(pc, st);
+        };
+        if !address.mutable || values.operand0 & !NUMBER != 0 {
+            return self.effect(pc, st);
+        }
+        let Some(record) = self.static_record(st, address, base, pc) else {
+            return self.effect(pc, st);
+        };
+        let known = matches!(self.ops[pc], Op::UpdateCap(..)) && self.chunk.jit_cap_initialized(pc);
+        let mut cx = Before::new(pc);
+        let old = self.binding_value(st, &mut cx, record, address, known);
+        if self.declines_number(pc, st, &[old]) {
+            return self.effect(pc, st);
+        }
+        let increment = matches!(
+            kind,
+            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
+        );
+        let proven = self.known_int32(st, old);
+        let int = (proven || (int32_hint(&values) && self.int32_operand(st, old)))
+            && !self.declines_int32(pc, proven);
+        let (number, new) = match int.then(|| self.int32(st, &mut cx, old)).flatten() {
+            Some(x) => {
+                let one = self.hoist(Hoisted::I32(1));
+                let node = if increment {
+                    NodeOp::I32Add
+                } else {
+                    NodeOp::I32Sub
+                };
+                let state = self.before(&mut cx, st);
+                let new = self.add_exit(node, &[x, one], Rep::I32, pc, state, ExitReason::Overflow);
+                (x, new)
+            }
+            None => {
+                let Some(x) = self.number(st, &mut cx, old) else {
+                    return Err(Refusal::at(pc, "a Number binding without an f64 form"));
+                };
+                let one = self.hoist(Hoisted::F64(1f64.to_bits()));
+                let node = if increment {
+                    NodeOp::F64Add
+                } else {
+                    NodeOp::F64Sub
+                };
+                (x, self.add(node, &[x, one], Rep::F64, pc))
+            }
+        };
+        let word = self.tagged(st, new, pc);
+        self.store_binding(st, record, address, word, pc);
+        match kind {
+            UpdKind::PreInc | UpdKind::PreDec => st.stack.push(new),
+            UpdKind::PostInc | UpdKind::PostDec => st.stack.push(number),
+            UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+        }
+        Ok(())
     }
 
     /// LoadName, LoadNameForCall (`for_call`: the constant undefined `this` below the value, as
