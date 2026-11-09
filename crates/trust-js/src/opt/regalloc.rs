@@ -12,9 +12,12 @@
 //! or the new value is when its own next use is farther (Maglev's choice). A home is the value's
 //! for its whole range, so an exit's recipe names one place per value; registers and slots free
 //! again where ranges end. Phis take their inputs by parallel moves on the edges into their blocks
-//! (`a64`). Constants have no home: each use takes them as its instruction's immediate where the
-//! encoding allows (stage 2 step 7) and rematerializes them otherwise, and a recipe records them
-//! as constants.
+//! (`a64`). Code order is the builder's, a loop's body right after its header and its exit code
+//! after the body, and a loop phi's register is the hint of the values its back edges carry,
+//! which take it where it is free and so need no move (stage 2 step 6; Maglev's bytecode order
+//! and SetLoopPhiRegisterHint). Constants have no home: each use takes them as its instruction's
+//! immediate where the encoding allows (stage 2 step 7) and rematerializes them otherwise, and a
+//! recipe records them as constants.
 //!
 //! Raw cell pointers and tagged words in callee-saved registers and spill slots are roots: the
 //! collector scans the native stack and the callee-saved registers conservatively and resolves
@@ -178,7 +181,12 @@ impl Bits {
     }
 }
 
-/// Reverse postorder from the entry over `succs`.
+/// Reverse postorder from the entry over `succs`, the last successor first so that the first
+/// comes first: the builder's block order (`build::in_reverse_postorder`), in which a loop's body
+/// follows its header (its condition's then-block) and the loop's exit code follows the body, as
+/// Maglev allocates in bytecode order (P3 stage 2 step 6). Visiting the first successor first
+/// placed the body after the exit code, so that a loop phi's hull spanned that code, effects
+/// and all.
 fn reverse_postorder(graph: &Graph, entry: BlockIx) -> Vec<BlockIx> {
     let mut seen = vec![false; graph.blocks.len()];
     let mut post = Vec::with_capacity(graph.blocks.len());
@@ -186,7 +194,8 @@ fn reverse_postorder(graph: &Graph, entry: BlockIx) -> Vec<BlockIx> {
     seen[entry.index()] = true;
     while let Some(&mut (block, ref mut next)) = stack.last_mut() {
         let succs = &graph.block(block).succs;
-        if let Some(&succ) = succs.get(*next) {
+        if *next < succs.len() {
+            let succ = succs[succs.len() - 1 - *next];
             *next += 1;
             if !seen[succ.index()] {
                 seen[succ.index()] = true;
@@ -211,6 +220,12 @@ impl Pool {
     fn take(list: &mut Vec<u8>) -> Option<u8> {
         // The lowest-numbered free register, for stable code.
         let (index, _) = list.iter().enumerate().min_by_key(|&(_, &r)| r)?;
+        Some(list.swap_remove(index))
+    }
+
+    /// Register `r`, where it is free.
+    fn take_this(list: &mut Vec<u8>, r: u8) -> Option<u8> {
+        let index = list.iter().position(|&free| free == r)?;
         Some(list.swap_remove(index))
     }
 }
@@ -434,13 +449,18 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             }
         });
     };
+    // A loop phi's register, hinted to its inputs defined after it (its back edges' values):
+    // where the register is free when such a value is defined, the value takes it and its edge
+    // moves nothing (Maglev's SetLoopPhiRegisterHint, maglev-regalloc.cc:1227-1240).
+    let mut hints: Vec<Option<u8>> = vec![None; n];
     let mut assign = |v: NodeIx,
                       homes: &mut Vec<Home>,
                       active: &mut Vec<(u32, NodeIx)>,
                       gp: &mut Pool,
                       fp: &mut Pool,
                       free_slots: &mut Vec<u32>,
-                      spill_bytes: &mut u32| {
+                      spill_bytes: &mut u32,
+                      hints: &[Option<u8>]| {
         let node = graph.node(v);
         if rematerializable(&node.op) {
             homes[v.index()] = Home::Const;
@@ -458,11 +478,21 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             Class::Gp => &mut *gp,
             Class::Fp => &mut *fp,
         };
-        let mut register = if across {
-            Pool::take(&mut pool.callee)
-        } else {
-            Pool::take(&mut pool.caller).or_else(|| Pool::take(&mut pool.callee))
-        };
+        let hinted = hints[v.index()].and_then(|r| {
+            if across {
+                Pool::take_this(&mut pool.callee, r)
+            } else {
+                Pool::take_this(&mut pool.caller, r)
+                    .or_else(|| Pool::take_this(&mut pool.callee, r))
+            }
+        });
+        let mut register = hinted.or_else(|| {
+            if across {
+                Pool::take(&mut pool.callee)
+            } else {
+                Pool::take(&mut pool.caller).or_else(|| Pool::take(&mut pool.callee))
+            }
+        });
         if register.is_none() {
             // No register is free: as Maglev chooses, the held value whose next use is the
             // farthest gives up its register and is spilled at its definition, unless this
@@ -531,7 +561,16 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                 &mut fp,
                 &mut free_slots,
                 &mut spill_bytes,
+                &hints,
             );
+            if let Home::Gp(r) | Home::Fp(r) = homes[phi.index()] {
+                for &input in &graph.node(phi).inputs {
+                    let at = pos[input.index()];
+                    if at != u32::MAX && at > pos[phi.index()] {
+                        hints[input.index()] = Some(r);
+                    }
+                }
+            }
         }
         for &node in &data.body {
             let p = pos[node.index()];
@@ -547,6 +586,7 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                     &mut fp,
                     &mut free_slots,
                     &mut spill_bytes,
+                    &hints,
                 );
                 expire(&mut active, p, &homes, &mut gp, &mut fp, &mut free_slots);
             } else {
@@ -559,6 +599,7 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                     &mut fp,
                     &mut free_slots,
                     &mut spill_bytes,
+                    &hints,
                 );
             }
         }
@@ -793,5 +834,54 @@ pub(crate) mod tests {
         assert_ne!(alloc.homes[fn_.index()], alloc.homes[next.index()]);
         assert_eq!(alloc.homes[zero.index()], Home::Const);
         assert_eq!(alloc.live_at(poll), vec![fn_, i]);
+    }
+
+    #[test]
+    fn a_loops_body_follows_its_header_and_its_back_edge_takes_the_phis_register() {
+        // entry: n = slot 0; jump header. header: i = phi(0, i'); poll; branch i < n.
+        // body: i' = i + 1; jump header. exit: return n. The body comes right after the header
+        // (the builder's order), and i, dead at the add, gives its register to i', the value its
+        // back edge carries (Maglev's loop-phi hint): the edge moves nothing.
+        let mut g = Graph::new(1);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let body = g.add_block(2, false);
+        let exit = g.add_block(3, false);
+        g.entry = Some(entry);
+        g.add_edge(entry, header);
+        g.add_edge(header, body);
+        g.add_edge(header, exit);
+        g.add_edge(body, header);
+        let n = g.add_node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+        let s = state(&mut g, 0, &[]);
+        let fn_ = g.add_node(entry, NodeOp::CheckNumber, &[n], Rep::F64, 0);
+        g.node_mut(fn_).state = Some(s);
+        let zero = g.add_node(entry, NodeOp::ConstF64(0), &[], Rep::F64, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::F64, 1);
+        let ps = state(&mut g, 1, &[]);
+        let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
+        g.node_mut(poll).state = Some(ps);
+        let lt = g.add_node(header, NodeOp::F64Cmp(Cond::Lt), &[i, fn_], Rep::Bool, 1);
+        g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: body,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            1,
+        );
+        let one = g.add_node(body, NodeOp::ConstF64(1f64.to_bits()), &[], Rep::F64, 2);
+        let next = g.add_node(body, NodeOp::F64Add, &[i, one], Rep::F64, 2);
+        g.node_mut(i).inputs.push(next);
+        g.add_node(body, NodeOp::Jump(header), &[], Rep::None, 2);
+        g.add_node(exit, NodeOp::Return, &[n], Rep::None, 3);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert_eq!(alloc.order, vec![entry, header, body, exit]);
+        assert!(matches!(alloc.homes[i.index()], Home::Fp(_)));
+        assert_eq!(alloc.homes[next.index()], alloc.homes[i.index()]);
     }
 }
