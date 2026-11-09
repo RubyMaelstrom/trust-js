@@ -1821,25 +1821,298 @@ fn an_element_update_reads_adds_and_writes_back() {
 
 #[test]
 fn element_sites_the_words_do_not_serve_stay_effects() {
+    // Strings, arguments objects, a generic site, and typed arrays whose stores take values that
+    // are no Numbers (a typed array converts them first, which may run code).
     let mut engine = vm_engine(
-        "function str(s, i) { return s[i]; } function typed(t, i) { return t[i]; }
+        "function str(s, i) { return s[i]; } function store(t, i) { t[i] = 's'; }
          function args(x, i) { return x[i]; } function generic(o, k) { return o[k]; }
          function argsof() { return arguments; } var u8 = new Uint8Array(4);
          var list = argsof(1, 2);
          for (var k = 0; k < 20; k++) {
-           str('abc', 1); typed(u8, 1); args(list, 1); generic({a: 1}, 'a');
+           str('abc', 1); store(u8, 1); args(list, 1); generic({a: 1}, 'a');
          }",
     );
-    for name in ["str", "typed", "args", "generic"] {
+    for name in ["str", "store", "args", "generic"] {
         let (chunk, graph) = graph_of(&mut engine, name);
         let text = dump(&graph, &chunk);
         assert_eq!(
-            count(&graph, |op| matches!(op, NodeOp::LoadElement(_))),
+            count(&graph, |op| matches!(
+                op,
+                NodeOp::LoadElement(_)
+                    | NodeOp::StoreTyped(_)
+                    | NodeOp::TypedElement { .. }
+                    | NodeOp::CheckElements(_)
+            )),
             0,
             "{name}: {text}"
         );
         assert!(count(&graph, is_effect) >= 1, "{name}: {text}");
     }
+}
+
+#[test]
+fn typed_array_sites_access_their_one_kind_in_line() {
+    // Maglev's typed-array access (TryBuildElementAccessOnTypedArray, maglev-graph-builder.cc:
+    // 5052-5211): the kind checked, the view and its length value facts, the bounds checked per
+    // access and the data address per effect epoch, then the element by its kind; a store's
+    // value converted first.
+    let mut engine = vm_engine(
+        "function sum(t) { var s = 0; for (var i = 0; i < 4; i++) s += t[i]; return s; }
+         function sumU(t) { var s = 0; for (var i = 0; i < 4; i++) s += t[i]; return s; }
+         function put(t, i, v) { t[i] = v; } function clamp(t, i, v) { t[i] = v; }
+         function both(t, i) { t[i] = t[i] + 1; return t[i + 1]; }
+         var f = new Float64Array(4), u = new Uint8Array(4), c = new Uint8ClampedArray(4);
+         var w = new Int32Array(8), big = new Uint32Array(4);
+         for (var k = 0; k < 20; k++) {
+           sum(f); put(u, k % 4, k * 1.5); clamp(c, 1, k + 0.5); both(w, k % 4); sumU(big);
+         }",
+    );
+    let typed = |kind| NodeOp::CheckElements(ElemKind::Typed(Some(kind)));
+    // Uint32 elements pass the int32 range: an f64.
+    for (name, kind, rep) in [
+        ("sum", TypedKind::F64, Rep::F64),
+        ("sumU", TypedKind::U32, Rep::F64),
+    ] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        for op in [
+            typed(kind),
+            NodeOp::TypedView,
+            NodeOp::TypedLength,
+            NodeOp::CheckBounds,
+            NodeOp::TypedData { write: false },
+            NodeOp::LoadTyped(kind),
+        ] {
+            let found = nodes(&graph, |candidate| *candidate == op);
+            assert_eq!(found.len(), 1, "{name} {op:?}: {text}");
+            if op == NodeOp::LoadTyped(kind) {
+                assert_eq!(found[0].rep, rep, "{name}: {text}");
+            }
+        }
+        let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckElements(_)));
+        assert_eq!(checks[0].reason, Some(ExitReason::WrongElements), "{text}");
+        let data = nodes(&graph, |op| matches!(op, NodeOp::TypedData { .. }));
+        assert_eq!(data[0].reason, Some(ExitReason::Detached), "{text}");
+    }
+    // The stores: an integer kind's ToInt32 truncation, Uint8Clamped's clamp.
+    for (name, kind, convert) in [
+        ("put", TypedKind::U8, NodeOp::TruncateToInt32),
+        ("clamp", TypedKind::U8Clamped, NodeOp::ClampToUint8),
+    ] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        let stores = nodes(&graph, |op| *op == NodeOp::StoreTyped(kind));
+        assert_eq!(stores.len(), 1, "{name}: {text}");
+        assert_eq!(
+            graph.node(stores[0].inputs[4]).op,
+            convert,
+            "{name}: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::TypedData { write: true }),
+            1,
+            "{name}: {text}"
+        );
+    }
+    // A read, a write and a read of one Int32Array: one view, and the store's data address
+    // serves the read after it.
+    let (chunk, graph) = graph_of(&mut engine, "both");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == typed(TypedKind::I32)),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::TypedView), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckBounds), 3, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::TypedData { .. })),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::LoadTyped(TypedKind::I32)),
+        2,
+        "{text}"
+    );
+    let stores = nodes(&graph, |op| *op == NodeOp::StoreTyped(TypedKind::I32));
+    assert_eq!(stores.len(), 1, "{text}");
+    assert_eq!(graph.node(stores[0].inputs[4]).rep, Rep::I32, "{text}");
+}
+
+#[test]
+fn typed_sites_of_more_than_one_kind_call_the_template_stub() {
+    let mut engine = vm_engine(
+        "function get(t, i) { return t[i]; } function put(t, i, v) { t[i] = v; }
+         var f = new Float64Array(4), u = new Uint8Array(4), big = new BigInt64Array(4);
+         for (var k = 0; k < 20; k++) { var t = k % 2 ? f : u; get(t, 1); put(t, 1, k); }
+         get(big, 1);",
+    );
+    for (name, op) in [
+        ("get", NodeOp::TypedElement { write: false }),
+        ("put", NodeOp::TypedElement { write: true }),
+    ] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        let calls = nodes(&graph, |candidate| *candidate == op);
+        assert_eq!(calls.len(), 1, "{name}: {text}");
+        assert_eq!(
+            calls[0].reason,
+            Some(ExitReason::OutOfBounds),
+            "{name}: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| *op
+                == NodeOp::CheckElements(ElemKind::Typed(None))),
+            1,
+            "{name}: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::TypedView),
+            0,
+            "{name}: {text}"
+        );
+    }
+}
+
+#[test]
+fn typed_arrays_among_other_receivers_branch_on_the_kind_tag() {
+    // The template dispatches on the tag (emit_get_elem_inline): the stub on one side, the words
+    // on the other, a phi of their words; an empty record (the first stage's in-line hits
+    // record nothing) takes the same branch.
+    let mut engine = vm_engine(
+        "function get(o, i) { return o[i]; } function put(o, i, v) { o[i] = v; }
+         var f = new Float64Array(4);
+         for (var k = 0; k < 20; k++) { var o = k % 2 ? f : [1, 2]; get(o, 1); put(o, 1, k); }",
+    );
+    let shape = |graph: &Graph, write: bool| {
+        count(graph, |op| *op == NodeOp::IsTypedArray) == 1
+            && count(graph, |op| matches!(op, NodeOp::Branch { .. })) == 1
+            && count(graph, |op| *op == NodeOp::TypedElement { write }) == 1
+            && count(graph, |op| {
+                matches!(op, NodeOp::CheckElements(ElemKind::Array))
+            }) == 1
+    };
+    let (chunk, graph) = graph_of(&mut engine, "get");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert!(shape(&graph, false), "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadElement(_))),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::Phi), 1, "{text}");
+    let (chunk, graph) = graph_of(&mut engine, "put");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert!(shape(&graph, true), "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::StoreElement(_))),
+        1,
+        "{text}"
+    );
+    // Under ARM64's first stage alone, the site's record stays empty (x86-64's calls the
+    // element helper, which records every access).
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        let mut jit = self::engine(Tier::Jit);
+        eval(
+            &mut jit,
+            "function get(o, i) { return o[i]; }
+             for (var k = 0; k < 20; k++) get([1, 2, 3], k % 3);",
+        );
+        let (chunk, graph) = graph_of(&mut jit, "get");
+        let pc = pc_of(&chunk, |op| matches!(op, Op::GetElemLocal(_)));
+        let view = Snapshot::take(&chunk).element(pc).expect("an element site");
+        assert_eq!(view.recorded_receivers, 0, "an empty record");
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{text}");
+        assert_eq!(count(&graph, |op| *op == NodeOp::IsTypedArray), 1, "{text}");
+        let words = |op: &NodeOp| matches!(op, NodeOp::CheckElements(ElemKind::Words));
+        assert_eq!(count(&graph, words), 1, "{text}");
+    }
+}
+
+#[test]
+fn flagged_typed_sites_read_past_the_length_or_take_the_generic_access() {
+    let source = "function get(t, i) { return t[i]; } function put(t, i, v) { t[i] = v; }
+         function any(t, i) { return t[i]; } function mixed(t, i) { return t[i]; }
+         var f = new Float64Array(4), u = new Uint8Array(4);
+         for (var k = 0; k < 20; k++) {
+           get(f, 1); put(f, 1, k); any(k % 2 ? f : u, 1); mixed(k % 2 ? f : [1, 2], 1);
+         }";
+    let get = |op: &Op| matches!(op, Op::GetElemLocal(_));
+    let put = |op: &Op| matches!(op, Op::SetElemLocalDrop(_));
+    let loads = |graph: &Graph| count(graph, |op| matches!(op, NodeOp::LoadTyped(_))) == 1;
+    let stores = |graph: &Graph| count(graph, |op| matches!(op, NodeOp::StoreTyped(_))) == 1;
+    let stub = |graph: &Graph| count(graph, |op| matches!(op, NodeOp::TypedElement { .. })) == 1;
+    // A load of one kind reads past the length: undefined there, with no bounds exit.
+    let mut engine = vm_engine(source);
+    let (chunk, pc, graph) =
+        flagged_element_graph(&mut engine, "get", get, ExitReason::OutOfBounds, loads);
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op
+            == NodeOp::LoadTypedOrUndefined(TypedKind::F64)),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckBounds), 0, "{text}");
+    assert_eq!(declines(&graph), [(pc, ExitReason::OutOfBounds)], "{text}");
+    assert_eq!(graph.declines[0].form, "the read past the view's length");
+    // A buffer's flag, a store's bounds, and the bounds where the stub's status or the words'
+    // reads share the flag: the generic access.
+    let cases: [(
+        &str,
+        &dyn Fn(&Op) -> bool,
+        ExitReason,
+        &dyn Fn(&Graph) -> bool,
+    ); 6] = [
+        ("get", &get, ExitReason::Detached, &loads),
+        ("put", &put, ExitReason::Detached, &stores),
+        ("put", &put, ExitReason::OutOfBounds, &stores),
+        ("any", &get, ExitReason::OutOfBounds, &stub),
+        ("any", &get, ExitReason::Detached, &stub),
+        ("mixed", &get, ExitReason::OutOfBounds, &stub),
+    ];
+    for (name, site, reason, before) in cases {
+        let mut engine = vm_engine(source);
+        let (chunk, pc, graph) = flagged_element_graph(&mut engine, name, site, reason, before);
+        let text = dump(&graph, &chunk);
+        assert!(
+            nodes(&graph, is_effect)
+                .iter()
+                .any(|node| node.pc as usize == pc),
+            "{name} {reason:?}: {text}"
+        );
+        assert_eq!(
+            declines(&graph),
+            [(pc, reason)],
+            "{name} {reason:?}: {text}"
+        );
+        assert_eq!(graph.declines[0].form, "the generic access", "{name}");
+    }
+    // A Hole flag at a site of typed arrays and Arrays reads the words' holes.
+    let mut engine = vm_engine(source);
+    let (chunk, pc, graph) =
+        flagged_element_graph(&mut engine, "mixed", get, ExitReason::Hole, stub);
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::LoadElement(Holes::Undefined)),
+        1,
+        "{text}"
+    );
+    assert_eq!(declines(&graph), [(pc, ExitReason::Hole)], "{text}");
 }
 
 /// The graph of `name` (an element site at its one `site` operation) with `reason` flagged

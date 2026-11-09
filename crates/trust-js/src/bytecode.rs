@@ -7454,7 +7454,12 @@ fn record_element(chunk: &Chunk, pc: usize, object: &Value, key: &Value) {
                         }
                         bits
                     }
-                    KIND_TYPED_ARRAY_TAG => ELEM_TYPED_ARRAY,
+                    KIND_TYPED_ARRAY_TAG => {
+                        ELEM_TYPED_ARRAY
+                            | b.kind
+                                .typed_array()
+                                .map_or(0, |view| elem_typed_kind(view.kind))
+                    }
                     tag if tag <= KIND_ORDINARY_LAST => ELEM_ORDINARY,
                     _ if matches!(b.kind, ObjectKind::Arguments(_)) => ELEM_ARGUMENTS,
                     _ => ELEM_EXOTIC,

@@ -91,6 +91,7 @@ impl Chunk {
                 recorded_keys,
                 facts: word & ELEMENT_FACTS,
                 generic: word & crate::feedback::ELEM_GENERIC != 0,
+                typed_kinds: word & crate::feedback::ELEM_TYPED_KINDS,
             });
         }
         let allocation = |kind, image: bool, template: bool| {

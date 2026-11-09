@@ -258,6 +258,7 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
                 hash.write_u32(element.recorded_keys);
                 hash.write_u32(element.facts);
                 hash.write_u8(u8::from(element.generic));
+                hash.write_u32(element.typed_kinds);
             }
             SiteView::Call(call) => {
                 hash.write_u8(call.state as u8);

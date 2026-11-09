@@ -218,6 +218,7 @@ fn the_vm_records_every_element_receiver_and_key() {
         element(&mut engine, "g", load),
         ELEM_ARRAY
             | ELEM_TYPED_ARRAY
+            | crate::feedback::elem_typed_kind(1)
             | ELEM_ORDINARY
             | ELEM_ARGUMENTS
             | ELEM_EXOTIC
@@ -231,6 +232,35 @@ fn the_vm_records_every_element_receiver_and_key() {
             | ELEM_GENERIC,
         "the VM records every access, past the generic mark too"
     );
+}
+
+#[test]
+fn the_vm_records_a_typed_arrays_element_kind() {
+    // Each native kind its own bit (Uint8 0 .. Uint8Clamped 8), none for a view the native code
+    // declines (BigInt elements here).
+    use crate::feedback::{elem_typed_kind, ELEM_TYPED_KINDS};
+    let mut engine = engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "function g(a, i) { return a[i]; } g(new Float64Array(2), 0); g(new Uint8Array(2), 1);
+         function b(a, i) { return a[i]; } b(new BigInt64Array(2), 0);
+         function every(a, i) { return a[i]; }
+         [Uint8Array, Int8Array, Uint16Array, Int16Array, Uint32Array, Int32Array, Float32Array,
+          Float64Array, Uint8ClampedArray].forEach(function (K) { every(new K(1), 0); });",
+    );
+    assert_eq!(
+        element(&mut engine, "g", load),
+        ELEM_TYPED_ARRAY | elem_typed_kind(7) | elem_typed_kind(0) | ELEM_KEY_INDEX
+    );
+    assert_eq!(
+        element(&mut engine, "b", load),
+        ELEM_TYPED_ARRAY | ELEM_KEY_INDEX
+    );
+    assert_eq!(
+        element(&mut engine, "every", load),
+        ELEM_TYPED_ARRAY | ELEM_TYPED_KINDS | ELEM_KEY_INDEX
+    );
+    assert_eq!(ELEM_TYPED_KINDS & crate::feedback::ELEM_GENERIC, 0);
 }
 
 #[test]

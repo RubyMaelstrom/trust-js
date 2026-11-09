@@ -113,6 +113,9 @@ pub(crate) struct ElementView {
     /// The site is generic (a key that is not an index reached an object): it is lowered to the
     /// generic keyed access, and its record stopped growing at its helpers' misses.
     pub(crate) generic: bool,
+    /// The record alone: the element kinds of the typed arrays it saw (feedback.rs
+    /// ELEM_TYPED_KINDS), as the VM and the misses saw them.
+    pub(crate) typed_kinds: u32,
 }
 
 impl ElementView {

@@ -381,6 +381,22 @@ pub(crate) const ELEM_OUT_OF_BOUNDS: u32 = 1 << 20;
 /// a megamorphic keyed load; as V8 stops updating a megamorphic site's feedback, the element
 /// helpers stop classifying and writing at its later misses (the VM goes on recording).
 pub(crate) const ELEM_GENERIC: u32 = 1 << 24;
+/// A typed array receiver's element kinds (P3 stage 2 step 2), in the free bits 21-23 and 25-30
+/// around the generic mark: its native view's kind (native_typed_array.rs; Uint8 0, Int8 1,
+/// Uint16 2, Int16 3, Uint32 4, Int32 5, Float32 6, Float64 7, Uint8Clamped 8), so that the
+/// speculative tier loads and stores one kind in line. A view generated code declines (BigInt or
+/// Float16 elements, a shared or too long buffer) records none.
+pub(crate) const ELEM_TYPED_KINDS: u32 = 0b111 << 21 | 0b11_1111 << 25;
+
+/// The element record's bit for a typed array of native kind `kind` (`ELEM_TYPED_KINDS`), none
+/// for a declined view's.
+pub(crate) const fn elem_typed_kind(kind: u8) -> u32 {
+    match kind {
+        0..=2 => 1 << (21 + kind),
+        3..=8 => 1 << (22 + kind),
+        _ => 0,
+    }
+}
 
 /// The value record's roles (W4 step 3): a word holds three ValueClass sets, operand 0 in bits
 /// 0-8, operand 1 in bits 9-17 and the result in bits 18-26.

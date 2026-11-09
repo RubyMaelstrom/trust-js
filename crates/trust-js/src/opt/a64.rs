@@ -760,6 +760,8 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckBounds | NodeOp::LoadElementOrUndefined => ExitReason::OutOfBounds,
         NodeOp::LoadElement(_) => ExitReason::Hole,
         NodeOp::StoreElement(_) => ExitReason::WrongElements,
+        NodeOp::TypedData { .. } => ExitReason::Detached,
+        NodeOp::TypedElement { .. } => ExitReason::OutOfBounds,
         NodeOp::Exit(reason) => *reason,
         _ => ExitReason::Forced,
     }
@@ -1458,6 +1460,27 @@ impl Gen<'_> {
                 let site = self.check_exit(n)?;
                 let cell = self.gp(input(0), X16);
                 let layout = self.layout;
+                if let ElemKind::Typed(element) = *kind {
+                    // A typed array's tag, as the typed templates test it (`emit_access`); its
+                    // IC_PLAIN is clear, as every typed array's is.
+                    self.a
+                        .ldrb_imm(X17, cell, (layout.obj_from_cell + layout.obj_kind) as u32);
+                    self.a
+                        .cmp_imm_w(X17, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+                    self.a.b_cond(NE, site);
+                    if let Some(element) = element {
+                        // Then its view's kind byte, which a declined view's (u8::MAX, its buffer
+                        // record null) never matches.
+                        use crate::native_typed_array::NativeTypedArray as View;
+                        let view = layout.obj_from_cell + self.native()?.object_view;
+                        self.a.ldr_imm(X17, cell, view as u32);
+                        self.a
+                            .ldrb_imm(X17, X17, std::mem::offset_of!(View, kind) as u32);
+                        self.a.cmp_imm_w(X17, element as u32);
+                        self.a.b_cond(NE, site);
+                    }
+                    return Ok(());
+                }
                 // The kind tag, then IC_PLAIN, as the element templates test a receiver
                 // (`emit_get_elem_inline`): an ordinary kind's or the Array's tag, whose tag
                 // follows them, and no side-table internal method.
@@ -1521,6 +1544,73 @@ impl Gen<'_> {
                     let dst = self.gp_dst(n);
                     self.a.ldr_imm(dst, X17, 0);
                     self.gp_done(n, dst);
+                }
+            }
+            NodeOp::TypedView => {
+                if !unused {
+                    let native = self.native()?;
+                    let cell = self.gp(input(0), X16);
+                    let dst = self.gp_dst(n);
+                    let view = self.layout.obj_from_cell + native.object_view;
+                    self.a.ldr_imm(dst, cell, view as u32);
+                    self.gp_done(n, dst);
+                }
+            }
+            NodeOp::TypedLength => {
+                if !unused {
+                    use crate::native_typed_array::NativeTypedArray as View;
+                    // At most 2^31: its low word compares unsigned with an index.
+                    let view = self.gp(input(0), X16);
+                    let dst = self.gp_dst(n);
+                    let limit = std::mem::offset_of!(View, limit);
+                    self.a.ldr_imm(dst, view, limit as u32);
+                    self.gp_done(n, dst);
+                }
+            }
+            NodeOp::TypedData { write } => self.lower_typed_data(n, *write)?,
+            NodeOp::LoadTyped(kind) => {
+                if !unused {
+                    self.lower_load_typed(n, *kind);
+                }
+            }
+            NodeOp::LoadTypedOrUndefined(kind) => {
+                if !unused {
+                    self.lower_load_typed_or_undefined(n, *kind);
+                }
+            }
+            NodeOp::StoreTyped(kind) => self.lower_store_typed(n, *kind),
+            NodeOp::ClampToUint8 => {
+                if !unused {
+                    // ToUint8Clamp: FCVTNS rounds half to even, saturates, and takes NaN to 0;
+                    // then the clamp to [0, 255], as the template stores Uint8Clamped.
+                    let d = self.fp(input(0), D31);
+                    let w = self.gp_dst(n);
+                    let low = self.a.new_label();
+                    let done = self.a.new_label();
+                    self.a.fcvtns_w_d(w, d);
+                    self.a.cmp_imm_w(w, 0);
+                    self.a.b_cond(LT, low);
+                    self.a.cmp_imm_w(w, 255);
+                    self.a.b_cond(LS, done);
+                    self.a.movz(w, 255, 0);
+                    self.a.b(done);
+                    self.a.bind(low);
+                    self.a.movz(w, 0, 0);
+                    self.a.bind(done);
+                    self.gp_done(n, w);
+                }
+            }
+            NodeOp::TypedElement { write } => self.lower_typed_element(n, *write)?,
+            NodeOp::IsTypedArray => {
+                if !unused {
+                    let cell = self.gp(input(0), X16);
+                    let w = self.gp_dst(n);
+                    let kind = self.layout.obj_from_cell + self.layout.obj_kind;
+                    self.a.ldrb_imm(X17, cell, kind as u32);
+                    self.a
+                        .cmp_imm_w(X17, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+                    self.a.cset_w(w, EQ);
+                    self.gp_done(n, w);
                 }
             }
             NodeOp::Poll => {
@@ -2247,6 +2337,241 @@ impl Gen<'_> {
 
 /// Element accesses (P3 stage 2 step 2): Maglev's element nodes on TRust's element words (ir.rs).
 impl Gen<'_> {
+    /// The typed arrays' native layout, which the typed nodes read through.
+    fn native(&self) -> Result<crate::native_typed_array::Layout, Refusal> {
+        self.layout
+            .native_typed_array
+            .ok_or(Refusal::whole("typed arrays without a probed layout"))
+    }
+
+    /// TypedData: as the template's access tests a typed array (`typed_array::emit_access`), the
+    /// buffer attached, writable for a store, its bytes borrowed by no Rust code, and reaching
+    /// the view's end (a resizable buffer that shrank fails); then the elements' address, the
+    /// bytes' plus the view's offset. Native accesses reload the bytes' header, never keeping its
+    /// address (native_typed_array.rs), and this one keeps it for its effect epoch only.
+    fn lower_typed_data(&mut self, n: NodeIx, write: bool) -> Result<(), Refusal> {
+        use crate::native_typed_array::{NativeBuffer as Buffer, NativeTypedArray as View};
+        use std::mem::offset_of;
+        let native = self.native()?;
+        let site = self.check_exit(n)?;
+        let view = self.gp(self.graph.node(n).inputs[1], X16);
+        self.a
+            .ldr_imm(X17, view, offset_of!(View, buffer_ptr) as u32);
+        self.a
+            .ldrb_imm(X9, X17, offset_of!(Buffer, attached) as u32);
+        self.a.cbz(X9, false, site);
+        if write {
+            self.a
+                .ldrb_imm(X9, X17, offset_of!(Buffer, writable) as u32);
+            self.a.cbz(X9, false, site);
+        }
+        self.a
+            .ldr_imm(X17, X17, offset_of!(Buffer, storage_ptr) as u32);
+        // The RefCell's borrow flag, first: no Rust borrow while the code holds the address.
+        self.a.ldr_imm(X9, X17, 0);
+        self.a.cbnz(X9, true, site);
+        self.a
+            .ldr_imm(X9, X17, (native.refcell_value + native.vec_len) as u32);
+        self.a.ldr_imm(X30, view, offset_of!(View, end) as u32);
+        self.a.cmp_reg_x(X9, X30);
+        self.a.b_cond(LO, site);
+        let dst = self.gp_dst(n);
+        self.a
+            .ldr_imm(X9, X17, (native.refcell_value + native.vec_ptr) as u32);
+        self.a.ldr_imm(X30, view, offset_of!(View, offset) as u32);
+        self.a.add_shifted(dst, X9, X30, 0);
+        self.gp_done(n, dst);
+        Ok(())
+    }
+
+    /// LoadTyped: one load of the element's width at the zero-extended index, an int32 kind's
+    /// sign- or zero-extended, Uint32's converted unsigned, Float32's widened (exactly).
+    fn lower_load_typed(&mut self, n: NodeIx, kind: TypedKind) {
+        let node = self.graph.node(n);
+        let data = self.gp(node.inputs[1], X16);
+        let index = self.gp(node.inputs[2], X17);
+        self.a.mov_w(X9, index);
+        if kind.rep(false) == Rep::I32 {
+            let w = self.gp_dst(n);
+            match kind {
+                TypedKind::U8 | TypedKind::U8Clamped => self.a.ldrb_reg(w, data, X9),
+                TypedKind::I8 => self.a.ldrsb_reg(w, data, X9),
+                TypedKind::U16 => self.a.ldrh_lsl1(w, data, X9),
+                TypedKind::I16 => self.a.ldrsh_lsl1(w, data, X9),
+                _ => self.a.ldr_w_lsl2(w, data, X9),
+            }
+            self.gp_done(n, w);
+            return;
+        }
+        let d = self.fp_dst(n);
+        match kind {
+            TypedKind::U32 => {
+                self.a.ldr_w_lsl2(X9, data, X9);
+                self.a.ucvtf_d_w(d, X9);
+            }
+            TypedKind::F32 => {
+                self.a.ldr_s_lsl2(D31, data, X9);
+                self.a.fcvt_float_width(d, D31, false);
+            }
+            _ => self.a.ldr_d_lsl3(d, data, X9),
+        }
+        self.fp_done(n, d);
+    }
+
+    /// LoadTypedOrUndefined: the unsigned bounds check as a branch to undefined, then LoadTyped's
+    /// element boxed, an int32 kind's and Uint32's converted exactly, a float's NaN canonicalized
+    /// (its bytes may hold any NaN, which would read as a tag), as the template boxes it
+    /// (`emit_float_result`).
+    fn lower_load_typed_or_undefined(&mut self, n: NodeIx, kind: TypedKind) {
+        let node = self.graph.node(n);
+        let data = self.gp(node.inputs[1], X16);
+        let index = self.gp(node.inputs[2], X17);
+        let length = self.gp(node.inputs[3], X30);
+        let dst = self.gp_dst(n);
+        let past = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.cmp_reg_w(index, length);
+        self.a.b_cond(HS, past);
+        self.a.mov_w(X30, index);
+        match kind {
+            TypedKind::U32 => {
+                self.a.ldr_w_lsl2(X30, data, X30);
+                self.a.ucvtf_d_w(D31, X30);
+            }
+            TypedKind::F32 => {
+                self.a.ldr_s_lsl2(D31, data, X30);
+                self.a.fcvt_float_width(D31, D31, false);
+            }
+            TypedKind::F64 => self.a.ldr_d_lsl3(D31, data, X30),
+            _ => {
+                match kind {
+                    TypedKind::U8 | TypedKind::U8Clamped => self.a.ldrb_reg(X30, data, X30),
+                    TypedKind::I8 => self.a.ldrsb_reg(X30, data, X30),
+                    TypedKind::U16 => self.a.ldrh_lsl1(X30, data, X30),
+                    TypedKind::I16 => self.a.ldrsh_lsl1(X30, data, X30),
+                    _ => self.a.ldr_w_lsl2(X30, data, X30),
+                }
+                self.a.scvtf_d_w(D31, X30);
+            }
+        }
+        self.a.fmov_x_d(dst, D31);
+        if matches!(kind, TypedKind::F32 | TypedKind::F64) {
+            self.a.fcmp(D31, D31);
+            self.a.movz(X30, 0x7ff8, 3); // PACK_CANON_NAN
+            self.a.csel_x(dst, X30, dst, VS);
+        }
+        self.a.b(done);
+        self.a.bind(past);
+        self.a.mov_imm64(dst, crate::value::PACK_UNDEFINED);
+        self.a.bind(done);
+        self.gp_done(n, dst);
+    }
+
+    /// StoreTyped: the value's low bits (an integer kind's) or its float at the zero-extended
+    /// index, then the buffer's dirty interval and write count for embedders, as the template's
+    /// `emit_dirty` keeps them: [view offset + index << shift, + width), one write.
+    fn lower_store_typed(&mut self, n: NodeIx, kind: TypedKind) {
+        use crate::native_typed_array::{NativeBuffer as Buffer, NativeTypedArray as View};
+        use std::mem::offset_of;
+        let node = self.graph.node(n);
+        let (view, data, index, value) = (
+            node.inputs[1],
+            node.inputs[2],
+            node.inputs[3],
+            node.inputs[4],
+        );
+        let data = self.gp(data, X17);
+        let index = self.gp(index, X9);
+        self.a.mov_w(X9, index);
+        // log2 of the element's bytes.
+        let shift = match kind {
+            TypedKind::U8 | TypedKind::I8 | TypedKind::U8Clamped => 0,
+            TypedKind::U16 | TypedKind::I16 => 1,
+            TypedKind::U32 | TypedKind::I32 | TypedKind::F32 => 2,
+            TypedKind::F64 => 3,
+        };
+        match kind {
+            TypedKind::F32 => {
+                let d = self.fp(value, D30);
+                self.a.fcvt_float_width(D31, d, true);
+                self.a.str_s_lsl2(D31, data, X9);
+            }
+            TypedKind::F64 => {
+                let d = self.fp(value, D30);
+                self.a.str_d_lsl3(d, data, X9);
+            }
+            _ => {
+                let w = self.gp(value, X30);
+                match shift {
+                    0 => self.a.strb_reg(w, data, X9),
+                    1 => self.a.strh_lsl1(w, data, X9),
+                    _ => self.a.str_w_lsl2(w, data, X9),
+                }
+            }
+        }
+        let view = self.gp(view, X16);
+        self.a.ldr_imm(X17, view, offset_of!(View, offset) as u32);
+        self.a.add_shifted(X9, X17, X9, shift);
+        self.a
+            .ldr_imm(X17, view, offset_of!(View, buffer_ptr) as u32);
+        self.a.add_imm(X30, X9, 1 << shift);
+        let start_done = self.a.new_label();
+        let end_done = self.a.new_label();
+        let start = offset_of!(Buffer, dirty_start) as u32;
+        let end = offset_of!(Buffer, dirty_end) as u32;
+        let writes = offset_of!(Buffer, writes) as u32;
+        self.a.ldr_imm(X16, X17, start);
+        self.a.cmp_reg_x(X9, X16);
+        self.a.b_cond(HS, start_done);
+        self.a.str_imm(X9, X17, start);
+        self.a.bind(start_done);
+        self.a.ldr_imm(X16, X17, end);
+        self.a.cmp_reg_x(X30, X16);
+        self.a.b_cond(LS, end_done);
+        self.a.str_imm(X30, X17, end);
+        self.a.bind(end_done);
+        self.a.ldr_imm(X16, X17, writes);
+        self.a.add_imm(X16, X16, 1);
+        self.a.str_imm(X16, X17, writes);
+    }
+
+    /// TypedElement: the template's TypedElement stub on its register contract (x11 the Object,
+    /// x9 the index, w12 the kind tag, d1 a store's value -> w13 1 or 0, x12 a load's word; it
+    /// clobbers x9, x12-x17, d1, d2 and x30: jit_typed_array.rs), the live caller-saved values
+    /// saved around it, as the cold paths' calls save them. A 0 exits.
+    fn lower_typed_element(&mut self, n: NodeIx, write: bool) -> Result<(), Refusal> {
+        let node = self.graph.node(n);
+        let site = self.check_exit(n)?;
+        let cell = self.gp(node.inputs[0], X16);
+        let index = self.gp(node.inputs[1], X17);
+        let value = if write {
+            Some(self.fp(node.inputs[2], D30))
+        } else {
+            None
+        };
+        let saved = self.save_live_caller_saved(n);
+        // The index first: x11 may be its home.
+        self.a.mov_w(X9, index);
+        self.a.add_imm(11, cell, self.layout.obj_from_cell as u32);
+        self.a
+            .movz(12, crate::value::KIND_TYPED_ARRAY_TAG as u32, 0);
+        if let Some(d) = value {
+            self.a.fmov_d_d(1, d);
+        }
+        let stub = self.a.shared_stub(SharedStub::TypedElement { write }.key());
+        self.a.bl_label(stub);
+        self.a.mov(X16, 13);
+        self.a.mov(X17, 12);
+        self.restore_live_caller_saved(&saved);
+        self.a.cbz(X16, false, site);
+        if !write && self.home(n) != Home::None {
+            let dst = self.gp_dst(n);
+            self.a.mov(dst, X17);
+            self.gp_done(n, dst);
+        }
+        Ok(())
+    }
+
     /// A further exit of `n`'s frame state, with `reason`: a node one of whose paths fails for
     /// another reason than its own (an element read past the used words beside its hole path).
     fn exit_for(&mut self, n: NodeIx, reason: ExitReason) -> Result<usize, Refusal> {

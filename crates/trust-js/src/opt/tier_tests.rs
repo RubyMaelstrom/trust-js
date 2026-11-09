@@ -202,6 +202,27 @@ const PROGRAMS: &[&str] = &[
      let t = 0; for (let k = 0; k < 1000; k++) { fill(big, 100, k); \
      if (k % 50 === 0) { const junk = []; for (let j = 0; j < 200; j++) junk.push([j]); } \
      t += big[k % 100].k + big[(k * 7) % 100].i; } t",
+    // Typed arrays: one kind per site read and written, with each kind's conversions (fractions,
+    // NaN, -0, past the int32 range, clamps, Float32's rounding), the stub at a site of every
+    // kind, typed arrays and Arrays at one site, reads past the length, and buffers detached and
+    // shrunk mid-loop.
+    "function sumF(t) { let s = 0; for (let i = 0; i < 8; i++) s += t[i]; return s; }\n\
+     function setU(u, k) { u[k % 8] = k * 2654435761; return u[(k + 3) % 8]; }\n\
+     function fill(t, v) { for (let i = 0; i < 8; i++) t[i] = v * (i - 3); return t; }\n\
+     function at(t, i) { return t[i]; }\n\
+     function count(t) { let n = 0; while (t[n] !== undefined) n++; return n; }\n\
+     const kinds = [Int8Array, Uint8Array, Uint8ClampedArray, Int16Array, Uint16Array, \
+     Int32Array, Uint32Array, Float32Array, Float64Array];\n\
+     const all = kinds.map(K => new K(8)); const u = new Uint32Array(8);\n\
+     const rab = new ArrayBuffer(64, {maxByteLength: 64}); let f = new Float64Array(rab, 0, 8);\n\
+     const vals = [1.5, -0, NaN, 300.5, -2147483649, 1e10, 0.5, 2.5, Infinity, -1.25];\n\
+     let t = 0; for (let k = 0; k < 2000; k++) { const v = vals[k % vals.length]; \
+     fill(all[k % 9], v); fill(f, v); \
+     if (k === 1200) rab.resize(32); if (k === 1300) rab.resize(64); \
+     if (k === 1400) f.buffer.transfer(); if (k === 1500) f = new Float64Array(8); \
+     t = (t + (sumF(f) || 0) + setU(u, k) + (at(all[k % 9], k % 9) || 0) + \
+     (at(k % 2 ? f : [k, 1], 1) || 0) + count(all[k % 9])) % 1000003; }\n\
+     String(t) + all.map(a => Array.from(a, x => Object.is(x, -0) ? 'z' : x).join()).join('|')",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {
@@ -267,6 +288,56 @@ fn second_stage(engine: &mut Engine, name: &str) -> Option<std::rc::Rc<crate::by
         return None;
     };
     user.func.runtime().code2.get().and_then(Option::clone)
+}
+
+#[test]
+fn typed_arrays_of_one_kind_run_in_the_tiers_code() {
+    // The VM's runs record each site's element kind, which the first stage's in-line hits never
+    // do: the tier then reads and writes each kind in line, with the VM's results.
+    const TYPED: &str = "function sumF(t) { let s = 0; for (let i = 0; i < 16; i++) s += t[i]; \
+         return s; }\n\
+         function scale(t, v) { for (let i = 0; i < 16; i++) t[i] = (t[i] * v + 0.5) % 1000; \
+         return t; }\n\
+         function clamp(b, v) { for (let i = 0; i < 16; i++) b[i] = v + i * 37; return b[3]; }\n\
+         function shorts(w, v) { for (let i = 0; i < 16; i++) w[i] = v * i; return w[15]; }\n\
+         const f = new Float64Array(16), c = new Uint8ClampedArray(16), w = new Int16Array(16);\n\
+         for (let k = 0; k < 3; k++) { scale(f, 1.5); sumF(f); clamp(c, 1.5); shorts(w, 1.5); }";
+    const RUN: &str = "let t = 0; for (let k = 0; k < 3000; k++) { scale(f, k % 3 ? 1.5 : -0.5); \
+         t = (t + sumF(f) + clamp(c, k * 0.75) + shorts(w, k * 1000.5)) % 1000003; }\n\
+         String(t) + f.join() + c.join() + w.join()";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, TYPED);
+        eval(&mut vm, RUN)
+    };
+    eager().set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Bytecode);
+    engine.set_tier_threshold(0);
+    eval(&mut engine, TYPED);
+    engine.set_tier(Tier::Jit);
+    compiled();
+    exits();
+    assert_eq!(eval(&mut engine, RUN), expected);
+    assert!(exits().is_empty(), "the speculation held");
+    let tier = compiled();
+    use super::ir::{NodeOp, TypedKind};
+    for (name, op) in [
+        ("sumF", NodeOp::LoadTyped(TypedKind::F64)),
+        ("scale", NodeOp::StoreTyped(TypedKind::F64)),
+        ("clamp", NodeOp::StoreTyped(TypedKind::U8Clamped)),
+        ("shorts", NodeOp::StoreTyped(TypedKind::I16)),
+    ] {
+        let chunk = second_stage(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
+        assert!(
+            tier.contains(&address(&chunk)),
+            "{name}: the tier compiled it"
+        );
+        let graph = graph_now(&chunk);
+        assert!(graph.nodes.iter().any(|node| node.op == op), "{name}");
+    }
 }
 
 #[test]
@@ -905,6 +976,55 @@ fn an_int32_overflow_converges_on_f64_arithmetic() {
     use super::ir::NodeOp;
     assert!(graph.nodes.iter().any(|node| node.op == NodeOp::F64Add));
     assert!(!graph.nodes.iter().any(|node| node.op == NodeOp::I32Add));
+}
+
+#[test]
+fn an_array_that_gains_a_hole_converges_on_reading_holes() {
+    // The first stage's in-line hits record nothing, so the site is compiled from an empty
+    // record (the kind tag's branch); its hole exits flag Hole, and the recompile reads holes as
+    // undefined under the prototype proof.
+    let chunk = converges(
+        "get",
+        "function get(a, i) { return a[i]; }\n\
+         var p = [1, 2, 3, 4];\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += get(p, k & 3); t",
+        "delete p[1]; let s = 0; for (let k = 0; k < 600; k++) \
+         s += get(p, 1) === undefined ? 1 : 0; s",
+        "String(get(p, 1)) + get(p, 2)",
+        ExitReason::Hole,
+    );
+    let graph = graph_now(&chunk);
+    use super::ir::{Holes, NodeOp};
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| node.op == NodeOp::LoadElement(Holes::Undefined)));
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| node.op == NodeOp::LoadElement(Holes::Exit)));
+}
+
+#[test]
+fn a_typed_read_past_the_length_converges_on_undefined() {
+    // The stub's exits flag OutOfBounds, and the first stage's misses record the array's kind:
+    // the recompile reads that kind, undefined past the length.
+    let chunk = converges(
+        "get",
+        "function get(t, i) { return t[i]; }\n\
+         var f = new Float64Array([1.5, 2.5, 3.5, 4.5]);\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += get(f, k & 3); t",
+        "let s = 0; for (let k = 0; k < 600; k++) \
+         s += get(f, 4 + (k & 1)) === undefined ? 1 : 0; s",
+        "String(get(f, 4)) + get(f, 1) + get(f, -1)",
+        ExitReason::OutOfBounds,
+    );
+    let graph = graph_now(&chunk);
+    use super::ir::{NodeOp, TypedKind};
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| node.op == NodeOp::LoadTypedOrUndefined(TypedKind::F64)));
 }
 
 #[test]

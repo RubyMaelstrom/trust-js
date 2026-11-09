@@ -347,6 +347,27 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         // Its value takes one of three representations (`representations`).
         NodeOp::StoreElement(_) => return None,
         NodeOp::LoadArrayLength => (CELL, Rep::Tagged),
+        NodeOp::TypedView => (CELL, Rep::Ptr),
+        NodeOp::TypedLength => (&[Rep::Ptr], Rep::I32),
+        NodeOp::TypedData { .. } => (&[Rep::Cell, Rep::Ptr], Rep::Ptr),
+        NodeOp::LoadTyped(kind) => (&[Rep::Cell, Rep::Ptr, Rep::I32], kind.rep(false)),
+        NodeOp::LoadTypedOrUndefined(_) => {
+            (&[Rep::Cell, Rep::Ptr, Rep::I32, Rep::I32], Rep::Tagged)
+        }
+        NodeOp::StoreTyped(kind) => match kind.rep(true) {
+            Rep::F64 => (
+                &[Rep::Cell, Rep::Ptr, Rep::Ptr, Rep::I32, Rep::F64],
+                Rep::None,
+            ),
+            _ => (
+                &[Rep::Cell, Rep::Ptr, Rep::Ptr, Rep::I32, Rep::I32],
+                Rep::None,
+            ),
+        },
+        NodeOp::ClampToUint8 => (F64, Rep::I32),
+        NodeOp::TypedElement { write: false } => (&[Rep::Cell, Rep::I32], Rep::Tagged),
+        NodeOp::TypedElement { write: true } => (&[Rep::Cell, Rep::I32, Rep::F64], Rep::None),
+        NodeOp::IsTypedArray => (CELL, Rep::Bool),
         NodeOp::StoreSlot(_) => (TAGGED, Rep::None),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),

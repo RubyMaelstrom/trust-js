@@ -55,9 +55,11 @@ pub(crate) enum Rep {
     /// first word, a typed array's view record or its data, in an x register. Only element nodes
     /// take one, each with its owner's cell, which keeps the storage alive while the address is
     /// used (Warp's keep-alive: a storage block a frame names keeps its memory, not its owner or
-    /// the values it holds, gc_storage.rs); no frame state, phi or exit recipe holds one, so an
-    /// address never crosses a block edge, and its heap fact ends at the next effect, so it never
-    /// crosses a safepoint either.
+    /// the values it holds, gc_storage.rs). No frame state, phi or exit recipe holds one. Element
+    /// words and a typed array's data are heap facts, which end at the next effect, so neither
+    /// address crosses a safepoint; a view record is a value fact, fixed at install in a payload
+    /// cell that lives as long as its typed array, so its address may (the collector moves
+    /// nothing).
     Ptr,
     /// No value: stores, flushes, terminators.
     None,
@@ -94,12 +96,61 @@ pub(crate) enum ElemKind {
     Words,
     /// An Array, IC_PLAIN set.
     Array,
+    /// A typed array (its tag; its IC_PLAIN is clear, which keeps the words' paths off it), of
+    /// the element kind given, its view's kind byte (Maglev's map check, a map per elements
+    /// kind): the view is fixed at install as well (native_typed_array.rs install_typed_array).
+    Typed(Option<TypedKind>),
 }
 
 impl ElemKind {
     /// Whether a proof of `self` proves `other` too.
     pub(crate) fn proves(self, other: ElemKind) -> bool {
-        self == other || (self == ElemKind::Array && other == ElemKind::Words)
+        self == other
+            || matches!(
+                (self, other),
+                (ElemKind::Array, ElemKind::Words)
+                    | (ElemKind::Typed(Some(_)), ElemKind::Typed(None))
+            )
+    }
+}
+
+/// A typed array's element kind, as its native view numbers it (jit_typed_array.rs; feedback.rs
+/// ELEM_TYPED_KINDS).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum TypedKind {
+    U8 = 0,
+    I8 = 1,
+    U16 = 2,
+    I16 = 3,
+    U32 = 4,
+    I32 = 5,
+    F32 = 6,
+    F64 = 7,
+    U8Clamped = 8,
+}
+
+impl TypedKind {
+    pub(crate) const ALL: [TypedKind; 9] = [
+        TypedKind::U8,
+        TypedKind::I8,
+        TypedKind::U16,
+        TypedKind::I16,
+        TypedKind::U32,
+        TypedKind::I32,
+        TypedKind::F32,
+        TypedKind::F64,
+        TypedKind::U8Clamped,
+    ];
+
+    /// The representation of a load's element and a store's value: an int32 for the integer
+    /// kinds (a load of Uint32 excepted, whose element can pass the int32 range), an f64 for
+    /// the floats.
+    pub(crate) fn rep(self, store: bool) -> Rep {
+        match self {
+            TypedKind::F32 | TypedKind::F64 => Rep::F64,
+            TypedKind::U32 if !store => Rep::F64,
+            _ => Rep::I32,
+        }
     }
 }
 
@@ -183,7 +234,6 @@ pub(crate) enum ExitReason {
     Hole,
     /// A typed array whose buffer is detached, shrunk below the view or borrowed by Rust (V8's
     /// kArrayBufferWasDetached).
-    #[expect(dead_code, reason = "the typed-array checks build it (step 2's (e))")]
     Detached,
     /// An append whose growth failed (V8's kCouldNotGrowElements).
     CouldNotGrow,
@@ -350,6 +400,52 @@ pub(crate) enum NodeOp {
     /// that `i < a.length` loops keep their bodies free of effects (Maglev reads a JSArray's
     /// length as a known property, maglev-reducer-inl.h:1038-1059).
     LoadArrayLength,
+    /// Cell -> Ptr: a typed array's view record, fixed at install: a value fact.
+    TypedView,
+    /// Ptr -> I32: the view's element count, 0 for a view the code declines (BigInt or Float16
+    /// elements, a shared or length-tracking buffer), so that every index fails its bounds check:
+    /// a value fact (Maglev's LoadTypedArrayLength of a fixed-length array). At most 2^31, which
+    /// only the unsigned bounds check reads.
+    TypedLength,
+    /// (Cell, Ptr view) -> Ptr: the elements' address, the buffer's bytes plus the view's offset,
+    /// with the buffer attached, writable for a store, unborrowed by Rust and reaching the view's
+    /// end [Detached] (Maglev's CheckTypedArrayValid, TRust having no detaching protector; the
+    /// template's checks, jit_typed_array.rs emit_access): a heap fact of the effect epoch, as
+    /// only Rust detaches, resizes or borrows a buffer. The element kind's check precedes it,
+    /// which a declined view, whose buffer record is null, fails (its kind byte is no kind's).
+    TypedData {
+        write: bool,
+    },
+    /// (Cell, Ptr data, I32 index) -> I32 | F64: the element of `kind` at an index below the
+    /// length (Maglev's Load{SignedInt,UnsignedInt,Double}TypedArrayElement): an int32, or an
+    /// f64 for Uint32 and the floats, an f64's NaN as it is (its boxing canonicalizes it).
+    LoadTyped(TypedKind),
+    /// (Cell, Ptr data, I32 index, I32 length) -> Tagged: a read whose site exited past the
+    /// view's length (Maglev's Select on BranchIfTypedArrayBounds under kHandleOOB): below the
+    /// length, LoadTyped's element as a Number; at or past it, or at a negative index, undefined,
+    /// as a typed array reads every index it lacks (ECMA-262 TypedArrayGetElement), with no
+    /// prototype to consult.
+    LoadTypedOrUndefined(TypedKind),
+    /// (Cell, Ptr view, Ptr data, I32 index, value I32 | F64): the store of `kind` (Maglev's
+    /// Store{Int,Double}TypedArrayElement, the value converted first): an integer kind's low bits
+    /// of an int32 (a ToInt32 truncation's, or ClampToUint8's), a float's f64 (FCVT to Float32);
+    /// then the buffer's dirty range and write count, kept for embedders as the template keeps
+    /// them (jit_typed_array.rs emit_dirty).
+    StoreTyped(TypedKind),
+    /// F64 -> I32: ToUint8Clamp (ECMA-262 7.1.12): round half to even and clamp to [0, 255], NaN
+    /// to 0 (FCVTNS saturates and takes NaN to 0), as the template stores Uint8Clamped.
+    ClampToUint8,
+    /// (Cell, I32 index[, F64 value]) -> Tagged (a load) | None (a store): an element of a typed
+    /// array whose kind the snapshot does not know, through the template's TypedElement stub, a
+    /// call on its register contract (jit_typed_array.rs; jit.rs SharedStub::TypedElement):
+    /// [OutOfBounds] where the stub declines, whose one status does not say why.
+    TypedElement {
+        write: bool,
+    },
+    /// Cell -> Bool: whether the object is a typed array, by its kind tag, on which an element
+    /// site whose record holds typed arrays and other receivers, or none, branches between the
+    /// stub and the words, as the template dispatches (jit.rs emit_get_elem_inline).
+    IsTypedArray,
 
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's
@@ -416,6 +512,8 @@ impl NodeOp {
                 | NodeOp::LoadElement(_)
                 | NodeOp::LoadElementOrUndefined
                 | NodeOp::StoreElement(_)
+                | NodeOp::TypedData { .. }
+                | NodeOp::TypedElement { .. }
         )
     }
 

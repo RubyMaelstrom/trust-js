@@ -3121,3 +3121,530 @@ fn edges_stored_into_large_arrays_mark_their_runs() {
     );
     assert!(exits().is_empty());
 }
+
+/// `get(a, i)` (GET) on a typed array: `a` checked a typed array of `kind` (of any kind for the
+/// template's stub where `kind` is None), `i` an index, then the element by its kind, its bounds
+/// checked, or undefined past them where `past`; the graph returns it.
+fn typed_get(kind: Option<TypedKind>, past: bool) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let a = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let i = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let at_get = b.state(1, &[i], &[], &[]);
+    let check = |b: &mut Build, op: NodeOp, inputs: &[NodeIx], rep: Rep, reason: ExitReason| {
+        b.exiting(entry, op, inputs, rep, 1, at_get, reason)
+    };
+    let cell = check(
+        &mut b,
+        NodeOp::CheckObject,
+        &[a],
+        Rep::Cell,
+        ExitReason::NotObject,
+    );
+    check(
+        &mut b,
+        NodeOp::CheckElements(ElemKind::Typed(kind)),
+        &[cell],
+        Rep::None,
+        ExitReason::WrongElements,
+    );
+    let number = check(
+        &mut b,
+        NodeOp::CheckNumber,
+        &[i],
+        Rep::F64,
+        ExitReason::NotNumber,
+    );
+    let index = check(
+        &mut b,
+        NodeOp::CheckIndex,
+        &[number],
+        Rep::I32,
+        ExitReason::NotInt32,
+    );
+    let value = match kind {
+        None => check(
+            &mut b,
+            NodeOp::TypedElement { write: false },
+            &[cell, index],
+            Rep::Tagged,
+            ExitReason::OutOfBounds,
+        ),
+        Some(kind) => {
+            let view = b.node(entry, NodeOp::TypedView, &[cell], Rep::Ptr, 1);
+            let length = b.node(entry, NodeOp::TypedLength, &[view], Rep::I32, 1);
+            if !past {
+                check(
+                    &mut b,
+                    NodeOp::CheckBounds,
+                    &[index, length],
+                    Rep::None,
+                    ExitReason::OutOfBounds,
+                );
+            }
+            let data = check(
+                &mut b,
+                NodeOp::TypedData { write: false },
+                &[cell, view],
+                Rep::Ptr,
+                ExitReason::Detached,
+            );
+            if past {
+                let op = NodeOp::LoadTypedOrUndefined(kind);
+                b.node(entry, op, &[cell, data, index, length], Rep::Tagged, 1)
+            } else {
+                let rep = kind.rep(false);
+                let op = NodeOp::LoadTyped(kind);
+                let element = b.node(entry, op, &[cell, data, index], rep, 1);
+                let boxing = match rep {
+                    Rep::I32 => NodeOp::I32ToTagged,
+                    _ => NodeOp::F64ToTagged,
+                };
+                b.node(entry, boxing, &[element], Rep::Tagged, 1)
+            }
+        }
+    };
+    b.node(entry, NodeOp::Return, &[value], Rep::None, 2);
+    b.g
+}
+
+/// Each element kind's constructor and four values that test its conversions.
+const TYPED_KINDS: [(TypedKind, &str, &str); 9] = [
+    (TypedKind::U8, "Uint8Array", "0, 255, 128, 1"),
+    (TypedKind::I8, "Int8Array", "-128, 127, -1, 0"),
+    (TypedKind::U16, "Uint16Array", "65535, 0, 32768, 1"),
+    (TypedKind::I16, "Int16Array", "-32768, 32767, -1, 0"),
+    (
+        TypedKind::U32,
+        "Uint32Array",
+        "4294967295, 0, 2147483648, 1",
+    ),
+    (
+        TypedKind::I32,
+        "Int32Array",
+        "-2147483648, 2147483647, -1, 0",
+    ),
+    (TypedKind::F32, "Float32Array", "1.1, -0, NaN, 3.4e38"),
+    (TypedKind::F64, "Float64Array", "1.1, -0, NaN, -Infinity"),
+    (TypedKind::U8Clamped, "Uint8ClampedArray", "0, 255, 128, 1"),
+];
+
+/// What the bytecode VM answers to `source` in a fixture of `fixture_source`.
+fn vm_answer(fixture_source: &str, source: &str) -> String {
+    let mut engine = fixture(fixture_source);
+    eval(&mut engine, source)
+}
+
+/// `readAll(t)`: every element of `t` through `get`, -0 as such, joined.
+const READ_ALL: &str = "function readAll(t) { var r = []; \
+     for (var k = 0; k < t.length; k++) { var x = get(t, k); \
+     r.push(Object.is(x, -0) ? '-0' : String(x)); } return r.join(); }";
+
+#[test]
+fn typed_elements_load_by_their_kind_as_the_vm_reads_them() {
+    for (kind, ctor, values) in TYPED_KINDS {
+        for past in [false, true] {
+            let label = format!("{ctor} past {past}");
+            let mut engine = fixture(GET);
+            eval(&mut engine, READ_ALL);
+            install(
+                &mut engine,
+                "get",
+                &typed_get(Some(kind), past),
+                Options::default(),
+            );
+            stress(&engine);
+            exits();
+            // The values, then a view one element into its buffer.
+            for read in [
+                format!("var t = new {ctor}([{values}]); readAll(t)"),
+                format!(
+                    "readAll(new {ctor}(new {ctor}([{values}, {values}]).buffer, \
+                     {ctor}.BYTES_PER_ELEMENT, 5))"
+                ),
+            ] {
+                let expected = vm_answer(GET, &format!("{READ_ALL} {read}"));
+                assert_eq!(eval(&mut engine, &read), expected, "{label}: {read}");
+            }
+            assert!(exits().is_empty(), "{label}");
+            // Past the length and a negative index: undefined, in line where `past`.
+            assert_eq!(
+                eval(
+                    &mut engine,
+                    "get(t, 4) + ':' + get(t, -1) + ':' + get(t, 2147483647)"
+                ),
+                "undefined:undefined:undefined",
+                "{label}"
+            );
+            let expect = if past {
+                vec![]
+            } else {
+                vec![ExitReason::OutOfBounds; 3]
+            };
+            assert_eq!(reasons(), expect, "{label}");
+            // Another kind, a view the native code declines, an Array, an ordinary object.
+            let other = if kind == TypedKind::F64 {
+                "Float32Array"
+            } else {
+                "Float64Array"
+            };
+            for (call, result) in [
+                (format!("get(new {other}([2.5]), 0)"), "2.5"),
+                ("String(get(new BigInt64Array([5n]), 0))".to_string(), "5"),
+                ("get([5], 0)".to_string(), "5"),
+                ("get({0: 6}, 0)".to_string(), "6"),
+            ] {
+                assert_eq!(eval(&mut engine, &call), result, "{label}: {call}");
+                assert_eq!(
+                    reasons(),
+                    vec![ExitReason::WrongElements],
+                    "{label}: {call}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn a_float_elements_nan_is_read_as_the_canonical_nan() {
+    // A buffer's bytes may hold any NaN, and every NaN but one is a tag in the boxing (the first
+    // here is the hole's).
+    for past in [false, true] {
+        for (kind, setup) in [
+            (
+                TypedKind::F64,
+                "var t = new Float64Array(2), u = new Uint32Array(t.buffer); \
+                 u[1] = 0x7ffa0000; u[3] = 0xfff40000; u[2] = 1;",
+            ),
+            (
+                TypedKind::F32,
+                "var t = new Float32Array(2), u = new Uint32Array(t.buffer); \
+                 u[0] = 0x7fa00001; u[1] = 0xffc00000;",
+            ),
+        ] {
+            let mut engine = fixture(GET);
+            install(
+                &mut engine,
+                "get",
+                &typed_get(Some(kind), past),
+                Options::default(),
+            );
+            exits();
+            let read = format!(
+                "{setup} var x = get(t, 0), y = get(t, 1); \
+                 [x !== x, y !== y, typeof x, typeof y, [x, y].indexOf(x)].join()"
+            );
+            assert_eq!(
+                eval(&mut engine, &read),
+                "true,true,number,number,-1",
+                "{kind:?} {past}"
+            );
+            assert!(exits().is_empty());
+        }
+    }
+}
+
+#[test]
+fn a_detached_or_shrunk_buffer_exits_where_the_vm_reads_undefined() {
+    for past in [false, true] {
+        let mut engine = fixture(GET);
+        install(
+            &mut engine,
+            "get",
+            &typed_get(Some(TypedKind::F64), past),
+            Options::default(),
+        );
+        exits();
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var d = new Float64Array([1.5, 2.5]); var before = get(d, 1); \
+                 d.buffer.transfer(); before + ':' + get(d, 1)"
+            ),
+            "2.5:undefined"
+        );
+        assert_eq!(reasons(), vec![ExitReason::Detached], "{past}");
+        // A fixed view past a shrunk buffer's end reads nothing until the buffer grows back.
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var rab = new ArrayBuffer(32, {maxByteLength: 64}); \
+                 var f = new Float64Array(rab, 8, 2); f[0] = 2; f[1] = 3; var a1 = get(f, 1); \
+                 rab.resize(16); var a2 = get(f, 0); rab.resize(64); \
+                 [a1, a2, get(f, 0), get(f, 1)].join()"
+            ),
+            "3,,2,0"
+        );
+        assert_eq!(reasons(), vec![ExitReason::Detached], "{past}");
+        // A length-tracking view has no element count: a read exits at the bounds or, past
+        // them, at the buffer's end, which none reaches.
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var tracking = new Float64Array(new ArrayBuffer(16, {maxByteLength: 32})); \
+                 tracking[1] = 4; get(tracking, 1)"
+            ),
+            "4"
+        );
+        let reason = if past {
+            ExitReason::Detached
+        } else {
+            ExitReason::OutOfBounds
+        };
+        assert_eq!(reasons(), vec![reason], "{past}");
+    }
+}
+
+#[test]
+fn the_template_stub_reads_any_kind_and_exits_where_it_declines() {
+    let mut engine = fixture(GET);
+    eval(&mut engine, READ_ALL);
+    install(
+        &mut engine,
+        "get",
+        &typed_get(None, false),
+        Options::default(),
+    );
+    stress(&engine);
+    exits();
+    for (_, ctor, values) in TYPED_KINDS {
+        let read = format!("readAll(new {ctor}([{values}]))");
+        let expected = vm_answer(GET, &format!("{READ_ALL} {read}"));
+        assert_eq!(eval(&mut engine, &read), expected, "{ctor}");
+    }
+    assert!(exits().is_empty());
+    for (call, result, reason) in [
+        // One status for every decline: the bounds, a detached buffer, a declined view.
+        (
+            "get(new Uint8Array(2), 2)",
+            "undefined",
+            ExitReason::OutOfBounds,
+        ),
+        (
+            "var gone = new Int16Array(2); gone.buffer.transfer(); get(gone, 0)",
+            "undefined",
+            ExitReason::OutOfBounds,
+        ),
+        (
+            "String(get(new BigInt64Array([5n]), 0))",
+            "5",
+            ExitReason::OutOfBounds,
+        ),
+        ("get([5], 0)", "5", ExitReason::WrongElements),
+    ] {
+        assert_eq!(eval(&mut engine, call), result, "{call}");
+        assert_eq!(reasons(), vec![reason], "{call}");
+    }
+}
+
+/// `set(a, i, v)` (SET) on a typed array: `a` checked a typed array of `kind` (of any kind for the
+/// stub where `kind` is None), `i` an index and `v` a Number, converted as `kind` stores it.
+fn typed_set(kind: Option<TypedKind>) -> Graph {
+    let mut b = Build::new(3);
+    let entry = b.block(0, false);
+    let a = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let i = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let v = b.node(entry, NodeOp::EntrySlot(2), &[], Rep::Tagged, 0);
+    let at_set = b.state(2, &[i, v], &[], &[]);
+    let check = |b: &mut Build, op: NodeOp, inputs: &[NodeIx], rep: Rep, reason: ExitReason| {
+        b.exiting(entry, op, inputs, rep, 2, at_set, reason)
+    };
+    let cell = check(
+        &mut b,
+        NodeOp::CheckObject,
+        &[a],
+        Rep::Cell,
+        ExitReason::NotObject,
+    );
+    check(
+        &mut b,
+        NodeOp::CheckElements(ElemKind::Typed(kind)),
+        &[cell],
+        Rep::None,
+        ExitReason::WrongElements,
+    );
+    let fi = check(
+        &mut b,
+        NodeOp::CheckNumber,
+        &[i],
+        Rep::F64,
+        ExitReason::NotNumber,
+    );
+    let index = check(
+        &mut b,
+        NodeOp::CheckIndex,
+        &[fi],
+        Rep::I32,
+        ExitReason::NotInt32,
+    );
+    let fv = check(
+        &mut b,
+        NodeOp::CheckNumber,
+        &[v],
+        Rep::F64,
+        ExitReason::NotNumber,
+    );
+    match kind {
+        None => {
+            check(
+                &mut b,
+                NodeOp::TypedElement { write: true },
+                &[cell, index, fv],
+                Rep::None,
+                ExitReason::OutOfBounds,
+            );
+        }
+        Some(kind) => {
+            let stored = match kind {
+                TypedKind::F32 | TypedKind::F64 => fv,
+                TypedKind::U8Clamped => b.node(entry, NodeOp::ClampToUint8, &[fv], Rep::I32, 2),
+                _ => b.node(entry, NodeOp::TruncateToInt32, &[fv], Rep::I32, 2),
+            };
+            let view = b.node(entry, NodeOp::TypedView, &[cell], Rep::Ptr, 2);
+            let length = b.node(entry, NodeOp::TypedLength, &[view], Rep::I32, 2);
+            check(
+                &mut b,
+                NodeOp::CheckBounds,
+                &[index, length],
+                Rep::None,
+                ExitReason::OutOfBounds,
+            );
+            let data = check(
+                &mut b,
+                NodeOp::TypedData { write: true },
+                &[cell, view],
+                Rep::Ptr,
+                ExitReason::Detached,
+            );
+            let op = NodeOp::StoreTyped(kind);
+            b.node(entry, op, &[cell, view, data, index, stored], Rep::None, 2);
+        }
+    }
+    b.node(entry, NodeOp::Return, &[a], Rep::None, 4);
+    b.g
+}
+
+/// `writeAll(t)`: values every kind's store converts (NaN, -0, the int32 bounds and past them,
+/// fractions both ways, the infinities, halves between bytes, one past Float32's range) stored
+/// through `set`, then `t`'s elements, -0 as such, joined.
+const WRITE_ALL: &str = "function writeAll(t) { var v = [NaN, -0, 2147483648, 4294967301, -1, \
+     1.9, -1.9, Infinity, -Infinity, 254.5, 255.5, 0.5, 1.5, 1e40, -2147483649, 65535.5]; \
+     for (var k = 0; k < v.length; k++) set(t, k, v[k]); \
+     return Array.from(t, function (x) { return Object.is(x, -0) ? '-0' : String(x); }).join(); }";
+
+#[test]
+fn typed_elements_store_each_kinds_conversion_as_the_vm_does() {
+    let all = TYPED_KINDS.map(|(kind, ctor, _)| (Some(kind), ctor));
+    for (kind, ctor) in [(None, "Uint8Array")].into_iter().chain(all) {
+        let label = format!("{kind:?} {ctor}");
+        let mut engine = fixture(SET);
+        eval(&mut engine, WRITE_ALL);
+        install(&mut engine, "set", &typed_set(kind), Options::default());
+        stress(&engine);
+        exits();
+        let ctors: Vec<&str> = match kind {
+            Some(_) => vec![ctor],
+            None => TYPED_KINDS.iter().map(|&(_, ctor, _)| ctor).collect(),
+        };
+        for ctor in ctors {
+            // The values, then a view four elements into its buffer.
+            for write in [
+                format!("writeAll(new {ctor}(16))"),
+                format!(
+                    "var whole = new {ctor}(20); writeAll(new {ctor}(whole.buffer, \
+                     4 * {ctor}.BYTES_PER_ELEMENT, 16)); Array.from(whole).join()"
+                ),
+            ] {
+                let expected = vm_answer(SET, &format!("{WRITE_ALL} {write}"));
+                assert_eq!(eval(&mut engine, &write), expected, "{label}: {write}");
+            }
+        }
+        // The stub declines values FCVTZS cannot take without FJCVTZS: the VM stores them.
+        let taken = reasons();
+        if kind.is_some() || crate::jit::jscvt_available() {
+            assert!(taken.is_empty(), "{label}: {taken:?}");
+        } else {
+            assert!(
+                taken.iter().all(|&r| r == ExitReason::OutOfBounds),
+                "{label}"
+            );
+        }
+        // The stub's one status, or the buffer's reason for a kind's store.
+        let buffer = if kind.is_none() {
+            ExitReason::OutOfBounds
+        } else {
+            ExitReason::Detached
+        };
+        let other = if kind == Some(TypedKind::F64) {
+            "Float32Array"
+        } else {
+            "Float64Array"
+        };
+        let mut cases = vec![
+            (
+                format!("var short = new {ctor}(2); set(short, 2, 1); Array.from(short).join()"),
+                ExitReason::OutOfBounds,
+            ),
+            (
+                format!("set(new {ctor}(2), 0, '3')[0] + ''"),
+                ExitReason::NotNumber,
+            ),
+            (
+                format!("var gone = new {ctor}(2); gone.buffer.transfer(); set(gone, 0, 1).length"),
+                buffer,
+            ),
+            (
+                format!(
+                    "var im = new {ctor}(new ArrayBuffer(8).transferToImmutable()); \
+                     try {{ set(im, 0, 1); 'stored:' + im[0] }} catch (e) {{ e.constructor.name }}"
+                ),
+                buffer,
+            ),
+            (
+                "set([1], 0, 2)[0] + ''".to_string(),
+                ExitReason::WrongElements,
+            ),
+        ];
+        if kind.is_some() {
+            cases.push((
+                format!("set(new {other}(1), 0, 2.5)[0] + ''"),
+                ExitReason::WrongElements,
+            ));
+        }
+        for (call, reason) in cases {
+            let expected = vm_answer(SET, &call);
+            assert_eq!(eval(&mut engine, &call), expected, "{label}: {call}");
+            assert_eq!(reasons(), vec![reason], "{label}: {call}");
+        }
+    }
+}
+
+#[test]
+fn typed_stores_keep_the_buffers_dirty_ranges_and_generation() {
+    // Embedders mirror a buffer by its generation and dirty ranges: the stores fold into them
+    // as the template's do (`emit_dirty`).
+    let mut engine = fixture(SET);
+    install(
+        &mut engine,
+        "set",
+        &typed_set(Some(TypedKind::I16)),
+        Options::default(),
+    );
+    exits();
+    eval(
+        &mut engine,
+        "var buf = new ArrayBuffer(32); var t = new Int16Array(buf, 4, 8);",
+    );
+    let env = engine.interp.global_env;
+    let buf = engine.interp.get_var("buf", &env).ok().expect("the buffer");
+    engine.interp.take_array_buffer_dirty_ranges(&buf);
+    let version = engine.interp.array_buffer_version(&buf).expect("attached");
+    eval(&mut engine, "set(t, 1, 7); set(t, 3, 8);");
+    assert!(exits().is_empty());
+    assert_eq!(
+        engine.interp.take_array_buffer_dirty_ranges(&buf),
+        Some(vec![6..12])
+    );
+    assert_eq!(engine.interp.array_buffer_version(&buf), Some(version + 2));
+    assert_eq!(eval(&mut engine, "Array.from(t).join()"), "0,7,0,8,0,0,0,0");
+}

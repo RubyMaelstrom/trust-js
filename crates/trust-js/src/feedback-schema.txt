@@ -176,6 +176,9 @@ record's:
     (NO_HOLES clear), 17 a non-Number (NUMBERS clear), 18 a non-int32 (INT32 clear), 19 frozen
     or a shared literal's block (FROZEN or COW), 20 an index key at or past the used words (a
     read out of bounds, a store that appends or leaves a gap).
+  A typed array's element kinds (bits 21-23 and 25-30; P3 stage 2 step 2), its native view's
+    kind (native_typed_array.rs): 21 Uint8, 22 Int8, 23 Uint16, 25 Int16, 26 Uint32, 27 Int32,
+    28 Float32, 29 Float64, 30 Uint8Clamped; a view generated code declines records none.
 
 Who writes it:
 - The VM, on every element access, before it runs it.

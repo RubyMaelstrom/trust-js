@@ -48,7 +48,7 @@ use super::ir::{
     BlockData, BlockIx, Cond, Decline, ExitReason, FrameState, Graph, NodeIx, NodeOp, Refusal, Rep,
     SlotSource, StateIx,
 };
-use super::ir::{ElemKind, Holes, Store};
+use super::ir::{ElemKind, Holes, Store, TypedKind};
 use super::snapshot::{Ran, Snapshot};
 use crate::bytecode::{Chunk, Op, UpdKind};
 use crate::fasthash::FastMap;
@@ -569,6 +569,13 @@ struct State {
     present: crate::fasthash::FastSet<(NodeIx, NodeIx)>,
     /// An Array word's `length`, loaded this effect epoch, which an append ends.
     lengths: FastMap<NodeIx, NodeIx>,
+    /// A typed array word's view, and a view's element count: value facts, as the view is fixed
+    /// at install (its address may cross a safepoint: its owner's cell, which the accesses take
+    /// too, keeps the view's memory, and the collector moves nothing).
+    views: FastMap<NodeIx, NodeIx>,
+    typed_lengths: FastMap<NodeIx, NodeIx>,
+    /// A view's elements' address, checked valid this effect epoch (for a store too).
+    typed_data: FastMap<(NodeIx, bool), NodeIx>,
 }
 
 impl State {
@@ -585,6 +592,7 @@ impl State {
         self.loaded.clear();
         self.present.clear();
         self.lengths.clear();
+        self.typed_data.clear();
     }
 
     /// Whether a handler record of a `for…of` body is active (a return there is routed through
@@ -712,6 +720,9 @@ fn meet_elements(first: &State, rest: &[(BlockIx, State)]) -> State {
             .copied()
             .collect(),
         lengths: alike(&first.lengths, rest, |state| &state.lengths),
+        views: alike(&first.views, rest, |state| &state.views),
+        typed_lengths: alike(&first.typed_lengths, rest, |state| &state.typed_lengths),
+        typed_data: alike(&first.typed_data, rest, |state| &state.typed_data),
         ..State::default()
     }
 }
@@ -767,6 +778,15 @@ struct Before {
 impl Before {
     fn new(pc: usize) -> Self {
         Before { pc, state: None }
+    }
+
+    /// The state an operation's exits share, made already (an arm of a branch the operation
+    /// builds: P3 stage 2 step 2's kind-tag dispatch).
+    fn with(pc: usize, state: StateIx) -> Self {
+        Before {
+            pc,
+            state: Some(state),
+        }
     }
 }
 
@@ -1375,6 +1395,10 @@ impl<'a> Builder<'a> {
         st.loaded.retain(|(words, _), _| addresses.contains(words));
         st.present.retain(|(words, _)| addresses.contains(words));
         st.lengths.retain(|word, _| live.contains(word));
+        st.views.retain(|word, _| live.contains(word));
+        let views: crate::fasthash::FastSet<NodeIx> = st.views.values().copied().collect();
+        st.typed_lengths.retain(|view, _| views.contains(view));
+        st.typed_data.retain(|(view, _), _| views.contains(view));
     }
 
     // ---- control flow --------------------------------------------------------------------------
@@ -1609,6 +1633,8 @@ impl<'a> Builder<'a> {
             truncated: met.truncated,
             kinds: met.kinds,
             indices: met.indices,
+            views: met.views,
+            typed_lengths: met.typed_lengths,
             ..State::default()
         };
         let poll = self.frame_state(pc, &st);
@@ -2496,11 +2522,26 @@ struct ElemSite {
     /// Whether Arrays are among the receivers: a store then fills holes and appends in line,
     /// whatever the facts, since the first stage does both in line and records neither.
     arrays: bool,
+    /// Where typed arrays are among the receivers: the access's form for them.
+    typed: Typed,
+}
+
+/// What an element site does with typed arrays (the design's choice from the receiver set).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Typed {
+    /// None among the receivers: the element words alone.
+    None,
+    /// Typed arrays alone, of the one kind the record saw (per-kind loads and stores) or not
+    /// (the template's TypedElement stub).
+    Only(Option<TypedKind>),
+    /// Typed arrays and other receivers, or no record at all: a branch on the kind tag between
+    /// the stub and the element words, as the template dispatches.
+    Mixed,
 }
 
 /// The exit reasons whose flag at an element load sends it to the generic access: its receiver's
 /// object and elements checks and its key's Number and index checks. Hole and OutOfBounds widen
-/// its reads instead (`flagged_reads`).
+/// its reads instead (`flagged_reads`; a typed array site's, TYPED_DECLINES).
 const LOAD_DECLINES: &[ExitReason] = &[
     ExitReason::WrongElements,
     ExitReason::NotObject,
@@ -2517,6 +2558,13 @@ const STORE_DECLINES: &[ExitReason] = &[
     ExitReason::Hole,
     ExitReason::CouldNotGrow,
 ];
+/// A typed array site's, beside a load's or a store's: a detached or shrunk buffer, and an index
+/// past the view's length, whose flag at the stub (its one status) or at a site of other
+/// receivers too (the words' reads) does not say what exited. A load of one kind reads past the
+/// length instead, as Maglev's does under kHandleOOB (a Select on BranchIfTypedArrayBounds,
+/// maglev-graph-builder.cc:5134-5143); a store's flag is STORE_DECLINES' own (Maglev skips such
+/// a store in line, 5148-5200).
+const TYPED_DECLINES: &[ExitReason] = &[ExitReason::OutOfBounds, ExitReason::Detached];
 /// An update's: a load's, its read's hole and bounds (the write after it would exit at a hole
 /// the read took as undefined); Overflow takes f64 arithmetic instead.
 const UPDATE_DECLINES: &[ExitReason] = &[
@@ -2559,12 +2607,24 @@ impl Builder<'_> {
         } else {
             ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY
         };
-        let kind = if receivers == ELEM_ARRAY {
-            ElemKind::Array
-        } else if receivers == ELEM_ORDINARY || receivers == ELEM_ARRAY | ELEM_ORDINARY {
-            ElemKind::Words
-        } else {
+        if receivers & !(ELEM_ARRAY | ELEM_TYPED_ARRAY | ELEM_ORDINARY) != 0 {
             return None;
+        }
+        let kind = if receivers & ELEM_ORDINARY == 0 {
+            ElemKind::Array
+        } else {
+            ElemKind::Words
+        };
+        let typed = if receivers & ELEM_TYPED_ARRAY == 0 {
+            Typed::None
+        } else if receivers == ELEM_TYPED_ARRAY {
+            // The one kind the VM and the misses saw, if they saw one.
+            let mut kinds = TypedKind::ALL.into_iter().filter(|&kind| {
+                view.typed_kinds & crate::feedback::elem_typed_kind(kind as u8) != 0
+            });
+            Typed::Only(kinds.next().filter(|_| kinds.next().is_none()))
+        } else {
+            Typed::Mixed
         };
         let reads = if view.facts & ELEM_OUT_OF_BOUNDS != 0 {
             Reads::PastUsed
@@ -2577,6 +2637,7 @@ impl Builder<'_> {
             kind,
             reads,
             arrays: receivers & ELEM_ARRAY != 0,
+            typed,
         })
     }
 
@@ -2633,23 +2694,39 @@ impl Builder<'_> {
         word: NodeIx,
         kind: ElemKind,
     ) -> NodeIx {
-        let pc = cx.pc;
-        let cell = match self.forms(st, word).cell {
-            Some(cell) => cell,
-            None => {
-                let state = self.before(cx, st);
-                let cell = self.add_exit(
-                    NodeOp::CheckObject,
-                    &[word],
-                    Rep::Cell,
-                    pc,
-                    state,
-                    ExitReason::NotObject,
-                );
-                self.relate(st, word, cell);
-                cell
-            }
-        };
+        let cell = self.object_cell(st, cx, word);
+        self.elements_kind(st, cx, word, cell, kind);
+        cell
+    }
+
+    /// The cell of the object `word` names: its cell form, or CheckObject [NotObject].
+    fn object_cell(&mut self, st: &mut State, cx: &mut Before, word: NodeIx) -> NodeIx {
+        if let Some(cell) = self.forms(st, word).cell {
+            return cell;
+        }
+        let state = self.before(cx, st);
+        let cell = self.add_exit(
+            NodeOp::CheckObject,
+            &[word],
+            Rep::Cell,
+            cx.pc,
+            state,
+            ExitReason::NotObject,
+        );
+        self.relate(st, word, cell);
+        cell
+    }
+
+    /// CheckElements(`kind`) of the object `word` names (its cell `cell`) [WrongElements], unless
+    /// the value facts prove it.
+    fn elements_kind(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        kind: ElemKind,
+    ) {
         let proven = st.kinds.get(&word).is_some_and(|known| known.proves(kind))
             || (kind == ElemKind::Words && st.shapes.contains_key(&word));
         if !proven {
@@ -2658,13 +2735,12 @@ impl Builder<'_> {
                 NodeOp::CheckElements(kind),
                 &[cell],
                 Rep::None,
-                pc,
+                cx.pc,
                 state,
                 ExitReason::WrongElements,
             );
             st.kinds.insert(word, kind);
         }
-        cell
     }
 
     /// The element index `key` names, an int32: an int32 form as it is, a constant folded, an
@@ -2825,11 +2901,62 @@ impl Builder<'_> {
         if !self.element_operands(receiver, key) || self.declines_element(pc, LOAD_DECLINES) {
             return self.effect(pc, st);
         }
-        site.reads = self.flagged_reads(pc, site.reads);
+        let mut past_length = false;
+        match site.typed {
+            Typed::None => site.reads = self.flagged_reads(pc, site.reads),
+            Typed::Only(Some(_)) => {
+                if self.declines_element(pc, &[ExitReason::Detached]) {
+                    return self.effect(pc, st);
+                }
+                past_length = self.declined(
+                    pc,
+                    ExitReason::OutOfBounds,
+                    "the read past the view's length",
+                );
+            }
+            Typed::Only(None) | Typed::Mixed => {
+                if self.declines_element(pc, TYPED_DECLINES) {
+                    return self.effect(pc, st);
+                }
+                site.reads = self.flagged_reads(pc, site.reads);
+            }
+        }
         let mut cx = Before::new(pc);
-        let cell = self.elements_cell(st, &mut cx, receiver, site.kind);
-        let index = self.element_index(st, &mut cx, key);
-        let value = self.element_read(st, &mut cx, receiver, cell, index, site.reads);
+        let value = match site.typed {
+            Typed::None => {
+                let cell = self.elements_cell(st, &mut cx, receiver, site.kind);
+                let index = self.element_index(st, &mut cx, key);
+                self.element_read(st, &mut cx, receiver, cell, index, site.reads)
+            }
+            Typed::Only(kind) => {
+                let cell = self.elements_cell(st, &mut cx, receiver, ElemKind::Typed(kind));
+                let index = self.element_index(st, &mut cx, key);
+                self.typed_read(st, &mut cx, receiver, cell, index, kind, past_length)
+            }
+            Typed::Mixed => {
+                let cell = self.object_cell(st, &mut cx, receiver);
+                let index = self.element_index(st, &mut cx, key);
+                let state = self.before(&mut cx, st);
+                let typed = self.add(NodeOp::IsTypedArray, &[cell], Rep::Bool, pc);
+                self.branch_on_typed(
+                    st,
+                    pc,
+                    typed,
+                    |this, st| {
+                        let mut cx = Before::with(pc, state);
+                        Some(this.typed_read(st, &mut cx, receiver, cell, index, None, false))
+                    },
+                    |this, st| {
+                        let mut cx = Before::with(pc, state);
+                        this.elements_kind(st, &mut cx, receiver, cell, site.kind);
+                        let value =
+                            this.element_read(st, &mut cx, receiver, cell, index, site.reads);
+                        Some(this.tagged(st, value, pc))
+                    },
+                )
+                .expect("both arms read a value")
+            }
+        };
         let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
         st.stack.truncate(len - pops);
         st.stack.push(value);
@@ -2858,12 +2985,9 @@ impl Builder<'_> {
     /// SetElem, SetElemDrop, SetElemLocal and SetElemLocalDrop to an existing element of element
     /// words (Maglev's element store on a JSArray or JSObject, maglev-graph-builder.cc:5346-5461,
     /// as Warp's StoreDenseElement, WarpCacheIRTranspiler.cpp:3167-3194): the receiver and the
-    /// key as a load takes them, then StoreElement, which checks the bounds and the hole unless
-    /// the epoch proved the element present, keeps the kind bits exact in place, copies a shared
-    /// literal's block, and exits on frozen elements. A store may copy or grow a block, and
-    /// another word may name its object, so every element address and read of the epoch ends
-    /// with it but its own words, whose element it now knows; no store makes a hole, so the
-    /// present elements stay.
+    /// key as a load takes them, then StoreElement (`words_store`); a typed array's element by
+    /// its kind or through the template's stub, its value a Number (`typed_write`); or, for
+    /// typed arrays among other receivers, a branch on the kind tag between the two.
     fn element_store(
         &mut self,
         pc: usize,
@@ -2871,29 +2995,98 @@ impl Builder<'_> {
         keep: bool,
         st: &mut State,
     ) -> Result<(), Refusal> {
-        let Some(site) = self.element_site(pc) else {
+        let Some(mut site) = self.element_site(pc) else {
             return self.effect(pc, st);
         };
         let len = st.stack.len();
         let (key, value) = (st.stack[len - 2], st.stack[len - 1]);
         let receiver = self.receiver(recv, st, 2, pc);
-        if !self.element_operands(receiver, key) || self.declines_element(pc, STORE_DECLINES) {
+        if !self.element_operands(receiver, key)
+            || self.declines_element(pc, STORE_DECLINES)
+            || (site.typed != Typed::None && self.declines_element(pc, TYPED_DECLINES))
+        {
             return self.effect(pc, st);
         }
+        if !self.numeric(value) {
+            // A typed array takes a Number in line (its store converts any other value first,
+            // which may run code): the words alone, where the site saw others.
+            match site.typed {
+                Typed::Only(_) => return self.effect(pc, st),
+                Typed::Mixed => site.typed = Typed::None,
+                Typed::None => {}
+            }
+        }
         let mut cx = Before::new(pc);
-        let cell = self.elements_cell(st, &mut cx, receiver, site.kind);
-        let index = self.element_index(st, &mut cx, key);
-        let words = self.elements_of(st, receiver, cell, pc);
+        match site.typed {
+            Typed::None => {
+                let cell = self.elements_cell(st, &mut cx, receiver, site.kind);
+                let index = self.element_index(st, &mut cx, key);
+                self.words_store(st, &mut cx, receiver, cell, index, value, site.arrays);
+            }
+            Typed::Only(kind) => {
+                let cell = self.elements_cell(st, &mut cx, receiver, ElemKind::Typed(kind));
+                let index = self.element_index(st, &mut cx, key);
+                self.typed_write(st, &mut cx, receiver, cell, index, value, kind);
+            }
+            Typed::Mixed => {
+                let cell = self.object_cell(st, &mut cx, receiver);
+                let index = self.element_index(st, &mut cx, key);
+                let state = self.before(&mut cx, st);
+                let typed = self.add(NodeOp::IsTypedArray, &[cell], Rep::Bool, pc);
+                self.branch_on_typed(
+                    st,
+                    pc,
+                    typed,
+                    |this, st| {
+                        let mut cx = Before::with(pc, state);
+                        this.typed_write(st, &mut cx, receiver, cell, index, value, None);
+                        None
+                    },
+                    |this, st| {
+                        let mut cx = Before::with(pc, state);
+                        this.elements_kind(st, &mut cx, receiver, cell, site.kind);
+                        this.words_store(st, &mut cx, receiver, cell, index, value, site.arrays);
+                        None
+                    },
+                );
+            }
+        }
+        let pops = if matches!(recv, Recv::Stack) { 3 } else { 2 };
+        st.stack.truncate(len - pops);
+        if keep {
+            st.stack.push(value);
+        }
+        Ok(())
+    }
+
+    /// StoreElement of `value` at `index` of the element words of the object `word` names (its
+    /// cell `cell`, whose kind is proven): Present where the epoch proved the element, Create for
+    /// an Array site, else Existing. A store may copy or grow a block, and another word may name
+    /// its object, so every element address and read of the epoch ends with it but its own words,
+    /// whose element it now knows; no store makes a hole, so the present elements stay.
+    #[allow(clippy::too_many_arguments)]
+    fn words_store(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        index: NodeIx,
+        value: NodeIx,
+        arrays: bool,
+    ) {
+        let pc = cx.pc;
+        let words = self.elements_of(st, word, cell, pc);
         let stored = self.element_value(st, value, pc);
         let key = self.index_key(index);
         let mode = if st.present.contains(&(words, key)) {
             Store::Present
-        } else if site.arrays {
+        } else if arrays {
             Store::Create
         } else {
             Store::Existing
         };
-        let state = self.before(&mut cx, st);
+        let state = self.before(cx, st);
         let after = self.add_exit(
             NodeOp::StoreElement(mode),
             &[cell, words, index, stored],
@@ -2909,15 +3102,237 @@ impl Builder<'_> {
             // An append raises an Array's `length`, whichever word names the Array.
             st.lengths.clear();
         }
-        st.elements.insert(receiver, after);
+        st.elements.insert(word, after);
         st.present.insert((after, key));
         st.loaded.insert((after, key), value);
-        let pops = if matches!(recv, Recv::Stack) { 3 } else { 2 };
-        st.stack.truncate(len - pops);
-        if keep {
-            st.stack.push(value);
+    }
+
+    /// The view of the typed array `word` names (its cell `cell`) and the view's length, value
+    /// facts.
+    fn typed_view(
+        &mut self,
+        st: &mut State,
+        word: NodeIx,
+        cell: NodeIx,
+        pc: usize,
+    ) -> (NodeIx, NodeIx) {
+        let view = match st.views.get(&word) {
+            Some(&view) => view,
+            None => {
+                let view = self.add(NodeOp::TypedView, &[cell], Rep::Ptr, pc);
+                st.views.insert(word, view);
+                view
+            }
+        };
+        let length = match st.typed_lengths.get(&view) {
+            Some(&length) => length,
+            None => {
+                let length = self.add(NodeOp::TypedLength, &[view], Rep::I32, pc);
+                st.typed_lengths.insert(view, length);
+                length
+            }
+        };
+        (view, length)
+    }
+
+    /// The elements' address of the typed array `cell` (its view `view`, its element kind
+    /// proven), checked valid, for a store too where `write` [Detached]: a heap fact of the
+    /// epoch, which a store's check serves a load too.
+    fn typed_data(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        cell: NodeIx,
+        view: NodeIx,
+        write: bool,
+    ) -> NodeIx {
+        let known = st
+            .typed_data
+            .get(&(view, true))
+            .or_else(|| st.typed_data.get(&(view, false)).filter(|_| !write));
+        if let Some(&data) = known {
+            return data;
         }
-        Ok(())
+        let state = self.before(cx, st);
+        let data = self.add_exit(
+            NodeOp::TypedData { write },
+            &[cell, view],
+            Rep::Ptr,
+            cx.pc,
+            state,
+            ExitReason::Detached,
+        );
+        st.typed_data.insert((view, write), data);
+        data
+    }
+
+    /// A typed array's view, the index's bounds check [OutOfBounds] and the elements' address
+    /// (`typed_data`): the view and the address.
+    fn typed_access(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        index: NodeIx,
+        write: bool,
+    ) -> (NodeIx, NodeIx) {
+        let pc = cx.pc;
+        let (view, length) = self.typed_view(st, word, cell, pc);
+        let state = self.before(cx, st);
+        self.add_exit(
+            NodeOp::CheckBounds,
+            &[index, length],
+            Rep::None,
+            pc,
+            state,
+            ExitReason::OutOfBounds,
+        );
+        let data = self.typed_data(st, cx, cell, view, write);
+        (view, data)
+    }
+
+    /// The element of a typed array (its kind proven) at `index`: by its element kind where the
+    /// record saw one (Maglev's typed-array loads), undefined past the length where `past_length`
+    /// (the site exited there), else through the template's TypedElement stub [OutOfBounds],
+    /// whose word it is.
+    #[allow(clippy::too_many_arguments)]
+    fn typed_read(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        index: NodeIx,
+        kind: Option<TypedKind>,
+        past_length: bool,
+    ) -> NodeIx {
+        let pc = cx.pc;
+        let Some(kind) = kind else {
+            let state = self.before(cx, st);
+            return self.add_exit(
+                NodeOp::TypedElement { write: false },
+                &[cell, index],
+                Rep::Tagged,
+                pc,
+                state,
+                ExitReason::OutOfBounds,
+            );
+        };
+        if past_length {
+            let (view, length) = self.typed_view(st, word, cell, pc);
+            let data = self.typed_data(st, cx, cell, view, false);
+            return self.add(
+                NodeOp::LoadTypedOrUndefined(kind),
+                &[cell, data, index, length],
+                Rep::Tagged,
+                pc,
+            );
+        }
+        let (_, data) = self.typed_access(st, cx, word, cell, index, false);
+        self.add(
+            NodeOp::LoadTyped(kind),
+            &[cell, data, index],
+            kind.rep(false),
+            pc,
+        )
+    }
+
+    /// A typed array's store of `value`, a Number (`numeric`), at `index`: converted first, as
+    /// Maglev converts it (an integer kind's ToInt32 truncation, Uint8Clamped's clamp, a float's
+    /// f64), then stored by its kind; or through the template's stub where the record saw no one
+    /// kind [OutOfBounds].
+    #[allow(clippy::too_many_arguments)]
+    fn typed_write(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        index: NodeIx,
+        value: NodeIx,
+        kind: Option<TypedKind>,
+    ) {
+        let pc = cx.pc;
+        let Some(kind) = kind else {
+            let number = self.number(st, cx, value).expect("a Number value");
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::TypedElement { write: true },
+                &[cell, index, number],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::OutOfBounds,
+            );
+            return;
+        };
+        let stored = match kind {
+            TypedKind::F32 | TypedKind::F64 => self.number(st, cx, value).expect("a Number value"),
+            TypedKind::U8Clamped => {
+                let number = self.number(st, cx, value).expect("a Number value");
+                self.add(NodeOp::ClampToUint8, &[number], Rep::I32, pc)
+            }
+            _ => self.truncated_int32(st, cx, value).expect("a Number value"),
+        };
+        let (view, data) = self.typed_access(st, cx, word, cell, index, true);
+        self.add(
+            NodeOp::StoreTyped(kind),
+            &[cell, view, data, index, stored],
+            Rep::None,
+            pc,
+        );
+    }
+
+    /// Branch on `typed` (IsTypedArray) to `on_typed` and `on_words`, each built in a block of
+    /// its own on a copy of `st`, then join them: the frame as it was (neither arm changes it),
+    /// the facts both arms hold, and their values, where they give some, as a phi of words.
+    fn branch_on_typed(
+        &mut self,
+        st: &mut State,
+        pc: usize,
+        typed: NodeIx,
+        on_typed: impl FnOnce(&mut Self, &mut State) -> Option<NodeIx>,
+        on_words: impl FnOnce(&mut Self, &mut State) -> Option<NodeIx>,
+    ) -> Option<NodeIx> {
+        let first = self.cur;
+        let typed_block = self.graph.add_block(pc as u32, false);
+        let words_block = self.graph.add_block(pc as u32, false);
+        let join = self.graph.add_block(pc as u32, false);
+        self.add(
+            NodeOp::Branch {
+                then_block: typed_block,
+                else_block: words_block,
+            },
+            &[typed],
+            Rep::None,
+            pc,
+        );
+        self.graph.add_edge(first, typed_block);
+        self.graph.add_edge(first, words_block);
+        let mut typed_st = st.clone();
+        self.cur = typed_block;
+        let a = on_typed(self, &mut typed_st);
+        self.add(NodeOp::Jump(join), &[], Rep::None, pc);
+        self.graph.add_edge(typed_block, join);
+        let mut words_st = st.clone();
+        self.cur = words_block;
+        let b = on_words(self, &mut words_st);
+        self.add(NodeOp::Jump(join), &[], Rep::None, pc);
+        self.graph.add_edge(words_block, join);
+        self.cur = join;
+        let met = meet(&[(typed_block, typed_st), (words_block, words_st)]);
+        *st = State {
+            slots: std::mem::take(&mut st.slots),
+            stack: std::mem::take(&mut st.stack),
+            handlers: std::mem::take(&mut st.handlers),
+            ..met
+        };
+        let (a, b) = (a?, b?);
+        Some(
+            self.graph
+                .add_node(join, NodeOp::Phi, &[a, b], Rep::Tagged, pc as u32),
+        )
     }
 
     /// UpdateElem (`a[i]++`, `--a[i]`) where its value record says Number: the receiver's element
