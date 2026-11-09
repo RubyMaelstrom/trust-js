@@ -1,11 +1,15 @@
-//! The optimizing tier end to end (P3 stage 1, milestone 2): programs whose hot functions reach
-//! the second-stage checkpoints run with the tier on, eager, and with the forced-exit gate, and
-//! their results equal the bytecode VM's; a callee-free loop function runs in the tier's code;
-//! repeated exits move a function's new entries to the template JIT's code.
+//! The optimizing tier end to end (P3 stage 1, milestone 2; stage 2, step 3): programs whose hot
+//! functions reach the second-stage checkpoints run with the tier on, eager, and with the
+//! forced-exit gate, and their results equal the bytecode VM's; a callee-free loop function runs
+//! in the tier's code; repeated exits discard a function's code, and its recompile, past the
+//! warm-up, declines what exited.
 
+use super::ir::ExitReason;
+use super::profile::{self, ChunkProfile};
 use super::TestSwitches;
-use crate::bytecode::Tier;
+use crate::bytecode::{Chunk, Tier};
 use crate::{Completion, Engine};
+use std::rc::Rc;
 
 fn eval(engine: &mut Engine, source: &str) -> String {
     match engine.eval(source, false).expect("the program parses") {
@@ -21,12 +25,66 @@ fn run(tier: Tier, source: &str) -> String {
     eval(&mut engine, source)
 }
 
+/// An engine at the JIT tier that compiles every function at its first call.
+fn jit_engine() -> Engine {
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    engine
+}
+
+/// The tier on and eager, nothing forced.
+fn eager() -> TestSwitches {
+    TestSwitches {
+        on: true,
+        eager: true,
+        ..Default::default()
+    }
+}
+
 fn compiled() -> Vec<usize> {
     super::TEST_COMPILED.with(|compiled| std::mem::take(&mut *compiled.borrow_mut()))
 }
 
-fn exits() -> Vec<(u32, super::ir::ExitReason)> {
+fn exits() -> Vec<(u32, ExitReason)> {
     super::exit::TEST_EXITS.with(|exits| std::mem::take(&mut *exits.borrow_mut()))
+}
+
+/// The codes discards retired since the last call.
+fn discarded() -> Vec<usize> {
+    super::TEST_DISCARDED.with(|discarded| std::mem::take(&mut *discarded.borrow_mut()))
+}
+
+fn address(chunk: &Rc<Chunk>) -> usize {
+    Rc::as_ptr(chunk) as usize
+}
+
+/// Whether `code` is the tier's (it has an exit table), not the template JIT's.
+fn is_tier_code(code: &crate::jit::JitCode) -> bool {
+    super::exit::table_bytes(code.mem_ptr()) != 0
+}
+
+/// R: the discards of the function whose recompile `chunk` is.
+fn discards(chunk: &Chunk) -> u8 {
+    ChunkProfile::get(profile::first_stage(chunk)).map_or(0, ChunkProfile::discards)
+}
+
+/// The exit sites keyed on `chunk`: (pc, reason, inlined).
+fn sites_on(chunk: &Chunk) -> Vec<(u32, u8, bool)> {
+    let mut sites = Vec::new();
+    if let Some(profile) = ChunkProfile::get(chunk) {
+        for pc in 0..chunk.jit_ops().len() as u32 {
+            profile.sites_at(pc, |reason, inlined, _| sites.push((pc, reason, inlined)));
+        }
+    }
+    sites
+}
+
+/// The exit sites keyed on a recompile and on its function's first stage.
+fn sites(chunk: &Chunk) -> Vec<(u32, u8, bool)> {
+    let mut sites = sites_on(chunk);
+    sites.extend(sites_on(profile::first_stage(chunk)));
+    sites
 }
 
 /// Programs whose functions run past the second stage's checkpoints (100, 500, 2,100 and 8,500
@@ -99,6 +157,7 @@ fn results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits() {
                 on: true,
                 eager: false,
                 exit_every: 0,
+                ..Default::default()
             },
         ),
         (
@@ -107,6 +166,7 @@ fn results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits() {
                 on: true,
                 eager: true,
                 exit_every: 0,
+                ..Default::default()
             },
         ),
         (
@@ -115,6 +175,7 @@ fn results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits() {
                 on: true,
                 eager: true,
                 exit_every: 7,
+                ..Default::default()
             },
         ),
     ];
@@ -170,6 +231,7 @@ fn a_callee_free_loop_function_runs_in_the_tiers_code() {
         on: true,
         eager: true,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     let mut engine = Engine::new();
@@ -233,6 +295,7 @@ fn a_for_of_whose_binding_takes_its_handlers_operand_runs_in_the_tiers_code() {
         on: true,
         eager: true,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     let mut engine = Engine::new();
@@ -280,16 +343,16 @@ fn a_for_of_whose_binding_takes_its_handlers_operand_runs_in_the_tiers_code() {
 }
 
 #[test]
-fn repeated_exits_send_new_entries_to_the_template_jits_code() {
+fn under_no_reopt_repeated_exits_send_new_entries_to_the_template_jits_code_for_good() {
+    // TRUST_JS_OPT_NO_REOPT: stage 1's fallback, whose subject this is.
     TestSwitches {
         on: true,
         eager: true,
-        exit_every: 0,
+        no_reopt: true,
+        ..Default::default()
     }
     .set();
-    let mut engine = Engine::new();
-    engine.set_tier(Tier::Jit);
-    engine.set_tier_threshold(0);
+    let mut engine = jit_engine();
     compiled();
     eval(
         &mut engine,
@@ -297,15 +360,15 @@ fn repeated_exits_send_new_entries_to_the_template_jits_code() {
          let t = 0; for (let k = 0; k < 1000; k++) t += add(k, 1); t",
     );
     let chunk = second_stage(&mut engine, "add").expect("the tier compiled add");
-    assert!(compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)));
+    assert!(compiled().contains(&address(&chunk)));
     let optimized = chunk.jit.get().flatten().expect("resident");
     exits();
-    super::TEST_FELL_BACK.with(|fell| fell.borrow_mut().clear());
-    // Strings fail the Number checks: every call exits until the code falls back.
+    discarded();
+    // Strings fail the Number checks: every call exits until the code is discarded.
     assert_eq!(
         eval(
             &mut engine,
-            "let s = ''; for (let k = 0; k < 300; k++) s = add('', k % 10); s"
+            "let s = ''; for (let k = 0; k < 3000; k++) s = add('', k % 10); s"
         ),
         "9"
     );
@@ -313,12 +376,17 @@ fn repeated_exits_send_new_entries_to_the_template_jits_code() {
     assert_eq!(
         taken,
         super::EXIT_LIMIT as usize,
-        "no exit after the fallback"
+        "no exit after the discard"
     );
-    let fell = super::TEST_FELL_BACK.with(|fell| fell.borrow().clone());
-    assert_eq!(fell, vec![optimized.mem_ptr() as usize]);
+    assert_eq!(discarded(), vec![optimized.mem_ptr() as usize]);
     let now = chunk.jit.get().flatten().expect("the template JIT's code");
     assert!(!std::rc::Rc::ptr_eq(&now, &optimized));
+    assert!(!is_tier_code(&now));
+    // No profile, no R, no recompile.
+    assert_eq!(discards(&chunk), 0);
+    assert!(!super::reoptimizing(&chunk));
+    assert!(sites(&chunk).is_empty());
+    assert!(compiled().is_empty(), "no recompile");
     assert_eq!(eval(&mut engine, "add(2, 3) + add('a', 'b')"), "5ab");
     assert!(exits().is_empty());
     drop(optimized);
@@ -335,6 +403,7 @@ fn the_settled_feedback_rule_waits_for_an_unchanged_fingerprint() {
         on: true,
         eager: false,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     let mut engine = Engine::new();
@@ -369,6 +438,7 @@ fn the_settled_feedback_rule_waits_for_an_unchanged_fingerprint() {
         on: true,
         eager: true,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     super::forget(&chunk);
@@ -404,6 +474,7 @@ fn feedback_that_changes_at_every_checkpoint_compiles_at_the_last() {
         on: true,
         eager: false,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     let mut engine = Engine::new();
@@ -493,6 +564,7 @@ fn named_reads_on_primitives_stay_effects_and_never_exit() {
         on: true,
         eager: true,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     let mut engine = Engine::new();
@@ -552,6 +624,7 @@ fn a_site_that_sees_string_prototype_and_primitive_strings_stays_an_effect() {
             on: true,
             eager: true,
             exit_every: 0,
+            ..Default::default()
         }
         .set();
         let expected = run(Tier::Bytecode, program);
@@ -612,4 +685,495 @@ fn a_primitive_mark_survives_seeding_into_a_second_stage() {
         primitive_at(&second, method_pc(&second)),
         crate::bytecode::IC_PRIMITIVE_STRING
     );
+}
+
+/// One reason's convergence (the stage 2 design's Tests): `warm` runs the global function
+/// `name` until the tier, eager, compiled its second stage; `exit` then makes it exit for
+/// `reason` at its calls until the discard (100 exits), after which the template JIT's code and,
+/// from the warm-up's first checkpoint (200 native runs at R = 1), the tier's recompile run it
+/// without an exit; `after` runs the recompile. Every result equals the VM's. The second stage.
+fn converges(name: &str, warm: &str, exit: &str, after: &str, reason: ExitReason) -> Rc<Chunk> {
+    converges_with(name, warm, &|_| {}, exit, after, reason)
+}
+
+/// [`converges`], with `prepare` run on each engine before `exit`.
+fn converges_with(
+    name: &str,
+    warm: &str,
+    prepare: &dyn Fn(&mut Engine),
+    exit: &str,
+    after: &str,
+    reason: ExitReason,
+) -> Rc<Chunk> {
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        let warmed = eval(&mut vm, warm);
+        prepare(&mut vm);
+        [warmed, eval(&mut vm, exit), eval(&mut vm, after)]
+    };
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    exits();
+    discarded();
+    assert_eq!(eval(&mut engine, warm), expected[0], "{name}: warm");
+    let chunk = second_stage(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
+    assert!(compiled().contains(&address(&chunk)), "{name}: compiled");
+    let optimized = chunk.jit.get().flatten().expect("resident");
+    assert!(is_tier_code(&optimized), "{name}");
+    assert!(exits().is_empty(), "{name}: no exit while warm");
+    prepare(&mut engine);
+    assert_eq!(eval(&mut engine, exit), expected[1], "{name}: exit");
+    let taken = exits();
+    assert_eq!(
+        taken.len(),
+        super::EXIT_LIMIT as usize,
+        "{name}: exits until the discard and none after: {taken:?}"
+    );
+    assert!(
+        taken.iter().all(|&(_, why)| why == reason),
+        "{name}: {taken:?}"
+    );
+    assert_eq!(
+        discarded(),
+        vec![optimized.mem_ptr() as usize],
+        "{name}: one discard"
+    );
+    assert_eq!(discards(&chunk), 1, "{name}: R");
+    assert!(
+        compiled().contains(&address(&chunk)),
+        "{name}: the recompile"
+    );
+    assert!(!super::reoptimizing(&chunk), "{name}: the warm-up ended");
+    let now = chunk.jit.get().flatten().expect("resident");
+    assert!(
+        !Rc::ptr_eq(&now, &optimized) && is_tier_code(&now),
+        "{name}: the recompile is resident"
+    );
+    now.referenced.set(0);
+    assert_eq!(eval(&mut engine, after), expected[2], "{name}: after");
+    assert!(exits().is_empty(), "{name}: no exit after the recompile");
+    assert!(now.referenced.get() != 0, "{name}: the recompile ran");
+    drop((optimized, now));
+    super::release_retired(&mut engine.interp);
+    chunk
+}
+
+/// The tier's graph of `chunk` as a compile would build it now.
+fn graph_now(chunk: &Chunk) -> super::ir::Graph {
+    super::build::build(chunk, &super::snapshot::Snapshot::take(chunk)).expect("built")
+}
+
+/// The global `name`'s object, its shape made one no cache way takes, as a map's past the
+/// process's shape ids (`Props::force_uncacheable_shape_for_test`).
+fn make_uncacheable(engine: &mut Engine, name: &str) {
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var(name, &env).ok().expect("a global");
+    let object = value.as_obj().expect("an object");
+    object.borrow_mut().props.force_uncacheable_shape_for_test();
+}
+
+#[test]
+fn an_uncacheable_receiver_converges_on_the_generic_access() {
+    // Its exits fill no way: the cache's refused fill marks the site generic (W4 step 5), which
+    // the recompile reads, the profile's WrongShape site a backstop for compiles that read
+    // another site's cache (a splice elsewhere; `exit_sites_key_where_every_compile...`).
+    let chunk = converges_with(
+        "getx",
+        "function getx(o) { return o.x; }\n\
+         var p = {x: 1}, u = {x: 5};\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += getx(p); t",
+        &|engine| make_uncacheable(engine, "u"),
+        "let s = 0; for (let k = 0; k < 600; k++) s += getx(u); s",
+        "getx(u) * 10 + getx(p)",
+        ExitReason::WrongShape,
+    );
+    let graph = graph_now(&chunk);
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, super::ir::NodeOp::CheckShape(_))));
+}
+
+#[test]
+fn a_new_shape_that_fills_a_way_is_checked_again() {
+    // Its exits fill a second way: the recompile checks both shapes.
+    let chunk = converges(
+        "getx",
+        "function getx(o) { return o.x; }\n\
+         var p = {x: 1}, q = {x: 2, a: 0};\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += getx(p); t",
+        "let s = 0; for (let k = 0; k < 600; k++) s += getx(q); s",
+        "getx(q) * 10 + getx(p)",
+        ExitReason::WrongShape,
+    );
+    let graph = graph_now(&chunk);
+    assert!(graph.declines.is_empty(), "{:?}", graph.declines);
+    assert!(graph.nodes.iter().any(
+        |node| matches!(&node.op, super::ir::NodeOp::CheckShape(shapes) if shapes.len() == 2)
+    ));
+}
+
+#[test]
+fn strings_into_add_converge_on_the_generic_add() {
+    converges(
+        "add",
+        "function add(a, b) { return a + b; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += add(k, 1); t",
+        "let s = ''; for (let k = 0; k < 600; k++) s = add('', k % 10); s",
+        "add('a', 'b') + add(2, 3)",
+        ExitReason::NotNumber,
+    );
+}
+
+#[test]
+fn an_int32_overflow_converges_on_f64_arithmetic() {
+    // `(a | 0) + (b | 0)` adds proven int32s, whose int32 add ignores the records: only the
+    // profile's Overflow flag takes the recompile to f64.
+    let chunk = converges(
+        "f",
+        "function f(a, b) { return (a | 0) + (b | 0); }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = (t + f(k, 1)) % 1000; t",
+        "let u = 0; for (let k = 0; k < 600; k++) u = (u + f(2147483647, k)) % 1000003; u",
+        "f(2147483647, 2147483647) + f(1, 2)",
+        ExitReason::Overflow,
+    );
+    let graph = graph_now(&chunk);
+    use super::ir::NodeOp;
+    assert!(graph.nodes.iter().any(|node| node.op == NodeOp::F64Add));
+    assert!(!graph.nodes.iter().any(|node| node.op == NodeOp::I32Add));
+}
+
+#[test]
+fn a_fifth_shape_converges_on_the_generic_access() {
+    // Four shapes share `x`'s slot, which the code checks; a fifth fills no way.
+    converges(
+        "getx",
+        "function getx(o) { return o.x; }\n\
+         const four = [{x: 1}, {x: 2, a: 0}, {x: 3, b: 0}, {x: 4, c: 0}];\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += getx(four[k % 4]); t",
+        "const fifth = {x: 5, d: 0}; let u = 0; for (let k = 0; k < 600; k++) u += getx(fifth); u",
+        "getx({x: 6, e: 0}) + getx(four[0]) + getx(fifth)",
+        ExitReason::WrongShape,
+    );
+}
+
+#[test]
+fn a_call_over_four_callees_converges_on_the_guards_mismatch_edge() {
+    // Richards' `t.run()`: one callee while the second stage is built, which splices it; four
+    // afterwards, which the recompile's guard sends to the generic call in place.
+    let chunk = converges(
+        "runTask",
+        "function A() {} A.prototype.run = function () { return 1; };\n\
+         function B() {} B.prototype.run = function () { return 2; };\n\
+         function C() {} C.prototype.run = function () { return 3; };\n\
+         function D() {} D.prototype.run = function () { return 4; };\n\
+         function runTask(t) { return t.run(); }\n\
+         const tasks = [new A(), new B(), new C(), new D()];\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += runTask(tasks[0]); t",
+        "let u = 0; for (let k = 0; k < 600; k++) u += runTask(tasks[k % 4]); u",
+        "runTask(tasks[1]) * 1000 + runTask(tasks[2]) * 100 + runTask(tasks[3]) * 10 + \
+         runTask(tasks[0])",
+        ExitReason::WrongCallee,
+    );
+    let graph = graph_now(&chunk);
+    use super::ir::NodeOp;
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::CalleeMatches { .. })));
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::CheckCallee { .. })));
+}
+
+#[test]
+fn a_block_that_starts_to_run_converges_on_its_code() {
+    converges(
+        "nr",
+        "function nr(o, c) { if (c) { return o.y + 1; } return 1; }\n\
+         const p = {y: 1};\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += nr(p, false); t",
+        "let u = 0; for (let k = 0; k < 600; k++) u += nr(p, true); u",
+        "nr(p, true) * 10 + nr(p, false)",
+        ExitReason::NeverRan,
+    );
+}
+
+/// A run whose int32 sums overflow at every other call, over 20,000 calls after the warm-up.
+const FLIPPING: &str = "function f(a, b) { return (a | 0) + (b | 0); }\n\
+     let t = 0; for (let k = 0; k < 1000; k++) t = (t + f(k, 1)) % 1000;\n\
+     for (let k = 0; k < 20000; k++) t = (t + f(k % 2 ? 2147483647 : k, k)) % 1000003; t";
+
+/// [`FLIPPING`]'s result under `switches`, R and the discards of `f`.
+fn flipping(switches: TestSwitches) -> (String, u8, usize) {
+    switches.set();
+    let mut engine = jit_engine();
+    discarded();
+    let result = eval(&mut engine, FLIPPING);
+    let chunk = second_stage(&mut engine, "f").expect("f's second stage");
+    (result, discards(&chunk), discarded().len())
+}
+
+#[test]
+fn backoff_keeps_the_discards_of_flipping_overflows_logarithmic() {
+    let expected = run(Tier::Bytecode, FLIPPING);
+    // With the profile, the recompile takes f64 arithmetic: one discard.
+    let (result, r, count) = flipping(eager());
+    assert_eq!(result, expected);
+    assert_eq!((r, count), (1, 1));
+    // Without it every recompile overflows again: each discard doubles the next code's limit
+    // (100 << R exits) and the warm-up before its recompile, so that 20,000 calls make no more
+    // than log2(20,000 / 100) discards, and R counts them.
+    let (result, r, count) = flipping(TestSwitches {
+        no_exit_profile: true,
+        ..eager()
+    });
+    assert_eq!(result, expected);
+    assert!((2..=7).contains(&count), "{count} discards");
+    assert_eq!(usize::from(r), count);
+}
+
+#[test]
+fn a_discard_of_unfixable_exits_only_arms_no_recompile() {
+    // `throw k` in a try exits to the VM, which runs the catch: nothing to decline.
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    eval(
+        &mut engine,
+        "function risky(k) { try { if (k < 0) throw k; return k; } catch (e) { return -1; } }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += risky(k); t",
+    );
+    let chunk = second_stage(&mut engine, "risky").expect("risky's second stage");
+    assert!(compiled().contains(&address(&chunk)));
+    let optimized = chunk.jit.get().flatten().expect("resident");
+    exits();
+    discarded();
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let u = 0; for (let k = 0; k < 3000; k++) u += risky(-1 - k % 2); u"
+        ),
+        "-3000"
+    );
+    let taken = exits();
+    assert_eq!(taken.len(), super::EXIT_LIMIT as usize);
+    assert!(
+        taken
+            .iter()
+            .all(|&(_, why)| matches!(why, ExitReason::Unsupported | ExitReason::Throw)),
+        "{taken:?}"
+    );
+    assert_eq!(discarded(), vec![optimized.mem_ptr() as usize]);
+    assert_eq!(discards(&chunk), 1, "a discard all the same");
+    assert!(!super::reoptimizing(&chunk), "no warm-up");
+    assert!(sites(&chunk).is_empty(), "nothing flagged");
+    assert!(compiled().is_empty(), "no recompile");
+    let now = chunk.jit.get().flatten().expect("the template JIT's code");
+    assert!(!is_tier_code(&now));
+}
+
+#[test]
+fn a_long_activation_finishes_in_its_discarded_code_while_later_calls_run_the_new() {
+    // f(x, n) for n > 0 calls f(x, 0) n times, which adds 1 to x: the outer activation runs the
+    // tier's code while its inner calls exit on a String, until the discard; it finishes in the
+    // discarded code, its later inner calls in the template JIT's.
+    const SOURCE: &str = "function f(x, n) { if (n > 0) { for (let k = 0; k < n; k++) f(x, 0); \
+         return n; } return x + 1; }\n\
+         let w = 0; for (let k = 0; k < 300; k++) w += f(k, 3); w";
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    eval(&mut engine, SOURCE);
+    let chunk = second_stage(&mut engine, "f").expect("f's second stage");
+    assert!(compiled().contains(&address(&chunk)));
+    let optimized = chunk.jit.get().flatten().expect("resident");
+    exits();
+    discarded();
+    assert_eq!(eval(&mut engine, "f('s', 150)"), "150");
+    let taken = exits();
+    assert_eq!(taken.len(), super::EXIT_LIMIT as usize, "{taken:?}");
+    let add = taken[0].0;
+    assert!(
+        taken
+            .iter()
+            .all(|&(pc, why)| pc == add && why == ExitReason::NotNumber),
+        "only the inner calls exit, at their Add: {taken:?}"
+    );
+    assert_eq!(discarded(), vec![optimized.mem_ptr() as usize]);
+    // Kept while the outer activation ran it; released once nothing does.
+    assert!(engine
+        .interp
+        .opt_retired
+        .iter()
+        .any(|code| Rc::ptr_eq(code, &optimized)));
+    let retired = optimized.mem_ptr() as usize;
+    drop(optimized);
+    super::release_retired(&mut engine.interp);
+    assert!(engine
+        .interp
+        .opt_retired
+        .iter()
+        .all(|code| code.mem_ptr() as usize != retired));
+    // Later calls: the template JIT's code, then from the warm-up's checkpoint the recompile,
+    // which takes the generic add.
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let v = ''; for (let k = 0; k < 400; k++) v = f('t' + k % 3, 0); v"
+        ),
+        "t01"
+    );
+    assert!(exits().is_empty());
+    assert!(compiled().contains(&address(&chunk)), "the recompile");
+    let now = chunk.jit.get().flatten().expect("resident");
+    assert!(is_tier_code(&now));
+    assert_eq!(eval(&mut engine, "f('u', 0) + f(1, 0) + f(2, 4)"), "u124");
+    assert!(exits().is_empty());
+}
+
+#[test]
+fn forced_exits_record_nothing() {
+    TestSwitches {
+        exit_every: 3,
+        ..eager()
+    }
+    .set();
+    let mut engine = jit_engine();
+    compiled();
+    exits();
+    discarded();
+    assert_eq!(
+        eval(
+            &mut engine,
+            "function add(a, b) { return a + b; }\n\
+             let t = 0; for (let k = 0; k < 3000; k++) t += add(k, 0.5); t"
+        ),
+        "4500000"
+    );
+    let chunk = second_stage(&mut engine, "add").expect("add's second stage");
+    assert!(compiled().contains(&address(&chunk)));
+    let taken = exits();
+    assert!(
+        taken.len() > super::EXIT_LIMIT as usize,
+        "forced exits past the limit: {}",
+        taken.len()
+    );
+    assert!(taken.iter().all(|&(_, why)| why == ExitReason::Forced));
+    assert!(discarded().is_empty(), "forced exits discard nothing");
+    assert_eq!(discards(&chunk), 0);
+    assert!(sites(&chunk).is_empty(), "nothing flagged");
+    let code = chunk.jit.get().flatten().expect("resident");
+    assert!(is_tier_code(&code));
+}
+
+#[test]
+fn a_stale_chains_recompile_is_compiled_by_the_tier() {
+    // A discarded second stage runs the template JIT's code, whose operator chains bake the
+    // shapes its caches held (`jit::build_chain`); a second class's replays ask for the recompile
+    // without chains (`Chunk::note_chain_replay`), code3, which the tier compiles as it does a
+    // second stage, before the warm-up's own checkpoint.
+    TestSwitches {
+        exit_limit: 1,
+        ..eager()
+    }
+    .set();
+    let mut engine = jit_engine();
+    compiled();
+    discarded();
+    eval(
+        &mut engine,
+        "function A(x) { this.x = x; } function B(x) { this.y = 0; this.x = x; }\n\
+         function one() { return 1; }\n\
+         function staged(o) { var k = one(); if (o.x < 50) return k; return 0; }\n\
+         var a = new A(1), b = new B(2), t = 0;\n\
+         for (var i = 0; i < 300; i++) t += staged(a); t",
+    );
+    let code2 = second_stage(&mut engine, "staged").expect("staged's second stage");
+    assert!(compiled().contains(&address(&code2)));
+    // A primitive receiver fails the shape check: at the limit of 1, the discard.
+    assert_eq!(eval(&mut engine, "staged(5)"), "0");
+    assert_eq!(discarded().len(), 1);
+    assert!(super::reoptimizing(&code2));
+    assert!(
+        code2.property_chains.get(),
+        "the template JIT's code builds chains"
+    );
+    assert_eq!(
+        eval(
+            &mut engine,
+            "for (var i = 0; i < 150; i++) t += staged(b); t"
+        ),
+        "450"
+    );
+    let code3 = {
+        let env = engine.interp.global_env;
+        let value = engine.interp.get_var("staged", &env).ok().unwrap();
+        let object = value.as_obj().unwrap();
+        let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+            panic!("an author function")
+        };
+        user.func.runtime().code3.get().and_then(Option::clone)
+    }
+    .expect("the recompile without property chains");
+    assert!(code3.no_property_chains.get());
+    assert!(
+        compiled().contains(&address(&code3)),
+        "the tier compiled it"
+    );
+    let code = code3.jit.get().flatten().expect("resident");
+    assert!(is_tier_code(&code));
+    code.referenced.set(0);
+    assert_eq!(
+        eval(&mut engine, "staged(a) + staged(b) + staged({x: 99})"),
+        "2"
+    );
+    assert!(code.referenced.get() != 0, "later calls run it");
+}
+
+#[test]
+fn the_exit_limit_doubles_with_r_up_to_its_cap() {
+    eager().set();
+    let mut engine = jit_engine();
+    eval(&mut engine, "function g(a) { return a; } g(1);");
+    let chunk = first_stage(&mut engine, "g");
+    assert_eq!(super::exit_limit(&chunk), 100);
+    let profile = ChunkProfile::of(&chunk);
+    assert_eq!(profile.add_discard(), 1);
+    assert_eq!(super::exit_limit(&chunk), 200);
+    for _ in 0..30 {
+        profile.add_discard();
+    }
+    // R stops where the warm-up's last checkpoint, 6,400 << R runs away, still fits its word.
+    assert_eq!(profile.discards(), profile::MAX_DISCARDS);
+    assert_eq!(super::exit_limit(&chunk), 100 << 19);
+    assert!(6400u64 << profile::MAX_DISCARDS <= u64::from(u32::MAX));
+    TestSwitches {
+        exit_limit: 1,
+        ..eager()
+    }
+    .set();
+    assert_eq!(super::exit_limit(&chunk), 1 << 19);
+}
+
+#[test]
+fn an_exit_limit_of_one_cycles_reoptimization_and_results_hold() {
+    // TRUST_JS_OPT_EXIT_LIMIT=1, the gates' cycling configuration: each code is discarded at its
+    // first exit (the limit 100 << R becomes 1 << R).
+    let switches = TestSwitches {
+        exit_limit: 1,
+        ..eager()
+    };
+    let mut compiles = 0;
+    for program in PROGRAMS {
+        let expected = run(Tier::Bytecode, program);
+        compiled();
+        assert_eq!(with_switches(switches, program), expected, "{program}");
+        compiles += compiled().len();
+    }
+    assert!(compiles > 0);
 }

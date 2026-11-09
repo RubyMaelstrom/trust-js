@@ -24,9 +24,12 @@
 //! decrements `Interp::opt_exit_countdown` and exits when it reaches zero; the deoptimizer then
 //! counts the exit as forced and starts the countdown again from `Interp::opt_exit_every`.
 //!
-//! Repeated exits: a table counts its code's exits, forced ones left out, and at
-//! `opt::EXIT_LIMIT` the deoptimizer has new entries take the template JIT's code instead
-//! (`opt::fall_back`).
+//! Repeated exits (stage 2's point 12): each record counts its exits and the table their total,
+//! forced ones left out, and at the table's limit (`opt::exit_limit`, 100 << R) the deoptimizer
+//! discards the code before its VM run (`opt::discard`): new entries take the template JIT's
+//! code, and the records' counts become the exit profile. Activations still running a discarded
+//! code finish in it, and their exits count without triggering anything again, as JSC's exit
+//! returns early for a jettisoned code block (dfg/DFGOperations.cpp:6664-6672).
 
 use super::ir::{ExitReason, Rep};
 
@@ -71,8 +74,12 @@ pub(crate) struct ExitRecord {
     /// The handler records active at `pc`, innermost last: (push pc, operand depth at the push).
     pub(crate) handlers: Box<[(u32, u32)]>,
     /// A shape check's receiver and expected shapes, which a WrongShape exit's log line shows
-    /// (`describe_receiver`).
+    /// (`describe_receiver`) and the exit profile keeps the count of.
     pub(crate) shape_check: Option<Box<ShapeCheck>>,
+    /// The exits taken here, forced ones left out: a discard tallies the records with one, as
+    /// JSC's tallyFrequentExitSites tallies the exits its code took
+    /// (bytecode/CodeBlock.cpp:3094-3120).
+    pub(crate) count: std::cell::Cell<u32>,
 }
 
 /// What a shape check tested: the receiver word's source at the check, and its shapes.
@@ -92,8 +99,13 @@ pub(crate) struct ExitTable {
     pub(crate) exits: Vec<ExitRecord>,
     /// The function's name, for the log.
     pub(crate) name: Box<str>,
-    /// The exits taken so far, forced ones left out (`opt::fall_back` at `opt::EXIT_LIMIT`).
+    /// The exits taken so far, forced ones left out.
     pub(crate) taken: std::cell::Cell<u32>,
+    /// The exits past which the code is discarded (`opt::exit_limit` when it was compiled), so
+    /// that an exit reads no chunk to decide.
+    pub(crate) limit: u32,
+    /// Whether the code was discarded (`opt::discard`).
+    pub(crate) discarded: std::cell::Cell<bool>,
 }
 
 /// The save area the exit stub makes (ARM64): x0..x29 at words 0..29, d0..d31 at words 30..61;
@@ -339,13 +351,14 @@ pub(crate) unsafe extern "C" fn deoptimize(
         },
     };
     if reason != ExitReason::Forced {
-        // Repeated exits: at the limit, new entries stop using this code (`opt::fall_back`);
-        // this activation finishes in it, as any other running it does. The frame holds every
-        // value by now, so the fallback's compile may allocate.
+        // Repeated exits: at the limit, the code is discarded once (`opt::discard`) and new
+        // entries stop using it; this activation finishes in the VM, any other running it in it.
+        // The frame holds every value by now, so the discard's compile may allocate.
+        exit.count.set(exit.count.get().saturating_add(1));
         let taken = table.taken.get().saturating_add(1);
         table.taken.set(taken);
-        if taken == super::EXIT_LIMIT {
-            super::fall_back(i, chunk);
+        if taken >= table.limit && !table.discarded.get() {
+            super::discard(i, chunk, table);
         }
     }
     ctx.handlers.clear();

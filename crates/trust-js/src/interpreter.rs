@@ -4756,8 +4756,8 @@ pub struct Interp {
         expect(dead_code, reason = "only the tier's back end reads the gate")
     )]
     pub(crate) opt_exit_every: u32,
-    /// The optimizing tier's codes that repeated exits retired (`opt::fall_back`): no entry takes
-    /// them any more, and each stays until no activation runs it (`opt::release_retired`).
+    /// The native codes the optimizing tier replaced (`opt::discard`, `opt::reoptimize`): no entry
+    /// takes them any more, and each stays until no activation runs it (`opt::release_retired`).
     pub(crate) opt_retired: Vec<Rc<crate::jit::JitCode>>,
     /// Execution tier (env `TRUST_JS_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
     /// default; `Interp` is the reference tree-walker, opt-in via `TRUST_JS_TIER=interp`.
@@ -16614,6 +16614,13 @@ impl Interp {
         {
             return;
         }
+        // A chunk whose optimized code was discarded after repeated exits counts its warm-up
+        // toward the optimizing tier's recompile on its checkpoint word (P3 stage 2): the due
+        // checkpoint is the tier's.
+        if crate::opt::reoptimizing(chunk) {
+            crate::opt::reoptimize(self, chunk);
+            return;
+        }
         // With the optimizing tier on (P3 stage 1), the checkpoints advance as ever, but the
         // tier's settled-feedback rule below decides when the second stage is built, in place of
         // the planner's test for changed call feedback.
@@ -16747,6 +16754,11 @@ impl Interp {
         else {
             return decline("the compile failed");
         };
+        // With the optimizing tier on, the tier generates its native code as a second stage's
+        // (P3 stage 2): a refusal keeps the template JIT's, made at its first native entry.
+        if crate::opt::enabled() {
+            crate::opt::compile_into(self, &chunk3);
+        }
         let slot = if second_stage {
             &runtime.code3
         } else {

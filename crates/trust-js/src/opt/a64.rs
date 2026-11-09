@@ -451,6 +451,7 @@ impl<'a> Gen<'a> {
             last_effect: None,
             table: Box::new(ExitTable {
                 name: format!("fn({name})").into_boxed_str(),
+                limit: crate::opt::exit_limit(chunk),
                 ..ExitTable::default()
             }),
         }
@@ -796,6 +797,7 @@ impl Gen<'_> {
             stack: stack.into(),
             handlers: state.handlers.clone(),
             shape_check: None,
+            count: Cell::new(0),
         };
         let site = self.a.new_label();
         let ret = self.a.new_label();
@@ -1019,6 +1021,7 @@ impl Gen<'_> {
                 self.gp_done(n, dst);
             }
             NodeOp::CheckCallee { target } => self.lower_check_callee(n, *target)?,
+            NodeOp::CalleeMatches { target } => self.lower_callee_matches(n, *target)?,
             NodeOp::I32ToF64 => {
                 if !unused {
                     let w = self.gp(input(0), X16);
@@ -1407,6 +1410,60 @@ impl Gen<'_> {
             self.a.cmn_imm_x(X17, 7);
             self.a.b_cond(NE, site);
         }
+        Ok(())
+    }
+
+    /// A guard's test without an exit (CalleeMatches): `lower_check_callee`'s comparisons, each
+    /// mismatch giving false. The result is written after every input is read, since its home
+    /// may be an input's whose range ends here.
+    fn lower_callee_matches(&mut self, n: NodeIx, target: u32) -> Result<(), Refusal> {
+        let node = self.graph.node(n);
+        let it = self.chunk.jit_inline_target(target);
+        let mismatch = self.a.new_label();
+        let done = self.a.new_label();
+        // A dead callee never matches.
+        let stored = it.pin.upgrade().map(|object| {
+            let some: Option<crate::value::Gc> = Some(object);
+            unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
+        });
+        if let Some(stored) = stored {
+            let callee = self.gp(node.inputs[0], X16);
+            if it.expected_env != 0 {
+                self.a
+                    .ldr_imm(X17, 19, std::mem::offset_of!(JitCtx, env_raw) as u32);
+                self.a.mov_imm64(X30, it.expected_env as u64);
+                self.a.cmp_reg_x(X17, X30);
+                self.a.b_cond(NE, mismatch);
+            }
+            self.a
+                .ldr_imm(X17, 19, std::mem::offset_of!(JitCtx, genv) as u32);
+            self.a.mov_imm64(X30, it.expected_genv as u64);
+            self.a.cmp_reg_x(X17, X30);
+            self.a.b_cond(NE, mismatch);
+            self.a
+                .mov_imm64(X17, crate::value::PACK_OBJ | stored as u64);
+            self.a.cmp_reg_x(callee, X17);
+            self.a.b_cond(NE, mismatch);
+            if it.check_this {
+                let receiver = *node.inputs.get(1).ok_or(Refusal::at(
+                    node.pc as usize,
+                    "a callee test of `this` without the receiver",
+                ))?;
+                let word = self.gp(receiver, X16);
+                self.a.asr_imm(X17, word, 48);
+                self.a.cmn_imm_x(X17, 7);
+                self.a.b_cond(NE, mismatch);
+            }
+        } else {
+            self.a.b(mismatch);
+        }
+        let w = self.gp_dst(n);
+        self.a.movz(w, 1, 0);
+        self.a.b(done);
+        self.a.bind(mismatch);
+        self.a.movz(w, 0, 0);
+        self.a.bind(done);
+        self.gp_done(n, w);
         Ok(())
     }
 

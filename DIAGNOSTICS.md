@@ -60,21 +60,44 @@ comment/example in the same change.
   second stage is built as without the tier, a function with nothing to splice getting its own
   chunk again, and the tier generates its native code in place of the template JIT: a refused
   second stage keeps the template JIT's code, and a refused chunk with nothing spliced is
-  dropped, the function keeping its first stage. A failed speculation exits to the bytecode VM,
-  which finishes the call; after 100 exits of one code object, new entries take the template
-  JIT's code. Under `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, without
+  dropped, the function keeping its first stage (a stale chain's recompile, `code3`, is compiled
+  by the tier too). A failed speculation exits to the bytecode VM, which finishes the call.
+  After 100 << R exits of one code object (R, the function's discards so far, up to 19) the code
+  is discarded: new entries take the template JIT's code (a compile deferred for executable
+  capacity leaves the chunk to compile at its next entry), activations still running it finish
+  in it, each exit site but throws and unsupported operations is flagged in the function's exit
+  profile, R grows, and the second stage's warm-up begins: checkpoints (100, 400, 1,600, 6,400)
+  << R native runs apart, at which, once the feedback fingerprint is unchanged since the last
+  (or at the last checkpoint), the tier compiles the chunk again, declining what the profile
+  flagged (the generic operation for NotNumber, f64 for NotInt32 and Overflow, the generic
+  access for WrongShape unless the site's ways grew, the guard's mismatch edge for WrongCallee,
+  the block for NeverRan). A discard whose exits were all throws or unsupported operations arms
+  no recompile. Each discard and each recompile moves the call caches' epoch. Under
+  `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, a recompile's too, without
   waiting for the feedback to settle (the eager gate: V8's `--stress-maglev`).
   `TRUST_JS_OPT_EXIT_EVERY=N` compiles every check and effect of the tier's code with a
   countdown that exits at every Nth one (the forced-exit gate: V8's `--deopt-every-n-times`);
-  forced exits are not counted against the 100. `TRUST_JS_OPT_LOG=1` prints one stderr line
-  per compile (with its time and code range, `at <base> <length>` in hex), refusal (with its
-  reason and pc), wait for settled feedback (with the function and checkpoint), compile of
-  unsettled feedback at the last checkpoint, exit (with its pc, reason and kind, and for a shape
-  check's the shapes it expected and the receiver's, or what the receiver is when it is no
-  object), and fallback, and one per template JIT compile of a second stage: `[opt] template
-  <base> <length> <name> (second stage|fallback)`, the code of a second stage the tier refused
-  (or of a loop's borrowed-frame entry) or of a fallback. A profile's samples join to these
-  ranges, since the perf map names a second stage's template code `JS:^`, as its first stage's.
+  forced exits neither count toward the limit nor flag anything.
+  `TRUST_JS_OPT_EXIT_LIMIT=N` (a positive N) sets the limit's base in place of 100: 1 discards
+  each code at its first exit, the configuration that cycles reoptimization.
+  `TRUST_JS_OPT_NO_REOPT=1` keeps stage 1's fallback for good: a discard flags nothing, adds
+  nothing to R and arms no recompile. `TRUST_JS_OPT_NO_EXIT_PROFILE=1` flags nothing, so that
+  recompiles decline nothing (the feedback alone guides them). `TRUST_JS_OPT_LOG=1` prints one
+  stderr line per compile (with its time and code range, `at <base> <length>` in hex), refusal
+  (with its reason and pc), decline (`[opt] declined <name> pc <pc> <reason>: <form built>`),
+  wait for settled feedback (with the function and checkpoint, a warm-up's marked
+  `(reoptimization)`), compile of unsettled feedback at the last checkpoint, exit (with its pc,
+  reason and kind, and for a shape check's the shapes it expected and the receiver's, or what the
+  receiver is when it is no object), discard (`[opt] discarded <name> after <n> exits (limit
+  <l>, R <r> -> <r'>) for <what new entries run>: pc <pc> <reason> x<count>, ...`), new exit
+  site (`[opt] flag <name> pc <pc> <reason> own|at <baseline name> pc <pc>[ (spliced)]`), discard
+  of unfixable exits only (`[opt] not reoptimized <name>: unfixable exits only`), recompile
+  (`[opt] reoptimizing <name> at checkpoint <k> (R <r>)`) and epoch move (`[opt] epoch moved
+  (discard|reoptimization), <n> by the tier`), and one per template JIT compile of a second
+  stage: `[opt] template <base> <length> <name> (second stage|fallback)`, the code of a second
+  stage the tier refused (or of a loop's borrowed-frame entry) or of a discard. A profile's
+  samples join to these ranges, since the perf map names a second stage's template code `JS:^`,
+  as its first stage's.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at

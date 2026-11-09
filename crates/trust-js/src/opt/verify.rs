@@ -341,7 +341,8 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::Phi
         | NodeOp::Projection(_)
         | NodeOp::Effect { .. }
-        | NodeOp::CheckCallee { .. } => return None,
+        | NodeOp::CheckCallee { .. }
+        | NodeOp::CalleeMatches { .. } => return None,
     })
 }
 
@@ -404,7 +405,7 @@ fn representations(
                 return Err(format!("a {:?} effect", node.rep));
             }
         }
-        &NodeOp::CheckCallee { target } => {
+        &NodeOp::CheckCallee { target } | &NodeOp::CalleeMatches { target } => {
             // The guard's InlineGuard is at the node's pc; its inputs are the callee's word and,
             // for a guard of `this`, the receiver's.
             let Some(&Op::InlineGuard(guard, _)) = chunk.jit_ops().get(node.pc as usize) else {
@@ -417,8 +418,15 @@ fn representations(
             if reps.len() != inputs || reps.iter().any(|&rep| rep != Rep::Tagged) {
                 return Err(format!("operands {reps:?} for {inputs} words"));
             }
-            if !matches!(node.rep, Rep::None | Rep::Tagged) {
-                return Err(format!("a {:?} callee check", node.rep));
+            let check = matches!(node.op, NodeOp::CheckCallee { .. });
+            if (check && !matches!(node.rep, Rep::None | Rep::Tagged))
+                || (!check && node.rep != Rep::Bool)
+            {
+                return Err(format!(
+                    "a {:?} callee {}",
+                    node.rep,
+                    if check { "check" } else { "test" }
+                ));
             }
         }
         op => {

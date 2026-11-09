@@ -16,9 +16,11 @@
 //! - `regalloc` and `a64`: registers and ARM64 code, the effects through the baseline templates,
 //!   the exits;
 //! - `exit`: the recipes and the deoptimizer that rebuilds the canonical frame and resumes the
-//!   chunk in the VM;
-//! - `driver`: the switches, the settled-feedback rule, the pipeline's run and the fall-back from
-//!   code that exits too often.
+//!   chunk in the VM, and the exits' counts;
+//! - `profile`: what a chunk carries for the tier (its settled-feedback fingerprint, the exit
+//!   profile, R, a discarded second stage's warm-up);
+//! - `driver`: the switches, the settled-feedback rule, the pipeline's run, the discard of code
+//!   that exits too often and its reoptimization (stage 2, step 3).
 //!
 //! x86-64 builds none of the back end until the plan's stage 6: there the tier is off, and the
 //! front end is built only for its tests.
@@ -54,6 +56,8 @@ pub(crate) mod exit;
     )
 ))]
 pub(crate) mod ir;
+// Every chunk carries the record's cell (`Chunk::opt`), wherever the tier has a back end or not.
+pub(crate) mod profile;
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -126,6 +130,12 @@ mod off {
         false
     }
 
+    pub(crate) fn reoptimizing(_: &Chunk) -> bool {
+        false
+    }
+
+    pub(crate) fn reoptimize(_: &mut Interp, _: &Chunk) {}
+
     /// No code has an exit table.
     pub(crate) mod exit {
         pub(crate) fn release(_: *const u8) {}
@@ -165,6 +175,9 @@ pub(crate) fn pin_forced_exits_off_for_test() {
         on: enabled(),
         eager: eager(),
         exit_every: 0,
+        no_reopt: no_reopt(),
+        no_exit_profile: no_exit_profile(),
+        exit_limit: exit_limit_base(),
     }
     .set();
 }

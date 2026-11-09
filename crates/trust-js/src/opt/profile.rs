@@ -1,0 +1,166 @@
+//! The optimizing tier's record of a chunk (P3 stage 2, step 3; the plan's point 12 and the
+//! stage's "Step 3, the exit profile and reoptimization"): what a chunk carries for the tier, made
+//! at its first use and dropped with the chunk, so that no record outlives its chunk or passes to
+//! a later chunk at the same address. It holds integers only: no GC edge.
+//!
+//! - The feedback fingerprint the settled-feedback rule recorded at the chunk's last checkpoint
+//!   (`opt::settled`): a first stage's before its second stage is built, a discarded second
+//!   stage's during its warm-up.
+//! - The exit profile: the sites whose exits a discarded code took, each a (pc, reason, inlined)
+//!   key, as JSC's DFG::ExitProfile keys a site by its bytecode index, its exit kind and its
+//!   inline kind (bytecode/DFGExitProfile.h:45-145). A key lives on the baseline chunk the
+//!   discarded second stage's record map names for the exit's pc, so that every later compile of
+//!   that site finds it (the second stage again, another caller's splice, the callee's own second
+//!   stage), as JSC adds a site to the code block of the exit's semantic origin
+//!   (bytecode/DFGExitProfile.cpp:44-75); a pc the map names nothing for keys on the second stage
+//!   itself. A WrongShape key keeps the most shapes a discarded check at its site expected, which
+//!   tells a recompile whether the site's ways grew since.
+//! - R, the function's count of discards, on its first stage, as JSC keeps its reoptimization
+//!   retry counter on the baseline code block (bytecode/CodeBlock.cpp:2478-2483).
+//! - A discarded second stage's warm-up: its next checkpoint toward the recompile and the native
+//!   run count it is due at.
+//!
+//! Only the tier's back end reads and writes the record (`snapshot`, `driver`): where it has none
+//! (x86-64 until the plan's stage 6) a chunk carries an empty cell.
+#![cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+
+use crate::bytecode::Chunk;
+use std::cell::{Cell, RefCell};
+
+/// The most discards R counts: the warm-up's last checkpoint, 6,400 << R native runs away, then
+/// still fits the u32 checkpoint word, as JSC's cap comes from its counter's range
+/// (runtime/Options.cpp:940-947). Optimization is never disabled for good.
+pub(crate) const MAX_DISCARDS: u8 = 19;
+
+/// A chunk's record (see the module's doc).
+#[derive(Debug, Default)]
+pub(crate) struct ChunkProfile {
+    settling: Cell<Option<u64>>,
+    /// The exit sites, ascending by key: `pc << 8 | reason << 1 | inlined`, and for a WrongShape
+    /// key the most shapes a discarded check there expected (0 otherwise).
+    sites: RefCell<Vec<(u32, u8)>>,
+    discards: Cell<u8>,
+    /// The warm-up's next checkpoint (1 to 4), 0 while none is armed.
+    warm_up: Cell<u8>,
+    /// The native run count the warm-up's next checkpoint is due at.
+    warm_up_at: Cell<u32>,
+}
+
+/// The key of an exit site.
+fn key(pc: u32, reason: u8, inlined: bool) -> u32 {
+    debug_assert!(pc <= crate::feedback::RecordMap::MAX_PC as u32 && reason < 0x80);
+    pc << 8 | u32::from(reason) << 1 | u32::from(inlined)
+}
+
+impl ChunkProfile {
+    /// `chunk`'s record, made at its first use.
+    pub(crate) fn of(chunk: &Chunk) -> &ChunkProfile {
+        chunk.opt.get_or_init(Box::default)
+    }
+
+    /// `chunk`'s record, if it has one.
+    pub(crate) fn get(chunk: &Chunk) -> Option<&ChunkProfile> {
+        chunk.opt.get().map(|profile| &**profile)
+    }
+
+    /// Record the fingerprint of this checkpoint; the previous checkpoint's.
+    pub(crate) fn settle(&self, print: u64) -> Option<u64> {
+        self.settling.replace(Some(print))
+    }
+
+    /// The chunk's checkpoints ended, or its wait starts afresh.
+    pub(crate) fn unsettle(&self) {
+        self.settling.set(None);
+    }
+
+    /// Add the exit site (`pc`, the reason's code, `inlined`), with the shapes its check expected
+    /// for a WrongShape site: whether the site is new.
+    pub(crate) fn add_site(&self, pc: u32, reason: u8, inlined: bool, ways: u8) -> bool {
+        let key = key(pc, reason, inlined);
+        let mut sites = self.sites.borrow_mut();
+        match sites.binary_search_by_key(&key, |&(key, _)| key) {
+            Ok(at) => {
+                sites[at].1 = sites[at].1.max(ways);
+                false
+            }
+            Err(at) => {
+                sites.insert(at, (key, ways));
+                true
+            }
+        }
+    }
+
+    /// Whether the record holds exit sites.
+    pub(crate) fn has_sites(&self) -> bool {
+        !self.sites.borrow().is_empty()
+    }
+
+    /// The exit sites at `pc`: each one's reason code, whether it is inlined, and its shapes.
+    pub(crate) fn sites_at(&self, pc: u32, mut each: impl FnMut(u8, bool, u8)) {
+        let sites = self.sites.borrow();
+        let first = sites.partition_point(|&(key, _)| key < pc << 8);
+        for &(key, ways) in sites[first..]
+            .iter()
+            .take_while(|&&(key, _)| key >> 8 == pc)
+        {
+            each((key >> 1 & 0x7f) as u8, key & 1 != 0, ways);
+        }
+    }
+
+    /// R, the function's discards so far (on its first stage).
+    pub(crate) fn discards(&self) -> u8 {
+        self.discards.get()
+    }
+
+    /// Count a discard; the new R.
+    pub(crate) fn add_discard(&self) -> u8 {
+        let r = self.discards.get().saturating_add(1).min(MAX_DISCARDS);
+        self.discards.set(r);
+        r
+    }
+
+    /// The warm-up's next checkpoint and the run count it is due at, while one is armed.
+    pub(crate) fn warm_up(&self) -> Option<(u8, u32)> {
+        let checkpoint = self.warm_up.get();
+        (checkpoint != 0).then(|| (checkpoint, self.warm_up_at.get()))
+    }
+
+    /// Arm the warm-up's `checkpoint`, due at `at` native runs.
+    pub(crate) fn arm(&self, checkpoint: u8, at: u32) {
+        self.warm_up.set(checkpoint);
+        self.warm_up_at.set(at);
+    }
+
+    /// The warm-up ends: its recompile was made, or refused, or none follows.
+    pub(crate) fn disarm(&self) {
+        self.warm_up.set(0);
+    }
+
+    /// Heap bytes the record holds (the memory census).
+    pub(crate) fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.sites.borrow().capacity() * 8
+    }
+}
+
+/// The function's first stage, which holds R and the keys of its own sites: the baseline chunk
+/// a recompile's record map names first, or the chunk itself, which has no map.
+pub(crate) fn first_stage(chunk: &Chunk) -> &Chunk {
+    chunk
+        .feedback_vector()
+        .record_map()
+        .and_then(|map| map.targets().first())
+        .map_or(chunk, |first| &**first)
+}
+
+/// The baseline chunk and pc a recompile's record map names for its `pc`, and whether the site
+/// is a splice's; None for a pc the map names nothing for (guards, calls, block starts that are
+/// no value or named site), and for a chunk without a map.
+pub(crate) fn baseline_site(chunk: &Chunk, pc: usize) -> Option<(&Chunk, usize, bool)> {
+    chunk.feedback_vector().record_map()?.site(pc)
+}

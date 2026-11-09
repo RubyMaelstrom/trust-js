@@ -66,7 +66,8 @@ pub(crate) enum Cond {
     Ne,
 }
 
-/// Why a check fails or an exit is taken, for the log, the exit profile (stage 2) and tests.
+/// Why a check fails or an exit is taken, for the log, the exit profile (stage 2; keyed by the
+/// reason's discriminant, `opt::profile`) and tests.
 // Only the back end builds the reasons of exits on objects and Booleans and of the forced-exit
 // gate: where the tier has none (x86-64 until the plan's stage 6), nothing builds those three.
 #[cfg_attr(
@@ -156,6 +157,13 @@ pub(crate) enum NodeOp {
     /// the expected callee cell, its closure environment and the planning Realm's global
     /// environment are the chunk's InlineTarget.
     CheckCallee {
+        target: u32,
+    },
+    /// The test of a guard whose WrongCallee exits the profile flagged (stage 2): inputs as
+    /// CheckCallee's; true where the callee, its environment, the Realm and the receiver are as
+    /// the guard expects, without an exit (-> Bool), so that the code branches to the splice or
+    /// to the guard's mismatch, the generic call.
+    CalleeMatches {
         target: u32,
     },
 
@@ -372,6 +380,15 @@ impl Refusal {
     }
 }
 
+/// A speculation the builder declined at a site the exit profile flagged (stage 2): the pc, the
+/// flag's reason, and what the builder built instead, for the log and tests.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Decline {
+    pub(crate) pc: u32,
+    pub(crate) reason: ExitReason,
+    pub(crate) form: &'static str,
+}
+
 /// A function's graph.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Graph {
@@ -381,6 +398,8 @@ pub(crate) struct Graph {
     pub(crate) n_slots: usize,
     /// The entry block (blocks[0] when built by the builder).
     pub(crate) entry: Option<BlockIx>,
+    /// The speculations the builder declined, in the order it built their sites.
+    pub(crate) declines: Vec<Decline>,
 }
 
 impl Graph {

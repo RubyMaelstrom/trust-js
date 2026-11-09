@@ -24,6 +24,7 @@ fn engine(tier: Tier) -> Engine {
         on: false,
         eager: false,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     let mut engine = Engine::new();
@@ -1026,4 +1027,354 @@ fn the_verifier_rejects_broken_graphs() {
     broken.blocks[entry.index()].succs.reverse();
     rejects("swapped successors", broken, "successors");
     verify(&graph, &chunk).expect("the graph itself holds");
+}
+
+// ---- the exit profile's declines (stage 2, step 3) ----------------------------------------------
+
+/// Flag `reason` at `pc` of `chunk`, as a discard keys an exit there (`opt::profile`): `inlined`
+/// for a site a splice took, `ways` the shapes a WrongShape exit's check expected.
+fn flag(chunk: &Chunk, pc: usize, reason: ExitReason, inlined: bool, ways: u8) {
+    super::profile::ChunkProfile::of(chunk).add_site(pc as u32, reason as u8, inlined, ways);
+}
+
+fn declines(graph: &Graph) -> Vec<(usize, ExitReason)> {
+    graph
+        .declines
+        .iter()
+        .map(|decline| (decline.pc as usize, decline.reason))
+        .collect()
+}
+
+#[test]
+fn a_flagged_number_check_takes_the_generic_operation() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function f(a, b) { return a + b * 2; } for (var i = 0; i < 20; i++) f(i, 0.5);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "f");
+    assert_eq!(count(&graph, is_effect), 0);
+    assert!(graph.declines.is_empty());
+    let add = pc_of(&chunk, |op| matches!(op, Op::Add));
+    flag(&chunk, add, ExitReason::NotNumber, false, 0);
+    let graph = graph_for(&chunk, "f flagged");
+    let text = dump(&graph, &chunk);
+    // The Add, whose operand `a` needs its check, is the generic operation; the Mul keeps its.
+    let effects = nodes(&graph, is_effect);
+    assert_eq!(effects.len(), 1, "{text}");
+    assert_eq!(effects[0].pc as usize, add, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64Mul), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64Add), 0, "{text}");
+    assert_eq!(declines(&graph), [(add, ExitReason::NotNumber)], "{text}");
+    assert_eq!(graph.declines[0].form, "the generic operation");
+}
+
+#[test]
+fn flagged_int32_speculation_takes_f64_arithmetic() {
+    // NotInt32: the hint's int32 path (CheckInt32 on each operand) is declined for f64.
+    let mut vm = engine(Tier::Bytecode);
+    eval(
+        &mut vm,
+        "function sub(a, b) { return a - b; } function lt(a, b) { return a < b; }
+         function inc(a) { a++; return a; }
+         for (var i = 0; i < 20; i++) { sub(i, 1); lt(i, 3); inc(i); }",
+    );
+    let (chunk, graph) = graph_of(&mut vm, "sub");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Sub), 1);
+    let sub = pc_of(&chunk, |op| matches!(op, Op::Sub));
+    flag(&chunk, sub, ExitReason::NotInt32, false, 0);
+    let graph = graph_for(&chunk, "sub flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Sub), 0, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64Sub), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckInt32), 0, "{text}");
+    assert_eq!(declines(&graph), [(sub, ExitReason::NotInt32)], "{text}");
+    // A comparison too.
+    let (chunk, graph) = graph_of(&mut vm, "lt");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Cmp(Cond::Lt)), 1);
+    let lt = pc_of(&chunk, |op| matches!(op, Op::Lt));
+    flag(&chunk, lt, ExitReason::NotInt32, false, 0);
+    let graph = graph_for(&chunk, "lt flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::F64Cmp(Cond::Lt)),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckInt32), 0, "{text}");
+    // Overflow: `++` on its int32 takes f64 too.
+    let (chunk, graph) = graph_of(&mut vm, "inc");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Add), 1);
+    let inc = pc_of(&chunk, |op| matches!(op, Op::UpdateLocal(..)));
+    flag(&chunk, inc, ExitReason::Overflow, false, 0);
+    let graph = graph_for(&chunk, "inc flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Add), 0, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64Add), 1, "{text}");
+    assert_eq!(declines(&graph), [(inc, ExitReason::Overflow)], "{text}");
+}
+
+#[test]
+fn a_flagged_overflow_takes_f64_even_on_proven_int32s() {
+    // JSC's makeSafe: proven int32s, whose add ignores the records, add as f64s.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function f(a, b) { return (a | 0) + (b | 0); } function half(a) { return a >>> 1; }
+         for (var i = 0; i < 20; i++) { f(i, i); half(i); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "f");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Add), 1);
+    let add = pc_of(&chunk, |op| matches!(op, Op::Add));
+    flag(&chunk, add, ExitReason::Overflow, false, 0);
+    let graph = graph_for(&chunk, "f flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Add), 0, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64Add), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32ToF64), 2, "{text}");
+    assert_eq!(declines(&graph), [(add, ExitReason::Overflow)], "{text}");
+    // `>>> 1`'s uint32 as an f64, without its exit.
+    let (chunk, graph) = graph_of(&mut engine, "half");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32UShr), 1);
+    let ushr = pc_of(&chunk, |op| matches!(op, Op::UShr));
+    flag(&chunk, ushr, ExitReason::Overflow, false, 0);
+    let graph = graph_for(&chunk, "half flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32UShr), 0, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32UShrToF64), 1, "{text}");
+    assert_eq!(declines(&graph), [(ushr, ExitReason::Overflow)], "{text}");
+}
+
+#[test]
+fn unary_and_bitwise_operations_decline_their_number_checks() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function neg(a) { return -a; } function or(a) { return a | 1; }
+         for (var i = 0; i < 20; i++) { neg(i + 0.5); or(i); }",
+    );
+    for (name, op) in [("neg", Op::Neg), ("or", Op::BitOr)] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        assert_eq!(count(&graph, is_effect), 0, "{name}");
+        assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 1, "{name}");
+        let pc = pc_of(&chunk, |candidate| *candidate == op);
+        flag(&chunk, pc, ExitReason::NotNumber, false, 0);
+        let graph = graph_for(&chunk, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::CheckNumber),
+            0,
+            "{name}: {text}"
+        );
+        assert_eq!(
+            nodes(&graph, is_effect)[0].pc as usize,
+            pc,
+            "{name}: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_flagged_shape_check_is_declined_unless_its_ways_grew() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function getx(o) { return o.x; } var p = {x: 1};
+         for (var i = 0; i < 20; i++) getx(p);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "getx");
+    assert_eq!(count(&graph, |op| matches!(op, NodeOp::CheckShape(_))), 1);
+    let get = pc_of(&chunk, |op| matches!(op, Op::GetPropLocal(..)));
+    // The discarded check expected the one shape the site has: the generic access.
+    flag(&chunk, get, ExitReason::WrongShape, false, 1);
+    let graph = graph_for(&chunk, "getx flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        0,
+        "{text}"
+    );
+    assert_eq!(count(&graph, is_effect), 1, "{text}");
+    assert_eq!(declines(&graph), [(get, ExitReason::WrongShape)], "{text}");
+    // A second way since: both shapes are checked again.
+    eval(&mut engine, "getx({x: 2, y: 3});");
+    let graph = graph_for(&chunk, "getx with a new way");
+    let text = dump(&graph, &chunk);
+    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    assert_eq!(checks.len(), 1, "{text}");
+    assert!(
+        matches!(&checks[0].op, NodeOp::CheckShape(shapes) if shapes.len() == 2),
+        "{text}"
+    );
+    assert!(graph.declines.is_empty(), "{text}");
+}
+
+#[test]
+fn a_flagged_block_that_never_ran_is_built() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function nr(o, c) { if (c) { return o.y + o.z(); } return 1; } var p = {y: 1};
+         for (var i = 0; i < 20; i++) nr(p, false);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "nr");
+    let exits = nodes(&graph, |op| *op == NodeOp::Exit(ExitReason::NeverRan));
+    assert_eq!(exits.len(), 1);
+    let start = graph.state(exits[0].state.expect("a state")).pc as usize;
+    flag(&chunk, start, ExitReason::NeverRan, false, 0);
+    let graph = graph_for(&chunk, "nr flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::Exit(ExitReason::NeverRan)),
+        0,
+        "{text}"
+    );
+    // The block's sites hold no feedback: their generic operations.
+    assert!(
+        nodes(&graph, is_effect)
+            .iter()
+            .any(|node| node.pc as usize == start),
+        "{text}"
+    );
+    assert_eq!(declines(&graph), [(start, ExitReason::NeverRan)], "{text}");
+}
+
+#[test]
+fn a_flagged_guard_branches_to_its_mismatch_without_an_exit() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function add(a, b) { return a + b; }
+         function caller(x) { return add(x, 1); }
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(i); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    let ops = transformed.jit_ops();
+    let guard = pc_of(&transformed, |op| matches!(op, Op::InlineGuard(..)));
+    let Op::InlineGuard(target, mismatch) = ops[guard] else {
+        unreachable!()
+    };
+    // The guard's pc is no site the record map names: its flag is the second stage's own.
+    assert!(transformed
+        .feedback_vector()
+        .record_map()
+        .is_some_and(|map| map.target(guard).is_none()));
+    flag(&transformed, guard, ExitReason::WrongCallee, false, 0);
+    let graph = graph_for(&transformed, "caller's flagged second stage");
+    let text = dump(&graph, &transformed);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckCallee { .. })),
+        0,
+        "{text}"
+    );
+    let tests = nodes(&graph, |op| *op == NodeOp::CalleeMatches { target });
+    assert_eq!(tests.len(), 1, "{text}");
+    assert_eq!(tests[0].rep, Rep::Bool, "{text}");
+    assert!(tests[0].state.is_none(), "no exit: {text}");
+    // The guard's block branches on it to the splice and to the mismatch, which is built.
+    let block = graph.block(tests[0].block);
+    let last = graph.node(*block.body.last().expect("a terminator"));
+    let NodeOp::Branch {
+        then_block,
+        else_block,
+    } = last.op
+    else {
+        panic!("the guard branches: {text}")
+    };
+    assert_eq!(
+        graph.node(last.inputs[0]).op,
+        NodeOp::CalleeMatches { target },
+        "{text}"
+    );
+    assert_eq!(
+        graph.block(then_block).first_pc as usize,
+        guard + 1,
+        "{text}"
+    );
+    assert_eq!(graph.block(else_block).first_pc, mismatch, "{text}");
+    assert_eq!(
+        declines(&graph),
+        [(guard, ExitReason::WrongCallee)],
+        "{text}"
+    );
+}
+
+#[test]
+fn exit_sites_key_where_every_compile_of_the_site_finds_them() {
+    // `leaf` spliced into two callers. A discard of c1's second stage keys its exits at leaf's
+    // first stage, marked spliced: c2's splice finds both; leaf's own second stage finds the
+    // value site but not the named one, a site of another inline kind (JSC's split).
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function leaf(o, b) { return o.v + b; }
+         function c1(o) { return leaf(o, 1); } function c2(o) { return leaf(o, 2); }
+         var p = {v: 1};
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += c1(p) + c2(p);
+           return t; }
+         drive(150);",
+    );
+    let (Some(first), Some(second)) = (
+        second_stage(&mut engine, "c1", "drive(150)"),
+        second_stage(&mut engine, "c2", "drive(150)"),
+    ) else {
+        return;
+    };
+    let leaf = chunk_of(&mut engine, "leaf");
+    fn map(chunk: &Chunk) -> &crate::feedback::RecordMap {
+        chunk.feedback_vector().record_map().expect("a map")
+    }
+    let site = |chunk: &Rc<Chunk>, which: &dyn Fn(&Op) -> bool| -> (usize, usize) {
+        let pc = pc_of(chunk, which);
+        let (baseline, baseline_pc, spliced) = map(chunk).site(pc).expect("a mapped site");
+        assert!(std::ptr::eq(baseline, &*leaf) && spliced);
+        (pc, baseline_pc)
+    };
+    let is_add = |op: &Op| matches!(op, Op::Add);
+    let is_get = |op: &Op| matches!(op, Op::GetPropLocal(..) | Op::GetProp(..));
+    let (_, add) = site(&first, &is_add);
+    let (_, get) = site(&first, &is_get);
+    flag(&leaf, add, ExitReason::NotNumber, true, 0);
+    flag(&leaf, get, ExitReason::WrongShape, true, 1);
+    // c1's guard: no site the map names, so its own.
+    let guard = pc_of(&first, |op| matches!(op, Op::InlineGuard(..)));
+    flag(&first, guard, ExitReason::WrongCallee, false, 0);
+    // Another caller's splice: both of leaf's sites, none of c1's own.
+    let (add2, _) = site(&second, &is_add);
+    let (get2, _) = site(&second, &is_get);
+    let snapshot = Snapshot::take(&second);
+    assert!(snapshot.declines(add2, ExitReason::NotNumber));
+    assert!(snapshot.declines(get2, ExitReason::WrongShape));
+    assert_eq!(snapshot.discarded_ways(get2), 1);
+    let guard2 = pc_of(&second, |op| matches!(op, Op::InlineGuard(..)));
+    assert!(!snapshot.declines(guard2, ExitReason::WrongCallee));
+    // c1's recompile: its own site too.
+    let snapshot = Snapshot::take(&first);
+    assert!(snapshot.declines(guard, ExitReason::WrongCallee));
+    // leaf's own second stage (a recompile with nothing spliced): the value site only.
+    let env = engine.interp.global_env;
+    let value: Value = engine.interp.get_var("leaf", &env).ok().expect("leaf");
+    let ValueView::Obj(function) = value.view() else {
+        panic!("leaf is an object")
+    };
+    let ObjectKind::User(user) = &function.borrow().kind else {
+        panic!("leaf is a user function")
+    };
+    let own = crate::bytecode::compile_with_inlines(&user.func, &Default::default(), &leaf)
+        .expect("leaf's recompile");
+    let own_add = pc_of(&own, is_add);
+    let own_get = pc_of(&own, is_get);
+    let (baseline, baseline_add, spliced) = map(&own).site(own_add).expect("mapped");
+    assert!(std::ptr::eq(baseline, &*leaf) && baseline_add == add && !spliced);
+    let snapshot = Snapshot::take(&own);
+    assert!(snapshot.declines(own_add, ExitReason::NotNumber));
+    assert!(!snapshot.declines(own_get, ExitReason::WrongShape));
+    // And leaf's first stage itself, whose own sites are its spliced callers' context for the
+    // named one.
+    let snapshot = Snapshot::take(&leaf);
+    assert!(snapshot.declines(add, ExitReason::NotNumber));
+    assert!(!snapshot.declines(get, ExitReason::WrongShape));
 }

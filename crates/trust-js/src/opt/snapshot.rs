@@ -2,8 +2,9 @@
 //! front end): one view of the read API (`crate::feedback::read`) per pc, copied once when a
 //! compile starts, so that the builder reads only this snapshot and the chunk's immutable
 //! operations, as V8's ProcessedFeedback, JSC's status objects and SpiderMonkey's WarpSnapshot
-//! serve their builders. Taking it allocates the two per-pc arrays and nothing else; it interns
-//! nothing (the views hold process shape ids and cell addresses).
+//! serve their builders. Taking it allocates the per-pc arrays (the third only where an exit
+//! profile has sites) and nothing else; it interns nothing (the views hold process shape ids and
+//! cell addresses).
 //!
 //! A transformed chunk (a second stage, its hot callees spliced in) keeps its own property and
 //! call caches, which the second stage seeded from the first stage and goes on filling, but its
@@ -13,7 +14,16 @@
 //! The evidence that code ran comes from named and call sites only: their first execution fills a
 //! way or sets the generic or megamorphic mark, and a second stage's seeded caches count. Value
 //! and element records are no evidence, since in-line hits record nothing (rule U).
+//!
+//! The exit profile (stage 2; `opt::profile`) joins the feedback as each pc's declined reasons:
+//! the chunk's own sites at the pc and those of the baseline site its record map names, a value
+//! or coverage site from any inline kind and a named or call site only from a site of the pc's
+//! own kind (spliced or not), as JSC's parser takes its decisions' exit sites at any inline kind
+//! and its IC statuses' at the matching one (bytecode/DFGExitProfile.h:195-232,
+//! GetByStatus.cpp:462-475, CallLinkStatus.cpp:116-119).
 
+use super::ir::ExitReason;
+use super::profile::ChunkProfile;
 use crate::bytecode::{Chunk, Op};
 use crate::feedback::{self, CallState, NamedView, RecordMap, SiteView, ValuesView};
 
@@ -33,6 +43,9 @@ pub(crate) enum Ran {
 pub(crate) struct Snapshot {
     views: Box<[SiteView]>,
     ran: Box<[Ran]>,
+    /// Each pc's declined reasons (bits by discriminant) and, for WrongShape, the most shapes a
+    /// discarded check there expected; empty where no chunk the compile reads has exit sites.
+    declined: Box<[(u16, u8)]>,
 }
 
 impl Snapshot {
@@ -50,7 +63,22 @@ impl Snapshot {
         Snapshot {
             views: views.into_boxed_slice(),
             ran: ran.into_boxed_slice(),
+            declined: declined(chunk, map, ops.len()),
         }
+    }
+
+    /// Whether the exit profile flagged `reason` at `pc`: the builder declines what it names.
+    pub(crate) fn declines(&self, pc: usize, reason: ExitReason) -> bool {
+        self.declined
+            .get(pc)
+            .is_some_and(|&(reasons, _)| reasons & bit(reason) != 0)
+    }
+
+    /// The most shapes a discarded check at `pc` expected, where WrongShape is flagged there.
+    pub(crate) fn discarded_ways(&self, pc: usize) -> usize {
+        self.declined
+            .get(pc)
+            .map_or(0, |&(_, ways)| usize::from(ways))
     }
 
     /// The operation count the snapshot covers.
@@ -84,6 +112,58 @@ impl Snapshot {
             _ => None,
         }
     }
+}
+
+/// A reason's bit in a declined mask.
+fn bit(reason: ExitReason) -> u16 {
+    1 << reason as u8
+}
+
+/// Whether a reason's sites apply only where the inline kind matches: a named access's shapes
+/// and a call's callees are a site's in its context, as an IC status is, where a value's type or a
+/// block's coverage is the operation's anywhere.
+fn kind_bound(reason: u8) -> bool {
+    reason == ExitReason::WrongShape as u8 || reason == ExitReason::WrongCallee as u8
+}
+
+/// The exit profile's declined reasons per pc of `chunk` (see the module's doc): empty unless the
+/// chunk or a baseline chunk its map names holds exit sites.
+fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u16, u8)]> {
+    let has_sites = |chunk: &Chunk| ChunkProfile::get(chunk).is_some_and(ChunkProfile::has_sites);
+    let own = ChunkProfile::get(chunk).filter(|profile| profile.has_sites());
+    let baselines = map.is_some_and(|map| map.targets().iter().any(|target| has_sites(target)));
+    if own.is_none() && !baselines {
+        return Box::new([]);
+    }
+    let mut declined = vec![(0u16, 0u8); len];
+    for (pc, (reasons, ways)) in declined.iter_mut().enumerate() {
+        let mut add = |reason: u8, shapes: u8| {
+            *reasons |= 1 << reason;
+            if reason == ExitReason::WrongShape as u8 {
+                *ways = (*ways).max(shapes);
+            }
+        };
+        // The chunk's own sites, keyed at its pcs: a recompile's where its map names nothing,
+        // or a baseline chunk's own (its spliced sites are its callers' context).
+        if let Some(profile) = own {
+            profile.sites_at(pc as u32, |reason, inlined, shapes| {
+                if !kind_bound(reason) || !inlined {
+                    add(reason, shapes);
+                }
+            });
+        }
+        let Some((baseline, baseline_pc, spliced)) = map.and_then(|map| map.site(pc)) else {
+            continue;
+        };
+        if let Some(profile) = ChunkProfile::get(baseline) {
+            profile.sites_at(baseline_pc as u32, |reason, inlined, shapes| {
+                if !kind_bound(reason) || inlined == spliced {
+                    add(reason, shapes);
+                }
+            });
+        }
+    }
+    declined.into_boxed_slice()
 }
 
 /// The view of `pc` the tier reads: the chunk's own, with a transformed chunk's value and element

@@ -3601,6 +3601,10 @@ pub struct Chunk {
     pub(crate) jit_budget_wait_bytes: std::cell::Cell<usize>,
     /// Separate native entry kind borrowing a live Script VM activation.
     pub(crate) osr: std::cell::OnceCell<Box<crate::tiering::OsrCodeState>>,
+    /// The optimizing tier's record of this chunk (`opt::profile`): its settled-feedback
+    /// fingerprint, its exit profile and R, a discarded second stage's warm-up. Made at the
+    /// tier's first use of the chunk, and dropped with it.
+    pub(crate) opt: std::cell::OnceCell<Box<crate::opt::profile::ChunkProfile>>,
 }
 
 /// The feedback census snapshots a chunk's production feedback when it drops (W4 step 2).
@@ -3610,9 +3614,6 @@ impl Drop for Chunk {
         if self.feedback.census.is_some() {
             self.feedback_census_snapshot();
         }
-        // The optimizing tier's record of the chunk's feedback, if a checkpoint left one: its
-        // key is the chunk's address, which a later chunk may take.
-        crate::opt::forget(self);
     }
 }
 
@@ -3880,6 +3881,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             jit: _,
             jit_budget_wait_bytes: _,
             osr: _,
+            opt: _, // integers: no cells
         } = self;
         consts.trace_gc(sink);
         private_sites.as_ref().trace_gc(sink);
@@ -4434,6 +4436,9 @@ impl Chunk {
         bytes = bytes.saturating_add(self.jit.retained_metadata_bytes());
         if let Some(state) = self.osr.get() {
             state.scan_retained_memory(visitor);
+        }
+        if let Some(profile) = self.opt.get() {
+            bytes = bytes.saturating_add(profile.retained_bytes());
         }
         visitor.add_function_bytecode_bytes(bytes);
     }
@@ -10166,6 +10171,7 @@ fn finish_chunk(
         jit: crate::jit::cache::NativeCodeSlot::new(),
         jit_budget_wait_bytes: std::cell::Cell::new(0),
         osr: std::cell::OnceCell::new(),
+        opt: std::cell::OnceCell::new(),
     };
     let chunk = Rc::new(chunk);
     crate::value::register_code_roots(&chunk);

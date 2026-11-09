@@ -441,6 +441,7 @@ fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
             on,
             eager,
             exit_every: 0,
+            ..Default::default()
         }
         .set();
         #[cfg(not(target_arch = "aarch64"))]

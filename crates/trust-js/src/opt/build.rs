@@ -22,6 +22,14 @@
 //! - Feedback: a block whose named and call sites never ran is an exit at its first pc (Maglev,
 //!   Warp and the DFG); arithmetic and comparisons take int32 or f64 from rule U's value classes;
 //!   named loads and stores on own data ways check the shape and load or store the slot.
+//! - The exit profile (stage 2): where the snapshot says a discarded code's exits flagged a site,
+//!   the builder declines the speculation that exited, as JSC's parser consults its exit sites
+//!   (dfg/DFGByteCodeParser.cpp): NotNumber takes the generic operation, NotInt32 the f64 path,
+//!   Overflow f64 arithmetic even on proven int32s (JSC's makeSafe, DFGByteCodeParser.cpp:
+//!   1371-1376), WrongShape the generic access unless the site's ways grew since, WrongCallee the
+//!   guard's mismatch edge (CallLinkStatus's couldTakeSlowPath, CallLinkStatus.cpp:98-120), and
+//!   NeverRan builds the block (the parser's InadequateCoverage backstop, :7105-7124). The graph
+//!   lists each decline.
 //! - Everything else that is not control flow is an effect: the operation's baseline template on
 //!   the canonical frame, with the dirty slots flushed before it and every slot read back from the
 //!   frame after it.
@@ -37,7 +45,7 @@
 //!   where a block first needs them.
 
 use super::ir::{
-    BlockData, BlockIx, Cond, ExitReason, FrameState, Graph, NodeIx, NodeOp, Refusal, Rep,
+    BlockData, BlockIx, Cond, Decline, ExitReason, FrameState, Graph, NodeIx, NodeOp, Refusal, Rep,
     SlotSource, StateIx,
 };
 use super::snapshot::{Ran, Snapshot};
@@ -771,7 +779,8 @@ impl<'a> Builder<'a> {
         let block = self.blocks[ix(id)].expect("an edge made the block");
         self.cur = block;
         self.built[ix(id)] = true;
-        let never_ran = self.never_ran(start, end);
+        let never_ran = self.never_ran(start, end)
+            && !self.declined(start, ExitReason::NeverRan, "the block built");
         let mut st = match self.flow.heads[ix(id)] {
             Some(found) if !never_ran => self.header(id, block, preds, found)?,
             _ => self.merge(block, preds, start, &mut Vec::new())?,
@@ -795,6 +804,21 @@ impl<'a> Builder<'a> {
             return Err(Refusal::at(end - 1, "control falls off the end"));
         }
         self.jump(end - 1, end, st)
+    }
+
+    /// Whether the exit profile flagged `reason` at `pc` (the snapshot's declined mask), listing
+    /// the decline with `form`, what the builder builds instead: the caller asks only where it
+    /// would otherwise speculate.
+    fn declined(&mut self, pc: usize, reason: ExitReason, form: &'static str) -> bool {
+        if !self.snapshot.declines(pc, reason) {
+            return false;
+        }
+        self.graph.declines.push(Decline {
+            pc: pc as u32,
+            reason,
+            form,
+        });
+        true
     }
 
     /// Whether the block's named and call sites hold some and none of them ran.
@@ -1714,9 +1738,14 @@ impl<'a> Builder<'a> {
                 self.nullish(pc, target as usize, std::mem::take(st))?;
                 return Ok(false);
             }
-            Op::InlineGuard(target, _) => {
-                self.inline_guard(pc, target, st)?;
-                self.jump(pc, pc + 1, std::mem::take(st))?;
+            Op::InlineGuard(target, mismatch) => {
+                if self.declined(pc, ExitReason::WrongCallee, "the guard's mismatch edge") {
+                    let matches = self.callee_matches(pc, target, st)?;
+                    self.branch(pc, matches, pc + 1, mismatch as usize, std::mem::take(st))?;
+                } else {
+                    self.inline_guard(pc, target, st)?;
+                    self.jump(pc, pc + 1, std::mem::take(st))?;
+                }
                 return Ok(false);
             }
             Op::PushHandler(_) | Op::PushIterator(..) => {
@@ -1793,6 +1822,21 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
+    /// NotNumber flagged at `pc`, where an operand of `operands` needs its Number checked: the
+    /// generic operation, as if the record had seen what is not a Number.
+    fn declines_number(&mut self, pc: usize, st: &State, operands: &[NodeIx]) -> bool {
+        !operands.iter().all(|&value| self.known_number(st, value))
+            && self.declined(pc, ExitReason::NotNumber, "the generic operation")
+    }
+
+    /// Whether int32 arithmetic at `pc` is declined for f64: NotInt32 flagged where an operand
+    /// needs its int32 checked (none does when `proven`), or Overflow flagged, which takes f64
+    /// even on proven int32s (JSC's makeSafe).
+    fn declines_int32(&mut self, pc: usize, proven: bool) -> bool {
+        (!proven && self.declined(pc, ExitReason::NotInt32, "f64 arithmetic"))
+            || self.declined(pc, ExitReason::Overflow, "f64 arithmetic")
+    }
+
     /// Add, Sub, Mul, Div and Mod: f64 arithmetic on Numbers, int32 with an overflow exit where
     /// rule U's hint or the operands' facts say int32 (Add and Sub on proven int32s; Mul only on
     /// the hint, its int32 products leaving the range too often); the generic operation where a
@@ -1806,21 +1850,17 @@ impl<'a> Builder<'a> {
         if (values.operand0 | values.operand1) & !NUMBER != 0
             || !self.numeric(a)
             || !self.numeric(b)
+            || self.declines_number(pc, st, &[a, b])
         {
             return self.effect(pc, st);
         }
+        let proven = self.known_int32(st, a) && self.known_int32(st, b);
+        let hinted = int32_hint(&values) && self.int32_operand(st, a) && self.int32_operand(st, b);
         let int = match op {
-            Op::Add | Op::Sub => {
-                (self.known_int32(st, a) && self.known_int32(st, b))
-                    || (int32_hint(&values)
-                        && self.int32_operand(st, a)
-                        && self.int32_operand(st, b))
-            }
-            Op::Mul => {
-                int32_hint(&values) && self.int32_operand(st, a) && self.int32_operand(st, b)
-            }
+            Op::Add | Op::Sub => proven || hinted,
+            Op::Mul => hinted,
             _ => false,
-        };
+        } && !self.declines_int32(pc, proven);
         let mut cx = Before::new(pc);
         let result = if int {
             let (Some(x), Some(y)) = (self.int32(st, &mut cx, a), self.int32(st, &mut cx, b))
@@ -1870,6 +1910,7 @@ impl<'a> Builder<'a> {
         if (values.operand0 | values.operand1) & !NUMBER != 0
             || !self.numeric(a)
             || !self.numeric(b)
+            || self.declines_number(pc, st, &[a, b])
         {
             return self.effect(pc, st);
         }
@@ -1892,7 +1933,8 @@ impl<'a> Builder<'a> {
             let fits = self
                 .constant(b)
                 .and_then(number_word)
-                .is_some_and(|count| crate::eval::to_int32(count) & 31 != 0);
+                .is_some_and(|count| crate::eval::to_int32(count) & 31 != 0)
+                && !self.declined(pc, ExitReason::Overflow, "a uint32 as an f64");
             if fits {
                 // The result is below 2^31: the exit never runs.
                 let state = self.before(&mut cx, st);
@@ -1915,7 +1957,10 @@ impl<'a> Builder<'a> {
         };
         let len = st.stack.len();
         let value = st.stack[len - 1];
-        if values.operand0 & !NUMBER != 0 || !self.numeric(value) {
+        if values.operand0 & !NUMBER != 0
+            || !self.numeric(value)
+            || self.declines_number(pc, st, &[value])
+        {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
@@ -1955,6 +2000,7 @@ impl<'a> Builder<'a> {
         if (values.operand0 | values.operand1) & !NUMBER != 0
             || !self.numeric(a)
             || !self.numeric(b)
+            || self.declines_number(pc, st, &[a, b])
         {
             return self.effect(pc, st);
         }
@@ -1964,8 +2010,10 @@ impl<'a> Builder<'a> {
             Op::Le => Cond::Le,
             _ => Cond::Ge,
         };
-        let int = (self.known_int32(st, a) && self.known_int32(st, b))
-            || (int32_hint(&values) && self.int32_operand(st, a) && self.int32_operand(st, b));
+        let proven = self.known_int32(st, a) && self.known_int32(st, b);
+        let hinted = int32_hint(&values) && self.int32_operand(st, a) && self.int32_operand(st, b);
+        let int =
+            proven || (hinted && !self.declined(pc, ExitReason::NotInt32, "an f64 comparison"));
         let result = self.compare(pc, cond, a, b, int, st)?;
         st.stack.truncate(len - 2);
         st.stack.push(result);
@@ -2045,14 +2093,16 @@ impl<'a> Builder<'a> {
             return self.effect(pc, st);
         }
         let old = self.read_slot(st, slot, pc);
-        if !self.numeric(old) {
+        if !self.numeric(old) || self.declines_number(pc, st, &[old]) {
             return self.effect(pc, st);
         }
         let increment = matches!(
             kind,
             UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
         );
-        let int = self.known_int32(st, old) || (int32_hint(&values) && self.int32_operand(st, old));
+        let proven = self.known_int32(st, old);
+        let int = (proven || (int32_hint(&values) && self.int32_operand(st, old)))
+            && !self.declines_int32(pc, proven);
         let mut cx = Before::new(pc);
         let (number, new) = match int.then(|| self.int32(st, &mut cx, old)).flatten() {
             Some(x) => {
@@ -2128,6 +2178,16 @@ impl<'a> Builder<'a> {
         })
     }
 
+    /// WrongShape flagged at `pc` where the site's ways did not grow since a discarded check
+    /// there (a fifth shape, a receiver no way caches): the generic access, JSC's slow version
+    /// being an IC in its optimized code. Ways that grew are checked again, as V8 and
+    /// SpiderMonkey recompile on what their ICs learned.
+    fn stale_ways(&mut self, pc: usize, ways: &Ways) -> bool {
+        self.snapshot.declines(pc, ExitReason::WrongShape)
+            && ways.shapes.len() <= self.snapshot.discarded_ways(pc)
+            && self.declined(pc, ExitReason::WrongShape, "the generic access")
+    }
+
     fn receiver(&mut self, recv: Recv, st: &mut State, below: usize, pc: usize) -> NodeIx {
         match recv {
             Recv::Stack => st.stack[st.stack.len() - 1 - below],
@@ -2149,6 +2209,9 @@ impl<'a> Builder<'a> {
         let Some(ways) = self.own_data_ways(pc, name, false) else {
             return self.effect(pc, st);
         };
+        if self.stale_ways(pc, &ways) {
+            return self.effect(pc, st);
+        }
         let receiver = self.receiver(recv, st, 0, pc);
         let mut cx = Before::new(pc);
         let word = self.tagged(st, receiver, pc);
@@ -2189,6 +2252,9 @@ impl<'a> Builder<'a> {
         let Some(ways) = self.own_data_ways(pc, name, true) else {
             return self.effect(pc, st);
         };
+        if self.stale_ways(pc, &ways) {
+            return self.effect(pc, st);
+        }
         let len = st.stack.len();
         let value = st.stack[len - 1];
         let receiver = self.receiver(recv, st, 1, pc);
@@ -2216,11 +2282,14 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// InlineGuard (a spliced callee's): the callee and the Realm compared, and for a sloppy
-    /// callee that reads `this` the receiver an object (CheckCallee, its inputs the callee's word
-    /// and then the receiver's); a failure exits at the guard, whose mismatch the VM then takes,
-    /// so the mismatch edge is not built.
-    fn inline_guard(&mut self, pc: usize, target: u32, st: &mut State) -> Result<(), Refusal> {
+    /// The words an InlineGuard tests: the callee's, and for a sloppy callee that reads `this`
+    /// the receiver's.
+    fn guard_inputs(
+        &mut self,
+        pc: usize,
+        target: u32,
+        st: &mut State,
+    ) -> Result<Vec<NodeIx>, Refusal> {
         let guard = self.chunk.jit_inline_target(target);
         let callee_depth = guard.argc as usize + 1;
         let check_this = guard.check_this;
@@ -2228,13 +2297,22 @@ impl<'a> Builder<'a> {
         if len < callee_depth + usize::from(check_this) {
             return Err(Refusal::at(pc, "an inline guard above too few operands"));
         }
-        let mut cx = Before::new(pc);
         let callee = st.stack[len - callee_depth];
         let mut inputs = vec![self.tagged(st, callee, pc)];
         if check_this {
             let receiver = st.stack[len - callee_depth - 1];
             inputs.push(self.tagged(st, receiver, pc));
         }
+        Ok(inputs)
+    }
+
+    /// InlineGuard (a spliced callee's): the callee and the Realm compared, and for a sloppy
+    /// callee that reads `this` the receiver an object (CheckCallee, its inputs the callee's word
+    /// and then the receiver's); a failure exits at the guard, whose mismatch the VM then takes,
+    /// so the mismatch edge is not built.
+    fn inline_guard(&mut self, pc: usize, target: u32, st: &mut State) -> Result<(), Refusal> {
+        let inputs = self.guard_inputs(pc, target, st)?;
+        let mut cx = Before::new(pc);
         let state = self.before(&mut cx, st);
         self.add_exit(
             NodeOp::CheckCallee { target },
@@ -2245,5 +2323,21 @@ impl<'a> Builder<'a> {
             ExitReason::WrongCallee,
         );
         Ok(())
+    }
+
+    /// An InlineGuard whose WrongCallee the exit profile flagged: its test as a Boolean
+    /// (CalleeMatches), on which the caller branches to the splice or to the guard's mismatch,
+    /// the generic call, so that another callee runs in place, as the template JIT's second stage
+    /// runs it (JSC's couldTakeSlowPath turns the DFG's CheckBadValue into a slow-path call,
+    /// dfg/DFGByteCodeParser.cpp:2867-2883; Maglev drops its CheckValue once the call's feedback
+    /// is megamorphic, maglev-graph-builder.cc:11460-11485).
+    fn callee_matches(
+        &mut self,
+        pc: usize,
+        target: u32,
+        st: &mut State,
+    ) -> Result<NodeIx, Refusal> {
+        let inputs = self.guard_inputs(pc, target, st)?;
+        Ok(self.add(NodeOp::CalleeMatches { target }, &inputs, Rep::Bool, pc))
     }
 }

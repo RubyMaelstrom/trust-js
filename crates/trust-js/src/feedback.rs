@@ -820,6 +820,25 @@ impl RecordMap {
         Some((chunk, (word & 0xff_ffff) as usize))
     }
 
+    /// [`RecordMap::target`], and whether the site is a splice's: its baseline chunk is a spliced
+    /// callee's first stage, not the function's own (target 0). The optimizing tier keys its
+    /// exit profile by it (`opt::profile`).
+    pub(crate) fn site(&self, pc: usize) -> Option<(&crate::bytecode::Chunk, usize, bool)> {
+        let word = *self.pcs.get(pc)?;
+        if word == Self::UNMAPPED {
+            return None;
+        }
+        let target = (word >> 24) as usize;
+        let chunk = self.targets.get(target)?;
+        Some((chunk, (word & 0xff_ffff) as usize, target != 0))
+    }
+
+    /// The baseline chunks the map names: the function's own first stage, then the spliced
+    /// callees' first stages.
+    pub(crate) fn targets(&self) -> &[std::rc::Rc<crate::bytecode::Chunk>] {
+        &self.targets
+    }
+
     /// The transformed pcs whose baseline site is `pc` of `chunk`.
     pub(crate) fn sources<'a>(
         &'a self,

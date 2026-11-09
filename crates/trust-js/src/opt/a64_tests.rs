@@ -27,6 +27,7 @@ fn fixture(source: &str) -> Engine {
         on: false,
         eager: false,
         exit_every: 0,
+        ..Default::default()
     }
     .set();
     let mut engine = Engine::new();
@@ -2261,4 +2262,90 @@ fn malformed_graphs_are_refused() {
         crate::opt::a64::compile_with(&chunk, &b.g, &layout, &ilayout, Options::default()).is_err(),
         "an effect on a branch"
     );
+}
+
+#[test]
+fn a_code_past_its_exit_limit_is_discarded_once_for_the_template_jits() {
+    // The tier off (the fixture's switches): the discard is stage 1's fallback, at 100 exits.
+    let mut engine = fixture(ADD);
+    let code = install(&mut engine, "add", &add_f64(), Options::default());
+    let chunk = chunk_of(&mut engine, "add");
+    exits();
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var s = ''; for (var k = 0; k < 150; k++) s = add('', k % 10); s"
+        ),
+        "9"
+    );
+    assert_eq!(exits().len(), crate::opt::EXIT_LIMIT as usize);
+    let now = chunk.jit.get().flatten().expect("the template JIT's code");
+    assert!(!Rc::ptr_eq(&now, &code));
+    assert_eq!(crate::opt::exit::table_bytes(now.mem_ptr()), 0);
+    assert!(
+        engine
+            .interp
+            .opt_retired
+            .iter()
+            .any(|retired| Rc::ptr_eq(retired, &code)),
+        "retired, not freed"
+    );
+}
+
+#[test]
+fn a_discard_whose_template_compile_waits_for_capacity_leaves_the_slot_cold() {
+    // The executable budget is process-wide: hold all of it in a process of its own, as
+    // `jit::executable_code_budget_tests` does, rather than steal it from concurrent tests.
+    const CHILD: &str = "TRUST_JS_TEST_OPT_DEFERRED_DISCARD_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "jit::opt_a64::tests::\
+                 a_discard_whose_template_compile_waits_for_capacity_leaves_the_slot_cold",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    use std::sync::atomic::Ordering::Relaxed;
+    let mut engine = fixture(ADD);
+    let code = install(&mut engine, "add", &add_f64(), Options::default());
+    let chunk = chunk_of(&mut engine, "add");
+    exits();
+    let budget = crate::jit::executable_code_budget();
+    let held =
+        crate::jit::ExecutableCodeReservation::try_new(budget, budget.remaining.load(Relaxed))
+            .expect("the whole budget");
+    // The 100th exit discards the code, whose template compile finds no capacity: the slot goes
+    // cold, not unavailable, and the VM runs the calls meanwhile.
+    assert_eq!(
+        eval(
+            &mut engine,
+            "var s = ''; for (var k = 0; k < 150; k++) s = add('', k % 10); s"
+        ),
+        "9"
+    );
+    assert_eq!(exits().len(), crate::opt::EXIT_LIMIT as usize);
+    assert!(chunk.jit.get().is_none(), "a cold slot");
+    assert!(chunk.jit_budget_wait_bytes.get() > 0);
+    drop(held);
+    // Capacity again: the next entry compiles the template JIT's code.
+    assert_eq!(eval(&mut engine, "add(1, 2) + add('a', 'b')"), "3ab");
+    let now = chunk
+        .jit
+        .get()
+        .flatten()
+        .expect("compiled at its next entry");
+    assert!(!Rc::ptr_eq(&now, &code));
+    assert_eq!(crate::opt::exit::table_bytes(now.mem_ptr()), 0);
+    assert!(exits().is_empty());
 }

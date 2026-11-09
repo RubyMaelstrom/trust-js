@@ -1,12 +1,33 @@
 //! The tier's driver, where it has a back end: its switches, the settled-feedback rule that picks
-//! the checkpoint it compiles at, the pipeline run that makes a chunk's native code, and the
-//! fall-back from code that exits too often.
+//! the checkpoint it compiles at, the pipeline run that makes a chunk's native code, the discard
+//! of code that exits too often, and its reoptimization (P3 stage 2, step 3).
+//!
+//! The plan's point 12 on TRust's code (the stage 2 design, "Step 3"): past its limit of exits,
+//! 100 << R, a code is discarded (`discard`): its exits' sites become the exit profile, R (the
+//! function's discards) grows, the template JIT's code takes new entries, and the second stage's
+//! warm-up is armed, its checkpoints (100, 400, 1,600, 6,400) << R native runs apart, as JSC
+//! waits twice as long after each jettison (bytecode/CodeBlock.cpp:2602-2608). At a checkpoint
+//! whose feedback has settled, or the last, the tier compiles the chunk again (`reoptimize`),
+//! declining what the profile flagged, and its code replaces the template JIT's. Departures from
+//! point 12, each for a precondition TRust lacks yet: the recompile takes the same chunk again
+//! (a second stage is set once; another splicing is stage 3's); the warm-up counts native entries
+//! where JSC also weighs iterations; the limit for an exited frame that then loops hot (5 x 2^R)
+//! waits for stage 5's back-edge counters; and a discard whose exits were all unfixable (throws,
+//! unsupported operations) arms no recompile, which would build the same code, as SpiderMonkey
+//! disables Ion for frequent unfixable bailouts (jit/IonScript.h:336-341), until the in-place
+//! resume takes exceptions out of the count. Each discard and each recompile moves the call
+//! caches' global epoch, where the exemplars reach only the replaced code's callers; the log
+//! counts the moves.
 
-use super::ir::Refusal;
+use super::exit::{ExitRecord, ExitTable};
+use super::ir::{ExitReason, Refusal};
+use super::profile::{self, ChunkProfile};
 use super::{a64, build, snapshot, verify};
 use crate::bytecode::Chunk;
 use crate::interpreter::Interp;
-use std::cell::RefCell;
+use crate::jit::JitCode;
+use std::cell::Cell;
+use std::rc::Rc;
 
 /// The switches a test sets for its thread in place of the environment's, which a process reads
 /// once (`TestSwitches::set`).
@@ -16,17 +37,26 @@ pub(crate) struct TestSwitches {
     pub(crate) on: bool,
     pub(crate) eager: bool,
     pub(crate) exit_every: u32,
+    pub(crate) no_reopt: bool,
+    pub(crate) no_exit_profile: bool,
+    /// The base exit limit; 0: the default ([`EXIT_LIMIT`]).
+    pub(crate) exit_limit: u32,
 }
 
 #[cfg(test)]
 thread_local! {
     static TEST_SWITCHES: std::cell::Cell<Option<TestSwitches>> =
         const { std::cell::Cell::new(None) };
-    /// The chunks the tier compiled on this thread, and the codes repeated exits retired.
-    pub(crate) static TEST_COMPILED: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    pub(crate) static TEST_FELL_BACK: RefCell<Vec<usize>> = const { RefCell::new(Vec::new()) };
-    /// The checkpoints (chunk, number) at which the tier waited for settled feedback.
-    pub(crate) static TEST_WAITS: RefCell<Vec<(usize, u8)>> = const { RefCell::new(Vec::new()) };
+    /// The chunks the tier compiled on this thread (recompiles included), and the codes discards
+    /// retired.
+    pub(crate) static TEST_COMPILED: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    pub(crate) static TEST_DISCARDED: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The checkpoints (chunk, number) at which the tier waited for settled feedback, a warm-up's
+    /// among them.
+    pub(crate) static TEST_WAITS: std::cell::RefCell<Vec<(usize, u8)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -54,14 +84,15 @@ pub(crate) fn enabled() -> bool {
 }
 
 /// TRUST_JS_OPT_LOG: one stderr line per compile (its time and code range), refusal (with its
-/// reason and pc), exit, wait for settled feedback, fallback, and template compile of a second
-/// stage (its code range).
+/// reason and pc), decline, exit, wait for settled feedback, discard, flag, reoptimization, epoch
+/// move, and template compile of a second stage (its code range).
 pub(crate) fn log_enabled() -> bool {
     env_flag!("TRUST_JS_OPT_LOG")
 }
 
 /// TRUST_JS_OPT_EAGER: compile at the first checkpoint, without waiting for settled feedback (the
-/// eager gate; V8's --stress-maglev, SpiderMonkey's eager Ion compilation).
+/// eager gate; V8's --stress-maglev, SpiderMonkey's eager Ion compilation); a warm-up's
+/// recompile too.
 pub(crate) fn eager() -> bool {
     #[cfg(test)]
     if let Some(switches) = test_switches() {
@@ -82,74 +113,131 @@ pub(crate) fn exit_every() -> u32 {
         .unwrap_or(0)
 }
 
-/// The exits of one code object past which new entries stop using it (`fall_back`): the plan's
-/// point 12, JSC's 100 x 2^R exits at R = 0, without the recompile stage 2 brings.
-pub(crate) const EXIT_LIMIT: u32 = 100;
-
-thread_local! {
-    /// The feedback fingerprint the last second-stage checkpoint of each chunk recorded while
-    /// the tier waits for its feedback to settle, by the chunk's address: an entry goes when the
-    /// chunk's checkpoints end, and with the chunk (`forget`). The tier's own state, so that the
-    /// chunk carries nothing for it while the tier is off.
-    static SETTLING: RefCell<crate::fasthash::FastMap<usize, u64>> =
-        RefCell::new(Default::default());
-    /// Whether `fall_back` is compiling the template JIT's code (`note_template`'s label).
-    static FALLING_BACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+/// TRUST_JS_OPT_NO_REOPT: stage 1's fallback for good: a discard records no exit profile, adds
+/// nothing to R and arms no recompile.
+pub(crate) fn no_reopt() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = test_switches() {
+        return switches.no_reopt;
+    }
+    env_flag!("TRUST_JS_OPT_NO_REOPT")
 }
 
-/// The settled-feedback rule at a second-stage checkpoint of `chunk` (the plan's Stage 1 record,
-/// "When"; V8's wait for a quiet IC): whether its feedback fingerprint (`snapshot::fingerprint`)
-/// equals the one its previous checkpoint recorded, or, under TRUST_JS_OPT_EAGER, any
-/// checkpoint. Records this checkpoint's fingerprint for the next one.
+/// TRUST_JS_OPT_NO_EXIT_PROFILE: discards record no exit profile, so that recompiles decline
+/// nothing (P2's variant, its plan:6581-6587): the feedback alone guides them.
+pub(crate) fn no_exit_profile() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = test_switches() {
+        return switches.no_exit_profile;
+    }
+    env_flag!("TRUST_JS_OPT_NO_EXIT_PROFILE")
+}
+
+/// The base exit limit: TRUST_JS_OPT_EXIT_LIMIT=N, a positive N, else [`EXIT_LIMIT`] (1 cycles
+/// reoptimization at every exit, the gates' fourth configuration).
+pub(crate) fn exit_limit_base() -> u32 {
+    #[cfg(test)]
+    if let Some(switches) = test_switches() {
+        return if switches.exit_limit == 0 {
+            EXIT_LIMIT
+        } else {
+            switches.exit_limit
+        };
+    }
+    env_value!("TRUST_JS_OPT_EXIT_LIMIT")
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(EXIT_LIMIT)
+}
+
+/// The base exit limit by default: JSC's 100 x 2^R exits at R = 0 (the plan's point 12;
+/// exitCountThresholdForReoptimization, bytecode/CodeBlock.cpp:2738-2771).
+pub(crate) const EXIT_LIMIT: u32 = 100;
+
+/// The exits past which the tier's code for `chunk`, compiled now, is discarded: the base limit
+/// << R, R the function's discards so far (on its first stage), so that each discard doubles
+/// the next code's limit.
+pub(crate) fn exit_limit(chunk: &Chunk) -> u32 {
+    let r = ChunkProfile::get(profile::first_stage(chunk)).map_or(0, ChunkProfile::discards);
+    (u64::from(exit_limit_base()) << r).min(u64::from(u32::MAX)) as u32
+}
+
+/// The warm-up's first distance in native runs at R = 0; each later one is four times the last
+/// ((100, 400, 1,600, 6,400) << R), the second stage's own schedule
+/// (`Chunk::advance_inline_feedback`) doubled at each discard.
+const WARM_UP: u32 = 100;
+/// The warm-up's checkpoints, the last compiling whatever its fingerprint says.
+const WARM_UP_CHECKPOINTS: u8 = 4;
+
+/// The native runs from a warm-up's checkpoint `k` (0 for the discard) to the next, at `r`.
+fn warm_up_gap(r: u8, k: u8) -> u32 {
+    (u64::from(WARM_UP) << r << (2 * k)).min(u64::from(u32::MAX)) as u32
+}
+
+thread_local! {
+    /// Whether `discard` is compiling the template JIT's code (`note_template`'s label).
+    static DISCARDING: Cell<bool> = const { Cell::new(false) };
+    /// The epoch moves the tier made on this thread (the log's count).
+    static EPOCH_MOVES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// The settled-feedback rule at a checkpoint of `chunk` (the plan's Stage 1 record, "When"; V8's
+/// wait for a quiet IC): whether its feedback fingerprint (`snapshot::fingerprint`) equals the
+/// one its previous checkpoint recorded, or, under TRUST_JS_OPT_EAGER, any checkpoint. Records
+/// this checkpoint's fingerprint for the next one, on the chunk (`opt::profile`).
 pub(crate) fn settled(chunk: &Chunk) -> bool {
     let print = snapshot::fingerprint(chunk);
-    let key = chunk as *const Chunk as usize;
-    let previous = SETTLING.with(|settling| settling.borrow_mut().insert(key, print));
+    let previous = ChunkProfile::of(chunk).settle(print);
     eager() || previous == Some(print)
 }
 
-/// Whether the tier waits for `chunk`'s next checkpoint (`last`: none follows this one): while
-/// a checkpoint remains and the feedback has not settled (`settled`). The last checkpoint
-/// compiles whatever the fingerprint says, as JSC optimizes after maximumOptimizationDelay
-/// delays whatever its profiles say (CodeBlock::shouldOptimizeNowFromBaseline) and V8 pushes a
-/// tier-up out at an IC change but never cancels it (TieringManager::NotifyICChanged). Logs
-/// each wait and each compile of unsettled feedback under TRUST_JS_OPT_LOG.
+/// Whether the tier waits for `chunk`'s next second-stage checkpoint (`last`: none follows this
+/// one): while a checkpoint remains and the feedback has not settled (`settled`). The last
+/// checkpoint compiles whatever the fingerprint says, as JSC optimizes after
+/// maximumOptimizationDelay delays whatever its profiles say
+/// (CodeBlock::shouldOptimizeNowFromBaseline) and V8 pushes a tier-up out at an IC change but
+/// never cancels it (TieringManager::NotifyICChanged). Logs each wait and each compile of
+/// unsettled feedback under TRUST_JS_OPT_LOG.
 pub(crate) fn waits(chunk: &Chunk, last: bool) -> bool {
+    waits_at(chunk, chunk.inline_checkpoints(), last, "")
+}
+
+/// [`waits`] at `chunk`'s checkpoint `checkpoint`, `what` the log's note of its kind.
+fn waits_at(chunk: &Chunk, checkpoint: u8, last: bool, what: &str) -> bool {
     if settled(chunk) {
         return false;
     }
     if !last {
         if log_enabled() {
             eprintln!(
-                "[opt] waiting {} at checkpoint {}: feedback changed",
-                name(chunk),
-                chunk.inline_checkpoints()
+                "[opt] waiting {} at checkpoint {checkpoint}: feedback changed{what}",
+                name(chunk)
             );
         }
         #[cfg(test)]
         TEST_WAITS.with(|waits| {
             waits
                 .borrow_mut()
-                .push((chunk as *const Chunk as usize, chunk.inline_checkpoints()))
+                .push((chunk as *const Chunk as usize, checkpoint))
         });
         return true;
     }
     if log_enabled() {
         eprintln!(
-            "[opt] compiling {} at its last checkpoint ({}) with unsettled feedback",
-            name(chunk),
-            chunk.inline_checkpoints()
+            "[opt] compiling {} at its last checkpoint ({checkpoint}) with unsettled \
+             feedback{what}",
+            name(chunk)
         );
     }
     false
 }
 
-/// `chunk`'s checkpoints have ended (its second stage was built, the last one passed, or the
-/// chunk drops), or its wait starts afresh.
+/// `chunk`'s checkpoints have ended (its second stage was built, the last one passed, or its
+/// recompile was made), or its wait starts afresh.
 pub(crate) fn forget(chunk: &Chunk) {
-    let key = chunk as *const Chunk as usize;
-    // A chunk can drop while the thread's locals are torn down.
-    let _ = SETTLING.try_with(|settling| settling.borrow_mut().remove(&key));
+    if let Some(profile) = ChunkProfile::get(chunk) {
+        profile.unsettle();
+    }
 }
 
 fn name(chunk: &Chunk) -> String {
@@ -162,26 +250,27 @@ fn name(chunk: &Chunk) -> String {
     format!("fn({})", names.join(","))
 }
 
-/// Compile `chunk` with the tier (the snapshot, the graph, its verification, the ARM64 code) and
-/// make the code the chunk's native code: `chunk` is a second stage, or the function's own chunk
-/// compiled again because it had nothing to splice, and has no native code yet. Whether the tier
-/// accepted it. A refusal is logged with its reason and pc under TRUST_JS_OPT_LOG; a graph the
-/// verifier rejects is the builder's bug, which panics in tests and debug builds and is refused
-/// otherwise.
-pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
-    release_retired(i);
+/// The tier's code for `chunk`: its snapshot (the exit profile's declines among its feedback),
+/// its graph, the graph's verification, the ARM64 code. Logs the compile with its time and code
+/// range, each decline, or the refusal with its reason and pc, under TRUST_JS_OPT_LOG; a graph
+/// the verifier rejects is the builder's bug, which panics in tests and debug builds and is
+/// refused otherwise.
+fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
     let started = std::time::Instant::now();
-    // The slot first, as the template JIT's compiles take it: a refusal drops the permit, which
-    // leaves the slot cold.
-    let Some(permit) = chunk.jit.begin_compile() else {
-        if log_enabled() {
-            eprintln!("[opt] refused {}: no code slot", name(chunk));
-        }
-        return false;
-    };
     let compiled = (|| {
         let snapshot = snapshot::Snapshot::take(chunk);
         let graph = build::build(chunk, &snapshot)?;
+        if log_enabled() {
+            for decline in &graph.declines {
+                eprintln!(
+                    "[opt] declined {} pc {} {:?}: {}",
+                    name(chunk),
+                    decline.pc,
+                    decline.reason,
+                    decline.form
+                );
+            }
+        }
         if let Err(message) = verify::verify(&graph, chunk) {
             if cfg!(any(test, debug_assertions)) {
                 panic!(
@@ -225,8 +314,7 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
             #[cfg(test)]
             TEST_COMPILED
                 .with(|compiled| compiled.borrow_mut().push(chunk as *const Chunk as usize));
-            permit.commit(Some(code));
-            true
+            Some(code)
         }
         Err(refusal) => {
             if log_enabled() {
@@ -245,17 +333,140 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
                     ),
                 }
             }
-            false
+            None
         }
     }
 }
 
-/// Past [`EXIT_LIMIT`] exits of the tier's code for `chunk` (the plan's Stage 1 record, "Repeated
-/// exits"): new entries take the template JIT's code for the chunk, compiled now (or the VM where
-/// it cannot be), the call caches' epoch moves so that every way re-resolves, and the tier's code
-/// stays alive among the interpreter's retired codes while an activation runs it, the exiting one
-/// among them. Stage 1 compiles the chunk with the tier no more.
-pub(crate) fn fall_back(i: &mut Interp, chunk: &Chunk) {
+/// Compile `chunk` with the tier and make the code the chunk's native code: `chunk` is a second
+/// stage (a stale chain's rebuilt one among them), or the function's own chunk compiled again
+/// because it had nothing to splice, and has no native code yet. Whether the tier accepted it.
+pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
+    release_retired(i);
+    // The slot first, as the template JIT's compiles take it: a refusal drops the permit, which
+    // leaves the slot cold.
+    let Some(permit) = chunk.jit.begin_compile() else {
+        if log_enabled() {
+            eprintln!("[opt] refused {}: no code slot", name(chunk));
+        }
+        return false;
+    };
+    match generate(i, chunk) {
+        Some(code) => {
+            permit.commit(Some(code));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Move the call caches' global epoch, so that every way re-resolves (a cached call names the
+/// replaced code, which is freed once nothing runs it): `why` names the tier's reason in the
+/// log, which counts the moves.
+fn move_epoch(why: &str) {
+    crate::bytecode::invalidate_call_caches();
+    let moves = EPOCH_MOVES.with(|moves| {
+        moves.set(moves.get() + 1);
+        moves.get()
+    });
+    if log_enabled() {
+        eprintln!("[opt] epoch moved ({why}), {moves} by the tier");
+    }
+}
+
+/// Past its exit limit (`exit_limit`), the tier's code for `chunk`, whose exit table `table` is,
+/// is discarded (see the module's doc), before the exiting activation's VM run; activations
+/// still running it finish in it, kept among the interpreter's retired codes. Each record that
+/// counted exits adds its site to the exit profile (`flag`), as JSC's tallyFrequentExitSites
+/// (bytecode/CodeBlock.cpp:3094-3120), but throws and unsupported operations, which flag nothing
+/// (there is nothing to decline); R grows; the template JIT's code takes new entries (a compile
+/// deferred for capacity leaves the slot cold, compiled at its next entry); the epoch moves;
+/// and the warm-up toward the recompile is armed, unless every exit was unfixable. Under
+/// TRUST_JS_OPT_NO_REOPT, or where the tier is off (tests that install its code by hand), the
+/// discard is stage 1's fallback for good.
+pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
+    table.discarded.set(true);
+    let first = profile::first_stage(chunk);
+    let reoptimizing = enabled() && !no_reopt();
+    let before = ChunkProfile::get(first).map_or(0, ChunkProfile::discards);
+    let r = if reoptimizing {
+        ChunkProfile::of(first).add_discard()
+    } else {
+        before
+    };
+    let taken: Vec<&ExitRecord> = table
+        .exits
+        .iter()
+        .filter(|exit| exit.count.get() != 0)
+        .collect();
+    let fixable = taken
+        .iter()
+        .any(|exit| !matches!(exit.reason, ExitReason::Throw | ExitReason::Unsupported));
+    let now = swap_in_template(i, chunk, table);
+    if log_enabled() {
+        // The exits by site and reason (a site's checks of one reason share its pc).
+        let mut sites: Vec<(u32, ExitReason, u32)> = Vec::new();
+        for exit in &taken {
+            match sites
+                .iter_mut()
+                .find(|(pc, reason, _)| *pc == exit.pc && *reason == exit.reason)
+            {
+                Some(site) => site.2 = site.2.saturating_add(exit.count.get()),
+                None => sites.push((exit.pc, exit.reason, exit.count.get())),
+            }
+        }
+        sites.sort_by_key(|&(pc, _, _)| pc);
+        let sites: Vec<String> = sites
+            .iter()
+            .map(|(pc, reason, count)| format!("pc {pc} {reason:?} x{count}"))
+            .collect();
+        eprintln!(
+            "[opt] discarded {} after {} exits (limit {}, R {before} -> {r}) for {}: {}",
+            name(chunk),
+            table.taken.get(),
+            table.limit,
+            now,
+            sites.join(", ")
+        );
+    }
+    if reoptimizing && !no_exit_profile() {
+        for exit in &taken {
+            if !matches!(exit.reason, ExitReason::Throw | ExitReason::Unsupported) {
+                flag(chunk, exit);
+            }
+        }
+    }
+    move_epoch("discard");
+    // The warm-up runs on a recompile's checkpoint word, which no first-stage schedule uses: a
+    // chunk with a record map (a second stage, the tier's own chunk of a function with nothing
+    // to splice, a stale chain's recompile).
+    if reoptimizing && chunk.feedback_vector().record_map().is_some() {
+        if fixable {
+            let profile = ChunkProfile::of(chunk);
+            let at = chunk.jit_runs.get().saturating_add(warm_up_gap(r, 0));
+            profile.arm(1, at);
+            chunk.set_inline_retry_at(at);
+            // The first checkpoint compares the feedback with this, the exits' VM runs' records
+            // included.
+            profile.settle(snapshot::fingerprint(chunk));
+        } else if log_enabled() {
+            eprintln!(
+                "[opt] not reoptimized {}: unfixable exits only",
+                name(chunk)
+            );
+        }
+    }
+    release_retired(i);
+}
+
+/// The template JIT's code in place of the discarded `table`'s in `chunk`'s slot, which still
+/// holds it (the code runs, so no eviction took it); what new entries now run, for the log.
+fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'static str {
+    let holds = matches!(chunk.jit.get(), Some(Some(code))
+        if code.mem_ptr() as usize == table.code_base);
+    if !holds {
+        return "another code";
+    }
     let layout = *i
         .jit_layout
         .get_or_init(|| crate::value::jit_layout(&i.object_proto));
@@ -263,44 +474,165 @@ pub(crate) fn fall_back(i: &mut Interp, chunk: &Chunk) {
         let layout = crate::interpreter::interp_layout(i);
         i.interp_layout.set(layout);
     }
-    FALLING_BACK.with(|falling| falling.set(true));
-    let template = match crate::jit::compile_profiled(chunk, &layout, &i.interp_layout.get()) {
-        crate::jit::JitCompileOutcome::Compiled(code) => Some(std::rc::Rc::new(code)),
-        _ => None,
+    DISCARDING.with(|discarding| discarding.set(true));
+    let outcome = crate::jit::compile_profiled(chunk, &layout, &i.interp_layout.get());
+    DISCARDING.with(|discarding| discarding.set(false));
+    let (retired, now) = match outcome {
+        crate::jit::JitCompileOutcome::Compiled(code) => (
+            chunk.jit.replace_resident(Some(Rc::new(code))),
+            "the template JIT's code",
+        ),
+        crate::jit::JitCompileOutcome::Deferred { required_bytes } => {
+            // No capacity now: the slot goes cold, and the chunk's next entry compiles it once
+            // the bytes fit, as a deferred first compile waits.
+            chunk.jit_budget_wait_bytes.set(required_bytes);
+            (
+                chunk.jit.discard(),
+                "the template JIT's code at the next entry",
+            )
+        }
+        crate::jit::JitCompileOutcome::Unavailable => (chunk.jit.replace_resident(None), "the VM"),
     };
-    FALLING_BACK.with(|falling| falling.set(false));
-    let compiled = template.is_some();
-    if let Some(retired) = chunk.jit.replace_resident(template) {
+    if let Some(retired) = retired {
         #[cfg(test)]
-        TEST_FELL_BACK.with(|fell| fell.borrow_mut().push(retired.mem_ptr() as usize));
+        TEST_DISCARDED.with(|discarded| discarded.borrow_mut().push(retired.mem_ptr() as usize));
         i.opt_retired.push(retired);
     }
-    crate::bytecode::invalidate_call_caches();
+    now
+}
+
+/// Add `exit`'s site to the exit profile (see `opt::profile`): at the baseline site `chunk`'s
+/// record map names for its pc, on that first-stage chunk and marked whether it is a splice's,
+/// or at the pc on `chunk` itself; a WrongShape site with the shapes its check expected. Logs
+/// each new site.
+fn flag(chunk: &Chunk, exit: &ExitRecord) {
+    let shapes = match exit.reason {
+        ExitReason::WrongShape => exit.shape_check.as_ref().map_or(0, |check| {
+            check.shapes.len().min(usize::from(u8::MAX)) as u8
+        }),
+        _ => 0,
+    };
+    let (at, pc, inlined) = match profile::baseline_site(chunk, exit.pc as usize) {
+        Some((baseline, pc, spliced)) => (baseline, pc as u32, spliced),
+        None => (chunk, exit.pc, false),
+    };
+    let new = ChunkProfile::of(at).add_site(pc, exit.reason as u8, inlined, shapes);
+    if new && log_enabled() {
+        let key = if std::ptr::eq(at, chunk) {
+            "own".to_string()
+        } else {
+            format!(
+                "at {} pc {pc}{}",
+                name(at),
+                if inlined { " (spliced)" } else { "" }
+            )
+        };
+        eprintln!(
+            "[opt] flag {} pc {} {:?} {key}",
+            name(chunk),
+            exit.pc,
+            exit.reason
+        );
+    }
+}
+
+/// Whether `chunk`'s checkpoint word counts toward a recompile after a discard (its warm-up is
+/// armed): `Interp::try_inline_recompile` hands its due checkpoints to [`reoptimize`].
+pub(crate) fn reoptimizing(chunk: &Chunk) -> bool {
+    ChunkProfile::get(chunk).is_some_and(|profile| profile.warm_up().is_some())
+}
+
+/// A due checkpoint of `chunk`'s warm-up (see the module's doc): the next one is armed, and
+/// where the feedback settled since the last (or at the last checkpoint, or under
+/// TRUST_JS_OPT_EAGER at any), the tier compiles the chunk again, the snapshot holding the exit
+/// profile's flags, and installs the code in place of the template JIT's. A refusal keeps the
+/// template JIT's code. No Realm test: the code's guards compare the Realm's global environment.
+pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
+    let profile = ChunkProfile::of(chunk);
+    let Some((checkpoint, at)) = profile.warm_up() else {
+        return;
+    };
+    let runs = chunk.jit_runs.get();
+    if runs < at {
+        // Another request moved the word (a stale chain's, which its branch declined): the
+        // warm-up's checkpoint stands.
+        chunk.set_inline_retry_at(at);
+        return;
+    }
+    let r = ChunkProfile::get(profile::first_stage(chunk)).map_or(0, ChunkProfile::discards);
+    let last = checkpoint >= WARM_UP_CHECKPOINTS;
+    if last {
+        profile.disarm();
+        chunk.set_inline_retry_at(0);
+    } else {
+        let next = runs.saturating_add(warm_up_gap(r, checkpoint));
+        profile.arm(checkpoint + 1, next);
+        chunk.set_inline_retry_at(next);
+    }
+    if waits_at(chunk, checkpoint, last, " (reoptimization)") {
+        return;
+    }
+    profile.disarm();
+    chunk.set_inline_retry_at(0);
+    forget(chunk);
     if log_enabled() {
         eprintln!(
-            "[opt] {} fell back after {EXIT_LIMIT} exits to the {}",
-            name(chunk),
-            if compiled {
-                "template JIT's code"
-            } else {
-                "VM"
-            }
+            "[opt] reoptimizing {} at checkpoint {checkpoint} (R {r})",
+            name(chunk)
         );
     }
     release_retired(i);
+    if let Some(code) = generate(i, chunk) {
+        if install(i, chunk, code) {
+            move_epoch("reoptimization");
+        }
+    }
+    release_retired(i);
+}
+
+/// Make `code`, the tier's recompile of `chunk`, the chunk's native code: in place of the
+/// resident code, which joins the retired codes until no activation runs it, or in a cold slot
+/// (evicted, or left cold by a deferred discard). An unavailable slot keeps the chunk in the VM.
+fn install(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
+    match chunk.jit.get() {
+        Some(Some(_)) => {
+            if let Some(replaced) = chunk.jit.replace_resident(Some(code)) {
+                i.opt_retired.push(replaced);
+            }
+            true
+        }
+        Some(None) => {
+            if log_enabled() {
+                eprintln!("[opt] refused {}: an unavailable code slot", name(chunk));
+            }
+            false
+        }
+        None => match chunk.jit.begin_compile() {
+            Some(permit) => {
+                permit.commit(Some(code));
+                true
+            }
+            None => {
+                if log_enabled() {
+                    eprintln!("[opt] refused {}: no code slot", name(chunk));
+                }
+                false
+            }
+        },
+    }
 }
 
 /// The template JIT compiled `chunk`'s code at `base`, `len` bytes: under TRUST_JS_OPT_LOG with
 /// the tier on, a second stage's (a chunk with a record map, the tier's own empty-plan chunks
 /// among them) is logged with its code range, as the tier's compiles are, so that a profile's
 /// samples tell the two kinds of second-stage code apart (the perf map names both `JS:^`).
-/// "fallback" is `fall_back`'s compile; "second stage" any other, such as the first native
+/// "fallback" is a discard's compile; "second stage" any other, such as the first native
 /// entry's compile of a second stage the tier refused, or a loop's borrowed-frame code.
 pub(crate) fn note_template(chunk: &Chunk, base: *mut u8, len: usize) {
     if !log_enabled() || !enabled() || chunk.feedback_vector().record_map().is_none() {
         return;
     }
-    let why = if FALLING_BACK.with(std::cell::Cell::get) {
+    let why = if DISCARDING.with(Cell::get) {
         "fallback"
     } else {
         "second stage"

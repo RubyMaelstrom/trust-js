@@ -81,10 +81,10 @@ impl NativeCodeSlot {
 
     /// Replace the slot's resident code with `code` (`None`: the slot becomes unavailable, and
     /// the bytecode VM runs its chunk), keeping its registration; returns the code it held, which
-    /// activations may still be running. The optimizing tier's fallback after repeated exits
-    /// (`opt::fall_back`): the caller moves the call caches' epoch, so that no way enters the old
-    /// code again, and keeps that code alive until no activation runs it. Nothing happens to a
-    /// slot that holds no resident code.
+    /// activations may still be running. The optimizing tier's discard after repeated exits and
+    /// its recompile (`opt::discard`, `opt::reoptimize`): the caller moves the call caches'
+    /// epoch, so that no way enters the old code again, and keeps that code alive until no
+    /// activation runs it. Nothing happens to a slot that holds no resident code.
     #[cfg(all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -106,6 +106,39 @@ impl NativeCodeSlot {
             unreachable!("checked: resident")
         };
         Some(old)
+    }
+
+    /// Take the slot's resident code out and leave the slot cold, without a cooldown and with
+    /// its registration released, so that the chunk's next entry compiles again; returns the
+    /// code, which activations may still be running (the caller keeps it alive until none does,
+    /// and moves the call caches' epoch). The optimizing tier's discard when the template JIT's
+    /// compile is deferred for capacity (`opt::discard`): an unavailable slot would leave the
+    /// chunk to the VM for good. Nothing happens to a slot that holds no resident code.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn discard(&self) -> Option<Rc<JitCode>> {
+        let state = self.state.get()?;
+        let mut contents = state.code.borrow_mut();
+        if !matches!(*contents, CodeState::Resident(_)) {
+            return None;
+        }
+        let CodeState::Resident(code) = std::mem::take(&mut *contents) else {
+            unreachable!("checked: resident")
+        };
+        drop(contents);
+        state.cooldown.set(0);
+        let mut retired = Retirement::default();
+        REGISTRY.with(|registry| {
+            let mut registry = registry.borrow_mut();
+            let index = state.registration.replace(NO_REGISTRATION);
+            if index != NO_REGISTRATION {
+                registry.remove(index as usize, &mut retired);
+            }
+        });
+        retired.finish();
+        Some(code)
     }
 
     /// No compile was ever attempted for this slot (nothing resident, pending or reclaimed).
