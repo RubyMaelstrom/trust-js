@@ -777,6 +777,7 @@ impl Gen<'_> {
             slots: slots.into(),
             stack: stack.into(),
             handlers: state.handlers.clone(),
+            shape_check: None,
         };
         let site = self.a.new_label();
         let ret = self.a.new_label();
@@ -942,6 +943,15 @@ impl Gen<'_> {
             }
             NodeOp::CheckShape(shapes) => {
                 let site = self.check_exit(n)?;
+                // For the log: what a WrongShape exit expected, and where its receiver is.
+                let pc = graph.state(node.state.expect("checked")).pc;
+                let receiver = self.source(input(0), pc)?;
+                if let Some((_, _, record)) = self.exits.last_mut() {
+                    record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
+                        receiver,
+                        shapes: shapes.clone().into(),
+                    }));
+                }
                 let word = self.gp(input(0), X16);
                 let t = if word == X16 { X17 } else { X16 };
                 self.a.asr_imm(t, word, 48);

@@ -70,6 +70,16 @@ pub(crate) struct ExitRecord {
     pub(crate) stack: Box<[Source]>,
     /// The handler records active at `pc`, innermost last: (push pc, operand depth at the push).
     pub(crate) handlers: Box<[(u32, u32)]>,
+    /// A shape check's receiver and expected shapes, which a WrongShape exit's log line shows
+    /// (`describe_receiver`).
+    pub(crate) shape_check: Option<Box<ShapeCheck>>,
+}
+
+/// What a shape check tested: the receiver word's source at the check, and its shapes.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ShapeCheck {
+    pub(crate) receiver: Source,
+    pub(crate) shapes: Box<[u32]>,
 }
 
 /// A code object's exits.
@@ -116,6 +126,9 @@ fn record_bytes(record: &ExitRecord) -> usize {
         + record.slots.len() * std::mem::size_of::<(u16, Source)>()
         + record.stack.len() * std::mem::size_of::<Source>()
         + record.handlers.len() * 8
+        + record.shape_check.as_ref().map_or(0, |check| {
+            std::mem::size_of::<ShapeCheck>() + check.shapes.len() * 4
+        })
 }
 
 /// The exit tables of the optimized code objects alive in the process, by their code's first
@@ -218,6 +231,35 @@ unsafe fn read(saved: *const u64, source: Source) -> crate::value::Value {
     }
 }
 
+/// A WrongShape exit's log detail: the shapes the check expected, and the receiver's, or what
+/// the receiver is when it is no object (a primitive whose wrapper prototype a cache way names,
+/// say).
+fn describe_receiver(word: crate::value::Value, shapes: &[u32]) -> String {
+    use crate::value::ValueView;
+    let expected: Vec<String> = shapes.iter().map(|shape| format!("{shape:#x}")).collect();
+    let actual = match word.view() {
+        ValueView::Obj(object) => match object.try_borrow() {
+            Ok(object) => format!(
+                "{:#x}{}",
+                object.props.shape(),
+                if object.ic_plain() {
+                    ""
+                } else {
+                    " (not IC-plain)"
+                }
+            ),
+            Err(_) => "an object in use".to_string(),
+        },
+        ValueView::Str(_) => "a string".to_string(),
+        ValueView::Num(_) => "a number".to_string(),
+        ValueView::Bool(_) => "a Boolean".to_string(),
+        ValueView::Undefined => "undefined".to_string(),
+        ValueView::Null => "null".to_string(),
+        _ => "another primitive".to_string(),
+    };
+    format!(" expected [{}] actual {actual}", expected.join(" "))
+}
+
 /// The exit stub's call (`a64`): apply the exit's recipe, then run the chunk in the VM from its pc
 /// to completion. Returns 1 with `ctx.ret` the completion's value or 0 with `ctx.error` set,
 /// which the stub turns into the matching epilogue.
@@ -243,8 +285,14 @@ pub(crate) unsafe extern "C" fn deoptimize(
         reason = ExitReason::Forced;
     }
     if super::log_enabled() {
+        let detail = match &exit.shape_check {
+            Some(check) if reason == ExitReason::WrongShape => {
+                describe_receiver(unsafe { read(saved, check.receiver) }, &check.shapes)
+            }
+            _ => String::new(),
+        };
         eprintln!(
-            "[opt] exit {} pc {} {:?} ({:?})",
+            "[opt] exit {} pc {} {:?} ({:?}){detail}",
             table.name, exit.pc, reason, exit.kind
         );
     }

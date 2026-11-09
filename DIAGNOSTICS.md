@@ -69,11 +69,12 @@ comment/example in the same change.
   forced exits are not counted against the 100. `TRUST_JS_OPT_LOG=1` prints one stderr line
   per compile (with its time and code range, `at <base> <length>` in hex), refusal (with its
   reason and pc), wait for settled feedback (with the function and checkpoint), compile of
-  unsettled feedback at the last checkpoint, exit (with its pc, reason and kind), and fallback,
-  and one per template JIT compile of a second stage: `[opt] template <base> <length> <name>
-  (second stage|fallback)`, the code of a second stage the tier refused (or of a loop's
-  borrowed-frame entry) or of a fallback. A profile's samples join to these ranges, since the
-  perf map names a second stage's template code `JS:^`, as its first stage's.
+  unsettled feedback at the last checkpoint, exit (with its pc, reason and kind, and for a shape
+  check's the shapes it expected and the receiver's, or what the receiver is when it is no
+  object), and fallback, and one per template JIT compile of a second stage: `[opt] template
+  <base> <length> <name> (second stage|fallback)`, the code of a second stage the tier refused
+  (or of a loop's borrowed-frame entry) or of a fallback. A profile's samples join to these
+  ranges, since the perf map names a second stage's template code `JS:^`, as its first stage's.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at
