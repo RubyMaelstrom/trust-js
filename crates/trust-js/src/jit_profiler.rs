@@ -13,8 +13,16 @@
 //! marker for Sparkplug code (`CodeKindToMarker`, src/objects/code-kind.cc). A shared stub is
 //! `Stub:<kind>` and a RegExp program `RegExp:/<source>/<flags>` (V8 now writes
 //! `RegExp.< src: '<source>' flags: '<flags>'`, a form pprof's demangler needs). Freed code is
-//! not unlisted, as the format has no unload record (V8's map has the same limit; a jitdump for
-//! `perf inject --jit` would lift it if address reuse confused a profile).
+//! not unlisted, as the format has no unload record (V8's map has the same limit).
+//!
+//! `TRUST_JS_PERF_JITDUMP=<directory>` writes perf's jitdump, `<directory>/jit-<pid>.dump`
+//! (Linux tools/perf/Documentation/jitdump-specification.txt), as V8's `--perf-prof` does
+//! (`LinuxPerfJitLogger`, src/diagnostics/perf-jit.cc): one JIT_CODE_LOAD record per piece of code
+//! the perf map lists, timestamped with CLOCK_MONOTONIC, so that a sample at an address a freed
+//! code's memory held before another code took it is attributed to the code that ran then, where
+//! the perf map's last line at the address takes every sample. A record names its code as the
+//! perf map does, and with the optimizing tier on, a second stage's template code adds its
+//! class, ` (second stage)` or ` (fallback)` (`opt::template_class`).
 //!
 //! `TRUST_JS_JIT_GPROFNG` registers live chunks with GNU gprofng. The ABI is the public GNU
 //! Binutils `collectorAPI.h` interface. No collector is linked or loaded by TRust JS; both
@@ -29,11 +37,16 @@ use std::rc::Rc;
 pub(super) fn register(chunk: &Chunk, memory: *mut u8, length: usize) {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     native::register(chunk, memory, length);
-    perf_map_code(memory, length, || match &chunk.perf_map_label {
-        Some(label) => label.to_string(),
-        // Compiled while this thread's map was off: only a test turns a map on mid-process.
-        None => chunk_label(None, chunk.jit_slot_names()).into(),
-    });
+    list_code(
+        memory,
+        length,
+        crate::opt::template_class(chunk),
+        || match &chunk.perf_map_label {
+            Some(label) => label.to_string(),
+            // Compiled while this thread's map was off: only a test turns a map on mid-process.
+            None => chunk_label(None, chunk.jit_slot_names()).into(),
+        },
+    );
 }
 
 /// Register the optimizing tier's code for `chunk` (P3 stage 1, `opt::a64`): named as V8 names
@@ -72,16 +85,32 @@ pub(super) fn unregister(memory: *mut u8) {
     let _ = memory;
 }
 
-/// Whether the code this thread generates is listed in a perf map (`TRUST_JS_PERF_MAP`). Names
-/// are built only when it is, so the default path pays this check per piece of code.
+/// Whether the code this thread generates is listed in a perf map (`TRUST_JS_PERF_MAP`) or a
+/// jitdump (`TRUST_JS_PERF_JITDUMP`). Names are built only when it is, so the default path pays
+/// this check per piece of code.
 pub(crate) fn perf_map_enabled() -> bool {
-    with_perf_map(|_| ()).is_some()
+    with_perf_map(|_| ()).is_some() || jitdump::process().is_some()
 }
 
-/// List `length` bytes of generated code at `memory` in the perf map, under the name `name`
-/// builds, if the map is on.
+/// List `length` bytes of generated code at `memory` in the perf map and the jitdump, whichever
+/// is on, under the name `name` builds.
 pub(crate) fn perf_map_code(memory: *const u8, length: usize, name: impl FnOnce() -> String) {
-    with_perf_map(|map| map.write(&perf_map_line(memory as usize, length, &name())));
+    list_code(memory, length, None, name);
+}
+
+/// [`perf_map_code`], the jitdump's name adding `class`, the optimizing tier's class of a second
+/// stage's template code, in parentheses.
+fn list_code(memory: *const u8, length: usize, class: Option<&str>, name: impl FnOnce() -> String) {
+    let Some(dump) = jitdump::process() else {
+        with_perf_map(|map| map.write(&perf_map_line(memory as usize, length, &name())));
+        return;
+    };
+    let name = name();
+    with_perf_map(|map| map.write(&perf_map_line(memory as usize, length, &name)));
+    match class {
+        Some(class) => dump.load(memory, length, &format!("{name} ({class})")),
+        None => dump.load(memory, length, &name),
+    }
 }
 
 /// The perf map name of a chunk compiled from `function` (none for a loop fragment), whose
@@ -448,6 +477,258 @@ mod native {
             assert!(label.to_str().unwrap().ends_with("@1234"));
             assert!(label.as_bytes().len() < 4096);
         }
+    }
+}
+
+/// perf's jitdump (see the module's doc): the header, the executable mapping of the file's first
+/// page that perf record logs and `perf inject --jit` finds the dump by, and one load record per
+/// piece of code.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+mod jitdump {
+    use std::io::Write as _;
+    use std::os::unix::io::AsRawFd as _;
+    use std::sync::{Mutex, OnceLock};
+
+    #[repr(C)]
+    struct Timespec {
+        tv_sec: i64,
+        tv_nsec: i64,
+    }
+
+    extern "C" {
+        fn clock_gettime(clock: i32, time: *mut Timespec) -> i32;
+        fn gettid() -> i32;
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+        fn sysconf(name: i32) -> i64;
+    }
+
+    const CLOCK_MONOTONIC: i32 = 1;
+    const PROT_READ: i32 = 1;
+    const PROT_EXEC: i32 = 4;
+    const MAP_PRIVATE: i32 = 2;
+    const SC_PAGESIZE: i32 = 30;
+    /// "JiTD" (jitdump-specification.txt, struct jitheader).
+    const MAGIC: u32 = 0x4A69_5444;
+    const VERSION: u32 = 1;
+    const HEADER_SIZE: u32 = 40;
+    const JIT_CODE_LOAD: u32 = 0;
+    /// A load record's fixed part: the prefix (id, size, timestamp), then pid, tid, vma, code
+    /// address, code size and code index.
+    const LOAD_SIZE: usize = 16 + 40;
+    #[cfg(target_arch = "aarch64")]
+    const ELF_MACH: u32 = 183; // EM_AARCH64
+    #[cfg(target_arch = "x86_64")]
+    const ELF_MACH: u32 = 62; // EM_X86_64
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    const ELF_MACH: u32 = 0;
+
+    /// CLOCK_MONOTONIC in nanoseconds: `perf record -k mono` stamps its samples with it.
+    fn now() -> u64 {
+        let mut time = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: a valid out pointer; CLOCK_MONOTONIC cannot fail on Linux.
+        unsafe { clock_gettime(CLOCK_MONOTONIC, &mut time) };
+        (time.tv_sec as u64)
+            .wrapping_mul(1_000_000_000)
+            .wrapping_add(time.tv_nsec as u64)
+    }
+
+    pub(super) struct JitDump {
+        /// The file and the next record's code index; one write per record under this lock.
+        file: Mutex<(std::fs::File, u64)>,
+    }
+
+    impl JitDump {
+        /// A new dump at `path`, its header written and its first page mapped executable.
+        pub(super) fn create(path: &std::path::Path) -> std::io::Result<JitDump> {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)?;
+            let mut header = Vec::with_capacity(HEADER_SIZE as usize);
+            header.extend_from_slice(&MAGIC.to_ne_bytes());
+            header.extend_from_slice(&VERSION.to_ne_bytes());
+            header.extend_from_slice(&HEADER_SIZE.to_ne_bytes());
+            header.extend_from_slice(&ELF_MACH.to_ne_bytes());
+            header.extend_from_slice(&0u32.to_ne_bytes());
+            header.extend_from_slice(&std::process::id().to_ne_bytes());
+            header.extend_from_slice(&now().to_ne_bytes());
+            header.extend_from_slice(&0u64.to_ne_bytes());
+            file.write_all(&header)?;
+            // The marker: perf record logs only executable mappings, and `perf inject --jit`
+            // finds the dump by this one's file name (V8's OpenMarkerFile). It stays mapped.
+            // SAFETY: a fresh private mapping of an open file, which nothing reads or writes.
+            let page = unsafe { sysconf(SC_PAGESIZE) }.max(4096) as usize;
+            let marker = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    page,
+                    PROT_READ | PROT_EXEC,
+                    MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            if marker as isize == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(JitDump {
+                file: Mutex::new((file, 0)),
+            })
+        }
+
+        /// A JIT_CODE_LOAD record for the `length` bytes of code at `memory`, named `name` (its
+        /// control characters escaped, as the perf map's are, so that no NUL ends it early).
+        pub(super) fn load(&self, memory: *const u8, length: usize, name: &str) {
+            let timestamp = now();
+            let mut escaped = String::with_capacity(name.len());
+            for ch in name.chars() {
+                if ch.is_control() {
+                    escaped.extend(ch.escape_default());
+                } else {
+                    escaped.push(ch);
+                }
+            }
+            let total = LOAD_SIZE + escaped.len() + 1 + length;
+            let Ok(total_u32) = u32::try_from(total) else {
+                return;
+            };
+            // SAFETY: the code was just written and published readable (its registration
+            // precedes any free of it).
+            let code = unsafe { std::slice::from_raw_parts(memory, length) };
+            // SAFETY: gettid cannot fail.
+            let tid = unsafe { gettid() } as u32;
+            let mut file = self
+                .file
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let index = file.1;
+            file.1 += 1;
+            let mut record = Vec::with_capacity(total);
+            record.extend_from_slice(&JIT_CODE_LOAD.to_ne_bytes());
+            record.extend_from_slice(&total_u32.to_ne_bytes());
+            record.extend_from_slice(&timestamp.to_ne_bytes());
+            record.extend_from_slice(&std::process::id().to_ne_bytes());
+            record.extend_from_slice(&tid.to_ne_bytes());
+            record.extend_from_slice(&(memory as u64).to_ne_bytes());
+            record.extend_from_slice(&(memory as u64).to_ne_bytes());
+            record.extend_from_slice(&(length as u64).to_ne_bytes());
+            record.extend_from_slice(&index.to_ne_bytes());
+            record.extend_from_slice(escaped.as_bytes());
+            record.push(0);
+            record.extend_from_slice(code);
+            // A diagnostic: a failed write loses the record, never the program.
+            let _ = file.0.write_all(&record);
+        }
+    }
+
+    /// The process's dump, when `TRUST_JS_PERF_JITDUMP` names a directory (not empty, not `0`).
+    /// The switch is read once; a dump that cannot be made is reported once, and nothing is
+    /// written.
+    pub(super) fn process() -> Option<&'static JitDump> {
+        static DUMP: OnceLock<Option<JitDump>> = OnceLock::new();
+        DUMP.get_or_init(|| {
+            let directory = std::env::var_os("TRUST_JS_PERF_JITDUMP")?;
+            if directory.is_empty() || directory == "0" {
+                return None;
+            }
+            let path =
+                std::path::Path::new(&directory).join(format!("jit-{}.dump", std::process::id()));
+            match JitDump::create(&path) {
+                Ok(dump) => Some(dump),
+                Err(error) => {
+                    eprintln!(
+                        "TRust JS: TRUST_JS_PERF_JITDUMP: cannot make {}: {error}",
+                        path.display()
+                    );
+                    None
+                }
+            }
+        })
+        .as_ref()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn u32_at(bytes: &[u8], at: usize) -> u32 {
+            u32::from_ne_bytes(bytes[at..at + 4].try_into().unwrap())
+        }
+
+        fn u64_at(bytes: &[u8], at: usize) -> u64 {
+            u64::from_ne_bytes(bytes[at..at + 8].try_into().unwrap())
+        }
+
+        #[test]
+        fn a_dump_holds_perfs_header_and_a_load_record_per_code() {
+            let path = std::env::temp_dir().join(format!(
+                "trust-js-jitdump-{}-{:?}.dump",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            let dump = JitDump::create(&path).expect("dump");
+            let code = [0xd503_201fu32; 4]; // four NOPs
+            let before = now();
+            // A computed function name can hold a NUL, which would end the record's name early.
+            dump.load(code.as_ptr().cast(), 16, "JS:^de\0mo (second stage)");
+            dump.load(code.as_ptr().cast(), 8, "Stub:a\nb");
+            let bytes = std::fs::read(&path).expect("read");
+            let _ = std::fs::remove_file(&path);
+            assert_eq!(u32_at(&bytes, 0), MAGIC);
+            assert_eq!(u32_at(&bytes, 4), VERSION);
+            assert_eq!(u32_at(&bytes, 8), HEADER_SIZE);
+            assert_eq!(u32_at(&bytes, 12), ELF_MACH);
+            assert_eq!(u32_at(&bytes, 20), std::process::id());
+            let mut at = HEADER_SIZE as usize;
+            let mut names = Vec::new();
+            for (index, size) in [(0u64, 16usize), (1, 8)] {
+                assert_eq!(u32_at(&bytes, at), JIT_CODE_LOAD);
+                let total = u32_at(&bytes, at + 4) as usize;
+                assert!(u64_at(&bytes, at + 8) >= before, "a monotonic timestamp");
+                assert_eq!(u32_at(&bytes, at + 16), std::process::id());
+                assert_eq!(u64_at(&bytes, at + 24), code.as_ptr() as u64);
+                assert_eq!(u64_at(&bytes, at + 32), code.as_ptr() as u64);
+                assert_eq!(u64_at(&bytes, at + 40), size as u64);
+                assert_eq!(u64_at(&bytes, at + 48), index);
+                let name_end = at
+                    + LOAD_SIZE
+                    + bytes[at + LOAD_SIZE..]
+                        .iter()
+                        .position(|&byte| byte == 0)
+                        .expect("a NUL-terminated name");
+                names.push(String::from_utf8(bytes[at + LOAD_SIZE..name_end].to_vec()).unwrap());
+                assert_eq!(total, name_end + 1 + size - at);
+                assert_eq!(
+                    &bytes[name_end + 1..name_end + 1 + size],
+                    &code
+                        .iter()
+                        .flat_map(|word| word.to_ne_bytes())
+                        .collect::<Vec<_>>()[..size]
+                );
+                at += total;
+            }
+            assert_eq!(at, bytes.len());
+            assert_eq!(names, ["JS:^de\\u{0}mo (second stage)", "Stub:a\\nb"]);
+        }
+    }
+}
+
+/// No jitdump where perf's interface is not GNU/Linux's.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+mod jitdump {
+    pub(super) struct JitDump;
+
+    impl JitDump {
+        pub(super) fn load(&self, _: *const u8, _: usize, _: &str) {}
+    }
+
+    pub(super) fn process() -> Option<&'static JitDump> {
+        None
     }
 }
 

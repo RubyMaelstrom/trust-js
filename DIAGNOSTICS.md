@@ -421,6 +421,16 @@ comment/example in the same change.
   While another perf session holds the user's locked-memory budget
   (`perf_event_mlock_kb`), `perf record` fails to open its events; smaller ring buffers
   (`-m 16`) let it open them.
+- `TRUST_JS_PERF_JITDUMP=<directory>` writes perf's jitdump, `<directory>/jit-<pid>.dump`
+  (Linux `tools/perf/Documentation/jitdump-specification.txt`), as V8's `--perf-prof` does: one
+  load record per piece of code the perf map lists, with its bytes, under the perf map's name,
+  and with the optimizing tier on, a second stage's template code marked `(second stage)` or
+  `(fallback)` (see `TRUST_JS_OPT_LOG`). Each record is stamped with `CLOCK_MONOTONIC`, so a
+  profile recorded with `perf record -k mono` attributes a sample to the code that ran at its
+  address then, where the perf map gives an address that freed code's memory left to later code
+  to its last entry. `perf inject --jit -i perf.data -o perf.jit.data` writes one ELF file per
+  record beside the dump; report from `perf.jit.data`. GNU/Linux only; the file lives until it
+  is deleted, and the map's switch may be on or off with it.
 
 ## RegExp diagnostic controls
 

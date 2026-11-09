@@ -622,20 +622,32 @@ fn install(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
     }
 }
 
-/// The template JIT compiled `chunk`'s code at `base`, `len` bytes: under TRUST_JS_OPT_LOG with
-/// the tier on, a second stage's (a chunk with a record map, the tier's own empty-plan chunks
-/// among them) is logged with its code range, as the tier's compiles are, so that a profile's
-/// samples tell the two kinds of second-stage code apart (the perf map names both `JS:^`).
-/// "fallback" is a discard's compile; "second stage" any other, such as the first native
-/// entry's compile of a second stage the tier refused, or a loop's borrowed-frame code.
-pub(crate) fn note_template(chunk: &Chunk, base: *mut u8, len: usize) {
-    if !log_enabled() || !enabled() || chunk.feedback_vector().record_map().is_none() {
-        return;
+/// What the template JIT's code for `chunk`, compiled now, is to the tier: with the tier on, a
+/// second stage's (a chunk with a record map, the tier's own empty-plan chunks among them) is
+/// "fallback" when a discard compiles it and "second stage" otherwise, such as the first native
+/// entry's compile of a second stage the tier refused, or a loop's borrowed-frame code; None for
+/// any other code. The log (`note_template`) and the jitdump's names (`jit::profiler`) mark it.
+pub(crate) fn template_class(chunk: &Chunk) -> Option<&'static str> {
+    if !enabled() || chunk.feedback_vector().record_map().is_none() {
+        return None;
     }
-    let why = if DISCARDING.with(Cell::get) {
+    Some(if DISCARDING.with(Cell::get) {
         "fallback"
     } else {
         "second stage"
+    })
+}
+
+/// The template JIT compiled `chunk`'s code at `base`, `len` bytes: under TRUST_JS_OPT_LOG, a
+/// second stage's (`template_class`) is logged with its code range, as the tier's compiles are,
+/// so that a profile's samples tell the two kinds of second-stage code apart (the perf map names
+/// both `JS:^`).
+pub(crate) fn note_template(chunk: &Chunk, base: *mut u8, len: usize) {
+    if !log_enabled() {
+        return;
+    }
+    let Some(why) = template_class(chunk) else {
+        return;
     };
     eprintln!(
         "[opt] template {:#x} {:#x} {} ({why})",

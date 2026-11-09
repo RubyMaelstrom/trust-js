@@ -126,6 +126,10 @@ mod off {
 
     pub(crate) fn note_template(_: &Chunk, _: *mut u8, _: usize) {}
 
+    pub(crate) fn template_class(_: &Chunk) -> Option<&'static str> {
+        None
+    }
+
     pub(crate) fn compile_into(_: &mut Interp, _: &Chunk) -> bool {
         false
     }
