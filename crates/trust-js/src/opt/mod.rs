@@ -11,7 +11,8 @@
 //! - `snapshot`: the immutable per-compile summary of the chunk's feedback (one view per pc), and
 //!   the feedback fingerprint the settled-feedback rule compares between checkpoints;
 //! - `build`: the graph from the chunk's operations and the snapshot (one forward pass, known
-//!   facts, never-run blocks as exits), or a refusal;
+//!   facts, never-run blocks as exits), or a refusal, with `liveness`, the slots each pc may read,
+//!   and `phis`, the selection of each phi's representation after the build (stage 2 step 6);
 //! - `verify`: the graph's invariants (SSA dominance, representations, states, terminators);
 //! - `regalloc` and `a64`: registers and ARM64 code, the effects through the baseline templates,
 //!   the exits;
@@ -64,6 +65,14 @@ pub(crate) mod ir;
     )
 ))]
 pub(crate) mod liveness;
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
+pub(crate) mod phis;
 // Every chunk carries the record's cell (`Chunk::opt`), wherever the tier has a back end or not.
 pub(crate) mod profile;
 #[cfg(all(

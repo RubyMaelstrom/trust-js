@@ -315,6 +315,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::CheckInt32 => (F64, Rep::I32),
         NodeOp::CheckObject | NodeOp::CheckShape(_) => (TAGGED, Rep::Cell),
         NodeOp::CheckBoolean | NodeOp::ToBoolean => (TAGGED, Rep::Bool),
+        NodeOp::F64ToBoolean => (F64, Rep::Bool),
         NodeOp::I32ToF64 => (I32, Rep::F64),
         NodeOp::TruncateToInt32 => (F64, Rep::I32),
         NodeOp::I32UShrToF64 => (I32S, Rep::F64),

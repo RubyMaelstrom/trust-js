@@ -319,22 +319,25 @@ fn an_f64_that_arithmetic_made_is_truncated_for_a_bitwise_operation() {
 
 #[test]
 fn a_loop_has_header_phis_with_back_edge_inputs() {
-    let mut engine = engine(Tier::Jit);
-    eval(
-        &mut engine,
-        "function sum(n) { var s = 0; for (var i = 0; i < n; i++) s += i; return s; }
-         for (var k = 0; k < 20; k++) sum(10);",
-    );
-    let (chunk, graph) = graph_of(&mut engine, "sum");
+    const SUM: &str = "function sum(n) { var s = 0; for (var i = 0; i < n; i++) s += i; return s; }
+         for (var k = 0; k < 20; k++) sum(10);";
+    let header_of = |graph: &Graph| -> BlockData {
+        let headers: Vec<&BlockData> = graph
+            .blocks
+            .iter()
+            .filter(|block| block.loop_header)
+            .collect();
+        assert_eq!(headers.len(), 1);
+        headers[0].clone()
+    };
+    // The first stage's in-line hits record nothing: no int32 hint, so `s` and `i` add as f64s,
+    // and their phis are F64 (stage 2 step 6), from the constant 0 and the sums.
+    let mut jit = engine(Tier::Jit);
+    eval(&mut jit, SUM);
+    let (chunk, graph) = graph_of(&mut jit, "sum");
     let text = dump(&graph, &chunk);
     assert_eq!(count(&graph, is_effect), 0, "{text}");
-    let headers: Vec<&BlockData> = graph
-        .blocks
-        .iter()
-        .filter(|block| block.loop_header)
-        .collect();
-    assert_eq!(headers.len(), 1, "{text}");
-    let header = headers[0];
+    let header = header_of(&graph);
     assert_eq!(header.preds.len(), 2, "an entry and a back edge: {text}");
     // The header's poll opens its body and exits, on a throw, with the header's state.
     let poll = graph.node(header.body[0]);
@@ -343,21 +346,55 @@ fn a_loop_has_header_phis_with_back_edge_inputs() {
     let state = graph.state(poll.state.expect("a poll has a state"));
     assert_eq!(state.pc, header.first_pc, "{text}");
     assert_eq!(count(&graph, |op| *op == NodeOp::Poll), 1, "{text}");
-    // `s` and `i` are assigned in the loop; `n` is not, and the loop's arithmetic could have been
-    // an effect, so it is read from the frame.
+    // `s` and `i` are assigned in the loop; `n` is not, and keeps its word through the header.
     assert_eq!(header.phis.len(), 2, "{text}");
     for &phi in &header.phis {
-        assert_eq!(graph.node(phi).inputs.len(), 2, "{text}");
-        assert_eq!(graph.node(phi).rep, Rep::Tagged, "{text}");
+        let node = graph.node(phi);
+        assert_eq!(node.rep, Rep::F64, "{text}");
+        assert_eq!(node.inputs.len(), 2, "{text}");
+        assert_eq!(graph.node(node.inputs[0]).op, NodeOp::ConstF64(0), "{text}");
+        assert_eq!(graph.node(node.inputs[1]).op, NodeOp::F64Add, "{text}");
     }
     assert_eq!(
         count(&graph, |op| *op == NodeOp::F64Cmp(Cond::Lt)),
         1,
         "{text}"
     );
-    // `i`'s check in the header serves `s += i` and `i++` too.
-    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 3, "{text}");
+    // Only `n` is checked (in the loop: loop-invariant checks stay where they are); the phis
+    // need no check and their sums no boxing, but where `s` is returned.
+    let checks = nodes(&graph, |op| *op == NodeOp::CheckNumber);
+    assert_eq!(checks.len(), 1, "{text}");
+    assert_eq!(
+        graph.node(checks[0].inputs[0]).op,
+        NodeOp::EntrySlot(0),
+        "{text}"
+    );
     assert_eq!(count(&graph, |op| *op == NodeOp::F64Add), 2, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64ToTagged), 1, "{text}");
+    // With the VM's records, whose int32s are the hint, the phis are I32 and the adds int32s
+    // with their overflow exits.
+    let mut vm = engine(Tier::Bytecode);
+    eval(&mut vm, SUM);
+    let (chunk, graph) = graph_of(&mut vm, "sum");
+    let text = dump(&graph, &chunk);
+    let header = header_of(&graph);
+    assert_eq!(header.phis.len(), 2, "{text}");
+    for &phi in &header.phis {
+        let node = graph.node(phi);
+        assert_eq!(node.rep, Rep::I32, "{text}");
+        assert_eq!(graph.node(node.inputs[0]).op, NodeOp::ConstI32(0), "{text}");
+        assert_eq!(graph.node(node.inputs[1]).op, NodeOp::I32Add, "{text}");
+    }
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Add), 2, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::I32Cmp(Cond::Lt)),
+        1,
+        "{text}"
+    );
+    // `n`'s checks; none of a phi.
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckInt32), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32ToTagged), 1, "{text}");
 }
 
 #[test]
@@ -3391,4 +3428,344 @@ fn an_operand_a_lowered_form_cannot_take_exits_where_the_rules_lower_it() {
             .any(|node| node.pc as usize == mul),
         "{text}"
     );
+}
+
+// ---- untagged phis (stage 2, step 6) ------------------------------------------------------------
+
+/// The phis of `graph`'s blocks, by block.
+fn phis_of(graph: &Graph) -> Vec<&Node> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.phis.iter().map(|&phi| graph.node(phi)))
+        .collect()
+}
+
+/// The one phi of `graph` that merges `chunk`'s local `name` at the block that starts at `pc`
+/// (a phi a state at that pc names for the slot).
+fn phi_of_slot(graph: &Graph, chunk: &Chunk, name: &str, pc: u32) -> NodeIx {
+    let slot = slot_named(chunk, name) as usize;
+    let block = graph
+        .blocks
+        .iter()
+        .find(|block| block.first_pc == pc && !block.phis.is_empty())
+        .unwrap_or_else(|| panic!("a join at pc {pc}"));
+    graph
+        .states
+        .iter()
+        .filter(|state| state.pc == pc)
+        .find_map(|state| match state.slots[slot] {
+            SlotSource::Value(value) if block.phis.contains(&value) => Some(value),
+            _ => None,
+        })
+        .or_else(|| {
+            // A join without a state at its pc: its phis' order follows the slots'.
+            block.phis.iter().copied().find(|&phi| {
+                graph
+                    .nodes
+                    .iter()
+                    .any(|node| node.op == NodeOp::StoreSlot(slot as u16) && node.inputs[0] == phi)
+            })
+        })
+        .unwrap_or_else(|| panic!("{name}'s phi at pc {pc}"))
+}
+
+#[test]
+fn an_accumulator_of_halves_is_an_f64_phi_from_the_constant_zero() {
+    // `x` starts at the int32 constant 0 and adds 0.5: an F64 phi whose entry input is the
+    // constant as an f64 (inputs only widen). With the VM's records `i` is an I32 phi.
+    let mut vm = vm_engine(
+        "function acc(n) { var x = 0; for (var i = 0; i < n; i++) x += 0.5; return x; }
+         for (var k = 0; k < 20; k++) acc(10);",
+    );
+    let (chunk, graph) = graph_of(&mut vm, "acc");
+    let text = dump(&graph, &chunk);
+    let header = the_loop(&graph);
+    let x = graph.node(phi_of_slot(&graph, &chunk, "x", header));
+    assert_eq!(x.rep, Rep::F64, "{text}");
+    assert_eq!(graph.node(x.inputs[0]).op, NodeOp::ConstF64(0), "{text}");
+    assert_eq!(graph.node(x.inputs[1]).op, NodeOp::F64Add, "{text}");
+    let i = graph.node(phi_of_slot(&graph, &chunk, "i", header));
+    assert_eq!(i.rep, Rep::I32, "{text}");
+    assert_eq!(graph.node(i.inputs[0]).op, NodeOp::ConstI32(0), "{text}");
+    // No phi is checked or boxed in the loop.
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 1, "n's: {text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32ToTagged), 0, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64ToTagged), 1, "the return's: {text}");
+}
+
+#[test]
+fn a_join_of_an_int32_and_an_f64_is_an_f64_phi_the_int32_widened_in_its_predecessor() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function join(a, c) { var x; if (c) { x = a | 0; } else { x = a * 0.5; } return x + 1; }
+         for (var i = 0; i < 20; i++) { join(i, true); join(i, false); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "join");
+    let text = dump(&graph, &chunk);
+    let phis = phis_of(&graph);
+    assert_eq!(phis.len(), 1, "{text}");
+    let phi = phis[0];
+    assert_eq!(phi.rep, Rep::F64, "{text}");
+    let preds = &graph.block(phi.block).preds;
+    let widened: Vec<&Node> = phi
+        .inputs
+        .iter()
+        .map(|&input| graph.node(input))
+        .filter(|input| input.op == NodeOp::I32ToF64)
+        .collect();
+    assert_eq!(widened.len(), 1, "{text}");
+    assert_eq!(graph.node(widened[0].inputs[0]).op, NodeOp::I32Or, "{text}");
+    assert!(preds.contains(&widened[0].block), "in its predecessor: {text}");
+    assert!(
+        phi.inputs
+            .iter()
+            .any(|&input| graph.node(input).op == NodeOp::F64Mul),
+        "{text}"
+    );
+    // `x + 1` takes the phi as it is: no check (but `a`'s in each arm), no boxing of an input.
+    let checks = nodes(&graph, |op| *op == NodeOp::CheckNumber);
+    assert_eq!(checks.len(), 2, "{text}");
+    assert!(
+        checks
+            .iter()
+            .all(|check| graph.node(check.inputs[0]).op == NodeOp::EntrySlot(0)),
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32ToTagged), 0, "{text}");
+}
+
+#[test]
+fn undefined_keeps_a_phi_tagged() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function u(c, a) { var x = void 0; if (c) { x = a * 2; } return x; }
+         for (var i = 0; i < 20; i++) { u(true, i); u(false, i); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "u");
+    let text = dump(&graph, &chunk);
+    let phis = phis_of(&graph);
+    assert_eq!(phis.len(), 1, "{text}");
+    assert_eq!(phis[0].rep, Rep::Tagged, "{text}");
+    assert!(
+        phis[0]
+            .inputs
+            .iter()
+            .any(|&input| graph.node(input).op == NodeOp::ConstTagged(PACK_UNDEFINED)),
+        "{text}"
+    );
+    assert!(
+        phis[0]
+            .inputs
+            .iter()
+            .any(|&input| graph.node(input).op == NodeOp::F64ToTagged),
+        "the f64 boxed in its predecessor: {text}"
+    );
+}
+
+#[test]
+fn a_back_edge_that_keeps_a_phis_value_does_not_vote() {
+    // `x` reaches the header from the entry (1), from the `continue` (2.5) and from the body's
+    // end, which keeps it: the phi is F64 and takes itself there.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function keep(n, c) { var x = 1, i = 0;
+           while (i < n) { i = i + 1; if (c) { x = 2.5; continue; } } return x; }
+         for (var k = 0; k < 20; k++) { keep(4, true); keep(4, false); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "keep");
+    let text = dump(&graph, &chunk);
+    let header = the_loop(&graph);
+    let x = phi_of_slot(&graph, &chunk, "x", header);
+    let node = graph.node(x);
+    assert_eq!(node.rep, Rep::F64, "{text}");
+    assert_eq!(node.inputs.len(), 3, "{text}");
+    assert!(node.inputs.contains(&x), "its own back edge: {text}");
+    let constants: Vec<NodeOp> = node
+        .inputs
+        .iter()
+        .filter(|&&input| input != x)
+        .map(|&input| graph.node(input).op.clone())
+        .collect();
+    assert_eq!(
+        constants,
+        [
+            NodeOp::ConstF64(1f64.to_bits()),
+            NodeOp::ConstF64(2.5f64.to_bits())
+        ],
+        "{text}"
+    );
+}
+
+#[test]
+fn an_inner_join_feeding_a_loop_phi_settles_with_it() {
+    // The loop phi of `x` takes the inner join's phi on its back edge, and the join takes the
+    // loop phi on one arm: undecided each until the other is, both untagged together.
+    let source = "function inner(n) { var x = 0; for (var i = 0; i < n; i++) { if (i & 1) { x = x + 1; } }
+           return x; }
+         for (var k = 0; k < 20; k++) inner(9);";
+    for (tier, rep) in [(Tier::Jit, Rep::F64), (Tier::Bytecode, Rep::I32)] {
+        let mut engine = engine(tier);
+        eval(&mut engine, source);
+        let (chunk, graph) = graph_of(&mut engine, "inner");
+        let text = dump(&graph, &chunk);
+        let header = the_loop(&graph);
+        let x = phi_of_slot(&graph, &chunk, "x", header);
+        assert_eq!(graph.node(x).rep, rep, "{tier:?}: {text}");
+        let join = graph
+            .node(x)
+            .inputs
+            .iter()
+            .copied()
+            .find(|&input| graph.node(input).op == NodeOp::Phi)
+            .unwrap_or_else(|| panic!("the inner join's phi: {text}"));
+        assert_eq!(graph.node(join).rep, rep, "{tier:?}: {text}");
+        assert!(graph.node(join).inputs.contains(&x), "{tier:?}: {text}");
+        assert!(
+            phis_of(&graph).iter().all(|phi| phi.rep != Rep::Tagged),
+            "{tier:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn slot_stores_and_effects_take_untagged_phis_and_a_call_keeps_them_in_callee_saved_homes() {
+    // `s` (F64) and `i` (I32, by its `| 0`) are on the operand stack across the call: the flush
+    // before it stores `i`, live after it, as it is (`s` is dead there), the call takes `i` as its
+    // operand as it is, and the allocator gives each phi a callee-saved home (d8-d15, x23-x28).
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function withcall(n, g) { var s = 0.5, i = 0;
+           for (var k = 0; k < n; k++) { s = s + (i + g(i)); i = (i + 1) | 0; } return s; }
+         function id(v) { return v; }
+         for (var r = 0; r < 20; r++) withcall(8, id);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "withcall");
+    let text = dump(&graph, &chunk);
+    let header = the_loop(&graph);
+    let s = phi_of_slot(&graph, &chunk, "s", header);
+    let i = phi_of_slot(&graph, &chunk, "i", header);
+    assert_eq!(graph.node(s).rep, Rep::F64, "{text}");
+    assert_eq!(graph.node(i).rep, Rep::I32, "{text}");
+    let i_slot = slot_named(&chunk, "i");
+    assert!(
+        nodes(&graph, |op| *op == NodeOp::StoreSlot(i_slot))
+            .iter()
+            .any(|store| store.inputs[0] == i),
+        "{text}"
+    );
+    let call = nodes(&graph, is_effect);
+    assert_eq!(call.len(), 1, "{text}");
+    assert!(call[0].inputs.contains(&i), "{text}");
+    let state = graph.state(call[0].state.expect("an effect's state"));
+    assert_eq!(
+        state.slots[slot_named(&chunk, "s") as usize],
+        SlotSource::Dead,
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32ToTagged), 0, "{text}");
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        use super::regalloc::{allocate, Home, ARM64};
+        let alloc = allocate(&graph, &ARM64).expect("allocated");
+        assert!(
+            matches!(alloc.homes[s.index()], Home::Fp(r) if ARM64.fp_callee.contains(&r)),
+            "{:?}: {text}",
+            alloc.homes[s.index()]
+        );
+        assert!(
+            matches!(alloc.homes[i.index()], Home::Gp(r) if ARM64.gp_callee.contains(&r)),
+            "{:?}: {text}",
+            alloc.homes[i.index()]
+        );
+    }
+}
+
+#[test]
+fn a_phi_used_as_a_word_is_retagged_once_per_block() {
+    // After the loop, `o.v = x` and `return x` take the F64 phi's word: one retagging.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function ret(o, n) { var x = 0; for (var i = 0; i < n; i++) x = x + 0.5; o.v = x;
+           return x; }
+         var p = {v: 0};
+         for (var k = 0; k < 20; k++) ret(p, 4);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "ret");
+    let text = dump(&graph, &chunk);
+    let header = the_loop(&graph);
+    let x = phi_of_slot(&graph, &chunk, "x", header);
+    assert_eq!(graph.node(x).rep, Rep::F64, "{text}");
+    let retags = nodes(&graph, |op| *op == NodeOp::F64ToTagged);
+    assert_eq!(retags.len(), 1, "{text}");
+    assert_eq!(retags[0].inputs, [x], "{text}");
+    let retag = NodeIx(
+        graph
+            .nodes
+            .iter()
+            .position(|node| node.op == NodeOp::F64ToTagged)
+            .expect("the retagging") as u32,
+    );
+    let store = nodes(&graph, |op| matches!(op, NodeOp::StoreField { .. }));
+    assert_eq!(store.len(), 1, "{text}");
+    assert_eq!(store[0].inputs[1], retag, "{text}");
+    let ret = nodes(&graph, |op| *op == NodeOp::Return);
+    assert_eq!(ret[0].inputs, [retag], "{text}");
+}
+
+#[test]
+fn to_boolean_of_untagged_phis_tests_their_numbers() {
+    // `a` (I32) and `b` (F64) after the loop: ToBoolean of each without a word.
+    let mut vm = vm_engine(
+        "function tb(n) { var a = 0, b = 0.5; for (var i = 0; i < n; i++) { a = a + 1; b = b * 2; }
+           if (a) { if (b) { return 1; } return 2; } return 3; }
+         for (var k = 0; k < 20; k++) { tb(3); tb(0); }",
+    );
+    let (chunk, graph) = graph_of(&mut vm, "tb");
+    let text = dump(&graph, &chunk);
+    let header = the_loop(&graph);
+    let a = phi_of_slot(&graph, &chunk, "a", header);
+    let b = phi_of_slot(&graph, &chunk, "b", header);
+    assert_eq!(graph.node(a).rep, Rep::I32, "{text}");
+    assert_eq!(graph.node(b).rep, Rep::F64, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::ToBoolean), 0, "{text}");
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.op == NodeOp::I32Cmp(Cond::Ne) && node.inputs[0] == a),
+        "{text}"
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| node.op == NodeOp::F64ToBoolean && node.inputs == [b]),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_verifier_refuses_a_phi_whose_inputs_are_not_its_representation() {
+    let mut vm = vm_engine(
+        "function acc(n) { var x = 0; for (var i = 0; i < n; i++) x += 0.5; return x; }
+         for (var k = 0; k < 20; k++) acc(10);",
+    );
+    let (chunk, graph) = graph_of(&mut vm, "acc");
+    let header = the_loop(&graph);
+    let i = phi_of_slot(&graph, &chunk, "i", header);
+    let x = phi_of_slot(&graph, &chunk, "x", header);
+    // An I32 phi with an f64 input.
+    let mut broken = graph.clone();
+    broken.nodes[i.index()].inputs[0] = graph.node(x).inputs[0];
+    let error = verify(&broken, &chunk).expect_err("mixed inputs");
+    assert!(error.contains("for a I32 phi"), "{error}");
 }

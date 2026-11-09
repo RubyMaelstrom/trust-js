@@ -1860,6 +1860,8 @@ fn every_pure_operation_computes_as_the_language_does() {
         (NodeOp::F64Cmp(Cond::Eq), F64, false, Rep::Bool, "a == b"),
         (NodeOp::F64Cmp(Cond::Ne), F64, false, Rep::Bool, "a != b"),
         (NodeOp::BoolNot, F64, false, Rep::Bool, "!(a < b)"),
+        // ToBoolean of an untagged phi's f64 (stage 2 step 6): false for ±0 and NaN.
+        (NodeOp::F64ToBoolean, F64, true, Rep::Bool, "!!a"),
     ];
     let ints = [
         (0, 0),

@@ -123,7 +123,11 @@ pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Graph, Refusal
     };
     let flow = Flow::new(chunk, &cfg, &rules)?;
     let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
-    Builder::new(chunk, snapshot, &cfg, &flow, &initialized, &liveness).run()
+    let (mut graph, notes) =
+        Builder::new(chunk, snapshot, &cfg, &flow, &initialized, &liveness).run()?;
+    // The phis' representations, after the build (stage 2 step 6).
+    super::phis::select(&mut graph, &notes, snapshot);
+    Ok(graph)
 }
 
 /// Why stage 1 refuses a chunk holding `op` (the Stage 1 record's list).
@@ -1169,7 +1173,7 @@ impl<'a> Builder<'a> {
         }
     }
 
-    fn run(mut self) -> Result<Graph, Refusal> {
+    fn run(mut self) -> Result<(Graph, PhiNotes), Refusal> {
         let flow = self.flow;
         let entry = flow.rpo[0];
         let initial = State {
@@ -1194,7 +1198,7 @@ impl<'a> Builder<'a> {
         }
         let hoisted = std::mem::take(&mut self.hoisted_nodes);
         self.graph.blocks[first.index()].body.splice(0..0, hoisted);
-        Ok(in_reverse_postorder(self.graph))
+        Ok((in_reverse_postorder(self.graph), self.notes))
     }
 
     fn build_block(&mut self, id: BlockId) -> Result<(), Refusal> {
@@ -1581,6 +1585,9 @@ impl<'a> Builder<'a> {
         let truth = if self.rep(value) == Rep::I32 {
             let zero = self.hoist(Hoisted::I32(0));
             self.add(NodeOp::I32Cmp(Cond::Ne), &[value, zero], Rep::Bool, pc)
+        } else if self.rep(value) == Rep::F64 {
+            // Maglev's Float64ToBoolean, where stage 1 boxed the f64 for ToBoolean.
+            self.add(NodeOp::F64ToBoolean, &[value], Rep::Bool, pc)
         } else {
             let word = self.tagged(st, value, pc);
             self.add(NodeOp::ToBoolean, &[word], Rep::Bool, pc)

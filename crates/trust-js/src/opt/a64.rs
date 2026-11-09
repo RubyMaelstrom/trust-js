@@ -1383,6 +1383,18 @@ impl Gen<'_> {
                     self.lower_to_boolean(n);
                 }
             }
+            NodeOp::F64ToBoolean => {
+                if !unused {
+                    // ±0 compares equal to zero and NaN unordered: true where the comparison
+                    // is not equal and ordered (Maglev's Float64ToBoolean).
+                    let d = self.fp(input(0), D31);
+                    let w = self.gp_dst(n);
+                    self.a.fcmp_zero(d);
+                    self.a.cset_w(w, NE);
+                    self.a.csel_x(w, 31, w, VS);
+                    self.gp_done(n, w);
+                }
+            }
             NodeOp::I32Add | NodeOp::I32Sub => {
                 let site = self.check_exit(n)?;
                 let sub = node.op == NodeOp::I32Sub;

@@ -324,6 +324,9 @@ pub(crate) enum NodeOp {
     /// on it, and lowers `!` through it, where the value is not proven a Boolean (CheckBoolean
     /// would exit on every other value, as `if (object)` has one).
     ToBoolean,
+    /// F64 -> Bool: ToBoolean of a Number (ECMA-262 §7.1.2), false for +0, -0 and NaN (Maglev's
+    /// Float64ToBoolean; stage 2 step 6).
+    F64ToBoolean,
 
     // Arithmetic. The I32 forms with a state exit on overflow (Mul also on a -0 result).
     I32Add,
@@ -733,8 +736,28 @@ impl Graph {
         rep: Rep,
         pc: u32,
     ) -> NodeIx {
-        let ix = NodeIx(self.nodes.len() as u32);
         let is_phi = op == NodeOp::Phi;
+        let ix = self.new_node(block, op, inputs, rep, pc);
+        let data = &mut self.blocks[block.index()];
+        if is_phi {
+            data.phis.push(ix);
+        } else {
+            data.body.push(ix);
+        }
+        ix
+    }
+
+    /// A node of `block` that its lists do not hold yet: the caller places it (a pass that
+    /// inserts nodes amid a block's, the phi selector's).
+    pub(crate) fn new_node(
+        &mut self,
+        block: BlockIx,
+        op: NodeOp,
+        inputs: &[NodeIx],
+        rep: Rep,
+        pc: u32,
+    ) -> NodeIx {
+        let ix = NodeIx(self.nodes.len() as u32);
         self.nodes.push(Node {
             op,
             inputs: inputs.to_vec(),
@@ -744,12 +767,6 @@ impl Graph {
             pc,
             block,
         });
-        let data = &mut self.blocks[block.index()];
-        if is_phi {
-            data.phis.push(ix);
-        } else {
-            data.body.push(ix);
-        }
         ix
     }
 

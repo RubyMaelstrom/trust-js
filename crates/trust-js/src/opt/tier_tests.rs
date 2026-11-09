@@ -1824,3 +1824,127 @@ fn a_catch_reads_a_variable_its_try_overwrites_before_any_other_read() {
          let t = 0; for (let r = 0; r < 300; r++) t = (t + f(20)) % 1000003; t",
     );
 }
+
+/// The representations of the phis the tier builds now for the global function `name`'s second
+/// stage, once `source` ran with the tier eager: (I32 phis, F64 phis, tagged phis).
+fn phi_reps(source: &str, name: &str) -> (usize, usize, usize) {
+    use super::ir::Rep;
+    eager().set();
+    let mut engine = jit_engine();
+    eval(&mut engine, source);
+    let chunk = second_stage(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
+    let graph = graph_now(&chunk);
+    let reps: Vec<Rep> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.phis.iter().map(|&phi| graph.node(phi).rep))
+        .collect();
+    let count = |rep: Rep| reps.iter().filter(|&&r| r == rep).count();
+    (count(Rep::I32), count(Rep::F64), count(Rep::Tagged))
+}
+
+#[test]
+fn an_f64_phi_carries_minus_zero_and_nan_into_an_index_and_a_boxing() {
+    // `x` is an F64 phi from -0: -0 indexes element 0, NaN and a fraction fail the index's check
+    // at the use (NotInt32), and the boxings keep -0 and canonicalize NaN.
+    const SOURCE: &str = "function walk(a, n, step) { let s = ''; let x = -0;
+           for (let k = 0; k < n; k++) { const v = a[x]; s += v === undefined ? 'u' : String(v);
+             x = x + step; }
+           return s + (Object.is(x, -0) ? 'z' : String(x)); }
+         const arr = [7, 8, 9, 10, 11]; let out = '';
+         for (let r = 0; r < 300; r++) out = walk(arr, 4, 1);
+         out + walk(arr, 4, -0) + walk(arr, 3, NaN) + walk(arr, 3, 0.5) + walk(arr, 2, 1) +
+           walk(arr, 3, -0.5)";
+    // `x` is the F64 phi, `k` an I32 one, and the strings' phis are tagged.
+    assert_eq!(phi_reps(SOURCE, "walk"), (1, 1, 3));
+    names_hold(SOURCE);
+}
+
+#[test]
+fn a_swap_of_two_locals_moves_a_cycle_on_the_back_edge() {
+    // `a` and `b` (F64 phis) and `p` and `q` (I32 phis) take each other's values at the back
+    // edge: a cycle of moves in each register class.
+    const SOURCE: &str = "function swap(n) { let a = 0.5, b = 1.5, p = 1, q = 2;
+           for (let k = 0; k < n; k++) { const t = a; a = b; b = t; const u = p; p = q; q = u; }
+           return a * 10 + b + p * 100 + q * 1000; }
+         let s = 0; for (let r = 0; r < 300; r++) s += swap(r % 7); s";
+    // `a`, `b` and `k` F64, `p` and `q` I32.
+    assert_eq!(phi_reps(SOURCE, "swap"), (2, 3, 0));
+    names_hold(SOURCE);
+}
+
+#[test]
+fn exits_with_untagged_phis_in_registers_and_spill_slots_rebuild_their_numbers() {
+    // Twenty-four int32 phis and ten f64 phis in one loop take every register a class has and
+    // spill the rest; forced exits at every seventh check rebuild each from its home.
+    let ints: Vec<String> = (0..24).map(|k| format!("a{k}")).collect();
+    let floats: Vec<String> = (0..10).map(|k| format!("f{k}")).collect();
+    let declare = ints
+        .iter()
+        .enumerate()
+        .map(|(k, name)| format!("{name} = {k}"))
+        .chain(
+            floats
+                .iter()
+                .enumerate()
+                .map(|(k, name)| format!("{name} = {k}.5")),
+        )
+        .collect::<Vec<_>>()
+        .join(", ");
+    let step = ints
+        .iter()
+        .enumerate()
+        .map(|(k, name)| format!("{name} = ({name} + {} + k) | 0;", ints[(k + 1) % ints.len()]))
+        .chain(floats.iter().enumerate().map(|(k, name)| {
+            format!(
+                "{name} = {name} * 0.5 + {} * 0.25;",
+                floats[(k + 1) % floats.len()]
+            )
+        }))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let all = ints
+        .iter()
+        .chain(&floats)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "function many(n) {{ let {declare}; for (let k = 0; k < n; k++) {{ {step} }} \
+         return [{all}].join(); }}\n\
+         let s = ''; for (let r = 0; r < 300; r++) s = many(r % 9); s + many(40)"
+    );
+    // The twenty-four int32s, the ten f64s and the counter.
+    assert_eq!(phi_reps(&source, "many"), (24, 11, 0));
+    names_hold(&source);
+}
+
+#[test]
+fn untagged_phis_live_across_collections_beside_words() {
+    // `s` and `i` live across each `push`, which allocates: with a collection at every
+    // allocation their homes beside the array's word survive each one.
+    const SOURCE: &str = "function keep(n) { let s = 0.5, i = 0; const objs = [];
+           for (let k = 0; k < n; k++) { objs.push({v: k, pad: [k]}); s = s + objs[k].v * 0.5;
+             i = (i + 3) | 0; }
+           return s + i + objs.length + objs[n - 1].pad[0]; }
+         let t = 0; for (let r = 0; r < 300; r++) t += keep(r % 9 + 1); t";
+    let expected = run(Tier::Bytecode, SOURCE);
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    assert_eq!(eval(&mut engine, SOURCE), expected);
+    assert!(!compiled().is_empty(), "the tier compiled keep");
+    {
+        let mut core = engine.interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(1);
+        core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    }
+    let again = "let u = 0; for (let r = 0; r < 200; r++) u += keep(r % 13 + 1); u";
+    let mut vm = Engine::new();
+    vm.set_tier(Tier::Bytecode);
+    vm.set_tier_threshold(0);
+    eval(&mut vm, SOURCE);
+    let expected = eval(&mut vm, again);
+    assert_eq!(eval(&mut engine, again), expected);
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
+}
