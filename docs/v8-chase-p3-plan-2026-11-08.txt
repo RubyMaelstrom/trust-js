@@ -729,6 +729,18 @@ The back end:
   builder keeps such a site an effect: the baseline template handles primitives as the template
   JIT's code does. Maglev's lowering (a check of the primitive, the prototype's shape and a load
   from it) is a later stage's.
+- Throws (2026-11-09): an exit for a throw (a thrown effect, a throwing poll, Op::Throw) counts
+  toward the 100, so that a function that keeps catching falls back to the template JIT's code,
+  which handles its handlers in place. JSC leaves exception exits out of its reoptimization counts
+  (ExitKind.cpp, exitKindMayJettison), but its exit resumes at op_catch in baseline code, where ours
+  runs the rest of the call in the VM; stage 2's in-place resume takes JSC's rule.
+- Engine behaviour the tier exposes (2026-11-09, the gate's triage): a polymorphic call site went
+  megamorphic when its callees got new code (a superseded overflow entry's refill evicted a live
+  way), which the tier's chunks for every hot callee made common; as V8's call feedback names the
+  closure and JSC's call variants the callee, a callee's new code now refills its own entry. A
+  second stage was built unsettled, so the direct-call sequence declined it for its first 100
+  entries, which every tier compile paid; second stages are now built settled, as V8 enters new
+  code through the dispatch table at once. Both change tier-off behaviour slightly.
 - Shapes (review of the front end, 2026-11-08): CheckShape proves what the baseline's own-data
   probe proves (an object word, an ordinary kind, which excludes Arrays, whose element entries
   take slots without a shape transition, the IC-plain flag, the shape). A field access after it
