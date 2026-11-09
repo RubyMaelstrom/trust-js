@@ -72,8 +72,9 @@ comment/example in the same change.
   flagged (the generic operation for NotNumber, f64 for NotInt32 and Overflow, the generic
   access for WrongShape unless the site's ways grew, the guard's mismatch edge for WrongCallee,
   the block for NeverRan, an f64 loop phi for PhiNotInt32 and a tagged one for PhiNotNumber,
-  the two exits of a loop's entry check of a word entering an untagged phi, at its header). A discard whose exits were all throws or unsupported operations arms
-  no recompile. Each discard and each recompile moves the call caches' epoch. Under
+  the two exits of a loop's entry check of a word entering an untagged phi, at its header). A
+  discard whose exits were all throws or unsupported operations arms no recompile. Each discard
+  and each recompile moves the call caches' epoch. Under
   `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, a recompile's too, without
   waiting for the feedback to settle (the eager gate: V8's `--stress-maglev`).
   `TRUST_JS_OPT_EXIT_EVERY=N` compiles every check and effect of the tier's code with a

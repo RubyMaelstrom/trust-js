@@ -881,6 +881,9 @@ Steps:
 7. Immediate operands in the back end's arithmetic (added 2026-11-09, below): 12 of am3's
    instructions per iteration move a constant into a scratch register for its use. Back end only,
    so it runs beside step 4.
+8. Back edges counted toward the checkpoints (added 2026-11-09 by step 5's measurement, below; the
+   owner's order: step 8 next, then the measurement again): Richards' Scheduler.schedule, entered
+   once a run with the benchmark's loop inside, never reaches the tier.
 
 Stage 2's exit (the owner's, 2026-11-09: stage 1's bars carried): stage 1's gates in the tier's
 three configurations; coverage, the tier's code taking at least 80% of the time spent in
@@ -1291,6 +1294,44 @@ behind proofs made once per loop entry. Per the exemplars:
   exits at the poll and at every check with phis in registers and spill slots; a catch reading a
   loop variable; GC stress; Test262's for, while, do-while, update and compound assignment tests in
   the four configurations; the difftest corpus seeded with the same.
+Step 6 landed (dbdd73cd..c23c36a7, 2026-11-09). The library's suites pass with the tier off and on
+eager (3,109 each); the tier's tests (230) off, eager with exits forced every 7, with an exit limit
+of 1 and without FEAT_JSCVT; Test262's for, while, do-while, update and compound-assignment tests
+(1,055) and its try, for-of, for-in, switch, labeled, break, continue, if, conditional and logical
+tests (1,401) in the tier's four configurations with no failure beyond off's, and 2,126 of them
+(the first group with try, for-of and for-in) eager with an exit limit of 1; on x86-64 the
+type-check, Windows' and the library's suite (2,764). The difftest corpus is carried with steps 2
+and 4's. Untimed, on non-LTO builds of main (faf2c03e) and the step (target/p3/stage2/step6-impl):
+am3's loop runs 102 instructions per iteration (146: no boxing and no check of a phi, against 14
+and 28, and 5 moves against 7), montReduce's splice of it 102 (157, whose 18 moves and spill
+accesses the block order and the liveness remove); Crypto's count with the tier on falls from
+931.1M to 713.0M, against 715.7M off: -0.4% (+30.1% before). One run each of the rest of Octane
+with the tier on against main's: Mandreel -11.2%, zlib -4.0%, TypeScript -2.5%, Splay -2.4%,
+EarleyBoyer -2.0%, RegExp -1.1%, RayTrace -1.0%, Richards -0.9%, the rest within 0.4% (Splay's
+and EarleyBoyer's counts off move by 2.3% and 0.5% between the two engines, which run the same
+code there: one run's noise); DeltaBlue is the one benchmark whose count with the tier on stays
+above its count off (+5.7%; +5.5% before). Crypto's 11 compiles hold 1,495 nodes (2,065) and
+61.7 KB of code (68.8 KB). Choices: the selector (opt/phis.rs) runs inside build(), after the
+blocks' renumbering, on SpiderMonkey's optimistic lattice (undecided, I32, F64, Tagged; widened in
+block order until none changes, the undecided then tagged); the checks and boxings the rewrites
+replace leave the graph, whose nodes are numbered again so that each sits in one block; an entry
+edge's state is the header poll's with the header's phis replaced by their entry inputs (a
+boxing's operand for a boxing); the speculation's numeric use is a CheckNumber of the phi in its
+loop, and a tagged phi's word on an entry edge speculates as any word does, as Maglev's hoisting
+takes any input; a decline is listed only where the flag changed the phi's representation;
+ToBoolean of an f64 is F64ToBoolean (Maglev's Float64ToBoolean), the builder's too where stage 1
+boxed the f64; the liveness (opt/liveness.rs) counts an operation it does not list as reading
+none or only its named slots as reading every slot, which answers Q7: EvalExpr's and
+AssignTarget's frame projections read them all, the for-of and destructuring steps their hidden
+slots. Departures: an untagged phi that is an element store's value is stored as its I32 or F64,
+which step 2's store takes, where the design listed a tagged element value among the retaggings
+(the kind bits stay exact, as for an int32 form); a retagging sits before the first use of its
+block that needs a word, where Maglev's EnsurePhiTagged starts the block and serves the
+dominated path. Open: the counters' back-edge moves stay (each increment's overflow exit keeps
+the old value in its state, Maglev's output-register rule), so the hints move none of am3's
+four; loop-invariant checks stay in their loops (sum's n, am3's receivers' kind checks: LICM);
+the flag per header (D4), peeling (Q2), back-edge speculation (Q3), Bool and Cell phis (Q1);
+compile time is not measured.
 
 Step 7, immediate operands (design, 2026-11-09). The back end rematerializes every constant operand
 into a scratch register at its use (`mov x17, #0x3fff` before `and w4, w3, w17`), where Maglev's
@@ -1405,3 +1446,44 @@ thread (point 13), the exemplars' answer and a larger step. Then the rest of the
 kept across effects (React's steady state), the polymorphic call after its decline (Richards'
 TaskControlBlock.run), allocation in line, closures, strings, natives, exceptions, `arguments`
 and rest, getters and setters, dependencies.
+The owner's order (2026-11-09): step 8 next, then the measurement again.
+
+Step 8, back edges counted toward the checkpoints (design, 2026-11-09). With the tier on, a
+template code's loop iterations count as native runs toward its chunk's checkpoints: the second
+stage's, where the tier compiles, and a discard's warm-up, where it recompiles. SpiderMonkey's
+warm-up counter counts a loop head as an entry: its baseline code increments the script's counter
+in the prologue and at each LoopHead, after the loop's interrupt check (emit_LoopHead,
+jit/BaselineCodeGen.cpp:2603-2614; the prologue, 7095-7106; the increment, 1679-1712), against one
+threshold for Ion (normalIonWarmUpThreshold 1,500, jit/JitOptions.cpp:249). JSC's execution
+counter takes 15 an entry and 1 an iteration, against thresholds scaled by code size
+(runtime/OptionsList.h:373-377); V8's budget is in bytecode bytes, a back edge charging its jump
+distance and a return the function's length (InterpreterAssembler::JumpBackward,
+interpreter/interpreter-assembler.cc:1252-1256), against invocations times length
+(invocation_count_for_maglev 400). The checkpoints count events against fixed numbers, one counter
+for entries, as SpiderMonkey's counter does, so the step takes SpiderMonkey's weight: a loop head
+counts as an entry (JSC's weights and V8's byte budget would change what the counter counts).
+- Where: at a loop header's poll in template code (the interrupt targets, which every iteration
+  of a loop run in canonical code passes, as SpiderMonkey's LoopHead does), at each back edge of a
+  register region (a general region's poll guard, a linked scan's), and for a helper-free region,
+  whose countdown polls once per 16,384 iterations, the iterations the countdown ran, at each of
+  its polls and at its exits. Every template code of a chunk, with the tier on: first stages and
+  a discarded code's fallback.
+- How: the running record's chunk (JitCtx::chunk) counts while its checkpoint word is nonzero (a
+  checkpoint or a warm-up pending), as a direct entry counts, saturating; three instructions per
+  iteration with no checkpoint pending, six with one. The next native entry's gate (the direct
+  sequence's runs against the word, or H_CALL_HIT) takes the checkpoint as it does today, so the
+  loop's function gets the tier's code at its next entry; transfer into a running loop is OSR,
+  stage 5's.
+- Unchanged: the settled-feedback rule (V8's own delay after an IC change is 500 invocations'
+  worth of budget, which a loop spends as fast), the checkpoints' distances, and the tier-off
+  configuration (P2's entry counts). TRUST_JS_OPT_NO_LOOP_COUNT=1 turns the counting off, for
+  comparisons. Step 3's departure "the warm-up counts native entries where JSC also weighs
+  iterations" ends; its limit for an exited frame that then loops hot (JSC's 5 x 2^R) stays with
+  stage 5.
+- Tests: a function entered a few times whose loop runs thousands of iterations each time gets
+  the tier's code by its third or fourth entry with the tier on, and keeps its first stage with
+  the counting off; with no checkpoint pending the count stays; the count saturates; a loop in a
+  general region, a linked scan and a helper-free rotated loop each count; a discard's warm-up
+  reaches its recompile through a loop's iterations; with the tier off loops count nothing; the
+  poll and interruption tests unchanged; Test262's loop tests in the tier's four configurations;
+  Richards' schedule compiled in its log, and Richards' counts against the eager figure.
