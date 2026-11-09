@@ -14,8 +14,9 @@
 //! 881-885), but its frees come from the GC's finalization, well after an invalidation. Here a
 //! discard frees the tier's code before its recompile, and on the Cortex-X925 new code at the
 //! addresses of code just freed mispredicts its branches at every execution: so a freed page is
-//! taken again only once the cursor has passed the rest of the region, which stands in for the
-//! exemplars' wait for the GC.
+//! taken again only when the cursor comes round to it. Until the cursor first wraps, every freed
+//! page is behind it and waits for the rest of the region, which stands in for the exemplars'
+//! wait for the GC; after that, a page freed just ahead of the cursor can be taken at once.
 //!
 //! Where the region cannot be reserved (an address-space limit) or has no free run long enough,
 //! an allocation maps its own memory, as every allocation did before the region
