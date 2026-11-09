@@ -15,6 +15,9 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 }
 
 fn engine() -> Engine {
+    // The subject is the template JIT's element stores and its helper: with the tier on (P3
+    // stage 2 step 2), a second stage's stores are the tier's own and call no helper.
+    crate::opt::pin_tier_off_for_test();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
