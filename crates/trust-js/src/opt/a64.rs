@@ -207,11 +207,15 @@ fn check_graph(chunk: &Chunk, graph: &Graph, cfg: &crate::jit_ir::Cfg) -> Result
                 if state.slots.len() != graph.n_slots {
                     return Err(Refusal::at(state.pc as usize, "a frame state's slots"));
                 }
+                // A record's depth is the operand depth at its push, which its region may run
+                // below: a for-of pushes its handler with the step's value on the stack, and the
+                // binding's store pops it. An unwind keeps the smaller depth, as the VM's and the
+                // first stage's do (and the deoptimizer's for a pending throw).
                 let pushes_handler = |&(push_pc, depth): &(u32, u32)| {
                     matches!(
                         ops.get(push_pc as usize),
                         Some(Op::PushHandler(_) | Op::PushFinally(..) | Op::PushIterator(..))
-                    ) && depth as usize <= state.stack.len()
+                    ) && cfg.stack_depth_at(push_pc as usize) == Some(depth as usize)
                 };
                 if !state.handlers.iter().all(pushes_handler) {
                     return Err(Refusal::at(state.pc as usize, "a frame state's handlers"));

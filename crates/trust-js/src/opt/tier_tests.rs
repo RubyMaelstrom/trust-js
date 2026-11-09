@@ -68,6 +68,14 @@ const PROGRAMS: &[&str] = &[
     // A shape change after the feedback settles.
     "function getx(o) { return o.x; }\n\
      let t = 0; for (let k = 0; k < 3000; k++) t += getx(k < 2500 ? {x: k} : {y: 0, x: -k}); t",
+    // A for-of whose body sometimes throws: the iterator's handler closes it on the way out.
+    "function firstBig(a) { for (const v of a) { if (v > 1000) throw new RangeError('big ' + v); } \
+     return a.length; }\n\
+     function run(k) { try { return firstBig(k % 97 === 0 ? [1, 2, 5000] : [1, 2, 3]); } \
+     catch (e) { return e.message; } }\n\
+     let out = ''; for (let k = 0; k < 3000; k++) { const r = run(k); \
+     out += typeof r === 'string' ? r[4] : r; }\n\
+     out.length + out.slice(0, 40)",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {
@@ -207,6 +215,61 @@ fn a_callee_free_loop_function_runs_in_the_tiers_code() {
     code.referenced.set(0);
     assert_eq!(eval(&mut engine, "sum(100000)"), "4999950000");
     assert!(code.referenced.get() != 0, "the tier's code ran");
+}
+
+#[test]
+fn a_for_of_whose_binding_takes_its_handlers_operand_runs_in_the_tiers_code() {
+    // The for-of pushes its iterator's handler with the step's value on the operand stack, and
+    // the binding's store pops it: the frame states inside the loop are shallower than the
+    // handler record, as the VM and the first stage allow.
+    TestSwitches {
+        on: true,
+        eager: true,
+        exit_every: 0,
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    compiled();
+    eval(
+        &mut engine,
+        "function total(a) { let s = 0; for (const v of a) s += JSON.parse(v); return s; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += total(['1', '2', String(k)]); t",
+    );
+    let chunk = second_stage(&mut engine, "total").expect("the tier compiled total");
+    assert!(compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)));
+    let code = chunk.jit.get().flatten().expect("its code is resident");
+    code.referenced.set(0);
+    exits();
+    assert_eq!(eval(&mut engine, "total(['4', '5', '6'])"), "15");
+    assert!(code.referenced.get() != 0, "the tier's code ran");
+    assert!(exits().is_empty());
+    // A throw in the loop's call leaves with the throw pending, below the record's depth: the
+    // handler closes the iterator and the caller's catch takes the error.
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let r = 'none'; try { total(['1', 'x', '3']); } catch (e) { r = e.name; } r"
+        ),
+        "SyntaxError"
+    );
+    assert_eq!(
+        exits()
+            .into_iter()
+            .map(|(_, reason)| reason)
+            .collect::<Vec<_>>(),
+        vec![super::ir::ExitReason::Throw]
+    );
+    // A failed check inside the loop: the VM resumes in the region with the handler rebuilt.
+    assert_eq!(eval(&mut engine, "total(['1', '\"2\"', '3'])"), "123");
+    assert_eq!(
+        exits()
+            .into_iter()
+            .map(|(_, reason)| reason)
+            .collect::<Vec<_>>(),
+        vec![super::ir::ExitReason::NotNumber]
+    );
 }
 
 #[test]
