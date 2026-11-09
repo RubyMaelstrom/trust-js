@@ -10973,7 +10973,13 @@ impl Interp {
         // `o`, nothing mutates during the read). On an ordinary descriptor within reach record
         // (depth, slot, receiver shape, holder shape); a non-plain level defers to full
         // `[[Get]]`. An ordinary accessor is invoked only after this lookup returns.
-        let recv_shape = unsafe { (*head).borrow().props.shape() };
+        let (recv_shape, primitive) = unsafe {
+            let receiver = (*head).borrow();
+            (
+                receiver.props.shape(),
+                crate::value::primitive_kind_bits(&receiver.kind),
+            )
+        };
         let mut cur: *const ObjCell = head;
         // The depth-1 hop's shape, recorded when that hop is a plain (non-array) ordinary object:
         // a depth-2 fill stores it as `mid_shape` so later hits can shape-validate the whole
@@ -11061,7 +11067,7 @@ impl Interp {
                         slot: slot as u32,
                         recv_shape,
                         holder_shape: b.props.shape(),
-                        mid_ok,
+                        mid_ok: mid_ok | primitive,
                         loc,
                         mid_shape: mids[0].unwrap_or(0),
                         mid2_shape: mids[1].unwrap_or(0),
@@ -11101,7 +11107,7 @@ impl Interp {
                                 slot: levels as u32,
                                 recv_shape: absent_shapes[0],
                                 holder_shape: absent_shapes[5],
-                                mid_ok: 0,
+                                mid_ok: primitive,
                                 loc: 0,
                                 mid_shape: absent_shapes[1],
                                 mid2_shape: absent_shapes[2],

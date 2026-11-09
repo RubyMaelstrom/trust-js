@@ -5976,6 +5976,24 @@ pub(crate) fn live_objects_ptr(heap: &GcHeap) -> *const i64 {
     heap.live.as_ptr()
 }
 
+/// The primitive kind a property cache way records for a fill whose receiver is of `kind`
+/// (bits 4-6 of its `mid_ok`, [`crate::bytecode::IC_MID_PRIMITIVE`]): a String, Number or Boolean
+/// wrapper's, which is a primitive's wrapper prototype when the read was the primitive's; 0
+/// otherwise.
+#[inline]
+pub(crate) fn primitive_kind_bits(kind: &ObjectKind) -> u8 {
+    use crate::bytecode::{
+        IC_MID_PRIMITIVE_SHIFT, IC_PRIMITIVE_BOOLEAN, IC_PRIMITIVE_NUMBER, IC_PRIMITIVE_STRING,
+    };
+    let primitive = match kind {
+        ObjectKind::StrWrap(_) => IC_PRIMITIVE_STRING,
+        ObjectKind::NumWrap(_) => IC_PRIMITIVE_NUMBER,
+        ObjectKind::BoolWrap(_) => IC_PRIMITIVE_BOOLEAN,
+        _ => return 0,
+    };
+    primitive << IC_MID_PRIMITIVE_SHIFT
+}
+
 /// This heap's fixed-size shape-directory array, borrowed by each native activation. Its pages
 /// may be replaced as shapes are cached, but the directory itself stays inside the stable heap.
 pub(crate) fn shape_layouts_ptr(heap: &GcHeap) -> *const u8 {

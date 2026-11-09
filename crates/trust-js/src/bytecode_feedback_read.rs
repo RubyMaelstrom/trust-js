@@ -198,6 +198,7 @@ fn named_way(state: IcState) -> Option<NamedWay> {
     Some(NamedWay {
         receiver_shape: state.recv_shape,
         holder_shape: state.holder_shape,
+        primitive: (state.mid_ok & IC_MID_PRIMITIVE) >> IC_MID_PRIMITIVE_SHIFT,
         depth,
         slot,
         location: state.loc,

@@ -148,6 +148,10 @@ pub(crate) struct NamedWay {
     /// The holder's shape (a creation's: the shape the insert lands on; an absence's: the last
     /// level's).
     pub(crate) holder_shape: u32,
+    /// The kind of primitive whose wrapper was the fill's receiver (`IC_PRIMITIVE_STRING` and
+    /// the rest; 0: an object of no wrapper kind): the receiver shape is then its wrapper
+    /// prototype's (or a wrapper object's), and a primitive's read hits the way.
+    pub(crate) primitive: u8,
     /// Prototype hops from the receiver to the holder (0: own); an absence's levels.
     pub(crate) depth: u8,
     /// The holder's slot index (0 for an absence or a creation).

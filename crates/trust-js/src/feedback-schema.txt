@@ -232,6 +232,19 @@ property (a non-writable or index-named one, a slot past the cache's reach, a de
 which leave no mark. The census's state word reports the mark in bit 7 (`generic` in its header's
 records).
 
+Each way also carries its primitive kind, bits 4-6 of its mid_ok (IC_MID_PRIMITIVE: 1 a string, 2
+a number, 3 a Boolean; 0 an object of no wrapper kind), which no probe reads either. A
+primitive's named read resolves through the realm's wrapper prototype, which is then the fill's
+receiver (Interp::get_prop_ic_impl), and the templates' probe hits the way with a primitive as
+well (emit_packed_probe_receiver), so such a way's receiver shape is String.prototype's (or
+Number's, Boolean's) and says nothing of the receiver word. The fill records the kind whenever its
+receiver is a wrapper (Interp::ic_get_rederive): the prototype on a primitive's behalf, the
+prototype read itself, a wrapper object. Ways keep their byte as Interp::ic_insert moves them, and
+a recompile's seeds copy it. Reading it: a marked way is no own data way of an object, which the
+speculative tier keeps generic; V8's string and number maps, JSC's string structures and
+SpiderMonkey's string guards say the same of their feedback. Symbols and BigInts fill no named
+way.
+
 5.4 The read API (step 6). crate::feedback::read(chunk, pc) answers one view of the operation at
 a baseline pc (feedback_read.rs; the chunk's side in bytecode_feedback_read.rs), allocating and
 interning nothing: its shapes are the process's shape ids, its targets the process's cells.

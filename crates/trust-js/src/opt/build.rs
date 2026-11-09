@@ -2039,9 +2039,10 @@ impl<'a> Builder<'a> {
 
     /// A named site's own data ways (one shape, or up to four sharing their location and slot),
     /// None where the site takes the generic operation: a generic mark, another kind of way, ways
-    /// at different locations, no way, or a store site without its writability proof. A
-    /// `prototype` property may hold a function's deferred prototype, which only the checked
-    /// operation materializes.
+    /// at different locations, no way, a way of a primitive's (its receiver shape is a wrapper
+    /// prototype's, which a CheckShape of the receiver word never passes for the primitive), or
+    /// a store site without its writability proof. A `prototype` property may hold a function's
+    /// deferred prototype, which only the checked operation materializes.
     fn own_data_ways(&self, pc: usize, name: u32, store: bool) -> Option<Ways> {
         if self.chunk.jit_name(name) == "prototype" {
             return None;
@@ -2054,6 +2055,7 @@ impl<'a> Builder<'a> {
         let mut at = None;
         for way in named.filled() {
             let own = way.kind == NamedWayKind::Data
+                && way.primitive == 0
                 && way.depth == 0
                 && way.receiver_shape == way.holder_shape
                 && crate::value::is_cacheable_shape(way.receiver_shape)

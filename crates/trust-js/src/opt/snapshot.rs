@@ -190,6 +190,7 @@ fn hash_named(hash: &mut impl std::hash::Hasher, named: &NamedView) {
     for way in named.filled() {
         hash.write_u32(way.receiver_shape);
         hash.write_u32(way.holder_shape);
+        hash.write_u8(way.primitive);
         hash.write_u32(way.slot);
         hash.write_u8(way.depth);
         hash.write_u8(way.kind as u8);

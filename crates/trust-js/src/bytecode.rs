@@ -93,8 +93,9 @@ pub struct IcState {
     pub depth: u8,
     /// Bit 0: `mid_shape` was recorded (a `depth ≥ 2` fill whose depth-1 hop was a plain
     /// ordinary object); bits 1..3 cover `mid2_shape` through `mid4_shape`. Shape id 0
-    /// is a real shape (the empty object). Bit 7, in a site's way 0 only, is the site's generic
-    /// mark ([`IC_MID_GENERIC`]); every probe tests bits 0-3 alone.
+    /// is a real shape (the empty object). Bits 4-6 are the way's primitive kind
+    /// ([`IC_MID_PRIMITIVE`]), and bit 7, in a site's way 0 only, is the site's generic mark
+    /// ([`IC_MID_GENERIC`]); every probe tests bits 0-3 alone.
     pub mid_ok: u8,
     /// Where the slot lives, for generated code (W2d step 3; [`crate::value::Props::slot_location`]):
     /// the holder's slot in a data, accessor or key-checked state, the new slot in a creation
@@ -147,6 +148,21 @@ pub const IC_EMPTY: u8 = u8::MAX;
 /// ([`crate::interpreter::Interp::ic_insert`] carries it into each new way 0) and nothing
 /// clears it; no probe reads it, the templates testing `mid_ok`'s bits 0-3 one by one.
 pub const IC_MID_GENERIC: u8 = 0x80;
+/// A way's primitive kind (feedback-schema.txt section 5.3), bits 4-6 of its `mid_ok`: the fill's
+/// receiver was a wrapper of that kind, [`IC_PRIMITIVE_STRING`], [`IC_PRIMITIVE_NUMBER`] or
+/// [`IC_PRIMITIVE_BOOLEAN`] (0: an object of no wrapper kind). A primitive's named read resolves
+/// through the realm's wrapper prototype, which is the fill's receiver
+/// (`Interp::get_prop_ic_impl`), and the templates' probe hits the way with a primitive the same
+/// way (`emit_packed_probe_receiver`), so the way's receiver shape is the wrapper prototype's and
+/// says nothing of the receiver word, as V8's string and number maps, JSC's string structures and
+/// SpiderMonkey's string guards do: a fill on the prototype itself or on a wrapper object records
+/// the kind too. Symbols and BigInts fill no named way. No probe reads the bits; the optimizing
+/// tier keeps a marked site generic.
+pub const IC_MID_PRIMITIVE: u8 = 0x70;
+pub const IC_MID_PRIMITIVE_SHIFT: u32 = 4;
+pub const IC_PRIMITIVE_STRING: u8 = 1;
+pub const IC_PRIMITIVE_NUMBER: u8 = 2;
+pub const IC_PRIMITIVE_BOOLEAN: u8 = 3;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
 /// is missing along the entire (all `ObjectKind::ExoticNone`, all ic-plain) prototype chain. The chain's
 /// shapes sit in recv_shape/mid_shape/mid2_shape/mid3_shape/mid4_shape/holder_shape in walk
