@@ -764,6 +764,50 @@ The back end:
   codePointAt in loops, as in Djot's getEol and skipSpace): with the tier eager, string_call_fusion's
   register-region test made 4,696 fused calls where it expects at least 10,000. Their lowering is a
   later stage's.
+- Stage 1's measurements (2026-11-09; 06e68cf0 in fat LTO, the tier on against off on that build,
+  090cd551 with the tier off as the base; target/p3/stage1/session-p3s1-06e68cf0, its report
+  report-p3s1-06e68cf0.txt; every period uncapped). The tier off against the base is within noise
+  throughout (Octane's Score 0.1%, the fixtures and steady states 1% or less). The tier on against
+  off: Vue's measured pass 5.9% faster (193 against 205 ms), React's 3.3% slower (31 against 30) and
+  Djot's 4.0% (78 against 75); in steady state Vue 0.9% faster, React 7.4% slower (29 against 27
+  ms), Djot equal. Calls: method-call 8.9% faster, class-and-getter 5.7%, fib 4.8%; closure-call
+  3.3% slower; the rest within 1.5%. Octane's Score 12% lower (4,019 against 4,565): Crypto 2.64x
+  slower, zlib 2.19x, Mandreel 1.86x, Richards 1.29x (its rounds 1,051-1,310), MandreelLatency 5.7%;
+  Box2D 30% faster, RayTrace 15%, TypeScript 11.5%, EarleyBoyer 9.2%, DeltaBlue 4.6%, the rest
+  within 1.4%. ARES-6 (one run) 16% faster: Air 2.8x in steady state, Babylon 12%; Basic 2-10%
+  slower, ML 2%. Web Tooling (one run) 1.9% faster: babel 20% faster; espree 17% slower, terser
+  11%, acorn 6%, chai 4%. Compile time, every compile of the run against the measured pass (an
+  upper bound): Vue 4.5 ms (2.3%), React 1.2 ms (3.8%), Djot 9.3 ms (11.9%, 2.1 ms of it a chunk
+  that later fell back). Coverage (coverage-s1.sh, coverage-p3s1-06e68cf0/coverage.txt): the
+  tier's code takes 46.9% of the second-stage samples, Vue 83% (80% in steady state), React 100%,
+  Djot 85% (66%), Octane 44%: there 41% runs in template code the tier fell back to (229 of 1,000
+  compiles fell back; TypeScript's type collection, its preCollect*Types, alone 25%), 9% in second
+  stages' loop code (OSR's, stage 5) and those it refused. The gates are met; coverage and
+  performance are not.
+- Why (2026-11-09, untimed profiles of each side, target/p3/stage1/diag):
+  - Elements are effects. Crypto's time is the tier's code (96% of its samples: montReduce with am3
+    spliced, and bnpSquareTo). Around each element load and store, run as its baseline template,
+    every live int32 is stored to the frame as a double and comes back through FJCVTZS, the loop's
+    hottest instructions; the second stage's register region keeps them in registers and its
+    elements in line. React's steady state has no exits: its 7% is spread over the spliced map
+    loop's calls and element stores.
+  - Bitwise operations on f64 stay effects. An operand that f64 arithmetic made sends `|`, `&` and
+    the shifts to the VM's operation helper (jit_exec): 38% of zlib's samples with the tier on
+    (0.4% off) and 31% of Mandreel's (none off). Maglev truncates such an operand in line
+    (GetTruncatedInt32ForToNumber adds TruncateFloat64ToInt32 for a Float64, maglev-reducer-inl.h;
+    FJCVTZS on ARM64, macro-assembler-arm64.cc:3014).
+  - Exits without reoptimization. Alone: Mandreel's 53 compiles had 853 exits (int32 overflow, a
+    word not a Number, blocks that never ran) and 8 fell back; Crypto's 42 had 652 (BigInteger
+    receivers of a second shape) and 4 fell back; Richards' 31 had 300 (two inline guards of
+    `this.task.run(packet)`, whose callee varies over four task kinds, where the second stage's
+    guard calls in place, and a block that never ran) and 3 fell back, after which
+    TaskControlBlock.run runs on its own (25% of the samples against 5% off) rather than inside
+    schedule's second stage; Djot's measured pass had 399 and 3 fell back. V8 invalidates the code
+    at the first eager deopt and optimizes again on the new feedback (deoptimizer.cc:1851-1872;
+    IsDeoptimizationWithoutCodeInvalidation exempts only OSR's reasons); JSC jettisons past its exit
+    threshold and recompiles with the exit profile; stage 1 falls back for good.
+  - Not warm-up: with the tier eager (9 rounds, uncapped), React's measured pass is the same 3.3%
+    slower and Djot's 17% (4.0% at the settled checkpoint); Vue's gain is 5.8% (5.3%).
 - Shapes (review of the front end, 2026-11-08): CheckShape proves what the baseline's own-data
   probe proves (an object word, an ordinary kind, which excludes Arrays, whose element entries
   take slots without a shape transition, the IC-plain flag, the shape). A field access after it
@@ -796,3 +840,5 @@ Stage 1's exit (proposed, for the owner's agreement):
 - Performance, the tier on against main in one session: no fixture, Octane benchmark or call
   microbenchmark slower by more than 2%, Octane's geomean faster, and compile time at most 3% of any
   fixture's measured pass.
+Measured 2026-11-09 (Stage 1's measurements and Why, above): the gates are met; coverage (46.9%) and
+performance are not. The owner's decision on the exit is pending.
