@@ -1073,3 +1073,16 @@ NeverRan, a fifth shape and an uncacheable receiver converge through the feedbac
 marks the site generic at an evicting or refused fill); Overflow and WrongCallee need the profile
 in code2's own recompile, and a WrongShape flag keyed on a first stage declined its site in another
 chunk's compile (a stale chain's code3). Untimed; a discard and its recompile move the epoch twice.
+Coverage attribution (2026-11-09). Stage 1's measurement joined each sample to the last code the
+perf map listed at its address (target/p3/stage1/coverage.py), and Octane frees and maps code
+memory again: in stage 1's run, 26,551 of the 42,958 samples it placed in second-stage code lay
+where more than one such code had been, 8,582 where a first stage was listed last. The engine now
+writes perf's jitdump (TRUST_JS_PERF_JITDUMP, 33e4d523; V8's --perf-prof), whose records carry
+CLOCK_MONOTONIC times, and target/p3/stage2/tools/coverage2.py joins each sample of a `perf record
+-k mono` run to the code at its address when it was taken; coverage-s2.sh is stage 1's runner on
+it. One untimed run of main at 33e4d523 (steps 1 and 3, a non-LTO build): Octane's coverage is
+92.6% joined by time, 84.0% by the old join of the same samples (which gives fallback code 8.0% of
+them where it held 2.4%), with 298 discards and 261 recompiles; the fixtures' is 88.0% (Vue 87.6%,
+React 100%, Djot 91.6%; their steady state 83.8%, 100%, 93.8%), Vue's rest a second stage the tier
+refuses for `finally` (8.3% of its samples, 14.6% in the steady state). Stage 1's 46.9% came from
+the old join; step 5 measures the bar by time on the fat-LTO engine.
