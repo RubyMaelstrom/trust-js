@@ -1669,3 +1669,59 @@ recompiled when.
 The order (proposed): step 9 now (the trigger the measurement's plan asked for, and the largest
 open regression); then compile time as ordered (2026-11-09), React's and Djot's passes with it;
 then NavierStokes' instructions on the A725, constructor's stalls and the list.
+
+The compile-time investigation (2026-11-10, target/p3/stage2/compile-diag; a probe counting each
+phase's instructions and cycles, branch p3-compile-probe, unlanded). The log's time is generate's;
+of its user cycles on Djot: the register allocator 23.7%, emission 20.0% (2.6 points a CFG
+rebuild), the Builder 19.2% (17 hash maps of facts cloned at each branch and met at each join;
+an element load's typed-against-words diamond), the verifier 9.9% (3.6 points its own CFG), phi
+selection 7.3% (a whole-graph copy), the CFG 4.7%, initialized reads 3.1%, slot liveness 3.1%,
+the snapshot 2.0%, finishing 4.5%; malloc and free 13.7% across them, Vec growth 8.5%, hash maps
+6.7%. The CFG is built three times a compile (build.rs:111, verify.rs:33, a64.rs:128) and the
+initialized reads twice. About 3,200 cycles a node, near linear (29K cycles plus 3,200 a node);
+React and Vue alike. Outside generate, per Djot run: second stages' bytecode recompiles 3.0M
+cycles against generate's 17.6M (21 of 37 plans splice nothing and still recompile), the
+fingerprints 0.86M, the discards' fallback template compiles about 1.6M. Of Djot's compile
+cycles, 21.5% go to three compiles later discarded, 5.8% to two recompiles, 28.2% to four
+compiles on unsettled feedback at the last checkpoint, 9.4% to three whose code never ran; the
+tier's code ran 17.2M cycles in all against about 20M to compile it. With the first checkpoint
+at 400 (TRUST_JS_INLINE_AT=400; V8 tiers to Maglev at 400 invocations' budget) Djot compiles 20
+functions in 7.4 ms against 38 in 15.1, and its measured pass runs 1.1% faster than the tier off
+against 6.4% slower. V8's Maglev on this machine and CPU (node, Maglev only, its trace): 13.0 ms
+of Djot's 35 ms pass compiling (37%) on one CPU; 23 ms for the pass on two CPUs with Maglev's
+concurrent compiles. The clock: the X925 cores deliver 1.37 GHz under load (a spin loop's cycles
+over task-clock; cpuinfo_avg_freq; CPPC's feedback counters since boot, 1.39 GHz on average),
+not 3.9 GHz, with thermald at state 0 and scaling_max_freq at 3.9 GHz, which is all uncapped.sh
+reads; the A725 cores deliver 1.15 of 2.81 GHz. Every session since at least 2026-11-05 ran so
+(Richards off 1,656 to 1,670 in each), so their ratios stand.
+
+10. Compile time, first part (new): three changes that leave the tier's code identical.
+   - The verifier runs in debug builds (the library's tests) and, in release builds, only under
+     TRUST_JS_OPT_VERIFY=1, as Maglev verifies only #ifdef DEBUG (VerifyGraph,
+     maglev/maglev-compiler.cc:74-80), SpiderMonkey's AssertGraphCoherency is empty without
+     DEBUG (jit/MIRGraph.cpp:1812-1822) and JSC validates with assertions or the validateGraph
+     option, false by default (validationEnabled, dfg/DFGCommon.h:88-95;
+     runtime/OptionsList.h:183-184).
+   - One CFG and one set of initialized reads a compile, made with the graph and handed to the
+     verifier and the emitter, as Maglev's graph builder keeps the one BytecodeAnalysis it
+     made (maglev/maglev-graph-builder.h:1775-1777, 1818).
+   - The register allocator's internals, its decisions unchanged: register pools as bitmasks,
+     as Maglev's register state keeps its free registers (maglev/maglev-regalloc.h:57-94),
+     frame-state values listed once, flat next-use lists, no allocation in each pass, and an
+     index for live_at in place of its scan of every value at each slow-path call.
+   - Expected (the probe's counts): generate's cycles on Djot -22% (15.0M against 19.3M a run),
+     React -19%, Vue -21%; the code identical (masked code hashes equal).
+   - Tests: the tier's tests in its four configurations and the library's suites (debug: the
+     verifier on); code hashes before and after for the three fixtures, Richards and Crypto's
+     fixed runs and the tier's tests; the fixtures in release under TRUST_JS_OPT_VERIFY=1.
+   These with the further single-thread work estimated (one forward pass for the allocator's
+   live ranges and next uses, as Maglev's; an arena for the IR; frame states shared until an
+   effect; phi selection without its copy; copy-on-write facts) take Djot to about 10% of its
+   pass, and with a tier-up policy nearer V8's (thresholds scaled by size, no compile on
+   unsettled feedback at the last checkpoint, second stages that splice nothing built from the
+   first stage) to about 4%. The bar, 3% of a fixture's measured pass on one pinned CPU, is past
+   what Maglev does here (37%); the exemplars meet their budgets by compiling off the main
+   thread (V8's prepare, execute and finalize, compiler.h:395-401; SpiderMonkey's off-thread
+   Ion, which it turns off with one CPU, jit/Ion.cpp:2110-2118; JSC's useConcurrentJIT, on by
+   default, runtime/OptionsList.h:291). Which CPU model the bar assumes is the owner's (asked
+   2026-11-10).
