@@ -52,6 +52,23 @@ const LT: u32 = 11;
 const GT: u32 = 12;
 const LE: u32 = 13;
 
+/// The condition on (b, a) that holds where `code` holds on (a, b): a comparison's operands
+/// swapped, which reverses an order and keeps an equality (P3 stage 2 step 7).
+fn swapped(code: u32) -> u32 {
+    match code {
+        LT => GT,
+        GT => LT,
+        LE => GE,
+        GE => LE,
+        LO => HI,
+        HI => LO,
+        HS => LS,
+        LS => HS,
+        EQ | NE => code,
+        _ => unreachable!("a comparison's condition"),
+    }
+}
+
 // Scratch registers.
 const X9: u32 = 9;
 const X16: u32 = 16;
@@ -819,7 +836,8 @@ impl Gen<'_> {
         }
     }
 
-    /// The d register that holds `v` here (as [`Gen::gp`]; a constant goes through x30).
+    /// The d register that holds `v` here (as [`Gen::gp`]; a constant by FMOV's 8-bit immediate
+    /// where it encodes, else through x30).
     fn fp(&mut self, v: NodeIx, scratch: u32) -> u32 {
         match self.home(v) {
             Home::Fp(r) => u32::from(r),
@@ -831,6 +849,8 @@ impl Gen<'_> {
                 let bits = self.const_bits(v);
                 if bits == 0 {
                     self.a.fmov_d_x(scratch, 31); // xzr
+                } else if let Some(imm8) = asm::fmov_imm8_d(bits) {
+                    self.a.fmov_d_imm(scratch, imm8);
                 } else {
                     self.a.mov_imm64(X30, bits);
                     self.a.fmov_d_x(scratch, X30);
@@ -838,6 +858,88 @@ impl Gen<'_> {
                 scratch
             }
             Home::Gp(_) | Home::None => unreachable!("a read value has a d home"),
+        }
+    }
+
+    /// `v`'s value where it is an int32 constant, which an instruction may take as its immediate
+    /// (P3 stage 2 step 7; Maglev's TryGetInt32ConstantInput). No register holds a constant
+    /// (`regalloc`): one whose immediate does not encode is loaded into a scratch register at
+    /// its use, as before.
+    fn const_i32(&self, v: NodeIx) -> Option<i32> {
+        match self.graph.node(v).op {
+            NodeOp::ConstI32(x) => Some(x),
+            _ => None,
+        }
+    }
+
+    /// The immediate a constant operand of `node`, an operation on two int32s, takes as `encode`
+    /// gives it, and the operand that stays in a register: the right operand's, else, where the
+    /// operation commutes, the left one's, the operands swapped. Maglev's ARM64 code generator
+    /// takes the right operand's (TryGetAddImmediateInt32ConstantInput and
+    /// TryGetLogicalImmediateInt32ConstantInput, maglev-ir-arm64.cc).
+    fn imm_operand<T>(
+        &self,
+        node: &Node,
+        commutes: bool,
+        encode: impl Fn(i32) -> Option<T>,
+    ) -> Option<(NodeIx, T)> {
+        let (left, right) = (node.inputs[0], node.inputs[1]);
+        if let Some(imm) = self.const_i32(right).and_then(&encode) {
+            return Some((left, imm));
+        }
+        let imm = self.const_i32(left).filter(|_| commutes).and_then(encode)?;
+        Some((right, imm))
+    }
+
+    /// An int32 add (`sub` clear) or subtract of the constant `c` by ADD/SUB immediate
+    /// (`asm::add_sub_imm`): whether the instruction subtracts, and its immediate. A negative
+    /// constant takes the opposite operation by its magnitude, as V8's and SpiderMonkey's
+    /// macro-assemblers take one; its flags are the same (AddWithCarry sums x + c either way,
+    /// so N, Z, C and V agree, V the overflow exit's and N, Z and V a comparison's). INT32_MIN's
+    /// magnitude encodes in neither form.
+    fn add_sub_imm(c: i32, sub: bool) -> Option<(bool, u32)> {
+        let magnitude = c.unsigned_abs();
+        asm::add_sub_imm(magnitude).then_some((sub != (c < 0), magnitude))
+    }
+
+    /// Compare the int32s `a` and `b` (CMP) and give the condition to test for `code`, a
+    /// condition on (a, b): a constant `b` by CMP's immediate (a negative one by CMN's, by its
+    /// magnitude), a constant `a` likewise with the operands swapped and the condition reversed,
+    /// any other pair in registers.
+    fn cmp_i32(&mut self, a: NodeIx, b: NodeIx, code: u32) -> u32 {
+        let imm = |c| Self::add_sub_imm(c, true);
+        let (x, (subtract, imm), code) = if let Some(i) = self.const_i32(b).and_then(imm) {
+            (a, i, code)
+        } else if let Some(i) = self.const_i32(a).and_then(imm) {
+            (b, i, swapped(code))
+        } else {
+            let ra = self.gp(a, X16);
+            let rb = self.gp(b, X17);
+            self.a.cmp_reg_w(ra, rb);
+            return code;
+        };
+        let r = self.gp(x, X16);
+        if subtract {
+            self.a.cmp_imm_w(r, imm);
+        } else {
+            self.a.cmn_imm_w(r, imm);
+        }
+        code
+    }
+
+    /// `rd` = the int32 in `rn` shifted by the int32 `count` (op: 0 LSL, 1 LSR, 2 ASR), which
+    /// JavaScript takes modulo 32 as the register forms do: a constant count as the immediate,
+    /// its low five bits.
+    fn shift_i32(&mut self, op: u32, rd: u32, rn: u32, count: NodeIx) {
+        let Some(c) = self.const_i32(count) else {
+            let rm = self.gp(count, X17);
+            return self.a.shift_w(op, rd, rn, rm);
+        };
+        let c = c as u32 & 31;
+        match op {
+            0 => self.a.lsl_imm_w(rd, rn, c),
+            1 => self.a.lsr_imm_w(rd, rn, c),
+            _ => self.a.asr_imm_w(rd, rn, c),
         }
     }
 
@@ -1283,13 +1385,27 @@ impl Gen<'_> {
             }
             NodeOp::I32Add | NodeOp::I32Sub => {
                 let site = self.check_exit(n)?;
-                let a = self.gp(input(0), X16);
-                let b = self.gp(input(1), X17);
+                let sub = node.op == NodeOp::I32Sub;
                 let w = self.gp_dst(n);
-                if node.op == NodeOp::I32Add {
-                    self.a.adds_reg_w(w, a, b);
-                } else {
-                    self.a.subs_reg_w(w, a, b);
+                // A constant that encodes takes the immediate, an addition's on either side.
+                match self.imm_operand(node, !sub, |c| Self::add_sub_imm(c, sub)) {
+                    Some((x, (true, imm))) => {
+                        let a = self.gp(x, X16);
+                        self.a.subs_imm_w(w, a, imm);
+                    }
+                    Some((x, (false, imm))) => {
+                        let a = self.gp(x, X16);
+                        self.a.adds_imm_w(w, a, imm);
+                    }
+                    None => {
+                        let a = self.gp(input(0), X16);
+                        let b = self.gp(input(1), X17);
+                        if sub {
+                            self.a.subs_reg_w(w, a, b);
+                        } else {
+                            self.a.adds_reg_w(w, a, b);
+                        }
+                    }
                 }
                 self.a.b_cond(VS, site);
                 self.gp_done(n, w);
@@ -1312,43 +1428,53 @@ impl Gen<'_> {
             }
             NodeOp::I32And | NodeOp::I32Or | NodeOp::I32Xor => {
                 if !unused {
-                    let a = self.gp(input(0), X16);
-                    let b = self.gp(input(1), X17);
                     let w = self.gp_dst(n);
                     let op = match node.op {
                         NodeOp::I32And => 0,
                         NodeOp::I32Or => 1,
                         _ => 2,
                     };
-                    self.a.logic_w(op, w, a, b);
+                    // A constant that encodes takes the logical immediate, on either side.
+                    match self.imm_operand(node, true, |c| asm::logical_imm_w(c as u32)) {
+                        Some((x, field)) => {
+                            let a = self.gp(x, X16);
+                            self.a.logic_imm_w(op, w, a, field);
+                        }
+                        None => {
+                            let a = self.gp(input(0), X16);
+                            let b = self.gp(input(1), X17);
+                            self.a.logic_w(op, w, a, b);
+                        }
+                    }
                     self.gp_done(n, w);
                 }
             }
             NodeOp::I32Shl | NodeOp::I32Sar => {
                 if !unused {
                     let a = self.gp(input(0), X16);
-                    let b = self.gp(input(1), X17);
                     let w = self.gp_dst(n);
                     // The count is taken mod 32, as JavaScript takes it.
                     let op = if node.op == NodeOp::I32Shl { 0 } else { 2 };
-                    self.a.shift_w(op, w, a, b);
+                    self.shift_i32(op, w, a, input(1));
                     self.gp_done(n, w);
                 }
             }
             NodeOp::I32UShr => {
                 let site = self.check_exit(n)?;
                 let a = self.gp(input(0), X16);
-                let b = self.gp(input(1), X17);
                 let w = self.gp_dst(n);
-                self.a.shift_w(1, w, a, b);
-                self.a.tbnz(w, 31, site); // past int32
+                self.shift_i32(1, w, a, input(1));
+                // Past int32, unless a constant count of 1 to 31 clears bit 31 (the builder's
+                // only kind, whose exit then never runs; the forced-exit gate keeps it).
+                if self.const_i32(input(1)).is_none_or(|c| c & 31 == 0) {
+                    self.a.tbnz(w, 31, site);
+                }
                 self.gp_done(n, w);
             }
             NodeOp::I32UShrToF64 => {
                 if !unused {
                     let a = self.gp(input(0), X16);
-                    let b = self.gp(input(1), X17);
-                    self.a.shift_w(1, X16, a, b);
+                    self.shift_i32(1, X16, a, input(1));
                     let d = self.fp_dst(n);
                     self.a.ucvtf_d_w(d, X16);
                     self.fp_done(n, d);
@@ -1403,10 +1529,7 @@ impl Gen<'_> {
             }
             NodeOp::I32Cmp(cond) => {
                 if !unused {
-                    let a = self.gp(input(0), X16);
-                    let b = self.gp(input(1), X17);
                     let w = self.gp_dst(n);
-                    self.a.cmp_reg_w(a, b);
                     let code = match cond {
                         Cond::Lt => LT,
                         Cond::Le => LE,
@@ -1415,6 +1538,7 @@ impl Gen<'_> {
                         Cond::Eq => EQ,
                         Cond::Ne => NE,
                     };
+                    let code = self.cmp_i32(input(0), input(1), code);
                     self.a.cset_w(w, code);
                     self.gp_done(n, w);
                 }
@@ -1554,11 +1678,10 @@ impl Gen<'_> {
             }
             NodeOp::CheckBounds => {
                 let site = self.check_exit(n)?;
-                let index = self.gp(input(0), X16);
-                let length = self.gp(input(1), X17);
-                // Unsigned: a negative index is past every length.
-                self.a.cmp_reg_w(index, length);
-                self.a.b_cond(HS, site);
+                // Unsigned: a negative index is past every length. A constant index (`a[3]`)
+                // takes the immediate, compared from the length's side.
+                let code = self.cmp_i32(input(0), input(1), HS);
+                self.a.b_cond(code, site);
             }
             NodeOp::LoadElement(holes) => self.lower_load_element(n, *holes)?,
             NodeOp::LoadElementOrUndefined => self.lower_load_element_or_undefined(n)?,

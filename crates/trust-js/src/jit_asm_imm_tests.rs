@@ -1037,3 +1037,231 @@ fn flags(value: u64, imm: u64, wide: bool, add: bool) -> (u64, u64) {
         | u64::from(overflow) << 28;
     (result, nzcv)
 }
+
+// ---- the optimizing tier's immediate operands (P3 stage 2 step 7) ----
+
+/// FMOV (scalar, immediate)'s double for `imm8`, as Arm A64's VFPExpandImm gives it: the sign,
+/// the exponent NOT(b), b eight times, c:d, the fraction e:f:g:h over 48 zero bits.
+fn vfp_expand_imm(imm8: u32) -> u64 {
+    let imm8 = u64::from(imm8);
+    let b = (imm8 >> 6) & 1;
+    let exponent = (b ^ 1) << 10 | (b * 0xFF) << 2 | (imm8 >> 4) & 3;
+    (imm8 >> 7) << 63 | exponent << 52 | (imm8 & 0xF) << 48
+}
+
+/// The operands the tier takes as immediates: ADD/SUB's (a 12-bit immediate, or one shifted by
+/// 12, for ADDS, SUBS, CMP and CMN), FMOV's 8-bit doubles, and the words of every form the tier
+/// emits for them, as llvm-mc 23 encodes them (`llvm-mc -triple=aarch64 -show-encoding`).
+#[test]
+fn the_tiers_immediate_operands_encode_as_the_assembler_does() {
+    use super::asm::{add_sub_imm, fmov_imm8_d, logical_imm_w};
+    for v in [0, 1, 4095, 4096, 0x2000, 0x1000, 0x7F_F000, 0xFF_F000] {
+        assert!(add_sub_imm(v), "{v:#x}");
+    }
+    for v in [
+        4097,
+        0x1001,
+        0xFF_F001,
+        0x100_0000,
+        0x100_1000,
+        0x7FFF_FFFF,
+        1 << 31,
+        u32::MAX,
+    ] {
+        assert!(!add_sub_imm(v), "{v:#x}");
+    }
+    let before = legalized();
+    let logical = |v| logical_imm_w(v).unwrap();
+    let fmov = |x: f64| fmov_imm8_d(x.to_bits()).unwrap();
+    let cases: Vec<(Vec<u32>, u32, &str)> = vec![
+        (
+            words(|a| a.adds_imm_w(9, 10, 4095)),
+            0x313F_FD49,
+            "adds w9, w10, #4095",
+        ),
+        (
+            words(|a| a.subs_imm_w(9, 10, 4096)),
+            0x7140_0549,
+            "subs w9, w10, #1, lsl #12",
+        ),
+        (
+            words(|a| a.adds_imm_w(0, 3, 0xFF_F000)),
+            0x317F_FC60,
+            "adds w0, w3, #4095, lsl #12",
+        ),
+        (words(|a| a.cmp_imm_w(8, 0)), 0x7100_011F, "cmp w8, #0"),
+        (words(|a| a.cmn_imm_w(8, 1)), 0x3100_051F, "cmn w8, #1"),
+        (
+            words(|a| a.cmp_imm_w(3, 0xFF_F000)),
+            0x717F_FC7F,
+            "cmp w3, #4095, lsl #12",
+        ),
+        (
+            words(|a| a.logic_imm_w(0, 4, 3, logical(0x3FFF))),
+            0x1200_3464,
+            "and w4, w3, #0x3fff",
+        ),
+        (
+            words(|a| a.logic_imm_w(1, 1, 11, logical(0xFFF_FFFF))),
+            0x3200_6D61,
+            "orr w1, w11, #0xfffffff",
+        ),
+        (
+            words(|a| a.logic_imm_w(2, 2, 5, logical(0xFFFF_FFF8))),
+            0x521D_70A2,
+            "eor w2, w5, #0xfffffff8",
+        ),
+        (
+            words(|a| a.logic_imm_w(0, 1, 2, logical(0x8000_0000))),
+            0x1201_0041,
+            "and w1, w2, #0x80000000",
+        ),
+        (
+            words(|a| a.asr_imm_w(0, 3, 14)),
+            0x130E_7C60,
+            "asr w0, w3, #14",
+        ),
+        (
+            words(|a| a.lsl_imm_w(8, 8, 14)),
+            0x5312_4508,
+            "lsl w8, w8, #14",
+        ),
+        (
+            words(|a| a.lsl_imm_w(8, 8, 31)),
+            0x5301_0108,
+            "lsl w8, w8, #31",
+        ),
+        (
+            words(|a| a.lsr_imm_w(8, 8, 31)),
+            0x531F_7D08,
+            "lsr w8, w8, #31",
+        ),
+        // A shift by 0 copies: `lsl w8, w8, #0` assembles as `lsr w8, w8, #0`.
+        (
+            words(|a| a.lsl_imm_w(8, 8, 0)),
+            0x5300_7D08,
+            "lsr w8, w8, #0",
+        ),
+        (
+            words(|a| a.lsr_imm_w(8, 8, 0)),
+            0x5300_7D08,
+            "lsr w8, w8, #0",
+        ),
+        (
+            words(|a| a.asr_imm_w(8, 8, 0)),
+            0x1300_7D08,
+            "asr w8, w8, #0",
+        ),
+        (
+            words(|a| a.fmov_d_imm(0, fmov(1.0))),
+            0x1E6E_1000,
+            "fmov d0, #1.0",
+        ),
+        (
+            words(|a| a.fmov_d_imm(31, fmov(-2.5))),
+            0x1E70_901F,
+            "fmov d31, #-2.5",
+        ),
+        (
+            words(|a| a.fmov_d_imm(8, fmov(0.125))),
+            0x1E68_1008,
+            "fmov d8, #0.125",
+        ),
+        (
+            words(|a| a.fmov_d_imm(30, fmov(31.0))),
+            0x1E67_F01E,
+            "fmov d30, #31.0",
+        ),
+        (
+            words(|a| a.fmov_d_imm(1, fmov(-0.1875))),
+            0x1E79_1001,
+            "fmov d1, #-0.1875",
+        ),
+        (
+            words(|a| a.fmov_d_imm(17, fmov(2.0))),
+            0x1E60_1011,
+            "fmov d17, #2.0",
+        ),
+    ];
+    for (emitted, expected, text) in cases {
+        assert_eq!(emitted, [expected], "{text}");
+    }
+    assert_eq!(
+        legalized(),
+        before,
+        "every immediate the tier takes is one word"
+    );
+    // FMOV's 256 doubles are ±(16 + n)/16 · 2^e for n in 0..16 and e in -3..=4, each the
+    // expansion of its own field.
+    let mut values: Vec<u64> = Vec::new();
+    for e in -3..=4 {
+        for n in 0..16 {
+            let x = f64::from(16 + n) / 16.0 * 2f64.powi(e);
+            values.extend([x.to_bits(), (-x).to_bits()]);
+        }
+    }
+    values.sort_unstable();
+    let mut expanded: Vec<u64> = (0..256).map(vfp_expand_imm).collect();
+    expanded.sort_unstable();
+    assert_eq!(expanded, values);
+    for imm8 in 0..256 {
+        assert_eq!(fmov_imm8_d(vfp_expand_imm(imm8)), Some(imm8), "{imm8:#x}");
+    }
+    for x in [
+        0.0,
+        -0.0,
+        0.1,
+        1.0 / 3.0,
+        0.0625,
+        32.0,
+        16.5,
+        4095.0,
+        -33.0,
+        1e300,
+        f64::MAX,
+        f64::MIN_POSITIVE,
+        5e-324,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ] {
+        assert_eq!(fmov_imm8_d(x.to_bits()), None, "{x:e}");
+    }
+    // A set low fraction bit takes a double out of the form.
+    assert_eq!(fmov_imm8_d(1f64.to_bits() | 1), None);
+    assert_eq!(fmov_imm8_d(1f64.to_bits() | 1 << 47), None);
+    // Past 8 bits the field is a template bug.
+    let mut a = Asm::new();
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| a.fmov_d_imm(0, 256)));
+    if cfg!(debug_assertions) {
+        assert!(caught.is_err());
+    } else {
+        assert!(caught.is_ok() && a.failed().is_some());
+    }
+}
+
+/// Every FMOV immediate run on the CPU: d0 holds the field's expansion, every other register as
+/// it was.
+#[test]
+fn fmov_immediates_run_on_the_cpu() {
+    let stack = Region::new(1 << 16);
+    let mut a = Asm::new();
+    let probes: Vec<(usize, u32)> = (0..256)
+        .map(|imm8| (append_probe(&mut a, |a| a.fmov_d_imm(0, imm8)), imm8))
+        .collect();
+    assert_eq!(a.failed(), None);
+    let code = executable(a);
+    for (at, imm8) in probes {
+        let before = machine(&stack);
+        let mut after = before;
+        run(&code, at, &mut after);
+        let mut expected = before;
+        expected.d[0] = vfp_expand_imm(imm8);
+        assert_eq!(
+            after,
+            expected,
+            "fmov d0, #{}",
+            f64::from_bits(expected.d[0])
+        );
+    }
+}

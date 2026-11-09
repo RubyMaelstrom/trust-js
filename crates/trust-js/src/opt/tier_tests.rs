@@ -223,6 +223,28 @@ const PROGRAMS: &[&str] = &[
      t = (t + (sumF(f) || 0) + setU(u, k) + (at(all[k % 9], k % 9) || 0) + \
      (at(k % 2 ? f : [k, 1], 1) || 0) + count(all[k % 9])) % 1000003; }\n\
      String(t) + all.map(a => Array.from(a, x => Object.is(x, -0) ? 'z' : x).join()).join('|')",
+    // Immediate operands (P3 stage 2 step 7): int32 additions, subtractions, masks, shifts and
+    // comparisons with constants at the encodings' bounds and past them, on either side, and
+    // f64 constants. The parameters are made int32s first, as asm.js code makes them, so the
+    // arithmetic is int32; they reach the int32 range's ends late, so additions with an
+    // immediate operand overflow and exit, and the recompiles take f64 arithmetic there.
+    "function imm(a, b) { a = a | 0; b = b | 0; \
+     let r = ((a + 4095) ^ (a - 4096) ^ (0xfff000 + a) ^ (a - -1) ^ (b - 0x1000000) ^ \
+     (a + -2147483648) ^ (4097 - b)) | 0; \
+     r = r ^ (a & 0x3fff) ^ (b | 0xfffffff) ^ (a ^ 0x12345) ^ (0x55555555 & b) ^ (a & -8) ^ \
+     (b | 0); \
+     r = r ^ (a << 14) ^ (b >> 31) ^ (a >>> 28) ^ (b << 33) ^ (a >> 0) ^ (1 << (b & 31)) ^ \
+     ((a >>> 0) & 1) ^ (b >>> 32); \
+     if (a < 4096) r = r + 1 | 0; if (-4096 >= b) r = r - 3 | 0; if (a == 0xfff000) r = ~r; \
+     if (4095 > b) r = r ^ 7; if (b != -1) r = r ^ 0x100; if (a <= -2147483648) r = r ^ 9; \
+     return r; }\n\
+     function fimm(x) { return x * 0.5 + 1.5 - x / 31 + (x < 0.125 ? 0.1 : -2.5) * 0.1; }\n\
+     const vals = [0, 1, -1, 4095, 4096, -4096, 0x3fff, 0xfff000, 123456789, -987654321];\n\
+     let t = 0, u = 0; for (let k = 0; k < 3000; k++) { \
+     const a = k < 2000 ? vals[k % vals.length] : k % 2 ? 2147483647 : -2147483648; \
+     const b = vals[(k * 7) % vals.length]; \
+     t = (t + imm(a, b)) | 0; u += fimm(k * 0.25 - 100); }\n\
+     t + ':' + u",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {

@@ -3648,3 +3648,504 @@ fn typed_stores_keep_the_buffers_dirty_ranges_and_generation() {
     assert_eq!(engine.interp.array_buffer_version(&buf), Some(version + 2));
     assert_eq!(eval(&mut engine, "Array.from(t).join()"), "0,7,0,8,0,0,0,0");
 }
+
+// ---- immediate operands (P3 stage 2 step 7) ----
+
+/// The words of installed code.
+fn code_words(code: &JitCode) -> Vec<u32> {
+    let bytes = unsafe { std::slice::from_raw_parts(code.mem_ptr(), code.code_bytes()) };
+    let (words, _) = bytes.as_chunks::<4>();
+    words.iter().map(|&w| u32::from_le_bytes(w)).collect()
+}
+
+/// Whether `code` holds `word` in the bits `mask` keeps (its registers masked out).
+fn holds(code: &[u32], word: u32, mask: u32) -> bool {
+    code.iter().any(|&w| w & mask == word & mask)
+}
+
+/// JavaScript source for an int32.
+fn js_int(x: i32) -> String {
+    format!("({x})")
+}
+
+/// `f(a, b)` (LoadLocal 0, LoadLocal 1, the operation at pc 2, Return) as the int32 operation
+/// `op` with the constant `c` for its left operand (`left`) or its right one: the other operand
+/// is its argument's int32, checked at pc 2, where an exiting `op` exits too; the VM's operation
+/// then reads the arguments, which the calls make `c` where the graph has the constant.
+fn const_operand(op: NodeOp, c: i32, left: bool, out: Rep) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let word = if left { y } else { x };
+    let f = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[word],
+        Rep::F64,
+        2,
+        at,
+        ExitReason::NotNumber,
+    );
+    let v = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[f],
+        Rep::I32,
+        2,
+        at,
+        ExitReason::NotInt32,
+    );
+    let k = b.node(entry, NodeOp::ConstI32(c), &[], Rep::I32, 2);
+    let inputs = if left { [k, v] } else { [v, k] };
+    let r = if op.can_exit() {
+        b.exiting(entry, op, &inputs, out, 2, at, ExitReason::Overflow)
+    } else {
+        b.node(entry, op, &inputs, out, 2)
+    };
+    let boxing = match out {
+        Rep::I32 => NodeOp::I32ToTagged,
+        Rep::F64 => NodeOp::F64ToTagged,
+        _ => NodeOp::BoolToTagged,
+    };
+    let boxed = b.node(entry, boxing, &[r], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    b.g
+}
+
+/// The instruction, its registers aside, that takes the constant `c` of `op` (on the left where
+/// `left`) as its immediate, and the mask of the bits it fixes; None where `c` stays in a
+/// register. An independent model of the encodings (Arm A64): ADDS and SUBS (CMN and CMP, which
+/// write XZR) with a 12-bit immediate or one shifted by 12, a negative constant by the opposite
+/// operation; AND, ORR and EOR with a 32-bit logical immediate; LSL, LSR and ASR as UBFM and SBFM
+/// by the count's low five bits.
+fn imm_form(op: &NodeOp, c: i32, left: bool) -> Option<(u32, u32)> {
+    let add_sub = |sub: bool| {
+        let m = c.unsigned_abs();
+        let field = if m < 1 << 12 {
+            m << 10
+        } else if m < 1 << 24 && m & 0xFFF == 0 {
+            1 << 22 | (m >> 12) << 10
+        } else {
+            return None;
+        };
+        Some(
+            if sub != (c < 0) {
+                0x7100_0000
+            } else {
+                0x3100_0000
+            } | field,
+        )
+    };
+    let shift = |op: &NodeOp| {
+        let s = c as u32 & 31;
+        match op {
+            NodeOp::I32Shl => 0x5300_0000 | ((32 - s) & 31) << 16 | (31 - s) << 10,
+            NodeOp::I32Sar => 0x1300_0000 | s << 16 | 31 << 10,
+            _ => 0x5300_0000 | s << 16 | 31 << 10,
+        }
+    };
+    const REGISTERS: u32 = 0xFFFF_FC00;
+    match op {
+        NodeOp::I32Add => Some((add_sub(false)?, REGISTERS)),
+        NodeOp::I32Sub if !left => Some((add_sub(true)?, REGISTERS)),
+        // CMP or CMN, either side (a left constant reverses the condition): XZR's Rd.
+        NodeOp::I32Cmp(_) => Some((add_sub(true)? | 31, 0xFFFF_FC1F)),
+        NodeOp::I32And | NodeOp::I32Or | NodeOp::I32Xor => {
+            let base = match op {
+                NodeOp::I32And => 0x1200_0000,
+                NodeOp::I32Or => 0x3200_0000,
+                _ => 0x5200_0000,
+            };
+            let field = asm::logical_imm_w(c as u32)?;
+            Some((base | field << 10, REGISTERS))
+        }
+        NodeOp::I32Shl | NodeOp::I32Sar | NodeOp::I32UShr | NodeOp::I32UShrToF64 if !left => {
+            Some((shift(op), REGISTERS))
+        }
+        _ => None,
+    }
+}
+
+/// The int32 nodes with a constant operand (P3 stage 2 step 7), on its right and on its left, at
+/// each encoding's bounds and past them: the code takes an immediate exactly where the encoding
+/// allows (a commutative operation's left constant swapped to the right, a comparison's with
+/// its condition reversed, a negative add or subtract constant by the opposite operation, a
+/// shift count's low five bits), keeps the register elsewhere, and computes as the language does
+/// for operands at the edges of int32, its overflow exits taken with an immediate operand.
+#[test]
+fn int32_constants_take_the_immediate_where_it_encodes() {
+    let add_sub: &[i32] = &[
+        0,
+        1,
+        4095,
+        4096,
+        4097,
+        0xFF_F000,
+        0xFF_F001,
+        0x100_0000,
+        -1,
+        -4095,
+        -4096,
+        -4097,
+        -0xFF_F000,
+        -0x100_0000,
+        i32::MAX,
+        i32::MIN,
+    ];
+    let logical: &[i32] = &[
+        0x3FFF,
+        0xFFF_FFFF,
+        0x12345,
+        0,
+        -1,
+        -8,
+        0x5555_5555,
+        i32::MIN,
+        i32::MAX,
+        1,
+        5,
+    ];
+    let counts: &[i32] = &[0, 1, 14, 31, 32, 33, 63, -1, -32, 100, i32::MIN];
+    let ops: Vec<(NodeOp, &str, Rep, &[i32])> = vec![
+        (NodeOp::I32Add, "+", Rep::I32, add_sub),
+        (NodeOp::I32Sub, "-", Rep::I32, add_sub),
+        (NodeOp::I32And, "&", Rep::I32, logical),
+        (NodeOp::I32Or, "|", Rep::I32, logical),
+        (NodeOp::I32Xor, "^", Rep::I32, logical),
+        (NodeOp::I32Shl, "<<", Rep::I32, counts),
+        (NodeOp::I32Sar, ">>", Rep::I32, counts),
+        (NodeOp::I32UShr, ">>>", Rep::I32, counts),
+        (NodeOp::I32UShrToF64, ">>>", Rep::F64, counts),
+        (NodeOp::I32Cmp(Cond::Lt), "<", Rep::Bool, add_sub),
+        (NodeOp::I32Cmp(Cond::Le), "<=", Rep::Bool, add_sub),
+        (NodeOp::I32Cmp(Cond::Gt), ">", Rep::Bool, add_sub),
+        (NodeOp::I32Cmp(Cond::Ge), ">=", Rep::Bool, add_sub),
+        (NodeOp::I32Cmp(Cond::Eq), "==", Rep::Bool, add_sub),
+        (NodeOp::I32Cmp(Cond::Ne), "!=", Rep::Bool, add_sub),
+    ];
+    // The argument beside the constant: int32s at the edges, and a fraction, which exits.
+    let ints = [
+        0,
+        1,
+        -1,
+        2,
+        7,
+        4095,
+        4096,
+        -4096,
+        0x3FFF,
+        0x12345,
+        0xFF_F000,
+        0x100_0000,
+        i32::MAX,
+        i32::MIN,
+        0x7FFF_F000,
+        -0x7FFF_F001,
+        123_456_789,
+        -987_654_321,
+    ];
+    let mut cases = Vec::new();
+    for (op, js, out, constants) in &ops {
+        for &c in *constants {
+            for left in [false, true] {
+                cases.push((op.clone(), *js, *out, c, left));
+            }
+        }
+    }
+    let source: String = cases
+        .iter()
+        .enumerate()
+        .map(|(k, (_, js, ..))| format!("function f{k}(a, b) {{ return a {js} b; }} f{k}(1, 2);\n"))
+        .collect();
+    let mut engine = fixture(&source);
+    let (mut immediates, mut overflows) = (0, 0);
+    for (k, (op, js, out, c, left)) in cases.into_iter().enumerate() {
+        let name = format!("f{k}");
+        let graph = const_operand(op.clone(), c, left, out);
+        let code = install(&mut engine, &name, &graph, Options::default());
+        let context = format!(
+            "{op:?} with {c} on the {}",
+            if left { "left" } else { "right" }
+        );
+        if let Some((word, mask)) = imm_form(&op, c, left) {
+            assert!(
+                holds(&code_words(&code), word, mask),
+                "{context}: no immediate"
+            );
+            immediates += 1;
+        }
+        let pair = |v: &str| {
+            if left {
+                format!("{}, {v}", js_int(c))
+            } else {
+                format!("{v}, {}", js_int(c))
+            }
+        };
+        let calls: Vec<String> = ints
+            .iter()
+            .map(|&v| format!("{name}({})", pair(&js_int(v))))
+            .chain([format!("{name}({})", pair("1.5"))])
+            .collect();
+        let direct: Vec<String> = ints
+            .iter()
+            .map(|&v| pair(&js_int(v)).replace(", ", &format!(" {js} ")))
+            .chain([pair("1.5").replace(", ", &format!(" {js} "))])
+            .collect();
+        exits();
+        let got = eval(&mut engine, &format!("[{}].join()", calls.join(", ")));
+        let exited = exits();
+        let expected = eval(&mut engine, &format!("[{}].join()", direct.join(", ")));
+        assert_eq!(got, expected, "{context}");
+        // The fraction exits at its check; an int32 result past int32 at the operation.
+        assert!(exited.contains(&(2, ExitReason::NotInt32)), "{context}");
+        let past = ints
+            .iter()
+            .filter(|&&v| {
+                let (a, b) = if left { (c, v) } else { (v, c) };
+                match op {
+                    NodeOp::I32Add => a.checked_add(b).is_none(),
+                    NodeOp::I32Sub => a.checked_sub(b).is_none(),
+                    NodeOp::I32UShr => (a as u32) >> (b as u32 & 31) > i32::MAX as u32,
+                    _ => false,
+                }
+            })
+            .count();
+        let taken = exited
+            .iter()
+            .filter(|&&exit| exit == (2, ExitReason::Overflow))
+            .count();
+        assert_eq!(taken, past, "{context}: overflow exits");
+        if imm_form(&op, c, left).is_some() {
+            overflows += taken;
+        }
+    }
+    assert!(immediates > 200, "{immediates} immediates");
+    assert!(
+        overflows > 20,
+        "{overflows} overflow exits with an immediate operand"
+    );
+}
+
+/// `cb(a, b)` (LoadLocal 0, LoadLocal 1, Add at pc 2, Return) as an element bounds check on
+/// int32s, the constant `c` its index (`index_constant`) or its length, the argument's int32 the
+/// other: the argument back where the check holds, an OutOfBounds exit where it fails (the VM
+/// then adds, the call passing `c` where the graph has it).
+fn bounds_check(c: i32, index_constant: bool) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let f = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[x],
+        Rep::F64,
+        2,
+        at,
+        ExitReason::NotNumber,
+    );
+    let v = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[f],
+        Rep::I32,
+        2,
+        at,
+        ExitReason::NotInt32,
+    );
+    let k = b.node(entry, NodeOp::ConstI32(c), &[], Rep::I32, 2);
+    let inputs = if index_constant { [k, v] } else { [v, k] };
+    b.exiting(
+        entry,
+        NodeOp::CheckBounds,
+        &inputs,
+        Rep::None,
+        2,
+        at,
+        ExitReason::OutOfBounds,
+    );
+    let boxed = b.node(entry, NodeOp::I32ToTagged, &[v], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    b.g
+}
+
+/// The branching comparison, CheckBounds, with a constant index (`a[3]`, compared from the
+/// length's side with the unsigned condition reversed) or a constant length: CMP's immediate,
+/// or CMN's for a negative constant (the same flags, the carry among them), past every
+/// unsigned bound as a negative index must be.
+#[test]
+fn bounds_checks_take_a_constant_as_the_immediate() {
+    let constants = [
+        0,
+        1,
+        4095,
+        4096,
+        4097,
+        0xFF_F000,
+        0x100_0000,
+        -1,
+        -4096,
+        i32::MAX,
+        i32::MIN,
+    ];
+    let values = [
+        0,
+        1,
+        2,
+        4095,
+        4096,
+        4097,
+        0xFF_F000,
+        0xFF_F001,
+        0x100_0000,
+        -1,
+        -4096,
+        i32::MAX,
+        i32::MIN,
+    ];
+    let mut cases = Vec::new();
+    for c in constants {
+        for index_constant in [true, false] {
+            cases.push((c, index_constant));
+        }
+    }
+    let source: String = (0..cases.len())
+        .map(|k| format!("function cb{k}(a, b) {{ return a + b; }} cb{k}(1, 2);\n"))
+        .collect();
+    let mut engine = fixture(&source);
+    for (k, (c, index_constant)) in cases.into_iter().enumerate() {
+        let code = install(
+            &mut engine,
+            &format!("cb{k}"),
+            &bounds_check(c, index_constant),
+            Options::default(),
+        );
+        let context = format!(
+            "{c} as the {}",
+            if index_constant { "index" } else { "length" }
+        );
+        if let Some((word, mask)) = imm_form(&NodeOp::I32Cmp(Cond::Lt), c, false) {
+            assert!(holds(&code_words(&code), word, mask), "{context}");
+        }
+        for v in values {
+            let (index, length) = if index_constant { (c, v) } else { (v, c) };
+            let inside = (index as u32) < (length as u32);
+            exits();
+            let got = eval(&mut engine, &format!("cb{k}({}, {})", js_int(v), js_int(c)));
+            let expected = if inside {
+                v.to_string()
+            } else {
+                (i64::from(v) + i64::from(c)).to_string()
+            };
+            assert_eq!(got, expected, "{context}, {v}");
+            let out = if inside {
+                vec![]
+            } else {
+                vec![(2, ExitReason::OutOfBounds)]
+            };
+            assert_eq!(exits(), out, "{context}, {v}");
+        }
+    }
+}
+
+/// `f(a, b)` (LoadLocal 0, LoadLocal 1, Add or Sub at pc 2, Return) on Numbers as `op` with the
+/// f64 constant whose bits are `bits` on its right, or on its left (`left`), the argument's f64
+/// the other operand.
+fn f64_constant(op: NodeOp, bits: u64, left: bool) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let word = if left { y } else { x };
+    let f = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[word],
+        Rep::F64,
+        2,
+        at,
+        ExitReason::NotNumber,
+    );
+    let k = b.node(entry, NodeOp::ConstF64(bits), &[], Rep::F64, 2);
+    let inputs = if left { [k, f] } else { [f, k] };
+    let r = b.node(entry, op, &inputs, Rep::F64, 2);
+    let boxed = b.node(entry, NodeOp::F64ToTagged, &[r], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    b.g
+}
+
+/// F64 constants FMOV's 8-bit immediate encodes take it; the rest keep x30's (zero XZR's), with
+/// -0, NaN and the infinities exact.
+#[test]
+fn f64_constants_take_fmovs_immediate_where_it_encodes() {
+    let constants = [
+        1.0,
+        0.5,
+        -2.5,
+        31.0,
+        0.125,
+        -0.1875,
+        2.0,
+        0.0,
+        -0.0,
+        0.1,
+        32.0,
+        0.0625,
+        4095.0,
+        1e300,
+        f64::INFINITY,
+        f64::NAN,
+    ];
+    let values = ["0", "-0", "1.5", "-7.25", "1e10", "NaN", "-Infinity", "0.1"];
+    let mut cases = Vec::new();
+    for x in constants {
+        for (op, js) in [(NodeOp::F64Add, "+"), (NodeOp::F64Sub, "-")] {
+            for left in [false, true] {
+                cases.push((op.clone(), js, x, left));
+            }
+        }
+    }
+    let source: String = cases
+        .iter()
+        .enumerate()
+        .map(|(k, (_, js, ..))| format!("function g{k}(a, b) {{ return a {js} b; }} g{k}(1, 2);\n"))
+        .collect();
+    let mut engine = fixture(&source);
+    // A result's sign shows: -0 as "-0".
+    let shown = |e: &str| format!("(r => Object.is(r, -0) ? '-0' : String(r))({e})");
+    for (k, (op, js, x, left)) in cases.into_iter().enumerate() {
+        let name = format!("g{k}");
+        let code = install(
+            &mut engine,
+            &name,
+            &f64_constant(op.clone(), x.to_bits(), left),
+            Options::default(),
+        );
+        let context = format!(
+            "{op:?} with {x:?} on the {}",
+            if left { "left" } else { "right" }
+        );
+        if let Some(imm8) = asm::fmov_imm8_d(x.to_bits()) {
+            assert!(
+                holds(&code_words(&code), 0x1E60_1000 | imm8 << 13, 0xFFFF_FFE0),
+                "{context}"
+            );
+        }
+        for v in values {
+            let (a, b) = if left {
+                (js_number(x), v.to_string())
+            } else {
+                (v.to_string(), js_number(x))
+            };
+            exits();
+            let got = eval(&mut engine, &shown(&format!("{name}({a}, {b})")));
+            assert!(exits().is_empty(), "{context}, {v}");
+            let expected = eval(&mut engine, &shown(&format!("{a} {js} {b}")));
+            assert_eq!(got, expected, "{context}, {v}");
+        }
+    }
+}

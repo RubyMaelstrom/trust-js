@@ -12,8 +12,9 @@
 //! or the new value is when its own next use is farther (Maglev's choice). A home is the value's
 //! for its whole range, so an exit's recipe names one place per value; registers and slots free
 //! again where ranges end. Phis take their inputs by parallel moves on the edges into their blocks
-//! (`a64`). Constants have no home: each use rematerializes them, and a recipe records them as
-//! constants.
+//! (`a64`). Constants have no home: each use takes them as its instruction's immediate where the
+//! encoding allows (stage 2 step 7) and rematerializes them otherwise, and a recipe records them
+//! as constants.
 //!
 //! Raw cell pointers and tagged words in callee-saved registers and spill slots are roots: the
 //! collector scans the native stack and the callee-saved registers conservatively and resolves

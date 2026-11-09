@@ -3462,6 +3462,14 @@ mod asm {
         pub fn fmov_one(&mut self, rd: u32) {
             self.emit_fp(0x1E6E_1000 | rd);
         }
+        /// fmov dd, #imm (FMOV (scalar, immediate), double precision; `imm8` from
+        /// [`fmov_imm8_d`])
+        pub fn fmov_d_imm(&mut self, rd: u32, imm8: u32) {
+            if imm8 > 0xFF {
+                return self.bad("an FMOV immediate past 8 bits");
+            }
+            self.emit_fp(0x1E60_1000 | (imm8 << 13) | rd);
+        }
         /// fcvtzu wd, dn (float → unsigned 32-bit, round toward zero, saturating)
         pub fn fcvtzu_w_d(&mut self, rd: u32, rn: u32) {
             self.emit_fp(0x1E79_0000 | (rn << 5) | rd);
@@ -4569,6 +4577,29 @@ mod asm {
     #[cfg(test)]
     pub fn legalized() -> usize {
         FAR.with(std::cell::Cell::get)
+    }
+
+    /// Whether ADD and SUB (immediate), and their flag-setting forms ADDS, SUBS, CMN and CMP,
+    /// encode `v` in their one instruction: a 12-bit immediate, or one shifted left by 12 (V8's
+    /// `IsImmAddSub`). [`Asm::flags`] emits either form as one word; past them it legalizes.
+    pub fn add_sub_imm(v: u32) -> bool {
+        v < 1 << 12 || (v < 1 << 24 && v & 0xFFF == 0)
+    }
+
+    /// FMOV (scalar, immediate)'s 8-bit field for the double whose bits are `bits`, if it
+    /// encodes there (Arm A64 VFPExpandImm, imm8 = a:b:c:d:e:f:g:h): the sign a; the exponent
+    /// NOT(b), b eight times, then c:d; the fraction e:f:g:h, then 48 zero bits. These are
+    /// ±(16 + n)/16 · 2^e for n in 0..16 and e in -3..=4, 0.125 to 31.0 in magnitude; zero, the
+    /// infinities and NaN are not among them (`fmov dd, xzr` gives +0).
+    pub fn fmov_imm8_d(bits: u64) -> Option<u32> {
+        let b = (bits >> 54) & 1;
+        // Bits 62..54: NOT(b), then b eight times.
+        let exponent_top = if b == 1 { 0x0FF } else { 0x100 };
+        if bits & 0xFFFF_FFFF_FFFF != 0 || (bits >> 54) & 0x1FF != exponent_top {
+            return None;
+        }
+        // a, b, then c:d:e:f:g:h, the exponent's two low bits and the fraction's four high ones.
+        Some((((bits >> 63) << 7) | (b << 6) | ((bits >> 48) & 0x3F)) as u32)
     }
 
     /// Encode a 32-bit logical immediate for AND/ORR/EOR (immediate form): the 12-bit
