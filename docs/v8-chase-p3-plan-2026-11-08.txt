@@ -905,3 +905,79 @@ on (38% before the step) and none of Mandreel's (31%); zlib scores 3,591 with th
 3,915 off (1,731 against 3,780 before), Mandreel 1,074 against 1,096 (617 against 1,097). In zlib
 the tier's code for a6 and a3 now takes 28% and 16% more samples than their second stages do, and
 a8's hot loop runs in its second stage's loop code with the tier on as off (OSR, stage 5).
+
+Step 3, the exit profile and reoptimization (design, 2026-11-09; input
+target/p3/stage2/reopt-input.txt, which cites the code and the exemplars line by line). Its input
+came before step 2's; the two are independent and land in the order they are done. Stage 1 counts
+every exit but forced ones toward one total per code and at 100 falls back for good: nothing
+records which sites failed, and nothing compiles the chunk with the tier again (code2 is set once
+and, settled from birth, has no checkpoint). Point 12 on TRust's code:
+- Counting. Each exit record counts its exits, and the code's exit table holds its limit (100 << R)
+  and whether it was discarded. An exit that is not forced adds to its record and the total; at the
+  limit the code is discarded before the VM run, where the fallback is now. Activations still
+  running a discarded code finish in it, and their exits count without triggering anything again
+  (JSC returns early, dfg/DFGOperations.cpp:6664-6672).
+- The profile. At the discard every record with a count adds its reason as a flag at its key, as
+  JSC's tallyFrequentExitSites (bytecode/CodeBlock.cpp:3094-3120). The key is the baseline site the
+  second stage's record map names for the exit's pc, on that first-stage chunk and marked whether
+  the site was spliced, as JSC keys a site at the exit's semantic origin with its inline kind
+  (bytecode/DFGExitProfile.cpp:44-75, DFGExitProfile.h:45-145), so any later compile of the site
+  finds it: code2 again, another caller's splice, the callee's own second stage, stage 3's
+  inlining. A pc the map names nothing for (guards, calls, block starts, throws) keys on code2. The
+  profile lives on the chunk, made with its first flag; R, the function's count of discards, lives
+  on its first stage, as JSC keeps it on the baseline CodeBlock (CodeBlock.cpp:2478-2483).
+- The decline. The snapshot gathers each pc's flags (code2's own and its baseline site's, a named or
+  call flag only from a site of the same inline kind, a value flag from any, JSC's split), and the
+  builder declines what a flag names: NotNumber takes the generic operation and NotInt32 the f64
+  path; Overflow f64 arithmetic even on proven int32s (JSC's makeSafe,
+  dfg/DFGByteCodeParser.cpp:1371-1376); WrongShape checks the site's shapes again where its ways
+  grew since the discarded compile, as V8 and SpiderMonkey recompile on what their ICs learned, and
+  is an effect where they did not (a fifth shape, an uncacheable receiver), JSC's slow version being
+  an IC in optimized code; WrongCallee builds the guard's mismatch edge, so another callee runs in
+  place as the template JIT's second stage runs it (JSC's couldTakeSlowPath,
+  bytecode/CallLinkStatus.cpp:98-120; V8's call feedback turned megamorphic drops its CheckValue);
+  NeverRan builds the block (JSC's InadequateCoverage backstop, DFGByteCodeParser.cpp:7105-7124).
+  Much of this also comes from feedback alone: an exit resumes before its failing operation, and the
+  VM's run records the value at the baseline site and fills code2's caches.
+- The warm-up. A discard installs the template JIT's code, adds 1 to R and arms code2's four
+  checkpoints at (100, 400, 1,600, 6,400) << R native entries from the discard, with the
+  settled-feedback rule at each and the last compiling whatever its fingerprint: JSC waits twice as
+  long after each jettison (CodeBlock.cpp:2602-2608). The recompile generates code2's code again
+  with the tier and installs it in place. R saturates at 19, where the warm-up's u32 word would
+  overflow, as JSC's cap comes from its counter's range; optimization is never disabled for good.
+- Throws. Exits for throws and unsupported operations count, as in stage 1, and flag nothing (there
+  is nothing to decline); a discard whose exits were all such arms no recompile, which would build
+  the same code, as SpiderMonkey disables Ion for frequent unfixable bailouts (jit/IonScript.h:
+  336-341). With the in-place resume, exception exits leave the count as JSC's do
+  (bytecode/ExitKind.cpp:31-39, exitKindMayJettison) and this rule goes.
+- Epochs. The discard and the recompile each move the call caches' global epoch, as the fallback
+  does: a cached call names the replaced code. The exemplars reach only the replaced code's callers
+  (JSC unlinks incoming calls; V8 and SpiderMonkey load the callee's current entry at each call).
+  TRust's form of that, a per-chunk current-entry word that the direct sequence, which loads the
+  callee chunk's word already, compares at each call, is the mechanism the dependencies'
+  invalidation points need too, so it is designed with them; meanwhile the log counts epoch moves,
+  P2's measured cost of recompiling (P2 plan:6558-6602).
+- Departures from point 12, each for a missing precondition: (1) the recompile takes code2 again,
+  since code2 is set once and different splicing is stage 3's; (2) flags at unmapped pcs key on
+  code2; (3) the hot-loop limit (5 x 2^R when the exited frame then loops hot) waits for stage 5's
+  back-edge counters, since template code counts no iterations and the one signal now, a VM run
+  that reached a back edge, fires on cold loops as on hot ones; (4) the warm-up counts native
+  entries, where JSC also weighs iterations; (5) the unfixable-only rule above.
+- Also in this step: two defects the input found. A fallback whose template compile was deferred
+  for capacity left its slot unavailable for good, so the chunk ran in the VM thereafter (the slot
+  now goes cold and compiles at its next entry); the settled-feedback map's entries outlived their
+  chunks in default builds, so a new chunk at a freed address could inherit one (the state moves
+  onto the chunk). With the tier on, a stale chain's rebuilt second stage (code3) is compiled by the
+  tier as code2 is.
+- Switches and log (DIAGNOSTICS.md): TRUST_JS_OPT_NO_REOPT=1 keeps stage 1's fallback for good,
+  TRUST_JS_OPT_NO_EXIT_PROFILE=1 recompiles without declines (P2's variants), and
+  TRUST_JS_OPT_EXIT_LIMIT=N sets the base limit; TRUST_JS_OPT_LOG gains lines for a discard (its
+  exits by site and reason), each flag, each decline, each reoptimization and each epoch move.
+- Tests: per reason, the graph with the flag and without it; a flag set through a splice found by
+  the callee's own compile and by another caller's splice, an own flag by code2's recompile; end to
+  end for each reason (a discard, a recompile at R = 1, no exits after it, the VM's results:
+  strings into add, int32 overflow, a fifth shape, a call over four callees, a block that starts to
+  run); backoff under types that keep flipping; an unfixable-only discard; a long activation that
+  finishes in its discarded code while later calls run the new; forced exits recording nothing. The
+  gates gain a configuration that cycles reoptimization: the tier eager with
+  TRUST_JS_OPT_EXIT_LIMIT=1.
