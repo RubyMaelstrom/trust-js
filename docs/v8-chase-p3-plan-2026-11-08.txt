@@ -1208,6 +1208,29 @@ against 4.6% today and 9.7% with names alone. Per class, the exemplars' form:
   configurable global; a function of another realm reading its own globals; typed arrays bound to
   a global and to a module variable, with step 2; sites that first run after the compile; the
   difftest corpus seeded with the same.
+Step 4 landed (be68a483..ddc7801d, 2026-11-09). The library's suites pass with the tier off and on
+eager (3,077 each), the tier's tests eager with exits forced every 7 and with an exit limit of 1,
+Test262's let, const, class, global-code, identifier-resolution and global-object tests (8,792) and
+a wider sweep of scope, eval, with, function, assignment, update, typeof and delete tests (5,712)
+in the tier's four configurations, and on x86-64 the type-check and the library's suite (2,747); a
+difftest corpus of 12 name cases agrees in five configurations but lives outside the tree (carried
+with step 2's to the stage's gates); wasm32 is unchecked (no target on the x86-64 host; the one
+file it compiles is target-independent). Choices: scope records' addresses are a representation of
+their own (Env), which may live across effects within an activation and never enters a frame
+state; a store ends its slot's facts on every record (a splice's holder and a chain from the
+running record can name the same one); the realm proof is two identity checks, the search record
+against the compile's global environment (its address pinned weakly per realm, as the call caches
+pin it) and ctx.global_body against the compile's global object; the loop prepass and the builder
+read one rule (Rules::lowers), and where a value's facts contradict the rule the builder exits at
+the operation, which the profile then declines, instead of taking an effect the prepass did not
+count (debug builds panic on one). Departure: the epoch is a u16 in every property map, the
+realm's being its global object's, where SpiderMonkey keeps one counter in the global's data: every
+slot-moving path is a Props method, the bytes were spare, and it saturates into reads kept as
+effects. Q4: the global declarative record does not only append (a script's var and function names
+are inserted and removed again by swap, a sloppy eval's deletable bindings removed, its slots moved
+to a block when it outgrows its cell), so script-level lexicals read under the cache's proof. Open:
+an epoch move makes every compiled global reader in the realm exit until its limit, then
+reoptimize (step 3's policy); checks inside a loop are not hoisted out of it (LICM).
 
 Step 6, untagged phis (design, 2026-11-09, pulled forward from stage 4's untagging; input
 target/p3/stage2/phis-input.txt, which cites the code and the exemplars line by line, with its runs
