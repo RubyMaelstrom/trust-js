@@ -1487,3 +1487,81 @@ counts as an entry (JSC's weights and V8's byte budget would change what the cou
   reaches its recompile through a loop's iterations; with the tier off loops count nothing; the
   poll and interruption tests unchanged; Test262's loop tests in the tier's four configurations;
   Richards' schedule compiled in its log, and Richards' counts against the eager figure.
+
+Step 8 landed (cb5307ce..97d09da3, 2026-11-09). With the tier on, each loop iteration of template
+code counts as one native run toward its chunk's checkpoint word (JitCtx::chunk's: each activation
+runs on its own record) while the word is nonzero: at a loop header's poll in canonical code, at a
+general region's and a linked scan's back edges after their poll guards, and for a helper-free
+rotated loop the iterations its countdown ran (16,384 less x28) at its exit, at its poll's bail and
+at each speculation's bail, nothing in the loop. First stages, a discard's fallback and
+borrowed-frame (OSR) code count; the tier's code counts nothing; the next native entry's gate
+takes the checkpoint as before. Costs: three instructions an iteration with no checkpoint pending,
+eight with one (seven once it is due), a rotated loop's thirteen at each way out.
+- Departures: (1) the count saturates one below the word, not at u32::MAX: the direct sequence's
+  gate adds one in 32 bits, so a word saturated at u32::MAX wraps to 0 there, is stored and loses
+  the checkpoint; a loop counts as that gate does (while runs + 1 is below the word), as
+  SpiderMonkey's LoopHead compares its count with Ion's threshold (emitWarmUpCounterIncrement,
+  jit/BaselineCodeGen.cpp:1756) and, without OSR, has nothing to do past it; (2) so eight
+  instructions an iteration with a checkpoint pending, not six; (3) twelve poll, interruption and
+  call tests whose loop functions now reach their checkpoints inside the test changed: ten whose
+  subject is template code (a region's bails at the poll word, a warmed parent's mapping in an
+  Agent test, regions, rotated loops, baked reads, fused String steps, direct returns, a
+  hand-published second stage) pin the tier off, as stage 1 did for such tests, and two whose
+  callees must tier up before their caller (callee_pickup_tests' polymorphic and megamorphic
+  sites) turn the counting off (pin_loop_count_off_for_test).
+- Tier off unchanged: with the tier off the template emits main's code. Every code object of 40
+  fixed Richards runs and the three fixtures with the tier off is the same instruction stream on
+  main (2bf8412c) and the step but for embedded values (109, 162, 61 and 274 of Djot's 303; its
+  other 29 are RegExp programs whose literal pools hold Rust function addresses; main against
+  itself is byte-identical). Richards' count off is 7,095,419,188 against 7,095,408,444, and on
+  under TRUST_JS_OPT_NO_LOOP_COUNT 6,116,476,916 against main's 6,116,458,209, with the same 22
+  compiles and 200 exits.
+- Tests: the library's suites with the tier off and on eager (3,118 each; one eager run of two
+  failed native_stub_tests' a_boundary_natives_author_code_re_enters, 20 of its 40 natives through
+  the stub, which ten runs alone and beside the tier's tests pass: open), the tier's tests eager
+  with exits forced every 7 and with an exit limit of 1 (232 each), the poll and Agent tests with
+  the tier on (51), and Test262's for, while, do-while, for-in, for-of, postfix-increment and
+  compound-assignment tests (1,821) in the tier's four configurations with no failure beyond off's;
+  removing any one counting site fails its shape's test. On zombie (x86-64): the check with tests
+  and Windows' (x86_64-pc-windows-msvc) check clean, and the library's suite passes (2,764).
+- Richards, 400 fixed runs, instructions:u, median of 3: off 7,095,419,188; on 5,755,458,807
+  (-18.9%); on without the counting 6,116,476,916; eager 6,224,366,744; eager without the
+  counting (step 5's eager compile) 6,324,561,226, so on is 9.0% below that figure rather than
+  near it. Schedule's log: run 1's loop transfers from the tree-walker into borrowed-frame code,
+  which counts to the first checkpoint; run 2's entry takes it and waits, run 3's waits again
+  (the code before the loop first ran natively in run 2), and run 4's compiles its second stage
+  (2 sites spliced, 440 ops, 524 nodes, 39,268 bytes); one WrongCallee exit a run (pc 63, then pc
+  348: the spliced TaskControlBlock.run's polymorphic call) discards it at runs 104 and 305, each
+  recompile coming at the next run's entry, whose fallback's loop reached the warm-up's
+  checkpoint; no exit after run 306. Without the counting the tier never compiles schedule. Eager
+  now takes its first checkpoint at the first native entry, before the code ahead of its loop ran
+  natively, and exits NeverRan at pc 0 100 times first.
+- Fixtures, the tier on (compiles and the summed compile time the log prints, CPUs 10-13 under
+  load, median of 3; counting off equals main): Vue 36 and 8.7 ms, unchanged; React 9 and 3.1 ms
+  against 7 and 2.1 (the self-hosted iteration callback loop compiled, discarded for WrongCallee
+  and recompiled); Djot 38 and 22.2 ms (4,486 ops, 5,885 nodes) against 33 and 17.7 (3,440,
+  4,769): +26%, against the compile-time bar.
+- The call microbenchmarks (review, target/p3/stage2/step8-review; the step's release shell, one
+  process a case; instructions:u on CPU 10; times on CPU 5, 7 interleaved rounds, 0 s capped):
+  each case's loop function is entered twice (its warm-up and the measured call), so its
+  measured loop runs in template code with a checkpoint due, at seven instructions an iteration
+  (+35.0M on the 5M-iteration cases, +7.0M on the 1M; recursion unchanged). Instructions, on
+  against off (main's in parentheses): direct-call +1.2% (-1.6%), closure-call +1.5% (-1.1%),
+  method-call -8.0% (-10.0%), arguments-object and rest-params +3.7% (+1.6%), array-push-pop
+  +0.6% (0.0%), constructor 0.0% (-1.1%). Times, on against off: direct-call +0.6%,
+  closure-call +1.3%, method-call -6.8%, array-push-pop +0.7%, arguments-object +2.8% and
+  rest-params 0.0% (36 and 37 ms at the script's 1 ms resolution, the same without the
+  counting); on against on without the counting: closure-call +2.0%, method-call +1.7%,
+  array-push-pop +0.9%, direct-call -0.6%. SpiderMonkey's baseline code pays its counter at every
+  loop head as well, about seven instructions (the ICScript's load, the count's load, add and
+  store, the trial-inlining compare, the Ion threshold's load and compare:
+  emitWarmUpCounterIncrement, jit/BaselineCodeGen.cpp:1679-1756), until OSR moves the loop into
+  Ion; here that move is stage 5's. The measurement's fat-LTO session is the bar's reading.
+- Open: SpiderMonkey emits no increment where a script can never be Ion-compiled
+  (maybeIonCompileable, jit/BaselineCodeGen.cpp:1696-1700); Script bodies, loop fragments and
+  resumable chunks count here though the tier compiles none of them, seven instructions an iteration
+  once due; telling them apart needs the chunk's kind at compile_entry. A superseded first stage's
+  word is 1, so its running loops pay seven. Richards' exits are the polymorphic call after its
+  decline (the list). Djot's added compiles weigh on the compile-time bar. The stub test's one
+  failure is unexplained (a round run outside the template's code would fit; an eviction under the
+  process's code-memory pressure is the agent's guess, unconfirmed).
