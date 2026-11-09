@@ -17,7 +17,10 @@
 //! - Liveness (stage 2 step 6): a slot dead at a pc is Dead in its frame states, no join merges
 //!   it, no flush writes it, and no value holds it after an effect.
 //! - Joins: a phi where the predecessors' values differ and one of them is not in the frame.
-//!   Values cross block boundaries as tagged words in stage 1 (untagging phis is stage 4's).
+//!   Values cross an edge into a block of one predecessor as they are; a phi's inputs are words,
+//!   boxed at the end of each predecessor as Maglev's MergeValue tags them, with their untagged
+//!   forms there noted for the phi selector (`opt::phis`, stage 2 step 6), which picks each
+//!   phi's representation after the build.
 //! - Known facts per value (Maglev's KnownNodeAspects): its other representations (a word's
 //!   Number as an f64, its exact int32, its Boolean, its object's cell, an unboxed value's word),
 //!   which are properties of the immutable value; and the heap facts of the current effect epoch
@@ -1007,6 +1010,21 @@ fn meet_elements(first: &State, rest: &[(BlockIx, State)]) -> State {
     }
 }
 
+/// A phi input's untagged forms at the end of its predecessor (Maglev's alternatives), which the
+/// selector may take in place of the input's word (stage 2 step 6).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Alternatives {
+    pub(crate) i32: Option<NodeIx>,
+    pub(crate) f64: Option<NodeIx>,
+}
+
+/// What the builder hands the phi selector beside the graph (stage 2 step 6).
+#[derive(Debug, Default)]
+pub(crate) struct PhiNotes {
+    /// The alternatives of each phi input that has some, by (phi, input index).
+    pub(crate) alternatives: FastMap<(NodeIx, u32), Alternatives>,
+}
+
 /// A built loop header: its phis by the location each merges, the state it assumed for what the
 /// phis do not merge (each back edge must agree with it), and its poll's frame state.
 struct Header {
@@ -1102,6 +1120,8 @@ struct Builder<'a> {
     moves_env: bool,
     /// Set where an operation's lowering ended its block with an exit (`mismatch`).
     ended: bool,
+    /// The phi inputs' alternatives, for the selector.
+    notes: PhiNotes,
 }
 
 impl<'a> Builder<'a> {
@@ -1134,6 +1154,7 @@ impl<'a> Builder<'a> {
             hoisted_nodes: Vec::new(),
             moves_env: chunk.jit_ops().iter().any(names::moves_env),
             ended: false,
+            notes: PhiNotes::default(),
         }
     }
 
@@ -1677,20 +1698,69 @@ impl<'a> Builder<'a> {
         }
     }
 
-    /// Box every value the frame's locations hold (before a block's terminator: values cross
-    /// block boundaries as words in stage 1).
-    fn box_state(&mut self, st: &mut State, pc: usize) {
-        for slot in 0..self.n_slots {
-            if let Slot::Dirty(value) = st.slots[slot] {
-                let word = self.tagged(st, value, pc);
-                st.slots[slot] = Slot::Dirty(word);
-            }
+    /// `value`, a phi's input on the edge from `block` (ended, its state `st`), as the word the
+    /// builder's phis take: its word form, a constant's word, or a boxing placed before `block`'s
+    /// terminator, as Maglev's MergeValue tags its phis' inputs; and its untagged forms there,
+    /// which the selector may take instead (Maglev's alternatives; stage 2 step 6). Values cross
+    /// every other edge as they are.
+    fn phi_input(
+        &mut self,
+        block: BlockIx,
+        st: &mut State,
+        value: NodeIx,
+        pc: usize,
+    ) -> (NodeIx, Alternatives) {
+        let forms = self.forms(st, value);
+        let alternatives = Alternatives {
+            i32: forms.i32,
+            f64: forms.f64,
+        };
+        if let Some(word) = forms.tagged {
+            return (word, alternatives);
         }
-        for position in 0..st.stack.len() {
-            let value = st.stack[position];
-            st.stack[position] = self.tagged(st, value, pc);
+        if let Some(word) = self.constant(value) {
+            return (self.word(word), alternatives);
         }
-        self.prune(st);
+        let op = match self.rep(value) {
+            Rep::F64 => NodeOp::F64ToTagged,
+            Rep::I32 => NodeOp::I32ToTagged,
+            Rep::Bool => NodeOp::BoolToTagged,
+            // A cell always has its word as a form, and nothing else reaches here.
+            _ => return (value, alternatives),
+        };
+        let word = self.add_at_end(block, op, &[value], Rep::Tagged, pc);
+        self.relate(st, value, word);
+        (word, alternatives)
+    }
+
+    /// Note the alternatives of `phi`'s input `k` for the selector, where it has some.
+    fn note(&mut self, phi: NodeIx, k: usize, alternatives: Alternatives) {
+        if alternatives != Alternatives::default() {
+            self.notes.alternatives.insert((phi, k as u32), alternatives);
+        }
+    }
+
+    /// A phi in `block` of `values`, one per predecessor in `preds`' order, each its input at
+    /// that predecessor's end (`phi_input`).
+    fn merge_phi(
+        &mut self,
+        block: BlockIx,
+        preds: &mut [(BlockIx, State)],
+        values: &[NodeIx],
+        pc: usize,
+    ) -> NodeIx {
+        let mut words = Vec::with_capacity(values.len());
+        let mut alternatives = Vec::with_capacity(values.len());
+        for ((from, st), &value) in preds.iter_mut().zip(values) {
+            let (word, alternative) = self.phi_input(*from, st, value, pc);
+            words.push(word);
+            alternatives.push(alternative);
+        }
+        let phi = self.phi(block, &words, pc);
+        for (k, alternative) in alternatives.into_iter().enumerate() {
+            self.note(phi, k, alternative);
+        }
+        phi
     }
 
     /// Drop the facts of values no later operation can reach: a value reaches an operation only
@@ -1798,7 +1868,10 @@ impl<'a> Builder<'a> {
         }
         for &(phi, loc) in &header.phis {
             let value = self.value_at_end(from, &mut st, loc, pc);
-            self.graph.node_mut(phi).inputs.push(value);
+            let (word, alternatives) = self.phi_input(from, &mut st, value, pc);
+            let k = self.graph.node(phi).inputs.len();
+            self.graph.node_mut(phi).inputs.push(word);
+            self.note(phi, k, alternatives);
         }
         for slot in 0..self.n_slots {
             if header.phis.iter().any(|&(_, loc)| loc == Loc::Slot(slot)) {
@@ -1863,7 +1936,7 @@ impl<'a> Builder<'a> {
             if values.iter().all(|&value| value == values[0]) {
                 stack.push(values[0]);
             } else {
-                let phi = self.phi(block, &values, pc);
+                let phi = self.merge_phi(block, &mut preds, &values, pc);
                 phis.push((phi, Loc::Stack(position)));
                 stack.push(phi);
             }
@@ -1911,7 +1984,7 @@ impl<'a> Builder<'a> {
         if values.iter().all(|&value| value == values[0]) {
             return (Slot::Dirty(values[0]), None);
         }
-        let phi = self.phi(block, &values, pc);
+        let phi = self.merge_phi(block, preds, &values, pc);
         (Slot::Dirty(phi), Some(phi))
     }
 
@@ -1935,7 +2008,7 @@ impl<'a> Builder<'a> {
         let mut stack = Vec::with_capacity(depth);
         for position in 0..depth {
             let values: Vec<NodeIx> = preds.iter().map(|(_, st)| st.stack[position]).collect();
-            let phi = self.phi(block, &values, pc);
+            let phi = self.merge_phi(block, &mut preds, &values, pc);
             phis.push((phi, Loc::Stack(position)));
             stack.push(phi);
         }
@@ -1950,7 +2023,7 @@ impl<'a> Builder<'a> {
                 for (from, st) in preds.iter_mut() {
                     values.push(self.value_at_end(*from, st, Loc::Slot(slot), pc));
                 }
-                let phi = self.phi(block, &values, pc);
+                let phi = self.merge_phi(block, &mut preds, &values, pc);
                 phis.push((phi, Loc::Slot(slot)));
                 slots.push(Slot::Dirty(phi));
             } else if lp.effects {
@@ -1995,7 +2068,7 @@ impl<'a> Builder<'a> {
     }
 
     fn jump(&mut self, pc: usize, target: usize, mut st: State) -> Result<(), Refusal> {
-        self.box_state(&mut st, pc);
+        self.prune(&mut st);
         let to = self.block_for(target)?;
         self.add(NodeOp::Jump(to), &[], Rep::None, pc);
         let from = self.cur;
@@ -2013,7 +2086,7 @@ impl<'a> Builder<'a> {
         if self.cfg.block_at(then_pc) == self.cfg.block_at(else_pc) {
             return self.jump(pc, then_pc, st);
         }
-        self.box_state(&mut st, pc);
+        self.prune(&mut st);
         let then_block = self.block_for(then_pc)?;
         let else_block = self.block_for(else_pc)?;
         self.add(
@@ -2054,8 +2127,8 @@ impl<'a> Builder<'a> {
         if self.cfg.block_at(pc + 1) == self.cfg.block_at(target) {
             return self.jump(pc, target, st);
         }
-        self.box_state(&mut st, pc);
-        let word = *st.stack.last().expect("the stack analysis saw the operand");
+        let word = self.tagged(&mut st, value, pc);
+        self.prune(&mut st);
         let undefined = self.word(PACK_UNDEFINED);
         let null = self.word(PACK_NULL);
         let nullish = self.block_for(pc + 1)?;

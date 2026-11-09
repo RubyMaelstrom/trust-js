@@ -373,7 +373,8 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::TypedElement { write: false } => (&[Rep::Cell, Rep::I32], Rep::Tagged),
         NodeOp::TypedElement { write: true } => (&[Rep::Cell, Rep::I32, Rep::F64], Rep::None),
         NodeOp::IsTypedArray => (CELL, Rep::Bool),
-        NodeOp::StoreSlot(_) => (TAGGED, Rep::None),
+        // Its value takes any representation an exit can box (`representations`).
+        NodeOp::StoreSlot(_) => return None,
         NodeOp::Env | NodeOp::ConstEnv(_) => (&[], Rep::Env),
         NodeOp::EnvParent => (&[Rep::Env], Rep::Env),
         NodeOp::LoadBinding { .. } => (&[Rep::Env], Rep::Tagged),
@@ -452,7 +453,9 @@ fn representations(
                     chunk.jit_stack_effect(pc as usize)
                 ));
             }
-            if node.inputs.len() != pops as usize || reps.iter().any(|&rep| rep != Rep::Tagged) {
+            // Each operand in a representation the code boxes into its word (stage 2 step 6:
+            // an untagged phi's uses need no retagging).
+            if node.inputs.len() != pops as usize || !reps.iter().all(|&rep| boxable(rep)) {
                 return Err(format!("operands {reps:?} for {pops} words"));
             }
             if node.rep != Rep::None {
@@ -481,6 +484,13 @@ fn representations(
                     node.rep,
                     if check { "check" } else { "test" }
                 ));
+            }
+        }
+        NodeOp::StoreSlot(_) => {
+            // The frame's word of a value of any representation an exit can box: the store boxes
+            // it (stage 2 step 6).
+            if !matches!(reps[..], [rep] if boxable(rep)) || node.rep != Rep::None {
+                return Err(format!("({reps:?}) -> {:?} for a slot's store", node.rep));
             }
         }
         NodeOp::StoreElement(_) => {
@@ -521,6 +531,12 @@ fn representations(
         }
         _ => Ok(()),
     }
+}
+
+/// Whether a value of `rep` has a word an exit, a slot's store or an effect's operand can box it
+/// into: a Number of an f64 or an int32, a Boolean, or a word.
+fn boxable(rep: Rep) -> bool {
+    matches!(rep, Rep::Tagged | Rep::F64 | Rep::I32 | Rep::Bool)
 }
 
 /// The values a frame state names, slots then stack.
@@ -565,7 +581,7 @@ fn frame_state(
     }
     for value in state_values(frame) {
         match graph.nodes.get(value.index()).map(|node| node.rep) {
-            Some(Rep::Tagged | Rep::F64 | Rep::I32 | Rep::Bool) => {}
+            Some(rep) if boxable(rep) => {}
             rep => return Err(format!("{value:?} of representation {rep:?}")),
         }
     }

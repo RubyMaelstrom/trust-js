@@ -361,6 +361,42 @@ fn a_loop_has_header_phis_with_back_edge_inputs() {
 }
 
 #[test]
+fn values_cross_an_edge_into_a_block_of_one_predecessor_as_they_are() {
+    // The product is an f64 in the entry block; the branch's arm, whose one predecessor that
+    // is, adds to it as it is: no boxing before the branch and no check after it (stage 2 step
+    // 6; stage 1 boxed every value at every block's end).
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function f(a, c) { var x = a * 2.5; if (c) { return x + 1; } return x; }
+         for (var i = 0; i < 20; i++) { f(i, true); f(i, false); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "f");
+    let text = dump(&graph, &chunk);
+    let mul = graph
+        .nodes
+        .iter()
+        .position(|node| node.op == NodeOp::F64Mul)
+        .map(|index| NodeIx(index as u32))
+        .unwrap_or_else(|| panic!("{text}"));
+    let add = nodes(&graph, |op| *op == NodeOp::F64Add);
+    assert_eq!(add.len(), 1, "{text}");
+    assert_eq!(add[0].inputs[0], mul, "{text}");
+    assert_ne!(add[0].block, graph.node(mul).block, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 1, "{text}");
+    // Each arm boxes its value where it returns it.
+    assert_eq!(count(&graph, |op| *op == NodeOp::F64ToTagged), 2, "{text}");
+    let entry = graph.block(graph.entry.expect("an entry"));
+    assert!(
+        entry
+            .body
+            .iter()
+            .all(|&node| graph.node(node).op != NodeOp::F64ToTagged),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_loop_at_the_entry_gets_an_entry_block() {
     let mut engine = engine(Tier::Jit);
     eval(
