@@ -1894,7 +1894,12 @@ fn exits_with_untagged_phis_in_registers_and_spill_slots_rebuild_their_numbers()
     let step = ints
         .iter()
         .enumerate()
-        .map(|(k, name)| format!("{name} = ({name} + {} + k) | 0;", ints[(k + 1) % ints.len()]))
+        .map(|(k, name)| {
+            format!(
+                "{name} = ({name} + {} + k) | 0;",
+                ints[(k + 1) % ints.len()]
+            )
+        })
         .chain(floats.iter().enumerate().map(|(k, name)| {
             format!(
                 "{name} = {name} * 0.5 + {} * 0.25;",
@@ -1976,7 +1981,9 @@ fn entered_phi(graph: &super::ir::Graph) -> super::ir::Rep {
 fn a_loop_entered_with_a_double_where_int32s_were_seen_converges_on_an_f64_phi() {
     // The entry's CheckInt32 exits at the loop header (PhiNotInt32), whose flag the recompile
     // declines to an F64 phi, checked a Number only.
-    let source = format!("{ENTERED}let t = 0; for (let r = 0; r < 1000; r++) t = (t + entered(r, 3)) | 0; t");
+    let source = format!(
+        "{ENTERED}let t = 0; for (let r = 0; r < 1000; r++) t = (t + entered(r, 3)) | 0; t"
+    );
     let chunk = converges(
         "entered",
         &source,
@@ -1994,7 +2001,9 @@ fn a_loop_entered_with_a_double_where_int32s_were_seen_converges_on_an_f64_phi()
 
 #[test]
 fn a_loop_entered_with_a_string_where_int32s_were_seen_converges_on_a_tagged_phi() {
-    let source = format!("{ENTERED}let t = 0; for (let r = 0; r < 1000; r++) t = (t + entered(r, 3)) | 0; t");
+    let source = format!(
+        "{ENTERED}let t = 0; for (let r = 0; r < 1000; r++) t = (t + entered(r, 3)) | 0; t"
+    );
     let chunk = converges(
         "entered",
         &source,
@@ -2052,7 +2061,11 @@ fn a_counter_passing_2_31_exits_on_overflow_and_converges_on_an_f64_phi() {
         vm.set_tier(Tier::Bytecode);
         vm.set_tier_threshold(0);
         eval(&mut vm, SOURCE);
-        [eval(&mut vm, WARM), eval(&mut vm, PAST), eval(&mut vm, AFTER)]
+        [
+            eval(&mut vm, WARM),
+            eval(&mut vm, PAST),
+            eval(&mut vm, AFTER),
+        ]
     };
     eager().set();
     let mut engine = Engine::new();
@@ -2068,8 +2081,11 @@ fn a_counter_passing_2_31_exits_on_overflow_and_converges_on_an_f64_phi() {
     let chunk = second_stage(&mut engine, "count").expect("count's second stage");
     assert!(compiled().contains(&address(&chunk)));
     let int = graph_now(&chunk);
-    assert!(int.nodes.iter().any(|node| node.op == super::ir::NodeOp::I32Add
-        && node.reason == Some(ExitReason::Overflow)));
+    assert!(int
+        .nodes
+        .iter()
+        .any(|node| node.op == super::ir::NodeOp::I32Add
+            && node.reason == Some(ExitReason::Overflow)));
     assert_eq!(
         int.blocks
             .iter()
@@ -2097,4 +2113,44 @@ fn a_counter_passing_2_31_exits_on_overflow_and_converges_on_an_f64_phi() {
         other => panic!("i: {other:?}"),
     };
     assert_eq!(graph.node(i).rep, super::ir::Rep::F64);
+}
+
+#[test]
+fn a_poll_interrupted_with_untagged_phis_in_its_state_leaves_and_the_code_runs_again() {
+    // `s` (F64), `i` and `j` (I32) are the loop's phis at its header's poll, inside a try: the
+    // host's interruption there exits through the poll's recipe (its state's phis read from the
+    // registers the slow path restored), and the interruption, no throw, leaves the function.
+    const SOURCE: &str = "function spin(n) { let s = 0.5, i = 0, j = 0;
+           try { while (i < n) { s = s * 0.5 + 1; i = (i + 1) | 0; j = (j + 3) | 0; } }
+           catch (e) { return -1; }
+           return s + i + j; }\n\
+         let t = 0; for (let r = 0; r < 300; r++) t += spin(r % 20); t";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [eval(&mut vm, SOURCE), eval(&mut vm, "spin(10) + spin(3)")]
+    };
+    assert_eq!(phi_reps(SOURCE, "spin"), (2, 1, 0));
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    assert_eq!(eval(&mut engine, SOURCE), expected[0]);
+    assert!(!compiled().is_empty(), "the tier compiled spin");
+    exits();
+    let interrupt = engine.interrupt_handle();
+    interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(100),
+    ));
+    let outcome = engine.eval_interruptible("spin(3e9)", false).unwrap();
+    interrupt.set_deadline(None);
+    assert!(
+        matches!(outcome, crate::ExecutionOutcome::Interrupted { .. }),
+        "the interruption is no throw the catch takes"
+    );
+    assert!(
+        exits().iter().any(|&(_, why)| why == ExitReason::Throw),
+        "the poll's exit"
+    );
+    assert_eq!(eval(&mut engine, "spin(10) + spin(3)"), expected[1]);
 }

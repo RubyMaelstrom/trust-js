@@ -29,11 +29,12 @@
 //!   hints), votes nothing and takes the phi's representation: CheckNumber, and for an I32 phi
 //!   CheckInt32, at that predecessor's end, exiting with PhiNotNumber or PhiNotInt32 at the
 //!   header's pc with the state that edge leaves. That is Maglev's hoisted untagging of a loop
-//!   phi's entry input (UntagInputWithHoistedUntagging), which Maglev keeps behind a flag "for want
-//!   of feedback to back off" and reaches by peeling its loops: TRust's exit profile is that
-//!   back-off, a flag at the header declining the speculation there, PhiNotInt32 to an F64 phi
-//!   and PhiNotNumber to a tagged one (the plan's departures 2 and 3: the check by default where
-//!   V8 peels; a flag per header, not per phi). No speculation on back edges or at forward joins
+//!   phi's entry input (UntagInputWithHoistedUntagging), which Maglev keeps behind an
+//!   experimental flag until it has feedback to back off with (maglev-phi-representation-
+//!   selector.cc:267-286) and reaches by peeling its loops: TRust's exit profile is that back-off,
+//!   a flag at the header declining the speculation there, PhiNotInt32 to an F64 phi and
+//!   PhiNotNumber to a tagged one (the plan's departures 2 and 3: the check by default where V8
+//!   peels; a flag per header, not per phi). No speculation on back edges or at forward joins
 //!   (Maglev's default outside peeled loops; departure 4).
 //! - Inputs of an untagged phi: a boxing's operand, a noted form, a constant of the phi's
 //!   representation, an untagged phi as it is or widened, a speculation's check.
@@ -44,8 +45,9 @@
 //!   take it as it is (each boxes what it stores); a use only a word serves (a return, a field's
 //!   or binding's store, an identity test, an object check, a tagged phi's input) takes a
 //!   retagging, one per block before its first such use, or at a predecessor's end for a phi's
-//!   input (Maglev's EnsurePhiTagged). The checks a rewrite replaces leave their blocks, and so do
-//!   the boxings and widenings no use is left of.
+//!   input (Maglev's EnsurePhiTagged). The checks a rewrite replaces leave the graph, and so do
+//!   the boxings and widenings no use is left of; the graph's nodes are numbered again, so that
+//!   every node still sits in one block (the verifier's invariant).
 
 use super::build::{Alternatives, PhiNotes};
 use super::ir::{
@@ -361,7 +363,9 @@ impl<'g> Selector<'g> {
                 (Some(ExitReason::PhiNotNumber), Kind::I32 | Kind::F64) => {
                     (ExitReason::PhiNotNumber, "a tagged phi")
                 }
-                (Some(ExitReason::PhiNotInt32), Kind::I32) => (ExitReason::PhiNotInt32, "an f64 phi"),
+                (Some(ExitReason::PhiNotInt32), Kind::I32) => {
+                    (ExitReason::PhiNotInt32, "an f64 phi")
+                }
                 _ => continue,
             };
             let pc = self.graph.block(self.graph.node(phi).block).first_pc;
@@ -542,7 +546,11 @@ impl<'g> Selector<'g> {
             return state;
         }
         let poll = self.graph.block(header).body[0];
-        let at = self.graph.node(poll).state.expect("a loop header's poll has a state");
+        let at = self
+            .graph
+            .node(poll)
+            .state
+            .expect("a loop header's poll has a state");
         let mut frame = self.graph.state(at).clone();
         let phis = &self.graph.block(header).phis;
         let edge = |value: NodeIx| -> NodeIx {
@@ -615,12 +623,7 @@ impl<'g> Selector<'g> {
                 }
             }
             // A retagging per block, before its first use there.
-            tagged.sort_by_key(|&user| {
-                (
-                    self.graph.node(user).block,
-                    self.position[user.index()],
-                )
-            });
+            tagged.sort_by_key(|&user| (self.graph.node(user).block, self.position[user.index()]));
             let op = if rep == Rep::I32 {
                 NodeOp::I32ToTagged
             } else {
@@ -820,8 +823,10 @@ fn compact(graph: &mut Graph) {
     }
     // A removed node's index stays out of range, which the verifier refuses where it is named.
     let map = |node: NodeIx| NodeIx(number[node.index()]);
-    let mut old_states: Vec<Option<super::ir::FrameState>> =
-        std::mem::take(&mut graph.states).into_iter().map(Some).collect();
+    let mut old_states: Vec<Option<super::ir::FrameState>> = std::mem::take(&mut graph.states)
+        .into_iter()
+        .map(Some)
+        .collect();
     let mut state_number = vec![u32::MAX; old_states.len()];
     let mut states = Vec::new();
     let old_nodes = std::mem::take(&mut graph.nodes);

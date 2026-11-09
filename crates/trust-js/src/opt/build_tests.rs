@@ -457,7 +457,11 @@ fn a_loop_at_the_entry_gets_an_entry_block() {
     assert_eq!(exits.len(), 1, "{text}");
     assert_eq!(exits[0].op, NodeOp::CheckNumber, "{text}");
     assert_eq!(exits[0].reason, Some(ExitReason::PhiNotNumber), "{text}");
-    assert_eq!(graph.state(exits[0].state.expect("a state")).pc, 0, "{text}");
+    assert_eq!(
+        graph.state(exits[0].state.expect("a state")).pc,
+        0,
+        "{text}"
+    );
     let last = *entry.body.last().expect("a terminator");
     let NodeOp::Jump(header) = graph.node(last).op else {
         panic!("the entry jumps to the loop: {text}")
@@ -848,7 +852,11 @@ fn a_slot_in_its_temporal_dead_zone_holds_the_marker_in_states_where_it_is_live(
         .find(|check| graph.state(check.state.expect("a state")).pc as usize == gt)
         .unwrap_or_else(|| panic!("the check of `c > 1000`: {text}"));
     let state = graph.state(check.state.expect("a check has a state"));
-    assert_eq!(marked(&graph, state), 1, "`y` before its declaration runs: {text}");
+    assert_eq!(
+        marked(&graph, state),
+        1,
+        "`y` before its declaration runs: {text}"
+    );
 }
 
 #[test]
@@ -1143,7 +1151,10 @@ fn the_verifier_rejects_broken_graphs() {
         .iter()
         .enumerate()
         .find_map(|(index, state)| {
-            let slot = state.slots.iter().position(|slot| *slot != SlotSource::Dead)?;
+            let slot = state
+                .slots
+                .iter()
+                .position(|slot| *slot != SlotSource::Dead)?;
             Some((index, slot))
         })
         .expect("a live slot in a state");
@@ -3494,9 +3505,17 @@ fn an_accumulator_of_halves_is_an_f64_phi_from_the_constant_zero() {
     assert_eq!(i.rep, Rep::I32, "{text}");
     assert_eq!(graph.node(i.inputs[0]).op, NodeOp::ConstI32(0), "{text}");
     // No phi is checked or boxed in the loop.
-    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 1, "n's: {text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckNumber),
+        1,
+        "n's: {text}"
+    );
     assert_eq!(count(&graph, |op| *op == NodeOp::I32ToTagged), 0, "{text}");
-    assert_eq!(count(&graph, |op| *op == NodeOp::F64ToTagged), 1, "the return's: {text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::F64ToTagged),
+        1,
+        "the return's: {text}"
+    );
 }
 
 #[test]
@@ -3522,7 +3541,10 @@ fn a_join_of_an_int32_and_an_f64_is_an_f64_phi_the_int32_widened_in_its_predeces
         .collect();
     assert_eq!(widened.len(), 1, "{text}");
     assert_eq!(graph.node(widened[0].inputs[0]).op, NodeOp::I32Or, "{text}");
-    assert!(preds.contains(&widened[0].block), "in its predecessor: {text}");
+    assert!(
+        preds.contains(&widened[0].block),
+        "in its predecessor: {text}"
+    );
     assert!(
         phi.inputs
             .iter()
@@ -3609,7 +3631,8 @@ fn a_back_edge_that_keeps_a_phis_value_does_not_vote() {
 fn an_inner_join_feeding_a_loop_phi_settles_with_it() {
     // The loop phi of `x` takes the inner join's phi on its back edge, and the join takes the
     // loop phi on one arm: undecided each until the other is, both untagged together.
-    let source = "function inner(n) { var x = 0; for (var i = 0; i < n; i++) { if (i & 1) { x = x + 1; } }
+    let source =
+        "function inner(n) { var x = 0; for (var i = 0; i < n; i++) { if (i & 1) { x = x + 1; } }
            return x; }
          for (var k = 0; k < 20; k++) inner(9);";
     for (tier, rep) in [(Tier::Jit, Rep::F64), (Tier::Bytecode, Rep::I32)] {
@@ -3804,7 +3827,11 @@ fn am3s_counters_are_int32_phis_checked_once_on_the_loops_entry() {
         assert_eq!(int.reason, Some(ExitReason::PhiNotInt32), "{name}: {text}");
         let number = graph.node(int.inputs[0]);
         assert_eq!(number.op, NodeOp::CheckNumber, "{name}: {text}");
-        assert_eq!(number.reason, Some(ExitReason::PhiNotNumber), "{name}: {text}");
+        assert_eq!(
+            number.reason,
+            Some(ExitReason::PhiNotNumber),
+            "{name}: {text}"
+        );
         assert_eq!(
             graph.node(number.inputs[0]).op,
             NodeOp::EntrySlot(slot_named(&chunk, name)),

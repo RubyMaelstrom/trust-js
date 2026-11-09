@@ -55,7 +55,12 @@ impl SlotLiveness {
             .collect();
         let everything = |ops: &[Op]| SlotLiveness {
             words,
-            bits: all.iter().copied().cycle().take(words * ops.len()).collect(),
+            bits: all
+                .iter()
+                .copied()
+                .cycle()
+                .take(words * ops.len())
+                .collect(),
         };
         // Each block's handler records at its start (push pcs, innermost last), from the entry
         // and from each push to its targets; None for a block nothing reaches.
@@ -129,7 +134,12 @@ impl SlotLiveness {
             }
         }
         // Each pc's live-in slots.
-        let mut bits = all.iter().copied().cycle().take(words * ops.len()).collect::<Vec<_>>();
+        let mut bits = all
+            .iter()
+            .copied()
+            .cycle()
+            .take(words * ops.len())
+            .collect::<Vec<_>>();
         for (b, block) in blocks.iter().enumerate() {
             let Some(stack) = &stacks[b] else {
                 continue;

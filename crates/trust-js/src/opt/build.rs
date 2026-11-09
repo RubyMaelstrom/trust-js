@@ -1743,7 +1743,9 @@ impl<'a> Builder<'a> {
     /// Note the alternatives of `phi`'s input `k` for the selector, where it has some.
     fn note(&mut self, phi: NodeIx, k: usize, alternatives: Alternatives) {
         if alternatives != Alternatives::default() {
-            self.notes.alternatives.insert((phi, k as u32), alternatives);
+            self.notes
+                .alternatives
+                .insert((phi, k as u32), alternatives);
         }
     }
 
