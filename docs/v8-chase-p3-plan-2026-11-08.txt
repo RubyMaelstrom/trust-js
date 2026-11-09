@@ -1565,3 +1565,107 @@ eight with one (seven once it is due), a rotated loop's thirteen at each way out
   decline (the list). Djot's added compiles weigh on the compile-time bar. The stub test's one
   failure is unexplained (a round run outside the template's code would fit; an eviction under the
   process's code-memory pressure is the agent's guess, unconfirmed).
+
+The measurement after step 8 (2026-11-09; session p3s2-3860133b on main 3860133b's fat-LTO engine
+against stage 1's p3s1-06e68cf0, CPU 5, no phase capped; target/p3/stage2/session-p3s2-3860133b,
+report.txt). The tier on against off: Octane's Score 4,960 against 4,561, +8.75% (step 5's session:
+-1.83%); the fixtures' measured passes Vue -10.8%, React +6.7% (32 ms against 30) and Djot +5.3%
+(79 against 75), their steady states -4.4%, -3.6% and -9.8%; the call microbenchmarks within 2%
+but constructor +3.1% (67 ms against 65); compile time Vue 5.38 ms (3.0% of the pass, 36
+compiles), React 2.06 ms (6.4%; 9 compiles, the iteration callback's discard and recompile) and
+Djot 15.32 ms (19.4%; 38 compiles, 3 discards, 2 recompiles) against the 3% bar. ARES-6's summary
+-20.7% (Basic's first iteration +15.1%) and Web Tooling's geomean -12.9% (terser +2.3%, uglify-js
++1.8%), for the record. Octane's tier-on rounds split: Richards 1,459, 2,716 and 1,735 against off's
+1,645 to 1,666; Crypto 9,060, 6,308 and 8,729 against 8,830 to 8,855; NavierStokes 3,288, 11,575
+and 3,248 against 10,579 in every round (+221.7% in the median: the exit's worst). So the bars
+missed: React's and Djot's measured passes (their compiles), constructor (+3.1%; the same
+instructions, 603.3M, and 4.4M more backend-stall cycles: 94.5M cycles against 92.6M),
+NavierStokes, and compile time. Coverage waits for the next session: its shares are times, which
+the X925 effect below distorts. The pathology counts again (pathology2.sh, X925 on CPU 15, 400
+fixed Richards runs, 40 Crypto): Richards on 1.132G cycles against off 1.235G, 3.9M mispredictions
+against 1.4M (step 5: 3.12G and 53.2M), without step 8's counting 2.583G and 25.8M; Crypto on 811M
+against 784M, 2.6M mispredictions against 1.0M (step 5: 1,311M and 7.1M), without the counting 968M
+and 9.4M. Crypto's churn: the counting compiles its BigInteger methods sooner, 38 compiles and 16
+discards against 22 and 8 (OutOfBounds, WrongShape and NotObject exits), +186M instructions
+(4.886G against 4.700G without the counting).
+
+The X925 effect's trigger (2026-11-09, target/p3/stage2/diag-navier): new code mapped at the
+addresses of code just freed. NavierStokes alone, 400 fixed runs (fixed-400.js) on CPU 5 under
+setarch -R with TRUST_JS_GC_PACING=0: every run's code at the same addresses (the tier's log) and
+the same 45.76G instructions, but 6.0G to 33.8G cycles and 6.1M to 598M mispredictions, in three
+modes (about 6M, 400M and 598M) from run to run; with ASLR the same spread. The runs take 10 ms
+each until run 101 and 50 to 79 ms from run 102 on in the slow modes: run 102 is where the tier
+discards project (pc 53 NotInt32), lin_solve (pc 35 NeverRan) and a third function (pc 15
+NeverRan) after 100 exits each and recompiles each into the pages its discarded code had just
+freed (the same addresses in the log): each code object is its own mmap (jit.rs, sys::alloc_exec),
+a discard unmaps its code once nothing runs it (release_retired), and the kernel hands the hole to
+the next mapping that fits, the recompile's. With an LD_PRELOAD shim that keeps every freed
+executable range reserved (shim/noreuse.c: its munmap becomes mprotect(PROT_NONE)), every run takes
+5.64G cycles with 1.1M mispredictions; with its variant that frees the pages and keeps the
+addresses (noreuse-decommit.c: a fixed PROT_NONE mapping over the range), the same; so the
+addresses, not the physical pages. On an A725 (CPU 10) the runs take 8.63G cycles with and
+without the shim; off, 7.80G cycles on the X925 and 8.43G on the A725 (32.04G instructions), so
+NavierStokes' tier code is 28% faster on the X925 and 2.4% slower on the A725, with 43% more
+instructions (open).
+Octane through NavierStokes (octane-driver.js, six runs each, ASLR on): without the shim
+NavierStokes 2,223 to 12,305 (five of six below 4,500), Richards 1,154 to 1,977 and Crypto 6,088 to
+8,528; with it 14,309 to 14,395, 3,209 to 3,262 and 9,235 to 9,290. All of Octane with the shim
+(three runs, not under the session's cool-down or cap check): Score 5,687 to 5,746 against the
+session's off 4,561 (+25%), every benchmark at or above its off score (Richards 3,220 to 3,258,
+DeltaBlue 2,451 to 2,466, Crypto 9,217 to 9,239, NavierStokes 14,380 to 14,395). The shim changes
+neither React's and Djot's passes nor the constructor case. This is step 5's open trigger (the
+same signature: branches mispredicting at every execution beside neighbours that predict, the
+X925 only, coming and going with the code's configuration; Richards' discarded and recompiled
+TaskControlBlock.run among its code), and step 8 moved it by moving which code is discarded and
+recompiled when.
+
+9. Executable memory from one reserved region (new). V8, SpiderMonkey and JSC each reserve one
+   region for code and place code inside it: V8's code range (kMaximalCodeRangeSize 128 or 256 MB
+   on arm64, src/common/globals.h:543-545; NormalPage pages, heap/code-range.cc:160-185),
+   SpiderMonkey's process executable memory (MaxCodeBytesPerProcess 2,044 MB on 64-bit,
+   jit/ProcessExecutableMemory.h:26, 64 KB pages and pools: ExecutableCodePageSize, :65) and
+   JSC's fixed pool (fixedExecutableMemoryPoolSize 128 MB on arm64 without jump islands, 512 MB
+   with, 1 GB on x86-64: jit/ExecutableAllocator.cpp:92-105). In none of them does a recompile
+   land on its invalidated predecessor: they bump-allocate (ExecutablePool::alloc,
+   jit/ExecutableAllocator.cpp:69-78; a pool is freed only when all its code is dead,
+   :32-57), and they free invalidated code only when the GC finalizes it (JitCode::finalize,
+   jit/Ion.cpp:662-694; V8's and JSC's code objects are the GC's as well), so its addresses
+   stay taken until well after the recompile. Here every code object is its own mapping, freed
+   as soon as nothing runs it, and the next mapping takes the hole.
+   - The design: on Linux (aarch64 and x86-64) and Windows, executable memory comes from one
+     region per process reserved at the first allocation (1 GiB of addresses with no access,
+     or twice the code budget if TRUST_JS_JIT_CODE_BUDGET_MB sets more than 512): a bitmap of its
+     pages and a cursor. An allocation takes the first run of free pages at or after the cursor,
+     wrapping at the region's end, commits it writable, copies, flushes and protects it
+     executable as now, and moves the cursor past it; a free decommits its pages (Linux: a
+     fixed no-access mapping over them; Windows: MEM_DECOMMIT) and clears their bits. Each code
+     object keeps its own pages, so the W^X protections stay per object as now. All executable
+     code takes it: the template JIT's, the tier's, shared stubs, native RegExp programs.
+   - Departure: SpiderMonkey's cursor moves back to a freed page "so we can reuse pages instead
+     of fragmenting the whole region" (ProcessExecutableMemory::deallocate,
+     jit/ProcessExecutableMemory.cpp:881-885), and its frees come from the GC's finalization,
+     well after an invalidation. Here a discard frees its code before its recompile, so a cursor
+     moving back would hand the recompile its predecessor's pages, the trigger above. The cursor
+     never moves back: a freed page is taken again only after the cursor has passed the rest of
+     the region, a GiB of later code, which stands in for the exemplars' wait for the GC.
+     SpiderMonkey's random skip of a page (allocate, :792) is a hardening the other two lack;
+     not taken.
+   - macOS keeps its MAP_JIT mapping per object (its JIT write protection and its MAP_JIT rules
+     make a region another design; no machine here measures it).
+   - When the region cannot be reserved (an address-space limit) or has no free run long
+     enough, an allocation maps its own memory as now. The budget's accounting is unchanged
+     (live requested bytes). The region is shared by the process's threads under a lock.
+   - Expected: NavierStokes' 400 fixed runs at the shim's 5.64G cycles in every run, Octane at
+     the shim's scores (Score near 5,700, Richards near 3,250), the A725's counts unchanged, and
+     the shim, run on the step, changing nothing.
+   - Tests: an allocation after a free of the same size gets other pages while the region has
+     them; the cursor wraps and reuses freed pages; a region with no free run long enough falls
+     back to an own mapping; allocations from several threads; code in the region runs, and
+     each page's protection is its object's (/proc/self/maps on Linux); the library's suites,
+     the tier's four configurations and the RegExp tests on Crystal; zombie's x86-64 suite and
+     Windows' check (and its tests under Wine if they run there).
+   - Measurement: the reduced case's counts (X925 and A725), Octane through NavierStokes, then a
+     session and the coverage run on the step.
+The order (proposed): step 9 now (the trigger the measurement's plan asked for, and the largest
+open regression); then compile time as ordered (2026-11-09), React's and Djot's passes with it;
+then NavierStokes' instructions on the A725, constructor's stalls and the list.
