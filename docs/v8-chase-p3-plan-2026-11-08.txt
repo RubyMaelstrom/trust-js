@@ -628,7 +628,14 @@ precedent), or at the first checkpoint under TRUST_JS_OPT_EAGER=1. A function wh
 is empty gets a chunk of its own all the same when the tier is on (compile_with_inlines with the
 empty plan, seeded and record-mapped from the first stage), published only if the tier accepts it:
 Maglev compiles a hot function whether or not it inlines, and the hottest leaf loops have nothing
-to splice (2026-11-08).
+to splice (2026-11-08). The last checkpoint compiles whatever its fingerprint (2026-11-09): neither
+exemplar abandons a hot function's tier-up while its feedback changes. JSC optimizes after
+maximumOptimizationDelay (5) delays whatever its value profiles say
+(CodeBlock::shouldOptimizeNowFromBaseline); V8 pushes the budget out by
+minimum_invocations_after_ic_update (500) at each IC change and never cancels
+(TieringManager::NotifyICChanged). The four checkpoints are a bounded schedule like JSC's delays,
+and the repeated-exit rule below bounds what compiling unsettled feedback costs. TRUST_JS_OPT_LOG
+logs each wait.
 
 The front end:
 - Inputs, immutable during the compile: the chunk's operations (Chunk::jit_ops, the list its code
@@ -696,7 +703,12 @@ The back end:
   stop using it and the chunk takes the template JIT's code, compiled then if it has none; running
   activations finish in the tier's code, which stays alive until none runs it. Stage 1 does not
   recompile: the exit profile and reoptimization are stage 2's. This keeps an exit loop from making
-  the tier slower than the code it replaces.
+  the tier slower than the code it replaces. Milestone 2's runs (non-LTO, Octane at 5 runs and the
+  three fixtures, 2026-11-09): 241 of 905 compiled codes fell back with the tier on (eager: 436 of
+  1,345), 97 of GBEMU's 110 and 82 of TypeScript's 354. Their exits: a wrong shape 17,111 (GBEMU
+  and TypeScript, mostly at pc 0), a wrong callee 4,717, a block that never ran 2,259. Whether the
+  shapes change for the program's reasons (a property added after the snapshot) or the engine's is
+  examined before the stage's timing.
 - Shapes (review of the front end, 2026-11-08): CheckShape proves what the baseline's own-data
   probe proves (an object word, an ordinary kind, which excludes Arrays, whose element entries
   take slots without a shape transition, the IC-plain flag, the shape). A field access after it
