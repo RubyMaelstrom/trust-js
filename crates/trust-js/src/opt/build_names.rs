@@ -27,6 +27,11 @@
 //!   be tested again, as a call does SpiderMonkey's movable guard), and the slot's load
 //!   ([`NodeOp::LoadField`] on the global object, a heap fact per location). Each check exits
 //!   with WrongName.
+//! - A script-level lexical's read (the cache in scope mode on the global environment) takes the
+//!   cache's own proof, the plan's Q4 having found that the global declarative record does not
+//!   only append: the record is the realm's ([`NodeOp::CheckEnvIs`]), its generation the cache's
+//!   ([`NodeOp::CheckEnvGeneration`], a heap fact), and the binding's word at the address the
+//!   proof keeps ([`NodeOp::LoadGlobalLexical`]), with no TDZ test.
 //! - Facts ([`Facts`]), as the exemplars' alias rules have them: parent links are value facts
 //!   within an activation (the one later write, class evaluation re-parenting its fresh outer
 //!   record, eval.rs's `eval_class_strict`, happens after its heritage and keys ran, when no
@@ -77,6 +82,10 @@ pub(super) struct Facts {
     checked: FastSet<(NodeIx, u64)>,
     /// A heap fact: the global property epoch checked in this effect epoch.
     epoch: bool,
+    /// Heap facts: the global environment's generation checked, by its record's node...
+    generations: FastSet<(NodeIx, u32)>,
+    /// ...and the global lexicals loaded, by their bindings' addresses.
+    lexicals: FastMap<u64, NodeIx>,
 }
 
 impl Facts {
@@ -84,6 +93,8 @@ impl Facts {
     pub(super) fn clear_heap(&mut self) {
         self.values.clear();
         self.epoch = false;
+        self.generations.clear();
+        self.lexicals.clear();
     }
 
     /// An operation moved the running environment: the records it reaches are other nodes from
@@ -116,6 +127,13 @@ impl Facts {
                 .copied()
                 .collect(),
             epoch: first.epoch && others().all(|names| names.epoch),
+            generations: first
+                .generations
+                .iter()
+                .filter(|key| others().all(|names| names.generations.contains(key)))
+                .copied()
+                .collect(),
+            lexicals: common(&first.lexicals, others().map(|names| &names.lexicals)),
         }
     }
 
@@ -129,6 +147,8 @@ impl Facts {
         Facts {
             values: FastMap::default(),
             epoch: false,
+            generations: FastSet::default(),
+            lexicals: FastMap::default(),
             ..self.clone()
         }
     }
@@ -420,6 +440,7 @@ impl Builder<'_> {
                 self.binding_value(st, &mut cx, record, address, known)
             }
             view @ NameView::Global { .. } => self.global_read(st, &mut cx, view),
+            view @ NameView::GlobalLexical { .. } => self.global_lexical_read(st, &mut cx, view),
             _ => return self.effect(pc, st),
         };
         if for_call {
@@ -497,6 +518,58 @@ impl Builder<'_> {
             pc,
         );
         st.fields.insert((object, location), value);
+        value
+    }
+
+    /// A script-level lexical's read (see the module's doc), the site's view `view`.
+    fn global_lexical_read(&mut self, st: &mut State, cx: &mut Before, view: NameView) -> NodeIx {
+        let NameView::GlobalLexical {
+            search,
+            genv,
+            generation,
+            binding,
+        } = view
+        else {
+            unreachable!("a global lexical's view")
+        };
+        let pc = cx.pc;
+        let proof = view.proof();
+        let record = match search {
+            Search::Running(hops) => {
+                let env = self.running_env(st, pc);
+                let record = self.walk(st, env, hops, pc);
+                let check = NodeOp::CheckEnvIs {
+                    env: genv as u64,
+                    proof,
+                };
+                self.check_identity(st, cx, check, record);
+                record
+            }
+            // A splice's pinned [[Environment]], which its guard keeps.
+            Search::Pinned => self.hoist(Hoisted::ConstEnv(genv as u64)),
+        };
+        if st.names.generations.insert((record, generation)) {
+            let state = self.before(cx, st);
+            self.add_exit(
+                NodeOp::CheckEnvGeneration { generation, proof },
+                &[record],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::WrongName,
+            );
+        }
+        let binding = binding as u64;
+        if let Some(&value) = st.names.lexicals.get(&binding) {
+            return value;
+        }
+        let value = self.add(
+            NodeOp::LoadGlobalLexical { binding },
+            &[record],
+            Rep::Tagged,
+            pc,
+        );
+        st.names.lexicals.insert(binding, value);
         value
     }
 }

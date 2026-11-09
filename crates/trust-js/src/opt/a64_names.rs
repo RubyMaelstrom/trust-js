@@ -94,6 +94,28 @@ impl Gen<'_> {
                 self.a.cmp_reg_x(value, X17);
                 self.a.b_cond(NE, site);
             }
+            NodeOp::CheckEnvGeneration { generation, .. } => {
+                let site = self.check_exit(n)?;
+                let record = self.gp(node.inputs[0], X16);
+                self.a.ldr_w_imm(X17, record, self.layout.scope_gen as u32);
+                if generation < 4096 {
+                    self.a.cmp_imm_w(X17, generation);
+                } else {
+                    self.a.mov_imm64(X9, u64::from(generation));
+                    self.a.cmp_reg_w(X17, X9);
+                }
+                self.a.b_cond(NE, site);
+            }
+            NodeOp::LoadGlobalLexical { binding } => {
+                // The binding's address, which the record's generation keeps: embedded only in
+                // this code, after the checks that proved the record.
+                if !unused {
+                    let dst = self.gp_dst(n);
+                    self.a.mov_imm64(dst, binding);
+                    self.a.ldr_imm(dst, dst, self.layout.binding_value as u32);
+                    self.gp_done(n, dst);
+                }
+            }
             NodeOp::CheckGlobalEpoch { epoch, .. } => {
                 // The epoch through the global object, which the realm's checks proved.
                 let site = self.check_exit(n)?;

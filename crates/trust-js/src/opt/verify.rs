@@ -377,6 +377,8 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::GlobalObject => (&[], Rep::Cell),
         NodeOp::CheckEnvIs { .. } => (&[Rep::Env], Rep::None),
         NodeOp::CheckCellIs { .. } | NodeOp::CheckGlobalEpoch { .. } => (CELL, Rep::None),
+        NodeOp::CheckEnvGeneration { .. } => (&[Rep::Env], Rep::None),
+        NodeOp::LoadGlobalLexical { .. } => (&[Rep::Env], Rep::Tagged),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),
         NodeOp::Return => (TAGGED, Rep::None),

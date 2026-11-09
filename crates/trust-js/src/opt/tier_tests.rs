@@ -1698,3 +1698,55 @@ fn typed_arrays_bound_to_a_global_and_to_a_module_variable() {
          t",
     );
 }
+
+#[test]
+fn script_level_lexicals_read_while_scripts_assign_and_declare_them() {
+    // Assignments keep the record's generation (no exit); a later script's declarations move it,
+    // and the code exits WrongName until its recompile takes the new proof.
+    const WARM: &str = "let lex = 1; const k = 3;
+         function readLex() { return lex * 2 + k; }
+         let t = 0; for (let n = 0; n < 1000; n++) t += readLex(); t";
+    const ASSIGN: &str = "for (let n = 0; n < 50; n++) { lex = n; t += readLex(); } t";
+    const DECLARE: &str =
+        "let another = 4; for (let n = 0; n < 900; n++) t += readLex() + another; t";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [WARM, ASSIGN, DECLARE].map(|source| eval(&mut vm, source))
+    };
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    exits();
+    discarded();
+    assert_eq!(eval(&mut engine, WARM), expected[0]);
+    let optimized = tier_code(&mut engine, "readLex").expect("the tier compiled readLex");
+    assert_eq!(eval(&mut engine, ASSIGN), expected[1], "assignments");
+    assert!(exits().is_empty(), "an assignment moves no generation");
+    assert_eq!(
+        eval(&mut engine, DECLARE),
+        expected[2],
+        "a later declaration"
+    );
+    let taken = exits();
+    assert!(
+        !taken.is_empty() && taken.iter().all(|&(_, why)| why == ExitReason::WrongName),
+        "{taken:?}"
+    );
+    assert_eq!(discarded(), vec![optimized.mem_ptr() as usize]);
+    let now = tier_code(&mut engine, "readLex").expect("the recompile is resident");
+    now.referenced.set(0);
+    // `lex` is 49 since the assignments: 49 * 2 + 3 + 4.
+    assert_eq!(eval(&mut engine, "readLex() + another"), "105");
+    assert!(exits().is_empty());
+    assert!(now.referenced.get() != 0);
+    drop((optimized, now));
+    super::release_retired(&mut engine.interp);
+    names_hold(
+        "let a = 1; let b = 'x';
+         function f(n) { return a + n + b.length; }
+         let t = 0; for (let k = 0; k < 600; k++) { t += f(k); if (k % 100 === 0) a = a + 1; }
+         t",
+    );
+}

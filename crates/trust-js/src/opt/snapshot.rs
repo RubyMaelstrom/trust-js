@@ -110,6 +110,21 @@ pub(crate) enum NameView {
         location: u16,
         epoch: u16,
     },
+    /// A binding of the realm's global declarative record, a script-level `let`, `const` or
+    /// `class` (the cache in scope mode on the realm's global environment), under the cache's
+    /// own proof: the record's generation and the binding's address. Not unguarded, as
+    /// SpiderMonkey reads its global lexical slots: the record does not only append (each
+    /// script's GlobalDeclarationInstantiation adds its var names and removes them again, which
+    /// moves the last binding into the gap, `Interp::run_program_body`; a sloppy eval's
+    /// deletable bindings go too, `Interp::delete_ident`) and its slots move when it outgrows
+    /// its cell (the plan's Q4). No TDZ test: the cache filled only an initialized binding, and
+    /// a global lexical never returns to its TDZ (SpiderMonkey's rule, CacheIR.cpp:3450-3466).
+    GlobalLexical {
+        search: Search,
+        genv: usize,
+        generation: u32,
+        binding: usize,
+    },
     /// A cache in a mode the tier keeps the effect for (scope, depth-1, layout, deep, another
     /// realm's), or a store's or update's that has no static address.
     Dynamic,
@@ -126,6 +141,9 @@ impl NameView {
     pub(crate) fn proof(&self) -> u8 {
         match *self {
             NameView::Global { genv, epoch, .. } => (genv >> 4) as u8 ^ epoch as u8,
+            NameView::GlobalLexical {
+                genv, generation, ..
+            } => (genv >> 4) as u8 ^ generation as u8,
             _ => 0,
         }
     }
@@ -338,7 +356,10 @@ fn name_evidence(name: &NameView) -> Ran {
     match name {
         NameView::None | NameView::Static { .. } => Ran::Unknown,
         NameView::Empty => Ran::No,
-        NameView::Global { .. } | NameView::Dynamic | NameView::Refused => Ran::Yes,
+        NameView::Global { .. }
+        | NameView::GlobalLexical { .. }
+        | NameView::Dynamic
+        | NameView::Refused => Ran::Yes,
     }
 }
 
@@ -403,9 +424,10 @@ fn name_view(chunk: &Chunk, op: &Op, realm: Option<&Interp>) -> NameView {
 
 /// A global read's view (see [`NameView::Global`]): its cache in global-object mode on `realm`'s
 /// global environment, the name found again now as a data property of the realm's global object,
-/// ordinary and IC_PLAIN, which no global lexical shadows, at a slot a location word reaches; a
-/// splice's only where its pinned [[Environment]] is that environment and its guard proves the
-/// realm. None otherwise.
+/// ordinary and IC_PLAIN, which no global lexical shadows, at a slot a location word reaches; or
+/// its cache in scope mode there, a global lexical's (see [`NameView::GlobalLexical`]), whose
+/// proof still holds. A splice's only where its pinned [[Environment]] is that environment and
+/// its guard proves the realm. None otherwise.
 fn global_view(
     chunk: &Chunk,
     realm: &Interp,
@@ -427,6 +449,18 @@ fn global_view(
         }
         None => Search::Running(chunk.jit_name_global(cache).unwrap_or(0)),
     };
+    if ic.env == genv {
+        // Scope mode on the global environment: a global lexical, under its cache's proof.
+        let record = realm.global_env.try_borrow().ok()?;
+        return (ic.gen != u32::MAX && record.vars.matches_generation(ic.gen)).then_some(
+            NameView::GlobalLexical {
+                search,
+                genv,
+                generation: ic.gen,
+                binding: ic.binding as usize,
+            },
+        );
+    }
     if ic.env != genv | 1 {
         return None;
     }

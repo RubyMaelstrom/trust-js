@@ -511,6 +511,18 @@ pub(crate) enum NodeOp {
         epoch: u16,
         proof: u8,
     },
+    /// (Env): the global environment's record has the compile's generation [WrongName]: no
+    /// binding was added, removed or moved since, so the cache's binding address is a global
+    /// lexical's still (the plan's Q4: the record does not only append).
+    CheckEnvGeneration {
+        generation: u32,
+        proof: u8,
+    },
+    /// Env -> Tagged: the global lexical binding at the address the cache's proof names, which
+    /// the record's generation check keeps (its input, the record, orders it after the check).
+    LoadGlobalLexical {
+        binding: u64,
+    },
 
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's
@@ -568,6 +580,7 @@ impl NodeOp {
                 | NodeOp::CheckEnvIs { .. }
                 | NodeOp::CheckCellIs { .. }
                 | NodeOp::CheckGlobalEpoch { .. }
+                | NodeOp::CheckEnvGeneration { .. }
                 | NodeOp::I32Add
                 | NodeOp::I32Sub
                 | NodeOp::I32Mul

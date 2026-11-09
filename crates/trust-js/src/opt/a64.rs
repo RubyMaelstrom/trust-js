@@ -757,7 +757,8 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckInitialized => ExitReason::Tdz,
         NodeOp::CheckEnvIs { .. }
         | NodeOp::CheckCellIs { .. }
-        | NodeOp::CheckGlobalEpoch { .. } => ExitReason::WrongName,
+        | NodeOp::CheckGlobalEpoch { .. }
+        | NodeOp::CheckEnvGeneration { .. } => ExitReason::WrongName,
         NodeOp::I32Add | NodeOp::I32Sub | NodeOp::I32Mul | NodeOp::I32UShr => ExitReason::Overflow,
         NodeOp::CheckElements(_) => ExitReason::WrongElements,
         NodeOp::CheckIndex => ExitReason::NotInt32,
@@ -958,7 +959,8 @@ impl Gen<'_> {
         let proof = match node.op {
             NodeOp::CheckEnvIs { proof, .. }
             | NodeOp::CheckCellIs { proof, .. }
-            | NodeOp::CheckGlobalEpoch { proof, .. } => proof,
+            | NodeOp::CheckGlobalEpoch { proof, .. }
+            | NodeOp::CheckEnvGeneration { proof, .. } => proof,
             _ => 0,
         };
         let record = ExitRecord {
@@ -1056,7 +1058,9 @@ impl Gen<'_> {
             | NodeOp::GlobalObject
             | NodeOp::CheckEnvIs { .. }
             | NodeOp::CheckCellIs { .. }
-            | NodeOp::CheckGlobalEpoch { .. } => self.lower_name(n)?,
+            | NodeOp::CheckGlobalEpoch { .. }
+            | NodeOp::CheckEnvGeneration { .. }
+            | NodeOp::LoadGlobalLexical { .. } => self.lower_name(n)?,
             NodeOp::EntrySlot(slot) | NodeOp::FrameSlot(slot) => {
                 if !unused {
                     let dst = self.gp_dst(n);

@@ -3035,3 +3035,49 @@ fn the_global_property_epoch_moves_at_removals_kind_changes_and_shadowing_only()
     eval(&mut engine, "let e = 1;");
     assert_eq!(epoch(&engine), start + 4);
 }
+
+#[test]
+fn a_script_level_lexical_is_read_under_its_caches_proof_without_a_tdz_test() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "let counter = 5; const fixed = 7;
+         function r() { return counter + fixed + counter; }
+         for (var i = 0; i < 20; i++) r();",
+    );
+    let chunk = chunk_of(&mut engine, "r");
+    let graph = graph_in(&engine, &chunk, "r");
+    let text = dump(&graph, &chunk);
+    let snapshot = Snapshot::take_in(&chunk, Some(&engine.interp));
+    for name in ["counter", "fixed"] {
+        assert!(
+            matches!(
+                snapshot.name(name_reads(&chunk, name)[0]),
+                super::snapshot::NameView::GlobalLexical { .. }
+            ),
+            "{name}: {:?}",
+            snapshot.name(name_reads(&chunk, name)[0])
+        );
+    }
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckEnvIs { .. })),
+        1,
+        "{text}"
+    );
+    let generations = nodes(&graph, |op| matches!(op, NodeOp::CheckEnvGeneration { .. }));
+    assert_eq!(generations.len(), 1, "{text}");
+    assert_eq!(generations[0].reason, Some(ExitReason::WrongName), "{text}");
+    // `counter`'s second read is the first's word.
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadGlobalLexical { .. })),
+        2,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckInitialized),
+        0,
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::GlobalObject), 0, "{text}");
+}
