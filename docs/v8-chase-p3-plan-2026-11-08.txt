@@ -1307,3 +1307,13 @@ node, constants at each encoding's bounds (0, 4095, 4096, 0xfff000, 0x1000000, -
 INT32_MIN), encodable and unencodable logical immediates (0x3fff, 0xfffffff, 0x12345), shift
 counts 0, 31 and 32 and above, and the overflow exits taken with an immediate operand; Crypto's
 counts again.
+Step 7 landed (34f1999b, 2026-11-09). The tier's tests and the library's suites pass with the tier
+off and on eager (two template tests that count the store helper's calls failed on main as well
+when the tier's own stores took over theirs; 1a6a545a pins them to the tier-off pipeline they
+test), and the x86-64 type-check; encodings are checked against llvm-mc and every FMOV immediate
+on the CPU. Not every node the design names has a form to take: the IR has no int32 add without
+its overflow exit, comparisons are not fused with their branches (CheckBounds takes CMP's
+immediate), and zero, which no logical immediate encodes, keeps its register. A `>>>` by a
+constant count of 1 to 31 drops its sign test, which cannot fail. am3's loop, non-LTO, tier on:
+172 instructions per iteration at 3b5e38ec, 158 with step 4's prepass, 146 with immediates;
+Crypto's count with the tier on 977.8M before step 7 and 931.2M after, 715.8M off.
