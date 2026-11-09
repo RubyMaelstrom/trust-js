@@ -846,3 +846,55 @@ gates, with its coverage and performance recorded as measured; the tier stays of
 same coverage and performance bars become Stage 2's exit, and Stage 2 starts with the three causes:
 elements in line, f64 operands truncated for ToInt32 in line (Maglev's TruncateFloat64ToInt32), and
 point 12's exit profile with reoptimization.
+
+### Stage 2: coverage (design, 2026-11-09)
+
+The owner's decision on stage 1's exit sets where stage 2 starts: with the three causes stage 1's
+measurements found (Stage 1's measurements and Why, above), then the rest of the stage's list
+(## Stages, 2), ordered by a measurement after the three. Each step's design is written here
+before its code; the steps land on main as they are done, diagnostics as needed, and the gates in
+full at the stage's end (Gates; P2's Decision 8).
+
+Steps:
+1. ToInt32 in line (below).
+2. Elements in line: loads and stores of dense Arrays and typed arrays as nodes (design before its
+   code, from target/p3/stage2/elements-input.txt).
+3. The exit profile and reoptimization, point 12 (design before its code, from
+   target/p3/stage2/reopt-input.txt).
+4. A measurement: the coverage run and a session of the regressed workloads, which orders what
+   follows: values kept across effects instead of reloaded (React's steady state), a guard miss at
+   a polymorphic call that calls instead of exiting (Richards), and the rest of the list
+   (allocation in line, closures, strings through helpers, natives through their entries,
+   exceptions by exit with the in-place resume, `arguments` and rest elided where proven, getters
+   and setters as calls, dependencies with invalidation points).
+
+Stage 2's exit (the owner's, 2026-11-09: stage 1's bars carried): stage 1's gates in the tier's
+three configurations; coverage, the tier's code taking at least 80% of the time spent in
+second-stage code on the three fixtures and Octane; performance, the tier on against off on main
+in one session: no fixture, Octane benchmark or call microbenchmark slower by more than 2%,
+Octane's geomean faster, and compile time at most 3% of any fixture's measured pass.
+
+Step 1, ToInt32 in line. The bitwise operations (BitAnd, BitOr, BitXor, Shl, Shr, UShr, BitNot)
+take their operands' ToInt32 (ECMA-262 7.1.6), which wraps modulo 2^32. Stage 1 converted each
+operand exactly (CheckInt32, exiting with NotInt32 when the Number is no int32) and left an operand
+held as an f64 to the effect path, so `(a * b) & m`, a `| 0` on an f64 sum and `h >> 14` on a
+double went through the VM's operation helper: 38% of zlib's samples and 31% of Mandreel's with the
+tier on. Maglev truncates: GetTruncatedInt32ForToNumber takes an Int32 as it is, adds
+TruncateFloat64ToInt32 for a Float64 and TruncateCheckedNumberOrOddballToInt32 for a tagged value
+(src/maglev/maglev-reducer-inl.h), and ARM64's truncation is FJCVTZS where FEAT_JSCVT is present
+(TruncateDoubleToI, src/codegen/arm64/macro-assembler-arm64.cc:3014), else FCVTZS to 64 bits with
+a saturation test and the DoubleToI builtin when it saturates. The tier does the same with a
+TruncateToInt32 node (f64 to int32, no exit): FJCVTZS under jscvt_available(); otherwise FCVTZS to
+a 64-bit register, whose low word is the result unless the conversion saturated, and on that cold
+path the low word computed from the exponent and mantissa (zero from 2^84 up, and for the
+infinities), in line where V8 calls its builtin. A tagged operand is checked a Number (CheckNumber,
+NotNumber) and truncated, a proven int32 is used as it is, and a constant folds. A truncation is not
+a form of its operand (forms hold one value), so it is cached per value beside the forms. UShr's
+result is an int32 when its count is a constant with count & 31 non-zero, as in stage 1; any other
+count (asm.js's `>>> 0` among them), which stage 1 left an effect, gives a uint32 that the tier
+holds as an f64 (UCVTF), as Maglev's shift "returns a Uint32" (Int32ShiftRightLogical,
+src/maglev/maglev-ir.h:3519-3525), used as a Float64 where it may exceed the int32 range.
+Operands the feedback says are not Numbers keep the effect path, as stage 1's. Tests: the builder's
+graph for each operand form (an int32, an f64 product, a tagged double, a constant); end-to-end
+values under the tier eager and with exits forced, with and without TRUST_JS_JIT_NO_JSCVT (-0, NaN,
+the infinities, 2^31, -2^31 - 1, 2^53, 2^63, 2^84, a product past 2^53).
