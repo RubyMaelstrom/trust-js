@@ -741,6 +741,29 @@ The back end:
   second stage was built unsettled, so the direct-call sequence declined it for its first 100
   entries, which every tier compile paid; second stages are now built settled, as V8 enters new
   code through the dispatch table at once. Both change tier-off behaviour slightly.
+- The gate (2026-11-09, target/p3/stage1/gate-s1.sh; the tier off at a7bae3c6, its three
+  configurations at 090cd551): difftest, the fixtures and Test262 (language and built-ins) gave
+  the tier-off results in every configuration, and the eager configuration's GC-stress runs passed
+  but for one native-stub test the primitive receivers' exits failed. The lib suite failed 27 tests
+  beyond the tier-off run's with the tier on, 34 eager and 39 forcing exits, 50 in all, none with a
+  wrong JavaScript result. Most assumed the tier-off pipeline: exact native-run counts to the first
+  checkpoint, the template JIT's register regions, property chains and fused String steps, a second
+  stage built at the first checkpoint, or work counted in generated code that a forced exit hands to
+  the VM. Tests whose subject is the tier-off pipeline now pin the tier off on their thread
+  (pin_tier_off_for_test, as V8's variants set flags and its status files skip tests); those that
+  count what a forced exit hands to the VM keep the tier without forced exits; the rest run on to the
+  checkpoint the settled-feedback rule compiles at, or look for the second stage's inline guards
+  rather than its presence. Four failures were the tier's or the engine's: the primitive receivers
+  (fb3b3155), the two call behaviours above (eaee31ee, 9847786e), and a fallback's epoch move, which
+  staled the first stage's entry a test read. At 06e68cf0 the lib suite passes in all four
+  configurations (2,975 tests each), and on x86-64 (before a last change to tests).
+- Open (2026-11-09): in the full lib suite with the tier on, a constructor's feedback fingerprint
+  changed at its second and third checkpoints in 3 of 5 runs and never when its test ran alone
+  (callee_pickup_tests' construct site, which now runs to the last checkpoint); the cause is
+  unknown. The tier's code lacks the template JIT's fused String method steps (charCodeAt and
+  codePointAt in loops, as in Djot's getEol and skipSpace): with the tier eager, string_call_fusion's
+  register-region test made 4,696 fused calls where it expects at least 10,000. Their lowering is a
+  later stage's.
 - Shapes (review of the front end, 2026-11-08): CheckShape proves what the baseline's own-data
   probe proves (an object word, an ordinary kind, which excludes Arrays, whose element entries
   take slots without a shape transition, the IC-plain flag, the shape). A field access after it
