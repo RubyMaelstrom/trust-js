@@ -2389,3 +2389,216 @@ fn a_deep_cache_seeds_a_second_stage_with_the_refused_fill_mark() {
         assert_eq!(Snapshot::take(&second).ran(pc), Ran::Yes);
     });
 }
+
+/// The static address of the free-name site at `pc`.
+fn static_address(snapshot: &Snapshot, pc: usize) -> crate::bytecode::StaticName {
+    match snapshot.name(pc) {
+        super::snapshot::NameView::Static { address, .. } => address,
+        other => panic!("no static address at pc {pc}: {other:?}"),
+    }
+}
+
+/// The loads of `graph` from a record's slot `slot`.
+fn binding_loads(graph: &Graph, slot: u16) -> usize {
+    count(graph, |op| *op == NodeOp::LoadBinding { slot })
+}
+
+#[test]
+fn static_reads_walk_their_hops_without_guards() {
+    // `g` makes no record: x2 is in its running environment, x1 one record up, x0 two.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function f0() { var x0 = 1; function f1() { var x1 = 2; function f2() { var x2 = 3;
+           return function () { return x0 + x1 + x2; }; } return f2(); } return f1(); }
+         var g = f0();
+         for (var i = 0; i < 20; i++) g();",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "g");
+    let text = dump(&graph, &chunk);
+    let snapshot = Snapshot::take(&chunk);
+    let hops: Vec<u16> = ["x0", "x1", "x2"]
+        .iter()
+        .map(|name| static_address(&snapshot, name_reads(&chunk, name)[0]).hops)
+        .collect();
+    assert_eq!(hops, [2, 1, 0], "{text}");
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    // One running environment at the entry, two parent links (x1's serves x0's walk), a load
+    // a binding, and no guard: no check of an environment, no TDZ test of a `var`.
+    assert_eq!(count(&graph, |op| *op == NodeOp::Env), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::EnvParent), 2, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadBinding { .. })),
+        3,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckInitialized),
+        0,
+        "{text}"
+    );
+    let env = nodes(&graph, |op| *op == NodeOp::Env)[0];
+    assert_eq!(env.block, graph.entry.expect("an entry"), "hoisted: {text}");
+    // The words are checked Numbers for the adds, as any loaded word is.
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 3, "{text}");
+}
+
+#[test]
+fn a_lexical_read_is_checked_once_per_record() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { let x = 1; return function (c) { var t = x; if (c) { t = t + x; }
+           return t + x; }; }
+         var r = mk();
+         for (var i = 0; i < 20; i++) { r(true); r(false); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "r");
+    let text = dump(&graph, &chunk);
+    let checks = nodes(&graph, |op| *op == NodeOp::CheckInitialized);
+    assert_eq!(checks.len(), 1, "{text}");
+    assert_eq!(checks[0].reason, Some(ExitReason::Tdz), "{text}");
+    // The check exits before the read, with the read's operands (none) on the stack.
+    let first = name_reads(&chunk, "x")[0];
+    let state = graph.state(checks[0].state.expect("a state"));
+    assert_eq!(state.pc as usize, first, "{text}");
+    assert_eq!(
+        state.stack.len(),
+        crate::jit_ir::Cfg::build(&chunk)
+            .unwrap()
+            .stack_depth_at(first)
+            .unwrap(),
+        "{text}"
+    );
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+}
+
+#[test]
+fn a_const_is_kept_across_a_call_and_a_var_reloaded_after_one() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { const k = 2; var v = 3; function noop() {}
+           return function () { var a = k + v; noop(); return a + k + v; }; }
+         var r = mk();
+         for (var i = 0; i < 20; i++) r();",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "r");
+    let text = dump(&graph, &chunk);
+    let snapshot = Snapshot::take(&chunk);
+    let k = static_address(&snapshot, name_reads(&chunk, "k")[0]);
+    let v = static_address(&snapshot, name_reads(&chunk, "v")[0]);
+    assert!(!k.mutable && v.mutable, "{text}");
+    assert_eq!(count(&graph, is_effect), 1, "the call: {text}");
+    // `k`'s initialized value is a value fact; `v`'s a heap fact, which the call ends.
+    assert_eq!(binding_loads(&graph, k.slot), 1, "{text}");
+    assert_eq!(binding_loads(&graph, v.slot), 2, "{text}");
+    // A `const`'s TDZ is tested once, a `var` has none.
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckInitialized),
+        1,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_free_name_called_has_an_undefined_receiver() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { var f = function () { return 1; }; return function () { return f(); }; }
+         var r = mk();
+         for (var i = 0; i < 20; i++) r();",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "r");
+    let text = dump(&graph, &chunk);
+    let call = nodes(&graph, is_effect);
+    assert_eq!(call.len(), 1, "{text}");
+    let receiver = graph.node(call[0].inputs[0]);
+    assert_eq!(receiver.op, NodeOp::ConstTagged(PACK_UNDEFINED), "{text}");
+    let callee = graph.node(call[0].inputs[1]);
+    assert!(matches!(callee.op, NodeOp::LoadBinding { .. }), "{text}");
+}
+
+#[test]
+fn a_captured_binding_is_read_at_its_activations_slot() {
+    // `c` lives in capt's own record (`get` captures it): LoadCap, at hops 0 from the running
+    // environment, its TDZ proven by the initialization before it in its block.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function capt(n) { let c = n + 1; function get() { return c; } return c * 2 + get(); }
+         for (var i = 0; i < 20; i++) capt(i);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "capt");
+    let text = dump(&graph, &chunk);
+    if !chunk.jit_fixed_activation() {
+        return; // activation plans off (TRUST_JS_NO_ACTIVATION_PLANS): LoadCap keeps its effect
+    }
+    let load = pc_of(&chunk, |op| matches!(op, Op::LoadCap(_)));
+    let address = static_address(&Snapshot::take(&chunk), load);
+    assert_eq!(address.hops, 0, "{text}");
+    let loads = nodes(&graph, |op| {
+        *op == NodeOp::LoadBinding { slot: address.slot }
+    });
+    assert_eq!(loads.len(), 1, "{text}");
+    assert_eq!(graph.node(loads[0].inputs[0]).op, NodeOp::Env, "{text}");
+    assert!(
+        nodes(&graph, is_effect)
+            .iter()
+            .all(|node| node.pc as usize != load),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_splices_static_reads_start_from_its_pinned_environments_holder() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function mk() { var base = 10; return function (v) { return v + base; }; }
+         var add = mk();
+         function caller(x) { return add(x); }
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(i); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "caller", "drive(150)") else {
+        return;
+    };
+    let graph = graph_for(&transformed, "caller's second stage");
+    let text = dump(&graph, &transformed);
+    let Some(&read) = name_reads(&transformed, "base").first() else {
+        panic!("add is spliced: {text}")
+    };
+    assert!(
+        matches!(transformed.jit_ops()[read], Op::LoadNameIn(..)),
+        "{text}"
+    );
+    // `add` makes no record: its [[Environment]], mk's activation, holds `base`.
+    let value = engine
+        .interp
+        .get_var("add", &engine.interp.global_env.clone())
+        .ok()
+        .expect("add");
+    let holder = match &value.as_obj().expect("a function").borrow().kind {
+        ObjectKind::User(user) => crate::interpreter::Env::as_ptr(&user.env) as u64,
+        _ => panic!("an author function"),
+    };
+    let snapshot = Snapshot::take(&transformed);
+    assert_eq!(
+        snapshot.name(read),
+        super::snapshot::NameView::Static {
+            address: static_address(&snapshot, read),
+            base: super::snapshot::Base::Holder(holder as usize),
+        },
+        "{text}"
+    );
+    let loads = nodes(&graph, |op| matches!(op, NodeOp::LoadBinding { .. }));
+    assert_eq!(loads.len(), 1, "{text}");
+    assert_eq!(
+        graph.node(loads[0].inputs[0]).op,
+        NodeOp::ConstEnv(holder),
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::Env), 0, "{text}");
+}

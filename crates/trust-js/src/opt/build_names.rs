@@ -1,0 +1,250 @@
+//! The builder's free names (P3 stage 2, step 4; the plan's "Step 4", its input
+//! target/p3/stage2/names-input.txt): every name operation was an effect; a static address
+//! (Decision 21's: closure variables, and a fixed activation's captured bindings) is now a walk of
+//! parent links and a slot's load, without a guard, as V8's context slots, SpiderMonkey's
+//! GetAliasedVar and JSC's GetClosureVar are read.
+//!
+//! - The running environment (`ctx.env_raw`, [`NodeOp::Env`]) is hoisted to the entry where no
+//!   operation of the chunk moves it (`moves_env`); otherwise it is read where a site first needs
+//!   it and forgotten at an operation that moves it, an effect. A call never moves its caller's.
+//! - A splice's static read (`Op::LoadNameIn`) starts from its pinned [[Environment]], its hops
+//!   folded at the compile into the holder record ([`NodeOp::ConstEnv`]; JSC's SkipScope on a
+//!   constant base, V8's constant context), alive while the splice's guard holds.
+//! - A lexical binding's word is checked not empty ([`NodeOp::CheckInitialized`], exiting with
+//!   Tdz), as SpiderMonkey's LexicalCheck and JSC's CheckNotEmpty: once checked, a (record, slot)
+//!   is initialized for the rest of the function, since a record's binding never returns to its
+//!   TDZ (a loop's fresh bindings are new records, which effects make).
+//! - Facts ([`Facts`]), as the exemplars' alias rules have them: parent links are value facts
+//!   within an activation (the one later write, class evaluation re-parenting its fresh outer
+//!   record, eval.rs's `eval_class_strict`, happens after its heritage and keys ran, when no
+//!   running activation's chain holds that record); an immutable binding's value is a value fact
+//!   once initialized (V8's loaded_context_constants_); a mutable one's a heap fact, reloaded
+//!   after an effect, as all three reload mutable slots. A store kills a slot's facts on every
+//!   record: a splice's folded holder and a chain from the running environment can name one
+//!   record.
+
+use super::*;
+use crate::bytecode::StaticName;
+use crate::fasthash::FastSet;
+use crate::opt::snapshot::{Base, NameView};
+
+/// Whether `op` can change the running environment (`ctx.env_raw`): the VM's operations that
+/// write it (`run_vm`'s `*env` stores, which `jit_vm_operation` and `jit_scope_op` copy back to
+/// the native frame), every one an effect in the tier.
+pub(super) fn moves_env(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::PushLex(_)
+            | Op::PushCatchLex(_)
+            | Op::CloneLex(_)
+            | Op::PopEnv
+            | Op::PushWith
+            | Op::ClassStart(..)
+            | Op::ClassHeritage(..)
+            | Op::ClassFinish(_)
+            | Op::ClassAbort(_)
+    )
+}
+
+/// The free names' facts a state holds (see the module's doc).
+#[derive(Clone, Default)]
+pub(super) struct Facts {
+    /// The running environment's node, in a chunk whose operations move it (in any other it is
+    /// hoisted), until such an operation.
+    running: Option<NodeIx>,
+    /// Value facts: each record's outer record, by the record's node.
+    parents: FastMap<NodeIx, NodeIx>,
+    /// Value facts: the lexical bindings known initialized, by (record, slot).
+    initialized: FastSet<(NodeIx, u16)>,
+    /// Value facts: the values of initialized immutable bindings, by (record, slot).
+    constants: FastMap<(NodeIx, u16), NodeIx>,
+    /// Heap facts: the values of mutable bindings loaded or stored in this effect epoch.
+    values: FastMap<(NodeIx, u16), NodeIx>,
+}
+
+impl Facts {
+    /// An effect ends the heap facts.
+    pub(super) fn clear_heap(&mut self) {
+        self.values.clear();
+    }
+
+    /// An operation moved the running environment: the records it reaches are other nodes from
+    /// now on, so no fact keyed on the old ones serves.
+    pub(super) fn moved(&mut self) {
+        *self = Facts::default();
+    }
+
+    /// The facts every predecessor holds.
+    pub(super) fn meet(preds: &[(BlockIx, State)]) -> Facts {
+        let (first, rest) = (&preds[0].1.names, &preds[1..]);
+        let others = || rest.iter().map(|(_, st)| &st.names);
+        Facts {
+            running: first
+                .running
+                .filter(|&env| others().all(|names| names.running == Some(env))),
+            parents: common(&first.parents, others().map(|names| &names.parents)),
+            initialized: first
+                .initialized
+                .iter()
+                .filter(|key| others().all(|names| names.initialized.contains(key)))
+                .copied()
+                .collect(),
+            constants: common(&first.constants, others().map(|names| &names.constants)),
+            values: common(&first.values, others().map(|names| &names.values)),
+        }
+    }
+
+    /// The facts a loop header keeps from its entry's (`meet`): no heap fact (opt/build.rs's
+    /// module doc), and no fact at all in a chunk whose operations move its environment, since a
+    /// back edge may come from another one (a `for (let ...)` loop's CloneLex).
+    pub(super) fn at_header(&self, moves_env: bool) -> Facts {
+        if moves_env {
+            return Facts::default();
+        }
+        Facts {
+            values: FastMap::default(),
+            ..self.clone()
+        }
+    }
+}
+
+/// The entries of `first` every map of `rest` holds alike.
+fn common<'a, K: Copy + Eq + std::hash::Hash + 'a>(
+    first: &FastMap<K, NodeIx>,
+    rest: impl Iterator<Item = &'a FastMap<K, NodeIx>> + Clone,
+) -> FastMap<K, NodeIx> {
+    first
+        .iter()
+        .filter(|(key, value)| rest.clone().all(|map| map.get(key) == Some(value)))
+        .map(|(&key, &value)| (key, value))
+        .collect()
+}
+
+impl Builder<'_> {
+    /// The running environment: hoisted where no operation of the chunk moves it.
+    fn running_env(&mut self, st: &mut State, pc: usize) -> NodeIx {
+        if !self.moves_env {
+            return self.hoist(Hoisted::Env);
+        }
+        if let Some(env) = st.names.running {
+            return env;
+        }
+        let env = self.add(NodeOp::Env, &[], Rep::Env, pc);
+        st.names.running = Some(env);
+        env
+    }
+
+    /// The record `hops` parent links from `record`, each link loaded once (a value fact).
+    fn walk(&mut self, st: &mut State, mut record: NodeIx, hops: u16, pc: usize) -> NodeIx {
+        for _ in 0..hops {
+            record = match st.names.parents.get(&record) {
+                Some(&parent) => parent,
+                None => {
+                    let parent = self.add(NodeOp::EnvParent, &[record], Rep::Env, pc);
+                    st.names.parents.insert(record, parent);
+                    parent
+                }
+            };
+        }
+        record
+    }
+
+    /// The record that holds the binding of a static address from `base`, None for a splice
+    /// whose holder the compile could not fold. A slot past a record's in-place slots is no
+    /// planned record's (they never spill): None as well.
+    fn static_record(
+        &mut self,
+        st: &mut State,
+        address: StaticName,
+        base: Base,
+        pc: usize,
+    ) -> Option<NodeIx> {
+        if usize::from(address.slot) >= crate::interpreter::MAX_INLINE_SLOTS {
+            return None;
+        }
+        match base {
+            Base::Running => {
+                let env = self.running_env(st, pc);
+                Some(self.walk(st, env, address.hops, pc))
+            }
+            Base::Holder(holder) => Some(self.hoist(Hoisted::ConstEnv(holder as u64))),
+            Base::Unknown => None,
+        }
+    }
+
+    /// The value of the binding at `slot` of `record`: a fact's, or loaded, its TDZ checked where
+    /// the binding is lexical and neither `known_initialized` nor proven so.
+    fn binding_value(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        record: NodeIx,
+        address: StaticName,
+        known_initialized: bool,
+    ) -> NodeIx {
+        let key = (record, address.slot);
+        if let Some(&value) = st
+            .names
+            .constants
+            .get(&key)
+            .or_else(|| st.names.values.get(&key))
+        {
+            return value;
+        }
+        let pc = cx.pc;
+        let value = self.add(
+            NodeOp::LoadBinding { slot: address.slot },
+            &[record],
+            Rep::Tagged,
+            pc,
+        );
+        if address.lexical {
+            if !known_initialized && !st.names.initialized.contains(&key) {
+                let state = self.before(cx, st);
+                self.add_exit(
+                    NodeOp::CheckInitialized,
+                    &[value],
+                    Rep::None,
+                    pc,
+                    state,
+                    ExitReason::Tdz,
+                );
+            }
+            st.names.initialized.insert(key);
+        }
+        if address.mutable {
+            st.names.values.insert(key, value);
+        } else {
+            st.names.constants.insert(key, value);
+        }
+        value
+    }
+
+    /// LoadName, LoadNameForCall (`for_call`: the constant undefined `this` below the value, as
+    /// all three exemplars call a free name; the `with` case never reaches the tier), their
+    /// splices' forms, and LoadCap: a static address's binding (see the module's doc); any other
+    /// site stays the effect.
+    pub(super) fn name_load(
+        &mut self,
+        pc: usize,
+        for_call: bool,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let NameView::Static { address, base } = self.snapshot.name(pc) else {
+            return self.effect(pc, st);
+        };
+        let Some(record) = self.static_record(st, address, base, pc) else {
+            return self.effect(pc, st);
+        };
+        // A captured binding checked earlier in the operation's block (`cap_tdz_known`).
+        let known = matches!(self.ops[pc], Op::LoadCap(_)) && self.chunk.jit_cap_initialized(pc);
+        let mut cx = Before::new(pc);
+        let value = self.binding_value(st, &mut cx, record, address, known);
+        if for_call {
+            let undefined = self.word(PACK_UNDEFINED);
+            st.stack.push(undefined);
+        }
+        st.stack.push(value);
+        Ok(())
+    }
+}

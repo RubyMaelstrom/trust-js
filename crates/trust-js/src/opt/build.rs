@@ -56,6 +56,9 @@ use crate::feedback::{NamedWayKind, ValueClass, ValuesView};
 use crate::jit_ir::{BlockId, BuildError, Cfg, InitializedReads};
 use crate::value::{PACK_BOOL, PACK_CANON_NAN, PACK_EMPTY, PACK_NULL, PACK_UNDEFINED};
 
+#[path = "build_names.rs"]
+mod names;
+
 const NUMBER: u32 = ValueClass::NumberInt32.bit() | ValueClass::NumberDouble.bit();
 const INT32: u32 = ValueClass::NumberInt32.bit();
 /// The most operations a chunk may have: compile_entry's limit (an operation's index fits one
@@ -576,6 +579,8 @@ struct State {
     typed_lengths: FastMap<NodeIx, NodeIx>,
     /// A view's elements' address, checked valid this effect epoch (for a store too).
     typed_data: FastMap<(NodeIx, bool), NodeIx>,
+    /// The free names' facts (stage 2, step 4), value and heap facts (see `names`).
+    names: names::Facts,
 }
 
 impl State {
@@ -583,6 +588,7 @@ impl State {
         self.shapes.clear();
         self.fields.clear();
         self.clear_elements();
+        self.names.clear_heap();
     }
 
     /// End the element heap facts (an effect, which may run any code).
@@ -667,6 +673,7 @@ fn meet(preds: &[(BlockIx, State)]) -> State {
         truncated,
         shapes,
         fields,
+        names: names::Facts::meet(preds),
         ..meet_elements(first, rest)
     }
 }
@@ -766,6 +773,10 @@ enum Hoisted {
     Bool(bool),
     This,
     Entry(u16),
+    /// The running environment, where no operation of the chunk moves it (stage 2, step 4).
+    Env,
+    /// A record known at the compile (a splice's folded holder).
+    ConstEnv(u64),
 }
 
 /// The state an operation's exits share: the frame state before the operation (its operands on
@@ -810,6 +821,8 @@ struct Builder<'a> {
     hoisted: FastMap<Hoisted, NodeIx>,
     /// The hoisted nodes in the order made, which head the entry block once it is built.
     hoisted_nodes: Vec<NodeIx>,
+    /// Whether an operation of the chunk moves its running environment (`names::moves_env`).
+    moves_env: bool,
 }
 
 impl<'a> Builder<'a> {
@@ -838,6 +851,7 @@ impl<'a> Builder<'a> {
             headers: (0..blocks).map(|_| None).collect(),
             hoisted: FastMap::default(),
             hoisted_nodes: Vec::new(),
+            moves_env: chunk.jit_ops().iter().any(names::moves_env),
         }
     }
 
@@ -991,6 +1005,8 @@ impl<'a> Builder<'a> {
             Hoisted::Bool(value) => (NodeOp::ConstBool(value), Rep::Bool),
             Hoisted::This => (NodeOp::This, Rep::Tagged),
             Hoisted::Entry(slot) => (NodeOp::EntrySlot(slot), Rep::Tagged),
+            Hoisted::Env => (NodeOp::Env, Rep::Env),
+            Hoisted::ConstEnv(address) => (NodeOp::ConstEnv(address), Rep::Env),
         };
         let entry = self.graph.entry.expect("the entry block is made first");
         let node = self.graph.add_node(entry, op, &[], rep, 0);
@@ -1067,7 +1083,8 @@ impl<'a> Builder<'a> {
             Rep::Cell => forms.cell = Some(value),
             // An address is no form of a value: it names storage the value's object owns.
             Rep::Ptr => {}
-            Rep::None => {}
+            // An environment is no language value (stage 2, step 4).
+            Rep::Env | Rep::None => {}
         }
         forms
     }
@@ -1635,6 +1652,7 @@ impl<'a> Builder<'a> {
             indices: met.indices,
             views: met.views,
             typed_lengths: met.typed_lengths,
+            names: met.names.at_header(self.moves_env),
             ..State::default()
         };
         let poll = self.frame_state(pc, &st);
@@ -1866,6 +1884,10 @@ impl<'a> Builder<'a> {
                 let slot = self.slot(pc, slot as usize)?;
                 self.to_prop_key(pc, Recv::Slot(slot), st)?
             }
+            Op::LoadName(..) | Op::LoadNameIn(..) | Op::LoadCap(_) => {
+                self.name_load(pc, false, st)?
+            }
+            Op::LoadNameForCall(..) | Op::LoadNameForCallIn(..) => self.name_load(pc, true, st)?,
             Op::Jump(target) => {
                 self.jump(pc, target as usize, std::mem::take(st))?;
                 return Ok(false);
@@ -1973,6 +1995,9 @@ impl<'a> Builder<'a> {
         }
         st.slots.fill(Slot::Frame);
         st.clear_heap();
+        if names::moves_env(&self.ops[pc]) {
+            st.names.moved();
+        }
         Ok(())
     }
 

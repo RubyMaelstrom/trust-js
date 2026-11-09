@@ -140,13 +140,6 @@ impl Snapshot {
     }
 
     /// The view of the free-name site at `pc` ([`NameView::None`] for any other operation).
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the builder lowers static addresses from step 4's (b)"
-        )
-    )]
     pub(crate) fn name(&self, pc: usize) -> NameView {
         self.names.get(pc).copied().unwrap_or(NameView::None)
     }

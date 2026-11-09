@@ -754,6 +754,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckShape(_) => ExitReason::WrongShape,
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
+        NodeOp::CheckInitialized => ExitReason::Tdz,
         NodeOp::I32Add | NodeOp::I32Sub | NodeOp::I32Mul | NodeOp::I32UShr => ExitReason::Overflow,
         NodeOp::CheckElements(_) => ExitReason::WrongElements,
         NodeOp::CheckIndex => ExitReason::NotInt32,
@@ -780,6 +781,8 @@ impl Gen<'_> {
             NodeOp::ConstF64(bits) => Value::Num(f64::from_bits(bits)).bits(),
             NodeOp::ConstI32(x) => Value::Num(f64::from(x)).bits(),
             NodeOp::ConstBool(b) => Value::Bool(b).bits(),
+            // No frame state holds an environment (verify.rs): its address as it is.
+            NodeOp::ConstEnv(address) => address,
             _ => unreachable!("a constant node"),
         }
     }
@@ -787,7 +790,7 @@ impl Gen<'_> {
     /// A constant node's bits in its own representation (what a register of its class holds).
     fn const_bits(&self, v: NodeIx) -> u64 {
         match self.graph.node(v).op {
-            NodeOp::ConstTagged(bits) | NodeOp::ConstF64(bits) => bits,
+            NodeOp::ConstTagged(bits) | NodeOp::ConstF64(bits) | NodeOp::ConstEnv(bits) => bits,
             NodeOp::ConstI32(x) => u64::from(x as u32),
             NodeOp::ConstBool(b) => u64::from(b),
             _ => unreachable!("a constant node"),
@@ -872,6 +875,7 @@ impl Gen<'_> {
                 scratch
             }
             Rep::Ptr => unreachable!("a frame state holds no address (verify.rs)"),
+            Rep::Env => unreachable!("a frame state holds no environment (verify.rs)"),
             Rep::None => unreachable!("a frame state holds values"),
         }
     }
@@ -1032,7 +1036,12 @@ impl Gen<'_> {
             | NodeOp::ConstF64(_)
             | NodeOp::ConstI32(_)
             | NodeOp::ConstBool(_)
+            | NodeOp::ConstEnv(_)
             | NodeOp::Phi => {}
+            NodeOp::Env
+            | NodeOp::EnvParent
+            | NodeOp::LoadBinding { .. }
+            | NodeOp::CheckInitialized => self.lower_name(n)?,
             NodeOp::EntrySlot(slot) | NodeOp::FrameSlot(slot) => {
                 if !unused {
                     let dst = self.gp_dst(n);
@@ -3171,6 +3180,9 @@ impl Gen<'_> {
         self.a.bind(proven);
     }
 }
+
+#[path = "a64_names.rs"]
+mod names;
 
 #[cfg(test)]
 #[path = "a64_tests.rs"]

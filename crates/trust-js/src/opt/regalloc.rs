@@ -50,6 +50,9 @@ pub(crate) fn class_of(rep: Rep) -> Option<Class> {
         // An address (P3 stage 2 step 2): in an x register like a cell, and a root only through
         // the owner's cell, which the node that reads the address also takes (Rep::Ptr).
         Rep::Ptr => Some(Class::Gp),
+        // An environment (stage 2 step 4) in an x register like a cell: a record the running
+        // activation's chain keeps alive, which the collector does not move (Rep::Env).
+        Rep::Env => Some(Class::Gp),
         Rep::F64 => Some(Class::Fp),
         Rep::None => None,
     }
@@ -59,7 +62,11 @@ pub(crate) fn class_of(rep: Rep) -> Option<Class> {
 pub(crate) fn rematerializable(op: &NodeOp) -> bool {
     matches!(
         op,
-        NodeOp::ConstTagged(_) | NodeOp::ConstF64(_) | NodeOp::ConstI32(_) | NodeOp::ConstBool(_)
+        NodeOp::ConstTagged(_)
+            | NodeOp::ConstF64(_)
+            | NodeOp::ConstI32(_)
+            | NodeOp::ConstBool(_)
+            | NodeOp::ConstEnv(_)
     )
 }
 

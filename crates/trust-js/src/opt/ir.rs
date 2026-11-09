@@ -61,6 +61,12 @@ pub(crate) enum Rep {
     /// cell that lives as long as its typed array, so its address may (the collector moves
     /// nothing).
     Ptr,
+    /// An Environment Record's address (`Env::as_ptr`, stage 2 step 4), in an x register. Records
+    /// never move and the running activation's chain keeps every record it reaches alive, so an
+    /// environment lives across effects within an activation (a value fact, unlike step 2's
+    /// addresses inside an object's storage); it is no language value, so no frame state, phi or
+    /// exit recipe holds one.
+    Env,
     /// No value: stores, flushes, terminators.
     None,
 }
@@ -456,6 +462,26 @@ pub(crate) enum NodeOp {
     /// stub and the words, as the template dispatches (jit.rs emit_get_elem_inline).
     IsTypedArray,
 
+    // Free names (stage 2, step 4): Decision 21's static addresses, as V8's context slots,
+    // SpiderMonkey's aliased variables and JSC's closure variables are read.
+    /// -> Env: the running environment (`ctx.env_raw`). Maglev's GetContext.
+    Env,
+    /// Env -> Env: a record's outer record, one load of its parent field. Maglev's PREVIOUS
+    /// load, Warp's MEnclosingEnvironment, JSC's SkipScope.
+    EnvParent,
+    /// -> Env: a record known at the compile (a splice's holder, folded from its pinned
+    /// [[Environment]]), alive while the splice's guard holds.
+    ConstEnv(u64),
+    /// Env -> Tagged: the binding at `slot` of the record, in place after its header (planned
+    /// records never spill); the empty word while a lexical binding is in its TDZ. Maglev's
+    /// LoadContextSlot, Warp's MLoadFixedSlot, JSC's GetClosureVar.
+    LoadBinding {
+        slot: u16,
+    },
+    /// (Tagged): exits [Tdz] when the word is the empty one, a binding in its TDZ. Warp's
+    /// MLexicalCheck, JSC's CheckNotEmpty.
+    CheckInitialized,
+
     // Safepoints.
     /// A loop header's interrupt and collection poll, the first node of every loop header's
     /// body (after its phis), where the first stage polls at a backward branch's target. Its
@@ -508,6 +534,7 @@ impl NodeOp {
                 | NodeOp::CheckShape(_)
                 | NodeOp::CheckBoolean
                 | NodeOp::CheckCallee { .. }
+                | NodeOp::CheckInitialized
                 | NodeOp::I32Add
                 | NodeOp::I32Sub
                 | NodeOp::I32Mul
