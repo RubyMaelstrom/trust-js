@@ -871,6 +871,13 @@ Steps:
    of the list (allocation in line, closures, strings through helpers, natives through their
    entries, exceptions by exit with the in-place resume, `arguments` and rest elided where proven,
    getters and setters as calls, dependencies with invalidation points).
+6. Untagged phis, pulled forward from stage 4 (added 2026-11-09, below; input
+   target/p3/stage2/phis-input.txt): instruction counts of main at 9d74051a with the tier on
+   against off put Crypto at +43.7%, all of it am3's loop, which the template's second stage runs
+   in 69 instructions per iteration with its loop-carried numbers unboxed and the tier in 172-177
+   with them boxed and checked each iteration; stage 2's performance bar cannot be met with every
+   phi tagged. After step 4, whose loop prepass change it builds on; step 5's session confirms the
+   order.
 
 Stage 2's exit (the owner's, 2026-11-09: stage 1's bars carried): stage 1's gates in the tier's
 three configurations; coverage, the tier's code taking at least 80% of the time spent in
@@ -1198,3 +1205,63 @@ against 4.6% today and 9.7% with names alone. Per class, the exemplars' form:
   configurable global; a function of another realm reading its own globals; typed arrays bound to
   a global and to a module variable, with step 2; sites that first run after the compile; the
   difftest corpus seeded with the same.
+
+Step 6, untagged phis (design, 2026-11-09, pulled forward from stage 4's untagging; input
+target/p3/stage2/phis-input.txt, which cites the code and the exemplars line by line, with its runs
+in target/p3/stage2/phis-research). The builder makes every phi Tagged and boxes every dirty value
+before every terminator, so a loop-carried int32 costs 7 instructions per iteration (its boxing at
+the back edge, a CheckNumber and a CheckInt32 at its first use), 11 when it is also an index; the
+back end, the allocator's classes, the edge moves, the exit recipes and the verifier already take
+I32 and F64 phis. The template's loop chains keep counters int32 in x registers and the rest f64
+behind proofs made once per loop entry. Per the exemplars:
+- Structure: Maglev's, a selection pass between the build and the verifier over every phi, loop
+  headers and forward joins, rewriting inputs, uses and back edges (maglev-phi-representation-
+  selector.cc); the builder keeps making tagged phis, its facts unchanged.
+- The rule: SpiderMonkey's, from inputs alone (TypeAnalyzer, jit/IonAnalysis.cpp): all inputs
+  int32, I32; int32 and f64, F64; anything else, Tagged; inputs only widen (an int32 input of an
+  F64 phi converted at its predecessor's end), never a checked narrowing (Maglev's deopt-loop
+  rule). Maglev also keeps tagged a Float64-input phi with int32 or tagged uses, for Smis and
+  HeapNumbers, which TRust lacks (Decision 5): its tagged phi is its costliest form.
+- Liveness: loop phis only for slots live at the header and written in the loop, as Maglev and
+  JSC prune by liveness and Ion eliminates unobservable phis; a template that may read any slot
+  counts as reading all, and a try region's handlers keep the slots they read; a dead slot is
+  Dead in frame states.
+- Edges: values cross single-predecessor edges in their representation; words only for phis that
+  stay tagged and for tagged uses (a retagging per block, Maglev's EnsurePhiTagged); a phi input's
+  forms at its predecessor's end are recorded for the selector (Maglev's alternatives).
+- A tagged input on a loop's entry edge (a parameter, a reload, a load) of a phi with numeric uses
+  in its loop and untagged other inputs: CheckNumber, and CheckInt32 for an I32 phi, at the end of
+  the entry predecessor, exiting at the header's pc with two new reasons, PhiNotNumber and
+  PhiNotInt32, whose flags decline the speculation at that header (to F64, or tagged). One check
+  per loop entry, the steady-state code of V8's peeled loops and JSC's checks at entry; Maglev keeps
+  hoisted untagging experimental for want of a back-off, which the exit profile is. No speculation
+  on back edges or at forward joins (Maglev's default outside peeled loops).
+- Overflow: an I32 phi's increment keeps its Overflow exit; the decline's f64 arithmetic widens the
+  phi to F64 at the recompile, as V8's feedback, SpiderMonkey's IC and JSC's makeSafe do. No Int52:
+  f64 holds the integers below 2^53 exactly. No truncated-int32 phis (V8's Turbolev only).
+- Allocation: the builder's block order (a loop's body after its header, its exit code after the
+  body) and Maglev's loop-phi register hint for the back-edge input.
+- Not in this step: Bool and Cell phis (SpiderMonkey's and JSC's; no measured loop carries them
+  hot), loop peeling, Maglev's truncation of int32 additions whose every use truncates (Mandreel's
+  Overflow exits), immediate operands in the back end's arithmetic (12 of am3's instructions per
+  iteration), loop-invariant checks hoisted (LICM) and range analysis.
+- Departures, each for a missing precondition: (1) the representation from inputs alone (above);
+  (2) the hoisted entry check by default where V8 peels (the precondition: peeling); (3) flags per
+  loop header, not per phi (a profile key per header and slot); (4) no back-edge speculation (V8
+  checks peeled loops' back edges).
+- Estimate (Crypto's counted run, from am3's classified loop): +43.7% against the tier off to
+  about +29% with untagged phis, +25% with liveness, +22% with the block order and hints, +9% with
+  step 4's prepass fix; zlib and Mandreel about +1% and +3% before names are lowered.
+- Order: (a) the allocator's block order and hints; (b) liveness and Dead slots; (c) words for phi
+  inputs only, the inputs' forms recorded, StoreSlot and effect operands widened; (d) the selection
+  pass; (e) the entry checks, their reasons, flags and declines; (f) the counts again.
+- Tests: the builder's graphs (am3's counters I32 with no check in the loop and its dead slots
+  without phis; an F64 accumulator; a forward join of int32 and f64; undefined keeping a phi tagged;
+  a self back edge; an inner join feeding a loop phi; a loop with a call, its phis in callee-saved
+  registers; retaggings; ToBoolean of untagged phis; each decline; the verifier's refusals). End to
+  end with the tier eager, exits forced, TRUST_JS_OPT_EXIT_LIMIT=1 and TRUST_JS_JIT_NO_JSCVT: a
+  counter passing 2^31 (the exit, then the F64 phi; 2^53 exact); a loop entered with a double and
+  with a string where int32s were seen; -0 and NaN through an F64 phi; a swap of two f64 locals;
+  exits at the poll and at every check with phis in registers and spill slots; a catch reading a
+  loop variable; GC stress; Test262's for, while, do-while, update and compound assignment tests in
+  the four configurations; the difftest corpus seeded with the same.
