@@ -4179,6 +4179,10 @@ pub(super) fn emit(
                 let poll = a.new_label();
                 exits.push((poll, target));
                 emit_region_poll_guard(a, poll, true);
+                // A back edge: one iteration toward the chunk's checkpoint (P3 stage 2, step
+                // 8). Only the homes (d8..d15) are live: the edge's operands are canonical. A
+                // bail at the guard counts at the canonical header instead.
+                emit_loop_count(a);
             }
             a.b(to);
         } else {

@@ -10,14 +10,20 @@
 //! whose feedback has settled, or the last, the tier compiles the chunk again (`reoptimize`),
 //! declining what the profile flagged, and its code replaces the template JIT's. Departures from
 //! point 12, each for a precondition TRust lacks yet: the recompile takes the same chunk again
-//! (a second stage is set once; another splicing is stage 3's); the warm-up counts native entries
-//! where JSC also weighs iterations; the limit for an exited frame that then loops hot (5 x 2^R)
-//! waits for stage 5's back-edge counters; and a discard whose exits were all unfixable (throws,
-//! unsupported operations) arms no recompile, which would build the same code, as SpiderMonkey
-//! disables Ion for frequent unfixable bailouts (jit/IonScript.h:336-341), until the in-place
-//! resume takes exceptions out of the count. Each discard and each recompile moves the call
-//! caches' global epoch, where the exemplars reach only the replaced code's callers; the log
-//! counts the moves.
+//! (a second stage is set once; another splicing is stage 3's); the limit for an exited frame
+//! that then loops hot (5 x 2^R) stays with stage 5, since the exited frame finishes in the VM,
+//! whose loops count nothing; and a discard whose exits were all unfixable (throws, unsupported
+//! operations) arms no recompile, which would build the same code, as SpiderMonkey disables Ion
+//! for frequent unfixable bailouts (jit/IonScript.h:336-341), until the in-place resume takes
+//! exceptions out of the count. Each discard and each recompile moves the call caches' global
+//! epoch, where the exemplars reach only the replaced code's callers; the log counts the moves.
+//!
+//! The checkpoints count loop iterations as well as native entries (stage 2, step 8): with the
+//! tier on, each loop iteration of template code (a first stage's, a discarded code's fallback)
+//! counts as one native run toward its chunk's checkpoint word while a checkpoint or a warm-up is
+//! pending (`counts_loops`, `jit::emit_loop_count`), as SpiderMonkey's warm-up counter counts a
+//! loop head as an entry (emit_LoopHead, jit/BaselineCodeGen.cpp:2603-2614), and the next native
+//! entry takes the checkpoint; transfer into a running loop is OSR, stage 5's.
 
 use super::exit::{ExitRecord, ExitTable};
 use super::ir::{ExitReason, Refusal};
@@ -41,6 +47,8 @@ pub(crate) struct TestSwitches {
     pub(crate) no_exit_profile: bool,
     /// The base exit limit; 0: the default ([`EXIT_LIMIT`]).
     pub(crate) exit_limit: u32,
+    /// TRUST_JS_OPT_NO_LOOP_COUNT: template code's loop iterations count toward no checkpoint.
+    pub(crate) no_loop_count: bool,
 }
 
 #[cfg(test)]
@@ -154,6 +162,23 @@ pub(crate) fn exit_limit_base() -> u32 {
 /// exitCountThresholdForReoptimization, bytecode/CodeBlock.cpp:2738-2771).
 pub(crate) const EXIT_LIMIT: u32 = 100;
 
+/// TRUST_JS_OPT_NO_LOOP_COUNT: template code's loop iterations count toward no checkpoint, which
+/// then count native entries alone, as before stage 2's step 8 (for comparisons).
+pub(crate) fn no_loop_count() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = test_switches() {
+        return switches.no_loop_count;
+    }
+    env_flag!("TRUST_JS_OPT_NO_LOOP_COUNT")
+}
+
+/// Whether the template JIT's code, compiled now, counts its loop iterations toward its chunk's
+/// checkpoints (stage 2, step 8; see the module's doc): with the tier on, unless
+/// TRUST_JS_OPT_NO_LOOP_COUNT. Tier-off code counts nothing and is emitted as before.
+pub(crate) fn counts_loops() -> bool {
+    enabled() && !no_loop_count()
+}
+
 /// The exits past which the tier's code for `chunk`, compiled now, is discarded: the base limit
 /// << R, R the function's discards so far (on its first stage), so that each discard doubles
 /// the next code's limit.
@@ -164,7 +189,8 @@ pub(crate) fn exit_limit(chunk: &Chunk) -> u32 {
 
 /// The warm-up's first distance in native runs at R = 0; each later one is four times the last
 /// ((100, 400, 1,600, 6,400) << R), the second stage's own schedule
-/// (`Chunk::advance_inline_feedback`) doubled at each discard.
+/// (`Chunk::advance_inline_feedback`) doubled at each discard. A native run is an entry or, in
+/// the fallback's template code, a loop iteration (`counts_loops`).
 const WARM_UP: u32 = 100;
 /// The warm-up's checkpoints, the last compiling whatever its fingerprint says.
 const WARM_UP_CHECKPOINTS: u8 = 4;

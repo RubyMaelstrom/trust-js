@@ -199,6 +199,7 @@ pub(crate) fn pin_forced_exits_off_for_test() {
         no_reopt: no_reopt(),
         no_exit_profile: no_exit_profile(),
         exit_limit: exit_limit_base(),
+        no_loop_count: no_loop_count(),
     }
     .set();
 }

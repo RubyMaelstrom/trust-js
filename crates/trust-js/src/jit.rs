@@ -2922,6 +2922,12 @@ mod asm {
         /// The local reads whose slot surely holds a value (`Cfg::initialized_reads`): their
         /// TDZ test is dead. Empty in loose test assemblies, which keep every test.
         initialized_reads: crate::jit_ir::InitializedReads,
+        /// The byte offsets of `Chunk::jit_runs` and `Chunk::inline_retry_at` where the code
+        /// counts its loop iterations toward its chunk's checkpoints (P3 stage 2, step 8; see
+        /// `super::emit_loop_count`): a chunk's template code with the optimizing tier on. None
+        /// in code that counts nothing: the tier off, `TRUST_JS_OPT_NO_LOOP_COUNT`, the tier's
+        /// own code and loose test assemblies.
+        loop_counts: Option<(u32, u32)>,
     }
 
     #[derive(Clone, Copy)]
@@ -2968,6 +2974,7 @@ mod asm {
                 failed: None,
                 fixed_activation: false,
                 initialized_reads: Default::default(),
+                loop_counts: None,
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3048,6 +3055,14 @@ mod asm {
         }
         pub fn fixed_activation(&self) -> bool {
             self.fixed_activation
+        }
+        /// Declare that the code emitted from here on counts its loop iterations, `runs` and
+        /// `retry` being the chunk's offsets (see the `loop_counts` field).
+        pub fn set_loop_counts(&mut self, runs: u32, retry: u32) {
+            self.loop_counts = Some((runs, retry));
+        }
+        pub fn loop_counts(&self) -> Option<(u32, u32)> {
+            self.loop_counts
         }
         /// Declare the local reads whose TDZ test is dead (see `Cfg::initialized_reads`).
         pub(crate) fn set_initialized_reads(&mut self, reads: crate::jit_ir::InitializedReads) {
@@ -5515,6 +5530,19 @@ fn compile_entry(
     a.set_first_stage(!chunk.jit_second_stage());
     // A borrowed frame's activation may be another tier's, without the plan's fixed slots.
     a.set_fixed_activation(!borrowed_entry && chunk.jit_fixed_activation());
+    // P3 stage 2, step 8: with the optimizing tier on, the code's loop iterations count toward
+    // its chunk's checkpoints (`emit_loop_count`); the tier off, it is emitted as before.
+    if crate::opt::counts_loops() {
+        let (runs, retry) = (chunk.jit_runs_off(), chunk.jit_inline_retry_at_off());
+        let fits4 = |offset: usize| offset & 3 == 0 && offset / 4 < 4096;
+        debug_assert!(
+            fits4(runs) && fits4(retry),
+            "one LDR (32-bit) reaches each word"
+        );
+        if fits4(runs) && fits4(retry) {
+            a.set_loop_counts(runs as u32, retry as u32);
+        }
+    }
     // The local reads that need no TDZ test (`TRUST_JS_JIT_NO_TDZ_PROOF` keeps every test).
     if !env_flag!("TRUST_JS_JIT_NO_TDZ_PROOF") {
         a.set_initialized_reads(cfg.initialized_reads(ops, !borrowed_entry));
@@ -5639,6 +5667,9 @@ fn compile_entry(
         a.set_hot(in_loop[pc]);
         if interrupt_targets[pc] {
             emit_interrupt_poll(&mut a, POLL_LOOP, l_unwind);
+            // Every iteration of a loop run in canonical code passes here, as SpiderMonkey's
+            // LoopHead: one native run toward the chunk's checkpoint (P3 stage 2, step 8).
+            emit_loop_count(&mut a);
         }
         if skip > 0 {
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
@@ -21411,6 +21442,9 @@ fn emit_linked_scan_region(
     a.mov(0, 15);
     a.movz(8, 1, 0);
     emit_region_poll_guard(a, fail, false);
+    // The back edge: one iteration toward the chunk's checkpoint (P3 stage 2, step 8); x0 and x8
+    // stay live.
+    emit_loop_count(a);
     a.b(body);
 
     a.bind(found_null);
@@ -22449,16 +22483,21 @@ fn emit_loop_chain(
             emit_exec_number_store(a, d, 22, s.off as i32, 9);
         }
     };
+    // The iterations the countdown ran count toward the chunk's checkpoint at each path out of
+    // the loop after its first pass (P3 stage 2, step 8), before x28 is restored; the first
+    // pass's exit (`exit_a`) and the preamble's (`pre_fail`) ran none.
     a.bind(exit_a);
     emit_flush(a, &cond_virgins);
     restore_ext(a);
     a.b(pc_labels[plan.exit_pc]);
     a.bind(exit_b);
     emit_flush(a, &all_virgins);
+    emit_loop_count_countdown(a, 28);
     restore_ext(a);
     a.b(pc_labels[plan.exit_pc]);
     a.bind(poll_bail);
     emit_flush(a, &all_virgins);
+    emit_loop_count_countdown(a, 28);
     // The canonical header polls the word, with every root materialized, and re-enters.
     restore_ext(a);
     a.b(pc_labels[plan.head]);
@@ -22492,6 +22531,7 @@ fn emit_loop_chain(
             a.add_imm(20, 20, 8);
         }
         emit_flush(a, &seen);
+        emit_loop_count_countdown(a, 28);
         restore_ext(a);
         let pc = plan.chain[idx].1;
         if pc == plan.head {
@@ -22777,7 +22817,82 @@ fn emit_interrupt_poll(a: &mut asm::Asm, kind: u32, l_unwind: usize) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_region_poll_start(a: &mut asm::Asm, counter: u32) {
-    a.movz(counter, 16384, 0);
+    a.movz(counter, REGION_POLL_COUNTDOWN, 0);
+}
+
+/// The iterations a helper-free region runs between two polls of the word (see
+/// [`emit_region_poll_start`]).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const REGION_POLL_COUNTDOWN: u32 = 16384;
+
+/// One loop iteration of template code, counted as a native run toward its chunk's checkpoint
+/// (P3 stage 2, step 8; the plan's "Step 8, back edges counted toward the checkpoints"), where
+/// the code counts its loops (`Asm::loop_counts`: the optimizing tier on): the running record's
+/// chunk (`JitCtx::chunk`) adds one to `Chunk::jit_runs` while its checkpoint word
+/// (`Chunk::inline_retry_at`: the second stage's next checkpoint, or a discard's warm-up) is
+/// nonzero and the run would not reach it, as a direct entry counts (the retry gate of
+/// [`emit_direct_sequence`]). A due checkpoint is left to the next native entry's gate, which
+/// takes it as ever: without OSR the function gets new code at its next entry. The count so
+/// saturates one below the word, where the gate's 32-bit `runs + 1` cannot wrap. SpiderMonkey's
+/// baseline code counts a loop head as an entry, after the loop's interrupt check (emit_LoopHead,
+/// jit/BaselineCodeGen.cpp:2603-2614; emitWarmUpCounterIncrement, 1679-1712). Three
+/// instructions while no checkpoint is pending, eight while one is; it writes x9, x16 and x17,
+/// which every site leaves free after its poll. The word is read through the record, so a
+/// shared stub could hold this code (it embeds no address).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_loop_count(a: &mut asm::Asm) {
+    let Some((runs, retry)) = a.loop_counts() else {
+        return;
+    };
+    let done = a.new_label();
+    a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
+    a.ldr_w_imm(17, 16, retry);
+    a.cbz(17, false, done);
+    a.ldr_w_imm(9, 16, runs);
+    // 64-bit: a word at u32::MAX (an entry's own saturation) adds no wrap.
+    a.add_imm(9, 9, 1);
+    a.cmp_reg_x(9, 17);
+    a.b_cond(C_HS, done);
+    a.str_w_imm(9, 16, runs);
+    a.bind(done);
+}
+
+/// The iterations a helper-free region's countdown ran ([`REGION_POLL_COUNTDOWN`] less
+/// `counter`, which [`emit_region_poll_start`] started), counted as [`emit_loop_count`] counts
+/// one: the running chunk's runs grow by them, up to one below its checkpoint word, while a
+/// checkpoint is pending and not yet due. At each of the region's polls and exits, where its
+/// loop has ended: nothing in the loop itself. Writes x9, x10, x16 and x17.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_loop_count_countdown(a: &mut asm::Asm, counter: u32) {
+    let Some((runs, retry)) = a.loop_counts() else {
+        return;
+    };
+    let done = a.new_label();
+    a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
+    a.ldr_w_imm(17, 16, retry);
+    a.cbz(17, false, done);
+    a.ldr_w_imm(9, 16, runs);
+    // x17 = the most the loops count to, one below the word; a due checkpoint counts nothing.
+    a.sub_imm(17, 17, 1);
+    a.cmp_reg_x(9, 17);
+    a.b_cond(C_HS, done);
+    // The countdown's register is a W register's zero extension (MOVZ, SUBS W).
+    a.movz(10, REGION_POLL_COUNTDOWN, 0);
+    a.sub_reg(10, 10, counter);
+    a.add_shifted(9, 9, 10, 0);
+    a.cmp_reg_x(9, 17);
+    a.csel_x(9, 9, 17, C_LO);
+    a.str_w_imm(9, 16, runs);
+    a.bind(done);
 }
 
 /// A region's back-edge poll: a set word bails to `bail`, whose canonical code reaches the

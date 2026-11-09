@@ -74,7 +74,12 @@ comment/example in the same change.
   the block for NeverRan, an f64 loop phi for PhiNotInt32 and a tagged one for PhiNotNumber,
   the two exits of a loop's entry check of a word entering an untagged phi, at its header). A
   discard whose exits were all throws or unsupported operations arms no recompile. Each discard
-  and each recompile moves the call caches' epoch. Under
+  and each recompile moves the call caches' epoch. With the tier on, a native run is a native
+  entry or a loop iteration of template code (a first stage's, a discarded code's fallback):
+  each iteration counts toward its chunk's pending checkpoint or warm-up, up to one below it,
+  and the next native entry takes the checkpoint (SpiderMonkey's warm-up counter counts loop
+  heads as entries); `TRUST_JS_OPT_NO_LOOP_COUNT=1` counts native entries alone, as with the
+  tier off, whose code counts no iteration. Under
   `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, a recompile's too, without
   waiting for the feedback to settle (the eager gate: V8's `--stress-maglev`).
   `TRUST_JS_OPT_EXIT_EVERY=N` compiles every check and effect of the tier's code with a
