@@ -1768,3 +1768,34 @@ stub there); an ExecutableBuffer remembers where its pages came from.
   reaches it, however recent the free; a full Octane run commits 34,104 pages in 4,930 commits
   (13% of the region), so the first wrap comes after about seven Octane runs in one process. The
   1 GiB reservation counts against address-space limits (a process under one maps its own).
+
+Step 10 landed (4d34bdb8..a38b3dd8, 2026-11-10). (1) driver::verifies: the verifier runs where
+cfg!(any(test, debug_assertions)) holds or TRUST_JS_OPT_VERIFY is set (to any value, as the
+tier's other switches), documented in DIAGNOSTICS.md; a rejected graph still panics in tests and
+debug builds and is refused in release. (2) build::build returns Built { graph, cfg, initialized
+}, which verify and a64::compile take, the code generator keeping a reference
+(TRUST_JS_JIT_NO_TDZ_PROOF as before); tests on hand-built graphs make the chunk's Cfg in a
+helper. (3) The allocator: bit-mask register pools with the same lowest-register choice, each
+frame state's values and each edge's phi inputs listed once, flat bit sets with reused scratch,
+flat sorted next-use lists, no allocation in the passes; live_at reads an index (ranges sorted by
+start with a tree of their latest ends, built at the first query), and the old scan stays as the
+tests' reference (live_at_scan), which assert_consistent compares with the index at every node of
+every graph the allocator's and back end's tests allocate.
+- Code identical: masked code hashes (setarch -R), main against the step: Djot 39 compiles (38
+  and a refusal), React 9, Vue 38 (36 and 2 refusals), Richards' 400 fixed runs 25, Crypto's 40
+  fixed runs 38, the tier's 155 module tests one thread 426: each sequence identical, outputs
+  equal. Release under TRUST_JS_OPT_VERIFY=1: the fixtures, Richards and Crypto verify every graph
+  with no failure, the same compiles and refusals, the same outputs.
+- Compile cost (generate's user counts a run, medians, CPU 8; target/p3/stage2/step10-impl):
+  Djot 48.58M instructions and 19.28M cycles against 33.94M and 14.82M (-30.1%, -23.1%; 20 runs),
+  React 5.87M and 2.50M against 4.16M and 1.97M (-29.2%, -21.1%; 40), Vue 14.76M and 6.50M against
+  10.16M and 5.01M (-31.2%, -23.0%; 10); min-max ranges apart.
+- Tests: the library's suites with the tier off and on eager (3,123 each, 10 ignored), the
+  tier's tests eager with exits every 7 and an exit limit of 1 (237 each), the poll and Agent
+  tests with the tier on (51), five new tests (the switch's four cases; every graph the tests
+  compile verified; the build's Cfg and initialized reads equal fresh ones at every pc; the
+  allocator on a hand-built graph with spills, callee-saved values, a loop and an effect, and on
+  every PROGRAMS function), clippy as main, fmt clean. On zombie (x86-64): the check with tests,
+  clippy and Windows' check clean (date.rs's 20 warnings), the library's suite passes (2,765).
+  Combined with step 9 (rebased): the tier's module tests and the region's (160) on Crystal, and
+  zombie's x86-64 check with tests and Windows' check, clean.
