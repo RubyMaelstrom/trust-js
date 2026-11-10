@@ -41,8 +41,9 @@
 
 use super::exit::{ExitRecord, ExitTable};
 use super::ir::{ExitReason, Refusal};
+use super::job::{self, Compiled, Finished, Job, Outcome};
 use super::profile::{self, ChunkProfile};
-use super::{a64, build, snapshot, verify};
+use super::{a64, snapshot};
 use crate::bytecode::Chunk;
 use crate::interpreter::Interp;
 use crate::jit::JitCode;
@@ -98,6 +99,10 @@ impl TestSwitches {
 
 #[cfg(test)]
 fn test_switches() -> Option<TestSwitches> {
+    debug_assert!(
+        !crate::jit::off_main_compile(),
+        "a compile off the main thread reads no test switch (they are the main thread's)"
+    );
     TEST_SWITCHES.with(std::cell::Cell::get)
 }
 
@@ -411,122 +416,267 @@ fn name(chunk: &Chunk) -> String {
     format!("fn({})", names.join(","))
 }
 
-/// The tier's code for `chunk`: its snapshot (the exit profile's declines among its feedback),
-/// its graph, the graph's verification where the build verifies (`verifies`), the ARM64 code.
-/// A chunk over the size limit (`MAX_OPTIMIZED_OPS`) is refused first. Logs the compile with its
-/// time and code range, each decline, or the refusal with its reason and pc, under
-/// TRUST_JS_OPT_LOG; a graph the verifier rejects is the builder's bug, which panics in tests and
-/// debug builds and is refused otherwise.
-fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
+/// The tier's code for `chunk`, compiled now (P3 stage 2, step 12's three parts, run in a row):
+/// the main thread's preparation (`prepare`: the snapshot, its exit profile's declines among its
+/// feedback, and the chunk's frozen view), the compile (`opt::job`: its graph, the graph's
+/// verification where the build verifies (`verifies`), the ARM64 code), and the main thread's
+/// link of the code (`finish`). A chunk over the size limit (`MAX_OPTIMIZED_OPS`) is refused
+/// first. Logs the compile with its time and code range, each decline, or the refusal with its
+/// reason and pc, under TRUST_JS_OPT_LOG, and the preparation as a main-thread part; a graph the
+/// verifier rejects is the builder's bug, which panics in tests and debug builds and is refused
+/// otherwise. With the code, the timer of its install, which the caller ends (`log_main_thread`'s
+/// `install`).
+fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::time::Instant>)> {
     let started = std::time::Instant::now();
-    let compiled = (|| {
-        // V8's size limit, before any work (stage 2, step 11).
-        if chunk.jit_ops().len() > MAX_OPTIMIZED_OPS {
-            return Err(Refusal::whole("over the size limit"));
-        }
-        // The global names resolve in the running realm (stage 2, step 4).
-        let snapshot = snapshot::Snapshot::take_in(chunk, Some(&*i));
-        // The graph, and the chunk's Cfg and initialized reads, made once for the verifier and
-        // the back end too.
-        let build::Built {
-            graph,
-            cfg,
-            initialized,
-        } = build::build(chunk, &snapshot)?;
-        if log_enabled() {
-            for decline in &graph.declines {
-                eprintln!(
-                    "[opt] declined {} pc {} {:?}: {}",
-                    name(chunk),
-                    decline.pc,
-                    decline.reason,
-                    decline.form
-                );
-            }
-        }
-        if verifies() {
-            #[cfg(test)]
-            TEST_VERIFIED.with(|verified| verified.set(verified.get() + 1));
-            if let Err(message) = verify::verify(&graph, chunk, &cfg) {
-                if cfg!(any(test, debug_assertions)) {
-                    panic!(
-                        "the tier's graph of {} fails verification: {message}",
-                        name(chunk)
-                    );
-                }
-                if log_enabled() {
-                    eprintln!("[opt] verify {} failed: {message}", name(chunk));
-                }
-                return Err(Refusal::whole("the graph fails verification"));
-            }
-        }
-        let layout = *i
-            .jit_layout
-            .get_or_init(|| crate::value::jit_layout(&i.object_proto));
-        if !i.interp_layout.get().valid {
-            let layout = crate::interpreter::interp_layout(i);
-            i.interp_layout.set(layout);
-        }
-        if !crate::jit::ensure_executable_capacity(0) {
-            return Err(Refusal::whole("no executable capacity"));
-        }
-        let code = a64::compile(
-            chunk,
-            &graph,
-            &cfg,
-            initialized,
-            &layout,
-            &i.interp_layout.get(),
-        )?;
-        pin_global_environment(i, &graph);
-        Ok((graph.nodes.len(), code))
-    })();
-    let elapsed = started.elapsed();
-    match compiled {
-        Ok((nodes, code)) => {
-            if log_enabled() {
-                eprintln!(
-                    "[opt] compiled {} ({} ops, {nodes} nodes, {} bytes) in {:.3} ms \
-                     at {:#x} {:#x}",
-                    name(chunk),
-                    chunk.jit_ops().len(),
-                    code.code_bytes(),
-                    elapsed.as_secs_f64() * 1e3,
-                    code.mem_ptr() as usize,
-                    code.code_bytes()
-                );
-            }
-            #[cfg(test)]
-            TEST_COMPILED
-                .with(|compiled| compiled.borrow_mut().push(chunk as *const Chunk as usize));
-            Some(code)
-        }
+    let timer = main_thread_timer();
+    let (job, pin) = match prepare(i, chunk, compiles_on_another_thread()) {
+        Ok(prepared) => prepared,
         Err(refusal) => {
-            #[cfg(test)]
-            TEST_REFUSED.with(|refused| {
-                refused
-                    .borrow_mut()
-                    .push((chunk as *const Chunk as usize, refusal.reason))
-            });
-            if log_enabled() {
-                match refusal.pc {
-                    Some(pc) => eprintln!(
-                        "[opt] refused {} at pc {pc}: {} ({:.3} ms)",
-                        name(chunk),
-                        refusal.reason,
-                        elapsed.as_secs_f64() * 1e3
-                    ),
-                    None => eprintln!(
-                        "[opt] refused {}: {} ({:.3} ms)",
-                        name(chunk),
-                        refusal.reason,
-                        elapsed.as_secs_f64() * 1e3
-                    ),
-                }
-            }
-            None
+            note_refusal(chunk, &refusal, started.elapsed());
+            return None;
+        }
+    };
+    log_main_thread("snapshot", chunk, timer);
+    let finished = run_here(job, chunk);
+    let install = main_thread_timer();
+    finish(i, chunk, finished, pin).map(|code| (code, install))
+}
+
+/// A compile's main-thread preparation (the plan's point 2): V8's size limit, the snapshot (its
+/// global names resolved in the running realm, stage 2 step 4), the chunk's frozen view, the
+/// layouts, the code generator's switches; with `off_thread`, the stub table's snapshot, and the
+/// code mapped by the compile. With the job, a pin of the running realm's global environment,
+/// where the snapshot reads its global names or the compile runs off the main thread, which keeps
+/// its address from reuse until the install (the plan's point 7): the install compares it with
+/// the running realm's, and keeps the pin where the code checks it (`pin_global_environment`).
+fn prepare(
+    i: &mut Interp,
+    chunk: &Chunk,
+    off_thread: bool,
+) -> Result<(Job, Option<crate::interpreter::WeakEnv>), Refusal> {
+    // V8's size limit, before any work (stage 2, step 11).
+    if chunk.jit_ops().len() > MAX_OPTIMIZED_OPS {
+        return Err(Refusal::whole("over the size limit"));
+    }
+    // The global names resolve in the running realm (stage 2, step 4).
+    let snapshot = snapshot::Snapshot::take_in(chunk, Some(&*i));
+    let view = chunk.freeze(!off_thread);
+    let layout = *i
+        .jit_layout
+        .get_or_init(|| crate::value::jit_layout(&i.object_proto));
+    if !i.interp_layout.get().valid {
+        let layout = crate::interpreter::interp_layout(i);
+        i.interp_layout.set(layout);
+    }
+    if !crate::jit::ensure_executable_capacity(0) {
+        return Err(Refusal::whole("no executable capacity"));
+    }
+    let genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
+    let pin = (off_thread || snapshot.reads_global_names_of(genv))
+        .then(|| crate::interpreter::Env::downgrade(&i.global_env));
+    let job = Job {
+        view,
+        snapshot,
+        options: a64::Options::from_env(),
+        switches: a64::Switches::read(chunk),
+        layout,
+        ilayout: i.interp_layout.get(),
+        verifies: verifies(),
+        genv,
+        stubs: off_thread.then(|| crate::jit::stub_table_snapshot(&[])),
+        stub_copies: Vec::new(),
+        maps: off_thread,
+        #[cfg(test)]
+        test_addresses: crate::jit::TestAddresses::capture(),
+    };
+    Ok((job, pin))
+}
+
+/// Whether a compile runs off the main thread: in test builds under
+/// TRUST_JS_OPT_SCOPED_COMPILE, on a scoped thread joined at once (`run_here`), the check that it
+/// reads none of the main thread's state.
+fn compiles_on_another_thread() -> bool {
+    cfg!(test) && env_flag!("TRUST_JS_OPT_SCOPED_COMPILE")
+}
+
+/// Run `job`, a compile of `chunk`, until it needs no stub the main thread has not assembled and
+/// no atom it has not made: on this thread, or where `compiles_on_another_thread` on a scoped
+/// thread joined at once. What it found missing is made here, on the main thread (`provide`,
+/// logged as a main-thread part), and the job runs again.
+fn run_here(mut job: Job, chunk: &Chunk) -> Finished {
+    loop {
+        let finished = if compiles_on_another_thread() {
+            std::thread::scope(|scope| {
+                let compile = std::thread::Builder::new()
+                    .name("trust-js-opt-scoped".into())
+                    .stack_size(COMPILE_STACK)
+                    .spawn_scoped(scope, move || {
+                        let _off = crate::jit::OffMainCompile::enter();
+                        job::compile(job)
+                    })
+                    .expect("a scoped compile thread");
+                compile
+                    .join()
+                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+            })
+        } else {
+            job::compile(job)
+        };
+        let Outcome::Needs { stubs } = &finished.outcome else {
+            return finished;
+        };
+        let timer = main_thread_timer();
+        let stubs = stubs.clone();
+        job = finished.job;
+        provide(&mut job, &stubs);
+        log_main_thread("stubs", chunk, timer);
+    }
+}
+
+/// What a compile off the main thread found missing (main thread): the stubs `stubs` assembled
+/// (those whose assembly failed kept per chunk by its next run) and the stub table's snapshot
+/// taken again, the names' atoms made.
+fn provide(job: &mut Job, stubs: &[u32]) {
+    if !stubs.is_empty() {
+        let failed = assemble_stubs(job, stubs);
+        job.stub_copies.extend(failed);
+        job.stubs = Some(crate::jit::stub_table_snapshot(&job.stub_copies));
+    }
+    job.view.make_missing_keys();
+}
+
+/// The stack of a thread that compiles: the builder and the allocator iterate, so this bounds
+/// only their callees (V8's background compile threads' stacks are its platform's default).
+pub(crate) const COMPILE_STACK: usize = 16 << 20;
+
+/// Assemble the stubs `keys` that `job`'s emission found missing (main thread): those whose
+/// assembly failed, which its next run keeps per chunk.
+fn assemble_stubs(job: &Job, keys: &[u32]) -> Vec<u32> {
+    let direct =
+        (job.switches.fast & (1 << 20) != 0 && job.switches.direct_shared_context).then(|| {
+            (
+                job.view.jit_inline_attempted_off(),
+                job.view.jit_runs_off(),
+                job.view.jit_inline_retry_at_off(),
+            )
+        });
+    crate::jit::assemble_stubs(keys, &job.layout, &job.ilayout, direct)
+}
+
+/// A refusal of `chunk`'s compile after `elapsed`: the tests' record and the log's line.
+fn note_refusal(chunk: &Chunk, refusal: &Refusal, elapsed: std::time::Duration) {
+    #[cfg(test)]
+    TEST_REFUSED.with(|refused| {
+        refused
+            .borrow_mut()
+            .push((chunk as *const Chunk as usize, refusal.reason))
+    });
+    if log_enabled() {
+        match refusal.pc {
+            Some(pc) => eprintln!(
+                "[opt] refused {} at pc {pc}: {} ({:.3} ms)",
+                name(chunk),
+                refusal.reason,
+                elapsed.as_secs_f64() * 1e3
+            ),
+            None => eprintln!(
+                "[opt] refused {}: {} ({:.3} ms)",
+                name(chunk),
+                refusal.reason,
+                elapsed.as_secs_f64() * 1e3
+            ),
         }
     }
+}
+
+/// The main thread's end of a compile of `chunk` (`finished`): the verifier's and the builder's
+/// log lines, and for a compiled code its mapping where the compile could not map it (after the
+/// main thread's reclaim), the instruction barrier where another thread mapped it, its link
+/// (`a64::link`: the exit table registered, the JitCode, the perf map's entry), the realm's pin
+/// where the code compares its global environment, and the log's line; or the refusal's.
+fn finish(
+    i: &mut Interp,
+    chunk: &Chunk,
+    finished: Finished,
+    pin: Option<crate::interpreter::WeakEnv>,
+) -> Option<Rc<JitCode>> {
+    let Finished {
+        outcome,
+        declines,
+        verified,
+        verify_failure,
+        elapsed,
+        embeds_genv,
+        ..
+    } = finished;
+    #[cfg(test)]
+    if verified {
+        TEST_VERIFIED.with(|count| count.set(count.get() + 1));
+    }
+    let _ = verified;
+    if log_enabled() {
+        for decline in &declines {
+            eprintln!(
+                "[opt] declined {} pc {} {:?}: {}",
+                name(chunk),
+                decline.pc,
+                decline.reason,
+                decline.form
+            );
+        }
+        if let Some(message) = &verify_failure {
+            eprintln!("[opt] verify {} failed: {message}", name(chunk));
+        }
+    }
+    let compiled = match outcome {
+        Outcome::Compiled(compiled) => compiled,
+        Outcome::Refused(refusal) => {
+            note_refusal(chunk, &refusal, elapsed);
+            return None;
+        }
+        Outcome::Needs { .. } => unreachable!("a run ends with what it needs made"),
+    };
+    let Compiled {
+        assembled,
+        executable,
+        nodes,
+    } = *compiled;
+    let executable = match executable {
+        Some(executable) => {
+            // Mapped by another thread: this core runs none of the code's stale instructions
+            // (JSC's crossModifyingCodeFence; the writer's flush synchronizes only the writer).
+            crate::jit::sync_instruction_stream();
+            executable.0
+        }
+        None => match crate::jit::ExecutableBuffer::from_bytes(assembled.bytes()) {
+            Some(executable) => executable,
+            None => {
+                note_refusal(chunk, &Refusal::whole("no executable memory"), elapsed);
+                return None;
+            }
+        },
+    };
+    let code = a64::link(assembled, executable, chunk);
+    if embeds_genv {
+        if let Some(pin) = pin {
+            pin_global_environment(i, pin);
+        }
+    }
+    if log_enabled() {
+        eprintln!(
+            "[opt] compiled {} ({} ops, {nodes} nodes, {} bytes) in {:.3} ms \
+             at {:#x} {:#x}",
+            name(chunk),
+            chunk.jit_ops().len(),
+            code.code_bytes(),
+            elapsed.as_secs_f64() * 1e3,
+            code.mem_ptr() as usize,
+            code.code_bytes()
+        );
+    }
+    #[cfg(test)]
+    TEST_COMPILED.with(|compiled| compiled.borrow_mut().push(chunk as *const Chunk as usize));
+    Some(code)
 }
 
 /// Compile `chunk` with the tier and make the code the chunk's native code: `chunk` is a second
@@ -543,10 +693,9 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
         return false;
     };
     match generate(i, chunk) {
-        Some(code) => {
-            let started = main_thread_timer();
+        Some((code, install)) => {
             permit.commit(Some(code));
-            log_main_thread("install", chunk, started);
+            log_main_thread("install", chunk, install);
             true
         }
         None => false,
@@ -787,8 +936,7 @@ pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
         );
     }
     release_retired(i);
-    if let Some(code) = generate(i, chunk) {
-        let started = main_thread_timer();
+    if let Some((code, started)) = generate(i, chunk) {
         let installed = install(i, chunk, code);
         log_main_thread("install", chunk, started);
         if installed {
@@ -798,24 +946,18 @@ pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
     release_retired(i);
 }
 
-/// Keep the running realm's global environment from address reuse while the heap lives, where
-/// `graph`'s code compares a record with it (stage 2, step 4): a global read's code embeds its
-/// address, and another environment at that address would pass its check. As the call caches'
-/// same-realm proof pins it (`Interp::global_env_pins`): a weak pin, which owns no binding.
-fn pin_global_environment(i: &mut Interp, graph: &super::ir::Graph) {
-    use super::ir::NodeOp;
-    let genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
-    let embeds = graph
-        .nodes
+/// Keep the realm's global environment, `pin`'s, from address reuse while the heap lives, where
+/// a code compares a record with it (stage 2, step 4): a global read's code embeds its address,
+/// and another environment at that address would pass its check. As the call caches' same-realm
+/// proof pins it (`Interp::global_env_pins`): a weak pin, which owns no binding. The pin was
+/// taken with the snapshot (`prepare`), so that the realm the code checks is the snapshot's (the
+/// plan's step 12, point 7).
+fn pin_global_environment(i: &mut Interp, pin: crate::interpreter::WeakEnv) {
+    if !i
+        .global_env_pins
         .iter()
-        .any(|node| matches!(node.op, NodeOp::CheckEnvIs { env, .. } if env as usize == genv));
-    if embeds
-        && !i
-            .global_env_pins
-            .iter()
-            .any(|pin| pin.as_ptr() as usize == genv)
+        .any(|kept| kept.as_ptr() == pin.as_ptr())
     {
-        let pin = crate::interpreter::Env::downgrade(&i.global_env);
         i.global_env_pins.push(pin);
     }
 }

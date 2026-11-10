@@ -35,6 +35,16 @@ use crate::value::Value;
 
 #[path = "bytecode_activation.rs"]
 pub(crate) mod activation;
+/// The optimizing tier's frozen view of a chunk (P3 stage 2, step 12).
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
+#[path = "bytecode_freeze.rs"]
+mod freeze;
 #[path = "bytecode_scope_plan.rs"]
 pub(crate) mod scope_plan;
 use activation::{activation_plans_enabled, ActivationPlan};
@@ -7404,6 +7414,33 @@ fn transformed_record_map(
 }
 
 /// The property cache (its way 0's index) of a named load's or store's operation.
+/// The name a named operation's property cache is for (see [`named_site_cache`]).
+#[cfg_attr(
+    not(any(
+        test,
+        all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn named_site_name(op: &Op) -> Option<u32> {
+    match *op {
+        Op::GetProp(name, _)
+        | Op::GetPropThis(name, _)
+        | Op::GetPropLocal(_, name, _)
+        | Op::GetMethod(name, _)
+        | Op::SetProp(name, _)
+        | Op::SetPropDrop(name, _)
+        | Op::SetPropThisDrop(name, _)
+        | Op::SetPropLocalDrop(_, name, _)
+        | Op::AppendProp(name, _)
+        | Op::UpdateProp(name, _, _) => Some(name),
+        _ => None,
+    }
+}
+
 pub(crate) fn named_site_cache(op: &Op) -> Option<u32> {
     match *op {
         Op::GetProp(_, cache)
@@ -27640,7 +27677,7 @@ pub(crate) unsafe extern "C" fn jit_make_closure(
 
 /// The most elements a MakeArray native code makes in line has (W2e step 5): each costs a load,
 /// a store and its kind's test.
-const MAX_INLINE_ELEMENTS: usize = 8;
+pub(crate) const MAX_INLINE_ELEMENTS: usize = 8;
 
 /// Constructions over which a constructor learns its instances' capacity ([`Chunk::note_instance`],
 /// W2d step 3d): V8's slack tracking decides after seven (map.h:443-479).

@@ -23,12 +23,24 @@
 
 use super::ir::{BlockIx, ExitReason, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource};
 use super::liveness::SlotLiveness;
-use crate::bytecode::{Chunk, Op};
+use super::view::FrozenChunk;
+use crate::bytecode::Op;
 use crate::jit_ir::Cfg;
 
-/// Whether `graph`, built from `chunk`, holds the invariants the back end relies on; the first
-/// violation found otherwise. `cfg` is the chunk's, as its build made it (`build::Built`).
-pub(crate) fn verify(graph: &Graph, chunk: &Chunk, cfg: &Cfg) -> Result<(), String> {
+/// [`verify_view`] against a live chunk's frozen view (`Chunk::freeze`): the tests' path.
+#[cfg(test)]
+pub(crate) fn verify(
+    graph: &Graph,
+    chunk: &crate::bytecode::Chunk,
+    cfg: &Cfg,
+) -> Result<(), String> {
+    verify_view(graph, &chunk.freeze(true), cfg)
+}
+
+/// Whether `graph`, built from `chunk` (a chunk's frozen view), holds the invariants the back end
+/// relies on; the first violation found otherwise. `cfg` is the chunk's, as its build made it
+/// (`build::Built`). Reads nothing but its arguments, so that it runs on any thread.
+pub(crate) fn verify_view(graph: &Graph, chunk: &FrozenChunk, cfg: &Cfg) -> Result<(), String> {
     let ops = chunk.jit_ops();
     let (_, n_slots) = chunk.jit_frame();
     if graph.n_slots != n_slots {
@@ -475,7 +487,7 @@ fn representations(
     graph: &Graph,
     node: &Node,
     ix: NodeIx,
-    chunk: &Chunk,
+    chunk: &FrozenChunk,
     n_slots: usize,
 ) -> Result<(), String> {
     let rep_of = |input: &NodeIx| graph.nodes.get(input.index()).map(|node| node.rep);

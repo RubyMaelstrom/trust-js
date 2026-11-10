@@ -13,9 +13,9 @@
 use super::*;
 use crate::bytecode::Op;
 
-pub(super) fn emit(
+pub(super) fn emit<C: JitChunk + ?Sized>(
     a: &mut asm::Asm,
-    chunk: &Chunk,
+    chunk: &C,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
     pc: usize,
@@ -76,7 +76,7 @@ pub(super) fn emit(
                 ilayout,
                 chunk.jit_cache_ptr(*cache),
                 chunk.jit_cache_preferred(*cache),
-                chunk.jit_name(*n),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 false,
@@ -96,7 +96,7 @@ pub(super) fn emit(
                 ilayout,
                 chunk.jit_cache_ptr(*cache),
                 chunk.jit_cache_preferred(*cache),
-                chunk.jit_name(*n),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 false,
@@ -118,7 +118,7 @@ pub(super) fn emit(
                 ilayout,
                 chunk.jit_cache_ptr(*cache),
                 chunk.jit_cache_preferred(*cache),
-                chunk.jit_name(*n),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 false,
@@ -155,7 +155,7 @@ pub(super) fn emit(
             a.add_imm(20, 20, 8);
             #[cfg(test)]
             {
-                a.mov_imm64(9, chunk.test_this_commits.as_ptr() as u64);
+                a.mov_imm64(9, chunk.test_this_commits_ptr() as u64);
                 a.ldr_imm(10, 9, 0);
                 a.add_imm(10, 10, 1);
                 a.str_imm(10, 9, 0);
@@ -178,15 +178,15 @@ pub(super) fn emit(
         Op::LoadNameIn(_, cache, target) | Op::LoadNameForCallIn(_, cache, target)
             if fast & 8192 != 0
                 && static_name(layout, chunk, *cache).is_some()
-                && chunk.inline_target_env(*target).is_some() =>
+                && chunk.inline_target_env_word(*target).is_some() =>
         {
             // From the pinned callee's [[Environment]], which its identity guard proved.
             let address = static_name(layout, chunk, *cache).expect("guarded");
-            let env = chunk.inline_target_env(*target).expect("guarded");
+            let env = chunk.inline_target_env_word(*target).expect("guarded");
             emit_static_name_load(
                 a,
                 layout,
-                Some(crate::interpreter::Env::as_ptr(&env) as u64),
+                Some(env as u64),
                 address,
                 matches!(op, Op::LoadNameForCallIn(..)),
                 pc as u32,
@@ -225,14 +225,14 @@ pub(super) fn emit(
         {
             // A dead pin's guard always takes the generic call; this site is then unreachable
             // and keeps the checked operation.
-            let Some(env) = chunk.inline_target_env(*target) else {
+            let Some(env) = chunk.inline_target_env_word(*target) else {
                 return false;
             };
             emit_load_name_in_inline(
                 a,
                 layout,
                 chunk.jit_name_cache_ptr(*cache),
-                NameBase::Pinned(crate::interpreter::Env::as_ptr(&env) as u64),
+                NameBase::Pinned(env as u64),
                 pc as u32,
                 unwind,
                 matches!(op, Op::LoadNameForCallIn(..)),
@@ -420,7 +420,7 @@ pub(super) fn emit(
                 ilayout,
                 chunk.jit_cache_ptr(*cache),
                 chunk.jit_cache_preferred(*cache),
-                chunk.jit_name(*n),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 true,
@@ -565,41 +565,35 @@ pub(super) fn emit(
             emit_exec(a, pc as u32, unwind);
             a.bind(done);
         }
-        Op::SetProp(_, cache) | Op::SetPropDrop(_, cache)
+        Op::SetProp(n, cache) | Op::SetPropDrop(n, cache)
             if fast & 65536 != 0 && layout.valid && set_prop_inlinable(layout) =>
         {
             emit_set_prop_inline(
                 a,
                 layout,
                 chunk.jit_cache_ptr(*cache),
-                chunk.jit_name(match op {
-                    Op::SetProp(n, _) | Op::SetPropDrop(n, _) => *n,
-                    _ => unreachable!(),
-                }),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 PropRecv::Stack,
                 matches!(op, Op::SetProp(..)),
             );
         }
-        Op::SetPropThisDrop(_, cache)
+        Op::SetPropThisDrop(n, cache)
             if fast & 65536 != 0 && layout.valid && set_prop_inlinable(layout) =>
         {
             emit_set_prop_inline(
                 a,
                 layout,
                 chunk.jit_cache_ptr(*cache),
-                chunk.jit_name(match op {
-                    Op::SetPropThisDrop(n, _) => *n,
-                    _ => unreachable!(),
-                }),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 PropRecv::This,
                 false,
             );
         }
-        Op::SetPropLocalDrop(s, _, cache)
+        Op::SetPropLocalDrop(s, n, cache)
             if fast & 65536 != 0
                 && layout.valid
                 && set_prop_inlinable(layout)
@@ -609,10 +603,7 @@ pub(super) fn emit(
                 a,
                 layout,
                 chunk.jit_cache_ptr(*cache),
-                chunk.jit_name(match op {
-                    Op::SetPropLocalDrop(_, n, _) => *n,
-                    _ => unreachable!(),
-                }),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 PropRecv::Slot(*s as u32 * 8),
@@ -641,7 +632,7 @@ pub(super) fn emit(
                 a,
                 layout,
                 chunk.jit_cache_ptr(*cache),
-                chunk.jit_name(*n),
+                JitName::of(chunk.jit_name(*n), &|| chunk.jit_name_key(*n)),
                 pc as u32,
                 unwind,
                 PropRecv::Stack,
@@ -1286,9 +1277,9 @@ fn emit_elided_element(
 /// emitted runs only in activations its chunk's plan made (`Asm::fixed_activation`; a borrowed
 /// frame's may be another tier's) and the chunk keeps it at a fixed slot
 /// (`Chunk::jit_cap_binding`).
-fn fixed_cap(
+fn fixed_cap<C: JitChunk + ?Sized>(
     a: &asm::Asm,
-    chunk: &Chunk,
+    chunk: &C,
     n: u32,
 ) -> Option<(u32, crate::interpreter::BindingAttrs)> {
     a.fixed_activation()
@@ -1304,9 +1295,9 @@ pub(super) fn cap_slot_offset(slot: u32) -> u32 {
 
 /// The static address of the free-name read at name cache `cache` (Decision 21,
 /// `bytecode::StaticName`), when the record layout lets generated code walk to it.
-pub(super) fn static_name(
+pub(super) fn static_name<C: JitChunk + ?Sized>(
     layout: &crate::value::JitLayout,
-    chunk: &Chunk,
+    chunk: &C,
     cache: u32,
 ) -> Option<crate::bytecode::StaticName> {
     (layout.scope_parent_valid
@@ -1319,9 +1310,9 @@ pub(super) fn static_name(
 /// The records from the running environment to the realm's global environment for the
 /// free-name read at name cache `cache` (Decision 21, `Chunk::jit_name_global`), when the record
 /// layout lets generated code walk to it.
-pub(super) fn static_global(
+pub(super) fn static_global<C: JitChunk + ?Sized>(
     layout: &crate::value::JitLayout,
-    chunk: &Chunk,
+    chunk: &C,
     cache: u32,
 ) -> Option<u16> {
     (layout.scope_parent_valid

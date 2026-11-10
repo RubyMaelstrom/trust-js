@@ -208,6 +208,22 @@ impl Snapshot {
         self.declined.get(pc).map_or(0, |&(_, proof)| proof)
     }
 
+    /// Whether a free-name site's view reads the realm whose global environment is `genv` (a
+    /// global property's or a global lexical's), which the code may then check by identity: the
+    /// compile pins it (`driver::prepare`).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn reads_global_names_of(&self, genv: usize) -> bool {
+        self.names.iter().any(|name| {
+            matches!(*name, NameView::Global { genv: g, .. } | NameView::GlobalLexical { genv: g, .. } if g == genv)
+        })
+    }
+
     /// The view of the free-name site at `pc` ([`NameView::None`] for any other operation).
     pub(crate) fn name(&self, pc: usize) -> NameView {
         self.names.get(pc).copied().unwrap_or(NameView::None)
@@ -586,7 +602,7 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
                 if call.state != CallState::Megamorphic {
                     for target in call.ways.iter().flatten() {
                         hash.write_usize(target.callee);
-                        hash.write_usize(target.function as usize);
+                        hash.write_usize(target.function);
                         hash.write_u32(u32::from(target.builtin));
                     }
                 }

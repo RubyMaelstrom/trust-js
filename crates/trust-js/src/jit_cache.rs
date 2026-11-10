@@ -165,6 +165,10 @@ impl NativeCodeSlot {
     /// cache admission leaves the canonical activation and completion untouched.
     /// No registry access is added to a resident call or native entry/exit.
     pub(crate) fn begin_compile(&self) -> Option<CompilePermit> {
+        debug_assert!(
+            !super::off_main_compile(),
+            "native-code residency is the main thread's"
+        );
         let state = self.state.get_or_init(|| Rc::new(SlotState::default()));
         if !matches!(*state.code.borrow(), CodeState::Cold) {
             return None;

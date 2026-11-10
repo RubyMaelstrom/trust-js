@@ -23,7 +23,7 @@ thread_local! {
 /// Count an in-line activation in a test build (x10 and x11 scratch, before the poll).
 #[cfg(all(test, target_arch = "aarch64"))]
 pub(super) fn record_inline_activation(a: &mut asm::Asm) {
-    let address = super::TEST_INLINE_ACTIVATIONS.with(|count| count.as_ptr() as usize);
+    let address = super::TestAddresses::current().inline_activations;
     a.mov_imm64(10, address as u64);
     a.ldr_imm(11, 10, 0);
     a.add_imm(11, 11, 1);
@@ -34,7 +34,7 @@ pub(super) fn record_inline_activation(a: &mut asm::Asm) {
 /// x9/x10 are scratch at these commit sites and all live words stay in their original homes.
 #[cfg(all(test, target_arch = "aarch64"))]
 pub(super) fn record_name_commit(a: &mut asm::Asm, kind: usize) {
-    let address = TEST_NATIVE_NAME_COMMITS.with(|counts| counts[kind].as_ptr() as usize);
+    let address = super::TestAddresses::current().native_name_commits[kind];
     a.mov_imm64(9, address as u64);
     a.ldr_imm(10, 9, 0);
     a.add_imm(10, 10, 1);
@@ -198,7 +198,7 @@ pub(super) fn emit_deep_name_value_ptr(
     emit_target_value_ptr(a, layout, slow);
     #[cfg(test)]
     {
-        let address = TEST_NATIVE_DEEP_NAMES.with(|count| count.as_ptr() as usize);
+        let address = super::TestAddresses::current().native_deep_names;
         a.mov_imm64(15, address as u64);
         a.ldr_imm(16, 15, 0);
         a.add_imm(16, 16, 1);
@@ -275,7 +275,11 @@ fn emit_reference_target_ptr(a: &mut asm::Asm, layout: &crate::value::JitLayout,
 /// can be a function's deferred prototype. The compiler gives every `ResolveNameRef` a fresh
 /// Reference, emitted before the Reference's uses, so the nearest one before `pc` names it; a
 /// Reference whose `ResolveNameRef` is not found is treated as if it could.
-fn reference_may_name_prototype(chunk: &Chunk, pc: usize, reference: u16) -> bool {
+fn reference_may_name_prototype<C: JitChunk + ?Sized>(
+    chunk: &C,
+    pc: usize,
+    reference: u16,
+) -> bool {
     chunk.jit_ops()[..pc]
         .iter()
         .rev()
@@ -290,11 +294,11 @@ fn reference_may_name_prototype(chunk: &Chunk, pc: usize, reference: u16) -> boo
 
 /// Whole-operation native Reference template. All proof/owner guards precede mutation. The
 /// canonical slot owns the base/name across RHS effects; no hint miss restarts resolution.
-pub(super) fn emit_reference_op(
+pub(super) fn emit_reference_op<C: JitChunk + ?Sized>(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
-    chunk: &Chunk,
+    chunk: &C,
     op: &crate::bytecode::Op,
     pc: u32,
     unwind: usize,
@@ -402,7 +406,7 @@ pub(super) fn emit_reference_op(
             Op::LoadRef(_) => 1,
             _ => 2,
         };
-        let address = TEST_NATIVE_REFERENCES.with(|counts| counts[index].as_ptr() as usize);
+        let address = super::TestAddresses::current().native_references[index];
         a.mov_imm64(9, address as u64);
         a.ldr_imm(10, 9, 0);
         a.add_imm(10, 10, 1);

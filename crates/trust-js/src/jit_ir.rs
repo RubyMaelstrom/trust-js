@@ -1171,6 +1171,25 @@ impl Cfg {
         Self::build_with(ops, |pc| chunk.jit_stack_effect(pc))
     }
 
+    /// [`Cfg::build`] from a chunk's operations and their stack effects (`effect(pc)`), as the
+    /// optimizing tier's frozen view keeps them (P3 stage 2, step 12).
+    #[cfg_attr(
+        not(any(
+            test,
+            all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            )
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn build_from(
+        ops: &[Op],
+        effect: impl Fn(usize) -> Option<(usize, usize)>,
+    ) -> Result<Cfg, BuildError> {
+        Self::build_with(ops, effect)
+    }
+
     #[cfg(test)]
     pub(crate) fn test_build_with(
         ops: &[Op],

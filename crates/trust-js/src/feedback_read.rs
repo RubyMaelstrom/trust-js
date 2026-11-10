@@ -199,9 +199,10 @@ pub(crate) enum CallState {
 pub(crate) struct CallTarget {
     /// The callee object's cell address (its handle word).
     pub(crate) callee: usize,
-    /// The callee's function literal; closures of one literal share it (V8's FeedbackCell).
-    /// Null for a native target.
-    pub(crate) function: *const crate::ast::Function,
+    /// The callee's function literal's address (closures of one literal share it, V8's
+    /// FeedbackCell), a word to compare and never to read, so that a snapshot holding views
+    /// crosses threads (P3 stage 2, step 12). 0 for a native target.
+    pub(crate) function: usize,
     /// A native target's builtin id and entry (0 for a user function).
     pub(crate) builtin: u16,
     pub(crate) native: usize,

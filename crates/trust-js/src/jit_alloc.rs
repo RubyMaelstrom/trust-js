@@ -110,7 +110,8 @@ pub(super) fn emit_inline_array_elements(
     a: &mut asm::Asm,
     cell: &InlineAllocSite,
     block: &InlineAllocSite,
-    image: &crate::bytecode::ObjectImage,
+    // The image's address (`JitChunk::jit_array_elements_site`), a word the code embeds.
+    image: usize,
     count: usize,
     helper: usize,
     pc: u32,
@@ -119,7 +120,7 @@ pub(super) fn emit_inline_array_elements(
     use crate::value::word_block::{KIND_ALL, KIND_INT32, KIND_NO_HOLES};
     let slow = a.new_label();
     let done = a.new_label();
-    let image_addr = std::ptr::from_ref(image) as u64;
+    let image_addr = image as u64;
     a.mov_imm64(9, image_addr);
     a.ldr_imm(
         10,
@@ -369,7 +370,8 @@ fn emit_header_copy(
 pub(super) fn emit_inline_object(
     a: &mut asm::Asm,
     site: &InlineAllocSite,
-    image: &crate::bytecode::ObjectImage,
+    // The image's address (`JitChunk::jit_object_site`), a word the code embeds.
+    image: usize,
     slots: usize,
     helper: usize,
     pc: u32,
@@ -394,7 +396,8 @@ pub(super) fn emit_inline_object(
 pub(super) fn emit_inline_array(
     a: &mut asm::Asm,
     site: &InlineAllocSite,
-    image: &crate::bytecode::ObjectImage,
+    // The image's address (`JitChunk::jit_array_site`), a word the code embeds.
+    image: usize,
     helper: usize,
     pc: u32,
     unwind: usize,
@@ -409,7 +412,7 @@ pub(super) fn emit_inline_array(
 fn emit_inline_cell(
     a: &mut asm::Asm,
     site: &InlineAllocSite,
-    image: &crate::bytecode::ObjectImage,
+    image: usize,
     proto: usize,
     fixed: usize,
     slots: usize,
@@ -420,7 +423,7 @@ fn emit_inline_cell(
     debug_assert!(fixed <= 1);
     let slow = a.new_label();
     let done = a.new_label();
-    let image = std::ptr::from_ref(image) as u64;
+    let image = image as u64;
     a.mov_imm64(9, image);
     a.ldr_imm(
         10,
@@ -477,7 +480,7 @@ thread_local! {
 /// x10 and x11 are scratch here).
 #[cfg(test)]
 fn record_inline_object(a: &mut asm::Asm) {
-    let address = INLINE_OBJECTS.with(|count| count.as_ptr() as usize);
+    let address = super::TestAddresses::current().inline_objects;
     a.mov_imm64(10, address as u64);
     a.ldr_imm(11, 10, 0);
     a.add_imm(11, 11, 1);

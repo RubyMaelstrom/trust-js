@@ -57,6 +57,11 @@ pub(crate) mod exit;
     )
 ))]
 pub(crate) mod ir;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) mod job;
 #[cfg(any(
     test,
     all(
@@ -96,6 +101,14 @@ pub(crate) mod snapshot;
     )
 ))]
 pub(crate) mod verify;
+#[cfg(any(
+    test,
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
+pub(crate) mod view;
 
 #[cfg(test)]
 mod build_tests;

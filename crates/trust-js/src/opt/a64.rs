@@ -36,6 +36,7 @@ use crate::bytecode::Op;
 use crate::opt::exit::{ExitKind, ExitRecord, ExitTable, Source, SAVE_BYTES};
 use crate::opt::ir::*;
 use crate::opt::regalloc::{self, Allocation, Home};
+use crate::opt::view::FrozenChunk;
 
 // Condition codes.
 const EQ: u32 = 0;
@@ -88,7 +89,8 @@ pub(crate) struct Options {
 }
 
 impl Options {
-    /// The options the switches select.
+    /// The options the switches select (main thread: TRUST_JS_OPT_EXIT_EVERY is a test's switch
+    /// there).
     pub(crate) fn from_env() -> Self {
         Options {
             forced_exits: crate::opt::exit_every() > 0,
@@ -97,28 +99,53 @@ impl Options {
     }
 }
 
-/// Generate `graph`'s code for `chunk` (the switches' options), from the chunk's Cfg and
-/// initialized reads as its build made them (`build::Built`).
-pub(crate) fn compile(
-    chunk: &Chunk,
-    graph: &Graph,
-    cfg: &crate::jit_ir::Cfg,
-    initialized: crate::jit_ir::InitializedReads,
-    layout: &crate::value::JitLayout,
-    ilayout: &crate::interpreter::InterpLayout,
-) -> Result<Rc<JitCode>, Refusal> {
-    compile_with(
-        chunk,
-        graph,
-        cfg,
-        initialized,
-        layout,
-        ilayout,
-        Options::from_env(),
-    )
+/// The process switches and the chunk's facts the code generator reads, read on the main thread
+/// with the snapshot (P3 stage 2, step 12; the plan's point 2), so that a compile reads none.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Switches {
+    /// The templates' feature mask (`template_mask`, TRUST_JS_JIT_FAST).
+    pub(crate) fast: u32,
+    /// The stack analysis's TDZ proof (off under TRUST_JS_JIT_NO_TDZ_PROOF).
+    pub(crate) tdz_proof: bool,
+    /// Off under TRUST_JS_JIT_NO_ARRAY_INTRINSICS and TRUST_JS_JIT_NO_FUNCTION_CALL_INTRINSIC.
+    pub(crate) array_intrinsics: bool,
+    pub(crate) function_call_intrinsic: bool,
+    /// The direct call sequence (off under TRUST_JS_JIT_NO_DIRECT_CALLS).
+    pub(crate) direct_shared_context: bool,
+    /// FEAT_JSCVT, unless TRUST_JS_JIT_NO_JSCVT (`jscvt_available`).
+    pub(crate) jscvt: bool,
+    /// The code's exit limit (`opt::exit_limit`: 100 << R at the snapshot).
+    pub(crate) exit_limit: u32,
+    /// The native runs an entry counts (`opt::entry_weight`), which the direct sequence's shared
+    /// stubs hold as a process constant.
+    pub(crate) entry_weight: u32,
+    /// Whether the running Agent's heap has the in-line allocation site of class-0 cells, which
+    /// a direct construct's in-line `this` uses (`value::object_inline_alloc_site`).
+    pub(crate) inline_construct: bool,
 }
 
-/// Generate `graph`'s code for `chunk` with `options` (see [`compile`]).
+impl Switches {
+    /// The switches as the process sets them, for `chunk`'s code (main thread).
+    pub(crate) fn read(chunk: &Chunk) -> Self {
+        prime_switches();
+        Switches {
+            fast: template_mask(chunk),
+            tdz_proof: !env_flag!("TRUST_JS_JIT_NO_TDZ_PROOF"),
+            array_intrinsics: !env_flag!("TRUST_JS_JIT_NO_ARRAY_INTRINSICS"),
+            function_call_intrinsic: !env_flag!("TRUST_JS_JIT_NO_FUNCTION_CALL_INTRINSIC"),
+            direct_shared_context: crate::bytecode::direct_shared_context_enabled(),
+            jscvt: jscvt_available(),
+            exit_limit: crate::opt::exit_limit(chunk),
+            entry_weight: crate::opt::entry_weight(),
+            inline_construct: crate::value::object_inline_alloc_site(0).is_some(),
+        }
+    }
+}
+
+/// Generate `graph`'s code for `chunk` (the switches' options), from the chunk's Cfg and
+/// initialized reads as its build made them (`build::Built`), on the calling thread, and map it:
+/// the tests' path, which installs the code by hand.
+#[cfg(test)]
 pub(crate) fn compile_with(
     chunk: &Chunk,
     graph: &Graph,
@@ -128,6 +155,127 @@ pub(crate) fn compile_with(
     ilayout: &crate::interpreter::InterpLayout,
     options: Options,
 ) -> Result<Rc<JitCode>, Refusal> {
+    let view = chunk.freeze(true);
+    let switches = Switches::read(chunk);
+    let mut stubs = Stubs::live();
+    let assembled = assemble(
+        &view,
+        graph,
+        cfg,
+        initialized,
+        layout,
+        ilayout,
+        options,
+        &switches,
+        &mut stubs,
+    )?;
+    let executable = ExecutableBuffer::from_bytes(assembled.bytes())
+        .ok_or(Refusal::whole("no executable memory"))?;
+    Ok(link(assembled, executable, chunk))
+}
+
+/// What a code generation's emission does with the process-wide shared stubs its sites request
+/// (P3 stage 2, step 12; the plan's point 3): on the main thread, assemble a missing one at once
+/// as the template JIT does (`Live`); in a job, find each in the main thread's table as it stood
+/// at the snapshot (`jit::StubTableSnapshot`), and record a missing one, which the main thread
+/// assembles before the job runs again (`Frozen`).
+pub(crate) struct Stubs<'s> {
+    table: Option<&'s StubTableSnapshot>,
+    /// The keys the snapshot's table lacks, in the order the emission requested them.
+    pub(crate) missing: Vec<u32>,
+}
+
+impl<'s> Stubs<'s> {
+    /// Assemble missing stubs now, on this thread (main thread only).
+    pub(crate) fn live() -> Self {
+        Stubs {
+            table: None,
+            missing: Vec::new(),
+        }
+    }
+
+    /// Read the stubs from `table`, recording the missing ones.
+    pub(crate) fn frozen(table: &'s StubTableSnapshot) -> Self {
+        Stubs {
+            table: Some(table),
+            missing: Vec::new(),
+        }
+    }
+}
+
+/// A code generation's words and exit table, made without executable memory or any registry, so
+/// that it crosses threads: the caller maps the words (`ExecutableBuffer`) and links the code
+/// (`link`) on the main thread or maps them on the compile thread (P3 stage 2, step 12).
+pub(crate) struct Assembled {
+    pub(crate) words: Vec<u32>,
+    pub(crate) table: Box<ExitTable>,
+    /// The trap's offset, which every pc's code offset names.
+    trap: u32,
+    needs_global: bool,
+    max_stack: usize,
+    ops: usize,
+}
+
+impl Assembled {
+    /// The code's bytes.
+    pub(crate) fn bytes(&self) -> &[u8] {
+        // SAFETY: the words' bytes, in the words' memory.
+        unsafe {
+            std::slice::from_raw_parts(self.words.as_ptr() as *const u8, self.words.len() * 4)
+        }
+    }
+}
+
+/// The code `assembled` now that `executable` holds its bytes (main thread): its exit table
+/// registered by its code's base, the JitCode, the perf map's entry under `chunk`'s name.
+pub(crate) fn link(
+    assembled: Assembled,
+    executable: ExecutableBuffer,
+    chunk: &Chunk,
+) -> Rc<JitCode> {
+    let Assembled {
+        mut table,
+        trap,
+        needs_global,
+        max_stack,
+        ops,
+        ..
+    } = assembled;
+    let mem = executable.as_ptr() as *mut u8;
+    let len = executable.len();
+    table.code_base = mem as usize;
+    crate::opt::exit::register(mem as usize, table);
+    let code = JitCode {
+        entry_kind: NativeEntryKind::FreshFrame,
+        osr_entry_depths: Vec::new(),
+        resume_depths: Vec::new(),
+        needs_global,
+        mem,
+        len,
+        pc_offsets: vec![trap; ops],
+        max_stack,
+        executable,
+        referenced: Cell::new(0),
+    };
+    profiler::register_optimized(chunk, mem, len);
+    Rc::new(code)
+}
+
+/// Generate `graph`'s code for `chunk` with `options` and `switches`, its stubs from `stubs`,
+/// into words (see [`Assembled`]): reads nothing but its arguments and process constants, so
+/// that it runs on any thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn assemble(
+    chunk: &FrozenChunk,
+    graph: &Graph,
+    cfg: &crate::jit_ir::Cfg,
+    initialized: crate::jit_ir::InitializedReads,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    options: Options,
+    switches: &Switches,
+    stubs: &mut Stubs<'_>,
+) -> Result<Assembled, Refusal> {
     if !layout.valid || !ilayout.valid {
         return Err(Refusal::whole("no validated object or interpreter layout"));
     }
@@ -165,9 +313,10 @@ pub(crate) fn compile_with(
         cfg,
         initialized,
         options,
+        switches,
         frame,
     );
-    gen.emit()?;
+    gen.emit(stubs)?;
     gen.finish()
 }
 
@@ -175,7 +324,11 @@ pub(crate) fn compile_with(
 /// terminator ending every block and nowhere else, a poll opening every loop header, entry
 /// slots read in the entry block, a state on every node that can exit, and effects only on
 /// operations whose baseline template the canonical frame can run.
-fn check_graph(chunk: &Chunk, graph: &Graph, cfg: &crate::jit_ir::Cfg) -> Result<(), Refusal> {
+fn check_graph(
+    chunk: &FrozenChunk,
+    graph: &Graph,
+    cfg: &crate::jit_ir::Cfg,
+) -> Result<(), Refusal> {
     let entry = graph
         .entry
         .ok_or(Refusal::whole("a graph without an entry block"))?;
@@ -481,13 +634,14 @@ enum Loc {
 
 struct Gen<'a> {
     a: asm::Asm,
-    chunk: &'a Chunk,
+    chunk: &'a FrozenChunk,
     graph: &'a Graph,
     alloc: Allocation,
     layout: &'a crate::value::JitLayout,
     ilayout: &'a crate::interpreter::InterpLayout,
     cfg: &'a crate::jit_ir::Cfg,
     options: Options,
+    switches: &'a Switches,
     frame: EntryFrame,
     blocks: Vec<usize>,
     l_ret_ok: usize,
@@ -514,8 +668,9 @@ struct Gen<'a> {
 
 impl<'a> Gen<'a> {
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn new(
-        chunk: &'a Chunk,
+        chunk: &'a FrozenChunk,
         graph: &'a Graph,
         alloc: Allocation,
         layout: &'a crate::value::JitLayout,
@@ -523,6 +678,7 @@ impl<'a> Gen<'a> {
         cfg: &'a crate::jit_ir::Cfg,
         initialized: crate::jit_ir::InitializedReads,
         options: Options,
+        switches: &'a Switches,
         frame: EntryFrame,
     ) -> Self {
         let ops = chunk.jit_ops();
@@ -530,23 +686,18 @@ impl<'a> Gen<'a> {
         a.set_stubs_ok(true);
         a.set_first_stage(!chunk.jit_second_stage());
         a.set_fixed_activation(chunk.jit_fixed_activation());
-        if !env_flag!("TRUST_JS_JIT_NO_TDZ_PROOF") {
+        a.set_entry_weight(switches.entry_weight);
+        a.set_inline_construct(switches.inline_construct);
+        if switches.tdz_proof {
             a.set_initialized_reads(initialized);
         }
-        let fast = template_mask(chunk);
+        let fast = switches.fast;
         let blocks = (0..graph.blocks.len()).map(|_| a.new_label()).collect();
         let l_ret_ok = a.new_label();
         let l_ret_throw = a.new_label();
         let l_direct_finish = a.new_label();
         let l_exit_stub = a.new_label();
         let l_trap = a.new_label();
-        let name = chunk
-            .jit_slot_names()
-            .iter()
-            .take(4)
-            .map(|s| &**s)
-            .collect::<Vec<_>>()
-            .join(",");
         Gen {
             a,
             chunk,
@@ -556,6 +707,7 @@ impl<'a> Gen<'a> {
             ilayout,
             cfg,
             options,
+            switches,
             frame,
             blocks,
             l_ret_ok,
@@ -568,20 +720,20 @@ impl<'a> Gen<'a> {
             exits: Vec::new(),
             cold: Vec::new(),
             fast,
-            array_intrinsics_on: !env_flag!("TRUST_JS_JIT_NO_ARRAY_INTRINSICS"),
-            function_call_intrinsic_on: !env_flag!("TRUST_JS_JIT_NO_FUNCTION_CALL_INTRINSIC"),
-            direct_on: fast & (1 << 20) != 0 && crate::bytecode::direct_shared_context_enabled(),
+            array_intrinsics_on: switches.array_intrinsics,
+            function_call_intrinsic_on: switches.function_call_intrinsic,
+            direct_on: fast & (1 << 20) != 0 && switches.direct_shared_context,
             in_loop: loop_body_mask(ops),
             last_effect: None,
             table: Box::new(ExitTable {
-                name: format!("fn({name})").into_boxed_str(),
-                limit: crate::opt::exit_limit(chunk),
+                name: chunk.label().into(),
+                limit: switches.exit_limit,
                 ..ExitTable::default()
             }),
         }
     }
 
-    fn emit(&mut self) -> Result<(), Refusal> {
+    fn emit(&mut self, stubs: &mut Stubs<'_>) -> Result<(), Refusal> {
         // The entry's throws (the poll, the frame setup) find no handler at pc 0.
         self.l_dsave = emit_entry_prologue(
             &mut self.a,
@@ -609,19 +761,26 @@ impl<'a> Gen<'a> {
         self.a.bind(self.l_trap);
         self.a.brk(0x4f50);
         // The shared stubs the effects' templates requested, and the direct-call teardown.
-        emit_shared_stubs(
-            &mut self.a,
-            &StubContext {
-                layout: self.layout,
-                ilayout: Some(self.ilayout),
-                direct: self.direct_on.then(|| DirectCallContext {
-                    attempted_off: self.chunk.jit_inline_attempted_off(),
-                    runs_off: self.chunk.jit_runs_off(),
-                    retry_off: self.chunk.jit_inline_retry_at_off(),
-                    finish_stub: self.l_direct_finish,
-                }),
-            },
-        );
+        let context = StubContext {
+            layout: self.layout,
+            ilayout: Some(self.ilayout),
+            direct: self.direct_on.then(|| DirectCallContext {
+                attempted_off: self.chunk.jit_inline_attempted_off(),
+                runs_off: self.chunk.jit_runs_off(),
+                retry_off: self.chunk.jit_inline_retry_at_off(),
+                finish_stub: self.l_direct_finish,
+            }),
+        };
+        match stubs.table {
+            None => emit_shared_stubs(&mut self.a, &context),
+            Some(table) => emit_shared_stubs_from(
+                &mut self.a,
+                &context,
+                table,
+                self.switches.entry_weight,
+                &mut stubs.missing,
+            ),
+        }
         self.a.bind(self.l_direct_finish);
         if self.direct_on && self.a.label_referenced(self.l_direct_finish) {
             emit_direct_finish_stub(&mut self.a, self.ilayout, self.layout.valid);
@@ -629,7 +788,7 @@ impl<'a> Gen<'a> {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<Rc<JitCode>, Refusal> {
+    fn finish(mut self) -> Result<Assembled, Refusal> {
         if self.alloc.fp_callee_across_effect
             && STUB_WRITES_CALLEE_SAVED_FP.load(std::sync::atomic::Ordering::Relaxed)
         {
@@ -664,26 +823,10 @@ impl<'a> Gen<'a> {
         let mut table = self.table;
         table.return_offsets = exits.iter().map(|&(offset, _)| offset).collect();
         table.exits = exits.into_iter().map(|(_, record)| record).collect();
-        if let Some(pat) = env_value!("TRUST_JS_JIT_CODEDUMP") {
-            if pat == "*" || table.name.contains(pat) {
-                eprintln!("[opt-codedump] {} {} words", table.name, words.len());
-                for w in &words {
-                    eprintln!("[opt-codedump] {w:08x}");
-                }
-            }
-        }
-        let executable = ExecutableBuffer::from_bytes(unsafe {
-            std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
-        })
-        .ok_or(Refusal::whole("no executable memory"))?;
-        let mem = executable.as_ptr() as *mut u8;
-        let len = executable.len();
-        table.code_base = mem as usize;
-        crate::opt::exit::register(mem as usize, table);
-        let code = JitCode {
-            entry_kind: NativeEntryKind::FreshFrame,
-            osr_entry_depths: Vec::new(),
-            resume_depths: Vec::new(),
+        Ok(Assembled {
+            words,
+            table,
+            trap,
             needs_global: ops.iter().any(|o| {
                 matches!(
                     o,
@@ -693,15 +836,9 @@ impl<'a> Gen<'a> {
                         | Op::LoadNameForCallIn(..)
                 )
             }),
-            mem,
-            len,
-            pc_offsets: vec![trap; ops.len()],
             max_stack: self.cfg.jit_stack_capacity(),
-            executable,
-            referenced: Cell::new(0),
-        };
-        profiler::register_optimized(self.chunk, mem, len);
-        Ok(Rc::new(code))
+            ops: ops.len(),
+        })
     }
 }
 
@@ -1011,7 +1148,7 @@ impl Gen<'_> {
     /// Where `n` writes its x value: its home register, or x9 for a spill slot or no home.
     /// Whether to use FJCVTZS (ToInt32 itself, FEAT_JSCVT).
     fn jscvt(&self) -> bool {
-        jscvt_available() && !self.options.no_jscvt
+        self.switches.jscvt && !self.options.no_jscvt
     }
 
     fn gp_dst(&self, n: NodeIx) -> u32 {
@@ -1867,14 +2004,11 @@ impl Gen<'_> {
     fn lower_check_callee(&mut self, n: NodeIx, target: u32) -> Result<(), Refusal> {
         let node = self.graph.node(n);
         let site = self.check_exit(n)?;
-        let it = self.chunk.jit_inline_target(target);
+        let it = *self.chunk.jit_inline_target(target);
         // The expected function's stored word, read out of an Option<Gc> as the first stage's
-        // InlineGuard reads it; a dead callee always exits.
-        let stored = it.pin.upgrade().map(|object| {
-            let some: Option<crate::value::Gc> = Some(object);
-            unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
-        });
-        let Some(stored) = stored else {
+        // InlineGuard reads it (the frozen view upgraded its pin on the main thread); a dead
+        // callee always exits.
+        let Some(stored) = it.callee else {
             self.a.b(site);
             return Ok(());
         };
@@ -1919,15 +2053,11 @@ impl Gen<'_> {
     /// may be an input's whose range ends here.
     fn lower_callee_matches(&mut self, n: NodeIx, target: u32) -> Result<(), Refusal> {
         let node = self.graph.node(n);
-        let it = self.chunk.jit_inline_target(target);
+        let it = *self.chunk.jit_inline_target(target);
         let mismatch = self.a.new_label();
         let done = self.a.new_label();
         // A dead callee never matches.
-        let stored = it.pin.upgrade().map(|object| {
-            let some: Option<crate::value::Gc> = Some(object);
-            unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
-        });
-        if let Some(stored) = stored {
+        if let Some(stored) = it.callee {
             let callee = self.gp(node.inputs[0], X16);
             if it.expected_env != 0 {
                 self.a

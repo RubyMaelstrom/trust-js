@@ -598,7 +598,7 @@ fn the_call_and_construct_views_read_their_targets() {
     assert_eq!(mono.state, CallState::Monomorphic);
     let target = mono.ways.iter().flatten().next().copied().unwrap();
     // `current` may be off: a concurrent test can bump the process-wide call-cache epoch.
-    assert!(!target.function.is_null() && target.builtin == 0);
+    assert!(target.function != 0 && target.builtin == 0);
     assert_eq!(call(&mut engine, "poly").state, CallState::Polymorphic);
     let native = call(&mut engine, "native");
     let target = native.ways.iter().flatten().next().copied().unwrap();
@@ -607,9 +607,7 @@ fn the_call_and_construct_views_read_their_targets() {
     else {
         panic!("new has the construct view")
     };
-    assert!(construct
-        .target
-        .is_some_and(|target| !target.function.is_null()));
+    assert!(construct.target.is_some_and(|target| target.function != 0));
 }
 
 #[test]

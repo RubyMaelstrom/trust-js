@@ -231,7 +231,7 @@ fn call_view(site: &CallSite) -> CallView {
 fn call_target(entry: &CallIc) -> Option<CallTarget> {
     (entry.callee != 0).then(|| CallTarget {
         callee: entry.callee,
-        function: entry.func,
+        function: entry.func as usize,
         builtin: entry.builtin,
         native: entry.native,
         realm: entry.realm,

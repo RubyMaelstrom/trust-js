@@ -15,6 +15,7 @@ use crate::value::Value;
 use std::rc::Rc;
 
 /// A plan activation that a fresh frame's prologue makes in line ([`ActivationPlan::inline_activation`]).
+#[derive(Clone)]
 pub(crate) struct InlineActivation {
     pub(crate) site: crate::gc_core::InlineAllocSite,
     pub(crate) header: [u64; crate::interpreter::RECORD_HEADER / 8],

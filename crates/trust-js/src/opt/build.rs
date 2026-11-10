@@ -58,7 +58,8 @@ use super::ir::{
 use super::ir::{ElemKind, Holes, Store, TypedKind};
 use super::liveness::SlotLiveness;
 use super::snapshot::{Ran, Snapshot};
-use crate::bytecode::{Chunk, Op, UpdKind};
+use super::view::FrozenChunk;
+use crate::bytecode::{Op, UpdKind};
 use crate::fasthash::FastMap;
 use crate::feedback::{NamedWayKind, ValueClass, ValuesView};
 use crate::jit_ir::{BlockId, BuildError, Cfg, InitializedReads};
@@ -90,9 +91,17 @@ pub(crate) struct Built {
     pub(crate) initialized: InitializedReads,
 }
 
-/// The graph of `chunk` from its operations and `snapshot` (its feedback), with the analyses it
-/// was built from, or why the tier declines it.
-pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Built, Refusal> {
+/// [`build_view`] of a live chunk's frozen view (`Chunk::freeze`), on the calling thread: the
+/// tests' path.
+#[cfg(test)]
+pub(crate) fn build(chunk: &crate::bytecode::Chunk, snapshot: &Snapshot) -> Result<Built, Refusal> {
+    build_view(&chunk.freeze(true), snapshot)
+}
+
+/// The graph of `chunk`, a chunk's frozen view, from its operations and `snapshot` (its
+/// feedback), with the analyses it was built from, or why the tier declines it. Reads nothing
+/// but its arguments, so that it runs on any thread (stage 2, step 12).
+pub(crate) fn build_view(chunk: &FrozenChunk, snapshot: &Snapshot) -> Result<Built, Refusal> {
     let ops = chunk.jit_ops();
     if chunk.jit_is_resumable() {
         return Err(Refusal::whole("resumable (a generator or an async body)"));
@@ -120,7 +129,7 @@ pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Built, Refusal
     {
         return Err(Refusal::at(pc, reason));
     }
-    let cfg = Cfg::build(chunk).map_err(stack_refusal)?;
+    let cfg = chunk.cfg().map_err(stack_refusal)?;
     let (_, n_slots) = chunk.jit_frame();
     if n_slots + cfg.jit_stack_capacity() > crate::jit::FRAME_BUF {
         return Err(Refusal::whole("a frame over the record's 256 words"));
@@ -196,7 +205,7 @@ fn ix(id: BlockId) -> usize {
 
 /// The constant word of chunk constant `k` (a scalar's, or a String's, which the chunk's pool
 /// roots while code it owns can run), None for a constant generated code does not embed.
-fn const_word(chunk: &Chunk, k: u32) -> Option<u64> {
+fn const_word(chunk: &FrozenChunk, k: u32) -> Option<u64> {
     if chunk.jit_const_copyable(k) {
         chunk.jit_const_scalar_bits(k)
     } else {
@@ -214,7 +223,7 @@ fn const_word(chunk: &Chunk, k: u32) -> Option<u64> {
 /// each come from one source. A release build refuses a disagreement at the loop's back edge.
 #[derive(Clone, Copy)]
 struct Rules<'a> {
-    chunk: &'a Chunk,
+    chunk: &'a FrozenChunk,
     ops: &'a [Op],
     snapshot: &'a Snapshot,
     cfg: &'a Cfg,
@@ -556,7 +565,7 @@ struct Loop {
 }
 
 impl Flow {
-    fn new(chunk: &Chunk, cfg: &Cfg, rules: &Rules) -> Result<Flow, Refusal> {
+    fn new(chunk: &FrozenChunk, cfg: &Cfg, rules: &Rules) -> Result<Flow, Refusal> {
         let blocks = cfg.blocks();
         let ops = chunk.jit_ops();
         let (_, n_slots) = chunk.jit_frame();
@@ -1118,7 +1127,7 @@ impl Before {
 }
 
 struct Builder<'a> {
-    chunk: &'a Chunk,
+    chunk: &'a FrozenChunk,
     ops: &'a [Op],
     snapshot: &'a Snapshot,
     cfg: &'a Cfg,
@@ -1149,7 +1158,7 @@ struct Builder<'a> {
 
 impl<'a> Builder<'a> {
     fn new(
-        chunk: &'a Chunk,
+        chunk: &'a FrozenChunk,
         snapshot: &'a Snapshot,
         cfg: &'a Cfg,
         flow: &'a Flow,

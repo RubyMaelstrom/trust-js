@@ -395,6 +395,157 @@ pub(crate) fn test_tdz_effect_paths() -> [u64; 5] {
 #[path = "jit_operations.rs"]
 mod operations;
 
+/// Discard this core's prefetched instructions before it runs code another thread published (P3
+/// stage 2, step 12): the writer's flush (`dc cvau`, `ic ivau`, `dsb ish`) reaches every core's
+/// caches, and this context synchronization event, an `isb`, the executing core's pipeline, as
+/// JSC's main thread runs its crossModifyingCodeFence before it installs a compiler thread's code
+/// (dfg/DFGJITFinalizer.cpp:60).
+pub(crate) fn sync_instruction_stream() {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: an instruction barrier has no operands and changes no state.
+    unsafe {
+        core::arch::asm!("isb", options(nostack, preserves_flags));
+    }
+}
+
+/// Whether this thread is running an optimizing tier's compile off the main thread (P3 stage 2,
+/// step 12): debug builds check that such a compile reaches none of the main thread's state (its
+/// capacity reclaim, stub table, test switches, agent heap).
+pub(crate) fn off_main_compile() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        OFF_MAIN_COMPILE.with(Cell::get)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
+}
+
+#[cfg(debug_assertions)]
+thread_local! {
+    static OFF_MAIN_COMPILE: Cell<bool> = const { Cell::new(false) };
+}
+
+/// This thread runs a compile off the main thread while the guard lives ([`off_main_compile`]).
+pub(crate) struct OffMainCompile {
+    #[cfg(debug_assertions)]
+    previous: bool,
+}
+
+impl OffMainCompile {
+    pub(crate) fn enter() -> Self {
+        OffMainCompile {
+            #[cfg(debug_assertions)]
+            previous: OFF_MAIN_COMPILE.with(|off| off.replace(true)),
+        }
+    }
+}
+
+impl Drop for OffMainCompile {
+    fn drop(&mut self) {
+        #[cfg(debug_assertions)]
+        OFF_MAIN_COMPILE.with(|off| off.set(self.previous));
+    }
+}
+
+/// The addresses of the per-thread counters test builds' templates embed (P3 stage 2, step 12):
+/// a test reads its own thread's, so a compile on another thread embeds the main thread's, which
+/// its job carries ([`TestAddresses::install`]).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TestAddresses {
+    pub(crate) inline_activations: usize,
+    pub(crate) native_name_commits: [usize; 5],
+    pub(crate) native_deep_names: usize,
+    pub(crate) native_references: [usize; 3],
+    pub(crate) direct_packed_throws: usize,
+    pub(crate) direct_full_state: usize,
+    pub(crate) inline_objects: usize,
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    static TEST_ADDRESSES: Cell<Option<TestAddresses>> = const { Cell::new(None) };
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl TestAddresses {
+    /// This thread's own counters.
+    pub(crate) fn capture() -> Self {
+        let address = |count: &Cell<usize>| count.as_ptr() as usize;
+        TestAddresses {
+            inline_activations: TEST_INLINE_ACTIVATIONS.with(address),
+            native_name_commits: names::TEST_NATIVE_NAME_COMMITS
+                .with(|counts| std::array::from_fn(|kind| address(&counts[kind]))),
+            native_deep_names: names::TEST_NATIVE_DEEP_NAMES.with(address),
+            native_references: names::TEST_NATIVE_REFERENCES
+                .with(|counts| std::array::from_fn(|kind| address(&counts[kind]))),
+            direct_packed_throws: TEST_DIRECT_PACKED_THROWS.with(address),
+            direct_full_state: TEST_DIRECT_FULL_STATE.with(address),
+            inline_objects: alloc::INLINE_OBJECTS.with(address),
+        }
+    }
+
+    /// The counters the code emitted now embeds: a job's main thread's while it compiles,
+    /// else this thread's own.
+    pub(crate) fn current() -> Self {
+        TEST_ADDRESSES
+            .with(Cell::get)
+            .unwrap_or_else(TestAddresses::capture)
+    }
+
+    /// Embed `addresses` in the code emitted on this thread while the guard lives.
+    pub(crate) fn install(addresses: TestAddresses) -> TestAddressesGuard {
+        TestAddressesGuard(TEST_ADDRESSES.with(|installed| installed.replace(Some(addresses))))
+    }
+}
+
+/// [`TestAddresses::install`]'s guard, which restores the previous addresses.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) struct TestAddressesGuard(Option<TestAddresses>);
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl Drop for TestAddressesGuard {
+    fn drop(&mut self) {
+        TEST_ADDRESSES.with(|installed| installed.set(self.0));
+    }
+}
+
+/// What the shared emitters read of a chunk: the live chunk's accessors, or the optimizing tier's
+/// frozen view (P3 stage 2, step 12).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_view.rs"]
+pub(crate) mod view;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) use view::JitChunk;
+
 /// The optimizing tier's ARM64 code generator (P3 stage 1): a child of this module, as the regions
 /// and the operation emitters are, since it emits through their encoder, templates and frame
 /// (`opt::a64` names it).
@@ -1574,6 +1725,10 @@ pub(crate) fn executable_code_can_fit(bytes: usize) -> bool {
 /// Reclaim only inactive, unleased code owned by this thread. Another thread's
 /// live mappings or a fully active working set may still require VM fallback.
 pub(crate) fn ensure_executable_capacity(bytes: usize) -> bool {
+    debug_assert!(
+        !off_main_compile(),
+        "the capacity's reclaim is the main thread's (its CLOCK registry)"
+    );
     let budget = executable_code_budget();
     if bytes > budget.limit {
         return false;
@@ -1627,7 +1782,35 @@ pub(crate) struct ExecutableCodeReservation<'a> {
 }
 
 impl<'a> ExecutableCodeReservation<'a> {
+    /// [`Self::try_new`] off the main thread (P3 stage 2, step 12): a reservation the budget
+    /// cannot take now records nothing, neither a denial nor this thread's compilation pressure,
+    /// since the main thread then maps the code after its reclaim, where `try_new` counts them.
+    fn try_quietly(budget: &'a ExecutableCodeBudget, bytes: usize) -> Option<Self> {
+        if bytes == 0 {
+            return None;
+        }
+        let mut remaining = budget.remaining.load(std::sync::atomic::Ordering::Relaxed);
+        loop {
+            if remaining < bytes {
+                return None;
+            }
+            match budget.remaining.compare_exchange_weak(
+                remaining,
+                remaining - bytes,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            ) {
+                Ok(_) => return Some(Self { bytes, budget }),
+                Err(next) => remaining = next,
+            }
+        }
+    }
+
     fn try_new(budget: &'a ExecutableCodeBudget, bytes: usize) -> Option<Self> {
+        debug_assert!(
+            !off_main_compile(),
+            "a compile off the main thread records no compilation pressure"
+        );
         if bytes == 0 {
             return None;
         }
@@ -1860,6 +2043,21 @@ impl ExecutableBuffer {
         Self::from_bytes_in(bytes, code_region::process_region())
     }
 
+    /// [`Self::from_bytes`] off the main thread (P3 stage 2, step 12; the plan's point 6): no
+    /// reclaim, which is the main thread's (its CLOCK registry), and None where the budget cannot
+    /// take the bytes now, recording nothing, so that the main thread maps them after its reclaim.
+    /// The region's pages are taken under its lock, published (copied, flushed, made executable)
+    /// on this thread; the core that runs the code synchronizes at the install
+    /// ([`sync_instruction_stream`]).
+    pub(crate) fn from_bytes_quietly(bytes: &[u8]) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let reservation =
+            ExecutableCodeReservation::try_quietly(executable_code_budget(), bytes.len())?;
+        Self::place(bytes, code_region::process_region(), reservation)
+    }
+
     /// `bytes` as code in `region`'s pages, else in a mapping of its own.
     fn from_bytes_in(
         bytes: &[u8],
@@ -1871,6 +2069,15 @@ impl ExecutableBuffer {
         ensure_executable_capacity(bytes.len());
         let reservation =
             ExecutableCodeReservation::try_new(executable_code_budget(), bytes.len())?;
+        Self::place(bytes, region, reservation)
+    }
+
+    /// `bytes` as code under `reservation`, in `region`'s pages or a mapping of its own.
+    fn place(
+        bytes: &[u8],
+        region: Option<&'static code_region::CodeRegion>,
+        reservation: ExecutableCodeReservation<'static>,
+    ) -> Option<Self> {
         #[cfg(any(
             all(
                 target_arch = "aarch64",
@@ -3089,6 +3296,14 @@ mod asm {
         /// (`Chunk::jit_fixed_activation`): a fresh frame's body and regions. Clear in code a
         /// borrowed frame enters, whose activation another tier may have made.
         fixed_activation: bool,
+        /// The native runs an entry counts in the direct sequence's retry gate where the code
+        /// generator set it (`opt::entry_weight` read on the main thread with its snapshot: P3
+        /// stage 2, step 12); None: read now (`Asm::entry_weight`).
+        entry_weight: Option<u32>,
+        /// Whether a direct construct makes its `this` in line, which needs the running Agent
+        /// heap's in-line allocation site, where the code generator set it (read on the main
+        /// thread with its snapshot); None: read now (`Asm::inline_construct`).
+        inline_construct: Option<bool>,
         /// The local reads whose slot surely holds a value (`Cfg::initialized_reads`): their
         /// TDZ test is dead. Empty in loose test assemblies, which keep every test.
         initialized_reads: crate::jit_ir::InitializedReads,
@@ -3146,6 +3361,8 @@ mod asm {
                 fp_callee_saved: false,
                 failed: None,
                 fixed_activation: false,
+                entry_weight: None,
+                inline_construct: None,
                 initialized_reads: Default::default(),
                 loop_counts: None,
                 loop_weights: Vec::new(),
@@ -3229,6 +3446,24 @@ mod asm {
         }
         pub fn fixed_activation(&self) -> bool {
             self.fixed_activation
+        }
+        /// Use `weight` as the native runs an entry counts (see the `entry_weight` field).
+        pub fn set_entry_weight(&mut self, weight: u32) {
+            self.entry_weight = Some(weight);
+        }
+        /// The native runs an entry counts (`opt::entry_weight`, unless set).
+        pub fn entry_weight(&self) -> u32 {
+            self.entry_weight.unwrap_or_else(crate::opt::entry_weight)
+        }
+        /// Whether direct constructs make `this` in line (see the `inline_construct` field).
+        pub fn set_inline_construct(&mut self, inline: bool) {
+            self.inline_construct = Some(inline);
+        }
+        /// Whether direct constructs make `this` in line: the agent heap has an in-line
+        /// allocation site for its class-0 cells (`value::object_inline_alloc_site`), unless set.
+        pub fn inline_construct(&self) -> bool {
+            self.inline_construct
+                .unwrap_or_else(|| crate::value::object_inline_alloc_site(0).is_some())
         }
         /// Declare that the code emitted from here on counts its loop iterations, `runs` and
         /// `retry` being the chunk's offsets (see the `loop_counts` field).
@@ -5470,9 +5705,9 @@ impl EntryFrame {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_entry_prologue(
+fn emit_entry_prologue<C: JitChunk + ?Sized>(
     a: &mut asm::Asm,
-    chunk: &Chunk,
+    chunk: &C,
     borrowed_entry: bool,
     frame: &EntryFrame,
     l_unwind: usize,
@@ -7960,10 +8195,48 @@ fn emit_prop_read_stub(
     a.ret();
 }
 
+/// A property name as the property templates read it (P3 stage 2, step 12): its text, and its
+/// key's word (`atom::PropKey::word`: an atom's address in the code's heap, or a tagged index),
+/// asked for only where a template embeds it (a key-checked or creating site). A live chunk's
+/// name makes its key when asked, as the templates always did (`JitName::text`); the optimizing
+/// tier's frozen view gives the key its main thread found or made (`JitChunk::jit_name_key`).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[derive(Clone, Copy)]
+pub(crate) struct JitName<'a> {
+    pub(crate) text: &'a str,
+    key: Option<&'a dyn Fn() -> u64>,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl<'a> JitName<'a> {
+    /// `text`, whose key is atomized in the active heap when asked for.
+    pub(crate) fn text(text: &'a str) -> Self {
+        JitName { text, key: None }
+    }
+
+    /// Name `n` of `chunk`, its key asked of `key` (which reads the chunk: `jit_name_key`).
+    pub(crate) fn of(text: &'a str, key: &'a dyn Fn() -> u64) -> Self {
+        JitName {
+            text,
+            key: Some(key),
+        }
+    }
+
+    /// The key's word.
+    pub(crate) fn key_word(&self) -> u64 {
+        match self.key {
+            Some(key) => key(),
+            None => crate::atom::PropKey::from_text(self.text).word(),
+        }
+    }
+}
+
 /// A first-stage named read outside loops whose cache gave the compile no way to bake: the
 /// receiver's load, the object-tag test (or, for a read that probes a primitive's wrapper
 /// prototype, the receiver word for the stub) and a String's `length` stay in line; the shared
@@ -7971,11 +8244,15 @@ fn emit_prop_read_stub(
 /// the in-line template's slow path does. V8's Sparkplug calls a builtin for such a read
 /// (LoadICBaseline), SpiderMonkey's Baseline its site's IC stub, compiled once per zone and
 /// shared by the sites that attach the same CacheIR.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[allow(clippy::too_many_arguments)]
 fn emit_prop_read_site(
     a: &mut asm::Asm,
     cache_ptr: usize,
-    name: &str,
+    name: JitName<'_>,
     pc: u32,
     l_unwind: usize,
     flags: PropReadFlags,
@@ -8007,7 +8284,7 @@ fn emit_prop_read_site(
     if flags.probe.kc {
         // The site's key word: an atom's address, which lives as long as the heap this code
         // belongs to, or a tagged index.
-        a.mov_imm64(6, crate::atom::PropKey::from_text(name).word());
+        a.mov_imm64(6, name.key_word());
     }
     let stub = a.shared_stub(SharedStub::PropRead(flags).key());
     a.bl_label(stub);
@@ -8079,7 +8356,7 @@ fn emit_prop_load_inline(
     // The site's interned name (`chunk.jit_name(n)`): its data pointer keys the stub-cache
     // arm, and its bytes are the key-checked arm's compare immediates. Pinned by the chunk
     // the emitted code belongs to.
-    name: &str,
+    name: JitName<'_>,
     pc: u32,
     l_unwind: usize,
     method: bool,
@@ -8098,7 +8375,7 @@ fn emit_prop_load_inline(
     // Key-checked entries (`IC_ARR_KEYCHK`: the holder is an Array — `arr.length`, or a method
     // on the Array-exotic `Array.prototype`): validated by an inline compare of the entry's key
     // with the site's compile-time name's, one word each (`PropKey`).
-    let kc = !name.is_empty();
+    let kc = !name.text.is_empty();
     let slow = a.new_label();
     let done = a.new_label();
     let load = a.new_label();
@@ -8122,13 +8399,17 @@ fn emit_prop_load_inline(
         && fits_proto(il.string_proto)
         && fits_proto(il.number_proto)
         && fits_proto(il.boolean_proto)
-        && name != "length"
-        && name != "description"
-        && !name.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
+        && name.text != "length"
+        && name.text != "description"
+        && !name
+            .text
+            .as_bytes()
+            .first()
+            .is_some_and(|b| b.is_ascii_digit());
     let emit_packed_probe_receiver = |a: &mut asm::Asm| emit_packed_probe_receiver(a, il, slow);
     // `length` of a String primitive is its own non-writable, non-configurable data property
     // (ECMA-262 §10.4.3.5 StringGetOwnProperty via ToObject), so no user code can intervene.
-    let string_length = !method && name == "length";
+    let string_length = !method && name.text == "length";
     // After bytecode warmup, ordinary OO sites overwhelmingly have one stable depth/shape/slot.
     // Bake that state into a compact probe instead of embedding the full four-way/deep/exotic
     // state machine at every site. Every fact that made the cached slot authoritative is guarded
@@ -8181,7 +8462,7 @@ fn emit_prop_load_inline(
                 kc,
             },
             push: method || !matches!(recv, PropRecv::Stack),
-            proto: name == "prototype",
+            proto: name.text == "prototype",
         };
         emit_prop_read_site(a, cache_ptr, name, pc, l_unwind, flags, recv, string_length);
         return;
@@ -8352,7 +8633,7 @@ fn emit_prop_load_inline(
                 kc: false,
             },
             push: method || !matches!(recv, PropRecv::Stack),
-            proto: name == "prototype",
+            proto: name.text == "prototype",
         };
         a.mov_imm64(8, cache_ptr as u64);
         let stub = a.shared_stub(SharedStub::PropRead(flags).key());
@@ -8440,7 +8721,7 @@ fn emit_prop_load_inline(
     // of discarding the validation and re-deriving the resolution in Rust.
     branch_accessor_word(a, 12, 9, accessor_hit);
     a.bind(val_body);
-    if name == "prototype" {
+    if name.text == "prototype" {
         // Only this key can hold a function's deferred prototype.
         property_word_guard(a, 12, 13, slow);
     }
@@ -8477,7 +8758,7 @@ fn emit_prop_load_inline(
         a.cbz(17, true, slow);
         a.ldr_imm(17, 17, layout.layout_keys_ptr as u32);
         a.ldr_x_lsl3(17, 17, 13);
-        a.mov_imm64(16, crate::atom::PropKey::from_text(name).word());
+        a.mov_imm64(16, name.key_word());
         a.cmp_reg_x(17, 16);
         a.b_cond(C_NE, slow);
         a.b(val);
@@ -9651,9 +9932,9 @@ fn emit_computed_method_inline(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[allow(clippy::too_many_arguments)]
-fn emit_call_inline(
+fn emit_call_inline<C: JitChunk + ?Sized>(
     a: &mut asm::Asm,
-    chunk: &Chunk,
+    chunk: &C,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
     pc: usize,
@@ -9684,9 +9965,9 @@ fn emit_call_inline(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[allow(clippy::too_many_arguments)]
-fn emit_call_inline_marked(
+fn emit_call_inline_marked<C: JitChunk + ?Sized>(
     a: &mut asm::Asm,
-    chunk: &Chunk,
+    chunk: &C,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
     pc: usize,
@@ -12012,7 +12293,7 @@ fn emit_direct_sequence(
     // optimizing tier on (`opt::entry_weight`, a process constant, which the shared stubs'
     // table keys: P3 stage 2, step 11), compared in 64 bits, so that a count near u32::MAX
     // takes the helper, which saturates, rather than wrap; one with the tier off, as P2's.
-    let weight = crate::opt::entry_weight();
+    let weight = a.entry_weight();
     let retry_done = a.new_label();
     a.ldr_w_imm(5, 4, retry_off as u32);
     a.cbz(5, false, retry_done);
@@ -12049,7 +12330,7 @@ fn emit_direct_sequence(
         let made = a.new_label();
         // In a shared stub too: the allocation reads the running Agent's heap (see
         // `gc_core::InlineAllocSite`).
-        if crate::value::object_inline_alloc_site(0).is_some() {
+        if a.inline_construct() {
             let helper = a.new_label();
             alloc::emit_inline_construct_this(a, helper, made);
             a.bind(helper);
@@ -12331,7 +12612,7 @@ fn emit_direct_sequence(
     {
         let normal = a.new_label();
         a.cbz(8, true, normal);
-        let address = TEST_DIRECT_PACKED_THROWS.with(|count| count.as_ptr() as usize);
+        let address = TestAddresses::current().direct_packed_throws;
         a.mov_imm64(4, address as u64);
         a.ldr_imm(5, 4, 0);
         a.add_imm(5, 5, 1);
@@ -12370,7 +12651,7 @@ fn emit_direct_sequence(
     a.bind(full_state);
     #[cfg(test)]
     {
-        let address = TEST_DIRECT_FULL_STATE.with(|count| count.as_ptr() as usize);
+        let address = TestAddresses::current().direct_full_state;
         a.mov_imm64(4, address as u64);
         a.ldr_imm(5, 4, 0);
         a.add_imm(5, 5, 1);
@@ -12513,9 +12794,9 @@ fn emit_direct_sequence(
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[allow(clippy::too_many_arguments)]
-fn emit_direct_construct(
+fn emit_direct_construct<C: JitChunk + ?Sized>(
     a: &mut asm::Asm,
-    chunk: &Chunk,
+    chunk: &C,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
     argc: usize,
@@ -12603,7 +12884,7 @@ thread_local! {
     };
     static TEST_DIRECT_PACKED_RETURNS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     // Direct callee errors dispatched only after restoring constructing and new_target.
-    static TEST_DIRECT_PACKED_THROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    pub(crate) static TEST_DIRECT_PACKED_THROWS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// Direct calls whose caller was constructing or held a NewTarget (the sequence's full
     /// save-and-restore form).
     pub(crate) static TEST_DIRECT_FULL_STATE: std::cell::Cell<usize> = const {
@@ -13827,7 +14108,7 @@ fn emit_instanceof_inline(
 fn emit_prop_create_probe(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
-    name: Option<&str>,
+    name: Option<JitName<'_>>,
     miss: usize,
     commit: usize,
 ) {
@@ -13906,7 +14187,7 @@ fn emit_prop_create_probe(
     a.ldr_x_lsl3(17, 16, 13);
     match name {
         Some(name) => {
-            a.mov_imm64(14, crate::atom::PropKey::from_text(name).word());
+            a.mov_imm64(14, name.key_word());
             a.cmp_reg_x(17, 14);
         }
         None => a.cmp_reg_x(17, 6),
@@ -14060,7 +14341,7 @@ struct PropWriteFlags {
 fn emit_prop_write_site(
     a: &mut asm::Asm,
     cache_ptr: usize,
-    name: &str,
+    name: JitName<'_>,
     pc: u32,
     l_unwind: usize,
     recv: PropRecv,
@@ -14077,7 +14358,7 @@ fn emit_prop_write_site(
     emit_exec_payload(a, 9, 10);
     a.mov_imm64(8, cache_ptr as u64);
     if flags.create {
-        a.mov_imm64(6, crate::atom::PropKey::from_text(name).word());
+        a.mov_imm64(6, name.key_word());
     }
     let stub = a.shared_stub(SharedStub::PropWrite(flags).key());
     a.bl_label(stub);
@@ -14214,7 +14495,7 @@ fn emit_set_prop_inline(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     cache_ptr: usize,
-    name: &str,
+    name: JitName<'_>,
     pc: u32,
     l_unwind: usize,
     recv: PropRecv,
@@ -14239,7 +14520,7 @@ fn emit_set_prop_inline(
         let flags = PropWriteFlags {
             stack: matches!(recv, PropRecv::Stack),
             keep,
-            create: store_may_create(name),
+            create: store_may_create(name.text),
         };
         emit_prop_write_site(a, cache_ptr, name, pc, l_unwind, recv, flags);
         return;
@@ -14288,7 +14569,7 @@ fn emit_set_prop_inline(
     // Creation IC: constructors repeatedly assign a named field to a fresh receiver whose map
     // lacks it (see `emit_prop_create_probe`). Its ways share the site's cells with ordinary
     // update ways; the single way loop below dispatches on each way's kind.
-    let create_ok = store_may_create(name);
+    let create_ok = store_may_create(name.text);
     let create_commit = a.new_label();
     // 3-8 per way (sites allocate PROP_IC_WAYS consecutive cells; the Rust fast path probes
     // all of them, so the template must too or a rotating store site helper-calls forever):
@@ -15490,7 +15771,7 @@ fn load_name_inlinable(layout: &crate::value::JitLayout) -> bool {
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_prologue_copies(a: &mut asm::Asm, chunk: &Chunk, card_mark: bool) {
+fn emit_prologue_copies<C: JitChunk + ?Sized>(a: &mut asm::Asm, chunk: &C, card_mark: bool) {
     let Some((parameters, this_slot)) = chunk.jit_prologue_copies() else {
         return;
     };
@@ -17162,6 +17443,9 @@ struct GlobalStubTable {
     ilayout: crate::interpreter::InterpLayout,
     direct: Option<(usize, usize, usize, u32)>,
     addresses: crate::fasthash::FastMap<u32, u64>,
+    /// Counts the table's changes (a stub assembled, the direct inputs set), so that the
+    /// optimizing tier's snapshots of it are made again only after one (`stub_table_snapshot`).
+    generation: u64,
 }
 
 #[cfg(all(
@@ -17188,6 +17472,10 @@ thread_local! {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn with_global_stubs<R>(f: impl FnOnce(&mut Option<GlobalStubTable>) -> R) -> Option<R> {
+    debug_assert!(
+        !off_main_compile(),
+        "the stubs are assembled on the main thread (P3 stage 2, step 12)"
+    );
     #[cfg(not(test))]
     {
         let mut table = GLOBAL_STUBS.lock().ok()?;
@@ -17234,6 +17522,7 @@ fn global_stub_address(key: u32, context: &StubContext<'_>) -> Option<u64> {
             ilayout,
             direct,
             addresses: Default::default(),
+            generation: 0,
         });
         if table.layout != *context.layout || table.ilayout != ilayout {
             return None;
@@ -17242,7 +17531,10 @@ fn global_stub_address(key: u32, context: &StubContext<'_>) -> Option<u64> {
             match table.direct {
                 Some(known) if Some(known) != direct => return None,
                 Some(_) => {}
-                None => table.direct = direct,
+                None => {
+                    table.direct = direct;
+                    table.generation += 1;
+                }
             }
         }
         if let Some(&address) = table.addresses.get(&key) {
@@ -17250,8 +17542,241 @@ fn global_stub_address(key: u32, context: &StubContext<'_>) -> Option<u64> {
         }
         let address = assemble_global_stub(key, context)?;
         table.addresses.insert(key, address);
+        table.generation += 1;
         Some(address)
     })?
+}
+
+/// The process-wide stub table as the main thread saw it at a compile's snapshot (P3 stage 2,
+/// step 12; the plan's point 3): what an emission on another thread finds each requested stub as
+/// (`emit_shared_stubs_from`), without the table's lock or, in test builds, the main thread's
+/// own table. A stub the table lacks is the main thread's to assemble (`assemble_stubs`) before
+/// the compile runs again: no stub is assembled off the main thread.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) struct StubTableSnapshot {
+    /// TRUST_JS_JIT_CHUNK_STUBS: every chunk keeps its own copies.
+    chunk_stubs: bool,
+    table: Option<StubTableCopy>,
+    /// The stubs whose assembly failed (no executable memory): their chunks keep copies.
+    copies: Vec<u32>,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+struct StubTableCopy {
+    layout: crate::value::JitLayout,
+    ilayout: crate::interpreter::InterpLayout,
+    direct: Option<(usize, usize, usize, u32)>,
+    addresses: crate::fasthash::FastMap<u32, u64>,
+    generation: u64,
+}
+
+/// What an emission finds a requested stub as in a [`StubTableSnapshot`].
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+enum StubLookup {
+    /// Assembled: a veneer to this address.
+    At(u64),
+    /// Kept per chunk: its body in the code (another context, chunk stubs, a failed assembly).
+    Copy,
+    /// Not assembled yet: the main thread's to assemble.
+    Missing,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl StubTableSnapshot {
+    /// `key`'s stub for an emission in `context` whose direct sequence counts `entry_weight` an
+    /// entry (`opt::entry_weight` on the main thread), as [`global_stub_address`] would find it.
+    fn lookup(&self, key: u32, context: &StubContext<'_>, entry_weight: u32) -> StubLookup {
+        if self.chunk_stubs || self.copies.contains(&key) {
+            return StubLookup::Copy;
+        }
+        let Some(&ilayout) = context.ilayout else {
+            return StubLookup::Copy;
+        };
+        let direct = context.direct.map(|direct| {
+            (
+                direct.attempted_off,
+                direct.runs_off,
+                direct.retry_off,
+                entry_weight,
+            )
+        });
+        let is_direct = SharedStub::from_key(key).enters_direct_sequence();
+        if is_direct && direct.is_none() {
+            return StubLookup::Copy;
+        }
+        let Some(table) = &self.table else {
+            // The first stub makes the table, with this context.
+            return StubLookup::Missing;
+        };
+        if table.layout != *context.layout || table.ilayout != ilayout {
+            return StubLookup::Copy;
+        }
+        if is_direct {
+            match table.direct {
+                Some(known) if Some(known) != direct => return StubLookup::Copy,
+                Some(_) => {}
+                None => return StubLookup::Missing,
+            }
+        }
+        match table.addresses.get(&key) {
+            Some(&address) => StubLookup::At(address),
+            None => StubLookup::Missing,
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    /// The last snapshot of the stub table this thread took (`stub_table_snapshot`), reused while
+    /// the table has not changed.
+    static STUB_SNAPSHOT: std::cell::RefCell<Option<std::sync::Arc<StubTableSnapshot>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The stub table as it stands, for a compile on another thread (main thread; see
+/// [`StubTableSnapshot`]), its stubs whose assembly failed in `copies`: the last one this thread
+/// made while the table has not changed since.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn stub_table_snapshot(copies: &[u32]) -> std::sync::Arc<StubTableSnapshot> {
+    let chunk_stubs = env_flag!("TRUST_JS_JIT_CHUNK_STUBS");
+    let generation =
+        with_global_stubs(|table| table.as_ref().map(|table| table.generation)).flatten();
+    let cached = STUB_SNAPSHOT.with(|cached| cached.borrow().clone());
+    if let Some(snapshot) = cached {
+        let current = snapshot.table.as_ref().map(|table| table.generation) == generation;
+        if current && snapshot.copies == copies && snapshot.chunk_stubs == chunk_stubs {
+            return snapshot;
+        }
+    }
+    let table = with_global_stubs(|table| {
+        table.as_ref().map(|table| StubTableCopy {
+            layout: table.layout,
+            ilayout: table.ilayout,
+            direct: table.direct,
+            addresses: table.addresses.clone(),
+            generation: table.generation,
+        })
+    })
+    .flatten();
+    let snapshot = std::sync::Arc::new(StubTableSnapshot {
+        chunk_stubs,
+        table,
+        copies: copies.to_vec(),
+    });
+    STUB_SNAPSHOT.with(|cached| *cached.borrow_mut() = Some(snapshot.clone()));
+    snapshot
+}
+
+/// Assemble the stubs `keys` (in their order) for an emission in the context of `layout`,
+/// `ilayout` and, for the direct sequence's stubs, the `direct` chunk offsets (main thread), as
+/// the emission would have on the main thread (`global_stub_address`); the keys whose assembly
+/// failed, whose chunks keep copies.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn assemble_stubs(
+    keys: &[u32],
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    direct: Option<(usize, usize, usize)>,
+) -> Vec<u32> {
+    let mut a = asm::Asm::new();
+    let finish = a.new_label();
+    let context = StubContext {
+        layout,
+        ilayout: Some(ilayout),
+        direct: direct.map(|(attempted_off, runs_off, retry_off)| DirectCallContext {
+            attempted_off,
+            runs_off,
+            retry_off,
+            finish_stub: finish,
+        }),
+    };
+    keys.iter()
+        .copied()
+        .filter(|&key| global_stub_address(key, &context).is_none())
+        .collect()
+}
+
+/// [`emit_shared_stubs`] in an emission off the main thread: each stub from `table`, a veneer to
+/// its address, or its body where the chunk keeps a copy, and a missing one recorded in
+/// `missing` with a veneer to nothing (the compile is then made again once the main thread has
+/// assembled it). `entry_weight` is the main thread's `opt::entry_weight`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_shared_stubs_from(
+    a: &mut asm::Asm,
+    context: &StubContext<'_>,
+    table: &StubTableSnapshot,
+    entry_weight: u32,
+    missing: &mut Vec<u32>,
+) {
+    loop {
+        let requested = a.take_shared_stubs();
+        if requested.is_empty() {
+            return;
+        }
+        for (key, label) in requested {
+            a.bind(label);
+            let address = match table.lookup(key, context, entry_weight) {
+                StubLookup::At(address) => address,
+                StubLookup::Copy => {
+                    SharedStub::from_key(key).emit(a, context);
+                    continue;
+                }
+                StubLookup::Missing => {
+                    if !missing.contains(&key) {
+                        missing.push(key);
+                    }
+                    0
+                }
+            };
+            a.ldr_literal_x(16, 8);
+            a.br(16);
+            a.word(address as u32);
+            a.word((address >> 32) as u32);
+        }
+    }
+}
+
+/// Read once on the main thread the process switches the shared templates read through their
+/// own caches, so that an emission on another thread finds each one made (P3 stage 2, step 12):
+/// they are the environment's, the same on every thread.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn prime_switches() {
+    let _ = (
+        jit_map_enabled(),
+        shared_stubs_enabled(),
+        hot_loop_ops(),
+        jscvt_available(),
+        crate::bytecode::direct_shared_context_enabled(),
+        crate::bytecode::call_paths_enabled(),
+        env_flag!("TRUST_JS_JIT_CHUNK_STUBS"),
+    );
 }
 
 /// Assemble one shared stub (with any stubs it requests, and the direct-call finish stub) into

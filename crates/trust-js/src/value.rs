@@ -5942,6 +5942,10 @@ impl Drop for ActiveHeapCell {
 /// same as `with_active_gc_heap`. `f` must not change the active Agent.
 #[inline(always)]
 fn with_agent_heap<R>(f: impl FnOnce(&GcState) -> R) -> R {
+    debug_assert!(
+        !crate::jit::off_main_compile(),
+        "a compile off the main thread reads no agent heap (its frozen view holds the sites)"
+    );
     let state = ACTIVE_AGENT_TAG.with(|tag| tag.get().0) as *const GcState;
     if !state.is_null() {
         // SAFETY: while the tag names a heap, the active-heap cell holds an `Rc` of it:
