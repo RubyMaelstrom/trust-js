@@ -2190,12 +2190,26 @@ frame, the only frame the tier has until stage 3: when the VM moves a frame into
 borrowed-frame code (the loop transfer) while the chunk's entry code is the tier's, so that the
 frame came from an exit, and that code's exits have reached 5 << R (ExitTable::loop_limit, made
 beside `limit`), the code is discarded as at its limit (opt::discard: flags, R + 1, the template
-fallback, the warm-up), and the frame goes on into its borrowed-frame code as now. The log names
-the loop limit. Tests: a function whose tier code exits early in a long loop is discarded at its
-fifth such call, not its hundredth; exits that no loop transfer follows count to 100 << R as now;
-the tier off unchanged. Expected: zlib's four functions discard after 5 calls in place of 100,
-most of a8's 8.3 points of Octane's coverage move to tier code, and zlib's fixed runs execute
-fewer instructions (to be measured as step 11's were).
+fallback, the warm-up), and the frame goes on into its borrowed-frame code as now. The loop must
+be hot, as JSC's is (revised 2026-11-10, before any code): every exit that does not jettison
+resets the baseline's execution counter to a long warm-up (thresholdForOptimizeAfterLongWarmUp,
+1,000 scaled by the code's size and 2^R; a loop iteration counts 1, an entry 15:
+dfg/DFGOSRExitCompilerCommon.cpp:115-141, runtime/OptionsList.h:373-377, bytecode/CodeBlock.cpp:
+2602-2608), so the from-loop check in operationOptimize runs only once the exited frame's own loop
+has warmed up again, not for a cold loop. TRust's exited frame transfers at its first back edge
+(run_native_frame_in_vm's VmTiering::hot, which leaves the VM, the slowest place to loop, at once),
+so that transfer alone would fire on cold loops as on hot ones (the departure that deferred this
+rule in step 3). So: an exit that brings the code's count to its loop limit or past it, the code
+not discarded, runs its frame under the VM's own warm-up (VmTiering::new: 128 back edges and 4,096
+units of loop work) in place of hot; when that frame's loop asks for the transfer, the code is
+discarded and the frame moves into its borrowed-frame code as now; a frame whose loop ends first
+finishes in the VM. Below the loop limit an exited frame transfers at its first back edge as now.
+The log names the loop limit. Tests: a function whose tier code exits early in each call and then
+loops long is discarded at its fifth such call, not its hundredth (its tenth at R = 1); one whose
+loop after the exit is short is not, and its exits count to 100 << R as now; exits that no loop
+transfer follows count to 100 << R as now; the tier off unchanged. Expected: zlib's four functions
+discard after 5 calls in place of 100, most of a8's 8.3 points of Octane's coverage move to tier
+code, and zlib's fixed runs execute fewer instructions (to be measured as step 11's were).
 
 The owner's answer on the fallback compiles (2026-11-10): "You can leave the fallback compiles out
 if you think it's best." They are left out of the 3% count, which counts the bytecode recompile
