@@ -451,8 +451,10 @@ fn constructions_keep_their_instance_across_collections() {
 #[test]
 fn hot_new_sites_construct_through_the_direct_sequence() {
     // Counts the constructions the direct sequence completes, in the tier's effects too; a
-    // forced exit hands its construction to the VM.
+    // forced exit hands its construction to the VM, and a compile off the main thread that
+    // installs during a count changes the code under it: compiled on the main thread.
     crate::opt::pin_forced_exits_off_for_test();
+    crate::opt::pin_synchronous_for_test();
     if !run_alone("jit::construct_tests::hot_new_sites_construct_through_the_direct_sequence") {
         return;
     }
