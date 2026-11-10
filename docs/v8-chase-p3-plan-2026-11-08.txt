@@ -1725,3 +1725,46 @@ reads; the A725 cores deliver 1.15 of 2.81 GHz. Every session since at least 202
    Ion, which it turns off with one CPU, jit/Ion.cpp:2110-2118; JSC's useConcurrentJIT, on by
    default, runtime/OptionsList.h:291). Which CPU model the bar assumes is the owner's (asked
    2026-11-10).
+
+Step 9 landed (709e8a1b..1ab94b0e, 2026-11-10). On Linux and Windows executable code comes from
+one region of addresses reserved at the first allocation (jit_code_region.rs): max(1 GiB, twice
+the code budget), a bitmap of its pages and a cursor under a lock. An allocation takes the first
+free run at or after the cursor (wrapping, never across the end), commits it with SpiderMonkey's
+flags, publishes (copy, flush, RX: one `publish` now shared with the own-mapping path; the two
+Linux modules merged, x86-64's flush empty), and moves the cursor past it, for every size
+(SpiderMonkey moves it only past runs of two pages or fewer); a free decommits, then clears the
+bits; the cursor never moves back; no random skip. Bits are taken under the lock and committed
+outside it, as SpiderMonkey's. macOS keeps its mapping per object (an uninhabited CodeRegion
+stub there); an ExecutableBuffer remembers where its pages came from.
+- Departures: (1) the decommit's fixed no-access mapping adds MAP_NORESERVE, as the reservation
+  has, so a freed range merges back into its no-access neighbours (/proc/self/maps shows one
+  ---p mapping again after all frees) rather than staying a mapping of its own against
+  vm.max_map_count; (2) failures: a commit the system refuses leaves its pages taken for good (a
+  kernel that unmaps before it maps could leave another mapping there), a refused protection
+  decommits and releases, a refused decommit leaks its pages where SpiderMonkey crashes, and any
+  failure in the region falls back to a mapping of its own.
+- Counts (fat-LTO builds of main 9107efbc and the step from git-archive exports; NavierStokes'
+  400 fixed runs, setarch -R, TRUST_JS_GC_PACING=0, the tier on; target/p3/stage2/step9-impl,
+  measure.out): CPU 5, main 5.786G, 5.760G, 7.768G and 7.353G cycles (1.7M, 1.6M, 40.1M and 33.8M
+  mispredictions), the step 5.634G to 5.661G (1.13M to 1.28M), main with the shim 5.642G to
+  5.645G, the step with the shim 5.632G to 5.635G (the shim changes nothing on the step); the
+  same 45.762G instructions (the step +28K). Tier off 7.793G and 7.797G. CPU 10 (A725) 8.633G on
+  both. Octane through NavierStokes, four runs each alternating, CPU 5, ASLR on (CPUs 5 and 10
+  capped 0 of 299 s): main Richards 1,280 to 2,595, Crypto 6,335 to 8,644, NavierStokes 3,304 to
+  12,280; the step 3,329 to 3,336, 9,229 to 9,265 and 14,323 to 14,395.
+- Tests: the library's suites with the tier off and on eager (3,126 each), the tier's tests eager
+  with exits every 7 and with an exit limit of 1 (232 each), the region's 8 tests (100 repeats),
+  Test262 in the tier's four configurations (53,573 of 53,575 each; the two staging/sm failures
+  as gate 1's), clippy clean but main's single_range_in_vec_init (opt/a64_tests.rs, since step 6).
+  The RegExp tests under TRUST_JS_REGEXP_TIER_UP_AT=1 and TRUST_JS_REGEXP_NATIVE_VERIFY=1: 146
+  pass and deeply_nested_patterns_compile_on_a_small_stack_or_fail_cleanly overflows its 256 KiB
+  thread there, as on main (it passes at the default tier-up); allocation_failure's
+  exhausted_memory_throws_range_error_for_array_buffers fails as on main in every tier (under
+  its 192 MiB limit the region is refused and code maps its own, as on main). On zombie
+  (x86-64): the check and clippy clean, the library's suite passes (2,772); Windows' check clean
+  but date.rs's 20 warnings, and its tests under Wine pass but the three snapshot codec tests that
+  fail on main's Windows build under Wine as well (2,763 of 2,766; the region's 8 pass).
+- Open: after the cursor's first wrap a page freed just ahead of it is taken when the cursor
+  reaches it, however recent the free; a full Octane run commits 34,104 pages in 4,930 commits
+  (13% of the region), so the first wrap comes after about seven Octane runs in one process. The
+  1 GiB reservation counts against address-space limits (a process under one maps its own).
