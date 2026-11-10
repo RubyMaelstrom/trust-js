@@ -50,6 +50,35 @@ use crate::jit::JitCode;
 use std::cell::Cell;
 use std::rc::Rc;
 
+/// Print a line of the tier's log (`eprintln!`), its time left out of the main-thread parts'
+/// timers ([`main_thread_timer`]): the log is the measurement's instrument, not the compile's
+/// work.
+macro_rules! log_line {
+    ($($arg:tt)*) => {
+        print_log_line(format_args!($($arg)*))
+    };
+}
+
+thread_local! {
+    /// The time this thread spent printing the tier's log ([`log_line!`]), which the main-thread
+    /// parts' clock leaves out ([`work_clock`]).
+    static LOGGED: Cell<std::time::Duration> = const { Cell::new(std::time::Duration::ZERO) };
+}
+
+fn print_log_line(line: std::fmt::Arguments<'_>) {
+    let started = std::time::Instant::now();
+    eprintln!("{line}");
+    LOGGED.with(|logged| logged.set(logged.get() + started.elapsed()));
+}
+
+/// The main-thread parts' clock: now, less the time this thread has spent printing the log, so
+/// that a part's time from [`main_thread_timer`] to [`log_main_thread`] leaves out the lines
+/// printed meanwhile.
+fn work_clock() -> std::time::Instant {
+    let now = std::time::Instant::now();
+    now.checked_sub(LOGGED.with(Cell::get)).unwrap_or(now)
+}
+
 /// The switches a test sets for its thread in place of the environment's, which a process reads
 /// once (`TestSwitches::set`).
 #[cfg(test)]
@@ -319,7 +348,7 @@ fn waits_at(chunk: &Chunk, checkpoint: u8, what: &str) -> bool {
         return false;
     }
     if log_enabled() {
-        eprintln!(
+        log_line!(
             "[opt] waiting {} at checkpoint {checkpoint}: feedback changed{what}",
             name(chunk)
         );
@@ -351,7 +380,7 @@ pub(crate) fn refuses_unspliced(chunk: &Chunk) -> bool {
             .push((chunk as *const Chunk as usize, "over the size limit"))
     });
     if log_enabled() {
-        eprintln!(
+        log_line!(
             "[opt] refused {}: over the size limit ({ops} ops, before its recompile)",
             name(chunk)
         );
@@ -371,7 +400,7 @@ pub(crate) fn forget(chunk: &Chunk) {
 /// (None otherwise: no clock read): the owner's count for the compile bar takes every such part
 /// (the plan's "The owner's answers", 2026-11-10), each logged by [`log_main_thread`].
 pub(crate) fn main_thread_timer() -> Option<std::time::Instant> {
-    log_enabled().then(std::time::Instant::now)
+    log_enabled().then(work_clock)
 }
 
 /// Log the main-thread `part` of a tier compile of `chunk` (`recompile`: the bytecode recompile
@@ -380,10 +409,13 @@ pub(crate) fn main_thread_timer() -> Option<std::time::Instant> {
 /// ([`main_thread_timer`]): `[opt] main-thread <part> <name> in <ms> ms`. Nothing without a timer.
 pub(crate) fn log_main_thread(part: &str, chunk: &Chunk, started: Option<std::time::Instant>) {
     if let Some(started) = started {
-        eprintln!(
+        log_line!(
             "[opt] main-thread {part} {} in {:.3} ms",
             name(chunk),
-            started.elapsed().as_secs_f64() * 1e3
+            work_clock()
+                .saturating_duration_since(started)
+                .as_secs_f64()
+                * 1e3
         );
     }
 }
@@ -396,7 +428,7 @@ pub(crate) fn fallback_timer(chunk: &Chunk) -> Option<std::time::Instant> {
         return None;
     }
     let deferred = ChunkProfile::get(chunk).is_some_and(ChunkProfile::fallback_deferred);
-    (DISCARDING.with(Cell::get) || deferred).then(std::time::Instant::now)
+    (DISCARDING.with(Cell::get) || deferred).then(work_clock)
 }
 
 /// The fallback's compile that [`fallback_timer`] timed ended, `deferred` if it was deferred for
@@ -648,13 +680,13 @@ fn note_refusal(chunk: &Chunk, refusal: &Refusal, timing: &Timing) {
     if log_enabled() {
         let ms = timing.compiled.as_secs_f64() * 1e3;
         match refusal.pc {
-            Some(pc) => eprintln!(
+            Some(pc) => log_line!(
                 "[opt] refused {} at pc {pc}: {} ({ms:.3} ms) {}",
                 name(chunk),
                 refusal.reason,
                 timing.fields()
             ),
-            None => eprintln!(
+            None => log_line!(
                 "[opt] refused {}: {} ({ms:.3} ms) {}",
                 name(chunk),
                 refusal.reason,
@@ -691,7 +723,7 @@ fn finish(
     let _ = verified;
     if log_enabled() {
         for decline in &declines {
-            eprintln!(
+            log_line!(
                 "[opt] declined {} pc {} {:?}: {}",
                 name(chunk),
                 decline.pc,
@@ -700,7 +732,7 @@ fn finish(
             );
         }
         if let Some(message) = &verify_failure {
-            eprintln!("[opt] verify {} failed: {message}", name(chunk));
+            log_line!("[opt] verify {} failed: {message}", name(chunk));
         }
     }
     let compiled = match outcome {
@@ -738,7 +770,7 @@ fn finish(
         }
     }
     if log_enabled() {
-        eprintln!(
+        log_line!(
             "[opt] compiled {} ({} ops, {nodes} nodes, {} bytes) in {:.3} ms \
              at {:#x} {:#x} {}",
             name(chunk),
@@ -764,7 +796,7 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
     // leaves the slot cold.
     let Some(permit) = chunk.jit.begin_compile() else {
         if log_enabled() {
-            eprintln!("[opt] refused {}: no code slot", name(chunk));
+            log_line!("[opt] refused {}: no code slot", name(chunk));
         }
         return false;
     };
@@ -1033,7 +1065,7 @@ fn land(
                 }
                 None => {
                     if log_enabled() {
-                        eprintln!("[opt] refused {}: no code slot", name(&chunk));
+                        log_line!("[opt] refused {}: no code slot", name(&chunk));
                     }
                     false
                 }
@@ -1135,7 +1167,7 @@ fn install_job(i: &mut Interp, job: PendingJob, finished: Finished) {
                 .push((Rc::as_ptr(&job.chunk) as usize, reason))
         });
         if log_enabled() {
-            eprintln!(
+            log_line!(
                 "[opt] dropped {}: {reason} (compiled in {:.3} ms {})",
                 name(&job.chunk),
                 job.timing.compiled.as_secs_f64() * 1e3,
@@ -1244,7 +1276,7 @@ fn move_epoch(why: &str) {
         moves.get()
     });
     if log_enabled() {
-        eprintln!("[opt] epoch moved ({why}), {moves} by the tier");
+        log_line!("[opt] epoch moved ({why}), {moves} by the tier");
     }
 }
 
@@ -1294,7 +1326,7 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
             .iter()
             .map(|(pc, reason, count)| format!("pc {pc} {reason:?} x{count}"))
             .collect();
-        eprintln!(
+        log_line!(
             "[opt] discarded {} after {} exits (limit {}, R {before} -> {r}) for {}: {}",
             name(chunk),
             table.taken.get(),
@@ -1317,7 +1349,7 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
     if reoptimizing && chunk.feedback_vector().record_map().is_some() {
         if !fixable {
             if log_enabled() {
-                eprintln!(
+                log_line!(
                     "[opt] not reoptimized {}: unfixable exits only",
                     name(chunk)
                 );
@@ -1330,7 +1362,7 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
             // included.
             profile.settle(snapshot::fingerprint(chunk));
         } else if log_enabled() {
-            eprintln!(
+            log_line!(
                 "[opt] not reoptimized {}: its warm-up would pass the checkpoint word",
                 name(chunk)
             );
@@ -1410,7 +1442,7 @@ fn flag(chunk: &Chunk, exit: &ExitRecord) {
                 if inlined { " (spliced)" } else { "" }
             )
         };
-        eprintln!(
+        log_line!(
             "[opt] flag {} pc {} {:?} {key}",
             name(chunk),
             exit.pc,
@@ -1472,7 +1504,7 @@ pub(crate) fn reoptimize(
     chunk.set_inline_retry_at(0);
     forget(chunk);
     if log_enabled() {
-        eprintln!(
+        log_line!(
             "[opt] reoptimizing {} at checkpoint {checkpoint} (R {r})",
             name(chunk)
         );
@@ -1528,7 +1560,7 @@ fn install_code(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
         }
         Some(None) => {
             if log_enabled() {
-                eprintln!("[opt] refused {}: an unavailable code slot", name(chunk));
+                log_line!("[opt] refused {}: an unavailable code slot", name(chunk));
             }
             false
         }
@@ -1539,7 +1571,7 @@ fn install_code(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
             }
             None => {
                 if log_enabled() {
-                    eprintln!("[opt] refused {}: no code slot", name(chunk));
+                    log_line!("[opt] refused {}: no code slot", name(chunk));
                 }
                 false
             }
@@ -1574,7 +1606,7 @@ pub(crate) fn note_template(chunk: &Chunk, base: *mut u8, len: usize) {
     let Some(why) = template_class(chunk) else {
         return;
     };
-    eprintln!(
+    log_line!(
         "[opt] template {:#x} {:#x} {} ({why})",
         base as usize,
         len,
