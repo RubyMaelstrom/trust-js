@@ -2196,3 +2196,19 @@ fifth such call, not its hundredth; exits that no loop transfer follows count to
 the tier off unchanged. Expected: zlib's four functions discard after 5 calls in place of 100,
 most of a8's 8.3 points of Octane's coverage move to tier code, and zlib's fixed runs execute
 fewer instructions (to be measured as step 11's were).
+
+The owner's answer on the fallback compiles (2026-11-10): "You can leave the fallback compiles out
+if you think it's best." They are left out of the 3% count, which counts the bytecode recompile
+that makes the tier's chunk, the snapshot, generate while it runs on the main thread, and the
+install; the fallback compiles stay logged (step 11's `main-thread fallback` lines) and every
+session reports them beside the bar. Why: a fallback compile makes the template JIT's code for a
+second stage, which the tier-off engine compiles for every spliced second stage at its first
+native entry, so with the tier on these compiles are a subset of the tier-off engine's, not new
+work (Djot's three are all of spliced chunks); none of the exemplars compiles at a
+deoptimization, since their baseline code exists, and their compile-time counts are the
+optimizing compile's own; and the time stays in the measured passes, which the bar of no fixture
+more than 2% slower with the tier on counts whole. Effect on the expectations (step 11's logs
+scaled to session p3s2-7f92ab9d's Djot pass): after step 12 about 3.4% of Djot's pass counted
+(5.3% with the fallback compiles), after step 14 about 2.6% (4.5% with them: step 14 removes the
+empty plans' recompiles and fallbacks, and Djot's fallbacks are of spliced chunks); the two-CPU
+session measures them.
