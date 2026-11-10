@@ -761,6 +761,17 @@ impl Engine {
         self.interp.collect_garbage_for_host();
     }
 
+    /// Define `globalThis.performance` with `now()`, as the engine shell has it (d8's and JSC's
+    /// shells define one too): the milliseconds, with a fraction, on the monotonic clock since
+    /// the first call of this in the process. Hidden like the method above: the shell's, not
+    /// embedder API, since hosts define their own `performance` (the runtime's comes from
+    /// trust-js-web) and no engine realm carries one otherwise.
+    #[doc(hidden)]
+    pub fn unstable_install_shell_performance(&mut self) {
+        self.interp.activate_gc_heap();
+        builtins::install_shell_performance(&mut self.interp);
+    }
+
     /// Collections so far, and the minor collections among them. Hidden like the method above:
     /// a diagnostic for host crates' allocation-accounting tests, not supported embedder API.
     #[doc(hidden)]

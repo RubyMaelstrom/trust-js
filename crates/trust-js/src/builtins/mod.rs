@@ -28,6 +28,7 @@ mod errors;
 mod function_proto;
 mod globals;
 mod host;
+pub(crate) use host::install_shell_performance;
 mod json;
 pub(crate) use json::parse_json;
 mod math;

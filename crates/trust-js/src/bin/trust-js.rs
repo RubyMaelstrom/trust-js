@@ -9,6 +9,9 @@
 //!
 //! With `--module` each file is evaluated as an ES module; relative import specifiers resolve
 //! against the importing file on disk (what a test262 host like test262.fyi expects).
+//!
+//! Besides the language's globals the shell has `performance.now()`, the milliseconds on a
+//! monotonic clock since it started (as d8's and JSC's shells; embedders define their own).
 
 use std::io::{BufRead, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
@@ -66,6 +69,8 @@ fn main() {
         })
         .collect();
     let mut engine = Engine::new();
+    // The shell's `performance.now()` (as d8's and JSC's): the fixtures and benchmarks time with it.
+    engine.unstable_install_shell_performance();
     if let Some(t) = tier {
         engine.set_tier(t);
     }
@@ -176,6 +181,11 @@ Options:
                           moves into compiled code at a loop header once its
                           function has tiered up, or after 128 backedges of
                           one loop execution.
+
+Globals (besides the language's):
+  print(value)               Print the value as one line
+  performance.now()          Milliseconds, with a fraction, on a monotonic clock
+                             since the shell started (as d8's and JSC's shells)
 
 Environment:
   TRUST_JS_TIER=TIER         Default execution tier (--tier overrides it)

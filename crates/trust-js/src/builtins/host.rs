@@ -10,6 +10,24 @@ pub(super) fn install_host(it: &mut Interp) {
     set_builtin(&it.global, "$262", host);
 }
 
+/// `performance.now()`'s zero point: the first install in the process, which is the shell's start
+/// (d8's `kInitialTicks`, src/d8/d8.cc:632).
+static SHELL_TIME_ORIGIN: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+
+/// The engine shell's `performance` (`Engine::unstable_install_shell_performance`), as d8's and
+/// JSC's shells define one: a plain object whose `now()` is the milliseconds, with a fraction, on
+/// the monotonic clock since the shell started. Not coarsened, as d8's is not (JSC reduces its own
+/// to 20 µs). Embedders' realms do not get it: hosts define their own `performance`.
+pub(crate) fn install_shell_performance(it: &mut Interp) {
+    SHELL_TIME_ORIGIN.get_or_init(std::time::Instant::now);
+    let performance = it.new_object();
+    it.def_method(&performance, "now", 0, |_i, _t, _a| {
+        let origin = SHELL_TIME_ORIGIN.get_or_init(std::time::Instant::now);
+        Ok(Value::Num(origin.elapsed().as_secs_f64() * 1000.0))
+    });
+    set_builtin(&it.global, "performance", Value::Obj(performance));
+}
+
 /// Build a `$262` host object. `realm_global` is the global of the realm this `$262` controls
 /// (None for the main realm, in which case the live `it.global` is used and `evalScript` runs in the
 /// current realm).
