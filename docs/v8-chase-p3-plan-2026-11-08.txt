@@ -2212,3 +2212,46 @@ scaled to session p3s2-7f92ab9d's Djot pass): after step 12 about 3.4% of Djot's
 (5.3% with the fallback compiles), after step 14 about 2.6% (4.5% with them: step 14 removes the
 empty plans' recompiles and fallbacks, and Djot's fallbacks are of spliced chunks); the two-CPU
 session measures them.
+
+Splicing's worth with the tier on, and the inlining input (2026-11-10; target/p3/stage2/
+splice-worth, target/p3/stage2/inlining-input.txt). Main's code (step 11's fat-LTO binary), the
+tier on with its splicing against TRUST_JS_INLINE_BUDGET=0 TRUST_JS_INLINE_SMALL_BUDGET=0 (every
+plan empty), one CPU (CPU 4: instructions are the reading, its cycles shared with builds):
+- Octane's fixed runs without splicing: +4.12% instructions (geomean; DeltaBlue +19.3%, Splay
+  +17.1%, Mandreel +14.8%, Crypto +8.9%, TypeScript +8.5%, Earley-Boyer +2.6%, GBEMU +1.3%;
+  Richards -6.6%, RayTrace -0.8%; NavierStokes, zlib, RegExp and CodeLoad splice nothing), -5.67%
+  against the tier off where splicing gives -9.41%.
+- The fixtures without splicing: Vue's measured pass +12.75% instructions and its passes 2-10
+  +4.72% (worse than the tier off's +8.58% and +2.27%); React's measured pass -4.00%, its passes
+  2-10 equal (its one discard gone: a self-hosted builtin's callback site, whose splice fails for
+  every caller but the first); Djot's -3.89% and -1.71% (discards 3 to 1, exits 402 to 202, all
+  200 WrongCallee exits gone; generate 22.6 to 18.6 ms, 47 compiles against 39).
+- So splicing stays until the tier inlines in its graph: it is worth 4% of Octane and 13% of
+  Vue's pass, and what it costs Djot and React is its identity guards' failures. WrongCallee, the
+  splice guard's exit, is 22,937 of the policy census's 52,446 exits and names a site in 115 of
+  its 326 discards; Djot skips 16 ways a run whose closure died (sites that meet a new closure of
+  one literal per call, inferred). The exemplars inline no call site with several callees
+  (Maglev only a polymorphic load's constant-function arms, maglev-graph-builder.cc:6038-6222;
+  Warp's trial inlining skips a site with more than one stub, TrialInlining.cpp:865-878) and guard
+  varying closures by their code (SpiderMonkey's later stubs by script, GuardFunctionScript,
+  CacheIR.cpp:6607-6623; V8 by feedback cell; JSC by executable); SpiderMonkey gives a
+  self-hosted builtin's callback site a private feedback copy per caller (createInlinedICScript,
+  TrialInlining.cpp:809-861).
+- The rest of the inlining input, for stage 3's design: the tier's pipeline is one chunk
+  throughout (pcs, frame states, the verifier, the exits, the snapshot); every operation the tier
+  does not lower runs its template on ctx.chunk's canonical frame, so an inlined callee's effects,
+  calls among them, have no frame of their own: callees without effects first (E0), then a
+  canonical frame per inlined callee switched around its effects (E1, JSC's InlineCallFrame
+  layout) or templates taking their chunk and frame (E2); a multi-frame exit can be composed from
+  today's VM pieces (the inner frame run to its end, then the outer frame from its call's pc + 1
+  with the result pushed, or at the call with the throw pending); no per-site call counts on main
+  (the parked e854636e counts per way), and Maglev's frequency rule needs a caller's invocation
+  count, which jit_runs no longer is. Two corrections: point 8's Maglev numbers (callees under 30
+  bytes inline eagerly to depth 10 within a 3,000-byte total; 27 bytes, or 75 with float inputs or
+  outputs, is the size exempt from the 0.95 frequency rule; the depth limit is the inlining
+  function's, so other callees reach depth 2), and point 7's exemplar (JSC's unlinked DFG, whose
+  invalidation points the plan adopts, inlines nothing, DFGByteCodeParser.cpp:2075-2078; its
+  linked DFG and FTL do).
+- Steps 12 to 14 do not change. If the measured passes still miss the 2% bar after them, the
+  splicing policy is the next lever: only call sites with one callee, or guards by code, as the
+  exemplars inline.
