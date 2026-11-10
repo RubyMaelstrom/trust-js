@@ -114,13 +114,17 @@ comment/example in the same change.
   site (`[opt] flag <name> pc <pc> <reason> own|at <baseline name> pc <pc>[ (spliced)]`), discard
   of unfixable exits only (`[opt] not reoptimized <name>: unfixable exits only`) or of a warm-up
   past the count (`[opt] not reoptimized <name>: its warm-up would pass the checkpoint word`),
-  recompile
-  (`[opt] reoptimizing <name> at checkpoint <k> (R <r>)`) and epoch move (`[opt] epoch moved
-  (discard|reoptimization), <n> by the tier`), and one per template JIT compile of a second
-  stage: `[opt] template <base> <length> <name> (second stage|fallback)`, the code of a second
-  stage the tier refused (or of a loop's borrowed-frame entry) or of a discard. A profile's
-  samples join to these ranges, since the perf map names a second stage's template code `JS:^`,
-  as its first stage's.
+  recompile (`[opt] reoptimizing <name> at checkpoint <k> (R <r>)`) and epoch move (`[opt]
+  epoch moved (discard|reoptimization), <n> by the tier`), and one per template JIT compile of
+  a second stage: `[opt] template <base> <length> <name> (second stage|fallback)`, the code of
+  a second stage the tier refused (or of a loop's borrowed-frame entry) or of a discard. A
+  profile's samples join to these ranges, since the perf map names a second stage's template
+  code `JS:^`, as its first stage's. The parts of a tier compile that run on the main thread
+  besides the compile line's own time (the snapshot, the graph, the code) each print `[opt]
+  main-thread <part> <name> in <ms> ms`: `recompile`, the bytecode recompile that makes the
+  tier's chunk (its second stage, or a stale chain's recompile); `install`, the code's
+  installation after its compile; `fallback`, the template JIT's compile of a discarded code's
+  fallback, at the discard or, deferred there for executable capacity, at a later entry.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at

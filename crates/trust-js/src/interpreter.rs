@@ -16689,7 +16689,16 @@ impl Interp {
             chunk.set_inline_retry_at(0);
             return;
         }
-        if let Some(chunk2) = crate::bytecode::compile_with_inlines(func, &plan, chunk) {
+        // The bytecode recompile that makes the tier's chunk runs on the main thread: its time
+        // under TRUST_JS_OPT_LOG (no clock read otherwise).
+        let started = if tier {
+            crate::opt::main_thread_timer()
+        } else {
+            None
+        };
+        let recompiled = crate::bytecode::compile_with_inlines(func, &plan, chunk);
+        crate::opt::log_main_thread("recompile", chunk, started);
+        if let Some(chunk2) = recompiled {
             if tier {
                 crate::opt::forget(chunk);
                 // The tier generates the native code of the chunk this publishes. A chunk with
@@ -16764,8 +16773,16 @@ impl Interp {
         };
         let started = log.then(std::time::Instant::now);
         let plan = crate::bytecode::plan_inlines(&base, func, realm, &self.global_env);
-        let Some(chunk3) = crate::bytecode::compile_without_property_chains(func, &plan, &base)
-        else {
+        // With the optimizing tier on, the recompile is the tier's chunk, made on the main
+        // thread: its time under TRUST_JS_OPT_LOG (no clock read otherwise).
+        let recompile = if crate::opt::enabled() {
+            crate::opt::main_thread_timer()
+        } else {
+            None
+        };
+        let recompiled = crate::bytecode::compile_without_property_chains(func, &plan, &base);
+        crate::opt::log_main_thread("recompile", &base, recompile);
+        let Some(chunk3) = recompiled else {
             return decline("the compile failed");
         };
         // With the optimizing tier on, the tier generates its native code as a second stage's

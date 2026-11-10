@@ -143,6 +143,18 @@ mod off {
         false
     }
 
+    pub(crate) fn main_thread_timer() -> Option<std::time::Instant> {
+        None
+    }
+
+    pub(crate) fn log_main_thread(_: &str, _: &Chunk, _: Option<std::time::Instant>) {}
+
+    pub(crate) fn fallback_timer(_: &Chunk) -> Option<std::time::Instant> {
+        None
+    }
+
+    pub(crate) fn log_fallback(_: &Chunk, _: Option<std::time::Instant>, _: bool) {}
+
     pub(crate) fn forget(_: &Chunk) {}
 
     pub(crate) fn note_template(_: &Chunk, _: *mut u8, _: usize) {}

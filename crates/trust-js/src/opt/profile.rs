@@ -52,6 +52,10 @@ pub(crate) struct ChunkProfile {
     warm_up: Cell<u8>,
     /// The native run count the warm-up's next checkpoint is due at.
     warm_up_at: Cell<u32>,
+    /// Under TRUST_JS_OPT_LOG only: the discard's compile of the template JIT's fallback was
+    /// deferred for executable capacity, so the chunk's next compile is the fallback's
+    /// (`opt::fallback_timer`).
+    fallback_deferred: Cell<bool>,
 }
 
 /// The key of an exit site.
@@ -151,6 +155,16 @@ impl ChunkProfile {
     /// The warm-up ends: its recompile was made, or refused, or none follows.
     pub(crate) fn disarm(&self) {
         self.warm_up.set(0);
+    }
+
+    /// Whether the fallback's compile is deferred (see the field; the log's only).
+    pub(crate) fn fallback_deferred(&self) -> bool {
+        self.fallback_deferred.get()
+    }
+
+    /// Mark the fallback's compile deferred, or clear the mark (the log's only).
+    pub(crate) fn set_fallback_deferred(&self, deferred: bool) {
+        self.fallback_deferred.set(deferred);
     }
 
     /// Heap bytes the record holds (the memory census).

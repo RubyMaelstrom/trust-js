@@ -131,7 +131,8 @@ pub(crate) fn verifies_in(debug: bool, switch: bool) -> bool {
 
 /// TRUST_JS_OPT_LOG: one stderr line per compile (its time and code range), refusal (with its
 /// reason and pc), decline, exit, wait for settled feedback, discard, flag, reoptimization, epoch
-/// move, and template compile of a second stage (its code range).
+/// move, template compile of a second stage (its code range), and main-thread part of a tier
+/// compile besides `generate` (`log_main_thread`: the recompile, the install, a fallback).
 pub(crate) fn log_enabled() -> bool {
     env_flag!("TRUST_JS_OPT_LOG")
 }
@@ -353,6 +354,53 @@ pub(crate) fn forget(chunk: &Chunk) {
     }
 }
 
+/// A timer for a part of a tier compile that runs on the main thread, under TRUST_JS_OPT_LOG
+/// (None otherwise: no clock read): the owner's count for the compile bar takes every such part
+/// (the plan's "The owner's answers", 2026-11-10), each logged by [`log_main_thread`].
+pub(crate) fn main_thread_timer() -> Option<std::time::Instant> {
+    log_enabled().then(std::time::Instant::now)
+}
+
+/// Log the main-thread `part` of a tier compile of `chunk` (`recompile`: the bytecode recompile
+/// that makes the tier's chunk; `install`: the code's installation after `generate`; `fallback`:
+/// the template JIT's compile of a discarded code's fallback), timed from `started`
+/// ([`main_thread_timer`]): `[opt] main-thread <part> <name> in <ms> ms`. Nothing without a timer.
+pub(crate) fn log_main_thread(part: &str, chunk: &Chunk, started: Option<std::time::Instant>) {
+    if let Some(started) = started {
+        eprintln!(
+            "[opt] main-thread {part} {} in {:.3} ms",
+            name(chunk),
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+}
+
+/// A timer for the template JIT's compile of `chunk` that starts now (`jit::compile_profiled`)
+/// where it is a discarded code's fallback, under TRUST_JS_OPT_LOG: the compile `discard` makes,
+/// or the one at a later entry where the discard's was deferred for executable capacity.
+pub(crate) fn fallback_timer(chunk: &Chunk) -> Option<std::time::Instant> {
+    if !log_enabled() {
+        return None;
+    }
+    let deferred = ChunkProfile::get(chunk).is_some_and(ChunkProfile::fallback_deferred);
+    (DISCARDING.with(Cell::get) || deferred).then(std::time::Instant::now)
+}
+
+/// The fallback's compile that [`fallback_timer`] timed ended, `deferred` if it was deferred for
+/// executable capacity: its main-thread line, and the mark that sends the next compile of the
+/// chunk to the log while one is deferred.
+pub(crate) fn log_fallback(chunk: &Chunk, started: Option<std::time::Instant>, deferred: bool) {
+    if started.is_none() {
+        return;
+    }
+    log_main_thread("fallback", chunk, started);
+    if deferred {
+        ChunkProfile::of(chunk).set_fallback_deferred(true);
+    } else if let Some(profile) = ChunkProfile::get(chunk) {
+        profile.set_fallback_deferred(false);
+    }
+}
+
 fn name(chunk: &Chunk) -> String {
     let names: Vec<&str> = chunk
         .jit_slot_names()
@@ -496,7 +544,9 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
     };
     match generate(i, chunk) {
         Some(code) => {
+            let started = main_thread_timer();
             permit.commit(Some(code));
+            log_main_thread("install", chunk, started);
             true
         }
         None => false,
@@ -738,7 +788,10 @@ pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
     }
     release_retired(i);
     if let Some(code) = generate(i, chunk) {
-        if install(i, chunk, code) {
+        let started = main_thread_timer();
+        let installed = install(i, chunk, code);
+        log_main_thread("install", chunk, started);
+        if installed {
             move_epoch("reoptimization");
         }
     }

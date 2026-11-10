@@ -7203,7 +7203,16 @@ pub(crate) fn compile_profiled(
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
 ) -> JitCompileOutcome {
-    compile_profiled_with(chunk, || compile(chunk, layout, ilayout))
+    // A discarded code's fallback is main-thread work of the optimizing tier: its time under
+    // TRUST_JS_OPT_LOG (`opt::fallback_timer`; no clock read otherwise).
+    let fallback = crate::opt::fallback_timer(chunk);
+    let outcome = compile_profiled_with(chunk, || compile(chunk, layout, ilayout));
+    crate::opt::log_fallback(
+        chunk,
+        fallback,
+        matches!(outcome, JitCompileOutcome::Deferred { .. }),
+    );
+    outcome
 }
 
 pub(crate) fn compile_borrowed_profiled(
