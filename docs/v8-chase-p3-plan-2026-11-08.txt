@@ -2160,3 +2160,39 @@ read without the log.
   until they fall in one epoch, since other test threads move the process's call-cache epoch.
 - Open: Vue's cycles at equal work (placement); the deferred fallback's log line, which no
   workload reached, checked by reading.
+
+zlib's a8 (record, 2026-11-10; target/p3/stage2/step11-impl/marked/br11-on.oct-zlib.err and the
+last coverage run's coverage-p3s2-7f92ab9d/octane/err.log). The 8.3 points of Octane's coverage
+that a8 (2,462 operations) spends in template code labeled "(second stage)" are no mislabel: its
+tier code exits at pc 278 (NotNumber) early in each call, the exited frame goes on in the VM,
+whose loop moves into the chunk's borrowed-frame template code (tiering.rs OsrCodeState; its
+compile is logged right after the first exit), and the long call runs there to its end. The code
+is discarded only at its 100th exit, a hundred calls later, and then recompiled with the site
+declined (R 1), after which it runs without exits. Three other zlib functions do the same
+(fn(d,f,g,h), 50 exits at each of two sites; fn(b,d,f,g); fn(f,g,h,i)). The exemplars discard
+sooner. JSC keeps 100 << R for exits (osrExitCountForReoptimization, runtime/OptionsList.h:397)
+but 5 << R when the exited frame loops (osrExitCountForReoptimizationFromLoop, :398): the baseline
+loop's tier-up check in an exited frame (one whose code block has a replacement, so it came from
+an exit) jettisons the replacement once its exits reach that threshold (operationOptimize,
+jit/JITOperations.cpp:2944-2966; CodeBlock::shouldReoptimizeFromLoopNow, bytecode/CodeBlock.cpp:
+2758-2771, shifted by R at 2740-2751), and an exit inside an inlined function that has tried to
+enter a loop uses it at once (dfg/DFGOSRExitCompilerCommon.cpp:70-104; setDidTryToEnterInLoop,
+dfg/DFGOSREntry.cpp:226). SpiderMonkey invalidates after 10 fixable bailouts, whatever follows
+them (frequentBailoutThreshold, jit/JitOptions.cpp:262; IonScript::shouldInvalidate,
+jit/IonScript.h:336-338; jit/BaselineBailouts.cpp:2204-2224); V8 at its first eager
+deoptimization. Step 3 left JSC's loop limit to stage 5 because "the exited frame finishes in the
+VM, whose loops count nothing" (driver.rs's module doc), but the VM's loop transfer into
+borrowed-frame code is where JSC's check sits.
+
+Step 13, the exit limit of an exited frame that loops (proposed; after step 12 lands, since step
+12 reworks the exit table's construction and the discard path). JSC's rule for the outermost
+frame, the only frame the tier has until stage 3: when the VM moves a frame into its chunk's
+borrowed-frame code (the loop transfer) while the chunk's entry code is the tier's, so that the
+frame came from an exit, and that code's exits have reached 5 << R (ExitTable::loop_limit, made
+beside `limit`), the code is discarded as at its limit (opt::discard: flags, R + 1, the template
+fallback, the warm-up), and the frame goes on into its borrowed-frame code as now. The log names
+the loop limit. Tests: a function whose tier code exits early in a long loop is discarded at its
+fifth such call, not its hundredth; exits that no loop transfer follows count to 100 << R as now;
+the tier off unchanged. Expected: zlib's four functions discard after 5 calls in place of 100,
+most of a8's 8.3 points of Octane's coverage move to tier code, and zlib's fixed runs execute
+fewer instructions (to be measured as step 11's were).
