@@ -466,6 +466,9 @@ pub(crate) struct TestAddresses {
     pub(crate) direct_packed_throws: usize,
     pub(crate) direct_full_state: usize,
     pub(crate) inline_objects: usize,
+    /// The packed append's witness (receiver, length, commits), where the thread opted in
+    /// (`TEST_PACKED_APPEND_ENABLED`).
+    pub(crate) packed_append: Option<[usize; 3]>,
 }
 
 #[cfg(all(
@@ -496,6 +499,13 @@ impl TestAddresses {
             direct_packed_throws: TEST_DIRECT_PACKED_THROWS.with(address),
             direct_full_state: TEST_DIRECT_FULL_STATE.with(address),
             inline_objects: alloc::INLINE_OBJECTS.with(address),
+            packed_append: TEST_PACKED_APPEND_ENABLED.with(Cell::get).then(|| {
+                [
+                    TEST_PACKED_APPEND_RECEIVER.with(address),
+                    TEST_PACKED_APPEND_LENGTH.with(address),
+                    TEST_PACKED_APPEND_COMMITS.with(address),
+                ]
+            }),
         }
     }
 
@@ -19103,21 +19113,21 @@ fn emit_define_elem_inline(
     a.stur_d(1, 14, 0);
     a.bind(length_kept);
     #[cfg(test)]
-    if TEST_PACKED_APPEND_ENABLED.with(Cell::get) {
+    if let Some([receiver, length, commits]) = TestAddresses::current().packed_append {
         // Opt in at Rust emission time: ordinary debug tests retain their exact instruction
         // layout and do not embed unused witness TLS addresses.
         // Post-commit witness for one armed receiver/length. x9/x17 are dead, and these
         // direct Cell updates invoke no helper, allocation, GC or author callback.
         let skip = a.new_label();
-        a.mov_imm64(9, TEST_PACKED_APPEND_RECEIVER.with(Cell::as_ptr) as u64);
+        a.mov_imm64(9, receiver as u64);
         a.ldr_imm(17, 9, 0);
         a.cmp_reg_x(10, 17);
         a.b_cond(C_NE, skip);
-        a.mov_imm64(9, TEST_PACKED_APPEND_LENGTH.with(Cell::as_ptr) as u64);
+        a.mov_imm64(9, length as u64);
         a.ldr_imm(17, 9, 0);
         a.cmp_reg_x(16, 17);
         a.b_cond(C_NE, skip);
-        a.mov_imm64(9, TEST_PACKED_APPEND_COMMITS.with(Cell::as_ptr) as u64);
+        a.mov_imm64(9, commits as u64);
         a.ldr_imm(17, 9, 0);
         a.add_imm(17, 17, 1);
         a.str_imm(17, 9, 0);
