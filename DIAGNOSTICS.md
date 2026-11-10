@@ -133,17 +133,19 @@ comment/example in the same change.
   compile's) end with where its time was spent: `on the main thread` or `on the compile
   thread` (`on a scoped thread` in the tests' TRUST_JS_OPT_SCOPED_COMPILE check), `queued <ms>
   ms` (its wait in the compile thread's queue), `installed <ms> ms after its snapshot` and, for
-  a job that ran again after the main thread made the stubs or atoms it lacked, `, <n> runs`; a
+  a job that ran again after the main thread made the stubs or atoms it lacked, `, <n> runs, <ms>
+  ms before the last` (the compile thread's time of the runs before the last); a
   dropped result prints `[opt] dropped <name>: <reason> (compiled in <ms> ms on the compile
   thread, ...)`. The parts of a tier compile that run on the main thread besides the compile
   line's own time each print `[opt] main-thread <part> <name> in <ms> ms`: `recompile`, the
   bytecode recompile that makes the tier's chunk (its second stage, or a stale chain's
-  recompile); `snapshot`, the snapshot and the chunk's frozen view; `stubs`, the process stubs
+  recompile); `snapshot`, the snapshot, the chunk's frozen view and the job's hand-off to the
+  compile thread; `stubs`, the process stubs
   and atoms a compile found missing, made for its next run; `install`, the code's link and
   installation after its compile; `fallback`, the template JIT's compile of a discarded code's
-  fallback, at the discard or, deferred there for executable capacity, at a later entry. The
-  main thread's share of the tier's compiles is then the main-thread lines and the compile and
-  refusal lines `on the main thread`.
+  fallback, at the discard or, deferred there for executable capacity, at a later entry. Each
+  part's time leaves out the log's own printing. The main thread's share of the tier's compiles
+  is then the main-thread lines and the compile and refusal lines `on the main thread`.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at
