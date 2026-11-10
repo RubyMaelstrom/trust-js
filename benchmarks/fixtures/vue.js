@@ -56,9 +56,10 @@ function updateModel(n) {
     }
 }
 updateModel(1000);
-var start = Date.now();
+var now = typeof performance !== "undefined" ? () => performance.now() : () => Date.now();
+var start = now();
 updateModel(10000);
-var elapsed = Date.now() - start;
+var elapsed = Math.round((now() - start) * 100) / 100;
 if (observed !== 30016 || model.items.length !== 16)
     throw new Error('reactivity checksum mismatch: ' + observed);
 console.log(JSON.stringify({case:'vue-reactivity', n:10000, elapsed_ms:elapsed, observed:observed, invocations:invocations}));

@@ -101,8 +101,9 @@ function reducerBatch(passes) {
     return checksum;
 }
 reducerBatch(2);
-const reducerStart = Date.now();
+const now = typeof performance !== "undefined" ? () => performance.now() : () => Date.now();
+const reducerStart = now();
 const reducerChecksum = reducerBatch(20);
-const reducerElapsed = Date.now() - reducerStart;
+const reducerElapsed = Math.round((now() - reducerStart) * 100) / 100;
 console.log(JSON.stringify({case: 'react-reducer', passes: 20, elapsed_ms: reducerElapsed,
     checksum: reducerChecksum, expected: 2124760}));

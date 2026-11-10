@@ -11,7 +11,12 @@ the originals). Do not edit them: gate comparability depends on byte
 identity. Any replacement must be recorded here with new hashes and a
 re-baseline.
 
-sha256:
+sha256 (since 2026-11-10; see "Timer change" below):
+  vue.js   7304729396cb4db636a0b32724d7a618aadb770cdbaba9f155918a8569138681
+  react.js e863b6bda1f8c2c0f318411510da4f27ff7c2a2c2991e97d1517d6a6651aaf4a
+  djot.js  fc148eb542044267c26cb7bd209301a5cba94f0147baa0fd587c0bc6d1d03084
+
+sha256 of the 2026-10-15 originals (Date.now() timers):
   vue.js   38b44c1a7cc0f0829e94d6ebc5876c6b18192a86632229d50b5c62c4948190cc
   react.js 1468db260223f8f15f279faa75483eb781a6b4cd38f75cfecfc80f31a6e2f7bc
   djot.js  c41742a492701b4b11fb2e31f6b8d06c6469916c10d922d606e0c415316cd682
@@ -27,3 +32,14 @@ Content:
 
 Run with the engine binary (trust-js-cli accepts only interp|bytecode):
   taskset -c 5 target/release/trust-js --tier=jit benchmarks/fixtures/vue.js
+
+Timer change (2026-11-10, P3 stage 2; owner-approved; docs/v8-chase-p3-plan-2026-11-08.txt,
+"The fixtures' timer"):
+  The timed section's lines only: the fixtures read performance.now() when the global has one
+  (Node, d8, JSC and the engine shell, which gained it the same day) and Date.now() otherwise,
+  and report elapsed_ms rounded to 0.01 ms, as the call microbenchmarks do. Date.now()'s whole
+  milliseconds were coarser than the 2% regression bar on React's ~30 ms pass. Every line before
+  the first timer line is byte-identical to the originals, so copies cut there (the "warm"
+  copies, which omit the timed pass) are unchanged; the workloads and their expected output
+  fields are unchanged. Re-baseline: elapsed_ms from before the change compares only within its
+  own session; instruction counts of the timed pass change by the timer's calls.
