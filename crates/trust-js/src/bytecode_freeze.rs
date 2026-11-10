@@ -62,13 +62,25 @@ impl Chunk {
                 }
             }
         }
-        let mut preferred: Vec<(u32, Option<super::IcState>)> = ops
+        // The named sites' ways, which the property templates bake (read once, here).
+        #[allow(clippy::type_complexity)]
+        let mut sites: Vec<(
+            u32,
+            Option<super::IcState>,
+            [super::IcState; super::PROP_IC_WAYS],
+        )> = ops
             .iter()
             .filter_map(named_site_cache)
-            .map(|cache| (cache, self.jit_cache_preferred(cache)))
+            .map(|cache| {
+                (
+                    cache,
+                    self.jit_cache_preferred(cache),
+                    self.jit_cache_ways(cache),
+                )
+            })
             .collect();
-        preferred.sort_unstable_by_key(|&(cache, _)| cache);
-        preferred.dedup_by_key(|&mut (cache, _)| cache);
+        sites.sort_unstable_by_key(|&(cache, _, _)| cache);
+        sites.dedup_by_key(|&mut (cache, _, _)| cache);
         let mut resolution_sites: Vec<(u32, usize)> = ops
             .iter()
             .filter_map(|op| match *op {
@@ -170,7 +182,7 @@ impl Chunk {
                 .iter()
                 .map(|site| site.entries.as_ptr() as usize)
                 .collect(),
-            preferred: preferred.into_boxed_slice(),
+            sites: sites.into_boxed_slice(),
             call_positions: self.call_positions.clone(),
             construct_positions: self.construct_positions.clone(),
             inline_targets,

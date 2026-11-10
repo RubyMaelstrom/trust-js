@@ -99,8 +99,16 @@ pub(crate) struct FrozenChunk {
     pub(crate) construct_caches_base: usize,
     /// Each call site's way-1 address (`Chunk::jit_call_cache_ptr`).
     pub(crate) call_caches: Box<[usize]>,
-    /// The named sites' preferred ways (`Chunk::jit_cache_preferred`), by cache index, ascending.
-    pub(crate) preferred: Box<[(u32, Option<IcState>)]>,
+    /// The named sites' preferred ways (`Chunk::jit_cache_preferred`) and ways
+    /// (`Chunk::jit_cache_ways`), by cache index, ascending.
+    #[allow(clippy::type_complexity)]
+    pub(crate) sites: Box<
+        [(
+            u32,
+            Option<IcState>,
+            [IcState; crate::bytecode::PROP_IC_WAYS],
+        )],
+    >,
     pub(crate) call_positions: Box<[u32]>,
     pub(crate) construct_positions: Box<[u32]>,
     pub(crate) inline_targets: Box<[InlineTargetView]>,
@@ -219,6 +227,20 @@ impl FrozenChunk {
         &self.label
     }
 
+    /// Where named site `idx`'s ways are in `sites`.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    fn site(&self, idx: u32) -> usize {
+        self.sites
+            .binary_search_by_key(&idx, |&(cache, _, _)| cache)
+            .unwrap_or_else(|_| panic!("the frozen view has no ways for cache {idx}"))
+    }
+
     /// Name `n`'s key's word (see `keys`), its atom made now where the compile runs on the main
     /// thread; else 0, and the name recorded as missing.
     pub(crate) fn jit_name_key(&self, n: u32) -> u64 {
@@ -302,11 +324,10 @@ impl crate::jit::JitChunk for FrozenChunk {
         self.caches_base + idx as usize * std::mem::size_of::<std::cell::Cell<IcState>>()
     }
     fn jit_cache_preferred(&self, idx: u32) -> Option<IcState> {
-        let at = self
-            .preferred
-            .binary_search_by_key(&idx, |&(cache, _)| cache)
-            .unwrap_or_else(|_| panic!("the frozen view has no preferred way for cache {idx}"));
-        self.preferred[at].1
+        self.sites[self.site(idx)].1
+    }
+    fn jit_cache_ways(&self, idx: u32) -> [IcState; crate::bytecode::PROP_IC_WAYS] {
+        self.sites[self.site(idx)].2
     }
     fn jit_call_cache_ptr(&self, idx: u32) -> usize {
         self.call_caches[idx as usize]

@@ -23375,6 +23375,11 @@ impl Chunk {
             (1..PROP_IC_WAYS).all(|way| self.caches[idx as usize + way].get().depth == IC_EMPTY);
         (st.has_cacheable_shapes() && mono).then_some(st)
     }
+    /// Property cache `idx`'s ways as they stand, which a polymorphic site's template bakes
+    /// (main thread: the optimizing tier's frozen view copies them, P3 stage 2, step 12).
+    pub(crate) fn jit_cache_ways(&self, idx: u32) -> [IcState; PROP_IC_WAYS] {
+        std::array::from_fn(|way| self.caches[idx as usize + way].get())
+    }
     /// The stable address of call site `idx`'s way-1 `Cell<CallIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]: `call_caches` is fixed once compilation finishes and the Chunk
     /// outlives its JIT code).

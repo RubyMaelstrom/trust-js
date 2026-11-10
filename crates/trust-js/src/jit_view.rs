@@ -44,6 +44,9 @@ pub(crate) trait JitChunk {
     /// Property cache `idx`'s preferred way, which a compact template bakes in behind full
     /// guards: the live chunk's now, the frozen view's at its snapshot.
     fn jit_cache_preferred(&self, idx: u32) -> Option<IcState>;
+    /// Property cache `idx`'s ways, which a polymorphic site's template bakes and a store's
+    /// tests for an empty cache: the live chunk's now, the frozen view's at its snapshot.
+    fn jit_cache_ways(&self, idx: u32) -> [IcState; crate::bytecode::PROP_IC_WAYS];
     fn jit_call_cache_ptr(&self, idx: u32) -> usize;
     fn jit_construct_cache_ptr(&self, idx: u32) -> usize;
     fn jit_name_cache_ptr(&self, idx: u32) -> usize;
@@ -76,6 +79,16 @@ pub(crate) trait JitChunk {
     fn test_this_commits_ptr(&self) -> usize;
 }
 
+/// The live chunk's mutable state, lazily built facts and heap are the main thread's: a compile
+/// off it reads the frozen view (debug builds check, P3 stage 2, step 12).
+#[inline(always)]
+fn live() {
+    debug_assert!(
+        !crate::jit::off_main_compile(),
+        "a compile off the main thread reads a live chunk"
+    );
+}
+
 impl JitChunk for Chunk {
     #[inline]
     fn jit_ops(&self) -> &[Op] {
@@ -87,6 +100,7 @@ impl JitChunk for Chunk {
     }
     #[inline]
     fn jit_name_key(&self, n: u32) -> u64 {
+        live();
         crate::atom::PropKey::from_text(Chunk::jit_name(self, n)).word()
     }
     #[inline]
@@ -115,22 +129,27 @@ impl JitChunk for Chunk {
     }
     #[inline]
     fn jit_inline_activation(&self) -> Option<crate::bytecode::activation::InlineActivation> {
+        live();
         Chunk::jit_inline_activation(self)
     }
     #[inline]
     fn jit_prologue_copies(&self) -> Option<(Vec<(u32, u16)>, Option<u32>)> {
+        live();
         Chunk::jit_prologue_copies(self)
     }
     #[inline]
     fn jit_mapped_formals(&self) -> Option<(u32, Option<u32>)> {
+        live();
         Chunk::jit_mapped_formals(self)
     }
     #[inline]
     fn jit_cap_binding(&self, n: u32) -> Option<(u32, BindingAttrs)> {
+        live();
         Chunk::jit_cap_binding(self, n)
     }
     #[inline]
     fn jit_cap_initialized(&self, pc: usize) -> bool {
+        live();
         Chunk::jit_cap_initialized(self, pc)
     }
     #[inline]
@@ -147,7 +166,13 @@ impl JitChunk for Chunk {
     }
     #[inline]
     fn jit_cache_preferred(&self, idx: u32) -> Option<IcState> {
+        live();
         Chunk::jit_cache_preferred(self, idx)
+    }
+    #[inline]
+    fn jit_cache_ways(&self, idx: u32) -> [IcState; crate::bytecode::PROP_IC_WAYS] {
+        live();
+        Chunk::jit_cache_ways(self, idx)
     }
     #[inline]
     fn jit_call_cache_ptr(&self, idx: u32) -> usize {
@@ -191,11 +216,13 @@ impl JitChunk for Chunk {
     }
     #[inline]
     fn jit_object_site(&self, tidx: u32, count: usize) -> Option<(InlineAllocSite, usize)> {
+        live();
         Chunk::jit_object_site(self, tidx, count)
             .map(|(site, image)| (site, std::ptr::from_ref(image) as usize))
     }
     #[inline]
     fn jit_array_site(&self, literal: Option<u32>) -> Option<(InlineAllocSite, usize)> {
+        live();
         Chunk::jit_array_site(self, literal)
             .map(|(site, image)| (site, std::ptr::from_ref(image) as usize))
     }
@@ -204,15 +231,18 @@ impl JitChunk for Chunk {
         &self,
         count: usize,
     ) -> Option<(InlineAllocSite, InlineAllocSite, usize)> {
+        live();
         Chunk::jit_array_elements_site(self, count)
             .map(|(cell, block, image)| (cell, block, std::ptr::from_ref(image) as usize))
     }
     #[inline]
     fn inline_target_env_word(&self, t: u32) -> Option<usize> {
+        live();
         Chunk::inline_target_env(self, t).map(|env| crate::interpreter::Env::as_ptr(&env) as usize)
     }
     #[inline]
     fn jit_resolution_cache_ptr(&self, name: u32) -> usize {
+        live();
         Chunk::jit_resolution_cache_ptr(self, name)
     }
     #[inline]

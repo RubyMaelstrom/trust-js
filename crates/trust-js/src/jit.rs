@@ -8363,9 +8363,12 @@ fn emit_prop_load_inline(
     il: &crate::interpreter::InterpLayout,
     cache_ptr: usize,
     preferred: Option<crate::bytecode::IcState>,
-    // The site's interned name (`chunk.jit_name(n)`): its data pointer keys the stub-cache
-    // arm, and its bytes are the key-checked arm's compare immediates. Pinned by the chunk
-    // the emitted code belongs to.
+    // The site's ways as the compile reads them (`JitChunk::jit_cache_ways`: the live cache now,
+    // or the frozen view's copy), from which a polymorphic site bakes its warm ones.
+    ways: [crate::bytecode::IcState; crate::bytecode::PROP_IC_WAYS],
+    // The site's name (`chunk.jit_name(n)`): its text decides the template's forms (`length`,
+    // `prototype`, an element-like key), and its key's word (`JitName::key_word`) is the
+    // key-checked arm's compare immediate.
     name: JitName<'_>,
     pc: u32,
     l_unwind: usize,
@@ -8452,10 +8455,8 @@ fn emit_prop_load_inline(
     // way loop, which still sees ways filled after compilation, and then to the helper.
     let baked: Vec<crate::bytecode::IcState> = match compact {
         Some(st) => vec![st],
-        None if cache_ptr != 0 => (0..crate::bytecode::PROP_IC_WAYS)
-            .map(|way| unsafe {
-                (*(cache_ptr as *const std::cell::Cell<crate::bytecode::IcState>).add(way)).get()
-            })
+        None if cache_ptr != 0 => ways
+            .into_iter()
             .filter(|st| st.has_cacheable_shapes() && bakeable(st))
             .collect(),
         None => Vec::new(),
@@ -14505,6 +14506,8 @@ fn emit_set_prop_inline(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     cache_ptr: usize,
+    // The site's ways as the compile reads them (`JitChunk::jit_cache_ways`).
+    ways: [crate::bytecode::IcState; crate::bytecode::PROP_IC_WAYS],
     name: JitName<'_>,
     pc: u32,
     l_unwind: usize,
@@ -14518,14 +14521,9 @@ fn emit_set_prop_inline(
     // shared stub carries the ways, the commit and the card mark (see `emit_prop_write_site`).
     // As for the reads, a site whose bytecode runs filled its cache keeps the in-line template.
     let cold = cache_ptr != 0
-        && (0..crate::bytecode::PROP_IC_WAYS).all(|way| {
-            // SAFETY: a site's ways are consecutive cells of its chunk's cache table, which
-            // outlives the compile.
-            let way = unsafe {
-                (*(cache_ptr as *const std::cell::Cell<crate::bytecode::IcState>).add(way)).get()
-            };
-            way.depth == crate::bytecode::IC_EMPTY
-        });
+        && ways
+            .iter()
+            .all(|way| way.depth == crate::bytecode::IC_EMPTY);
     if cold && a.stubs_ok() && use_shared_stub(a) {
         let flags = PropWriteFlags {
             stack: matches!(recv, PropRecv::Stack),
