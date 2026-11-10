@@ -2106,3 +2106,57 @@ The step:
   0.79% of Djot's pass, 0.32% of React's, 0.20% of Vue's, against 16.22%, 5.50% and 2.58% today;
   with the recompiles and fallback compiles still on the main thread until the next step 5.49%,
   1.64% and 0.85%. Unmeasured: a job's hand-off and the later install's cost in template code.
+
+Step 11 landed (bbc8e8e2..838c1865, 2026-11-10; target/p3/stage2/step11-impl). As designed, with
+the tier on; the tier off keeps P2's schedule and counts, its direct gate byte-identical.
+(1) opt::ENTRY_WEIGHT (K = 64): the direct gate adds K and compares in 64 bits (a count within K
+of u32::MAX takes the helper, which saturates), the construct take-back subtracts it, the shared
+stubs' table keys it; the Rust entry paths (H_CALL_HIT, note_native_entry, run_borrowed_frame)
+read Interp::opt_entry_weight, the engine's copy made with it, as opt_exit_every is (the first
+build read a OnceLock there, which gave note_native_entry a stack frame and the tier off +0.25%
+instructions in TypeScript). compile_entry records each header's span in its backward-jump scan
+and gives the Asm each header's weight (Asm::loop_weights); a count that would reach the word
+stops one below it (eight instructions while pending, eleven once due, step 8's seven); a rotated
+loop's countdown adds its iterations times the weight (MOVZ, MADD). (2) next_inline_checkpoint:
+(100, 400, 1,600, 6,400) x K, then 500 x K; warm_up_gap and warm_up_word likewise << R; nothing
+armed past the word (a discard whose warm-up would pass it logs "not reoptimized ...: its
+warm-up would pass the checkpoint word"); `last` and the compile on unsettled feedback gone; R's
+cap 13. (3) The fingerprint as designed. (4) MAX_OPTIMIZED_OPS = 15,000: generate refuses before
+the snapshot, and try_inline_recompile stops a first stage over it whose plan is empty before its
+bytecode recompile (refuses_unspliced, disarmed as the empty plan's refusal is), so zlib's a1
+(21,869 operations) now costs nothing where main spent 3.14 ms of generate and a recompile on it.
+(5) The main-thread parts of a tier compile logged (838c1865): `[opt] main-thread
+recompile|install|fallback <name> in <ms> ms`, the deferred fallback's compile included; no clock
+read without the log.
+- Measured (fat LTO, the branch against main 0bb3041f; the fixtures on CPU 10, medians of 5;
+  Octane's fixed runs on CPUs 10-13, medians of 3): Octane -0.88% (aBc -0.88%): TypeScript -2.19%,
+  DeltaBlue -6.83%, Crypto -1.14%, RegExp -1.09%, every benchmark within 0.3 points of aBc; the
+  tier off within 0.05% but TypeScript's +0.18%, the incremental collector's time-bounded slices
+  (with TRUST_JS_GC_INCREMENTAL=0 equal within 0.003%). The fixtures compile exactly aBc's
+  functions; instructions: Vue +0.01% and +0.02% (the measured pass, passes 2-10), React +0.04%
+  and +0.01%, Djot +1.09% and -0.53% (aBc +1.1%, -0.4%); generate Djot +9.2% (aBc +8.0%). Cycles
+  at equal work differ by placement: Vue +1.40% and +3.24% (front-end stalls, I-cache refills,
+  mispredictions; the tier-off Vue pass +1.66% at +0.01% instructions with identical template code,
+  and round 1's binary, with the same code, +0.88% for passes 2-10), React +0.21% and +0.31%, Djot
+  +1.39% and -0.24%: the X925 session is the bar's reading. No compile on unsettled feedback in the
+  fixtures or Octane (main: TypeScript 96, GBEMU 6, Box2D 5, PdfJS 3, DeltaBlue 1, Earley-Boyer 1).
+  Richards' schedule in run 4; Crypto's 40 runs 33 compiles and 7 discards.
+- The main-thread parts (CPU 10, medians a run): Djot's recompiles 2.88 ms (38), installs 0.024
+  ms, fallbacks 2.09 ms (3), beside generate's 19.31 ms; React 0.36, 0.005 and 0.34 ms beside 2.73;
+  Vue 1.71, 0.009 and 0.25 ms beside 7.28. Octane's 5-run logs: recompiles 104 ms, installs 0.85
+  ms, fallbacks 219 ms (TypeScript's 133 ms in 124) against 843 ms of generate.
+- Tests: the design's list (the 500th entry; a long function's short loop; nested loops; a rotated
+  loop's countdown and bails; the quiet window after the fourth checkpoint and feedback that never
+  settles; the fingerprint's refills and transitions; both size-limit paths; saturation below the
+  word and nothing past it; R's cap; the tier off; a direct entry at the top of the word), and 11
+  mutation checks, each removing one piece of the step, all caught (the direct gate's first test
+  missed its 32-bit compare and was rewritten). The library's suites with the tier off and on
+  eager (3,141 each, 10 ignored), the tier's tests eager with exits every 7 and with an exit limit
+  of 1 (244 each), the poll and Agent tests with the tier on (51); clippy as main, fmt clean. On
+  zombie (x86-64): the check with tests, clippy with -D warnings and Windows' check clean (date.rs's
+  20 warnings), the library's suite passes (2,773).
+- Departures: the engine's copy of the weight (a test that switches the tier after making an
+  engine keeps the old weight in the Rust entry paths); the fingerprint test retries its evictions
+  until they fall in one epoch, since other test threads move the process's call-cache epoch.
+- Open: Vue's cycles at equal work (placement); the deferred fallback's log line, which no
+  workload reached, checked by reading.
