@@ -1799,3 +1799,49 @@ every graph the allocator's and back end's tests allocate.
   clippy and Windows' check clean (date.rs's 20 warnings), the library's suite passes (2,765).
   Combined with step 9 (rebased): the tier's module tests and the region's (160) on Crystal, and
   zombie's x86-64 check with tests and Windows' check, clean.
+
+The measurement after steps 9 and 10 (2026-11-10; session p3s2-7f92ab9d on main 7f92ab9d's fat-LTO
+engine against stage 1's p3s1-06e68cf0, CPU 5; target/p3/stage2/session-p3s2-7f92ab9d, report.txt).
+Web Tooling's phase ran during the daily GPU batch, capped 1,308 of 1,672 s, and was rerun after it
+(tools/rerun-wtb-s2.sh): its off and on runs uncapped, base's run capped 21 s (espree's). The tier
+on against off: Octane's Score 5,811 against 4,585, +26.7% (step 8's session +8.75%), its rounds
+5,800 to 5,838 against 4,581 to 4,586; each benchmark faster but CodeLoad (+1.5%; rounds 14,484 to
+14,772 against 14,704 to 14,885) and SplayLatency (+0.2%): Richards 3,297 against 1,638 (rounds
+3,294 to 3,301), NavierStokes 14,413 in every round against 10,589 (step 8's 3,248 to 11,575),
+Crypto 9,282 against 8,869, Mandreel 2,330 against 1,194, Box2D 7,209 against 4,163, DeltaBlue
+2,461 against 1,617. The fixtures' measured passes: Vue -9.9% (182 ms against 202), React +6.7% (32
+against 30) and Djot +4.1% (76 against 73); their steady states -5.2%, 0.0% and -11.8%. The call
+microbenchmarks within 2%: constructor +1.5% (66 ms against 65; step 8's +3.1%), and
+array-shift-queue-holey's 14 ms against 13 (rounds 13, 14 and 14 against 14, 13 and 13 at the
+script's 1 ms) is the resolution's: the case alone, 15 rounds interleaved on CPU 5, 14 ms on both
+sides, 23.78M cycles against 23.81M (target/p3/stage2/holey-check). Compile time Vue 4.70 ms (2.6%
+of the pass; 36 compiles), React 1.76 ms (5.5%; 9 compiles, the iteration callback's discard and
+recompile) and Djot 12.33 ms (16.2%; 38 compiles, 3 discards, 2 recompiles, 4 on unsettled feedback
+at the last checkpoint) against the 3% bar; step 8's session 5.38, 2.06 and 15.32 ms (-13%, -15%,
+-20%: step 10). For the record, ARES-6's summary -24.1% (Air's steady state -67.6%; Basic's first
+iteration +6.1%) and Web Tooling's geomean -13.3% (every benchmark faster but coffeescript +0.7% and
+uglify-js +2.7%). Coverage (coverage-s2.sh on the session's engine; coverage-p3s2-7f92ab9d.log):
+82.9% of 25,464 second-stage samples (step 5's 82.6%); Vue 88.1%, React 99.0%, Djot 90.9%, their
+steady-state copies 85.1%, 100% and 92.3%, Octane 81.8%, of which 8.3 points are zlib's a8
+(fn(f,g,h,j)), which the tier refuses as a frame over the record's 256 words after 2.36 ms
+(step 5's coverage: 7.1 points). Base against off (the tier-off changes since stage 1): within each
+case's spread but Octane's Richards, 1,638 against 1,666 in every round; its 400 fixed runs under
+setarch -R take the same cycles on main, step 8's main and stage 1's (1,235.0M, 1,232.7M and
+1,233.0M on CPU 5; 2,141M, 2,148M and 2,148M on CPU 10; the same 7.0954G instructions;
+target/p3/stage2/richards-off-check): open, small, in Octane's timed rounds only.
+So the bars: Octane's geomean met; coverage met (82.9%, each fixture and Octane at 80% or more);
+no case slower by more than 2%: React's and Djot's measured passes miss it, by their compiles
+(Djot's 12.33 ms compiling against the 3 ms difference, its steady state 11.8% faster; React's 1.76
+ms against 2 ms, its steady state equal); compile time: Vue meets it (2.6%), React (5.5%) and Djot
+(16.2%) miss it. The two misses are one: compile time on the main thread.
+The order (proposed): step 11, the tier-up policy nearer V8's, from a measured input
+(target/p3/stage2/policy-input.txt: a census of each compile's runs, entries and loop iterations,
+and which feedback moved before the unsettled compiles; the variants measured). Maglev's budget is
+400 invocations' worth of executed bytecode (a back edge spends its loop's length, a return the
+bytes before it: interpreter-assembler.cc JumpBackward, UpdateInterruptBudgetOnReturn;
+tiering-manager.cc InterruptBudgetFor), where step 8 counts an iteration as a whole entry; an IC
+change raises the budget to 500 invocations' worth (NotifyICChanged) and nothing compiles while the
+ICs change, where the tier compiles at its fourth checkpoint whatever the fingerprint says
+(JSC's maximumOptimizationDelay). Then the further single-thread compile work (step 10's list) or,
+if the owner's answer on the bar is two CPUs, compiles off the main thread (plan point 13); then
+NavierStokes' instructions on the A725, Crypto's churn and the frame limit's refusal of zlib's a8.
