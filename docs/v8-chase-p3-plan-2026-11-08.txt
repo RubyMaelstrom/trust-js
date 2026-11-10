@@ -2000,3 +2000,109 @@ ms off Djot's main thread and most of React's pass difference), then the per-chu
 with the tier's code on the first stage and discards that fall back to code that exists (JSC's
 jettison, V8's deopt), which together remove the empty plans' recompiles and the fallback
 compiles (about 2.4% of Djot's pass); the spliced recompiles go with stage 3.
+
+Step 12, compiling off the main thread (point 13; design, 2026-11-10; input
+target/p3/stage2/offthread-input.txt). The exemplars split a compile in three. V8's Maglev
+(63481c19): the job made on the main thread without reading feedback (Prepare; the broker and
+persistent handles, maglev-compilation-info.cc:68-140); the graph, its feedback read through the
+broker and memoized per site, register allocation, assembly and by default the Code object on a
+background thread (Execute; maglev-compiler.cc:90-313; maglev_build_code_on_background,
+flag-definitions.h:657), at most two (concurrent_maglev_max_threads, 694-696); dependencies
+committed, weak objects registered and the code stored in the dispatch entry on the main thread
+(Finalize; maglev-compiler.cc:316-384, compiler.cc:4706-4775), from the stack guard's
+INSTALL_MAGLEV_CODE interrupt (maglev-concurrent-dispatcher.cc:315-320, 391-414); while a job is
+pending the function is marked tiering and its budget is out of reach (tiering-manager.cc:213-216);
+synchronous when the dispatcher is off (compiler.cc:1258-1293). SpiderMonkey: the WarpSnapshot on
+the main thread, holding what "WarpBuilder can't read off-thread without racing" (jit/
+WarpSnapshot.h:53-56; jit/Ion.cpp:1775-1792), the bytecode read off thread; WarpBuilder, the
+optimizations, register allocation and code generation into a buffer on a helper thread (Ion.cpp:
+1750-1771, 1906-1918); attached at an interrupt and linked at the next call, with the dependencies
+checked and the code copied into executable memory on the main thread (vm/Runtime.cpp:403-422;
+Ion.cpp:357-405); off thread only with more than one CPU (Ion.cpp:2110-2118). JSC: everything,
+the profiles' reads (under each CodeBlock's lock) and the code's mapping included, in a compiler
+thread (dfg/DFGPlan.cpp:186-; DFGSpeculativeJIT.cpp:175-194); validation, a cross-modifying-code
+fence and the install on the main thread (DFGPlan.cpp:574-640; DFGJITFinalizer.cpp:56-88). The
+tier: the builder reads the snapshot, immutable chunk data and one lazily filled cell; the back
+end also reads live chunk state (the compact templates' preferred ways, the inline targets' weak
+pins, lazily built activation facts and resolution sites, the agent heap's allocation sites, R)
+and may assemble a process-wide stub (offthread-input.txt 2.2-2.3); the graph, the build's output,
+the allocation, the assembler and the exit tables are Send, the chunk, the snapshot (one raw
+pointer the builder never reads), the builder and code generator (they hold &Chunk) and the code
+objects are not (2.5); the code is position-independent, emitted into words and copied into
+executable memory at the end (2.6). Of generate's time on Djot after step 10: the build 44.7%,
+register allocation 18.6%, emission 18.4%, executable memory 10.0% (before step 9), the snapshot
+2.6%, the install 2.2% (3.2).
+The step:
+1. Where each part runs: the snapshot on the main thread (SpiderMonkey's oracle; point 3's
+   immutable summary); the build, register allocation, emission and the copy into executable
+   memory on a compile thread (V8's Execute with its Code object, JSC's compiler thread); the
+   install on the main thread. Departure from V8 and JSC, measured: the feedback is read on the
+   main thread. The caches and records are Cells that helpers and generated code write, so a
+   concurrent read would race unless every feedback cell were atomic or locked (V8 keeps the main
+   thread the sole writer and locks two-slot groups, feedback-vector.h:398-406), and the snapshot is
+   2.6% of generate (0.43% of Djot's pass).
+2. The job's inputs, all Send: the snapshot, extended with every live read of the back end (each
+   named site's preferred way, the inline targets' callee words and environments with their pins
+   upgraded on the main thread, the activation facts and resolution sites forced there, the
+   allocation sites' cursor indices and cell sizes, R and the exit limit, the layouts; a call
+   target's function as an address word); a frozen view of the chunk's immutable data (ops, names'
+   text, constant words, frame, flags, positions, slot names, the inline targets' data, the name
+   statics and globals, the chunk's cell addresses and images), which the builder and the back end
+   read through a trait the live chunk also implements, so that the emitters the template JIT
+   shares stay one code; and the code generator's options and switches, read on the main thread.
+   The job reads no heap memory, so the collector needs neither to trace nor to cancel it
+   (SpiderMonkey traces its snapshots and JSC suspends its threads because theirs do).
+3. One compile thread a process, started at the first job, serving every engine (agents and
+   workers run engines on other threads); a job carries its engine's result queue and poll word.
+   One thread because the measured queue is short (offthread-input.txt 3.4: a Djot job ends 0.32
+   ms after its checkpoint on average, 1.70 ms at most) and the owner's model has two CPUs, one
+   of them the main thread's. The process-wide stubs the tier calls are assembled on the main
+   thread before the first job.
+4. While a job is pending its chunk has no checkpoint armed and its profile says compiling (V8's
+   tiering_in_progress, SpiderMonkey's isIonCompilingOffThread); the function runs the code it
+   has, the first stage's or a discarded code's fallback, until the install.
+5. Finishing: the compile thread queues the result and sets a new bit of the engine's poll word
+   (already an atomic shared by Arc and set from other threads, interrupt.rs:36-90); the next poll
+   at an entry, a back edge or after an allocating helper installs every finished job (V8's
+   interrupt, SpiderMonkey's attach). The install checks what no run-time guard covers: the chunk
+   is still the one to install into (not superseded, not published by a chain recompile, still
+   warming up for a recompile), its function's runtime lives, the realm whose global environment
+   the snapshot pinned is the running one, no discard flagged sites since the snapshot; otherwise
+   it drops the result and the function may tier up again (V8 drops a job whose dependencies fail
+   "s.t. we may reattempt compilation", maglev-compiler.cc:359-368). Then the JitCode, the exit
+   table, the slot and the publication as today, after an instruction barrier on the main thread
+   (JSC's crossModifyingCodeFence; the writer's flush synchronizes only the writer). A refusal ends
+   as one ends today.
+6. Executable memory: the compile thread copies the code into the region under its Mutex and
+   flushes it. The capacity's reclaim is the main thread's (CLOCK, a thread-local registry), so a
+   job denied capacity returns its words and the install maps them after the main thread's
+   reclaim (SpiderMonkey's link, as the fallback).
+7. The global environment's pin is taken with the snapshot, not at the install; the engine's list
+   of pending jobs keeps each job's chunk and first stage alive.
+8. Synchronous, today's path: with one CPU available to the process (std::thread::
+   available_parallelism, which honors the affinity mask where SpiderMonkey counts configured
+   CPUs: a process confined to one CPU gains nothing from the thread); where no thread can be
+   spawned (wasm32, a failed spawn, which degrades as the watchdog's does); under
+   TRUST_JS_OPT_SYNC=1; and in the tests that read a compile's results at once (V8's
+   --single-threaded, SpiderMonkey's runtime switch, JSC's useConcurrentJIT=false). The gates run
+   the tier's configurations both ways.
+9. An engine dropped with jobs pending marks them cancelled; the compile thread skips them and
+   their results are dropped.
+10. The log: each job's time on the compile thread apart from the main-thread parts (step 11's
+   lines, the snapshot's and the install's), so the sessions count the main thread's share as the
+   owner's bar does.
+- In two parts, each reviewable: (a) generate split into the snapshot and frozen view on the
+  main thread, a compile function of Send inputs and Send outputs, and the install, run
+  synchronously; masked code hashes identical to main on the fixtures, Richards, Crypto and the
+  tier's tests; (b) the thread, the queue, the poll bit, the checks at the install, the
+  synchronous mode, teardown.
+- Tests: (a)'s hashes; a function gets the tier's code after its job ends, at the next poll; a job
+  whose chunk was superseded, discarded or whose function was collected meanwhile is dropped and the
+  function may tier up again; an engine dropped with jobs pending; one CPU (an affinity mask of
+  one) compiles synchronously; the library's suite, Test262's subsets and the tier's tests with
+  the tier on in both modes; x86-64, Windows and wasm32 build (the thread is the tier's target's
+  only).
+- Expected (offthread-input.txt 3.3, scaled to session p3s2-7f92ab9d): generate's main-thread part
+  0.79% of Djot's pass, 0.32% of React's, 0.20% of Vue's, against 16.22%, 5.50% and 2.58% today;
+  with the recompiles and fallback compiles still on the main thread until the next step 5.49%,
+  1.64% and 0.85%. Unmeasured: a job's hand-off and the later install's cost in template code.
