@@ -64,6 +64,10 @@ pub(crate) struct TestSwitches {
     pub(crate) exit_limit: u32,
     /// TRUST_JS_OPT_NO_LOOP_COUNT: template code's loop iterations count toward no checkpoint.
     pub(crate) no_loop_count: bool,
+    /// The tier compiles off the main thread (`asynchronous`, where the process can): false for
+    /// a test that reads a compile's results at once, which compiles on the main thread (P3
+    /// stage 2, step 12).
+    pub(crate) asynchronous: bool,
 }
 
 #[cfg(test)]
@@ -85,6 +89,10 @@ thread_local! {
     /// The chunks the tier refused on this thread (`generate`, `refuses_unspliced`), with the
     /// refusals' reasons.
     pub(crate) static TEST_REFUSED: std::cell::RefCell<Vec<(usize, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The chunks whose compiles off the main thread their install dropped (`install_job`), with
+    /// the reasons (stage 2, step 12).
+    pub(crate) static TEST_DROPPED: std::cell::RefCell<Vec<(usize, &'static str)>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -432,14 +440,67 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::t
     let (job, pin) = match prepare(i, chunk, compiles_on_another_thread()) {
         Ok(prepared) => prepared,
         Err(refusal) => {
-            note_refusal(chunk, &refusal, started.elapsed());
+            note_refusal(chunk, &refusal, &Timing::main(started, started.elapsed()));
             return None;
         }
     };
     log_main_thread("snapshot", chunk, timer);
     let finished = run_here(job, chunk);
     let install = main_thread_timer();
-    finish(i, chunk, finished, pin).map(|code| (code, install))
+    let timing = Timing {
+        thread: if compiles_on_another_thread() {
+            "a scoped"
+        } else {
+            "the main"
+        },
+        compiled: finished.elapsed,
+        waited: std::time::Duration::ZERO,
+        snapshot: started,
+        runs: 1,
+    };
+    finish(i, chunk, finished, pin, &timing).map(|code| (code, install))
+}
+
+/// Where and when a compile ran, for its log line (the plan's point 10): the thread its build
+/// and code generation ran on (`the main`, `the compile`), their time there (summed over its
+/// runs: a job that found stubs or atoms missing runs again), its wait in the compile thread's
+/// queue, and when its snapshot started, so that the line gives the time from the snapshot to
+/// the install.
+struct Timing {
+    thread: &'static str,
+    compiled: std::time::Duration,
+    waited: std::time::Duration,
+    snapshot: std::time::Instant,
+    runs: u32,
+}
+
+impl Timing {
+    /// A refusal on the main thread before any compile, `elapsed` after `started`.
+    fn main(started: std::time::Instant, elapsed: std::time::Duration) -> Self {
+        Timing {
+            thread: "the main",
+            compiled: elapsed,
+            waited: std::time::Duration::ZERO,
+            snapshot: started,
+            runs: 0,
+        }
+    }
+
+    /// The log's fields after a compile line's own: `on <thread> thread, queued <ms> ms,
+    /// installed <ms> ms after its snapshot` (and `, <n> runs` past one).
+    fn fields(&self) -> String {
+        format!(
+            "on {} thread, queued {:.3} ms, installed {:.3} ms after its snapshot{}",
+            self.thread,
+            self.waited.as_secs_f64() * 1e3,
+            self.snapshot.elapsed().as_secs_f64() * 1e3,
+            if self.runs > 1 {
+                format!(", {} runs", self.runs)
+            } else {
+                String::new()
+            }
+        )
+    }
 }
 
 /// A compile's main-thread preparation (the plan's point 2): V8's size limit, the snapshot (its
@@ -563,8 +624,9 @@ fn assemble_stubs(job: &Job, keys: &[u32]) -> Vec<u32> {
     crate::jit::assemble_stubs(keys, &job.layout, &job.ilayout, direct)
 }
 
-/// A refusal of `chunk`'s compile after `elapsed`: the tests' record and the log's line.
-fn note_refusal(chunk: &Chunk, refusal: &Refusal, elapsed: std::time::Duration) {
+/// A refusal of `chunk`'s compile, timed as `timing` says: the tests' record and the log's line,
+/// `(<ms> ms)` the time on the compile's thread, the thread and the waits after it.
+fn note_refusal(chunk: &Chunk, refusal: &Refusal, timing: &Timing) {
     #[cfg(test)]
     TEST_REFUSED.with(|refused| {
         refused
@@ -572,18 +634,19 @@ fn note_refusal(chunk: &Chunk, refusal: &Refusal, elapsed: std::time::Duration) 
             .push((chunk as *const Chunk as usize, refusal.reason))
     });
     if log_enabled() {
+        let ms = timing.compiled.as_secs_f64() * 1e3;
         match refusal.pc {
             Some(pc) => eprintln!(
-                "[opt] refused {} at pc {pc}: {} ({:.3} ms)",
+                "[opt] refused {} at pc {pc}: {} ({ms:.3} ms) {}",
                 name(chunk),
                 refusal.reason,
-                elapsed.as_secs_f64() * 1e3
+                timing.fields()
             ),
             None => eprintln!(
-                "[opt] refused {}: {} ({:.3} ms)",
+                "[opt] refused {}: {} ({ms:.3} ms) {}",
                 name(chunk),
                 refusal.reason,
-                elapsed.as_secs_f64() * 1e3
+                timing.fields()
             ),
         }
     }
@@ -599,13 +662,13 @@ fn finish(
     chunk: &Chunk,
     finished: Finished,
     pin: Option<crate::interpreter::WeakEnv>,
+    timing: &Timing,
 ) -> Option<Rc<JitCode>> {
     let Finished {
         outcome,
         declines,
         verified,
         verify_failure,
-        elapsed,
         embeds_genv,
         ..
     } = finished;
@@ -631,7 +694,7 @@ fn finish(
     let compiled = match outcome {
         Outcome::Compiled(compiled) => compiled,
         Outcome::Refused(refusal) => {
-            note_refusal(chunk, &refusal, elapsed);
+            note_refusal(chunk, &refusal, timing);
             return None;
         }
         Outcome::Needs { .. } => unreachable!("a run ends with what it needs made"),
@@ -651,7 +714,7 @@ fn finish(
         None => match crate::jit::ExecutableBuffer::from_bytes(assembled.bytes()) {
             Some(executable) => executable,
             None => {
-                note_refusal(chunk, &Refusal::whole("no executable memory"), elapsed);
+                note_refusal(chunk, &Refusal::whole("no executable memory"), timing);
                 return None;
             }
         },
@@ -665,13 +728,14 @@ fn finish(
     if log_enabled() {
         eprintln!(
             "[opt] compiled {} ({} ops, {nodes} nodes, {} bytes) in {:.3} ms \
-             at {:#x} {:#x}",
+             at {:#x} {:#x} {}",
             name(chunk),
             chunk.jit_ops().len(),
             code.code_bytes(),
-            elapsed.as_secs_f64() * 1e3,
+            timing.compiled.as_secs_f64() * 1e3,
             code.mem_ptr() as usize,
-            code.code_bytes()
+            code.code_bytes(),
+            timing.fields()
         );
     }
     #[cfg(test)]
@@ -699,6 +763,457 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
             true
         }
         None => false,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Compiling off the main thread (stage 2, step 12; the plan's points 3-10)
+// ---------------------------------------------------------------------------------------------
+
+/// Whether the tier compiles off the main thread now (the plan's point 8): with more than one
+/// CPU available to the process and a compile thread started, unless TRUST_JS_OPT_SYNC is set,
+/// or, in test builds, unless the test's switches say otherwise (`TestSwitches::asynchronous`:
+/// a test that reads a compile's results at once compiles on the main thread, V8's
+/// --single-threaded, SpiderMonkey's runtime switch, JSC's useConcurrentJIT=false).
+pub(crate) fn asynchronous() -> bool {
+    #[cfg(test)]
+    if let Some(switches) = test_switches() {
+        return switches.asynchronous && compile_thread_usable();
+    }
+    !env_flag!("TRUST_JS_OPT_SYNC") && compile_thread_usable()
+}
+
+/// TRUST_JS_OPT_SYNC is unset (the environment's mode, which tests' switches copy).
+#[cfg(test)]
+pub(crate) fn asynchronous_by_environment() -> bool {
+    !env_flag!("TRUST_JS_OPT_SYNC")
+}
+
+/// Whether a compile can run on the compile thread: more than one CPU available (one gains
+/// nothing from it, SpiderMonkey's rule, jit/Ion.cpp:2110-2118) and the thread started (a
+/// failed start compiles on the main thread, as the watchdog's degrades).
+fn compile_thread_usable() -> bool {
+    more_than_one_cpu() && super::compiler::available()
+}
+
+/// More than one CPU available to the process, by `std::thread::available_parallelism`, which
+/// honors the affinity mask (a process confined to one CPU of many counts one, where
+/// SpiderMonkey counts the configured CPUs): read once a process.
+fn more_than_one_cpu() -> bool {
+    static MANY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *MANY.get_or_init(|| std::thread::available_parallelism().is_ok_and(|n| n.get() > 1))
+}
+
+/// How a tier compile ends, which its caller decided (stage 2, step 12): run now on the main
+/// thread, or at the install of a compile off it.
+pub(crate) enum Landing {
+    /// A function's recompile (its second stage, the tier's chunk of a function with nothing to
+    /// splice, a stale chain's recompile): published as `Interp::publish_recompile` says.
+    Publish(crate::interpreter::Publication),
+    /// A discarded code's recompile (`reoptimize`): the code in place of the template JIT's and
+    /// the epoch moved; the function, and the warm-up's next checkpoint and its run count, armed
+    /// again where the result is dropped.
+    Reoptimize {
+        func: std::rc::Weak<crate::ast::Function>,
+        warm_up: Option<(u8, u32)>,
+    },
+}
+
+/// An engine's compiles running off the main thread (`Interp::opt_pending`), which keep their
+/// chunks alive (the plan's point 7), and the queue the compile thread returns them on. An
+/// engine dropped with compiles pending cancels them (the plan's point 9): the compile thread
+/// skips them, or drops their results.
+#[derive(Default)]
+pub(crate) struct PendingCompiles {
+    results: Option<std::sync::Arc<super::compiler::Results>>,
+    jobs: Vec<PendingJob>,
+    next: u64,
+}
+
+impl PendingCompiles {
+    /// The compiles pending (tests).
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.jobs.len()
+    }
+
+    /// The heap bytes the pending compiles' records hold, each chunk they keep handed to
+    /// `chunk` (the memory census).
+    pub(crate) fn measure(&self, mut chunk: impl FnMut(&Rc<Chunk>)) -> usize {
+        for job in &self.jobs {
+            chunk(&job.chunk);
+        }
+        self.jobs.capacity() * std::mem::size_of::<PendingJob>()
+    }
+
+    /// Cancel every pending compile.
+    pub(crate) fn cancel(&mut self) {
+        for job in self.jobs.drain(..) {
+            job.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
+    }
+}
+
+impl Drop for PendingCompiles {
+    fn drop(&mut self) {
+        self.cancel();
+    }
+}
+
+/// A compile running off the main thread, as its engine keeps it.
+struct PendingJob {
+    id: u64,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The chunk the code goes into (its record map keeps the function's first stage).
+    chunk: Rc<Chunk>,
+    /// The chunk whose checkpoint started it, marked compiling and its checkpoint disarmed until
+    /// the install, and the word that checkpoint had armed.
+    asking: Rc<Chunk>,
+    armed: u32,
+    landing: Landing,
+    /// The pin of the running realm's global environment at the snapshot, and its address.
+    pin: Option<crate::interpreter::WeakEnv>,
+    genv: usize,
+    /// The revisions of the exit profiles the snapshot read (`revisions`).
+    revisions: u64,
+    /// The compile's runs and their time on the compile thread and in its queue so far.
+    timing: Timing,
+}
+
+/// The revisions of the exit profiles a snapshot of `chunk` reads (its own and its record map's
+/// targets'): a discard that flags sites or counts R changes them.
+fn revisions(chunk: &Chunk) -> u64 {
+    let of = |chunk: &Chunk| ChunkProfile::get(chunk).map_or(0, |p| u64::from(p.revision()));
+    of(chunk)
+        + chunk
+            .feedback_vector()
+            .record_map()
+            .map_or(0, |map| map.targets().iter().map(|target| of(target)).sum())
+}
+
+/// Whether a compile `chunk`'s checkpoint started runs off the main thread (its profile says
+/// compiling): no checkpoint of it compiles meanwhile.
+pub(crate) fn compiling(chunk: &Chunk) -> bool {
+    ChunkProfile::get(chunk).is_some_and(ChunkProfile::compiling)
+}
+
+/// Compile `chunk`, a function's recompile, with the tier and publish it as `publication` says
+/// (`Interp::publish_recompile`): now, where the tier compiles on the main thread
+/// (`asynchronous`), or at the install of a compile off it, where the publication then moves
+/// (published before its code exists, the chunk would run in the bytecode VM). `asking` is the
+/// chunk whose checkpoint asked.
+pub(crate) fn compile_recompile(
+    i: &mut Interp,
+    chunk: Rc<Chunk>,
+    asking: &Chunk,
+    publication: crate::interpreter::Publication,
+) {
+    if asynchronous() {
+        if let Some(asking_rc) = publication.asking.clone() {
+            match start_job(i, chunk, asking_rc, Landing::Publish(publication)) {
+                Ok(()) => return,
+                Err((chunk, Landing::Publish(publication))) => {
+                    i.publish_recompile(&publication, asking, chunk, false);
+                    return;
+                }
+                Err(_) => unreachable!("a publication's landing"),
+            }
+        }
+    }
+    let accepted = compile_into(i, &chunk);
+    i.publish_recompile(&publication, asking, chunk, accepted);
+}
+
+/// Start a compile of `chunk` off the main thread (the plan's points 3 and 4), its ending
+/// `landing` at the install: its preparation now (the snapshot, logged as a main-thread part),
+/// the job queued for the compile thread, and `asking`, the chunk whose checkpoint asked, marked
+/// compiling with no checkpoint armed until then (V8's tiering_in_progress, SpiderMonkey's
+/// isIonCompilingOffThread). The chunk and the landing back where the preparation refused the
+/// compile (logged), which the caller then ends as a refusal.
+#[allow(clippy::result_large_err)]
+fn start_job(
+    i: &mut Interp,
+    chunk: Rc<Chunk>,
+    asking: Rc<Chunk>,
+    landing: Landing,
+) -> Result<(), (Rc<Chunk>, Landing)> {
+    release_retired(i);
+    let started = std::time::Instant::now();
+    let timer = main_thread_timer();
+    let (job, pin) = match prepare(i, &chunk, true) {
+        Ok(prepared) => prepared,
+        Err(refusal) => {
+            note_refusal(&chunk, &refusal, &Timing::main(started, started.elapsed()));
+            return Err((chunk, landing));
+        }
+    };
+    let pending = &mut i.opt_pending;
+    pending.next += 1;
+    let id = pending.next;
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let results = pending.results.get_or_insert_with(Default::default).clone();
+    let genv = job.genv;
+    if let Err(job) = super::compiler::enqueue(id, job, cancelled.clone(), results, i.poll.clone())
+    {
+        // No compile thread after all: compiled here, and ended now.
+        log_main_thread("snapshot", &chunk, timer);
+        let finished = run_here(job, &chunk);
+        let timing = Timing {
+            thread: "the main",
+            compiled: finished.elapsed,
+            waited: std::time::Duration::ZERO,
+            snapshot: started,
+            runs: 1,
+        };
+        let install = main_thread_timer();
+        let code = finish(i, &chunk, finished, pin, &timing);
+        land(i, chunk, &asking, landing, code, install);
+        return Ok(());
+    }
+    let armed = asking.inline_retry_at.get();
+    asking.set_inline_retry_at(0);
+    ChunkProfile::of(&asking).set_compiling(true);
+    let revisions = revisions(&chunk);
+    // The main thread's part of starting it: the snapshot, the frozen view, the hand-off.
+    log_main_thread("snapshot", &chunk, timer);
+    i.opt_pending.jobs.push(PendingJob {
+        id,
+        cancelled,
+        chunk,
+        asking,
+        armed,
+        landing,
+        pin,
+        genv,
+        revisions,
+        timing: Timing {
+            thread: "the compile",
+            compiled: std::time::Duration::ZERO,
+            waited: std::time::Duration::ZERO,
+            snapshot: started,
+            runs: 0,
+        },
+    });
+    Ok(())
+}
+
+/// The end of a compile of `chunk` whose code is `code` (None: refused), as `landing` says: the
+/// publication, or the reoptimization's install and epoch move; `install` times the main
+/// thread's part (`[opt] main-thread install`).
+fn land(
+    i: &mut Interp,
+    chunk: Rc<Chunk>,
+    asking: &Chunk,
+    landing: Landing,
+    code: Option<Rc<JitCode>>,
+    install: Option<std::time::Instant>,
+) {
+    match landing {
+        Landing::Publish(publication) => {
+            let accepted = code.is_some_and(|code| match chunk.jit.begin_compile() {
+                Some(permit) => {
+                    permit.commit(Some(code));
+                    log_main_thread("install", &chunk, install);
+                    true
+                }
+                None => {
+                    if log_enabled() {
+                        eprintln!("[opt] refused {}: no code slot", name(&chunk));
+                    }
+                    false
+                }
+            });
+            i.publish_recompile(&publication, asking, chunk, accepted);
+        }
+        Landing::Reoptimize { .. } => {
+            if let Some(code) = code {
+                let installed = install_code(i, &chunk, code);
+                log_main_thread("install", &chunk, install);
+                if installed {
+                    move_epoch("reoptimization");
+                }
+            }
+            release_retired(i);
+        }
+    }
+}
+
+/// Install the compiles of `i` that finished off the main thread (the plan's point 5), at a
+/// poll of generated code that found the install bit set (`jit_interrupt`, V8's
+/// INSTALL_MAGLEV_CODE interrupt, SpiderMonkey's attach): each result whose job is still pending
+/// is checked (`dropped`), then linked and landed as its caller decided, its code run after the
+/// instruction barrier (`finish`); a result whose job found stubs or atoms missing has them made
+/// here and runs again; a panic on the compile thread is raised here.
+pub(crate) fn install_finished(i: &mut Interp) {
+    if !i.poll.take_install_request() {
+        return;
+    }
+    let Some(results) = i.opt_pending.results.clone() else {
+        return;
+    };
+    for done in results.take() {
+        install_one(i, done, &results);
+    }
+}
+
+fn install_one(
+    i: &mut Interp,
+    done: super::compiler::Done,
+    results: &std::sync::Arc<super::compiler::Results>,
+) {
+    let Some(at) = i.opt_pending.jobs.iter().position(|job| job.id == done.id) else {
+        return;
+    };
+    let finished = match done.finished {
+        Ok(finished) => finished,
+        Err(panic) => {
+            let job = i.opt_pending.jobs.remove(at);
+            undo(&job);
+            std::panic::resume_unwind(panic);
+        }
+    };
+    {
+        let timing = &mut i.opt_pending.jobs[at].timing;
+        timing.compiled += finished.elapsed;
+        timing.waited += done.waited;
+        timing.runs += 1;
+    }
+    if let Outcome::Needs { stubs } = &finished.outcome {
+        let stubs = stubs.clone();
+        let chunk = i.opt_pending.jobs[at].chunk.clone();
+        let timer = main_thread_timer();
+        let mut job = finished.job;
+        provide(&mut job, &stubs);
+        let pending = &i.opt_pending.jobs[at];
+        let requeued = super::compiler::enqueue(
+            pending.id,
+            job,
+            pending.cancelled.clone(),
+            results.clone(),
+            i.poll.clone(),
+        );
+        log_main_thread("stubs", &chunk, timer);
+        if let Err(job) = requeued {
+            // No compile thread after all: run here, and install now.
+            let finished = run_here(job, &chunk);
+            let job = i.opt_pending.jobs.remove(at);
+            install_job(i, job, finished);
+        }
+        return;
+    }
+    let job = i.opt_pending.jobs.remove(at);
+    install_job(i, job, finished);
+}
+
+/// Install `finished`, `job`'s result, or drop it where a check fails (`dropped`).
+fn install_job(i: &mut Interp, job: PendingJob, finished: Finished) {
+    let install = main_thread_timer();
+    ChunkProfile::of(&job.asking).set_compiling(false);
+    if let Some(reason) = dropped(i, &job) {
+        #[cfg(test)]
+        TEST_DROPPED.with(|dropped| {
+            dropped
+                .borrow_mut()
+                .push((Rc::as_ptr(&job.chunk) as usize, reason))
+        });
+        if log_enabled() {
+            eprintln!(
+                "[opt] dropped {}: {reason} (compiled in {:.3} ms {})",
+                name(&job.chunk),
+                job.timing.compiled.as_secs_f64() * 1e3,
+                job.timing.fields()
+            );
+        }
+        undo(&job);
+        // The result goes here, its executable pages with it.
+        drop(finished);
+        log_main_thread("install", &job.chunk, install);
+        return;
+    }
+    let PendingJob {
+        chunk,
+        asking,
+        landing,
+        pin,
+        timing,
+        ..
+    } = job;
+    let code = finish(i, &chunk, finished, pin, &timing);
+    if code.is_none() {
+        // A refusal's ending: its time at the install is the main thread's too.
+        let refused = chunk.clone();
+        land(i, chunk, &asking, landing, code, None);
+        log_main_thread("install", &refused, install);
+        return;
+    }
+    land(i, chunk, &asking, landing, code, install);
+}
+
+/// What no run-time guard of the code covers, checked at its install (the plan's point 5): why
+/// `job`'s result is dropped, if it is. The realm whose global environment the snapshot pinned
+/// is the running one; no discard flagged sites or counted R since the snapshot (`revisions`);
+/// the function lives; the chunk is still the one to install into (the asking chunk not
+/// superseded, no recompile published meanwhile, a reoptimized chunk not superseded). V8 drops a
+/// job whose dependencies fail "s.t. we may reattempt compilation"
+/// (maglev/maglev-compiler.cc:359-368): so does `undo`.
+fn dropped(i: &Interp, job: &PendingJob) -> Option<&'static str> {
+    if job.pin.as_ref().is_some_and(|pin| pin.strong_count() == 0)
+        || crate::interpreter::Env::as_ptr(&i.global_env) as usize != job.genv
+    {
+        return Some("another realm runs");
+    }
+    if revisions(&job.chunk) != job.revisions {
+        return Some("a discard flagged its sites since its snapshot");
+    }
+    match &job.landing {
+        Landing::Publish(publication) => {
+            let Some(func) = publication.func.upgrade() else {
+                return Some("its function was collected");
+            };
+            let runtime = func.runtime();
+            if !runtime.heap.is_alive() {
+                return Some("its function was collected");
+            }
+            if job.asking.superseded() {
+                return Some("its chunk was superseded");
+            }
+            if publication.slot(&runtime).get().is_some() {
+                return Some("a recompile was published meanwhile");
+            }
+        }
+        Landing::Reoptimize { func, .. } => {
+            let Some(func) = func.upgrade() else {
+                return Some("its function was collected");
+            };
+            if !func.runtime().heap.is_alive() {
+                return Some("its function was collected");
+            }
+            if job.chunk.superseded() {
+                return Some("its chunk was superseded");
+            }
+        }
+    }
+    None
+}
+
+/// After a dropped result, the function may tier up again: its asking chunk's checkpoint (or a
+/// reoptimization's warm-up) armed again as it was, a chain recompile asked for again.
+fn undo(job: &PendingJob) {
+    ChunkProfile::of(&job.asking).set_compiling(false);
+    match &job.landing {
+        Landing::Publish(publication) => {
+            job.asking.set_inline_retry_at(job.armed);
+            if publication.chain() {
+                job.asking.reoptimize.set(true);
+            }
+        }
+        Landing::Reoptimize { warm_up, .. } => {
+            if let Some((checkpoint, at)) = *warm_up {
+                ChunkProfile::of(&job.chunk).arm(checkpoint, at);
+                job.chunk.set_inline_retry_at(at);
+            }
+        }
     }
 }
 
@@ -899,8 +1414,16 @@ pub(crate) fn reoptimizing(chunk: &Chunk) -> bool {
 /// the exit profile's flags, and installs the code in place of the template JIT's. Nothing forces
 /// the recompile: feedback that keeps changing keeps the template JIT's code (stage 2, step 11).
 /// A refusal keeps the template JIT's code. No Realm test: the code's guards compare the Realm's
-/// global environment.
-pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
+/// global environment. Off the main thread (`asynchronous`), the recompile is installed at its
+/// job's install, `chunk` (its Rc, `chunk_rc`, kept meanwhile) marked compiling until then; a
+/// dropped result arms the warm-up's next checkpoint again (`undo`). `func` is the chunk's
+/// function.
+pub(crate) fn reoptimize(
+    i: &mut Interp,
+    chunk: &Chunk,
+    func: std::rc::Weak<crate::ast::Function>,
+    chunk_rc: Option<Rc<Chunk>>,
+) {
     let profile = ChunkProfile::of(chunk);
     let Some((checkpoint, at)) = profile.warm_up() else {
         return;
@@ -913,16 +1436,18 @@ pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
         return;
     }
     let r = ChunkProfile::get(profile::first_stage(chunk)).map_or(0, ChunkProfile::discards);
-    match warm_up_word(runs, r, checkpoint) {
+    let warm_up = match warm_up_word(runs, r, checkpoint) {
         Some(next) => {
             profile.arm(checkpoint.saturating_add(1), next);
             chunk.set_inline_retry_at(next);
+            Some((checkpoint.saturating_add(1), next))
         }
         None => {
             profile.disarm();
             chunk.set_inline_retry_at(0);
+            None
         }
-    }
+    };
     if waits_at(chunk, checkpoint, " (reoptimization)") {
         return;
     }
@@ -935,9 +1460,20 @@ pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
             name(chunk)
         );
     }
+    if asynchronous() {
+        if let Some(chunk_rc) = chunk_rc {
+            // A refusal at the preparation keeps the template JIT's code, as one at the compile.
+            let landing = Landing::Reoptimize { func, warm_up };
+            if start_job(i, chunk_rc.clone(), chunk_rc, landing).is_err() {
+                release_retired(i);
+            }
+            return;
+        }
+    }
+    let _ = (func, warm_up);
     release_retired(i);
     if let Some((code, started)) = generate(i, chunk) {
-        let installed = install(i, chunk, code);
+        let installed = install_code(i, chunk, code);
         log_main_thread("install", chunk, started);
         if installed {
             move_epoch("reoptimization");
@@ -965,7 +1501,7 @@ fn pin_global_environment(i: &mut Interp, pin: crate::interpreter::WeakEnv) {
 /// Make `code`, the tier's recompile of `chunk`, the chunk's native code: in place of the
 /// resident code, which joins the retired codes until no activation runs it, or in a cold slot
 /// (evicted, or left cold by a deferred discard). An unavailable slot keeps the chunk in the VM.
-fn install(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
+fn install_code(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
     match chunk.jit.get() {
         Some(Some(_)) => {
             if let Some(replaced) = chunk.jit.replace_resident(Some(code)) {

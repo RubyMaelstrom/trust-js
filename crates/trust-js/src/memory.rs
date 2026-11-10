@@ -1437,6 +1437,10 @@ fn scan_realm(
     for code in &interp.opt_retired {
         visitor.jit_code(code);
     }
+    // Its compiles running off the main thread, which keep their chunks until their install.
+    totals
+        .engine_caches
+        .add(interp.opt_pending.measure(|chunk| visitor.chunk(chunk)));
     totals.engine_caches.add(
         interp
             .opt_retired

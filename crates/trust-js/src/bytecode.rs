@@ -31702,6 +31702,12 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
+    // The optimizing tier's compiles that finished off the main thread are installed here, at
+    // the next poll after their thread set the install bit (P3 stage 2, step 12): no new code
+    // runs before the poll returns.
+    if i.poll.install_requested() {
+        crate::opt::install_finished(i);
+    }
     #[cfg(test)]
     let (collections, overshoot, live_overshoot) = {
         let core = i.gc_heap.core.borrow();

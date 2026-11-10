@@ -4759,6 +4759,10 @@ pub struct Interp {
     /// The native codes the optimizing tier replaced (`opt::discard`, `opt::reoptimize`): no entry
     /// takes them any more, and each stays until no activation runs it (`opt::release_retired`).
     pub(crate) opt_retired: Vec<Rc<crate::jit::JitCode>>,
+    /// The optimizing tier's compiles running off the main thread (P3 stage 2, step 12), which
+    /// keep their chunks until their install at a poll (`opt::install_finished`); the engine's
+    /// drop cancels them.
+    pub(crate) opt_pending: crate::opt::PendingCompiles,
     /// The native runs an entry counts toward its chunk's checkpoints (`opt::entry_weight` when
     /// the engine was made: K with the optimizing tier on, one with it off; P3 stage 2, step 11),
     /// which the Rust paths that count an entry read here: the call helper's hit,
@@ -5241,6 +5245,7 @@ interp_memory_inventory! {
     opt_exit_countdown => "non_owning",
     opt_exit_every => "non_owning",
     opt_retired => "measured",
+    opt_pending => "measured",
     opt_entry_weight => "non_owning",
     tier => "non_owning",
     tier_threshold => "non_owning",
@@ -5383,7 +5388,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 147);
+    assert_eq!(names.len(), 148);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -5415,6 +5420,9 @@ fn drop_collected_realm(mut realm: crate::agent_access::Owned<Interp>) {
 
 impl Drop for Interp {
     fn drop(&mut self) {
+        // The optimizing tier's compiles still running off the main thread are cancelled: the
+        // compile thread skips them or drops their results (P3 stage 2, step 12).
+        self.opt_pending.cancel();
         self.runtime_interrupt.unregister(&self.poll);
         crate::value::detach_poll_word(&self.gc_heap, &self.poll);
         // libtest exits the process before persistent runtime-worker TLS destructors run. Flush
@@ -6999,6 +7007,7 @@ impl Interp {
             opt_exit_countdown: crate::opt::exit_every(),
             opt_exit_every: crate::opt::exit_every(),
             opt_retired: Vec::new(),
+            opt_pending: Default::default(),
             opt_entry_weight: crate::opt::entry_weight(),
             depth: 0,
             direct_call_depth: MAX_DIRECT_CALL_DEPTH,
@@ -14105,6 +14114,7 @@ impl Interp {
             opt_exit_countdown: _,
             opt_exit_every: _,
             opt_retired: _,
+            opt_pending: _,
             opt_entry_weight: _,
             tier: _,
             tier_threshold: _,
@@ -16617,6 +16627,13 @@ impl Interp {
             crate::jit::perf_inline_suppressed();
             return;
         }
+        // A compile this chunk's checkpoint started runs off the main thread (P3 stage 2, step
+        // 12): no checkpoint of it compiles until its install, and none stays armed (a stale
+        // chain's request, which re-arms the word, is taken after the install).
+        if crate::opt::compiling(chunk) {
+            chunk.set_inline_retry_at(0);
+            return;
+        }
         // Alive as below: the callee object that carried this IC is alive. A declined recompile
         // leaves the checkpoint to run as it would have.
         if chunk.reoptimize.replace(false)
@@ -16628,7 +16645,11 @@ impl Interp {
         // toward the optimizing tier's recompile on its checkpoint word (P3 stage 2): the due
         // checkpoint is the tier's.
         if crate::opt::reoptimizing(chunk) {
-            crate::opt::reoptimize(self, chunk);
+            // SAFETY: as below, the function is alive.
+            let runtime = unsafe { &*func }.runtime();
+            let chunk_rc = runtime_chunk(&runtime, chunk);
+            drop(runtime);
+            crate::opt::reoptimize(self, chunk, function_weak(func), chunk_rc);
             return;
         }
         // With the optimizing tier on (P3 stage 1), the checkpoints advance as ever, but the
@@ -16667,7 +16688,7 @@ impl Interp {
         let plan = crate::bytecode::plan_inlines(chunk, func, realm, &self.global_env);
         if plan.is_empty() {
             crate::jit::perf_inline_empty_plan();
-            if std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
+            if env_flag!("TRUST_JS_TIER_LOG") {
                 let src = func.source.as_deref().unwrap_or("<no source>");
                 let head: String = src.chars().take(60).collect();
                 eprintln!("[tier] inline: empty plan for: {}", head.replace('\n', " "));
@@ -16701,17 +16722,21 @@ impl Interp {
         if let Some(chunk2) = recompiled {
             if tier {
                 crate::opt::forget(chunk);
-                // The tier generates the native code of the chunk this publishes. A chunk with
-                // nothing spliced is published only if the tier accepts it: refused, the
-                // function keeps its first stage; a refused second stage keeps today's code,
-                // the template JIT's, made at its first native entry.
-                if !crate::opt::compile_into(self, &chunk2) && plan.is_empty() {
-                    chunk.set_inline_retry_at(0);
-                    return;
-                }
+                // The tier generates the native code of the chunk this publishes
+                // (`publish_recompile`): now, or where it compiles off the main thread (P3 stage
+                // 2, step 12) at its install, the publication waiting for the code.
+                let publication = Publication {
+                    func: function_weak(func),
+                    asking: runtime_chunk(&runtime, chunk),
+                    genv,
+                    kind: PublicationKind::SecondStage { sites: plan.len() },
+                };
+                drop(runtime);
+                crate::opt::compile_recompile(self, chunk2, chunk, publication);
+                return;
             }
             crate::jit::perf_inline_success();
-            if std::env::var_os("TRUST_JS_TIER_LOG").is_some() {
+            if env_flag!("TRUST_JS_TIER_LOG") {
                 let src = func.source.as_deref().unwrap_or("<no source>");
                 let head: String = src.chars().take(60).collect();
                 eprintln!(
@@ -16748,7 +16773,7 @@ impl Interp {
         genv: usize,
     ) -> bool {
         let runtime = func.runtime();
-        let log = std::env::var_os("TRUST_JS_TIER_LOG").is_some();
+        let log = env_flag!("TRUST_JS_TIER_LOG");
         let decline = |reason: &str| {
             if log {
                 eprintln!("[tier] recompile without property chains declined: {reason}");
@@ -16786,9 +16811,22 @@ impl Interp {
             return decline("the compile failed");
         };
         // With the optimizing tier on, the tier generates its native code as a second stage's
-        // (P3 stage 2): a refusal keeps the template JIT's, made at its first native entry.
+        // (P3 stage 2): a refusal keeps the template JIT's, made at its first native entry. The
+        // publication follows its compile (`publish_recompile`): now, or at its install where
+        // the tier compiles off the main thread (P3 stage 2, step 12).
         if crate::opt::enabled() {
-            crate::opt::compile_into(self, &chunk3);
+            let publication = Publication {
+                func: function_weak(func),
+                asking: runtime_chunk(&runtime, chunk),
+                genv,
+                kind: PublicationKind::Chain {
+                    second_stage,
+                    started: started.map(|started| (started, plan.len())),
+                },
+            };
+            drop(runtime);
+            crate::opt::compile_recompile(self, chunk3, chunk, publication);
+            return true;
         }
         let slot = if second_stage {
             &runtime.code3
@@ -16809,6 +16847,70 @@ impl Interp {
             );
         }
         true
+    }
+
+    /// End a function's recompile `chunk`, which the optimizing tier compiled (`accepted`: its
+    /// code is the chunk's) or refused, as `publication` says (P3 stage 2, step 12): the ending
+    /// [`Interp::try_inline_recompile`] and the chain recompile had after the tier's compile,
+    /// now run when it ends, at once or at the install of a compile off the main thread. A second
+    /// stage with nothing spliced is published only if the tier accepted it (refused, the
+    /// function keeps its first stage); a refused second stage is published with the template
+    /// JIT's code, made at its first native entry, and so is a chain recompile; `asking`, the
+    /// chunk whose checkpoint asked, has no checkpoint after. A function collected meanwhile
+    /// takes nothing.
+    pub(crate) fn publish_recompile(
+        &mut self,
+        publication: &Publication,
+        asking: &crate::bytecode::Chunk,
+        chunk: Rc<crate::bytecode::Chunk>,
+        accepted: bool,
+    ) {
+        let Some(func) = publication.func.upgrade() else {
+            return;
+        };
+        let runtime = func.runtime();
+        match publication.kind {
+            PublicationKind::SecondStage { sites } => {
+                if !accepted && sites == 0 {
+                    asking.set_inline_retry_at(0);
+                    return;
+                }
+                crate::jit::perf_inline_success();
+                if env_flag!("TRUST_JS_TIER_LOG") {
+                    let src = func.source.as_deref().unwrap_or("<no source>");
+                    let head: String = src.chars().take(60).collect();
+                    eprintln!(
+                        "[tier] inlined {sites} site(s) into: {}",
+                        head.replace('\n', " ")
+                    );
+                }
+                runtime.publish(&runtime.code2, chunk, publication.genv);
+                asking.set_inline_retry_at(0);
+            }
+            PublicationKind::Chain {
+                second_stage,
+                started,
+            } => {
+                let slot = if second_stage {
+                    &runtime.code3
+                } else {
+                    &runtime.code2
+                };
+                runtime.publish(slot, chunk, publication.genv);
+                asking.set_inline_retry_at(0);
+                if let Some((started, sites)) = started {
+                    let src = func.source.as_deref().unwrap_or("<no source>");
+                    let head: String = src.chars().take(60).collect();
+                    eprintln!(
+                        "[tier] recompiled without property chains after {} chain replays ({} inline sites, bytecode {:.3} ms): {}",
+                        asking.stale_chain_replays(),
+                        sites,
+                        started.elapsed().as_secs_f64() * 1e3,
+                        head.replace('\n', " ")
+                    );
+                }
+            }
+        }
     }
 
     fn learned_construct_layout(&self, constructor: &Gc) -> Option<crate::value::PropertyLayout> {
@@ -19823,4 +19925,93 @@ impl Default for Interp {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// How a function's recompile is published once the optimizing tier's compile of it ends (P3
+/// stage 2, step 12; [`Interp::publish_recompile`]): at once on the main thread, or at the
+/// install of a compile off it, which keeps the chunk unpublished meanwhile.
+pub(crate) struct Publication {
+    /// The function, held weakly: a compile off the main thread checks at its install that it
+    /// lives.
+    pub(crate) func: std::rc::Weak<crate::ast::Function>,
+    /// The chunk whose checkpoint asked, where the function's runtime holds it, which a compile
+    /// off the main thread marks compiling until its install.
+    pub(crate) asking: Option<Rc<crate::bytecode::Chunk>>,
+    /// The publishing call's global environment (`FunctionRuntime::publish`).
+    pub(crate) genv: usize,
+    pub(crate) kind: PublicationKind,
+}
+
+/// Which recompile a [`Publication`] publishes.
+pub(crate) enum PublicationKind {
+    /// The second stage, `sites` sites spliced in (none: the tier's own chunk of a function
+    /// with nothing to splice), into `code2`.
+    SecondStage { sites: usize },
+    /// The recompile without property chains, into `code3` where the function has a second
+    /// stage, else `code2`; its start and its plan's sites under TRUST_JS_TIER_LOG.
+    Chain {
+        second_stage: bool,
+        started: Option<(std::time::Instant, usize)>,
+    },
+}
+
+impl Publication {
+    /// The slot of `runtime` the recompile goes into.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn slot<'r>(
+        &self,
+        runtime: &'r crate::function_runtime::FunctionRuntime,
+    ) -> &'r std::cell::OnceCell<Option<Rc<crate::bytecode::Chunk>>> {
+        match self.kind {
+            PublicationKind::Chain {
+                second_stage: true, ..
+            } => &runtime.code3,
+            PublicationKind::SecondStage { .. } | PublicationKind::Chain { .. } => &runtime.code2,
+        }
+    }
+
+    /// Whether it is the recompile without property chains.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn chain(&self) -> bool {
+        matches!(self.kind, PublicationKind::Chain { .. })
+    }
+}
+
+/// A weak handle of the function `func` addresses, which a call cache or entry recorded with
+/// `Rc::as_ptr` of its live `Rc` (every caller of `Interp::try_inline_recompile` does).
+fn function_weak(func: *const crate::ast::Function) -> std::rc::Weak<crate::ast::Function> {
+    // SAFETY: `func` is `Rc::as_ptr` of a live `Rc<Function>` (the callee object that carried
+    // the call is alive): a strong count taken and given back leaves the counts as they were.
+    let rc = unsafe {
+        Rc::increment_strong_count(func);
+        Rc::from_raw(func)
+    };
+    Rc::downgrade(&rc)
+}
+
+/// `chunk`'s `Rc` where `runtime` holds it (its code, second stage or chain recompile).
+fn runtime_chunk(
+    runtime: &crate::function_runtime::FunctionRuntime,
+    chunk: &crate::bytecode::Chunk,
+) -> Option<Rc<crate::bytecode::Chunk>> {
+    [&runtime.code, &runtime.code2, &runtime.code3]
+        .into_iter()
+        .find_map(|slot| {
+            slot.get()
+                .and_then(Option::as_ref)
+                .filter(|held| std::ptr::eq(&***held, chunk))
+                .cloned()
+        })
 }

@@ -100,6 +100,16 @@ comment/example in the same change.
   dominance, representations, frame states and terminators) and refuses a graph that fails,
   logging why under `TRUST_JS_OPT_LOG`; debug builds and the library's tests always verify, and
   panic at a failure (Maglev, SpiderMonkey and JSC verify their graphs in debug builds only).
+  The tier compiles off the main thread: at a checkpoint the main thread takes the snapshot and
+  the chunk's frozen view, and the process's compile thread (`trust-js-opt`, started at the first
+  compile) builds, allocates registers, emits and maps the code; the next poll of generated code
+  after it finished installs it (a function's second stage is published then: until then the
+  function runs the code it has). The install drops a result whose realm no longer runs, whose
+  exit profile a discard changed, whose function was collected or whose chunk was superseded or
+  published over meanwhile, and the function tiers up again. `TRUST_JS_OPT_SYNC=1` compiles on
+  the main thread, as do a process with one CPU available (its affinity mask counts) and one
+  that cannot start the thread; the library's tests whose switches read a compile's results at
+  once (`TestSwitches::asynchronous` false) do too.
   `TRUST_JS_OPT_NO_REOPT=1` keeps stage 1's fallback for good: a discard flags nothing, adds
   nothing to R and arms no recompile. `TRUST_JS_OPT_NO_EXIT_PROFILE=1` flags nothing, so that
   recompiles decline nothing (the feedback alone guides them). `TRUST_JS_OPT_LOG=1` prints one
@@ -119,12 +129,21 @@ comment/example in the same change.
   a second stage: `[opt] template <base> <length> <name> (second stage|fallback)`, the code of
   a second stage the tier refused (or of a loop's borrowed-frame entry) or of a discard. A
   profile's samples join to these ranges, since the perf map names a second stage's template
-  code `JS:^`, as its first stage's. The parts of a tier compile that run on the main thread
-  besides the compile line's own time (the snapshot, the graph, the code) each print `[opt]
-  main-thread <part> <name> in <ms> ms`: `recompile`, the bytecode recompile that makes the
-  tier's chunk (its second stage, or a stale chain's recompile); `install`, the code's
+  code `JS:^`, as its first stage's. A compile's line and a refusal's (whose `(<ms> ms)` is the
+  compile's) end with where its time was spent: `on the main thread` or `on the compile
+  thread` (`on a scoped thread` in the tests' TRUST_JS_OPT_SCOPED_COMPILE check), `queued <ms>
+  ms` (its wait in the compile thread's queue), `installed <ms> ms after its snapshot` and, for
+  a job that ran again after the main thread made the stubs or atoms it lacked, `, <n> runs`; a
+  dropped result prints `[opt] dropped <name>: <reason> (compiled in <ms> ms on the compile
+  thread, ...)`. The parts of a tier compile that run on the main thread besides the compile
+  line's own time each print `[opt] main-thread <part> <name> in <ms> ms`: `recompile`, the
+  bytecode recompile that makes the tier's chunk (its second stage, or a stale chain's
+  recompile); `snapshot`, the snapshot and the chunk's frozen view; `stubs`, the process stubs
+  and atoms a compile found missing, made for its next run; `install`, the code's link and
   installation after its compile; `fallback`, the template JIT's compile of a discarded code's
-  fallback, at the discard or, deferred there for executable capacity, at a later entry.
+  fallback, at the discard or, deferred there for executable capacity, at a later entry. The
+  main thread's share of the tier's compiles is then the main-thread lines and the compile and
+  refusal lines `on the main thread`.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at

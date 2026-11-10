@@ -43,6 +43,11 @@ pub(crate) mod build;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+mod compiler;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod driver;
 #[cfg(all(
     target_arch = "aarch64",
@@ -117,6 +122,12 @@ mod build_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+mod offthread_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod tier_tests;
 
 #[cfg(all(
@@ -176,15 +187,44 @@ mod off {
         None
     }
 
-    pub(crate) fn compile_into(_: &mut Interp, _: &Chunk) -> bool {
+    pub(crate) fn compiling(_: &Chunk) -> bool {
         false
+    }
+
+    pub(crate) fn compile_recompile(
+        i: &mut Interp,
+        chunk: std::rc::Rc<Chunk>,
+        asking: &Chunk,
+        publication: crate::interpreter::Publication,
+    ) {
+        i.publish_recompile(&publication, asking, chunk, false);
     }
 
     pub(crate) fn reoptimizing(_: &Chunk) -> bool {
         false
     }
 
-    pub(crate) fn reoptimize(_: &mut Interp, _: &Chunk) {}
+    pub(crate) fn reoptimize(
+        _: &mut Interp,
+        _: &Chunk,
+        _: std::rc::Weak<crate::ast::Function>,
+        _: Option<std::rc::Rc<Chunk>>,
+    ) {
+    }
+
+    pub(crate) fn install_finished(_: &mut Interp) {}
+
+    /// No compile runs off the main thread where the tier has no back end.
+    #[derive(Default)]
+    pub(crate) struct PendingCompiles;
+
+    impl PendingCompiles {
+        pub(crate) fn measure(&self, _: impl FnMut(&std::rc::Rc<Chunk>)) -> usize {
+            0
+        }
+
+        pub(crate) fn cancel(&mut self) {}
+    }
 
     /// No code has an exit table.
     pub(crate) mod exit {
@@ -271,6 +311,7 @@ pub(crate) fn pin_forced_exits_off_for_test() {
         no_exit_profile: no_exit_profile(),
         exit_limit: exit_limit_base(),
         no_loop_count: no_loop_count(),
+        asynchronous: asynchronous_by_environment(),
     }
     .set();
 }
@@ -294,6 +335,7 @@ pub(crate) fn pin_loop_count_off_for_test() {
         no_exit_profile: no_exit_profile(),
         exit_limit: exit_limit_base(),
         no_loop_count: true,
+        asynchronous: asynchronous_by_environment(),
     }
     .set();
 }

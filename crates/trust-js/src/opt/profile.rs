@@ -56,6 +56,15 @@ pub(crate) struct ChunkProfile {
     /// deferred for executable capacity, so the chunk's next compile is the fallback's
     /// (`opt::fallback_timer`).
     fallback_deferred: Cell<bool>,
+    /// A compile this chunk's checkpoint started runs off the main thread (P3 stage 2, step 12):
+    /// no checkpoint of the chunk is armed meanwhile, and none compiles it again until the
+    /// install, as V8 marks a function tiering_in_progress (objects/feedback-vector.h:417-421)
+    /// and SpiderMonkey a script isIonCompilingOffThread (jit/Ion.cpp:1918).
+    compiling: Cell<bool>,
+    /// Counts the changes of what a snapshot reads of the record (a site added or its shapes or
+    /// proof changed, a discard counted), so that an install can tell that a discard flagged
+    /// sites since its snapshot (stage 2, step 12).
+    revision: Cell<u32>,
 }
 
 /// The key of an exit site.
@@ -101,14 +110,38 @@ impl ChunkProfile {
         let mut sites = self.sites.borrow_mut();
         match sites.binary_search_by_key(&key, |&(key, _)| key) {
             Ok(at) => {
-                sites[at].1 = if latest { ways } else { sites[at].1.max(ways) };
+                let next = if latest { ways } else { sites[at].1.max(ways) };
+                if next != sites[at].1 {
+                    sites[at].1 = next;
+                    self.revise();
+                }
                 false
             }
             Err(at) => {
                 sites.insert(at, (key, ways));
+                self.revise();
                 true
             }
         }
+    }
+
+    fn revise(&self) {
+        self.revision.set(self.revision.get().wrapping_add(1));
+    }
+
+    /// The record's revision (see the field), which an install compares with its snapshot's.
+    pub(crate) fn revision(&self) -> u32 {
+        self.revision.get()
+    }
+
+    /// Whether a compile the chunk's checkpoint started runs off the main thread.
+    pub(crate) fn compiling(&self) -> bool {
+        self.compiling.get()
+    }
+
+    /// Mark a compile of the chunk running off the main thread, or its end.
+    pub(crate) fn set_compiling(&self, compiling: bool) {
+        self.compiling.set(compiling);
     }
 
     /// Whether the record holds exit sites.
@@ -137,6 +170,7 @@ impl ChunkProfile {
     pub(crate) fn add_discard(&self) -> u8 {
         let r = self.discards.get().saturating_add(1).min(MAX_DISCARDS);
         self.discards.set(r);
+        self.revise();
         r
     }
 
