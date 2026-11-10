@@ -806,8 +806,8 @@ fn generic_native_promotion_uses_the_callees_running_realm() {
         };
         user.func.runtime().code2.get().is_some()
     };
-    // With the optimizing tier on, the second stage waits for settled feedback, at most to the
-    // last checkpoint (8,500 native runs): the calls go on until it is built.
+    // With the optimizing tier on, the second stage waits for settled feedback (nothing forces
+    // it): the calls go on until it is built.
     let mut calls = 0;
     while calls < 150 || (crate::opt::enabled() && calls < 9_000 && !second_stage(&callee)) {
         // The parent Realm initiates this generic call. Realm activation must precede

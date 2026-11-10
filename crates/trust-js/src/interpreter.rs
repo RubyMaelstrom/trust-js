@@ -4759,6 +4759,13 @@ pub struct Interp {
     /// The native codes the optimizing tier replaced (`opt::discard`, `opt::reoptimize`): no entry
     /// takes them any more, and each stays until no activation runs it (`opt::release_retired`).
     pub(crate) opt_retired: Vec<Rc<crate::jit::JitCode>>,
+    /// The native runs an entry counts toward its chunk's checkpoints (`opt::entry_weight` when
+    /// the engine was made: K with the optimizing tier on, one with it off; P3 stage 2, step 11),
+    /// which the Rust paths that count an entry read here: the call helper's hit,
+    /// [`Interp::note_native_entry`] and a borrowed frame's entry. A field read keeps those paths
+    /// as short as with the constant (the process's switch behind a `OnceLock` gave the entry
+    /// accounting a stack frame).
+    pub(crate) opt_entry_weight: u32,
     /// Execution tier (env `TRUST_JS_TIER`, CLI `--tier`, [`Engine::set_tier`]). `Jit` is the
     /// default; `Interp` is the reference tree-walker, opt-in via `TRUST_JS_TIER=interp`.
     pub(crate) tier: crate::bytecode::Tier,
@@ -5234,6 +5241,7 @@ interp_memory_inventory! {
     opt_exit_countdown => "non_owning",
     opt_exit_every => "non_owning",
     opt_retired => "measured",
+    opt_entry_weight => "non_owning",
     tier => "non_owning",
     tier_threshold => "non_owning",
     jit_admit_runs => "non_owning",
@@ -5375,7 +5383,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 146);
+    assert_eq!(names.len(), 147);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -6991,6 +6999,7 @@ impl Interp {
             opt_exit_countdown: crate::opt::exit_every(),
             opt_exit_every: crate::opt::exit_every(),
             opt_retired: Vec::new(),
+            opt_entry_weight: crate::opt::entry_weight(),
             depth: 0,
             direct_call_depth: MAX_DIRECT_CALL_DEPTH,
             proxy_forward_depth: 0,
@@ -14096,6 +14105,7 @@ impl Interp {
             opt_exit_countdown: _,
             opt_exit_every: _,
             opt_retired: _,
+            opt_entry_weight: _,
             tier: _,
             tier_threshold: _,
             jit_admit_runs: _,
@@ -15903,7 +15913,7 @@ impl Interp {
         realm: usize,
         global_env: usize,
     ) {
-        let runs = chunk.jit_runs.get().saturating_add(1);
+        let runs = chunk.jit_runs.get().saturating_add(self.opt_entry_weight);
         chunk.jit_runs.set(runs);
         // A prepared body retains its original FunctionDeclarationInstantiation even when
         // its canonical caller chunk is recompiled with frame-independent callee splices.
@@ -16629,8 +16639,6 @@ impl Interp {
             crate::jit::perf_inline_suppressed();
             return;
         }
-        // No checkpoint follows this one (the chunk is current, so its word is its schedule's).
-        let last = chunk.inline_retry_at.get() == 0;
         // Alive because the callee object that carried this IC is alive and its `call` field is
         // never reassigned (the same argument that makes the rest of the IC readable).
         let func = unsafe { &*func };
@@ -16647,16 +16655,13 @@ impl Interp {
         // A cached native checkpoint must still describe the active Realm. Borrow its live
         // environment for planning; raw addresses cannot manufacture a lifetime pin.
         if genv != Env::as_ptr(&self.global_env) as usize {
-            if tier && last {
-                crate::opt::forget(chunk);
-            }
             crate::jit::perf_inline_suppressed();
             return;
         }
-        // The settled-feedback rule: wait while the feedback changes and a checkpoint remains;
-        // the last one compiles whatever the feedback (JSC optimizes after its maximum delays,
-        // and V8 delays a tier-up at an IC change but never cancels it).
-        if tier && crate::opt::waits(chunk, last) {
+        // The settled-feedback rule: wait while the feedback changes, at every checkpoint (P3
+        // stage 2, step 11: V8 delays a tier-up 500 invocations' worth after an IC change, and
+        // nothing forces it; with the tier on the checkpoints go on every 500 invocations).
+        if tier && crate::opt::waits(chunk) {
             return;
         }
         let plan = crate::bytecode::plan_inlines(chunk, func, realm, &self.global_env);
@@ -16674,6 +16679,15 @@ impl Interp {
             }
         } else {
             crate::jit::perf_inline_plan_sites(plan.len());
+        }
+        // V8's size limit, before the recompile (P3 stage 2, step 11): a chunk over it with
+        // nothing to splice has no second stage to keep, so the recompile, which only the tier
+        // would take, is not made, and the function keeps its first stage, as after the tier's
+        // refusal of such a chunk. With splices the second stage is built, and the tier refuses it.
+        if tier && plan.is_empty() && crate::opt::refuses_unspliced(chunk) {
+            crate::opt::forget(chunk);
+            chunk.set_inline_retry_at(0);
+            return;
         }
         if let Some(chunk2) = crate::bytecode::compile_with_inlines(func, &plan, chunk) {
             if tier {

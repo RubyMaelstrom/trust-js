@@ -2294,6 +2294,7 @@ impl Interp {
             opt_exit_countdown: _,
             opt_exit_every: _,
             opt_retired: _,
+            opt_entry_weight: _,
             tier: _,
             tier_threshold: _,
             jit_admit_runs: _,

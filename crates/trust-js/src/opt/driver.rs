@@ -5,25 +5,39 @@
 //! The plan's point 12 on TRust's code (the stage 2 design, "Step 3"): past its limit of exits,
 //! 100 << R, a code is discarded (`discard`): its exits' sites become the exit profile, R (the
 //! function's discards) grows, the template JIT's code takes new entries, and the second stage's
-//! warm-up is armed, its checkpoints (100, 400, 1,600, 6,400) << R native runs apart, as JSC
-//! waits twice as long after each jettison (bytecode/CodeBlock.cpp:2602-2608). At a checkpoint
-//! whose feedback has settled, or the last, the tier compiles the chunk again (`reoptimize`),
-//! declining what the profile flagged, and its code replaces the template JIT's. Departures from
-//! point 12, each for a precondition TRust lacks yet: the recompile takes the same chunk again
-//! (a second stage is set once; another splicing is stage 3's); the limit for an exited frame
-//! that then loops hot (5 x 2^R) stays with stage 5, since the exited frame finishes in the VM,
-//! whose loops count nothing; and a discard whose exits were all unfixable (throws, unsupported
-//! operations) arms no recompile, which would build the same code, as SpiderMonkey disables Ion
-//! for frequent unfixable bailouts (jit/IonScript.h:336-341), until the in-place resume takes
-//! exceptions out of the count. Each discard and each recompile moves the call caches' global
-//! epoch, where the exemplars reach only the replaced code's callers; the log counts the moves.
+//! warm-up is armed, its checkpoints (100, 400, 1,600, 6,400) << R invocations apart, as JSC
+//! waits twice as long after each jettison (bytecode/CodeBlock.cpp:2602-2608), and then one
+//! every 500 << R. At a checkpoint whose feedback has settled the tier compiles the chunk again
+//! (`reoptimize`), declining what the profile flagged, and its code replaces the template JIT's.
+//! Departures from point 12, each for a precondition TRust lacks yet: the recompile takes the
+//! same chunk again (a second stage is set once; another splicing is stage 3's); the limit for an
+//! exited frame that then loops hot (5 x 2^R) stays with stage 5, since the exited frame finishes
+//! in the VM, whose loops count nothing; and a discard whose exits were all unfixable (throws,
+//! unsupported operations) arms no recompile, which would build the same code, as SpiderMonkey
+//! disables Ion for frequent unfixable bailouts (jit/IonScript.h:336-341), until the in-place
+//! resume takes exceptions out of the count. Each discard and each recompile moves the call
+//! caches' global epoch, where the exemplars reach only the replaced code's callers; the log
+//! counts the moves.
 //!
-//! The checkpoints count loop iterations as well as native entries (stage 2, step 8): with the
-//! tier on, each loop iteration of template code (a first stage's, a discarded code's fallback)
-//! counts as one native run toward its chunk's checkpoint word while a checkpoint or a warm-up is
-//! pending (`counts_loops`, `jit::emit_loop_count`), as SpiderMonkey's warm-up counter counts a
-//! loop head as an entry (emit_LoopHead, jit/BaselineCodeGen.cpp:2603-2614), and the next native
-//! entry takes the checkpoint; transfer into a running loop is OSR, stage 5's.
+//! The checkpoints count loop iterations as well as native entries (stage 2, step 8), with V8's
+//! weight (step 11): with the tier on, an entry counts K native runs (`super::ENTRY_WEIGHT`), and
+//! each loop iteration of template code (a first stage's, a discarded code's fallback) its loop's
+//! share of an entry, max(1, round(K x B / L)), B the loop's span and L the chunk's length
+//! (`loop_weight`), toward its chunk's checkpoint word while a checkpoint or a warm-up is pending
+//! (`counts_loops`, `jit::emit_loop_count`), as Ignition's back edge charges its loop's length
+//! against a budget of invocations times the bytecode's length (InterpreterAssembler::
+//! JumpBackward, interpreter/interpreter-assembler.cc:1252-1256); the next native entry takes the
+//! checkpoint, and transfer into a running loop is OSR, stage 5's. Each distance is in
+//! invocations, K native runs each, so that a loop-free function keeps its schedule.
+//!
+//! Nothing forces a compile (step 11): the settled-feedback rule waits at every checkpoint whose
+//! feedback changed since the last, and past the fourth one comes every 500 invocations
+//! (`super::SETTLED_WINDOW`; a warm-up's, 500 << R), V8's wait after an IC change, which raises a
+//! function's budget to minimum_invocations_after_ic_update invocations' worth and forces nothing
+//! later (TieringManager::NotifyICChanged, execution/tiering-manager.cc:497-576). A function whose
+//! feedback never settles keeps its template code; so does one whose next checkpoint would pass
+//! the u32 word, which is not armed. The tier refuses a chunk over V8's size limit
+//! (`MAX_OPTIMIZED_OPS`) before its snapshot, or with nothing to splice before its recompile.
 
 use super::exit::{ExitRecord, ExitTable};
 use super::ir::{ExitReason, Refusal};
@@ -67,6 +81,10 @@ thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
     /// The graphs the verifier checked on this thread (`generate`).
     pub(crate) static TEST_VERIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The chunks the tier refused on this thread (`generate`, `refuses_unspliced`), with the
+    /// refusals' reasons.
+    pub(crate) static TEST_REFUSED: std::cell::RefCell<Vec<(usize, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
@@ -199,6 +217,26 @@ pub(crate) fn counts_loops() -> bool {
     enabled() && !no_loop_count()
 }
 
+/// The native runs an iteration of a loop spanning `span` operations (its header to its last
+/// back edge) counts in a chunk of `len` (stage 2, step 11): its share of an entry's K
+/// (`super::ENTRY_WEIGHT`), max(1, round(K x span / len)), as Ignition's back edge charges its
+/// loop's length against a budget of invocations times the bytecode's length (see the module's
+/// doc). At most K: a loop spans no more than its chunk.
+pub(crate) fn loop_weight(span: usize, len: usize) -> u32 {
+    let k = u64::from(super::ENTRY_WEIGHT);
+    let (span, len) = (span as u64, len.max(1) as u64);
+    ((k * span + len / 2) / len).clamp(1, k) as u32
+}
+
+/// The tier's size limit (stage 2, step 11): `generate` refuses a chunk of more operations
+/// before its snapshot, and a first stage of more with nothing to splice is not recompiled
+/// (`refuses_unspliced`), as V8 never optimizes a function over max_optimized_bytecode_size (60
+/// KB; flags/flag-definitions.h:1557), giving it the largest budget
+/// (execution/tiering-manager.cc:282-283): 60 KB at three to six bytes of V8's bytecode an
+/// operation (Mandreel's initPhysics, 19,580 operations, is 66,944 bytes in V8 13.6). A refusal
+/// keeps the second stage, as every refusal does.
+pub(crate) const MAX_OPTIMIZED_OPS: usize = 15_000;
+
 /// The exits past which the tier's code for `chunk`, compiled now, is discarded: the base limit
 /// << R, R the function's discards so far (on its first stage), so that each discard doubles
 /// the next code's limit.
@@ -207,17 +245,32 @@ pub(crate) fn exit_limit(chunk: &Chunk) -> u32 {
     (u64::from(exit_limit_base()) << r).min(u64::from(u32::MAX)) as u32
 }
 
-/// The warm-up's first distance in native runs at R = 0; each later one is four times the last
-/// ((100, 400, 1,600, 6,400) << R), the second stage's own schedule
-/// (`Chunk::advance_inline_feedback`) doubled at each discard. A native run is an entry or, in
-/// the fallback's template code, a loop iteration (`counts_loops`).
+/// The warm-up's first distance in invocations at R = 0; each of the next three is four times
+/// the last ((100, 400, 1,600, 6,400) << R), the second stage's own schedule
+/// (`Chunk::advance_inline_feedback`) doubled at each discard, and then one every 500 << R
+/// (`super::SETTLED_WINDOW`), V8's wait after an IC change: nothing forces the recompile. An
+/// invocation is K native runs (`super::entry_weight`): an entry, or in the fallback's template
+/// code loop iterations (`counts_loops`, `loop_weight`).
 const WARM_UP: u32 = 100;
-/// The warm-up's checkpoints, the last compiling whatever its fingerprint says.
+/// The warm-up's checkpoints apart by growing distances; the window follows them.
 const WARM_UP_CHECKPOINTS: u8 = 4;
 
-/// The native runs from a warm-up's checkpoint `k` (0 for the discard) to the next, at `r`.
-fn warm_up_gap(r: u8, k: u8) -> u32 {
-    (u64::from(WARM_UP) << r << (2 * k)).min(u64::from(u32::MAX)) as u32
+/// The native runs from a warm-up's checkpoint `k` (0 for the discard) to the next, at `r`:
+/// None where they would pass the u32 word (never at R up to `profile::MAX_DISCARDS`).
+pub(crate) fn warm_up_gap(r: u8, k: u8) -> Option<u32> {
+    let invocations = if k < WARM_UP_CHECKPOINTS {
+        u64::from(WARM_UP) << (2 * u32::from(k))
+    } else {
+        u64::from(super::SETTLED_WINDOW)
+    };
+    u32::try_from((invocations * u64::from(super::entry_weight())) << r).ok()
+}
+
+/// The checkpoint word a warm-up's checkpoint `k` (0 for the discard) arms at `runs` native runs,
+/// at `r`: None where it would pass u32::MAX, which arms nothing (the template JIT's code stays,
+/// as the second stage's past its word does).
+pub(crate) fn warm_up_word(runs: u32, r: u8, k: u8) -> Option<u32> {
+    runs.checked_add(warm_up_gap(r, k)?)
 }
 
 thread_local! {
@@ -237,49 +290,63 @@ pub(crate) fn settled(chunk: &Chunk) -> bool {
     eager() || previous == Some(print)
 }
 
-/// Whether the tier waits for `chunk`'s next second-stage checkpoint (`last`: none follows this
-/// one): while a checkpoint remains and the feedback has not settled (`settled`). The last
-/// checkpoint compiles whatever the fingerprint says, as JSC optimizes after
-/// maximumOptimizationDelay delays whatever its profiles say
-/// (CodeBlock::shouldOptimizeNowFromBaseline) and V8 pushes a tier-up out at an IC change but
-/// never cancels it (TieringManager::NotifyICChanged). Logs each wait and each compile of
-/// unsettled feedback under TRUST_JS_OPT_LOG.
-pub(crate) fn waits(chunk: &Chunk, last: bool) -> bool {
-    waits_at(chunk, chunk.inline_checkpoints(), last, "")
+/// Whether the tier waits at `chunk`'s second-stage checkpoint: while the feedback has not
+/// settled (`settled`), at every checkpoint, the next one coming at most 500 invocations later
+/// (`Chunk::advance_inline_feedback`), as V8 delays a tier-up 500 invocations' worth after an IC
+/// change and forces nothing (TieringManager::NotifyICChanged; stage 2, step 11). Logs each wait
+/// under TRUST_JS_OPT_LOG.
+pub(crate) fn waits(chunk: &Chunk) -> bool {
+    waits_at(chunk, chunk.inline_checkpoints(), "")
 }
 
 /// [`waits`] at `chunk`'s checkpoint `checkpoint`, `what` the log's note of its kind.
-fn waits_at(chunk: &Chunk, checkpoint: u8, last: bool, what: &str) -> bool {
+fn waits_at(chunk: &Chunk, checkpoint: u8, what: &str) -> bool {
     if settled(chunk) {
         return false;
     }
-    if !last {
-        if log_enabled() {
-            eprintln!(
-                "[opt] waiting {} at checkpoint {checkpoint}: feedback changed{what}",
-                name(chunk)
-            );
-        }
-        #[cfg(test)]
-        TEST_WAITS.with(|waits| {
-            waits
-                .borrow_mut()
-                .push((chunk as *const Chunk as usize, checkpoint))
-        });
-        return true;
-    }
     if log_enabled() {
         eprintln!(
-            "[opt] compiling {} at its last checkpoint ({checkpoint}) with unsettled \
-             feedback{what}",
+            "[opt] waiting {} at checkpoint {checkpoint}: feedback changed{what}",
             name(chunk)
         );
     }
-    false
+    #[cfg(test)]
+    TEST_WAITS.with(|waits| {
+        waits
+            .borrow_mut()
+            .push((chunk as *const Chunk as usize, checkpoint))
+    });
+    true
 }
 
-/// `chunk`'s checkpoints have ended (its second stage was built, the last one passed, or its
-/// recompile was made), or its wait starts afresh.
+/// V8's size limit before the bytecode recompile (stage 2, step 11): whether `chunk`, a first
+/// stage whose plan splices nothing, is over the limit (`MAX_OPTIMIZED_OPS`), so that its
+/// recompile, which only the tier would take, is not made, and the function keeps its first
+/// stage, as after the tier's refusal of a chunk with nothing spliced. Logged as a refusal under
+/// TRUST_JS_OPT_LOG. A chunk with splices is recompiled, and `generate` refuses it, the second
+/// stage keeping the template JIT's code.
+pub(crate) fn refuses_unspliced(chunk: &Chunk) -> bool {
+    let ops = chunk.jit_ops().len();
+    if ops <= MAX_OPTIMIZED_OPS {
+        return false;
+    }
+    #[cfg(test)]
+    TEST_REFUSED.with(|refused| {
+        refused
+            .borrow_mut()
+            .push((chunk as *const Chunk as usize, "over the size limit"))
+    });
+    if log_enabled() {
+        eprintln!(
+            "[opt] refused {}: over the size limit ({ops} ops, before its recompile)",
+            name(chunk)
+        );
+    }
+    true
+}
+
+/// `chunk`'s checkpoints have ended (its second stage was built, or its recompile was made), or
+/// its wait starts afresh.
 pub(crate) fn forget(chunk: &Chunk) {
     if let Some(profile) = ChunkProfile::get(chunk) {
         profile.unsettle();
@@ -298,12 +365,17 @@ fn name(chunk: &Chunk) -> String {
 
 /// The tier's code for `chunk`: its snapshot (the exit profile's declines among its feedback),
 /// its graph, the graph's verification where the build verifies (`verifies`), the ARM64 code.
-/// Logs the compile with its time and code range, each decline, or the refusal with its reason
-/// and pc, under TRUST_JS_OPT_LOG; a graph the verifier rejects is the builder's bug, which
-/// panics in tests and debug builds and is refused otherwise.
+/// A chunk over the size limit (`MAX_OPTIMIZED_OPS`) is refused first. Logs the compile with its
+/// time and code range, each decline, or the refusal with its reason and pc, under
+/// TRUST_JS_OPT_LOG; a graph the verifier rejects is the builder's bug, which panics in tests and
+/// debug builds and is refused otherwise.
 fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
     let started = std::time::Instant::now();
     let compiled = (|| {
+        // V8's size limit, before any work (stage 2, step 11).
+        if chunk.jit_ops().len() > MAX_OPTIMIZED_OPS {
+            return Err(Refusal::whole("over the size limit"));
+        }
         // The global names resolve in the running realm (stage 2, step 4).
         let snapshot = snapshot::Snapshot::take_in(chunk, Some(&*i));
         // The graph, and the chunk's Cfg and initialized reads, made once for the verifier and
@@ -382,6 +454,12 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
             Some(code)
         }
         Err(refusal) => {
+            #[cfg(test)]
+            TEST_REFUSED.with(|refused| {
+                refused
+                    .borrow_mut()
+                    .push((chunk as *const Chunk as usize, refusal.reason))
+            });
             if log_enabled() {
                 match refusal.pc {
                     Some(pc) => eprintln!(
@@ -506,9 +584,15 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
     // chunk with a record map (a second stage, the tier's own chunk of a function with nothing
     // to splice, a stale chain's recompile).
     if reoptimizing && chunk.feedback_vector().record_map().is_some() {
-        if fixable {
+        if !fixable {
+            if log_enabled() {
+                eprintln!(
+                    "[opt] not reoptimized {}: unfixable exits only",
+                    name(chunk)
+                );
+            }
+        } else if let Some(at) = warm_up_word(chunk.jit_runs.get(), r, 0) {
             let profile = ChunkProfile::of(chunk);
-            let at = chunk.jit_runs.get().saturating_add(warm_up_gap(r, 0));
             profile.arm(1, at);
             chunk.set_inline_retry_at(at);
             // The first checkpoint compares the feedback with this, the exits' VM runs' records
@@ -516,7 +600,7 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
             profile.settle(snapshot::fingerprint(chunk));
         } else if log_enabled() {
             eprintln!(
-                "[opt] not reoptimized {}: unfixable exits only",
+                "[opt] not reoptimized {}: its warm-up would pass the checkpoint word",
                 name(chunk)
             );
         }
@@ -610,11 +694,13 @@ pub(crate) fn reoptimizing(chunk: &Chunk) -> bool {
     ChunkProfile::get(chunk).is_some_and(|profile| profile.warm_up().is_some())
 }
 
-/// A due checkpoint of `chunk`'s warm-up (see the module's doc): the next one is armed, and
-/// where the feedback settled since the last (or at the last checkpoint, or under
-/// TRUST_JS_OPT_EAGER at any), the tier compiles the chunk again, the snapshot holding the exit
-/// profile's flags, and installs the code in place of the template JIT's. A refusal keeps the
-/// template JIT's code. No Realm test: the code's guards compare the Realm's global environment.
+/// A due checkpoint of `chunk`'s warm-up (see the module's doc): the next one is armed (none
+/// past the u32 word), and where the feedback settled since the last (or under
+/// TRUST_JS_OPT_EAGER at any checkpoint), the tier compiles the chunk again, the snapshot holding
+/// the exit profile's flags, and installs the code in place of the template JIT's. Nothing forces
+/// the recompile: feedback that keeps changing keeps the template JIT's code (stage 2, step 11).
+/// A refusal keeps the template JIT's code. No Realm test: the code's guards compare the Realm's
+/// global environment.
 pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
     let profile = ChunkProfile::of(chunk);
     let Some((checkpoint, at)) = profile.warm_up() else {
@@ -628,16 +714,17 @@ pub(crate) fn reoptimize(i: &mut Interp, chunk: &Chunk) {
         return;
     }
     let r = ChunkProfile::get(profile::first_stage(chunk)).map_or(0, ChunkProfile::discards);
-    let last = checkpoint >= WARM_UP_CHECKPOINTS;
-    if last {
-        profile.disarm();
-        chunk.set_inline_retry_at(0);
-    } else {
-        let next = runs.saturating_add(warm_up_gap(r, checkpoint));
-        profile.arm(checkpoint + 1, next);
-        chunk.set_inline_retry_at(next);
+    match warm_up_word(runs, r, checkpoint) {
+        Some(next) => {
+            profile.arm(checkpoint.saturating_add(1), next);
+            chunk.set_inline_retry_at(next);
+        }
+        None => {
+            profile.disarm();
+            chunk.set_inline_retry_at(0);
+        }
     }
-    if waits_at(chunk, checkpoint, last, " (reoptimization)") {
+    if waits_at(chunk, checkpoint, " (reoptimization)") {
         return;
     }
     profile.disarm();

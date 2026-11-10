@@ -703,8 +703,8 @@ mod tests {
                 runtime.code2.get().and_then(Option::clone),
             )
         };
-        // With the optimizing tier on, the second stage waits for settled feedback, at most to
-        // the last checkpoint (8,500 native runs).
+        // With the optimizing tier on, the second stage waits for settled feedback (its
+        // checkpoints go on every 500 invocations past the fourth, nothing forced).
         for _ in 0..40 {
             if !crate::opt::enabled() || stages(&mut engine).1.is_some() {
                 break;

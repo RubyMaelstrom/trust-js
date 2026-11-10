@@ -33,10 +33,12 @@
 use crate::bytecode::Chunk;
 use std::cell::{Cell, RefCell};
 
-/// The most discards R counts: the warm-up's last checkpoint, 6,400 << R native runs away, then
-/// still fits the u32 checkpoint word, as JSC's cap comes from its counter's range
-/// (runtime/Options.cpp:940-947). Optimization is never disabled for good.
-pub(crate) const MAX_DISCARDS: u8 = 19;
+/// The most discards R counts: the warm-up's longest distance, the 6,400 invocations << R to its
+/// fourth checkpoint, 409,600 << R native runs at K = 64 an invocation (`opt::ENTRY_WEIGHT`;
+/// stage 2, step 11), then still fits the u32 checkpoint word (409,600 << 13 is 3,355,443,200),
+/// as JSC's cap comes from its counter's range (runtime/Options.cpp:940-947). Optimization is
+/// never disabled for good.
+pub(crate) const MAX_DISCARDS: u8 = 13;
 
 /// A chunk's record (see the module's doc).
 #[derive(Debug, Default)]
@@ -46,7 +48,7 @@ pub(crate) struct ChunkProfile {
     /// key the most shapes a discarded check there expected (0 otherwise).
     sites: RefCell<Vec<(u32, u8)>>,
     discards: Cell<u8>,
-    /// The warm-up's next checkpoint (1 to 4), 0 while none is armed.
+    /// The warm-up's next checkpoint (from 1, saturating at 255), 0 while none is armed.
     warm_up: Cell<u8>,
     /// The native run count the warm-up's next checkpoint is due at.
     warm_up_at: Cell<u32>,

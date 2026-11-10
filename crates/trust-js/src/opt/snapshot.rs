@@ -550,7 +550,11 @@ fn is_length_read(chunk: &Chunk, op: &Op) -> bool {
 /// reads them (a transformed chunk's records are its baseline sites', which its misses go on
 /// filling; its own never change), and its free-name caches' classes (stage 2, step 4). A call
 /// way's epoch (`CallTarget::current`) is left out: an epoch moved by another function's code
-/// changes no feedback of this one.
+/// changes no feedback of this one. So are a generic named site's ways and a megamorphic call
+/// site's (stage 2, step 11): past their capacity their refills are churn, which the snapshot
+/// reads as the generic access and the megamorphic call, as V8's megamorphic IC updates only its
+/// stub cache and notifies no IC change (ic/ic.cc:1061-1072), where the transition to the state
+/// does (:377-390).
 pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
     use std::hash::Hasher;
     let mut hash = crate::fasthash::FxHasher::default();
@@ -579,10 +583,12 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
             }
             SiteView::Call(call) => {
                 hash.write_u8(call.state as u8);
-                for target in call.ways.iter().flatten() {
-                    hash.write_usize(target.callee);
-                    hash.write_usize(target.function as usize);
-                    hash.write_u32(u32::from(target.builtin));
+                if call.state != CallState::Megamorphic {
+                    for target in call.ways.iter().flatten() {
+                        hash.write_usize(target.callee);
+                        hash.write_usize(target.function as usize);
+                        hash.write_u32(u32::from(target.builtin));
+                    }
                 }
             }
             SiteView::Construct(construct) => {
@@ -597,8 +603,13 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
     hash.finish()
 }
 
+/// A named site's part of the fingerprint: its generic mark, and while it is not generic its
+/// filled ways.
 fn hash_named(hash: &mut impl std::hash::Hasher, named: &NamedView) {
     hash.write_u8(u8::from(named.generic));
+    if named.generic {
+        return;
+    }
     for way in named.filled() {
         hash.write_u32(way.receiver_shape);
         hash.write_u32(way.holder_shape);

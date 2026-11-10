@@ -160,8 +160,8 @@ fn a_construct_site_picks_up_its_constructors_new_code() {
     let (p_key, p) = function(i, "P");
     let (_, make) = function(i, "make");
     let first = stages(&p).0;
-    // With the optimizing tier on, the second stage waits for settled feedback, at most to the
-    // last checkpoint (8,500 constructions).
+    // With the optimizing tier on, the second stage waits for settled feedback, at a later
+    // checkpoint (nothing forces it: P3 stage 2, step 11).
     let mut runs = 0;
     while stages(&p).1.is_none() && runs < 200 {
         assert_eq!(eval(&mut engine, "make(50)"), sum(50));
@@ -275,7 +275,7 @@ fn rust_callers_pick_up_new_code() {
     let sum: u64 = (0..400u64).map(|k| k * k).sum();
     // One forEach: cb's checkpoint publishes its second stage after its hundredth call, and the
     // rest of the iteration's calls enter it. With the optimizing tier on, the second stage
-    // waits for settled feedback (a later checkpoint, by 8,500 calls), which a later forEach
+    // waits for settled feedback (a later checkpoint, nothing forced), which a later forEach
     // reaches as far into its iteration.
     let (_, cb) = function(&mut engine.interp, "cb");
     for _ in 0..25 {
@@ -470,7 +470,7 @@ fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
             })
             .collect();
         // The callees past the checkpoint that publishes their second stages: the first, or with
-        // the tier on the first whose feedback has settled (8,500 native runs at the latest).
+        // the tier on the first whose feedback has settled (nothing forced).
         for _ in 0..80 {
             assert_eq!(eval(&mut engine, "stable(400)"), "199070", "{label}");
             if callees.iter().all(|(_, func)| stages(func).1.is_some()) {

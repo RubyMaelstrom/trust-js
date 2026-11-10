@@ -88,7 +88,7 @@ fn sites(chunk: &Chunk) -> Vec<(u32, u8, bool)> {
 }
 
 /// Programs whose functions run past the second stage's checkpoints (100, 500, 2,100 and 8,500
-/// native runs).
+/// invocations, then every 500).
 const PROGRAMS: &[&str] = &[
     // A callee-free arithmetic loop.
     "function sum(n) { let s = 0; for (let i = 0; i < n; i++) s = s + i; return s; }\n\
@@ -636,6 +636,193 @@ fn the_settled_feedback_rule_waits_for_an_unchanged_fingerprint() {
     super::forget(&chunk);
 }
 
+#[test]
+fn a_sites_refills_past_its_capacity_leave_the_fingerprint_and_its_transitions_change_it() {
+    // V8's megamorphic rule (stage 2, step 11): a named site's fifth receiver shape makes it
+    // generic, which changes the fingerprint, and the shapes after it refill its ways without
+    // changing it; a call site's evictions of live ways make it megamorphic, which changes it,
+    // and its ways' refills after an epoch move do not.
+    use crate::feedback::{CallState, SiteView};
+    TestSwitches {
+        on: true,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = jit_engine();
+    let mut source = String::from(
+        "function getx(o) { return o.x; }\nfunction callf(f) { return f(); }\nvar fs = [];",
+    );
+    for k in 0..16 {
+        source.push_str(&format!("\nfs.push(function () {{ return {k}; }});"));
+    }
+    // Each function's chunk is made at its first call, the callees' before callf's site sees
+    // them (a site fills a way for a callee with native code).
+    source.push_str("\nfor (var k = 0; k < fs.length; k++) fs[k]();");
+    eval(&mut engine, &source);
+    eval(&mut engine, "getx({x: 0}); callf(fs[0]);");
+    let getx = first_stage(&mut engine, "getx");
+    let callf = first_stage(&mut engine, "callf");
+    let print = |chunk: &Chunk| super::snapshot::fingerprint(chunk);
+    let named = |chunk: &Chunk| {
+        let snapshot = super::snapshot::Snapshot::take(chunk);
+        (0..snapshot.len())
+            .find_map(|pc| snapshot.named(pc))
+            .expect("getx's named site")
+    };
+    let call = |chunk: &Chunk| {
+        let snapshot = super::snapshot::Snapshot::take(chunk);
+        (0..snapshot.len())
+            .find_map(|pc| match snapshot.site(pc) {
+                SiteView::Call(call) => Some(call),
+                _ => None,
+            })
+            .expect("callf's call site")
+    };
+    // The named site: four shapes fill its four ways, each a change.
+    let shapes = [
+        "{x: 0}",
+        "{a: 0, x: 0}",
+        "{b: 0, x: 0}",
+        "{c: 0, x: 0}",
+        "{d: 0, x: 0}",
+        "{e: 0, x: 0}",
+        "{f: 0, x: 0}",
+    ];
+    let mut last = print(&getx);
+    for shape in &shapes[1..4] {
+        eval(&mut engine, &format!("getx({shape})"));
+        assert_ne!(print(&getx), last, "{shape}: a new way");
+        last = print(&getx);
+    }
+    assert!(!named(&getx).generic);
+    eval(&mut engine, &format!("getx({})", shapes[4]));
+    assert!(named(&getx).generic, "the fifth shape: generic");
+    assert_ne!(print(&getx), last, "the transition changes it");
+    last = print(&getx);
+    let ways = named(&getx).ways;
+    for shape in &shapes[5..] {
+        eval(&mut engine, &format!("getx({shape})"));
+    }
+    assert_ne!(named(&getx).ways, ways, "the generic site's ways refilled");
+    assert_eq!(print(&getx), last, "its refills change nothing");
+    // The call site: one callee, then four ways, then four evictions of live ways in one epoch.
+    assert_eq!(call(&callf).state, CallState::Monomorphic);
+    let mut last = print(&callf);
+    eval(&mut engine, "callf(fs[1])");
+    assert_eq!(call(&callf).state, CallState::Polymorphic);
+    assert_ne!(print(&callf), last, "its second");
+    let polymorphic = print(&callf);
+    // The epoch is the process's: another test's thread may move it between two evictions (a
+    // discard, a recompile), so a round of evictions repeats until one falls in one epoch.
+    for _ in 0..100 {
+        if call(&callf).state == CallState::Megamorphic {
+            break;
+        }
+        eval(&mut engine, "for (var k = 2; k < 10; k++) callf(fs[k]);");
+    }
+    assert_eq!(call(&callf).state, CallState::Megamorphic);
+    assert_ne!(print(&callf), polymorphic, "the transition changes it");
+    last = print(&callf);
+    // A moved epoch: the ways of the old one are refilled as new callees arrive.
+    let targets = call(&callf).ways;
+    crate::bytecode::invalidate_call_caches();
+    eval(&mut engine, "for (var k = 10; k < 16; k++) callf(fs[k]);");
+    assert_eq!(call(&callf).state, CallState::Megamorphic);
+    let refilled = call(&callf).ways;
+    assert!(
+        refilled.iter().flatten().any(|target| !targets
+            .iter()
+            .flatten()
+            .any(|old| old.callee == target.callee)),
+        "the megamorphic site's ways refilled"
+    );
+    assert_eq!(print(&callf), last, "its refills change nothing");
+}
+
+#[test]
+fn a_chunk_over_the_size_limit_is_refused_before_its_snapshot_and_keeps_its_second_stage() {
+    // V8's size limit (stage 2, step 11): big, which splices inc, has more operations than the
+    // tier takes; its second stage is built and published, and the tier refuses it first thing,
+    // so that the template JIT's code runs it, as after any refusal.
+    let mut source =
+        String::from("function inc(x) { return x + 1; }\nfunction big(x) { x = inc(x);");
+    for k in 0..4000 {
+        source.push_str(&format!(" x = (x + {}) | 0;", k % 7));
+    }
+    source.push_str(" return x; }");
+    let program =
+        format!("{source}\nvar t = 0; for (var k = 0; k < 150; k++) t = (t + big(k)) | 0; t");
+    let expected = [
+        run(Tier::Bytecode, &program),
+        run(Tier::Bytecode, &format!("{source}\nbig(1)")),
+    ];
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    super::TEST_REFUSED.with(|refused| refused.borrow_mut().clear());
+    assert_eq!(eval(&mut engine, &program), expected[0]);
+    let chunk = second_stage(&mut engine, "big").expect("big's second stage");
+    assert!(
+        chunk.jit_ops().len() > super::MAX_OPTIMIZED_OPS,
+        "{} operations",
+        chunk.jit_ops().len()
+    );
+    let refused = super::TEST_REFUSED.with(|refused| refused.borrow().clone());
+    assert!(
+        refused.contains(&(address(&chunk), "over the size limit")),
+        "{refused:?}"
+    );
+    assert!(!compiled().contains(&address(&chunk)));
+    let code = chunk.jit.get().flatten().expect("the template JIT's code");
+    assert!(!is_tier_code(&code));
+    code.referenced.set(0);
+    assert_eq!(eval(&mut engine, "big(1)"), expected[1]);
+    assert!(code.referenced.get() != 0, "the second stage runs");
+}
+
+#[test]
+fn a_chunk_over_the_size_limit_with_nothing_to_splice_is_never_recompiled() {
+    // V8's size limit before the recompile (stage 2, step 11): huge splices nothing, so it has no
+    // second stage to keep, and the tier stops at its checkpoint before the bytecode recompile,
+    // which only the tier would take: the refusal is the first stage's (a refused recompile's
+    // would be another chunk's), the function keeps its first stage, its checkpoints disarmed.
+    let mut source = String::from("function huge(x) {");
+    for k in 0..4000 {
+        source.push_str(&format!(" x = (x + {}) | 0;", k % 7));
+    }
+    source.push_str(" return x; }");
+    let program =
+        format!("{source}\nvar t = 0; for (var k = 0; k < 150; k++) t = (t + huge(k)) | 0; t");
+    let expected = run(Tier::Bytecode, &program);
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    super::TEST_REFUSED.with(|refused| refused.borrow_mut().clear());
+    assert_eq!(eval(&mut engine, &program), expected);
+    let first = first_stage(&mut engine, "huge");
+    assert!(
+        first.jit_ops().len() > super::MAX_OPTIMIZED_OPS,
+        "{} operations",
+        first.jit_ops().len()
+    );
+    let refused = super::TEST_REFUSED.with(|refused| refused.borrow().clone());
+    assert_eq!(
+        refused,
+        vec![(address(&first), "over the size limit")],
+        "refused before its recompile"
+    );
+    assert!(
+        second_stage(&mut engine, "huge").is_none(),
+        "no second stage"
+    );
+    assert!(compiled().is_empty());
+    assert_eq!(first.inline_retry_at.get(), 0, "its checkpoints disarmed");
+    assert!(
+        first.jit.get().flatten().is_some(),
+        "its first stage's code"
+    );
+}
+
 /// The first-stage chunk of the global function `name`.
 fn first_stage(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::bytecode::Chunk> {
     let env = engine.interp.global_env;
@@ -652,11 +839,24 @@ fn first_stage(engine: &mut Engine, name: &str) -> std::rc::Rc<crate::bytecode::
         .unwrap()
 }
 
+/// The checkpoints (chunk, number) at which `first` waited since the last clear.
+fn waits_of(first: &Rc<Chunk>) -> Vec<u8> {
+    super::TEST_WAITS.with(|waits| {
+        waits
+            .borrow()
+            .iter()
+            .filter(|&&(chunk, _)| chunk == address(first))
+            .map(|&(_, checkpoint)| checkpoint)
+            .collect()
+    })
+}
+
 #[test]
-fn feedback_that_changes_at_every_checkpoint_compiles_at_the_last() {
-    // getx's receivers show a shape new at each checkpoint (native runs 100, 500, 2,100 and
-    // 8,500): the tier waits at the first three and compiles at the fourth, whatever the
-    // fingerprint says.
+fn feedback_that_changes_until_the_fourth_checkpoint_compiles_at_the_first_quiet_window() {
+    // getx's receivers show a shape new before each of the first four checkpoints (100, 500,
+    // 2,100 and 8,500 invocations): the tier waits at each, the fourth too, where it compiled
+    // whatever the fingerprint said before step 11, and compiles at the next checkpoint, the
+    // first 500-invocation window in which the feedback did not change (9,000), settled.
     TestSwitches {
         on: true,
         eager: false,
@@ -676,36 +876,158 @@ fn feedback_that_changes_at_every_checkpoint_compiles_at_the_last() {
              function receiver(k) { if (k < 300) return {x: k}; \
              if (k < 1200) return {a: 0, x: k}; if (k < 5000) return {b: 0, x: k}; \
              return {c: 0, x: k}; }\n\
-             var k = 0, t = 0; for (; k < 2300; k++) t += getx(receiver(k)); t"
+             var k = 0, t = 0; for (; k < 8950; k++) t += getx(receiver(k)); t"
         ),
-        "2643850"
+        "40046775"
     );
     let first = first_stage(&mut engine, "getx");
-    let waits = || {
-        super::TEST_WAITS.with(|waits| {
-            waits
-                .borrow()
-                .iter()
-                .filter(|&&(chunk, _)| chunk == std::rc::Rc::as_ptr(&first) as usize)
-                .map(|&(_, checkpoint)| checkpoint)
-                .collect::<Vec<_>>()
-        })
-    };
-    assert_eq!(waits(), vec![1, 2, 3]);
+    assert_eq!(
+        waits_of(&first),
+        vec![1, 2, 3, 4],
+        "a wait at the fourth too"
+    );
     assert!(
         second_stage(&mut engine, "getx").is_none(),
-        "the tier waits"
+        "nothing forced at the fourth checkpoint"
     );
     assert_eq!(
         eval(
             &mut engine,
-            "for (; k < 9000; k++) t += getx(receiver(k)); t"
+            "for (; k < 9050; k++) t += getx(receiver(k)); t"
         ),
-        "40495500"
+        "40946725"
     );
-    let chunk = second_stage(&mut engine, "getx").expect("the last checkpoint compiles");
-    assert!(compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)));
-    assert_eq!(waits(), vec![1, 2, 3], "no wait at the last checkpoint");
+    let chunk = second_stage(&mut engine, "getx").expect("the first quiet window compiles");
+    assert!(compiled().contains(&address(&chunk)));
+    assert_eq!(waits_of(&first), vec![1, 2, 3, 4], "settled at the fifth");
+    let code = chunk.jit.get().flatten().expect("resident");
+    assert!(is_tier_code(&code));
+}
+
+/// A function whose sites run one after another, `phase` choosing the one that runs: each new
+/// site's first way changes the fingerprint.
+const PHASED: &str = "function g(o, p) { if (p === 0) return o.a; if (p === 1) return o.b; \
+     if (p === 2) return o.c; if (p === 3) return o.d; if (p === 4) return o.e; \
+     if (p === 5) return o.f; if (p === 6) return o.g; if (p === 7) return o.h; \
+     if (p === 8) return o.i; if (p === 9) return o.j; return 0; }\n\
+     var o = {a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: 10};\n\
+     var starts = [0, 300, 1200, 5000, 8700, 9200, 9700, 10200, 10700];\n\
+     function phase(k) { var p = 0; while (p + 1 < starts.length && k >= starts[p + 1]) p++; \
+     return p; }\n\
+     var k = 0, t = 0;";
+
+#[test]
+fn feedback_that_changes_in_every_window_never_compiles() {
+    // A new site runs between every two checkpoints, past the fourth too (8,500, then every 500
+    // invocations): the tier waits at each of the first nine, and nothing forces a compile; once
+    // the sites stop changing (from 10,700), the next window (11,500) compiles, settled.
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, PHASED);
+        [
+            eval(&mut vm, "for (; k < 11450; k++) t += g(o, phase(k)); t"),
+            eval(&mut vm, "for (; k < 11550; k++) t += g(o, phase(k)); t"),
+        ]
+    };
+    TestSwitches {
+        on: true,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = jit_engine();
+    compiled();
+    super::TEST_WAITS.with(|waits| waits.borrow_mut().clear());
+    eval(&mut engine, PHASED);
+    assert_eq!(
+        eval(&mut engine, "for (; k < 11450; k++) t += g(o, phase(k)); t"),
+        expected[0]
+    );
+    let first = first_stage(&mut engine, "g");
+    assert_eq!(waits_of(&first), (1..=9).collect::<Vec<u8>>());
+    assert!(
+        second_stage(&mut engine, "g").is_none(),
+        "no compile while the feedback changes"
+    );
+    assert_eq!(
+        eval(&mut engine, "for (; k < 11550; k++) t += g(o, phase(k)); t"),
+        expected[1]
+    );
+    let chunk = second_stage(&mut engine, "g").expect("the quiet window compiles");
+    assert!(compiled().contains(&address(&chunk)));
+    assert_eq!(waits_of(&first), (1..=9).collect::<Vec<u8>>());
+}
+
+#[test]
+fn a_loop_free_function_gets_the_tiers_code_at_its_500th_entry() {
+    // Its first checkpoint (100 invocations) waits, the settled-feedback rule having no earlier
+    // fingerprint, and its second (500) compiles: each entry counts K, each distance is K times
+    // as long, so a loop-free function keeps its schedule (step 11).
+    TestSwitches {
+        on: true,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = jit_engine();
+    eval(
+        &mut engine,
+        "function sq(x) { return x * x; }\nvar k = 0, t = 0;",
+    );
+    compiled();
+    assert_eq!(
+        eval(&mut engine, "for (; k < 499; k++) t += sq(k); t"),
+        "41292749"
+    );
+    let first = first_stage(&mut engine, "sq");
+    assert_eq!(
+        first.jit_runs.get(),
+        499 * super::ENTRY_WEIGHT,
+        "K an entry"
+    );
+    assert!(second_stage(&mut engine, "sq").is_none(), "499 entries");
+    assert_eq!(
+        eval(&mut engine, "for (; k < 500; k++) t += sq(k); t"),
+        "41541750"
+    );
+    let chunk = second_stage(&mut engine, "sq").expect("compiled at the 500th entry");
+    assert!(compiled().contains(&address(&chunk)));
+    let code = chunk.jit.get().flatten().expect("resident");
+    assert!(is_tier_code(&code));
+    code.referenced.set(0);
+    assert_eq!(eval(&mut engine, "sq(7)"), "49");
+    assert!(
+        code.referenced.get() != 0,
+        "the 501st entry runs the tier's code"
+    );
+}
+
+#[test]
+fn with_the_tier_off_an_entry_counts_one_and_the_second_stage_comes_at_the_100th() {
+    // P2's checkpoints, unchanged by step 11: one an entry, the first at 100 entries, where the
+    // template JIT's second stage splices inc.
+    TestSwitches::default().set();
+    let mut engine = jit_engine();
+    eval(
+        &mut engine,
+        "function inc(x) { return x + 1; }\n\
+         function f(x) { return inc(x) * 2; }\nvar k = 0, t = 0;",
+    );
+    assert_eq!(
+        eval(&mut engine, "for (; k < 99; k++) t += f(k); t"),
+        "9900"
+    );
+    let first = first_stage(&mut engine, "f");
+    assert_eq!(first.jit_runs.get(), 99, "one an entry");
+    assert!(second_stage(&mut engine, "f").is_none(), "99 entries");
+    assert_eq!(
+        eval(&mut engine, "for (; k < 100; k++) t += f(k); t"),
+        "10100"
+    );
+    assert!(
+        second_stage(&mut engine, "f").is_some(),
+        "the second stage at the 100th entry"
+    );
 }
 
 /// The pc of `chunk`'s first GetMethod.
@@ -1422,16 +1744,34 @@ fn the_exit_limit_doubles_with_r_up_to_its_cap() {
     for _ in 0..30 {
         profile.add_discard();
     }
-    // R stops where the warm-up's last checkpoint, 6,400 << R runs away, still fits its word.
+    // R stops where the warm-up's longest distance, its fourth checkpoint's 6,400 invocations
+    // << R (K native runs each), still fits its word (step 11), and so does every window after it.
     assert_eq!(profile.discards(), profile::MAX_DISCARDS);
-    assert_eq!(super::exit_limit(&chunk), 100 << 19);
-    assert!(6400u64 << profile::MAX_DISCARDS <= u64::from(u32::MAX));
+    assert_eq!(profile::MAX_DISCARDS, 13);
+    assert_eq!(super::exit_limit(&chunk), 100 << 13);
+    let k = u64::from(super::ENTRY_WEIGHT);
+    assert!((6400 * k) << profile::MAX_DISCARDS <= u64::from(u32::MAX));
+    assert!((6400 * k) << (profile::MAX_DISCARDS + 1) > u64::from(u32::MAX));
+    for checkpoint in 0..8 {
+        assert!(
+            super::warm_up_gap(profile::MAX_DISCARDS, checkpoint).is_some(),
+            "checkpoint {checkpoint}"
+        );
+    }
+    assert_eq!(
+        super::warm_up_gap(profile::MAX_DISCARDS, 3),
+        Some((6400 << 13) * super::ENTRY_WEIGHT)
+    );
+    assert_eq!(
+        super::warm_up_gap(profile::MAX_DISCARDS, 4),
+        Some((500 << 13) * super::ENTRY_WEIGHT)
+    );
     TestSwitches {
         exit_limit: 1,
         ..eager()
     }
     .set();
-    assert_eq!(super::exit_limit(&chunk), 1 << 19);
+    assert_eq!(super::exit_limit(&chunk), 1 << 13);
 }
 
 #[test]
@@ -2233,11 +2573,13 @@ const ENTERED_ONCE: &str = "function step(x) { return (x * 7 + 1) % 1009; }\n\
 
 #[test]
 fn a_function_entered_a_few_times_with_a_long_loop_gets_the_tiers_code_by_its_third_entry() {
-    // Its loop's iterations count toward the second stage's checkpoints: the first entry's loop
-    // reaches the first checkpoint (100 runs), which the second entry takes and waits at (the
-    // settled-feedback rule has no earlier fingerprint there), and its loop the second (500),
-    // which the third entry takes and compiles at; the fourth runs the tier's code. With the
-    // counting off, the four entries count four runs: no checkpoint, the first stage kept.
+    // Its loop's iterations count toward the second stage's checkpoints, each its loop's weight
+    // (a share of an entry's K, its loop spanning most of the function): the first entry's loop
+    // reaches the first checkpoint (100 invocations' worth), which the second entry takes and
+    // waits at (the settled-feedback rule has no earlier fingerprint there), and its loop the
+    // second (500), which the third entry takes and compiles at; the fourth runs the tier's
+    // code. With the counting off, the four entries count four entries' K: no checkpoint, the
+    // first stage kept.
     let expected = {
         let mut vm = Engine::new();
         vm.set_tier(Tier::Bytecode);
@@ -2278,7 +2620,11 @@ fn a_function_entered_a_few_times_with_a_long_loop_gets_the_tiers_code_by_its_th
         });
         if !counting {
             assert_eq!(compiled_at, None, "counting off: no checkpoint");
-            assert_eq!(first.jit_runs.get(), 4, "the entries alone");
+            assert_eq!(
+                first.jit_runs.get(),
+                4 * super::ENTRY_WEIGHT,
+                "the entries alone"
+            );
             assert!(waits.is_empty());
             continue;
         }
@@ -2295,6 +2641,130 @@ fn a_function_entered_a_few_times_with_a_long_loop_gets_the_tiers_code_by_its_th
         assert_eq!(eval(&mut engine, "drive(10)"), expected[1]);
         assert!(code.referenced.get() != 0, "the tier's code runs");
     }
+}
+
+/// A long function with a short loop (stage 2, step 11): 48 statements ahead of a loop of a few
+/// operations.
+fn long_with_short_loop() -> String {
+    let mut source = String::from("function longf(a, n) { var s = a | 0;");
+    for k in 0..48 {
+        source.push_str(&format!(" s = (s * 3 + {k}) | 0;"));
+    }
+    source.push_str(" for (var i = 0; i < n; i++) s = (s + i) | 0; return s; }");
+    source
+}
+
+/// The one loop's weight in `chunk`, max(1, round(K x B / L)) (see `jit::loop_count_tests`).
+fn the_loop_weight(chunk: &Chunk) -> u32 {
+    use crate::bytecode::Op;
+    let ops = chunk.jit_ops();
+    let spans: Vec<usize> = ops
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| match *op {
+            Op::Jump(target)
+            | Op::AbruptJump(target, _)
+            | Op::JumpIfFalse(target)
+            | Op::JumpIfFalsePeek(target)
+            | Op::JumpIfTruePeek(target)
+            | Op::JumpIfNotNullishPeek(target)
+                if target as usize <= pc =>
+            {
+                Some(pc - target as usize + 1)
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(spans.len(), 1, "one back edge");
+    let (k, len) = (u64::from(super::ENTRY_WEIGHT), ops.len() as u64);
+    ((k * spans[0] as u64 + len / 2) / len).max(1) as u32
+}
+
+/// The entry at which a function each of whose entries runs `n` iterations of its one loop, of
+/// weight `w`, reaches its second checkpoint, where settled feedback compiles: an entry adds K
+/// and takes a due checkpoint, the next one 400 invocations' K later; the loop adds its
+/// iterations' weights up to one below the word.
+fn second_checkpoint_entry(n: u64, w: u64) -> u32 {
+    let k = u64::from(super::ENTRY_WEIGHT);
+    let (mut runs, mut word, mut taken) = (0u64, 100 * k, 0);
+    for entry in 1u32.. {
+        runs += k;
+        if runs >= word {
+            taken += 1;
+            if taken == 2 {
+                return entry;
+            }
+            word = runs + 400 * k;
+        }
+        runs = (runs + n * w).min(word - 1);
+    }
+    unreachable!()
+}
+
+#[test]
+fn a_long_function_with_a_short_loop_compiles_after_500_invocations_worth_of_its_loop() {
+    // Its loop's iterations each count the loop's small share of an entry, so the function
+    // reaches its second checkpoint after about 500 x L / B iterations, as V8's budget of 500
+    // invocations' worth of bytecode would, where counting each iteration as an entry (step 8)
+    // compiled it at its third entry.
+    let n = 2000u64;
+    let source = long_with_short_loop();
+    let expected: Vec<String> = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, &source);
+        (1..=12)
+            .map(|entry| eval(&mut vm, &format!("longf({entry}, {n})")))
+            .collect()
+    };
+    TestSwitches {
+        on: true,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = jit_engine();
+    eval(&mut engine, &source);
+    compiled();
+    let mut compiled_at = None;
+    let mut w = 0;
+    for entry in 1..=12usize {
+        assert_eq!(
+            eval(&mut engine, &format!("longf({entry}, {n})")),
+            expected[entry - 1],
+            "entry {entry}"
+        );
+        if entry == 1 {
+            w = the_loop_weight(&first_stage(&mut engine, "longf"));
+        }
+        if compiled_at.is_none() && second_stage(&mut engine, "longf").is_some() {
+            compiled_at = Some(entry);
+        }
+    }
+    let first = first_stage(&mut engine, "longf");
+    let len = first.jit_ops().len();
+    eprintln!("longf: {len} ops, loop weight {w}, compiled at entry {compiled_at:?}");
+    assert!(
+        len > 200 && (1..=4).contains(&w),
+        "a short loop in a long function"
+    );
+    let at = second_checkpoint_entry(n, u64::from(w));
+    assert!(at > 3, "{at}");
+    let compiled_at = compiled_at.expect("compiled within 12 entries") as u32;
+    assert!(
+        (at - 1..=at + 1).contains(&compiled_at),
+        "compiled at entry {compiled_at}, the counting's {at}"
+    );
+    // About 500 invocations' worth of the loop, 500 x K / w iterations, within the two entries'
+    // loops the checkpoints' clamps leave uncounted.
+    let iterations = u64::from(compiled_at - 1) * n;
+    let budget = 500 * u64::from(super::ENTRY_WEIGHT) / u64::from(w);
+    assert!(
+        iterations + 2 * n >= budget && iterations <= budget + 2 * n,
+        "{iterations} iterations before the compile, 500 invocations' worth {budget}"
+    );
+    let chunk = second_stage(&mut engine, "longf").expect("its second stage");
+    assert!(compiled().contains(&address(&chunk)));
 }
 
 #[test]

@@ -860,6 +860,8 @@ mod tests {
 
     #[test]
     fn inline_feedback_retries_are_changed_only_exponential_and_bounded() {
+        // The template JIT's schedule, the optimizing tier off (P2's checkpoints).
+        crate::opt::pin_tier_off_for_test();
         let (_engine, chunk, _, _) = reader();
         chunk.inline_attempted.set(false);
         chunk.jit_runs.set(100);
@@ -883,5 +885,52 @@ mod tests {
         assert!(!chunk.advance_inline_feedback());
         assert_eq!(chunk.inline_retry_at.get(), 0);
         assert!(!chunk.inline_retry_due(u32::MAX));
+    }
+
+    /// With the optimizing tier on (P3 stage 2, step 11): the same distances in invocations of
+    /// K native runs, then one checkpoint every 500 invocations, none forced; none past the
+    /// u32 word.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    #[test]
+    fn with_the_tier_on_the_checkpoints_go_on_every_500_invocations_below_the_word() {
+        crate::opt::TestSwitches {
+            on: true,
+            ..Default::default()
+        }
+        .set();
+        let k = crate::opt::ENTRY_WEIGHT;
+        let (_engine, chunk, _, _) = reader();
+        assert_eq!(
+            chunk.inline_retry_at.get(),
+            100 * k,
+            "the first, 100 invocations"
+        );
+        let mut runs = 100 * k;
+        for gap in [400, 1600, 6400, 500, 500, 500] {
+            chunk.jit_runs.set(runs);
+            chunk.advance_inline_feedback();
+            assert_eq!(
+                chunk.inline_retry_at.get(),
+                runs + gap * k,
+                "{gap} invocations"
+            );
+            runs += gap * k;
+        }
+        assert_eq!(chunk.inline_checkpoints(), 6);
+        // A checkpoint that would pass u32::MAX is not armed.
+        chunk.jit_runs.set(u32::MAX - 500 * k + 1);
+        chunk.advance_inline_feedback();
+        assert_eq!(chunk.inline_retry_at.get(), 0, "nothing past the word");
+        chunk.jit_runs.set(u32::MAX - 500 * k);
+        chunk.set_inline_retry_at(1);
+        chunk.advance_inline_feedback();
+        assert_eq!(
+            chunk.inline_retry_at.get(),
+            u32::MAX,
+            "up to the word's top"
+        );
     }
 }

@@ -3098,6 +3098,9 @@ mod asm {
         /// in code that counts nothing: the tier off, `TRUST_JS_OPT_NO_LOOP_COUNT`, the tier's
         /// own code and loose test assemblies.
         loop_counts: Option<(u32, u32)>,
+        /// The native runs an iteration of each loop counts, by its header's pc (P3 stage 2,
+        /// step 11; `opt::loop_weight`): set with `loop_counts`, empty where no loop counts.
+        loop_weights: Vec<u8>,
     }
 
     #[derive(Clone, Copy)]
@@ -3145,6 +3148,7 @@ mod asm {
                 fixed_activation: false,
                 initialized_reads: Default::default(),
                 loop_counts: None,
+                loop_weights: Vec::new(),
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3233,6 +3237,20 @@ mod asm {
         }
         pub fn loop_counts(&self) -> Option<(u32, u32)> {
             self.loop_counts
+        }
+        /// Declare each loop's weight, by its header's pc (see the `loop_weights` field).
+        pub fn set_loop_weights(&mut self, weights: Vec<u8>) {
+            self.loop_weights = weights;
+        }
+        /// The native runs an iteration of the loop headed at `header` counts: its weight, or
+        /// one where none was declared.
+        pub fn loop_weight(&self, header: usize) -> u32 {
+            let weight = self.loop_weights.get(header).copied().unwrap_or(0);
+            debug_assert!(
+                weight != 0 || self.loop_weights.is_empty(),
+                "a loop count at pc {header}, which no back edge targets"
+            );
+            u32::from(weight.max(1))
         }
         /// Declare the local reads whose TDZ test is dead (see `Cfg::initialized_reads`).
         pub(crate) fn set_initialized_reads(&mut self, reads: crate::jit_ir::InitializedReads) {
@@ -5745,6 +5763,9 @@ fn compile_entry(
     // nothing can land on the branch op itself.
     let mut targeted = vec![false; ops.len() + 1];
     let mut interrupt_targets = vec![false; ops.len() + 1];
+    // Each loop header's span: its header to its last back edge, in operations (P3 stage 2,
+    // step 11: the loop's weight).
+    let mut loop_spans = vec![0usize; ops.len() + 1];
     for (pc, op) in ops.iter().enumerate() {
         if borrowed_entry && crate::bytecode::jit_slice_exit_op(op) && pc + 1 < ops.len() {
             targeted[pc + 1] = true;
@@ -5794,9 +5815,24 @@ fn compile_entry(
                 if (*target as usize) <= pc =>
             {
                 interrupt_targets[*target as usize] = true;
+                let span = &mut loop_spans[*target as usize];
+                *span = (*span).max(pc - *target as usize + 1);
             }
             _ => {}
         }
+    }
+    // P3 stage 2, step 11: an iteration counts its loop's weight, its span's share of an entry's
+    // K (`opt::loop_weight`), as V8's back edge charges its loop's length.
+    if a.loop_counts().is_some() {
+        a.set_loop_weights(
+            loop_spans
+                .iter()
+                .map(|&span| match span {
+                    0 => 0,
+                    span => crate::opt::loop_weight(span, ops.len()) as u8,
+                })
+                .collect(),
+        );
     }
     // Emit primitive bitwise exits after the body, preserving numeric loop code layout.
     let mut primitive_bit_paths = Vec::new();
@@ -5838,8 +5874,9 @@ fn compile_entry(
         if interrupt_targets[pc] {
             emit_interrupt_poll(&mut a, POLL_LOOP, l_unwind);
             // Every iteration of a loop run in canonical code passes here, as SpiderMonkey's
-            // LoopHead: one native run toward the chunk's checkpoint (P3 stage 2, step 8).
-            emit_loop_count(&mut a);
+            // LoopHead: the loop's weight toward the chunk's checkpoint (P3 stage 2, steps 8
+            // and 11).
+            emit_loop_count(&mut a, pc);
         }
         if skip > 0 {
             // Consumed by a fusion (chain / compare+branch / key-producer pair). The label and
@@ -5886,7 +5923,7 @@ fn compile_entry(
             }
             let mut emitted_region = false;
             if let Some(plan) = plan_linked_scan(chunk, ops, pc, &cfg, layout, fast) {
-                let plain_h = emit_linked_scan_region(&mut a, layout, &plan, &pc_labels);
+                let plain_h = emit_linked_scan_region(&mut a, layout, &plan, &pc_labels, pc);
                 a.bind(plain_h);
                 for p in pc + 1..pc + 9 {
                     targeted[p] = true;
@@ -11962,13 +11999,21 @@ fn emit_direct_sequence(
     // This gate runs after every other fallback check, before committing any call state: a
     // construct's allocation, below, can still decline, and then takes the count back. A
     // superseded chunk's word is 1, so every entry into it takes the helper, which refills the
-    // way with the function's current code (`Chunk::supersede`).
+    // way with the function's current code (`Chunk::supersede`). An entry counts K with the
+    // optimizing tier on (`opt::entry_weight`, a process constant, which the shared stubs'
+    // table keys: P3 stage 2, step 11), compared in 64 bits, so that a count near u32::MAX
+    // takes the helper, which saturates, rather than wrap; one with the tier off, as P2's.
+    let weight = crate::opt::entry_weight();
     let retry_done = a.new_label();
     a.ldr_w_imm(5, 4, retry_off as u32);
     a.cbz(5, false, retry_done);
     a.ldr_w_imm(6, 4, runs_off as u32);
-    a.add_imm(6, 6, 1);
-    a.cmp_reg_w(6, 5);
+    a.add_imm(6, 6, weight);
+    if weight == 1 {
+        a.cmp_reg_w(6, 5);
+    } else {
+        a.cmp_reg_x(6, 5);
+    }
     a.b_cond(C_HS, hit_slow);
     a.str_w_imm(6, 4, runs_off as u32);
     a.bind(retry_done);
@@ -12380,7 +12425,7 @@ fn emit_direct_sequence(
         a.ldr_w_imm(5, 4, retry_off as u32);
         a.cbz(5, false, hit_slow);
         a.ldr_w_imm(6, 4, runs_off as u32);
-        a.sub_imm(6, 6, 1);
+        a.sub_imm(6, 6, weight);
         a.str_w_imm(6, 4, runs_off as u32);
         a.b(hit_slow);
     }
@@ -17097,8 +17142,8 @@ fn emit_shared_stubs(a: &mut asm::Asm, context: &StubContext<'_>) {
 }
 
 /// The inputs a shared stub's body is assembled from. They are process constants (probed type
-/// layouts and `Chunk` field offsets); a context that differs from the first one keeps its
-/// stubs per chunk.
+/// layouts, `Chunk` field offsets and the direct sequence's entry weight, `opt::entry_weight`); a
+/// context that differs from the first one keeps its stubs per chunk.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17106,7 +17151,7 @@ fn emit_shared_stubs(a: &mut asm::Asm, context: &StubContext<'_>) {
 struct GlobalStubTable {
     layout: crate::value::JitLayout,
     ilayout: crate::interpreter::InterpLayout,
-    direct: Option<(usize, usize, usize)>,
+    direct: Option<(usize, usize, usize, u32)>,
     addresses: crate::fasthash::FastMap<u32, u64>,
 }
 
@@ -17160,9 +17205,16 @@ fn global_stub_address(key: u32, context: &StubContext<'_>) -> Option<u64> {
         return None;
     }
     let ilayout = *context.ilayout?;
-    let direct = context
-        .direct
-        .map(|direct| (direct.attempted_off, direct.runs_off, direct.retry_off));
+    // The direct sequence's offsets and its entry weight (`emit_direct_sequence`'s retry gate),
+    // which a test thread may change by switching the tier.
+    let direct = context.direct.map(|direct| {
+        (
+            direct.attempted_off,
+            direct.runs_off,
+            direct.retry_off,
+            crate::opt::entry_weight(),
+        )
+    });
     let is_direct = SharedStub::from_key(key).enters_direct_sequence();
     if is_direct && direct.is_none() {
         return None;
@@ -21574,6 +21626,8 @@ fn emit_linked_scan_region(
     layout: &crate::value::JitLayout,
     plan: &LinkedScanPlan,
     pc_labels: &[usize],
+    // The loop's header, whose weight its back edge counts.
+    header: usize,
 ) -> usize {
     let plain_h = a.new_label();
     let body = a.new_label();
@@ -21623,7 +21677,7 @@ fn emit_linked_scan_region(
     emit_region_poll_guard(a, fail, false);
     // The back edge: one iteration toward the chunk's checkpoint (P3 stage 2, step 8); x0 and x8
     // stay live.
-    emit_loop_count(a);
+    emit_loop_count(a, header);
     a.b(body);
 
     a.bind(found_null);
@@ -22678,12 +22732,12 @@ fn emit_loop_chain(
     a.b(pc_labels[plan.exit_pc]);
     a.bind(exit_b);
     emit_flush(a, &all_virgins);
-    emit_loop_count_countdown(a, 28);
+    emit_loop_count_countdown(a, 28, plan.head);
     restore_ext(a);
     a.b(pc_labels[plan.exit_pc]);
     a.bind(poll_bail);
     emit_flush(a, &all_virgins);
-    emit_loop_count_countdown(a, 28);
+    emit_loop_count_countdown(a, 28, plan.head);
     // The canonical header polls the word, with every root materialized, and re-enters.
     restore_ext(a);
     a.b(pc_labels[plan.head]);
@@ -22717,7 +22771,7 @@ fn emit_loop_chain(
             a.add_imm(20, 20, 8);
         }
         emit_flush(a, &seen);
-        emit_loop_count_countdown(a, 28);
+        emit_loop_count_countdown(a, 28, plan.head);
         restore_ext(a);
         let pc = plan.chain[idx].1;
         if pc == plan.head {
@@ -23014,54 +23068,74 @@ fn emit_region_poll_start(a: &mut asm::Asm, counter: u32) {
 ))]
 const REGION_POLL_COUNTDOWN: u32 = 16384;
 
-/// One loop iteration of template code, counted as a native run toward its chunk's checkpoint
-/// (P3 stage 2, step 8; the plan's "Step 8, back edges counted toward the checkpoints"), where
-/// the code counts its loops (`Asm::loop_counts`: the optimizing tier on): the running record's
-/// chunk (`JitCtx::chunk`) adds one to `Chunk::jit_runs` while its checkpoint word
-/// (`Chunk::inline_retry_at`: the second stage's next checkpoint, or a discard's warm-up) is
-/// nonzero and the run would not reach it, as a direct entry counts (the retry gate of
-/// [`emit_direct_sequence`]). A due checkpoint is left to the next native entry's gate, which
-/// takes it as ever: without OSR the function gets new code at its next entry. The count so
-/// saturates one below the word, where the gate's 32-bit `runs + 1` cannot wrap. SpiderMonkey's
+/// One loop iteration of template code, counted toward its chunk's checkpoint (P3 stage 2, step
+/// 8; the plan's "Step 8, back edges counted toward the checkpoints"), where the code counts its
+/// loops (`Asm::loop_counts`: the optimizing tier on): the running record's chunk
+/// (`JitCtx::chunk`) adds the loop's weight (`Asm::loop_weight` of the loop headed at `header`:
+/// its span's share of an entry's K, `opt::loop_weight`, step 11) to `Chunk::jit_runs` while its
+/// checkpoint word (`Chunk::inline_retry_at`: the second stage's next checkpoint, or a discard's
+/// warm-up) is nonzero, up to one below the word: a count that would reach it stops one below
+/// (a weight of one never passes it), and a due checkpoint counts nothing. The next native
+/// entry's gate (the retry gate of [`emit_direct_sequence`]), which adds K, then takes the
+/// checkpoint as ever: without OSR the function gets new code at its next entry. SpiderMonkey's
 /// baseline code counts a loop head as an entry, after the loop's interrupt check (emit_LoopHead,
-/// jit/BaselineCodeGen.cpp:2603-2614; emitWarmUpCounterIncrement, 1679-1712). Three
-/// instructions while no checkpoint is pending, eight while one is; it writes x9, x16 and x17,
-/// which every site leaves free after its poll. The word is read through the record, so a
-/// shared stub could hold this code (it embeds no address).
+/// jit/BaselineCodeGen.cpp:2603-2614; emitWarmUpCounterIncrement, 1679-1712); V8's back edge
+/// charges its loop's length (InterpreterAssembler::JumpBackward,
+/// interpreter/interpreter-assembler.cc:1252-1256). Three instructions while no checkpoint is
+/// pending, eight while one is; it writes x9, x16 and x17, which every site leaves free after its
+/// poll. The word is read through the record, so a shared stub could hold this code (it embeds no
+/// address).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_loop_count(a: &mut asm::Asm) {
+fn emit_loop_count(a: &mut asm::Asm, header: usize) {
     let Some((runs, retry)) = a.loop_counts() else {
         return;
     };
+    let weight = a.loop_weight(header);
     let done = a.new_label();
     a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
     a.ldr_w_imm(17, 16, retry);
     a.cbz(17, false, done);
     a.ldr_w_imm(9, 16, runs);
     // 64-bit: a word at u32::MAX (an entry's own saturation) adds no wrap.
-    a.add_imm(9, 9, 1);
+    a.add_imm(9, 9, weight);
     a.cmp_reg_x(9, 17);
-    a.b_cond(C_HS, done);
+    if weight == 1 {
+        // Ones reach one below the word and stop there.
+        a.b_cond(C_HS, done);
+    } else {
+        let store = a.new_label();
+        a.b_cond(C_LO, store);
+        // The count would reach the word: one below it, unless the count is there already or
+        // past it (a due checkpoint).
+        a.sub_imm(17, 17, 1);
+        a.sub_imm(9, 9, weight);
+        a.cmp_reg_x(9, 17);
+        a.b_cond(C_HS, done);
+        a.mov(9, 17);
+        a.bind(store);
+    }
     a.str_w_imm(9, 16, runs);
     a.bind(done);
 }
 
 /// The iterations a helper-free region's countdown ran ([`REGION_POLL_COUNTDOWN`] less
-/// `counter`, which [`emit_region_poll_start`] started), counted as [`emit_loop_count`] counts
-/// one: the running chunk's runs grow by them, up to one below its checkpoint word, while a
-/// checkpoint is pending and not yet due. At each of the region's polls and exits, where its
-/// loop has ended: nothing in the loop itself. Writes x9, x10, x16 and x17.
+/// `counter`, which [`emit_region_poll_start`] started), each counted as [`emit_loop_count`]
+/// counts one of the loop headed at `header` (its weight): the running chunk's runs grow by them,
+/// up to one below its checkpoint word, while a checkpoint is pending and not yet due. At each of
+/// the region's polls and exits, where its loop has ended: nothing in the loop itself. Writes x9,
+/// x10, x16 and x17.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_loop_count_countdown(a: &mut asm::Asm, counter: u32) {
+fn emit_loop_count_countdown(a: &mut asm::Asm, counter: u32, header: usize) {
     let Some((runs, retry)) = a.loop_counts() else {
         return;
     };
+    let weight = a.loop_weight(header);
     let done = a.new_label();
     a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
     a.ldr_w_imm(17, 16, retry);
@@ -23074,7 +23148,16 @@ fn emit_loop_count_countdown(a: &mut asm::Asm, counter: u32) {
     // The countdown's register is a W register's zero extension (MOVZ, SUBS W).
     a.movz(10, REGION_POLL_COUNTDOWN, 0);
     a.sub_reg(10, 10, counter);
-    a.add_shifted(9, 9, 10, 0);
+    if weight == 1 {
+        a.add_shifted(9, 9, 10, 0);
+    } else {
+        // x9 += the iterations times the weight (at most 2^14 x 64: no wrap), with x17 the
+        // weight for the multiply and then the limit again.
+        a.movz(17, weight, 0);
+        a.madd(9, 10, 17, 9);
+        a.ldr_w_imm(17, 16, retry);
+        a.sub_imm(17, 17, 1);
+    }
     a.cmp_reg_x(9, 17);
     a.csel_x(9, 9, 17, C_LO);
     a.str_w_imm(9, 16, runs);
@@ -23509,7 +23592,9 @@ pub(crate) unsafe fn run_borrowed_frame(
         } else {
             chunk.jit_is_strict()
         };
-        chunk.jit_runs.set(chunk.jit_runs.get().saturating_add(1));
+        chunk
+            .jit_runs
+            .set(chunk.jit_runs.get().saturating_add(i.opt_entry_weight));
         #[cfg(test)]
         if chunk.jit_is_resumable() {
             TEST_NATIVE_SLICES.with(|count| count.set(count.get() + 1));

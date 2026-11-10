@@ -135,7 +135,11 @@ mod off {
         0
     }
 
-    pub(crate) fn waits(_: &Chunk, _: bool) -> bool {
+    pub(crate) fn waits(_: &Chunk) -> bool {
+        false
+    }
+
+    pub(crate) fn refuses_unspliced(_: &Chunk) -> bool {
         false
     }
 
@@ -164,6 +168,48 @@ mod off {
         pub(crate) fn table_bytes(_: *const u8) -> usize {
             0
         }
+    }
+}
+
+/// K, the native runs an entry counts toward its chunk's checkpoints with the tier on (stage 2,
+/// step 11; the plan's "Step 11, the tier-up policy of point 2"): the checkpoint word counts in
+/// 64ths of an invocation, so that a loop's back edge can charge its span's share of the chunk
+/// (`jit::emit_loop_count`), as V8's interrupt budget counts bytecode bytes: Ignition charges the
+/// whole bytecode length at an entry (InterpreterEntryTrampoline, builtins/arm64/
+/// builtins-arm64.cc:1427-1433) and a back edge its loop's length (InterpreterAssembler::
+/// JumpBackward, interpreter/interpreter-assembler.cc:1252-1256), against invocations times the
+/// length (TieringManager's budget, execution/tiering-manager.cc:187-195, 264-290). Every distance
+/// the checkpoints keep is K times as long, so that a loop-free function keeps its schedule.
+pub(crate) const ENTRY_WEIGHT: u32 = 64;
+
+/// The invocations between two checkpoints past the fourth with the tier on (stage 2, step 11),
+/// a discard's warm-up's at R = 0: V8's minimum_invocations_after_ic_update (500;
+/// flags/flag-definitions.h:1150), the budget an IC change raises a function's to
+/// (TieringManager::NotifyICChanged, execution/tiering-manager.cc:497-576). Nothing forces a
+/// compile: a function compiles at the first such window its feedback does not change in.
+pub(crate) const SETTLED_WINDOW: u32 = 500;
+
+/// The native runs an entry adds to its chunk's checkpoint count (`Chunk::jit_runs`): K
+/// ([`ENTRY_WEIGHT`]) with the tier on, one with it off (P2's count). Every path that counts an
+/// entry takes it: the direct sequence's gate and the construct sequence's take-back
+/// (`jit::emit_direct_sequence`, whose shared stubs hold it as a process constant), and through
+/// the engine's copy (`Interp::opt_entry_weight`) the call helper's hit,
+/// `Interp::note_native_entry` and a borrowed frame's entry.
+#[inline]
+pub(crate) fn entry_weight() -> u32 {
+    #[cfg(test)]
+    {
+        if enabled() {
+            ENTRY_WEIGHT
+        } else {
+            1
+        }
+    }
+    #[cfg(not(test))]
+    {
+        // The tier's switch is read once a process (`enabled`): so is the weight.
+        static WEIGHT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *WEIGHT.get_or_init(|| if enabled() { ENTRY_WEIGHT } else { 1 })
     }
 }
 

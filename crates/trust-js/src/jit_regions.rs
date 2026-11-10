@@ -4182,7 +4182,7 @@ pub(super) fn emit(
                 // A back edge: one iteration toward the chunk's checkpoint (P3 stage 2, step
                 // 8). Only the homes (d8..d15) are live: the edge's operands are canonical. A
                 // bail at the guard counts at the canonical header instead.
-                emit_loop_count(a);
+                emit_loop_count(a, target);
             }
             a.b(to);
         } else {

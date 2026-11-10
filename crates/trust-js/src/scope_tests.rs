@@ -784,10 +784,12 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
         // Keep inline-retry accounting active without replacing this exact native image.
         recursive.inline_retry_at.set(u32::MAX);
         assert_eq!(value_in(cx, "loanRecurse(280)").as_num_opt(), Some(280.0));
+        // An entry counts one, or K with the optimizing tier on.
+        let entry = crate::opt::entry_weight();
         assert!(
-            recursive.jit_runs.get() >= 281,
+            recursive.jit_runs.get() >= 281 * entry,
             "the exact non-tail recursive chunk must enter >256 native frames, got {}",
-            recursive.jit_runs.get()
+            recursive.jit_runs.get() / entry
         );
         value_in(
             cx,
@@ -809,7 +811,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
         assert_eq!(value_in(cx, "loanOversized()").as_num_opt(), Some(619.0));
         assert_eq!(
             oversized.jit_runs.get(),
-            1,
+            entry,
             "the exact oversized chunk must enter native code"
         );
 

@@ -76,8 +76,8 @@ fn require_hot_native(engine: &mut Engine, name: &str, inlined: bool) {
 }
 
 /// Evaluate `drive` (which answers `expected`) until the global function `name` has a second
-/// stage: with the optimizing tier on, the second stage waits for settled feedback, at most to
-/// the last checkpoint (8,500 native runs); with it off, the first checkpoint built it.
+/// stage: with the optimizing tier on, the second stage waits for settled feedback (nothing
+/// forces it); with it off, the first checkpoint built it.
 fn drive_to_second_stage(engine: &mut Engine, name: &str, drive: &str, expected: &str) {
     for _ in 0..40 {
         if !crate::opt::enabled() || function(engine, name).runtime().code2.get().is_some() {

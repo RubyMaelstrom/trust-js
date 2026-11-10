@@ -180,8 +180,8 @@ fn constructors_run_only_under_new_reach_their_second_stage_compile() {
             .get()
             .is_some_and(|code| code.is_some())
     };
-    // With the optimizing tier on, a second stage waits for settled feedback, at most to the
-    // last checkpoint (8,500 native runs): the constructions go on until both are compiled.
+    // With the optimizing tier on, a second stage waits for settled feedback (nothing forces
+    // it): the constructions go on until both are compiled.
     for _ in 0..40 {
         if !crate::opt::enabled()
             || ["Box", "Plain"]
@@ -206,9 +206,10 @@ fn constructors_run_only_under_new_reach_their_second_stage_compile() {
     }
 }
 
-/// Each construction counts once toward its constructor's checkpoints, whichever path makes
-/// it: one whose allocation declines (a `prototype` that is not an Object) leaves the direct
-/// sequence's count to the generic [[Construct]] that makes it.
+/// Each construction counts once toward its constructor's checkpoints (an entry's weight: one,
+/// or K with the optimizing tier on, `opt::entry_weight`), whichever path makes it: one whose
+/// allocation declines (a `prototype` that is not an Object) leaves the direct sequence's count
+/// to the generic [[Construct]] that makes it.
 #[test]
 fn every_construction_counts_once() {
     if !run_alone("jit::construct_tests::every_construction_counts_once") {
@@ -258,11 +259,16 @@ fn every_construction_counts_once() {
         "no allocation declined"
     );
     let declined = runs(&mut engine);
-    assert_eq!(declined - before, 21, "constructions with a null prototype");
+    let entry = crate::opt::entry_weight();
+    assert_eq!(
+        declined - before,
+        21 * entry,
+        "constructions with a null prototype"
+    );
     assert_eq!(evaluate(&mut engine, "F.prototype = {}; make(20)"), "190");
     assert_eq!(
         runs(&mut engine) - declined,
-        20,
+        20 * entry,
         "constructions with an Object prototype"
     );
 }

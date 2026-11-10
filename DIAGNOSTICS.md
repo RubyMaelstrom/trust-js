@@ -52,34 +52,43 @@ comment/example in the same change.
   `TRUST_JS_TIER_LOG=1` reports each native compile, and each bytecode tier-up compile with its
   reason (calls, loop budget or loop transfer).
 - `TRUST_JS_INLINE_AT=N` changes the speculative inline recompile threshold (default:
-  100 machine-code runs); zero disables inlining.
+  100 machine-code runs; with the optimizing tier on, 100 invocations, each K = 64 native runs,
+  so that N keeps meaning invocations); zero disables inlining.
 - `TRUST_JS_OPT=1` turns on the speculative optimizing tier (ARM64 only; off by default until a
   stage exit measures a net win; docs/v8-chase-p3-plan-2026-11-08.txt, "Stage 1"). At the second
-  stage's checkpoints (about 100, 500, 2,100 and 8,500 native runs), once a function's feedback
-  fingerprint equals its previous checkpoint's, or at the last checkpoint whatever it says, the
+  stage's checkpoints (about 100, 500, 2,100 and 8,500 invocations, then one every 500
+  invocations), once a function's feedback fingerprint equals its previous checkpoint's, the
   second stage is built as without the tier, a function with nothing to splice getting its own
-  chunk again, and the tier generates its native code in place of the template JIT: a refused
-  second stage keeps the template JIT's code, and a refused chunk with nothing spliced is
-  dropped, the function keeping its first stage (a stale chain's recompile, `code3`, is compiled
-  by the tier too). A failed speculation exits to the bytecode VM, which finishes the call.
-  After 100 << R exits of one code object (R, the function's discards so far, up to 19) the code
-  is discarded: new entries take the template JIT's code (a compile deferred for executable
-  capacity leaves the chunk to compile at its next entry), activations still running it finish
-  in it, each exit site but throws and unsupported operations is flagged in the function's exit
-  profile, R grows, and the second stage's warm-up begins: checkpoints (100, 400, 1,600, 6,400)
-  << R native runs apart, at which, once the feedback fingerprint is unchanged since the last
-  (or at the last checkpoint), the tier compiles the chunk again, declining what the profile
-  flagged (the generic operation for NotNumber, f64 for NotInt32 and Overflow, the generic
-  access for WrongShape unless the site's ways grew, the guard's mismatch edge for WrongCallee,
-  the block for NeverRan, an f64 loop phi for PhiNotInt32 and a tagged one for PhiNotNumber,
-  the two exits of a loop's entry check of a word entering an untagged phi, at its header). A
-  discard whose exits were all throws or unsupported operations arms no recompile. Each discard
-  and each recompile moves the call caches' epoch. With the tier on, a native run is a native
-  entry or a loop iteration of template code (a first stage's, a discarded code's fallback):
-  each iteration counts toward its chunk's pending checkpoint or warm-up, up to one below it,
-  and the next native entry takes the checkpoint (SpiderMonkey's warm-up counter counts loop
-  heads as entries); `TRUST_JS_OPT_NO_LOOP_COUNT=1` counts native entries alone, as with the
-  tier off, whose code counts no iteration. Under
+  chunk again, and the tier generates its native code in place of the template JIT: nothing
+  forces a compile (V8's wait after an IC change), so a function whose feedback keeps changing
+  keeps its template code. The fingerprint leaves out a generic named site's ways and a
+  megamorphic call site's (their refills), not their transitions. A refused second stage keeps
+  the template JIT's code, and a refused chunk with nothing spliced is dropped, the function
+  keeping its first stage (a stale chain's recompile, `code3`, is compiled by the tier too); the
+  tier refuses a chunk of more than 15,000 operations before its snapshot, and one with nothing
+  to splice before its bytecode recompile (V8's `max_optimized_bytecode_size`). A failed
+  speculation exits to the bytecode VM, which finishes the call. After 100 << R exits of one
+  code object (R, the function's discards so far, up to 13) the code is discarded: new entries
+  take the template JIT's code (a compile deferred for executable capacity leaves the chunk to
+  compile at its next entry), activations still running it finish in it, each exit site but
+  throws and unsupported operations is flagged in the function's exit profile, R grows, and the
+  second stage's warm-up begins: checkpoints (100, 400, 1,600, 6,400) << R invocations apart,
+  then one every 500 << R, at which, once the feedback fingerprint is unchanged since the last,
+  the tier compiles the chunk again, declining what the profile flagged (the generic operation
+  for NotNumber, f64 for NotInt32 and Overflow, the generic access for WrongShape unless the
+  site's ways grew, the guard's mismatch edge for WrongCallee, the block for NeverRan, an f64
+  loop phi for PhiNotInt32 and a tagged one for PhiNotNumber, the two exits of a loop's entry
+  check of a word entering an untagged phi, at its header). A discard whose exits were all
+  throws or unsupported operations arms no recompile. Each discard and each recompile moves the
+  call caches' epoch. With the tier on, the checkpoints count V8's weight: a native entry counts
+  K = 64 native runs (an invocation), and a loop iteration of template code (a first stage's, a
+  discarded code's fallback) its loop's share of one, max(1, round(K x B / L)), B the loop's
+  span in operations (its header to its last back edge) and L its chunk's (V8's back edge
+  charges its loop's length against invocations times the bytecode's length): each iteration
+  counts toward its chunk's pending checkpoint or warm-up, up to one below it, and the next
+  native entry takes the checkpoint; a checkpoint that would pass the 32-bit count is not armed.
+  `TRUST_JS_OPT_NO_LOOP_COUNT=1` counts native entries alone, K each; with the tier off an entry
+  counts one, and no iteration counts. Under
   `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, a recompile's too, without
   waiting for the feedback to settle (the eager gate: V8's `--stress-maglev`).
   `TRUST_JS_OPT_EXIT_EVERY=N` compiles every check and effect of the tier's code with a
@@ -95,14 +104,17 @@ comment/example in the same change.
   nothing to R and arms no recompile. `TRUST_JS_OPT_NO_EXIT_PROFILE=1` flags nothing, so that
   recompiles decline nothing (the feedback alone guides them). `TRUST_JS_OPT_LOG=1` prints one
   stderr line per compile (with its time and code range, `at <base> <length>` in hex), refusal
-  (with its reason and pc), decline (`[opt] declined <name> pc <pc> <reason>: <form built>`),
-  wait for settled feedback (with the function and checkpoint, a warm-up's marked
-  `(reoptimization)`), compile of unsettled feedback at the last checkpoint, exit (with its pc,
-  reason and kind, and for a shape check's the shapes it expected and the receiver's, or what the
+  (with its reason and pc; `over the size limit` for a chunk past 15,000 operations, with `(<n>
+  ops, before its recompile)` where it had nothing to splice), decline
+  (`[opt] declined <name> pc <pc> <reason>: <form built>`), wait for settled feedback (with the
+  function and checkpoint, a warm-up's marked `(reoptimization)`), exit (with its pc, reason
+  and kind, and for a shape check's the shapes it expected and the receiver's, or what the
   receiver is when it is no object), discard (`[opt] discarded <name> after <n> exits (limit
   <l>, R <r> -> <r'>) for <what new entries run>: pc <pc> <reason> x<count>, ...`), new exit
   site (`[opt] flag <name> pc <pc> <reason> own|at <baseline name> pc <pc>[ (spliced)]`), discard
-  of unfixable exits only (`[opt] not reoptimized <name>: unfixable exits only`), recompile
+  of unfixable exits only (`[opt] not reoptimized <name>: unfixable exits only`) or of a warm-up
+  past the count (`[opt] not reoptimized <name>: its warm-up would pass the checkpoint word`),
+  recompile
   (`[opt] reoptimizing <name> at checkpoint <k> (R <r>)`) and epoch move (`[opt] epoch moved
   (discard|reoptimization), <n> by the tier`), and one per template JIT compile of a second
   stage: `[opt] template <base> <length> <name> (second stage|fallback)`, the code of a second

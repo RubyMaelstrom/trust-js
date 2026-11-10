@@ -3579,7 +3579,9 @@ pub struct Chunk {
     /// forms (`jit::compact_templates`).
     #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
     second_stage: bool,
-    /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these).
+    /// Machine-code runs of this chunk (the [`plan_inlines`] trigger counts these): one an entry
+    /// with the optimizing tier off; with it on, K an entry and a template loop's iteration its
+    /// loop's share of K (`opt::entry_weight`, `opt::loop_weight`; P3 stage 2, steps 8 and 11).
     pub(crate) jit_runs: std::cell::Cell<u32>,
     /// Test-only per-code evidence, recorded after the receiver word is pushed by native
     /// execution (including its checked op helper). No GC edge or production field.
@@ -10189,7 +10191,7 @@ fn finish_chunk(
         test_direct_throws: std::cell::Cell::new(0),
         vm_runs: std::cell::Cell::new(0),
         inline_attempted: std::cell::Cell::new(inline_recompile_at() == 0),
-        inline_retry_at: std::cell::Cell::new(inline_recompile_at()),
+        inline_retry_at: std::cell::Cell::new(first_inline_checkpoint()),
         inline_checks: std::cell::Cell::new(0),
         inline_feedback: std::cell::Cell::new(0),
         superseded: std::cell::Cell::new(None),
@@ -10211,7 +10213,8 @@ fn finish_chunk(
     Some(chunk)
 }
 
-/// Machine-code runs before the first bounded, feedback-adaptive inline checkpoint.
+/// Invocations before the first bounded, feedback-adaptive inline checkpoint
+/// (TRUST_JS_INLINE_AT, 100 by default; zero disables the checkpoints).
 pub(crate) fn inline_recompile_at() -> u32 {
     static AT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     *AT.get_or_init(|| {
@@ -10220,6 +10223,40 @@ pub(crate) fn inline_recompile_at() -> u32 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(100)
     })
+}
+
+/// A new chunk's checkpoint word: [`inline_recompile_at`]'s invocations in native runs, K each
+/// with the optimizing tier on (`opt::entry_weight`; P3 stage 2, step 11), one each with it off.
+fn first_inline_checkpoint() -> u32 {
+    inline_recompile_at().saturating_mul(crate::opt::entry_weight())
+}
+
+/// The checkpoint word after a chunk's checkpoint `checks` (1 for its first), at `runs` native
+/// runs; 0 for none. The tier off: P2's schedule, [`inline_recompile_at`] x 4^k native runs
+/// apart (100, 500, 2,100 and 8,500 by default), the fourth the last. The tier on (P3 stage 2,
+/// step 11): the same distances in invocations of K native runs (`opt::entry_weight`), and past
+/// the fourth one every 500 invocations (`opt::SETTLED_WINDOW`), V8's wait after an IC change,
+/// so that nothing forces a compile; a word that would pass u32::MAX is not armed, and the
+/// function keeps its code.
+fn next_inline_checkpoint(runs: u32, checks: u8) -> u32 {
+    if !crate::opt::enabled() {
+        return if checks >= 4 {
+            0
+        } else {
+            runs.saturating_add(
+                inline_recompile_at()
+                    .max(1)
+                    .saturating_mul(4u32.pow(checks as u32)),
+            )
+        };
+    }
+    let invocations = if checks >= 4 {
+        u64::from(crate::opt::SETTLED_WINDOW)
+    } else {
+        u64::from(inline_recompile_at().max(1)) << (2 * u32::from(checks))
+    };
+    let word = u64::from(runs) + invocations * u64::from(crate::opt::entry_weight());
+    u32::try_from(word).unwrap_or(0)
 }
 
 /// A mixed or unrestricted graph may contain a useful way in another Realm. Only a
@@ -24531,7 +24568,8 @@ impl Chunk {
         &self.inline_retry_at as *const _ as usize - self as *const Chunk as usize
     }
     /// The inline checkpoints the chunk has reached (1 to 4 at the adaptive schedule's
-    /// checkpoints; see [`Chunk::advance_inline_feedback`]).
+    /// checkpoints, and with the optimizing tier on one more at each 500-invocation window
+    /// after them, saturating at 255; see [`Chunk::advance_inline_feedback`]).
     pub(crate) fn inline_checkpoints(&self) -> u8 {
         self.inline_checks.get()
     }
@@ -24638,19 +24676,13 @@ impl Chunk {
     /// Four exponentially spaced feedback checkpoints bound compilation work. Empty early
     /// profiles can mature, but unchanged profiles never rerun the planner. Only identities
     /// and immutable compile states enter this signature; no user property reads are needed.
+    /// With the optimizing tier on, its settled-feedback rule decides instead, and the
+    /// checkpoints go on past the fourth every 500 invocations ([`next_inline_checkpoint`]).
     pub(crate) fn advance_inline_feedback(&self) -> bool {
         use std::hash::{Hash, Hasher};
         let checks = self.inline_checks.get().saturating_add(1);
         self.inline_checks.set(checks);
-        self.set_inline_retry_at(if checks >= 4 {
-            0
-        } else {
-            self.jit_runs.get().saturating_add(
-                inline_recompile_at()
-                    .max(1)
-                    .saturating_mul(4u32.pow(checks as u32)),
-            )
-        });
+        self.set_inline_retry_at(next_inline_checkpoint(self.jit_runs.get(), checks));
         // No epoch: a way's refill after a fencing move changes nothing the planner reads, and a
         // callee's new code changes the way's `chunk_raw` (per-callee pickup).
         let mut fingerprint = std::collections::hash_map::DefaultHasher::new();
@@ -26764,7 +26796,7 @@ unsafe fn jit_call_hit_inner(
     note_call_path(CallPath::HitHelper);
     jit_callstat(i, ctx, &ic, argc, with_this, sp);
     let chunk_ref = &*ic.chunk;
-    let runs = chunk_ref.jit_runs.get().saturating_add(1);
+    let runs = chunk_ref.jit_runs.get().saturating_add(i.opt_entry_weight);
     chunk_ref.jit_runs.set(runs);
     if chunk_ref.inline_retry_due(runs) {
         i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
@@ -29706,7 +29738,10 @@ unsafe fn jit_callstat(
             break 'r "gate: callee's chunk superseded (refill)";
         }
         let retry_at = callee.inline_retry_at.get();
-        if retry_at != 0 && callee.jit_runs.get().wrapping_add(1) >= retry_at {
+        if retry_at != 0
+            && u64::from(callee.jit_runs.get()) + u64::from(i.opt_entry_weight)
+                >= u64::from(retry_at)
+        {
             break 'r "gate: inline retry due";
         }
         break 'r "all gates pass (no direct sequence at the site)";
