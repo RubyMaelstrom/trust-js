@@ -30,6 +30,8 @@ fn function(engine: &mut Engine, name: &str) -> Rc<Function> {
 }
 
 fn require_hot_native(engine: &mut Engine, name: &str, inlined: bool) {
+    // A second stage the tier compiles off the main thread is published at its install.
+    crate::opt::finish_compiles_for_test(&mut engine.interp);
     let function = function(engine, name);
     let runtime = function.runtime();
     let chunk = runtime
@@ -80,6 +82,7 @@ fn require_hot_native(engine: &mut Engine, name: &str, inlined: bool) {
 /// forces it); with it off, the first checkpoint built it.
 fn drive_to_second_stage(engine: &mut Engine, name: &str, drive: &str, expected: &str) {
     for _ in 0..40 {
+        crate::opt::finish_compiles_for_test(&mut engine.interp);
         if !crate::opt::enabled() || function(engine, name).runtime().code2.get().is_some() {
             return;
         }

@@ -214,6 +214,9 @@ mod off {
 
     pub(crate) fn install_finished(_: &mut Interp) {}
 
+    #[cfg(test)]
+    pub(crate) fn finish_compiles_for_test(_: &mut Interp) {}
+
     /// No compile runs off the main thread where the tier has no back end.
     #[derive(Default)]
     pub(crate) struct PendingCompiles;

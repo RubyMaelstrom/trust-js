@@ -1103,6 +1103,20 @@ pub(crate) fn install_finished(i: &mut Interp) {
     }
 }
 
+/// Wait for this engine's compiles off the main thread and install them, as V8's
+/// %FinalizeOptimization does: for a test that reads what a compile changed (a second stage's
+/// publication) once its evaluation returns, however late the shared compile thread runs it.
+#[cfg(test)]
+pub(crate) fn finish_compiles_for_test(i: &mut Interp) {
+    while !i.opt_pending.jobs.is_empty() {
+        if i.poll.install_requested() {
+            install_finished(i);
+        } else {
+            std::thread::yield_now();
+        }
+    }
+}
+
 fn install_one(
     i: &mut Interp,
     done: super::compiler::Done,
