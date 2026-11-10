@@ -1966,3 +1966,14 @@ The step, with the tier on (off, P2's checkpoints and counts stay):
 The order after it: the tier's chunk made without the bytecode recompile where its plan splices
 nothing (21 of Djot's 37 plans), as Maglev compiles from the function's own bytecode; then
 compiling off the main thread (point 13).
+
+The owner's answers (2026-11-10), both as proposed: the 3% counts every part of a tier compile that
+runs on the main thread (the bytecode recompile that makes the tier's chunk, the snapshot,
+generate while it stays there, the install, and the template JIT's compile of a discarded code's
+fallback), each logged under TRUST_JS_OPT_LOG from step 11 on; and the reference runs take the
+same two CPUs as the engine ("otherwise we're cheating"). From the next session, every engine
+and reference run (main, base, off, node, node-mg) is pinned to two X925 cores (CPUs 5 and 6),
+both checked uncapped; the tier-off engine is single-threaded and loses nothing by it, and until
+point 13 neither is the tier. Point 13's design will say what stays on the main thread. Decision
+1's exit (the fixtures and Octane within 2x of node-mg) is measured the same way, which moves the
+reference: node-mg's Djot pass is 23 ms on two CPUs against 35 on one.
