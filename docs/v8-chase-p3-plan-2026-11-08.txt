@@ -1977,3 +1977,26 @@ both checked uncapped; the tier-off engine is single-threaded and loses nothing 
 point 13 neither is the tier. Point 13's design will say what stays on the main thread. Decision
 1's exit (the fixtures and Octane within 2x of node-mg) is measured the same way, which moves the
 reference: node-mg's Djot pass is 23 ms on two CPUs against 35 on one.
+
+The empty plans' recompile (input, 2026-11-10: target/p3/stage2/recompile-input.txt). An empty
+plan costs a whole AST-to-bytecode compile of the function and a second chunk with seeded caches
+and an identity record map, on which everything after runs (entries, exits, discards, warm-up,
+the chain recompile). Per run (the compile probe, CPU 5): Djot's 21 empty-plan recompiles 0.866M
+cycles (0.69 ms, 0.9% of its measured pass) against 1.868M for its 16 spliced ones; React 0.119M
+(0.3%), Vue 0.353M (0.16%); across the policy census 684 of 1,135 second stages splice nothing.
+Inside a recompile: the body walk 53%, finish_chunk 17%, the seeds 14%. The discards' fallback
+template compiles, also main-thread work under the owner's count, are Djot's 1.56M cycles a run
+(its three discards, all of spliced chunks). The exemplars: V8 and SpiderMonkey keep one bytecode
+and one feedback store a function and put the optimized code on a per-function entry word (V8's
+dispatch entry, js-function-inl.h:126-167; SpiderMonkey's jitCodeRaw, vm/JSScript.cpp:3487-3520),
+so that one store redirects every caller and a deopt resumes in the baseline code that exists;
+JSC copies a second CodeBlock that shares the baseline's bytecode and profiling metadata
+(CopyParsedBlock, bytecode/CodeBlock.cpp:287-340) and relinks only the replaced code's callers.
+The tier's code on the first stage (V8's structure) needs that per-chunk redirect, since A2 picks
+up new code only on a new chunk (a global epoch move per install is P2's measured loser), and the
+first stage's template code kept as the fallback.
+So the order changes: point 13 first (compiling off the main thread, which takes generate's 12
+ms off Djot's main thread and most of React's pass difference), then the per-chunk entry word
+with the tier's code on the first stage and discards that fall back to code that exists (JSC's
+jettison, V8's deopt), which together remove the empty plans' recompiles and the fallback
+compiles (about 2.4% of Djot's pass); the spliced recompiles go with stage 3.
