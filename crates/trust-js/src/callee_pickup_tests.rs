@@ -146,6 +146,10 @@ fn a_callers_way_picks_up_its_callees_new_code_and_no_other_site_refills() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_construct_site_picks_up_its_constructors_new_code() {
+    // The constructor's new code is published at its checkpoint, and the test reads `make`'s first
+    // stage's site: off the main thread `make`'s own second stage could land first, and its site,
+    // not this one, would take the new code.
+    crate::opt::pin_synchronous_for_test();
     let mut engine = engine();
     let sum = |n: u64| (0..n).map(|k| k * k).sum::<u64>().to_string();
     assert_eq!(
