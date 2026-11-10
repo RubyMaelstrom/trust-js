@@ -2606,3 +2606,92 @@ exit session. Every engine and reference run on CPUs 5 and 6, both uncapped thro
   asynchronous +7.7% (the process, the compile thread included) at +1.21%: the deficit is the tier
   code's cycles at equal work, not compile work; step 15 removes its WrongCallee exits and their
   discard and recompile.
+
+Step 13, measured (2026-11-10; target/p3/stage2/step13-impl, report.txt and its "OPTION (c)";
+branches p3-step13 31abeba0 and p3-step13c 7558959b, neither landed). As designed (a), the rule
+holds: a8 and fn(b,d,f,g) are discarded at their loop limit after 5 exits in place of 100, a8's
+second-stage share of a zlib run falls from 26.3% to 2.2%, zlib's coverage 69.0% -> 96.9%, its
+fixed runs -40.7% instructions. But the VM warm-up costs where exited frames past the loop limit
+loop fewer than 128 times: those loops now run in the VM, TRust's slowest tier, where JSC's run
+in baseline code: DeltaBlue +39.4%, Box2D +11.5%, Crypto +2.1%, React's full run +10.2%, Djot's
+measured pass +1.7% (Octane's geomean -0.89%). And most of zlib's gain is not the rule's: the
+VM's iterations fill the value and element records that template code's in-line hits never
+record (rule U, feedback-schema.txt 5.1 and 5.2), so zlib's four recompiles come out 13-25%
+smaller in bytes; without the warm-up (hotv: the first transfer past the loop limit discards) the
+recompiles are main's to the byte and zlib gains -14.4% (geomean -1.08%; Crypto +2.6%, Djot +1.3%
+and +0.85%). JSC's mechanism, read again: every exit that does not jettison resets the baseline
+counter to the long warm-up (dfg/DFGOSRExitCompilerCommon.cpp:105-141; 1,000, the warm-up a
+jettison's alternative waits too, runtime/OptionsList.h:373-374, bytecode/CodeBlock.cpp:2412-2414,
+2641-2669), and while an optimized replacement exists only baseline loops reach that counter,
+since calls are relinked to the replacement (jit/JITOperations.cpp:2947-2966). Option (c) does
+that with the template JIT as the baseline: each exit at or past the loop limit that does not
+discard arms (and re-arms) a per-chunk loop word at warm_up_gap(R, 0); template code's loop
+iterations (step 8's counting, step 11's weights) count toward it and entries never do (its own
+word, Chunk::loop_retry_at; the entry word stays idle while it is armed); the crossing copies it
+into the entry word, and the next entry's try_inline_recompile takes the loop limit's check and
+discards. Exited frames transfer at their first back edge as on main. Measured: Octane's geomean
+-1.21% (the best of the four), zlib -14.25% (a8 at 5; the other three stay under the warm-up
+between exits), GBEMU -5.5%, DeltaBlue +0.05%, Crypto +0.56%, Box2D +1.55% (three of its
+minified functions now discarded at their loop limit and reoptimized; not root-caused), React 0,
+Djot's measured pass +0.02% and passes 2-10 +0.25% (the due path's store; a cheaper form clears
+the loop word at the crossing, so that a due chunk's loops count nothing at 3 instructions). The
+tier off +0.02%. For the owner (asked 2026-11-11): (c) recommended, with the cheaper due path,
+rebased onto step 14; rule U's record filling to be designed as its own item after step 15 (JSC's
+baseline ORs a double result into the arith profile on its in-line path,
+jit/JITAddGenerator.cpp:158-160, bytecode/ArithProfile.cpp:82-93; V8's Sparkplug calls typed
+stubs chosen by the feedback, baseline/baseline-compiler.cc:1269-1317; SpiderMonkey's baseline
+ICs attach a stub per type, so a new type misses and is recorded).
+
+Step 14 landed (8d1803f1..66b90635, 2026-11-11; target/p3/stage2/step14-impl). As designed, with
+the tier on: a function whose inline plan splices nothing gets no second chunk; the tier compiles
+its first stage in place (opt::compile_in_place; off the main thread Landing::InPlace, dropped at
+the install by step 12's checks and its own: the function collected, the first stage superseded,
+a second stage published, a discard that flagged its sites since the snapshot), and the install
+puts the tier's code in the chunk's own slot, keeps the template code as the fallback
+(ChunkProfile::kept, with its own CLOCK registration; CLOCK may evict either code, and every
+eviction moves the epoch), and moves the chunk's entry word, not the epoch. A discard returns to
+the kept code, compiling only where CLOCK evicted it. Departures: (1) the entry word is a byte in
+Chunk's last padding byte, not a u32 (any u32 field moves inline_attempted, which the template
+code embeds, so the tier off would not stay byte-identical); between two epoch moves it changes
+at most twice (an install in place, a supersession), so a way whose epoch matches never sees it
+wrap; CallIc::entry is the u32 at 60. (2) The kept code lives on the chunk's tier record, for the
+same reason; where the code cache admits no slot for it, the template code is retired and the
+epoch moves. (3) The Rust probes (jit_call_hit, resolve_cached_call's ways, overflow table and
+code-keyed retry, prepared_call_current, construct_jit_fast, call_compiled_target) compare the word
+with the tier on and off, since testing the switch costs what the compare does; supersede moves
+the word too (66b90635), so the word answers alone, 2 instructions a probe more than main's
+superseded test. (4) A reoptimization's install keeps the replaced template code for every chunk.
+(5) The direct sequence's compare is 3 instructions (the way's copy rides the LDP that loads the
+callee chunk; LDRB, CMP, B.NE). (6) main's a_construct_site_picks_up_its_constructors_new_code is
+pinned synchronous (065b4116): flaky with the off-thread compile (about 1 run in 20). Tests:
+opt::inplace_tests (13: the first stage carrying the tier's code with no second chunk; a way
+filled before the install entering the tier's code with no epoch move through the direct sequence,
+jit_call_hit, resolve_cached_call, prepared_call_current, a construct site and the overflow table;
+the discard's return and its compile when the kept code was evicted; the warm-up and the
+reoptimization; the done test; the chain recompile superseding a first stage that carries the
+tier's code; a superseded job dropped; the exit profile read by a caller's splice) and
+jit::entry_word_tests; 13 mutations caught; the library's suites in every configuration (3,163),
+the tier's (265, three configurations), poll and Agent (51, both modes); Test262 53,573 of 53,575
+in four configurations; zombie's check, clippy -D warnings, Windows' check and suite (2,773); the
+tier off's template code byte-identical on 21 workloads (PdfJS and TypeScript made deterministic).
+Measured (fat LTO, A725 CPUs 12-13, instructions, against main 4509bd62):
+- The empty plans' second stages are gone: the fixtures' 56 a run (Vue 29, React 6, Djot 21),
+  Octane's 611 of 1,010 (60.9% of the census; the plan's 60.3%), each an install in place; tier
+  compiles unchanged (1,300); Octane's fallback compiles 309 -> 139 (167 discards return to the
+  kept code); peak RSS Djot -100 KiB, the others unchanged.
+- The main thread's recompile line a run: Djot 3.00 -> 2.20 ms, React 0.38 -> 0.22, Vue 1.86 ->
+  1.28; the bar's sum on A725 log runs Djot 2.98% -> 2.45% of its pass (the plan: about 2.6%),
+  React 1.51% -> 1.27%, Vue 0.89% -> 0.73%. The two-CPU session reads the bar.
+- The compare's cost, which the plan named but did not estimate: +3.00 instructions a direct call
+  with the tier on (none off), +2.00 a Rust probe on and off. With the tier on, the fixtures'
+  measured passes Vue +0.25%, React +0.46%, Djot +0.03%, passes 2-10 +0.25%, +0.52% and +0.08%;
+  Octane's geomean -0.008% asynchronous and -0.184% synchronous (Box2D -2.6%: 108 recompiles and 6
+  fallback compiles fewer; Earley-Boyer +0.6% to +0.9%); the tier off +0.029% (RayTrace +0.30%,
+  its constructions' probe).
+So on call-heavy code the compare costs more than the recompiles it removes, and the exemplars
+pay no per-call compare: JSC relinks a code block's incoming calls when code changes
+(bytecode/CodeBlock.cpp:2221-2228, linkIncomingCall and unlinkOrUpgradeIncomingCalls), V8's calls
+load the entry through the callee's dispatch handle (codegen/arm64/macro-assembler-arm64.cc:4141,
+LoadEntrypointFromJSDispatchTable), and SpiderMonkey's load the callee script's jitCodeRaw (its
+header word, vm/JSScript.h:1761). Which of these TRust takes is a design item after step 15, with
+the probes' floor of one instruction.
