@@ -2459,3 +2459,85 @@ has met another closure of a way's function:
   - the tier off's plans unchanged.
 - Order: after step 13 lands, beside step 14. Its call paths are near step 14's entry word, so the
   agent that lands second rebases.
+
+Step 12 landed (b8b38dd5..5f333a74, 2026-11-10; target/p3/stage2/step12-impl). As designed:
+(a) a tier compile is the main thread's preparation (driver::prepare: the snapshot, Chunk::freeze's
+frozen view opt::view::FrozenChunk, a64::Switches, the layouts, the realm's pin), a compile of Send
+inputs and outputs (opt::job::compile: the build, verification, allocation, emission into words
+and, off the main thread, the copy into executable memory without the main thread's reclaim) and
+the main thread's link and landing; the emitters the template JIT shares are generic over
+jit::JitChunk (jit_view.rs), which the live chunk and the view implement, so the two keep one code.
+(b) One compile thread a process (opt::compiler, `trust-js-opt`, started at the first job, serving
+every engine); a checkpoint queues the job, its asking chunk marked compiling with no checkpoint
+armed; the compile thread sets the poll word's install bit (POLL_INSTALL, release) and the next
+poll of generated code (jit_interrupt) installs the result after the checks no run-time guard
+covers (the running realm, a discard since the snapshot, the function collected, the chunk
+superseded, a recompile published meanwhile), with an instruction barrier, or drops it and arms
+the checkpoint or warm-up again; the second stage's publication and the chain recompile's and the
+reoptimization's installs moved to the install (Interp::publish_recompile, opt::Landing);
+synchronous with one CPU (available_parallelism, the affinity mask), under TRUST_JS_OPT_SYNC=1,
+where the thread cannot start, and in tests pinned so; an engine dropped with jobs pending cancels
+them; the log's `[opt] main-thread recompile|snapshot|stubs|install|fallback` lines (their timers
+leaving out the log's own printing), `on the main|compile thread, queued <ms> ms, installed <ms> ms
+after its snapshot`, `[opt] dropped`, and a rerun's `<n> runs, <ms> ms before the last`. The
+review's finding (5b16206e): the property templates read a site's ways through
+JitChunk::jit_cache_ways (the view's copy), not the live cache, and the live chunk's JitChunk
+methods that read mutable state assert in debug builds that no compile off the main thread calls
+them. After the first measurement (0a580e91): the stack effects and the capture TDZ facts made on
+the compile thread from the operations (bytecode::stack_effect, a move checked line for line), only
+the constants an Op::Const pushes copied (debug builds assert no other is read), the keys looked up
+only for compiles off the main thread, the job and the mapped code's words freed on the compile
+thread.
+- Measured (fat LTO, 8d4cd523's code against main da6933eb; the fixtures on A725 CPUs 10-11,
+  setarch -R, medians of 5; Octane's fixed runs on CPUs 10-13, medians of 3). The bar's sum (the
+  main-thread parts, the fallbacks beside), main to branch: Djot 21.79 to 4.52 ms (recompile 2.82,
+  snapshot 1.27, stubs 0.18, install 0.26), React 3.06 to 0.73, Vue 8.64 to 3.04; as shares of the
+  log runs' timed loops 2.88%, 1.46% and 0.82% (main 12.9%, 6.0%, 2.29%), with the fallbacks 4.15%,
+  2.10% and 0.89%: under 3% on A725 cores; the X925 two-CPU session is the bar's reading. The main
+  thread's instructions in the measured pass -8.20%, -0.70% and -0.09% (cycles -7.55%, -2.20%,
+  -3.00%), the process's +2.97%, +1.20% and +0.05%; passes 2-10's main thread -1.07%, -0.05%,
+  -0.02%. Against the design's expectation (offthread-input.txt 3.3): generate's main-thread part
+  is 9.0%, 13.3% and 18.1% of main's generate where it expected 4.9%, 5.8% and 7.8%, the excess all
+  the snapshot line's (6.7-10.5% of generate against the feedback snapshot's 2.6%: it also holds
+  the freeze's copies and the facts it forces, and off the main thread the key lookups and the
+  hand-off, about 11 us a job); the install 1.4-2.7% (the design's 2.2%); template code running
+  longer while compiles are pending about 0.5% of Djot's pass (an estimate); snapshot to install
+  0.78 ms mean and 5.2 ms most on Djot (a compile that ran twice). Octane: the main thread -0.66%,
+  the process +0.14% (Richards -8.94% and +11.60%: three more compiles, callees that main's tier
+  code splices reaching their own checkpoints while called from template code, and two reruns),
+  the bar's sum 935 to 167 ms, the synchronous mode +0.05%. Reruns for missing stubs or atoms:
+  Djot 3, React 3, Vue 2, Octane 44 of 1,302 compiles (30.5 ms of the compile thread, 2.9 ms of the
+  main thread). The tier off: Octane +0.07% (Earley-Boyer +0.94%, PdfJS +0.33%, TypeScript +0.27%),
+  all of it the install bit's three-line check in jit_interrupt (a build without just those lines
+  counts as main): the collector scans the native stack conservatively under jit_interrupt's
+  frame, and the check's code changes which stale words it finds (Earley-Boyer's first minor
+  collection keeps 5,367 objects against 5,328; 75 collections against 74): stack-scan luck, not
+  work. Reported to the owner as small.
+- Tests: part (a)'s masked code hashes identical to main on the five workloads and in the tier's
+  tests (481); (b)'s synchronous code differs from main's by Interp's offsets alone (+40 bytes, the
+  pending compiles' list); the off-thread tests (8: the install at the poll; drops after a
+  discard's flags, a publication meanwhile, a superseded chunk and a collected function, each with
+  the tier-up after; an engine dropped with jobs pending; forced exits; one CPU); 9 mutation checks,
+  all caught. The library's suites with the tier off, on eager synchronous and on eager
+  asynchronous (3,149 each with the embed feature; the asynchronous twice, one beside a
+  synchronous run for load), the tier's tests with exits every 7 and with an exit limit of 1 (251
+  each), the poll and Agent tests in both modes; Test262 in full, 53,573 of 53,575 in each of the
+  four configurations (off, on, eager, exits every 100) on main and the branch, the same two
+  staging/sm failures; clippy as main, fmt clean; zombie (x86-64): the check with tests, clippy
+  with -D warnings, Windows' check (date.rs's 20 warnings), the library's suite (2,773). wasm32
+  unchecked (no target installed on either machine).
+- Departures: (1) the stubs and atoms a job finds missing are made on the main thread at the
+  install's poll, which runs the job again (Outcome::Needs), rather than all made before the first
+  job, which would assemble stubs no workload calls and atoms the template JIT never makes; (2) the
+  process's OnceLock switches the shared templates read are primed on the main thread
+  (jit::prime_switches); (3) Interp's 40 bytes move the offsets generated code embeds, so (b)'s
+  identity is the code dump's; (4) five library tests that read a compile's results at once
+  compile on the main thread (opt::pin_synchronous_for_test, point 8), and the inline-context
+  tests wait for pending compiles (opt::finish_compiles_for_test, as V8's %FinalizeOptimization);
+  the off-thread tests return on one CPU; (5) the main-thread lines leave out the log's printing
+  (eprintln! writes each formatted piece to unbuffered stderr, tens of us a compiled line, most of
+  the first round's install line).
+- Open: the snapshot line's copies (the chunk's immutable operations and names shared with the
+  compile thread behind an Arc, and its remaining pure facts made there, would cut it); the
+  reruns' latency; tests that read the tier's state right after an evaluation may still fail
+  rarely in the asynchronous configuration (finish_compiles_for_test is the fix's form).
