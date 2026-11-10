@@ -2562,3 +2562,47 @@ on/off comparisons hold for it, not for Vue's steady state as its measured pass 
 fx3 runs the nine passes before reaction.stop() and checks the work (invocations 113,609 after
 them, on Node and on the shell). fx2's Djot printed the time since its start (all ten sets) where
 the others print the measured pass; no report read that field, and fx3 prints the measured pass.
+
+The interim two-CPU session (2026-11-10; target/p3/stage2/session-2cpu-p3s2-4509bd62, report.txt;
+main 4509bd62: step 12 and the shell's performance.now()). The bar's phases only (the fixtures,
+their steady state on fx3, the calls, Octane, the tier's log); ARES-6 and Web Tooling wait for the
+exit session. Every engine and reference run on CPUs 5 and 6, both uncapped through every phase
+(0 capped seconds); the owner's own programs busy 2.5-3 cores elsewhere meanwhile
+(load-2cpu-p3s2-4509bd62.log).
+- The 2% bar, the tier on against off: Vue's measured pass -11.87% (177.31 against 201.2 ms),
+  Djot's -8.70% (70.21 against 76.9; +4.11% in p3s2-7f92ab9d), React's +2.96% (30.99 against
+  30.1; +6.67% before); the steady states (fx3) Vue -11.98%, React -2.39%, Djot -13.15%; the calls
+  within 2% (direct-call +1.66% the largest); Octane every benchmark faster or equal but CodeLoad,
+  +10.66% (12,887 against 14,261); the geomean +27.25%.
+- The compile bar (the main-thread parts; the fallbacks beside): Vue 1.07% (1.89 ms: recompile
+  1.16, snapshot 0.42, stubs 0.17, install 0.10), React 1.51% (0.47 ms), Djot 4.54% (3.19 ms:
+  recompile 2.03, snapshot 0.87, stubs 0.11, install 0.14). Djot misses: step 14 removes its empty
+  plans' recompiles (the design: 0.69 ms), step 15 its splices at sites with several callees or
+  closures, and the snapshot line's copies are step 12's open item.
+- Against node-mg on the same two CPUs (the P3 exit's yardstick, decision 1: within 2x): the
+  measured passes Vue 3.82x, React 3.10x, Djot 2.86x; the steady states 3.94x, 3.42x, 4.13x;
+  Octane's geomean over the 15 benchmarks Node runs 4.13x (the tier off 5.41x).
+- CodeLoad (target/p3/stage2/codeload-diag): the compile thread makes the process multi-threaded,
+  and glibc's malloc then leaves its single-thread fast path (arena locks and atomics on each call
+  its 7-entry tcache does not serve). The shell's allocator (fastalloc::ClassAlloc: a per-thread
+  cache of blocks up to 1 KB, 256 KB a class, each miss and overflow one glibc call) sends
+  CodeLoad's parse bursts there: 210,842 allocations and 209,931 frees in its 5 fixed runs, 96% of
+  1 KB or less. An idle second thread (an LD_PRELOAD shim) costs the tier-off engine +10.1%
+  cycles and +1.25% instructions on CodeLoad's fixed runs (7 rounds), the session's gap; glibc's
+  malloc and free go from about 11% of its cycles to 22.6% (perf: __libc_malloc2, the locking
+  path, 7.4%). With glibc's tcache deepened (GLIBC_TUNABLES tcache_count=65535) the run is -3.3%
+  single-threaded and +1.2% with the idle thread. The tier-on runs without a compile (5 fixed
+  runs reach none) equal the tier off. The fixtures' measured passes call glibc 700 to 6,900
+  times and lose nothing measurable to an idle thread (cycles React -0.93%, Djot -3.91%, Vue
+  -0.01%). The exemplars' parsers allocate their trees in arenas, never per node through malloc:
+  V8's Zone (src/zone/zone.h:43, the bump allocation at 55-67; AstNodeFactory, src/ast/ast.h:3069,
+  zone_->New at 3082), SpiderMonkey's LifoAlloc (js/src/ds/LifoAlloc.h:690; allocParseNode,
+  frontend/FullParseHandler.h:49, through ParseNodeAllocator, frontend/ParseNode.h:2649), JSC's
+  ParserArena (parser/ParserArena.h:165 allocateFreeable; ParserArenaFreeable's operator new,
+  parser/Nodes.h:110-123); and their allocators refill per-thread caches in batches from slabs.
+  For the owner: the fix's direction (below, in the report of 2026-11-10).
+- React at equal work (codeload-diag/fixtures-summary.txt; user cycles on CPUs 5-6 under the
+  1.378 GHz cap, GC pacing off): the tier on synchronous +5.8% cycles at +0.13% instructions,
+  asynchronous +7.7% (the process, the compile thread included) at +1.21%: the deficit is the tier
+  code's cycles at equal work, not compile work; step 15 removes its WrongCallee exits and their
+  discard and recompile.
