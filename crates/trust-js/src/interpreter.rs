@@ -15816,16 +15816,15 @@ impl Interp {
         if epoch == u32::MAX {
             return CachedCall::Miss;
         }
-        // A way whose chunk a newer one superseded takes its function's current code first
+        // A way whose chunk a newer one superseded, or whose chunk's code changed in place (its
+        // entry word moved, P3 stage 2 step 14), takes its function's current code first
         // (per-callee pickup, `Chunk::supersede`); one that cannot yet misses, and an overflow
         // entry's misses for the caller's fill.
         for e in &site.entries {
             let p = e.as_ptr();
             unsafe {
                 if (*p).callee == key && (*p).global_env == genv && (*p).epoch == epoch {
-                    if crate::bytecode::entry_superseded(p)
-                        && !crate::bytecode::refill_superseded(e)
-                    {
+                    if crate::bytecode::entry_stale(p) && !crate::bytecode::refill_stale(e) {
                         return CachedCall::Miss;
                     }
                     return CachedCall::Entry(p);
@@ -15833,7 +15832,7 @@ impl Interp {
             }
         }
         if let Some(entry) = self.call_overflow.lookup_entry(key, genv, epoch) {
-            if unsafe { crate::bytecode::entry_superseded(entry) } {
+            if unsafe { crate::bytecode::entry_stale(entry) } {
                 return CachedCall::Miss;
             }
             return CachedCall::Entry(entry);
@@ -15879,8 +15878,7 @@ impl Interp {
                     let p = e.as_ptr();
                     unsafe {
                         if (*p).func == fp && (*p).global_env == genv && (*p).epoch == epoch {
-                            if crate::bytecode::entry_superseded(p)
-                                && !crate::bytecode::refill_superseded(e)
+                            if crate::bytecode::entry_stale(p) && !crate::bytecode::refill_stale(e)
                             {
                                 return CachedCall::Miss;
                             }
@@ -15953,15 +15951,16 @@ impl Interp {
 
     /// Whether a preparation still describes the entry [`Interp::call_jit_cached`] would take:
     /// the global call-cache epoch (reclaimed code, invalidations) and the active realm are
-    /// unchanged, and no newer chunk of the callee superseded the prepared one. Callee identity
-    /// is fixed by the preparation's owner.
+    /// unchanged, no newer chunk of the callee superseded the prepared one, and the chunk's code
+    /// did not change in place (its entry word, P3 stage 2 step 14). Callee identity is fixed by
+    /// the preparation's owner.
     #[inline]
     pub(crate) fn prepared_call_current(&self, prepared: &PreparedCall) -> bool {
         prepared.ic.epoch
             == crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed)
             && prepared.ic.global_env == Env::as_ptr(&self.global_env) as usize
             // SAFETY: the entry's epoch is the live one, so its chunk is alive.
-            && !unsafe { crate::bytecode::entry_superseded(&prepared.ic) }
+            && !unsafe { crate::bytecode::entry_stale(&prepared.ic) }
     }
 
     /// One call through a current [`PreparedCall`], with exactly the effects of the
@@ -16226,8 +16225,9 @@ impl Interp {
         if let Some(entry) = self
             .call_overflow
             .lookup_entry(key, global_env, epoch)
-            // A superseded chunk's entry misses: the guarded call below refills it.
-            .filter(|&entry| !unsafe { crate::bytecode::entry_superseded(entry) })
+            // A superseded chunk's entry misses, as does one whose chunk's code changed in place
+            // (its entry word): the guarded call below refills it.
+            .filter(|&entry| !unsafe { crate::bytecode::entry_stale(entry) })
         {
             // SAFETY: a live entry, copied before anything re-entrant runs (the callee may
             // refill the table).
@@ -17246,7 +17246,8 @@ impl Interp {
         // already known to be a same-realm ordinary user constructor. Probe it before classifying
         // natives: hot `new C()` sites otherwise borrow C and look up `.prototype` twice per
         // allocation (once to ask whether C is native, then again for the live instance proto).
-        // A superseded chunk's entry misses (per-callee pickup): the fill below refills both
+        // A superseded chunk's entry misses (per-callee pickup), as does one whose chunk's code
+        // changed in place (its entry word, P3 stage 2 step 14): the fill below refills both
         // caches with the constructor's current code.
         let cached_site = site
             .map(|(chunk, cache)| chunk.construct_cache(cache))
@@ -17254,7 +17255,7 @@ impl Interp {
                 entry.call.callee == key
                     && entry.call.epoch == epoch
                     && entry.call.global_env == genv
-                    && !unsafe { crate::bytecode::entry_superseded(&entry.call) }
+                    && !unsafe { crate::bytecode::entry_stale(&entry.call) }
             });
         // Native constructors do not need an ordinary instance or a JS activation: they build
         // their result in the native body. Keep them on the same read-only argument-window
@@ -17308,7 +17309,7 @@ impl Interp {
                     if entry.pin.as_ptr() == Gc::as_ptr(o)
                         && entry.call.epoch == epoch
                         && entry.call.global_env == genv
-                        && !unsafe { crate::bytecode::entry_superseded(&entry.call) } =>
+                        && !unsafe { crate::bytecode::entry_stale(&entry.call) } =>
                 {
                     (
                         entry.call,
@@ -17684,6 +17685,7 @@ impl Interp {
                     << 2),
             func: Rc::as_ptr(&func),
             epoch,
+            entry: u32::from(chunk.entry_word()),
             chunk_raw: Rc::as_ptr(chunk),
             code_mem: code.mem_ptr(),
             pc_offs_ptr: code.pc_offsets_ptr(),
@@ -17854,6 +17856,7 @@ impl Interp {
                             },
                         func: Rc::as_ptr(&func),
                         epoch,
+                        entry: u32::from(chunk.entry_word()),
                         chunk_raw: Rc::as_ptr(chunk),
                         code_mem: code.mem_ptr(),
                         pc_offs_ptr: code.pc_offsets_ptr(),

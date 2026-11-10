@@ -51,7 +51,7 @@ pub(super) fn realm_fallback() {
 pub(super) fn overflow_renewal() {
     add(12);
 }
-/// A superseded chunk's way took its function's current code (see `refill_superseded`).
+/// A superseded chunk's way took its function's current code (see `refill_stale`).
 pub(super) fn in_place_refill() {
     add(13);
 }

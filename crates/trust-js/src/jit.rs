@@ -277,6 +277,14 @@ mod chain_reoptimize_tests;
 
 #[cfg(all(
     test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_entry_word_tests.rs"]
+mod entry_word_tests;
+
+#[cfg(all(
+    test,
     any(target_arch = "aarch64", target_arch = "x86_64"),
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
@@ -3224,6 +3232,8 @@ mod layout_asserts {
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, callee) == 0);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, global_env) == 32);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, epoch) == 56);
+        // The direct sequence loads the entry word's copy and the chunk with one LDP from 56.
+        const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, entry) == 60);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_params) == 42);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_slots) == 44);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, direct) == 46);
@@ -3464,6 +3474,15 @@ mod asm {
         /// The native runs an entry counts (`opt::entry_weight`, unless set).
         pub fn entry_weight(&self) -> u32 {
             self.entry_weight.unwrap_or_else(crate::opt::entry_weight)
+        }
+        /// Whether the direct sequence compares its way's copy of the callee chunk's entry word
+        /// with the chunk's (P3 stage 2, step 14): with the optimizing tier on, whose installs
+        /// change a chunk's code in place. The tier on is what makes an entry weigh K
+        /// (`opt::entry_weight`, a process constant that the shared stubs' table keys), so the
+        /// weight tells; with the tier off no chunk's code changes in place, and the sequence
+        /// stays as it was.
+        pub fn compares_entry_words(&self) -> bool {
+            self.entry_weight() != 1
         }
         /// Whether direct constructs make `this` in line (see the `inline_construct` field).
         pub fn set_inline_construct(&mut self, inline: bool) {
@@ -4076,6 +4095,13 @@ mod asm {
         /// cmp xn, xm (SUBS xzr, xn, xm)
         pub fn cmp_reg_x(&mut self, rn: u32, rm: u32) {
             self.emit(0xEB00_001F | (rm << 16) | (rn << 5));
+        }
+        /// cmp xn, xm, lsr #shift (SUBS xzr, xn, xm, LSR #shift)
+        pub fn cmp_lsr_x(&mut self, rn: u32, rm: u32, shift: u32) {
+            if shift >= 64 {
+                return self.bad("a register shift past 63");
+            }
+            self.emit(0xEB40_001F | (rm << 16) | (shift << 10) | (rn << 5));
         }
         /// lsr xd, xn, #shift (UBFM xd, xn, #shift, #63)
         #[inline]
@@ -11999,6 +12025,12 @@ const _: () = assert!((crate::bytecode::CALL_IC_WAYS as u32) < CALL_CODE_HIT);
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 const _: () = assert!(crate::bytecode::CALL_SITE_CODE_HINT_OFF < 4096);
+// The direct sequence loads the callee chunk's entry word with one LDRB (P3 stage 2, step 14).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const _: () = assert!(crate::bytecode::CHUNK_ENTRY_OFF < 4096);
 
 /// Secondary identity probe. Inputs match the primary probe: x13 = live callee identity,
 /// w15 = epoch, x17 = realm, x10 = stored callee pointer. On hit x12 points at a CallIc and
@@ -12233,11 +12265,15 @@ fn emit_direct_sequence(
     const IC_NPARAMS: u32 = 42;
     const IC_NSLOTS: u32 = 44;
     const IC_DIRECT: i32 = 46;
+    const IC_EPOCH: i32 = 56;
+    const IC_ENTRY: i32 = 60;
     const IC_CHUNK_RAW: i32 = 64;
     const IC_CODE: i32 = 24;
     const IC_CODE_MEM: i32 = 72;
     const IC_PC_OFFS: i32 = 80;
     const _: () = assert!(offset_of!(crate::bytecode::CallIc, code) == IC_CODE as usize);
+    const _: () = assert!(offset_of!(crate::bytecode::CallIc, epoch) == IC_EPOCH as usize);
+    const _: () = assert!(offset_of!(crate::bytecode::CallIc, entry) == IC_ENTRY as usize);
     // The install moves these pairs with one LDP/STP each.
     const _: () = assert!(IC_PC_OFFS == IC_CODE_MEM + 8);
     const _: () = assert!(offset_of!(JitCtx, n_slots) == offset_of!(JitCtx, chunk) + 8);
@@ -12268,14 +12304,32 @@ fn emit_direct_sequence(
     a.logic_imm_w(0, 11, 9, ready);
     a.cbz(11, false, static_gates);
     a.bind(static_done);
-    // x4 = the callee's chunk, kept for the retry gate below.
-    a.ldur(4, 12, IC_CHUNK_RAW);
+    // x4 = the callee's chunk, kept for the retry gate below. With the optimizing tier on, x6
+    // = the way's epoch and its copy of the chunk's entry word (bits 32-63), in the same LDP.
+    let compares_entry = a.compares_entry_words();
+    if compares_entry {
+        const _: () = assert!(IC_CHUNK_RAW == IC_EPOCH + 8 && IC_ENTRY == IC_EPOCH + 4);
+        a.ldp_base(6, 4, 12, IC_EPOCH);
+    } else {
+        a.ldur(4, 12, IC_CHUNK_RAW);
+    }
     if !construct {
         // recompile settled (live chunk byte — see attempted_off). A construct waits for no
         // attempt: it counts from its first run (below), and its code's first checkpoint is
         // that attempt.
         a.ldrb_imm(11, 4, attempted_off as u32);
         a.cbz(11, false, hit_slow);
+    }
+    if compares_entry {
+        // The callee's code is the one the way holds: the chunk's entry word, which counts the
+        // changes of its code in place (the tier's install over the template JIT's code, a
+        // discard, a reoptimization; P3 stage 2, step 14), equals the way's copy. A mismatch
+        // takes the helper, which refills the way from the chunk's current code, as V8's and
+        // SpiderMonkey's calls load a function's current entry; the code the way holds still
+        // lives (an install keeps the template JIT's code), so this is for speed.
+        a.ldrb_imm(5, 4, crate::bytecode::CHUNK_ENTRY_OFF as u32);
+        a.cmp_lsr_x(5, 6, 32);
+        a.b_cond(C_NE, hit_slow);
     }
     // Arity needs no gate: the sequence moves min(argc, n_params) arguments into their slots,
     // tags every remaining slot Undefined (the missing-argument binding), and leaves any

@@ -1040,7 +1040,7 @@ mod computed_read_cache_tests {
 #[derive(Clone, Copy)]
 /// `repr(C)` with this field order gives the JIT call template fixed byte offsets for its
 /// inline way-1 probe: callee@0, env@8, chunk@16, code@24, global_env@32, strict@40,
-/// uses_this@41, n_params@42, n_slots@44, func@48, epoch@56. The complete stride,
+/// uses_this@41, n_params@42, n_slots@44, func@48, epoch@56, entry@60. The complete stride,
 /// including the direct-call/native fields below, is compile-asserted in jit.rs.
 #[repr(C)]
 pub struct CallIc {
@@ -1079,6 +1079,11 @@ pub struct CallIc {
     /// dropped function runtime are never entered). A callee's new code supersedes the chunk
     /// this entry holds instead ([`Chunk::supersede`]).
     pub epoch: u32,
+    /// The callee chunk's entry word at fill time ([`Chunk::entry_word`], zero-extended; 0 for
+    /// a native entry): a mismatch means the chunk's code changed in place since (P3 stage 2,
+    /// step 14), and the way refills from its current code ([`entry_stale`], [`refill_stale`]).
+    /// Beside `epoch`, so that the direct sequence loads both with the chunk in one LDP.
+    pub entry: u32,
     /// `Rc::as_ptr` of the callee's chunk — what `ctx.chunk` holds (the direct-call sequence
     /// swaps it in without the RcBox-offset arithmetic a `*const Rc<Chunk>` deref would need).
     /// NULL for a NATIVE entry (see `native`) — every machine-code consumer that dereferences
@@ -1233,6 +1238,7 @@ impl CallIc {
         direct: 0,
         func: std::ptr::null(),
         epoch: 0,
+        entry: 0,
         chunk_raw: std::ptr::null(),
         code_mem: std::ptr::null(),
         pc_offs_ptr: std::ptr::null(),
@@ -1303,31 +1309,38 @@ pub(crate) fn note_selected(chunk: &Chunk) -> bool {
     true
 }
 
-/// Whether `ic`, an entry its probe matched, runs a chunk that a newer one superseded
-/// ([`Chunk::supersede`]): the caller refills it with its function's current code instead.
+/// Whether `ic`, an entry its probe matched, holds code its function no longer enters first:
+/// its chunk was superseded by a newer one ([`Chunk::supersede`]), or the chunk's code changed
+/// in place since the fill (its entry word moved: [`Chunk::note_entry_change`], P3 stage 2,
+/// step 14). The caller refills it with its function's current code instead
+/// ([`refill_stale`]), or misses. A stale entry's code still lives: this is for speed, the
+/// epoch for safety.
 ///
 /// # Safety
 /// `ic` matched the live epoch, so a user entry's chunk is alive (a native's is null).
 #[inline(always)]
-pub(crate) unsafe fn entry_superseded(ic: *const CallIc) -> bool {
+pub(crate) unsafe fn entry_stale(ic: *const CallIc) -> bool {
     let chunk = unsafe { (*ic).chunk_raw };
-    !chunk.is_null() && unsafe { (*chunk).superseded() }
+    !chunk.is_null()
+        && unsafe { (*chunk).superseded() || u32::from((*chunk).entry_word()) != (*ic).entry }
 }
 
-/// Refill `way`, whose chunk a newer one superseded and whose probe matched (so its epoch and
-/// Realm are the live ones), with its function's current code in that Realm: the chunk fields
-/// that [`Interp::call_jit_fast`] would record for the same callee, whose identity and every
-/// proof about it stay. A code-keyed probe then finds the new code too, which a fill under the
-/// live closure's identity would leave behind. `false` leaves the way as it was: the current code
-/// has no entry a way can hold yet (not compiled, a prepared or resumable body), or the Realm
-/// still selects the superseded chunk, which [`note_selected`] made current again.
+/// Refill `way`, a stale entry ([`entry_stale`]) whose probe matched (so its epoch and Realm are
+/// the live ones), with its function's current code in that Realm: the chunk fields that
+/// [`Interp::call_jit_fast`] would record for the same callee, whose identity and every proof
+/// about it stay. For a superseded chunk that is the newer chunk's code, for one whose code
+/// changed in place the same chunk's current code. A code-keyed probe then finds the new code
+/// too, which a fill under the live closure's identity would leave behind. `false` leaves the
+/// way as it was: the current code has no entry a way can hold yet (not compiled, a prepared or
+/// resumable body), or the Realm still selects the superseded chunk, which [`note_selected`]
+/// made current again.
 ///
 /// # Safety
 /// The way's probe matched the live epoch and the active Realm, with its callee (or another
 /// closure of its function) live: the way's function and its runtime's slots are alive.
 #[cold]
 #[inline(never)]
-pub(crate) unsafe fn refill_superseded(way: &std::cell::Cell<CallIc>) -> bool {
+pub(crate) unsafe fn refill_stale(way: &std::cell::Cell<CallIc>) -> bool {
     let mut ic = way.get();
     // SAFETY: the site pins the function, and its live closure keeps it.
     let func = unsafe { &*ic.func };
@@ -1335,8 +1348,9 @@ pub(crate) unsafe fn refill_superseded(way: &std::cell::Cell<CallIc>) -> bool {
     let Some(Some(chunk)) = runtime.execution_code_for(ic.global_env) else {
         return false;
     };
-    if std::ptr::eq(Rc::as_ptr(chunk), ic.chunk_raw) {
-        note_selected(chunk);
+    // The same chunk, current again in another Realm: the epoch moved. Otherwise the same
+    // chunk is current with new code (its entry word moved), which the way takes below.
+    if std::ptr::eq(Rc::as_ptr(chunk), ic.chunk_raw) && note_selected(chunk) {
         return false;
     }
     let Some(Some(code)) = chunk.jit.get() else {
@@ -1358,6 +1372,7 @@ pub(crate) unsafe fn refill_superseded(way: &std::cell::Cell<CallIc>) -> bool {
     ic.direct = chunk.jit_direct_flags(&code)
         | (((chunk.inline_attempted.get() || runtime.code2.get().is_some()) as u8) << 2)
         | (ic.direct & CALL_IC_LEXICAL_THIS);
+    ic.entry = u32::from(chunk.entry_word());
     ic.chunk_raw = Rc::as_ptr(chunk);
     ic.code_mem = code.mem_ptr();
     ic.pc_offs_ptr = code.pc_offsets_ptr();
@@ -3640,7 +3655,26 @@ pub struct Chunk {
     /// fingerprint, its exit profile and R, a discarded second stage's warm-up. Made at the
     /// tier's first use of the chunk, and dropped with it.
     pub(crate) opt: std::cell::OnceCell<Box<crate::opt::profile::ChunkProfile>>,
+    /// The entry word (P3 stage 2, step 14): counts, modulo 256, the changes of the code in
+    /// `jit` made in place, which leave the chunk its function's current code: the optimizing
+    /// tier's install of its code over the template JIT's, a discard's return to the template
+    /// JIT's code and a reoptimization's install. A call way copies it at its fill
+    /// ([`CallIc::entry`]), and every path that enters a way's code compares the two
+    /// ([`entry_stale`]; with the tier on, the direct sequence too), a mismatch refilling the way
+    /// from the chunk's current code ([`refill_stale`]), as V8's and SpiderMonkey's calls load a
+    /// function's current entry (its dispatch entry, its script's jitCodeRaw). For speed only: a
+    /// way that misses a change enters code that still lives (the template JIT's code an install
+    /// keeps), since every change that frees code moves the call caches' epoch as before. Between
+    /// two epoch moves it changes at most once, so its wrap is never seen. A byte, and the last
+    /// field: it takes the padding byte after the others, so that no field the template code
+    /// addresses moves and the tier off's code stays byte-identical ([`CHUNK_ENTRY_OFF`]).
+    entry: std::cell::Cell<u8>,
 }
+
+/// The byte offset of a chunk's entry word (`Chunk::entry`), which the direct sequence loads
+/// from its callee's chunk (`jit::emit_direct_sequence`).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const CHUNK_ENTRY_OFF: usize = std::mem::offset_of!(Chunk, entry);
 
 /// The feedback census snapshots a chunk's production feedback when it drops (W4 step 2).
 #[cfg(feature = "architecture-diagnostics")]
@@ -3917,6 +3951,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             jit_budget_wait_bytes: _,
             osr: _,
             opt: _, // integers: no cells
+            entry: _,
         } = self;
         consts.trace_gc(sink);
         private_sites.as_ref().trace_gc(sink);
@@ -10240,6 +10275,7 @@ fn finish_chunk(
         jit_budget_wait_bytes: std::cell::Cell::new(0),
         osr: std::cell::OnceCell::new(),
         opt: std::cell::OnceCell::new(),
+        entry: std::cell::Cell::new(0),
     };
     let chunk = Rc::new(chunk);
     crate::value::register_code_roots(&chunk);
@@ -24646,6 +24682,18 @@ impl Chunk {
     pub(crate) fn superseded(&self) -> bool {
         self.superseded.get().is_some()
     }
+    /// The chunk's entry word (see the field `entry`), which a call way copies at its fill.
+    #[inline(always)]
+    pub(crate) fn entry_word(&self) -> u8 {
+        self.entry.get()
+    }
+    /// The code in the chunk's slot changed in place (P3 stage 2, step 14; see the field
+    /// `entry`): every way that holds the old code refills at its next entry, and no other
+    /// call site re-resolves.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn note_entry_change(&self) {
+        self.entry.set(self.entry.get().wrapping_add(1));
+    }
     /// A newer chunk of the function replaced this one in the Realm that published it, as a
     /// tiering request redirects V8's next call of a function (SetTieringRequest,
     /// src/sandbox/js-dispatch-table.h:267-271): this chunk's retry word becomes 1, so every
@@ -26804,11 +26852,12 @@ unsafe fn jit_call_hit_inner(
             ctx, sp, argc, with_this, native, intrinsic, signature, entry,
         );
     }
-    // A newer chunk of the callee superseded the way's (per-callee pickup): its direct entry
-    // came here through the retry gate. The way takes the function's current code, and this
+    // A newer chunk of the callee superseded the way's (per-callee pickup), or the chunk's code
+    // changed in place (its entry word moved): its direct entry came here through the retry
+    // gate or the entry word's compare. The way takes the function's current code, and this
     // call runs it; while the current code has no entry a way can hold, the generic call runs
     // it (`Interp::resolve_cached_call_entry` misses on the way).
-    if entry_superseded(entry.as_ptr()) && !refill_superseded(entry) {
+    if entry_stale(entry.as_ptr()) && !refill_stale(entry) {
         note_call_path(CallPath::Superseded);
         if ctx.callstat_enabled {
             jit_callstat(i, ctx, &entry.get(), argc, with_this, sp);
@@ -29243,6 +29292,7 @@ unsafe fn jit_call_inner(
                                 direct: signature, // bit 0 clear: compiled-entry gate uses the helper
                                 func: std::ptr::null(),
                                 epoch,
+                                entry: 0,
                                 chunk_raw: std::ptr::null(),
                                 code_mem: std::ptr::null(),
                                 pc_offs_ptr: std::ptr::null(),

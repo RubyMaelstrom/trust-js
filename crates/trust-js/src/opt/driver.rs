@@ -1419,6 +1419,8 @@ fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'stati
         }
         crate::jit::JitCompileOutcome::Unavailable => (chunk.jit.replace_resident(None), "the VM"),
     };
+    // The slot's code changed in place: its entry word moves (P3 stage 2, step 14).
+    chunk.note_entry_change();
     if let Some(retired) = retired {
         #[cfg(test)]
         TEST_DISCARDED.with(|discarded| discarded.borrow_mut().push(retired.mem_ptr() as usize));
@@ -1563,13 +1565,16 @@ fn pin_global_environment(i: &mut Interp, pin: crate::interpreter::WeakEnv) {
 
 /// Make `code`, the tier's recompile of `chunk`, the chunk's native code: in place of the
 /// resident code, which joins the retired codes until no activation runs it, or in a cold slot
-/// (evicted, or left cold by a deferred discard). An unavailable slot keeps the chunk in the VM.
+/// (evicted, or left cold by a deferred discard). Either way the chunk's code changed in place:
+/// its entry word moves (`Chunk::note_entry_change`, P3 stage 2, step 14). An unavailable slot
+/// keeps the chunk in the VM.
 fn install_code(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
     match chunk.jit.get() {
         Some(Some(_)) => {
             if let Some(replaced) = chunk.jit.replace_resident(Some(code)) {
                 i.opt_retired.push(replaced);
             }
+            chunk.note_entry_change();
             true
         }
         Some(None) => {
@@ -1581,6 +1586,7 @@ fn install_code(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
         None => match chunk.jit.begin_compile() {
             Some(permit) => {
                 permit.commit(Some(code));
+                chunk.note_entry_change();
                 true
             }
             None => {
