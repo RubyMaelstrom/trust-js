@@ -1845,3 +1845,124 @@ ICs change, where the tier compiles at its fourth checkpoint whatever the finger
 (JSC's maximumOptimizationDelay). Then the further single-thread compile work (step 10's list) or,
 if the owner's answer on the bar is two CPUs, compiles off the main thread (plan point 13); then
 NavierStokes' instructions on the A725, Crypto's churn and the frame limit's refusal of zlib's a8.
+Correction (2026-11-10): the 8.3 points of Octane's second-stage samples that the coverage above
+gives to zlib are a8's (<anonymous>:1:126768, 2,462 operations), in template code the log labels
+a second stage; the refusal for a frame over the record's 256 words is another function's, a1
+(<anonymous>:1:70112, 21,869 operations), after 2.36 ms. Why a8 runs template code there is open
+(the census's a8 is compiled, discarded after 100 exits and recompiled).
+
+The owner's answer on the bar (2026-11-10): the compile-time bar assumes two CPUs, the tier
+compiling off the main thread (point 13), as V8, SpiderMonkey and JSC do. Proposed with it, for
+the owner's agreement: the 3% counts every part of a compile that stays on the main thread (the
+snapshot, the bytecode recompile that makes the tier's chunk, the install), of which the
+sessions' figure, generate's time, leaves out the recompile (3.0M cycles a Djot run, 2.9% of its
+pass); and the reference runs (node, node-mg) take the same two CPUs (node-mg's Djot pass 35 ms
+on one CPU, 23 ms on two). With one CPU the tier compiles on the main thread, as SpiderMonkey
+does (jit/Ion.cpp:2110-2118).
+
+Step 11, the tier-up policy of point 2 (design, 2026-11-10; input
+target/p3/stage2/policy-input.txt: a census of every compile on the fixtures, Octane's fixed runs
+and Richards' and Crypto's marked runs, and policy variants, each measured in its probe binary
+against that binary's default; branch p3-policy-probe, unlanded). V8 (63481c19) gives
+Maglev a budget of invocation_count_for_maglev (400; flags/flag-definitions.h:1126) times the
+bytecode's length (execution/tiering-manager.cc:187-195, 264-290), drawn down by the bytecode
+executed: Ignition charges the whole length at each entry (InterpreterEntryTrampoline,
+builtins/arm64/builtins-arm64.cc:1427-1433) and a back edge its loop's length
+(InterpreterAssembler::JumpBackward, interpreter/interpreter-assembler.cc:1252-1256); Sparkplug
+charges at a return the bytes through it and at a back edge its loop's length
+(baseline/baseline-compiler.cc:2905-2913, 2666-2671). An IC change raises the budget to at least
+minimum_invocations_after_ic_update (500; flag-definitions.h:1150) times the length
+(NotifyICChanged, tiering-manager.cc:497-576): a property IC's monomorphic, polymorphic and
+megamorphic configurations notify (ic/ic.cc:346-430, 661), a megamorphic IC's cache updates do
+not (:1061-1072), nor do call and binary-operation feedback (builtins/ic-callable.tq:22-50;
+codegen/code-stub-assembler.cc:13851-13879). When the budget runs out the function compiles,
+whatever its feedback (MaybeOptimizeFrame, tiering-manager.cc:339-432): nothing is forced, since
+nothing waits but the budget. A function over max_optimized_bytecode_size (60 KB;
+flag-definitions.h:1557) gets the largest budget and is never optimized (tiering-manager.cc:
+282-283). The tier: checkpoints at 100, 500, 2,100 and 8,500 native runs, an entry and a loop
+iteration each counting one (step 8, SpiderMonkey's weight); it compiles at the first checkpoint
+whose fingerprint equals the previous one's, and at the fourth whatever the fingerprint (JSC's
+maximumOptimizationDelay).
+- The census (the default policy, one run each): Djot 38 compiles in 17.25 ms (CPU 10, median
+  of 5), 4 of them at the fourth checkpoint on feedback that had really changed (code running for
+  the first time, call sites going polymorphic or megamorphic; 4.47 ms); over the 20 workloads,
+  116 compiles on unsettled feedback, 47 of them changed only by refills of sites past their
+  capacity (generic named sites, megamorphic call sites; all TypeScript's); 359 of the 1,421
+  compiles at a checkpoint reached it by runs at least half loop iterations (503 of 967 ms).
+- The variants (Octane's fixed runs' instructions, the fixtures' cycles and generate's time on
+  CPU 10): (a) V8's weight, Ignition's: Octane -0.7 to -0.8% (DeltaBlue -6.8%: long functions
+  with short loops no longer compile; Mandreel's initPhysics, 35.6 ms, among them), Djot's
+  generate -6 to -10% and its measured pass -1.2 to -2.0%, Vue and React unchanged; (r)
+  Sparkplug's weight, at returns, with a: Octane -0.07% against a, React's measured pass +2.2%
+  instructions (its reducer returns early and compiles after 3,264 calls in place of 2,100),
+  compiles never entered 28 to 13, the call microbenchmarks within 0.3%; (b) nothing forced, the
+  gaps 4x past the fourth checkpoint: Djot's passes 2-10 +10.7% (its four functions never
+  compile), TypeScript +13.5%; (B) nothing forced, a checkpoint every 500 runs past the fourth
+  (V8's wait): Octane +0.07%, Djot's passes 2-10 +0.3%; (c) the refills of sites past their
+  capacity left out of the fingerprint (V8's megamorphic rule): TypeScript -1.4%, Djot's generate
+  +7% and its passes 2-10 -1.5%; aB -0.73% and aBc -0.88% (TypeScript -2.0%; Djot's measured
+  pass +0.8%, its passes 2-10 -1.5%, generate +8%); (u) a checkpoint every 500 runs from the
+  first, nothing forced (V8's wait at the checkpoints' grain): Octane +1.3 to +1.6% (DeltaBlue
+  +32 to +35%: functions compiled at the windows of 1,000 and 1,500 runs are discarded, 1,701
+  exits and 22 epoch moves in its 5 runs against a's 460 and 6), Djot's generate +10 to +32%,
+  and without c TypeScript's churning functions fingerprinted every 500 runs (4,311 fingerprints
+  in 114 ms against 1,612 in 22); (v) only V8's notifications in the fingerprint, no call ways
+  or value records: Djot 54 compiles and 10 discards against 38 and 3; the first checkpoint at
+  400 (e400): Djot's generate -52%, but Vue's measured pass +2.5% and Richards +5.0%. No variant
+  near V8's rule moves Djot's compile time by more than a tenth: the bar's answer is point 13.
+  The settled rule's own cost: Djot's 156 fingerprints take 1.10 ms a run (6.2% of generate).
+The step, with the tier on (off, P2's checkpoints and counts stay):
+1. V8's weight, Ignition's. The runs word counts in 64ths of an invocation (K = 64): an entry adds
+   K (the direct sequence's gate, H_CALL_HIT, note_native_entry, the slice and OSR entry; the
+   construct sequence's take-back K); a loop's back edge adds max(1, round(K x B / L)), B the
+   loop's span (its header to its last back edge), L the chunk's operations (jit_ops), the
+   weights computed where compile_entry arms the counting and kept per header beside it (a
+   rotated loop's countdown adds its iterations times its weight); every distance is K times as
+   long. A loop-free function keeps its schedule; a long function with a short loop needs as
+   many iterations as V8's budget would.
+2. Nothing forced: past the fourth checkpoint the checkpoints go on every 500 runs (x K,
+   minimum_invocations_after_ic_update), so a function compiles at the first such window its
+   feedback does not change in, and one whose feedback never settles keeps its template code; a
+   discard's warm-up likewise, (100, 400, 1,600, 6,400) << R, then every 500 << R. The counts
+   saturate below the word, and a checkpoint past u32::MAX is not armed. R's cap falls from 19 to
+   13, where the warm-up's fourth distance, 409,600 << R, still fits the word (profile.rs's
+   argument, as JSC's cap comes from its counter's range).
+3. V8's notifications in the fingerprint: a generic named site counts its generic mark and not
+   its ways, a megamorphic call site its state and not its ways (ic.cc:1061-1072).
+4. V8's size limit: the tier refuses a chunk of more than 15,000 operations before its snapshot
+   (60 KB at three to six bytes of V8's bytecode an operation: Mandreel's initPhysics, 19,580
+   operations and 66,944 bytes in node 24, which V8 never optimizes and the default policy
+   compiles in 35.6 ms; zlib's a1, 21,869 operations, refused now for its frame after 2.36 ms). A
+   refusal keeps today's second stage, as every refusal does.
+- Departures, each measured: (1) Ignition's weight, not Sparkplug's at returns, the template
+  code's analog: r costs React's reducer 1,164 more calls in template code (React's measured pass
+  +2.2%) and moves nothing else by more than 1%. (2) The four checkpoints stay before V8's
+  500-run windows: u's earlier compiles are discarded where V8's would deoptimize once (V8
+  invalidates code at its first deoptimization), the tier's discard taking 100 << R exits in the
+  VM and moving the call caches' epoch (step 3, after JSC's exit counts); the widening windows
+  are JSC's delays, which go with JSC's exits. When a discard costs what V8's does (an exit that
+  invalidates, no global epoch move), u again. (3) The fingerprint keeps call ways and value and
+  element records, which V8 does not notify (v's compiles and discards). (4) Sampled at the
+  checkpoints, not notified: a notification at every fill would put a test into template code's
+  record updates; a fingerprint a window costs Djot 1.10 ms a run.
+- Unchanged: the tier off (P2's checkpoints and counts); exits, discards and the warm-up's start
+  (step 3); the snapshot and the code.
+- Tests: a loop-free function's tier code at its 500th entry with settled feedback, as now; a
+  function of L operations with one loop of span B compiles after about 500 x L / B iterations,
+  a nested loop's back edge charging its own span, a rotated loop's countdown its iterations at
+  its exits; a function whose feedback changes until its fourth checkpoint compiles at the first
+  quiet 500-run window after it, settled, and one whose feedback changes in every window never
+  compiles; a generic named site's and a megamorphic call site's refills leave the fingerprint
+  unchanged and their transitions change it; a chunk over 15,000 operations is refused before its
+  snapshot and keeps its second stage; the counts saturate below the word, no checkpoint past
+  it, R capped at 13; the tier off unchanged (a second stage at the 100th entry); Richards'
+  schedule compiled in run 4; the library's suites with the tier off and on, the tier's tests in
+  its configurations.
+- Expected (binary 2's aBc and binary 1's a, against their defaults): Octane's fixed runs -0.9%
+  (TypeScript -2.0%, DeltaBlue -6.8%, Crypto and RegExp -1.1%), Vue and React within 1%, Djot's
+  passes 2-10 -1.5% and its measured pass about +0.8% with 8% more generate (functions that only
+  churned now settle and compile, a cost that leaves the main thread with point 13), no compile
+  on unsettled feedback; Richards' schedule in run 4; Crypto 33 compiles and 7 discards in 40 runs.
+The order after it: the tier's chunk made without the bytecode recompile where its plan splices
+nothing (21 of Djot's 37 plans), as Maglev compiles from the function's own bytecode; then
+compiling off the main thread (point 13).
