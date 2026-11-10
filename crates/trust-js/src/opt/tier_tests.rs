@@ -957,6 +957,40 @@ fn graph_now(chunk: &Chunk) -> super::ir::Graph {
         .graph
 }
 
+/// `live_at`'s index (stage 2, step 10) agrees with a scan of every range at each node of the
+/// tier's graphs of the programs' functions: loops, effects, calls, element and named accesses.
+#[test]
+fn live_at_agrees_with_a_scan_on_the_tiers_graphs() {
+    let mut graphs = 0;
+    let mut live = 0;
+    for program in PROGRAMS {
+        eager().set();
+        let mut engine = jit_engine();
+        eval(&mut engine, program);
+        let names: Vec<&str> = program
+            .split("function ")
+            .skip(1)
+            .filter_map(|rest| rest.split('(').next())
+            .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric()))
+            .collect();
+        for name in names {
+            let Some(chunk) = second_stage(&mut engine, name) else {
+                continue;
+            };
+            let Ok(built) = super::build::build(&chunk, &super::snapshot::Snapshot::take(&chunk))
+            else {
+                continue;
+            };
+            let alloc = super::regalloc::allocate(&built.graph, &super::regalloc::ARM64)
+                .expect("the tier's graph allocates");
+            live += super::regalloc::tests::assert_live_at_agrees(&built.graph, &alloc);
+            graphs += 1;
+        }
+    }
+    assert!(graphs >= 10, "{graphs} graphs");
+    assert!(live > 0);
+}
+
 /// The global `name`'s object, its shape made one no cache way takes, as a map's past the
 /// process's shape ids (`Props::force_uncacheable_shape_for_test`).
 fn make_uncacheable(engine: &mut Engine, name: &str) {

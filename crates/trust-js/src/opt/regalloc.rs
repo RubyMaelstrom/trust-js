@@ -116,12 +116,25 @@ pub(crate) struct Allocation {
     /// Whether a value living across an effect has a d8..d15 home (`a64` then checks that no
     /// shared stub writes those registers).
     pub(crate) fp_callee_across_effect: bool,
+    /// `live_at`'s index of the ranges, made at its first query.
+    live_index: std::cell::OnceCell<LiveIndex>,
 }
 
 impl Allocation {
     /// The values live where `node` reads its inputs and its state and still needed there or
-    /// after it, which `node` did not define: what a call made at `node` must keep.
+    /// after it, which `node` did not define: what a call made at `node` must keep. Ascending;
+    /// each slow-path call's query reads the index of the ranges (`LiveIndex`), made at the
+    /// first, in place of a scan of every value's.
     pub(crate) fn live_at(&self, node: NodeIx) -> Vec<NodeIx> {
+        let at = self.pos[node.index()];
+        self.live_index
+            .get_or_init(|| LiveIndex::new(&self.homes, &self.ranges))
+            .live_at(at)
+    }
+
+    /// [`Allocation::live_at`] by a scan of every value's range: the index's reference.
+    #[cfg(test)]
+    pub(crate) fn live_at_scan(&self, node: NodeIx) -> Vec<NodeIx> {
         let at = self.pos[node.index()];
         (0..self.homes.len())
             .filter(|&v| {
@@ -133,51 +146,207 @@ impl Allocation {
     }
 }
 
-/// The values a node reads where it runs: its inputs (a phi's are read on its edges) and the
-/// values of its frame state, which its exit writes.
-fn reads(graph: &Graph, node: NodeIx) -> impl Iterator<Item = NodeIx> + '_ {
-    let n = graph.node(node);
-    let inputs: &[NodeIx] = if n.op == NodeOp::Phi { &[] } else { &n.inputs };
-    let state = n.state.map(|s| graph.state(s));
-    inputs
-        .iter()
-        .copied()
-        .chain(state.into_iter().flat_map(|s| {
-            s.stack
-                .iter()
-                .copied()
-                .chain(s.slots.iter().filter_map(|slot| match slot {
-                    SlotSource::Value(v) => Some(*v),
-                    _ => None,
-                }))
-        }))
+/// The ranges of the values that have a home, for [`Allocation::live_at`]: by start, with a
+/// tree over their ends (each node the latest end of the ranges below it), so that a query
+/// visits only the subtrees holding a range that reaches its position.
+#[derive(Debug)]
+pub(crate) struct LiveIndex {
+    /// (start, end, value), by start.
+    ranges: Vec<(u32, u32, u32)>,
+    /// The tree: the leaves, `ranges`' ends, at `[leaves, 2 * leaves)`.
+    ends: Vec<u32>,
+    leaves: usize,
 }
 
-/// A bit set over node indices.
-#[derive(Clone, PartialEq, Eq)]
-struct Bits(Vec<u64>);
-
-impl Bits {
-    fn new(n: usize) -> Self {
-        Bits(vec![0; n.div_ceil(64)])
-    }
-    fn insert(&mut self, i: usize) {
-        self.0[i / 64] |= 1 << (i % 64);
-    }
-    fn remove(&mut self, i: usize) {
-        self.0[i / 64] &= !(1 << (i % 64));
-    }
-    fn union(&mut self, other: &Bits) {
-        for (a, b) in self.0.iter_mut().zip(&other.0) {
-            *a |= *b;
+impl LiveIndex {
+    fn new(homes: &[Home], ranges: &[(u32, u32)]) -> Self {
+        let mut held: Vec<(u32, u32, u32)> = homes
+            .iter()
+            .enumerate()
+            .filter(|(_, home)| !matches!(home, Home::None | Home::Const))
+            .map(|(v, _)| (ranges[v].0, ranges[v].1, v as u32))
+            .collect();
+        held.sort_unstable();
+        let leaves = held.len().next_power_of_two();
+        let mut ends = vec![0; 2 * leaves];
+        for (k, &(_, end, _)) in held.iter().enumerate() {
+            ends[leaves + k] = end;
+        }
+        for k in (1..leaves).rev() {
+            ends[k] = ends[2 * k].max(ends[2 * k + 1]);
+        }
+        LiveIndex {
+            ranges: held,
+            ends,
+            leaves,
         }
     }
-    fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().enumerate().flat_map(|(k, &word)| {
-            (0..64)
-                .filter(move |bit| word & (1 << bit) != 0)
-                .map(move |bit| k * 64 + bit)
-        })
+
+    /// The values whose range has start < `at` <= end, ascending.
+    fn live_at(&self, at: u32) -> Vec<NodeIx> {
+        // The ranges that start before `at` are a prefix; of those, the ones that end at or
+        // after it.
+        let before = self.ranges.partition_point(|&(start, _, _)| start < at);
+        let mut live = Vec::new();
+        let mut pending = vec![(1usize, 0usize, self.leaves)];
+        while let Some((node, first, width)) = pending.pop() {
+            if first >= before || self.ends[node] < at {
+                continue;
+            }
+            if width == 1 {
+                live.push(NodeIx(self.ranges[first].2));
+                continue;
+            }
+            let half = width / 2;
+            pending.push((2 * node + 1, first + half, half));
+            pending.push((2 * node, first, half));
+        }
+        live.sort_unstable();
+        live
+    }
+}
+
+/// The values each node reads where it runs (stage 2, step 10): its inputs (a phi's are read on
+/// its edges) and the values of its frame state, which its exit writes, but constants and nodes
+/// of no representation, which no home holds. Each state's values are listed once, its operand
+/// stack's and then its slots', not walked again at each of the allocator's passes.
+struct Reads<'g> {
+    graph: &'g Graph,
+    value: Vec<bool>,
+    /// Each state's first entry in `state_values`, and one past the last state's.
+    state_start: Vec<u32>,
+    state_values: Vec<u32>,
+}
+
+impl<'g> Reads<'g> {
+    fn new(graph: &'g Graph) -> Self {
+        let value: Vec<bool> = graph
+            .nodes
+            .iter()
+            .map(|node| node.rep != Rep::None && !rematerializable(&node.op))
+            .collect();
+        let mut state_start = Vec::with_capacity(graph.states.len() + 1);
+        let mut state_values = Vec::new();
+        state_start.push(0);
+        for state in &graph.states {
+            let slots = state.slots.iter().filter_map(|slot| match slot {
+                SlotSource::Value(v) => Some(*v),
+                _ => None,
+            });
+            for v in state.stack.iter().copied().chain(slots) {
+                if value[v.index()] {
+                    state_values.push(v.0);
+                }
+            }
+            state_start.push(state_values.len() as u32);
+        }
+        Reads {
+            graph,
+            value,
+            state_start,
+            state_values,
+        }
+    }
+
+    /// Whether `v` is a value some home holds.
+    fn is_value(&self, v: NodeIx) -> bool {
+        self.value[v.index()]
+    }
+
+    /// Each value `node` reads.
+    fn each(&self, node: NodeIx, mut f: impl FnMut(NodeIx)) {
+        let n = self.graph.node(node);
+        if n.op != NodeOp::Phi {
+            for &input in &n.inputs {
+                if self.value[input.index()] {
+                    f(input);
+                }
+            }
+        }
+        if let Some(state) = n.state {
+            let (from, to) = (
+                self.state_start[state.index()] as usize,
+                self.state_start[state.index() + 1] as usize,
+            );
+            for &v in &self.state_values[from..to] {
+                f(NodeIx(v));
+            }
+        }
+    }
+}
+
+/// The values each edge out of a reachable block carries into its successor's phis (values only),
+/// in the successor's phi order, listed once with the edges' checks.
+struct EdgeInputs {
+    /// Each reachable block's first edge in `start`.
+    first: Vec<u32>,
+    /// Each edge's first entry in `values`, and one past the last edge's.
+    start: Vec<u32>,
+    values: Vec<u32>,
+}
+
+impl EdgeInputs {
+    fn new(graph: &Graph, order: &[BlockIx], reads: &Reads) -> Result<Self, Refusal> {
+        let mut edges = EdgeInputs {
+            first: vec![0; graph.blocks.len()],
+            start: Vec::new(),
+            values: Vec::new(),
+        };
+        for &pred in order {
+            edges.first[pred.index()] = edges.start.len() as u32;
+            for &succ in &graph.block(pred).succs {
+                edges.start.push(edges.values.len() as u32);
+                let data = graph.block(succ);
+                let mut found = data.preds.iter().enumerate().filter(|&(_, &p)| p == pred);
+                let Some((index, _)) = found.next() else {
+                    return Err(Refusal::whole("an edge its successor does not list"));
+                };
+                if found.next().is_some() && !data.phis.is_empty() {
+                    return Err(Refusal::whole("two edges from one block into a merge"));
+                }
+                for &phi in &data.phis {
+                    let Some(&input) = graph.node(phi).inputs.get(index) else {
+                        return Err(Refusal::whole(
+                            "a phi without an input for each predecessor",
+                        ));
+                    };
+                    if reads.is_value(input) {
+                        edges.values.push(input.0);
+                    }
+                }
+            }
+        }
+        edges.start.push(edges.values.len() as u32);
+        Ok(edges)
+    }
+
+    /// The values the edge from `pred` to its `k`th successor carries.
+    fn of(&self, pred: BlockIx, k: usize) -> impl Iterator<Item = NodeIx> + '_ {
+        let edge = self.first[pred.index()] as usize + k;
+        self.values[self.start[edge] as usize..self.start[edge + 1] as usize]
+            .iter()
+            .map(|&v| NodeIx(v))
+    }
+}
+
+/// Add node index `i` to a flat bit set's words.
+fn insert(bits: &mut [u64], i: usize) {
+    bits[i / 64] |= 1 << (i % 64);
+}
+
+/// Take node index `i` out of a flat bit set's words.
+fn remove(bits: &mut [u64], i: usize) {
+    bits[i / 64] &= !(1 << (i % 64));
+}
+
+/// Each index in `bits`, ascending.
+fn for_each_bit(bits: &[u64], mut f: impl FnMut(usize)) {
+    for (k, &word) in bits.iter().enumerate() {
+        let mut rest = word;
+        while rest != 0 {
+            f(k * 64 + rest.trailing_zeros() as usize);
+            rest &= rest - 1;
+        }
     }
 }
 
@@ -210,24 +379,44 @@ fn reverse_postorder(graph: &Graph, entry: BlockIx) -> Vec<BlockIx> {
     post
 }
 
-/// The free registers and spill slots of one class during the pass.
+/// The free registers of one class during the pass, as bit masks (Maglev's register state keeps
+/// its free registers as a RegList, maglev/maglev-regalloc.h:57-94).
 struct Pool {
-    caller: Vec<u8>,
-    callee: Vec<u8>,
+    caller: u64,
+    callee: u64,
 }
 
 impl Pool {
-    fn take(list: &mut Vec<u8>) -> Option<u8> {
-        // The lowest-numbered free register, for stable code.
-        let (index, _) = list.iter().enumerate().min_by_key(|&(_, &r)| r)?;
-        Some(list.swap_remove(index))
+    fn of(caller: &[u8], callee: &[u8]) -> Self {
+        Pool {
+            caller: mask(caller),
+            callee: mask(callee),
+        }
     }
 
-    /// Register `r`, where it is free.
-    fn take_this(list: &mut Vec<u8>, r: u8) -> Option<u8> {
-        let index = list.iter().position(|&free| free == r)?;
-        Some(list.swap_remove(index))
+    /// The lowest-numbered free register of `free`, for stable code.
+    fn take(free: &mut u64) -> Option<u8> {
+        if *free == 0 {
+            return None;
+        }
+        let r = free.trailing_zeros() as u8;
+        *free &= !(1 << r);
+        Some(r)
     }
+
+    /// Register `r` of `free`, where it is free.
+    fn take_this(free: &mut u64, r: u8) -> Option<u8> {
+        let bit = 1 << r;
+        (*free & bit != 0).then(|| {
+            *free &= !bit;
+            r
+        })
+    }
+}
+
+/// The registers of `list` as a mask.
+fn mask(list: &[u8]) -> u64 {
+    list.iter().fold(0, |mask, &r| mask | (1 << r))
 }
 
 /// Allocate `graph`'s values to `file`'s registers and spill slots.
@@ -256,75 +445,52 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         tail[b.index()] = next - 1;
     }
 
-    // Liveness over the blocks (values that are not constants), to a fixed point.
-    let value = |v: NodeIx| {
-        let node = graph.node(v);
-        node.rep != Rep::None && !rematerializable(&node.op)
-    };
-    let mut live_in: Vec<Bits> = vec![Bits::new(n); graph.blocks.len()];
-    let mut live_out: Vec<Bits> = vec![Bits::new(n); graph.blocks.len()];
-    let edge_inputs = |pred: BlockIx, succ: BlockIx| -> Result<Vec<NodeIx>, Refusal> {
-        let data = graph.block(succ);
-        let mut found = data.preds.iter().enumerate().filter(|&(_, &p)| p == pred);
-        let Some((index, _)) = found.next() else {
-            return Err(Refusal::whole("an edge its successor does not list"));
-        };
-        if found.next().is_some() && !data.phis.is_empty() {
-            return Err(Refusal::whole("two edges from one block into a merge"));
-        }
-        data.phis
-            .iter()
-            .map(|&phi| {
-                graph
-                    .node(phi)
-                    .inputs
-                    .get(index)
-                    .copied()
-                    .ok_or(Refusal::whole(
-                        "a phi without an input for each predecessor",
-                    ))
-            })
-            .collect()
-    };
+    // What each node and each edge reads, listed once for the passes below.
+    let reads = Reads::new(graph);
+    let edges = EdgeInputs::new(graph, &order, &reads)?;
+
+    // Liveness over the blocks (values that are not constants), to a fixed point, in flat bit
+    // sets of `words` words a block, the scratch sets made once.
+    let words = n.div_ceil(64);
+    // A block's set in `live_in` and `live_out`.
+    let set = |b: BlockIx| b.index() * words..(b.index() + 1) * words;
+    let mut live_in = vec![0u64; graph.blocks.len() * words];
+    let mut live_out = vec![0u64; graph.blocks.len() * words];
+    let mut live = vec![0u64; words];
+    let mut from = vec![0u64; words];
     let mut changed = true;
     while changed {
         changed = false;
         for &b in order.iter().rev() {
             let data = graph.block(b);
-            let mut live = Bits::new(n);
-            for &s in &data.succs {
-                let mut from = live_in[s.index()].clone();
+            live.fill(0);
+            for (k, &s) in data.succs.iter().enumerate() {
+                from.copy_from_slice(&live_in[set(s)]);
                 for &phi in &graph.block(s).phis {
-                    from.remove(phi.index());
+                    remove(&mut from, phi.index());
                 }
-                live.union(&from);
-                for input in edge_inputs(b, s)? {
-                    if value(input) {
-                        live.insert(input.index());
-                    }
+                for (word, bits) in live.iter_mut().zip(&from) {
+                    *word |= bits;
+                }
+                for input in edges.of(b, k) {
+                    insert(&mut live, input.index());
                 }
             }
-            if live != live_out[b.index()] {
-                live_out[b.index()] = live.clone();
-            }
+            live_out[set(b)].copy_from_slice(&live);
             for &node in data.body.iter().rev() {
-                live.remove(node.index());
-                for read in reads(graph, node) {
-                    if value(read) {
-                        live.insert(read.index());
-                    }
-                }
+                remove(&mut live, node.index());
+                reads.each(node, |read| insert(&mut live, read.index()));
             }
             for &phi in &data.phis {
-                live.remove(phi.index());
+                remove(&mut live, phi.index());
             }
-            if live != live_in[b.index()] {
-                live_in[b.index()] = live;
+            if live[..] != live_in[set(b)] {
+                live_in[set(b)].copy_from_slice(&live);
                 changed = true;
             }
         }
     }
-    if live_in[entry.index()].iter().next().is_some() {
+    if live_in[set(entry)].iter().any(|&word| word != 0) {
         return Err(Refusal::whole("a value read before its definition"));
     }
 
@@ -340,53 +506,77 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             ranges[node.index()] = (p + 1, p + 1);
         }
     }
-    let extend = |v: NodeIx, at: u32, ranges: &mut Vec<(u32, u32)>| {
-        let range = &mut ranges[v.index()];
-        range.1 = range.1.max(at);
-    };
     for &b in &order {
         let data = graph.block(b);
         for &node in &data.body {
-            for read in reads(graph, node) {
-                if value(read) {
-                    if pos[read.index()] == u32::MAX {
-                        return Err(Refusal::whole("a value defined in no reachable block"));
-                    }
-                    extend(read, pos[node.index()], &mut ranges);
-                }
+            let at = pos[node.index()];
+            let mut unplaced = false;
+            reads.each(node, |read| {
+                unplaced |= pos[read.index()] == u32::MAX;
+                let range = &mut ranges[read.index()];
+                range.1 = range.1.max(at);
+            });
+            if unplaced {
+                return Err(Refusal::whole("a value defined in no reachable block"));
             }
         }
-        for v in live_out[b.index()].iter() {
-            extend(NodeIx(v as u32), tail[b.index()], &mut ranges);
-        }
+        let end = tail[b.index()];
+        for_each_bit(&live_out[set(b)], |v| {
+            let range = &mut ranges[v];
+            range.1 = range.1.max(end);
+        });
     }
 
-    // Next uses: each value's reads in code order (a phi's input is read at its edge's block end).
-    let mut uses: Vec<Vec<u32>> = vec![Vec::new(); n];
+    // Next uses: each value's reads in code order (a phi's input is read at its edge's block end),
+    // flat: counted, placed, then sorted and deduplicated in each value's run.
+    let mut use_start = vec![0u32; n + 1];
     for &b in &order {
         let data = graph.block(b);
         for &node in &data.body {
-            for read in reads(graph, node) {
-                if value(read) {
-                    uses[read.index()].push(pos[node.index()]);
-                }
-            }
+            reads.each(node, |read| use_start[read.index() + 1] += 1);
         }
-        for &s in &data.succs {
-            for input in edge_inputs(b, s)? {
-                if value(input) {
-                    uses[input.index()].push(tail[b.index()]);
-                }
+        for k in 0..data.succs.len() {
+            for input in edges.of(b, k) {
+                use_start[input.index() + 1] += 1;
             }
         }
     }
-    for list in &mut uses {
-        list.sort_unstable();
-        list.dedup();
+    for v in 0..n {
+        use_start[v + 1] += use_start[v];
+    }
+    let mut use_end: Vec<u32> = use_start[..n].to_vec();
+    let mut uses = vec![0u32; use_start[n] as usize];
+    for &b in &order {
+        let data = graph.block(b);
+        for &node in &data.body {
+            let at = pos[node.index()];
+            reads.each(node, |read| {
+                uses[use_end[read.index()] as usize] = at;
+                use_end[read.index()] += 1;
+            });
+        }
+        for k in 0..data.succs.len() {
+            for input in edges.of(b, k) {
+                uses[use_end[input.index()] as usize] = tail[b.index()];
+                use_end[input.index()] += 1;
+            }
+        }
+    }
+    for v in 0..n {
+        let run = &mut uses[use_start[v] as usize..use_end[v] as usize];
+        run.sort_unstable();
+        let mut kept = 0;
+        for k in 0..run.len() {
+            if k == 0 || run[k] != run[kept - 1] {
+                run[kept] = run[k];
+                kept += 1;
+            }
+        }
+        use_end[v] = use_start[v] + kept as u32;
     }
     // The first read of `v` after `at`, or the end of its range (a read in a loop's next turn).
     let next_use = |v: NodeIx, at: u32| {
-        let list = &uses[v.index()];
+        let list = &uses[use_start[v.index()] as usize..use_end[v.index()] as usize];
         list.get(list.partition_point(|&p| p <= at))
             .copied()
             .unwrap_or(ranges[v.index()].1)
@@ -408,14 +598,8 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
 
     // The pass: a home at each definition, freed where the range ends.
     let mut homes = vec![Home::None; n];
-    let mut gp = Pool {
-        caller: file.gp_caller.to_vec(),
-        callee: file.gp_callee.to_vec(),
-    };
-    let mut fp = Pool {
-        caller: file.fp_caller.to_vec(),
-        callee: file.fp_callee.to_vec(),
-    };
+    let mut gp = Pool::of(file.gp_caller, file.gp_callee);
+    let mut fp = Pool::of(file.fp_caller, file.fp_callee);
     let mut free_slots: Vec<u32> = Vec::new();
     let mut spill_bytes = 0u32;
     let mut used_callee_gp: Vec<u8> = Vec::new();
@@ -427,10 +611,10 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         Class::Fp => file.fp_callee.contains(&r),
     };
     let release = |home: Home, gp: &mut Pool, fp: &mut Pool, free_slots: &mut Vec<u32>| match home {
-        Home::Gp(r) if file.gp_callee.contains(&r) => gp.callee.push(r),
-        Home::Gp(r) => gp.caller.push(r),
-        Home::Fp(r) if file.fp_callee.contains(&r) => fp.callee.push(r),
-        Home::Fp(r) => fp.caller.push(r),
+        Home::Gp(r) if file.gp_callee.contains(&r) => gp.callee |= 1 << r,
+        Home::Gp(r) => gp.caller |= 1 << r,
+        Home::Fp(r) if file.fp_callee.contains(&r) => fp.callee |= 1 << r,
+        Home::Fp(r) => fp.caller |= 1 << r,
         Home::Spill(offset) => free_slots.push(offset),
         Home::None | Home::Const => {}
     };
@@ -619,6 +803,7 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         spill_bytes,
         callee_saved_gp: used_callee_gp,
         fp_callee_across_effect,
+        live_index: std::cell::OnceCell::new(),
     })
 }
 
@@ -637,8 +822,10 @@ pub(crate) mod tests {
     }
 
     /// No two values whose ranges overlap share a register or a slot, values living across a
-    /// call have callee-saved homes or slots, and every read value has a home.
+    /// call have callee-saved homes or slots, every read value has a home, and `live_at`'s
+    /// index agrees with a scan of every range at each scheduled node.
     pub(crate) fn assert_consistent(graph: &Graph, alloc: &Allocation) {
+        assert_live_at_agrees(graph, alloc);
         let calls: Vec<u32> = graph
             .nodes
             .iter()
@@ -679,6 +866,21 @@ pub(crate) mod tests {
                 assert_ne!(alloc.homes[v], Home::None, "value {v} is read");
             }
         }
+    }
+
+    /// `live_at` (its index) and `live_at_scan` at each node the allocation scheduled.
+    pub(crate) fn assert_live_at_agrees(graph: &Graph, alloc: &Allocation) -> usize {
+        let mut values = 0;
+        for v in 0..graph.nodes.len() {
+            if alloc.pos[v] == u32::MAX {
+                continue;
+            }
+            let node = NodeIx(v as u32);
+            let live = alloc.live_at(node);
+            assert_eq!(live, alloc.live_at_scan(node), "live at node {v}");
+            values += live.len();
+        }
+        values
     }
 
     #[test]
@@ -834,6 +1036,89 @@ pub(crate) mod tests {
         assert_ne!(alloc.homes[fn_.index()], alloc.homes[next.index()]);
         assert_eq!(alloc.homes[zero.index()], Home::Const);
         assert_eq!(alloc.live_at(poll), vec![fn_, i]);
+    }
+
+    /// The index behind `live_at` (stage 2, step 10) answers as the scan it replaced: values in
+    /// caller-saved and callee-saved registers and in spill slots, ranges that end at the node
+    /// and ranges that start there, across an effect and through a loop.
+    #[test]
+    fn live_at_answers_as_a_scan_of_every_range() {
+        let count = 24u16;
+        let mut g = Graph::new(count as usize);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let body = g.add_block(2, false);
+        let exit = g.add_block(3, false);
+        g.entry = Some(entry);
+        g.add_edge(entry, header);
+        g.add_edge(header, body);
+        g.add_edge(header, exit);
+        g.add_edge(body, header);
+        let slots: Vec<NodeIx> = (0..count)
+            .map(|k| g.add_node(entry, NodeOp::EntrySlot(k), &[], Rep::Tagged, 0))
+            .collect();
+        let s = state(&mut g, 0, &[]);
+        let limit = g.add_node(entry, NodeOp::CheckNumber, &[slots[0]], Rep::F64, 0);
+        g.node_mut(limit).state = Some(s);
+        let zero = g.add_node(entry, NodeOp::ConstF64(0), &[], Rep::F64, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::F64, 1);
+        let ps = state(&mut g, 1, &[]);
+        let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
+        g.node_mut(poll).state = Some(ps);
+        let lt = g.add_node(header, NodeOp::F64Cmp(Cond::Lt), &[i, limit], Rep::Bool, 1);
+        g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: body,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            1,
+        );
+        // The body's effect keeps every slot across it.
+        let es = state(&mut g, 2, &slots);
+        let call = g.add_node(
+            body,
+            NodeOp::Effect {
+                pc: 2,
+                pops: 0,
+                pushes: 0,
+            },
+            &[],
+            Rep::None,
+            2,
+        );
+        g.node_mut(call).state = Some(es);
+        let one = g.add_node(body, NodeOp::ConstF64(1f64.to_bits()), &[], Rep::F64, 2);
+        let next = g.add_node(body, NodeOp::F64Add, &[i, one], Rep::F64, 2);
+        g.node_mut(i).inputs.push(next);
+        g.add_node(body, NodeOp::Jump(header), &[], Rep::None, 2);
+        let mut acc = slots[1];
+        for &v in &slots[2..] {
+            let same = g.add_node(exit, NodeOp::TaggedSame, &[acc, v], Rep::Bool, 3);
+            acc = g.add_node(exit, NodeOp::BoolToTagged, &[same], Rep::Tagged, 3);
+        }
+        g.add_node(exit, NodeOp::Return, &[acc], Rep::None, 3);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        let homes = |want: fn(Home) -> bool| alloc.homes.iter().any(|&home| want(home));
+        assert!(
+            homes(|home| matches!(home, Home::Spill(_))),
+            "some value spills"
+        );
+        assert!(homes(
+            |home| matches!(home, Home::Gp(r) if ARM64.gp_callee.contains(&r))
+        ));
+        assert!(homes(
+            |home| matches!(home, Home::Gp(r) if ARM64.gp_caller.contains(&r))
+        ));
+        assert!(assert_live_at_agrees(&g, &alloc) > 0);
+        assert_consistent(&g, &alloc);
+        // The effect's state reads every slot.
+        let mut live = alloc.live_at(call);
+        live.retain(|v| slots.contains(v));
+        assert_eq!(live, slots);
     }
 
     #[test]
