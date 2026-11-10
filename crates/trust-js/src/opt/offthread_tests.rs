@@ -30,6 +30,18 @@ fn asynchronous() -> TestSwitches {
     }
 }
 
+/// Set `asynchronous()`'s switches: whether this process compiles off the main thread with
+/// them, which takes a second CPU (`opt::asynchronous`): a test of the asynchronous path run on
+/// one CPU has nothing to test, and returns (`one_cpu_compiles_on_the_main_thread` tests that).
+fn asynchronous_here() -> bool {
+    asynchronous().set();
+    let here = super::asynchronous();
+    if !here {
+        eprintln!("one CPU: the tier compiles on the main thread, nothing asynchronous to test");
+    }
+    here
+}
+
 fn jit_engine() -> Engine {
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
@@ -123,7 +135,9 @@ const SQ: &str = "function sq(x) { return x * x + 1; }";
 
 #[test]
 fn a_function_gets_the_tiers_code_at_the_poll_after_its_compile_ends() {
-    asynchronous().set();
+    if !asynchronous_here() {
+        return;
+    }
     let mut engine = jit_engine();
     compiled();
     eval(&mut engine, SQ);
@@ -169,7 +183,9 @@ fn a_function_gets_the_tiers_code_at_the_poll_after_its_compile_ends() {
 
 #[test]
 fn a_result_whose_sites_a_discard_flagged_meanwhile_is_dropped_and_the_function_tiers_up_again() {
-    asynchronous().set();
+    if !asynchronous_here() {
+        return;
+    }
     let mut engine = jit_engine();
     compiled();
     dropped();
@@ -200,7 +216,9 @@ fn a_result_whose_sites_a_discard_flagged_meanwhile_is_dropped_and_the_function_
 
 #[test]
 fn a_result_after_a_recompile_was_published_meanwhile_is_dropped() {
-    asynchronous().set();
+    if !asynchronous_here() {
+        return;
+    }
     let mut engine = jit_engine();
     compiled();
     dropped();
@@ -234,7 +252,9 @@ fn a_result_after_a_recompile_was_published_meanwhile_is_dropped() {
 
 #[test]
 fn a_result_whose_chunk_was_superseded_meanwhile_is_dropped() {
-    asynchronous().set();
+    if !asynchronous_here() {
+        return;
+    }
     let mut engine = jit_engine();
     compiled();
     dropped();
@@ -265,7 +285,9 @@ fn a_result_whose_chunk_was_superseded_meanwhile_is_dropped() {
 
 #[test]
 fn a_result_whose_function_was_collected_meanwhile_is_dropped() {
-    asynchronous().set();
+    if !asynchronous_here() {
+        return;
+    }
     let mut engine = jit_engine();
     compiled();
     dropped();
@@ -295,7 +317,9 @@ fn a_result_whose_function_was_collected_meanwhile_is_dropped() {
 #[test]
 fn an_engine_dropped_with_compiles_pending_cancels_them() {
     use std::sync::atomic::Ordering;
-    asynchronous().set();
+    if !asynchronous_here() {
+        return;
+    }
     let cancelled = super::compiler::TEST_CANCELLED.load(Ordering::Relaxed);
     for _ in 0..4 {
         let mut engine = jit_engine();
