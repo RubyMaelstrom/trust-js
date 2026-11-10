@@ -454,6 +454,7 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::t
             "the main"
         },
         compiled: finished.elapsed,
+        needed: std::time::Duration::ZERO,
         waited: std::time::Duration::ZERO,
         snapshot: started,
         runs: 1,
@@ -469,6 +470,9 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::t
 struct Timing {
     thread: &'static str,
     compiled: std::time::Duration,
+    /// The part of `compiled` its runs before the last spent: the runs that found stubs or atoms
+    /// missing.
+    needed: std::time::Duration,
     waited: std::time::Duration,
     snapshot: std::time::Instant,
     runs: u32,
@@ -480,6 +484,7 @@ impl Timing {
         Timing {
             thread: "the main",
             compiled: elapsed,
+            needed: std::time::Duration::ZERO,
             waited: std::time::Duration::ZERO,
             snapshot: started,
             runs: 0,
@@ -487,7 +492,8 @@ impl Timing {
     }
 
     /// The log's fields after a compile line's own: `on <thread> thread, queued <ms> ms,
-    /// installed <ms> ms after its snapshot` (and `, <n> runs` past one).
+    /// installed <ms> ms after its snapshot` (and, past one run, `, <n> runs, <ms> ms before the
+    /// last`: the time of the runs that found stubs or atoms missing).
     fn fields(&self) -> String {
         format!(
             "on {} thread, queued {:.3} ms, installed {:.3} ms after its snapshot{}",
@@ -495,7 +501,11 @@ impl Timing {
             self.waited.as_secs_f64() * 1e3,
             self.snapshot.elapsed().as_secs_f64() * 1e3,
             if self.runs > 1 {
-                format!(", {} runs", self.runs)
+                format!(
+                    ", {} runs, {:.3} ms before the last",
+                    self.runs,
+                    self.needed.as_secs_f64() * 1e3
+                )
             } else {
                 String::new()
             }
@@ -962,6 +972,7 @@ fn start_job(
         let timing = Timing {
             thread: "the main",
             compiled: finished.elapsed,
+            needed: std::time::Duration::ZERO,
             waited: std::time::Duration::ZERO,
             snapshot: started,
             runs: 1,
@@ -990,6 +1001,7 @@ fn start_job(
         timing: Timing {
             thread: "the compile",
             compiled: std::time::Duration::ZERO,
+            needed: std::time::Duration::ZERO,
             waited: std::time::Duration::ZERO,
             snapshot: started,
             runs: 0,
@@ -1080,6 +1092,7 @@ fn install_one(
         timing.runs += 1;
     }
     if let Outcome::Needs { stubs } = &finished.outcome {
+        i.opt_pending.jobs[at].timing.needed += finished.elapsed;
         let stubs = stubs.clone();
         let chunk = i.opt_pending.jobs[at].chunk.clone();
         let timer = main_thread_timer();
