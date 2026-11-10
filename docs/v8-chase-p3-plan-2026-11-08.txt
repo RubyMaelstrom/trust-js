@@ -2695,3 +2695,77 @@ load the entry through the callee's dispatch handle (codegen/arm64/macro-assembl
 LoadEntrypointFromJSDispatchTable), and SpiderMonkey's load the callee script's jitCodeRaw (its
 header word, vm/JSScript.h:1761). Which of these TRust takes is a design item after step 15, with
 the probes' floor of one instruction.
+
+The owner's answers (2026-11-11): "JSC's form for step 13 is approved, as is your recommendation
+for refilling each thread from its own pages." Step 13 lands as option (c) with the cheaper due
+path, rebased onto step 14 (its agent builds that version now). The shell allocator's fix is
+designed below.
+
+The shell allocator's spans (design, 2026-11-11; input: the interim session's CodeLoad finding,
+target/p3/stage2/codeload-diag). fastalloc::ClassAlloc, the engine shell's global allocator (the
+library registers none; the test262 runner and the difftest keep their own, and the runtime's CLI
+uses the system's), keeps a per-thread intrusive free list for each 16-byte class up to 1 KiB,
+capped at 256 KiB a class, and takes every miss from the system and gives every overflow back to
+it, one call a block. Once the compile thread exists, glibc takes its locking path on each of
+those calls: CodeLoad's parse bursts make about 210,000 such allocations and 210,000 such frees a
+5-run fixed set, and an idle second thread alone costs the tier-off engine +10.1% cycles there.
+JSC's libpas never takes a lock per small block: a thread's local allocator for a size class
+allocates from a page it holds, by bump or from a copy of the page's free bits
+(pas_local_allocator.h:60-80), and takes another page from the size class's directory when that
+one is spent (pas_local_allocator_refill_with_known_config, pas_local_allocator_inlines.h:444);
+a thread's frees go to a thread-local deallocation log (pas_thread_local_cache.h:57-63, appended
+at 389-403; 100 entries, pas_internal_config.h:91), flushed to their pages in batches; a scavenger
+decommits empty pages every 100 ms (pas_scavenger.c:70; pas_segregated_page_take_empty_granules,
+pas_segregated_page.c:316). The design takes that shape:
+1. Unchanged: the per-thread lists and their pop and push (the fast paths), the 16-byte classes up
+   to 1 KiB, the 256 KiB cap a class, large and over-aligned blocks from the system, realloc
+   within a class for free, alloc_zeroed clearing class blocks, the exit drain, trim after a
+   major collection (gc_collect's reclaimed >= 50,000).
+2. Spans: class blocks come from 64 KiB spans at 64 KiB boundaries, each of one class, carved from
+   2 MiB segments mapped from the OS (the collector's os_pages: mmap, VirtualAlloc on Windows),
+   never from the system allocator. A span's header, in its first 64 bytes, holds its class, the
+   list of its blocks returned to it, its bump cursor over blocks never handed out, the count of
+   its blocks out (in use or in a thread's list) and its links in its class's list of spans with
+   free blocks.
+3. A thread's miss: its list empty, it takes blocks from its own bump region of the class (a span
+   tail it holds, as libpas's local allocator holds a page's bump region), carving one block a
+   miss with nothing to lock; with no region left it refills under the class's lock: from the
+   class's first span with free blocks, that span's whole returned list into the thread's list and
+   its bump tail as the thread's region, else a span from the empty pool or a new segment. One
+   lock round trip per span's worth of blocks.
+4. A thread's overflow: a free that finds the thread's list at its cap returns a batch, the colder
+   part of the list (bounded in bytes, a quarter to a half of the cap; the step says which and
+   why), to their spans under the class's lock, each onto its span's returned list (the span
+   found by masking the address), its out count down; a span with blocks again joins its class's
+   list; a span whose count reaches zero leaves it for the empty pool. One lock round trip per
+   batch, as libpas's log flush.
+5. Memory back to the OS: empty spans wait in a pool for any class; trim, after a major
+   collection, returns the thread's lists to their spans and discards the empty pool's memory
+   (madvise MADV_DONTNEED on Linux, keeping the mapping: it reads as zero when reused; the other
+   systems' equivalents where the collector has them), and the pool beyond a committed bound is
+   discarded at once. Where libpas's scavenger decommits on a timer, the engine has a natural
+   point already, its major collections, and no thread of its own for a timer.
+6. Threads: a block freed on another thread joins that thread's list, as today, and goes back to
+   its span at that thread's overflow, trim or exit; spans are global, under their class's lock,
+   so ownership needs nothing more. A thread's exit returns its lists and its bump regions to
+   their spans; a free after that goes to its span at once.
+7. The allocator never allocates (its lists and spans are intrusive, its locks std's const-built
+   mutexes, its memory mapped directly), so no path re-enters it.
+Expected: no class block reaches glibc, so the compile thread's existence no longer changes their
+cost (CodeLoad's +10.66% with the tier on; about 4% of its blocks are over 1 KiB and still go to
+the system), and the burst pattern costs a lock round trip per batch where it cost a malloc or
+free per block (deepening glibc's tcache, the nearest stand-in, gave CodeLoad -3.3% single-
+threaded). Risks: class-segregated spans cannot lend memory across classes as malloc's heap
+does, so a span pinned by a few live blocks holds its memory (peak and post-trim RSS measured
+against main on the fixtures and Octane, Splay, TypeScript, PdfJS, CodeLoad and zlib among them,
+with fresh copies of both binaries and an empty-script control); a burst at a class's lock while
+another thread holds it (the compile thread's own classes rarely meet the main thread's at the
+same moment). Tests: the allocator's own (the classes' blocks from spans, the bump region, the
+refill and overflow batches, the returned lists, an emptied span to the pool and its reuse by
+another class, trim's discard and the memory reading zero after it, cross-thread frees, a
+thread's exit, frees after exit, alloc_zeroed, realloc across classes, a randomized
+multi-threaded stress with contents checked); the shell's tests; the x86-64 and Windows checks.
+Measured: CodeLoad's fixed runs (tier off and on, alone and with the idle-thread shim, cycles
+and instructions), the calls that still reach glibc (codeload-diag's malloc-hist.so), Octane's
+fixed runs, the fixtures' measured passes and passes 2-10, peak and post-trim RSS; the two-CPU
+session reads the bar.
