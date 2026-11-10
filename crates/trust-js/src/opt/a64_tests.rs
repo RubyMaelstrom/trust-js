@@ -53,6 +53,20 @@ fn chunk_of(engine: &mut Engine, name: &str) -> Rc<Chunk> {
         .expect("the function ran as bytecode")
 }
 
+/// `compile_with` on a graph built by hand, with the chunk's own Cfg and initialized reads, as a
+/// build hands them over.
+fn compile_graph(
+    chunk: &Chunk,
+    graph: &Graph,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    options: Options,
+) -> Result<Rc<JitCode>, Refusal> {
+    let cfg = crate::jit_ir::Cfg::build(chunk).expect("the chunk's stack depths settle");
+    let initialized = cfg.initialized_reads(chunk.jit_ops(), true);
+    crate::opt::a64::compile_with(chunk, graph, &cfg, initialized, layout, ilayout, options)
+}
+
 /// Generate `graph`'s code for `name`'s chunk, install it as the chunk's native code and move the
 /// engine to the JIT tier, whose entries then run it.
 fn install(engine: &mut Engine, name: &str, graph: &Graph, options: Options) -> Rc<JitCode> {
@@ -61,7 +75,7 @@ fn install(engine: &mut Engine, name: &str, graph: &Graph, options: Options) -> 
     crate::opt::regalloc::tests::assert_consistent(graph, &alloc);
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
     let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
-    let code = crate::opt::a64::compile_with(&chunk, graph, &layout, &ilayout, options)
+    let code = compile_graph(&chunk, graph, &layout, &ilayout, options)
         .unwrap_or_else(|refusal| panic!("the tier refused {name}: {refusal:?}"));
     chunk
         .jit
@@ -1412,9 +1426,7 @@ fn a_spliced_callees_guard_exits_when_the_callee_changes() {
     assert!(matches!(inlined.jit_ops()[2], Op::InlineGuard(0, 13)));
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
     let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
-    let code =
-        crate::opt::a64::compile_with(&inlined, &via_leaf(), &layout, &ilayout, Options::default())
-            .unwrap();
+    let code = compile_graph(&inlined, &via_leaf(), &layout, &ilayout, Options::default()).unwrap();
     inlined.jit.begin_compile().unwrap().commit(Some(code));
     assert!(func.runtime().code2.set(Some(inlined)).is_ok());
     exits();
@@ -2239,7 +2251,7 @@ fn malformed_graphs_are_refused() {
     let header = graph.blocks[1].body.remove(0);
     graph.nodes[header.index()].op = NodeOp::I32Not;
     assert_eq!(
-        crate::opt::a64::compile_with(&chunk, &graph, &layout, &ilayout, Options::default())
+        compile_graph(&chunk, &graph, &layout, &ilayout, Options::default())
             .err()
             .map(|refusal| refusal.reason),
         Some("a loop header without a poll")
@@ -2261,7 +2273,7 @@ fn malformed_graphs_are_refused() {
         ExitReason::Forced,
     );
     assert!(
-        crate::opt::a64::compile_with(&chunk, &b.g, &layout, &ilayout, Options::default()).is_err(),
+        compile_graph(&chunk, &b.g, &layout, &ilayout, Options::default()).is_err(),
         "an effect on a branch"
     );
 }

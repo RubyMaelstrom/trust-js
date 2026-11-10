@@ -731,7 +731,9 @@ fn primitive_at(chunk: &crate::bytecode::Chunk, pc: usize) -> u8 {
 fn stays_an_effect(chunk: &crate::bytecode::Chunk, pc: usize) -> bool {
     use super::ir::NodeOp;
     let snapshot = super::snapshot::Snapshot::take(chunk);
-    let graph = super::build::build(chunk, &snapshot).expect("the tier builds it");
+    let graph = super::build::build(chunk, &snapshot)
+        .expect("the tier builds it")
+        .graph;
     !graph
         .nodes
         .iter()
@@ -950,7 +952,9 @@ fn converges_with(
 
 /// The tier's graph of `chunk` as a compile would build it now.
 fn graph_now(chunk: &Chunk) -> super::ir::Graph {
-    super::build::build(chunk, &super::snapshot::Snapshot::take(chunk)).expect("built")
+    super::build::build(chunk, &super::snapshot::Snapshot::take(chunk))
+        .expect("built")
+        .graph
 }
 
 /// The global `name`'s object, its shape made one no cache way takes, as a map's past the

@@ -78,9 +78,21 @@ const UNREACHED: u32 = u32::MAX;
 /// a location word that fits a cache's 15 bits names a lower slot anyway).
 const MAX_FIELD_SLOT: u32 = 4096;
 
-/// The graph of `chunk` from its operations and `snapshot` (its feedback), or why the tier
-/// declines it.
-pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Graph, Refusal> {
+/// A chunk's graph and the analyses of the chunk its build made, which the verifier and the back
+/// end take from it rather than making them again (stage 2, step 10), as Maglev's graph builder
+/// keeps the one BytecodeAnalysis it made (maglev/maglev-graph-builder.h:1775-1777, 1818).
+pub(crate) struct Built {
+    pub(crate) graph: Graph,
+    /// The chunk's Cfg: its blocks and the operand-stack depth at each pc.
+    pub(crate) cfg: Cfg,
+    /// The local reads its stack analysis proves initialized (`Cfg::initialized_reads`), whose
+    /// TDZ tests the builder and the effects' templates leave out.
+    pub(crate) initialized: InitializedReads,
+}
+
+/// The graph of `chunk` from its operations and `snapshot` (its feedback), with the analyses it
+/// was built from, or why the tier declines it.
+pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Built, Refusal> {
     let ops = chunk.jit_ops();
     if chunk.jit_is_resumable() {
         return Err(Refusal::whole("resumable (a generator or an async body)"));
@@ -114,20 +126,27 @@ pub(crate) fn build(chunk: &Chunk, snapshot: &Snapshot) -> Result<Graph, Refusal
         return Err(Refusal::whole("a frame over the record's 256 words"));
     }
     let initialized = cfg.initialized_reads(ops, true);
-    let rules = Rules {
-        chunk,
-        ops,
-        snapshot,
-        cfg: &cfg,
-        initialized: &initialized,
+    let graph = {
+        let rules = Rules {
+            chunk,
+            ops,
+            snapshot,
+            cfg: &cfg,
+            initialized: &initialized,
+        };
+        let flow = Flow::new(chunk, &cfg, &rules)?;
+        let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
+        let (mut graph, notes) =
+            Builder::new(chunk, snapshot, &cfg, &flow, &initialized, &liveness).run()?;
+        // The phis' representations, after the build (stage 2 step 6).
+        super::phis::select(&mut graph, &notes, snapshot);
+        graph
     };
-    let flow = Flow::new(chunk, &cfg, &rules)?;
-    let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
-    let (mut graph, notes) =
-        Builder::new(chunk, snapshot, &cfg, &flow, &initialized, &liveness).run()?;
-    // The phis' representations, after the build (stage 2 step 6).
-    super::phis::select(&mut graph, &notes, snapshot);
-    Ok(graph)
+    Ok(Built {
+        graph,
+        cfg,
+        initialized,
+    })
 }
 
 /// Why stage 1 refuses a chunk holding `op` (the Stage 1 record's list).

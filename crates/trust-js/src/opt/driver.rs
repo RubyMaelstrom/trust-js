@@ -306,7 +306,13 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
     let compiled = (|| {
         // The global names resolve in the running realm (stage 2, step 4).
         let snapshot = snapshot::Snapshot::take_in(chunk, Some(&*i));
-        let graph = build::build(chunk, &snapshot)?;
+        // The graph, and the chunk's Cfg and initialized reads, made once for the verifier and
+        // the back end too.
+        let build::Built {
+            graph,
+            cfg,
+            initialized,
+        } = build::build(chunk, &snapshot)?;
         if log_enabled() {
             for decline in &graph.declines {
                 eprintln!(
@@ -321,7 +327,7 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
         if verifies() {
             #[cfg(test)]
             TEST_VERIFIED.with(|verified| verified.set(verified.get() + 1));
-            if let Err(message) = verify::verify(&graph, chunk) {
+            if let Err(message) = verify::verify(&graph, chunk, &cfg) {
                 if cfg!(any(test, debug_assertions)) {
                     panic!(
                         "the tier's graph of {} fails verification: {message}",
@@ -344,7 +350,14 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
         if !crate::jit::ensure_executable_capacity(0) {
             return Err(Refusal::whole("no executable capacity"));
         }
-        let code = a64::compile(chunk, &graph, &layout, &i.interp_layout.get())?;
+        let code = a64::compile(
+            chunk,
+            &graph,
+            &cfg,
+            initialized,
+            &layout,
+            &i.interp_layout.get(),
+        )?;
         pin_global_environment(i, &graph);
         Ok((graph.nodes.len(), code))
     })();

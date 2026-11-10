@@ -27,10 +27,9 @@ use crate::bytecode::{Chunk, Op};
 use crate::jit_ir::Cfg;
 
 /// Whether `graph`, built from `chunk`, holds the invariants the back end relies on; the first
-/// violation found otherwise.
-pub(crate) fn verify(graph: &Graph, chunk: &Chunk) -> Result<(), String> {
+/// violation found otherwise. `cfg` is the chunk's, as its build made it (`build::Built`).
+pub(crate) fn verify(graph: &Graph, chunk: &Chunk, cfg: &Cfg) -> Result<(), String> {
     let ops = chunk.jit_ops();
-    let cfg = Cfg::build(chunk).map_err(|error| format!("the chunk's stack analysis: {error}"))?;
     let (_, n_slots) = chunk.jit_frame();
     if graph.n_slots != n_slots {
         return Err(format!(
@@ -118,9 +117,9 @@ pub(crate) fn verify(graph: &Graph, chunk: &Chunk) -> Result<(), String> {
     }
     // The builder's liveness again, where its cost is a test's or a debug build's.
     let liveness =
-        cfg!(any(test, debug_assertions)).then(|| SlotLiveness::compute(ops, &cfg, n_slots));
+        cfg!(any(test, debug_assertions)).then(|| SlotLiveness::compute(ops, cfg, n_slots));
     for (index, frame) in graph.states.iter().enumerate() {
-        frame_state(graph, frame, ops, &cfg, n_slots, liveness.as_ref())
+        frame_state(graph, frame, ops, cfg, n_slots, liveness.as_ref())
             .map_err(|what| format!("frame state {index} (pc {}): {what}", frame.pc))?;
     }
     Ok(())

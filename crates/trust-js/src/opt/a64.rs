@@ -97,20 +97,33 @@ impl Options {
     }
 }
 
-/// Generate `graph`'s code for `chunk` (the switches' options).
+/// Generate `graph`'s code for `chunk` (the switches' options), from the chunk's Cfg and
+/// initialized reads as its build made them (`build::Built`).
 pub(crate) fn compile(
     chunk: &Chunk,
     graph: &Graph,
+    cfg: &crate::jit_ir::Cfg,
+    initialized: crate::jit_ir::InitializedReads,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
 ) -> Result<Rc<JitCode>, Refusal> {
-    compile_with(chunk, graph, layout, ilayout, Options::from_env())
+    compile_with(
+        chunk,
+        graph,
+        cfg,
+        initialized,
+        layout,
+        ilayout,
+        Options::from_env(),
+    )
 }
 
-/// Generate `graph`'s code for `chunk` with `options`.
+/// Generate `graph`'s code for `chunk` with `options` (see [`compile`]).
 pub(crate) fn compile_with(
     chunk: &Chunk,
     graph: &Graph,
+    cfg: &crate::jit_ir::Cfg,
+    initialized: crate::jit_ir::InitializedReads,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
     options: Options,
@@ -125,9 +138,7 @@ pub(crate) fn compile_with(
     if chunk.jit_is_resumable() {
         return Err(Refusal::whole("a resumable chunk"));
     }
-    let cfg = crate::jit_ir::Cfg::build(chunk)
-        .map_err(|_| Refusal::whole("the chunk's stack depths do not settle"))?;
-    check_graph(chunk, graph, &cfg)?;
+    check_graph(chunk, graph, cfg)?;
     if !words_inlinable(layout) && graph.nodes.iter().any(|node| reads_words(&node.op)) {
         return Err(Refusal::whole(
             "element words in a layout the code cannot address",
@@ -145,7 +156,17 @@ pub(crate) fn compile_with(
     }
     let alloc = regalloc::allocate(graph, &regalloc::ARM64)?;
     let frame = entry_frame(&alloc)?;
-    let mut gen = Gen::new(chunk, graph, alloc, layout, ilayout, cfg, options, frame);
+    let mut gen = Gen::new(
+        chunk,
+        graph,
+        alloc,
+        layout,
+        ilayout,
+        cfg,
+        initialized,
+        options,
+        frame,
+    );
     gen.emit()?;
     gen.finish()
 }
@@ -465,7 +486,7 @@ struct Gen<'a> {
     alloc: Allocation,
     layout: &'a crate::value::JitLayout,
     ilayout: &'a crate::interpreter::InterpLayout,
-    cfg: crate::jit_ir::Cfg,
+    cfg: &'a crate::jit_ir::Cfg,
     options: Options,
     frame: EntryFrame,
     blocks: Vec<usize>,
@@ -499,7 +520,8 @@ impl<'a> Gen<'a> {
         alloc: Allocation,
         layout: &'a crate::value::JitLayout,
         ilayout: &'a crate::interpreter::InterpLayout,
-        cfg: crate::jit_ir::Cfg,
+        cfg: &'a crate::jit_ir::Cfg,
+        initialized: crate::jit_ir::InitializedReads,
         options: Options,
         frame: EntryFrame,
     ) -> Self {
@@ -509,7 +531,7 @@ impl<'a> Gen<'a> {
         a.set_first_stage(!chunk.jit_second_stage());
         a.set_fixed_activation(chunk.jit_fixed_activation());
         if !env_flag!("TRUST_JS_JIT_NO_TDZ_PROOF") {
-            a.set_initialized_reads(cfg.initialized_reads(ops, true));
+            a.set_initialized_reads(initialized);
         }
         let fast = template_mask(chunk);
         let blocks = (0..graph.blocks.len()).map(|_| a.new_label()).collect();

@@ -4,7 +4,6 @@
 use super::build::build;
 use super::ir::*;
 use super::snapshot::{fingerprint, Ran, Snapshot};
-use super::verify::verify;
 use crate::bytecode::{Chunk, Op, Tier};
 use crate::feedback::SiteView;
 use crate::value::{ObjectKind, Value, ValueView, PACK_EMPTY, PACK_NULL, PACK_UNDEFINED};
@@ -126,12 +125,20 @@ fn dump(graph: &Graph, chunk: &Chunk) -> String {
     out
 }
 
+/// The verifier on `graph` with `chunk`'s own Cfg, as its build hands it over (a graph a test
+/// built or broke by hand has none).
+fn verify(graph: &Graph, chunk: &Chunk) -> Result<(), String> {
+    let cfg = crate::jit_ir::Cfg::build(chunk).expect("the chunk's stack depths settle");
+    super::verify::verify(graph, chunk, &cfg)
+}
+
 /// The verified graph of `chunk`.
 fn graph_for(chunk: &Chunk, name: &str) -> Graph {
     let snapshot = Snapshot::take(chunk);
-    let graph = build(chunk, &snapshot)
+    let built = build(chunk, &snapshot)
         .unwrap_or_else(|refusal| panic!("{name}: {refusal:?}\n{:#?}", chunk.jit_ops()));
-    if let Err(error) = verify(&graph, chunk) {
+    let graph = built.graph;
+    if let Err(error) = super::verify::verify(&graph, chunk, &built.cfg) {
         panic!("{name}: {error}\n{}", dump(&graph, chunk));
     }
     // Blocks in reverse postorder: the entry first, and only a loop's back edges go backward.
@@ -162,7 +169,7 @@ fn refusal_of(engine: &mut Engine, name: &str) -> Refusal {
     let chunk = chunk_of(engine, name);
     let snapshot = Snapshot::take(&chunk);
     match build(&chunk, &snapshot) {
-        Ok(graph) => panic!("{name} was built\n{}", dump(&graph, &chunk)),
+        Ok(built) => panic!("{name} was built\n{}", dump(&built.graph, &chunk)),
         Err(refusal) => refusal,
     }
 }
@@ -187,6 +194,43 @@ fn pc_of(chunk: &Chunk, which: impl Fn(&Op) -> bool) -> usize {
         .collect();
     assert_eq!(pcs.len(), 1, "one such operation: {:?}", chunk.jit_ops());
     pcs[0]
+}
+
+/// A build hands over the analyses it made of the chunk (stage 2, step 10), which the verifier
+/// and the back end take in place of making their own: the chunk's Cfg, and the local reads its
+/// stack analysis proves initialized, as fresh ones say.
+#[test]
+fn a_build_hands_over_the_chunks_cfg_and_initialized_reads() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function tdz(n) { let s = 0; for (let i = 0; i < n; i++) { const d = i * 2; s = s + d; }
+                           return s; }
+         for (var k = 0; k < 20; k++) tdz(k);",
+    );
+    let chunk = chunk_of(&mut engine, "tdz");
+    let built = build(&chunk, &Snapshot::take(&chunk)).expect("the tier builds tdz");
+    let ops = chunk.jit_ops();
+    let cfg = crate::jit_ir::Cfg::build(&chunk).expect("the chunk's stack depths settle");
+    let reads = cfg.initialized_reads(ops, true);
+    assert_eq!(built.cfg.jit_stack_capacity(), cfg.jit_stack_capacity());
+    for pc in 0..ops.len() {
+        assert_eq!(
+            built.cfg.stack_depth_at(pc),
+            cfg.stack_depth_at(pc),
+            "pc {pc}"
+        );
+        assert_eq!(
+            built.initialized.contains(pc),
+            reads.contains(pc),
+            "pc {pc}"
+        );
+    }
+    assert!(
+        (0..ops.len()).any(|pc| built.initialized.contains(pc)),
+        "some read of a binding is proven initialized: {ops:#?}"
+    );
+    super::verify::verify(&built.graph, &chunk, &built.cfg).expect("the graph holds");
 }
 
 #[test]
@@ -2982,9 +3026,10 @@ fn a_store_ends_its_slots_facts_on_every_record() {
 /// the driver's compiles take it.
 fn graph_in(engine: &Engine, chunk: &Chunk, name: &str) -> Graph {
     let snapshot = Snapshot::take_in(chunk, Some(&engine.interp));
-    let graph = build(chunk, &snapshot)
+    let built = build(chunk, &snapshot)
         .unwrap_or_else(|refusal| panic!("{name}: {refusal:?}\n{:#?}", chunk.jit_ops()));
-    if let Err(error) = verify(&graph, chunk) {
+    let graph = built.graph;
+    if let Err(error) = super::verify::verify(&graph, chunk, &built.cfg) {
         panic!("{name}: {error}\n{}", dump(&graph, chunk));
     }
     graph
