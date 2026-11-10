@@ -65,6 +65,8 @@ thread_local! {
     /// among them.
     pub(crate) static TEST_WAITS: std::cell::RefCell<Vec<(usize, u8)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The graphs the verifier checked on this thread (`generate`).
+    pub(crate) static TEST_VERIFIED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -89,6 +91,24 @@ pub(crate) fn enabled() -> bool {
         return switches.on;
     }
     matches!(env_value!("TRUST_JS_OPT"), Some(v) if v != "0")
+}
+
+/// Whether the tier verifies the graphs it builds (`verify`, stage 2 step 10): in debug builds
+/// and the library's tests, and in release builds only under TRUST_JS_OPT_VERIFY=1, as Maglev
+/// verifies only #ifdef DEBUG (VerifyGraph, maglev/maglev-compiler.cc:74-80), SpiderMonkey's
+/// AssertGraphCoherency is empty without DEBUG (jit/MIRGraph.cpp:1812-1822) and JSC validates
+/// with assertions or its validateGraph option, false by default (validationEnabled,
+/// dfg/DFGCommon.h:88-95). A release build otherwise spends none of its compile time on it.
+pub(crate) fn verifies() -> bool {
+    verifies_in(
+        cfg!(any(test, debug_assertions)),
+        env_flag!("TRUST_JS_OPT_VERIFY"),
+    )
+}
+
+/// [`verifies`] in a build with or without debug assertions, TRUST_JS_OPT_VERIFY set or not.
+pub(crate) fn verifies_in(debug: bool, switch: bool) -> bool {
+    debug || switch
 }
 
 /// TRUST_JS_OPT_LOG: one stderr line per compile (its time and code range), refusal (with its
@@ -277,10 +297,10 @@ fn name(chunk: &Chunk) -> String {
 }
 
 /// The tier's code for `chunk`: its snapshot (the exit profile's declines among its feedback),
-/// its graph, the graph's verification, the ARM64 code. Logs the compile with its time and code
-/// range, each decline, or the refusal with its reason and pc, under TRUST_JS_OPT_LOG; a graph
-/// the verifier rejects is the builder's bug, which panics in tests and debug builds and is
-/// refused otherwise.
+/// its graph, the graph's verification where the build verifies (`verifies`), the ARM64 code.
+/// Logs the compile with its time and code range, each decline, or the refusal with its reason
+/// and pc, under TRUST_JS_OPT_LOG; a graph the verifier rejects is the builder's bug, which
+/// panics in tests and debug builds and is refused otherwise.
 fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
     let started = std::time::Instant::now();
     let compiled = (|| {
@@ -298,17 +318,21 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<Rc<JitCode>> {
                 );
             }
         }
-        if let Err(message) = verify::verify(&graph, chunk) {
-            if cfg!(any(test, debug_assertions)) {
-                panic!(
-                    "the tier's graph of {} fails verification: {message}",
-                    name(chunk)
-                );
+        if verifies() {
+            #[cfg(test)]
+            TEST_VERIFIED.with(|verified| verified.set(verified.get() + 1));
+            if let Err(message) = verify::verify(&graph, chunk) {
+                if cfg!(any(test, debug_assertions)) {
+                    panic!(
+                        "the tier's graph of {} fails verification: {message}",
+                        name(chunk)
+                    );
+                }
+                if log_enabled() {
+                    eprintln!("[opt] verify {} failed: {message}", name(chunk));
+                }
+                return Err(Refusal::whole("the graph fails verification"));
             }
-            if log_enabled() {
-                eprintln!("[opt] verify {} failed: {message}", name(chunk));
-            }
-            return Err(Refusal::whole("the graph fails verification"));
         }
         let layout = *i
             .jit_layout

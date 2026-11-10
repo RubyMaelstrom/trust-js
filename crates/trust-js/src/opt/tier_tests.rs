@@ -302,6 +302,39 @@ fn results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits() {
     );
 }
 
+/// The verifier's switch (stage 2, step 10): a debug build verifies every graph the tier builds,
+/// a release build only under TRUST_JS_OPT_VERIFY=1, and the library's tests always.
+#[test]
+fn a_release_build_verifies_only_under_its_switch() {
+    assert!(super::verifies_in(true, false), "a debug build verifies");
+    assert!(super::verifies_in(true, true));
+    assert!(
+        !super::verifies_in(false, false),
+        "a release build without TRUST_JS_OPT_VERIFY does not"
+    );
+    assert!(
+        super::verifies_in(false, true),
+        "a release build under TRUST_JS_OPT_VERIFY=1 does"
+    );
+    assert!(super::verifies(), "the library's tests verify");
+}
+
+/// In the library's tests the tier verifies the graph of each function it compiles.
+#[test]
+fn the_tier_verifies_each_graph_it_compiles_in_the_tests() {
+    let expected = run(Tier::Bytecode, PROGRAMS[0]);
+    super::TEST_VERIFIED.with(|verified| verified.set(0));
+    compiled();
+    assert_eq!(with_switches(eager(), PROGRAMS[0]), expected);
+    let compiles = compiled().len();
+    let verified = super::TEST_VERIFIED.with(std::cell::Cell::get);
+    assert!(compiles > 0, "the tier compiled sum");
+    assert!(
+        verified >= compiles,
+        "{verified} graphs verified for {compiles} compiles"
+    );
+}
+
 fn second_stage(engine: &mut Engine, name: &str) -> Option<std::rc::Rc<crate::bytecode::Chunk>> {
     let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok()?;

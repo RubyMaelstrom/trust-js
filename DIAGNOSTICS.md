@@ -87,6 +87,10 @@ comment/example in the same change.
   forced exits neither count toward the limit nor flag anything.
   `TRUST_JS_OPT_EXIT_LIMIT=N` (a positive N) sets the limit's base in place of 100: 1 discards
   each code at its first exit, the configuration that cycles reoptimization.
+  `TRUST_JS_OPT_VERIFY=1` verifies each graph the tier builds in a release build (its SSA
+  dominance, representations, frame states and terminators) and refuses a graph that fails,
+  logging why under `TRUST_JS_OPT_LOG`; debug builds and the library's tests always verify, and
+  panic at a failure (Maglev, SpiderMonkey and JSC verify their graphs in debug builds only).
   `TRUST_JS_OPT_NO_REOPT=1` keeps stage 1's fallback for good: a discard flags nothing, adds
   nothing to R and arms no recompile. `TRUST_JS_OPT_NO_EXIT_PROFILE=1` flags nothing, so that
   recompiles decline nothing (the feedback alone guides them). `TRUST_JS_OPT_LOG=1` prints one
