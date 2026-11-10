@@ -233,6 +233,37 @@ fn a_result_after_a_recompile_was_published_meanwhile_is_dropped() {
 }
 
 #[test]
+fn a_result_whose_chunk_was_superseded_meanwhile_is_dropped() {
+    asynchronous().set();
+    let mut engine = jit_engine();
+    compiled();
+    dropped();
+    eval(&mut engine, SQ);
+    let (_, hold) = until_pending(&mut engine, "sq");
+    let first = first_stage(&mut engine, "sq");
+    // Another compile of the function supersedes the first stage the compile started from.
+    {
+        let value = function(&mut engine, "sq");
+        let object = value.as_obj().unwrap();
+        let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+            unreachable!()
+        };
+        let other = crate::bytecode::compile(&user.func).expect("a chunk");
+        let runtime = user.func.runtime();
+        let genv = crate::interpreter::Env::as_ptr(&engine.interp.global_env) as usize;
+        assert!(runtime.publish(&runtime.code2, other, genv));
+    }
+    assert!(first.superseded());
+    drop(hold);
+    wait_finished(&engine);
+    call(&mut engine, "sq", 2.0);
+    let drops = dropped();
+    assert_eq!(drops.len(), 1, "{drops:?}");
+    assert_eq!(drops[0].1, "its chunk was superseded");
+    assert!(compiled().is_empty());
+}
+
+#[test]
 fn a_result_whose_function_was_collected_meanwhile_is_dropped() {
     asynchronous().set();
     let mut engine = jit_engine();
