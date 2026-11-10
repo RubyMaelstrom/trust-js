@@ -106,7 +106,12 @@ comment/example in the same change.
   after it finished installs it (a function's second stage is published then: until then the
   function runs the code it has). The install drops a result whose realm no longer runs, whose
   exit profile a discard changed, whose function was collected or whose chunk was superseded or
-  published over meanwhile, and the function tiers up again. `TRUST_JS_OPT_SYNC=1` compiles on
+  published over meanwhile, and the function tiers up again. A function whose inline plan
+  splices nothing gets no second chunk: the tier compiles its own chunk and installs the code in
+  the chunk's slot over the template JIT's code, which stays as the fallback a discard returns
+  to without a compile (one is compiled where the code cache's CLOCK evicted it); the chunk's
+  entry word, which every call way copies and, with the tier on, every entry compares, sends the
+  ways filled before the install to the new code without moving the call caches' epoch. `TRUST_JS_OPT_SYNC=1` compiles on
   the main thread, as do a process with one CPU available (its affinity mask counts) and one
   that cannot start the thread; the library's tests whose switches read a compile's results at
   once (`TestSwitches::asynchronous` false) do too.
@@ -115,19 +120,24 @@ comment/example in the same change.
   recompiles decline nothing (the feedback alone guides them). `TRUST_JS_OPT_LOG=1` prints one
   stderr line per compile (with its time and code range, `at <base> <length>` in hex), refusal
   (with its reason and pc; `over the size limit` for a chunk past 15,000 operations, with `(<n>
-  ops, before its recompile)` where it had nothing to splice), decline
+  ops, before its recompile)` where it had nothing to splice), install of the tier's code in a
+  chunk's own slot (`[opt] installed <name> in place at <base> over <template base> <template
+  length>`, or `, no template code kept` where the slot held none), decline
   (`[opt] declined <name> pc <pc> <reason>: <form built>`), wait for settled feedback (with the
   function and checkpoint, a warm-up's marked `(reoptimization)`), exit (with its pc, reason
   and kind, and for a shape check's the shapes it expected and the receiver's, or what the
   receiver is when it is no object), discard (`[opt] discarded <name> after <n> exits (limit
-  <l>, R <r> -> <r'>) for <what new entries run>: pc <pc> <reason> x<count>, ...`), new exit
+  <l>, R <r> -> <r'>) for <what new entries run>: pc <pc> <reason> x<count>, ...`; `the
+  template JIT's kept code` where it returned to the code an install kept), new exit
   site (`[opt] flag <name> pc <pc> <reason> own|at <baseline name> pc <pc>[ (spliced)]`), discard
   of unfixable exits only (`[opt] not reoptimized <name>: unfixable exits only`) or of a warm-up
   past the count (`[opt] not reoptimized <name>: its warm-up would pass the checkpoint word`),
   recompile (`[opt] reoptimizing <name> at checkpoint <k> (R <r>)`) and epoch move (`[opt]
   epoch moved (discard|reoptimization), <n> by the tier`), and one per template JIT compile of
-  a second stage: `[opt] template <base> <length> <name> (second stage|fallback)`, the code of
-  a second stage the tier refused (or of a loop's borrowed-frame entry) or of a discard. A
+  a second stage, or of a first stage after the tier's code was installed in it: `[opt]
+  template <base> <length> <name> (second stage|fallback)`, the code of a second stage the tier
+  refused (or of a loop's borrowed-frame entry, or of a slot CLOCK evicted) or of a discard
+  whose kept code was gone. A
   profile's samples join to these ranges, since the perf map names a second stage's template
   code `JS:^`, as its first stage's. A compile's line and a refusal's (whose `(<ms> ms)` is the
   compile's) end with where its time was spent: `on the main thread` or `on the compile
@@ -139,7 +149,8 @@ comment/example in the same change.
   thread, ...)`. The parts of a tier compile that run on the main thread besides the compile
   line's own time each print `[opt] main-thread <part> <name> in <ms> ms`: `recompile`, the
   bytecode recompile that makes the tier's chunk (its second stage, or a stale chain's
-  recompile); `snapshot`, the snapshot, the chunk's frozen view and the job's hand-off to the
+  recompile; none for a function with nothing to splice, whose own chunk the tier compiles);
+  `snapshot`, the snapshot, the chunk's frozen view and the job's hand-off to the
   compile thread; `stubs`, the process stubs
   and atoms a compile found missing, made for its next run; `install`, the code's link and
   installation after its compile; `fallback`, the template JIT's compile of a discarded code's
@@ -473,7 +484,9 @@ comment/example in the same change.
   (Linux `tools/perf/Documentation/jitdump-specification.txt`), as V8's `--perf-prof` does: one
   load record per piece of code the perf map lists, with its bytes, under the perf map's name,
   and with the optimizing tier on, a second stage's template code marked `(second stage)` or
-  `(fallback)` (see `TRUST_JS_OPT_LOG`). Each record is stamped with `CLOCK_MONOTONIC`, so a
+  `(fallback)` (see `TRUST_JS_OPT_LOG`); a first stage's template code compiled before the
+  tier's code was installed in its slot keeps its name (the install's log line gives its
+  range). Each record is stamped with `CLOCK_MONOTONIC`, so a
   profile recorded with `perf record -k mono` attributes a sample to the code that ran at its
   address then, where the perf map gives an address that freed code's memory left to later code
   to its last entry. `perf inject --jit -i perf.data -o perf.jit.data` writes one ELF file per

@@ -1377,9 +1377,18 @@ pub(crate) unsafe fn refill_stale(way: &std::cell::Cell<CallIc>) -> bool {
     ic.code_mem = code.mem_ptr();
     ic.pc_offs_ptr = code.pc_offsets_ptr();
     way.set(ic);
+    #[cfg(test)]
+    TEST_STALE_REFILLS.with(|refills| refills.set(refills.get() + 1));
     #[cfg(feature = "architecture-diagnostics")]
     call_cache_diagnostics::in_place_refill();
     true
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The ways [`refill_stale`] refilled on this thread (P3 stage 2, step 14's tests).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) static TEST_STALE_REFILLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Whether publications move [`CALL_IC_EPOCH`] as before per-callee pickup
@@ -3652,8 +3661,9 @@ pub struct Chunk {
     /// Separate native entry kind borrowing a live Script VM activation.
     pub(crate) osr: std::cell::OnceCell<Box<crate::tiering::OsrCodeState>>,
     /// The optimizing tier's record of this chunk (`opt::profile`): its settled-feedback
-    /// fingerprint, its exit profile and R, a discarded second stage's warm-up. Made at the
-    /// tier's first use of the chunk, and dropped with it.
+    /// fingerprint, its exit profile and R, a discarded code's warm-up, the template JIT's code
+    /// an install of the tier's keeps. Made at the tier's first use of the chunk, and dropped
+    /// with it.
     pub(crate) opt: std::cell::OnceCell<Box<crate::opt::profile::ChunkProfile>>,
     /// The entry word (P3 stage 2, step 14): counts, modulo 256, the changes of the code in
     /// `jit` made in place, which leave the chunk its function's current code: the optimizing
@@ -3950,7 +3960,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             jit: _,
             jit_budget_wait_bytes: _,
             osr: _,
-            opt: _, // integers: no cells
+            opt: _, // integers and the template JIT's kept code: no cells
             entry: _,
         } = self;
         consts.trace_gc(sink);
@@ -4509,6 +4519,10 @@ impl Chunk {
         }
         if let Some(profile) = self.opt.get() {
             bytes = bytes.saturating_add(profile.retained_bytes());
+            // The template JIT's code an install of the tier's kept (P3 stage 2, step 14).
+            if let Some(code) = profile.kept_code() {
+                visitor.jit_code(&code);
+            }
         }
         visitor.add_function_bytecode_bytes(bytes);
     }

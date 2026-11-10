@@ -122,6 +122,12 @@ mod build_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+mod inplace_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod offthread_tests;
 #[cfg(all(
     test,
@@ -202,6 +208,19 @@ mod off {
 
     pub(crate) fn reoptimizing(_: &Chunk) -> bool {
         false
+    }
+
+    pub(crate) fn in_place(_: &Chunk) -> bool {
+        false
+    }
+
+    pub(crate) fn compile_in_place(
+        _: &mut Interp,
+        chunk: &Chunk,
+        _: Option<std::rc::Rc<Chunk>>,
+        _: std::rc::Weak<crate::ast::Function>,
+    ) {
+        chunk.set_inline_retry_at(0);
     }
 
     pub(crate) fn reoptimize(

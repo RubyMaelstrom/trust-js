@@ -82,9 +82,18 @@ fn first_stage(engine: &mut Engine, name: &str) -> Rc<Chunk> {
     .expect("its first stage")
 }
 
-fn second_stage(engine: &mut Engine, name: &str) -> Option<Rc<Chunk>> {
+/// The chunk the tier's code went into: the function's second stage, where one was published,
+/// else its first stage once the tier's code was installed in it (`sq`'s plan splices nothing:
+/// P3 stage 2, step 14).
+fn tier_chunk(engine: &mut Engine, name: &str) -> Option<Rc<Chunk>> {
     runtime_slot(engine, name, |runtime| {
-        runtime.code2.get().and_then(Option::clone)
+        runtime.code2.get().and_then(Option::clone).or_else(|| {
+            runtime
+                .code
+                .get()
+                .and_then(Option::clone)
+                .filter(|first| super::in_place(first))
+        })
     })
 }
 
@@ -144,24 +153,28 @@ fn a_function_gets_the_tiers_code_at_the_poll_after_its_compile_ends() {
     let (calls, hold) = until_pending(&mut engine, "sq");
     assert!(calls <= 200, "the first checkpoint asks ({calls} calls)");
     let first = first_stage(&mut engine, "sq");
-    // Pending: the chunk is not published, the first stage runs its template code, marked
-    // compiling with no checkpoint armed.
-    assert!(second_stage(&mut engine, "sq").is_none());
+    // Pending: the first stage runs its template code, marked compiling with no checkpoint
+    // armed.
+    assert!(tier_chunk(&mut engine, "sq").is_none());
     assert!(ChunkProfile::get(&first).is_some_and(ChunkProfile::compiling));
     assert_eq!(first.inline_retry_at.get(), 0);
     assert!(compiled().is_empty(), "nothing installed before its poll");
     // Another call runs the template code meanwhile.
     assert_eq!(call(&mut engine, "sq", 4.0), 17.0);
-    assert!(second_stage(&mut engine, "sq").is_none());
+    assert!(tier_chunk(&mut engine, "sq").is_none());
     drop(hold);
     wait_finished(&engine);
     // Finished, but no poll yet: still not installed.
-    assert!(second_stage(&mut engine, "sq").is_none());
+    assert!(tier_chunk(&mut engine, "sq").is_none());
     assert_eq!(engine.interp.opt_pending.len(), 1);
     // The next entry's poll installs it.
     assert_eq!(call(&mut engine, "sq", 3.0), 10.0);
     assert_eq!(engine.interp.opt_pending.len(), 0);
-    let chunk = second_stage(&mut engine, "sq").expect("published at the install");
+    let chunk = tier_chunk(&mut engine, "sq").expect("installed in place at the install");
+    assert!(
+        Rc::ptr_eq(&chunk, &first),
+        "the first stage carries the tier's code"
+    );
     assert_eq!(compiled(), vec![Rc::as_ptr(&chunk) as usize]);
     assert!(!ChunkProfile::get(&first).is_some_and(ChunkProfile::compiling));
     let code = chunk.jit.get().flatten().expect("its code is resident");
@@ -202,14 +215,14 @@ fn a_result_whose_sites_a_discard_flagged_meanwhile_is_dropped_and_the_function_
     assert_eq!(drops.len(), 1, "{drops:?}");
     assert_eq!(drops[0].1, "a discard flagged its sites since its snapshot");
     assert!(compiled().is_empty());
-    assert!(second_stage(&mut engine, "sq").is_none());
+    assert!(tier_chunk(&mut engine, "sq").is_none());
     // It may tier up again: its checkpoint armed again, a later one compiles it.
     assert!(!ChunkProfile::get(&first).is_some_and(ChunkProfile::compiling));
     assert_ne!(first.inline_retry_at.get(), 0, "a checkpoint armed again");
     drop(until_pending(&mut engine, "sq"));
     wait_finished(&engine);
     call(&mut engine, "sq", 2.0);
-    let chunk = second_stage(&mut engine, "sq").expect("the second compile installs");
+    let chunk = tier_chunk(&mut engine, "sq").expect("the second compile installs");
     assert_eq!(compiled(), vec![Rc::as_ptr(&chunk) as usize]);
     assert!(dropped().is_empty());
 }
@@ -244,10 +257,7 @@ fn a_result_after_a_recompile_was_published_meanwhile_is_dropped() {
     assert_eq!(drops.len(), 1, "{drops:?}");
     assert_eq!(drops[0].1, "a recompile was published meanwhile");
     assert!(compiled().is_empty());
-    assert!(Rc::ptr_eq(
-        &second_stage(&mut engine, "sq").unwrap(),
-        &first
-    ));
+    assert!(Rc::ptr_eq(&tier_chunk(&mut engine, "sq").unwrap(), &first));
 }
 
 #[test]
@@ -344,7 +354,7 @@ fn an_engine_dropped_with_compiles_pending_cancels_them() {
     drop(until_pending(&mut engine, "sq"));
     wait_finished(&engine);
     call(&mut engine, "sq", 2.0);
-    let chunk = second_stage(&mut engine, "sq").expect("installed");
+    let chunk = tier_chunk(&mut engine, "sq").expect("installed");
     assert_eq!(compiled(), vec![Rc::as_ptr(&chunk) as usize]);
 }
 
@@ -431,6 +441,6 @@ fn one_cpu_compiles_on_the_main_thread() {
         call(&mut engine, "sq", f64::from(k));
     }
     assert_eq!(engine.interp.opt_pending.len(), 0, "nothing ran off it");
-    let chunk = second_stage(&mut engine, "sq").expect("compiled and published at once");
+    let chunk = tier_chunk(&mut engine, "sq").expect("compiled and published at once");
     assert_eq!(compiled(), vec![Rc::as_ptr(&chunk) as usize]);
 }

@@ -80,10 +80,14 @@ fn sites_on(chunk: &Chunk) -> Vec<(u32, u8, bool)> {
     sites
 }
 
-/// The exit sites keyed on a recompile and on its function's first stage.
+/// The exit sites keyed on a recompile and on its function's first stage, or on a first stage
+/// that carries the tier's code (P3 stage 2, step 14).
 fn sites(chunk: &Chunk) -> Vec<(u32, u8, bool)> {
     let mut sites = sites_on(chunk);
-    sites.extend(sites_on(profile::first_stage(chunk)));
+    let first = profile::first_stage(chunk);
+    if !std::ptr::eq(first, chunk) {
+        sites.extend(sites_on(first));
+    }
     sites
 }
 
@@ -335,14 +339,24 @@ fn the_tier_verifies_each_graph_it_compiles_in_the_tests() {
     );
 }
 
-fn second_stage(engine: &mut Engine, name: &str) -> Option<std::rc::Rc<crate::bytecode::Chunk>> {
+/// The chunk the tier compiled for the global function `name`: its second stage, where its plan
+/// splices callees (or a stale chain's recompile made one), else its first stage once the tier's
+/// code was installed in it (a plan that splices nothing, P3 stage 2, step 14).
+fn tier_chunk(engine: &mut Engine, name: &str) -> Option<std::rc::Rc<crate::bytecode::Chunk>> {
     let env = engine.interp.global_env;
     let value = engine.interp.get_var(name, &env).ok()?;
     let object = value.as_obj()?;
     let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
         return None;
     };
-    user.func.runtime().code2.get().and_then(Option::clone)
+    let runtime = user.func.runtime();
+    runtime.code2.get().and_then(Option::clone).or_else(|| {
+        runtime
+            .code
+            .get()
+            .and_then(Option::clone)
+            .filter(|first| super::in_place(first))
+    })
 }
 
 #[test]
@@ -385,7 +399,7 @@ fn typed_arrays_of_one_kind_run_in_the_tiers_code() {
         ("clamp", NodeOp::StoreTyped(TypedKind::U8Clamped)),
         ("shorts", NodeOp::StoreTyped(TypedKind::I16)),
     ] {
-        let chunk = second_stage(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
+        let chunk = tier_chunk(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
         assert!(
             tier.contains(&address(&chunk)),
             "{name}: the tier compiled it"
@@ -412,7 +426,7 @@ fn a_callee_free_loop_function_runs_in_the_tiers_code() {
         ),
         "45000"
     );
-    assert!(second_stage(&mut engine, "sum").is_none());
+    assert!(tier_chunk(&mut engine, "sum").is_none());
     // The tier on: the function's own chunk, compiled by the tier at a checkpoint.
     TestSwitches {
         on: true,
@@ -433,12 +447,13 @@ fn a_callee_free_loop_function_runs_in_the_tiers_code() {
         ),
         "45000"
     );
-    let chunk = second_stage(&mut engine, "sum").expect("the tier's chunk was published");
+    let chunk = tier_chunk(&mut engine, "sum").expect("the tier's code");
     assert!(
         compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)),
         "the tier compiled it"
     );
-    // Nothing spliced: the first stage's operations, its feedback forwarded by the record map.
+    // Nothing spliced: the tier compiled the first stage itself and installed its code there
+    // (P3 stage 2, step 14), with no second chunk and no record map.
     let first = {
         let env = engine.interp.global_env;
         let value = engine.interp.get_var("sum", &env).ok().unwrap();
@@ -446,6 +461,7 @@ fn a_callee_free_loop_function_runs_in_the_tiers_code() {
         let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
             panic!("an author function")
         };
+        assert!(user.func.runtime().code2.get().is_none(), "no second chunk");
         user.func
             .runtime()
             .code
@@ -453,11 +469,8 @@ fn a_callee_free_loop_function_runs_in_the_tiers_code() {
             .and_then(Option::clone)
             .unwrap()
     };
-    assert_eq!(
-        format!("{:?}", chunk.jit_ops()),
-        format!("{:?}", first.jit_ops())
-    );
-    assert!(chunk.feedback_vector().record_map().is_some());
+    assert!(std::rc::Rc::ptr_eq(&chunk, &first));
+    assert!(chunk.feedback_vector().record_map().is_none());
     let code = chunk.jit.get().flatten().expect("its code is resident");
     exits();
     assert_eq!(
@@ -494,7 +507,7 @@ fn a_for_of_whose_binding_takes_its_handlers_operand_runs_in_the_tiers_code() {
         "function total(a) { let s = 0; for (const v of a) s += JSON.parse(v); return s; }\n\
          let t = 0; for (let k = 0; k < 1000; k++) t += total(['1', '2', String(k)]); t",
     );
-    let chunk = second_stage(&mut engine, "total").expect("the tier compiled total");
+    let chunk = tier_chunk(&mut engine, "total").expect("the tier compiled total");
     assert!(compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)));
     let code = chunk.jit.get().flatten().expect("its code is resident");
     code.referenced.set(0);
@@ -546,7 +559,7 @@ fn under_no_reopt_repeated_exits_send_new_entries_to_the_template_jits_code_for_
         "function add(a, b) { return a + b; }\n\
          let t = 0; for (let k = 0; k < 1000; k++) t += add(k, 1); t",
     );
-    let chunk = second_stage(&mut engine, "add").expect("the tier compiled add");
+    let chunk = tier_chunk(&mut engine, "add").expect("the tier compiled add");
     assert!(compiled().contains(&address(&chunk)));
     let optimized = chunk.jit.get().flatten().expect("resident");
     exits();
@@ -761,7 +774,7 @@ fn a_chunk_over_the_size_limit_is_refused_before_its_snapshot_and_keeps_its_seco
     compiled();
     super::TEST_REFUSED.with(|refused| refused.borrow_mut().clear());
     assert_eq!(eval(&mut engine, &program), expected[0]);
-    let chunk = second_stage(&mut engine, "big").expect("big's second stage");
+    let chunk = tier_chunk(&mut engine, "big").expect("big's second stage");
     assert!(
         chunk.jit_ops().len() > super::MAX_OPTIMIZED_OPS,
         "{} operations",
@@ -811,10 +824,7 @@ fn a_chunk_over_the_size_limit_with_nothing_to_splice_is_never_recompiled() {
         vec![(address(&first), "over the size limit")],
         "refused before its recompile"
     );
-    assert!(
-        second_stage(&mut engine, "huge").is_none(),
-        "no second stage"
-    );
+    assert!(tier_chunk(&mut engine, "huge").is_none(), "no second stage");
     assert!(compiled().is_empty());
     assert_eq!(first.inline_retry_at.get(), 0, "its checkpoints disarmed");
     assert!(
@@ -887,7 +897,7 @@ fn feedback_that_changes_until_the_fourth_checkpoint_compiles_at_the_first_quiet
         "a wait at the fourth too"
     );
     assert!(
-        second_stage(&mut engine, "getx").is_none(),
+        tier_chunk(&mut engine, "getx").is_none(),
         "nothing forced at the fourth checkpoint"
     );
     assert_eq!(
@@ -897,7 +907,7 @@ fn feedback_that_changes_until_the_fourth_checkpoint_compiles_at_the_first_quiet
         ),
         "40946725"
     );
-    let chunk = second_stage(&mut engine, "getx").expect("the first quiet window compiles");
+    let chunk = tier_chunk(&mut engine, "getx").expect("the first quiet window compiles");
     assert!(compiled().contains(&address(&chunk)));
     assert_eq!(waits_of(&first), vec![1, 2, 3, 4], "settled at the fifth");
     let code = chunk.jit.get().flatten().expect("resident");
@@ -947,14 +957,14 @@ fn feedback_that_changes_in_every_window_never_compiles() {
     let first = first_stage(&mut engine, "g");
     assert_eq!(waits_of(&first), (1..=9).collect::<Vec<u8>>());
     assert!(
-        second_stage(&mut engine, "g").is_none(),
+        tier_chunk(&mut engine, "g").is_none(),
         "no compile while the feedback changes"
     );
     assert_eq!(
         eval(&mut engine, "for (; k < 11550; k++) t += g(o, phase(k)); t"),
         expected[1]
     );
-    let chunk = second_stage(&mut engine, "g").expect("the quiet window compiles");
+    let chunk = tier_chunk(&mut engine, "g").expect("the quiet window compiles");
     assert!(compiled().contains(&address(&chunk)));
     assert_eq!(waits_of(&first), (1..=9).collect::<Vec<u8>>());
 }
@@ -985,12 +995,12 @@ fn a_loop_free_function_gets_the_tiers_code_at_its_500th_entry() {
         499 * super::ENTRY_WEIGHT,
         "K an entry"
     );
-    assert!(second_stage(&mut engine, "sq").is_none(), "499 entries");
+    assert!(tier_chunk(&mut engine, "sq").is_none(), "499 entries");
     assert_eq!(
         eval(&mut engine, "for (; k < 500; k++) t += sq(k); t"),
         "41541750"
     );
-    let chunk = second_stage(&mut engine, "sq").expect("compiled at the 500th entry");
+    let chunk = tier_chunk(&mut engine, "sq").expect("compiled at the 500th entry");
     assert!(compiled().contains(&address(&chunk)));
     let code = chunk.jit.get().flatten().expect("resident");
     assert!(is_tier_code(&code));
@@ -1019,13 +1029,13 @@ fn with_the_tier_off_an_entry_counts_one_and_the_second_stage_comes_at_the_100th
     );
     let first = first_stage(&mut engine, "f");
     assert_eq!(first.jit_runs.get(), 99, "one an entry");
-    assert!(second_stage(&mut engine, "f").is_none(), "99 entries");
+    assert!(tier_chunk(&mut engine, "f").is_none(), "99 entries");
     assert_eq!(
         eval(&mut engine, "for (; k < 100; k++) t += f(k); t"),
         "10100"
     );
     assert!(
-        second_stage(&mut engine, "f").is_some(),
+        tier_chunk(&mut engine, "f").is_some(),
         "the second stage at the 100th entry"
     );
 }
@@ -1107,7 +1117,7 @@ fn named_reads_on_primitives_stay_effects_and_never_exit() {
         ("fixed", IC_PRIMITIVE_NUMBER),
         ("shown", IC_PRIMITIVE_BOOLEAN),
     ] {
-        let chunk = second_stage(&mut engine, name).expect("the tier's chunk");
+        let chunk = tier_chunk(&mut engine, name).expect("the tier's chunk");
         assert!(
             compiles.contains(&(std::rc::Rc::as_ptr(&chunk) as usize)),
             "the tier compiled {name}"
@@ -1145,7 +1155,7 @@ fn a_site_that_sees_string_prototype_and_primitive_strings_stays_an_effect() {
         compiled();
         exits();
         assert_eq!(eval(&mut engine, program), expected, "{program}");
-        let chunk = second_stage(&mut engine, "first").expect("the tier's chunk");
+        let chunk = tier_chunk(&mut engine, "first").expect("the tier's chunk");
         assert!(compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)));
         let pc = method_pc(&chunk);
         assert_eq!(
@@ -1230,7 +1240,7 @@ fn converges_with(
     exits();
     discarded();
     assert_eq!(eval(&mut engine, warm), expected[0], "{name}: warm");
-    let chunk = second_stage(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
+    let chunk = tier_chunk(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
     assert!(compiled().contains(&address(&chunk)), "{name}: compiled");
     let optimized = chunk.jit.get().flatten().expect("resident");
     assert!(is_tier_code(&optimized), "{name}");
@@ -1296,7 +1306,7 @@ fn live_at_agrees_with_a_scan_on_the_tiers_graphs() {
             .filter(|name| !name.is_empty() && name.chars().all(|c| c.is_alphanumeric()))
             .collect();
         for name in names {
-            let Some(chunk) = second_stage(&mut engine, name) else {
+            let Some(chunk) = tier_chunk(&mut engine, name) else {
                 continue;
             };
             let Ok(built) = super::build::build(&chunk, &super::snapshot::Snapshot::take(&chunk))
@@ -1510,7 +1520,7 @@ fn flipping(switches: TestSwitches) -> (String, u8, usize) {
     let mut engine = jit_engine();
     discarded();
     let result = eval(&mut engine, FLIPPING);
-    let chunk = second_stage(&mut engine, "f").expect("f's second stage");
+    let chunk = tier_chunk(&mut engine, "f").expect("f's second stage");
     (result, discards(&chunk), discarded().len())
 }
 
@@ -1544,7 +1554,7 @@ fn a_discard_of_unfixable_exits_only_arms_no_recompile() {
         "function risky(k) { try { if (k < 0) throw k; return k; } catch (e) { return -1; } }\n\
          let t = 0; for (let k = 0; k < 1000; k++) t += risky(k); t",
     );
-    let chunk = second_stage(&mut engine, "risky").expect("risky's second stage");
+    let chunk = tier_chunk(&mut engine, "risky").expect("risky's second stage");
     assert!(compiled().contains(&address(&chunk)));
     let optimized = chunk.jit.get().flatten().expect("resident");
     exits();
@@ -1585,7 +1595,7 @@ fn a_long_activation_finishes_in_its_discarded_code_while_later_calls_run_the_ne
     let mut engine = jit_engine();
     compiled();
     eval(&mut engine, SOURCE);
-    let chunk = second_stage(&mut engine, "f").expect("f's second stage");
+    let chunk = tier_chunk(&mut engine, "f").expect("f's second stage");
     assert!(compiled().contains(&address(&chunk)));
     let optimized = chunk.jit.get().flatten().expect("resident");
     exits();
@@ -1651,7 +1661,7 @@ fn forced_exits_record_nothing() {
         ),
         "4500000"
     );
-    let chunk = second_stage(&mut engine, "add").expect("add's second stage");
+    let chunk = tier_chunk(&mut engine, "add").expect("add's second stage");
     assert!(compiled().contains(&address(&chunk)));
     let taken = exits();
     assert!(
@@ -1689,7 +1699,7 @@ fn a_stale_chains_recompile_is_compiled_by_the_tier() {
          var a = new A(1), b = new B(2), t = 0;\n\
          for (var i = 0; i < 300; i++) t += staged(a); t",
     );
-    let code2 = second_stage(&mut engine, "staged").expect("staged's second stage");
+    let code2 = tier_chunk(&mut engine, "staged").expect("staged's second stage");
     assert!(compiled().contains(&address(&code2)));
     // A primitive receiver fails the shape check: at the limit of 1, the discard.
     assert_eq!(eval(&mut engine, "staged(5)"), "0");
@@ -1974,7 +1984,7 @@ fn a_class_whose_heritage_makes_and_calls_a_closure_that_reads_outer_variables()
 
 /// `name`'s code now, and whether it is the tier's.
 fn tier_code(engine: &mut Engine, name: &str) -> Option<Rc<crate::jit::JitCode>> {
-    let chunk = second_stage(engine, name)?;
+    let chunk = tier_chunk(engine, name)?;
     chunk.jit.get().flatten().filter(|code| is_tier_code(code))
 }
 
@@ -2243,7 +2253,7 @@ fn phi_reps(source: &str, name: &str) -> (usize, usize, usize) {
     eager().set();
     let mut engine = jit_engine();
     eval(&mut engine, source);
-    let chunk = second_stage(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
+    let chunk = tier_chunk(&mut engine, name).unwrap_or_else(|| panic!("{name}: code2"));
     let graph = graph_now(&chunk);
     let reps: Vec<Rep> = graph
         .blocks
@@ -2451,7 +2461,7 @@ fn entry_speculations_back_off_without_an_exit_cycle() {
     .set();
     let mut engine = jit_engine();
     assert_eq!(eval(&mut engine, &source), expected);
-    let chunk = second_stage(&mut engine, "entered").expect("entered's second stage");
+    let chunk = tier_chunk(&mut engine, "entered").expect("entered's second stage");
     assert!(discards(&chunk) <= 3, "{} discards", discards(&chunk));
 }
 
@@ -2489,7 +2499,7 @@ fn a_counter_passing_2_31_exits_on_overflow_and_converges_on_an_f64_phi() {
     discarded();
     assert_eq!(eval(&mut engine, WARM), expected[0]);
     assert!(exits().is_empty(), "the speculation held");
-    let chunk = second_stage(&mut engine, "count").expect("count's second stage");
+    let chunk = tier_chunk(&mut engine, "count").expect("count's second stage");
     assert!(compiled().contains(&address(&chunk)));
     let int = graph_now(&chunk);
     assert!(int
@@ -2605,7 +2615,7 @@ fn a_function_entered_a_few_times_with_a_long_loop_gets_the_tiers_code_by_its_th
                 expected[0],
                 "entry {entry}"
             );
-            if compiled_at.is_none() && second_stage(&mut engine, "drive").is_some() {
+            if compiled_at.is_none() && tier_chunk(&mut engine, "drive").is_some() {
                 compiled_at = Some(entry);
             }
         }
@@ -2630,7 +2640,7 @@ fn a_function_entered_a_few_times_with_a_long_loop_gets_the_tiers_code_by_its_th
         }
         assert_eq!(compiled_at, Some(3), "compiled at the third entry");
         assert_eq!(waits, vec![1], "waited at the first checkpoint");
-        let chunk = second_stage(&mut engine, "drive").expect("drive's second stage");
+        let chunk = tier_chunk(&mut engine, "drive").expect("drive's second stage");
         assert!(
             compiled().contains(&address(&chunk)),
             "the tier compiled it"
@@ -2737,7 +2747,7 @@ fn a_long_function_with_a_short_loop_compiles_after_500_invocations_worth_of_its
         if entry == 1 {
             w = the_loop_weight(&first_stage(&mut engine, "longf"));
         }
-        if compiled_at.is_none() && second_stage(&mut engine, "longf").is_some() {
+        if compiled_at.is_none() && tier_chunk(&mut engine, "longf").is_some() {
             compiled_at = Some(entry);
         }
     }
@@ -2763,7 +2773,7 @@ fn a_long_function_with_a_short_loop_compiles_after_500_invocations_worth_of_its
         iterations + 2 * n >= budget && iterations <= budget + 2 * n,
         "{iterations} iterations before the compile, 500 invocations' worth {budget}"
     );
-    let chunk = second_stage(&mut engine, "longf").expect("its second stage");
+    let chunk = tier_chunk(&mut engine, "longf").expect("its second stage");
     assert!(compiled().contains(&address(&chunk)));
 }
 
@@ -2792,7 +2802,7 @@ fn a_discards_warm_up_reaches_its_recompile_through_a_loops_iterations() {
             ),
             "3000"
         );
-        let chunk = second_stage(&mut engine, "f").expect("f's second stage");
+        let chunk = tier_chunk(&mut engine, "f").expect("f's second stage");
         assert!(compiled().contains(&address(&chunk)));
         let optimized = chunk.jit.get().flatten().expect("resident");
         assert!(is_tier_code(&optimized));

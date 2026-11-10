@@ -54,6 +54,21 @@ pub(crate) struct NativeCodeSlot {
     state: OnceCell<Rc<SlotState>>,
 }
 
+impl std::fmt::Debug for NativeCodeSlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = match self.state.get() {
+            None => "cold",
+            Some(state) => match &*state.code.borrow() {
+                CodeState::Cold => "cold",
+                CodeState::Pending => "pending",
+                CodeState::Unavailable => "unavailable",
+                CodeState::Resident(_) => "resident",
+            },
+        };
+        f.write_str(state)
+    }
+}
+
 impl NativeCodeSlot {
     pub(crate) fn retained_metadata_bytes(&self) -> usize {
         self.state

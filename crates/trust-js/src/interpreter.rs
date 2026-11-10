@@ -1405,6 +1405,13 @@ thread_local! {
     pub(crate) static TEST_COMPILED_TARGET_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// The code (its first byte) the last call or construction through a cache entry entered
+    /// from Rust ran (`call_jit_committed`, `construct_jit_fast`): which of a chunk's codes a
+    /// stale entry's refill made it enter (P3 stage 2, step 14).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) static TEST_ENTERED_CODE: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     /// Natives [`Interp::call_native_lean`] ran (candidate 2's fork B2), for tests.
     pub(crate) static TEST_LEAN_BOUNDARY_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
@@ -16554,6 +16561,8 @@ impl Interp {
         argc: usize,
     ) -> Result<Value, Abrupt> {
         // --- committed: identical to call_jit_fast's committed path ---
+        #[cfg(test)]
+        TEST_ENTERED_CODE.with(|entered| entered.set(code.mem_ptr() as usize));
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
@@ -16613,7 +16622,9 @@ impl Interp {
     /// spliced inline. On success the new chunk lands in `FunctionRuntime::code2` and supersedes
     /// the chunk it replaces, so that chunk's cached callers pick it up at their next call
     /// (`FunctionRuntime::publish`); the old chunk stays alive (and correct) beneath any pointers
-    /// already handed out.
+    /// already handed out. With the optimizing tier on, a plan that splices nothing makes no
+    /// second chunk: the tier compiles the chunk itself and installs its code in the chunk's own
+    /// slot (`opt::compile_in_place`, P3 stage 2, step 14).
     pub(crate) fn try_inline_recompile(
         &mut self,
         func: *const crate::ast::Function,
@@ -16664,7 +16675,12 @@ impl Interp {
         // never reassigned (the same argument that makes the rest of the IC readable).
         let func = unsafe { &*func };
         let runtime = func.runtime();
-        if runtime.code2.get().is_some() {
+        // Done: the function's recompile was made, or the tier's code was installed in this
+        // chunk itself (P3 stage 2, step 14), whose tier-up is then its discards' and warm-ups'
+        // (above), or its compile is pending (`opt::compiling`, above). A later checkpoint (a
+        // stale chain's request the chain recompile declined, a chunk superseded in another
+        // Realm and current again) builds no second stage on top.
+        if runtime.code2.get().is_some() || (tier && crate::opt::in_place(chunk)) {
             chunk.set_inline_retry_at(0);
             if tier {
                 crate::opt::forget(chunk);
@@ -16693,22 +16709,27 @@ impl Interp {
                 let head: String = src.chars().take(60).collect();
                 eprintln!("[tier] inline: empty plan for: {}", head.replace('\n', " "));
             }
-            // The tier compiles a hot function whether or not it splices anything, as Maglev
-            // does: its own chunk again, seeded and record-mapped from this one.
             if !tier {
                 return;
             }
+            // V8's size limit (P3 stage 2, step 11): the tier refuses a chunk over it before its
+            // snapshot, and the function keeps its template code with no checkpoint after.
+            crate::opt::forget(chunk);
+            if crate::opt::refuses_unspliced(chunk) {
+                chunk.set_inline_retry_at(0);
+                return;
+            }
+            // The tier compiles a hot function whether or not it splices anything, as Maglev
+            // does, and with nothing to splice it compiles the function's own chunk, as Maglev
+            // compiles a function's one bytecode (P3 stage 2, step 14): no recompile, no second
+            // chunk; the code goes in this chunk's slot over the template JIT's, kept as the
+            // fallback (`opt::compile_in_place`).
+            let chunk_rc = runtime_chunk(&runtime, chunk);
+            drop(runtime);
+            crate::opt::compile_in_place(self, chunk, chunk_rc, function_weak(func));
+            return;
         } else {
             crate::jit::perf_inline_plan_sites(plan.len());
-        }
-        // V8's size limit, before the recompile (P3 stage 2, step 11): a chunk over it with
-        // nothing to splice has no second stage to keep, so the recompile, which only the tier
-        // would take, is not made, and the function keeps its first stage, as after the tier's
-        // refusal of such a chunk. With splices the second stage is built, and the tier refuses it.
-        if tier && plan.is_empty() && crate::opt::refuses_unspliced(chunk) {
-            crate::opt::forget(chunk);
-            chunk.set_inline_retry_at(0);
-            return;
         }
         // The bytecode recompile that makes the tier's chunk runs on the main thread: its time
         // under TRUST_JS_OPT_LOG (no clock read otherwise).
@@ -17324,6 +17345,8 @@ impl Interp {
         // Before GC, instance preparation or a forwarding initializer can
         // compile/reclaim code, turn the validated raw pointer into a lease.
         let code = unsafe { crate::jit::cache::lease_raw(ic.code) };
+        #[cfg(test)]
+        TEST_ENTERED_CODE.with(|entered| entered.set(code.mem_ptr() as usize));
         if cached_site.is_none() {
             // The site shares the engine construct cache's pin of the constructor, which the
             // lookup above found or `construct_ic_fill` made.
@@ -17905,6 +17928,8 @@ impl Interp {
             chunk.needs_frame_this(),
             func.is_strict,
         );
+        #[cfg(test)]
+        TEST_ENTERED_CODE.with(|entered| entered.set(code.mem_ptr() as usize));
         // A successful cache fill is a native entry just like the next cache hit. Its
         // original code lease stays live even if the checkpoint invalidates the fresh IC.
         self.note_native_entry(

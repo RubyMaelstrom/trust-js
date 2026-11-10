@@ -19,6 +19,21 @@
 //! caches' global epoch, where the exemplars reach only the replaced code's callers; the log
 //! counts the moves.
 //!
+//! The tier's code on the first stage (step 14): a first stage whose inline plan splices nothing
+//! is compiled itself, as V8 and SpiderMonkey compile a function's one bytecode
+//! (`compile_in_place`), and its code goes in the chunk's own slot over the template JIT's code,
+//! which stays beside it as the fallback (`install_in_place`, `ChunkProfile::kept`; SpiderMonkey's
+//! JitScript holds its Baseline and Ion code side by side, jit/JitScript.h:295-400). The install
+//! moves the chunk's entry word, not the global epoch: every call way copies the word at its
+//! fill and every entry through a way compares it, a mismatch refilling the way from the
+//! chunk's current code (`bytecode::entry_stale`, `jit::emit_direct_sequence`), as V8's and
+//! SpiderMonkey's calls load a function's current entry; a way that misses the change enters the
+//! kept code, which lives. A discard returns to the kept code without a compile, as JSC's
+//! jettison installs the baseline code (bytecode/CodeBlock.cpp:2400-2434), and compiles the
+//! template JIT's code only where CLOCK evicted it (`swap_in_template`); the warm-up then runs on
+//! the first stage's checkpoint word, free since its checkpoints ended, and the reoptimization's
+//! install keeps the template code again. Discards and reoptimizations still move the epoch.
+//!
 //! The checkpoints count loop iterations as well as native entries (stage 2, step 8), with V8's
 //! weight (step 11): with the tier on, an entry counts K native runs (`super::ENTRY_WEIGHT`), and
 //! each loop iteration of template code (a first stage's, a discarded code's fallback) its loop's
@@ -122,6 +137,10 @@ thread_local! {
     /// The chunks whose compiles off the main thread their install dropped (`install_job`), with
     /// the reasons (stage 2, step 12).
     pub(crate) static TEST_DROPPED: std::cell::RefCell<Vec<(usize, &'static str)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The chunks the tier's code was installed in, in place (`install_in_place`, stage 2,
+    /// step 14).
+    pub(crate) static TEST_IN_PLACE: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -362,12 +381,12 @@ fn waits_at(chunk: &Chunk, checkpoint: u8, what: &str) -> bool {
     true
 }
 
-/// V8's size limit before the bytecode recompile (stage 2, step 11): whether `chunk`, a first
-/// stage whose plan splices nothing, is over the limit (`MAX_OPTIMIZED_OPS`), so that its
-/// recompile, which only the tier would take, is not made, and the function keeps its first
-/// stage, as after the tier's refusal of a chunk with nothing spliced. Logged as a refusal under
-/// TRUST_JS_OPT_LOG. A chunk with splices is recompiled, and `generate` refuses it, the second
-/// stage keeping the template JIT's code.
+/// V8's size limit before the tier's compile of a first stage whose plan splices nothing (stage
+/// 2, step 11; since step 14 the chunk itself is compiled, `compile_in_place`): whether `chunk`
+/// is over the limit (`MAX_OPTIMIZED_OPS`), so that no compile starts and the function keeps
+/// its template code, as after any refusal. Logged as a refusal under TRUST_JS_OPT_LOG. A chunk
+/// with splices is recompiled, and `generate` refuses it, the second stage keeping the template
+/// JIT's code.
 pub(crate) fn refuses_unspliced(chunk: &Chunk) -> bool {
     let ops = chunk.jit_ops().len();
     if ops <= MAX_OPTIMIZED_OPS {
@@ -861,6 +880,12 @@ pub(crate) enum Landing {
         func: std::rc::Weak<crate::ast::Function>,
         warm_up: Option<(u8, u32)>,
     },
+    /// A first stage's own compile, its plan splicing nothing (`compile_in_place`, P3 stage 2,
+    /// step 14): the code in the chunk's slot over the template JIT's, which stays as the
+    /// fallback (`install_in_place`), and the chunk's checkpoints ended; the function's.
+    InPlace {
+        func: std::rc::Weak<crate::ast::Function>,
+    },
 }
 
 /// An engine's compiles running off the main thread (`Interp::opt_pending`), which keep their
@@ -967,6 +992,81 @@ pub(crate) fn compile_recompile(
     }
     let accepted = compile_into(i, &chunk);
     i.publish_recompile(&publication, asking, chunk, accepted);
+}
+
+/// Compile `chunk`, a first stage whose inline plan splices nothing, with the tier, and put the
+/// code in the chunk's own slot over the template JIT's (P3 stage 2, step 14;
+/// `install_in_place`): no second chunk is made, as V8's Maglev compiles a function's one
+/// bytecode and feedback (maglev-compilation-unit.cc:18-48) and SpiderMonkey's Ion its script's.
+/// Now, where the tier compiles on the main thread (`asynchronous`), or at the install of a
+/// compile off it, the chunk (its Rc, `chunk_rc`, kept meanwhile) marked compiling with no
+/// checkpoint armed until then; a dropped result arms its checkpoint again (`undo`). The
+/// chunk's checkpoints end either way, a refusal keeping the template JIT's code, as one of
+/// the chunk's recompile kept the first stage. `func` is the chunk's function.
+pub(crate) fn compile_in_place(
+    i: &mut Interp,
+    chunk: &Chunk,
+    chunk_rc: Option<Rc<Chunk>>,
+    func: std::rc::Weak<crate::ast::Function>,
+) {
+    if asynchronous() {
+        if let Some(chunk_rc) = chunk_rc {
+            // A refusal at the preparation keeps the template JIT's code, as one at the compile.
+            if start_job(i, chunk_rc.clone(), chunk_rc, Landing::InPlace { func }).is_err() {
+                chunk.set_inline_retry_at(0);
+                release_retired(i);
+            }
+            return;
+        }
+    }
+    let _ = func;
+    release_retired(i);
+    if let Some((code, started)) = generate(i, chunk) {
+        install_in_place(i, chunk, code);
+        log_main_thread("install", chunk, started);
+    }
+    chunk.set_inline_retry_at(0);
+    release_retired(i);
+}
+
+/// Whether the tier's code was installed in `chunk`'s own slot (`install_in_place`): the
+/// function's tier-up is the chunk's own from then on, and no checkpoint builds it a second
+/// stage (`Interp::try_inline_recompile`'s done test).
+pub(crate) fn in_place(chunk: &Chunk) -> bool {
+    ChunkProfile::get(chunk).is_some_and(ChunkProfile::in_place)
+}
+
+/// Put `code`, the tier's code for `chunk`, a first stage, in the chunk's own slot over the
+/// template JIT's code (P3 stage 2, step 14): `install_code`, which keeps that code as the
+/// fallback a discard returns to and moves the chunk's entry word, so that each way that holds
+/// the template code refills at its next entry, and the call caches' epoch stays (P2's measured
+/// loser was an epoch move per install). A way that misses the change enters the kept code,
+/// which lives. Logged with both codes' addresses under TRUST_JS_OPT_LOG (the coverage tool
+/// counts the first stage's template code as the fallback from then on).
+fn install_in_place(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
+    let base = code.mem_ptr() as usize;
+    if !install_code(i, chunk, code) {
+        return false;
+    }
+    let profile = ChunkProfile::of(chunk);
+    profile.set_in_place();
+    #[cfg(test)]
+    TEST_IN_PLACE.with(|in_place| in_place.borrow_mut().push(chunk as *const Chunk as usize));
+    if log_enabled() {
+        match profile.kept_code() {
+            Some(kept) => log_line!(
+                "[opt] installed {} in place at {base:#x} over {:#x} {:#x}",
+                name(chunk),
+                kept.mem_ptr() as usize,
+                kept.code_bytes()
+            ),
+            None => log_line!(
+                "[opt] installed {} in place at {base:#x}, no template code kept",
+                name(chunk)
+            ),
+        }
+    }
+    true
 }
 
 /// Start a compile of `chunk` off the main thread (the plan's points 3 and 4), its ending
@@ -1080,6 +1180,17 @@ fn land(
                     move_epoch("reoptimization");
                 }
             }
+            release_retired(i);
+        }
+        Landing::InPlace { .. } => {
+            if let Some(code) = code {
+                install_in_place(i, &chunk, code);
+                log_main_thread("install", &chunk, install);
+            }
+            // The checkpoints end, the tier's code installed or refused (a stale chain's request
+            // made meanwhile waits for the template JIT's code to run again: a discard's
+            // warm-up takes it).
+            asking.set_inline_retry_at(0);
             release_retired(i);
         }
     }
@@ -1256,6 +1367,24 @@ fn dropped(i: &Interp, job: &PendingJob) -> Option<&'static str> {
                 return Some("its chunk was superseded");
             }
         }
+        Landing::InPlace { func } => {
+            let Some(func) = func.upgrade() else {
+                return Some("its function was collected");
+            };
+            let runtime = func.runtime();
+            if !runtime.heap.is_alive() {
+                return Some("its function was collected");
+            }
+            // The first stage must still be its function's current code: not superseded (a
+            // stale chain's recompile, another compile published), and no second stage
+            // published meanwhile.
+            if job.chunk.superseded() {
+                return Some("its chunk was superseded");
+            }
+            if runtime.code2.get().is_some() {
+                return Some("a recompile was published meanwhile");
+            }
+        }
     }
     None
 }
@@ -1277,6 +1406,7 @@ fn undo(job: &PendingJob) {
                 job.chunk.set_inline_retry_at(at);
             }
         }
+        Landing::InPlace { .. } => job.asking.set_inline_retry_at(job.armed),
     }
 }
 
@@ -1357,10 +1487,10 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
         }
     }
     move_epoch("discard");
-    // The warm-up runs on a recompile's checkpoint word, which no first-stage schedule uses: a
-    // chunk with a record map (a second stage, the tier's own chunk of a function with nothing
-    // to splice, a stale chain's recompile).
-    if reoptimizing && chunk.feedback_vector().record_map().is_some() {
+    // The warm-up runs on a checkpoint word no first-stage schedule uses: a recompile's, a chunk
+    // with a record map (a second stage, a stale chain's recompile), or a first stage's whose
+    // checkpoints ended when the tier's code was installed in it (P3 stage 2, step 14).
+    if reoptimizing && (chunk.feedback_vector().record_map().is_some() || in_place(chunk)) {
         if !fixable {
             if log_enabled() {
                 log_line!(
@@ -1386,12 +1516,28 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
 }
 
 /// The template JIT's code in place of the discarded `table`'s in `chunk`'s slot, which still
-/// holds it (the code runs, so no eviction took it); what new entries now run, for the log.
+/// holds it (the code runs, so no eviction took it): the code its install kept, where CLOCK has
+/// not evicted it, as JSC's jettison installs the baseline code that exists
+/// (bytecode/CodeBlock.cpp:2400-2434) and V8's deoptimization points the dispatch entry at the
+/// interpreter (objects/code.cc:166-224), else the template JIT's compile of the chunk, as
+/// before P3 stage 2's step 14 (the main thread's `fallback`). The chunk's entry word moves
+/// either way. What new entries now run, for the log.
 fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'static str {
     let holds = matches!(chunk.jit.get(), Some(Some(code))
         if code.mem_ptr() as usize == table.code_base);
     if !holds {
         return "another code";
+    }
+    if let Some(kept) = ChunkProfile::get(chunk).and_then(|profile| profile.kept().discard()) {
+        let retired = chunk.jit.replace_resident(Some(kept));
+        chunk.note_entry_change();
+        if let Some(retired) = retired {
+            #[cfg(test)]
+            TEST_DISCARDED
+                .with(|discarded| discarded.borrow_mut().push(retired.mem_ptr() as usize));
+            i.opt_retired.push(retired);
+        }
+        return "the template JIT's kept code";
     }
     let layout = *i
         .jit_layout
@@ -1419,7 +1565,6 @@ fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'stati
         }
         crate::jit::JitCompileOutcome::Unavailable => (chunk.jit.replace_resident(None), "the VM"),
     };
-    // The slot's code changed in place: its entry word moves (P3 stage 2, step 14).
     chunk.note_entry_change();
     if let Some(retired) = retired {
         #[cfg(test)]
@@ -1563,16 +1708,17 @@ fn pin_global_environment(i: &mut Interp, pin: crate::interpreter::WeakEnv) {
     }
 }
 
-/// Make `code`, the tier's recompile of `chunk`, the chunk's native code: in place of the
-/// resident code, which joins the retired codes until no activation runs it, or in a cold slot
-/// (evicted, or left cold by a deferred discard). Either way the chunk's code changed in place:
-/// its entry word moves (`Chunk::note_entry_change`, P3 stage 2, step 14). An unavailable slot
-/// keeps the chunk in the VM.
+/// Make `code`, the tier's code for `chunk`, the chunk's native code: in place of the resident
+/// code, the template JIT's, which stays as the fallback a discard returns to (`keep_template`,
+/// P3 stage 2, step 14), or in a cold slot (evicted, or left cold by a deferred discard). Either
+/// way the chunk's code changed in place: its entry word moves (`Chunk::note_entry_change`), so
+/// that every way that holds the old code refills at its next entry. An unavailable slot keeps
+/// the chunk in the VM.
 fn install_code(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
     match chunk.jit.get() {
         Some(Some(_)) => {
             if let Some(replaced) = chunk.jit.replace_resident(Some(code)) {
-                i.opt_retired.push(replaced);
+                keep_template(i, chunk, replaced);
             }
             chunk.note_entry_change();
             true
@@ -1599,13 +1745,40 @@ fn install_code(i: &mut Interp, chunk: &Chunk, code: Rc<JitCode>) -> bool {
     }
 }
 
+/// Keep `template`, the template JIT's code an install of the tier's code replaced in `chunk`'s
+/// slot, as the fallback a discard returns to (P3 stage 2, step 14; `ChunkProfile::kept`): in a
+/// slot of the code cache's own, which CLOCK may evict as any code. Where the cache admits no
+/// slot, the code is retired as before, and the epoch moves, since a way that missed the entry
+/// word's change could otherwise enter code that is freed once no activation runs it; so does
+/// a kept code from before (none: a discard takes it back).
+fn keep_template(i: &mut Interp, chunk: &Chunk, template: Rc<JitCode>) {
+    debug_assert!(
+        super::exit::table_bytes(template.mem_ptr()) == 0,
+        "the code an install replaces is the template JIT's"
+    );
+    let kept = ChunkProfile::of(chunk).kept();
+    if let Some(old) = kept.discard() {
+        i.opt_retired.push(old);
+        move_epoch("an old kept fallback");
+    }
+    match kept.begin_compile() {
+        Some(permit) => permit.commit(Some(template)),
+        None => {
+            i.opt_retired.push(template);
+            move_epoch("an unkept fallback");
+        }
+    }
+}
+
 /// What the template JIT's code for `chunk`, compiled now, is to the tier: with the tier on, a
-/// second stage's (a chunk with a record map, the tier's own empty-plan chunks among them) is
-/// "fallback" when a discard compiles it and "second stage" otherwise, such as the first native
-/// entry's compile of a second stage the tier refused, or a loop's borrowed-frame code; None for
-/// any other code. The log (`note_template`) and the jitdump's names (`jit::profiler`) mark it.
+/// second stage's (a chunk with a record map), or a first stage's after the tier's code was
+/// installed in it (P3 stage 2, step 14), is "fallback" when a discard compiles it and "second
+/// stage" otherwise, such as the first native entry's compile of a second stage the tier
+/// refused, or a loop's borrowed-frame code; None for any other code, a first stage's template
+/// code compiled before the install (the code the install keeps) among them. The log
+/// (`note_template`) and the jitdump's names (`jit::profiler`) mark it.
 pub(crate) fn template_class(chunk: &Chunk) -> Option<&'static str> {
-    if !enabled() || chunk.feedback_vector().record_map().is_none() {
+    if !enabled() || (chunk.feedback_vector().record_map().is_none() && !in_place(chunk)) {
         return None;
     }
     Some(if DISCARDING.with(Cell::get) {

@@ -1,7 +1,8 @@
 //! The optimizing tier's record of a chunk (P3 stage 2, step 3; the plan's point 12 and the
 //! stage's "Step 3, the exit profile and reoptimization"): what a chunk carries for the tier, made
 //! at its first use and dropped with the chunk, so that no record outlives its chunk or passes to
-//! a later chunk at the same address. It holds integers only: no GC edge.
+//! a later chunk at the same address. It holds integers and the template JIT's kept code: no GC
+//! edge.
 //!
 //! - The feedback fingerprint the settled-feedback rule recorded at the chunk's last checkpoint
 //!   (`opt::settled`): a first stage's before its second stage is built, a discarded second
@@ -19,6 +20,9 @@
 //!   retry counter on the baseline code block (bytecode/CodeBlock.cpp:2478-2483).
 //! - A discarded second stage's warm-up: its next checkpoint toward the recompile and the native
 //!   run count it is due at.
+//! - The tier's code in place (P3 stage 2, step 14): whether an install put the tier's code in
+//!   the chunk's own slot, over its template JIT's code (a first stage whose plan splices
+//!   nothing), and that template code, kept as the fallback a discard returns to.
 //!
 //! Only the tier's back end reads and writes the record (`snapshot`, `driver`): where it has none
 //! (x86-64 until the plan's stage 6) a chunk carries an empty cell.
@@ -65,6 +69,19 @@ pub(crate) struct ChunkProfile {
     /// proof changed, a discard counted), so that an install can tell that a discard flagged
     /// sites since its snapshot (stage 2, step 12).
     revision: Cell<u32>,
+    /// An install put the tier's code in the chunk's own slot, over the template JIT's code (P3
+    /// stage 2, step 14: a first stage whose plan splices nothing, compiled as V8 and
+    /// SpiderMonkey compile a function's one bytecode): the function's tier-up is this chunk's
+    /// from then on (its discards, warm-ups and reoptimizations), and no checkpoint of it builds
+    /// a second stage (`Interp::try_inline_recompile`'s done test).
+    in_place: Cell<bool>,
+    /// The template JIT's code an install of the tier's code replaced in the chunk's slot, kept
+    /// as the fallback a discard returns to (P3 stage 2, step 14), as SpiderMonkey's JitScript
+    /// keeps the BaselineScript beside the IonScript (jit/JitScript.h:295-400) and JSC's DFG code
+    /// block its baseline alternative (bytecode/CodeBlock.cpp:2400-2434): a slot of the code
+    /// cache's own, whose CLOCK may evict it as any code (a discard whose kept code is gone
+    /// compiles one, as before step 14).
+    kept: crate::jit::cache::NativeCodeSlot,
 }
 
 /// The key of an exit site.
@@ -201,9 +218,33 @@ impl ChunkProfile {
         self.fallback_deferred.set(deferred);
     }
 
-    /// Heap bytes the record holds (the memory census).
+    /// Whether an install put the tier's code in the chunk's own slot (see the field).
+    pub(crate) fn in_place(&self) -> bool {
+        self.in_place.get()
+    }
+
+    /// Mark an install of the tier's code in the chunk's own slot (see the field).
+    pub(crate) fn set_in_place(&self) {
+        self.in_place.set(true);
+    }
+
+    /// The template JIT's code an install kept (see the field), whose slot the caller takes it
+    /// from or puts it in.
+    pub(crate) fn kept(&self) -> &crate::jit::cache::NativeCodeSlot {
+        &self.kept
+    }
+
+    /// Heap bytes the record holds (the memory census), the kept code's own bytes left to
+    /// `scan_kept`.
     pub(crate) fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.sites.borrow().capacity() * 8
+        std::mem::size_of::<Self>()
+            + self.sites.borrow().capacity() * 8
+            + self.kept.retained_metadata_bytes()
+    }
+
+    /// The kept code, for the memory census.
+    pub(crate) fn kept_code(&self) -> Option<std::rc::Rc<crate::jit::JitCode>> {
+        self.kept.get().flatten()
     }
 }
 
