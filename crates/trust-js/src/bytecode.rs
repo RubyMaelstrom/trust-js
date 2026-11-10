@@ -1309,20 +1309,19 @@ pub(crate) fn note_selected(chunk: &Chunk) -> bool {
     true
 }
 
-/// Whether `ic`, an entry its probe matched, holds code its function no longer enters first:
-/// its chunk was superseded by a newer one ([`Chunk::supersede`]), or the chunk's code changed
-/// in place since the fill (its entry word moved: [`Chunk::note_entry_change`], P3 stage 2,
-/// step 14). The caller refills it with its function's current code instead
-/// ([`refill_stale`]), or misses. A stale entry's code still lives: this is for speed, the
-/// epoch for safety.
+/// Whether `ic`, an entry its probe matched, holds code its function no longer enters first: the
+/// chunk's entry word moved since the fill ([`Chunk::note_entry_change`], P3 stage 2, step 14),
+/// because its code changed in place or a newer chunk superseded it ([`Chunk::supersede`] moves
+/// the word too, so that the word alone answers, in place of the superseded mark's test before
+/// it). The caller refills it with its function's current code instead ([`refill_stale`]), or
+/// misses. A stale entry's code still lives: this is for speed, the epoch for safety.
 ///
 /// # Safety
 /// `ic` matched the live epoch, so a user entry's chunk is alive (a native's is null).
 #[inline(always)]
 pub(crate) unsafe fn entry_stale(ic: *const CallIc) -> bool {
     let chunk = unsafe { (*ic).chunk_raw };
-    !chunk.is_null()
-        && unsafe { (*chunk).superseded() || u32::from((*chunk).entry_word()) != (*ic).entry }
+    !chunk.is_null() && unsafe { u32::from((*chunk).entry_word()) != (*ic).entry }
 }
 
 /// Refill `way`, a stale entry ([`entry_stale`]) whose probe matched (so its epoch and Realm are
@@ -3665,19 +3664,21 @@ pub struct Chunk {
     /// an install of the tier's keeps. Made at the tier's first use of the chunk, and dropped
     /// with it.
     pub(crate) opt: std::cell::OnceCell<Box<crate::opt::profile::ChunkProfile>>,
-    /// The entry word (P3 stage 2, step 14): counts, modulo 256, the changes of the code in
-    /// `jit` made in place, which leave the chunk its function's current code: the optimizing
-    /// tier's install of its code over the template JIT's, a discard's return to the template
-    /// JIT's code and a reoptimization's install. A call way copies it at its fill
-    /// ([`CallIc::entry`]), and every path that enters a way's code compares the two
-    /// ([`entry_stale`]; with the tier on, the direct sequence too), a mismatch refilling the way
-    /// from the chunk's current code ([`refill_stale`]), as V8's and SpiderMonkey's calls load a
-    /// function's current entry (its dispatch entry, its script's jitCodeRaw). For speed only: a
-    /// way that misses a change enters code that still lives (the template JIT's code an install
-    /// keeps), since every change that frees code moves the call caches' epoch as before. Between
-    /// two epoch moves it changes at most once, so its wrap is never seen. A byte, and the last
-    /// field: it takes the padding byte after the others, so that no field the template code
-    /// addresses moves and the tier off's code stays byte-identical ([`CHUNK_ENTRY_OFF`]).
+    /// The entry word (P3 stage 2, step 14): counts, modulo 256, the changes of the code a way
+    /// holding this chunk enters: those of the code in `jit` made in place (the optimizing tier's
+    /// install of its code over the template JIT's, a discard's return to the template JIT's
+    /// code and a reoptimization's install), and the chunk's supersession by a newer chunk
+    /// ([`Chunk::supersede`]). A call way copies it at its fill ([`CallIc::entry`]), and every
+    /// path that enters a way's code compares the two ([`entry_stale`]; with the tier on, the
+    /// direct sequence too), a mismatch refilling the way from the function's current code
+    /// ([`refill_stale`]), as V8's and SpiderMonkey's calls load a function's current entry (its
+    /// dispatch entry, its script's jitCodeRaw). For speed only: a way that misses a change enters
+    /// code that still lives (the template JIT's code an install keeps, a superseded chunk's),
+    /// since every change that frees code moves the call caches' epoch as before. Between two
+    /// epoch moves it changes at most twice (an install in place and a supersession), so its wrap
+    /// is never seen. A byte, and the last field: it takes the padding byte after the others, so
+    /// that no field the template code addresses moves and the tier off's code stays
+    /// byte-identical ([`CHUNK_ENTRY_OFF`]).
     entry: std::cell::Cell<u8>,
 }
 
@@ -24701,10 +24702,9 @@ impl Chunk {
     pub(crate) fn entry_word(&self) -> u8 {
         self.entry.get()
     }
-    /// The code in the chunk's slot changed in place (P3 stage 2, step 14; see the field
-    /// `entry`): every way that holds the old code refills at its next entry, and no other
-    /// call site re-resolves.
-    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    /// The code a way holding this chunk enters changed: in place, or by a supersession (P3
+    /// stage 2, step 14; see the field `entry`): every way that holds the chunk refills at its
+    /// next entry, and no other call site re-resolves.
     pub(crate) fn note_entry_change(&self) {
         self.entry.set(self.entry.get().wrapping_add(1));
     }
@@ -24713,13 +24713,17 @@ impl Chunk {
     /// src/sandbox/js-dispatch-table.h:267-271): this chunk's retry word becomes 1, so every
     /// direct entry into it takes the call helper (its gate, `jit::emit_direct_sequence`, sees
     /// the checkpoint due), which refills the entry's way with the function's current code
-    /// (`execution_code_for`), and Rust's probes miss on its ways. No other call site
+    /// (`execution_code_for`), and its entry word moves, so that Rust's probes find its ways
+    /// stale (`entry_stale`) and refill them likewise. No other call site
     /// re-resolves, and the call caches' epoch stays where it is. Frames running this chunk
     /// finish in it, and a caller that still enters it runs valid code: the chunk lives in its
     /// set-once slot as long as its function's runtime.
     pub(crate) fn supersede(&self) {
         if self.superseded.get().is_none() {
             self.superseded.set(Some(self.inline_retry_at.replace(1)));
+            // Rust's probes and, with the optimizing tier on, the direct sequence find its ways
+            // stale by the entry word alone (`entry_stale`).
+            self.note_entry_change();
             #[cfg(feature = "architecture-diagnostics")]
             call_cache_diagnostics::supersede();
         }
