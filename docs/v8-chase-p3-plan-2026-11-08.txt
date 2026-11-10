@@ -2269,3 +2269,77 @@ plan empty), one CPU (CPU 4: instructions are the reading, its cycles shared wit
 - Steps 12 to 14 do not change. If the measured passes still miss the 2% bar after them, the
   splicing policy is the next lever: only call sites with one callee, or guards by code, as the
   exemplars inline.
+
+Step 14, the tier's code on the first stage (design, 2026-11-10; input target/p3/stage2/
+recompile-input.txt sections 1, 3.B, 3.C, 4 and 5.1; after step 13). For an empty plan the tier
+compiles the function's first-stage chunk itself, as V8 and SpiderMonkey compile a function's one
+bytecode, and no second chunk is made; spliced plans keep their second stages until stage 3.
+1. try_inline_recompile: an empty plan with the tier on makes no compile_with_inlines and
+   publishes nothing: step 12's job compiles the first stage (its snapshot of the first stage's own
+   caches and records, no record map) and installs into it at the next poll; the first stage's
+   checkpoints end as now. The done test covers a first stage that carries the tier's code or has
+   its job pending, or a later checkpoint (the chain request's re-arm, supersede's) would build a
+   second stage on top. The size limit (refuses_unspliced) and a refusal keep the first stage's
+   template code as now, with no recompile to drop.
+2. Where the code goes (recompile-input's B2; SpiderMonkey's JitScript holds the Baseline and Ion
+   code side by side, jit/JitScript.h:295-400): the tier's code into the first stage's code slot
+   (chunk.jit, replace_resident, as reoptimize's install does), the template code it replaces
+   kept on the chunk as the fallback instead of retired. CLOCK may evict either, as now; a discard
+   whose kept code is gone compiles one, as today's discard does.
+3. The redirect (B's R2): the chunk's entry word, a u32 beside its runs and retry words that
+   counts its slot's code changes; a call way copies it at its fill (CallIc's free bytes 60-63,
+   after epoch) and every path that enters a way's code compares it: the direct sequence (it loads
+   the callee chunk and its retry word already), jit_call_hit, resolve_cached_call,
+   prepared_call_current, the construct sites and the overflow table. A mismatch takes the slow
+   path, which refills from the chunk's current code. The exemplars load the current entry at each
+   call (SpiderMonkey's jitCodeRaw, vm/JSScript.cpp:3487-3520; V8's dispatch entry,
+   objects/js-function-inl.h:126-167); a TRust way caches more than the entry (the code's memory,
+   its pc table, the CLOCK reference), all of it the code's, so it checks one word and refills; a
+   global epoch move per install (R1) is P2's measured loser (v8-chase-p2-plan-2026-10-26.txt:
+   6558-6602). Template code compiled with the tier off emits no compare and stays byte-identical
+   (as step 11's direct gate), since without the tier no slot's code changes in place.
+   Correctness stays on today's mechanism: after an install a stale way enters the kept template
+   code, which is valid; a discard and a reoptimization move the global epoch as now, besides the
+   entry word, so no stale way can enter discarded code once it is released. A missed compare
+   costs speed, not correctness; leaving the epoch at discards to the entry word alone belongs to
+   the dependencies' invalidation points (point 7), once every path is proven.
+4. The discard falls back to code that exists (JSC's jettison installs the baseline code,
+   bytecode/CodeBlock.cpp:2400-2434; V8's deopt points the dispatch entry at the interpreter,
+   objects/code.cc:166-224): the kept template code goes back into the slot, and swap_in_template
+   compiles only where the kept code is gone. R + 1, the flags (on the first stage), the exit and
+   loop limits and the warm-up as now; the warm-up's gate admits a first stage that carried the
+   tier's code, on its inline_retry_at, free since its checkpoints ended. Reoptimize: generate on
+   the first stage as now; its install keeps the template code as the fallback again.
+5. The chain recompile (reoptimize_without_property_chains) is unchanged: it supersedes the first
+   stage, the tier's code included, as it supersedes a spliced second stage and its tier code
+   today; a job of a chunk superseded meanwhile is dropped at the install (step 12's check).
+6. Exits resume on the first stage's ops and its borrowed-frame code (ctx.chunk is the first
+   stage), step 13's loop limit unchanged. The exit profile's keys that were chunk2's unmapped pcs
+   are the first stage's, which a caller's splice of this function then reads under the
+   inline-kind rules, as JSC keeps one exit profile per function that its inlined uses read too
+   (bytecode/UnlinkedCodeBlock.h:322-334; each inlined frame's parser entry takes its callee's,
+   dfg/DFGByteCodeParser.cpp:11696).
+7. The census and coverage: no "[tier] inlined 0 site(s)" line for these, "[opt] compiled" names
+   the first stage as now, and the kept code is labeled the first stage's (template_class). The
+   coverage tool (coverage2.py, which joins samples to code by time) counts a first stage's
+   template samples taken after the tier's first install into it as fallback, or the bar's
+   denominator would lose them; the sessions sum the main-thread lines as now, without recompile
+   lines for these.
+- Tests: an empty plan's function runs the tier's code on its first stage with no second chunk; a
+  way filled before the install enters the tier's code after it, with no epoch move, through each
+  path (the direct sequence, jit_call_hit, resolve_cached_call, prepared_call_current, a construct
+  site, the overflow table); a discard restores the kept code without a compile, and compiles one
+  when the kept code was evicted; the warm-up and reoptimization on the first stage; the done test;
+  the chain recompile superseding a first stage that carries the tier's code; a job whose first
+  stage was superseded meanwhile dropped; the exit profile on the first stage read by a caller's
+  splice; the tier off byte-identical.
+- Expected: the empty plans' recompiles gone (684 of the census's 1,135 second stages; per run
+  Djot's 0.866M cycles, 0.69 ms, 0.9% of its pass; React's 0.119M, 0.3%; Vue's 0.353M, 0.16%),
+  with their chunks' memory and the fallback compiles of empty-plan discards (none on the
+  fixtures, 104 in the census); Djot's counted main-thread share about 2.6% of its pass (the owner's
+  answer's record). Cost: a load and a compare per direct call and per Rust probe with the tier on
+  (Octane's fixed runs and the call microbenchmarks measure it). Risks: the fallback is the first
+  stage's template code as compiled at its first native entry (no acyclic regions; compact
+  templates baked from the caches then), where today's is compiled at the discard from mature
+  caches, so the runs between a discard and its reoptimization may be slower (measured: the
+  fallback samples' share on the fixtures and Octane); and the compare on every call path.
