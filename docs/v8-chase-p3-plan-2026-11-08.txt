@@ -2541,3 +2541,24 @@ thread.
   compile thread behind an Arc, and its remaining pure facts made there, would cut it); the
   reruns' latency; tests that read the tier's state right after an evaluation may still fail
   rarely in the asynchronous configuration (finish_compiles_for_test is the fix's form).
+
+The fixtures' timer landed (b7b2a1cd..3cd1b05f, 2026-11-10; target/p3/stage2/perfnow-impl), as designed:
+Engine::unstable_install_shell_performance (builtins/host.rs install_shell_performance: a plain
+non-enumerable performance object, now() of length 0 reading a process-wide OnceLock<Instant>
+origin set at the first install), the shell's call after Engine::new() and its --help's Globals;
+the fixtures' timer lines (new hashes in PROVENANCE.txt; the lines before the first timer line
+byte-identical, the warm copies checked equal up to it); fx3 under target/p3/stage2. Tests:
+crates/trust-js/tests/shell_performance.rs (the object's shape; under each tier, 10,000 readings
+never decreasing with a step under a millisecond, the first under a minute, a 20 ms busy wait by
+Date.now() reading 19 ms or more and under a second), each assertion's mutation caught through a
+prelude on the built shell (seconds, microseconds, whole milliseconds, the wall clock, a step
+backwards; enumerable, a length of 1, absent); clippy -D warnings on the crate, fmt. The fixtures'
+outputs carry PROVENANCE's fields on the shell and on Node.
+A finding while making fx3: fx2's Vue passes 2-10 ran after the fixture's reaction.stop(), so they
+timed the reactive model's writes with the effect unsubscribed (invocations stay at 12,359; Node
+about 64 ms a pass against 86 ms with the effect), not the measured pass's work. Stage 1's and
+stage 2's steady-state Vue rows (fx2) measured that lighter work, the tier on and off alike: their
+on/off comparisons hold for it, not for Vue's steady state as its measured pass defines the work.
+fx3 runs the nine passes before reaction.stop() and checks the work (invocations 113,609 after
+them, on Node and on the shell). fx2's Djot printed the time since its start (all ten sets) where
+the others print the measured pass; no report read that field, and fx3 prints the measured pass.
