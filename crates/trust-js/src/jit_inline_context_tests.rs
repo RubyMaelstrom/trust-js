@@ -192,6 +192,8 @@ fn hot_private_names_and_typeof_closure_reads_keep_definition_environments() {
 
 #[test]
 fn frame_independent_effects_still_inline_with_local_and_receiver_remapping() {
+    // The second stage is read right after its checkpoint.
+    crate::opt::pin_synchronous_for_test();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);

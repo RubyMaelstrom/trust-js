@@ -626,6 +626,8 @@ fn a_region_loop_completes_when_the_poll_word_makes_it_bail() {
 /// alone then sends every poll to its slow path.
 #[test]
 fn no_poll_takes_its_slow_path_while_the_word_is_clear() {
+    // A compile off the main thread sets the word's install bit, whose slow path installs it.
+    crate::opt::pin_synchronous_for_test();
     const SOURCE: &str = r#"
         function depth(n) { return n === 0 ? 0 : depth(n - 1) + 1; }
         function deep(rounds) {

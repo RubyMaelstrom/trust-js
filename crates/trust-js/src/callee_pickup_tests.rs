@@ -84,6 +84,8 @@ const LEAF: &str = r#"
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_callers_way_picks_up_its_callees_new_code_and_no_other_site_refills() {
+    // The callee's new code is published at its checkpoint, which this test reads at once.
+    crate::opt::pin_synchronous_for_test();
     // CALL_IC_EPOCH is process-wide: a test beside this one that drops a function's runtime or
     // reclaims code moves it, and every way refills. Check a run that ended at its start's epoch,
     // read before the setup fills the bystander's way.

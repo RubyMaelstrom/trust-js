@@ -316,6 +316,30 @@ pub(crate) fn pin_forced_exits_off_for_test() {
     .set();
 }
 
+/// Keep the tier as the environment sets it, compiling on the main thread (P3 stage 2, step 12),
+/// on this thread: for a test that reads what a compile changed at once (a second stage's
+/// publication, its callers' pickup, the polls' slow paths), which a compile off the main thread
+/// changes only at the poll after it ends (V8's --single-threaded for such tests). Called first
+/// in the test, as `pin_tier_off_for_test` is.
+#[cfg(test)]
+pub(crate) fn pin_synchronous_for_test() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    TestSwitches {
+        on: enabled(),
+        eager: eager(),
+        exit_every: exit_every(),
+        no_reopt: no_reopt(),
+        no_exit_profile: no_exit_profile(),
+        exit_limit: exit_limit_base(),
+        no_loop_count: no_loop_count(),
+        asynchronous: false,
+    }
+    .set();
+}
+
 /// Keep the tier as the environment sets it, its template code counting no loop iterations
 /// toward the checkpoints (TRUST_JS_OPT_NO_LOOP_COUNT), on this thread: for a test whose subject
 /// needs its callees to reach their checkpoints before a caller whose loop calls them (stage 2,

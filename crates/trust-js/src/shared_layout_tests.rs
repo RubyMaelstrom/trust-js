@@ -327,6 +327,8 @@ fn constructed_instances_use_shared_layouts_in_all_tiers() {
 ))]
 #[test]
 fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
+    // The constructors' second stages are read right after their checkpoints.
+    crate::opt::pin_synchronous_for_test();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);
