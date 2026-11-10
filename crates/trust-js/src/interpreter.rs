@@ -19936,6 +19936,13 @@ pub(crate) struct Publication {
     pub(crate) func: std::rc::Weak<crate::ast::Function>,
     /// The chunk whose checkpoint asked, where the function's runtime holds it, which a compile
     /// off the main thread marks compiling until its install.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) asking: Option<Rc<crate::bytecode::Chunk>>,
     /// The publishing call's global environment (`FunctionRuntime::publish`).
     pub(crate) genv: usize,
