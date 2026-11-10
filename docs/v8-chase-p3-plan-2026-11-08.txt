@@ -2401,3 +2401,61 @@ clock, not coarsened (as d8's, the runtime's and Node's):
 - Landing: after the two running agents' measurements (they read benchmarks/fixtures and
   attrib/fx2 from main's tree) and after step 12, whose rebase this does not touch. The two-CPU
   session runs with it.
+
+Step 15, the exemplars' splice rule (design, 2026-11-10; input target/p3/stage2/
+splice-policy-input.txt, the probe 911f9b8e on p3-splice-probe, never landed). With the tier on,
+plan_inlines_at splices no call site whose ways hold more than one distinct callee, and none that
+has met another closure of a way's function:
+1. Several callees: Maglev inlines no polymorphic call (only a polymorphic load's constant-
+   function arms; inlining-input.txt 1.1.6), and Warp's trial inlining skips a site with more than
+   one stub (jit/TrialInlining.cpp:865-878). JSC's DFG inlines polymorphic calls, so this half is
+   V8's and SpiderMonkey's rule.
+2. Another closure: all three keep inlining such a site, guarded by the callee's code instead of
+   its identity. SpiderMonkey's later stubs guard the script (GuardFunctionScript, jit/CacheIR.cpp:
+   6607-6623). JSC despecifies a site that has seen closures to its executable (bytecode/
+   CallLinkStatus.cpp:228-232; dfg/DFGByteCodeParser.cpp:1932-1954). V8's call feedback moves to
+   the closures' shared feedback cell (src/builtins/ic-callable.tq:132-148). A splice pins its
+   callee's identity and its environment, so until stage 3 builds callees into the caller's graph
+   with a code guard and the environment read from the callee, not splicing is stage 2's form of
+   their rule.
+3. The record of a code-keyed hit. V8 writes the feedback cell once, at the transition
+   (ic-callable.tq:148), and its steady state compares without writing (107, 137). The probe's
+   sticky byte cost two instructions at every code-keyed hit (+0.06M to +0.81M instructions in the
+   measured passes, the tier off's too). The step records a site's first code-keyed hit once: the
+   site's code hint starts at a value the hinted-way test cannot hit, so the first code-keyed hit
+   takes the full code probe, which writes the hint as it does today, and the planner reads that
+   the hint was written. Where the hint's encoding cannot carry that safely at no cost, the
+   fallback is one instruction on the hit paths (a store of the zero register into a byte that
+   starts non-zero). The Rust paths record too: resolve_cached_call_entry's code-sharing retry
+   (the VM's and the prepared calls') and jit_call_hit's live-closure path.
+4. The tier off keeps P2's policy. It is the bar's baseline, the template JIT's spliced guard
+   failures are not the tier's exits and discards, and splicing's measured worth with the tier off
+   stands. The hint's initial value is the only change it sees: one full probe at a site's first
+   code-keyed hit.
+5. A site that meets its second closure after its splice: its guard's WrongCallee exits run to the
+   exit limit as now, and the reoptimization's plan reads the record. Check that the
+   reoptimization plans again rather than reusing the old splice; where it does not, the discard
+   flags the site, as stage 2's discards flag sites.
+6. Skipped sites leave empty plans where a function had nothing else to splice, which step 14
+   compiles on the first stage.
+- Expected, from the probe's instructions against main's policy:
+  - Octane's geomean -1.8%: Richards -12.5%, DeltaBlue -7.7%, RayTrace -3.9%; Splay, Mandreel,
+    Crypto and TypeScript kept.
+  - React's measured pass -3.4%, which puts it 3.1% under the tier off.
+  - Djot's measured pass -0.9% and its passes 2-10 -1.7%.
+  - Vue unchanged.
+  - Every WrongCallee exit on the fixtures gone.
+  Djot's measured pass stays +4.6% over the tier off in instructions. That is compile work for
+  splices that buy nothing on its first ten parses; step 12 takes it off the main thread, but
+  not out of the instruction count.
+- Tests:
+  - a two-callee site not spliced with the tier on, and spliced with it off;
+  - a site of fresh closures of one function (React's map callback) not spliced once a code-keyed
+    hit happened, through each path that records it;
+  - a one-closure site spliced as now;
+  - the record's cost: nothing on an identity hit, and the template code's instructions on a
+    code-keyed hit;
+  - a late second closure's next plan;
+  - the tier off's plans unchanged.
+- Order: after step 13 lands, beside step 14. Its call paths are near step 14's entry word, so the
+  agent that lands second rebases.
