@@ -79,8 +79,8 @@ unsafe impl Send for SendExecutable {}
 
 /// A compile's outputs (see the module's doc).
 pub(crate) struct Finished {
-    /// The job, for a retry after its missing stubs, and for the log's facts.
-    pub(crate) job: Job,
+    /// The job where it runs again (`Outcome::Needs`); otherwise the compile's thread dropped it.
+    pub(crate) job: Option<Job>,
     pub(crate) outcome: Outcome,
     /// The builder's declines, which the install logs.
     pub(crate) declines: Vec<Decline>,
@@ -134,7 +134,7 @@ pub(crate) fn compile(job: Job) -> Finished {
             Some(table) => Stubs::frozen(table),
             None => Stubs::live(),
         };
-        let assembled = match a64::assemble(
+        let mut assembled = match a64::assemble(
             &job.view,
             &graph,
             &cfg,
@@ -159,12 +159,19 @@ pub(crate) fn compile(job: Job) -> Finished {
             .then(|| ExecutableBuffer::from_bytes_quietly(assembled.bytes()))
             .flatten()
             .map(SendExecutable);
+        if executable.is_some() {
+            // The mapping holds the bytes: the words are freed here, not at the install.
+            assembled.words = Vec::new();
+        }
         Outcome::Compiled(Box::new(Compiled {
             assembled,
             executable,
             nodes: graph.nodes.len(),
         }))
     })();
+    // The job's frozen view, snapshot and stub table go here, on the compile's thread, unless
+    // the job runs again.
+    let job = matches!(outcome, Outcome::Needs { .. }).then_some(job);
     Finished {
         job,
         outcome,

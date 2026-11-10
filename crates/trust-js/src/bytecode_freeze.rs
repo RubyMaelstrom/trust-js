@@ -6,32 +6,33 @@ use crate::opt::view::{FrozenChunk, FrozenConst, InlineTargetView};
 
 impl Chunk {
     /// The tier's frozen view of this chunk (see `opt::view`): its immutable data copied, its
-    /// lazily built facts forced, the live state the back end bakes in read now, and its cells'
-    /// and images' addresses as words. Main thread only: it upgrades the inline targets' pins and
-    /// reads the agent heap's allocation sites.
+    /// lazily built facts forced (but those of the operations alone, which the compile makes),
+    /// the live state the back end bakes in read now, and its cells' and images' addresses as
+    /// words; the names' keys looked up where `interns` is false (a compile off the main
+    /// thread). Main thread only: it upgrades the inline targets' pins and reads the agent
+    /// heap's allocation sites.
     pub(crate) fn freeze(&self, interns: bool) -> FrozenChunk {
         let ops = self.ops.as_slice();
-        let len = ops.len();
         let mut names = String::new();
         let mut name_ends = Vec::with_capacity(self.names.len());
         for name in &self.names {
             names.push_str(name);
             name_ends.push(names.len() as u32);
         }
-        let consts = self
-            .consts
-            .iter()
-            .enumerate()
-            .map(|(k, _)| {
-                let k = k as u32;
-                FrozenConst {
-                    copyable: self.jit_const_copyable(k),
-                    scalar_bits: self.jit_const_scalar_bits(k),
-                    is_str: self.jit_const_is_str(k),
-                    str_word: self.jit_const_str_word(k),
+        // The constants the operations push, the only ones a compile reads.
+        let mut consts = vec![None; self.consts.len()];
+        for op in ops {
+            if let Op::Const(k) = *op {
+                if let Some(slot @ None) = consts.get_mut(k as usize) {
+                    *slot = Some(FrozenConst {
+                        copyable: self.jit_const_copyable(k),
+                        scalar_bits: self.jit_const_scalar_bits(k),
+                        is_str: self.jit_const_is_str(k),
+                        str_word: self.jit_const_str_word(k),
+                    });
                 }
-            })
-            .collect();
+            }
+        }
         let fixed_activation = self.jit_fixed_activation();
         // The captured bindings the cap operations' templates read (`jit_operations::fixed_cap`):
         // their names' slots in the fixed activation's plan.
@@ -50,14 +51,19 @@ impl Chunk {
                 }
             }
         }
-        // The named operations' names' keys, where their atoms exist (none is made here).
+        // The named operations' names' keys, where their atoms exist (none is made here), for a
+        // compile off the main thread; one on it makes a key when a template asks for it, as the
+        // template JIT does.
         let mut keys = vec![None; self.names.len()];
-        for op in ops {
-            if let Some(n) = super::named_site_name(op) {
-                if let Some(key) = keys.get_mut(n as usize) {
-                    if key.is_none() {
-                        *key = crate::atom::PropKey::lookup_text(&self.names[n as usize])
-                            .map(|key| key.word());
+        if !interns {
+            let mut looked = vec![false; self.names.len()];
+            for op in ops {
+                if let Some(n) = super::named_site_name(op) {
+                    if let Some(looked @ false) = looked.get_mut(n as usize) {
+                        *looked = true;
+                        keys[n as usize] =
+                            crate::atom::PropKey::lookup_text(&self.names[n as usize])
+                                .map(|key| key.word());
                     }
                 }
             }
@@ -144,7 +150,7 @@ impl Chunk {
             keys: keys.into_boxed_slice(),
             interns,
             missing_keys: Default::default(),
-            consts,
+            consts: consts.into_boxed_slice(),
             n_params: self.n_params,
             n_slots: self.n_slots,
             resumable: self.resumable,
@@ -160,16 +166,7 @@ impl Chunk {
             inline_activation: self.jit_inline_activation(),
             prologue_copies: self.jit_prologue_copies(),
             mapped_formals: self.jit_mapped_formals(),
-            stack_effects: (0..len)
-                .map(|pc| {
-                    self.jit_stack_effect(pc)
-                        .map(|(pops, pushes)| (pops as u32, pushes as u32))
-                })
-                .collect(),
-            cap_initialized: self
-                .jit_cap_tdz_known
-                .get_or_init(|| super::cap_tdz_known(&self.ops))
-                .clone(),
+            cap_initialized: std::cell::OnceCell::new(),
             cap_bindings: cap_bindings.into_boxed_slice(),
             name_statics: self.name_statics.clone(),
             name_globals: self.name_globals.clone(),

@@ -2,12 +2,13 @@
 //! main thread", point 2): what the builder, the verifier and the back end read of the chunk,
 //! copied or forced on the main thread with the snapshot (`Chunk::freeze`), so that a compile
 //! reads no chunk state at all and can run on another thread. It holds plain data only: the
-//! operations, the names' text, the constants' words, the frame's facts, the stack effects, the
-//! lazily built facts forced (the activation plan's, the captured bindings' TDZ facts, the
-//! resolution sites), the live state the back end bakes in read once (the compact templates'
-//! preferred ways, the inline targets' callee words and environments with their pins upgraded,
-//! the in-line allocation sites of the agent heap), and the addresses of the chunk's cells and
-//! images as words the code embeds and nothing reads through. The chunk outlives every code that
+//! operations, the names' text, the constants' words, the frame's facts, the lazily built facts
+//! forced (the activation plan's, the resolution sites), the live state the back end bakes in
+//! read once (the compact templates' preferred ways, the inline targets' callee words and
+//! environments with their pins upgraded, the in-line allocation sites of the agent heap), and
+//! the addresses of the chunk's cells and images as words the code embeds and nothing reads
+//! through. What is a function of the operations alone (the stack effects, the captured
+//! bindings' TDZ facts) it makes on the compile's thread. The chunk outlives every code that
 //! embeds them: the engine's list of pending compiles keeps it alive until the install.
 //!
 //! The shared emitters read it through `jit::JitChunk`, as they read a live chunk, so that the
@@ -58,15 +59,18 @@ pub(crate) struct FrozenChunk {
     pub(crate) names: Box<str>,
     pub(crate) name_ends: Box<[u32]>,
     /// The property keys' words (`atom::PropKey::word`) of the names the named operations read
-    /// and write, by name index, where the chunk's heap had their atoms at the freeze (an atom is
-    /// made only where a template embeds one: `jit_name_key`).
+    /// and write, by name index, where the chunk's heap had their atoms at the freeze of a
+    /// compile off the main thread (an atom is made only where a template embeds one:
+    /// `jit_name_key`); none for one on the main thread, which makes them as its templates ask.
     pub(crate) keys: Box<[Option<u64>]>,
     /// Whether the compile runs on the main thread, which makes a missing key's atom when a
     /// template asks for it, as the template JIT does; elsewhere the name is recorded in
     /// `missing_keys` for the main thread to make before the compile runs again.
     pub(crate) interns: bool,
     pub(crate) missing_keys: std::cell::RefCell<Vec<u32>>,
-    pub(crate) consts: Box<[FrozenConst]>,
+    /// The constants the operations push (`Op::Const`), by index; None for the others, which
+    /// nothing in a compile reads.
+    pub(crate) consts: Box<[Option<FrozenConst>]>,
     pub(crate) n_params: usize,
     pub(crate) n_slots: usize,
     pub(crate) resumable: bool,
@@ -83,10 +87,9 @@ pub(crate) struct FrozenChunk {
     #[allow(clippy::type_complexity)]
     pub(crate) prologue_copies: Option<(Vec<(u32, u16)>, Option<u32>)>,
     pub(crate) mapped_formals: Option<(u32, Option<u32>)>,
-    /// Each pc's (pops, pushes), None where the native tiers do not compile the operation.
-    pub(crate) stack_effects: Box<[Option<(u32, u32)>]>,
-    /// Each pc's `Chunk::jit_cap_initialized`.
-    pub(crate) cap_initialized: Box<[bool]>,
+    /// Each pc's `Chunk::jit_cap_initialized` (`bytecode::cap_tdz_known` of the operations),
+    /// made from the operations on the compile's thread when the compile first asks.
+    pub(crate) cap_initialized: std::cell::OnceCell<Box<[bool]>>,
     /// Each name's `Chunk::jit_cap_binding` (empty where the chunk's activation is not fixed).
     pub(crate) cap_bindings: Box<[Option<(u32, BindingAttrs)>]>,
     pub(crate) name_statics: Box<[Option<StaticName>]>,
@@ -173,16 +176,29 @@ impl FrozenChunk {
         self.fixed_activation
     }
 
+    /// (pops, pushes) of the operation at `pc` (`Chunk::jit_stack_effect`), from the operations,
+    /// on the compile's thread.
     pub(crate) fn jit_stack_effect(&self, pc: usize) -> Option<(usize, usize)> {
-        self.stack_effects
-            .get(pc)
-            .copied()
-            .flatten()
-            .map(|(pops, pushes)| (pops as usize, pushes as usize))
+        crate::bytecode::stack_effect(&self.ops, pc, self.resumable, false)
     }
 
     pub(crate) fn jit_cap_initialized(&self, pc: usize) -> bool {
-        self.cap_initialized.get(pc).copied().unwrap_or(false)
+        self.cap_initialized
+            .get_or_init(|| crate::bytecode::cap_tdz_known(&self.ops))
+            .get(pc)
+            .copied()
+            .unwrap_or(false)
+    }
+
+    /// Constant `k`, which an `Op::Const` pushes (a compile reads no other); none embeddable
+    /// otherwise, which debug builds refuse.
+    fn constant(&self, k: u32) -> FrozenConst {
+        let constant = self.consts.get(k as usize).copied().flatten();
+        debug_assert!(
+            constant.is_some(),
+            "no Op::Const of the chunk pushes constant {k}"
+        );
+        constant.unwrap_or_default()
     }
 
     pub(crate) fn jit_inline_target(&self, t: u32) -> &InlineTargetView {
@@ -190,19 +206,19 @@ impl FrozenChunk {
     }
 
     pub(crate) fn jit_const_copyable(&self, k: u32) -> bool {
-        self.consts[k as usize].copyable
+        self.constant(k).copyable
     }
 
     pub(crate) fn jit_const_scalar_bits(&self, k: u32) -> Option<u64> {
-        self.consts[k as usize].scalar_bits
+        self.constant(k).scalar_bits
     }
 
     pub(crate) fn jit_const_is_str(&self, k: u32) -> bool {
-        self.consts[k as usize].is_str
+        self.constant(k).is_str
     }
 
     pub(crate) fn jit_const_str_word(&self, k: u32) -> Option<u64> {
-        self.consts[k as usize].str_word
+        self.constant(k).str_word
     }
 
     pub(crate) fn jit_inline_attempted_off(&self) -> usize {

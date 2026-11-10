@@ -24903,280 +24903,7 @@ impl Chunk {
     }
 
     fn jit_stack_effect_for_entry(&self, pc: usize, borrowed: bool) -> Option<(usize, usize)> {
-        if matches!(self.ops[pc], Op::FragmentExit(_)) && !borrowed {
-            return None;
-        }
-        // AssignTarget enters the normative tree-walker with a projected Environment Record.
-        // Keep that uncommon bridge in the bytecode VM: re-entering arbitrary evaluator code
-        // from a packed ARM64 frame is both unnecessary for coroutine conversion and unsafe for
-        // JIT ownership assumptions. The rest of the function still avoids the tree-walker and,
-        // crucially, coroutine bodies remain heap-owned rather than native-thread-backed.
-        if matches!(
-            self.ops[pc],
-            Op::AssignTarget(_)
-                | Op::EvalExpr(_)
-                | Op::PushWith
-                | Op::PushLex(_)
-                | Op::PushCatchLex(_)
-                | Op::CloneLex(_)
-                | Op::InitLex(_)
-                | Op::PopEnv
-                | Op::ResolveNameRef(..)
-                | Op::LoadRef(_)
-                | Op::StoreRef(_)
-                | Op::PushDisposeFrame
-                | Op::AddDisposable(_)
-                | Op::DisposeNormal
-                | Op::DisposeThrow
-                | Op::DisposeReturn
-                | Op::DisposeBareReturn
-                | Op::DisposeResumeReturn
-                | Op::DisposeJump
-                | Op::StoreConstLocal(..)
-                | Op::StoreConstCap(_)
-                | Op::UpdateConst(..)
-                | Op::RequireObject
-                | Op::DestructureStepL(..)
-                | Op::DestructureRestL(..)
-                | Op::IterCloseIfNotDoneL(..)
-                | Op::IterAbortIfNotDoneL(..)
-                | Op::ObjectRest(_)
-                | Op::AsyncIterStepL(..)
-                | Op::AsyncIterCloseL(..)
-                | Op::NewArray
-                | Op::ArrayPush
-                | Op::ArrayHole
-                | Op::ArraySpread
-                | Op::CallArgsArray
-                | Op::CallArgsArrayThis
-                | Op::EvalCallArgsArray
-                | Op::TailEvalCallArgsArray
-                | Op::NewArgsArray
-                | Op::ImportMeta
-                | Op::DynamicImport(..)
-                | Op::UpdatePrivate(..)
-                | Op::SuperCallStart
-                | Op::SuperCallArgsArray
-                | Op::LoadLexicalThis
-                | Op::SuperThis
-                | Op::SuperBase
-                | Op::SuperGet
-                | Op::SuperGetKeep
-                | Op::SuperGetMethod
-                | Op::SuperSet
-                | Op::SuperUpdate(_)
-                | Op::TemplateObject(_)
-                | Op::RequireCallable
-                | Op::ClassStart(..)
-                | Op::ClassHeritage(..)
-                | Op::ClassKey(..)
-                | Op::ClassDecorator(..)
-                | Op::ClassFinish(_)
-                | Op::ClassAbort(_)
-        ) && !jit_bridge_op(&self.ops[pc])
-            && !(self.resumable && jit_slice_exit_op(&self.ops[pc]))
-            && !(borrowed
-                && matches!(
-                    self.ops[pc],
-                    Op::DisposeNormal
-                        | Op::DisposeThrow
-                        | Op::DisposeReturn
-                        | Op::DisposeBareReturn
-                        | Op::DisposeResumeReturn
-                        | Op::DisposeJump
-                ))
-        {
-            return None;
-        }
-        let upd = |k: &UpdKind| match k {
-            UpdKind::IncDiscard | UpdKind::DecDiscard => 0,
-            _ => 1,
-        };
-        Some(match &self.ops[pc] {
-            Op::FragmentExit(_) => (1, 0),
-            Op::AnnexBSync(_) => (0, 0),
-            Op::Const(_)
-            | Op::Undef
-            | Op::LoadLocal(_)
-            | Op::LoadCap(_)
-            | Op::LoadName(..)
-            | Op::LoadNameIn(..)
-            | Op::LoadThis
-            | Op::LoadLexicalThis
-            | Op::MakeClosure(..) => (0, 1),
-            Op::Dup => (1, 2),
-            Op::Dup2 => (2, 4),
-            Op::Pop
-            | Op::StoreLocal(_)
-            | Op::StoreCap(_)
-            | Op::StoreCapInit(_)
-            | Op::StoreName(_)
-            | Op::StoreGlobalName(_)
-            | Op::StoreNameCached(..)
-            | Op::StoreConstLocal(..)
-            | Op::StoreConstCap(_)
-            | Op::UpdateConst(..) => (1, 0),
-            Op::UpdateLocal(_, k) | Op::UpdateCap(_, k) | Op::UpdateName(_, k) => (0, upd(k)),
-            Op::UpdateNameCached(_, _, k) => (0, upd(k)),
-            Op::UpdateProp(_, _, k) => (1, upd(k)),
-            Op::UpdateElem(k) => (2, upd(k)),
-            Op::Tdz(_) => (0, 0),
-            Op::GetProp(..) | Op::RequireObject => (1, 1),
-            Op::GetPropThis(..) => (0, 1),
-            Op::GetPropLocal(..) => (0, 1),
-            Op::SetProp(..) => (2, 1),
-            Op::SetPropDrop(..) => (2, 0),
-            Op::SetPropThisDrop(..) => (1, 0),
-            Op::SetPropLocalDrop(..) => (1, 0),
-            Op::GetElem => (2, 1),
-            Op::SetElem => (3, 1),
-            Op::SetElemDrop => (3, 0),
-            Op::AppendProp(..) => (3, 0),
-            Op::DestructureGuard => (1, 1),
-            Op::DestructureArr(n) => (1, *n as usize),
-            Op::TryArrayBinding(..) => (1, 2),
-            Op::ArrayBindingStep(..) => (0, 1),
-            Op::AssignTarget(_) => (1, 0),
-            Op::EvalExpr(_) => (0, 1),
-            Op::ClassStart(_, count) => (*count as usize * 2, 0),
-            Op::ClassAbort(_) => (0, 0),
-            Op::ClassHeritage(_, present) => (usize::from(*present), 0),
-            Op::ClassKey(..) => (1, 0),
-            Op::ClassDecorator(..) => (2, 0),
-            Op::ClassFinish(_) => (0, 1),
-            Op::ResolveNameRef(..) => (0, 0),
-            Op::LoadRef(_) => (0, 1),
-            Op::StoreRef(_) => (1, 0),
-            Op::PushWith => (1, 0),
-            Op::PushLex(_) | Op::PushCatchLex(_) | Op::CloneLex(_) => (0, 0),
-            Op::InitLex(_) => (1, 0),
-            Op::PopEnv => (0, 0),
-            Op::PushDisposeFrame | Op::DisposeNormal => (0, 0),
-            Op::AddDisposable(_) => (1, 1),
-            Op::DisposeThrow | Op::DisposeReturn | Op::DisposeResumeReturn => (1, 0),
-            Op::DisposeBareReturn => (0, 0),
-            Op::DisposeJump => (2, 0),
-            Op::ObjectRest(count) => (*count as usize + 1, 1),
-            Op::DeleteProp(..) => (1, 1),
-            Op::DeleteElem(_) => (2, 1),
-            Op::DeleteName(_) => (0, 1),
-            Op::DeleteSuper => (0, 0),
-            Op::CallSpread(argc, _) => (*argc as usize + 1, 1),
-            Op::CallSpreadThis(argc, _) => (*argc as usize + 2, 1),
-            Op::CallArgsArray => (2, 1),
-            Op::CallArgsArrayThis => (3, 1),
-            Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => (3, 1),
-            Op::TailDeep => (0, 1),
-            Op::TailCall(mode, with_this) => {
-                let count = match mode {
-                    CallArgsMode::Fixed(count) | CallArgsMode::FinalSpread(count) => {
-                        *count as usize
-                    }
-                    CallArgsMode::Array => 1,
-                };
-                (count + 1 + usize::from(*with_this), 1)
-            }
-            Op::ToStr => (1, 1),
-            Op::GetIter => (1, 2),
-            Op::GetAsyncIter => (1, 3),
-            Op::ForInKeys => (1, 1),
-            Op::ForInStepL(..) => (0, 2),
-            Op::IterStepL(..) => (0, 2),
-            Op::IterNextBuiltin(_) => (0, 1),
-            Op::RequireIterResult => (1, 1),
-            Op::IterCloseL(_) => (0, 0),
-            Op::IterAbortL(_) => (1, 0),
-            Op::DestructureStepL(..) | Op::DestructureRestL(..) => (0, 1),
-            Op::IterCloseIfNotDoneL(..) => (0, 0),
-            Op::IterAbortIfNotDoneL(..) => (1, 0),
-            Op::AsyncIterStepL(..) => (0, 1),
-            Op::AsyncIterResumeL(..) => (1, 2),
-            Op::AsyncIterCloseL(..) => (0, 0),
-            Op::GetElemLocal(_) | Op::ArgElem(_) | Op::RestElem(_) => (1, 1),
-            Op::ArgLength(..) | Op::RestLength(..) => (0, 1),
-            Op::SetElemLocal(_) => (2, 1),
-            Op::SetElemLocalDrop(_) => (2, 0),
-            Op::ToPropKey => (2, 2),
-            Op::ToPropKeyLocal(_) => (1, 1),
-            Op::GetMethod(..) => (1, 2),
-            Op::GetMethodElem => (2, 2),
-            Op::Add
-            | Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Mod
-            | Op::BitAnd
-            | Op::BitOr
-            | Op::BitXor
-            | Op::Shl
-            | Op::Shr
-            | Op::UShr
-            | Op::Lt
-            | Op::Gt
-            | Op::Le
-            | Op::Ge
-            | Op::EqEq
-            | Op::NotEq
-            | Op::StrictEq
-            | Op::StrictNotEq
-            | Op::InstanceOf(_)
-            | Op::In
-            | Op::GenBin(_) => (2, 1),
-            Op::Neg
-            | Op::Plus
-            | Op::Not
-            | Op::BitNot
-            | Op::Typeof
-            | Op::TypeofIs(..)
-            | Op::Void => (1, 1),
-            Op::TypeofName(_) => (0, 1),
-            Op::Jump(_) | Op::AbruptJump(..) => (0, 0),
-            Op::InlineGuard(..) => (0, 0),
-            Op::ResetSlots(..) => (0, 0),
-            Op::JumpIfFalse(_) => (1, 0),
-            Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
-            Op::Call(argc, _) => (*argc as usize + 1, 1),
-            Op::LoadNameForCall(..) | Op::LoadNameForCallIn(..) => (0, 2),
-            Op::CallWithThis(argc, _) => (*argc as usize + 2, 1),
-            Op::New(argc, _) => (*argc as usize + 1, 1),
-            Op::NewArgsArray => (2, 1),
-            Op::MakeRegExp(..) => (0, 1),
-            Op::MakeArray(n) => (*n as usize, 1),
-            Op::MakeArrayLiteral(_) | Op::NewArray => (0, 1),
-            Op::ArrayPush | Op::ArraySpread => (2, 1),
-            Op::ArrayHole => (1, 1),
-            Op::MakeObject(_, count, _) => (*count as usize, 1),
-            Op::NewObject => (0, 1),
-            Op::ObjectData(_) => (3, 1),
-            Op::ObjectSpread | Op::ObjectProto | Op::ObjectMethod(..) | Op::ObjectDataName(..) => {
-                (2, 1)
-            }
-            Op::ObjectMethodName(..) => (1, 1),
-            Op::Abstract(op) => op.stack_effect(),
-            Op::ImportMeta | Op::NewTarget | Op::TemplateObject(_) => (0, 1),
-            Op::DynamicImport(_, has_options) => (usize::from(*has_options) + 1, 1),
-            Op::PrivateIn(..) => (1, 1),
-            Op::GetPrivate(..) => (1, 1),
-            Op::GetPrivateKeep(..) | Op::GetPrivateMethod(..) => (1, 2),
-            Op::SetPrivate(..) => (2, 1),
-            Op::UpdatePrivate(_, kind) => (1, upd(kind)),
-            Op::SuperCallStart => (0, 2),
-            Op::SuperCallArgsArray => (3, 1),
-            Op::SuperThis | Op::SuperBase => (0, 1),
-            Op::SuperGet => (3, 1),
-            Op::SuperGetKeep => (3, 4),
-            Op::SuperGetMethod => (3, 2),
-            Op::SuperSet => (4, 1),
-            Op::SuperUpdate(kind) => (3, upd(kind)),
-            Op::RequireCallable => (0, 0),
-            Op::Throw | Op::Return | Op::ResumeReturn => (1, 0),
-            Op::ResumeJump => (2, 0),
-            Op::ReturnBare | Op::ReturnUndef => (0, 0),
-            Op::Await | Op::Yield | Op::YieldStar => (1, 1),
-            Op::PushHandler(_) | Op::PushFinally(..) | Op::PushIterator(..) | Op::PopHandler => {
-                (0, 0)
-            }
-        })
+        stack_effect(&self.ops, pc, self.resumable, borrowed)
     }
 }
 
@@ -25273,9 +25000,288 @@ fn op_jump_targets(op: &Op) -> impl Iterator<Item = u32> {
     targets.into_iter().flatten()
 }
 
+/// (pops, pushes) of operation `pc` of `ops`, for the static stack-depth analysis
+/// ([`Chunk::jit_stack_effect`]; `borrowed`: [`Chunk::jit_borrowed_stack_effect`]), in a chunk that
+/// is `resumable` or not: a function of the operations alone, which the optimizing tier's frozen
+/// view computes off the main thread (P3 stage 2, step 12). `None` = an operation the JIT can't
+/// account for (which refuses compilation).
+pub(crate) fn stack_effect(
+    ops: &[Op],
+    pc: usize,
+    resumable: bool,
+    borrowed: bool,
+) -> Option<(usize, usize)> {
+    if matches!(ops[pc], Op::FragmentExit(_)) && !borrowed {
+        return None;
+    }
+    // AssignTarget enters the normative tree-walker with a projected Environment Record.
+    // Keep that uncommon bridge in the bytecode VM: re-entering arbitrary evaluator code
+    // from a packed ARM64 frame is both unnecessary for coroutine conversion and unsafe for
+    // JIT ownership assumptions. The rest of the function still avoids the tree-walker and,
+    // crucially, coroutine bodies remain heap-owned rather than native-thread-backed.
+    if matches!(
+        ops[pc],
+        Op::AssignTarget(_)
+            | Op::EvalExpr(_)
+            | Op::PushWith
+            | Op::PushLex(_)
+            | Op::PushCatchLex(_)
+            | Op::CloneLex(_)
+            | Op::InitLex(_)
+            | Op::PopEnv
+            | Op::ResolveNameRef(..)
+            | Op::LoadRef(_)
+            | Op::StoreRef(_)
+            | Op::PushDisposeFrame
+            | Op::AddDisposable(_)
+            | Op::DisposeNormal
+            | Op::DisposeThrow
+            | Op::DisposeReturn
+            | Op::DisposeBareReturn
+            | Op::DisposeResumeReturn
+            | Op::DisposeJump
+            | Op::StoreConstLocal(..)
+            | Op::StoreConstCap(_)
+            | Op::UpdateConst(..)
+            | Op::RequireObject
+            | Op::DestructureStepL(..)
+            | Op::DestructureRestL(..)
+            | Op::IterCloseIfNotDoneL(..)
+            | Op::IterAbortIfNotDoneL(..)
+            | Op::ObjectRest(_)
+            | Op::AsyncIterStepL(..)
+            | Op::AsyncIterCloseL(..)
+            | Op::NewArray
+            | Op::ArrayPush
+            | Op::ArrayHole
+            | Op::ArraySpread
+            | Op::CallArgsArray
+            | Op::CallArgsArrayThis
+            | Op::EvalCallArgsArray
+            | Op::TailEvalCallArgsArray
+            | Op::NewArgsArray
+            | Op::ImportMeta
+            | Op::DynamicImport(..)
+            | Op::UpdatePrivate(..)
+            | Op::SuperCallStart
+            | Op::SuperCallArgsArray
+            | Op::LoadLexicalThis
+            | Op::SuperThis
+            | Op::SuperBase
+            | Op::SuperGet
+            | Op::SuperGetKeep
+            | Op::SuperGetMethod
+            | Op::SuperSet
+            | Op::SuperUpdate(_)
+            | Op::TemplateObject(_)
+            | Op::RequireCallable
+            | Op::ClassStart(..)
+            | Op::ClassHeritage(..)
+            | Op::ClassKey(..)
+            | Op::ClassDecorator(..)
+            | Op::ClassFinish(_)
+            | Op::ClassAbort(_)
+    ) && !jit_bridge_op(&ops[pc])
+        && !(resumable && jit_slice_exit_op(&ops[pc]))
+        && !(borrowed
+            && matches!(
+                ops[pc],
+                Op::DisposeNormal
+                    | Op::DisposeThrow
+                    | Op::DisposeReturn
+                    | Op::DisposeBareReturn
+                    | Op::DisposeResumeReturn
+                    | Op::DisposeJump
+            ))
+    {
+        return None;
+    }
+    let upd = |k: &UpdKind| match k {
+        UpdKind::IncDiscard | UpdKind::DecDiscard => 0,
+        _ => 1,
+    };
+    Some(match &ops[pc] {
+        Op::FragmentExit(_) => (1, 0),
+        Op::AnnexBSync(_) => (0, 0),
+        Op::Const(_)
+        | Op::Undef
+        | Op::LoadLocal(_)
+        | Op::LoadCap(_)
+        | Op::LoadName(..)
+        | Op::LoadNameIn(..)
+        | Op::LoadThis
+        | Op::LoadLexicalThis
+        | Op::MakeClosure(..) => (0, 1),
+        Op::Dup => (1, 2),
+        Op::Dup2 => (2, 4),
+        Op::Pop
+        | Op::StoreLocal(_)
+        | Op::StoreCap(_)
+        | Op::StoreCapInit(_)
+        | Op::StoreName(_)
+        | Op::StoreGlobalName(_)
+        | Op::StoreNameCached(..)
+        | Op::StoreConstLocal(..)
+        | Op::StoreConstCap(_)
+        | Op::UpdateConst(..) => (1, 0),
+        Op::UpdateLocal(_, k) | Op::UpdateCap(_, k) | Op::UpdateName(_, k) => (0, upd(k)),
+        Op::UpdateNameCached(_, _, k) => (0, upd(k)),
+        Op::UpdateProp(_, _, k) => (1, upd(k)),
+        Op::UpdateElem(k) => (2, upd(k)),
+        Op::Tdz(_) => (0, 0),
+        Op::GetProp(..) | Op::RequireObject => (1, 1),
+        Op::GetPropThis(..) => (0, 1),
+        Op::GetPropLocal(..) => (0, 1),
+        Op::SetProp(..) => (2, 1),
+        Op::SetPropDrop(..) => (2, 0),
+        Op::SetPropThisDrop(..) => (1, 0),
+        Op::SetPropLocalDrop(..) => (1, 0),
+        Op::GetElem => (2, 1),
+        Op::SetElem => (3, 1),
+        Op::SetElemDrop => (3, 0),
+        Op::AppendProp(..) => (3, 0),
+        Op::DestructureGuard => (1, 1),
+        Op::DestructureArr(n) => (1, *n as usize),
+        Op::TryArrayBinding(..) => (1, 2),
+        Op::ArrayBindingStep(..) => (0, 1),
+        Op::AssignTarget(_) => (1, 0),
+        Op::EvalExpr(_) => (0, 1),
+        Op::ClassStart(_, count) => (*count as usize * 2, 0),
+        Op::ClassAbort(_) => (0, 0),
+        Op::ClassHeritage(_, present) => (usize::from(*present), 0),
+        Op::ClassKey(..) => (1, 0),
+        Op::ClassDecorator(..) => (2, 0),
+        Op::ClassFinish(_) => (0, 1),
+        Op::ResolveNameRef(..) => (0, 0),
+        Op::LoadRef(_) => (0, 1),
+        Op::StoreRef(_) => (1, 0),
+        Op::PushWith => (1, 0),
+        Op::PushLex(_) | Op::PushCatchLex(_) | Op::CloneLex(_) => (0, 0),
+        Op::InitLex(_) => (1, 0),
+        Op::PopEnv => (0, 0),
+        Op::PushDisposeFrame | Op::DisposeNormal => (0, 0),
+        Op::AddDisposable(_) => (1, 1),
+        Op::DisposeThrow | Op::DisposeReturn | Op::DisposeResumeReturn => (1, 0),
+        Op::DisposeBareReturn => (0, 0),
+        Op::DisposeJump => (2, 0),
+        Op::ObjectRest(count) => (*count as usize + 1, 1),
+        Op::DeleteProp(..) => (1, 1),
+        Op::DeleteElem(_) => (2, 1),
+        Op::DeleteName(_) => (0, 1),
+        Op::DeleteSuper => (0, 0),
+        Op::CallSpread(argc, _) => (*argc as usize + 1, 1),
+        Op::CallSpreadThis(argc, _) => (*argc as usize + 2, 1),
+        Op::CallArgsArray => (2, 1),
+        Op::CallArgsArrayThis => (3, 1),
+        Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => (3, 1),
+        Op::TailDeep => (0, 1),
+        Op::TailCall(mode, with_this) => {
+            let count = match mode {
+                CallArgsMode::Fixed(count) | CallArgsMode::FinalSpread(count) => *count as usize,
+                CallArgsMode::Array => 1,
+            };
+            (count + 1 + usize::from(*with_this), 1)
+        }
+        Op::ToStr => (1, 1),
+        Op::GetIter => (1, 2),
+        Op::GetAsyncIter => (1, 3),
+        Op::ForInKeys => (1, 1),
+        Op::ForInStepL(..) => (0, 2),
+        Op::IterStepL(..) => (0, 2),
+        Op::IterNextBuiltin(_) => (0, 1),
+        Op::RequireIterResult => (1, 1),
+        Op::IterCloseL(_) => (0, 0),
+        Op::IterAbortL(_) => (1, 0),
+        Op::DestructureStepL(..) | Op::DestructureRestL(..) => (0, 1),
+        Op::IterCloseIfNotDoneL(..) => (0, 0),
+        Op::IterAbortIfNotDoneL(..) => (1, 0),
+        Op::AsyncIterStepL(..) => (0, 1),
+        Op::AsyncIterResumeL(..) => (1, 2),
+        Op::AsyncIterCloseL(..) => (0, 0),
+        Op::GetElemLocal(_) | Op::ArgElem(_) | Op::RestElem(_) => (1, 1),
+        Op::ArgLength(..) | Op::RestLength(..) => (0, 1),
+        Op::SetElemLocal(_) => (2, 1),
+        Op::SetElemLocalDrop(_) => (2, 0),
+        Op::ToPropKey => (2, 2),
+        Op::ToPropKeyLocal(_) => (1, 1),
+        Op::GetMethod(..) => (1, 2),
+        Op::GetMethodElem => (2, 2),
+        Op::Add
+        | Op::Sub
+        | Op::Mul
+        | Op::Div
+        | Op::Mod
+        | Op::BitAnd
+        | Op::BitOr
+        | Op::BitXor
+        | Op::Shl
+        | Op::Shr
+        | Op::UShr
+        | Op::Lt
+        | Op::Gt
+        | Op::Le
+        | Op::Ge
+        | Op::EqEq
+        | Op::NotEq
+        | Op::StrictEq
+        | Op::StrictNotEq
+        | Op::InstanceOf(_)
+        | Op::In
+        | Op::GenBin(_) => (2, 1),
+        Op::Neg | Op::Plus | Op::Not | Op::BitNot | Op::Typeof | Op::TypeofIs(..) | Op::Void => {
+            (1, 1)
+        }
+        Op::TypeofName(_) => (0, 1),
+        Op::Jump(_) | Op::AbruptJump(..) => (0, 0),
+        Op::InlineGuard(..) => (0, 0),
+        Op::ResetSlots(..) => (0, 0),
+        Op::JumpIfFalse(_) => (1, 0),
+        Op::JumpIfFalsePeek(_) | Op::JumpIfTruePeek(_) | Op::JumpIfNotNullishPeek(_) => (1, 1),
+        Op::Call(argc, _) => (*argc as usize + 1, 1),
+        Op::LoadNameForCall(..) | Op::LoadNameForCallIn(..) => (0, 2),
+        Op::CallWithThis(argc, _) => (*argc as usize + 2, 1),
+        Op::New(argc, _) => (*argc as usize + 1, 1),
+        Op::NewArgsArray => (2, 1),
+        Op::MakeRegExp(..) => (0, 1),
+        Op::MakeArray(n) => (*n as usize, 1),
+        Op::MakeArrayLiteral(_) | Op::NewArray => (0, 1),
+        Op::ArrayPush | Op::ArraySpread => (2, 1),
+        Op::ArrayHole => (1, 1),
+        Op::MakeObject(_, count, _) => (*count as usize, 1),
+        Op::NewObject => (0, 1),
+        Op::ObjectData(_) => (3, 1),
+        Op::ObjectSpread | Op::ObjectProto | Op::ObjectMethod(..) | Op::ObjectDataName(..) => {
+            (2, 1)
+        }
+        Op::ObjectMethodName(..) => (1, 1),
+        Op::Abstract(op) => op.stack_effect(),
+        Op::ImportMeta | Op::NewTarget | Op::TemplateObject(_) => (0, 1),
+        Op::DynamicImport(_, has_options) => (usize::from(*has_options) + 1, 1),
+        Op::PrivateIn(..) => (1, 1),
+        Op::GetPrivate(..) => (1, 1),
+        Op::GetPrivateKeep(..) | Op::GetPrivateMethod(..) => (1, 2),
+        Op::SetPrivate(..) => (2, 1),
+        Op::UpdatePrivate(_, kind) => (1, upd(kind)),
+        Op::SuperCallStart => (0, 2),
+        Op::SuperCallArgsArray => (3, 1),
+        Op::SuperThis | Op::SuperBase => (0, 1),
+        Op::SuperGet => (3, 1),
+        Op::SuperGetKeep => (3, 4),
+        Op::SuperGetMethod => (3, 2),
+        Op::SuperSet => (4, 1),
+        Op::SuperUpdate(kind) => (3, upd(kind)),
+        Op::RequireCallable => (0, 0),
+        Op::Throw | Op::Return | Op::ResumeReturn => (1, 0),
+        Op::ResumeJump => (2, 0),
+        Op::ReturnBare | Op::ReturnUndef => (0, 0),
+        Op::Await | Op::Yield | Op::YieldStar => (1, 1),
+        Op::PushHandler(_) | Op::PushFinally(..) | Op::PushIterator(..) | Op::PopHandler => (0, 0),
+    })
+}
+
 /// [`Chunk::jit_cap_initialized`] for every operation: a cap operation whose binding an earlier
 /// operation of its basic block (from a jump target to the next) checked or initialized.
-fn cap_tdz_known(ops: &[Op]) -> Box<[bool]> {
+pub(crate) fn cap_tdz_known(ops: &[Op]) -> Box<[bool]> {
     let mut leader = vec![false; ops.len() + 1];
     for op in ops {
         for target in op_jump_targets(op) {

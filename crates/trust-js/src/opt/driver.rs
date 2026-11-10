@@ -598,7 +598,9 @@ fn run_here(mut job: Job, chunk: &Chunk) -> Finished {
         };
         let timer = main_thread_timer();
         let stubs = stubs.clone();
-        job = finished.job;
+        job = finished
+            .job
+            .expect("a job that needs stubs or atoms runs again");
         provide(&mut job, &stubs);
         log_main_thread("stubs", chunk, timer);
     }
@@ -1096,7 +1098,9 @@ fn install_one(
         let stubs = stubs.clone();
         let chunk = i.opt_pending.jobs[at].chunk.clone();
         let timer = main_thread_timer();
-        let mut job = finished.job;
+        let mut job = finished
+            .job
+            .expect("a job that needs stubs or atoms runs again");
         provide(&mut job, &stubs);
         let pending = &i.opt_pending.jobs[at];
         let requeued = super::compiler::enqueue(

@@ -209,11 +209,10 @@ impl<'s> Stubs<'s> {
 pub(crate) struct Assembled {
     pub(crate) words: Vec<u32>,
     pub(crate) table: Box<ExitTable>,
-    /// The trap's offset, which every pc's code offset names.
-    trap: u32,
+    /// Every pc's code offset: the trap's.
+    pc_offsets: Vec<u32>,
     needs_global: bool,
     max_stack: usize,
-    ops: usize,
 }
 
 impl Assembled {
@@ -235,10 +234,9 @@ pub(crate) fn link(
 ) -> Rc<JitCode> {
     let Assembled {
         mut table,
-        trap,
+        pc_offsets,
         needs_global,
         max_stack,
-        ops,
         ..
     } = assembled;
     let mem = executable.as_ptr() as *mut u8;
@@ -252,7 +250,7 @@ pub(crate) fn link(
         needs_global,
         mem,
         len,
-        pc_offsets: vec![trap; ops],
+        pc_offsets,
         max_stack,
         executable,
         referenced: Cell::new(0),
@@ -826,7 +824,8 @@ impl<'a> Gen<'a> {
         Ok(Assembled {
             words,
             table,
-            trap,
+            // Made here, on the compile's thread.
+            pc_offsets: vec![trap; ops.len()],
             needs_global: ops.iter().any(|o| {
                 matches!(
                     o,
@@ -837,7 +836,6 @@ impl<'a> Gen<'a> {
                 )
             }),
             max_stack: self.cfg.jit_stack_capacity(),
-            ops: ops.len(),
         })
     }
 }
