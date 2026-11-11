@@ -997,6 +997,20 @@ impl FeedbackVector {
             .map_or(0, Cell::get)
     }
 
+    /// The chunk's own records by pc, copied, as [`FeedbackVector::record_word`] reads them: none
+    /// for a transformed chunk (its records are its baseline sites') or a chunk that never
+    /// recorded (P3 stage 2, step 16: the optimizing tier's snapshot copies them on the main
+    /// thread for its compile thread to decode).
+    pub(crate) fn own_record_words(&self) -> Box<[u32]> {
+        if self.through.is_some() {
+            return Box::new([]);
+        }
+        match self.record.get() {
+            Some(words) => words.iter().map(Cell::get).collect(),
+            None => Box::new([]),
+        }
+    }
+
     pub(crate) fn layout(&self) -> &FeedbackLayout {
         &self.layout
     }

@@ -663,9 +663,13 @@ fn prepare(
     if chunk.jit_ops().len() > MAX_OPTIMIZED_OPS {
         return Err(Refusal::whole("over the size limit"));
     }
-    // The global names resolve in the running realm (stage 2, step 4).
-    let snapshot = snapshot::Snapshot::take_in(chunk, Some(&*i));
+    // The raw copy of the feedback, its global names resolved in the running realm (stage 2,
+    // steps 4 and 16), and the frozen view, which holds the property caches' ways the copy's
+    // decode reads.
+    let snapshot = snapshot::Raw::take_in(chunk, Some(&*i));
     let view = chunk.freeze();
+    #[cfg(debug_assertions)]
+    snapshot::check_decode(chunk, &snapshot, &view);
     let layout = *i
         .jit_layout
         .get_or_init(|| crate::value::jit_layout(&i.object_proto));

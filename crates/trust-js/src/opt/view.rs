@@ -97,7 +97,9 @@ pub(crate) struct FrozenChunk {
     /// Each call site's way-1 address (`Chunk::jit_call_cache_ptr`).
     pub(crate) call_caches: Box<[usize]>,
     /// The named sites' preferred ways (`Chunk::jit_cache_preferred`) and ways
-    /// (`Chunk::jit_cache_ways`), by cache index, ascending.
+    /// (`Chunk::jit_cache_ways`), by cache index, ascending: the one read of the property caches
+    /// a compile makes, which the property templates bake and the snapshot's decode reads (P3
+    /// stage 2, step 16: `bytecode::feedback_read::CopiedWords`).
     #[allow(clippy::type_complexity)]
     pub(crate) sites: Box<
         [(

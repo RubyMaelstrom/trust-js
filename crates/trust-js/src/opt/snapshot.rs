@@ -1,10 +1,19 @@
 //! The tier's summary of a chunk's feedback (the plan's Design point 3 and the Stage 1 record's
-//! front end): one view of the read API (`crate::feedback::read`) per pc, copied once when a
-//! compile starts, so that the builder reads only this snapshot and the chunk's immutable
-//! operations, as V8's ProcessedFeedback, JSC's status objects and SpiderMonkey's WarpSnapshot
-//! serve their builders. Taking it allocates the per-pc arrays (the third only where an exit
-//! profile has sites) and nothing else; it interns nothing (the views hold process shape ids and
-//! cell addresses).
+//! front end): one view of the read API (`crate::feedback::read`) per pc, so that the builder
+//! reads only this snapshot and the chunk's immutable operations, as V8's ProcessedFeedback,
+//! JSC's status objects and SpiderMonkey's WarpSnapshot serve their builders. The views hold
+//! process shape ids and cell addresses; nothing is interned.
+//!
+//! In two parts (P3 stage 2, step 16), as SpiderMonkey's main-thread oracle copies a Baseline
+//! IC's stub data, sparsely, "to protect against the stub being unlinked or mutated"
+//! (jit/WarpOracle.cpp:310-336, 1333-1352) and WarpBuilder interprets it off thread: when a
+//! compile starts, the main thread takes the raw copy ([`Raw`]: each feedback-bearing site's
+//! words, `bytecode::feedback_read::FeedbackCopy`, the property caches' ways in the frozen view's
+//! one read, which its templates read too; the free names' views, which read the realm; the exit
+//! profile), and the compile's thread decodes the per-pc views from it ([`Snapshot::decode`]) by
+//! the decode the live chunk's views come from (`bytecode::feedback_read::site_view`, generic
+//! over its source), so that the two cannot differ (debug builds compare them at every compile:
+//! [`check_decode`]).
 //!
 //! A transformed chunk (a second stage, its hot callees spliced in) keeps its own property and
 //! call caches, which the second stage seeded from the first stage and goes on filling, but its
@@ -30,8 +39,12 @@
 
 use super::ir::ExitReason;
 use super::profile::ChunkProfile;
+use super::view::FrozenChunk;
+#[cfg(any(test, debug_assertions))]
+use crate::bytecode::feedback_read::LiveAt;
+use crate::bytecode::feedback_read::{self, CopiedWords, FeedbackCopy, FeedbackWords};
 use crate::bytecode::{Chunk, NameIc, Op, StaticName};
-use crate::feedback::{self, CallState, NamedView, RecordMap, SiteView, ValuesView};
+use crate::feedback::{CallState, NamedView, RecordMap, SiteView, ValuesView};
 use crate::interpreter::{Env, Interp};
 
 /// Whether a pc's feedback shows that its operation ran.
@@ -47,6 +60,7 @@ pub(crate) enum Ran {
 }
 
 /// The per-pc feedback one compile reads (see the module's doc).
+#[derive(Debug, PartialEq)]
 pub(crate) struct Snapshot {
     views: Box<[SiteView]>,
     ran: Box<[Ran]>,
@@ -149,41 +163,131 @@ impl NameView {
     }
 }
 
+/// The main thread's part of a snapshot (P3 stage 2, step 16; see the module's doc): the raw copy
+/// of a chunk's feedback words, the views of its free names' sites, which read the realm, and its
+/// exit profile's declines, which read the profiles of the chunks it names. `Send`: words only.
+#[derive(Debug)]
+pub(crate) struct Raw {
+    feedback: FeedbackCopy,
+    /// The free-name sites' views, by pc, ascending (see [`NameView`]).
+    names: Box<[(u32, NameView)]>,
+    /// The exit profile's declines (see [`Snapshot`]'s `declined`).
+    declined: Box<[(u32, u8)]>,
+}
+
+impl Raw {
+    /// The raw copy of `chunk`'s feedback as it stands now (main thread), its global names
+    /// resolved in `realm`'s running realm, the one the compile runs in, whose global
+    /// environment and object its code checks (in none, they stay effects).
+    pub(crate) fn take_in(chunk: &Chunk, realm: Option<&Interp>) -> Raw {
+        let ops = chunk.jit_ops();
+        let mut names = Vec::new();
+        for (pc, op) in ops.iter().enumerate() {
+            let name = name_view(chunk, op, realm);
+            if name != NameView::None {
+                names.push((pc as u32, name));
+            }
+        }
+        Raw {
+            feedback: chunk.copy_feedback(),
+            names: names.into_boxed_slice(),
+            declined: declined(chunk, chunk.feedback_vector().record_map(), ops.len()),
+        }
+    }
+
+    /// Whether a free-name site's view reads the realm whose global environment is `genv` (a
+    /// global property's or a global lexical's), which the code may then check by identity: the
+    /// compile pins it (`driver::prepare`).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn reads_global_names_of(&self, genv: usize) -> bool {
+        self.names.iter().any(|(_, name)| {
+            matches!(*name, NameView::Global { genv: g, .. } | NameView::GlobalLexical { genv: g, .. } if g == genv)
+        })
+    }
+}
+
 impl Snapshot {
     /// The feedback of every operation of `chunk` (its `jit_ops`), as it stands now, its global
-    /// names resolved in no realm (they stay effects): the tests' view.
+    /// names resolved in no realm (they stay effects): the tests' view, decoded from the live
+    /// chunk.
     #[cfg(test)]
     pub(crate) fn take(chunk: &Chunk) -> Snapshot {
         Snapshot::take_in(chunk, None)
     }
 
-    /// The feedback of every operation of `chunk` (its `jit_ops`), as it stands now, its global
-    /// names resolved in `realm`'s running realm, the one the compile runs in, whose global
-    /// environment and object its code checks (in none, they stay effects).
+    /// [`Snapshot::take`] with the global names resolved in `realm`'s running realm (tests).
+    #[cfg(test)]
     pub(crate) fn take_in(chunk: &Chunk, realm: Option<&Interp>) -> Snapshot {
-        let ops = chunk.jit_ops();
-        let map = chunk.feedback_vector().record_map();
-        let mut views = Vec::with_capacity(ops.len());
-        let mut ran = Vec::with_capacity(ops.len());
+        Snapshot::live(chunk, &Raw::take_in(chunk, realm))
+    }
+
+    /// The snapshot a compile reads, decoded from `raw` with `view`'s operations, names and named
+    /// sites' ways (`view` the chunk's frozen view made with it): on any thread.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn decode(raw: &Raw, view: &FrozenChunk) -> Snapshot {
+        let words = CopiedWords {
+            copy: &raw.feedback,
+            ops: view.jit_ops(),
+            ways: &view.sites,
+        };
+        Snapshot::decode_from(&words, view.jit_ops().len(), raw, |n| view.jit_name(n))
+    }
+
+    /// The same decode of `raw`'s chunk, `chunk`, from its live words (main thread), at the call
+    /// caches' epoch `raw` read: the tests' snapshot, and the other side of [`check_decode`].
+    #[cfg(any(test, debug_assertions))]
+    pub(crate) fn live(chunk: &Chunk, raw: &Raw) -> Snapshot {
+        let words = LiveAt {
+            chunk,
+            epoch: raw.feedback.epoch(),
+        };
+        Snapshot::decode_from(&words, chunk.jit_ops().len(), raw, |n| chunk.jit_name(n))
+    }
+
+    /// The views of a chunk of `len` operations whose feedback words `words` holds, with `raw`'s
+    /// free names and declines, `name` giving a name's text.
+    fn decode_from<'n>(
+        words: &impl FeedbackWords,
+        len: usize,
+        raw: &Raw,
+        name: impl Fn(u32) -> &'n str,
+    ) -> Snapshot {
         let mut names = Vec::new();
-        for (pc, op) in ops.iter().enumerate() {
-            let view = view(chunk, map, pc);
-            let name = name_view(chunk, op, realm);
-            if name == NameView::None {
-                ran.push(evidence(chunk, op, &view));
-            } else {
-                if names.is_empty() {
-                    names = vec![NameView::None; ops.len()];
-                }
-                ran.push(name_evidence(&name));
-                names[pc] = name;
+        if !raw.names.is_empty() {
+            names = vec![NameView::None; len];
+            for &(pc, free) in raw.names.iter() {
+                names[pc as usize] = free;
             }
-            views.push(view);
+        }
+        let mut views = Vec::with_capacity(len);
+        let mut ran = Vec::with_capacity(len);
+        for pc in 0..len {
+            let site = view(words, pc);
+            match names.get(pc) {
+                Some(free) if *free != NameView::None => ran.push(name_evidence(free)),
+                _ => ran.push(match words.site_op(pc) {
+                    Some(op) => evidence(op, &site, &name),
+                    None => Ran::Unknown,
+                }),
+            }
+            views.push(site);
         }
         Snapshot {
             views: views.into_boxed_slice(),
             ran: ran.into_boxed_slice(),
-            declined: declined(chunk, map, ops.len()),
+            declined: raw.declined.clone(),
             names: names.into_boxed_slice(),
         }
     }
@@ -206,22 +310,6 @@ impl Snapshot {
     /// ([`NameView::proof`]).
     pub(crate) fn discarded_proof(&self, pc: usize) -> u8 {
         self.declined.get(pc).map_or(0, |&(_, proof)| proof)
-    }
-
-    /// Whether a free-name site's view reads the realm whose global environment is `genv` (a
-    /// global property's or a global lexical's), which the code may then check by identity: the
-    /// compile pins it (`driver::prepare`).
-    #[cfg_attr(
-        not(all(
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        )),
-        allow(dead_code)
-    )]
-    pub(crate) fn reads_global_names_of(&self, genv: usize) -> bool {
-        self.names.iter().any(|name| {
-            matches!(*name, NameView::Global { genv: g, .. } | NameView::GlobalLexical { genv: g, .. } if g == genv)
-        })
     }
 
     /// The view of the free-name site at `pc` ([`NameView::None`] for any other operation).
@@ -329,16 +417,53 @@ fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u32, u8
     declined.into_boxed_slice()
 }
 
-/// The view of `pc` the tier reads: the chunk's own, with a transformed chunk's value and element
-/// records its baseline site's (`map` is the chunk's record map).
-fn view(chunk: &Chunk, map: Option<&RecordMap>, pc: usize) -> SiteView {
-    let own = feedback::read(chunk, pc);
-    match map.and_then(|map| map.target(pc)) {
-        Some((baseline, baseline_pc)) => {
-            with_baseline_records(own, feedback::read(baseline, baseline_pc))
+/// The view of `pc` the tier reads, of the chunk whose words `words` holds: its own
+/// (`feedback_read::site_view`), with a transformed chunk's value and element records its
+/// baseline site's through its record map. Only a value, element or named-update site takes
+/// anything of its baseline site (`with_baseline_records`), and only its records
+/// (`feedback_read::baseline_records_view`), so the baseline's caches are not read.
+fn view(words: &impl FeedbackWords, pc: usize) -> SiteView {
+    let own = feedback_read::site_view(words, pc);
+    if !matches!(
+        own,
+        SiteView::Values(_) | SiteView::Element(_) | SiteView::NamedUpdate(..)
+    ) {
+        return own;
+    }
+    match words.baseline_record(pc) {
+        Some((op, word)) => {
+            with_baseline_records(own, feedback_read::baseline_records_view(op, word))
         }
         None => own,
     }
+}
+
+/// The snapshot `raw` and `view` give decoded both ways, from the copy and from the live chunk,
+/// which must agree (debug builds, at every compile's preparation; P3 stage 2, step 16): the copy
+/// holds every word the decode reads (`bytecode::feedback_read`'s doc).
+#[cfg(debug_assertions)]
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn check_decode(chunk: &Chunk, raw: &Raw, view: &FrozenChunk) {
+    let copied = Snapshot::decode(raw, view);
+    let live = Snapshot::live(chunk, raw);
+    for pc in 0..live.len().max(copied.len()) {
+        assert_eq!(
+            (copied.site(pc), copied.ran(pc)),
+            (live.site(pc), live.ran(pc)),
+            "the raw copy's view of pc {pc} ({:?}) is the live chunk's",
+            chunk.jit_ops().get(pc)
+        );
+    }
+    assert!(
+        copied == live,
+        "the raw copy's snapshot is the live chunk's"
+    );
 }
 
 /// A transformed chunk's view of a site with its baseline site's value or element record in place
@@ -354,13 +479,13 @@ fn with_baseline_records(own: SiteView, baseline: SiteView) -> SiteView {
     }
 }
 
-/// The evidence the view of `op` gives (see [`Ran`]).
-fn evidence(chunk: &Chunk, op: &Op, view: &SiteView) -> Ran {
+/// The evidence the view of `op` gives (see [`Ran`]), `name` giving a name's text.
+fn evidence<'n>(op: &Op, view: &SiteView, name: &impl Fn(u32) -> &'n str) -> Ran {
     match view {
         SiteView::Named(named) | SiteView::NamedUpdate(named, _) => {
             if named.generic || named.filled().next().is_some() {
                 Ran::Yes
-            } else if is_length_read(chunk, op) {
+            } else if is_length_read(op, name) {
                 Ran::Unknown
             } else {
                 Ran::No
@@ -549,13 +674,14 @@ fn cache_class(ic: &NameIc) -> u8 {
     }
 }
 
-/// Whether `op` reads a property named `length` (which a String receiver reads without a way).
-fn is_length_read(chunk: &Chunk, op: &Op) -> bool {
+/// Whether `op` reads a property named `length` (which a String receiver reads without a way),
+/// `name` giving a name's text.
+fn is_length_read<'n>(op: &Op, name: &impl Fn(u32) -> &'n str) -> bool {
     match *op {
         Op::GetProp(n, _)
         | Op::GetPropThis(n, _)
         | Op::GetPropLocal(_, n, _)
-        | Op::GetMethod(n, _) => chunk.jit_name(n) == "length",
+        | Op::GetMethod(n, _) => name(n) == "length",
         _ => false,
     }
 }
@@ -574,7 +700,6 @@ fn is_length_read(chunk: &Chunk, op: &Op) -> bool {
 pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
     use std::hash::Hasher;
     let mut hash = crate::fasthash::FxHasher::default();
-    let map = chunk.feedback_vector().record_map();
     for (pc, op) in chunk.jit_ops().iter().enumerate() {
         hash.write_usize(pc);
         if let Some((_, cache, _)) = name_site(op) {
@@ -583,7 +708,7 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
                 hash.write_u8(cache_class(&chunk.jit_name_ic(cache)));
             }
         }
-        match view(chunk, map, pc) {
+        match view(chunk, pc) {
             SiteView::Named(named) => hash_named(&mut hash, &named),
             SiteView::NamedUpdate(named, values) => {
                 hash_named(&mut hash, &named);

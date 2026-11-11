@@ -1,11 +1,16 @@
 //! The snapshot in the exemplars' shape (P3 stage 2, step 16): a chunk carries its names' keys (a
 //! first stage's table made at its first freeze where the VM has not made it, a second stage's
 //! carried at its recompile from the tables of the chunks it was made from, a name no table
-//! holds made there).
+//! holds made there), and the snapshot's raw copy, taken on the main thread, decodes on any
+//! thread to the views the live chunk decodes to, each snapshot reading the caches as they stood
+//! at its own copy.
 
+use super::snapshot::{check_decode, Raw, Snapshot};
 use super::TestSwitches;
 use crate::atom::PropKey;
-use crate::bytecode::{Chunk, Tier};
+use crate::bytecode::{Chunk, Op, Tier};
+use crate::feedback::SiteView;
+use crate::jit::JitChunk;
 use crate::{Completion, Engine};
 use std::rc::Rc;
 
@@ -180,4 +185,152 @@ fn a_name_with_no_atom_yet_is_made_at_the_first_freeze() {
         view.keys,
         "a later freeze reads the same table"
     );
+}
+
+/// Sites of every kind the decode reads: named loads, stores and updates (one way, several, a
+/// generic site), value and element records, calls (one callee, several), a construct site,
+/// literals (object, array, constant array, RegExp, closure) and free names.
+const KINDS: &str = "var G = 3;\n\
+     function C(v) { this.v = v; }\n\
+     function one(x) { return x + 1; }\n\
+     function two(x) { return x * 2; }\n\
+     function kinds(o, a, t, k, f) {\n\
+       var s = o.x + G;\n\
+       o.y = s;\n\
+       o.n++;\n\
+       s += a[k] + t[k & 3];\n\
+       a[k & 7] = s;\n\
+       s = s < 1e9 ? -s : s;\n\
+       var c = new C(s);\n\
+       s += f(k) + one(k);\n\
+       var lit = { p: s, q: c.v };\n\
+       var arr = [s, k];\n\
+       var cst = [1, 2, 3];\n\
+       var re = /ab+c/;\n\
+       var cl = function () { return lit.p; };\n\
+       return s + arr.length + cst[1] + (re.test('abbc') ? 1 : 0) + cl() + lit.q;\n\
+     }\n\
+     function caller(o, a, t, k) { return kinds(o, a, t, k, two) + one(k) + ('' + k).length; }\n\
+     var shapes = [{ x: 1, y: 0, n: 0 }, { y: 0, x: 1, n: 0 }, { n: 0, x: 1, y: 0 }];\n\
+     var ta = new Int32Array(4);\n\
+     for (var k = 0; k < 40; k++) {\n\
+       kinds(shapes[k % 3], [1, 2, 3, 4, 5, 6, 7, 8], ta, k, (k & 1) ? one : two);\n\
+       caller(shapes[0], [1, 2, 3, 4, 5, 6, 7, 8], ta, k);\n\
+     }\n\
+     function generic(o) { return o.z; }\n\
+     for (var k = 0; k < 12; k++) { var g = { z: k }; g['w' + k] = k; generic(g); }";
+
+/// The views of `chunk` decoded from its raw copy and from its live words agree (`check_decode`
+/// asserts it pc by pc), and the copy is no more than the sites' words: `chunk`'s snapshot.
+fn decodes_both_ways(chunk: &Chunk) -> Snapshot {
+    let raw = Raw::take_in(chunk, None);
+    let view = chunk.freeze();
+    check_decode(chunk, &raw, &view);
+    Snapshot::decode(&raw, &view)
+}
+
+#[test]
+fn the_raw_copy_decodes_to_the_live_chunks_views() {
+    let mut engine = engine(true, Tier::Jit);
+    eval(&mut engine, KINDS);
+    for name in ["kinds", "caller", "generic", "C", "one"] {
+        let chunk = first_stage(&mut engine, name);
+        let snapshot = decodes_both_ways(&chunk);
+        assert_eq!(snapshot.len(), chunk.jit_ops().len());
+    }
+    // The site kinds are there to compare.
+    let snapshot = decodes_both_ways(&first_stage(&mut engine, "kinds"));
+    let kinds: Vec<&str> = (0..snapshot.len())
+        .map(|pc| match snapshot.site(pc) {
+            SiteView::Values(_) => "values",
+            SiteView::Element(_) => "element",
+            SiteView::Named(_) => "named",
+            SiteView::NamedUpdate(..) => "update",
+            SiteView::Call(_) => "call",
+            SiteView::Construct(_) => "construct",
+            SiteView::Allocation(_) => "allocation",
+            SiteView::None => "none",
+        })
+        .collect();
+    for kind in [
+        "values",
+        "element",
+        "named",
+        "update",
+        "call",
+        "construct",
+        "allocation",
+    ] {
+        assert!(kinds.contains(&kind), "kinds has a {kind} site: {kinds:?}");
+    }
+    let generic = decodes_both_ways(&first_stage(&mut engine, "generic"));
+    assert!(
+        (0..generic.len()).any(|pc| generic.named(pc).is_some_and(|named| named.generic)),
+        "a generic site"
+    );
+    // A transformed chunk: its value and element records are its baseline sites', which the copy
+    // takes through the record map.
+    let second = second_stage(&mut engine, "caller");
+    assert!(second.feedback_vector().record_map().is_some());
+    let snapshot = decodes_both_ways(&second);
+    assert!(
+        (0..snapshot.len()).any(|pc| snapshot.values(pc).is_some_and(|v| v.has_record())),
+        "a value site with its baseline's record (the string concatenation's)"
+    );
+}
+
+#[test]
+fn each_snapshot_reads_the_ways_of_its_own_copy() {
+    let mut engine = engine(true, Tier::Bytecode);
+    eval(
+        &mut engine,
+        "function g(o) { return o.x; }\n\
+         for (var k = 0; k < 5; k++) g({ x: k });",
+    );
+    let chunk = first_stage(&mut engine, "g");
+    let (pc, cache) = chunk
+        .jit_ops()
+        .iter()
+        .enumerate()
+        .find_map(|(pc, op)| match *op {
+            Op::GetProp(_, cache) | Op::GetPropLocal(_, _, cache) => Some((pc, cache)),
+            _ => None,
+        })
+        .expect("g's named read");
+    let filled = |ways: [crate::bytecode::IcState; crate::bytecode::PROP_IC_WAYS]| {
+        ways.iter()
+            .filter(|way| way.depth != crate::bytecode::IC_EMPTY)
+            .count()
+    };
+    let first_raw = Raw::take_in(&chunk, None);
+    let first_view = chunk.freeze();
+    let first = Snapshot::decode(&first_raw, &first_view);
+    // A second receiver shape fills a second way.
+    eval(
+        &mut engine,
+        "for (var k = 0; k < 5; k++) g({ y: 0, x: k });",
+    );
+    let second_raw = Raw::take_in(&chunk, None);
+    let second_view = chunk.freeze();
+    let second = Snapshot::decode(&second_raw, &second_view);
+    // The first copy: one way, which the templates bake as the compact form, and the decode's.
+    assert_eq!(first.named(pc).map(|named| named.filled().count()), Some(1));
+    assert_eq!(filled(first_view.jit_cache_ways(cache)), 1);
+    assert!(first_view.jit_cache_preferred(cache).is_some());
+    // The second: both ways, in the templates and the decode alike, read at its own copy.
+    assert_eq!(
+        second.named(pc).map(|named| named.filled().count()),
+        Some(2)
+    );
+    assert_eq!(filled(second_view.jit_cache_ways(cache)), 2);
+    assert!(second_view.jit_cache_preferred(cache).is_none());
+    assert_eq!(
+        second_view.jit_cache_ways(cache).map(|way| way.recv_shape),
+        chunk.jit_cache_ways(cache).map(|way| way.recv_shape),
+        "the live ways at the second copy"
+    );
+    // A copy is a copy: the first is as it was.
+    assert_eq!(filled(first_view.jit_cache_ways(cache)), 1);
+    assert_eq!(Snapshot::decode(&first_raw, &first_view), first);
+    check_decode(&chunk, &second_raw, &second_view);
 }

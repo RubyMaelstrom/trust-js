@@ -7566,6 +7566,17 @@ fn transformed_record_map(
     ))
 }
 
+/// The way a compact template bakes of a property cache whose ways are `ways`
+/// ([`Chunk::jit_cache_preferred`]): way 0, where it is the only way and has cacheable shapes.
+/// A compact template bakes one shape. It is a win only for a truly monomorphic site; choosing
+/// way 0 at a polymorphic virtual-method call makes every other stable way fall through to Rust.
+/// Seeded second-stage chunks preserve all hot ways, so keep their full native probe whenever
+/// warmup observed more than one receiver shape.
+pub(crate) fn preferred_way(ways: &[IcState; PROP_IC_WAYS]) -> Option<IcState> {
+    let mono = ways[1..].iter().all(|way| way.depth == IC_EMPTY);
+    (ways[0].has_cacheable_shapes() && mono).then_some(ways[0])
+}
+
 /// The property cache (its way 0's index) of a named load's or store's operation.
 pub(crate) fn named_site_cache(op: &Op) -> Option<u32> {
     match *op {
@@ -23597,17 +23608,11 @@ impl Chunk {
     /// The hottest property-cache way observed during bytecode warmup. A compact JIT site may
     /// bake this state behind full shape/prototype guards and route misses to the checked helper.
     pub(crate) fn jit_cache_preferred(&self, idx: u32) -> Option<IcState> {
-        let st = self.caches[idx as usize].get();
-        // A compact template bakes one shape. It is a win only for a truly monomorphic site;
-        // choosing way 0 at a polymorphic virtual-method call makes every other stable way fall
-        // through to Rust. Seeded second-stage chunks preserve all hot ways, so keep their full
-        // native probe whenever warmup observed more than one receiver shape.
-        let mono =
-            (1..PROP_IC_WAYS).all(|way| self.caches[idx as usize + way].get().depth == IC_EMPTY);
-        (st.has_cacheable_shapes() && mono).then_some(st)
+        preferred_way(&self.jit_cache_ways(idx))
     }
     /// Property cache `idx`'s ways as they stand, which a polymorphic site's template bakes
-    /// (main thread: the optimizing tier's frozen view copies them, P3 stage 2, step 12).
+    /// (main thread: the optimizing tier's frozen view copies them, P3 stage 2, step 12, once,
+    /// for its templates and its snapshot's decode, step 16).
     pub(crate) fn jit_cache_ways(&self, idx: u32) -> [IcState; PROP_IC_WAYS] {
         std::array::from_fn(|way| self.caches[idx as usize + way].get())
     }

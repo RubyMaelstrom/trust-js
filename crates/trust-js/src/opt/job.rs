@@ -11,7 +11,7 @@
 
 use super::a64::{self, Assembled, Options, Stubs, Switches};
 use super::ir::{Decline, Refusal};
-use super::snapshot::Snapshot;
+use super::snapshot::{Raw, Snapshot};
 use super::view::FrozenChunk;
 use super::{build, verify};
 use crate::jit::{ExecutableBuffer, StubTableSnapshot};
@@ -21,8 +21,9 @@ use std::sync::Arc;
 pub(crate) struct Job {
     /// The chunk's frozen view.
     pub(crate) view: FrozenChunk,
-    /// Its feedback, read at the snapshot.
-    pub(crate) snapshot: Snapshot,
+    /// Its feedback's raw copy, taken at the snapshot, which the compile decodes (P3 stage 2,
+    /// step 16).
+    pub(crate) snapshot: Raw,
     pub(crate) options: Options,
     pub(crate) switches: Switches,
     pub(crate) layout: crate::value::JitLayout,
@@ -97,7 +98,10 @@ pub(crate) struct Finished {
     pub(crate) embeds_genv: bool,
 }
 
-/// Compile `job` (see the module's doc): reads nothing but the job and process constants.
+/// Compile `job` (see the module's doc): reads nothing but the job and process constants. Its
+/// snapshot's views are decoded here, on the compile's thread, from the raw copy the main thread
+/// took (P3 stage 2, step 16: SpiderMonkey's WarpBuilder interprets its oracle's stub copies off
+/// thread).
 pub(crate) fn compile(job: Job) -> Finished {
     let started = job.timed.then(std::time::Instant::now);
     #[cfg(test)]
@@ -107,7 +111,8 @@ pub(crate) fn compile(job: Job) -> Finished {
     let mut verify_failure = None;
     let mut embeds_genv = false;
     let outcome = (|| {
-        let built = match build::build_view(&job.view, &job.snapshot) {
+        let snapshot = Snapshot::decode(&job.snapshot, &job.view);
+        let built = match build::build_view(&job.view, &snapshot) {
             Ok(built) => built,
             Err(refusal) => return Outcome::Refused(refusal),
         };

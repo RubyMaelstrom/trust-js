@@ -68,11 +68,8 @@ impl Chunk {
             .iter()
             .filter_map(named_site_cache)
             .map(|cache| {
-                (
-                    cache,
-                    self.jit_cache_preferred(cache),
-                    self.jit_cache_ways(cache),
-                )
+                let ways = self.jit_cache_ways(cache);
+                (cache, super::preferred_way(&ways), ways)
             })
             .collect();
         sites.sort_unstable_by_key(|&(cache, _, _)| cache);
