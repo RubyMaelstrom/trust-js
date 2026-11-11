@@ -342,10 +342,11 @@ fn bitwise_operations_whose_records_saw_oddballs_truncate_them_in_line() {
         "function or(a) { return a | 0; } function xor(a, b) { return a ^ b; }
          function not(a) { return ~a; } function str(a) { return a | 0; }
          function lit(a) { return (void 0 | a) + (true | 0) + (null ^ a); }
+         function num(a) { return a & 7; }
          var odd = [undefined, null, true, false];
          for (var i = 0; i < 20; i++) {
              or(i); or(odd[i & 3]); xor(i, odd[i & 3]); not(i); not(odd[i & 3]);
-             str(i); str('7'); lit(i); lit(odd[i & 3]);
+             str(i); str('7'); lit(i); lit(odd[i & 3]); num(i);
          }",
     );
     for (name, op, words) in [
@@ -398,12 +399,23 @@ fn bitwise_operations_whose_records_saw_oddballs_truncate_them_in_line() {
     assert_eq!(count(&graph, |op| *op == NodeOp::ConstI32(1)), 1, "{text}");
     assert_eq!(count(&graph, |op| *op == NodeOp::I32Or), 2, "{text}");
     assert_eq!(count(&graph, |op| *op == NodeOp::I32Xor), 1, "{text}");
-    // A flag at the operation declines the truncation for the generic operation, as a
-    // CheckNumber's does.
+    // A Number check's NotNumber flag (byte 0) met oddballs, which the record holds: the
+    // truncation is built again. Its own exit's (TRUNCATION_EXIT) declines it for the generic
+    // operation.
     let (chunk, _) = graph_of(&mut engine, "or");
     let or = pc_of(&chunk, |op| matches!(op, Op::BitOr));
     flag(&chunk, or, ExitReason::NotNumber, false, 0);
-    let graph = graph_for(&chunk, "or flagged");
+    let graph = graph_for(&chunk, "or flagged by a Number check");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::TruncateNumberOrOddball),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert!(declines(&graph).is_empty(), "{text}");
+    flag(&chunk, or, ExitReason::NotNumber, false, TRUNCATION_EXIT);
+    let graph = graph_for(&chunk, "or flagged by its truncation");
     let text = dump(&graph, &chunk);
     assert_eq!(
         count(&graph, |op| *op == NodeOp::TruncateNumberOrOddball),
@@ -412,6 +424,15 @@ fn bitwise_operations_whose_records_saw_oddballs_truncate_them_in_line() {
     );
     assert_eq!(nodes(&graph, is_effect)[0].pc as usize, or, "{text}");
     assert_eq!(declines(&graph), [(or, ExitReason::NotNumber)], "{text}");
+    // A record of Numbers alone declines at a Number check's flag, as before.
+    let (chunk, graph) = graph_of(&mut engine, "num");
+    assert_eq!(count(&graph, |op| *op == NodeOp::CheckNumber), 1);
+    let num = pc_of(&chunk, |op| matches!(op, Op::BitAnd));
+    flag(&chunk, num, ExitReason::NotNumber, false, 0);
+    let graph = graph_for(&chunk, "num flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(nodes(&graph, is_effect)[0].pc as usize, num, "{text}");
+    assert_eq!(declines(&graph), [(num, ExitReason::NotNumber)], "{text}");
 }
 
 #[test]

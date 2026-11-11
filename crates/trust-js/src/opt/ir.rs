@@ -263,6 +263,12 @@ pub(crate) enum ExitReason {
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
 
+/// The exit profile's byte for a NotNumber exit that a TruncateNumberOrOddball took (a String,
+/// a Symbol, a BigInt or an object where its record saw Numbers and oddballs), where a Number
+/// check's NotNumber exit keeps 0: the builder declines a bitwise operation whose record holds
+/// oddballs to the generic one only after its truncation exited (`Rules::bitwise_declined`).
+pub(crate) const TRUNCATION_EXIT: u8 = 1;
+
 /// What a node does. Inputs are in [`Node::inputs`] in the order each variant names.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum NodeOp {

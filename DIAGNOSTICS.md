@@ -90,7 +90,10 @@ comment/example in the same change.
   for NotNumber, f64 for NotInt32 and Overflow, the generic access for WrongShape unless the
   site's ways grew, the guard's mismatch edge for WrongCallee, the block for NeverRan, an f64
   loop phi for PhiNotInt32 and a tagged one for PhiNotNumber, the two exits of a loop's entry
-  check of a word entering an untagged phi, at its header). A code whose exited frames loop is
+  check of a word entering an untagged phi, at its header); at a bitwise operation whose record
+  holds undefined, null or Booleans, a NotNumber flag declines the operation only once its
+  truncation of them exited (a Number check's exits there were oddballs the VM recorded, which
+  the truncation takes). A code whose exited frames loop is
   discarded sooner, as JSC's from its baseline loop: once its exits reach 5 << R (never more
   than its limit), each exit that does not discard starts a warm-up of its chunk's template loop
   iterations (100 << R invocations' worth, a discard's warm-up's first distance) that entries do

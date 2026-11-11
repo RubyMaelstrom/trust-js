@@ -1294,6 +1294,7 @@ impl Gen<'_> {
             | NodeOp::CheckCellIs { proof, .. }
             | NodeOp::CheckGlobalEpoch { proof, .. }
             | NodeOp::CheckEnvGeneration { proof, .. } => proof,
+            NodeOp::TruncateNumberOrOddball => TRUNCATION_EXIT,
             _ => 0,
         };
         let record = ExitRecord {

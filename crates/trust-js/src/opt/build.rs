@@ -376,12 +376,12 @@ impl Rules<'_> {
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Gt | Op::Le | Op::Ge => {
                 self.numbers(pc, true).is_some() && !flagged(&[ExitReason::NotNumber])
             }
-            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
-                self.truncatable(pc, true).is_some() && !flagged(&[ExitReason::NotNumber])
-            }
-            Op::BitNot => {
-                self.truncatable(pc, false).is_some() && !flagged(&[ExitReason::NotNumber])
-            }
+            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => self
+                .truncatable(pc, true)
+                .is_some_and(|values| !self.bitwise_declined(pc, holds_oddballs(&values, true))),
+            Op::BitNot => self
+                .truncatable(pc, false)
+                .is_some_and(|values| !self.bitwise_declined(pc, holds_oddballs(&values, false))),
             Op::Neg | Op::Plus | Op::UpdateLocal(..) => {
                 self.numbers(pc, false).is_some() && !flagged(&[ExitReason::NotNumber])
             }
@@ -491,6 +491,18 @@ impl Rules<'_> {
         (roles & !(NUMBER | ODDBALL) == 0).then_some(values)
     }
 
+    /// Whether NotNumber flagged at the bitwise operation at `pc` declines it to the generic
+    /// operation, `oddballs` where its record holds oddballs. A Number check's exits there met
+    /// words the VM then ran the operation on and recorded: where those were oddballs, which the
+    /// record now holds, the truncation takes them and is built again, as V8 reoptimizes on the
+    /// kNumberOrOddball feedback its deopt left (and as ways that grew are checked again,
+    /// `stale_ways`); an oddball truncation's own exit (TRUNCATION_EXIT: a word that is neither,
+    /// which a Symbol's or a BigInt's throw leaves unrecorded) declines it for good.
+    fn bitwise_declined(&self, pc: usize, oddballs: bool) -> bool {
+        self.snapshot.declines(pc, ExitReason::NotNumber)
+            && (!oddballs || self.snapshot.truncation_exited(pc))
+    }
+
     /// Whether the value the element store at `pc` takes may be a Number: not a constant that
     /// is none, which the operation before the store pushes in its block (`t[i] = 's'`), where a
     /// typed array's store takes the effect, its conversion being the operation's.
@@ -523,6 +535,16 @@ impl Rules<'_> {
 /// f64 bits, every other kind a tag above the canonical NaN).
 fn number_word(word: u64) -> Option<f64> {
     (((word >> 48) as u16 & 0x7fff) < 0x7ff9).then(|| f64::from_bits(word))
+}
+
+/// Whether a bitwise operation's record (`two`: both operands' roles) holds oddballs.
+fn holds_oddballs(values: &ValuesView, two: bool) -> bool {
+    let roles = if two {
+        values.operand0 | values.operand1
+    } else {
+        values.operand0
+    };
+    roles & ODDBALL != 0
 }
 
 /// ToInt32 of an oddball's word (ECMA-262 §7.1.4 ToNumber: undefined NaN, null +0, false +0,
@@ -2578,6 +2600,20 @@ impl<'a> Builder<'a> {
             && self.declined(pc, ExitReason::NotNumber, "the generic operation")
     }
 
+    /// `declines_number` for a bitwise operation, whose NotNumber flag declines it only as
+    /// [`Rules::bitwise_declined`] says (`oddballs`: its record holds oddballs).
+    fn declines_bitwise(
+        &mut self,
+        pc: usize,
+        st: &State,
+        operands: &[NodeIx],
+        oddballs: bool,
+    ) -> bool {
+        !operands.iter().all(|&value| self.known_number(st, value))
+            && self.rules().bitwise_declined(pc, oddballs)
+            && self.declined(pc, ExitReason::NotNumber, "the generic operation")
+    }
+
     /// Whether int32 arithmetic at `pc` is declined for f64: NotInt32 flagged where an operand
     /// needs its int32 checked (none does when `proven`), or Overflow flagged, which takes f64
     /// even on proven int32s (JSC's makeSafe).
@@ -2655,7 +2691,7 @@ impl<'a> Builder<'a> {
         let Some(values) = self.rules().truncatable(pc, true) else {
             return self.effect(pc, st);
         };
-        let oddballs = (values.operand0 | values.operand1) & ODDBALL != 0;
+        let oddballs = holds_oddballs(&values, true);
         let len = st.stack.len();
         let (a, b) = (st.stack[len - 2], st.stack[len - 1]);
         let takes = |builder: &Self, value| {
@@ -2668,7 +2704,7 @@ impl<'a> Builder<'a> {
         if !takes(self, a) || !takes(self, b) {
             return self.mismatch(pc, ExitReason::NotNumber, st);
         }
-        if self.declines_number(pc, st, &[a, b]) {
+        if self.declines_bitwise(pc, st, &[a, b], oddballs) {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);
@@ -2719,7 +2755,7 @@ impl<'a> Builder<'a> {
         let Some(values) = values else {
             return self.effect(pc, st);
         };
-        let oddballs = op == Op::BitNot && values.operand0 & ODDBALL != 0;
+        let oddballs = op == Op::BitNot && holds_oddballs(&values, false);
         let len = st.stack.len();
         let value = st.stack[len - 1];
         let takes = if oddballs {
@@ -2730,7 +2766,12 @@ impl<'a> Builder<'a> {
         if !takes {
             return self.mismatch(pc, ExitReason::NotNumber, st);
         }
-        if self.declines_number(pc, st, &[value]) {
+        let declines = if op == Op::BitNot {
+            self.declines_bitwise(pc, st, &[value], oddballs)
+        } else {
+            self.declines_number(pc, st, &[value])
+        };
+        if declines {
             return self.effect(pc, st);
         }
         let mut cx = Before::new(pc);

@@ -66,7 +66,8 @@ pub(crate) struct Snapshot {
     ran: Box<[Ran]>,
     /// Each pc's declined reasons (bits by discriminant) and, for WrongShape, the most shapes a
     /// discarded check there expected, for WrongName the proof byte a discarded check there
-    /// expected; empty where no chunk the compile reads has exit sites.
+    /// expected, for NotNumber at a bitwise operation whether its oddball truncation exited
+    /// (TRUNCATION_EXIT); empty where no chunk the compile reads has exit sites.
     declined: Box<[(u32, u8)]>,
     /// Each free-name site's view (see [`NameView`]); empty for a chunk without one.
     names: Box<[NameView]>,
@@ -314,6 +315,16 @@ impl Snapshot {
             .map_or(0, |&(_, ways)| usize::from(ways))
     }
 
+    /// Whether an oddball truncation's NotNumber exit at `pc` is flagged (TRUNCATION_EXIT): a
+    /// bitwise operation whose record holds oddballs is then declined to the generic one.
+    pub(crate) fn truncation_exited(&self, pc: usize) -> bool {
+        self.declines(pc, ExitReason::NotNumber)
+            && self
+                .declined
+                .get(pc)
+                .is_some_and(|&(_, byte)| byte & super::ir::TRUNCATION_EXIT != 0)
+    }
+
     /// The proof byte a discarded check at `pc` expected, where WrongName is flagged there
     /// ([`NameView::proof`]).
     pub(crate) fn discarded_proof(&self, pc: usize) -> u8 {
@@ -395,7 +406,9 @@ fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u32, u8
     for (pc, (reasons, ways)) in declined.iter_mut().enumerate() {
         let mut add = |reason: u8, shapes: u8| {
             *reasons |= 1u32 << reason;
-            if reason == ExitReason::WrongShape as u8 {
+            if reason == ExitReason::WrongShape as u8 || reason == ExitReason::NotNumber as u8 {
+                // The most shapes a discarded check expected; whether an oddball truncation
+                // exited (TRUNCATION_EXIT) at a bitwise operation, the one NotNumber with a byte.
                 *ways = (*ways).max(shapes);
             } else if reason == ExitReason::WrongName as u8 {
                 // A name site's byte is the proof its discarded check expected, as it is.

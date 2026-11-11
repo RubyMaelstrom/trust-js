@@ -88,7 +88,9 @@ pub(crate) struct ExitRecord {
     /// (`describe_receiver`) and the exit profile keeps the count of.
     pub(crate) shape_check: Option<Box<ShapeCheck>>,
     /// A free name's check's proof byte (snapshot.rs's NameView::proof), which a WrongName exit
-    /// keeps in the exit profile (stage 2, step 4); 0 for every other exit.
+    /// keeps in the exit profile (stage 2, step 4); [`super::ir::TRUNCATION_EXIT`] for a
+    /// TruncateNumberOrOddball's NotNumber exit, which the profile keeps likewise; 0 for every
+    /// other exit.
     pub(crate) proof: u8,
     /// The exits taken here, forced ones left out: a discard tallies the records with one, as
     /// JSC's tallyFrequentExitSites tallies the exits its code took

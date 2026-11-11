@@ -1753,8 +1753,8 @@ fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'stati
 
 /// Add `exit`'s site to the exit profile (see `opt::profile`): at the baseline site `chunk`'s
 /// record map names for its pc, on that first-stage chunk and marked whether it is a splice's,
-/// or at the pc on `chunk` itself; a WrongShape site with the shapes its check expected. Logs
-/// each new site.
+/// or at the pc on `chunk` itself; a WrongShape site with the shapes its check expected, a
+/// NotNumber site with whether an oddball truncation exited. Logs each new site.
 fn flag(chunk: &Chunk, exit: &ExitRecord) {
     let shapes = match exit.reason {
         ExitReason::WrongShape => exit.shape_check.as_ref().map_or(0, |check| {
@@ -1762,6 +1762,8 @@ fn flag(chunk: &Chunk, exit: &ExitRecord) {
         }),
         // The proof's byte its check expected (stage 2, step 4).
         ExitReason::WrongName => exit.proof,
+        // Whether a bitwise operation's oddball truncation took it (TRUNCATION_EXIT).
+        ExitReason::NotNumber => exit.proof,
         _ => 0,
     };
     let (at, pc, inlined) = match profile::baseline_site(chunk, exit.pc as usize) {

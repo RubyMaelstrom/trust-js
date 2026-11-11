@@ -1384,6 +1384,72 @@ fn a_new_shape_that_fills_a_way_is_checked_again() {
 }
 
 #[test]
+fn oddballs_into_a_bitwise_operation_converge_on_their_truncation() {
+    // Compiled on Numbers, `v | 0` checks a Number and exits for the undefined and null that
+    // reach it later (a holey array's hole once the code ran); the VM records them, and the
+    // recompile truncates them in line, as V8 reoptimizes on kNumberOrOddball, where the flag
+    // alone declined the generic operation.
+    let chunk = converges(
+        "low",
+        "function low(v) { return (v | 0) + 1; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = (t + low(k)) | 0; t",
+        "let s = 0; for (let k = 0; k < 600; k++) s = (s + low(k % 3 ? undefined : null)) | 0; s",
+        "low(undefined) + low(true) * 10 + low(7.5) * 100",
+        ExitReason::NotNumber,
+    );
+    let graph = graph_now(&chunk);
+    use super::ir::NodeOp;
+    assert!(graph.declines.is_empty(), "{:?}", graph.declines);
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| node.op == NodeOp::TruncateNumberOrOddball));
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::Effect { .. })));
+}
+
+#[test]
+fn a_symbol_into_an_oddball_truncation_converges_on_the_generic_operation() {
+    // Compiled on Numbers and oddballs, `v | 0` truncates them in line and exits for a Symbol,
+    // whose TypeError leaves the record as it was: its truncation's flag (TRUNCATION_EXIT)
+    // declines the generic operation, which throws there without an exit.
+    let chunk = converges(
+        "low",
+        "function low(v) { return (v | 0) + 1; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = (t + low(k % 2 ? k : undefined)) | 0; t",
+        "let s = 0; for (let k = 0; k < 600; k++) { try { low(Symbol()); } catch (e) { s++; } } s",
+        "low(undefined) + low(5) * 10 + (() => { try { return low(Symbol()); } \
+         catch (e) { return e.name; } })()",
+        ExitReason::NotNumber,
+    );
+    let graph = graph_now(&chunk);
+    use super::ir::NodeOp;
+    let or = chunk
+        .jit_ops()
+        .iter()
+        .position(|op| *op == crate::bytecode::Op::BitOr)
+        .expect("the BitOr");
+    assert_eq!(
+        graph
+            .declines
+            .iter()
+            .map(|decline| (decline.pc as usize, decline.reason))
+            .collect::<Vec<_>>(),
+        [(or, ExitReason::NotNumber)]
+    );
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| node.op == NodeOp::TruncateNumberOrOddball));
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::Effect { pc, .. } if pc as usize == or)));
+}
+
+#[test]
 fn strings_into_add_converge_on_the_generic_add() {
     converges(
         "add",
