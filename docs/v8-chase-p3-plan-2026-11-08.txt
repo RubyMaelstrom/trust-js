@@ -2822,3 +2822,108 @@ the asynchronous mode alike):
   (step15-impl/tools/closures.js, not one of the bar's call microbenchmarks), the tier on is
   +4.96% against main and +4.75% over the tier off (main -0.20%). Main splices way 0's closure;
   the rule splices none of them until stage 3 guards by code.
+
+Djot's compile bar after steps 14 and 15 (study, 2026-11-11; target/p3/stage2/
+compile-bar-input.txt, evidence compile-bar/). On main 3a79e650 Djot's main-thread parts a run
+on an A725 core (medians of 7 log runs): recompile 2.07 ms (15 recompiles), snapshot about 1.5 ms
+(47 jobs; 0.93 synchronous), stubs 0.21 (3 reruns), install 0.28. By the interim session's
+per-part ratios that is about 2.80 ms on X925, 4.0% (3.9-4.3%) of Djot's pass, against 3%
+(2.09 ms). React is about 1.2% and Vue 0.96%. Where it goes:
+- The recompile, 53%: the AST body walk 63% of it, finish_chunk 17.5%, the seeds 7.8%. Its cost
+  follows the recompiled caller's size (0.6 us an output operation): next() (512 operations)
+  costs 0.29 ms to splice 75 operations of callees, feed() (491) 0.24 ms to splice 12, both
+  through the small-callee budget alone.
+- The snapshot, synchronously: Snapshot::take_in 61% (a 168-byte SiteView for every pc, 1.08 MB a
+  run, where 1,175 of 5,473 pcs carry feedback) and Chunk::freeze 33% (340 KB copied a run, 46%
+  of it the named sites' ways, which take_in has just read; the operations 39%). Asynchronously
+  also the names' key lookups (381 a run, 2.7 us a job, all found) and the hand-off (the queue,
+  and a futex wake at every enqueue: 5-10 us a job on two cores, by difference).
+- The install line holds the log's own formatting: about 3.2 us an install, half the line.
+- Step 15's 7 extra compiles pay back: refusing them costs Djot's measured pass +0.87%
+  instructions and passes 2-10 +1.22% cycles. They stay.
+- Outside the bar's parts: the settled-feedback fingerprint at the checkpoints costs about as much
+  main-thread time as the snapshot line (0.97M cycles a run).
+The exemplars copy no bytecode on the main thread. V8's Maglev reads the BytecodeArray and its
+constant pool through the handle on the background thread (src/compiler/heap-refs.h:1150-1152),
+and the feedback through the broker as it builds (src/compiler/js-heap-broker.cc:926-934).
+SpiderMonkey's main-thread snapshot walks the ops but copies only the Baseline ICs' stub data,
+sparsely (jit/WarpOracle.cpp:310-336 and 1333-1352; jit/WarpSnapshot.h:53-56), into one LifoAlloc
+reused across compiles (jit/Ion.cpp:1795-1845); WarpBuilder reads the bytecode and its atoms off
+thread. JSC's DFG parses the baseline's shared instructions on its own thread and reads the
+profiles under the block's lock (dfg/DFGByteCodeParser.cpp:8338, 10582). All three carry property
+names as atoms in the bytecode (V8's constant pool, interpreter/bytecode-array-builder.cc:942-947;
+SpiderMonkey's gcthings, vm/JSScript.h:2361-2377; JSC's identifiers, bytecode/
+UnlinkedCodeBlock.h:196). None wakes a busy compile thread: SpiderMonkey's dispatch returns while
+every helper runs a task (vm/HelperThreads.cpp:262-265), JSC wakes threads only below a load-based
+target (jit/JITWorklist.cpp:106-148), and V8 posts a worker only below its two-thread cap
+(libplatform/default-job.cc:42-62). JSC's compiler threads make a missing shared thunk themselves,
+under the thunks' lock (jit/JITThunks.cpp:189-222).
+Estimated savings on X925:
+- the exemplars' snapshot, keys, hand-off and stubs, and the instrument's fix: about 0.63 ms
+  (0.5-0.75), to about 3.1% (2.9-3.5%), not reliably under 3%;
+- with an interim splice rule (no recompile of a caller over the shared budget for small-callee
+  splices alone): about 2.5%;
+- stage 3's graph inlining, which recompiles no bytecode: about 1.7% with the stubs and
+  instrument items.
+The interim rule is TRust's trade, not an exemplar's (Maglev inlines small callees whatever the
+caller's size, as it pays no recompile); its Octane measurement is under way, and the choice
+between it, stage 3's inlining and carrying the bar goes to the owner with that and the next
+session's readings.
+
+Step 16, the snapshot and the hand-off in the exemplars' shape (design, 2026-11-11; input
+compile-bar-input.txt sections 2, 4 and 5). Each part is needed whichever way the bar is met: with
+an interim splice rule, for the margin; with stage 3, because inlined callees add snapshots and
+jobs.
+1. The instrument. The main-thread timers stop before the log's formatting: log_main_thread reads
+   the clock before it formats the chunk's name, and the install's timer ends before finish
+   formats its compiled line. The bar's parts then time the engine's work. Nothing changes without
+   the log.
+2. Keys carried by the chunk. The frozen view takes a named operation's key from its chunk's key
+   table (Chunk::name_keys), made once a chunk, instead of looking up its text each job. A first
+   stage's table is the one the VM made, or is made at its first freeze, on the main thread, as
+   the VM's first named access makes it. A second stage's table comes from its first stage's and
+   its spliced callees' tables at the recompile; the names the recompile adds are made there.
+   This is the exemplars' atoms in the bytecode. Constraints: the tier off pays nothing it does
+   not pay now, and no job reruns for a missing atom.
+3. The hand-off. The compile thread marks itself waiting under the queue's lock before it waits,
+   and enqueue notifies only a waiting thread, which is SpiderMonkey's and JSC's rule. The job's
+   clock reads (its Timing fields, the queue's stamp) happen only under the log.
+4. The snapshot sparse, and decoded on the compile thread, as SpiderMonkey's oracle copies the IC
+   data that cannot be read off thread and WarpBuilder interprets it there.
+   - On the main thread: one raw copy of each feedback-bearing site's words (a named site's
+     preferred way and ways, which the property templates' view then reads in place of the
+     freeze's second read; a call site's ways; the value, element and construct records through
+     the record map), the free names' global views (they read the realm) and the exit profile.
+     This replaces a SiteView for every pc.
+   - On the compile thread: the SiteViews, decoded from the raw copies by the same decode, made
+     generic over its source as step 12 made the emitters (jit::JitChunk).
+   The step settles the raw copy's form, and says what it holds and why the decode cannot see a
+   difference.
+5. The job's allocations in one arena that the next job reuses (SpiderMonkey's LifoAlloc reuse,
+   jit/Ion.cpp:1795-1845), where the step's measurement shows the allocator's share of prepare
+   (9-13% today) still there after points 2 and 4.
+Not in the step:
+- The chunk's operations and names shared behind an Arc (0.04-0.07 ms X925). An Arc made at
+  every chunk's compile costs the tier off, and stage 3's frozen view of first stages is where
+  the sharing pays.
+- The remaining pure facts (0.02-0.03 ms). The activation plan is heap-bound.
+- Tests:
+  - the tier's code identical before and after on the fixtures, Octane's fixed runs and the
+    tier's tests (masked hashes, step 12's identity tools);
+  - the snapshot's views equal both ways (a debug check that decodes from both sources);
+  - the keys: a second stage's keys equal to lookups by text; a name with no atom yet (made at
+    the recompile or the freeze, never a rerun);
+  - the hand-off: a job queued while the thread compiles is taken without a wake, one queued
+    while it waits wakes it, and no job is left behind (a stress of many small jobs, the queue
+    drained; an engine dropped with jobs pending);
+  - the instrument: the lines' sums with the log's formatting left out.
+- Expected:
+  - Djot's snapshot line falls by 0.5-0.6 ms on A725: the decode and arrays 0.25M cycles, the
+    freeze's second read of the sites 0.12-0.15 ms, the lookups up to 0.13 ms, the busy wakes
+    and clock reads 0.06-0.1 ms.
+  - Its install line falls by 0.15 ms with the log.
+  - About 0.45 ms on X925 in all: Djot to about 3.4% (3.2-3.7%).
+  - The tier's code, its plans and the tier off unchanged.
+- Step 17, after it: the shared stubs made on the compile thread under the stub table's lock, the
+  main thread fencing at the install as now (JSC's ctiStubImpl, jit/JITThunks.cpp:189-222). That
+  removes the stubs line (0.21 ms A725) and each rerun's latency.
