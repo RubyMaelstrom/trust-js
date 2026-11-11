@@ -3157,3 +3157,80 @@ stubs' addresses: identity_norm.py); the tier off untouched. Mutations: the look
 skipped (a stub made twice), the generation not moved, the flag set after the insert.
 Expected: the stubs part (0.21 ms A725, 0.11 ms X925 on Djot) gone from the bar, and the jobs
 that met a missing stub installed one compile sooner. The tier's code unchanged.
+
+Step 16 landed (726843c6..ea40878e, 2026-11-11; target/p3/stage2/step16-impl, report.txt). The
+five points as designed, each its own commit:
+- (1) The instrument: a log line's arguments, formatting and printing are left out of the
+  main-thread parts' clock, and each part ends before its line is made.
+- (3) The hand-off (opt::compiler::Queue): the compile thread marks itself waiting under the
+  queue's lock before it waits; an enqueue takes the mark under the lock and notifies only where
+  it found it. No job is stranded: the thread's look at the jobs and its mark share one hold of
+  the lock, an enqueue's push and its read of the mark another, and the condition variable's wait
+  releases the lock and sleeps as one step. The job's clock reads happen under the log only.
+- (2) Keys carried by the chunk: the frozen view takes every name's key from the chunk's table
+  (made by the VM's first named access or the tier's first freeze); a second stage's table is
+  carried at its recompile, with the tier on only, through a map of its record map's chunks'
+  tables by text (Chunk::carry_name_keys: 48.5 us a Djot run against 61.0 for a lookup a name).
+  No job reruns for an atom.
+- (4) The snapshot sparse, decoded on the compile thread: the main thread copies the words the
+  decode reads, by the index it reads them by (records, a second stage's baseline records through
+  the record map, the call and construct entries' words, the literals' readiness, the call caches'
+  epoch); the property caches' ways come from the frozen view's one read, which the templates and
+  the decode share. One decode (feedback_read::site_view), generic over its source, serves the
+  live chunk and the copy; debug builds compare both at every compile.
+- (5) The job's memory reused (needed: the allocator was 24% of start_job after (2) and (4)): the
+  frozen view's and the raw copy's vectors go back to the preparing thread at the install (two
+  kept a thread), as SpiderMonkey reuses a finished compile's LifoAlloc. Reused vectors rather
+  than a bump arena: Rust has no stable allocator-parameterized collections.
+Measured (fat LTO, main be6b5ee2 against the branch):
+- Djot's bar, asynchronous on two A725 cores, medians of 7 log runs: 3.889 -> 3.288 ms a run
+  (snapshot -0.443, install -0.155, stubs -0.042, recompile +0.064 for the carry); by the study's
+  ratios 3.82% -> 3.29% on X925 (the plan: about 3.4%). React 0.451 -> 0.421 ms, Vue 2.504 ->
+  2.209. Per job the snapshot line is 30.5 -> 21.0 us, the install 6.3 -> 3.0 us. 8 of Djot's 50
+  enqueues found the thread busy (React 4 of 10, Vue 19 of 43). The snapshot line fell less than
+  the expected 0.5-0.6 ms: log runs keep the job's clock reads by design, few enqueues found the
+  thread busy, and the raw copy and the first freezes' key tables are new work.
+- The tier's code and the tier off's template code identical to main's on the fixtures, their fx3
+  copies, Octane's fixed runs and the tier's tests (every differing hash an address loaded in a
+  different number of MOVZ/MOVK instructions). Instructions: Octane geomean +0.03% off, +0.10%
+  asynchronous, +0.09% synchronous; the fixtures within 0.2% (Vue's +1.3% at setarch -R is
+  layout, +0.03% randomized); the calls within 0.01%.
+- Tests: the design's list and five mutations, all caught; the library's suites (3,198, tier off
+  and on in both modes), the tier's in three configurations (297 each), poll and Agent (51 each,
+  both modes), Test262 53,573 of 53,575 in four configurations; clippy, fmt; zombie's check,
+  clippy -D warnings, Windows' check and suite (2,774). No asynchronous flake seen.
+
+The owner's answers (2026-11-11):
+- Step 15's rule: "Maglev's form". A site whose ways hold several distinct callees splices them
+  guarded again where the call is a named method call; keyed and plain calls with several
+  callees still decline, and so do sites that met another closure (below).
+- The delivered clock: "Time as the machine runs". Sessions accept the machine's power state,
+  record the delivered clock with each phase (user cycles over task clock, cpuinfo_avg_freq), and
+  require it steady across phases and between compared sessions. The logger since showed that
+  the GPU is not the cause: with the GPU idle (225 samples, 11:54-13:08) the X925 cores still
+  delivered 1.36-1.37 GHz and the A725 cores 0.98-0.99 GHz, thermald at state 0, about 60 C. The
+  limit sits below cpufreq, its cause unknown; nothing on the machine was changed.
+
+Step 15b, Maglev's polymorphic method calls (design, 2026-11-11; the owner's answer above; the
+diagnosis in the be6b5ee2 session's record). With the tier on, a call site whose ways hold several
+distinct callees splices them, guarded by callee as before step 15, where the call's callee is a
+named property's value: a method call o.m(...), whose callee Op::GetMethod reads. Maglev continues
+a polymorphic named load's arms through the call of the loaded function, where each arm's function
+is a constant it can inline (maglev_poly_calls, on by default;
+FindContinuationForPolymorphicPropertyLoad, maglev-graph-builder.cc:6038-6125). Its load has at
+most V8's four maps, our ways at most the cache's four. A site whose callee is a keyed read's
+(Op::GetMethodElem: Gameboy's memoryReader[address](...), OPCODE[opcode](...)) or any other
+value's declines, as Maglev's continuation follows GetNamedProperty alone and V8's call feedback
+has no polymorphic state. A site that met another closure of a way's function declines as now
+(stage 3 guards those by code).
+- The record: the bytecode compiler marks each call site whose callee GetMethod made (a flag set
+  once at the compile), so the planner reads it without walking the operations. The tier off
+  keeps P2's policy.
+- Tests: a named method site over two classes spliced with the tier on, a keyed one over two
+  callees not spliced; a plain call over two functions not spliced; a closure site not spliced;
+  a method site that also met another closure not spliced; the tier off unchanged.
+- Measured with timed Octane on X925 beside the fixed-run counts (the counts read the warm-up's
+  exits; the session reads the steady state), the delivered clock recorded.
+- Expected, from the probe and Gameboy's sites: DeltaBlue +13.8%, RayTrace +2%, Richards +3.4%
+  (the rest of its loss is placement: step 13's earlier discards), Gameboy as main; the fixtures
+  and the compile bar as main.
