@@ -37,9 +37,10 @@
 //! chunks once its heap is large enough): size classes put the blocks a program makes together
 //! (a compiled chunk's `Vec`s of ops, names and caches, adjacent in glibc's heap) on as many
 //! pages as they have classes, and with base pages the L1 data TLB missed twice as often as
-//! with glibc on Vue's passes (+10% cycles on an A725 core); one huge page a segment maps all
-//! its spans with one TLB entry. A huge page makes its whole segment resident, which spans of
-//! `SPAN` (16 KiB) keep small: a class with a few blocks holds one 16 KiB span, not 64 KiB.
+//! with glibc on Vue's passes (+3% cycles on an A725 core, Djot's +1.5%); one huge page a
+//! segment maps all its spans with one TLB entry. A huge page makes its whole segment resident
+//! (about 2 MiB more RSS for a small program), which spans of `SPAN` (16 KiB) keep small: a
+//! class with a few blocks holds one 16 KiB span, not 64 KiB.
 //!
 //! Threads: a block freed on another thread than the one it was allocated on joins the freeing
 //! thread's list, and goes back to its span at that thread's overflow, trim or exit; spans are
@@ -1059,7 +1060,7 @@ pub struct ClassAlloc;
 
 // The fast paths belong in the allocator shims (`__rust_alloc`, `__rust_dealloc`) the compiler
 // generates for the registered allocator: out of line they cost every allocation and free a jump
-// and the front end a code location of their own (Vue's passes +4% cycles at equal instructions,
+// and the front end a code location of their own (Vue's passes +3% cycles at equal instructions,
 // more L1I refills and mispredicted branches, when fat LTO left them out of line).
 unsafe impl GlobalAlloc for ClassAlloc {
     #[inline(always)]
