@@ -415,6 +415,7 @@ pub(crate) mod os_pages {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         fn munmap(addr: *mut u8, len: usize) -> i32;
         fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
+        fn getpagesize() -> i32;
     }
     const PROT_READ_WRITE: i32 = 0x1 | 0x2;
     #[cfg(target_os = "linux")]
@@ -451,6 +452,13 @@ pub(crate) mod os_pages {
         } else {
             ptr
         }
+    }
+
+    /// The system's page size, the granularity of [`decommit`]: 4 KiB on x86-64; on AArch64
+    /// 16 KiB on macOS, and 4, 16 or 64 KiB on Linux, as its kernel was built.
+    pub(crate) fn page_size() -> usize {
+        // SAFETY: no arguments; it reads the size the system gave the process.
+        unsafe { getpagesize() as usize }
     }
 
     /// `len` zeroed bytes at an `align` boundary, `align` a power of two and both multiples of the
@@ -546,7 +554,23 @@ pub(crate) mod os_pages {
     unsafe extern "system" {
         fn VirtualAlloc(addr: *mut u8, len: usize, kind: u32, protect: u32) -> *mut u8;
         fn VirtualFree(addr: *mut u8, len: usize, kind: u32) -> i32;
+        fn GetSystemInfo(info: *mut SystemInfo);
     }
+    /// `SYSTEM_INFO`, of which only the page size is read.
+    #[repr(C)]
+    struct SystemInfo {
+        processor_architecture: u32,
+        page_size: u32,
+        minimum_application_address: *mut u8,
+        maximum_application_address: *mut u8,
+        active_processor_mask: usize,
+        number_of_processors: u32,
+        processor_type: u32,
+        allocation_granularity: u32,
+        processor_level: u16,
+        processor_revision: u16,
+    }
+    const _: () = assert!(std::mem::size_of::<SystemInfo>() == 48);
     const MEM_COMMIT: u32 = 0x1000;
     const MEM_RESERVE: u32 = 0x2000;
     const MEM_COMMIT_RESERVE: u32 = MEM_COMMIT | MEM_RESERVE;
@@ -565,6 +589,17 @@ pub(crate) mod os_pages {
                 MEM_COMMIT_RESERVE,
                 PAGE_READWRITE,
             )
+        }
+    }
+
+    /// The system's page size, the granularity of [`decommit`] (4 KiB on Windows' x86-64 and
+    /// AArch64).
+    pub(crate) fn page_size() -> usize {
+        let mut info = std::mem::MaybeUninit::<SystemInfo>::uninit();
+        // SAFETY: the call fills the whole structure.
+        unsafe {
+            GetSystemInfo(info.as_mut_ptr());
+            info.assume_init().page_size as usize
         }
     }
 

@@ -2,11 +2,34 @@
 //! library's test binary does not register it, so nothing else in the binary uses its spans.
 
 use super::*;
+use std::cell::RefCell;
 use std::collections::HashSet;
 use std::sync::mpsc;
 use std::sync::{Barrier, Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
 static SERIAL: Mutex<()> = Mutex::new(());
+
+/// Spans' memory goes back to the OS alone, or not, while it lives (as the system's page decides
+/// it).
+struct Alone(u32);
+
+impl Alone {
+    fn set(alone: bool) -> Self {
+        let bits = span_bits();
+        SPAN_BITS.store(
+            if alone { bits | ALONE } else { bits & !ALONE },
+            Ordering::Relaxed,
+        );
+        Alone(bits)
+    }
+}
+
+impl Drop for Alone {
+    fn drop(&mut self) {
+        SPAN_BITS.store(self.0, Ordering::Relaxed);
+    }
+}
 
 /// One test at a time: they share the allocator's spans and pool. Each test runs its allocations
 /// on threads of its own, joined before it ends (their exit drains have run by then), and gives
@@ -45,7 +68,7 @@ fn free(p: usize, size: usize) {
 }
 
 fn per_span(class: usize) -> usize {
-    SPAN / class_size(class)
+    span_size() / class_size(class)
 }
 
 fn bytes<'a>(p: usize, len: usize) -> &'a [u8] {
@@ -212,8 +235,8 @@ fn audit() -> Audit {
             audit.segments += 1;
             let start = segment as usize;
             assert_eq!(start % SEGMENT, 0);
-            for k in 1..SEGMENT / SPAN {
-                let base = start + k * SPAN;
+            for k in 1..SEGMENT / span_size() {
+                let base = start + k * span_size();
                 if start + SEGMENT == pool.carve_end && base >= pool.carve {
                     break;
                 }
@@ -333,16 +356,39 @@ fn the_spin_lock_excludes() {
 fn span_headers_sit_in_their_segments_first_span() {
     let segment = 0x7f12_3440_0000_usize;
     assert_eq!(segment % SEGMENT, 0);
-    for k in 1..SEGMENT / SPAN {
-        let base = segment + k * SPAN;
-        for at in [base, base + 4321, base + SPAN - 1] {
+    let span = span_size();
+    for k in 1..SEGMENT / span {
+        let base = segment + k * span;
+        for at in [base, base + 4321, base + span - 1] {
             assert_eq!(span_of(at) as usize, segment + k * 64);
         }
         assert_eq!(base_of(span_of(base)), base);
     }
-    assert_eq!(class_end(0), SPAN as u32);
-    assert_eq!(class_end(2), (SPAN / 48 * 48) as u32);
-    assert_eq!(class_end(63), SPAN as u32);
+    assert_eq!(class_end(0), span as u32);
+    assert_eq!(class_end(2), (span / 48 * 48) as u32);
+    assert_eq!(class_end(63), span as u32);
+}
+
+/// A span is whole pages, so that its memory can go back alone: 16 KiB, or the page where that is
+/// larger (a Linux kernel of 64 KiB pages: AArch64's RHEL, NVIDIA's Grace); past 64 KiB, spans of
+/// 16 KiB whose memory stays.
+#[test]
+fn spans_are_whole_pages() {
+    let _serial = serial();
+    assert_eq!(span_for_page(4096), (16 << 10, true));
+    assert_eq!(span_for_page(16 << 10), (16 << 10, true));
+    assert_eq!(span_for_page(64 << 10), (64 << 10, true));
+    assert_eq!(span_for_page(128 << 10), (16 << 10, false));
+    assert_eq!(span_for_page(12 << 10), (16 << 10, false));
+    let (span, alone_by_page) = span_for_page(segments::page_size());
+    assert_eq!((span_size(), alone()), (span, alone_by_page));
+    assert!(span_size().is_multiple_of(segments::page_size()) || !alone());
+    eprintln!(
+        "page {} KiB, spans {} KiB, a span's memory back alone: {}",
+        segments::page_size() >> 10,
+        span_size() >> 10,
+        alone()
+    );
 }
 
 #[test]
@@ -424,7 +470,7 @@ fn a_refill_takes_the_blocks_returned_to_the_class_spans() {
         assert!(list
             .iter()
             .chain([&p])
-            .all(|&b| (b - base).is_multiple_of(2 * size) && b - base < SPAN));
+            .all(|&b| (b - base).is_multiple_of(2 * size) && b - base < span_size()));
         let v = view(base);
         assert_eq!((v.place, v.out as usize, v.returned), (Place::Out, n, 0));
         assert!(class_spans(class).is_empty());
@@ -490,7 +536,7 @@ fn an_overflow_gives_the_colder_half_back() {
     let _serial = serial();
     let class = 63;
     let (size, cap, n) = (class_size(class), CLASS_CAPS[class], per_span(class));
-    assert_eq!((cap, n), (256, 16));
+    assert!(cap == 256 && (cap / 2).is_multiple_of(n));
     on_thread(|| {
         let blocks: Vec<_> = (0..300).map(|_| alloc(size)).collect();
         for &b in &blocks[..cap] {
@@ -499,7 +545,7 @@ fn an_overflow_gives_the_colder_half_back() {
         assert_eq!(thread_list(class).len(), cap);
         free(blocks[cap], size);
         // The hotter half stays, last freed first, with the block freed; the colder half (the
-        // first 128 freed: eight whole spans) went back, and those spans to the pool.
+        // first 128 freed: eight whole 16 KiB spans) went back, and those spans to the pool.
         let expected: Vec<_> = blocks[cap / 2..=cap].iter().rev().copied().collect();
         assert_eq!(thread_list(class), expected);
         assert!((0..cap / 2 / n).all(|k| pooled(blocks[k * n])));
@@ -575,6 +621,7 @@ fn an_emptied_span_goes_to_the_pool_and_serves_another_class() {
 #[test]
 fn trim_returns_the_pools_memory_and_it_reads_zero_after() {
     let _serial = serial();
+    let _alone = Alone::set(true);
     let class = 30;
     let size = class_size(class);
     let base = on_thread(|| {
@@ -596,7 +643,7 @@ fn trim_returns_the_pools_memory_and_it_reads_zero_after() {
     assert_eq!(pool_spans().1[0], base);
     assert_eq!(v.tail_zero, segments::DECOMMIT_ZEROES);
     #[cfg(target_os = "linux")]
-    assert!(bytes(base, SPAN).iter().all(|&x| x == 0));
+    assert!(bytes(base, span_size()).iter().all(|&x| x == 0));
     // The span serves the next class that needs one, recommitted.
     let other = 31;
     on_thread(move || {
@@ -791,7 +838,7 @@ fn alloc_zeroed_clears_only_blocks_that_may_be_dirty() {
             let (p, zero) = alloc_miss(class);
             let p = p as usize;
             assert!(zero && view(p).base == p && thread_region(class).2);
-            assert!(bytes(p, SPAN).iter().all(|&x| x == 0));
+            assert!(bytes(p, span_size()).iter().all(|&x| x == 0));
             // SAFETY: a nonzero size.
             let z = unsafe { ClassAlloc.alloc_zeroed(layout(250)) } as usize;
             assert_eq!(z, p + size);
@@ -1037,4 +1084,376 @@ fn a_randomized_multithreaded_stress_keeps_every_block_intact() {
         "{audit:?}"
     );
     assert!(audit.carved > 0);
+}
+
+/// Blocks a thread-local destructor frees and allocates at the thread's exit: after the exit
+/// drain where it was registered before the thread's first allocation (glibc runs them last
+/// registered first), before it otherwise.
+struct ChurnLate {
+    held: RefCell<Vec<Held>>,
+    to: RefCell<Option<mpsc::Sender<Vec<Held>>>>,
+    seed: Cell<u64>,
+}
+
+impl Drop for ChurnLate {
+    fn drop(&mut self) {
+        let held = std::mem::take(&mut *self.held.borrow_mut());
+        let mut rng = Rng(self.seed.get() | 1);
+        let to = self.to.borrow_mut().take();
+        let mut gift = Vec::new();
+        for h in held {
+            if rng.below(2) == 0 {
+                h.free();
+            } else {
+                gift.push(h);
+            }
+        }
+        for _ in 0..rng.below(40) {
+            let size = 1 + rng.below(1024);
+            let zeroed = rng.below(3) == 0;
+            let l = Layout::from_size_align(size, 8).unwrap();
+            // SAFETY: a nonzero size.
+            let at = unsafe {
+                if zeroed {
+                    ClassAlloc.alloc_zeroed(l)
+                } else {
+                    ClassAlloc.alloc(l)
+                }
+            } as usize;
+            assert!(at != 0);
+            if zeroed {
+                assert!(bytes(at, size).iter().all(|&x| x == 0), "late zeroed");
+            }
+            let h = Held {
+                at,
+                size,
+                align: 8,
+                tag: rng.next() as u8,
+            };
+            h.write();
+            if rng.below(2) == 0 {
+                h.free();
+            } else {
+                gift.push(h);
+            }
+        }
+        if rng.below(4) == 0 {
+            trim_now();
+        }
+        match to {
+            Some(to) if !gift.is_empty() => {
+                if let Err(e) = to.send(gift) {
+                    e.0.into_iter().for_each(Held::free);
+                }
+            }
+            _ => gift.into_iter().for_each(Held::free),
+        }
+    }
+}
+
+thread_local! {
+    static CHURN_LATE: ChurnLate = const {
+        ChurnLate {
+            held: RefCell::new(Vec::new()),
+            to: RefCell::new(None),
+            seed: Cell::new(0),
+        }
+    };
+}
+
+fn churn_alloc(rng: &mut Rng, hot: bool) -> Held {
+    let (size, align) = if hot {
+        ([8, 16, 90, 1024][rng.below(4)], 8)
+    } else {
+        match rng.below(100) {
+            0..=59 => (1 + rng.below(256), 8),
+            60..=84 => (257 + rng.below(768), 16),
+            85..=89 => ([15, 16, 17, 1023, 1024, 1025][rng.below(6)], 16),
+            90..=95 => (1025 + rng.below(4096), 8),
+            _ => (1 + rng.below(512), 32 << rng.below(2)),
+        }
+    };
+    let l = Layout::from_size_align(size, align).unwrap();
+    let zeroed = rng.below(6) == 0;
+    // SAFETY: a nonzero size.
+    let at = unsafe {
+        if zeroed {
+            ClassAlloc.alloc_zeroed(l)
+        } else {
+            ClassAlloc.alloc(l)
+        }
+    } as usize;
+    assert!(at != 0 && at.is_multiple_of(align));
+    if zeroed {
+        assert!(
+            bytes(at, size).iter().all(|&x| x == 0),
+            "zeroed block of {size} at {at:#x} reads nonzero"
+        );
+    }
+    let h = Held {
+        at,
+        size,
+        align,
+        tag: rng.next() as u8,
+    };
+    h.write();
+    h
+}
+
+fn churn_realloc(rng: &mut Rng, h: Held) -> Held {
+    h.check(h.size);
+    let size = if rng.below(2) == 0 {
+        [1, 15, 16, 17, 1023, 1024, 1025, 2000][rng.below(8)]
+    } else {
+        1 + rng.below(3000)
+    };
+    // SAFETY: the block with its layout, and a nonzero size.
+    let at = unsafe { ClassAlloc.realloc(h.at as *mut u8, h.layout(), size) } as usize;
+    assert!(at != 0 && at.is_multiple_of(h.align));
+    Held { at, ..h }.check(h.size.min(size));
+    let resized = Held {
+        at,
+        size,
+        align: h.align,
+        tag: rng.next() as u8,
+    };
+    resized.write();
+    resized
+}
+
+fn churn_child(seed: u64, late_first: bool, hot: bool, senders: Vec<mpsc::Sender<Vec<Held>>>) {
+    let mut rng = Rng(seed | 1);
+    let arm = |rng: &mut Rng| {
+        let (s, to) = (rng.next(), rng.below(senders.len()));
+        CHURN_LATE.with(|l| {
+            l.seed.set(s);
+            *l.to.borrow_mut() = Some(senders[to].clone());
+        });
+    };
+    let mut mine: Vec<Held> = Vec::new();
+    if late_first {
+        arm(&mut rng);
+    } else {
+        mine.push(churn_alloc(&mut rng, hot));
+        arm(&mut rng);
+    }
+    for _ in 0..300 + rng.below(1500) {
+        match rng.below(20) {
+            0..=10 => mine.push(churn_alloc(&mut rng, hot)),
+            11..=14 if !mine.is_empty() => {
+                let k = rng.below(mine.len());
+                mine.swap_remove(k).free();
+            }
+            15..=16 if !mine.is_empty() => {
+                let k = rng.below(mine.len());
+                mine[k] = churn_realloc(&mut rng, mine[k]);
+            }
+            17..=18 if !mine.is_empty() => {
+                let n = 1 + rng.below(32.min(mine.len()));
+                let gift: Vec<_> = (0..n)
+                    .map(|_| {
+                        let k = rng.below(mine.len());
+                        mine.swap_remove(k)
+                    })
+                    .collect();
+                senders[rng.below(senders.len())].send(gift).unwrap();
+            }
+            _ => {}
+        }
+    }
+    for h in mine {
+        match rng.below(4) {
+            0 => CHURN_LATE.with(|l| l.held.borrow_mut().push(h)),
+            1 => senders[rng.below(senders.len())].send(vec![h]).unwrap(),
+            _ => h.free(),
+        }
+    }
+}
+
+fn churn_stress(hot: bool, spawners: usize, children: usize) -> Audit {
+    const LIVE: usize = 4;
+    let (senders, receivers): (Vec<_>, Vec<_>) =
+        (0..LIVE).map(|_| mpsc::channel::<Vec<Held>>()).unzip();
+    std::thread::scope(|s| {
+        let mut threads = Vec::new();
+        for (t, inbox) in receivers.into_iter().enumerate() {
+            threads.push(s.spawn(move || {
+                let mut rng = Rng(0xA5A5_0000 + t as u64 * 7919);
+                let mut kept: Vec<Held> = Vec::new();
+                loop {
+                    match inbox.recv_timeout(Duration::from_micros(200)) {
+                        Ok(gift) => {
+                            for h in gift {
+                                h.check(h.size);
+                                if rng.below(3) == 0 {
+                                    kept.push(h);
+                                } else {
+                                    h.free();
+                                }
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {}
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                    if kept.len() > 3000 {
+                        while kept.len() > 200 {
+                            let k = rng.below(kept.len());
+                            kept.swap_remove(k).free();
+                        }
+                    }
+                    if t < 2 && rng.below(300) == 0 {
+                        trim_now();
+                    }
+                    if rng.below(3) == 0 {
+                        kept.push(churn_alloc(&mut rng, hot));
+                    }
+                    if !kept.is_empty() && rng.below(3) == 0 {
+                        let k = rng.below(kept.len());
+                        kept.swap_remove(k).free();
+                    }
+                }
+                kept.drain(..).for_each(Held::free);
+            }));
+        }
+        for sp in 0..spawners {
+            let senders = senders.clone();
+            threads.push(s.spawn(move || {
+                let mut rng = Rng(0x5EED_0000 + sp as u64 * 104_729);
+                for _ in 0..children {
+                    let (seed, late_first) = (rng.next(), rng.below(2) == 0);
+                    let senders = senders.clone();
+                    std::thread::spawn(move || churn_child(seed, late_first, hot, senders))
+                        .join()
+                        .unwrap();
+                }
+            }));
+        }
+        if !hot {
+            // Bursts past the pool's committed bound while the others run: its oldest spans are
+            // decommitted, then served again as another class's zeroed blocks.
+            threads.push(s.spawn(|| {
+                for round in 0..3 {
+                    let size = 1024;
+                    let blocks: Vec<usize> = (0..6 * 1024)
+                        .map(|_| {
+                            let p = alloc(size);
+                            // SAFETY: a block of `size` bytes the test holds.
+                            unsafe { *(p as *mut u64) = p as u64 ^ 0x5555 };
+                            p
+                        })
+                        .collect();
+                    for &p in &blocks {
+                        // SAFETY: as above.
+                        assert_eq!(unsafe { *(p as *const u64) }, p as u64 ^ 0x5555);
+                        free(p, size);
+                    }
+                    let other = 656 - round * 16;
+                    let zs: Vec<usize> = (0..4096)
+                        .map(|_| {
+                            // SAFETY: a nonzero size.
+                            let z = unsafe { ClassAlloc.alloc_zeroed(layout(other)) } as usize;
+                            assert!(z != 0);
+                            assert!(
+                                bytes(z, other).iter().all(|&x| x == 0),
+                                "burst zeroed at {z:#x}"
+                            );
+                            fill(z, other, 0xEE);
+                            z
+                        })
+                        .collect();
+                    for z in zs {
+                        assert!(bytes(z, other).iter().all(|&x| x == 0xEE));
+                        free(z, other);
+                    }
+                }
+            }));
+        }
+        drop(senders);
+        threads.into_iter().for_each(|t| t.join().unwrap());
+    });
+    let audit = audit();
+    assert_eq!(
+        (audit.blocks_out, audit.out, audit.partial),
+        (0, 0, 0),
+        "{audit:?}"
+    );
+    audit
+}
+
+/// Threads that churn blocks of every size, hand them to each other and exit, with thread-local
+/// destructors that free and allocate after their exit drains, while others trim: past the
+/// pool's bound and at the trims, empty spans' memory goes back alone (the review's stress, as on
+/// Windows and macOS, or where no huge page backs a segment).
+#[test]
+fn threads_that_churn_exit_and_trim_keep_every_block_intact() {
+    let _serial = serial();
+    let _alone = Alone::set(true);
+    let audit = churn_stress(false, 3, 40);
+    eprintln!("churn, spans back alone: {audit:?}");
+    assert!(audit.decommitted > 0, "{audit:?}");
+}
+
+/// Threads that churn a few hot sizes.
+#[test]
+fn threads_that_churn_hot_sizes_keep_every_block_intact() {
+    let _serial = serial();
+    let audit = churn_stress(true, 4, 40);
+    eprintln!("churn, hot sizes: {audit:?}");
+}
+
+/// A span's memory going back to the OS leaves the spans beside it alone: here a span at a 64 KiB
+/// boundary is emptied and trimmed while the next span's blocks are live (on a kernel of 64 KiB
+/// pages a 16 KiB span's discard took three neighbours' blocks with it).
+#[test]
+fn a_spans_discard_keeps_its_neighbours() {
+    let _serial = serial();
+    for alone in [true, false] {
+        let _alone = Alone::set(alone);
+        with_empty_pool(|| {
+            on_thread(|| {
+                let class = 63;
+                let (size, n) = (class_size(class), per_span(class));
+                let blocks: Vec<usize> = (0..12 * n).map(|_| alloc(size)).collect();
+                for &b in &blocks {
+                    fill(b, size, 0x77);
+                }
+                let s = (0..11)
+                    .find(|&s| {
+                        blocks[s * n].is_multiple_of(64 * 1024)
+                            && blocks[(s + 1) * n] == blocks[s * n] + span_size()
+                    })
+                    .expect("a span at a 64 KiB boundary with its neighbour carved next");
+                for &b in &blocks[s * n..(s + 1) * n] {
+                    free(b, size);
+                }
+                trim_now();
+                let v = view(blocks[s * n]);
+                assert_eq!(
+                    v.place,
+                    if alone {
+                        Place::Decommitted
+                    } else {
+                        Place::Committed
+                    }
+                );
+                let lost: Vec<usize> = blocks[(s + 1) * n..(s + 2) * n]
+                    .iter()
+                    .copied()
+                    .filter(|&b| !bytes(b, size).iter().all(|&x| x == 0x77))
+                    .collect();
+                for (k, &b) in blocks.iter().enumerate() {
+                    if k / n != s {
+                        free(b, size);
+                    }
+                }
+                assert!(
+                    lost.is_empty(),
+                    "{} live blocks of the next span lost their contents: first {:#x}",
+                    lost.len(),
+                    lost[0]
+                );
+            })
+        });
+    }
+    audit();
 }

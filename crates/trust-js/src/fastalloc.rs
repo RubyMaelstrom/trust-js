@@ -11,13 +11,13 @@
 //! free block, so an allocation the list serves, or a free it takes, locks nothing. Large or
 //! over-aligned requests pass straight through to [`std::alloc::System`].
 //!
-//! Class blocks come from spans: `SPAN` bytes of one class at a `SPAN` boundary, carved from
-//! `SEGMENT`s mapped from the OS, never from the system allocator. (Each miss and each overflow
-//! of a thread's list was one call of the system allocator a block, and once a process has a
-//! second thread glibc's malloc takes its locking path on every such call: the tier's compile
-//! thread cost CodeLoad's parse bursts about 10%.) The shape is JSC's libpas's: a thread
-//! allocates from a span it holds and frees into a thread-local log flushed in batches
-//! (`pas_local_allocator`, `pas_thread_local_cache`):
+//! Class blocks come from spans: 16 KiB of one class at a boundary of their size (a span is never
+//! smaller than the system's page: `span_for_page`), carved from `SEGMENT`s mapped from the OS,
+//! never from the system allocator. (Each miss and each overflow of a thread's list was one call
+//! of the system allocator a block, and once a process has a second thread glibc's malloc takes
+//! its locking path on every such call: the tier's compile thread cost CodeLoad's parse bursts
+//! about 10%.) The shape is JSC's libpas's: a thread allocates from a span it holds and frees
+//! into a thread-local log flushed in batches (`pas_local_allocator`, `pas_thread_local_cache`):
 //! - a thread's miss takes the next block of its bump region of the class, a span's tail it
 //!   holds, with nothing to lock. With the region spent it refills under the class's lock: the
 //!   blocks returned to the class's spans with blocks to hand out become its list (64 KiB's
@@ -27,11 +27,13 @@
 //!   blocks' spans (each found by masking the block's address), a few dozen runs of one span's
 //!   blocks at a time under the class's lock;
 //! - a span whose blocks are all back goes to the pool of empty spans, for any class. The pool's
-//!   spans beyond `POOL_COMMITTED`, and all of them at [`trim`] (after a major collection), have
-//!   their memory returned to the OS and their ranges kept for reuse.
+//!   spans beyond `POOL_COMMITTED_BYTES`, and all of them at [`trim`] (after a major collection),
+//!   have their memory returned to the OS and their ranges kept for reuse.
 //!
 //! A segment's first span holds the segment's span headers (64 bytes a span), so a span's memory
-//! can go back to the OS whole.
+//! can go back to the OS alone: a span is a whole number of the system's pages (on a Linux
+//! kernel of 64 KiB pages spans are 64 KiB), so that none of its neighbours' memory goes with
+//! it.
 //!
 //! On Linux each segment is advised for transparent huge pages (as the collector advises its
 //! chunks once its heap is large enough): size classes put the blocks a program makes together
@@ -39,8 +41,8 @@
 //! pages as they have classes, and with base pages the L1 data TLB missed twice as often as
 //! with glibc on Vue's passes (+3% cycles on an A725 core, Djot's +1.5%); one huge page a
 //! segment maps all its spans with one TLB entry. A huge page makes its whole segment resident
-//! (about 2 MiB more RSS for a small program), which spans of `SPAN` (16 KiB) keep small: a
-//! class with a few blocks holds one 16 KiB span, not 64 KiB.
+//! (about 2 MiB more RSS for a small program), which spans of 16 KiB keep small: a class with a
+//! few blocks holds one 16 KiB span, not 64 KiB.
 //!
 //! Threads: a block freed on another thread than the one it was allocated on joins the freeing
 //! thread's list, and goes back to its span at that thread's overflow, trim or exit; spans are
@@ -55,7 +57,9 @@
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::{Cell, UnsafeCell};
+use std::mem::size_of;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 /// Largest cached block size, in bytes.
 const MAX_CLASS: usize = 1024;
@@ -80,21 +84,82 @@ const fn class_caps() -> [usize; NUM_CLASSES] {
 
 const CLASS_CAPS: [usize; NUM_CLASSES] = class_caps();
 
-/// The size and alignment of a span, the blocks of one class.
-const SPAN: usize = 16 * 1024;
-/// The size and alignment of a segment, the spans mapped from the OS together (one huge page).
-/// Its first span holds the headers of its spans.
+/// The smallest and the largest span (see [`span_for_page`]).
+const MIN_SPAN: usize = 16 * 1024;
+const MAX_SPAN: usize = 64 * 1024;
+/// The size and alignment of a segment, the spans mapped from the OS together (one huge page
+/// where base pages are 4 KiB). Its first span holds the headers of its spans.
 const SEGMENT: usize = 2 * 1024 * 1024;
 /// A refill gathers the blocks returned to its class's spans until it holds this many bytes'
 /// worth, from `REFILL_SPANS` spans at most.
 const REFILL_BYTES: usize = 64 * 1024;
 const REFILL_SPANS: usize = 16;
-/// The empty spans the pool keeps committed between trims (4 MiB): the oldest beyond go back to
-/// the OS at once.
-const POOL_COMMITTED: usize = (4 << 20) / SPAN;
+/// The empty spans' bytes the pool keeps committed between trims (4 MiB): where a span's memory
+/// goes back alone, its oldest spans' beyond go back to the OS at once.
+const POOL_COMMITTED_BYTES: usize = 4 << 20;
 /// The runs of one span's blocks gathered outside the class's lock and spliced under it at a
 /// time, when blocks go back to their spans.
 const RUNS: usize = 32;
+
+/// The span size for the system's page size `page`, and whether a span's memory can go back to
+/// the OS alone: `MIN_SPAN`, or the page where that is larger, up to `MAX_SPAN`. A discard is
+/// whole pages (a 16 KiB span's on a kernel of 64 KiB pages would discard three neighbours'
+/// blocks with it, or be refused), so with larger pages (or a size not a power of two) spans of
+/// `MIN_SPAN` keep their memory.
+const fn span_for_page(page: usize) -> (usize, bool) {
+    if !page.is_power_of_two() || page > MAX_SPAN {
+        (MIN_SPAN, false)
+    } else if page < MIN_SPAN {
+        (MIN_SPAN, true)
+    } else {
+        (page, true)
+    }
+}
+
+/// How spans are laid out and returned, set at the first use from the system's answer (0 until
+/// then): the span size's log2 in the low byte, and `ALONE` where a span's memory goes back to
+/// the OS alone (`span_for_page`).
+static SPAN_BITS: AtomicU32 = AtomicU32::new(0);
+const SHIFT_MASK: u32 = 0xff;
+const ALONE: u32 = 1 << 8;
+
+#[inline]
+fn span_bits() -> u32 {
+    let bits = SPAN_BITS.load(Ordering::Relaxed);
+    if bits != 0 {
+        bits
+    } else {
+        init_span_bits()
+    }
+}
+
+/// The system's answer is the same at every call: threads that race store one value.
+#[cold]
+#[inline(never)]
+fn init_span_bits() -> u32 {
+    let (span, alone) = span_for_page(segments::page_size());
+    let bits = span.trailing_zeros() | if alone { ALONE } else { 0 };
+    SPAN_BITS.store(bits, Ordering::Relaxed);
+    bits
+}
+
+/// The log2 of the size and alignment of a span, the blocks of one class.
+#[inline]
+fn span_shift() -> u32 {
+    span_bits() & SHIFT_MASK
+}
+
+/// The size and alignment of a span.
+#[inline]
+fn span_size() -> usize {
+    1 << span_shift()
+}
+
+/// Whether a span's memory goes back to the OS alone (see `span_for_page`).
+#[inline]
+fn alone() -> bool {
+    span_bits() & ALONE != 0
+}
 
 /// Where a span is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -110,12 +175,12 @@ enum Place {
     Decommitted,
 }
 
-/// A span's header. Each segment's first span holds the headers of its spans: the span at
-/// `k * SPAN` from the segment's start is described by the header at `k * 64` (the first header
-/// is the segment's own, its `next` linking the segments mapped). A header is guarded by its
-/// class's lock while its span holds blocks of the class, by the pool's lock while the span is
-/// in the pool, and by nothing while a thread sets up a span taken from the pool (no other thread
-/// can reach it then).
+/// A span's header. Each segment's first span holds the headers of its spans: the `k`th span from
+/// the segment's start is described by the header at `k * 64` (the first header is the
+/// segment's own, its `next` linking the segments mapped). A header is guarded by its class's
+/// lock while its span holds blocks of the class, by the pool's lock while the span is in the
+/// pool, and by nothing while a thread sets up a span taken from the pool (no other thread can
+/// reach it then).
 #[repr(C, align(64))]
 struct Span {
     /// The links of its class's list of spans with blocks to hand out, or of the pool's lists.
@@ -138,14 +203,17 @@ struct Span {
     tail_zero: bool,
 }
 
-// The headers fit in a segment's first span.
-const _: () = assert!(std::mem::size_of::<Span>() == 64 && SEGMENT / SPAN * 64 <= SPAN);
+// The headers fit in a segment's first span, at any span size; a segment holds spans of the
+// largest.
+const _: () = assert!(
+    size_of::<Span>() == 64 && SEGMENT / MIN_SPAN * 64 <= MIN_SPAN && 4 * MAX_SPAN <= SEGMENT
+);
 
 /// The header of the span holding the address `at`.
 #[inline]
 fn span_of(at: usize) -> *mut Span {
     let segment = at & !(SEGMENT - 1);
-    (segment + (at - segment) / SPAN * std::mem::size_of::<Span>()) as *mut Span
+    (segment + ((at - segment) >> span_shift()) * size_of::<Span>()) as *mut Span
 }
 
 /// The start of the span `span` describes.
@@ -153,7 +221,7 @@ fn span_of(at: usize) -> *mut Span {
 fn base_of(span: *mut Span) -> usize {
     let at = span as usize;
     let segment = at & !(SEGMENT - 1);
-    segment + (at - segment) / std::mem::size_of::<Span>() * SPAN
+    segment + (((at - segment) / size_of::<Span>()) << span_shift())
 }
 
 #[inline]
@@ -164,7 +232,7 @@ fn class_size(class: usize) -> usize {
 /// The end of a span's last block of the class.
 #[inline]
 fn class_end(class: usize) -> u32 {
-    (SPAN / class_size(class) * class_size(class)) as u32
+    (span_size() / class_size(class) * class_size(class)) as u32
 }
 
 /// A lock that never allocates (see the module docs).
@@ -314,7 +382,7 @@ use lock::Lock;
 mod segments {
     use super::SEGMENT;
     use crate::gc_core::os_pages;
-    pub(super) use os_pages::{decommit, recommit, DECOMMIT_ZEROES};
+    pub(super) use os_pages::{decommit, page_size, recommit, DECOMMIT_ZEROES};
 
     /// A new segment: `SEGMENT` zeroed bytes at a `SEGMENT` boundary, on Linux advised for
     /// transparent huge pages (see the module docs); null when the system refuses.
@@ -350,6 +418,10 @@ mod segments {
     use std::alloc::{GlobalAlloc, Layout, System};
 
     pub(super) const DECOMMIT_ZEROES: bool = false;
+
+    pub(super) fn page_size() -> usize {
+        4096
+    }
 
     pub(super) fn map() -> *mut u8 {
         // SAFETY: a nonzero size and a power-of-two alignment.
@@ -919,7 +991,7 @@ fn take_span() -> (*mut Span, bool) {
             pool.decommitted = (*span).next;
             pool.decommitted_len -= 1;
             drop(guard);
-            if segments::recommit(base_of(span) as *mut u8, SPAN) {
+            if segments::recommit(base_of(span) as *mut u8, span_size()) {
                 return (span, (*span).tail_zero);
             }
             // The system's commit limit: the span waits in the pool.
@@ -938,17 +1010,17 @@ fn take_span() -> (*mut Span, bool) {
             let own = segment as *mut Span;
             (*own).next = pool.segments;
             pool.segments = own;
-            pool.carve = segment as usize + SPAN;
+            pool.carve = segment as usize + span_size();
             pool.carve_end = segment as usize + SEGMENT;
         }
         let base = pool.carve;
-        pool.carve += SPAN;
+        pool.carve += span_size();
         (span_of(base), true)
     }
 }
 
-/// Put the spans emptied, linked by `next`, first in the pool's committed list; the oldest beyond
-/// `POOL_COMMITTED` go back to the OS.
+/// Put the spans emptied, linked by `next`, first in the pool's committed list; where a span's
+/// memory goes back alone, the oldest beyond `POOL_COMMITTED_BYTES` go back to the OS.
 ///
 /// # Safety
 /// The spans are empty and off every list, and no thread reaches them.
@@ -973,7 +1045,7 @@ unsafe fn pool_put(mut list: *mut Span) {
                 pool.committed = span;
                 pool.committed_len += 1;
             }
-            while pool.committed_len > POOL_COMMITTED {
+            while alone() && pool.committed_len > POOL_COMMITTED_BYTES >> span_shift() {
                 let span = pool.committed_last;
                 pool.committed_last = (*span).prev;
                 if pool.committed_last.is_null() {
@@ -993,8 +1065,9 @@ unsafe fn pool_put(mut list: *mut Span) {
     }
 }
 
-/// Return the memory of the spans of `list`, linked by `next`, to the OS (a system call each,
-/// outside the pool's lock), and put them first in the pool's decommitted list, in order.
+/// Return the memory of the spans of `list`, linked by `next`, to the OS where a span's memory
+/// goes back alone (a system call each, outside the pool's lock), and put them first in the
+/// pool's decommitted list, in order.
 ///
 /// # Safety
 /// The spans are empty and off every list, and no thread reaches them.
@@ -1003,8 +1076,8 @@ unsafe fn decommit_spans(list: *mut Span) {
     // SAFETY: the caller's contract.
     unsafe {
         while !span.is_null() {
-            let zeroed = segments::decommit(base_of(span) as *mut u8, SPAN);
-            (*span).tail_zero = zeroed && segments::DECOMMIT_ZEROES;
+            let discarded = alone() && segments::decommit(base_of(span) as *mut u8, span_size());
+            (*span).tail_zero = discarded && segments::DECOMMIT_ZEROES;
             (*span).place = Place::Decommitted;
             last = span;
             span = (*span).next;
@@ -1018,9 +1091,10 @@ unsafe fn decommit_spans(list: *mut Span) {
     }
 }
 
-/// Return the thread's lists and regions to their spans and the memory of the pool's empty spans
-/// to the OS. Called only after a major GC: doing this on every collection would throw away the
-/// hot allocation cache and turn steady-state churn into refills and page faults.
+/// Return the thread's lists and regions to their spans and, where a span's memory goes back
+/// alone, the memory of the pool's empty spans to the OS. Called only after a major GC: doing
+/// this on every collection would throw away the hot allocation cache and turn steady-state
+/// churn into refills and page faults.
 pub(crate) fn trim() {
     // The library's test binary does not register the allocator: only its own tests use it, and
     // they trim when they mean to (`trim_now`), so the other tests' collections leave it alone.
@@ -1032,13 +1106,15 @@ pub(crate) fn trim() {
 
 fn trim_now() {
     let _ = CACHE.try_with(drain);
-    let list = {
+    let list = if alone() {
         let _guard = POOL.lock.lock();
         // SAFETY: the pool's state, under the pool's lock.
         let pool = unsafe { &mut *POOL.state.get() };
         pool.committed_last = null_mut();
         pool.committed_len = 0;
         std::mem::replace(&mut pool.committed, null_mut())
+    } else {
+        null_mut()
     };
     if !list.is_null() {
         // SAFETY: taken off the pool's committed list: no thread reaches them.
