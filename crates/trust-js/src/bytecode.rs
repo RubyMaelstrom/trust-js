@@ -3692,7 +3692,11 @@ pub struct Chunk {
     pub(crate) vm_runs: std::cell::Cell<u32>,
     /// Whether an inline recompile has been considered (also enables the direct-call entry).
     pub(crate) inline_attempted: std::cell::Cell<bool>,
-    /// Next adaptive feedback checkpoint, or zero after success/exhaustion/disablement.
+    /// Next adaptive feedback checkpoint, or zero after success/exhaustion/disablement: the
+    /// checkpoint word, which native entries count toward (the direct sequence's retry gate while
+    /// it is nonzero, and the Rust entry paths, [`Chunk::counts_entries`]) and whose due count
+    /// takes the checkpoint. Template code's loop iterations count toward the loop word
+    /// ([`Chunk::loop_word`]), which holds its value but for the optimizing tier's loop limit.
     pub(crate) inline_retry_at: std::cell::Cell<u32>,
     inline_checks: std::cell::Cell<u8>,
     inline_feedback: std::cell::Cell<u64>,
@@ -3739,16 +3743,48 @@ pub struct Chunk {
     /// code that still lives (the template JIT's code an install keeps, a superseded chunk's),
     /// since every change that frees code moves the call caches' epoch as before. Between two
     /// epoch moves it changes at most twice (an install in place and a supersession), so its wrap
-    /// is never seen. A byte, and the last field: it takes the padding byte after the others, so
-    /// that no field the template code addresses moves and the tier off's code stays
-    /// byte-identical ([`CHUNK_ENTRY_OFF`]).
+    /// is never seen. A byte, and the last field but the loop word's bytes: it takes the padding
+    /// byte after the others, so that no field the template code addresses moves and the tier
+    /// off's code stays byte-identical ([`CHUNK_ENTRY_OFF`]).
     entry: std::cell::Cell<u8>,
+    /// The loop word (P3 stage 2, step 13), little-endian in these four bytes: the word template
+    /// code's loop iterations count toward (`jit::emit_loop_count`), read and written whole
+    /// ([`Chunk::loop_word`]; one 32-bit access at [`CHUNK_LOOP_WORD_OFF`] in machine code). It
+    /// holds the checkpoint word's value (`inline_retry_at`; each of its setters sets both) but
+    /// for the optimizing tier's loop limit (`opt::arm_loop_limit`): armed, the loop word holds
+    /// the limit's warm-up while the checkpoint word idles, so that native entries count nothing
+    /// toward it; a loop whose count reaches the loop word copies it into the checkpoint word, the
+    /// next native entry's request, and clears the loop word, so that loops count nothing more
+    /// meanwhile; a superseded chunk's is zero. Four bytes after `entry`, the last fields, as
+    /// `entry` is: they take bytes past the others, so that no field the template code addresses
+    /// moves and the tier off's code stays the same code (its embedded addresses aside: the chunk
+    /// grows by 8 bytes), where a 32-bit field would sit among the others (the offset's checks
+    /// below).
+    loop_word0: std::cell::Cell<u8>,
+    loop_word1: std::cell::Cell<u8>,
+    loop_word2: std::cell::Cell<u8>,
+    loop_word3: std::cell::Cell<u8>,
 }
 
 /// The byte offset of a chunk's entry word (`Chunk::entry`), which the direct sequence loads
 /// from its callee's chunk (`jit::emit_direct_sequence`).
 #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
 pub(crate) const CHUNK_ENTRY_OFF: usize = std::mem::offset_of!(Chunk, entry);
+
+/// The byte offset of a chunk's loop word (`Chunk::loop_word0` to `loop_word3`, little-endian),
+/// which template code's loop counting loads and stores as one 32-bit word
+/// (`jit::emit_loop_count`).
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const CHUNK_LOOP_WORD_OFF: usize = std::mem::offset_of!(Chunk, loop_word0);
+const _: () = {
+    assert!(std::mem::offset_of!(Chunk, loop_word1) == CHUNK_LOOP_WORD_OFF + 1);
+    assert!(std::mem::offset_of!(Chunk, loop_word2) == CHUNK_LOOP_WORD_OFF + 2);
+    assert!(std::mem::offset_of!(Chunk, loop_word3) == CHUNK_LOOP_WORD_OFF + 3);
+    // One LDR (32-bit, scaled immediate) reaches it where template code counts loops: a field
+    // added among the bytes moves it off its alignment (pad the bytes back to it).
+    #[cfg(target_arch = "aarch64")]
+    assert!(CHUNK_LOOP_WORD_OFF & 3 == 0 && CHUNK_LOOP_WORD_OFF / 4 < 4096);
+};
 
 /// The feedback census snapshots a chunk's production feedback when it drops (W4 step 2).
 #[cfg(feature = "architecture-diagnostics")]
@@ -4026,6 +4062,10 @@ impl crate::gc_trace::GcTrace for Chunk {
             osr: _,
             opt: _, // integers and the template JIT's kept code: no cells
             entry: _,
+            loop_word0: _,
+            loop_word1: _,
+            loop_word2: _,
+            loop_word3: _,
         } = self;
         consts.trace_gc(sink);
         private_sites.as_ref().trace_gc(sink);
@@ -10218,6 +10258,9 @@ fn finish_chunk(
     // Built only while the perf map is on; the default path pays the one check.
     let perf_map_label = crate::jit::profiler::perf_map_enabled()
         .then(|| crate::jit::profiler::chunk_label(source, &c.slot_names));
+    // The checkpoint word and the loop word start alike (`Chunk::loop_word`).
+    let first_checkpoint = first_inline_checkpoint();
+    let loop_word = first_checkpoint.to_le_bytes();
     let chunk = Chunk {
         debug_origin: source.map_or((0, 0), |func| {
             (
@@ -10345,7 +10388,7 @@ fn finish_chunk(
         test_direct_throws: std::cell::Cell::new(0),
         vm_runs: std::cell::Cell::new(0),
         inline_attempted: std::cell::Cell::new(inline_recompile_at() == 0),
-        inline_retry_at: std::cell::Cell::new(first_inline_checkpoint()),
+        inline_retry_at: std::cell::Cell::new(first_checkpoint),
         inline_checks: std::cell::Cell::new(0),
         inline_feedback: std::cell::Cell::new(0),
         superseded: std::cell::Cell::new(None),
@@ -10358,6 +10401,10 @@ fn finish_chunk(
         osr: std::cell::OnceCell::new(),
         opt: std::cell::OnceCell::new(),
         entry: std::cell::Cell::new(0),
+        loop_word0: std::cell::Cell::new(loop_word[0]),
+        loop_word1: std::cell::Cell::new(loop_word[1]),
+        loop_word2: std::cell::Cell::new(loop_word[2]),
+        loop_word3: std::cell::Cell::new(loop_word[3]),
     };
     let chunk = Rc::new(chunk);
     crate::value::register_code_roots(&chunk);
@@ -24815,6 +24862,42 @@ impl Chunk {
     pub(crate) fn jit_inline_retry_at_off(&self) -> usize {
         &self.inline_retry_at as *const _ as usize - self as *const Chunk as usize
     }
+    /// Byte offset of the loop word, which template code's loops count toward
+    /// ([`CHUNK_LOOP_WORD_OFF`]).
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn jit_loop_word_off(&self) -> usize {
+        CHUNK_LOOP_WORD_OFF
+    }
+    /// The loop word (P3 stage 2, step 13; see the field `loop_word0`): its four bytes, which the
+    /// compiler reads with one load, as machine code does.
+    #[inline(always)]
+    pub(crate) fn loop_word(&self) -> u32 {
+        u32::from_le_bytes([
+            self.loop_word0.get(),
+            self.loop_word1.get(),
+            self.loop_word2.get(),
+            self.loop_word3.get(),
+        ])
+    }
+    /// Set the loop word alone: the optimizing tier's loop limit (`opt::arm_loop_limit`); every
+    /// setter of the checkpoint word sets both.
+    #[inline(always)]
+    pub(crate) fn set_loop_word(&self, word: u32) {
+        let [b0, b1, b2, b3] = word.to_le_bytes();
+        self.loop_word0.set(b0);
+        self.loop_word1.set(b1);
+        self.loop_word2.set(b2);
+        self.loop_word3.set(b3);
+    }
+    /// Whether a native entry counts toward the checkpoint word (`jit_runs`): every one does but
+    /// while the optimizing tier's loop limit waits on its warm-up (P3 stage 2, step 13: the loop
+    /// word armed, the checkpoint word idle), which loop iterations alone count toward, as JSC's
+    /// calls go to the replacement and only the baseline's loops count. The direct sequence's
+    /// retry gate counts only while the checkpoint word is nonzero; the Rust entry paths ask this.
+    #[inline(always)]
+    pub(crate) fn counts_entries(&self) -> bool {
+        self.inline_retry_at.get() != 0 || self.loop_word() == 0
+    }
     /// The inline checkpoints the chunk has reached (1 to 4 at the adaptive schedule's
     /// checkpoints, and with the optimizing tier on one more at each 500-invocation window
     /// after them, saturating at 255; see [`Chunk::advance_inline_feedback`]).
@@ -24828,13 +24911,24 @@ impl Chunk {
         at != 0 && runs >= at && self.superseded.get().is_none()
     }
     /// Set the chunk's next inline checkpoint (0: none). A superseded chunk keeps it for the
-    /// time it is current again (see [`Chunk::unsupersede`]).
+    /// time it is current again (see [`Chunk::unsupersede`]). The loop word takes it too, and an
+    /// armed loop limit ends (the words' other uses come first: P3 stage 2, step 13).
     pub(crate) fn set_inline_retry_at(&self, at: u32) {
+        crate::opt::profile::disarm_loop_limit(self);
         if self.superseded.get().is_some() {
             self.superseded.set(Some(at));
         } else {
             self.inline_retry_at.set(at);
+            self.set_loop_word(at);
         }
+    }
+    /// Set the checkpoint and loop words alike, past the superseded check (tests that pin a
+    /// chunk's checkpoints).
+    #[cfg(test)]
+    pub(crate) fn set_retry_words_for_test(&self, at: u32) {
+        crate::opt::profile::disarm_loop_limit(self);
+        self.inline_retry_at.set(at);
+        self.set_loop_word(at);
     }
     /// A recompile (a second stage, the optimizing tier's chunk of a function with nothing to
     /// splice, a recompile without property chains) has no inline checkpoint of its own: its
@@ -24845,7 +24939,9 @@ impl Chunk {
     /// for the recompile without chains (`Chunk::note_chain_replay` re-arms the checkpoint).
     pub(crate) fn settle_inline_checkpoints(&self) {
         self.inline_attempted.set(true);
+        crate::opt::profile::disarm_loop_limit(self);
         self.inline_retry_at.set(0);
+        self.set_loop_word(0);
     }
     /// Whether a newer chunk of the function replaced this one (see [`Chunk::supersede`]).
     #[inline(always)]
@@ -24875,7 +24971,17 @@ impl Chunk {
     /// set-once slot as long as its function's runtime.
     pub(crate) fn supersede(&self) {
         if self.superseded.get().is_none() {
-            self.superseded.set(Some(self.inline_retry_at.replace(1)));
+            // An armed loop limit ends, with the request a loop's crossing made (P3 stage 2, step
+            // 13): the chunk's code is no longer its function's.
+            let at = if crate::opt::profile::disarm_loop_limit(self) {
+                0
+            } else {
+                self.inline_retry_at.get()
+            };
+            self.inline_retry_at.set(1);
+            // Its loops count nothing, as they counted nothing toward the 1.
+            self.set_loop_word(0);
+            self.superseded.set(Some(at));
             // Rust's probes and, with the optimizing tier on, the direct sequence find its ways
             // stale by the entry word alone (`entry_stale`).
             self.note_entry_change();
@@ -24888,6 +24994,7 @@ impl Chunk {
     pub(crate) fn unsupersede(&self) {
         if let Some(at) = self.superseded.take() {
             self.inline_retry_at.set(at);
+            self.set_loop_word(at);
         }
     }
     /// A property operation that a chain's bail replays through the generic helper
@@ -27070,10 +27177,13 @@ unsafe fn jit_call_hit_inner(
     note_call_path(CallPath::HitHelper);
     jit_callstat(i, ctx, &ic, argc, with_this, sp);
     let chunk_ref = &*ic.chunk;
-    let runs = chunk_ref.jit_runs.get().saturating_add(i.opt_entry_weight);
-    chunk_ref.jit_runs.set(runs);
-    if chunk_ref.inline_retry_due(runs) {
-        i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
+    // Nothing while the optimizing tier's loop limit waits on its warm-up (P3 stage 2, step 13).
+    if chunk_ref.counts_entries() {
+        let runs = chunk_ref.jit_runs.get().saturating_add(i.opt_entry_weight);
+        chunk_ref.jit_runs.set(runs);
+        if chunk_ref.inline_retry_due(runs) {
+            i.try_inline_recompile(ic.func, chunk_ref, ic.realm, ic.global_env);
+        }
     }
     let args_ptr = sp.sub(argc);
     let mut undef = std::mem::ManuallyDrop::new(Value::Undefined);

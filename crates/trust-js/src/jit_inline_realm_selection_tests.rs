@@ -51,7 +51,7 @@ fn prepared_shared_body_uses_primary_in_other_realms_and_inline_in_its_own() {
         let primary = bytecode::compile(function).expect("prepared primary");
         assert!(primary.prepared_entry);
         primary.inline_attempted.set(true);
-        primary.inline_retry_at.set(0);
+        primary.set_retry_words_for_test(0);
         assert!(function.runtime().code.set(Some(primary.clone())).is_ok());
         for _ in 0..8 {
             assert_eq!(eval_string(i, "subject(5)"), "9:8:8");
@@ -221,7 +221,7 @@ fn realm_inline_metadata_pins_the_planning_environment_allocation_without_roots(
     let user = subject(i);
     let primary = bytecode::compile(&user.func).unwrap();
     primary.inline_attempted.set(true);
-    primary.inline_retry_at.set(0);
+    primary.set_retry_words_for_test(0);
     assert!(user.func.runtime().code.set(Some(primary.clone())).is_ok());
     for _ in 0..8 {
         assert_eq!(eval_string(i, "subject(5)"), "16");

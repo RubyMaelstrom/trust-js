@@ -116,6 +116,11 @@ pub(crate) struct Switches {
     pub(crate) jscvt: bool,
     /// The code's exit limit (`opt::exit_limit`: 100 << R at the snapshot).
     pub(crate) exit_limit: u32,
+    /// The code's loop limit (`opt::loop_exit_limit`: 5 << R at the snapshot, never above the
+    /// exit limit) and its warm-up (`opt::loop_warm_up`: a discard's warm-up's first distance at
+    /// the snapshot's R; stage 2, step 13).
+    pub(crate) loop_exit_limit: u32,
+    pub(crate) loop_warm_up: u32,
     /// The native runs an entry counts (`opt::entry_weight`), which the direct sequence's shared
     /// stubs hold as a process constant.
     pub(crate) entry_weight: u32,
@@ -136,6 +141,8 @@ impl Switches {
             direct_shared_context: crate::bytecode::direct_shared_context_enabled(),
             jscvt: jscvt_available(),
             exit_limit: crate::opt::exit_limit(chunk),
+            loop_exit_limit: crate::opt::loop_exit_limit(chunk),
+            loop_warm_up: crate::opt::loop_warm_up(chunk),
             entry_weight: crate::opt::entry_weight(),
             inline_construct: crate::value::object_inline_alloc_site(0).is_some(),
         }
@@ -726,6 +733,8 @@ impl<'a> Gen<'a> {
             table: Box::new(ExitTable {
                 name: chunk.label().into(),
                 limit: switches.exit_limit,
+                loop_limit: switches.loop_exit_limit,
+                loop_warm_up: switches.loop_warm_up,
                 ..ExitTable::default()
             }),
         }

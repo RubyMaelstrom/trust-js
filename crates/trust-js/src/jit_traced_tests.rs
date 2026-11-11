@@ -69,7 +69,7 @@ pub(super) fn assert_native(engine: &mut Engine, names: &[&str]) {
 pub(super) fn settle(engine: &mut Engine, name: &str) {
     with_chunk(engine, name, |chunk| {
         chunk.inline_attempted.set(true);
-        chunk.inline_retry_at.set(0);
+        chunk.set_retry_words_for_test(0);
     });
 }
 

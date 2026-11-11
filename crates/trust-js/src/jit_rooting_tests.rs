@@ -533,7 +533,7 @@ fn a_fresh_callee_closure_survives_its_direct_call() {
     settle(&mut engine, "make");
     with_chunk(&mut engine, "proto", |chunk| {
         chunk.inline_attempted.set(true);
-        chunk.inline_retry_at.set(0);
+        chunk.set_retry_words_for_test(0);
     });
     assert_eq!(direct_round(&mut engine, "fresh(1);", 1), "R:K1");
     assert!(last_census().records >= 2);

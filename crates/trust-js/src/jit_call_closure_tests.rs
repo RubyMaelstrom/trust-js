@@ -514,7 +514,7 @@ fn settle(engine: &mut Engine, name: &str) {
     let chunk = runtime.code.get().and_then(Option::as_ref).expect("chunk");
     assert!(chunk.jit.get().flatten().is_some(), "{name} runs natively");
     chunk.inline_attempted.set(true);
-    chunk.inline_retry_at.set(0);
+    chunk.set_retry_words_for_test(0);
 }
 
 /// Callees with every slot count from 1 to 13 holding the owner `a` at the first, middle and

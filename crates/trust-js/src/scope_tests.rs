@@ -782,7 +782,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
         let recursive = chunk(cx, "loanRecurse");
         recursive.jit_runs.set(0);
         // Keep inline-retry accounting active without replacing this exact native image.
-        recursive.inline_retry_at.set(u32::MAX);
+        recursive.set_retry_words_for_test(u32::MAX);
         assert_eq!(value_in(cx, "loanRecurse(280)").as_num_opt(), Some(280.0));
         // An entry counts one, or K with the optimizing tier on.
         let entry = crate::opt::entry_weight();
@@ -807,7 +807,7 @@ fn committed_scoped_calls_loan_the_original_window_through_gc_and_pool_churn() {
         let oversized = chunk(cx, "loanOversized");
         assert!(oversized.jit_frame().1 > crate::jit::FRAME_BUF);
         oversized.jit_runs.set(0);
-        oversized.inline_retry_at.set(u32::MAX);
+        oversized.set_retry_words_for_test(u32::MAX);
         assert_eq!(value_in(cx, "loanOversized()").as_num_opt(), Some(619.0));
         assert_eq!(
             oversized.jit_runs.get(),

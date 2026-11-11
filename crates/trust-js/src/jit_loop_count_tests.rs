@@ -423,12 +423,12 @@ fn a_rotated_loop_counts_the_iterations_before_its_bails() {
     );
 }
 
-/// The counting sites in `code`: its `ldr w17, [x16, #retry]`, the second instruction of each
-/// count (`emit_loop_count`, `emit_loop_count_countdown`), which no other template emits.
+/// The counting sites in `code`: its `ldr w17, [x16, #loop word]`, the second instruction of
+/// each count (`emit_loop_count`, `emit_loop_count_countdown`), which no other template emits.
 fn counting_sites(code: &super::JitCode) -> usize {
     let retry = {
         let mut a = super::asm::Asm::new();
-        let offset = std::mem::offset_of!(crate::bytecode::Chunk, inline_retry_at);
+        let offset = crate::bytecode::CHUNK_LOOP_WORD_OFF;
         a.ldr_w_imm(17, 16, offset as u32);
         a.buf[0]
     };

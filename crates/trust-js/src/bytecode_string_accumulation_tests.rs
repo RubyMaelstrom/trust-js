@@ -281,7 +281,7 @@ fn prepare_callback(engine: &mut Engine) -> Rc<Chunk> {
     // `return !0` returns a Boolean constant (`bytecode::literal_truthiness`).
     assert_eq!(chunk.ops.len(), 14);
     chunk.inline_attempted.set(true);
-    chunk.inline_retry_at.set(0);
+    chunk.set_retry_words_for_test(0);
     assert!(function.runtime().code.set(Some(chunk.clone())).is_ok());
     chunk
 }

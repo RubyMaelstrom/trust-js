@@ -835,7 +835,7 @@ mod entry_root_tests {
             )
         });
         chunk.jit_runs.set(0);
-        chunk.inline_retry_at.set(u32::MAX);
+        chunk.set_retry_words_for_test(u32::MAX);
         let before = engine.interp.gc_heap.core.borrow().collections();
         // The first compiled-entry poll must collect before argument slots are seeded. The
         // scalar-returning body neither reads this argument nor executes any later safepoint.

@@ -10,14 +10,29 @@
 //! every 500 << R. At a checkpoint whose feedback has settled the tier compiles the chunk again
 //! (`reoptimize`), declining what the profile flagged, and its code replaces the template JIT's.
 //! Departures from point 12, each for a precondition TRust lacks yet: the recompile takes the
-//! same chunk again (a second stage is set once; another splicing is stage 3's); the limit for an
-//! exited frame that then loops hot (5 x 2^R) stays with stage 5, since the exited frame finishes
-//! in the VM, whose loops count nothing; and a discard whose exits were all unfixable (throws,
-//! unsupported operations) arms no recompile, which would build the same code, as SpiderMonkey
-//! disables Ion for frequent unfixable bailouts (jit/IonScript.h:336-341), until the in-place
-//! resume takes exceptions out of the count. Each discard and each recompile moves the call
-//! caches' global epoch, where the exemplars reach only the replaced code's callers; the log
-//! counts the moves.
+//! same chunk again (a second stage is set once; another splicing is stage 3's); and a discard
+//! whose exits were all unfixable (throws, unsupported operations) arms no recompile, which would
+//! build the same code, as SpiderMonkey disables Ion for frequent unfixable bailouts
+//! (jit/IonScript.h:336-341), until the in-place resume takes exceptions out of the count. Each
+//! discard and each recompile moves the call caches' global epoch, where the exemplars reach only
+//! the replaced code's callers; the log counts the moves.
+//!
+//! An exited frame that loops (step 13): JSC discards sooner, at 5 << R exits
+//! (osrExitCountForReoptimizationFromLoop, runtime/OptionsList.h:398), when the baseline loop's
+//! tier-up check runs in a frame whose code block has an optimized replacement (operationOptimize,
+//! jit/JITOperations.cpp:2944-2966), and the loop must be hot first: every exit that does not
+//! jettison resets the baseline's counter to a long warm-up (dfg/DFGOSRExitCompilerCommon.cpp:
+//! 105-141), which only the loops then count, since calls go to the replacement
+//! (jit/JITOperations.cpp:2947-2950). The template JIT's code is the baseline here: each exit at
+//! or past the loop limit (`loop_exit_limit`) that does not discard arms the warm-up again on the
+//! chunk's loop word (`arm_loop_limit`), which only template code's loop iterations count toward
+//! (step 8's counting with step 11's weights: exited frames' borrowed-frame code, frames that
+//! started before the code's install), entries counting nothing while the checkpoint word idles;
+//! a loop whose count reaches the word copies it into the checkpoint word and clears it, and the
+//! next native entry takes the check (`loop_limit_due`), which discards the code as at its exit
+//! limit. Exited frames leave the VM at their first back edge, as every exited frame does. The
+//! chunk is the one the code is installed in: a second stage, or a first stage that carries the
+//! tier's code (step 14), whose discard returns to its kept template code.
 //!
 //! The tier's code on the first stage (step 14): a first stage whose inline plan splices nothing
 //! is compiled itself, as V8 and SpiderMonkey compile a function's one bytecode
@@ -106,6 +121,8 @@ pub(crate) struct TestSwitches {
     pub(crate) no_exit_profile: bool,
     /// The base exit limit; 0: the default ([`EXIT_LIMIT`]).
     pub(crate) exit_limit: u32,
+    /// The base loop limit; 0: the default ([`LOOP_EXIT_LIMIT`]).
+    pub(crate) loop_exit_limit: u32,
     /// TRUST_JS_OPT_NO_LOOP_COUNT: template code's loop iterations count toward no checkpoint.
     pub(crate) no_loop_count: bool,
     /// The tier compiles off the main thread (`asynchronous`, where the process can): false for
@@ -123,6 +140,10 @@ thread_local! {
     pub(crate) static TEST_COMPILED: std::cell::RefCell<Vec<usize>> =
         const { std::cell::RefCell::new(Vec::new()) };
     pub(crate) static TEST_DISCARDED: std::cell::RefCell<Vec<usize>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// The limit each discard on this thread reached, in order, with the exits it came after
+    /// (stage 2, step 13).
+    pub(crate) static TEST_LIMITS: std::cell::RefCell<Vec<(Limit, u32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// The checkpoints (chunk, number) at which the tier waited for settled feedback, a warm-up's
     /// among them.
@@ -262,6 +283,29 @@ pub(crate) fn exit_limit_base() -> u32 {
 /// exitCountThresholdForReoptimization, bytecode/CodeBlock.cpp:2738-2771).
 pub(crate) const EXIT_LIMIT: u32 = 100;
 
+/// The base loop limit: TRUST_JS_OPT_LOOP_EXIT_LIMIT=N, a positive N, else [`LOOP_EXIT_LIMIT`]
+/// (a diagnostic, as TRUST_JS_OPT_EXIT_LIMIT is).
+pub(crate) fn loop_exit_limit_base() -> u32 {
+    #[cfg(test)]
+    if let Some(switches) = test_switches() {
+        return if switches.loop_exit_limit == 0 {
+            LOOP_EXIT_LIMIT
+        } else {
+            switches.loop_exit_limit
+        };
+    }
+    env_value!("TRUST_JS_OPT_LOOP_EXIT_LIMIT")
+        .and_then(|v| v.parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(LOOP_EXIT_LIMIT)
+}
+
+/// The base loop limit by default: JSC's 5 x 2^R exits at R = 0 for a code whose exited frame
+/// loops (osrExitCountForReoptimizationFromLoop, runtime/OptionsList.h:398;
+/// exitCountThresholdForReoptimizationFromLoop, bytecode/CodeBlock.cpp:2758-2771; stage 2, step
+/// 13).
+pub(crate) const LOOP_EXIT_LIMIT: u32 = 5;
+
 /// TRUST_JS_OPT_NO_LOOP_COUNT: template code's loop iterations count toward no checkpoint, which
 /// then count native entries alone, as before stage 2's step 8 (for comparisons).
 pub(crate) fn no_loop_count() -> bool {
@@ -303,8 +347,34 @@ pub(crate) const MAX_OPTIMIZED_OPS: usize = 15_000;
 /// << R, R the function's discards so far (on its first stage), so that each discard doubles
 /// the next code's limit.
 pub(crate) fn exit_limit(chunk: &Chunk) -> u32 {
+    shifted_by_r(chunk, exit_limit_base())
+}
+
+/// The exits from which each exit of the tier's code for `chunk`, compiled now, that does not
+/// discard it arms the loop limit's warm-up (stage 2, step 13; see the module's doc): the base
+/// loop limit << R, as JSC shifts both of its thresholds by the retry counter
+/// (CodeBlock::adjustedExitCountThreshold, bytecode/CodeBlock.cpp:2738-2751), and never above the
+/// exit limit, so that a limit of 1 still discards at the first exit.
+pub(crate) fn loop_exit_limit(chunk: &Chunk) -> u32 {
+    shifted_by_r(chunk, loop_exit_limit_base()).min(exit_limit(chunk))
+}
+
+/// The loop limit's warm-up for the tier's code for `chunk`, compiled now (stage 2, step 13): a
+/// discard's warm-up's first distance at R (`warm_up_gap(R, 0)`, (100 invocations x K) << R
+/// native runs), as JSC's exit resets the baseline's counter to
+/// thresholdForOptimizeAfterLongWarmUp, the 1,000 that a jettison's alternative waits too
+/// (thresholdForOptimizeAfterWarmUp; runtime/OptionsList.h:373-374, bytecode/CodeBlock.cpp:
+/// 2412-2414 and 2641-2669).
+pub(crate) fn loop_warm_up(chunk: &Chunk) -> u32 {
     let r = ChunkProfile::get(profile::first_stage(chunk)).map_or(0, ChunkProfile::discards);
-    (u64::from(exit_limit_base()) << r).min(u64::from(u32::MAX)) as u32
+    warm_up_gap(r, 0).unwrap_or(u32::MAX)
+}
+
+/// `base` << R, R the discards of `chunk`'s function so far (on its first stage), saturating at
+/// the u32 word.
+fn shifted_by_r(chunk: &Chunk, base: u32) -> u32 {
+    let r = ChunkProfile::get(profile::first_stage(chunk)).map_or(0, ChunkProfile::discards);
+    (u64::from(base) << r).min(u64::from(u32::MAX)) as u32
 }
 
 /// The warm-up's first distance in invocations at R = 0; each of the next three is four times
@@ -1424,6 +1494,72 @@ fn move_epoch(why: &str) {
     }
 }
 
+/// Which limit a discard reached (the log's cause at the end of its line).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Limit {
+    /// The exit limit (`ExitTable::limit`), at an exit.
+    Exits,
+    /// The loop limit (`ExitTable::loop_limit`), at the entry after a loop crossed its warm-up
+    /// (`loop_limit_due`).
+    Loop,
+}
+
+/// An exit of the tier's code for `chunk` at or past its loop limit, the code not discarded
+/// (stage 2, step 13): the loop limit's warm-up starts again, `warm_up` native runs of the
+/// chunk's template loop iterations from now on its loop word, as JSC's exit resets the
+/// baseline's counter (dfg/DFGOSRExitCompilerCommon.cpp:105-141). The checkpoint word stays idle,
+/// so that entries count nothing toward it: the direct sequence's retry gate counts only while
+/// the checkpoint word is armed, and the Rust entry paths ask `Chunk::counts_entries`. Nothing
+/// where the checkpoint word is in another use: a checkpoint, a discard's warm-up, a chain's
+/// request, a superseded chunk's refills, or the loop limit's own crossing, whose check the next
+/// entry takes.
+pub(crate) fn arm_loop_limit(chunk: &Chunk, warm_up: u32) {
+    if chunk.inline_retry_at.get() != 0 {
+        return;
+    }
+    let Some(at) = chunk.jit_runs.get().checked_add(warm_up) else {
+        return;
+    };
+    chunk.set_loop_word(at);
+    ChunkProfile::of(chunk).set_loop_armed(true);
+}
+
+/// A native entry of `chunk` found its checkpoint word due (`Interp::try_inline_recompile`):
+/// where the tier's loop limit is armed on the chunk, a template loop's count reached its warm-up
+/// and copied it into the checkpoint word (`jit::emit_loop_count`), and this is the loop limit's
+/// check (stage 2, step 13): the chunk's tier code, still its code at its loop limit and not
+/// discarded, is discarded (`discard`), as JSC's baseline loop's tier-up check jettisons the
+/// replacement (jit/JITOperations.cpp:2960-2966), here at the next entry after the crossing
+/// rather than at it; the words idle otherwise. Whether the due word was the loop limit's.
+pub(crate) fn loop_limit_due(i: &mut Interp, chunk: &Chunk) -> bool {
+    if !ChunkProfile::get(chunk).is_some_and(ChunkProfile::loop_armed) {
+        return false;
+    }
+    debug_assert_ne!(chunk.inline_retry_at.get(), 0, "a crossing's request");
+    // The tier compiles no resumable chunk, whose slot holds a continuation's code.
+    if !chunk.jit_is_resumable() {
+        if let Some(Some(code)) = chunk.jit.get() {
+            if let Some(table) = super::exit::table_of(&code) {
+                if table.taken.get() >= table.loop_limit && !table.discarded.get() {
+                    // The discard ends the loop limit.
+                    discard(i, chunk, table, Limit::Loop);
+                    return true;
+                }
+            }
+        }
+    }
+    end_loop_limit(chunk);
+    true
+}
+
+/// The loop limit ends on `chunk` where it is armed (its code discarded, or its check taken): its
+/// words idle, the request of a loop's crossing dropped with it.
+fn end_loop_limit(chunk: &Chunk) {
+    if ChunkProfile::get(chunk).is_some_and(ChunkProfile::loop_armed) {
+        chunk.set_inline_retry_at(0);
+    }
+}
+
 /// Past its exit limit (`exit_limit`), the tier's code for `chunk`, whose exit table `table` is,
 /// is discarded (see the module's doc), before the exiting activation's VM run; activations
 /// still running it finish in it, kept among the interpreter's retired codes. Each record that
@@ -1434,8 +1570,14 @@ fn move_epoch(why: &str) {
 /// and the warm-up toward the recompile is armed, unless every exit was unfixable. Under
 /// TRUST_JS_OPT_NO_REOPT, or where the tier is off (tests that install its code by hand), the
 /// discard is stage 1's fallback for good.
-pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
+///
+/// Past its loop limit instead, at the entry after a loop crossed its warm-up (`loop_limit_due`),
+/// `limit` `Loop`: the same, and the log's line names the cause. Either ends an armed loop limit.
+pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: Limit) {
     table.discarded.set(true);
+    end_loop_limit(chunk);
+    #[cfg(test)]
+    TEST_LIMITS.with(|limits| limits.borrow_mut().push((limit, table.taken.get())));
     let first = profile::first_stage(chunk);
     let reoptimizing = enabled() && !no_reopt();
     let before = ChunkProfile::get(first).map_or(0, ChunkProfile::discards);
@@ -1470,8 +1612,16 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable) {
             .iter()
             .map(|(pc, reason, count)| format!("pc {pc} {reason:?} x{count}"))
             .collect();
+        let cause = match limit {
+            Limit::Exits => String::new(),
+            Limit::Loop => format!(
+                "; at its loop limit: {} exits >= {}",
+                table.taken.get(),
+                table.loop_limit
+            ),
+        };
         log_line!(
-            "[opt] discarded {} after {} exits (limit {}, R {before} -> {r}) for {}: {}",
+            "[opt] discarded {} after {} exits (limit {}, R {before} -> {r}) for {}: {}{cause}",
             name(chunk),
             table.taken.get(),
             table.limit,

@@ -299,7 +299,7 @@ fn packed_native_return_direct_call_moves_and_clears_the_entire_word() {
         let chunk = runtime.code.get().and_then(Option::as_ref).unwrap();
         assert!(chunk.jit.get().flatten().is_some());
         chunk.inline_attempted.set(true);
-        chunk.inline_retry_at.set(0);
+        chunk.set_retry_words_for_test(0);
     }
     super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
     let result = engine
@@ -428,7 +428,7 @@ fn direct_calls_enter_callees_that_materialize_native_activations() {
         assert!(chunk.jit.get().flatten().is_some());
         assert_eq!(chunk.jit_needs_activation_state(), name == "shaped");
         chunk.inline_attempted.set(true);
-        chunk.inline_retry_at.set(0);
+        chunk.set_retry_words_for_test(0);
     }
     super::TEST_DIRECT_PACKED_RETURNS.with(|count| count.set(0));
     let result = engine

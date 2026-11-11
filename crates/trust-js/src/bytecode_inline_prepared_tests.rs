@@ -75,7 +75,7 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
         let primary = bytecode::compile(&user.func).expect("prepared primary");
         assert!(primary.prepared_entry);
         primary.inline_attempted.set(true);
-        primary.inline_retry_at.set(0);
+        primary.set_retry_words_for_test(0);
         assert!(user.func.runtime().code.set(Some(primary.clone())).is_ok());
         // Inline planning consumes native call-cache feedback; the transformed continuation
         // is then exercised separately on both the bytecode and template native tiers.

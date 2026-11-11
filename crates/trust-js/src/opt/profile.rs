@@ -23,6 +23,8 @@
 //! - The tier's code in place (P3 stage 2, step 14): whether an install put the tier's code in
 //!   the chunk's own slot, over its template JIT's code (a first stage whose plan splices
 //!   nothing), and that template code, kept as the fallback a discard returns to.
+//! - The tier's loop limit (P3 stage 2, step 13): whether its warm-up is armed on the chunk's
+//!   loop word.
 //!
 //! Only the tier's back end reads and writes the record (`snapshot`, `driver`): where it has none
 //! (x86-64 until the plan's stage 6) a chunk carries an empty cell.
@@ -82,6 +84,11 @@ pub(crate) struct ChunkProfile {
     /// cache's own, whose CLOCK may evict it as any code (a discard whose kept code is gone
     /// compiles one, as before step 14).
     kept: crate::jit::cache::NativeCodeSlot,
+    /// The tier's loop limit is armed on the chunk (P3 stage 2, step 13; `opt::arm_loop_limit`):
+    /// its loop word holds the warm-up and its checkpoint word idles, or holds the request of a
+    /// loop's crossing, until the words' other uses set them (`Chunk::set_inline_retry_at`) or an
+    /// entry takes the check (`opt::loop_limit_due`).
+    loop_armed: Cell<bool>,
 }
 
 /// The key of an exit site.
@@ -234,6 +241,16 @@ impl ChunkProfile {
         &self.kept
     }
 
+    /// Whether the tier's loop limit is armed on the chunk (see the field).
+    pub(crate) fn loop_armed(&self) -> bool {
+        self.loop_armed.get()
+    }
+
+    /// Arm the loop limit (`opt::arm_loop_limit`).
+    pub(crate) fn set_loop_armed(&self, armed: bool) {
+        self.loop_armed.set(armed);
+    }
+
     /// Heap bytes the record holds (the memory census), the kept code's own bytes left to
     /// `scan_kept`.
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -246,6 +263,13 @@ impl ChunkProfile {
     pub(crate) fn kept_code(&self) -> Option<std::rc::Rc<crate::jit::JitCode>> {
         self.kept.get().flatten()
     }
+}
+
+/// End the tier's loop limit on `chunk` where it is armed (the words' other uses come first; P3
+/// stage 2, step 13): whether it was. One load where the chunk has no record.
+#[inline]
+pub(crate) fn disarm_loop_limit(chunk: &Chunk) -> bool {
+    ChunkProfile::get(chunk).is_some_and(|profile| profile.loop_armed.replace(false))
 }
 
 /// The function's first stage, which holds R and the keys of its own sites: the baseline chunk

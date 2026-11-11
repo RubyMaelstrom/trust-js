@@ -317,7 +317,7 @@ fn prepared_caller_and_actual_inline_splice_skip_both_directive_prefixes() {
         let primary = compile(&function).unwrap();
         assert!(primary.prepared_entry);
         primary.inline_attempted.set(true);
-        primary.inline_retry_at.set(0);
+        primary.set_retry_words_for_test(0);
         assert!(function.runtime().code.set(Some(primary.clone())).is_ok());
         for _ in 0..8 {
             eval(&mut engine, "subject(5)");

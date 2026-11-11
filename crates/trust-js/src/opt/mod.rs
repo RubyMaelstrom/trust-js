@@ -128,6 +128,12 @@ mod inplace_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+mod loop_limit_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod offthread_tests;
 #[cfg(all(
     test,
@@ -239,6 +245,12 @@ mod off {
 
     pub(crate) fn install_finished(_: &mut Interp) {}
 
+    /// No code is the tier's: no loop limit is ever armed.
+    #[inline(always)]
+    pub(crate) fn loop_limit_due(_: &mut Interp, _: &Chunk) -> bool {
+        false
+    }
+
     #[cfg(test)]
     pub(crate) fn finish_compiles_for_test(_: &mut Interp) {}
 
@@ -338,6 +350,7 @@ pub(crate) fn pin_forced_exits_off_for_test() {
         no_reopt: no_reopt(),
         no_exit_profile: no_exit_profile(),
         exit_limit: exit_limit_base(),
+        loop_exit_limit: loop_exit_limit_base(),
         no_loop_count: no_loop_count(),
         asynchronous: asynchronous_by_environment(),
     }
@@ -362,6 +375,7 @@ pub(crate) fn pin_synchronous_for_test() {
         no_reopt: no_reopt(),
         no_exit_profile: no_exit_profile(),
         exit_limit: exit_limit_base(),
+        loop_exit_limit: loop_exit_limit_base(),
         no_loop_count: no_loop_count(),
         asynchronous: false,
     }
@@ -386,6 +400,7 @@ pub(crate) fn pin_loop_count_off_for_test() {
         no_reopt: no_reopt(),
         no_exit_profile: no_exit_profile(),
         exit_limit: exit_limit_base(),
+        loop_exit_limit: loop_exit_limit_base(),
         no_loop_count: true,
         asynchronous: asynchronous_by_environment(),
     }

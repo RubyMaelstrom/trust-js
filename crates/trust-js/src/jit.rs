@@ -3327,12 +3327,13 @@ mod asm {
         /// The local reads whose slot surely holds a value (`Cfg::initialized_reads`): their
         /// TDZ test is dead. Empty in loose test assemblies, which keep every test.
         initialized_reads: crate::jit_ir::InitializedReads,
-        /// The byte offsets of `Chunk::jit_runs` and `Chunk::inline_retry_at` where the code
-        /// counts its loop iterations toward its chunk's checkpoints (P3 stage 2, step 8; see
+        /// The byte offsets of `Chunk::jit_runs`, the loop word (`Chunk::loop_word`) and the
+        /// checkpoint word (`Chunk::inline_retry_at`) where the code counts its loop iterations
+        /// toward its chunk's checkpoints (P3 stage 2, steps 8 and 13; see
         /// `super::emit_loop_count`): a chunk's template code with the optimizing tier on. None
         /// in code that counts nothing: the tier off, `TRUST_JS_OPT_NO_LOOP_COUNT`, the tier's
         /// own code and loose test assemblies.
-        loop_counts: Option<(u32, u32)>,
+        loop_counts: Option<(u32, u32, u32)>,
         /// The native runs an iteration of each loop counts, by its header's pc (P3 stage 2,
         /// step 11; `opt::loop_weight`): set with `loop_counts`, empty where no loop counts.
         loop_weights: Vec<u8>,
@@ -3494,12 +3495,12 @@ mod asm {
             self.inline_construct
                 .unwrap_or_else(|| crate::value::object_inline_alloc_site(0).is_some())
         }
-        /// Declare that the code emitted from here on counts its loop iterations, `runs` and
-        /// `retry` being the chunk's offsets (see the `loop_counts` field).
-        pub fn set_loop_counts(&mut self, runs: u32, retry: u32) {
-            self.loop_counts = Some((runs, retry));
+        /// Declare that the code emitted from here on counts its loop iterations, `runs`, `word`
+        /// and `checkpoint` being the chunk's offsets (see the `loop_counts` field).
+        pub fn set_loop_counts(&mut self, runs: u32, word: u32, checkpoint: u32) {
+            self.loop_counts = Some((runs, word, checkpoint));
         }
-        pub fn loop_counts(&self) -> Option<(u32, u32)> {
+        pub fn loop_counts(&self) -> Option<(u32, u32, u32)> {
             self.loop_counts
         }
         /// Declare each loop's weight, by its header's pc (see the `loop_weights` field).
@@ -5992,14 +5993,18 @@ fn compile_entry(
     // P3 stage 2, step 8: with the optimizing tier on, the code's loop iterations count toward
     // its chunk's checkpoints (`emit_loop_count`); the tier off, it is emitted as before.
     if crate::opt::counts_loops() {
-        let (runs, retry) = (chunk.jit_runs_off(), chunk.jit_inline_retry_at_off());
+        let (runs, word, checkpoint) = (
+            chunk.jit_runs_off(),
+            chunk.jit_loop_word_off(),
+            chunk.jit_inline_retry_at_off(),
+        );
         let fits4 = |offset: usize| offset & 3 == 0 && offset / 4 < 4096;
         debug_assert!(
-            fits4(runs) && fits4(retry),
+            fits4(runs) && fits4(word) && fits4(checkpoint),
             "one LDR (32-bit) reaches each word"
         );
-        if fits4(runs) && fits4(retry) {
-            a.set_loop_counts(runs as u32, retry as u32);
+        if fits4(runs) && fits4(word) && fits4(checkpoint) {
+            a.set_loop_counts(runs as u32, word as u32, checkpoint as u32);
         }
     }
     // The local reads that need no TDZ test (`TRUST_JS_JIT_NO_TDZ_PROOF` keeps every test).
@@ -23685,50 +23690,58 @@ const REGION_POLL_COUNTDOWN: u32 = 16384;
 /// loops (`Asm::loop_counts`: the optimizing tier on): the running record's chunk
 /// (`JitCtx::chunk`) adds the loop's weight (`Asm::loop_weight` of the loop headed at `header`:
 /// its span's share of an entry's K, `opt::loop_weight`, step 11) to `Chunk::jit_runs` while its
-/// checkpoint word (`Chunk::inline_retry_at`: the second stage's next checkpoint, or a discard's
-/// warm-up) is nonzero, up to one below the word: a count that would reach it stops one below
-/// (a weight of one never passes it), and a due checkpoint counts nothing. The next native
-/// entry's gate (the retry gate of [`emit_direct_sequence`]), which adds K, then takes the
-/// checkpoint as ever: without OSR the function gets new code at its next entry. SpiderMonkey's
+/// loop word (`Chunk::loop_word`: the checkpoint word's copy, the second stage's next checkpoint
+/// or a discard's warm-up, or the optimizing tier's loop limit's warm-up, step 13) is nonzero, up
+/// to one below the word. A count that would reach the word is the crossing: it stops one below
+/// (a weight of one never passes it; a count there already or past it, a due checkpoint, stays),
+/// the checkpoint word (`Chunk::inline_retry_at`) takes the loop word, which it holds already
+/// but for the loop limit's warm-up, and the loop word is cleared, so that the loops count
+/// nothing more: the next native entry's gate (the retry gate of [`emit_direct_sequence`]),
+/// which adds K, then takes the checkpoint, or the loop limit's check (step 13), and sets both
+/// words again; without OSR the function gets new code at its next entry. SpiderMonkey's
 /// baseline code counts a loop head as an entry, after the loop's interrupt check (emit_LoopHead,
 /// jit/BaselineCodeGen.cpp:2603-2614; emitWarmUpCounterIncrement, 1679-1712); V8's back edge
 /// charges its loop's length (InterpreterAssembler::JumpBackward,
 /// interpreter/interpreter-assembler.cc:1252-1256). Three instructions while no checkpoint is
-/// pending, eight while one is; it writes x9, x16 and x17, which every site leaves free after its
-/// poll. The word is read through the record, so a shared stub could hold this code (it embeds no
-/// address).
+/// pending or after the crossing, eight while one is pending, and ten (a weight of one) or up to
+/// fifteen at the crossing; it writes x9, x16 and x17, which every site leaves free after its
+/// poll. The words are read through the record, so a shared stub could hold this code (it embeds
+/// no address).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_loop_count(a: &mut asm::Asm, header: usize) {
-    let Some((runs, retry)) = a.loop_counts() else {
+    let Some((runs, word, checkpoint)) = a.loop_counts() else {
         return;
     };
     let weight = a.loop_weight(header);
     let done = a.new_label();
+    let store = a.new_label();
     a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
-    a.ldr_w_imm(17, 16, retry);
+    a.ldr_w_imm(17, 16, word);
     a.cbz(17, false, done);
     a.ldr_w_imm(9, 16, runs);
     // 64-bit: a word at u32::MAX (an entry's own saturation) adds no wrap.
     a.add_imm(9, 9, weight);
     a.cmp_reg_x(9, 17);
+    a.b_cond(C_LO, store);
+    // The crossing: the checkpoint word takes the loop word (the next entry's request), and the
+    // loop word is cleared.
+    a.str_w_imm(17, 16, checkpoint);
+    a.str_w_imm(31, 16, word);
     if weight == 1 {
         // Ones reach one below the word and stop there.
-        a.b_cond(C_HS, done);
+        a.b(done);
     } else {
-        let store = a.new_label();
-        a.b_cond(C_LO, store);
-        // The count would reach the word: one below it, unless the count is there already or
-        // past it (a due checkpoint).
+        // One below the word, unless the count is there already or past it (a due checkpoint).
         a.sub_imm(17, 17, 1);
         a.sub_imm(9, 9, weight);
         a.cmp_reg_x(9, 17);
         a.b_cond(C_HS, done);
         a.mov(9, 17);
-        a.bind(store);
     }
+    a.bind(store);
     a.str_w_imm(9, 16, runs);
     a.bind(done);
 }
@@ -23736,27 +23749,30 @@ fn emit_loop_count(a: &mut asm::Asm, header: usize) {
 /// The iterations a helper-free region's countdown ran ([`REGION_POLL_COUNTDOWN`] less
 /// `counter`, which [`emit_region_poll_start`] started), each counted as [`emit_loop_count`]
 /// counts one of the loop headed at `header` (its weight): the running chunk's runs grow by them,
-/// up to one below its checkpoint word, while a checkpoint is pending and not yet due. At each of
-/// the region's polls and exits, where its loop has ended: nothing in the loop itself. Writes x9,
-/// x10, x16 and x17.
+/// up to one below its loop word, while a checkpoint is pending; a count that reaches one below
+/// the word, or a due checkpoint's, is the crossing, as [`emit_loop_count`]'s (the checkpoint
+/// word takes the loop word, which is cleared). At each of the region's polls and exits, where
+/// its loop has ended: nothing in the loop itself. Writes x9, x10, x16 and x17.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_loop_count_countdown(a: &mut asm::Asm, counter: u32, header: usize) {
-    let Some((runs, retry)) = a.loop_counts() else {
+    let Some((runs, word, checkpoint)) = a.loop_counts() else {
         return;
     };
     let weight = a.loop_weight(header);
     let done = a.new_label();
+    let crossing = a.new_label();
+    let store = a.new_label();
     a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
-    a.ldr_w_imm(17, 16, retry);
+    a.ldr_w_imm(17, 16, word);
     a.cbz(17, false, done);
     a.ldr_w_imm(9, 16, runs);
     // x17 = the most the loops count to, one below the word; a due checkpoint counts nothing.
     a.sub_imm(17, 17, 1);
     a.cmp_reg_x(9, 17);
-    a.b_cond(C_HS, done);
+    a.b_cond(C_HS, crossing);
     // The countdown's register is a W register's zero extension (MOVZ, SUBS W).
     a.movz(10, REGION_POLL_COUNTDOWN, 0);
     a.sub_reg(10, 10, counter);
@@ -23767,11 +23783,20 @@ fn emit_loop_count_countdown(a: &mut asm::Asm, counter: u32, header: usize) {
         // weight for the multiply and then the limit again.
         a.movz(17, weight, 0);
         a.madd(9, 10, 17, 9);
-        a.ldr_w_imm(17, 16, retry);
+        a.ldr_w_imm(17, 16, word);
         a.sub_imm(17, 17, 1);
     }
     a.cmp_reg_x(9, 17);
-    a.csel_x(9, 9, 17, C_LO);
+    a.b_cond(C_LO, store);
+    // The count reaches one below the word: it stops there.
+    a.str_w_imm(17, 16, runs);
+    // The crossing: the checkpoint word takes the loop word, and the loop word is cleared.
+    a.bind(crossing);
+    a.add_imm(10, 17, 1);
+    a.str_w_imm(10, 16, checkpoint);
+    a.str_w_imm(31, 16, word);
+    a.b(done);
+    a.bind(store);
     a.str_w_imm(9, 16, runs);
     a.bind(done);
 }
@@ -24204,9 +24229,13 @@ pub(crate) unsafe fn run_borrowed_frame(
         } else {
             chunk.jit_is_strict()
         };
-        chunk
-            .jit_runs
-            .set(chunk.jit_runs.get().saturating_add(i.opt_entry_weight));
+        // Nothing while the optimizing tier's loop limit waits on its warm-up (P3 stage 2, step
+        // 13).
+        if chunk.counts_entries() {
+            chunk
+                .jit_runs
+                .set(chunk.jit_runs.get().saturating_add(i.opt_entry_weight));
+        }
         #[cfg(test)]
         if chunk.jit_is_resumable() {
             TEST_NATIVE_SLICES.with(|count| count.set(count.get() + 1));

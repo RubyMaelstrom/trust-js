@@ -15931,6 +15931,11 @@ impl Interp {
         realm: usize,
         global_env: usize,
     ) {
+        // Nothing while the optimizing tier's loop limit waits on its warm-up, which loop
+        // iterations alone count toward (P3 stage 2, step 13).
+        if !chunk.counts_entries() {
+            return;
+        }
         let runs = chunk.jit_runs.get().saturating_add(self.opt_entry_weight);
         chunk.jit_runs.set(runs);
         // A prepared body retains its original FunctionDeclarationInstantiation even when
@@ -15974,11 +15979,15 @@ impl Interp {
     }
 
     /// One call through a current [`PreparedCall`], with exactly the effects of the
-    /// corresponding [`Interp::call_jit_cached`] hit.
+    /// corresponding [`Interp::call_jit_cached`] hit. Inlined into its native algorithms' calls
+    /// (`Callback::call`): the entry's count (`note_native_entry`, inlined here) grew by the loop
+    /// limit's test (P3 stage 2, step 13), which left this outlined without the hint, at about 30
+    /// instructions a call (a sort's comparator).
     ///
     /// # Safety
     /// Same immutable-window loan as `call_jit_cached`; `prepared` must be current
     /// (see [`Interp::prepared_call_current`]) for a callee the caller keeps alive.
+    #[inline]
     pub(crate) unsafe fn call_prepared(
         &mut self,
         prepared: &PreparedCall,
@@ -16637,6 +16646,12 @@ impl Interp {
         // That Realm's global environment, the call cache's fill-time same-Realm proof.
         genv: usize,
     ) {
+        // The optimizing tier's loop limit (P3 stage 2, step 13): a loop whose count reached the
+        // armed warm-up asked for this entry's check, which discards the chunk's tier code at its
+        // loop limit, as JSC's baseline loop's tier-up check jettisons the replacement.
+        if crate::opt::loop_limit_due(self, chunk) {
+            return;
+        }
         if func.is_null() {
             crate::jit::perf_inline_suppressed();
             return;

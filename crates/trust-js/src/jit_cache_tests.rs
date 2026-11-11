@@ -151,7 +151,7 @@ fn direct_return_and_throw_survive_reentrant_reclamation() {
     for name in ["activeParent", "activeLeaf"] {
         let c = chunk(&mut e.interp, name);
         c.inline_attempted.set(true);
-        c.inline_retry_at.set(0);
+        c.set_retry_words_for_test(0);
     }
     let victim = chunk(&mut e.interp, "victim");
     assert!(victim.jit.get().flatten().is_some());

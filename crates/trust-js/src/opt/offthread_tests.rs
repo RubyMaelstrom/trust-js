@@ -444,3 +444,87 @@ fn one_cpu_compiles_on_the_main_thread() {
     let chunk = tier_chunk(&mut engine, "sq").expect("compiled and published at once");
     assert_eq!(compiled(), vec![Rc::as_ptr(&chunk) as usize]);
 }
+
+fn discarded() -> Vec<usize> {
+    super::TEST_DISCARDED.with(|discarded| std::mem::take(&mut *discarded.borrow_mut()))
+}
+
+#[test]
+fn a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile() {
+    // A discard at the loop limit (stage 2, step 13) is a discard as any: it counts R on the
+    // first stage and flags the exits' sites, so that a compile whose snapshot read them is
+    // dropped at its install. The tier starts a reoptimization only from a discarded code's
+    // warm-up, while the chunk runs the template JIT's fallback, so a job of the chunk pending
+    // while its tier code reaches the loop limit is made here by hand.
+    if !asynchronous_here() {
+        return;
+    }
+    let mut engine = jit_engine();
+    compiled();
+    dropped();
+    eval(
+        &mut engine,
+        "function noop() {}\n\
+         function f(a, n, cb) { let s = (a | 0) + 1; \
+         for (let i = 0; i < n; i++) { if (i === 0) cb(); s = s + (i & 3); } return s; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = (t + f(k, 4, noop)) | 0; t",
+    );
+    super::finish_compiles_for_test(&mut engine.interp);
+    let chunk = tier_chunk(&mut engine, "f").expect("f's tier chunk");
+    let code = chunk.jit.get().flatten().expect("resident");
+    assert!(
+        super::exit::table_bytes(code.mem_ptr()) != 0,
+        "the tier's code"
+    );
+    compiled();
+    let func = {
+        let value = function(&mut engine, "f");
+        let object = value.as_obj().unwrap();
+        let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+            unreachable!()
+        };
+        Rc::downgrade(&*user.func)
+    };
+    let hold = super::compiler::TEST_HOLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    ChunkProfile::of(&chunk).arm(1, 0);
+    super::reoptimize(&mut engine.interp, &chunk, func, Some(chunk.clone()));
+    assert_eq!(
+        engine.interp.opt_pending.len(),
+        1,
+        "the reoptimization pending"
+    );
+    discarded();
+    // Each call exits at its start (an int32 overflow) and loops 2,000 times: the fifth exit
+    // reaches the loop limit and arms its warm-up, which its frame's loop crosses, and the next
+    // entry discards the code.
+    for _ in 0..5 {
+        assert_eq!(eval(&mut engine, "f(2147483647, 2000, noop)"), "2147486648");
+    }
+    assert!(discarded().is_empty());
+    assert_eq!(eval(&mut engine, "f(1, 0, noop)"), "2");
+    assert_eq!(discarded(), vec![code.mem_ptr() as usize]);
+    drop(hold);
+    wait_finished(&engine);
+    // Any poll installs: a loop's back edges (an entry of f could also take its warm-up's
+    // checkpoint, which the discard armed).
+    eval(
+        &mut engine,
+        "let u = 0; for (let k = 0; k < 100; k++) u += k; u",
+    );
+    assert_eq!(engine.interp.opt_pending.len(), 0);
+    let drops = dropped();
+    assert_eq!(drops.len(), 1, "{drops:?}");
+    assert_eq!(drops[0].0, Rc::as_ptr(&chunk) as usize);
+    assert_eq!(drops[0].1, "a discard flagged its sites since its snapshot");
+    assert!(compiled().is_empty(), "nothing installed");
+    let now = chunk.jit.get().flatten().expect("the fallback");
+    assert_eq!(
+        super::exit::table_bytes(now.mem_ptr()),
+        0,
+        "the template JIT's code stays"
+    );
+    drop(code);
+    super::release_retired(&mut engine.interp);
+}

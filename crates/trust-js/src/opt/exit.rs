@@ -30,6 +30,17 @@
 //! code, and the records' counts become the exit profile. Activations still running a discarded
 //! code finish in it, and their exits count without triggering anything again, as JSC's exit
 //! returns early for a jettisoned code block (dfg/DFGOperations.cpp:6664-6672).
+//!
+//! An exited frame that loops (stage 2, step 13, JSC's form with the template JIT as the
+//! baseline): each exit at or past the table's loop limit (`opt::loop_exit_limit`, 5 << R, never
+//! above the limit) that does not discard arms the loop limit's warm-up again
+//! (`opt::arm_loop_limit`: `loop_warm_up` of the chunk's template loop iterations from now), as
+//! JSC's exit resets the baseline's execution counter to its long warm-up
+//! (dfg/DFGOSRExitCompilerCommon.cpp:105-141); a template loop whose count reaches it asks the
+//! next native entry to discard the code (`opt::loop_limit_due`), as the baseline loop's tier-up
+//! check jettisons the replacement whose exits reached osrExitCountForReoptimizationFromLoop
+//! (jit/JITOperations.cpp:2944-2966). The exited frame leaves the VM at its first back edge, as
+//! every exited frame does. Forced exits arm nothing, as they count toward nothing.
 
 use super::ir::{ExitReason, Rep};
 
@@ -107,6 +118,17 @@ pub(crate) struct ExitTable {
     /// The exits past which the code is discarded (`opt::exit_limit` when it was compiled), so
     /// that an exit reads no chunk to decide.
     pub(crate) limit: u32,
+    /// The exits from which each exit that does not discard arms the loop limit's warm-up on
+    /// the chunk (`opt::arm_loop_limit`), whose crossing discards the code at the next entry
+    /// (`opt::loop_exit_limit` when it was compiled: 5 << R, never above `limit`; stage 2, step
+    /// 13): JSC's exitCountThresholdForReoptimizationFromLoop (bytecode/CodeBlock.cpp:
+    /// 2758-2771).
+    pub(crate) loop_limit: u32,
+    /// The loop limit's warm-up in native runs of template loop iterations
+    /// (`opt::loop_warm_up` when it was compiled: a discard's warm-up's first distance, as
+    /// JSC's exit and jettison both wait thresholdForOptimizeAfterWarmUp's 1,000,
+    /// runtime/OptionsList.h:373-374).
+    pub(crate) loop_warm_up: u32,
     /// Whether the code was discarded (`opt::discard`).
     pub(crate) discarded: std::cell::Cell<bool>,
 }
@@ -189,6 +211,24 @@ pub(crate) fn table_bytes(code_base: *const u8) -> usize {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(code_base as usize))
         .map_or(0, |table| table.retained_bytes())
+}
+
+/// The exit table of `code`, if it is the tier's code (template JIT code has none). The table
+/// lives as long as its code, which the caller holds: only the code's drop releases it
+/// (`release`), and the registry's map moves only its boxes.
+pub(crate) fn table_of(code: &crate::jit::JitCode) -> Option<&ExitTable> {
+    let registry = registry();
+    if registry.live.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        return None;
+    }
+    let table = registry
+        .tables
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(code.mem_ptr() as usize))
+        .map(|table| &**table as *const ExitTable)?;
+    // SAFETY: the box is freed only by `release`, at `code`'s drop, which the borrow outlives.
+    Some(unsafe { &*table })
 }
 
 /// Free the exit table of the code at `code_base`, if it has one (every code object's drop
@@ -363,7 +403,13 @@ pub(crate) unsafe extern "C" fn deoptimize(
         let taken = table.taken.get().saturating_add(1);
         table.taken.set(taken);
         if taken >= table.limit && !table.discarded.get() {
-            super::discard(i, chunk, table);
+            super::discard(i, chunk, table, super::Limit::Exits);
+        }
+        // An exited frame that loops (stage 2, step 13; see the module's doc): at the loop limit
+        // or past it, the code not discarded, the loop limit's warm-up starts again (JSC's reset
+        // of the baseline counter at every exit that does not jettison); below it, nothing.
+        if taken >= table.loop_limit && !table.discarded.get() {
+            super::arm_loop_limit(chunk, table.loop_warm_up);
         }
     }
     ctx.handlers.clear();

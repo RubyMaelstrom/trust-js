@@ -85,15 +85,22 @@ comment/example in the same change.
   for NotNumber, f64 for NotInt32 and Overflow, the generic access for WrongShape unless the
   site's ways grew, the guard's mismatch edge for WrongCallee, the block for NeverRan, an f64
   loop phi for PhiNotInt32 and a tagged one for PhiNotNumber, the two exits of a loop's entry
-  check of a word entering an untagged phi, at its header). A discard whose exits were all
-  throws or unsupported operations arms no recompile. Each discard and each recompile moves the
-  call caches' epoch. With the tier on, the checkpoints count V8's weight: a native entry counts
-  K = 64 native runs (an invocation), and a loop iteration of template code (a first stage's, a
-  discarded code's fallback) its loop's share of one, max(1, round(K x B / L)), B the loop's
-  span in operations (its header to its last back edge) and L its chunk's (V8's back edge
-  charges its loop's length against invocations times the bytecode's length): each iteration
-  counts toward its chunk's pending checkpoint or warm-up, up to one below it, and the next
-  native entry takes the checkpoint; a checkpoint that would pass the 32-bit count is not armed.
+  check of a word entering an untagged phi, at its header). A code whose exited frames loop is
+  discarded sooner, as JSC's from its baseline loop: once its exits reach 5 << R (never more
+  than its limit), each exit that does not discard starts a warm-up of its chunk's template loop
+  iterations (100 << R invocations' worth, a discard's warm-up's first distance) that entries do
+  not count, and when a loop's count reaches it (an exited frame's loop in the chunk's
+  borrowed-frame code, which every exited frame moves into at its first back edge) the loops
+  count nothing more and the next native entry discards the code as at its limit. A discard
+  whose exits were all throws or unsupported operations arms no recompile. Each discard and
+  each recompile moves the call caches' epoch. With the tier on, the checkpoints count V8's
+  weight: a native entry counts K = 64 native runs (an invocation), and a loop iteration of
+  template code (a first stage's, a discarded code's fallback) its loop's share of one,
+  max(1, round(K x B / L)), B the loop's span in operations (its header to its last back edge)
+  and L its chunk's (V8's back edge charges its loop's length against invocations times the
+  bytecode's length): each iteration counts toward its chunk's pending checkpoint or warm-up,
+  up to one below it, after which its loops count nothing, and the next native entry takes the
+  checkpoint; a checkpoint that would pass the 32-bit count is not armed.
   `TRUST_JS_OPT_NO_LOOP_COUNT=1` counts native entries alone, K each; with the tier off an entry
   counts one, and no iteration counts. Under
   `TRUST_JS_OPT_EAGER=1` the tier compiles at the first checkpoint, a recompile's too, without
@@ -103,6 +110,9 @@ comment/example in the same change.
   forced exits neither count toward the limit nor flag anything.
   `TRUST_JS_OPT_EXIT_LIMIT=N` (a positive N) sets the limit's base in place of 100: 1 discards
   each code at its first exit, the configuration that cycles reoptimization.
+  `TRUST_JS_OPT_LOOP_EXIT_LIMIT=N` (a positive N) sets the base of the limit for exited frames
+  that loop in place of 5 (JSC's `osrExitCountForReoptimizationFromLoop`); it never passes the
+  exit limit.
   `TRUST_JS_OPT_VERIFY=1` verifies each graph the tier builds in a release build (its SSA
   dominance, representations, frame states and terminators) and refuses a graph that fails,
   logging why under `TRUST_JS_OPT_LOG`; debug builds and the library's tests always verify, and
@@ -135,7 +145,8 @@ comment/example in the same change.
   and kind, and for a shape check's the shapes it expected and the receiver's, or what the
   receiver is when it is no object), discard (`[opt] discarded <name> after <n> exits (limit
   <l>, R <r> -> <r'>) for <what new entries run>: pc <pc> <reason> x<count>, ...`; `the
-  template JIT's kept code` where it returned to the code an install kept), new exit
+  template JIT's kept code` where it returned to the code an install kept; ending `; at its
+  loop limit: <n> exits >= <loop limit>` for a discard at the loop limit), new exit
   site (`[opt] flag <name> pc <pc> <reason> own|at <baseline name> pc <pc>[ (spliced)]`), discard
   of unfixable exits only (`[opt] not reoptimized <name>: unfixable exits only`) or of a warm-up
   past the count (`[opt] not reoptimized <name>: its warm-up would pass the checkpoint word`),

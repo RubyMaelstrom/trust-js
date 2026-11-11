@@ -77,7 +77,7 @@ fn settle(engine: &mut Engine, names: &[&str]) {
     for name in names {
         with_chunk(engine, name, |chunk| {
             chunk.inline_attempted.set(true);
-            chunk.inline_retry_at.set(0);
+            chunk.set_retry_words_for_test(0);
         });
     }
 }
