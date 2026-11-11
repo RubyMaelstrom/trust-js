@@ -40,6 +40,9 @@ pub(crate) struct Job {
     /// Whether the compile maps its code itself (off the main thread; the main thread's
     /// synchronous compile maps at the install, as before).
     pub(crate) maps: bool,
+    /// Whether the compile reads the clock for its time (`Finished::elapsed`): under
+    /// TRUST_JS_OPT_LOG only, the log's (stage 2, step 16).
+    pub(crate) timed: bool,
     /// The main thread's addresses of the counters test builds' templates embed.
     #[cfg(test)]
     pub(crate) test_addresses: crate::jit::TestAddresses,
@@ -87,7 +90,7 @@ pub(crate) struct Finished {
     /// Whether a graph was verified, and the verifier's message where it failed (release).
     pub(crate) verified: bool,
     pub(crate) verify_failure: Option<String>,
-    /// The compile's time on its thread.
+    /// The compile's time on its thread, where it was timed (`Job::timed`; zero otherwise).
     pub(crate) elapsed: std::time::Duration,
     /// Whether the code compares a record with the realm's global environment (`genv`), which
     /// the install then pins (stage 2, step 4).
@@ -96,7 +99,7 @@ pub(crate) struct Finished {
 
 /// Compile `job` (see the module's doc): reads nothing but the job and process constants.
 pub(crate) fn compile(job: Job) -> Finished {
-    let started = std::time::Instant::now();
+    let started = job.timed.then(std::time::Instant::now);
     #[cfg(test)]
     let _addresses = crate::jit::TestAddresses::install(job.test_addresses);
     let mut declines = Vec::new();
@@ -178,7 +181,7 @@ pub(crate) fn compile(job: Job) -> Finished {
         declines,
         verified,
         verify_failure,
-        elapsed: started.elapsed(),
+        elapsed: started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
         embeds_genv,
     }
 }

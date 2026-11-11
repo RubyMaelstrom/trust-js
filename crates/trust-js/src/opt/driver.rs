@@ -563,12 +563,12 @@ fn name(chunk: &Chunk) -> String {
 /// otherwise. With the code, the timer of its install, which the caller ends (`log_main_thread`'s
 /// `install`).
 fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::time::Instant>)> {
-    let started = std::time::Instant::now();
+    let started = log_clock();
     let timer = main_thread_timer();
     let (job, pin) = match prepare(i, chunk, compiles_on_another_thread()) {
         Ok(prepared) => prepared,
         Err(refusal) => {
-            note_refusal(chunk, &refusal, &Timing::main(started, started.elapsed()));
+            note_refusal(chunk, &refusal, &Timing::main(started));
             return None;
         }
     };
@@ -590,11 +590,17 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::t
     finish(i, chunk, finished, pin, &timing).map(|code| (code, install))
 }
 
+/// Now, under TRUST_JS_OPT_LOG (None otherwise: no clock read): a compile's clock reads are the
+/// log's (stage 2, step 16).
+fn log_clock() -> Option<std::time::Instant> {
+    log_enabled().then(std::time::Instant::now)
+}
+
 /// Where and when a compile ran, for its log line (the plan's point 10): the thread its build
 /// and code generation ran on (`the main`, `the compile`), their time there (summed over its
 /// runs: a job that found stubs or atoms missing runs again), its wait in the compile thread's
 /// queue, and when its snapshot started, so that the line gives the time from the snapshot to
-/// the install.
+/// the install. Timed under TRUST_JS_OPT_LOG only (`log_clock`): the times are zero otherwise.
 struct Timing {
     thread: &'static str,
     compiled: std::time::Duration,
@@ -602,16 +608,16 @@ struct Timing {
     /// missing.
     needed: std::time::Duration,
     waited: std::time::Duration,
-    snapshot: std::time::Instant,
+    snapshot: Option<std::time::Instant>,
     runs: u32,
 }
 
 impl Timing {
-    /// A refusal on the main thread before any compile, `elapsed` after `started`.
-    fn main(started: std::time::Instant, elapsed: std::time::Duration) -> Self {
+    /// A refusal on the main thread before any compile, which started at `started`.
+    fn main(started: Option<std::time::Instant>) -> Self {
         Timing {
             thread: "the main",
-            compiled: elapsed,
+            compiled: started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
             needed: std::time::Duration::ZERO,
             waited: std::time::Duration::ZERO,
             snapshot: started,
@@ -627,7 +633,8 @@ impl Timing {
             "on {} thread, queued {:.3} ms, installed {:.3} ms after its snapshot{}",
             self.thread,
             self.waited.as_secs_f64() * 1e3,
-            self.snapshot.elapsed().as_secs_f64() * 1e3,
+            self.snapshot
+                .map_or(0.0, |snapshot| snapshot.elapsed().as_secs_f64() * 1e3),
             if self.runs > 1 {
                 format!(
                     ", {} runs, {:.3} ms before the last",
@@ -685,6 +692,7 @@ fn prepare(
         stubs: off_thread.then(|| crate::jit::stub_table_snapshot(&[])),
         stub_copies: Vec::new(),
         maps: off_thread,
+        timed: log_enabled(),
         #[cfg(test)]
         test_addresses: crate::jit::TestAddresses::capture(),
     };
@@ -1160,12 +1168,12 @@ fn start_job(
     landing: Landing,
 ) -> Result<(), (Rc<Chunk>, Landing)> {
     release_retired(i);
-    let started = std::time::Instant::now();
+    let started = log_clock();
     let timer = main_thread_timer();
     let (job, pin) = match prepare(i, &chunk, true) {
         Ok(prepared) => prepared,
         Err(refusal) => {
-            note_refusal(&chunk, &refusal, &Timing::main(started, started.elapsed()));
+            note_refusal(&chunk, &refusal, &Timing::main(started));
             return Err((chunk, landing));
         }
     };
