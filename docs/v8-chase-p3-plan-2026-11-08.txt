@@ -3282,3 +3282,43 @@ thread's class lists from its own 16 KiB spans carved from 2 MiB segments (the o
   (chunk-granular release, or dehugify before a discard); it goes with the study of a compiled
   function's data layout the owner asked for, which also decides whether the segments' huge-page
   advice is still needed.
+
+A compiled function's data layout and the huge pages (study, 2026-11-11; target/p3/stage2/
+layout-input.txt, evidence layout/ and layout-x925/; the owner's request with the allocator's
+huge pages). A compiled function is 37-59 separate heap blocks (11-31 KB), 92% of them 1 KiB or
+less and so in the allocator's size classes; template code embeds each per-site cell's address.
+JSC keeps a function's per-site data in two blocks (MetadataTable, BaselineJITData) reached
+through pinned registers, SpiderMonkey in one JitScript with trailing IC arrays (attached stubs
+bump-allocated per realm), V8 in one FeedbackVector reached from a frame slot; none embeds
+per-site addresses, none advises huge pages by default, all release memory a base page at a time.
+- The allocator keeps its segments' huge-page advice. Grouping a chunk's blocks (a probe, one
+  binary with runtime switches, A725) removes only 31% of Vue's extra L1 TLB refills without the
+  advice, 11% of React's and 5% of Djot's: the rest is the engine's other small runtime data
+  (Maps' buckets, closures, the frame stack) and the collector's entries it evicts from the
+  A725's 48-entry L1 TLB. One exactly sized block a chunk (the exemplars' form) is worth doing
+  later for memory (the Vecs' slack is 25-50% of those arrays) and for platforms without huge
+  pages, with the allocator serving blocks of a few KiB from its segments.
+- The collector advises its 2 MiB chunks for huge pages from the heap's fourth chunk and discards
+  64 KiB pages inside them, which frees nothing until the kernel splits the page under pressure:
+  after TypeScript's final collection RSS reads 169 MiB while the charge is 524 MiB (161 after a
+  reclaim). Dehugifying before the discard changes nothing (538 MiB); keeping chunks whole
+  returns nothing even under pressure (531). Without the advice every discard frees at once
+  (161 MiB), at cycles (fixed runs, the same binary): on an X925 core Splay +4.2% (tier on)
+  and +4.6% (off), TypeScript +1.5% and +1.6%, Earley-Boyer +0.4% and +0.3%, Richards unchanged;
+  on the A725 Splay +3.4%, TypeScript +1.4%, Earley-Boyer +1.0%, Djot's passes +0.7%. The
+  exemplars' collectors advise none (V8's sweeper and pool, heap/sweeper.cc:1045-1090;
+  SpiderMonkey's arenas in 1 MiB chunks, gc/Memory.cpp:999-1027; JSC's MarkedBlocks through
+  libpas). The choice goes to the owner.
+The tier-off shifts between the interim sessions (Crystal: Splay +6.7%, RegExp +6.1%, TypeScript
++3.6%, array-shift-queue -5.3%, its holey case +6.5%, 4509bd62 to be6b5ee2), timed on zombie
+(x86-64, idle, the owner's offer; target/p3/stage2/zombie-perf/drift2.sh, each run after a
+minute with no build there, 3.46 GHz delivered in every run, 3 rounds alternating): Octane within
+-2.1% (Splay) and +1.4%, the calls within +1.9% but array-shift-queue -12.5% and its holey case
+-10.1%. Crystal's shifts were its machine state (or aarch64 alone), not shared code; the shift
+cases' gain is code. (A first attempt overlapped the agents' x86 builds in 8 of 12 runs: void.)
+Open: the calls' array-shift-queue-holey (+2.35% tier on against off in the session) hides a
+larger cost. Alone (target/p3/stage2/holey-diag), the tier's code, installed in place during the
+third run, takes 17.85 ms a run against template code's 14.3 (+25%), at +15% instructions: its
+own code 12.9% of them (template code 6.6%), the PropWays stub 6.6% (3.0%), a native-call
+boundary 2.6% (none). The benchmark times the run in which the install lands, so the bar reads
++2.35%. To find: how the tier lowers a.push() and a.shift() on a holey array.
