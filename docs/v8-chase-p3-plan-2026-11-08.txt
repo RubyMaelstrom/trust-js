@@ -2927,3 +2927,90 @@ Not in the step:
 - Step 17, after it: the shared stubs made on the compile thread under the stub table's lock, the
   main thread fencing at the install as now (JSC's ctiStubImpl, jit/JITThunks.cpp:189-222). That
   removes the stubs line (0.21 ms A725) and each rerun's latency.
+
+Step 13 landed (e7047743, 2026-11-11; target/p3/stage2/step13-impl, report.txt's "LANDING
+VERSION"; evidence land/ and land/r47). Option (c) with the cheaper due path, as the owner
+approved, rebased onto step 15:
+- The loop limit (5 << R, never above the exit limit) is armed at each exit of the tier's code
+  that does not discard it. Its warm-up goes on the chunk's loop word (Chunk::loop_word, four bytes
+  after the entry word, so that no field the template code addresses moves; Chunk 1,896 -> 1,904
+  bytes).
+- Template code's loop iterations count toward the loop word; entries count nothing while it is
+  armed.
+- A count that reaches the word is the crossing: the checkpoint word takes the loop word, and the
+  loop word is cleared. A due chunk's loops then cost 3 instructions an iteration (main: 7 or 11).
+- The next native entry's check (opt::loop_limit_due, first in try_inline_recompile) discards the
+  code as at its exit limit, returning a first stage's in-place code to its kept template code.
+Departures:
+- (1) A loop limit ending idles both words: 7558959b could leave a stale due checkpoint after a
+  discard that arms no warm-up.
+- (2) Forced exits arm nothing.
+- (3) supersede drops a crossing's pending request.
+- (4) Interp::call_prepared is hinted inline, as main inlines it: the entry test's growth had left
+  it outlined after LTO (a sort comparator +2.16%; now +0.26%, 3.5 instructions a call).
+- (5) The Rust entry paths count nothing while the warm-up is armed and not crossed: +1 instruction
+  an entry with a checkpoint pending, +3 with none.
+Tests: opt::loop_limit_tests and an off-thread test, both placements (second stage and in place);
+8 mutations caught (on two earlier forms of the commit, the same lines); the library's suites
+(3,050 each), the tier's in six configurations (286 each), poll and Agent (45 each); Test262 eager
+53,573 of 53,575; zombie's check, clippy -D warnings, Windows' check and suite (2,774). The tier
+off: 156 of 3,068 template compiles byte-identical, the other 2,912 identical but for embedded
+addresses (all 166,812 differing loaded values at or above 2^32; the heap's layout moved with the
+chunk's 8 bytes).
+Measured (fat LTO, instructions, against main 47a6197a, the tier on synchronous; asynchronous
+alike; land/r47):
+- Octane -1.87% geomean (asynchronous -1.83%, tier off +0.01%): zlib -14.27%, GBEMU -10.00%, Box2D
+  -1.84%, Mandreel -0.68%, Richards -0.28%.
+- GBEMU's gain doubled against the step on its own (-4.88% on 1e3515d5): step 15 no longer splices
+  the polymorphic sites whose guards made the old base's recompiles exit (160 exits); its
+  interpreter loop is discarded at 5, 10 and 20 exits and its fourth code is stable.
+- Crypto +0.38%: am3 is discarded at its loop limit after 5 out-of-bounds exits, and the recompile
+  takes the generic access every iteration (+0.8% a run past the warm-up). The recompile's
+  out-of-bounds read is the fix, not this rule.
+- Splay +0.12% (+0.78% asynchronous): no discard or exit differs; layout.
+- The fixtures within 0.13% (Djot's synchronous measured pass +0.13%, repeatable, not
+  attributed); their exits and discards are main's, and no loop-limit discard happens there. The
+  bar's sums are unchanged (Djot 4.13 -> 4.08 ms a run, asynchronous, A725).
+- Box2D's +1.55% under (c) on 4509bd62 was a warm-up cost: over 20 runs (c) was -1.80%, the 15
+  later runs -3.3%. On 1e3515d5, main no longer exits at three of its five discard sites; the
+  landing keeps the two discards that pay at once.
+- The step on its own (8d130e5f against 1e3515d5): -1.50% synchronous geomean.
+
+The interim splice rule on Octane (compile-bar-input.txt section 8; the tier on synchronous,
+TRUST_JS_INLINE_SMALL_BUDGET=0 against main): +1.12% instructions geomean. Mandreel +14.96% (13
+callers left with no splices: Bullet's broadphase sorts, the dynamics world's passes, the TLSF
+allocator's helpers), TypeScript +2.04% (40 large emitter, parser, scanner and checker
+functions), Box2D +0.54%. These are callers over the shared budget whose hottest calls go to tiny
+callees, the small budget's purpose; the planner has no per-site call frequency to tell them from
+Djot's next() and feed(), whose splices buy little. Withdrawn. Before stage 3, the study's
+estimate for the exemplar-shaped set (steps 16 and 17) and two engine-only items (a cheaper
+recompile, about 0.2 ms; the job's arena) is Djot at about 2.7% (2.5-3.1%). Stage 3's graph
+inlining clears the bar with room.
+
+The owner's answer on the shell allocator (2026-11-11): "With 2 MiB pages". The allocator
+(p3-alloc; target/p3/stage2/alloc-impl) lands with its segments advised for huge pages. Without
+them, a compiled chunk's separate arrays (ops, names, caches), adjacent in glibc's heap, sit in
+their classes' spans, and the A725's L1 data TLB misses twice as often (Vue's passes +6%). After
+it comes a study of a compiled function's data layout (the exemplars keep a function's inline
+caches in fewer blocks), dropping the advice if that removes the need.
+Measured on CPU 14 against caf13bdf:
+- CodeLoad: -6.76% cycles alone, -10.32% with an idle second thread; the idle thread's penalty
+  +4.75% -> +0.76%. Its calls reaching glibc 210,842 -> 3,562.
+- Octane: -0.97% cycles geomean with the tier off, -1.17% on (TypeScript +1.07% and +0.71% at
+  equal instructions).
+- The fixtures, at equal or fewer instructions:
+  - React even;
+  - Vue's measured pass +2.41% and passes 2-10 +4.06% (tier off); +2.42% and +1.02% (tier on);
+  - Djot +2.39% and +2.69% (tier off); +0.20% and -0.05% (tier on);
+  - with randomized addresses: Vue +1.65%, Djot +0.49%.
+- RSS: about one segment (2 MiB) more where a program's spans reach into a segment, less where
+  glibc fragmented (zlib -26.5 MiB after a trim).
+An independent review (target/p3/stage2/alloc-review) found two platform bugs, to be fixed
+before it lands:
+- On aarch64 kernels with 64 KiB pages, a 16 KiB span's decommit discards its neighbours' live
+  blocks: madvise rounds to whole pages. Confirmed by a test under emulation.
+- On Windows, the main thread's exit drain can deadlock: ExitProcess kills the other threads
+  first, one of them may hold a class lock, and the drain runs in the detach phase.
+- Also, trim's partial discards inside a huge page are only unmapped. The kernel frees them when
+  it splits the page, typically under memory pressure, so RSS counters overstate what a trim
+  returns.
