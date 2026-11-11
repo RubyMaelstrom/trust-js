@@ -1057,7 +1057,12 @@ fn trim_now() {
 /// See the module docs.
 pub struct ClassAlloc;
 
+// The fast paths belong in the allocator shims (`__rust_alloc`, `__rust_dealloc`) the compiler
+// generates for the registered allocator: out of line they cost every allocation and free a jump
+// and the front end a code location of their own (Vue's passes +4% cycles at equal instructions,
+// more L1I refills and mispredicted branches, when fat LTO left them out of line).
 unsafe impl GlobalAlloc for ClassAlloc {
+    #[inline(always)]
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         if let Some(class) = class_of(layout.size(), layout.align()) {
             let cached = CACHE.with(|c| {
@@ -1076,6 +1081,7 @@ unsafe impl GlobalAlloc for ClassAlloc {
         unsafe { System.alloc(layout) }
     }
 
+    #[inline(always)]
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         if let Some(class) = class_of(layout.size(), layout.align()) {
             let cached = CACHE.with(|c| {
@@ -1102,6 +1108,7 @@ unsafe impl GlobalAlloc for ClassAlloc {
         unsafe { System.dealloc(ptr, layout) }
     }
 
+    #[inline]
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         // Blocks too large for a class (ArrayBuffer data) come from the system already zeroed:
         // calloc maps fresh pages, which cost nothing until written. A class block from a
@@ -1129,6 +1136,7 @@ unsafe impl GlobalAlloc for ClassAlloc {
         ptr
     }
 
+    #[inline]
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         // Within one size class a grow/shrink is free; otherwise allocate-copy-free through
         // the same class discipline.
