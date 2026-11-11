@@ -3234,3 +3234,51 @@ has no polymorphic state. A site that met another closure of a way's function de
 - Expected, from the probe and Gameboy's sites: DeltaBlue +13.8%, RayTrace +2%, Richards +3.4%
   (the rest of its loss is placement: step 13's earlier discards), Gameboy as main; the fixtures
   and the compile bar as main.
+
+The shell allocator's spans landed (d3601756..04d730d1, 2026-11-11; target/p3/stage2/alloc-impl
+and alloc-fix, report.txt each; the review alloc-review). fastalloc::ClassAlloc, the
+#[global_allocator] of the shell, the Test262 runner and the differential tester, refills each
+thread's class lists from its own 16 KiB spans carved from 2 MiB segments (the owner's answers of
+2026-11-11: the thread's own pages; with 2 MiB pages), instead of a glibc call a miss.
+- The review's findings, fixed:
+  - 64 KiB-page kernels (AArch64 RHEL, Grace): a span's discard took its neighbours' live blocks.
+    A span is now 16 KiB or the system's page where larger, up to 64 KiB (a1e205b5); every
+    allocator test passes under an emulated 64 KiB kernel (the head before: 2 of 16).
+  - Huge pages: a span's MADV_DONTNEED inside a THP-backed segment frees nothing until the kernel
+    splits the page under pressure, and costs the segment its TLB entry. Segment-granular release
+    (3ca5b64f): inside a huge page no span is discarded alone; a segment whose spans are all free
+    is unmapped whole (past the pool's bound and at trims); where no huge page backs a segment
+    (Windows, macOS, THP off, 16/64 KiB kernels) spans are still discarded alone. As TCMalloc's
+    HugePageFiller subreleases a used huge page only when it must and jemalloc's HPA dehugifies
+    before a partial purge. Given up: 2.6-8.4 MiB that six workloads freed under memory pressure
+    through splits (zlib, CodeLoad, GBEMU, Mandreel, Splay, Earley-Boyer); HPA's dehugify at a trim
+    is the next step if it matters.
+  - Windows' process end: ExitProcess ends the other threads wherever they are (one may hold an
+    allocator lock), then runs the exiting thread's destructors, whose drain waited for good. The
+    drain now returns at once while ntdll's RtlDllShutdownInProgress is TRUE, as JSC's libpas does
+    (pas_thread_local_cache.c's destructor, pas_process.c:38-55), the function resolved once at
+    the first thread's registration (04d730d1). Verified under Wine 11.21 (its ntdll exports it;
+    a child process that exits while another thread holds the pool's and a class's locks ends at
+    once, and hangs with the check made never true; the shell's every exit path skips the drain
+    and takes no lock after it). Not run on real Windows; it rests on libpas's assumption.
+- Measured (CPU 14, fat LTO, against main be6b5ee2): CodeLoad -6.20% cycles and -9.04%
+  instructions with the tier off (-5.78% on); the idle second thread's cost +4.25% on main,
+  +0.55% on the branch; the fixtures' measured passes and passes 2-10 within -2.3% and +0.6% (the
+  first build's Vue +2.4%/+4.1% tier off, a layout residue, gone).
+- Memory (each run in its own cgroup, charge): against glibc after a trim, zlib -18.5 MiB,
+  Mandreel -14.6, TypeScript -8.0; CodeLoad +5.5, DeltaBlue +3.4, Crypto +3.3, GBEMU +2.9, small
+  programs +1.2 to +1.7 (a segment's huge page). Corrections: the first report's RSS figures
+  omitted split pages' held memory; the plan's "zlib -26.5 MiB after a trim" is -18.5 charged,
+  Mandreel's -19.3 is -14.6.
+- Tests: the allocator's 21 (23 on Windows) on Crystal, under the 64 KiB emulation, on zombie and
+  under Wine; 20 mutations of the spans' fixes caught, and the Windows check's; the library's
+  suites on zombie tier off and on (2,797 each); the shell's tests as main's;
+  Test262 with the branch's runner (the allocator its global allocator) against main's, tier off
+  and on: 53,573 of 53,575 each, main's two failures and none beyond (alloc-fix/landing).
+- Open, not fixed: the collector's 64 KiB page discards inside its THP-advised 2 MiB chunks behave
+  the same way. After TypeScript's final collection every build, main's included, holds 351-396
+  MiB of split huge pages: RSS reads 168 MiB while the charge is 516-564 MiB until reclaim. RSS
+  figures for collections overstate what they return. The same choice applies there
+  (chunk-granular release, or dehugify before a discard); it goes with the study of a compiled
+  function's data layout the owner asked for, which also decides whether the segments' huge-page
+  advice is still needed.
