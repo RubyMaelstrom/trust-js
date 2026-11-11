@@ -20,8 +20,8 @@
 //! (`pas_local_allocator`, `pas_thread_local_cache`):
 //! - a thread's miss takes the next block of its bump region of the class, a span's tail it
 //!   holds, with nothing to lock. With the region spent it refills under the class's lock: the
-//!   blocks returned to the class's spans with blocks to hand out become its list (a span's
-//!   worth, from a few spans at most), and such a span's tail its region; else an empty span,
+//!   blocks returned to the class's spans with blocks to hand out become its list (64 KiB's
+//!   worth, from 16 spans at most), and such a span's tail its region; else an empty span,
 //!   from the pool or a new segment, becomes its region;
 //! - a free that finds the thread's list at its cap returns the colder half of the list to the
 //!   blocks' spans (each found by masking the block's address), a few dozen runs of one span's
@@ -31,7 +31,15 @@
 //!   their memory returned to the OS and their ranges kept for reuse.
 //!
 //! A segment's first span holds the segment's span headers (64 bytes a span), so a span's memory
-//! can go back to the OS whole; the rest of that first span is never touched.
+//! can go back to the OS whole.
+//!
+//! On Linux each segment is advised for transparent huge pages (as the collector advises its
+//! chunks once its heap is large enough): size classes put the blocks a program makes together
+//! (a compiled chunk's `Vec`s of ops, names and caches, adjacent in glibc's heap) on as many
+//! pages as they have classes, and with base pages the L1 data TLB missed twice as often as
+//! with glibc on Vue's passes (+10% cycles on an A725 core); one huge page a segment maps all
+//! its spans with one TLB entry. A huge page makes its whole segment resident, which spans of
+//! `SPAN` (16 KiB) keep small: a class with a few blocks holds one 16 KiB span, not 64 KiB.
 //!
 //! Threads: a block freed on another thread than the one it was allocated on joins the freeing
 //! thread's list, and goes back to its span at that thread's overflow, trim or exit; spans are
@@ -72,17 +80,17 @@ const fn class_caps() -> [usize; NUM_CLASSES] {
 const CLASS_CAPS: [usize; NUM_CLASSES] = class_caps();
 
 /// The size and alignment of a span, the blocks of one class.
-const SPAN: usize = 64 * 1024;
-/// The size and alignment of a segment, the spans mapped from the OS together. Its first span
-/// holds the headers of its spans.
+const SPAN: usize = 16 * 1024;
+/// The size and alignment of a segment, the spans mapped from the OS together (one huge page).
+/// Its first span holds the headers of its spans.
 const SEGMENT: usize = 2 * 1024 * 1024;
 /// A refill gathers the blocks returned to its class's spans until it holds this many bytes'
 /// worth, from `REFILL_SPANS` spans at most.
-const REFILL_BYTES: usize = SPAN;
+const REFILL_BYTES: usize = 64 * 1024;
 const REFILL_SPANS: usize = 16;
-/// The empty spans the pool keeps committed between trims: the oldest beyond go back to the OS
-/// at once.
-const POOL_COMMITTED: usize = 64;
+/// The empty spans the pool keeps committed between trims (4 MiB): the oldest beyond go back to
+/// the OS at once.
+const POOL_COMMITTED: usize = (4 << 20) / SPAN;
 /// The runs of one span's blocks gathered outside the class's lock and spliced under it at a
 /// time, when blocks go back to their spans.
 const RUNS: usize = 32;
@@ -129,7 +137,8 @@ struct Span {
     tail_zero: bool,
 }
 
-const _: () = assert!(std::mem::size_of::<Span>() == 64 && SPAN / 64 * 64 == SPAN);
+// The headers fit in a segment's first span.
+const _: () = assert!(std::mem::size_of::<Span>() == 64 && SEGMENT / SPAN * 64 <= SPAN);
 
 /// The header of the span holding the address `at`.
 #[inline]
@@ -306,10 +315,20 @@ mod segments {
     use crate::gc_core::os_pages;
     pub(super) use os_pages::{decommit, recommit, DECOMMIT_ZEROES};
 
-    /// A new segment: `SEGMENT` zeroed bytes at a `SEGMENT` boundary; null when the system
-    /// refuses. Linux places a mapping of a huge page's size at a huge page's boundary, so the
-    /// plain mapping usually serves; else the aligned mapping maps twice the size for a moment.
+    /// A new segment: `SEGMENT` zeroed bytes at a `SEGMENT` boundary, on Linux advised for
+    /// transparent huge pages (see the module docs); null when the system refuses.
     pub(super) fn map() -> *mut u8 {
+        let ptr = map_aligned();
+        #[cfg(target_os = "linux")]
+        if !ptr.is_null() {
+            os_pages::advise_huge_pages(ptr, SEGMENT);
+        }
+        ptr
+    }
+
+    /// Linux places a mapping of a huge page's size at a huge page's boundary, so the plain
+    /// mapping usually serves; else the aligned mapping maps twice the size for a moment.
+    fn map_aligned() -> *mut u8 {
         let ptr = os_pages::map(SEGMENT);
         if ptr.is_null() || (ptr as usize).is_multiple_of(SEGMENT) {
             return ptr;
@@ -502,9 +521,10 @@ fn alloc_miss(class: usize) -> (*mut u8, bool) {
 }
 
 /// Refill the thread's empty list and spent region of `class`, under the class's lock: the blocks
-/// returned to the class's spans with blocks to hand out, a span's worth from `REFILL_SPANS`
-/// spans at most, become the list, and one such span's tail the region; with none, an empty span
-/// (the pool's or a new segment's) becomes the region whole. False when the OS refuses memory.
+/// returned to the class's spans with blocks to hand out, `REFILL_BYTES`' worth from
+/// `REFILL_SPANS` spans at most, become the list, and one such span's tail the region; with none,
+/// an empty span (the pool's or a new segment's) becomes the region whole. False when the OS
+/// refuses memory.
 fn refill(cache: &Cache, class: usize) -> bool {
     let size = class_size(class);
     let spans = &CLASSES[class];

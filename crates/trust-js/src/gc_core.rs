@@ -483,7 +483,7 @@ pub(crate) mod os_pages {
     /// Ask the system to back `ptr..ptr + len`, mapped here, with transparent huge pages. A system
     /// without them refuses, which changes nothing.
     #[cfg(target_os = "linux")]
-    pub(super) fn advise_huge_pages(ptr: *mut u8, len: usize) {
+    pub(crate) fn advise_huge_pages(ptr: *mut u8, len: usize) {
         // SAFETY: advice only: no contents change.
         unsafe { madvise(ptr, len, MADV_HUGEPAGE) };
     }

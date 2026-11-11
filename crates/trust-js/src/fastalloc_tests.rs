@@ -443,14 +443,16 @@ fn a_refill_gathers_a_span_worth_from_a_few_spans_at_most() {
     let _serial = serial();
     let class = 9;
     let (size, n) = (class_size(class), per_span(class));
-    // Two spans with 300 blocks returned to each, then 20 with 8 each (all allocated first: the
+    // Six spans with 90 blocks returned to each, then 20 with 4 each (all allocated first: the
     // thread's frees join its list, which its allocations would take). The thread's exit drain
     // gives its list back last freed first, and each span joins its class's list first: the
-    // 300-block spans come first.
+    // 90-block spans come first.
+    assert!(n >= 90 && 4 * 90 * size < REFILL_BYTES && 5 * 90 * size >= REFILL_BYTES);
+    assert!((90 + 15 * 4) * size < REFILL_BYTES && REFILL_SPANS == 16);
     let kept: Vec<usize> = on_thread(|| {
-        let blocks: Vec<_> = (0..22 * n).map(|_| alloc(size)).collect();
+        let blocks: Vec<_> = (0..26 * n).map(|_| alloc(size)).collect();
         let mut kept = Vec::new();
-        for (s, returned) in [300, 300].into_iter().chain([8; 20]).enumerate() {
+        for (s, returned) in [90; 6].into_iter().chain([4; 20]).enumerate() {
             assert_eq!(view(blocks[s * n]).base, blocks[s * n]);
             for (k, &b) in blocks[s * n..(s + 1) * n].iter().enumerate() {
                 if k < returned {
@@ -462,7 +464,7 @@ fn a_refill_gathers_a_span_worth_from_a_few_spans_at_most() {
         }
         kept
     });
-    assert_eq!(class_spans(class).len(), 22);
+    assert_eq!(class_spans(class).len(), 26);
     let refills = on_thread(|| {
         let mut taken = Vec::new();
         let mut refills = Vec::new();
@@ -476,9 +478,9 @@ fn a_refill_gathers_a_span_worth_from_a_few_spans_at_most() {
         taken.into_iter().for_each(|b| free(b, size));
         refills
     });
-    // 300 * 160 bytes falls short of a span's worth, 600 does not; 16 spans of 8 blocks is as
-    // far as a refill goes.
-    assert_eq!(refills, [(600, 20), (128, 4)]);
+    // Four 90-block spans fall short of REFILL_BYTES' worth, five do not; then a 90-block span
+    // and 15 4-block spans: 16 spans is as far as a refill goes.
+    assert_eq!(refills, [(450, 21), (150, 5)]);
     on_thread(move || kept.into_iter().for_each(|b| free(b, size)));
     audit();
 }
@@ -488,7 +490,7 @@ fn an_overflow_gives_the_colder_half_back() {
     let _serial = serial();
     let class = 63;
     let (size, cap, n) = (class_size(class), CLASS_CAPS[class], per_span(class));
-    assert_eq!((cap, n), (256, 64));
+    assert_eq!((cap, n), (256, 16));
     on_thread(|| {
         let blocks: Vec<_> = (0..300).map(|_| alloc(size)).collect();
         for &b in &blocks[..cap] {
@@ -497,11 +499,11 @@ fn an_overflow_gives_the_colder_half_back() {
         assert_eq!(thread_list(class).len(), cap);
         free(blocks[cap], size);
         // The hotter half stays, last freed first, with the block freed; the colder half (the
-        // first 128 freed: two whole spans) went back, and those spans to the pool.
+        // first 128 freed: eight whole spans) went back, and those spans to the pool.
         let expected: Vec<_> = blocks[cap / 2..=cap].iter().rev().copied().collect();
         assert_eq!(thread_list(class), expected);
-        assert!(pooled(blocks[0]) && pooled(blocks[n]));
-        for k in 2..4 {
+        assert!((0..cap / 2 / n).all(|k| pooled(blocks[k * n])));
+        for k in cap / 2 / n..cap / n {
             let v = view(blocks[k * n]);
             assert_eq!((v.place, v.out as usize, v.returned), (Place::Out, n, 0));
         }
@@ -510,25 +512,26 @@ fn an_overflow_gives_the_colder_half_back() {
         }
     });
     on_thread(|| {
-        // A list of blocks of four spans in turn: its colder half is 128 runs of one block,
+        // A list of blocks of 16 spans in turn: its colder half is 128 runs of one block,
         // spliced 32 at a time.
-        let more: Vec<_> = (0..6 * n).map(|_| alloc(size)).collect();
-        let spans: Vec<_> = (0..6).map(|s| view(more[s * n]).base).collect();
-        assert!((0..6).all(|s| spans[s] == more[s * n]));
+        let turn = cap / n;
+        let more: Vec<_> = (0..(turn + 2) * n).map(|_| alloc(size)).collect();
+        let spans: Vec<_> = (0..turn + 2).map(|s| view(more[s * n]).base).collect();
+        assert!((0..turn + 2).all(|s| spans[s] == more[s * n]));
         for k in 0..n {
-            for s in 0..4 {
+            for s in 0..turn {
                 free(more[s * n + k], size);
             }
         }
-        free(more[4 * n], size);
-        for &s in &spans[..4] {
+        free(more[turn * n], size);
+        for &s in &spans[..turn] {
             let v = view(s);
             assert_eq!(
                 (v.place, v.out as usize, v.returned as usize),
                 (Place::Partial, n - n / 2, n / 2)
             );
         }
-        for &b in &more[4 * n + 1..] {
+        for &b in &more[turn * n + 1..] {
             free(b, size);
         }
     });
@@ -638,7 +641,7 @@ fn blocks_freed_on_another_thread_go_back_to_their_spans() {
         blocks[..257].iter().for_each(|&b| free(b, size));
         assert_eq!(thread_list(class).len(), 129);
         assert!(pooled(blocks[0]) && pooled(blocks[64]));
-        assert_eq!(view(blocks[128]).out, 64);
+        assert_eq!(view(blocks[128]).out as usize, per_span(class));
         blocks[257..].iter().for_each(|&b| free(b, size));
     });
     audit();
