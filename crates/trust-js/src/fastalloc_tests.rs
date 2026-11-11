@@ -1663,3 +1663,129 @@ fn past_the_bound_used_segments_keep_their_empty_spans_where_huge_pages_back_the
     });
     audit();
 }
+
+/// The loader tells the process's end: ntdll exports `RtlDllShutdownInProgress`, FALSE while the
+/// process runs.
+#[cfg(windows)]
+#[test]
+fn the_loader_tells_whether_the_process_is_ending() {
+    assert_ne!(
+        ending::resolve(),
+        ending::ABSENT,
+        "ntdll exports no RtlDllShutdownInProgress"
+    );
+    assert!(!ending::process_is_shutting_down());
+}
+
+/// A thread-local whose destructor runs after the thread's exit drain's (registered first): at
+/// Windows' process end it writes whether the loader says the process is ending (through
+/// WriteFile: nothing allocated), and frees and allocates a block of `EXIT_CLASS` through the
+/// thread's list, which the skipped drain left as it was.
+#[cfg(windows)]
+struct AfterTheDrain;
+
+#[cfg(windows)]
+const EXIT_CLASS: usize = 4;
+
+#[cfg(windows)]
+impl Drop for AfterTheDrain {
+    fn drop(&mut self) {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetStdHandle(handle: u32) -> *mut std::ffi::c_void;
+            fn WriteFile(
+                file: *mut std::ffi::c_void,
+                buffer: *const u8,
+                len: u32,
+                written: *mut u32,
+                overlapped: *mut std::ffi::c_void,
+            ) -> i32;
+        }
+        let ending = ending::process_is_shutting_down();
+        let p = alloc(class_size(EXIT_CLASS));
+        free(p, class_size(EXIT_CLASS));
+        let line: &[u8] = if ending {
+            b"[after the drain] shutting down: 1\n"
+        } else {
+            b"[after the drain] shutting down: 0\n"
+        };
+        let mut written = 0;
+        const STD_ERROR_HANDLE: u32 = -12i32 as u32;
+        // SAFETY: the process's standard error, a buffer of `len` bytes.
+        unsafe {
+            WriteFile(
+                GetStdHandle(STD_ERROR_HANDLE),
+                line.as_ptr(),
+                line.len() as u32,
+                &mut written,
+                std::ptr::null_mut(),
+            )
+        };
+    }
+}
+
+#[cfg(windows)]
+thread_local! {
+    static AFTER_THE_DRAIN: AfterTheDrain = const { AfterTheDrain };
+}
+
+/// Windows' ExitProcess ends the other threads wherever they are, a lock held held for good, and
+/// then runs the exiting thread's thread-local destructors: its drain must not wait for the lock.
+/// A child process (this test binary, running this test alone) lets a thread take the pool's lock
+/// and the lock of the class the exiting thread's list holds, and exits; the loader says the
+/// process is ending in the destructors that run after the drain's, and the thread's list still
+/// serves it there.
+#[cfg(windows)]
+#[test]
+fn a_process_exit_while_another_thread_holds_a_lock_ends() {
+    use std::io::Read;
+    use std::time::Instant;
+    const CHILD: &str = "TRUST_JS_FASTALLOC_EXIT_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // Registered before the exit drain, its destructor runs after the drain's.
+        AFTER_THE_DRAIN.with(|_| ());
+        free(alloc(class_size(EXIT_CLASS)), class_size(EXIT_CLASS));
+        let (locked_tx, locked) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _class = CLASSES[EXIT_CLASS].lock.lock();
+            let _pool = POOL.lock.lock();
+            locked_tx.send(()).unwrap();
+            loop {
+                std::thread::park();
+            }
+        });
+        locked.recv().unwrap();
+        std::process::exit(7);
+    }
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "fastalloc::tests::a_process_exit_while_another_thread_holds_a_lock_ends",
+            "--exact",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if start.elapsed() > Duration::from_secs(60) {
+            let _ = child.kill();
+            panic!("the child process hung at its exit");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert_eq!(status.code(), Some(7), "{err}");
+    assert!(err.contains("[after the drain] shutting down: 1"), "{err}");
+}

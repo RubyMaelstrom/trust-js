@@ -56,7 +56,9 @@
 //! thread's list, and goes back to its span at that thread's overflow, trim or exit; spans are
 //! global, under their class's lock. A thread's exit (`ExitDrain`) returns its lists and regions
 //! to their spans; after that its frees go back to their spans at once and its allocations take
-//! one block at a time from them.
+//! one block at a time from them. (Windows ends a process by ending its other threads wherever
+//! they are, a lock they held held for good, and then runs the exiting thread's destructors: see
+//! `ending`.)
 //!
 //! The allocator never allocates: its lists and span headers are intrusive, its memory is mapped
 //! directly, and its locks never allocate (std's mutex where it is a futex or an SRW lock;
@@ -800,10 +802,93 @@ struct ExitDrain;
 
 impl Drop for ExitDrain {
     fn drop(&mut self) {
+        // The process is ending (see `ending`): the thread's lists and regions stay as they are and
+        // serve it until the end.
+        #[cfg(windows)]
+        if ending::process_is_shutting_down() {
+            return;
+        }
         let _ = CACHE.try_with(|cache| {
             cache.exited.set(true);
             drain(cache);
         });
+    }
+}
+
+/// Windows ends a process (ExitProcess) by ending its other threads wherever they are, one
+/// perhaps holding a class's lock or the pool's (`take_span` holds it across VirtualAlloc), and
+/// then runs the exiting thread's thread-local destructors (std's FLS callback), where a drain
+/// would wait for that lock for good. They run in the loader's shutdown, which ExitProcess begins
+/// once the other threads are ended (LdrShutdownProcess: `RtlDllShutdownInProgress` is TRUE from
+/// then on), on both ways out of a process: the return from `main` (the CRT's `exit`, then
+/// ExitProcess) and `std::process::exit` (ExitProcess at once). So a thread's exit drain returns
+/// at once while the loader says the process is shutting down, as libpas's thread-local cache's
+/// destructor does (pas_thread_local_cache.c, `destructor`; pas_process.c,
+/// `pas_process_is_shutting_down`), and the thread's lists and regions keep serving it until the
+/// end. Elsewhere a process's end leaves its threads running until it is over, and their locks
+/// are released as ever.
+#[cfg(windows)]
+mod ending {
+    use std::ffi::c_void;
+    use std::ptr::null_mut;
+    use std::sync::atomic::{AtomicPtr, Ordering};
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn GetModuleHandleW(name: *const u16) -> *mut c_void;
+        fn GetProcAddress(module: *mut c_void, name: *const u8) -> *mut c_void;
+    }
+
+    const fn wide<const N: usize>(text: &[u8; N]) -> [u16; N] {
+        let mut wide = [0; N];
+        let mut k = 0;
+        while k < N {
+            wide[k] = text[k] as u16;
+            k += 1;
+        }
+        wide
+    }
+
+    const NTDLL: [u16; 10] = wide(b"ntdll.dll\0");
+
+    /// ntdll's `RtlDllShutdownInProgress`, resolved once: null until then, `ABSENT` where ntdll
+    /// does not export it (the process's end is then not told, as in libpas).
+    static SHUTDOWN_IN_PROGRESS: AtomicPtr<c_void> = AtomicPtr::new(null_mut());
+    pub(super) const ABSENT: *mut c_void = std::ptr::without_provenance_mut(1);
+
+    /// Resolve `RtlDllShutdownInProgress`: at the first thread's registration, so that the loader
+    /// is not asked while the process ends.
+    pub(super) fn resolve() -> *mut c_void {
+        let resolved = SHUTDOWN_IN_PROGRESS.load(Ordering::Relaxed);
+        if !resolved.is_null() {
+            return resolved;
+        }
+        // SAFETY: a NUL-terminated module name, and a NUL-terminated export name of a module
+        // that stays loaded.
+        let function = unsafe {
+            let ntdll = GetModuleHandleW(NTDLL.as_ptr());
+            if ntdll.is_null() {
+                null_mut()
+            } else {
+                GetProcAddress(ntdll, c"RtlDllShutdownInProgress".as_ptr().cast())
+            }
+        };
+        let resolved = if function.is_null() { ABSENT } else { function };
+        SHUTDOWN_IN_PROGRESS.store(resolved, Ordering::Relaxed);
+        resolved
+    }
+
+    /// Whether the process is ending: ExitProcess's loader shutdown has begun.
+    pub(super) fn process_is_shutting_down() -> bool {
+        let resolved = resolve();
+        if resolved == ABSENT {
+            return false;
+        }
+        // SAFETY: ntdll's `BOOLEAN NTAPI RtlDllShutdownInProgress(void)`.
+        unsafe {
+            let function: unsafe extern "system" fn() -> u8 = std::mem::transmute(resolved);
+            function() != 0
+        }
     }
 }
 
@@ -813,6 +898,8 @@ impl Drop for ExitDrain {
 #[inline(never)]
 fn register(cache: &Cache) -> bool {
     cache.registered.set(true);
+    #[cfg(windows)]
+    ending::resolve();
     if EXIT_DRAIN.try_with(|_| ()).is_ok() {
         return true;
     }
