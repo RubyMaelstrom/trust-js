@@ -80,30 +80,32 @@ use crate::jit::JitCode;
 use std::cell::Cell;
 use std::rc::Rc;
 
-/// Print a line of the tier's log (`eprintln!`), its time left out of the main-thread parts'
-/// timers ([`main_thread_timer`]): the log is the measurement's instrument, not the compile's
-/// work.
+/// Print a line of the tier's log (`eprintln!`), its whole time left out of the main-thread
+/// parts' timers ([`main_thread_timer`]): the evaluation of its arguments (a function's name, a
+/// compile's timing fields), their formatting and the printing (stage 2, step 16; step 12 left
+/// out the printing alone). The log is the measurement's instrument, not the compile's work.
 macro_rules! log_line {
-    ($($arg:tt)*) => {
-        print_log_line(format_args!($($arg)*))
-    };
+    ($($arg:tt)*) => {{
+        let started = std::time::Instant::now();
+        eprintln!($($arg)*);
+        logged_since(started);
+    }};
 }
 
 thread_local! {
-    /// The time this thread spent printing the tier's log ([`log_line!`]), which the main-thread
+    /// The time this thread spent on the tier's log lines ([`log_line!`]), which the main-thread
     /// parts' clock leaves out ([`work_clock`]).
     static LOGGED: Cell<std::time::Duration> = const { Cell::new(std::time::Duration::ZERO) };
 }
 
-fn print_log_line(line: std::fmt::Arguments<'_>) {
-    let started = std::time::Instant::now();
-    eprintln!("{line}");
+/// A log line that started at `started` ended now: its time is the log's ([`work_clock`]).
+fn logged_since(started: std::time::Instant) {
     LOGGED.with(|logged| logged.set(logged.get() + started.elapsed()));
 }
 
-/// The main-thread parts' clock: now, less the time this thread has spent printing the log, so
-/// that a part's time from [`main_thread_timer`] to [`log_main_thread`] leaves out the lines
-/// printed meanwhile.
+/// The main-thread parts' clock: now, less the time this thread has spent on the log's lines,
+/// so that a part's time from [`main_thread_timer`] to [`log_main_thread`] leaves out the lines
+/// made and printed meanwhile.
 fn work_clock() -> std::time::Instant {
     let now = std::time::Instant::now();
     now.checked_sub(LOGGED.with(Cell::get)).unwrap_or(now)
@@ -496,17 +498,22 @@ pub(crate) fn main_thread_timer() -> Option<std::time::Instant> {
 /// that makes the tier's chunk; `install`: the code's installation after `generate`; `fallback`:
 /// the template JIT's compile of a discarded code's fallback), timed from `started`
 /// ([`main_thread_timer`]): `[opt] main-thread <part> <name> in <ms> ms`. Nothing without a timer.
+/// The part ends before its line is made (stage 2, step 16: step 12's line formatted the
+/// function's name first, inside the part).
 pub(crate) fn log_main_thread(part: &str, chunk: &Chunk, started: Option<std::time::Instant>) {
     if let Some(started) = started {
-        log_line!(
-            "[opt] main-thread {part} {} in {:.3} ms",
-            name(chunk),
-            work_clock()
-                .saturating_duration_since(started)
-                .as_secs_f64()
-                * 1e3
-        );
+        let ms = part_ms(started);
+        log_line!("[opt] main-thread {part} {} in {ms:.3} ms", name(chunk));
     }
+}
+
+/// The milliseconds of a main-thread part that started at `started` ([`main_thread_timer`]) and
+/// ends now, the log's lines left out ([`work_clock`]).
+fn part_ms(started: std::time::Instant) -> f64 {
+    work_clock()
+        .saturating_duration_since(started)
+        .as_secs_f64()
+        * 1e3
 }
 
 /// A timer for the template JIT's compile of `chunk` that starts now (`jit::compile_profiled`)
@@ -1965,4 +1972,48 @@ pub(crate) fn release_retired(i: &mut Interp) {
     let running = crate::jit::running_code();
     i.opt_retired
         .retain(|code| running.contains(&(code.mem_ptr() as usize)));
+}
+
+#[cfg(test)]
+mod log_tests {
+    use super::*;
+    use std::time::Duration;
+
+    /// A value whose formatting takes its duration (a function's name stands in).
+    struct Slow(Duration);
+
+    impl std::fmt::Display for Slow {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            std::thread::sleep(self.0);
+            f.write_str("slow")
+        }
+    }
+
+    /// The main-thread parts time the engine's work (stage 2, step 16): a log line's argument
+    /// evaluation, formatting and printing are left out of a part's clock, and a part ends
+    /// before its own line is made.
+    #[test]
+    fn a_log_lines_making_and_printing_are_left_out_of_the_main_thread_parts() {
+        let line = Duration::from_millis(40);
+        let work = Duration::from_millis(5);
+        let started = work_clock();
+        // The part's own work.
+        let begun = std::time::Instant::now();
+        while begun.elapsed() < work {
+            std::hint::spin_loop();
+        }
+        // Lines made meanwhile: an argument slow to evaluate, one slow to format.
+        log_line!("[opt-test] {}", {
+            std::thread::sleep(line);
+            "an argument"
+        });
+        log_line!("[opt-test] {}", Slow(line));
+        let ms = part_ms(started);
+        assert!(
+            ms >= work.as_secs_f64() * 1e3 && ms < line.as_secs_f64() * 1e3,
+            "the part reads its own {:?} of work, not the lines' {:?}: {ms:.3} ms",
+            work,
+            line * 2
+        );
+    }
 }
