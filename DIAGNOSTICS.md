@@ -119,7 +119,9 @@ comment/example in the same change.
   panic at a failure (Maglev, SpiderMonkey and JSC verify their graphs in debug builds only).
   The tier compiles off the main thread: at a checkpoint the main thread takes the snapshot and
   the chunk's frozen view, and the process's compile thread (`trust-js-opt`, started at the first
-  compile) builds, allocates registers, emits and maps the code; the next poll of generated code
+  compile) builds, allocates registers, emits and maps the code, making any process-wide shared
+  stub the code calls that is still missing (under the stub table's lock, as the main thread
+  makes one); the next poll of generated code
   after it finished installs it (a function's second stage is published then: until then the
   function runs the code it has). The install drops a result whose realm no longer runs, whose
   exit profile a discard changed, whose function was collected or whose chunk was superseded or
@@ -161,16 +163,15 @@ comment/example in the same change.
   compile's) end with where its time was spent: `on the main thread` or `on the compile
   thread` (`on a scoped thread` in the tests' TRUST_JS_OPT_SCOPED_COMPILE check), `queued <ms>
   ms` (its wait in the compile thread's queue), `installed <ms> ms after its snapshot` and, for
-  a job that ran again after the main thread made the stubs or atoms it lacked, `, <n> runs, <ms>
-  ms before the last` (the compile thread's time of the runs before the last); a
+  a compile whose snapshot of the shared stubs lacked some, `, met <n> missing stubs, made <m>`
+  (it looked them up again in the stub table and made those still missing, in its one run); a
   dropped result prints `[opt] dropped <name>: <reason> (compiled in <ms> ms on the compile
   thread, ...)`. The parts of a tier compile that run on the main thread besides the compile
   line's own time each print `[opt] main-thread <part> <name> in <ms> ms`: `recompile`, the
   bytecode recompile that makes the tier's chunk (its second stage, or a stale chain's
   recompile; none for a function with nothing to splice, whose own chunk the tier compiles);
   `snapshot`, the snapshot, the chunk's frozen view and the job's hand-off to the
-  compile thread; `stubs`, the process stubs
-  and atoms a compile found missing, made for its next run; `install`, the code's link and
+  compile thread; `install`, the code's link and
   installation after its compile; `fallback`, the template JIT's compile of a discarded code's
   fallback, at the discard or, deferred there for executable capacity, at a later entry. Each
   part's time leaves out the log's own printing. The main thread's share of the tier's compiles
