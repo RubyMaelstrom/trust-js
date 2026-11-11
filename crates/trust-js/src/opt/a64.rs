@@ -570,6 +570,16 @@ enum Cold {
         dst: u32,
         resume: usize,
     },
+    /// TruncateNumberOrOddball's NaN case, the word in `word`: the canonical NaN, undefined and
+    /// null give 0 and a Boolean its bit, into `dst`; any other word (a String, a Symbol, a
+    /// BigInt, an object) takes `exit`.
+    NumberOrOddball {
+        label: usize,
+        word: u32,
+        dst: u32,
+        exit: usize,
+        resume: usize,
+    },
     /// A poll's slow path.
     Poll {
         label: usize,
@@ -958,7 +968,7 @@ unsafe extern "C" fn remember_element(words: u64, index: u64) {
 /// The exit reason a check reports when its node names none.
 fn default_reason(op: &NodeOp) -> ExitReason {
     match op {
-        NodeOp::CheckNumber => ExitReason::NotNumber,
+        NodeOp::CheckNumber | NodeOp::TruncateNumberOrOddball => ExitReason::NotNumber,
         NodeOp::CheckInt32 => ExitReason::NotInt32,
         NodeOp::CheckObject => ExitReason::NotObject,
         NodeOp::CheckShape(_) => ExitReason::WrongShape,
@@ -1183,6 +1193,34 @@ impl Gen<'_> {
     /// Whether to use FJCVTZS (ToInt32 itself, FEAT_JSCVT).
     fn jscvt(&self) -> bool {
         self.switches.jscvt && !self.options.no_jscvt
+    }
+
+    /// ToInt32 of the f64 in `d` into the w register `w` (TruncateToInt32's code, and
+    /// TruncateNumberOrOddball's for a Number).
+    fn truncate(&mut self, d: u32, w: u32) {
+        if self.jscvt() {
+            // ToInt32 itself (FEAT_JSCVT), as V8's TruncateDoubleToI uses it.
+            self.a.fjcvtzs_w_d(w, d);
+        } else {
+            // Below 2^63 the conversion to 64 bits is exact and its low word is ToInt32 (NaN
+            // converts to 0). INT64_MIN and INT64_MAX mean it saturated, which subtracting or
+            // adding 1 detects as signed overflow (V8's TryConvertDoubleToInt64); the cold path
+            // computes the low word then.
+            let saturated = self.a.new_label();
+            let resume = self.a.new_label();
+            self.a.fcvtzs_x_d(w, d);
+            self.a.cmp_imm_x(w, 1);
+            self.a.ccmn_imm_x(w, 1, 0b0001, VC);
+            self.a.b_cond(VS, saturated);
+            self.a.mov_w(w, w);
+            self.a.bind(resume);
+            self.cold.push(Cold::Truncate {
+                label: saturated,
+                d,
+                dst: w,
+                resume,
+            });
+        }
     }
 
     fn gp_dst(&self, n: NodeIx) -> u32 {
@@ -1516,31 +1554,31 @@ impl Gen<'_> {
                 if !unused {
                     let d = self.fp(input(0), D31);
                     let w = self.gp_dst(n);
-                    if self.jscvt() {
-                        // ToInt32 itself (FEAT_JSCVT), as V8's TruncateDoubleToI uses it.
-                        self.a.fjcvtzs_w_d(w, d);
-                    } else {
-                        // Below 2^63 the conversion to 64 bits is exact and its low word is
-                        // ToInt32 (NaN converts to 0). INT64_MIN and INT64_MAX mean it saturated,
-                        // which subtracting or adding 1 detects as signed overflow (V8's
-                        // TryConvertDoubleToInt64); the cold path computes the low word then.
-                        let saturated = self.a.new_label();
-                        let resume = self.a.new_label();
-                        self.a.fcvtzs_x_d(w, d);
-                        self.a.cmp_imm_x(w, 1);
-                        self.a.ccmn_imm_x(w, 1, 0b0001, VC);
-                        self.a.b_cond(VS, saturated);
-                        self.a.mov_w(w, w);
-                        self.a.bind(resume);
-                        self.cold.push(Cold::Truncate {
-                            label: saturated,
-                            d,
-                            dst: w,
-                            resume,
-                        });
-                    }
+                    self.truncate(d, w);
                     self.gp_done(n, w);
                 }
+            }
+            NodeOp::TruncateNumberOrOddball => {
+                let site = self.check_exit(n)?;
+                let word = self.gp(input(0), X16);
+                let w = self.gp_dst(n);
+                let nan = self.a.new_label();
+                let resume = self.a.new_label();
+                // A Number's word is its f64 (CheckNumber's test); every NaN goes out of line,
+                // where the canonical one, undefined, null and the Booleans convert.
+                self.a.fmov_d_x(D31, word);
+                self.a.fcmp(D31, D31);
+                self.a.b_cond(VS, nan);
+                self.truncate(D31, w);
+                self.a.bind(resume);
+                self.cold.push(Cold::NumberOrOddball {
+                    label: nan,
+                    word,
+                    dst: w,
+                    exit: site,
+                    resume,
+                });
+                self.gp_done(n, w);
             }
             NodeOp::F64ToTagged => {
                 if !unused {
@@ -2344,6 +2382,36 @@ impl Gen<'_> {
                     self.a.b(resume);
                     self.a.bind(zero);
                     self.a.mov_w(dst, 31);
+                    self.a.b(resume);
+                }
+                Cold::NumberOrOddball {
+                    label,
+                    word,
+                    dst,
+                    exit,
+                    resume,
+                } => {
+                    use crate::value::{PACK_BOOL, PACK_CANON_NAN, PACK_NULL, PACK_UNDEFINED};
+                    let boolean = self.a.new_label();
+                    let zero = self.a.new_label();
+                    self.a.bind(label);
+                    // A Boolean's word less its tag is its bit (CheckBoolean's test).
+                    self.a.movz(X17, (PACK_BOOL >> 48) as u32, 3);
+                    self.a.logic_x(2, X17, word, X17);
+                    self.a.cmp_imm_x(X17, 1);
+                    self.a.b_cond(LS, boolean);
+                    // Each of the others is one word: its tag over a zero payload.
+                    for oddball in [PACK_UNDEFINED, PACK_NULL, PACK_CANON_NAN] {
+                        self.a.movz(X17, (oddball >> 48) as u32, 3);
+                        self.a.cmp_reg_x(word, X17);
+                        self.a.b_cond(EQ, zero);
+                    }
+                    self.a.b(exit);
+                    self.a.bind(boolean);
+                    self.a.mov_w(dst, X17);
+                    self.a.b(resume);
+                    self.a.bind(zero);
+                    self.a.movz(dst, 0, 0);
                     self.a.b(resume);
                 }
                 Cold::Jump { label, target } => {

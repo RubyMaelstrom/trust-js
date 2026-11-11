@@ -487,6 +487,119 @@ fn truncation_is_to_int32_with_and_without_fjcvtzs() {
     }
 }
 
+/// `or(a, b)` (LoadLocal 0, LoadLocal 1, BitOr at pc 2, Return) on Numbers and oddballs: each
+/// word truncated by TruncateNumberOrOddball at the operation's pc, then I32Or, boxed.
+fn oddball_or() -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at_op = b.state(2, &[x, y], &[], &[]);
+    let int = |b: &mut Build, v| {
+        b.exiting(
+            entry,
+            NodeOp::TruncateNumberOrOddball,
+            &[v],
+            Rep::I32,
+            2,
+            at_op,
+            ExitReason::NotNumber,
+        )
+    };
+    let ix = int(&mut b, x);
+    let iy = int(&mut b, y);
+    let result = b.node(entry, NodeOp::I32Or, &[ix, iy], Rep::I32, 2);
+    let boxed = b.node(entry, NodeOp::I32ToTagged, &[result], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    b.g
+}
+
+#[test]
+fn oddballs_truncate_to_their_int32_and_other_words_exit() {
+    let two = |e: i32| 2f64.powi(e);
+    // Numbers as `truncation_is_to_int32_with_and_without_fjcvtzs` takes them, NaN among them.
+    let numbers = [
+        0.0,
+        -0.0,
+        1.9,
+        -1.9,
+        two(31),
+        -two(31) - 1.0,
+        two(32) + 1.5,
+        two(63) + two(11),
+        -two(83) - two(31),
+        1e300,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+        f64::NAN,
+    ];
+    for no_jscvt in [false, true] {
+        let mut engine = fixture("function or(a, b) { return a | b; } or(1, 2);");
+        let chunk = chunk_of(&mut engine, "or");
+        assert_eq!(chunk.jit_ops()[2], Op::BitOr, "{:?}", chunk.jit_ops());
+        let options = Options {
+            no_jscvt,
+            ..Options::default()
+        };
+        install(&mut engine, "or", &oddball_or(), options);
+        exits();
+        for x in numbers {
+            let source = js_number(x);
+            let int = crate::eval::to_int32(x);
+            let context = format!("{source} without FJCVTZS: {no_jscvt}");
+            for call in [
+                format!("or({source}, 0)"),
+                format!("or(undefined, {source})"),
+            ] {
+                assert_eq!(
+                    eval(&mut engine, &call),
+                    int.to_string(),
+                    "{call}: {context}"
+                );
+            }
+        }
+        // ToNumber of undefined is NaN, of null and false +0, of true 1 (ECMA-262 §7.1.4).
+        for (a, b, result) in [
+            ("undefined", "undefined", 0),
+            ("null", "6", 6),
+            ("true", "6", 7),
+            ("false", "true", 1),
+            ("true", "-2", -1),
+            ("-1.5", "null", -1),
+        ] {
+            let call = format!("or({a}, {b})");
+            assert_eq!(
+                eval(&mut engine, &call),
+                result.to_string(),
+                "{call} without FJCVTZS: {no_jscvt}"
+            );
+        }
+        assert!(exits().is_empty(), "Numbers and oddballs never exit");
+        // Every other word exits, its operation then the VM's (a Symbol's and a BigInt mixed
+        // with a Number throw a TypeError there).
+        for (call, result) in [
+            ("or('3', 4)", Some("7")),
+            ("or(1, {valueOf() { return 8; }})", Some("9")),
+            ("or(Symbol(), 0)", None),
+            ("or(2, 1n)", None),
+        ] {
+            let got = eval(&mut engine, call);
+            match result {
+                Some(result) => assert_eq!(got, result, "{call} without FJCVTZS: {no_jscvt}"),
+                None => assert!(
+                    got.starts_with("throw TypeError"),
+                    "{call}: {got} without FJCVTZS: {no_jscvt}"
+                ),
+            }
+            assert_eq!(
+                exits(),
+                vec![(2, ExitReason::NotNumber)],
+                "{call} without FJCVTZS: {no_jscvt}"
+            );
+        }
+    }
+}
+
 /// `getx(o)` (GetPropLocal 0 at pc 0, Return): the receiver's shape checked against its site's
 /// way, the field loaded where the way's location word says.
 fn getx(chunk: &Chunk) -> Graph {

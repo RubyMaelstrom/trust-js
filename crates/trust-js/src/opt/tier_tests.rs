@@ -249,6 +249,16 @@ const PROGRAMS: &[&str] = &[
      const b = vals[(k * 7) % vals.length]; \
      t = (t + imm(a, b)) | 0; u += fimm(k * 0.25 - 100); }\n\
      t + ':' + u",
+    // Bitwise operations on oddballs: a holey array's push/shift queue, whose hole's undefined
+    // reaches `| 0` (the calls benchmark's array-shift-queue-holey), and undefined, null and
+    // Booleans at every bitwise operator, a String reaching them late (their truncation exits).
+    "function queue(n) { const a = []; for (let k = 0; k < 40; k++) a.push(k); delete a[20]; \
+     let s = 0; for (let k = 0; k < n; k++) { a.push(k); s = (s + (a.shift() | 0)) | 0; } \
+     return s; }\n\
+     function bits(v, k) { return (v | 0) ^ ~v ^ (k >>> v) ^ (v << 2) ^ (v & k) ^ (v >> 1); }\n\
+     const vals = [undefined, null, true, false, 3, -2.5, 4294967296.5, NaN];\n\
+     let t = 0; for (let k = 0; k < 3000; k++) { t = (t + queue(k % 60)) | 0; \
+     t = (t + bits(k < 2800 ? vals[k % vals.length] : String(k % 7), k)) | 0; } t",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {

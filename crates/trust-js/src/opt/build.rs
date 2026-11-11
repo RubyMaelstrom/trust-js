@@ -70,6 +70,10 @@ mod names;
 
 const NUMBER: u32 = ValueClass::NumberInt32.bit() | ValueClass::NumberDouble.bit();
 const INT32: u32 = ValueClass::NumberInt32.bit();
+/// The primitives besides Numbers whose ToNumber reads nothing (NaN, 0, 0 and 1): V8's oddballs
+/// (BinaryOperationHint::kNumberOrOddball), JSC's non-cells but BigInts.
+const ODDBALL: u32 =
+    ValueClass::Undefined.bit() | ValueClass::Null.bit() | ValueClass::Boolean.bit();
 /// The most operations a chunk may have: compile_entry's limit (an operation's index fits one
 /// movz).
 const MAX_OPS: usize = 0xffff;
@@ -369,22 +373,16 @@ impl Rules<'_> {
         match self.ops[pc] {
             Op::Const(k) => const_word(self.chunk, k).is_some(),
             Op::LoadLocal(_) => self.initialized.contains(pc),
-            Op::Add
-            | Op::Sub
-            | Op::Mul
-            | Op::Div
-            | Op::Mod
-            | Op::BitAnd
-            | Op::BitOr
-            | Op::BitXor
-            | Op::Shl
-            | Op::Shr
-            | Op::UShr
-            | Op::Lt
-            | Op::Gt
-            | Op::Le
-            | Op::Ge => self.numbers(pc, true).is_some() && !flagged(&[ExitReason::NotNumber]),
-            Op::Neg | Op::Plus | Op::BitNot | Op::UpdateLocal(..) => {
+            Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Gt | Op::Le | Op::Ge => {
+                self.numbers(pc, true).is_some() && !flagged(&[ExitReason::NotNumber])
+            }
+            Op::BitAnd | Op::BitOr | Op::BitXor | Op::Shl | Op::Shr | Op::UShr => {
+                self.truncatable(pc, true).is_some() && !flagged(&[ExitReason::NotNumber])
+            }
+            Op::BitNot => {
+                self.truncatable(pc, false).is_some() && !flagged(&[ExitReason::NotNumber])
+            }
+            Op::Neg | Op::Plus | Op::UpdateLocal(..) => {
                 self.numbers(pc, false).is_some() && !flagged(&[ExitReason::NotNumber])
             }
             Op::GetProp(name, _) | Op::GetPropThis(name, _) | Op::GetPropLocal(_, name, _)
@@ -465,8 +463,9 @@ impl Rules<'_> {
         }
     }
 
-    /// The value record of an arithmetic, bitwise, relational, unary or update operation at
+    /// The value record of an arithmetic, relational, unary (Neg, Plus) or update operation at
     /// `pc` (`two`: both operands' roles), where it saw Numbers only: the operation's Number path.
+    /// A bitwise operation's is [`Rules::truncatable`].
     fn numbers(&self, pc: usize, two: bool) -> Option<ValuesView> {
         let values = self.snapshot.values(pc)?;
         let roles = if two {
@@ -475,6 +474,21 @@ impl Rules<'_> {
             values.operand0
         };
         (roles & !NUMBER == 0).then_some(values)
+    }
+
+    /// The value record of a bitwise operation at `pc` (`two`: both operands' roles), where it
+    /// saw Numbers and oddballs only (undefined, null, Booleans): its operands' ToInt32 in line,
+    /// as Maglev truncates kNumberOrOddball operands (BuildTruncatingInt32BinaryOperationNode-
+    /// ForToNumber, maglev-graph-builder.cc:1505-1564) and JSC's DFG a NotCellNorBigIntUse
+    /// (fixIntConvertingEdge, DFGFixupPhase.cpp:4948-4968).
+    fn truncatable(&self, pc: usize, two: bool) -> Option<ValuesView> {
+        let values = self.snapshot.values(pc)?;
+        let roles = if two {
+            values.operand0 | values.operand1
+        } else {
+            values.operand0
+        };
+        (roles & !(NUMBER | ODDBALL) == 0).then_some(values)
     }
 
     /// Whether the value the element store at `pc` takes may be a Number: not a constant that
@@ -509,6 +523,16 @@ impl Rules<'_> {
 /// f64 bits, every other kind a tag above the canonical NaN).
 fn number_word(word: u64) -> Option<f64> {
     (((word >> 48) as u16 & 0x7fff) < 0x7ff9).then(|| f64::from_bits(word))
+}
+
+/// ToInt32 of an oddball's word (ECMA-262 §7.1.4 ToNumber: undefined NaN, null +0, false +0,
+/// true 1), None for any other word.
+fn oddball_int32(word: u64) -> Option<i32> {
+    match word {
+        PACK_UNDEFINED | PACK_NULL => Some(0),
+        _ if word & !1 == PACK_BOOL => Some((word & 1) as i32),
+        _ => None,
+    }
 }
 
 /// `x` as an int32, when it is one exactly (not -0).
@@ -857,8 +881,9 @@ struct State {
     forms: FastMap<NodeIx, Forms>,
     /// ToBoolean of a value.
     truth: FastMap<NodeIx, NodeIx>,
-    /// ToInt32 of an f64 value (its TruncateToInt32), which is no form of it: forms hold one
-    /// value, and the truncation is another unless the f64 is an int32.
+    /// ToInt32 of an f64 value (its TruncateToInt32) or of a word (its TruncateNumberOrOddball),
+    /// which is no form of it: forms hold one value, and the truncation is another unless the
+    /// value is an int32.
     truncated: FastMap<NodeIx, NodeIx>,
     /// Heap facts of the current effect epoch: an object word's possible shapes...
     shapes: FastMap<NodeIx, Vec<u32>>,
@@ -1483,6 +1508,18 @@ impl<'a> Builder<'a> {
         }
     }
 
+    /// Whether a bitwise operation's ToInt32 can take `value` where its record saw oddballs: a
+    /// constant Number or oddball, an unboxed Number or Boolean, or a word it checks.
+    fn truncatable_operand(&self, value: NodeIx) -> bool {
+        match self.constant(value) {
+            Some(word) => number_word(word).is_some() || oddball_int32(word).is_some(),
+            None => matches!(
+                self.rep(value),
+                Rep::Tagged | Rep::F64 | Rep::I32 | Rep::Bool
+            ),
+        }
+    }
+
     /// Whether an int32 path can take `value` without an f64 that arithmetic made (whose int32
     /// test would fail where the arithmetic left the int32 range): a proven int32 or a word it
     /// checks.
@@ -1583,6 +1620,10 @@ impl<'a> Builder<'a> {
             let int = crate::eval::to_int32(number_word(word)?);
             return Some(self.hoist(Hoisted::I32(int)));
         }
+        // A word an oddball's operation truncated already: ToInt32 of it, as a check would give.
+        if let Some(&int) = st.truncated.get(&value) {
+            return Some(int);
+        }
         let number = match self.rep(value) {
             Rep::F64 => value,
             Rep::Tagged => self.number(st, cx, value)?,
@@ -1597,6 +1638,62 @@ impl<'a> Builder<'a> {
         let int = self.add(NodeOp::TruncateToInt32, &[number], Rep::I32, cx.pc);
         st.truncated.insert(number, int);
         Some(int)
+    }
+
+    /// ToInt32 of `value` for a bitwise operation whose record saw oddballs besides Numbers, as
+    /// Maglev's GetTruncatedInt32ForToNumber takes a kNumberOrOddball operand
+    /// (maglev-reducer-inl.h:1750-1826): a value proven a Number as `truncated_int32` gives it, an
+    /// oddball constant folded, and any other word (a Boolean's) truncated by
+    /// TruncateNumberOrOddball, which exits for a word that is neither; None for a value that is
+    /// never either.
+    fn truncated_oddball_int32(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        value: NodeIx,
+    ) -> Option<NodeIx> {
+        if self.known_number(st, value) {
+            return self.truncated_int32(st, cx, value);
+        }
+        if let Some(word) = self.constant(value) {
+            let int = oddball_int32(word)?;
+            return Some(self.hoist(Hoisted::I32(int)));
+        }
+        let word = match self.rep(value) {
+            Rep::Tagged => value,
+            Rep::Bool => self.tagged(st, value, cx.pc),
+            _ => return None,
+        };
+        if let Some(&int) = st.truncated.get(&word) {
+            return Some(int);
+        }
+        let state = self.before(cx, st);
+        let int = self.add_exit(
+            NodeOp::TruncateNumberOrOddball,
+            &[word],
+            Rep::I32,
+            cx.pc,
+            state,
+            ExitReason::NotNumber,
+        );
+        st.truncated.insert(word, int);
+        Some(int)
+    }
+
+    /// A bitwise operand's ToInt32: `truncated_oddball_int32` where the operation's record saw
+    /// oddballs, `truncated_int32` where it saw Numbers alone.
+    fn bitwise_operand(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        value: NodeIx,
+        oddballs: bool,
+    ) -> Option<NodeIx> {
+        if oddballs {
+            self.truncated_oddball_int32(st, cx, value)
+        } else {
+            self.truncated_int32(st, cx, value)
+        }
     }
 
     /// ToBoolean of `value`, as a Bool.
@@ -2549,16 +2646,26 @@ impl<'a> Builder<'a> {
     }
 
     /// The bitwise operators on their operands' ToInt32 (ECMA-262 §7.1.6), each a Number
-    /// truncated in line (Maglev's GetTruncatedInt32ForToNumber). `>>>` gives an int32 when its
-    /// count is a constant whose low five bits are not all zero, and otherwise its uint32 result
-    /// as an f64, as Maglev's Int32ShiftRightLogical gives a Uint32.
+    /// truncated in line (Maglev's GetTruncatedInt32ForToNumber), and where the record saw
+    /// undefined, null or Booleans too, each word by TruncateNumberOrOddball (Maglev's
+    /// kNumberOrOddball). `>>>` gives an int32 when its count is a constant whose low five bits
+    /// are not all zero, and otherwise its uint32 result as an f64, as Maglev's
+    /// Int32ShiftRightLogical gives a Uint32.
     fn bitwise(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
-        if self.rules().numbers(pc, true).is_none() {
+        let Some(values) = self.rules().truncatable(pc, true) else {
             return self.effect(pc, st);
-        }
+        };
+        let oddballs = (values.operand0 | values.operand1) & ODDBALL != 0;
         let len = st.stack.len();
         let (a, b) = (st.stack[len - 2], st.stack[len - 1]);
-        if !self.numeric(a) || !self.numeric(b) {
+        let takes = |builder: &Self, value| {
+            if oddballs {
+                builder.truncatable_operand(value)
+            } else {
+                builder.numeric(value)
+            }
+        };
+        if !takes(self, a) || !takes(self, b) {
             return self.mismatch(pc, ExitReason::NotNumber, st);
         }
         if self.declines_number(pc, st, &[a, b]) {
@@ -2566,8 +2673,8 @@ impl<'a> Builder<'a> {
         }
         let mut cx = Before::new(pc);
         let (Some(x), Some(y)) = (
-            self.truncated_int32(st, &mut cx, a),
-            self.truncated_int32(st, &mut cx, b),
+            self.bitwise_operand(st, &mut cx, a, oddballs),
+            self.bitwise_operand(st, &mut cx, b, oddballs),
         ) else {
             return Err(Refusal::at(pc, "a Number operand without its ToInt32"));
         };
@@ -2600,14 +2707,27 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// Neg, Plus (ToNumber) and BitNot on Numbers.
+    /// Neg, Plus (ToNumber) and BitNot on Numbers, BitNot on oddballs too as `bitwise` takes
+    /// them.
     fn unary(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
-        if self.rules().numbers(pc, false).is_none() {
+        let rules = self.rules();
+        let values = if op == Op::BitNot {
+            rules.truncatable(pc, false)
+        } else {
+            rules.numbers(pc, false)
+        };
+        let Some(values) = values else {
             return self.effect(pc, st);
-        }
+        };
+        let oddballs = op == Op::BitNot && values.operand0 & ODDBALL != 0;
         let len = st.stack.len();
         let value = st.stack[len - 1];
-        if !self.numeric(value) {
+        let takes = if oddballs {
+            self.truncatable_operand(value)
+        } else {
+            self.numeric(value)
+        };
+        if !takes {
             return self.mismatch(pc, ExitReason::NotNumber, st);
         }
         if self.declines_number(pc, st, &[value]) {
@@ -2616,7 +2736,7 @@ impl<'a> Builder<'a> {
         let mut cx = Before::new(pc);
         let result = match op {
             Op::BitNot => {
-                let Some(x) = self.truncated_int32(st, &mut cx, value) else {
+                let Some(x) = self.bitwise_operand(st, &mut cx, value, oddballs) else {
                     return Err(Refusal::at(pc, "a Number operand without its ToInt32"));
                 };
                 self.add(NodeOp::I32Not, &[x], Rep::I32, pc)

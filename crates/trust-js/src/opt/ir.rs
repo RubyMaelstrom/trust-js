@@ -289,6 +289,11 @@ pub(crate) enum NodeOp {
     CheckNumber,
     /// F64 -> I32: an exact int32 and not -0.
     CheckInt32,
+    /// Tagged -> I32: ECMAScript ToInt32 (§7.1.6) of a Number, undefined, null or a Boolean
+    /// (ToNumber gives NaN, 0, 0 and 1 for the last three), exiting NotNumber for any other
+    /// word: a bitwise operand whose record saw those oddballs besides Numbers (Maglev's
+    /// TruncateCheckedNumberOrOddballToInt32, JSC's ValueToInt32 of a NotCellNorBigIntUse).
+    TruncateNumberOrOddball,
     /// Tagged -> Cell.
     CheckObject,
     /// Tagged -> Cell: an object whose shape is one of these (at most four).
@@ -582,6 +587,7 @@ impl NodeOp {
             self,
             NodeOp::CheckNumber
                 | NodeOp::CheckInt32
+                | NodeOp::TruncateNumberOrOddball
                 | NodeOp::CheckObject
                 | NodeOp::CheckShape(_)
                 | NodeOp::CheckBoolean

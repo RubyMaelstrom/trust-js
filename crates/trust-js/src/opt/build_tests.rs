@@ -331,6 +331,90 @@ fn bitwise_operators_truncate_their_operands_and_an_unsigned_shift_by_zero_is_an
 }
 
 #[test]
+fn bitwise_operations_whose_records_saw_oddballs_truncate_them_in_line() {
+    // A holey array's read gives undefined (`a.shift() | 0` past a hole), a flag null or a
+    // Boolean: as V8's kNumberOrOddball and JSC's NotCellNorBigIntUse, the operation stays
+    // int32, each word truncated by TruncateNumberOrOddball, not the generic operation. The VM
+    // records every execution (the first stage's in-line paths record nothing).
+    let mut engine = engine(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "function or(a) { return a | 0; } function xor(a, b) { return a ^ b; }
+         function not(a) { return ~a; } function str(a) { return a | 0; }
+         function lit(a) { return (void 0 | a) + (true | 0) + (null ^ a); }
+         var odd = [undefined, null, true, false];
+         for (var i = 0; i < 20; i++) {
+             or(i); or(odd[i & 3]); xor(i, odd[i & 3]); not(i); not(odd[i & 3]);
+             str(i); str('7'); lit(i); lit(odd[i & 3]);
+         }",
+    );
+    for (name, op, words) in [
+        ("or", NodeOp::I32Or, 1),
+        ("xor", NodeOp::I32Xor, 2),
+        ("not", NodeOp::I32Not, 1),
+    ] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        assert_eq!(count(&graph, |node| *node == op), 1, "{name}: {text}");
+        let truncations = nodes(&graph, |op| *op == NodeOp::TruncateNumberOrOddball);
+        assert_eq!(truncations.len(), words, "{name}: {text}");
+        for truncation in &truncations {
+            assert_eq!(
+                truncation.reason,
+                Some(ExitReason::NotNumber),
+                "{name}: {text}"
+            );
+            assert_eq!(truncation.rep, Rep::I32, "{name}: {text}");
+        }
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::CheckNumber),
+            0,
+            "{name}: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::TruncateToInt32),
+            0,
+            "{name}: {text}"
+        );
+    }
+    // A String is no oddball: the generic operation.
+    let (chunk, graph) = graph_of(&mut engine, "str");
+    let text = dump(&graph, &chunk);
+    let effects = nodes(&graph, is_effect);
+    assert_eq!(effects.len(), 1, "{text}");
+    let or = pc_of(&chunk, |op| matches!(op, Op::BitOr));
+    assert_eq!(effects[0].pc as usize, or, "{text}");
+    // Oddball constants fold (`void 0 | a` is a's ToInt32, `true | 0` is 1), and `a` is
+    // truncated once for both of its operations.
+    let (chunk, graph) = graph_of(&mut engine, "lit");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::TruncateNumberOrOddball),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, |op| *op == NodeOp::ConstI32(1)), 1, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Or), 2, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::I32Xor), 1, "{text}");
+    // A flag at the operation declines the truncation for the generic operation, as a
+    // CheckNumber's does.
+    let (chunk, _) = graph_of(&mut engine, "or");
+    let or = pc_of(&chunk, |op| matches!(op, Op::BitOr));
+    flag(&chunk, or, ExitReason::NotNumber, false, 0);
+    let graph = graph_for(&chunk, "or flagged");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::TruncateNumberOrOddball),
+        0,
+        "{text}"
+    );
+    assert_eq!(nodes(&graph, is_effect)[0].pc as usize, or, "{text}");
+    assert_eq!(declines(&graph), [(or, ExitReason::NotNumber)], "{text}");
+}
+
+#[test]
 fn an_f64_that_arithmetic_made_is_truncated_for_a_bitwise_operation() {
     // The first stage's in-line hits record no int32 hint, so the products are f64s; stage 1 sent
     // their `&` and `~` to the effect path.
