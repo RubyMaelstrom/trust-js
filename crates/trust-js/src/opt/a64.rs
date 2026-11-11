@@ -162,7 +162,7 @@ pub(crate) fn compile_with(
     ilayout: &crate::interpreter::InterpLayout,
     options: Options,
 ) -> Result<Rc<JitCode>, Refusal> {
-    let view = chunk.freeze(true);
+    let view = chunk.freeze();
     let switches = Switches::read(chunk);
     let mut stubs = Stubs::live();
     let assembled = assemble(

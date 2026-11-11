@@ -7567,33 +7567,6 @@ fn transformed_record_map(
 }
 
 /// The property cache (its way 0's index) of a named load's or store's operation.
-/// The name a named operation's property cache is for (see [`named_site_cache`]).
-#[cfg_attr(
-    not(any(
-        test,
-        all(
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        )
-    )),
-    allow(dead_code)
-)]
-pub(crate) fn named_site_name(op: &Op) -> Option<u32> {
-    match *op {
-        Op::GetProp(name, _)
-        | Op::GetPropThis(name, _)
-        | Op::GetPropLocal(_, name, _)
-        | Op::GetMethod(name, _)
-        | Op::SetProp(name, _)
-        | Op::SetPropDrop(name, _)
-        | Op::SetPropThisDrop(name, _)
-        | Op::SetPropLocalDrop(_, name, _)
-        | Op::AppendProp(name, _)
-        | Op::UpdateProp(name, _, _) => Some(name),
-        _ => None,
-    }
-}
-
 pub(crate) fn named_site_cache(op: &Op) -> Option<u32> {
     match *op {
         Op::GetProp(_, cache)
@@ -9148,6 +9121,11 @@ pub(crate) fn compile_with_inlines(
     crate::jit::perf_bytecode_compile_end(started, result.is_some());
     if let Some(chunk) = &result {
         chunk.settle_inline_checkpoints();
+        // The optimizing tier compiles the recompile next: its names' keys carried from the
+        // chunks it was made from (P3 stage 2, step 16).
+        if crate::opt::enabled() {
+            chunk.carry_name_keys();
+        }
     }
     result
 }
@@ -24635,12 +24613,71 @@ impl Chunk {
     /// The property key of name `index`, in the chunk's heap: every name's is made at the
     /// first use of any.
     pub(crate) fn name_key(&self, index: u32) -> crate::atom::PropKey {
+        self.name_keys()[index as usize]
+    }
+
+    /// The property keys of the chunk's names, in its heap ([`Chunk::name_key`]), made now if
+    /// none was: the VM's first named access makes them, or the optimizing tier's first freeze of
+    /// the chunk (P3 stage 2, step 16), or a second stage's recompile carries them
+    /// ([`Chunk::carry_name_keys`]).
+    pub(crate) fn name_keys(&self) -> &[crate::atom::PropKey] {
         self.name_keys.get_or_init(|| {
             self.names
                 .iter()
                 .map(|name| crate::atom::PropKey::from_text(name))
                 .collect()
-        })[index as usize]
+        })
+    }
+
+    /// Give a recompiled chunk (a second stage) its names' keys from the chunks its record map
+    /// names, its function's first stage and its spliced callees', where theirs were made, a name
+    /// none of them holds made here (P3 stage 2, step 16; the optimizing tier's recompiles only,
+    /// so that the tier off pays nothing new). The exemplars carry a name's atom in the bytecode
+    /// (V8's constant pool, interpreter/bytecode-array-builder.cc:942-947; SpiderMonkey's
+    /// gcthings, vm/JSScript.h:2361-2377; JSC's identifiers, bytecode/UnlinkedCodeBlock.h:196),
+    /// so that a compile looks no name up: the tier's frozen view takes a named operation's key
+    /// from this table. A key is its text's atom in the chunk's heap whichever chunk made it,
+    /// the same word a lookup by text finds.
+    pub(crate) fn carry_name_keys(&self) {
+        if self.name_keys.get().is_some() {
+            return;
+        }
+        let Some(map) = self.feedback.record_map() else {
+            return;
+        };
+        let mut known: crate::fasthash::FastMap<&str, crate::atom::PropKey> =
+            crate::fasthash::FastMap::default();
+        known.reserve(self.names.len());
+        for target in map.targets() {
+            if let Some(keys) = target.name_keys.get() {
+                for (name, &key) in target.names.iter().zip(keys.iter()) {
+                    known.entry(&**name).or_insert(key);
+                }
+            }
+        }
+        let keys = self
+            .names
+            .iter()
+            .map(|name| {
+                known
+                    .get(&**name)
+                    .copied()
+                    .unwrap_or_else(|| crate::atom::PropKey::from_text(name))
+            })
+            .collect();
+        let _ = self.name_keys.set(keys);
+    }
+
+    /// Whether the chunk's names' keys were made (tests).
+    #[cfg(test)]
+    pub(crate) fn has_name_keys(&self) -> bool {
+        self.name_keys.get().is_some()
+    }
+
+    /// The chunk's count of names (tests).
+    #[cfg(test)]
+    pub(crate) fn name_count(&self) -> usize {
+        self.names.len()
     }
 
     /// Exact straight-line field constructor recognized without function or benchmark identity.

@@ -95,7 +95,7 @@ pub(crate) struct Built {
 /// tests' path.
 #[cfg(test)]
 pub(crate) fn build(chunk: &crate::bytecode::Chunk, snapshot: &Snapshot) -> Result<Built, Refusal> {
-    build_view(&chunk.freeze(true), snapshot)
+    build_view(&chunk.freeze(), snapshot)
 }
 
 /// The graph of `chunk`, a chunk's frozen view, from its operations and `snapshot` (its

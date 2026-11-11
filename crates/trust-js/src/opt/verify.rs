@@ -34,7 +34,7 @@ pub(crate) fn verify(
     chunk: &crate::bytecode::Chunk,
     cfg: &Cfg,
 ) -> Result<(), String> {
-    verify_view(graph, &chunk.freeze(true), cfg)
+    verify_view(graph, &chunk.freeze(), cfg)
 }
 
 /// Whether `graph`, built from `chunk` (a chunk's frozen view), holds the invariants the back end

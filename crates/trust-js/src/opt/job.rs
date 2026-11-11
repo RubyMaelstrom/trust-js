@@ -54,9 +54,9 @@ pub(crate) enum Outcome {
     Compiled(Box<Compiled>),
     Refused(Refusal),
     /// The emission found stubs missing from the snapshot's table (`stubs`, in the order it
-    /// requested them), or names whose atoms the frozen view lacks (`FrozenChunk::missing_keys`):
-    /// the main thread assembles and makes them, and the job runs again. Off the main thread
-    /// only.
+    /// requested them): the main thread assembles them, and the job runs again. Off the main
+    /// thread only. (No atom is ever missing: the frozen view carries every name's key, P3
+    /// stage 2, step 16.)
     Needs {
         stubs: Vec<u32>,
     },
@@ -151,7 +151,7 @@ pub(crate) fn compile(job: Job) -> Finished {
             Ok(assembled) => assembled,
             Err(refusal) => return Outcome::Refused(refusal),
         };
-        if !stubs.missing.is_empty() || !job.view.missing_keys.borrow().is_empty() {
+        if !stubs.missing.is_empty() {
             return Outcome::Needs {
                 stubs: stubs.missing,
             };

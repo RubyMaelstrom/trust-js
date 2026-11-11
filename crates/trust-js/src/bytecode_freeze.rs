@@ -8,10 +8,10 @@ impl Chunk {
     /// The tier's frozen view of this chunk (see `opt::view`): its immutable data copied, its
     /// lazily built facts forced (but those of the operations alone, which the compile makes),
     /// the live state the back end bakes in read now, and its cells' and images' addresses as
-    /// words; the names' keys looked up where `interns` is false (a compile off the main
-    /// thread). Main thread only: it upgrades the inline targets' pins and reads the agent
-    /// heap's allocation sites.
-    pub(crate) fn freeze(&self, interns: bool) -> FrozenChunk {
+    /// words; the names' keys from the chunk's table, made now if none was (P3 stage 2, step
+    /// 16). Main thread only: it upgrades the inline targets' pins, reads the agent heap's
+    /// allocation sites and may make atoms.
+    pub(crate) fn freeze(&self) -> FrozenChunk {
         let ops = self.ops.as_slice();
         let mut names = String::new();
         let mut name_ends = Vec::with_capacity(self.names.len());
@@ -51,24 +51,14 @@ impl Chunk {
                 }
             }
         }
-        // The named operations' names' keys, where their atoms exist (none is made here), for a
-        // compile off the main thread; one on it makes a key when a template asks for it, as the
-        // template JIT does.
-        let mut keys = vec![None; self.names.len()];
-        if !interns {
-            let mut looked = vec![false; self.names.len()];
-            for op in ops {
-                if let Some(n) = super::named_site_name(op) {
-                    if let Some(looked @ false) = looked.get_mut(n as usize) {
-                        *looked = true;
-                        keys[n as usize] =
-                            crate::atom::PropKey::lookup_text(&self.names[n as usize])
-                                .map(|key| key.word());
-                    }
-                }
-            }
-        }
-        // The named sites' ways, which the property templates bake (read once, here).
+        // The names' keys, from the chunk's table, made once a chunk (P3 stage 2, step 16): its
+        // first freeze makes it where the VM has not, as the VM's first named access would, and a
+        // second stage's recompile carries it (`Chunk::carry_name_keys`), as the exemplars' compiles
+        // read a name's atom from the bytecode. No compile looks a name up or makes an atom.
+        let keys: Box<[u64]> = self.name_keys().iter().map(|key| key.word()).collect();
+        // The named sites' ways, read once, here: the property templates bake them, with each
+        // site's preferred way (`Chunk::jit_cache_preferred`), and the snapshot's decode reads
+        // them (P3 stage 2, step 16: `feedback_read::CopiedWords`).
         #[allow(clippy::type_complexity)]
         let mut sites: Vec<(
             u32,
@@ -147,9 +137,7 @@ impl Chunk {
             ops: ops.into(),
             names: names.into_boxed_str(),
             name_ends: name_ends.into_boxed_slice(),
-            keys: keys.into_boxed_slice(),
-            interns,
-            missing_keys: Default::default(),
+            keys,
             consts: consts.into_boxed_slice(),
             n_params: self.n_params,
             n_slots: self.n_slots,

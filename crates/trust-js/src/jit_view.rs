@@ -22,7 +22,7 @@ pub(crate) trait JitChunk {
     fn jit_name(&self, n: u32) -> &str;
     /// Name `n`'s property key's word (`atom::PropKey::word`) in the chunk's heap, which a
     /// key-checked or creating property template embeds: the live chunk atomizes it now, as the
-    /// templates did; the frozen view gives the one its main thread found (`Chunk::freeze`).
+    /// templates did; the frozen view gives its chunk's key table's (`Chunk::freeze`).
     fn jit_name_key(&self, n: u32) -> u64;
     /// (parameters, slots).
     fn jit_frame(&self) -> (usize, usize);

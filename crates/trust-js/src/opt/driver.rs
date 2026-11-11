@@ -598,14 +598,13 @@ fn log_clock() -> Option<std::time::Instant> {
 
 /// Where and when a compile ran, for its log line (the plan's point 10): the thread its build
 /// and code generation ran on (`the main`, `the compile`), their time there (summed over its
-/// runs: a job that found stubs or atoms missing runs again), its wait in the compile thread's
-/// queue, and when its snapshot started, so that the line gives the time from the snapshot to
-/// the install. Timed under TRUST_JS_OPT_LOG only (`log_clock`): the times are zero otherwise.
+/// runs: a job that found stubs missing runs again), its wait in the compile thread's queue, and
+/// when its snapshot started, so that the line gives the time from the snapshot to the install.
+/// Timed under TRUST_JS_OPT_LOG only (`log_clock`): the times are zero otherwise.
 struct Timing {
     thread: &'static str,
     compiled: std::time::Duration,
-    /// The part of `compiled` its runs before the last spent: the runs that found stubs or atoms
-    /// missing.
+    /// The part of `compiled` its runs before the last spent: the runs that found stubs missing.
     needed: std::time::Duration,
     waited: std::time::Duration,
     snapshot: Option<std::time::Instant>,
@@ -627,7 +626,7 @@ impl Timing {
 
     /// The log's fields after a compile line's own: `on <thread> thread, queued <ms> ms,
     /// installed <ms> ms after its snapshot` (and, past one run, `, <n> runs, <ms> ms before the
-    /// last`: the time of the runs that found stubs or atoms missing).
+    /// last`: the time of the runs that found stubs missing).
     fn fields(&self) -> String {
         format!(
             "on {} thread, queued {:.3} ms, installed {:.3} ms after its snapshot{}",
@@ -666,7 +665,7 @@ fn prepare(
     }
     // The global names resolve in the running realm (stage 2, step 4).
     let snapshot = snapshot::Snapshot::take_in(chunk, Some(&*i));
-    let view = chunk.freeze(!off_thread);
+    let view = chunk.freeze();
     let layout = *i
         .jit_layout
         .get_or_init(|| crate::value::jit_layout(&i.object_proto));
@@ -706,10 +705,10 @@ fn compiles_on_another_thread() -> bool {
     cfg!(test) && env_flag!("TRUST_JS_OPT_SCOPED_COMPILE")
 }
 
-/// Run `job`, a compile of `chunk`, until it needs no stub the main thread has not assembled and
-/// no atom it has not made: on this thread, or where `compiles_on_another_thread` on a scoped
-/// thread joined at once. What it found missing is made here, on the main thread (`provide`,
-/// logged as a main-thread part), and the job runs again.
+/// Run `job`, a compile of `chunk`, until it needs no stub the main thread has not assembled: on
+/// this thread, or where `compiles_on_another_thread` on a scoped thread joined at once. What it
+/// found missing is made here, on the main thread (`provide`, logged as a main-thread part), and
+/// the job runs again.
 fn run_here(mut job: Job, chunk: &Chunk) -> Finished {
     loop {
         let finished = if compiles_on_another_thread() {
@@ -734,9 +733,7 @@ fn run_here(mut job: Job, chunk: &Chunk) -> Finished {
         };
         let timer = main_thread_timer();
         let stubs = stubs.clone();
-        job = finished
-            .job
-            .expect("a job that needs stubs or atoms runs again");
+        job = finished.job.expect("a job that needs stubs runs again");
         provide(&mut job, &stubs);
         log_main_thread("stubs", chunk, timer);
     }
@@ -744,14 +741,13 @@ fn run_here(mut job: Job, chunk: &Chunk) -> Finished {
 
 /// What a compile off the main thread found missing (main thread): the stubs `stubs` assembled
 /// (those whose assembly failed kept per chunk by its next run) and the stub table's snapshot
-/// taken again, the names' atoms made.
+/// taken again.
 fn provide(job: &mut Job, stubs: &[u32]) {
     if !stubs.is_empty() {
         let failed = assemble_stubs(job, stubs);
         job.stub_copies.extend(failed);
         job.stubs = Some(crate::jit::stub_table_snapshot(&job.stub_copies));
     }
-    job.view.make_missing_keys();
 }
 
 /// The stack of a thread that compiles: the builder and the allocator iterate, so this bounds
@@ -1285,8 +1281,8 @@ fn land(
 /// poll of generated code that found the install bit set (`jit_interrupt`, V8's
 /// INSTALL_MAGLEV_CODE interrupt, SpiderMonkey's attach): each result whose job is still pending
 /// is checked (`dropped`), then linked and landed as its caller decided, its code run after the
-/// instruction barrier (`finish`); a result whose job found stubs or atoms missing has them made
-/// here and runs again; a panic on the compile thread is raised here.
+/// instruction barrier (`finish`); a result whose job found stubs missing has them made here and
+/// runs again; a panic on the compile thread is raised here.
 pub(crate) fn install_finished(i: &mut Interp) {
     if !i.poll.take_install_request() {
         return;
@@ -1340,9 +1336,7 @@ fn install_one(
         let stubs = stubs.clone();
         let chunk = i.opt_pending.jobs[at].chunk.clone();
         let timer = main_thread_timer();
-        let mut job = finished
-            .job
-            .expect("a job that needs stubs or atoms runs again");
+        let mut job = finished.job.expect("a job that needs stubs runs again");
         provide(&mut job, &stubs);
         let pending = &i.opt_pending.jobs[at];
         let requeued = super::compiler::enqueue(

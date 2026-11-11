@@ -58,16 +58,10 @@ pub(crate) struct FrozenChunk {
     /// The names' text, one after the other, and where each ends.
     pub(crate) names: Box<str>,
     pub(crate) name_ends: Box<[u32]>,
-    /// The property keys' words (`atom::PropKey::word`) of the names the named operations read
-    /// and write, by name index, where the chunk's heap had their atoms at the freeze of a
-    /// compile off the main thread (an atom is made only where a template embeds one:
-    /// `jit_name_key`); none for one on the main thread, which makes them as its templates ask.
-    pub(crate) keys: Box<[Option<u64>]>,
-    /// Whether the compile runs on the main thread, which makes a missing key's atom when a
-    /// template asks for it, as the template JIT does; elsewhere the name is recorded in
-    /// `missing_keys` for the main thread to make before the compile runs again.
-    pub(crate) interns: bool,
-    pub(crate) missing_keys: std::cell::RefCell<Vec<u32>>,
+    /// The names' property keys' words (`atom::PropKey::word`), by name index: the chunk's key
+    /// table's (`Chunk::name_keys`; P3 stage 2, step 16), which a key-checked or creating
+    /// property template embeds (`jit_name_key`).
+    pub(crate) keys: Box<[u64]>,
     /// The constants the operations push (`Op::Const`), by index; None for the others, which
     /// nothing in a compile reads.
     pub(crate) consts: Box<[Option<FrozenConst>]>,
@@ -257,29 +251,9 @@ impl FrozenChunk {
             .unwrap_or_else(|_| panic!("the frozen view has no ways for cache {idx}"))
     }
 
-    /// Name `n`'s key's word (see `keys`), its atom made now where the compile runs on the main
-    /// thread; else 0, and the name recorded as missing.
+    /// Name `n`'s key's word (see `keys`).
     pub(crate) fn jit_name_key(&self, n: u32) -> u64 {
-        if let Some(word) = self.keys.get(n as usize).copied().flatten() {
-            return word;
-        }
-        if self.interns {
-            return crate::atom::PropKey::from_text(self.jit_name(n)).word();
-        }
-        let mut missing = self.missing_keys.borrow_mut();
-        if !missing.contains(&n) {
-            missing.push(n);
-        }
-        0
-    }
-
-    /// Make the atoms of the names a compile off the main thread found missing (main thread),
-    /// for its next run.
-    pub(crate) fn make_missing_keys(&mut self) {
-        for n in std::mem::take(self.missing_keys.get_mut()) {
-            let word = crate::atom::PropKey::from_text(self.jit_name(n)).word();
-            self.keys[n as usize] = Some(word);
-        }
+        self.keys[n as usize]
     }
 }
 
