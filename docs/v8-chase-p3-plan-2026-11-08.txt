@@ -3014,3 +3014,146 @@ before it lands:
 - Also, trim's partial discards inside a huge page are only unmapped. The kernel frees them when
   it splits the page, typically under memory pressure, so RSS counters overstate what a trim
   returns.
+
+The interim two-CPU session of be6b5ee2 (2026-11-11; target/p3/stage2/session-2cpu-p3s2-be6b5ee2,
+report.txt; main be6b5ee2: steps 13, 14 and 15 since the last session). The bar's phases only,
+every engine and reference run on CPUs 5 and 6, both uncapped through every phase (0 capped
+seconds); the agents held; the owner's programs busy 2-3.4 cores elsewhere.
+- The 2% bar, the tier on against off:
+  - the measured passes: Vue -11.48% (178.27 against 201.39 ms), React -0.56% (29.92 against
+    30.09; +2.96% at 4509bd62, the WrongCallee exits step 15 removed), Djot -13.00% (65.27
+    against 75.02);
+  - the steady states (fx3): Vue -12.27%, React -2.74%, Djot -17.41%;
+  - the calls within 2% but array-shift-queue-holey, +2.35% (14.83 against 14.49 ms; +1.62% at
+    4509bd62; each side's three samples within 0.3%);
+  - Octane: every benchmark faster but CodeLoad, +9.21% (13,153 against 14,364; the shell
+    allocator, pending, is its fix); the geomean +30.42%.
+- The compile bar: Vue 0.76% (1.36 ms), React 0.94% (0.28 ms), Djot 3.81% (2.49 ms: recompile
+  1.37, snapshot 0.87, stubs 0.11, install 0.15; the fallback beside, 1.04 ms, one compile). The
+  study's estimate for 3a79e650 was 2.80 ms, 4.0% (3.9-4.3%: recompile 1.49, snapshot 1.03, stubs
+  0.13, install 0.15); each part reads at or below it, the snapshot most, and the pass is shorter
+  (65.27 ms against the study's 69.5). 3% is 1.96 ms, so 0.53 ms must go. Step 16's expected
+  0.45 ms puts Djot at about 3.1%, step 17's stubs part at about 2.95%.
+- Against node-mg on the same two CPUs (decision 1: within 2x): the measured passes Vue 3.83x,
+  React 3.07x, Djot 2.73x; the steady states 3.86x, 3.42x, 4.17x; Octane's geomean over the 15
+  benchmarks Node runs 3.98x (the tier off 5.35x; 4.13x and 5.41x at 4509bd62).
+- Against 4509bd62, the tier on: Octane's geomean score +3.86% (Box2D +28.8%, zlib +16.6%,
+  TypeScript +11.6%, Gameboy +9.8%, PdfJS +4.9%), but DeltaBlue -10.47%, Richards -6.15% and
+  RayTrace -1.76% (below). The tier off differs too, with no tier-off change to explain it: Splay
+  +6.7%, RegExp +6.1%, TypeScript +3.6%, and on the calls array-shift-queue -5.3% and its holey
+  case +6.5% (the tier on alike, -4.7% and +7.3%). Not attributed.
+Richards, DeltaBlue and RayTrace (target/p3/stage2/x925-diag; X925 cores 7 and 8 after the
+session, the agents building on the A725 cores, so indicative; timed Octane with every file loaded
+as the session's runs, the first four benchmarks run, 2-3 rounds):
+- The drop is step 15's. Its own builds (66b90635 against 47a6197a, step15-impl's): Richards
+  3,350 -> 3,128-3,160, DeltaBlue 2,411-2,424 -> 2,175-2,178, RayTrace 3,205-3,217 ->
+  3,141-3,160. Step 14's own builds: neutral (RayTrace -1.2%); step 13's: neutral.
+- The cause: the rule's first half declines the sites whose ways hold several distinct callees,
+  and these three benchmarks' hottest calls are such sites, all method calls on polymorphic
+  receivers: Richards' scheduler calls this.task.run(packet) over four task classes (the
+  planner's comment called it "exactly four-way polymorphic, and leaving half of it as real calls
+  dominates runtime"); DeltaBlue's planner calls its constraints' methods over two or three
+  classes (five sites a function at depth 3); RayTrace's scene calls intersect over two shapes.
+  Main's scheduler chunk settles at 440 operations (50 KB) after two WrongCallee discards; step
+  15's is 72 (10 KB), a real call each iteration.
+- Why step 15's record read gains (Richards -12.54% instructions): Octane's fixed runs (5 a
+  benchmark) are mostly warm-up on the short benchmarks (Richards' 5 runs take about 40 ms), where
+  the polymorphic splice's WrongCallee exits, discards and recompiles fell away; the timed score
+  measures a second after a second's warm-up. Over 200 runs (X925 cycles) step 15 still reads
+  -42.7% on Richards, over 2,000 -6.8%, and the timed score -6.6%. Tier steps get timed Octane on
+  X925 beside the fixed-run counts from now on.
+- The exemplars, read again: current V8 Maglev inlines exactly these calls. maglev_poly_calls
+  (flag-definitions.h:667, on by default) continues a polymorphic named load's arms through the
+  call of the loaded function (FindContinuationForPolymorphicPropertyLoad,
+  maglev-graph-builder.cc:6038-6125: GetNamedProperty, Sta, CallProperty), where each arm's
+  function is a constant the call can inline. Step 15's design cited this as the exception
+  ("only a polymorphic load's constant-function arms"); the sites that pay are that exception.
+  TurboFan inlines up to four targets (js-inlining-heuristic.h:66), JSC's FTL switches on the
+  callee (dfg/DFGByteCodeParser.cpp:2726-2775; not its DFG), SpiderMonkey's Warp does not
+  (jit/TrialInlining.cpp:865-878).
+- A probe (52603616 on be6b5ee2, the rule's second half alone: several distinct callees splice
+  guarded again, a site that met another closure still declines), against main, the tier on
+  asynchronous, X925 cores 7-8, 3 rounds: timed Octane geomean +1.15%: DeltaBlue +13.75% (above
+  4509bd62's), Richards +3.39%, RayTrace +2.02%, Gameboy -1.85% (outside its spread; its 41
+  declined sites are keyed calls over two to four callees, memoryReader[address](...) and
+  OPCODE[opcode](...), which Maglev's continuation does not cover), Splay -1.15% (within its
+  spread). The fixtures' measured passes React -0.97%, Vue -0.29%, Djot +0.75%; the steady states
+  React -0.26%, Vue -0.48%, Djot +2.85%, though no Djot site is declined for several callees and
+  its steady state counts the same instructions (+0.2%) and cycles (+0.6%). The compile bar
+  unchanged (Djot 2.57 -> 2.59 ms). Its fixed-5 counts read the other way, +1.80% instructions
+  geomean (Richards +14.38%, DeltaBlue +8.18%, RayTrace +4.06%): the warm-up's exits.
+- On step 15's own commit (eda5739b against 47a6197a, built alike) the probe restores all three:
+  Richards 3,343-3,354 (66b90635's 3,343), DeltaBlue 2,435-2,441, RayTrace 3,246-3,249. On main
+  Richards keeps a gap: timed in batches of 250 runs (ASLR on), the steady state is 266.5 ms on
+  step 15 with the probe, 271 on main with it, 280.5 and 278-285 without it. Under setarch -R the
+  two probes' steady states are equal to the instruction and the cycle (10.33M instructions,
+  1.46M cycles a run; L1I refills +48%): step 13 makes the scheduler's discards come at its loop
+  limit (5 and 10 exits for 100 and 200), so its final code (the same 50,524 bytes) is made
+  earlier and lands elsewhere. Placement, not work.
+The delivered clock (2026-11-11, found in this diagnosis; target/p3/stage2/clock-watch). Under
+load the X925 cores deliver 1.37 GHz of their 3.9 (cpuinfo_avg_freq, and user cycles over task
+clock in a busy loop: CPUs 5, 7, 9, 15, 19 alike) and the A725 cores 1.00 GHz of 2.81, while
+cpufreq requests the maximum (scaling_cur_freq 3.9 GHz) and scaling_max_freq is not capped.
+thermald reports state 0 (no cap; hottest 66.7 C) and gpu_idle=no: the GPU has been busy since
+08:14:51, and was busy through the 4509bd62 session too (every status line from 18:20 to 18:45 on
+2026-11-10). The likely limit is the GB10's power sharing between CPU and GPU, below cpufreq;
+uncapped.sh reads scaling_max_freq alone and cannot see it, and the compile-bar study's A725
+reading of 1.15 GHz was the same limit. Both interim sessions ran under it: their ratios (on
+against off, the compile bar, node-mg on the same CPUs) are internally consistent, their absolute
+times are not the cores' full speed. A logger (clock-watch/watch.sh) records the delivered clocks
+against thermald's gpu_idle every 10 s, to confirm the link when the GPU next idles. Nothing was
+changed on the machine.
+
+Step 17, the shared stubs made on the compile thread (design, 2026-11-11; input
+compile-bar-input.txt sections 1 and 5, the exemplars' thunk caches). Today a compile off the main
+thread that requests a stub its snapshot of the process's stub table lacks emits a veneer to
+nothing, finishes, and returns Needs: the main thread assembles the stubs (driver::provide, logged
+as the bar's `stubs` part, 0.21 ms a run on Djot, A725), takes the table's snapshot again, and
+queues the job to run again from the start. JSC's compiler threads make a missing thunk
+themselves: JITThunks::ctiStubImpl takes the thunks' lock, looks the key up, generates the thunk
+where it is missing and adds it, marking the entry for a cross-modifying-code fence when a
+compilation thread made it; the main thread runs the fence the first time it takes such an entry
+(jit/JITThunks.cpp:189-222). V8's builtins are made at the build (the embedded blob), and
+SpiderMonkey's VM wrappers and trampolines at the runtime's start (JitRuntime::initialize): in
+neither does a compile meet a missing stub. TRust's stubs are made lazily, by key (several
+hundred flag and helper combinations, a few dozen of which a program uses), so JSC's form is the
+one that fits.
+1. The lookup. An emission off the main thread asks the snapshot first, as now. A stub the
+   snapshot lacks is looked up again under the table's lock (another thread may have made it
+   since the snapshot) and, where it is still missing, assembled there, under the lock, by the
+   main thread's own path (global_stub_address, assemble_global_stub): the same context (the
+   job's layout, interpreter layout and direct-sequence offsets), the same buffer form, the
+   perf map's entries. The table's generation moves, so the main thread's next snapshot is
+   taken again.
+2. The fence. The compile thread's flush (dc cvau, ic ivau, dsb ish) makes the stub's words
+   visible to every core's instruction side, as for the job's own code; the main thread's
+   instruction barrier at the install (sync_instruction_stream) covers the job's stubs as it
+   covers its code. A later compile on any thread that finds the stub in the table branches to
+   it from code it publishes itself, whose flush ends with dsb ish and isb on that thread, after
+   it took the table's lock: no thread runs a shared stub without a context synchronization
+   event after the stub was made. JSC needs its per-entry flag because its main thread can take
+   a thunk without publishing code; TRust has no such path (the step checks it: every
+   global_stub_address caller emits code). The step states this in the code.
+3. The callee-saved flag. A stub that writes d8-d15 sets STUB_WRITES_CALLEE_SAVED_FP before it
+   enters the table under the lock, and the job's finish reads the flag after its stubs, on its
+   own thread, as the template JIT's finish does: a compile that reaches the stub keeps its
+   saves.
+4. A failed assembly (no executable memory) keeps the stub's body in the chunk (StubLookup::Copy)
+   at once, recorded in the job's copies for its next compiles, with no second run.
+5. Then no job runs twice: the Needs outcome, run_here's loop and install_one's requeue go, and
+   so does the bar's `stubs` part. The debug check that a compile off the main thread reaches
+   none of the main thread's state (OffMainCompile) admits the table's lock and the executable
+   buffer's mapping, which are the process's.
+6. Test builds keep a table a thread, as their stub bodies embed the main thread's test counters
+   (TestAddresses): the job carries its main thread's table (a shared handle in place of the
+   thread-local cell), so that the compile thread adds to the table its stubs' counters belong
+   to, and a test's perf map capture receives their entries.
+Tests: a compile off the main thread that requests a missing stub makes it and runs once (the
+stub in the main thread's table after the install, the generation moved); two engines on two
+threads requesting one stub at once make it once; a stub made off the main thread that writes
+d8-d15 keeps the saves of the job that reaches it and of a later main-thread compile; a failed
+assembly keeps a copy without a rerun; the tier's code identical before and after (but for the
+stubs' addresses: identity_norm.py); the tier off untouched. Mutations: the lookup under the lock
+skipped (a stub made twice), the generation not moved, the flag set after the insert.
+Expected: the stubs part (0.21 ms A725, 0.11 ms X925 on Djot) gone from the bar, and the jobs
+that met a missing stub installed one compile sooner. The tier's code unchanged.
