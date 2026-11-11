@@ -1561,6 +1561,13 @@ pub struct CallSite {
     /// offset from the first way is compile-asserted below), so that this test fails at its
     /// first compare without reading outside the site.
     hint_guard: u8,
+    /// Whether the call's callee is a named property's value, read by [`Op::GetMethod`] (a method
+    /// call `o.m(...)`), set once by the bytecode compiler and never written after (P3 stage 2,
+    /// step 15b): the inline planner splices such a site's several callees with the optimizing
+    /// tier on ([`CallSite::is_named_method_call`]). In what was the padding after `hint_guard`,
+    /// so that no field moves and the site's size stays (compile-asserted below); machine code
+    /// never reads it (the hinted-way test's word holds it above its odd low byte).
+    named_method: bool,
     /// The calls a megamorphic site has made through the full guards, its admissions spent, for
     /// want of an entry, since its window began, up to [`CALL_SITE_OVERFLOW_RENEWAL`].
     declined: std::cell::Cell<u16>,
@@ -1654,6 +1661,16 @@ const _: () = assert!(
         && CALL_SITE_HINT_GUARD % 2 == 1
         && std::mem::align_of::<Function>() >= 8
 );
+// The named-method mark (P3 stage 2, step 15b) takes the padding byte after `hint_guard`: the
+// fields around it keep their offsets and the site its size (504 bytes on 64-bit targets), so
+// the template code's offsets and the chunks' call-cache arrays are as before.
+const _: () = assert!(
+    std::mem::offset_of!(CallSite, named_method) == std::mem::offset_of!(CallSite, hint_guard) + 1
+        && std::mem::offset_of!(CallSite, declined)
+            == std::mem::offset_of!(CallSite, hint_guard) + 2
+);
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<CallSite>() == 504);
 
 impl CallSite {
     pub fn empty() -> CallSite {
@@ -1671,8 +1688,20 @@ impl CallSite {
             admissions: std::cell::Cell::new(0),
             counted_epoch: std::cell::Cell::new(0),
             hint_guard: CALL_SITE_HINT_GUARD,
+            named_method: false,
             declined: std::cell::Cell::new(0),
         }
+    }
+    /// Whether the call's callee is a named property's value, read by [`Op::GetMethod`]: a
+    /// method call `o.m(...)`, `this.task.run(...)`, `o?.m(...)` or `o.m?.(...)`, as the
+    /// bytecode compiler marked the site (P3 stage 2, step 15b). With the optimizing tier on, the
+    /// inline planner splices such a site's several distinct callees, guarded by callee, as
+    /// Maglev continues a polymorphic named load's arms through the call of the loaded function
+    /// (maglev_poly_calls, FindContinuationForPolymorphicPropertyLoad,
+    /// maglev-graph-builder.cc:6038-6125); a keyed method call's (`Op::GetMethodElem`), a super
+    /// or private method's, or any other callee's site splices one callee alone.
+    pub fn is_named_method_call(&self) -> bool {
+        self.named_method
     }
     /// Whether the site has met another closure of a way's function: a code-keyed hit wrote its
     /// hint (see [`CallSite::code_hint`]). The inline planner splices no such site with the
@@ -10840,8 +10869,8 @@ fn plan_inlines_at(
     let pins = chunk.call_pins.borrow();
     let sites_in_loops = call_sites_in_loops(chunk);
     let spread_sites = spread_call_sites(chunk);
-    // With the optimizing tier on, the exemplars' rule (`splice_rule_declines`); with it off,
-    // P2's policy, the template JIT's guarded splices of every way.
+    // With the optimizing tier on, the exemplars' rule in Maglev's form (`splice_rule_declines`);
+    // with it off, P2's policy, the template JIT's guarded splices of every way.
     let exemplars_rule = crate::opt::enabled();
     for (idx, site) in chunk.call_caches.iter().enumerate() {
         if spread_sites[idx] {
@@ -10865,9 +10894,12 @@ fn plan_inlines_at(
         if exemplars_rule {
             if let Some(why) = splice_rule_declines(site, &filled) {
                 if log {
-                    log_splice_rule_skip(chunk, depth, idx, &filled, why, &pins);
+                    log_splice_rule(chunk, depth, idx, &filled, Some(why), &pins);
                 }
                 continue;
+            }
+            if log && several_callees(&filled) {
+                log_splice_rule(chunk, depth, idx, &filled, None, &pins);
             }
         }
         let mut ways: Vec<InlineWay> = Vec::new();
@@ -11001,35 +11033,53 @@ fn plan_inlines_at(
 }
 
 /// Why the inline planner splices none of a call site's ways with the optimizing tier on (P3
-/// stage 2, step 15), its ways `filled` (the filled ways, as the planner lists them), if it does
-/// not. The exemplars' rule: no site whose ways hold more than one distinct callee, as Maglev
-/// inlines no polymorphic call (only a polymorphic load's constant-function arms,
-/// maglev-graph-builder.cc:6038-6222) and Warp's trial inlining skips a site with more than one
-/// stub (jit/TrialInlining.cpp:865-878); and none that met another closure of a way's function
-/// ([`CallSite::met_another_closure`]), which all three keep inlining guarded by the callee's
-/// code (SpiderMonkey's GuardFunctionScript, jit/CacheIR.cpp:6607-6623; JSC's executable check,
-/// bytecode/CallLinkStatus.cpp:228-232; V8's feedback cell, src/builtins/ic-callable.tq:
-/// 132-148), where a splice pins its callee's identity and environment. A site with one callee
-/// that never met another closure splices as before.
+/// stage 2, steps 15 and 15b), its ways `filled` (the filled ways, as the planner lists them),
+/// if it does not. The exemplars' rule, in Maglev's form:
+/// - no site whose ways hold more than one distinct callee, unless its call is a named method
+///   call ([`CallSite::is_named_method_call`]): Maglev inlines no polymorphic call, but
+///   continues a polymorphic named load's arms through the call of the function each loads, a
+///   constant it can inline (maglev_poly_calls, FindContinuationForPolymorphicPropertyLoad,
+///   maglev-graph-builder.cc:6038-6125; V8's call feedback has no polymorphic state), and
+///   Warp's trial inlining skips a site with more than one stub (jit/TrialInlining.cpp:
+///   865-878). A named method call's several callees splice guarded by callee, as before step
+///   15: at most the cache's four ways, as Maglev's load has at most V8's four maps;
+/// - none that met another closure of a way's function ([`CallSite::met_another_closure`]),
+///   which all three keep inlining guarded by the callee's code (SpiderMonkey's
+///   GuardFunctionScript, jit/CacheIR.cpp:6607-6623; JSC's executable check,
+///   bytecode/CallLinkStatus.cpp:228-232; V8's feedback cell, src/builtins/ic-callable.tq:
+///   132-148), where a splice pins its callee's identity and environment.
+///
+/// It reads a spliced callee's sites (depth > 0) as the optimized function's: they are the
+/// callee's first stage's, marked at its own compile.
 fn splice_rule_declines(site: &CallSite, filled: &[CallIc]) -> Option<&'static str> {
-    let first = filled.first()?;
-    if filled.iter().any(|c| c.callee != first.callee) {
-        return Some("several callees");
+    if filled.is_empty() {
+        return None;
+    }
+    if several_callees(filled) && !site.is_named_method_call() {
+        return Some("several callees, not a named method call");
     }
     site.met_another_closure()
         .then_some("another closure of its callee's function")
 }
 
+/// Whether a site's filled ways `filled` hold more than one distinct callee.
+fn several_callees(filled: &[CallIc]) -> bool {
+    filled
+        .first()
+        .is_some_and(|first| filled.iter().any(|c| c.callee != first.callee))
+}
+
 /// Under TRUST_JS_TIER_LOG, the planner's line for a site the optimizing tier's splice rule
-/// declines (`splice_rule_declines`): the site, its call's pc in `chunk` (a first stage: the
-/// optimized function's at depth 0, a spliced callee's below), the reason, and the ways' callees
-/// (a user function's name and first stage, by its cell's address).
-fn log_splice_rule_skip(
+/// declines (`why`, from `splice_rule_declines`), or for a named method call's site of several
+/// callees that it admits (`why` None): the site, its call's pc in `chunk` (a first stage: the
+/// optimized function's at depth 0, a spliced callee's below) and source name, the reason, and
+/// the ways' callees (a user function's name and first stage, by its cell's address).
+fn log_splice_rule(
     chunk: &Chunk,
     depth: u32,
     idx: usize,
     filled: &[CallIc],
-    why: &str,
+    why: Option<&str>,
     pins: &crate::fasthash::FastMap<usize, crate::value::WeakGc>,
 ) {
     let stage = |chunk: &Chunk| {
@@ -11041,11 +11091,12 @@ fn log_splice_rule_skip(
             .collect();
         format!("fn({})", names.join(","))
     };
-    let pc = chunk
+    let at = chunk
         .ops
         .iter()
-        .position(|op| matches!(*op, Op::Call(_, c) | Op::CallWithThis(_, c) if c as usize == idx))
-        .map_or_else(|| "?".to_string(), |pc| pc.to_string());
+        .position(|op| matches!(*op, Op::Call(_, c) | Op::CallWithThis(_, c) if c as usize == idx));
+    let pc = at.map_or_else(|| "?".to_string(), |pc| pc.to_string());
+    let call = at.and_then(|pc| chunk.call_name(pc)).unwrap_or("?");
     let mut callees: Vec<usize> = filled.iter().map(|c| c.callee).collect();
     callees.sort_unstable();
     callees.dedup();
@@ -11066,9 +11117,13 @@ fn log_splice_rule_skip(
         format!("{name}|{first}|{callee:#x}")
     };
     let labels: Vec<String> = filled.iter().map(|c| label(c.callee)).collect();
+    let (verdict, why) = match why {
+        Some(why) => ("skip site", why),
+        None => ("site", "several callees at a named method call, admitted"),
+    };
     eprintln!(
-        "[tier] inline skip site {idx} (pc {pc} of {}, depth {depth}): {why}, the tier's rule; \
-         {} distinct callee(s): {}",
+        "[tier] inline {verdict} {idx} (pc {pc} of {}, depth {depth}, call {call}): {why}, the \
+         tier's rule; {} distinct callee(s): {}",
         stage(chunk),
         callees.len(),
         labels.join("; ")
@@ -11607,6 +11662,47 @@ pub enum CallArgsMode {
     Fixed(u16),
     FinalSpread(u16),
     Array,
+}
+
+/// What evaluating a call's callee left beneath its arguments, and what the call may make of it
+/// (`Compiler::call_reference`, `Compiler::finish_call`).
+#[derive(Clone, Copy)]
+struct CalleeShape {
+    /// [receiver, callee] rather than [callee]: the call passes the receiver as `this`.
+    with_this: bool,
+    /// Speculative inline eligibility: the recompile may splice the call's callees.
+    allow_inline: bool,
+    /// The callee is a named property's value, read by `Op::GetMethod`: the call site is marked
+    /// a named method call ([`CallSite::is_named_method_call`]).
+    named_method: bool,
+}
+
+impl CalleeShape {
+    /// [callee]: any other value's (a local binding's, a call's, a comma expression's).
+    const VALUE: CalleeShape = CalleeShape {
+        with_this: false,
+        allow_inline: true,
+        named_method: false,
+    };
+    /// [receiver, callee] of a keyed method (`Op::GetMethodElem`), of a free name's base object
+    /// (`Op::LoadNameForCall`), or of the self-hosted `Call(F, V, ...)`.
+    const RECEIVER: CalleeShape = CalleeShape {
+        with_this: true,
+        allow_inline: true,
+        named_method: false,
+    };
+    /// [receiver, callee] of a named method (`Op::GetMethod`): `o.m(...)`.
+    const NAMED_METHOD: CalleeShape = CalleeShape {
+        with_this: true,
+        allow_inline: true,
+        named_method: true,
+    };
+    /// [receiver, callee] of a super or private method, never spliced.
+    const UNSPLICED_METHOD: CalleeShape = CalleeShape {
+        with_this: true,
+        allow_inline: false,
+        named_method: false,
+    };
 }
 
 /// Whether a parameter default is in the compiler's lowerable subset: no reference to any
@@ -12429,8 +12525,10 @@ impl Compiler {
         };
         Ok(())
     }
-    /// Reserve a fresh call-cache slot for a `Call`/`CallWithThis` site.
-    fn new_call_cache(&mut self) -> u32 {
+    /// Reserve a fresh call-cache slot for a `Call`/`CallWithThis` site, marked a named method
+    /// call where `named_method` (its callee `Op::GetMethod`'s value: see
+    /// [`CallSite::is_named_method_call`]).
+    fn new_call_cache(&mut self, named_method: bool) -> u32 {
         // Every frame counts its own call-site ordinals (see `Compiler::plan_stack`).
         if let Some(top) = self.plan_stack.last_mut() {
             top.1 += 1;
@@ -12462,10 +12560,14 @@ impl Compiler {
                 admissions: std::cell::Cell::new(0),
                 counted_epoch: std::cell::Cell::new(evictions.1),
                 hint_guard: CALL_SITE_HINT_GUARD,
+                named_method,
                 declined: std::cell::Cell::new(0),
             }
         } else {
-            CallSite::empty()
+            CallSite {
+                named_method,
+                ..CallSite::empty()
+            }
         };
         self.call_caches.push(site);
         (self.call_caches.len() - 1) as u32
@@ -13215,7 +13317,7 @@ impl Compiler {
                 // The receiver sits beneath the callee, exactly as for `V.method(...args)`.
                 self.expr(items[1])?;
                 self.expr(items[0])?;
-                self.finish_call(&args[2..], true, true)?;
+                self.finish_call(&args[2..], CalleeShape::RECEIVER)?;
                 return Ok(true);
             }
             ("ToObject", 2) => {
@@ -13243,7 +13345,12 @@ impl Compiler {
         Ok(true)
     }
 
-    fn finish_call(&mut self, args: &[ArrayElem], with_this: bool, allow_inline: bool) -> CResult {
+    fn finish_call(&mut self, args: &[ArrayElem], callee: CalleeShape) -> CResult {
+        let CalleeShape {
+            with_this,
+            allow_inline,
+            named_method,
+        } = callee;
         // Taken before the arguments compile: their own calls record their own names.
         let name = self.pending_call_name.take();
         let tail = std::mem::take(&mut self.tail_finish) && ordinary_tail_call_depth() != 0;
@@ -13254,7 +13361,7 @@ impl Compiler {
                 let plan_hit = (allow_inline && (tail || !self.lowering_tail))
                     .then(|| self.plan_hit())
                     .flatten();
-                let cache = self.new_call_cache();
+                let cache = self.new_call_cache(named_method);
                 // [operands] TailDeep; JumpIfFalse(ordinary); TailCall; Jump(join);
                 // ordinary: <call or splice>; join: (see `Op::TailDeep`).
                 let join = tail.then(|| {
@@ -13291,7 +13398,8 @@ impl Compiler {
                 }
             }
             CallArgsMode::FinalSpread(argc) => {
-                let cache = self.new_call_cache();
+                // Marked as the fixed form is, though the planner splices no spread call.
+                let cache = self.new_call_cache(named_method);
                 let call = self.emit(if with_this {
                     Op::CallSpreadThis(argc, cache)
                 } else {
@@ -13348,7 +13456,9 @@ impl Compiler {
         self.patch(generic);
         self.emit(Op::LoadLocal(iter_s));
         self.emit(Op::LoadLocal(next_s));
-        let call = self.new_call_cache();
+        // `next` was read once, before the loop, into its slot: not a named method call's
+        // callee (and no plan reaches this site).
+        let call = self.new_call_cache(false);
         self.emit(Op::CallWithThis(0, call));
         self.emit(Op::RequireIterResult);
         self.emit(Op::Dup);
@@ -13368,7 +13478,7 @@ impl Compiler {
     /// needed. Grouping does not apply GetValue (ECMA-262 §13.2.9.3), including around an
     /// OptionalExpression. A grouped chain owns its short-circuit boundary: `(null?.m)(arg())`
     /// must evaluate arg before throwing, while `(null?.m)?.(arg())` skips it.
-    fn callee_reference(&mut self, e: &Expr) -> Result<(bool, bool), Bail> {
+    fn callee_reference(&mut self, e: &Expr) -> Result<CalleeShape, Bail> {
         let mut shorts = Vec::new();
         let shape = self.call_reference(e, &mut shorts)?;
         if !shorts.is_empty() {
@@ -13376,7 +13486,7 @@ impl Compiler {
             for short in shorts {
                 self.patch(short);
             }
-            if shape.0 {
+            if shape.with_this {
                 self.emit(Op::Undef); // a short-circuit is a value, not a property Reference
             }
             self.emit(Op::Undef);
@@ -13385,11 +13495,12 @@ impl Compiler {
         Ok(shape)
     }
 
-    /// The open-chain form shares short-circuit exits with subsequent links. The returned
-    /// booleans select [receiver, callee] versus [callee], and speculative inline eligibility.
-    /// EvaluateCall (§13.3.6.2) also preserves WithBaseObject for Environment References;
-    /// comma/conditional/call results instead pass through ordinary value evaluation.
-    fn call_reference(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> Result<(bool, bool), Bail> {
+    /// The open-chain form shares short-circuit exits with subsequent links. The returned shape
+    /// selects [receiver, callee] versus [callee], speculative inline eligibility, and whether
+    /// the callee is a named method's (`Op::GetMethod`'s value). EvaluateCall (§13.3.6.2) also
+    /// preserves WithBaseObject for Environment References; comma/conditional/call results
+    /// instead pass through ordinary value evaluation.
+    fn call_reference(&mut self, e: &Expr, shorts: &mut Vec<usize>) -> Result<CalleeShape, Bail> {
         match e {
             Expr::Paren(inner) => self.call_reference(inner, shorts),
             Expr::OptionalChain(inner) => self.callee_reference(inner),
@@ -13401,7 +13512,7 @@ impl Compiler {
             } if matches!(**obj, Expr::Super) => {
                 self.super_named_reference(prop);
                 self.emit(Op::SuperGetMethod);
-                Ok((true, false))
+                Ok(CalleeShape::UNSPLICED_METHOD)
             }
             Expr::Index {
                 obj,
@@ -13411,7 +13522,7 @@ impl Compiler {
             } if matches!(**obj, Expr::Super) => {
                 self.super_computed_reference(index)?;
                 self.emit(Op::SuperGetMethod);
-                Ok((true, false))
+                Ok(CalleeShape::UNSPLICED_METHOD)
             }
             Expr::Member {
                 obj,
@@ -13427,11 +13538,11 @@ impl Compiler {
                 if prop.starts_with('#') {
                     let site = self.new_private_site();
                     self.emit(Op::GetPrivateMethod(name, site));
-                    Ok((true, false))
+                    Ok(CalleeShape::UNSPLICED_METHOD)
                 } else {
                     let cache = self.new_cache(name);
                     self.emit(Op::GetMethod(name, cache));
-                    Ok((true, true))
+                    Ok(CalleeShape::NAMED_METHOD)
                 }
             }
             Expr::Index {
@@ -13446,7 +13557,7 @@ impl Compiler {
                 }
                 self.expr(index)?;
                 self.emit(Op::GetMethodElem);
-                Ok((true, true))
+                Ok(CalleeShape::RECEIVER)
             }
             Expr::Ident(name, _) if self.home(name).is_none() => {
                 let text = name;
@@ -13454,11 +13565,11 @@ impl Compiler {
                 let cache = self.new_name_cache(name, false);
                 self.note_static_name(cache, text);
                 self.emit(Op::LoadNameForCall(name, cache));
-                Ok((true, true))
+                Ok(CalleeShape::RECEIVER)
             }
             other => {
                 self.opt_chain(other, shorts)?;
-                Ok((false, true))
+                Ok(CalleeShape::VALUE)
             }
         }
     }
@@ -13688,12 +13799,13 @@ impl Compiler {
                 if matches!(&**callee, Expr::Super) && !call_opt {
                     return self.expr(e);
                 }
-                let (with_this, allow_inline) = self.call_reference(callee, shorts)?;
+                let shape = self.call_reference(callee, shorts)?;
                 if *call_opt {
-                    self.opt_link(if with_this { 2 } else { 1 }, shorts);
+                    // `o.m?.()`: the call runs on GetMethod's value where it is not nullish.
+                    self.opt_link(if shape.with_this { 2 } else { 1 }, shorts);
                 }
                 self.pending_call_name = Some(crate::callee_name::callee_name(callee));
-                self.finish_call(args, with_this, allow_inline)
+                self.finish_call(args, shape)
             }
             // The chain's base (before any `?.` link): an ordinary expression.
             other => self.expr(other),
@@ -17365,29 +17477,29 @@ impl Compiler {
             };
             let outermost = std::ptr::eq(link, e);
             self.at_position(*pos, |c| {
-                let (with_this, allow_inline) = match &**callee {
+                let shape = match &**callee {
                     Expr::Member { prop, .. } => {
                         let name = c.property_name_idx(prop);
                         if prop.starts_with('#') {
                             let site = c.new_private_site();
                             c.emit(Op::GetPrivateMethod(name, site));
-                            (true, false)
+                            CalleeShape::UNSPLICED_METHOD
                         } else {
                             let cache = c.new_cache(name);
                             c.emit(Op::GetMethod(name, cache));
-                            (true, true)
+                            CalleeShape::NAMED_METHOD
                         }
                     }
                     Expr::Index { index, .. } => {
                         c.expr(index)?;
                         c.emit(Op::GetMethodElem);
-                        (true, true)
+                        CalleeShape::RECEIVER
                     }
-                    _ => (false, true),
+                    _ => CalleeShape::VALUE,
                 };
                 c.tail_finish = tail && outermost;
                 c.pending_call_name = Some(crate::callee_name::callee_name(callee));
-                c.finish_call(args, with_this, allow_inline)
+                c.finish_call(args, shape)
             })?;
         }
         Ok(())
@@ -17750,7 +17862,7 @@ impl Compiler {
             } => {
                 // Evaluation retains the Reference receiver. EvaluateCall checks IsCallable
                 // only after TemplateLiteral ArgumentListEvaluation, including substitutions.
-                let (with_this, _) = self.callee_reference(tag)?;
+                let shape = self.callee_reference(tag)?;
                 let site = self.templates.len() as u32;
                 self.templates.push((*site_id, quasis.clone()));
                 self.emit(Op::TemplateObject(site));
@@ -17758,8 +17870,11 @@ impl Compiler {
                     self.expr(substitution)?;
                 }
                 let argc = u16::try_from(subs.len() + 1).map_err(|_| Bail)?;
-                let cache = self.new_call_cache();
-                let call = self.emit(if with_this {
+                // Not marked a named method call, whatever the tag: the recompile splices no
+                // tagged template's call (it takes no plan here), and a mark would only have the
+                // planner plan several callees for nothing.
+                let cache = self.new_call_cache(false);
+                let call = self.emit(if shape.with_this {
                     Op::CallWithThis(argc, cache)
                 } else {
                     Op::Call(argc, cache)
@@ -17858,10 +17973,10 @@ impl Compiler {
                         if tail {
                             self.tail_call_node = 0;
                         }
-                        let (with_this, allow_inline) = self.callee_reference(other)?;
+                        let shape = self.callee_reference(other)?;
                         self.tail_finish = tail;
                         self.pending_call_name = Some(crate::callee_name::callee_name(other));
-                        self.finish_call(args, with_this, allow_inline)?;
+                        self.finish_call(args, shape)?;
                     }
                 }
                 Ok(())

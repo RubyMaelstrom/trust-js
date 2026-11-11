@@ -67,13 +67,18 @@ comment/example in the same change.
   keeping its first stage (a stale chain's recompile, `code3`, is compiled by the tier too); the
   tier refuses a chunk of more than 15,000 operations before its snapshot, and one with nothing
   to splice before its bytecode recompile (V8's `max_optimized_bytecode_size`). With the tier on
-  the inline plan splices no call site whose ways hold more than one distinct callee, and none
-  that met another closure of a way's function (its first code-keyed hit, which the site records
-  once by writing its code hint), as Maglev and Warp inline no polymorphic call and the exemplars
-  guard closures by their code; with the tier off the plans are as before. `TRUST_JS_TIER_LOG=1`
-  names each such site (`[tier] inline skip site <n> (pc <pc> of <name>, depth <d>): several
-  callees|another closure of its callee's function, the tier's rule; <n> distinct callee(s):
-  <name>|<first stage>|<cell address>; ...`). A failed
+  the inline plan splices no call site whose ways hold more than one distinct callee unless the
+  call is a named method call (`o.m(...)`, whose callee `GetMethod` reads, as the bytecode
+  compiler marks the site), and none that met another closure of a way's function (its first
+  code-keyed hit, which the site records once by writing its code hint): Maglev inlines no
+  polymorphic call but continues a polymorphic named load's arms through the call of the loaded
+  function, Warp inlines none, and the exemplars guard closures by their code; with the tier off
+  the plans are as before. `TRUST_JS_TIER_LOG=1` names each site the rule declines, and each
+  named method call's site of several callees it admits (`[tier] inline skip site|site <n> (pc
+  <pc> of <name>, depth <d>, call <source name>): several callees, not a named method
+  call|another closure of its callee's function|several callees at a named method call,
+  admitted, the tier's rule; <n> distinct callee(s): <name>|<first stage>|<cell address>;
+  ...`). A failed
   speculation exits to the bytecode VM, which finishes the call. After 100 << R exits of one
   code object (R, the function's discards so far, up to 13) the code is discarded: new entries
   take the template JIT's code (a compile deferred for executable capacity leaves the chunk to
