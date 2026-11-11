@@ -1496,6 +1496,45 @@ fn a_call_over_four_callees_converges_on_the_guards_mismatch_edge() {
         .any(|node| matches!(node.op, NodeOp::CheckCallee { .. })));
 }
 
+/// A late second closure (P3 stage 2, step 15's point 5): a site that met one closure when the
+/// second stage was planned splices it under the tier's rule; fresh closures afterwards fail its
+/// guard to the exit limit. No plan follows: the reoptimization compiles the same second stage
+/// (step 3's departure 1), and the discard's WrongCallee flag sends the closures to the guard's
+/// mismatch edge, the generic call in place, which meets them by code.
+#[test]
+fn a_late_second_closure_converges_on_the_guards_mismatch_edge() {
+    let chunk = converges(
+        "apply1",
+        "function apply1(f, x) { return f(x); }\n\
+         function make(k) { return (v) => v + k; }\n\
+         const one = make(1);\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t += apply1(one, k); t",
+        "let u = 0; for (let k = 0; k < 600; k++) u += apply1(make(k), k); u",
+        "apply1(make(3), 4) * 100 + apply1(make(5), 6)",
+        ExitReason::WrongCallee,
+    );
+    let graph = graph_now(&chunk);
+    use super::ir::NodeOp;
+    assert!(graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::CalleeMatches { .. })));
+    assert!(!graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::CheckCallee { .. })));
+    // The splice's generic call met the closures by code, through the second stage's own site.
+    let generic = chunk
+        .jit_ops()
+        .iter()
+        .find_map(|op| match *op {
+            crate::bytecode::Op::Call(1, c) => Some(c),
+            _ => None,
+        })
+        .expect("the splice's generic call");
+    assert!(chunk.test_call_site(generic).met_another_closure());
+}
+
 #[test]
 fn a_block_that_starts_to_run_converges_on_its_code() {
     converges(

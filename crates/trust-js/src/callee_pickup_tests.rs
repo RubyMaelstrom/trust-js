@@ -429,8 +429,9 @@ fn a_megamorphic_site_keeps_its_overflow_entries() {
 
 /// A polymorphic site's callees get new code: a callee in the site's ways refills its way, and
 /// one in the overflow table refills its entry there, evicting no way (a callee's new code is
-/// not a new callee). The site stays polymorphic with its ways, and the caller's own second
-/// stage splices the callees they hold, with the optimizing tier on as with it off.
+/// not a new callee). The site stays polymorphic with its ways; with the optimizing tier off the
+/// caller's own second stage splices the callees they hold, and with it on the caller's plan
+/// splices none of them (the exemplars' rule: P3 stage 2, step 15).
 #[test]
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
@@ -446,7 +447,6 @@ fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
         #[cfg(target_arch = "aarch64")]
         ("tier eager", true, true),
     ];
-    let mut splices = None;
     for (label, on, eager) in configurations {
         // The callees' checkpoints come first: `stable`'s loop counts nothing toward its own. With
         // the counting (P3 stage 2, step 8) it gets six runs for each of a callee's, and its
@@ -509,12 +509,23 @@ fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
                 "{label}: six[{q}] is cached"
             );
         }
-        // `stable` past its own checkpoint: its second stage splices its ways' callees.
+        // `stable` past its own checkpoint. With the tier off its second stage splices its ways'
+        // callees. With the tier on its site, which holds four callees, splices none (the
+        // exemplars' rule, P3 stage 2, step 15): the plan is empty, and the tier's code goes on
+        // `stable`'s first stage (step 14).
         for _ in 0..40 {
             eval(&mut engine, "for (var r = 0; r < 250; r++) stable(6);");
-            if stages(&stable).1.is_some() {
+            if stages(&stable).1.is_some() || crate::opt::in_place(&stages(&stable).0) {
                 break;
             }
+        }
+        if on {
+            assert!(stages(&stable).1.is_none(), "{label}: nothing spliced");
+            assert!(
+                crate::opt::in_place(&stages(&stable).0),
+                "{label}: the tier's code on stable's first stage"
+            );
+            continue;
         }
         let second = stages(&stable)
             .1
@@ -525,7 +536,6 @@ fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
             .filter(|op| matches!(op, Op::InlineGuard(..)))
             .count();
         assert!(guards >= 4, "{label}: {guards} splices");
-        assert_eq!(*splices.get_or_insert(guards), guards, "{label}");
     }
 }
 

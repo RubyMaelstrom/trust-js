@@ -440,3 +440,69 @@ fn a_construct_site_of_fresh_constructors_pins_only_its_entry() {
         assert!(filled >= 1, "{maker}'s site took the construct cache");
     }
 }
+
+/// P3 stage 2, step 15: a call site records its first code-keyed hit, another closure of a way's
+/// function, by writing its code hint, which starts at `CALL_SITE_NO_CODE_HIT`, and keeps it (the
+/// record the inline planner reads with the optimizing tier on). On ARM64 the call template's full
+/// code probe writes it; on x86-64, whose calls take the generic call helper, the Rust
+/// code-sharing retry (`Interp::resolve_cached_call_entry`). A site that meets one closure only,
+/// or another function's, has no record; a recompile's site starts with its first stage's.
+#[test]
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_call_site_records_its_first_code_keyed_hit() {
+    crate::opt::pin_tier_off_for_test();
+    let program = "function apply1(f, x) { return f(x); }\n\
+                   function make(k) { return (v) => v + k; }\n\
+                   function id(v) { return v; }\n\
+                   const one = make(1);\n\
+                   apply1(one, 1) + apply1(one, 2) + apply1(id, 3)";
+    // The call-cache epoch is process-wide: another test's discard that moves it between the
+    // fills and the hit makes the hit a refill of another way, and the run is made again.
+    for _ in 0..3 {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        assert_eq!(eval(&mut engine, program), "8");
+        let chunk = chunk_of(&mut engine, "apply1");
+        let site = chunk.test_call_site(0);
+        assert_eq!(site.code_hint.get(), CALL_SITE_NO_CODE_HIT);
+        assert!(
+            !site.met_another_closure(),
+            "one closure and another function"
+        );
+        assert_eq!(eval(&mut engine, "apply1(make(2), 40)"), "42");
+        let env = engine.interp.global_env;
+        let one: Value = engine.interp.get_var("one", &env).ok().expect("bound name");
+        let ValueView::Obj(one) = one.view() else {
+            panic!("a closure")
+        };
+        let one = crate::value::Gc::as_ptr(&one) as usize;
+        let way = site.entries.iter().position(|way| way.get().callee == one);
+        // A run is judged when no way holds another closure of the arrow (`id`'s way may be
+        // filled or not, as its first call found it compiled or not).
+        let arrow = site.entries[way.unwrap_or(0)].get().func;
+        let others = site
+            .entries
+            .iter()
+            .filter(|way| way.get().callee != one && way.get().func == arrow)
+            .count();
+        if way.is_none() || others != 0 {
+            continue;
+        }
+        assert!(
+            site.met_another_closure(),
+            "the first code-keyed hit's record"
+        );
+        assert_eq!(Some(usize::from(site.code_hint.get())), way);
+        assert_eq!(eval(&mut engine, "apply1(make(3), 40)"), "43");
+        assert!(site.met_another_closure(), "kept");
+        // A recompile's site starts with its first stage's record (`call_cache_seeds`).
+        let seeds = call_cache_seeds(&chunk);
+        assert_eq!(seeds[0].code_hint, site.code_hint.get());
+        return;
+    }
+    panic!("the call-cache epoch moved in each of three runs");
+}

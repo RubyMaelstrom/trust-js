@@ -15881,7 +15881,7 @@ impl Interp {
                     return CachedCall::Miss;
                 }
                 let mut found = None;
-                for e in &site.entries {
+                for (way, e) in site.entries.iter().enumerate() {
                     let p = e.as_ptr();
                     unsafe {
                         if (*p).func == fp && (*p).global_env == genv && (*p).epoch == epoch {
@@ -15889,14 +15889,17 @@ impl Interp {
                             {
                                 return CachedCall::Miss;
                             }
-                            found = Some(*p);
+                            found = Some((way, *p));
                             break;
                         }
                     }
                 }
-                let Some(mut ic) = found else {
+                let Some((way, mut ic)) = found else {
                     return CachedCall::Miss;
                 };
+                // The site met another closure of the way's function: its record, as the
+                // machine code's full probe writes it (`CallSite::code_hint`).
+                site.note_code_hit(way);
                 // PrepareForOrdinaryCall's Function is the LIVE closure, not the
                 // instance that populated this code-sharing entry. FnFrame borrows
                 // its identity from the caller's callee Value; the old instance may

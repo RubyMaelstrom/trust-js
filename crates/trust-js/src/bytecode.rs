@@ -1523,7 +1523,8 @@ impl PrivateSite {
 /// Way count of [`CallSite::entries`] — the JIT call template's inline probe walks all of them.
 pub const CALL_IC_WAYS: usize = 4;
 
-/// `repr(C)`: machine code addresses `code_hint` from the first way (`CALL_SITE_CODE_HINT_OFF`).
+/// `repr(C)`: machine code addresses `code_hint` from the first way (`CALL_SITE_CODE_HINT_OFF`),
+/// and the hinted-way test of [`CALL_SITE_NO_CODE_HIT`] reads `hint_guard`'s word.
 #[repr(C)]
 pub struct CallSite {
     pub entries: [std::cell::Cell<CallIc>; CALL_IC_WAYS],
@@ -1534,10 +1535,16 @@ pub struct CallSite {
     /// Round-robin fill cursor.
     pub next: std::cell::Cell<u8>,
     /// The way of the site's last code-keyed hit, which the call template tests first once way
-    /// 0's identity misses (a site whose callee is made afresh for each pass, a callback, say).
-    /// Only a hint: machine code writes it (the secondary probe's code-keyed hit, see
-    /// `jit::emit_call_code_probe`), any value below `CALL_IC_WAYS` names a way, and a stale one
-    /// costs one failed test.
+    /// 0's identity misses (a site whose callee is made afresh for each pass, a callback, say),
+    /// or [`CALL_SITE_NO_CODE_HIT`] until the site's first code-keyed hit. A hint: the machine
+    /// code's full code probe writes it (`jit::emit_call_code_probe`), and so do the Rust paths'
+    /// code-keyed hits ([`CallSite::note_code_hit`]); a stale way costs one failed test. It is
+    /// also the record that the site met another closure of a way's function, which the inline
+    /// planner reads with the optimizing tier on ([`CallSite::met_another_closure`]), as V8
+    /// writes a call slot's feedback cell once, at its transition
+    /// (src/builtins/ic-callable.tq:132-148), and compares without writing after: the hinted-way
+    /// test cannot hit the starting value, so the first code-keyed hit takes the full probe,
+    /// which writes the hint.
     pub code_hint: std::cell::Cell<u8>,
     /// The live ways the site's fills have evicted in the epoch `counted_epoch`, up to
     /// [`CALL_SITE_MEGAMORPHIC_EVICTIONS`], where the site is megamorphic for good (see
@@ -1546,13 +1553,31 @@ pub struct CallSite {
     /// The callees a megamorphic site has put in the overflow table in its current window, up
     /// to [`CALL_SITE_OVERFLOW_ADMISSIONS`] (see [`CallSite::admits_overflow`]).
     admissions: std::cell::Cell<u8>,
-    /// The calls a megamorphic site has made through the full guards, its admissions spent, for
-    /// want of an entry, since its window began, up to [`CALL_SITE_OVERFLOW_RENEWAL`].
-    declined: std::cell::Cell<u16>,
     /// The [`CALL_IC_EPOCH`] whose events `evictions` counts, and `admissions` once the site is
     /// megamorphic.
     counted_epoch: std::cell::Cell<u32>,
+    /// [`CALL_SITE_HINT_GUARD`], never written after: the low byte of the word that the hinted-way
+    /// test reads as the function of way [`CALL_SITE_NO_CODE_HIT`], the way past the last (its
+    /// offset from the first way is compile-asserted below), so that this test fails at its
+    /// first compare without reading outside the site.
+    hint_guard: u8,
+    /// The calls a megamorphic site has made through the full guards, its admissions spent, for
+    /// want of an entry, since its window began, up to [`CALL_SITE_OVERFLOW_RENEWAL`].
+    declined: std::cell::Cell<u16>,
 }
+
+/// [`CallSite::code_hint`] before the site's first code-keyed hit (P3 stage 2, step 15): the way
+/// past the last, which the hinted-way test cannot hit. The test computes the hinted way's address
+/// as the first way's plus the hint times a way's size, and compares that way's function word
+/// first (`jit::emit_call_code_way`): for this value it reads the site's own `hint_guard` word,
+/// inside the site, whose low byte, [`CALL_SITE_HINT_GUARD`], is odd, while a function's identity
+/// (`Rc::as_ptr` of an `ast::Function`) is a multiple of 8, so the compare fails and no other
+/// word is read. Any other value the hint takes (a way's index, written by a code-keyed hit)
+/// names a way.
+pub const CALL_SITE_NO_CODE_HIT: u8 = CALL_IC_WAYS as u8;
+
+/// [`CallSite::hint_guard`]'s value: odd, so that its word is never a function's identity.
+pub const CALL_SITE_HINT_GUARD: u8 = 1;
 
 /// The live ways a call site may evict in one call-cache epoch before it is megamorphic: having
 /// seen four more callees than its ways hold, eight in all, it keeps its ways and stops refilling
@@ -1610,6 +1635,26 @@ const _: () =
 pub(crate) const CALL_SITE_CODE_HINT_OFF: usize =
     std::mem::offset_of!(CallSite, code_hint) - std::mem::offset_of!(CallSite, entries);
 
+/// Byte offset of [`CallSite::hint_guard`] from the site's first way.
+pub(crate) const CALL_SITE_HINT_GUARD_OFF: usize =
+    std::mem::offset_of!(CallSite, hint_guard) - std::mem::offset_of!(CallSite, entries);
+// The hinted-way test of `CALL_SITE_NO_CODE_HIT` reads only `hint_guard`'s word (see
+// `CALL_SITE_NO_CODE_HIT`): it lies where that way's function word would, it is whole inside the
+// site (and 8-aligned, as the site is), its low byte is odd, and every function identity is a
+// multiple of 8 (an `ast::Function`'s alignment).
+const _: () = assert!(
+    CALL_SITE_NO_CODE_HIT as usize == CALL_IC_WAYS
+        && CALL_SITE_HINT_GUARD_OFF
+            == CALL_SITE_NO_CODE_HIT as usize * std::mem::size_of::<std::cell::Cell<CallIc>>()
+                + std::mem::offset_of!(CallIc, func)
+        && CALL_SITE_HINT_GUARD_OFF.is_multiple_of(8)
+        && std::mem::align_of::<CallSite>().is_multiple_of(8)
+        && std::mem::offset_of!(CallSite, entries) + CALL_SITE_HINT_GUARD_OFF + 8
+            <= std::mem::size_of::<CallSite>()
+        && CALL_SITE_HINT_GUARD % 2 == 1
+        && std::mem::align_of::<Function>() >= 8
+);
+
 impl CallSite {
     pub fn empty() -> CallSite {
         CallSite {
@@ -1621,11 +1666,29 @@ impl CallSite {
             ],
             func_pins: std::cell::RefCell::new(std::array::from_fn(|_| std::rc::Weak::new())),
             next: std::cell::Cell::new(0),
-            code_hint: std::cell::Cell::new(0),
+            code_hint: std::cell::Cell::new(CALL_SITE_NO_CODE_HIT),
             evictions: std::cell::Cell::new(0),
             admissions: std::cell::Cell::new(0),
-            declined: std::cell::Cell::new(0),
             counted_epoch: std::cell::Cell::new(0),
+            hint_guard: CALL_SITE_HINT_GUARD,
+            declined: std::cell::Cell::new(0),
+        }
+    }
+    /// Whether the site has met another closure of a way's function: a code-keyed hit wrote its
+    /// hint (see [`CallSite::code_hint`]). The inline planner splices no such site with the
+    /// optimizing tier on (P3 stage 2, step 15), as V8, SpiderMonkey and JSC guard such a site's
+    /// inlined callee by its code rather than its identity, which a splice cannot do.
+    pub fn met_another_closure(&self) -> bool {
+        self.code_hint.get() != CALL_SITE_NO_CODE_HIT
+    }
+    /// A code-keyed hit at way `way` on a Rust path (the code-sharing retry of
+    /// `Interp::resolve_cached_call_entry`, the call-hit helper's run of the live closure): the
+    /// hint names the way, as the machine code's full probe writes it, which records the hit.
+    /// Written only when it changes, as the machine code's hinted test writes nothing.
+    pub(crate) fn note_code_hit(&self, way: usize) {
+        debug_assert!(way < CALL_IC_WAYS);
+        if usize::from(self.code_hint.get()) != way {
+            self.code_hint.set(way as u8);
         }
     }
     /// Whether the site is megamorphic: its fills have evicted
@@ -9102,6 +9165,9 @@ struct CallSeed {
     entries: [CallIc; CALL_IC_WAYS],
     func_pins: [std::rc::Weak<Function>; CALL_IC_WAYS],
     next: u8,
+    /// The site's code hint, its record of a code-keyed hit (see `CallSite::code_hint`): the
+    /// seeded ways keep their order, so a way it names is the same function's or empty.
+    code_hint: u8,
     /// The site's evictions and their epoch, so that a megamorphic site stays megamorphic in
     /// recompiled code.
     evictions: u8,
@@ -9180,6 +9246,7 @@ fn call_cache_seeds(chunk: &Chunk) -> Vec<CallSeed> {
                     }
                 }),
                 next: site.next.get(),
+                code_hint: site.code_hint.get(),
                 evictions: site.evictions.get(),
                 counted_epoch: site.counted_epoch.get(),
                 pins: seed_pins,
@@ -10737,6 +10804,9 @@ fn plan_inlines_at(
     let pins = chunk.call_pins.borrow();
     let sites_in_loops = call_sites_in_loops(chunk);
     let spread_sites = spread_call_sites(chunk);
+    // With the optimizing tier on, the exemplars' rule (`splice_rule_declines`); with it off,
+    // P2's policy, the template JIT's guarded splices of every way.
+    let exemplars_rule = crate::opt::enabled();
     for (idx, site) in chunk.call_caches.iter().enumerate() {
         if spread_sites[idx] {
             skip!(idx, "spread call (never spliced)")
@@ -10756,6 +10826,14 @@ fn plan_inlines_at(
         // so consume all four when the body budget permits: Richards' central task dispatcher is
         // exactly four-way polymorphic, and leaving half of it as real calls dominates runtime.
         filled.dedup_by_key(|c| c.callee);
+        if exemplars_rule {
+            if let Some(why) = splice_rule_declines(site, &filled) {
+                if log {
+                    log_splice_rule_skip(chunk, depth, idx, &filled, why, &pins);
+                }
+                continue;
+            }
+        }
         let mut ways: Vec<InlineWay> = Vec::new();
         for ic in filled.iter().take(INLINE_MAX_WAYS) {
             let Some(weak) = pins.get(&ic.callee) else {
@@ -10884,6 +10962,81 @@ fn plan_inlines_at(
         plan.insert(idx as u32, InlinePlanEntry { ways });
     }
     plan
+}
+
+/// Why the inline planner splices none of a call site's ways with the optimizing tier on (P3
+/// stage 2, step 15), its ways `filled` (the filled ways, as the planner lists them), if it does
+/// not. The exemplars' rule: no site whose ways hold more than one distinct callee, as Maglev
+/// inlines no polymorphic call (only a polymorphic load's constant-function arms,
+/// maglev-graph-builder.cc:6038-6222) and Warp's trial inlining skips a site with more than one
+/// stub (jit/TrialInlining.cpp:865-878); and none that met another closure of a way's function
+/// ([`CallSite::met_another_closure`]), which all three keep inlining guarded by the callee's
+/// code (SpiderMonkey's GuardFunctionScript, jit/CacheIR.cpp:6607-6623; JSC's executable check,
+/// bytecode/CallLinkStatus.cpp:228-232; V8's feedback cell, src/builtins/ic-callable.tq:
+/// 132-148), where a splice pins its callee's identity and environment. A site with one callee
+/// that never met another closure splices as before.
+fn splice_rule_declines(site: &CallSite, filled: &[CallIc]) -> Option<&'static str> {
+    let first = filled.first()?;
+    if filled.iter().any(|c| c.callee != first.callee) {
+        return Some("several callees");
+    }
+    site.met_another_closure()
+        .then_some("another closure of its callee's function")
+}
+
+/// Under TRUST_JS_TIER_LOG, the planner's line for a site the optimizing tier's splice rule
+/// declines (`splice_rule_declines`): the site, its call's pc in `chunk` (a first stage: the
+/// optimized function's at depth 0, a spliced callee's below), the reason, and the ways' callees
+/// (a user function's name and first stage, by its cell's address).
+fn log_splice_rule_skip(
+    chunk: &Chunk,
+    depth: u32,
+    idx: usize,
+    filled: &[CallIc],
+    why: &str,
+    pins: &crate::fasthash::FastMap<usize, crate::value::WeakGc>,
+) {
+    let stage = |chunk: &Chunk| {
+        let names: Vec<&str> = chunk
+            .jit_slot_names()
+            .iter()
+            .take(4)
+            .map(|name| &**name)
+            .collect();
+        format!("fn({})", names.join(","))
+    };
+    let pc = chunk
+        .ops
+        .iter()
+        .position(|op| matches!(*op, Op::Call(_, c) | Op::CallWithThis(_, c) if c as usize == idx))
+        .map_or_else(|| "?".to_string(), |pc| pc.to_string());
+    let mut callees: Vec<usize> = filled.iter().map(|c| c.callee).collect();
+    callees.sort_unstable();
+    callees.dedup();
+    let label = |callee: usize| -> String {
+        let Some(obj) = pins.get(&callee).and_then(|weak| weak.upgrade()) else {
+            return format!("<dead>|{callee:#x}");
+        };
+        let b = obj.borrow();
+        let crate::value::ObjectKind::User(user) = &b.kind else {
+            return format!("<native>|{callee:#x}");
+        };
+        let runtime = user.func.runtime();
+        let first = match runtime.code.get() {
+            Some(Some(chunk)) => stage(chunk),
+            _ => "fn(?)".to_string(),
+        };
+        let name = user.func.name.as_deref().unwrap_or("<anon>");
+        format!("{name}|{first}|{callee:#x}")
+    };
+    let labels: Vec<String> = filled.iter().map(|c| label(c.callee)).collect();
+    eprintln!(
+        "[tier] inline skip site {idx} (pc {pc} of {}, depth {depth}): {why}, the tier's rule; \
+         {} distinct callee(s): {}",
+        stage(chunk),
+        callees.len(),
+        labels.join("; ")
+    );
 }
 
 #[cfg(test)]
@@ -12253,13 +12406,13 @@ impl Compiler {
                 (
                     seed.entries,
                     seed.func_pins.clone(),
-                    seed.next,
+                    (seed.next, seed.code_hint),
                     (seed.evictions, seed.counted_epoch),
                     seed.pins.clone(),
                 )
             })
         });
-        let site = if let Some((entries, func_pins, next, evictions, pins)) = seed {
+        let site = if let Some((entries, func_pins, (next, code_hint), evictions, pins)) = seed {
             for (callee, pin) in pins {
                 self.call_pins.entry(callee).or_insert(pin);
             }
@@ -12267,11 +12420,13 @@ impl Compiler {
                 entries: std::array::from_fn(|way| std::cell::Cell::new(entries[way])),
                 func_pins: std::cell::RefCell::new(func_pins),
                 next: std::cell::Cell::new(next),
-                code_hint: std::cell::Cell::new(0),
+                // The record of a code-keyed hit carries over, as the evictions do.
+                code_hint: std::cell::Cell::new(code_hint),
                 evictions: std::cell::Cell::new(evictions.0),
                 admissions: std::cell::Cell::new(0),
-                declined: std::cell::Cell::new(0),
                 counted_epoch: std::cell::Cell::new(evictions.1),
+                hint_guard: CALL_SITE_HINT_GUARD,
+                declined: std::cell::Cell::new(0),
             }
         } else {
             CallSite::empty()
@@ -26902,6 +27057,10 @@ unsafe fn jit_call_hit_inner(
                 debug_assert_eq!(Rc::as_ptr(&user.func), ic.func);
                 ic.callee = key;
                 ic.env = Env::as_ptr(&user.env);
+                // The site's record of a code-keyed hit (`CallSite::code_hint`). The probe that
+                // came here wrote it already (the hinted test hits only a written hint, and the
+                // full probe writes it before its hit), so this finds it written.
+                chunk.call_caches[c as usize].note_code_hit(way);
             }
         }
     });

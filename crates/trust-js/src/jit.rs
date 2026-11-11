@@ -7381,6 +7381,13 @@ mod call_epoch_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_call_record_tests.rs"]
+mod call_record_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "native_array_local_tests.rs"]
 mod native_array_local_tests;
 #[cfg(all(
@@ -11779,7 +11786,11 @@ fn emit_call_identity_way(a: &mut asm::Asm, miss: usize) {
 /// the callee must be an object from here on, since the code-keyed tests read its cell. Then the
 /// code-keyed test of the way of the site's last code-keyed hit (`CallSite::code_hint`: a site
 /// whose callee is made afresh for each pass, a callback, say, hits there), ways 1.. by
-/// identity, and the secondary probes. Inputs: x9 = the callee's word, x10 = that word EOR the
+/// identity, and the secondary probes. Until the site's first code-keyed hit the hint is
+/// `bytecode::CALL_SITE_NO_CODE_HIT`, the way past the last, whose test reads the site's guard
+/// word as that way's function and fails there, so that the first code-keyed hit takes the full
+/// probe, which writes the hint: the site's record of the hit (P3 stage 2, step 15), made with
+/// no instruction on any hit. Inputs: x9 = the callee's word, x10 = that word EOR the
 /// Object tag, x12 = the site's first way, w15 = the live epoch, x17 = the active Realm's global
 /// scope. A hit branches to `hit` with x12 at the matching entry and x15 = its index (tagged
 /// with `CALL_CODE_HIT` for a code-keyed hit; `CALL_IC_WAYS` for an overflow hit); anything else
@@ -11802,7 +11813,8 @@ fn emit_call_ways(
     a.mov(13, 10);
     let ways = a.new_label();
     if call_code_probe_supported(layout) {
-        // w6 = the hinted way's index, x14 = its entry.
+        // w6 = the hinted way's index, x14 = its entry (for `CALL_SITE_NO_CODE_HIT`, the way past
+        // the last, whose function word is the site's guard word: the test fails at that compare).
         a.ldrb_imm(6, 12, crate::bytecode::CALL_SITE_CODE_HINT_OFF as u32);
         a.movz(16, stride as u32, 0);
         a.madd(14, 6, 16, 12);
@@ -11930,7 +11942,8 @@ fn emit_call_code_probe(
     a.cbnz(7, false, miss);
     a.movz(15, crate::bytecode::CALL_IC_WAYS as u32 + CALL_CODE_HIT, 0);
     a.sub_reg(15, 15, 14);
-    // The site tests this way first next time (`CallSite::code_hint`).
+    // The site tests this way first next time (`CallSite::code_hint`); a first code-keyed hit's
+    // store is the site's record of it.
     let index = asm::logical_imm_w(crate::bytecode::CALL_IC_WAYS as u32 - 1).unwrap();
     a.logic_imm_w(0, 7, 15, index);
     a.strb_imm(7, 6, crate::bytecode::CALL_SITE_CODE_HINT_OFF as u32);
@@ -11964,7 +11977,10 @@ fn call_code_probe_supported(layout: &crate::value::JitLayout) -> bool {
 /// as a code-keyed hit, and branches to `miss` otherwise. Inputs are the code-keyed probe's
 /// (x10 = an object callee's cell, w15 = live epoch, x17 = the active Realm's global scope);
 /// only x7, x9, x11 and x16 are clobbered. The layout must allow the test
-/// ([`call_code_probe_supported`]).
+/// ([`call_code_probe_supported`]). The way's function word is the first of it read, and a
+/// mismatch there reads no more of it: the hinted-way test of `bytecode::CALL_SITE_NO_CODE_HIT`
+/// gives a "way" of which only that word lies inside the site (the site's guard word, never a
+/// function's identity).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
