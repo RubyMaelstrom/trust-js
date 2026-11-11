@@ -177,6 +177,10 @@ enum PerfMapFile {
     Open(std::fs::File),
     /// The file could not be opened. That is reported once, and later lines are dropped.
     Failed,
+    /// A test's capture ended (`PerfMapCapture`): later lines, from a job that outlived the
+    /// test, are dropped.
+    #[cfg(test)]
+    Closed,
 }
 
 impl PerfMap {
@@ -234,9 +238,57 @@ fn process_perf_map() -> Option<&'static PerfMap> {
 #[cfg(test)]
 thread_local! {
     /// A test's own map (see [`PerfMapCapture`]), which this thread's code is listed in instead
-    /// of the process's.
-    static TEST_PERF_MAP: std::cell::RefCell<Option<Rc<PerfMap>>> =
+    /// of the process's; on a thread that compiles a job, its main thread's (`TestPerfMap`).
+    static TEST_PERF_MAP: std::cell::RefCell<Option<std::sync::Arc<PerfMap>>> =
         const { std::cell::RefCell::new(None) };
+}
+
+/// The perf map capture of a test's main thread, which a job carries to the thread that compiles
+/// it, so that the stubs the compile makes are listed where the test reads them (P3 stage 2,
+/// step 17; as `jit::TestAddresses` carries its counters).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Default)]
+pub(crate) struct TestPerfMap(Option<std::sync::Arc<PerfMap>>);
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl TestPerfMap {
+    /// This thread's capture, if one is on.
+    pub(crate) fn capture() -> Self {
+        TestPerfMap(TEST_PERF_MAP.with(|map| map.borrow().clone()))
+    }
+
+    /// List this thread's code in the capture while the guard lives.
+    pub(crate) fn install(self) -> TestPerfMapGuard {
+        TestPerfMapGuard(TEST_PERF_MAP.with(|map| map.replace(self.0)))
+    }
+}
+
+/// [`TestPerfMap::install`]'s guard, which restores the previous capture.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) struct TestPerfMapGuard(Option<std::sync::Arc<PerfMap>>);
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl Drop for TestPerfMapGuard {
+    fn drop(&mut self) {
+        let previous = self.0.take();
+        let _ = TEST_PERF_MAP.try_with(|map| *map.borrow_mut() = previous);
+    }
 }
 
 /// Run `f` on the map this thread's code is listed in, if any.
@@ -258,6 +310,7 @@ fn with_perf_map<R>(f: impl FnOnce(&PerfMap) -> R) -> Option<R> {
 #[cfg(test)]
 pub(crate) struct PerfMapCapture {
     path: std::path::PathBuf,
+    map: std::sync::Arc<PerfMap>,
 }
 
 #[cfg(test)]
@@ -270,9 +323,9 @@ impl PerfMapCapture {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&path);
-        let map = Rc::new(PerfMap::new(path.clone()));
-        TEST_PERF_MAP.with(|current| *current.borrow_mut() = Some(map));
-        PerfMapCapture { path }
+        let map = std::sync::Arc::new(PerfMap::new(path.clone()));
+        TEST_PERF_MAP.with(|current| *current.borrow_mut() = Some(map.clone()));
+        PerfMapCapture { path, map }
     }
 
     /// Stop listing this thread's code; the lines written so far stay readable.
@@ -316,6 +369,11 @@ impl PerfMapCapture {
 impl Drop for PerfMapCapture {
     fn drop(&mut self) {
         self.stop();
+        *self
+            .map
+            .file
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = PerfMapFile::Closed;
         let _ = std::fs::remove_file(&self.path);
     }
 }

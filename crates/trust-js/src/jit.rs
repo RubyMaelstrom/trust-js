@@ -418,7 +418,10 @@ pub(crate) fn sync_instruction_stream() {
 
 /// Whether this thread is running an optimizing tier's compile off the main thread (P3 stage 2,
 /// step 12): debug builds check that such a compile reaches none of the main thread's state (its
-/// capacity reclaim, stub table, test switches, agent heap).
+/// capacity reclaim, test switches, agent heap, and in test builds its own stub table). The
+/// process's stub table under its lock and the executable buffers' mappings are the process's,
+/// which such a compile reaches (step 17: it makes a stub its snapshot lacks, through the table
+/// its job carries, `StubTableSnapshot`).
 pub(crate) fn off_main_compile() -> bool {
     #[cfg(debug_assertions)]
     {
@@ -7232,7 +7235,11 @@ fn callee_saved_fp_writes_are_found_in_every_encoding_class() {
 }
 
 /// Set once a process-wide stub writes one of d8..d15: chunks compiled afterwards keep their
-/// saves (a stub is compiled before any chunk that branches to it is finished).
+/// saves (a stub is compiled before any chunk that branches to it is finished). On every thread
+/// (P3 stage 2, step 17): the flag is set before the stub enters the table under the table's
+/// lock, and a compile reads it at its finish, after its stubs were found or made under that lock
+/// or in a snapshot its main thread took under it, so that the store happens before the read
+/// (the flag is never cleared, so a relaxed load after it reads it set).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -7411,6 +7418,13 @@ mod property_store_tests;
 #[cfg(test)]
 #[path = "jit_return_tests.rs"]
 mod return_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_stub_table_tests.rs"]
+mod stub_table_tests;
 
 #[cfg(all(
     target_arch = "x86_64",
@@ -17531,6 +17545,8 @@ struct GlobalStubTable {
     generation: u64,
 }
 
+// The process's table, under its lock: every thread's compiles share it, the optimizing tier's
+// compile thread's among them (P3 stage 2, step 17).
 #[cfg(all(
     not(test),
     target_arch = "aarch64",
@@ -17539,34 +17555,282 @@ struct GlobalStubTable {
 static GLOBAL_STUBS: std::sync::Mutex<Option<GlobalStubTable>> = std::sync::Mutex::new(None);
 
 // Test builds instrument some stub bodies with the addresses of thread-local counters, so a
-// body is only valid on the thread that assembled it: keep one table per thread there.
+// body is only valid with the counters of the thread it was assembled for: keep one table per
+// thread there, which a compile off that thread reaches through its job (`StubTable`), the
+// stubs it makes embedding that thread's counters (`TestAddresses`).
 #[cfg(all(
     test,
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 thread_local! {
-    static GLOBAL_STUBS: std::cell::RefCell<Option<GlobalStubTable>> =
-        const { std::cell::RefCell::new(None) };
+    static GLOBAL_STUBS: std::sync::Arc<std::sync::Mutex<Option<GlobalStubTable>>> =
+        std::sync::Arc::default();
+}
+
+/// A handle on the shared stubs' table (P3 stage 2, step 17): the process's; in test builds a
+/// thread's own, which a job carries to its compile's thread in its snapshot
+/// ([`StubTableSnapshot`]), so that the stubs the compile makes go into the table of the thread
+/// whose counters they embed.
+///
+/// The fence. A stub may be made on any thread ([`StubTable::stub`]), which publishes its buffer
+/// to the instruction side (`dc cvau`, `dsb ish`, `ic ivau`, `dsb ish`) before it releases the
+/// table's lock. Every path that obtains a stub's address branches to it only from code that its
+/// running thread synchronizes after taking that lock, so that no thread runs a stub without a
+/// context synchronization event after the stub was made:
+/// - a compile on a main thread (the template JIT's, the tier's synchronous one:
+///   `global_stub_address`) branches from the code it then publishes itself, whose flush ends in
+///   `dsb ish; isb` on that thread (`sys::publish`; on Windows FlushInstructionCache's system
+///   call);
+/// - a compile off the main thread, which finds the stub in its job's snapshot (taken under the
+///   lock on the main thread) or under the lock (found or made), branches from code its main
+///   thread runs only after the install's instruction barrier (`sync_instruction_stream`), which
+///   follows the snapshot in program order and the compile's lock through the results' queue.
+/// JSC marks a thunk a compiler thread made and fences the main thread at its first use of it
+/// (needsCrossModifyingCodeFence, jit/JITThunks.cpp:193-205), because its main thread can take a
+/// thunk without publishing code (calling it, or repatching a call to it). Here no path does:
+/// every caller of `global_stub_address` emits code, and no code is patched once published.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone)]
+pub(crate) struct StubTable {
+    #[cfg(test)]
+    table: std::sync::Arc<std::sync::Mutex<Option<GlobalStubTable>>>,
 }
 
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn with_global_stubs<R>(f: impl FnOnce(&mut Option<GlobalStubTable>) -> R) -> Option<R> {
-    debug_assert!(
-        !off_main_compile(),
-        "the stubs are assembled on the main thread (P3 stage 2, step 12)"
-    );
-    #[cfg(not(test))]
-    {
+impl StubTable {
+    /// This thread's table. A compile off the main thread asks its job's (its snapshot's
+    /// `owner`), which in test builds is another thread's.
+    fn current() -> Self {
+        debug_assert!(
+            !off_main_compile(),
+            "a compile off the main thread asks its job's stub table (P3 stage 2, step 17)"
+        );
+        StubTable {
+            #[cfg(test)]
+            table: GLOBAL_STUBS.with(std::sync::Arc::clone),
+        }
+    }
+
+    /// Run `f` on the table under its lock (None where a panic poisoned it).
+    fn with<R>(&self, f: impl FnOnce(&mut Option<GlobalStubTable>) -> R) -> Option<R> {
+        #[cfg(not(test))]
         let mut table = GLOBAL_STUBS.lock().ok()?;
+        #[cfg(test)]
+        let mut table = self.table.lock().ok()?;
         Some(f(&mut table))
     }
+
+    /// `key`'s stub for an emission in `context`, assembled into the table where the table lacks
+    /// it: its address, and whether this call made it; None where the chunk keeps its own copy
+    /// (TRUST_JS_JIT_CHUNK_STUBS, another context, a failed assembly). The lookup, the assembly
+    /// and the insert are one hold of the table's lock, so that of the threads that ask for one
+    /// key at once (engines' main threads, their template JIT's and tier's compiles, the compile
+    /// thread's) the first makes the stub and the others find it, as JSC's JITThunks::ctiStubImpl
+    /// holds its thunks' lock across the lookup, the generation and the add
+    /// (jit/JITThunks.cpp:189-222). A stub made here sets the callee-saved flag before it enters
+    /// the table (`assemble_global_stub`), and the table's generation moves, so that its owner's
+    /// next snapshot is taken again (`stub_table_snapshot`). `job`: an emission off the main
+    /// thread's reads (P3 stage 2, step 17), with which the stub is assembled and mapped without
+    /// the main thread's reclaim; None: the calling thread's own, with the reclaim.
+    fn stub(
+        &self,
+        key: u32,
+        context: &StubContext<'_>,
+        job: Option<&StubReads>,
+    ) -> Option<(u64, bool)> {
+        if env_flag!("TRUST_JS_JIT_CHUNK_STUBS") {
+            return None;
+        }
+        let ilayout = *context.ilayout?;
+        // The direct sequence's offsets and its entry weight (`emit_direct_sequence`'s retry
+        // gate), which a test thread may change by switching the tier: a job's as its main
+        // thread read it with the snapshot.
+        let entry_weight = match job {
+            Some(job) => job.entry_weight,
+            None => crate::opt::entry_weight(),
+        };
+        let direct = context.direct.map(|direct| {
+            (
+                direct.attempted_off,
+                direct.runs_off,
+                direct.retry_off,
+                entry_weight,
+            )
+        });
+        let is_direct = SharedStub::from_key(key).enters_direct_sequence();
+        if is_direct && direct.is_none() {
+            return None;
+        }
+        let stub = self.with(|table| {
+            let table = table.get_or_insert_with(|| GlobalStubTable {
+                layout: *context.layout,
+                ilayout,
+                direct,
+                addresses: Default::default(),
+                generation: 0,
+            });
+            if table.layout != *context.layout || table.ilayout != ilayout {
+                return None;
+            }
+            if is_direct {
+                match table.direct {
+                    Some(known) if Some(known) != direct => return None,
+                    Some(_) => {}
+                    None => {
+                        table.direct = direct;
+                        table.generation += 1;
+                    }
+                }
+            }
+            if let Some(&address) = table.addresses.get(&key) {
+                return Some((address, false));
+            }
+            let address = assemble_global_stub(key, context, job)?;
+            let earlier = table.addresses.insert(key, address);
+            debug_assert!(earlier.is_none(), "a stub is made once");
+            table.generation += 1;
+            Some((address, true))
+        })?;
+        // Tests: the stub made is in the table, and the lock released (`TEST_STUB_MADE`).
+        #[cfg(test)]
+        if let Some((_, true)) = stub {
+            if let Some(hook) = TEST_STUB_MADE.with(|hook| hook.borrow_mut().take()) {
+                hook();
+            }
+        }
+        stub
+    }
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    /// Run once by the next stub this thread makes, once the stub is in the table and the
+    /// table's lock released: the first moment another thread can find it (tests).
+    pub(crate) static TEST_STUB_MADE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` on this thread's stub table under its lock (tests).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn with_global_stubs<R>(f: impl FnOnce(&mut Option<GlobalStubTable>) -> R) -> Option<R> {
+    StubTable::current().with(f)
+}
+
+/// This thread's stub table (tests): its generation, and its stubs' addresses by key.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn stub_table_for_test() -> (u64, Vec<(u32, u64)>) {
+    with_global_stubs(|table| {
+        table.as_ref().map_or((0, Vec::new()), |table| {
+            let mut stubs: Vec<(u32, u64)> = table
+                .addresses
+                .iter()
+                .map(|(&key, &address)| (key, address))
+                .collect();
+            stubs.sort_unstable();
+            (table.generation, stubs)
+        })
+    })
+    .unwrap_or_default()
+}
+
+/// Whether a process-wide stub wrote d8-d15 (tests; `STUB_WRITES_CALLEE_SAVED_FP`).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn stub_writes_callee_saved_fp_for_test() -> bool {
+    STUB_WRITES_CALLEE_SAVED_FP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Forget this thread's stubs (tests), so that the next request of each makes it again: the
+/// table keeps its context and its generation moves; the forgotten stubs' code stays mapped for
+/// the chunks that branch to it, as every stub's does.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn forget_stubs_for_test() {
+    with_global_stubs(|table| {
+        if let Some(table) = table {
+            table.addresses.clear();
+            table.generation += 1;
+        }
+    });
+}
+
+/// What a shared stub's assembly reads besides its context, which an emission off the main
+/// thread takes from its job (P3 stage 2, step 17): the native runs an entry counts
+/// (`opt::entry_weight`) and whether a direct construct makes `this` in line (the running Agent
+/// heap's in-line allocation site), read on the job's main thread with its snapshot
+/// (`opt::a64::Switches`), where the main thread's own assembly reads them as its emission does
+/// (`Asm::entry_weight`, `Asm::inline_construct`).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct StubReads {
+    pub(crate) entry_weight: u32,
+    pub(crate) inline_construct: bool,
+    /// Tests: the stubs the emission makes find no executable memory, as where the budget cannot
+    /// take them without the main thread's reclaim (`opt::TestSwitches::stub_memory_refused`).
     #[cfg(test)]
-    {
-        GLOBAL_STUBS.with(|table| Some(f(&mut table.borrow_mut())))
+    pub(crate) memory_refused: bool,
+    /// Tests: the stubs the emission makes write d8 (`opt::TestSwitches::stubs_write_d8`).
+    #[cfg(test)]
+    pub(crate) writes_d8: bool,
+}
+
+/// The stubs an emission off the main thread met missing from its snapshot's table (P3 stage 2,
+/// step 17), by key, in the order it met them: those it found in the table under its lock (made
+/// by another thread since the snapshot), those it made there, and those whose assembly failed,
+/// whose bodies the code carries.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Debug, Default)]
+pub(crate) struct MissingStubs {
+    pub(crate) found: Vec<u32>,
+    pub(crate) made: Vec<u32>,
+    pub(crate) copies: Vec<u32>,
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl MissingStubs {
+    /// How many stubs the emission met missing.
+    pub(crate) fn len(&self) -> usize {
+        self.found.len() + self.made.len() + self.copies.len()
+    }
+
+    fn note(list: &mut Vec<u32>, key: u32) {
+        if !list.contains(&key) {
+            list.push(key);
+        }
     }
 }
 
@@ -17575,66 +17839,23 @@ fn with_global_stubs<R>(f: impl FnOnce(&mut Option<GlobalStubTable>) -> R) -> Op
 /// stub body is assembled once per process into executable memory that is never reclaimed, and
 /// chunks branch to it through a veneer instead of carrying a copy each (the Cloudflare
 /// challenge emitted about 8 MB of such copies per load). `TRUST_JS_JIT_CHUNK_STUBS=1` keeps
-/// per-chunk copies for diagnosis.
+/// per-chunk copies for diagnosis. The main thread's path ([`StubTable::stub`] in this thread's
+/// table, with its own reads): the template JIT's compiles and the tier's on the main thread.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn global_stub_address(key: u32, context: &StubContext<'_>) -> Option<u64> {
-    if env_flag!("TRUST_JS_JIT_CHUNK_STUBS") {
-        return None;
-    }
-    let ilayout = *context.ilayout?;
-    // The direct sequence's offsets and its entry weight (`emit_direct_sequence`'s retry gate),
-    // which a test thread may change by switching the tier.
-    let direct = context.direct.map(|direct| {
-        (
-            direct.attempted_off,
-            direct.runs_off,
-            direct.retry_off,
-            crate::opt::entry_weight(),
-        )
-    });
-    let is_direct = SharedStub::from_key(key).enters_direct_sequence();
-    if is_direct && direct.is_none() {
-        return None;
-    }
-    with_global_stubs(|table| {
-        let table = table.get_or_insert_with(|| GlobalStubTable {
-            layout: *context.layout,
-            ilayout,
-            direct,
-            addresses: Default::default(),
-            generation: 0,
-        });
-        if table.layout != *context.layout || table.ilayout != ilayout {
-            return None;
-        }
-        if is_direct {
-            match table.direct {
-                Some(known) if Some(known) != direct => return None,
-                Some(_) => {}
-                None => {
-                    table.direct = direct;
-                    table.generation += 1;
-                }
-            }
-        }
-        if let Some(&address) = table.addresses.get(&key) {
-            return Some(address);
-        }
-        let address = assemble_global_stub(key, context)?;
-        table.addresses.insert(key, address);
-        table.generation += 1;
-        Some(address)
-    })?
+    StubTable::current()
+        .stub(key, context, None)
+        .map(|(address, _)| address)
 }
 
-/// The process-wide stub table as the main thread saw it at a compile's snapshot (P3 stage 2,
-/// step 12; the plan's point 3): what an emission on another thread finds each requested stub as
-/// (`emit_shared_stubs_from`), without the table's lock or, in test builds, the main thread's
-/// own table. A stub the table lacks is the main thread's to assemble (`assemble_stubs`) before
-/// the compile runs again: no stub is assembled off the main thread.
+/// The stub table as the main thread saw it at a compile's snapshot (P3 stage 2, step 12; the
+/// plan's point 3): what an emission on another thread finds each requested stub as
+/// (`emit_shared_stubs_from`), without the table's lock; and the table it was taken of, where a
+/// stub the snapshot lacks is looked up again under the lock and made where still missing (step
+/// 17, [`StubTable::stub`]), so that no compile runs twice.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17643,8 +17864,8 @@ pub(crate) struct StubTableSnapshot {
     /// TRUST_JS_JIT_CHUNK_STUBS: every chunk keeps its own copies.
     chunk_stubs: bool,
     table: Option<StubTableCopy>,
-    /// The stubs whose assembly failed (no executable memory): their chunks keep copies.
-    copies: Vec<u32>,
+    /// The table it was taken of: the process's, or in test builds the main thread's own.
+    owner: StubTable,
 }
 
 #[cfg(all(
@@ -17667,9 +17888,9 @@ struct StubTableCopy {
 enum StubLookup {
     /// Assembled: a veneer to this address.
     At(u64),
-    /// Kept per chunk: its body in the code (another context, chunk stubs, a failed assembly).
+    /// Kept per chunk: its body in the code (another context, chunk stubs).
     Copy,
-    /// Not assembled yet: the main thread's to assemble.
+    /// Not in the snapshot: looked up again in the table, and made there where still missing.
     Missing,
 }
 
@@ -17681,7 +17902,7 @@ impl StubTableSnapshot {
     /// `key`'s stub for an emission in `context` whose direct sequence counts `entry_weight` an
     /// entry (`opt::entry_weight` on the main thread), as [`global_stub_address`] would find it.
     fn lookup(&self, key: u32, context: &StubContext<'_>, entry_weight: u32) -> StubLookup {
-        if self.chunk_stubs || self.copies.contains(&key) {
+        if self.chunk_stubs {
             return StubLookup::Copy;
         }
         let Some(&ilayout) = context.ilayout else {
@@ -17732,78 +17953,51 @@ thread_local! {
 }
 
 /// The stub table as it stands, for a compile on another thread (main thread; see
-/// [`StubTableSnapshot`]), its stubs whose assembly failed in `copies`: the last one this thread
-/// made while the table has not changed since.
+/// [`StubTableSnapshot`]): the last one this thread made while the table has not changed since.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-pub(crate) fn stub_table_snapshot(copies: &[u32]) -> std::sync::Arc<StubTableSnapshot> {
+pub(crate) fn stub_table_snapshot() -> std::sync::Arc<StubTableSnapshot> {
     let chunk_stubs = env_flag!("TRUST_JS_JIT_CHUNK_STUBS");
-    let generation =
-        with_global_stubs(|table| table.as_ref().map(|table| table.generation)).flatten();
+    let owner = StubTable::current();
+    let generation = owner
+        .with(|table| table.as_ref().map(|table| table.generation))
+        .flatten();
     let cached = STUB_SNAPSHOT.with(|cached| cached.borrow().clone());
     if let Some(snapshot) = cached {
         let current = snapshot.table.as_ref().map(|table| table.generation) == generation;
-        if current && snapshot.copies == copies && snapshot.chunk_stubs == chunk_stubs {
+        if current && snapshot.chunk_stubs == chunk_stubs {
             return snapshot;
         }
     }
-    let table = with_global_stubs(|table| {
-        table.as_ref().map(|table| StubTableCopy {
-            layout: table.layout,
-            ilayout: table.ilayout,
-            direct: table.direct,
-            addresses: table.addresses.clone(),
-            generation: table.generation,
+    let table = owner
+        .with(|table| {
+            table.as_ref().map(|table| StubTableCopy {
+                layout: table.layout,
+                ilayout: table.ilayout,
+                direct: table.direct,
+                addresses: table.addresses.clone(),
+                generation: table.generation,
+            })
         })
-    })
-    .flatten();
+        .flatten();
     let snapshot = std::sync::Arc::new(StubTableSnapshot {
         chunk_stubs,
         table,
-        copies: copies.to_vec(),
+        owner,
     });
     STUB_SNAPSHOT.with(|cached| *cached.borrow_mut() = Some(snapshot.clone()));
     snapshot
 }
 
-/// Assemble the stubs `keys` (in their order) for an emission in the context of `layout`,
-/// `ilayout` and, for the direct sequence's stubs, the `direct` chunk offsets (main thread), as
-/// the emission would have on the main thread (`global_stub_address`); the keys whose assembly
-/// failed, whose chunks keep copies.
-#[cfg(all(
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
-pub(crate) fn assemble_stubs(
-    keys: &[u32],
-    layout: &crate::value::JitLayout,
-    ilayout: &crate::interpreter::InterpLayout,
-    direct: Option<(usize, usize, usize)>,
-) -> Vec<u32> {
-    let mut a = asm::Asm::new();
-    let finish = a.new_label();
-    let context = StubContext {
-        layout,
-        ilayout: Some(ilayout),
-        direct: direct.map(|(attempted_off, runs_off, retry_off)| DirectCallContext {
-            attempted_off,
-            runs_off,
-            retry_off,
-            finish_stub: finish,
-        }),
-    };
-    keys.iter()
-        .copied()
-        .filter(|&key| global_stub_address(key, &context).is_none())
-        .collect()
-}
-
-/// [`emit_shared_stubs`] in an emission off the main thread: each stub from `table`, a veneer to
-/// its address, or its body where the chunk keeps a copy, and a missing one recorded in
-/// `missing` with a veneer to nothing (the compile is then made again once the main thread has
-/// assembled it). `entry_weight` is the main thread's `opt::entry_weight`.
+/// [`emit_shared_stubs`] in an emission off the main thread (P3 stage 2, steps 12 and 17): each
+/// stub from `table`, the snapshot its job took, as a veneer to its address; one the snapshot
+/// lacks looked up again in the table under its lock, where another thread may have made it
+/// since, and made there where still missing ([`StubTable::stub`], with the job's `reads`), as
+/// JSC's compiler threads make a missing thunk (JITThunks::ctiStubImpl, jit/JITThunks.cpp:
+/// 189-222); its body where the chunk keeps a copy (another context, chunk stubs, a failed
+/// assembly, which is not tried again for the same emission). What it met missing goes in `met`.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17812,8 +18006,8 @@ fn emit_shared_stubs_from(
     a: &mut asm::Asm,
     context: &StubContext<'_>,
     table: &StubTableSnapshot,
-    entry_weight: u32,
-    missing: &mut Vec<u32>,
+    reads: &StubReads,
+    met: &mut MissingStubs,
 ) {
     loop {
         let requested = a.take_shared_stubs();
@@ -17822,23 +18016,31 @@ fn emit_shared_stubs_from(
         }
         for (key, label) in requested {
             a.bind(label);
-            let address = match table.lookup(key, context, entry_weight) {
-                StubLookup::At(address) => address,
-                StubLookup::Copy => {
-                    SharedStub::from_key(key).emit(a, context);
-                    continue;
-                }
-                StubLookup::Missing => {
-                    if !missing.contains(&key) {
-                        missing.push(key);
+            let address = match table.lookup(key, context, reads.entry_weight) {
+                StubLookup::At(address) => Some(address),
+                StubLookup::Copy => None,
+                StubLookup::Missing if met.copies.contains(&key) => None,
+                StubLookup::Missing => match table.owner.stub(key, context, Some(reads)) {
+                    Some((address, made)) => {
+                        MissingStubs::note(if made { &mut met.made } else { &mut met.found }, key);
+                        Some(address)
                     }
-                    0
-                }
+                    None => {
+                        MissingStubs::note(&mut met.copies, key);
+                        None
+                    }
+                },
             };
-            a.ldr_literal_x(16, 8);
-            a.br(16);
-            a.word(address as u32);
-            a.word((address >> 32) as u32);
+            match address {
+                // Every stub's contract lets it clobber x16 (see `emit_shared_stubs`).
+                Some(address) => {
+                    a.ldr_literal_x(16, 8);
+                    a.br(16);
+                    a.word(address as u32);
+                    a.word((address >> 32) as u32);
+                }
+                None => SharedStub::from_key(key).emit(a, context),
+            }
         }
     }
 }
@@ -17864,12 +18066,23 @@ pub(crate) fn prime_switches() {
 
 /// Assemble one shared stub (with any stubs it requests, and the direct-call finish stub) into
 /// its own permanent executable buffer; the entry address, or `None` when memory is refused.
+/// `job`: an emission off the main thread's reads (P3 stage 2, step 17), which the assembly takes
+/// in place of the calling thread's, its buffer mapped without the main thread's reclaim
+/// (`ExecutableBuffer::from_bytes_quietly`: None where the budget cannot take it now).
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
+fn assemble_global_stub(
+    key: u32,
+    context: &StubContext<'_>,
+    job: Option<&StubReads>,
+) -> Option<u64> {
     let mut a = asm::Asm::new();
+    if let Some(job) = job {
+        a.set_entry_weight(job.entry_weight);
+        a.set_inline_construct(job.inline_construct);
+    }
     let entry = a.new_label();
     let finish = a.new_label();
     let local = StubContext {
@@ -17881,6 +18094,11 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
         }),
     };
     a.bind(entry);
+    // Tests: a stub that writes d8 (and keeps its value) for the callee-saved flag's tests.
+    #[cfg(test)]
+    if job.is_some_and(|job| job.writes_d8) {
+        a.fmov_d_d(8, 8);
+    }
     SharedStub::from_key(key).emit(&mut a, &local);
     // Each stub in the buffer, in order, by entry label: the perf map names them one by one.
     let mut stubs = vec![(entry, key)];
@@ -17914,12 +18132,23 @@ fn assemble_global_stub(key: u32, context: &StubContext<'_>) -> Option<u64> {
         fp_callee_saved || !words.iter().any(|&word| writes_callee_saved_fp(word)),
         "a stub's SIMD&FP instruction bypassed Asm::emit_fp"
     );
+    // Set before the stub enters the table, under the table's lock (`StubTable::stub`): a compile
+    // on any thread that finds the stub there, or in a snapshot taken after, takes the lock after
+    // this store and reads the flag at its finish, after its stubs (P3 stage 2, step 17).
     if fp_callee_saved {
         STUB_WRITES_CALLEE_SAVED_FP.store(true, std::sync::atomic::Ordering::Relaxed);
     }
-    let executable = ExecutableBuffer::from_bytes(unsafe {
-        std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4)
-    })?;
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 4) };
+    let executable = match job {
+        #[cfg(test)]
+        Some(job) if job.memory_refused => None,
+        // Off the main thread: no reclaim, which is the main thread's (its CLOCK registry); the
+        // chunk keeps a copy where the budget cannot take the stub now. The buffer is published
+        // on this thread (copied, flushed to the instruction side with `dc cvau`, `ic ivau` and
+        // `dsb ish`); a thread that branches to it synchronizes first (see `StubTable::stub`).
+        Some(_) => ExecutableBuffer::from_bytes_quietly(bytes),
+        None => ExecutableBuffer::from_bytes(bytes),
+    }?;
     let address = executable.as_ptr() as u64 + u64::from(offsets[0]);
     list_global_stubs(&executable, &stubs, &offsets);
     // Permanent: any compiled chunk may branch here for the rest of the process.

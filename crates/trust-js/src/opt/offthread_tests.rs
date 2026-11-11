@@ -528,3 +528,310 @@ fn a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile() {
     drop(code);
     super::release_retired(&mut engine.interp);
 }
+
+// ---------------------------------------------------------------------------------------------
+// The shared stubs made on the compile thread (P3 stage 2, step 17)
+// ---------------------------------------------------------------------------------------------
+//
+// `sq`'s tier code calls the interrupt helper's shared stub (the poll's slow path), which its
+// template code does not request: with its thread's stubs forgotten after its template compile
+// (`jit::forget_stubs_for_test`), its job's snapshot lacks every stub its code requests.
+
+/// The compiles whose emission met stubs missing from its snapshot, since the last call.
+fn stubs_met() -> Vec<(usize, crate::jit::MissingStubs)> {
+    super::TEST_STUBS_MET.with(|met| std::mem::take(&mut *met.borrow_mut()))
+}
+
+/// `code`'s words.
+fn code_words(code: &crate::jit::JitCode) -> Vec<u32> {
+    // SAFETY: the code's mapping, which lives with `code`.
+    unsafe { std::slice::from_raw_parts(code.mem_ptr() as *const u32, code.code_bytes() / 4) }
+        .to_vec()
+}
+
+/// The addresses `words`' shared-stub veneers branch to (`ldr x16, #8`, `br x16`, the address).
+fn veneers(words: &[u32]) -> Vec<u64> {
+    (0..words.len().saturating_sub(3))
+        .filter(|&k| words[k] == 0x5800_0050 && words[k + 1] == 0xD61F_0200)
+        .map(|k| u64::from(words[k + 2]) | u64::from(words[k + 3]) << 32)
+        .collect()
+}
+
+/// The fourth word of a chunk's code where its d8-d15 saves are skipped (`b .+16` over them).
+const FP_SAVES_SKIPPED: u32 = 0x1400_0004;
+
+/// Call `sq` once, so that its template code is compiled, then forget this thread's stubs.
+fn template_then_forget(engine: &mut Engine) {
+    eval(engine, SQ);
+    assert_eq!(call(engine, "sq", 1.0), 2.0);
+    crate::jit::forget_stubs_for_test();
+}
+
+#[test]
+fn a_job_that_meets_a_missing_stub_makes_it_and_runs_once() {
+    if !asynchronous_here() {
+        return;
+    }
+    let capture = crate::jit::profiler::PerfMapCapture::start("step17");
+    let mut engine = jit_engine();
+    compiled();
+    stubs_met();
+    template_then_forget(&mut engine);
+    let (generation, stubs) = crate::jit::stub_table_for_test();
+    assert!(stubs.is_empty());
+    let (_, hold) = until_pending(&mut engine, "sq");
+    // The job's snapshot, which the next one reuses while the table stays as it is.
+    let snapshot = crate::jit::stub_table_snapshot();
+    drop(hold);
+    wait_finished(&engine);
+    assert!(
+        tier_chunk(&mut engine, "sq").is_none(),
+        "no install before the poll"
+    );
+    // The first poll after the job ended installs it: it ran once, and is not queued again.
+    assert_eq!(call(&mut engine, "sq", 3.0), 10.0);
+    assert_eq!(engine.interp.opt_pending.len(), 0, "installed at once");
+    let chunk = tier_chunk(&mut engine, "sq").expect("installed");
+    assert_eq!(compiled(), vec![Rc::as_ptr(&chunk) as usize]);
+    let met = stubs_met();
+    assert_eq!(met.len(), 1, "{met:?}");
+    let (at, met) = &met[0];
+    assert_eq!(*at, Rc::as_ptr(&chunk) as usize);
+    assert!(!met.made.is_empty(), "made on the compile thread: {met:?}");
+    assert!(met.found.is_empty() && met.copies.is_empty(), "{met:?}");
+    // In the main thread's table, the generation moved; the code branches to them; the test's
+    // perf map capture lists them.
+    let (now, stubs) = crate::jit::stub_table_for_test();
+    assert_eq!(
+        now,
+        generation + met.made.len() as u64,
+        "a move a stub made"
+    );
+    let code = chunk.jit.get().flatten().expect("its code is resident");
+    let branches = veneers(&code_words(&code));
+    let lines = capture.lines();
+    for key in &met.made {
+        let address = stubs
+            .iter()
+            .find(|&&(stub, _)| stub == *key)
+            .map(|&(_, address)| address)
+            .unwrap_or_else(|| panic!("{key:#x} in the main thread's table"));
+        assert!(branches.contains(&address), "the code branches to {key:#x}");
+        assert!(
+            lines
+                .iter()
+                .any(|&(start, size, _)| start as u64 == address && size > 0),
+            "{key:#x} at {address:#x} in the test's perf map: {lines:x?}"
+        );
+    }
+    // The main thread's next snapshot is taken again, and a later job finds the stubs there.
+    assert!(
+        !std::sync::Arc::ptr_eq(&crate::jit::stub_table_snapshot(), &snapshot),
+        "a stale snapshot is not reused"
+    );
+    eval(&mut engine, "function sq2(x) { return x * x + 2; }");
+    drop(until_pending(&mut engine, "sq2"));
+    wait_finished(&engine);
+    assert_eq!(call(&mut engine, "sq2", 3.0), 11.0);
+    assert!(tier_chunk(&mut engine, "sq2").is_some());
+    assert!(stubs_met().is_empty(), "the next job's snapshot holds them");
+    // It runs, and results hold.
+    code.referenced.set(0);
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let t = 0; for (let k = 0; k < 1000; k++) t += sq(k % 7); t"
+        ),
+        "13977"
+    );
+    assert!(code.referenced.get() != 0, "the tier's code ran");
+}
+
+#[test]
+fn two_engines_jobs_that_meet_one_missing_stub_make_it_once() {
+    if !asynchronous_here() {
+        return;
+    }
+    // Two engines on this thread share its table (test builds keep a table a thread; in release
+    // builds the table is the process's); each is made the running one before it is used.
+    let mut engines = [jit_engine(), jit_engine()];
+    compiled();
+    stubs_met();
+    for engine in &mut engines {
+        engine.interp.activate_gc_heap();
+        eval(engine, SQ);
+        assert_eq!(call(engine, "sq", 1.0), 2.0);
+    }
+    crate::jit::forget_stubs_for_test();
+    let (generation, _) = crate::jit::stub_table_for_test();
+    // Both jobs queued with snapshots that lack the stubs, the compile thread held meanwhile.
+    let hold = super::compiler::TEST_HOLD
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    for engine in &mut engines {
+        engine.interp.activate_gc_heap();
+        let mut calls = 0;
+        while engine.interp.opt_pending.len() == 0 {
+            calls += 1;
+            assert!(calls < 20_000, "no compile of sq was queued");
+            call(engine, "sq", f64::from(calls));
+        }
+    }
+    drop(hold);
+    for engine in &mut engines {
+        engine.interp.activate_gc_heap();
+        super::finish_compiles_for_test(&mut engine.interp);
+    }
+    let met = stubs_met();
+    assert_eq!(met.len(), 2, "{met:?}");
+    let made = &met[0].1.made;
+    assert!(!made.is_empty(), "the first job made them: {met:?}");
+    assert_eq!(
+        &met[1].1.found, made,
+        "the second found them under the lock"
+    );
+    assert!(met[1].1.made.is_empty() && met[1].1.copies.is_empty());
+    let (now, stubs) = crate::jit::stub_table_for_test();
+    assert_eq!(now, generation + made.len() as u64, "each made once");
+    assert_eq!(stubs.len(), made.len());
+    // Both codes branch to the one copy of each.
+    for engine in &mut engines {
+        engine.interp.activate_gc_heap();
+        let chunk = tier_chunk(engine, "sq").expect("installed");
+        let branches = veneers(&code_words(&chunk.jit.get().flatten().expect("resident")));
+        assert!(stubs.iter().all(|(_, address)| branches.contains(address)));
+        assert_eq!(call(engine, "sq", 4.0), 17.0);
+    }
+}
+
+#[test]
+fn a_failed_stub_assembly_keeps_a_copy_without_a_rerun() {
+    let mut switches = asynchronous();
+    switches.stub_memory_refused = true;
+    switches.set();
+    if !super::asynchronous() {
+        return;
+    }
+    let mut engine = jit_engine();
+    compiled();
+    stubs_met();
+    template_then_forget(&mut engine);
+    let (generation, _) = crate::jit::stub_table_for_test();
+    drop(until_pending(&mut engine, "sq"));
+    wait_finished(&engine);
+    assert_eq!(call(&mut engine, "sq", 3.0), 10.0);
+    assert_eq!(engine.interp.opt_pending.len(), 0, "installed at once");
+    let chunk = tier_chunk(&mut engine, "sq").expect("installed");
+    assert_eq!(compiled(), vec![Rc::as_ptr(&chunk) as usize]);
+    let met = stubs_met();
+    assert_eq!(met.len(), 1, "{met:?}");
+    let met = &met[0].1;
+    assert!(!met.copies.is_empty(), "kept as copies: {met:?}");
+    assert!(met.made.is_empty() && met.found.is_empty(), "{met:?}");
+    assert_eq!(
+        crate::jit::stub_table_for_test(),
+        (generation, Vec::new()),
+        "nothing made"
+    );
+    // The copies run in the code.
+    let code = chunk.jit.get().flatten().expect("resident");
+    assert!(veneers(&code_words(&code)).is_empty(), "no veneer");
+    code.referenced.set(0);
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let t = 0; for (let k = 0; k < 1000; k++) t += sq(k % 7); t"
+        ),
+        "13977"
+    );
+    assert!(code.referenced.get() != 0, "the tier's code ran");
+}
+
+/// A stub that a job makes and that writes d8 (the test switch: `fmov d8, d8`) sets the
+/// callee-saved flag, so that the job's code, which branches to it, keeps its d8-d15 saves, and
+/// so does a later compile on the main thread that branches to it. In a process of its own,
+/// where no stub set the flag before.
+#[test]
+fn a_stub_that_writes_d8_keeps_the_saves_of_the_job_and_of_a_later_compile() {
+    const CHILD: &str = "TRUST_JS_OPT_D8_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "opt::offthread_tests::a_stub_that_writes_d8_keeps_the_saves_of_the_job_and_of_a_later_compile",
+                "--test-threads=1",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut switches = asynchronous();
+    switches.stubs_write_d8 = true;
+    switches.set();
+    if !super::asynchronous() || env_flag!("TRUST_JS_JIT_CHUNK_STUBS") {
+        return;
+    }
+    assert!(!crate::jit::stub_writes_callee_saved_fp_for_test());
+    let mut engine = jit_engine();
+    stubs_met();
+    template_then_forget(&mut engine);
+    // Its template code writes none of d8-d15, and no stub did: it skips their saves.
+    let first = first_stage(&mut engine, "sq");
+    let template = first.jit.get().flatten().expect("its template code");
+    assert_eq!(code_words(&template)[3], FP_SAVES_SKIPPED);
+    drop(until_pending(&mut engine, "sq"));
+    wait_finished(&engine);
+    assert_eq!(call(&mut engine, "sq", 3.0), 10.0);
+    let chunk = tier_chunk(&mut engine, "sq").expect("installed");
+    let met = stubs_met();
+    assert_eq!(met.len(), 1, "{met:?}");
+    let made = met[0].1.made.clone();
+    assert!(!made.is_empty(), "{met:?}");
+    assert!(
+        crate::jit::stub_writes_callee_saved_fp_for_test(),
+        "the stubs the job made set the flag"
+    );
+    let (_, stubs) = crate::jit::stub_table_for_test();
+    let words = code_words(&chunk.jit.get().flatten().expect("resident"));
+    assert!(
+        stubs
+            .iter()
+            .any(|(_, address)| veneers(&words).contains(address)),
+        "the job's code branches to a stub that writes d8"
+    );
+    assert_ne!(words[3], FP_SAVES_SKIPPED, "the job's code keeps its saves");
+    // A later compile on the main thread that branches to the stub keeps its saves too.
+    switches.asynchronous = false;
+    switches.set();
+    eval(&mut engine, "function cube(x) { return x * x * x + 1; }");
+    for k in 0..20_000 {
+        assert_eq!(call(&mut engine, "cube", 2.0), 9.0, "call {k}");
+        if tier_chunk(&mut engine, "cube").is_some() {
+            break;
+        }
+    }
+    let cube = tier_chunk(&mut engine, "cube").expect("compiled on the main thread");
+    let words = code_words(&cube.jit.get().flatten().expect("resident"));
+    assert!(
+        stubs
+            .iter()
+            .any(|(_, address)| veneers(&words).contains(address)),
+        "the later code branches to the stub"
+    );
+    assert_ne!(words[3], FP_SAVES_SKIPPED, "the later code keeps its saves");
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let t = 0; for (let k = 0; k < 1000; k++) t += sq(k % 7) + cube(k % 5); t"
+        ),
+        "34977"
+    );
+}

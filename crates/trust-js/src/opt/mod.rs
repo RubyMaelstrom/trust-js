@@ -359,6 +359,8 @@ pub(crate) fn pin_forced_exits_off_for_test() {
         loop_exit_limit: loop_exit_limit_base(),
         no_loop_count: no_loop_count(),
         asynchronous: asynchronous_by_environment(),
+        stub_memory_refused: stub_test_switches().0,
+        stubs_write_d8: stub_test_switches().1,
     }
     .set();
 }
@@ -384,6 +386,8 @@ pub(crate) fn pin_synchronous_for_test() {
         loop_exit_limit: loop_exit_limit_base(),
         no_loop_count: no_loop_count(),
         asynchronous: false,
+        stub_memory_refused: stub_test_switches().0,
+        stubs_write_d8: stub_test_switches().1,
     }
     .set();
 }
@@ -409,6 +413,8 @@ pub(crate) fn pin_loop_count_off_for_test() {
         loop_exit_limit: loop_exit_limit_base(),
         no_loop_count: true,
         asynchronous: asynchronous_by_environment(),
+        stub_memory_refused: stub_test_switches().0,
+        stubs_write_d8: stub_test_switches().1,
     }
     .set();
 }

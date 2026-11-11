@@ -127,6 +127,12 @@ pub(crate) struct Switches {
     /// Whether the running Agent's heap has the in-line allocation site of class-0 cells, which
     /// a direct construct's in-line `this` uses (`value::object_inline_alloc_site`).
     pub(crate) inline_construct: bool,
+    /// Tests: the stubs a compile off the main thread makes find no executable memory, or write
+    /// d8 (`opt::TestSwitches`; P3 stage 2, step 17).
+    #[cfg(test)]
+    pub(crate) stub_memory_refused: bool,
+    #[cfg(test)]
+    pub(crate) stubs_write_d8: bool,
 }
 
 impl Switches {
@@ -145,6 +151,23 @@ impl Switches {
             loop_warm_up: crate::opt::loop_warm_up(chunk),
             entry_weight: crate::opt::entry_weight(),
             inline_construct: crate::value::object_inline_alloc_site(0).is_some(),
+            #[cfg(test)]
+            stub_memory_refused: crate::opt::stub_test_switches().0,
+            #[cfg(test)]
+            stubs_write_d8: crate::opt::stub_test_switches().1,
+        }
+    }
+
+    /// What a shared stub that a compile off the main thread makes reads (P3 stage 2, step 17):
+    /// these switches, read on the main thread with the snapshot.
+    pub(crate) fn stub_reads(&self) -> StubReads {
+        StubReads {
+            entry_weight: self.entry_weight,
+            inline_construct: self.inline_construct,
+            #[cfg(test)]
+            memory_refused: self.stub_memory_refused,
+            #[cfg(test)]
+            writes_d8: self.stubs_write_d8,
         }
     }
 }
@@ -182,30 +205,32 @@ pub(crate) fn compile_with(
 }
 
 /// What a code generation's emission does with the process-wide shared stubs its sites request
-/// (P3 stage 2, step 12; the plan's point 3): on the main thread, assemble a missing one at once
-/// as the template JIT does (`Live`); in a job, find each in the main thread's table as it stood
-/// at the snapshot (`jit::StubTableSnapshot`), and record a missing one, which the main thread
-/// assembles before the job runs again (`Frozen`).
+/// (P3 stage 2, steps 12 and 17; the plan's point 3): on the main thread, find or make each in
+/// the table as the template JIT does (`live`); in a job, find each in the main thread's table as
+/// it stood at the snapshot (`jit::StubTableSnapshot`), and one the snapshot lacks in the table
+/// itself, under its lock, made there where still missing, with the job's reads (`frozen`), so
+/// that the job runs once.
 pub(crate) struct Stubs<'s> {
     table: Option<&'s StubTableSnapshot>,
-    /// The keys the snapshot's table lacks, in the order the emission requested them.
-    pub(crate) missing: Vec<u32>,
+    /// The stubs the snapshot's table lacked: found under the table's lock, made there, or kept
+    /// as copies where their assembly failed.
+    pub(crate) met: MissingStubs,
 }
 
 impl<'s> Stubs<'s> {
-    /// Assemble missing stubs now, on this thread (main thread only).
+    /// Find or make each stub in this thread's table (main thread only).
     pub(crate) fn live() -> Self {
         Stubs {
             table: None,
-            missing: Vec::new(),
+            met: MissingStubs::default(),
         }
     }
 
-    /// Read the stubs from `table`, recording the missing ones.
+    /// Find each stub in `table`, and one it lacks in the table it was taken of.
     pub(crate) fn frozen(table: &'s StubTableSnapshot) -> Self {
         Stubs {
             table: Some(table),
-            missing: Vec::new(),
+            met: MissingStubs::default(),
         }
     }
 }
@@ -784,8 +809,8 @@ impl<'a> Gen<'a> {
                 &mut self.a,
                 &context,
                 table,
-                self.switches.entry_weight,
-                &mut stubs.missing,
+                &self.switches.stub_reads(),
+                &mut stubs.met,
             ),
         }
         self.a.bind(self.l_direct_finish);
@@ -796,6 +821,8 @@ impl<'a> Gen<'a> {
     }
 
     fn finish(mut self) -> Result<Assembled, Refusal> {
+        // Read after the emission found or made its stubs (`emit`), on this thread: a stub that
+        // writes d8-d15 set the flag before it entered the table (P3 stage 2, step 17).
         if self.alloc.fp_callee_across_effect
             && STUB_WRITES_CALLEE_SAVED_FP.load(std::sync::atomic::Ordering::Relaxed)
         {
