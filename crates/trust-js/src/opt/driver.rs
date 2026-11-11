@@ -71,7 +71,7 @@
 
 use super::exit::{ExitRecord, ExitTable};
 use super::ir::{ExitReason, Refusal};
-use super::job::{self, Compiled, Finished, Job, Outcome};
+use super::job::{self, Compiled, Finished, Job, JobMemory, Outcome};
 use super::profile::{self, ChunkProfile};
 use super::{a64, snapshot};
 use crate::bytecode::Chunk;
@@ -647,6 +647,59 @@ impl Timing {
     }
 }
 
+thread_local! {
+    /// The memory of this thread's finished compiles (P3 stage 2, step 16, point 5): frozen views
+    /// and raw copies whose vectors kept their capacities, which the next preparations fill
+    /// again (`job_memory`), as SpiderMonkey reuses a finished compile's LifoAlloc
+    /// (JitRuntime::tryReuseIonLifoAlloc, jit/Ion.cpp:1795-1826, 1837-1845). Given back by the
+    /// install of a compile off the main thread or the end of one on it (`give_back`).
+    static JOB_MEMORY: std::cell::RefCell<Vec<JobMemory>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The finished compiles' memories a thread keeps: one job compiles while another may be queued.
+const JOB_MEMORIES: usize = 2;
+
+/// The most operations a kept memory's frozen view may have held: a larger chunk's memory goes
+/// (the tier compiles chunks up to `MAX_OPTIMIZED_OPS`; Djot's largest holds 612 operations).
+const JOB_MEMORY_OPS: usize = 4096;
+
+/// A finished compile's memory for a preparation to fill, or a new one.
+fn job_memory() -> JobMemory {
+    JOB_MEMORY
+        .with(|kept| kept.borrow_mut().pop())
+        .unwrap_or_default()
+}
+
+/// Keep `memory`, a finished compile's, for a later preparation, unless the thread keeps enough
+/// or it grew past [`JOB_MEMORY_OPS`].
+fn give_back(memory: Option<JobMemory>) {
+    let Some(memory) = memory else {
+        return;
+    };
+    if memory.0.ops.capacity() > JOB_MEMORY_OPS {
+        return;
+    }
+    JOB_MEMORY.with(|kept| {
+        let mut kept = kept.borrow_mut();
+        if kept.len() < JOB_MEMORIES {
+            kept.push(memory);
+        }
+    });
+}
+
+/// The memories this thread keeps, and the address of the first one's operations (tests).
+#[cfg(test)]
+pub(crate) fn job_memories_for_test() -> (usize, Option<usize>) {
+    JOB_MEMORY.with(|kept| {
+        let kept = kept.borrow();
+        (
+            kept.len(),
+            kept.first().map(|memory| memory.0.ops.as_ptr() as usize),
+        )
+    })
+}
+
 /// A compile's main-thread preparation (the plan's point 2): V8's size limit, the snapshot (its
 /// global names resolved in the running realm, stage 2 step 4), the chunk's frozen view, the
 /// layouts, the code generator's switches; with `off_thread`, the stub table's snapshot, and the
@@ -665,9 +718,10 @@ fn prepare(
     }
     // The raw copy of the feedback, its global names resolved in the running realm (stage 2,
     // steps 4 and 16), and the frozen view, which holds the property caches' ways the copy's
-    // decode reads.
-    let snapshot = snapshot::Raw::take_in(chunk, Some(&*i));
-    let view = chunk.freeze();
+    // decode reads, both made in a finished job's memory where the thread kept one (point 5).
+    let (mut view, mut snapshot) = job_memory();
+    snapshot.take_into(chunk, Some(&*i));
+    chunk.freeze_into(&mut view);
     #[cfg(debug_assertions)]
     snapshot::check_decode(chunk, &snapshot, &view);
     let layout = *i
@@ -818,8 +872,10 @@ fn finish(
         verified,
         verify_failure,
         embeds_genv,
+        memory,
         ..
     } = finished;
+    give_back(memory);
     #[cfg(test)]
     if verified {
         TEST_VERIFIED.with(|count| count.set(count.get() + 1));
@@ -1383,8 +1439,12 @@ fn install_job(i: &mut Interp, job: PendingJob, finished: Finished) {
             );
         }
         undo(&job);
-        // The result goes here, its executable pages with it.
-        drop(finished);
+        // The result goes here, its executable pages with it; its memory goes back (point 5).
+        let Finished {
+            memory, outcome, ..
+        } = finished;
+        drop(outcome);
+        give_back(memory);
         log_main_thread("install", &job.chunk, install);
         return;
     }

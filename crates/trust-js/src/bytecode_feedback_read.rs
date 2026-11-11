@@ -248,19 +248,20 @@ impl Chunk {
     /// The copy of the words of this chunk's feedback that the decode reads, but the property
     /// caches' ways (the optimizing tier's frozen view copies those, once, for its templates and
     /// the decode alike), for a compile off the main thread (P3 stage 2, step 16; see the
-    /// module's doc). Main thread only: it reads cells.
-    pub(crate) fn copy_feedback(&self) -> FeedbackCopy {
+    /// module's doc), made in `copy`, whose vectors it fills again, their capacities kept (point
+    /// 5: a job reuses a finished one's memory). Main thread only: it reads cells.
+    pub(crate) fn copy_feedback_into(&self, copy: &mut FeedbackCopy) {
         // A transformed chunk's value and element records are its baseline sites': the
         // baseline operation and record of each of its value and element sites, through the
         // map. Its own record words are never read (`FeedbackVector::record_word`).
-        let mut baselines = Vec::new();
+        copy.baselines.clear();
         if let Some(map) = self.feedback.record_map() {
             for (pc, op) in self.ops.iter().enumerate() {
                 if value_in_line_set(op).is_none() && !is_element_access(op) {
                     continue;
                 }
                 if let Some((baseline, baseline_pc)) = map.target(pc) {
-                    baselines.push((
+                    copy.baselines.push((
                         pc as u32,
                         baseline.ops.get(baseline_pc).copied(),
                         baseline.feedback.record_word(baseline_pc),
@@ -268,64 +269,63 @@ impl Chunk {
                 }
             }
         }
-        FeedbackCopy {
-            records: self.feedback.own_record_words(),
-            baselines: baselines.into_boxed_slice(),
-            calls: self.call_caches.iter().map(CallSiteWords::of).collect(),
-            constructs: self
-                .construct_caches
+        self.feedback.own_record_words_into(&mut copy.records);
+        copy.calls.clear();
+        copy.calls
+            .extend(self.call_caches.iter().map(CallSiteWords::of));
+        copy.constructs.clear();
+        copy.constructs.extend(
+            self.construct_caches
                 .iter()
-                .map(|site| ConstructWords::of(&site.get()))
-                .collect(),
-            object_images: self
-                .obj_images
+                .map(|site| ConstructWords::of(&site.get())),
+        );
+        copy.object_images.clear();
+        copy.object_images
+            .extend(self.obj_images.iter().map(|image| image.ready.get() != 0));
+        copy.array_images.clear();
+        copy.array_images
+            .extend(self.array_images.iter().map(|image| image.ready.get() != 0));
+        copy.array_literals.clear();
+        copy.array_literals.extend(
+            self.array_literals
                 .iter()
-                .map(|image| image.ready.get() != 0)
-                .collect(),
-            array_images: self
-                .array_images
-                .iter()
-                .map(|image| image.ready.get() != 0)
-                .collect(),
-            array_literals: self
-                .array_literals
-                .iter()
-                .map(|literal| literal.block.get().is_some())
-                .collect(),
-            empty_array_image: self.empty_array_image_ready(),
-            regexps: self
-                .regexp_literals
+                .map(|literal| literal.block.get().is_some()),
+        );
+        copy.empty_array_image = self.empty_array_image_ready();
+        copy.regexps.clear();
+        copy.regexps.extend(
+            self.regexp_literals
                 .iter()
                 .enumerate()
                 .filter(|(_, literal)| literal.get().is_some())
-                .map(|(pc, _)| pc as u32)
-                .collect(),
-            epoch: self.call_epoch(),
-        }
+                .map(|(pc, _)| pc as u32),
+        );
+        copy.epoch = self.call_epoch();
     }
 }
 
 /// The words of a chunk's feedback copied on the main thread for a compile (P3 stage 2, step
-/// 16; [`Chunk::copy_feedback`]), each by the index the decode reads it by, but the property
-/// caches' ways, which the tier's frozen view holds ([`CopiedWords`] joins them).
-#[derive(Debug)]
+/// 16; [`Chunk::copy_feedback_into`]), each by the index the decode reads it by, but the property
+/// caches' ways, which the tier's frozen view holds ([`CopiedWords`] joins them). Empty by
+/// default, a husk whose vectors a copy fills.
+#[derive(Debug, Default)]
 pub(crate) struct FeedbackCopy {
     /// The chunk's own records by pc (empty for a transformed chunk and one that never recorded).
-    records: Box<[u32]>,
+    records: Vec<u32>,
     /// A transformed chunk's value and element sites' baseline operations and records, by pc,
     /// ascending (the mapped ones).
-    baselines: Box<[(u32, Option<Op>, u32)]>,
+    baselines: Vec<(u32, Option<Op>, u32)>,
     /// The call sites' and construct sites' words, by cache.
-    calls: Box<[CallSiteWords]>,
-    constructs: Box<[ConstructWords]>,
+    calls: Vec<CallSiteWords>,
+    constructs: Vec<ConstructWords>,
     /// The literal sites' readiness: object-literal templates' and array-literal sites' images,
     /// constant array literals' blocks, by site; the MakeArrays' image; the pcs of the RegExp
     /// literals with a compiled pattern, ascending.
-    object_images: Box<[bool]>,
-    array_images: Box<[bool]>,
-    array_literals: Box<[bool]>,
+    object_images: Vec<bool>,
+    array_images: Vec<bool>,
+    array_literals: Vec<bool>,
     empty_array_image: bool,
-    regexps: Box<[u32]>,
+    regexps: Vec<u32>,
     /// The call caches' epoch at the copy.
     epoch: u32,
 }

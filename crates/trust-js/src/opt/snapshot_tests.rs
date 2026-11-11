@@ -334,3 +334,42 @@ fn each_snapshot_reads_the_ways_of_its_own_copy() {
     assert_eq!(Snapshot::decode(&first_raw, &first_view), first);
     check_decode(&chunk, &second_raw, &second_view);
 }
+
+#[test]
+fn a_finished_compiles_memory_is_filled_again_by_the_next_preparation() {
+    // The tier on, eager and synchronous: each compile ends at once and gives its frozen view and
+    // raw copy back to this thread, whose next preparation fills the same vectors (point 5).
+    TestSwitches {
+        on: true,
+        eager: true,
+        asynchronous: false,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let compiled = || super::TEST_COMPILED.with(|compiled| compiled.borrow().len());
+    eval(
+        &mut engine,
+        "function big(o, k) { var s = 0; s += o.a + o.b * k; s += o.c - k; s += o.a * o.c;\n\
+           return s + (k & 7) + (o.b | 0); }\n\
+         function small(x) { return x + 1; }",
+    );
+    let before = compiled();
+    eval(
+        &mut engine,
+        "for (var k = 0; k < 2000; k++) big({ a: 1, b: 2, c: 3 }, k);",
+    );
+    assert!(compiled() > before, "big compiled");
+    let (kept, first) = super::job_memories_for_test();
+    assert_eq!(kept, 1, "its memory kept");
+    let before = compiled();
+    eval(&mut engine, "for (var k = 0; k < 2000; k++) small(k);");
+    assert!(compiled() > before, "small compiled");
+    assert_eq!(
+        super::job_memories_for_test(),
+        (1, first),
+        "the next compile filled the same memory and gave it back"
+    );
+}

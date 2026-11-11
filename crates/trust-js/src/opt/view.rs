@@ -14,6 +14,13 @@
 //! The shared emitters read it through `jit::JitChunk`, as they read a live chunk, so that the
 //! template JIT's code and the tier's effects stay one code. Where the tier has no back end the
 //! view serves the front end's tests only.
+//!
+//! Its arrays are vectors that the next job's freeze fills again (P3 stage 2, step 16, point 5):
+//! a compile gives its frozen view back with the snapshot's raw copy when it ends, their
+//! capacities kept, and the engine's thread keeps them for its next preparation
+//! (`opt::driver`'s job memory), as SpiderMonkey reuses a finished compile's LifoAlloc for the
+//! next one (JitRuntime::tryReuseIonLifoAlloc, jit/Ion.cpp:1795-1826, 1837-1845), its
+//! snapshot's pieces bump allocations in it.
 #![cfg_attr(
     not(all(
         target_arch = "aarch64",
@@ -52,19 +59,21 @@ pub(crate) struct InlineTargetView {
     pub(crate) env: Option<usize>,
 }
 
-/// The frozen view of a chunk (see the module's doc).
+/// The frozen view of a chunk (see the module's doc); empty by default, a husk whose vectors a
+/// freeze fills (`Chunk::freeze_into`).
+#[derive(Default)]
 pub(crate) struct FrozenChunk {
-    pub(crate) ops: Box<[Op]>,
+    pub(crate) ops: Vec<Op>,
     /// The names' text, one after the other, and where each ends.
-    pub(crate) names: Box<str>,
-    pub(crate) name_ends: Box<[u32]>,
+    pub(crate) names: String,
+    pub(crate) name_ends: Vec<u32>,
     /// The names' property keys' words (`atom::PropKey::word`), by name index: the chunk's key
     /// table's (`Chunk::name_keys`; P3 stage 2, step 16), which a key-checked or creating
     /// property template embeds (`jit_name_key`).
-    pub(crate) keys: Box<[u64]>,
+    pub(crate) keys: Vec<u64>,
     /// The constants the operations push (`Op::Const`), by index; None for the others, which
     /// nothing in a compile reads.
-    pub(crate) consts: Box<[Option<FrozenConst>]>,
+    pub(crate) consts: Vec<Option<FrozenConst>>,
     pub(crate) n_params: usize,
     pub(crate) n_slots: usize,
     pub(crate) resumable: bool,
@@ -85,9 +94,9 @@ pub(crate) struct FrozenChunk {
     /// made from the operations on the compile's thread when the compile first asks.
     pub(crate) cap_initialized: std::cell::OnceCell<Box<[bool]>>,
     /// Each name's `Chunk::jit_cap_binding` (empty where the chunk's activation is not fixed).
-    pub(crate) cap_bindings: Box<[Option<(u32, BindingAttrs)>]>,
-    pub(crate) name_statics: Box<[Option<StaticName>]>,
-    pub(crate) name_globals: Box<[Option<u16>]>,
+    pub(crate) cap_bindings: Vec<Option<(u32, BindingAttrs)>>,
+    pub(crate) name_statics: Vec<Option<StaticName>>,
+    pub(crate) name_globals: Vec<Option<u16>>,
     /// The addresses of the first property, name and captured-binding caches (`caches` and the
     /// others never reallocate), and of the construct caches by site.
     pub(crate) caches_base: usize,
@@ -95,26 +104,24 @@ pub(crate) struct FrozenChunk {
     pub(crate) cap_caches_base: usize,
     pub(crate) construct_caches_base: usize,
     /// Each call site's way-1 address (`Chunk::jit_call_cache_ptr`).
-    pub(crate) call_caches: Box<[usize]>,
+    pub(crate) call_caches: Vec<usize>,
     /// The named sites' preferred ways (`Chunk::jit_cache_preferred`) and ways
     /// (`Chunk::jit_cache_ways`), by cache index, ascending: the one read of the property caches
     /// a compile makes, which the property templates bake and the snapshot's decode reads (P3
     /// stage 2, step 16: `bytecode::feedback_read::CopiedWords`).
     #[allow(clippy::type_complexity)]
-    pub(crate) sites: Box<
-        [(
-            u32,
-            Option<IcState>,
-            [IcState; crate::bytecode::PROP_IC_WAYS],
-        )],
-    >,
-    pub(crate) call_positions: Box<[u32]>,
-    pub(crate) construct_positions: Box<[u32]>,
-    pub(crate) inline_targets: Box<[InlineTargetView]>,
+    pub(crate) sites: Vec<(
+        u32,
+        Option<IcState>,
+        [IcState; crate::bytecode::PROP_IC_WAYS],
+    )>,
+    pub(crate) call_positions: Vec<u32>,
+    pub(crate) construct_positions: Vec<u32>,
+    pub(crate) inline_targets: Vec<InlineTargetView>,
     /// The object literals' images' addresses, by template index; the constant array literals'
     /// by site; the MakeArrays' image's.
-    pub(crate) object_images: Box<[usize]>,
-    pub(crate) array_images: Box<[usize]>,
+    pub(crate) object_images: Vec<usize>,
+    pub(crate) array_images: Vec<usize>,
     pub(crate) empty_array_image: usize,
     /// The agent heap's in-line allocation sites: an object's cell by capacity class (0 to 3,
     /// `value::object_inline_alloc_site`), an element block by its count of words (1 to
@@ -124,7 +131,7 @@ pub(crate) struct FrozenChunk {
     pub(crate) words_sites: [Option<InlineAllocSite>; crate::bytecode::MAX_INLINE_ELEMENTS + 1],
     /// The resolution sites' addresses of the names the chunk's ResolveNameRefs resolve, by name
     /// index, ascending.
-    pub(crate) resolution_sites: Box<[(u32, usize)]>,
+    pub(crate) resolution_sites: Vec<(u32, usize)>,
     /// The address of the chunk's first name slot (`Chunk::jit_shared_name_ptr`).
     pub(crate) names_base: usize,
     pub(crate) name_slot_size: usize,

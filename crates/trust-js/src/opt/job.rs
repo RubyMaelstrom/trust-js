@@ -17,6 +17,10 @@ use super::{build, verify};
 use crate::jit::{ExecutableBuffer, StubTableSnapshot};
 use std::sync::Arc;
 
+/// A job's memory (P3 stage 2, step 16, point 5): its frozen view and its snapshot's raw copy,
+/// whose vectors the next job's preparation fills again.
+pub(crate) type JobMemory = (FrozenChunk, Raw);
+
 /// A compile's inputs (see the module's doc).
 pub(crate) struct Job {
     /// The chunk's frozen view.
@@ -93,6 +97,9 @@ pub(crate) struct Finished {
     pub(crate) verify_failure: Option<String>,
     /// The compile's time on its thread, where it was timed (`Job::timed`; zero otherwise).
     pub(crate) elapsed: std::time::Duration,
+    /// The job's memory, its frozen view and its snapshot's raw copy, given back for the next
+    /// job's preparation to fill again, unless the job runs again (P3 stage 2, step 16, point 5).
+    pub(crate) memory: Option<JobMemory>,
     /// Whether the code compares a record with the realm's global environment (`genv`), which
     /// the install then pins (stage 2, step 4).
     pub(crate) embeds_genv: bool,
@@ -177,11 +184,16 @@ pub(crate) fn compile(job: Job) -> Finished {
             nodes: graph.nodes.len(),
         }))
     })();
-    // The job's frozen view, snapshot and stub table go here, on the compile's thread, unless
-    // the job runs again.
-    let job = matches!(outcome, Outcome::Needs { .. }).then_some(job);
+    // The job runs again, or its memory goes back to the thread that prepared it (point 5), the
+    // rest of it here, on the compile's thread.
+    let (job, memory) = if matches!(outcome, Outcome::Needs { .. }) {
+        (Some(job), None)
+    } else {
+        (None, Some((job.view, job.snapshot)))
+    };
     Finished {
         job,
+        memory,
         outcome,
         declines,
         verified,

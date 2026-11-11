@@ -166,33 +166,41 @@ impl NameView {
 /// The main thread's part of a snapshot (P3 stage 2, step 16; see the module's doc): the raw copy
 /// of a chunk's feedback words, the views of its free names' sites, which read the realm, and its
 /// exit profile's declines, which read the profiles of the chunks it names. `Send`: words only.
-#[derive(Debug)]
+/// Empty by default, a husk whose vectors a copy fills ([`Raw::take_into`]), so that a job reuses
+/// a finished one's memory (point 5).
+#[derive(Debug, Default)]
 pub(crate) struct Raw {
     feedback: FeedbackCopy,
     /// The free-name sites' views, by pc, ascending (see [`NameView`]).
-    names: Box<[(u32, NameView)]>,
-    /// The exit profile's declines (see [`Snapshot`]'s `declined`).
+    names: Vec<(u32, NameView)>,
+    /// The exit profile's declines (see [`Snapshot`]'s `declined`; rare: made afresh).
     declined: Box<[(u32, u8)]>,
 }
 
 impl Raw {
-    /// The raw copy of `chunk`'s feedback as it stands now (main thread), its global names
-    /// resolved in `realm`'s running realm, the one the compile runs in, whose global
-    /// environment and object its code checks (in none, they stay effects).
+    /// [`Raw::take_into`] a raw copy of its own (tests).
+    #[cfg(test)]
     pub(crate) fn take_in(chunk: &Chunk, realm: Option<&Interp>) -> Raw {
+        let mut raw = Raw::default();
+        raw.take_into(chunk, realm);
+        raw
+    }
+
+    /// The raw copy of `chunk`'s feedback as it stands now (main thread), made in this one, whose
+    /// vectors it fills again, its global names resolved in `realm`'s running realm, the one the
+    /// compile runs in, whose global environment and object its code checks (in none, they stay
+    /// effects).
+    pub(crate) fn take_into(&mut self, chunk: &Chunk, realm: Option<&Interp>) {
         let ops = chunk.jit_ops();
-        let mut names = Vec::new();
+        self.names.clear();
         for (pc, op) in ops.iter().enumerate() {
             let name = name_view(chunk, op, realm);
             if name != NameView::None {
-                names.push((pc as u32, name));
+                self.names.push((pc as u32, name));
             }
         }
-        Raw {
-            feedback: chunk.copy_feedback(),
-            names: names.into_boxed_slice(),
-            declined: declined(chunk, chunk.feedback_vector().record_map(), ops.len()),
-        }
+        chunk.copy_feedback_into(&mut self.feedback);
+        self.declined = declined(chunk, chunk.feedback_vector().record_map(), ops.len());
     }
 
     /// Whether a free-name site's view reads the realm whose global environment is `genv` (a
