@@ -2769,3 +2769,56 @@ Measured: CodeLoad's fixed runs (tier off and on, alone and with the idle-thread
 and instructions), the calls that still reach glibc (codeload-diag's malloc-hist.so), Octane's
 fixed runs, the fixtures' measured passes and passes 2-10, peak and post-trim RSS; the two-CPU
 session reads the bar.
+
+Step 15 landed (6d328c5d..47a6197a, 2026-11-11; target/p3/stage2/step15-impl). As designed: with
+the tier on, plan_inlines_at splices no call site whose ways hold more than one distinct callee
+and none that met another closure of a way's function, at every depth, before any way is charged
+to the budget (bytecode::splice_rule_declines; TRUST_JS_TIER_LOG names each skip); the tier off
+keeps P2's plans. The record adds no instruction to any hit: a site's code hint starts at 4, the
+way past the last, whose hinted-way test reads the site's own guard word (CallSite::hint_guard, an
+odd byte 4 x 112 + 48 bytes past the first way, inside the 504-byte site, whose offsets and size
+are unchanged; every function identity is a multiple of 8, so the test's first compare fails and
+no read leaves the site; compile-asserted, and a test runs it against an unreadable page after the
+site), so a site's first code-keyed hit takes the full probe, which writes the hint as before (108
+instructions in place of 35, once a site). The one-instruction fallback was not needed. The Rust
+paths record too (CallSite::note_code_hit: resolve_cached_call_entry's code-sharing retry, every
+call's on x86-64, and jit_call_hit's live closure), and a recompile's site starts with its first
+stage's hint. Departures: (1) point 5: the reoptimization does not plan again (it recompiles the
+same chunk), and the discard's WrongCallee flag already makes it take the guard's mismatch edge,
+so nothing was added (a test covers it); the late closures are recorded on the second stage's own
+site, which plans from the first stage do not read. (2) The x86-64 JIT has no hinted test or probe
+in machine code; its calls take the generic helper, whose Rust retry records. (3) jit_call_hit's
+record is a backstop no mutation can catch: the hit that reaches it was recorded by the machine
+code already. (4) The tier off is not instruction-identical: a site's first code-keyed hit takes
+the full probe, a closure from the overflow table takes the generic helper until a full-probe hit
+writes the hint, and the Rust paths load and compare a byte; within 0.08% everywhere (Octane's
+geomean +0.00%, calls.js within 0.0002%); its template code is main's up to heap addresses (40 of
+3,067 compiles hash differently, a heap address taking one MOVZ/MOVK fewer; normalized, 2,423 of
+2,423 alike on the deterministic workloads). (5) callee_pickup_tests' rust_callers_pick_up_new_code
+is pinned synchronous (47a6197a): an asynchronous flake under load. Tests: opt::splice_rule_tests,
+tier_tests' late second closure, jit::call_record_tests (the guard page among them),
+call_feedback_tests' record on both architectures, callee_pickup_tests' polymorphic site adapted;
+6 of 7 mutations caught (the seventh is (3)); the library's suites (3,174 in every configuration),
+the tier's (273, three configurations), poll and Agent (51, both modes); Test262 off and eager
+53,573 of 53,575 (main's two failures); zombie's check, clippy -D warnings, Windows' check and
+suite (2,774); wasm32 unchecked.
+Measured (fat LTO, A725 CPUs 10-11, instructions, against main 66b90635; the tier on synchronous,
+the asynchronous mode alike):
+- The fixtures: React's measured pass -3.36% (the plan: -3.4%), 2.82% under the tier off; Djot's
+  -0.99% and its passes 2-10 -1.76% (-0.9%, -1.7%); Vue +0.02% and -0.09% (unchanged). Every
+  WrongCallee exit on the fixtures is gone (React 100 -> 0, Djot 200 -> 0). Djot's pass stays
+  +4.77% over the tier off (the plan: +4.6%).
+- Octane: -1.78% geomean (-1.97% asynchronous; the plan: -1.8%): Richards -12.54%, DeltaBlue
+  -7.56%, RayTrace -3.91% (-12.5%, -7.7%, -3.9%); Splay, Mandreel, Crypto, zlib and TypeScript
+  unchanged. WrongCallee exits 24,816 -> 7,653, discards 305 -> 253, installs in place 610 -> 637
+  (plans the rule empties take step 14's path). The tier on against off: -11.27% (main -9.66%).
+- The compile bar is not moved, against the interim session's expectation. Djot's main-thread
+  sum in single asynchronous log runs (indicative) goes 3.96 -> 4.39 ms: recompile 2.15 -> 2.17,
+  snapshot 1.34 -> 1.63, stubs 0.19 -> 0.23, install 0.28 -> 0.36. It compiles 7 functions more
+  (callees no longer spliced, which main's run never compiles), and these cost what the removed
+  discards' reoptimizations save; its fallback compiles 2.12 -> 1.50 ms. React 0.67 -> 0.48 ms.
+  What is left of Djot's bar is the recompile and the snapshot's copies (step 12's open item).
+- The rule's cost: where closures of one function share a site and one of them is hot
+  (step15-impl/tools/closures.js, not one of the bar's call microbenchmarks), the tier on is
+  +4.96% against main and +4.75% over the tier off (main -0.20%). Main splices way 0's closure;
+  the rule splices none of them until stage 3 guards by code.
