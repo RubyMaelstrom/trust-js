@@ -3322,3 +3322,71 @@ third run, takes 17.85 ms a run against template code's 14.3 (+25%), at +15% ins
 own code 12.9% of them (template code 6.6%), the PropWays stub 6.6% (3.0%), a native-call
 boundary 2.6% (none). The benchmark times the run in which the install lands, so the bar reads
 +2.35%. To find: how the tier lowers a.push() and a.shift() on a holey array.
+
+Step 17 landed (a0218103..c1b6aa85, 2026-11-11; target/p3/stage2/step17-impl, report.txt). As
+designed: a stub missing from a job's snapshot is looked up again under the table's lock and made
+there by the main thread's own path with the job's context; one hold of the lock covers the
+lookup, the assembly, the insert and the generation's move, as JSC's ctiStubImpl
+(jit/JITThunks.cpp:189-222). Outcome::Needs, run_here's loop, provide, assemble_stubs and
+install_one's requeue are gone; the log says `met <n> missing stubs, made <m>`.
+- The fence: every path that obtains a stub's address branches to it only from code synchronized
+  after the lock (a main-thread compile publishes its own code, whose flush ends in dsb ish; isb;
+  a job's code runs only after the install's isb), and no code is patched after it is published,
+  so JSC's per-entry flag is not needed (the argument at jit::StubTable). The callee-saved FP flag
+  is set under the lock before the insert and read at every compile's finish, after its stubs.
+  Test builds: each thread's table behind a shared handle the job's snapshot carries, with the
+  main thread's test counters and perf map capture.
+- Departure (ff089590): the main thread's snapshot of the table no longer waits for its lock; it
+  reuses its last snapshot while the lock is held. A stale snapshot is safe: the job looks up what
+  it lacks under the lock. With the first commit alone Vue's snapshot line rose 0.106 ms a run.
+- Measured (fat LTO, main eb7c0c98 against the branch, asynchronous on two A725 cores, medians of
+  7 log runs, 1.14 GHz delivered throughout): the bar's sums Djot 3.446 -> 3.245 ms a run (the
+  stubs part -0.193), React 0.424 -> 0.340 (-0.114), Vue 2.253 -> 1.772 (-0.415), the other parts
+  within their spread; a job that met a missing stub installs one compile sooner (Djot's largest
+  4.96 -> 2.96 ms from its snapshot to its install). The tier's code identical but for the stubs'
+  addresses (1,227 tier and 2,079 template compiles, synchronous), the tier off's 2,491 of 2,492
+  (the other one the conservative stack scan's). Instructions: Octane's geomean -0.84%
+  asynchronous (Richards -5.81%: the reruns, and one callee compile fewer as its callers install
+  sooner), -0.12% off, -0.09% synchronous; the calls within 0.014%.
+- Tests: 8 new; the brief's 4 mutations and 2 more caught; the library's suites (3,206 tier on in
+  both modes; tier off 3,205 and one wall-clock bound missed under a load of 15-21,
+  long_bigint_operations_honor_the_deadline, which passes alone on main's and the branch's
+  binaries), the tier's in three configurations (301 each), poll and Agent (51), Test262
+  53,573/53,575 eager and with forced exits; clippy, fmt; zombie's check, clippy, Windows' check
+  and suite (2,774).
+Step 15b landed (14dd76d2, 2026-11-11; target/p3/stage2/step15b-impl, report.txt). As designed: a
+call site's callee shape is marked once at the bytecode compile, CallSite::named_method (the
+padding byte after hint_guard, offset 497: no field moves, the site stays 504 bytes,
+compile-asserted), and the planner splices a site with several distinct callees, guarded by callee,
+where it is set. Marked: o.m(), this.task.run(), (o.m)(), o?.m(), a chain's named links. Not
+marked: super.m(), o.#m(), o[k]() (Gameboy's), free-name, local and comma calls, for-of's next();
+o['m']() too (TRust reads it keyed). Beyond Maglev's reach and marked: o.m?.() and calls whose
+arguments jump or run long, where Maglev's continuation stops because it replays the bytecode in
+each arm (V8's own comments say so), which a splice does not do (a one-line change to match it
+exactly). At depth > 0 the planner reads a spliced callee's own sites, marked at its compile.
+- 68 sites change plans, all named method calls over 2-4 callees: Richards 2 (this.task.run),
+  DeltaBlue 7, RayTrace 2 (shape.intersect), PdfJS 6, TypeScript 51; none on the fixtures, Gameboy
+  or the rest.
+- Measured: timed Octane on X925 cores 7-8, 10 rounds alternating, 1.369-1.372 GHz delivered in
+  every run: DeltaBlue +14.91%, RayTrace +1.92%, Richards +2.41% (the probe's score), Gameboy
+  +0.08%, the geomean +1.27%; in batches (time, the steady state) Richards -2.4%, DeltaBlue -14.2%,
+  RayTrace -0.4%. The fixed-5 counts read +1.71% synchronous and +1.97% asynchronous: the
+  warm-up's guard exits, as designed. The fixtures within 0.05% instructions, the compile bar
+  unchanged, the calls within 0.001%. The tier off's template code identical but for addresses
+  (1,180 compiles).
+- Tests: 7 new, 5 mutations caught; the library's suites (3,205 off, on synchronous, on
+  asynchronous twice), the tier's (304 each, three configurations), poll and Agent (51), Test262
+  eager 53,573/53,575; clippy, fmt; zombie's check, clippy, Windows' check and suite (2,774).
+The two together (step 17 rebased on 512291e7, step 15b on it, no conflict; target/p3/stage2/
+land-15b17): clippy clean; the library's suite 3,234 with the tier off and on eager
+(asynchronous); the tier's tests eager with exits every 7, 308; zombie's check, clippy -D warnings
+and Windows' check clean.
+The collector's chunks are not advised for huge pages (d16a14db, 2026-11-11; the owner's answer
+above): the page source maps its 2 MiB chunks as before and advises none, so a page's discard
+frees at once, as in V8's, SpiderMonkey's and JSC's heaps; a system whose huge pages are `always`
+still backs them as it chooses. The test of the advice became a test that no chunk is advised past
+the four at which they were (the mapping's `hg` flag), and a doc comment it had split was mended.
+Expected, from the study's probe of the same behavior (one binary, runtime switch): TypeScript's
+charge after its final collection 524 -> 161 MiB; cycles on an X925 core Splay +4.2%, TypeScript
++1.5%, Earley-Boyer +0.4%. Checks: clippy, the library's suite tier off and on eager (3,219
+each), zombie's check, clippy and Windows' check (target/p3/stage2/gcthp).
