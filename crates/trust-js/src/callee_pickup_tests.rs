@@ -266,6 +266,10 @@ fn a_frame_running_the_replaced_chunk_finishes_in_it() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn rust_callers_pick_up_new_code() {
+    // The callbacks' new code is published at their checkpoints, which this test reads at once:
+    // off the main thread it lands at a later poll, and under load the forEach's later calls (and
+    // the trap's) can finish before it does.
+    crate::opt::pin_synchronous_for_test();
     let mut engine = engine();
     eval(
         &mut engine,
