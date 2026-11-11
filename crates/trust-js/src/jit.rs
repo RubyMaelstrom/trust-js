@@ -17627,6 +17627,16 @@ impl StubTable {
         Some(f(&mut table))
     }
 
+    /// [`StubTable::with`] where the lock is free now: None where another thread holds it (or a
+    /// panic poisoned it).
+    fn try_with<R>(&self, f: impl FnOnce(&mut Option<GlobalStubTable>) -> R) -> Option<R> {
+        #[cfg(not(test))]
+        let mut table = GLOBAL_STUBS.try_lock().ok()?;
+        #[cfg(test)]
+        let mut table = self.table.try_lock().ok()?;
+        Some(f(&mut table))
+    }
+
     /// `key`'s stub for an emission in `context`, assembled into the table where the table lacks
     /// it: its address, and whether this call made it; None where the chunk keeps its own copy
     /// (TRUST_JS_JIT_CHUNK_STUBS, another context, a failed assembly). The lookup, the assembly
@@ -17953,7 +17963,11 @@ thread_local! {
 }
 
 /// The stub table as it stands, for a compile on another thread (main thread; see
-/// [`StubTableSnapshot`]): the last one this thread made while the table has not changed since.
+/// [`StubTableSnapshot`]): the last one this thread made while the table has not changed since,
+/// or while another thread holds the table's lock. The main thread never waits here for a stub's
+/// assembly, which holds the lock (P3 stage 2, step 17): a stale snapshot lacks at most the stubs
+/// made since, which the job's emission looks up again under the lock, as any stub its snapshot
+/// lacks.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -17961,18 +17975,17 @@ thread_local! {
 pub(crate) fn stub_table_snapshot() -> std::sync::Arc<StubTableSnapshot> {
     let chunk_stubs = env_flag!("TRUST_JS_JIT_CHUNK_STUBS");
     let owner = StubTable::current();
-    let generation = owner
-        .with(|table| table.as_ref().map(|table| table.generation))
-        .flatten();
-    let cached = STUB_SNAPSHOT.with(|cached| cached.borrow().clone());
-    if let Some(snapshot) = cached {
-        let current = snapshot.table.as_ref().map(|table| table.generation) == generation;
-        if current && snapshot.chunk_stubs == chunk_stubs {
-            return snapshot;
-        }
-    }
-    let table = owner
-        .with(|table| {
+    let cached = STUB_SNAPSHOT
+        .with(|cached| cached.borrow().clone())
+        .filter(|cached| cached.chunk_stubs == chunk_stubs);
+    // The table's copy where it changed since the last snapshot (None: unchanged), if the lock
+    // is free now (None: another thread holds it).
+    let copy = owner.try_with(|table| {
+        let generation = table.as_ref().map(|table| table.generation);
+        let current = cached.as_ref().is_some_and(|cached| {
+            cached.table.as_ref().map(|table| table.generation) == generation
+        });
+        (!current).then(|| {
             table.as_ref().map(|table| StubTableCopy {
                 layout: table.layout,
                 ilayout: table.ilayout,
@@ -17981,7 +17994,13 @@ pub(crate) fn stub_table_snapshot() -> std::sync::Arc<StubTableSnapshot> {
                 generation: table.generation,
             })
         })
-        .flatten();
+    });
+    let table = match (copy, cached) {
+        (Some(Some(table)), _) => table,
+        (_, Some(cached)) => return cached,
+        // No snapshot yet, and the lock another thread's: every stub is looked up under it.
+        (_, None) => None,
+    };
     let snapshot = std::sync::Arc::new(StubTableSnapshot {
         chunk_stubs,
         table,

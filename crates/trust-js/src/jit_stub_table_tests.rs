@@ -261,6 +261,8 @@ fn a_stub_that_writes_d8_sets_the_flag_before_it_enters_the_table() {
     let (to_main, from_maker) = made;
     let (to_maker, from_main) = resume;
     std::thread::scope(|scope| {
+        // Owned here, so that a failed assertion drops it and the paused maker resumes.
+        let to_maker = to_maker;
         let maker = scope.spawn(|| {
             let _off = OffMainCompile::enter();
             let _addresses = TestAddresses::install(addresses);
@@ -290,4 +292,63 @@ fn a_stub_that_writes_d8_sets_the_flag_before_it_enters_the_table() {
         assert_eq!(met.made, vec![key]);
         assert_eq!(veneer, Some(address));
     });
+}
+
+/// The main thread's snapshot never waits for the table's lock, which a stub's assembly holds:
+/// while another thread holds it, the last snapshot serves, stale (a job's emission looks a stub
+/// it lacks up again under the lock); once the lock is free, the next snapshot is taken again and
+/// holds the stub made meanwhile.
+#[test]
+fn a_snapshot_never_waits_for_the_tables_lock() {
+    if env_flag!("TRUST_JS_JIT_CHUNK_STUBS") {
+        return;
+    }
+    let (layout, ilayout) = layouts();
+    let context = StubContext {
+        layout: &layout,
+        ilayout: Some(&ilayout),
+        direct: None,
+    };
+    let weight = reads().entry_weight;
+    let key = SharedStub::NameValuePtr { property_ok: true }.key();
+    forget_stubs_for_test();
+    let before = stub_table_snapshot();
+    // A stub made since: the table changed.
+    let address = global_stub_address(key, &context).expect("made on the main thread");
+    let owner = StubTable::current();
+    let patience = std::time::Duration::from_secs(10);
+    let (to_main, held) = std::sync::mpsc::channel::<()>();
+    let (to_holder, release) = std::sync::mpsc::channel::<()>();
+    std::thread::scope(|scope| {
+        let table = owner.clone();
+        let holder = scope.spawn(move || {
+            // Another thread holds the lock, as a stub's assembly does.
+            table.with(|_| {
+                to_main.send(()).unwrap();
+                release.recv_timeout(patience)
+            })
+        });
+        held.recv_timeout(patience).expect("the lock held");
+        let stale = stub_table_snapshot();
+        let released = to_holder.send(());
+        assert!(
+            holder
+                .join()
+                .expect("the holder")
+                .is_some_and(|r| r.is_ok()),
+            "the snapshot returned while the lock was held"
+        );
+        released.unwrap();
+        assert!(Arc::ptr_eq(&stale, &before), "the last snapshot serves");
+        assert!(matches!(
+            stale.lookup(key, &context, weight),
+            StubLookup::Missing
+        ));
+    });
+    let next = stub_table_snapshot();
+    assert!(
+        !Arc::ptr_eq(&next, &before),
+        "taken again once the lock is free"
+    );
+    assert!(matches!(next.lookup(key, &context, weight), StubLookup::At(at) if at == address));
 }
