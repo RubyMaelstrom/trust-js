@@ -416,6 +416,12 @@ pub(crate) mod os_pages {
         fn munmap(addr: *mut u8, len: usize) -> i32;
         fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
         fn getpagesize() -> i32;
+        #[cfg(target_os = "linux")]
+        fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+        #[cfg(target_os = "linux")]
+        fn read(fd: i32, buf: *mut std::ffi::c_void, len: usize) -> isize;
+        #[cfg(target_os = "linux")]
+        fn close(fd: i32) -> i32;
     }
     const PROT_READ_WRITE: i32 = 0x1 | 0x2;
     #[cfg(target_os = "linux")]
@@ -459,6 +465,53 @@ pub(crate) mod os_pages {
     pub(crate) fn page_size() -> usize {
         // SAFETY: no arguments; it reads the size the system gave the process.
         unsafe { getpagesize() as usize }
+    }
+
+    /// The size of the transparent huge pages [`advise_huge_pages`] asks for, where the system
+    /// grants them (`/sys/kernel/mm/transparent_hugepage`: `enabled` is `always` or `madvise`,
+    /// and `hpage_pmd_size`, 2 MiB where base pages are 4 KiB); None where it does not. It
+    /// allocates nothing (the shell allocator asks it).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn huge_page_size() -> Option<usize> {
+        let (mut enabled, mut size) = ([0u8; 64], [0u8; 32]);
+        huge_page_setting(
+            read_small(c"/sys/kernel/mm/transparent_hugepage/enabled", &mut enabled)?,
+            read_small(
+                c"/sys/kernel/mm/transparent_hugepage/hpage_pmd_size",
+                &mut size,
+            )?,
+        )
+    }
+
+    /// [`huge_page_size`] from the settings' text: `enabled` (the mode chosen in brackets) and
+    /// `hpage_pmd_size` (bytes, in decimal).
+    #[cfg(target_os = "linux")]
+    pub(crate) fn huge_page_setting(enabled: &[u8], size: &[u8]) -> Option<usize> {
+        let chosen = |mode: &[u8]| enabled.windows(mode.len()).any(|w| w == mode);
+        if !chosen(b"[always]") && !chosen(b"[madvise]") {
+            return None;
+        }
+        let digits = size.iter().take_while(|b| b.is_ascii_digit());
+        let bytes = digits.fold(0usize, |n, &b| {
+            n.saturating_mul(10).saturating_add(usize::from(b - b'0'))
+        });
+        (bytes > 0).then_some(bytes)
+    }
+
+    /// The start of a small file (a system setting), read without allocating.
+    #[cfg(target_os = "linux")]
+    fn read_small<'a>(path: &std::ffi::CStr, buf: &'a mut [u8]) -> Option<&'a [u8]> {
+        const O_RDONLY_CLOEXEC: i32 = 0o2_000_000;
+        // SAFETY: a NUL-terminated path; the descriptor is closed below.
+        let fd = unsafe { open(path.as_ptr(), O_RDONLY_CLOEXEC) };
+        if fd < 0 {
+            return None;
+        }
+        // SAFETY: `buf` is writable for its length.
+        let n = unsafe { read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        // SAFETY: the descriptor opened above.
+        unsafe { close(fd) };
+        (n > 0).then(|| &buf[..n as usize])
     }
 
     /// `len` zeroed bytes at an `align` boundary, `align` a power of two and both multiples of the

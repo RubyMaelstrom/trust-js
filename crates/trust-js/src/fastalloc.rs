@@ -26,14 +26,17 @@
 //! - a free that finds the thread's list at its cap returns the colder half of the list to the
 //!   blocks' spans (each found by masking the block's address), a few dozen runs of one span's
 //!   blocks at a time under the class's lock;
-//! - a span whose blocks are all back goes to the pool of empty spans, for any class. The pool's
-//!   spans beyond `POOL_COMMITTED_BYTES`, and all of them at [`trim`] (after a major collection),
-//!   have their memory returned to the OS and their ranges kept for reuse.
+//! - a span whose blocks are all back goes to the pool of empty spans, for any class. A segment
+//!   whose spans are all in the pool is free: past `POOL_COMMITTED_BYTES` of empty spans the
+//!   oldest free segments go back to the OS whole, and at [`trim`] (after a major collection)
+//!   all of them. Where a span's memory can go back alone (below), the pool's oldest spans past
+//!   the bound, and all of them at a trim, then have their memory returned to the OS and their
+//!   ranges kept for reuse.
 //!
-//! A segment's first span holds the segment's span headers (64 bytes a span), so a span's memory
-//! can go back to the OS alone: a span is a whole number of the system's pages (on a Linux
-//! kernel of 64 KiB pages spans are 64 KiB), so that none of its neighbours' memory goes with
-//! it.
+//! A segment's first span holds the segment's header and its spans' headers (64 bytes a span), so
+//! a span's memory can go back to the OS alone: a span is a whole number of the system's pages
+//! (on a Linux kernel of 64 KiB pages spans are 64 KiB), so that none of its neighbours' memory
+//! goes with it.
 //!
 //! On Linux each segment is advised for transparent huge pages (as the collector advises its
 //! chunks once its heap is large enough): size classes put the blocks a program makes together
@@ -42,7 +45,12 @@
 //! with glibc on Vue's passes (+3% cycles on an A725 core, Djot's +1.5%); one huge page a
 //! segment maps all its spans with one TLB entry. A huge page makes its whole segment resident
 //! (about 2 MiB more RSS for a small program), which spans of 16 KiB keep small: a class with a
-//! few blocks holds one 16 KiB span, not 64 KiB.
+//! few blocks holds one 16 KiB span, not 64 KiB. A huge page's memory goes back to the OS only
+//! whole: a span's discard inside it splits the page's mapping and frees nothing until the
+//! kernel splits the page itself (under memory pressure), which costs the segment its one TLB
+//! entry, and khugepaged may collapse the range into a huge page again. So where the system
+//! grants huge pages of a segment's size (`os_pages::huge_page_size`), no span's memory goes back
+//! alone: segments go back whole, once free.
 //!
 //! Threads: a block freed on another thread than the one it was allocated on joins the freeing
 //! thread's list, and goes back to its span at that thread's overflow, trim or exit; spans are
@@ -88,14 +96,14 @@ const CLASS_CAPS: [usize; NUM_CLASSES] = class_caps();
 const MIN_SPAN: usize = 16 * 1024;
 const MAX_SPAN: usize = 64 * 1024;
 /// The size and alignment of a segment, the spans mapped from the OS together (one huge page
-/// where base pages are 4 KiB). Its first span holds the headers of its spans.
+/// where base pages are 4 KiB). Its first span holds the headers of the segment and its spans.
 const SEGMENT: usize = 2 * 1024 * 1024;
 /// A refill gathers the blocks returned to its class's spans until it holds this many bytes'
 /// worth, from `REFILL_SPANS` spans at most.
 const REFILL_BYTES: usize = 64 * 1024;
 const REFILL_SPANS: usize = 16;
-/// The empty spans' bytes the pool keeps committed between trims (4 MiB): where a span's memory
-/// goes back alone, its oldest spans' beyond go back to the OS at once.
+/// The empty spans' bytes the pool keeps committed between trims (4 MiB): past them its oldest
+/// free segments go back to the OS, and where a span's memory goes back alone, its oldest spans'.
 const POOL_COMMITTED_BYTES: usize = 4 << 20;
 /// The runs of one span's blocks gathered outside the class's lock and spliced under it at a
 /// time, when blocks go back to their spans.
@@ -105,7 +113,7 @@ const RUNS: usize = 32;
 /// the OS alone: `MIN_SPAN`, or the page where that is larger, up to `MAX_SPAN`. A discard is
 /// whole pages (a 16 KiB span's on a kernel of 64 KiB pages would discard three neighbours'
 /// blocks with it, or be refused), so with larger pages (or a size not a power of two) spans of
-/// `MIN_SPAN` keep their memory.
+/// `MIN_SPAN` keep their memory until their segment goes back.
 const fn span_for_page(page: usize) -> (usize, bool) {
     if !page.is_power_of_two() || page > MAX_SPAN {
         (MIN_SPAN, false)
@@ -116,9 +124,9 @@ const fn span_for_page(page: usize) -> (usize, bool) {
     }
 }
 
-/// How spans are laid out and returned, set at the first use from the system's answer (0 until
+/// How spans are laid out and returned, set at the first use from the system's answers (0 until
 /// then): the span size's log2 in the low byte, and `ALONE` where a span's memory goes back to
-/// the OS alone (`span_for_page`).
+/// the OS alone (`span_for_page`, and no huge page backs a segment).
 static SPAN_BITS: AtomicU32 = AtomicU32::new(0);
 const SHIFT_MASK: u32 = 0xff;
 const ALONE: u32 = 1 << 8;
@@ -133,12 +141,12 @@ fn span_bits() -> u32 {
     }
 }
 
-/// The system's answer is the same at every call: threads that race store one value.
+/// The system's answers are the same at every call: threads that race store one value.
 #[cold]
 #[inline(never)]
 fn init_span_bits() -> u32 {
     let (span, alone) = span_for_page(segments::page_size());
-    let bits = span.trailing_zeros() | if alone { ALONE } else { 0 };
+    let bits = span.trailing_zeros() | if alone && !segments::huge() { ALONE } else { 0 };
     SPAN_BITS.store(bits, Ordering::Relaxed);
     bits
 }
@@ -155,7 +163,7 @@ fn span_size() -> usize {
     1 << span_shift()
 }
 
-/// Whether a span's memory goes back to the OS alone (see `span_for_page`).
+/// Whether a span's memory goes back to the OS alone (see the module docs).
 #[inline]
 fn alone() -> bool {
     span_bits() & ALONE != 0
@@ -176,11 +184,10 @@ enum Place {
 }
 
 /// A span's header. Each segment's first span holds the headers of its spans: the `k`th span from
-/// the segment's start is described by the header at `k * 64` (the first header is the
-/// segment's own, its `next` linking the segments mapped). A header is guarded by its class's
-/// lock while its span holds blocks of the class, by the pool's lock while the span is in the
-/// pool, and by nothing while a thread sets up a span taken from the pool (no other thread can
-/// reach it then).
+/// the segment's start is described by the header at `k * 64` (the first slot holds the
+/// segment's own header, a [`Segment`]). A header is guarded by its class's lock while its span
+/// holds blocks of the class, by the pool's lock while the span is in the pool, and by nothing
+/// while a thread sets up a span taken from the pool (no other thread can reach it then).
 #[repr(C, align(64))]
 struct Span {
     /// The links of its class's list of spans with blocks to hand out, or of the pool's lists.
@@ -203,10 +210,32 @@ struct Span {
     tail_zero: bool,
 }
 
+/// A segment's header, in the first slot of its first span (its spans' headers follow), guarded
+/// by the pool's lock.
+#[repr(C, align(64))]
+struct Segment {
+    /// The links of the pool's list of the segments mapped.
+    next: *mut Segment,
+    prev: *mut Segment,
+    /// The links of the pool's list of free segments, while every span carved from the segment
+    /// is in the pool.
+    next_free: *mut Segment,
+    prev_free: *mut Segment,
+    /// The spans carved from the segment (those after its first, in order), and how many of them
+    /// are in the pool's lists.
+    carved: u32,
+    pooled: u32,
+    /// On the pool's list of free segments.
+    free: bool,
+}
+
 // The headers fit in a segment's first span, at any span size; a segment holds spans of the
 // largest.
 const _: () = assert!(
-    size_of::<Span>() == 64 && SEGMENT / MIN_SPAN * 64 <= MIN_SPAN && 4 * MAX_SPAN <= SEGMENT
+    size_of::<Span>() == 64
+        && size_of::<Segment>() == 64
+        && SEGMENT / MIN_SPAN * 64 <= MIN_SPAN
+        && 4 * MAX_SPAN <= SEGMENT
 );
 
 /// The header of the span holding the address `at`.
@@ -222,6 +251,12 @@ fn base_of(span: *mut Span) -> usize {
     let at = span as usize;
     let segment = at & !(SEGMENT - 1);
     segment + (((at - segment) / size_of::<Span>()) << span_shift())
+}
+
+/// The header of the segment holding `span`.
+#[inline]
+fn segment_of(span: *mut Span) -> *mut Segment {
+    (span as usize & !(SEGMENT - 1)) as *mut Segment
 }
 
 #[inline]
@@ -384,6 +419,26 @@ mod segments {
     use crate::gc_core::os_pages;
     pub(super) use os_pages::{decommit, page_size, recommit, DECOMMIT_ZEROES};
 
+    /// Whether the system backs a segment with one huge page (see the module docs).
+    #[cfg(target_os = "linux")]
+    pub(super) fn huge() -> bool {
+        os_pages::huge_page_size() == Some(SEGMENT)
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn huge() -> bool {
+        false
+    }
+
+    /// Return a segment `map` gave to the OS.
+    ///
+    /// # Safety
+    /// Nothing uses the segment's memory any more.
+    pub(super) unsafe fn unmap(segment: *mut u8) {
+        // SAFETY: the caller's contract; mapped with this size.
+        unsafe { os_pages::unmap(segment, SEGMENT) };
+    }
+
     /// A new segment: `SEGMENT` zeroed bytes at a `SEGMENT` boundary, on Linux advised for
     /// transparent huge pages (see the module docs); null when the system refuses.
     pub(super) fn map() -> *mut u8 {
@@ -423,9 +478,18 @@ mod segments {
         4096
     }
 
+    pub(super) fn huge() -> bool {
+        false
+    }
+
     pub(super) fn map() -> *mut u8 {
         // SAFETY: a nonzero size and a power-of-two alignment.
         unsafe { System.alloc_zeroed(Layout::from_size_align_unchecked(SEGMENT, SEGMENT)) }
+    }
+
+    pub(super) unsafe fn unmap(segment: *mut u8) {
+        // SAFETY: allocated by `map` with this layout, and unused.
+        unsafe { System.dealloc(segment, Layout::from_size_align_unchecked(SEGMENT, SEGMENT)) }
     }
 
     pub(super) unsafe fn decommit(_ptr: *mut u8, _len: usize) -> bool {
@@ -467,14 +531,18 @@ struct PoolState {
     committed: *mut Span,
     committed_last: *mut Span,
     committed_len: usize,
-    /// Empty spans whose memory went back to the OS: a list through `next`.
+    /// Empty spans whose memory went back to the OS: a list through `next` and `prev`.
     decommitted: *mut Span,
     decommitted_len: usize,
     /// The newest segment's spans never taken: `carve..carve_end`.
     carve: usize,
     carve_end: usize,
-    /// The segments mapped, by their first headers, linked by `next`.
-    segments: *mut Span,
+    /// The segments mapped: a list through their headers' `next` and `prev`, the newest first.
+    segments: *mut Segment,
+    /// The free segments: a list through `next_free` and `prev_free`, the most recently freed
+    /// first, and its last.
+    free: *mut Segment,
+    free_last: *mut Segment,
 }
 
 // SAFETY: `state`, and the headers of the spans on its lists, are touched only under `lock`.
@@ -491,8 +559,209 @@ static POOL: Pool = Pool {
         carve: 0,
         carve_end: 0,
         segments: null_mut(),
+        free: null_mut(),
+        free_last: null_mut(),
     }),
 };
+
+impl PoolState {
+    /// Put `span`, empty and off every list, first in the committed list.
+    ///
+    /// # Safety
+    /// The pool's lock is held, and no thread reaches `span` but through it.
+    unsafe fn push_committed(&mut self, span: *mut Span) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            (*span).place = Place::Committed;
+            (*span).prev = null_mut();
+            (*span).next = self.committed;
+            if self.committed.is_null() {
+                self.committed_last = span;
+            } else {
+                (*self.committed).prev = span;
+            }
+            self.committed = span;
+            self.committed_len += 1;
+            self.count_in(span);
+        }
+    }
+
+    /// Put `span`, empty and off every list, its memory returned, first in the decommitted list.
+    ///
+    /// # Safety
+    /// As `push_committed`.
+    unsafe fn push_decommitted(&mut self, span: *mut Span) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            (*span).place = Place::Decommitted;
+            (*span).prev = null_mut();
+            (*span).next = self.decommitted;
+            if !self.decommitted.is_null() {
+                (*self.decommitted).prev = span;
+            }
+            self.decommitted = span;
+            self.decommitted_len += 1;
+            self.count_in(span);
+        }
+    }
+
+    /// Take `span` off the pool's list it is on, for a thread.
+    ///
+    /// # Safety
+    /// The pool's lock is held, and `span` is on one of its lists.
+    unsafe fn remove(&mut self, span: *mut Span) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            self.unlist(span);
+            let segment = segment_of(span);
+            if (*segment).free {
+                self.unlink_free(segment);
+            }
+            (*segment).pooled -= 1;
+        }
+    }
+
+    /// Take `span` off the pool's list it is on, its segment's count left as it was.
+    ///
+    /// # Safety
+    /// As `remove`.
+    unsafe fn unlist(&mut self, span: *mut Span) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let (prev, next) = ((*span).prev, (*span).next);
+            if (*span).place == Place::Committed {
+                if prev.is_null() {
+                    self.committed = next;
+                } else {
+                    (*prev).next = next;
+                }
+                if next.is_null() {
+                    self.committed_last = prev;
+                } else {
+                    (*next).prev = prev;
+                }
+                self.committed_len -= 1;
+            } else {
+                debug_assert_eq!((*span).place, Place::Decommitted);
+                if prev.is_null() {
+                    self.decommitted = next;
+                } else {
+                    (*prev).next = next;
+                }
+                if !next.is_null() {
+                    (*next).prev = prev;
+                }
+                self.decommitted_len -= 1;
+            }
+            (*span).place = Place::Out;
+        }
+    }
+
+    /// One more span of `span`'s segment is in the pool: once every span carved is, the segment
+    /// goes first on the list of free segments.
+    ///
+    /// # Safety
+    /// The pool's lock is held.
+    unsafe fn count_in(&mut self, span: *mut Span) {
+        // SAFETY: the caller's contract; the segment's header is the pool's.
+        unsafe {
+            let segment = segment_of(span);
+            (*segment).pooled += 1;
+            debug_assert!((*segment).pooled <= (*segment).carved);
+            if (*segment).pooled == (*segment).carved {
+                (*segment).free = true;
+                (*segment).prev_free = null_mut();
+                (*segment).next_free = self.free;
+                if self.free.is_null() {
+                    self.free_last = segment;
+                } else {
+                    (*self.free).prev_free = segment;
+                }
+                self.free = segment;
+            }
+        }
+    }
+
+    /// Take `segment` off the list of free segments.
+    ///
+    /// # Safety
+    /// The pool's lock is held, and the segment is on the list.
+    unsafe fn unlink_free(&mut self, segment: *mut Segment) {
+        // SAFETY: the caller's contract.
+        unsafe {
+            let (prev, next) = ((*segment).prev_free, (*segment).next_free);
+            if prev.is_null() {
+                self.free = next;
+            } else {
+                (*prev).next_free = next;
+            }
+            if next.is_null() {
+                self.free_last = prev;
+            } else {
+                (*next).prev_free = prev;
+            }
+            (*segment).next_free = null_mut();
+            (*segment).prev_free = null_mut();
+            (*segment).free = false;
+        }
+    }
+
+    /// The oldest free segment, taken off every list and its spans off the pool's, for the
+    /// caller to return to the OS (linked by `next` with the others it collects); null when no
+    /// segment is free.
+    ///
+    /// # Safety
+    /// The pool's lock is held.
+    unsafe fn take_free(&mut self) -> *mut Segment {
+        // SAFETY: the caller's contract: the segment's spans are all on the pool's lists.
+        unsafe {
+            let segment = self.free_last;
+            if segment.is_null() {
+                return segment;
+            }
+            self.unlink_free(segment);
+            let first = segment as usize;
+            for k in 1..=(*segment).carved as usize {
+                self.unlist(span_of(first + (k << span_shift())));
+            }
+            let (prev, next) = ((*segment).prev, (*segment).next);
+            if prev.is_null() {
+                self.segments = next;
+            } else {
+                (*prev).next = next;
+            }
+            if !next.is_null() {
+                (*next).prev = prev;
+            }
+            if self.carve_end == first + SEGMENT {
+                // The newest segment: the next span is a new segment's.
+                self.carve = 0;
+                self.carve_end = 0;
+            }
+            segment
+        }
+    }
+
+    /// Take the free segments (see `take_free`), linked by `next`: all of them, or as many as
+    /// bring the committed spans down to `bound`.
+    ///
+    /// # Safety
+    /// The pool's lock is held.
+    unsafe fn take_free_segments(&mut self, bound: Option<usize>) -> *mut Segment {
+        let mut taken = null_mut::<Segment>();
+        while bound.is_none_or(|bound| self.committed_len > bound) {
+            // SAFETY: the caller's contract.
+            let segment = unsafe { self.take_free() };
+            if segment.is_null() {
+                break;
+            }
+            // SAFETY: taken off every list: the caller's.
+            unsafe { (*segment).next = taken };
+            taken = segment;
+        }
+        taken
+    }
+}
 
 /// The per-thread lists and regions. The type has no destructor, so the const-initialized
 /// thread-local is a plain TLS access on every allocation (a destructor would add a lazy
@@ -977,19 +1246,12 @@ fn take_span() -> (*mut Span, bool) {
         let pool = &mut *POOL.state.get();
         let span = pool.committed;
         if !span.is_null() {
-            pool.committed = (*span).next;
-            if pool.committed.is_null() {
-                pool.committed_last = null_mut();
-            } else {
-                (*pool.committed).prev = null_mut();
-            }
-            pool.committed_len -= 1;
+            pool.remove(span);
             return (span, false);
         }
         let span = pool.decommitted;
         if !span.is_null() {
-            pool.decommitted = (*span).next;
-            pool.decommitted_len -= 1;
+            pool.remove(span);
             drop(guard);
             if segments::recommit(base_of(span) as *mut u8, span_size()) {
                 return (span, (*span).tail_zero);
@@ -997,35 +1259,45 @@ fn take_span() -> (*mut Span, bool) {
             // The system's commit limit: the span waits in the pool.
             let _guard = POOL.lock.lock();
             let pool = &mut *POOL.state.get();
-            (*span).next = pool.decommitted;
-            pool.decommitted = span;
-            pool.decommitted_len += 1;
+            pool.push_decommitted(span);
             return (null_mut(), false);
         }
         if pool.carve == pool.carve_end {
-            let segment = segments::map();
-            if segment.is_null() {
+            let first = segments::map();
+            if first.is_null() {
                 return (null_mut(), false);
             }
-            let own = segment as *mut Span;
-            (*own).next = pool.segments;
-            pool.segments = own;
-            pool.carve = segment as usize + span_size();
-            pool.carve_end = segment as usize + SEGMENT;
+            // A new segment's header reads as zero: no span carved, none pooled, not free.
+            let segment = first as *mut Segment;
+            (*segment).next = pool.segments;
+            if !pool.segments.is_null() {
+                (*pool.segments).prev = segment;
+            }
+            pool.segments = segment;
+            pool.carve = first as usize + span_size();
+            pool.carve_end = first as usize + SEGMENT;
         }
         let base = pool.carve;
         pool.carve += span_size();
-        (span_of(base), true)
+        let span = span_of(base);
+        let segment = segment_of(span);
+        (*segment).carved += 1;
+        if (*segment).free {
+            pool.unlink_free(segment);
+        }
+        (span, true)
     }
 }
 
-/// Put the spans emptied, linked by `next`, first in the pool's committed list; where a span's
-/// memory goes back alone, the oldest beyond `POOL_COMMITTED_BYTES` go back to the OS.
+/// Put the spans emptied, linked by `next`, first in the pool's committed list. Past
+/// `POOL_COMMITTED_BYTES` of committed spans, the oldest free segments go back to the OS, and
+/// where a span's memory goes back alone, the oldest spans' memory after them.
 ///
 /// # Safety
 /// The spans are empty and off every list, and no thread reaches them.
 unsafe fn pool_put(mut list: *mut Span) {
     let mut excess = null_mut::<Span>();
+    let freed;
     {
         let _guard = POOL.lock.lock();
         // SAFETY: the pool's state and the spans' headers, under the pool's lock.
@@ -1034,34 +1306,30 @@ unsafe fn pool_put(mut list: *mut Span) {
             while !list.is_null() {
                 let span = list;
                 list = (*span).next;
-                (*span).place = Place::Committed;
-                (*span).prev = null_mut();
-                (*span).next = pool.committed;
-                if pool.committed.is_null() {
-                    pool.committed_last = span;
-                } else {
-                    (*pool.committed).prev = span;
-                }
-                pool.committed = span;
-                pool.committed_len += 1;
+                pool.push_committed(span);
             }
-            while alone() && pool.committed_len > POOL_COMMITTED_BYTES >> span_shift() {
-                let span = pool.committed_last;
-                pool.committed_last = (*span).prev;
-                if pool.committed_last.is_null() {
-                    pool.committed = null_mut();
-                } else {
-                    (*pool.committed_last).next = null_mut();
+            let bound = POOL_COMMITTED_BYTES >> span_shift();
+            freed = if releases() {
+                pool.take_free_segments(Some(bound))
+            } else {
+                null_mut()
+            };
+            if alone() {
+                while pool.committed_len > bound {
+                    let span = pool.committed_last;
+                    pool.remove(span);
+                    (*span).next = excess;
+                    excess = span;
                 }
-                pool.committed_len -= 1;
-                (*span).next = excess;
-                excess = span;
             }
         }
     }
-    if !excess.is_null() {
-        // SAFETY: taken off the pool's committed list: no thread reaches them.
-        unsafe { decommit_spans(excess) };
+    // SAFETY: taken off the pool's lists: no thread reaches them.
+    unsafe {
+        unmap_segments(freed);
+        if !excess.is_null() {
+            decommit_spans(excess);
+        }
     }
 }
 
@@ -1072,29 +1340,68 @@ unsafe fn pool_put(mut list: *mut Span) {
 /// # Safety
 /// The spans are empty and off every list, and no thread reaches them.
 unsafe fn decommit_spans(list: *mut Span) {
-    let (mut span, mut last, mut n) = (list, null_mut::<Span>(), 0);
     // SAFETY: the caller's contract.
     unsafe {
+        let (mut span, mut last) = (list, null_mut::<Span>());
         while !span.is_null() {
             let discarded = alone() && segments::decommit(base_of(span) as *mut u8, span_size());
             (*span).tail_zero = discarded && segments::DECOMMIT_ZEROES;
-            (*span).place = Place::Decommitted;
             last = span;
             span = (*span).next;
-            n += 1;
         }
         let _guard = POOL.lock.lock();
         let pool = &mut *POOL.state.get();
+        let (mut span, mut prev) = (list, null_mut::<Span>());
+        while !span.is_null() {
+            (*span).place = Place::Decommitted;
+            (*span).prev = prev;
+            pool.decommitted_len += 1;
+            pool.count_in(span);
+            prev = span;
+            span = (*span).next;
+        }
         (*last).next = pool.decommitted;
+        if !pool.decommitted.is_null() {
+            (*pool.decommitted).prev = last;
+        }
         pool.decommitted = list;
-        pool.decommitted_len += n;
     }
 }
 
-/// Return the thread's lists and regions to their spans and, where a span's memory goes back
-/// alone, the memory of the pool's empty spans to the OS. Called only after a major GC: doing
-/// this on every collection would throw away the hot allocation cache and turn steady-state
-/// churn into refills and page faults.
+/// Return the segments taken off the pool's lists, linked by `next`, to the OS.
+///
+/// # Safety
+/// No thread reaches them.
+unsafe fn unmap_segments(mut segment: *mut Segment) {
+    while !segment.is_null() {
+        // SAFETY: the caller's contract: the header is read before the segment goes.
+        unsafe {
+            let next = (*segment).next;
+            segments::unmap(segment as *mut u8);
+            segment = next;
+        }
+        #[cfg(test)]
+        tests::RELEASED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether free segments go back to the OS: always.
+#[cfg(not(test))]
+#[inline]
+fn releases() -> bool {
+    true
+}
+
+/// But in the tests that keep them (`tests::KEEP_SEGMENTS`), which read spans after they empty.
+#[cfg(test)]
+fn releases() -> bool {
+    !tests::KEEP_SEGMENTS.load(Ordering::Relaxed)
+}
+
+/// Return the thread's lists and regions to their spans, and the pool's free segments to the OS
+/// (and where a span's memory goes back alone, its empty spans' memory). Called only after a
+/// major GC: doing this on every collection would throw away the hot allocation cache and turn
+/// steady-state churn into refills and page faults.
 pub(crate) fn trim() {
     // The library's test binary does not register the allocator: only its own tests use it, and
     // they trim when they mean to (`trim_now`), so the other tests' collections leave it alone.
@@ -1106,19 +1413,34 @@ pub(crate) fn trim() {
 
 fn trim_now() {
     let _ = CACHE.try_with(drain);
-    let list = if alone() {
+    let (freed, list) = {
         let _guard = POOL.lock.lock();
-        // SAFETY: the pool's state, under the pool's lock.
-        let pool = unsafe { &mut *POOL.state.get() };
-        pool.committed_last = null_mut();
-        pool.committed_len = 0;
-        std::mem::replace(&mut pool.committed, null_mut())
-    } else {
-        null_mut()
+        // SAFETY: the pool's state and its spans' headers, under the pool's lock.
+        unsafe {
+            let pool = &mut *POOL.state.get();
+            let freed = if releases() {
+                pool.take_free_segments(None)
+            } else {
+                null_mut()
+            };
+            let mut list = null_mut::<Span>();
+            if alone() {
+                while !pool.committed_last.is_null() {
+                    let span = pool.committed_last;
+                    pool.remove(span);
+                    (*span).next = list;
+                    list = span;
+                }
+            }
+            (freed, list)
+        }
     };
-    if !list.is_null() {
-        // SAFETY: taken off the pool's committed list: no thread reaches them.
-        unsafe { decommit_spans(list) };
+    // SAFETY: taken off the pool's lists: no thread reaches them.
+    unsafe {
+        unmap_segments(freed);
+        if !list.is_null() {
+            decommit_spans(list);
+        }
     }
     #[cfg(target_os = "macos")]
     unsafe {

@@ -4,14 +4,38 @@
 use super::*;
 use std::cell::RefCell;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 use std::sync::mpsc;
 use std::sync::{Barrier, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 static SERIAL: Mutex<()> = Mutex::new(());
 
-/// Spans' memory goes back to the OS alone, or not, while it lives (as the system's page decides
-/// it).
+/// The segments returned to the OS (`unmap_segments`).
+pub(super) static RELEASED: AtomicUsize = AtomicUsize::new(0);
+
+/// Free segments stay mapped while set: most tests read a span's header after the span empties,
+/// which a segment gone would fault. `Releasing` clears it for a test.
+pub(super) static KEEP_SEGMENTS: AtomicBool = AtomicBool::new(true);
+
+/// Free segments go back to the OS, as outside the tests, while it lives.
+struct Releasing;
+
+impl Releasing {
+    fn new() -> Self {
+        KEEP_SEGMENTS.store(false, Ordering::Relaxed);
+        Releasing
+    }
+}
+
+impl Drop for Releasing {
+    fn drop(&mut self) {
+        KEEP_SEGMENTS.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Spans' memory goes back to the OS alone, or only with their segments, while it lives (as where
+/// the system's pages and huge pages decide it).
 struct Alone(u32);
 
 impl Alone {
@@ -186,6 +210,7 @@ fn pool_spans() -> (Vec<usize>, Vec<usize>) {
 #[derive(Debug, Default)]
 struct Audit {
     segments: usize,
+    free_segments: usize,
     carved: usize,
     committed: usize,
     decommitted: usize,
@@ -222,29 +247,43 @@ fn audit() -> Audit {
             (prev, span, n) = (span, (*span).next, n + 1);
         }
         assert_eq!((n, prev), (pool.committed_len, pool.committed_last));
-        let (mut span, mut n) = (pool.decommitted, 0);
+        let (mut span, mut prev, mut n) = (pool.decommitted, null_mut(), 0);
         while !span.is_null() {
             assert_eq!((*span).place, Place::Decommitted);
+            assert_eq!((*span).prev, prev);
             assert!(listed.insert(span as usize));
-            (span, n) = ((*span).next, n + 1);
+            (prev, span, n) = (span, (*span).next, n + 1);
         }
         assert_eq!(n, pool.decommitted_len);
+        let mut free = HashSet::new();
+        let (mut segment, mut prev) = (pool.free, null_mut());
+        while !segment.is_null() {
+            assert!((*segment).free);
+            assert_eq!((*segment).prev_free, prev);
+            assert!(free.insert(segment as usize));
+            (prev, segment) = (segment, (*segment).next_free);
+        }
+        assert_eq!(prev, pool.free_last);
         let mut seen = 0;
-        let mut segment = pool.segments;
+        let (mut segment, mut prev) = (pool.segments, null_mut());
         while !segment.is_null() {
             audit.segments += 1;
+            assert_eq!((*segment).prev, prev);
             let start = segment as usize;
             assert_eq!(start % SEGMENT, 0);
+            let (mut carved, mut pooled) = (0, 0);
             for k in 1..SEGMENT / span_size() {
                 let base = start + k * span_size();
                 if start + SEGMENT == pool.carve_end && base >= pool.carve {
                     break;
                 }
                 audit.carved += 1;
+                carved += 1;
                 let span = span_of(base);
                 match (*span).place {
                     Place::Committed | Place::Decommitted => {
                         assert_eq!((*span).out, 0);
+                        pooled += 1;
                         if (*span).place == Place::Committed {
                             audit.committed += 1;
                         } else {
@@ -290,45 +329,62 @@ fn audit() -> Audit {
                     assert!(listed.contains(&(span as usize)));
                 }
             }
-            segment = (*segment).next;
+            assert_eq!(
+                ((*segment).carved, (*segment).pooled),
+                (carved, pooled),
+                "{start:#x}"
+            );
+            assert_eq!((*segment).free, carved == pooled, "{start:#x}");
+            assert_eq!((*segment).free, free.contains(&start), "{start:#x}");
+            audit.free_segments += usize::from((*segment).free);
+            (prev, segment) = (segment, (*segment).next);
         }
         assert_eq!(seen, listed.len(), "a listed span outside the segments");
+        assert_eq!(audit.free_segments, free.len(), "a free segment unlisted");
     }
     audit
 }
 
 /// Run `f` with the pool's spans taken out, so that a refill carves a fresh span, and put them
-/// back after.
+/// back after (also when `f` panics, so that the tests after it find them pooled).
 fn with_empty_pool<T>(f: impl FnOnce() -> T) -> T {
+    /// The spans taken: the committed ones first.
+    struct Taken(Vec<*mut Span>, usize);
+
+    impl Drop for Taken {
+        fn drop(&mut self) {
+            let (mut again, mut gone) = (null_mut::<Span>(), null_mut::<Span>());
+            for (k, &span) in self.0.iter().enumerate() {
+                // SAFETY: spans taken from the pool, which nothing else reaches.
+                unsafe {
+                    if k < self.1 {
+                        (*span).next = again;
+                        again = span;
+                    } else {
+                        (*span).next = gone;
+                        gone = span;
+                    }
+                }
+            }
+            // SAFETY: as above.
+            unsafe {
+                if !again.is_null() {
+                    pool_put(again);
+                }
+                if !gone.is_null() {
+                    decommit_spans(gone);
+                }
+            }
+        }
+    }
+
     let (committed, decommitted) = pool_spans();
     let taken: Vec<_> = (0..committed.len() + decommitted.len())
         .map(|_| take_span().0)
         .collect();
     assert!(taken.iter().all(|s| !s.is_null()));
-    let result = f();
-    let (mut again, mut gone) = (null_mut::<Span>(), null_mut::<Span>());
-    for (k, &span) in taken.iter().enumerate() {
-        // SAFETY: spans taken from the pool, which nothing else reaches.
-        unsafe {
-            if k < committed.len() {
-                (*span).next = again;
-                again = span;
-            } else {
-                (*span).next = gone;
-                gone = span;
-            }
-        }
-    }
-    // SAFETY: as above.
-    unsafe {
-        if !again.is_null() {
-            pool_put(again);
-        }
-        if !gone.is_null() {
-            decommit_spans(gone);
-        }
-    }
-    result
+    let _taken = Taken(taken, committed.len());
+    f()
 }
 
 #[test]
@@ -361,6 +417,7 @@ fn span_headers_sit_in_their_segments_first_span() {
         let base = segment + k * span;
         for at in [base, base + 4321, base + span - 1] {
             assert_eq!(span_of(at) as usize, segment + k * 64);
+            assert_eq!(segment_of(span_of(at)) as usize, segment);
         }
         assert_eq!(base_of(span_of(base)), base);
     }
@@ -371,7 +428,8 @@ fn span_headers_sit_in_their_segments_first_span() {
 
 /// A span is whole pages, so that its memory can go back alone: 16 KiB, or the page where that is
 /// larger (a Linux kernel of 64 KiB pages: AArch64's RHEL, NVIDIA's Grace); past 64 KiB, spans of
-/// 16 KiB whose memory stays.
+/// 16 KiB whose memory goes back with their segments'. Where huge pages back segments, no span's
+/// memory goes back alone.
 #[test]
 fn spans_are_whole_pages() {
     let _serial = serial();
@@ -381,12 +439,40 @@ fn spans_are_whole_pages() {
     assert_eq!(span_for_page(128 << 10), (16 << 10, false));
     assert_eq!(span_for_page(12 << 10), (16 << 10, false));
     let (span, alone_by_page) = span_for_page(segments::page_size());
-    assert_eq!((span_size(), alone()), (span, alone_by_page));
+    assert_eq!(span_size(), span);
+    assert_eq!(alone(), alone_by_page && !segments::huge());
     assert!(span_size().is_multiple_of(segments::page_size()) || !alone());
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    {
+        use crate::gc_core::os_pages::huge_page_setting;
+        let mib2 = Some(2 << 20);
+        assert_eq!(
+            huge_page_setting(b"always [madvise] never\n", b"2097152\n"),
+            mib2
+        );
+        assert_eq!(
+            huge_page_setting(b"[always] madvise never\n", b"2097152\n"),
+            mib2
+        );
+        assert_eq!(
+            huge_page_setting(b"always madvise [never]\n", b"2097152\n"),
+            None
+        );
+        assert_eq!(
+            huge_page_setting(b"always [madvise] never\n", b"536870912\n"),
+            Some(512 << 20)
+        );
+        assert_eq!(huge_page_setting(b"always [madvise] never\n", b"\n"), None);
+        assert_eq!(huge_page_setting(b"", b"2097152\n"), None);
+    }
     eprintln!(
-        "page {} KiB, spans {} KiB, a span's memory back alone: {}",
+        "page {} KiB, spans {} KiB, huge pages {}, a span's memory back alone: {}",
         segments::page_size() >> 10,
         span_size() >> 10,
+        segments::huge(),
         alone()
     );
 }
@@ -1393,10 +1479,30 @@ fn threads_that_churn_exit_and_trim_keep_every_block_intact() {
     assert!(audit.decommitted > 0, "{audit:?}");
 }
 
+/// The same, free segments going back to the OS whole as well (spans back alone, and not, as
+/// where huge pages back segments); with every block back, a trim returns every segment.
+#[test]
+fn threads_that_churn_exit_and_trim_keep_every_block_intact_as_segments_go() {
+    let _serial = serial();
+    let _releasing = Releasing::new();
+    for alone in [true, false] {
+        let _alone = Alone::set(alone);
+        let released = RELEASED.load(Ordering::Relaxed);
+        let churn = churn_stress(false, 3, 40);
+        let during = RELEASED.load(Ordering::Relaxed) - released;
+        trim_now();
+        let after = audit();
+        eprintln!("churn, spans back alone {alone}: {during} segments released, {churn:?}");
+        assert_eq!(after.segments, 0, "{after:?}");
+        assert!(RELEASED.load(Ordering::Relaxed) - released >= churn.segments);
+    }
+}
+
 /// Threads that churn a few hot sizes.
 #[test]
 fn threads_that_churn_hot_sizes_keep_every_block_intact() {
     let _serial = serial();
+    let _releasing = Releasing::new();
     let audit = churn_stress(true, 4, 40);
     eprintln!("churn, hot sizes: {audit:?}");
 }
@@ -1455,5 +1561,105 @@ fn a_spans_discard_keeps_its_neighbours() {
             })
         });
     }
+    audit();
+}
+
+/// A segment whose spans are all in the pool is free: past the pool's bound the oldest free
+/// segments go back to the OS whole, their spans off the pool's lists, as many as bring the
+/// committed spans to the bound; at a trim all of them. A segment with a block out stays, its
+/// empty spans committed where no span's memory goes back alone.
+#[test]
+fn a_free_segment_goes_back_to_the_os_whole() {
+    let _serial = serial();
+    let _releasing = Releasing::new();
+    let _alone = Alone::set(false);
+    trim_now();
+    let start = audit();
+    assert_eq!(start.free_segments, 0);
+    let pooled = start.committed + start.decommitted;
+    let per_segment = SEGMENT / span_size() - 1;
+    let bound = POOL_COMMITTED_BYTES >> span_shift();
+    let class = 63;
+    let (size, n) = (class_size(class), per_span(class));
+    // The pool's spans and three segments' worth more: two segments at least carved for these
+    // blocks alone. The last block stays out, and its segment with it.
+    let blocks: Vec<usize> = on_thread(|| {
+        (0..(pooled + 3 * per_segment) * n)
+            .map(|_| alloc(size))
+            .collect()
+    });
+    let kept = *blocks.last().unwrap();
+    let segments = audit().segments;
+    let released = RELEASED.load(Ordering::Relaxed);
+    on_thread(|| {
+        blocks[..blocks.len() - 1]
+            .iter()
+            .for_each(|&b| free(b, size))
+    });
+    let past_bound = RELEASED.load(Ordering::Relaxed) - released;
+    let a = audit();
+    assert!(past_bound >= 1, "{a:?}");
+    assert!(a.committed <= bound || a.free_segments == 0, "{a:?}");
+    assert_eq!(a.segments, segments - past_bound);
+    assert!(
+        a.decommitted <= start.decommitted,
+        "a span's memory went back alone: {a:?}"
+    );
+    trim_now();
+    let all = RELEASED.load(Ordering::Relaxed) - released;
+    let b = audit();
+    assert!(all >= 2 && b.free_segments == 0, "{b:?}");
+    assert_eq!(b.segments, segments - all);
+    // The kept block's segment and span stay: the span on its class's list.
+    let v = view(kept);
+    assert_eq!((v.place, v.out), (Place::Partial, 1));
+    on_thread(|| free(kept, size));
+    audit();
+}
+
+/// Past the pool's bound, where no span's memory goes back alone (huge pages back segments), the
+/// empty spans of segments with a block out stay committed: neither discarded alone nor returned,
+/// at the bound or at a trim.
+#[test]
+fn past_the_bound_used_segments_keep_their_empty_spans_where_huge_pages_back_them() {
+    let _serial = serial();
+    let _releasing = Releasing::new();
+    let _alone = Alone::set(false);
+    let per_segment = SEGMENT / span_size() - 1;
+    let bound = POOL_COMMITTED_BYTES >> span_shift();
+    let class = 63;
+    let (size, n) = (class_size(class), per_span(class));
+    with_empty_pool(|| {
+        // Three segments' worth of spans carved for these blocks, a block of each segment they
+        // lie in kept out: once the others are back, past the bound, no segment of theirs is
+        // free.
+        let blocks: Vec<usize> =
+            on_thread(|| (0..3 * per_segment * n).map(|_| alloc(size)).collect());
+        let mut segments = HashSet::new();
+        let kept: HashSet<usize> = blocks
+            .iter()
+            .copied()
+            .filter(|&b| segments.insert(b & !(SEGMENT - 1)))
+            .collect();
+        let released = RELEASED.load(Ordering::Relaxed);
+        on_thread(|| {
+            for &b in blocks.iter().filter(|b| !kept.contains(b)) {
+                free(b, size);
+            }
+        });
+        let (committed, decommitted) = pool_spans();
+        assert!(
+            committed.len() > bound,
+            "{} spans committed",
+            committed.len()
+        );
+        assert!(decommitted.is_empty());
+        trim_now();
+        let (again, decommitted) = pool_spans();
+        assert_eq!((again.len(), decommitted.len()), (committed.len(), 0));
+        assert_eq!(RELEASED.load(Ordering::Relaxed), released);
+        on_thread(|| kept.iter().for_each(|&b| free(b, size)));
+        assert!(RELEASED.load(Ordering::Relaxed) > released);
+    });
     audit();
 }
