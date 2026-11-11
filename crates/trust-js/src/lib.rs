@@ -90,9 +90,9 @@ mod execution_storage;
 #[cfg(test)]
 mod external_memory_tests;
 /// The engine's size-class caching allocator, for its many small Rust-heap blocks (spilled
-/// property and binding storage, keys, argument lists, boxed internal state). NOT registered
-/// here: a library must not preempt an embedder's `#[global_allocator]` (the test262 runner caps
-/// worker allocations with its own). Binaries opt in:
+/// property and binding storage, keys, argument lists, boxed internal state), over spans of its
+/// own pages. NOT registered here: a library must not preempt an embedder's `#[global_allocator]`
+/// (the test262 runner caps worker allocations with its own). Binaries opt in:
 /// `#[global_allocator] static A: trust_js::fastalloc::ClassAlloc = trust_js::fastalloc::ClassAlloc;`
 #[cfg(not(target_arch = "wasm32"))]
 pub mod fastalloc;

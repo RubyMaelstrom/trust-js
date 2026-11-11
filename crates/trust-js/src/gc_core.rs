@@ -404,16 +404,16 @@ impl<T: ZeroValid> Drop for TableLevel<T> {
     }
 }
 
-/// Zeroed memory mapped from the OS (see [`TableLevel`] and `page_source`).
+/// Zeroed memory mapped from the OS (see [`TableLevel`], `page_source` and the shell allocator's
+/// segments, `fastalloc`).
 #[cfg(all(
     any(target_os = "linux", target_os = "macos"),
     any(target_arch = "aarch64", target_arch = "x86_64")
 ))]
-mod os_pages {
+pub(crate) mod os_pages {
     unsafe extern "C" {
         fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
         fn munmap(addr: *mut u8, len: usize) -> i32;
-        #[cfg(target_os = "linux")]
         fn madvise(addr: *mut u8, len: usize, advice: i32) -> i32;
     }
     const PROT_READ_WRITE: i32 = 0x1 | 0x2;
@@ -425,9 +425,16 @@ mod os_pages {
     const MADV_DONTNEED: i32 = 4;
     #[cfg(target_os = "linux")]
     const MADV_HUGEPAGE: i32 = 14;
+    #[cfg(target_os = "macos")]
+    const MADV_FREE_REUSE: i32 = 8;
+    /// [`decommit`]'s advice: `MADV_DONTNEED` on Linux, `MADV_FREE_REUSABLE` on macOS.
+    #[cfg(target_os = "linux")]
+    const DECOMMIT_ADVICE: i32 = MADV_DONTNEED;
+    #[cfg(target_os = "macos")]
+    const DECOMMIT_ADVICE: i32 = 7;
 
     /// `len` zeroed bytes at a page boundary; null when the system refuses.
-    pub(super) fn map(len: usize) -> *mut u8 {
+    pub(crate) fn map(len: usize) -> *mut u8 {
         // SAFETY: a new private anonymous mapping, where the system chooses.
         let ptr = unsafe {
             mmap(
@@ -449,7 +456,7 @@ mod os_pages {
     /// `len` zeroed bytes at an `align` boundary, `align` a power of two and both multiples of the
     /// system's page size: `len + align` bytes mapped, and the ends outside the range unmapped.
     /// Null when the system refuses.
-    pub(super) fn map_aligned(len: usize, align: usize) -> *mut u8 {
+    pub(crate) fn map_aligned(len: usize, align: usize) -> *mut u8 {
         let raw = map(len + align);
         if raw.is_null() {
             return raw;
@@ -468,7 +475,7 @@ mod os_pages {
 
     /// # Safety
     /// `ptr` and `len` are a `map` or `map_aligned` call's, and nothing uses the memory again.
-    pub(super) unsafe fn unmap(ptr: *mut u8, len: usize) {
+    pub(crate) unsafe fn unmap(ptr: *mut u8, len: usize) {
         // SAFETY: the caller's contract.
         unsafe { munmap(ptr, len) };
     }
@@ -492,25 +499,64 @@ mod os_pages {
         // SAFETY: the caller's contract.
         unsafe { madvise(ptr, len, MADV_DONTNEED) == 0 }
     }
+
+    /// Whether a range [`decommit`] returned to the system reads as zero once [`recommit`]ted.
+    pub(crate) const DECOMMIT_ZEROES: bool = cfg!(target_os = "linux");
+
+    /// Return the memory behind `ptr..ptr + len`, mapped here, at page boundaries, to the system
+    /// and keep the range mapped, to be [`recommit`]ted before it is used again. On Linux it is
+    /// discarded (`discard`: it reads as zero when next touched); on macOS it is marked reusable
+    /// (`MADV_FREE_REUSABLE`, as libpas and libmalloc do), which takes it out of the process's
+    /// footprint at once and leaves its contents undefined. False when the system refuses, which
+    /// leaves the contents as they were.
+    ///
+    /// # Safety
+    /// Nothing holds a reference into the range or needs its contents.
+    pub(crate) unsafe fn decommit(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: the caller's contract.
+        unsafe { madvise(ptr, len, DECOMMIT_ADVICE) == 0 }
+    }
+
+    /// Make a range [`decommit`] returned usable again (on macOS `MADV_FREE_REUSE`, which counts
+    /// it in the footprint again; on Linux its pages come back at their first touch). True: the
+    /// range is usable whatever the system answers.
+    ///
+    /// # Safety
+    /// `ptr..ptr + len` is a range `decommit` was given, which nothing uses yet.
+    pub(crate) unsafe fn recommit(ptr: *mut u8, len: usize) -> bool {
+        #[cfg(target_os = "macos")]
+        // SAFETY: advice only, on the caller's range.
+        unsafe {
+            madvise(ptr, len, MADV_FREE_REUSE);
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = (ptr, len);
+        true
+    }
 }
 
-/// Zeroed memory mapped from the OS (see [`TableLevel`] and `page_source`).
+/// Zeroed memory mapped from the OS (see [`TableLevel`], `page_source` and the shell allocator's
+/// segments, `fastalloc`).
 #[cfg(all(
     target_os = "windows",
     any(target_arch = "aarch64", target_arch = "x86_64")
 ))]
-mod os_pages {
+pub(crate) mod os_pages {
     #[link(name = "kernel32")]
     unsafe extern "system" {
         fn VirtualAlloc(addr: *mut u8, len: usize, kind: u32, protect: u32) -> *mut u8;
         fn VirtualFree(addr: *mut u8, len: usize, kind: u32) -> i32;
     }
-    const MEM_COMMIT_RESERVE: u32 = 0x1000 | 0x2000;
+    const MEM_COMMIT: u32 = 0x1000;
+    const MEM_RESERVE: u32 = 0x2000;
+    const MEM_COMMIT_RESERVE: u32 = MEM_COMMIT | MEM_RESERVE;
+    const MEM_DECOMMIT: u32 = 0x4000;
     const MEM_RELEASE: u32 = 0x8000;
+    const PAGE_NOACCESS: u32 = 0x01;
     const PAGE_READWRITE: u32 = 0x04;
 
     /// `len` zeroed bytes at a page boundary; null when the system refuses.
-    pub(super) fn map(len: usize) -> *mut u8 {
+    pub(crate) fn map(len: usize) -> *mut u8 {
         // SAFETY: a new committed region, where the system chooses; its pages read as zero.
         unsafe {
             VirtualAlloc(
@@ -522,11 +568,71 @@ mod os_pages {
         }
     }
 
+    /// `len` zeroed bytes at an `align` boundary, `align` a power of two and both multiples of the
+    /// allocation granularity: a reservation of `len + align` bytes finds an aligned address and
+    /// is released, and the range is reserved and committed there (another thread may take the
+    /// address meanwhile, which a new reservation retries). `unmap` releases it. Null when the
+    /// system refuses.
+    pub(crate) fn map_aligned(len: usize, align: usize) -> *mut u8 {
+        for _ in 0..16 {
+            // SAFETY: a new reservation, where the system chooses, released at once: only its
+            // address is used.
+            let probe = unsafe {
+                VirtualAlloc(
+                    std::ptr::null_mut(),
+                    len + align,
+                    MEM_RESERVE,
+                    PAGE_NOACCESS,
+                )
+            };
+            if probe.is_null() {
+                return probe;
+            }
+            let at = (probe as usize).next_multiple_of(align) as *mut u8;
+            // SAFETY: the reservation just made, with nothing in it; then a new committed region
+            // at an address inside it, which fails if another reservation took it meanwhile.
+            let ptr = unsafe {
+                VirtualFree(probe, 0, MEM_RELEASE);
+                VirtualAlloc(at, len, MEM_COMMIT_RESERVE, PAGE_READWRITE)
+            };
+            if !ptr.is_null() {
+                return ptr;
+            }
+        }
+        std::ptr::null_mut()
+    }
+
     /// # Safety
-    /// `ptr` is a `map` call's, and nothing uses the memory again.
-    pub(super) unsafe fn unmap(ptr: *mut u8, _len: usize) {
+    /// `ptr` is a `map` or `map_aligned` call's, and nothing uses the memory again.
+    pub(crate) unsafe fn unmap(ptr: *mut u8, _len: usize) {
         // SAFETY: the caller's contract.
         unsafe { VirtualFree(ptr, 0, MEM_RELEASE) };
+    }
+
+    /// Whether a range [`decommit`] returned to the system reads as zero once [`recommit`]ted.
+    pub(crate) const DECOMMIT_ZEROES: bool = true;
+
+    /// Return the memory behind `ptr..ptr + len`, mapped here, at page boundaries, to the system
+    /// with its commit charge (`MEM_DECOMMIT`, as libpas does on Windows) and keep the range
+    /// reserved: it faults until [`recommit`]ted. False when the system refuses, which leaves the
+    /// contents as they were.
+    ///
+    /// # Safety
+    /// Nothing holds a reference into the range or needs its contents.
+    pub(crate) unsafe fn decommit(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: the caller's contract; the range lies in one mapping.
+        unsafe { VirtualFree(ptr, len, MEM_DECOMMIT) != 0 }
+    }
+
+    /// Commit a range [`decommit`] returned again (`MEM_COMMIT`): its pages read as zero, and a
+    /// range never decommitted keeps its contents. False when the system refuses (its commit
+    /// limit): the range is not usable then.
+    ///
+    /// # Safety
+    /// `ptr..ptr + len` is a range `decommit` was given, which nothing uses yet.
+    pub(crate) unsafe fn recommit(ptr: *mut u8, len: usize) -> bool {
+        // SAFETY: the caller's range, in one mapping.
+        unsafe { !VirtualAlloc(ptr, len, MEM_COMMIT, PAGE_READWRITE).is_null() }
     }
 }
 
