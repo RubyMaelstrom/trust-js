@@ -71,16 +71,40 @@ const MEM_SOFT_CAP: usize = 256 * 1024 * 1024;
 
 static HEAP_USED: AtomicUsize = AtomicUsize::new(0);
 
+/// Count `bytes` against [`MEM_CAP`] unless that would pass it, in one atomic step: a request the
+/// cap refuses is never counted, not even for a moment. Counting first and taking it back after
+/// let a refused request (a 7 PiB `maxByteLength`'s, which the engine asks for to throw its
+/// RangeError) fail any other thread's allocation in between, and that one aborts the worker
+/// (`handle_alloc_error`): "memory allocation of 8 bytes failed", the tier compiling meanwhile on
+/// its own thread (P3 stage 2's gate, with the tier on and eager).
+/// (A compare-exchange loop: `try_update`, which Rust 1.99 prefers to the deprecated
+/// `fetch_update`, is stable only from 1.95, past the workspace's MSRV.)
+fn charge(bytes: usize) -> bool {
+    let mut used = HEAP_USED.load(Ordering::Relaxed);
+    loop {
+        let Some(total) = used.checked_add(bytes).filter(|&total| total <= MEM_CAP) else {
+            return false;
+        };
+        match HEAP_USED.compare_exchange_weak(used, total, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(current) => used = current,
+        }
+    }
+}
+
 struct CapAlloc;
 
 // SAFETY: delegates to `System`; the byte counter never affects layout or pointer validity.
 unsafe impl GlobalAlloc for CapAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if HEAP_USED.fetch_add(layout.size(), Ordering::Relaxed) + layout.size() > MEM_CAP {
-            HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
+        if !charge(layout.size()) {
             return std::ptr::null_mut();
         }
-        System.alloc(layout)
+        let ptr = System.alloc(layout);
+        if ptr.is_null() {
+            HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
+        }
+        ptr
     }
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         HEAP_USED.fetch_sub(layout.size(), Ordering::Relaxed);
@@ -89,14 +113,21 @@ unsafe impl GlobalAlloc for CapAlloc {
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         if new_size > layout.size() {
             let grow = new_size - layout.size();
-            if HEAP_USED.fetch_add(grow, Ordering::Relaxed) + grow > MEM_CAP {
-                HEAP_USED.fetch_sub(grow, Ordering::Relaxed);
+            if !charge(grow) {
                 return std::ptr::null_mut();
             }
+            let moved = System.realloc(ptr, layout, new_size);
+            if moved.is_null() {
+                HEAP_USED.fetch_sub(grow, Ordering::Relaxed);
+            }
+            moved
         } else {
-            HEAP_USED.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            let moved = System.realloc(ptr, layout, new_size);
+            if !moved.is_null() {
+                HEAP_USED.fetch_sub(layout.size() - new_size, Ordering::Relaxed);
+            }
+            moved
         }
-        System.realloc(ptr, layout, new_size)
     }
 }
 
@@ -1096,5 +1127,38 @@ fn find_root() -> Option<PathBuf> {
         if !dir.pop() {
             return None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A request past the cap, made over and over on one thread, fails no allocation of another
+    /// thread's (with the counting before `charge`, this run aborted on its first few thousand).
+    #[test]
+    fn a_refused_request_fails_no_other_threads_allocation() {
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let refuser = {
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                // `new ArrayBuffer(0, {maxByteLength: 7 * 1024 ** 5})`'s request.
+                let layout = Layout::array::<u8>(7 << 50).expect("a layout");
+                let mut refused = 0u64;
+                while !stop.load(Ordering::Relaxed) {
+                    // SAFETY: a non-zero size; a null result is checked.
+                    let ptr = unsafe { std::alloc::alloc(layout) };
+                    assert!(ptr.is_null(), "past the cap");
+                    refused += 1;
+                }
+                refused
+            })
+        };
+        for k in 0..2_000_000u64 {
+            std::hint::black_box(Box::new(k));
+        }
+        stop.store(true, Ordering::Relaxed);
+        assert!(refuser.join().expect("the refusing thread") > 0);
+        assert!(HEAP_USED.load(Ordering::Relaxed) < MEM_CAP);
     }
 }
