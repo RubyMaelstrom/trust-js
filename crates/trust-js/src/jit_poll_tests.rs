@@ -893,6 +893,12 @@ fn attempt_cyclic_walk(source: &str, deadline: bool) -> bool {
     let mut engine = engine();
     eval(&mut engine, source);
     assert_native(&mut engine, &["last"]);
+    // The collection the setup's last allocations made due runs here, before the clock starts,
+    // not at the walk's entry poll: under TRUST_JS_GC_STRESS one is due after each allocation,
+    // and a debug build's collection of this heap, verified, takes most of the 20 ms (17 ms on
+    // an idle core), so every attempt of the stress run's was interrupted before its loop.
+    engine.interp.gc_collect();
+    assert!(!engine.interp.poll.heap_due(), "no collection due");
     let interrupt = engine.interrupt_handle();
     let canceller = (!deadline).then(|| {
         let interrupt = interrupt.clone();
