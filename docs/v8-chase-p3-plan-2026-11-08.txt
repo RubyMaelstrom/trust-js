@@ -3489,3 +3489,40 @@ CallIc 100-103, CallSite 500-503); the splice rule declines a whole site before 
   dispatch, guards by code for closures, shared or per-site callee feedback, exceptions, positions,
   exit and loop limits, recursion, the callee shapes admitted first, what stays of splicing, and
   the install's checks with inlined callees.
+
+Stage 3, the tier's own inlining (design, 2026-11-12; target/p3/stage2/stage3-design-draft.txt is
+the detailed reference, with its file:line citations; inputs inlining-input.txt and -2.txt). The
+exemplars build a callee into the caller's graph from the callee's own bytecode and shared
+feedback, with a frame-state chain, and an exit rebuilds one baseline frame per function. TRust's
+splice recompiles the caller's AST with callees spliced behind identity guards: no frames of their
+own, and the bytecode recompile (1.31 ms of Djot's 1.97 ms at the bar). The steps, each measured
+graph against splice on one binary (a switch, TRUST_JS_OPT_INLINE=graph|splice, padded):
+1. Frame-state chains and exits through several frames: an inlined frame's table (its chunk, the
+   parent state at the call's pc + 1, the callee and `this`), states naming their frame, the
+   verifier per frame; the deoptimizer rebuilds every frame first (values rooted, a record and an
+   FnFrame each), then runs the innermost and resumes each parent after its call with the value or
+   at it with the throw, as all three exemplars do. Tested on hand-made graphs; no code changes.
+2. The graph inliner for callees without effects (E0), behind the switch, with the planner's
+   decisions: Djot's leaf-only callers stop recompiling (its bar about 2.6%).
+3. Effects, calls and throws in inlined frames (D6 below), positions by the splice's mechanism:
+   Djot's bar about 1.0%.
+4. The flip: graph inlining by default, no tier compile recompiles bytecode; a session reads the
+   bars.
+5. Named method calls as Maglev's polymorphic arms from the first compile, an unseen callee exiting
+   (input-2: 7,123 WrongCallee exits a census are a site's other way).
+6. Closures guarded by code where a site met another closure (literal, realm), the environment
+   read from the closure, as all three engines do (plan point 8).
+7. Calls the tier does not inline, direct to the known callee (point 5, Maglev's
+   CallKnownJSFunction).
+8. Per-site call counts and Maglev's policy (D2, D3).
+9. Callee shapes beyond the splice's (arguments and rest, activations, handlers, constructors),
+   each on a measured need.
+Splicing stays for the tier off and for functions the tier refuses (Decision 3 is the phase end's),
+selectable until the stage's exit. Risks, each measured per step: the WrongCallee convergence (each
+exit now rebuilds several frames), the compile thread's load, multi-frame exits' correctness
+(rooting, records, positions), shared callee feedback going polymorphic where a splice's seeded
+copy stayed monomorphic (measured per inlined site; trial inlining only on a measured loss), the
+per-frame records' cost against a splice's free effects, Maglev's smaller limits, and a discarded
+function's fallback to template code without splices. Forks for the owner: D2 (the policy's
+numbers), D3 (call counts), D6 (effects in inlined frames), D7 (polymorphic sites); the rest are
+detail, recommended in the draft.
