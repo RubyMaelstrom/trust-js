@@ -3526,3 +3526,22 @@ per-frame records' cost against a splice's free effects, Maglev's smaller limits
 function's fallback to template code without splices. Forks for the owner: D2 (the policy's
 numbers), D3 (call counts), D6 (effects in inlined frames), D7 (polymorphic sites); the rest are
 detail, recommended in the draft.
+
+The owner's answers on stage 3's forks (2026-11-12):
+- D2, the policy's numbers: "Maglev's numbers" (callees under 100 bytes, under 30 eagerly to depth
+  10 within a 3,000-byte small total, the 0.95 frequency rule past 27 bytes; sizes in JSC's cost
+  unit, each instruction's operands plus one, scaled at 1.17 V8 bytes a unit), measured at step 8
+  against step 7; a remaining loss comes back to the owner with Maglev's structure at TRust-sized
+  numbers.
+- D7, polymorphic sites: "Maglev: small arms": branches by callee from the first compile, arms under
+  Maglev's small size inlined, the others called (step 7's direct calls).
+- D6, effects in inlined frames: "Explicit operands", the exemplars' form, not the recommended
+  records per frame. Every operation the tier does not lower becomes the tier's own generic node
+  with explicit operands (its chunk, pc and input values), calling its helper with them, as
+  Maglev's generic nodes call builtins, JSC's DFG calls its operations (the code origin stored
+  before each call out) and Warp builds MIR calls; in every frame, the compiled function's own
+  too, so that the template effects on ctx.chunk's canonical frame go (stage 1's departure, plan
+  596-599, ends). Step 3 becomes that change, designed on its own input (the operations run as
+  effects today, their helpers' signatures, what each reads of the frame, the exits).
+- D3, call counts: "V8's counts": a count per call site and an invocation count per function,
+  counted only by template code compiled with the tier on.
