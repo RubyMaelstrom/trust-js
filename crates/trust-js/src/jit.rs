@@ -3235,7 +3235,7 @@ mod layout_asserts {
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, callee) == 0);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, global_env) == 32);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, epoch) == 56);
-        // The direct sequence loads the entry word's copy and the chunk with one LDP from 56.
+        // The direct sequence loads the entry word's copy (a u32 at 60) beside the chunk's LDUR.
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, entry) == 60);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_params) == 42);
         const _: () = assert!(std::mem::offset_of!(crate::bytecode::CallIc, n_slots) == 44);
@@ -4099,13 +4099,6 @@ mod asm {
         /// cmp xn, xm (SUBS xzr, xn, xm)
         pub fn cmp_reg_x(&mut self, rn: u32, rm: u32) {
             self.emit(0xEB00_001F | (rm << 16) | (rn << 5));
-        }
-        /// cmp xn, xm, lsr #shift (SUBS xzr, xn, xm, LSR #shift)
-        pub fn cmp_lsr_x(&mut self, rn: u32, rm: u32, shift: u32) {
-            if shift >= 64 {
-                return self.bad("a register shift past 63");
-            }
-            self.emit(0xEB40_001F | (rm << 16) | (shift << 10) | (rn << 5));
         }
         /// lsr xd, xn, #shift (UBFM xd, xn, #shift, #63)
         #[inline]
@@ -12339,15 +12332,9 @@ fn emit_direct_sequence(
     a.logic_imm_w(0, 11, 9, ready);
     a.cbz(11, false, static_gates);
     a.bind(static_done);
-    // x4 = the callee's chunk, kept for the retry gate below. With the optimizing tier on, x6
-    // = the way's epoch and its copy of the chunk's entry word (bits 32-63), in the same LDP.
+    // x4 = the callee's chunk, kept for the retry gate below.
     let compares_entry = a.compares_entry_words();
-    if compares_entry {
-        const _: () = assert!(IC_CHUNK_RAW == IC_EPOCH + 8 && IC_ENTRY == IC_EPOCH + 4);
-        a.ldp_base(6, 4, 12, IC_EPOCH);
-    } else {
-        a.ldur(4, 12, IC_CHUNK_RAW);
-    }
+    a.ldur(4, 12, IC_CHUNK_RAW);
     if !construct {
         // recompile settled (live chunk byte — see attempted_off). A construct waits for no
         // attempt: it counts from its first run (below), and its code's first checkpoint is
@@ -12361,9 +12348,16 @@ fn emit_direct_sequence(
         // discard, a reoptimization; P3 stage 2, step 14), equals the way's copy. A mismatch
         // takes the helper, which refills the way from the chunk's current code, as V8's and
         // SpiderMonkey's calls load a function's current entry; the code the way holds still
-        // lives (an install keeps the template JIT's code), so this is for speed.
+        // lives (an install keeps the template JIT's code), so this is for speed. The way's
+        // copy comes by a load of its own, inside the way's aligned word at 56: one LDP of bytes
+        // 56-71, the copy with the chunk, crosses the way's byte 64, a cache line's boundary
+        // where the way starts on one, and there the X925 and the A725 take the alignment's
+        // extra latency (the PMU's LD_ALIGN_LAT, once a call), which everything that reads the
+        // chunk after it waited for (about two cycles a construct on the X925).
+        const _: () = assert!(IC_ENTRY % 4 == 0 && IC_ENTRY % 8 == 4);
+        a.ldr_w_imm(6, 12, IC_ENTRY as u32);
         a.ldrb_imm(5, 4, crate::bytecode::CHUNK_ENTRY_OFF as u32);
-        a.cmp_lsr_x(5, 6, 32);
+        a.cmp_reg_w(5, 6);
         a.b_cond(C_NE, hit_slow);
     }
     // Arity needs no gate: the sequence moves min(argc, n_params) arguments into their slots,
