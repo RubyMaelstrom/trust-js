@@ -3602,3 +3602,32 @@ through the chunk, the Rust probes' entry_stale and the ways' entry copy gone), 
   passes alone 10 of 10 and fails as often on main's binary under the same load), the tier's in
   three configurations (313), poll and Agent (51), Test262 eager 53,573/53,575; clippy, fmt;
   zombie's check, clippy, Windows' check and suite (2,796).
+
+The collector's huge pages with honest discards landed (5f579b87, 6d704eba, 2026-11-12; target/p3/
+stage2/gcfault-impl, report.txt and report-b.txt; the owner's answer: "B: huge pages, honest
+discards"). The fault count that made dropping the advice costly was first touches, not churn:
+with GC pacing on the shell never runs the memory reducer, so nothing is given back in a timed run,
+and every fault is a new page's first touch (Splay's heap grows to 266 chunks: 16 faults a 64 KiB
+page on base pages, one a chunk on huge pages). Two options were built and measured in one session
+against main (X925 cores, 1.37 GHz delivered, 10 rounds):
+- A, the exemplars' form: no advice, and a helper thread keeping a chunk faulted in
+  (MADV_POPULATE_WRITE), as JSC's libpas prefaults its GC's blocks: TypeScript -1.44%, Box2D
+  -0.93%, SplayLatency -0.92%, the whole suite -1.1%, Splay on one A725 core -11.4%, up to 0.5 s
+  of system time on the helper; the charge after TypeScript's final collection 168.9 MiB.
+- B, landed: the chunks keep their advice; a page given back inside one is discarded with MADV_FREE
+  then MADV_DONTNEED (MADV_FREE splits the huge page, so the discard frees at once: TCMalloc's
+  free-then-dontneed release), and a chunk's first such page advises it MADV_NOHUGEPAGE until every
+  page given back has been taken again, then MADV_HUGEPAGE (jemalloc HPA's dehugify before a partial
+  purge; without it khugepaged re-collapsed split chunks 13-14 minutes later, zero-filling what was
+  given back). TypeScript -0.23%, Box2D -0.20%, SplayLatency -0.13%, the whole suite +0.7% (noise),
+  Splay on one A725 core +0.0%; the charge after TypeScript's collection 164.8 MiB (main 526.0,
+  RSS 168.4). With pacing as shipped B makes exactly main's madvise calls. None of V8, SpiderMonkey
+  or JSC does this: none advises its heap for huge pages.
+- Checks: the collector's tests (115, the new one reading the cgroup's charge), a mutation of each
+  rule caught, the library's suite tier off and on (3,240), clippy, fmt; on main: clippy clean, the
+  collector's tests, zombie's check, clippy and Windows' check.
+Open, found on the way (gcfault-impl/retention.txt): long Splay runs retain dead tree nodes. In a
+fixed 2,800-iteration run the live data after each major collection grows from 130 MB to 645 MB
+with the tier on and to 1,060 MB with the bytecode VM, where it stays flat at 118 MB with the
+template JIT alone (V8: 49-59 MB). Not floating garbage (a cycle allocates 8-43 MB), not the page
+source. Octane's timed Splay (about 1,200 iterations) stays under it. To be found.
