@@ -561,6 +561,27 @@ pub(crate) mod os_pages {
         unsafe { madvise(ptr, len, MADV_DONTNEED) == 0 }
     }
 
+    /// [`discard`] for a range that may lie inside a transparent huge page: `MADV_FREE` first,
+    /// which splits a huge page the range covers only in part (mm/huge_memory.c,
+    /// `madvise_free_huge_pmd`: "If user want to discard part-pages of THP, split it"), so that
+    /// the `MADV_DONTNEED` after it frees the range's memory at once. `MADV_DONTNEED` alone splits
+    /// only the mapping (mm/memory.c, `zap_pmd_range`) and leaves the huge page whole on the
+    /// deferred split queue, charged until memory pressure splits it (Documentation/admin-guide/
+    /// mm/transhuge.rst, `thp_deferred_split_page`). TCMalloc releases with the same two advices
+    /// (`MadvisePreference::kFreeAndDontNeed`). On base pages the `MADV_FREE` changes nothing the
+    /// discard does not. False as [`discard`]'s.
+    ///
+    /// # Safety
+    /// As [`discard`]'s: nothing holds a reference into the range or needs its contents.
+    #[cfg(target_os = "linux")]
+    pub(super) unsafe fn discard_splitting(ptr: *mut u8, len: usize) -> bool {
+        const MADV_FREE: i32 = 8;
+        // SAFETY: the caller's contract; the contents may go now, which the discard makes so.
+        unsafe { madvise(ptr, len, MADV_FREE) };
+        // SAFETY: the caller's contract.
+        unsafe { discard(ptr, len) }
+    }
+
     /// Whether a range [`decommit`] returned to the system reads as zero once [`recommit`]ted.
     pub(crate) const DECOMMIT_ZEROES: bool = cfg!(target_os = "linux");
 
@@ -761,6 +782,16 @@ mod os_pages {
 /// pages once the heap has a few of them, and carves its pages from them. A page given back is
 /// discarded (its memory freed, the range left mapped to read as zero) and taken again once the
 /// current chunk is carved, before a new chunk is mapped. Chunks are unmapped only with the heap.
+///
+/// Where the system backs chunks with huge pages, a page given back is discarded with the huge
+/// page under it split first (`os_pages::discard_splitting`; P3 stage 2, gcfault option B): a
+/// discard alone splits only the mapping, and the huge page stays whole on the kernel's deferred
+/// split queue, charged to the program until memory pressure splits it (after TypeScript's final
+/// collection 523 MiB charged where RSS read 169), and a page taken again then faults new memory
+/// in beside the memory still held. Split first, the discarded page's memory goes back at once,
+/// and the chunk's other pages stay as base pages (the discard alone had split their mapping
+/// already); khugepaged may collapse such a chunk into a huge page again later, as it may any
+/// advised range. A page taken again from a split chunk faults its base pages in.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "aarch64", target_arch = "x86_64")
@@ -784,6 +815,10 @@ mod page_source {
         end: usize,
         /// The pages given back, discarded, to be taken again before a new chunk is mapped.
         free: Vec<usize>,
+        /// Whether a huge page may back a chunk, so that a page given back splits it first
+        /// (`os_pages::discard_splitting`): the system grants transparent huge pages of a chunk's
+        /// size. Read at the first give-back.
+        split_first: Option<bool>,
     }
 
     impl PageSource {
@@ -793,6 +828,7 @@ mod page_source {
                 next: 0,
                 end: 0,
                 free: Vec::new(),
+                split_first: None,
             }
         }
 
@@ -841,8 +877,18 @@ mod page_source {
         /// # Safety
         /// `base` is a page `take` gave and not given back since, which nothing uses any more.
         pub(super) unsafe fn give_back(&mut self, base: *mut u8) {
+            let split_first = *self
+                .split_first
+                .get_or_insert_with(|| os_pages::huge_page_size() == Some(CHUNK_SIZE));
             // SAFETY: the caller's contract.
-            if !unsafe { os_pages::discard(base, PAGE_SIZE) } {
+            let discarded = unsafe {
+                if split_first {
+                    os_pages::discard_splitting(base, PAGE_SIZE)
+                } else {
+                    os_pages::discard(base, PAGE_SIZE)
+                }
+            };
+            if !discarded {
                 // The system keeps the memory (a locked mapping), so the page is zeroed here.
                 // SAFETY: as above.
                 unsafe { std::ptr::write_bytes(base, 0, PAGE_SIZE) };
@@ -7203,10 +7249,6 @@ mod tests {
         assert_eq!(pages(&fx), (0, 128));
     }
 
-    /// Pages are 64 KiB-aligned and every whole cell is zero before handout: new, reused from
-    /// the spare pool, and given back to the source when the pool is trimmed and taken again.
-    /// On Linux the pages given back are taken again before a new chunk is mapped (after the
-    /// current chunk's last pages), so they come from the same chunks. The heap's release returns
     /// A small heap's chunks keep base pages, which only the pages taken make resident; the
     /// chunk that makes the heap large enough advises every chunk mapped for huge pages, as the
     /// kernel's own mapping flags show.
@@ -7266,6 +7308,95 @@ mod tests {
         unsafe { source.release(taken) };
     }
 
+    /// P3 stage 2 (gcfault option B): a page given back inside a chunk a huge page backs frees its
+    /// memory at once: the source splits the huge page first (`os_pages::discard_splitting`),
+    /// where a discard alone leaves it whole on the kernel's deferred split queue, charged to the
+    /// cgroup though no longer mapped. The cgroup's own statistics show which: memory.stat's
+    /// anonymous memory on the LRU (`active_anon` + `inactive_anon`) less its mapped anonymous
+    /// memory (`anon`) is the memory of huge pages mapped only in part. Twelve chunks advised and
+    /// written (a huge page each, `anon_thp`), 31 of each one's 32 pages given back: 23.25 MiB of
+    /// such memory without the split, none with it. A system without huge pages of a chunk's size,
+    /// or one that backed too few of the chunks with them, or a cgroup without v2 statistics, has
+    /// nothing to measure: the test says so and ends.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn a_page_given_back_inside_a_huge_page_frees_its_memory() {
+        use super::page_source::{PageSource, CHUNK_SIZE, HUGE_PAGE_MIN_CHUNKS};
+        const HUGE_CHUNKS: usize = 12;
+        const PAGES_PER_CHUNK: usize = CHUNK_SIZE / PAGE_SIZE;
+        // This process's cgroup's memory.stat (v2): (anonymous memory on the LRU less the mapped
+        // anonymous memory, PMD-mapped huge pages), in KiB.
+        fn cgroup_stat() -> Option<(i64, i64)> {
+            let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;
+            let path = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+            let stat = std::fs::read_to_string(format!("/sys/fs/cgroup{path}/memory.stat")).ok()?;
+            let field = |key: &str| {
+                stat.lines().find_map(|line| {
+                    let value = line.strip_prefix(key)?.strip_prefix(' ')?;
+                    value.trim().parse::<i64>().ok().map(|bytes| bytes / 1024)
+                })
+            };
+            let held = field("active_anon")? + field("inactive_anon")? - field("anon")?;
+            Some((held, field("anon_thp")?))
+        }
+        if os_pages::huge_page_size() != Some(CHUNK_SIZE) {
+            eprintln!("no transparent huge pages of a chunk's size here: nothing to split");
+            return;
+        }
+        let Some((_, thp_before)) = cgroup_stat() else {
+            eprintln!("no cgroup v2 memory.stat to read: nothing to measure");
+            return;
+        };
+        let mut source = PageSource::new();
+        let mut taken = Vec::new();
+        // The chunks before the source advises them, then chunks advised as they are mapped,
+        // each written once: its first write faults a huge page in.
+        for _ in 0..HUGE_PAGE_MIN_CHUNKS * PAGES_PER_CHUNK {
+            taken.push(source.take() as usize);
+        }
+        assert!(source.huge_pages_advised());
+        // Each chunk's first page, which stays, and its other pages, to be given back.
+        let mut rest = Vec::new();
+        for _ in 0..HUGE_CHUNKS {
+            let first = source.take() as usize;
+            assert_eq!(first % CHUNK_SIZE, 0, "a new chunk's first page");
+            // SAFETY: the source's page, which nothing else uses.
+            unsafe { (first as *mut u8).write_volatile(1) };
+            taken.push(first);
+            for _ in 1..PAGES_PER_CHUNK {
+                rest.push(source.take() as usize);
+            }
+        }
+        let (held_before, thp_after) = cgroup_stat().expect("memory.stat");
+        let backed = (thp_after - thp_before) / 2048;
+        if backed < HUGE_CHUNKS as i64 / 2 {
+            eprintln!("huge pages backed about {backed} of {HUGE_CHUNKS} chunks: nothing to split");
+            taken.append(&mut rest);
+        } else {
+            // 31 of each chunk's 32 pages given back, the first kept mapped.
+            for &page in &rest {
+                // SAFETY: a page this source gave, which nothing uses.
+                unsafe { source.give_back(page as *mut u8) };
+            }
+            let (held_after, _) = cgroup_stat().expect("memory.stat");
+            let given = (HUGE_CHUNKS * (PAGES_PER_CHUNK - 1) * PAGE_SIZE / 1024) as i64;
+            assert!(
+                held_after - held_before < given / 4,
+                "{} KiB of {given} KiB given back still held in huge pages mapped in part",
+                held_after - held_before
+            );
+        }
+        // SAFETY: every page this source gave and did not take back is listed, and none is used.
+        unsafe { source.release(taken) };
+    }
+
+    /// Pages are 64 KiB-aligned and every whole cell is zero before handout: new, reused from
+    /// the spare pool, and given back to the source when the pool is trimmed and taken again.
+    /// On Linux the pages given back are taken again before a new chunk is mapped (after the
+    /// current chunk's last pages), so they come from the same chunks. The heap's release returns
     /// every page: live, spare and given back.
     #[test]
     fn pages_are_aligned_and_zeroed_when_new_reused_or_taken_again() {
