@@ -3462,3 +3462,30 @@ on Symbols).
   code. Open: the tier's own code in this loop still runs about 2% more instructions than template
   code (the effects' frame traffic, the poll after a helper call, `x | 0` not folded); push is not
   inlined; arithmetic on oddballs still takes the generic operation.
+
+Stage 3's input, refreshed (2026-11-12; target/p3/stage2/inlining-input-2.txt and its evidence,
+at main 24a52c5b; the first input, inlining-input.txt, was at da6933eb). The structural facts hold
+(one frame per graph, frame state and exit; effects on ctx.chunk's canonical frame; splicing an AST
+recompile behind identity guards; no per-site call counts); what moved: the builder reads only the
+frozen view and the decoded snapshot, so each inlined callee needs its own raw copy and frozen view;
+the emitters are generic over JitChunk; CallIc's offset 60 now holds step 14's entry word (free:
+CallIc 100-103, CallSite 500-503); the splice rule declines a whole site before charging a way.
+- Census (19 workloads): 1,146 plans, 717 empty (compiled in place), 429 spliced, 1,335 top-level
+  sites, +49,116 operations; 51,887 exits, 17,982 WrongCallee (22,937 before), none on the fixtures.
+  Of the WrongCallee exits 57% met a function none of the site's ways holds, 40% another way of the
+  same site: the builder builds no edge to the next way until a guard is flagged (build.rs:2480-
+  2488), so an n-way site needs up to n-1 discards to converge, where Maglev's polymorphic arms
+  branch by map from the first compile and deopt only on an unseen map.
+- Djot's recompile: 15 spliced recompiles a run (2,119 -> 3,309 operations, 33 ways), next()
+  0.38 ms to splice tip() five times, feed() 0.29 ms for singleChar(). Building them in the graph
+  instead costs each job its callees' first-stage preparation (1.5-8.6 us a chunk, 0.128 ms a run)
+  and saves 0.087 ms of the callers' snapshots: Djot's bar to about 0.68 ms on X925, about 1.0%.
+- Sixteen open choices, for the stage 3 design: where decisions and callee snapshots are made,
+  policy units and budgets (Maglev charges graph-wide totals and never the caller's size; Warp's
+  root total includes it; JSC a per-site balance and a ranked plan; TRust alone charges the
+  caller), call counts and their denominator (V8: a count in each call slot and the vector's
+  invocation count, times the parent's frequency; SpiderMonkey: a stub's entered count; JSC:
+  polymorphic stub edges), frame states, multi-frame exits, effects in inlined frames, polymorphic
+  dispatch, guards by code for closures, shared or per-site callee feedback, exceptions, positions,
+  exit and loop limits, recursion, the callee shapes admitted first, what stays of splicing, and
+  the install's checks with inlined callees.
