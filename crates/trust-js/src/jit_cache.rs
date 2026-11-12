@@ -35,6 +35,10 @@ struct SlotState {
     registration: Cell<u32>,
     evictions: Cell<u8>,
     cooldown: Cell<u16>,
+    /// The largest `max_stack` of the codes this slot has held (0 before the first): an
+    /// activation running any of them uses no operand word past it, which bounds the words of
+    /// its record the collector scans ([`NativeCodeSlot::max_stack`]).
+    max_stack: Cell<u32>,
 }
 
 impl Default for SlotState {
@@ -44,7 +48,16 @@ impl Default for SlotState {
             registration: Cell::new(NO_REGISTRATION),
             evictions: Cell::new(0),
             cooldown: Cell::new(0),
+            max_stack: Cell::new(0),
         }
+    }
+}
+
+impl SlotState {
+    /// `code` becomes resident: its operand depth counts toward the slot's bound.
+    fn note_max_stack(&self, code: &JitCode) {
+        let stack = u32::try_from(code.max_stack).unwrap_or(u32::MAX);
+        self.max_stack.set(self.max_stack.get().max(stack));
     }
 }
 
@@ -82,6 +95,16 @@ impl NativeCodeSlot {
         }
     }
 
+    /// The largest operand depth (`JitCode::max_stack`) of the codes this slot has held, or
+    /// `None` before its first: every code of a chunk takes its cfg's capacity, the template
+    /// JIT's and the optimizing tier's alike, and an activation that runs one of them, on a
+    /// record or not, uses no operand word past it (see `jit::JitCtx::frame_words`). Read
+    /// without a borrow, as the collector reads it.
+    pub(crate) fn max_stack(&self) -> Option<usize> {
+        let stack = self.state.get()?.max_stack.get();
+        (stack != 0).then_some(stack as usize)
+    }
+
     /// Outer None is retryable (cold, evicted, or capacity-deferred); inner None
     /// is structural unavailability. Every successful read owns a code lease.
     pub(crate) fn get(&self) -> Option<Option<Rc<JitCode>>> {
@@ -113,6 +136,7 @@ impl NativeCodeSlot {
         let next = match code {
             Some(code) => {
                 code.referenced.set(1);
+                state.note_max_stack(&code);
                 CodeState::Resident(code)
             }
             None => CodeState::Unavailable,
@@ -219,6 +243,7 @@ impl CompilePermit {
         debug_assert!(matches!(*state.code.borrow(), CodeState::Pending));
         if let Some(code) = code {
             code.referenced.set(1);
+            state.note_max_stack(&code);
             *state.code.borrow_mut() = CodeState::Resident(code);
             REGISTRY.with(|registry| registry.borrow_mut().pending -= 1);
         } else {

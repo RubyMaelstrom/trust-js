@@ -2456,12 +2456,34 @@ impl JitCtx {
         debug_assert!(slot < self.n_slots);
         unsafe { (*self.slots.add(slot)).get() }
     }
+
+    /// The words of its record the activation running on this active record's context can have
+    /// written: its `n_slots` slots and its code's operand stack, as deep as the largest
+    /// `max_stack` of the codes its chunk's slot has held (`NativeCodeSlot::max_stack`; every
+    /// code of a chunk takes its cfg's capacity, `jit_ir::Cfg::jit_stack_capacity`), or the
+    /// whole record while the chunk or that depth is unknown (a record just allocated). Both
+    /// entries write `chunk` and `n_slots` per activation before its code runs (`run_moved_inner`
+    /// and the direct sequence's install), and the bound is the one the record's admission
+    /// checks (`n_slots + max_stack <= FRAME_BUF`) and an oversized or borrowed entry registers
+    /// for the scan (its slots and `max_stack` operand words).
+    pub(crate) fn frame_words(&self) -> usize {
+        if self.chunk.is_null() {
+            return FRAME_BUF;
+        }
+        // SAFETY: an active record's chunk is its running activation's, which keeps it alive
+        // (the callee closure on the caller's operand stack, or the Rust entry's lease).
+        let max_stack = unsafe { (*self.chunk).jit.max_stack() };
+        max_stack.map_or(FRAME_BUF, |stack| {
+            self.n_slots.saturating_add(stack).min(FRAME_BUF)
+        })
+    }
 }
 
 /// The values a running context holds in its own fields, traced precisely. Whoever
 /// makes the context a root scans its slot and operand words: an active [`JitFrame`] record its
-/// whole word buffer, a Rust entry the ranges it registers (`gc_trace::JitFrameRoots`). The raw
-/// identities it caches are kept alive by their owners, as classified below.
+/// frame's words ([`JitCtx::frame_words`]), a Rust entry the ranges it registers
+/// (`gc_trace::JitFrameRoots`). The raw identities it caches are kept alive by their owners, as
+/// classified below.
 impl crate::gc_trace::GcTrace for JitCtx {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let JitCtx {
@@ -24713,11 +24735,16 @@ fn test_running_code() -> [usize; 0] {
 /// Rooting: the interpreter's `FramePool` registers every record, and the collector
 /// traces each one that is not pooled — from the pop that starts an activation (by a Rust entry
 /// or a direct call's machine code) to the push or free that ends it. It traces the context's
-/// values precisely (`GcTrace for JitCtx`) and all [`FRAME_BUF`] words conservatively, as packed
-/// words: the slots and the operand stack, including the caller's operands under a direct call
-/// (the callee closure among them) and the stale words a finished callee or a popped operand
-/// leaves, which can only retain. No stack pointer is needed. `alloc` zero-fills the words, so
-/// every scanned word has been written.
+/// values precisely (`GcTrace for JitCtx`) and the activation's frame conservatively, as packed
+/// words: the record's first [`JitCtx::frame_words`] words, its slots and its code's operand
+/// stack, including the caller's operands under a direct call (the callee closure among them)
+/// and the stale words a finished callee or a popped operand leaves there, which can only
+/// retain. No stack pointer is needed. The words past the frame belong to no live value of the
+/// activation: whatever an earlier, larger activation on the record, or an exit's frame state,
+/// left there stays until a larger frame writes it, and it is not scanned, as no exemplar reads a
+/// frame past its extent (SpiderMonkey's frames to their stack pointer, js/src/vm/Stack.cpp:
+/// 317-378, js/src/jit/BaselineFrame.cpp:69-87; V8's and JavaScriptCore's frames to theirs).
+/// `alloc` zero-fills the words, so every scanned word has been written.
 #[repr(C)]
 pub(crate) struct JitFrame {
     pub(crate) ctx: JitCtx,
@@ -24727,13 +24754,15 @@ pub(crate) struct JitFrame {
 /// Byte offset of a record's slot storage from the record (and its context) base.
 pub(crate) const FRAME_WORDS_OFF: usize = std::mem::offset_of!(JitFrame, words);
 
-/// An active record (see [`JitFrame`] and `GcTrace for FramePool`).
+/// An active record (see [`JitFrame`] and `GcTrace for FramePool`): its context and its frame.
 impl crate::gc_trace::GcTrace for JitFrame {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let JitFrame { ctx, words } = self;
         ctx.trace_gc(sink);
         // SAFETY: `alloc` zero-filled every word; later writes store complete packed words.
-        unsafe { crate::gc_trace::scan_words(words.as_ptr().cast::<u64>(), FRAME_BUF, sink) };
+        unsafe {
+            crate::gc_trace::scan_words(words.as_ptr().cast::<u64>(), ctx.frame_words(), sink)
+        };
     }
 }
 

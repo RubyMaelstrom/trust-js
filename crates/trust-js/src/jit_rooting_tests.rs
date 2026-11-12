@@ -1133,6 +1133,45 @@ fn tail_call_arguments_are_roots_in_the_trampoline() {
     assert_tracked_collectable(&mut engine);
 }
 
+/// (19) No root past an active record's frame (`JitCtx::frame_words`): `wide`, whose frame is 20
+/// slots and its operand words, leaves the object it tracked in its last slot and in operand
+/// words 12 and 13 (the array literal's elements stack up under it), and returns; `narrow`,
+/// whose frame is a few words, takes the same record from the pool (last in, first out; a Rust
+/// entry's pooled buffers, the same way) and collects. Nothing but those stale words names the
+/// object, so no root marks it: it is dead, or marked by a stale copy on the native stack (`S`),
+/// which the scan reads after the roots. A record scanned whole (before P3 stage 2's
+/// retention-impl) marked it from the record (`R`): with the optimizing tier on, the words of a
+/// larger frame left in a record a smaller activation reused kept a long Splay run's dead tree
+/// nodes, and every node they kept after.
+#[test]
+fn record_words_past_the_frame_are_no_roots() {
+    let mut engine = jit_engine(0);
+    let source = r#"
+        function wide(n) {
+            var a0 = 0, a1 = 0, a2 = 0, a3 = 0, a4 = 0, a5 = 0, a6 = 0, a7 = 0, a8 = 0, a9 = 0,
+                a10 = 0, a11 = 0, a12 = 0, a13 = 0, a14 = 0, a15 = 0, a16 = 0, a17 = 0, a18 = 0;
+            a18 = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, track({tag: 'W' + n})][12];
+            return a18.tag;
+        }
+        function narrow() { return collect(); }
+        function both(n) { return wide(n) + ':' + narrow(); }
+        both(0);
+    "#;
+    let first = run(&mut engine, source);
+    assert!(matches!(first.as_str(), "W0:D" | "W0:S"), "{first}");
+    assert_native(&mut engine, &["wide", "narrow", "both"]);
+    settle(&mut engine, "wide");
+    settle(&mut engine, "narrow");
+    let direct = direct_round(&mut engine, "both(1);", 2);
+    assert!(matches!(direct.as_str(), "W1:D" | "W1:S"), "{direct}");
+    let census = last_census();
+    assert!(
+        census.records >= 2,
+        "both's and narrow's records: {census:?}"
+    );
+    assert_tracked_collectable(&mut engine);
+}
+
 /// These programs, the rooting tests that use this harness beside the paths they cover (a
 /// callback's long argument list, an OSR entry's operand prefix), step 6's
 /// (`jit::traced_tests`), the owner-free words of `jit::word_routing_tests`, every kind of

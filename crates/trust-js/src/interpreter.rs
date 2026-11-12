@@ -1605,9 +1605,10 @@ impl FramePool {
     }
 }
 
-/// Every active record: its context's values precisely and its words conservatively (see
+/// Every active record: its context's values precisely and its frame's words conservatively (see
 /// `GcTrace for JitFrame`). Pooled records own nothing and are not traced, so the stale words a
-/// finished activation leaves in its record retain nothing.
+/// finished activation leaves in its record retain nothing while it is pooled, nor, past the
+/// next activation's frame, while that one runs on it.
 impl crate::gc_trace::GcTrace for FramePool {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         for record in self.active_records() {

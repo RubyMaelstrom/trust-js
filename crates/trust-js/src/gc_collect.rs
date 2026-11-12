@@ -2564,6 +2564,171 @@ mod tests {
         }
     }
 
+    thread_local! {
+        /// The objects each `sample()` of a test's program found alive.
+        static SAMPLES: std::cell::RefCell<Vec<i64>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Octane's Splay, small: a splay tree of `N` nodes whose rounds insert and remove `MODS`
+    /// nodes each; a removed node keeps the children it had. `sample()` runs from inside a
+    /// payload's construction, deep in the tree's operations, every 1,000 payload leaves: while
+    /// `measure`'s loop runs on the tree-walker (its first 128 rounds), once it moved into the
+    /// VM, and in a second call of `measure`, compiled from its start.
+    const SPLAY: &str = r#"
+        var N = 200, MODS = 10, ROUNDS = 250, seed = 49734321, leaves = 0;
+        function random() {
+            seed = ((seed + 0x7ed55d16) + (seed << 12)) & 0xffffffff;
+            seed = ((seed ^ 0xc761c23c) ^ (seed >>> 19)) & 0xffffffff;
+            seed = ((seed + 0x165667b1) + (seed << 5)) & 0xffffffff;
+            seed = ((seed + 0xd3a2646c) ^ (seed << 9)) & 0xffffffff;
+            return (seed & 0xfffffff) / 0x10000000;
+        }
+        function Node(key, value) { this.key = key; this.value = value; }
+        Node.prototype.left = null;
+        Node.prototype.right = null;
+        function Tree() {}
+        Tree.prototype.root = null;
+        Tree.prototype.splay = function (key) {
+            var dummy, left, right;
+            dummy = left = right = new Node(null, null);
+            var current = this.root;
+            while (true) {
+                if (key < current.key) {
+                    if (!current.left) break;
+                    if (key < current.left.key) {
+                        var tmp = current.left; current.left = tmp.right; tmp.right = current;
+                        current = tmp;
+                        if (!current.left) break;
+                    }
+                    right.left = current; right = current; current = current.left;
+                } else if (key > current.key) {
+                    if (!current.right) break;
+                    if (key > current.right.key) {
+                        var tmp = current.right; current.right = tmp.left; tmp.left = current;
+                        current = tmp;
+                        if (!current.right) break;
+                    }
+                    left.right = current; left = current; current = current.right;
+                } else break;
+            }
+            left.right = current.left; right.left = current.right;
+            current.left = dummy.right; current.right = dummy.left;
+            this.root = current;
+        };
+        Tree.prototype.insert = function (key, value) {
+            if (!this.root) { this.root = new Node(key, value); return; }
+            this.splay(key);
+            if (this.root.key == key) return;
+            var node = new Node(key, value);
+            if (key > this.root.key) {
+                node.left = this.root; node.right = this.root.right; this.root.right = null;
+            } else {
+                node.right = this.root; node.left = this.root.left; this.root.left = null;
+            }
+            this.root = node;
+        };
+        Tree.prototype.remove = function (key) {
+            this.splay(key);
+            var removed = this.root;
+            if (!this.root.left) {
+                this.root = this.root.right;
+            } else {
+                var right = this.root.right;
+                this.root = this.root.left;
+                this.splay(key);
+                this.root.right = right;
+            }
+            return removed;
+        };
+        Tree.prototype.find = function (key) {
+            if (!this.root) return null;
+            this.splay(key);
+            return this.root.key == key ? this.root : null;
+        };
+        Tree.prototype.findMax = function (start) {
+            var current = start;
+            while (current.right) current = current.right;
+            return current;
+        };
+        Tree.prototype.findGreatestLessThan = function (key) {
+            this.splay(key);
+            if (this.root.key < key) return this.root;
+            return this.root.left ? this.findMax(this.root.left) : null;
+        };
+        function payload(depth, tag) {
+            if (depth == 0) {
+                if (++leaves % 1000 == 0) sample();
+                return {array: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9], string: 'leaf ' + tag};
+            }
+            return {left: payload(depth - 1, tag), right: payload(depth - 1, tag)};
+        }
+        var tree = new Tree();
+        function insertNew() {
+            var key;
+            do { key = random(); } while (tree.find(key) != null);
+            tree.insert(key, payload(2, String(key)));
+            return key;
+        }
+        function round() {
+            for (var i = 0; i < MODS; i++) {
+                var key = insertNew();
+                var greatest = tree.findGreatestLessThan(key);
+                tree.remove(greatest == null ? key : greatest.key);
+            }
+        }
+        function measure(rounds) { for (var i = 0; i < rounds; i++) round(); }
+        for (var i = 0; i < N; i++) insertNew();
+        measure(ROUNDS);
+        measure(ROUNDS);
+        'done'
+    "#;
+
+    /// Long Splay runs kept dead tree nodes alive in the bytecode VM and with the optimizing tier
+    /// on (P3 stage 2, retention-impl): words finished frames left where later frames were built
+    /// and never wrote them, in the native stack's frames of the interpreters' call paths (now
+    /// zeroed where the stack unwound past them, at an allocation's slow path and at the
+    /// tree-walker's loop back edges and calls: `gc_core::sanitize_stack`), and in a pooled JIT
+    /// record past its activation's frame (no longer scanned: `jit::JitCtx::frame_words`). A
+    /// removed node such a word named kept the nodes removed after it, which it still names: the
+    /// kept set grew with every removal. Here the objects a major collection keeps, sampled from
+    /// deep inside the tree's operations, stay within a few nodes' objects (each node has 12) of
+    /// the first sample, in every tier: while `measure` runs on the tree-walker, once its loop
+    /// moved into the VM, and in a second, plain call of it. The JIT's calls run JIT to JIT on
+    /// records where the direct sequence exists (ARM64); x86-64's run through Rust entries,
+    /// whose frames the native stack scan reads as the VM's, which no sanitizing point here
+    /// covers between the calls of a compiled loop (the retention report's open items).
+    #[test]
+    fn a_splay_trees_live_data_stays_flat_in_every_tier() {
+        let tiers: &[Tier] = if cfg!(target_arch = "aarch64") {
+            &[Tier::Bytecode, Tier::Jit]
+        } else {
+            &[Tier::Bytecode]
+        };
+        for &tier in tiers {
+            let mut engine = Engine::new();
+            engine.set_tier(tier);
+            engine
+                .interp
+                .def_method(&engine.interp.global, "sample", 0, |interp, _, _| {
+                    interp.gc_collect();
+                    let live = crate::value::heap_live_objects(&interp.gc_heap);
+                    SAMPLES.with(|samples| samples.borrow_mut().push(live));
+                    Ok(Value::Undefined)
+                });
+            SAMPLES.with(|samples| samples.borrow_mut().clear());
+            eval(&mut engine, SPLAY, "done");
+            let samples = SAMPLES.with(|samples| samples.take());
+            assert!(samples.len() >= 15, "{tier:?}: samples {samples:?}");
+            let first = samples[0];
+            let most = samples.iter().copied().max().unwrap_or(first);
+            assert!(
+                most <= first + 600,
+                "{tier:?}: the live objects grew from {first} to {most} (a node is 12): {samples:?}"
+            );
+        }
+    }
+
     #[test]
     fn finalizer_targets_clear_together_and_ready_cells_are_removed() {
         let mut engine = Engine::new();

@@ -3343,13 +3343,17 @@ impl Heap {
     /// allocation that may collect first, under a stress interval or during a collection. A
     /// small cell is charged and counted as its cursor is flushed: at the cursor's next refill
     /// on the fast path's terms, at once when the heap counts each allocation. A large cell is
-    /// charged and counted at once.
+    /// charged and counted at once. It first zeroes the native stack the program unwound past
+    /// since the last time ([`sanitize_stack`]).
     #[inline(never)]
     fn alloc_cell_slow(&mut self, desc: DescId, size: usize, zero: bool) -> Option<*mut u8> {
         debug_assert!(
             (desc.0 as usize) < self.descs.len(),
             "unregistered GC descriptor"
         );
+        // JavaScriptCore's allocation slow path sanitizes the stack (see `sanitize_stack`).
+        #[cfg(not(target_arch = "wasm32"))]
+        sanitize_stack();
         let class = size_class(size);
         let collecting = self.control.collecting.get();
         if !collecting {
@@ -6319,6 +6323,56 @@ pub(crate) const ENTRY_SCRUB_BYTES: usize = if cfg!(debug_assertions) {
     128 << 10
 };
 
+thread_local! {
+    /// The stack pointer of this thread's last [`sanitize_stack`], 0 before the first:
+    /// JavaScriptCore's `VM::m_lastStackTop` (runtime/VM.h:1232).
+    #[cfg(not(target_arch = "wasm32"))]
+    static SANITIZED_TOP: Cell<usize> = const { Cell::new(0) };
+}
+
+/// JavaScriptCore's sanitizeStackForVM (runtime/VM.cpp:1510-1526, llint/LowLevelInterpreter.asm:
+/// 1970-2010): zero the native stack between the stack pointer of this thread's last sanitizing
+/// and the current one, when the stack has unwound since, and remember the current one. The
+/// region lies below the stack pointer, so it holds no live data; frames built there later start
+/// without the words the frames that used it left, which the conservative scan would otherwise
+/// take as roots for as long as the new frames leave them unwritten. The interpreters' Rust
+/// frames, about 7 KiB of slots a call level in the VM that the common path mostly never writes,
+/// kept a long Splay run's dead tree nodes so (P3 stage 2, retention-impl): a frame rebuilt at
+/// one place by each call from a loop, or built once for a long-lived activation, keeps a word
+/// an earlier occupant (another phase's frames, a rare path) wrote there and it never writes,
+/// for as long as nothing zeroes the place before it is built. Run where JavaScriptCore runs it
+/// and where those frames get built: the allocation slow path ([`Heap::alloc_cell_slow`]; JSC's
+/// heap/LocalAllocatorInlines.h:40, heap/CompleteSubspace.cpp:118, 161), at every depth the
+/// program allocates from; and the tree-walker's loop back edges, below which each iteration's
+/// calls ran, and its calls (JSC sanitizes at its loops' tier-up triggers,
+/// dfg/DFGOperations.cpp:7044, and its call slow paths, llint/LLIntSlowPaths.cpp:634-665): the
+/// outer, long-lived activations of a program run there (its top level, its drivers, a loop until
+/// it transfers). Each zeroes only what the stack unwound past since the last, nothing in a loop
+/// that calls nothing. A top on another stack (a `grow` segment) or one closer than 128 KiB to
+/// this stack's end is forgotten unzeroed.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(always)]
+pub(crate) fn sanitize_stack() {
+    let sp = native::current_sp();
+    let last = SANITIZED_TOP.with(|top| top.replace(sp));
+    if last != 0 && last < sp {
+        let bytes = (sp - last) & !15;
+        let available = stacker::remaining_stack()
+            .unwrap_or(0)
+            .saturating_sub(128 * 1024);
+        if bytes <= available {
+            // SAFETY: the range lies below the stack pointer, within this stack's remaining
+            // space with 128 KiB to spare, and holds no live data.
+            unsafe { zero_below_sp(bytes) };
+        }
+    }
+}
+
+/// No native stack is scanned on wasm32.
+#[cfg(target_arch = "wasm32")]
+#[inline(always)]
+pub(crate) fn sanitize_stack() {}
+
 /// Zero up to `bytes` of native stack below the caller's stack pointer, within the current stack
 /// or segment. Frames built there afterwards (a collection's own, or the next job's) then start
 /// without stale cell addresses, which the conservative scan would otherwise take as roots:
@@ -8949,6 +9003,74 @@ mod tests {
         // Precise collections ignore native frames: deterministic death.
         fx.collect();
         assert_eq!(fx.live(), 0);
+        black_box(&top);
+    }
+
+    /// Leave `hidden`'s cell address in 64 words of this frame, then allocate a cell of `size`
+    /// below it: the first of its class, so it takes the allocation slow path, which sanitizes
+    /// the stack there (`sanitize_stack`).
+    #[inline(never)]
+    fn leave_words_and_allocate(heap: &mut Heap, hidden: u64, desc: DescId, size: usize) {
+        let mut words = [0u64; 64];
+        for word in &mut words {
+            unsafe { std::ptr::write_volatile(word, !hidden) };
+        }
+        black_box(&words);
+        black_box(alloc_hidden(heap, desc, size));
+        black_box(&words);
+    }
+
+    /// Collect conservatively from a frame of 64 words it never writes, built where the frames
+    /// of the caller's previous callee were.
+    #[inline(never)]
+    fn collect_over_unwritten_words(heap: &mut Heap) -> bool {
+        let words = std::mem::MaybeUninit::<[u64; 64]>::uninit();
+        black_box(&words);
+        let ran = heap.collect();
+        black_box(&words);
+        ran
+    }
+
+    /// Run `f` below 16 KiB of this frame's own: deeper than the frames an allocation from the
+    /// caller builds (in debug builds too).
+    #[inline(never)]
+    fn below_padding<R>(f: impl FnOnce() -> R) -> R {
+        let padding = [0u64; 2048];
+        black_box(&padding);
+        let result = f();
+        black_box(&padding);
+        result
+    }
+
+    /// JavaScriptCore's stack sanitizing at the allocation slow path (`sanitize_stack`). A
+    /// finished frame leaves a cell's address in its words; a frame built over them that never
+    /// writes them keeps them, and the stack scan marks the cell (the control, which shows the
+    /// two frames overlap). Once an allocation's slow path runs above those words after one ran
+    /// below them, they are zero, and the cell dies.
+    #[test]
+    fn the_allocation_slow_path_zeroes_the_words_a_finished_frame_left() {
+        let mut fx = Box::new(Fixture::new());
+        fx.heap.set_collect_on_alloc(false);
+        let top = 0u64;
+        let _stack = unsafe { enter_native_stack(stack_top(&top)) };
+        let heap = &mut fx.heap;
+        let leaf = fx.leaf;
+        let kept = alloc_hidden(heap, leaf, 16);
+        below_padding(|| leave_words_and_allocate(heap, kept, leaf, 32));
+        assert!(below_padding(|| collect_over_unwritten_words(heap)));
+        assert!(
+            heap.is_allocated_word(!kept),
+            "control: the collecting frame did not inherit the finished frame's words"
+        );
+        let freed = alloc_hidden(heap, leaf, 48);
+        below_padding(|| leave_words_and_allocate(heap, freed, leaf, 64));
+        // This frame's first cell of another class: the slow path runs here, above them.
+        black_box(alloc_hidden(heap, leaf, 96));
+        assert!(below_padding(|| collect_over_unwritten_words(heap)));
+        assert!(
+            !heap.is_allocated_word(!freed),
+            "a finished frame's words, unwound past by an allocation slow path, kept its cell"
+        );
         black_box(&top);
     }
 

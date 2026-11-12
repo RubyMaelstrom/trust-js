@@ -1272,7 +1272,9 @@ impl Interp {
         };
         loop {
             // Safe point: collect when due / enforce the live-object ceiling. Catches tight
-            // loops (`for(;;){ x = {}; }`) that never call a function.
+            // loops (`for(;;){ x = {}; }`) that never call a function. Zero the stack the last
+            // iteration's calls unwound past (`gc_core::sanitize_stack`).
+            crate::gc_core::sanitize_stack();
             self.interrupt_poll()?;
             self.gc_check()?;
             match step(self, env, &v) {
@@ -3864,6 +3866,8 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         self.call_site = position;
+        // The callee's frames are built where earlier calls' were (`gc_core::sanitize_stack`).
+        crate::gc_core::sanitize_stack();
         let result = self.call(func, this, args);
         self.call_site = crate::stack_trace::NO_POSITION;
         result
@@ -3877,6 +3881,7 @@ impl Interp {
         args: &[Value],
     ) -> Result<Value, Abrupt> {
         self.call_site = position;
+        crate::gc_core::sanitize_stack();
         let result = self.construct(callee, args);
         self.call_site = crate::stack_trace::NO_POSITION;
         result
