@@ -148,6 +148,9 @@ function bad(n) {
 /// return primitives).
 #[test]
 fn a_constructing_callers_constructor_natives_run_with_a_calls_construct_state() {
+    // Counts the natives the stub runs, from the tier's effects too; a forced exit hands the
+    // rest of its call to the VM.
+    crate::opt::pin_forced_exits_off_for_test();
     let source = r#"
 function Box(v) { this.n = Number(v); this.b = Boolean(v); this.k = typeof this.n + typeof this.b; }
 function make(n) { var t = ''; for (var i = 0; i < n; i++) t = new Box('5').k; return t; }
