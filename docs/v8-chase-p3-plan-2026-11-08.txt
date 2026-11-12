@@ -3425,3 +3425,40 @@ nothing, on base pages each frees memory that Splay faults back in, though the s
 (2026-11-12, "Restore advice, then fix"): the change is reverted (27d7bb04); the cause is to be
 found and fixed in the exemplars' shape (an agent: target/p3/stage2/gcfault-impl), and the advice
 dropped again once it costs little.
+
+The owner's answer on Djot's compile bar (2026-11-12): "Carry to stage 3". Stage 2 closes with
+Djot's main-thread compile time at 3.02% of its measured pass (1.968 ms against 1.954), the rest
+of it mostly the bytecode recompile that builds a second stage's splices (1.31 ms); stage 3's
+graph inlining, which recompiles no bytecode (as none of V8, SpiderMonkey and JSC does), removes
+it (expected about 1%). Vue and React are under the bar (0.57%, 0.65%).
+
+The tier's bitwise operations on oddballs landed (764373b9, c54f2758, 2026-11-12; target/p3/stage2/
+holey-impl, report.txt): the calls' array-shift-queue-holey loop ran 25% slower in the tier's code
+than in template code because of `a.shift() | 0`, not push or shift. The hole makes one shift a run
+return undefined, so the BitOr's record held Undefined, and the tier lowered a bitwise operation
+only on Numbers: every iteration went through the generic executor (237 of the 312 extra
+instructions an iteration). Now a bitwise operation whose record saw only Numbers, undefined, null
+and Booleans truncates each operand not proven a Number in line (TruncateNumberOrOddball: a Number
+in the same 4 instructions, undefined and null 0, Booleans 0 or 1 out of line, anything else
+exits), as V8 records kNumberOrOddball and Maglev truncates it
+(TruncateCheckedNumberOrOddballToInt32), JSC's DFG converts a NotCellNorBigIntUse and
+SpiderMonkey's bitwise IC stub takes null and undefined as 0. An oddball first met after the
+compile on Numbers takes the truncation at the recompile, as V8 reoptimizes after the deopt; only
+the truncation's own exit declines the operation to the generic one (no exit and recompile cycles
+on Symbols).
+- Measured (fat LTO, A725 cores at about 1.14 GHz): the holey loop -5.2% time in the tier's code
+  against template code (+22.7% before), a late undefined +0.7% (+19.2%); Octane's fixed runs zlib
+  -1.35% and Mandreel -0.88% instructions, the geomean -0.11% asynchronous and -0.16% synchronous;
+  timed zlib +2.0%, Mandreel +1.3%; the fixtures and the calls at main's instruction counts; the
+  tier off's template code identical but for addresses.
+- Tests: graph, code and convergence tests and a tier program; 7 mutations caught; the tier's tests
+  in three configurations (301 each), the library's suite tier off and on eager in both modes
+  (3,223), Test262 eager 53,573/53,575; fmt; zombie's check, clippy, Windows' check and suite
+  (2,796). On main (target/p3/stage2/land-holey): clippy clean, the library's suite 3,238 tier off
+  and on eager (asynchronous), the tier's tests with exits every 7 (312), zombie's checks clean.
+- Found on the way: calls.js's case loops never reach the tier (each case function is entered
+  twice; the tier's checkpoints are at entries), so its cases time template code and the tier's
+  code for their small callees only; the holey case's +2.35% was template code against template
+  code. Open: the tier's own code in this loop still runs about 2% more instructions than template
+  code (the effects' frame traffic, the poll after a helper call, `x | 0` not folded); push is not
+  inlined; arithmetic on oddballs still takes the generic operation.
