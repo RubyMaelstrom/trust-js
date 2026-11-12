@@ -3573,3 +3573,32 @@ evidence; main b02f590d).
   of frame merges, throws by recipe, templates unchanged); 3b origins (chunk, pc, inline site) where
   the templates take the pc, as JSC's call-site index; 3c explicit context for inlined frames, kind
   by kind in the census's order; 3d register forms of the hottest kinds where measured.
+
+The small callees' calls into the tier's code landed (11275b17, 3a0d8427, 2026-11-12; target/p3/
+stage2/smallcallee-impl, report.txt): template code calling the tier's code for a tiny function
+was 1.2-2.5% slower than calling its template code (the session's constructor +2.21%, over the 2%
+bar). Two causes, X925 cycles a call averaged over six caller layouts:
+- The direct sequence's entry-word compare (step 14) loaded the way's copy with `LDP x6, x4,
+  [x12, #56]`, which crosses the way's byte 64: where a way starts on a cache line, one alignment
+  event every call (constructor +1.8 cycles), and the chunk pointer the call waits on later. Now
+  the copy is loaded alone (`LDR w6, [x12, #60]`) and the chunk by its own load, nothing crossing
+  byte 64 (4 instructions for 3; the tier off's sequence unchanged).
+- The tier boxed an f64 with FMOV, FCMP, MOVZ and a CSEL on VS, which put the compare on a caller's
+  loop-carried result; now FMOV, FCMP and B.VS to an out-of-line load of the canonical NaN,
+  SpiderMonkey's form (MacroAssembler-inl.h:971-976).
+The exemplars load the callee's entry on every call and compare nothing (V8's dispatch table,
+SpiderMonkey's jitCodeRaw) or relink a code block's incoming calls (JSC, CodeBlock.cpp:2221-2240);
+their optimized leaf entries are no heavier than their baselines'. Removing the compare their way is
+designed (a current-code record in jit_cache::SlotState, the direct sequence reading the code
+through the chunk, the Rust probes' entry_stale and the ways' entry copy gone), not built.
+- Measured (fat LTO, the tier on against off, main -> branch; calls.js timed on X925 cores, 5
+  rounds, 1.364-1.369 GHz): direct-call +1.18% -> -2.57%, closure-call +1.07% -> -0.87%,
+  constructor +2.53% -> +1.26% (bimodal rounds), arguments-object +1.97% -> +0.19%, rest-params
+  +1.61% -> -0.50%; on the A725, arguments +2.11% and rest +1.65% remain (per-call counts). Octane
+  timed +0.11% cycles geomean (within the tier off's spread), counted -0.01%; the fixtures within
+  0.17% instructions; the tier off's template code identical in 3,067 of 3,067 compiles.
+- Tests: new tests and four mutations caught; the library's suites (3,240 tier off and eager
+  synchronous; eager asynchronous 3,239 and a 20 ms timing test under another agent's load, which
+  passes alone 10 of 10 and fails as often on main's binary under the same load), the tier's in
+  three configurations (313), poll and Agent (51), Test262 eager 53,573/53,575; clippy, fmt;
+  zombie's check, clippy, Windows' check and suite (2,796).
