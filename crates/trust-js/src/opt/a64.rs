@@ -555,6 +555,12 @@ fn entry_frame(alloc: &Allocation) -> Result<EntryFrame, Refusal> {
 
 /// Out-of-line code, emitted after the body.
 enum Cold {
+    /// A boxed f64's NaN case (`box_f64`): the canonical NaN's word into `dst`.
+    CanonNan {
+        label: usize,
+        dst: u32,
+        resume: usize,
+    },
     /// CheckNumber's NaN case: a NaN word is a Number only when it is the canonical NaN.
     NanNumber {
         label: usize,
@@ -1146,9 +1152,30 @@ impl Gen<'_> {
         }
     }
 
+    /// `x` = the Number word of the f64 in `d`: its bits, a NaN's replaced by the canonical NaN
+    /// out of line (any other NaN reads as a tag), as the first stage's templates box a sum and
+    /// SpiderMonkey canonicalizes (canonicalizeDoubleNaN, jit/MacroAssembler-inl.h:971-976): a
+    /// branch over the replacement, which a Number's word never takes, so that the word is ready
+    /// when its FMOV is, where a CSEL on the comparison's flags waited for both and put the
+    /// comparison on the word's path (a small callee's result, on its caller's loop-carried
+    /// chain). Clobbers the flags.
+    fn box_f64(&mut self, d: u32, x: u32) {
+        let nan = self.a.new_label();
+        let resume = self.a.new_label();
+        self.a.fmov_x_d(x, d);
+        self.a.fcmp(d, d);
+        self.a.b_cond(VS, nan);
+        self.a.bind(resume);
+        self.cold.push(Cold::CanonNan {
+            label: nan,
+            dst: x,
+            resume,
+        });
+    }
+
     /// `v`'s execution word in an x register (`scratch` unless it is a tagged word in its home):
-    /// a Number for an f64 (NaN canonicalized) or an int32, the Boolean or Object word for a Bool
-    /// or a cell. Clobbers x30, d31 and the flags.
+    /// a Number for an f64 (NaN canonicalized, `box_f64`) or an int32, the Boolean or Object word
+    /// for a Bool or a cell. Clobbers x30, d31 and the flags.
     fn boxed(&mut self, v: NodeIx, scratch: u32) -> u32 {
         if self.home(v) == Home::Const {
             let word = self.const_word(v);
@@ -1159,10 +1186,7 @@ impl Gen<'_> {
             Rep::Tagged => self.gp(v, scratch),
             Rep::F64 => {
                 let d = self.fp(v, D31);
-                self.a.fmov_x_d(scratch, d);
-                self.a.fcmp(d, d);
-                self.a.movz(X30, 0x7ff8, 3); // PACK_CANON_NAN
-                self.a.csel_x(scratch, X30, scratch, VS);
+                self.box_f64(d, scratch);
                 scratch
             }
             Rep::I32 => {
@@ -1585,10 +1609,7 @@ impl Gen<'_> {
                 if !unused {
                     let d = self.fp(input(0), D31);
                     let x = self.gp_dst(n);
-                    self.a.fmov_x_d(x, d);
-                    self.a.fcmp(d, d);
-                    self.a.movz(X17, 0x7ff8, 3); // PACK_CANON_NAN
-                    self.a.csel_x(x, X17, x, VS);
+                    self.box_f64(d, x);
                     self.gp_done(n, x);
                 }
             }
@@ -2342,203 +2363,214 @@ impl Gen<'_> {
 
     /// The out-of-line code, then the exits' sites.
     fn emit_cold(&mut self) -> Result<(), Refusal> {
-        let cold = std::mem::take(&mut self.cold);
-        for item in cold {
-            match item {
-                Cold::NanNumber {
-                    label,
-                    word,
-                    exit,
-                    resume,
-                } => {
-                    self.a.bind(label);
-                    self.a.mov_imm64(X17, crate::value::PACK_CANON_NAN);
-                    self.a.cmp_reg_x(word, X17);
-                    self.a.b_cond(NE, exit);
-                    self.a.b(resume);
-                }
-                Cold::Truncate {
-                    label,
-                    d,
-                    dst,
-                    resume,
-                } => {
-                    // |x| >= 2^63, so its exponent's shift e - 1075 is at least 11: the implicit
-                    // bit and every bit above the mantissa's land at bit 63 or above, and the low
-                    // word of the bits shifted by it is that of |x| (zero from a shift of 32 up,
-                    // 2^84 and the infinities among them); the sign negates it modulo 2^32.
-                    let zero = self.a.new_label();
-                    let positive = self.a.new_label();
-                    self.a.bind(label);
-                    self.a.fmov_x_d(X16, d);
-                    self.a.ubfx(X17, X16, 52, 11);
-                    self.a.sub_imm(X17, X17, 1075);
-                    self.a.cmp_imm_x(X17, 32);
-                    self.a.b_cond(GE, zero);
-                    self.a.lsl_reg(X30, X16, X17);
-                    self.a.tbz(X16, 63, positive);
-                    self.a.neg_w(X30, X30);
-                    self.a.bind(positive);
-                    self.a.mov_w(dst, X30);
-                    self.a.b(resume);
-                    self.a.bind(zero);
-                    self.a.mov_w(dst, 31);
-                    self.a.b(resume);
-                }
-                Cold::NumberOrOddball {
-                    label,
-                    word,
-                    dst,
-                    exit,
-                    resume,
-                } => {
-                    use crate::value::{PACK_BOOL, PACK_CANON_NAN, PACK_NULL, PACK_UNDEFINED};
-                    let boolean = self.a.new_label();
-                    let zero = self.a.new_label();
-                    self.a.bind(label);
-                    // A Boolean's word less its tag is its bit (CheckBoolean's test).
-                    self.a.movz(X17, (PACK_BOOL >> 48) as u32, 3);
-                    self.a.logic_x(2, X17, word, X17);
-                    self.a.cmp_imm_x(X17, 1);
-                    self.a.b_cond(LS, boolean);
-                    // Each of the others is one word: its tag over a zero payload.
-                    for oddball in [PACK_UNDEFINED, PACK_NULL, PACK_CANON_NAN] {
-                        self.a.movz(X17, (oddball >> 48) as u32, 3);
+        // Until none is left: a cold path may itself push one (a boxed f64's NaN case).
+        loop {
+            let cold = std::mem::take(&mut self.cold);
+            if cold.is_empty() {
+                break;
+            }
+            for item in cold {
+                match item {
+                    Cold::CanonNan { label, dst, resume } => {
+                        self.a.bind(label);
+                        self.a.movz(dst, 0x7ff8, 3); // PACK_CANON_NAN
+                        self.a.b(resume);
+                    }
+                    Cold::NanNumber {
+                        label,
+                        word,
+                        exit,
+                        resume,
+                    } => {
+                        self.a.bind(label);
+                        self.a.mov_imm64(X17, crate::value::PACK_CANON_NAN);
                         self.a.cmp_reg_x(word, X17);
-                        self.a.b_cond(EQ, zero);
+                        self.a.b_cond(NE, exit);
+                        self.a.b(resume);
                     }
-                    self.a.b(exit);
-                    self.a.bind(boolean);
-                    self.a.mov_w(dst, X17);
-                    self.a.b(resume);
-                    self.a.bind(zero);
-                    self.a.movz(dst, 0, 0);
-                    self.a.b(resume);
-                }
-                Cold::Jump { label, target } => {
-                    self.a.bind(label);
-                    self.a.b(target);
-                }
-                Cold::ElementUndefined {
-                    label,
-                    node,
-                    dst,
-                    resume,
-                    exit,
-                    negative,
-                } => {
-                    self.a.bind(label);
-                    if let Some((index, negative_exit)) = negative {
-                        // A negative index names a String key ("-1"), never an element.
-                        self.a.tbnz(index, 31, negative_exit);
+                    Cold::Truncate {
+                        label,
+                        d,
+                        dst,
+                        resume,
+                    } => {
+                        // |x| >= 2^63, so its exponent's shift e - 1075 is at least 11: the implicit
+                        // bit and every bit above the mantissa's land at bit 63 or above, and the low
+                        // word of the bits shifted by it is that of |x| (zero from a shift of 32 up,
+                        // 2^84 and the infinities among them); the sign negates it modulo 2^32.
+                        let zero = self.a.new_label();
+                        let positive = self.a.new_label();
+                        self.a.bind(label);
+                        self.a.fmov_x_d(X16, d);
+                        self.a.ubfx(X17, X16, 52, 11);
+                        self.a.sub_imm(X17, X17, 1075);
+                        self.a.cmp_imm_x(X17, 32);
+                        self.a.b_cond(GE, zero);
+                        self.a.lsl_reg(X30, X16, X17);
+                        self.a.tbz(X16, 63, positive);
+                        self.a.neg_w(X30, X30);
+                        self.a.bind(positive);
+                        self.a.mov_w(dst, X30);
+                        self.a.b(resume);
+                        self.a.bind(zero);
+                        self.a.mov_w(dst, 31);
+                        self.a.b(resume);
                     }
-                    self.emit_no_inherited_elements(node, false, &[], exit);
-                    self.a.mov_imm64(dst, crate::value::PACK_UNDEFINED);
-                    self.a.b(resume);
-                }
-                Cold::ElementKinds {
-                    label,
-                    out,
-                    resume,
-                    unwritable,
-                } => {
-                    use crate::value::word_block::{KIND_SCANNED, KIND_UNWRITABLE};
-                    self.a.bind(label);
-                    let imm = |bits| asm::logical_imm_w(bits).expect("a run of kind bits");
-                    self.a.logic_imm_w(0, X17, X9, imm(KIND_UNWRITABLE));
-                    self.a.cbnz(X17, false, unwritable);
-                    self.a.tbz(X9, KIND_SCANNED.trailing_zeros(), resume);
-                    self.a.logic_imm_w(0, X9, X9, imm(!KIND_SCANNED));
-                    self.a.stur_w(X9, out, -(self.layout.words_flags as i32));
-                    self.a.b(resume);
-                }
-                Cold::Unwritable {
-                    label,
-                    node,
-                    out,
-                    retry,
-                    exit,
-                } => {
-                    use crate::value::word_block::KIND_FROZEN;
-                    self.a.bind(label);
-                    // A frozen block takes no write; a shared literal's is copied, then written.
-                    self.a.ldur_w(X9, out, -(self.layout.words_flags as i32));
-                    self.a.tbnz(X9, KIND_FROZEN.trailing_zeros(), exit);
-                    let cell = self.gp(self.graph.node(node).inputs[0], X17);
-                    let saved = self.save_live_caller_saved(node);
-                    self.a.mov(0, cell);
-                    self.a.mov_imm64(X16, unshare_elements as *const () as u64);
-                    self.a.blr(X16);
-                    self.a.mov(X9, 0);
-                    self.restore_live_caller_saved(&saved);
-                    self.a.cbz(X9, true, exit);
-                    self.a.mov(out, X9);
-                    self.a.b(retry);
-                }
-                Cold::Remember {
-                    label,
-                    node,
-                    out,
-                    resume,
-                } => {
-                    self.a.bind(label);
-                    // The arguments through scratch registers, which no home is: either may be
-                    // in x0 or x1.
-                    let index = self.gp(self.graph.node(node).inputs[2], X17);
-                    self.a.mov(X9, out);
-                    if index != X17 {
-                        self.a.mov_w(X17, index);
+                    Cold::NumberOrOddball {
+                        label,
+                        word,
+                        dst,
+                        exit,
+                        resume,
+                    } => {
+                        use crate::value::{PACK_BOOL, PACK_CANON_NAN, PACK_NULL, PACK_UNDEFINED};
+                        let boolean = self.a.new_label();
+                        let zero = self.a.new_label();
+                        self.a.bind(label);
+                        // A Boolean's word less its tag is its bit (CheckBoolean's test).
+                        self.a.movz(X17, (PACK_BOOL >> 48) as u32, 3);
+                        self.a.logic_x(2, X17, word, X17);
+                        self.a.cmp_imm_x(X17, 1);
+                        self.a.b_cond(LS, boolean);
+                        // Each of the others is one word: its tag over a zero payload.
+                        for oddball in [PACK_UNDEFINED, PACK_NULL, PACK_CANON_NAN] {
+                            self.a.movz(X17, (oddball >> 48) as u32, 3);
+                            self.a.cmp_reg_x(word, X17);
+                            self.a.b_cond(EQ, zero);
+                        }
+                        self.a.b(exit);
+                        self.a.bind(boolean);
+                        self.a.mov_w(dst, X17);
+                        self.a.b(resume);
+                        self.a.bind(zero);
+                        self.a.movz(dst, 0, 0);
+                        self.a.b(resume);
                     }
-                    // The words are the store's output, live after the call wherever a register
-                    // the call clobbers holds them.
-                    let keep = caller_saved(out);
-                    let saved = self.save_live_caller_saved_and(node, &keep);
-                    self.a.mov(0, X9);
-                    self.a.mov_w(1, X17);
-                    self.a.mov_imm64(X16, remember_element as *const () as u64);
-                    self.a.blr(X16);
-                    self.restore_live_caller_saved(&saved);
-                    self.a.b(resume);
-                }
-                Cold::ElementCreate {
-                    label,
-                    node,
-                    out,
-                    done,
-                    exits,
-                } => {
-                    self.a.bind(label);
-                    self.emit_element_create(node, out, done, exits);
-                }
-                Cold::Edge { label, from, to } => {
-                    self.a.bind(label);
-                    self.emit_moves(from, to)?;
-                    self.a.b(self.blocks[to.index()]);
-                }
-                Cold::Poll {
-                    label,
-                    node,
-                    resume,
-                    throw,
-                } => self.emit_poll_slow(label, node, resume, throw),
-                Cold::ToBoolean {
-                    label,
-                    node,
-                    word,
-                    dst,
-                    resume,
-                } => {
-                    self.a.bind(label);
-                    let saved = self.save_live_caller_saved(node);
-                    // The word first: it may be in x0.
-                    self.a.mov(1, word);
-                    self.a.mov(0, 19);
-                    self.a.mov_imm64(X16, to_boolean as *const () as u64);
-                    self.a.blr(X16);
-                    self.a.mov_w(X9, 0);
-                    self.restore_live_caller_saved(&saved);
-                    self.a.mov_w(dst, X9);
-                    self.a.b(resume);
+                    Cold::Jump { label, target } => {
+                        self.a.bind(label);
+                        self.a.b(target);
+                    }
+                    Cold::ElementUndefined {
+                        label,
+                        node,
+                        dst,
+                        resume,
+                        exit,
+                        negative,
+                    } => {
+                        self.a.bind(label);
+                        if let Some((index, negative_exit)) = negative {
+                            // A negative index names a String key ("-1"), never an element.
+                            self.a.tbnz(index, 31, negative_exit);
+                        }
+                        self.emit_no_inherited_elements(node, false, &[], exit);
+                        self.a.mov_imm64(dst, crate::value::PACK_UNDEFINED);
+                        self.a.b(resume);
+                    }
+                    Cold::ElementKinds {
+                        label,
+                        out,
+                        resume,
+                        unwritable,
+                    } => {
+                        use crate::value::word_block::{KIND_SCANNED, KIND_UNWRITABLE};
+                        self.a.bind(label);
+                        let imm = |bits| asm::logical_imm_w(bits).expect("a run of kind bits");
+                        self.a.logic_imm_w(0, X17, X9, imm(KIND_UNWRITABLE));
+                        self.a.cbnz(X17, false, unwritable);
+                        self.a.tbz(X9, KIND_SCANNED.trailing_zeros(), resume);
+                        self.a.logic_imm_w(0, X9, X9, imm(!KIND_SCANNED));
+                        self.a.stur_w(X9, out, -(self.layout.words_flags as i32));
+                        self.a.b(resume);
+                    }
+                    Cold::Unwritable {
+                        label,
+                        node,
+                        out,
+                        retry,
+                        exit,
+                    } => {
+                        use crate::value::word_block::KIND_FROZEN;
+                        self.a.bind(label);
+                        // A frozen block takes no write; a shared literal's is copied, then written.
+                        self.a.ldur_w(X9, out, -(self.layout.words_flags as i32));
+                        self.a.tbnz(X9, KIND_FROZEN.trailing_zeros(), exit);
+                        let cell = self.gp(self.graph.node(node).inputs[0], X17);
+                        let saved = self.save_live_caller_saved(node);
+                        self.a.mov(0, cell);
+                        self.a.mov_imm64(X16, unshare_elements as *const () as u64);
+                        self.a.blr(X16);
+                        self.a.mov(X9, 0);
+                        self.restore_live_caller_saved(&saved);
+                        self.a.cbz(X9, true, exit);
+                        self.a.mov(out, X9);
+                        self.a.b(retry);
+                    }
+                    Cold::Remember {
+                        label,
+                        node,
+                        out,
+                        resume,
+                    } => {
+                        self.a.bind(label);
+                        // The arguments through scratch registers, which no home is: either may be
+                        // in x0 or x1.
+                        let index = self.gp(self.graph.node(node).inputs[2], X17);
+                        self.a.mov(X9, out);
+                        if index != X17 {
+                            self.a.mov_w(X17, index);
+                        }
+                        // The words are the store's output, live after the call wherever a register
+                        // the call clobbers holds them.
+                        let keep = caller_saved(out);
+                        let saved = self.save_live_caller_saved_and(node, &keep);
+                        self.a.mov(0, X9);
+                        self.a.mov_w(1, X17);
+                        self.a.mov_imm64(X16, remember_element as *const () as u64);
+                        self.a.blr(X16);
+                        self.restore_live_caller_saved(&saved);
+                        self.a.b(resume);
+                    }
+                    Cold::ElementCreate {
+                        label,
+                        node,
+                        out,
+                        done,
+                        exits,
+                    } => {
+                        self.a.bind(label);
+                        self.emit_element_create(node, out, done, exits);
+                    }
+                    Cold::Edge { label, from, to } => {
+                        self.a.bind(label);
+                        self.emit_moves(from, to)?;
+                        self.a.b(self.blocks[to.index()]);
+                    }
+                    Cold::Poll {
+                        label,
+                        node,
+                        resume,
+                        throw,
+                    } => self.emit_poll_slow(label, node, resume, throw),
+                    Cold::ToBoolean {
+                        label,
+                        node,
+                        word,
+                        dst,
+                        resume,
+                    } => {
+                        self.a.bind(label);
+                        let saved = self.save_live_caller_saved(node);
+                        // The word first: it may be in x0.
+                        self.a.mov(1, word);
+                        self.a.mov(0, 19);
+                        self.a.mov_imm64(X16, to_boolean as *const () as u64);
+                        self.a.blr(X16);
+                        self.a.mov_w(X9, 0);
+                        self.restore_live_caller_saved(&saved);
+                        self.a.mov_w(dst, X9);
+                        self.a.b(resume);
+                    }
                 }
             }
         }

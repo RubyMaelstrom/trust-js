@@ -259,6 +259,22 @@ const PROGRAMS: &[&str] = &[
      const vals = [undefined, null, true, false, 3, -2.5, 4294967296.5, NaN];\n\
      let t = 0; for (let k = 0; k < 3000; k++) { t = (t + queue(k % 60)) | 0; \
      t = (t + bits(k < 2800 ? vals[k % vals.length] : String(k % 7), k)) | 0; } t",
+    // Effects at several operand depths (the small callees' study): x20 moved from the depth
+    // the emission knows, so each effect's operands must land where its template reads them:
+    // calls of a callee the tier never splices (its finally) under other operands, getters and
+    // `arguments` reads, both arms of a branch that merge, loops whose header reloads x20 (a long
+    // one whose call leaves x20 two words above the header's depth each iteration); and f64
+    // results boxed with a NaN canonicalized, a negated NaN's sign set among them.
+    "function g(a, b) { try { return a * 3 - b; } finally { } }\n\
+     const o = { v: 2, get w() { return this.v + 0.5; } };\n\
+     function eff(k, arr) { let s = k + g(k, 1) * (2 + g(1, k)) - arguments.length; \
+     if (k & 1) { s = s - o.w + g(s, o.w); } else { s = g(o.w, s) - o.w + s; } \
+     for (let i = 0; i < 3; i++) s = s + g(i, arr[i]) * arguments[0]; \
+     return s + -arr[3]; }\n\
+     function long(n) { let s = 0; for (let i = 0; i < n; i++) s = s + g(i, 1); return s; }\n\
+     let t = 0, nans = 0; for (let k = 0; k < 3000; k++) { \
+     const r = eff(k % 17, [k, 2, -1, k % 50 === 0 ? NaN : k % 7]); \
+     if (r !== r) nans++; else t += r; if (k % 100 === 0) t += long(4000); } t + ':' + nans",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {

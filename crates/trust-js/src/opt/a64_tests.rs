@@ -841,6 +841,51 @@ fn an_effect_calls_back_into_javascript_and_values_live_across_it() {
     );
 }
 
+/// The one word `emit` assembles.
+fn encode(emit: impl FnOnce(&mut asm::Asm)) -> u32 {
+    let mut a = asm::Asm::new();
+    emit(&mut a);
+    let words = a.finish();
+    assert_eq!(words.len(), 1);
+    words[0]
+}
+
+/// A boxed f64's NaN (the small callees' study): the word is the FMOV's, a NaN's replaced out of
+/// line by the canonical NaN (the first stage's and SpiderMonkey's branch), not selected on the
+/// comparison's flags; a negated NaN, which FNEG leaves with its sign set (a tag's bits), and a
+/// sum that propagates it box as the canonical NaN.
+#[test]
+fn a_boxed_f64_branches_over_its_nan_case() {
+    let mut engine = fixture("function neg(a, b) { return a + b; } neg(1, 2);");
+    install(
+        &mut engine,
+        "neg",
+        &op_graph(NodeOp::F64Neg, Operands::F64, true, Rep::F64),
+        Options::default(),
+    );
+    let mut sum = fixture(ADD);
+    let code = install(&mut sum, "add", &add_f64(), Options::default());
+    // No CSEL x, x, x, VS: the boxing branches (B.VS) to its NaN case.
+    let csel_vs = 0x9A80_6000;
+    assert!(!holds(&code_words(&code), csel_vs, 0xFFE0_FC00));
+    assert!(holds(
+        &code_words(&code),
+        encode(|a| a.movz(0, 0x7ff8, 3)),
+        !31
+    ));
+    exits();
+    for (call, expected) in [
+        ("var x = neg(NaN, 0); [x !== x, typeof x, [x].indexOf(x), Object.is(x, NaN)].join()", "true,number,-1,true"),
+        ("var y = neg(0 / 0, 0) + 1; [y !== y, typeof y].join()", "true,number"),
+        ("[neg(-0, 0), neg(1.5, 0), neg(-Infinity, 0)].map(v => Object.is(v, 0) ? '0' : String(v)).join()", "0,-1.5,Infinity"),
+        ("var z = add(-(0 / 0), 1) + add(Infinity, -Infinity); [z !== z, typeof z].join()", "true,number"),
+    ] {
+        let engine = if call.contains("add(") { &mut sum } else { &mut engine };
+        assert_eq!(eval(engine, call), expected, "{call}");
+    }
+    assert!(exits().is_empty());
+}
+
 #[test]
 fn collections_during_an_effect_keep_the_values_living_across_it() {
     let mut engine =
