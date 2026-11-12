@@ -8892,34 +8892,49 @@ mod tests {
         HELD.with(|held| unsafe { std::ptr::write_volatile(held.as_ptr(), !hidden) });
     }
 
+    /// A thread stack larger than glibc's whole stack cache (40 MiB unless the tunable
+    /// glibc.pthread.stack_cache_size says otherwise), which therefore never keeps one: a thread
+    /// spawned with it runs on a new mapping, zero-filled. Any other thread may get an exited
+    /// thread's stack of its size, as that thread left it.
+    #[cfg(target_os = "linux")]
+    const FRESH_STACK: usize = 64 << 20;
+
     /// A spawned thread's descriptor and static TLS sit at the top of its stack mapping (glibc,
     /// musl), above its outermost frame: the registered stack ends below them, so a cell that
-    /// only a thread-local holds dies at a conservative collection.
+    /// only a thread-local holds dies at a conservative collection. The thread runs on a stack
+    /// no thread used before ([`FRESH_STACK`]): the scan reads the closure's frame whole, slots
+    /// not yet written among them, which on a reused stack hold what an earlier thread left
+    /// there. In a debug build the slot that takes `collect`'s result is written only once the
+    /// collection returns, and a word another test had left there, naming a cell of a heap whose
+    /// chunk this fixture took next, kept the cell (P3 stage 2's gate, with forced exits).
     #[cfg(target_os = "linux")]
     #[test]
     fn a_thread_local_is_not_a_root() {
-        std::thread::spawn(|| {
-            let outer = 0u64;
-            assert!(register_thread_native_stack());
-            let top = native::entry_top().expect("registered");
-            let held = HELD.with(|held| held.as_ptr() as usize);
-            assert!(
-                (&raw const outer as usize) < top && top <= held,
-                "the stack ends between the thread's frames and its thread-locals"
-            );
-            let mut fx = Fixture::new();
-            let hidden = alloc_hidden(&mut fx.heap, fx.leaf, 16);
-            hold_in_thread_local(hidden);
-            scrub_stack();
-            assert!(fx.heap.collect());
-            assert!(
-                !fx.heap.is_allocated_word(HELD.with(Cell::get)),
-                "a thread-local retained its cell"
-            );
-            black_box(&outer);
-        })
-        .join()
-        .expect("collector thread");
+        let thread = std::thread::Builder::new().stack_size(FRESH_STACK);
+        thread
+            .spawn(|| {
+                let outer = 0u64;
+                assert!(register_thread_native_stack());
+                let top = native::entry_top().expect("registered");
+                let held = HELD.with(|held| held.as_ptr() as usize);
+                assert!(
+                    (&raw const outer as usize) < top && top <= held,
+                    "the stack ends between the thread's frames and its thread-locals"
+                );
+                let mut fx = Fixture::new();
+                let hidden = alloc_hidden(&mut fx.heap, fx.leaf, 16);
+                hold_in_thread_local(hidden);
+                scrub_stack();
+                assert!(fx.heap.collect());
+                assert!(
+                    !fx.heap.is_allocated_word(HELD.with(Cell::get)),
+                    "a thread-local retained its cell"
+                );
+                black_box(&outer);
+            })
+            .expect("a thread")
+            .join()
+            .expect("collector thread");
     }
 
     #[test]
