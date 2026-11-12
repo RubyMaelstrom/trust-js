@@ -3390,3 +3390,38 @@ Expected, from the study's probe of the same behavior (one binary, runtime switc
 charge after its final collection 524 -> 161 MiB; cycles on an X925 core Splay +4.2%, TypeScript
 +1.5%, Earley-Boyer +0.4%. Checks: clippy, the library's suite tier off and on eager (3,219
 each), zombie's check, clippy and Windows' check (target/p3/stage2/gcthp).
+
+The interim two-CPU session of d16a14db (2026-11-12; target/p3/stage2/session-2cpu-p3s2-d16a14db,
+report.txt; main d16a14db: steps 15b, 16 and 17, the shell allocator, the collector's chunks
+without huge pages; BASE p3s2-be6b5ee2, the last session's build, as the tier-off base). Every
+engine and reference on CPUs 5 and 6, 0 capped seconds in every phase (the calls phase crossed
+midnight, which uncapped.sh's check now handles), the delivered clock 1.368-1.370 GHz before and
+after every phase (the owner's answer: recorded, steady); the agents held.
+- The 2% bar, the tier on against off: the measured passes Vue -12.06%, React -0.74%, Djot
+  -13.04%; the steady states -13.17%, -2.89%, -17.20%; Octane every benchmark faster or within 2%
+  (SplayLatency +0.35%), CodeLoad now -0.98% (+9.21% before: the allocator), the geomean +32.37%;
+  the calls within 2% but constructor, +2.21% (+1.69% and +0.85% in the last two sessions). The
+  calls' case loops never reach the tier (each case function is entered twice; the holey fix's
+  agent found it): the cases time template code calling the tier's code for their small callees
+  (Point's constructor, five operations, compiles to 1,676 bytes), and the small-callee cases all
+  read +1.2% to +2.2%, about two cycles a call. To find. The holey case's +2.35% last session was
+  template code against template code (+0.67% now).
+- The compile bar: Djot 3.02% (1.968 ms: recompile 1.307, snapshot 0.580, install 0.081, stubs
+  gone; 3% is 1.954 ms), Vue 0.57% (1.009 ms), React 0.65% (0.191 ms); no rerun. Djot was 3.81%
+  (2.49 ms) at be6b5ee2; steps 16 and 17 took 0.52 ms (the plan: 0.45 + 0.11).
+- Against node-mg on the same CPUs: the measured passes Vue 3.79x, React 2.92x, Djot 2.60x;
+  Octane's geomean over the 15 benchmarks Node runs 3.80x (3.98x before; the tier off 5.16x).
+- The tier on against the last session: DeltaBlue +15.2%, CodeLoad +14.4%, Richards +4.3%,
+  RayTrace +2.5%; Splay -10.8%, TypeScript -3.1%, Box2D -3.0% (its spread), SplayLatency -2.9%.
+- The tier off against the base build: CodeLoad +3.2% (the allocator), Splay -6.6%, SplayLatency
+  -2.5%, TypeScript -1.5%: the collector without huge pages.
+The collector's huge pages, measured again. One binary (the layout probe, a runtime switch), timed
+Splay on X925 cores 5-6, the tier on, 3 rounds each: with the advice 5,007-5,297, without
+4,253-4,262 (-17.4%); SplayLatency -3.8%, TypeScript -1.4%. The study's +4.2% came from fixed runs
+with GC pacing off; with pacing off timed Splay loses 4.6%. With pacing on Splay took 150,288 page
+faults without the advice against 5,451 with it: inside a huge page the collector's discards did
+nothing, on base pages each frees memory that Splay faults back in, though the spare pool is V8's
+(pooled pages go back after 8 s, at once only in a reducing collection). The owner's answer
+(2026-11-12, "Restore advice, then fix"): the change is reverted (27d7bb04); the cause is to be
+found and fixed in the exemplars' shape (an agent: target/p3/stage2/gcfault-impl), and the advice
+dropped again once it costs little.
