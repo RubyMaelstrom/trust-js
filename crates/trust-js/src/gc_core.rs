@@ -549,6 +549,16 @@ pub(crate) mod os_pages {
         unsafe { madvise(ptr, len, MADV_HUGEPAGE) };
     }
 
+    /// Ask the system not to back `ptr..ptr + len`, mapped here, with transparent huge pages
+    /// (`MADV_NOHUGEPAGE`): khugepaged leaves the range alone, and no fault there takes a huge
+    /// page. It splits no huge page already there.
+    #[cfg(target_os = "linux")]
+    pub(super) fn advise_no_huge_pages(ptr: *mut u8, len: usize) {
+        const MADV_NOHUGEPAGE: i32 = 15;
+        // SAFETY: advice only: no contents change.
+        unsafe { madvise(ptr, len, MADV_NOHUGEPAGE) };
+    }
+
     /// Free the memory behind `ptr..ptr + len`, mapped here, at page boundaries, and leave the
     /// range mapped: it reads as zero when next touched. False when the system refuses (a locked
     /// mapping), which leaves the contents as they were.
@@ -790,8 +800,13 @@ mod os_pages {
 /// collection 523 MiB charged where RSS read 169), and a page taken again then faults new memory
 /// in beside the memory still held. Split first, the discarded page's memory goes back at once,
 /// and the chunk's other pages stay as base pages (the discard alone had split their mapping
-/// already); khugepaged may collapse such a chunk into a huge page again later, as it may any
-/// advised range. A page taken again from a split chunk faults its base pages in.
+/// already). The chunk is then advised against huge pages until every page given back from it is
+/// taken again, when it is advised for them again, as jemalloc's HPA gives up the huge page of a
+/// slab it purges in part and asks for one again once the slab is full (src/hpa_utils.c:16-20,
+/// src/hpa.c:516-580): khugepaged collapses an advised range with at least one page in use and
+/// up to `max_ptes_none` empty ones (511 by default) into a huge page, zero-filling the pages
+/// given back (mm/khugepaged.c:600-620, 1756-1761), and so took the memory back within 14
+/// minutes here. A page taken again from a split chunk faults its base pages in.
 #[cfg(all(
     target_os = "linux",
     any(target_arch = "aarch64", target_arch = "x86_64")
@@ -819,6 +834,9 @@ mod page_source {
         /// (`os_pages::discard_splitting`): the system grants transparent huge pages of a chunk's
         /// size. Read at the first give-back.
         split_first: Option<bool>,
+        /// Where pages are split first: by chunk, its pages given back and not taken again. A
+        /// chunk listed is advised against huge pages (`os_pages::advise_no_huge_pages`).
+        given: std::collections::HashMap<usize, u32>,
     }
 
     impl PageSource {
@@ -829,6 +847,7 @@ mod page_source {
                 end: 0,
                 free: Vec::new(),
                 split_first: None,
+                given: std::collections::HashMap::new(),
             }
         }
 
@@ -838,6 +857,7 @@ mod page_source {
         pub(super) fn take(&mut self) -> *mut u8 {
             if self.next == self.end {
                 if let Some(base) = self.free.pop() {
+                    self.taken_again(base);
                     return base as *mut u8;
                 }
                 self.map_chunk();
@@ -854,10 +874,13 @@ mod page_source {
             self.chunks.push(base as usize);
             match self.chunks.len() {
                 n if n < HUGE_PAGE_MIN_CHUNKS => {}
-                // The earlier chunks too: the heap is now large enough to use them whole.
+                // The earlier chunks too: the heap is now large enough to use them whole (but a
+                // chunk with pages given back, advised against them until they are taken again).
                 HUGE_PAGE_MIN_CHUNKS => {
                     for &chunk in &self.chunks {
-                        os_pages::advise_huge_pages(chunk as *mut u8, CHUNK_SIZE);
+                        if !self.given.contains_key(&chunk) {
+                            os_pages::advise_huge_pages(chunk as *mut u8, CHUNK_SIZE);
+                        }
                     }
                 }
                 _ => os_pages::advise_huge_pages(base, CHUNK_SIZE),
@@ -866,7 +889,6 @@ mod page_source {
         }
 
         /// Whether the chunks mapped so far are advised for huge pages.
-        #[cfg(test)]
         pub(super) fn huge_pages_advised(&self) -> bool {
             self.chunks.len() >= HUGE_PAGE_MIN_CHUNKS
         }
@@ -893,7 +915,33 @@ mod page_source {
                 // SAFETY: as above.
                 unsafe { std::ptr::write_bytes(base, 0, PAGE_SIZE) };
             }
+            if split_first {
+                // Its chunk's first page given back: no huge page for the chunk until it is
+                // taken again, or khugepaged would fill it in again.
+                let chunk = base as usize & !(CHUNK_SIZE - 1);
+                let count = self.given.entry(chunk).or_insert(0);
+                *count += 1;
+                if *count == 1 {
+                    os_pages::advise_no_huge_pages(chunk as *mut u8, CHUNK_SIZE);
+                }
+            }
             self.free.push(base as usize);
+        }
+
+        /// The page at `base`, given back, is taken again: once its chunk has none given back,
+        /// the chunk is advised for huge pages again, where the heap advises its chunks.
+        fn taken_again(&mut self, base: usize) {
+            let chunk = base & !(CHUNK_SIZE - 1);
+            let Some(count) = self.given.get_mut(&chunk) else {
+                return;
+            };
+            *count -= 1;
+            if *count == 0 {
+                self.given.remove(&chunk);
+                if self.huge_pages_advised() {
+                    os_pages::advise_huge_pages(chunk as *mut u8, CHUNK_SIZE);
+                }
+            }
         }
 
         /// Return every page to the OS, as the heap is released: `pages` are those `take` gave
@@ -921,6 +969,7 @@ mod page_source {
                 unsafe { os_pages::unmap(base as *mut u8, CHUNK_SIZE) };
             }
             self.free.clear();
+            self.given.clear();
             (self.next, self.end) = (0, 0);
         }
 
@@ -7389,6 +7438,84 @@ mod tests {
                 held_after - held_before
             );
         }
+        // SAFETY: every page this source gave and did not take back is listed, and none is used.
+        unsafe { source.release(taken) };
+    }
+
+    /// P3 stage 2 (gcfault option B): a chunk with a page given back is advised against huge pages
+    /// until every page given back from it is taken again, when it is advised for them again, as
+    /// jemalloc's HPA gives up the huge page of a slab it purges in part and asks for one again
+    /// once the slab is full: otherwise khugepaged fills the pages given back in again (here it
+    /// collapsed split chunks with one page in 32 in use within 14 minutes, the other 31
+    /// zero-filled). The kernel's own mapping flags show it (`hg` and `nh` in /proc/self/smaps).
+    /// Where the system grants no huge pages of a chunk's size, nothing is split or advised
+    /// against, and the test says so and ends.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "aarch64", target_arch = "x86_64")
+    ))]
+    #[test]
+    fn a_chunk_with_pages_given_back_is_advised_against_huge_pages_until_they_are_taken_again() {
+        use super::page_source::{PageSource, CHUNK_SIZE, HUGE_PAGE_MIN_CHUNKS};
+        const PAGES_PER_CHUNK: usize = CHUNK_SIZE / PAGE_SIZE;
+        // The mapping holding `address`: whether it is advised for huge pages (`hg`) and whether
+        // against them (`nh`), from its VmFlags.
+        fn advice(address: usize) -> (bool, bool) {
+            let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
+            let mut inside = false;
+            for line in smaps.lines() {
+                if let Some((range, _)) = line.split_once(' ') {
+                    if let Some((start, end)) = range.split_once('-') {
+                        if let (Ok(start), Ok(end)) = (
+                            usize::from_str_radix(start, 16),
+                            usize::from_str_radix(end, 16),
+                        ) {
+                            inside = (start..end).contains(&address);
+                            continue;
+                        }
+                    }
+                }
+                if inside {
+                    if let Some(flags) = line.strip_prefix("VmFlags:") {
+                        let has = |flag| flags.split_whitespace().any(|f| f == flag);
+                        return (has("hg"), has("nh"));
+                    }
+                }
+            }
+            panic!("no mapping holds {address:#x}");
+        }
+        if os_pages::huge_page_size() != Some(CHUNK_SIZE) {
+            eprintln!(
+                "no transparent huge pages of a chunk's size here: nothing to advise against"
+            );
+            return;
+        }
+        const ADVISED: (bool, bool) = (true, false);
+        const AGAINST: (bool, bool) = (false, true);
+        let mut source = PageSource::new();
+        let mut taken = Vec::new();
+        for _ in 0..(HUGE_PAGE_MIN_CHUNKS + 1) * PAGES_PER_CHUNK {
+            taken.push(source.take() as usize);
+        }
+        let first_chunk = taken[0];
+        let chunk = taken[HUGE_PAGE_MIN_CHUNKS * PAGES_PER_CHUNK];
+        assert_eq!(chunk % CHUNK_SIZE, 0, "the last chunk's first page");
+        assert_eq!(advice(chunk), ADVISED);
+        // Two of the last chunk's pages given back.
+        let (one, two) = (chunk + PAGE_SIZE, chunk + 2 * PAGE_SIZE);
+        taken.retain(|&page| page != one && page != two);
+        // SAFETY: pages this source gave, which nothing uses.
+        unsafe { source.give_back(one as *mut u8) };
+        assert_eq!(advice(chunk), AGAINST, "a page given back");
+        // SAFETY: as above.
+        unsafe { source.give_back(two as *mut u8) };
+        assert_eq!(advice(chunk), AGAINST);
+        assert_eq!(advice(first_chunk), ADVISED, "a chunk with none given back");
+        // Taken again (the chunks are all carved): one, then the other.
+        taken.push(source.take() as usize);
+        assert_eq!(advice(chunk), AGAINST, "a page still given back");
+        taken.push(source.take() as usize);
+        assert_eq!(advice(chunk), ADVISED, "every page taken again");
         // SAFETY: every page this source gave and did not take back is listed, and none is used.
         unsafe { source.release(taken) };
     }
