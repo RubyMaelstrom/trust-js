@@ -119,8 +119,7 @@ fn callees(engine: &mut Engine, name: &str, site: u32) -> usize {
 
 /// Whether a run that met closures of one function at `apply1`'s site 0 is one to judge: its
 /// ways hold one callee, the first closure. A run whose call-cache epoch moved under it holds
-/// more (a way of a moved epoch is refilled, not hit by code; the epoch is process-wide, and
-/// other tests' discards move it), and is run again.
+/// more (a way of a moved epoch is refilled, not hit by code), and is run again.
 fn judged(engine: &mut Engine) -> bool {
     match callees(engine, "apply1", 0) {
         1 => true,
@@ -160,7 +159,8 @@ const APPLY: &str = "function apply1(f, x) { return f(x); }\n\
                      function make(k) { return (v) => v + k; }\n";
 
 /// Runs `test` with a fresh engine up to three times, while its run's call-cache epoch moved
-/// under it (`test` answers whether its run was judged: see [`judged`]).
+/// under it (`test` answers whether its run was judged: see [`judged`]). Its callers run alone
+/// in their process ([`alone`]), where only their own engines move the epoch.
 fn with_retries(mut test: impl FnMut() -> bool) {
     for _ in 0..3 {
         if test() {
@@ -168,6 +168,37 @@ fn with_retries(mut test: impl FnMut() -> bool) {
         }
     }
     panic!("the call-cache epoch moved in each of three runs");
+}
+
+/// Whether this process runs the test `name` of this module alone (a child of the test binary,
+/// which runs the body); otherwise runs it so and checks that it passed, as
+/// `jit::call_record_tests` does. The call-cache epoch is process-wide, and the other tests move
+/// it: their function runtimes' drops (their engines' ends, their collections) and their tier's
+/// discards. Under TRUST_JS_GC_STRESS, whose collections stretch a run of these tests from
+/// milliseconds to seconds, it moved 11 to 127 times within single runs, in each of the three
+/// runs of two of these tests in P3 stage 2's gate.
+fn alone(name: &str) -> bool {
+    const CHILD: &str = "TRUST_JS_TEST_SPLICE_RULE_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            &format!("opt::splice_rule_tests::{name}"),
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .expect("the child runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the child {}:\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
 }
 
 #[test]
@@ -223,6 +254,9 @@ fn a_site_of_one_closure_is_spliced_with_the_tier_on_as_before() {
 /// Rust path runs: the probe's store of the hint is the only record.
 #[test]
 fn a_first_code_keyed_hit_through_the_full_probe_is_recorded_and_not_spliced() {
+    if !alone("a_first_code_keyed_hit_through_the_full_probe_is_recorded_and_not_spliced") {
+        return;
+    }
     with_retries(|| {
         let mut e = engine(tier_off());
         let program = format!(
@@ -250,6 +284,9 @@ fn a_first_code_keyed_hit_through_the_full_probe_is_recorded_and_not_spliced() {
 /// Later code-keyed hits through the hinted-way test, which writes nothing: the record stays.
 #[test]
 fn code_keyed_hits_through_the_hinted_way_test_keep_the_site_unspliced() {
+    if !alone("code_keyed_hits_through_the_hinted_way_test_keep_the_site_unspliced") {
+        return;
+    }
     with_retries(|| {
         let mut e = engine(tier_off());
         let program =
@@ -270,6 +307,9 @@ fn code_keyed_hits_through_the_hinted_way_test_keep_the_site_unspliced() {
 /// closure.
 #[test]
 fn a_code_keyed_hit_through_the_call_hit_helper_is_recorded_and_not_spliced() {
+    if !alone("a_code_keyed_hit_through_the_call_hit_helper_is_recorded_and_not_spliced") {
+        return;
+    }
     with_retries(|| {
         let mut e = engine(tier_off());
         let program = format!(
@@ -292,6 +332,9 @@ fn a_code_keyed_hit_through_the_call_hit_helper_is_recorded_and_not_spliced() {
 /// on x86-64): it records the hit as the machine code's full probe does.
 #[test]
 fn a_code_keyed_hit_of_the_rust_code_sharing_retry_is_recorded_and_not_spliced() {
+    if !alone("a_code_keyed_hit_of_the_rust_code_sharing_retry_is_recorded_and_not_spliced") {
+        return;
+    }
     with_retries(|| {
         let mut e = engine(tier_off());
         let program = format!(
@@ -615,6 +658,9 @@ fn a_spliced_callees_named_method_site_is_spliced_with_the_tier_on() {
 /// with the tier on, as the rule's closure half declines any such site; spliced with it off.
 #[test]
 fn a_named_method_site_that_met_another_closure_is_not_spliced_with_the_tier_on() {
+    if !alone("a_named_method_site_that_met_another_closure_is_not_spliced_with_the_tier_on") {
+        return;
+    }
     with_retries(|| {
         let program = "function A(v) { this.v = v; }\n\
                        A.prototype.get = function () { return this.v + 1; };\n\
