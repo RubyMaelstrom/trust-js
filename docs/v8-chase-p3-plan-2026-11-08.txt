@@ -3545,3 +3545,31 @@ The owner's answers on stage 3's forks (2026-11-12):
   effects today, their helpers' signatures, what each reads of the frame, the exits).
 - D3, call counts: "V8's counts": a count per call site and an invocation count per function,
   counted only by template code compiled with the tier on.
+
+Stage 3's step 3 input, explicit operands (2026-11-12; target/p3/stage2/effects-input.txt and its
+evidence; main b02f590d).
+- The census (a counting probe; the fixtures, their passes 2-10, Octane at 5 and 40 fixed runs):
+  314M effect executions a set of runs at 16,456 sites in 1,391 tier codes, 63 operation kinds,
+  sixteen of them 95%: named loads 35.2% (GetMethod 19.3%, GetPropLocal 12.0%), equality 23.6%
+  (EqEq 14.0%), calls 19.4% (CallWithThis 17.9%), named stores and updates 14.3%. About 73% are
+  operations the tier does not lower yet (prototype and string method loads, `==` on values no
+  fact has typed, stores that add properties, `o.x++`), which Maglev lowers from its feedback: a
+  larger lever than step 3, apart from it.
+- The canonical frame's cost: per effect 2 set-up instructions, 1.64 operand stores, 1.07 result
+  loads and 0.54 flushes, and 1.33 billion slot reloads, 83% re-checked (71% of them zlib's and
+  NavierStokes': after a call, a loop with no calls of its own reloads its invariant locals every
+  iteration). Explicit operands remove up to 2.3% of instructions (zlib 3.5%, NavierStokes 5.6%,
+  React's passes 2-10 5.2%), an upper bound that register pressure may take back.
+- A plain helper call per operation would make about 92% of today's effect executions slower: the
+  templates' in-line paths serve them. So the templates stay, fed explicit operands through an
+  operand area, as JSC's DFG keeps its ICs in line (Maglev calls builtins with the IC probe inside).
+- GC safety: TRust's collector never moves objects and scans the native stack, callee-saved
+  registers and active records conservatively, JSC's model: values held across a helper call need
+  no maps. Lazy deopt is not needed while the tier keeps no assumption across an effect (no
+  dependencies yet). Exceptions: JSC's form, an exit by recipe with the handler's values kept live,
+  in place of writing the whole frame state before each effect in a try region.
+- The step's shape: ahead of step 3, an effect-free loop's invariant locals loaded once at its
+  entry; 3a generic nodes in the compiled function's own frame (no flush, no reload, phis instead
+  of frame merges, throws by recipe, templates unchanged); 3b origins (chunk, pc, inline site) where
+  the templates take the pc, as JSC's call-site index; 3c explicit context for inlined frames, kind
+  by kind in the census's order; 3d register forms of the hottest kinds where measured.
