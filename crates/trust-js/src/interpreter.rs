@@ -1624,6 +1624,13 @@ impl crate::gc_trace::GcTrace for FramePool {
                 top.is_none_or(|top| top <= frame),
                 "a live top ({top:?}) above the frame's extent ({frame})"
             );
+            // A known top is an operand top: the poll's or a direct call's x20, never below the
+            // activation's stack_base, so every slot lies under it.
+            debug_assert!(
+                top.is_none_or(|top| top >= record.ctx.n_slots),
+                "a live top ({top:?}) inside the frame's {} slots",
+                record.ctx.n_slots
+            );
             record.trace_to(sink, top.unwrap_or(frame));
         }
     }
