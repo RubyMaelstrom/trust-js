@@ -683,7 +683,7 @@ fn return_context() -> super::JitCtx {
         stack_base: std::ptr::null_mut(),
         final_sp: std::ptr::null_mut(),
         slots: std::ptr::null_mut(),
-        reserved: 0,
+        poll_top: std::ptr::null(),
         strict_flag: std::ptr::null_mut(),
         call_ic_epoch: std::ptr::null(),
         argc: 0,
@@ -1169,6 +1169,148 @@ fn record_words_past_the_frame_are_no_roots() {
         census.records >= 2,
         "both's and narrow's records: {census:?}"
     );
+    assert_tracked_collectable(&mut engine);
+}
+
+/// (20) No root above an active record's live top while its activation waits on a direct call
+/// (`jit::live_tops`): `wide` leaves the object it tracked in its record's words 9 and 10 (the
+/// call that made the array literal's last element, over its eight zeros, and the call's
+/// argument), and returns; `caller`, whose frame reaches past them (its other branch's
+/// literal, whose sixteen elements stack up: a literal of constants alone is made from its
+/// site's copy, `Op::MakeArrayLiteral`, and pushes none), takes the same record from the pool
+/// (last in, first out) and calls `inner`
+/// directly with one operand word over its slot, and `inner` collects. Nothing but those stale
+/// words names the object, so no root marks it: it is dead, or marked by a stale copy on the
+/// native stack (`S`). Scanned to its frame's extent (`JitCtx::frame_words`), as before, the
+/// record marked it (`R`); so it still does where the collector does not know a waiting
+/// record's top: on x86-64, whose calls all run through Rust entries, and in the first round,
+/// whose calls run through the call helper.
+#[test]
+fn record_words_above_a_direct_calls_live_top_are_no_roots() {
+    let mut engine = jit_engine(0);
+    let source = r#"
+        function wide(n) { return [0, 0, 0, 0, 0, 0, 0, 0, track({tag: 'C' + n})][8].tag; }
+        function inner() { return collect(); }
+        function caller(deep) {
+            if (deep) {
+                return [deep, deep, deep, deep, deep, deep, deep, deep,
+                    deep, deep, deep, deep, deep, deep, deep, deep][15];
+            }
+            return inner();
+        }
+        function both(n) { var tag = wide(n); return tag + ':' + caller(false); }
+        both(0);
+    "#;
+    let first = run(&mut engine, source);
+    assert!(first.starts_with("C0:"), "{first}");
+    assert_native(&mut engine, &["wide", "inner", "caller", "both"]);
+    settle(&mut engine, "wide");
+    settle(&mut engine, "inner");
+    settle(&mut engine, "caller");
+    let direct = direct_round(&mut engine, "both(1);", 3);
+    if cfg!(target_arch = "aarch64") {
+        assert!(matches!(direct.as_str(), "C1:D" | "C1:S"), "{direct}");
+    } else if !crate::gc_test::stress_active() {
+        // At stress 1 the object can die before `inner` runs, while `wide`'s record is pooled.
+        assert_eq!(direct, "C1:R", "x86-64's calls run through Rust entries");
+    }
+    let census = last_census();
+    assert!(
+        census.records >= 3,
+        "both's, caller's and inner's records: {census:?}"
+    );
+    assert_tracked_collectable(&mut engine);
+}
+
+/// `stressOn()`: from here a collection is due after every allocation, at the safepoint that
+/// follows it, each one major and in one pause; `stressOff()` puts back the process's interval
+/// (`TRUST_JS_GC_STRESS`, 0 for none).
+fn stress_on(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+    let mut core = i.gc_heap.core.borrow_mut();
+    core.set_stress_every(1);
+    core.set_stress_major_every(1);
+    core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    Ok(Value::Undefined)
+}
+
+fn stress_off(i: &mut Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+    let every = crate::interpreter::gc_collect::gc_stress();
+    i.gc_heap.core.borrow_mut().set_stress_every(every);
+    Ok(Value::Undefined)
+}
+
+/// (21) No root above an active record's live top while its activation waits in the poll
+/// helper, where generated code's collections run (`JitCtx::poll_top`): as (20), with `polled`
+/// in `caller`'s place, which allocates in a loop with a collection due after each allocation
+/// and so collects at its polls (the poll census counts them), then reports with `marks()` what
+/// marked the object first in the last of those collections. Every round, the first one's
+/// through Rust entries included, and on both architectures.
+#[test]
+fn record_words_above_a_polls_live_top_are_no_roots() {
+    let mut engine = jit_engine(0);
+    install(&mut engine, "stressOn", 0, stress_on);
+    install(&mut engine, "stressOff", 0, stress_off);
+    let source = r#"
+        function wide(n) { return [0, 0, 0, 0, 0, 0, 0, 0, track({tag: 'P' + n})][8].tag; }
+        function polled(deep) {
+            if (deep) {
+                return [deep, deep, deep, deep, deep, deep, deep, deep,
+                    deep, deep, deep, deep, deep, deep, deep, deep][15];
+            }
+            stressOn();
+            var o = null;
+            for (var k = 0; k < 3; k++) o = {k: k};
+            stressOff();
+            return marks();
+        }
+        function both(n) { var tag = wide(n); return tag + ':' + polled(false); }
+        both(0);
+    "#;
+    let polled = |engine: &mut Engine, source: &str, round: usize| {
+        super::take_poll_census();
+        let result = if round == 0 {
+            run(engine, source)
+        } else {
+            direct_round(engine, source, 2)
+        };
+        let census = super::take_poll_census();
+        assert!(
+            census.collections.iter().sum::<u64>() > 0,
+            "round {round} collected at no poll: {census:?}"
+        );
+        result
+    };
+    let first = polled(&mut engine, source, 0);
+    assert!(matches!(first.as_str(), "P0:D" | "P0:S"), "{first}");
+    assert_native(&mut engine, &["wide", "polled", "both"]);
+    settle(&mut engine, "wide");
+    settle(&mut engine, "polled");
+    let direct = polled(&mut engine, "both(1);", 1);
+    assert!(matches!(direct.as_str(), "P1:D" | "P1:S"), "{direct}");
+    assert_tracked_collectable(&mut engine);
+}
+
+/// (22) A waiting caller's live top includes its top operand word: `inner` takes no parameter,
+/// so the direct sequence moves none of `caller`'s argument into its record (an over-applied
+/// call's surplus stays on the caller's operand stack), and the object the argument tracked
+/// waits there alone, as the caller's top word, while `inner` collects: a root (`R`), in the
+/// first round (a call through the helper, its record scanned to its frame) and in the direct
+/// rounds (to the top the call left, `jit::live_tops`).
+#[test]
+fn a_waiting_callers_top_operand_word_is_a_root() {
+    let mut engine = jit_engine(0);
+    let source = r#"
+        function inner() { return collect(); }
+        function caller(n) { return inner(track({tag: 'T' + n})); }
+        caller(0);
+    "#;
+    assert_eq!(run(&mut engine, source), "R");
+    assert_native(&mut engine, &["inner", "caller"]);
+    settle(&mut engine, "inner");
+    for n in 1..3 {
+        assert_eq!(direct_round(&mut engine, &format!("caller({n});"), 1), "R");
+    }
+    assert!(last_census().records >= 2, "caller's and inner's records");
     assert_tracked_collectable(&mut engine);
 }
 

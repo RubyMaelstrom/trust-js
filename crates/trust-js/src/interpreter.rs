@@ -1605,16 +1605,26 @@ impl FramePool {
     }
 }
 
-/// Every active record: its context's values precisely and its frame's words conservatively (see
-/// `GcTrace for JitFrame`). Pooled records own nothing and are not traced, so the stale words a
-/// finished activation leaves in its record retain nothing while it is pooled, nor, past the
-/// next activation's frame, while that one runs on it.
+/// Every active record: its context's values precisely and its frame's words conservatively, up
+/// to its activation's live top where the collector knows it, else to its frame's extent (see
+/// [`crate::jit::JitFrame`] and [`crate::jit::live_tops`]). Pooled records own nothing and are
+/// not traced, so the stale words a finished activation leaves in its record retain nothing
+/// while it is pooled, nor, above the next activation's live top or past its frame, while that
+/// one runs on it.
 impl crate::gc_trace::GcTrace for FramePool {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        for record in self.active_records() {
+        let records = self.active_records();
+        let tops = crate::jit::live_tops(&records);
+        for (record, top) in records.iter().zip(tops) {
             // SAFETY: a registered record is allocated until it is freed, which happens only
             // to pooled records (or past the pool limit, after its activation finished).
-            unsafe { record.as_ref() }.trace_gc(sink);
+            let record = unsafe { record.as_ref() };
+            let frame = record.ctx.frame_words();
+            debug_assert!(
+                top.is_none_or(|top| top <= frame),
+                "a live top ({top:?}) above the frame's extent ({frame})"
+            );
+            record.trace_to(sink, top.unwrap_or(frame));
         }
     }
 }

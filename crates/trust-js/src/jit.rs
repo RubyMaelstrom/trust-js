@@ -2294,14 +2294,20 @@ pub struct JitCtx {
     /// [8] Operand-stack base; the JIT keeps the live top in a register and stores it back here
     /// on every exit path.
     pub stack_base: *mut Value,
-    /// [16] Final stack top, written by the epilogues (for leftover-value cleanup on throw).
+    /// [16] Final stack top, written by the epilogues (for leftover-value cleanup on throw). Until
+    /// then nothing reads it, and it holds where the activation came from: a Rust entry sets it to
+    /// the activation's own `stack_base`, and the direct JIT→JIT sequence, which stores it with
+    /// `stack_base` in one STP, to its caller's operand top, below which lie all of the caller's
+    /// live operand words for the whole call: the collector scans the caller's record up to it
+    /// ([`live_tops`]).
     pub final_sp: *mut Value,
     /// [24] Local slots base (the inline LoadLocal/StoreLocal templates index off this).
     pub slots: *mut Cell<Value>,
-    /// [32] Unused (zero): it held the address of the realm-wide "no Proxy yet" latch, which the
-    /// in-line `instanceof` walk read until each hop tested its object's kind (W2g step 1). It
-    /// keeps the fixed offsets of the fields after it.
-    pub reserved: usize,
+    /// [32] The activation's operand top while it waits in the poll helper (`jit_interrupt`,
+    /// where generated code's collections run), null otherwise: the poll's caller passes it, and
+    /// the collector scans the record up to it ([`live_tops`]). Generated code never reads it.
+    /// (It held the address of the realm-wide "no Proxy yet" latch until W2g step 1.)
+    pub(crate) poll_top: *const Value,
     /// [40] `Env::as_ptr` of the activation env — what the inline LoadName template compares
     /// against the per-site name cache (see `bytecode::NameIc`).
     pub env_raw: *const u8,
@@ -2458,7 +2464,8 @@ impl JitCtx {
     }
 
     /// The words of its record the activation running on this active record's context can have
-    /// written: its `n_slots` slots and its code's operand stack, as deep as the largest
+    /// written, which the collector scans where it does not know the activation's live top
+    /// ([`live_tops`]): its `n_slots` slots and its code's operand stack, as deep as the largest
     /// `max_stack` of the codes its chunk's slot has held (`NativeCodeSlot::max_stack`; every
     /// code of a chunk takes its cfg's capacity, `jit_ir::Cfg::jit_stack_capacity`), or the
     /// whole record while the chunk or that depth is unknown (a record just allocated). Both
@@ -2481,9 +2488,9 @@ impl JitCtx {
 
 /// The values a running context holds in its own fields, traced precisely. Whoever
 /// makes the context a root scans its slot and operand words: an active [`JitFrame`] record its
-/// frame's words ([`JitCtx::frame_words`]), a Rust entry the ranges it registers
-/// (`gc_trace::JitFrameRoots`). The raw identities it caches are kept alive by their owners, as
-/// classified below.
+/// words up to its activation's live top ([`live_tops`]) or its frame's extent
+/// ([`JitCtx::frame_words`]), a Rust entry the ranges it registers (`gc_trace::JitFrameRoots`).
+/// The raw identities it caches are kept alive by their owners, as classified below.
 impl crate::gc_trace::GcTrace for JitCtx {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let JitCtx {
@@ -2491,7 +2498,7 @@ impl crate::gc_trace::GcTrace for JitCtx {
             stack_base: _, // the operand words: scanned by the registration
             final_sp: _,
             slots: _, // the slot words: scanned by the registration
-            reserved: _,
+            poll_top: _,
             // The running environment: the callee closure's (which the caller's operand stack
             // and FnFrame also hold), a borrowed entry's VM frame's (registered by `drive_vm`),
             // or the activation the prologue made (`bytecode::jit_frame_setup`), which only this
@@ -3239,7 +3246,7 @@ mod layout_asserts {
     const _: () = assert!(std::mem::offset_of!(JitCtx, stack_base) == 8);
     const _: () = assert!(std::mem::offset_of!(JitCtx, final_sp) == 16);
     const _: () = assert!(std::mem::offset_of!(JitCtx, slots) == 24);
-    const _: () = assert!(std::mem::offset_of!(JitCtx, reserved) == 32);
+    const _: () = assert!(std::mem::offset_of!(JitCtx, poll_top) == 32);
     const _: () = assert!(std::mem::offset_of!(JitCtx, env_raw) == 40);
     // [48]: the 8-byte packed `this` word.
     const _: () = assert!(
@@ -12596,9 +12603,14 @@ fn emit_direct_sequence(
     // ---- install the callee's per-frame fields in its own record ----
     // Interpreter-constant fields (helpers, interp, counters, slots) were written when the
     // record was created; this/ret/error/handlers are vacant while it is pooled.
-    // stack_base = slots + n_slots*8
+    // stack_base = slots + n_slots*8, stored with this caller's operand top beside it, in the
+    // callee's final_sp, which nothing reads before the callee's epilogue writes it
+    // (`JitCtx::final_sp`): all of the caller's live operand words lie below that top while the
+    // callee runs, and the collector scans the caller's record up to it (`live_tops`). One STP
+    // where an STR stored stack_base alone.
     a.add_shifted(3, 15, 5, 3);
-    a.str_imm(3, 9, cx_stack_base);
+    const _: () = assert!(offset_of!(JitCtx, final_sp) == offset_of!(JitCtx, stack_base) + 8);
+    a.stp_base(3, 20, 9, cx_stack_base as i32);
     // env_raw (selected into x13 above), and its parent cache from that environment: the
     // parent's stored word, its `Env::as_ptr`, or null.
     a.str_imm(13, 9, cx_env_raw);
@@ -24417,7 +24429,7 @@ pub(crate) unsafe fn run_borrowed_frame(
         stack_base,
         final_sp: stack_base.add(initial_depth),
         slots: slots.as_ptr().cast_mut(),
-        reserved: 0,
+        poll_top: std::ptr::null(),
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         argc: 0,
@@ -24592,7 +24604,7 @@ pub fn run(
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         slots: slots.as_mut_ptr(),
-        reserved: 0,
+        poll_top: std::ptr::null(),
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         argc: 0,
@@ -24736,15 +24748,20 @@ fn test_running_code() -> [usize; 0] {
 /// traces each one that is not pooled — from the pop that starts an activation (by a Rust entry
 /// or a direct call's machine code) to the push or free that ends it. It traces the context's
 /// values precisely (`GcTrace for JitCtx`) and the activation's frame conservatively, as packed
-/// words: the record's first [`JitCtx::frame_words`] words, its slots and its code's operand
-/// stack, including the caller's operands under a direct call (the callee closure among them)
-/// and the stale words a finished callee or a popped operand leaves there, which can only
-/// retain. No stack pointer is needed. The words past the frame belong to no live value of the
-/// activation: whatever an earlier, larger activation on the record, or an exit's frame state,
-/// left there stays until a larger frame writes it, and it is not scanned, as no exemplar reads a
-/// frame past its extent (SpiderMonkey's frames to their stack pointer, js/src/vm/Stack.cpp:
-/// 317-378, js/src/jit/BaselineFrame.cpp:69-87; V8's and JavaScriptCore's frames to theirs).
-/// `alloc` zero-fills the words, so every scanned word has been written.
+/// words from the record's first, up to the activation's live top where the collector knows it
+/// ([`live_tops`]): a record waiting on a direct call to the operand top the call left (its
+/// slots and operands, the callee closure and the arguments among them), one waiting in the
+/// poll helper, where generated code's collections run, to the top the poll passed. Any other
+/// record is scanned to [`JitCtx::frame_words`], its slots and its code's whole operand stack.
+/// Above the live top lie the words the activation popped and those an earlier activation on
+/// the record left, which this one has not written: they belong to no live value of the
+/// activation and are not scanned, as SpiderMonkey reads a frame up to its stack pointer
+/// (js/src/vm/Stack.cpp:317-378, the previous frame's from the frame above, Stack-inl.h:64-65;
+/// js/src/jit/BaselineFrame.cpp:69-87, the frame's size from the next frame's position,
+/// JSJitFrameIter.cpp:176-201). Below the top, the optimizing tier's code writes only its
+/// effects' operands and keeps its other values in registers and spill slots, which the native
+/// stack's scan reads, so there an earlier activation's words can still be read. `alloc`
+/// zero-fills the words, so every scanned word has been written.
 #[repr(C)]
 pub(crate) struct JitFrame {
     pub(crate) ctx: JitCtx,
@@ -24754,16 +24771,64 @@ pub(crate) struct JitFrame {
 /// Byte offset of a record's slot storage from the record (and its context) base.
 pub(crate) const FRAME_WORDS_OFF: usize = std::mem::offset_of!(JitFrame, words);
 
-/// An active record (see [`JitFrame`] and `GcTrace for FramePool`): its context and its frame.
-impl crate::gc_trace::GcTrace for JitFrame {
-    fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
-        let JitFrame { ctx, words } = self;
-        ctx.trace_gc(sink);
+impl JitFrame {
+    /// An active record (see [`JitFrame`] and `GcTrace for FramePool`): its context and its
+    /// first `words` words, its live top's or its frame's ([`live_tops`]).
+    pub(crate) fn trace_to(&self, sink: &mut dyn crate::gc_trace::GcSink, words: usize) {
+        let JitFrame { ctx, words: frame } = self;
+        crate::gc_trace::GcTrace::trace_gc(ctx, sink);
         // SAFETY: `alloc` zero-filled every word; later writes store complete packed words.
         unsafe {
-            crate::gc_trace::scan_words(words.as_ptr().cast::<u64>(), ctx.frame_words(), sink)
+            crate::gc_trace::scan_words(frame.as_ptr().cast::<u64>(), words.min(FRAME_BUF), sink)
         };
     }
+}
+
+/// The live top of each of `records`, the active records of one interpreter, where the
+/// collector knows it: how many of the record's words, from its first, its activation can need.
+/// - A record whose activation waits on a direct JIT→JIT call: its callee's `final_sp`, which
+///   the sequence's install set to the caller's operand top and which lies in the caller's frame
+///   until the callee's epilogue (`JitCtx::final_sp`; a Rust entry's or a finished callee's lies
+///   in its own record).
+/// - A record whose activation waits in the poll helper: its `poll_top`.
+///
+/// Elsewhere (`None`) the top is in a register of a call into Rust, and the record is scanned to
+/// [`JitCtx::frame_words`]: an activation waiting on a helper's call (a native's, one through a
+/// Rust entry, an accessor's, a teardown's), or on a collection a native starts. x86-64's calls
+/// all run through Rust entries.
+pub(crate) fn live_tops(records: &[std::ptr::NonNull<JitFrame>]) -> Vec<Option<usize>> {
+    const WORD: usize = std::mem::size_of::<Value>();
+    // SAFETY (for every dereference below): an active record is allocated.
+    let first = |record: &std::ptr::NonNull<JitFrame>| unsafe {
+        std::ptr::addr_of!((*record.as_ptr()).words) as usize
+    };
+    let mut frames: Vec<(usize, usize)> = records
+        .iter()
+        .enumerate()
+        .map(|(k, record)| (first(record), k))
+        .collect();
+    frames.sort_unstable();
+    let mut tops: Vec<Option<usize>> = vec![None; records.len()];
+    let mut note = |owner: usize, address: usize, start: usize| {
+        if address >= start && address - start <= FRAME_BUF * WORD {
+            let top = (address - start) / WORD;
+            tops[owner] = Some(tops[owner].map_or(top, |known: usize| known.max(top)));
+        }
+    };
+    for (k, record) in records.iter().enumerate() {
+        let ctx = unsafe { &(*record.as_ptr()).ctx };
+        if !ctx.poll_top.is_null() {
+            note(k, ctx.poll_top as usize, first(record));
+        }
+        let sp = ctx.final_sp as usize;
+        let at = frames.partition_point(|&(start, _)| start <= sp);
+        if let Some(&(start, owner)) = at.checked_sub(1).map(|at| &frames[at]) {
+            if owner != k {
+                note(owner, sp, start);
+            }
+        }
+    }
+    tops
 }
 
 impl JitFrame {
@@ -24785,7 +24850,7 @@ impl JitFrame {
                 stack_base: words,
                 final_sp: words,
                 slots,
-                reserved: 0,
+                poll_top: std::ptr::null(),
                 strict_flag: &mut i.strict as *mut bool,
                 call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
                 argc: 0,
@@ -25068,7 +25133,7 @@ unsafe fn run_moved_oversized(
         interp: i as *mut Interp,
         chunk: Rc::as_ptr(chunk),
         slots: slots_ptr,
-        reserved: 0,
+        poll_top: std::ptr::null(),
         strict_flag: &mut i.strict as *mut bool,
         call_ic_epoch: crate::bytecode::CALL_IC_EPOCH.as_ptr(),
         argc: 0,

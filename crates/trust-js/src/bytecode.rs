@@ -32207,6 +32207,10 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
 ) -> crate::jit::SpFlag {
     let ctx = unsafe { &mut *ctx };
     let i = unsafe { &mut *ctx.interp };
+    // While the activation waits here, the collector scans its record up to the operand top
+    // the poll passed (`JitCtx::poll_top`, `jit::live_tops`), as it scans one waiting on a
+    // direct call up to the call's.
+    ctx.poll_top = sp;
     // The optimizing tier's compiles that finished off the main thread are installed here, at
     // the next poll after their thread set the install bit (P3 stage 2, step 12): no new code
     // runs before the poll returns.
@@ -32221,6 +32225,7 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
         (core.collections(), core.budget_overshoot(), past)
     };
     let result = i.interrupt_poll_force().and_then(|()| i.gc_check());
+    ctx.poll_top = std::ptr::null();
     #[cfg(test)]
     {
         let collected = i.gc_heap.core.borrow().collections() != collections;
@@ -32277,7 +32282,7 @@ mod return_slot_tests {
             stack_base: std::ptr::null_mut(),
             final_sp: std::ptr::null_mut(),
             slots: std::ptr::null_mut(),
-            reserved: 0,
+            poll_top: std::ptr::null(),
             strict_flag: std::ptr::null_mut(),
             call_ic_epoch: std::ptr::null(),
             argc: 0,
@@ -32366,7 +32371,7 @@ mod return_slot_tests {
             assert_eq!(offset_of!(JitCtx, stack_base), 8);
             assert_eq!(offset_of!(JitCtx, final_sp), 16);
             assert_eq!(offset_of!(JitCtx, slots), 24);
-            assert_eq!(offset_of!(JitCtx, reserved), 32);
+            assert_eq!(offset_of!(JitCtx, poll_top), 32);
             assert_eq!(offset_of!(JitCtx, env_raw), 40);
             assert_eq!(offset_of!(JitCtx, this_word), 48);
             assert_eq!(offset_of!(JitCtx, global_body), 56);
