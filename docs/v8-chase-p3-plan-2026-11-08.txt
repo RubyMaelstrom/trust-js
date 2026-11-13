@@ -3631,3 +3631,30 @@ fixed 2,800-iteration run the live data after each major collection grows from 1
 with the tier on and to 1,060 MB with the bytecode VM, where it stays flat at 118 MB with the
 template JIT alone (V8: 49-59 MB). Not floating garbage (a cycle allocates 8-43 MB), not the page
 source. Octane's timed Splay (about 1,200 iterations) stays under it. To be found.
+
+Stage 2's exit gates (2026-11-12/13; target/p3/stage2/gate-s2.sh, stage 1's gate-s1.sh copied, on
+a git-archive export of main 0e77d515: target/p3/stage2/gate2; the triage target/p3/stage2/
+gatefix-impl, report.txt). In the four configurations (the tier off, on, eager, eager with forced
+exits every 100): the lib suite 3,242, difftest 138 agree, the fixtures' output the tier off's,
+Test262 53,573 of 53,575 (the two staging/sm failures); GC stress 1 over the stress set, off and
+eager. Six failures, none the engine's; the fixes landed (e8406619..d678eb23):
+- Two splice-rule tests under GC stress: the call caches' epoch is process-wide, and the other
+  tests' engines ending and discarding moved it 11-127 times within a run; the tests that need a
+  still epoch run alone in a child process, as jit::call_record_tests do. (Open: in a process of
+  several engines one engine's discard stales every engine's call caches.)
+- The cyclic walk's poll test under stress: the setup left a stress collection due, which the walk's
+  entry poll ran inside the 20 ms deadline; the test runs it before arming the timer.
+- The thread-local root test with forced exits: glibc gave the test's thread a stack an earlier
+  thread had used, one slot the closure's frame had not yet written holding that thread's word for
+  the cell; the thread now gets a stack larger than glibc's cache, always fresh.
+- The native-stub count with forced exits: forced exits hand its natives to the VM, stage 1's case;
+  the test keeps the tier without forced exits.
+- The opt:: stress run past its hour (313 tests; one takes hours under stress): gate-s2b.sh splits it
+  into four module runs, 4 hours each.
+- Test262's runner with the tier eager and forced: its counting allocator counted a refused 7 PiB
+  request for a moment, failing the compile thread's allocations meanwhile; it counts a request only
+  where the cap admits it.
+The combined tree (main, the retention fix and these fixes, 7 h 45 min): every stage passes but the
+retention fix's own test, a small splay tree's live data, with the tier on: a stale operand word
+above an active record's live top, inside the extent the fix scans; the retention fix is finishing
+with records scanned up to their live top (SpiderMonkey's form) before it lands.
