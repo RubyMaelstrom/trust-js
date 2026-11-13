@@ -12,8 +12,11 @@
 //!   every operand-stack position. A live slot the loop does not assign keeps its value through
 //!   the header when nothing in the loop can be an effect, and is in the frame at the header
 //!   otherwise (an effect leaves every slot in the frame); whether an operation can be one is the
-//!   builder's own choice of its form ([`Rules`], stage 2 step 4), which the builder keeps to. A
-//!   header's poll opens its body, with the header's state, once a back edge reaches it.
+//!   builder's own choice of its form ([`Rules`], stage 2 step 4), which the builder keeps to.
+//!   Where such a loop is entered with the slot in the frame's keeping, its value is loaded once
+//!   at the end of each entry predecessor and held through the loop, the frame still holding it
+//!   (P3 stage 3 step 0, `Builder::invariant`). A header's poll opens its body, with the
+//!   header's state, once a back edge reaches it.
 //! - Liveness (stage 2 step 6): a slot dead at a pc is Dead in its frame states, no join merges
 //!   it, no flush writes it, and no value holds it after an effect.
 //! - Joins: a phi where the predecessors' values differ and one of them is not in the frame.
@@ -2144,6 +2147,31 @@ impl<'a> Builder<'a> {
         (Slot::Dirty(phi), Some(phi))
     }
 
+    /// An effect-free loop's live `slot` that the loop does not write and that its entry edges
+    /// leave in their frames (`merge_slot`'s Frame), at the loop's header (P3 stage 3 step 0): its
+    /// value at the end of each entry predecessor (`value_at_end`, a load where the frame holds
+    /// it, as a written slot's phi inputs are taken), held Clean, the one value or a phi of the
+    /// entries' values (its back edges' inputs itself), so that the loop reads one SSA value and
+    /// never reloads it. Clean because each entry's frame holds the value it gives, which nothing
+    /// in the loop writes: the loop's frame states keep the slot in the frame's keeping.
+    fn invariant(
+        &mut self,
+        block: BlockIx,
+        preds: &mut [(BlockIx, State)],
+        slot: usize,
+        pc: usize,
+    ) -> (Slot, Option<NodeIx>) {
+        let mut values = Vec::with_capacity(preds.len());
+        for (from, st) in preds.iter_mut() {
+            values.push(self.value_at_end(*from, st, Loc::Slot(slot), pc));
+        }
+        if values.iter().all(|&value| value == values[0]) {
+            return (Slot::Clean(values[0]), None);
+        }
+        let phi = self.merge_phi(block, preds, &values, pc);
+        (Slot::Clean(phi), Some(phi))
+    }
+
     /// The state at a loop header from its entry edges (see the module's doc).
     fn header(
         &mut self,
@@ -2191,7 +2219,10 @@ impl<'a> Builder<'a> {
                 }
                 slots.push(Slot::Frame);
             } else {
-                let (merged, phi) = self.merge_slot(block, &mut preds, slot, pc);
+                let (mut merged, mut phi) = self.merge_slot(block, &mut preds, slot, pc);
+                if merged == Slot::Frame {
+                    (merged, phi) = self.invariant(block, &mut preds, slot, pc);
+                }
                 if let Some(phi) = phi {
                     phis.push((phi, Loc::Slot(slot)));
                 }

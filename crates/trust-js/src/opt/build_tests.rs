@@ -4118,3 +4118,295 @@ fn the_verifier_refuses_a_misplaced_speculation() {
     rejects("a check after it", broken, "before CheckNumber");
     verify(&graph, &chunk).expect("the graph itself holds");
 }
+
+// ---- loop invariants (stage 3, step 0) ----------------------------------------------------------
+
+/// An engine that ran `source` in the bytecode VM (its value records) and then `drive` at the
+/// JIT tier (its call sites' evidence, which the VM's calls do not record).
+fn warmed(source: &str, drive: &str) -> Engine {
+    let mut engine = vm_engine(source);
+    engine.set_tier(Tier::Jit);
+    eval(&mut engine, drive);
+    engine
+}
+
+/// The blocks of the natural loop whose header is block `header`: those that reach one of its back
+/// edges (from a block numbered at or after it) without passing it.
+fn loop_blocks(graph: &Graph, header: usize) -> Vec<bool> {
+    let mut members = vec![false; graph.blocks.len()];
+    members[header] = true;
+    let mut work: Vec<usize> = graph.blocks[header]
+        .preds
+        .iter()
+        .map(|pred| pred.index())
+        .filter(|&pred| pred >= header)
+        .collect();
+    while let Some(block) = work.pop() {
+        if std::mem::replace(&mut members[block], true) {
+            continue;
+        }
+        work.extend(graph.blocks[block].preds.iter().map(|pred| pred.index()));
+    }
+    members
+}
+
+/// The loop whose header starts at `pc`: its header's block, its entry predecessors and its
+/// blocks.
+struct LoopAt {
+    header: usize,
+    entries: Vec<usize>,
+    members: Vec<bool>,
+}
+
+fn loop_at(graph: &Graph, pc: u32) -> LoopAt {
+    let header = graph
+        .blocks
+        .iter()
+        .position(|block| block.loop_header && block.first_pc == pc)
+        .unwrap_or_else(|| panic!("a loop header at pc {pc}"));
+    let members = loop_blocks(graph, header);
+    let entries = graph.blocks[header]
+        .preds
+        .iter()
+        .map(|pred| pred.index())
+        .filter(|&pred| !members[pred])
+        .collect();
+    LoopAt {
+        header,
+        entries,
+        members,
+    }
+}
+
+/// The loop headers' pcs, in block order.
+fn loop_pcs(graph: &Graph) -> Vec<u32> {
+    graph
+        .blocks
+        .iter()
+        .filter(|block| block.loop_header)
+        .map(|block| block.first_pc)
+        .collect()
+}
+
+/// The FrameSlot loads of `chunk`'s local `name` in `graph`.
+fn loads_of(graph: &Graph, chunk: &Chunk, name: &str) -> Vec<NodeIx> {
+    let slot = slot_named(chunk, name);
+    (0..graph.nodes.len() as u32)
+        .map(NodeIx)
+        .filter(|&node| graph.node(node).op == NodeOp::FrameSlot(slot))
+        .collect()
+}
+
+/// The nodes of `graph` whose op `which` accepts and whose first input is `input`.
+fn checks_of(graph: &Graph, input: NodeIx, which: impl Fn(&NodeOp) -> bool) -> Vec<NodeIx> {
+    (0..graph.nodes.len() as u32)
+        .map(NodeIx)
+        .filter(|&node| {
+            let node = graph.node(node);
+            which(&node.op) && node.inputs.first() == Some(&input)
+        })
+        .collect()
+}
+
+/// An effect, then a loop without one reading the invariant locals `a` (in f64 arithmetic) and
+/// `n` (in an int32 comparison) and writing `s` and `i`.
+const INVARIANT: &str = "function inv(g, a, n) { var s = 0; g();
+       for (var i = 0; i < n; i++) s = s + a * i; return s + a; }
+     function nothing() {}
+     for (var r = 0; r < 20; r++) inv(nothing, 1.5, 10);";
+const INVARIANT_DRIVE: &str = "for (var r = 0; r < 20; r++) inv(nothing, 1.5, 10);";
+
+#[test]
+fn an_effect_free_loops_invariant_slots_are_loaded_once_on_its_entry() {
+    // After the call every slot is in the frame's keeping; the loop has no effect and does not
+    // write `a` and `n`: each is loaded once, at the end of the loop's entry predecessor, and
+    // held through the loop, where nothing reloads it and every state keeps it in the frame's
+    // keeping. `s` and `i` take phis.
+    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    let (chunk, graph) = graph_of(&mut engine, "inv");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 1, "{text}");
+    let header_pc = the_loop(&graph);
+    let lp = loop_at(&graph, header_pc);
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    let (a, n) = (
+        slot_named(&chunk, "a") as usize,
+        slot_named(&chunk, "n") as usize,
+    );
+    for node in &graph.nodes {
+        if lp.members[node.block.index()] {
+            assert!(
+                !matches!(node.op, NodeOp::FrameSlot(_)),
+                "a reload in the loop: {text}"
+            );
+            if let Some(state) = node.state {
+                let state = graph.state(state);
+                assert_eq!(state.slots[a], SlotSource::Frame, "{node:?}: {text}");
+                assert_eq!(state.slots[n], SlotSource::Frame, "{node:?}: {text}");
+            }
+        }
+    }
+    for name in ["a", "n"] {
+        let [load] = loads_of(&graph, &chunk, name)[..] else {
+            panic!("one load of {name}: {text}")
+        };
+        assert_eq!(graph.node(load).block.index(), entry, "{text}");
+    }
+    for name in ["s", "i"] {
+        phi_of_slot(&graph, &chunk, name, header_pc);
+    }
+}
+
+#[test]
+fn a_loop_entered_from_a_branch_loads_there_and_checks_in_the_loop() {
+    // The do-while's body is the branch's target: the invariant's load sits before the branch,
+    // whose two successors leave no edge of the loop's alone to move a check to (stage 2 step
+    // 6's speculation rule), so the check stays in the loop.
+    let mut engine = warmed(
+        "function br(g, a, n, c) { var s = 0; g();
+           if (c) do { s = s + a; } while (--n > 0);
+           return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) br(nothing, 1.5, 10, true);",
+        "for (var r = 0; r < 20; r++) br(nothing, 1.5, 10, true);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "br");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, the_loop(&graph));
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    assert_eq!(graph.blocks[entry].succs.len(), 2, "{text}");
+    let [load] = loads_of(&graph, &chunk, "a")[..] else {
+        panic!("one load of a: {text}")
+    };
+    assert_eq!(graph.node(load).block.index(), entry, "{text}");
+    let checks = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber);
+    assert_eq!(checks.len(), 1, "{text}");
+    assert!(lp.members[graph.node(checks[0]).block.index()], "{text}");
+}
+
+#[test]
+fn a_loop_with_an_effect_reloads_and_checks_its_invariant_slots_as_before() {
+    let mut engine = warmed(
+        "function eff(g, a, n) { var s = 0; g();
+           for (var i = 0; i < n; i++) { s = s + a * i; g(); } return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) eff(nothing, 1.5, 10);",
+        "for (var r = 0; r < 20; r++) eff(nothing, 1.5, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "eff");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, the_loop(&graph));
+    let loads = loads_of(&graph, &chunk, "a");
+    assert!(!loads.is_empty(), "{text}");
+    for load in loads {
+        assert!(lp.members[graph.node(load).block.index()], "{text}");
+        let checks = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber);
+        assert_eq!(checks.len(), 1, "{text}");
+        assert!(lp.members[graph.node(checks[0]).block.index()], "{text}");
+    }
+}
+
+#[test]
+fn a_slot_the_loop_writes_keeps_its_phi_and_its_entry_speculation() {
+    // `s`, in the frame's keeping at the entry and written in the loop, takes a phi whose entry
+    // input is its load (stage 2 step 6's PhiNotNumber speculation), never the invariant rule.
+    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    let (chunk, graph) = graph_of(&mut engine, "inv");
+    let text = dump(&graph, &chunk);
+    let header_pc = the_loop(&graph);
+    let phi = phi_of_slot(&graph, &chunk, "s", header_pc);
+    let [load] = loads_of(&graph, &chunk, "s")[..] else {
+        panic!("one load of s: {text}")
+    };
+    let checks = checks_of(&graph, load, |_| true);
+    assert_eq!(checks.len(), 1, "{text}");
+    assert_eq!(
+        graph.node(checks[0]).reason,
+        Some(ExitReason::PhiNotNumber),
+        "{text}"
+    );
+    assert_eq!(graph.node(phi).rep, Rep::F64, "{text}");
+}
+
+#[test]
+fn an_inner_loop_without_effects_in_one_with_an_effect_loads_on_its_own_entry() {
+    let mut engine = warmed(
+        "function nest(g, a, n) { var s = 0;
+           for (var k = 0; k < 3; k++) { g(); for (var i = 0; i < n; i++) s = s + a * i; }
+           return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) nest(nothing, 1.5, 10);",
+        "for (var r = 0; r < 20; r++) nest(nothing, 1.5, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "nest");
+    let text = dump(&graph, &chunk);
+    let [outer_pc, inner_pc] = loop_pcs(&graph)[..] else {
+        panic!("two loops: {text}")
+    };
+    let (outer, inner) = (loop_at(&graph, outer_pc), loop_at(&graph, inner_pc));
+    let [entry] = inner.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    assert!(outer.members[entry], "{text}");
+    let [load] = loads_of(&graph, &chunk, "a")[..] else {
+        panic!("one load of a: {text}")
+    };
+    assert_eq!(graph.node(load).block.index(), entry, "{text}");
+    assert_ne!(outer.header, inner.header);
+}
+
+#[test]
+fn a_loop_with_two_entry_edges_merges_their_loads_and_checks_in_the_loop() {
+    // `a` is in the frame's keeping on both entry edges: each loads it, a phi of the loads is held
+    // through the loop (its back edges' input itself), and with no one entry edge to move them
+    // to its checks stay in the loop.
+    let mut engine = warmed(
+        "function two(g, a, n, c) { var s = 0; g(); var i = 0;
+           if (c) { i = 1; } else { g(); }
+           while (i < n) { s = s + a; i++; }
+           return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) two(nothing, 1.5, 10, r % 2);",
+        "for (var r = 0; r < 20; r++) two(nothing, 1.5, 10, r % 2);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "two");
+    let text = dump(&graph, &chunk);
+    let header_pc = the_loop(&graph);
+    let lp = loop_at(&graph, header_pc);
+    assert_eq!(lp.entries.len(), 2, "{text}");
+    let loads = loads_of(&graph, &chunk, "a");
+    assert_eq!(loads.len(), 2, "{text}");
+    let header = &graph.blocks[lp.header];
+    let phi = header
+        .phis
+        .iter()
+        .copied()
+        .find(|&phi| {
+            loads
+                .iter()
+                .all(|load| graph.node(phi).inputs.contains(load))
+        })
+        .unwrap_or_else(|| panic!("a phi of the loads: {text}"));
+    for (k, pred) in header.preds.iter().enumerate() {
+        let input = graph.node(phi).inputs[k];
+        if lp.members[pred.index()] {
+            assert_eq!(input, phi, "{text}");
+        } else {
+            assert_eq!(graph.node(input).block, *pred, "{text}");
+        }
+    }
+    let checks = checks_of(&graph, phi, |op| *op == NodeOp::CheckNumber);
+    assert_eq!(checks.len(), 1, "{text}");
+    assert!(lp.members[graph.node(checks[0]).block.index()], "{text}");
+    let a = slot_named(&chunk, "a") as usize;
+    let poll = graph.node(header.body[0]);
+    assert_eq!(
+        graph.state(poll.state.expect("a poll's state")).slots[a],
+        SlotSource::Frame,
+        "{text}"
+    );
+}

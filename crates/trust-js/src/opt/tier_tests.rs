@@ -275,6 +275,28 @@ const PROGRAMS: &[&str] = &[
      let t = 0, nans = 0; for (let k = 0; k < 3000; k++) { \
      const r = eff(k % 17, [k, 2, -1, k % 50 === 0 ? NaN : k % 7]); \
      if (r !== r) nans++; else t += r; if (k % 100 === 0) t += long(4000); } t + ':' + nans",
+    // Loops without effects after one (`o.c++`, which the tier never lowers) reading invariant
+    // locals, loaded and checked once at the loop's entry (P3 stage 3 step 0): Numbers and an
+    // Array; an inner loop under one with the effect; a loop of two entry edges; a loop in a try
+    // region that throws the invariant; and invariants that turn into Strings, int32s and an
+    // Array with a String late, whose entry checks and checks in the loop then fail.
+    "function f1(o, a, n, x) { let s = 0; o.c++; \
+     for (let i = 0; i < n; i++) s = s + a * i + x[i & 3]; return s; }\n\
+     function f2(o, a, n, x) { let s = 0; for (let k = 0; k < 2; k++) { o.c++; \
+     for (let i = 0; i < n; i++) s = (s + x[i & 3] * a) % 100003; } return s; }\n\
+     function f3(o, a, n) { let s = 0; o.c++; let i = 0; if (n & 1) { i = 1; } else { o.c++; } \
+     while (i < n) { s = s + a; i++; } return s; }\n\
+     function f4(o, a, n) { let s = 0; try { o.c++; for (let j = 0; j < n; j++) { \
+     if (j === 5 && a > 3) throw a; s = s - a; } } catch (e) { s = s + e * 1000; } \
+     return s + a; }\n\
+     function h(r) { return typeof r === 'number' ? (r === r ? Math.round(r * 4) : 7) : r.length; }\n\
+     const O = {c: 0}; const X = [1.5, 2, 3.25, 4], Y = [1, 'y', 3, 4];\n\
+     let t = 0; for (let k = 0; k < 3000; k++) { \
+     const a = k < 2600 ? k % 5 + 0.5 : k % 3 ? 's' + k : k; const x = k < 2800 ? X : Y; \
+     t = (t * 31 + h(f1(O, a, k % 9, x)) + h(f2(O, a, k % 9, x)) + h(f3(O, a, k % 9)) + \
+     h(f4(O, a, k % 9))) % 1000003; }\n\
+     t + ':' + O.c + ':' + f1(O, 2.5, 7, X) + ':' + f2(O, 1.5, 5, X) + ':' + f3(O, 0.5, 6) + \
+     ':' + f4(O, 4.5, 8)",
 ];
 
 fn with_switches(switches: TestSwitches, source: &str) -> String {
@@ -2594,6 +2616,46 @@ fn entry_speculations_back_off_without_an_exit_cycle() {
     assert_eq!(eval(&mut engine, &source), expected);
     let chunk = tier_chunk(&mut engine, "entered").expect("entered's second stage");
     assert!(discards(&chunk) <= 3, "{} discards", discards(&chunk));
+}
+
+#[test]
+fn an_exit_inside_the_loop_finds_the_invariant_in_the_frame() {
+    // The element read of a String exits inside the loop (NotNumber at the multiplication):
+    // the frame the exit rebuilds keeps `a` in its slot (never written back, never moved), which
+    // the VM's run of the rest of the loop and the return read.
+    let source = "function f(o, a, n, x) { let s = 0; o.c++; \
+         for (let i = 0; i < n; i++) s = s + x[i] * a; return s + ':' + a; }\n\
+         const O = {c: 0}; const X = [1, 2, 3, 4], Y = [1, 2, 'z', 4];\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = (t + f(O, k * 0.5, 4, X).length) % 1000003; t";
+    let then = "f(O, 2.5, 4, Y) + f(O, 3.5, 4, X) + f(O, 0.25, 3, Y) + ':' + O.c";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [eval(&mut vm, source), eval(&mut vm, then)]
+    };
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    assert_eq!(eval(&mut engine, source), expected[0]);
+    let chunk = tier_chunk(&mut engine, "f").expect("f's tier chunk");
+    assert!(compiled().contains(&address(&chunk)));
+    let graph = graph_now(&chunk);
+    let header = graph
+        .blocks
+        .iter()
+        .find(|block| block.loop_header)
+        .expect("the loop")
+        .first_pc;
+    exits();
+    assert_eq!(eval(&mut engine, then), expected[1]);
+    let taken = exits();
+    assert!(
+        taken
+            .iter()
+            .any(|&(pc, why)| why == ExitReason::NotNumber && pc > header),
+        "{taken:?}"
+    );
 }
 
 #[test]
