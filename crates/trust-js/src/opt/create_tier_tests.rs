@@ -111,6 +111,37 @@ fn configurations() -> Vec<(&'static str, TestSwitches)> {
     all
 }
 
+/// Whether this process runs the test `name` of this module alone (a child of the test binary,
+/// which runs the body); otherwise runs it so and checks that it passed, as
+/// `opt::splice_rule_tests` does for the call caches' epoch. A creation way's own proof holds the
+/// creation epoch, which is process-wide: the other tests' engines move it (their prototypes'
+/// structural changes, their collections' pruned pins), the template's site then refills its ways
+/// until it turns generic, and the tier's snapshot of a generic site builds no creation. The
+/// results stay the VM's either way; what these tests assert is that the tier's code creates.
+fn alone(name: &str) -> bool {
+    const CHILD: &str = "TRUST_JS_TEST_CREATE_TIER_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        return true;
+    }
+    let output = std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            &format!("opt::tier_tests::create::{name}"),
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .expect("the child runs");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed"),
+        "the child {}:\n{stdout}\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    false
+}
+
 #[test]
 fn creations_have_the_vms_results_under_every_change_of_their_proof() {
     let expected = run(Tier::Bytecode, CREATE);
@@ -196,6 +227,9 @@ fn a_creations_slow_path_stores_a_value_from_its_spill_slot() {
 
 #[test]
 fn a_creations_commit_writes_the_slot_before_the_shape() {
+    if !alone("a_creations_commit_writes_the_slot_before_the_shape") {
+        return;
+    }
     // The commit's order (design note 5): the slot's word, its card, the shape and the count
     // last, with no call or poll between, as the template orders them, so that the collector,
     // which runs only at safepoints, never sees the shape without the slot. No program can see
@@ -269,6 +303,9 @@ fn creates(engine: &mut Engine, name: &str) -> bool {
 
 #[test]
 fn the_programs_creations_are_the_tiers_nodes_before_its_changes() {
+    if !alone("the_programs_creations_are_the_tiers_nodes_before_its_changes") {
+        return;
+    }
     // The suite above tests the creations: before the first change the tier's code of each
     // function creates its properties itself (wide's past the 8th and dict's stay the VM's).
     let warm = CREATE.replace("k < 1500", "k < 300");
@@ -286,6 +323,9 @@ fn the_programs_creations_are_the_tiers_nodes_before_its_changes() {
 
 #[test]
 fn a_constructor_runs_its_creations_in_the_tiers_code_without_an_exit() {
+    if !alone("a_constructor_runs_its_creations_in_the_tiers_code_without_an_exit") {
+        return;
+    }
     let source = "function P(x, y) { this.x = x; this.y = y; this.z = x * y; }\n\
          function W(v) { this.a = v; this.b = v; this.c = v; this.d = v; this.e = v; this.f = v; \
            this.g = v; this.h = v; this.i = v; this.j = v; this.k = v; this.l = v; }\n\
