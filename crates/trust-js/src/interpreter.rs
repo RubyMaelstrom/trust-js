@@ -1262,6 +1262,14 @@ pub struct FnFrame {
     pub extra: Option<Box<FrameExtra>>,
 }
 
+/// What a call's entry saved ([`Interp::enter_call_frame`]), which its leave restores
+/// ([`Interp::leave_call_frame`]): kept in the caller's native frame for the call, as the
+/// locals it replaces were.
+pub(crate) struct CallEntry {
+    saved_ctor: bool,
+    saved_nt: Value,
+}
+
 /// A mapped arguments object's ParameterMap (ECMA-262 CreateMappedArgumentsObject,
 /// spec.html:15083-15148), which the object keeps (`ObjectKind::Arguments`; W3 item 3's step 6,
 /// Decision 20f): the Function Environment Record its mapped indices alias and, per argument
@@ -15468,7 +15476,7 @@ impl Interp {
     /// body never reads `this` (`uses_this`), the word itself for a strict callee, and for a
     /// sloppy one the global object for undefined or null, an object word unchanged, and a
     /// primitive boxed into an object value.
-    fn bind_this_word(&mut self, this: Value, uses_this: bool, strict: bool) -> Value {
+    pub(crate) fn bind_this_word(&mut self, this: Value, uses_this: bool, strict: bool) -> Value {
         if !uses_this {
             Value::Undefined
         } else if strict || this.is_object() {
@@ -16590,31 +16598,15 @@ impl Interp {
         args: *const crate::value::Value,
         argc: usize,
     ) -> Result<Value, Abrupt> {
-        // --- committed: identical to call_jit_fast's committed path ---
+        // --- committed: the call's bookkeeping, as call_jit_fast's committed path makes it ---
         #[cfg(test)]
         TEST_ENTERED_CODE.with(|entered| entered.set(code.mem_ptr() as usize));
-        self.depth += 1;
-        if execution_stack_exhausted(self.depth) {
-            self.depth -= 1;
-            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
-        }
-        if let Err(e) = self.gc_check_amortized() {
-            self.depth -= 1;
-            return Err(e);
-        }
-        let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = if ic.direct & crate::bytecode::CALL_IC_LEXICAL_THIS != 0 {
-            self.new_target
-        } else {
-            std::mem::replace(&mut self.new_target, Value::Undefined)
-        };
-        self.fn_frames.push(FnFrame {
-            fn_ptr: ic.callee,
-            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
-            strict: ic.strict,
-            construct: false,
-            extra: None,
-        });
+        self.enter_call_depth()?;
+        let entry = self.push_call_frame(
+            ic.callee,
+            ic.strict,
+            ic.direct & crate::bytecode::CALL_IC_LEXICAL_THIS != 0,
+        );
         // The caller retains the callee, whose UserCallable traces this environment through
         // the call. Reconstructing this Copy Env handle registers no root or owner.
         let env = std::mem::ManuallyDrop::new(unsafe { Env::from_raw(ic.env) });
@@ -16622,7 +16614,7 @@ impl Interp {
         // OrdinaryCallBindThis on the copied receiver word, over `ic.strict` and the fill-time
         // `uses_this`: `bind_this_word` binds it on its tag.
         let this_val = self.bind_this_word(unsafe { this_slot.read() }, ic.uses_this, ic.strict);
-        let mut r = with_execution_stack(self.depth, || unsafe {
+        let r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved(
                 self,
                 chunk,
@@ -16634,10 +16626,68 @@ impl Interp {
                 (ic.n_params as usize, ic.n_slots as usize),
             )
         });
+        self.leave_call_frame(entry, r)
+    }
+
+    /// A call's entry's first half: the depth and its check, which throws the RangeError a call
+    /// past the limit throws, and the amortized collection check; the depth given back where
+    /// either fails. The cached call paths read their callee's facts after it, for
+    /// [`Interp::push_call_frame`], so that no value lives across its collection.
+    #[inline(always)]
+    pub(crate) fn enter_call_depth(&mut self) -> Result<(), Abrupt> {
+        self.depth += 1;
+        if execution_stack_exhausted(self.depth) {
+            self.depth -= 1;
+            return Err(self.throw("RangeError", "Maximum call stack size exceeded"));
+        }
+        if let Err(e) = self.gc_check_amortized() {
+            self.depth -= 1;
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    /// A call's entry's second half: the construct state saved and cleared (an arrow keeps
+    /// `new.target`) and the callee's FnFrame (`fn_ptr`, its strictness), which takes the call's
+    /// position from `call_site`.
+    #[inline(always)]
+    pub(crate) fn push_call_frame(
+        &mut self,
+        fn_ptr: usize,
+        strict: bool,
+        lexical_this: bool,
+    ) -> CallEntry {
+        let saved_ctor = std::mem::replace(&mut self.constructing, false);
+        let saved_nt = if lexical_this {
+            self.new_target
+        } else {
+            std::mem::replace(&mut self.new_target, Value::Undefined)
+        };
+        self.fn_frames.push(FnFrame {
+            fn_ptr,
+            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
+            strict,
+            construct: false,
+            extra: None,
+        });
+        CallEntry {
+            saved_ctor,
+            saved_nt,
+        }
+    }
+
+    /// A call's bookkeeping after its callee's run completed with `r` ([`Interp::enter_call_frame`]'s
+    /// pair): the FnFrame popped, the construct state restored, a pending tail call run (the
+    /// proper-tail-call trampoline, exactly like `call`), the depth given back.
+    #[inline(always)]
+    pub(crate) fn leave_call_frame(
+        &mut self,
+        entry: CallEntry,
+        mut r: Result<Value, Abrupt>,
+    ) -> Result<Value, Abrupt> {
         self.pop_fn_frame();
-        self.constructing = saved_ctor;
-        self.new_target = saved_nt;
-        // Proper-tail-call trampoline, exactly like `call`.
+        self.constructing = entry.saved_ctor;
+        self.new_target = entry.saved_nt;
         while r.is_ok() {
             match self.run_pending_tail(false) {
                 Some(next) => r = next,
@@ -17935,30 +17985,10 @@ impl Interp {
             }
         }
         // Committed: retain the caller's immutable argument/receiver window through the call.
-        self.depth += 1;
-        if execution_stack_exhausted(self.depth) {
-            self.depth -= 1;
-            return Some(Err(
-                self.throw("RangeError", "Maximum call stack size exceeded")
-            ));
-        }
-        if let Err(e) = self.gc_check_amortized() {
-            self.depth -= 1;
+        if let Err(e) = self.enter_call_depth() {
             return Some(Err(e));
         }
-        let saved_ctor = std::mem::replace(&mut self.constructing, false);
-        let saved_nt = if func.is_arrow {
-            self.new_target
-        } else {
-            std::mem::replace(&mut self.new_target, Value::Undefined)
-        };
-        self.fn_frames.push(FnFrame {
-            fn_ptr: Gc::as_ptr(o) as usize,
-            call_site: std::mem::replace(&mut self.call_site, crate::stack_trace::NO_POSITION),
-            strict: func.is_strict,
-            construct: false,
-            extra: None,
-        });
+        let entry = self.push_call_frame(Gc::as_ptr(o) as usize, func.is_strict, func.is_arrow);
         let this_val = self.bind_this_word(
             unsafe { this_slot.read() },
             chunk.needs_frame_this(),
@@ -17974,7 +18004,7 @@ impl Interp {
             realm,
             Env::as_ptr(&self.global_env) as usize,
         );
-        let mut r = with_execution_stack(self.depth, || unsafe {
+        let r = with_execution_stack(self.depth, || unsafe {
             crate::jit::run_moved(
                 self,
                 chunk,
@@ -17986,18 +18016,7 @@ impl Interp {
                 chunk.jit_frame(),
             )
         });
-        self.pop_fn_frame();
-        self.constructing = saved_ctor;
-        self.new_target = saved_nt;
-        // Proper-tail-call trampoline, exactly like `call`.
-        while r.is_ok() {
-            match self.run_pending_tail(false) {
-                Some(next) => r = next,
-                None => break,
-            }
-        }
-        self.depth -= 1;
-        Some(r)
+        Some(self.leave_call_frame(entry, r))
     }
 
     fn call_user_inner(
