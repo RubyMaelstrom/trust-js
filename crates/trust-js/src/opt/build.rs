@@ -376,6 +376,9 @@ impl Rules<'_> {
         match self.ops[pc] {
             Op::Const(k) => const_word(self.chunk, k).is_some(),
             Op::LoadLocal(_) => self.initialized.contains(pc),
+            Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq => {
+                self.equality_lowers(pc) && !flagged(&[ExitReason::NotNumber])
+            }
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Gt | Op::Le | Op::Ge => {
                 self.numbers(pc, true).is_some() && !flagged(&[ExitReason::NotNumber])
             }
@@ -464,6 +467,60 @@ impl Rules<'_> {
             | Op::IterAbortIfNotDoneL(..) => true,
             _ => false,
         }
+    }
+
+    /// Whether the equality at `pc` lowers whatever facts its block's entry brings: its two
+    /// operands made in its block by operations the builder gives a Number (a Number constant, a
+    /// bitwise or arithmetic operation these rules lower), or under `===` and `!==` one of them a
+    /// constant no other value equals: the cases of `Builder::equality` the operations alone
+    /// prove. Any other equality may still lower from the builder's facts, which the prepass
+    /// cannot see: it counts as a possible effect, as before (P3 stage 3 step 0b; asm.js-style
+    /// code's loop conditions, `(k | 0) != 0`, are of the first kind).
+    fn equality_lowers(&self, pc: usize) -> bool {
+        let strict = matches!(self.ops[pc], Op::StrictEq | Op::StrictNotEq);
+        let (Some(a), Some(b)) = (self.producer(pc, 1), self.producer(pc, 0)) else {
+            return false;
+        };
+        let number = |p: usize| match self.ops[p] {
+            Op::Const(k) => const_word(self.chunk, k).and_then(number_word).is_some(),
+            Op::BitAnd
+            | Op::BitOr
+            | Op::BitXor
+            | Op::Shl
+            | Op::Shr
+            | Op::UShr
+            | Op::BitNot
+            | Op::Add
+            | Op::Sub
+            | Op::Mul
+            | Op::Div
+            | Op::Mod
+            | Op::Neg
+            | Op::Plus => self.lowers(p),
+            _ => false,
+        };
+        let identity = |p: usize| match self.ops[p] {
+            Op::Const(k) => const_word(self.chunk, k).is_some_and(identity_constant),
+            Op::Undef => true,
+            _ => false,
+        };
+        (number(a) && number(b)) || (strict && (identity(a) || identity(b)))
+    }
+
+    /// The operation of `pc`'s block that pushed the operand `below` places under the top of the
+    /// stack at `pc` (0: the top), where one did and that value was its only push.
+    fn producer(&self, pc: usize, below: usize) -> Option<usize> {
+        let start = self.cfg.blocks()[ix(self.cfg.block_at(pc)?)].start;
+        let place = self.cfg.stack_depth_at(pc)?.checked_sub(below + 1)?;
+        for p in (start..pc).rev() {
+            let (pops, pushes) = self.chunk.jit_stack_effect(p)?;
+            let base = self.cfg.stack_depth_at(p)?.checked_sub(pops)?;
+            if base <= place {
+                // `p` wrote the place, or took it, which a later operation would have written.
+                return (pushes == 1 && place == base).then_some(p);
+            }
+        }
+        None
     }
 
     /// The value record of an arithmetic, relational, unary (Neg, Plus) or update operation at
@@ -2948,7 +3005,9 @@ impl<'a> Builder<'a> {
                 same
             }
         } else {
-            return self.effect(pc, st);
+            // The effect, unless the rules counted the equality lowered (`Rules::equality_lowers`,
+            // which these facts should then hold): an exit there, which the recompile declines.
+            return self.mismatch(pc, ExitReason::NotNumber, st);
         };
         st.stack.truncate(len - 2);
         st.stack.push(result);

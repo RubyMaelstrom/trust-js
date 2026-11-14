@@ -4443,6 +4443,79 @@ fn a_loop_with_an_effect_reloads_and_checks_its_invariant_slots_as_before() {
 }
 
 #[test]
+fn a_loop_whose_equalities_compare_numbers_its_blocks_made_is_free_of_effects() {
+    // `((i | 0) & 1) == 0`, `(s | 0) !== -1` and `i !== undefined` lower whatever the facts at
+    // the loop's entry (Rules::equality_lowers: bitwise results and Number constants, a constant
+    // no other value equals): the loop has no effect, so `a`, which it reads and does not write,
+    // is loaded once at its entry and never reloaded in it (P3 stage 3 step 0b).
+    let mut engine = warmed(
+        "function eqs(g, a, n) { var s = 0; g();
+           for (var i = 0; i < n; i++) {
+             if (((i | 0) & 1) == 0) s = s + a;
+             if ((s | 0) !== -1 && i !== undefined) s = s + 1;
+           }
+           return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) eqs(nothing, 1.5, 10);",
+        "for (var r = 0; r < 20; r++) eqs(nothing, 1.5, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "eqs");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, the_loop(&graph));
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    for node in &graph.nodes {
+        if lp.members[node.block.index()] {
+            assert!(!is_effect(&node.op), "an effect in the loop: {text}");
+            assert!(
+                !matches!(node.op, NodeOp::FrameSlot(_)),
+                "a reload in the loop: {text}"
+            );
+        }
+    }
+    let [load] = loads_of(&graph, &chunk, "a")[..] else {
+        panic!("one load of a: {text}")
+    };
+    assert_eq!(graph.node(load).block.index(), entry, "{text}");
+}
+
+#[test]
+fn a_loop_comparing_words_from_the_frame_counts_its_equality_an_effect() {
+    // `a == b` on two locals the loop's block did not make, and `a == undefined`, whose constant
+    // decides nothing under `==`: the rules cannot say they lower (the builder makes the generic
+    // operation here), so the loop has an effect and reloads `a` after it, as before; the
+    // function compiles, its prepass and its builder agreeing.
+    for test in ["a == b", "a == undefined"] {
+        let mut engine = warmed(
+            &format!(
+                "function eqf(g, a, b, n) {{ var s = 0; g();
+                   for (var i = 0; i < n; i++) {{ if ({test}) s = s + a; }} return s; }}
+                 function nothing() {{}}
+                 for (var r = 0; r < 20; r++) eqf(nothing, 1.5, '1.5', 10);"
+            ),
+            "for (var r = 0; r < 20; r++) eqf(nothing, 1.5, '1.5', 10);",
+        );
+        let (chunk, graph) = graph_of(&mut engine, "eqf");
+        let text = dump(&graph, &chunk);
+        let lp = loop_at(&graph, the_loop(&graph));
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| lp.members[node.block.index()] && is_effect(&node.op)),
+            "{test}: the equality's effect in the loop: {text}"
+        );
+        assert!(
+            loads_of(&graph, &chunk, "a")
+                .iter()
+                .any(|&load| lp.members[graph.node(load).block.index()]),
+            "{test}: a reload of a in the loop: {text}"
+        );
+    }
+}
+
+#[test]
 fn a_slot_the_loop_writes_keeps_its_phi_and_its_entry_speculation() {
     // `s`, in the frame's keeping at the entry and written in the loop, takes a phi whose entry
     // input is its load (stage 2 step 6's PhiNotNumber speculation), never the invariant rule.
