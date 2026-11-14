@@ -931,6 +931,10 @@ fn append_counts() -> (usize, usize, usize) {
 #[test]
 #[cfg(target_arch = "aarch64")]
 fn native_define_element_remembers_old_heap_append_and_same_length_regrowth() {
+    // It counts the appends generated code commits, and a forced exit that lands on one hands it
+    // to the VM (at TRUST_JS_OPT_EXIT_EVERY=100, 101 and 103 since step 3a moved the countdown's
+    // phase; not at 97, 99 or 250): the tier as the environment sets it, without forced exits.
+    crate::opt::pin_forced_exits_off_for_test();
     const CHILD: &str = "TRUST_JS_REMEMBERED_NATIVE_APPEND_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
