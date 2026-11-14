@@ -4037,3 +4037,62 @@ owner's choice of the same day): with the tier on, template code records its in-
   SpiderMonkey and JSC ship with profile-guided optimization and ordered text. A measured
   experiment (PGO or a link order file from the fixtures' and Octane's profiles) would say what
   it is worth and would also steady these readings.
+
+Stage 3 step 2 landed (de39cacd, 945d2435, 7a0f5f61, 320a9b10, 0228810f, 2026-11-14; target/p3/
+stage3/step2-impl, report.txt and design-note.txt): the graph inliner for callees without effects,
+behind TRUST_JS_OPT_INLINE=graph. The default stays splice, at which the tier's code is identical
+after normalization (1,339 of 1,339 compiles) and the tier off's template code identical.
+- At graph, a function whose inline plan's ways are all leaves is compiled in place on its first
+  stage with its callees built into its graph, each behind the guard a splice has and in an
+  inlined frame of step 1's; every other plan splices as before.
+- The oracle (opt/oracle.rs), on the main thread at the job's preparation, as SpiderMonkey's
+  WarpOracle snapshots each inlined script there (jit/WarpOracle.cpp:1404-1554): the splice
+  planner's ways (the same decisions, so that the step measures the mechanism), each distinct
+  callee first-stage chunk frozen and copied once a job (its last-seen element bytes merged
+  first, rule U; its exit profile read as an inlined frame's), each way's guard data and its
+  closure's environment records folded, the callees pinned. 0.004-0.011 ms a job.
+- The builder (opt/build_inline.rs): a nested builder over the callee's chunk into the same
+  graph from the current block, as Maglev's BuildEagerInlineCall runs a second graph builder
+  (maglev-graph-builder.cc:7669-7744): formals from the call's operands, missing ones undefined;
+  `this` the receiver; the environment the pinned closure's, a constant under the guard; each
+  return a jump to the continuation at the call's pc + 1, joined by the caller's own merge; value
+  and heap facts flow in and back (no effect ran). A site's guards form a chain: a guard whose
+  WrongCallee flag reached its place is a test and a branch to the next way, the first unflagged
+  one a check that ends the chain; all flagged, the generic call follows. Such a call with no
+  generic call left counts as lowered in the caller's loop prepass.
+- E0: a callee with an operation the tier leaves to its template is not inlined; its call stays
+  a call (generic nodes in inlined frames are step 3c's). An effect met in an inlined frame after
+  all refuses the compile, and a refused graph compile's function splices at its next checkpoint.
+- JSC's loop rule (D12): an exit through an inlined frame whose callee's first stage tried to
+  enter a loop takes the loop limit at once (dfg/DFGOSRExitCompilerCommon.cpp:70-104).
+- A reoptimization takes the ways its first compile took, as a second stage keeps its splices
+  (re-planning at each compile made each new callee cost a discard of its own: Richards' four-way
+  site 233 exits against the splice's 100); re-planning comes with the policy (step 8).
+- Graph against splice on one binary (fat LTO): 514 ways inlined, 117 declined by E0 (EqEq 21,
+  GetProp 18, NotEq 16, GetPropThis 11, GetElem 11, TypeofIs 10, AppendProp 10, others 20), 297
+  plans left to the splice for a callee that calls. Instructions at 5 fixed runs: Djot -1.08%
+  (steady state -0.89%), Mandreel -0.29%, Richards -0.24%, Crypto -0.19%; Earley-Boyer +2.63%,
+  GBEMU +1.48%, Vue +0.40% (steady +0.53%); Octane's geomean +0.22%. At 200 fixed runs Box2D
+  +0.98%, Earley-Boyer +3.03%, GBEMU +1.32%. Timed on X925 cores, 5 rounds: Mandreel +0.45%,
+  Box2D -0.19%, GBEMU -1.86%, Djot's steady state 0. Djot's compile bar on the same binary and
+  cores: 3.66% at splice, 3.13% at graph; the recompile part falls by 0.278 ms, as the design
+  expected (0.28 ms). No exit through an inlined frame in any workload: those paths run in the
+  tests, under forced exits (578 in difftest's inlining corpus) and nowhere else yet.
+- Why graph is slower where it is: E0's declined callees stay calls where the splice inlined them
+  (a diagnostic that splices any plan with a declined way: Box2D +0.98% -> -0.03%, Vue +0.40% ->
+  -0.50%, DeltaBlue +0.20% -> +0.03%, Earley-Boyer +3.03% -> +0.75%, the last part not
+  explained); GBEMU is the design's risk R7: a discard of in-place code falls back to template
+  code that inlines nothing (the fallback's share 6.7% -> 16.0%), where a discarded second stage
+  fell back to spliced code. Both are for step 3 (E0) and step 4 (the default's flip) to answer;
+  graph must not lose to splice there before the flip.
+- The branch at splice against main, my count (fat LTO, target/p3/stage3/merge-check/
+  counts-s2.out): Octane's geomean -0.008% with the tier off and +0.028% with it on
+  (TypeScript's bimodal +0.42% in it); nothing else beyond 0.12%.
+- Tests: opt::inline_tests, 26 (builder: nodes and frames, returns merged, missing and extra
+  arguments, strict and sloppy `this`, guards flagged and not, a callee's loop in a caller's
+  loop, never-ran callee blocks, declines read as inlined, E0, recursion refused; end to end at
+  graph: results equal the tier off's, forced exits inside callees, exit-profile keys on the
+  callee's first stage, the loop rule, Error.stack and f.caller from an exit in a callee) in 12
+  configurations with GC stress; 26 mutations, each caught; the tier's tests (308) in the four
+  configurations at splice and at graph; difftest with a corpus of inlining shapes; zombie's
+  check, clippy, Windows' check and suite (2,822).
