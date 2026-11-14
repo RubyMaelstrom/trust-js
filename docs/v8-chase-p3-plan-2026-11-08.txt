@@ -4318,7 +4318,12 @@ explicit operands in the compiled function's frame (the owner's D6).
   under the poison; the whole library suite (3,410) with the tier off, on, on with the poison
   and on at graph; difftest and the fixtures in seven configurations; the verifier sweep (none
   refused; mine on the landed tree: 42 runs, none); zombie's check, clippy, Windows' check and
-  suite (2,865).
+  suite (2,865). On the landed tree (b5d38feb; target/p3/stage3/step3a-review): the library
+  suite 3,410 passed and none failed with the tier off, on and eager, at graph on and eager, and
+  under the poison on and eager; with forced exits, at the default and at graph, one test failed,
+  the native append's count of committed appends, which a forced exit now lands on (pinned to no
+  forced exits in 23b8af9a: a count, not a result); difftest 138 agree and the fixtures' outputs
+  the tier off's in all nine configurations.
 - Open: (1) the allocator: a loop-level reload of a spilled value (Maglev's HoistLoopReloads and
   HoistLoopSpills, maglev-regalloc.cc:2240-2313), the next allocator step, for Mandreel's and
   zlib's cycles; (2) a possible defect older than this step, being settled now: a canonical-frame
