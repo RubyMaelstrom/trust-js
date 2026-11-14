@@ -7,7 +7,9 @@
 //! home at its definition: a free register of its class; a callee-saved one (x23-x28, d8-d15) or
 //! a spill slot when the value lives across an effect or a call, which clobber every
 //! caller-saved register (contracts 4.4: helpers and templates preserve x19-x28 and d8-d15, and
-//! no baseline template touches x23-x28 or writes d8-d15). When no register is free, the held
+//! no baseline template touches x23-x28 or writes d8-d15); none of the registers a shared stub's
+//! call clobbers when it lives across a node whose own path makes that call (`clobbers`: P3
+//! stage 3 step 0b, the exemplars' clobber sets). When no register is free, the held
 //! value whose next use is the farthest gives up its register and is spilled at its definition,
 //! or the new value is when its own next use is farther (Maglev's choice). A home is the value's
 //! for its whole range, so an exit's recipe names one place per value; registers and slots free
@@ -61,6 +63,31 @@ pub(crate) fn class_of(rep: Rep) -> Option<Class> {
         Rep::None => None,
     }
 }
+
+/// The caller-saved registers that a node which is no effect clobbers by a call on its own path,
+/// as masks of x and d registers (a shared stub's, whose contract names what it writes); none
+/// for every other node. A value live across such a node takes no home among them, so that the
+/// call keeps every value it does not clobber where it is, as Maglev frees a node's specific
+/// temporaries before it (AssignFixedTemporaries, maglev/maglev-regalloc.cc:2017-2046, of
+/// RequireSpecificTemporary, maglev-ir.h:2443-2452), Ion's fixed temps cover their instruction
+/// (BacktrackingAllocator.cpp:1915-1928) and Air's patchpoint clobbers are defs at theirs
+/// (Inst::forEachDefWithExtraClobberedRegs, b3/air/AirInstInlines.h:100-121). P3 stage 3 step
+/// 0b: a TypedElement call that saved and restored every live caller-saved register was 13% of
+/// zlib's instructions.
+pub(crate) fn clobbers(op: &NodeOp) -> (u64, u64) {
+    match op {
+        // The TypedElement stub writes x9, x12-x17, d1, d2 and x30 (jit_typed_array.rs), and
+        // its call's arguments x11 (the Object), w12 (the kind tag) and d1 (a store's value).
+        // Of the registers the allocator hands out: x11-x15, d1 and d2.
+        NodeOp::TypedElement { .. } => (TYPED_ELEMENT_GP, TYPED_ELEMENT_FP),
+        _ => (0, 0),
+    }
+}
+
+/// x11, x12, x13, x14 and x15.
+const TYPED_ELEMENT_GP: u64 = (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15);
+/// d1 and d2.
+const TYPED_ELEMENT_FP: u64 = (1 << 1) | (1 << 2);
 
 /// Whether a node is a constant, which no register holds.
 pub(crate) fn rematerializable(op: &NodeOp) -> bool {
@@ -404,6 +431,17 @@ impl Pool {
         Some(r)
     }
 
+    /// The lowest-numbered free register of `free` that `avoid` does not hold.
+    fn take_but(free: &mut u64, avoid: u64) -> Option<u8> {
+        let open = *free & !avoid;
+        if open == 0 {
+            return None;
+        }
+        let r = open.trailing_zeros() as u8;
+        *free &= !(1 << r);
+        Some(r)
+    }
+
     /// Register `r` of `free`, where it is free.
     fn take_this(free: &mut u64, r: u8) -> Option<u8> {
         let bit = 1 << r;
@@ -595,6 +633,39 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         let first = calls.partition_point(|&p| p <= start);
         calls.get(first).is_some_and(|&p| p < end)
     };
+    // The positions of the nodes whose own calls clobber a few caller-saved registers
+    // (`clobbers`), with those registers: a value live across one takes no home among them.
+    let mut stub_calls: Vec<(u32, u64, u64)> = order
+        .iter()
+        .flat_map(|&b| graph.block(b).body.iter())
+        .filter_map(|&node| {
+            let (gp, fp) = clobbers(&graph.node(node).op);
+            (gp | fp != 0).then(|| (pos[node.index()], gp, fp))
+        })
+        .collect();
+    stub_calls.sort_unstable();
+    let all_clobbered = stub_calls
+        .iter()
+        .fold((0, 0), |(gp, fp), &(_, g, f)| (gp | g, fp | f));
+    let clobbered = |(start, end): (u32, u32), class: Class| {
+        // The calls at `p` with start < p < end, as for `crosses_call`.
+        let all = match class {
+            Class::Gp => all_clobbered.0,
+            Class::Fp => all_clobbered.1,
+        };
+        let first = stub_calls.partition_point(|&(p, _, _)| p <= start);
+        let mut avoid = 0u64;
+        for &(p, gp, fp) in &stub_calls[first..] {
+            if p >= end || avoid == all {
+                break;
+            }
+            avoid |= match class {
+                Class::Gp => gp,
+                Class::Fp => fp,
+            };
+        }
+        avoid
+    };
 
     // The pass: a home at each definition, freed where the range ends.
     let mut homes = vec![Home::None; n];
@@ -658,23 +729,28 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             return; // nothing reads it: the code writes it to a scratch register
         }
         let across = crosses_call(range);
+        // A value across an effect takes a callee-saved home, which no call clobbers; across a
+        // stub's call, none of the registers that call clobbers.
+        let avoid = if across { 0 } else { clobbered(range, class) };
         let pool = match class {
             Class::Gp => &mut *gp,
             Class::Fp => &mut *fp,
         };
-        let hinted = hints[v.index()].and_then(|r| {
-            if across {
-                Pool::take_this(&mut pool.callee, r)
-            } else {
-                Pool::take_this(&mut pool.caller, r)
-                    .or_else(|| Pool::take_this(&mut pool.callee, r))
-            }
-        });
+        let hinted = hints[v.index()]
+            .filter(|&r| avoid & (1 << r) == 0)
+            .and_then(|r| {
+                if across {
+                    Pool::take_this(&mut pool.callee, r)
+                } else {
+                    Pool::take_this(&mut pool.caller, r)
+                        .or_else(|| Pool::take_this(&mut pool.callee, r))
+                }
+            });
         let mut register = hinted.or_else(|| {
             if across {
                 Pool::take(&mut pool.callee)
             } else {
-                Pool::take(&mut pool.caller).or_else(|| Pool::take(&mut pool.callee))
+                Pool::take_but(&mut pool.caller, avoid).or_else(|| Pool::take(&mut pool.callee))
             }
         });
         if register.is_none() {
@@ -684,8 +760,12 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             // one, which nothing else has held.
             let def = range.0;
             let fits = |home: Home| match (home, class) {
-                (Home::Gp(r), Class::Gp) => !across || file.gp_callee.contains(&r),
-                (Home::Fp(r), Class::Fp) => !across || file.fp_callee.contains(&r),
+                (Home::Gp(r), Class::Gp) => {
+                    (!across || file.gp_callee.contains(&r)) && avoid & (1 << r) == 0
+                }
+                (Home::Fp(r), Class::Fp) => {
+                    (!across || file.fp_callee.contains(&r)) && avoid & (1 << r) == 0
+                }
                 _ => false,
             };
             let victim = active
@@ -849,6 +929,22 @@ pub(crate) mod tests {
                     alloc.homes[a]
                 );
             }
+            for (v, node) in graph.nodes.iter().enumerate() {
+                let p = alloc.pos[v];
+                if p == u32::MAX || !(sa < p && p < ea) {
+                    continue;
+                }
+                let (gp, fp) = clobbers(&node.op);
+                assert!(
+                    match alloc.homes[a] {
+                        Home::Gp(r) => gp & (1 << r) == 0,
+                        Home::Fp(r) => fp & (1 << r) == 0,
+                        _ => true,
+                    },
+                    "value {a} lives across node {v}'s stub call in {:?}, which it clobbers",
+                    alloc.homes[a]
+                );
+            }
             for &b in &held[k + 1..] {
                 let (sb, eb) = alloc.ranges[b];
                 if sa <= eb && sb <= ea {
@@ -943,6 +1039,212 @@ pub(crate) mod tests {
         // The projection is defined after the effect: a caller-saved register will do.
         assert_eq!(alloc.homes[r.index()], Home::Gp(0));
         assert_eq!(alloc.live_at(call), vec![a]);
+    }
+
+    #[test]
+    fn values_live_across_a_typed_element_call_take_no_register_its_stub_clobbers() {
+        // Fourteen words and three f64s live across a TypedElement call, whose stub clobbers
+        // x11-x15, d1 and d2 (`clobbers`): taken lowest first, they would sit in x2-x8, x10-x15
+        // and x23 and in d0-d2, and the call would have to save them.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        g.entry = Some(entry);
+        let a = g.add_node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+        let i = g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let s = state(&mut g, 1, &[a, i]);
+        let exiting = |g: &mut Graph, op: NodeOp, inputs: &[NodeIx], rep: Rep| {
+            let n = g.add_node(entry, op, inputs, rep, 1);
+            g.node_mut(n).state = Some(s);
+            n
+        };
+        let words: Vec<NodeIx> = (0..14)
+            .map(|_| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0))
+            .collect();
+        let floats: Vec<NodeIx> = words[..3]
+            .iter()
+            .map(|&w| exiting(&mut g, NodeOp::CheckNumber, &[w], Rep::F64))
+            .collect();
+        let cell = exiting(&mut g, NodeOp::CheckObject, &[a], Rep::Cell);
+        let number = exiting(&mut g, NodeOp::CheckNumber, &[i], Rep::F64);
+        let index = exiting(&mut g, NodeOp::CheckIndex, &[number], Rep::I32);
+        let element = exiting(
+            &mut g,
+            NodeOp::TypedElement { write: false },
+            &[cell, index],
+            Rep::Tagged,
+        );
+        let mut acc = element;
+        for &w in &words {
+            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 2);
+            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2);
+        }
+        let mut sum = floats[0];
+        for &f in &floats[1..] {
+            sum = g.add_node(entry, NodeOp::F64Add, &[sum, f], Rep::F64, 2);
+        }
+        let boxed = g.add_node(entry, NodeOp::F64ToTagged, &[sum], Rep::Tagged, 2);
+        let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, boxed], Rep::Bool, 2);
+        let result = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2);
+        g.add_node(entry, NodeOp::Return, &[result], Rep::None, 3);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        let (gp, fp) = clobbers(&NodeOp::TypedElement { write: false });
+        for &v in words.iter().chain(&floats) {
+            match alloc.homes[v.index()] {
+                Home::Gp(r) => assert_eq!(gp & (1 << r), 0, "word {v:?} in x{r}"),
+                Home::Fp(r) => assert_eq!(fp & (1 << r), 0, "f64 {v:?} in d{r}"),
+                home => panic!("value {v:?} in {home:?}"),
+            }
+        }
+        // The rule binds only values across the call: its own inputs still take those registers.
+        assert!(
+            [cell, index]
+                .iter()
+                .any(|v| matches!(alloc.homes[v.index()], Home::Gp(r) if gp & (1 << r) != 0)),
+            "{:?} {:?}",
+            alloc.homes[cell.index()],
+            alloc.homes[index.index()]
+        );
+        // Six words beyond x0-x8 and x10 (two hold `a` and `i` until the call): callee-saved.
+        assert!(!alloc.callee_saved_gp.is_empty());
+        assert_eq!(alloc.spill_bytes, 0);
+    }
+
+    #[test]
+    fn a_back_edges_value_across_a_typed_element_call_skips_its_phis_clobbered_register() {
+        // entry: eleven words read after the loop (x0-x8, x10, x23 through it), a's cell; jump
+        // header.
+        // header: p = phi(0, next); poll; branch p < 100. body: next = p | 1; TypedElement(cell,
+        // next); jump header. exit: the words. `p`, read only before the call, takes x11 and
+        // hints it to `next`, its back edge's value, which lives across the call: not there.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let body = g.add_block(2, false);
+        let exit = g.add_block(3, false);
+        g.entry = Some(entry);
+        g.add_edge(entry, header);
+        g.add_edge(header, body);
+        g.add_edge(header, exit);
+        g.add_edge(body, header);
+        let words: Vec<NodeIx> = (0..11)
+            .map(|_| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0))
+            .collect();
+        let a = g.add_node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+        let s = state(&mut g, 0, &[]);
+        let cell = g.add_node(entry, NodeOp::CheckObject, &[a], Rep::Cell, 0);
+        g.node_mut(cell).state = Some(s);
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let p = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
+        let ps = state(&mut g, 1, &[]);
+        let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
+        g.node_mut(poll).state = Some(ps);
+        let hundred = g.add_node(header, NodeOp::ConstI32(100), &[], Rep::I32, 1);
+        let lt = g.add_node(
+            header,
+            NodeOp::I32Cmp(Cond::Lt),
+            &[p, hundred],
+            Rep::Bool,
+            1,
+        );
+        g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: body,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            1,
+        );
+        let one = g.add_node(body, NodeOp::ConstI32(1), &[], Rep::I32, 2);
+        let next = g.add_node(body, NodeOp::I32Or, &[p, one], Rep::I32, 2);
+        let bs = state(&mut g, 2, &[]);
+        let te = g.add_node(
+            body,
+            NodeOp::TypedElement { write: false },
+            &[cell, next],
+            Rep::Tagged,
+            2,
+        );
+        g.node_mut(te).state = Some(bs);
+        g.node_mut(p).inputs.push(next);
+        g.add_node(body, NodeOp::Jump(header), &[], Rep::None, 2);
+        let mut acc = words[0];
+        for &w in &words[1..] {
+            let same = g.add_node(exit, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 3);
+            acc = g.add_node(exit, NodeOp::BoolToTagged, &[same], Rep::Tagged, 3);
+        }
+        g.add_node(exit, NodeOp::Return, &[acc], Rep::None, 3);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        let (gp, _) = clobbers(&NodeOp::TypedElement { write: false });
+        assert!(
+            matches!(alloc.homes[p.index()], Home::Gp(r) if gp & (1 << r) != 0),
+            "the phi in {:?}",
+            alloc.homes[p.index()]
+        );
+        assert_ne!(alloc.homes[next.index()], alloc.homes[p.index()]);
+    }
+
+    #[test]
+    fn a_value_across_a_typed_element_call_takes_no_victims_clobbered_register() {
+        // Every x register holds a word when `v`, read after a TypedElement call, is defined:
+        // ten read soon (x0-x8 and x10; x9 is the code generator's), five read late but before
+        // the call (x11-x15), six read soon (x23-x28). The only words read later than `v` sit
+        // in registers the call clobbers, so no victim gives `v` its register: `v` spills.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        g.entry = Some(entry);
+        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let soon: Vec<NodeIx> = (0..10).map(|_| word(&mut g)).collect();
+        let late: Vec<NodeIx> = (0..5).map(|_| word(&mut g)).collect();
+        let soon2: Vec<NodeIx> = (0..6).map(|_| word(&mut g)).collect();
+        let v = g.add_node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+        let chain = |g: &mut Graph, mut acc: NodeIx, words: &[NodeIx]| {
+            for &w in words {
+                let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 1);
+                acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 1);
+            }
+            acc
+        };
+        let acc = chain(&mut g, soon[0], &soon[1..]);
+        let acc = chain(&mut g, acc, &soon2);
+        let acc = chain(&mut g, acc, &[v]);
+        let acc = chain(&mut g, acc, &late);
+        let s = state(&mut g, 1, &[]);
+        let exiting = |g: &mut Graph, op: NodeOp, inputs: &[NodeIx], rep: Rep| {
+            let n = g.add_node(entry, op, inputs, rep, 1);
+            g.node_mut(n).state = Some(s);
+            n
+        };
+        let cell = exiting(&mut g, NodeOp::CheckObject, &[acc], Rep::Cell);
+        let number = exiting(&mut g, NodeOp::CheckNumber, &[acc], Rep::F64);
+        let index = exiting(&mut g, NodeOp::CheckIndex, &[number], Rep::I32);
+        let te = exiting(
+            &mut g,
+            NodeOp::TypedElement { write: false },
+            &[cell, index],
+            Rep::Tagged,
+        );
+        let last = chain(&mut g, te, &[v]);
+        g.add_node(entry, NodeOp::Return, &[last], Rep::None, 2);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        let (gp, _) = clobbers(&NodeOp::TypedElement { write: false });
+        for &w in &late {
+            assert!(
+                matches!(alloc.homes[w.index()], Home::Gp(r) if gp & (1 << r) != 0),
+                "a late word in {:?}",
+                alloc.homes[w.index()]
+            );
+        }
+        assert!(
+            matches!(alloc.homes[v.index()], Home::Spill(_)),
+            "v in {:?}",
+            alloc.homes[v.index()]
+        );
     }
 
     #[test]

@@ -3821,6 +3821,193 @@ fn typed_stores_keep_the_buffers_dirty_ranges_and_generation() {
     assert_eq!(eval(&mut engine, "Array.from(t).join()"), "0,7,0,8,0,0,0,0");
 }
 
+// ---- a stub's call and the values across it (P3 stage 3 step 0b) ----
+
+/// `geti(a, i)`: LoadLocal 1, GetElemLocal 0 at pc 1, then `r`, which the VM returns where it
+/// reads an element, and `i` where it reads undefined.
+const GETI: &str = "function geti(a, i) { var r = a[i]; return r === undefined ? i : r; } \
+     geti(new Int8Array(2), 0);";
+
+/// Fillers live across `geti`'s TypedElement call: `i` + 1 .. `i` + FILLERS.
+const FILLERS: i32 = 12;
+
+/// `geti(a, i)` through the template's TypedElement stub, with `i`, its int32 and FILLERS int32s
+/// of it live across the stub's call (x0-x8, x10 and callee-saved registers, none of the x11-x15 the
+/// call clobbers), three of those as f64s too, and a second read of `i` that only the call's exit
+/// state holds (in a register the call clobbers): the code returns the element plus `i` plus the
+/// fillers, and where the stub
+/// declines it exits at the GetElemLocal with `i` on the stack and in its slot. Returns the graph
+/// and that second read.
+fn typed_get_across() -> (Graph, NodeIx) {
+    let mut b = Build::new(3);
+    let entry = b.block(0, false);
+    let i0 = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let at_fill = b.state(1, &[i0], &[], &[]);
+    let fy = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[i0],
+        Rep::F64,
+        1,
+        at_fill,
+        ExitReason::NotNumber,
+    );
+    let iy = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[fy],
+        Rep::I32,
+        1,
+        at_fill,
+        ExitReason::NotInt32,
+    );
+    let fillers: Vec<NodeIx> = (1..=FILLERS)
+        .map(|k| {
+            let c = b.node(entry, NodeOp::ConstI32(k), &[], Rep::I32, 1);
+            b.exiting(
+                entry,
+                NodeOp::I32Add,
+                &[iy, c],
+                Rep::I32,
+                1,
+                at_fill,
+                ExitReason::Overflow,
+            )
+        })
+        .collect();
+    // Three of them as f64s across the call too (d0 and two of d3-d29, not the d1 and d2 the
+    // stub writes).
+    let wide: Vec<NodeIx> = fillers[..3]
+        .iter()
+        .map(|&v| b.node(entry, NodeOp::I32ToF64, &[v], Rep::F64, 1))
+        .collect();
+    let a = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 1);
+    let i = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at_get = b.state(1, &[i], &[(1, i)], &[]);
+    let check = |b: &mut Build, op: NodeOp, inputs: &[NodeIx], rep: Rep, reason: ExitReason| {
+        b.exiting(entry, op, inputs, rep, 1, at_get, reason)
+    };
+    let cell = check(
+        &mut b,
+        NodeOp::CheckObject,
+        &[a],
+        Rep::Cell,
+        ExitReason::NotObject,
+    );
+    let number = check(
+        &mut b,
+        NodeOp::CheckNumber,
+        &[i],
+        Rep::F64,
+        ExitReason::NotNumber,
+    );
+    let index = check(
+        &mut b,
+        NodeOp::CheckIndex,
+        &[number],
+        Rep::I32,
+        ExitReason::NotInt32,
+    );
+    let element = check(
+        &mut b,
+        NodeOp::TypedElement { write: false },
+        &[cell, index],
+        Rep::Tagged,
+        ExitReason::OutOfBounds,
+    );
+    // After the read (pc 2, the element on the stack), `i0` still holds slot 1.
+    let after = b.state(2, &[element], &[(1, i0)], &[]);
+    let mut total = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[element],
+        Rep::F64,
+        2,
+        after,
+        ExitReason::NotNumber,
+    );
+    for &v in std::iter::once(&iy).chain(&fillers) {
+        let f = b.node(entry, NodeOp::I32ToF64, &[v], Rep::F64, 2);
+        total = b.node(entry, NodeOp::F64Add, &[total, f], Rep::F64, 2);
+    }
+    for &f in &wide {
+        total = b.node(entry, NodeOp::F64Add, &[total, f], Rep::F64, 2);
+    }
+    let boxed = b.node(entry, NodeOp::F64ToTagged, &[total], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    (b.g, i)
+}
+
+#[test]
+fn a_typed_element_call_saves_only_what_its_exit_reads_and_keeps_the_values_across_it() {
+    let (graph, second) = typed_get_across();
+    let alloc = crate::opt::regalloc::allocate(&graph, &crate::opt::regalloc::ARM64).unwrap();
+    let (clobbered, _) = crate::opt::regalloc::clobbers(&NodeOp::TypedElement { write: false });
+    // The case the save exists for: the exit state's read of `i` in a register the call clobbers.
+    assert!(
+        matches!(alloc.homes[second.index()], crate::opt::regalloc::Home::Gp(r) if clobbered & (1 << r) != 0),
+        "{:?}",
+        alloc.homes[second.index()]
+    );
+    let mut engine = fixture(GETI);
+    let chunk = chunk_of(&mut engine, "geti");
+    assert!(
+        matches!(
+            chunk.jit_ops()[..2],
+            [
+                crate::bytecode::Op::LoadLocal(1),
+                crate::bytecode::Op::GetElemLocal(0)
+            ]
+        ),
+        "{:?}",
+        &chunk.jit_ops()[..2]
+    );
+    let code = install(&mut engine, "geti", &graph, Options::default());
+    stress(&engine);
+    exits();
+    // The call saves one register: the exit's `i`. Before step 0b it saved every live
+    // caller-saved one, seventeen here.
+    let words = code_words(&code);
+    let tag_movz = 0xd280_000c | (u32::from(crate::value::KIND_TYPED_ARRAY_TAG) << 5);
+    let call = (1..words.len())
+        .find(|&k| words[k] >> 26 == 0b100101 && words[k - 1] == tag_movz)
+        .expect("the TypedElement call");
+    let frame = (0..call)
+        .rev()
+        .find(|&k| words[k] & 0xffc0_03ff == 0xd100_03ff)
+        .expect("the save's sp adjustment");
+    let saves = words[frame..call]
+        .iter()
+        .filter(|&&w| w & 0xbfc0_03e0 == 0xb900_03e0 || w & 0xffc0_03e0 == 0xfd00_03e0)
+        .count();
+    assert_eq!(saves, 1, "the TypedElement call's saves");
+    // `i` + the fillers + the three as f64s.
+    let fill = |k: i32| {
+        (1..=FILLERS).map(|j| k + j).sum::<i32>() + k + (1..=3).map(|j| k + j).sum::<i32>()
+    };
+    for (ctor, values) in [
+        ("Int8Array", "[-128, 127, -1, 5]"),
+        ("Float64Array", "[1.5, -0, 7, 1e300]"),
+        ("Uint16Array", "[65535, 0, 3, 9]"),
+    ] {
+        eval(&mut engine, &format!("var t = new {ctor}({values});"));
+        for k in 0..4 {
+            let element = eval(&mut engine, &format!("t[{k}]"));
+            let expected = eval(&mut engine, &format!("{element} + {}", fill(k)));
+            assert_eq!(
+                eval(&mut engine, &format!("geti(t, {k})")),
+                expected,
+                "{ctor}[{k}]"
+            );
+        }
+        assert!(exits().is_empty(), "{ctor}");
+        // Past the length the stub declines: the exit hands the VM `i` from the register the
+        // call saved, and the VM returns it.
+        assert_eq!(eval(&mut engine, "geti(t, 1000)"), "1000", "{ctor}");
+        assert_eq!(reasons(), vec![ExitReason::OutOfBounds], "{ctor}");
+    }
+}
+
 // ---- immediate operands (P3 stage 2 step 7) ----
 
 /// The words of installed code.

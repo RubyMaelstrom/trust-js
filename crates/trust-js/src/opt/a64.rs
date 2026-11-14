@@ -2647,6 +2647,46 @@ impl Gen<'_> {
         (live, size)
     }
 
+    /// Save on the native stack the values a call made on `node`'s own path clobbers
+    /// (`regalloc::clobbers`) and the code after the call still reads: those live past `node`
+    /// (none, as the allocator homes them: kept as a guard) and those of `node`'s frame state,
+    /// which its exit after the call reads. Its inputs, read before the call, are not. Maglev's
+    /// register snapshot of a node likewise takes its eager deopt's inputs
+    /// (maglev/maglev-regalloc.cc:1708-1730). Returns what `restore_live_caller_saved` restores.
+    fn save_live_clobbered(&mut self, node: NodeIx) -> (Vec<(bool, u32)>, u32) {
+        let (gp, fp) = regalloc::clobbers(&self.graph.node(node).op);
+        let at = self.alloc.pos[node.index()];
+        let state = self.graph.node(node).state.map(|s| self.graph.state(s));
+        let in_state = |v: NodeIx| {
+            state.is_some_and(|state| {
+                state.stack.contains(&v) || state.slots.contains(&SlotSource::Value(v))
+            })
+        };
+        let live: Vec<(bool, u32)> = self
+            .alloc
+            .live_at(node)
+            .into_iter()
+            .filter(|&v| self.alloc.ranges[v.index()].1 > at || in_state(v))
+            .filter_map(|v| match self.home(v) {
+                Home::Gp(r) if gp & (1 << r) != 0 => Some((false, u32::from(r))),
+                Home::Fp(r) if fp & (1 << r) != 0 => Some((true, u32::from(r))),
+                _ => None,
+            })
+            .collect();
+        let size = (8 * live.len() as u32).next_multiple_of(16);
+        if size > 0 {
+            self.a.sub_imm(31, 31, size);
+        }
+        for (k, &(fp, r)) in live.iter().enumerate() {
+            if fp {
+                self.a.str_d_imm(r, 31, 8 * k as u32);
+            } else {
+                self.a.str_imm(r, 31, 8 * k as u32);
+            }
+        }
+        (live, size)
+    }
+
     fn restore_live_caller_saved(&mut self, (live, size): &(Vec<(bool, u32)>, u32)) {
         for (k, &(fp, r)) in live.iter().enumerate() {
             if fp {
@@ -2987,8 +3027,11 @@ impl Gen<'_> {
 
     /// TypedElement: the template's TypedElement stub on its register contract (x11 the Object,
     /// x9 the index, w12 the kind tag, d1 a store's value -> w13 1 or 0, x12 a load's word; it
-    /// clobbers x9, x12-x17, d1, d2 and x30: jit_typed_array.rs), the live caller-saved values
-    /// saved around it, as the cold paths' calls save them. A 0 exits.
+    /// clobbers x9, x12-x17, d1, d2 and x30: jit_typed_array.rs). The allocator gives no value
+    /// live across the call a register the call clobbers (`regalloc::clobbers`), so the call
+    /// saves only the values its exit reads that sit in one (P3 stage 3 step 0b: saving every
+    /// live caller-saved register, as a cold path's call does, cost 13% of zlib's instructions).
+    /// A 0 exits.
     fn lower_typed_element(&mut self, n: NodeIx, write: bool) -> Result<(), Refusal> {
         let node = self.graph.node(n);
         let site = self.check_exit(n)?;
@@ -2999,7 +3042,7 @@ impl Gen<'_> {
         } else {
             None
         };
-        let saved = self.save_live_caller_saved(n);
+        let saved = self.save_live_clobbered(n);
         // The index first: x11 may be its home.
         self.a.mov_w(X9, index);
         self.a.add_imm(11, cell, self.layout.obj_from_cell as u32);
