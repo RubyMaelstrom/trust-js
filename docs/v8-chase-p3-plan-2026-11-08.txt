@@ -3721,3 +3721,11 @@ oddballs, the small callees' calls, and the exit gates' fixes.
   entry-word compare (designed); rule U's record filling; Crypto's am3 out-of-bounds recompile; the
   73% of effects the tier does not lower yet (stage 3's step 3); the tier's own code in the holey
   loop (+2% instructions); the tier off's Box2D reading above.
+
+The tier off's Box2D, read with fixed runs (2026-11-14; target/p3/stage2/box2d-off-check, run.sh,
+summary.txt): 40 fixed runs under setarch -R on CPU 5, five rounds alternating stage 1's exit build
+and main's, beside the retention gate on other CPUs. Instructions 28.550G against 28.537G (-0.04%);
+cycles 6,784M against 6,794M (+0.15%, inside the rounds' spread) with GC pacing as shipped and
+6,865M against 6,909M (+0.64%) with it off. The exit session's -3.9% is no cost of the tier off's
+code in fixed runs: it is in Octane's timed rounds only, as Richards' reading was at 7f92ab9d.
+Closed as an open item.
