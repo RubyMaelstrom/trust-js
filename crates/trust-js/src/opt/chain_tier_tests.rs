@@ -436,3 +436,121 @@ fn a_proxy_in_the_chain_exits_at_the_walk_and_converges() {
         ExitReason::WrongShape,
     );
 }
+
+/// Polymorphic sites (P3 stage 3 step L2's dispatch on the receiver's shape): `call` over three
+/// classes' methods (A's and B's prototypes share a shape, so two walks), `own` over three own slots, `mixed` over an own slot and a
+/// walk, `two` two loads around a call; the driver redefines, deletes and shadows methods,
+/// swaps a receiver's prototype for another arm's, freezes a receiver and a prototype, and adds a
+/// fifth receiver shape late.
+pub(super) const POLY: &str = "class A { constructor() { this.a = 1; } m() { return 1; } }\n\
+     class B extends A { constructor() { super(); this.b = 2; } m() { return 2; } }\n\
+     class C { constructor() { this.c = 3; this.d = 4; } n() { return 0; } m() { return 3; } }\n\
+     function call(o) { return o.m(); }\n\
+     function own(o) { return o.x; }\n\
+     function mixed(o) { return o.m; }\n\
+     function two(o, f) { var a = o.m(); f(o); return a * 10 + o.m(); }\n\
+     function noop(o) {}\n\
+     function h(x) { return typeof x === 'number' ? x : typeof x === 'function' ? 50 + x.length : -1; }\n\
+     const rs = [new A(), new B(), new C(), new A(), new C()];\n\
+     const ps = [{x: 1}, {y: 2, x: 3}, {z: 4, w: 5, x: 6}];\n\
+     const ms = [new A(), {m: 7}];\n\
+     let t = 0;\n\
+     for (let k = 0; k < 3000; k++) {\n\
+       if (k === 500) A.prototype.m = function () { return 11; };\n\
+       if (k === 700) delete B.prototype.m;\n\
+       if (k === 900) rs[3].m = function () { return 12; };\n\
+       if (k === 1100) Object.setPrototypeOf(rs[0], C.prototype);\n\
+       if (k === 1300) { Object.freeze(rs[4]); Object.freeze(C.prototype); }\n\
+       if (k === 1500) ps[1].x = 30;\n\
+       if (k === 1700) delete ps[2].z;\n\
+       if (k === 1900) ms[1].m = function (q) { return q; };\n\
+       if (k === 2100) rs.push({q: 1, m() { return 13; }}, {r: 2, m() { return 14; }});\n\
+       const o = rs[k % rs.length];\n\
+       const f = k === 600 ? function (x) { C.prototype.m = function () { return 15; }; } \
+         : k === 1200 ? function (x) { Object.setPrototypeOf(x, A.prototype); } : noop;\n\
+       let r;\n\
+       try { r = call(o) + two(o, f); } catch (e) { r = -9; }\n\
+       t = (t * 31 + r + h(own(ps[k % 3])) + h(mixed(ms[k & 1]))) % 1000003;\n\
+     }\n\
+     t + ':' + call(rs[1]) + ':' + own(ps[1]) + ':' + h(mixed(ms[0]))";
+
+#[test]
+fn polymorphic_loads_have_the_vms_results_under_every_mutation() {
+    let expected = run(Tier::Bytecode, POLY);
+    let mut compiles = 0;
+    for (label, switches) in configurations() {
+        compiled();
+        exits();
+        assert_eq!(
+            with_switches(switches, POLY),
+            expected,
+            "{label} {switches:?}"
+        );
+        compiles += compiled().len();
+    }
+    assert!(compiles > 0, "the tier compiled the functions");
+}
+
+#[test]
+fn the_polymorphic_programs_loads_dispatch_before_its_mutations() {
+    let warm = POLY.replace("k < 3000", "k < 400");
+    let expected = run(Tier::Bytecode, &warm);
+    eager().set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, &warm), expected);
+    for name in ["call", "own", "mixed", "two"] {
+        let chunk = tier_chunk(&mut engine, name).unwrap_or_else(|| panic!("{name}'s tier chunk"));
+        assert!(
+            graph_now(&chunk)
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, super::super::ir::NodeOp::ShapeIs(_))),
+            "{name} dispatches on the receiver's shape"
+        );
+    }
+}
+
+#[test]
+fn a_polymorphic_site_settles_within_its_ways_and_then_on_the_generic_access() {
+    // Three receiver shapes dispatch with no exit; a fourth fills a way, its first calls exit
+    // until the discard and the recompile dispatches on four; a fifth makes the site generic
+    // (the cache's mark), whose recompile takes the effect: a few discards, the VM's results.
+    let source = "function S(n) { this['f' + n] = n; this.x = n; }\n\
+         function get(o) { return o.x; }\n\
+         const os = [new S(1), new S(2), new S(3)];\n\
+         let t = 0; for (let k = 0; k < 2000; k++) t = t + get(os[k % 3]);\n\
+         os.push(new S(4)); for (let k = 0; k < 3000; k++) t = t + get(os[k % 4]);\n\
+         os.push(new S(5)); for (let k = 0; k < 3000; k++) t = t + get(os[k % 5]); t";
+    let expected = run(Tier::Bytecode, source);
+    eager().set();
+    let mut engine = jit_engine();
+    exits();
+    assert_eq!(eval(&mut engine, source), expected);
+    let chunk = tier_chunk(&mut engine, "get").expect("get's tier chunk");
+    assert!(discards(&chunk) <= 3, "{} discards", discards(&chunk));
+    exits();
+    assert_eq!(
+        eval(
+            &mut engine,
+            "let u = 0; for (let k = 0; k < 500; k++) u = u + get(os[k % 5]); u"
+        ),
+        "1500"
+    );
+    assert!(exits().is_empty(), "settled");
+}
+
+#[test]
+fn an_object_at_a_strings_site_exits_at_the_tag_check_and_converges() {
+    // A string's method site meets an object of its own method: the String tag check exits (the
+    // VM calls the object's method) until the discard; the recompile takes the effect.
+    let warm = "function f(s) { return s.charCodeAt(0); }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = t + f('abc'); t";
+    converges(
+        "f",
+        warm,
+        "const odd = { charCodeAt() { return 99; } }; \
+         let u = 0; for (let k = 0; k < 600; k++) u = u + f(odd); u",
+        "f('b') + ':' + f(odd)",
+        ExitReason::WrongShape,
+    );
+}

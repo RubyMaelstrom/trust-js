@@ -582,6 +582,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::CheckObject | NodeOp::CheckShape(_) => (TAGGED, Rep::Cell),
         NodeOp::CheckProto { .. } => (CELL, Rep::Cell),
         NodeOp::CheckStringProto { .. } => (TAGGED, Rep::Cell),
+        NodeOp::ShapeIs(_) => (CELL, Rep::Bool),
         NodeOp::CheckBoolean | NodeOp::ToBoolean => (TAGGED, Rep::Bool),
         NodeOp::F64ToBoolean => (F64, Rep::Bool),
         NodeOp::I32ToF64 => (I32, Rep::F64),
@@ -795,7 +796,9 @@ fn representations(
         {
             Err(format!("slot {slot} of {n_slots}"))
         }
-        NodeOp::CheckShape(ref shapes) if shapes.is_empty() || shapes.len() > 4 => {
+        NodeOp::CheckShape(ref shapes) | NodeOp::ShapeIs(ref shapes)
+            if shapes.is_empty() || shapes.len() > 4 =>
+        {
             Err(format!("{} shapes", shapes.len()))
         }
         NodeOp::CheckProto { ref shapes, ways } | NodeOp::CheckStringProto { ref shapes, ways }

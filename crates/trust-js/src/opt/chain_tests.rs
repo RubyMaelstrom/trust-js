@@ -178,7 +178,7 @@ fn receivers_of_several_shapes_that_share_the_walk_are_checked_together() {
 }
 
 #[test]
-fn several_walks_another_kind_of_way_or_a_numbers_stay_the_effect() {
+fn another_kind_of_way_or_a_numbers_stays_the_effect() {
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
@@ -190,27 +190,31 @@ fn several_walks_another_kind_of_way_or_a_numbers_stay_the_effect() {
          function mixed(o) { return o.m; }
          function prim1(b) { return b.hasOwnProperty('x'); }
          function inherited(o) { return typeof o.prototype; }
+         function midarr(o) { return o.m; }
          var a = new A(), b = new B(), g = new G(), own = {m: 5};
+         var arr = []; Object.setPrototypeOf(arr, A.prototype); var below = Object.create(arr);
          A.prototype[3] = 1;
          for (var i = 0; i < 20; i++) {
            walks(a); walks(b); getter(g); absent(a); prim(1.5); proto(A); index(a);
            mixed(a); mixed(own); prim1(true); inherited(Object.create(function () {}));
+           midarr(below);
          }",
     );
     // A number's method (Number.prototype's), a Boolean's through Boolean.prototype to
     // Object.prototype (depth 1, its primitive marked: an object's walk would check the word's
-    // shape and exit at every call); a `prototype` a function holds for the objects made from it (a deferred one in
-    // its slot until the checked operation materializes it).
+    // shape and exit at every call); a `prototype` a function holds for the objects made from it
+    // (a deferred one in its slot until the checked operation materializes it); an Array between
+    // the receiver and the holder (no recorded shape: the fill records none for an Array level,
+    // whose shape says nothing of its elements, and the templates check it by none).
     for name in [
-        "walks",
         "getter",
         "absent",
         "prim",
         "proto",
         "index",
-        "mixed",
         "prim1",
         "inherited",
+        "midarr",
     ] {
         let (chunk, graph) = graph_of(&mut engine, name);
         let text = dump(&graph, &chunk);
@@ -421,4 +425,86 @@ fn a_strings_method_is_its_tag_check_string_prototypes_and_its_field() {
         0,
         "{text}"
     );
+}
+
+#[test]
+fn receivers_of_several_walks_dispatch_on_their_shape() {
+    // Two walks (A's and B's prototypes of two shapes, from receivers of two shapes: a shape
+    // says nothing of the prototype, so instances of two classes with the same own keys share
+    // one and a test of it could not choose the walk), two own slots, an own slot and a walk:
+    // one CheckShape of all the receiver shapes, a ShapeIs of the first arm's and a branch, each
+    // arm its walk or none and its field, a phi of the two at the join (Maglev's polymorphic
+    // access); every check WrongShape at the load's pc, each hop keeping the site's two ways.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "class A { constructor() { this.a = 1; } m() { return 1; } }
+         class B { constructor() { this.b = 1; } n() { return 0; } m() { return 2; } }
+         function walks(o) { return o.m(); } function slots(o) { return o.x; }
+         function mixed(o) { return o.m; }
+         var a = new A(), b = new B(), p = {x: 1}, q = {y: 2, x: 3}, own = {m: 5};
+         for (var i = 0; i < 20; i++) { walks(a); walks(b); slots(p); slots(q); mixed(a); mixed(own); }",
+    );
+    for (name, hops, calls) in [("walks", 2, 1), ("slots", 0, 0), ("mixed", 1, 0)] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+        assert_eq!(checks.len(), 1, "{name}: {text}");
+        let NodeOp::CheckShape(shapes) = &checks[0].op else {
+            unreachable!()
+        };
+        assert_eq!(shapes.len(), 2, "{name}: {text}");
+        let tests = nodes(&graph, |op| matches!(op, NodeOp::ShapeIs(_)));
+        assert_eq!(tests.len(), 1, "{name}: {text}");
+        let NodeOp::ShapeIs(first) = &tests[0].op else {
+            unreachable!()
+        };
+        assert!(
+            first.len() == 1 && shapes.contains(&first[0]),
+            "{name}: {text}"
+        );
+        assert_eq!(protos(&graph).len(), hops, "{name}: {text}");
+        assert!(
+            protos(&graph)
+                .iter()
+                .all(|hop| matches!(hop.op, NodeOp::CheckProto { ways: 2, .. })),
+            "{name}: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| matches!(op, NodeOp::LoadField { .. })),
+            2,
+            "{name}: {text}"
+        );
+        assert_eq!(count(&graph, |op| *op == NodeOp::Phi), 1, "{name}: {text}");
+        assert_eq!(count(&graph, is_effect), calls, "{name}: {text}");
+        let pc = pc_of(&chunk, |op| {
+            matches!(
+                op,
+                Op::GetMethod(..) | Op::GetPropLocal(..) | Op::GetProp(..)
+            )
+        });
+        assert_exits_at(&graph, pc, &text);
+    }
+}
+
+#[test]
+fn a_receiver_shape_on_two_walks_stays_the_effect() {
+    // Two receivers of one shape whose prototypes differ in shape: a test of the receiver's
+    // shape cannot tell the walks apart, so the site takes the effect.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function P() {} P.prototype.m = 1; function Q() {} Q.prototype.q = 0; Q.prototype.m = 2;
+         function f(o) { return o.m; } var x = new P(), y = new P();
+         Object.setPrototypeOf(y, Q.prototype);
+         for (var i = 0; i < 20; i++) { f(x); f(y); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "f");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::ShapeIs(_))),
+        0,
+        "{text}"
+    );
+    assert_eq!(count(&graph, is_effect), 1, "{text}");
 }

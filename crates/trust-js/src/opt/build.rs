@@ -436,16 +436,89 @@ impl Rules<'_> {
     }
 
     /// Whether the named load of `name` at `pc` lowers (the builder's `named_load`): on own data
-    /// ways, or through the prototype chain (P3 stage 3 step L2), where no WrongShape flag of the
-    /// site's ways declines it, so that a loop whose named loads take either form counts as free
-    /// of effects and a callee holding them is no E0 decline.
+    /// ways, through the prototype chain, or by the receiver's shape to several walks (P3 stage 3
+    /// step L2), where no WrongShape flag of the site's ways declines it, so that a loop whose
+    /// named loads take these forms counts as free of effects and a callee holding them is no E0
+    /// decline.
     fn named_load_lowers(&self, pc: usize, name: u32) -> bool {
-        match self.own_data_ways(pc, name, false) {
-            Some(ways) => !self.stale_ways(pc, &ways),
-            None => self
-                .chain_ways(pc, name)
-                .is_some_and(|chain| !self.stale_shapes(pc, &chain.shapes)),
+        if let Some(ways) = self.own_data_ways(pc, name, false) {
+            return !self.stale_ways(pc, &ways);
         }
+        if let Some(chain) = self.chain_ways(pc, name) {
+            return !self.stale_shapes(pc, &chain.shapes);
+        }
+        self.poly_ways(pc, name)
+            .is_some_and(|arms| !self.stale_shapes(pc, &arm_shapes(&arms)))
+    }
+
+    /// A polymorphic named load's arms (P3 stage 3 step L2): data ways of objects at depth 0 (own,
+    /// the holder the receiver) to 3, each level's shape recorded and cacheable, the location in a
+    /// cache's reach, grouped by their walk (the levels' shapes, the holder's location and slot):
+    /// two walks or more whose receiver shapes are disjoint. The builder checks the receiver's
+    /// shapes together, tests each arm's but the last's, and makes each arm its walk and its
+    /// field (`Builder::poly_load`), as Maglev's polymorphic access dispatches on the map
+    /// (TryBuildPolymorphicPropertyAccess, maglev-graph-builder.cc:5775-, its arms' compares
+    /// BuildCompareMaps and the last one's CheckMaps). None for one walk (`own_data_ways`,
+    /// `chain_ways`), a receiver shape in two walks (which a test of the shape cannot tell
+    /// apart), a primitive's way, and what `chain_ways` refuses.
+    fn poly_ways(&self, pc: usize, name: u32) -> Option<Vec<Chain>> {
+        let text = self.chunk.jit_name(name);
+        if text == "prototype" || crate::value::canonical_index(text).is_some() {
+            return None;
+        }
+        let named = self.snapshot.named(pc)?;
+        if named.generic {
+            return None;
+        }
+        let mut arms: Vec<Chain> = Vec::new();
+        for way in named.filled() {
+            if way.kind != NamedWayKind::Data
+                || way.primitive != 0
+                || way.location == 0
+                || way.slot >= MAX_FIELD_SLOT
+                || !crate::value::is_cacheable_shape(way.receiver_shape)
+            {
+                return None;
+            }
+            let levels = if way.depth == 0 {
+                if way.receiver_shape != way.holder_shape {
+                    return None;
+                }
+                Vec::new()
+            } else {
+                way.levels()?
+            };
+            if !levels
+                .iter()
+                .all(|&shape| crate::value::is_cacheable_shape(shape))
+            {
+                return None;
+            }
+            let same = |arm: &Chain| {
+                arm.levels == levels && arm.location == way.location && arm.slot == way.slot
+            };
+            if arms
+                .iter()
+                .any(|arm| arm.shapes.contains(&way.receiver_shape) && !same(arm))
+            {
+                return None;
+            }
+            match arms.iter_mut().find(|arm| same(arm)) {
+                Some(arm) => {
+                    if !arm.shapes.contains(&way.receiver_shape) {
+                        arm.shapes.push(way.receiver_shape);
+                    }
+                }
+                None => arms.push(Chain {
+                    string: false,
+                    shapes: vec![way.receiver_shape],
+                    levels,
+                    location: way.location,
+                    slot: way.slot,
+                }),
+            }
+        }
+        (arms.len() >= 2).then_some(arms)
     }
 
     /// The element site at `pc` lowered on element words, or None for the generic access (an
@@ -1623,6 +1696,13 @@ struct Chain {
     levels: Vec<u32>,
     location: u16,
     slot: u32,
+}
+
+/// The receiver shapes of a polymorphic load's arms (`Rules::poly_ways`), each once.
+fn arm_shapes(arms: &[Chain]) -> Vec<u32> {
+    arms.iter()
+        .flat_map(|arm| arm.shapes.iter().copied())
+        .collect()
 }
 
 /// The values built once at the head of the entry block, where they dominate every use: the
@@ -3741,15 +3821,20 @@ impl<'a> Builder<'a> {
         st: &mut State,
     ) -> Result<(), Refusal> {
         let Some(ways) = self.own_data_ways(pc, name, false) else {
-            return match self.rules().chain_ways(pc, name) {
-                Some(chain)
-                    if !(self.rules().stale_shapes(pc, &chain.shapes)
-                        && self.declined(pc, ExitReason::WrongShape, "the generic access")) =>
-                {
-                    self.chain_load(pc, recv, method, &chain, st)
+            if let Some(chain) = self.rules().chain_ways(pc, name) {
+                if self.shapes_declined(pc, &chain.shapes) {
+                    return self.effect(pc, st);
                 }
-                _ => self.effect(pc, st),
-            };
+                return self.chain_load(pc, recv, method, &chain, st);
+            }
+            if let Some(arms) = self.rules().poly_ways(pc, name) {
+                let shapes = arm_shapes(&arms);
+                if self.shapes_declined(pc, &shapes) {
+                    return self.effect(pc, st);
+                }
+                return self.poly_load(pc, recv, method, &arms, &shapes, st);
+            }
+            return self.effect(pc, st);
         };
         if self.stale_ways(pc, &ways) {
             return self.effect(pc, st);
@@ -3759,6 +3844,112 @@ impl<'a> Builder<'a> {
         let word = self.tagged(st, receiver, pc);
         let cell = self.shaped(st, &mut cx, word, &ways.shapes);
         let value = self.field(st, word, cell, ways.location, ways.slot, pc);
+        if matches!(recv, Recv::Stack) && !method {
+            st.stack.pop();
+        }
+        st.stack.push(value);
+        Ok(())
+    }
+
+    /// WrongShape flagged at `pc` where the access's receiver shapes are no more than a discarded
+    /// check there expected (`Rules::stale_shapes`): the generic access, the decline listed.
+    fn shapes_declined(&mut self, pc: usize, shapes: &[u32]) -> bool {
+        self.rules().stale_shapes(pc, shapes)
+            && self.declined(pc, ExitReason::WrongShape, "the generic access")
+    }
+
+    /// A polymorphic named load (P3 stage 3 step L2; `Rules::poly_ways`): the receiver's shapes
+    /// checked together (CheckShape, unless proven), then each arm but the last tested by its
+    /// shapes (ShapeIs) and branched to, the last taking the rest; each arm, with the receiver's
+    /// shapes its own, walks its levels (CheckProto) and loads its holder's field, and the arms
+    /// join with a phi of their values and the facts they all hold (`meet`), as Maglev's
+    /// polymorphic access joins its arms (maglev-graph-builder.cc:5775-, the sub-graph's `done`
+    /// label). Every check exits WrongShape with the operation's before-state.
+    fn poly_load(
+        &mut self,
+        pc: usize,
+        recv: Recv,
+        method: bool,
+        arms: &[Chain],
+        shapes: &[u32],
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let receiver = self.receiver(recv, st, 0, pc);
+        let mut cx = Before::new(pc);
+        let word = self.tagged(st, receiver, pc);
+        let ways = u8::try_from(shapes.len()).expect("at most four ways");
+        let cell = self.shaped(st, &mut cx, word, shapes);
+        let state = self.before(&mut cx, st);
+        let mut ends = Vec::with_capacity(arms.len());
+        for (k, arm) in arms.iter().enumerate() {
+            let mut arm_st = st.clone();
+            let next = if k + 1 < arms.len() {
+                let test = self.add(NodeOp::ShapeIs(arm.shapes.clone()), &[cell], Rep::Bool, pc);
+                let first = self.cur;
+                let then_block = self.graph.add_block(pc as u32, false);
+                let else_block = self.graph.add_block(pc as u32, false);
+                self.add(
+                    NodeOp::Branch {
+                        then_block,
+                        else_block,
+                    },
+                    &[test],
+                    Rep::None,
+                    pc,
+                );
+                self.graph.add_edge(first, then_block);
+                self.graph.add_edge(first, else_block);
+                self.cur = then_block;
+                Some(else_block)
+            } else {
+                None
+            };
+            arm_st.shapes.insert(word, arm.shapes.clone());
+            let mut cx = Before::with(pc, state);
+            let mut object = word;
+            let mut arm_cell = cell;
+            for &shape in &arm.levels {
+                arm_cell = self.prototype(&mut arm_st, &mut cx, object, arm_cell, shape, ways);
+                object = arm_cell;
+            }
+            let value = self.field(&mut arm_st, object, arm_cell, arm.location, arm.slot, pc);
+            ends.push((self.cur, arm_st, value));
+            if let Some(else_block) = next {
+                self.cur = else_block;
+            }
+        }
+        let join = self.graph.add_block(pc as u32, false);
+        let mut preds = Vec::with_capacity(ends.len());
+        let mut values = Vec::with_capacity(ends.len());
+        for (block, arm_st, value) in ends {
+            self.graph.add_node_in(
+                self.frame,
+                block,
+                NodeOp::Jump(join),
+                &[],
+                Rep::None,
+                pc as u32,
+            );
+            self.graph.add_edge(block, join);
+            preds.push((block, arm_st));
+            values.push(value);
+        }
+        self.cur = join;
+        let met = meet(&preds);
+        *st = State {
+            slots: std::mem::take(&mut st.slots),
+            stack: std::mem::take(&mut st.stack),
+            handlers: std::mem::take(&mut st.handlers),
+            ..met
+        };
+        let value = self.graph.add_node_in(
+            self.frame,
+            join,
+            NodeOp::Phi,
+            &values,
+            Rep::Tagged,
+            pc as u32,
+        );
         if matches!(recv, Recv::Stack) && !method {
             st.stack.pop();
         }

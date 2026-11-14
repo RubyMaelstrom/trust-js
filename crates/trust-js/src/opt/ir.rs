@@ -361,6 +361,10 @@ pub(crate) enum NodeOp {
         expect(dead_code, reason = "stage 1's builder builds no CheckBoolean")
     )]
     CheckBoolean,
+    /// Cell -> Bool: whether the object's shape is one of these (at most four), with no exit: a
+    /// polymorphic named load's test of one arm's receiver shapes after its CheckShape of them
+    /// all (P3 stage 3 step L2; Maglev's BuildCompareMaps, maglev-graph-builder.cc:3750-).
+    ShapeIs(Vec<u32>),
     /// A spliced callee's guard (InlineGuard): inputs the callee word (Tagged), then, when the
     /// InlineTarget's `check_this` is set, the receiver word (Tagged), which must be an object;
     /// the expected callee cell, its closure environment and the planning Realm's global

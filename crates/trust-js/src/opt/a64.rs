@@ -500,6 +500,7 @@ fn check_graph(
                 NodeOp::CheckShape(ref shapes)
                 | NodeOp::CheckProto { ref shapes, .. }
                 | NodeOp::CheckStringProto { ref shapes, .. }
+                | NodeOp::ShapeIs(ref shapes)
                     if shapes.is_empty()
                         || shapes.len() > 4
                         || !shapes.iter().all(|&s| crate::value::is_cacheable_shape(s)) =>
@@ -1771,6 +1772,33 @@ impl Gen<'_> {
                     .ldr_w_imm(X17, X16, (layout.obj_props + layout.props_shape) as u32);
                 self.shape_compare(X17, shapes, site);
                 self.gp_done(n, proto);
+            }
+            NodeOp::ShapeIs(shapes) => {
+                if !unused {
+                    let layout = self.layout;
+                    let cell = self.gp(input(0), X16);
+                    self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
+                    self.a
+                        .ldr_w_imm(X17, X17, (layout.obj_props + layout.props_shape) as u32);
+                    let dst = self.gp_dst(n);
+                    let yes = self.a.new_label();
+                    let done = self.a.new_label();
+                    for &shape in shapes.iter() {
+                        if shape < 4096 {
+                            self.a.cmp_imm_w(X17, shape);
+                        } else {
+                            self.a.mov_imm64(X16, u64::from(shape));
+                            self.a.cmp_reg_w(X17, X16);
+                        }
+                        self.a.b_cond(EQ, yes);
+                    }
+                    self.a.movz(dst, 0, 0);
+                    self.a.b(done);
+                    self.a.bind(yes);
+                    self.a.movz(dst, 1, 0);
+                    self.a.bind(done);
+                    self.gp_done(n, dst);
+                }
             }
             NodeOp::CheckBoolean => {
                 let site = self.check_exit(n)?;
