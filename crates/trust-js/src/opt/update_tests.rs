@@ -104,7 +104,8 @@ fn an_update_whose_record_saw_a_string_stays_the_effect() {
         graph
             .nodes
             .iter()
-            .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. } if at as usize == pc)),
+            .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. }
+                | NodeOp::Generic { pc: at, .. } if at as usize == pc)),
         "{text}"
     );
 }

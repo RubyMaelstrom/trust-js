@@ -52,7 +52,10 @@ fn callees_that_create_update_and_read_a_strings_length_are_inlined_in_their_fra
         );
         assert!(
             nodes(&built.graph, |node| node.frame == FrameIx(1)
-                && matches!(node.op, NodeOp::Effect { .. }))
+                && matches!(
+                    node.op,
+                    NodeOp::Effect { .. } | NodeOp::Generic { .. }
+                ))
             .is_empty(),
             "{name}: {}",
             dump(&built.graph)

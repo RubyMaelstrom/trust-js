@@ -261,7 +261,8 @@ fn what_no_template_creates_and_setters_stay_effects() {
             graph
                 .nodes
                 .iter()
-                .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. } if at as usize == pc)),
+                .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. }
+                    | NodeOp::Generic { pc: at, .. } if at as usize == pc)),
             "{name}: {text}"
         );
     }

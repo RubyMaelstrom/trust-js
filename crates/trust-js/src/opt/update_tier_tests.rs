@@ -100,7 +100,7 @@ fn updates_and_lengths_have_the_vms_results() {
 }
 
 /// Whether the tier's code of `name` (its graph as a compile builds it now) holds a node `which`
-/// accepts and no effect at an operation `op` accepts.
+/// accepts and no effect or generic node (P3 stage 3 step 3a) at an operation `op` accepts.
 fn lowered(
     engine: &mut Engine,
     name: &str,
@@ -112,7 +112,8 @@ fn lowered(
     let graph = graph_now(&chunk);
     graph.nodes.iter().any(|node| which(&node.op))
         && !graph.nodes.iter().any(|node| {
-            matches!(node.op, NodeOp::Effect { pc, .. } if op(&chunk.jit_ops()[pc as usize]))
+            matches!(node.op, NodeOp::Effect { pc, .. } | NodeOp::Generic { pc, .. }
+                if op(&chunk.jit_ops()[pc as usize]))
         })
 }
 
