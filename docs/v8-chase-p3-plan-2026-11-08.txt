@@ -3889,3 +3889,77 @@ JIT's activation records and below the stack pointer.
 - Residual: below a record's live top the optimizing tier's code writes only its effects'
   operands, so an earlier activation's words there are still scanned; a record waiting on a call
   into Rust other than a poll is scanned to its extent. Closed as stage 2's carried item.
+
+Stage 3 step 1 landed (19112f3f, ed2b1611, 387b3f07, 2026-11-14; target/p3/stage3/step1-impl,
+report.txt): frame-state chains and exits through several frames. No builder makes an inlined
+frame yet (step 2's), so the tier's code and its exits are what they were.
+- The IR: a graph's table of inlined frames (InlinedFrame: the callee's first-stage chunk, the
+  parent state, the call's pc, the callee and the receiver), each Node and FrameState naming its
+  frame: Maglev's DeoptFrame with its parent (maglev-ir.h:1455-1537), JSC's CodeOrigin with its
+  inline call frame. A frame's parent state is the caller's at the call's pc + 1 without the
+  call's operands, one per inlined call and shared by its states (Maglev's GetCallerDeoptFrame,
+  maglev-graph-builder.cc:1042-1066). An inlined frame has no frame of its own while the code
+  runs: its slots are values or dead, and its nodes read nothing of the compiled frame's context.
+- The verifier checks each frame's nodes and states against that frame's chunk and admits the
+  splice's callee set only (no activation, rest parameter, arguments value, prepared entry or
+  coroutine; the compiled function's strictness; a frame that fits a pooled record); the back end
+  checks the same rules, since its exits rebuild what they describe.
+- The exit table: each record names its frame; a parent's recipe is kept once and shared by every
+  exit through it (JSC's one InlineCallFrame per inlined call, dfg/DFGOSRExitCompilerCommon.cpp:
+  293-415), which relies on a value's one home for its whole range: an allocator that splits
+  ranges must make a parent recipe name the spill slot. A record stays 72 bytes and the table 96;
+  a table without frames retains the bytes it did (13,495,987 over the measured workloads on both
+  sides).
+- The deoptimizer writes every frame's values to rooted storage first (the compiled frame's
+  record, a pooled record per inlined frame, each call's window in its parent's operand words,
+  which root the callee as SpiderMonkey's caller frame keeps the callee and this, jit/
+  BaselineBailouts.cpp:1036-1060), enters each inlined frame outermost first with the call
+  path's own bookkeeping (the depth and its RangeError, the FnFrame with the call's position, the
+  construct state, this bound), runs the innermost in the VM and resumes each parent after its
+  call with the result, or at the call with the throw pending (V8's deoptimizer advances its
+  non-topmost frames past their calls, deoptimizer/deoptimizer.cc:2080-2094, 2296-2300;
+  SpiderMonkey rebuilds a Baseline frame per inlined frame, jit/Bailouts.h:100-131). An
+  interruption passes every frame unrun. One exit count and one limit per code; an inlined
+  frame's exit is flagged on the callee's first stage, marked inlined (JSC's ExitFromInlined,
+  dfg/DFGOSRExitBase.cpp:38-60).
+- A call's bookkeeping is now one set of helpers (Interp::enter_call_depth, push_call_frame,
+  leave_call_frame) which call_jit_committed and call_jit_fast share and the exits compose; the
+  two halves stay apart on the cached paths so that no callee fact lives across the collection
+  check (a single helper cost them 6 and 12 instructions; split, they are 321 and 548 against
+  main's 323 and 553).
+- With steps 0b and the retention fix (the rebase): a stub call's save covers the values its
+  node's exit reads through its frames' chain (Graph::for_each_exit_value, which the allocator's
+  reads use too); an inlined poll passes the compiled frame's operand top; a rebuilt record is
+  scanned to its extent.
+- Departures: the chunks a code's inlined frames run are held in a thread-local map by the code's
+  base and released with its exit table, not in a JitCode field (which would grow every JitCode,
+  template code's too); the callee is rooted through its call's window, where V8 and JSC write
+  the function into the rebuilt frame. Not built here: JSC's loop rule (D12: step 2's), error
+  positions inside inlined frames (D11: step 3's).
+- Measured (fat LTO, 387b3f07's tree against 66ee302d; target/p3/stage3/merge-check): generated
+  code identical after normalization with the tier off and on (the agent's run against
+  87b38dea); instructions at 5 fixed runs, Octane's geomean +0.025% with the tier off and +0.08%
+  with it on (TypeScript's bimodal +0.57% in it; without it +0.05%). One residue beyond noise:
+  RayTrace +0.26% off and +0.29% on, and at 200 fixed runs on an X925 core +0.33% and +0.51%
+  cycles. It comes with the third commit alone (a bisect by commit), in jit_new_inner, whose
+  source and callees are unchanged and which fat LTO compiles 11 instructions longer (register
+  moves around a call): the compiler's allocation in an unchanged function, not the step's paths.
+  The agent's EarleyBoyer residue against 87b38dea (+0.81% off, more conservative retention) is
+  gone on the retention fix (-0.03%). Djot's measured pass reads +0.14% and +0.24% instructions
+  in the counts and no cycles at fixed work (-0.4%, inside a 2% spread). To be read again in the
+  stage's session.
+- Tests: opt::frames_tests, 21 on hand-made graphs (two- and three-frame chains exiting at each
+  depth; values in registers, spill slots and constants; a constant callee behind its identity
+  test; results, throws caught and passed, an interruption, a poll's throw; collections in the
+  inner run; Error.stack and f.caller equal to the VM's; receivers bound as calls bind them;
+  forced exits at every check; the depth check at a rebuilt frame; a declined typed-array stub
+  call in an inlined frame with a parent value in a clobbered register; the verifier's 20
+  refusals and the back end's 6), in six configurations with GC stress; 41 mutations, each caught
+  (one, an interruption run through a parent's catch, only after its test learned to count the
+  catch: an "interrupted" outcome alone does not prove a catch did not run, which the poll and
+  interrupt tests elsewhere may also assume); the tier's tests in four configurations (277);
+  zombie's check, clippy, Windows' check and suite (2,819). Not tested for want of a builder: the
+  phi selector's frame for the nodes it makes in an inlined frame's loop, and an inlined poll's
+  compiled-frame top: step 2's.
+- After it, 26a0c2c7: the back end passes clippy on ARM64 with warnings denied (main's two known
+  lints removed).
