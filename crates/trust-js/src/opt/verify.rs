@@ -19,7 +19,8 @@
 //!   recipe carries one; the signatures let only element nodes take one;
 //! - a loop's entry speculation (stage 2 step 6), CheckNumber [PhiNotNumber] or CheckInt32
 //!   [PhiNotInt32], or a loop invariant's check moved to the loop's entry (P3 stage 3 step 0),
-//!   CheckNumber, CheckInt32, CheckObject or CheckElements [HoistingFailed], sits at the end of a
+//!   CheckNumber, CheckInt32, CheckObject or CheckElements [HoistingFailed], or a typed array's
+//!   TypedData checked there (step 0c) [HoistingFailed], sits at the end of a
 //!   loop header's entry predecessor, where nothing after it exits or has an effect before the
 //!   jump, and exits at the header's pc with its handlers.
 //!
@@ -497,7 +498,7 @@ fn speculative(node: &Node) -> bool {
 
 /// A loop's entry speculation `node`, at `position` among its block's phis and body: its check
 /// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32, any of CheckNumber, CheckInt32,
-/// CheckObject and CheckElements for HoistingFailed) at the end of a loop header's entry
+/// CheckObject, CheckElements and TypedData for HoistingFailed) at the end of a loop header's entry
 /// predecessor, after which nothing but other speculations exits or has an effect before the jump
 /// to the header, with a state at the header's pc and the header's handlers.
 fn speculation(
@@ -515,6 +516,7 @@ fn speculation(
                 | NodeOp::CheckInt32
                 | NodeOp::CheckObject
                 | NodeOp::CheckElements(_)
+                | NodeOp::TypedData { .. }
         ),
     };
     if !check {

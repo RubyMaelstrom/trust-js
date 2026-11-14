@@ -283,8 +283,9 @@ pub(crate) enum ExitReason {
     /// A Number entering a loop's I32 phi is no exact int32 (CheckedFloat64ToInt32 there).
     PhiNotInt32,
     /// A check of a loop invariant moved to the loop's entry edge failed there (P3 stage 3 step
-    /// 0; JSC's HoistingFailed exit kind, Ion's LICM bailout kind): a flag at the header leaves
-    /// the invariants' checks in the loop.
+    /// 0; JSC's HoistingFailed exit kind, Ion's LICM bailout kind), or one of the checks of a
+    /// typed array an effect-free loop accesses, made at its entry edge (step 0c): a flag at the
+    /// header leaves the invariants' and the typed arrays' checks in the loop.
     HoistingFailed,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
@@ -475,7 +476,8 @@ pub(crate) enum NodeOp {
     /// end [Detached] (Maglev's CheckTypedArrayValid, TRust having no detaching protector; the
     /// template's checks, jit_typed_array.rs emit_access): a heap fact of the effect epoch, as
     /// only Rust detaches, resizes or borrows a buffer, which a loop without effects keeps through
-    /// its header (P3 stage 3 step 0c). The element kind's check precedes it,
+    /// its header and makes at its one entry edge where no entry holds it (P3 stage 3 step 0c;
+    /// its exit there HoistingFailed). The element kind's check precedes it,
     /// which a declined view, whose buffer record is null, fails (its kind byte is no kind's).
     TypedData {
         write: bool,

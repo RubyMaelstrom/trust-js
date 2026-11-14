@@ -288,3 +288,208 @@ fn a_binding_the_loop_stores_is_loaded_again_in_it() {
         "{text}"
     );
 }
+
+/// Typed arrays first accessed inside an effect-free loop that reads and writes them: a
+/// parameter's (`fp`, written: `fq` only reads) and an asm.js-style closure binding's (`fb`).
+const FIRST: &str = "var mf = (function (g) {
+       var a = new g.Int32Array(64);
+       function fb(n) { var s = 0;
+         for (var i = 0; i < n; i = (i + 1) | 0) { s = (s + (a[i] | 0)) | 0; a[i] = s; }
+         return s | 0; }
+       return { fb: fb };
+     })(this);
+     var fb = mf.fb;
+     function fp(t, n) { var s = 0;
+       for (var i = 0; i < n; i = (i + 1) | 0) { s = (s + (t[i] | 0)) | 0; t[i] = s; }
+       return s | 0; }
+     function fq(t, n) { var s = 0;
+       for (var i = 0; i < n; i = (i + 1) | 0) s = (s + (t[i] | 0)) | 0;
+       return s | 0; }
+     var T = new Int32Array(64);
+     for (var k = 0; k < 20; k++) { fb(60); fp(T, 60); fq(T, 60); }";
+const FIRST_DRIVE: &str = "for (var k = 0; k < 20; k++) { fb(60); fp(T, 60); fq(T, 60); }";
+
+#[test]
+fn a_typed_array_first_accessed_in_an_effect_free_loop_is_checked_at_its_entry() {
+    // The receiver's object, kind, view, length and data address are checked at the end of the
+    // loop's one entry predecessor (for a store where the loop stores), exiting at the header's
+    // pc with the state the edge leaves [HoistingFailed]; the loop checks none of them, nor
+    // loads the binding.
+    let mut engine = warmed(FIRST, FIRST_DRIVE);
+    for (name, write) in [("fb", true), ("fp", true), ("fq", false)] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        let header_pc = the_loop(&graph);
+        let lp = loop_at(&graph, header_pc);
+        let [entry] = lp.entries[..] else {
+            panic!("{name}: one entry edge: {text}")
+        };
+        assert!(
+            in_loop(&graph, header_pc, established).is_empty(),
+            "{name}: {text}"
+        );
+        let data = nodes(&graph, |op| matches!(op, NodeOp::TypedData { .. }));
+        let [data] = data[..] else {
+            panic!("{name}: one TypedData: {text}")
+        };
+        assert_eq!(data.op, NodeOp::TypedData { write }, "{name}: {text}");
+        for node in nodes(&graph, |op| {
+            matches!(
+                op,
+                NodeOp::CheckObject | NodeOp::CheckElements(_) | NodeOp::TypedData { .. }
+            )
+        }) {
+            assert_eq!(node.block.index(), entry, "{name} {node:?}: {text}");
+            assert_eq!(
+                node.reason,
+                Some(ExitReason::HoistingFailed),
+                "{name} {node:?}: {text}"
+            );
+            let state = graph.state(node.state.expect("a state"));
+            assert_eq!(state.pc, header_pc, "{name} {node:?}: {text}");
+        }
+        let block = &graph.blocks[entry];
+        assert_eq!(block.succs.len(), 1, "{name}: {text}");
+        assert!(
+            graph.nodes[block.body[block.body.len() - 1].index()]
+                .op
+                .is_terminator(),
+            "{name}: {text}"
+        );
+        assert!(graph.declines.is_empty(), "{name}: {text}");
+    }
+}
+
+#[test]
+fn a_flag_at_the_header_leaves_the_typed_arrays_checks_in_the_loop() {
+    let mut engine = warmed(FIRST, FIRST_DRIVE);
+    for name in ["fb", "fp"] {
+        let chunk = chunk_of(&mut engine, name);
+        let graph = graph_for(&chunk, name);
+        let header_pc = the_loop(&graph);
+        flag(
+            &chunk,
+            header_pc as usize,
+            ExitReason::HoistingFailed,
+            false,
+            0,
+        );
+        let graph = graph_for(&chunk, name);
+        let text = dump(&graph, &chunk);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+            "{name}: {text}"
+        );
+        // The read's and the store's, as before the step.
+        assert_eq!(
+            in_loop(&graph, header_pc, |op| matches!(
+                op,
+                NodeOp::TypedData { .. }
+            ))
+            .len(),
+            2,
+            "{name}: {text}"
+        );
+        assert!(
+            graph.declines.iter().any(|decline| decline.pc == header_pc
+                && decline.reason == ExitReason::HoistingFailed
+                && decline.form == "the typed arrays' checks in the loop"),
+            "{name}: {text}"
+        );
+    }
+}
+
+#[test]
+fn no_entry_check_without_one_entry_edge_from_a_jump_or_where_the_loop_writes_the_receiver() {
+    // Two entry edges (from a branch and from an arm; from two arms); a do-while entered from a
+    // branch; a receiver the loop picks itself (its slot written in the loop); a binding the
+    // loop stores; loops with an effect over a binding and a parameter; a receiver whose two
+    // sites saw one kind each, which differ; a receiver whose sites saw two kinds each (the
+    // stub).
+    let mut engine = warmed(
+        "var mb = (function (g) {
+           var a = new g.Int32Array(64), b = new g.Int32Array(64);
+           function sb(n) { var s = 0;
+             for (var i = 0; i < n; i = (i + 1) | 0) { s = (s + (a[i] | 0)) | 0; if (s > 1e9) a = b; }
+             return s | 0; }
+           function eb(f, n) { var s = 0;
+             for (var i = 0; i < n; i = (i + 1) | 0) { s = (s + (b[i] | 0)) | 0; f(); }
+             return s | 0; }
+           return { sb: sb, eb: eb };
+         })(this);
+         var sb = mb.sb, eb = mb.eb;
+         function two(t, n, c) { var s = 0, i = 0; if (c) { s = 1; }
+           while (i < n) { s = (s + (t[i] | 0)) | 0; i = (i + 1) | 0; } return s | 0; }
+         function arms(t, n, c) { var s = 0, i = 0; if (c) { s = 1; } else { i = 1; }
+           while (i < n) { s = (s + (t[i] | 0)) | 0; i = (i + 1) | 0; } return s | 0; }
+         function br(t, n, c) { var s = 0; if (c) do { s = (s + (t[n] | 0)) | 0; } while (--n > 0);
+           return s | 0; }
+         function pick(t, u, n) { var s = 0, x = t;
+           for (var i = 0; i < n; i = (i + 1) | 0) { s = (s + (x[i] | 0)) | 0; x = u; u = t; t = x; }
+           return s | 0; }
+         function eff(f, t, n) { var s = 0;
+           for (var i = 0; i < n; i = (i + 1) | 0) { s = (s + (t[i] | 0)) | 0; f(); } return s | 0; }
+         function apart(t, n, c) { var s = 0;
+           for (var i = 0; i < n; i = (i + 1) | 0) {
+             if (c) s = (s + (t[i] | 0)) | 0; else s = (s + (t[i + 1] | 0)) | 0; }
+           return s | 0; }
+         function kinds(t, n, c) { var s = 0;
+           for (var i = 0; i < n; i = (i + 1) | 0) { s = (s + (t[i] | 0)) | 0; if (c) s = (s + (t[i + 1] | 0)) | 0; }
+           return s | 0; }
+         function nothing() {}
+         var T = new Int32Array(64), U = new Int32Array(64), V = new Int16Array(64);
+         for (var k = 0; k < 20; k++) { sb(60); eb(nothing, 60); two(T, 60, k & 1); arms(T, 60, k & 1); br(T, 60, 1);
+           pick(T, U, 60); eff(nothing, T, 60); apart(k & 1 ? T : V, 60, k & 1);
+           kinds(k & 1 ? T : V, 60, 1); }",
+        "for (var k = 0; k < 20; k++) { sb(60); eb(nothing, 60); two(T, 60, k & 1); arms(T, 60, k & 1); br(T, 60, 1);
+           pick(T, U, 60); eff(nothing, T, 60); apart(k & 1 ? T : V, 60, k & 1);
+           kinds(k & 1 ? T : V, 60, 1); }",
+    );
+    for name in [
+        "sb", "eb", "two", "arms", "br", "pick", "eff", "apart", "kinds",
+    ] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+            "{name}: {text}"
+        );
+        if name == "kinds" {
+            continue; // the stub's TypedElement calls, which make no TypedData
+        }
+        let header_pc = the_loop(&graph);
+        assert!(
+            !in_loop(&graph, header_pc, |op| matches!(
+                op,
+                NodeOp::TypedData { .. }
+            ))
+            .is_empty(),
+            "{name}: {text}"
+        );
+    }
+}
+
+#[test]
+fn the_verifier_refuses_a_misplaced_entry_typed_data() {
+    let mut engine = warmed(FIRST, FIRST_DRIVE);
+    let chunk = chunk_of(&mut engine, "fp");
+    let graph = graph_for(&chunk, "fp");
+    let data = graph
+        .nodes
+        .iter()
+        .position(|node| matches!(node.op, NodeOp::TypedData { .. }))
+        .expect("a TypedData");
+    let mut broken = graph.clone();
+    let state = broken.nodes[data].state.expect("a state").index();
+    broken.states[state].pc = 0;
+    let error = verify(&broken, &chunk).expect_err("another pc");
+    assert!(error.contains("not its header's"), "{error}");
+    verify(&graph, &chunk).expect("the graph itself holds");
+}

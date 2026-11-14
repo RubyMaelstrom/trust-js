@@ -30,8 +30,9 @@
 //!   (an object's possible shapes, the fields loaded or stored), which an effect ends. Facts meet
 //!   at joins. A loop header keeps no heap fact, but a loop that can end none (no effect, no
 //!   `%`) keeps its entry's typed arrays' data addresses and free names' facts but the bindings it
-//!   stores (P3 stage 3 step 0c, `Builder::loop_heap_facts`). No check or load a fact proves is
-//!   emitted.
+//!   stores (P3 stage 3 step 0c, `Builder::loop_heap_facts`), and checks the typed arrays it
+//!   accesses in line at its one entry edge (`Builder::loop_entry_checks`). No check or load a
+//!   fact proves is emitted.
 //! - Feedback: a block whose named and call sites never ran is an exit at its first pc (Maglev,
 //!   Warp and the DFG); arithmetic and comparisons take int32 or f64 from rule U's value classes;
 //!   named loads and stores on own data ways check the shape and load or store the slot.
@@ -446,6 +447,56 @@ impl Rules<'_> {
             .is_some_and(|next| self.element_site(next).is_some())
     }
 
+    /// The receiver the element access at `pc` reaches, by its word's source (`Source`), with the
+    /// typed kind the site accesses in line (Typed::Only(Some(kind)); None for any other form,
+    /// which takes the receiver otherwise) and whether it stores (P3 stage 3 step 0c, the loop
+    /// prepass's `Loop::typed`); None for any other operation or a receiver of another source.
+    fn typed_source(&self, pc: usize) -> Option<(Source, Option<TypedKind>, bool)> {
+        let (source, write) = match self.ops[pc] {
+            Op::GetElemLocal(slot) => (Source::Slot(slot as usize), false),
+            Op::SetElemLocal(slot) | Op::SetElemLocalDrop(slot) => {
+                (Source::Slot(slot as usize), true)
+            }
+            Op::GetElem => (self.receiver_source(pc, 1)?, false),
+            Op::SetElem | Op::SetElemDrop => (self.receiver_source(pc, 2)?, true),
+            Op::UpdateElem(_) => (self.receiver_source(pc, 1)?, true),
+            _ => return None,
+        };
+        let kind = match (self.ops[pc], self.element_site(pc)) {
+            (Op::UpdateElem(_), _) => None,
+            (
+                _,
+                Some(ElemSite {
+                    typed: Typed::Only(Some(kind)),
+                    ..
+                }),
+            ) => Some(kind),
+            _ => None,
+        };
+        Some((source, kind, write))
+    }
+
+    /// The source of the word the operation of `pc`'s block that pushed the operand `below`
+    /// places under the top of the stack at `pc` (`producer`): an initialized local's read or a
+    /// free name's read at a static address.
+    fn receiver_source(&self, pc: usize, below: usize) -> Option<Source> {
+        let at = self.producer(pc, below)?;
+        match self.ops[at] {
+            Op::LoadLocal(slot) if self.initialized.contains(at) => {
+                Some(Source::Slot(slot as usize))
+            }
+            Op::LoadName(..) | Op::LoadNameIn(..) | Op::LoadCap(_) => {
+                match self.snapshot.name(at) {
+                    super::snapshot::NameView::Static { address, base } => {
+                        Some(Source::Name(address, base))
+                    }
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
     /// Whether the operation at `pc` lowers without an effect whatever its operands' facts (the
     /// loop prepass's question).
     fn lowers(&self, pc: usize) -> bool {
@@ -777,6 +828,28 @@ struct Loop {
     /// The binding slots the loop's free-name stores write, any record's (a store ends every
     /// record's fact of its slot, `names` store_binding), for a loop that keeps heap facts.
     stored: Vec<u16>,
+    /// The typed arrays the loop's element sites reach, by their receivers' sources, for a loop
+    /// that keeps heap facts (P3 stage 3 step 0c), whose checks its entry makes once
+    /// (`Builder::loop_entry_checks`).
+    typed: Vec<TypedUse>,
+}
+
+/// Where an element site's receiver word comes from, as the loop prepass reads it from the site's
+/// block (P3 stage 3 step 0c): a slot, or a free name's static address (its binding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Source {
+    Slot(usize),
+    Name(crate::bytecode::StaticName, super::snapshot::Base),
+}
+
+/// A receiver an effect-free loop's element sites reach (P3 stage 3 step 0c): its source, the
+/// typed kind every one of its sites accesses in line (None where they differ, or a site takes
+/// the receiver in another form), and whether one stores.
+#[derive(Clone, Copy, Debug)]
+struct TypedUse {
+    source: Source,
+    kind: Option<TypedKind>,
+    write: bool,
 }
 
 impl Flow {
@@ -894,6 +967,7 @@ impl Flow {
                 effects: false,
                 keeps_heap: false,
                 stored: Vec::new(),
+                typed: Vec::new(),
             };
             let mut modulo = false;
             for &index in &body {
@@ -940,6 +1014,21 @@ impl Flow {
                         if let Some(slot) = rules.name_store_slot(pc) {
                             if !found.stored.contains(&slot) {
                                 found.stored.push(slot);
+                            }
+                        }
+                        if let Some((source, kind, write)) = rules.typed_source(pc) {
+                            match found.typed.iter_mut().find(|known| known.source == source) {
+                                Some(known) => {
+                                    if known.kind != kind {
+                                        known.kind = None;
+                                    }
+                                    known.write |= write;
+                                }
+                                None => found.typed.push(TypedUse {
+                                    source,
+                                    kind,
+                                    write,
+                                }),
                             }
                         }
                     }
@@ -2505,6 +2594,9 @@ impl<'a> Builder<'a> {
                 slots.push(merged);
             }
         }
+        if lp.keeps_heap {
+            self.loop_entry_checks(lp, pc, &mut preds, &mut slots);
+        }
         let met = meet(&preds);
         let (typed_data, names) = self.loop_heap_facts(lp, &met);
         let st = State {
@@ -2557,6 +2649,97 @@ impl<'a> Builder<'a> {
             FastMap::default()
         };
         (typed_data, met.names.at_header(self.moves_env, kept))
+    }
+
+    /// The checks of the typed arrays that `lp`, a loop keeping heap facts whose header starts at
+    /// `pc`, accesses in line (`Loop::typed`), made once at the end of its one entry edge's
+    /// predecessor on that predecessor's state (P3 stage 3 step 0c): the receiver's word (the
+    /// slot's value at the header, `slots`, for a slot the loop does not write; the binding's
+    /// value, loaded there where no fact holds it, for a binding its stores do not write), then
+    /// CheckObject, CheckElements of its one kind, TypedView, TypedLength and TypedData (for a
+    /// store where a site stores), each where no fact proves it, as the sites build them. Their
+    /// exits leave at the header's pc with the state the edge leaves [HoistingFailed]; the facts,
+    /// the predecessor's, are the header's (`meet`, `loop_heap_facts`), so that the loop's
+    /// accesses check none of them. That is Ion's LICM to the loop's one predecessor
+    /// (jit/LICM.cpp:204-246; MArrayBufferViewElements and MArrayBufferViewLength are movable
+    /// loads, jit/MIROps.yaml:2023-2056) and the FTL's to the pre-header, GetIndexedPropertyStorage
+    /// and CheckDetached among them (dfg/DFGLICMPhase.cpp:150-151, 388-417), each a blind
+    /// speculation here, as step 0's moved checks are: a flag at the header (HoistingFailed, JSC's
+    /// exit kind, Ion's BailoutKind::LICM) leaves the checks in the loop. Nothing is made with two
+    /// entry edges (no pre-header) or from a predecessor that ends in a branch.
+    fn loop_entry_checks(
+        &mut self,
+        lp: &Loop,
+        pc: usize,
+        preds: &mut [(BlockIx, State)],
+        slots: &mut [Slot],
+    ) {
+        let [(pred, st)] = preds else {
+            return;
+        };
+        let pred = *pred;
+        if lp.typed.iter().all(|typed| typed.kind.is_none())
+            || self.graph.block(pred).succs.len() != 1
+            || self.declined(
+                pc,
+                ExitReason::HoistingFailed,
+                "the typed arrays' checks in the loop",
+            )
+        {
+            return;
+        }
+        let state = self.frame_state(pc, st);
+        let cur = std::mem::replace(&mut self.cur, pred);
+        let mark = self.graph.block(pred).body.len();
+        for typed in &lp.typed {
+            let Some(kind) = typed.kind else {
+                continue;
+            };
+            let mut cx = Before::with(pc, state);
+            let word = match typed.source {
+                Source::Slot(slot) if lp.written[slot] => continue,
+                Source::Slot(slot) => match slots[slot] {
+                    Slot::Clean(value) | Slot::Dirty(value) => value,
+                    // The entry block's read of it, held Clean as a read holds it, so that its
+                    // facts reach the loop's reads (`prune` keeps a held value's).
+                    Slot::Entry => {
+                        let value = self.hoist(Hoisted::Entry(slot as u16));
+                        slots[slot] = Slot::Clean(value);
+                        value
+                    }
+                    Slot::Frame | Slot::Dead => continue,
+                },
+                Source::Name(address, _) if self.moves_env || lp.stored.contains(&address.slot) => {
+                    continue
+                }
+                Source::Name(address, base) => {
+                    match self.entry_binding(st, &mut cx, address, base, pc) {
+                        Some(word) => word,
+                        None => continue,
+                    }
+                }
+            };
+            if self.rep(word) != Rep::Tagged || self.constant(word).is_some() {
+                continue;
+            }
+            let cell = self.object_cell(st, &mut cx, word);
+            self.elements_kind(st, &mut cx, word, cell, ElemKind::Typed(Some(kind)));
+            let (view, _) = self.typed_view(st, word, cell, pc);
+            self.typed_data(st, &mut cx, cell, view, typed.write);
+        }
+        self.cur = cur;
+        // The nodes made go before the predecessor's terminator, their exits the entry's.
+        let Graph { blocks, nodes, .. } = &mut self.graph;
+        let body = &mut blocks[pred.index()].body;
+        let made = body.split_off(mark);
+        for &node in &made {
+            let data = &mut nodes[node.index()];
+            if data.state.is_some() {
+                data.reason = Some(ExitReason::HoistingFailed);
+            }
+        }
+        let at = body.len() - 1;
+        body.splice(at..at, made);
     }
 
     fn jump(&mut self, pc: usize, target: usize, mut st: State) -> Result<(), Refusal> {

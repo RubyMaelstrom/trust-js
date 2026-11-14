@@ -96,3 +96,126 @@ fn typed_loops_without_effects_have_the_vms_results() {
     }
     assert!(compiles > 0, "the tier compiled the functions");
 }
+
+/// A loop without effects whose typed array its entry checks (P3 stage 3 step 0c), a detached
+/// view `D` and a view `R` of a resizable buffer.
+const ENTRY: &str = "function sum(t, n) { let s = 0; for (let i = 0; i < n; i++) s = s + t[i]; return s; }\n\
+     const T = new Float64Array(16); for (let i = 0; i < 16; i++) T[i] = i * 0.5;\n\
+     const D = new Float64Array(16); D.buffer.transfer();\n\
+     const rab = new ArrayBuffer(128, {maxByteLength: 128}); const R = new Float64Array(rab, 0, 16);\n";
+
+/// The checks `sum`'s graph makes at its loop's entry (HoistingFailed).
+fn entry_checks(chunk: &Chunk) -> usize {
+    graph_now(chunk)
+        .nodes
+        .iter()
+        .filter(|node| node.reason == Some(ExitReason::HoistingFailed))
+        .count()
+}
+
+#[test]
+fn a_zero_trip_loop_entered_with_a_detached_buffer_exits_at_its_entry_and_backs_off() {
+    // The blind speculation's cost: the loop never runs, so the old code never checked the view;
+    // the entry's check exits (HoistingFailed) until the discard, whose flag's recompile checks
+    // in the loop, which a zero-trip call never reaches: no exit after.
+    let warm = format!("{ENTRY}let t = 0; for (let r = 0; r < 1000; r++) t = t + sum(T, 16); t");
+    let chunk = converges(
+        "sum",
+        &warm,
+        "let u = 0; for (let r = 0; r < 600; r++) u = u + sum(D, 0); u",
+        "sum(D, 0) + sum(T, 16) + sum(R, 16)",
+        ExitReason::HoistingFailed,
+    );
+    assert_eq!(entry_checks(&chunk), 0, "the recompile checks in the loop");
+}
+
+#[test]
+fn a_zero_trip_loop_entered_with_a_shrunk_resizable_buffer_backs_off_the_same_way() {
+    let warm = format!("{ENTRY}let t = 0; for (let r = 0; r < 1000; r++) t = t + sum(R, 16); t");
+    let chunk = converges(
+        "sum",
+        &warm,
+        "rab.resize(64); let u = 0; for (let r = 0; r < 600; r++) u = u + sum(R, 0); u",
+        "rab.resize(128); sum(R, 16) + sum(T, 16) + sum(R, 0)",
+        ExitReason::HoistingFailed,
+    );
+    assert_eq!(entry_checks(&chunk), 0, "the recompile checks in the loop");
+}
+
+#[test]
+fn a_loop_entered_with_detached_buffers_converges_without_an_exit_cycle() {
+    // Detached and live views in turn, reading in the loop: the entry's check exits first and
+    // its flag keeps the checks in the loop, whose Detached exits then decline the accesses to
+    // the generic one; a few discards, not one a call, and the VM's results throughout, with the
+    // code discarded at every exit too.
+    let source = format!(
+        "{ENTRY}let t = 0; for (let r = 0; r < 1000; r++) t = t + sum(T, 16);\n\
+         for (let r = 0; r < 1200; r++) t = t + (sum(r % 3 ? T : D, 8) || 0) + sum(R, r & 7); t"
+    );
+    let expected = run(Tier::Bytecode, &source);
+    for (label, switches) in [
+        ("eager", eager()),
+        (
+            "exit limit 1",
+            TestSwitches {
+                exit_limit: 1,
+                ..eager()
+            },
+        ),
+    ] {
+        switches.set();
+        let mut engine = jit_engine();
+        assert_eq!(eval(&mut engine, &source), expected, "{label}");
+        let chunk = tier_chunk(&mut engine, "sum").expect("sum's second stage");
+        assert!(
+            discards(&chunk) <= 3,
+            "{label}: {} discards",
+            discards(&chunk)
+        );
+    }
+}
+
+#[test]
+fn an_interruption_at_the_poll_of_a_loop_whose_entry_checked_its_array_leaves_the_function() {
+    // The entry checked the array and the loop reads its address through its poll's slow path,
+    // in a try region: the host's interruption exits through the poll (its state has the
+    // handler) and leaves the function, no throw the catch takes, and the code runs again with
+    // the VM's results.
+    let source = format!(
+        "{ENTRY}function spin(t, n) {{ let s = 0; \
+         try {{ for (let i = 0; i < n; i++) s = s + t[i & 15]; }} catch (e) {{ return -1; }} \
+         return s; }}\n\
+         let t = 0; for (let r = 0; r < 300; r++) t = t + spin(T, r % 40); t"
+    );
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [
+            eval(&mut vm, &source),
+            eval(&mut vm, "spin(T, 100) + spin(T, 3)"),
+        ]
+    };
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    assert_eq!(eval(&mut engine, &source), expected[0]);
+    let chunk = tier_chunk(&mut engine, "spin").expect("spin's second stage");
+    assert!(entry_checks(&chunk) > 0, "the entry checks the array");
+    exits();
+    let interrupt = engine.interrupt_handle();
+    interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(100),
+    ));
+    let outcome = engine.eval_interruptible("spin(T, 3e9)", false).unwrap();
+    interrupt.set_deadline(None);
+    assert!(
+        matches!(outcome, crate::ExecutionOutcome::Interrupted { .. }),
+        "the interruption"
+    );
+    assert!(
+        exits().iter().any(|&(_, why)| why == ExitReason::Throw),
+        "the poll's exit"
+    );
+    assert_eq!(eval(&mut engine, "spin(T, 100) + spin(T, 3)"), expected[1]);
+}

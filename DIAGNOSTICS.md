@@ -91,8 +91,8 @@ comment/example in the same change.
   site's ways grew, the guard's mismatch edge for WrongCallee, the block for NeverRan, an f64
   loop phi for PhiNotInt32 and a tagged one for PhiNotNumber, the two exits of a loop's entry
   check of a word entering an untagged phi, at its header, and the checks in the loop for
-  HoistingFailed, the exit of a loop invariant's check moved to the loop's entry, at its
-  header); at a bitwise operation whose record
+  HoistingFailed, the exit of a loop invariant's check or of a typed array's checks moved to
+  the loop's entry, at its header); at a bitwise operation whose record
   holds undefined, null or Booleans, a NotNumber flag declines the operation only once its
   truncation of them exited (a Number check's exits there were oddballs the VM recorded, which
   the truncation takes). A code whose exited frames loop is

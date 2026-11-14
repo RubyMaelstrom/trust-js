@@ -2217,10 +2217,13 @@ fn typed_array_sites_access_their_one_kind_in_line() {
                 assert_eq!(found[0].rep, rep, "{name}: {text}");
             }
         }
+        // The loop has no effect and reads its parameter's array first inside it: its entry
+        // checks the kind and the data address (P3 stage 3 step 0c), whose exits there are
+        // HoistingFailed's.
         let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckElements(_)));
-        assert_eq!(checks[0].reason, Some(ExitReason::WrongElements), "{text}");
+        assert_eq!(checks[0].reason, Some(ExitReason::HoistingFailed), "{text}");
         let data = nodes(&graph, |op| matches!(op, NodeOp::TypedData { .. }));
-        assert_eq!(data[0].reason, Some(ExitReason::Detached), "{text}");
+        assert_eq!(data[0].reason, Some(ExitReason::HoistingFailed), "{text}");
     }
     // The stores: an integer kind's ToInt32 truncation, Uint8Clamped's clamp.
     for (name, kind, convert) in [

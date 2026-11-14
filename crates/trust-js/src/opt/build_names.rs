@@ -406,6 +406,26 @@ impl Builder<'_> {
         value
     }
 
+    /// The value of the binding at the static address `address` from `base`, as a loop's entry
+    /// predecessor ends with `st` (P3 stage 3 step 0c, `loop_entry_checks`): its fact, or its
+    /// load there, its record walked there where no fact holds it; None where the record is not
+    /// reachable in place, or for a lexical binding not known initialized (its TDZ test is no
+    /// entry check's).
+    pub(super) fn entry_binding(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        address: StaticName,
+        base: Base,
+        pc: usize,
+    ) -> Option<NodeIx> {
+        let record = self.static_record(st, address, base, pc)?;
+        if address.lexical && !st.names.initialized.contains(&(record, address.slot)) {
+            return None;
+        }
+        Some(self.binding_value(st, cx, record, address, true))
+    }
+
     /// Store `word` into the binding at `slot` of `record` (a mutable binding, or one being
     /// initialized), the binding's facts the word's from now on: every record's facts of the slot
     /// end first, since a splice's holder and a chain from the running environment can name one
