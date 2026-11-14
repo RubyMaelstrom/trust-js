@@ -570,6 +570,14 @@ impl<'g> Selector<'g> {
     fn hoist_invariant_checks(&mut self, invariants: &[(NodeIx, BlockIx)]) -> bool {
         let mut moved = false;
         for &(value, pred) in invariants {
+            // An invariant that is a phi the selection untags (an outer loop's counter held at an
+            // inner loop's header, P3 stage 3 step 3a) loses its Number checks to the rewrite of
+            // its uses, which knows only the checks the builder made: none moves.
+            if self.graph.node(value).op == NodeOp::Phi
+                && matches!(self.kind(value), Kind::I32 | Kind::F64)
+            {
+                continue;
+            }
             let [header] = self.graph.block(pred).succs[..] else {
                 continue;
             };

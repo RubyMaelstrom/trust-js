@@ -5829,3 +5829,37 @@ fn a_generic_nodes_throw_recipe_keeps_the_handlers_values_across_its_call() {
         }
     }
 }
+
+/// An inner loop's invariant can be an outer loop's phi (P3 stage 3 step 3a: the value its header
+/// holds): where the selection untags the phi, its Number checks go with the rewrite of its uses
+/// and none moves to the inner loop's entry, which would leave a check of an int32 there (the
+/// verifier's representations); a tagged phi's checks move as any invariant's.
+#[test]
+fn an_untagged_outer_phi_held_by_an_inner_loop_moves_no_check() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function nest(n, m, x) { var s = 0;
+           for (var j = 0; j < n; j++) {
+             for (var i = 0; i < m; i++) { s = s + x; }
+             x = x + 0.5;
+           }
+           return s; }
+         for (var k = 0; k < 20; k++) nest(4, 3, 1.5);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "nest");
+    let text = dump(&graph, &chunk);
+    let [outer_pc, _] = loop_pcs(&graph)[..] else {
+        panic!("two loops: {text}")
+    };
+    // `x`, the outer loop's phi, is first checked in the inner loop.
+    let x = phi_of_slot(&graph, &chunk, "x", outer_pc);
+    assert_ne!(graph.node(x).rep, Rep::Tagged, "{text}");
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| !(node.op == NodeOp::CheckNumber && node.inputs == [x])),
+        "no check of the untagged phi: {text}"
+    );
+}
