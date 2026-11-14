@@ -4328,3 +4328,66 @@ explicit operands in the compiled function's frame (the owner's D6).
   confirmed; with step 3a's agent, who is also to make the poison switch check for hidden
   writers (a poisoned word changed after a node); (3) inlined frames' generic nodes (step 3c),
   which lift E0; origins (3b); the exit tables' size.
+
+Lowerings L3 landed (14 commits ending c70c6281, 2026-11-14; target/p3/stage3/stepL3-impl,
+report.txt and design-note.txt): named stores that create their property, `o.x++` and `o.x += v`,
+and a String's length are the tier's own nodes.
+- Creation stores (a constructor's `this.x = v`: a shape transition) on one receiver shape: the
+  receiver's shape (which proves no own property of the name, the landing shape and the slot),
+  then the prototype chain walked level by level, each level's live [[Prototype]] checked against
+  the shape the snapshot recorded for it (L2's CheckProto) to the end or to the first level that
+  holds the name as a writable data property, so that no setter or read-only property is
+  skipped; the receiver extensible and no marked prototype; then the template's commit (the
+  layout, the slot, the card mark, the shape, the count, with no call or poll between, the count
+  last as the collector reads slots below it). Every check precedes the first write. Where the
+  in-line commit cannot make the property (eight keys or more, no layout, no room) a call makes
+  the VM's insert, which allocates and neither collects nor runs JavaScript, instead of an exit
+  (exits there ran 31,522 times in TypeScript).
+- Departure: the template proves the chain by the receiver's prototype's identity and a creation
+  epoch that every structural change of a marked prototype moves; the epoch is process-wide, so
+  another engine of the process moves it (a test exited at a creation its program never changed,
+  one run in five). The tier checks the levels' shapes instead, as SpiderMonkey's add-slot stub
+  guards its chain without a dependency: a check a level once per receiver and effect epoch.
+- The facts after a creation, the rule L2 and step 0c asked for: the receiver's shape fact
+  becomes the landing shape; every other value whose shape fact holds the old shape loses it (it
+  may be the same object: Maglev's stale maps on a transitioning store, TurboFan's KillMaps,
+  JSC's observeTransition); every field fact at the new location ends; links stay, but a walk
+  through the object checks its level again, its cell having lost its shape fact, so a load after
+  the creation through an object whose prototype it is sees the new property or exits. Nothing
+  step 0c keeps through loops is written by a creation.
+- Updates and appends on own writable data ways where the value record says Numbers: the load,
+  the arithmetic by its hint, the store. A `length` read at a site that filled no way is a
+  String's length (the tag, then the length as the template reads it).
+- A defect of the step, found by the agent after its rebase onto step 3a and fixed with a test:
+  the creation's slow call read its value's spill slot after the save of the live registers had
+  moved the stack pointer (TypeScript failed with the tier on; step 3a's longer-lived values
+  made the value a spilled one).
+- Measured (fat LTO against 3bf4f72d, the tier on; my recount agrees): the family's effect
+  executions 56.0M -> 15.0M, all effects -14.2%; instructions at 5 fixed runs RegExp -7.05%,
+  TypeScript -4.4%, Earley-Boyer -4.1%, GBEMU -3.6%, Box2D -2.7%, PdfJS -2.2%, Djot's steady
+  state -0.95%, Richards -0.7%; DeltaBlue +0.11%; Octane's geomean -1.70%. The agent's cycles at
+  200 fixed runs on an X925 core: RegExp -8.5%, GBEMU -5.9%, TypeScript -4.8%, Box2D -3.8%,
+  Richards -2.2%, DeltaBlue -1.8%; timed scores TypeScript +4.3%, Box2D +4.8%, RegExp +8.3%,
+  Richards +3.8%; Vue's steady state +0.4% cycles and Splay +0.2%, which the same binary shows
+  with the tier off too (+1.3%, +0.4%: the binary's layout, inferred). The tier off: counts
+  within 0.26%, template code identical. Code bytes -3.3%. E0's declines at graph 106 -> 95.
+  The verifier sweep on the landed tree (mine): 42 runs, none refused.
+- Tests: builder, back end and end to end over the brief's table (a creation on an object that is
+  another's prototype between two loads through it, two names for one object, a setter or a
+  read-only property on the chain, frozen, sealed, non-extensible and dictionary receivers, each
+  growth step with a collection forced at it, the update forms, strings' lengths); the brief's
+  mutations each caught by a named test, two by tests that read the emitted code (the shape
+  stored before the slot; the card mark missing); one mutation equivalent, three not rerun. The
+  whole library suite in five configurations; with forced exits one failure that main had too
+  (below); GC stress 24 of 25 (the last, a test of 24 spilled values, stopped unfinished after
+  2 h 50 min without a failure; run again by the coordinator).
+- Found beside it: main's native append test of the remembered set failed with forced exits
+  every 100 since step 3a moved the forced countdown's phase (it counts the appends generated
+  code commits; it passes at 97, 99 and 250): pinned to no forced exits (23b8af9a).
+- Open: creations at two or three receiver shapes (1.39M, TypeScript); the generic sites (11.5M,
+  the stub cache's probe); the in-line commit's eight-key limit, the template's; under graph
+  inlining PdfJS takes 343 exits at three newly inlined sites that have a second callee (the
+  inliner should dispatch or decline where a site holds a second unflagged callee); the save of
+  live registers should take its inputs before it moves the stack pointer, so that the defect
+  above cannot recur. For the owner: the template's creation epoch is process-wide; per Agent, as
+  SpiderMonkey's fuses are per realm, engines would stop invalidating each other's caches.
