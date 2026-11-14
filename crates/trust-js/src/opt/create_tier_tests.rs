@@ -10,7 +10,9 @@ use super::*;
 
 /// `P` three fields; `Q` two, its receiver frozen, sealed or made non-extensible first by
 /// its flag; `S` a strict constructor whose store into a read-only inherited property throws;
-/// `walk` a load through `c`'s chain around a creation on `p`, `c`'s prototype; `alias` a load of
+/// `walk` a load through `c`'s chain around a creation on `p`, `c`'s prototype, and `walk2`
+/// around one on `q`, of `p`'s shape and sometimes `p` (the second load's way expects `p`'s old
+/// shape); `alias` a load of
 /// `a` around a creation on `b`, sometimes `a` itself; `fill` seven fields on an object literal
 /// (a record grows past the cell's three slots), `wide` twelve (past the commit's 8); `dict`
 /// a creation on an object in dictionary mode; `N` a chain ending at a user object whose null
@@ -22,6 +24,7 @@ pub(super) const CREATE: &str = "function P(a, b, c) { this.a = a; this.b = b; t
      function S(v) { 'use strict'; this.r = v; this.w = v * 2; }\n\
      const base = { m() { return 1; } };\n\
      function walk(c, p, v) { const a = c.m(); p.m = v; return a * 1000 + c.m(); }\n\
+     function walk2(c, p, q, v) { const a = c.m(); q.m = v; return a * 1000 + c.m(); }\n\
      function alias(a, b, v) { const x = a.k; b.z = v; return x * 100 + a.k + (a.z === undefined ? 0 : a.z); }\n\
      function fill(o, v) { o.a = v; o.b = v; o.c = v; o.d = v; o.e = v; o.f = v; o.g = v; return o; }\n\
      function wide(o, v) { o.a = v; o.b = v; o.c = v; o.d = v; o.e = v; o.f = v; o.g = v; o.h = v; \
@@ -44,6 +47,8 @@ pub(super) const CREATE: &str = "function P(a, b, c) { this.a = a; this.b = b; t
        const p = Object.create(base); p.k = k;\n\
        const c = Object.create(p);\n\
        t = (t * 31 + h(walk(c, p, k % 2 ? function () { return 2; } : function () { return 3; }))) % 1000003;\n\
+       const p2 = Object.create(base), c2 = Object.create(p2);\n\
+       t = (t * 31 + h(walk2(c2, p2, k > 500 && k % 7 === 0 ? p2 : Object.create(base), function () { return 4; }))) % 1000003;\n\
        const a = { k: k }, b = k % 3 ? { k: 0 } : a;\n\
        t = (t * 31 + h(alias(a, b, k))) % 1000003;\n\
        t = (t * 31 + sum(fill({}, k)) + sum(wide({}, k))) % 1000003;\n\

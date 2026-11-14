@@ -207,15 +207,18 @@ fn a_creation_ends_the_shape_facts_that_hold_its_old_shape_and_keeps_the_others(
 
 #[test]
 fn a_walk_through_the_creations_receiver_checks_its_level_again() {
-    // c's method is on base, two levels up through p; the creation on p, c's prototype, between
-    // the two loads ends the fact of p's level (p's shape is the creation's old one), so the
-    // second load walks again (and exits where p now shadows the method).
+    // c's method is on base, two levels up through p; the creation on q, which has p's shape and
+    // may be p (c's prototype), between the two loads ends the fact of p's level, so the second
+    // load walks again (and exits where q was p and now shadows the method). Warm with q never p,
+    // so that the second load's way expects p's shape as it was.
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
         "var base = { m: function () { return 1; } };
-         function g(c, p, v) { var a = c.m; p.n = v; return c.m; }
-         for (var i = 0; i < 20; i++) { var p = Object.create(base); g(Object.create(p), p, i); }",
+         function g(c, p, q, v) { var a = c.m; q.m = v; return c.m; }
+         for (var i = 0; i < 20; i++) {
+           var p = Object.create(base); g(Object.create(p), p, Object.create(base), i);
+         }",
     );
     let (chunk, graph) = graph_in(&mut engine, "g");
     let text = dump(&graph, &chunk);
