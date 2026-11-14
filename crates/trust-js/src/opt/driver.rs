@@ -344,6 +344,45 @@ pub(crate) fn counts_loops() -> bool {
     enabled() && !no_loop_count()
 }
 
+/// The last-seen element bytes a template compile of `chunk` stores its in-line typed-array hits
+/// to (P3 stage 3, rule U; `jit::typed_array::emit`), (pc, byte's address) for each element site
+/// that has one, ascending by pc; None where its code records nothing (and for a chunk without
+/// element sites, for which nothing is allocated). With the tier on, where the tier does not refuse the chunk before
+/// its snapshot (over the size limit, resumable), as JSC's baseline emits its profiling only
+/// where the DFG could compile the code block (jit/JIT.cpp:722-733, a bytecode cost past
+/// maximumOptimizationCandidateBytecodeCost among CannotCompile's causes,
+/// dfg/DFGCapabilities.cpp:62-67). An element access's byte is its baseline site's: its own in
+/// a first stage, and in a transformed chunk the site its record map names (the function's
+/// first stage, a spliced callee's), whose record the tier reads, as the transformed vector
+/// forwards the VM's records (feedback-schema.txt 5.5); an unmapped pc has none. The bytes
+/// are made here (main thread) and never move; the map holds the chunks it names, so they
+/// outlive the code that embeds their addresses. Tier-off code records nothing and is emitted as
+/// before.
+pub(crate) fn element_records(chunk: &Chunk) -> Option<Vec<(u32, u64)>> {
+    let ops = chunk.jit_ops();
+    if !enabled() || ops.len() > MAX_OPTIMIZED_OPS || chunk.jit_is_resumable() {
+        return None;
+    }
+    let map = chunk.feedback_vector().record_map();
+    let mut table = Vec::new();
+    for (pc, op) in ops.iter().enumerate() {
+        if !crate::bytecode::feedback_read::is_element_access(op) {
+            continue;
+        }
+        let (site, site_pc) = match map {
+            Some(map) => match map.target(pc) {
+                Some(target) => target,
+                None => continue,
+            },
+            None => (chunk, pc),
+        };
+        if let Some(byte) = ChunkProfile::of(site).element_byte(site.jit_ops().len(), site_pc) {
+            table.push((pc as u32, byte));
+        }
+    }
+    (!table.is_empty()).then_some(table)
+}
+
 /// The native runs an iteration of a loop spanning `span` operations (its header to its last
 /// back edge) counts in a chunk of `len` (stage 2, step 11): its share of an entry's K
 /// (`super::ENTRY_WEIGHT`), max(1, round(K x span / len)), as Ignition's back edge charges its

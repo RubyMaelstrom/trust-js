@@ -2369,6 +2369,131 @@ fn typed_arrays_among_other_receivers_branch_on_the_kind_tag() {
 }
 
 #[test]
+fn a_kind_template_code_saw_last_lowers_its_site_in_line_and_a_wider_record_stays_wide() {
+    // P3 stage 3, rule U: a site the VM never ran (an empty record) whose last-seen byte holds a
+    // kind, as template code's in-line hit leaves it, reads once merged as typed arrays of that
+    // kind: per-kind loads and stores in line, with no stub and no kind branch. A record that
+    // holds more keeps it: a Float64Array the VM saw with a Uint8Array last seen takes the stub
+    // (two kinds), an Array the VM saw with an Int32Array last seen the kind branch.
+    use super::profile::{ChunkProfile, UNSEEN};
+    use crate::feedback::{elem_typed_kind, ELEM_KEY_INDEX, ELEM_TYPED_ARRAY};
+    let mut engine = vm_engine(
+        "function get(t, i, go) { if (go) return t[i]; return 0; }
+         function put(t, i, v, go) { if (go) t[i] = v; return 0; }
+         function wide(t, i) { return t[i]; } function mixed(o, i) { return o[i]; }
+         var f = new Float64Array(4);
+         for (var k = 0; k < 20; k++) {
+           get(f, 1, false); put(f, 1, k, false); wide(f, 1); mixed([1, 2], 1);
+         }",
+    );
+    let load = |op: &Op| matches!(op, Op::GetElemLocal(_));
+    let store = |op: &Op| matches!(op, Op::SetElemLocalDrop(_));
+    let typed = |kind| NodeOp::CheckElements(ElemKind::Typed(kind));
+    for (name, site, kind, access) in [
+        (
+            "get",
+            &load as &dyn Fn(&Op) -> bool,
+            TypedKind::I32,
+            NodeOp::LoadTyped(TypedKind::I32),
+        ),
+        (
+            "put",
+            &store,
+            TypedKind::F32,
+            NodeOp::StoreTyped(TypedKind::F32),
+        ),
+    ] {
+        let chunk = chunk_of(&mut engine, name);
+        let pc = pc_of(&chunk, site);
+        assert_eq!(
+            chunk.feedback_vector().record_word(pc),
+            0,
+            "{name}: never ran"
+        );
+        ChunkProfile::of(&chunk).see_element(chunk.jit_ops().len(), pc, kind as u8);
+        let graph = graph_for(&chunk, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        assert_eq!(
+            count(&graph, |op| *op == typed(Some(kind))),
+            1,
+            "{name}: {text}"
+        );
+        assert_eq!(count(&graph, |op| *op == access), 1, "{name}: {text}");
+        assert_eq!(
+            count(&graph, |op| matches!(
+                op,
+                NodeOp::TypedElement { .. } | NodeOp::IsTypedArray
+            )),
+            0,
+            "{name}: {text}"
+        );
+        // Merged into the record, the byte emptied.
+        assert_eq!(
+            chunk.feedback_vector().record_word(pc),
+            ELEM_TYPED_ARRAY | ELEM_KEY_INDEX | elem_typed_kind(kind as u8),
+            "{name}"
+        );
+        assert_eq!(ChunkProfile::of(&chunk).element_seen(pc), UNSEEN, "{name}");
+    }
+    // The VM's Float64Array and a Uint8Array last seen: two kinds, the stub.
+    let chunk = chunk_of(&mut engine, "wide");
+    let pc = pc_of(&chunk, load);
+    ChunkProfile::of(&chunk).see_element(chunk.jit_ops().len(), pc, TypedKind::U8 as u8);
+    let graph = graph_for(&chunk, "wide");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == typed(None)), 1, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::TypedElement { write: false }),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadTyped(_))),
+        0,
+        "{text}"
+    );
+    // The VM's Array and an Int32Array last seen: the kind branch, the stub on its typed side.
+    let chunk = chunk_of(&mut engine, "mixed");
+    let pc = pc_of(&chunk, load);
+    ChunkProfile::of(&chunk).see_element(chunk.jit_ops().len(), pc, TypedKind::I32 as u8);
+    let graph = graph_for(&chunk, "mixed");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, |op| *op == NodeOp::IsTypedArray), 1, "{text}");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::CheckElements(ElemKind::Array)),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::LoadTyped(_))),
+        0,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_last_seen_kind_changes_the_fingerprint_once() {
+    // The settled-feedback rule merges before it compares (JSC merges at every tier-up check):
+    // a kind template code saw since the last checkpoint changes the fingerprint; seen again, it
+    // changes nothing.
+    use super::profile::ChunkProfile;
+    let mut engine = vm_engine(
+        "function get(t, i, go) { if (go) return t[i]; return 0; }
+         for (var k = 0; k < 20; k++) get(null, 1, false);",
+    );
+    let chunk = chunk_of(&mut engine, "get");
+    let pc = pc_of(&chunk, |op| matches!(op, Op::GetElemLocal(_)));
+    let before = fingerprint(&chunk);
+    assert_eq!(fingerprint(&chunk), before);
+    ChunkProfile::of(&chunk).see_element(chunk.jit_ops().len(), pc, TypedKind::U16 as u8);
+    let seen = fingerprint(&chunk);
+    assert_ne!(seen, before, "a new kind is new feedback");
+    ChunkProfile::of(&chunk).see_element(chunk.jit_ops().len(), pc, TypedKind::U16 as u8);
+    assert_eq!(fingerprint(&chunk), seen, "the same kind again");
+}
+
+#[test]
 fn flagged_typed_sites_read_past_the_length_or_take_the_generic_access() {
     let source = "function get(t, i) { return t[i]; } function put(t, i, v) { t[i] = v; }
          function any(t, i) { return t[i]; } function mixed(t, i) { return t[i]; }

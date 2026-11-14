@@ -187,7 +187,19 @@ Who writes it:
   set_computed_element record where fast_get_elem, fast_set_elem and ordinary_set_existing_index
   decline, for a String key, and for a String receiver. x86-64, whose element accesses all take
   these helpers, records what ARM64's in-line paths would.
-- Nothing on an in-line path.
+- With the optimizing tier on (TRUST_JS_OPT=1; P3 stage 3, rule U's record filling), ARM64's
+  in-line typed-array accesses, in two parts, as JSC's baseline stores an access's last-seen
+  structure in its ArrayProfile and merges it into the observed modes when the profile is read
+  (jit/JITInlines.h:328-348, bytecode/ArrayProfile.cpp:126-136): template code stores the
+  view's native kind, one byte, in the site's last-seen byte (opt/profile.rs ChunkProfile; a
+  second stage's and a splice's code in the byte of the baseline site its record map names, 5.5),
+  and the tier merges each byte that holds a kind into its record as a typed array of that kind
+  with an index key, an OR, then empties the byte: at the copy a compile reads
+  (opt::snapshot::Raw::take_into) and at each settled-feedback checkpoint's fingerprint. A record
+  so filled names what the VM's path would have for those accesses. Code over the tier's size
+  limit (MAX_OPTIMIZED_OPS) or resumable records nothing.
+- Nothing else on an in-line path: an Array's or an ordinary object's in-line hit records
+  nothing, and with the tier off nothing in line records.
 
 The in-line sets (receiver, key):
   loads    an own data element of an Array or another ordinary object, or a typed array's
@@ -212,11 +224,12 @@ Reading it: rule U, the receivers and keys an access saw are its record's togeth
 in-line set's; that is complete but at a generic site, whose record stopped growing (it needs no
 more). Rule R, the record alone where it holds a receiver or key and
 the in-line set's where it holds none, is what the census's precision measures: it names them
-exactly where the VM's iteration or a miss also saw the in-line hits' receivers, and an empty
-record never tells an Array from a typed array or an ordinary object (the plan's design 2: P3
-keeps the baseline's dispatch there). An Array's facts are hints, as the value record's int32
-is: an in-line hit records none, so a fact is known only where the VM or a miss saw it, and P3
-reads the kind bits at run time, as the templates do.
+exactly where the VM's iteration or a miss also saw the in-line hits' receivers (with the tier
+on, a typed array's in-line hits too, once merged), and an empty record never tells an Array
+from a typed array or an ordinary object (the plan's design 2: P3 keeps the baseline's dispatch
+there). An Array's facts are hints, as the value record's int32 is: an in-line hit records none,
+so a fact is known only where the VM or a miss saw it, and P3 reads the kind bits at run time, as
+the templates do.
 
 5.3 The named sites' generic mark (step 5). A named load's or store's property cache (its four
 IcState ways) carries one site-level bit: bit 7 of way 0's mid_ok (bytecode.rs IC_MID_GENERIC),
@@ -254,7 +267,8 @@ interning nothing: its shapes are the process's shape ids, its targets the proce
 - Values (arithmetic, unary, update and relational operations, UpdateElem's too): the three
   ValueClass sets by rule U, and the record alone, whose int32/double split is a hint.
 - Element (element loads and stores): the receivers and keys by rule U, and the record alone with
-  an Array's facts, hints.
+  an Array's facts, hints. The read itself merges nothing: the tier merges template code's
+  last-seen typed kinds (5.2) before it reads.
 - Named (named loads and stores): each filled way, most recent first (receiver and holder shapes,
   depth, slot, slot location, kind: data, key-checked, accessor, absent or creation), and the
   generic mark; NamedUpdate (UpdateProp) adds the value record's view.

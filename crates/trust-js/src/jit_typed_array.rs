@@ -61,9 +61,24 @@ fn use_stub() -> bool {
         && *STUBS.get_or_init(|| std::env::var("TRUST_JS_JIT_TYPED_STUBS").as_deref() != Ok("0"))
 }
 
+/// Whether the process's element accesses call the shared stub (tests).
+#[cfg(test)]
+pub(super) fn stubs_for_test() -> bool {
+    use_stub()
+}
+
 /// X11 = Object, X9 = exact unsigned index, W12 its kind tag unless `tag` says the caller
 /// checked it. On read, X12 is a packed Number and D1 its numeric value. The caller chooses the
 /// ownership/stack commit at `hit`.
+///
+/// `record`, the site's last-seen byte (P3 stage 3, rule U; `Asm::element_record`): the access
+/// stores the view's native kind there (W17 holds it, see [`emit_access`]), as JSC's baseline
+/// stores an access's structure ID in its ArrayProfile (jit/JITInlines.h:328-348), so that the
+/// optimizing tier, which merges it into the site's element record (`opt::profile::
+/// merge_element_hits`), reads the kind a site that ran only in template code saw. Through the
+/// stub, after its hit (the stub is process-wide and embeds no address); in line, at the kind's
+/// load, before the access, as JSC records before its access. MOVZ/MOVK of the address and one
+/// STRB, in X16, a scratch of the access.
 pub(super) fn emit(
     a: &mut asm::Asm,
     layout: &JitLayout,
@@ -71,6 +86,7 @@ pub(super) fn emit(
     hit: usize,
     slow: usize,
     tag: KindTag,
+    record: Option<u64>,
 ) {
     let Some(native) = layout.native_typed_array else {
         a.b(slow);
@@ -91,7 +107,8 @@ pub(super) fn emit(
     }
     if use_stub() {
         // The stub takes W12 = the kind tag (a checked one is TypedArray's), and returns W13 = 1
-        // after an access and 0 when this template declines it.
+        // after an access, with W17 = the view's native kind, and 0 when this template declines
+        // it.
         if tag == KindTag::Checked {
             a.movz(12, crate::value::KIND_TYPED_ARRAY_TAG as u32, 0);
         }
@@ -103,11 +120,21 @@ pub(super) fn emit(
         );
         a.bl_label(stub);
         a.cbz(13, false, slow);
+        emit_record(a, record);
         a.b(hit);
     } else {
-        emit_access(a, &native, write.is_some(), hit, slow, tag);
+        emit_access(a, &native, write.is_some(), hit, slow, tag, record);
     }
     a.mark_pop();
+}
+
+/// Store W17, the native kind of the view just accessed, in the last-seen byte at `record` (see
+/// [`emit`]; nothing where the code records nothing). Clobbers X16.
+pub(super) fn emit_record(a: &mut asm::Asm, record: Option<u64>) {
+    if let Some(byte) = record {
+        a.mov_imm64(16, byte);
+        a.strb_imm(17, 16, 0);
+    }
 }
 
 /// The element access proper: X11 = Object, X9 = exact unsigned index, W12 its kind tag unless
@@ -116,8 +143,11 @@ pub(super) fn emit(
 ///
 /// After the receiver/index guards the template loads the live view, buffer and backing Vec,
 /// leaving X15 at the address of element zero (the Vec's data plus the view's byte offset), X13
-/// at the buffer record, X14 at the view's byte offset and X17 at the element kind; every
-/// element then addresses `[X15, X9, lsl #shift]` directly. Scratch: X9, X12..X17, D1..D2.
+/// at the buffer record, X14 at the view's byte offset and X17 at the element kind, which no
+/// access writes, so that X17 holds it at `hit` (the shared stub's contract); every element then
+/// addresses `[X15, X9, lsl #shift]` directly. Scratch: X9, X12..X17, D1..D2. With `record`, the
+/// site's last-seen byte takes the kind as soon as it is loaded ([`emit_record`]; none in the
+/// shared stub, which embeds no address).
 pub(super) fn emit_access(
     a: &mut asm::Asm,
     layout: &NativeLayout,
@@ -125,6 +155,7 @@ pub(super) fn emit_access(
     hit: usize,
     slow: usize,
     tag: KindTag,
+    record: Option<u64>,
 ) {
     if tag == KindTag::InW12 {
         // Proxies, namespaces and unsupported typed-array kinds have another kind.
@@ -153,6 +184,8 @@ pub(super) fn emit_access(
     a.ldr_imm(14, 12, offset_of!(View, offset) as u32);
     a.add_shifted(15, 15, 14, 0);
     a.ldrb_imm(17, 12, offset_of!(View, kind) as u32);
+    // X16 (the storage) is dead here: the store's conversions write it before they read it.
+    emit_record(a, record);
     if write {
         emit_store(a, hit, slow);
     } else {

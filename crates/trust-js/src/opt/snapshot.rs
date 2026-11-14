@@ -22,7 +22,10 @@
 //!
 //! The evidence that code ran comes from named and call sites only: their first execution fills a
 //! way or sets the generic or megamorphic mark, and a second stage's seeded caches count. Value
-//! and element records are no evidence, since in-line hits record nothing (rule U).
+//! and element records are no evidence, since in-line hits record nothing (rule U), but for
+//! template code's typed-array hits with the tier on (P3 stage 3, rule U's record filling: the
+//! last-seen kinds merged at the copy and at each fingerprint), an Array's or an ordinary
+//! object's in-line hit still recording nothing.
 //!
 //! A free name's site (stage 2, step 4) has a view of its own ([`NameView`]): its static address,
 //! or its name cache's class, a global property resolved again in the realm's global object as
@@ -190,8 +193,11 @@ impl Raw {
     /// The raw copy of `chunk`'s feedback as it stands now (main thread), made in this one, whose
     /// vectors it fills again, its global names resolved in `realm`'s running realm, the one the
     /// compile runs in, whose global environment and object its code checks (in none, they stay
-    /// effects).
+    /// effects). Template code's last-seen element kinds are merged into the records first (P3
+    /// stage 3, rule U; `profile::merge_element_hits`), as JSC's DFG merges an ArrayProfile when
+    /// it reads it (dfg/DFGByteCodeParser.cpp:1354-1359).
     pub(crate) fn take_into(&mut self, chunk: &Chunk, realm: Option<&Interp>) {
+        super::profile::merge_element_hits(chunk);
         let ops = chunk.jit_ops();
         self.names.clear();
         for (pc, op) in ops.iter().enumerate() {
@@ -717,9 +723,13 @@ fn is_length_read<'n>(op: &Op, name: &impl Fn(u32) -> &'n str) -> bool {
 /// site's (stage 2, step 11): past their capacity their refills are churn, which the snapshot
 /// reads as the generic access and the megamorphic call, as V8's megamorphic IC updates only its
 /// stub cache and notifies no IC change (ic/ic.cc:1061-1072), where the transition to the state
-/// does (:377-390).
+/// does (:377-390). Template code's last-seen element kinds are merged into the records first (P3
+/// stage 3, rule U; `profile::merge_element_hits`), as JSC merges its array profiles at every
+/// tier-up check, optimizing or not (jit/JITOperations.cpp:2826-2829, 2881, 2940): a site still
+/// finding kinds changes the fingerprint. Main thread.
 pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
     use std::hash::Hasher;
+    super::profile::merge_element_hits(chunk);
     let mut hash = crate::fasthash::FxHasher::default();
     for (pc, op) in chunk.jit_ops().iter().enumerate() {
         hash.write_usize(pc);

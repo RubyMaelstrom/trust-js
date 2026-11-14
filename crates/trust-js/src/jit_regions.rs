@@ -2031,6 +2031,8 @@ pub(super) fn emit_name_element_body(
     }
     // The value (d1) is in place: the access reads it as a register operand.
     match layout.native_typed_array {
+        // The body is the process-wide stub's too: it records nothing, and the site stores W17,
+        // the view's kind, at its hit (`emit_name_element`).
         Some(native) if leaf => typed_array::emit_access(
             a,
             &native,
@@ -2038,6 +2040,7 @@ pub(super) fn emit_name_element_body(
             committed,
             name_miss,
             typed_array::KindTag::Checked,
+            None,
         ),
         _ => {
             let value = write.then_some(typed_array::WriteValue::Register(1));
@@ -2048,6 +2051,7 @@ pub(super) fn emit_name_element_body(
                 committed,
                 name_miss,
                 typed_array::KindTag::Checked,
+                None,
             );
         }
     }
@@ -2226,6 +2230,10 @@ fn emit_name_element(
         );
     }
     a.bind(hit);
+    // A hit is a typed array's access (the body admits nothing else), which leaves W17 the view's
+    // kind: the element site's last-seen byte takes it (P3 stage 3, rule U).
+    let record = a.element_record(plan.elem_pc as u32);
+    typed_array::emit_record(a, record);
     if !plan.set {
         if lazy {
             // The result stays a register: nothing touches the operand stack.
@@ -3530,7 +3538,16 @@ pub(super) fn emit(
                     emit_word_read(a, layout, 11, 9, 12, bailout);
                     a.b(read);
                     a.bind(typed);
-                    typed_array::emit(a, layout, None, read, bailout, typed_array::KindTag::InW12);
+                    let record = a.element_record(pc as u32);
+                    typed_array::emit(
+                        a,
+                        layout,
+                        None,
+                        read,
+                        bailout,
+                        typed_array::KindTag::InW12,
+                        record,
+                    );
                     a.bind(read);
                     // The key's register holds the key until the read is known to be a Number.
                     emit_exec_number_guard(a, 12, 0, 13, bailout);
@@ -3594,6 +3611,7 @@ pub(super) fn emit(
                     a.b(stored);
                     a.bind(typed);
                     a.fmov_d_d(1, value);
+                    let record = a.element_record(pc as u32);
                     typed_array::emit(
                         a,
                         layout,
@@ -3601,6 +3619,7 @@ pub(super) fn emit(
                         stored,
                         bailout,
                         typed_array::KindTag::InW12,
+                        record,
                     );
                     a.bind(stored);
                     stack.pop();

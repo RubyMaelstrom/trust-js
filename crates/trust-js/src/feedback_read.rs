@@ -7,7 +7,9 @@
 //! Which parts are exact and which are hints, and when a view goes stale:
 //! - values and elements: rule U (the record together with the operation's in-line set) is
 //!   complete; the record alone is exact for what it holds, and its int32/double split and an
-//!   Array's facts are hints (the in-line paths record nothing);
+//!   Array's facts are hints (the in-line paths record nothing, but for ARM64's typed-array
+//!   accesses with the optimizing tier on, whose last-seen kinds the tier merges before it reads:
+//!   feedback-schema.txt 5.2);
 //! - named ways: exact when read, each a proof generated code re-validates (shapes are never
 //!   reused); a way may name a shape no live object has any more;
 //! - call targets: exact for the call-cache epoch they were filled in (`CallTarget::current`); an
@@ -114,12 +116,14 @@ pub(crate) struct ElementView {
     /// generic keyed access, and its record stopped growing at its helpers' misses.
     pub(crate) generic: bool,
     /// The record alone: the element kinds of the typed arrays it saw (feedback.rs
-    /// ELEM_TYPED_KINDS), as the VM and the misses saw them.
+    /// ELEM_TYPED_KINDS), as the VM, the misses and (the tier on) template code's merged in-line
+    /// hits saw them.
     pub(crate) typed_kinds: u32,
 }
 
 impl ElementView {
-    /// Whether a VM execution or a miss wrote the record.
+    /// Whether a VM execution, a miss or (the tier on) a merge of template code's in-line
+    /// typed-array hits wrote the record.
     pub(crate) fn has_record(&self) -> bool {
         self.recorded_receivers | self.recorded_keys != 0
     }

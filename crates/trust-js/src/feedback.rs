@@ -932,7 +932,9 @@ impl FeedbackVector {
 
     /// OR `bits` into the record of the operation at `pc`, storing only when the word changes
     /// (W4 steps 3 and 4). The record's layout per operation kind is feedback-schema.txt's
-    /// section 5; callers write it only on the VM's paths and generated code's miss paths.
+    /// section 5; callers write it only on the VM's paths, generated code's miss paths and, with
+    /// the optimizing tier on, the tier's merge of template code's last-seen typed-array kinds
+    /// (`opt::profile::merge_element_hits`, P3 stage 3 rule U).
     ///
     /// A transformed chunk's record goes to its operation's baseline site, through the record
     /// map, only when it adds a bit to those this chunk has forwarded for the operation, which

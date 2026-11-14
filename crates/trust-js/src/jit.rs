@@ -3369,6 +3369,12 @@ mod asm {
         /// The native runs an iteration of each loop counts, by its header's pc (P3 stage 2,
         /// step 11; `opt::loop_weight`): set with `loop_counts`, empty where no loop counts.
         loop_weights: Vec<u8>,
+        /// Each element site's pc and the address of its last-seen byte, ascending by pc, where
+        /// the code records its in-line typed-array hits (P3 stage 3, rule U;
+        /// `opt::element_records`, `super::typed_array::emit`): a chunk's template code with the
+        /// optimizing tier on. Empty in code that records nothing: the tier off, the tier's own
+        /// code, shared stubs and loose test assemblies.
+        element_records: Vec<(u32, u64)>,
     }
 
     #[derive(Clone, Copy)]
@@ -3419,6 +3425,7 @@ mod asm {
                 initialized_reads: Default::default(),
                 loop_counts: None,
                 loop_weights: Vec::new(),
+                element_records: Vec::new(),
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3548,6 +3555,18 @@ mod asm {
                 "a loop count at pc {header}, which no back edge targets"
             );
             u32::from(weight.max(1))
+        }
+        /// Declare each element site's last-seen byte (see the `element_records` field).
+        pub fn set_element_records(&mut self, records: Vec<(u32, u64)>) {
+            self.element_records = records;
+        }
+        /// The address of the last-seen byte of the element site at `pc`, where the code records
+        /// its in-line typed-array hits (see the `element_records` field).
+        pub fn element_record(&self, pc: u32) -> Option<u64> {
+            self.element_records
+                .binary_search_by_key(&pc, |&(at, _)| at)
+                .ok()
+                .map(|at| self.element_records[at].1)
         }
         /// Declare the local reads whose TDZ test is dead (see `Cfg::initialized_reads`).
         pub(crate) fn set_initialized_reads(&mut self, reads: crate::jit_ir::InitializedReads) {
@@ -6031,6 +6050,12 @@ fn compile_entry(
         if fits4(runs) && fits4(word) && fits4(checkpoint) {
             a.set_loop_counts(runs as u32, word as u32, checkpoint as u32);
         }
+    }
+    // P3 stage 3, rule U: with the optimizing tier on, the code's in-line typed-array hits store
+    // their view's kind in their site's last-seen byte (`typed_array::emit`), which the tier's
+    // readers merge into the element record; the tier off, it is emitted as before.
+    if let Some(records) = crate::opt::element_records(chunk) {
+        a.set_element_records(records);
     }
     // The local reads that need no TDZ test (`TRUST_JS_JIT_NO_TDZ_PROOF` keeps every test).
     if !env_flag!("TRUST_JS_JIT_NO_TDZ_PROOF") {
@@ -17134,6 +17159,7 @@ impl SharedStub {
                 let miss = a.new_label();
                 // W12 = the Object's kind tag (see `typed_array::emit`).
                 match layout.native_typed_array {
+                    // Process-wide: it records nothing (its callers store W17, the kind).
                     Some(native) => typed_array::emit_access(
                         a,
                         &native,
@@ -17141,6 +17167,7 @@ impl SharedStub {
                         hit,
                         miss,
                         typed_array::KindTag::InW12,
+                        None,
                     ),
                     None => a.b(miss),
                 }
@@ -18754,7 +18781,16 @@ fn emit_get_elem_inline_marked(
     a.sub_imm(20, 20, 8);
     a.b(done);
     a.bind(typed);
-    typed_array::emit(a, layout, None, hit, slow, typed_array::KindTag::InW12);
+    let record = a.element_record(pc);
+    typed_array::emit(
+        a,
+        layout,
+        None,
+        hit,
+        slow,
+        typed_array::KindTag::InW12,
+        record,
+    );
     a.bind(slow);
     emit_op_helper(a, H_GET_ELEM, pc, l_unwind);
     a.bind(done);
@@ -18823,6 +18859,7 @@ fn emit_set_elem_inline_marked(
     emit_word_store(a, layout, slow, done, true, keep);
     a.bind(typed);
     let typed_hit = a.new_label();
+    let record = a.element_record(pc);
     typed_array::emit(
         a,
         layout,
@@ -18830,6 +18867,7 @@ fn emit_set_elem_inline_marked(
         typed_hit,
         slow,
         typed_array::KindTag::InW12,
+        record,
     );
     a.bind(typed_hit);
     if keep {
@@ -19662,8 +19700,18 @@ fn emit_elem_local_keyed(
         emit_word_store(a, layout, slow, done, false, kind == ElemLocalKind::SetKeep);
     }
     a.bind(typed);
+    // The element operation is the last of the fused ones.
+    let record = pcs.last().and_then(|&pc| a.element_record(pc));
     if get {
-        typed_array::emit(a, layout, None, hit, slow, typed_array::KindTag::InW12);
+        typed_array::emit(
+            a,
+            layout,
+            None,
+            hit,
+            slow,
+            typed_array::KindTag::InW12,
+            record,
+        );
     } else {
         let typed_hit = a.new_label();
         typed_array::emit(
@@ -19673,6 +19721,7 @@ fn emit_elem_local_keyed(
             typed_hit,
             slow,
             typed_array::KindTag::InW12,
+            record,
         );
         a.bind(typed_hit);
         if kind == ElemLocalKind::SetKeep {
@@ -20605,7 +20654,7 @@ fn emit_chain_marked(
     // (chain index, bail label, virtual stack *before* the op) — slow paths follow the fast body.
     let mut bails: Vec<(usize, usize, Vec<(u32, bool)>)> = Vec::new();
 
-    for (idx, (cop, _pc)) in chain.iter().enumerate() {
+    for (idx, (cop, pc)) in chain.iter().enumerate() {
         // One bail label per chain op. The snapshot is the virtual stack before the op runs: the
         // emitter pops from `vregs` up front, but every guard fires before the op writes any
         // register or memory, so the snapshot registers still hold the pre-op values at any bail.
@@ -20877,6 +20926,7 @@ fn emit_chain_marked(
                     // A cached receiver's kind was checked by its first access, not here.
                     a.ldrb_imm(12, 11, ex);
                 }
+                let record = a.element_record(*pc as u32);
                 typed_array::emit(
                     a,
                     layout,
@@ -20884,6 +20934,7 @@ fn emit_chain_marked(
                     typed_hit,
                     guard!(),
                     typed_array::KindTag::InW12,
+                    record,
                 );
                 a.bind(typed_hit);
                 if !is_set {
@@ -25274,6 +25325,14 @@ mod count_guard_tests;
 ))]
 #[path = "jit_element_store_tests.rs"]
 mod element_store_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_element_record_tests.rs"]
+mod element_record_tests;
 
 #[cfg(all(
     test,

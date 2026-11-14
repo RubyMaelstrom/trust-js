@@ -458,6 +458,142 @@ fn typed_arrays_of_one_kind_run_in_the_tiers_code() {
 }
 
 #[test]
+fn typed_arrays_seen_only_by_template_code_run_in_line_in_the_tiers_code() {
+    // P3 stage 3, rule U: the functions above, warmed in template code alone (no VM run of
+    // their sites): their in-line hits' kinds, merged when the tier reads the records, make each
+    // site the kind's access in line, with no call of the template's stub, and the VM's results,
+    // with the tier on, eager and forcing exits (whose VM runs record as well).
+    const TYPED: &str = "function sumF(t) { let s = 0; for (let i = 0; i < 16; i++) s += t[i]; \
+         return s; }\n\
+         function scale(t, v) { for (let i = 0; i < 16; i++) t[i] = (t[i] * v + 0.5) % 1000; \
+         return t; }\n\
+         function clamp(b, v) { for (let i = 0; i < 16; i++) b[i] = v + i * 37; return b[3]; }\n\
+         function shorts(w, v) { for (let i = 0; i < 16; i++) w[i] = v * i; return w[15]; }\n\
+         const f = new Float64Array(16), c = new Uint8ClampedArray(16), w = new Int16Array(16);\n\
+         for (let k = 0; k < 3; k++) { scale(f, 1.5); sumF(f); clamp(c, 1.5); shorts(w, 1.5); }";
+    const RUN: &str = "let t = 0; for (let k = 0; k < 3000; k++) { scale(f, k % 3 ? 1.5 : -0.5); \
+         t = (t + sumF(f) + clamp(c, k * 0.75) + shorts(w, k * 1000.5)) % 1000003; }\n\
+         String(t) + f.join() + c.join() + w.join()";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, TYPED);
+        eval(&mut vm, RUN)
+    };
+    use super::ir::{NodeOp, TypedKind};
+    for (label, switches) in [
+        (
+            "on",
+            TestSwitches {
+                on: true,
+                ..Default::default()
+            },
+        ),
+        ("eager", eager()),
+        (
+            "forced exits",
+            TestSwitches {
+                on: true,
+                eager: true,
+                exit_every: 7,
+                ..Default::default()
+            },
+        ),
+    ] {
+        switches.set();
+        let mut engine = jit_engine();
+        eval(&mut engine, TYPED);
+        compiled();
+        exits();
+        assert_eq!(eval(&mut engine, RUN), expected, "{label}");
+        if switches.exit_every != 0 {
+            continue;
+        }
+        assert!(exits().is_empty(), "{label}: the speculation held");
+        let tier = compiled();
+        for (name, op) in [
+            ("sumF", NodeOp::LoadTyped(TypedKind::F64)),
+            ("scale", NodeOp::StoreTyped(TypedKind::F64)),
+            ("clamp", NodeOp::StoreTyped(TypedKind::U8Clamped)),
+            ("shorts", NodeOp::StoreTyped(TypedKind::I16)),
+        ] {
+            let chunk = tier_chunk(&mut engine, name)
+                .unwrap_or_else(|| panic!("{label} {name}: the tier's chunk"));
+            assert!(
+                tier.contains(&address(&chunk)),
+                "{label} {name}: the tier compiled it"
+            );
+            let graph = graph_now(&chunk);
+            assert!(
+                graph.nodes.iter().any(|node| node.op == op),
+                "{label} {name}"
+            );
+            assert!(
+                graph.nodes.iter().all(|node| !matches!(
+                    node.op,
+                    NodeOp::TypedElement { .. } | NodeOp::IsTypedArray
+                )),
+                "{label} {name}: no stub call, no kind branch"
+            );
+        }
+    }
+}
+
+#[test]
+fn sites_whose_last_seen_kind_misled_the_compile_settle() {
+    // P3 stage 3, rule U: two typed kinds alternating at a site, and an Array alternating with a
+    // typed array, seen by template code alone before the compile, which may have sampled one
+    // typed kind: the kind check exits, the VM records the other receiver, and the recompile
+    // takes the access the exit profile allows (the generic one where WrongElements exited, as
+    // JSC's DFG makes a site of several modes Generic, dfg/DFGArrayMode.cpp:155-158), after the
+    // exits the limits allow; the exits then stop and the results are the VM's.
+    for (what, other) in [
+        ("two kinds", "new Float64Array(8)"),
+        ("an Array", "[1, 2, 3, 4, 5, 6, 7, 8]"),
+    ] {
+        let source = format!(
+            "function at(t, i) {{ return t[i]; }} function put(t, i, v) {{ t[i] = v; }}
+             var a = new Int32Array(8), b = {other};
+             function run(n) {{ var s = 0; for (var k = 0; k < n; k++) {{
+               var t = (k >> 4) & 1 ? a : b; put(t, k & 7, k & 1023); s = (s + at(t, (k + 1) & 7)) % 1000003; }}
+               return s; }}"
+        );
+        let expected = {
+            let mut vm = Engine::new();
+            vm.set_tier(Tier::Bytecode);
+            vm.set_tier_threshold(0);
+            eval(&mut vm, &source);
+            [eval(&mut vm, "run(6000)"), eval(&mut vm, "run(2000)")]
+        };
+        eager().set();
+        let mut engine = jit_engine();
+        eval(&mut engine, &source);
+        // Template code first: a few calls below the first checkpoint.
+        assert_eq!(eval(&mut engine, "at(a, 1) + at(b, 1)"), {
+            let mut vm = Engine::new();
+            vm.set_tier(Tier::Bytecode);
+            eval(&mut vm, &source);
+            eval(&mut vm, "at(a, 1) + at(b, 1)")
+        });
+        exits();
+        assert_eq!(eval(&mut engine, "run(6000)"), expected[0], "{what}");
+        exits();
+        assert_eq!(eval(&mut engine, "run(2000)"), expected[1], "{what}");
+        assert!(exits().is_empty(), "{what}: settled");
+        for name in ["at", "put"] {
+            let chunk = tier_chunk(&mut engine, name)
+                .unwrap_or_else(|| panic!("{what} {name}: the tier's chunk"));
+            assert!(
+                discards(&chunk) <= 2,
+                "{what} {name}: {} discards",
+                discards(&chunk)
+            );
+        }
+    }
+}
+
+#[test]
 fn a_callee_free_loop_function_runs_in_the_tiers_code() {
     const LOOP: &str =
         "function sum(n) { let s = 0; for (let i = 0; i < n; i++) s = s + i; return s; }";
