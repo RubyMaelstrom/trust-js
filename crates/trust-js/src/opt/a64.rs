@@ -1140,7 +1140,8 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         | NodeOp::CheckStringProto { .. }
         | NodeOp::CheckCreatable { .. }
         | NodeOp::CheckNoProto { .. }
-        | NodeOp::StoreNew { .. } => ExitReason::WrongShape,
+        | NodeOp::StoreNew { .. }
+        | NodeOp::StringLength => ExitReason::WrongShape,
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
@@ -2295,6 +2296,32 @@ impl Gen<'_> {
                 key,
                 ways,
             } => self.lower_store_new(n, *location, *shape, *key, *ways)?,
+            NodeOp::StringLength => {
+                let site = self.check_exit(n)?;
+                let pc = graph.state(node.state.expect("checked")).pc;
+                let receiver = self.source(input(0), pc)?;
+                if let Some((_, _, record)) = self.exits.last_mut() {
+                    record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
+                        receiver,
+                        shapes: Box::new([]),
+                        ways: 0,
+                        hop: false,
+                    }));
+                }
+                // The String tag, as the templates test it (`emit_ascii_string_length`), then
+                // the header's length (a u32 of every string, flat or a view).
+                let word = self.gp(input(0), X16);
+                self.a.lsr_imm(X17, word, 48);
+                self.a.movz(X9, (crate::value::PACK_STR >> 48) as u32, 0);
+                self.a.cmp_reg_w(X17, X9);
+                self.a.b_cond(NE, site);
+                if !unused {
+                    self.a.ubfx(X17, word, 0, 48);
+                    let dst = self.gp_dst(n);
+                    self.a.ldr_w_imm(dst, X17, crate::lstr::LEN_OFF as u32);
+                    self.gp_done(n, dst);
+                }
+            }
             NodeOp::StoreSlot(slot) => {
                 let value = self.boxed(input(0), X16);
                 self.a.str_imm(value, 22, u32::from(*slot) * 8);

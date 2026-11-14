@@ -520,6 +520,13 @@ pub(crate) enum NodeOp {
     /// first (Maglev's EnsureWritableFastElements), frozen elements exit [WrongElements]. Its
     /// output is the object's words after the store: a copy's, a grown block's, or the input's.
     StoreElement(Store),
+    /// Tagged -> I32: a String's `length` (P3 stage 3 step L3): the word a String, else an exit
+    /// [WrongShape], then its header's length, the count of its UTF-16 code units for every
+    /// string, a flat buffer of either width or a view (lstr.rs unit_len), at most 2^30. A
+    /// String's own `length` is non-writable and non-configurable (ECMA-262 10.4.3.5): no code
+    /// can intervene. Maglev's StringLength, an int32 (maglev-reducer-inl.h:5198-5205); Warp's
+    /// MStringLength; JSC's GetArrayLength on a String.
+    StringLength,
     /// Cell -> Tagged: an Array's `length`, its first slot's word, a Number (ArrayCreate defines
     /// it first and nothing removes it: jit_storage.rs first_slot_addr), under an Array check, so
     /// that `i < a.length` loops keep their bodies free of effects (Maglev reads a JSArray's
@@ -708,6 +715,7 @@ impl NodeOp {
                 | NodeOp::CheckCreatable { .. }
                 | NodeOp::CheckNoProto { .. }
                 | NodeOp::StoreNew { .. }
+                | NodeOp::StringLength
                 | NodeOp::CheckBoolean
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CheckInitialized

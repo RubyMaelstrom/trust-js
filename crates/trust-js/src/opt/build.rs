@@ -549,6 +549,19 @@ impl Rules<'_> {
             .is_some_and(|arms| !self.stale_shapes(pc, &arm_shapes(&arms)))
     }
 
+    /// Whether the read of `name` at `pc` is a `length` whose site filled no way and holds no
+    /// generic mark (P3 stage 3 step L3): what a String's `length` leaves, which a String answers
+    /// by its tag and fills none (feedback-schema.txt 4, snapshot.rs `Ran::Unknown`), and an
+    /// Array's that the template read in line (RegExp's exec results). A method load is not one.
+    fn length_site(&self, pc: usize, name: u32) -> bool {
+        !matches!(self.ops[pc], Op::GetMethod(..))
+            && self.chunk.jit_name(name) == "length"
+            && self
+                .snapshot
+                .named(pc)
+                .is_some_and(|named| !named.generic && named.filled().next().is_none())
+    }
+
     /// A polymorphic named load's arms (P3 stage 3 step L2): data ways of objects at depth 0 (own,
     /// the holder the receiver) to 3, each level's shape recorded and cacheable, the location in a
     /// cache's reach, grouped by their walk (the levels' shapes, the holder's location and slot):
@@ -1606,6 +1619,10 @@ struct State {
     present: crate::fasthash::FastSet<(NodeIx, NodeIx)>,
     /// An Array word's `length`, loaded this effect epoch, which an append ends.
     lengths: FastMap<NodeIx, NodeIx>,
+    /// A String word's length (StringLength, P3 stage 3 step L3): a value fact, as a string's
+    /// units never change (lstr.rs), as Maglev records it a constant property of the string
+    /// (maglev-reducer-inl.h:5198-5205).
+    str_lengths: FastMap<NodeIx, NodeIx>,
     /// A typed array word's view, and a view's element count: value facts, as the view is fixed
     /// at install (its address may cross a safepoint: its owner's cell, which the accesses take
     /// too, keeps the view's memory, and the collector moves nothing).
@@ -1782,6 +1799,7 @@ fn meet_elements(first: &State, rest: &[(BlockIx, State)]) -> State {
             .collect(),
         lengths: alike(&first.lengths, rest, |state| &state.lengths),
         views: alike(&first.views, rest, |state| &state.views),
+        str_lengths: alike(&first.str_lengths, rest, |state| &state.str_lengths),
         typed_lengths: alike(&first.typed_lengths, rest, |state| &state.typed_lengths),
         typed_data: alike(&first.typed_data, rest, |state| &state.typed_data),
         ..State::default()
@@ -2754,6 +2772,7 @@ impl<'a> Builder<'a> {
         st.present.retain(|(words, _)| addresses.contains(words));
         st.lengths.retain(|word, _| live.contains(word));
         st.views.retain(|word, _| live.contains(word));
+        st.str_lengths.retain(|word, _| live.contains(word));
         let views: crate::fasthash::FastSet<NodeIx> = st.views.values().copied().collect();
         st.typed_lengths.retain(|view, _| views.contains(view));
         st.typed_data.retain(|(view, _), _| views.contains(view));
@@ -3118,6 +3137,7 @@ impl<'a> Builder<'a> {
             indices: met.indices,
             views: met.views,
             typed_lengths: met.typed_lengths,
+            str_lengths: met.str_lengths,
             typed_data,
             names,
             ..State::default()
@@ -4089,6 +4109,9 @@ impl<'a> Builder<'a> {
                     return self.effect(pc, st);
                 }
                 return self.poly_load(pc, recv, method, &arms, &shapes, st);
+            }
+            if self.rules().length_site(pc, name) {
+                return self.length(pc, recv, st);
             }
             return self.effect(pc, st);
         };
@@ -5627,6 +5650,44 @@ impl Builder<'_> {
             None => {
                 let length = self.add(NodeOp::LoadArrayLength, &[cell], Rep::Tagged, pc);
                 st.lengths.insert(receiver, length);
+                length
+            }
+        };
+        if matches!(recv, Recv::Stack) {
+            st.stack.pop();
+        }
+        st.stack.push(length);
+        Ok(())
+    }
+
+    /// A `length` read whose site has no way (`Rules::length_site`; P3 stage 3 step L3): a
+    /// String's length (StringLength [WrongShape]: the tag, then the header's count), a value fact
+    /// of the word; where a WrongShape flag declines it (the receivers were no Strings: RegExp's
+    /// exec results), an Array's length as `array_length` reads it, unless its checks are flagged
+    /// too, which leaves the generic access. With no record to say which, a site takes the String
+    /// first, as the census found 99.98% of these reads' String-only sites' (design-note 1).
+    fn length(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
+        if self.declined(pc, ExitReason::WrongShape, "an Array's length") {
+            return self.array_length(pc, recv, st);
+        }
+        let receiver = self.receiver(recv, st, 0, pc);
+        if self.rep(receiver) != Rep::Tagged {
+            return self.mismatch(pc, ExitReason::WrongShape, st);
+        }
+        let length = match st.str_lengths.get(&receiver) {
+            Some(&length) => length,
+            None => {
+                let mut cx = Before::new(pc);
+                let state = self.before(&mut cx, st);
+                let length = self.add_exit(
+                    NodeOp::StringLength,
+                    &[receiver],
+                    Rep::I32,
+                    pc,
+                    state,
+                    ExitReason::WrongShape,
+                );
+                st.str_lengths.insert(receiver, length);
                 length
             }
         };

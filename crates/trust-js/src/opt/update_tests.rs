@@ -108,3 +108,20 @@ fn an_update_whose_record_saw_a_string_stays_the_effect() {
         "{text}"
     );
 }
+
+#[test]
+fn a_strings_length_is_its_tag_check_and_header_read_once() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function len(s) { return s.length + s.length; }
+         for (var i = 0; i < 20; i++) len('abc' + i);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "len");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    let lengths = nodes(&graph, |op| *op == NodeOp::StringLength);
+    assert_eq!(lengths.len(), 1, "a value fact: {text}");
+    assert_eq!(lengths[0].rep, Rep::I32, "{text}");
+    assert_eq!(lengths[0].reason, Some(ExitReason::WrongShape), "{text}");
+}

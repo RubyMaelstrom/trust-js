@@ -142,4 +142,36 @@ fn the_programs_updates_and_lengths_are_the_tiers_nodes_before_its_changes() {
         ),
         "add appends in the tier's code"
     );
+    assert!(
+        lowered(
+            &mut engine,
+            "len",
+            |node| *node == NodeOp::StringLength,
+            |op| matches!(op, Op::GetPropLocal(..))
+        ),
+        "len reads lengths in the tier's code"
+    );
+}
+
+#[test]
+fn an_arrays_length_at_a_strings_site_exits_and_converges_on_the_arrays_length() {
+    // A site without a way takes a String's length; an Array there exits WrongShape until the
+    // discard, after which the recompile reads the Array's (and an exit there would leave the
+    // generic access).
+    let warm = "function f(a) { return a.length; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = t + f('ab' + k); t";
+    let chunk = converges(
+        "f",
+        warm,
+        "let u = 0; for (let k = 0; k < 600; k++) u = u + f([k, k, k]); u",
+        "f([1, 2]) + f([3])",
+        ExitReason::WrongShape,
+    );
+    assert!(
+        graph_now(&chunk)
+            .nodes
+            .iter()
+            .any(|node| node.op == super::super::ir::NodeOp::LoadArrayLength),
+        "the recompile reads the Array's length"
+    );
 }

@@ -656,6 +656,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         // Its value takes one of three representations (`representations`).
         NodeOp::StoreElement(_) => return None,
         NodeOp::LoadArrayLength => (CELL, Rep::Tagged),
+        NodeOp::StringLength => (TAGGED, Rep::I32),
         NodeOp::TypedView => (CELL, Rep::Ptr),
         NodeOp::TypedLength => (&[Rep::Ptr], Rep::I32),
         NodeOp::TypedData { .. } => (&[Rep::Cell, Rep::Ptr], Rep::Ptr),
