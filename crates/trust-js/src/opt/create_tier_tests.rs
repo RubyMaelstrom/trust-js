@@ -13,7 +13,9 @@ use super::*;
 /// `walk` a load through `c`'s chain around a creation on `p`, `c`'s prototype; `alias` a load of
 /// `a` around a creation on `b`, sometimes `a` itself; `fill` seven fields on an object literal
 /// (a record grows past the cell's three slots), `wide` twelve (past the commit's 8); `dict`
-/// a creation on an object in dictionary mode.
+/// a creation on an object in dictionary mode; `N` a chain ending at a user object whose null
+/// [[Prototype]] gains a setter's holder late (the chain's end check); `addv` a young value into
+/// old receivers (the card, under GC stress).
 pub(super) const CREATE: &str = "function P(a, b, c) { this.a = a; this.b = b; this.c = c; }\n\
      function Q(x, f) { if (f === 1) Object.freeze(this); else if (f === 2) Object.seal(this); \
        else if (f === 3) Object.preventExtensions(this); this.x = x; this.y = x + 1; }\n\
@@ -25,6 +27,10 @@ pub(super) const CREATE: &str = "function P(a, b, c) { this.a = a; this.b = b; t
      function wide(o, v) { o.a = v; o.b = v; o.c = v; o.d = v; o.e = v; o.f = v; o.g = v; o.h = v; \
        o.i = v; o.j = v; o.k = v; o.l = v; return o; }\n\
      function dict(o, v) { o.q = v; return o.q; }\n\
+     const nb = Object.create(null); nb.q = 1;\n\
+     function N(v) { this.s = v; } N.prototype = Object.create(nb);\n\
+     function Old() { this.a = 1; } const olds = []; for (let i = 0; i < 64; i++) olds.push(new Old());\n\
+     function addv(o, i) { o.v = { i: i, s: 'v' + i }; }\n\
      function h(x) { return typeof x === 'number' ? x % 1000003 : x === undefined ? -1 : 7; }\n\
      function sum(o) { let s = 0; for (const k in o) s = (s * 7 + h(o[k])) % 1000003; return s; }\n\
      let t = 0;\n\
@@ -43,6 +49,8 @@ pub(super) const CREATE: &str = "function P(a, b, c) { this.a = a; this.b = b; t
        t = (t * 31 + sum(fill({}, k)) + sum(wide({}, k))) % 1000003;\n\
        const d = { u: 1, v: 2, w: 3 }; if (k > 700) { delete d.v; }\n\
        t = (t * 31 + h(dict(d, k))) % 1000003;\n\
+       const nn = new N(k); t = (t * 31 + h(nn.s) + h(nn.ss)) % 1000003;\n\
+       if (k >= 1000 && k < 1064) addv(olds[k - 1000], k);\n\
      }\n\
      for (let k = 0; k < 1500; k++) {\n\
        if (k === 600) Object.defineProperty(P.prototype, 'b', \
@@ -50,8 +58,10 @@ pub(super) const CREATE: &str = "function P(a, b, c) { this.a = a; this.b = b; t
        if (k === 800) Object.defineProperty(S.prototype, 'w', { value: 9, writable: false });\n\
        if (k === 1000) { delete P.prototype.b; }\n\
        if (k === 1200) Object.defineProperty(Q.prototype, 'y', { value: 4, writable: false });\n\
+       if (k === 1300) Object.setPrototypeOf(nb, { set s(v) { this.ss = v * 5; } });\n\
        step(k);\n\
      }\n\
+     for (let i = 0; i < 64; i++) t = (t * 31 + olds[i].v.i + olds[i].v.s.length) % 1000003;\n\
      t";
 
 /// The gates' configurations, at splice and at TRUST_JS_OPT_INLINE=graph (chain_tier_tests'

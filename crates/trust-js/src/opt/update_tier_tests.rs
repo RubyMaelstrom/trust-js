@@ -6,7 +6,7 @@
 use super::*;
 
 /// `inc`, `dec`, `pre` and `add` update `o.x` (its value an int32, a double, -0, NaN, a String
-/// late, then a getter's); `big` overflows the int32 range; `len` reads Strings' lengths, `alen`
+/// late, then a getter's); `big` overflows the int32 range; `len` reads Strings' lengths, `two` two Strings', `alen`
 /// an exec result's.
 pub(super) const UPDATE: &str = "function inc(o) { return o.x++; }\n\
      function dec(o) { o.x--; return o.x; }\n\
@@ -15,6 +15,7 @@ pub(super) const UPDATE: &str = "function inc(o) { return o.x++; }\n\
      function big(o) { o.n++; return o.n; }\n\
      function len(s) { let n = 0; for (let i = 0; i < 3; i++) n += s.length; return n; }\n\
      function alen(re, s) { const a = re.exec(s); return a ? a.length : -1; }\n\
+     function two(a, b) { return a.length * 1000 + b.length; }\n\
      function h(x) { return typeof x === 'number' ? (x !== x ? -7 : Object.is(x, -0) ? -9 : x % 1000003) \
        : typeof x === 'string' ? x.length : -1; }\n\
      const long = 'x'.repeat(600) + '\\u00e9' + 'y'.repeat(300);\n\
@@ -35,6 +36,7 @@ pub(super) const UPDATE: &str = "function inc(o) { return o.x++; }\n\
        t = (t * 31 + h(big(n))) % 1000003;\n\
        t = (t * 31 + len(strs[k % strs.length]) + alen(/(a)(b)?/, k % 2 ? 'xab' : 'xa')) % 1000003;\n\
        if (k > 1400) t = (t * 31 + len([1, 2, 3])) % 1000003;\n\
+       t = (t * 31 + two(strs[k % 7], strs[(k + 3) % 7])) % 1000003;\n\
      }\n\
      t + ':' + o.x + ':' + p.x + ':' + q.x + ':' + r.x + ':' + g.v + ':' + n.n";
 
@@ -173,5 +175,20 @@ fn an_arrays_length_at_a_strings_site_exits_and_converges_on_the_arrays_length()
             .iter()
             .any(|node| node.op == super::super::ir::NodeOp::LoadArrayLength),
         "the recompile reads the Array's length"
+    );
+}
+
+#[test]
+fn a_string_appended_at_a_numbers_append_exits_and_converges_on_the_effect() {
+    // An append has no value record: a String read exits NotNumber until the discard, whose
+    // flag the recompile takes for the generic operation (the template's in-place append).
+    let warm = "function f(o, v) { o.k += v; return o.k; } const o = { k: 0 }, s = { k: '' };\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = t + f(o, 1); t";
+    converges(
+        "f",
+        warm,
+        "let u = 0; for (let k = 0; k < 600; k++) u = u + f(s, 'x').length; u",
+        "f(s, 'yz').length + f(o, 2)",
+        ExitReason::NotNumber,
     );
 }
