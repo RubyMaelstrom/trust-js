@@ -4229,3 +4229,32 @@ typeof, is in work).
   a debug build would panic on. The only such graph over Octane and the fixtures. With step 0c's
   agent to confirm and fix; the agents' common rules now ask for a sweep of the workloads under
   TRUST_JS_OPT_VERIFY=1 before any report.
+
+The verifier and a loop head without a back edge (fa793efa, 2026-11-14; target/p3/stage3/
+step0c-impl/report.txt's FOLLOWUP and followup/): the defect found beside lowerings L2, fixed.
+- The cause, from a dump of zlib's fn(d,f,g,h): step 0c's entry checks (CheckObject,
+  CheckElements, TypedData, each HoistingFailed at pc 1010) end the one predecessor of the block
+  at pc 1010, which heads a loop of the bytecode; the loop's only path to its latch ends in an
+  exit the builder makes where an operation the rules lower cannot take its operands
+  (Builder::mismatch, pc 1440), so no back edge is built and the block never becomes a loop
+  header in the graph (a block does at its first back edge). The verifier's rule for entry
+  speculations knew graph loop headers only.
+- No wrong frame could be rebuilt: the checks' exit is the one a real loop header's entry edge
+  has (the head's pc, the edge's state; its flag leaves the checks at their sites), the fix
+  changes no generated code, and with the rule passing zlib's whole graph passes every state
+  check. Release builds compiled the graph unverified from step 0c (c822fbea) on; a debug build
+  would have panicked on it, and TRUST_JS_OPT_VERIFY=1 refused the function.
+- The rule now takes a HoistingFailed check at the end of the one predecessor of a block that is
+  no loop header in the graph where that block's pc heads a loop of the frame's own bytecode
+  (Cfg::loop_at_header), with the state's pc and the nothing-after-it conditions as before and no
+  poll to compare handlers with. The phi selector's speculations and step 0's moved checks take
+  only headers with a back edge, so only the builder's entry checks meet the case.
+- Tests: a builder test of zlib's shape (it fails the old verifier with zlib's message) and an
+  end-to-end test whose entry check fails on a detached buffer (the exit at the head's pc with
+  the VM's result, the discard after its exits, the recompile without entry checks and without
+  exits; the tier on, eager and with forced exits); a mutation of the new rule, caught; the
+  tier's tests (361) in the four configurations and eager at graph; zombie's check.
+- The sweep: every Octane benchmark at 5 fixed runs and the fixtures and their fx3 copies under
+  TRUST_JS_OPT_VERIFY=1, at splice and at graph: 42 runs, no graph refused by the verifier (the
+  agent's; my own build of the landed tree: zlib at both settings, none, the function compiled).
+  This sweep is now a rule for every step before its report.
