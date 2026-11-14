@@ -619,6 +619,16 @@ fn named_way(state: IcState) -> Option<NamedWay> {
         depth if depth & IC_ARR_KEYCHK != 0 => (NamedWayKind::KeyChecked, depth & 0x1f, state.slot),
         depth => (NamedWayKind::Data, depth, state.slot),
     };
+    // A creation's prototype (its address split over `slot` and `mid2_shape`) and its epoch
+    // (`mid_shape`): Interp::try_ic_create's encoding.
+    let (proto, epoch) = if state.depth == IC_CREATE {
+        (
+            ((u64::from(state.mid2_shape) << 32) | u64::from(state.slot)) as usize,
+            state.mid_shape,
+        )
+    } else {
+        (0, 0)
+    };
     Some(NamedWay {
         receiver_shape: state.recv_shape,
         holder_shape: state.holder_shape,
@@ -629,6 +639,8 @@ fn named_way(state: IcState) -> Option<NamedWay> {
         kind,
         mids: [state.mid_shape, state.mid2_shape],
         mids_recorded: state.mid_ok & 0b11,
+        proto,
+        epoch,
     })
 }
 

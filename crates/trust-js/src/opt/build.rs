@@ -369,6 +369,92 @@ impl Rules<'_> {
         })
     }
 
+    /// A named store's creation ways (P3 stage 3 step L3; bytecode.rs IC_CREATE): every way a
+    /// creation of cacheable shapes, those whose prototype the snapshot walked (`Snapshot::
+    /// creation_chains`; a dead prototype's way is a proof nothing can meet) of one receiver
+    /// shape, one landing shape and location, and one chain: their chains alike, or of one length
+    /// and each ending at null (so that every level of each lacks the name, and a level's shapes
+    /// may be taken together, at most four). The receiver's check, a check per level reached by
+    /// its [[Prototype]] and of the end, the flags' check and the store (`Builder::creation_
+    /// store`), as SpiderMonkey's add-slot stub (jit/CacheIR.cpp:5616-5726). None for a name no
+    /// template creates (an index's, `length`, `prototype`: jit.rs store_may_create), a generic
+    /// mark, a site without its writability proof, a way of another kind, and the rest.
+    fn creation_ways(&self, pc: usize, name: u32) -> Option<Creation> {
+        let text = self.chunk.jit_name(name);
+        if text.is_empty()
+            || text.as_bytes()[0].is_ascii_digit()
+            || text == "length"
+            || text == "prototype"
+        {
+            return None;
+        }
+        let named = self.snapshot.named(pc)?;
+        if named.generic
+            || !named.writable
+            || named.filled().any(|way| way.kind != NamedWayKind::Creation)
+        {
+            return None;
+        }
+        let chains = self.snapshot.creation_chains(pc);
+        let mut creation: Option<Creation> = None;
+        let mut walks: Vec<&super::snapshot::CreationChain> = Vec::new();
+        for way in named.filled() {
+            let Some(chain) = chains.iter().find(|chain| chain.proto == way.proto) else {
+                continue;
+            };
+            if !crate::value::is_cacheable_shape(way.receiver_shape)
+                || !crate::value::is_cacheable_shape(way.holder_shape)
+                || way.location == 0
+            {
+                return None;
+            }
+            match &creation {
+                None => {
+                    creation = Some(Creation {
+                        shape: way.receiver_shape,
+                        landing: way.holder_shape,
+                        location: way.location,
+                        levels: Vec::new(),
+                        holder: chain.holder,
+                    })
+                }
+                Some(creation) => {
+                    if creation.shape != way.receiver_shape
+                        || creation.landing != way.holder_shape
+                        || creation.location != way.location
+                    {
+                        return None;
+                    }
+                }
+            }
+            if !walks.contains(&chain) {
+                walks.push(chain);
+            }
+        }
+        let mut creation = creation?;
+        let first = walks[0];
+        if walks.len() > 1
+            && walks
+                .iter()
+                .any(|walk| walk.holder || first.holder || walk.levels.len() != first.levels.len())
+        {
+            return None;
+        }
+        for level in 0..first.levels.len() {
+            let mut shapes: Vec<u32> = Vec::new();
+            for walk in &walks {
+                if !shapes.contains(&walk.levels[level]) {
+                    shapes.push(walk.levels[level]);
+                }
+            }
+            if shapes.len() > 4 {
+                return None;
+            }
+            creation.levels.push(shapes);
+        }
+        Some(creation)
+    }
+
     /// A named load's ways on the prototype chain (P3 stage 3 step L2): data ways of objects at
     /// depth 1 to 3, or of strings at depth 0 to 3 counted from String.prototype (the way's
     /// receiver shape), each level between with its recorded shape (the templates' limit and
@@ -1497,8 +1583,13 @@ struct State {
     fields: FastMap<(NodeIx, u16), NodeIx>,
     /// ...and an object's [[Prototype]] (P3 stage 3 step L2), keyed by the object (a receiver's
     /// word, or a prototype's cell), its checked cell (CheckProto), whose shapes `shapes` holds:
-    /// only an effect changes a [[Prototype]] or a shape (no lowered node does).
+    /// only an effect changes a [[Prototype]]; a shape changes at an effect and at a creation's
+    /// store (StoreNew, P3 stage 3 step L3), which ends the shape facts it may make false
+    /// (`Builder::creation_store`)...
     protos: FastMap<NodeIx, NodeIx>,
+    /// ...and the object words a creation's flags check proved extensible and no marked prototype
+    /// (CheckCreatable, P3 stage 3 step L3): only an effect changes either flag.
+    creatable: crate::fasthash::FastSet<NodeIx>,
     /// The elements kind an object word is proven to have (P3 stage 2 step 2): a value fact,
     /// since kind tags and IC_PLAIN never change once JavaScript sees an object (ElemKind).
     kinds: FastMap<NodeIx, ElemKind>,
@@ -1532,6 +1623,7 @@ impl State {
         self.shapes.clear();
         self.fields.clear();
         self.protos.clear();
+        self.creatable.clear();
         self.clear_elements();
         self.names.clear_heap();
     }
@@ -1621,6 +1713,12 @@ fn meet(preds: &[(BlockIx, State)]) -> State {
         })
         .map(|(&object, &proto)| (object, proto))
         .collect();
+    let creatable = first
+        .creatable
+        .iter()
+        .filter(|word| rest.iter().all(|(_, state)| state.creatable.contains(word)))
+        .copied()
+        .collect();
     State {
         forms,
         truth,
@@ -1628,6 +1726,7 @@ fn meet(preds: &[(BlockIx, State)]) -> State {
         shapes,
         fields,
         protos,
+        creatable,
         names: names::Facts::meet(preds),
         ..meet_elements(first, rest)
     }
@@ -1748,6 +1847,18 @@ struct Chain {
     levels: Vec<u32>,
     location: u16,
     slot: u32,
+}
+
+/// A named store's creation (`Rules::creation_ways`): the receiver's shape, the shape and the
+/// location the property lands on, the shapes each level of the receiver's chain may have
+/// (nearest first), and whether the last level holds the name as a writable data property (else
+/// the chain ends at null after it).
+struct Creation {
+    shape: u32,
+    landing: u32,
+    location: u16,
+    levels: Vec<Vec<u32>>,
+    holder: bool,
 }
 
 /// The receiver shapes of a polymorphic load's arms (`Rules::poly_ways`), each once.
@@ -2628,6 +2739,7 @@ impl<'a> Builder<'a> {
         st.shapes.retain(|word, _| live.contains(word));
         st.fields.retain(|(word, _), _| live.contains(word));
         st.protos.retain(|object, _| live.contains(object));
+        st.creatable.retain(|word| live.contains(word));
         // Element facts (P3 stage 2 step 2): a kind or an element address is an object word's,
         // and an index a Number's (reached through its value's forms, as a truncation is); a
         // used length and the element facts are an address's.
@@ -4188,11 +4300,25 @@ impl<'a> Builder<'a> {
         shape: u32,
         ways: u8,
     ) -> NodeIx {
+        self.prototype_in(st, cx, object, cell, &[shape], ways)
+    }
+
+    /// [`Builder::prototype`] for a level that may have any of `shapes` (P3 stage 3 step L3: a
+    /// creation's chains taken together).
+    fn prototype_in(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        object: NodeIx,
+        cell: NodeIx,
+        shapes: &[u32],
+        ways: u8,
+    ) -> NodeIx {
         if let Some(&proto) = st.protos.get(&object) {
             if st
                 .shapes
                 .get(&proto)
-                .is_some_and(|known| known.iter().all(|&known| known == shape))
+                .is_some_and(|known| known.iter().all(|known| shapes.contains(known)))
             {
                 return proto;
             }
@@ -4200,7 +4326,7 @@ impl<'a> Builder<'a> {
         let state = self.before(cx, st);
         let proto = self.add_exit(
             NodeOp::CheckProto {
-                shapes: vec![shape],
+                shapes: shapes.to_vec(),
                 ways,
             },
             &[cell],
@@ -4210,12 +4336,12 @@ impl<'a> Builder<'a> {
             ExitReason::WrongShape,
         );
         st.protos.insert(object, proto);
-        st.shapes.insert(proto, vec![shape]);
+        st.shapes.insert(proto, shapes.to_vec());
         proto
     }
 
     /// SetProp (which keeps the value), SetPropDrop, SetPropThisDrop and SetPropLocalDrop on own
-    /// writable data ways.
+    /// writable data ways, or on creation ways (P3 stage 3 step L3, `creation_store`).
     fn named_store(
         &mut self,
         pc: usize,
@@ -4225,6 +4351,12 @@ impl<'a> Builder<'a> {
         st: &mut State,
     ) -> Result<(), Refusal> {
         let Some(ways) = self.own_data_ways(pc, name, true) else {
+            if let Some(creation) = self.rules().creation_ways(pc, name) {
+                if self.shapes_declined(pc, &[creation.shape]) {
+                    return self.effect(pc, st);
+                }
+                return self.creation_store(pc, name, recv, keep, &creation, st);
+            }
             return self.effect(pc, st);
         };
         if self.stale_ways(pc, &ways) {
@@ -4249,6 +4381,106 @@ impl<'a> Builder<'a> {
         st.fields
             .retain(|&(_, location), _| location != ways.location);
         st.fields.insert((word, ways.location), stored);
+        let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
+        st.stack.truncate(len - pops);
+        if keep {
+            st.stack.push(value);
+        }
+        Ok(())
+    }
+
+    /// A store that creates its property (P3 stage 3 step L3; `Rules::creation_ways`; design
+    /// note 3): the receiver's shape (CheckShape), each level of its chain reached by its
+    /// [[Prototype]] and checked by its shapes (CheckProto) and the chain's end (CheckNoProto),
+    /// unless the receiver's facts of the epoch prove them, then that the receiver is extensible
+    /// and no marked prototype (CheckCreatable, unless proven) and the store (StoreNew), whose own
+    /// checks precede its first write; every check exits [WrongShape] with the operation's
+    /// before-state, so that nothing exits after a write. SpiderMonkey's add-slot stub, which
+    /// guards the receiver's old shape and every prototype's (jit/CacheIR.cpp:5616-5726,
+    /// ShapeGuardProtoChain 851-881), the checks without a dependency; JSC's CheckStructure,
+    /// its condition checks, PutByOffset and PutStructure (dfg/DFGByteCodeParser.cpp:8014-8072);
+    /// Maglev's StoreField then StoreMap (maglev-graph-builder.cc:4305-4423).
+    ///
+    /// The facts after it (design-note 4): the receiver's shape is the landing one; every other
+    /// value whose shape fact holds the receiver's old shape loses it, since it may be the same
+    /// object (two words for one object, or the object another's prototype, a walk's level), as
+    /// Maglev's transitioning StoreMap marks stale the nodes whose maps hold the old map
+    /// (maglev-known-node-aspects.cc:553-567, 912-932) and TurboFan's KillMaps keeps what its
+    /// maps-based alias test rules out (compiler/load-elimination.cc:1055-1072, 710-732); a fact
+    /// that excludes the old shape is no such object's. Every field fact at the new location ends,
+    /// as a store's, and the receiver's is the value. Links (a creation changes no
+    /// [[Prototype]]), flags, elements, typed arrays and the free names' facts stay: the store
+    /// writes none of them.
+    fn creation_store(
+        &mut self,
+        pc: usize,
+        name: u32,
+        recv: Recv,
+        keep: bool,
+        creation: &Creation,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let len = st.stack.len();
+        let value = st.stack[len - 1];
+        let receiver = self.receiver(recv, st, 1, pc);
+        let mut cx = Before::new(pc);
+        let word = self.tagged(st, receiver, pc);
+        let cell = self.shaped(st, &mut cx, word, &[creation.shape]);
+        let (mut object, mut level) = (word, cell);
+        for shapes in &creation.levels {
+            level = self.prototype_in(st, &mut cx, object, level, shapes, 1);
+            object = level;
+        }
+        if !creation.holder {
+            // The chain's end: the last level's [[Prototype]] null, a link fact to the null word.
+            let null = self.word(PACK_NULL);
+            if st.protos.get(&object) != Some(&null) {
+                let state = self.before(&mut cx, st);
+                self.add_exit(
+                    NodeOp::CheckNoProto { ways: 1 },
+                    &[level],
+                    Rep::None,
+                    pc,
+                    state,
+                    ExitReason::WrongShape,
+                );
+                st.protos.insert(object, null);
+            }
+        }
+        if !st.creatable.contains(&word) {
+            let state = self.before(&mut cx, st);
+            self.add_exit(
+                NodeOp::CheckCreatable { ways: 1 },
+                &[cell],
+                Rep::None,
+                pc,
+                state,
+                ExitReason::WrongShape,
+            );
+            st.creatable.insert(word);
+        }
+        let stored = self.tagged(st, value, pc);
+        let state = self.before(&mut cx, st);
+        self.add_exit(
+            NodeOp::StoreNew {
+                location: creation.location,
+                shape: creation.landing,
+                key: self.chunk.jit_name_key(name),
+                ways: 1,
+            },
+            &[cell, stored],
+            Rep::None,
+            pc,
+            state,
+            ExitReason::WrongShape,
+        );
+        let old = creation.shape;
+        st.shapes
+            .retain(|&object, shapes| object == word || !shapes.contains(&old));
+        st.shapes.insert(word, vec![creation.landing]);
+        st.fields
+            .retain(|&(_, location), _| location != creation.location);
+        st.fields.insert((word, creation.location), stored);
         let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
         st.stack.truncate(len - pops);
         if keep {

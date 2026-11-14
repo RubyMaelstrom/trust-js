@@ -356,6 +356,20 @@ pub(crate) enum NodeOp {
         shapes: Vec<u32>,
         ways: u8,
     },
+    /// Cell -> None: a creation's receiver may take a new property (P3 stage 3 step L3), as the
+    /// template's creation probe tests it (jit.rs emit_prop_create_probe): it is extensible
+    /// (FLAG_EXTENSIBLE, which no shape implies) and no marked prototype (FLAG_PROTO, whose
+    /// structural changes must move the creation epoch, which the VM's insert does); else an exit
+    /// [WrongShape]. `ways` as CheckProto's.
+    CheckCreatable {
+        ways: u8,
+    },
+    /// Cell -> None: the object's [[Prototype]] is null, else an exit [WrongShape]: a creation's
+    /// chain ends there (P3 stage 3 step L3; SpiderMonkey's ShapeGuardProtoChain ends at the
+    /// last prototype, whose shape implies its null prototype). `ways` as CheckProto's.
+    CheckNoProto {
+        ways: u8,
+    },
     /// Tagged -> Bool.
     // Stage 1's builder branches through ToBoolean and builds no CheckBoolean; the verifier and
     // the back end take one, as the tests do.
@@ -447,6 +461,24 @@ pub(crate) enum NodeOp {
     StoreField {
         location: u16,
         slot: u32,
+    },
+    /// (Cell, Tagged): the store that creates a plain data property of key word `key` (P3 stage 3
+    /// step L3) on an object whose shape, chain and flags its checks proved (CheckShape, a
+    /// CheckProto per level and CheckNoProto, CheckCreatable), as the template's creation commit
+    /// makes it (jit.rs emit_prop_create_probe,
+    /// emit_set_prop_inline's commit): where the object keeps no key index of its own, has fewer
+    /// than 8 named properties and has the key layout for its next slot (its own prediction
+    /// holding `key` with plain attributes, or the cached layout of `shape`, the landing shape),
+    /// else an exit [WrongShape] with nothing written; then, where the record lacks room for the
+    /// slot at `location`, the record grown by a pure call (`value::jit_grow_named_record`: it
+    /// allocates and neither collects nor runs JavaScript); then the layout, the value at
+    /// `location`, the card mark unless the value is no reference, `shape` and the count, with
+    /// no call between. `ways` as CheckProto's.
+    StoreNew {
+        location: u16,
+        shape: u32,
+        key: u64,
+        ways: u8,
     },
     /// (Tagged): writes the slot to the frame (a flush the builder places before effects and
     /// before exits that need the frame current).
@@ -673,6 +705,9 @@ impl NodeOp {
                 | NodeOp::CheckShape(_)
                 | NodeOp::CheckProto { .. }
                 | NodeOp::CheckStringProto { .. }
+                | NodeOp::CheckCreatable { .. }
+                | NodeOp::CheckNoProto { .. }
+                | NodeOp::StoreNew { .. }
                 | NodeOp::CheckBoolean
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CheckInitialized

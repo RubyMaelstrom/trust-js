@@ -613,6 +613,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::CheckObject | NodeOp::CheckShape(_) => (TAGGED, Rep::Cell),
         NodeOp::CheckProto { .. } => (CELL, Rep::Cell),
         NodeOp::CheckStringProto { .. } => (TAGGED, Rep::Cell),
+        NodeOp::CheckCreatable { .. } | NodeOp::CheckNoProto { .. } => (CELL, Rep::None),
         NodeOp::ShapeIs(_) => (CELL, Rep::Bool),
         NodeOp::CheckBoolean | NodeOp::ToBoolean => (TAGGED, Rep::Bool),
         NodeOp::F64ToBoolean => (F64, Rep::Bool),
@@ -641,7 +642,9 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::TaggedSame => (&[Rep::Tagged, Rep::Tagged], Rep::Bool),
         NodeOp::BoolNot => (BOOL, Rep::Bool),
         NodeOp::LoadField { .. } => (CELL, Rep::Tagged),
-        NodeOp::StoreField { .. } => (&[Rep::Cell, Rep::Tagged], Rep::None),
+        NodeOp::StoreField { .. } | NodeOp::StoreNew { .. } => {
+            (&[Rep::Cell, Rep::Tagged], Rep::None)
+        }
         NodeOp::CheckElements(_) => (CELL, Rep::None),
         NodeOp::LoadElements => (CELL, Rep::Ptr),
         NodeOp::LoadElementsUsed => (&[Rep::Ptr], Rep::I32),
@@ -880,6 +883,14 @@ fn representations(
                 "a prototype check of {} shapes, {ways} ways",
                 shapes.len()
             ))
+        }
+        NodeOp::CheckCreatable { ways } | NodeOp::CheckNoProto { ways }
+            if ways == 0 || ways > 4 =>
+        {
+            Err(format!("a creation's check of {ways} ways"))
+        }
+        NodeOp::StoreNew { location, ways, .. } if location == 0 || ways == 0 || ways > 4 => {
+            Err(format!("a creation at location {location}, {ways} ways"))
         }
         NodeOp::EntrySlot(_) if Some(node.block) != graph.entry => {
             Err("an entry slot outside the entry block".into())

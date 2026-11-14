@@ -173,6 +173,13 @@ pub(crate) struct NamedWay {
     /// shape (P3 stage 3 step L2: so does the optimizing tier's walk).
     pub(crate) mids: [u32; 2],
     pub(crate) mids_recorded: u8,
+    /// A creation's proof besides its shapes (P3 stage 3 step L3; bytecode.rs IC_CREATE): the
+    /// receiver's [[Prototype]] at the fill, by its cell's address (a word to compare, never to
+    /// read: the fill pinned the prototype, and the pin's prune moves the epoch before the
+    /// address can be reused), and the creation epoch the fill proved the chain at
+    /// (`value::proto_epoch`). 0 and 0 for every other kind.
+    pub(crate) proto: usize,
+    pub(crate) epoch: u32,
 }
 
 impl NamedWay {

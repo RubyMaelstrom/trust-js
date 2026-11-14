@@ -3479,3 +3479,7 @@ fn an_interruption_through_a_generic_node_in_a_try_leaves_the_function() {
     );
     assert_eq!(eval(&mut engine, "guarded(spin, 10)"), "56");
 }
+
+/// P3 stage 3 step L3: stores that create their property, end to end.
+#[path = "create_tier_tests.rs"]
+mod create;

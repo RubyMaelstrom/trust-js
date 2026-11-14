@@ -5891,3 +5891,7 @@ fn an_inner_loop_in_one_with_a_canonical_effect_loads_on_its_own_entry() {
     let a = slot_named(&chunk, "a") as usize;
     assert_hoisted(&graph, number, entry, inner_pc, &[a], &text);
 }
+
+/// P3 stage 3 step L3: named stores that create their property.
+#[path = "create_tests.rs"]
+mod create;

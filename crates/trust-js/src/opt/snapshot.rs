@@ -74,7 +74,32 @@ pub(crate) struct Snapshot {
     declined: Box<[(u32, u8)]>,
     /// Each free-name site's view (see [`NameView`]); empty for a chunk without one.
     names: Box<[NameView]>,
+    /// The creation ways' chains (see [`CreationChain`]), by pc, ascending; empty where no
+    /// creation way's prototype is alive or the snapshot read no realm.
+    chains: Box<[(u32, Box<[CreationChain]>)]>,
 }
+
+/// The prototype chain of a creation way's receiver as the main thread walked it at the
+/// snapshot (P3 stage 3 step L3): from the way's prototype (its cell's address, 0 for none; a
+/// prototype the creation's fill pinned, alive), each level an ordinary IC_PLAIN object of a
+/// cacheable shape, its shape, to the first level holding the name, which it holds as a writable
+/// data property (`holder`), or to the end of the chain (a null [[Prototype]] after the last).
+/// The compile checks the live chain against it level by level, as SpiderMonkey's add-slot stub
+/// guards every prototype's shape (jit/CacheIR.cpp ShapeGuardProtoChain 851-881): the shapes key
+/// every level's own names and attributes (value.rs:8600-8609), so they prove that no setter and
+/// no read-only property of the name is skipped, where the creation way's own proof (the
+/// prototype's identity and the process-wide creation epoch, Interp::try_ic_create) is one that
+/// another engine of the process moves.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreationChain {
+    pub(crate) proto: usize,
+    pub(crate) levels: Box<[u32]>,
+    pub(crate) holder: bool,
+}
+
+/// The most levels a creation's chain may have: the creation fill's walk bound
+/// (interpreter.rs try_ic_create).
+const MAX_CREATION_LEVELS: usize = 8;
 
 // Every reason has its bit in a declined mask: the discriminants run from 0 to the last reason's
 // (ExitReason's last variant), which the mask's width bounds.
@@ -179,6 +204,8 @@ pub(crate) struct Raw {
     names: Vec<(u32, NameView)>,
     /// The exit profile's declines (see [`Snapshot`]'s `declined`; rare: made afresh).
     declined: Box<[(u32, u8)]>,
+    /// The creation ways' chains (see [`CreationChain`]; made afresh where there are any).
+    chains: Vec<(u32, Box<[CreationChain]>)>,
 }
 
 impl Raw {
@@ -214,6 +241,14 @@ impl Raw {
             }
         }
         chunk.copy_feedback_into(&mut self.feedback);
+        self.chains.clear();
+        if let Some(realm) = realm {
+            for (pc, op) in ops.iter().enumerate() {
+                if let Some(chains) = creation_chains(chunk, pc, op, realm) {
+                    self.chains.push((pc as u32, chains));
+                }
+            }
+        }
         self.declined = declined(
             chunk,
             chunk.feedback_vector().record_map(),
@@ -360,6 +395,19 @@ impl Snapshot {
             ran: ran.into_boxed_slice(),
             declined: raw.declined.clone(),
             names: names.into_boxed_slice(),
+            chains: raw.chains.clone().into_boxed_slice(),
+        }
+    }
+
+    /// The chains of the creation ways of the named store at `pc` whose prototypes the snapshot
+    /// walked (see [`CreationChain`]); empty for any other site.
+    pub(crate) fn creation_chains(&self, pc: usize) -> &[CreationChain] {
+        match self
+            .chains
+            .binary_search_by_key(&(pc as u32), |&(at, _)| at)
+        {
+            Ok(at) => &self.chains[at].1,
+            Err(_) => &[],
         }
     }
 
@@ -566,6 +614,92 @@ fn with_baseline_records(own: SiteView, baseline: SiteView) -> SiteView {
         }
         (own, _) => own,
     }
+}
+
+/// The chains of the creation ways of `chunk`'s named store `op` at `pc` (main thread; see
+/// [`CreationChain`]), each way's prototype found alive by its pin in `realm`
+/// (`Interp::creation_pins`, which keeps the prototype's allocation for its ways' identity
+/// compares); None where the site has none. A way whose prototype died, or whose chain has a level
+/// that is no ordinary IC_PLAIN object, an uncacheable shape, a setter or a read-only property of
+/// the name, or more levels than the fill walks, has no chain.
+fn creation_chains(
+    chunk: &Chunk,
+    pc: usize,
+    op: &Op,
+    realm: &Interp,
+) -> Option<Box<[CreationChain]>> {
+    let (Op::SetProp(name, _)
+    | Op::SetPropDrop(name, _)
+    | Op::SetPropThisDrop(name, _)
+    | Op::SetPropLocalDrop(_, name, _)) = *op
+    else {
+        return None;
+    };
+    let named = match chunk.feedback_view(pc) {
+        SiteView::Named(named) => named,
+        _ => return None,
+    };
+    let creations = || {
+        named
+            .filled()
+            .filter(|way| way.kind == crate::feedback::NamedWayKind::Creation)
+    };
+    creations().next()?;
+    let key = crate::atom::PropKey::from_text(chunk.jit_name(name));
+    let mut chains: Vec<CreationChain> = Vec::new();
+    for way in creations() {
+        if chains.iter().any(|chain| chain.proto == way.proto) {
+            continue;
+        }
+        let mut level = if way.proto == 0 {
+            None
+        } else {
+            match realm
+                .creation_pins
+                .get(&way.proto)
+                .and_then(crate::value::WeakGc::upgrade)
+            {
+                Some(proto) => Some(proto),
+                None => continue,
+            }
+        };
+        let mut levels = Vec::new();
+        let mut holder = false;
+        let mut walked = true;
+        while let Some(object) = level {
+            let Ok(object) = object.try_borrow() else {
+                walked = false;
+                break;
+            };
+            let shape = object.props.shape();
+            if levels.len() == MAX_CREATION_LEVELS
+                || !(object.kind.is_ordinary() && object.ic_plain())
+                || !crate::value::is_cacheable_shape(shape)
+            {
+                walked = false;
+                break;
+            }
+            levels.push(shape);
+            if let Some(slot) = object.props.slot_of_key(key) {
+                match object.props.property_at(slot) {
+                    Some(property) if !property.accessor() && property.writable() => {
+                        holder = true;
+                    }
+                    _ => walked = false,
+                }
+                break;
+            }
+            level = object.proto;
+        }
+        if walked {
+            chains.push(CreationChain {
+                proto: way.proto,
+                levels: levels.into_boxed_slice(),
+                holder,
+            });
+        }
+    }
+    (!chains.is_empty()).then(|| chains.into_boxed_slice())
 }
 
 /// The evidence the view of `op` gives (see [`Ran`]), `name` giving a name's text.

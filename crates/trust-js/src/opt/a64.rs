@@ -395,6 +395,17 @@ pub(crate) fn assemble(
             "an Array's append in a layout the code cannot address",
         ));
     }
+    let creations = graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::StoreNew { .. }));
+    if creations && !set_prop_inlinable(layout) {
+        // The template's creation probe and commit bake the same offsets in
+        // (`emit_prop_create_probe`, `emit_set_prop_inline`).
+        return Err(Refusal::whole(
+            "a property's creation in a layout the code cannot address",
+        ));
+    }
     let alloc = regalloc::allocate(graph, &regalloc::ARM64)?;
     let frame = entry_frame(&alloc)?;
     let mut gen = Gen::new(
@@ -514,6 +525,12 @@ fn check_graph(
                             return Err(Refusal::at(pc as usize, "an effect's stack effect"));
                         }
                     }
+                }
+                NodeOp::StoreNew { shape, .. } if !crate::value::is_cacheable_shape(shape) => {
+                    return Err(Refusal::at(
+                        node.pc as usize,
+                        "a creation without a proving landing shape",
+                    ));
                 }
                 NodeOp::CheckShape(ref shapes)
                 | NodeOp::CheckProto { ref shapes, .. }
@@ -784,6 +801,14 @@ enum Cold {
     },
     /// A branch to a label (an effect's throw into its exit).
     Jump { label: usize, target: usize },
+    /// A creation's record without room for its slot (StoreNew, P3 stage 3 step L3): the
+    /// record grown by the template's pure call (`value::jit_grow_named_record`), the Object in
+    /// x17 and the layout to install in x16 kept, then `resume`.
+    CreateGrow {
+        label: usize,
+        node: NodeIx,
+        resume: usize,
+    },
 }
 
 /// The exits of an Array's hole fill or append: a receiver, prototype or `length` the in-line
@@ -1110,9 +1135,12 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckNumber | NodeOp::TruncateNumberOrOddball => ExitReason::NotNumber,
         NodeOp::CheckInt32 => ExitReason::NotInt32,
         NodeOp::CheckObject => ExitReason::NotObject,
-        NodeOp::CheckShape(_) | NodeOp::CheckProto { .. } | NodeOp::CheckStringProto { .. } => {
-            ExitReason::WrongShape
-        }
+        NodeOp::CheckShape(_)
+        | NodeOp::CheckProto { .. }
+        | NodeOp::CheckStringProto { .. }
+        | NodeOp::CheckCreatable { .. }
+        | NodeOp::CheckNoProto { .. }
+        | NodeOp::StoreNew { .. } => ExitReason::WrongShape,
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
@@ -2231,6 +2259,42 @@ impl Gen<'_> {
                     emit_card_mark(&mut self.a, cell, X9, X30);
                 }
             }
+            NodeOp::CheckCreatable { ways } | NodeOp::CheckNoProto { ways } => {
+                let site = self.check_exit(n)?;
+                let pc = graph.state(node.state.expect("checked")).pc;
+                let receiver = self.source(input(0), pc)?;
+                let hop = matches!(node.op, NodeOp::CheckNoProto { .. });
+                if let Some((_, _, record)) = self.exits.last_mut() {
+                    record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
+                        receiver,
+                        shapes: Box::new([]),
+                        ways: *ways,
+                        hop,
+                    }));
+                }
+                let layout = self.layout;
+                let cell = self.gp(input(0), X16);
+                self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
+                if hop {
+                    // The chain's end: a null [[Prototype]], read from the object as the
+                    // templates' hop reads it.
+                    self.a.ldr_imm(X16, X17, layout.obj_proto as u32);
+                    self.a.cbnz(X16, true, site);
+                } else {
+                    // As the template's creation probe (`emit_prop_create_probe`): extensible
+                    // and no marked prototype.
+                    self.a.ldrb_imm(X16, X17, layout.obj_flags as u32);
+                    self.a
+                        .tbz(X16, flag_bit(crate::value::FLAG_EXTENSIBLE), site);
+                    self.a.tbnz(X16, flag_bit(crate::value::FLAG_PROTO), site);
+                }
+            }
+            NodeOp::StoreNew {
+                location,
+                shape,
+                key,
+                ways,
+            } => self.lower_store_new(n, *location, *shape, *key, *ways)?,
             NodeOp::StoreSlot(slot) => {
                 let value = self.boxed(input(0), X16);
                 self.a.str_imm(value, 22, u32::from(*slot) * 8);
@@ -2939,6 +3003,26 @@ impl Gen<'_> {
                         self.a.bind(label);
                         self.emit_element_create(node, out, done, exits);
                     }
+                    Cold::CreateGrow {
+                        label,
+                        node,
+                        resume,
+                    } => {
+                        // jit_grow_named_record(cell, count), the template's call (W2d step 3):
+                        // room for the next slot, made after every check of the creation and
+                        // before its first write; it allocates a storage block and neither
+                        // collects nor runs JavaScript. The live caller-saved values, the Object
+                        // (x17) and the layout to install (x16) are kept across it.
+                        self.a.bind(label);
+                        let layout = self.layout;
+                        let saved = self.save_live_caller_saved_and(node, &[X16, X17]);
+                        named_len(&mut self.a, layout, 1, X17);
+                        self.a.sub_imm(0, X17, layout.obj_from_cell as u32);
+                        self.a.ldr_imm(X16, 21, (H_GROW_NAMED_RECORD * 8) as u32);
+                        self.a.blr(X16);
+                        self.restore_live_caller_saved(&saved);
+                        self.a.b(resume);
+                    }
                     Cold::Edge { label, from, to } => {
                         self.a.bind(label);
                         self.emit_moves(from, to)?;
@@ -3561,6 +3645,157 @@ impl Gen<'_> {
     /// and the hole checked first; then the value's store by its representation, every check
     /// before the first write. The cell, the first input, keeps the words alive, and marks its
     /// card for an edge.
+    /// StoreNew (P3 stage 3 step L3): the template's creation commit (`emit_prop_create_probe`
+    /// and `emit_set_prop_inline`'s commit, jit.rs) on the tier's scratch registers, its shapes
+    /// and location the node's constants: the checks first, each to the node's exit with nothing
+    /// written (no key index of its own, a named count below 8, the key layout); the record's
+    /// growth where a record slot lacks room, a pure call (cold); then the commit with no call
+    /// between its writes: the layout where one is installed, the value, the card (the Object's
+    /// address shares its cell's card), the landing shape and the count, as the template orders
+    /// them (the count last: the collector reads the slots below it).
+    fn lower_store_new(
+        &mut self,
+        n: NodeIx,
+        location: u16,
+        shape: u32,
+        key: u64,
+        ways: u8,
+    ) -> Result<(), Refusal> {
+        use crate::value::{
+            SHAPE_LAYOUT_PAGE_BITS, SHAPE_LAYOUT_PAGE_COUNT, SHAPE_LAYOUT_PAGE_SIZE,
+        };
+        let node = self.graph.node(n);
+        let (cell, value) = (node.inputs[0], node.inputs[1]);
+        let layout = self.layout;
+        let site = self.check_exit(n)?;
+        let pc = self.graph.state(node.state.expect("checked")).pc;
+        let receiver = self.source(cell, pc)?;
+        if let Some((_, _, record)) = self.exits.last_mut() {
+            record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
+                receiver,
+                shapes: Box::new([]),
+                ways,
+                hop: false,
+            }));
+        }
+        // A record slot's index in the record, which the location names past the record's header.
+        let record_index = if location & 1 != 0 {
+            let offset = usize::from(location >> 1);
+            if offset < layout.record_slots || !(offset - layout.record_slots).is_multiple_of(8) {
+                return Err(Refusal::at(pc as usize, "a creation's record slot"));
+            }
+            Some((offset - layout.record_slots) / 8)
+        } else {
+            None
+        };
+        let c = self.gp(cell, X16);
+        self.a.add_imm(X17, c, layout.obj_from_cell as u32);
+        // 1. A small map: no key index of its own, fewer than 8 named properties (the 9th needs
+        //    one, value.rs ensure_fallback_index): x9 the count.
+        guard_no_key_index(&mut self.a, layout, X17, X16, site);
+        named_len(&mut self.a, layout, X9, X17);
+        self.a.cmp_imm_x(X9, 8);
+        self.a.b_cond(HS, site);
+        // 2. The key layout for the next slot: the object's own prediction holding the key with
+        //    plain attributes (x16 = 0, nothing to install), else the landing shape's cached
+        //    layout from the shape-layout directory (x16), whose entry must be the shape's.
+        let transition = self.a.new_label();
+        let laid = self.a.new_label();
+        let plain = self.a.new_label();
+        self.a
+            .ldr_imm(X16, X17, (layout.obj_props + layout.props_layout) as u32);
+        self.a.cbz(X16, true, transition);
+        self.a.ldr_w_imm(X30, X16, layout.layout_keys_len as u32);
+        self.a.cmp_reg_x(X9, X30);
+        self.a.b_cond(HS, transition);
+        self.a.ldr_w_imm(X30, X16, layout.layout_attrs_len as u32);
+        self.a.cbz(X30, false, plain);
+        self.a.ldr_imm(X30, X16, layout.layout_attrs_ptr as u32);
+        self.a.ldrb_reg(X30, X30, X9);
+        self.a.cmp_imm_w(X30, crate::value::PROP_PLAIN as u32);
+        self.a.b_cond(NE, transition);
+        self.a.bind(plain);
+        self.a.ldr_imm(X16, X16, layout.layout_keys_ptr as u32);
+        self.a.ldr_x_lsl3(X16, X16, X9);
+        self.a.mov_imm64(X30, key);
+        self.a.cmp_reg_x(X16, X30);
+        self.a.b_cond(NE, transition);
+        self.a.movz(X16, 0, 0);
+        self.a.b(laid);
+        self.a.bind(transition);
+        // The directory's candidate for the shape (property_shapes.rs ShapeLayouts::index).
+        let index = shape as usize & (SHAPE_LAYOUT_PAGE_SIZE * SHAPE_LAYOUT_PAGE_COUNT - 1);
+        let (page, entry) = (
+            index >> SHAPE_LAYOUT_PAGE_BITS,
+            index & ((1 << SHAPE_LAYOUT_PAGE_BITS) - 1),
+        );
+        self.a
+            .ldr_imm(X16, 19, std::mem::offset_of!(JitCtx, shape_layouts) as u32);
+        self.a.ldr_imm(X16, X16, (8 * page) as u32);
+        self.a.cbz(X16, true, site);
+        self.a
+            .add_imm(X16, X16, (entry * layout.shape_layout_entry_size) as u32);
+        self.a
+            .ldr_w_imm(X30, X16, layout.shape_layout_entry_id as u32);
+        if shape < 4096 {
+            self.a.cmp_imm_w(X30, shape);
+        } else {
+            self.a.mov_imm64(X9, u64::from(shape));
+            self.a.cmp_reg_w(X30, X9);
+        }
+        self.a.b_cond(NE, site);
+        self.a
+            .ldr_imm(X16, X16, layout.shape_layout_entry_keys as u32);
+        self.a.cbz(X16, true, site);
+        named_len(&mut self.a, layout, X9, X17);
+        self.a.ldr_w_imm(X30, X16, layout.layout_keys_len as u32);
+        self.a.cmp_reg_x(X9, X30);
+        self.a.b_cond(HS, site);
+        self.a.bind(laid);
+        // 3. Room for the slot: the landing shape proves a cell slot's; a record slot needs the
+        //    record and its capacity (`guard_loc_room`), else the record grows (cold).
+        if let Some(index) = record_index {
+            let grow = self.a.new_label();
+            let room = self.a.new_label();
+            self.a
+                .ldr_imm(X30, X17, (layout.obj_props + layout.props_record) as u32);
+            self.a.cbz(X30, true, grow);
+            self.a.ldr_w_imm(X30, X30, layout.record_cap as u32);
+            self.a.cmp_imm_w(X30, index as u32);
+            self.a.b_cond(LS, grow);
+            self.a.bind(room);
+            self.cold.push(Cold::CreateGrow {
+                label: grow,
+                node: n,
+                resume: room,
+            });
+        }
+        // 4. The commit.
+        let kept = self.a.new_label();
+        self.a.cbz(X16, true, kept);
+        self.a
+            .str_imm(X16, X17, (layout.obj_props + layout.props_layout) as u32);
+        self.a.bind(kept);
+        slot_addr_loc_const(&mut self.a, layout, X30, X17, location);
+        let word = self.gp(value, X9);
+        self.a.str_imm(word, X30, 0);
+        // The write barrier (the template's site B): the Object can be old (a constructor's
+        // `this` made before the callee's entry poll), and an installed layout is an edge too.
+        debug_assert_object_in_cell_card(layout);
+        emit_card_mark(&mut self.a, X17, X9, X30);
+        if shape < 4096 {
+            self.a.movz(X9, shape, 0);
+        } else {
+            self.a.mov_imm64(X9, u64::from(shape));
+        }
+        self.a
+            .str_w_imm(X9, X17, (layout.obj_props + layout.props_shape) as u32);
+        named_len(&mut self.a, layout, X9, X17);
+        self.a.add_imm(X9, X9, 1);
+        named_set_len(&mut self.a, layout, X9, X17);
+        Ok(())
+    }
+
     fn lower_store_element(&mut self, n: NodeIx, mode: Store) -> Result<(), Refusal> {
         use crate::value::word_block::{KIND_INT32, KIND_UNWRITABLE};
         let node = self.graph.node(n);
