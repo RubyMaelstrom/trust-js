@@ -306,3 +306,74 @@ fn a_hops_exit_keeps_its_accesss_receiver_count_in_the_exit_profile() {
         "{sites:?}"
     );
 }
+
+/// A string's methods (P3 stage 3 step L2's string form): `code` a String.prototype method and
+/// its call, `has` one of Object.prototype's through String.prototype, `two` two loads around a
+/// call, `any` a site that meets a String wrapper and an object besides strings; the driver
+/// redefines a method, adds and deletes String.prototype's properties, shadows Object.prototype's
+/// method on String.prototype, freezes String.prototype and swaps its prototype.
+pub(super) const STRINGS: &str = "function code(s, i) { return s.charCodeAt(i); }\n\
+     function has(s) { return s.hasOwnProperty('length') ? 1 : 0; }\n\
+     function two(s, f) { var a = s.charCodeAt(0); f(); return a * 1000 + s.charCodeAt(1); }\n\
+     function any(s) { return s.indexOf('b'); }\n\
+     function noop() {}\n\
+     const strs = ['abc', 'bcd', 'x\\u00e9y', 'longer string'];\n\
+     const keep = String.prototype.charCodeAt, keepHas = Object.prototype.hasOwnProperty;\n\
+     let t = 0;\n\
+     for (let k = 0; k < 3000; k++) {\n\
+       const s = strs[k & 3];\n\
+       if (k === 600) String.prototype.charCodeAt = function (i) { return 7 + i; };\n\
+       if (k === 800) String.prototype.charCodeAt = keep;\n\
+       if (k === 1000) String.prototype.extra = 1;\n\
+       if (k === 1200) delete String.prototype.extra;\n\
+       if (k === 1400) String.prototype.hasOwnProperty = function () { return false; };\n\
+       if (k === 1600) delete String.prototype.hasOwnProperty;\n\
+       if (k === 1800) Object.prototype.hasOwnProperty = function () { return true; };\n\
+       if (k === 2000) Object.prototype.hasOwnProperty = keepHas;\n\
+       if (k === 2200) Object.setPrototypeOf(String.prototype, { hasOwnProperty() { return true; } });\n\
+       if (k === 2400) Object.setPrototypeOf(String.prototype, Object.prototype);\n\
+       if (k === 2600) Object.freeze(String.prototype);\n\
+       const between = k === 700 ? function () { String.prototype.charCodeAt = function () { return 3; }; } \
+         : k === 1500 ? function () { String.prototype.more = 2; } : noop;\n\
+       let r;\n\
+       try { r = two(s, between); } catch (e) { r = -9; }\n\
+       const odd = k % 50 === 0 ? new String('abc') : k % 50 === 1 ? { indexOf() { return 99; } } : s;\n\
+       t = (t * 31 + code(s, k & 1) + has(s) + r + any(odd)) % 1000003;\n\
+     }\n\
+     t + ':' + code('zz', 1) + ':' + has('q') + ':' + any('abc')";
+
+#[test]
+fn a_strings_loads_have_the_vms_results_under_every_mutation_of_string_prototype() {
+    let expected = run(Tier::Bytecode, STRINGS);
+    let mut compiles = 0;
+    for (label, switches) in configurations() {
+        compiled();
+        exits();
+        assert_eq!(
+            with_switches(switches, STRINGS),
+            expected,
+            "{label} {switches:?}"
+        );
+        compiles += compiled().len();
+    }
+    assert!(compiles > 0, "the tier compiled the functions");
+}
+
+#[test]
+fn the_string_programs_loads_take_string_prototype_before_its_mutations() {
+    let warm = STRINGS.replace("k < 3000", "k < 400");
+    let expected = run(Tier::Bytecode, &warm);
+    eager().set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, &warm), expected);
+    for name in ["code", "has", "two"] {
+        let chunk = tier_chunk(&mut engine, name).unwrap_or_else(|| panic!("{name}'s tier chunk"));
+        assert!(
+            graph_now(&chunk)
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, super::super::ir::NodeOp::CheckStringProto { .. })),
+            "{name} takes String.prototype"
+        );
+    }
+}

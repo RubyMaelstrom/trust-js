@@ -1323,11 +1323,27 @@ fn stays_an_effect(chunk: &crate::bytecode::Chunk, pc: usize) -> bool {
             .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. } if at as usize == pc))
 }
 
+/// Whether the tier's graph of `chunk` takes a string's method at `pc` through String.prototype
+/// (P3 stage 3 step L2): a CheckStringProto, and no effect at `pc`.
+fn takes_string_prototype(chunk: &crate::bytecode::Chunk, pc: usize) -> bool {
+    use super::ir::NodeOp;
+    let graph = graph_now(chunk);
+    graph
+        .nodes
+        .iter()
+        .any(|node| matches!(node.op, NodeOp::CheckStringProto { .. }) && node.pc as usize == pc)
+        && !graph
+            .nodes
+            .iter()
+            .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. } if at as usize == pc))
+}
+
 #[test]
-fn named_reads_on_primitives_stay_effects_and_never_exit() {
+fn a_strings_method_takes_string_prototype_and_a_numbers_or_a_booleans_stays_an_effect() {
     // Each site's way names String.prototype's (Number's, Boolean's) shape: its fill's receiver
-    // was the primitive's wrapper prototype, and the mark keeps the builder from checking the
-    // receiver word against it.
+    // was the primitive's wrapper prototype. A string's site checks the word a String and loads
+    // from the realm's String.prototype (P3 stage 3 step L2); a number's and a Boolean's keep
+    // the effect (their counts did not pay for a form); no site exits.
     TestSwitches {
         on: true,
         eager: true,
@@ -1335,16 +1351,16 @@ fn named_reads_on_primitives_stay_effects_and_never_exit() {
         ..Default::default()
     }
     .set();
-    let mut engine = Engine::new();
-    engine.set_tier(Tier::Jit);
-    engine.set_tier_threshold(0);
-    compiled();
     const PROGRAM: &str = "function code(s, i) { return s.charCodeAt(i); }\n\
          function fixed(n) { return n.toFixed(1); }\n\
          function shown(b) { return b.toString(); }\n\
          let t = 0; for (let k = 0; k < 1000; k++) \
          t += code('abc', k % 3) + fixed(k).length + shown(k % 2 === 0).length; t";
     let expected = run(Tier::Bytecode, PROGRAM);
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    compiled();
     exits();
     // The loop runs on past the first checkpoint, where the tier compiles each function.
     assert_eq!(eval(&mut engine, PROGRAM), expected);
@@ -1371,21 +1387,27 @@ fn named_reads_on_primitives_stay_effects_and_never_exit() {
         );
         let pc = method_pc(&chunk);
         assert_eq!(primitive_at(&chunk, pc), kind, "{name}'s way");
-        assert!(stays_an_effect(&chunk, pc), "{name}'s method load");
+        if kind == IC_PRIMITIVE_STRING {
+            assert!(takes_string_prototype(&chunk, pc), "{name}'s method load");
+        } else {
+            assert!(stays_an_effect(&chunk, pc), "{name}'s method load");
+        }
     }
 }
 
 #[test]
-fn a_site_that_sees_string_prototype_and_primitive_strings_stays_an_effect() {
+fn a_site_that_sees_string_prototype_and_primitive_strings_converges_on_the_effect() {
     // String.prototype itself and primitive strings share the site's way, whose shape is the
     // prototype's, in either order: the prototype's own fill records the string kind too, since
-    // the templates' probe then hits the way with primitives.
+    // the templates' probe then hits the way with primitives. The string's form checks the word
+    // a String (P3 stage 3 step L2), so the prototype's calls exit WrongShape until the discard;
+    // the recompile, its site flagged, keeps the effect; the VM's results throughout.
     for program in [
         "function first(s) { return s.charAt(0); }\n\
-         let out = ''; for (let k = 0; k < 1000; k++) \
+         let out = ''; for (let k = 0; k < 3000; k++) \
          out += first(k % 7 === 0 ? String.prototype : 'abc') + '.'; out.length + out.slice(0, 9)",
         "function first(s) { return s.charAt(0); }\n\
-         let out = ''; for (let k = 0; k < 1000; k++) \
+         let out = ''; for (let k = 0; k < 3000; k++) \
          out += first(k % 7 === 3 ? String.prototype : 'abc') + '.'; out.length + out.slice(0, 9)",
     ] {
         TestSwitches {
@@ -1402,15 +1424,18 @@ fn a_site_that_sees_string_prototype_and_primitive_strings_stays_an_effect() {
         compiled();
         exits();
         assert_eq!(eval(&mut engine, program), expected, "{program}");
+        let taken = exits();
+        assert!(
+            !taken.is_empty() && taken.iter().all(|&(_, why)| why == ExitReason::WrongShape),
+            "{program}: {taken:?}"
+        );
         let chunk = tier_chunk(&mut engine, "first").expect("the tier's chunk");
-        assert!(compiled().contains(&(std::rc::Rc::as_ptr(&chunk) as usize)));
         let pc = method_pc(&chunk);
         assert_eq!(
             primitive_at(&chunk, pc),
             crate::bytecode::IC_PRIMITIVE_STRING
         );
-        assert!(stays_an_effect(&chunk, pc));
-        assert!(exits().is_empty(), "{program}");
+        assert!(stays_an_effect(&chunk, pc), "{program}");
         assert_eq!(
             eval(
                 &mut engine,

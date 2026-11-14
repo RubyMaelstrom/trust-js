@@ -497,7 +497,9 @@ fn check_graph(
                         }
                     }
                 }
-                NodeOp::CheckShape(ref shapes) | NodeOp::CheckProto { ref shapes, .. }
+                NodeOp::CheckShape(ref shapes)
+                | NodeOp::CheckProto { ref shapes, .. }
+                | NodeOp::CheckStringProto { ref shapes, .. }
                     if shapes.is_empty()
                         || shapes.len() > 4
                         || !shapes.iter().all(|&s| crate::value::is_cacheable_shape(s)) =>
@@ -1069,7 +1071,9 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckNumber | NodeOp::TruncateNumberOrOddball => ExitReason::NotNumber,
         NodeOp::CheckInt32 => ExitReason::NotInt32,
         NodeOp::CheckObject => ExitReason::NotObject,
-        NodeOp::CheckShape(_) | NodeOp::CheckProto { .. } => ExitReason::WrongShape,
+        NodeOp::CheckShape(_) | NodeOp::CheckProto { .. } | NodeOp::CheckStringProto { .. } => {
+            ExitReason::WrongShape
+        }
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
@@ -1724,6 +1728,43 @@ impl Gen<'_> {
                 self.a
                     .cmp_imm_w(X17, crate::value::KIND_ORDINARY_LAST as u32);
                 self.a.b_cond(HI, site);
+                self.a.ldrb_imm(X17, X16, layout.obj_flags as u32);
+                self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
+                self.a
+                    .ldr_w_imm(X17, X16, (layout.obj_props + layout.props_shape) as u32);
+                self.shape_compare(X17, shapes, site);
+                self.gp_done(n, proto);
+            }
+            NodeOp::CheckStringProto { shapes, ways } => {
+                let site = self.check_exit(n)?;
+                let pc = graph.state(node.state.expect("checked")).pc;
+                let receiver = self.source(input(0), pc)?;
+                if let Some((_, _, record)) = self.exits.last_mut() {
+                    record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
+                        receiver,
+                        shapes: shapes.clone().into(),
+                        ways: *ways,
+                        hop: false,
+                    }));
+                }
+                let offset = self.ilayout.string_proto;
+                if !self.ilayout.valid || !offset.is_multiple_of(8) || offset / 8 >= 4096 {
+                    return Err(Refusal::at(pc as usize, "a String.prototype out of reach"));
+                }
+                // As the templates' string receiver (`emit_packed_probe_receiver`): the word's
+                // tag, then the realm's String.prototype through ctx.interp, its IC_PLAIN and its
+                // shape (its kind is the intrinsic's, StrWrap, which nothing changes).
+                let layout = self.layout;
+                let word = self.gp(input(0), X16);
+                self.a.lsr_imm(X17, word, 48);
+                self.a.movz(X16, (crate::value::PACK_STR >> 48) as u32, 0);
+                self.a.cmp_reg_w(X17, X16);
+                self.a.b_cond(NE, site);
+                let proto = self.gp_dst(n);
+                self.a
+                    .ldr_imm(X17, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+                self.a.ldr_imm(proto, X17, offset as u32);
+                self.a.add_imm(X16, proto, layout.obj_from_cell as u32);
                 self.a.ldrb_imm(X17, X16, layout.obj_flags as u32);
                 self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
                 self.a

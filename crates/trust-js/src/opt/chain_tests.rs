@@ -24,11 +24,12 @@ fn protos(graph: &Graph) -> Vec<&Node> {
 /// The checks of a load from `pc`: every one exits WrongShape at `pc` with the receiver on the
 /// stack (the operation's before-state).
 fn assert_exits_at(graph: &Graph, pc: usize, text: &str) {
-    for node in graph
-        .nodes
-        .iter()
-        .filter(|node| matches!(node.op, NodeOp::CheckShape(_) | NodeOp::CheckProto { .. }))
-    {
+    for node in graph.nodes.iter().filter(|node| {
+        matches!(
+            node.op,
+            NodeOp::CheckShape(_) | NodeOp::CheckProto { .. } | NodeOp::CheckStringProto { .. }
+        )
+    }) {
         assert_eq!(node.reason, Some(ExitReason::WrongShape), "{text}");
         let state = graph.state(node.state.expect("a check's state"));
         assert_eq!(state.pc as usize, pc, "{text}");
@@ -177,27 +178,28 @@ fn receivers_of_several_shapes_that_share_the_walk_are_checked_together() {
 }
 
 #[test]
-fn several_walks_another_kind_of_way_or_a_primitive_stay_the_effect() {
+fn several_walks_another_kind_of_way_or_a_numbers_stay_the_effect() {
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
         "class A { m() { return 1; } } class B { n() { return 0; } m() { return 2; } }
          class G { get m() { return 3; } }
          function walks(o) { return o.m(); } function getter(o) { return o.m; }
-         function absent(o) { return o.nothing; } function prim(s) { return s.charAt(0); }
+         function absent(o) { return o.nothing; } function prim(n) { return n.toFixed(1); }
          function proto(f) { return f.prototype; } function index(o) { return o['3']; }
          function mixed(o) { return o.m; }
-         function prim1(s) { return s.hasOwnProperty('length'); }
+         function prim1(b) { return b.hasOwnProperty('x'); }
          function inherited(o) { return typeof o.prototype; }
          var a = new A(), b = new B(), g = new G(), own = {m: 5};
          A.prototype[3] = 1;
          for (var i = 0; i < 20; i++) {
-           walks(a); walks(b); getter(g); absent(a); prim('xy'); proto(A); index(a);
-           mixed(a); mixed(own); prim1('xy'); inherited(Object.create(function () {}));
+           walks(a); walks(b); getter(g); absent(a); prim(1.5); proto(A); index(a);
+           mixed(a); mixed(own); prim1(true); inherited(Object.create(function () {}));
          }",
     );
-    // A string's way through String.prototype to Object.prototype (depth 1, its primitive
-    // marked); a `prototype` a function holds for the objects made from it (a deferred one in
+    // A number's method (Number.prototype's), a Boolean's through Boolean.prototype to
+    // Object.prototype (depth 1, its primitive marked: an object's walk would check the word's
+    // shape and exit at every call); a `prototype` a function holds for the objects made from it (a deferred one in
     // its slot until the checked operation materializes it).
     for name in [
         "walks",
@@ -354,6 +356,68 @@ fn a_loop_whose_loads_go_through_the_chain_is_free_of_effects() {
             op,
             NodeOp::FrameSlot(_) | NodeOp::StoreSlot(_)
         )),
+        0,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_strings_method_is_its_tag_check_string_prototypes_and_its_field() {
+    // A string's way names String.prototype's shape, its depth counted from it: CheckStringProto
+    // (the word a String, the realm's String.prototype's IC_PLAIN and shape), then the levels
+    // above it (Object.prototype's for hasOwnProperty), then the holder's field; no CheckShape.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function code(s, i) { return s.charCodeAt(i); }
+         function own(s) { return s.hasOwnProperty('length'); }
+         function len(s) { return s.length; }
+         for (var i = 0; i < 20; i++) { code('abc', 1); own('xy'); len('abc'); }",
+    );
+    for (name, depth) in [("code", 0), ("own", 1)] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        let pc = pc_of(&chunk, |op| matches!(op, Op::GetMethod(..)));
+        let way = way_at(&chunk, pc);
+        assert_eq!(
+            (way.primitive, way.depth),
+            (crate::bytecode::IC_PRIMITIVE_STRING, depth),
+            "{text}"
+        );
+        let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckStringProto { .. }));
+        assert_eq!(checks.len(), 1, "{name}: {text}");
+        assert_eq!(
+            checks[0].op,
+            NodeOp::CheckStringProto {
+                shapes: vec![way.receiver_shape],
+                ways: 1
+            },
+            "{name}: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+            0,
+            "{name}: {text}"
+        );
+        assert_eq!(protos(&graph).len(), depth as usize, "{name}: {text}");
+        if depth == 1 {
+            assert_eq!(
+                protos(&graph)[0].op,
+                NodeOp::CheckProto {
+                    shapes: vec![way.holder_shape],
+                    ways: 1
+                },
+                "{text}"
+            );
+        }
+        assert_eq!(count(&graph, is_effect), 1, "the call: {name}: {text}");
+        assert_exits_at(&graph, pc, &text);
+    }
+    // A String's `length` fills no way: it stays the effect, whose template reads it in line.
+    let (chunk, graph) = graph_of(&mut engine, "len");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckStringProto { .. })),
         0,
         "{text}"
     );

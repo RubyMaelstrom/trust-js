@@ -581,6 +581,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::TruncateNumberOrOddball => (TAGGED, Rep::I32),
         NodeOp::CheckObject | NodeOp::CheckShape(_) => (TAGGED, Rep::Cell),
         NodeOp::CheckProto { .. } => (CELL, Rep::Cell),
+        NodeOp::CheckStringProto { .. } => (TAGGED, Rep::Cell),
         NodeOp::CheckBoolean | NodeOp::ToBoolean => (TAGGED, Rep::Bool),
         NodeOp::F64ToBoolean => (F64, Rep::Bool),
         NodeOp::I32ToF64 => (I32, Rep::F64),
@@ -797,7 +798,7 @@ fn representations(
         NodeOp::CheckShape(ref shapes) if shapes.is_empty() || shapes.len() > 4 => {
             Err(format!("{} shapes", shapes.len()))
         }
-        NodeOp::CheckProto { ref shapes, ways }
+        NodeOp::CheckProto { ref shapes, ways } | NodeOp::CheckStringProto { ref shapes, ways }
             if shapes.is_empty() || shapes.len() > 4 || ways == 0 || ways > 4 =>
         {
             Err(format!(

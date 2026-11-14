@@ -66,6 +66,7 @@ use super::ir::{ElemKind, Holes, Store, TypedKind};
 use super::liveness::SlotLiveness;
 use super::snapshot::{Ran, Snapshot};
 use super::view::FrozenChunk;
+use crate::bytecode::IC_PRIMITIVE_STRING;
 use crate::bytecode::{Op, UpdKind};
 use crate::fasthash::FastMap;
 use crate::feedback::{NamedWayKind, ValueClass, ValuesView};
@@ -376,17 +377,32 @@ impl Rules<'_> {
         if named.generic {
             return None;
         }
+        // A string's ways: the names the fill caches for primitives (interpreter.rs
+        // get_prop_ic_impl: not `length`, `description` or digit-led, which a String answers
+        // itself or which name elements).
+        let strings = text != "length"
+            && text != "description"
+            && !text.as_bytes().first().is_some_and(|b| b.is_ascii_digit());
         let mut chain: Option<Chain> = None;
         for way in named.filled() {
             if way.kind != NamedWayKind::Data
-                || way.primitive != 0
+                || !(way.primitive == 0 || way.primitive == IC_PRIMITIVE_STRING && strings)
+                || chain
+                    .as_ref()
+                    .is_some_and(|chain| chain.string != (way.primitive != 0))
                 || way.location == 0
                 || way.slot >= MAX_FIELD_SLOT
                 || !crate::value::is_cacheable_shape(way.receiver_shape)
             {
                 return None;
             }
-            let levels = way.levels()?;
+            // A string's way counts its depth from String.prototype (its receiver shape), an
+            // object's from the receiver: depth 0 is String.prototype's own method.
+            let levels = if way.primitive != 0 && way.depth == 0 {
+                Vec::new()
+            } else {
+                way.levels()?
+            };
             if !levels
                 .iter()
                 .all(|&shape| crate::value::is_cacheable_shape(shape))
@@ -396,6 +412,7 @@ impl Rules<'_> {
             match &mut chain {
                 None => {
                     chain = Some(Chain {
+                        string: way.primitive != 0,
                         shapes: vec![way.receiver_shape],
                         levels,
                         location: way.location,
@@ -1597,10 +1614,11 @@ struct Ways {
     slot: u32,
 }
 
-/// A named load's walk through the prototype chain (`Rules::chain_ways`): the receiver's shapes,
-/// the shape of each level its [[Prototype]] links reach, the holder's last, and the holder's
-/// location and slot.
+/// A named load's walk through the prototype chain (`Rules::chain_ways`): the receiver's shapes
+/// (for a string's, `string`, the realm's String.prototype's), the shape of each level its
+/// [[Prototype]] links reach, the holder's last, and the holder's location and slot.
 struct Chain {
+    string: bool,
     shapes: Vec<u32>,
     levels: Vec<u32>,
     location: u16,
@@ -3794,7 +3812,26 @@ impl<'a> Builder<'a> {
         let word = self.tagged(st, receiver, pc);
         let ways = u8::try_from(chain.shapes.len()).expect("at most four ways");
         let mut object = word;
-        let mut cell = self.shaped(st, &mut cx, word, &chain.shapes);
+        let mut cell = if chain.string {
+            // No link fact: the String.prototype cell serves this load alone (a word that
+            // passed CheckShape elsewhere must not lend its prototype's facts to a string's).
+            let state = self.before(&mut cx, st);
+            let proto = self.add_exit(
+                NodeOp::CheckStringProto {
+                    shapes: chain.shapes.clone(),
+                    ways,
+                },
+                &[word],
+                Rep::Cell,
+                pc,
+                state,
+                ExitReason::WrongShape,
+            );
+            object = proto;
+            proto
+        } else {
+            self.shaped(st, &mut cx, word, &chain.shapes)
+        };
         for &shape in &chain.levels {
             cell = self.prototype(st, &mut cx, object, cell, shape, ways);
             object = cell;

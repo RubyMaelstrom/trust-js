@@ -343,6 +343,16 @@ pub(crate) enum NodeOp {
         shapes: Vec<u32>,
         ways: u8,
     },
+    /// Tagged -> Cell: the realm's String.prototype (`Interp::string_proto`, read through
+    /// ctx.interp as the templates read it: jit.rs emit_load_active_proto), where the word is a
+    /// String and that prototype has IC_PLAIN set and one of `shapes` (at most four); else an
+    /// exit [WrongShape] (P3 stage 3 step L2: a string's method load, Maglev's CheckString and
+    /// then its map's prototype, maglev-graph-builder.cc:4720-4724, compiler/access-info.cc:
+    /// 1093-1100). `ways` as CheckProto's.
+    CheckStringProto {
+        shapes: Vec<u32>,
+        ways: u8,
+    },
     /// Tagged -> Bool.
     // Stage 1's builder branches through ToBoolean and builds no CheckBoolean; the verifier and
     // the back end take one, as the tests do.
@@ -639,6 +649,7 @@ impl NodeOp {
                 | NodeOp::CheckObject
                 | NodeOp::CheckShape(_)
                 | NodeOp::CheckProto { .. }
+                | NodeOp::CheckStringProto { .. }
                 | NodeOp::CheckBoolean
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CheckInitialized
