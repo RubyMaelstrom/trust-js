@@ -905,7 +905,7 @@ fn a_loop_entered_past_its_invariants_failing_entry_check_discards_at_the_loop_l
     // limit's path. The fifth such exit arms the warm-up, which the frame's loop crosses, and the
     // next entry discards the code, its exits all the entry check's; the recompile, the header
     // flagged, leaves the check in the loop on the arm that never runs, and no call exits again.
-    const SOURCE: &str = "function inv(o, a, n) { let s = 0; o.c++; \
+    const SOURCE: &str = "function inv(o, a, n) { let s = 0; o.c++; delete o.d; \
          for (let i = 0; i < n; i++) { if (i > n) s = s + a; s = s + (i & 3); } return s; }\n\
          const O = {c: 0};\n\
          let t = 0; for (let k = 0; k < 1000; k++) t = (t + inv(O, k * 0.5, 4)) | 0; t";

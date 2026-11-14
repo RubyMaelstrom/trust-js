@@ -5895,3 +5895,7 @@ fn an_inner_loop_in_one_with_a_canonical_effect_loads_on_its_own_entry() {
 /// P3 stage 3 step L3: named stores that create their property.
 #[path = "create_tests.rs"]
 mod create;
+
+/// P3 stage 3 step L3: named updates and a String's length.
+#[path = "update_tests.rs"]
+mod update;

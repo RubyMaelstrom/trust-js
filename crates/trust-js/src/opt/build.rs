@@ -3448,6 +3448,8 @@ impl<'a> Builder<'a> {
                 let slot = self.slot(pc, slot as usize)?;
                 self.named_store(pc, name, Recv::Slot(slot), false, st)?
             }
+            Op::UpdateProp(name, _, kind) => self.update_prop(pc, name, kind, st)?,
+            Op::AppendProp(name, _) => self.append_prop(pc, name, st)?,
             Op::GetElem => self.element_load(pc, Recv::Stack, st)?,
             Op::GetElemLocal(slot) => {
                 let slot = self.slot(pc, slot as usize)?;
@@ -4486,6 +4488,166 @@ impl<'a> Builder<'a> {
         if keep {
             st.stack.push(value);
         }
+        Ok(())
+    }
+
+    /// UpdateProp (`o.x++`, `--o.x` and the rest, P3 stage 3 step L3) on own writable data ways
+    /// whose value record saw Numbers: the receiver's shape (CheckShape, unless proven), the field
+    /// (LoadField, unless loaded), the arithmetic as `update_local`'s (int32 with an Overflow exit
+    /// where the facts or the record's hint say int32, else f64), the sum's word stored
+    /// (StoreField: a Number needs no card), and the old Number (ToNumeric of a Number is itself)
+    /// or the new pushed as the kind says. Every check precedes the store, which ends the field
+    /// facts at its location as `named_store`'s. Maglev builds the same of Ignition's separate
+    /// load, Inc and store, the arithmetic by its feedback. The template takes one own way (jit.rs
+    /// emit_update_prop_inline); the generic operation where the record saw anything but
+    /// Numbers, NotNumber is flagged, or the ways are another kind or flagged.
+    fn update_prop(
+        &mut self,
+        pc: usize,
+        name: u32,
+        kind: UpdKind,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let rules = self.rules();
+        let (Some(values), Some(ways)) = (
+            rules.numbers(pc, false),
+            rules.own_data_ways(pc, name, true),
+        ) else {
+            return self.effect(pc, st);
+        };
+        if self.stale_ways(pc, &ways)
+            || self.declined(pc, ExitReason::NotNumber, "the generic operation")
+        {
+            return self.effect(pc, st);
+        }
+        let len = st.stack.len();
+        let receiver = st.stack[len - 1];
+        let mut cx = Before::new(pc);
+        let word = self.tagged(st, receiver, pc);
+        let cell = self.shaped(st, &mut cx, word, &ways.shapes);
+        let old = self.field(st, word, cell, ways.location, ways.slot, pc);
+        if !self.numeric(old) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
+        }
+        let increment = matches!(
+            kind,
+            UpdKind::PreInc | UpdKind::PostInc | UpdKind::IncDiscard
+        );
+        let proven = self.known_int32(st, old);
+        let int = (proven || (int32_hint(&values) && self.int32_operand(st, old)))
+            && !self.declines_int32(pc, proven);
+        let (number, new) = match int.then(|| self.int32(st, &mut cx, old)).flatten() {
+            Some(x) => {
+                let one = self.hoist(Hoisted::I32(1));
+                let node = if increment {
+                    NodeOp::I32Add
+                } else {
+                    NodeOp::I32Sub
+                };
+                let state = self.before(&mut cx, st);
+                let new = self.add_exit(node, &[x, one], Rep::I32, pc, state, ExitReason::Overflow);
+                (x, new)
+            }
+            None => {
+                let Some(x) = self.number(st, &mut cx, old) else {
+                    return Err(Refusal::at(pc, "a Number operand without an f64 form"));
+                };
+                let one = self.hoist(Hoisted::F64(1f64.to_bits()));
+                let node = if increment {
+                    NodeOp::F64Add
+                } else {
+                    NodeOp::F64Sub
+                };
+                (x, self.add(node, &[x, one], Rep::F64, pc))
+            }
+        };
+        let stored = self.tagged(st, new, pc);
+        self.add(
+            NodeOp::StoreField {
+                location: ways.location,
+                slot: ways.slot,
+            },
+            &[cell, stored],
+            Rep::None,
+            pc,
+        );
+        st.fields
+            .retain(|&(_, location), _| location != ways.location);
+        st.fields.insert((word, ways.location), stored);
+        st.stack.truncate(len - 1);
+        match kind {
+            UpdKind::PreInc | UpdKind::PreDec => st.stack.push(new),
+            UpdKind::PostInc | UpdKind::PostDec => st.stack.push(number),
+            UpdKind::IncDiscard | UpdKind::DecDiscard => {}
+        }
+        Ok(())
+    }
+
+    /// AppendProp (`o.k += v` as a statement, its read the GetProp before it; P3 stage 3 step L3)
+    /// on its own writable data ways: two Numbers added (I32Add with an Overflow exit where both
+    /// are proven int32s, else F64Add; Number::add either way), the sum's word stored (StoreField)
+    /// after the receiver's shape (CheckShape, unless proven: its read checked it), as the
+    /// template's in-line pair (jit_operations.rs AppendProp). It has no value record: each
+    /// operand is checked a Number unless proven, and a NotNumber exit (a String's `s += t`, which
+    /// the template appends in place) flags the generic operation, as arithmetic's does. Every
+    /// check precedes the store.
+    fn append_prop(&mut self, pc: usize, name: u32, st: &mut State) -> Result<(), Refusal> {
+        let Some(ways) = self.own_data_ways(pc, name, true) else {
+            return self.effect(pc, st);
+        };
+        if self.stale_ways(pc, &ways)
+            || self.declined(pc, ExitReason::NotNumber, "the generic operation")
+        {
+            return self.effect(pc, st);
+        }
+        let len = st.stack.len();
+        let (receiver, read, value) = (st.stack[len - 3], st.stack[len - 2], st.stack[len - 1]);
+        if !self.numeric(read) || !self.numeric(value) {
+            return self.mismatch(pc, ExitReason::NotNumber, st);
+        }
+        let mut cx = Before::new(pc);
+        let proven = self.known_int32(st, read) && self.known_int32(st, value);
+        let sum = if proven && !self.declined(pc, ExitReason::Overflow, "f64 arithmetic") {
+            let (Some(x), Some(y)) = (
+                self.int32(st, &mut cx, read),
+                self.int32(st, &mut cx, value),
+            ) else {
+                return Err(Refusal::at(pc, "an int32 operand without an int32 form"));
+            };
+            let state = self.before(&mut cx, st);
+            self.add_exit(
+                NodeOp::I32Add,
+                &[x, y],
+                Rep::I32,
+                pc,
+                state,
+                ExitReason::Overflow,
+            )
+        } else {
+            let (Some(x), Some(y)) = (
+                self.number(st, &mut cx, read),
+                self.number(st, &mut cx, value),
+            ) else {
+                return Err(Refusal::at(pc, "a Number operand without an f64 form"));
+            };
+            self.add(NodeOp::F64Add, &[x, y], Rep::F64, pc)
+        };
+        let word = self.tagged(st, receiver, pc);
+        let cell = self.shaped(st, &mut cx, word, &ways.shapes);
+        let stored = self.tagged(st, sum, pc);
+        self.add(
+            NodeOp::StoreField {
+                location: ways.location,
+                slot: ways.slot,
+            },
+            &[cell, stored],
+            Rep::None,
+            pc,
+        );
+        st.fields
+            .retain(|&(_, location), _| location != ways.location);
+        st.fields.insert((word, ways.location), stored);
+        st.stack.truncate(len - 3);
         Ok(())
     }
 

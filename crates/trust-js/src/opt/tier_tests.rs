@@ -275,18 +275,19 @@ const PROGRAMS: &[&str] = &[
      let t = 0, nans = 0; for (let k = 0; k < 3000; k++) { \
      const r = eff(k % 17, [k, 2, -1, k % 50 === 0 ? NaN : k % 7]); \
      if (r !== r) nans++; else t += r; if (k % 100 === 0) t += long(4000); } t + ':' + nans",
-    // Loops without effects after one (`o.c++`, which the tier never lowers) reading invariant
+    // Loops without effects after one (`delete o.d`, which the tier does not lower; `o.c++` is a
+    // node since P3 stage 3 step L3) reading invariant
     // locals, loaded and checked once at the loop's entry (P3 stage 3 step 0): Numbers and an
     // Array; an inner loop under one with the effect; a loop of two entry edges; a loop in a try
     // region that throws the invariant; and invariants that turn into Strings, int32s and an
     // Array with a String late, whose entry checks and checks in the loop then fail.
-    "function f1(o, a, n, x) { let s = 0; o.c++; \
+    "function f1(o, a, n, x) { let s = 0; o.c++; delete o.d; \
      for (let i = 0; i < n; i++) s = s + a * i + x[i & 3]; return s; }\n\
-     function f2(o, a, n, x) { let s = 0; for (let k = 0; k < 2; k++) { o.c++; \
+     function f2(o, a, n, x) { let s = 0; for (let k = 0; k < 2; k++) { o.c++; delete o.d; \
      for (let i = 0; i < n; i++) s = (s + x[i & 3] * a) % 100003; } return s; }\n\
-     function f3(o, a, n) { let s = 0; o.c++; let i = 0; if (n & 1) { i = 1; } else { o.c++; } \
+     function f3(o, a, n) { let s = 0; o.c++; delete o.d; let i = 0; if (n & 1) { i = 1; } else { o.c++; delete o.d; } \
      while (i < n) { s = s + a; i++; } return s; }\n\
-     function f4(o, a, n) { let s = 0; try { o.c++; for (let j = 0; j < n; j++) { \
+     function f4(o, a, n) { let s = 0; try { o.c++; delete o.d; for (let j = 0; j < n; j++) { \
      if (j === 5 && a > 3) throw a; s = s - a; } } catch (e) { s = s + e * 1000; } \
      return s + a; }\n\
      function h(r) { return typeof r === 'number' ? (r === r ? Math.round(r * 4) : 7) : r.length; }\n\
@@ -2851,10 +2852,11 @@ fn entry_speculations_back_off_without_an_exit_cycle() {
     assert!(discards(&chunk) <= 3, "{} discards", discards(&chunk));
 }
 
-/// An effect (`o.c++`, which the tier never lowers), then a loop without one that reads the
+/// An effect (`delete o.d`, which the tier does not lower; `o.c++` before it is a node since P3
+/// stage 3 step L3), then a loop without one that reads the
 /// invariant local `a` only where `i > n`, which never holds: its check moves to the loop's entry
 /// (P3 stage 3 step 0), where it runs whether the use does or not.
-const INVARIANT: &str = "function inv(o, a, n) { let s = 0; o.c++; \
+const INVARIANT: &str = "function inv(o, a, n) { let s = 0; o.c++; delete o.d; \
      for (let i = 0; i < n; i++) { if (i > n) s = s + a; s = s + i; } return s; }\n\
      const O = {c: 0};\n";
 
@@ -2890,7 +2892,7 @@ fn a_string_invariant_the_loop_reads_converges_on_the_generic_operation() {
     // the VM's runs of the exits record the String at the addition, whose recompile takes the
     // generic operation (an effect: the loop's invariants are in the frame's keeping again);
     // the results are the VM's throughout.
-    let source = "function cat(o, a, n) { let s = 0; o.c++; \
+    let source = "function cat(o, a, n) { let s = 0; o.c++; delete o.d; \
          for (let i = 0; i < n; i++) s = s + a; return s; }\n\
          const O = {c: 0};\n\
          let t = 0; for (let r = 0; r < 1000; r++) t = t + cat(O, r * 0.5, 3); t";
@@ -2913,7 +2915,7 @@ fn an_exit_inside_the_loop_finds_the_invariant_in_the_frame() {
     // The element read of a String exits inside the loop (NotNumber at the multiplication):
     // the frame the exit rebuilds keeps `a` in its slot (never written back, never moved), which
     // the VM's run of the rest of the loop and the return read.
-    let source = "function f(o, a, n, x) { let s = 0; o.c++; \
+    let source = "function f(o, a, n, x) { let s = 0; o.c++; delete o.d; \
          for (let i = 0; i < n; i++) s = s + x[i] * a; return s + ':' + a; }\n\
          const O = {c: 0}; const X = [1, 2, 3, 4], Y = [1, 2, 'z', 4];\n\
          let t = 0; for (let k = 0; k < 1000; k++) t = (t + f(O, k * 0.5, 4, X).length) % 1000003; t";
@@ -3483,3 +3485,7 @@ fn an_interruption_through_a_generic_node_in_a_try_leaves_the_function() {
 /// P3 stage 3 step L3: stores that create their property, end to end.
 #[path = "create_tier_tests.rs"]
 mod create;
+
+/// P3 stage 3 step L3: named updates and a String's length, end to end.
+#[path = "update_tier_tests.rs"]
+mod update;
