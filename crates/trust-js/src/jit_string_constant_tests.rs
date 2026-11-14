@@ -373,6 +373,9 @@ fn grown_apart(engine: &mut Engine, tier: Tier, name: &str, n: usize) {
 /// its callee is dead), returns the replacement's string.
 #[test]
 fn inlined_string_constants_belong_to_the_caller() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     const SOURCE: &str = r#"
         var callee = function () { return 'inlined-text'; };
         var expected = ['inlined', 'text'].join('-');

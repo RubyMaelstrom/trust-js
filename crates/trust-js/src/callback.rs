@@ -670,6 +670,9 @@ mod tests {
 
     #[test]
     fn plain_arrow_helpers_can_inline_without_changing_lexical_arrows() {
+        // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+        // plan of leaf callees.
+        crate::opt::pin_splice_for_test();
         let mut engine = Engine::new();
         engine.set_tier(Tier::Jit);
         engine.set_tier_threshold(0);

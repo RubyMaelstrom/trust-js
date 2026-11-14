@@ -783,6 +783,9 @@ thread_local! {
 
 #[test]
 fn generic_native_promotion_uses_the_callees_running_realm() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     use crate::realm_inline_guard_tests::{eval_string, in_realm, set_global};
     use crate::value::Value;
     let mut engine = Engine::new();

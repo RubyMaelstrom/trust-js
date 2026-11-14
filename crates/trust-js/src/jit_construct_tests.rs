@@ -145,6 +145,9 @@ fn base_classes_without_instance_elements_take_the_construct_cache() {
 /// callees spliced in. The splice keeps each callee's strictness.
 #[test]
 fn constructors_run_only_under_new_reach_their_second_stage_compile() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
     engine.set_tier_threshold(0);

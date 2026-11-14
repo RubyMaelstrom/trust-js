@@ -678,6 +678,9 @@ fn second_stage(engine: &mut Engine, name: &str, drive: &str) -> Option<std::rc:
 
 #[test]
 fn an_inlined_sites_record_reaches_its_baseline_site() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // Generated code records only its misses; a forced exit's VM run records every class it
     // executes, Int32 included.
     crate::opt::pin_forced_exits_off_for_test();
@@ -726,6 +729,9 @@ fn an_inlined_sites_record_reaches_its_baseline_site() {
 
 #[test]
 fn a_transformed_site_forwards_each_new_bit_to_its_baseline_site() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // Generated code records only its misses; a forced exit's VM run records every class it
     // executes, Int32 included.
     crate::opt::pin_forced_exits_off_for_test();
@@ -759,6 +765,9 @@ fn a_transformed_site_forwards_each_new_bit_to_its_baseline_site() {
 
 #[test]
 fn the_merged_view_holds_a_transformed_sites_ways() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     use crate::feedback::SiteView;
     let mut engine = engine(Tier::Jit);
     eval(

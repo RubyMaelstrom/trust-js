@@ -151,6 +151,9 @@ fn prepared_baseline_inlines_retain_mapped_arguments_eval_and_captured_bindings(
 
 #[test]
 fn prepared_native_hot_calls_publish_and_execute_baseline_inline_bodies() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     const CHILD: &str = "TRUST_JS_TEST_PREPARED_INLINE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output=std::process::Command::new(std::env::current_exe().unwrap())

@@ -325,6 +325,9 @@ fn shared_snapshot_binding_getters_cache_each_realms_live_closure() {
 /// `realm_inline_guard_tests`).
 #[test]
 fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     const SOURCE: &str = r#"(function () {
         "use strict";
         globalThis.shared = {

@@ -195,6 +195,9 @@ fn hot_private_names_and_typeof_closure_reads_keep_definition_environments() {
 
 #[test]
 fn frame_independent_effects_still_inline_with_local_and_receiver_remapping() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // The second stage is read right after its checkpoint.
     crate::opt::pin_synchronous_for_test();
     let mut engine = Engine::new();
@@ -422,6 +425,9 @@ fn spliced_reads_through_with_environments_keep_object_bindings() {
 /// splice from their separate budget.
 #[test]
 fn small_callees_splice_into_callers_beyond_the_shared_budget() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     let mut body = String::new();
     for k in 0..48 {
         body.push_str(&format!("acc = acc + get({k}) + (x & {k});\n"));
@@ -523,6 +529,9 @@ fn spliced_lexicals_leave_the_callers_homed_block_bindings_alone() {
 
 #[test]
 fn spliced_callee_outlives_dropping_its_last_reference() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // The splice reads the callee's captured bindings from its [[Environment]], which lives as
     // long as the function: the body dropping every other reference to the function must leave
     // it alive until the splice completes (warm machine-code reads and the cold helper alike).
@@ -588,6 +597,9 @@ fn legacy_caller_finds_spliced_activations() {
 
 #[test]
 fn legacy_caller_keeps_splices_across_implicit_author_calls() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // Expected results verified with Node. Legacy caller is an implementation extension;
     // ECMA-262 Forbidden Extensions still forbids exposing a strict function as its value.
     let source = r#"
@@ -657,6 +669,9 @@ fn legacy_caller_keeps_splices_across_implicit_author_calls() {
 
 #[test]
 fn spliced_implicit_callbacks_preserve_captured_and_thrown_stack_positions() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     let source = r#"var throwing = false;
 function observeStack() {
     var error = new Error('getter');

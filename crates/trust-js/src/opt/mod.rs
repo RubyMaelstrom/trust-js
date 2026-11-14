@@ -371,12 +371,13 @@ pub(crate) fn pin_tier_off_for_test() {
 /// Pin TRUST_JS_OPT_INLINE=splice on this thread, whatever the environment and the test's switches
 /// say, for a test whose subject is a splice's second stage, which graph inlining replaces for a
 /// plan of leaf callees (P3 stage 3, step 2). Called first in the test, as `pin_tier_off_for_test`.
-#[cfg(all(
-    test,
-    target_arch = "aarch64",
-    any(target_os = "macos", target_os = "linux", target_os = "windows")
-))]
+/// Where the tier has no back end there is no graph inlining to pin.
+#[cfg(test)]
 pub(crate) fn pin_splice_for_test() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
     pin_splice(true);
 }
 

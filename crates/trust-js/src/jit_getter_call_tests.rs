@@ -411,6 +411,9 @@ function drive() {
 
 #[test]
 fn spliced_reads_call_getters_with_their_inline_positions() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     let mut stacks = Vec::new();
     for tier in [Tier::Interp, Tier::Jit] {
         let mut engine = engine(tier, false);

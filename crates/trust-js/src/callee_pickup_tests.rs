@@ -84,6 +84,9 @@ const LEAF: &str = r#"
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_callers_way_picks_up_its_callees_new_code_and_no_other_site_refills() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // The callee's new code is published at its checkpoint, which this test reads at once.
     crate::opt::pin_synchronous_for_test();
     // CALL_IC_EPOCH is process-wide: a test beside this one that drops a function's runtime or
@@ -146,6 +149,9 @@ fn a_callers_way_picks_up_its_callees_new_code_and_no_other_site_refills() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_construct_site_picks_up_its_constructors_new_code() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // The constructor's new code is published at its checkpoint, and the test reads `make`'s first
     // stage's site: off the main thread `make`'s own second stage could land first, and its site,
     // not this one, would take the new code.
@@ -266,6 +272,9 @@ fn a_frame_running_the_replaced_chunk_finishes_in_it() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn rust_callers_pick_up_new_code() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // The callbacks' new code is published at their checkpoints, which this test reads at once:
     // off the main thread it lands at a later poll, and under load the forEach's later calls (and
     // the trap's) can finish before it does.
@@ -360,6 +369,9 @@ fn entries(chunk: &Chunk) -> usize {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_megamorphic_site_keeps_its_overflow_entries() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // The callees publish their second stages while `wide` runs its first stage, whose site this
     // reads: `wide`'s loop counts nothing toward its own checkpoints (P3 stage 2, step 8).
     crate::opt::pin_loop_count_off_for_test();
@@ -442,6 +454,9 @@ fn a_megamorphic_site_keeps_its_overflow_entries() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn a_polymorphic_sites_callees_get_new_code_and_it_keeps_its_ways() {
+    // Its subject is a splice's second stage, which TRUST_JS_OPT_INLINE=graph replaces for a
+    // plan of leaf callees.
+    crate::opt::pin_splice_for_test();
     // Six callees through four ways: two live in the overflow table. Each calls a helper, so its
     // checkpoint publishes a second stage (with the tier on, past its settled-feedback wait).
     let configurations = [
