@@ -166,6 +166,33 @@ pub(crate) struct NamedWay {
     /// Where the slot lives for generated code (`IcState::loc`; a creation's new slot).
     pub(crate) location: u16,
     pub(crate) kind: NamedWayKind,
+    /// The shapes of the levels between the receiver and the holder of a way at depth 2 or 3,
+    /// nearest the receiver first (`IcState::mid_shape`, `mid2_shape`), and which of them the
+    /// fill recorded (`mid_ok`'s bits 0 and 1: a level that was a plain ordinary object or a
+    /// wrapper); 0 and unrecorded otherwise. The templates check a level only by a recorded
+    /// shape (P3 stage 3 step L2: so does the optimizing tier's walk).
+    pub(crate) mids: [u32; 2],
+    pub(crate) mids_recorded: u8,
+}
+
+impl NamedWay {
+    /// The shapes of the levels a walk from the receiver checks after the receiver's own (each
+    /// level between, then the holder), where every level between has its recorded shape and
+    /// the depth is the templates' (1 to 3); None otherwise.
+    pub(crate) fn levels(&self) -> Option<Vec<u32>> {
+        let depth = usize::from(self.depth);
+        if !(1..=3).contains(&depth) {
+            return None;
+        }
+        let between = depth - 1;
+        let required = (1u8 << between) - 1;
+        if self.mids_recorded & required != required {
+            return None;
+        }
+        let mut levels: Vec<u32> = self.mids[..between].to_vec();
+        levels.push(self.holder_shape);
+        Some(levels)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

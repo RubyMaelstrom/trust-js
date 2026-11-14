@@ -332,6 +332,17 @@ pub(crate) enum NodeOp {
     CheckObject,
     /// Tagged -> Cell: an object whose shape is one of these (at most four).
     CheckShape(Vec<u32>),
+    /// Cell -> Cell: the input object's [[Prototype]] (its `proto` field, which no shape
+    /// implies), where it is an object of an ordinary kind with IC_PLAIN set and one of
+    /// `shapes` (at most four), as the templates' hop checks it (jit.rs emit_baked); else an
+    /// exit [WrongShape], a null prototype included (P3 stage 3 step L2: a named load through
+    /// the chain, each level reached from the one below, as SpiderMonkey's LoadProto and
+    /// GuardShape and JSC's poly-proto chain walk it). `ways` is the access's receiver shapes,
+    /// which its exit keeps in the exit profile as the receiver's check would.
+    CheckProto {
+        shapes: Vec<u32>,
+        ways: u8,
+    },
     /// Tagged -> Bool.
     // Stage 1's builder branches through ToBoolean and builds no CheckBoolean; the verifier and
     // the back end take one, as the tests do.
@@ -406,7 +417,8 @@ pub(crate) enum NodeOp {
     BoolNot,
 
     // Memory.
-    /// Cell -> Tagged: the property at the way's location and slot (IcState::loc). The slot holds
+    /// Cell -> Tagged: the property at the way's location and slot (IcState::loc), of the
+    /// receiver's cell or of a holder's a walk reached (CheckProto). The slot holds
     /// a data property's word, never a property-only one: a read keyed `prototype`, whose slot
     /// can hold a function's deferred prototype (value.rs's PACK_LAZY_PROTO), stays an effect.
     LoadField {
@@ -626,6 +638,7 @@ impl NodeOp {
                 | NodeOp::TruncateNumberOrOddball
                 | NodeOp::CheckObject
                 | NodeOp::CheckShape(_)
+                | NodeOp::CheckProto { .. }
                 | NodeOp::CheckBoolean
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CheckInitialized

@@ -580,6 +580,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::CheckInt32 => (F64, Rep::I32),
         NodeOp::TruncateNumberOrOddball => (TAGGED, Rep::I32),
         NodeOp::CheckObject | NodeOp::CheckShape(_) => (TAGGED, Rep::Cell),
+        NodeOp::CheckProto { .. } => (CELL, Rep::Cell),
         NodeOp::CheckBoolean | NodeOp::ToBoolean => (TAGGED, Rep::Bool),
         NodeOp::F64ToBoolean => (F64, Rep::Bool),
         NodeOp::I32ToF64 => (I32, Rep::F64),
@@ -795,6 +796,14 @@ fn representations(
         }
         NodeOp::CheckShape(ref shapes) if shapes.is_empty() || shapes.len() > 4 => {
             Err(format!("{} shapes", shapes.len()))
+        }
+        NodeOp::CheckProto { ref shapes, ways }
+            if shapes.is_empty() || shapes.len() > 4 || ways == 0 || ways > 4 =>
+        {
+            Err(format!(
+                "a prototype check of {} shapes, {ways} ways",
+                shapes.len()
+            ))
         }
         NodeOp::EntrySlot(_) if Some(node.block) != graph.entry => {
             Err("an entry slot outside the entry block".into())

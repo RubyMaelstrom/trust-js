@@ -125,11 +125,16 @@ pub(crate) struct FrameRecipe {
     pub(crate) handlers: Box<[(u32, u32)]>,
 }
 
-/// What a shape check tested: the receiver word's source at the check, and its shapes.
+/// What a shape check tested: the receiver word's source at the check, and its shapes; for a
+/// prototype's check (CheckProto, P3 stage 3 step L2: `hop`) the source of the object whose
+/// [[Prototype]] it checked. `ways` is the access's receiver shapes, the count its WrongShape
+/// site keeps in the exit profile (`Rules::stale_ways` compares the site's ways with it).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct ShapeCheck {
     pub(crate) receiver: Source,
     pub(crate) shapes: Box<[u32]>,
+    pub(crate) ways: u8,
+    pub(crate) hop: bool,
 }
 
 /// A code object's exits.
@@ -427,6 +432,19 @@ unsafe fn read(saved: *const u64, source: Source) -> crate::value::Value {
 /// A WrongShape exit's log detail: the shapes the check expected, and the receiver's, or what
 /// the receiver is when it is no object (a primitive whose wrapper prototype a cache way names,
 /// say).
+/// The [[Prototype]] of an object word (null for anything else, or an object in use), for the
+/// log of a prototype's check.
+fn prototype_of(word: crate::value::Value) -> crate::value::Value {
+    use crate::value::{Value, ValueView};
+    match word.view() {
+        ValueView::Obj(object) => match object.try_borrow() {
+            Ok(object) => object.proto.map_or(Value::Null, Value::Obj),
+            Err(_) => Value::Null,
+        },
+        _ => Value::Null,
+    }
+}
+
 fn describe_receiver(word: crate::value::Value, shapes: &[u32]) -> String {
     use crate::value::ValueView;
     let expected: Vec<String> = shapes.iter().map(|shape| format!("{shape:#x}")).collect();
@@ -480,7 +498,15 @@ pub(crate) unsafe extern "C" fn deoptimize(
     if super::log_enabled() {
         let detail = match &exit.shape_check {
             Some(check) if reason == ExitReason::WrongShape => {
-                describe_receiver(unsafe { read(saved, check.receiver) }, &check.shapes)
+                let word = unsafe { read(saved, check.receiver) };
+                if check.hop {
+                    format!(
+                        " (a prototype){}",
+                        describe_receiver(prototype_of(word), &check.shapes)
+                    )
+                } else {
+                    describe_receiver(word, &check.shapes)
+                }
             }
             _ => String::new(),
         };

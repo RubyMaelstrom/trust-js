@@ -358,6 +358,66 @@ impl Rules<'_> {
         })
     }
 
+    /// A named load's ways on the prototype chain (P3 stage 3 step L2): data ways of objects (no
+    /// primitive's) at depth 1 to 3, each level between with its recorded shape (the templates'
+    /// limit and rule: jit.rs emit_baked), every shape cacheable, the location in a cache's reach,
+    /// which share one walk (the levels' shapes, the holder's location and slot) and differ at
+    /// most in the receiver's shape (up to four): the receiver's check, then each level reached
+    /// by its [[Prototype]] and checked, then the holder's slot (`Builder::chain_load`). None
+    /// where the site takes another form or the generic operation: a generic mark, own ways,
+    /// several walks, another kind of way, `prototype` (a deferred prototype) or an index name
+    /// (which the fill never caches: interpreter.rs ic_get_rederive).
+    fn chain_ways(&self, pc: usize, name: u32) -> Option<Chain> {
+        let text = self.chunk.jit_name(name);
+        if text == "prototype" || crate::value::canonical_index(text).is_some() {
+            return None;
+        }
+        let named = self.snapshot.named(pc)?;
+        if named.generic {
+            return None;
+        }
+        let mut chain: Option<Chain> = None;
+        for way in named.filled() {
+            if way.kind != NamedWayKind::Data
+                || way.primitive != 0
+                || way.location == 0
+                || way.slot >= MAX_FIELD_SLOT
+                || !crate::value::is_cacheable_shape(way.receiver_shape)
+            {
+                return None;
+            }
+            let levels = way.levels()?;
+            if !levels
+                .iter()
+                .all(|&shape| crate::value::is_cacheable_shape(shape))
+            {
+                return None;
+            }
+            match &mut chain {
+                None => {
+                    chain = Some(Chain {
+                        shapes: vec![way.receiver_shape],
+                        levels,
+                        location: way.location,
+                        slot: way.slot,
+                    })
+                }
+                Some(chain) => {
+                    if chain.levels != levels
+                        || chain.location != way.location
+                        || chain.slot != way.slot
+                    {
+                        return None;
+                    }
+                    if !chain.shapes.contains(&way.receiver_shape) {
+                        chain.shapes.push(way.receiver_shape);
+                    }
+                }
+            }
+        }
+        chain
+    }
+
     /// The element site at `pc` lowered on element words, or None for the generic access (an
     /// effect): a generic mark, a key that is no index, or receivers by rule R (the record's where
     /// it holds any, else the in-line set's) other than Arrays and ordinary objects.
@@ -784,8 +844,15 @@ impl Rules<'_> {
     /// WrongShape flagged at `pc` where the site's ways did not grow since a discarded check
     /// there (see `Builder::stale_ways`).
     fn stale_ways(&self, pc: usize, ways: &Ways) -> bool {
+        self.stale_shapes(pc, &ways.shapes)
+    }
+
+    /// WrongShape flagged at `pc` where the access's receiver shapes, `shapes`, are no more than
+    /// a discarded check there expected (a check of a walk keeps its access's count:
+    /// CheckProto's `ways`), so that a chain's exit declines it as an own way's does.
+    fn stale_shapes(&self, pc: usize, shapes: &[u32]) -> bool {
         self.snapshot.declines(pc, ExitReason::WrongShape)
-            && ways.shapes.len() <= self.snapshot.discarded_ways(pc)
+            && shapes.len() <= self.snapshot.discarded_ways(pc)
     }
 }
 
@@ -1274,8 +1341,13 @@ struct State {
     truncated: FastMap<NodeIx, NodeIx>,
     /// Heap facts of the current effect epoch: an object word's possible shapes...
     shapes: FastMap<NodeIx, Vec<u32>>,
-    /// ...and the word at a location of an object word, loaded or stored.
+    /// ...and the word at a location of an object word, loaded or stored (or of a holder's cell
+    /// a walk reached, P3 stage 3 step L2)...
     fields: FastMap<(NodeIx, u16), NodeIx>,
+    /// ...and an object's [[Prototype]] (P3 stage 3 step L2), keyed by the object (a receiver's
+    /// word, or a prototype's cell), its checked cell (CheckProto), whose shapes `shapes` holds:
+    /// only an effect changes a [[Prototype]] or a shape (no lowered node does).
+    protos: FastMap<NodeIx, NodeIx>,
     /// The elements kind an object word is proven to have (P3 stage 2 step 2): a value fact,
     /// since kind tags and IC_PLAIN never change once JavaScript sees an object (ElemKind).
     kinds: FastMap<NodeIx, ElemKind>,
@@ -1308,6 +1380,7 @@ impl State {
     fn clear_heap(&mut self) {
         self.shapes.clear();
         self.fields.clear();
+        self.protos.clear();
         self.clear_elements();
         self.names.clear_heap();
     }
@@ -1388,12 +1461,22 @@ fn meet(preds: &[(BlockIx, State)]) -> State {
         })
         .map(|(&field, &value)| (field, value))
         .collect();
+    let protos = first
+        .protos
+        .iter()
+        .filter(|(object, proto)| {
+            rest.iter()
+                .all(|(_, state)| state.protos.get(object) == Some(proto))
+        })
+        .map(|(&object, &proto)| (object, proto))
+        .collect();
     State {
         forms,
         truth,
         truncated,
         shapes,
         fields,
+        protos,
         names: names::Facts::meet(preds),
         ..meet_elements(first, rest)
     }
@@ -1499,6 +1582,16 @@ enum Recv {
 /// A named site's own data ways: the receiver shapes and the one location and slot they share.
 struct Ways {
     shapes: Vec<u32>,
+    location: u16,
+    slot: u32,
+}
+
+/// A named load's walk through the prototype chain (`Rules::chain_ways`): the receiver's shapes,
+/// the shape of each level its [[Prototype]] links reach, the holder's last, and the holder's
+/// location and slot.
+struct Chain {
+    shapes: Vec<u32>,
+    levels: Vec<u32>,
     location: u16,
     slot: u32,
 }
@@ -2345,13 +2438,21 @@ impl<'a> Builder<'a> {
         // none of its cell, kind, view or data address past a block's edge without them. A
         // field's value may be an object whose fields are known in turn.
         live.extend(st.names.words());
-        while !st.fields.is_empty() {
+        // A live object's prototype links are live in turn (P3 stage 3 step L2), and a holder's
+        // field is as live as its cell.
+        while !st.fields.is_empty() || !st.protos.is_empty() {
             let before = live.len();
             let found: Vec<NodeIx> = st
                 .fields
                 .iter()
                 .filter(|((word, _), _)| live.contains(word))
                 .map(|(_, &value)| value)
+                .chain(
+                    st.protos
+                        .iter()
+                        .filter(|(object, _)| live.contains(object))
+                        .map(|(_, &proto)| proto),
+                )
                 .collect();
             live.extend(found);
             if live.len() == before {
@@ -2368,6 +2469,7 @@ impl<'a> Builder<'a> {
             .retain(|value, _| live.contains(value) || forms.contains_key(value));
         st.shapes.retain(|word, _| live.contains(word));
         st.fields.retain(|(word, _), _| live.contains(word));
+        st.protos.retain(|object, _| live.contains(object));
         // Element facts (P3 stage 2 step 2): a kind or an element address is an object word's,
         // and an index a Number's (reached through its value's forms, as a truncation is); a
         // used length and the element facts are an address's.
@@ -3599,7 +3701,8 @@ impl<'a> Builder<'a> {
     }
 
     /// GetProp, GetMethod (which keeps its receiver), GetPropThis and GetPropLocal on own data
-    /// ways: the shape checked (unless proven) and the field loaded (unless loaded this epoch).
+    /// ways: the shape checked (unless proven) and the field loaded (unless loaded this epoch);
+    /// on data ways through the prototype chain, the walk (`chain_load`).
     fn named_load(
         &mut self,
         pc: usize,
@@ -3609,7 +3712,15 @@ impl<'a> Builder<'a> {
         st: &mut State,
     ) -> Result<(), Refusal> {
         let Some(ways) = self.own_data_ways(pc, name, false) else {
-            return self.effect(pc, st);
+            return match self.rules().chain_ways(pc, name) {
+                Some(chain)
+                    if !(self.rules().stale_shapes(pc, &chain.shapes)
+                        && self.declined(pc, ExitReason::WrongShape, "the generic access")) =>
+                {
+                    self.chain_load(pc, recv, method, &chain, st)
+                }
+                _ => self.effect(pc, st),
+            };
         };
         if self.stale_ways(pc, &ways) {
             return self.effect(pc, st);
@@ -3618,27 +3729,108 @@ impl<'a> Builder<'a> {
         let mut cx = Before::new(pc);
         let word = self.tagged(st, receiver, pc);
         let cell = self.shaped(st, &mut cx, word, &ways.shapes);
-        let value = match st.fields.get(&(word, ways.location)) {
-            Some(&value) => value,
-            None => {
-                let value = self.add(
-                    NodeOp::LoadField {
-                        location: ways.location,
-                        slot: ways.slot,
-                    },
-                    &[cell],
-                    Rep::Tagged,
-                    pc,
-                );
-                st.fields.insert((word, ways.location), value);
-                value
-            }
-        };
+        let value = self.field(st, word, cell, ways.location, ways.slot, pc);
         if matches!(recv, Recv::Stack) && !method {
             st.stack.pop();
         }
         st.stack.push(value);
         Ok(())
+    }
+
+    /// The word at `location` and `slot` of the object `cell` checked, unless the epoch loaded or
+    /// stored it already: a field fact keyed by `object` (the receiver's word, or a holder's
+    /// cell).
+    fn field(
+        &mut self,
+        st: &mut State,
+        object: NodeIx,
+        cell: NodeIx,
+        location: u16,
+        slot: u32,
+        pc: usize,
+    ) -> NodeIx {
+        if let Some(&value) = st.fields.get(&(object, location)) {
+            return value;
+        }
+        let value = self.add(
+            NodeOp::LoadField { location, slot },
+            &[cell],
+            Rep::Tagged,
+            pc,
+        );
+        st.fields.insert((object, location), value);
+        value
+    }
+
+    /// A named load through the prototype chain (P3 stage 3 step L2; `Rules::chain_ways`): the
+    /// receiver's shapes checked (CheckShape, unless proven), each level its [[Prototype]] link
+    /// reaches checked by shape (CheckProto, unless a link fact proves it), the holder's slot
+    /// loaded (unless loaded this epoch), every check exiting [WrongShape] with the operation's
+    /// before-state. No identity and no address: a level is the object the link reaches now, as
+    /// the templates' probe walks it (jit.rs emit_baked), SpiderMonkey's LoadProto and GuardShape
+    /// (jit/CacheIR.cpp ShapeGuardProtoChainForCrossCompartmentHolder, 891-909) and JSC's
+    /// poly-proto chain (bytecode/InlineCacheCompiler.cpp 1866-1915).
+    fn chain_load(
+        &mut self,
+        pc: usize,
+        recv: Recv,
+        method: bool,
+        chain: &Chain,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let receiver = self.receiver(recv, st, 0, pc);
+        let mut cx = Before::new(pc);
+        let word = self.tagged(st, receiver, pc);
+        let ways = u8::try_from(chain.shapes.len()).expect("at most four ways");
+        let mut object = word;
+        let mut cell = self.shaped(st, &mut cx, word, &chain.shapes);
+        for &shape in &chain.levels {
+            cell = self.prototype(st, &mut cx, object, cell, shape, ways);
+            object = cell;
+        }
+        let value = self.field(st, object, cell, chain.location, chain.slot, pc);
+        if matches!(recv, Recv::Stack) && !method {
+            st.stack.pop();
+        }
+        st.stack.push(value);
+        Ok(())
+    }
+
+    /// The [[Prototype]] of `object` (its cell `cell`), checked to have `shape`, unless a link
+    /// fact of the epoch proves it (`State::protos`).
+    fn prototype(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        object: NodeIx,
+        cell: NodeIx,
+        shape: u32,
+        ways: u8,
+    ) -> NodeIx {
+        if let Some(&proto) = st.protos.get(&object) {
+            if st
+                .shapes
+                .get(&proto)
+                .is_some_and(|known| known.iter().all(|&known| known == shape))
+            {
+                return proto;
+            }
+        }
+        let state = self.before(cx, st);
+        let proto = self.add_exit(
+            NodeOp::CheckProto {
+                shapes: vec![shape],
+                ways,
+            },
+            &[cell],
+            Rep::Cell,
+            cx.pc,
+            state,
+            ExitReason::WrongShape,
+        );
+        st.protos.insert(object, proto);
+        st.shapes.insert(proto, vec![shape]);
+        proto
     }
 
     /// SetProp (which keeps the value), SetPropDrop, SetPropThisDrop and SetPropLocalDrop on own

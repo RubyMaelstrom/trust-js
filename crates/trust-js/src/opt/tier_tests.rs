@@ -3302,3 +3302,7 @@ fn a_discards_warm_up_reaches_its_recompile_through_a_loops_iterations() {
 /// P3 stage 3 step 0c: typed arrays' facts through effect-free loops, end to end.
 #[path = "typed_loop_tier_tests.rs"]
 mod typed_loop;
+
+/// P3 stage 3 step L2: named loads through the prototype chain, end to end.
+#[path = "chain_tier_tests.rs"]
+mod chain;

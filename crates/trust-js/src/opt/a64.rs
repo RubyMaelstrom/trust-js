@@ -497,7 +497,7 @@ fn check_graph(
                         }
                     }
                 }
-                NodeOp::CheckShape(ref shapes)
+                NodeOp::CheckShape(ref shapes) | NodeOp::CheckProto { ref shapes, .. }
                     if shapes.is_empty()
                         || shapes.len() > 4
                         || !shapes.iter().all(|&s| crate::value::is_cacheable_shape(s)) =>
@@ -1069,7 +1069,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckNumber | NodeOp::TruncateNumberOrOddball => ExitReason::NotNumber,
         NodeOp::CheckInt32 => ExitReason::NotInt32,
         NodeOp::CheckObject => ExitReason::NotObject,
-        NodeOp::CheckShape(_) => ExitReason::WrongShape,
+        NodeOp::CheckShape(_) | NodeOp::CheckProto { .. } => ExitReason::WrongShape,
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
@@ -1497,6 +1497,26 @@ impl Gen<'_> {
         Ok(site)
     }
 
+    /// Branch to `site` unless the shape in `shape` (a w register) is one of `shapes` (X16
+    /// scratch): an immediate compare where the id fits 12 bits, a built one otherwise.
+    fn shape_compare(&mut self, shape: u32, shapes: &[u32], site: usize) {
+        let ok = self.a.new_label();
+        for (k, &expected) in shapes.iter().enumerate() {
+            if expected < 4096 {
+                self.a.cmp_imm_w(shape, expected);
+            } else {
+                self.a.mov_imm64(X16, u64::from(expected));
+                self.a.cmp_reg_w(shape, X16);
+            }
+            if k + 1 == shapes.len() {
+                self.a.b_cond(NE, site);
+            } else {
+                self.a.b_cond(EQ, ok);
+            }
+        }
+        self.a.bind(ok);
+    }
+
     /// Whether `v`'s word is never a reference (a store of it needs no card mark).
     fn scalar_word(&self, v: NodeIx) -> bool {
         match self.graph.node(v).op {
@@ -1653,6 +1673,8 @@ impl Gen<'_> {
                     record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
                         receiver,
                         shapes: shapes.clone().into(),
+                        ways: shapes.len().min(usize::from(u8::MAX)) as u8,
+                        hop: false,
                     }));
                 }
                 let word = self.gp(input(0), X16);
@@ -1674,22 +1696,40 @@ impl Gen<'_> {
                 self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
                 self.a
                     .ldr_w_imm(X17, X16, (layout.obj_props + layout.props_shape) as u32);
-                let ok = self.a.new_label();
-                for (k, &shape) in shapes.iter().enumerate() {
-                    if shape < 4096 {
-                        self.a.cmp_imm_w(X17, shape);
-                    } else {
-                        self.a.mov_imm64(X16, u64::from(shape));
-                        self.a.cmp_reg_w(X17, X16);
-                    }
-                    if k + 1 == shapes.len() {
-                        self.a.b_cond(NE, site);
-                    } else {
-                        self.a.b_cond(EQ, ok);
-                    }
-                }
-                self.a.bind(ok);
+                self.shape_compare(X17, shapes, site);
                 self.gp_done(n, cell);
+            }
+            NodeOp::CheckProto { shapes, ways } => {
+                let site = self.check_exit(n)?;
+                let pc = graph.state(node.state.expect("checked")).pc;
+                let object = self.source(input(0), pc)?;
+                if let Some((_, _, record)) = self.exits.last_mut() {
+                    record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
+                        receiver: object,
+                        shapes: shapes.clone().into(),
+                        ways: *ways,
+                        hop: true,
+                    }));
+                }
+                // As the templates' hop (`emit_baked`): the [[Prototype]] read from the object,
+                // non-null, an ordinary kind, IC_PLAIN, then its shape.
+                let layout = self.layout;
+                let cell = self.gp(input(0), X16);
+                let proto = self.gp_dst(n);
+                self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
+                self.a.ldr_imm(proto, X17, layout.obj_proto as u32);
+                self.a.cbz(proto, true, site);
+                self.a.add_imm(X16, proto, layout.obj_from_cell as u32);
+                self.a.ldrb_imm(X17, X16, layout.obj_kind as u32);
+                self.a
+                    .cmp_imm_w(X17, crate::value::KIND_ORDINARY_LAST as u32);
+                self.a.b_cond(HI, site);
+                self.a.ldrb_imm(X17, X16, layout.obj_flags as u32);
+                self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
+                self.a
+                    .ldr_w_imm(X17, X16, (layout.obj_props + layout.props_shape) as u32);
+                self.shape_compare(X17, shapes, site);
+                self.gp_done(n, proto);
             }
             NodeOp::CheckBoolean => {
                 let site = self.check_exit(n)?;

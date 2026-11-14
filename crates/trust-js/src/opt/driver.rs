@@ -1996,9 +1996,8 @@ fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'stati
 /// NotNumber site with whether an oddball truncation exited. Logs each new site.
 fn flag(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>) {
     let shapes = match exit.reason {
-        ExitReason::WrongShape => exit.shape_check.as_ref().map_or(0, |check| {
-            check.shapes.len().min(usize::from(u8::MAX)) as u8
-        }),
+        // The access's receiver shapes (a prototype's check keeps its access's).
+        ExitReason::WrongShape => exit.shape_check.as_ref().map_or(0, |check| check.ways),
         // The proof's byte its check expected (stage 2, step 4).
         ExitReason::WrongName => exit.proof,
         // Whether a bitwise operation's oddball truncation took it (TRUNCATION_EXIT).

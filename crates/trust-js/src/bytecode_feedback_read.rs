@@ -627,6 +627,8 @@ fn named_way(state: IcState) -> Option<NamedWay> {
         slot,
         location: state.loc,
         kind,
+        mids: [state.mid_shape, state.mid2_shape],
+        mids_recorded: state.mid_ok & 0b11,
     })
 }
 
