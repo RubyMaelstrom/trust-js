@@ -989,3 +989,23 @@ fn a_claimed_speculation_its_operands_rule_out_exits() {
     let (graph, text) = graph_of(&mut engine, "cn");
     assert_eq!(count(&graph, is_effect), 1, "{text}");
 }
+
+#[test]
+fn the_equality_record_leaves_the_settled_feedback_fingerprint_as_it_was() {
+    // A pair met at an equality changes its record, which the merge at the fingerprint takes,
+    // and not the fingerprint: the function tiers up when its other feedback settles, as V8's
+    // compare feedback delays no tier-up.
+    let mut engine = warmed(SPECULATED);
+    let chunk = chunk_of(&mut engine, "en");
+    let before = super::snapshot::fingerprint(&chunk);
+    let pc = equality_pc(&chunk);
+    super::profile::ChunkProfile::of(&chunk).see_equality(chunk.jit_ops().len(), pc, NUMBERS);
+    assert_eq!(super::snapshot::fingerprint(&chunk), before);
+    assert_eq!(
+        chunk.feedback_vector().record_word(pc),
+        crate::feedback::EQ_NUMBERS,
+        "merged at the fingerprint"
+    );
+    super::profile::ChunkProfile::of(&chunk).see_equality(chunk.jit_ops().len(), pc, STRINGS);
+    assert_eq!(super::snapshot::fingerprint(&chunk), before);
+}

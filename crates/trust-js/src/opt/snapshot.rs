@@ -943,7 +943,12 @@ fn is_length_read<'n>(op: &Op, name: &impl Fn(u32) -> &'n str) -> bool {
 /// does (:377-390). Template code's last-seen element receivers are merged into the records first (P3
 /// stage 3, rule U; `profile::merge_element_hits`), as JSC merges its array profiles at every
 /// tier-up check, optimizing or not (jit/JITOperations.cpp:2826-2829, 2881, 2940): a site still
-/// finding kinds changes the fingerprint. Main thread.
+/// finding kinds changes the fingerprint. The equality record (P3 stage 3 step L1) is merged too
+/// but left out: V8 ORs a compare's feedback in at every execution and tells the tiering manager
+/// nothing of it (codegen/code-stub-assembler.cc:13847-13866), which only an IC's change delays
+/// (execution/tiering-manager.cc:497, called from ic/ic.cc:362), so that a function whose
+/// equalities go on meeting new pairs tiers up when its other feedback settles, a pair it meets
+/// later being a speculation's exit and flag. Main thread.
 pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
     use std::hash::Hasher;
     super::profile::merge_element_hits(chunk);
@@ -986,8 +991,7 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
                 }
                 hash.write_u32(construct.prototype_shape);
             }
-            SiteView::Equality(equality) => hash.write_u32(equality.pairs),
-            SiteView::Allocation(_) | SiteView::None => {}
+            SiteView::Equality(_) | SiteView::Allocation(_) | SiteView::None => {}
         }
     }
     hash.finish()
