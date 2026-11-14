@@ -576,6 +576,19 @@ fn check_graph(
                     if (pops as usize) > depth || node.inputs.len() != pops as usize + stale {
                         return Err(Refusal::at(pc as usize, "an effect's operands"));
                     }
+                    // An inlined frame's generic node publishes its frame's inline site, whose
+                    // caller position is the compiled frame's call's (the oracle's): a frame
+                    // inlined into an inlined frame (no plan builds one today: the oracle keeps
+                    // leaf callees) would need its site to chain its caller's.
+                    if graph
+                        .inlined(node.frame)
+                        .is_some_and(|frame| !graph.state(frame.parent).frame.is_compiled())
+                    {
+                        return Err(Refusal::at(
+                            pc as usize,
+                            "a generic node of a frame inlined into an inlined frame",
+                        ));
+                    }
                     // An inlined frame's node's operand words and slot window lie in the
                     // compiled frame's record, from its operand base (`lower_inlined_generic`).
                     if !node.frame.is_compiled()

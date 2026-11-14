@@ -183,6 +183,12 @@ pub(crate) fn prepare(
                 expected_genv: way.expected_genv,
                 genv_pin: way.genv_pin.clone(),
             });
+            // A leaf's frame is the compiled frame's child: its site's caller position is this
+            // chunk's call's, never an inline position (a nested frame's would chain it).
+            debug_assert!(way.leaf);
+            debug_assert!(!crate::stack_trace::is_inline_position(
+                chunk.call_position(cache)
+            ));
             inline_sites.push(crate::stack_trace::InlineSite {
                 callee: crate::value::Gc::downgrade(&way.obj),
                 inner: crate::stack_trace::NO_POSITION,

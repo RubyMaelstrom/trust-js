@@ -1887,3 +1887,68 @@ fn a_record_whose_slots_are_a_window_is_scanned_whole() {
     // SAFETY: the record runs nothing; it goes to the pool as any finished activation's does.
     unsafe { crate::jit::JitFrame::release(i, record) };
 }
+
+/// The code of a function with an inlined frame's generic node declares the operand words its
+/// node takes, the callee's capacity and slot window above the compiled frame's operand base,
+/// which every entry sizes its stack from (P3 stage 3 step 3c).
+#[test]
+fn an_inlined_frames_operand_words_and_window_bound_the_codes_stack() {
+    let locals = (0..30)
+        .map(|k| format!("v{k}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!(
+        "function M(v) {{ this.v = v; }}
+         Object.defineProperty(M.prototype, 'w', {{ get: function () {{ return this.v; }} }});
+         function wide(o) {{ var {locals}; return o.w; }}
+         function cw(o) {{ return wide(o); }}
+         var m = new M(1), r = 0; for (var k = 0; k < 300; k++) r += cw(m); r"
+    );
+    TestSwitches::default().set();
+    let expected = eval(&mut jit_engine(), &source);
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    inlined_generic();
+    assert_eq!(eval(&mut engine, &source), expected);
+    assert!(!inlined_generic().is_empty());
+    let cw = chunk_of(&mut engine, "cw");
+    let stack = cw.jit.max_stack().expect("cw has code");
+    assert!(
+        stack > 30,
+        "the code's operand words cover wide's window: {stack}"
+    );
+}
+
+/// The graph counterpart of the splice's `spliced_callee_outlives_dropping_its_last_reference`
+/// (P3 stage 3 step 3c; step 2's record asks for it before the flip): the inlined callee drops the
+/// last reference to itself, then its generic node's getter allocates (a collection at every
+/// allocation), then it reads its captured bindings, whose records the code embeds. The frame's
+/// callee is a node every state of the frame names, in a home the collector scans, which keeps
+/// the closure and its environment alive; the callee's chunk, which ctx.chunk names while the
+/// node runs, the code holds (`exit::Inlined::chunks`).
+#[test]
+fn an_inlined_callee_that_drops_its_last_reference_runs_on_through_collections() {
+    let source = "function M() {}
+         Object.defineProperty(M.prototype, 'w', { get: function () {
+           var junk = []; for (var j = 0; j < 4; j++) junk.push({j: j}); return junk.length; } });
+         function makeWarm() { var secret = {v: 42}; var other = [1, 2, 3];
+           return function target(holder) { var m = holder.m; if (holder.drop) holder.fn = null;
+             var k = m.w; return secret.v + other.length + k; }; }
+         function invoke(holder) { return holder.fn(holder); }
+         function drive(make) {
+           var holder = { fn: make(), drop: false, m: new M() }, last;
+           for (var i = 0; i < 300; i++) last = invoke(holder);
+           holder.drop = true;
+           return last + '->' + invoke(holder) + ',' + holder.fn;
+         }
+         drive(makeWarm)";
+    inlines();
+    inlined_generic();
+    let (expected, got) = both(source, 0, true);
+    assert_eq!(got, expected);
+    assert_eq!(expected, "49->49,null");
+    assert!(inlines()
+        .iter()
+        .any(|note| note.outcome == InlineOutcome::Inlined));
+    assert!(!inlined_generic().is_empty());
+}

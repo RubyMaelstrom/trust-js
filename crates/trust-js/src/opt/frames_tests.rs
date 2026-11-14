@@ -2089,3 +2089,67 @@ fn a_stub_call_in_an_inlined_frame_keeps_the_chain_its_exit_reads() {
     });
     assert_eq!(exits().1, vec![(1, get, ExitReason::OutOfBounds)]);
 }
+
+/// A generic node in a frame inlined into an inlined frame is refused by the back end (P3 stage
+/// 3 step 3c): its inline site's caller position is the compiled frame's call's, which a nested
+/// frame's would have to chain; no plan builds one (the oracle keeps leaf callees).
+#[test]
+fn a_generic_node_of_a_frame_inlined_into_an_inlined_frame_is_refused() {
+    let mut engine = fixture(FIXTURES);
+    let top3 = chunk_of(&mut engine, "top3");
+    let mid = chunk_of(&mut engine, "mid");
+    let inner = chunk_of(&mut engine, "inner");
+    let mut graph = three_frames(&top3, &mid, &inner);
+    // inner's Add (pc 2) as a generic node of frame 2, with the state of its own check.
+    let check = (0..graph.nodes.len())
+        .map(|k| NodeIx(k as u32))
+        .find(|&n| graph.node(n).frame == FrameIx(2) && graph.node(n).op == NodeOp::CheckNumber)
+        .expect("inner's check");
+    let (block, state, inputs) = {
+        let node = graph.node(check);
+        let state = graph.state(node.state.unwrap());
+        (node.block, node.state.unwrap(), state.stack.to_vec())
+    };
+    let generic = graph.new_node(
+        block,
+        NodeOp::Generic {
+            pc: 2,
+            pops: 2,
+            pushes: 1,
+        },
+        &inputs,
+        Rep::None,
+        2,
+    );
+    {
+        let node = graph.node_mut(generic);
+        node.frame = FrameIx(2);
+        node.state = Some(state);
+        node.reason = Some(ExitReason::Throw);
+    }
+    let body = &mut graph.blocks[block.index()].body;
+    let at = body.iter().position(|&n| n == check).unwrap();
+    body.insert(at + 1, generic);
+    let chunk = chunk_of(&mut engine, "top3");
+    let cfg = Cfg::build(&chunk).expect("the chunk's stack depths settle");
+    let inlined = callee_chunks(&mut engine, &["mid", "inner"]);
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
+    let initialized = cfg.initialized_reads(chunk.jit_ops(), true);
+    let refused = super::a64::compile_frames_with(
+        &chunk,
+        &graph,
+        &cfg,
+        &inlined,
+        initialized,
+        &layout,
+        &ilayout,
+        Options::default(),
+    )
+    .err()
+    .expect("the back end refuses the graph");
+    assert_eq!(
+        refused.reason,
+        "a generic node of a frame inlined into an inlined frame"
+    );
+}
