@@ -14,12 +14,13 @@
 //!   may be a canonical-frame effect, after which it is in the frame at the header (such an
 //!   effect leaves every slot in the frame); whether an operation can be one is the builder's own
 //!   choice of its form ([`Rules`], stage 2 step 4), which the builder keeps to. Where a loop
-//!   without effects or generic nodes reads such a slot and is entered with it in the frame's
+//!   without canonical-frame effects reads such a slot and is entered with it in the frame's
 //!   keeping, its value is loaded once at the end of each entry predecessor and held through the
 //!   loop, the frame still holding it (P3 stage 3 step 0, `Builder::invariant`); with one entry
 //!   edge, such a loop's invariants, the values its header holds for the slots it reads and does
 //!   not assign, are noted for the phi selector, which moves their checks in the loop to that
-//!   edge. A header's poll opens its body, with the header's state, once a back edge reaches it.
+//!   edge: a value's check holds across the loop's generic nodes, which cannot change the value
+//!   (P3 stage 3 step 3a). A header's poll opens its body, with the header's state, once a back edge reaches it.
 //! - Liveness (stage 2 step 6): a slot dead at a pc is Dead in its frame states, no join merges
 //!   it, no flush writes it, and no value holds it after an effect.
 //! - Joins: a phi where the predecessors' values differ and one of them is a node's (P3 stage 3
@@ -1069,10 +1070,12 @@ struct Loop {
     /// 3a), as Maglev's loop phis are its loop's assignments.
     written: Vec<bool>,
     /// The slots an operation of the loop may read (`liveness::add_reads`), for a loop without
-    /// effects (empty otherwise).
+    /// canonical-frame effects (empty otherwise).
     read: Vec<bool>,
-    /// Whether an operation of the loop may lower to an effect or a generic node: step 0's rules
-    /// take only loops without (the load of an invariant slot, the notes of invariants).
+    /// Whether an operation of the loop may be an effect or a generic node, either of which may run
+    /// anything and so ends the heap facts: `keeps_heap` requires none (P3 stage 3 step 0c). The
+    /// slot rules read `canonical` alone (P3 stage 3 step 3a: a generic node leaves the slots it
+    /// does not name as they are).
     effects: bool,
     /// Whether the loop keeps its entry's heap facts (P3 stage 3 step 0c): no effect, and no `%`,
     /// whose F64Mod call ends them in the builder's model. Nothing else the loop runs, its poll's
@@ -1088,7 +1091,8 @@ struct Loop {
     typed: Vec<TypedUse>,
     /// Whether an operation of the loop may be a canonical-frame effect ([`canonical`]), after
     /// which every slot is in the frame (P3 stage 3 step 3a: a generic node leaves the slots it
-    /// does not write as they are).
+    /// does not write as they are, so step 0's rules, the load of an invariant slot and the notes
+    /// of invariants, take every other loop).
     canonical: bool,
 }
 
@@ -1249,6 +1253,7 @@ impl Flow {
                     }
                     let whole = canonical(&ops[pc]);
                     if !rules.lowers(pc) {
+                        // A generic node or an effect: either may run anything (heap facts end).
                         found.effects = true;
                         found.canonical |= whole;
                     }
@@ -1260,8 +1265,9 @@ impl Flow {
                     }
                 }
             }
-            // The read set serves the load-once rule, which only a loop without effects takes.
-            if !found.effects {
+            // The read set serves step 0's rules, which only a loop without canonical-frame effects
+            // takes.
+            if !found.canonical {
                 let mut read = vec![0u64; words];
                 for &index in &body {
                     let block = &blocks[ix(rpo[index])];
@@ -1272,8 +1278,11 @@ impl Flow {
                 found.read = (0..n_slots)
                     .map(|slot| read[slot / 64] & (1 << (slot % 64)) != 0)
                     .collect();
-                found.keeps_heap = !modulo;
             }
+            // Heap facts through the header only where nothing in the loop can end them: no
+            // effect and no generic node (P3 stage 3 step 0c's rule; step 3a's generic nodes may
+            // run anything, so they count as effects here), and no `%`.
+            found.keeps_heap = !found.effects && !modulo;
             if found.keeps_heap {
                 for &index in &body {
                     let block = &blocks[ix(rpo[index])];
@@ -2955,7 +2964,7 @@ impl<'a> Builder<'a> {
             } else {
                 // The slot keeps its entry state through the loop (generic nodes leave it so).
                 let (mut merged, mut phi) = self.merge_slot(block, &mut preds, slot, pc);
-                let read = !lp.effects && lp.read[slot];
+                let read = lp.read[slot];
                 if merged == Slot::Frame && read {
                     (merged, phi) = self.invariant(block, &mut preds, slot, pc);
                 } else if read && preds.len() == 1 {

@@ -4856,10 +4856,10 @@ fn a_loop_with_an_effect_reloads_and_checks_its_invariant_slots_as_before() {
 }
 
 #[test]
-fn a_loop_with_a_generic_node_holds_its_invariant_and_checks_it_in_the_loop() {
+fn a_loop_with_a_generic_node_holds_its_invariant_and_checks_it_at_its_entry() {
     // P3 stage 3 step 3a: the call in the loop is a generic node, which leaves `a` alone: no
-    // reload anywhere, the loop reads `a`'s entry value and checks it in the loop (step 0's rule
-    // moves checks out of loops without effects or generic nodes only).
+    // reload anywhere, the loop reads `a`'s entry value, an invariant of the loop whose check holds
+    // across the call (the value cannot change), moved to the loop's entry edge.
     let mut engine = warmed(
         "function eff(g, a, n) { var s = 0; g();
            for (var i = 0; i < n; i++) { s = s + a * i; g(); } return s; }
@@ -4869,24 +4869,18 @@ fn a_loop_with_a_generic_node_holds_its_invariant_and_checks_it_in_the_loop() {
     );
     let (chunk, graph) = graph_of(&mut engine, "eff");
     let text = dump(&graph, &chunk);
-    let lp = loop_at(&graph, the_loop(&graph));
+    let header_pc = the_loop(&graph);
+    let lp = loop_at(&graph, header_pc);
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
     assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
     let value = entry_value(&graph, &chunk, "a");
-    let checks = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber);
-    assert!(!checks.is_empty(), "{text}");
-    assert!(
-        checks
-            .iter()
-            .all(|&check| lp.members[graph.node(check).block.index()]),
-        "{text}"
-    );
-    assert!(
-        graph
-            .nodes
-            .iter()
-            .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
-        "{text}"
-    );
+    let [number] = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber)[..] else {
+        panic!("one check of a: {text}")
+    };
+    let a = slot_named(&chunk, "a") as usize;
+    assert_hoisted(&graph, number, entry, header_pc, &[a], &text);
 }
 
 #[test]
@@ -4982,9 +4976,10 @@ fn a_slot_the_loop_writes_keeps_its_phi_and_its_entry_speculation() {
 
 #[test]
 fn an_inner_loop_without_effects_in_one_with_an_effect_loads_on_its_own_entry() {
-    // The outer loop's call is a generic node; the inner loop, free of them, notes `a`'s entry
-    // value as its invariant and checks it on its own entry edge (P3 stage 3 step 3a: held, not
-    // loaded).
+    // The outer loop's call is a generic node, which leaves `a` alone: the outer loop notes `a`'s
+    // entry value as its invariant first and checks it on its own entry edge, which covers the
+    // inner loop's check too (P3 stage 3 step 3a: held, not loaded; a canonical-frame effect in
+    // the outer loop would leave the inner loop's own entry to load and check it).
     let mut engine = warmed(
         "function nest(g, a, n) { var s = 0;
            for (var k = 0; k < 3; k++) { g(); for (var i = 0; i < n; i++) s = s + a * i; }
@@ -4999,17 +4994,17 @@ fn an_inner_loop_without_effects_in_one_with_an_effect_loads_on_its_own_entry() 
         panic!("two loops: {text}")
     };
     let (outer, inner) = (loop_at(&graph, outer_pc), loop_at(&graph, inner_pc));
-    let [entry] = inner.entries[..] else {
+    let [entry] = outer.entries[..] else {
         panic!("one entry edge: {text}")
     };
-    assert!(outer.members[entry], "{text}");
+    assert!(!inner.members[entry], "{text}");
     assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
     let value = entry_value(&graph, &chunk, "a");
     let [number] = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber)[..] else {
         panic!("one check of a: {text}")
     };
     let a = slot_named(&chunk, "a") as usize;
-    assert_hoisted(&graph, number, entry, inner_pc, &[a], &text);
+    assert_hoisted(&graph, number, entry, outer_pc, &[a], &text);
     assert_ne!(outer.header, inner.header);
 }
 
@@ -5862,4 +5857,37 @@ fn an_untagged_outer_phi_held_by_an_inner_loop_moves_no_check() {
             .all(|node| !(node.op == NodeOp::CheckNumber && node.inputs == [x])),
         "no check of the untagged phi: {text}"
     );
+}
+
+#[test]
+fn an_inner_loop_in_one_with_a_canonical_effect_loads_on_its_own_entry() {
+    // The outer loop's spread is a canonical-frame effect, after which every slot is in the
+    // frame: the inner loop, free of effects, loads `a` once on its own entry edge and checks it
+    // there (step 0's rule), and the outer loop notes nothing.
+    let mut engine = warmed(
+        "function nest(g, a, n) { var s = 0, t;
+           for (var k = 0; k < 3; k++) { t = [...g]; for (var i = 0; i < n; i++) s = s + a * i; }
+           return s + t.length; }
+         for (var r = 0; r < 20; r++) nest([], 1.5, 10);",
+        "for (var r = 0; r < 20; r++) nest([], 1.5, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "nest");
+    let text = dump(&graph, &chunk);
+    let [outer_pc, inner_pc] = loop_pcs(&graph)[..] else {
+        panic!("two loops: {text}")
+    };
+    let (outer, inner) = (loop_at(&graph, outer_pc), loop_at(&graph, inner_pc));
+    let [entry] = inner.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    assert!(outer.members[entry], "{text}");
+    let [load] = loads_of(&graph, &chunk, "a")[..] else {
+        panic!("one load of a: {text}")
+    };
+    assert_eq!(graph.node(load).block.index(), entry, "{text}");
+    let [number] = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber)[..] else {
+        panic!("one check of a: {text}")
+    };
+    let a = slot_named(&chunk, "a") as usize;
+    assert_hoisted(&graph, number, entry, inner_pc, &[a], &text);
 }
