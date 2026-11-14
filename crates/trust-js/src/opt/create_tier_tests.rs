@@ -128,17 +128,49 @@ fn creations_have_the_vms_results_under_every_change_of_their_proof() {
     assert!(compiles > 0, "the tier compiled the functions");
 }
 
-/// Whether the tier's code of `name` (its graph as a compile builds it now, its snapshot taken in
-/// the engine's realm, as the driver's) creates a property.
-fn creates(engine: &mut Engine, name: &str) -> bool {
-    let chunk = tier_chunk(engine, name).unwrap_or_else(|| panic!("{name}'s tier chunk"));
+#[test]
+fn a_creation_against_its_objects_predicted_layout_has_the_vms_results() {
+    // `R`'s instances are predicted to take `a` then `b` (its first runs' order); one in eight
+    // takes `b` first, against the prediction: the commit must take the landing shape's layout,
+    // not the object's predicted one, or its keys (for-in, Object.keys) name `a` where `b` is.
+    let source = "function R(f, v) { if (f) { this.a = v; this.b = v + 1; } \
+           else { this.b = v + 2; this.a = v + 3; } }\n\
+         let t = 0;\n\
+         for (let k = 0; k < 1500; k++) {\n\
+           const o = new R(k % 8 !== 5, k);\n\
+           const keys = Object.keys(o).join();\n\
+           t = (t * 31 + (keys === 'a,b' ? 1 : keys === 'b,a' ? 2 : 3) + o.a + o.b) % 1000003;\n\
+           for (const key in o) t = (t * 31 + key.charCodeAt(0) + o[key]) % 1000003;\n\
+         }\n\
+         t";
+    let expected = run(Tier::Bytecode, source);
+    for (label, switches) in configurations() {
+        assert_eq!(
+            with_switches(switches, source),
+            expected,
+            "{label} {switches:?}"
+        );
+    }
+}
+
+/// The creations of the tier's code of `name` (its graph as a compile builds it now, its
+/// snapshot taken in the engine's realm, as the driver's): of its tier chunk, else of its first
+/// stage (the chunk a compile of a function with nothing to splice takes).
+fn creations(engine: &mut Engine, name: &str) -> usize {
+    let chunk = tier_chunk(engine, name).unwrap_or_else(|| first_stage(engine, name));
     let snapshot = super::super::snapshot::Snapshot::take_in(&chunk, Some(&engine.interp));
     super::super::build::build(&chunk, &snapshot)
         .expect("built")
         .graph
         .nodes
         .iter()
-        .any(|node| matches!(node.op, super::super::ir::NodeOp::StoreNew { .. }))
+        .filter(|node| matches!(node.op, super::super::ir::NodeOp::StoreNew { .. }))
+        .count()
+}
+
+/// Whether the tier's code of `name` creates a property.
+fn creates(engine: &mut Engine, name: &str) -> bool {
+    creations(engine, name) > 0
 }
 
 #[test]
@@ -184,10 +216,17 @@ fn a_constructor_runs_its_creations_in_the_tiers_code_without_an_exit() {
     assert_eq!(eval(&mut engine, more), expected[1]);
     let taken = exits();
     assert!(taken.is_empty(), "no exit: {taken:?}");
-    assert!(creates(&mut engine, "P"), "P creates in the tier's code");
-    assert!(
-        creates(&mut engine, "W"),
-        "W creates its twelve fields in the tier's code, the last five by the slow path"
+    assert_eq!(
+        creations(&mut engine, "P"),
+        3,
+        "P creates in the tier's code"
+    );
+    // Had the commit's failing conditions exited, the exits would have flagged the 9th to 12th
+    // creations and the recompile taken them as effects, with no exit left in `more`.
+    assert_eq!(
+        creations(&mut engine, "W"),
+        12,
+        "W creates its twelve fields in the tier's code, the 9th to 12th by the slow path"
     );
     let chunk = tier_chunk(&mut engine, "P").expect("P's tier chunk");
     let optimized = chunk.jit.get().flatten().expect("resident");
@@ -233,17 +272,23 @@ fn non_extensible_receivers_exit_and_converge_on_the_effect() {
 fn a_setter_appearing_before_the_first_compile_keeps_the_creation_the_effect() {
     // The creation's way was filled before the prototype took a setter of the name, and the tier
     // compiles after: the snapshot's walk of the chain finds the setter and records no chain, so
-    // the creation stays the effect, which calls the setter (no exit ever teaches it).
+    // the creation stays the effect, which calls the setter (no exit ever teaches it). A graph
+    // built between the setter's definition and the site's next run reads the way alone, so
+    // only the walk refuses it.
     let warm = "function P(x) { this.x = x; return this; }\n\
          let t = 0; for (let k = 0; k < 300; k++) t = t + new P(k).x; t";
-    let then = "Object.defineProperty(P.prototype, 'x', { set(v) { this.y = v * 2; }, \
-           configurable: true });\n\
-         let u = 0; for (let k = 0; k < 600; k++) u = u + new P(k).y; u";
+    let setter = "Object.defineProperty(P.prototype, 'x', { set(v) { this.y = v * 2; }, \
+           configurable: true }); 0";
+    let then = "let u = 0; for (let k = 0; k < 600; k++) u = u + new P(k).y; u";
     let expected = {
         let mut vm = Engine::new();
         vm.set_tier(Tier::Bytecode);
         vm.set_tier_threshold(0);
-        [eval(&mut vm, warm), eval(&mut vm, then)]
+        [
+            eval(&mut vm, warm),
+            eval(&mut vm, setter),
+            eval(&mut vm, then),
+        ]
     };
     TestSwitches {
         on: false,
@@ -252,7 +297,16 @@ fn a_setter_appearing_before_the_first_compile_keeps_the_creation_the_effect() {
     .set();
     let mut engine = jit_engine();
     assert_eq!(eval(&mut engine, warm), expected[0]);
+    assert!(
+        creates(&mut engine, "P"),
+        "the way alone, no setter: a creation"
+    );
+    assert_eq!(eval(&mut engine, setter), expected[1]);
+    assert!(
+        !creates(&mut engine, "P"),
+        "the walk finds the setter before the site runs"
+    );
     eager().set();
-    assert_eq!(eval(&mut engine, then), expected[1]);
+    assert_eq!(eval(&mut engine, then), expected[2]);
     assert!(!creates(&mut engine, "P"), "the setter keeps the effect");
 }
