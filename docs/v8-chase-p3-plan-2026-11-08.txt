@@ -3843,15 +3843,23 @@ why values held through zlib's loops cost more than reloading them, and the reme
   tier off's template code. (b) The tier dispatches on the kind in line at such a site, as the
   stub does (Maglev's polymorphic element access, maglev-graph-builder.cc:5626-5700, but from
   recorded maps): more code at every such site and no exemplar for the unrecorded case. (a) is
-  the exemplars' form; to be measured (the tier off's cost, the tier on's gain) before the owner
-  decides.
+  the exemplars' form. By the probe's executed words a Mixed site's typed access costs about 43
+  instructions with the stub and a recorded site's about 18 in line (inferred from the words'
+  sums, not measured as a change). The owner chose (a) on 2026-11-14 ("go ahead with the JSC fix
+  for avoiding the stub if you think it will make an improvement"): it is built as a step of its
+  own (rule U; target/p3/stage3/briefs/ruleu.txt), the store emitted only where the tier is on,
+  which is off by default and alone reads the records, so that the tier off's template code
+  stays as it is.
 - Tests: the allocator's homes across a TypedElement call (fourteen words and three f64s, a loop
   phi's hint, a spill victim's register), the consistency check over every value across a stub
   call, the back end's call on three typed kinds with seventeen values live and one saved, the
   exit's frame where the stub declines; two builder tests of the equality rule; 13 mutations, 12
   caught (the thirteenth cannot change a result: every operation the rule classifies pushes one
   value); the tier's tests in four configurations (309) and the new ones under GC stress;
-  zombie's check, clippy and Windows' check.
+  zombie's check, clippy and Windows' check. On the landed tree, the tier off, on, eager and eager
+  with forced exits: the library suite 3,265 passed and none failed in each, difftest 138 agree in
+  each, the three fixtures' masked outputs equal the tier off's (target/p3/stage3/step0b-review/
+  gate.out).
 
 The retention fix landed (435036cf, 30fc9acd, 544d9c86, 2026-11-14; target/p3/stage2/
 retention-impl, report.txt): long Splay runs' dead tree nodes were kept by stale words in the
@@ -3874,8 +3882,10 @@ JIT's activation records and below the stack pointer.
   tier off's, Test262 53,572 of 53,575 with no failure beyond the tier off's; GC stress 1 off and
   eager over the tier's four module runs and the fourteen stress sets: all pass. zombie's check,
   clippy, Windows' check and suite (2,804) pass. Six mutations of the live-top rules, each caught.
-- Landed on top of stage 3's steps 0 and 0b, which touch only the tier's modules; the merged tree
-  checks, and its rooting, collector and tier tests are run again (target/p3/stage3/merge-check).
+- Landed on top of stage 3's steps 0 and 0b, which touch only the tier's modules; on the merged
+  tree the rooting tests (23, the tier off, on and eager), the collector's (116), the tier's (256
+  in the four configurations), the back end's (53) and the poll's (14) pass (target/p3/stage3/
+  merge-check/run.out).
 - Residual: below a record's live top the optimizing tier's code writes only its effects'
   operands, so an earlier activation's words there are still scanned; a record waiting on a call
   into Rust other than a poll is scanned to its extent. Closed as stage 2's carried item.
