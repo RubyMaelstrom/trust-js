@@ -3852,3 +3852,30 @@ why values held through zlib's loops cost more than reloading them, and the reme
   caught (the thirteenth cannot change a result: every operation the rule classifies pushes one
   value); the tier's tests in four configurations (309) and the new ones under GC stress;
   zombie's check, clippy and Windows' check.
+
+The retention fix landed (435036cf, 30fc9acd, 544d9c86, 2026-11-14; target/p3/stage2/
+retention-impl, report.txt): long Splay runs' dead tree nodes were kept by stale words in the
+JIT's activation records and below the stack pointer.
+- An active JIT record is scanned up to its activation's extent, and where the collector knows it
+  up to its live top (SpiderMonkey's form): a record waiting on a direct call up to the operand
+  top the call sequence stores beside the callee's stack base (one STP where an STR was: no
+  instruction added), a record inside a poll up to the top the poll helper keeps while it runs
+  (two stores on the poll's slow path); any other wait falls back to the extent. The native stack
+  below the stack pointer is zeroed as JSC sanitizes its stack. A debug assertion bounds a known
+  top between the activation's slots and its extent.
+- Measured (fat LTO): the live data after each major collection in a fixed 2,800-iteration Splay
+  run stays at 119-134 MB with the tier on where main's grew to 604 MB, and at 118-131 MB with the
+  bytecode VM where main's grew to 423 MB; the template JIT's was flat already. A call costs the
+  same instructions and cycles (fib(30), 5,200.5M against 5,200.5M). Octane timed in one session
+  (CPU 17, 1.318 GHz): 4,364 -> 4,435 with the tier off, 5,817 -> 5,854 with it on; Splay with the
+  tier on 4,678 and 4,751 -> 5,101 and 5,101.
+- The full gate on the branch's tree (target/p3/stage2/retention-impl/gate/gate2.out, 4 h 25 min):
+  in the four configurations the lib suite 3,248, difftest 138 agree, the fixtures' outputs the
+  tier off's, Test262 53,572 of 53,575 with no failure beyond the tier off's; GC stress 1 off and
+  eager over the tier's four module runs and the fourteen stress sets: all pass. zombie's check,
+  clippy, Windows' check and suite (2,804) pass. Six mutations of the live-top rules, each caught.
+- Landed on top of stage 3's steps 0 and 0b, which touch only the tier's modules; the merged tree
+  checks, and its rooting, collector and tier tests are run again (target/p3/stage3/merge-check).
+- Residual: below a record's live top the optimizing tier's code writes only its effects'
+  operands, so an earlier activation's words there are still scanned; a record waiting on a call
+  into Rust other than a poll is scanned to its extent. Closed as stage 2's carried item.
