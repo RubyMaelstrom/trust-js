@@ -194,6 +194,50 @@ fn a_creations_slow_path_stores_a_value_from_its_spill_slot() {
     );
 }
 
+#[test]
+fn a_creations_commit_writes_the_slot_before_the_shape() {
+    // The commit's order (design note 5): the slot's word, its card, the shape and the count
+    // last, with no call or poll between, as the template orders them, so that the collector,
+    // which runs only at safepoints, never sees the shape without the slot. No program can see
+    // the order, so the code is read: each slot store, `str x, [x30]`, is followed by the shape
+    // store, `str w, [x17, #shape]`, and preceded by none.
+    let source = "function P(x) { this.a = x; this.b = x + 1; this.c = x + 2; }\n\
+         let t = 0; for (let k = 0; k < 2000; k++) t = (t + new P(k).c) % 1000003; t";
+    let expected = run(Tier::Bytecode, source);
+    eager().set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, source), expected);
+    assert_eq!(creations(&mut engine, "P"), 3);
+    let chunk = tier_chunk(&mut engine, "P").expect("P's tier chunk");
+    let code = chunk.jit.get().flatten().expect("resident");
+    assert!(is_tier_code(&code), "P runs the tier's code");
+    // SAFETY: the installed code's mapped bytes, alive while `code` is.
+    let bytes = unsafe { std::slice::from_raw_parts(code.mem_ptr(), code.code_bytes()) };
+    let (chunks, _) = bytes.as_chunks::<4>();
+    let words: Vec<u32> = chunks.iter().map(|&w| u32::from_le_bytes(w)).collect();
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let shape_at = (layout.obj_props + layout.props_shape) as u32;
+    let shape_store = |w: u32| w & 0xffff_ffe0 == 0xb900_0000 | ((shape_at / 4) << 10) | (17 << 5);
+    let slot_store = |w: u32| w & 0xffff_ffe0 == 0xf900_03c0;
+    let commits: Vec<usize> = (0..words.len())
+        .filter(|&k| {
+            slot_store(words[k])
+                && words[k + 1..(k + 16).min(words.len())]
+                    .iter()
+                    .any(|&w| shape_store(w))
+        })
+        .collect();
+    assert_eq!(commits.len(), 3, "P's three commits");
+    for &k in &commits {
+        assert!(
+            !words[k.saturating_sub(8)..k]
+                .iter()
+                .any(|&w| shape_store(w)),
+            "a shape store before the slot's at word {k}"
+        );
+    }
+}
+
 /// The creations of the tier's code of `name` (its graph as a compile builds it now, its
 /// snapshot taken in the engine's realm, as the driver's): of its tier chunk, else of its first
 /// stage (the chunk a compile of a function with nothing to splice takes).
