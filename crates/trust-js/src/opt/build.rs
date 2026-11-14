@@ -71,6 +71,24 @@ use crate::value::{PACK_BOOL, PACK_CANON_NAN, PACK_EMPTY, PACK_NULL, PACK_UNDEFI
 #[path = "build_names.rs"]
 mod names;
 
+#[path = "build_inline.rs"]
+mod inline;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) use inline::E0_EFFECT;
+// The job and the driver read these where the tier has its back end.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(unused_imports)
+)]
+pub(crate) use inline::{Callee, InlineNote, InlineOutcome, InlineSite, InlineWay};
+
 const NUMBER: u32 = ValueClass::NumberInt32.bit() | ValueClass::NumberDouble.bit();
 const INT32: u32 = ValueClass::NumberInt32.bit();
 /// The primitives besides Numbers whose ToNumber reads nothing (NaN, 0, 0 and 1): V8's oddballs
@@ -96,6 +114,25 @@ pub(crate) struct Built {
     /// The local reads its stack analysis proves initialized (`Cfg::initialized_reads`), whose
     /// TDZ tests the builder and the effects' templates leave out.
     pub(crate) initialized: InitializedReads,
+    /// The Cfgs of the callee chunks the graph's inlined frames run (P3 stage 3, step 2), by
+    /// `InlinedFrame::chunk`, each with its index among the compile's callee chunks.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) callees: Vec<(u32, Cfg)>,
+    /// What the inliner did at each inlined site's ways, for the log.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) inlines: Vec<InlineNote>,
 }
 
 /// [`build_view`] of a live chunk's frozen view (`Chunk::freeze`), on the calling thread: the
@@ -107,8 +144,66 @@ pub(crate) fn build(chunk: &crate::bytecode::Chunk, snapshot: &Snapshot) -> Resu
 
 /// The graph of `chunk`, a chunk's frozen view, from its operations and `snapshot` (its
 /// feedback), with the analyses it was built from, or why the tier declines it. Reads nothing
-/// but its arguments, so that it runs on any thread (stage 2, step 12).
+/// but its arguments, so that it runs on any thread (stage 2, step 12). The tests'; a job builds
+/// with its inlined callees (`build_inlined`).
+#[cfg(test)]
 pub(crate) fn build_view(chunk: &FrozenChunk, snapshot: &Snapshot) -> Result<Built, Refusal> {
+    build_inlined(chunk, snapshot, None)
+}
+
+/// [`build_view`] with the callees the oracle inlines at `inlining`'s sites built into the graph,
+/// each an inlined frame (P3 stage 3, step 2; `inline`): the sites, and the callee chunks their
+/// ways name, by `InlineWay::chunk`.
+pub(crate) fn build_inlined(
+    chunk: &FrozenChunk,
+    snapshot: &Snapshot,
+    inlining: Option<(&[InlineSite], &[Callee<'_>])>,
+) -> Result<Built, Refusal> {
+    let cfg = admit(chunk, snapshot)?;
+    let ops = chunk.jit_ops();
+    let (_, n_slots) = chunk.jit_frame();
+    let initialized = cfg.initialized_reads(ops, true);
+    let tree = inlining.map(|(sites, callees)| inline::Tree::new(chunk, sites, callees));
+    let (graph, inlines) = {
+        let rules = Rules {
+            chunk,
+            ops,
+            snapshot,
+            cfg: &cfg,
+            initialized: &initialized,
+            inlining: tree.as_ref(),
+        };
+        let flow = Flow::new(chunk, &cfg, &rules)?;
+        let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
+        let (mut graph, notes, inlines) = Builder::new(
+            chunk,
+            snapshot,
+            &cfg,
+            &flow,
+            &initialized,
+            &liveness,
+            tree.as_ref(),
+        )
+        .run()?;
+        // The phis' representations, after the build (stage 2 step 6), each loop header's
+        // flags its own frame's.
+        let snapshots = inline::frame_snapshots(&graph, snapshot, tree.as_ref());
+        super::phis::select(&mut graph, &notes, &snapshots);
+        (graph, inlines)
+    };
+    Ok(Built {
+        graph,
+        cfg,
+        initialized,
+        callees: tree.map(inline::Tree::into_cfgs).unwrap_or_default(),
+        inlines,
+    })
+}
+
+/// Whether the tier takes `chunk` (a chunk's frozen view, `snapshot` its feedback) at all, and
+/// its Cfg where it does: the refusals of the chunk as a whole, its operations, its stack
+/// analysis and its frame's size, which an inlined callee's chunk meets too (P3 stage 3, step 2).
+fn admit(chunk: &FrozenChunk, snapshot: &Snapshot) -> Result<Cfg, Refusal> {
     let ops = chunk.jit_ops();
     if chunk.jit_is_resumable() {
         return Err(Refusal::whole("resumable (a generator or an async body)"));
@@ -141,28 +236,7 @@ pub(crate) fn build_view(chunk: &FrozenChunk, snapshot: &Snapshot) -> Result<Bui
     if n_slots + cfg.jit_stack_capacity() > crate::jit::FRAME_BUF {
         return Err(Refusal::whole("a frame over the record's 256 words"));
     }
-    let initialized = cfg.initialized_reads(ops, true);
-    let graph = {
-        let rules = Rules {
-            chunk,
-            ops,
-            snapshot,
-            cfg: &cfg,
-            initialized: &initialized,
-        };
-        let flow = Flow::new(chunk, &cfg, &rules)?;
-        let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
-        let (mut graph, notes) =
-            Builder::new(chunk, snapshot, &cfg, &flow, &initialized, &liveness).run()?;
-        // The phis' representations, after the build (stage 2 step 6).
-        super::phis::select(&mut graph, &notes, snapshot);
-        graph
-    };
-    Ok(Built {
-        graph,
-        cfg,
-        initialized,
-    })
+    Ok(cfg)
 }
 
 /// Why stage 1 refuses a chunk holding `op` (the Stage 1 record's list).
@@ -235,6 +309,8 @@ struct Rules<'a> {
     snapshot: &'a Snapshot,
     cfg: &'a Cfg,
     initialized: &'a InitializedReads,
+    /// The callees the oracle inlines at the chunk's call sites (P3 stage 3, step 2).
+    inlining: Option<&'a inline::Tree<'a>>,
 }
 
 impl Rules<'_> {
@@ -439,6 +515,11 @@ impl Rules<'_> {
             | Op::StoreCapInit(_)
             | Op::UpdateNameCached(..)
             | Op::UpdateCap(..) => self.name_lowers(pc),
+            // A call whose ways the graph inlines with no generic call left (P3 stage 3, step 2):
+            // its callees run no effect (E0) and write no slot of this frame.
+            Op::Call(_, cache) | Op::CallWithThis(_, cache) => self
+                .inlining
+                .is_some_and(|tree| tree.effect_free(cache, pc, self.snapshot)),
             Op::Undef
             | Op::Dup
             | Op::Dup2
@@ -644,6 +725,20 @@ fn identity_constant(word: u64) -> bool {
         || word == PACK_NULL
         || word & !1 == PACK_BOOL
         || number_word(word).is_some_and(|x| x != 0.0 && !x.is_nan())
+}
+
+/// Whether the block of `snapshot`'s chunk from `start` to `end` holds named or call sites and
+/// none of them ran (its build is an exit).
+fn never_ran(snapshot: &Snapshot, start: usize, end: usize) -> bool {
+    let mut sites = false;
+    for pc in start..end {
+        match snapshot.ran(pc) {
+            Ran::Yes => return false,
+            Ran::No => sites = true,
+            Ran::Unknown => {}
+        }
+    }
+    sites
 }
 
 /// Whether the record alone (a VM run's or a miss's) saw int32s only, in every role it holds:
@@ -1291,6 +1386,16 @@ struct Builder<'a> {
     ended: bool,
     /// The phi inputs' alternatives, for the selector.
     notes: PhiNotes,
+    /// The frame whose operations this builder builds (P3 stage 3, step 2): the compiled
+    /// function's, or an inlined callee's, whose builder `inline` makes over its own chunk.
+    frame: FrameIx,
+    /// The callees the oracle inlines at this chunk's call sites (the compiled function's
+    /// builder's).
+    inlining: Option<&'a inline::Tree<'a>>,
+    /// An inlined frame's builder's context (see `inline::Inlined`).
+    inlined: Option<inline::Inlined<'a>>,
+    /// What the inliner did at each site's ways, for the log.
+    inline_log: Vec<InlineNote>,
 }
 
 impl<'a> Builder<'a> {
@@ -1301,6 +1406,7 @@ impl<'a> Builder<'a> {
         flow: &'a Flow,
         initialized: &'a InitializedReads,
         liveness: &'a SlotLiveness,
+        inlining: Option<&'a inline::Tree<'a>>,
     ) -> Self {
         let (_, n_slots) = chunk.jit_frame();
         let blocks = cfg.blocks().len();
@@ -1324,6 +1430,10 @@ impl<'a> Builder<'a> {
             moves_env: chunk.jit_ops().iter().any(names::moves_env),
             ended: false,
             notes: PhiNotes::default(),
+            frame: FrameIx::COMPILED,
+            inlining,
+            inlined: None,
+            inline_log: Vec::new(),
         }
     }
 
@@ -1335,10 +1445,11 @@ impl<'a> Builder<'a> {
             snapshot: self.snapshot,
             cfg: self.cfg,
             initialized: self.initialized,
+            inlining: self.inlining,
         }
     }
 
-    fn run(mut self) -> Result<(Graph, PhiNotes), Refusal> {
+    fn run(mut self) -> Result<(Graph, PhiNotes, Vec<InlineNote>), Refusal> {
         let flow = self.flow;
         let entry = flow.rpo[0];
         let initial = State {
@@ -1363,7 +1474,11 @@ impl<'a> Builder<'a> {
         }
         let hoisted = std::mem::take(&mut self.hoisted_nodes);
         self.graph.blocks[first.index()].body.splice(0..0, hoisted);
-        Ok((in_reverse_postorder(self.graph), self.notes))
+        Ok((
+            in_reverse_postorder(self.graph),
+            self.notes,
+            self.inline_log,
+        ))
     }
 
     fn build_block(&mut self, id: BlockId) -> Result<(), Refusal> {
@@ -1414,27 +1529,21 @@ impl<'a> Builder<'a> {
             pc: pc as u32,
             reason,
             form,
+            frame: self.frame,
         });
         true
     }
 
     /// Whether the block's named and call sites hold some and none of them ran.
     fn never_ran(&self, start: usize, end: usize) -> bool {
-        let mut sites = false;
-        for pc in start..end {
-            match self.snapshot.ran(pc) {
-                Ran::Yes => return false,
-                Ran::No => sites = true,
-                Ran::Unknown => {}
-            }
-        }
-        sites
+        never_ran(self.snapshot, start, end)
     }
 
     // ---- nodes and states ----------------------------------------------------------------------
 
     fn add(&mut self, op: NodeOp, inputs: &[NodeIx], rep: Rep, pc: usize) -> NodeIx {
-        self.graph.add_node(self.cur, op, inputs, rep, pc as u32)
+        self.graph
+            .add_node_in(self.frame, self.cur, op, inputs, rep, pc as u32)
     }
 
     /// A node that can exit, with its state and reason.
@@ -1463,7 +1572,9 @@ impl<'a> Builder<'a> {
         rep: Rep,
         pc: usize,
     ) -> NodeIx {
-        let node = self.graph.add_node(block, op, inputs, rep, pc as u32);
+        let node = self
+            .graph
+            .add_node_in(self.frame, block, op, inputs, rep, pc as u32);
         let Graph { blocks, nodes, .. } = &mut self.graph;
         let body = &mut blocks[block.index()].body;
         body.pop();
@@ -1510,8 +1621,10 @@ impl<'a> Builder<'a> {
         self.liveness.live(pc, slot)
     }
 
-    /// The frame state at `pc` as `st` describes it, a slot dead there Dead.
+    /// The frame state at `pc` as `st` describes it, a slot dead there Dead. An inlined frame
+    /// has no frame while the code runs (P3 stage 3): each of its live slots is a value.
     fn frame_state(&mut self, pc: usize, st: &State) -> StateIx {
+        let inlined = !self.frame.is_compiled();
         let slots = st
             .slots
             .iter()
@@ -1523,7 +1636,11 @@ impl<'a> Builder<'a> {
                 debug_assert!(*held != Slot::Dead, "slot {slot} is live at pc {pc}");
                 match *held {
                     Slot::Dirty(value) => SlotSource::Value(value),
-                    _ => SlotSource::Frame,
+                    Slot::Clean(value) if inlined => SlotSource::Value(value),
+                    _ => {
+                        debug_assert!(!inlined, "an inlined frame's slot {slot} in a frame");
+                        SlotSource::Frame
+                    }
                 }
             })
             .collect();
@@ -1532,7 +1649,7 @@ impl<'a> Builder<'a> {
             slots,
             stack: st.stack.clone().into_boxed_slice(),
             handlers: st.handlers.clone().into_boxed_slice(),
-            frame: FrameIx::COMPILED,
+            frame: self.frame,
         })
     }
 
@@ -2026,6 +2143,11 @@ impl<'a> Builder<'a> {
         if let Some(&global) = self.hoisted.get(&Hoisted::GlobalObject) {
             live.insert(global);
         }
+        // An inlined frame's receiver, and its callers' values, which their operations reach
+        // after its return (P3 stage 3, step 2).
+        if let Some(inlined) = &self.inlined {
+            live.extend(inlined.live());
+        }
         st.forms.retain(|value, forms| {
             live.contains(value) || forms.members().any(|m| live.contains(&m))
         });
@@ -2103,9 +2225,14 @@ impl<'a> Builder<'a> {
             // the first stage polls at a backward branch's target); a throw from the poll exits
             // with the header's state.
             self.graph.blocks[header.block.index()].loop_header = true;
-            let poll = self
-                .graph
-                .add_node(header.block, NodeOp::Poll, &[], Rep::None, pc as u32);
+            let poll = self.graph.add_node_in(
+                self.frame,
+                header.block,
+                NodeOp::Poll,
+                &[],
+                Rep::None,
+                pc as u32,
+            );
             let data = self.graph.node_mut(poll);
             data.state = Some(header.poll);
             data.reason = Some(ExitReason::Throw);
@@ -2156,8 +2283,14 @@ impl<'a> Builder<'a> {
     }
 
     fn phi(&mut self, block: BlockIx, inputs: &[NodeIx], pc: usize) -> NodeIx {
-        self.graph
-            .add_node(block, NodeOp::Phi, inputs, Rep::Tagged, pc as u32)
+        self.graph.add_node_in(
+            self.frame,
+            block,
+            NodeOp::Phi,
+            inputs,
+            Rep::Tagged,
+            pc as u32,
+        )
     }
 
     /// The state at a forward join: a phi where the predecessors' values differ (`phis` gets
@@ -2497,7 +2630,7 @@ impl<'a> Builder<'a> {
                 }
             }
             Op::LoadThis => {
-                let this = self.hoist(Hoisted::This);
+                let this = self.this();
                 st.stack.push(this);
             }
             Op::Void => {
@@ -2625,6 +2758,15 @@ impl<'a> Builder<'a> {
                     self.exit(pc, ExitReason::Unsupported, std::mem::take(st));
                     return Ok(false);
                 }
+                if self.inlined.is_some() {
+                    // An inlined callee's return: a jump to its caller's continuation.
+                    let value = match op {
+                        Op::Return => st.stack.pop().expect("the stack analysis saw the operand"),
+                        _ => self.word(PACK_UNDEFINED),
+                    };
+                    self.inline_return(pc, value, std::mem::take(st));
+                    return Ok(false);
+                }
                 let value = if op == Op::Return {
                     let value = st.stack.pop().expect("the stack analysis saw the operand");
                     self.tagged(st, value, pc)
@@ -2640,6 +2782,9 @@ impl<'a> Builder<'a> {
                 self.exit(pc, ExitReason::Unsupported, std::mem::take(st));
                 return Ok(false);
             }
+            // A call whose callees the oracle inlines (P3 stage 3, step 2), else its template.
+            Op::Call(argc, cache) => self.call(pc, argc, cache, false, st)?,
+            Op::CallWithThis(argc, cache) => self.call(pc, argc, cache, true, st)?,
             _ => self.effect(pc, st)?,
         }
         // An exit in place of the operation (`mismatch`) ended the block.
@@ -2662,6 +2807,15 @@ impl<'a> Builder<'a> {
 
     /// The operation at `pc` as its baseline template on the canonical frame.
     fn effect(&mut self, pc: usize, st: &mut State) -> Result<(), Refusal> {
+        // An inlined frame runs no template (P3 stage 3, step 2's E0): the inliner declined every
+        // callee a built operation of which the rules leave to one.
+        debug_assert!(
+            self.frame.is_compiled(),
+            "an effect at pc {pc} of an inlined frame"
+        );
+        if !self.frame.is_compiled() {
+            return Err(Refusal::at(pc, "an effect in an inlined frame"));
+        }
         // The loop prepass took no operation the rules lower for an effect (see `Rules`).
         debug_assert!(
             !self.rules().lowers(pc),
@@ -3097,8 +3251,17 @@ impl<'a> Builder<'a> {
     fn receiver(&mut self, recv: Recv, st: &mut State, below: usize, pc: usize) -> NodeIx {
         match recv {
             Recv::Stack => st.stack[st.stack.len() - 1 - below],
-            Recv::This => self.hoist(Hoisted::This),
+            Recv::This => self.this(),
             Recv::Slot(slot) => self.read_slot(st, slot, pc),
+        }
+    }
+
+    /// The frame's `this`: the compiled frame's (`ctx.this_word`), or an inlined callee's
+    /// receiver (P3 stage 3, step 2).
+    fn this(&mut self) -> NodeIx {
+        match &self.inlined {
+            Some(inlined) => inlined.receiver(),
+            None => self.hoist(Hoisted::This),
         }
     }
 
@@ -4042,10 +4205,14 @@ impl Builder<'_> {
             ..met
         };
         let (a, b) = (a?, b?);
-        Some(
-            self.graph
-                .add_node(join, NodeOp::Phi, &[a, b], Rep::Tagged, pc as u32),
-        )
+        Some(self.graph.add_node_in(
+            self.frame,
+            join,
+            NodeOp::Phi,
+            &[a, b],
+            Rep::Tagged,
+            pc as u32,
+        ))
     }
 
     /// UpdateElem (`a[i]++`, `--a[i]`) where its value record says Number: the receiver's element

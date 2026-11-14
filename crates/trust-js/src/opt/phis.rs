@@ -146,8 +146,10 @@ fn exact_i32(x: f64) -> Option<i32> {
 }
 
 /// Pick every phi's representation in `graph`, as built from its chunk with `notes`, and rewrite
-/// the phis, their inputs and their uses to match (see the module's doc).
-pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, snapshot: &Snapshot) {
+/// the phis, their inputs and their uses to match (see the module's doc). `snapshots` gives each
+/// frame's feedback, by its index (the compiled function's first, then each inlined frame's: P3
+/// stage 3, step 2), whose flags a loop header of the frame reads.
+pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, snapshots: &[&Snapshot]) {
     let phis: Vec<NodeIx> = graph
         .blocks
         .iter()
@@ -156,7 +158,7 @@ pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, snapshot: &Snapshot) {
     if phis.is_empty() && notes.invariants.is_empty() {
         return;
     }
-    let mut selector = Selector::new(graph, notes, snapshot);
+    let mut selector = Selector::new(graph, notes, snapshots);
     selector.decide(&phis);
     selector.declines(&phis);
     // Before any rewrite, so that the entry states take the phis' inputs as built.
@@ -201,7 +203,8 @@ struct Selector<'g> {
     retags: FastMap<(NodeIx, BlockIx), NodeIx>,
     /// The nodes the rewrites made.
     made: Vec<NodeIx>,
-    snapshot: &'g Snapshot,
+    /// Each frame's feedback, by its index (see `select`).
+    snapshots: &'g [&'g Snapshot],
     /// Each loop header's blocks (its natural loop), by header.
     loops: FastMap<BlockIx, Vec<bool>>,
     /// The phis' inputs as the builder made them, for the speculations' states.
@@ -213,7 +216,7 @@ struct Selector<'g> {
 }
 
 impl<'g> Selector<'g> {
-    fn new(graph: &'g mut Graph, notes: &'g PhiNotes, snapshot: &'g Snapshot) -> Self {
+    fn new(graph: &'g mut Graph, notes: &'g PhiNotes, snapshots: &'g [&'g Snapshot]) -> Self {
         let n = graph.nodes.len();
         let mut users: Vec<Vec<NodeIx>> = vec![Vec::new(); n];
         let mut position = vec![u32::MAX; n];
@@ -278,7 +281,7 @@ impl<'g> Selector<'g> {
             removed: vec![false; n],
             retags: FastMap::default(),
             made: Vec::new(),
-            snapshot,
+            snapshots,
             loops,
             original: FastMap::default(),
             entry_states: FastMap::default(),
@@ -348,10 +351,9 @@ impl<'g> Selector<'g> {
         if !numeric {
             return None;
         }
-        let pc = self.graph.block(block).first_pc as usize;
-        Some(if self.snapshot.declines(pc, ExitReason::PhiNotNumber) {
+        Some(if self.header_declines(block, ExitReason::PhiNotNumber) {
             Kind::Tagged
-        } else if self.snapshot.declines(pc, ExitReason::PhiNotInt32) {
+        } else if self.header_declines(block, ExitReason::PhiNotInt32) {
             Kind::F64
         } else {
             Kind::Undecided
@@ -385,12 +387,29 @@ impl<'g> Selector<'g> {
                 }
                 _ => continue,
             };
-            let pc = self.graph.block(self.graph.node(phi).block).first_pc;
-            let decline = Decline { pc, reason, form };
+            let block = self.graph.node(phi).block;
+            let pc = self.graph.block(block).first_pc;
+            let frame = self.block_frame(block);
+            let decline = Decline {
+                pc,
+                reason,
+                form,
+                frame,
+            };
             if !self.graph.declines.contains(&decline) {
                 self.graph.declines.push(decline);
             }
         }
+    }
+
+    /// Whether the exit profile flagged `reason` at loop header `header`'s pc, in its frame's
+    /// chunk (P3 stage 3, step 2: an inlined callee's loop reads its callee's flags).
+    fn header_declines(&self, header: BlockIx, reason: ExitReason) -> bool {
+        let pc = self.graph.block(header).first_pc as usize;
+        let frame = self.block_frame(header);
+        self.snapshots
+            .get(frame.index())
+            .is_some_and(|snapshot| snapshot.declines(pc, reason))
     }
 
     fn alternatives(&self, phi: NodeIx, k: usize) -> Alternatives {
@@ -588,14 +607,12 @@ impl<'g> Selector<'g> {
                 continue;
             }
             let pc = self.graph.block(header).first_pc;
-            if self
-                .snapshot
-                .declines(pc as usize, ExitReason::HoistingFailed)
-            {
+            if self.header_declines(header, ExitReason::HoistingFailed) {
                 let decline = Decline {
                     pc,
                     reason: ExitReason::HoistingFailed,
                     form: "the checks in the loop",
+                    frame: self.block_frame(header),
                 };
                 if !self.graph.declines.contains(&decline) {
                     self.graph.declines.push(decline);

@@ -45,6 +45,11 @@ pub(crate) mod activation;
 ))]
 #[path = "bytecode_freeze.rs"]
 mod freeze;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) use freeze::stored_word;
 #[path = "bytecode_scope_plan.rs"]
 pub(crate) mod scope_plan;
 use activation::{activation_plans_enabled, ActivationPlan};
@@ -11015,6 +11020,7 @@ fn plan_inlines_at(
             ways.push(InlineWay {
                 check_this: uses_this && !f.is_strict,
                 uses_this,
+                leaf,
                 f,
                 obj,
                 free_names,
@@ -11552,6 +11558,9 @@ pub struct InlineWay {
     pub obj: crate::value::Gc,
     pub check_this: bool,
     pub uses_this: bool,
+    /// The callee calls nothing: no call or `new` of its own (the small budget's test), which
+    /// the optimizing tier's graph inliner admits alone (P3 stage 3, step 2).
+    pub leaf: bool,
     /// Free names the callee reads. The splice resolves them from the callee's own
     /// [[Environment]] (`Op::LoadNameIn`), so caller bindings never shadow them. Recorded with
     /// the plan; no Rust code reads it (the module was public until S6 step 11b).

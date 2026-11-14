@@ -137,6 +137,9 @@ pub(crate) struct TestSwitches {
     /// The shared stubs a compile off the main thread makes write d8, keeping its value
     /// (`fmov d8, d8`), as a stub that used a callee-saved FP register would (step 17).
     pub(crate) stubs_write_d8: bool,
+    /// TRUST_JS_OPT_INLINE's mode for this thread: Some(true) graph, Some(false) splice, None
+    /// the environment's (P3 stage 3, step 2), so that the suites run under the variable.
+    pub(crate) inline_graph: Option<bool>,
 }
 
 #[cfg(test)]
@@ -174,6 +177,10 @@ thread_local! {
     /// The compiles whose emission met stubs missing from its snapshot (`finish`, stage 2, step
     /// 17): the chunk, and the stubs found, made or kept as copies.
     pub(crate) static TEST_STUBS_MET: std::cell::RefCell<Vec<(usize, crate::jit::MissingStubs)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+    /// What the inliner did with the ways of the sites its installed and refused compiles
+    /// reached (P3 stage 3, step 2), in order.
+    pub(crate) static TEST_INLINES: std::cell::RefCell<Vec<super::build::InlineNote>> =
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
@@ -261,6 +268,20 @@ pub(crate) fn exit_every() -> u32 {
     env_value!("TRUST_JS_OPT_EXIT_EVERY")
         .and_then(|v| v.parse().ok())
         .unwrap_or(0)
+}
+
+/// TRUST_JS_OPT_INLINE=graph (P3 stage 3, step 2; default `splice`, any other value too): a
+/// function whose inline plan's ways are all leaves (their callees call nothing) is compiled by
+/// the tier on its first stage with those callees built into its graph, each an inlined frame
+/// (`opt::oracle`, `build`'s inliner), where `splice` recompiles its bytecode with them spliced
+/// in (stage 2); every other plan splices either way. Read once a process, as the other
+/// switches.
+pub(crate) fn inline_graph() -> bool {
+    #[cfg(test)]
+    if let Some(graph) = test_switches().and_then(|switches| switches.inline_graph) {
+        return graph;
+    }
+    matches!(env_value!("TRUST_JS_OPT_INLINE"), Some("graph"))
 }
 
 /// TRUST_JS_OPT_NO_REOPT: stage 1's fallback for good: a discard records no exit profile, adds
@@ -621,10 +642,14 @@ fn name(chunk: &Chunk) -> String {
 /// verifier rejects is the builder's bug, which panics in tests and debug builds and is refused
 /// otherwise. With the code, the timer of its install, which the caller ends (`log_main_thread`'s
 /// `install`).
-fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::time::Instant>)> {
+fn generate(
+    i: &mut Interp,
+    chunk: &Chunk,
+    inline: Option<super::oracle::Request>,
+) -> Option<(Rc<JitCode>, Option<std::time::Instant>)> {
     let started = log_clock();
     let timer = main_thread_timer();
-    let (job, pin) = match prepare(i, chunk, compiles_on_another_thread()) {
+    let (job, pin, held) = match prepare(i, chunk, compiles_on_another_thread(), inline) {
         Ok(prepared) => prepared,
         Err(refusal) => {
             note_refusal(chunk, &refusal, &Timing::main(started));
@@ -645,7 +670,7 @@ fn generate(i: &mut Interp, chunk: &Chunk) -> Option<(Rc<JitCode>, Option<std::t
         snapshot: started,
         stubs: (finished.stubs.len(), finished.stubs.made.len()),
     };
-    finish(i, chunk, finished, pin, &timing).map(|code| (code, install))
+    finish(i, chunk, finished, pin, held, &timing).map(|code| (code, install))
 }
 
 /// Now, under TRUST_JS_OPT_LOG (None otherwise: no clock read): a compile's clock reads are the
@@ -761,11 +786,20 @@ pub(crate) fn job_memories_for_test() -> (usize, Option<usize>) {
 /// names or the compile runs off the main thread, which keeps its address from reuse until the
 /// install (the plan's point 7): the install compares it with the running realm's, and keeps the
 /// pin where the code checks it (`pin_global_environment`).
+#[allow(clippy::type_complexity)]
 fn prepare(
     i: &mut Interp,
     chunk: &Chunk,
     off_thread: bool,
-) -> Result<(Job, Option<crate::interpreter::WeakEnv>), Refusal> {
+    inline: Option<super::oracle::Request>,
+) -> Result<
+    (
+        Job,
+        Option<crate::interpreter::WeakEnv>,
+        super::oracle::Held,
+    ),
+    Refusal,
+> {
     // V8's size limit, before any work (stage 2, step 11).
     if chunk.jit_ops().len() > MAX_OPTIMIZED_OPS {
         return Err(Refusal::whole("over the size limit"));
@@ -778,6 +812,29 @@ fn prepare(
     chunk.freeze_into(&mut view);
     #[cfg(debug_assertions)]
     snapshot::check_decode(chunk, &snapshot, &view);
+    // The oracle (TRUST_JS_OPT_INLINE=graph; P3 stage 3, step 2): the inline decisions and each
+    // inlined callee's snapshot, its guards' data appended to the view's inline targets.
+    let oracle_timer = main_thread_timer();
+    let (inlining, held) = match inline
+        .and_then(|request| super::oracle::prepare(i, chunk, &mut view, request, job_memory))
+    {
+        Some((inlining, held)) => (Some(inlining), held),
+        None => (None, super::oracle::Held::default()),
+    };
+    if let (Some(inlining), Some(started)) = (&inlining, oracle_timer) {
+        let ms = part_ms(started);
+        log_line!(
+            "[opt] oracle {}: {} sites, {} ways, {} callee chunks in {ms:.3} ms",
+            name(chunk),
+            inlining.sites.len(),
+            inlining
+                .sites
+                .iter()
+                .map(|site| site.ways.len())
+                .sum::<usize>(),
+            inlining.callees.len()
+        );
+    }
     let layout = *i
         .jit_layout
         .get_or_init(|| crate::value::jit_layout(&i.object_proto));
@@ -789,11 +846,13 @@ fn prepare(
         return Err(Refusal::whole("no executable capacity"));
     }
     let genv = crate::interpreter::Env::as_ptr(&i.global_env) as usize;
-    let pin = (off_thread || snapshot.reads_global_names_of(genv))
+    // A graph-inlined call's guard compares the realm's global environment as well (step 2).
+    let pin = (off_thread || snapshot.reads_global_names_of(genv) || inlining.is_some())
         .then(|| crate::interpreter::Env::downgrade(&i.global_env));
     let job = Job {
         view,
         snapshot,
+        inlining,
         options: a64::Options::from_env(),
         switches: a64::Switches::read(chunk),
         layout,
@@ -808,7 +867,7 @@ fn prepare(
         #[cfg(test)]
         test_perf_map: crate::jit::profiler::TestPerfMap::capture(),
     };
-    Ok((job, pin))
+    Ok((job, pin, held))
 }
 
 /// Whether a compile runs off the main thread: in test builds under
@@ -882,6 +941,7 @@ fn finish(
     chunk: &Chunk,
     finished: Finished,
     pin: Option<crate::interpreter::WeakEnv>,
+    held: super::oracle::Held,
     timing: &Timing,
 ) -> Option<Rc<JitCode>> {
     let Finished {
@@ -891,10 +951,16 @@ fn finish(
         verify_failure,
         embeds_genv,
         memory,
+        callee_memory,
+        inlines,
+        frame_chunks,
         stubs,
         ..
     } = finished;
     give_back(memory);
+    for memory in callee_memory {
+        give_back(memory);
+    }
     #[cfg(test)]
     if stubs.len() > 0 {
         TEST_STUBS_MET.with(|met| {
@@ -912,17 +978,24 @@ fn finish(
     if log_enabled() {
         for decline in &declines {
             log_line!(
-                "[opt] declined {} pc {} {:?}: {}",
+                "[opt] declined {} pc {} {:?}: {}{}",
                 name(chunk),
                 decline.pc,
                 decline.reason,
-                decline.form
+                decline.form,
+                match decline.frame.0 {
+                    0 => String::new(),
+                    frame => format!(" (inlined frame {frame})"),
+                }
             );
         }
         if let Some(message) = &verify_failure {
             log_line!("[opt] verify {} failed: {message}", name(chunk));
         }
+        log_inlines(chunk, &inlines, &held);
     }
+    #[cfg(test)]
+    TEST_INLINES.with(|log| log.borrow_mut().extend(inlines.iter().cloned()));
     let compiled = match outcome {
         Outcome::Compiled(compiled) => compiled,
         Outcome::Refused(refusal) => {
@@ -950,12 +1023,12 @@ fn finish(
             }
         },
     };
-    // No graph the builder makes has inlined frames yet (stage 3, step 2's): nothing to hold.
+    // What the code holds for its inlined frames: their chunks and the callees' pins (stage 3).
     let code = a64::link(
         assembled,
         executable,
         chunk,
-        super::exit::Inlined::default(),
+        held.into_inlined(&frame_chunks),
     );
     if embeds_genv {
         if let Some(pin) = pin {
@@ -980,6 +1053,47 @@ fn finish(
     Some(code)
 }
 
+/// The inliner's lines under TRUST_JS_OPT_LOG (P3 stage 3, step 2): each way of an inlined site
+/// the build reached, `[opt] inlined <name> pc <pc> way <k>: <callee>`, or `[opt] not inlined
+/// <name> pc <pc> way <k> <callee>: <reason>[ at pc <m> (<op>)]` (E0's and the callee chunk's
+/// refusals, and a way after its site's unflagged guard).
+fn log_inlines(chunk: &Chunk, inlines: &[super::build::InlineNote], held: &super::oracle::Held) {
+    use super::build::InlineOutcome;
+    for note in inlines {
+        let callee = held
+            .chunks
+            .get(note.chunk as usize)
+            .map_or_else(|| "fn(?)".to_string(), |callee| name(callee));
+        let (caller, pc, way) = (name(chunk), note.pc, note.way);
+        match &note.outcome {
+            InlineOutcome::Inlined => {
+                log_line!("[opt] inlined {caller} pc {pc} way {way}: {callee}")
+            }
+            InlineOutcome::Declined {
+                reason,
+                at: Some((at, op)),
+            } => log_line!(
+                "[opt] not inlined {caller} pc {pc} way {way} {callee}: {reason} at pc {at} ({op:?})"
+            ),
+            InlineOutcome::Declined { reason, at: None } => {
+                log_line!("[opt] not inlined {caller} pc {pc} way {way} {callee}: {reason}")
+            }
+            InlineOutcome::Unreached => log_line!(
+                "[opt] not inlined {caller} pc {pc} way {way} {callee}: after its site's unflagged guard"
+            ),
+        }
+    }
+}
+
+/// Under TRUST_JS_OPT_INLINE=graph, a plan a way of which calls (its callee is no leaf) splices
+/// as before (P3 stage 3, step 2): its line under TRUST_JS_OPT_LOG, `[opt] spliced <name>: a
+/// way's callee calls`.
+pub(crate) fn note_spliced(chunk: &Chunk) {
+    if log_enabled() {
+        log_line!("[opt] spliced {}: a way's callee calls", name(chunk));
+    }
+}
+
 /// Compile `chunk` with the tier and make the code the chunk's native code: `chunk` is a second
 /// stage (a stale chain's rebuilt one among them), or the function's own chunk compiled again
 /// because it had nothing to splice, and has no native code yet. Whether the tier accepted it.
@@ -993,7 +1107,7 @@ pub(crate) fn compile_into(i: &mut Interp, chunk: &Chunk) -> bool {
         }
         return false;
     };
-    match generate(i, chunk) {
+    match generate(i, chunk, None) {
         Some((code, install)) => {
             permit.commit(Some(code));
             log_main_thread("install", chunk, install);
@@ -1117,6 +1231,9 @@ struct PendingJob {
     landing: Landing,
     /// The pin of the running realm's global environment at the snapshot, and its address.
     pin: Option<crate::interpreter::WeakEnv>,
+    /// The inlined callees' chunks and pins, which the code holds from its install (P3 stage
+    /// 3, step 2).
+    held: super::oracle::Held,
     genv: usize,
     /// The revisions of the exit profiles the snapshot read (`revisions`).
     revisions: u64,
@@ -1154,7 +1271,7 @@ pub(crate) fn compile_recompile(
 ) {
     if asynchronous() {
         if let Some(asking_rc) = publication.asking.clone() {
-            match start_job(i, chunk, asking_rc, Landing::Publish(publication)) {
+            match start_job(i, chunk, asking_rc, Landing::Publish(publication), None) {
                 Ok(()) => return,
                 Err((chunk, Landing::Publish(publication))) => {
                     i.publish_recompile(&publication, asking, chunk, false);
@@ -1176,17 +1293,22 @@ pub(crate) fn compile_recompile(
 /// compile off it, the chunk (its Rc, `chunk_rc`, kept meanwhile) marked compiling with no
 /// checkpoint armed until then; a dropped result arms its checkpoint again (`undo`). The
 /// chunk's checkpoints end either way, a refusal keeping the template JIT's code, as one of
-/// the chunk's recompile kept the first stage. `func` is the chunk's function.
+/// the chunk's recompile kept the first stage. `func` is the chunk's function. `plan`: under
+/// TRUST_JS_OPT_INLINE=graph, the plan whose leaf callees the graph inlines (P3 stage 3, step 2;
+/// `opt::oracle`).
 pub(crate) fn compile_in_place(
     i: &mut Interp,
     chunk: &Chunk,
     chunk_rc: Option<Rc<Chunk>>,
     func: std::rc::Weak<crate::ast::Function>,
+    plan: Option<crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>>,
 ) {
+    let inline = plan.map(super::oracle::Request::Plan);
     if asynchronous() {
         if let Some(chunk_rc) = chunk_rc {
             // A refusal at the preparation keeps the template JIT's code, as one at the compile.
-            if start_job(i, chunk_rc.clone(), chunk_rc, Landing::InPlace { func }).is_err() {
+            let landing = Landing::InPlace { func };
+            if start_job(i, chunk_rc.clone(), chunk_rc, landing, inline).is_err() {
                 chunk.set_inline_retry_at(0);
                 release_retired(i);
             }
@@ -1195,7 +1317,7 @@ pub(crate) fn compile_in_place(
     }
     let _ = func;
     release_retired(i);
-    if let Some((code, started)) = generate(i, chunk) {
+    if let Some((code, started)) = generate(i, chunk, inline) {
         install_in_place(i, chunk, code);
         log_main_thread("install", chunk, started);
     }
@@ -1255,11 +1377,12 @@ fn start_job(
     chunk: Rc<Chunk>,
     asking: Rc<Chunk>,
     landing: Landing,
+    inline: Option<super::oracle::Request>,
 ) -> Result<(), (Rc<Chunk>, Landing)> {
     release_retired(i);
     let started = log_clock();
     let timer = main_thread_timer();
-    let (job, pin) = match prepare(i, &chunk, true) {
+    let (job, pin, held) = match prepare(i, &chunk, true, inline) {
         Ok(prepared) => prepared,
         Err(refusal) => {
             note_refusal(&chunk, &refusal, &Timing::main(started));
@@ -1285,14 +1408,14 @@ fn start_job(
             stubs: (finished.stubs.len(), finished.stubs.made.len()),
         };
         let install = main_thread_timer();
-        let code = finish(i, &chunk, finished, pin, &timing);
+        let code = finish(i, &chunk, finished, pin, held, &timing);
         land(i, chunk, &asking, landing, code, install);
         return Ok(());
     }
     let armed = asking.inline_retry_at.get();
     asking.set_inline_retry_at(0);
     ChunkProfile::of(&asking).set_compiling(true);
-    let revisions = revisions(&chunk);
+    let revisions = revisions(&chunk) + held.revisions();
     // The main thread's part of starting it: the snapshot, the frozen view, the hand-off.
     log_main_thread("snapshot", &chunk, timer);
     i.opt_pending.jobs.push(PendingJob {
@@ -1303,6 +1426,7 @@ fn start_job(
         armed,
         landing,
         pin,
+        held,
         genv,
         revisions,
         timing: Timing {
@@ -1453,10 +1577,11 @@ fn install_job(i: &mut Interp, job: PendingJob, finished: Finished) {
         asking,
         landing,
         pin,
+        held,
         timing,
         ..
     } = job;
-    let code = finish(i, &chunk, finished, pin, &timing);
+    let code = finish(i, &chunk, finished, pin, held, &timing);
     if code.is_none() {
         // A refusal's ending: its time at the install is the main thread's too.
         let refused = chunk.clone();
@@ -1480,7 +1605,7 @@ fn dropped(i: &Interp, job: &PendingJob) -> Option<&'static str> {
     {
         return Some("another realm runs");
     }
-    if revisions(&job.chunk) != job.revisions {
+    if revisions(&job.chunk) + job.held.revisions() != job.revisions {
         return Some("a discard flagged its sites since its snapshot");
     }
     match &job.landing {
@@ -1813,6 +1938,9 @@ fn flag(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>) {
         ExitReason::WrongName => exit.proof,
         // Whether a bitwise operation's oddball truncation took it (TRUNCATION_EXIT).
         ExitReason::NotNumber => exit.proof,
+        // A graph-inlined site's guard's place in its chain + 1, the most a site keeps (P3
+        // stage 3, step 2); 0 for a splice's guard.
+        ExitReason::WrongCallee => exit.proof,
         _ => 0,
     };
     let (at, pc, inlined) = match inlined {
@@ -1864,6 +1992,7 @@ pub(crate) fn reoptimize(
     chunk: &Chunk,
     func: std::rc::Weak<crate::ast::Function>,
     chunk_rc: Option<Rc<Chunk>>,
+    realm: usize,
 ) {
     let profile = ChunkProfile::of(chunk);
     let Some((checkpoint, at)) = profile.warm_up() else {
@@ -1901,11 +2030,18 @@ pub(crate) fn reoptimize(
             name(chunk)
         );
     }
+    // Under TRUST_JS_OPT_INLINE=graph a first stage compiled in place plans again, as every
+    // exemplar decides at each compile (P3 stage 3, step 2; `opt::oracle`); a second stage keeps
+    // its splices.
+    let inline = (inline_graph() && in_place(chunk))
+        .then(|| func.upgrade())
+        .flatten()
+        .map(|func| super::oracle::Request::Replan { func, realm });
     if asynchronous() {
         if let Some(chunk_rc) = chunk_rc {
             // A refusal at the preparation keeps the template JIT's code, as one at the compile.
             let landing = Landing::Reoptimize { func, warm_up };
-            if start_job(i, chunk_rc.clone(), chunk_rc, landing).is_err() {
+            if start_job(i, chunk_rc.clone(), chunk_rc, landing, inline).is_err() {
                 release_retired(i);
             }
             return;
@@ -1913,7 +2049,7 @@ pub(crate) fn reoptimize(
     }
     let _ = (func, warm_up);
     release_retired(i);
-    if let Some((code, started)) = generate(i, chunk) {
+    if let Some((code, started)) = generate(i, chunk, inline) {
         let installed = install_code(i, chunk, code);
         log_main_thread("install", chunk, started);
         if installed {

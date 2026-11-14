@@ -57,6 +57,10 @@ pub(crate) struct InlineTargetView {
     pub(crate) callee: Option<usize>,
     /// Its [[Environment]]'s address (`Chunk::inline_target_env`), None for a dead pin.
     pub(crate) env: Option<usize>,
+    /// A graph-inlined call site's guard (P3 stage 3, step 2): its place in the site's chain of
+    /// guards + 1, which its WrongCallee exit leaves in the exit profile (the guards of one site
+    /// share the call's pc, where each of a splice's has a pc of its own); 0 for a splice's.
+    pub(crate) guard: u8,
 }
 
 /// The frozen view of a chunk (see the module's doc); empty by default, a husk whose vectors a

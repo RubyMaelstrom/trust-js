@@ -186,6 +186,18 @@ comment/example in the same change.
   fallback, at the discard or, deferred there for executable capacity, at a later entry. Each
   part's time leaves out the log's own printing. The main thread's share of the tier's compiles
   is then the main-thread lines and the compile and refusal lines `on the main thread`.
+  `TRUST_JS_OPT_INLINE=graph` inlines in the tier's graph (P3 stage 3; the default, `splice`,
+  and any other value keep the splices above): a function whose inline plan's ways all call
+  nothing (no call or `new` in a callee) is compiled on its first stage, as one with nothing to
+  splice, each such callee built into its graph from the callee's own first stage behind the
+  guard a splice has, an inlined frame whose exits rebuild the callee's frame and its caller's;
+  a callee with an operation the tier leaves to its template is not inlined (its call stays),
+  and every other plan splices as before. A reoptimization of such a function plans again. Its
+  log adds `[opt] oracle <name>: <n> sites, <w> ways, <c> callee chunks in <ms> ms` (the inline
+  decisions and the callees' snapshots, inside the `snapshot` part), `[opt] inlined <name> pc
+  <pc> way <k>: <callee>`, `[opt] not inlined <name> pc <pc> way <k> <callee>: <reason>[ at pc
+  <m> (<op>)]` and, for a plan left to the splice, `[opt] spliced <name>: a way's callee calls`;
+  a decline in an inlined frame ends with ` (inlined frame <k>)`.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at

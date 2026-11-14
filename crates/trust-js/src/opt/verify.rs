@@ -64,7 +64,9 @@ pub(crate) fn verify(
 
 /// Whether `graph`, built from `chunk` (a chunk's frozen view), holds the invariants the back end
 /// relies on; the first violation found otherwise. `cfg` is the chunk's, as its build made it
-/// (`build::Built`). Reads nothing but its arguments, so that it runs on any thread.
+/// (`build::Built`). Reads nothing but its arguments, so that it runs on any thread. The tests';
+/// a job verifies with its inlined frames' chunks (`verify_frames`).
+#[cfg(test)]
 pub(crate) fn verify_view(graph: &Graph, chunk: &FrozenChunk, cfg: &Cfg) -> Result<(), String> {
     verify_frames(graph, (chunk, cfg), &[])
 }
@@ -726,15 +728,24 @@ fn representations(
             }
         }
         &NodeOp::CheckCallee { target } | &NodeOp::CalleeMatches { target } => {
-            // The guard's InlineGuard is at the node's pc; its inputs are the callee's word and,
-            // for a guard of `this`, the receiver's.
-            let Some(&Op::InlineGuard(guard, _)) = chunk.jit_ops().get(node.pc as usize) else {
-                return Err(format!("no InlineGuard at its pc ({ix:?})"));
+            // A splice's guard is at its InlineGuard; a graph-inlined call's (P3 stage 3, step 2)
+            // at its call, of its target's argument count, a plain call's checking no `this`.
+            // Its inputs are the callee's word and, for a guard of `this`, the receiver's.
+            let Some(it) = chunk.inline_targets.get(target as usize) else {
+                return Err(format!(
+                    "the guard of target {target}, which the chunk has not"
+                ));
             };
-            if guard != target {
-                return Err(format!("the InlineGuard of target {guard}, not {target}"));
+            match chunk.jit_ops().get(node.pc as usize) {
+                Some(&Op::InlineGuard(guard, _)) if guard == target => {}
+                Some(&Op::InlineGuard(guard, _)) => {
+                    return Err(format!("the InlineGuard of target {guard}, not {target}"));
+                }
+                Some(&Op::Call(argc, _)) if argc == it.argc && !it.check_this => {}
+                Some(&Op::CallWithThis(argc, _)) if argc == it.argc => {}
+                op => return Err(format!("a guard of target {target} at {op:?} ({ix:?})")),
             }
-            let inputs = 1 + usize::from(chunk.jit_inline_target(target).check_this);
+            let inputs = 1 + usize::from(it.check_this);
             if reps.len() != inputs || reps.iter().any(|&rep| rep != Rep::Tagged) {
                 return Err(format!("operands {reps:?} for {inputs} words"));
             }

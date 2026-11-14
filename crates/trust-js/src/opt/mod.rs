@@ -75,6 +75,11 @@ pub(crate) mod job;
     )
 ))]
 pub(crate) mod liveness;
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod oracle;
 #[cfg(any(
     test,
     all(
@@ -123,6 +128,12 @@ mod build_tests;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 mod frames_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod inline_tests;
 #[cfg(all(
     test,
     target_arch = "aarch64",
@@ -243,6 +254,7 @@ mod off {
         chunk: &Chunk,
         _: Option<std::rc::Rc<Chunk>>,
         _: std::rc::Weak<crate::ast::Function>,
+        _: Option<crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>>,
     ) {
         chunk.set_inline_retry_at(0);
     }
@@ -252,8 +264,16 @@ mod off {
         _: &Chunk,
         _: std::rc::Weak<crate::ast::Function>,
         _: Option<std::rc::Rc<Chunk>>,
+        _: usize,
     ) {
     }
+
+    /// The graph inliner needs the back end (P3 stage 3, step 2).
+    pub(crate) fn inline_graph() -> bool {
+        false
+    }
+
+    pub(crate) fn note_spliced(_: &Chunk) {}
 
     pub(crate) fn install_finished(_: &mut Interp) {}
 
@@ -367,6 +387,7 @@ pub(crate) fn pin_forced_exits_off_for_test() {
         asynchronous: asynchronous_by_environment(),
         stub_memory_refused: stub_test_switches().0,
         stubs_write_d8: stub_test_switches().1,
+        inline_graph: None,
     }
     .set();
 }
@@ -394,6 +415,7 @@ pub(crate) fn pin_synchronous_for_test() {
         asynchronous: false,
         stub_memory_refused: stub_test_switches().0,
         stubs_write_d8: stub_test_switches().1,
+        inline_graph: None,
     }
     .set();
 }
@@ -421,6 +443,7 @@ pub(crate) fn pin_loop_count_off_for_test() {
         asynchronous: asynchronous_by_environment(),
         stub_memory_refused: stub_test_switches().0,
         stubs_write_d8: stub_test_switches().1,
+        inline_graph: None,
     }
     .set();
 }

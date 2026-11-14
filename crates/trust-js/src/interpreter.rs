@@ -16770,7 +16770,7 @@ impl Interp {
             let runtime = unsafe { &*func }.runtime();
             let chunk_rc = runtime_chunk(&runtime, chunk);
             drop(runtime);
-            crate::opt::reoptimize(self, chunk, function_weak(func), chunk_rc);
+            crate::opt::reoptimize(self, chunk, function_weak(func), chunk_rc, realm);
             return;
         }
         // With the optimizing tier on (P3 stage 1), the checkpoints advance as ever, but the
@@ -16836,10 +16836,37 @@ impl Interp {
             // fallback (`opt::compile_in_place`).
             let chunk_rc = runtime_chunk(&runtime, chunk);
             drop(runtime);
-            crate::opt::compile_in_place(self, chunk, chunk_rc, function_weak(func));
+            crate::opt::compile_in_place(self, chunk, chunk_rc, function_weak(func), None);
             return;
         } else {
             crate::jit::perf_inline_plan_sites(plan.len());
+        }
+        // Under TRUST_JS_OPT_INLINE=graph (P3 stage 3, step 2), a plan whose ways' callees all
+        // call nothing is the tier's to inline in its graph: the first stage compiled in place,
+        // its callees built in from their own first stages (`opt::oracle`), and nothing
+        // recompiles the bytecode. Any other plan splices as below.
+        if tier && crate::opt::inline_graph() {
+            if plan
+                .values()
+                .all(|entry| entry.ways.iter().all(|way| way.leaf))
+            {
+                crate::opt::forget(chunk);
+                if crate::opt::refuses_unspliced(chunk) {
+                    chunk.set_inline_retry_at(0);
+                    return;
+                }
+                let chunk_rc = runtime_chunk(&runtime, chunk);
+                drop(runtime);
+                crate::opt::compile_in_place(
+                    self,
+                    chunk,
+                    chunk_rc,
+                    function_weak(func),
+                    Some(plan),
+                );
+                return;
+            }
+            crate::opt::note_spliced(chunk);
         }
         // The bytecode recompile that makes the tier's chunk runs on the main thread: its time
         // under TRUST_JS_OPT_LOG (no clock read otherwise).

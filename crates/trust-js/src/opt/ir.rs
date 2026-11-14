@@ -791,6 +791,8 @@ pub(crate) struct Decline {
     pub(crate) pc: u32,
     pub(crate) reason: ExitReason,
     pub(crate) form: &'static str,
+    /// The frame whose chunk `pc` is of (P3 stage 3, step 2: an inlined callee's site).
+    pub(crate) frame: FrameIx,
 }
 
 /// A function's graph.
@@ -896,18 +898,6 @@ impl Graph {
 
     /// Opens an inlined call's frame (stage 3): its parent state is the caller's (`frame`'s
     /// `parent`, added first), and the callee's nodes and states name the frame returned.
-    // Only the back end's tests open frames until step 2's inliner does.
-    #[cfg_attr(
-        not(all(
-            test,
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        )),
-        expect(
-            dead_code,
-            reason = "step 2's inliner opens frames; the tests do until then"
-        )
-    )]
     pub(crate) fn open_frame(&mut self, frame: InlinedFrame) -> FrameIx {
         self.frames.push(frame);
         FrameIx(self.frames.len() as u32)

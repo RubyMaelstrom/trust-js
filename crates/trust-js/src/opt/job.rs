@@ -25,6 +25,14 @@ use std::sync::Arc;
 /// whose vectors the next job's preparation fills again.
 pub(crate) type JobMemory = (FrozenChunk, Raw);
 
+/// What a compile inlines (P3 stage 3, step 2; `opt::oracle`): the sites, and each callee chunk's
+/// frozen view and raw copy, by `build::InlineWay::chunk`, made on the main thread in job memory
+/// as the compiled chunk's are.
+pub(crate) struct InlineJob {
+    pub(crate) sites: Vec<build::InlineSite>,
+    pub(crate) callees: Vec<JobMemory>,
+}
+
 /// A compile's inputs (see the module's doc).
 pub(crate) struct Job {
     /// The chunk's frozen view.
@@ -32,6 +40,8 @@ pub(crate) struct Job {
     /// Its feedback's raw copy, taken at the snapshot, which the compile decodes (P3 stage 2,
     /// step 16).
     pub(crate) snapshot: Raw,
+    /// The callees the oracle inlines (TRUST_JS_OPT_INLINE=graph; P3 stage 3, step 2).
+    pub(crate) inlining: Option<InlineJob>,
     pub(crate) options: Options,
     pub(crate) switches: Switches,
     pub(crate) layout: crate::value::JitLayout,
@@ -99,8 +109,15 @@ pub(crate) struct Finished {
     /// The compile's time on its thread, where it was timed (`Job::timed`; zero otherwise).
     pub(crate) elapsed: std::time::Duration,
     /// The job's memory, its frozen view and its snapshot's raw copy, given back for the next
-    /// job's preparation to fill again (P3 stage 2, step 16, point 5).
+    /// job's preparation to fill again (P3 stage 2, step 16, point 5), and its callees' (P3
+    /// stage 3, step 2).
     pub(crate) memory: JobMemory,
+    pub(crate) callee_memory: Vec<JobMemory>,
+    /// What the inliner did with each inlined site's ways, for the log (step 2).
+    pub(crate) inlines: Vec<build::InlineNote>,
+    /// The callee chunks the code's inlined frames run, by `InlinedFrame::chunk`: their indices
+    /// among the oracle's (`oracle::Held::chunks`).
+    pub(crate) frame_chunks: Vec<u32>,
     /// Whether the code compares a record with the realm's global environment (`genv`), which
     /// the install then pins (stage 2, step 4).
     pub(crate) embeds_genv: bool,
@@ -121,9 +138,29 @@ pub(crate) fn compile(job: Job) -> Finished {
     let mut verified = false;
     let mut verify_failure = None;
     let mut embeds_genv = false;
+    let mut inlines = Vec::new();
+    let mut frame_chunks = Vec::new();
     let outcome = (|| {
         let snapshot = Snapshot::decode(&job.snapshot, &job.view);
-        let built = match build::build_view(&job.view, &snapshot) {
+        // The inlined callees' snapshots, decoded here as the compiled chunk's (step 2).
+        let callee_memory = job
+            .inlining
+            .as_ref()
+            .map_or(&[][..], |inlining| &inlining.callees[..]);
+        let callee_snapshots: Vec<Snapshot> = callee_memory
+            .iter()
+            .map(|(view, raw)| Snapshot::decode(raw, view))
+            .collect();
+        let callees: Vec<build::Callee<'_>> = callee_memory
+            .iter()
+            .zip(&callee_snapshots)
+            .map(|((view, _), snapshot)| (view, snapshot))
+            .collect();
+        let inlining = job
+            .inlining
+            .as_ref()
+            .map(|inlining| (&inlining.sites[..], &callees[..]));
+        let built = match build::build_inlined(&job.view, &snapshot, inlining) {
             Ok(built) => built,
             Err(refusal) => return Outcome::Refused(refusal),
         };
@@ -131,14 +168,28 @@ pub(crate) fn compile(job: Job) -> Finished {
             graph,
             cfg,
             initialized,
+            callees: frame_cfgs,
+            inlines: notes,
         } = built;
+        inlines = notes;
+        frame_chunks = frame_cfgs.iter().map(|&(chunk, _)| chunk).collect();
+        // The chunks the graph's inlined frames run, with their Cfgs, by `InlinedFrame::chunk`.
+        let frames: Vec<verify::FrameChunk<'_>> = frame_cfgs
+            .iter()
+            .map(|(chunk, cfg)| (&callee_memory[*chunk as usize].0, cfg))
+            .collect();
         declines = graph.declines.clone();
-        embeds_genv = graph.nodes.iter().any(|node| {
-            matches!(node.op, super::ir::NodeOp::CheckEnvIs { env, .. } if env as usize == job.genv)
+        // A guard of a graph-inlined call compares the realm's global environment too (step 2).
+        embeds_genv = graph.nodes.iter().any(|node| match node.op {
+            super::ir::NodeOp::CheckEnvIs { env, .. } => env as usize == job.genv,
+            super::ir::NodeOp::CheckCallee { .. } | super::ir::NodeOp::CalleeMatches { .. } => {
+                job.inlining.is_some()
+            }
+            _ => false,
         });
         if job.verifies {
             verified = true;
-            if let Err(message) = verify::verify_view(&graph, &job.view, &cfg) {
+            if let Err(message) = verify::verify_frames(&graph, (&job.view, &cfg), &frames) {
                 if cfg!(any(test, debug_assertions)) {
                     panic!(
                         "the tier's graph of {} fails verification: {message}",
@@ -157,7 +208,7 @@ pub(crate) fn compile(job: Job) -> Finished {
             &job.view,
             &graph,
             &cfg,
-            &[],
+            &frames,
             initialized,
             &job.layout,
             &job.ilayout,
@@ -190,6 +241,11 @@ pub(crate) fn compile(job: Job) -> Finished {
     // on the compile's thread.
     Finished {
         memory: (job.view, job.snapshot),
+        callee_memory: job
+            .inlining
+            .map_or_else(Vec::new, |inlining| inlining.callees),
+        inlines,
+        frame_chunks,
         outcome,
         stubs: met,
         declines,

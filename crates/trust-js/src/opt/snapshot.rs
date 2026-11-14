@@ -197,6 +197,13 @@ impl Raw {
     /// stage 3, rule U; `profile::merge_element_hits`), as JSC's DFG merges an ArrayProfile when
     /// it reads it (dfg/DFGByteCodeParser.cpp:1354-1359).
     pub(crate) fn take_into(&mut self, chunk: &Chunk, realm: Option<&Interp>) {
+        self.take(chunk, realm, false);
+    }
+
+    /// The raw copy, its declines read as an inlined callee's where `inlined` (`declined`), the
+    /// chunk's last-seen element receivers merged first (rule U), an inlined callee's as the
+    /// compiled chunk's (P3 stage 3, step 2).
+    fn take(&mut self, chunk: &Chunk, realm: Option<&Interp>, inlined: bool) {
         super::profile::merge_element_hits(chunk);
         let ops = chunk.jit_ops();
         self.names.clear();
@@ -207,7 +214,56 @@ impl Raw {
             }
         }
         chunk.copy_feedback_into(&mut self.feedback);
-        self.declined = declined(chunk, chunk.feedback_vector().record_map(), ops.len());
+        self.declined = declined(
+            chunk,
+            chunk.feedback_vector().record_map(),
+            ops.len(),
+            inlined,
+        );
+    }
+
+    /// [`Raw::take_into`] of an inlined callee's first stage (P3 stage 3, step 2): its exit
+    /// profile read as an inlined frame's, kind-bound reasons from its inlined sites alone and the
+    /// others from any, as JSC's parser reads an inlined code block's exit sites
+    /// (bytecode/DFGExitProfile.h:195-232), where a chunk compiled itself reads its kind-bound
+    /// sites from its own context only.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn take_inlined_into(&mut self, chunk: &Chunk, realm: Option<&Interp>) {
+        self.take(chunk, realm, true);
+    }
+
+    /// The parent links each free-name site's view counts from the running environment: a static
+    /// address's hops from it, a global read's search's (P3 stage 3, step 2: an inlined callee's
+    /// running environment is its closure's, whose records the oracle folds).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn running_hops(&self) -> impl Iterator<Item = u16> + '_ {
+        self.names.iter().filter_map(|(_, name)| match *name {
+            NameView::Static {
+                address,
+                base: Base::Running,
+            } => Some(address.hops),
+            NameView::Global {
+                search: Search::Running(hops),
+                ..
+            }
+            | NameView::GlobalLexical {
+                search: Search::Running(hops),
+                ..
+            } => Some(hops),
+            _ => None,
+        })
     }
 
     /// Whether a free-name site's view reads the realm whose global environment is `genv` (a
@@ -400,8 +456,9 @@ fn kind_bound(reason: u8) -> bool {
 }
 
 /// The exit profile's declined reasons per pc of `chunk` (see the module's doc): empty unless the
-/// chunk or a baseline chunk its map names holds exit sites.
-fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u32, u8)]> {
+/// chunk or a baseline chunk its map names holds exit sites. `inlined`: the chunk is read as an
+/// inlined callee's (P3 stage 3, step 2), its kind-bound sites from its inlined keys.
+fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize, inlined: bool) -> Box<[(u32, u8)]> {
     let has_sites = |chunk: &Chunk| ChunkProfile::get(chunk).is_some_and(ChunkProfile::has_sites);
     let own = ChunkProfile::get(chunk).filter(|profile| profile.has_sites());
     let baselines = map.is_some_and(|map| map.targets().iter().any(|target| has_sites(target)));
@@ -412,9 +469,14 @@ fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u32, u8
     for (pc, (reasons, ways)) in declined.iter_mut().enumerate() {
         let mut add = |reason: u8, shapes: u8| {
             *reasons |= 1u32 << reason;
-            if reason == ExitReason::WrongShape as u8 || reason == ExitReason::NotNumber as u8 {
+            if reason == ExitReason::WrongShape as u8
+                || reason == ExitReason::NotNumber as u8
+                || reason == ExitReason::WrongCallee as u8
+            {
                 // The most shapes a discarded check expected; whether an oddball truncation
-                // exited (TRUNCATION_EXIT) at a bitwise operation, the one NotNumber with a byte.
+                // exited (TRUNCATION_EXIT) at a bitwise operation, the one NotNumber with a byte;
+                // the furthest guard of a graph-inlined call site's chain that exited (its place
+                // + 1, P3 stage 3 step 2; a splice's guards keep 0, each at a pc of its own).
                 *ways = (*ways).max(shapes);
             } else if reason == ExitReason::WrongName as u8 {
                 // A name site's byte is the proof its discarded check expected, as it is.
@@ -424,8 +486,8 @@ fn declined(chunk: &Chunk, map: Option<&RecordMap>, len: usize) -> Box<[(u32, u8
         // The chunk's own sites, keyed at its pcs: a recompile's where its map names nothing,
         // or a baseline chunk's own (its spliced sites are its callers' context).
         if let Some(profile) = own {
-            profile.sites_at(pc as u32, |reason, inlined, shapes| {
-                if !kind_bound(reason) || !inlined {
+            profile.sites_at(pc as u32, |reason, key_inlined, shapes| {
+                if !kind_bound(reason) || key_inlined == inlined {
                     add(reason, shapes);
                 }
             });
@@ -675,16 +737,24 @@ fn cache_view(ic: &NameIc) -> NameView {
 /// The record `hops` parent links from inline target `target`'s pinned [[Environment]], the
 /// holder a splice's static read folds (see [`Base::Holder`]).
 fn holder(chunk: &Chunk, target: u32, hops: u16) -> Base {
-    let Some(mut record) = chunk.inline_target_env(target) else {
-        return Base::Unknown;
-    };
-    for _ in 0..hops {
-        let Some(parent) = record.try_borrow().ok().and_then(|scope| scope.parent) else {
-            return Base::Unknown;
-        };
-        record = parent;
+    match chunk
+        .inline_target_env(target)
+        .and_then(|env| parent_record(env, hops))
+    {
+        Some(record) => Base::Holder(record),
+        None => Base::Unknown,
     }
-    Base::Holder(Env::as_ptr(&record) as usize)
+}
+
+/// The address of the record `hops` parent links from `record`, None where its chain is
+/// shorter: parent links do not change once code can read through them (the plan's Q3), so that
+/// a compile folds them, a splice's holder (`holder`) and an inlined callee's (P3 stage 3, step 2:
+/// `opt::oracle`).
+pub(crate) fn parent_record(mut record: Env, hops: u16) -> Option<usize> {
+    for _ in 0..hops {
+        record = record.try_borrow().ok().and_then(|scope| scope.parent)?;
+    }
+    Some(Env::as_ptr(&record) as usize)
 }
 
 /// A free-name cache's class for the fingerprint: its mode, which a fill or a refusal moves, and

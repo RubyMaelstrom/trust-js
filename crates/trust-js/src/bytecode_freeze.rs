@@ -4,6 +4,14 @@
 use super::{named_site_cache, Chunk, Op};
 use crate::opt::view::{FrozenChunk, FrozenConst, InlineTargetView};
 
+/// The stored word of an `Option<Gc>` holding `object`, as the first stage's InlineGuard reads its
+/// expected callee (`opt::a64`'s callee checks): an inline target's callee in the frozen view, a
+/// graph-inlined way's (P3 stage 3, step 2: `opt::oracle`).
+pub(crate) fn stored_word(object: crate::value::Gc) -> usize {
+    let some: Option<crate::value::Gc> = Some(object);
+    unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
+}
+
 impl Chunk {
     /// The tier's frozen view of this chunk, in a view of its own ([`Chunk::freeze_into`]): the
     /// tests'.
@@ -100,15 +108,11 @@ impl Chunk {
                     check_this: target.check_this,
                     expected_env: target.expected_env,
                     expected_genv: target.expected_genv,
-                    // The stored word of an `Option<Gc>`, as the first stage's InlineGuard reads
-                    // it (`opt::a64`'s callee checks).
-                    callee: target.pin.upgrade().map(|object| {
-                        let some: Option<crate::value::Gc> = Some(object);
-                        unsafe { *(&some as *const Option<crate::value::Gc> as *const usize) }
-                    }),
+                    callee: target.pin.upgrade().map(stored_word),
                     env: self
                         .inline_target_env(t as u32)
                         .map(|env| crate::interpreter::Env::as_ptr(&env) as usize),
+                    guard: 0,
                 }
             }));
         // The in-line allocation sites of the agent heap, where a literal may use one.

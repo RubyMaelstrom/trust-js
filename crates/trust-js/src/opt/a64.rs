@@ -1411,6 +1411,8 @@ impl Gen<'_> {
             | NodeOp::CheckGlobalEpoch { proof, .. }
             | NodeOp::CheckEnvGeneration { proof, .. } => proof,
             NodeOp::TruncateNumberOrOddball => TRUNCATION_EXIT,
+            // A graph-inlined site's guard's place in its chain (P3 stage 3, step 2).
+            NodeOp::CheckCallee { target } => self.chunk.jit_inline_target(target).guard,
             _ => 0,
         };
         let frame = self.frame_recipe(state.frame)?;

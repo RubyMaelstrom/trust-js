@@ -103,6 +103,16 @@ impl Facts {
         self.lexicals.clear();
     }
 
+    /// The running environment's node, which an inlined callee's frame does not share (its own
+    /// is its closure's) and its caller has again after it (P3 stage 3, step 2).
+    pub(super) fn running(&self) -> Option<NodeIx> {
+        self.running
+    }
+
+    pub(super) fn set_running(&mut self, running: Option<NodeIx>) {
+        self.running = running;
+    }
+
     /// An operation moved the running environment: the records it reaches are other nodes from
     /// now on, so no fact keyed on the old ones serves.
     pub(super) fn moved(&mut self) {
@@ -245,8 +255,13 @@ impl Builder<'_> {
         }
     }
 
-    /// The running environment: hoisted where no operation of the chunk moves it.
+    /// The running environment: hoisted where no operation of the chunk moves it. An inlined
+    /// callee's is its closure's [[Environment]], a constant while its guard holds, as a splice's
+    /// pinned one (P3 stage 3, step 2: an inlined callee moves no environment).
     fn running_env(&mut self, st: &mut State, pc: usize) -> NodeIx {
+        if let Some(env) = self.inlined.as_ref().map(|inlined| inlined.env()) {
+            return self.hoist(Hoisted::ConstEnv(env as u64));
+        }
         if !self.moves_env {
             return self.hoist(Hoisted::Env);
         }
@@ -256,6 +271,12 @@ impl Builder<'_> {
         let env = self.add(NodeOp::Env, &[], Rep::Env, pc);
         st.names.running = Some(env);
         env
+    }
+
+    /// In an inlined callee's frame, the record `hops` parent links from its closure's
+    /// [[Environment]], where the oracle folded it (P3 stage 3, step 2).
+    fn inlined_holder(&self, hops: u16) -> Option<usize> {
+        self.inlined.as_ref()?.holder(hops)
     }
 
     /// The record `hops` parent links from `record`, each link loaded once (a value fact).
@@ -287,10 +308,15 @@ impl Builder<'_> {
             return None;
         }
         match base {
-            Base::Running => {
-                let env = self.running_env(st, pc);
-                Some(self.walk(st, env, address.hops, pc))
-            }
+            // An inlined callee's holder, folded from its closure's [[Environment]] on the main
+            // thread as a splice's is (P3 stage 3, step 2).
+            Base::Running => match self.inlined_holder(address.hops) {
+                Some(holder) => Some(self.hoist(Hoisted::ConstEnv(holder as u64))),
+                None => {
+                    let env = self.running_env(st, pc);
+                    Some(self.walk(st, env, address.hops, pc))
+                }
+            },
             Base::Holder(holder) => Some(self.hoist(Hoisted::ConstEnv(holder as u64))),
             Base::Unknown => None,
         }
@@ -567,7 +593,11 @@ impl Builder<'_> {
         };
         let pc = cx.pc;
         let proof = view.proof();
-        if let Search::Running(hops) = search {
+        // An inlined callee's search reaching the realm's global environment from its closure's,
+        // folded on the main thread: no check, as a splice's pinned search (P3 stage 3, step 2).
+        let folded =
+            matches!(search, Search::Running(hops) if self.inlined_holder(hops) == Some(genv));
+        if let (Search::Running(hops), false) = (search, folded) {
             let env = self.running_env(st, pc);
             let record = self.walk(st, env, hops, pc);
             let check = NodeOp::CheckEnvIs {
@@ -621,6 +651,11 @@ impl Builder<'_> {
         let pc = cx.pc;
         let proof = view.proof();
         let record = match search {
+            // An inlined callee's search reaching the realm's global environment, folded (P3
+            // stage 3, step 2): the record, as a splice's pinned search takes it.
+            Search::Running(hops) if self.inlined_holder(hops) == Some(genv) => {
+                self.hoist(Hoisted::ConstEnv(genv as u64))
+            }
             Search::Running(hops) => {
                 let env = self.running_env(st, pc);
                 let record = self.walk(st, env, hops, pc);
