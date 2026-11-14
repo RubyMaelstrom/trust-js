@@ -778,6 +778,51 @@ fn template_code_marks_each_pairs_class() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[test]
+fn the_tdz_marker_and_an_arrays_hole_reach_no_equality_operand() {
+    // The class test of two tags takes the TDZ marker (0x7ffa) where CheckObjectOrNullish does not
+    // (feedback.rs EQ_CLASS_OBJECT_OR_NULLISH): no path gives an equality the marker. A binding
+    // read in its dead zone throws before the compare; an array's hole reads as undefined through
+    // an index, a spread, a destructuring, a for-of and an argument spread: two undefineds' class,
+    // never the marker's (2).
+    super::pin_forced_exits_off_for_test();
+    let mut engine = jit_engine(true);
+    eval(&mut engine, "function he(x, y) { return x === y; }");
+    template_only(&mut engine, "he", "he(1, 2)");
+    super::profile::merge_element_hits(&chunk_of(&mut engine, "he"));
+    assert_eq!(
+        eval(
+            &mut engine,
+            "function early() { return he(late, late); }
+             var thrown; try { early(); } catch (e) { thrown = e instanceof ReferenceError; }
+             let late = 1;
+             thrown"
+        ),
+        "true"
+    );
+    assert_eq!(
+        seen(&mut engine, "he").0,
+        0,
+        "the dead zone's read threw first"
+    );
+    for call in [
+        "var ha = [1, , 3]; he(ha[1], ha[1])",
+        "var [hd] = [, 1]; he(hd, hd)",
+        "var hs = [...[, 1]]; he(hs[0], hs[0])",
+        "for (var hf of [, 2]) { he(hf, hf); break; }",
+        "(function (a, b) { return he(a, a); })(...[, 1])",
+        "var hm = [, 1].map(function (v, k) { return k; }); he(hm[0], hm[0])",
+    ] {
+        eval(&mut engine, call);
+        assert_eq!(seen(&mut engine, "he").0, 1 << UNDEFINEDS, "{call}");
+        super::profile::merge_element_hits(&chunk_of(&mut engine, "he"));
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
 fn template_code_keeps_every_pair_met_between_two_merges() {
     // RayTrace's `shape != exclude`: an object against an object, then against null, then an
     // object again, all before one merge: both classes are kept and both merged (P3 stage 3 step

@@ -7844,8 +7844,9 @@ fn emit_equality_numbers_record(a: &mut asm::Asm, pc: u32, scratch: u32) {
 /// no Number, or both are the canonical NaN): mark their pair's class in the site's group (see
 /// [`emit_equality_numbers_record`]; `feedback::EQ_CLASSES`): for one tag, its low three bits and
 /// its sign bit as bit 3 (`feedback::eq_class_of_tag`); for two tags each an object or nullish
-/// (`(tag & 0x7fff) - 0x7ff9 < 3`, unsigned: undefined, the TDZ marker, null, an object; the
-/// internal lazy-prototype and accessor tags it also takes are no operand's),
+/// (`(tag & 0x7fff) - 0x7ff9 < 3`, unsigned: undefined, null, an object, and the TDZ marker and
+/// the internal lazy-prototype and accessor tags, which are no equality's operand; see
+/// `feedback::EQ_CLASS_OBJECT_OR_NULLISH` for the marker),
 /// `feedback::EQ_CLASS_OBJECT_OR_NULLISH`; else `feedback::EQ_CLASS_TWO_KINDS`. A plain store of
 /// zero into the class's byte, so that the classes met between two merges are all kept (P3 stage
 /// 3, step L1b). Nothing where the code records nothing. Clobbers x16, x17 and NZCV.

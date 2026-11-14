@@ -431,8 +431,12 @@ pub(crate) const EQ_CLASS_NUMBERS: u8 = 0;
     allow(dead_code)
 )]
 pub(crate) const EQ_CLASS_TWO_KINDS: u8 = 8;
-/// The class of two words of two tags, each an object or nullish (undefined, null or the TDZ
-/// marker): an object against undefined or null, undefined against null.
+/// The class of two words of two tags, each an object or nullish: an object against undefined or
+/// null, undefined against null. Its test, `(tag & 0x7fff) - 0x7ff9 < 3`, also takes the TDZ
+/// marker (0x7ffa), which CheckObjectOrNullish (`tag | 2`, undefined and null alone) does not:
+/// harmless, as the marker is no equality's operand (a read in a binding's dead zone throws
+/// first, an array's hole reads as undefined); were it one, the record would name the pair and
+/// the check exit once there and flag it.
 #[cfg_attr(
     not(all(
         target_arch = "aarch64",

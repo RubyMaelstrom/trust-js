@@ -4020,9 +4020,9 @@ impl Gen<'_> {
         self.gp_done(n, w);
     }
 
-    /// Branch to `not_nullish` unless `word` is undefined, null or the TDZ marker (`tag | 2` is
-    /// null's tag, as NullOrLikeUndefined and the templates' `== null` test it). Clobbers x9 and
-    /// x30.
+    /// Branch to `not_nullish` unless `word` is undefined or null (`tag | 2` is null's tag for those
+    /// two alone, their tags differing in bit 1, as NullOrLikeUndefined and the templates' `==
+    /// null` test it; the TDZ marker's 0x7ffa stays 0x7ffa). Clobbers x9 and x30.
     fn nullish_or(&mut self, word: u32, not_nullish: usize) {
         self.a.lsr_imm(X30, word, 48);
         let two = asm::logical_imm_w(2).expect("2 is a logical immediate");

@@ -367,7 +367,8 @@ emit_equality_numbers_record, emit_equality_tags_record): class 0 for two Number
 ordered; four instructions, `strb wzr`) and two canonical NaNs; for two words of one tag the
 tag's low three bits and its sign bit as bit 3 (undefined 1, the TDZ marker 2, null 3, a Boolean
 4, a BigInt 5, a String 6, a Symbol 7, an object 9); for two tags, 12 where each is an object or
-nullish, else 8. A class's byte holds a pair met since the last merge whatever came after it, so
+nullish (the test also takes the TDZ marker, which is no operand: feedback.rs
+EQ_CLASS_OBJECT_OR_NULLISH), else 8. A class's byte holds a pair met since the last merge whatever came after it, so
 the merge sees every class met in between, as V8 ORs a compare's feedback at every execution
 (codegen/code-stub-assembler.cc:13847-13866); step L1 kept the last pair only (one byte, a pair
 code), and lost a pair met between merges that was not the last. The forms that store: the

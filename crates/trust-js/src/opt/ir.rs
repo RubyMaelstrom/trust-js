@@ -454,8 +454,9 @@ pub(crate) enum NodeOp {
     TaggedSame,
     BoolNot,
     /// Tagged -> Bool: `x == null` (ECMA-262 IsLooselyEqual against undefined or null, P3 stage
-    /// 3 step L1): true for undefined and null (and the TDZ marker, which no operand is: `tag |
-    /// 2`, as the templates test it) and for the [[IsHTMLDDA]] object (Annex B.3.6), false for
+    /// 3 step L1): true for undefined and null (`tag | 2` is null's tag for those two alone, as
+    /// the templates test it; the TDZ marker's, 0x7ffa, stays 0x7ffa) and for the [[IsHTMLDDA]]
+    /// object (Annex B.3.6), false for
     /// every other value. An object whose ic_plain is set is no [[IsHTMLDDA]] (its makers clear
     /// it, and it is only ever cleared); one whose ic_plain is clear takes a cold call of the
     /// interpreter's test, which runs no JavaScript, allocates nothing and does not collect:
@@ -470,9 +471,14 @@ pub(crate) enum NodeOp {
     /// (Tagged): the word is a String's [NotString] (P3 stage 3 step L1; Maglev's CheckString,
     /// maglev-graph-builder.cc:2502-2506).
     CheckString,
-    /// (Tagged): the word is an object, undefined or null (`tag | 2` null's: the TDZ marker too, as
-    /// NullOrLikeUndefined takes it) [NotObjectOrNullish] (P3 stage 3 step L1b; Maglev's
+    /// (Tagged): the word is an object, undefined or null (`tag | 2` is null's tag for those two
+    /// alone, NullOrLikeUndefined's test) [NotObjectOrNullish] (P3 stage 3 step L1b; Maglev's
     /// CheckJSReceiverOrNullOrUndefined, maglev-graph-builder.cc:3706-, JSC's ObjectOrOtherUse).
+    /// The template's class test of a pair of two tags (feedback.rs EQ_CLASS_OBJECT_OR_NULLISH)
+    /// also takes the TDZ marker, 0x7ffa, which this check exits for: harmless, as the marker is no
+    /// equality's operand (a read of a binding in its dead zone throws first, an array's hole
+    /// reads as undefined); were it one, the record would name the pair and this check exit once
+    /// there and flag it.
     CheckObjectOrNullish,
     /// (Tagged, Tagged) -> Bool: IsLooselyEqual of two words each an object or nullish (P3 stage
     /// 3 step L1b), TurboFan's form (compiler/js-typed-lowering.cc:1009-1060): the same word is
