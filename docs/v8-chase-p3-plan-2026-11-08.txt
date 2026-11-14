@@ -4215,7 +4215,11 @@ typeof, is in work).
   30 mutations: 24 caught, 6 masked by another check of the same walk (the kind and plain tests
   behind the shape test, a field kept across an effect behind the link's own end); the tier's and
   the JIT's modules in the four configurations; difftest; zombie's check, clippy, Windows' check
-  and suite (2,845).
+  and suite (2,845). On the landed tree (64878bb6; target/p3/stage3/stepL2-review): the library
+  suite 3,385 passed and none failed with the tier off, on, eager and eager with forced exits,
+  and again with TRUST_JS_OPT_INLINE=graph on, eager and forced (the whole suite passes at graph
+  since the splice tests' pins); difftest 138 agree and the fixtures' outputs the tier off's in
+  all seven.
 - Open: a String's `length` (10.9M, a small node); the generic sites (34.4M, mostly
   TypeScript's megamorphic loads: the stub cache's probe as a node, with the generic node of step
   3a); named stores and updates, now the next family (44.2M: SetPropThisDrop 18.1M, UpdateProp
