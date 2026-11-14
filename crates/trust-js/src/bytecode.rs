@@ -26217,6 +26217,24 @@ unsafe fn jit_vm_operation(
     activation.stack.reserve(depth);
     std::ptr::copy_nonoverlapping(ctx.stack_base, activation.stack.as_mut_ptr(), depth);
     activation.stack.set_len(depth);
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    if crate::opt::poison() {
+        // TRUST_JS_OPT_POISON's reader check: a copied word that is the poison is one the tier's
+        // code did not write (`a64::Options::poison`), which this helper hands the operation
+        // and the collector's precise trace of the activation.
+        for (k, word) in activation.stack.raw_slice().iter().enumerate() {
+            if word.bits() == crate::opt::a64::POISON {
+                crate::opt::poison_fault(
+                    chunk,
+                    pc as usize,
+                    &format!("the VM-copy helper copied operand word {k}, the poison"),
+                );
+            }
+        }
+    }
     let mut next = pc as usize;
     let result = run_vm(
         &mut *ctx.interp,
@@ -26479,6 +26497,12 @@ pub(crate) unsafe extern "C" fn jit_exec(
         Op::SetProp(..) | Op::SetPropDrop(..) | Op::SetPropThisDrop(..) | Op::SetPropLocalDrop(..)
     ) {
         TEST_JIT_EXEC_PROPERTY_HELPERS.with(|count| count.set(count.get() + 1));
+    }
+    #[cfg(test)]
+    if let Some((at, write_pc, slot)) = TEST_HIDDEN_SLOT_WRITE.with(std::cell::Cell::get) {
+        if at == (*ctx).chunk as usize && write_pc == pc && slot < (*ctx).n_slots {
+            (*(*ctx).slots.add(slot)).set(Value::Undefined);
+        }
     }
     let _inline_position = ImplicitCallPosition::enter((*ctx).interp, chunk, pc as usize);
     if matches!(
@@ -28426,6 +28450,11 @@ pub(crate) unsafe extern "C" fn jit_iteration(
 
 #[cfg(test)]
 thread_local! {
+    /// A test's hidden writer (P3 stage 3 step 3a's follow-up): `jit_exec` at pc `.1` of the chunk
+    /// at `.0` writes Undefined into slot `.2`, a write its operation's `liveness::slot_use` does
+    /// not list, which the poison switch's check must report.
+    pub(crate) static TEST_HIDDEN_SLOT_WRITE: std::cell::Cell<Option<(usize, u32, usize)>> =
+        const { std::cell::Cell::new(None) };
     pub(crate) static TEST_JIT_LOCAL_RESET_HELPERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };

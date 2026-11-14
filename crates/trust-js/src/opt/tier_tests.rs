@@ -3433,15 +3433,65 @@ fn generic_programs(poison: bool) {
         assert!(!expected.starts_with("throw"), "{program}: {expected}");
         for (label, switches) in configurations {
             compiled();
+            super::take_poison_faults();
             assert_eq!(
                 with_switches(switches, program),
                 expected,
                 "{label}: {program}"
             );
+            assert_eq!(
+                super::take_poison_faults(),
+                0,
+                "{label}: no helper copied a poisoned word and no template wrote one: {program}"
+            );
             compiles += compiled().len();
         }
     }
     assert!(compiles > 0, "the tier compiled the programs' functions");
+}
+
+/// The poison switch's writer check (P3 stage 3 step 3a's follow-up): after a generic node's
+/// template, the words the switch poisoned before it, the slots its operation does not name among
+/// them, still hold the poison. A test hook makes the exact-PC helper of `f`'s `delete` write `x`'s
+/// slot, which `delete` does not name: the check reports it, and the tier's code still reads `x`
+/// from its home; without the hook, no fault.
+#[test]
+fn the_poison_check_reports_a_template_that_writes_a_slot_its_operation_does_not_name() {
+    TestSwitches {
+        poison: true,
+        ..eager()
+    }
+    .set();
+    let program = "function f(o, n) { var x = n * 3; delete o.c; return x + o.a; }\n\
+         var t = 0; for (var k = 0; k < 300; k++) t += f({a: k, c: 1}, k); t";
+    let expected = run(Tier::Bytecode, program);
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, program), expected);
+    let chunk = tier_chunk(&mut engine, "f").expect("the tier compiled f");
+    let pc = chunk
+        .jit_ops()
+        .iter()
+        .position(|op| matches!(op, crate::bytecode::Op::DeleteProp(..)))
+        .expect("f deletes a property");
+    let slot = chunk
+        .jit_slot_names()
+        .iter()
+        .position(|name| &**name == "x")
+        .expect("x has a slot");
+    super::take_poison_faults();
+    assert_eq!(eval(&mut engine, "f({a: 1, c: 2}, 4)"), "13");
+    assert_eq!(super::take_poison_faults(), 0, "no hidden writer, no fault");
+    crate::bytecode::TEST_HIDDEN_SLOT_WRITE.with(|write| {
+        write.set(Some((address(&chunk), pc as u32, slot)));
+    });
+    let result = eval(&mut engine, "f({a: 1, c: 2}, 4)");
+    crate::bytecode::TEST_HIDDEN_SLOT_WRITE.with(|write| write.set(None));
+    assert_eq!(result, "13", "the tier's code reads x from its home");
+    assert_eq!(
+        super::take_poison_faults(),
+        1,
+        "the check reports the write"
+    );
 }
 
 /// A host interruption inside a callee of a generic node at a pc with a handler leaves through the

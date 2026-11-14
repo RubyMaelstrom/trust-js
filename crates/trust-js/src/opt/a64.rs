@@ -92,13 +92,41 @@ pub(crate) struct Options {
     /// The poison before each generic node (TRUST_JS_OPT_POISON; P3 stage 3 step 3a): the frame's
     /// stale words, the slots it does not name whose words the state does not hold current and
     /// the operand words below its operands, overwritten with [`POISON`], so that a template or
-    /// helper that read one would compute with it, which the tests' results show.
+    /// helper that read one would compute with it, which the tests' results show; before each
+    /// canonical-frame effect without a handler, the operand words below its operands; and after
+    /// each generic node's template, the check that it wrote none of its poisoned words
+    /// (`Gen::check_poison`; the step's follow-up).
     pub(crate) poison: bool,
 }
 
 /// The word the poison switch writes (`Options::poison`): a Number by value.rs's encoding (a
 /// tiny negative double), which names no cell and which no program computes in passing.
 pub(crate) const POISON: u64 = 0x8bad_f00d_dead_beef;
+
+/// The poison check's code for an operand word below a generic node's operands (`BELOW | k`),
+/// where a slot's is its number ([`poison_written`]).
+const BELOW: u64 = 1 << 32;
+
+/// The poison check's report (`Gen::check_poison`): the word `code` names, which the poison
+/// switch wrote before the generic node at `pc` of `ctx`'s chunk, no longer holds the poison after
+/// the node's template.
+unsafe extern "C" fn poison_written(ctx: *mut JitCtx, pc: u64, code: u64) {
+    // SAFETY: the running code's context, whose chunk is live while its code runs.
+    let chunk = unsafe { &*(*ctx).chunk };
+    let what = if code & BELOW != 0 {
+        format!(
+            "its template wrote operand word {} below its operands",
+            code & !BELOW
+        )
+    } else {
+        let name = chunk
+            .jit_slot_names()
+            .get(code as usize)
+            .map_or("?", |name| &**name);
+        format!("its template wrote slot {code} ({name}), which its operation does not name")
+    };
+    crate::opt::poison_fault(chunk, pc as usize, &what);
+}
 
 impl Options {
     /// The options the switches select (main thread: TRUST_JS_OPT_EXIT_EVERY is a test's switch
@@ -2810,9 +2838,12 @@ impl Gen<'_> {
                 self.a.str_imm(word, 22, 8 * u32::from(slot));
             }
         }
-        if self.options.poison && generic {
-            self.poison(node, state, depth - pops);
-        }
+        // The poison switch: before a generic node, its stale words; before a canonical-frame
+        // effect that has no handler (with one, the frame holds the whole state, above), the
+        // operand words below its operands, which the code does not write either (the helpers
+        // that copy the operand stack to run the VM among them: `bytecode::jit_runs_on_vm_copy`).
+        let poisoned = (self.options.poison && (generic || !handlers))
+            .then(|| self.poison(node, state, depth - pops, generic));
         self.a.add_imm(20, X9, (8 * depth) as u32);
         let unwind = if handlers {
             let site = self.exit_throw(n)?;
@@ -2846,31 +2877,78 @@ impl Gen<'_> {
                 _ => emit_exec(&mut self.a, pc as u32, unwind),
             }
         }
+        if let Some(slots) = poisoned.filter(|_| generic) {
+            self.check_poison(pc, &slots, depth - pops);
+        }
         self.a.set_hot(false);
         self.last_effect = Some(n);
         Ok(())
     }
 
-    /// The poison switch's stores before generic node `node` (`Options::poison`): every slot its
-    /// operation does not name whose word `state` does not say current (a value's, stale; a dead
-    /// slot's), and the `below` operand words under its operands, x9 holding `stack_base`. Every
-    /// exit writes what it needs of them from its recipe (a throw's too), and the VM writes a dead
-    /// slot before it reads it.
-    fn poison(&mut self, node: &Node, state: &FrameState, below: usize) {
+    /// The poison switch's stores before effect `node` (`Options::poison`): before a generic node
+    /// (`slots`), every slot its operation does not name whose word `state` does not say current
+    /// (a value's, stale; a dead slot's); and the `below` operand words under its operands, x9
+    /// holding `stack_base`. Every exit writes what it needs of them from its recipe (a throw's
+    /// too), and the VM writes a dead slot before it reads it. Returns the slots it poisoned.
+    fn poison(&mut self, node: &Node, state: &FrameState, below: usize, slots: bool) -> Vec<u16> {
         let named = crate::opt::liveness::frame_slots(
             &self.chunk.jit_ops()[node.pc as usize],
             self.graph.n_slots,
         );
         self.a.mov_imm64(X16, POISON);
-        for (slot, source) in state.slots.iter().enumerate() {
+        let mut poisoned = Vec::new();
+        for (slot, source) in state.slots.iter().enumerate().filter(|_| slots) {
             let stale = matches!(source, SlotSource::Value(_) | SlotSource::Dead);
             if stale && !named.iter().any(|&(name, _)| usize::from(name) == slot) {
                 self.a.str_imm(X16, 22, 8 * slot as u32);
+                poisoned.push(slot as u16);
             }
         }
         for k in 0..below {
             self.a.str_imm(X16, X9, 8 * k as u32);
         }
+        poisoned
+    }
+
+    /// The poison switch's check after generic node at `pc`'s template has returned
+    /// (`Options::poison`): every word [`poison`](Self::poison) wrote before it, the `slots` it
+    /// does not name and the `below` operand words under its operands, still holds the poison;
+    /// one that does not was written by the template or a helper it called, a write
+    /// `liveness::slot_use` does not list, which [`poison_written`] reports. The template's call
+    /// left nothing live in a caller-saved register.
+    fn check_poison(&mut self, pc: usize, slots: &[u16], below: usize) {
+        if slots.is_empty() && below == 0 {
+            return;
+        }
+        let done = self.a.new_label();
+        let common = self.a.new_label();
+        let mut faults = Vec::new();
+        self.a
+            .ldr_imm(X9, 19, std::mem::offset_of!(JitCtx, stack_base) as u32);
+        self.a.mov_imm64(X17, POISON);
+        let words = slots
+            .iter()
+            .map(|&slot| (22, u32::from(slot), u64::from(slot)))
+            .chain((0..below).map(|k| (X9, k as u32, BELOW | k as u64)));
+        for (base, index, code) in words {
+            let fault = self.a.new_label();
+            self.a.ldr_imm(X16, base, 8 * index);
+            self.a.cmp_reg_x(X16, X17);
+            self.a.b_cond(NE, fault);
+            faults.push((fault, code));
+        }
+        self.a.b(done);
+        for (fault, code) in faults {
+            self.a.bind(fault);
+            self.a.mov_imm64(2, code);
+            self.a.b(common);
+        }
+        self.a.bind(common);
+        self.a.mov(0, 19);
+        self.a.mov_imm64(1, pc as u64);
+        self.a.mov_imm64(X16, poison_written as *const () as u64);
+        self.a.blr(X16);
+        self.a.bind(done);
     }
 
     /// The label a branch from `from` to `to` takes: the block's, or a trampoline that makes the

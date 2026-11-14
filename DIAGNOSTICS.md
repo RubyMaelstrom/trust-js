@@ -129,7 +129,13 @@ comment/example in the same change.
   not hold current: the slots it does not name whose values live in registers or spill slots or
   that are dead, and the operand words below its operands; a template or helper that read one
   would compute with the poison (a diagnostic of what they read of the frame; results differing
-  from the tier off's mean a hidden reader).
+  from the tier off's mean a hidden reader). Before each canonical-frame effect without a handler
+  it stores the poison into the operand words below the effect's operands as well. Under the
+  switch, the tier's code checks after each generic node's template that the words it poisoned
+  still hold the poison (one that does not was written by a template or helper: a slot write the
+  operation's slot use does not list), and the helper that runs the VM on a copy of the operand
+  stack checks the words it copies; each fault is written once to standard error as an
+  `[opt-poison]` line naming the function, the pc, the operation and the word.
   `TRUST_JS_OPT_VERIFY=1` verifies each graph the tier builds in a release build (its SSA
   dominance, representations, frame states and terminators) and refuses a graph that fails,
   logging why under `TRUST_JS_OPT_LOG`; debug builds and the library's tests always verify, and

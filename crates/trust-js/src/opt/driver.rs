@@ -315,6 +315,42 @@ pub(crate) fn poison() -> bool {
     env_flag!("TRUST_JS_OPT_POISON")
 }
 
+thread_local! {
+    /// The faults the poison switch's checks found on this thread (TRUST_JS_OPT_POISON; P3 stage
+    /// 3 step 3a's follow-up): a helper that copied a poisoned word, a template or helper that
+    /// wrote one. A test reads them ([`take_poison_faults`]).
+    static POISON_FAULTS: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Record a fault of the poison switch's checks at `pc` of `chunk`: counted, and reported on
+/// standard error (written past the test harness's capture, so that a whole suite's run lists
+/// every fault), each fault once per process.
+pub(crate) fn poison_fault(chunk: &Chunk, pc: usize, what: &str) {
+    use std::io::Write;
+    POISON_FAULTS.with(|count| count.set(count.get() + 1));
+    let op = chunk
+        .jit_ops()
+        .get(pc)
+        .map_or_else(String::new, |op| format!("{op:?}"));
+    let line = format!("[opt-poison] {} pc {pc} ({op}): {what}\n", name(chunk));
+    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    let fresh = SEEN
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get_or_insert_with(Default::default)
+        .insert(line.clone());
+    if fresh {
+        let _ = std::io::stderr().write_all(line.as_bytes());
+    }
+}
+
+/// The poison checks' faults on this thread since the last call (tests).
+#[cfg(test)]
+pub(crate) fn take_poison_faults() -> usize {
+    POISON_FAULTS.with(|count| count.replace(0))
+}
+
 /// TRUST_JS_OPT_NO_REOPT: stage 1's fallback for good: a discard records no exit profile, adds
 /// nothing to R and arms no recompile.
 pub(crate) fn no_reopt() -> bool {

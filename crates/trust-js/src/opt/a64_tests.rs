@@ -4549,3 +4549,44 @@ fn the_poison_switch_overwrites_the_stale_frame_words_before_a_generic_node() {
         assert!(exits().is_empty(), "poison {poison}");
     }
 }
+
+/// The poison switch before a canonical-frame effect (P3 stage 3 step 3a's follow-up): a function
+/// whose array literal's spread runs the VM on a copy of the operand stack (`NewArray` and
+/// `ArraySpread`, canonical-frame effects) with `n * 2` held in a register below its operands, and
+/// no generic node, compiled with the switch: its code stores the poison into the operand word
+/// below the effects' operands, which the code does not write; without the switch, no poison.
+#[test]
+fn the_poison_switch_overwrites_the_operand_words_below_a_canonical_frame_effects_operands() {
+    let source = "function ps(n, a) { return n * 2 + [...a].length; }
+         for (var k = 0; k < 20; k++) ps(k, [k, 1]);";
+    let poison_top = encode(|a| a.movk(16, 0x8bad, 3));
+    for poison in [true, false] {
+        let mut engine = fixture(source);
+        let chunk = chunk_of(&mut engine, "ps");
+        let snapshot = crate::opt::snapshot::Snapshot::take(&chunk);
+        let built = crate::opt::build::build(&chunk, &snapshot).expect("the tier builds ps");
+        let ops: Vec<&NodeOp> = built.graph.nodes.iter().map(|node| &node.op).collect();
+        assert!(
+            ops.iter()
+                .any(|op| matches!(op, NodeOp::Effect { pops: 2, .. })),
+            "the spread is a canonical-frame effect: {ops:?}"
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(op, NodeOp::Generic { .. })),
+            "no generic node: {ops:?}"
+        );
+        let code = install(
+            &mut engine,
+            "ps",
+            &built.graph,
+            Options {
+                poison,
+                ..Options::default()
+            },
+        );
+        assert_eq!(holds(&code_words(&code), poison_top, !31), poison);
+        exits();
+        assert_eq!(eval(&mut engine, "ps(4, [1, 2, 3])"), "11");
+        assert!(exits().is_empty(), "poison {poison}");
+    }
+}
