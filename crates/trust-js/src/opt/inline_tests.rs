@@ -691,6 +691,64 @@ fn a_callee_with_an_effect_is_declined_and_its_call_stays() {
 }
 
 #[test]
+fn callees_whose_equalities_and_typeof_tests_lower_are_inlined() {
+    // P3 stage 3 step L1: `x == null`, typeof tests and `x === 0` lower whatever the facts, an
+    // equality whose record names one pair speculates on it (C's claims in Rules::lowers, which
+    // E0 reads): no decline; a loose compare with a String constant still declines its callee.
+    let mut engine = warmed(
+        "function isn(x) { return x == null; }
+         function isnum(x) { return typeof x === 'number'; }
+         function isz(x) { return x === 0; }
+         function eqn(a, b) { return a == b; }
+         function lit(x) { return x == 'a'; }
+         function c(x) { return isn(x) || isnum(x) || isz(x); }
+         function d(a, b) { return eqn(a, b) ? 1 : 0; }
+         function f(x) { return lit(x); }
+         for (var k = 0; k < 30; k++) { c(k & 1 ? k : 's'); d(k, k + 1); f(k); }",
+    );
+    let eqn = chunk_of(&mut engine, "eqn");
+    let pc = pc_of(&eqn, |op| *op == Op::EqEq) as usize;
+    ChunkProfile::of(&eqn).see_equality(eqn.jit_ops().len(), pc, crate::feedback::EQ_SEEN_NUMBERS);
+    let built = Compile::new(&mut engine, "c").build();
+    assert_eq!(
+        outcomes(&built),
+        vec![
+            (0, InlineOutcome::Inlined),
+            (0, InlineOutcome::Inlined),
+            (0, InlineOutcome::Inlined)
+        ],
+        "{}",
+        dump(&built.graph)
+    );
+    let built = Compile::new(&mut engine, "d").build();
+    assert_eq!(outcomes(&built), vec![(0, InlineOutcome::Inlined)]);
+    assert!(
+        built
+            .graph
+            .nodes
+            .iter()
+            .any(|node| !node.frame.is_compiled()
+                && node.op == NodeOp::CheckNumber
+                && node.reason == Some(ExitReason::NotNumber)),
+        "the callee's speculation: {}",
+        dump(&built.graph)
+    );
+    let lit = chunk_of(&mut engine, "lit");
+    let eq = pc_of(&lit, |op| *op == Op::EqEq);
+    let built = Compile::new(&mut engine, "f").build();
+    assert_eq!(
+        outcomes(&built),
+        vec![(
+            0,
+            InlineOutcome::Declined {
+                reason: super::build::E0_EFFECT,
+                at: Some((eq, Op::EqEq)),
+            }
+        )]
+    );
+}
+
+#[test]
 fn recursion_is_refused_as_the_planner_refuses_it() {
     let mut engine = warmed(MISC);
     // The planner skips a self-recursive way: rec's plan is empty, its graph has no frame.

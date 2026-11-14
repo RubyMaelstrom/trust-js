@@ -613,30 +613,6 @@ fn a_flagged_speculation_leaves_the_generic_operation() {
     assert_eq!(count(&graph, is_effect), 0, "{text}");
 }
 
-#[test]
-fn a_speculation_its_operands_rule_out_stays_the_generic_operation() {
-    // The record saw two Numbers at `x == 'a'` (a constant String) and two Strings at
-    // `(a | 0) == b` (a proven int32): the operation, which the rules do not count lowered here,
-    // is the generic one.
-    let mut engine = warmed(
-        "function cn(x) { return x == 'a'; } function ci(a, b) { return (a | 0) == b; }
-         for (var i = 0; i < 20; i++) { cn(i); ci(i, 'b'); }",
-    );
-    see(&mut engine, "cn", &[NUMBERS]);
-    see(&mut engine, "ci", &[STRINGS]);
-    for name in ["cn", "ci"] {
-        let (graph, text) = graph_of(&mut engine, name);
-        assert_eq!(count(&graph, is_effect), 1, "{name}: {text}");
-        assert!(
-            graph.nodes.iter().all(|node| !matches!(
-                node.op,
-                NodeOp::CheckString | NodeOp::CheckNumber
-            ) || name == "ci"),
-            "{name}: {text}"
-        );
-    }
-}
-
 /// Template code's forms of equality, each in a function of its own: a compact site of two
 /// operands, compact sites of a Number and a String constant, a loop's local pair feeding a
 /// branch, a loop's value equality on a property, and a numeric loop's integer compare.
@@ -845,4 +821,171 @@ fn a_site_that_alternates_its_pairs_settles_within_the_limits() {
         flagged
     });
     assert!(flagged, "the site's flag");
+}
+
+// ---- C: the prepass's claims ------------------------------------------------------------------
+
+/// The blocks of `graph`'s one natural loop: its header and those that reach its back edges.
+fn loop_members(graph: &Graph, text: &str) -> Vec<bool> {
+    let header = graph
+        .blocks
+        .iter()
+        .position(|block| block.loop_header)
+        .unwrap_or_else(|| panic!("a loop: {text}"));
+    let mut members = vec![false; graph.blocks.len()];
+    members[header] = true;
+    let mut work: Vec<usize> = graph.blocks[header]
+        .preds
+        .iter()
+        .map(|pred| pred.index())
+        .filter(|&pred| pred >= header)
+        .collect();
+    while let Some(block) = work.pop() {
+        if std::mem::replace(&mut members[block], true) {
+            continue;
+        }
+        work.extend(graph.blocks[block].preds.iter().map(|pred| pred.index()));
+    }
+    members
+}
+
+#[test]
+fn a_loop_whose_equalities_and_typeof_tests_lower_is_free_of_effects() {
+    // `g()` before the loop leaves `a` in the frame's keeping; in a loop without effects it is
+    // loaded once at the entry (stage 3 step 0), as in one whose generic nodes leave it alone
+    // (step 3a); the lowered tests leave no generic node in the loop.
+    let tests = [
+        ("ln", "x == null", None),
+        ("lu", "undefined != x", None),
+        ("lt", "typeof x === 'number'", None),
+        ("lz", "x === 0", None),
+        ("ls", "x === y", Some(STRINGS)),
+        ("lx", "x == y", Some(NUMBERS)),
+    ];
+    let mut source = String::new();
+    for (name, test, _) in tests {
+        source.push_str(&format!(
+            "function {name}(g, a, x, y, n) {{ var s = 0; g();
+               for (var i = 0; i < n; i++) {{ if ({test}) s = s + a; }} return s; }}"
+        ));
+    }
+    source.push_str(
+        "function lo(g, a, x, y, n) { var s = 0; g();
+           for (var i = 0; i < n; i++) { if (x == 'a') s = s + a; } return s; }
+         function nothing() {}",
+    );
+    let mut drive = String::from("for (var r = 0; r < 20; r++) {");
+    for (name, _, _) in tests {
+        drive.push_str(&format!("{name}(nothing, 1.5, r, 'b', 4);"));
+    }
+    drive.push_str("lo(nothing, 1.5, r, 'b', 4); }");
+    // The VM's runs record; the JIT tier's then fill the call caches the builder reads.
+    let mut engine = warmed(&format!("{source} {drive}"));
+    eval(&mut engine, &drive);
+    for (name, test, code) in tests {
+        if let Some(code) = code {
+            see(&mut engine, name, &[code]);
+        }
+        let (graph, text) = graph_of(&mut engine, name);
+        let members = loop_members(&graph, &text);
+        let in_loop = |which: &dyn Fn(&NodeOp) -> bool| {
+            graph
+                .nodes
+                .iter()
+                .any(|node| members[node.block.index()] && which(&node.op))
+        };
+        assert!(
+            !in_loop(&is_effect),
+            "{test}: no effect in the loop: {text}"
+        );
+        assert!(
+            !in_loop(&|op| matches!(op, NodeOp::FrameSlot(_))),
+            "{test}: no reload in the loop: {text}"
+        );
+    }
+    // A loose compare with a String constant may coerce: a generic node.
+    let (graph, text) = graph_of(&mut engine, "lo");
+    let members = loop_members(&graph, &text);
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .any(|node| members[node.block.index()] && is_effect(&node.op)),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_loop_whose_equality_lowers_keeps_its_heap_facts() {
+    // A typed array's facts are heap facts, which a loop keeps through its header where nothing in
+    // it may end them (stage 3 step 0c): with `x === 0` lowered, the loop's read takes the data
+    // address the read before it checked; with `x == 'a'`, a generic node, which may run anything
+    // (step 3a), the loop checks and loads it again.
+    let mut engine = warmed(
+        "function hk(t, x, n) { var s = t[0] | 0;
+           for (var i = 0; i < n; i = (i + 1) | 0) { if (x === 0) s = (s + (t[i] | 0)) | 0; }
+           return s | 0; }
+         function hg(t, x, n) { var s = t[0] | 0;
+           for (var i = 0; i < n; i = (i + 1) | 0) { if (x == 'a') s = (s + (t[i] | 0)) | 0; }
+           return s | 0; }
+         var T = new Int32Array(8);
+         for (var r = 0; r < 20; r++) { hk(T, r & 1, 8); hg(T, 'a', 8); }",
+    );
+    for (name, generic) in [("hk", false), ("hg", true)] {
+        let (graph, text) = graph_of(&mut engine, name);
+        let members = loop_members(&graph, &text);
+        let in_loop = |which: &dyn Fn(&NodeOp) -> bool| {
+            graph
+                .nodes
+                .iter()
+                .any(|node| members[node.block.index()] && which(&node.op))
+        };
+        assert_eq!(in_loop(&is_effect), generic, "{name}: {text}");
+        assert_eq!(
+            in_loop(&|op| matches!(op, NodeOp::TypedData { .. })),
+            generic,
+            "{name}: the data address loaded in the loop only past a generic node: {text}"
+        );
+    }
+}
+
+#[test]
+fn a_claimed_speculation_its_operands_rule_out_exits() {
+    // The record saw two Numbers at `x == 'a'` (a constant String) and two Strings at `(a | 0)
+    // == b` (a proven int32): the rules claim them lowered, so the builder exits at each [its
+    // speculation's reason] rather than make the effect a loop would not expect, and the exit's
+    // flag then declines the claim.
+    let mut engine = warmed(
+        "function cn(x) { return x == 'a'; } function ci(a, b) { return (a | 0) == b; }
+         for (var i = 0; i < 20; i++) { cn(i); ci(i, 'b'); }",
+    );
+    see(&mut engine, "cn", &[NUMBERS]);
+    see(&mut engine, "ci", &[STRINGS]);
+    for (name, reason) in [("cn", ExitReason::NotNumber), ("ci", ExitReason::NotString)] {
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::Exit(reason)),
+            1,
+            "{name}: {text}"
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| !matches!(node.op, NodeOp::CheckString)),
+            "{name}: {text}"
+        );
+    }
+    let chunk = chunk_of(&mut engine, "cn");
+    let pc = equality_pc(&chunk);
+    super::profile::ChunkProfile::of(&chunk).add_site(
+        pc as u32,
+        ExitReason::NotNumber as u8,
+        false,
+        0,
+        false,
+    );
+    let (graph, text) = graph_of(&mut engine, "cn");
+    assert_eq!(count(&graph, is_effect), 1, "{text}");
 }

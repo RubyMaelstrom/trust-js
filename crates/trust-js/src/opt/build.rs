@@ -850,6 +850,9 @@ impl Rules<'_> {
             Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq => {
                 self.equality_lowers(pc) && !flagged(&[ExitReason::NotNumber])
             }
+            // A test of the tag and the kind, its rare objects through a cold call that runs no
+            // JavaScript (P3 stage 3 step L1).
+            Op::TypeofIs(..) => true,
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Gt | Op::Le | Op::Ge => {
                 self.numbers(pc, true).is_some() && !flagged(&[ExitReason::NotNumber])
             }
@@ -963,11 +966,19 @@ impl Rules<'_> {
     /// Whether the equality at `pc` lowers whatever facts its block's entry brings: its two
     /// operands made in its block by operations the builder gives a Number (a Number constant, a
     /// bitwise or arithmetic operation these rules lower), or under `===` and `!==` one of them a
-    /// constant no other value equals: the cases of `Builder::equality` the operations alone
-    /// prove. Any other equality may still lower from the builder's facts, which the prepass
-    /// cannot see: it counts as a possible effect, as before (P3 stage 3 step 0b; asm.js-style
-    /// code's loop conditions, `(k | 0) != 0`, are of the first kind).
+    /// constant no other value equals or any Number constant (P3 stage 3 step L1: the word's
+    /// double compare), or under `==` and `!=` one of them an undefined or null constant (the
+    /// NullOrLikeUndefined test); or its record names a pair whose speculation no flag declines
+    /// (step L1, B): the cases of `Builder::equality` the operations and the snapshot alone
+    /// prove, each of which the builder lowers or, where its facts rule the speculation out,
+    /// exits (`Builder::mismatch`); none of them runs JavaScript or anything that writes. Any
+    /// other equality may still lower from the builder's facts, which the prepass cannot see:
+    /// it counts as a possible effect, as before (P3 stage 3 step 0b; asm.js-style code's loop
+    /// conditions, `(k | 0) != 0`, are of the first kind).
     fn equality_lowers(&self, pc: usize) -> bool {
+        if self.equality_speculation(pc).is_some() {
+            return true;
+        }
         let strict = matches!(self.ops[pc], Op::StrictEq | Op::StrictNotEq);
         let (Some(a), Some(b)) = (self.producer(pc, 1), self.producer(pc, 0)) else {
             return false;
@@ -991,11 +1002,28 @@ impl Rules<'_> {
             _ => false,
         };
         let identity = |p: usize| match self.ops[p] {
-            Op::Const(k) => const_word(self.chunk, k).is_some_and(identity_constant),
+            Op::Const(k) => const_word(self.chunk, k)
+                .is_some_and(|word| identity_constant(word) || number_word(word).is_some()),
             Op::Undef => true,
             _ => false,
         };
-        (number(a) && number(b)) || (strict && (identity(a) || identity(b)))
+        let nullish = |p: usize| match self.ops[p] {
+            Op::Const(k) => const_word(self.chunk, k)
+                .is_some_and(|word| word == PACK_UNDEFINED || word == PACK_NULL),
+            Op::Undef => true,
+            _ => false,
+        };
+        (number(a) && number(b))
+            || (strict && (identity(a) || identity(b)))
+            || (!strict && (nullish(a) || nullish(b)))
+    }
+
+    /// The pair the equality at `pc` speculates on: its record's one pair (see
+    /// [`Rules::equality_record`]) where no flag of its checks' reason declines it, which the
+    /// builder then builds or exits for (P3 stage 3 step L1, C).
+    fn equality_speculation(&self, pc: usize) -> Option<EqPair> {
+        self.equality_record(pc)
+            .filter(|pair| !self.snapshot.declines(pc, pair.reason()))
     }
 
     /// The pair of operand kinds the equality at `pc` speculates on (P3 stage 3 step L1, B): the
