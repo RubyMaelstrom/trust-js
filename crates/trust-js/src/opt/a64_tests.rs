@@ -4590,3 +4590,248 @@ fn the_poison_switch_overwrites_the_operand_words_below_a_canonical_frame_effect
         assert!(exits().is_empty(), "poison {poison}");
     }
 }
+
+// ---- loop caches of spilled values (P3 stage 3 step R1) ----
+
+const INV: &str =
+    "function inv(n, a) { let s = 0; for (let i = 0; i < n; i++) { s = s + a; } return s; } inv(3, 1);";
+
+/// `inv(n, a)` (slots n, a, s, i; the loop's header at pc 6, its Add at 12 on [s, a], i's
+/// increment at 16, the return at 18) on int32s, over hand-made pressure: a's int32, then
+/// twenty-one int32s made from n, which fill the x registers and push out the values whose next
+/// use is the farthest, a's and n's, read in the loop (spilled at their definitions); a chain
+/// reads the twenty-one into s's initial 0.
+/// The loop reads the spilled a, and n's int32, from their loop caches. Returns a's int32.
+fn inv_graph() -> (Graph, NodeIx) {
+    let mut b = Build::new(4);
+    let entry = b.block(0, false);
+    let header = b.block(6, true);
+    let body = b.block(10, false);
+    let exit = b.block(18, false);
+    b.edge(entry, header);
+    b.edge(header, body);
+    b.edge(header, exit);
+    b.edge(body, header);
+    let n = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let a = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+    let at_entry = b.state(0, &[], &[], &[]);
+    let fn_ = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[n],
+        Rep::F64,
+        0,
+        at_entry,
+        ExitReason::NotNumber,
+    );
+    let in_ = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[fn_],
+        Rep::I32,
+        0,
+        at_entry,
+        ExitReason::NotInt32,
+    );
+    let fa = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[a],
+        Rep::F64,
+        0,
+        at_entry,
+        ExitReason::NotNumber,
+    );
+    let ia = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[fa],
+        Rep::I32,
+        0,
+        at_entry,
+        ExitReason::NotInt32,
+    );
+    let words: Vec<NodeIx> = (0..21)
+        .map(|k| {
+            let c = b.node(entry, NodeOp::ConstI32(k), &[], Rep::I32, 0);
+            b.node(entry, NodeOp::I32Or, &[in_, c], Rep::I32, 0)
+        })
+        .collect();
+    let mut acc = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+    for &w in &words {
+        let zero = b.node(entry, NodeOp::I32Xor, &[w, w], Rep::I32, 0);
+        acc = b.node(entry, NodeOp::I32Or, &[acc, zero], Rep::I32, 0);
+    }
+    let zero = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+    b.node(entry, NodeOp::Jump(header), &[], Rep::None, 5);
+    let i = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 6);
+    let s = b.node(header, NodeOp::Phi, &[acc], Rep::I32, 6);
+    let at_header = b.state(6, &[], &[(2, s), (3, i)], &[]);
+    b.exiting(
+        header,
+        NodeOp::Poll,
+        &[],
+        Rep::None,
+        6,
+        at_header,
+        ExitReason::Throw,
+    );
+    let lt = b.node(header, NodeOp::I32Cmp(Cond::Lt), &[i, in_], Rep::Bool, 8);
+    b.node(
+        header,
+        NodeOp::Branch {
+            then_block: body,
+            else_block: exit,
+        },
+        &[lt],
+        Rep::None,
+        9,
+    );
+    let at_add = b.state(12, &[s, ia], &[(2, s), (3, i)], &[]);
+    let s2 = b.exiting(
+        body,
+        NodeOp::I32Add,
+        &[s, ia],
+        Rep::I32,
+        12,
+        at_add,
+        ExitReason::Overflow,
+    );
+    let one = b.node(body, NodeOp::ConstI32(1), &[], Rep::I32, 16);
+    let at_inc = b.state(16, &[], &[(2, s2), (3, i)], &[]);
+    let i2 = b.exiting(
+        body,
+        NodeOp::I32Add,
+        &[i, one],
+        Rep::I32,
+        16,
+        at_inc,
+        ExitReason::Overflow,
+    );
+    b.node(body, NodeOp::Jump(header), &[], Rep::None, 17);
+    b.g.node_mut(i).inputs.push(i2);
+    b.g.node_mut(s).inputs.push(s2);
+    let boxed = b.node(exit, NodeOp::I32ToTagged, &[s], Rep::Tagged, 18);
+    b.node(exit, NodeOp::Return, &[boxed], Rep::None, 19);
+    (b.g, ia)
+}
+
+#[test]
+fn a_spilled_invariant_is_read_from_its_loop_cache_and_its_exits_name_its_slot() {
+    use crate::opt::exit::Source;
+    use crate::opt::regalloc::{allocate, Home, ARM64};
+    let (graph, ia) = inv_graph();
+    let alloc = allocate(&graph, &ARM64).unwrap();
+    crate::opt::regalloc::tests::assert_consistent(&graph, &alloc);
+    let Home::Spill(offset) = alloc.homes[ia.index()] else {
+        panic!("a's int32 in {:?}", alloc.homes[ia.index()])
+    };
+    let cache = *alloc
+        .caches
+        .iter()
+        .find(|c| c.value == ia)
+        .expect("a's loop cache");
+    let Home::Gp(r) = cache.reg else {
+        panic!("{cache:?}")
+    };
+    assert!(
+        ARM64.gp_caller.contains(&r),
+        "a call-free loop's cache: x{r}"
+    );
+    let mut engine = fixture(INV);
+    let code = install(&mut engine, "inv", &graph, Options::default());
+    exits();
+    assert_eq!(eval(&mut engine, "inv(10, 3)"), "30");
+    assert_eq!(eval(&mut engine, "inv(0, 3)"), "0");
+    assert_eq!(eval(&mut engine, "inv(100000, -7)"), "-700000");
+    assert!(exits().is_empty());
+    // The cache's load of a's slot at the loop's header, and no load of it into a scratch
+    // register, where a use without the cache loads it.
+    let words = code_words(&code);
+    let load = encode(|a| a.ldr_imm(u32::from(r), 31, offset));
+    assert!(words.contains(&load));
+    for scratch in [X9, X16, X17, X30] {
+        let use_load = encode(|a| a.ldr_imm(scratch, 31, offset));
+        assert!(
+            !words.contains(&use_load),
+            "a use loads a's slot into x{scratch}"
+        );
+    }
+    // The header's loads are its first words: the entry falls through into them, and the back
+    // edge branches past them, so that they run once per entry.
+    let loads: Vec<usize> = alloc
+        .caches
+        .iter()
+        .filter(|c| c.header == cache.header)
+        .map(|c| {
+            let (Home::Gp(q), Home::Spill(at)) = (c.reg, alloc.homes[c.value.index()]) else {
+                panic!("{c:?}")
+            };
+            let word = encode(|a| a.ldr_imm(u32::from(q), 31, at));
+            words
+                .iter()
+                .position(|&w| w == word)
+                .expect("a cache's load")
+        })
+        .collect();
+    let (first, last) = (*loads.iter().min().unwrap(), *loads.iter().max().unwrap());
+    assert_eq!(last + 1 - first, loads.len(), "the loads are contiguous");
+    let targets: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter_map(|(k, &w)| {
+            let offset = if w & 0xFC00_0000 == 0x1400_0000 {
+                ((w << 6) as i32) >> 6
+            } else if w & 0xFF00_0010 == 0x5400_0000 || w & 0x7E00_0000 == 0x3400_0000 {
+                ((w << 8) as i32) >> 13
+            } else {
+                return None;
+            };
+            Some((k as isize + offset as isize) as usize)
+        })
+        .collect();
+    assert!(
+        !targets.contains(&first),
+        "a branch into the header's loads"
+    );
+    assert!(
+        targets.contains(&(last + 1)),
+        "the back edge past the loads"
+    );
+    // The Add's exit names a's slot, its one home, not the cache.
+    let table = crate::opt::exit::table_of(&code).expect("the tier's exit table");
+    let add = table
+        .exits
+        .iter()
+        .find(|e| e.pc == 12 && e.reason == ExitReason::Overflow)
+        .expect("the Add's exit");
+    assert_eq!(
+        add.stack[1],
+        Source::Spill {
+            offset,
+            rep: Rep::I32
+        }
+    );
+    // An overflow inside the loop: the VM finishes from the Add with a read from its slot.
+    assert_eq!(eval(&mut engine, "inv(1000, 1073741824)"), "1073741824000");
+    assert_eq!(exits(), vec![(12, ExitReason::Overflow)]);
+    assert_eq!(eval(&mut engine, "inv(7, 2.5)"), "17.5");
+    assert_eq!(exits(), vec![(0, ExitReason::NotInt32)]);
+}
+
+#[test]
+fn a_polls_slow_path_keeps_a_caller_saved_loop_cache() {
+    // Every poll takes its slow path (the poll word set by hand), whose call clobbers the
+    // caller-saved registers: it saves and restores the cache with the live values. Under
+    // collections at every allocation a collection runs in it.
+    let (graph, _) = inv_graph();
+    let mut engine = fixture(INV);
+    install(&mut engine, "inv", &graph, Options::default());
+    exits();
+    stress(&engine);
+    engine.interp.poll.set_heap_due(true);
+    assert_eq!(eval(&mut engine, "inv(1000, 3)"), "3000");
+    assert_eq!(eval(&mut engine, "inv(500, -11)"), "-5500");
+    engine.interp.poll.set_heap_due(false);
+    assert!(exits().is_empty());
+}

@@ -1001,6 +1001,12 @@ struct Gen<'a> {
     /// The frame area's save area for inlined frames' generic nodes (`SAVE_AREA_BYTES` at this
     /// byte offset), where the graph has one.
     save_area: Option<u32>,
+    /// The block whose code is being emitted, whose loop caches its reads take (P3 stage 3 step
+    /// R1); None in out-of-line code but an edge's moves, which read the slots.
+    cur_block: Option<BlockIx>,
+    /// Each loop header with caches: the label after their loads, which its loop's own edges
+    /// take.
+    after_loads: Vec<Option<usize>>,
 }
 
 /// What an inlined frame's generic node switched of the context (P3 stage 3 step 3c), which its
@@ -1044,6 +1050,12 @@ impl<'a> Gen<'a> {
         }
         let fast = switches.fast;
         let blocks = (0..graph.blocks.len()).map(|_| a.new_label()).collect();
+        let mut after_loads = vec![None; graph.blocks.len()];
+        for c in &alloc.caches {
+            if after_loads[c.header.index()].is_none() {
+                after_loads[c.header.index()] = Some(a.new_label());
+            }
+        }
         let l_ret_ok = a.new_label();
         let l_ret_throw = a.new_label();
         let l_direct_finish = a.new_label();
@@ -1088,6 +1100,8 @@ impl<'a> Gen<'a> {
             frames: Vec::new(),
             inlined: &[],
             save_area: None,
+            cur_block: None,
+            after_loads,
         }
     }
 
@@ -1106,6 +1120,8 @@ impl<'a> Gen<'a> {
             let next = order.get(k + 1).copied();
             self.a.bind(self.blocks[b.index()]);
             self.last_effect = None;
+            self.load_caches(b);
+            self.cur_block = Some(b);
             for &n in &self.graph.block(b).body {
                 self.lower(n, b, next)?;
             }
@@ -1446,9 +1462,53 @@ impl Gen<'_> {
         }
     }
 
+    /// The register that holds a copy of spilled value `v` in the block being emitted, if a loop
+    /// cache does (P3 stage 3 step R1, `regalloc::loop_caches`).
+    fn cached(&self, v: NodeIx) -> Option<Home> {
+        if !matches!(self.home(v), Home::Spill(_)) {
+            return None;
+        }
+        self.alloc.cache_of(self.cur_block?, v)
+    }
+
+    /// The loads of a loop header's caches from their values' slots, then the label its loop's
+    /// own edges take, so that the loads run once per entry and the back edges run nothing.
+    fn load_caches(&mut self, header: BlockIx) {
+        let Some(after) = self.after_loads[header.index()] else {
+            return;
+        };
+        for k in 0..self.alloc.caches.len() {
+            let cache = self.alloc.caches[k];
+            if cache.header != header {
+                continue;
+            }
+            let Home::Spill(offset) = self.home(cache.value) else {
+                unreachable!("a cache copies a spilled value")
+            };
+            match cache.reg {
+                Home::Gp(r) => self.a.ldr_imm(u32::from(r), 31, offset),
+                Home::Fp(r) => self.a.ldr_d_imm(u32::from(r), 31, offset),
+                _ => unreachable!("a cache is a register"),
+            }
+        }
+        self.a.bind(after);
+    }
+
+    /// The label a branch from `from` into `to` takes: `to`'s, or after its caches' loads for an
+    /// edge of `to`'s loop.
+    fn block_label(&self, from: BlockIx, to: BlockIx) -> usize {
+        match self.after_loads[to.index()] {
+            Some(after) if self.alloc.enters_loaded(from, to) => after,
+            _ => self.blocks[to.index()],
+        }
+    }
+
     /// The x register that holds `v` here: its home, or `scratch`, loaded from its spill slot or
     /// with its constant.
     fn gp(&mut self, v: NodeIx, scratch: u32) -> u32 {
+        if let Some(Home::Gp(r)) = self.cached(v) {
+            return u32::from(r);
+        }
         match self.home(v) {
             Home::Gp(r) => u32::from(r),
             Home::Spill(offset) => {
@@ -1467,6 +1527,9 @@ impl Gen<'_> {
     /// The d register that holds `v` here (as [`Gen::gp`]; a constant by FMOV's 8-bit immediate
     /// where it encodes, else through x30).
     fn fp(&mut self, v: NodeIx, scratch: u32) -> u32 {
+        if let Some(Home::Fp(r)) = self.cached(v) {
+            return u32::from(r);
+        }
         match self.home(v) {
             Home::Fp(r) => u32::from(r),
             Home::Spill(offset) => {
@@ -2856,8 +2919,9 @@ impl Gen<'_> {
             }
             NodeOp::Jump(target) => {
                 self.emit_moves(block, *target)?;
-                if next != Some(*target) {
-                    self.a.b(self.blocks[target.index()]);
+                let label = self.block_label(block, *target);
+                if next != Some(*target) || label != self.blocks[target.index()] {
+                    self.a.b(label);
                 }
             }
             NodeOp::Branch {
@@ -3481,7 +3545,7 @@ impl Gen<'_> {
     /// edge's moves into its phis first.
     fn edge_target(&mut self, from: BlockIx, to: BlockIx) -> usize {
         if self.graph.block(to).phis.is_empty() {
-            return self.blocks[to.index()];
+            return self.block_label(from, to);
         }
         let label = self.a.new_label();
         self.cold.push(Cold::Edge { label, from, to });
@@ -3514,8 +3578,9 @@ impl Gen<'_> {
                 continue; // a phi nothing reads
             };
             let input = graph.node(phi).inputs[index];
-            let src = loc(self.home(input), input)
-                .ok_or(Refusal::whole("a phi's input without a home"))?;
+            // A spilled input's loop cache in the edge's source block (step R1) is a copy of it.
+            let home = self.cached(input).unwrap_or(self.home(input));
+            let src = loc(home, input).ok_or(Refusal::whole("a phi's input without a home"))?;
             if src != dst {
                 moves.push((dst, src, graph.node(phi).rep == Rep::F64));
             }
@@ -3578,6 +3643,8 @@ impl Gen<'_> {
 
     /// The out-of-line code, then the exits' sites.
     fn emit_cold(&mut self) -> Result<(), Refusal> {
+        // Out-of-line code reads spilled values from their slots, an edge's moves aside.
+        self.cur_block = None;
         // Until none is left: a cold path may itself push one (a boxed f64's NaN case).
         loop {
             let cold = std::mem::take(&mut self.cold);
@@ -3802,8 +3869,11 @@ impl Gen<'_> {
                     }
                     Cold::Edge { label, from, to } => {
                         self.a.bind(label);
+                        // The moves run on the edge out of `from`, whose loop caches hold.
+                        self.cur_block = Some(from);
                         self.emit_moves(from, to)?;
-                        self.a.b(self.blocks[to.index()]);
+                        self.cur_block = None;
+                        self.a.b(self.block_label(from, to));
                     }
                     Cold::Poll {
                         label,
@@ -3885,7 +3955,7 @@ impl Gen<'_> {
     /// allocator did not see as a call). Returns what `restore_live_caller_saved` restores.
     fn save_live_caller_saved(&mut self, node: NodeIx) -> (Vec<(bool, u32)>, u32) {
         let file = &regalloc::ARM64;
-        let live: Vec<(bool, u32)> = self
+        let mut live: Vec<(bool, u32)> = self
             .alloc
             .live_at(node)
             .into_iter()
@@ -3895,6 +3965,7 @@ impl Gen<'_> {
                 _ => None,
             })
             .collect();
+        live.extend(self.caller_saved_caches(node));
         let size = (8 * live.len() as u32).next_multiple_of(16);
         if size > 0 {
             self.a.sub_imm(31, 31, size);
@@ -3907,6 +3978,21 @@ impl Gen<'_> {
             }
         }
         (live, size)
+    }
+
+    /// The caller-saved registers of the loop caches valid in `node`'s block (P3 stage 3 step
+    /// R1): a cold path's call clobbers them, and the loop reads them after it, so the call keeps
+    /// them with the live values. A callee-saved cache needs nothing.
+    fn caller_saved_caches(&self, node: NodeIx) -> Vec<(bool, u32)> {
+        let file = &regalloc::ARM64;
+        self.alloc
+            .caches_in(self.graph.node(node).block)
+            .filter_map(|c| match c.reg {
+                Home::Gp(r) if file.gp_caller.contains(&r) => Some((false, u32::from(r))),
+                Home::Fp(r) if file.fp_caller.contains(&r) => Some((true, u32::from(r))),
+                _ => None,
+            })
+            .collect()
     }
 
     /// [`Gen::save_live_caller_saved`], with the x registers in `scratch` saved too: values of a
@@ -3928,6 +4014,7 @@ impl Gen<'_> {
                 _ => None,
             })
             .collect();
+        live.extend(self.caller_saved_caches(node));
         live.extend(scratch.iter().map(|&r| (false, r)));
         let size = (8 * live.len() as u32).next_multiple_of(16);
         if size > 0 {

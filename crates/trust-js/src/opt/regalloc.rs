@@ -143,8 +143,27 @@ pub(crate) struct Allocation {
     /// Whether a value living across an effect has a d8..d15 home (`a64` then checks that no
     /// shared stub writes those registers).
     pub(crate) fp_callee_across_effect: bool,
+    /// The loop-level caches of spilled values (P3 stage 3 step R1, `loop_caches`).
+    pub(crate) caches: Vec<Cache>,
+    /// Each block's caches, indices into `caches` (empty, or one list per block of the graph).
+    pub(crate) block_caches: Vec<Vec<u16>>,
     /// `live_at`'s index of the ranges, made at its first query.
     live_index: std::cell::OnceCell<LiveIndex>,
+}
+
+/// A register that holds a copy of a spilled value through one loop (P3 stage 3 step R1,
+/// `loop_caches`): loaded at the loop's header, read by the loop's blocks, and nothing else's
+/// through the loop's hull. The value's spill slot stays its home.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Cache {
+    /// The value, whose home is a spill slot.
+    pub(crate) value: NodeIx,
+    /// The register: `Home::Gp` or `Home::Fp`.
+    pub(crate) reg: Home,
+    /// The loop's header, at whose start the register is loaded.
+    pub(crate) header: BlockIx,
+    /// The loop's hull: its header's head position to the last tail of its blocks.
+    pub(crate) hull: (u32, u32),
 }
 
 impl Allocation {
@@ -157,6 +176,26 @@ impl Allocation {
         self.live_index
             .get_or_init(|| LiveIndex::new(&self.homes, &self.ranges))
             .live_at(at)
+    }
+
+    /// The caches valid in `block` (step R1): its loops' caches.
+    pub(crate) fn caches_in(&self, block: BlockIx) -> impl Iterator<Item = &Cache> + '_ {
+        self.block_caches
+            .get(block.index())
+            .into_iter()
+            .flatten()
+            .map(|&k| &self.caches[k as usize])
+    }
+
+    /// The register that holds a copy of spilled value `v` in `block`, if a cache does.
+    pub(crate) fn cache_of(&self, block: BlockIx, v: NodeIx) -> Option<Home> {
+        self.caches_in(block).find(|c| c.value == v).map(|c| c.reg)
+    }
+
+    /// Whether the edge from `from` into `to` is an edge of `to`'s loop, which enters the header
+    /// after its caches' loads (step R1): `from` is one of the loop's blocks.
+    pub(crate) fn enters_loaded(&self, from: BlockIx, to: BlockIx) -> bool {
+        self.caches_in(from).any(|c| c.header == to)
     }
 
     /// [`Allocation::live_at`] by a scan of every value's range: the index's reference.
@@ -916,8 +955,19 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             homes[v] = Home::Const;
         }
     }
+    let (caches, block_caches) = loop_caches(
+        graph,
+        file,
+        &order,
+        (&head, &tail),
+        &homes,
+        &ranges,
+        &edges,
+        &mut used_callee_gp,
+        &mut fp_callee_across_effect,
+    );
     used_callee_gp.sort_unstable();
-    Ok(Allocation {
+    let alloc = Allocation {
         order,
         homes,
         pos,
@@ -925,8 +975,297 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         spill_bytes,
         callee_saved_gp: used_callee_gp,
         fp_callee_across_effect,
+        caches,
+        block_caches,
         live_index: std::cell::OnceCell::new(),
-    })
+    };
+    #[cfg(test)]
+    {
+        tests::assert_caches(graph, &alloc);
+        TEST_CACHES.with(|made| made.set(made.get() + alloc.caches.len()));
+    }
+    Ok(alloc)
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The loop caches the allocations on this thread made (step R1's end-to-end tests).
+    pub(crate) static TEST_CACHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// 10^k for the static execution estimate of a block at loop depth k (B3's,
+/// b3/B3EstimateStaticExecutionCounts.cpp:42-43), up to depth 9.
+const FREQUENCY: [u64; 10] = [
+    1,
+    10,
+    100,
+    1_000,
+    10_000,
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+];
+
+/// A natural loop of the code order (`loop_caches`).
+struct Loop {
+    header: BlockIx,
+    /// Its blocks, the header first.
+    blocks: Vec<BlockIx>,
+    /// Its blocks as a bit set over block indices.
+    member: Vec<u64>,
+    /// The header's head position to the last tail of its blocks.
+    hull: (u32, u32),
+    /// The loops that hold its header, itself among them.
+    depth: u32,
+    /// Whether one of its blocks holds an effect or a call (`NodeOp::is_effectful`).
+    call: bool,
+    /// The registers its blocks' stub calls clobber (`clobbers`), x and d.
+    clobbered: (u64, u64),
+}
+
+/// Whether block index `i` is in the bit set `bits`.
+fn contains(bits: &[u64], i: usize) -> bool {
+    bits[i / 64] & (1 << (i % 64)) != 0
+}
+
+/// The natural loops of the code order: a block the builder marked a loop header with a
+/// predecessor at or after it, and the blocks that reach those predecessors without passing it.
+/// A walk that reaches the entry block found no natural loop there, and gives none.
+fn natural_loops(graph: &Graph, order: &[BlockIx], (head, tail): (&[u32], &[u32])) -> Vec<Loop> {
+    let mut place = vec![u32::MAX; graph.blocks.len()];
+    for (k, &b) in order.iter().enumerate() {
+        place[b.index()] = k as u32;
+    }
+    let reachable = |b: BlockIx| place[b.index()] != u32::MAX;
+    let words = graph.blocks.len().div_ceil(64);
+    let mut loops: Vec<Loop> = Vec::new();
+    for &h in order {
+        let data = graph.block(h);
+        if !data.loop_header {
+            continue;
+        }
+        let mut stack: Vec<BlockIx> = data
+            .preds
+            .iter()
+            .copied()
+            .filter(|&p| reachable(p) && place[p.index()] >= place[h.index()])
+            .collect();
+        if stack.is_empty() {
+            continue;
+        }
+        let mut member = vec![0u64; words];
+        insert(&mut member, h.index());
+        let mut blocks = vec![h];
+        let mut natural = true;
+        while let Some(b) = stack.pop() {
+            if contains(&member, b.index()) {
+                continue;
+            }
+            if b == order[0] {
+                natural = false;
+                break;
+            }
+            insert(&mut member, b.index());
+            blocks.push(b);
+            stack.extend(
+                graph
+                    .block(b)
+                    .preds
+                    .iter()
+                    .copied()
+                    .filter(|&p| reachable(p) && !contains(&member, p.index())),
+            );
+        }
+        if !natural {
+            continue;
+        }
+        let mut hull = (head[h.index()], 0);
+        let (mut call, mut clobbered) = (false, (0, 0));
+        for &b in &blocks {
+            hull.1 = hull.1.max(tail[b.index()]);
+            for &node in &graph.block(b).body {
+                let op = &graph.node(node).op;
+                call |= op.is_effectful();
+                let (gp, fp) = clobbers(op);
+                clobbered = (clobbered.0 | gp, clobbered.1 | fp);
+            }
+        }
+        loops.push(Loop {
+            header: h,
+            blocks,
+            member,
+            hull,
+            depth: 0,
+            call,
+            clobbered,
+        });
+    }
+    for k in 0..loops.len() {
+        let h = loops[k].header.index();
+        loops[k].depth = loops.iter().filter(|l| contains(&l.member, h)).count() as u32;
+    }
+    loops
+}
+
+/// Loop-level caches of spilled values (P3 stage 3 step R1). A value whose home is a spill slot,
+/// defined outside a loop and read inside it, is loaded once at the loop's header into a register
+/// that nothing else holds through the loop, and the loop's reads take the register; the slot
+/// stays the value's one home, which every exit, throw and parent recipe names and the collector
+/// scans. Maglev's reload hint (HoistLoopReloads, maglev/maglev-regalloc.cc:2240-2271: a node
+/// defined before the loop and used in it without a call between, loaded into a free register on
+/// the loop's forward edge and kept across its back edge); the choice among values by Air's
+/// frequency-weighted use cost (b3/air/AirAllocateRegistersByGreedy.cpp:733-752, a block at depth
+/// k counting 10^k), less the load at each entry (its loop split's fixup cost, :2715-2722), and
+/// the outermost loop the register is free through first, as Air's loop split chooses
+/// (:2645-2679). A loop with a call takes only a callee-saved register, which no call clobbers;
+/// none takes a register one of its stub calls clobbers. A value defined in the loop is not
+/// cached: that would be a second home over part of its range.
+#[allow(clippy::too_many_arguments)]
+fn loop_caches(
+    graph: &Graph,
+    file: &RegisterFile,
+    order: &[BlockIx],
+    (head, tail): (&[u32], &[u32]),
+    homes: &[Home],
+    ranges: &[(u32, u32)],
+    edges: &EdgeInputs,
+    used_callee_gp: &mut Vec<u8>,
+    fp_callee_across_effect: &mut bool,
+) -> (Vec<Cache>, Vec<Vec<u16>>) {
+    let spilled = |v: NodeIx| matches!(homes[v.index()], Home::Spill(_));
+    if !homes.iter().any(|home| matches!(home, Home::Spill(_))) {
+        return (Vec::new(), Vec::new());
+    }
+    let loops = natural_loops(graph, order, (head, tail));
+    if loops.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut depth = vec![0u32; graph.blocks.len()];
+    for l in &loops {
+        for &b in &l.blocks {
+            depth[b.index()] += 1;
+        }
+    }
+    // The candidates: (loop, value, weight), each read of a spilled value defined outside the
+    // loop counting its block's frequency.
+    let mut reads: Vec<(u32, u32, u64)> = Vec::new();
+    for (k, l) in loops.iter().enumerate() {
+        let outside = |v: NodeIx| spilled(v) && !contains(&l.member, graph.node(v).block.index());
+        for &b in &l.blocks {
+            let weight = FREQUENCY[(depth[b.index()] as usize).min(9)];
+            let data = graph.block(b);
+            for &node in &data.body {
+                for &input in &graph.node(node).inputs {
+                    if outside(input) {
+                        reads.push((k as u32, input.0, weight));
+                    }
+                }
+            }
+            for s in 0..data.succs.len() {
+                for input in edges.of(b, s) {
+                    if outside(input) {
+                        reads.push((k as u32, input.0, weight));
+                    }
+                }
+            }
+        }
+    }
+    if reads.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    reads.sort_unstable();
+    // (benefit, loop, value): the reads' weight less one load at each entry.
+    let mut candidates: Vec<(u64, u32, u32)> = Vec::new();
+    for run in reads.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
+        let (k, v, _) = run[0];
+        let weight: u64 = run.iter().map(|r| r.2).sum();
+        let entry = FREQUENCY[(loops[k as usize].depth as usize - 1).min(9)];
+        if weight > entry {
+            candidates.push((weight - entry, k, v));
+        }
+    }
+    candidates.sort_unstable_by(|a, b| {
+        b.0.cmp(&a.0)
+            .then(loops[b.1 as usize].depth.cmp(&loops[a.1 as usize].depth))
+            .then(a.2.cmp(&b.2))
+    });
+    // Each register's ranges, by start (they do not overlap: one value a register at a time).
+    let mut held: [Vec<Vec<(u32, u32)>>; 2] = [vec![Vec::new(); 32], vec![Vec::new(); 32]];
+    for (v, home) in homes.iter().enumerate() {
+        match *home {
+            Home::Gp(r) => held[0][r as usize].push(ranges[v]),
+            Home::Fp(r) => held[1][r as usize].push(ranges[v]),
+            _ => {}
+        }
+    }
+    for list in held.iter_mut().flatten() {
+        list.sort_unstable();
+    }
+    let mut caches: Vec<Cache> = Vec::new();
+    let overlap = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
+    for &(_, k, v) in &candidates {
+        let l = &loops[k as usize];
+        let v = NodeIx(v);
+        if caches
+            .iter()
+            .any(|c| c.value == v && overlap(c.hull, l.hull))
+        {
+            continue;
+        }
+        let Some(class) = class_of(graph.node(v).rep) else {
+            continue;
+        };
+        let (ci, caller, callee, avoid) = match class {
+            Class::Gp => (0, file.gp_caller, file.gp_callee, l.clobbered.0),
+            Class::Fp => (1, file.fp_caller, file.fp_callee, l.clobbered.1),
+        };
+        let free = |r: u8| {
+            let list = &held[ci][r as usize];
+            let first = list.partition_point(|&(_, end)| end < l.hull.0);
+            avoid & (1 << r) == 0
+                && list.get(first).is_none_or(|&(start, _)| start > l.hull.1)
+                && !caches.iter().any(|c| {
+                    matches!((c.reg, class), (Home::Gp(q), Class::Gp) | (Home::Fp(q), Class::Fp) if q == r)
+                        && overlap(c.hull, l.hull)
+                })
+        };
+        let choices: &[u8] = if l.call { &[] } else { caller };
+        let Some(r) = choices.iter().chain(callee).copied().find(|&r| free(r)) else {
+            continue;
+        };
+        let reg = match class {
+            Class::Gp => Home::Gp(r),
+            Class::Fp => Home::Fp(r),
+        };
+        if class == Class::Gp && callee.contains(&r) && !used_callee_gp.contains(&r) {
+            used_callee_gp.push(r);
+        }
+        if class == Class::Fp && callee.contains(&r) && l.call {
+            *fp_callee_across_effect = true;
+        }
+        caches.push(Cache {
+            value: v,
+            reg,
+            header: l.header,
+            hull: l.hull,
+        });
+    }
+    if caches.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut block_caches: Vec<Vec<u16>> = vec![Vec::new(); graph.blocks.len()];
+    for (k, c) in caches.iter().enumerate() {
+        let l = loops
+            .iter()
+            .find(|l| l.header == c.header)
+            .expect("a cache's loop");
+        for &b in &l.blocks {
+            block_caches[b.index()].push(k as u16);
+        }
+    }
+    (caches, block_caches)
 }
 
 #[cfg(test)]
@@ -949,6 +1288,7 @@ pub(crate) mod tests {
     /// index agrees with a scan of every range at each scheduled node.
     pub(crate) fn assert_consistent(graph: &Graph, alloc: &Allocation) {
         assert_live_at_agrees(graph, alloc);
+        assert_caches(graph, alloc);
         let calls: Vec<u32> = graph
             .nodes
             .iter()
@@ -1003,6 +1343,96 @@ pub(crate) mod tests {
             let read = alloc.ranges[v].1 > alloc.ranges[v].0;
             if read && node.rep != Rep::None && alloc.pos[v] != u32::MAX {
                 assert_ne!(alloc.homes[v], Home::None, "value {v} is read");
+            }
+        }
+    }
+
+    /// The loop caches' rules (step R1), checked after every allocation the tests make: each
+    /// cache copies a spilled value of its register's class, defined outside the loop and live
+    /// through the loop's hull; the cache's blocks are a loop whose header is its; no value homed
+    /// in the register and no other cache in it overlaps the hull, and no node of the loop
+    /// clobbers it (a stub call's clobbers; a call's every caller-saved register); a value has no
+    /// two caches at a point; a callee-saved x register is saved by the prologue, and a d8-d15
+    /// one through a loop with a call is flagged for the stubs' check.
+    pub(crate) fn assert_caches(graph: &Graph, alloc: &Allocation) {
+        let overlap = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
+        for (k, c) in alloc.caches.iter().enumerate() {
+            let v = c.value.index();
+            assert!(
+                matches!(alloc.homes[v], Home::Spill(_)),
+                "cache {k} of value {v} in {:?}",
+                alloc.homes[v]
+            );
+            let class = class_of(graph.nodes[v].rep);
+            let (r, callee) = match (c.reg, class) {
+                (Home::Gp(r), Some(Class::Gp)) => (r, ARM64.gp_callee.contains(&r)),
+                (Home::Fp(r), Some(Class::Fp)) => (r, ARM64.fp_callee.contains(&r)),
+                other => panic!("cache {k} of value {v}: {other:?}"),
+            };
+            let blocks: Vec<usize> = (0..alloc.block_caches.len())
+                .filter(|&b| alloc.block_caches[b].contains(&(k as u16)))
+                .collect();
+            assert!(
+                blocks.contains(&c.header.index()) && graph.blocks[c.header.index()].loop_header,
+                "cache {k}'s header"
+            );
+            assert!(
+                !blocks.contains(&graph.nodes[v].block.index()),
+                "cache {k}: value {v} is defined in its loop"
+            );
+            let (start, end) = alloc.ranges[v];
+            assert!(
+                start < c.hull.0 && end >= c.hull.1,
+                "cache {k}: value {v}'s range {:?} does not cover the loop's {:?}",
+                (start, end),
+                c.hull
+            );
+            for (u, &home) in alloc.homes.iter().enumerate() {
+                if home == c.reg && alloc.pos[u] != u32::MAX {
+                    assert!(
+                        !overlap(alloc.ranges[u], c.hull),
+                        "cache {k} in {:?} overlaps value {u} {:?} (loop {:?})",
+                        c.reg,
+                        alloc.ranges[u],
+                        c.hull
+                    );
+                }
+            }
+            for (j, d) in alloc.caches.iter().enumerate() {
+                if j != k && overlap(d.hull, c.hull) {
+                    assert_ne!(d.reg, c.reg, "caches {k} and {j} share a register");
+                    assert_ne!(d.value, c.value, "caches {k} and {j} copy one value");
+                }
+            }
+            let mut call = false;
+            for &b in &blocks {
+                for &n in &graph.blocks[b].body {
+                    let op = &graph.nodes[n.index()].op;
+                    call |= op.is_effectful();
+                    let (gp, fp) = clobbers(op);
+                    let hit = match c.reg {
+                        Home::Gp(_) => gp & (1 << r) != 0,
+                        _ => fp & (1 << r) != 0,
+                    };
+                    assert!(!hit, "cache {k} in {:?}, which node {n:?} clobbers", c.reg);
+                }
+            }
+            assert!(
+                callee || !call,
+                "cache {k} in caller-saved {:?} through a loop with a call",
+                c.reg
+            );
+            if callee && matches!(c.reg, Home::Gp(_)) {
+                assert!(
+                    alloc.callee_saved_gp.contains(&r),
+                    "cache {k}'s x{r} is not saved by the prologue"
+                );
+            }
+            if callee && call && matches!(c.reg, Home::Fp(_)) {
+                assert!(
+                    alloc.fp_callee_across_effect,
+                    "cache {k}'s d{r} across a call"
+                );
             }
         }
     }
@@ -1464,6 +1894,438 @@ pub(crate) mod tests {
         let mut live = alloc.live_at(call);
         live.retain(|v| slots.contains(v));
         assert_eq!(live, slots);
+    }
+
+    /// A loop over values spilled before it (step R1's tests): the entry defines 21 words and
+    /// then `values`, which the loop reads; the words fill every x register and die in a chain
+    /// before the loop, and each value's next use, in the loop, is farther than theirs, so each
+    /// spills at its definition; then `keep` words read only after the loop, each holding a
+    /// register through it. header: q = phi(acc, q'), i = phi(0, i'); poll; branch i < 100.
+    /// body: `body` builds from (q, the values) the word the back edge gives q; i' = i | 1; jump
+    /// header. exit: the kept words and return q.
+    struct Looped {
+        g: Graph,
+        entry: BlockIx,
+        header: BlockIx,
+        body: BlockIx,
+        values: Vec<NodeIx>,
+    }
+
+    fn looped(
+        values: usize,
+        keep: usize,
+        body: impl FnOnce(&mut Graph, BlockIx, NodeIx, &[NodeIx]) -> NodeIx,
+    ) -> Looped {
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let body_block = g.add_block(2, false);
+        let exit = g.add_block(3, false);
+        g.entry = Some(entry);
+        g.add_edge(entry, header);
+        g.add_edge(header, body_block);
+        g.add_edge(header, exit);
+        g.add_edge(body_block, header);
+        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
+        let vs: Vec<NodeIx> = (0..values).map(|_| word(&mut g)).collect();
+        let mut acc = words[0];
+        for &w in &words[1..] {
+            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
+            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
+        }
+        // Defined once the chain freed the registers: each holds one through the loop.
+        let kept: Vec<NodeIx> = (0..keep).map(|_| word(&mut g)).collect();
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let q = g.add_node(header, NodeOp::Phi, &[acc], Rep::Tagged, 1);
+        let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
+        let ps = state(&mut g, 1, &[]);
+        let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
+        g.node_mut(poll).state = Some(ps);
+        let hundred = g.add_node(header, NodeOp::ConstI32(100), &[], Rep::I32, 1);
+        let lt = g.add_node(
+            header,
+            NodeOp::I32Cmp(Cond::Lt),
+            &[i, hundred],
+            Rep::Bool,
+            1,
+        );
+        g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: body_block,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            1,
+        );
+        let q2 = body(&mut g, body_block, q, &vs);
+        let one = g.add_node(body_block, NodeOp::ConstI32(1), &[], Rep::I32, 2);
+        let i2 = g.add_node(body_block, NodeOp::I32Or, &[i, one], Rep::I32, 2);
+        g.add_node(body_block, NodeOp::Jump(header), &[], Rep::None, 2);
+        g.node_mut(q).inputs.push(q2);
+        g.node_mut(i).inputs.push(i2);
+        let mut out = q;
+        for &k in &kept {
+            let same = g.add_node(exit, NodeOp::TaggedSame, &[out, k], Rep::Bool, 3);
+            out = g.add_node(exit, NodeOp::BoolToTagged, &[same], Rep::Tagged, 3);
+        }
+        g.add_node(exit, NodeOp::Return, &[out], Rep::None, 3);
+        Looped {
+            g,
+            entry,
+            header,
+            body: body_block,
+            values: vs,
+        }
+    }
+
+    /// `acc` compared with each of `values` `times` times in `b`, as a chain of words.
+    fn compare_each(
+        g: &mut Graph,
+        b: BlockIx,
+        mut acc: NodeIx,
+        values: &[NodeIx],
+        times: usize,
+    ) -> NodeIx {
+        for &v in values {
+            for _ in 0..times {
+                let same = g.add_node(b, NodeOp::TaggedSame, &[acc, v], Rep::Bool, 2);
+                acc = g.add_node(b, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2);
+            }
+        }
+        acc
+    }
+
+    #[test]
+    fn a_spilled_invariant_read_in_a_call_free_loop_is_loaded_once_into_a_register() {
+        // One value, spilled at its definition, read in the loop's body: a caller-saved cache
+        // for the loop, valid in its header and body only, which its back edge enters after the
+        // loads and its entry before them.
+        let l = looped(1, 0, |g, b, q, vs| compare_each(g, b, q, vs, 1));
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert_consistent(&l.g, &alloc);
+        let v = l.values[0];
+        assert!(
+            matches!(alloc.homes[v.index()], Home::Spill(_)),
+            "{:?}",
+            alloc.homes[v.index()]
+        );
+        assert_eq!(alloc.caches.len(), 1, "{:?}", alloc.caches);
+        let cache = alloc.caches[0];
+        assert_eq!((cache.value, cache.header), (v, l.header));
+        let Home::Gp(r) = cache.reg else {
+            panic!("{cache:?}")
+        };
+        assert!(ARM64.gp_caller.contains(&r), "x{r}");
+        assert_eq!(alloc.cache_of(l.body, v), Some(cache.reg));
+        assert_eq!(alloc.cache_of(l.header, v), Some(cache.reg));
+        assert_eq!(alloc.cache_of(l.entry, v), None);
+        assert!(alloc.enters_loaded(l.body, l.header));
+        assert!(!alloc.enters_loaded(l.entry, l.header));
+    }
+
+    #[test]
+    fn a_spilled_invariant_through_a_loop_with_a_call_takes_a_callee_saved_cache_or_none() {
+        // The body calls (an effect) before it reads the value: only a callee-saved register
+        // survives the call, and the prologue saves it.
+        let with_call = |g: &mut Graph, b: BlockIx, q: NodeIx, vs: &[NodeIx]| {
+            let s = state(g, 2, &[q]);
+            let call = g.add_node(
+                b,
+                NodeOp::Effect {
+                    pc: 2,
+                    pops: 0,
+                    pushes: 0,
+                },
+                &[],
+                Rep::None,
+                2,
+            );
+            g.node_mut(call).state = Some(s);
+            compare_each(g, b, q, vs, 1)
+        };
+        let l = looped(1, 0, with_call);
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert_consistent(&l.g, &alloc);
+        let v = l.values[0];
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        let Home::Gp(r) = cache.reg else {
+            panic!("{cache:?}")
+        };
+        assert!(ARM64.gp_callee.contains(&r), "x{r}");
+        assert!(alloc.callee_saved_gp.contains(&r));
+        // Six words read after the loop take every callee-saved register through it: no cache.
+        let l = looped(1, 6, with_call);
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert_consistent(&l.g, &alloc);
+        assert!(matches!(alloc.homes[l.values[0].index()], Home::Spill(_)));
+        assert!(alloc.caches.is_empty(), "{:?}", alloc.caches);
+    }
+
+    /// Nested loops over a value spilled before them: entry (21 words in a chain, v, `keep` words
+    /// read after the loops) -> H1 (q1, i; poll; i < 10) -> B1 (an effect where `call`) -> H2 (q2,
+    /// j; poll; j < 10) -> B2 (q2 compared with v; j | 1) -> H2; H2 -> L1 (i | 1) -> H1; H1 -> X.
+    fn nested(call: bool, keep: usize) -> (Graph, [BlockIx; 4], NodeIx) {
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let h1 = g.add_block(1, true);
+        let b1 = g.add_block(2, false);
+        let h2 = g.add_block(3, true);
+        let b2 = g.add_block(4, false);
+        let l1 = g.add_block(5, false);
+        let x = g.add_block(6, false);
+        g.entry = Some(entry);
+        for (a, b) in [
+            (entry, h1),
+            (h1, b1),
+            (h1, x),
+            (b1, h2),
+            (h2, b2),
+            (h2, l1),
+            (b2, h2),
+            (l1, h1),
+        ] {
+            g.add_edge(a, b);
+        }
+        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
+        let v = word(&mut g);
+        let mut acc = words[0];
+        for &w in &words[1..] {
+            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
+            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
+        }
+        let kept: Vec<NodeIx> = (0..keep).map(|_| word(&mut g)).collect();
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        let one = g.add_node(entry, NodeOp::ConstI32(1), &[], Rep::I32, 0);
+        let ten = g.add_node(entry, NodeOp::ConstI32(10), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(h1), &[], Rep::None, 0);
+        let header = |g: &mut Graph, h: BlockIx, body: BlockIx, out: BlockIx, init: NodeIx| {
+            let q = g.add_node(h, NodeOp::Phi, &[init], Rep::Tagged, 1);
+            let i = g.add_node(h, NodeOp::Phi, &[zero], Rep::I32, 1);
+            let ps = state(g, 1, &[]);
+            let poll = g.add_node(h, NodeOp::Poll, &[], Rep::None, 1);
+            g.node_mut(poll).state = Some(ps);
+            let lt = g.add_node(h, NodeOp::I32Cmp(Cond::Lt), &[i, ten], Rep::Bool, 1);
+            g.add_node(
+                h,
+                NodeOp::Branch {
+                    then_block: body,
+                    else_block: out,
+                },
+                &[lt],
+                Rep::None,
+                1,
+            );
+            (q, i)
+        };
+        let (q1, i) = header(&mut g, h1, b1, x, acc);
+        if call {
+            let s = state(&mut g, 2, &[q1]);
+            let effect = g.add_node(
+                b1,
+                NodeOp::Effect {
+                    pc: 2,
+                    pops: 0,
+                    pushes: 0,
+                },
+                &[],
+                Rep::None,
+                2,
+            );
+            g.node_mut(effect).state = Some(s);
+        }
+        g.add_node(b1, NodeOp::Jump(h2), &[], Rep::None, 2);
+        let (q2, j) = header(&mut g, h2, b2, l1, q1);
+        let q2b = compare_each(&mut g, b2, q2, &[v], 2);
+        let j2 = g.add_node(b2, NodeOp::I32Or, &[j, one], Rep::I32, 4);
+        g.add_node(b2, NodeOp::Jump(h2), &[], Rep::None, 4);
+        g.node_mut(q2).inputs.push(q2b);
+        g.node_mut(j).inputs.push(j2);
+        let i2 = g.add_node(l1, NodeOp::I32Or, &[i, one], Rep::I32, 5);
+        g.add_node(l1, NodeOp::Jump(h1), &[], Rep::None, 5);
+        g.node_mut(q1).inputs.push(q2);
+        g.node_mut(i).inputs.push(i2);
+        let out = compare_each(&mut g, x, q1, &kept, 1);
+        g.add_node(x, NodeOp::Return, &[out], Rep::None, 6);
+        (g, [h1, b1, h2, b2], v)
+    }
+
+    #[test]
+    fn nested_loops_cache_a_value_through_the_outermost_loop_a_register_is_free_through() {
+        // No call: the outer loop's cache serves the inner loop's reads too, loaded at the outer
+        // header (its weight counts the inner reads and its entries are rarer).
+        let (g, [h1, b1, h2, b2], v) = nested(false, 0);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        assert_eq!(cache.header, h1);
+        for b in [h1, b1, h2, b2] {
+            assert_eq!(alloc.cache_of(b, v), Some(cache.reg), "{b:?}");
+        }
+        // The outer loop calls and six words read after the loops hold its callee-saved
+        // registers: the inner, call-free loop takes the cache, a caller-saved register.
+        let (g, [h1, b1, h2, b2], v) = nested(true, 6);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        assert_eq!(cache.header, h2);
+        assert!(matches!(cache.reg, Home::Gp(r) if ARM64.gp_caller.contains(&r)));
+        assert_eq!(alloc.cache_of(b2, v), Some(cache.reg));
+        assert_eq!(alloc.cache_of(b1, v), None);
+        assert_eq!(alloc.cache_of(h1, v), None);
+        assert!(alloc.enters_loaded(b2, h2) && !alloc.enters_loaded(b1, h2));
+    }
+
+    #[test]
+    fn a_loop_entered_from_two_blocks_loads_its_caches_after_both_entries() {
+        // entry branches to A or B, both of which enter the header: neither is the loop's, so
+        // both reach the loads; the body's back edge does not.
+        let mut l = looped(1, 0, |g, b, q, vs| compare_each(g, b, q, vs, 1));
+        let g = &mut l.g;
+        let (a, b) = (g.add_block(5, false), g.add_block(6, false));
+        let acc = g.node(g.block(l.header).phis[0]).inputs[0];
+        let zero = g.node(g.block(l.header).phis[1]).inputs[0];
+        // The entry's jump becomes a branch to A and B.
+        g.blocks[l.entry.index()].body.pop();
+        g.blocks[l.entry.index()].succs.clear();
+        g.blocks[l.header.index()].preds.retain(|&p| p != l.entry);
+        let c = g.add_node(l.entry, NodeOp::TaggedSame, &[acc, acc], Rep::Bool, 0);
+        g.add_node(
+            l.entry,
+            NodeOp::Branch {
+                then_block: a,
+                else_block: b,
+            },
+            &[c],
+            Rep::None,
+            0,
+        );
+        g.add_edge(l.entry, a);
+        g.add_edge(l.entry, b);
+        for from in [a, b] {
+            g.add_node(from, NodeOp::Jump(l.header), &[], Rep::None, 0);
+            g.add_edge(from, l.header);
+        }
+        // The header's preds are now (body, a, b): each phi takes an input per pred, in order.
+        for (k, &phi) in g.block(l.header).phis.clone().iter().enumerate() {
+            let back = g.node(phi).inputs[1];
+            let init = if k == 0 { acc } else { zero };
+            g.node_mut(phi).inputs = vec![back, init, init];
+        }
+        let alloc = allocate(g, &ARM64).unwrap();
+        assert_consistent(g, &alloc);
+        let v = l.values[0];
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        assert_eq!(cache.header, l.header);
+        assert!(alloc.enters_loaded(l.body, l.header));
+        assert!(!alloc.enters_loaded(a, l.header) && !alloc.enters_loaded(b, l.header));
+        assert_eq!(alloc.cache_of(a, v), None);
+    }
+
+    #[test]
+    fn more_candidates_than_free_registers_cache_the_most_read_first() {
+        // Eight spilled values, the kth read k + 1 times an iteration, with fourteen words
+        // holding registers through the loop: the cached ones are the most read.
+        let l = looped(8, 14, |g, b, mut q, vs| {
+            for (k, &v) in vs.iter().enumerate() {
+                q = compare_each(g, b, q, &[v], k + 1);
+            }
+            q
+        });
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert_consistent(&l.g, &alloc);
+        for &v in &l.values {
+            assert!(matches!(alloc.homes[v.index()], Home::Spill(_)), "{v:?}");
+        }
+        let cached: Vec<NodeIx> = alloc.caches.iter().map(|c| c.value).collect();
+        let n = cached.len();
+        assert!(n > 0 && n < l.values.len(), "{cached:?}");
+        let mut most: Vec<NodeIx> = l.values[l.values.len() - n..].to_vec();
+        most.reverse();
+        assert_eq!(cached, most);
+    }
+
+    #[test]
+    fn a_value_defined_in_the_loop_and_spilled_there_gets_no_cache() {
+        // Twenty-four words made in the body and compared in reverse: some spill, all defined in
+        // the loop; the invariant read beside them still may take a cache.
+        let made = std::cell::RefCell::new(Vec::new());
+        let l = looped(1, 0, |g, b, q, vs| {
+            let mut words = Vec::new();
+            for _ in 0..24 {
+                let same = g.add_node(b, NodeOp::TaggedSame, &[q, q], Rep::Bool, 2);
+                words.push(g.add_node(b, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2));
+            }
+            let mut acc = compare_each(g, b, q, vs, 1);
+            for &w in words.iter().rev() {
+                acc = compare_each(g, b, acc, &[w], 1);
+            }
+            made.borrow_mut().extend(words);
+            acc
+        });
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert_consistent(&l.g, &alloc);
+        let made = made.into_inner();
+        assert!(
+            made.iter()
+                .any(|v| matches!(alloc.homes[v.index()], Home::Spill(_))),
+            "some word made in the loop spills"
+        );
+        assert!(
+            alloc.caches.iter().all(|c| !made.contains(&c.value)),
+            "{:?}",
+            alloc.caches
+        );
+    }
+
+    #[test]
+    fn a_stub_call_in_the_loop_keeps_caches_out_of_the_registers_it_clobbers() {
+        // A TypedElement call in the body: ten words read after the loop and live across it take
+        // x0-x8 and x10 (not its clobbers), so the caller-saved registers free through the loop
+        // are its clobbered x11-x15, which no cache may take.
+        let l = looped(1, 10, |g, b, q, vs| {
+            let s = state(g, 2, &[]);
+            let cell = g.add_node(b, NodeOp::CheckObject, &[q], Rep::Cell, 2);
+            g.node_mut(cell).state = Some(s);
+            let zero = g.add_node(b, NodeOp::ConstI32(0), &[], Rep::I32, 2);
+            let te = g.add_node(
+                b,
+                NodeOp::TypedElement { write: false },
+                &[cell, zero],
+                Rep::Tagged,
+                2,
+            );
+            g.node_mut(te).state = Some(s);
+            let acc = compare_each(g, b, te, vs, 1);
+            compare_each(g, b, acc, &[q], 1)
+        });
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert_consistent(&l.g, &alloc);
+        assert!(matches!(alloc.homes[l.values[0].index()], Home::Spill(_)));
+        let (gp, _) = clobbers(&NodeOp::TypedElement { write: false });
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        assert!(
+            matches!(cache.reg, Home::Gp(r) if gp & (1 << r) == 0),
+            "{cache:?}"
+        );
     }
 
     #[test]

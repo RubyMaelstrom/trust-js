@@ -3544,3 +3544,7 @@ mod create;
 /// P3 stage 3 step L3: named updates and a String's length, end to end.
 #[path = "update_tier_tests.rs"]
 mod update;
+
+/// P3 stage 3 step R1: loop caches of spilled values, end to end.
+#[path = "loop_cache_tier_tests.rs"]
+mod loop_cache;
