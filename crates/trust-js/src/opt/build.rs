@@ -359,12 +359,14 @@ impl Rules<'_> {
         })
     }
 
-    /// A named load's ways on the prototype chain (P3 stage 3 step L2): data ways of objects (no
-    /// primitive's) at depth 1 to 3, each level between with its recorded shape (the templates'
-    /// limit and rule: jit.rs emit_baked), every shape cacheable, the location in a cache's reach,
-    /// which share one walk (the levels' shapes, the holder's location and slot) and differ at
-    /// most in the receiver's shape (up to four): the receiver's check, then each level reached
-    /// by its [[Prototype]] and checked, then the holder's slot (`Builder::chain_load`). None
+    /// A named load's ways on the prototype chain (P3 stage 3 step L2): data ways of objects at
+    /// depth 1 to 3, or of strings at depth 0 to 3 counted from String.prototype (the way's
+    /// receiver shape), each level between with its recorded shape (the templates' limit and
+    /// rule: jit.rs emit_baked), every shape cacheable, the location in a cache's reach, which
+    /// share one walk (the levels' shapes, the holder's location and slot) and differ at most in
+    /// the receiver's shape (up to four): the receiver's check (a string's: its tag and
+    /// String.prototype's), then each level reached by its [[Prototype]] and checked, then the
+    /// holder's slot (`Builder::chain_load`). None
     /// where the site takes another form or the generic operation: a generic mark, own ways,
     /// several walks, another kind of way, `prototype` (a deferred prototype) or an index name
     /// (which the fill never caches: interpreter.rs ic_get_rederive).
