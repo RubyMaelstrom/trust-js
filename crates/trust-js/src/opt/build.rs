@@ -418,6 +418,19 @@ impl Rules<'_> {
         chain
     }
 
+    /// Whether the named load of `name` at `pc` lowers (the builder's `named_load`): on own data
+    /// ways, or through the prototype chain (P3 stage 3 step L2), where no WrongShape flag of the
+    /// site's ways declines it, so that a loop whose named loads take either form counts as free
+    /// of effects and a callee holding them is no E0 decline.
+    fn named_load_lowers(&self, pc: usize, name: u32) -> bool {
+        match self.own_data_ways(pc, name, false) {
+            Some(ways) => !self.stale_ways(pc, &ways),
+            None => self
+                .chain_ways(pc, name)
+                .is_some_and(|chain| !self.stale_shapes(pc, &chain.shapes)),
+        }
+    }
+
     /// The element site at `pc` lowered on element words, or None for the generic access (an
     /// effect): a generic mark, a key that is no index, or receivers by rule R (the record's where
     /// it holds any, else the in-line set's) other than Arrays and ordinary objects.
@@ -652,9 +665,7 @@ impl Rules<'_> {
             Op::GetProp(name, _)
             | Op::GetMethod(name, _)
             | Op::GetPropThis(name, _)
-            | Op::GetPropLocal(_, name, _) => self
-                .own_data_ways(pc, name, false)
-                .is_some_and(|ways| !self.stale_ways(pc, &ways)),
+            | Op::GetPropLocal(_, name, _) => self.named_load_lowers(pc, name),
             Op::SetProp(name, _)
             | Op::SetPropDrop(name, _)
             | Op::SetPropThisDrop(name, _)

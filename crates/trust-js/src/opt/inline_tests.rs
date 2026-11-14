@@ -1332,3 +1332,7 @@ fn a_sites_later_guard_leaves_its_own_byte_and_the_reoptimization_branches_there
 /// loops and in callers' loops around inlined calls.
 #[path = "typed_loop_inline_tests.rs"]
 mod typed_loop;
+
+/// P3 stage 3 step L2 under TRUST_JS_OPT_INLINE=graph: callees whose loads go through the chain.
+#[path = "chain_inline_tests.rs"]
+mod chain;

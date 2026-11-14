@@ -333,3 +333,28 @@ fn prototypes_of_one_shape_share_a_way_and_the_walk_reads_the_one_it_reaches() {
     assert_eq!(protos(&graph).len(), 1, "{text}");
     assert_eq!(eval(&mut engine, "f(a) * 10 + f(b)"), "12");
 }
+
+#[test]
+fn a_loop_whose_loads_go_through_the_chain_is_free_of_effects() {
+    // The rules lower the walk (Rules::named_load_lowers): the loop keeps its slots' values
+    // through its header, with no reload from the frame and no flush.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function P() { this.v = 1; } P.prototype.k = 5;
+         function sum(o, n) { var s = 0; for (var i = 0; i < n; i++) s = s + o.k; return s; }
+         var p = new P(); for (var i = 0; i < 20; i++) sum(p, 3);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "sum");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(protos(&graph).len(), 1, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(
+            op,
+            NodeOp::FrameSlot(_) | NodeOp::StoreSlot(_)
+        )),
+        0,
+        "{text}"
+    );
+}
