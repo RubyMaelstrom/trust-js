@@ -344,8 +344,9 @@ pub(crate) fn counts_loops() -> bool {
     enabled() && !no_loop_count()
 }
 
-/// The last-seen element bytes a template compile of `chunk` stores its in-line typed-array hits
-/// to (P3 stage 3, rule U; `jit::typed_array::emit`), (pc, byte's address) for each element site
+/// The last-seen element bytes a template compile of `chunk` stores its in-line element hits to
+/// (P3 stage 3, rule U; `jit::typed_array::emit`, `jit::emit_family_record`), (pc, the address of
+/// its typed byte, the family byte the next) for each element site
 /// that has one, ascending by pc; None where its code records nothing (and for a chunk without
 /// element sites, for which nothing is allocated). With the tier on, where the tier does not refuse the chunk before
 /// its snapshot (over the size limit, resumable), as JSC's baseline emits its profiling only

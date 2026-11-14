@@ -1,9 +1,10 @@
-//! Template code records its in-line typed-array hits with the optimizing tier on (P3 stage 3,
-//! rule U): each element form's typed arm stores the view's native kind in its site's last-seen
-//! byte (`typed_array::emit`, `opt::element_records`), which the tier's readers merge into the
-//! element record (`opt::profile::merge_element_hits`), as JSC's baseline stores an access's
-//! structure in its ArrayProfile (jit/JITInlines.h:328-348) and computeUpdatedPrediction merges
-//! it (bytecode/ArrayProfile.cpp:126-136). The tests run template code only (no VM run of a site,
+//! Template code records its in-line element hits with the optimizing tier on (P3 stage 3, rule
+//! U): each element form's typed arm stores the view's native kind in its site's last-seen typed
+//! byte (`typed_array::emit`, `opt::element_records`), and its words path the Array's or ordinary
+//! object's kind tag in its family byte (`emit_family_record`), which the tier's readers merge
+//! into the element record (`opt::profile::merge_element_hits`), as JSC's baseline stores an
+//! access's structure in its ArrayProfile (jit/JITInlines.h:328-348) and computeUpdatedPrediction
+//! merges it (bytecode/ArrayProfile.cpp:126-136). The tests run template code only (no VM run of a site,
 //! no helper miss: its record stays empty until the merge), through the shared stub and, in a
 //! child process under TRUST_JS_JIT_TYPED_STUBS=0, in line; a second stage's hits reach the
 //! baseline site's byte; views the native access declines record no kind; with the tier off no
@@ -299,17 +300,29 @@ fn second_stage_of(engine: &mut Engine, name: &str) -> Option<std::rc::Rc<Chunk>
     user.func.runtime().code2.get().and_then(Option::clone)
 }
 
-/// The recording stores in `code`: its `strb w17, [x16]` words, which only `typed_array::
-/// emit_record` emits.
-fn recording_stores(code: &super::JitCode) -> usize {
-    let store = {
+/// The recording stores in `code` of register `reg`'s byte: `strb w<reg>, [x16]` (and for w12
+/// `[x13]`, a loop chain's), which only `typed_array::emit_record` (w17, the kind) and
+/// `emit_family_record` (w12, the tag) emit.
+fn stores_of(code: &super::JitCode, reg: u32) -> usize {
+    let store = |base: u32| {
         let mut a = super::asm::Asm::new();
-        a.strb_imm(17, 16, 0);
+        a.strb_imm(reg, base, 0);
         a.buf[0]
     };
+    let stores = [store(16), if reg == 12 { store(13) } else { store(16) }];
     // SAFETY: the code's `len` bytes are mapped and readable while `code` lives.
     let words = unsafe { std::slice::from_raw_parts(code.mem as *const u32, code.len / 4) };
-    words.iter().filter(|&&word| word == store).count()
+    words.iter().filter(|&&word| stores.contains(&word)).count()
+}
+
+/// The typed hits' recording stores in `code`.
+fn recording_stores(code: &super::JitCode) -> usize {
+    stores_of(code, 17)
+}
+
+/// The words paths' recording stores in `code`.
+fn family_stores(code: &super::JitCode) -> usize {
+    stores_of(code, 12)
 }
 
 #[test]
@@ -334,12 +347,17 @@ fn with_the_tier_off_template_code_records_nothing() {
                 let pc = pc_of(chunk, which);
                 let code = chunk.jit.get().flatten().expect("native");
                 let stores = recording_stores(&code);
+                let families = family_stores(&code);
                 assert_eq!(crate::opt::element_records(chunk).is_some(), on, "{name}");
                 if on {
                     assert!(stores >= 1, "{name}: the tier on records");
+                    assert!(
+                        families >= 1 || name == "rn" || name == "wn",
+                        "{name}: a words path records"
+                    );
                     assert_eq!(seen(chunk, pc).0, 5, "{name}");
                 } else {
-                    assert_eq!(stores, 0, "{name}: no recording word");
+                    assert_eq!(stores + families, 0, "{name}: no recording word");
                     assert!(
                         ChunkProfile::get(chunk).is_none_or(|p| p.element_seen(pc) == UNSEEN),
                         "{name}: no byte"
@@ -447,6 +465,17 @@ fn a_second_stages_hits_reach_the_baseline_sites_bytes() {
             .is_none_or(|p| (0..second.jit_ops().len()).all(|pc| p.element_seen(pc) == UNSEEN)),
         "nothing in the second stage's own bytes"
     );
+    // Arrays, which the second stage's words paths take (its loop is a register region): both
+    // sites' family bytes hold the Array's tag.
+    eval(
+        &mut engine,
+        "var wa = [1, 2, 3, 4], wb = [5, 6, 7, 8]; outer(wa, wb, 4)",
+    );
+    for &(baseline, pc) in &targets {
+        // SAFETY: the map holds the baseline chunks while `second` lives.
+        let tag = ChunkProfile::get(unsafe { &*baseline }).map_or(UNSEEN, |p| p.family_seen(pc));
+        assert_eq!(tag, crate::value::KIND_ARRAY_TAG, "pc {pc}: an Array's tag");
+    }
 }
 
 #[test]
@@ -474,6 +503,90 @@ fn the_fused_name_element_site_records_at_its_own_hit() {
             let code = chunk.jit.get().flatten().expect("native");
             assert_eq!(recording_stores(&code), 3, "{name}: the fused site's store");
             assert_eq!(seen(chunk, pc_of(chunk, *which)), (2, 0), "{name}");
+        });
+    }
+}
+
+/// The receivers whose element words the words paths take: an Array, and an ordinary object with
+/// elements.
+const FAMILIES: [(&str, &str, bool); 2] = [
+    ("an Array", "[0, 1, 2, 3, 4, 5, 6, 7]", true),
+    (
+        "an object",
+        "{0: 0, 1: 1, 2: 2, 3: 3, 4: 4, 5: 5, 6: 6, 7: 7}",
+        false,
+    ),
+];
+
+#[test]
+fn words_path_hits_record_the_receivers_family_in_every_element_form() {
+    // An Array's and an ordinary object's in-line element hits store their kind tag in the
+    // site's family byte, none in its typed byte; the merge makes the record an Array or an
+    // ordinary receiver with an index key. The fused name-element site has no words path: its
+    // binding holding an Array, the access runs in its fallback's plain templates, which record.
+    use crate::feedback::{ELEM_ARRAY, ELEM_ORDINARY};
+    crate::opt::pin_forced_exits_off_for_test();
+    for (what, literal, array) in FAMILIES {
+        let mut engine = engine(tier_on());
+        eval(
+            &mut engine,
+            &format!(
+                "var view = {literal}; var named = {literal}; var holder = {{t: view}};                  {FORMS} {LOOPS}"
+            ),
+        );
+        for &(name, call, which) in CALLS.iter().chain(&LOOP_CALLS) {
+            template_only(&mut engine, name, call);
+            with_chunk(&mut engine, name, |chunk| {
+                let pc = pc_of(chunk, which);
+                let profile = ChunkProfile::get(chunk).expect("the bytes");
+                let tag = profile.family_seen(pc);
+                assert_ne!(tag, UNSEEN, "{name} on {what}: the family byte");
+                assert_eq!(
+                    tag == crate::value::KIND_ARRAY_TAG,
+                    array,
+                    "{name} on {what}"
+                );
+                assert_eq!(seen(chunk, pc), (UNSEEN, 0), "{name} on {what}");
+                profile::merge_element_hits(chunk);
+                let family = if array { ELEM_ARRAY } else { ELEM_ORDINARY };
+                assert_eq!(
+                    chunk.feedback_vector().record_word(pc),
+                    family | ELEM_KEY_INDEX,
+                    "{name} on {what}: merged"
+                );
+                assert_eq!(profile.family_seen(pc), UNSEEN, "{name} on {what}: emptied");
+            });
+        }
+    }
+}
+
+#[test]
+fn a_chains_later_accesses_of_a_receiver_record_its_family() {
+    // A numeric chain validates a receiver at its first access and keeps it in a register for
+    // the next ones, whose family store reloads the tag.
+    crate::opt::pin_forced_exits_off_for_test();
+    for (what, literal, array) in FAMILIES {
+        let mut engine = engine(tier_on());
+        eval(
+            &mut engine,
+            &format!("var view = {literal}; function two(t, k) {{ return t[k] + t[k + 1]; }}"),
+        );
+        template_only(&mut engine, "two", "two(view, 1)");
+        with_chunk(&mut engine, "two", |chunk| {
+            let code = chunk.jit.get().flatten().expect("native");
+            assert!(family_stores(&code) >= 2, "{what}: both sites record");
+            let profile = ChunkProfile::get(chunk).expect("the bytes");
+            for pc in (0..chunk.jit_ops().len())
+                .filter(|&pc| matches!(chunk.jit_ops()[pc], Op::GetElemLocal(_)))
+            {
+                let tag = profile.family_seen(pc);
+                assert_ne!(tag, UNSEEN, "{what}: pc {pc}");
+                assert_eq!(
+                    tag == crate::value::KIND_ARRAY_TAG,
+                    array,
+                    "{what}: pc {pc}"
+                );
+            }
         });
     }
 }

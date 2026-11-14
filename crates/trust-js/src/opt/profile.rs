@@ -25,10 +25,11 @@
 //!   nothing), and that template code, kept as the fallback a discard returns to.
 //! - The tier's loop limit (P3 stage 2, step 13): whether its warm-up is armed on the chunk's
 //!   loop word.
-//! - Template code's last-seen element kinds (P3 stage 3, rule U): one byte per pc, which the
-//!   template JIT's in-line typed-array hits store and the tier's readers merge into the element
-//!   records ([`merge_element_hits`]), as JSC's baseline stores a last-seen structure into an
-//!   access's ArrayProfile (jit/JITInlines.h:328-348) and computeUpdatedPrediction merges it
+//! - Template code's last-seen element receivers (P3 stage 3, rule U): two bytes per pc, which
+//!   the template JIT's in-line element hits store (a typed array's native kind, an Array's or an
+//!   ordinary object's kind tag) and the tier's readers merge into the element records
+//!   ([`merge_element_hits`]), as JSC's baseline stores a last-seen structure into an access's
+//!   ArrayProfile (jit/JITInlines.h:328-348) and computeUpdatedPrediction merges it
 //!   (bytecode/ArrayProfile.cpp:126-136).
 //!
 //! Only the tier reads and writes the record (`snapshot`, `driver`; the template JIT's code, with
@@ -46,7 +47,7 @@ use crate::bytecode::Chunk;
 use std::cell::{Cell, OnceCell, RefCell};
 
 /// A last-seen byte no in-line access stored since the last merge (rule U): no native kind is
-/// 0xff (native_typed_array.rs: Uint8 0 .. Uint8Clamped 8).
+/// 0xff (native_typed_array.rs: Uint8 0 .. Uint8Clamped 8), and no kind tag (value.rs: below 64).
 pub(crate) const UNSEEN: u8 = 0xff;
 
 /// The most discards R counts: the warm-up's longest distance, the 6,400 invocations << R to its
@@ -99,12 +100,15 @@ pub(crate) struct ChunkProfile {
     /// loop's crossing, until the words' other uses set them (`Chunk::set_inline_retry_at`) or an
     /// entry takes the check (`opt::loop_limit_due`).
     loop_armed: Cell<bool>,
-    /// Template code's last-seen element kinds (P3 stage 3, rule U), one byte per pc, made by the
-    /// first template compile that records into them ([`ChunkProfile::element_byte`]): [`UNSEEN`],
-    /// or the native kind of the typed-array view an in-line access of the site served last
-    /// (`jit::typed_array::emit`), JSC's ArrayProfile::m_lastSeenStructureID
-    /// (bytecode/ArrayProfile.h:245-246). A kind, never a pointer: nothing the collector reads.
-    /// The bytes never move: generated code stores to their addresses.
+    /// Template code's last-seen element receivers (P3 stage 3, rule U), two bytes per pc (`2 pc`
+    /// and `2 pc + 1`), made by the first template compile that records into them
+    /// ([`ChunkProfile::element_byte`]), JSC's ArrayProfile::m_lastSeenStructureID
+    /// (bytecode/ArrayProfile.h:245-246): the first [`UNSEEN`] or the native kind of the
+    /// typed-array view an in-line access of the site served last (`jit::typed_array::emit`), the
+    /// second [`UNSEEN`] or the kind tag of the Array or other ordinary object whose element words
+    /// an in-line access of the site took last (`jit::emit_family_record`). Kinds and tags, never
+    /// a pointer: nothing the collector reads. The bytes never move: generated code stores to
+    /// their addresses.
     elements: OnceCell<Box<[Cell<u8>]>>,
 }
 
@@ -268,31 +272,51 @@ impl ChunkProfile {
         self.loop_armed.set(armed);
     }
 
-    /// The address of `pc`'s last-seen element byte in a chunk of `len` operations, the bytes made
-    /// [`UNSEEN`] at the first ask (main thread: a template compile that records, rule U); None
-    /// past the chunk. Generated code stores a kind there (`jit::typed_array::emit`).
+    /// The address of `pc`'s last-seen typed-kind byte in a chunk of `len` operations, its family
+    /// byte the next (see the `elements` field), the bytes made [`UNSEEN`] at the first ask (main
+    /// thread: a template compile that records, rule U); None past the chunk. Generated code
+    /// stores a kind there (`jit::typed_array::emit`) and a tag in the next
+    /// (`jit::emit_family_record`).
     pub(crate) fn element_byte(&self, len: usize, pc: usize) -> Option<u64> {
         let bytes = self
             .elements
-            .get_or_init(|| (0..len).map(|_| Cell::new(UNSEEN)).collect());
-        bytes.get(pc).map(|byte| byte.as_ptr() as u64)
+            .get_or_init(|| (0..2 * len).map(|_| Cell::new(UNSEEN)).collect());
+        bytes.get(2 * pc).map(|byte| byte.as_ptr() as u64)
     }
 
-    /// `pc`'s last-seen element byte ([`UNSEEN`] where none was made: tests).
+    /// `pc`'s last-seen typed-kind byte ([`UNSEEN`] where none was made: tests).
     #[cfg(test)]
     pub(crate) fn element_seen(&self, pc: usize) -> u8 {
+        self.seen_byte(2 * pc)
+    }
+
+    /// `pc`'s last-seen family byte, a kind tag ([`UNSEEN`] where none was made: tests).
+    #[cfg(test)]
+    pub(crate) fn family_seen(&self, pc: usize) -> u8 {
+        self.seen_byte(2 * pc + 1)
+    }
+
+    #[cfg(test)]
+    fn seen_byte(&self, at: usize) -> u8 {
         self.elements
             .get()
-            .and_then(|bytes| bytes.get(pc))
+            .and_then(|bytes| bytes.get(at))
             .map_or(UNSEEN, Cell::get)
     }
 
-    /// Store `kind` in `pc`'s last-seen element byte of a chunk of `len` operations, as template
-    /// code's hit does (tests: the builder's, where no template code runs).
+    /// Store `kind` in `pc`'s last-seen typed-kind byte of a chunk of `len` operations, as
+    /// template code's hit does (tests: the builder's, where no template code runs).
     #[cfg(test)]
     pub(crate) fn see_element(&self, len: usize, pc: usize, kind: u8) {
         self.element_byte(len, pc).expect("a pc of the chunk");
-        self.elements.get().expect("made")[pc].set(kind);
+        self.elements.get().expect("made")[2 * pc].set(kind);
+    }
+
+    /// Store the kind tag `tag` in `pc`'s last-seen family byte (tests, as [`see_element`]).
+    #[cfg(test)]
+    pub(crate) fn see_family(&self, len: usize, pc: usize, tag: u8) {
+        self.element_byte(len, pc).expect("a pc of the chunk");
+        self.elements.get().expect("made")[2 * pc + 1].set(tag);
     }
 
     /// Heap bytes the record holds (the memory census), the kept code's own bytes left to
@@ -310,12 +334,13 @@ impl ChunkProfile {
     }
 }
 
-/// Merge template code's last-seen element kinds into the element records the tier reads of
+/// Merge template code's last-seen element receivers into the element records the tier reads of
 /// `chunk` (P3 stage 3, rule U): its own, and for a transformed chunk those of each baseline
-/// chunk its record map names, where its code's hits stored (`opt::element_records`). Each byte
-/// that holds a kind ORs a typed array of that kind with an index key (the in-line access's) into
-/// its site's record through `FeedbackVector::record`, the record's one writer, and is reset to
-/// [`UNSEEN`], as JSC's ArrayProfile::computeUpdatedPrediction ORs its last-seen structure into
+/// chunk its record map names, where its code's hits stored (`opt::element_records`). A typed
+/// byte that holds a kind ORs a typed array of that kind, a family byte that holds a tag an Array
+/// (`KIND_ARRAY_TAG`) or another ordinary object, each with an index key (the in-line access's),
+/// into its site's record through `FeedbackVector::record`, the record's one writer, and is reset
+/// to [`UNSEEN`], as JSC's ArrayProfile::computeUpdatedPrediction ORs its last-seen structure into
 /// the observed array modes and clears it (bytecode/ArrayProfile.cpp:126-136): a record that holds
 /// more (another kind, other receivers, a String key, the generic mark) keeps all of it. JSC's
 /// first-run pruning (:137-140, the first merge's modes cut to the last-seen one) is not taken:
@@ -334,18 +359,29 @@ pub(crate) fn merge_element_hits(chunk: &Chunk) {
 
 /// [`merge_element_hits`] of `chunk`'s own bytes.
 fn merge_own_element_hits(chunk: &Chunk) {
-    use crate::feedback::{elem_typed_kind, ELEM_KEY_INDEX, ELEM_TYPED_ARRAY};
+    use crate::feedback::{
+        elem_typed_kind, ELEM_ARRAY, ELEM_KEY_INDEX, ELEM_ORDINARY, ELEM_TYPED_ARRAY,
+    };
     let Some(bytes) = ChunkProfile::get(chunk).and_then(|profile| profile.elements.get()) else {
         return;
     };
     let feedback = chunk.feedback_vector();
-    for (pc, byte) in bytes.iter().enumerate() {
-        let kind = byte.replace(UNSEEN);
+    for (pc, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let kind = pair[0].replace(UNSEEN);
         if kind != UNSEEN {
             feedback.record(
                 pc,
                 ELEM_TYPED_ARRAY | ELEM_KEY_INDEX | elem_typed_kind(kind),
             );
+        }
+        let tag = pair[1].replace(UNSEEN);
+        if tag != UNSEEN {
+            let family = if tag == crate::value::KIND_ARRAY_TAG {
+                ELEM_ARRAY
+            } else {
+                ELEM_ORDINARY
+            };
+            feedback.record(pc, family | ELEM_KEY_INDEX);
         }
     }
 }

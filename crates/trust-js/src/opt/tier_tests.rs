@@ -542,19 +542,25 @@ fn typed_arrays_seen_only_by_template_code_run_in_line_in_the_tiers_code() {
 
 #[test]
 fn sites_whose_last_seen_kind_misled_the_compile_settle() {
-    // P3 stage 3, rule U: two typed kinds alternating at a site, and an Array alternating with a
-    // typed array, seen by template code alone before the compile, which may have sampled one
-    // typed kind: the kind check exits, the VM records the other receiver, and the recompile
-    // takes the access the exit profile allows (the generic one where WrongElements exited, as
-    // JSC's DFG makes a site of several modes Generic, dfg/DFGArrayMode.cpp:155-158), after the
-    // exits the limits allow; the exits then stop and the results are the VM's.
-    for (what, other) in [
-        ("two kinds", "new Float64Array(8)"),
-        ("an Array", "[1, 2, 3, 4, 5, 6, 7, 8]"),
+    // P3 stage 3, rule U: two typed kinds alternating at a site, an Array alternating with a
+    // typed array, and an Array with an ordinary object, seen by template code alone before the
+    // compile, which may have sampled one of them: the kind check exits, the VM records the
+    // other receiver, and the recompile takes the access the exit profile allows (the generic one
+    // where WrongElements exited, as JSC's DFG makes a site of several modes Generic,
+    // dfg/DFGArrayMode.cpp:155-158), after the exits the limits allow; the exits then stop and
+    // the results are the VM's.
+    for (what, first, other) in [
+        ("two kinds", "new Int32Array(8)", "new Float64Array(8)"),
+        ("an Array", "new Int32Array(8)", "[1, 2, 3, 4, 5, 6, 7, 8]"),
+        (
+            "an Array and an object",
+            "[1, 2, 3, 4, 5, 6, 7, 8]",
+            "{0: 1, 1: 2, 2: 3, 3: 4, 4: 5, 5: 6, 6: 7, 7: 8}",
+        ),
     ] {
         let source = format!(
             "function at(t, i) {{ return t[i]; }} function put(t, i, v) {{ t[i] = v; }}
-             var a = new Int32Array(8), b = {other};
+             var a = {first}, b = {other};
              function run(n) {{ var s = 0; for (var k = 0; k < n; k++) {{
                var t = (k >> 4) & 1 ? a : b; put(t, k & 7, k & 1023); s = (s + at(t, (k + 1) & 7)) % 1000003; }}
                return s; }}"
@@ -590,6 +596,60 @@ fn sites_whose_last_seen_kind_misled_the_compile_settle() {
                 discards(&chunk)
             );
         }
+    }
+}
+
+#[test]
+fn arrays_seen_only_by_template_code_drop_the_kind_branch_in_the_tiers_code() {
+    // P3 stage 3, rule U: an Array site and an ordinary object's, warmed in template code alone:
+    // their in-line hits' families, merged, make the tier's access the element words with no
+    // kind branch and no stub call, and the VM's results.
+    const WORDS: &str = "function sumA(a) { let s = 0; for (let i = 0; i < 16; i++) s += a[i]; \
+         return s; }\n\
+         function bumpO(o) { for (let i = 0; i < 4; i++) o[i] = o[i] + 1; return o[3]; }\n\
+         const arr = []; for (let i = 0; i < 16; i++) arr.push(i * 0.5);\n\
+         const obj = {0: 1, 1: 2, 2: 3, 3: 4};\n\
+         for (let k = 0; k < 3; k++) { sumA(arr); bumpO(obj); }";
+    const RUN: &str = "let t = 0; for (let k = 0; k < 3000; k++) { \
+         t = (t + sumA(arr) + bumpO(obj)) % 1000003; } t";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, WORDS);
+        eval(&mut vm, RUN)
+    };
+    use super::ir::{ElemKind, NodeOp};
+    eager().set();
+    let mut engine = jit_engine();
+    eval(&mut engine, WORDS);
+    compiled();
+    exits();
+    assert_eq!(eval(&mut engine, RUN), expected);
+    assert!(exits().is_empty(), "the speculation held");
+    let tier = compiled();
+    for (name, kind) in [("sumA", ElemKind::Array), ("bumpO", ElemKind::Words)] {
+        let chunk =
+            tier_chunk(&mut engine, name).unwrap_or_else(|| panic!("{name}: the tier's chunk"));
+        assert!(
+            tier.contains(&address(&chunk)),
+            "{name}: the tier compiled it"
+        );
+        let graph = graph_now(&chunk);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .any(|node| node.op == NodeOp::CheckElements(kind)),
+            "{name}"
+        );
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .all(|node| !matches!(node.op, NodeOp::TypedElement { .. } | NodeOp::IsTypedArray)),
+            "{name}: no kind branch"
+        );
     }
 }
 

@@ -2473,6 +2473,62 @@ fn a_kind_template_code_saw_last_lowers_its_site_in_line_and_a_wider_record_stay
 }
 
 #[test]
+fn a_family_template_code_saw_last_drops_the_kind_branch() {
+    // P3 stage 3, rule U: an empty record whose family byte holds an Array's tag (template code's
+    // words-path hit) reads once merged as Arrays alone: the element words with an Array's kind
+    // check, no IsTypedArray, no stub; an ordinary object's tag, as words of either; a typed kind
+    // and an Array's tag both seen, the kind branch.
+    use super::profile::{ChunkProfile, UNSEEN};
+    let mut engine = vm_engine(
+        "function arr(a, i, go) { if (go) return a[i]; return 0; }
+         function obj(o, i, go) { if (go) return o[i]; return 0; }
+         function both(o, i, go) { if (go) return o[i]; return 0; }
+         for (var k = 0; k < 20; k++) { arr(null, 1, false); obj(null, 1, false); both(null, 1, false); }",
+    );
+    let load = |op: &Op| matches!(op, Op::GetElemLocal(_));
+    let array_tag = crate::value::KIND_ARRAY_TAG;
+    for (name, tag, typed, kind) in [
+        ("arr", array_tag, None, Some(ElemKind::Array)),
+        ("obj", 0, None, Some(ElemKind::Words)),
+        ("both", array_tag, Some(TypedKind::I32), None),
+    ] {
+        let chunk = chunk_of(&mut engine, name);
+        let pc = pc_of(&chunk, load);
+        assert_eq!(
+            chunk.feedback_vector().record_word(pc),
+            0,
+            "{name}: never ran"
+        );
+        let profile = ChunkProfile::of(&chunk);
+        profile.see_family(chunk.jit_ops().len(), pc, tag);
+        if let Some(typed) = typed {
+            profile.see_element(chunk.jit_ops().len(), pc, typed as u8);
+        }
+        let graph = graph_for(&chunk, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        let branch = count(&graph, |op| *op == NodeOp::IsTypedArray);
+        match kind {
+            Some(kind) => {
+                assert_eq!(branch, 0, "{name}: {text}");
+                assert_eq!(
+                    count(&graph, |op| *op == NodeOp::CheckElements(kind)),
+                    1,
+                    "{name}: {text}"
+                );
+                assert_eq!(
+                    count(&graph, |op| matches!(op, NodeOp::TypedElement { .. })),
+                    0,
+                    "{name}: {text}"
+                );
+            }
+            None => assert_eq!(branch, 1, "{name}: {text}"),
+        }
+        assert_eq!(profile.family_seen(pc), UNSEEN, "{name}: emptied");
+    }
+}
+
+#[test]
 fn a_last_seen_kind_changes_the_fingerprint_once() {
     // The settled-feedback rule merges before it compares (JSC merges at every tier-up check):
     // a kind template code saw since the last checkpoint changes the fingerprint; seen again, it

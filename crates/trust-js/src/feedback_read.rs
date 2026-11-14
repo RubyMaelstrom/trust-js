@@ -7,8 +7,8 @@
 //! Which parts are exact and which are hints, and when a view goes stale:
 //! - values and elements: rule U (the record together with the operation's in-line set) is
 //!   complete; the record alone is exact for what it holds, and its int32/double split and an
-//!   Array's facts are hints (the in-line paths record nothing, but for ARM64's typed-array
-//!   accesses with the optimizing tier on, whose last-seen kinds the tier merges before it reads:
+//!   Array's facts are hints (the in-line paths record nothing, but for ARM64's element accesses
+//!   with the optimizing tier on, whose last-seen receivers the tier merges before it reads:
 //!   feedback-schema.txt 5.2);
 //! - named ways: exact when read, each a proof generated code re-validates (shapes are never
 //!   reused); a way may name a shape no live object has any more;
@@ -122,8 +122,8 @@ pub(crate) struct ElementView {
 }
 
 impl ElementView {
-    /// Whether a VM execution, a miss or (the tier on) a merge of template code's in-line
-    /// typed-array hits wrote the record.
+    /// Whether a VM execution, a miss or (the tier on) a merge of template code's in-line hits
+    /// wrote the record.
     pub(crate) fn has_record(&self) -> bool {
         self.recorded_receivers | self.recorded_keys != 0
     }

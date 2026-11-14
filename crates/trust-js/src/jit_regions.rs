@@ -3535,10 +3535,12 @@ pub(super) fn emit(
                     // A typed array's view is read with its tag still in w12.
                     a.ldrb_imm(13, 11, layout.obj_flags as u32);
                     a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
+                    // The receiver's family, w12 its tag (rule U).
+                    let record = a.element_record(pc as u32);
+                    emit_family_record(a, record, 16);
                     emit_word_read(a, layout, 11, 9, 12, bailout);
                     a.b(read);
                     a.bind(typed);
-                    let record = a.element_record(pc as u32);
                     typed_array::emit(
                         a,
                         layout,
@@ -3592,6 +3594,9 @@ pub(super) fn emit(
                     // A typed array's view is read with its tag still in w12.
                     a.ldrb_imm(13, 11, layout.obj_flags as u32);
                     a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
+                    // The receiver's family, w12 its tag (rule U).
+                    let record = a.element_record(pc as u32);
+                    emit_family_record(a, record, 16);
                     emit_words_base(a, layout, 11, 15, 14);
                     a.cmp_reg_x(9, 14);
                     a.b_cond(C_HS, bailout);
@@ -3611,7 +3616,6 @@ pub(super) fn emit(
                     a.b(stored);
                     a.bind(typed);
                     a.fmov_d_d(1, value);
-                    let record = a.element_record(pc as u32);
                     typed_array::emit(
                         a,
                         layout,

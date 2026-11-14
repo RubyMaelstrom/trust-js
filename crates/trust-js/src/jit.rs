@@ -3369,11 +3369,12 @@ mod asm {
         /// The native runs an iteration of each loop counts, by its header's pc (P3 stage 2,
         /// step 11; `opt::loop_weight`): set with `loop_counts`, empty where no loop counts.
         loop_weights: Vec<u8>,
-        /// Each element site's pc and the address of its last-seen byte, ascending by pc, where
-        /// the code records its in-line typed-array hits (P3 stage 3, rule U;
-        /// `opt::element_records`, `super::typed_array::emit`): a chunk's template code with the
-        /// optimizing tier on. Empty in code that records nothing: the tier off, the tier's own
-        /// code, shared stubs and loose test assemblies.
+        /// Each element site's pc and the address of its last-seen typed byte (its family byte
+        /// the next), ascending by pc, where the code records its in-line element hits (P3 stage
+        /// 3, rule U; `opt::element_records`, `super::typed_array::emit`,
+        /// `super::emit_family_record`): a chunk's template code with the optimizing tier on.
+        /// Empty in code that records nothing: the tier off, the tier's own code, shared stubs
+        /// and loose test assemblies.
         element_records: Vec<(u32, u64)>,
     }
 
@@ -3561,7 +3562,7 @@ mod asm {
             self.element_records = records;
         }
         /// The address of the last-seen byte of the element site at `pc`, where the code records
-        /// its in-line typed-array hits (see the `element_records` field).
+        /// its in-line element hits (see the `element_records` field).
         pub fn element_record(&self, pc: u32) -> Option<u64> {
             self.element_records
                 .binary_search_by_key(&pc, |&(at, _)| at)
@@ -6051,9 +6052,10 @@ fn compile_entry(
             a.set_loop_counts(runs as u32, word as u32, checkpoint as u32);
         }
     }
-    // P3 stage 3, rule U: with the optimizing tier on, the code's in-line typed-array hits store
-    // their view's kind in their site's last-seen byte (`typed_array::emit`), which the tier's
-    // readers merge into the element record; the tier off, it is emitted as before.
+    // P3 stage 3, rule U: with the optimizing tier on, the code's in-line element hits store their
+    // receiver's kind in their site's last-seen bytes (`typed_array::emit`, `emit_family_record`),
+    // which the tier's readers merge into the element record; the tier off, it is emitted as
+    // before.
     if let Some(records) = crate::opt::element_records(chunk) {
         a.set_element_records(records);
     }
@@ -7763,6 +7765,25 @@ fn guard_exotic_ordinary_or_array(
     const _: () = assert!(crate::value::KIND_ARRAY_TAG == crate::value::KIND_ORDINARY_LAST + 1);
     a.cmp_imm_w(reg, crate::value::KIND_ARRAY_TAG as u32);
     a.b_cond(C_HI, miss);
+}
+
+/// On an element template's words path, W12 the receiver's kind tag (an Array's or another
+/// ordinary object's, `guard_exotic_ordinary_or_array` passed and `ic_plain` set): store it in the
+/// site's last-seen family byte, the one after its typed byte at `record` (P3 stage 3, rule U;
+/// `opt::profile::ChunkProfile`'s `elements`), which the optimizing tier merges into the element
+/// record as an Array or an ordinary receiver, as JSC's baseline stores every access's structure in
+/// its ArrayProfile (jit/JITInlines.h:328-348). Nothing where the code records nothing. Before the
+/// access, as JSC records before its access. Clobbers x`scratch` (X16 but in a loop chain, whose
+/// receivers live in X16 and X17).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_family_record(a: &mut asm::Asm, record: Option<u64>, scratch: u32) {
+    if let Some(byte) = record {
+        a.mov_imm64(scratch, byte + 1);
+        a.strb_imm(12, scratch, 0);
+    }
 }
 
 /// Branch to `miss` unless the kind tag already loaded in `reg` is ordinary
@@ -18772,7 +18793,9 @@ fn emit_get_elem_inline_marked(
     a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
     // 5. element words: a plain element's value in one indexed load, with no index string or
     // entry-table chase (x9's upper bits are zero from the w-form fcvtzu); a hole is absent and
-    // consults the prototype chain.
+    // consults the prototype chain. The receiver's family first, w12 its tag (rule U).
+    let record = a.element_record(pc);
+    emit_family_record(a, record, 16);
     emit_word_read(a, layout, 11, 9, 12, slow);
     // --- commit: everything validated; from here only writes ---
     a.bind(hit);
@@ -18781,7 +18804,6 @@ fn emit_get_elem_inline_marked(
     a.sub_imm(20, 20, 8);
     a.b(done);
     a.bind(typed);
-    let record = a.element_record(pc);
     typed_array::emit(
         a,
         layout,
@@ -18855,11 +18877,13 @@ fn emit_set_elem_inline_marked(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(13, 11, plain);
     a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
-    // 5. element words: any value over an existing element, into a hole, or appended
+    // 5. element words: any value over an existing element, into a hole, or appended; the
+    // receiver's family first, w12 its tag (rule U)
+    let record = a.element_record(pc);
+    emit_family_record(a, record, 16);
     emit_word_store(a, layout, slow, done, true, keep);
     a.bind(typed);
     let typed_hit = a.new_label();
-    let record = a.element_record(pc);
     typed_array::emit(
         a,
         layout,
@@ -19671,6 +19695,10 @@ fn emit_elem_local_keyed(
     guard_exotic_ordinary_or_array(a, layout, 12, 13, slow);
     a.ldrb_imm(13, 11, plain);
     a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
+    // The element operation is the last of the fused ones; its receiver's family, w12 its tag
+    // (rule U).
+    let record = pcs.last().and_then(|&pc| a.element_record(pc));
+    emit_family_record(a, record, 16);
     // 5. element words: a read copies a plain element's value; a store writes any value over
     // an existing element, into a hole, or appended ([`emit_word_store`]).
     if get {
@@ -19700,8 +19728,6 @@ fn emit_elem_local_keyed(
         emit_word_store(a, layout, slow, done, false, kind == ElemLocalKind::SetKeep);
     }
     a.bind(typed);
-    // The element operation is the last of the fused ones.
-    let record = pcs.last().and_then(|&pc| a.element_record(pc));
     if get {
         typed_array::emit(
             a,
@@ -20857,11 +20883,17 @@ fn emit_chain_marked(
                 let typed = a.new_label();
                 let typed_hit = a.new_label();
                 let cached = rcache.iter().position(|c| c.off == xoff);
+                let record = a.element_record(*pc as u32);
                 match cached {
                     Some(k) => {
                         a.mov(11, rcache[k].base);
                         a.ldrb_imm(12, 11, plain);
                         a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
+                        // The receiver's family (rule U): its tag, which its first access checked.
+                        if record.is_some() {
+                            a.ldrb_imm(12, 11, ex);
+                        }
+                        emit_family_record(a, record, 16);
                     }
                     None => {
                         // First access to this receiver in the chain: validate once.
@@ -20875,6 +20907,8 @@ fn emit_chain_marked(
                         // still in w12.
                         a.ldrb_imm(13, 11, plain);
                         a.tbz(13, flag_bit(crate::value::FLAG_IC_PLAIN), typed);
+                        // The receiver's family, w12 its tag (rule U).
+                        emit_family_record(a, record, 16);
                         if let Some(base) = rfree.pop() {
                             a.mov(base, 11);
                             rcache.push(RcEnt { off: xoff, base });
@@ -20926,7 +20960,6 @@ fn emit_chain_marked(
                     // A cached receiver's kind was checked by its first access, not here.
                     a.ldrb_imm(12, 11, ex);
                 }
-                let record = a.element_record(*pc as u32);
                 typed_array::emit(
                     a,
                     layout,
@@ -22806,6 +22839,24 @@ fn emit_loop_chain(
         guard_exotic_ordinary_or_array(a, layout, 12, 13, pre_fail);
         a.ldrb_imm(12, r, plain);
         a.tbz(12, flag_bit(crate::value::FLAG_IC_PLAIN), pre_fail);
+        // The receiver's family, once a loop entry, for each element site the chain has on it
+        // (rule U): its tag in w12, which the words' proof below writes before it reads.
+        let sites: Vec<u64> = plan
+            .chain
+            .iter()
+            .filter_map(|(op, pc)| match op {
+                ChainOp::GetElem(xoff) | ChainOp::SetElem(xoff, _) if *xoff == rp.off => {
+                    a.element_record(*pc as u32)
+                }
+                _ => None,
+            })
+            .collect();
+        if !sites.is_empty() {
+            a.ldrb_imm(12, r, ex);
+            for byte in sites {
+                emit_family_record(a, Some(byte), 13);
+            }
+        }
         if rp.words {
             // The element words must be in use, every one a Number with no hole, and (for
             // int-read receivers) an exact int32: element reads become bounds + one indexed
