@@ -746,6 +746,18 @@ enum Cold {
         dst: u32,
         resume: usize,
     },
+    /// A test node's object its in-line code does not decide (P3 stage 3 step L1: one that may be
+    /// [[IsHTMLDDA]], a proxy): `helper(ctx, word, arg)`, which runs no JavaScript, allocates
+    /// nothing and does not collect, its 0 or 1 to `dst`.
+    TestCall {
+        label: usize,
+        node: NodeIx,
+        word: u32,
+        dst: u32,
+        resume: usize,
+        helper: u64,
+        arg: u64,
+    },
     /// The moves of an edge into a merge from a block with two successors.
     Edge {
         label: usize,
@@ -1058,6 +1070,37 @@ impl<'a> Gen<'a> {
 unsafe extern "C" fn to_boolean(ctx: *mut JitCtx, word: u64) -> u64 {
     let i = unsafe { &*(*ctx).interp };
     u64::from(i.to_boolean(&unsafe { crate::value::Value::from_bits(word) }))
+}
+
+/// NullOrLikeUndefined's cold path (P3 stage 3 step L1): whether the object `word`, whose
+/// ic_plain is clear, is the [[IsHTMLDDA]] object. It runs no JavaScript, allocates nothing and
+/// does not collect.
+unsafe extern "C" fn emulates_undefined(ctx: *mut JitCtx, word: u64, _: u64) -> u64 {
+    let i = unsafe { &*(*ctx).interp };
+    u64::from(i.is_htmldda(&unsafe { crate::value::Value::from_bits(word) }))
+}
+
+/// TypeofIs's cold path (P3 stage 3 step L1): the interpreter's typeof_matches of `word` for
+/// the test whose discriminant is `test` (a proxy's callability is a field of it; an object
+/// that may be [[IsHTMLDDA]] is looked up). It runs no JavaScript, allocates nothing and does
+/// not collect.
+unsafe extern "C" fn typeof_matches(ctx: *mut JitCtx, word: u64, test: u64) -> u64 {
+    use crate::value::TypeofTest;
+    let i = unsafe { &*(*ctx).interp };
+    let test = [
+        TypeofTest::Undefined,
+        TypeofTest::Boolean,
+        TypeofTest::Number,
+        TypeofTest::BigInt,
+        TypeofTest::String,
+        TypeofTest::Symbol,
+        TypeofTest::Object,
+        TypeofTest::Function,
+    ]
+    .into_iter()
+    .find(|&t| u64::from(t as u8) == test)
+    .unwrap_or(TypeofTest::Never);
+    u64::from(i.typeof_matches(&unsafe { crate::value::Value::from_bits(word) }, test))
 }
 
 extern "C" fn f64_remainder(dividend: f64, divisor: f64) -> f64 {
@@ -2262,6 +2305,24 @@ impl Gen<'_> {
                     self.gp_done(n, w);
                 }
             }
+            NodeOp::NullOrLikeUndefined => {
+                if !unused {
+                    self.lower_null_or_like_undefined(n);
+                }
+            }
+            NodeOp::TypeofIs(test) => {
+                if !unused {
+                    self.lower_typeof_is(n, *test);
+                }
+            }
+            NodeOp::WordAsF64 => {
+                if !unused {
+                    let word = self.gp(input(0), X16);
+                    let d = self.fp_dst(n);
+                    self.a.fmov_d_x(d, word);
+                    self.fp_done(n, d);
+                }
+            }
             NodeOp::LoadField { location, .. } => {
                 if !unused {
                     let cell = self.gp(input(0), X16);
@@ -3120,6 +3181,28 @@ impl Gen<'_> {
                         self.a.mov_w(dst, X9);
                         self.a.b(resume);
                     }
+                    Cold::TestCall {
+                        label,
+                        node,
+                        word,
+                        dst,
+                        resume,
+                        helper,
+                        arg,
+                    } => {
+                        self.a.bind(label);
+                        let saved = self.save_live_caller_saved(node);
+                        // The word first: it may be in x0 or x2.
+                        self.a.mov(1, word);
+                        self.a.mov(0, 19);
+                        self.a.mov_imm64(2, arg);
+                        self.a.mov_imm64(X16, helper);
+                        self.a.blr(X16);
+                        self.a.mov_w(X9, 0);
+                        self.restore_live_caller_saved(&saved);
+                        self.a.mov_w(dst, X9);
+                        self.a.b(resume);
+                    }
                 }
             }
         }
@@ -3349,6 +3432,170 @@ impl Gen<'_> {
             word,
             dst: w,
             resume: done,
+        });
+        self.gp_done(n, w);
+    }
+
+    /// Branch to `not_object` unless `word` is an object's; otherwise x30 = its object's address
+    /// (the cell plus `obj_from_cell`), for its kind and flag bytes. Clobbers x17 and x30.
+    fn object_or(&mut self, word: u32, not_object: usize) {
+        // The Object tag 0xfff9 is -7 as a signed half.
+        self.a.asr_imm(X17, word, 48);
+        self.a.cmn_imm_x(X17, 7);
+        self.a.b_cond(NE, not_object);
+        self.a.ubfx(X30, word, 0, 48);
+        self.a.add_imm(X30, X30, self.layout.obj_from_cell as u32);
+    }
+
+    /// NullOrLikeUndefined (P3 stage 3 step L1): undefined and null by `tag | 2`, an object whose
+    /// ic_plain is set false, one whose ic_plain is clear by the cold call of
+    /// `Interp::is_htmldda`, any other word false. Each path reads the word before it writes the
+    /// result, which may share its register.
+    fn lower_null_or_like_undefined(&mut self, n: NodeIx) {
+        use crate::value::PACK_NULL;
+        let word = self.gp(self.graph.node(n).inputs[0], X16);
+        let w = self.gp_dst(n);
+        let nullish = self.a.new_label();
+        let no = self.a.new_label();
+        let slow = self.a.new_label();
+        let done = self.a.new_label();
+        // Undefined's and null's tags differ in bit 1 alone: `tag | 2` is null's for both.
+        self.a.lsr_imm(X17, word, 48);
+        let two = asm::logical_imm_w(2).expect("2 is a logical immediate");
+        self.a.logic_imm_w(1, X17, X17, two);
+        self.a.movz(X30, (PACK_NULL >> 48) as u32, 0);
+        self.a.cmp_reg_w(X17, X30);
+        self.a.b_cond(EQ, nullish);
+        self.object_or(word, no);
+        self.a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+        self.a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+        self.a.bind(no);
+        self.a.movz(w, 0, 0);
+        self.a.b(done);
+        self.a.bind(nullish);
+        self.a.movz(w, 1, 0);
+        self.a.bind(done);
+        self.cold.push(Cold::TestCall {
+            label: slow,
+            node: n,
+            word,
+            dst: w,
+            resume: done,
+            helper: emulates_undefined as *const () as u64,
+            arg: 0,
+        });
+        self.gp_done(n, w);
+    }
+
+    /// TypeofIs (P3 stage 3 step L1): the interpreter's typeof_matches. A primitive by its tag;
+    /// an object by its kind tag (the callables' range, KIND_CALLABLE_FIRST..=KIND_EXOTIC_NONE_LAST,
+    /// and the proxy's) and ic_plain: "object" is true for null and an object of no callable
+    /// kind ([[IsHTMLDDA]] is a callable native), "function" for a callable kind with ic_plain
+    /// set, "undefined" for undefined (and the TDZ marker, as typeof_matches takes it); a proxy,
+    /// and an object that may be [[IsHTMLDDA]] where that decides, take the cold call of
+    /// typeof_matches. Each path reads the word before it writes the result.
+    fn lower_typeof_is(&mut self, n: NodeIx, test: crate::value::TypeofTest) {
+        use crate::value::{
+            TypeofTest, KIND_CALLABLE_FIRST, KIND_EXOTIC_NONE_LAST, KIND_PROXY_TAG, PACK_BIGINT,
+            PACK_BOOL, PACK_NULL, PACK_STR, PACK_SYM, PACK_UNDEFINED,
+        };
+        let word = self.gp(self.graph.node(n).inputs[0], X16);
+        let w = self.gp_dst(n);
+        let yes = self.a.new_label();
+        let no = self.a.new_label();
+        let slow = self.a.new_label();
+        let done = self.a.new_label();
+        let callables = u32::from(KIND_EXOTIC_NONE_LAST - KIND_CALLABLE_FIRST);
+        let proxy = u32::from(KIND_PROXY_TAG - KIND_CALLABLE_FIRST);
+        // The object's kind tag less the first callable's: at most `callables` for a callable kind.
+        let kind = |g: &mut Self| {
+            g.a.ldrb_imm(X17, X30, g.layout.obj_kind as u32);
+            g.a.sub_imm(X17, X17, u32::from(KIND_CALLABLE_FIRST));
+        };
+        match test {
+            TypeofTest::Number => {
+                // Every word but a Number's is a NaN, and the canonical NaN is a Number.
+                self.a.fmov_d_x(D31, word);
+                self.a.fcmp(D31, D31);
+                self.a.b_cond(VC, yes);
+                self.a.mov_imm64(X17, crate::value::PACK_CANON_NAN);
+                self.a.cmp_reg_x(word, X17);
+                self.a.b_cond(EQ, yes);
+                self.a.b(no);
+            }
+            TypeofTest::Boolean => {
+                // A Boolean's word EOR its tag is its payload, 0 or 1; every other word is larger.
+                self.a.movz(X17, (PACK_BOOL >> 48) as u32, 3);
+                self.a.logic_x(2, X17, word, X17);
+                self.a.cmp_imm_x(X17, 1);
+                self.a.b_cond(LS, yes);
+                self.a.b(no);
+            }
+            TypeofTest::String | TypeofTest::Symbol | TypeofTest::BigInt => {
+                let tag = match test {
+                    TypeofTest::String => PACK_STR,
+                    TypeofTest::Symbol => PACK_SYM,
+                    _ => PACK_BIGINT,
+                };
+                self.a.lsr_imm(X17, word, 48);
+                self.a.movz(X30, (tag >> 48) as u32, 0);
+                self.a.cmp_reg_w(X17, X30);
+                self.a.b_cond(EQ, yes);
+                self.a.b(no);
+            }
+            TypeofTest::Undefined => {
+                // Undefined's tag, or the TDZ marker's after it.
+                self.a.lsr_imm(X17, word, 48);
+                self.a.movz(X30, (PACK_UNDEFINED >> 48) as u32, 0);
+                self.a.sub_reg(X17, X17, X30);
+                self.a.cmp_imm_x(X17, 1);
+                self.a.b_cond(LS, yes);
+                self.object_or(word, no);
+                self.a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+                self.a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+                self.a.b(no);
+            }
+            TypeofTest::Object => {
+                self.a.mov_imm64(X17, PACK_NULL);
+                self.a.cmp_reg_x(word, X17);
+                self.a.b_cond(EQ, yes);
+                self.object_or(word, no);
+                kind(self);
+                self.a.cmp_imm_x(X17, callables);
+                self.a.b_cond(LS, no);
+                self.a.cmp_imm_x(X17, proxy);
+                self.a.b_cond(EQ, slow);
+                self.a.b(yes);
+            }
+            TypeofTest::Function => {
+                self.object_or(word, no);
+                self.a.ldrb_imm(X9, X30, self.layout.obj_flags as u32);
+                kind(self);
+                self.a.cmp_imm_x(X17, proxy);
+                self.a.b_cond(EQ, slow);
+                self.a.cmp_imm_x(X17, callables);
+                self.a.b_cond(HI, no);
+                // A callable: [[IsHTMLDDA]] (a native whose ic_plain is clear) is "undefined".
+                self.a.tbz(X9, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+                self.a.b(yes);
+            }
+            // The builder folds a test no typeof result matches.
+            TypeofTest::Never => self.a.b(no),
+        }
+        self.a.bind(no);
+        self.a.movz(w, 0, 0);
+        self.a.b(done);
+        self.a.bind(yes);
+        self.a.movz(w, 1, 0);
+        self.a.bind(done);
+        self.cold.push(Cold::TestCall {
+            label: slow,
+            node: n,
+            word,
+            dst: w,
+            resume: done,
+            helper: typeof_matches as *const () as u64,
+            arg: u64::from(test as u8),
         });
         self.gp_done(n, w);
     }

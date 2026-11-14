@@ -122,6 +122,8 @@ pub(crate) mod view;
 
 #[cfg(test)]
 mod build_tests;
+#[cfg(test)]
+mod equality_tests;
 #[cfg(all(
     test,
     target_arch = "aarch64",

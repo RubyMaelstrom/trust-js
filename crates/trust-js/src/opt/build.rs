@@ -1145,6 +1145,20 @@ fn const_truth(word: u64) -> Option<bool> {
     number_word(word).map(|x| x != 0.0 && !x.is_nan())
 }
 
+/// The typeof of a constant word (a scalar's or a String's: constants are never objects), None
+/// for a word of no typeof (the TDZ marker).
+fn constant_typeof(word: u64) -> Option<crate::value::TypeofTest> {
+    use crate::value::{TypeofTest, PACK_STR};
+    Some(match word {
+        PACK_UNDEFINED => TypeofTest::Undefined,
+        PACK_NULL => TypeofTest::Object,
+        _ if word & !1 == PACK_BOOL => TypeofTest::Boolean,
+        _ if number_word(word).is_some() => TypeofTest::Number,
+        _ if word >> 48 == PACK_STR >> 48 => TypeofTest::String,
+        _ => return None,
+    })
+}
+
 /// Whether `word === other` is `word`'s identity with `other`'s for every `other`: undefined,
 /// null, a Boolean and a Number other than 0, -0 and NaN, each a word no other value has.
 fn identity_constant(word: u64) -> bool {
@@ -3461,6 +3475,7 @@ impl<'a> Builder<'a> {
             Op::Neg | Op::Plus | Op::BitNot => self.unary(pc, op, st)?,
             Op::Lt | Op::Gt | Op::Le | Op::Ge => self.relational(pc, op, st)?,
             Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq => self.equality(pc, op, st)?,
+            Op::TypeofIs(test, negate) => self.typeof_is(pc, test, negate, st)?,
             Op::UpdateLocal(slot, kind) => {
                 let slot = self.slot(pc, slot as usize)?;
                 self.update_local(pc, slot, kind, st)?
@@ -3972,16 +3987,22 @@ impl<'a> Builder<'a> {
         Ok(self.add(NodeOp::F64Cmp(cond), &[x, y], Rep::Bool, pc))
     }
 
-    /// Equality, which records nothing (W4 decision 3), typed from its operands as JSC does: two
-    /// proven Numbers compare as Numbers; words whose kinds make identity the answer (two proven
-    /// Booleans or objects, or under `===` a constant no other value equals) compare as words;
-    /// anything else is the generic operation.
+    /// Equality, typed from its operands as JSC does: two proven Numbers compare as Numbers;
+    /// words whose kinds make identity the answer (two proven Booleans or objects, or under `===`
+    /// a constant no other value equals, a proven object or Boolean) compare as words; under `==`
+    /// an undefined or null constant makes the other's NullOrLikeUndefined the answer, as V8's
+    /// TestUndetectable and JSC's CompareEq on KnownOtherUse are built from the value alone
+    /// (maglev-graph-builder.cc:3077-3084, DFGFixupPhase.cpp:923-946); under `===` a Number,
+    /// constant or proven, compares with the other's word as a double, which every word but a
+    /// Number's makes unordered (P3 stage 3 step L1); anything else is the generic operation.
     fn equality(&mut self, pc: usize, op: Op, st: &mut State) -> Result<(), Refusal> {
         let strict = matches!(op, Op::StrictEq | Op::StrictNotEq);
         let negate = matches!(op, Op::StrictNotEq | Op::NotEq);
         let len = st.stack.len();
         let (a, b) = (st.stack[len - 2], st.stack[len - 1]);
         let (fa, fb) = (self.forms(st, a), self.forms(st, b));
+        let nullish = |word: u64| word == PACK_UNDEFINED || word == PACK_NULL;
+        let (ca, cb) = (self.constant(a), self.constant(b));
         let result = if self.known_number(st, a) && self.known_number(st, b) {
             let cond = if negate { Cond::Ne } else { Cond::Eq };
             let int = self.known_int32(st, a) && self.known_int32(st, b);
@@ -3989,23 +4010,112 @@ impl<'a> Builder<'a> {
         } else if (fa.boolean.is_some() && fb.boolean.is_some())
             || (fa.cell.is_some() && fb.cell.is_some())
             || (strict
-                && (self.constant(a).is_some_and(identity_constant)
-                    || self.constant(b).is_some_and(identity_constant)))
+                && (ca.is_some_and(identity_constant)
+                    || cb.is_some_and(identity_constant)
+                    || fa.cell.is_some()
+                    || fb.cell.is_some()
+                    || fa.boolean.is_some()
+                    || fb.boolean.is_some()))
         {
+            // Under `===` an object is equal only to itself and a Boolean only to its word,
+            // whatever the other operand (JSC's ObjectUse on one side, DFGFixupPhase.cpp:
+            // 5499-5508).
             let x = self.tagged(st, a, pc);
             let y = self.tagged(st, b, pc);
             let same = self.add(NodeOp::TaggedSame, &[x, y], Rep::Bool, pc);
-            if negate {
-                self.add(NodeOp::BoolNot, &[same], Rep::Bool, pc)
+            self.negated(same, negate, pc)
+        } else if !strict && (ca.is_some_and(nullish) || cb.is_some_and(nullish)) {
+            let other = if ca.is_some_and(nullish) { b } else { a };
+            let test = self.null_or_like_undefined(st, other, pc);
+            self.negated(test, negate, pc)
+        } else if strict && (self.known_number(st, a) || self.known_number(st, b)) {
+            let (number, other) = if self.known_number(st, a) {
+                (a, b)
             } else {
-                same
-            }
+                (b, a)
+            };
+            let mut cx = Before::new(pc);
+            let Some(x) = self.number(st, &mut cx, number) else {
+                return Err(Refusal::at(pc, "a Number operand without an f64 form"));
+            };
+            let word = self.tagged(st, other, pc);
+            let y = self.add(NodeOp::WordAsF64, &[word], Rep::F64, pc);
+            let cond = if negate { Cond::Ne } else { Cond::Eq };
+            self.add(NodeOp::F64Cmp(cond), &[y, x], Rep::Bool, pc)
         } else {
             // The effect, unless the rules counted the equality lowered (`Rules::equality_lowers`,
             // which these facts should then hold): an exit there, which the recompile declines.
             return self.mismatch(pc, ExitReason::NotNumber, st);
         };
         st.stack.truncate(len - 2);
+        st.stack.push(result);
+        Ok(())
+    }
+
+    /// `test`, negated where `negate` (a constant folded).
+    fn negated(&mut self, test: NodeIx, negate: bool, pc: usize) -> NodeIx {
+        if !negate {
+            return test;
+        }
+        match self.graph.node(test).op {
+            NodeOp::ConstBool(value) => self.hoist(Hoisted::Bool(!value)),
+            _ => self.add(NodeOp::BoolNot, &[test], Rep::Bool, pc),
+        }
+    }
+
+    /// Whether `value` is undefined, null or the [[IsHTMLDDA]] object (`x == null`), its facts
+    /// folding it: a constant decides, and a proven Number, int32 or Boolean is never nullish.
+    fn null_or_like_undefined(&mut self, st: &mut State, value: NodeIx, pc: usize) -> NodeIx {
+        let forms = self.forms(st, value);
+        if let Some(word) = self.constant(value) {
+            // Constants are scalars and Strings, never an object.
+            return self.hoist(Hoisted::Bool(word == PACK_UNDEFINED || word == PACK_NULL));
+        }
+        if forms.f64.is_some() || forms.i32.is_some() || forms.boolean.is_some() {
+            return self.hoist(Hoisted::Bool(false));
+        }
+        let word = self.tagged(st, value, pc);
+        self.add(NodeOp::NullOrLikeUndefined, &[word], Rep::Bool, pc)
+    }
+
+    /// TypeofIs: `typeof x === "<test>"` (negated for `!==`) as a test of the value's tag and,
+    /// for an object, its kind (NodeOp::TypeofIs; P3 stage 3 step L1), as Maglev builds TestTypeOf
+    /// from the value alone (maglev-graph-builder.cc:3192-3205); the value's facts fold it.
+    fn typeof_is(
+        &mut self,
+        pc: usize,
+        test: crate::value::TypeofTest,
+        negate: bool,
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        use crate::value::TypeofTest;
+        let value = st.stack.pop().expect("the stack analysis saw the operand");
+        let forms = self.forms(st, value);
+        let known = if test == TypeofTest::Never {
+            Some(false)
+        } else if let Some(word) = self.constant(value) {
+            Some(constant_typeof(word) == Some(test))
+        } else if forms.f64.is_some() || forms.i32.is_some() {
+            Some(test == TypeofTest::Number)
+        } else if forms.boolean.is_some() {
+            Some(test == TypeofTest::Boolean)
+        } else if forms.cell.is_some() {
+            // An object: its typeof is "object", "function" or "undefined".
+            match test {
+                TypeofTest::Object | TypeofTest::Function | TypeofTest::Undefined => None,
+                _ => Some(false),
+            }
+        } else {
+            None
+        };
+        let result = match known {
+            Some(matches) => self.hoist(Hoisted::Bool(matches != negate)),
+            None => {
+                let word = self.tagged(st, value, pc);
+                let matches = self.add(NodeOp::TypeofIs(test), &[word], Rep::Bool, pc);
+                self.negated(matches, negate, pc)
+            }
+        };
         st.stack.push(result);
         Ok(())
     }

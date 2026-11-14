@@ -446,6 +446,25 @@ pub(crate) enum NodeOp {
     /// both proven objects, a proven constant of undefined or null) -> Bool.
     TaggedSame,
     BoolNot,
+    /// Tagged -> Bool: `x == null` (ECMA-262 IsLooselyEqual against undefined or null, P3 stage
+    /// 3 step L1): true for undefined and null (and the TDZ marker, which no operand is: `tag |
+    /// 2`, as the templates test it) and for the [[IsHTMLDDA]] object (Annex B.3.6), false for
+    /// every other value. An object whose ic_plain is set is no [[IsHTMLDDA]] (its makers clear
+    /// it, and it is only ever cleared); one whose ic_plain is clear takes a cold call of the
+    /// interpreter's test, which runs no JavaScript, allocates nothing and does not collect:
+    /// SpiderMonkey's IsNullOrLikeUndefined, V8's TestUndetectable, JSC's CompareEq on KnownOther.
+    NullOrLikeUndefined,
+    /// Tagged -> Bool: `typeof x === "<test>"` (P3 stage 3 step L1), the interpreter's
+    /// typeof_matches exactly: a primitive by its tag, an object by its kind tag and ic_plain,
+    /// and a proxy, or an object that may be [[IsHTMLDDA]], by a cold call of typeof_matches
+    /// (no JavaScript, no allocation, no collection), as SpiderMonkey's MTypeOfIs calls
+    /// TypeOfObject out of line. Never TypeofTest::Never, which the builder folds.
+    TypeofIs(crate::value::TypeofTest),
+    /// Tagged -> F64: the word's bits as a double, unchecked (P3 stage 3 step L1). A Number's
+    /// word is its f64 and every other word is a NaN, so an F64Cmp against a Number is `===`
+    /// exactly: unordered, so unequal, for every word that is no Number (the template's constant
+    /// form, jit.rs emit_eq_constant). No form of the value: it is a Number only when it is one.
+    WordAsF64,
 
     // Memory.
     /// Cell -> Tagged: the property at the way's location and slot (IcState::loc), of the

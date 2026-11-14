@@ -4919,11 +4919,12 @@ fn a_loop_whose_equalities_compare_numbers_its_blocks_made_is_free_of_effects() 
 
 #[test]
 fn a_loop_comparing_words_from_the_frame_counts_its_equality_an_effect() {
-    // `a == b` on two locals the loop's block did not make, and `a == undefined`, whose constant
-    // decides nothing under `==`: the rules cannot say they lower (the builder makes the generic
-    // operation here), so the loop has a generic node; the function compiles, its prepass and its
-    // builder agreeing, and the node leaves `a` alone (P3 stage 3 step 3a): no reload.
-    for test in ["a == b", "a == undefined"] {
+    // `a == b` on two locals the loop's block did not make, and `a == '1'`, whose constant
+    // decides nothing under `==` (a coercion): the rules cannot say they lower (the builder makes
+    // the generic operation here), so the loop has a generic node; the function compiles, its
+    // prepass and its builder agreeing, and the node leaves `a` alone (P3 stage 3 step 3a): no
+    // reload. (`a == undefined` is a word test since P3 stage 3 step L1.)
+    for test in ["a == b", "a == '1'"] {
         let mut engine = warmed(
             &format!(
                 "function eqf(g, a, b, n) {{ var s = 0; g();

@@ -641,6 +641,8 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::F64Cmp(_) => (F64S, Rep::Bool),
         NodeOp::TaggedSame => (&[Rep::Tagged, Rep::Tagged], Rep::Bool),
         NodeOp::BoolNot => (BOOL, Rep::Bool),
+        NodeOp::NullOrLikeUndefined | NodeOp::TypeofIs(_) => (TAGGED, Rep::Bool),
+        NodeOp::WordAsF64 => (TAGGED, Rep::F64),
         NodeOp::LoadField { .. } => (CELL, Rep::Tagged),
         NodeOp::StoreField { .. } | NodeOp::StoreNew { .. } => {
             (&[Rep::Cell, Rep::Tagged], Rep::None)
