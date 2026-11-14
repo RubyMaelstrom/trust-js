@@ -608,7 +608,8 @@ struct Flow {
 struct Loop {
     /// The slots a native write in the loop assigns (StoreLocal, UpdateLocal, Tdz, ResetSlots).
     written: Vec<bool>,
-    /// The slots an operation of the loop may read (`liveness::add_reads`).
+    /// The slots an operation of the loop may read (`liveness::add_reads`), for a loop without
+    /// effects (empty otherwise).
     read: Vec<bool>,
     /// Whether an operation of the loop may lower to an effect, after which every slot is in the
     /// frame.
@@ -729,11 +730,9 @@ impl Flow {
                 read: Vec::new(),
                 effects: false,
             };
-            let mut read = vec![0u64; words];
-            for index in body {
+            for &index in &body {
                 let block = &blocks[ix(rpo[index])];
                 for pc in block.start..block.end {
-                    super::liveness::add_reads(&ops[pc], &mut read, &mut scratch, &all);
                     let writes = match ops[pc] {
                         Op::StoreLocal(slot) | Op::UpdateLocal(slot, _) | Op::Tdz(slot) => {
                             slot as usize..slot as usize + 1
@@ -753,9 +752,19 @@ impl Flow {
                     }
                 }
             }
-            found.read = (0..n_slots)
-                .map(|slot| read[slot / 64] & (1 << (slot % 64)) != 0)
-                .collect();
+            // The read set serves the load-once rule, which only a loop without effects takes.
+            if !found.effects {
+                let mut read = vec![0u64; words];
+                for &index in &body {
+                    let block = &blocks[ix(rpo[index])];
+                    for op in &ops[block.start..block.end] {
+                        super::liveness::add_reads(op, &mut read, &mut scratch, &all);
+                    }
+                }
+                found.read = (0..n_slots)
+                    .map(|slot| read[slot / 64] & (1 << (slot % 64)) != 0)
+                    .collect();
+            }
             heads[ix(rpo[header])] = Some(loops.len());
             loops.push(found);
         }
