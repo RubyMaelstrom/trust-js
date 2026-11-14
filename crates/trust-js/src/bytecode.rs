@@ -30406,7 +30406,7 @@ pub(crate) fn ordinary_tail_call_depth() -> u32 {
 /// The source position of the call or `new` operation at `pc`; the cached call forms answer
 /// without a search.
 #[inline]
-fn call_op_position(chunk: &Chunk, pc: usize) -> u32 {
+pub(crate) fn call_op_position(chunk: &Chunk, pc: usize) -> u32 {
     match chunk.ops.get(pc) {
         Some(
             Op::Call(_, cache)

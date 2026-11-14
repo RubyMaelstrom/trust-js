@@ -185,13 +185,46 @@ pub(crate) fn compile_with(
     ilayout: &crate::interpreter::InterpLayout,
     options: Options,
 ) -> Result<Rc<JitCode>, Refusal> {
+    compile_frames_with(
+        chunk,
+        graph,
+        cfg,
+        &[],
+        initialized,
+        layout,
+        ilayout,
+        options,
+    )
+}
+
+/// [`compile_with`] of a graph with inlined frames (stage 3), whose chunks `inlined` gives with
+/// their Cfgs, by `InlinedFrame::chunk`: the code holds them (`exit::Inlined`).
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn compile_frames_with(
+    chunk: &Chunk,
+    graph: &Graph,
+    cfg: &crate::jit_ir::Cfg,
+    inlined: &[(Rc<Chunk>, crate::jit_ir::Cfg)],
+    initialized: crate::jit_ir::InitializedReads,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    options: Options,
+) -> Result<Rc<JitCode>, Refusal> {
     let view = chunk.freeze();
+    let views: Vec<FrozenChunk> = inlined.iter().map(|(chunk, _)| chunk.freeze()).collect();
+    let frames: Vec<crate::opt::verify::FrameChunk<'_>> = views
+        .iter()
+        .zip(inlined)
+        .map(|(view, (_, cfg))| (view, cfg))
+        .collect();
     let switches = Switches::read(chunk);
     let mut stubs = Stubs::live();
     let assembled = assemble(
         &view,
         graph,
         cfg,
+        &frames,
         initialized,
         layout,
         ilayout,
@@ -201,7 +234,11 @@ pub(crate) fn compile_with(
     )?;
     let executable = ExecutableBuffer::from_bytes(assembled.bytes())
         .ok_or(Refusal::whole("no executable memory"))?;
-    Ok(link(assembled, executable, chunk))
+    let held = crate::opt::exit::Inlined {
+        chunks: inlined.iter().map(|(chunk, _)| chunk.clone()).collect(),
+        pins: Box::new([]),
+    };
+    Ok(link(assembled, executable, chunk, held))
 }
 
 /// What a code generation's emission does with the process-wide shared stubs its sites request
@@ -258,11 +295,14 @@ impl Assembled {
 }
 
 /// The code `assembled` now that `executable` holds its bytes (main thread): its exit table
-/// registered by its code's base, the JitCode, the perf map's entry under `chunk`'s name.
+/// registered by its code's base with what the code holds for its inlined frames (`inlined`:
+/// their chunks and the identities it embeds, stage 3; none without them), the JitCode, the perf
+/// map's entry under `chunk`'s name.
 pub(crate) fn link(
     assembled: Assembled,
     executable: ExecutableBuffer,
     chunk: &Chunk,
+    inlined: crate::opt::exit::Inlined,
 ) -> Rc<JitCode> {
     let Assembled {
         mut table,
@@ -274,6 +314,14 @@ pub(crate) fn link(
     let mem = executable.as_ptr() as *mut u8;
     let len = executable.len();
     table.code_base = mem as usize;
+    debug_assert!(
+        table
+            .frames
+            .iter()
+            .all(|frame| (frame.chunk as usize) < inlined.chunks.len()),
+        "a code holds the chunks of its inlined frames"
+    );
+    crate::opt::exit::hold(mem as usize, inlined);
     crate::opt::exit::register(mem as usize, table);
     let code = JitCode {
         entry_kind: NativeEntryKind::FreshFrame,
@@ -293,12 +341,14 @@ pub(crate) fn link(
 
 /// Generate `graph`'s code for `chunk` with `options` and `switches`, its stubs from `stubs`,
 /// into words (see [`Assembled`]): reads nothing but its arguments and process constants, so
-/// that it runs on any thread.
+/// that it runs on any thread. `inlined` gives the chunks of the graph's inlined frames with
+/// their Cfgs, by `InlinedFrame::chunk` (stage 3).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn assemble(
     chunk: &FrozenChunk,
     graph: &Graph,
     cfg: &crate::jit_ir::Cfg,
+    inlined: &[crate::opt::verify::FrameChunk<'_>],
     initialized: crate::jit_ir::InitializedReads,
     layout: &crate::value::JitLayout,
     ilayout: &crate::interpreter::InterpLayout,
@@ -316,7 +366,7 @@ pub(crate) fn assemble(
     if chunk.jit_is_resumable() {
         return Err(Refusal::whole("a resumable chunk"));
     }
-    check_graph(chunk, graph, cfg)?;
+    check_graph(chunk, graph, cfg, inlined)?;
     if !words_inlinable(layout) && graph.nodes.iter().any(|node| reads_words(&node.op)) {
         return Err(Refusal::whole(
             "element words in a layout the code cannot address",
@@ -353,11 +403,14 @@ pub(crate) fn assemble(
 /// The checks that keep the code generator's assumptions: one entry without predecessors, a
 /// terminator ending every block and nowhere else, a poll opening every loop header, entry
 /// slots read in the entry block, a state on every node that can exit, and effects only on
-/// operations whose baseline template the canonical frame can run.
+/// operations whose baseline template the canonical frame can run; and with inlined frames
+/// (stage 3), the frames' rules the deoptimizer relies on (`verify::frames`), each node of its
+/// frame, and each state against its frame's chunk.
 fn check_graph(
     chunk: &FrozenChunk,
     graph: &Graph,
     cfg: &crate::jit_ir::Cfg,
+    inlined: &[crate::opt::verify::FrameChunk<'_>],
 ) -> Result<(), Refusal> {
     let entry = graph
         .entry
@@ -365,6 +418,17 @@ fn check_graph(
     if !graph.block(entry).preds.is_empty() {
         return Err(Refusal::whole("an entry block with predecessors"));
     }
+    if !graph.frames.is_empty() {
+        crate::opt::verify::frames(graph, (chunk, cfg), inlined)
+            .map_err(|_| Refusal::whole("an inlined frame no exit can rebuild"))?;
+    }
+    // A frame's chunk and Cfg, by its index; None for a frame the graph has not.
+    let frame_chunk = |frame: FrameIx| -> Option<crate::opt::verify::FrameChunk<'_>> {
+        let Some(k) = frame.index().checked_sub(1) else {
+            return Some((chunk, cfg));
+        };
+        inlined.get(graph.frames.get(k)?.chunk as usize).copied()
+    };
     let ops = chunk.jit_ops();
     for (index, block) in graph.blocks.iter().enumerate() {
         let Some((&last, rest)) = block.body.split_last() else {
@@ -392,6 +456,14 @@ fn check_graph(
                 return Err(Refusal::at(
                     node.pc as usize,
                     "an exit without a frame state",
+                ));
+            }
+            if !node.frame.is_compiled()
+                && (frame_chunk(node.frame).is_none() || node.op.reads_compiled_frame())
+            {
+                return Err(Refusal::at(
+                    node.pc as usize,
+                    "an inlined frame's node that reads the compiled frame",
                 ));
             }
             match node.op {
@@ -438,15 +510,29 @@ fn check_graph(
                 _ => {}
             }
             if let Some(state) = node.state {
-                // The VM resumes at the state's pc on the settled stack there.
+                // The VM resumes at the state's pc on the settled stack there, in the node's
+                // frame (an inlined frame's chunk and Cfg).
                 let state = graph.state(state);
+                let Some((state_chunk, cfg)) =
+                    frame_chunk(state.frame).filter(|_| state.frame == node.frame)
+                else {
+                    return Err(Refusal::at(state.pc as usize, "a frame state's frame"));
+                };
+                let ops = state_chunk.jit_ops();
                 if cfg.stack_depth_at(state.pc as usize) != Some(state.stack.len()) {
                     return Err(Refusal::at(
                         state.pc as usize,
                         "a frame state's operand depth",
                     ));
                 }
-                if state.slots.len() != graph.n_slots {
+                let n_slots = if state.frame.is_compiled() {
+                    graph.n_slots
+                } else {
+                    state_chunk.jit_frame().1
+                };
+                if state.slots.len() != n_slots
+                    || !state.frame.is_compiled() && state.slots.contains(&SlotSource::Frame)
+                {
                     return Err(Refusal::at(state.pc as usize, "a frame state's slots"));
                 }
                 // A record's depth is the operand depth at its push, which its region may run
@@ -710,6 +796,10 @@ struct Gen<'a> {
     last_effect: Option<NodeIx>,
     /// The exit table, whose address the exit stub embeds.
     table: Box<ExitTable>,
+    /// Each inlined frame's index in the table's frames, once an exit passes through it (stage
+    /// 3), by the graph's frame index; and the frames' recipes so far.
+    frame_index: Vec<Option<u16>>,
+    frames: Vec<crate::opt::exit::FrameRecipe>,
 }
 
 impl<'a> Gen<'a> {
@@ -778,6 +868,8 @@ impl<'a> Gen<'a> {
                 loop_warm_up: switches.loop_warm_up,
                 ..ExitTable::default()
             }),
+            frame_index: vec![None; graph.frames.len()],
+            frames: Vec::new(),
         }
     }
 
@@ -873,6 +965,7 @@ impl<'a> Gen<'a> {
         let mut table = self.table;
         table.return_offsets = exits.iter().map(|&(offset, _)| offset).collect();
         table.exits = exits.into_iter().map(|(_, record)| record).collect();
+        table.frames = self.frames.into_boxed_slice();
         Ok(Assembled {
             words,
             table,
@@ -1321,6 +1414,7 @@ impl Gen<'_> {
             NodeOp::TruncateNumberOrOddball => TRUNCATION_EXIT,
             _ => 0,
         };
+        let frame = self.frame_recipe(state.frame)?;
         let record = ExitRecord {
             pc: state.pc,
             kind,
@@ -1331,11 +1425,54 @@ impl Gen<'_> {
             shape_check: None,
             proof,
             count: Cell::new(0),
+            frame,
         };
         let site = self.a.new_label();
         let ret = self.a.new_label();
         self.exits.push((site, ret, record));
         Ok(site)
+    }
+
+    /// The table's index of inlined frame `frame`'s recipe (0 for the compiled function's frame),
+    /// made at the first exit through the frame, after its parent's (stage 3): its callee's and
+    /// receiver's sources and its parent state's recipe, which every exit through the frame
+    /// shares, each value having one home for its whole range (`regalloc`).
+    fn frame_recipe(&mut self, frame: FrameIx) -> Result<u16, Refusal> {
+        let graph = self.graph;
+        let Some(inlined) = graph.inlined(frame) else {
+            return Ok(0);
+        };
+        if let Some(index) = self.frame_index[frame.index() - 1] {
+            return Ok(index);
+        }
+        let parent = graph.state(inlined.parent);
+        let parent_frame = self.frame_recipe(parent.frame)?;
+        let mut slots = Vec::new();
+        for (slot, source) in parent.slots.iter().enumerate() {
+            if let SlotSource::Value(v) = *source {
+                slots.push((slot as u16, self.source(v, parent.pc)?));
+            }
+        }
+        let stack = parent
+            .stack
+            .iter()
+            .map(|&v| self.source(v, parent.pc))
+            .collect::<Result<Vec<_>, _>>()?;
+        let recipe = crate::opt::exit::FrameRecipe {
+            chunk: inlined.chunk,
+            call_pc: inlined.call_pc,
+            parent: parent_frame,
+            callee: self.source(inlined.callee, parent.pc)?,
+            receiver: self.source(inlined.receiver, parent.pc)?,
+            slots: slots.into(),
+            stack: stack.into(),
+            handlers: parent.handlers.clone(),
+        };
+        self.frames.push(recipe);
+        let index = u16::try_from(self.frames.len())
+            .map_err(|_| Refusal::whole("more inlined frames than an exit can name"))?;
+        self.frame_index[frame.index() - 1] = Some(index);
+        Ok(index)
     }
 
     /// The forced-exit gate: decrement the countdown, and take `site` at zero.
@@ -2037,8 +2174,8 @@ impl Gen<'_> {
                 self.a.ldr_imm(X9, X9, 0);
                 self.a.cbnz(X9, true, slow);
                 self.a.bind(resume);
-                let state = graph.state(node.state.expect("checked"));
-                let throw = if state.handlers.is_empty() {
+                // A handler in its frame or a frame its exit rebuilds (stage 3) takes the throw.
+                let throw = if !graph.chain_has_handlers(node.state.expect("checked")) {
                     self.l_ret_throw
                 } else {
                     self.exit(n, ExitKind::PollThrow)?
@@ -2656,12 +2793,13 @@ impl Gen<'_> {
     fn save_live_clobbered(&mut self, node: NodeIx) -> (Vec<(bool, u32)>, u32) {
         let (gp, fp) = regalloc::clobbers(&self.graph.node(node).op);
         let at = self.alloc.pos[node.index()];
-        let state = self.graph.node(node).state.map(|s| self.graph.state(s));
-        let in_state = |v: NodeIx| {
-            state.is_some_and(|state| {
-                state.stack.contains(&v) || state.slots.contains(&SlotSource::Value(v))
-            })
-        };
+        // What the node's exit reads: its state's values and, in an inlined frame, its chain's
+        // (stage 3), the values the allocator's reads hold at the node (`for_each_exit_value`).
+        let mut reads = Vec::new();
+        if let Some(state) = self.graph.node(node).state {
+            self.graph.for_each_exit_value(state, |v| reads.push(v));
+        }
+        let in_state = |v: NodeIx| reads.contains(&v);
         let live: Vec<(bool, u32)> = self
             .alloc
             .live_at(node)
@@ -2703,11 +2841,16 @@ impl Gen<'_> {
     /// A poll's slow path: the live caller-saved registers saved, `H_INTERRUPT` called as the
     /// first stage's loop poll calls it, the registers restored, and a throw taken to `throw`.
     fn emit_poll_slow(&mut self, label: usize, node: NodeIx, resume: usize, throw: usize) {
-        let depth = self
+        // The compiled frame's operand top, which the helper keeps as its record's live top
+        // (`JitCtx::poll_top`): its state's depth, or in an inlined frame (stage 3) the depth of
+        // the compiled frame's state at the outermost call, whose frame the record holds.
+        let mut state = self
             .graph
-            .state(self.graph.node(node).state.expect("checked"))
-            .stack
-            .len() as u32;
+            .state(self.graph.node(node).state.expect("checked"));
+        while let Some(inlined) = self.graph.inlined(state.frame) {
+            state = self.graph.state(inlined.parent);
+        }
+        let depth = state.stack.len() as u32;
         self.a.bind(label);
         let saved = self.save_live_caller_saved(node);
         let a = &mut self.a;

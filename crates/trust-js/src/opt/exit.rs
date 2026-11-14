@@ -96,6 +96,33 @@ pub(crate) struct ExitRecord {
     /// JSC's tallyFrequentExitSites tallies the exits its code took
     /// (bytecode/CodeBlock.cpp:3094-3120).
     pub(crate) count: std::cell::Cell<u32>,
+    /// The frame the recipe rebuilds (stage 3): 0, the compiled function's, or an inlined
+    /// frame's, [`ExitTable::frames`]`[frame - 1]`, whose recipe and its parents' rebuild the
+    /// frames below it. In the record's padding: a record is no larger than before.
+    pub(crate) frame: u16,
+}
+
+/// An inlined frame's part of the exits through it (P3 stage 3, step 1), kept once in the table
+/// for every exit of the frame and the frames above it: where its callee and receiver are, and
+/// its parent's recipe, the caller's state at `call_pc + 1` without the call's operands, which
+/// the deoptimizer resumes with the call's result pushed (or at `call_pc` with its throw). JSC
+/// keeps one InlineCallFrame per inlined call that every exit through it reads
+/// (dfg/DFGOSRExitCompilerCommon.cpp:293-415); a home is a value's for its whole range
+/// (`regalloc`), so one recipe of the parent serves every exit.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FrameRecipe {
+    /// The callee's first-stage chunk: its index among the code's inlined chunks ([`Inlined`]).
+    pub(crate) chunk: u32,
+    /// The call's pc in the parent's chunk.
+    pub(crate) call_pc: u32,
+    /// The parent's frame: 0, the compiled function's, or `frames[parent - 1]`.
+    pub(crate) parent: u16,
+    pub(crate) callee: Source,
+    pub(crate) receiver: Source,
+    /// The parent's slots and operand stack, as an exit record's.
+    pub(crate) slots: Box<[(u16, Source)]>,
+    pub(crate) stack: Box<[Source]>,
+    pub(crate) handlers: Box<[(u32, u32)]>,
 }
 
 /// What a shape check tested: the receiver word's source at the check, and its shapes.
@@ -111,8 +138,12 @@ pub(crate) struct ExitTable {
     /// The code's first byte, set when it is mapped.
     pub(crate) code_base: usize,
     /// Each exit's return address from its `bl`, as a byte offset into the code, ascending.
-    pub(crate) return_offsets: Vec<u32>,
-    pub(crate) exits: Vec<ExitRecord>,
+    pub(crate) return_offsets: Box<[u32]>,
+    pub(crate) exits: Box<[ExitRecord]>,
+    /// The inlined frames some exit passes through, each a parent's before its own (stage 3);
+    /// empty for a code without inlined frames. Boxes, where the two above were vectors, keep
+    /// the table's size.
+    pub(crate) frames: Box<[FrameRecipe]>,
     /// The function's name, for the log.
     pub(crate) name: Box<str>,
     /// The exits taken so far, forced ones left out.
@@ -154,9 +185,15 @@ impl ExitTable {
     /// Heap bytes the table holds (the memory census's metadata).
     pub(crate) fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
-            + self.return_offsets.capacity() * 4
+            + self.return_offsets.len() * 4
             + self.exits.iter().map(record_bytes).sum::<usize>()
+            + self.frames.iter().map(frame_bytes).sum::<usize>()
             + self.name.len()
+    }
+
+    /// Inlined frame `frame`'s recipe (`frame` > 0).
+    fn frame(&self, frame: u16) -> &FrameRecipe {
+        &self.frames[usize::from(frame) - 1]
     }
 }
 
@@ -168,6 +205,98 @@ fn record_bytes(record: &ExitRecord) -> usize {
         + record.shape_check.as_ref().map_or(0, |check| {
             std::mem::size_of::<ShapeCheck>() + check.shapes.len() * 4
         })
+}
+
+fn frame_bytes(frame: &FrameRecipe) -> usize {
+    std::mem::size_of::<FrameRecipe>()
+        + frame.slots.len() * std::mem::size_of::<(u16, Source)>()
+        + frame.stack.len() * std::mem::size_of::<Source>()
+        + frame.handlers.len() * 8
+}
+
+/// What a code with inlined frames holds for as long as it lives (stage 3): the chunks its
+/// inlined frames run, by [`FrameRecipe::chunk`], which its exits rebuild frames of, and the weak
+/// pins of the identities it embeds, so that no other object takes their addresses (as an
+/// InlineTarget's pin keeps a splice's callee, bytecode.rs's `InlineTarget::pin`). Kept with the
+/// code's base on the thread that linked the code, which alone runs and drops it (the exit table
+/// crosses threads and holds the chunks by index), and released with its exit table (`release`).
+#[derive(Default)]
+pub(crate) struct Inlined {
+    pub(crate) chunks: Box<[std::rc::Rc<crate::bytecode::Chunk>]>,
+    pub(crate) pins: Box<[crate::value::WeakGc]>,
+}
+
+thread_local! {
+    /// Each linked code's [`Inlined`], by its code's base.
+    static INLINED: std::cell::RefCell<crate::fasthash::FastMap<usize, Inlined>> =
+        std::cell::RefCell::new(Default::default());
+}
+
+/// Keep `inlined` as long as the code at `code_base` (its link, on its thread): nothing for a
+/// code without inlined frames.
+pub(crate) fn hold(code_base: usize, inlined: Inlined) {
+    if inlined.chunks.is_empty() && inlined.pins.is_empty() {
+        return;
+    }
+    let replaced = INLINED.with(|held| held.borrow_mut().insert(code_base, inlined));
+    debug_assert!(replaced.is_none(), "a released code's holds left with it");
+    // Dropped out of the map's borrow, as `drop_held` drops.
+    drop(replaced);
+}
+
+/// Inlined chunk `index` of the code at `code_base`, which lives as long as the code: its
+/// running activation keeps it, and only its drop releases what it holds.
+fn inlined_chunk(code_base: usize, index: u32) -> *const crate::bytecode::Chunk {
+    INLINED.with(|held| {
+        let held = held.borrow();
+        let inlined = held
+            .get(&code_base)
+            .expect("a code with inlined frames holds their chunks");
+        std::rc::Rc::as_ptr(&inlined.chunks[index as usize])
+    })
+}
+
+/// The first-stage chunk of the inlined frame `exit` rebuilds, None for the compiled function's
+/// frame (the exit profile's key, `opt::discard`).
+pub(crate) fn exit_chunk<'t>(
+    table: &'t ExitTable,
+    exit: &ExitRecord,
+) -> Option<&'t crate::bytecode::Chunk> {
+    (exit.frame != 0).then(|| {
+        // SAFETY: the code holds the chunk as long as its table lives (`release`).
+        unsafe { &*inlined_chunk(table.code_base, table.frame(exit.frame).chunk) }
+    })
+}
+
+/// The heap bytes the code at `code_base` holds for its inlined frames (the memory census).
+fn held_bytes(code_base: usize) -> usize {
+    INLINED
+        .try_with(|held| {
+            held.borrow().get(&code_base).map_or(0, |inlined| {
+                std::mem::size_of::<Inlined>()
+                    + inlined.chunks.len()
+                        * std::mem::size_of::<std::rc::Rc<crate::bytecode::Chunk>>()
+                    + inlined.pins.len() * std::mem::size_of::<crate::value::WeakGc>()
+            })
+        })
+        .unwrap_or(0)
+}
+
+/// Drop what the code at `code_base` held for its inlined frames, if anything (its release).
+fn drop_held(code_base: usize) {
+    let held = INLINED
+        .try_with(|held| {
+            let mut held = held.borrow_mut();
+            if held.is_empty() {
+                None
+            } else {
+                held.remove(&code_base)
+            }
+        })
+        .ok()
+        .flatten();
+    // Dropped out of the map's borrow: a chunk's drop may release other codes.
+    drop(held);
 }
 
 /// The exit tables of the optimized code objects alive in the process, by their code's first
@@ -207,12 +336,16 @@ pub(crate) fn table_bytes(code_base: *const u8) -> usize {
     if registry.live.load(std::sync::atomic::Ordering::Relaxed) == 0 {
         return 0;
     }
-    registry
+    let bytes = registry
         .tables
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(&(code_base as usize))
-        .map_or(0, |table| table.retained_bytes())
+        .map(|table| table.retained_bytes());
+    match bytes {
+        Some(bytes) => bytes + held_bytes(code_base as usize),
+        None => 0,
+    }
 }
 
 /// The exit table of `code`, if it is the tier's code (template JIT code has none). The table
@@ -249,6 +382,7 @@ pub(crate) fn release(code_base: *const u8) {
         registry
             .live
             .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        drop_held(code_base as usize);
     }
 }
 
@@ -350,13 +484,20 @@ pub(crate) unsafe extern "C" fn deoptimize(
             }
             _ => String::new(),
         };
+        let frame = match exit.frame {
+            0 => String::new(),
+            frame => format!(" in inlined frame {frame}"),
+        };
         eprintln!(
-            "[opt] exit {} pc {} {:?} ({:?}){detail}",
+            "[opt] exit {} pc {} {:?} ({:?}){frame}{detail}",
             table.name, exit.pc, reason, exit.kind
         );
     }
     #[cfg(test)]
     TEST_EXITS.with(|exits| exits.borrow_mut().push((exit.pc, reason)));
+    if exit.frame != 0 {
+        return unsafe { deoptimize_frames(ctx, table, exit, reason, saved) };
+    }
     let chunk = unsafe { &*ctx.chunk };
     let mut depth = exit.stack.len();
     let pending = match exit.kind {
@@ -397,10 +538,32 @@ pub(crate) unsafe extern "C" fn deoptimize(
             }
         },
     };
+    // The frame holds every value by now, so the discard's compile may allocate.
+    count(i, chunk, table, exit, reason);
+    ctx.handlers.clear();
+    ctx.handlers
+        .extend(exit.handlers.iter().map(|&(push_pc, depth)| {
+            crate::bytecode::pushed_handler(chunk, push_pc as usize, depth as usize)
+        }));
+    let result =
+        unsafe { crate::bytecode::run_native_frame_in_vm(ctx, exit.pc as usize, depth, pending) };
+    complete(ctx, result)
+}
+
+/// An exit's count (see the module's doc), forced ones left out: one count and one limit for the
+/// code, whichever frame exits, as JSC counts every exit of a code block on it
+/// (dfg/DFGOSRExitCompilerCommon.cpp:42-104). Every frame's values are in rooted storage.
+#[inline(always)]
+fn count(
+    i: &mut crate::interpreter::Interp,
+    chunk: &crate::bytecode::Chunk,
+    table: &ExitTable,
+    exit: &ExitRecord,
+    reason: ExitReason,
+) {
     if reason != ExitReason::Forced {
         // Repeated exits: at the limit, the code is discarded once (`opt::discard`) and new
         // entries stop using it; this activation finishes in the VM, any other running it in it.
-        // The frame holds every value by now, so the discard's compile may allocate.
         exit.count.set(exit.count.get().saturating_add(1));
         let taken = table.taken.get().saturating_add(1);
         table.taken.set(taken);
@@ -414,13 +577,15 @@ pub(crate) unsafe extern "C" fn deoptimize(
             super::arm_loop_limit(chunk, table.loop_warm_up);
         }
     }
-    ctx.handlers.clear();
-    ctx.handlers
-        .extend(exit.handlers.iter().map(|&(push_pc, depth)| {
-            crate::bytecode::pushed_handler(chunk, push_pc as usize, depth as usize)
-        }));
-    let result =
-        unsafe { crate::bytecode::run_native_frame_in_vm(ctx, exit.pc as usize, depth, pending) };
+}
+
+/// The compiled frame's completion, for the stub's epilogue: 1 with `ctx.ret` its value, or 0
+/// with `ctx.error` set.
+#[inline(always)]
+fn complete(
+    ctx: &mut crate::jit::JitCtx,
+    result: Result<crate::value::Value, crate::interpreter::Abrupt>,
+) -> u64 {
     match result {
         Ok(value) => {
             ctx.ret = value;
@@ -430,6 +595,418 @@ pub(crate) unsafe extern "C" fn deoptimize(
             ctx.error = Some(error);
             0
         }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Exits through inlined frames taken on this thread: the exiting frame's depth in its chain
+    /// (1 the outermost inlined frame), its pc and the reason (tests).
+    pub(crate) static TEST_INLINED_EXITS: std::cell::RefCell<Vec<(usize, u32, ExitReason)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// An inlined frame the deoptimizer rebuilt (`deoptimize_frames`): its record, the callee's
+/// bookkeeping a call would make, and its call in its parent.
+struct Rebuilt {
+    record: std::ptr::NonNull<crate::jit::JitFrame>,
+    /// The callee's identity (`Gc::as_ptr`), rooted by its parent's operand words, where the
+    /// call's window holds it.
+    fn_ptr: usize,
+    strict: bool,
+    arrow: bool,
+    uses_this: bool,
+    /// The parent's chunk and the call's pc there.
+    parent_chunk: *const crate::bytecode::Chunk,
+    call_pc: u32,
+    /// The parent's operand depth without the call's operands: where the call's result goes.
+    parent_depth: usize,
+}
+
+/// Where the innermost frame resumes: the exit's pc, its operand depth and the throw it carries.
+struct Top {
+    pc: usize,
+    depth: usize,
+    pending: Option<crate::value::Value>,
+}
+
+/// What `deoptimize_frames` checks of its first phase (tests): when every frame's values are
+/// written, nothing has been allocated or collected and no frame entered since the exit.
+#[cfg(test)]
+struct Quiet {
+    collections: u64,
+    objects: u64,
+    frames: usize,
+    depth: u32,
+}
+
+#[cfg(test)]
+impl Quiet {
+    fn now(i: &crate::interpreter::Interp) -> Self {
+        Quiet {
+            collections: i.gc_heap.core.borrow().collections(),
+            objects: crate::value::heap_allocated_objects(&i.gc_heap),
+            frames: i.fn_frames.len(),
+            depth: i.depth,
+        }
+    }
+
+    fn check(&self, i: &crate::interpreter::Interp) {
+        assert!(
+            i.gc_heap.core.borrow().collections() == self.collections
+                && crate::value::heap_allocated_objects(&i.gc_heap) == self.objects
+                && i.fn_frames.len() == self.frames
+                && i.depth == self.depth,
+            "a frame's values written after an allocation, a collection or a frame's entry"
+        );
+    }
+}
+
+/// An exit through inlined frames (P3 stage 3, step 1; D5): every frame rebuilt first, then the
+/// innermost run in the VM and each parent resumed after its call, as V8's deoptimizer builds an
+/// interpreter frame per function, the non-topmost ones advancing past their call with the
+/// callee's result (deoptimizer/deoptimizer.cc:2080-2094, 2296-2300), SpiderMonkey rebuilds a
+/// Baseline frame per inlined frame (jit/Bailouts.h:100-131) and JSC reifies every inline call
+/// frame (dfg/DFGOSRExitCompilerCommon.cpp:293-415) before the innermost resumes.
+///
+/// (a) Every frame's values in rooted storage before anything allocates or collects: the compiled
+/// frame's in its slots and operand words, as a one-frame exit writes them; each inlined frame's
+/// in a pooled activation record popped for it, which the collector traces while it is out of
+/// the pool, its receiver its `this` until (b) binds it; each call's window, the callee and a
+/// CallWithThis's receiver, in its parent's operand words above the parent's depth, where a
+/// call's operands lie while it runs (SpiderMonkey's caller frame keeps the call's callee and
+/// `this` the same way, jit/BaselineBailouts.cpp:1036-1060). (b) For each inlined frame,
+/// outermost first, the bookkeeping of a call (`Interp::enter_call_frame`, the call path's own):
+/// the depth and its check, an FnFrame with the call's position in its parent, the construct
+/// state saved; then `this` bound. (c) The innermost frame runs in the VM from the exit's pc on
+/// its record (`run_native_frame_in_vm`). (d) Each parent resumes from its call's pc + 1 with the
+/// result pushed, or from the call's pc with the throw pending, which the VM routes to the
+/// parent's handler or out; an interruption passes every frame; each frame's FnFrame is popped and
+/// its record released as its run ends (`Interp::leave_call_frame`). (e) The compiled frame's
+/// completion goes to the stub's epilogue, as a one-frame exit's.
+///
+/// # Safety
+/// As [`deoptimize`]'s, `exit` an exit of `table` through an inlined frame.
+#[cold]
+#[inline(never)]
+unsafe fn deoptimize_frames(
+    ctx: &mut crate::jit::JitCtx,
+    table: &ExitTable,
+    exit: &ExitRecord,
+    reason: ExitReason,
+    saved: *const u64,
+) -> u64 {
+    use crate::interpreter::Abrupt;
+    use crate::value::Value;
+    let i = unsafe { &mut *ctx.interp };
+    #[cfg(test)]
+    let quiet = Quiet::now(i);
+    // A throw the exit carries; an interruption leaves the function as it is, no frame rebuilt.
+    let mut pending = match exit.kind {
+        ExitKind::Check => None,
+        ExitKind::PollThrow => match ctx.error.take() {
+            Some(Abrupt::Throw(error)) => Some(error),
+            other => {
+                ctx.error = other;
+                return 0;
+            }
+        },
+        ExitKind::EffectThrow => unreachable!("no effect runs in an inlined frame (step 3's)"),
+    };
+    // The chain, innermost first.
+    let mut chain: Vec<u16> = Vec::new();
+    let mut frame = exit.frame;
+    while frame != 0 {
+        chain.push(frame);
+        frame = table.frame(frame).parent;
+    }
+    #[cfg(test)]
+    TEST_INLINED_EXITS.with(|exits| exits.borrow_mut().push((chain.len(), exit.pc, reason)));
+    let chunk = unsafe { &*ctx.chunk };
+    // (a) Each inlined frame, outermost first: its record and its values, its call's window in
+    // its parent's operand words. A frame's own state is the exit's for the innermost, and the
+    // parent recipe of the frame above it for the others; the compiled frame's, the outermost
+    // inlined frame's parent recipe.
+    let state_of = |k: usize| -> (&[(u16, Source)], &[Source], &[(u32, u32)]) {
+        // The state of chain[k]: its own exit's, or the parent recipe of chain[k - 1].
+        if k == 0 {
+            (&exit.slots, &exit.stack, &exit.handlers)
+        } else {
+            let above = table.frame(chain[k - 1]);
+            (&above.slots, &above.stack, &above.handlers)
+        }
+    };
+    let outermost = table.frame(*chain.last().expect("an inlined frame"));
+    let mut rebuilt: Vec<Rebuilt> = Vec::with_capacity(chain.len());
+    // The compiled frame's values, as a one-frame exit writes them.
+    unsafe {
+        write_values(
+            ctx,
+            &outermost.slots,
+            &outermost.stack,
+            saved,
+            #[cfg(test)]
+            (&quiet, &*i),
+        )
+    };
+    let (code_base, genv) = (ctx.code_base as usize, ctx.genv);
+    for k in (0..chain.len()).rev() {
+        let recipe = table.frame(chain[k]);
+        let callee_chunk = unsafe { &*inlined_chunk(code_base, recipe.chunk) };
+        let callee = unsafe { read(saved, recipe.callee) };
+        let receiver = unsafe { read(saved, recipe.receiver) };
+        let object = callee
+            .as_obj()
+            .expect("an inlined frame's callee is a function (its identity guard)");
+        let (strict, arrow, env) = match &object.borrow().kind {
+            crate::value::ObjectKind::User(user) => {
+                (user.func.is_strict, user.func.is_arrow, user.env)
+            }
+            _ => unreachable!("an inlined frame's callee is an author function"),
+        };
+        // The call's window in its parent's operand words, above the parent's depth.
+        let parent_ctx = match rebuilt.last() {
+            None => &mut *ctx,
+            Some(parent) => unsafe { &mut (*parent.record.as_ptr()).ctx },
+        };
+        let parent_chunk = parent_ctx.chunk;
+        let parent_depth = state_of(k + 1).1.len();
+        unsafe { write_window(parent_ctx, parent_depth, recipe.call_pc, callee, receiver) };
+        let record = i
+            .frame_pool
+            .pop()
+            .unwrap_or_else(|| crate::jit::JitFrame::alloc(i));
+        let record_ctx = unsafe { &mut (*record.as_ptr()).ctx };
+        let (_, n_slots) = callee_chunk.jit_frame();
+        record_ctx.chunk = callee_chunk;
+        record_ctx.n_slots = n_slots;
+        record_ctx.stack_base = unsafe { record_ctx.slots.add(n_slots).cast::<Value>() };
+        record_ctx.final_sp = record_ctx.stack_base;
+        record_ctx.env_raw = crate::interpreter::Env::as_ptr(&env) as *const u8;
+        record_ctx.env_parent_raw = crate::jit::jit_env_parent_raw(&env);
+        record_ctx.genv = genv;
+        // Unbound until (b): the record keeps it meanwhile.
+        record_ctx.set_this(receiver);
+        // An inlined frame's every slot: Undefined, then the recipe's (Dead slots stay so).
+        let slots = unsafe { std::slice::from_raw_parts(record_ctx.slots, n_slots) };
+        for slot in slots {
+            slot.set(Value::Undefined);
+        }
+        let (own_slots, own_stack, _) = state_of(k);
+        unsafe {
+            write_values(
+                record_ctx,
+                own_slots,
+                own_stack,
+                saved,
+                #[cfg(test)]
+                (&quiet, &*i),
+            )
+        };
+        rebuilt.push(Rebuilt {
+            record,
+            fn_ptr: crate::value::Gc::as_ptr(&object) as usize,
+            strict,
+            arrow,
+            uses_this: callee_chunk.needs_frame_this(),
+            parent_chunk,
+            call_pc: recipe.call_pc,
+            parent_depth,
+        });
+    }
+    #[cfg(test)]
+    quiet.check(i);
+    // Tests: each rebuilt frame's callee lies in its call's window, in its parent's operand words,
+    // which root it while the frame runs (its FnFrame holds no handle, `FnFrame::fn_ptr`).
+    #[cfg(test)]
+    for (level, frame) in rebuilt.iter().enumerate() {
+        let parent = match level {
+            0 => &*ctx,
+            _ => unsafe { &(*rebuilt[level - 1].record.as_ptr()).ctx },
+        };
+        let window =
+            unsafe { std::slice::from_raw_parts(parent.stack_base.add(frame.parent_depth), 2) };
+        assert!(
+            window.iter().any(|word| word
+                .as_obj()
+                .is_some_and(|callee| crate::value::Gc::as_ptr(&callee) as usize == frame.fn_ptr)),
+            "a rebuilt frame's callee in its call's window"
+        );
+    }
+    // Every frame's values are in rooted storage: the count, whose discard may allocate.
+    count(i, chunk, table, exit, reason);
+    // Each frame's handler records, rebuilt from its state against its own chunk.
+    let frame_handlers = |frame_ctx: &mut crate::jit::JitCtx, handlers: &[(u32, u32)]| {
+        let frame_chunk = unsafe { &*frame_ctx.chunk };
+        frame_ctx.handlers.clear();
+        frame_ctx
+            .handlers
+            .extend(handlers.iter().map(|&(push_pc, depth)| {
+                crate::bytecode::pushed_handler(frame_chunk, push_pc as usize, depth as usize)
+            }));
+    };
+    frame_handlers(ctx, state_of(chain.len()).2);
+    for (level, frame) in rebuilt.iter().enumerate() {
+        let k = chain.len() - 1 - level;
+        frame_handlers(unsafe { &mut (*frame.record.as_ptr()).ctx }, state_of(k).2);
+    }
+    let mut depth = exit.stack.len();
+    if pending.is_some() {
+        // The innermost handler restores its depth; the words above it are dead.
+        if let Some(&(_, handler_depth)) = exit.handlers.last() {
+            depth = depth.min(handler_depth as usize);
+        }
+    }
+    let top = Top {
+        pc: exit.pc as usize,
+        depth,
+        pending: pending.take(),
+    };
+    let inner = unsafe { run_inlined(i, &rebuilt, 0, top) };
+    let result = unsafe { resume(ctx, &rebuilt[0], inner) };
+    complete(ctx, result)
+}
+
+/// Write a frame's values from the save area: the slots its recipe names and its operand words.
+///
+/// # Safety
+/// As [`deoptimize`]'s; `frame` a frame's record of the recipe's chunk.
+unsafe fn write_values(
+    frame: &mut crate::jit::JitCtx,
+    slots: &[(u16, Source)],
+    stack: &[Source],
+    saved: *const u64,
+    #[cfg(test)] (quiet, i): (&Quiet, &crate::interpreter::Interp),
+) {
+    #[cfg(test)]
+    quiet.check(i);
+    let words = unsafe { std::slice::from_raw_parts(frame.slots, frame.n_slots) };
+    for &(slot, source) in slots {
+        words[slot as usize].set(unsafe { read(saved, source) });
+    }
+    for (k, &source) in stack.iter().enumerate() {
+        let word = unsafe { read(saved, source) };
+        debug_assert!(!word.is_empty(), "an Empty word on the operand stack");
+        unsafe { frame.stack_base.add(k).write(word) };
+    }
+}
+
+/// A call's window in its parent's operand words, from `depth` up, as the call left them while it
+/// ran: a Call's callee; a CallWithThis's receiver, then its callee (bytecode.rs's Op::Call and
+/// Op::CallWithThis). The parent's VM run starts below them; they root the callee meanwhile.
+///
+/// # Safety
+/// `parent` is a frame's record whose operand words hold the call's window.
+unsafe fn write_window(
+    parent: &mut crate::jit::JitCtx,
+    depth: usize,
+    call_pc: u32,
+    callee: crate::value::Value,
+    receiver: crate::value::Value,
+) {
+    let chunk = unsafe { &*parent.chunk };
+    unsafe {
+        match chunk.jit_ops()[call_pc as usize] {
+            crate::bytecode::Op::Call(..) => parent.stack_base.add(depth).write(callee),
+            crate::bytecode::Op::CallWithThis(..) => {
+                parent.stack_base.add(depth).write(receiver);
+                parent.stack_base.add(depth + 1).write(callee);
+            }
+            _ => unreachable!("an inlined frame's call is a Call or a CallWithThis (verify.rs)"),
+        }
+    }
+}
+
+/// Inlined frames `frames[level..]` (outermost first) entered as their calls enter them, the
+/// innermost run from `top`, and each resumed after the frame above it, back to `frames[level]`'s
+/// completion (see `deoptimize_frames`'s (b) to (d)). A frame whose entry fails (the depth past
+/// its limit, a collection's throw, an interruption) completes so, as its call would, and the
+/// frames above it are released unrun.
+///
+/// # Safety
+/// `frames` were rebuilt by `deoptimize_frames` for this exit; their records are out of the pool.
+unsafe fn run_inlined(
+    i: &mut crate::interpreter::Interp,
+    frames: &[Rebuilt],
+    level: usize,
+    top: Top,
+) -> Result<crate::value::Value, crate::interpreter::Abrupt> {
+    let frame = &frames[level];
+    // The call's position in its parent, which its frame keeps (`explicit_call`'s).
+    i.call_site =
+        crate::bytecode::call_op_position(unsafe { &*frame.parent_chunk }, frame.call_pc as usize);
+    let entry = match i.enter_call_frame(frame.fn_ptr, frame.strict, frame.arrow) {
+        Ok(entry) => entry,
+        Err(error) => {
+            i.call_site = crate::stack_trace::NO_POSITION;
+            for unrun in &frames[level..] {
+                unsafe { crate::jit::JitFrame::release(i, unrun.record) };
+            }
+            return Err(error);
+        }
+    };
+    let record = unsafe { &mut (*frame.record.as_ptr()).ctx };
+    let this = i.bind_this_word(record.this_value(), frame.uses_this, frame.strict);
+    record.set_this(this);
+    let depth = i.depth;
+    let result = crate::interpreter::with_execution_stack(depth, || {
+        if level + 1 < frames.len() {
+            let inner = unsafe { run_inlined(i, frames, level + 1, top) };
+            unsafe { resume(record, &frames[level + 1], inner) }
+        } else {
+            unsafe {
+                crate::bytecode::run_native_frame_in_vm(record, top.pc, top.depth, top.pending)
+            }
+        }
+    });
+    let result = i.leave_call_frame(entry, result);
+    i.call_site = crate::stack_trace::NO_POSITION;
+    unsafe { crate::jit::JitFrame::release(i, frame.record) };
+    result
+}
+
+/// `parent`'s run after its call to `callee` (an inlined frame) completed with `inner`: from the
+/// call's pc + 1 with the value pushed where the call's window began, as the call leaves it; from
+/// the call's pc with a throw pending, which the VM routes to the parent's handler or out, at the
+/// innermost handler's depth; an interruption passes it unrun.
+///
+/// # Safety
+/// `parent` is the record of `callee`'s parent, its values and handlers rebuilt.
+unsafe fn resume(
+    parent: &mut crate::jit::JitCtx,
+    callee: &Rebuilt,
+    inner: Result<crate::value::Value, crate::interpreter::Abrupt>,
+) -> Result<crate::value::Value, crate::interpreter::Abrupt> {
+    use crate::interpreter::Abrupt;
+    match inner {
+        Ok(value) => {
+            unsafe { parent.stack_base.add(callee.parent_depth).write(value) };
+            unsafe {
+                crate::bytecode::run_native_frame_in_vm(
+                    parent,
+                    callee.call_pc as usize + 1,
+                    callee.parent_depth + 1,
+                    None,
+                )
+            }
+        }
+        Err(Abrupt::Throw(error)) => {
+            let depth = parent
+                .handlers
+                .last()
+                .map_or(callee.parent_depth, |handler| {
+                    callee.parent_depth.min(handler.stack_depth)
+                });
+            unsafe {
+                crate::bytecode::run_native_frame_in_vm(
+                    parent,
+                    callee.call_pc as usize,
+                    depth,
+                    Some(error),
+                )
+            }
+        }
+        Err(other) => Err(other),
     }
 }
 

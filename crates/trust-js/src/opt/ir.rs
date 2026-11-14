@@ -967,6 +967,28 @@ impl Graph {
         }
     }
 
+    /// Whether a handler record is active in `state`'s frame or any frame of its chain, so that a
+    /// throw there exits to the VM rather than leaving the function (stage 3).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(dead_code, reason = "the back end and its tests use it")
+    )]
+    pub(crate) fn chain_has_handlers(&self, state: StateIx) -> bool {
+        let mut state = self.state(state);
+        loop {
+            if !state.handlers.is_empty() {
+                return true;
+            }
+            match self.inlined(state.frame) {
+                Some(inlined) => state = self.state(inlined.parent),
+                None => return false,
+            }
+        }
+    }
+
     /// Records an edge (predecessor lists are in the order edges are added).
     pub(crate) fn add_edge(&mut self, from: BlockIx, to: BlockIx) {
         self.blocks[from.index()].succs.push(to);

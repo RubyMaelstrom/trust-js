@@ -157,6 +157,7 @@ pub(crate) fn compile(job: Job) -> Finished {
             &job.view,
             &graph,
             &cfg,
+            &[],
             initialized,
             &job.layout,
             &job.ilayout,

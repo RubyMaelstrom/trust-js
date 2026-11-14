@@ -910,7 +910,13 @@ fn finish(
             }
         },
     };
-    let code = a64::link(assembled, executable, chunk);
+    // No graph the builder makes has inlined frames yet (stage 3, step 2's): nothing to hold.
+    let code = a64::link(
+        assembled,
+        executable,
+        chunk,
+        super::exit::Inlined::default(),
+    );
     if embeds_genv {
         if let Some(pin) = pin {
             pin_global_environment(i, pin);
@@ -1659,7 +1665,7 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
     if reoptimizing && !no_exit_profile() {
         for exit in &taken {
             if !matches!(exit.reason, ExitReason::Throw | ExitReason::Unsupported) {
-                flag(chunk, exit);
+                flag(chunk, exit, super::exit::exit_chunk(table, exit));
             }
         }
     }
@@ -1753,9 +1759,12 @@ fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'stati
 
 /// Add `exit`'s site to the exit profile (see `opt::profile`): at the baseline site `chunk`'s
 /// record map names for its pc, on that first-stage chunk and marked whether it is a splice's,
-/// or at the pc on `chunk` itself; a WrongShape site with the shapes its check expected, a
+/// or at the pc on `chunk` itself; an inlined frame's exit (`inlined`, the frame's first-stage
+/// chunk; stage 3) at its pc on that chunk, marked inlined, the key splices use, as JSC adds an
+/// exit site of an inline call frame to its baseline code block marked ExitFromInlined
+/// (dfg/DFGOSRExitBase.cpp:38-60); a WrongShape site with the shapes its check expected, a
 /// NotNumber site with whether an oddball truncation exited. Logs each new site.
-fn flag(chunk: &Chunk, exit: &ExitRecord) {
+fn flag(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>) {
     let shapes = match exit.reason {
         ExitReason::WrongShape => exit.shape_check.as_ref().map_or(0, |check| {
             check.shapes.len().min(usize::from(u8::MAX)) as u8
@@ -1766,9 +1775,12 @@ fn flag(chunk: &Chunk, exit: &ExitRecord) {
         ExitReason::NotNumber => exit.proof,
         _ => 0,
     };
-    let (at, pc, inlined) = match profile::baseline_site(chunk, exit.pc as usize) {
-        Some((baseline, pc, spliced)) => (baseline, pc as u32, spliced),
-        None => (chunk, exit.pc, false),
+    let (at, pc, inlined) = match inlined {
+        Some(callee) => (callee, exit.pc, true),
+        None => match profile::baseline_site(chunk, exit.pc as usize) {
+            Some((baseline, pc, spliced)) => (baseline, pc as u32, spliced),
+            None => (chunk, exit.pc, false),
+        },
     };
     let latest = exit.reason == ExitReason::WrongName;
     let new = ChunkProfile::of(at).add_site(pc, exit.reason as u8, inlined, shapes, latest);

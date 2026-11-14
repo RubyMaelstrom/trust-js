@@ -16629,6 +16629,30 @@ impl Interp {
         self.leave_call_frame(entry, r)
     }
 
+    /// A call's bookkeeping before its callee runs (P3 stage 3, step 1, shared by the cached call
+    /// paths and the optimizing tier's exits, whose rebuilt frames enter as calls do):
+    /// [`Interp::enter_call_depth`], then [`Interp::push_call_frame`]. Pair it with
+    /// [`Interp::leave_call_frame`] when the callee's run ends.
+    // The tier's exits call it (the cached paths call its halves apart): ARM64's only until the
+    // plan's stage 6.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(dead_code, reason = "the tier's exits use it")
+    )]
+    #[inline(always)]
+    pub(crate) fn enter_call_frame(
+        &mut self,
+        fn_ptr: usize,
+        strict: bool,
+        lexical_this: bool,
+    ) -> Result<CallEntry, Abrupt> {
+        self.enter_call_depth()?;
+        Ok(self.push_call_frame(fn_ptr, strict, lexical_this))
+    }
+
     /// A call's entry's first half: the depth and its check, which throws the RangeError a call
     /// past the limit throws, and the amortized collection check; the depth given back where
     /// either fails. The cached call paths read their callee's facts after it, for

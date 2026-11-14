@@ -2580,7 +2580,7 @@ pub(crate) fn jscvt_available() -> bool {
     })
 }
 
-fn jit_env_parent_raw(env: &Env) -> *const u8 {
+pub(crate) fn jit_env_parent_raw(env: &Env) -> *const u8 {
     env.borrow()
         .parent
         .as_ref()
