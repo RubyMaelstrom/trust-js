@@ -377,3 +377,62 @@ fn the_string_programs_loads_take_string_prototype_before_its_mutations() {
         );
     }
 }
+
+#[test]
+fn a_this_read_after_a_call_that_swaps_its_prototype_reads_the_new_holder() {
+    // `this` is one node through the whole function, so its facts would cross a call if the
+    // link facts did not end at effects: the call swaps the receiver's prototype for one of the
+    // same shape and another value, and the second read must walk again.
+    let source = "function P() {} P.prototype.p = 1; P.prototype.t = function (f) { \
+         var a = this.p; f(this); return a * 10 + this.p; };\n\
+         function Q() {} Q.prototype.p = 2; Q.prototype.t = P.prototype.t;\n\
+         function keep(o) {} function swap(o) { Object.setPrototypeOf(o, Q.prototype); }\n\
+         let t = 0; for (let k = 0; k < 3000; k++) t = t + new P().t(keep); t";
+    let after = "let u = 0; for (let k = 0; k < 50; k++) u = u + new P().t(swap); u";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [eval(&mut vm, source), eval(&mut vm, after)]
+    };
+    assert_eq!(expected[1], "600", "the VM reads Q's p after the swap");
+    eager().set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, source), expected[0]);
+    assert_eq!(eval(&mut engine, after), expected[1]);
+}
+
+#[test]
+fn a_prototype_set_to_null_exits_at_the_walk_and_converges() {
+    // A receiver of the way's shape whose [[Prototype]] is null: the hop's null test exits
+    // (the VM reads undefined) until the discard; the recompile takes the effect.
+    let warm = "function P() { this.v = 1; } P.prototype.p = 7;\n\
+         function f(o) { return o.p; } const a = new P();\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = t + f(a); t";
+    converges(
+        "f",
+        warm,
+        "const n = new P(); Object.setPrototypeOf(n, null); \
+         let u = 0; for (let k = 0; k < 600; k++) u = u + (f(n) === undefined ? 1 : 0); u",
+        "f(a) + ':' + f(n)",
+        ExitReason::WrongShape,
+    );
+}
+
+#[test]
+fn a_proxy_in_the_chain_exits_at_the_walk_and_converges() {
+    // A Proxy as a receiver's prototype is no ordinary IC_PLAIN object: the hop exits until the
+    // discard (the VM runs the trap), and the recompile takes the effect.
+    let warm = "function P() { this.v = 1; } P.prototype.p = 7;\n\
+         function f(o) { return o.p; } const a = new P();\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = t + f(a); t";
+    converges(
+        "f",
+        warm,
+        "const x = new P(); Object.setPrototypeOf(x, new Proxy(P.prototype, \
+         { get(t, k, r) { return k === 'p' ? 9 : Reflect.get(t, k, r); } })); \
+         let u = 0; for (let k = 0; k < 600; k++) u = u + f(x); u",
+        "f(a) + ':' + f(x)",
+        ExitReason::WrongShape,
+    );
+}
