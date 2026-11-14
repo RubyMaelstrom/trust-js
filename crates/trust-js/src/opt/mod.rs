@@ -404,6 +404,7 @@ pub(crate) fn pin_forced_exits_off_for_test() {
         stub_memory_refused: stub_test_switches().0,
         stubs_write_d8: stub_test_switches().1,
         inline_graph: None,
+        poison: poison(),
     }
     .set();
 }
@@ -432,6 +433,7 @@ pub(crate) fn pin_synchronous_for_test() {
         stub_memory_refused: stub_test_switches().0,
         stubs_write_d8: stub_test_switches().1,
         inline_graph: None,
+        poison: poison(),
     }
     .set();
 }
@@ -460,6 +462,7 @@ pub(crate) fn pin_loop_count_off_for_test() {
         stub_memory_refused: stub_test_switches().0,
         stubs_write_d8: stub_test_switches().1,
         inline_graph: None,
+        poison: poison(),
     }
     .set();
 }

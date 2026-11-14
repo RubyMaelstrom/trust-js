@@ -140,6 +140,8 @@ pub(crate) struct TestSwitches {
     /// TRUST_JS_OPT_INLINE's mode for this thread: Some(true) graph, Some(false) splice, None
     /// the environment's (P3 stage 3, step 2), so that the suites run under the variable.
     pub(crate) inline_graph: Option<bool>,
+    /// TRUST_JS_OPT_POISON (P3 stage 3 step 3a), which the environment turns on as well.
+    pub(crate) poison: bool,
 }
 
 #[cfg(test)]
@@ -300,6 +302,17 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn pin_splice(pinned: bool) {
     SPLICE_PINNED.with(|pin| pin.set(pinned));
+}
+
+/// TRUST_JS_OPT_POISON: the tier's code writes a poison word into the frame's stale words before
+/// each generic node (P3 stage 3 step 3a, `a64::Options::poison`), a diagnostic of what templates
+/// and helpers read of the frame; a test's switches can turn it on too.
+pub(crate) fn poison() -> bool {
+    #[cfg(test)]
+    if test_switches().is_some_and(|switches| switches.poison) {
+        return true;
+    }
+    env_flag!("TRUST_JS_OPT_POISON")
 }
 
 /// TRUST_JS_OPT_NO_REOPT: stage 1's fallback for good: a discard records no exit profile, adds

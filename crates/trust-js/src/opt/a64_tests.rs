@@ -4511,3 +4511,41 @@ fn f64_constants_take_fmovs_immediate_where_it_encodes() {
         }
     }
 }
+
+/// The poison switch (P3 stage 3 step 3a): the builder's graph of a function whose call is a
+/// generic node, with `x` held in a register across it, compiled with the switch: its code stores
+/// the poison word (built in x16, its top half by MOVK #0x8bad, LSL #48) into the frame's stale
+/// words before the call, and the result is the language's; without the switch, no poison.
+#[test]
+fn the_poison_switch_overwrites_the_stale_frame_words_before_a_generic_node() {
+    let source = "function pz(o, g) { var x = o.a + 1; g(); return x + o.a; }
+         function nothing() {} for (var k = 0; k < 20; k++) pz({a: k}, nothing);";
+    let poison_top = encode(|a| a.movk(16, 0x8bad, 3));
+    for poison in [true, false] {
+        let mut engine = fixture(source);
+        let chunk = chunk_of(&mut engine, "pz");
+        let snapshot = crate::opt::snapshot::Snapshot::take(&chunk);
+        let built = crate::opt::build::build(&chunk, &snapshot).expect("the tier builds pz");
+        assert!(
+            built
+                .graph
+                .nodes
+                .iter()
+                .any(|node| matches!(node.op, NodeOp::Generic { .. })),
+            "the call is a generic node"
+        );
+        let code = install(
+            &mut engine,
+            "pz",
+            &built.graph,
+            Options {
+                poison,
+                ..Options::default()
+            },
+        );
+        assert_eq!(holds(&code_words(&code), poison_top, !31), poison);
+        exits();
+        assert_eq!(eval(&mut engine, "pz({a: 2}, nothing)"), "5");
+        assert!(exits().is_empty(), "poison {poison}");
+    }
+}

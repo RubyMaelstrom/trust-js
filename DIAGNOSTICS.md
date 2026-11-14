@@ -123,6 +123,13 @@ comment/example in the same change.
   `TRUST_JS_OPT_LOOP_EXIT_LIMIT=N` (a positive N) sets the base of the limit for exited frames
   that loop in place of 5 (JSC's `osrExitCountForReoptimizationFromLoop`); it never passes the
   exit limit.
+  `TRUST_JS_OPT_POISON=1` compiles a store of a poison Number (`0x8badf00ddeadbeef`) before
+  each generic node of the tier's code (P3 stage 3 step 3a: an operation the tier does not lower,
+  run on the canonical operand words with explicit operands) into every frame word its state does
+  not hold current: the slots it does not name whose values live in registers or spill slots or
+  that are dead, and the operand words below its operands; a template or helper that read one
+  would compute with the poison (a diagnostic of what they read of the frame; results differing
+  from the tier off's mean a hidden reader).
   `TRUST_JS_OPT_VERIFY=1` verifies each graph the tier builds in a release build (its SSA
   dominance, representations, frame states and terminators) and refuses a graph that fails,
   logging why under `TRUST_JS_OPT_LOG`; debug builds and the library's tests always verify, and

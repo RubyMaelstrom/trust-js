@@ -89,7 +89,16 @@ pub(crate) struct Options {
     /// The sequences for a core without FEAT_JSCVT where it has it (tests; the switch
     /// TRUST_JS_JIT_NO_JSCVT does the same for a process through jscvt_available).
     pub(crate) no_jscvt: bool,
+    /// The poison before each generic node (TRUST_JS_OPT_POISON; P3 stage 3 step 3a): the frame's
+    /// stale words, the slots it does not name whose words the state does not hold current and
+    /// the operand words below its operands, overwritten with [`POISON`], so that a template or
+    /// helper that read one would compute with it, which the tests' results show.
+    pub(crate) poison: bool,
 }
+
+/// The word the poison switch writes (`Options::poison`): a Number by value.rs's encoding (a
+/// tiny negative double), which names no cell and which no program computes in passing.
+pub(crate) const POISON: u64 = 0x8bad_f00d_dead_beef;
 
 impl Options {
     /// The options the switches select (main thread: TRUST_JS_OPT_EXIT_EVERY is a test's switch
@@ -98,6 +107,7 @@ impl Options {
         Options {
             forced_exits: crate::opt::exit_every() > 0,
             no_jscvt: false,
+            poison: crate::opt::poison(),
         }
     }
 }
@@ -2587,6 +2597,9 @@ impl Gen<'_> {
                 self.a.str_imm(word, 22, 8 * u32::from(slot));
             }
         }
+        if self.options.poison && generic {
+            self.poison(node, state, depth - pops);
+        }
         self.a.add_imm(20, X9, (8 * depth) as u32);
         let unwind = if handlers {
             let site = self.exit_throw(n)?;
@@ -2623,6 +2636,28 @@ impl Gen<'_> {
         self.a.set_hot(false);
         self.last_effect = Some(n);
         Ok(())
+    }
+
+    /// The poison switch's stores before generic node `node` (`Options::poison`): every slot its
+    /// operation does not name whose word `state` does not say current (a value's, stale; a dead
+    /// slot's), and the `below` operand words under its operands, x9 holding `stack_base`. Every
+    /// exit writes what it needs of them from its recipe (a throw's too), and the VM writes a dead
+    /// slot before it reads it.
+    fn poison(&mut self, node: &Node, state: &FrameState, below: usize) {
+        let named = crate::opt::liveness::frame_slots(
+            &self.chunk.jit_ops()[node.pc as usize],
+            self.graph.n_slots,
+        );
+        self.a.mov_imm64(X16, POISON);
+        for (slot, source) in state.slots.iter().enumerate() {
+            let stale = matches!(source, SlotSource::Value(_) | SlotSource::Dead);
+            if stale && !named.iter().any(|&(name, _)| usize::from(name) == slot) {
+                self.a.str_imm(X16, 22, 8 * slot as u32);
+            }
+        }
+        for k in 0..below {
+            self.a.str_imm(X16, X9, 8 * k as u32);
+        }
     }
 
     /// The label a branch from `from` to `to` takes: the block's, or a trampoline that makes the

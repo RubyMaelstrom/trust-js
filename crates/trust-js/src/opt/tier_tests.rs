@@ -3391,6 +3391,17 @@ pub(crate) const GENERIC_PROGRAMS: &[&str] = &[
 
 #[test]
 fn generic_nodes_results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits() {
+    generic_programs(false);
+}
+
+/// GENERIC_PROGRAMS with the poison switch on (P3 stage 3 step 3a): the frame's stale words
+/// overwritten before every generic node, which no template or helper may read.
+#[test]
+fn generic_nodes_read_no_stale_frame_word_under_the_poison_switch() {
+    generic_programs(true);
+}
+
+fn generic_programs(poison: bool) {
     let configurations = [
         (
             "on",
@@ -3398,16 +3409,18 @@ fn generic_nodes_results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits(
                 on: true,
                 eager: false,
                 exit_every: 0,
+                poison,
                 ..Default::default()
             },
         ),
-        ("eager", eager()),
+        ("eager", TestSwitches { poison, ..eager() }),
         (
             "forced exits",
             TestSwitches {
                 on: true,
                 eager: true,
                 exit_every: 7,
+                poison,
                 ..Default::default()
             },
         ),
