@@ -545,8 +545,16 @@ impl Rules<'_> {
         if let Some(chain) = self.chain_ways(pc, name) {
             return !self.stale_shapes(pc, &chain.shapes);
         }
-        self.poly_ways(pc, name)
-            .is_some_and(|arms| !self.stale_shapes(pc, &arm_shapes(&arms)))
+        if let Some(arms) = self.poly_ways(pc, name) {
+            return !self.stale_shapes(pc, &arm_shapes(&arms));
+        }
+        // A way-less `length` (P3 stage 3 step L3, `Builder::length`): a String's, or where
+        // WrongShape is flagged an Array's, unless its checks are flagged too.
+        self.length_site(pc, name)
+            && (!self.snapshot.declines(pc, ExitReason::WrongShape)
+                || ![ExitReason::WrongElements, ExitReason::NotObject]
+                    .iter()
+                    .any(|&reason| self.snapshot.declines(pc, reason)))
     }
 
     /// Whether the read of `name` at `pc` is a `length` whose site filled no way and holds no
@@ -870,9 +878,26 @@ impl Rules<'_> {
             Op::SetProp(name, _)
             | Op::SetPropDrop(name, _)
             | Op::SetPropThisDrop(name, _)
-            | Op::SetPropLocalDrop(_, name, _) => self
-                .own_data_ways(pc, name, true)
-                .is_some_and(|ways| !self.stale_ways(pc, &ways)),
+            | Op::SetPropLocalDrop(_, name, _) => match self.own_data_ways(pc, name, true) {
+                Some(ways) => !self.stale_ways(pc, &ways),
+                // A creation (P3 stage 3 step L3, `Builder::creation_store`).
+                None => self
+                    .creation_ways(pc, name)
+                    .is_some_and(|creation| !self.stale_shapes(pc, &[creation.shape])),
+            },
+            // P3 stage 3 step L3: `Builder::update_prop` and `Builder::append_prop`.
+            Op::UpdateProp(name, _, _) => {
+                self.numbers(pc, false).is_some()
+                    && self
+                        .own_data_ways(pc, name, true)
+                        .is_some_and(|ways| !self.stale_ways(pc, &ways))
+                    && !flagged(&[ExitReason::NotNumber])
+            }
+            Op::AppendProp(name, _) => {
+                self.own_data_ways(pc, name, true)
+                    .is_some_and(|ways| !self.stale_ways(pc, &ways))
+                    && !flagged(&[ExitReason::NotNumber])
+            }
             Op::GetElem | Op::GetElemLocal(_) => self.element_site(pc).is_some_and(|site| {
                 !flagged(LOAD_DECLINES)
                     && match site.typed {

@@ -1354,3 +1354,8 @@ mod typed_loop;
 /// P3 stage 3 step L2 under TRUST_JS_OPT_INLINE=graph: callees whose loads go through the chain.
 #[path = "chain_inline_tests.rs"]
 mod chain;
+
+/// P3 stage 3 step L3 under TRUST_JS_OPT_INLINE=graph: callees that create, update and read a
+/// String's length.
+#[path = "create_inline_tests.rs"]
+mod create;

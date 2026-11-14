@@ -125,3 +125,47 @@ fn a_strings_length_is_its_tag_check_and_header_read_once() {
     assert_eq!(lengths[0].rep, Rep::I32, "{text}");
     assert_eq!(lengths[0].reason, Some(ExitReason::WrongShape), "{text}");
 }
+
+/// P3 stage 3 step L3 D: the rules say these forms lower, so a loop holding them is free of
+/// effects: its invariant `a` is one value through the loop, read from no frame slot again.
+#[test]
+fn loops_of_updates_creations_and_lengths_are_free_of_effects() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function up(o, a, n) { let s = 0; for (let i = 0; i < n; i++) { o.x++; s = s + a; } return s; }
+         function app(o, a, n) { let s = 0; for (let i = 0; i < n; i++) { o.k += 1; s = s + a; } return s; }
+         function len(t, a) { let s = 0; for (let i = 0; i < t.length; i++) s = s + a; return s; }
+         function mk(os, a, n) { let s = 0; for (let i = 0; i < n; i++) { os[i].z = i; s = s + a; } return s; }
+         for (var r = 0; r < 20; r++) {
+           up({ x: 1 }, 0.5, 3); app({ k: 1 }, 0.5, 3); len('abcd', 0.5);
+           mk([{ y: 1 }, { y: 2 }, { y: 3 }], 0.5, 3);
+         }",
+    );
+    for name in ["up", "app", "len"] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        assert_eq!(
+            count(&graph, |op| matches!(op, NodeOp::FrameSlot(_))),
+            0,
+            "{name}: no reload in the loop: {text}"
+        );
+    }
+    // The creation's chain needs the realm's snapshot.
+    let chunk = chunk_of(&mut engine, "mk");
+    let snapshot = Snapshot::take_in(&chunk, Some(&engine.interp));
+    let graph = build(&chunk, &snapshot).expect("built").graph;
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::StoreNew { .. })),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::FrameSlot(_))),
+        0,
+        "mk: no reload in the loop: {text}"
+    );
+}
