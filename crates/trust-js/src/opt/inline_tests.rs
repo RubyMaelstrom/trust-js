@@ -762,14 +762,15 @@ fn an_inlined_callees_element_site_takes_the_hits_its_template_code_saw() {
 const FACTS: &str = "
 function cn(v) { return v + 1; }
 function c14(o) { var a = o.v; var x = a * 3; var y = cn(a); return x + y + a; }
-function mk() { var z = 5; return function () { return function (v) { return v + z; }; }; }
+function c18(o, p) { var a = o.v; var x = a * 3; var y = cn(p); return x + y + a; }
+function mk() { var z = 5; return function () { var w = 1; return function (v) { return v + z + w; }; }; }
 var cz = mk()();
 function c15(x) { return cz(x); }
 var gk = 3;
 function rg(v) { return v + gk; }
 function c16(x) { return rg(x); }
 var o14 = {v: 2};
-for (var k = 0; k < 30; k++) { c14(o14); c15(k); c16(k); }
+for (var k = 0; k < 30; k++) { c14(o14); c15(k); c16(k); c18(o14, k); }
 ";
 
 #[test]
@@ -792,6 +793,23 @@ fn value_facts_flow_into_a_callee_and_back() {
         node.op == NodeOp::CheckNumber && node.inputs[0] == load
     });
     assert_eq!(checks.len(), 1, "{}", dump(graph));
+    // A caller's value the callee never sees keeps its facts through the callee's build (its
+    // prunes keep the callers' values): `a`'s Number, checked before cn(p), is not checked again
+    // after it.
+    let built = Compile::new(&mut engine, "c18").build();
+    let graph = &built.graph;
+    assert_eq!(graph.frames.len(), 1, "{}", dump(graph));
+    let loads = nodes(graph, |node| {
+        matches!(node.op, NodeOp::LoadField { .. })
+            && matches!(graph.node(node.inputs[0]).op, NodeOp::CheckShape(_))
+    });
+    let [load] = loads[..] else {
+        panic!("{}", dump(graph))
+    };
+    let checks = nodes(graph, |node| {
+        node.op == NodeOp::CheckNumber && node.inputs[0] == load
+    });
+    assert_eq!(checks.len(), 1, "{}", dump(graph));
 }
 
 #[test]
@@ -802,16 +820,18 @@ fn a_callees_free_names_start_from_its_closures_environment_folded() {
     let built = Compile::new(&mut engine, "c15").build();
     let graph = &built.graph;
     assert_eq!(graph.frames.len(), 1, "{}", dump(graph));
+    // w at hops 0 (the middle function's record), z at hops 1 (mk's): both read from folded
+    // records.
     let reads = nodes(graph, |node| {
         node.frame == FrameIx(1) && matches!(node.op, NodeOp::LoadBinding { .. })
     });
-    let [read] = reads[..] else {
-        panic!("{}", dump(graph))
-    };
-    assert!(matches!(
-        graph.node(graph.node(read).inputs[0]).op,
-        NodeOp::ConstEnv(_)
-    ));
+    assert_eq!(reads.len(), 2, "{}", dump(graph));
+    for read in reads {
+        assert!(matches!(
+            graph.node(graph.node(read).inputs[0]).op,
+            NodeOp::ConstEnv(_)
+        ));
+    }
     assert!(nodes(graph, |node| node.frame == FrameIx(1)
         && matches!(node.op, NodeOp::EnvParent | NodeOp::Env))
     .is_empty());
@@ -1252,4 +1272,58 @@ fn a_reoptimization_inlines_the_ways_its_first_compile_took() {
         vec![(0, InlineOutcome::Inlined)],
         "the reoptimization's one way, the first compile's"
     );
+}
+
+#[test]
+fn a_sites_later_guard_leaves_its_own_byte_and_the_reoptimization_branches_there_too() {
+    // Two ways at the first compile: the first's guard exits for the second's callee (its byte
+    // 1); the reoptimization branches there and checks the second; a third callee then exits at
+    // the second guard (its byte 2), and the next reoptimization branches at both, the generic
+    // call after them, as a splice's guards converge one at a time.
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(
+        &mut engine,
+        "function A() {} A.prototype.m = function () { return 1; };
+         function B() {} B.prototype.m = function () { return 2; };
+         function C() {} C.prototype.m = function () { return 3; };
+         function site(o) { return o.m(); }
+         var a = new A(), b = new B(), c = new C();
+         var t = 0; for (var k = 0; k < 3000; k++) t += site(k % 2 ? a : b);",
+    );
+    let chunk = chunk_of(&mut engine, "site");
+    let call = pc_of(&chunk, is_call);
+    let byte = |chunk: &Chunk| {
+        let mut most = None;
+        if let Some(profile) = ChunkProfile::get(chunk) {
+            profile.sites_at(call, |reason, _, byte| {
+                if reason == ExitReason::WrongCallee as u8 {
+                    most = Some(byte);
+                }
+            });
+        }
+        most
+    };
+    assert_eq!(
+        ChunkProfile::get(&chunk).map(|profile| profile.inline_ways().len()),
+        Some(2)
+    );
+    assert_eq!(byte(&chunk), Some(1), "the first guard's exits");
+    eval(
+        &mut engine,
+        "for (var k = 0; k < 6000; k++) t += site(k % 3 == 0 ? c : k % 3 == 1 ? a : b); t",
+    );
+    assert_eq!(
+        byte(&chunk),
+        Some(2),
+        "the second guard's exits leave its byte"
+    );
+    super::exit::TEST_EXITS.with(|exits| exits.borrow_mut().clear());
+    let out = eval(
+        &mut engine,
+        "var u = 0; for (var k = 0; k < 3000; k++) u += site(k % 3 == 0 ? c : k % 3 == 1 ? a : b); u",
+    );
+    assert_eq!(out, "6000");
+    let exits = super::exit::TEST_EXITS.with(|exits| std::mem::take(&mut *exits.borrow_mut()));
+    assert!(exits.is_empty(), "converged: {exits:?}");
 }
