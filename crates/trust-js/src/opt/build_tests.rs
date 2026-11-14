@@ -801,6 +801,50 @@ fn a_block_whose_sites_never_ran_is_an_exit() {
 
 #[test]
 fn effects_flush_dirty_slots_and_read_them_back_from_the_frame() {
+    // A canonical-frame effect (the spread, whose helper runs the VM on a copy of the operand
+    // stack) flushes the dirty `x` before it and reads it back after it, and `o` too is read back
+    // and checked again.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function call(o, g) { var x = 1; x = x + 1; var t = [...g]; return x + o.x + t.length; }
+         var p = {x: 1};
+         for (var i = 0; i < 20; i++) call(p, []);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "call");
+    let text = dump(&graph, &chunk);
+    let block = graph.block(graph.entry.expect("an entry"));
+    let x = slot_named(&chunk, "x");
+    let position = |which: &dyn Fn(&NodeOp) -> bool| {
+        block
+            .body
+            .iter()
+            .position(|&node| which(&graph.node(node).op))
+            .unwrap_or_else(|| panic!("{text}"))
+    };
+    let effect = position(&|op| matches!(op, NodeOp::Effect { .. }));
+    let store = position(&|op| *op == NodeOp::StoreSlot(x));
+    let reload = position(&|op| *op == NodeOp::FrameSlot(x));
+    assert!(store < effect && effect < reload, "{text}");
+    let effect = graph.node(block.body[effect]);
+    assert_eq!(effect.reason, Some(ExitReason::Throw), "{text}");
+    let state = graph.state(effect.state.expect("an effect has a state"));
+    assert!(
+        state
+            .slots
+            .iter()
+            .all(|source| matches!(source, SlotSource::Frame | SlotSource::Dead)),
+        "the flush left every live slot in the frame: {text}"
+    );
+    assert_eq!(state.pc, effect.pc, "{text}");
+    assert_eq!(count(&graph, |op| *op == NodeOp::FrameSlot(0)), 1, "{text}");
+}
+
+#[test]
+fn a_generic_node_neither_flushes_nor_reloads_the_slots() {
+    // P3 stage 3 step 3a: the call is a generic node: nothing is flushed before it, the dirty `x`
+    // read after it is the value from before it, and `o` is its entry value, never reloaded; the
+    // node's state holds `x` as that value and `g`, read for the call, Dead.
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
@@ -810,35 +854,44 @@ fn effects_flush_dirty_slots_and_read_them_back_from_the_frame() {
     );
     let (chunk, graph) = graph_of(&mut engine, "call");
     let text = dump(&graph, &chunk);
-    let block = graph.block(graph.entry.expect("an entry"));
-    let position = |which: &dyn Fn(&NodeOp) -> bool| {
-        block
-            .body
-            .iter()
-            .position(|&node| which(&graph.node(node).op))
-            .unwrap_or_else(|| panic!("{text}"))
-    };
-    let effect = position(&is_effect);
-    let store = position(&|op| *op == NodeOp::StoreSlot(2));
-    let reload = position(&|op| *op == NodeOp::FrameSlot(2));
-    assert!(store < effect && effect < reload, "{text}");
-    let effect = graph.node(block.body[effect]);
-    assert_eq!(effect.reason, Some(ExitReason::Throw), "{text}");
-    let state = graph.state(effect.state.expect("an effect has a state"));
-    // `g`, read for the call, is dead there (stage 2 step 6): no flush, and the exit leaves it.
-    let g = slot_named(&chunk, "g") as usize;
-    assert_eq!(state.slots[g], SlotSource::Dead, "{text}");
-    assert!(
-        state
-            .slots
-            .iter()
-            .enumerate()
-            .all(|(slot, source)| slot == g || *source == SlotSource::Frame),
-        "the flush left every live slot in the frame: {text}"
+    assert_eq!(
+        count(&graph, |op| matches!(
+            op,
+            NodeOp::FrameSlot(_) | NodeOp::StoreSlot(_)
+        )),
+        0,
+        "no flush and no reload: {text}"
     );
-    assert_eq!(state.pc, effect.pc, "{text}");
-    // After the effect, `o` too is read back and checked again.
-    assert_eq!(count(&graph, |op| *op == NodeOp::FrameSlot(0)), 1, "{text}");
+    let [generic] = nodes(&graph, |op| matches!(op, NodeOp::Generic { .. }))[..] else {
+        panic!("one generic node: {text}")
+    };
+    assert_eq!(generic.reason, Some(ExitReason::Throw), "{text}");
+    let state = graph.state(generic.state.expect("a generic node has a state"));
+    let (x, g, o) = (
+        slot_named(&chunk, "x") as usize,
+        slot_named(&chunk, "g") as usize,
+        slot_named(&chunk, "o") as usize,
+    );
+    assert_eq!(state.slots[g], SlotSource::Dead, "{text}");
+    assert_eq!(state.slots[o], SlotSource::Frame, "{text}");
+    let SlotSource::Value(held) = state.slots[x] else {
+        panic!("x is a value at the call: {text}")
+    };
+    // The return's sum reads that value (x + o.x).
+    let add = nodes(&graph, |op| matches!(op, NodeOp::I32Add | NodeOp::F64Add))
+        .into_iter()
+        .rev()
+        .find(|node| node.pc as usize > generic.pc as usize)
+        .unwrap_or_else(|| panic!("the return's sum: {text}"));
+    let reads_held = add
+        .inputs
+        .iter()
+        .any(|&input| input == held || graph.node(input).inputs.first() == Some(&held));
+    assert!(
+        reads_held,
+        "the sum reads x's value from before the call: {text}"
+    );
+    entry_value(&graph, &chunk, "o");
 }
 
 #[test]
@@ -2091,10 +2144,12 @@ fn an_arrays_length_is_a_load_that_an_append_ends() {
         1,
         "{text}"
     );
+    // The loop's invariant `a` has its kind check moved to the loop's entry (P3 stage 3 step 3a:
+    // its entry value is an invariant of the loop, which has no effect).
     assert!(
         nodes(&graph, |op| *op == NodeOp::CheckElements(ElemKind::Array))
             .iter()
-            .all(|node| node.reason == Some(ExitReason::WrongElements)),
+            .all(|node| node.reason == Some(ExitReason::HoistingFailed)),
         "{text}"
     );
     // Read once for `n` and the key, and again after the append, which ends the first read.
@@ -4006,9 +4061,10 @@ fn an_inner_join_feeding_a_loop_phi_settles_with_it() {
 
 #[test]
 fn slot_stores_and_effects_take_untagged_phis_and_a_call_keeps_them_in_callee_saved_homes() {
-    // `s` (F64) and `i` (I32, by its `| 0`) are on the operand stack across the call: the flush
-    // before it stores `i`, live after it, as it is (`s` is dead there), the call takes `i` as its
-    // operand as it is, and the allocator gives each phi a callee-saved home (d8-d15, x23-x28).
+    // `s` (F64) and `i` (I32, by its `| 0`) are on the operand stack across the call, a generic
+    // node: nothing is flushed before it (P3 stage 3 step 3a), its state holds `i` as its phi
+    // (`s` is dead there), the call takes `i` as its operand as it is, and the allocator gives
+    // each phi a callee-saved home (d8-d15, x23-x28).
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
@@ -4025,16 +4081,16 @@ fn slot_stores_and_effects_take_untagged_phis_and_a_call_keeps_them_in_callee_sa
     assert_eq!(graph.node(s).rep, Rep::F64, "{text}");
     assert_eq!(graph.node(i).rep, Rep::I32, "{text}");
     let i_slot = slot_named(&chunk, "i");
-    assert!(
-        nodes(&graph, |op| *op == NodeOp::StoreSlot(i_slot))
-            .iter()
-            .any(|store| store.inputs[0] == i),
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::StoreSlot(_))),
+        0,
         "{text}"
     );
     let call = nodes(&graph, is_effect);
     assert_eq!(call.len(), 1, "{text}");
     assert!(call[0].inputs.contains(&i), "{text}");
     let state = graph.state(call[0].state.expect("an effect's state"));
+    assert_eq!(state.slots[i_slot as usize], SlotSource::Value(i), "{text}");
     assert_eq!(
         state.slots[slot_named(&chunk, "s") as usize],
         SlotSource::Dead,
@@ -4392,6 +4448,17 @@ fn loads_of(graph: &Graph, chunk: &Chunk, name: &str) -> Vec<NodeIx> {
         .collect()
 }
 
+/// The entry block's read of `chunk`'s local `name` (its EntrySlot): the value a loop reads where
+/// its entry leaves the slot unwritten and no canonical-frame effect ran (P3 stage 3 step 3a: a
+/// generic node leaves it in place, and no reload replaces it).
+fn entry_value(graph: &Graph, chunk: &Chunk, name: &str) -> NodeIx {
+    let slot = slot_named(chunk, name);
+    (0..graph.nodes.len() as u32)
+        .map(NodeIx)
+        .find(|&node| graph.node(node).op == NodeOp::EntrySlot(slot))
+        .unwrap_or_else(|| panic!("the entry value of {name}"))
+}
+
 /// The nodes of `graph` whose op `which` accepts and whose first input is `input`.
 fn checks_of(graph: &Graph, input: NodeIx, which: impl Fn(&NodeOp) -> bool) -> Vec<NodeIx> {
     (0..graph.nodes.len() as u32)
@@ -4434,17 +4501,23 @@ const INVARIANT: &str = "function inv(g, a, n) { var s = 0; g();
      function nothing() {}
      for (var r = 0; r < 20; r++) inv(nothing, 1.5, 10);";
 const INVARIANT_DRIVE: &str = "for (var r = 0; r < 20; r++) inv(nothing, 1.5, 10);";
+/// INVARIANT with a canonical-frame effect in place of the call (an array spread, whose helper
+/// runs the VM on a copy of the operand stack): every live slot is in the frame's keeping after
+/// it (P3 stage 3 step 3a).
+const INVARIANT_SPREAD: &str = "function inv(g, a, n) { var s = 0; var t = [...g];
+       for (var i = 0; i < n; i++) s = s + a * i; return s + a + t.length; }
+     for (var r = 0; r < 20; r++) inv([], 1.5, 10);";
+const INVARIANT_SPREAD_DRIVE: &str = "for (var r = 0; r < 20; r++) inv([], 1.5, 10);";
 
 #[test]
 fn an_effect_free_loops_invariant_slots_are_loaded_once_on_its_entry() {
-    // After the call every slot is in the frame's keeping; the loop has no effect and does not
+    // After the spread every slot is in the frame's keeping; the loop has no effect and does not
     // write `a` and `n`: each is loaded once, at the end of the loop's entry predecessor, and
     // held through the loop, where nothing reloads it and every state keeps it in the frame's
     // keeping. `s` and `i` take phis.
-    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    let mut engine = warmed(INVARIANT_SPREAD, INVARIANT_SPREAD_DRIVE);
     let (chunk, graph) = graph_of(&mut engine, "inv");
     let text = dump(&graph, &chunk);
-    assert_eq!(count(&graph, is_effect), 1, "{text}");
     let header_pc = the_loop(&graph);
     let lp = loop_at(&graph, header_pc);
     let [entry] = lp.entries[..] else {
@@ -4456,6 +4529,7 @@ fn an_effect_free_loops_invariant_slots_are_loaded_once_on_its_entry() {
     );
     for node in &graph.nodes {
         if lp.members[node.block.index()] {
+            assert!(!is_effect(&node.op), "an effect in the loop: {text}");
             assert!(
                 !matches!(node.op, NodeOp::FrameSlot(_)),
                 "a reload in the loop: {text}"
@@ -4479,16 +4553,62 @@ fn an_effect_free_loops_invariant_slots_are_loaded_once_on_its_entry() {
 }
 
 #[test]
+fn a_generic_node_before_a_loop_leaves_its_invariants_held_without_loads() {
+    // P3 stage 3 step 3a: the call before the loop is a generic node, which leaves `a` and `n`
+    // as they were, unwritten since the entry: the loop reads their entry values, nothing loads
+    // them from the frame anywhere, and every state in the loop keeps them in the frame's
+    // keeping. `s` and `i` take phis.
+    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    let (chunk, graph) = graph_of(&mut engine, "inv");
+    let text = dump(&graph, &chunk);
+    assert_eq!(count(&graph, is_effect), 1, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::Generic { .. })),
+        1,
+        "{text}"
+    );
+    let header_pc = the_loop(&graph);
+    let lp = loop_at(&graph, header_pc);
+    let (a, n) = (
+        slot_named(&chunk, "a") as usize,
+        slot_named(&chunk, "n") as usize,
+    );
+    assert_eq!(
+        count(&graph, |op| matches!(
+            op,
+            NodeOp::FrameSlot(_) | NodeOp::StoreSlot(_)
+        )),
+        0,
+        "no load or flush: {text}"
+    );
+    for node in &graph.nodes {
+        if lp.members[node.block.index()] {
+            if let Some(state) = node.state {
+                let state = graph.state(state);
+                assert_eq!(state.slots[a], SlotSource::Frame, "{node:?}: {text}");
+                assert_eq!(state.slots[n], SlotSource::Frame, "{node:?}: {text}");
+            }
+        }
+    }
+    for name in ["a", "n"] {
+        entry_value(&graph, &chunk, name);
+    }
+    for name in ["s", "i"] {
+        phi_of_slot(&graph, &chunk, name, header_pc);
+    }
+}
+
+#[test]
 fn a_slot_read_only_after_the_loop_stays_in_the_frame_through_it() {
     // `b` is live at the header but only the return reads it: it stays in the frame through the
     // loop (no load at the entry, none in the loop) and is read back after it; `a`, which the
-    // loop reads, is loaded at the entry.
+    // loop reads, is loaded at the entry. A canonical-frame effect (the spread) leaves both in
+    // the frame's keeping.
     let mut engine = warmed(
-        "function after(g, a, b, n) { var s = 0; g();
-           for (var i = 0; i < n; i++) s = s + a; return s + b; }
-         function nothing() {}
-         for (var r = 0; r < 20; r++) after(nothing, 1.5, 2.5, 10);",
-        "for (var r = 0; r < 20; r++) after(nothing, 1.5, 2.5, 10);",
+        "function after(g, a, b, n) { var s = 0; var t = [...g];
+           for (var i = 0; i < n; i++) s = s + a; return s + b + t.length; }
+         for (var r = 0; r < 20; r++) after([], 1.5, 2.5, 10);",
+        "for (var r = 0; r < 20; r++) after([], 1.5, 2.5, 10);",
     );
     let (chunk, graph) = graph_of(&mut engine, "after");
     let text = dump(&graph, &chunk);
@@ -4516,10 +4636,11 @@ fn a_slot_read_only_after_the_loop_stays_in_the_frame_through_it() {
 
 #[test]
 fn an_effect_free_loops_invariant_checks_move_to_its_entry() {
-    // The checks in the loop of the loaded `a` and `n` move to the end of the entry predecessor
-    // (CheckNumber of `a`, CheckNumber and CheckInt32 of `n`; HoistingFailed, exiting at the
-    // header's pc with both in the frame's keeping): nothing in the loop reads their words. The
-    // check of `a` after the loop (the return's addition) stays there.
+    // The checks in the loop of the invariants `a` and `n`, held across the call (P3 stage 3
+    // step 3a: their entry values), move to the end of the entry predecessor (CheckNumber of `a`,
+    // CheckNumber and CheckInt32 of `n`; HoistingFailed, exiting at the header's pc with both in
+    // the frame's keeping): nothing in the loop reads their words. The check of `a` after the
+    // loop (the return's addition) stays there.
     let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
     let (chunk, graph) = graph_of(&mut engine, "inv");
     let text = dump(&graph, &chunk);
@@ -4533,22 +4654,18 @@ fn an_effect_free_loops_invariant_checks_move_to_its_entry() {
         slot_named(&chunk, "a") as usize,
         slot_named(&chunk, "n") as usize,
     ];
-    let [load_a] = loads_of(&graph, &chunk, "a")[..] else {
-        panic!("one load of a: {text}")
-    };
-    let [load_n] = loads_of(&graph, &chunk, "n")[..] else {
-        panic!("one load of n: {text}")
-    };
-    for load in [load_a, load_n] {
+    let value_a = entry_value(&graph, &chunk, "a");
+    let value_n = entry_value(&graph, &chunk, "n");
+    for value in [value_a, value_n] {
         assert!(
             (0..graph.nodes.len() as u32)
                 .map(NodeIx)
                 .filter(|&node| in_loop(node))
-                .all(|node| !graph.node(node).inputs.contains(&load)),
+                .all(|node| !graph.node(node).inputs.contains(&value)),
             "a use of the word in the loop: {text}"
         );
     }
-    let [number, after] = checks_of(&graph, load_a, |op| *op == NodeOp::CheckNumber)[..] else {
+    let [number, after] = checks_of(&graph, value_a, |op| *op == NodeOp::CheckNumber)[..] else {
         panic!("two checks of a: {text}")
     };
     let (number, after) = if graph.node(number).block.index() == entry {
@@ -4561,7 +4678,7 @@ fn an_effect_free_loops_invariant_checks_move_to_its_entry() {
     assert!(!lp.members[after.block.index()], "{text}");
     assert_ne!(after.block.index(), entry, "{text}");
     assert_eq!(after.reason, Some(ExitReason::NotNumber), "{text}");
-    let [number] = checks_of(&graph, load_n, |op| *op == NodeOp::CheckNumber)[..] else {
+    let [number] = checks_of(&graph, value_n, |op| *op == NodeOp::CheckNumber)[..] else {
         panic!("one check of n: {text}")
     };
     assert_hoisted(&graph, number, entry, header_pc, &kept, &text);
@@ -4573,10 +4690,112 @@ fn an_effect_free_loops_invariant_checks_move_to_its_entry() {
 }
 
 #[test]
+fn an_invariants_checks_move_to_its_loops_entry_in_the_renumbered_blocks() {
+    // P3 stage 3 step 3a: the notes name an invariant's entry predecessor by its block, which the
+    // builder numbers as it makes it and the reverse postorder renumbers. EarleyBoyer's conf-set
+    // getter: its second stage splices `make` and, in it, `fill`'s loop, whose entry block the
+    // builder made after the guards' fallback blocks; under the builder's number the array's
+    // checks moved to the end of the loop's back edge, which dominates none of their uses (the
+    // verifier refused the graph). They move to the entry block.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function fill(a, v) { for (var i = 0; i < a.length; i++) a[i] = v; }
+         function make(size, v) { var a = new Array(size); if (v !== undefined) fill(a, v);
+           return a; }
+         function get(state, num, conf) { var set, found;
+           return (found = state[conf + 1]) !== false ? found
+             : (set = make(num + 6, false), set[1] = -3, state[conf + 1] = set, set); }
+         function drive() { var s = 0;
+           for (var k = 0; k < 40; k++) { var state = make(8, false);
+             for (var j = 0; j < 10; j++) s += get(state, 4, j % 5).length; }
+           return s; }
+         for (var r = 0; r < 20; r++) drive();",
+    );
+    let Some(transformed) = second_stage(&mut engine, "get", "drive()") else {
+        return;
+    };
+    let graph = graph_for(&transformed, "get's second stage");
+    let text = dump(&graph, &transformed);
+    let lp = loop_at(&graph, the_loop(&graph));
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    let hoisted = nodes(&graph, |_| true)
+        .into_iter()
+        .filter(|node| node.reason == Some(ExitReason::HoistingFailed))
+        .collect::<Vec<_>>();
+    assert!(
+        hoisted.iter().any(|node| node.op == NodeOp::CheckObject),
+        "the array's check: {text}"
+    );
+    for node in hoisted {
+        assert_eq!(node.block.index(), entry, "{node:?}: {text}");
+    }
+}
+
+#[test]
+fn sibling_loops_holding_one_entry_value_each_check_it_at_their_entries() {
+    // P3 stage 3 step 3a: an entry value two arms' loops read (NavierStokes' lin_solve: its
+    // arrays, held across the branch's generic equality) is an invariant of each: the notes take
+    // it at both headers and each loop's checks of it move to its own entry. Noted once, the
+    // second arm's loop kept its checks (NavierStokes +2.3% instructions); each arm's nested loops
+    // check it once, at the outer loop's entry.
+    let mut engine = warmed(
+        "function ls(b, x, x0, a, c, n, g) {
+           if (a === 0 && c === 1) {
+             for (var j = 1; j <= n; j++) { var r = j * 2;
+               for (var i = 0; i < n; i++) { x[r] = x0[r]; ++r; } }
+             g(b, x);
+           } else {
+             var inv = 1 / c;
+             for (var k = 0; k < 2; k++) {
+               for (var j = 1; j <= n; j++) { var r = j * 2; var last = x[r];
+                 for (var i = 1; i <= n; i++) last = x[r] = (x0[r] + a * (last + x[++r])) * inv; }
+             }
+             g(b, x);
+           }
+         }
+         function bnd(b, x) { if (b === 1) x[0] = 1; }
+         var X = [], X0 = []; for (var q = 0; q < 40; q++) { X.push(0.5); X0.push(1.5); }
+         for (var w = 0; w < 20; w++) { ls(0, X, X0, 0, 1, 8, bnd); ls(1, X, X0, 0.1, 1.4, 8, bnd); }",
+        "for (var w = 0; w < 20; w++) { ls(0, X, X0, 0, 1, 8, bnd); ls(1, X, X0, 0.1, 1.4, 8, bnd); }",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "ls");
+    let text = dump(&graph, &chunk);
+    let headers: Vec<usize> = (0..graph.blocks.len())
+        .filter(|&b| graph.blocks[b].loop_header)
+        .collect();
+    let in_any_loop = |block: usize| {
+        headers
+            .iter()
+            .any(|&header| loop_blocks(&graph, header)[block])
+    };
+    for name in ["x", "x0"] {
+        let value = entry_value(&graph, &chunk, name);
+        let checks = checks_of(&graph, value, |op| *op == NodeOp::CheckObject);
+        assert_eq!(
+            checks.len(),
+            2,
+            "{name}: one at each arm's outer loop: {text}"
+        );
+        for check in checks {
+            let node = graph.node(check);
+            assert_eq!(
+                node.reason,
+                Some(ExitReason::HoistingFailed),
+                "{name}: {text}"
+            );
+            assert!(!in_any_loop(node.block.index()), "{name}: {text}");
+        }
+    }
+}
+
+#[test]
 fn a_loop_entered_from_a_branch_loads_there_and_checks_in_the_loop() {
-    // The do-while's body is the branch's target: the invariant's load sits before the branch,
-    // whose two successors leave no edge of the loop's alone to move a check to (stage 2 step
-    // 6's speculation rule), so the check stays in the loop.
+    // The do-while's body is the branch's target: the invariant (`a`'s entry value, held across
+    // the call) enters from a branch whose two successors leave no edge of the loop's alone to
+    // move a check to (stage 2 step 6's speculation rule), so the check stays in the loop.
     let mut engine = warmed(
         "function br(g, a, n, c) { var s = 0; g();
            if (c) do { s = s + a; } while (--n > 0);
@@ -4592,11 +4811,9 @@ fn a_loop_entered_from_a_branch_loads_there_and_checks_in_the_loop() {
         panic!("one entry edge: {text}")
     };
     assert_eq!(graph.blocks[entry].succs.len(), 2, "{text}");
-    let [load] = loads_of(&graph, &chunk, "a")[..] else {
-        panic!("one load of a: {text}")
-    };
-    assert_eq!(graph.node(load).block.index(), entry, "{text}");
-    let checks = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber);
+    assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
+    let value = entry_value(&graph, &chunk, "a");
+    let checks = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber);
     assert_eq!(checks.len(), 1, "{text}");
     assert!(lp.members[graph.node(checks[0]).block.index()], "{text}");
     assert!(
@@ -4610,12 +4827,13 @@ fn a_loop_entered_from_a_branch_loads_there_and_checks_in_the_loop() {
 
 #[test]
 fn a_loop_with_an_effect_reloads_and_checks_its_invariant_slots_as_before() {
+    // A canonical-frame effect in the loop (a spread) leaves every slot in the frame's keeping:
+    // `a` is reloaded after it and checked in the loop, as before P3 stage 3 step 3a.
     let mut engine = warmed(
-        "function eff(g, a, n) { var s = 0; g();
-           for (var i = 0; i < n; i++) { s = s + a * i; g(); } return s; }
-         function nothing() {}
-         for (var r = 0; r < 20; r++) eff(nothing, 1.5, 10);",
-        "for (var r = 0; r < 20; r++) eff(nothing, 1.5, 10);",
+        "function eff(g, a, n) { var s = 0; var t;
+           for (var i = 0; i < n; i++) { s = s + a * i; t = [...g]; } return s + t.length; }
+         for (var r = 0; r < 20; r++) eff([], 1.5, 10);",
+        "for (var r = 0; r < 20; r++) eff([], 1.5, 10);",
     );
     let (chunk, graph) = graph_of(&mut engine, "eff");
     let text = dump(&graph, &chunk);
@@ -4638,11 +4856,46 @@ fn a_loop_with_an_effect_reloads_and_checks_its_invariant_slots_as_before() {
 }
 
 #[test]
+fn a_loop_with_a_generic_node_holds_its_invariant_and_checks_it_in_the_loop() {
+    // P3 stage 3 step 3a: the call in the loop is a generic node, which leaves `a` alone: no
+    // reload anywhere, the loop reads `a`'s entry value and checks it in the loop (step 0's rule
+    // moves checks out of loops without effects or generic nodes only).
+    let mut engine = warmed(
+        "function eff(g, a, n) { var s = 0; g();
+           for (var i = 0; i < n; i++) { s = s + a * i; g(); } return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) eff(nothing, 1.5, 10);",
+        "for (var r = 0; r < 20; r++) eff(nothing, 1.5, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "eff");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, the_loop(&graph));
+    assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
+    let value = entry_value(&graph, &chunk, "a");
+    let checks = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber);
+    assert!(!checks.is_empty(), "{text}");
+    assert!(
+        checks
+            .iter()
+            .all(|&check| lp.members[graph.node(check).block.index()]),
+        "{text}"
+    );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_loop_whose_equalities_compare_numbers_its_blocks_made_is_free_of_effects() {
     // `((i | 0) & 1) == 0`, `(s | 0) !== -1` and `i !== undefined` lower whatever the facts at
     // the loop's entry (Rules::equality_lowers: bitwise results and Number constants, a constant
-    // no other value equals): the loop has no effect, so `a`, which it reads and does not write,
-    // is loaded once at its entry and never reloaded in it (P3 stage 3 step 0b).
+    // no other value equals): the loop has no effect, and `a`, which it reads and does not write,
+    // is never reloaded in it (P3 stage 3 step 0b); its entry value is held across the call
+    // (step 3a).
     let mut engine = warmed(
         "function eqs(g, a, n) { var s = 0; g();
            for (var i = 0; i < n; i++) {
@@ -4657,9 +4910,6 @@ fn a_loop_whose_equalities_compare_numbers_its_blocks_made_is_free_of_effects() 
     let (chunk, graph) = graph_of(&mut engine, "eqs");
     let text = dump(&graph, &chunk);
     let lp = loop_at(&graph, the_loop(&graph));
-    let [entry] = lp.entries[..] else {
-        panic!("one entry edge: {text}")
-    };
     for node in &graph.nodes {
         if lp.members[node.block.index()] {
             assert!(!is_effect(&node.op), "an effect in the loop: {text}");
@@ -4669,18 +4919,16 @@ fn a_loop_whose_equalities_compare_numbers_its_blocks_made_is_free_of_effects() 
             );
         }
     }
-    let [load] = loads_of(&graph, &chunk, "a")[..] else {
-        panic!("one load of a: {text}")
-    };
-    assert_eq!(graph.node(load).block.index(), entry, "{text}");
+    assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
+    entry_value(&graph, &chunk, "a");
 }
 
 #[test]
 fn a_loop_comparing_words_from_the_frame_counts_its_equality_an_effect() {
     // `a == b` on two locals the loop's block did not make, and `a == undefined`, whose constant
     // decides nothing under `==`: the rules cannot say they lower (the builder makes the generic
-    // operation here), so the loop has an effect and reloads `a` after it, as before; the
-    // function compiles, its prepass and its builder agreeing.
+    // operation here), so the loop has a generic node; the function compiles, its prepass and its
+    // builder agreeing, and the node leaves `a` alone (P3 stage 3 step 3a): no reload.
     for test in ["a == b", "a == undefined"] {
         let mut engine = warmed(
             &format!(
@@ -4698,23 +4946,23 @@ fn a_loop_comparing_words_from_the_frame_counts_its_equality_an_effect() {
             graph
                 .nodes
                 .iter()
-                .any(|node| lp.members[node.block.index()] && is_effect(&node.op)),
-            "{test}: the equality's effect in the loop: {text}"
+                .any(|node| lp.members[node.block.index()]
+                    && matches!(node.op, NodeOp::Generic { .. })),
+            "{test}: the equality's generic node in the loop: {text}"
         );
         assert!(
-            loads_of(&graph, &chunk, "a")
-                .iter()
-                .any(|&load| lp.members[graph.node(load).block.index()]),
-            "{test}: a reload of a in the loop: {text}"
+            loads_of(&graph, &chunk, "a").is_empty(),
+            "{test}: no reload of a: {text}"
         );
     }
 }
 
 #[test]
 fn a_slot_the_loop_writes_keeps_its_phi_and_its_entry_speculation() {
-    // `s`, in the frame's keeping at the entry and written in the loop, takes a phi whose entry
-    // input is its load (stage 2 step 6's PhiNotNumber speculation), never the invariant rule.
-    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    // `s`, in the frame's keeping at the entry (after the spread, a canonical-frame effect) and
+    // written in the loop, takes a phi whose entry input is its load (stage 2 step 6's
+    // PhiNotNumber speculation), never the invariant rule.
+    let mut engine = warmed(INVARIANT_SPREAD, INVARIANT_SPREAD_DRIVE);
     let (chunk, graph) = graph_of(&mut engine, "inv");
     let text = dump(&graph, &chunk);
     let header_pc = the_loop(&graph);
@@ -4734,6 +4982,9 @@ fn a_slot_the_loop_writes_keeps_its_phi_and_its_entry_speculation() {
 
 #[test]
 fn an_inner_loop_without_effects_in_one_with_an_effect_loads_on_its_own_entry() {
+    // The outer loop's call is a generic node; the inner loop, free of them, notes `a`'s entry
+    // value as its invariant and checks it on its own entry edge (P3 stage 3 step 3a: held, not
+    // loaded).
     let mut engine = warmed(
         "function nest(g, a, n) { var s = 0;
            for (var k = 0; k < 3; k++) { g(); for (var i = 0; i < n; i++) s = s + a * i; }
@@ -4752,11 +5003,9 @@ fn an_inner_loop_without_effects_in_one_with_an_effect_loads_on_its_own_entry() 
         panic!("one entry edge: {text}")
     };
     assert!(outer.members[entry], "{text}");
-    let [load] = loads_of(&graph, &chunk, "a")[..] else {
-        panic!("one load of a: {text}")
-    };
-    assert_eq!(graph.node(load).block.index(), entry, "{text}");
-    let [number] = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber)[..] else {
+    assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
+    let value = entry_value(&graph, &chunk, "a");
+    let [number] = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber)[..] else {
         panic!("one check of a: {text}")
     };
     let a = slot_named(&chunk, "a") as usize;
@@ -4783,11 +5032,9 @@ fn invariant_checks_in_an_inner_loop_move_to_the_outermost_entry_without_effects
     let [entry] = outer.entries[..] else {
         panic!("one entry edge: {text}")
     };
-    let [load] = loads_of(&graph, &chunk, "a")[..] else {
-        panic!("one load of a: {text}")
-    };
-    assert_eq!(graph.node(load).block.index(), entry, "{text}");
-    let [number] = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber)[..] else {
+    assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
+    let value = entry_value(&graph, &chunk, "a");
+    let [number] = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber)[..] else {
         panic!("one check of a: {text}")
     };
     let a = slot_named(&chunk, "a") as usize;
@@ -4797,17 +5044,16 @@ fn invariant_checks_in_an_inner_loop_move_to_the_outermost_entry_without_effects
 
 #[test]
 fn a_loop_with_two_entry_edges_merges_their_loads_and_checks_in_the_loop() {
-    // `a` is in the frame's keeping on both entry edges: each loads it, a phi of the loads is held
-    // through the loop (its back edges' input itself), and with no one entry edge to move them
-    // to its checks stay in the loop.
+    // `a` is in the frame's keeping on both entry edges (each after a spread, a canonical-frame
+    // effect): each loads it, a phi of the loads is held through the loop (its back edges' input
+    // itself), and with no one entry edge to move them to its checks stay in the loop.
     let mut engine = warmed(
-        "function two(g, a, n, c) { var s = 0; g(); var i = 0;
-           if (c) { i = 1; } else { g(); }
+        "function two(g, a, n, c) { var s = 0; var t = [...g]; var i = 0;
+           if (c) { i = 1; } else { t = [...g]; }
            while (i < n) { s = s + a; i++; }
-           return s; }
-         function nothing() {}
-         for (var r = 0; r < 20; r++) two(nothing, 1.5, 10, r % 2);",
-        "for (var r = 0; r < 20; r++) two(nothing, 1.5, 10, r % 2);",
+           return s + t.length; }
+         for (var r = 0; r < 20; r++) two([], 1.5, 10, r % 2);",
+        "for (var r = 0; r < 20; r++) two([], 1.5, 10, r % 2);",
     );
     let (chunk, graph) = graph_of(&mut engine, "two");
     let text = dump(&graph, &chunk);
@@ -4855,6 +5101,37 @@ fn a_loop_with_two_entry_edges_merges_their_loads_and_checks_in_the_loop() {
 }
 
 #[test]
+fn a_loop_with_two_entry_edges_after_generic_nodes_reads_its_entry_value() {
+    // P3 stage 3 step 3a: after generic nodes on both entry edges `a` is still its entry value,
+    // unwritten: no load, no phi, and with two entry edges its check stays in the loop.
+    let mut engine = warmed(
+        "function two(g, a, n, c) { var s = 0; g(); var i = 0;
+           if (c) { i = 1; } else { g(); }
+           while (i < n) { s = s + a; i++; }
+           return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) two(nothing, 1.5, 10, r % 2);",
+        "for (var r = 0; r < 20; r++) two(nothing, 1.5, 10, r % 2);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "two");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, the_loop(&graph));
+    assert_eq!(lp.entries.len(), 2, "{text}");
+    assert!(loads_of(&graph, &chunk, "a").is_empty(), "{text}");
+    let value = entry_value(&graph, &chunk, "a");
+    let checks = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber);
+    assert_eq!(checks.len(), 1, "{text}");
+    assert!(lp.members[graph.node(checks[0]).block.index()], "{text}");
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+        "{text}"
+    );
+}
+
+#[test]
 fn a_flag_at_the_header_leaves_the_invariants_checks_in_the_loop() {
     let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
     let chunk = chunk_of(&mut engine, "inv");
@@ -4877,16 +5154,14 @@ fn a_flag_at_the_header_leaves_the_invariants_checks_in_the_loop() {
             .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
         "{text}"
     );
-    // Still loaded once, at the entry; checked in the loop, not at the entry.
+    // The invariants (their entry values, held across the call: P3 stage 3 step 3a) are checked
+    // in the loop, not at the entry.
     let [entry] = lp.entries[..] else {
         panic!("one entry edge: {text}")
     };
     for name in ["a", "n"] {
-        let [load] = loads_of(&graph, &chunk, name)[..] else {
-            panic!("one load of {name}: {text}")
-        };
-        assert_eq!(graph.node(load).block.index(), entry, "{text}");
-        let checks = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber);
+        let value = entry_value(&graph, &chunk, name);
+        let checks = checks_of(&graph, value, |op| *op == NodeOp::CheckNumber);
         assert!(
             checks
                 .iter()
@@ -4925,11 +5200,9 @@ fn an_invariant_receivers_object_and_kind_checks_move_to_the_entry() {
     let [entry] = lp.entries[..] else {
         panic!("one entry edge: {text}")
     };
-    let [load] = loads_of(&graph, &chunk, "x")[..] else {
-        panic!("one load of x: {text}")
-    };
+    let value = entry_value(&graph, &chunk, "x");
     let x = slot_named(&chunk, "x") as usize;
-    let [cell] = checks_of(&graph, load, |op| *op == NodeOp::CheckObject)[..] else {
+    let [cell] = checks_of(&graph, value, |op| *op == NodeOp::CheckObject)[..] else {
         panic!("one object check of x: {text}")
     };
     assert_hoisted(&graph, cell, entry, header_pc, &[x], &text);
@@ -4965,10 +5238,8 @@ fn a_kind_check_behind_a_typed_array_test_stays_in_the_loop() {
     let [entry] = lp.entries[..] else {
         panic!("one entry edge: {text}")
     };
-    let [load] = loads_of(&graph, &chunk, "x")[..] else {
-        panic!("one load of x: {text}")
-    };
-    let [cell] = checks_of(&graph, load, |op| *op == NodeOp::CheckObject)[..] else {
+    let value = entry_value(&graph, &chunk, "x");
+    let [cell] = checks_of(&graph, value, |op| *op == NodeOp::CheckObject)[..] else {
         panic!("one object check of x: {text}")
     };
     let x = slot_named(&chunk, "x") as usize;
@@ -5065,5 +5336,412 @@ fn operations_needing_the_whole_frame_stay_canonical_effects_and_others_are_gene
     assert!(
         matches!(at(spread), Some(NodeOp::Effect { .. })),
         "the spread runs on a copy of the stack: {text}"
+    );
+}
+
+/// Each generic node's inputs: its operands (the words its state's stack ends with), then the
+/// values of the slots its operation names that its state holds as values, in their order (P3
+/// stage 3 step 3a).
+fn assert_generic_inputs(graph: &Graph, chunk: &Chunk, text: &str) {
+    for node in &graph.nodes {
+        let NodeOp::Generic { pc, pops, .. } = node.op else {
+            continue;
+        };
+        let state = graph.state(node.state.expect("a generic node's state"));
+        let pops = usize::from(pops);
+        assert_eq!(
+            node.inputs[..pops],
+            state.stack[state.stack.len() - pops..],
+            "pc {pc}'s operands: {text}"
+        );
+        let stale: Vec<NodeIx> =
+            super::liveness::frame_slots(&chunk.jit_ops()[pc as usize], graph.n_slots)
+                .iter()
+                .filter_map(|&(slot, _)| match state.slots[usize::from(slot)] {
+                    SlotSource::Value(value) => Some(value),
+                    _ => None,
+                })
+                .collect();
+        assert_eq!(node.inputs[pops..], stale[..], "pc {pc}'s slots: {text}");
+    }
+}
+
+#[test]
+fn a_slot_a_generic_node_writes_is_its_output() {
+    // `s++` on a String is a generic node (UpdateLocal), which writes the slot: the slot after it
+    // is its SlotResult, which the return reads, with no reload (P3 stage 3 step 3a).
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function upd(s) { s++; return s; } for (var k = 0; k < 20; k++) upd('1');",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "upd");
+    let text = dump(&graph, &chunk);
+    let s = slot_named(&chunk, "s");
+    let [generic] = nodes(&graph, |op| matches!(op, NodeOp::Generic { .. }))[..] else {
+        panic!("one generic node: {text}")
+    };
+    assert!(
+        matches!(chunk.jit_ops()[generic.pc as usize], Op::UpdateLocal(slot, _) if slot == s),
+        "{text}"
+    );
+    let result = (0..graph.nodes.len() as u32)
+        .map(NodeIx)
+        .find(|&node| graph.node(node).op == NodeOp::SlotResult(s))
+        .unwrap_or_else(|| panic!("the slot's result: {text}"));
+    let generic_ix = graph.node(result).inputs[0];
+    assert!(
+        matches!(graph.node(generic_ix).op, NodeOp::Generic { .. }),
+        "{text}"
+    );
+    let [ret] = nodes(&graph, |op| *op == NodeOp::Return)[..] else {
+        panic!("one return: {text}")
+    };
+    assert_eq!(ret.inputs, [result], "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::FrameSlot(_))),
+        0,
+        "{text}"
+    );
+    assert_generic_inputs(&graph, &chunk, &text);
+}
+
+#[test]
+fn a_join_of_slots_the_frames_held_takes_a_clean_phi() {
+    // Each arm's `s++`/`s--` on a String is a generic node writing `s`: the join merges their
+    // results by a phi (P3 stage 3 step 3a; the frame merged them before), Clean in the sense that
+    // each arm's frame holds its input, which the return reads, with no reload.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function arms(s, c) { if (c) s++; else s--; return s; }
+         for (var k = 0; k < 20; k++) arms('1', k & 1);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "arms");
+    let text = dump(&graph, &chunk);
+    let s = slot_named(&chunk, "s");
+    let results: Vec<NodeIx> = (0..graph.nodes.len() as u32)
+        .map(NodeIx)
+        .filter(|&node| graph.node(node).op == NodeOp::SlotResult(s))
+        .collect();
+    assert_eq!(results.len(), 2, "{text}");
+    let [ret] = nodes(&graph, |op| *op == NodeOp::Return)[..] else {
+        panic!("one return: {text}")
+    };
+    let phi = graph.node(ret.inputs[0]);
+    assert_eq!(phi.op, NodeOp::Phi, "{text}");
+    let mut inputs = phi.inputs.clone();
+    inputs.sort();
+    assert_eq!(inputs, results, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::FrameSlot(_))),
+        0,
+        "{text}"
+    );
+}
+
+#[test]
+fn a_loop_header_takes_a_phi_for_the_slot_a_generic_node_writes() {
+    // A `for…in` step is a generic node that writes its index slot: the loop's header takes a phi
+    // for that slot (the prepass counts the node's writes, P3 stage 3 step 3a), whose back edge's
+    // input is the step's SlotResult, and nothing in the loop reloads a slot.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function keys(o) { var n = 0; for (var k in o) n++; return n; }
+         for (var r = 0; r < 20; r++) keys({a: 1, b: 2, c: 3});",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "keys");
+    let text = dump(&graph, &chunk);
+    let step = pc_of(&chunk, |op| matches!(op, Op::ForInStepL(..)));
+    let Op::ForInStepL(_, index, _) = chunk.jit_ops()[step] else {
+        unreachable!()
+    };
+    let header = the_loop(&graph);
+    let lp = loop_at(&graph, header);
+    let result = (0..graph.nodes.len() as u32)
+        .map(NodeIx)
+        .find(|&node| graph.node(node).op == NodeOp::SlotResult(index))
+        .unwrap_or_else(|| panic!("the step's result: {text}"));
+    let phi = graph.blocks[lp.header]
+        .phis
+        .iter()
+        .copied()
+        .find(|&phi| graph.node(phi).inputs.contains(&result))
+        .unwrap_or_else(|| panic!("a phi taking the step's result: {text}"));
+    assert!(
+        graph.node(phi).inputs.iter().any(|&input| input != result),
+        "{text}"
+    );
+    for node in &graph.nodes {
+        if lp.members[node.block.index()] {
+            assert!(
+                !matches!(node.op, NodeOp::FrameSlot(_) | NodeOp::StoreSlot(_)),
+                "a reload or flush in the loop: {text}"
+            );
+        }
+    }
+    assert_generic_inputs(&graph, &chunk, &text);
+}
+
+#[test]
+fn an_entry_value_read_on_one_arm_of_a_loop_merges_without_a_phi() {
+    // `p`, an entry slot read on one arm of the loop's body only: the join takes the entry value
+    // the arm read for the other arm too (the frame holds it there), so the back edge agrees with
+    // the header (P3 stage 3 step 3a). The join made the slot Frame before, which the back edge
+    // refused ("a loop's slot changes outside its phis").
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function arm(p, n) { var s = 0; for (var i = 0; i < n; i++) { if (i & 1) s += p; }
+           return s; }
+         for (var k = 0; k < 20; k++) arm(k, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "arm");
+    let text = dump(&graph, &chunk);
+    let p = slot_named(&chunk, "p");
+    assert_eq!(count(&graph, |op| *op == NodeOp::FrameSlot(p)), 0, "{text}");
+    entry_value(&graph, &chunk, "p");
+    // With two entry edges the header notes no invariant and holds `p` as the entry's: the join
+    // in the body meets the arm's read (its entry value) and the other arm's Entry, whose input
+    // is that same value, so that no phi and no load is made.
+    eval(
+        &mut engine,
+        "function arm2(p, n, c) { var s = 0, i = 0; if (c) { i = 1; } else { i = 2; }
+           while (i < n) { if (i & 1) s += p; i++; }
+           return s; }
+         for (var k = 0; k < 20; k++) arm2(k, 10, k & 1);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "arm2");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, the_loop(&graph));
+    assert_eq!(lp.entries.len(), 2, "{text}");
+    let p = slot_named(&chunk, "p");
+    assert_eq!(count(&graph, |op| *op == NodeOp::FrameSlot(p)), 0, "{text}");
+    entry_value(&graph, &chunk, "p");
+}
+
+#[test]
+fn generic_nodes_take_their_operands_and_their_stale_named_slots() {
+    // One function per family (P3 stage 3 step 3a): a call, a named load of an accessor (with
+    // its receiver in a slot the frame holds, and in a dirty one; a data property's load through
+    // the prototype chain is the tier's own since step L2, a getter's stays generic), an equality
+    // of untyped words, a store that adds a property, an update of a property, a keyed method
+    // load.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function call(f, x) { return f(x, 1); }
+         function held(o) { return o.g; }
+         function dirty(o) { var p = o.q; return p.g; }
+         function eq(a, b) { return a == b; }
+         function store(o, v) { var p = {}; p.z = v; o.w = p; }
+         function update(o) { o.x++; }
+         function keyed(o, k) { return o[k](); }
+         function id(v) { return v; }
+         var acc = {get g() { return 1; }}, holder = {q: acc};
+         for (var k = 0; k < 20; k++) {
+           call(id, k); held(acc); dirty(holder); eq(k, '1'); store({}, k);
+           update({x: 'a'}); keyed([1, 2], 'pop');
+         }",
+    );
+    for name in ["call", "held", "dirty", "eq", "store", "update", "keyed"] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert!(
+            count(&graph, |op| matches!(op, NodeOp::Generic { .. })) > 0,
+            "{name}: {text}"
+        );
+        assert_eq!(
+            count(&graph, |op| matches!(
+                op,
+                NodeOp::StoreSlot(_) | NodeOp::FrameSlot(_)
+            )),
+            0,
+            "{name}: no flush or reload: {text}"
+        );
+        assert_generic_inputs(&graph, &chunk, &text);
+    }
+    // The receiver's slot: none where the frame holds it (`held`), its value where it is dirty
+    // (`dirty`).
+    let local_load = |name: &str, receiver: &str, engine: &mut Engine| {
+        let (chunk, graph) = graph_of(engine, name);
+        let text = dump(&graph, &chunk);
+        let slot = slot_named(&chunk, receiver);
+        let pc = pc_of(
+            &chunk,
+            |op| matches!(op, Op::GetPropLocal(local, ..) if *local == slot),
+        );
+        let generic = nodes(&graph, |op| matches!(op, NodeOp::Generic { .. }))
+            .into_iter()
+            .find(|node| node.pc as usize == pc)
+            .unwrap_or_else(|| panic!("{name}: the load's generic node: {text}"))
+            .clone();
+        (generic, text)
+    };
+    let (generic, text) = local_load("held", "o", &mut engine);
+    assert!(generic.inputs.is_empty(), "held: {text}");
+    let (generic, text) = local_load("dirty", "p", &mut engine);
+    assert_eq!(generic.inputs.len(), 1, "dirty: {text}");
+}
+
+/// Sixteen locals made before a call and read after it (P3 stage 3 step 3a): the call, a generic
+/// node, flushes none of them, so each crosses it in a home a call preserves, the callee-saved
+/// registers (x23-x28, d8-d15) and, past them, spill slots, never a caller-saved register.
+#[test]
+fn values_across_a_generic_node_take_callee_saved_homes_and_spill_slots() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function many(a, g) { var x1 = a + 1, x2 = a * 2, x3 = a - 3, x4 = a / 4, x5 = a + 5.5,
+           x6 = a * 6.5, x7 = a + 7, x8 = a + 8, x9 = a + 9, x10 = a + 10, x11 = a | 11,
+           x12 = a ^ 12, x13 = a + 13, x14 = a & 14, x15 = a * 15, x16 = a + 16; g();
+           return x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10 + x11 + x12 + x13 + x14 + x15
+             + x16; }
+         function nothing() {}
+         for (var k = 0; k < 20; k++) many(k + 0.5, nothing);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "many");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| matches!(
+            op,
+            NodeOp::StoreSlot(_) | NodeOp::FrameSlot(_)
+        )),
+        0,
+        "{text}"
+    );
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    {
+        use super::regalloc::{allocate, Home, ARM64};
+        let alloc = allocate(&graph, &ARM64).expect("allocated");
+        super::regalloc::tests::assert_consistent(&graph, &alloc);
+        let generic = (0..graph.nodes.len())
+            .find(|&n| matches!(graph.nodes[n].op, NodeOp::Generic { .. }))
+            .unwrap_or_else(|| panic!("the call: {text}"));
+        let at = alloc.pos[generic];
+        let across: Vec<Home> = (0..graph.nodes.len())
+            .filter(|&v| {
+                let (start, end) = alloc.ranges[v];
+                start < at && at < end && !matches!(alloc.homes[v], Home::None | Home::Const)
+            })
+            .map(|v| alloc.homes[v])
+            .collect();
+        assert!(across.len() >= 16, "{across:?}: {text}");
+        let callee = |home: &Home| match *home {
+            Home::Gp(r) => ARM64.gp_callee.contains(&r),
+            Home::Fp(r) => ARM64.fp_callee.contains(&r),
+            _ => false,
+        };
+        assert!(
+            across
+                .iter()
+                .all(|home| callee(home) || matches!(home, Home::Spill(_))),
+            "{across:?}: {text}"
+        );
+        assert!(across.iter().any(callee), "{across:?}: {text}");
+        assert!(
+            across.iter().any(|home| matches!(home, Home::Spill(_))),
+            "{across:?}: {text}"
+        );
+    }
+}
+
+#[test]
+fn the_verifier_refuses_a_generic_nodes_missing_slot_input_and_a_stray_slot_result() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function dirty(o) { var p = o.q; return p.g; }
+         function upd(s) { s++; return s; }
+         var holder = {q: {get g() { return 1; }}};
+         for (var k = 0; k < 20; k++) { dirty(holder); upd('1'); }",
+    );
+    let rejects = |chunk: &Chunk, what: &str, broken: Graph, expected: &str| {
+        let error = verify(&broken, chunk).expect_err(what);
+        assert!(error.contains(expected), "{what}: {error}");
+    };
+    // A generic node without the value of its dirty named slot.
+    let (chunk, graph) = graph_of(&mut engine, "dirty");
+    let generic = graph
+        .nodes
+        .iter()
+        .position(|node| matches!(node.op, NodeOp::Generic { .. }) && !node.inputs.is_empty())
+        .expect("the load with its slot input");
+    let mut broken = graph.clone();
+    broken.nodes[generic].inputs.pop();
+    rejects(&chunk, "a missing slot input", broken, "stale slots");
+    verify(&graph, &chunk).expect("the graph itself holds");
+    // A slot result of a slot its node's operation does not write (the load reads `p`).
+    let p = slot_named(&chunk, "p");
+    let mut broken = graph.clone();
+    let block = broken.nodes[generic].block;
+    let stray = broken.new_node(
+        block,
+        NodeOp::SlotResult(p),
+        &[NodeIx(generic as u32)],
+        Rep::Tagged,
+        broken.nodes[generic].pc,
+    );
+    let body = &mut broken.blocks[block.index()].body;
+    let at = body
+        .iter()
+        .position(|&node| node.index() == generic)
+        .expect("the load in its block");
+    body.insert(at + 1, stray);
+    rejects(&chunk, "another slot's result", broken, "does not write");
+    // A slot result of no generic node.
+    let (chunk, graph) = graph_of(&mut engine, "upd");
+    let result = graph
+        .nodes
+        .iter()
+        .position(|node| matches!(node.op, NodeOp::SlotResult(_)))
+        .expect("the update's result");
+    let mut broken = graph.clone();
+    broken.nodes[result].inputs = vec![NodeIx(result as u32)];
+    rejects(
+        &chunk,
+        "a result of another node",
+        broken,
+        "a slot's result of",
+    );
+    verify(&graph, &chunk).expect("the graph itself holds");
+}
+
+/// Heap facts end at a generic node, which may run any code (P3 stage 3 step 3a: as at an effect):
+/// a field loaded before the call is loaded again after it, its object's shape checked again,
+/// while the object's word itself, a value, is the same node.
+#[test]
+fn a_generic_node_ends_the_heap_facts_and_keeps_the_values() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function hf(o, g) { var a = o.x; g(o); return a + o.x; }
+         function bump(o) { o.x = o.x + 1; }
+         for (var k = 0; k < 20; k++) hf({x: k}, bump);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "hf");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::Generic { .. })),
+        1,
+        "{text}"
+    );
+    let loads = nodes(&graph, |op| matches!(op, NodeOp::LoadField { .. }));
+    assert_eq!(
+        loads.len(),
+        2,
+        "the field is loaded again after the call: {text}"
+    );
+    let shapes = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    assert_eq!(shapes.len(), 2, "its shape checked again: {text}");
+    assert_eq!(shapes[0].inputs, shapes[1].inputs, "one word: {text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::FrameSlot(_))),
+        0,
+        "{text}"
     );
 }

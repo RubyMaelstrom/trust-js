@@ -317,6 +317,9 @@ pub(crate) enum NodeOp {
     Phi,
     /// The i-th result of the effect or generic node that is this node's only input (Tagged).
     Projection(u8),
+    /// The word the generic node that is this node's only input left in slot `s`, which its
+    /// operation writes (Tagged; P3 stage 3 step 3a): the frame holds it after the node.
+    SlotResult(u16),
 
     // Checks: each node has a frame state (its eager exit's) and a reason.
     /// Tagged -> F64.
@@ -623,10 +626,14 @@ pub(crate) enum NodeOp {
         pushes: u8,
     },
     /// Any other operation the tier does not lower, as the tier's own node (P3 stage 3 step 3a;
-    /// the owner's D6, explicit operands): inputs are its popped operands (words, or values the
-    /// code boxes into them), its results the Projections that follow it, its state the frame
-    /// state before it, as an effect's. Its lowering runs the operation's baseline template on
-    /// the canonical operand words at its pc's depth.
+    /// the owner's D6, explicit operands): inputs are its popped operands, then the values of the
+    /// slots it names (`liveness::SlotUse`) whose frame words are stale (the slots its state holds
+    /// as values), in their order, each a word or a value the code boxes into one; its results are
+    /// the Projections that follow it, the slots it writes the SlotResults after them; its state
+    /// is the frame state before it, as an effect's. It reads and writes no other slot, so a slot
+    /// it does not name keeps its value and its place across it. Its lowering runs the operation's
+    /// baseline template on the canonical operand words at its pc's depth, the named slots'
+    /// words written first.
     Generic {
         pc: u32,
         pops: u8,
@@ -718,6 +725,7 @@ impl NodeOp {
                 // inlined frame's generic nodes are step 3c's).
                 | NodeOp::Generic { .. }
                 | NodeOp::Projection(_)
+                | NodeOp::SlotResult(_)
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CalleeMatches { .. }
                 | NodeOp::Return

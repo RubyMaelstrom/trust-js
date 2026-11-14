@@ -242,6 +242,40 @@ pub(crate) enum SlotUse {
     Any,
 }
 
+impl SlotUse {
+    /// The slots it names, in their order (none for a write's range, `NoSlot` and `Any`).
+    pub(crate) fn named(&self) -> &[u16] {
+        match self {
+            SlotUse::Named { slots, count, .. } => &slots[..usize::from(*count)],
+            _ => &[],
+        }
+    }
+
+    /// Whether it writes its `k`th named slot.
+    pub(crate) fn writes(&self, k: usize) -> bool {
+        matches!(self, SlotUse::Named { written, .. } if written & (1 << k) != 0)
+    }
+}
+
+/// The slots of the frame `op` names, each once and in its order, with whether it writes it
+/// (a named number past the frame's `n_slots`, a binding's count or a step's index, is none): a
+/// generic node's slot inputs and outputs (P3 stage 3 step 3a, `opt::build`), which the verifier
+/// and the back end read again.
+pub(crate) fn frame_slots(op: &Op, n_slots: usize) -> Vec<(u16, bool)> {
+    let uses = slot_use(op);
+    let mut slots: Vec<(u16, bool)> = Vec::new();
+    for (k, &slot) in uses.named().iter().enumerate() {
+        if usize::from(slot) >= n_slots {
+            continue;
+        }
+        match slots.iter_mut().find(|(known, _)| *known == slot) {
+            Some((_, written)) => *written |= uses.writes(k),
+            None => slots.push((slot, uses.writes(k))),
+        }
+    }
+    slots
+}
+
 /// The named slots `slots` (the first `count` of them), `written` marking those the operation
 /// writes.
 fn named(slots: &[u16], written: u8) -> SlotUse {
@@ -358,6 +392,11 @@ pub(crate) fn slot_use(op: &Op) -> SlotUse {
         | Op::StrictNotEq
         | Op::InstanceOf(_)
         | Op::In
+        // The abstract operations (ToObject, LengthOfArrayLike, IsCallable, ArraySpeciesCreate,
+        // CreateDataPropertyOrThrow, ThrowTypeError) take their operands only: their template
+        // (`emit_define_elem_inline`) and helper (`jit_abstract_operation_inner`) read no slot
+        // (P3 stage 3 step 3a).
+        | Op::Abstract(_)
         | Op::GenBin(_)
         | Op::Neg
         | Op::Plus
@@ -566,6 +605,11 @@ mod tests {
             SlotUse::Writes { start: 3, count: 1 }
         );
         assert_eq!(slot_use(&Op::Call(1, 0)), SlotUse::NoSlot);
+        // P3 stage 3 step 3a: the abstract operations take their operands only.
+        assert_eq!(
+            slot_use(&Op::Abstract(crate::bytecode::AbstractOp::IsCallable)),
+            SlotUse::NoSlot
+        );
         assert_eq!(slot_use(&Op::EvalExpr(0)), SlotUse::Any);
     }
 

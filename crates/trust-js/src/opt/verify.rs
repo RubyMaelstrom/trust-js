@@ -691,6 +691,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::Return => (TAGGED, Rep::None),
         NodeOp::Phi
         | NodeOp::Projection(_)
+        | NodeOp::SlotResult(_)
         | NodeOp::Effect { .. }
         | NodeOp::Generic { .. }
         | NodeOp::CheckCallee { .. }
@@ -756,13 +757,51 @@ fn representations(
                     chunk.jit_stack_effect(pc as usize)
                 ));
             }
+            // A generic node's slot inputs (P3 stage 3 step 3a): the slots its operation names
+            // that its state holds as values, whose stale words it writes.
+            let stale = match (&node.op, node.state) {
+                (NodeOp::Generic { .. }, Some(state)) => {
+                    let state = graph.state(state);
+                    super::liveness::frame_slots(&chunk.jit_ops()[pc as usize], n_slots)
+                        .iter()
+                        .filter(|&&(slot, _)| {
+                            matches!(
+                                state.slots.get(usize::from(slot)),
+                                Some(SlotSource::Value(_))
+                            )
+                        })
+                        .count()
+                }
+                _ => 0,
+            };
             // Each operand in a representation the code boxes into its word (stage 2 step 6:
             // an untagged phi's uses need no retagging).
-            if node.inputs.len() != pops as usize || !reps.iter().all(|&rep| boxable(rep)) {
-                return Err(format!("operands {reps:?} for {pops} words"));
+            if node.inputs.len() != pops as usize + stale || !reps.iter().all(|&rep| boxable(rep)) {
+                return Err(format!(
+                    "operands {reps:?} for {pops} words and {stale} stale slots"
+                ));
             }
             if node.rep != Rep::None {
                 return Err(format!("a {:?} effect", node.rep));
+            }
+        }
+        &NodeOp::SlotResult(slot) => {
+            // A slot its generic node's operation writes, read in the node's block after it.
+            let generic = match node.inputs[..] {
+                [generic] => graph.node(generic),
+                _ => return Err("a slot's result of other than one node".into()),
+            };
+            let NodeOp::Generic { pc, .. } = generic.op else {
+                return Err(format!("a slot's result of {:?}", generic.op));
+            };
+            let writes = super::liveness::frame_slots(&chunk.jit_ops()[pc as usize], n_slots)
+                .contains(&(slot, true));
+            if !writes || generic.block != node.block || node.rep != Rep::Tagged {
+                return Err(format!(
+                    "a {:?} result of slot {slot}, which pc {pc}'s operation does not write \
+                     or in another block",
+                    node.rep
+                ));
             }
         }
         &NodeOp::CheckCallee { target } | &NodeOp::CalleeMatches { target } => {

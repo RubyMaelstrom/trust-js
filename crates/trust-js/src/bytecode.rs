@@ -25867,6 +25867,16 @@ fn jit_bridge_op(op: &Op) -> bool {
 /// step over a copy of the whole operand stack (its dispatch: the bridge operations but the
 /// Reference and lexical-scope ones, which their own helpers run on the canonical owners). The
 /// optimizing tier keeps every such operation a canonical-frame effect (P3 stage 3 step 3a).
+#[cfg_attr(
+    not(any(
+        test,
+        all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )
+    )),
+    expect(dead_code, reason = "the tier's builder reads it")
+)]
 pub(crate) fn jit_runs_on_vm_copy(op: &Op) -> bool {
     jit_bridge_op(op)
         && !jit_scope_operation(op)

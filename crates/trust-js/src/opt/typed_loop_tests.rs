@@ -129,10 +129,13 @@ fn an_effect_free_loop_keeps_a_typed_arrays_facts_its_entry_holds() {
             NodeOp::TypedData { write: true },
             "{name}: {text}"
         );
+        // No entry check of the array's facts (P3 stage 3 step 3a: the loop bound's Number checks,
+        // an invariant the header holds, do move to the entry).
         assert!(
             graph
                 .nodes
                 .iter()
+                .filter(|node| established(&node.op))
                 .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
             "{name}: {text}"
         );
@@ -458,13 +461,38 @@ fn no_entry_check_without_one_entry_edge_from_a_jump_or_where_the_loop_writes_th
     ] {
         let (chunk, graph) = graph_of(&mut engine, name);
         let text = dump(&graph, &chunk);
+        // No entry check of the array's heap facts. (P3 stage 3 step 3a moves the value checks of
+        // an invariant the header holds to the loop's entry: the loop bound's Number checks, the
+        // array's CheckObject and a kind check every access shares, also across `eff`'s call, a
+        // generic node, which cannot change a value; never two kinds, nor a heap fact.)
+        let heap = |op: &NodeOp| {
+            matches!(
+                op,
+                NodeOp::TypedView
+                    | NodeOp::TypedLength
+                    | NodeOp::TypedData { .. }
+                    | NodeOp::LoadBinding { .. }
+            )
+        };
         assert!(
             graph
                 .nodes
                 .iter()
+                .filter(|node| heap(&node.op))
                 .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
             "{name}: {text}"
         );
+        if name == "apart" {
+            // Its arms read the array as two kinds: no kind check moves.
+            assert!(
+                graph
+                    .nodes
+                    .iter()
+                    .all(|node| !(matches!(node.op, NodeOp::CheckElements(_))
+                        && node.reason == Some(ExitReason::HoistingFailed))),
+                "{name}: {text}"
+            );
+        }
         if name == "kinds" {
             continue; // the stub's TypedElement calls, which make no TypedData
         }

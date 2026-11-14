@@ -36,9 +36,10 @@
 //!   PhiNotNumber to a tagged one (the plan's departures 2 and 3: the check by default where V8
 //!   peels; a flag per header, not per phi). No speculation on back edges or at forward joins
 //!   (Maglev's default outside peeled loops; departure 4).
-//! - A loop's invariants (P3 stage 3 step 0): the value an effect-free loop's header loaded on its
-//!   one entry edge for a slot the loop does not write (`PhiNotes::invariants`), an untagged
-//!   phi's degenerate case (one input, the entry's), is checked on that edge too: its checks in
+//! - A loop's invariants (P3 stage 3 step 0): the value an effect-free loop's one entry edge brings
+//!   for a slot the loop reads and does not write (`PhiNotes::invariants`: one its header holds,
+//!   P3 stage 3 step 3a, or loads at that edge's predecessor's end where the frame kept it), an
+//!   untagged phi's degenerate case (one input, the entry's), is checked on that edge too: its checks in
 //!   the loop, CheckNumber and CheckInt32 of that, CheckObject and CheckElements of that, move to
 //!   the entry predecessor's end, each kind once, exiting at the header's pc with the state the
 //!   edge leaves. That is Ion's LICM of guards to the loop's predecessor (jit/LICM.cpp:204-246,
@@ -566,10 +567,9 @@ impl<'g> Selector<'g> {
     /// the edge leaves [HoistingFailed]; none where the loop also tests the cell for a typed
     /// array, a test the kind check's arm sits behind. A flag at the header leaves them in the
     /// loop. Whether any moved.
-    fn hoist_invariant_checks(&mut self, invariants: &[NodeIx]) -> bool {
+    fn hoist_invariant_checks(&mut self, invariants: &[(NodeIx, BlockIx)]) -> bool {
         let mut moved = false;
-        for &value in invariants {
-            let pred = self.graph.node(value).block;
+        for &(value, pred) in invariants {
             let [header] = self.graph.block(pred).succs[..] else {
                 continue;
             };
@@ -578,12 +578,17 @@ impl<'g> Selector<'g> {
             };
             let graph = &*self.graph;
             let users = &self.users;
+            // A check an enclosing loop's entry took already (the notes hold the value for each
+            // loop whose header holds it, the enclosing loop's first) is no check of this loop.
+            let removed = &self.removed;
             let in_loop = |node: NodeIx| members[graph.node(node).block.index()];
             let checks = |of: NodeIx, op: fn(&NodeOp) -> bool| -> Vec<NodeIx> {
                 users[of.index()]
                     .iter()
                     .copied()
-                    .filter(|&user| op(&graph.node(user).op) && in_loop(user))
+                    .filter(|&user| {
+                        !removed[user.index()] && op(&graph.node(user).op) && in_loop(user)
+                    })
                     .collect()
             };
             let numbers = checks(value, |op| *op == NodeOp::CheckNumber);
@@ -595,7 +600,7 @@ impl<'g> Selector<'g> {
             let typed_test = cells
                 .iter()
                 .any(|&cell| !checks(cell, |op| *op == NodeOp::IsTypedArray).is_empty());
-            let kinds: Vec<NodeIx> = if typed_test {
+            let mut kinds: Vec<NodeIx> = if typed_test {
                 Vec::new()
             } else {
                 cells
@@ -603,6 +608,15 @@ impl<'g> Selector<'g> {
                     .flat_map(|&cell| checks(cell, |op| matches!(op, NodeOp::CheckElements(_))))
                     .collect()
             };
+            // Kind checks of different kinds sit on paths the loop takes for different arrays (an
+            // invariant the header holds, P3 stage 3 step 3a, may be read on each arm): moved to
+            // the entry together, one of them would always fail. None moves then.
+            if kinds
+                .iter()
+                .any(|&kind| graph.node(kind).op != graph.node(kinds[0]).op)
+            {
+                kinds.clear();
+            }
             if numbers.is_empty() && cells.is_empty() {
                 continue;
             }

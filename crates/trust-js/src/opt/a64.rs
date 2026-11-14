@@ -486,7 +486,12 @@ fn check_graph(
                     let depth = cfg
                         .stack_depth_at(pc as usize)
                         .ok_or(Refusal::at(pc as usize, "an effect at an unreachable pc"))?;
-                    if (pops as usize) > depth || node.inputs.len() != pops as usize {
+                    let stale = if matches!(node.op, NodeOp::Generic { .. }) {
+                        stale_slots(chunk, graph, node).len()
+                    } else {
+                        0
+                    };
+                    if (pops as usize) > depth || node.inputs.len() != pops as usize + stale {
                         return Err(Refusal::at(pc as usize, "an effect's operands"));
                     }
                     if let Some(after) = cfg.stack_depth_at(pc as usize + 1) {
@@ -566,6 +571,26 @@ fn check_graph(
         }
     }
     Ok(())
+}
+
+/// The slots generic node `node` writes before its template, in the order of its slot inputs
+/// (P3 stage 3 step 3a, `build::Builder::effect`): those its operation names that its state holds
+/// as values, their frame words stale.
+fn stale_slots(chunk: &FrozenChunk, graph: &Graph, node: &Node) -> Vec<u16> {
+    let Some(state) = node.state else {
+        return Vec::new();
+    };
+    let state = graph.state(state);
+    crate::opt::liveness::frame_slots(&chunk.jit_ops()[node.pc as usize], graph.n_slots)
+        .into_iter()
+        .filter(|&(slot, _)| {
+            matches!(
+                state.slots.get(usize::from(slot)),
+                Some(SlotSource::Value(_))
+            )
+        })
+        .map(|(slot, _)| slot)
+        .collect()
 }
 
 /// Whether a node addresses element words or their header, whose offsets the layout must let
@@ -1597,6 +1622,21 @@ impl Gen<'_> {
                     self.gp_done(n, dst);
                 }
             }
+            NodeOp::SlotResult(slot) => {
+                // The template's write of the slot, read right after its node (and its
+                // projections).
+                if self.last_effect != Some(input(0)) {
+                    return Err(Refusal::at(
+                        node.pc as usize,
+                        "a slot's result apart from its node",
+                    ));
+                }
+                if !unused {
+                    let dst = self.gp_dst(n);
+                    self.a.ldr_imm(dst, 22, u32::from(*slot) * 8);
+                    self.gp_done(n, dst);
+                }
+            }
             NodeOp::Projection(k) => {
                 let effect = input(0);
                 let (NodeOp::Effect { pushes, .. } | NodeOp::Generic { pushes, .. }) =
@@ -2469,9 +2509,18 @@ impl Gen<'_> {
                 }
             }
         }
-        for (k, &v) in node.inputs.iter().enumerate() {
+        for (k, &v) in node.inputs[..pops].iter().enumerate() {
             let word = self.boxed(v, X16);
             self.a.str_imm(word, X9, (8 * (depth - pops + k)) as u32);
+        }
+        // A generic node's named slots whose words are stale (P3 stage 3 step 3a): the template
+        // reads them in the frame.
+        if matches!(node.op, NodeOp::Generic { .. }) {
+            let slots = stale_slots(self.chunk, graph, node);
+            for (&slot, &v) in slots.iter().zip(&node.inputs[pops..]) {
+                let word = self.boxed(v, X16);
+                self.a.str_imm(word, 22, 8 * u32::from(slot));
+            }
         }
         self.a.add_imm(20, X9, (8 * depth) as u32);
         let unwind = if handlers {

@@ -8,18 +8,22 @@
 //!   are other roots of the Cfg, which the graph never enters: a throw in optimized code exits to
 //!   the VM at the throwing pc, where the VM runs the pad (the plan's point 11).
 //! - Loops: a loop-assignment prepass gives each loop header a phi for every slot a native write
-//!   in the loop assigns and that is live at the header (stage 2 step 6, `opt::liveness`), and for
-//!   every operand-stack position. A live slot the loop does not assign keeps its value through
-//!   the header when nothing in the loop can be an effect, and is in the frame at the header
-//!   otherwise (an effect leaves every slot in the frame); whether an operation can be one is the
-//!   builder's own choice of its form ([`Rules`], stage 2 step 4), which the builder keeps to.
-//!   Where such a loop reads such a slot and is entered with it in the frame's keeping, its value
-//!   is loaded once at the end of each entry predecessor and held through the loop, the frame
-//!   still holding it (P3 stage 3 step 0, `Builder::invariant`). A header's poll opens its body, with the
-//!   header's state, once a back edge reaches it.
+//!   or a generic node in the loop may assign and that is live at the header (stage 2 step 6,
+//!   `opt::liveness`; P3 stage 3 step 3a), and for every operand-stack position. A live slot the
+//!   loop does not assign keeps its value through the header, unless an operation of the loop
+//!   may be a canonical-frame effect, after which it is in the frame at the header (such an
+//!   effect leaves every slot in the frame); whether an operation can be one is the builder's own
+//!   choice of its form ([`Rules`], stage 2 step 4), which the builder keeps to. Where a loop
+//!   without effects or generic nodes reads such a slot and is entered with it in the frame's
+//!   keeping, its value is loaded once at the end of each entry predecessor and held through the
+//!   loop, the frame still holding it (P3 stage 3 step 0, `Builder::invariant`); with one entry
+//!   edge, such a loop's invariants, the values its header holds for the slots it reads and does
+//!   not assign, are noted for the phi selector, which moves their checks in the loop to that
+//!   edge. A header's poll opens its body, with the header's state, once a back edge reaches it.
 //! - Liveness (stage 2 step 6): a slot dead at a pc is Dead in its frame states, no join merges
 //!   it, no flush writes it, and no value holds it after an effect.
-//! - Joins: a phi where the predecessors' values differ and one of them is not in the frame.
+//! - Joins: a phi where the predecessors' values differ and one of them is a node's (P3 stage 3
+//!   step 3a: the frame no longer merges slots a generic node left alone).
 //!   Values cross an edge into a block of one predecessor as they are; a phi's inputs are words,
 //!   boxed at the end of each predecessor as Maglev's MergeValue tags them, with their untagged
 //!   forms there noted for the phi selector (`opt::phis`, stage 2 step 6), which picks each
@@ -44,9 +48,14 @@
 //!   guard's mismatch edge (CallLinkStatus's couldTakeSlowPath, CallLinkStatus.cpp:98-120), and
 //!   NeverRan builds the block (the parser's InadequateCoverage backstop, :7105-7124). The graph
 //!   lists each decline.
-//! - Everything else that is not control flow is an effect: the operation's baseline template on
-//!   the canonical frame, with the dirty slots flushed before it and every slot read back from the
-//!   frame after it.
+//! - Everything else that is not control flow is a generic node (P3 stage 3 step 3a; the owner's
+//!   D6): its operands and the values of the slots it names are its inputs, its pushes and the
+//!   slots it writes its outputs, and every other slot keeps its value across it, as Maglev's
+//!   generic nodes take their inputs; its lowering runs the operation's baseline template on the
+//!   canonical operand words. An operation that needs the whole frame (it may read any slot, or
+//!   its helper runs the VM on a copy of the operand stack: [`canonical`]) is a canonical-frame
+//!   effect: its template on the canonical frame, the dirty slots flushed before it and every slot
+//!   read back from the frame after it.
 //! - Exits: a check before an operation exits at the operation's pc with its operands on the
 //!   stack, and so does an operation's own exit (an int32 overflow); nothing exits after an
 //!   operation has had an effect, so an exit never replays one (the regions' rule,
@@ -63,7 +72,7 @@ use super::ir::{
     Refusal, Rep, SlotSource, StateIx,
 };
 use super::ir::{ElemKind, Holes, Store, TypedKind};
-use super::liveness::{slot_use, SlotLiveness, SlotUse};
+use super::liveness::{frame_slots, slot_use, SlotLiveness, SlotUse};
 use super::snapshot::{Ran, Snapshot};
 use super::view::FrozenChunk;
 use crate::bytecode::IC_PRIMITIVE_STRING;
@@ -1055,13 +1064,15 @@ struct Flow {
 
 /// A natural loop's prepass facts.
 struct Loop {
-    /// The slots a native write in the loop assigns (StoreLocal, UpdateLocal, Tdz, ResetSlots).
+    /// The slots a native write in the loop assigns (StoreLocal, UpdateLocal, Tdz, ResetSlots),
+    /// and those a generic node of the loop may write (`liveness::frame_slots`; P3 stage 3 step
+    /// 3a), as Maglev's loop phis are its loop's assignments.
     written: Vec<bool>,
     /// The slots an operation of the loop may read (`liveness::add_reads`), for a loop without
     /// effects (empty otherwise).
     read: Vec<bool>,
-    /// Whether an operation of the loop may lower to an effect, after which every slot is in the
-    /// frame.
+    /// Whether an operation of the loop may lower to an effect or a generic node: step 0's rules
+    /// take only loops without (the load of an invariant slot, the notes of invariants).
     effects: bool,
     /// Whether the loop keeps its entry's heap facts (P3 stage 3 step 0c): no effect, and no `%`,
     /// whose F64Mod call ends them in the builder's model. Nothing else the loop runs, its poll's
@@ -1075,6 +1086,10 @@ struct Loop {
     /// that keeps heap facts (P3 stage 3 step 0c), whose checks its entry makes once
     /// (`Builder::loop_entry_checks`).
     typed: Vec<TypedUse>,
+    /// Whether an operation of the loop may be a canonical-frame effect ([`canonical`]), after
+    /// which every slot is in the frame (P3 stage 3 step 3a: a generic node leaves the slots it
+    /// does not write as they are).
+    canonical: bool,
 }
 
 /// Where an element site's receiver word comes from, as the loop prepass reads it from the site's
@@ -1211,6 +1226,7 @@ impl Flow {
                 keeps_heap: false,
                 stored: Vec::new(),
                 typed: Vec::new(),
+                canonical: false,
             };
             let mut modulo = false;
             for &index in &body {
@@ -1231,8 +1247,16 @@ impl Flow {
                             *written = true;
                         }
                     }
+                    let whole = canonical(&ops[pc]);
                     if !rules.lowers(pc) {
                         found.effects = true;
+                        found.canonical |= whole;
+                    }
+                    // The slots its generic node may write (none where the operation lowers).
+                    if !whole {
+                        for (slot, writes) in frame_slots(&ops[pc], n_slots) {
+                            found.written[usize::from(slot)] |= writes;
+                        }
                     }
                 }
             }
@@ -1289,8 +1313,9 @@ impl Flow {
 }
 
 /// `graph` with its blocks numbered in reverse postorder from the entry: the entry first, every
-/// block after its dominators and forward edges forward, the order a one-pass back end walks.
-fn in_reverse_postorder(mut graph: Graph) -> Graph {
+/// block after its dominators and forward edges forward, the order a one-pass back end walks;
+/// `notes`' blocks renumbered with them.
+fn in_reverse_postorder(mut graph: Graph, notes: &mut PhiNotes) -> Graph {
     let entry = graph.entry.expect("the builder makes the entry");
     let count = graph.blocks.len();
     let mut seen = vec![false; count];
@@ -1349,6 +1374,10 @@ fn in_reverse_postorder(mut graph: Graph) -> Graph {
         }
     }
     graph.entry = Some(renumber(entry));
+    // The notes' blocks too (an invariant's entry predecessor, P3 stage 3 step 3a).
+    for (_, pred) in &mut notes.invariants {
+        *pred = renumber(*pred);
+    }
     graph
 }
 
@@ -1664,10 +1693,12 @@ pub(crate) struct Alternatives {
 pub(crate) struct PhiNotes {
     /// The alternatives of each phi input that has some, by (phi, input index).
     pub(crate) alternatives: FastMap<(NodeIx, u32), Alternatives>,
-    /// The loads of effect-free loops' invariant slots on their loops' one entry edge, each at
-    /// the end of that edge's predecessor (`Builder::invariant`; P3 stage 3 step 0), whose checks
-    /// in the loop the selector moves to that edge.
-    pub(crate) invariants: Vec<NodeIx>,
+    /// The invariants of effect-free loops with one entry edge, each with that edge's
+    /// predecessor, whose checks in the loop the selector moves to that edge (P3 stage 3 step 0):
+    /// the values live across their loop's header in slots the loop reads and does not write,
+    /// held at the header (P3 stage 3 step 3a) or loaded at the end of the predecessor where the
+    /// frame kept them (`Builder::invariant`).
+    pub(crate) invariants: Vec<(NodeIx, BlockIx)>,
 }
 
 /// A built loop header: its phis by the location each merges, the state it assumed for what the
@@ -1877,11 +1908,8 @@ impl<'a> Builder<'a> {
         }
         let hoisted = std::mem::take(&mut self.hoisted_nodes);
         self.graph.blocks[first.index()].body.splice(0..0, hoisted);
-        Ok((
-            in_reverse_postorder(self.graph),
-            self.notes,
-            self.inline_log,
-        ))
+        let graph = in_reverse_postorder(self.graph, &mut self.notes);
+        Ok((graph, self.notes, self.inline_log))
     }
 
     fn build_block(&mut self, id: BlockId) -> Result<(), Refusal> {
@@ -2770,6 +2798,15 @@ impl<'a> Builder<'a> {
         })
     }
 
+    /// A live slot at a join of `preds`: their state where they agree, and otherwise a phi of
+    /// their values (P3 stage 3 step 3a: joins merge by phis, as Maglev's merge points do,
+    /// maglev-interpreter-frame-state.cc MergeValue), Clean where every predecessor's frame holds
+    /// its value, and so the phi's, Dirty where one's does not. Where none holds a node's value
+    /// (Frame and Entry, after a canonical-frame effect) the slot stays in the frame's keeping. An
+    /// Entry predecessor's input is the entry's value where the builder made it already (another
+    /// predecessor's read, which then needs no phi), and the frame's word loaded at its end
+    /// otherwise (`entry_at_end`), not a new entry value, whose range would run from the
+    /// function's entry.
     fn merge_slot(
         &mut self,
         block: BlockIx,
@@ -2786,19 +2823,46 @@ impl<'a> Builder<'a> {
         }
         if preds
             .iter()
-            .all(|(_, st)| !matches!(st.slots[slot], Slot::Dirty(_)))
+            .all(|(_, st)| matches!(st.slots[slot], Slot::Entry | Slot::Frame))
         {
-            return (Slot::Frame, None); // every frame holds its value
+            return (Slot::Frame, None); // every frame holds its value, and no node does
         }
+        let dirty = preds
+            .iter()
+            .any(|(_, st)| matches!(st.slots[slot], Slot::Dirty(_)));
         let mut values = Vec::with_capacity(preds.len());
         for (from, st) in preds.iter_mut() {
-            values.push(self.value_at_end(*from, st, Loc::Slot(slot), pc));
+            let value = if st.slots[slot] == Slot::Entry {
+                self.entry_at_end(*from, st, slot, pc)
+            } else {
+                self.value_at_end(*from, st, Loc::Slot(slot), pc)
+            };
+            values.push(value);
         }
+        let merged = |value| {
+            if dirty {
+                Slot::Dirty(value)
+            } else {
+                Slot::Clean(value)
+            }
+        };
         if values.iter().all(|&value| value == values[0]) {
-            return (Slot::Dirty(values[0]), None);
+            return (merged(values[0]), None);
         }
         let phi = self.merge_phi(block, preds, &values, pc);
-        (Slot::Dirty(phi), Some(phi))
+        (merged(phi), Some(phi))
+    }
+
+    /// The entry value of `slot`, which `block` (ended, its state `st`) leaves unwritten: the
+    /// entry block's read of it where one was made, or else the frame's word loaded before
+    /// `block`'s terminator; Clean there.
+    fn entry_at_end(&mut self, block: BlockIx, st: &mut State, slot: usize, pc: usize) -> NodeIx {
+        let value = match self.hoisted.get(&Hoisted::Entry(slot as u16)) {
+            Some(&value) => value,
+            None => self.add_at_end(block, NodeOp::FrameSlot(slot as u16), &[], Rep::Tagged, pc),
+        };
+        st.slots[slot] = Slot::Clean(value);
+        value
     }
 
     /// An effect-free loop's live `slot` that the loop reads and does not write and that its entry
@@ -2824,12 +2888,22 @@ impl<'a> Builder<'a> {
         }
         if values.iter().all(|&value| value == values[0]) {
             if preds.len() == 1 {
-                self.notes.invariants.push(values[0]);
+                self.note_invariant(values[0], preds[0].0);
             }
             return (Slot::Clean(values[0]), None);
         }
         let phi = self.merge_phi(block, preds, &values, pc);
         (Slot::Clean(phi), Some(phi))
+    }
+
+    /// Note `value`, an invariant of the loop whose one entry edge leaves `pred`, for the selector
+    /// (`PhiNotes::invariants`): every loop whose header holds it, an enclosing loop's before its
+    /// inner loops' (the header order), whose checks it moves first, and sibling loops each (an
+    /// entry value two arms' loops read: NavierStokes' lin_solve).
+    fn note_invariant(&mut self, value: NodeIx, pred: BlockIx) {
+        if !self.notes.invariants.contains(&(value, pred)) {
+            self.notes.invariants.push((value, pred));
+        }
     }
 
     /// The state at a loop header from its entry edges (see the module's doc).
@@ -2870,7 +2944,7 @@ impl<'a> Builder<'a> {
                 let phi = self.merge_phi(block, &mut preds, &values, pc);
                 phis.push((phi, Loc::Slot(slot)));
                 slots.push(Slot::Dirty(phi));
-            } else if lp.effects {
+            } else if lp.canonical {
                 for (from, st) in preds.iter_mut() {
                     if let Slot::Dirty(value) = st.slots[slot] {
                         self.store_at_end(*from, slot, value, pc);
@@ -2879,9 +2953,27 @@ impl<'a> Builder<'a> {
                 }
                 slots.push(Slot::Frame);
             } else {
+                // The slot keeps its entry state through the loop (generic nodes leave it so).
                 let (mut merged, mut phi) = self.merge_slot(block, &mut preds, slot, pc);
-                if merged == Slot::Frame && lp.read[slot] {
+                let read = !lp.effects && lp.read[slot];
+                if merged == Slot::Frame && read {
                     (merged, phi) = self.invariant(block, &mut preds, slot, pc);
+                } else if read && preds.len() == 1 {
+                    // An invariant the header holds (P3 stage 3 step 3a): the value the entry
+                    // edge brings, the entry's value hoisted for an unread entry slot (which the
+                    // loop's read would hoist).
+                    let held = match merged {
+                        Slot::Clean(value) | Slot::Dirty(value) => Some(value),
+                        Slot::Entry => {
+                            let value = self.hoist(Hoisted::Entry(slot as u16));
+                            merged = Slot::Clean(value);
+                            Some(value)
+                        }
+                        Slot::Frame | Slot::Dead => None,
+                    };
+                    if let Some(value) = held {
+                        self.note_invariant(value, preds[0].0);
+                    }
                 }
                 if let Some(phi) = phi {
                     phis.push((phi, Loc::Slot(slot)));
@@ -3363,7 +3455,11 @@ impl<'a> Builder<'a> {
 
     /// The operation at `pc`, which the tier does not lower: a generic node, or, where the
     /// operation needs the whole frame ([`canonical`]), its baseline template on the canonical
-    /// frame.
+    /// frame. A generic node's inputs are its operands and the values of the slots it names whose
+    /// frame words are stale (Dirty), which its lowering writes there; nothing is flushed before
+    /// it, and after it each slot it does not name is as it was (a Clean slot's frame still holds
+    /// it), each named slot it stored is Clean, and each it writes is its SlotResult, Clean (P3
+    /// stage 3 step 3a; the owner's D6).
     fn effect(&mut self, pc: usize, st: &mut State) -> Result<(), Refusal> {
         // An inlined frame runs no template (P3 stage 3, step 2's E0): the inliner declined every
         // callee a built operation of which the rules leave to one.
@@ -3387,7 +3483,8 @@ impl<'a> Builder<'a> {
         let (Ok(pop_count), Ok(push_count)) = (u8::try_from(pops), u8::try_from(pushes)) else {
             return Err(Refusal::at(pc, "an operation over 255 operands"));
         };
-        let op = if canonical(&self.ops[pc]) {
+        let whole = canonical(&self.ops[pc]);
+        let op = if whole {
             NodeOp::Effect {
                 pc: pc as u32,
                 pops: pop_count,
@@ -3400,14 +3497,25 @@ impl<'a> Builder<'a> {
                 pushes: push_count,
             }
         };
-        self.flush(st, pc);
+        let named = if whole {
+            self.flush(st, pc);
+            Vec::new()
+        } else {
+            frame_slots(&self.ops[pc], self.n_slots)
+        };
         let len = st.stack.len();
-        let mut inputs = Vec::with_capacity(pops);
+        let mut inputs = Vec::with_capacity(pops + named.len());
         for position in len - pops..len {
             let value = st.stack[position];
             let word = self.tagged(st, value, pc);
             st.stack[position] = word;
             inputs.push(word);
+        }
+        // The named slots' stale words, which the node writes (each value boxed as it stores it).
+        for &(slot, _) in &named {
+            if let Slot::Dirty(value) = st.slots[usize::from(slot)] {
+                inputs.push(value);
+            }
         }
         let state = self.frame_state(pc, st);
         let effect = self.add_exit(op, &inputs, Rep::None, pc, state, ExitReason::Throw);
@@ -3416,14 +3524,23 @@ impl<'a> Builder<'a> {
             let value = self.add(NodeOp::Projection(result), &[effect], Rep::Tagged, pc);
             st.stack.push(value);
         }
-        // Every slot live here is in the frame now, the flush's or the template's write; a dead
-        // one holds no value anyone reads.
+        for &(slot, writes) in &named {
+            let slot = usize::from(slot);
+            if writes {
+                let value = self.add(NodeOp::SlotResult(slot as u16), &[effect], Rep::Tagged, pc);
+                st.slots[slot] = Slot::Clean(value);
+            } else if let Slot::Dirty(value) = st.slots[slot] {
+                st.slots[slot] = Slot::Clean(value);
+            }
+        }
+        // After a canonical-frame effect every slot live here is in the frame, the flush's or the
+        // template's write; a dead one holds no value anyone reads.
         for slot in 0..self.n_slots {
-            st.slots[slot] = if self.live(pc, slot) {
-                Slot::Frame
-            } else {
-                Slot::Dead
-            };
+            if !self.live(pc, slot) {
+                st.slots[slot] = Slot::Dead;
+            } else if whole {
+                st.slots[slot] = Slot::Frame;
+            }
         }
         st.clear_heap();
         if names::moves_env(&self.ops[pc]) {

@@ -3331,3 +3331,94 @@ mod typed_loop;
 /// P3 stage 3 step L2: named loads through the prototype chain, end to end.
 #[path = "chain_tier_tests.rs"]
 mod chain;
+
+/// Programs whose hot functions' generic nodes hold values across them (P3 stage 3 step 3a):
+/// effects in loops, effects between writes and reads of one local (the `*Local` forms reading a
+/// dirty slot's word), slots the nodes write (updates of Strings, `for…in` steps), effects in try
+/// regions with throws caught, nested loops, values past the registers across a call, joins of
+/// written slots, and an entry slot read on one arm of a loop.
+pub(crate) const GENERIC_PROGRAMS: &[&str] = &[
+    "function f(o, n, g) { var s = 0, x = o.a * 2; for (var i = 0; i < n; i++) { s += x + g(i); } \
+     return s + x; }\n\
+     function id(v) { return v; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) t += f({a: k % 7}, k % 20, id); t",
+    "function w(o, g) { var p = o.q; g(p); var r = p.v; p = {v: r + 1}; g(p); \
+     var e = p.v; return p.v + r + e; }\n\
+     function nothing(v) { return v; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) t += w({q: {v: k % 11}}, nothing); t",
+    "function u(s, g) { s++; g(); s++; return s; }\n\
+     function fi(o) { var n = 0, ks = ''; for (var k in o) { n++; ks += k; } return ks + n; }\n\
+     function nothing() {}\n\
+     var t = ''; for (var k = 0; k < 3000; k++) { t = String(u(String(k % 13), nothing)) + \
+     fi(k % 2 ? {a: 1, b: 2} : {c: 3}); } t",
+    "function tr(o, g) { var a = o.x + 1, b = 0; try { b = g(a); a = a + b; } \
+     catch (e) { return a * 10 + (e | 0); } return a + b; }\n\
+     function thrower(v) { if (v % 5 === 0) throw v + 1; return v * 2; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) t += tr({x: k % 17}, thrower); t",
+    "function nest(m, g) { var s = 0; for (var i = 0; i < m; i++) { var y = i * 2; \
+     for (var j = 0; j < 3; j++) { s += y + g(j); } } return s; }\n\
+     function id(v) { return v; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) t += nest(k % 9, id); t",
+    "function many(a, g) { var x1 = a + 1, x2 = a * 2, x3 = a - 3, x4 = a / 4, x5 = a + 5.5, \
+     x6 = a * 6.5, x7 = a + 7, x8 = a + 8, x9 = a + 9, x10 = a + 10, x11 = a | 11, x12 = a ^ 12, \
+     x13 = a + 13, x14 = a & 14, x15 = a * 15, x16 = a + 16; g(); g(); \
+     return x1 + x2 + x3 + x4 + x5 + x6 + x7 + x8 + x9 + x10 + x11 + x12 + x13 + x14 + x15 + x16; }\n\
+     function churn() { var a = []; for (var j = 0; j < 8; j++) a.push({j: j}); return a; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) t += many(k % 23, churn); t",
+    "function arms(s, c, g) { if (c) s++; else s--; g(); return s; }\n\
+     function arm(p, n) { var s = 0; for (var i = 0; i < n; i++) { if (i & 1) s += p; } return s; }\n\
+     function nothing() {}\n\
+     var t = 0; for (var k = 0; k < 3000; k++) t += arms(String(k % 7), k & 1, nothing) + \
+     arm(k % 5, 6); t",
+    "class Q { constructor(n) { this.n = n; } get size() { return this.n * 2; } }\n\
+     function gs(o, g) { var p = o.q; g(); var a = p.size; p = new Q(a); g(); \
+     return p.size + a; }\n\
+     function hf(o, g) { var a = o.x; Object.assign(o, {x: a + 1}); g(o); return a + o.x; }\n\
+     function bump(o) { if (o) o.x = o.x + 1; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) { var o = {x: k % 9}; \
+     t += gs({q: new Q(k % 5)}, bump) + hf(o, bump); } t",
+    "function loopy(o, g) { var s = 0, n = o.n; try { for (var i = 0; i < n; i++) { \
+     s += g(i); if (s > 1000) throw s; } } catch (e) { s = -e; } return s + n; }\n\
+     function sq(v) { return v * v; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) t += loopy({n: k % 25}, sq); t",
+];
+
+#[test]
+fn generic_nodes_results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits() {
+    let configurations = [
+        (
+            "on",
+            TestSwitches {
+                on: true,
+                eager: false,
+                exit_every: 0,
+                ..Default::default()
+            },
+        ),
+        ("eager", eager()),
+        (
+            "forced exits",
+            TestSwitches {
+                on: true,
+                eager: true,
+                exit_every: 7,
+                ..Default::default()
+            },
+        ),
+    ];
+    let mut compiles = 0;
+    for program in GENERIC_PROGRAMS {
+        let expected = run(Tier::Bytecode, program);
+        assert!(!expected.starts_with("throw"), "{program}: {expected}");
+        for (label, switches) in configurations {
+            compiled();
+            assert_eq!(
+                with_switches(switches, program),
+                expected,
+                "{label}: {program}"
+            );
+            compiles += compiled().len();
+        }
+    }
+    assert!(compiles > 0, "the tier compiled the programs' functions");
+}
