@@ -26197,6 +26197,62 @@ unsafe fn jit_scope_op(
     crate::jit::SpFlag { sp, flag: 0 }
 }
 
+/// The operands of a bridge operation [`jit_vm_operation`] runs: its stack effect's pops, which a
+/// debug build checks against [`stack_effect`], in a match of the bridge operations alone, since
+/// the helper runs at each such operation's execution (None for the lexical-scope and Reference
+/// operations, which their own helpers run).
+fn vm_copy_operands(op: &Op) -> Option<usize> {
+    Some(match *op {
+        Op::AnnexBSync(_)
+        | Op::EvalExpr(_)
+        | Op::DestructureStepL(..)
+        | Op::DestructureRestL(..)
+        | Op::IterCloseIfNotDoneL(..)
+        | Op::NewArray
+        | Op::ImportMeta
+        | Op::SuperCallStart
+        | Op::LoadLexicalThis
+        | Op::SuperThis
+        | Op::SuperBase
+        | Op::TemplateObject(_)
+        | Op::ClassFinish(_)
+        | Op::ClassAbort(_)
+        | Op::PushDisposeFrame => 0,
+        Op::AssignTarget(_)
+        | Op::PushWith
+        | Op::StoreConstLocal(..)
+        | Op::StoreConstCap(_)
+        | Op::UpdateConst(..)
+        | Op::RequireObject
+        | Op::IterAbortIfNotDoneL(..)
+        | Op::ArrayHole
+        | Op::UpdatePrivate(..)
+        | Op::RequireCallable
+        | Op::ClassKey(..)
+        | Op::AddDisposable(_)
+        | Op::GetAsyncIter
+        | Op::AsyncIterResumeL(..) => 1,
+        Op::ArrayPush
+        | Op::ArraySpread
+        | Op::CallArgsArray
+        | Op::NewArgsArray
+        | Op::ClassDecorator(..) => 2,
+        Op::CallArgsArrayThis
+        | Op::EvalCallArgsArray
+        | Op::SuperCallArgsArray
+        | Op::SuperGet
+        | Op::SuperGetKeep
+        | Op::SuperGetMethod
+        | Op::SuperUpdate(_) => 3,
+        Op::SuperSet => 4,
+        Op::ObjectRest(count) => usize::from(count) + 1,
+        Op::DynamicImport(_, has_options) => usize::from(has_options) + 1,
+        Op::ClassStart(_, count) => usize::from(count) * 2,
+        Op::ClassHeritage(_, present) => usize::from(present),
+        _ => return None,
+    })
+}
+
 /// Count the words of `copy` that are the word a test watches for ([`TEST_COPY_WATCH`]).
 #[cfg(test)]
 fn test_watch_copy(copy: &[Value]) {
@@ -26233,7 +26289,12 @@ unsafe fn jit_vm_operation(
     // and the collector's precise trace of it (`GcTrace for NativeActivation`) as Values (P3
     // stage 3 step 3a's follow-up).
     let depth = sp.offset_from(ctx.stack_base) as usize;
-    let pops = stack_effect(&chunk.ops, pc as usize, false, false).map_or(depth, |(pops, _)| pops);
+    let pops = vm_copy_operands(&chunk.ops[pc as usize]).unwrap_or(depth);
+    debug_assert_eq!(
+        Some(pops),
+        stack_effect(&chunk.ops, pc as usize, false, false).map(|(pops, _)| pops),
+        "the VM-copy helper's operands are the stack effect's"
+    );
     debug_assert!(
         pops <= depth,
         "an operation's operands lie within its frame's depth"
