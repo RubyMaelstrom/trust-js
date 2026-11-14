@@ -155,6 +155,38 @@ impl<'a> Tree<'a> {
         })
     }
 
+    /// The binding slots the callees of site `cache`'s ways store at static addresses (their
+    /// free-name stores, `Rules::name_store_slot` over each analysed callee chunk), for its
+    /// caller's loop prepass (P3 stage 3 step 0c: `Rules::inlined_stores`).
+    pub(super) fn stored_slots(&self, cache: u32) -> Vec<u16> {
+        let mut slots = Vec::new();
+        let Some(site) = self.sites.get(&cache) else {
+            return slots;
+        };
+        for way in &site.ways {
+            let Ok(analysis) = &self.analyses[way.chunk as usize] else {
+                continue;
+            };
+            let (view, snapshot) = self.callees[way.chunk as usize];
+            let rules = Rules {
+                chunk: view,
+                ops: view.jit_ops(),
+                snapshot,
+                cfg: &analysis.cfg,
+                initialized: &analysis.initialized,
+                inlining: None,
+            };
+            for pc in 0..view.jit_ops().len() {
+                if let Some(slot) = rules.name_store_slot(pc) {
+                    if !slots.contains(&slot) {
+                        slots.push(slot);
+                    }
+                }
+            }
+        }
+        slots
+    }
+
     /// The Cfgs of the chunks the graph's inlined frames may run, by `InlinedFrame::chunk`, each
     /// with its index among the compile's callee chunks.
     pub(super) fn into_cfgs(self) -> Vec<(u32, Cfg)> {

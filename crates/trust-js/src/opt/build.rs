@@ -508,10 +508,11 @@ impl Rules<'_> {
                 Op::ResetSlots(start, count) => start as usize..start as usize + count as usize,
                 _ => 0..0,
             };
-            let name = self.name_store_slot(pc);
+            let mut names: Vec<u16> = self.name_store_slot(pc).into_iter().collect();
+            names.extend(self.inlined_stores(pc));
             stored.retain(|source| match *source {
                 Source::Slot(slot) => !written.contains(&slot),
-                Source::Name(address, _) => name != Some(address.slot),
+                Source::Name(address, _) => !names.contains(&address.slot),
             });
             match self.typed_source(pc) {
                 Some((source, Some(_), true)) if !stored.contains(&source) => stored.push(source),
@@ -520,6 +521,22 @@ impl Rules<'_> {
             }
         }
         reads
+    }
+
+    /// The binding slots the callees the graph inlines at the call at `pc` store at static
+    /// addresses, any record's (P3 stage 3 step 0c, `Loop::stored`): an inlined call runs no
+    /// effect (step 2's E0), but its callees' stores end every record's fact of their slots in
+    /// the builder's state, as their nodes write them, so a loop holding the call keeps no value
+    /// of those slots through its header (Maglev's inner builder adds its callee's effects to its
+    /// caller's loop's, maglev-graph-builder.cc:732-735, 14602-14611). Empty for any other
+    /// operation.
+    fn inlined_stores(&self, pc: usize) -> Vec<u16> {
+        match (self.ops[pc], self.inlining) {
+            (Op::Call(_, cache) | Op::CallWithThis(_, cache), Some(tree)) => {
+                tree.stored_slots(cache)
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// The source of the word the operation of `pc`'s block that pushed the operand `below`
@@ -1057,7 +1074,11 @@ impl Flow {
                 for &index in &body {
                     let block = &blocks[ix(rpo[index])];
                     for pc in block.start..block.end {
-                        if let Some(slot) = rules.name_store_slot(pc) {
+                        for slot in rules
+                            .name_store_slot(pc)
+                            .into_iter()
+                            .chain(rules.inlined_stores(pc))
+                        {
                             if !found.stored.contains(&slot) {
                                 found.stored.push(slot);
                             }

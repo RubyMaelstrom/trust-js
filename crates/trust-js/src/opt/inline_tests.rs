@@ -1327,3 +1327,8 @@ fn a_sites_later_guard_leaves_its_own_byte_and_the_reoptimization_branches_there
     let exits = super::exit::TEST_EXITS.with(|exits| std::mem::take(&mut *exits.borrow_mut()));
     assert!(exits.is_empty(), "converged: {exits:?}");
 }
+
+/// P3 stage 3 step 0c under TRUST_JS_OPT_INLINE=graph: typed arrays' facts in inlined callees'
+/// loops and in callers' loops around inlined calls.
+#[path = "typed_loop_inline_tests.rs"]
+mod typed_loop;
