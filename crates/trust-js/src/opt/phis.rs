@@ -64,7 +64,7 @@
 
 use super::build::{Alternatives, PhiNotes};
 use super::ir::{
-    BlockIx, Cond, Decline, ExitReason, Graph, NodeIx, NodeOp, Rep, SlotSource, StateIx,
+    BlockIx, Cond, Decline, ExitReason, FrameIx, Graph, NodeIx, NodeOp, Rep, SlotSource, StateIx,
 };
 use super::snapshot::Snapshot;
 use crate::fasthash::FastMap;
@@ -436,9 +436,22 @@ impl<'g> Selector<'g> {
     /// A node of `op` made for a rewrite in `block` (placed at the end).
     fn make(&mut self, block: BlockIx, op: NodeOp, inputs: &[NodeIx], rep: Rep, pc: u32) -> NodeIx {
         let node = self.graph.new_node(block, op, inputs, rep, pc);
+        // Of the block's frame, whose pc `at_end` gives it (stage 3: a block's first pc is its
+        // first node's frame's); a speculation, a hoisted check or a retagging takes its own.
+        let frame = self.block_frame(block);
+        self.graph.node_mut(node).frame = frame;
         self.removed.push(false);
         self.made.push(node);
         node
+    }
+
+    /// The frame of `block`'s first node (stage 3), the compiled function's for an empty block.
+    fn block_frame(&self, block: BlockIx) -> FrameIx {
+        let data = self.graph.block(block);
+        data.phis
+            .first()
+            .or(data.body.first())
+            .map_or(FrameIx::COMPILED, |&node| self.graph.node(node).frame)
     }
 
     /// A node of `op` placed before `block`'s terminator.
@@ -600,9 +613,12 @@ impl<'g> Selector<'g> {
             let state = self.entry_state(header, k);
             let hoist = |selector: &mut Self, op: NodeOp, input: NodeIx, rep: Rep| {
                 let node = selector.at_end(pred, op, &[input], rep);
+                // The frame its exit rebuilds, the header poll's (`entry_state`).
+                let frame = selector.graph.state(state).frame;
                 let data = selector.graph.node_mut(node);
                 data.pc = pc;
                 data.state = Some(state);
+                data.frame = frame;
                 data.reason = Some(ExitReason::HoistingFailed);
                 node
             };
@@ -648,6 +664,8 @@ impl<'g> Selector<'g> {
     fn speculate(&mut self, header: BlockIx, k: usize, word: NodeIx, rep: Rep) -> NodeIx {
         let pred = self.graph.block(header).preds[k];
         let state = self.entry_state(header, k);
+        // The frame its exit rebuilds, the header poll's (`entry_state`).
+        let frame = self.graph.state(state).frame;
         let pc = self.graph.block(header).first_pc;
         let number = match self.speculated.get(&(pred, word, Rep::F64)) {
             Some(&number) => number,
@@ -656,6 +674,7 @@ impl<'g> Selector<'g> {
                 let node = self.graph.node_mut(number);
                 node.pc = pc;
                 node.state = Some(state);
+                node.frame = frame;
                 node.reason = Some(ExitReason::PhiNotNumber);
                 self.speculated.insert((pred, word, Rep::F64), number);
                 number
@@ -671,6 +690,7 @@ impl<'g> Selector<'g> {
         let node = self.graph.node_mut(int);
         node.pc = pc;
         node.state = Some(state);
+        node.frame = frame;
         node.reason = Some(ExitReason::PhiNotInt32);
         self.speculated.insert((pred, word, Rep::I32), int);
         int
@@ -774,6 +794,8 @@ impl<'g> Selector<'g> {
                     None => {
                         let pc = self.graph.node(user).pc;
                         let word = self.make(block, op.clone(), &[phi], Rep::Tagged, pc);
+                        // The user's frame, whose pc it takes.
+                        self.graph.node_mut(word).frame = self.graph.node(user).frame;
                         self.before.entry(user).or_default().push(word);
                         self.retags.insert((phi, block), word);
                         word
@@ -848,6 +870,14 @@ impl<'g> Selector<'g> {
                 state.slots = slots.into_boxed_slice();
                 state.stack = stack.into_boxed_slice();
             }
+            // The inlined frames' callees and receivers (stage 3).
+            for k in 0..self.graph.frames.len() {
+                let callee = self.resolve(self.graph.frames[k].callee);
+                let receiver = self.resolve(self.graph.frames[k].receiver);
+                let frame = &mut self.graph.frames[k];
+                frame.callee = callee;
+                frame.receiver = receiver;
+            }
         }
         self.remove_dead_conversions();
         let entry = self.graph.entry.expect("a graph with an entry");
@@ -901,6 +931,20 @@ impl<'g> Selector<'g> {
         };
         loop {
             let mut uses = vec![0u32; n];
+            // The inlined frames' values, which every exit through them reads (stage 3).
+            for frame in &self.graph.frames {
+                uses[frame.callee.index()] += 1;
+                uses[frame.receiver.index()] += 1;
+                let parent = self.graph.state(frame.parent);
+                for source in parent.slots.iter() {
+                    if let SlotSource::Value(value) = *source {
+                        uses[value.index()] += 1;
+                    }
+                }
+                for &value in parent.stack.iter() {
+                    uses[value.index()] += 1;
+                }
+            }
             for index in 0..n {
                 if !kept[index] || self.removed[index] {
                     continue;
@@ -939,8 +983,9 @@ impl<'g> Selector<'g> {
     }
 }
 
-/// `graph`'s nodes renumbered to those its blocks hold, and its states to those its nodes name:
-/// the replaced and dead nodes leave the graph, which keeps every node in exactly one block.
+/// `graph`'s nodes renumbered to those its blocks hold, and its states to those its nodes and its
+/// inlined frames (their parents) name: the replaced and dead nodes leave the graph, which keeps
+/// every node in exactly one block.
 fn compact(graph: &mut Graph) {
     let n = graph.nodes.len();
     let mut number = vec![u32::MAX; n];
@@ -969,6 +1014,32 @@ fn compact(graph: &mut Graph) {
     let mut states = Vec::new();
     let old_nodes = std::mem::take(&mut graph.nodes);
     let mut nodes = Vec::with_capacity(kept as usize);
+    // A state's number, renumbering it at its first name.
+    let mut renumber = |state: StateIx| -> StateIx {
+        if state_number[state.index()] == u32::MAX {
+            let mut frame = old_states[state.index()].take().expect("each state once");
+            let slots: Vec<SlotSource> = frame
+                .slots
+                .iter()
+                .map(|&source| match source {
+                    SlotSource::Value(value) => SlotSource::Value(map(value)),
+                    other => other,
+                })
+                .collect();
+            frame.slots = slots.into_boxed_slice();
+            let stack: Vec<NodeIx> = frame.stack.iter().map(|&value| map(value)).collect();
+            frame.stack = stack.into_boxed_slice();
+            state_number[state.index()] = states.len() as u32;
+            states.push(frame);
+        }
+        StateIx(state_number[state.index()])
+    };
+    // The inlined frames' parent states first, so that each is kept (stage 3).
+    for frame in &mut graph.frames {
+        frame.parent = renumber(frame.parent);
+        frame.callee = map(frame.callee);
+        frame.receiver = map(frame.receiver);
+    }
     for (index, mut node) in old_nodes.into_iter().enumerate() {
         if number[index] == u32::MAX {
             continue;
@@ -977,23 +1048,7 @@ fn compact(graph: &mut Graph) {
             *input = map(*input);
         }
         if let Some(state) = node.state {
-            if state_number[state.index()] == u32::MAX {
-                let mut frame = old_states[state.index()].take().expect("each state once");
-                let slots: Vec<SlotSource> = frame
-                    .slots
-                    .iter()
-                    .map(|&source| match source {
-                        SlotSource::Value(value) => SlotSource::Value(map(value)),
-                        other => other,
-                    })
-                    .collect();
-                frame.slots = slots.into_boxed_slice();
-                let stack: Vec<NodeIx> = frame.stack.iter().map(|&value| map(value)).collect();
-                frame.stack = stack.into_boxed_slice();
-                state_number[state.index()] = states.len() as u32;
-                states.push(frame);
-            }
-            node.state = Some(StateIx(state_number[state.index()]));
+            node.state = Some(renumber(state));
         }
         nodes.push(node);
     }

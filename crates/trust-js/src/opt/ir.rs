@@ -19,6 +19,25 @@ pub(crate) struct NodeIx(pub(crate) u32);
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub(crate) struct StateIx(pub(crate) u32);
 
+/// A frame of the graph (P3 stage 3, step 1): [`FrameIx::COMPILED`], the compiled function's, or
+/// an inlined call's, `Graph::frames[k - 1]` for `FrameIx(k)`. Frames are opened outermost first,
+/// so that a frame's parent precedes it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct FrameIx(pub(crate) u32);
+
+impl FrameIx {
+    /// The compiled function's frame.
+    pub(crate) const COMPILED: FrameIx = FrameIx(0);
+
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
+
+    pub(crate) fn is_compiled(self) -> bool {
+        self == FrameIx::COMPILED
+    }
+}
+
 impl BlockIx {
     pub(crate) fn index(self) -> usize {
         self.0 as usize
@@ -630,6 +649,26 @@ impl NodeOp {
     pub(crate) fn is_effectful(&self) -> bool {
         matches!(self, NodeOp::Effect { .. } | NodeOp::F64Mod)
     }
+
+    /// Whether this node reads the compiled function's own context (stage 3): its canonical
+    /// slots and operand words, `this`, running environment, chunk (an effect's template, a
+    /// splice's guard data) or its return. A node of an inlined frame reads none of it: the
+    /// frame's values are explicit (its states, its descriptor's callee and receiver).
+    pub(crate) fn reads_compiled_frame(&self) -> bool {
+        matches!(
+            self,
+            NodeOp::EntrySlot(_)
+                | NodeOp::FrameSlot(_)
+                | NodeOp::StoreSlot(_)
+                | NodeOp::This
+                | NodeOp::Env
+                | NodeOp::Effect { .. }
+                | NodeOp::Projection(_)
+                | NodeOp::CheckCallee { .. }
+                | NodeOp::CalleeMatches { .. }
+                | NodeOp::Return
+        )
+    }
 }
 
 /// One SSA node.
@@ -642,9 +681,14 @@ pub(crate) struct Node {
     pub(crate) state: Option<StateIx>,
     /// The exit's reason, for nodes that can exit (Exit carries its own).
     pub(crate) reason: Option<ExitReason>,
-    /// The bytecode pc this node was built for.
+    /// The bytecode pc this node was built for, a pc of its frame's chunk.
     pub(crate) pc: u32,
     pub(crate) block: BlockIx,
+    /// The frame whose operation the node was built for (P3 stage 3, step 1): with `pc`, the
+    /// node's origin, as JSC's DFG node carries its CodeOrigin, a bytecode index and the inline
+    /// call frame it belongs to (bytecode/CodeOrigin.h). A node of an inlined frame reads only
+    /// values: the compiled frame's slots, `this`, environment and templates are not its own.
+    pub(crate) frame: FrameIx,
 }
 
 /// Where a slot's value is when an exit rebuilds the frame.
@@ -660,18 +704,51 @@ pub(crate) enum SlotSource {
     Dead,
 }
 
-/// The bytecode state at a pc, as an exit rebuilds it (one canonical frame; stage 3 adds the
-/// parent of an inlined frame).
+/// The bytecode state of one frame at a pc, as an exit rebuilds it. A state of an inlined frame
+/// chains its frame's parent state ([`InlinedFrame::parent`]), and so on to the compiled
+/// function's: an exit rebuilds every frame of the chain (P3 stage 3, step 1).
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct FrameState {
     /// The pc execution resumes at: the failing operation's own pc for a check before it, the next
-    /// operation's after an effect.
+    /// operation's after an effect; a pc of the frame's chunk.
     pub(crate) pc: u32,
+    /// One source per slot of the frame's chunk. An inlined frame has no frame of its own while
+    /// the code runs (the owner's "explicit operands", plan:3538-3545): its slots are values or
+    /// Dead, never `Frame`.
     pub(crate) slots: Box<[SlotSource]>,
     /// Every live operand-stack position, bottom first (all Tagged-representable nodes).
     pub(crate) stack: Box<[NodeIx]>,
     /// Handler records active at the pc, innermost last: (push pc, operand depth at the push).
     pub(crate) handlers: Box<[(u32, u32)]>,
+    /// The frame the state describes.
+    pub(crate) frame: FrameIx,
+}
+
+/// An inlined call's frame (P3 stage 3, step 1): Maglev's DeoptFrame with its parent
+/// (maglev/maglev-ir.h:1455-1537), JSC's InlineCallFrame (bytecode/InlineCallFrame.h). The
+/// callee runs from its own first-stage chunk; its states name this frame, and an exit through it
+/// rebuilds the caller from `parent`, one record per frame (`opt::exit`). Shapes beyond the
+/// splice's callee set come with step 9: where the actual arguments' count differs from the
+/// callee's parameters, the frame keeps them here too, as Maglev's InlinedArgumentsDeoptFrame
+/// sits between a call and its callee's frame (maglev-graph-builder.cc:1025-1040).
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct InlinedFrame {
+    /// The callee's first-stage chunk: its index among the compile's inlined chunks (the job's
+    /// views of them, the code's held chunks), shared by the frames of one callee's calls.
+    pub(crate) chunk: u32,
+    /// The caller's state at the call, one per inlined call and shared by every state of this
+    /// frame (Maglev's GetCallerDeoptFrame, maglev-graph-builder.cc:1063-1066): its frame (an
+    /// earlier one), resuming at `call_pc + 1` without the call's operands, where an exit pushes
+    /// the call's result, as Maglev's caller frame "resumes after the call" with its accumulator
+    /// dead (maglev-graph-builder.cc:1042-1062); or at `call_pc` with the callee's throw.
+    pub(crate) parent: StateIx,
+    /// The call's pc in the parent's chunk: an Op::Call or an Op::CallWithThis.
+    pub(crate) call_pc: u32,
+    /// The callee as the call met it (Tagged): a node, or a constant under its identity guard.
+    pub(crate) callee: NodeIx,
+    /// The receiver the call passes (Tagged): a CallWithThis's operand, undefined for a Call. An
+    /// exit binds it as the call would (OrdinaryCallBindThis).
+    pub(crate) receiver: NodeIx,
 }
 
 /// One basic block.
@@ -727,6 +804,8 @@ pub(crate) struct Graph {
     pub(crate) entry: Option<BlockIx>,
     /// The speculations the builder declined, in the order it built their sites.
     pub(crate) declines: Vec<Decline>,
+    /// The inlined frames, outermost first: `FrameIx(k)` is `frames[k - 1]` (stage 3).
+    pub(crate) frames: Vec<InlinedFrame>,
 }
 
 impl Graph {
@@ -750,7 +829,7 @@ impl Graph {
         ix
     }
 
-    /// Appends a node to `block`'s body (a phi goes to its phis).
+    /// Appends a node of the compiled function's frame to `block`'s body (a phi goes to its phis).
     pub(crate) fn add_node(
         &mut self,
         block: BlockIx,
@@ -759,8 +838,23 @@ impl Graph {
         rep: Rep,
         pc: u32,
     ) -> NodeIx {
+        self.add_node_in(FrameIx::COMPILED, block, op, inputs, rep, pc)
+    }
+
+    /// Appends a node of `frame`, built for its chunk's operation at `pc`, to `block`'s body (a
+    /// phi goes to its phis).
+    pub(crate) fn add_node_in(
+        &mut self,
+        frame: FrameIx,
+        block: BlockIx,
+        op: NodeOp,
+        inputs: &[NodeIx],
+        rep: Rep,
+        pc: u32,
+    ) -> NodeIx {
         let is_phi = op == NodeOp::Phi;
         let ix = self.new_node(block, op, inputs, rep, pc);
+        self.nodes[ix.index()].frame = frame;
         let data = &mut self.blocks[block.index()];
         if is_phi {
             data.phis.push(ix);
@@ -789,6 +883,7 @@ impl Graph {
             reason: None,
             pc,
             block,
+            frame: FrameIx::COMPILED,
         });
         ix
     }
@@ -797,6 +892,79 @@ impl Graph {
         let ix = StateIx(self.states.len() as u32);
         self.states.push(state);
         ix
+    }
+
+    /// Opens an inlined call's frame (stage 3): its parent state is the caller's (`frame`'s
+    /// `parent`, added first), and the callee's nodes and states name the frame returned.
+    // Only the back end's tests open frames until step 2's inliner does.
+    #[cfg_attr(
+        not(all(
+            test,
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(
+            dead_code,
+            reason = "step 2's inliner opens frames; the tests do until then"
+        )
+    )]
+    pub(crate) fn open_frame(&mut self, frame: InlinedFrame) -> FrameIx {
+        self.frames.push(frame);
+        FrameIx(self.frames.len() as u32)
+    }
+
+    /// Inlined frame `frame`'s descriptor; None for the compiled function's frame.
+    pub(crate) fn inlined(&self, frame: FrameIx) -> Option<&InlinedFrame> {
+        frame.0.checked_sub(1).map(|k| &self.frames[k as usize])
+    }
+
+    /// The values an exit of a state of `frame` reads besides its state's own: those of every
+    /// inlined frame from `frame` out, its callee, its receiver and its parent state's values
+    /// (stage 3). Empty for the compiled function's frame.
+    pub(crate) fn chain_values(&self, mut frame: FrameIx) -> Vec<NodeIx> {
+        let mut values = Vec::new();
+        while let Some(inlined) = self.inlined(frame) {
+            values.push(inlined.callee);
+            values.push(inlined.receiver);
+            let parent = self.state(inlined.parent);
+            values.extend(parent.stack.iter().copied());
+            values.extend(parent.slots.iter().filter_map(|source| match source {
+                SlotSource::Value(value) => Some(*value),
+                SlotSource::Frame | SlotSource::Dead => None,
+            }));
+            frame = parent.frame;
+        }
+        values
+    }
+
+    /// Each value an exit with `state` reads, in order: the state's operand stack, its slots'
+    /// values, then its frame's chain's (as `chain_values` lists them, without a vector). The
+    /// register allocator keeps each homed at the exiting node (`regalloc`'s reads), and a call on
+    /// the node's own path keeps each where its exit after the call finds it (`a64`'s
+    /// `save_live_clobbered`).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(dead_code, reason = "the back end's")
+    )]
+    pub(crate) fn for_each_exit_value(&self, state: StateIx, mut f: impl FnMut(NodeIx)) {
+        let mut state = self.state(state);
+        loop {
+            state.stack.iter().copied().for_each(&mut f);
+            for source in state.slots.iter() {
+                if let SlotSource::Value(value) = *source {
+                    f(value);
+                }
+            }
+            let Some(inlined) = self.inlined(state.frame) else {
+                return;
+            };
+            f(inlined.callee);
+            f(inlined.receiver);
+            state = self.state(inlined.parent);
+        }
     }
 
     /// Records an edge (predecessor lists are in the order edges are added).

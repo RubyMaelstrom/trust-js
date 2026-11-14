@@ -122,6 +122,12 @@ mod build_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+mod frames_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 mod inplace_tests;
 #[cfg(all(
     test,
@@ -437,6 +443,7 @@ mod tests {
             slots: vec![SlotSource::Frame, SlotSource::Dead].into(),
             stack: vec![a].into(),
             handlers: Box::new([]),
+            frame: FrameIx::COMPILED,
         });
         g.node_mut(n).state = Some(state);
         g.node_mut(n).reason = Some(ExitReason::NotNumber);

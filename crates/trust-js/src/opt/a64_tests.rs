@@ -147,6 +147,7 @@ impl Build {
             slots: sources.into(),
             stack: stack.into(),
             handlers: handlers.into(),
+            frame: FrameIx::COMPILED,
         })
     }
 

@@ -22,12 +22,35 @@
 //!   CheckNumber, CheckInt32, CheckObject or CheckElements [HoistingFailed], sits at the end of a
 //!   loop header's entry predecessor, where nothing after it exits or has an effect before the
 //!   jump, and exits at the header's pc with its handlers.
+//!
+//! Inlined frames (P3 stage 3, step 1; `frames`, which the back end checks too):
+//! - each frame's states and nodes are checked against that frame's chunk and Cfg: a node's pc
+//!   and a block's first pc (its first node's frame) are pcs of their frame's chunk, and a node
+//!   that exits rebuilds its own frame's state;
+//! - an inlined frame's chunk is one of the compile's; its parent state is an earlier frame's,
+//!   at its call's pc + 1, of the call's depth less its pops (the exit pushes the result), and
+//!   no node's own state; the call is a Call or a CallWithThis; its callee and receiver are
+//!   Tagged nodes, a Call's receiver undefined;
+//! - an inlined frame's chunk is a callee a call enters as its rebuilt frame runs it (no
+//!   activation, rest parameter, arguments value, prepared entry or coroutine), of the compiled
+//!   function's strictness, whose frame fits a pooled activation record (the splice's callee
+//!   set, the plan's question 6; step 9 widens it);
+//! - an inlined frame's states have no `Frame` slot (the frame has none while the code runs: the
+//!   owner's explicit operands) and no handler record (step 9's), and its nodes read no context of
+//!   the compiled frame's (`NodeOp::reads_compiled_frame`);
+//! - an exit's chain, each inlined frame's callee and receiver and its parent state's values, is
+//!   available at the node that exits.
 
-use super::ir::{BlockIx, ExitReason, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource};
+use super::ir::{
+    BlockIx, ExitReason, FrameIx, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource,
+};
 use super::liveness::SlotLiveness;
 use super::view::FrozenChunk;
 use crate::bytecode::Op;
 use crate::jit_ir::Cfg;
+
+/// A frame's chunk as the verifier and the back end read it (stage 3): its frozen view and Cfg.
+pub(crate) type FrameChunk<'a> = (&'a FrozenChunk, &'a Cfg);
 
 /// [`verify_view`] against a live chunk's frozen view (`Chunk::freeze`): the tests' path.
 #[cfg(test)]
@@ -43,7 +66,17 @@ pub(crate) fn verify(
 /// relies on; the first violation found otherwise. `cfg` is the chunk's, as its build made it
 /// (`build::Built`). Reads nothing but its arguments, so that it runs on any thread.
 pub(crate) fn verify_view(graph: &Graph, chunk: &FrozenChunk, cfg: &Cfg) -> Result<(), String> {
-    let ops = chunk.jit_ops();
+    verify_frames(graph, (chunk, cfg), &[])
+}
+
+/// [`verify_view`] of a graph with inlined frames (stage 3): `compiled` is the compiled
+/// function's chunk, `inlined` the chunks its inlined frames name (`InlinedFrame::chunk`).
+pub(crate) fn verify_frames(
+    graph: &Graph,
+    compiled: FrameChunk<'_>,
+    inlined: &[FrameChunk<'_>],
+) -> Result<(), String> {
+    let (chunk, _) = compiled;
     let (_, n_slots) = chunk.jit_frame();
     if graph.n_slots != n_slots {
         return Err(format!(
@@ -58,9 +91,31 @@ pub(crate) fn verify_view(graph: &Graph, chunk: &FrozenChunk, cfg: &Cfg) -> Resu
     if !graph.block(entry).preds.is_empty() {
         return Err(format!("the entry {entry:?} has predecessors"));
     }
+    frames(graph, compiled, inlined)?;
+    // Each frame's chunk, by the frame's index.
+    let chunks: Vec<FrameChunk<'_>> = std::iter::once(compiled)
+        .chain(
+            graph
+                .frames
+                .iter()
+                .map(|frame| inlined[frame.chunk as usize]),
+        )
+        .collect();
+    let chunk_of = |frame: FrameIx| chunks.get(frame.index()).copied();
     let place = placement(graph)?;
-    edges(graph, ops.len())?;
+    edges(graph, |frame| {
+        chunk_of(frame).map(|(view, _)| view.jit_ops().len())
+    })?;
     let dom = Dominators::new(graph, entry)?;
+    // The states that are a frame's parent: no node's own (`frames`).
+    let mut parent = vec![false; graph.states.len()];
+    for frame in &graph.frames {
+        parent[frame.parent.index()] = true;
+    }
+    // Each frame's chain values, which an exit of a state of the frame reads too.
+    let chain: Vec<Vec<NodeIx>> = (0..chunks.len())
+        .map(|frame| graph.chain_values(FrameIx(frame as u32)))
+        .collect();
     let available = |value: NodeIx, (block, index): (BlockIx, usize)| -> bool {
         let Some(&Some((defined, at))) = place.get(value.index()) else {
             return false;
@@ -80,8 +135,14 @@ pub(crate) fn verify_view(graph: &Graph, chunk: &FrozenChunk, cfg: &Cfg) -> Resu
                 node.op, node.pc
             ))
         };
-        if node.pc as usize >= ops.len() {
+        let Some((frame_chunk, _)) = chunk_of(node.frame) else {
+            return fail("a frame that does not exist");
+        };
+        if node.pc as usize >= frame_chunk.jit_ops().len() {
             return fail("a pc past the chunk");
+        }
+        if !node.frame.is_compiled() && node.op.reads_compiled_frame() {
+            return fail("a node of an inlined frame reads the compiled frame's context");
         }
         if let Err(what) = representations(graph, node, ix, chunk, n_slots) {
             return fail(&what);
@@ -119,19 +180,126 @@ pub(crate) fn verify_view(graph: &Graph, chunk: &FrozenChunk, cfg: &Cfg) -> Resu
             let Some(frame) = graph.states.get(state.index()) else {
                 return fail("a frame state that does not exist");
             };
+            if frame.frame != node.frame {
+                return fail(&format!(
+                    "a state of frame {:?}, not its own {:?}",
+                    frame.frame, node.frame
+                ));
+            }
+            if parent[state.index()] {
+                return fail("an inlined frame's parent state as its own");
+            }
             if let Some(value) = state_values(frame).find(|&value| !available(value, at)) {
                 return fail(&format!(
                     "its frame state's {value:?} does not dominate the node"
                 ));
             }
+            if let Some(value) = chain[node.frame.index()]
+                .iter()
+                .find(|&&value| !available(value, at))
+            {
+                return fail(&format!(
+                    "its frame's chain's {value:?} does not dominate the node"
+                ));
+            }
         }
     }
-    // The builder's liveness again, where its cost is a test's or a debug build's.
-    let liveness =
-        cfg!(any(test, debug_assertions)).then(|| SlotLiveness::compute(ops, cfg, n_slots));
+    // The builder's liveness again, where its cost is a test's or a debug build's: each frame's
+    // chunk's.
+    let liveness: Vec<Option<SlotLiveness>> = chunks
+        .iter()
+        .map(|&(view, cfg)| {
+            cfg!(any(test, debug_assertions))
+                .then(|| SlotLiveness::compute(view.jit_ops(), cfg, view.jit_frame().1))
+        })
+        .collect();
     for (index, frame) in graph.states.iter().enumerate() {
-        frame_state(graph, frame, ops, cfg, n_slots, liveness.as_ref())
-            .map_err(|what| format!("frame state {index} (pc {}): {what}", frame.pc))?;
+        let what = |what: String| format!("frame state {index} (pc {}): {what}", frame.pc);
+        let (view, cfg) =
+            chunk_of(frame.frame).ok_or_else(|| what("a frame that does not exist".into()))?;
+        frame_state(
+            graph,
+            frame,
+            (view, cfg),
+            parent[index],
+            liveness[frame.frame.index()].as_ref(),
+        )
+        .map_err(what)?;
+    }
+    Ok(())
+}
+
+/// The inlined frames' rules (see the module's doc), which the back end checks as well
+/// (`a64::check_graph`), since its exits rebuild the frames they describe.
+pub(crate) fn frames(
+    graph: &Graph,
+    compiled: FrameChunk<'_>,
+    inlined: &[FrameChunk<'_>],
+) -> Result<(), String> {
+    for (k, frame) in graph.frames.iter().enumerate() {
+        let ix = FrameIx(k as u32 + 1);
+        let fail = |what: String| Err(format!("inlined frame {}: {what}", ix.0));
+        let Some(&(callee, callee_cfg)) = inlined.get(frame.chunk as usize) else {
+            return fail(format!("chunk {}, which the compile has not", frame.chunk));
+        };
+        let Some(parent) = graph.states.get(frame.parent.index()) else {
+            return fail("a parent state that does not exist".into());
+        };
+        // Frames open outermost first: a parent's frame precedes its children.
+        if parent.frame >= ix {
+            return fail(format!("a parent state of frame {:?}", parent.frame));
+        }
+        let (caller, caller_cfg) = match graph.inlined(parent.frame) {
+            None => compiled,
+            Some(caller) => inlined[caller.chunk as usize],
+        };
+        let call = frame.call_pc as usize;
+        let op = caller.jit_ops().get(call);
+        if !matches!(op, Some(Op::Call(..) | Op::CallWithThis(..))) {
+            return fail(format!("a call at pc {call} by {op:?}"));
+        }
+        if parent.pc as usize != call + 1 {
+            return fail(format!(
+                "a parent state at pc {}, not past its call at {call}",
+                parent.pc
+            ));
+        }
+        // Without the call's operands: the exit pushes the result.
+        let depth = caller_cfg
+            .stack_depth_at(call)
+            .zip(caller.jit_stack_effect(call))
+            .and_then(|(depth, (pops, _))| depth.checked_sub(pops));
+        if depth != Some(parent.stack.len()) {
+            return fail(format!(
+                "a parent state of depth {}, where its call's less its operands is {depth:?}",
+                parent.stack.len()
+            ));
+        }
+        for (what, value) in [("callee", frame.callee), ("receiver", frame.receiver)] {
+            if graph.nodes.get(value.index()).map(|node| node.rep) != Some(Rep::Tagged) {
+                return fail(format!("a {what} that is no Tagged node"));
+            }
+        }
+        if matches!(op, Some(Op::Call(..)))
+            && graph.node(frame.receiver).op
+                != NodeOp::ConstTagged(crate::value::Value::Undefined.bits())
+        {
+            return fail("a Call's receiver that is not undefined".into());
+        }
+        // A callee a call enters as the rebuilt frame runs it, on a pooled record.
+        if callee.jit_is_resumable() || callee.prepared_entry || callee.frame_args_needed {
+            return fail(
+                "a callee whose call makes more than its frame (an activation, a rest parameter, \
+                 an arguments value, a prepared entry or a coroutine)"
+                    .into(),
+            );
+        }
+        if callee.strict != compiled.0.strict {
+            return fail("a callee of another strictness".into());
+        }
+        if callee.jit_frame().1 + callee_cfg.jit_stack_capacity() > crate::jit::FRAME_BUF {
+            return fail("a callee's frame past a pooled activation record".into());
+        }
     }
     Ok(())
 }
@@ -171,16 +339,18 @@ fn placement(graph: &Graph) -> Result<Vec<Option<(BlockIx, usize)>>, String> {
 }
 
 /// Terminators and edges: one terminator per block, at its end, naming the block's successors,
-/// and predecessor lists that mirror the successor lists.
-fn edges(graph: &Graph, n_ops: usize) -> Result<(), String> {
+/// and predecessor lists that mirror the successor lists. `n_ops` gives a frame's chunk's
+/// operation count: a block's first pc is a pc of its first node's frame.
+fn edges(graph: &Graph, n_ops: impl Fn(FrameIx) -> Option<usize>) -> Result<(), String> {
     let mut balance = crate::fasthash::FastMap::<(u32, u32), i64>::default();
     for (index, block) in graph.blocks.iter().enumerate() {
-        if block.first_pc as usize >= n_ops {
-            return Err(format!("block {index} starts past the chunk"));
-        }
         let Some((&last, rest)) = block.body.split_last() else {
             return Err(format!("block {index} is empty"));
         };
+        let first = block.phis.first().unwrap_or(&block.body[0]);
+        if n_ops(graph.node(*first).frame).is_none_or(|n_ops| block.first_pc as usize >= n_ops) {
+            return Err(format!("block {index} starts past the chunk"));
+        }
         if !graph.node(last).op.is_terminator() {
             return Err(format!("block {index} ends without a terminator"));
         }
@@ -644,17 +814,20 @@ fn state_values(frame: &FrameState) -> impl Iterator<Item = NodeIx> + '_ {
         .chain(frame.stack.iter().copied())
 }
 
-/// A frame state against its pc: the slot count, the stack analysis's depth, the handler records
-/// the chunk pushes at their depths, values an exit can box, and Dead slots dead at the pc where
-/// `liveness` is given.
+/// A frame state against its pc in its frame's chunk: the slot count, the stack analysis's depth
+/// (one less for an inlined frame's `parent` state, whose call's result the exit pushes), the
+/// handler records the chunk pushes at their depths, values an exit can box, Dead slots dead at
+/// the pc where `liveness` is given, and for an inlined frame's state values or Dead slots only
+/// and no handler record.
 fn frame_state(
     graph: &Graph,
     frame: &FrameState,
-    ops: &[Op],
-    cfg: &Cfg,
-    n_slots: usize,
+    (chunk, cfg): FrameChunk<'_>,
+    parent: bool,
     liveness: Option<&SlotLiveness>,
 ) -> Result<(), String> {
+    let ops = chunk.jit_ops();
+    let (_, n_slots) = chunk.jit_frame();
     let pc = frame.pc as usize;
     if pc >= ops.len() {
         return Err("a pc past the chunk".into());
@@ -665,12 +838,22 @@ fn frame_state(
             frame.slots.len()
         ));
     }
-    if cfg.stack_depth_at(pc) != Some(frame.stack.len()) {
+    let depth = cfg
+        .stack_depth_at(pc)
+        .and_then(|depth| depth.checked_sub(usize::from(parent)));
+    if depth != Some(frame.stack.len()) {
         return Err(format!(
-            "{} stack values where the depth is {:?}",
+            "{} stack values where the depth is {depth:?}",
             frame.stack.len(),
-            cfg.stack_depth_at(pc)
         ));
+    }
+    if !frame.frame.is_compiled() {
+        if frame.slots.contains(&SlotSource::Frame) {
+            return Err("an inlined frame's slot read from a frame it has not".into());
+        }
+        if !frame.handlers.is_empty() {
+            return Err("a handler record in an inlined frame".into());
+        }
     }
     for value in state_values(frame) {
         match graph.nodes.get(value.index()).map(|node| node.rep) {

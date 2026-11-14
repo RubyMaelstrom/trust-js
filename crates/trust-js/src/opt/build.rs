@@ -55,8 +55,8 @@
 //!   where a block first needs them.
 
 use super::ir::{
-    BlockData, BlockIx, Cond, Decline, ExitReason, FrameState, Graph, NodeIx, NodeOp, Refusal, Rep,
-    SlotSource, StateIx,
+    BlockData, BlockIx, Cond, Decline, ExitReason, FrameIx, FrameState, Graph, NodeIx, NodeOp,
+    Refusal, Rep, SlotSource, StateIx,
 };
 use super::ir::{ElemKind, Holes, Store, TypedKind};
 use super::liveness::SlotLiveness;
@@ -1532,6 +1532,7 @@ impl<'a> Builder<'a> {
             slots,
             stack: st.stack.clone().into_boxed_slice(),
             handlers: st.handlers.clone().into_boxed_slice(),
+            frame: FrameIx::COMPILED,
         })
     }
 

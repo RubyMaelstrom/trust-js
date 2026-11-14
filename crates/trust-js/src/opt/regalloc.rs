@@ -25,7 +25,7 @@
 //! collector scans the native stack and the callee-saved registers conservatively and resolves
 //! interior pointers (contracts 4.4; JSC's design point), so the homes need no maps.
 
-use super::ir::{BlockIx, Graph, NodeIx, NodeOp, Refusal, Rep, SlotSource};
+use super::ir::{BlockIx, Graph, NodeIx, NodeOp, Refusal, Rep, StateIx};
 
 /// Where a value lives for its whole range.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -236,7 +236,10 @@ impl LiveIndex {
 /// The values each node reads where it runs (stage 2, step 10): its inputs (a phi's are read on
 /// its edges) and the values of its frame state, which its exit writes, but constants and nodes
 /// of no representation, which no home holds. Each state's values are listed once, its operand
-/// stack's and then its slots', not walked again at each of the allocator's passes.
+/// stack's and then its slots', not walked again at each of the allocator's passes; a state of an
+/// inlined frame lists its chain's after them (stage 3, `Graph::chain_values`), which its exit
+/// writes as well, so that every value of a parent's recipe keeps its one home at each exit
+/// through the frame.
 struct Reads<'g> {
     graph: &'g Graph,
     value: Vec<bool>,
@@ -255,16 +258,12 @@ impl<'g> Reads<'g> {
         let mut state_start = Vec::with_capacity(graph.states.len() + 1);
         let mut state_values = Vec::new();
         state_start.push(0);
-        for state in &graph.states {
-            let slots = state.slots.iter().filter_map(|slot| match slot {
-                SlotSource::Value(v) => Some(*v),
-                _ => None,
-            });
-            for v in state.stack.iter().copied().chain(slots) {
+        for k in 0..graph.states.len() {
+            graph.for_each_exit_value(StateIx(k as u32), |v| {
                 if value[v.index()] {
                     state_values.push(v.0);
                 }
-            }
+            });
             state_start.push(state_values.len() as u32);
         }
         Reads {
@@ -898,6 +897,7 @@ pub(crate) mod tests {
             slots: vec![SlotSource::Frame; g.n_slots].into(),
             stack: stack.into(),
             handlers: Box::new([]),
+            frame: FrameIx::COMPILED,
         })
     }
 
