@@ -3729,3 +3729,58 @@ cycles 6,784M against 6,794M (+0.15%, inside the rounds' spread) with GC pacing 
 6,865M against 6,909M (+0.64%) with it off. The exit session's -3.9% is no cost of the tier off's
 code in fixed runs: it is in Octane's timed rounds only, as Richards' reading was at 7f92ab9d.
 Closed as an open item.
+
+Stage 3 step 0 landed (c6b50adb, d2f9e626, 00e1391a, 4f9e98a0, 2026-11-14; target/p3/stage3/
+step0-impl, report.txt and design-note.txt): a loop without effects loads its invariant slots once
+and checks them at its entry.
+- The load: at the header of a loop the prepass finds free of effects, a live slot the loop reads
+  and does not write, which its entry edges leave in the frame's keeping, takes its value at the
+  end of each entry predecessor (a FrameSlot there, as a written slot's phi inputs are taken) and
+  is held Clean through the loop: the one value, or a phi of the entries' values. The frame still
+  holds it, so every state in the loop keeps the slot in the frame's keeping and an exit rebuilds
+  the frame it did. A slot the loop does not read stays in the frame, which holds it at no cost
+  (GBEMU's scanline renderers held locals read only after their loops in registers and spill slots
+  across them: +0.24% instructions without the read set, -0.18% with it).
+- The checks: the phi selector moves the checks in the loop of a value loaded on the loop's one
+  entry edge (CheckNumber and CheckInt32 of it, CheckObject and CheckElements of its cell, each
+  kind once) to the end of that edge's predecessor, where step 6 puts its speculations, exiting at
+  the header's pc with the state the edge leaves under a new reason, HoistingFailed, whose flag at
+  the header leaves the checks in the loop: Ion's LICM of guards to the loop's predecessor and its
+  back-off after a hoisted guard bails out (jit/LICM.cpp:204-246, BaselineBailouts.cpp:2061-2087)
+  and the FTL's hoisting to the pre-header, which stops after a HoistingFailed exit (dfg/
+  DFGLICMPhase.cpp:254-271, 337-386). Maglev has no LICM: it peels the loop, the precondition step
+  6's departure 2 already left. TRust's loops are not rotated, so every body block is behind the
+  loop's test and every move is a blind speculation in JSC's sense: a failing entry check costs one
+  exit a call and at most one discard a header. Nothing moves with two entry edges (no pre-header),
+  from a predecessor that ends in a branch, or for a kind check where the loop tests the same cell
+  for a typed array.
+- Measured (fat LTO against 87b38dea, the tier on): NavierStokes -8.25% instructions at 5 fixed
+  runs (the load alone -1.34%), -12.4% instructions and -7.1% cycles at 200 on an X925 core,
+  Octane's timed score +7.7% (10 rounds, +7.5 to +8.0%); its reloads 8,016,368 -> 996 a run. PdfJS
+  -0.83%, GBEMU -0.18%, Crypto -0.13%; nothing above +0.01%. The tier off's template code
+  identical (3,067 compiles); compile work equal (Djot -0.01% instructions with its compiles on the
+  main thread). Mandreel's cycles read +0.2 to +0.6% with identical instructions and code (none of
+  its 84 compiles changed; the tier off equal): unexplained, to be read again in the stage's
+  session.
+- zlib and Mandreel gain nothing, and the step 3 input's attribution does not hold for them (it put
+  71% of the reloads in zlib's and NavierStokes' effect-free loops). Their reloads, 76% of the
+  census's 1.40 billion, are in loops the prepass counts as having effects only because
+  Rules::lowers has no case for equality, which the builder then lowers from its operands' facts.
+  A diagnostic build that counts equality as lowered, so that those loops hold their values, made
+  zlib 10.2% slower in instructions (103.95G -> 114.56G) with the same compiles, exits and flags:
+  a8's code 52,004 -> 57,696 and 81,584 -> 86,324 bytes with fewer nodes, the typed element stub
+  14.9G -> 21.5G instructions; Mandreel +1.77%, three functions refused where an untyped equality
+  stayed an effect. Step 3a will hold every loop's values that way, so the cause is found first
+  (step 0b: an investigation, the exemplars' answer to the cause, the remedy if it is contained).
+- Tests: 13 builder tests, 3 end-to-end and a loop-limit test, a program of the shapes in the
+  tier's equal-results test; 14 mutations, one a rule, each caught by a builder test (on zombie);
+  the tier's tests in four configurations (251) and the new ones under GC stress; a stress
+  program in the VM and six tier configurations, with and without GC stress; zombie's check,
+  clippy, Windows' check and suite (2,810). On the landed tree, the tier off, on, eager and eager
+  with forced exits: the library suite 3,259 passed and none failed in each, difftest 138 agree in
+  each (12 skipped by budget), the three fixtures' masked outputs equal the tier off's in each
+  (target/p3/stage3/step0-review/gate.out).
+- Open: the checks of values the loop's entry already held (entry slots, `this`, slots read before
+  the loop: am3's receivers) and of values that are no slots in loops with effects, the general
+  LICM of checks, the same mechanism over a wider set, a step of its own; a pre-header for loops
+  of two entry edges (rare in the measured code).
