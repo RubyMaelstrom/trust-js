@@ -200,7 +200,9 @@ fn a_creations_commit_writes_the_slot_before_the_shape() {
     // last, with no call or poll between, as the template orders them, so that the collector,
     // which runs only at safepoints, never sees the shape without the slot. No program can see
     // the order, so the code is read: each slot store, `str x, [x30]`, is followed by the shape
-    // store, `str w, [x17, #shape]`, and preceded by none.
+    // store, `str w, [x17, #shape]`, and preceded by none, and the card mark's byte store,
+    // `strb w9, [x9]` (jit.rs emit_card_mark), lies between them (a young value stored into an
+    // old receiver needs it; the GC-stress tests do not reach the commit in line for that case).
     let source = "function P(x) { this.a = x; this.b = x + 1; this.c = x + 2; }\n\
          let t = 0; for (let k = 0; k < 2000; k++) t = (t + new P(k).c) % 1000003; t";
     let expected = run(Tier::Bytecode, source);
@@ -234,6 +236,13 @@ fn a_creations_commit_writes_the_slot_before_the_shape() {
                 .iter()
                 .any(|&w| shape_store(w)),
             "a shape store before the slot's at word {k}"
+        );
+        let shape = (k + 1..words.len())
+            .find(|&j| shape_store(words[j]))
+            .expect("the shape store");
+        assert!(
+            words[k + 1..shape].contains(&0x3900_0129),
+            "the card mark between the slot's store at word {k} and the shape's"
         );
     }
 }
