@@ -263,3 +263,20 @@ fn what_no_template_creates_and_setters_stay_effects() {
         );
     }
 }
+
+#[test]
+fn a_creation_at_the_ninth_slot_or_past_it_stays_the_effect() {
+    // The template's commit stops at a named count of 8 (the next key needs a key index): the
+    // receiver's shape fixes the slot, so those sites keep the effect from the first compile.
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function wide(o, v) { o.a = v; o.b = v; o.c = v; o.d = v; o.e = v; o.f = v; o.g = v;
+           o.h = v; o.i = v; o.j = v; }
+         for (var i = 0; i < 20; i++) wide({}, i);",
+    );
+    let (chunk, graph) = graph_in(&mut engine, "wide");
+    let text = dump(&graph, &chunk);
+    assert_eq!(creations(&graph).len(), 8, "{text}");
+    assert_eq!(count(&graph, is_effect), 2, "{text}");
+}

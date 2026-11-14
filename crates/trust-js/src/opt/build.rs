@@ -432,6 +432,15 @@ impl Rules<'_> {
             }
         }
         let mut creation = creation?;
+        // The slot the property lands in, which the receiver's shape fixes (its key count and its
+        // class's cell slots: value.rs location_word): the template's commit takes one below 8
+        // alone (jit.rs emit_prop_create_probe: the 9th key needs a key index, value.rs
+        // ensure_fallback_index), so a site at 8 or more stays the effect, which the template's
+        // helper serves, rather than exit at each creation.
+        let cell = crate::value::class_slots(crate::value::shape_class(creation.shape)) as usize;
+        if !(0..8).any(|slot| crate::value::location_word(cell, slot) == Some(creation.location)) {
+            return None;
+        }
         let first = walks[0];
         if walks.len() > 1
             && walks
