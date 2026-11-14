@@ -184,7 +184,7 @@ fn count(graph: &Graph, which: impl Fn(&NodeOp) -> bool) -> usize {
 }
 
 fn is_effect(op: &NodeOp) -> bool {
-    matches!(op, NodeOp::Effect { .. })
+    matches!(op, NodeOp::Effect { .. } | NodeOp::Generic { .. })
 }
 
 /// The pc of `name`'s one operation `which` accepts.
@@ -5033,3 +5033,37 @@ mod typed_loop;
 /// P3 stage 3 step L2: named loads through the prototype chain.
 #[path = "chain_tests.rs"]
 mod chain;
+
+/// An operation the tier does not lower is a generic node (P3 stage 3 step 3a); one that may read
+/// any slot or whose helper runs the VM on a copy of the operand stack stays a canonical-frame
+/// effect (`liveness::SlotUse::Any`, `bytecode::jit_runs_on_vm_copy`).
+#[test]
+fn operations_needing_the_whole_frame_stay_canonical_effects_and_others_are_generic() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function g(x) { return x; }
+         function f(a) { var o = g(a); var s = [...a]; return o.length + s.length; }
+         for (var i = 0; i < 20; i++) f([1, 2]);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "f");
+    let text = dump(&graph, &chunk);
+    let call = pc_of(&chunk, |op| {
+        matches!(op, Op::Call(..) | Op::CallWithThis(..))
+    });
+    let spread = pc_of(&chunk, |op| matches!(op, Op::ArraySpread));
+    let at = |pc: usize| {
+        nodes(&graph, is_effect)
+            .into_iter()
+            .find(|node| node.pc as usize == pc)
+            .map(|node| node.op.clone())
+    };
+    assert!(
+        matches!(at(call), Some(NodeOp::Generic { .. })),
+        "the call is a generic node: {text}"
+    );
+    assert!(
+        matches!(at(spread), Some(NodeOp::Effect { .. })),
+        "the spread runs on a copy of the stack: {text}"
+    );
+}

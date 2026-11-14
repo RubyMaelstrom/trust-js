@@ -789,7 +789,7 @@ impl<'g> Selector<'g> {
                     }
                     NodeOp::ToBoolean => self.graph.node_mut(user).op = NodeOp::F64ToBoolean,
                     // Each boxes what it stores (a64's `boxed`).
-                    NodeOp::StoreSlot(_) | NodeOp::Effect { .. } => {}
+                    NodeOp::StoreSlot(_) | NodeOp::Effect { .. } | NodeOp::Generic { .. } => {}
                     // An element store's value: its cell, words and index are no word.
                     NodeOp::StoreElement(_) => {}
                     NodeOp::Phi if self.kind(user) != Kind::Tagged => {}

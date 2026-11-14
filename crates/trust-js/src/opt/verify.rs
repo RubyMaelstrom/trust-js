@@ -692,6 +692,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::Phi
         | NodeOp::Projection(_)
         | NodeOp::Effect { .. }
+        | NodeOp::Generic { .. }
         | NodeOp::CheckCallee { .. }
         | NodeOp::CalleeMatches { .. } => return None,
     })
@@ -737,14 +738,15 @@ fn representations(
                 _ => return Err("a projection of other than one node".into()),
             };
             match effect.op {
-                NodeOp::Effect { pushes, .. } if result < pushes => {}
+                NodeOp::Effect { pushes, .. } | NodeOp::Generic { pushes, .. }
+                    if result < pushes => {}
                 _ => return Err(format!("a projection of {:?}", effect.op)),
             }
             if node.rep != Rep::Tagged {
                 return Err(format!("a {:?} projection", node.rep));
             }
         }
-        &NodeOp::Effect { pc, pops, pushes } => {
+        &NodeOp::Effect { pc, pops, pushes } | &NodeOp::Generic { pc, pops, pushes } => {
             if pc != node.pc {
                 return Err(format!("an effect of pc {pc} built at another pc"));
             }

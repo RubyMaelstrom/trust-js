@@ -315,7 +315,7 @@ pub(crate) enum NodeOp {
     This,
     /// One input per predecessor of its block, in predecessor order.
     Phi,
-    /// The i-th result of the effect that is this node's only input (Tagged).
+    /// The i-th result of the effect or generic node that is this node's only input (Tagged).
     Projection(u8),
 
     // Checks: each node has a frame state (its eager exit's) and a reason.
@@ -614,8 +614,20 @@ pub(crate) enum NodeOp {
     /// The baseline template of the operation at `pc`, on the canonical frame: inputs are the
     /// operation's popped operands (Tagged), its results are the Projections that follow it, its
     /// state is the frame state before it (the operation's own pc; used when it throws at a pc
-    /// with a handler, and by the forced-exit gate).
+    /// with a handler, and by the forced-exit gate). The operations that need the whole frame
+    /// (P3 stage 3 step 3a): those that may read any slot (`liveness::SlotUse::Any`) and those
+    /// whose helper runs the VM on a copy of the operand stack (`bytecode::jit_runs_on_vm_copy`).
     Effect {
+        pc: u32,
+        pops: u8,
+        pushes: u8,
+    },
+    /// Any other operation the tier does not lower, as the tier's own node (P3 stage 3 step 3a;
+    /// the owner's D6, explicit operands): inputs are its popped operands (words, or values the
+    /// code boxes into them), its results the Projections that follow it, its state the frame
+    /// state before it, as an effect's. Its lowering runs the operation's baseline template on
+    /// the canonical operand words at its pc's depth.
+    Generic {
         pc: u32,
         pops: u8,
         pushes: u8,
@@ -667,6 +679,7 @@ impl NodeOp {
                 | NodeOp::I32UShr
                 | NodeOp::Poll
                 | NodeOp::Effect { .. }
+                | NodeOp::Generic { .. }
                 | NodeOp::Exit(_)
                 | NodeOp::CheckElements(_)
                 | NodeOp::CheckIndex
@@ -682,7 +695,10 @@ impl NodeOp {
     /// Whether running this node may run JavaScript, collect, or write anything a later node reads
     /// (heap facts die across it; values live across it need a callee-saved home).
     pub(crate) fn is_effectful(&self) -> bool {
-        matches!(self, NodeOp::Effect { .. } | NodeOp::F64Mod)
+        matches!(
+            self,
+            NodeOp::Effect { .. } | NodeOp::Generic { .. } | NodeOp::F64Mod
+        )
     }
 
     /// Whether this node reads the compiled function's own context (stage 3): its canonical
@@ -698,6 +714,9 @@ impl NodeOp {
                 | NodeOp::This
                 | NodeOp::Env
                 | NodeOp::Effect { .. }
+                // Its template runs on the compiled frame's operand words (P3 stage 3 step 3a; an
+                // inlined frame's generic nodes are step 3c's).
+                | NodeOp::Generic { .. }
                 | NodeOp::Projection(_)
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CalleeMatches { .. }

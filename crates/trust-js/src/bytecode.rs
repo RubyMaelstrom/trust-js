@@ -25863,6 +25863,20 @@ fn jit_bridge_op(op: &Op) -> bool {
     )
 }
 
+/// Whether [`jit_exec`] runs the operation in a fresh frame through [`jit_vm_operation`], one VM
+/// step over a copy of the whole operand stack (its dispatch: the bridge operations but the
+/// Reference and lexical-scope ones, which their own helpers run on the canonical owners). The
+/// optimizing tier keeps every such operation a canonical-frame effect (P3 stage 3 step 3a).
+pub(crate) fn jit_runs_on_vm_copy(op: &Op) -> bool {
+    jit_bridge_op(op)
+        && !jit_scope_operation(op)
+        && !jit_object_literal_operation(op)
+        && !matches!(
+            op,
+            Op::ResolveNameRef(..) | Op::LoadRef(_) | Op::StoreRef(_)
+        )
+}
+
 /// Run one checked operation against the canonical borrowed continuation, not an activation
 /// copy. A nested ordinary direct callee has another chunk and must not use this view.
 unsafe fn jit_continuation_operation(

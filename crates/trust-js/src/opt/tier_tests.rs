@@ -1320,7 +1320,7 @@ fn stays_an_effect(chunk: &crate::bytecode::Chunk, pc: usize) -> bool {
         && graph
             .nodes
             .iter()
-            .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. } if at as usize == pc))
+            .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. } | NodeOp::Generic { pc: at, .. } if at as usize == pc))
 }
 
 /// Whether the tier's graph of `chunk` takes a string's method at `pc` through String.prototype
@@ -1669,7 +1669,7 @@ fn oddballs_into_a_bitwise_operation_converge_on_their_truncation() {
     assert!(!graph
         .nodes
         .iter()
-        .any(|node| matches!(node.op, NodeOp::Effect { .. })));
+        .any(|node| matches!(node.op, NodeOp::Effect { .. } | NodeOp::Generic { .. })));
 }
 
 #[test]
@@ -1708,7 +1708,7 @@ fn a_symbol_into_an_oddball_truncation_converges_on_the_generic_operation() {
     assert!(graph
         .nodes
         .iter()
-        .any(|node| matches!(node.op, NodeOp::Effect { pc, .. } if pc as usize == or)));
+        .any(|node| matches!(node.op, NodeOp::Effect { pc, .. } | NodeOp::Generic { pc, .. } if pc as usize == or)));
 }
 
 #[test]

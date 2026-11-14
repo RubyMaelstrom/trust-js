@@ -473,7 +473,7 @@ fn check_graph(
                         "an entry slot outside the entry block",
                     ));
                 }
-                NodeOp::Effect { pc, pops, pushes } => {
+                NodeOp::Effect { pc, pops, pushes } | NodeOp::Generic { pc, pops, pushes } => {
                     let op = ops
                         .get(pc as usize)
                         .ok_or(Refusal::at(pc as usize, "an effect past the chunk"))?;
@@ -1599,7 +1599,9 @@ impl Gen<'_> {
             }
             NodeOp::Projection(k) => {
                 let effect = input(0);
-                let NodeOp::Effect { pushes, .. } = graph.node(effect).op else {
+                let (NodeOp::Effect { pushes, .. } | NodeOp::Generic { pushes, .. }) =
+                    graph.node(effect).op
+                else {
                     return Err(Refusal::at(node.pc as usize, "a projection of no effect"));
                 };
                 if self.last_effect != Some(effect) || *k >= pushes {
@@ -2297,7 +2299,7 @@ impl Gen<'_> {
                     throw,
                 });
             }
-            NodeOp::Effect { pc, pops, .. } => {
+            NodeOp::Effect { pc, pops, .. } | NodeOp::Generic { pc, pops, .. } => {
                 self.lower_effect(n, *pc as usize, *pops as usize)?;
             }
             NodeOp::Jump(target) => {

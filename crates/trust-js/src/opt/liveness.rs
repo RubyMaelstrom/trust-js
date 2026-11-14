@@ -217,19 +217,55 @@ pub(crate) fn add_reads(op: &Op, read: &mut [u64], scratch: &mut [u64], all: &[u
     union(read, scratch);
 }
 
-/// The slots live before `op` from those live after it (`all`: every slot).
-fn transfer(op: &Op, live: &mut [u64], all: &[u64]) {
+/// What an operation does with the frame's slots (see the module's doc): the one list the
+/// liveness (`transfer`) and the tier's generic nodes read (P3 stage 3 step 3a: a generic node's
+/// inputs are the slots it names, its outputs the slots it writes, `opt::build`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SlotUse {
+    /// It writes `count` slots from `start` and reads none (StoreLocal and Tdz one, ResetSlots a
+    /// range).
+    Writes { start: u16, count: u16 },
+    /// It reads the first `count` of the slots it names and no other, and writes those whose bit
+    /// `written` sets (bit k for `slots[k]`), each after reading it: an update, an elided read
+    /// materializing its object (bytecode.rs `elided_arguments_element`), a binding's or a
+    /// `for…in` step's hidden slots (`open_array_binding`, `for_in_step`).
+    Named {
+        slots: [u16; 3],
+        count: u8,
+        written: u8,
+    },
+    /// It reads and writes no slot: its operands are the operand stack's, `this`, the
+    /// environment's or the heap's.
+    NoSlot,
+    /// It may read any slot (EvalExpr's and AssignTarget's projections of the frame, and every
+    /// operation the lists here do not name).
+    Any,
+}
+
+/// The named slots `slots` (the first `count` of them), `written` marking those the operation
+/// writes.
+fn named(slots: &[u16], written: u8) -> SlotUse {
+    let mut words = [0u16; 3];
+    words[..slots.len()].copy_from_slice(slots);
+    SlotUse::Named {
+        slots: words,
+        count: slots.len() as u8,
+        written,
+    }
+}
+
+/// What `op` does with the frame's slots (see [`SlotUse`]).
+pub(crate) fn slot_use(op: &Op) -> SlotUse {
     match *op {
         // Writes.
-        Op::StoreLocal(slot) | Op::Tdz(slot) => clear(live, slot),
-        Op::ResetSlots(start, count) => {
-            for slot in start..start.saturating_add(count) {
-                clear(live, slot);
-            }
-        }
+        Op::StoreLocal(slot) | Op::Tdz(slot) => SlotUse::Writes {
+            start: slot,
+            count: 1,
+        },
+        Op::ResetSlots(start, count) => SlotUse::Writes { start, count },
         // Reads (an update's write follows its read, so the slot is live before it).
+        Op::UpdateLocal(slot, _) | Op::ArgElem(slot) | Op::RestElem(slot) => named(&[slot], 1),
         Op::LoadLocal(slot)
-        | Op::UpdateLocal(slot, _)
         | Op::GetPropLocal(slot, ..)
         | Op::SetPropLocalDrop(slot, ..)
         | Op::GetElemLocal(slot)
@@ -240,23 +276,21 @@ fn transfer(op: &Op, live: &mut [u64], all: &[u64]) {
         | Op::IterCloseL(slot)
         | Op::IterAbortL(slot)
         | Op::IterNextBuiltin(slot)
-        | Op::ArgElem(slot)
-        | Op::RestElem(slot)
         | Op::ArgLength(slot, ..)
-        | Op::RestLength(slot, ..) => set(live, slot),
+        | Op::RestLength(slot, ..) => named(&[slot], 0),
         Op::IterStepL(a, b) | Op::IterCloseIfNotDoneL(a, b) | Op::IterAbortIfNotDoneL(a, b) => {
-            set(live, a);
-            set(live, b);
+            named(&[a, b], 0)
         }
-        Op::ForInStepL(a, b, c)
-        | Op::DestructureStepL(a, b, c)
+        // A `for…in` step advances its index slot; an array binding's opening stores its
+        // iterator and `next` (its third operand is a count, its step's an index: named as
+        // slots, which only keeps more live).
+        Op::ForInStepL(a, b, c) => named(&[a, b, c], 0b010),
+        Op::TryArrayBinding(a, b, c) => named(&[a, b, c], 0b011),
+        // Destructuring's steps run in the VM on a copy of the operand stack (a canonical-frame
+        // effect in the tier, `bytecode::jit_runs_on_vm_copy`): their writes are not listed.
+        Op::DestructureStepL(a, b, c)
         | Op::DestructureRestL(a, b, c)
-        | Op::TryArrayBinding(a, b, c)
-        | Op::ArrayBindingStep(a, b, c) => {
-            set(live, a);
-            set(live, b);
-            set(live, c);
-        }
+        | Op::ArrayBindingStep(a, b, c) => named(&[a, b, c], 0),
         // Operations that read no slot: their operands are the operand stack's, `this`, the
         // environment's or the heap's.
         Op::Const(_)
@@ -377,9 +411,27 @@ fn transfer(op: &Op, live: &mut [u64], all: &[u64]) {
         | Op::Throw
         | Op::Return
         | Op::ReturnBare
-        | Op::ReturnUndef => {}
+        | Op::ReturnUndef => SlotUse::NoSlot,
         // Any other operation may read any slot.
-        _ => live.copy_from_slice(all),
+        _ => SlotUse::Any,
+    }
+}
+
+/// The slots live before `op` from those live after it (`all`: every slot).
+fn transfer(op: &Op, live: &mut [u64], all: &[u64]) {
+    match slot_use(op) {
+        SlotUse::Writes { start, count } => {
+            for slot in start..start.saturating_add(count) {
+                clear(live, slot);
+            }
+        }
+        SlotUse::Named { slots, count, .. } => {
+            for &slot in &slots[..usize::from(count)] {
+                set(live, slot);
+            }
+        }
+        SlotUse::NoSlot => {}
+        SlotUse::Any => live.copy_from_slice(all),
     }
 }
 
@@ -472,6 +524,49 @@ mod tests {
         assert_eq!(live_at(&live, 13, 2), [0]);
         // The pad reads y.
         assert_eq!(live_at(&live, 10, 2), [1]);
+    }
+
+    #[test]
+    fn named_writes_are_updates_materializing_reads_and_iteration_steps() {
+        // The operations that write a slot they name, each after reading it (P3 stage 3 step
+        // 3a: a generic node's outputs).
+        let written = |op: Op| match slot_use(&op) {
+            SlotUse::Named {
+                slots,
+                count,
+                written,
+            } => (slots[..usize::from(count)].to_vec(), written),
+            other => panic!("{op:?} is {other:?}"),
+        };
+        assert_eq!(written(Op::UpdateLocal(4, UpdKind::PostInc)), (vec![4], 1));
+        assert_eq!(written(Op::ArgElem(2)), (vec![2], 1));
+        assert_eq!(written(Op::RestElem(2)), (vec![2], 1));
+        assert_eq!(written(Op::ForInStepL(1, 2, 3)), (vec![1, 2, 3], 0b010));
+        assert_eq!(
+            written(Op::TryArrayBinding(1, 2, 3)),
+            (vec![1, 2, 3], 0b011)
+        );
+        // Reads alone.
+        for op in [
+            Op::LoadLocal(5),
+            Op::GetPropLocal(5, 0, 0),
+            Op::SetPropLocalDrop(5, 0, 0),
+            Op::GetElemLocal(5),
+            Op::SetElemLocal(5),
+            Op::SetElemLocalDrop(5),
+            Op::ToPropKeyLocal(5),
+            Op::IterNextBuiltin(5),
+            Op::IterCloseL(5),
+        ] {
+            assert_eq!(written(op), (vec![5], 0), "{op:?}");
+        }
+        assert_eq!(written(Op::IterStepL(5, 6)), (vec![5, 6], 0));
+        assert_eq!(
+            slot_use(&Op::StoreLocal(3)),
+            SlotUse::Writes { start: 3, count: 1 }
+        );
+        assert_eq!(slot_use(&Op::Call(1, 0)), SlotUse::NoSlot);
+        assert_eq!(slot_use(&Op::EvalExpr(0)), SlotUse::Any);
     }
 
     #[test]

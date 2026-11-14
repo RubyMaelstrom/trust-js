@@ -291,7 +291,11 @@ fn a_leaf_callee_is_built_in_the_graph_in_a_frame_of_its_own() {
         "the callee is the guard's word"
     );
     // The call's operation is no effect: sq's multiplication is a node of frame 1.
-    assert!(nodes(graph, |node| matches!(node.op, NodeOp::Effect { .. })).is_empty());
+    assert!(nodes(graph, |node| matches!(
+        node.op,
+        NodeOp::Effect { .. } | NodeOp::Generic { .. }
+    ))
+    .is_empty());
     assert!(
         !nodes(graph, |node| node.frame == FrameIx(1)
             && matches!(node.op, NodeOp::F64Mul | NodeOp::I32Mul))
@@ -432,7 +436,7 @@ fn a_flagged_guard_branches_to_its_next_way_and_the_last_to_the_call() {
             .len(),
             nodes(
                 graph,
-                |node| matches!(node.op, NodeOp::Effect { pc, .. } if pc == call),
+                |node| matches!(node.op, NodeOp::Effect { pc, .. } | NodeOp::Generic { pc, .. } if pc == call),
             )
             .len(),
         )
@@ -480,7 +484,7 @@ fn a_flagged_one_way_site_keeps_its_call_after_the_mismatch() {
     assert_eq!(
         nodes(
             graph,
-            |node| matches!(node.op, NodeOp::Effect { pc, .. } if pc == call)
+            |node| matches!(node.op, NodeOp::Effect { pc, .. } | NodeOp::Generic { pc, .. } if pc == call)
         )
         .len(),
         1,
@@ -508,7 +512,10 @@ fn a_callees_loop_inside_its_callers_loop_leaves_the_callers_values_held() {
     assert!(
         nodes(graph, |node| matches!(
             node.op,
-            NodeOp::Effect { .. } | NodeOp::FrameSlot(_) | NodeOp::StoreSlot(_)
+            NodeOp::Effect { .. }
+                | NodeOp::Generic { .. }
+                | NodeOp::FrameSlot(_)
+                | NodeOp::StoreSlot(_)
         ))
         .is_empty(),
         "{}",
@@ -676,7 +683,7 @@ fn a_callee_with_an_effect_is_declined_and_its_call_stays() {
     assert_eq!(
         nodes(
             &built.graph,
-            |node| matches!(node.op, NodeOp::Effect { pc, .. } if pc == call)
+            |node| matches!(node.op, NodeOp::Effect { pc, .. } | NodeOp::Generic { pc, .. } if pc == call)
         )
         .len(),
         1

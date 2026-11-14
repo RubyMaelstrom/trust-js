@@ -63,7 +63,7 @@ use super::ir::{
     Refusal, Rep, SlotSource, StateIx,
 };
 use super::ir::{ElemKind, Holes, Store, TypedKind};
-use super::liveness::SlotLiveness;
+use super::liveness::{slot_use, SlotLiveness, SlotUse};
 use super::snapshot::{Ran, Snapshot};
 use super::view::FrozenChunk;
 use crate::bytecode::IC_PRIMITIVE_STRING;
@@ -957,6 +957,16 @@ impl Rules<'_> {
         self.snapshot.declines(pc, ExitReason::WrongShape)
             && shapes.len() <= self.snapshot.discarded_ways(pc)
     }
+}
+
+/// Whether `op`, where the tier does not lower it, runs as a canonical-frame effect (NodeOp::Effect)
+/// rather than as a generic node: it may read any slot (`liveness::SlotUse::Any`, and the slot
+/// writes, which the rules always lower), or its helper runs the VM on a copy of the operand
+/// stack (`bytecode::jit_runs_on_vm_copy`), so that it needs the whole canonical frame (P3 stage
+/// 3 step 3a).
+fn canonical(op: &Op) -> bool {
+    matches!(slot_use(op), SlotUse::Any | SlotUse::Writes { .. })
+        || crate::bytecode::jit_runs_on_vm_copy(op)
 }
 
 /// The f64 a tagged word holds, None for a word that is not a Number (value.rs: a Number is its
@@ -3351,7 +3361,9 @@ impl<'a> Builder<'a> {
         Ok(())
     }
 
-    /// The operation at `pc` as its baseline template on the canonical frame.
+    /// The operation at `pc`, which the tier does not lower: a generic node, or, where the
+    /// operation needs the whole frame ([`canonical`]), its baseline template on the canonical
+    /// frame.
     fn effect(&mut self, pc: usize, st: &mut State) -> Result<(), Refusal> {
         // An inlined frame runs no template (P3 stage 3, step 2's E0): the inliner declined every
         // callee a built operation of which the rules leave to one.
@@ -3375,6 +3387,19 @@ impl<'a> Builder<'a> {
         let (Ok(pop_count), Ok(push_count)) = (u8::try_from(pops), u8::try_from(pushes)) else {
             return Err(Refusal::at(pc, "an operation over 255 operands"));
         };
+        let op = if canonical(&self.ops[pc]) {
+            NodeOp::Effect {
+                pc: pc as u32,
+                pops: pop_count,
+                pushes: push_count,
+            }
+        } else {
+            NodeOp::Generic {
+                pc: pc as u32,
+                pops: pop_count,
+                pushes: push_count,
+            }
+        };
         self.flush(st, pc);
         let len = st.stack.len();
         let mut inputs = Vec::with_capacity(pops);
@@ -3385,18 +3410,7 @@ impl<'a> Builder<'a> {
             inputs.push(word);
         }
         let state = self.frame_state(pc, st);
-        let effect = self.add_exit(
-            NodeOp::Effect {
-                pc: pc as u32,
-                pops: pop_count,
-                pushes: push_count,
-            },
-            &inputs,
-            Rep::None,
-            pc,
-            state,
-            ExitReason::Throw,
-        );
+        let effect = self.add_exit(op, &inputs, Rep::None, pc, state, ExitReason::Throw);
         st.stack.truncate(len - pops);
         for result in 0..push_count {
             let value = self.add(NodeOp::Projection(result), &[effect], Rep::Tagged, pc);
