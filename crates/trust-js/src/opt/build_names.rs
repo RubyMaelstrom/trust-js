@@ -119,6 +119,16 @@ impl Facts {
         *self = Facts::default();
     }
 
+    /// The words these facts give back to a later operation (a binding's value, a global
+    /// lexical's), whose own facts `Builder::prune` keeps (P3 stage 3 step 0c).
+    pub(super) fn words(&self) -> impl Iterator<Item = NodeIx> + '_ {
+        self.constants
+            .values()
+            .chain(self.values.values())
+            .chain(self.lexicals.values())
+            .copied()
+    }
+
     /// The facts every predecessor holds.
     pub(super) fn meet(preds: &[(BlockIx, State)]) -> Facts {
         let (first, rest) = (&preds[0].1.names, &preds[1..]);

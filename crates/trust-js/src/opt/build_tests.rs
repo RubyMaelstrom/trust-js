@@ -5011,3 +5011,7 @@ fn the_verifier_refuses_a_misplaced_invariant_check() {
     rejects("a check after it", broken, "before CheckNumber");
     verify(&graph, &chunk).expect("the graph itself holds");
 }
+
+/// P3 stage 3 step 0c: a typed array's facts through block edges and effect-free loops.
+#[path = "typed_loop_tests.rs"]
+mod typed_loop;

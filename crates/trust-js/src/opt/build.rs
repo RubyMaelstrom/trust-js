@@ -2127,9 +2127,10 @@ impl<'a> Builder<'a> {
         phi
     }
 
-    /// Drop the facts of values no later operation can reach: a value reaches an operation only
-    /// through the frame (a slot or a stack position) or as `this`, so a fact about any other is
-    /// dead weight on every state cloned at an edge.
+    /// Drop the facts of values no later operation can reach: a value reaches an operation
+    /// through the frame (a slot or a stack position), as `this`, or as the word a heap fact gives
+    /// back (a binding's value, a global lexical's, a live object's field), so a fact about any
+    /// other is dead weight on every state cloned at an edge.
     fn prune(&self, st: &mut State) {
         let mut live: crate::fasthash::FastSet<NodeIx> = st.stack.iter().copied().collect();
         live.extend(st.slots.iter().filter_map(|slot| match *slot {
@@ -2147,6 +2148,25 @@ impl<'a> Builder<'a> {
         // after its return (P3 stage 3, step 2).
         if let Some(inlined) = &self.inlined {
             live.extend(inlined.live());
+        }
+        // The words a binding's or a field's fact gives a later read instead of a load (P3 stage
+        // 3 step 0c): their facts serve that read, as a slot's serve its reads. A typed array
+        // held in a closure binding (asm.js code's heap views) or a global (Mandreel's) kept
+        // none of its cell, kind, view or data address past a block's edge without them. A
+        // field's value may be an object whose fields are known in turn.
+        live.extend(st.names.words());
+        while !st.fields.is_empty() {
+            let before = live.len();
+            let found: Vec<NodeIx> = st
+                .fields
+                .iter()
+                .filter(|((word, _), _)| live.contains(word))
+                .map(|(_, &value)| value)
+                .collect();
+            live.extend(found);
+            if live.len() == before {
+                break;
+            }
         }
         st.forms.retain(|value, forms| {
             live.contains(value) || forms.members().any(|m| live.contains(&m))
