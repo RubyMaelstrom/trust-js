@@ -444,6 +444,11 @@ fn opaque_echo() -> crate::embed::NativeFn {
 
 #[test]
 fn bare_scoped_native_keeps_its_signature_in_native_and_prepared_caches() {
+    // Its subject is the template JIT's call-hit path, and it counts that path's completions: in
+    // the optimizing tier's code a call that an exit hands to the VM is not one of them, and with
+    // compiles off the main thread the code lands at a poll of its own choosing (31 of 32 for one
+    // kind, in one run of six to one of two).
+    crate::opt::pin_tier_off_for_test();
     const CHILD: &str = "TRUST_JS_TEST_SCOPED_NATIVE_SIGNATURE_CHILD";
     if std::env::var_os(CHILD).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
