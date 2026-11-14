@@ -100,6 +100,10 @@ pub(crate) struct ChunkProfile {
     /// loop's crossing, until the words' other uses set them (`Chunk::set_inline_retry_at`) or an
     /// entry takes the check (`opt::loop_limit_due`).
     loop_armed: Cell<bool>,
+    /// The tier refused a compile of the chunk that inlined in its graph (TRUST_JS_OPT_INLINE=
+    /// graph; P3 stage 3, step 2): its function's next checkpoint splices, as a function the tier
+    /// refuses keeps a second stage's splices for its template code.
+    graph_refused: Cell<bool>,
     /// Template code's last-seen element receivers (P3 stage 3, rule U), two bytes per pc (`2 pc`
     /// and `2 pc + 1`), made by the first template compile that records into them
     /// ([`ChunkProfile::element_byte`]), JSC's ArrayProfile::m_lastSeenStructureID
@@ -270,6 +274,16 @@ impl ChunkProfile {
     /// Arm the loop limit (`opt::arm_loop_limit`).
     pub(crate) fn set_loop_armed(&self, armed: bool) {
         self.loop_armed.set(armed);
+    }
+
+    /// Whether the tier refused a compile of the chunk that inlined in its graph (see the
+    /// field).
+    pub(crate) fn graph_refused(&self) -> bool {
+        self.graph_refused.get()
+    }
+
+    pub(crate) fn set_graph_refused(&self) {
+        self.graph_refused.set(true);
     }
 
     /// The address of `pc`'s last-seen typed-kind byte in a chunk of `len` operations, its family

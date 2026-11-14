@@ -1182,3 +1182,26 @@ fn a_guards_exits_flag_its_call_and_the_reoptimized_code_branches_on_it() {
         "{bytes:?}"
     );
 }
+
+#[test]
+fn a_function_the_tier_refuses_splices_at_its_next_checkpoint() {
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(
+        &mut engine,
+        "function lf(x) { return x + 1; }
+         function rf(x) { var t = 0; try { t = lf(x); } finally { t = t + 1; } return t; }
+         for (var i = 0; i < 2000; i++) rf(i);",
+    );
+    // rf's plan inlines lf, a leaf; the tier refuses rf (its `finally`), and its next checkpoint
+    // splices, as a function the tier refuses keeps a second stage's splices.
+    let (func, _) = function(&mut engine, "rf");
+    let first = first_stage(&func);
+    assert!(super::graph_refused(&first), "the graph compile refused");
+    assert!(!super::in_place(&first));
+    assert!(
+        func.runtime().code2.get().and_then(Option::clone).is_some(),
+        "a second stage with its splice"
+    );
+    assert_eq!(eval(&mut engine, "rf(5)"), "7");
+}

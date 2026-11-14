@@ -16845,7 +16845,7 @@ impl Interp {
         // call nothing is the tier's to inline in its graph: the first stage compiled in place,
         // its callees built in from their own first stages (`opt::oracle`), and nothing
         // recompiles the bytecode. Any other plan splices as below.
-        if tier && crate::opt::inline_graph() {
+        if tier && crate::opt::inline_graph() && !crate::opt::graph_refused(chunk) {
             if plan
                 .values()
                 .all(|entry| entry.ways.iter().all(|way| way.leaf))

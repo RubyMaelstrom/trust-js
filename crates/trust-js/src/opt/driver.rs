@@ -1173,6 +1173,9 @@ pub(crate) enum Landing {
     /// fallback (`install_in_place`), and the chunk's checkpoints ended; the function's.
     InPlace {
         func: std::rc::Weak<crate::ast::Function>,
+        /// The compile inlines in its graph (TRUST_JS_OPT_INLINE=graph, P3 stage 3, step 2): a
+        /// refusal sends the function's next checkpoint to the splice (`splice_after_refusal`).
+        graph: bool,
     },
 }
 
@@ -1303,13 +1306,17 @@ pub(crate) fn compile_in_place(
     func: std::rc::Weak<crate::ast::Function>,
     plan: Option<crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>>,
 ) {
+    let graph = plan.is_some();
     let inline = plan.map(super::oracle::Request::Plan);
     if asynchronous() {
         if let Some(chunk_rc) = chunk_rc {
             // A refusal at the preparation keeps the template JIT's code, as one at the compile.
-            let landing = Landing::InPlace { func };
+            let landing = Landing::InPlace { func, graph };
             if start_job(i, chunk_rc.clone(), chunk_rc, landing, inline).is_err() {
                 chunk.set_inline_retry_at(0);
+                if graph {
+                    splice_after_refusal(chunk);
+                }
                 release_retired(i);
             }
             return;
@@ -1317,12 +1324,40 @@ pub(crate) fn compile_in_place(
     }
     let _ = func;
     release_retired(i);
-    if let Some((code, started)) = generate(i, chunk, inline) {
-        install_in_place(i, chunk, code);
-        log_main_thread("install", chunk, started);
-    }
+    let refused = match generate(i, chunk, inline) {
+        Some((code, started)) => {
+            install_in_place(i, chunk, code);
+            log_main_thread("install", chunk, started);
+            false
+        }
+        None => true,
+    };
     chunk.set_inline_retry_at(0);
+    if refused && graph {
+        splice_after_refusal(chunk);
+    }
     release_retired(i);
+}
+
+/// The tier refused an in-place compile of `chunk` that inlined in its graph (P3 stage 3, step
+/// 2): its function splices at its next checkpoint, as a function the tier refuses keeps a second
+/// stage's splices for its template code (the step's decision), the checkpoint armed at its next
+/// native entry, whose settled-feedback rule waits as at any checkpoint.
+fn splice_after_refusal(chunk: &Chunk) {
+    ChunkProfile::of(chunk).set_graph_refused();
+    chunk.set_inline_retry_at(chunk.jit_runs.get().saturating_add(1));
+    if log_enabled() {
+        log_line!(
+            "[opt] graph inlining refused {}: its next checkpoint splices",
+            name(chunk)
+        );
+    }
+}
+
+/// Whether the tier refused an in-place compile of `chunk` that inlined in its graph (see
+/// `splice_after_refusal`): its function's checkpoints splice from then on.
+pub(crate) fn graph_refused(chunk: &Chunk) -> bool {
+    ChunkProfile::get(chunk).is_some_and(ChunkProfile::graph_refused)
 }
 
 /// Whether the tier's code was installed in `chunk`'s own slot (`install_in_place`): the
@@ -1478,15 +1513,19 @@ fn land(
             }
             release_retired(i);
         }
-        Landing::InPlace { .. } => {
+        Landing::InPlace { graph, .. } => {
+            let refused = code.is_none();
             if let Some(code) = code {
                 install_in_place(i, &chunk, code);
                 log_main_thread("install", &chunk, install);
             }
             // The checkpoints end, the tier's code installed or refused (a stale chain's request
             // made meanwhile waits for the template JIT's code to run again: a discard's
-            // warm-up takes it).
+            // warm-up takes it); a refused graph compile's function splices (step 2).
             asking.set_inline_retry_at(0);
+            if refused && graph {
+                splice_after_refusal(asking);
+            }
             release_retired(i);
         }
     }
@@ -1635,7 +1674,7 @@ fn dropped(i: &Interp, job: &PendingJob) -> Option<&'static str> {
                 return Some("its chunk was superseded");
             }
         }
-        Landing::InPlace { func } => {
+        Landing::InPlace { func, .. } => {
             let Some(func) = func.upgrade() else {
                 return Some("its function was collected");
             };

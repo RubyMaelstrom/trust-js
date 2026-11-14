@@ -275,6 +275,10 @@ mod off {
 
     pub(crate) fn note_spliced(_: &Chunk) {}
 
+    pub(crate) fn graph_refused(_: &Chunk) -> bool {
+        false
+    }
+
     pub(crate) fn install_finished(_: &mut Interp) {}
 
     /// No code is the tier's: no loop limit is ever armed.
