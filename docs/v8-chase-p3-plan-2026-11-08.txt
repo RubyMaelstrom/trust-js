@@ -4096,3 +4096,59 @@ after normalization (1,339 of 1,339 compiles) and the tier off's template code i
   configurations with GC stress; 26 mutations, each caught; the tier's tests (308) in the four
   configurations at splice and at graph; difftest with a corpus of inlining shapes; zombie's
   check, clippy, Windows' check and suite (2,822).
+
+Stage 3 step 0c landed (449fa24d, f7547b2f, 30d63461, ad490cc6, 5b4afc77, 2026-11-14; target/p3/
+stage3/step0c-impl, report.txt and design-note.txt): a loop without effects keeps its entry's heap
+facts that nothing in it can end, and checks the typed arrays it accesses once, at its entry.
+- Where the 666M TypedData executions of zlib came from (a probe classing every typed node by
+  its dominator chain): 27% a header between two accesses with the array's word taken again
+  inside, 21% a first access inside a loop, 18% the same epoch with the facts dropped at a block
+  edge, 17% a store's check after a read's, 6% a join. The brief's first form (the fact every
+  entry holds, kept through the header) reached none: the fact is keyed by the view, the view by
+  the array's word, and zlib's arrays are the asm.js module's mutable closure bindings, whose
+  values are heap facts the header dropped and the builder's prune dropped at every edge.
+- What can end the facts in a loop the prepass finds free of effects: nothing but the loop's own
+  stores. A header's poll runs no JavaScript on its slow path (it links finished compiles, reads
+  the interrupt state, which throws out, and may collect: the collector moves nothing and frees no
+  attached storage), and only builtins and host functions, which are effects, detach, transfer,
+  resize or borrow a buffer. The exemplars' interrupt checks alias nothing (Ion's InterruptCheck
+  has no alias set, JSC's CheckTraps writes InternalState only, TurboFan's loop stack check is
+  kNoWrite). F64Mod ends heap facts in the builder's model, so a loop with `%` keeps none.
+- Built: (P) prune keeps the facts of the words a heap fact gives back to a later read (a
+  binding's value, a global lexical's, a live object's field's); (A) a loop without effects and
+  without `%` keeps through its header the typed data addresses and the free names' heap facts
+  its entry edges agree on, but the values of the bindings its stores write (a static store
+  ends its slot's facts on every record; a store to a global is an effect), as Ion's LICM hoists
+  a load whose alias set no instruction of the loop stores (jit/LICM.cpp:154-172), the DFG's a
+  node that reads nothing the loop writes (dfg/DFGLICMPhase.cpp:404-409) and TurboFan's loop
+  state keeps what the loop's writes do not kill (compiler/load-elimination.cc:1370-1486); (B)
+  the builder makes the checks of each typed array such a loop accesses in line (the receiver's
+  word from a slot the loop does not write or a binding it does not store, the object, its
+  kind, its view, length and data address) once at the end of the loop's one entry edge's
+  predecessor, exiting at the header's pc with HoistingFailed, whose flag leaves them in the
+  loop, as step 0's moved checks; (C) a typed read whose block stores later to the same array
+  checks its data address for the store; (D) a loop's stored bindings include those the callees
+  inlined in it store (latent: today's planner inlines no callee that stores a binding).
+- Measured (fat LTO against main 6fb1b1e4, the tier on; my recount agrees): instructions at 5
+  fixed runs zlib -25.27% (60.95G -> 45.55G; P -7.3%, A -18.0%, B -24.6%, C -25.3% cumulatively),
+  Mandreel -1.88% (all P's: its loops hold calls), PdfJS -1.24%, GBEMU -0.87%, Earley-Boyer
+  -0.45%, Crypto -0.33%, Djot's steady state -0.31%, NavierStokes -0.28%; Richards +0.19% and
+  DeltaBlue +0.11%, compile work at 5 runs (their compiles' code is the same or smaller; cycles
+  at fixed work inside noise); Octane's geomean -2.25%. zlib's TypedData executions 666M -> 90M.
+  Octane's timed zlib on X925 cores alone, 10 rounds: +44.5% (every round +37.6 to +45.1%),
+  cycles a run -30.7%; cycles at fixed work on one core zlib -29.1%, Mandreel -1.4%, PdfJS -0.8%,
+  GBEMU -0.7%. The tier off equal (nothing outside the tier's modules changed).
+- zlib over the day, instructions at 5 fixed runs with the tier on: 103.95G at step 0, 88.70G
+  with the clobber set, 85.90G with the equality rule, 60.95G with rule U, 45.55G now (-56%).
+- Tests: 27 new (18 builder, 5 end to end, 4 at TRUST_JS_OPT_INLINE=graph): zero-trip loops
+  entered with a detached and with a shrunk buffer, a detach between loops and inside a loop
+  with calls, an interruption at the loop's poll, immutable buffers, an inlined callee's loop
+  keeping its caller's facts, a callee's store ending them; 25 mutations, each caught; the tier's
+  tests (329) in five configurations, the new ones under GC stress; difftest in five; zombie's
+  check, clippy, Windows' check and suite (2,833).
+- Open: Mandreel's arrays are global fields, whose facts a call ends (its loops hold calls: 80%
+  of its TypedData); zlib's remaining 90M (49M in loops with effects, 22M first accesses in two
+  effect-free loops the entry check does not reach, not investigated); Array element facts
+  (element words, used length) through loops without effects, which an append in the loop ends
+  (NavierStokes loads its element words 6.75M times): a smaller step of its own; the general
+  LICM of checks would build on B's source analysis.
