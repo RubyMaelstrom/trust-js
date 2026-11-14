@@ -3814,9 +3814,11 @@ fn typed_stores_keep_the_buffers_dirty_ranges_and_generation() {
     let version = engine.interp.array_buffer_version(&buf).expect("attached");
     eval(&mut engine, "set(t, 1, 7); set(t, 3, 8);");
     assert!(exits().is_empty());
+    // One range, the bytes 6 to 12.
+    let dirty: Vec<std::ops::Range<usize>> = std::iter::once(6..12).collect();
     assert_eq!(
         engine.interp.take_array_buffer_dirty_ranges(&buf),
-        Some(vec![6..12])
+        Some(dirty)
     );
     assert_eq!(engine.interp.array_buffer_version(&buf), Some(version + 2));
     assert_eq!(eval(&mut engine, "Array.from(t).join()"), "0,7,0,8,0,0,0,0");

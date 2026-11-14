@@ -804,7 +804,6 @@ struct Gen<'a> {
 
 impl<'a> Gen<'a> {
     #[allow(clippy::too_many_arguments)]
-    #[allow(clippy::too_many_arguments)]
     fn new(
         chunk: &'a FrozenChunk,
         graph: &'a Graph,
