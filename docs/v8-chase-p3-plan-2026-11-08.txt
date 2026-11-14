@@ -4262,3 +4262,69 @@ step0c-impl/report.txt's FOLLOWUP and followup/): the defect found beside loweri
   TRUST_JS_OPT_VERIFY=1, at splice and at graph: 42 runs, no graph refused by the verifier (the
   agent's; my own build of the landed tree: zlib at both settings, none, the function compiled).
   This sweep is now a rule for every step before its report.
+
+Stage 3 step 3a landed (six commits ending b5d38feb, 2026-11-14; target/p3/stage3/step3a-impl,
+report.txt and design-note.txt): an operation the tier does not lower is a generic node with
+explicit operands in the compiled function's frame (the owner's D6).
+- The node (NodeOp::Generic): its inputs are its popped operands and the values of the slots its
+  operation names whose frame words are stale; its outputs its pushes (Projection) and the slots
+  it writes (SlotResult). Nothing is flushed before it and nothing reloaded after it: a slot it
+  does not name keeps its value and its home across it, in a callee-saved register or a spill
+  slot, which the collector scans. Its lowering writes the operands to the canonical operand
+  words at its pc's depth and the stale named slots to their words, sets x20 and emits the
+  operation's baseline template unchanged. Joins and loop headers merge by phis, as Maglev's
+  merge points do; a slot is in the frame's keeping only after a canonical-frame effect.
+- What a node names is one list, liveness::slot_use, which the liveness, the builder, the
+  verifier and the back end all read: per operation the slots it reads and those it writes (an
+  update's, a materializing read's, a `for…in` step's index, an array binding's iterator and
+  next). Operations that may read any slot, and those whose helper runs the VM on a copy of the
+  operand stack (bytecode::jit_runs_on_vm_copy: the bridge operations but the scope, object
+  literal and Reference ones), stay canonical-frame effects (NodeOp::Effect) with the old flush
+  and reload. The audit of what templates and helpers read is proved by a switch,
+  TRUST_JS_OPT_POISON=1: the code writes a poison word into every stale frame word before each
+  generic node, and the whole library suite, difftest and the fixtures give the same results
+  under it.
+- A throw from a generic node at a pc with a handler exits by recipe (JSC's exception exit): the
+  handler's live slots and the stack below the handler's depth, each read from a home the call
+  preserves, where an effect wrote its whole state to the frame before every execution.
+- Step 0's rules now take every loop without a canonical-frame effect: an invariant is a value
+  live across the header in a slot the loop reads and does not write, and its checks move to the
+  entry edge across generic nodes too (a value's check does not depend on the heap); heap facts
+  still end at every generic node, and step 0c's kept facts need a loop with neither.
+- Bugs found on the way, each fixed with a test: an untagged phi taken for an invariant (PdfJS
+  crashed); the notes' block numbers stale after renumbering (four workloads refused by the
+  verifier); sibling loops sharing one note (NavierStokes +2.3% until each had its own); two
+  kinds' checks of one value moved together, one always failing.
+- Measured (fat LTO against 8a953ec1, the tier on; my recount and my timing agree with the
+  agent's): instructions at 5 fixed runs Crypto -7.9%, Mandreel -4.2%, React's steady state -3.4%,
+  NavierStokes -2.4%, PdfJS -1.8%, zlib -1.4%, RegExp -1.3%, GBEMU -1.2%, Box2D -0.85%, Djot's and
+  Vue's steady states -0.6% and -0.5%; Richards +0.59% and Earley-Boyer +0.52% (compile work, the
+  agent infers: the same compiles and exits), Splay and RayTrace +0.15 to +0.18%; Octane's
+  geomean -1.34%. The tier off equal. Executed flushes 206M -> 0, reloads 628M -> 0.6M, all
+  checks -25% (on an earlier base). Cycles at fixed work on an X925 core (my run): Crypto at 200
+  runs -8.3%, React's steady state -5.0%, Djot's -1.3%, Vue's -1.1%; Mandreel +0.7% with 4.2%
+  fewer instructions and zlib +0.14% with 1.4% fewer, Richards at 200 +0.4%. Mandreel's and
+  zlib's cycles are spill loads on their hot loops' dependency chains (the agent's PMU reading:
+  backend stalls +18% in Mandreel): a value live across a loop's calls has one home, a spill
+  slot, and is loaded at each use. Code bytes -0.8%; exit-table bytes +36% (recipes name more
+  slots).
+- Not landed: the in-block reload of a spilled value (0.1% on zlib and Mandreel for +2.3% of
+  Richards' compile work: it does not reach loop-carried spills); the removal of step 0b's
+  equality rule (step 0c and the lowerings read Rules::equality_lowers).
+- Tests: the builder's (no StoreSlot before and no FrameSlot after a generic node, a named
+  slot's input and output per family, phis at joins and headers, a canonical-frame effect still
+  flushing), the lowering's, throws with and without a handler, end to end under the poison; 26
+  mutations, each caught; the tier's modules (437) in the four configurations, at graph and
+  under the poison; the whole library suite (3,410) with the tier off, on, on with the poison
+  and on at graph; difftest and the fixtures in seven configurations; the verifier sweep (none
+  refused; mine on the landed tree: 42 runs, none); zombie's check, clippy, Windows' check and
+  suite (2,865).
+- Open: (1) the allocator: a loop-level reload of a spilled value (Maglev's HoistLoopReloads and
+  HoistLoopSpills, maglev-regalloc.cc:2240-2313), the next allocator step, for Mandreel's and
+  zlib's cycles; (2) a possible defect older than this step, being settled now: a canonical-frame
+  effect whose helper runs the VM on a copy of the operand stack copies operand words below its
+  own operands, which the tier's code has not written unless the pc has a handler; if a
+  collection runs during that step, the copy's stale words could be traced as values. Not
+  confirmed; with step 3a's agent, who is also to make the poison switch check for hidden
+  writers (a poisoned word changed after a node); (3) inlined frames' generic nodes (step 3c),
+  which lift E0; origins (3b); the exit tables' size.
