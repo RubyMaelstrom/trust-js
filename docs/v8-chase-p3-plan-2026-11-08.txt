@@ -4171,3 +4171,61 @@ facts that nothing in it can end, and checks the typed arrays it accesses once, 
   (element words, used length) through loops without effects, which an append in the loop ends
   (NavierStokes loads its element words 6.75M times): a smaller step of its own; the general
   LICM of checks would build on B's source analysis.
+
+Lowerings L2 landed (9 commits ending 64878bb6; the code is 7e3f51e8's; 2026-11-14; target/p3/
+stage3/stepL2-impl, report.txt and design-note.txt): named loads through the prototype chain are
+the tier's own nodes. The first piece of the separate lowering track to land (L1, equality and
+typeof, is in work).
+- The counts first (the effects probe at c822fbea, Octane at 5 fixed runs and the fixtures): 381.5M
+  effect executions, named loads 125.8M of them: one data way at depth 1 to 3 on a prototype
+  46.1M, generic sites 34.7M, String.prototype's methods 18.2M, a String's `length` 10.9M, several
+  walks or own ways at different slots 6.8M, accessors 4.3M, absences 2.5M, key-checked Array
+  holders 1.8M.
+- The checked walk: TRust's shapes say nothing of the prototype and its code is written once
+  with no dependencies, so a hit is the template's probe as nodes (jit.rs emit_baked): the
+  receiver's shape (CheckShape), then for each level the [[Prototype]] loaded from the level
+  below and checked non-null, of an ordinary kind, plain, and of the shape the way recorded
+  (CheckProto), then the holder's slot (LoadField). No holder's address or identity is in the
+  code. SpiderMonkey walks and guards the same where it cannot use a dependency (jit/CacheIR.cpp
+  891-909), JSC's poly-proto access too (bytecode/InlineCacheCompiler.cpp 1866-1915). Depth 1 to
+  3 (the template's limit), up to four receiver shapes sharing a walk; a string's method through
+  the realm's String.prototype read from the context (CheckStringProto); a polymorphic site as
+  Maglev's (one CheckShape of all receiver shapes, a ShapeIs test and an arm a walk, a phi).
+  Refused: accessors, absences, Array receivers and wrapper levels, the names `prototype` and
+  index names, a receiver shape that reaches two walks.
+- Facts: a level's link and shape and the holder's field are heap facts of the effect epoch
+  (no lowered node changes a shape or a [[Prototype]]: creation stores are effects; a lowered
+  store ends every field fact at its location). They do not cross a loop header.
+- Rules::lowers says so (named_load_lowers), so such loads no longer make their loops effectful
+  or their callees E0 declines (named-load declines at graph 32 -> 11; ways inlined 514 -> 531).
+- Measured (fat LTO against c822fbea, the tier on; my recount agrees): named-load effect
+  executions 125.4M -> 54.7M and all effect executions 380.0M -> 310.2M (-18.4%); instructions at
+  5 fixed runs DeltaBlue -5.99%, Djot's steady state -4.65% (its pass -2.7%), Crypto -4.35%,
+  TypeScript -4.2%, Richards -4.07%, Splay -1.5%, Box2D -1.37%, RayTrace -1.26%, GBEMU -1.13%,
+  PdfJS -1.07%, RegExp -0.95%, Vue -0.5%, nothing worse; Octane's geomean -1.75%. At 200 fixed
+  runs on an X925 core (my run): DeltaBlue -17.3% instructions and -20.3% cycles, Richards -12.4%
+  and -16.3%; Djot's steady state -3.5% cycles, Vue's -1.3%. Octane's timed scores on X925 cores
+  alone, 5 rounds: DeltaBlue +41.6%, Richards +24.9%, TypeScript +10.8%, RayTrace +2.9%. The
+  tier off: template code identical after normalization, counts equal. The tier's code bytes
+  -15%. Exits unchanged but PdfJS (+200 and one discard) and TypeScript (+175 WrongShape).
+- Tests: 30 new (12 builder, 16 end to end against the VM in ten configurations over every
+  change of a chain between two loads: a method redefined, deleted, shadowed on the receiver or
+  a level between, a prototype swapped, a dictionary holder, a Proxy in the chain, a receiver of
+  the same shape with another prototype, frozen and sealed objects, class chains; 2 at graph);
+  30 mutations: 24 caught, 6 masked by another check of the same walk (the kind and plain tests
+  behind the shape test, a field kept across an effect behind the link's own end); the tier's and
+  the JIT's modules in the four configurations; difftest; zombie's check, clippy, Windows' check
+  and suite (2,845).
+- Open: a String's `length` (10.9M, a small node); the generic sites (34.4M, mostly
+  TypeScript's megamorphic loads: the stub cache's probe as a node, with the generic node of step
+  3a); named stores and updates, now the next family (44.2M: SetPropThisDrop 18.1M, UpdateProp
+  14.7M, AppendProp 7.3M, SetPropLocalDrop 4.1M), whose creation stores change shapes and so end
+  the facts above. For the owner: folding a holder or a method's value into the code (V8's
+  stable maps and constant fields, JSC's watchpoints) needs the tier to consume dependencies and
+  code that can be invalidated, which TRust's written-once code does not have.
+- Found beside it (step 3a's agent, confirmed): since step 0c, zlib's fn(d,f,g,h) builds a graph
+  the verifier rejects (a HoistingFailed entry check in front of a bytecode loop head that gets
+  no back edge in the graph, by my reading), which release builds compile without verifying and
+  a debug build would panic on. The only such graph over Octane and the fixtures. With step 0c's
+  agent to confirm and fix; the agents' common rules now ask for a sweep of the workloads under
+  TRUST_JS_OPT_VERIFY=1 before any report.
