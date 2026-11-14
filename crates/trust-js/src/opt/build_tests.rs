@@ -677,15 +677,21 @@ fn polymorphic_loads_check_every_shape_that_shares_the_slot() {
         "{text}"
     );
     assert_eq!(count(&graph, is_effect), 0, "{text}");
-    // `x` in another slot of the second shape: the generic access.
+    // `x` in another slot of the second shape: a dispatch on the shape (P3 stage 3 step L2), one
+    // check of both and a test of one.
     let (chunk, graph) = graph_of(&mut engine, "other");
     let text = dump(&graph, &chunk);
-    assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
-        0,
+    assert!(
+        matches!(&nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)))[..],
+            [check] if matches!(&check.op, NodeOp::CheckShape(shapes) if shapes.len() == 2)),
         "{text}"
     );
-    assert_eq!(count(&graph, is_effect), 1, "{text}");
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::ShapeIs(_))),
+        1,
+        "{text}"
+    );
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
 }
 
 #[test]

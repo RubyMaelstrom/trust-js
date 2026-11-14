@@ -1092,12 +1092,23 @@ fn an_inlined_callees_exit_rebuilds_both_frames_and_flags_the_callees_first_stag
         "cx's code discarded ({discarded:?})"
     );
     assert!(ChunkProfile::get(&cx).map_or(0, ChunkProfile::discards) >= 1);
-    // cx inlining px again takes the inlined flag (E0 declines the way).
+    // cx inlining px again: the flag, px's inlined key, would decline its one-shape check, but
+    // its ways grew (the new shape filled one, at another slot), so the load is checked again,
+    // dispatching on the two shapes in px's frame (P3 stage 3 step L2: `Rules::poly_ways`), as a
+    // grown site's own check is (`stale_ways`).
     let again = Compile::new(&mut engine, "cx").build();
     assert!(
-        matches!(&outcomes(&again)[..], [(0, InlineOutcome::Declined { .. })]),
+        matches!(&outcomes(&again)[..], [(0, InlineOutcome::Inlined)]),
         "{:?}",
         again.inlines
+    );
+    assert!(
+        again
+            .graph
+            .nodes
+            .iter()
+            .any(|node| node.frame == FrameIx(1) && matches!(node.op, NodeOp::ShapeIs(_))),
+        "px's load dispatches"
     );
 }
 
