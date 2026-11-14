@@ -147,6 +147,10 @@ pub(crate) struct Allocation {
     pub(crate) caches: Vec<Cache>,
     /// Each block's caches, indices into `caches` (empty, or one list per block of the graph).
     pub(crate) block_caches: Vec<Vec<u16>>,
+    /// The read spans of spilled values (step R1, `read_spans`), by block and first read.
+    pub(crate) spans: Vec<Span>,
+    /// Each block's spans, indices into `spans` by first read (empty, or one list per block).
+    pub(crate) block_spans: Vec<Vec<u16>>,
     /// `live_at`'s index of the ranges, made at its first query.
     live_index: std::cell::OnceCell<LiveIndex>,
 }
@@ -164,6 +168,23 @@ pub(crate) struct Cache {
     pub(crate) header: BlockIx,
     /// The loop's hull: its header's head position to the last tail of its blocks.
     pub(crate) hull: (u32, u32),
+}
+
+/// A register that holds a copy of a spilled value over a run of its reads in one block with no
+/// call between them (P3 stage 3 step R1, `read_spans`): loaded before its first reading node,
+/// read by the nodes of the run, and nothing else's from its first read to its last. The value's
+/// spill slot stays its home.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Span {
+    /// The value, whose home is a spill slot.
+    pub(crate) value: NodeIx,
+    /// The register: `Home::Gp` or `Home::Fp`.
+    pub(crate) reg: Home,
+    /// The block of its reads.
+    pub(crate) block: BlockIx,
+    /// The positions of its first and its last reading node.
+    pub(crate) from: u32,
+    pub(crate) to: u32,
 }
 
 impl Allocation {
@@ -190,6 +211,15 @@ impl Allocation {
     /// The register that holds a copy of spilled value `v` in `block`, if a cache does.
     pub(crate) fn cache_of(&self, block: BlockIx, v: NodeIx) -> Option<Home> {
         self.caches_in(block).find(|c| c.value == v).map(|c| c.reg)
+    }
+
+    /// The read spans of `block` (step R1), by first read.
+    pub(crate) fn spans_in(&self, block: BlockIx) -> impl Iterator<Item = &Span> + '_ {
+        self.block_spans
+            .get(block.index())
+            .into_iter()
+            .flatten()
+            .map(|&k| &self.spans[k as usize])
     }
 
     /// Whether the edge from `from` into `to` is an edge of `to`'s loop, which enters the header
@@ -955,11 +985,10 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             homes[v] = Home::Const;
         }
     }
-    let (caches, block_caches) = loop_caches(
+    let copies = spill_copies(
         graph,
         file,
-        &order,
-        (&head, &tail),
+        (&order, &pos, &head, &tail),
         &homes,
         &ranges,
         &edges,
@@ -975,14 +1004,17 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         spill_bytes,
         callee_saved_gp: used_callee_gp,
         fp_callee_across_effect,
-        caches,
-        block_caches,
+        caches: copies.caches,
+        block_caches: copies.block_caches,
+        spans: copies.spans,
+        block_spans: copies.block_spans,
         live_index: std::cell::OnceCell::new(),
     };
     #[cfg(test)]
     {
         tests::assert_caches(graph, &alloc);
         TEST_CACHES.with(|made| made.set(made.get() + alloc.caches.len()));
+        TEST_SPANS.with(|made| made.set(made.get() + alloc.spans.len()));
     }
     Ok(alloc)
 }
@@ -991,6 +1023,8 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
 thread_local! {
     /// The loop caches the allocations on this thread made (step R1's end-to-end tests).
     pub(crate) static TEST_CACHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The read spans the allocations on this thread made.
+    pub(crate) static TEST_SPANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// 10^k for the static execution estimate of a block at loop depth k (B3's,
@@ -1126,28 +1160,15 @@ fn natural_loops(graph: &Graph, order: &[BlockIx], (head, tail): (&[u32], &[u32]
 fn loop_caches(
     graph: &Graph,
     file: &RegisterFile,
-    order: &[BlockIx],
-    (head, tail): (&[u32], &[u32]),
+    loops: &[Loop],
+    depth: &[u32],
     homes: &[Home],
-    ranges: &[(u32, u32)],
     edges: &EdgeInputs,
+    held: &[Vec<Vec<(u32, u32)>>; 2],
     used_callee_gp: &mut Vec<u8>,
     fp_callee_across_effect: &mut bool,
 ) -> (Vec<Cache>, Vec<Vec<u16>>) {
     let spilled = |v: NodeIx| matches!(homes[v.index()], Home::Spill(_));
-    if !homes.iter().any(|home| matches!(home, Home::Spill(_))) {
-        return (Vec::new(), Vec::new());
-    }
-    let loops = natural_loops(graph, order, (head, tail));
-    if loops.is_empty() {
-        return (Vec::new(), Vec::new());
-    }
-    let mut depth = vec![0u32; graph.blocks.len()];
-    for l in &loops {
-        for &b in &l.blocks {
-            depth[b.index()] += 1;
-        }
-    }
     // The candidates: (loop, value, weight), each read of a spilled value defined outside the
     // loop counting its block's frequency.
     let mut reads: Vec<(u32, u32, u64)> = Vec::new();
@@ -1191,18 +1212,6 @@ fn loop_caches(
             .then(loops[b.1 as usize].depth.cmp(&loops[a.1 as usize].depth))
             .then(a.2.cmp(&b.2))
     });
-    // Each register's ranges, by start (they do not overlap: one value a register at a time).
-    let mut held: [Vec<Vec<(u32, u32)>>; 2] = [vec![Vec::new(); 32], vec![Vec::new(); 32]];
-    for (v, home) in homes.iter().enumerate() {
-        match *home {
-            Home::Gp(r) => held[0][r as usize].push(ranges[v]),
-            Home::Fp(r) => held[1][r as usize].push(ranges[v]),
-            _ => {}
-        }
-    }
-    for list in held.iter_mut().flatten() {
-        list.sort_unstable();
-    }
     let mut caches: Vec<Cache> = Vec::new();
     let overlap = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
     for &(_, k, v) in &candidates {
@@ -1266,6 +1275,252 @@ fn loop_caches(
         }
     }
     (caches, block_caches)
+}
+
+/// The register copies of spilled values (P3 stage 3 step R1): loop caches, then read spans.
+#[derive(Default)]
+struct Copies {
+    caches: Vec<Cache>,
+    block_caches: Vec<Vec<u16>>,
+    spans: Vec<Span>,
+    block_spans: Vec<Vec<u16>>,
+}
+
+/// Add `range` to `list`, a register's ranges by start, which it does not overlap.
+fn hold(list: &mut Vec<(u32, u32)>, range: (u32, u32)) {
+    let at = list.partition_point(|&(start, _)| start < range.0);
+    list.insert(at, range);
+}
+
+/// Whether no range of `list` (a register's, by start, none overlapping another) overlaps
+/// `range`.
+fn free_over(list: &[(u32, u32)], range: (u32, u32)) -> bool {
+    let first = list.partition_point(|&(_, end)| end < range.0);
+    list.get(first).is_none_or(|&(start, _)| start > range.1)
+}
+
+/// The register copies of spilled values (`Copies`), only where some value spilled: the natural
+/// loops and each block's depth, each register's ranges, then the loop caches (`loop_caches`),
+/// whose hulls then hold their registers, then the read spans (`read_spans`).
+#[allow(clippy::too_many_arguments)]
+fn spill_copies(
+    graph: &Graph,
+    file: &RegisterFile,
+    (order, pos, head, tail): (&[BlockIx], &[u32], &[u32], &[u32]),
+    homes: &[Home],
+    ranges: &[(u32, u32)],
+    edges: &EdgeInputs,
+    used_callee_gp: &mut Vec<u8>,
+    fp_callee_across_effect: &mut bool,
+) -> Copies {
+    let mut copies = Copies::default();
+    if !homes.iter().any(|home| matches!(home, Home::Spill(_))) {
+        return copies;
+    }
+    let loops = natural_loops(graph, order, (head, tail));
+    let mut depth = vec![0u32; graph.blocks.len()];
+    for l in &loops {
+        for &b in &l.blocks {
+            depth[b.index()] += 1;
+        }
+    }
+    // Each register's ranges, by start (they do not overlap: one value a register at a time).
+    let mut held: [Vec<Vec<(u32, u32)>>; 2] = [vec![Vec::new(); 32], vec![Vec::new(); 32]];
+    for (v, home) in homes.iter().enumerate() {
+        match *home {
+            Home::Gp(r) => held[0][r as usize].push(ranges[v]),
+            Home::Fp(r) => held[1][r as usize].push(ranges[v]),
+            _ => {}
+        }
+    }
+    for list in held.iter_mut().flatten() {
+        list.sort_unstable();
+    }
+    if !loops.is_empty() {
+        (copies.caches, copies.block_caches) = loop_caches(
+            graph,
+            file,
+            &loops,
+            &depth,
+            homes,
+            edges,
+            &held,
+            used_callee_gp,
+            fp_callee_across_effect,
+        );
+        for c in &copies.caches {
+            match c.reg {
+                Home::Gp(r) => hold(&mut held[0][r as usize], c.hull),
+                Home::Fp(r) => hold(&mut held[1][r as usize], c.hull),
+                _ => {}
+            }
+        }
+    }
+    (copies.spans, copies.block_spans) = read_spans(
+        graph,
+        file,
+        (order, pos, head),
+        homes,
+        &depth,
+        (&copies.caches, &copies.block_caches),
+        &mut held,
+        used_callee_gp,
+    );
+    copies
+}
+
+/// Read spans of spilled values (P3 stage 3 step R1): within a block, the reads of a spilled
+/// value that no loop cache holds there, with no call between them (a call's own read ends a
+/// run), read one register, loaded before the first, where a register of its class is free from
+/// the first read to the last. Maglev's reload at a register use, kept while the register is free
+/// and until the next call (AssignArbitraryRegisterInput, maglev/maglev-regalloc.cc:1423-1490;
+/// SpillAndClearRegisters at a call, :1187, 1680-1683), within one-home allocation: the register
+/// is a copy over the run, never the value's home. Runs by the weight of the loads they save
+/// (Air's frequency-weighted cost); a run whose registers give out part way is cut there, its
+/// rest a run of its own. A caller-saved register, or a callee-saved one the prologue saves
+/// already (an x register a home or cache took): a span adds no save.
+#[allow(clippy::too_many_arguments)]
+fn read_spans(
+    graph: &Graph,
+    file: &RegisterFile,
+    (order, pos, head): (&[BlockIx], &[u32], &[u32]),
+    homes: &[Home],
+    depth: &[u32],
+    (caches, block_caches): (&[Cache], &[Vec<u16>]),
+    held: &mut [Vec<Vec<(u32, u32)>>; 2],
+    used_callee_gp: &[u8],
+) -> (Vec<Span>, Vec<Vec<u16>>) {
+    // (block, value, the calls before it in the block, position) of each read of a spilled value
+    // no loop cache holds there: a run is one block, value and call count.
+    let mut reads: Vec<(u32, u32, u32, u32)> = Vec::new();
+    for &b in order {
+        let cached = |v: NodeIx| {
+            block_caches
+                .get(b.index())
+                .is_some_and(|ks| ks.iter().any(|&k| caches[k as usize].value == v))
+        };
+        let mut calls = 0u32;
+        for &node in &graph.block(b).body {
+            let p = pos[node.index()];
+            for &input in &graph.node(node).inputs {
+                if matches!(homes[input.index()], Home::Spill(_)) && !cached(input) {
+                    reads.push((b.0, input.0, calls, p));
+                }
+            }
+            if graph.node(node).op.is_effectful() {
+                calls += 1;
+            }
+        }
+    }
+    if reads.len() < 2 {
+        return (Vec::new(), Vec::new());
+    }
+    reads.sort_unstable();
+    // (weight, first, end) of each run of two reads or more, as indices into `reads`.
+    let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+    let mut first = 0;
+    while first < reads.len() {
+        let key = |k: usize| (reads[k].0, reads[k].1, reads[k].2);
+        let mut end = first + 1;
+        while end < reads.len() && key(end) == key(first) {
+            end += 1;
+        }
+        if end - first >= 2 {
+            let frequency = FREQUENCY[(depth[reads[first].0 as usize] as usize).min(9)];
+            runs.push((
+                (end - first - 1) as u64 * frequency,
+                first as u32,
+                end as u32,
+            ));
+        }
+        first = end;
+    }
+    runs.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    // The registers a span may take, by class: caller-saved, then the callee-saved x registers
+    // the prologue saves already.
+    let gp_regs: Vec<u8> = file
+        .gp_caller
+        .iter()
+        .chain(file.gp_callee.iter().filter(|r| used_callee_gp.contains(r)))
+        .copied()
+        .collect();
+    let mut spans: Vec<Span> = Vec::new();
+    for &(_, first, end) in &runs {
+        let run = &reads[first as usize..end as usize];
+        let (block, v) = (BlockIx(run[0].0), NodeIx(run[0].1));
+        let Some(class) = class_of(graph.node(v).rep) else {
+            continue;
+        };
+        let (ci, regs): (usize, &[u8]) = match class {
+            Class::Gp => (0, &gp_regs),
+            Class::Fp => (1, file.fp_caller),
+        };
+        // The registers of the class free from position `p` to `q` in the block: no range in
+        // them overlaps, and no stub call of the block's nodes there clobbers them.
+        let body = &graph.block(block).body;
+        let base = head[block.index()] + 2;
+        let free = |held: &[Vec<Vec<(u32, u32)>>; 2], p: u32, q: u32| {
+            let clobbered = body[((p - base) / 2) as usize..=((q - base) / 2) as usize]
+                .iter()
+                .fold(0u64, |acc, &n| {
+                    let (gp, fp) = clobbers(&graph.node(n).op);
+                    acc | if ci == 0 { gp } else { fp }
+                });
+            regs.iter().fold(0u64, |mask, &r| {
+                if clobbered & (1 << r) == 0 && free_over(&held[ci][r as usize], (p, q)) {
+                    mask | (1 << r)
+                } else {
+                    mask
+                }
+            })
+        };
+        // Segments of the run, each the longest from its first read through which a register
+        // stays free, up to the definition of its last reading node's value (to + 1), so that the
+        // span's register is no home its readers write: a node may write its output before it
+        // reads all its inputs, and a cold path's restore would put the copy back over it.
+        let mut take = |held: &mut [Vec<Vec<(u32, u32)>>; 2], from: u32, to: u32, mask: u64| {
+            let r = regs
+                .iter()
+                .copied()
+                .find(|&r| mask & (1 << r) != 0)
+                .expect("a free register");
+            hold(&mut held[ci][r as usize], (from, to));
+            spans.push(Span {
+                value: v,
+                reg: if ci == 0 { Home::Gp(r) } else { Home::Fp(r) },
+                block,
+                from,
+                to,
+            });
+        };
+        let mut start = 0;
+        let mut mask = 0u64;
+        for k in 1..run.len() {
+            let step = free(held, run[k - 1].3, run[k].3 + 1);
+            let next = if k - 1 == start { step } else { mask & step };
+            if next != 0 {
+                mask = next;
+                continue;
+            }
+            if k - 1 > start {
+                take(held, run[start].3, run[k - 1].3, mask);
+            }
+            start = k;
+            mask = 0;
+        }
+        if run.len() - 1 > start {
+            take(held, run[start].3, run[run.len() - 1].3, mask);
+        }
+    }
+    if spans.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    spans.sort_unstable_by_key(|s| (s.block, s.from, s.value));
+    let mut block_spans: Vec<Vec<u16>> = vec![Vec::new(); graph.blocks.len()];
+    for (k, s) in spans.iter().enumerate() {
+        block_spans[s.block.index()].push(k as u16);
+    }
+    (spans, block_spans)
 }
 
 #[cfg(test)]
@@ -1432,6 +1687,92 @@ pub(crate) mod tests {
                 assert!(
                     alloc.fp_callee_across_effect,
                     "cache {k}'s d{r} across a call"
+                );
+            }
+        }
+        assert_spans(graph, alloc);
+    }
+
+    /// The read spans' rules (step R1): each span copies a spilled value of its register's class
+    /// over reads of it in its block, from its first reading node to its last; no call runs
+    /// before its last read; no node there clobbers its register; no value homed in the register
+    /// overlaps the span or the definition after its last read, no cache and no other span in it
+    /// overlaps the span; no loop cache of the value holds in
+    /// the block and no other span of the value overlaps; a callee-saved x register is one the
+    /// prologue saves.
+    pub(crate) fn assert_spans(graph: &Graph, alloc: &Allocation) {
+        let overlap = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
+        for (k, s) in alloc.spans.iter().enumerate() {
+            let v = s.value.index();
+            assert!(
+                matches!(alloc.homes[v], Home::Spill(_)),
+                "span {k} of value {v} in {:?}",
+                alloc.homes[v]
+            );
+            let r = match (s.reg, class_of(graph.nodes[v].rep)) {
+                (Home::Gp(r), Some(Class::Gp)) | (Home::Fp(r), Some(Class::Fp)) => r,
+                other => panic!("span {k} of value {v}: {other:?}"),
+            };
+            assert!(alloc.block_spans[s.block.index()].contains(&(k as u16)));
+            let body = &graph.blocks[s.block.index()].body;
+            let reads = |p: u32| {
+                body.iter().any(|&n| {
+                    alloc.pos[n.index()] == p && graph.nodes[n.index()].inputs.contains(&s.value)
+                })
+            };
+            assert!(
+                s.from <= s.to && reads(s.from) && reads(s.to),
+                "span {k}: {s:?}"
+            );
+            for &n in body {
+                let p = alloc.pos[n.index()];
+                if p < s.from || p > s.to {
+                    continue;
+                }
+                let op = &graph.nodes[n.index()].op;
+                assert!(
+                    !op.is_effectful() || p == s.to,
+                    "span {k} across node {n:?}'s call"
+                );
+                let (gp, fp) = clobbers(op);
+                let mask = if matches!(s.reg, Home::Gp(_)) { gp } else { fp };
+                assert_eq!(
+                    mask & (1 << r),
+                    0,
+                    "span {k} in {:?}, which {n:?} clobbers",
+                    s.reg
+                );
+            }
+            for (u, &home) in alloc.homes.iter().enumerate() {
+                if home == s.reg && alloc.pos[u] != u32::MAX {
+                    assert!(
+                        !overlap(alloc.ranges[u], (s.from, s.to + 1)),
+                        "span {k} in {:?} overlaps value {u} {:?}",
+                        s.reg,
+                        alloc.ranges[u]
+                    );
+                }
+            }
+            for c in &alloc.caches {
+                assert!(
+                    c.reg != s.reg || !overlap(c.hull, (s.from, s.to)),
+                    "span {k} in a cache's register"
+                );
+            }
+            assert!(
+                alloc.cache_of(s.block, s.value).is_none(),
+                "span {k} beside a loop cache of its value"
+            );
+            for (j, t) in alloc.spans.iter().enumerate() {
+                if j != k && overlap((t.from, t.to), (s.from, s.to)) {
+                    assert_ne!(t.reg, s.reg, "spans {k} and {j} share a register");
+                    assert_ne!(t.value, s.value, "spans {k} and {j} copy one value");
+                }
+            }
+            if matches!(s.reg, Home::Gp(_)) && ARM64.gp_callee.contains(&r) {
+                assert!(
+                    alloc.callee_saved_gp.contains(&r),
+                    "span {k}'s x{r} is not saved by the prologue"
                 );
             }
         }
@@ -2295,6 +2636,79 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_value_made_in_its_loops_header_and_spilled_after_the_loop_gets_no_cache() {
+        // vt is made in the header each iteration, read in the body and after the loop, where
+        // twenty-two words made from q push it out (its next use is the farthest): its home is
+        // a slot, and registers are free through the loop. A cache loaded at the header would
+        // hold the previous iteration's vt.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let body = g.add_block(2, false);
+        let exit = g.add_block(3, false);
+        g.entry = Some(entry);
+        g.add_edge(entry, header);
+        g.add_edge(header, body);
+        g.add_edge(header, exit);
+        g.add_edge(body, header);
+        let a = g.add_node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let q = g.add_node(header, NodeOp::Phi, &[a], Rep::Tagged, 1);
+        let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
+        let ps = state(&mut g, 1, &[]);
+        let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
+        g.node_mut(poll).state = Some(ps);
+        let same = g.add_node(header, NodeOp::TaggedSame, &[q, q], Rep::Bool, 1);
+        let vt = g.add_node(header, NodeOp::BoolToTagged, &[same], Rep::Tagged, 1);
+        let hundred = g.add_node(header, NodeOp::ConstI32(100), &[], Rep::I32, 1);
+        let lt = g.add_node(
+            header,
+            NodeOp::I32Cmp(Cond::Lt),
+            &[i, hundred],
+            Rep::Bool,
+            1,
+        );
+        g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: body,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            1,
+        );
+        let q2 = compare_each(&mut g, body, q, &[vt], 2);
+        let one = g.add_node(body, NodeOp::ConstI32(1), &[], Rep::I32, 2);
+        let i2 = g.add_node(body, NodeOp::I32Or, &[i, one], Rep::I32, 2);
+        g.add_node(body, NodeOp::Jump(header), &[], Rep::None, 2);
+        g.node_mut(q).inputs.push(q2);
+        g.node_mut(i).inputs.push(i2);
+        let words: Vec<NodeIx> = (0..22)
+            .map(|_| {
+                let same = g.add_node(exit, NodeOp::TaggedSame, &[q, q], Rep::Bool, 3);
+                g.add_node(exit, NodeOp::BoolToTagged, &[same], Rep::Tagged, 3)
+            })
+            .collect();
+        let acc = compare_each(&mut g, exit, words[0], &words[1..], 1);
+        let out = compare_each(&mut g, exit, acc, &[vt], 1);
+        g.add_node(exit, NodeOp::Return, &[out], Rep::None, 3);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            matches!(alloc.homes[vt.index()], Home::Spill(_)),
+            "{:?}",
+            alloc.homes[vt.index()]
+        );
+        assert!(
+            alloc.caches.iter().all(|c| c.value != vt),
+            "{:?}",
+            alloc.caches
+        );
+    }
+
+    #[test]
     fn a_stub_call_in_the_loop_keeps_caches_out_of_the_registers_it_clobbers() {
         // A TypedElement call in the body: ten words read after the loop and live across it take
         // x0-x8 and x10 (not its clobbers), so the caller-saved registers free through the loop
@@ -2326,6 +2740,151 @@ pub(crate) mod tests {
             matches!(cache.reg, Home::Gp(r) if gp & (1 << r) == 0),
             "{cache:?}"
         );
+    }
+
+    /// Straight-line reads of a spilled value (step R1's read spans): the entry defines 21 words
+    /// and then v, spilled at its definition (its next use is the farthest); the words die in a
+    /// chain, then `reads` builds on (the chain's word, v) and the result is returned.
+    fn straight(
+        reads: impl FnOnce(&mut Graph, BlockIx, NodeIx, NodeIx) -> NodeIx,
+    ) -> (Graph, NodeIx) {
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        g.entry = Some(entry);
+        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
+        let v = word(&mut g);
+        let mut acc = words[0];
+        for &w in &words[1..] {
+            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
+            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
+        }
+        let out = reads(&mut g, entry, acc, v);
+        g.add_node(entry, NodeOp::Return, &[out], Rep::None, 1);
+        (g, v)
+    }
+
+    fn effect(g: &mut Graph, b: BlockIx, keep: NodeIx) {
+        let s = state(g, 1, &[keep]);
+        let call = g.add_node(
+            b,
+            NodeOp::Effect {
+                pc: 1,
+                pops: 0,
+                pushes: 0,
+            },
+            &[],
+            Rep::None,
+            1,
+        );
+        g.node_mut(call).state = Some(s);
+    }
+
+    #[test]
+    fn a_spilled_values_reads_with_no_call_between_share_one_loaded_register() {
+        // Three reads of v after the chain: one span from the first to the last, in a
+        // caller-saved register.
+        let (g, v) = straight(|g, b, acc, v| compare_each(g, b, acc, &[v], 3));
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let readers: Vec<u32> = g
+            .block(g.entry.unwrap())
+            .body
+            .iter()
+            .filter(|&&n| g.node(n).inputs.contains(&v))
+            .map(|&n| alloc.pos[n.index()])
+            .collect();
+        assert_eq!(readers.len(), 3);
+        let [span] = alloc.spans[..] else {
+            panic!("{:?}", alloc.spans)
+        };
+        assert_eq!(
+            (span.value, span.from, span.to),
+            (v, readers[0], readers[2])
+        );
+        assert!(
+            matches!(span.reg, Home::Gp(r) if ARM64.gp_caller.contains(&r)),
+            "{span:?}"
+        );
+    }
+
+    #[test]
+    fn a_call_between_a_spilled_values_reads_ends_their_span() {
+        // Two reads, a call, two reads: a span on each side, none across the call.
+        let (g, v) = straight(|g, b, acc, v| {
+            let acc = compare_each(g, b, acc, &[v], 2);
+            effect(g, b, acc);
+            compare_each(g, b, acc, &[v], 2)
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let call = g
+            .block(g.entry.unwrap())
+            .body
+            .iter()
+            .find(|&&n| g.node(n).op.is_effectful())
+            .map(|&n| alloc.pos[n.index()])
+            .unwrap();
+        assert_eq!(alloc.spans.len(), 2, "{:?}", alloc.spans);
+        assert!(
+            alloc.spans.iter().all(|s| s.to < call || s.from > call),
+            "{:?}",
+            alloc.spans
+        );
+        // One read on each side: no span.
+        let (g, _) = straight(|g, b, acc, v| {
+            let acc = compare_each(g, b, acc, &[v], 1);
+            effect(g, b, acc);
+            compare_each(g, b, acc, &[v], 1)
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(alloc.spans.is_empty(), "{:?}", alloc.spans);
+    }
+
+    #[test]
+    fn a_stub_call_between_a_spilled_values_reads_keeps_their_span_out_of_its_clobbers() {
+        // A TypedElement call between the reads, with ten words read after it holding x0-x8 and
+        // x10: the caller-saved registers left are its clobbers, which the span may not take.
+        let (g, v) = straight(|g, b, acc, v| {
+            let kept: Vec<NodeIx> = (0..10)
+                .map(|_| g.add_node(b, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0))
+                .collect();
+            let acc = compare_each(g, b, acc, &[v], 2);
+            let s = state(g, 1, &[]);
+            let cell = g.add_node(b, NodeOp::CheckObject, &[acc], Rep::Cell, 1);
+            g.node_mut(cell).state = Some(s);
+            let zero = g.add_node(b, NodeOp::ConstI32(0), &[], Rep::I32, 1);
+            let te = g.add_node(
+                b,
+                NodeOp::TypedElement { write: false },
+                &[cell, zero],
+                Rep::Tagged,
+                1,
+            );
+            g.node_mut(te).state = Some(s);
+            let acc = compare_each(g, b, te, &[v], 2);
+            compare_each(g, b, acc, &kept, 1)
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let (gp, _) = clobbers(&NodeOp::TypedElement { write: false });
+        assert!(!alloc.spans.is_empty());
+        let te = g
+            .block(g.entry.unwrap())
+            .body
+            .iter()
+            .find(|&&n| matches!(g.node(n).op, NodeOp::TypedElement { .. }))
+            .map(|&n| alloc.pos[n.index()])
+            .unwrap();
+        for s in &alloc.spans {
+            if s.from <= te && te <= s.to {
+                assert!(matches!(s.reg, Home::Gp(r) if gp & (1 << r) == 0), "{s:?}");
+            }
+        }
     }
 
     #[test]

@@ -1007,6 +1007,11 @@ struct Gen<'a> {
     /// Each loop header with caches: the label after their loads, which its loop's own edges
     /// take.
     after_loads: Vec<Option<usize>>,
+    /// The position of the node being emitted, and the read spans of its block (step R1), the
+    /// next to load first.
+    cur_pos: u32,
+    cur_spans: Vec<regalloc::Span>,
+    next_span: usize,
 }
 
 /// What an inlined frame's generic node switched of the context (P3 stage 3 step 3c), which its
@@ -1102,6 +1107,9 @@ impl<'a> Gen<'a> {
             save_area: None,
             cur_block: None,
             after_loads,
+            cur_pos: u32::MAX,
+            cur_spans: Vec::new(),
+            next_span: 0,
         }
     }
 
@@ -1122,7 +1130,11 @@ impl<'a> Gen<'a> {
             self.last_effect = None;
             self.load_caches(b);
             self.cur_block = Some(b);
+            self.cur_spans = self.alloc.spans_in(b).copied().collect();
+            self.next_span = 0;
             for &n in &self.graph.block(b).body {
+                self.cur_pos = self.alloc.pos[n.index()];
+                self.load_spans();
                 self.lower(n, b, next)?;
             }
         }
@@ -1468,7 +1480,32 @@ impl Gen<'_> {
         if !matches!(self.home(v), Home::Spill(_)) {
             return None;
         }
-        self.alloc.cache_of(self.cur_block?, v)
+        let at = self.cur_pos;
+        self.alloc.cache_of(self.cur_block?, v).or_else(|| {
+            self.cur_spans
+                .iter()
+                .find(|s| s.value == v && s.from <= at && at <= s.to)
+                .map(|s| s.reg)
+        })
+    }
+
+    /// The loads of the read spans whose first read is the node at `cur_pos` (step R1,
+    /// `regalloc::read_spans`), from their values' slots, before the node.
+    fn load_spans(&mut self) {
+        while let Some(&span) = self.cur_spans.get(self.next_span) {
+            if span.from != self.cur_pos {
+                break;
+            }
+            self.next_span += 1;
+            let Home::Spill(offset) = self.home(span.value) else {
+                unreachable!("a span copies a spilled value")
+            };
+            match span.reg {
+                Home::Gp(r) => self.a.ldr_imm(u32::from(r), 31, offset),
+                Home::Fp(r) => self.a.ldr_d_imm(u32::from(r), 31, offset),
+                _ => unreachable!("a span is a register"),
+            }
+        }
     }
 
     /// The loads of a loop header's caches from their values' slots, then the label its loop's
@@ -3645,6 +3682,7 @@ impl Gen<'_> {
     fn emit_cold(&mut self) -> Result<(), Refusal> {
         // Out-of-line code reads spilled values from their slots, an edge's moves aside.
         self.cur_block = None;
+        self.cur_spans.clear();
         // Until none is left: a cold path may itself push one (a boxed f64's NaN case).
         loop {
             let cold = std::mem::take(&mut self.cold);
@@ -3985,9 +4023,17 @@ impl Gen<'_> {
     /// them with the live values. A callee-saved cache needs nothing.
     fn caller_saved_caches(&self, node: NodeIx) -> Vec<(bool, u32)> {
         let file = &regalloc::ARM64;
+        let (block, at) = (self.graph.node(node).block, self.alloc.pos[node.index()]);
+        let spans = self
+            .alloc
+            .spans_in(block)
+            .filter(|s| s.from <= at && at <= s.to)
+            .map(|s| s.reg);
         self.alloc
-            .caches_in(self.graph.node(node).block)
-            .filter_map(|c| match c.reg {
+            .caches_in(block)
+            .map(|c| c.reg)
+            .chain(spans)
+            .filter_map(|reg| match reg {
                 Home::Gp(r) if file.gp_caller.contains(&r) => Some((false, u32::from(r))),
                 Home::Fp(r) if file.fp_caller.contains(&r) => Some((true, u32::from(r))),
                 _ => None,

@@ -4824,9 +4824,33 @@ fn a_polls_slow_path_keeps_a_caller_saved_loop_cache() {
     // Every poll takes its slow path (the poll word set by hand), whose call clobbers the
     // caller-saved registers: it saves and restores the cache with the live values. Under
     // collections at every allocation a collection runs in it.
+    use crate::opt::regalloc::{allocate, Home, ARM64};
     let (graph, _) = inv_graph();
+    let alloc = allocate(&graph, &ARM64).unwrap();
     let mut engine = fixture(INV);
-    install(&mut engine, "inv", &graph, Options::default());
+    let code = install(&mut engine, "inv", &graph, Options::default());
+    // The slow path's save stores each caller-saved cache register on the stack, where nothing
+    // else of this code stores it.
+    let words = code_words(&code);
+    let caller: Vec<u8> = alloc
+        .caches
+        .iter()
+        .filter_map(|c| match c.reg {
+            Home::Gp(r) if ARM64.gp_caller.contains(&r) => Some(r),
+            _ => None,
+        })
+        .collect();
+    assert!(!caller.is_empty(), "{:?}", alloc.caches);
+    for r in caller {
+        assert!(
+            holds(
+                &words,
+                encode(|a| a.str_imm(u32::from(r), 31, 0)),
+                0xFFC0_03FF
+            ),
+            "x{r} is not saved"
+        );
+    }
     exits();
     stress(&engine);
     engine.interp.poll.set_heap_due(true);
@@ -4834,4 +4858,151 @@ fn a_polls_slow_path_keeps_a_caller_saved_loop_cache() {
     assert_eq!(eval(&mut engine, "inv(500, -11)"), "-5500");
     engine.interp.poll.set_heap_due(false);
     assert!(exits().is_empty());
+}
+
+/// `add(a, b)`'s chunk (the Add at pc 2 on [a, b]) under a hand-made graph of read spans (step
+/// R1): b's int32 y, z = y * y, then twenty-one int32s made from y, which fill the x registers and
+/// push out the values whose next use is the farthest, a's word and z (spilled at their
+/// definitions); a chain reads the twenty-one into 0; then t1 = 0 + z, t2 = t1 + z, ToBoolean(a)
+/// (a BigInt's takes its out-of-line call), t3 = t2 + z: z's three reads in one span; a true a
+/// returns t3, a false one t2. Returns z.
+fn spans_graph() -> (Graph, NodeIx) {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let yes = b.block(3, false);
+    let no = b.block(3, false);
+    b.edge(entry, yes);
+    b.edge(entry, no);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at_add = b.state(2, &[x, y], &[], &[]);
+    let fy = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[y],
+        Rep::F64,
+        2,
+        at_add,
+        ExitReason::NotNumber,
+    );
+    let iy = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[fy],
+        Rep::I32,
+        2,
+        at_add,
+        ExitReason::NotInt32,
+    );
+    let z = b.exiting(
+        entry,
+        NodeOp::I32Mul,
+        &[iy, iy],
+        Rep::I32,
+        2,
+        at_add,
+        ExitReason::Overflow,
+    );
+    let words: Vec<NodeIx> = (0..21)
+        .map(|k| {
+            let c = b.node(entry, NodeOp::ConstI32(k), &[], Rep::I32, 2);
+            b.node(entry, NodeOp::I32Or, &[iy, c], Rep::I32, 2)
+        })
+        .collect();
+    let mut acc = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 2);
+    for &w in &words {
+        let zero = b.node(entry, NodeOp::I32Xor, &[w, w], Rep::I32, 2);
+        acc = b.node(entry, NodeOp::I32Or, &[acc, zero], Rep::I32, 2);
+    }
+    let t1 = b.exiting(
+        entry,
+        NodeOp::I32Add,
+        &[acc, z],
+        Rep::I32,
+        2,
+        at_add,
+        ExitReason::Overflow,
+    );
+    let t2 = b.exiting(
+        entry,
+        NodeOp::I32Add,
+        &[t1, z],
+        Rep::I32,
+        2,
+        at_add,
+        ExitReason::Overflow,
+    );
+    let truthy = b.node(entry, NodeOp::ToBoolean, &[x], Rep::Bool, 2);
+    let t3 = b.exiting(
+        entry,
+        NodeOp::I32Add,
+        &[t2, z],
+        Rep::I32,
+        2,
+        at_add,
+        ExitReason::Overflow,
+    );
+    b.node(
+        entry,
+        NodeOp::Branch {
+            then_block: yes,
+            else_block: no,
+        },
+        &[truthy],
+        Rep::None,
+        2,
+    );
+    for (block, value) in [(yes, t3), (no, t2)] {
+        let boxed = b.node(block, NodeOp::I32ToTagged, &[value], Rep::Tagged, 3);
+        b.node(block, NodeOp::Return, &[boxed], Rep::None, 3);
+    }
+    (b.g, z)
+}
+
+#[test]
+fn a_spilled_values_reads_in_a_block_share_a_span_kept_across_a_slow_call() {
+    use crate::opt::regalloc::{allocate, Home, ARM64};
+    let (graph, z) = spans_graph();
+    let alloc = allocate(&graph, &ARM64).unwrap();
+    crate::opt::regalloc::tests::assert_consistent(&graph, &alloc);
+    let Home::Spill(offset) = alloc.homes[z.index()] else {
+        panic!("z in {:?}", alloc.homes[z.index()])
+    };
+    let span = *alloc.spans.iter().find(|s| s.value == z).expect("z's span");
+    let Home::Gp(r) = span.reg else {
+        panic!("{span:?}")
+    };
+    assert!(ARM64.gp_caller.contains(&r), "x{r}");
+    let mut engine = fixture(ADD);
+    let code = install(&mut engine, "add", &graph, Options::default());
+    exits();
+    // A BigInt's ToBoolean calls out between z's reads, which clobbers the caller-saved
+    // registers: the span's register is saved and restored around the call.
+    assert_eq!(eval(&mut engine, "add(10n, 3)"), "27");
+    assert_eq!(eval(&mut engine, "add(0n, 3)"), "18");
+    assert_eq!(eval(&mut engine, "add(1, 4)"), "48");
+    assert_eq!(eval(&mut engine, "add(0, 4)"), "32");
+    assert!(exits().is_empty());
+    // The span's one load of z's slot, and none into a scratch register; the slow call's save
+    // stores the span's register, where nothing else of this code stores it.
+    let words = code_words(&code);
+    assert!(
+        holds(
+            &words,
+            encode(|a| a.str_imm(u32::from(r), 31, 0)),
+            0xFFC0_03FF
+        ),
+        "x{r} is not saved"
+    );
+    assert!(words.contains(&encode(|a| a.ldr_imm(u32::from(r), 31, offset))));
+    for scratch in [X9, X16, X17, X30] {
+        let use_load = encode(|a| a.ldr_imm(scratch, 31, offset));
+        assert!(
+            !words.contains(&use_load),
+            "a read loads z's slot into x{scratch}"
+        );
+    }
+    // An exit after the span's first read: the VM's Add from the frame's words.
+    assert_eq!(eval(&mut engine, "add(1, 2.5)"), "3.5");
+    assert_eq!(exits(), vec![(2, ExitReason::NotInt32)]);
 }

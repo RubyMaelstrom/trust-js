@@ -97,6 +97,29 @@ const INLINED: &str = "function st(s, k) { return (s * 31 + k) & 0xfffff; }\n\
      let t = 0; for (let k = 0; k < 300; k++) t = (t + outer(10, k)) % 1000003;\n\
      t + ':' + outer(4, 2.5)";
 
+/// Fourteen int32s live across the loop's two calls and read several times between them in one
+/// block: no loop cache (every callee-saved register holds a value across the calls), read spans.
+const BETWEEN: &str = "function st(s, k) { return (s * 31 + k) & 0xfffff; }\n\
+     function st2(s, k) { return (s ^ (k * 7)) & 0xfffff; }\n\
+     const fs = [st, st2];\n\
+     function between(n, a, b) { \
+       let a1 = (a * 3) & 0xfff, a2 = (a1 ^ b) & 0xfff, a3 = (a2 + 5) & 0xfff, \
+         a4 = (a3 - 2) & 0xfff, a5 = (a4 * 7) & 0xfff, a6 = (a5 ^ a) & 0xfff, \
+         a7 = (a6 + b) & 0xfff, a8 = (a7 >> 1) & 0xfff, a9 = (a8 + 11) & 0xfff, \
+         a10 = (a9 ^ 3) & 0xfff, a11 = (a10 + 9) & 0xfff, a12 = (a11 * 5) & 0xfff, \
+         a13 = (a12 ^ a1) & 0xfff, a14 = (a13 + a2) & 0xfff; \
+       let s = 0; \
+       for (let i = 0; i < n; i++) { \
+         s = fs[i & 1](s, i); \
+         s = (s + (a1 ^ a2) + (a1 & a3) + (a1 | a4) + (a2 ^ a5) + (a2 & a6) + (a3 | a7) \
+           + (a3 ^ a8) + (a4 & a9) + (a4 | a10) + (a5 ^ a11) + (a6 & a12) + (a7 | a13) \
+           + (a8 ^ a14) + (a9 & a1) + (a10 | a2) + (a11 ^ a3) + (a12 & a4) + (a13 | a5) \
+           + (a14 ^ a6)) & 0xfffff; \
+         s = fs[(i + 1) & 1](s, a1 & 7); } \
+       return s + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14; }\n\
+     let t = 0; for (let k = 0; k < 400; k++) t = (t + between(10, k, k * 3)) % 1000003;\n\
+     t + ':' + between(5, 2.5, 1) + ':' + between(3, 1e9, 2)";
+
 fn configurations() -> Vec<(&'static str, TestSwitches)> {
     let on = TestSwitches {
         on: true,
@@ -146,6 +169,19 @@ fn equal_with_caches(program: &str, cached: &str) {
         assert!(!compiled().is_empty(), "{label}: the tier compiled");
         if label == cached {
             assert!(made > 0, "{label}: the allocations made loop caches");
+        }
+    }
+}
+
+#[test]
+fn values_read_several_times_between_a_loops_calls_read_one_register_each_run() {
+    let expected = run(Tier::Bytecode, BETWEEN);
+    for (label, switches) in configurations() {
+        crate::opt::regalloc::TEST_SPANS.with(|made| made.set(0));
+        assert_eq!(with_switches(switches, BETWEEN), expected, "{label}");
+        let made = crate::opt::regalloc::TEST_SPANS.with(|made| made.replace(0));
+        if label == "eager" {
+            assert!(made > 0, "eager: the allocations made read spans");
         }
     }
 }
