@@ -4096,6 +4096,18 @@ after normalization (1,339 of 1,339 compiles) and the tier off's template code i
   configurations with GC stress; 26 mutations, each caught; the tier's tests (308) in the four
   configurations at splice and at graph; difftest with a corpus of inlining shapes; zombie's
   check, clippy, Windows' check and suite (2,822).
+- On the landed tree (target/p3/stage3/step2-review): at the default, the tier off, on, eager and
+  eager with forced exits, the library suite 3,335 passed and none failed in each, difftest 138
+  agree, the fixtures' outputs the tier off's. With TRUST_JS_OPT_INLINE=graph over the whole
+  library suite, which the step had run at graph for the tier's modules only: difftest and the
+  fixtures as at the default, and 21 library tests failing, each a test of a splice's second
+  stage outside the tier's modules expecting one where graph compiles in place (callee pickup,
+  the transformed sites' records, the inline contexts, getter and setter splices), none a wrong
+  result; pinned to the splice in e7ee40b8, as the tier's own such tests were, after which their
+  75 tests pass at graph in the four configurations. Before the default flips (step 4), the
+  subjects those tests hold for splices need their counterparts at graph where the tier's tests
+  have none yet: a callee of another realm, a callee that outlives its last reference, a
+  callee's string constants.
 
 Stage 3 step 0c landed (449fa24d, f7547b2f, 30d63461, ad490cc6, 5b4afc77, 2026-11-14; target/p3/
 stage3/step0c-impl, report.txt and design-note.txt): a loop without effects keeps its entry's heap
@@ -4145,7 +4157,14 @@ facts that nothing in it can end, and checks the typed arrays it accesses once, 
   with calls, an interruption at the loop's poll, immutable buffers, an inlined callee's loop
   keeping its caller's facts, a callee's store ending them; 25 mutations, each caught; the tier's
   tests (329) in five configurations, the new ones under GC stress; difftest in five; zombie's
-  check, clippy, Windows' check and suite (2,833).
+  check, clippy, Windows' check and suite (2,833). On the landed tree (target/p3/stage3/
+  step0c-review), the tier off, on, eager and eager with forced exits: the library suite 3,355
+  passed in each but one test with the tier on, difftest 138 agree, the fixtures' outputs the tier
+  off's; at graph the same 21 splice tests as step 2's tree and no other. The one test, the
+  scoped native's signature test, counts the template JIT's call-hit completions and fails where
+  the tier's code lands mid-count (31 of 32): 1 or 2 runs of 12 on the trees of steps 0b, 1 and
+  rule U, 6 of 12 on step 2's, 8 of 12 on this one; pinned to the tier off, the pipeline it
+  tests (b85f0029), it passes 12 of 12.
 - Open: Mandreel's arrays are global fields, whose facts a call ends (its loops hold calls: 80%
   of its TypedData); zlib's remaining 90M (49M in loops with effects, 22M first accesses in two
   effect-free loops the entry check does not reach, not investigated); Array element facts
