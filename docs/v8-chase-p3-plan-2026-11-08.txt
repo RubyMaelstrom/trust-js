@@ -3658,3 +3658,66 @@ The combined tree (main, the retention fix and these fixes, 7 h 45 min): every s
 retention fix's own test, a small splay tree's live data, with the tier on: a stale operand word
 above an active record's live top, inside the extent the fix scans; the retention fix is finishing
 with records scanned up to their live top (SpiderMonkey's form) before it lands.
+
+Stage 2's exit (2026-11-14; the session target/p3/stage2/session-2cpu-p3s2-87b38dea, report.txt;
+main 87b38dea; BASE p3s1-06e68cf0, stage 1's exit build, as the tier-off base; coverage
+target/p3/stage2/coverage-p3s2-87b38dea.log).
+Stage 2 landed steps 1-17 and 15b (coverage: elements, allocation in line, closures, strings,
+natives, exceptions by exit, the exit profile and reoptimization; compiles off the main thread; the
+loop limit; first stages compiled in place; Maglev's splice rule and polymorphic method calls; the
+snapshot and hand-off in the exemplars' shape; stubs made on the compile thread), the shell
+allocator's spans, the collector's huge pages with honest discards, the tier's bitwise truncation of
+oddballs, the small callees' calls, and the exit gates' fixes.
+- The session (2026-11-13 23:09 to 01:26): every engine and reference on CPUs 5 and 6, run a phase
+  at a time by a launcher (target/p3/stage2/session-launch/run-p3s2-87b38dea-d.sh, loadwatch.py). A
+  phase starts once the whole machine has stayed under 3 busy cores for a minute with the agents
+  held; the load is logged every 5 s, and a phase with more than a tenth of its samples over 7 busy
+  cores is set aside and run again. The build's first session (2026-11-13 06:31) ran beside 18-19
+  busy cores of other work on the machine and is void (session-2cpu-p3s2-87b38dea-void). In this one
+  Octane's first run met 20 busy cores in 30% of its samples and was set aside
+  (engine.jsonl.disturbed-octane-1); every kept phase ran with the machine at 0.7-1.9 busy cores
+  (medians, the session's own engine included; 4.5 at most). 0 capped seconds in every phase, the
+  delivered clock 1.367-1.370 GHz before and after each.
+- The bars:
+  - coverage at least 80%: met, 94.3% of 24,038 second-stage samples (82.9% at 7f92ab9d): Vue 90.3%,
+    React 100%, Djot 96.3%, their steady-state copies 85.6%, 99.2% and 97.9%, Octane 95.1% (81.8%;
+    its samples in second-stage template code 14.2% -> 2.9%);
+  - no fixture, Octane benchmark or call microbenchmark more than 2% slower with the tier on than
+    off: met. The measured passes Vue -12.11%, React +0.20%, Djot -12.95%; the steady states
+    -12.56%, -2.38%, -16.76%; every Octane benchmark faster (the least SplayLatency -1.70%, CodeLoad
+    -2.13%, Splay -3.69%, RegExp -4.05%); the calls within 2%, the slowest constructor +1.57% and
+    array-push-pop +1.41% (+2.21% and +1.19% at d16a14db; direct-call +1.22% -> -2.59%,
+    arguments-object +1.76% -> -0.31%, rest-params +1.70% -> -0.39%: the small callees' calls);
+  - Octane's geomean faster: met, +33.89% (6,100 against 4,556; +32.37% at d16a14db);
+  - the main-thread compile time at most 3% of each fixture's measured pass: Vue 0.54% (0.967 ms),
+    React 0.63% (0.186 ms), Djot 3.05% (1.960 ms: recompile 1.303, snapshot 0.574, install 0.081;
+    the phase's two earlier runs 2.96% and 3.01%, kept as log.disturbed-1 and -2: the 2 s phase is
+    shorter than the load log's interval); Djot's carried to stage 3 by the owner (its graph
+    inlining removes the bytecode recompile).
+- ARES-6 and Web Tooling (one run each), the tier on against off: ARES-6's summary -26.32% (162.68
+  ms against 220.78; the steady states Air -68.1%, Babylon -31.7%, ML -11.6%, Basic -0.9%; Basic's
+  first iteration +1.2%); Web Tooling's geomean 1.87 runs/s against 1.57 (+19.1%), every tool faster
+  (the least coffeescript, +2.0%). The report's "OUTPUT DIGESTS DIFFER" on both is the collector's
+  log: bench.py runs the two with TRUST_JS_GC_LOG=1 and its digest kept the log's "[gc] live="
+  lines; without them the three engines' outputs and Node's are equal (bench.py's mask now drops
+  them).
+- Against node-mg on the same CPUs: the measured passes Vue 3.80x, React 3.00x, Djot 2.65x; the
+  steady states 3.93x, 3.39x, 4.04x; ARES-6 7.36x; Web Tooling 5.70x; Octane's geomean over the 15
+  benchmarks Node runs 3.99x (the tier off 5.45x). Node is v24.22.3 in this session (v24.22.2 at
+  d16a14db's) and its Splay and SplayLatency read 80% and 76% higher (12,753 and 7,691 against 7,102
+  and 4,344); over the other 13 benchmarks 4.64x against d16a14db's 4.74x.
+- The tier on against d16a14db's session: Octane's score +1.7%; Splay +9.2%, TypeScript +5.8%,
+  SplayLatency +4.3% (the tier off +7.2%, +3.5%, +2.2%: the collector's huge pages back, with honest
+  discards), Box2D +3.0%, EarleyBoyer +2.3%, the rest within 1%. Peak RSS with the tier on against
+  off: Vue 29.4 MiB against 25.4, React 20.8 against 18.6, Djot 35.2 against 34.3.
+- The tier off against stage 1's exit build: Octane's score -0.7% (4,556 against 4,589), every
+  benchmark within 1.4% but Box2D, -3.9% (4,006 against 4,169, in one session; be6b5ee2's build read
+  4,129 in its own session and 3,966 as the next one's base, so a session moves it as far: to be
+  read with fixed runs before it is called a cost); the fixtures' measured passes -0.9%, -1.2%,
+  -0.3% (stage 1's build prints whole milliseconds).
+- Carried and open: Djot's compile bar (stage 3); the retention fix (records scanned to their live
+  top, JSC's stack sanitizing: reviewed, zombie's checks and suite pass at d89a5175, its gate
+  running); the process-wide call-cache epoch in a process of several engines; removing the
+  entry-word compare (designed); rule U's record filling; Crypto's am3 out-of-bounds recompile; the
+  73% of effects the tier does not lower yet (stage 3's step 3); the tier's own code in the holey
+  loop (+2% instructions); the tier off's Box2D reading above.
