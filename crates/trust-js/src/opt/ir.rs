@@ -259,6 +259,10 @@ pub(crate) enum ExitReason {
     PhiNotNumber,
     /// A Number entering a loop's I32 phi is no exact int32 (CheckedFloat64ToInt32 there).
     PhiNotInt32,
+    /// A check of a loop invariant moved to the loop's entry edge failed there (P3 stage 3 step
+    /// 0; JSC's HoistingFailed exit kind, Ion's LICM bailout kind): a flag at the header leaves
+    /// the invariants' checks in the loop.
+    HoistingFailed,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }

@@ -4208,6 +4208,30 @@ fn checks_of(graph: &Graph, input: NodeIx, which: impl Fn(&NodeOp) -> bool) -> V
         .collect()
 }
 
+/// The entry check `check` moved to its loop's entry: at the end of `entry`, HoistingFailed,
+/// exiting at the header's pc with the slots `kept` in the frame's keeping.
+fn assert_hoisted(
+    graph: &Graph,
+    check: NodeIx,
+    entry: usize,
+    header_pc: u32,
+    kept: &[usize],
+    text: &str,
+) {
+    let node = graph.node(check);
+    assert_eq!(node.block.index(), entry, "{node:?}: {text}");
+    assert_eq!(
+        node.reason,
+        Some(ExitReason::HoistingFailed),
+        "{node:?}: {text}"
+    );
+    let state = graph.state(node.state.expect("a hoisted check's state"));
+    assert_eq!(state.pc, header_pc, "{node:?}: {text}");
+    for &slot in kept {
+        assert_eq!(state.slots[slot], SlotSource::Frame, "{node:?}: {text}");
+    }
+}
+
 /// An effect, then a loop without one reading the invariant locals `a` (in f64 arithmetic) and
 /// `n` (in an int32 comparison) and writing `s` and `i`.
 const INVARIANT: &str = "function inv(g, a, n) { var s = 0; g();
@@ -4260,6 +4284,64 @@ fn an_effect_free_loops_invariant_slots_are_loaded_once_on_its_entry() {
 }
 
 #[test]
+fn an_effect_free_loops_invariant_checks_move_to_its_entry() {
+    // The checks in the loop of the loaded `a` and `n` move to the end of the entry predecessor
+    // (CheckNumber of `a`, CheckNumber and CheckInt32 of `n`; HoistingFailed, exiting at the
+    // header's pc with both in the frame's keeping): nothing in the loop reads their words. The
+    // check of `a` after the loop (the return's addition) stays there.
+    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    let (chunk, graph) = graph_of(&mut engine, "inv");
+    let text = dump(&graph, &chunk);
+    let header_pc = the_loop(&graph);
+    let lp = loop_at(&graph, header_pc);
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    let in_loop = |node: NodeIx| lp.members[graph.node(node).block.index()];
+    let kept = [
+        slot_named(&chunk, "a") as usize,
+        slot_named(&chunk, "n") as usize,
+    ];
+    let [load_a] = loads_of(&graph, &chunk, "a")[..] else {
+        panic!("one load of a: {text}")
+    };
+    let [load_n] = loads_of(&graph, &chunk, "n")[..] else {
+        panic!("one load of n: {text}")
+    };
+    for load in [load_a, load_n] {
+        assert!(
+            (0..graph.nodes.len() as u32)
+                .map(NodeIx)
+                .filter(|&node| in_loop(node))
+                .all(|node| !graph.node(node).inputs.contains(&load)),
+            "a use of the word in the loop: {text}"
+        );
+    }
+    let [number, after] = checks_of(&graph, load_a, |op| *op == NodeOp::CheckNumber)[..] else {
+        panic!("two checks of a: {text}")
+    };
+    let (number, after) = if graph.node(number).block.index() == entry {
+        (number, after)
+    } else {
+        (after, number)
+    };
+    assert_hoisted(&graph, number, entry, header_pc, &kept, &text);
+    let after = graph.node(after);
+    assert!(!lp.members[after.block.index()], "{text}");
+    assert_ne!(after.block.index(), entry, "{text}");
+    assert_eq!(after.reason, Some(ExitReason::NotNumber), "{text}");
+    let [number] = checks_of(&graph, load_n, |op| *op == NodeOp::CheckNumber)[..] else {
+        panic!("one check of n: {text}")
+    };
+    assert_hoisted(&graph, number, entry, header_pc, &kept, &text);
+    let [int] = checks_of(&graph, number, |op| *op == NodeOp::CheckInt32)[..] else {
+        panic!("one int32 check of n: {text}")
+    };
+    assert_hoisted(&graph, int, entry, header_pc, &kept, &text);
+    assert!(graph.declines.is_empty(), "{text}");
+}
+
+#[test]
 fn a_loop_entered_from_a_branch_loads_there_and_checks_in_the_loop() {
     // The do-while's body is the branch's target: the invariant's load sits before the branch,
     // whose two successors leave no edge of the loop's alone to move a check to (stage 2 step
@@ -4286,6 +4368,13 @@ fn a_loop_entered_from_a_branch_loads_there_and_checks_in_the_loop() {
     let checks = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber);
     assert_eq!(checks.len(), 1, "{text}");
     assert!(lp.members[graph.node(checks[0]).block.index()], "{text}");
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+        "{text}"
+    );
 }
 
 #[test]
@@ -4308,6 +4397,13 @@ fn a_loop_with_an_effect_reloads_and_checks_its_invariant_slots_as_before() {
         assert_eq!(checks.len(), 1, "{text}");
         assert!(lp.members[graph.node(checks[0]).block.index()], "{text}");
     }
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+        "{text}"
+    );
 }
 
 #[test]
@@ -4356,7 +4452,43 @@ fn an_inner_loop_without_effects_in_one_with_an_effect_loads_on_its_own_entry() 
         panic!("one load of a: {text}")
     };
     assert_eq!(graph.node(load).block.index(), entry, "{text}");
+    let [number] = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber)[..] else {
+        panic!("one check of a: {text}")
+    };
+    let a = slot_named(&chunk, "a") as usize;
+    assert_hoisted(&graph, number, entry, inner_pc, &[a], &text);
     assert_ne!(outer.header, inner.header);
+}
+
+#[test]
+fn invariant_checks_in_an_inner_loop_move_to_the_outermost_entry_without_effects() {
+    let mut engine = warmed(
+        "function nest2(g, a, n) { var s = 0; g();
+           for (var k = 0; k < 3; k++) for (var i = 0; i < n; i++) s = s + a * i;
+           return s; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) nest2(nothing, 1.5, 10);",
+        "for (var r = 0; r < 20; r++) nest2(nothing, 1.5, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "nest2");
+    let text = dump(&graph, &chunk);
+    let [outer_pc, inner_pc] = loop_pcs(&graph)[..] else {
+        panic!("two loops: {text}")
+    };
+    let outer = loop_at(&graph, outer_pc);
+    let [entry] = outer.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    let [load] = loads_of(&graph, &chunk, "a")[..] else {
+        panic!("one load of a: {text}")
+    };
+    assert_eq!(graph.node(load).block.index(), entry, "{text}");
+    let [number] = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber)[..] else {
+        panic!("one check of a: {text}")
+    };
+    let a = slot_named(&chunk, "a") as usize;
+    assert_hoisted(&graph, number, entry, outer_pc, &[a], &text);
+    assert!(inner_pc > outer_pc, "{text}");
 }
 
 #[test]
@@ -4409,4 +4541,183 @@ fn a_loop_with_two_entry_edges_merges_their_loads_and_checks_in_the_loop() {
         SlotSource::Frame,
         "{text}"
     );
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_flag_at_the_header_leaves_the_invariants_checks_in_the_loop() {
+    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    let chunk = chunk_of(&mut engine, "inv");
+    let graph = graph_for(&chunk, "inv");
+    let header_pc = the_loop(&graph);
+    flag(
+        &chunk,
+        header_pc as usize,
+        ExitReason::HoistingFailed,
+        false,
+        0,
+    );
+    let graph = graph_for(&chunk, "inv flagged");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, header_pc);
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
+        "{text}"
+    );
+    // Still loaded once, at the entry; checked in the loop, not at the entry.
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    for name in ["a", "n"] {
+        let [load] = loads_of(&graph, &chunk, name)[..] else {
+            panic!("one load of {name}: {text}")
+        };
+        assert_eq!(graph.node(load).block.index(), entry, "{text}");
+        let checks = checks_of(&graph, load, |op| *op == NodeOp::CheckNumber);
+        assert!(
+            checks
+                .iter()
+                .any(|&check| lp.members[graph.node(check).block.index()]),
+            "{name}: {text}"
+        );
+        assert!(
+            checks
+                .iter()
+                .all(|&check| graph.node(check).block.index() != entry),
+            "{name}: {text}"
+        );
+    }
+    assert_eq!(
+        declines(&graph),
+        [(header_pc as usize, ExitReason::HoistingFailed)],
+        "{text}"
+    );
+    assert_eq!(graph.declines[0].form, "the checks in the loop");
+}
+
+#[test]
+fn an_invariant_receivers_object_and_kind_checks_move_to_the_entry() {
+    let mut engine = warmed(
+        "function sumel(g, x, n) { var s = 0; g();
+           for (var i = 0; i < n; i++) s = s + x[i]; return s; }
+         function nothing() {}
+         var X = [1.5, 2.5, 3.5, 4.5];
+         for (var r = 0; r < 20; r++) sumel(nothing, X, 4);",
+        "for (var r = 0; r < 20; r++) sumel(nothing, X, 4);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "sumel");
+    let text = dump(&graph, &chunk);
+    let header_pc = the_loop(&graph);
+    let lp = loop_at(&graph, header_pc);
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    let [load] = loads_of(&graph, &chunk, "x")[..] else {
+        panic!("one load of x: {text}")
+    };
+    let x = slot_named(&chunk, "x") as usize;
+    let [cell] = checks_of(&graph, load, |op| *op == NodeOp::CheckObject)[..] else {
+        panic!("one object check of x: {text}")
+    };
+    assert_hoisted(&graph, cell, entry, header_pc, &[x], &text);
+    let kinds = checks_of(&graph, cell, |op| matches!(op, NodeOp::CheckElements(_)));
+    assert_eq!(kinds.len(), 1, "{text}");
+    assert_hoisted(&graph, kinds[0], entry, header_pc, &[x], &text);
+    assert!(
+        graph
+            .nodes
+            .iter()
+            .all(|node| !lp.members[node.block.index()]
+                || !matches!(node.op, NodeOp::CheckObject | NodeOp::CheckElements(_))),
+        "{text}"
+    );
+}
+
+#[test]
+fn a_kind_check_behind_a_typed_array_test_stays_in_the_loop() {
+    // A site that met typed arrays and Arrays tests the cell's kind tag in the loop; the words
+    // arm's kind check sits behind it and would fail at the entry for every typed array.
+    let mut engine = warmed(
+        "function mixed(g, x, n) { var s = 0; g();
+           for (var i = 0; i < n; i++) s = s + x[i]; return s; }
+         function nothing() {}
+         var T = new Float64Array([1, 2, 3, 4]), X = [1.5, 2.5, 3.5, 4.5];
+         for (var r = 0; r < 20; r++) mixed(nothing, r % 2 ? T : X, 4);",
+        "for (var r = 0; r < 20; r++) mixed(nothing, r % 2 ? T : X, 4);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "mixed");
+    let text = dump(&graph, &chunk);
+    let header_pc = the_loop(&graph);
+    let lp = loop_at(&graph, header_pc);
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    let [load] = loads_of(&graph, &chunk, "x")[..] else {
+        panic!("one load of x: {text}")
+    };
+    let [cell] = checks_of(&graph, load, |op| *op == NodeOp::CheckObject)[..] else {
+        panic!("one object check of x: {text}")
+    };
+    let x = slot_named(&chunk, "x") as usize;
+    assert_hoisted(&graph, cell, entry, header_pc, &[x], &text);
+    let typed = checks_of(&graph, cell, |op| *op == NodeOp::IsTypedArray);
+    assert_eq!(typed.len(), 1, "{text}");
+    assert!(lp.members[graph.node(typed[0]).block.index()], "{text}");
+    let kinds = nodes(&graph, |op| matches!(op, NodeOp::CheckElements(_)));
+    assert!(!kinds.is_empty(), "{text}");
+    assert!(
+        kinds.iter().all(|kind| lp.members[kind.block.index()]
+            && kind.reason != Some(ExitReason::HoistingFailed)),
+        "{text}"
+    );
+}
+
+#[test]
+fn the_verifier_refuses_a_misplaced_invariant_check() {
+    let mut engine = warmed(INVARIANT, INVARIANT_DRIVE);
+    let (chunk, graph) = graph_of(&mut engine, "inv");
+    let hoisted = graph
+        .nodes
+        .iter()
+        .position(|node| {
+            node.reason == Some(ExitReason::HoistingFailed) && node.op == NodeOp::CheckNumber
+        })
+        .expect("a hoisted check");
+    let rejects = |what: &str, broken: Graph, expected: &str| {
+        let error = verify(&broken, &chunk).expect_err(what);
+        assert!(error.contains(expected), "{what}: {error}");
+    };
+    // Another pc than the header's.
+    let mut broken = graph.clone();
+    let state = broken.nodes[hoisted].state.expect("a state").index();
+    broken.states[state].pc = 0;
+    rejects("another pc", broken, "not its header's");
+    // A check of another kind under the reason.
+    let mut broken = graph.clone();
+    let block = broken.nodes[hoisted].block;
+    let word = broken.nodes[hoisted].inputs[0];
+    let check = broken.new_node(block, NodeOp::CheckBoolean, &[word], Rep::Bool, 0);
+    broken.nodes[check.index()].state = broken.nodes[hoisted].state;
+    broken.nodes[check.index()].reason = Some(ExitReason::HoistingFailed);
+    let body = &mut broken.blocks[block.index()].body;
+    body.insert(body.len() - 1, check);
+    rejects("another check", broken, "speculation by CheckBoolean");
+    // A check that is no speculation after it in its block.
+    let mut broken = graph.clone();
+    let check = broken.new_node(block, NodeOp::CheckNumber, &[word], Rep::F64, 0);
+    broken.nodes[check.index()].state = broken.nodes[hoisted].state;
+    broken.nodes[check.index()].reason = Some(ExitReason::NotNumber);
+    let body = &mut broken.blocks[block.index()].body;
+    body.insert(body.len() - 1, check);
+    rejects("a check after it", broken, "before CheckNumber");
+    verify(&graph, &chunk).expect("the graph itself holds");
 }

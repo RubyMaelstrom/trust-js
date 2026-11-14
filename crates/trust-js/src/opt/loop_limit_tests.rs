@@ -891,3 +891,93 @@ fn a_loop_limit_discard_logs_its_cause_at_the_end_of_the_discard_line() {
     }
     assert_eq!(discarded(), vec![code.mem_ptr() as usize]);
 }
+
+#[test]
+fn a_loop_entered_past_its_invariants_failing_entry_check_discards_at_the_loop_limit() {
+    // P3 stage 3 step 0: `a`'s check moved to the loop's entry fails for a String the loop never
+    // reads (only where `i > n`), so each call exits at the loop header (HoistingFailed) and its
+    // frame runs the loop's 2,000 iterations in the VM and the borrowed-frame code: the loop
+    // limit's path. The fifth such exit arms the warm-up, which the frame's loop crosses, and the
+    // next entry discards the code, its exits all the entry check's; the recompile, the header
+    // flagged, leaves the check in the loop on the arm that never runs, and no call exits again.
+    const SOURCE: &str = "function inv(o, a, n) { let s = 0; o.c++; \
+         for (let i = 0; i < n; i++) { if (i > n) s = s + a; s = s + (i & 3); } return s; }\n\
+         const O = {c: 0};\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = (t + inv(O, k * 0.5, 4)) | 0; t";
+    const LONG: &str = "inv(O, 's', 2000) + ':' + O.c";
+    const WARM: &str =
+        "let u = 0; for (let k = 0; k < 1000; k++) u = (u + inv(O, k * 0.5, 4)) | 0; u";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        eval(&mut vm, SOURCE);
+        let mut out = Vec::new();
+        for _ in 0..6 {
+            out.push(eval(&mut vm, LONG));
+        }
+        out.push(eval(&mut vm, WARM));
+        for _ in 0..3 {
+            out.push(eval(&mut vm, LONG));
+        }
+        out
+    };
+    eager().set();
+    let mut engine = jit_engine();
+    compiled();
+    eval(&mut engine, SOURCE);
+    let (chunk, _) = tier_chunk(&mut engine, "inv").expect("inv's tier chunk");
+    assert!(
+        compiled().contains(&address(&chunk)),
+        "the tier compiled it"
+    );
+    let code = resident(&chunk);
+    assert!(is_tier_code(&code));
+    let header = chunk
+        .jit_ops()
+        .iter()
+        .enumerate()
+        .find_map(|(pc, op)| match *op {
+            crate::bytecode::Op::Jump(target) if target as usize <= pc => Some(target),
+            _ => None,
+        })
+        .expect("the loop's back edge");
+    exits();
+    discarded();
+    limits();
+    osr_entries();
+    for call in 0..5 {
+        assert_eq!(eval(&mut engine, LONG), expected[call], "call {call}");
+        assert!(discarded().is_empty(), "call {call}");
+    }
+    assert_eq!(osr_entries(), 5, "each frame's loop moved");
+    assert_eq!(loop_limit_state(&chunk), (true, true), "the crossing asked");
+    assert_eq!(eval(&mut engine, LONG), expected[5]);
+    assert_eq!(discarded(), vec![code.mem_ptr() as usize]);
+    assert_eq!(limits(), vec![(super::Limit::Loop, 5)]);
+    let taken = exits();
+    assert_eq!(taken.len(), 6, "{taken:?}");
+    assert!(
+        taken
+            .iter()
+            .all(|&exit| exit == (header, ExitReason::HoistingFailed)),
+        "{taken:?}"
+    );
+    assert_eq!(discards(&chunk), 1, "R");
+    assert_eq!(eval(&mut engine, WARM), expected[6]);
+    let recompiled = resident(&chunk);
+    assert!(is_tier_code(&recompiled) && !Rc::ptr_eq(&recompiled, &code));
+    assert_eq!(compiled(), vec![address(&chunk)], "one recompile");
+    exits();
+    for call in 0..3 {
+        assert_eq!(
+            eval(&mut engine, LONG),
+            expected[7 + call],
+            "after, call {call}"
+        );
+    }
+    assert!(exits().is_empty(), "the flag declined the entry check");
+    assert!(discarded().is_empty());
+    drop((code, recompiled));
+    super::release_retired(&mut engine.interp);
+}

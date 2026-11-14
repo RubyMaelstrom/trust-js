@@ -36,6 +36,19 @@
 //!   PhiNotNumber to a tagged one (the plan's departures 2 and 3: the check by default where V8
 //!   peels; a flag per header, not per phi). No speculation on back edges or at forward joins
 //!   (Maglev's default outside peeled loops; departure 4).
+//! - A loop's invariants (P3 stage 3 step 0): the value an effect-free loop's header loaded on its
+//!   one entry edge for a slot the loop does not write (`PhiNotes::invariants`), an untagged
+//!   phi's degenerate case (one input, the entry's), is checked on that edge too: its checks in
+//!   the loop, CheckNumber and CheckInt32 of that, CheckObject and CheckElements of that, move to
+//!   the entry predecessor's end, each kind once, exiting at the header's pc with the state the
+//!   edge leaves. That is Ion's LICM of guards to the loop's predecessor (jit/LICM.cpp:204-246,
+//!   from conditional blocks too) and the FTL's of checks to the pre-header (dfg/DFGLICMPhase.cpp:
+//!   337-386), which back off after a hoisted check failed (Ion's BailoutKind::LICM and
+//!   hadLICMInvalidation, BaselineBailouts.cpp:2061-2087; JSC's HoistingFailed, DFGLICMPhase.cpp:
+//!   254, 338-339): here a flag at the header, HoistingFailed, leaves the checks in the loop.
+//!   Maglev peels the loop instead (MaglevGraphBuilder::PeelLoop), which the plan's step 6
+//!   departure 2 leaves for its precondition. No hoisting where the loop has two entry edges (no
+//!   pre-header: JSC's LICM needs one, DFGLICMPhase.cpp:150-151).
 //! - Inputs of an untagged phi: a boxing's operand, a noted form, a constant of the phi's
 //!   representation, an untagged phi as it is or widened, a speculation's check.
 //! - Uses of an untagged phi: CheckNumber of an I32 phi becomes I32ToF64 of it, and CheckInt32,
@@ -140,22 +153,26 @@ pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, snapshot: &Snapshot) {
         .iter()
         .flat_map(|block| block.phis.iter().copied())
         .collect();
-    if phis.is_empty() {
+    if phis.is_empty() && notes.invariants.is_empty() {
         return;
     }
     let mut selector = Selector::new(graph, notes, snapshot);
     selector.decide(&phis);
     selector.declines(&phis);
+    // Before any rewrite, so that the entry states take the phis' inputs as built.
+    let hoisted = selector.hoist_invariant_checks(&notes.invariants);
     let untagged: Vec<NodeIx> = phis
         .iter()
         .copied()
         .filter(|&phi| matches!(selector.kind(phi), Kind::I32 | Kind::F64))
         .collect();
-    if untagged.is_empty() {
+    if untagged.is_empty() && !hoisted {
         return;
     }
-    selector.untag_inputs(&untagged);
-    selector.rewrite_uses(&untagged);
+    if !untagged.is_empty() {
+        selector.untag_inputs(&untagged);
+        selector.rewrite_uses(&untagged);
+    }
     selector.finish();
 }
 
@@ -459,15 +476,9 @@ impl<'g> Selector<'g> {
 
     /// The inputs of each untagged phi in its representation (see the module's doc).
     fn untag_inputs(&mut self, untagged: &[NodeIx]) {
-        // The inputs as built, which a speculation's state takes in place of the header's phis.
         for &phi in untagged {
             let block = self.graph.node(phi).block;
-            for &other in &self.graph.block(block).phis {
-                if !self.original.contains_key(&other) {
-                    self.original
-                        .insert(other, self.graph.node(other).inputs.clone());
-                }
-            }
+            self.keep_inputs(block);
         }
         for &phi in untagged {
             let kind = self.kind(phi);
@@ -502,6 +513,133 @@ impl<'g> Selector<'g> {
             node.inputs = new;
             node.rep = rep;
         }
+    }
+
+    /// The inputs of loop header `header`'s phis as built, which a speculation's state takes in
+    /// place of the phis (`entry_state`), kept before any rewrite changes them.
+    fn keep_inputs(&mut self, header: BlockIx) {
+        for &phi in &self.graph.block(header).phis {
+            if !self.original.contains_key(&phi) {
+                self.original
+                    .insert(phi, self.graph.node(phi).inputs.clone());
+            }
+        }
+    }
+
+    /// The checks in its loop of each invariant the builder loaded on its loop's one entry edge
+    /// (`PhiNotes::invariants`; P3 stage 3 step 0), moved to the end of that edge's predecessor
+    /// as the entry's speculations are (see the module's doc): CheckNumber of the invariant and
+    /// CheckInt32 of its f64, CheckObject and CheckElements of its cell, each kind once, every
+    /// check of that kind in the loop replaced by it, exiting at the header's pc with the state
+    /// the edge leaves [HoistingFailed]; none where the loop also tests the cell for a typed
+    /// array, a test the kind check's arm sits behind. A flag at the header leaves them in the
+    /// loop. Whether any moved.
+    fn hoist_invariant_checks(&mut self, invariants: &[NodeIx]) -> bool {
+        let mut moved = false;
+        for &value in invariants {
+            let pred = self.graph.node(value).block;
+            let [header] = self.graph.block(pred).succs[..] else {
+                continue;
+            };
+            let Some(members) = self.loops.get(&header).cloned() else {
+                continue; // no back edge reached the header
+            };
+            let graph = &*self.graph;
+            let users = &self.users;
+            let in_loop = |node: NodeIx| members[graph.node(node).block.index()];
+            let checks = |of: NodeIx, op: fn(&NodeOp) -> bool| -> Vec<NodeIx> {
+                users[of.index()]
+                    .iter()
+                    .copied()
+                    .filter(|&user| op(&graph.node(user).op) && in_loop(user))
+                    .collect()
+            };
+            let numbers = checks(value, |op| *op == NodeOp::CheckNumber);
+            let ints: Vec<NodeIx> = numbers
+                .iter()
+                .flat_map(|&number| checks(number, |op| *op == NodeOp::CheckInt32))
+                .collect();
+            let cells = checks(value, |op| *op == NodeOp::CheckObject);
+            let typed_test = cells
+                .iter()
+                .any(|&cell| !checks(cell, |op| *op == NodeOp::IsTypedArray).is_empty());
+            let kinds: Vec<NodeIx> = if typed_test {
+                Vec::new()
+            } else {
+                cells
+                    .iter()
+                    .flat_map(|&cell| checks(cell, |op| matches!(op, NodeOp::CheckElements(_))))
+                    .collect()
+            };
+            if numbers.is_empty() && cells.is_empty() {
+                continue;
+            }
+            let pc = self.graph.block(header).first_pc;
+            if self
+                .snapshot
+                .declines(pc as usize, ExitReason::HoistingFailed)
+            {
+                let decline = Decline {
+                    pc,
+                    reason: ExitReason::HoistingFailed,
+                    form: "the checks in the loop",
+                };
+                if !self.graph.declines.contains(&decline) {
+                    self.graph.declines.push(decline);
+                }
+                continue;
+            }
+            let k = self
+                .graph
+                .block(header)
+                .preds
+                .iter()
+                .position(|&from| from == pred)
+                .expect("an edge into the predecessor's successor");
+            self.keep_inputs(header);
+            let state = self.entry_state(header, k);
+            let hoist = |selector: &mut Self, op: NodeOp, input: NodeIx, rep: Rep| {
+                let node = selector.at_end(pred, op, &[input], rep);
+                let data = selector.graph.node_mut(node);
+                data.pc = pc;
+                data.state = Some(state);
+                data.reason = Some(ExitReason::HoistingFailed);
+                node
+            };
+            if !numbers.is_empty() {
+                let number = hoist(self, NodeOp::CheckNumber, value, Rep::F64);
+                for check in numbers {
+                    self.replace(check, number);
+                }
+                if !ints.is_empty() {
+                    let int = hoist(self, NodeOp::CheckInt32, number, Rep::I32);
+                    for check in ints {
+                        self.replace(check, int);
+                    }
+                }
+            }
+            if !cells.is_empty() {
+                let cell = hoist(self, NodeOp::CheckObject, value, Rep::Cell);
+                for check in cells {
+                    self.replace(check, cell);
+                }
+                let mut made: Vec<(NodeOp, NodeIx)> = Vec::new();
+                for check in kinds {
+                    let op = self.graph.node(check).op.clone();
+                    let node = match made.iter().find(|(kind, _)| *kind == op) {
+                        Some(&(_, node)) => node,
+                        None => {
+                            let node = hoist(self, op.clone(), cell, Rep::None);
+                            made.push((op, node));
+                            node
+                        }
+                    };
+                    self.replace(check, node);
+                }
+            }
+            moved = true;
+        }
+        moved
     }
 
     /// The checks of `word`, input `k` of a phi of loop header `header`, at the end of that

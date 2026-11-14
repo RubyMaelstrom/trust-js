@@ -1105,6 +1105,10 @@ pub(crate) struct Alternatives {
 pub(crate) struct PhiNotes {
     /// The alternatives of each phi input that has some, by (phi, input index).
     pub(crate) alternatives: FastMap<(NodeIx, u32), Alternatives>,
+    /// The loads of effect-free loops' invariant slots on their loops' one entry edge, each at
+    /// the end of that edge's predecessor (`Builder::invariant`; P3 stage 3 step 0), whose checks
+    /// in the loop the selector moves to that edge.
+    pub(crate) invariants: Vec<NodeIx>,
 }
 
 /// A built loop header: its phis by the location each merges, the state it assumed for what the
@@ -2153,7 +2157,9 @@ impl<'a> Builder<'a> {
     /// it, as a written slot's phi inputs are taken), held Clean, the one value or a phi of the
     /// entries' values (its back edges' inputs itself), so that the loop reads one SSA value and
     /// never reloads it. Clean because each entry's frame holds the value it gives, which nothing
-    /// in the loop writes: the loop's frame states keep the slot in the frame's keeping.
+    /// in the loop writes: the loop's frame states keep the slot in the frame's keeping. The one
+    /// entry edge's load is noted for the selector, which moves its checks in the loop to that
+    /// edge (`opt::phis`).
     fn invariant(
         &mut self,
         block: BlockIx,
@@ -2166,6 +2172,9 @@ impl<'a> Builder<'a> {
             values.push(self.value_at_end(*from, st, Loc::Slot(slot), pc));
         }
         if values.iter().all(|&value| value == values[0]) {
+            if preds.len() == 1 {
+                self.notes.invariants.push(values[0]);
+            }
             return (Slot::Clean(values[0]), None);
         }
         let phi = self.merge_phi(block, preds, &values, pc);

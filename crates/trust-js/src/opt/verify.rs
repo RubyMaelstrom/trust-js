@@ -18,8 +18,10 @@
 //! - an address (Rep::Ptr) is never a phi's or a frame state's value, so no block edge or exit
 //!   recipe carries one; the signatures let only element nodes take one;
 //! - a loop's entry speculation (stage 2 step 6), CheckNumber [PhiNotNumber] or CheckInt32
-//!   [PhiNotInt32], sits at the end of a loop header's entry predecessor, where nothing after it
-//!   exits or has an effect before the jump, and exits at the header's pc with its handlers.
+//!   [PhiNotInt32], or a loop invariant's check moved to the loop's entry (P3 stage 3 step 0),
+//!   CheckNumber, CheckInt32, CheckObject or CheckElements [HoistingFailed], sits at the end of a
+//!   loop header's entry predecessor, where nothing after it exits or has an effect before the
+//!   jump, and exits at the header's pc with its handlers.
 
 use super::ir::{BlockIx, ExitReason, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource};
 use super::liveness::SlotLiveness;
@@ -108,10 +110,7 @@ pub(crate) fn verify_view(graph: &Graph, chunk: &FrozenChunk, cfg: &Cfg) -> Resu
                 return fail("an exit without a reason");
             }
         }
-        if matches!(
-            node.reason,
-            Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32)
-        ) {
+        if speculative(node) {
             if let Err(what) = speculation(graph, node, &dom, at.1) {
                 return fail(&what);
             }
@@ -320,12 +319,13 @@ impl Dominators {
 fn speculative(node: &Node) -> bool {
     matches!(
         node.reason,
-        Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32)
+        Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32 | ExitReason::HoistingFailed)
     )
 }
 
 /// A loop's entry speculation `node`, at `position` among its block's phis and body: its check
-/// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32) at the end of a loop header's entry
+/// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32, any of CheckNumber, CheckInt32,
+/// CheckObject and CheckElements for HoistingFailed) at the end of a loop header's entry
 /// predecessor, after which nothing but other speculations exits or has an effect before the jump
 /// to the header, with a state at the header's pc and the header's handlers.
 fn speculation(
@@ -334,12 +334,18 @@ fn speculation(
     dom: &Dominators,
     position: usize,
 ) -> Result<(), String> {
-    let check = if node.reason == Some(ExitReason::PhiNotNumber) {
-        NodeOp::CheckNumber
-    } else {
-        NodeOp::CheckInt32
+    let check = match node.reason {
+        Some(ExitReason::PhiNotNumber) => node.op == NodeOp::CheckNumber,
+        Some(ExitReason::PhiNotInt32) => node.op == NodeOp::CheckInt32,
+        _ => matches!(
+            node.op,
+            NodeOp::CheckNumber
+                | NodeOp::CheckInt32
+                | NodeOp::CheckObject
+                | NodeOp::CheckElements(_)
+        ),
     };
-    if node.op != check {
+    if !check {
         return Err(format!("a phi's speculation by {:?}", node.op));
     }
     let block = graph.block(node.block);

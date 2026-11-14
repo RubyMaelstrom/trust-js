@@ -2618,6 +2618,63 @@ fn entry_speculations_back_off_without_an_exit_cycle() {
     assert!(discards(&chunk) <= 3, "{} discards", discards(&chunk));
 }
 
+/// An effect (`o.c++`, which the tier never lowers), then a loop without one that reads the
+/// invariant local `a` only where `i > n`, which never holds: its check moves to the loop's entry
+/// (P3 stage 3 step 0), where it runs whether the use does or not.
+const INVARIANT: &str = "function inv(o, a, n) { let s = 0; o.c++; \
+     for (let i = 0; i < n; i++) { if (i > n) s = s + a; s = s + i; } return s; }\n\
+     const O = {c: 0};\n";
+
+#[test]
+fn a_loop_entered_with_a_string_invariant_where_numbers_were_seen_backs_off_its_entry_check() {
+    // `a` turns into a String the loop never reads: the moved check exits at the loop's entry
+    // (HoistingFailed), where the old code ran on; the flag's recompile leaves the check in the
+    // loop, on the arm that never runs, and no call exits again.
+    let source = format!(
+        "{INVARIANT}let t = 0; for (let r = 0; r < 1000; r++) t = t + inv(O, r * 0.5, 4); t"
+    );
+    let chunk = converges(
+        "inv",
+        &source,
+        "let u = 0; for (let r = 0; r < 600; r++) u = u + inv(O, 's' + r, 4); u",
+        "inv(O, 'a', 6) + inv(O, 2.5, 3) + ':' + O.c",
+        ExitReason::HoistingFailed,
+    );
+    let graph = graph_now(&chunk);
+    assert!(graph
+        .declines
+        .iter()
+        .any(|decline| decline.reason == ExitReason::HoistingFailed));
+    assert!(graph
+        .nodes
+        .iter()
+        .all(|node| node.reason != Some(ExitReason::HoistingFailed)));
+}
+
+#[test]
+fn a_string_invariant_the_loop_reads_converges_on_the_generic_operation() {
+    // A number, then a String the loop adds: the entry check exits first (HoistingFailed), and
+    // the VM's runs of the exits record the String at the addition, whose recompile takes the
+    // generic operation (an effect: the loop's invariants are in the frame's keeping again);
+    // the results are the VM's throughout.
+    let source = "function cat(o, a, n) { let s = 0; o.c++; \
+         for (let i = 0; i < n; i++) s = s + a; return s; }\n\
+         const O = {c: 0};\n\
+         let t = 0; for (let r = 0; r < 1000; r++) t = t + cat(O, r * 0.5, 3); t";
+    let chunk = converges(
+        "cat",
+        source,
+        "let u = ''; for (let r = 0; r < 600; r++) u = cat(O, 's' + r, 3) + u.slice(0, 20); u",
+        "cat(O, 'z', 4) + ':' + cat(O, 1.5, 4) + ':' + O.c",
+        ExitReason::HoistingFailed,
+    );
+    let graph = graph_now(&chunk);
+    assert!(graph
+        .nodes
+        .iter()
+        .all(|node| node.reason != Some(ExitReason::HoistingFailed)));
+}
+
 #[test]
 fn an_exit_inside_the_loop_finds_the_invariant_in_the_frame() {
     // The element read of a String exits inside the loop (NotNumber at the multiplication):
