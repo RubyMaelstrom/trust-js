@@ -8,8 +8,8 @@ use super::*;
 /// Loops without effects over typed arrays of every kind: parameters read before the loop
 /// (`before`) or first in it (`first`), an asm.js-style module's closure bindings (`mod`), a
 /// global (`glob`), a loop that stores what it reads, two loops with a call between them that
-/// detaches the buffer (`two`), and a driver that transfers, shrinks and grows buffers between
-/// calls.
+/// detaches the buffer (`two`), a read and a store of one element of a writable or an immutable
+/// buffer (`bump`), and a driver that transfers, shrinks and grows buffers between calls.
 const PROGRAM: &str = "function before(t, n) { let s = t[0] || 0; \
      for (let i = 0; i < n; i++) s = s + t[i] * 0.5; return s; }\n\
      function first(t, n, v) { let s = 0; \
@@ -43,6 +43,8 @@ const PROGRAM: &str = "function before(t, n) { let s = t[0] || 0; \
      const rab = new ArrayBuffer(128, {maxByteLength: 128}); let r = new Float64Array(rab, 0, 16);\n\
      let gone = new Int32Array(16);\n\
      function keep() {} function drop(t) { if (t.length > 0 && t[0] > 1e9) t.buffer.transfer(); }\n\
+     function bump(t, k) { t[k & 3] = (t[k & 3] | 0) + 1; return t[k & 3] | 0; }\n\
+     const IM = new Int32Array(new ArrayBuffer(16).transferToImmutable()); const BM = new Int32Array(4);\n\
      function late(t, i) { if (i === 3 && t[0] > 1e9) t.buffer.transfer(); }\n\
      const vals = [1.5, -0, NaN, 300.5, -2147483649, 1e10, 0.5, 2.5, Infinity, -1.25];\n\
      function h(x) { return x === x && x < 1e300 && x > -1e300 ? Math.round(x) % 1000003 : 7; }\n\
@@ -58,6 +60,7 @@ const PROGRAM: &str = "function before(t, n) { let s = t[0] || 0; \
      gone.fill((k & 7) + 1); gone[0] = k === 1800 ? 1.5e9 : k; t = (t + h(inner(gone, k === 1800 ? late : keep, 8))) % 1000003; \
      if (k === 1800) gone = new Int32Array(16); \
      if (k === 1900) M.set0(77); if (k === 2001) M.set0(88); \
+     t = (t + bump(k % 7 ? BM : IM, k)) % 1000003; \
      t = (t + M.calls(k % 3 ? [M.stay, M.renew] : [M.renew, M.cut], 12)) % 1000003; }\n\
      String(t) + all.map(a => Array.from(a, x => Object.is(x, -0) ? 'z' : x).join()).join('|') \
      + ':' + G.join() + ':' + M.mix(40)";

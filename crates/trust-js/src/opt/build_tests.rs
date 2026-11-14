@@ -2246,8 +2246,8 @@ fn typed_array_sites_access_their_one_kind_in_line() {
             "{name}: {text}"
         );
     }
-    // A read, a write and a read of one Int32Array: one view, and the store's data address
-    // serves the read after it.
+    // A read, a write and a read of one Int32Array: one view, and one data address, which the
+    // first read checks for the store its block makes (P3 stage 3 step 0c) and the rest take.
     let (chunk, graph) = graph_of(&mut engine, "both");
     let text = dump(&graph, &chunk);
     assert_eq!(count(&graph, is_effect), 0, "{text}");
@@ -2259,8 +2259,13 @@ fn typed_array_sites_access_their_one_kind_in_line() {
     assert_eq!(count(&graph, |op| *op == NodeOp::TypedView), 1, "{text}");
     assert_eq!(count(&graph, |op| *op == NodeOp::CheckBounds), 3, "{text}");
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::TypedData { .. })),
-        2,
+        count(&graph, |op| *op == NodeOp::TypedData { write: true }),
+        1,
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::TypedData { write: false }),
+        0,
         "{text}"
     );
     assert_eq!(

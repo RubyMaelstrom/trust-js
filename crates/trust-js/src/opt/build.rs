@@ -476,6 +476,52 @@ impl Rules<'_> {
         Some((source, kind, write))
     }
 
+    /// The typed reads among the operations from `start` to `end` of one block that check their
+    /// data address for a store (P3 stage 3 step 0c): those whose receiver a later in-line typed
+    /// store of the block reaches (`typed_source`) with no effect, `%` (F64Mod ends the heap
+    /// facts) or write of the receiver's slot or binding between, so that one TypedData { write:
+    /// true } serves the read and the store (`Builder::typed_data`), as the brief's form C. A
+    /// read of a buffer that is not writable then exits at the read where it exited at the store,
+    /// before any effect either way.
+    fn store_checking_reads(&self, start: usize, end: usize) -> Vec<usize> {
+        let store = |op: &Op| {
+            matches!(
+                op,
+                Op::SetElem | Op::SetElemDrop | Op::SetElemLocal(_) | Op::SetElemLocalDrop(_)
+            )
+        };
+        let mut stored: Vec<Source> = Vec::new();
+        let mut reads = Vec::new();
+        for pc in (start..end).rev() {
+            // Before the scan meets a store (backwards), nothing waits for a read: no rule to ask.
+            if stored.is_empty() && !store(&self.ops[pc]) {
+                continue;
+            }
+            if !self.lowers(pc) || self.ops[pc] == Op::Mod {
+                stored.clear();
+                continue;
+            }
+            let written = match self.ops[pc] {
+                Op::StoreLocal(slot) | Op::UpdateLocal(slot, _) | Op::Tdz(slot) => {
+                    slot as usize..slot as usize + 1
+                }
+                Op::ResetSlots(start, count) => start as usize..start as usize + count as usize,
+                _ => 0..0,
+            };
+            let name = self.name_store_slot(pc);
+            stored.retain(|source| match *source {
+                Source::Slot(slot) => !written.contains(&slot),
+                Source::Name(address, _) => name != Some(address.slot),
+            });
+            match self.typed_source(pc) {
+                Some((source, Some(_), true)) if !stored.contains(&source) => stored.push(source),
+                Some((source, Some(_), false)) if stored.contains(&source) => reads.push(pc),
+                _ => {}
+            }
+        }
+        reads
+    }
+
     /// The source of the word the operation of `pc`'s block that pushed the operand `below`
     /// places under the top of the stack at `pc` (`producer`): an initialized local's read or a
     /// free name's read at a static address.
@@ -1500,6 +1546,9 @@ struct Builder<'a> {
     hoisted_nodes: Vec<NodeIx>,
     /// Whether an operation of the chunk moves its running environment (`names::moves_env`).
     moves_env: bool,
+    /// The typed reads of the block being built that check for a store
+    /// (`Rules::store_checking_reads`).
+    checks_store: Vec<usize>,
     /// Set where an operation's lowering ended its block with an exit (`mismatch`).
     ended: bool,
     /// The phi inputs' alternatives, for the selector.
@@ -1546,6 +1595,7 @@ impl<'a> Builder<'a> {
             hoisted: FastMap::default(),
             hoisted_nodes: Vec::new(),
             moves_env: chunk.jit_ops().iter().any(names::moves_env),
+            checks_store: Vec::new(),
             ended: false,
             notes: PhiNotes::default(),
             frame: FrameIx::COMPILED,
@@ -1609,6 +1659,7 @@ impl<'a> Builder<'a> {
         let block = self.blocks[ix(id)].expect("an edge made the block");
         self.cur = block;
         self.built[ix(id)] = true;
+        self.checks_store = self.rules().store_checking_reads(start, end);
         let never_ran = self.never_ran(start, end)
             && !self.declined(start, ExitReason::NeverRan, "the block built");
         let mut st = match self.flow.heads[ix(id)] {
@@ -4358,7 +4409,8 @@ impl Builder<'_> {
         };
         if past_length {
             let (view, length) = self.typed_view(st, word, cell, pc);
-            let data = self.typed_data(st, cx, cell, view, false);
+            let write = self.checks_store.contains(&pc);
+            let data = self.typed_data(st, cx, cell, view, write);
             return self.add(
                 NodeOp::LoadTypedOrUndefined(kind),
                 &[cell, data, index, length],
@@ -4366,7 +4418,8 @@ impl Builder<'_> {
                 pc,
             );
         }
-        let (_, data) = self.typed_access(st, cx, word, cell, index, false);
+        let write = self.checks_store.contains(&pc);
+        let (_, data) = self.typed_access(st, cx, word, cell, index, write);
         self.add(
             NodeOp::LoadTyped(kind),
             &[cell, data, index],

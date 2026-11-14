@@ -120,9 +120,15 @@ fn an_effect_free_loop_keeps_a_typed_arrays_facts_its_entry_holds() {
             1,
             "{name}: {text}"
         );
-        // The store's check before the loop serves the loop's reads and writes.
+        // The read before the loop checks for the store its block makes, which serves the
+        // store and the loop's reads and writes.
         let data = nodes(&graph, |op| matches!(op, NodeOp::TypedData { .. }));
-        assert_eq!(data.len(), 2, "{name}: {text}");
+        assert_eq!(data.len(), 1, "{name}: {text}");
+        assert_eq!(
+            data[0].op,
+            NodeOp::TypedData { write: true },
+            "{name}: {text}"
+        );
         assert!(
             graph
                 .nodes
@@ -384,14 +390,12 @@ fn a_flag_at_the_header_leaves_the_typed_arrays_checks_in_the_loop() {
                 .all(|node| node.reason != Some(ExitReason::HoistingFailed)),
             "{name}: {text}"
         );
-        // The read's and the store's, as before the step.
+        // The loop's read, which its block's store's check serves.
         assert_eq!(
-            in_loop(&graph, header_pc, |op| matches!(
-                op,
-                NodeOp::TypedData { .. }
-            ))
+            in_loop(&graph, header_pc, |op| *op
+                == NodeOp::TypedData { write: true })
             .len(),
-            2,
+            1,
             "{name}: {text}"
         );
         assert!(
@@ -492,4 +496,51 @@ fn the_verifier_refuses_a_misplaced_entry_typed_data() {
     let error = verify(&broken, &chunk).expect_err("another pc");
     assert!(error.contains("not its header's"), "{error}");
     verify(&graph, &chunk).expect("the graph itself holds");
+}
+
+#[test]
+fn a_read_its_block_then_stores_to_checks_for_the_store() {
+    // `rw`'s reads each meet a store to the same array later in their block, with no effect
+    // between: one TypedData for a store an effect epoch, which the read makes and the store and
+    // the last read take. `rb` stores on a branch's arm, `re` after a call and `xy` to another
+    // array: their reads check for a read.
+    let mut engine = warmed(
+        "function rw(t, f) { t[0] = (t[0] | 0) + 1; f(); t[1] = (t[1] | 0) + 1; return t[2] | 0; }
+         function rb(t, c) { var x = t[0] | 0; if (c) t[1] = x; return x | 0; }
+         function re(t, f) { var x = t[0] | 0; f(); t[1] = x; return x | 0; }
+         function xy(t, u) { var x = t[0] | 0; u[0] = x; return x | 0; }
+         function nothing() {}
+         var T = new Int32Array(8), U = new Int32Array(8);
+         for (var k = 0; k < 20; k++) { rw(T, nothing); rb(T, k & 1); re(T, nothing); xy(T, U); }",
+        "for (var k = 0; k < 20; k++) { rw(T, nothing); rb(T, k & 1); re(T, nothing); xy(T, U); }",
+    );
+    let data_of = |graph: &Graph| -> Vec<NodeOp> {
+        nodes(graph, |op| matches!(op, NodeOp::TypedData { .. }))
+            .into_iter()
+            .map(|node| node.op.clone())
+            .collect()
+    };
+    let (chunk, graph) = graph_of(&mut engine, "rw");
+    let text = dump(&graph, &chunk);
+    assert_eq!(
+        data_of(&graph),
+        [
+            NodeOp::TypedData { write: true },
+            NodeOp::TypedData { write: true }
+        ],
+        "{text}"
+    );
+    // `xy` stores to another array than it reads: the read checks for a read.
+    for name in ["rb", "re", "xy"] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        assert_eq!(
+            data_of(&graph),
+            [
+                NodeOp::TypedData { write: false },
+                NodeOp::TypedData { write: true }
+            ],
+            "{name}: {text}"
+        );
+    }
 }

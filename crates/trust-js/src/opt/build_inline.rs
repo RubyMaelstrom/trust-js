@@ -567,6 +567,7 @@ impl<'a> Builder<'a> {
             hoisted: std::mem::take(&mut self.hoisted),
             hoisted_nodes: std::mem::take(&mut self.hoisted_nodes),
             moves_env: view.jit_ops().iter().any(names::moves_env),
+            checks_store: Vec::new(),
             ended: false,
             notes: std::mem::take(&mut self.notes),
             frame,
