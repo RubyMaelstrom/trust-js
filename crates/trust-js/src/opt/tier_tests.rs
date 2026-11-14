@@ -3334,6 +3334,11 @@ mod typed_loop;
 #[path = "chain_tier_tests.rs"]
 mod chain;
 
+/// P3 stage 3 step 3a's follow-up: the effects whose helper runs the VM on a copy of the operand
+/// stack, end to end.
+#[path = "vm_copy_tier_tests.rs"]
+mod vm_copy;
+
 /// Programs whose hot functions' generic nodes hold values across them (P3 stage 3 step 3a):
 /// effects in loops, effects between writes and reads of one local (the `*Local` forms reading a
 /// dirty slot's word), slots the nodes write (updates of Strings, `for…in` steps), effects in try

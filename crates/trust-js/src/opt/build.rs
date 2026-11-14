@@ -1136,9 +1136,9 @@ impl Rules<'_> {
 
 /// Whether `op`, where the tier does not lower it, runs as a canonical-frame effect (NodeOp::Effect)
 /// rather than as a generic node: it may read any slot (`liveness::SlotUse::Any`, and the slot
-/// writes, which the rules always lower), or its helper runs the VM on a copy of the operand
-/// stack (`bytecode::jit_runs_on_vm_copy`), so that it needs the whole canonical frame (P3 stage
-/// 3 step 3a).
+/// writes, which the rules always lower), or its helper runs the VM for it on the frame's slots
+/// in place (`bytecode::jit_runs_on_vm_copy`; destructuring's steps write slots that liveness does
+/// not list), so that it needs the whole canonical frame (P3 stage 3 step 3a).
 fn canonical(op: &Op) -> bool {
     matches!(slot_use(op), SlotUse::Any | SlotUse::Writes { .. })
         || crate::bytecode::jit_runs_on_vm_copy(op)

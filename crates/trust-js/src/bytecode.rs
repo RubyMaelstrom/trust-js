@@ -25771,7 +25771,8 @@ pub(crate) fn stack_effect(
         Op::SuperGetMethod => (3, 2),
         Op::SuperSet => (4, 1),
         Op::SuperUpdate(kind) => (3, upd(kind)),
-        Op::RequireCallable => (0, 0),
+        // It reads the tag it leaves on the stack (the VM's `stack.last()`): an operand.
+        Op::RequireCallable => (1, 1),
         Op::Throw | Op::Return | Op::ResumeReturn => (1, 0),
         Op::ResumeJump => (2, 0),
         Op::ReturnBare | Op::ReturnUndef => (0, 0),
@@ -25871,9 +25872,10 @@ fn jit_bridge_op(op: &Op) -> bool {
 }
 
 /// Whether [`jit_exec`] runs the operation in a fresh frame through [`jit_vm_operation`], one VM
-/// step over a copy of the whole operand stack (its dispatch: the bridge operations but the
-/// Reference and lexical-scope ones, which their own helpers run on the canonical owners). The
-/// optimizing tier keeps every such operation a canonical-frame effect (P3 stage 3 step 3a).
+/// step over a copy of its operands, on the frame's slots in place (its dispatch: the bridge
+/// operations but the Reference and lexical-scope ones, which their own helpers run on the
+/// canonical owners). The optimizing tier keeps every such operation a canonical-frame effect (P3
+/// stage 3 step 3a).
 #[cfg_attr(
     not(any(
         test,
@@ -26195,6 +26197,15 @@ unsafe fn jit_scope_op(
     crate::jit::SpFlag { sp, flag: 0 }
 }
 
+/// Count the words of `copy` that are the word a test watches for ([`TEST_COPY_WATCH`]).
+#[cfg(test)]
+fn test_watch_copy(copy: &[Value]) {
+    if let Some(watched) = TEST_COPY_WATCH.with(std::cell::Cell::get) {
+        let seen = copy.iter().filter(|word| word.bits() == watched).count();
+        TEST_COPY_SEEN.with(|count| count.set(count.get() + seen));
+    }
+}
+
 unsafe fn jit_vm_operation(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -26212,11 +26223,32 @@ unsafe fn jit_vm_operation(
         .activation
         .as_mut()
         .expect("native activation initialized");
+    // The operation's operands only, the top words its stack effect names: a helper's
+    // precondition is the operation's operands in the top words below sp, sp the canonical top, the
+    // slots and the context (P3 stage 1 contracts 4.3), and every operation that runs here reads
+    // and writes no deeper word (each VM arm pops, peeks or splits off its own operands). The
+    // words below them are no input of the operation, and the optimizing tier's code does not
+    // write them (it keeps those values in registers and spill slots), so that they can hold what
+    // an earlier activation of the record left: copied, they would reach the operation's VM stack
+    // and the collector's precise trace of it (`GcTrace for NativeActivation`) as Values (P3
+    // stage 3 step 3a's follow-up).
     let depth = sp.offset_from(ctx.stack_base) as usize;
+    let pops = stack_effect(&chunk.ops, pc as usize, false, false).map_or(depth, |(pops, _)| pops);
+    debug_assert!(
+        pops <= depth,
+        "an operation's operands lie within its frame's depth"
+    );
+    let base = depth - pops;
     debug_assert!(activation.stack.is_empty());
-    activation.stack.reserve(depth);
-    std::ptr::copy_nonoverlapping(ctx.stack_base, activation.stack.as_mut_ptr(), depth);
-    activation.stack.set_len(depth);
+    activation.stack.reserve(pops);
+    std::ptr::copy_nonoverlapping(
+        ctx.stack_base.add(base),
+        activation.stack.as_mut_ptr(),
+        pops,
+    );
+    activation.stack.set_len(pops);
+    #[cfg(test)]
+    test_watch_copy(activation.stack.raw_slice());
     #[cfg(all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -26230,7 +26262,10 @@ unsafe fn jit_vm_operation(
                 crate::opt::poison_fault(
                     chunk,
                     pc as usize,
-                    &format!("the VM-copy helper copied operand word {k}, the poison"),
+                    &format!(
+                        "the VM-copy helper copied operand word {}, the poison",
+                        base + k
+                    ),
                 );
             }
         }
@@ -26253,10 +26288,15 @@ unsafe fn jit_vm_operation(
         None,
     )
     .map(VmRunExit::single_operation);
-    // Transfer the live suffix back even on error. The native unwinder must never
-    // observe moved-out inputs or omit values produced before a later abrupt step.
-    let depth = activation.stack.len();
-    std::ptr::copy_nonoverlapping(activation.stack.as_ptr(), ctx.stack_base, depth);
+    // Transfer the live suffix back even on error, above the words below the operands. The
+    // native unwinder must never observe moved-out inputs or omit values produced before a later
+    // abrupt step.
+    let depth = base + activation.stack.len();
+    std::ptr::copy_nonoverlapping(
+        activation.stack.as_ptr(),
+        ctx.stack_base.add(base),
+        activation.stack.len(),
+    );
     activation.stack.set_len(0);
     ctx.env_raw = Env::as_ptr(&activation.env) as *const u8;
     ctx.env_parent_raw = activation
@@ -28450,6 +28490,11 @@ pub(crate) unsafe extern "C" fn jit_iteration(
 
 #[cfg(test)]
 thread_local! {
+    /// A word a test watches for in the copies `jit_vm_operation` makes, and how many copied words
+    /// were it (P3 stage 3 step 3a's follow-up).
+    pub(crate) static TEST_COPY_WATCH: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+    pub(crate) static TEST_COPY_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// A test's hidden writer (P3 stage 3 step 3a's follow-up): `jit_exec` at pc `.1` of the chunk
     /// at `.0` writes Undefined into slot `.2`, a write its operation's `liveness::slot_use` does
     /// not list, which the poison switch's check must report.
@@ -32616,7 +32661,7 @@ impl crate::gc_trace::GcTrace for VmStep {
 }
 
 /// A native activation's bridge state, reached from its context (see `GcTrace for JitCtx`).
-/// The operand words `jit_vm_operation` lends to one VM operation sit in `stack` meanwhile.
+/// The operands `jit_vm_operation` lends to one VM operation sit in `stack` meanwhile.
 impl crate::gc_trace::GcTrace for NativeActivation {
     fn trace_gc(&self, sink: &mut dyn crate::gc_trace::GcSink) {
         let Self {

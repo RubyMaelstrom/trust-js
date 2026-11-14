@@ -25012,6 +25012,26 @@ pub(crate) fn live_tops(records: &[std::ptr::NonNull<JitFrame>]) -> Vec<Option<u
     tops
 }
 
+/// Fill the words `from..` of every pooled record of `i` with `word` (tests: what an earlier
+/// activation of a record left in it, such as the word of a cell freed since, which the next
+/// activation's code need not write; P3 stage 3 step 3a's follow-up). Every activation writes its
+/// slots at its entry and its operand words as it pushes them.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn fill_pooled_words_for_test(i: &Interp, from: usize, word: u64) {
+    for record in i.frame_pool.iter() {
+        // SAFETY: a pooled record is allocated and runs no code.
+        let words = unsafe { std::ptr::addr_of_mut!((*record.as_ptr()).words).cast::<u64>() };
+        for k in from..FRAME_BUF {
+            // SAFETY: within the record's words.
+            unsafe { words.add(k).write(word) };
+        }
+    }
+}
+
 impl JitFrame {
     /// A new record owned by `i`'s pool, with its interpreter-constant fields initialized
     /// (registered with the pool, its words zero-filled).
