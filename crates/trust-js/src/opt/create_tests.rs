@@ -268,9 +268,9 @@ fn what_no_template_creates_and_setters_stay_effects() {
 }
 
 #[test]
-fn a_creation_at_the_ninth_slot_or_past_it_stays_the_effect() {
-    // The template's commit stops at a named count of 8 (the next key needs a key index): the
-    // receiver's shape fixes the slot, so those sites keep the effect from the first compile.
+fn a_creation_at_the_ninth_slot_or_past_it_is_a_creation_too() {
+    // The template's in-line commit stops at a named count of 8 (the next key needs a key index);
+    // StoreNew takes its insert's pure call there, so those sites are nodes too.
     let mut engine = engine(Tier::Jit);
     eval(
         &mut engine,
@@ -280,6 +280,6 @@ fn a_creation_at_the_ninth_slot_or_past_it_stays_the_effect() {
     );
     let (chunk, graph) = graph_in(&mut engine, "wide");
     let text = dump(&graph, &chunk);
-    assert_eq!(creations(&graph).len(), 8, "{text}");
-    assert_eq!(count(&graph, is_effect), 2, "{text}");
+    assert_eq!(creations(&graph).len(), 10, "{text}");
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
 }

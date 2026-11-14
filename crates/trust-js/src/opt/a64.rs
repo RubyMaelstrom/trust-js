@@ -801,13 +801,14 @@ enum Cold {
     },
     /// A branch to a label (an effect's throw into its exit).
     Jump { label: usize, target: usize },
-    /// A creation's record without room for its slot (StoreNew, P3 stage 3 step L3): the
-    /// record grown by the template's pure call (`value::jit_grow_named_record`), the Object in
-    /// x17 and the layout to install in x16 kept, then `resume`.
-    CreateGrow {
+    /// A creation the in-line commit cannot make (StoreNew, P3 stage 3 step L3): the insert by a
+    /// pure call (`store_new_slow`), the Object in x17, then `done`, or `exit` where it did not
+    /// insert.
+    CreateSlow {
         label: usize,
         node: NodeIx,
-        resume: usize,
+        done: usize,
+        exit: usize,
     },
 }
 
@@ -1108,6 +1109,30 @@ unsafe extern "C" fn grow_elements(cell: u64) -> u64 {
         .props
         .grown_words_address()
         .map_or(0, |words| words as u64)
+}
+
+/// A creation's insert where StoreNew's in-line commit cannot make it (P3 stage 3 step L3): a key
+/// index of the object's own, a named count of 8 or more, no key layout for the slot, or a record
+/// without room. `Props::append_new`, the insert the VM's creation hit makes (Interp::try_ic_set),
+/// of a key the receiver's shape proved absent, landing on `shape`: it maintains the key index
+/// and the layout and grows the record. It allocates and neither collects (engine heaps collect at
+/// their safepoints) nor runs JavaScript; the object's mutable borrow marks its card for the new
+/// edge and any new block. 1, or 0 where the object is borrowed (nothing written).
+unsafe extern "C" fn store_new_slow(cell: u64, key: u64, value: u64, shape: u64) -> u64 {
+    let word = unsafe { crate::value::Value::from_bits(crate::value::PACK_OBJ | cell) };
+    let Some(object) = word.as_obj() else {
+        return 0;
+    };
+    let Ok(mut object) = object.try_borrow_mut() else {
+        return 0;
+    };
+    // SAFETY: the node's key word, the site's name's key in this heap.
+    let key = unsafe { crate::atom::PropKey::from_word(key) };
+    let value = unsafe { crate::value::Value::from_bits(value) };
+    object
+        .props
+        .append_new(key, crate::value::Property::plain(value), shape as u32);
+    1
 }
 
 /// `out` where a call clobbers it: a node's own value, which no save of the live values keeps
@@ -3030,25 +3055,39 @@ impl Gen<'_> {
                         self.a.bind(label);
                         self.emit_element_create(node, out, done, exits);
                     }
-                    Cold::CreateGrow {
+                    Cold::CreateSlow {
                         label,
                         node,
-                        resume,
+                        done,
+                        exit,
                     } => {
-                        // jit_grow_named_record(cell, count), the template's call (W2d step 3):
-                        // room for the next slot, made after every check of the creation and
-                        // before its first write; it allocates a storage block and neither
-                        // collects nor runs JavaScript. The live caller-saved values, the Object
-                        // (x17) and the layout to install (x16) are kept across it.
+                        // store_new_slow(cell, key, value, shape) after every check of the
+                        // creation, before any write: it runs no JavaScript and does not collect.
+                        // The live caller-saved values are kept across it; the value is read
+                        // into x9 before the arguments are set.
                         self.a.bind(label);
                         let layout = self.layout;
-                        let saved = self.save_live_caller_saved_and(node, &[X16, X17]);
-                        named_len(&mut self.a, layout, 1, X17);
+                        let (value, key, shape) = match self.graph.node(node).op {
+                            NodeOp::StoreNew { key, shape, .. } => {
+                                (self.graph.node(node).inputs[1], key, shape)
+                            }
+                            _ => unreachable!("a creation's slow path"),
+                        };
+                        let saved = self.save_live_caller_saved(node);
+                        let word = self.gp(value, X9);
+                        if word != X9 {
+                            self.a.mov(X9, word);
+                        }
                         self.a.sub_imm(0, X17, layout.obj_from_cell as u32);
-                        self.a.ldr_imm(X16, 21, (H_GROW_NAMED_RECORD * 8) as u32);
+                        self.a.mov_imm64(1, key);
+                        self.a.mov(2, X9);
+                        self.a.mov_imm64(3, u64::from(shape));
+                        self.a.mov_imm64(X16, store_new_slow as *const () as u64);
                         self.a.blr(X16);
+                        self.a.mov(X9, 0);
                         self.restore_live_caller_saved(&saved);
-                        self.a.b(resume);
+                        self.a.cbz(X9, true, exit);
+                        self.a.b(done);
                     }
                     Cold::Edge { label, from, to } => {
                         self.a.bind(label);
@@ -3674,12 +3713,13 @@ impl Gen<'_> {
     /// card for an edge.
     /// StoreNew (P3 stage 3 step L3): the template's creation commit (`emit_prop_create_probe`
     /// and `emit_set_prop_inline`'s commit, jit.rs) on the tier's scratch registers, its shapes
-    /// and location the node's constants: the checks first, each to the node's exit with nothing
-    /// written (no key index of its own, a named count below 8, the key layout); the record's
-    /// growth where a record slot lacks room, a pure call (cold); then the commit with no call
-    /// between its writes: the layout where one is installed, the value, the card (the Object's
-    /// address shares its cell's card), the landing shape and the count, as the template orders
-    /// them (the count last: the collector reads the slots below it).
+    /// and location the node's constants: its conditions first (no key index of its own, a named
+    /// count below 8, the key layout, room in a record slot), any failing one taking the insert's
+    /// pure call (`store_new_slow`, cold) with nothing written, where the template takes its
+    /// helper; then the commit with no call between its writes: the layout where one is
+    /// installed, the value, the card (the Object's address shares its cell's card), the landing
+    /// shape and the count, as the template orders them (the count last: the collector reads the
+    /// slots below it). The node exits only where the call could not borrow the object.
     fn lower_store_new(
         &mut self,
         n: NodeIx,
@@ -3717,12 +3757,20 @@ impl Gen<'_> {
         };
         let c = self.gp(cell, X16);
         self.a.add_imm(X17, c, layout.obj_from_cell as u32);
+        let slow = self.a.new_label();
+        let done = self.a.new_label();
+        self.cold.push(Cold::CreateSlow {
+            label: slow,
+            node: n,
+            done,
+            exit: site,
+        });
         // 1. A small map: no key index of its own, fewer than 8 named properties (the 9th needs
         //    one, value.rs ensure_fallback_index): x9 the count.
-        guard_no_key_index(&mut self.a, layout, X17, X16, site);
+        guard_no_key_index(&mut self.a, layout, X17, X16, slow);
         named_len(&mut self.a, layout, X9, X17);
         self.a.cmp_imm_x(X9, 8);
-        self.a.b_cond(HS, site);
+        self.a.b_cond(HS, slow);
         // 2. The key layout for the next slot: the object's own prediction holding the key with
         //    plain attributes (x16 = 0, nothing to install), else the landing shape's cached
         //    layout from the shape-layout directory (x16), whose entry must be the shape's.
@@ -3759,7 +3807,7 @@ impl Gen<'_> {
         self.a
             .ldr_imm(X16, 19, std::mem::offset_of!(JitCtx, shape_layouts) as u32);
         self.a.ldr_imm(X16, X16, (8 * page) as u32);
-        self.a.cbz(X16, true, site);
+        self.a.cbz(X16, true, slow);
         self.a
             .add_imm(X16, X16, (entry * layout.shape_layout_entry_size) as u32);
         self.a
@@ -3770,32 +3818,24 @@ impl Gen<'_> {
             self.a.mov_imm64(X9, u64::from(shape));
             self.a.cmp_reg_w(X30, X9);
         }
-        self.a.b_cond(NE, site);
+        self.a.b_cond(NE, slow);
         self.a
             .ldr_imm(X16, X16, layout.shape_layout_entry_keys as u32);
-        self.a.cbz(X16, true, site);
+        self.a.cbz(X16, true, slow);
         named_len(&mut self.a, layout, X9, X17);
         self.a.ldr_w_imm(X30, X16, layout.layout_keys_len as u32);
         self.a.cmp_reg_x(X9, X30);
-        self.a.b_cond(HS, site);
+        self.a.b_cond(HS, slow);
         self.a.bind(laid);
         // 3. Room for the slot: the landing shape proves a cell slot's; a record slot needs the
-        //    record and its capacity (`guard_loc_room`), else the record grows (cold).
+        //    record and its capacity (`guard_loc_room`), else the slow path grows it.
         if let Some(index) = record_index {
-            let grow = self.a.new_label();
-            let room = self.a.new_label();
             self.a
                 .ldr_imm(X30, X17, (layout.obj_props + layout.props_record) as u32);
-            self.a.cbz(X30, true, grow);
+            self.a.cbz(X30, true, slow);
             self.a.ldr_w_imm(X30, X30, layout.record_cap as u32);
             self.a.cmp_imm_w(X30, index as u32);
-            self.a.b_cond(LS, grow);
-            self.a.bind(room);
-            self.cold.push(Cold::CreateGrow {
-                label: grow,
-                node: n,
-                resume: room,
-            });
+            self.a.b_cond(LS, slow);
         }
         // 4. The commit.
         let kept = self.a.new_label();
@@ -3820,6 +3860,7 @@ impl Gen<'_> {
         named_len(&mut self.a, layout, X9, X17);
         self.a.add_imm(X9, X9, 1);
         named_set_len(&mut self.a, layout, X9, X17);
+        self.a.bind(done);
         Ok(())
     }
 

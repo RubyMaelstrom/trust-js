@@ -432,15 +432,6 @@ impl Rules<'_> {
             }
         }
         let mut creation = creation?;
-        // The slot the property lands in, which the receiver's shape fixes (its key count and its
-        // class's cell slots: value.rs location_word): the template's commit takes one below 8
-        // alone (jit.rs emit_prop_create_probe: the 9th key needs a key index, value.rs
-        // ensure_fallback_index), so a site at 8 or more stays the effect, which the template's
-        // helper serves, rather than exit at each creation.
-        let cell = crate::value::class_slots(crate::value::shape_class(creation.shape)) as usize;
-        if !(0..8).any(|slot| crate::value::location_word(cell, slot) == Some(creation.location)) {
-            return None;
-        }
         let first = walks[0];
         if walks.len() > 1
             && walks
@@ -557,13 +548,9 @@ impl Rules<'_> {
         if let Some(arms) = self.poly_ways(pc, name) {
             return !self.stale_shapes(pc, &arm_shapes(&arms));
         }
-        // A way-less `length` (P3 stage 3 step L3, `Builder::length`): a String's, or where
-        // WrongShape is flagged an Array's, unless its checks are flagged too.
-        self.length_site(pc, name)
-            && (!self.snapshot.declines(pc, ExitReason::WrongShape)
-                || ![ExitReason::WrongElements, ExitReason::NotObject]
-                    .iter()
-                    .any(|&reason| self.snapshot.declines(pc, reason)))
+        // A way-less `length` (P3 stage 3 step L3, `Builder::length`): a String's, unless
+        // WrongShape is flagged.
+        self.length_site(pc, name) && !self.snapshot.declines(pc, ExitReason::WrongShape)
     }
 
     /// Whether the read of `name` at `pc` is a `length` whose site filled no way and holds no
@@ -5696,13 +5683,13 @@ impl Builder<'_> {
 
     /// A `length` read whose site has no way (`Rules::length_site`; P3 stage 3 step L3): a
     /// String's length (StringLength [WrongShape]: the tag, then the header's count), a value fact
-    /// of the word; where a WrongShape flag declines it (the receivers were no Strings: RegExp's
-    /// exec results), an Array's length as `array_length` reads it, unless its checks are flagged
-    /// too, which leaves the generic access. With no record to say which, a site takes the String
-    /// first, as the census found 99.98% of these reads' String-only sites' (design-note 1).
+    /// of the word; the generic access where WrongShape is flagged, as at any named site. With no
+    /// record to say which, a site takes the String, as the census found nearly every such read
+    /// a String's (design-note 1); an Array's read in the VM, which an exit leaves, fills a
+    /// key-checked way, after which the site reads the Array's `length` (`array_length`).
     fn length(&mut self, pc: usize, recv: Recv, st: &mut State) -> Result<(), Refusal> {
-        if self.declined(pc, ExitReason::WrongShape, "an Array's length") {
-            return self.array_length(pc, recv, st);
+        if self.declined(pc, ExitReason::WrongShape, "the generic access") {
+            return self.effect(pc, st);
         }
         let receiver = self.receiver(recv, st, 0, pc);
         if self.rep(receiver) != Rep::Tagged {

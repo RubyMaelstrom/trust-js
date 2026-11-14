@@ -161,8 +161,11 @@ fn the_programs_creations_are_the_tiers_nodes_before_its_changes() {
 #[test]
 fn a_constructor_runs_its_creations_in_the_tiers_code_without_an_exit() {
     let source = "function P(x, y) { this.x = x; this.y = y; this.z = x * y; }\n\
+         function W(v) { this.a = v; this.b = v; this.c = v; this.d = v; this.e = v; this.f = v; \
+           this.g = v; this.h = v; this.i = v; this.j = v; this.k = v; this.l = v; }\n\
          var C = class { constructor(v) { this.v = v; this.w = [v]; } };\n\
-         function f(k) { const p = new P(k, k + 1), c = new C(k); return p.x + p.y + p.z + c.v + c.w[0]; }\n\
+         function f(k) { const p = new P(k, k + 1), c = new C(k), w = new W(k); \
+           return p.x + p.y + p.z + c.v + c.w[0] + w.l; }\n\
          let t = 0; for (let k = 0; k < 3000; k++) t = (t + f(k)) % 1000003; t";
     // `var`s: a script's new global lexical moves the global record's generation, which a
     // global lexical's read checks (WrongName).
@@ -182,6 +185,10 @@ fn a_constructor_runs_its_creations_in_the_tiers_code_without_an_exit() {
     let taken = exits();
     assert!(taken.is_empty(), "no exit: {taken:?}");
     assert!(creates(&mut engine, "P"), "P creates in the tier's code");
+    assert!(
+        creates(&mut engine, "W"),
+        "W creates its twelve fields in the tier's code, the last five by the slow path"
+    );
     let chunk = tier_chunk(&mut engine, "P").expect("P's tier chunk");
     let optimized = chunk.jit.get().flatten().expect("resident");
     assert!(is_tier_code(&optimized), "P runs the tier's code");
@@ -201,6 +208,23 @@ fn a_setter_appearing_on_the_prototype_exits_and_converges_on_the_effect() {
            get() { return this.yy; }, configurable: true }); \
          let u = 0; for (let k = 0; k < 600; k++) u = u + new P(k).y; u",
         "new P(3).y + new P(4).x",
+        ExitReason::WrongShape,
+    );
+}
+
+#[test]
+fn non_extensible_receivers_exit_and_converge_on_the_effect() {
+    // A receiver made non-extensible fails the creation's checks (its shape demoted, its flag
+    // clear), which the snapshot's chain cannot see: the exits flag the site, and the recompile
+    // takes the effect (its WrongShape flag), whose store fails silently in sloppy code.
+    let warm = "function P(x) { this.x = x; return this; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = t + new P(k).x; t";
+    converges(
+        "P",
+        warm,
+        "let u = 0; for (let k = 0; k < 600; k++) \
+           u = u + (P.call(Object.preventExtensions({}), k).x === undefined ? 1 : 0); u",
+        "(P.call(Object.preventExtensions({}), 3).x === undefined) + ':' + new P(4).x",
         ExitReason::WrongShape,
     );
 }

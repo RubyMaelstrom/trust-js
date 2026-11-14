@@ -1,7 +1,8 @@
 //! P3 stage 3 step L3 end to end: named updates and a String's `length` against the VM: `o.x++`,
 //! `++o.x`, `o.x--`, `o.x += 1`, `o.x += 0.5`, `o.x += "s"`, an int32 overflow, -0 and NaN, a
 //! getter-backed `x`; the lengths of an empty, an ASCII, a non-ASCII, a concatenated and a sliced
-//! (a view's) String, and an Array's at a site without a way (RegExp's exec result).
+//! (a view's) String, and an Array's at a site without a way (RegExp's exec result), which
+//! exits and then reads the key-checked way the VM fills.
 
 use super::*;
 
@@ -190,5 +191,28 @@ fn a_string_appended_at_a_numbers_append_exits_and_converges_on_the_effect() {
         "let u = 0; for (let k = 0; k < 600; k++) u = u + f(s, 'x').length; u",
         "f(s, 'yz').length + f(o, 2)",
         ExitReason::NotNumber,
+    );
+}
+
+#[test]
+fn a_numbers_length_at_a_strings_site_exits_and_converges_on_the_effect() {
+    // A Number's `length` fills no way (the fill caches no primitive's `length`): the String's
+    // check exits until the discard, and the recompile takes the generic access by the WrongShape
+    // flag, with no exit after.
+    let warm = "function f(a) { return a.length; }\n\
+         let t = 0; for (let k = 0; k < 1000; k++) t = t + f('ab' + k); t";
+    let chunk = converges(
+        "f",
+        warm,
+        "let u = 0; for (let k = 0; k < 600; k++) u = u + (f(k) === undefined ? 1 : 0); u",
+        "(f(3) === undefined) + ':' + f('abc')",
+        ExitReason::WrongShape,
+    );
+    assert!(
+        graph_now(&chunk)
+            .declines
+            .iter()
+            .any(|decline| decline.reason == ExitReason::WrongShape),
+        "the generic access by the flag"
     );
 }

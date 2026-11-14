@@ -226,6 +226,23 @@ impl PropKey {
         self.0.get()
     }
 
+    /// The key whose word is `word` ([`PropKey::word`]), as generated code holds it (P3 stage 3
+    /// step L3: a creation's slow path).
+    ///
+    /// # Safety
+    /// `word` is the word of a key of the active heap.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    #[inline]
+    pub(crate) unsafe fn from_word(word: u64) -> PropKey {
+        PropKey(NonZeroU64::new(word).expect("a key's word is never 0"))
+    }
+
     /// The key of engine text `text` in the active heap (see [`PropKey::from_units`]).
     pub(crate) fn from_text(text: &str) -> PropKey {
         match crate::value::canonical_index(text) {
