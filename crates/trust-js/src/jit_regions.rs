@@ -3844,6 +3844,11 @@ pub(super) fn emit(
                     let operands = [stack[depth - 2], stack[depth - 1]];
                     stack.pop();
                     stack.pop();
+                    if arithmetic.is_none() {
+                        // Two Numbers: an equality's pair code (P3 stage 3, step L1; a
+                        // relational compare has no byte).
+                        emit_equality_numbers_record(a, pc as u32, 16);
+                    }
                     if let Some(op) = arithmetic {
                         a.f_arith(op, left, left, right);
                         stack.push(Operand::temporary(ScalarKind::Number));

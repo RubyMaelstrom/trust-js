@@ -998,6 +998,23 @@ impl Rules<'_> {
         (number(a) && number(b)) || (strict && (identity(a) || identity(b)))
     }
 
+    /// The pair of operand kinds the equality at `pc` speculates on (P3 stage 3 step L1, B): the
+    /// one its record names (feedback-schema.txt 5.8: the pairs template code met there), which a
+    /// flag of its checks' reason at the pc declines (the builder's `declined`); None for a
+    /// record of no pair, of several, or of another pair (two kinds, nullish, Symbols, BigInts),
+    /// which keeps the generic operation, as Maglev takes a compare's hint
+    /// (maglev-graph-builder.cc:2402-2622) and its kAny the generic node.
+    fn equality_record(&self, pc: usize) -> Option<EqPair> {
+        use crate::feedback::{EQ_BOOLEANS, EQ_NUMBERS, EQ_OBJECTS, EQ_STRINGS};
+        Some(match self.snapshot.equality(pc)?.pairs {
+            EQ_NUMBERS => EqPair::Numbers,
+            EQ_STRINGS => EqPair::Strings,
+            EQ_OBJECTS => EqPair::Objects,
+            EQ_BOOLEANS => EqPair::Booleans,
+            _ => return None,
+        })
+    }
+
     /// The operation of `pc`'s block that pushed the operand `below` places under the top of the
     /// stack at `pc` (0: the top), where one did and that value was its only push.
     fn producer(&self, pc: usize, below: usize) -> Option<usize> {
@@ -1097,6 +1114,33 @@ impl Rules<'_> {
 fn canonical(op: &Op) -> bool {
     matches!(slot_use(op), SlotUse::Any | SlotUse::Writes { .. })
         || crate::bytecode::jit_runs_on_vm_copy(op)
+}
+
+/// The pair of operand kinds an equality speculates on from its record (P3 stage 3 step L1, B).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EqPair {
+    /// Both checked Numbers [NotNumber]: Number::equal, as Maglev's kNumber
+    /// (maglev-graph-builder.cc:2441-2471).
+    Numbers,
+    /// Both checked Strings [NotString]: their contents, as Maglev's kString (:2502-2538).
+    Strings,
+    /// Both checked objects [NotObject]: identity, as Maglev's kReceiver (:2609-2618).
+    Objects,
+    /// Both checked Booleans [NotBoolean]: identity, as JSC's BooleanUse (DFGFixupPhase.cpp:
+    /// 829-835, 5441-5446).
+    Booleans,
+}
+
+impl EqPair {
+    /// The reason of its checks' exits, whose flag declines the speculation.
+    fn reason(self) -> ExitReason {
+        match self {
+            EqPair::Numbers => ExitReason::NotNumber,
+            EqPair::Strings => ExitReason::NotString,
+            EqPair::Objects => ExitReason::NotObject,
+            EqPair::Booleans => ExitReason::NotBoolean,
+        }
+    }
 }
 
 /// The f64 a tagged word holds, None for a word that is not a Number (value.rs: a Number is its
@@ -4042,6 +4086,16 @@ impl<'a> Builder<'a> {
             let y = self.add(NodeOp::WordAsF64, &[word], Rep::F64, pc);
             let cond = if negate { Cond::Ne } else { Cond::Eq };
             self.add(NodeOp::F64Cmp(cond), &[y, x], Rep::Bool, pc)
+        } else if let Some(pair) = self
+            .rules()
+            .equality_record(pc)
+            .filter(|pair| !self.declined(pc, pair.reason(), "the generic operation"))
+        {
+            match self.speculated_equality(pc, pair, a, b, negate, st)? {
+                Some(result) => result,
+                // Operands of another kind than the record's (a constant, an unboxed value).
+                None => return self.mismatch(pc, pair.reason(), st),
+            }
         } else {
             // The effect, unless the rules counted the equality lowered (`Rules::equality_lowers`,
             // which these facts should then hold): an exit there, which the recompile declines.
@@ -4050,6 +4104,98 @@ impl<'a> Builder<'a> {
         st.stack.truncate(len - 2);
         st.stack.push(result);
         Ok(())
+    }
+
+    /// The equality at `pc` of `a` and `b` (negated where `negate`) speculated on the operand
+    /// kinds its record names (P3 stage 3 step L1, B): each operand checked of the kind unless
+    /// its facts prove it (a constant of the kind takes no check), at the equality's pc with its
+    /// operands, its flag declining the speculation; then Number::equal, the Strings' contents or
+    /// identity. None where an operand's facts rule the kind out (a constant of another kind, an
+    /// unboxed value of another).
+    fn speculated_equality(
+        &mut self,
+        pc: usize,
+        pair: EqPair,
+        a: NodeIx,
+        b: NodeIx,
+        negate: bool,
+        st: &mut State,
+    ) -> Result<Option<NodeIx>, Refusal> {
+        use crate::value::PACK_STR;
+        let mut cx = Before::new(pc);
+        let result = match pair {
+            EqPair::Numbers => {
+                if !self.numeric(a) || !self.numeric(b) {
+                    return Ok(None);
+                }
+                let cond = if negate { Cond::Ne } else { Cond::Eq };
+                let int = self.known_int32(st, a) && self.known_int32(st, b);
+                return self.compare(pc, cond, a, b, int, st).map(Some);
+            }
+            EqPair::Strings => {
+                let string = |builder: &Self, value: NodeIx| match builder.constant(value) {
+                    Some(word) => word >> 48 == PACK_STR >> 48,
+                    None => builder.rep(value) == Rep::Tagged,
+                };
+                if !string(self, a) || !string(self, b) {
+                    return Ok(None);
+                }
+                let (x, y) = (self.tagged(st, a, pc), self.tagged(st, b, pc));
+                for word in [x, y] {
+                    if self.constant(word).is_none() {
+                        let state = self.before(&mut cx, st);
+                        self.add_exit(
+                            NodeOp::CheckString,
+                            &[word],
+                            Rep::None,
+                            pc,
+                            state,
+                            ExitReason::NotString,
+                        );
+                    }
+                }
+                self.add(NodeOp::StringEqual, &[x, y], Rep::Bool, pc)
+            }
+            EqPair::Objects => {
+                let object = |builder: &Self, value: NodeIx| {
+                    builder.constant(value).is_none()
+                        && matches!(builder.rep(value), Rep::Tagged | Rep::Cell)
+                };
+                if !object(self, a) || !object(self, b) {
+                    return Ok(None);
+                }
+                let (x, y) = (self.tagged(st, a, pc), self.tagged(st, b, pc));
+                self.object_cell(st, &mut cx, x);
+                self.object_cell(st, &mut cx, y);
+                self.add(NodeOp::TaggedSame, &[x, y], Rep::Bool, pc)
+            }
+            EqPair::Booleans => {
+                let boolean = |builder: &Self, value: NodeIx| match builder.constant(value) {
+                    Some(word) => word & !1 == PACK_BOOL,
+                    None => matches!(builder.rep(value), Rep::Tagged | Rep::Bool),
+                };
+                if !boolean(self, a) || !boolean(self, b) {
+                    return Ok(None);
+                }
+                let (x, y) = (self.tagged(st, a, pc), self.tagged(st, b, pc));
+                for word in [x, y] {
+                    if self.constant(word).is_none() && self.forms(st, word).boolean.is_none() {
+                        let state = self.before(&mut cx, st);
+                        let checked = self.add_exit(
+                            NodeOp::CheckBoolean,
+                            &[word],
+                            Rep::Bool,
+                            pc,
+                            state,
+                            ExitReason::NotBoolean,
+                        );
+                        self.relate(st, word, checked);
+                    }
+                }
+                self.add(NodeOp::TaggedSame, &[x, y], Rep::Bool, pc)
+            }
+        };
+        Ok(Some(self.negated(result, negate, pc)))
     }
 
     /// `test`, negated where `negate` (a constant folded).

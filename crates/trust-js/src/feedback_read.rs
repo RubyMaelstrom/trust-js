@@ -37,8 +37,10 @@ pub(crate) enum SiteView {
     Construct(ConstructView),
     /// Allocation sites.
     Allocation(AllocationView),
-    /// No feedback by design: equality (W4 decision 3), typeof and `in` (lowered generically),
-    /// branches, names and everything else.
+    /// Equality (`==`, `!=`, `===`, `!==`; P3 stage 3, step L1): the equality record.
+    Equality(EqualityView),
+    /// No feedback by design: typeof and `in` (lowered generically), branches, names and
+    /// everything else.
     None,
 }
 
@@ -99,6 +101,14 @@ impl ValuesView {
     pub(crate) fn has_record(&self) -> bool {
         self.recorded != [0; 3]
     }
+}
+
+/// The equality record's view (section 5.8): the pairs of operand kinds template code met at the
+/// site with the optimizing tier on (feedback.rs EQ_*), the record alone (there is no in-line
+/// set: the forms that record store every execution's pair; the VM records nothing).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EqualityView {
+    pub(crate) pairs: u32,
 }
 
 /// The element record's view (section 5.2), in the record's bit positions (feedback.rs ELEM_*).

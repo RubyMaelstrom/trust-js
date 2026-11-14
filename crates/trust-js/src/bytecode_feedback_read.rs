@@ -64,6 +64,12 @@ pub(crate) fn value_in_line_set(op: &Op) -> Option<[u32; 3]> {
     })
 }
 
+/// Whether `op` is an equality (`==`, `!=`, `===`, `!==`), with the equality record (P3 stage
+/// 3, step L1; feedback-schema.txt section 5.8).
+pub(crate) fn is_equality(op: &Op) -> bool {
+    matches!(op, Op::EqEq | Op::NotEq | Op::StrictEq | Op::StrictNotEq)
+}
+
 /// Whether `op` is an element load or store with the element record.
 pub(crate) fn is_element_access(op: &Op) -> bool {
     matches!(
@@ -257,7 +263,7 @@ impl Chunk {
         copy.baselines.clear();
         if let Some(map) = self.feedback.record_map() {
             for (pc, op) in self.ops.iter().enumerate() {
-                if value_in_line_set(op).is_none() && !is_element_access(op) {
+                if value_in_line_set(op).is_none() && !is_element_access(op) && !is_equality(op) {
                     continue;
                 }
                 if let Some((baseline, baseline_pc)) = map.target(pc) {
@@ -542,6 +548,11 @@ fn record_view(op: &Op, word: u32) -> Option<SiteView> {
     if let Some(in_line) = value_in_line_set(op) {
         return Some(SiteView::Values(values_view(word, in_line)));
     }
+    if is_equality(op) {
+        return Some(SiteView::Equality(crate::feedback::EqualityView {
+            pairs: word,
+        }));
+    }
     if is_element_access(op) {
         let recorded_receivers = word & ELEMENT_RECEIVERS;
         let recorded_keys = word & ELEMENT_KEYS;
@@ -559,7 +570,7 @@ fn record_view(op: &Op, word: u32) -> Option<SiteView> {
 }
 
 /// The records of a baseline site whose operation is `op` (None past its chunk) and whose record
-/// is `word`, as [`site_view`] decodes them: a value or element site's view, or a named update's
+/// is `word`, as [`site_view`] decodes them: a value, element or equality site's view, or a named update's
 /// with its values (its ways empty: a transformed chunk's view keeps its own); None for another
 /// operation. What a transformed chunk's view takes of its baseline site (`opt::snapshot`), so
 /// that it reads no baseline cache.

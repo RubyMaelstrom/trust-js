@@ -322,7 +322,8 @@ impl ChunkProfile {
     /// byte the next (see the `elements` field), the bytes made [`UNSEEN`] at the first ask (main
     /// thread: a template compile that records, rule U); None past the chunk. Generated code
     /// stores a kind there (`jit::typed_array::emit`) and a tag in the next
-    /// (`jit::emit_family_record`).
+    /// (`jit::emit_family_record`); at an equality's pc, the first byte holds the pair code its
+    /// template code met last (P3 stage 3, step L1; `jit::emit_equality_record`).
     pub(crate) fn element_byte(&self, len: usize, pc: usize) -> Option<u64> {
         let bytes = self
             .elements
@@ -356,6 +357,20 @@ impl ChunkProfile {
     pub(crate) fn see_element(&self, len: usize, pc: usize, kind: u8) {
         self.element_byte(len, pc).expect("a pc of the chunk");
         self.elements.get().expect("made")[2 * pc].set(kind);
+    }
+
+    /// Store the pair code `code` in the equality at `pc`'s last-seen byte (tests, as
+    /// [`see_element`]; P3 stage 3, step L1).
+    #[cfg(test)]
+    pub(crate) fn see_equality(&self, len: usize, pc: usize, code: u8) {
+        self.element_byte(len, pc).expect("a pc of the chunk");
+        self.elements.get().expect("made")[2 * pc].set(code);
+    }
+
+    /// `pc`'s last-seen equality pair code ([`UNSEEN`] where none was made: tests).
+    #[cfg(test)]
+    pub(crate) fn equality_seen(&self, pc: usize) -> u8 {
+        self.seen_byte(2 * pc)
     }
 
     /// Store the kind tag `tag` in `pc`'s last-seen family byte (tests, as [`see_element`]).
@@ -413,7 +428,20 @@ fn merge_own_element_hits(chunk: &Chunk) {
         return;
     };
     let feedback = chunk.feedback_vector();
+    let ops = chunk.jit_ops();
     for (pc, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        if ops
+            .get(pc)
+            .is_some_and(crate::bytecode::feedback_read::is_equality)
+        {
+            // An equality's byte holds the pair code its template code met last (P3 stage 3,
+            // step L1; feedback-schema.txt 5.8).
+            let code = pair[0].replace(UNSEEN);
+            if code != UNSEEN {
+                feedback.record(pc, crate::feedback::eq_pair(code));
+            }
+            continue;
+        }
         let kind = pair[0].replace(UNSEEN);
         if kind != UNSEEN {
             feedback.record(

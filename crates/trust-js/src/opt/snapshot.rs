@@ -103,7 +103,7 @@ const MAX_CREATION_LEVELS: usize = 8;
 
 // Every reason has its bit in a declined mask: the discriminants run from 0 to the last reason's
 // (ExitReason's last variant), which the mask's width bounds.
-const _: () = assert!((ExitReason::HoistingFailed as u32) < u32::BITS);
+const _: () = assert!((ExitReason::NotString as u32) < u32::BITS);
 
 /// Where a free-name read's search starts (stage 2, step 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -470,6 +470,15 @@ impl Snapshot {
         }
     }
 
+    /// The pairs of operand kinds an equality's template code met (P3 stage 3, step L1; a
+    /// transformed chunk's are its baseline site's, as values() reads them).
+    pub(crate) fn equality(&self, pc: usize) -> Option<crate::feedback::EqualityView> {
+        match self.site(pc) {
+            SiteView::Equality(equality) => Some(equality),
+            _ => None,
+        }
+    }
+
     /// The ways of a named load, store or update.
     pub(crate) fn named(&self, pc: usize) -> Option<NamedView> {
         match self.site(pc) {
@@ -563,7 +572,10 @@ fn view(words: &impl FeedbackWords, pc: usize) -> SiteView {
     let own = feedback_read::site_view(words, pc);
     if !matches!(
         own,
-        SiteView::Values(_) | SiteView::Element(_) | SiteView::NamedUpdate(..)
+        SiteView::Values(_)
+            | SiteView::Element(_)
+            | SiteView::Equality(_)
+            | SiteView::NamedUpdate(..)
     ) {
         return own;
     }
@@ -609,6 +621,7 @@ fn with_baseline_records(own: SiteView, baseline: SiteView) -> SiteView {
     match (own, baseline) {
         (SiteView::Values(_), SiteView::Values(values)) => SiteView::Values(values),
         (SiteView::Element(_), SiteView::Element(element)) => SiteView::Element(element),
+        (SiteView::Equality(_), SiteView::Equality(equality)) => SiteView::Equality(equality),
         (SiteView::NamedUpdate(named, _), SiteView::NamedUpdate(_, values)) => {
             SiteView::NamedUpdate(named, values)
         }
@@ -973,6 +986,7 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
                 }
                 hash.write_u32(construct.prototype_shape);
             }
+            SiteView::Equality(equality) => hash.write_u32(equality.pairs),
             SiteView::Allocation(_) | SiteView::None => {}
         }
     }

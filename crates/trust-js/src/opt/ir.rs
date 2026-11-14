@@ -287,6 +287,11 @@ pub(crate) enum ExitReason {
     /// typed array an effect-free loop accesses, made at its entry edge (step 0c): a flag at the
     /// header leaves the invariants' and the typed arrays' checks in the loop.
     HoistingFailed,
+    /// An equality whose record saw two Strings met a word that is no String (P3 stage 3 step
+    /// L1; V8's kNotAString of CheckString): the flag at its pc leaves the equality the generic
+    /// operation. Not kind-bound, as NotNumber is not: a value site's speculation, at any inline
+    /// kind (snapshot.rs `kind_bound`).
+    NotString,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
@@ -370,13 +375,8 @@ pub(crate) enum NodeOp {
     CheckNoProto {
         ways: u8,
     },
-    /// Tagged -> Bool.
-    // Stage 1's builder branches through ToBoolean and builds no CheckBoolean; the verifier and
-    // the back end take one, as the tests do.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "stage 1's builder builds no CheckBoolean")
-    )]
+    /// Tagged -> Bool [NotBoolean]: an equality's operand where its record saw two Booleans (P3
+    /// stage 3 step L1); the builder branches through ToBoolean.
     CheckBoolean,
     /// Cell -> Bool: whether the object's shape is one of these (at most four), with no exit: a
     /// polymorphic named load's test of one arm's receiver shapes after its CheckShape of them
@@ -460,6 +460,14 @@ pub(crate) enum NodeOp {
     /// (no JavaScript, no allocation, no collection), as SpiderMonkey's MTypeOfIs calls
     /// TypeOfObject out of line. Never TypeofTest::Never, which the builder folds.
     TypeofIs(crate::value::TypeofTest),
+    /// (Tagged): the word is a String's [NotString] (P3 stage 3 step L1; Maglev's CheckString,
+    /// maglev-graph-builder.cc:2502-2506).
+    CheckString,
+    /// (Tagged, Tagged) -> Bool: IsStrictlyEqual of two proven Strings (P3 stage 3 step L1): the
+    /// same cell is equal, different lengths unequal, and equal lengths a cold call of the
+    /// contents' compare, which runs no JavaScript, allocates nothing and does not collect
+    /// (Maglev's StringEqual: identity, the lengths, then its builtin, maglev-ir.cc:6586-6626).
+    StringEqual,
     /// Tagged -> F64: the word's bits as a double, unchecked (P3 stage 3 step L1). A Number's
     /// word is its f64 and every other word is a NaN, so an F64Cmp against a Number is `===`
     /// exactly: unordered, so unequal, for every word that is no Number (the template's constant
@@ -738,6 +746,7 @@ impl NodeOp {
                 | NodeOp::CheckBoolean
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CheckInitialized
+                | NodeOp::CheckString
                 | NodeOp::CheckEnvIs { .. }
                 | NodeOp::CheckCellIs { .. }
                 | NodeOp::CheckGlobalEpoch { .. }

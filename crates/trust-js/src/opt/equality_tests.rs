@@ -460,3 +460,389 @@ fn typeof_results_over_every_kind_equal_the_vms() {
          h + ':' + t"
     ));
 }
+
+// ---- B: the equality record and its speculations ----------------------------------------------
+
+/// The pc of `chunk`'s one equality.
+fn equality_pc(chunk: &Chunk) -> usize {
+    let pcs: Vec<usize> = (0..chunk.jit_ops().len())
+        .filter(|&pc| crate::bytecode::feedback_read::is_equality(&chunk.jit_ops()[pc]))
+        .collect();
+    assert_eq!(pcs.len(), 1, "one equality: {:?}", chunk.jit_ops());
+    pcs[0]
+}
+
+/// Store `codes` one after another in the last-seen byte of the global function `name`'s one
+/// equality, each merged into its record, as template code's stores and the tier's merges at its
+/// checkpoints make it.
+fn see(engine: &mut Engine, name: &str, codes: &[u8]) {
+    let chunk = chunk_of(engine, name);
+    let pc = equality_pc(&chunk);
+    for &code in codes {
+        super::profile::ChunkProfile::of(&chunk).see_equality(chunk.jit_ops().len(), pc, code);
+        super::profile::merge_element_hits(&chunk);
+    }
+}
+
+/// Pair codes as template code stores them (feedback.rs EQ_SEEN_*, eq_seen_tag).
+const NUMBERS: u8 = crate::feedback::EQ_SEEN_NUMBERS;
+const TWO_TAGS: u8 = crate::feedback::EQ_SEEN_TWO_TAGS;
+const STRINGS: u8 = crate::feedback::eq_seen_tag(crate::value::PACK_STR);
+const OBJECTS: u8 = crate::feedback::eq_seen_tag(crate::value::PACK_OBJ);
+const BOOLEANS: u8 = crate::feedback::eq_seen_tag(crate::value::PACK_BOOL);
+
+/// The checks of `op` in `graph` and their reasons.
+fn checks(graph: &Graph, op: &NodeOp) -> Vec<Option<ExitReason>> {
+    graph
+        .nodes
+        .iter()
+        .filter(|node| node.op == *op)
+        .map(|node| node.reason)
+        .collect()
+}
+
+const SPECULATED: &str = "function en(a, b) { return a == b; }
+     function es(a, b) { return a !== b; }
+     function ec(a) { return a === 'lit'; }
+     function eo(a, b) { return a == b; }
+     function eb(a, b) { return a === b; }
+     for (var i = 0; i < 20; i++) { en(i, 2); es('a', 'b'); ec('x'); eo({}, {}); eb(true, false); }";
+
+#[test]
+fn an_equality_whose_record_saw_one_pair_speculates_on_it() {
+    let mut engine = warmed(SPECULATED);
+    for (name, code) in [
+        ("en", NUMBERS),
+        ("es", STRINGS),
+        ("ec", STRINGS),
+        ("eo", OBJECTS),
+        ("eb", BOOLEANS),
+    ] {
+        see(&mut engine, name, &[code]);
+    }
+    let (graph, text) = graph_of(&mut engine, "en");
+    assert_eq!(
+        checks(&graph, &NodeOp::CheckNumber),
+        [Some(ExitReason::NotNumber); 2],
+        "{text}"
+    );
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::F64Cmp(Cond::Eq)),
+        1,
+        "{text}"
+    );
+    for (name, strings, nots) in [("es", 2, 1), ("ec", 1, 0)] {
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(
+            checks(&graph, &NodeOp::CheckString),
+            vec![Some(ExitReason::NotString); strings],
+            "{name}: {text}"
+        );
+        assert_eq!(count(&graph, |op| *op == NodeOp::StringEqual), 1, "{text}");
+        assert_eq!(count(&graph, |op| *op == NodeOp::BoolNot), nots, "{text}");
+    }
+    for (name, check, reason) in [
+        ("eo", NodeOp::CheckObject, ExitReason::NotObject),
+        ("eb", NodeOp::CheckBoolean, ExitReason::NotBoolean),
+    ] {
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(checks(&graph, &check), [Some(reason); 2], "{name}: {text}");
+        assert_eq!(count(&graph, |op| *op == NodeOp::TaggedSame), 1, "{text}");
+    }
+    for name in ["en", "es", "ec", "eo", "eb"] {
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+    }
+}
+
+#[test]
+fn an_equality_whose_record_saw_several_pairs_or_another_stays_the_generic_operation() {
+    let mut engine = warmed(SPECULATED);
+    see(&mut engine, "en", &[NUMBERS, STRINGS]);
+    see(&mut engine, "es", &[TWO_TAGS]);
+    see(&mut engine, "eo", &[OBJECTS, TWO_TAGS]);
+    // Two undefineds, two Symbols: one tag, but no speculation's.
+    see(
+        &mut engine,
+        "eb",
+        &[crate::feedback::eq_seen_tag(crate::value::PACK_UNDEFINED)],
+    );
+    for name in ["en", "es", "eo", "eb", "ec"] {
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(count(&graph, is_effect), 1, "{name}: {text}");
+    }
+}
+
+#[test]
+fn a_flagged_speculation_leaves_the_generic_operation() {
+    // A discarded code's check exited at the site: its recompile declines the speculation, the
+    // record notwithstanding.
+    let mut engine = warmed(SPECULATED);
+    for (name, code, reason) in [
+        ("en", NUMBERS, ExitReason::NotNumber),
+        ("es", STRINGS, ExitReason::NotString),
+        ("eo", OBJECTS, ExitReason::NotObject),
+        ("eb", BOOLEANS, ExitReason::NotBoolean),
+    ] {
+        see(&mut engine, name, &[code]);
+        let chunk = chunk_of(&mut engine, name);
+        let pc = equality_pc(&chunk);
+        super::profile::ChunkProfile::of(&chunk).add_site(pc as u32, reason as u8, false, 0, false);
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(count(&graph, is_effect), 1, "{name}: {text}");
+        assert!(
+            graph
+                .declines
+                .iter()
+                .any(|decline| decline.pc == pc as u32 && decline.reason == reason),
+            "{name}: the decline is noted: {text}"
+        );
+    }
+    // Another reason's flag declines nothing of it.
+    see(&mut engine, "ec", &[STRINGS]);
+    let chunk = chunk_of(&mut engine, "ec");
+    let pc = equality_pc(&chunk);
+    super::profile::ChunkProfile::of(&chunk).add_site(
+        pc as u32,
+        ExitReason::NotNumber as u8,
+        false,
+        0,
+        false,
+    );
+    let (graph, text) = graph_of(&mut engine, "ec");
+    assert_eq!(count(&graph, is_effect), 0, "{text}");
+}
+
+#[test]
+fn a_speculation_its_operands_rule_out_stays_the_generic_operation() {
+    // The record saw two Numbers at `x == 'a'` (a constant String) and two Strings at
+    // `(a | 0) == b` (a proven int32): the operation, which the rules do not count lowered here,
+    // is the generic one.
+    let mut engine = warmed(
+        "function cn(x) { return x == 'a'; } function ci(a, b) { return (a | 0) == b; }
+         for (var i = 0; i < 20; i++) { cn(i); ci(i, 'b'); }",
+    );
+    see(&mut engine, "cn", &[NUMBERS]);
+    see(&mut engine, "ci", &[STRINGS]);
+    for name in ["cn", "ci"] {
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(count(&graph, is_effect), 1, "{name}: {text}");
+        assert!(
+            graph.nodes.iter().all(|node| !matches!(
+                node.op,
+                NodeOp::CheckString | NodeOp::CheckNumber
+            ) || name == "ci"),
+            "{name}: {text}"
+        );
+    }
+}
+
+/// Template code's forms of equality, each in a function of its own: a compact site of two
+/// operands, compact sites of a Number and a String constant, a loop's local pair feeding a
+/// branch, a loop's value equality on a property, and a numeric loop's integer compare.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const FORMS: &str = "function c2(a, b) { return a === b; }
+     function cn(a) { return a == 0; }
+     function cs(a) { return a === 'a'; }
+     function lp(a, b, n) { var c = 0; for (var i = 0; i < n; i++) { if (a == b) c++; } return c; }
+     function lv(o, b, n) { var c = 0; for (var i = 0; i < n; i++) { c += o.v === b ? 1 : 0; }
+       return c; }
+     function li(n) { var c = 0; for (var i = 0; i < n; i++) { if ((i & 3) == 1) c++; } return c; }";
+
+/// An engine at the JIT tier compiling at the first call, under `switches` (forced exits off).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn jit_engine(on: bool) -> Engine {
+    super::TestSwitches {
+        on,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    engine
+}
+
+/// Run `call` as template code only: its first call compiles the function, whose checkpoint is
+/// then never due, so that the tier compiles nothing.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn template_only(engine: &mut Engine, name: &str, call: &str) {
+    eval(engine, call);
+    let chunk = chunk_of(engine, name);
+    assert!(chunk.jit.get().flatten().is_some(), "{name}: native");
+    chunk.set_inline_retry_at(u32::MAX);
+    eval(engine, call);
+}
+
+/// The equality's last-seen byte and record of the global function `name`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn seen(engine: &mut Engine, name: &str) -> (u8, u32) {
+    let chunk = chunk_of(engine, name);
+    let pc = equality_pc(&chunk);
+    (
+        super::profile::ChunkProfile::get(&chunk)
+            .map_or(super::profile::UNSEEN, |profile| profile.equality_seen(pc)),
+        chunk.feedback_vector().record_word(pc),
+    )
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn template_code_records_the_pair_each_form_met() {
+    use crate::feedback::{EQ_NUMBERS, EQ_OBJECTS, EQ_OTHER, EQ_STRINGS};
+    super::pin_forced_exits_off_for_test();
+    let mut engine = jit_engine(true);
+    eval(&mut engine, FORMS);
+    for (name, call, code) in [
+        ("c2", "c2(1, 2.5)", NUMBERS),
+        ("c2", "c2('ab', ['a', 'b'].join(''))", STRINGS),
+        ("c2", "c2({}, {})", OBJECTS),
+        ("c2", "c2(true, false)", BOOLEANS),
+        ("c2", "c2(1, 'a')", TWO_TAGS),
+        ("cn", "cn(3)", NUMBERS),
+        ("cn", "cn('0')", TWO_TAGS),
+        ("cs", "cs('b')", STRINGS),
+        ("cs", "cs(1)", TWO_TAGS),
+        ("lp", "lp(1, 2, 8)", NUMBERS),
+        ("lp", "lp('a', 'b', 8)", STRINGS),
+        ("lp", "lp({}, null, 8)", TWO_TAGS),
+        ("lv", "lv({v: 1}, 2, 8)", NUMBERS),
+        ("lv", "lv({v: 'a'}, 'b', 8)", STRINGS),
+        ("lv", "lv({v: {}}, {}, 8)", OBJECTS),
+        ("li", "li(8)", NUMBERS),
+    ] {
+        template_only(&mut engine, name, call);
+        assert_eq!(seen(&mut engine, name).0, code, "{call}: the byte");
+        // The merge ORs the pair's bit into the record and empties the byte.
+        super::profile::merge_element_hits(&chunk_of(&mut engine, name));
+        let (byte, record) = seen(&mut engine, name);
+        assert_eq!(byte, super::profile::UNSEEN, "{call}");
+        let bit = match code {
+            NUMBERS => EQ_NUMBERS,
+            STRINGS => EQ_STRINGS,
+            OBJECTS => EQ_OBJECTS,
+            BOOLEANS => crate::feedback::EQ_BOOLEANS,
+            _ => EQ_OTHER,
+        };
+        assert_ne!(record & bit, 0, "{call}: {record:#x}");
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn with_the_tier_off_template_code_records_no_pair() {
+    super::pin_forced_exits_off_for_test();
+    let mut engine = jit_engine(false);
+    eval(&mut engine, FORMS);
+    for (name, call) in [
+        ("c2", "c2(1, 2)"),
+        ("cn", "cn(3)"),
+        ("cs", "cs('b')"),
+        ("lp", "lp(1, 2, 8)"),
+        ("lv", "lv({v: 1}, 2, 8)"),
+        ("li", "li(8)"),
+    ] {
+        template_only(&mut engine, name, call);
+        assert_eq!(
+            seen(&mut engine, name),
+            (super::profile::UNSEEN, 0),
+            "{call}: nothing recorded"
+        );
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn speculated_equality_results_equal_the_vms() {
+    // Sites that meet one pair for long, then others late (their checks exit), a String pair
+    // of equal lengths and contents in other cells, a long String, interned and made Strings,
+    // and the table's pairs at sites the records leave generic.
+    results_equal_the_vms(&format!(
+        "{TABLE}
+         function nn(a, b) {{ return a == b; }} function ss(a, b) {{ return a === b; }}
+         function sl(a) {{ return a !== 'a'; }} function oo(a, b) {{ return a == b; }}
+         function bb(a, b) {{ return a !== b; }} function ln(a) {{ return a == 1.5; }}
+         const strs = ['a', 'ab', s2, l1, l2, 'b', 'a'.concat(''), String.fromCharCode(97)];
+         let h = 0, t = 0;
+         for (let k = 0; k < 6000; k++) {{
+           const late = k > 5000, x = vals[k % n], y = vals[(k >> 3) % n];
+           const bits = [
+             nn(late ? x : k & 7, late ? y : (k >> 2) & 7),
+             ss(late ? x : strs[k & 7], late ? y : strs[(k >> 3) & 7]),
+             sl(late ? x : strs[k & 7]),
+             oo(late ? x : (k & 1 ? o : p), late ? y : (k & 2 ? o : p)),
+             bb(late ? x : (k & 1) === 0, late ? y : (k & 2) === 0),
+             ln(late ? x : (k & 3) / 2)];
+           for (const bit of bits) {{ h = (h * 2 + (bit ? 1 : 0)) % 1000003; t += bit ? 1 : 0; }}
+         }}
+         h + ':' + t"
+    ));
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn a_site_that_alternates_its_pairs_settles_within_the_limits() {
+    // `a === b` meets Numbers, then Strings, then both, in turns: its speculation exits, its
+    // flag declines it, and the recompile keeps the generic operation, within two discards.
+    super::pin_forced_exits_off_for_test();
+    let program = "function alt(a, b) { return a === b; }
+         let t = 0;
+         for (let k = 0; k < 40000; k++) {
+           const phase = Math.floor(k / 4000) % 3;
+           const a = phase === 1 ? 's' + (k & 3) : phase === 2 && k & 1 ? 'x' : k & 3;
+           t += alt(a, phase === 0 ? 2 : 's1') ? 1 : 0;
+         }
+         t";
+    let expected = {
+        super::TestSwitches {
+            on: false,
+            ..Default::default()
+        }
+        .set();
+        let mut engine = engine(Tier::Bytecode);
+        eval(&mut engine, program)
+    };
+    super::TEST_DISCARDED.with(|discarded| discarded.borrow_mut().clear());
+    let mut engine = jit_engine(true);
+    assert_eq!(eval(&mut engine, program), expected);
+    let discards = super::TEST_DISCARDED.with(|discarded| discarded.borrow().len());
+    assert!(
+        (1..=2).contains(&discards),
+        "{discards} discards: the speculation exited, then settled"
+    );
+    let chunk = chunk_of(&mut engine, "alt");
+    let first = super::profile::first_stage(&chunk);
+    let flagged = super::profile::ChunkProfile::get(first).is_some_and(|profile| {
+        let mut flagged = false;
+        profile.sites_at(equality_pc(&chunk) as u32, |reason, _, _| {
+            flagged |=
+                reason == ExitReason::NotNumber as u8 || reason == ExitReason::NotString as u8
+        });
+        flagged
+    });
+    assert!(flagged, "the site's flag");
+}

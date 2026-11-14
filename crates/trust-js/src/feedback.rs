@@ -345,7 +345,8 @@ mod read_api;
 #[allow(unused_imports)]
 pub(crate) use read_api::{
     read, read_merged, AllocationKind, AllocationView, CallState, CallTarget, CallView,
-    ConstructView, ElementView, NamedView, NamedWay, NamedWayKind, SiteView, ValuesView,
+    ConstructView, ElementView, EqualityView, NamedView, NamedWay, NamedWayKind, SiteView,
+    ValuesView,
 };
 
 /// The element record (W4 step 4; feedback-schema.txt section 5.2): an element load's or store's
@@ -395,6 +396,55 @@ pub(crate) const fn elem_typed_kind(kind: u8) -> u32 {
         0..=2 => 1 << (21 + kind),
         3..=8 => 1 << (22 + kind),
         _ => 0,
+    }
+}
+
+/// The equality record (P3 stage 3, step L1; feedback-schema.txt section 5.8): an equality's
+/// (`==`, `!=`, `===`, `!==`) word holds the pairs of operand kinds template code met there with
+/// the optimizing tier on, ORed in: two Numbers, two Strings, two objects, two Booleans, any
+/// other pair (two kinds, undefined, null, Symbols, BigInts).
+pub(crate) const EQ_NUMBERS: u32 = 1 << 0;
+pub(crate) const EQ_STRINGS: u32 = 1 << 1;
+pub(crate) const EQ_OBJECTS: u32 = 1 << 2;
+pub(crate) const EQ_BOOLEANS: u32 = 1 << 3;
+pub(crate) const EQ_OTHER: u32 = 1 << 4;
+
+/// The pair code template code stores in an equality's last-seen byte for two Numbers
+/// (`opt::profile::ChunkProfile`; one `strb wzr`).
+pub(crate) const EQ_SEEN_NUMBERS: u8 = 0;
+/// The pair code for operands of two tags.
+// Only the ARM64 templates store it (x86-64 has no optimizing tier yet).
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) const EQ_SEEN_TWO_TAGS: u8 = 1;
+
+/// The pair code of two words of one tag: the tag's bits 0-6 and its sign bit as bit 7 (value.rs:
+/// the canonical NaN 0x78, undefined 0x79, the TDZ marker 0x7a, null 0x7b, a Boolean 0x7c, a
+/// BigInt 0x7d, a String 0x7e, a Symbol 0x7f, an object 0xf9), as template code computes it from
+/// a word (`ubfx` of bits 48-54, `bfi` of bit 63).
+pub(crate) const fn eq_seen_tag(word: u64) -> u8 {
+    (((word >> 48) & 0x7f) | ((word >> 63) << 7)) as u8
+}
+
+/// The equality record's bit for a last-seen pair code (see [`EQ_SEEN_NUMBERS`],
+/// [`eq_seen_tag`]): two Numbers (the canonical NaN's pair too), two Strings, two objects, two
+/// Booleans, else the other pairs'.
+pub(crate) const fn eq_pair(code: u8) -> u32 {
+    const NAN: u8 = eq_seen_tag(crate::value::PACK_CANON_NAN);
+    const STR: u8 = eq_seen_tag(crate::value::PACK_STR);
+    const OBJ: u8 = eq_seen_tag(crate::value::PACK_OBJ);
+    const BOOL: u8 = eq_seen_tag(crate::value::PACK_BOOL);
+    match code {
+        EQ_SEEN_NUMBERS | NAN => EQ_NUMBERS,
+        STR => EQ_STRINGS,
+        OBJ => EQ_OBJECTS,
+        BOOL => EQ_BOOLEANS,
+        _ => EQ_OTHER,
     }
 }
 

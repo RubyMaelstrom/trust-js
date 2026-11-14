@@ -7786,6 +7786,55 @@ fn emit_family_record(a: &mut asm::Asm, record: Option<u64>, scratch: u32) {
     }
 }
 
+/// At an equality whose two operands are Numbers: store the pair code of two Numbers
+/// (`feedback::EQ_SEEN_NUMBERS`, 0) in the site's last-seen byte (P3 stage 3, step L1;
+/// `opt::profile::ChunkProfile`'s bytes, an equality's first), which the optimizing tier merges
+/// into the equality record (feedback-schema.txt 5.8), as V8's baseline combines a compare's
+/// feedback at every execution (baseline/baseline-compiler.cc:2155-2196). Four instructions
+/// (the address and `strb wzr`), nothing where the code records nothing (the tier off). Clobbers
+/// x`scratch` only: NZCV and the operands' registers are kept.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_equality_numbers_record(a: &mut asm::Asm, pc: u32, scratch: u32) {
+    if let Some(byte) = a.element_record(pc) {
+        a.mov_imm64(scratch, byte);
+        a.strb_imm(31, scratch, 0);
+    }
+}
+
+/// At an equality whose operands, the words in x`x` and x`y`, are not two Numbers (one of them is
+/// no Number, or both are the canonical NaN): store their pair code in the site's last-seen byte
+/// (see [`emit_equality_numbers_record`]): their one tag's code
+/// (`feedback::eq_seen_tag`, its bits 0-6 and its sign bit), or two tags'
+/// (`feedback::EQ_SEEN_TWO_TAGS`). Nothing where the code records nothing. Clobbers x16, x17 and
+/// NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_equality_tags_record(a: &mut asm::Asm, pc: u32, x: u32, y: u32) {
+    let Some(byte) = a.element_record(pc) else {
+        return;
+    };
+    let two = a.new_label();
+    let store = a.new_label();
+    a.logic_x(2, 16, x, y);
+    a.lsr_imm(16, 16, 48);
+    a.cbnz(16, false, two);
+    a.ubfx(16, x, 48, 7);
+    a.lsr_imm(17, x, 63);
+    a.lsl_imm(17, 17, 7);
+    a.logic_x(1, 16, 16, 17);
+    a.b(store);
+    a.bind(two);
+    a.movz(16, u32::from(crate::feedback::EQ_SEEN_TWO_TAGS), 0);
+    a.bind(store);
+    a.mov_imm64(17, byte);
+    a.strb_imm(16, 17, 0);
+}
+
 /// Branch to `miss` unless the kind tag already loaded in `reg` is ordinary
 /// ([`crate::value::ObjectKind::is_ordinary`]: see [`branch_exotic_ordinary`]) or an
 /// admitted primitive-wrapper tag. Wrapper tags are admitted only at sites whose compile-time
@@ -13981,6 +14030,20 @@ fn emit_local_eq_branch(
     a.b_cond(C_EQ, slow);
     a.cmp_imm_w(10, 1);
     a.b_cond(C_EQ, slow);
+    // The pair's code (P3 stage 3, step L1): two Numbers by their kinds, else by their tags.
+    if a.element_record(first_pc + 2).is_some() {
+        let numbers = a.new_label();
+        let recorded = a.new_label();
+        a.cmp_imm_w(9, 4);
+        a.b_cond(C_NE, numbers);
+        a.cmp_imm_w(10, 4);
+        a.b_cond(C_NE, numbers);
+        emit_equality_numbers_record(a, first_pc + 2, 16);
+        a.b(recorded);
+        a.bind(numbers);
+        emit_equality_tags_record(a, first_pc + 2, 12, 13);
+        a.bind(recorded);
+    }
     a.cmp_imm_w(9, 8);
     a.b_cond(C_EQ, lhs_obj);
     a.cmp_imm_w(10, 8);
@@ -14917,8 +14980,10 @@ fn emit_eq_inline(
     let scalar_bool = a.new_label();
     emit_exec_number_guard(a, 12, 0, 14, tagged);
     emit_exec_number_guard(a, 13, 1, 14, tagged);
+    emit_equality_numbers_record(a, pc, 16);
     a.b(l_num);
     a.bind(tagged);
+    emit_equality_tags_record(a, pc, 12, 13);
     // Undefined/Null/Bool pairs are complete scalar comparisons, with no owners to release.
     // Do not generalize raw-bit equality to Numbers (NaN/±0) or reference-valued operands.
     a.lsr_imm(9, 12, 48);
@@ -15279,6 +15344,7 @@ fn emit_equal_site(
     a.fmov_d_x(1, 13);
     a.fcmp(0, 1);
     a.b_cond(C_VS, call);
+    emit_equality_numbers_record(a, pc, 16);
     match branch {
         Some(target) => {
             // JumpIfFalse jumps when the operation's result is false.
@@ -15295,6 +15361,7 @@ fn emit_equal_site(
     }
     a.b(done);
     a.bind(call);
+    emit_equality_tags_record(a, pc, 12, 13);
     emit_equal_call(a, pc, l_unwind, strict, negate, branch, true);
     a.bind(done);
 }
@@ -15848,6 +15915,13 @@ fn emit_eq_constant(
                 a.fmov_d_x(1, 10);
                 a.fcmp(0, 1);
             }
+            // The pair's code (P3 stage 3, step L1): two Numbers where the compare is ordered,
+            // else two tags (the constant is a Number, the operand none or NaN); the flags kept.
+            if let Some(byte) = a.element_record(pc) {
+                a.cset_w(16, C_VS);
+                a.mov_imm64(17, byte);
+                a.strb_imm(16, 17, 0);
+            }
             a.b_cond(C_VS, generic);
             decide(a, C_EQ);
             a.b(done);
@@ -15872,6 +15946,8 @@ fn emit_eq_constant(
         EqConstant::Str(word) => {
             // x10 keeps the word for the fallback's push.
             a.mov_imm64(10, word);
+            // The pair's code (P3 stage 3, step L1): two Strings' or two tags'.
+            emit_equality_tags_record(a, pc, 9, 10);
             a.cmp_reg_x(9, 10);
             a.b_cond(C_EQ, equal);
             (word, [true, false])
@@ -21080,6 +21156,9 @@ fn emit_chain_marked(
             ChainOp::CmpBranch(neg, target) => {
                 let (rm, _) = vregs.pop().expect("chain vstack");
                 let (rn, _) = vregs.pop().expect("chain vstack");
+                // Two Numbers (the chain's guards): an equality's pair code (P3 stage 3, step L1;
+                // a relational compare has no byte).
+                emit_equality_numbers_record(a, *pc as u32, 16);
                 a.fcmp(rn, rm);
                 a.b_cond(neg, pc_labels[target]);
                 free.push(rm);

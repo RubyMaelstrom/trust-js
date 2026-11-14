@@ -756,7 +756,7 @@ enum Cold {
         dst: u32,
         resume: usize,
         helper: u64,
-        arg: u64,
+        arg: TestArg,
     },
     /// The moves of an edge into a merge from a block with two successors.
     Edge {
@@ -822,6 +822,13 @@ enum Cold {
         done: usize,
         exit: usize,
     },
+}
+
+/// A test call's second argument (`Cold::TestCall`): an immediate, or a register's word.
+#[derive(Clone, Copy)]
+enum TestArg {
+    Imm(u64),
+    Reg(u32),
 }
 
 /// The exits of an Array's hole fill or append: a receiver, prototype or `length` the in-line
@@ -1080,6 +1087,21 @@ unsafe extern "C" fn emulates_undefined(ctx: *mut JitCtx, word: u64, _: u64) -> 
     u64::from(i.is_htmldda(&unsafe { crate::value::Value::from_bits(word) }))
 }
 
+/// StringEqual's cold path (P3 stage 3 step L1): IsStrictlyEqual of the Strings `a` and `b` of
+/// equal lengths, their contents compared (`LStr`'s equality). It runs no JavaScript, allocates
+/// nothing and does not collect.
+unsafe extern "C" fn strings_equal(ctx: *mut JitCtx, a: u64, b: u64) -> u64 {
+    let i = unsafe { &*(*ctx).interp };
+    // SAFETY: two Strings' words, which the code's frame keeps alive.
+    let (a, b) = unsafe {
+        (
+            crate::value::Value::from_bits(a),
+            crate::value::Value::from_bits(b),
+        )
+    };
+    u64::from(i.strict_equals(&a, &b))
+}
+
 /// TypeofIs's cold path (P3 stage 3 step L1): the interpreter's typeof_matches of `word` for
 /// the test whose discriminant is `test` (a proxy's callability is a field of it; an object
 /// that may be [[IsHTMLDDA]] is looked up). It runs no JavaScript, allocates nothing and does
@@ -1213,6 +1235,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
+        NodeOp::CheckString => ExitReason::NotString,
         NodeOp::CheckEnvIs { .. }
         | NodeOp::CheckCellIs { .. }
         | NodeOp::CheckGlobalEpoch { .. }
@@ -2315,6 +2338,19 @@ impl Gen<'_> {
                     self.lower_typeof_is(n, *test);
                 }
             }
+            NodeOp::CheckString => {
+                let site = self.check_exit(n)?;
+                let word = self.gp(input(0), X16);
+                self.a.lsr_imm(X17, word, 48);
+                self.a.movz(X30, (crate::value::PACK_STR >> 48) as u32, 0);
+                self.a.cmp_reg_w(X17, X30);
+                self.a.b_cond(NE, site);
+            }
+            NodeOp::StringEqual => {
+                if !unused {
+                    self.lower_string_equal(n);
+                }
+            }
             NodeOp::WordAsF64 => {
                 if !unused {
                     let word = self.gp(input(0), X16);
@@ -3192,10 +3228,25 @@ impl Gen<'_> {
                     } => {
                         self.a.bind(label);
                         let saved = self.save_live_caller_saved(node);
-                        // The word first: it may be in x0 or x2.
-                        self.a.mov(1, word);
+                        // x1 = the word, x2 = the argument, x0 = the context, in an order that
+                        // reads each register before it is written.
+                        let other = match arg {
+                            TestArg::Reg(1) => {
+                                self.a.mov(X17, 1);
+                                Some(X17)
+                            }
+                            TestArg::Reg(r) => Some(r),
+                            TestArg::Imm(_) => None,
+                        };
+                        if word != 1 {
+                            self.a.mov(1, word);
+                        }
+                        match (arg, other) {
+                            (_, Some(r)) => self.a.mov(2, r),
+                            (TestArg::Imm(imm), None) => self.a.mov_imm64(2, imm),
+                            (TestArg::Reg(_), None) => unreachable!("a register's argument"),
+                        }
                         self.a.mov(0, 19);
-                        self.a.mov_imm64(2, arg);
                         self.a.mov_imm64(X16, helper);
                         self.a.blr(X16);
                         self.a.mov_w(X9, 0);
@@ -3482,7 +3533,47 @@ impl Gen<'_> {
             dst: w,
             resume: done,
             helper: emulates_undefined as *const () as u64,
-            arg: 0,
+            arg: TestArg::Imm(0),
+        });
+        self.gp_done(n, w);
+    }
+
+    /// StringEqual (P3 stage 3 step L1): two proven Strings, the same cell equal, lengths that
+    /// differ unequal, equal lengths the cold call of the contents' compare (IsStrictlyEqual, as
+    /// the shared Equal stub and the checked helper compare them). The inputs are read before the
+    /// result is written.
+    fn lower_string_equal(&mut self, n: NodeIx) {
+        let node = self.graph.node(n);
+        let x = self.gp(node.inputs[0], X16);
+        let y = self.gp(node.inputs[1], X17);
+        let w = self.gp_dst(n);
+        let yes = self.a.new_label();
+        let no = self.a.new_label();
+        let slow = self.a.new_label();
+        let done = self.a.new_label();
+        self.a.cmp_reg_x(x, y);
+        self.a.b_cond(EQ, yes);
+        let len = crate::lstr::LEN_OFF as u32;
+        self.a.ubfx(X30, x, 0, 48);
+        self.a.ldr_w_imm(X30, X30, len);
+        self.a.ubfx(X9, y, 0, 48);
+        self.a.ldr_w_imm(X9, X9, len);
+        self.a.cmp_reg_w(X30, X9);
+        self.a.b_cond(EQ, slow);
+        self.a.bind(no);
+        self.a.movz(w, 0, 0);
+        self.a.b(done);
+        self.a.bind(yes);
+        self.a.movz(w, 1, 0);
+        self.a.bind(done);
+        self.cold.push(Cold::TestCall {
+            label: slow,
+            node: n,
+            word: x,
+            dst: w,
+            resume: done,
+            helper: strings_equal as *const () as u64,
+            arg: TestArg::Reg(y),
         });
         self.gp_done(n, w);
     }
@@ -3595,7 +3686,7 @@ impl Gen<'_> {
             dst: w,
             resume: done,
             helper: typeof_matches as *const () as u64,
-            arg: u64::from(test as u8),
+            arg: TestArg::Imm(u64::from(test as u8)),
         });
         self.gp_done(n, w);
     }

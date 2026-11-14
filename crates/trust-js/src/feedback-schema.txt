@@ -119,8 +119,9 @@ every execution there), an element access when its record read by rule R (sectio
 exactly the receivers and keys that record saw, and typeof, `in` and equality, which record
 nothing, as not precise.
 Branches, loops, `!` (ToBoolean) and names are counted but left out: no exemplar records branch
-directions or ToBoolean, and names mostly have static addresses. Equality has no record by design
-(W4 decision 3), so the script prints a second total without it.
+directions or ToBoolean, and names mostly have static addresses. Equality had no record by design
+(W4 decision 3), so the script prints a second total without it; since P3 stage 3 step L1 its
+record (5.8) is written only with the optimizing tier on, which the census's runs do not take.
 
 5. The always-on records (W4; each step adds its record here)
 
@@ -138,8 +139,8 @@ Who writes it:
   helper (jit_add_strings), the string accumulation, the update helpers. A miss records only
   values outside its operation's in-line set, so a backend that runs an operation out of line
   (x86-64's Add, Sub, Mul, Div, `%`, shifts, Neg, updates) records what ARM64's in-line path would.
-- Nothing on an in-line path, and nothing for equality (==, !=, ===, !==): the speculative tier
-  types equality from its operands, as JSC does (the plan's W4 decision 3).
+- Nothing on an in-line path, and nothing for equality (==, !=, ===, !==), which has a record of
+  its own (5.8).
 
 The in-line sets, by operation (operand 0, operand 1, result):
   Add, Sub, Mul, Div, UShr, `**` (GenBin)        Number, Number, Number
@@ -284,7 +285,8 @@ interning nothing: its shapes are the process's shape ids, its targets the proce
 - Allocation: the kind (object, array, RegExp, closure) and whether the image and the template (an
   object literal's template, an array literal's shared block, a RegExp literal's compiled
   pattern) exist.
-- None: the rest, equality (no record by design), typeof and `in` among them.
+- Equality (==, !=, ===, !==): the equality record (5.8).
+- None: the rest, typeof and `in` among them.
 Exact: the ways and targets as read, each a proof that generated code re-validates (a shape is
 never reused; a way may name a shape no live object has any more), and an epoch-current call
 target. Hints: the int32/double split and an Array's facts. Stale: a call target of an older
@@ -344,3 +346,34 @@ The registry costs one load at a marked prototype's structural change while no s
 registered, and nothing elsewhere. Its first consumer is the speculative tier (Phase 3); the
 tests (dependency_tests.rs) consume it meanwhile. PROTO_EPOCH and CALL_IC_EPOCH stay the
 baseline caches' invalidation.
+
+5.8 The equality record (P3 stage 3, step L1; it reverses W4 decision 3 for template code with
+the optimizing tier on). An equality's (==, !=, ===, !==) word in the feedback vector (the value
+record's word, which no other writer touches at an equality's pc) holds the pairs of operand
+kinds template code met there, a bit set ORed in (feedback.rs EQ_*):
+  bit 0 two Numbers (EQ_NUMBERS), 1 two Strings (EQ_STRINGS), 2 two objects (EQ_OBJECTS),
+  3 two Booleans (EQ_BOOLEANS), 4 any other pair (EQ_OTHER: operands of two kinds, two
+  undefineds or nulls, two Symbols, two BigInts).
+Who writes it: only the optimizing tier's merge, from template code's last-seen byte (rule U's
+mechanism, 5.2): with the tier on and only in chunks the tier would compile (the element bytes'
+gate, opt::element_records), each form of equality in template code stores a pair code into the
+first last-seen byte of its site's pc (opt/profile.rs ChunkProfile; a transformed chunk's into
+its baseline site's, through the record map, which names equality operations since step L1):
+0 for two Numbers (FCMP ordered; four instructions, `strb wzr`), else for two words of one tag
+its code (bits 0-6 of the tag and its sign bit as bit 7: the canonical NaN 0x78, undefined 0x79,
+null 0x7b, a Boolean 0x7c, a BigInt 0x7d, a String 0x7e, a Symbol 0x7f, an object 0xf9) and 1
+for two tags (feedback.rs EQ_SEEN_*, eq_seen_tag; jit.rs emit_equality_numbers_record,
+emit_equality_tags_record). The forms that store: the in-line template (emit_eq_inline, its
+Number path and its tagged path), the compact site (emit_equal_site, before its stub call), the
+compact constant sites of a loose Number constant and of a String constant (emit_eq_constant),
+a local pair feeding a branch (emit_local_eq_branch), the numeric chains' and regions' compares
+of two Numbers; the shared Equal stub is unchanged. The merge (opt::profile::merge_element_hits)
+ORs the code's bit (feedback.rs eq_pair: 0 and 0x78 two Numbers, 0x7e Strings, 0xf9 objects,
+0x7c Booleans, anything else EQ_OTHER) into the record and empties the byte, at the compile's
+copy and at each settled-feedback checkpoint's fingerprint. The VM, the helpers and the tier-off
+template code record nothing for equality.
+Reading it: the record alone (no in-line set: the forms that store store every execution's pair).
+A pair met only in the VM, or in a form that stores nothing (an x86-64 template, a site of a
+layout the in-line templates decline), is missing from it: the speculative tier's check then
+exits, its flag at the pc declines the speculation, as a wrong guess from rule U's last-seen
+bytes is corrected. An empty record is "not observed".

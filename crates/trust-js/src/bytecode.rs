@@ -7387,10 +7387,12 @@ fn record_origins(c: &Compiler) -> Vec<(u32, u32)> {
     origins
 }
 
-/// Whether an operation has a baseline site the record map names: a value, element or named one.
+/// Whether an operation has a baseline site the record map names: a value, element, equality
+/// (P3 stage 3, step L1) or named one.
 fn mapped_operation(op: &Op) -> bool {
     feedback_read::value_in_line_set(op).is_some()
         || feedback_read::is_element_access(op)
+        || feedback_read::is_equality(op)
         || named_site_cache(op).is_some()
 }
 
@@ -7442,12 +7444,17 @@ fn mapped_kind(op: &Op) -> usize {
         Op::SetPropThisDrop(..) => 42,
         Op::SetPropLocalDrop(..) => 43,
         Op::AppendProp(..) => 44,
+        // P3 stage 3, step L1: the equality record's.
+        Op::EqEq => 45,
+        Op::NotEq => 46,
+        Op::StrictEq => 47,
+        Op::StrictNotEq => 48,
         _ => 0,
     }
 }
 
 /// The kind codes' count (0 included).
-const MAPPED_KINDS: usize = 45;
+const MAPPED_KINDS: usize = 49;
 
 /// A chunk's named operations grouped by kind, each group in pc order (a counting sort): kind
 /// k's pcs are `pcs[start[k]..start[k + 1]]`.

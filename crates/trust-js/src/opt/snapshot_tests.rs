@@ -249,6 +249,7 @@ fn the_raw_copy_decodes_to_the_live_chunks_views() {
             SiteView::Call(_) => "call",
             SiteView::Construct(_) => "construct",
             SiteView::Allocation(_) => "allocation",
+            SiteView::Equality(_) => "equality",
             SiteView::None => "none",
         })
         .collect();
