@@ -204,8 +204,8 @@ fn another_kind_of_way_or_a_numbers_stays_the_effect() {
     // Object.prototype (depth 1, its primitive marked: an object's walk would check the word's
     // shape and exit at every call); a `prototype` a function holds for the objects made from it
     // (a deferred one in its slot until the checked operation materializes it); an Array between
-    // the receiver and the holder (no recorded shape: the fill records none for an Array level,
-    // whose shape says nothing of its elements, and the templates check it by none).
+    // the receiver and the holder (the fill makes such a site generic; were a way to name a level
+    // whose shape it did not record, `NamedWay::levels` would refuse it).
     for name in [
         "getter",
         "absent",
