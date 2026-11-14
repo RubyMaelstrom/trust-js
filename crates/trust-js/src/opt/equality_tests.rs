@@ -922,6 +922,235 @@ fn a_site_that_alternates_its_pairs_settles_within_the_limits() {
     assert!(flagged, "the site's flag");
 }
 
+// ---- L1b: the object-or-nullish pair ------------------------------------------------------------
+
+const NULLISH_SITES: &str = "function on(a, b) { return a == b; }
+     function os(a, b) { return a !== b; }
+     function oc(a) { return a == 'x'; }
+     function ou(a, b) { return a === b; }
+     function ox(a, b) { return a == b; }
+     for (var i = 0; i < 20; i++) { on(i & 1 ? {} : null, {}); os(undefined, null); oc({});
+       ou({}, i & 1 ? {} : undefined); ox(null, i & 1 ? {} : 1); }";
+
+#[test]
+fn a_record_of_objects_and_nullish_values_checks_each_an_object_or_nullish() {
+    // An object against null and two objects (`==`): each operand checked an object or nullish
+    // [NotObjectOrNullish], then TurboFan's loose compare; two undefineds alone (`!==`): the
+    // checks, then identity, negated; `a == 'x'` with such a record: the String constant rules
+    // the pair out, the mismatch exit; nullish pairs and another (null against a Number): the
+    // generic operation.
+    let mut engine = warmed(NULLISH_SITES);
+    see(&mut engine, "on", &[OBJECTS, OBJECT_OR_NULLISH]);
+    see(&mut engine, "os", &[UNDEFINEDS]);
+    see(&mut engine, "oc", &[OBJECT_OR_NULLISH]);
+    see(&mut engine, "ou", &[OBJECT_OR_NULLISH, OBJECTS]);
+    see(&mut engine, "ox", &[OBJECT_OR_NULLISH, TWO_TAGS]);
+    let (graph, text) = graph_of(&mut engine, "ox");
+    assert_eq!(count(&graph, is_effect), 1, "{text}");
+    for (name, compare) in [
+        ("on", NodeOp::ObjectOrNullishEqual),
+        ("os", NodeOp::TaggedSame),
+        ("ou", NodeOp::TaggedSame),
+    ] {
+        let (graph, text) = graph_of(&mut engine, name);
+        assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
+        assert_eq!(
+            checks(&graph, &NodeOp::CheckObjectOrNullish),
+            vec![Some(ExitReason::NotObjectOrNullish); 2],
+            "{name}: {text}"
+        );
+        assert_eq!(count(&graph, |op| *op == compare), 1, "{name}: {text}");
+        assert_eq!(
+            count(&graph, |op| *op == NodeOp::BoolNot),
+            usize::from(name == "os"),
+            "{name}: {text}"
+        );
+    }
+    let (graph, text) = graph_of(&mut engine, "oc");
+    assert_eq!(
+        count(&graph, |op| *op
+            == NodeOp::Exit(ExitReason::NotObjectOrNullish)),
+        1,
+        "{text}"
+    );
+    // NotObject's flag (an Objects speculation's exit) leaves the pair; its own flag declines it.
+    let chunk = chunk_of(&mut engine, "on");
+    let pc = equality_pc(&chunk);
+    let profile = super::profile::ChunkProfile::of(&chunk);
+    profile.add_site(pc as u32, ExitReason::NotObject as u8, false, 0, false);
+    let (graph, text) = graph_of(&mut engine, "on");
+    assert_eq!(
+        count(&graph, |op| *op == NodeOp::ObjectOrNullishEqual),
+        1,
+        "{text}"
+    );
+    profile.add_site(
+        pc as u32,
+        ExitReason::NotObjectOrNullish as u8,
+        false,
+        0,
+        false,
+    );
+    let (graph, text) = graph_of(&mut engine, "on");
+    assert_eq!(count(&graph, is_effect), 1, "{text}");
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn object_or_nullish_equality_results_equal_the_vms() {
+    // Sites that meet objects (an [[IsHTMLDDA]] one among them), undefined and null for long, then
+    // the whole table late (their checks exit), under `==`, `!=`, `===` and `!==`.
+    results_equal_the_vms(&format!(
+        "{TABLE}
+         function le(a, b) {{ return a == b; }} function ln(a, b) {{ return a != b; }}
+         function se(a, b) {{ return a === b; }} function sn(a, b) {{ return a !== b; }}
+         const kin = [o, p, null, undefined, dda, o, [1], null];
+         let h = 0, t = 0;
+         for (let k = 0; k < 6000; k++) {{
+           const late = k > 5000, x = vals[k % n], y = vals[(k >> 3) % n];
+           const a = late ? x : kin[k & 7], b = late ? y : kin[(k >> 3) & 7];
+           const bits = [le(a, b), ln(b, a), se(a, b), sn(a, b), le(a, a), se(b, null)];
+           for (const bit of bits) {{ h = (h * 2 + (bit ? 1 : 0)) % 1000003; t += bit ? 1 : 0; }}
+         }}
+         h + ':' + t"
+    ));
+}
+
+/// Run `program` with the tier on (forced exits off), its result the VM's; the exits taken, and
+/// the discards made, while it ran.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn exits_and_discards(program: &str) -> (Engine, Vec<ExitReason>, usize) {
+    let expected = {
+        super::TestSwitches {
+            on: false,
+            ..Default::default()
+        }
+        .set();
+        let mut engine = engine(Tier::Bytecode);
+        eval(&mut engine, program)
+    };
+    super::TEST_DISCARDED.with(|discarded| discarded.borrow_mut().clear());
+    super::TEST_COMPILED.with(|compiled| compiled.borrow_mut().clear());
+    super::exit::TEST_EXITS.with(|exits| exits.borrow_mut().clear());
+    let mut engine = jit_engine(true);
+    assert_eq!(eval(&mut engine, program), expected, "{program}");
+    assert!(
+        super::TEST_COMPILED.with(|compiled| !compiled.borrow().is_empty()),
+        "the tier compiled: {program}"
+    );
+    let exits = super::exit::TEST_EXITS
+        .with(|exits| exits.borrow().iter().map(|&(_, reason)| reason).collect());
+    let discards = super::TEST_DISCARDED.with(|discarded| discarded.borrow().len());
+    (engine, exits, discards)
+}
+
+/// The equality speculations' exit reasons.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+const EQUALITY_REASONS: [ExitReason; 5] = [
+    ExitReason::NotNumber,
+    ExitReason::NotString,
+    ExitReason::NotObject,
+    ExitReason::NotBoolean,
+    ExitReason::NotObjectOrNullish,
+];
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn sites_whose_pairs_alternate_take_no_exit_once_their_record_has_seen_both() {
+    // From the first call: RayTrace's `shape != exclude` (an object, null for one call in four,
+    // each call's loop meeting one pair), Strings and Numbers in turns, two Strings and a String
+    // against an object in turns. The record keeps both pairs (P3 stage 3 step L1b), so the first
+    // compile speculates on objects or nullish values, or keeps the generic operation: no exit.
+    super::pin_forced_exits_off_for_test();
+    for (name, program, compare) in [
+        (
+            "rt",
+            "function rt(shapes, ex) { var h = 0;
+               for (var i = 0; i < shapes.length; i++) { if (shapes[i] != ex) h++; } return h; }
+             const S = [{}, {}, {}, {}]; let t = 0;
+             for (let k = 0; k < 20000; k++) t += rt(S, k & 3 ? S[k & 3] : null);
+             t",
+            Some(NodeOp::ObjectOrNullishEqual),
+        ),
+        (
+            "sn",
+            "function sn(a, b) { return a === b; } let t = 0;
+             for (let k = 0; k < 20000; k++) t += (k & 1 ? sn(k & 3, 2) : sn('s' + (k & 3), 's1')) ? 1 : 0;
+             t",
+            None,
+        ),
+        (
+            "st",
+            "function st(a, b) { return a === b; } const o = {}; let t = 0;
+             for (let k = 0; k < 20000; k++) t += (k & 1 ? st('a' + (k & 1), 'a1') : st('a', o)) ? 1 : 0;
+             t",
+            None,
+        ),
+    ] {
+        let (mut engine, exits, _) = exits_and_discards(program);
+        let at_equality: Vec<_> = exits
+            .iter()
+            .filter(|reason| EQUALITY_REASONS.contains(reason))
+            .collect();
+        assert!(at_equality.is_empty(), "{name}: {at_equality:?}");
+        let (graph, text) = graph_of(&mut engine, name);
+        match &compare {
+            Some(op) => assert_eq!(count(&graph, |node| node == op), 1, "{name}: {text}"),
+            None => assert_eq!(count(&graph, is_effect), 1, "{name}: {text}"),
+        }
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn a_site_that_meets_a_second_pair_late_converges_in_one_discard() {
+    // Objects alone for long, then objects and null in turns: the Objects speculation exits
+    // [NotObject], one discard, and the recompile speculates on objects or nullish values with no
+    // exit after; Numbers for long, then Strings: one discard, then the generic operation.
+    super::pin_forced_exits_off_for_test();
+    for (name, program, compare) in [
+        (
+            "cv",
+            "function cv(shapes, ex) { var h = 0;
+               for (var i = 0; i < shapes.length; i++) { if (shapes[i] != ex) h++; } return h; }
+             const S = [{}, {}, {}, {}]; let t = 0;
+             for (let k = 0; k < 40000; k++) t += cv(S, k < 20000 || k & 3 ? S[k & 3] : null);
+             t",
+            Some(NodeOp::ObjectOrNullishEqual),
+        ),
+        (
+            "nv",
+            "function nv(a, b) { return a === b; } let t = 0;
+             for (let k = 0; k < 40000; k++) t += (k < 20000 ? nv(k & 3, 2) : nv('s' + (k & 3), 's1')) ? 1 : 0;
+             t",
+            None,
+        ),
+    ] {
+        let (mut engine, exits, discards) = exits_and_discards(program);
+        assert_eq!(discards, 1, "{name}: {exits:?}");
+        let (graph, text) = graph_of(&mut engine, name);
+        match &compare {
+            Some(op) => assert_eq!(count(&graph, |node| node == op), 1, "{name}: {text}"),
+            None => assert_eq!(count(&graph, is_effect), 1, "{name}: {text}"),
+        }
+    }
+}
+
 // ---- C: the prepass's claims ------------------------------------------------------------------
 
 /// The blocks of `graph`'s one natural loop: its header and those that reach its back edges.

@@ -1374,6 +1374,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckCallee { .. } => ExitReason::WrongCallee,
         NodeOp::CheckInitialized => ExitReason::Tdz,
         NodeOp::CheckString => ExitReason::NotString,
+        NodeOp::CheckObjectOrNullish => ExitReason::NotObjectOrNullish,
         NodeOp::CheckEnvIs { .. }
         | NodeOp::CheckCellIs { .. }
         | NodeOp::CheckGlobalEpoch { .. }
@@ -2514,6 +2515,22 @@ impl Gen<'_> {
             NodeOp::StringEqual => {
                 if !unused {
                     self.lower_string_equal(n);
+                }
+            }
+            NodeOp::CheckObjectOrNullish => {
+                let site = self.check_exit(n)?;
+                let word = self.gp(input(0), X16);
+                let ok = self.a.new_label();
+                // An object: the tag 0xfff9 is -7 as a signed half.
+                self.a.asr_imm(X30, word, 48);
+                self.a.cmn_imm_x(X30, 7);
+                self.a.b_cond(EQ, ok);
+                self.nullish_or(word, site);
+                self.a.bind(ok);
+            }
+            NodeOp::ObjectOrNullishEqual => {
+                if !unused {
+                    self.lower_object_or_nullish_equal(n);
                 }
             }
             NodeOp::WordAsF64 => {
@@ -4001,6 +4018,84 @@ impl Gen<'_> {
             arg: TestArg::Imm(0),
         });
         self.gp_done(n, w);
+    }
+
+    /// Branch to `not_nullish` unless `word` is undefined, null or the TDZ marker (`tag | 2` is
+    /// null's tag, as NullOrLikeUndefined and the templates' `== null` test it). Clobbers x9 and
+    /// x30.
+    fn nullish_or(&mut self, word: u32, not_nullish: usize) {
+        self.a.lsr_imm(X30, word, 48);
+        let two = asm::logical_imm_w(2).expect("2 is a logical immediate");
+        self.a.logic_imm_w(1, X30, X30, two);
+        self.a.movz(X9, (crate::value::PACK_NULL >> 48) as u32, 0);
+        self.a.cmp_reg_w(X30, X9);
+        self.a.b_cond(NE, not_nullish);
+    }
+
+    /// ObjectOrNullishEqual (P3 stage 3 step L1b): IsLooselyEqual of two words each an object or
+    /// nullish (their checks made), TurboFan's form (compiler/js-typed-lowering.cc:1009-1060):
+    /// the same word true; else, where one is nullish, whether the other is nullish or
+    /// [[IsHTMLDDA]] (an object of ic_plain set is not, one of ic_plain clear takes the cold call
+    /// of `Interp::is_htmldda`, as NullOrLikeUndefined decides); else (two objects) false. The
+    /// inputs are read before the result is written; only x9 and x30 are written before that.
+    fn lower_object_or_nullish_equal(&mut self, n: NodeIx) {
+        let node = self.graph.node(n);
+        let x = self.gp(node.inputs[0], X16);
+        let y = self.gp(node.inputs[1], X17);
+        let w = self.gp_dst(n);
+        let yes = self.a.new_label();
+        let no = self.a.new_label();
+        let done = self.a.new_label();
+        let x_not = self.a.new_label();
+        let slow_x = self.a.new_label();
+        let slow_y = self.a.new_label();
+        self.a.cmp_reg_x(x, y);
+        self.a.b_cond(EQ, yes);
+        self.nullish_or(x, x_not);
+        // x nullish: equal where y is nullish, or an object that is [[IsHTMLDDA]].
+        self.not_nullish_object_test(y, yes, no, slow_y);
+        self.a.bind(x_not);
+        // x an object: equal where y is nullish and x [[IsHTMLDDA]]; two objects differ.
+        self.nullish_or(y, no);
+        self.htmldda_test(x, no, slow_x);
+        self.a.bind(no);
+        self.a.movz(w, 0, 0);
+        self.a.b(done);
+        self.a.bind(yes);
+        self.a.movz(w, 1, 0);
+        self.a.bind(done);
+        for (label, word) in [(slow_x, x), (slow_y, y)] {
+            self.cold.push(Cold::TestCall {
+                label,
+                node: n,
+                word,
+                dst: w,
+                resume: done,
+                helper: emulates_undefined as *const () as u64,
+                arg: TestArg::Imm(0),
+            });
+        }
+        self.gp_done(n, w);
+    }
+
+    /// For `word`, an object or nullish: to `nullish` where it is nullish, else as
+    /// [`Gen::htmldda_test`]. Clobbers x9 and x30.
+    fn not_nullish_object_test(&mut self, word: u32, nullish: usize, no: usize, slow: usize) {
+        let object = self.a.new_label();
+        self.nullish_or(word, object);
+        self.a.b(nullish);
+        self.a.bind(object);
+        self.htmldda_test(word, no, slow);
+    }
+
+    /// For `word`, an object: to `no` where its ic_plain is set (no [[IsHTMLDDA]] object has it),
+    /// else to `slow`, the cold call that asks. Clobbers x30.
+    fn htmldda_test(&mut self, word: u32, no: usize, slow: usize) {
+        self.a.ubfx(X30, word, 0, 48);
+        self.a.add_imm(X30, X30, self.layout.obj_from_cell as u32);
+        self.a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+        self.a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
+        self.a.b(no);
     }
 
     /// StringEqual (P3 stage 3 step L1): two proven Strings, the same cell equal, lengths that

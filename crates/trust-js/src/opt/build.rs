@@ -1028,17 +1028,21 @@ impl Rules<'_> {
 
     /// The pair of operand kinds the equality at `pc` speculates on (P3 stage 3 step L1, B): the
     /// one its record names (feedback-schema.txt 5.8: the pairs template code met there), which a
-    /// flag of its checks' reason at the pc declines (the builder's `declined`); None for a
-    /// record of no pair, of several, or of another pair (two kinds, nullish, Symbols, BigInts),
-    /// which keeps the generic operation, as Maglev takes a compare's hint
+    /// flag of its checks' reason at the pc declines (the builder's `declined`); a record of
+    /// nullish pairs, with or without two objects', names the object-or-nullish pair (step L1b,
+    /// V8's kReceiverOrNullOrUndefined, the union of the kReceiver and kNullOrUndefined flags);
+    /// None for a record of no pair, of several others, or of another pair (two kinds, Symbols,
+    /// BigInts), which keeps the generic operation, as Maglev takes a compare's hint
     /// (maglev-graph-builder.cc:2402-2622) and its kAny the generic node.
     fn equality_record(&self, pc: usize) -> Option<EqPair> {
-        use crate::feedback::{EQ_BOOLEANS, EQ_NUMBERS, EQ_OBJECTS, EQ_STRINGS};
+        use crate::feedback::{EQ_BOOLEANS, EQ_NULLISH, EQ_NUMBERS, EQ_OBJECTS, EQ_STRINGS};
         Some(match self.snapshot.equality(pc)?.pairs {
             EQ_NUMBERS => EqPair::Numbers,
             EQ_STRINGS => EqPair::Strings,
             EQ_OBJECTS => EqPair::Objects,
             EQ_BOOLEANS => EqPair::Booleans,
+            EQ_NULLISH => EqPair::ObjectsOrNullish,
+            pairs if pairs == EQ_NULLISH | EQ_OBJECTS => EqPair::ObjectsOrNullish,
             _ => return None,
         })
     }
@@ -1157,6 +1161,11 @@ enum EqPair {
     /// Both checked Booleans [NotBoolean]: identity, as JSC's BooleanUse (DFGFixupPhase.cpp:
     /// 829-835, 5441-5446).
     Booleans,
+    /// Each checked an object or nullish [NotObjectOrNullish] (P3 stage 3 step L1b): under `===`
+    /// identity, as Maglev's kReceiverOrNullOrUndefined (:2597-2607); under `==` TurboFan's form
+    /// (ObjectOrNullishEqual; compiler/js-typed-lowering.cc:1009-1060), which Maglev leaves
+    /// generic.
+    ObjectsOrNullish,
 }
 
 impl EqPair {
@@ -1167,6 +1176,7 @@ impl EqPair {
             EqPair::Strings => ExitReason::NotString,
             EqPair::Objects => ExitReason::NotObject,
             EqPair::Booleans => ExitReason::NotBoolean,
+            EqPair::ObjectsOrNullish => ExitReason::NotObjectOrNullish,
         }
     }
 }
@@ -4132,7 +4142,7 @@ impl<'a> Builder<'a> {
             .equality_record(pc)
             .filter(|pair| !self.declined(pc, pair.reason(), "the generic operation"))
         {
-            match self.speculated_equality(pc, pair, a, b, negate, st)? {
+            match self.speculated_equality(pc, pair, a, b, strict, negate, st)? {
                 Some(result) => result,
                 // Operands of another kind than the record's (a constant, an unboxed value).
                 None => return self.mismatch(pc, pair.reason(), st),
@@ -4151,14 +4161,17 @@ impl<'a> Builder<'a> {
     /// kinds its record names (P3 stage 3 step L1, B): each operand checked of the kind unless
     /// its facts prove it (a constant of the kind takes no check), at the equality's pc with its
     /// operands, its flag declining the speculation; then Number::equal, the Strings' contents or
-    /// identity. None where an operand's facts rule the kind out (a constant of another kind, an
-    /// unboxed value of another).
+    /// identity (under `==` of objects or nullish words, ObjectOrNullishEqual). None where an
+    /// operand's facts rule the kind out (a constant of another kind, an unboxed value of
+    /// another).
+    #[allow(clippy::too_many_arguments)]
     fn speculated_equality(
         &mut self,
         pc: usize,
         pair: EqPair,
         a: NodeIx,
         b: NodeIx,
+        strict: bool,
         negate: bool,
         st: &mut State,
     ) -> Result<Option<NodeIx>, Refusal> {
@@ -4234,6 +4247,37 @@ impl<'a> Builder<'a> {
                     }
                 }
                 self.add(NodeOp::TaggedSame, &[x, y], Rep::Bool, pc)
+            }
+            EqPair::ObjectsOrNullish => {
+                // An undefined or null constant needs no check (the branches before take most of
+                // them); a constant of another kind, or an unboxed value, rules the pair out.
+                let fits = |builder: &Self, value: NodeIx| match builder.constant(value) {
+                    Some(word) => word == PACK_UNDEFINED || word == PACK_NULL,
+                    None => matches!(builder.rep(value), Rep::Tagged | Rep::Cell),
+                };
+                if !fits(self, a) || !fits(self, b) {
+                    return Ok(None);
+                }
+                let (x, y) = (self.tagged(st, a, pc), self.tagged(st, b, pc));
+                for word in [x, y] {
+                    if self.constant(word).is_none() && self.forms(st, word).cell.is_none() {
+                        let state = self.before(&mut cx, st);
+                        self.add_exit(
+                            NodeOp::CheckObjectOrNullish,
+                            &[word],
+                            Rep::None,
+                            pc,
+                            state,
+                            ExitReason::NotObjectOrNullish,
+                        );
+                    }
+                }
+                let op = if strict {
+                    NodeOp::TaggedSame
+                } else {
+                    NodeOp::ObjectOrNullishEqual
+                };
+                self.add(op, &[x, y], Rep::Bool, pc)
             }
         };
         Ok(Some(self.negated(result, negate, pc)))

@@ -292,6 +292,13 @@ pub(crate) enum ExitReason {
     /// operation. Not kind-bound, as NotNumber is not: a value site's speculation, at any inline
     /// kind (snapshot.rs `kind_bound`).
     NotString,
+    /// An equality whose record saw objects and nullish values met a word that is neither (P3
+    /// stage 3 step L1b; Maglev's CheckJSReceiverOrNullOrUndefined and its
+    /// kNotAJavaScriptObjectOrNullOrUndefined, maglev-graph-builder.cc:3706-3714):
+    /// the flag at its pc leaves the equality the generic operation. Its own reason, not
+    /// NotObject's: an Objects speculation that met null exits NotObject, and its recompile, whose
+    /// record then holds both, takes this pair. Not kind-bound, as NotString is not.
+    NotObjectOrNullish,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
@@ -463,6 +470,16 @@ pub(crate) enum NodeOp {
     /// (Tagged): the word is a String's [NotString] (P3 stage 3 step L1; Maglev's CheckString,
     /// maglev-graph-builder.cc:2502-2506).
     CheckString,
+    /// (Tagged): the word is an object, undefined or null (`tag | 2` null's: the TDZ marker too, as
+    /// NullOrLikeUndefined takes it) [NotObjectOrNullish] (P3 stage 3 step L1b; Maglev's
+    /// CheckJSReceiverOrNullOrUndefined, maglev-graph-builder.cc:3706-, JSC's ObjectOrOtherUse).
+    CheckObjectOrNullish,
+    /// (Tagged, Tagged) -> Bool: IsLooselyEqual of two words each an object or nullish (P3 stage
+    /// 3 step L1b), TurboFan's form (compiler/js-typed-lowering.cc:1009-1060): the same word is
+    /// equal; else a nullish word equals the other exactly where that one is nullish or an
+    /// [[IsHTMLDDA]] object (NullOrLikeUndefined's test, its cold call for an object of clear
+    /// ic_plain), and two objects that differ are unequal.
+    ObjectOrNullishEqual,
     /// (Tagged, Tagged) -> Bool: IsStrictlyEqual of two proven Strings (P3 stage 3 step L1): the
     /// same cell is equal, different lengths unequal, and equal lengths a cold call of the
     /// contents' compare, which runs no JavaScript, allocates nothing and does not collect
@@ -747,6 +764,7 @@ impl NodeOp {
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CheckInitialized
                 | NodeOp::CheckString
+                | NodeOp::CheckObjectOrNullish
                 | NodeOp::CheckEnvIs { .. }
                 | NodeOp::CheckCellIs { .. }
                 | NodeOp::CheckGlobalEpoch { .. }

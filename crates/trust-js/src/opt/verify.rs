@@ -650,8 +650,10 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::BoolNot => (BOOL, Rep::Bool),
         NodeOp::NullOrLikeUndefined | NodeOp::TypeofIs(_) => (TAGGED, Rep::Bool),
         NodeOp::WordAsF64 => (TAGGED, Rep::F64),
-        NodeOp::CheckString => (TAGGED, Rep::None),
-        NodeOp::StringEqual => (&[Rep::Tagged, Rep::Tagged], Rep::Bool),
+        NodeOp::CheckString | NodeOp::CheckObjectOrNullish => (TAGGED, Rep::None),
+        NodeOp::StringEqual | NodeOp::ObjectOrNullishEqual => {
+            (&[Rep::Tagged, Rep::Tagged], Rep::Bool)
+        }
         NodeOp::LoadField { .. } => (CELL, Rep::Tagged),
         NodeOp::StoreField { .. } | NodeOp::StoreNew { .. } => {
             (&[Rep::Cell, Rep::Tagged], Rep::None)
