@@ -489,7 +489,7 @@ fn a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     ChunkProfile::of(&chunk).arm(1, 0);
-    super::reoptimize(&mut engine.interp, &chunk, func, Some(chunk.clone()), 0);
+    super::reoptimize(&mut engine.interp, &chunk, func, Some(chunk.clone()));
     assert_eq!(
         engine.interp.opt_pending.len(),
         1,

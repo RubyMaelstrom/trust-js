@@ -998,6 +998,9 @@ fn a_sites_refills_past_its_capacity_leave_the_fingerprint_and_its_transitions_c
 
 #[test]
 fn a_chunk_over_the_size_limit_is_refused_before_its_snapshot_and_keeps_its_second_stage() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     // V8's size limit (stage 2, step 11): big, which splices inc, has more operations than the
     // tier takes; its second stage is built and published, and the tier refuses it first thing,
     // so that the template JIT's code runs it, as after any refusal.
@@ -1778,6 +1781,9 @@ fn a_fifth_shape_converges_on_the_generic_access() {
 
 #[test]
 fn a_call_over_four_callees_converges_on_the_guards_mismatch_edge() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     // Richards' `t.run()`: one callee while the second stage is built, which splices it; four
     // afterwards, which the recompile's guard sends to the generic call in place.
     let chunk = converges(
@@ -1813,6 +1819,9 @@ fn a_call_over_four_callees_converges_on_the_guards_mismatch_edge() {
 /// mismatch edge, the generic call in place, which meets them by code.
 #[test]
 fn a_late_second_closure_converges_on_the_guards_mismatch_edge() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     let chunk = converges(
         "apply1",
         "function apply1(f, x) { return f(x); }\n\
@@ -2028,6 +2037,9 @@ fn forced_exits_record_nothing() {
 
 #[test]
 fn a_stale_chains_recompile_is_compiled_by_the_tier() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     // A discarded second stage runs the template JIT's code, whose operator chains bake the
     // shapes its caches held (`jit::build_chain`); a second class's replays ask for the recompile
     // without chains (`Chunk::note_chain_replay`), code3, which the tier compiles as it does a

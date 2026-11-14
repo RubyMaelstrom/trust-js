@@ -264,7 +264,6 @@ mod off {
         _: &Chunk,
         _: std::rc::Weak<crate::ast::Function>,
         _: Option<std::rc::Rc<Chunk>>,
-        _: usize,
     ) {
     }
 
@@ -367,6 +366,18 @@ pub(crate) fn pin_tier_off_for_test() {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     TestSwitches::default().set();
+}
+
+/// Pin TRUST_JS_OPT_INLINE=splice on this thread, whatever the environment and the test's switches
+/// say, for a test whose subject is a splice's second stage, which graph inlining replaces for a
+/// plan of leaf callees (P3 stage 3, step 2). Called first in the test, as `pin_tier_off_for_test`.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn pin_splice_for_test() {
+    pin_splice(true);
 }
 
 /// Keep the tier as the environment sets it, without its forced exits (TRUST_JS_OPT_EXIT_EVERY),

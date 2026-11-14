@@ -656,6 +656,9 @@ fn the_chain_recompile_supersedes_a_first_stage_that_carries_the_tiers_code() {
 
 #[test]
 fn the_exit_profile_on_the_first_stage_is_read_by_a_callers_splice() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     // `leaf`'s own code exits at its add, keyed on its first stage (it has no other chunk); a
     // caller's second stage that splices it declines the site.
     exit_limit_one().set();

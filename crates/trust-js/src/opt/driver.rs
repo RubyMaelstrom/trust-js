@@ -278,10 +278,28 @@ pub(crate) fn exit_every() -> u32 {
 /// switches.
 pub(crate) fn inline_graph() -> bool {
     #[cfg(test)]
+    if SPLICE_PINNED.with(Cell::get) {
+        return false;
+    }
+    #[cfg(test)]
     if let Some(graph) = test_switches().and_then(|switches| switches.inline_graph) {
         return graph;
     }
     matches!(env_value!("TRUST_JS_OPT_INLINE"), Some("graph"))
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `pin_splice_for_test`'s pin, whatever this thread's switches say.
+    static SPLICE_PINNED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Pin TRUST_JS_OPT_INLINE=splice on this thread, whatever its switches (which helpers set again)
+/// and the environment say: for a test whose subject is a splice, a second stage, which graph
+/// inlining replaces for an all-leaf plan (P3 stage 3, step 2).
+#[cfg(test)]
+pub(crate) fn pin_splice(pinned: bool) {
+    SPLICE_PINNED.with(|pin| pin.set(pinned));
 }
 
 /// TRUST_JS_OPT_NO_REOPT: stage 1's fallback for good: a discard records no exit profile, adds
@@ -2039,7 +2057,6 @@ pub(crate) fn reoptimize(
     chunk: &Chunk,
     func: std::rc::Weak<crate::ast::Function>,
     chunk_rc: Option<Rc<Chunk>>,
-    realm: usize,
 ) {
     let profile = ChunkProfile::of(chunk);
     let Some((checkpoint, at)) = profile.warm_up() else {
@@ -2077,13 +2094,9 @@ pub(crate) fn reoptimize(
             name(chunk)
         );
     }
-    // Under TRUST_JS_OPT_INLINE=graph a first stage compiled in place plans again, as every
-    // exemplar decides at each compile (P3 stage 3, step 2; `opt::oracle`); a second stage keeps
-    // its splices.
-    let inline = (inline_graph() && in_place(chunk))
-        .then(|| func.upgrade())
-        .flatten()
-        .map(|func| super::oracle::Request::Replan { func, realm });
+    // Under TRUST_JS_OPT_INLINE=graph a first stage compiled in place inlines the ways its first
+    // compile took (P3 stage 3, step 2; `opt::oracle`), as a second stage keeps its splices.
+    let inline = (inline_graph() && in_place(chunk)).then_some(super::oracle::Request::Kept);
     if asynchronous() {
         if let Some(chunk_rc) = chunk_rc {
             // A refusal at the preparation keeps the template JIT's code, as one at the compile.

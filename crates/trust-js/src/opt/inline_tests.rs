@@ -1205,3 +1205,51 @@ fn a_function_the_tier_refuses_splices_at_its_next_checkpoint() {
     );
     assert_eq!(eval(&mut engine, "rf(5)"), "7");
 }
+
+#[test]
+fn a_reoptimization_inlines_the_ways_its_first_compile_took() {
+    // Richards' `t.run()`: one callee at the first compile, four afterwards. The reoptimization
+    // inlines the first compile's way again (`ChunkProfile::inline_ways`), its guard flagged, and
+    // the others take the generic call after it, as a second stage's reoptimization keeps its
+    // splices: one discard, then no exit.
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(
+        &mut engine,
+        "function A() {} A.prototype.run = function () { return 1; };
+         function B() {} B.prototype.run = function () { return 2; };
+         function C() {} C.prototype.run = function () { return 3; };
+         function D() {} D.prototype.run = function () { return 4; };
+         function runTask(t) { return t.run(); }
+         var tasks = [new A(), new B(), new C(), new D()];
+         for (var k = 0; k < 1000; k++) runTask(tasks[0]);",
+    );
+    let chunk = chunk_of(&mut engine, "runTask");
+    assert!(super::in_place(&chunk));
+    assert_eq!(
+        ChunkProfile::get(&chunk).map(|profile| profile.inline_ways().len()),
+        Some(1)
+    );
+    inlines();
+    super::exit::TEST_EXITS.with(|exits| exits.borrow_mut().clear());
+    let out = eval(
+        &mut engine,
+        "var u = 0; for (var k = 0; k < 2000; k++) u += runTask(tasks[k % 4]); u",
+    );
+    assert_eq!(out, "5000");
+    let exits = super::exit::TEST_EXITS.with(|exits| std::mem::take(&mut *exits.borrow_mut()));
+    assert_eq!(
+        exits.len(),
+        super::EXIT_LIMIT as usize,
+        "one discard's exits, then none"
+    );
+    let notes = inlines();
+    assert_eq!(
+        notes
+            .iter()
+            .map(|note| (note.way, note.outcome.clone()))
+            .collect::<Vec<_>>(),
+        vec![(0, InlineOutcome::Inlined)],
+        "the reoptimization's one way, the first compile's"
+    );
+}

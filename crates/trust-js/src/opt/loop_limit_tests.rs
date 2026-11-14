@@ -175,6 +175,11 @@ fn exit_then_loop(
     placement: Placement,
 ) -> (Engine, Rc<Chunk>, Rc<JitCode>) {
     switches.set();
+    if placement == Placement::Spliced {
+        // A second stage is the placement asked for (graph inlining compiles a plan of leaf
+        // callees in place: P3 stage 3, step 2).
+        super::pin_splice_for_test();
+    }
     let mut engine = jit_engine();
     compiled();
     eval(&mut engine, placement.source());

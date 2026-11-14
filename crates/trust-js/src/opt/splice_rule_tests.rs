@@ -231,6 +231,9 @@ fn a_site_with_two_callees_is_not_spliced_with_the_tier_on_and_is_with_it_off() 
 
 #[test]
 fn a_site_of_one_closure_is_spliced_with_the_tier_on_as_before() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     let program = format!(
         "{APPLY}const one = make(1);\n\
          let t = 0; for (let k = 0; k < 300; k++) t += apply1(one, k); t"
@@ -527,6 +530,9 @@ fn assert_settled_after_the_guards_warm_up(chunk: &Chunk) {
 /// both guards and settles with the tier's code.
 #[test]
 fn a_named_method_site_over_two_classes_is_spliced_with_the_tier_on() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     let program = format!(
         "{CLASSES}function call2(o) {{ return o.get(); }}\n\
          let t = 0; for (let k = 0; k < 1000; k++) t += call2(k % 2 ? new A(k) : new B(k)); t"
@@ -604,6 +610,9 @@ fn a_free_names_call_over_two_functions_is_not_spliced_with_the_tier_on() {
 /// holds the named site's two guards alone and settles with the tier's code.
 #[test]
 fn only_the_named_method_site_among_its_neighbours_is_spliced_with_the_tier_on() {
+    // A second stage's splices are this test's subject (graph inlining replaces them for a
+    // plan of leaf callees: P3 stage 3, step 2).
+    super::pin_splice_for_test();
     let program = format!(
         "{CLASSES}function inc(x) {{ return x + 1; }}\n\
          function dbl(x) {{ return x * 2; }}\n\

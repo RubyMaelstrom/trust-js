@@ -192,8 +192,9 @@ comment/example in the same change.
   splice, each such callee built into its graph from the callee's own first stage behind the
   guard a splice has, an inlined frame whose exits rebuild the callee's frame and its caller's;
   a callee with an operation the tier leaves to its template is not inlined (its call stays),
-  and every other plan splices as before. A reoptimization of such a function plans again; one
-  the tier refuses splices at its next checkpoint (`[opt] graph inlining refused <name>: its
+  and every other plan splices as before. A reoptimization of such a function inlines the ways
+  its first compile took (while their callees live), as a second stage's reoptimization keeps its
+  splices; a function the tier refuses splices at its next checkpoint (`[opt] graph inlining refused <name>: its
   next checkpoint splices`), as a refused second stage keeps its splices. Its
   log adds `[opt] oracle <name>: <n> sites, <w> ways, <c> callee chunks in <ms> ms` (the inline
   decisions and the callees' snapshots, inside the `snapshot` part), `[opt] inlined <name> pc

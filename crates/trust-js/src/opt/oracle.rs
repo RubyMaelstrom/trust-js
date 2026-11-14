@@ -6,11 +6,13 @@
 //! Maglev's and JSC's are, would need every cell atomic.
 //!
 //! - The decisions are the splice planner's (`bytecode::plan_inlines`: the same ways, so that the
-//!   step measures the mechanism alone; the policy is step 8's): the plan the checkpoint made, or
-//!   at a reoptimization a fresh one, as every exemplar decides at each compile (a plan holds
-//!   unrooted function cells, which no chunk may keep). Kept of each site: the ways whose callees
-//!   are leaves (no call or `new`), the splice's own emission's filters (at most eight arguments;
-//!   no `this` from a plain call), recursion refused as the planner refuses it (D13).
+//!   step measures the mechanism alone; the policy is step 8's): the plan the checkpoint made, and
+//!   at a reoptimization the ways that compile took (`ChunkProfile::inline_ways`, weak pins), as a
+//!   second stage's reoptimization recompiles the splices its recompile made, so that a site that
+//!   meets other callees later converges as a splice does, on its guard's mismatch edge. Kept of
+//!   each site: the ways whose callees are leaves (no call or `new`), the splice's own emission's
+//!   filters (at most eight arguments; no `this` from a plain call), recursion refused as the
+//!   planner refuses it (D13).
 //! - Each distinct callee first-stage chunk, once per job: its frozen view and raw copy in job
 //!   memory, as the compiled chunk's (`Chunk::freeze_into`, `Raw::take_inlined_into`, which reads
 //!   its exit profile as an inlined frame's).
@@ -21,6 +23,7 @@
 
 use super::build::{InlineSite, InlineWay};
 use super::job::{InlineJob, JobMemory};
+use super::profile::{ChunkProfile, KeptWay};
 use super::view::{FrozenChunk, InlineTargetView};
 use crate::bytecode::{Chunk, InlinePlanEntry, Op};
 use crate::fasthash::FastMap;
@@ -28,14 +31,10 @@ use crate::interpreter::{Env, Interp};
 use std::rc::Rc;
 
 /// What a compile's preparation asks the oracle for: the plan its checkpoint made (a first
-/// compile), or a fresh plan of the function (a reoptimization).
+/// compile), or the ways that compile took (a reoptimization: `ChunkProfile::inline_ways`).
 pub(crate) enum Request {
     Plan(FastMap<u32, InlinePlanEntry>),
-    Replan {
-        func: Rc<crate::ast::Function>,
-        /// The function's [[Realm]] (`UserCallable::realm`), as its call cache recorded it.
-        realm: usize,
-    },
+    Kept,
 }
 
 /// What the main thread keeps of a compile's inlining until its install: the callee chunks, by
@@ -83,9 +82,7 @@ pub(crate) fn prepare(
 ) -> Option<(InlineJob, Held)> {
     let plan = match request {
         Request::Plan(plan) => plan,
-        Request::Replan { func, realm } => {
-            crate::bytecode::plan_inlines(chunk, &func, realm, &i.global_env)
-        }
+        Request::Kept => kept_plan(chunk),
     };
     if plan.is_empty() {
         return None;
@@ -105,6 +102,7 @@ pub(crate) fn prepare(
     let mut sites = Vec::new();
     let mut callees: Vec<JobMemory> = Vec::new();
     let mut held = Held::default();
+    let mut kept: Vec<KeptWay> = Vec::new();
     for (cache, entry) in entries {
         let Some(&(argc, with_this)) = calls.get(&cache) else {
             continue;
@@ -167,6 +165,14 @@ pub(crate) fn prepare(
                 guard: (ways.len() + 1) as u8,
             });
             held.pins.push(crate::value::Gc::downgrade(&way.obj));
+            kept.push(KeptWay {
+                cache,
+                callee: crate::value::Gc::downgrade(&way.obj),
+                check_this: way.check_this,
+                uses_this: way.uses_this,
+                expected_genv: way.expected_genv,
+                genv_pin: way.genv_pin.clone(),
+            });
             ways.push(InlineWay {
                 target,
                 chunk: index as u32,
@@ -178,5 +184,42 @@ pub(crate) fn prepare(
             sites.push(InlineSite { cache, ways });
         }
     }
+    // The ways a reoptimization takes again (see the module's doc).
+    ChunkProfile::of(chunk).set_inline_ways(kept);
     (!sites.is_empty()).then_some((InlineJob { sites, callees }, held))
+}
+
+/// The plan of the ways `chunk`'s first compile took (`ChunkProfile::inline_ways`), in their
+/// sites and order, each while its callee lives: a reoptimization's, as a second stage's
+/// reoptimization recompiles the splices its recompile made (stage 2, step 3's departure 1).
+fn kept_plan(chunk: &Chunk) -> FastMap<u32, InlinePlanEntry> {
+    let mut plan: FastMap<u32, InlinePlanEntry> = FastMap::default();
+    let Some(profile) = ChunkProfile::get(chunk) else {
+        return plan;
+    };
+    for way in profile.inline_ways() {
+        let Some(obj) = way.callee.upgrade() else {
+            continue;
+        };
+        let f = match &obj.borrow().kind {
+            crate::value::ObjectKind::User(user) => Rc::clone(&user.func),
+            _ => continue,
+        };
+        plan.entry(way.cache)
+            .or_insert_with(|| InlinePlanEntry { ways: Vec::new() })
+            .ways
+            .push(crate::bytecode::InlineWay {
+                f,
+                obj,
+                check_this: way.check_this,
+                uses_this: way.uses_this,
+                leaf: true,
+                free_names: Vec::new(),
+                expected_env: 0,
+                expected_genv: way.expected_genv,
+                genv_pin: way.genv_pin,
+                nested: FastMap::default(),
+            });
+    }
+    plan
 }

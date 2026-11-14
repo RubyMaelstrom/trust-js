@@ -104,6 +104,10 @@ pub(crate) struct ChunkProfile {
     /// graph; P3 stage 3, step 2): its function's next checkpoint splices, as a function the tier
     /// refuses keeps a second stage's splices for its template code.
     graph_refused: Cell<bool>,
+    /// The ways the graph inliner took at the chunk's first compile under TRUST_JS_OPT_INLINE=
+    /// graph (P3 stage 3, step 2), which its reoptimizations take again (`opt::oracle`), as a
+    /// second stage keeps the splices its recompile made: weak pins, no GC edge.
+    inline_ways: RefCell<Vec<KeptWay>>,
     /// Template code's last-seen element receivers (P3 stage 3, rule U), two bytes per pc (`2 pc`
     /// and `2 pc + 1`), made by the first template compile that records into them
     /// ([`ChunkProfile::element_byte`]), JSC's ArrayProfile::m_lastSeenStructureID
@@ -114,6 +118,25 @@ pub(crate) struct ChunkProfile {
     /// a pointer: nothing the collector reads. The bytes never move: generated code stores to
     /// their addresses.
     elements: OnceCell<Box<[Cell<u8>]>>,
+}
+
+/// A way the graph inliner took (`ChunkProfile::inline_ways`; P3 stage 3, step 2): its call
+/// site, its callee's pin and the planner's facts of it, from which a reoptimization makes the way
+/// again while the callee lives.
+#[derive(Clone)]
+pub(crate) struct KeptWay {
+    pub(crate) cache: u32,
+    pub(crate) callee: crate::value::WeakGc,
+    pub(crate) check_this: bool,
+    pub(crate) uses_this: bool,
+    pub(crate) expected_genv: usize,
+    pub(crate) genv_pin: crate::interpreter::WeakEnv,
+}
+
+impl std::fmt::Debug for KeptWay {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "KeptWay(site {})", self.cache)
+    }
 }
 
 /// The key of an exit site.
@@ -286,6 +309,15 @@ impl ChunkProfile {
         self.graph_refused.set(true);
     }
 
+    /// The ways the graph inliner took at the chunk's first compile (see the field).
+    pub(crate) fn inline_ways(&self) -> Vec<KeptWay> {
+        self.inline_ways.borrow().clone()
+    }
+
+    pub(crate) fn set_inline_ways(&self, ways: Vec<KeptWay>) {
+        *self.inline_ways.borrow_mut() = ways;
+    }
+
     /// The address of `pc`'s last-seen typed-kind byte in a chunk of `len` operations, its family
     /// byte the next (see the `elements` field), the bytes made [`UNSEEN`] at the first ask (main
     /// thread: a template compile that records, rule U); None past the chunk. Generated code
@@ -339,6 +371,7 @@ impl ChunkProfile {
         std::mem::size_of::<Self>()
             + self.sites.borrow().capacity() * 8
             + self.elements.get().map_or(0, |bytes| bytes.len())
+            + self.inline_ways.borrow().capacity() * std::mem::size_of::<KeptWay>()
             + self.kept.retained_metadata_bytes()
     }
 

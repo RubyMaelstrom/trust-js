@@ -16770,7 +16770,7 @@ impl Interp {
             let runtime = unsafe { &*func }.runtime();
             let chunk_rc = runtime_chunk(&runtime, chunk);
             drop(runtime);
-            crate::opt::reoptimize(self, chunk, function_weak(func), chunk_rc, realm);
+            crate::opt::reoptimize(self, chunk, function_weak(func), chunk_rc);
             return;
         }
         // With the optimizing tier on (P3 stage 1), the checkpoints advance as ever, but the
