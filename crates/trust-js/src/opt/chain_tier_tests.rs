@@ -381,14 +381,15 @@ fn the_string_programs_loads_take_string_prototype_before_its_mutations() {
 #[test]
 fn a_this_read_after_a_call_that_swaps_its_prototype_reads_the_new_holder() {
     // `this` is one node through the whole function, so its facts would cross a call if the
-    // link facts did not end at effects: the call swaps the receiver's prototype for one of the
-    // same shape and another value, and the second read must walk again.
-    let source = "function P() {} P.prototype.p = 1; P.prototype.t = function (f) { \
-         var a = this.p; f(this); return a * 10 + this.p; };\n\
-         function Q() {} Q.prototype.p = 2; Q.prototype.t = P.prototype.t;\n\
-         function keep(o) {} function swap(o) { Object.setPrototypeOf(o, Q.prototype); }\n\
-         let t = 0; for (let k = 0; k < 3000; k++) t = t + new P().t(keep); t";
-    let after = "let u = 0; for (let k = 0; k < 50; k++) u = u + new P().t(swap); u";
+    // link facts did not end at effects: the call (a native's, always an effect) swaps the
+    // receiver's prototype for one of the same shape and another value, and the second read
+    // must walk again.
+    let source = "function tm(q) { var a = this.p; Object.setPrototypeOf(this, q); \
+         return a * 10 + this.p; }\n\
+         function P() {} P.prototype.p = 1; P.prototype.t = tm;\n\
+         function Q() {} Q.prototype.p = 2; Q.prototype.t = tm;\n\
+         let t = 0; for (let k = 0; k < 3000; k++) t = t + new P().t(P.prototype); t";
+    let after = "let u = 0; for (let k = 0; k < 50; k++) u = u + new P().t(Q.prototype); u";
     let expected = {
         let mut vm = Engine::new();
         vm.set_tier(Tier::Bytecode);
@@ -399,7 +400,13 @@ fn a_this_read_after_a_call_that_swaps_its_prototype_reads_the_new_holder() {
     eager().set();
     let mut engine = jit_engine();
     assert_eq!(eval(&mut engine, source), expected[0]);
+    assert!(walks(&mut engine, "tm"), "tm walks the chain from `this`");
+    exits();
     assert_eq!(eval(&mut engine, after), expected[1]);
+    assert!(
+        exits().is_empty(),
+        "the same shape: the walk passes, no exit"
+    );
 }
 
 #[test]
