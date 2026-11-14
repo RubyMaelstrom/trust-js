@@ -92,9 +92,10 @@ fn vm_copy_effects_results_equal_the_vms_and_copy_no_word_their_code_did_not_wri
 /// pooled record's words above `f`'s slots with the word of an object the program dropped and a
 /// precise major collection freed; `f`, compiled by the tier, then runs an array literal's spread
 /// and a call's argument array with `n * 2` and a sum held in registers below their operands. The
-/// helper's copy holds none of those words (before the fix it copied them, and with
-/// TRUST_JS_GC_STRESS=1 collections ran with the freed cell's word in the copy's precise trace),
-/// and the result is the VM's.
+/// helper's copy holds none of those words while the cell is free (before the fix it copied them,
+/// and with TRUST_JS_GC_STRESS=1 collections ran with the freed cell's word in the copy's precise
+/// trace; under the stress a new cell can take the address, whose word an operand then is), and the
+/// result is the VM's.
 #[test]
 fn a_vm_copy_effect_copies_no_word_an_earlier_activation_left_in_its_record() {
     use crate::gc_core::CollectionKind;

@@ -26253,12 +26253,17 @@ fn vm_copy_operands(op: &Op) -> Option<usize> {
     })
 }
 
-/// Count the words of `copy` that are the word a test watches for ([`TEST_COPY_WATCH`]).
+/// Count the words of `copy` that are the word a test watches for ([`TEST_COPY_WATCH`]) while it
+/// names no allocated cell of `i`'s heap: a freed cell's word, not the same bits naming a cell
+/// allocated since at that address (under TRUST_JS_GC_STRESS=1 the operation's own operands can).
 #[cfg(test)]
-fn test_watch_copy(copy: &[Value]) {
+fn test_watch_copy(i: &Interp, copy: &[Value]) {
     if let Some(watched) = TEST_COPY_WATCH.with(std::cell::Cell::get) {
+        let freed = i.gc_heap.core.borrow().cell_age(watched).is_none();
         let seen = copy.iter().filter(|word| word.bits() == watched).count();
-        TEST_COPY_SEEN.with(|count| count.set(count.get() + seen));
+        if freed {
+            TEST_COPY_SEEN.with(|count| count.set(count.get() + seen));
+        }
     }
 }
 
@@ -26309,7 +26314,7 @@ unsafe fn jit_vm_operation(
     );
     activation.stack.set_len(pops);
     #[cfg(test)]
-    test_watch_copy(activation.stack.raw_slice());
+    test_watch_copy(&*ctx.interp, activation.stack.raw_slice());
     #[cfg(all(
         target_arch = "aarch64",
         any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -28552,7 +28557,7 @@ pub(crate) unsafe extern "C" fn jit_iteration(
 #[cfg(test)]
 thread_local! {
     /// A word a test watches for in the copies `jit_vm_operation` makes, and how many copied words
-    /// were it (P3 stage 3 step 3a's follow-up).
+    /// were it while it named no allocated cell (P3 stage 3 step 3a's follow-up).
     pub(crate) static TEST_COPY_WATCH: std::cell::Cell<Option<u64>> =
         const { std::cell::Cell::new(None) };
     pub(crate) static TEST_COPY_SEEN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
