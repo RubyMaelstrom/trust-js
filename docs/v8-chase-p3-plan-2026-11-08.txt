@@ -3784,3 +3784,71 @@ and checks them at its entry.
   the loop: am3's receivers) and of values that are no slots in loops with effects, the general
   LICM of checks, the same mechanism over a wider set, a step of its own; a pre-header for loops
   of two entry edges (rare in the measured code).
+
+Stage 3 step 0b landed (b04c14ec, 6b6a353f, 2026-11-14; target/p3/stage3/step0b-impl, report.txt):
+why values held through zlib's loops cost more than reloading them, and the remedy.
+- The cause, by a counting probe on every emitted word and by SPE: a TypedElement node calls the
+  template's shared typed-array stub on its main path, and the back end saved and restored every
+  live caller-saved register around each call (the cold paths' register snapshot), while the
+  allocator, which did not count the call, gave loop-long values caller-saved registers. Main paid
+  it too: 15.3G of the tier's 59.7G executed words in zlib at 5 fixed runs (758M calls, 10.1 words
+  a call). Step 0's diagnostic's +10.57G was +12.94G of those saves and +2.23G of spills against
+  -4.61G of checks, reloads, conversions and moves it removed. The stub ran the same calls on both
+  sides: the profile's +44% in it was PMU skid (SPE reads it flat).
+- The exemplars agree: the allocator knows a main-path call's clobbers and keeps values live
+  across it out of them (Maglev frees a node's specific temporaries before it, maglev-regalloc.cc:
+  2017-2046; Ion's fixed temps cover their instruction, BacktrackingAllocator.cpp:1915-1928; Air's
+  patchpoint clobbers are defs, b3/air/AirInstInlines.h:100-121); saving the live registers around
+  a call is for out-of-line calls only (Maglev's register snapshot, Ion's saveLive, the DFG's
+  silentSpill).
+- The clobber set (b04c14ec): regalloc::clobbers names the registers a node's own stub call
+  clobbers (TypedElement: x11-x15, d1, d2); a value whose range crosses the node takes no home
+  among them (its hint, the free registers and a spill victim's alike), and the call saves only a
+  clobbered register that holds a value its exit reads. Departure: one home per range keeps such a
+  value out of those registers for its whole range, where Maglev moves it once at the node and Ion
+  and Air split the range. Measured (fat LTO, main to it, the tier on; my recount of zlib and
+  Mandreel agrees): instructions at 5 fixed runs zlib -14.67%, Mandreel -11.34%, GBEMU -1.48%,
+  Splay -1.21%, PdfJS -0.80%, nothing above +0.07%; Octane's timed scores on X925 cores alone, 10
+  rounds, 1.370 GHz: zlib +21.6% (cycles -17.7%), Mandreel +17.1% (-11.6%), GBEMU +2.7% (-2.5%),
+  Crypto, NavierStokes, Djot's and Vue's steady states inside their spread; compile time inside
+  its spread (Djot 20.1 -> 20.3 ms over 46 compiles). Box2D's timed rounds fall in two modes on
+  both binaries (7.32G and 7.69G instructions a round, main mostly in one and the branch in the
+  other: -1.55% score); at fixed work the branch runs -0.28% cycles at equal instructions. What
+  picks the mode is not found: to read in the stage's timing session.
+- The equality rule (6b6a353f): the loop prepass counts an equality lowered where its own block
+  proves the builder's case (both operands made there by a Number constant or a bitwise or
+  arithmetic operation the rules lower, or under === and !== one a constant no other value
+  equals); where the builder then cannot lower it, it exits (Builder::mismatch) and the NotNumber
+  flag withdraws the claim. With the clobber set this is the diagnostic's whole gain without its
+  refusals: zlib a further -3.16% instructions and -1.22% cycles, its compiles the diagnostic's
+  node for node; Mandreel unchanged, none refused. Its use ends with step 3a for loops whose only
+  effects are generic nodes.
+- For step 3a: held values win once the call is known. What they still pay is spills: one home per
+  range, spilled at the definition and loaded at every use (a6 +1.30G and bc +0.23G words in zlib
+  with values held; a6 spills 49 values where it spilled 10). The exemplars' form is Maglev's: a
+  spilled value loaded into a register at its first register use and kept there while one is free,
+  with the loop's reload and spill hints (maglev-regalloc.cc:1423-1490, 2240-2313). It goes into
+  step 3a's brief as its allocator item.
+- Step 1 must extend the call's save: an exit of an inlined frame's node reads its frame's chain
+  values too, which save_live_clobbered does not yet count (no graph has inlined frames before
+  step 2); step 1's rebase adds them with a test.
+- Open, for the owner: the typed-array lowering gap (rule U's record filling, now counted). Every
+  one of the tier's 758M TypedElement calls in zlib's 5 runs (89% of the stubs' entries; the stubs
+  are about a quarter of zlib's sampled operations) comes from an element site whose record is
+  empty, because template code's in-line accesses and the stub's hits record nothing: 1,360 site
+  decisions with no record against 156 with one recorded kind, whose 545M accesses run in line.
+  (a) Template code records the receiver's typed kind on its in-line path, as JSC's baseline
+  profiles every element access with one store (jit/JITPropertyAccess.cpp:76, ArrayProfile.h:
+  245-251) and V8's and SpiderMonkey's ICs record a new receiver at its first miss: it changes the
+  tier off's template code. (b) The tier dispatches on the kind in line at such a site, as the
+  stub does (Maglev's polymorphic element access, maglev-graph-builder.cc:5626-5700, but from
+  recorded maps): more code at every such site and no exemplar for the unrecorded case. (a) is
+  the exemplars' form; to be measured (the tier off's cost, the tier on's gain) before the owner
+  decides.
+- Tests: the allocator's homes across a TypedElement call (fourteen words and three f64s, a loop
+  phi's hint, a spill victim's register), the consistency check over every value across a stub
+  call, the back end's call on three typed kinds with seventeen values live and one saved, the
+  exit's frame where the stub declines; two builder tests of the equality rule; 13 mutations, 12
+  caught (the thirteenth cannot change a result: every operation the rule classifies pushes one
+  value); the tier's tests in four configurations (309) and the new ones under GC stress;
+  zombie's check, clippy and Windows' check.
