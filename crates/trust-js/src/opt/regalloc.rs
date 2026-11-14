@@ -485,6 +485,28 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
     // What each node and each edge reads, listed once for the passes below.
     let reads = Reads::new(graph);
     let edges = EdgeInputs::new(graph, &order, &reads)?;
+    // The values a generic node's throw exit reads after its call, at its position + 1 (P3 stage
+    // 3 step 3a, `Graph::throw_recipe`): each crosses the call, and so takes a home the call
+    // preserves, as Maglev allocates a throwing call's lazy-deopt inputs, which its catch block
+    // reuses, after the call cleared every register (maglev-regalloc.cc:767, 786-806).
+    let mut after_call: Vec<(NodeIx, NodeIx)> = Vec::new();
+    for &b in &order {
+        for &node in &graph.block(b).body {
+            if !matches!(graph.node(node).op, NodeOp::Generic { .. }) {
+                continue;
+            }
+            let (slots, stack) = graph.throw_recipe(node);
+            for v in slots
+                .into_iter()
+                .map(|(_, v)| v)
+                .chain(stack.into_iter().flatten())
+            {
+                if reads.is_value(v) && !after_call.contains(&(node, v)) {
+                    after_call.push((node, v));
+                }
+            }
+        }
+    }
 
     // Liveness over the blocks (values that are not constants), to a fixed point, in flat bit
     // sets of `words` words a block, the scratch sets made once.
@@ -563,6 +585,10 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             range.1 = range.1.max(end);
         });
     }
+    for &(node, v) in &after_call {
+        let range = &mut ranges[v.index()];
+        range.1 = range.1.max(pos[node.index()] + 1);
+    }
 
     // Next uses: each value's reads in code order (a phi's input is read at its edge's block end),
     // flat: counted, placed, then sorted and deduplicated in each value's run.
@@ -577,6 +603,9 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                 use_start[input.index() + 1] += 1;
             }
         }
+    }
+    for &(_, v) in &after_call {
+        use_start[v.index() + 1] += 1;
     }
     for v in 0..n {
         use_start[v + 1] += use_start[v];
@@ -598,6 +627,10 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                 use_end[input.index()] += 1;
             }
         }
+    }
+    for &(node, v) in &after_call {
+        uses[use_end[v.index()] as usize] = pos[node.index()] + 1;
+        use_end[v.index()] += 1;
     }
     for v in 0..n {
         let run = &mut uses[use_start[v] as usize..use_end[v] as usize];

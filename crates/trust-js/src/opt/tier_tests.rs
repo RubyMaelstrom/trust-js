@@ -3377,6 +3377,12 @@ pub(crate) const GENERIC_PROGRAMS: &[&str] = &[
      function bump(o) { if (o) o.x = o.x + 1; }\n\
      var t = 0; for (var k = 0; k < 3000; k++) { var o = {x: k % 9}; \
      t += gs({q: new Q(k % 5)}, bump) + hf(o, bump); } t",
+    "function hp(o, k) { var s = k * 2; try { s = s + o.p.q; } catch (e) { s = s - 1; } \
+     return s; }\n\
+     function nh(g, a) { var x = a + 1; g(x); return x; }\n\
+     function thrower(v) { if (v % 4 === 0) throw v; return v; }\n\
+     var t = 0; for (var k = 0; k < 3000; k++) { t += hp(k % 3 ? {p: {q: k}} : {}, k); \
+     try { t += nh(thrower, k); } catch (e) { t += e * 3; } } t",
     "function loopy(o, g) { var s = 0, n = o.n; try { for (var i = 0; i < n; i++) { \
      s += g(i); if (s > 1000) throw s; } } catch (e) { s = -e; } return s + n; }\n\
      function sq(v) { return v * v; }\n\
@@ -3421,4 +3427,42 @@ fn generic_nodes_results_equal_the_vms_with_the_tier_on_eager_and_forcing_exits(
         }
     }
     assert!(compiles > 0, "the tier compiled the programs' functions");
+}
+
+/// A host interruption inside a callee of a generic node at a pc with a handler leaves through the
+/// node's throw exit, which takes no interruption for a throw (P3 stage 3 step 3a): the catch does
+/// not run, the program is interrupted, and the function runs again afterwards.
+#[test]
+fn an_interruption_through_a_generic_node_in_a_try_leaves_the_function() {
+    eager().set();
+    let mut engine = jit_engine();
+    eval(
+        &mut engine,
+        "function spin(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + i) | 0; return s; }
+         function guarded(g, n) { var a = n + 1; try { a = a + g(n); } catch (e) { return -a; }
+           return a; }
+         var t = 0; for (var k = 0; k < 3000; k++) t += guarded(spin, 10); t",
+    );
+    compiled();
+    exits();
+    let interrupt = engine.interrupt_handle();
+    interrupt.set_deadline(Some(
+        std::time::Instant::now() + std::time::Duration::from_millis(100),
+    ));
+    let outcome = engine
+        .eval_interruptible("guarded(spin, 3e9)", false)
+        .expect("the program parses");
+    interrupt.set_deadline(None);
+    assert!(
+        matches!(outcome, crate::ExecutionOutcome::Interrupted { .. }),
+        "the interruption is no throw the catch takes"
+    );
+    // The tier's code of `guarded` took its call's throw exit, which left with the interruption.
+    assert!(
+        exits()
+            .iter()
+            .any(|&(_, reason)| reason == ExitReason::Throw),
+        "the call's throw exit"
+    );
+    assert_eq!(eval(&mut engine, "guarded(spin, 10)"), "56");
 }

@@ -14,14 +14,17 @@
 //! caller's. A value's register holds a tagged word (Tagged), an object's cell address (Cell),
 //! 0 or 1 (Bool) or an int32 in its low 32 bits (I32), or an f64 in a d register.
 //!
-//! Effects run the operation's baseline template on the canonical frame (contracts 4): the
-//! operands written to the canonical words below `stack_base + 8 * depth(pc)`, x20 set there,
-//! the template emitted through `operations::emit` (`emit_exec` where it declines) with the
-//! tier's unwind, the results loaded from below the returned x20 by the projections that follow.
-//! A throw leaves through the throw epilogue (ctx.error is the helper's), or, at a pc with a
-//! handler, exits to the VM with the throw pending; for that the code writes the effect's whole
-//! frame state to the frame before the effect, since the template clobbers the caller-saved
-//! registers. Values living across an effect have callee-saved homes or spill slots
+//! Effects and generic nodes run the operation's baseline template on the canonical operand
+//! words (contracts 4): the operands written to the canonical words below `stack_base + 8 *
+//! depth(pc)`, a generic node's named slots whose words are stale written to them (P3 stage 3
+//! step 3a), x20 set there, the template emitted through `operations::emit` (`emit_exec` where it
+//! declines) with the tier's unwind, the results loaded from below the returned x20 by the
+//! projections that follow and a written slot's word by its SlotResult. A throw leaves through
+//! the throw epilogue (ctx.error is the helper's), or, at a pc with a handler, exits to the VM
+//! with the throw pending: a generic node's exit reads its recipe's values from the homes its call
+//! preserves (`Graph::throw_recipe`), and a canonical-frame effect's code writes its whole frame
+//! state to the frame before it, since the template clobbers the caller-saved registers. Values
+//! living across an effect or a generic node have callee-saved homes or spill slots
 //! (`regalloc`), which templates and helpers preserve.
 //!
 //! Exits (`opt::exit`): each failing check branches to its exit's site, one `bl` to the code's
@@ -1506,6 +1509,66 @@ impl Gen<'_> {
         Ok(index)
     }
 
+    /// An effect's or a generic node's exit for a throw at a pc with a handler: a canonical-frame
+    /// effect's recipe writes nothing (its code wrote the state to the frame before it), a
+    /// generic node's is its `Graph::throw_recipe`, each value in a home its call preserves (P3
+    /// stage 3 step 3a: the allocator reads them after the call), the operand words above it left
+    /// as the template left them.
+    fn exit_throw(&mut self, n: NodeIx) -> Result<usize, Refusal> {
+        let graph = self.graph;
+        let node = graph.node(n);
+        let state = graph.state(node.state.expect("checked: a state on every exit"));
+        let (slots, stack) = graph.throw_recipe(n);
+        let preserved = |source: &Source| match *source {
+            Source::Gp { reg, .. } => regalloc::ARM64.gp_callee.contains(&reg),
+            Source::Fp { reg } => regalloc::ARM64.fp_callee.contains(&reg),
+            Source::Spill { .. } | Source::Const(_) | Source::Frame => true,
+        };
+        let mut recipe_slots = Vec::with_capacity(slots.len());
+        for (slot, v) in slots {
+            recipe_slots.push((slot, self.source(v, state.pc)?));
+        }
+        let mut recipe_stack = Vec::with_capacity(state.stack.len());
+        if matches!(node.op, NodeOp::Generic { .. }) {
+            for v in stack {
+                recipe_stack.push(match v {
+                    Some(v) => self.source(v, state.pc)?,
+                    None => Source::Frame,
+                });
+            }
+        } else {
+            recipe_stack.resize(state.stack.len(), Source::Frame);
+        }
+        if !recipe_slots
+            .iter()
+            .map(|(_, source)| source)
+            .chain(&recipe_stack)
+            .all(preserved)
+        {
+            return Err(Refusal::at(
+                node.pc as usize,
+                "a throw's value in a register its call clobbers",
+            ));
+        }
+        let record = ExitRecord {
+            pc: state.pc,
+            kind: ExitKind::EffectThrow,
+            reason: ExitReason::Throw,
+            slots: recipe_slots.into(),
+            stack: recipe_stack.into(),
+            handlers: state.handlers.clone(),
+            shape_check: None,
+            proof: 0,
+            count: Cell::new(0),
+            // The compiled function's (no effect or generic node runs in an inlined frame).
+            frame: self.frame_recipe(state.frame)?,
+        };
+        let site = self.a.new_label();
+        let ret = self.a.new_label();
+        self.exits.push((site, ret, record));
+        Ok(site)
+    }
+
     /// The forced-exit gate: decrement the countdown, and take `site` at zero.
     fn forced(&mut self, site: usize) {
         if !self.options.forced_exits {
@@ -2493,11 +2556,13 @@ impl Gen<'_> {
             self.forced(site);
         }
         let depth = self.cfg.stack_depth_at(pc).expect("checked");
+        let generic = matches!(node.op, NodeOp::Generic { .. });
         self.a
             .ldr_imm(X9, 19, std::mem::offset_of!(JitCtx, stack_base) as u32);
-        if handlers {
+        if handlers && !generic {
             // A throw exits with this state, which the template's clobbers would lose: the frame
-            // holds all of it before the template runs.
+            // holds all of it before the template runs (a canonical-frame effect's; a generic
+            // node's throw exit reads its recipe's homes, which its call preserves).
             for (k, &v) in state.stack.iter().enumerate() {
                 let word = self.boxed(v, X16);
                 self.a.str_imm(word, X9, 8 * k as u32);
@@ -2524,7 +2589,7 @@ impl Gen<'_> {
         }
         self.a.add_imm(20, X9, (8 * depth) as u32);
         let unwind = if handlers {
-            let site = self.exit(n, ExitKind::EffectThrow)?;
+            let site = self.exit_throw(n)?;
             let label = self.a.new_label();
             self.cold.push(Cold::Jump {
                 label,

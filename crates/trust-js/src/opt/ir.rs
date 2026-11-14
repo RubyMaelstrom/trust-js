@@ -1041,6 +1041,54 @@ impl Graph {
         }
     }
 
+    /// What the throw exit of generic node `node` rebuilds from the homes of its values, where
+    /// its state has a handler (P3 stage 3 step 3a, throws by recipe): the state's slots that
+    /// hold values but those the node's operation writes (its SlotResults: the frame holds what
+    /// its template left there, written or not), and for each operand-stack position of the
+    /// state its value below the node's operands and the innermost handler's depth, which the VM
+    /// keeps, or None above them, where the frame's word stays as the template left it (the VM
+    /// keeps the stack to the smaller of the state's depth and the handler's, as it did when the
+    /// code wrote the whole state to the frame before the node). The exit reads every value here
+    /// after the node's call, which the allocator keeps them across. Empty for any other node.
+    pub(crate) fn throw_recipe(&self, node: NodeIx) -> (Vec<(u16, NodeIx)>, Vec<Option<NodeIx>>) {
+        let data = self.node(node);
+        let (NodeOp::Generic { pops, .. }, Some(state)) = (&data.op, data.state) else {
+            return (Vec::new(), Vec::new());
+        };
+        let state = self.state(state);
+        let Some(&(_, handler_depth)) = state.handlers.last() else {
+            return (Vec::new(), Vec::new());
+        };
+        let written: Vec<u16> = self
+            .block(data.block)
+            .body
+            .iter()
+            .filter_map(|&n| match self.node(n).op {
+                NodeOp::SlotResult(slot) if self.node(n).inputs[..] == [node] => Some(slot),
+                _ => None,
+            })
+            .collect();
+        let slots = state
+            .slots
+            .iter()
+            .enumerate()
+            .filter_map(|(slot, source)| match *source {
+                SlotSource::Value(value) if !written.contains(&(slot as u16)) => {
+                    Some((slot as u16, value))
+                }
+                _ => None,
+            })
+            .collect();
+        let kept = (state.stack.len() - usize::from(*pops)).min(handler_depth as usize);
+        let stack = state
+            .stack
+            .iter()
+            .enumerate()
+            .map(|(k, &value)| (k < kept).then_some(value))
+            .collect();
+        (slots, stack)
+    }
+
     /// Records an edge (predecessor lists are in the order edges are added).
     pub(crate) fn add_edge(&mut self, from: BlockIx, to: BlockIx) {
         self.blocks[from.index()].succs.push(to);

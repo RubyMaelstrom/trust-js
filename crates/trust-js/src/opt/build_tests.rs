@@ -5745,3 +5745,87 @@ fn a_generic_node_ends_the_heap_facts_and_keeps_the_values() {
         "{text}"
     );
 }
+
+/// A throw from a generic node at a pc with a handler exits by recipe (P3 stage 3 step 3a, JSC's
+/// exception exit): its recipe names the values the handler's frame needs, the slots its state
+/// holds as values (`a`, live into the catch and after it; `c`, live into the catch alone, whose
+/// last read is the call's own recipe) and the stack below the handler's depth (`fo`'s for-of,
+/// whose handler, which closes the iterator, keeps the operand stack's first word: here the sum
+/// the call's addition reads), and the allocator keeps each in a home the call preserves, which
+/// the exit reads after the call.
+#[test]
+fn a_generic_nodes_throw_recipe_keeps_the_handlers_values_across_its_call() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function tr(o, g) { var a = o.x + 1, b = 0, c = o.x * 3;
+           try { b = g(a); } catch (e) { return a * 10 + c + (e | 0); }
+           return a + b; }
+         function fo(d, g) { var s = 0; for (var x of d) { s += g(x); } return s; }
+         function thrower(v) { if (v % 5 === 0) throw v + 1; return v * 2; }
+         for (var k = 0; k < 20; k++) { tr({x: k}, thrower); fo([1, 2, 3], String); }",
+    );
+    for (name, slot_names, below) in [("tr", &["a", "c"][..], 0), ("fo", &[][..], 1)] {
+        let (chunk, graph) = graph_of(&mut engine, name);
+        let text = dump(&graph, &chunk);
+        let call = (0..graph.nodes.len() as u32)
+            .map(NodeIx)
+            .find(|&n| {
+                let node = graph.node(n);
+                matches!(node.op, NodeOp::Generic { .. })
+                    && node
+                        .state
+                        .is_some_and(|state| !graph.state(state).handlers.is_empty())
+            })
+            .unwrap_or_else(|| panic!("{name}: the call in the try: {text}"));
+        let (slots, stack) = graph.throw_recipe(call);
+        for slot_name in slot_names {
+            let slot = slot_named(&chunk, slot_name);
+            assert!(
+                slots.iter().any(|&(recipe, _)| recipe == slot),
+                "{name}: {slot_name}: {slots:?}: {text}"
+            );
+        }
+        let state = graph.state(graph.node(call).state.expect("a state"));
+        assert_eq!(stack.len(), state.stack.len(), "{name}: {text}");
+        let NodeOp::Generic { pops, .. } = graph.node(call).op else {
+            unreachable!()
+        };
+        let (_, depth) = *state.handlers.last().expect("a handler");
+        let kept = (state.stack.len() - usize::from(pops)).min(depth as usize);
+        assert_eq!(
+            kept, below,
+            "{name}: the stack below the handler's depth: {text}"
+        );
+        for (k, value) in stack.iter().enumerate() {
+            assert_eq!(value.is_some(), k < kept, "{name}: position {k}: {text}");
+        }
+        #[cfg(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
+        {
+            use super::regalloc::{allocate, Home, ARM64};
+            let alloc = allocate(&graph, &ARM64).expect("allocated");
+            let preserved = |home: Home| match home {
+                Home::Gp(r) => ARM64.gp_callee.contains(&r),
+                Home::Fp(r) => ARM64.fp_callee.contains(&r),
+                Home::Spill(_) | Home::Const => true,
+                Home::None => false,
+            };
+            for value in slots
+                .iter()
+                .map(|&(_, value)| value)
+                .chain(stack.iter().flatten().copied())
+            {
+                let home = alloc.homes[value.index()];
+                assert!(preserved(home), "{name}: {value:?} in {home:?}: {text}");
+                let (_, end) = alloc.ranges[value.index()];
+                assert!(
+                    end > alloc.pos[call.index()],
+                    "{name}: {value:?} read after the call: {text}"
+                );
+            }
+        }
+    }
+}

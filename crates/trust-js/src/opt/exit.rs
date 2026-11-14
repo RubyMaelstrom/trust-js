@@ -17,8 +17,10 @@
 //!
 //! Two exits carry a pending throw, for a throw at a pc with a handler (the plan's point 11):
 //! a poll's, whose registers its slow path restored before it branches to its exit, and an
-//! effect's, whose frame state the code wrote to the frame before the effect ran (the effect
-//! clobbers the caller-saved registers), so that its recipe is empty.
+//! effect's: a canonical-frame effect's code wrote its frame state to the frame before it ran
+//! (it clobbers the caller-saved registers), so that its recipe is empty, and a generic node's
+//! recipe names its values' homes, callee-saved registers and spill slots its call preserves, as
+//! JSC's exception exit recovers the catch's live values from the frame (P3 stage 3 step 3a).
 //!
 //! TRUST_JS_OPT_EXIT_EVERY (the forced-exit gate): when it is compiled in, every check first
 //! decrements `Interp::opt_exit_countdown` and exits when it reaches zero; the deoptimizer then
@@ -55,6 +57,9 @@ pub(crate) enum Source {
     Spill { offset: u32, rep: Rep },
     /// A constant execution word.
     Const(u64),
+    /// The frame's word as it is (P3 stage 3 step 3a): an operand word a throw's exit keeps as the
+    /// node's template left it; never read.
+    Frame,
 }
 
 /// What state an exit finds the frame and registers in.
@@ -66,8 +71,10 @@ pub(crate) enum ExitKind {
     /// A throw from a loop header's poll: the registers hold the state's values (the slow path
     /// restored them), and the throw is in `ctx.error`.
     PollThrow,
-    /// A throw from an effect: the code wrote the state's values to the frame before the effect,
-    /// and the throw is in `ctx.error`.
+    /// A throw from an effect or a generic node, the throw in `ctx.error`: a canonical-frame
+    /// effect's code wrote the state's values to the frame before it (its recipe writes nothing),
+    /// and a generic node's recipe names the homes its values kept across its call (P3 stage 3
+    /// step 3a: `Graph::throw_recipe`).
     EffectThrow,
 }
 
@@ -425,6 +432,7 @@ unsafe fn read(saved: *const u64, source: Source) -> crate::value::Value {
                 word(rep, at.cast::<u64>().read())
             }
             Source::Const(bits) => Value::from_bits(bits),
+            Source::Frame => unreachable!("an exit writes no word the frame keeps"),
         }
     }
 }
@@ -526,26 +534,25 @@ pub(crate) unsafe extern "C" fn deoptimize(
     }
     let chunk = unsafe { &*ctx.chunk };
     let mut depth = exit.stack.len();
-    let pending = match exit.kind {
-        ExitKind::Check | ExitKind::PollThrow => {
-            // Every value goes to the frame before anything can allocate: from then on the
-            // frame's words are what the collector finds.
-            let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
-            for &(slot, source) in exit.slots.iter() {
-                slots[slot as usize].set(unsafe { read(saved, source) });
-            }
-            for (k, &source) in exit.stack.iter().enumerate() {
-                let word = unsafe { read(saved, source) };
-                debug_assert!(!word.is_empty(), "an Empty word on the operand stack");
-                unsafe { ctx.stack_base.add(k).write(word) };
-            }
-            if exit.kind == ExitKind::Check {
-                None
-            } else {
-                Some(())
-            }
+    let pending = {
+        // Every value goes to the frame before anything can allocate: from then on the frame's
+        // words are what the collector finds. A word the frame keeps is left (a throw's).
+        let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
+        for &(slot, source) in exit.slots.iter() {
+            slots[slot as usize].set(unsafe { read(saved, source) });
         }
-        ExitKind::EffectThrow => Some(()),
+        for (k, &source) in exit.stack.iter().enumerate() {
+            if source == Source::Frame {
+                continue;
+            }
+            let word = unsafe { read(saved, source) };
+            debug_assert!(!word.is_empty(), "an Empty word on the operand stack");
+            unsafe { ctx.stack_base.add(k).write(word) };
+        }
+        match exit.kind {
+            ExitKind::Check => None,
+            ExitKind::PollThrow | ExitKind::EffectThrow => Some(()),
+        }
     };
     let pending = match pending {
         None => None,
