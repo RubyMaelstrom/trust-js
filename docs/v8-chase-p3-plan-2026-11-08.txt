@@ -3962,7 +3962,9 @@ frame yet (step 2's), so the tier's code and its exits are what they were.
   phi selector's frame for the nodes it makes in an inlined frame's loop, and an inlined poll's
   compiled-frame top: step 2's.
 - After it, 26a0c2c7: the back end passes clippy on ARM64 with warnings denied (main's two known
-  lints removed).
+  lints removed). On that tree, the tier off, on, eager and eager with forced exits: the library
+  suite 3,292 passed and none failed in each, difftest 138 agree in each, the three fixtures'
+  masked outputs equal the tier off's (target/p3/stage3/step1-review/gate.out).
 
 Rule U landed (d3d2394b, fb21e95d, 2026-11-14; target/p3/stage3/ruleu-impl, report.txt; the
 owner's choice of the same day): with the tier on, template code records its in-line element hits.
@@ -4015,7 +4017,10 @@ owner's choice of the same day): with the tier on, template code records its in-
   from frozen views, three end-to-end: typed sites in line with no stub call, Array and object
   sites without the kind branch, alternating sites that settle within two discards); 28
   mutations, each caught; jit:: and opt:: 815 in four configurations; difftest and the fixtures
-  in four; zombie's check, clippy, Windows' check and suite (2,822).
+  in four; zombie's check, clippy, Windows' check and suite (2,822). On the landed tree
+  (fb21e95d), the tier off, on, eager and eager with forced exits: the library suite 3,309 passed
+  and none failed in each, difftest 138 agree in each, the fixtures' masked outputs equal the
+  tier off's (target/p3/stage3/ruleu-review/gate.out).
 - Open, from its counts: (1) the sites still without a record (zlib's 15.5M stub calls, React's
   steady state 4.1M executions): with template code recording, an empty record now means the
   site did not run there either, so Maglev's deopt on no feedback (maglev-graph-builder.cc:
