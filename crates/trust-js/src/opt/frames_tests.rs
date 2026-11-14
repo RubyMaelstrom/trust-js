@@ -307,6 +307,8 @@ impl Build {
             call_pc,
             callee,
             receiver,
+            position: crate::stack_trace::NO_POSITION,
+            env: 0,
         })
     }
 }

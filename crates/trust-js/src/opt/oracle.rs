@@ -38,11 +38,14 @@ pub(crate) enum Request {
 }
 
 /// What the main thread keeps of a compile's inlining until its install: the callee chunks, by
-/// the oracle's index (`InlineWay::chunk`), and the pins of the callees the code embeds.
+/// the oracle's index (`InlineWay::chunk`), the pins of the callees the code embeds, and the
+/// ways' inline sites (`InlineWay::position`, P3 stage 3 step 3c), registered in the thread's
+/// table and released with the code or with a job dropped before its install.
 #[derive(Default)]
 pub(crate) struct Held {
     pub(crate) chunks: Vec<Rc<Chunk>>,
     pub(crate) pins: Vec<crate::value::WeakGc>,
+    pub(crate) sites: crate::stack_trace::InlineSites,
 }
 
 impl Held {
@@ -55,6 +58,7 @@ impl Held {
                 .map(|&chunk| self.chunks[chunk as usize].clone())
                 .collect(),
             pins: self.pins.into_boxed_slice(),
+            sites: self.sites,
         }
     }
 
@@ -103,6 +107,12 @@ pub(crate) fn prepare(
     let mut callees: Vec<JobMemory> = Vec::new();
     let mut held = Held::default();
     let mut kept: Vec<KeptWay> = Vec::new();
+    // Each way's inline site, in the order of the ways (`InlineWay::position`): the callee, no
+    // position of its own (its frame's operations place a thrown error, `Interp::place_thrown`,
+    // and a callback's frame reports its start, as a callee entered implicitly does), and the
+    // call's position in this chunk, as a splice's body site (bytecode.rs's `inline_position`
+    // with NO_POSITION); registered here, on the main thread, since the code embeds them.
+    let mut inline_sites: Vec<crate::stack_trace::InlineSite> = Vec::new();
     for (cache, entry) in entries {
         let Some(&(argc, with_this)) = calls.get(&cache) else {
             continue;
@@ -173,16 +183,31 @@ pub(crate) fn prepare(
                 expected_genv: way.expected_genv,
                 genv_pin: way.genv_pin.clone(),
             });
+            inline_sites.push(crate::stack_trace::InlineSite {
+                callee: crate::value::Gc::downgrade(&way.obj),
+                inner: crate::stack_trace::NO_POSITION,
+                outer: chunk.call_position(cache),
+            });
             ways.push(InlineWay {
                 target,
                 chunk: index as u32,
                 env: Env::as_ptr(&env) as usize,
                 holders: holders.into_boxed_slice(),
+                // Its site's index among this job's, until they are registered below.
+                position: (inline_sites.len() - 1) as u32,
             });
         }
         if !ways.is_empty() {
             sites.push(InlineSite { cache, ways });
         }
+    }
+    let (registered, positions) = crate::stack_trace::InlineSites::register(inline_sites);
+    held.sites = registered;
+    for way in sites
+        .iter_mut()
+        .flat_map(|site: &mut InlineSite| site.ways.iter_mut())
+    {
+        way.position = positions[way.position as usize];
     }
     // The ways a reoptimization takes again (see the module's doc).
     ChunkProfile::of(chunk).set_inline_ways(kept);

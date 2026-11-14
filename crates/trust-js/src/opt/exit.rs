@@ -236,6 +236,9 @@ fn frame_bytes(frame: &FrameRecipe) -> usize {
 pub(crate) struct Inlined {
     pub(crate) chunks: Box<[std::rc::Rc<crate::bytecode::Chunk>]>,
     pub(crate) pins: Box<[crate::value::WeakGc]>,
+    /// The inline sites its inlined frames' generic nodes publish (`InlinedFrame::position`, P3
+    /// stage 3 step 3c), released with it, as a spliced chunk's are with the chunk.
+    pub(crate) sites: crate::stack_trace::InlineSites,
 }
 
 thread_local! {
@@ -247,7 +250,7 @@ thread_local! {
 /// Keep `inlined` as long as the code at `code_base` (its link, on its thread): nothing for a
 /// code without inlined frames.
 pub(crate) fn hold(code_base: usize, inlined: Inlined) {
-    if inlined.chunks.is_empty() && inlined.pins.is_empty() {
+    if inlined.chunks.is_empty() && inlined.pins.is_empty() && inlined.sites.is_empty() {
         return;
     }
     let replaced = INLINED.with(|held| held.borrow_mut().insert(code_base, inlined));
@@ -746,14 +749,17 @@ unsafe fn deoptimize_frames(
     // A throw the exit carries; an interruption leaves the function as it is, no frame rebuilt.
     let mut pending = match exit.kind {
         ExitKind::Check => None,
-        ExitKind::PollThrow => match ctx.error.take() {
+        // A generic node's throw (P3 stage 3 step 3c): its frame has no handler of its own (the
+        // planner's callees have none), so the VM unwinds it at once and the parent that has one
+        // resumes at its call with the throw pending, as a poll's throw does; its recipe keeps no
+        // value of the innermost frame (`Graph::throw_recipe`).
+        ExitKind::PollThrow | ExitKind::EffectThrow => match ctx.error.take() {
             Some(Abrupt::Throw(error)) => Some(error),
             other => {
                 ctx.error = other;
                 return 0;
             }
         },
-        ExitKind::EffectThrow => unreachable!("no effect runs in an inlined frame (step 3's)"),
     };
     // The chain, innermost first.
     let mut chain: Vec<u16> = Vec::new();

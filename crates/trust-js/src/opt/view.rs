@@ -101,6 +101,10 @@ pub(crate) struct FrozenChunk {
     pub(crate) cap_bindings: Vec<Option<(u32, BindingAttrs)>>,
     pub(crate) name_statics: Vec<Option<StaticName>>,
     pub(crate) name_globals: Vec<Option<u16>>,
+    /// The chunk's own address (`Rc::as_ptr`): an inlined frame's generic node stores it into
+    /// `JitCtx::chunk`, where its template's helpers find their chunk (P3 stage 3 step 3c). The
+    /// code that embeds it holds the chunk (`exit::Inlined::chunks`).
+    pub(crate) chunk_addr: usize,
     /// The addresses of the first property, name and captured-binding caches (`caches` and the
     /// others never reallocate), and of the construct caches by site.
     pub(crate) caches_base: usize,

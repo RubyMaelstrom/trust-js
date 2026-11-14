@@ -93,7 +93,7 @@ mod inline;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-pub(crate) use inline::E0_EFFECT;
+pub(crate) use inline::{E0_EFFECT, PAST_RECORD};
 // The job and the driver read these where the tier has its back end.
 #[cfg_attr(
     not(all(
@@ -3711,15 +3711,19 @@ impl<'a> Builder<'a> {
     /// it, and after it each slot it does not name is as it was (a Clean slot's frame still holds
     /// it), each named slot it stored is Clean, and each it writes is its SlotResult, Clean (P3
     /// stage 3 step 3a; the owner's D6).
+    ///
+    /// In an inlined frame (P3 stage 3 step 3c) only a generic node: the inliner declines a
+    /// callee an operation of which needs the whole frame (`build_inline`'s E0). Its inputs are
+    /// its operands and every slot it names that holds a value, which its lowering writes into
+    /// the node's slot window, and its named slots stay values after it (Dirty): no frame keeps
+    /// them, and the window lives for the node alone.
     fn effect(&mut self, pc: usize, st: &mut State) -> Result<(), Refusal> {
-        // An inlined frame runs no template (P3 stage 3, step 2's E0): the inliner declined every
-        // callee a built operation of which the rules leave to one.
-        debug_assert!(
-            self.frame.is_compiled(),
-            "an effect at pc {pc} of an inlined frame"
-        );
-        if !self.frame.is_compiled() {
-            return Err(Refusal::at(pc, "an effect in an inlined frame"));
+        let inlined = !self.frame.is_compiled();
+        if inlined && canonical(&self.ops[pc]) {
+            return Err(Refusal::at(
+                pc,
+                "a canonical-frame effect in an inlined frame",
+            ));
         }
         // The loop prepass took no operation the rules lower for an effect (see `Rules`).
         debug_assert!(
@@ -3764,8 +3768,13 @@ impl<'a> Builder<'a> {
         }
         // The named slots' stale words, which the node writes (each value boxed as it stores it).
         for &(slot, _) in &named {
-            if let Slot::Dirty(value) = st.slots[usize::from(slot)] {
-                inputs.push(value);
+            match st.slots[usize::from(slot)] {
+                Slot::Dirty(value) => inputs.push(value),
+                // An inlined frame's slots are values or dead (step 1's invariant).
+                Slot::Clean(_) | Slot::Entry | Slot::Frame if inlined => {
+                    return Err(Refusal::at(pc, "an inlined frame's slot in a frame"));
+                }
+                _ => {}
             }
         }
         let state = self.frame_state(pc, st);
@@ -3779,8 +3788,12 @@ impl<'a> Builder<'a> {
             let slot = usize::from(slot);
             if writes {
                 let value = self.add(NodeOp::SlotResult(slot as u16), &[effect], Rep::Tagged, pc);
-                st.slots[slot] = Slot::Clean(value);
-            } else if let Slot::Dirty(value) = st.slots[slot] {
+                st.slots[slot] = if inlined {
+                    Slot::Dirty(value)
+                } else {
+                    Slot::Clean(value)
+                };
+            } else if let (Slot::Dirty(value), false) = (st.slots[slot], inlined) {
                 st.slots[slot] = Slot::Clean(value);
             }
         }

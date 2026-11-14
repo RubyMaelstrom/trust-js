@@ -135,7 +135,11 @@ comment/example in the same change.
   still hold the poison (one that does not was written by a template or helper: a slot write the
   operation's slot use does not list), and the helper that runs the VM on a copy of the operand
   stack checks the words it copies; each fault is written once to standard error as an
-  `[opt-poison]` line naming the function, the pc, the operation and the word.
+  `[opt-poison]` line naming the function, the pc, the operation and the word. An inlined frame's
+  generic node (P3 stage 3 step 3c) runs its template on a slot window under the switch, every
+  word of it but its named slots' holding the poison, the operand words below its operands too,
+  and, where its operation reads no `this`, `this` the poison while it runs; the check after its
+  template covers the window and those operand words.
   `TRUST_JS_OPT_VERIFY=1` verifies each graph the tier builds in a release build (its SSA
   dominance, representations, frame states and terminators) and refuses a graph that fails,
   logging why under `TRUST_JS_OPT_LOG`; debug builds and the library's tests always verify, and
@@ -204,8 +208,13 @@ comment/example in the same change.
   nothing (no call or `new` in a callee) is compiled on its first stage, as one with nothing to
   splice, each such callee built into its graph from the callee's own first stage behind the
   guard a splice has, an inlined frame whose exits rebuild the callee's frame and its caller's;
-  a callee with an operation the tier leaves to its template is not inlined (its call stays),
-  and every other plan splices as before. A reoptimization of such a function inlines the ways
+  an operation of a callee the tier does not lower is a generic node of the inlined frame (P3
+  stage 3 step 3c: its template run with the callee's chunk, inline position, `this`,
+  environment and named slots written where its helpers read them, and the caller's restored
+  after it), but one that needs the whole canonical frame (it may read any slot, or its helper
+  runs the VM on the frame's slots) or a call, which declines its callee (E0: its call stays),
+  as does a callee whose slot window would put its caller past a pooled activation record (`an
+  inlined frame past its record`); every other plan splices as before. A reoptimization of such a function inlines the ways
   its first compile took (while their callees live), as a second stage's reoptimization keeps its
   splices; a function the tier refuses splices at its next checkpoint (`[opt] graph inlining refused <name>: its
   next checkpoint splices`), as a refused second stage keeps its splices. Its

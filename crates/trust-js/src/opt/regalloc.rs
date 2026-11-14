@@ -496,10 +496,20 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                 continue;
             }
             let (slots, stack) = graph.throw_recipe(node);
+            // An inlined frame's node whose chain has a handler (P3 stage 3 step 3c): its throw
+            // exit rebuilds the frames above, from their callees, receivers and parent states.
+            let data = graph.node(node);
+            let chain = match data.state {
+                Some(state) if !data.frame.is_compiled() && graph.chain_has_handlers(state) => {
+                    graph.chain_values(data.frame)
+                }
+                _ => Vec::new(),
+            };
             for v in slots
                 .into_iter()
                 .map(|(_, v)| v)
                 .chain(stack.into_iter().flatten())
+                .chain(chain)
             {
                 if reads.is_value(v) && !after_call.contains(&(node, v)) {
                     after_call.push((node, v));

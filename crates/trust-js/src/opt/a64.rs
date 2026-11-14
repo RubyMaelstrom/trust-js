@@ -99,6 +99,14 @@ pub(crate) struct Options {
     pub(crate) poison: bool,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The inlined frames' generic nodes this thread's code generations lowered, by their
+    /// operation (tests: P3 stage 3 step 3c).
+    pub(crate) static TEST_INLINED_GENERIC: std::cell::RefCell<Vec<Op>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// The word the poison switch writes (`Options::poison`): a Number by value.rs's encoding (a
 /// tiny negative double), which names no cell and which no program computes in passing.
 pub(crate) const POISON: u64 = 0x8bad_f00d_dead_beef;
@@ -278,6 +286,7 @@ pub(crate) fn compile_frames_with(
     let held = crate::opt::exit::Inlined {
         chunks: inlined.iter().map(|(chunk, _)| chunk.clone()).collect(),
         pins: Box::new([]),
+        sites: Default::default(),
     };
     Ok(link(assembled, executable, chunk, held))
 }
@@ -435,7 +444,13 @@ pub(crate) fn assemble(
         ));
     }
     let alloc = regalloc::allocate(graph, &regalloc::ARM64)?;
-    let frame = entry_frame(&alloc)?;
+    // An inlined frame's generic node saves the compiled frame's context words it switches
+    // (P3 stage 3 step 3c) in the frame area, which the collector scans with the native stack.
+    let inlined_generic = graph
+        .nodes
+        .iter()
+        .any(|node| !node.frame.is_compiled() && matches!(node.op, NodeOp::Generic { .. }));
+    let (frame, save_area) = entry_frame(&alloc, inlined_generic)?;
     let mut gen = Gen::new(
         chunk,
         graph,
@@ -448,6 +463,8 @@ pub(crate) fn assemble(
         switches,
         frame,
     );
+    gen.inlined = inlined;
+    gen.save_area = save_area;
     gen.emit(stubs)?;
     gen.finish()
 }
@@ -481,7 +498,6 @@ fn check_graph(
         };
         inlined.get(graph.frames.get(k)?.chunk as usize).copied()
     };
-    let ops = chunk.jit_ops();
     for (index, block) in graph.blocks.iter().enumerate() {
         let Some((&last, rest)) = block.body.split_last() else {
             return Err(Refusal::whole("an empty block"));
@@ -526,6 +542,15 @@ fn check_graph(
                     ));
                 }
                 NodeOp::Effect { pc, pops, pushes } | NodeOp::Generic { pc, pops, pushes } => {
+                    // The node's frame's chunk and Cfg: an inlined frame's generic node's are
+                    // its callee's (P3 stage 3 step 3c), a canonical-frame effect's the
+                    // compiled function's only.
+                    let Some((frame_view, frame_cfg)) = frame_chunk(node.frame).filter(|_| {
+                        node.frame.is_compiled() || !matches!(node.op, NodeOp::Effect { .. })
+                    }) else {
+                        return Err(Refusal::at(pc as usize, "an effect in an inlined frame"));
+                    };
+                    let ops = frame_view.jit_ops();
                     let op = ops
                         .get(pc as usize)
                         .ok_or(Refusal::at(pc as usize, "an effect past the chunk"))?;
@@ -535,18 +560,31 @@ fn check_graph(
                             "an effect on a control-flow operation",
                         ));
                     }
-                    let depth = cfg
+                    let depth = frame_cfg
                         .stack_depth_at(pc as usize)
                         .ok_or(Refusal::at(pc as usize, "an effect at an unreachable pc"))?;
+                    let n_frame_slots = if node.frame.is_compiled() {
+                        graph.n_slots
+                    } else {
+                        frame_view.jit_frame().1
+                    };
                     let stale = if matches!(node.op, NodeOp::Generic { .. }) {
-                        stale_slots(chunk, graph, node).len()
+                        stale_slots(frame_view, n_frame_slots, graph, node).len()
                     } else {
                         0
                     };
                     if (pops as usize) > depth || node.inputs.len() != pops as usize + stale {
                         return Err(Refusal::at(pc as usize, "an effect's operands"));
                     }
-                    if let Some(after) = cfg.stack_depth_at(pc as usize + 1) {
+                    // An inlined frame's node's operand words and slot window lie in the
+                    // compiled frame's record, from its operand base (`lower_inlined_generic`).
+                    if !node.frame.is_compiled()
+                        && graph.n_slots + frame_cfg.jit_stack_capacity() + n_frame_slots
+                            > crate::jit::FRAME_BUF
+                    {
+                        return Err(Refusal::at(pc as usize, "an inlined frame past its record"));
+                    }
+                    if let Some(after) = frame_cfg.stack_depth_at(pc as usize + 1) {
                         if !matches!(op, Op::Throw)
                             && depth - pops as usize + pushes as usize != after
                         {
@@ -633,13 +671,14 @@ fn check_graph(
 
 /// The slots generic node `node` writes before its template, in the order of its slot inputs
 /// (P3 stage 3 step 3a, `build::Builder::effect`): those its operation names that its state holds
-/// as values, their frame words stale.
-fn stale_slots(chunk: &FrozenChunk, graph: &Graph, node: &Node) -> Vec<u16> {
+/// as values, their frame words stale; `chunk` and `n_slots` its frame's (an inlined frame's
+/// node writes them into its slot window: step 3c).
+fn stale_slots(chunk: &FrozenChunk, n_slots: usize, graph: &Graph, node: &Node) -> Vec<u16> {
     let Some(state) = node.state else {
         return Vec::new();
     };
     let state = graph.state(state);
-    crate::opt::liveness::frame_slots(&chunk.jit_ops()[node.pc as usize], graph.n_slots)
+    crate::opt::liveness::frame_slots(&chunk.jit_ops()[node.pc as usize], n_slots)
         .into_iter()
         .filter(|&(slot, _)| {
             matches!(
@@ -705,9 +744,16 @@ fn effect_supported(op: &Op) -> bool {
 
 /// The frame area below the header: the spill slots, then the saves of the callee-saved x
 /// registers the allocation uses, in pairs.
-fn entry_frame(alloc: &Allocation) -> Result<EntryFrame, Refusal> {
+/// The frame area: the spill slots, then where `save_area` asks for it the inlined frames' save
+/// area (`SAVE_AREA_BYTES` at the returned offset: P3 stage 3 step 3c), then the saves of the
+/// callee-saved registers the code writes.
+fn entry_frame(alloc: &Allocation, save_area: bool) -> Result<(EntryFrame, Option<u32>), Refusal> {
     let mut saves = Vec::new();
     let mut offset = alloc.spill_bytes.next_multiple_of(16);
+    let area = save_area.then_some(offset);
+    if save_area {
+        offset += SAVE_AREA_BYTES;
+    }
     for pair in alloc.callee_saved_gp.chunks(2) {
         saves.push((
             u32::from(pair[0]),
@@ -719,11 +765,24 @@ fn entry_frame(alloc: &Allocation) -> Result<EntryFrame, Refusal> {
     if offset >= 4096 {
         return Err(Refusal::whole("a frame area past 4,095 bytes"));
     }
-    Ok(EntryFrame {
-        extra: offset,
-        saves,
-    })
+    Ok((
+        EntryFrame {
+            extra: offset,
+            saves,
+        },
+        area,
+    ))
 }
+
+/// The inlined frames' save area (P3 stage 3 step 3c): the compiled frame's chunk, `this`,
+/// running environment and its parent, and slots base, while an inlined frame's generic node
+/// runs with its own (`Gen::lower_inlined_generic`), at these byte offsets from its start.
+const SAVE_AREA_BYTES: u32 = 48;
+const SAVE_CHUNK: u32 = 0;
+const SAVE_THIS: u32 = 8;
+const SAVE_ENV: u32 = 16;
+const SAVE_ENV_PARENT: u32 = 24;
+const SAVE_SLOTS: u32 = 32;
 
 /// Out-of-line code, emitted after the body.
 enum Cold {
@@ -841,6 +900,13 @@ enum Cold {
     },
     /// A branch to a label (an effect's throw into its exit).
     Jump { label: usize, target: usize },
+    /// An inlined frame's generic node's throw (P3 stage 3 step 3c): the compiled frame's
+    /// context words it switched restored, then a branch to the throw epilogue or its exit.
+    Restore {
+        label: usize,
+        switched: Switched,
+        target: usize,
+    },
     /// A creation the in-line commit cannot make (StoreNew, P3 stage 3 step L3): the insert by a
     /// pure call (`store_new_slow`), the Object in x17, then `done`, or `exit` where it did not
     /// insert.
@@ -914,6 +980,20 @@ struct Gen<'a> {
     /// 3), by the graph's frame index; and the frames' recipes so far.
     frame_index: Vec<Option<u16>>,
     frames: Vec<crate::opt::exit::FrameRecipe>,
+    /// The chunks of the graph's inlined frames, with their Cfgs, by `InlinedFrame::chunk`.
+    inlined: &'a [crate::opt::verify::FrameChunk<'a>],
+    /// The frame area's save area for inlined frames' generic nodes (`SAVE_AREA_BYTES` at this
+    /// byte offset), where the graph has one.
+    save_area: Option<u32>,
+}
+
+/// What an inlined frame's generic node switched of the context (P3 stage 3 step 3c), which its
+/// return and its throw restore (`Gen::restore_context`).
+#[derive(Clone, Copy)]
+struct Switched {
+    this: bool,
+    env: bool,
+    slots: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -983,6 +1063,8 @@ impl<'a> Gen<'a> {
             }),
             frame_index: vec![None; graph.frames.len()],
             frames: Vec::new(),
+            inlined: &[],
+            save_area: None,
         }
     }
 
@@ -1079,21 +1161,36 @@ impl<'a> Gen<'a> {
         table.return_offsets = exits.iter().map(|&(offset, _)| offset).collect();
         table.exits = exits.into_iter().map(|(_, record)| record).collect();
         table.frames = self.frames.into_boxed_slice();
+        let names_global = |o: &Op| {
+            matches!(
+                o,
+                Op::LoadName(..)
+                    | Op::LoadNameForCall(..)
+                    | Op::LoadNameIn(..)
+                    | Op::LoadNameForCallIn(..)
+            )
+        };
+        // An inlined frame's generic nodes run their templates on the compiled frame's record
+        // (P3 stage 3 step 3c): its operand words and slot window, which every entry's stack
+        // must hold, and the global names its templates read.
+        let mut max_stack = self.cfg.jit_stack_capacity();
+        let mut inlined_global = false;
+        for node in &self.graph.nodes {
+            let (Some(frame), NodeOp::Generic { .. }) = (self.graph.inlined(node.frame), &node.op)
+            else {
+                continue;
+            };
+            let (view, cfg) = self.inlined[frame.chunk as usize];
+            max_stack = max_stack.max(cfg.jit_stack_capacity() + view.jit_frame().1);
+            inlined_global |= names_global(&view.jit_ops()[node.pc as usize]);
+        }
         Ok(Assembled {
             words,
             table,
             // Made here, on the compile's thread.
             pc_offsets: vec![trap; ops.len()],
-            needs_global: ops.iter().any(|o| {
-                matches!(
-                    o,
-                    Op::LoadName(..)
-                        | Op::LoadNameForCall(..)
-                        | Op::LoadNameIn(..)
-                        | Op::LoadNameForCallIn(..)
-                )
-            }),
-            max_stack: self.cfg.jit_stack_capacity(),
+            needs_global: inlined_global || ops.iter().any(names_global),
+            max_stack,
         })
     }
 }
@@ -1697,10 +1794,24 @@ impl Gen<'_> {
         } else {
             recipe_stack.resize(state.stack.len(), Source::Frame);
         }
+        // An inlined frame's throw (P3 stage 3 step 3c) also reads its chain's recipes, the
+        // frames' callees, receivers and parent states, after the call.
+        let frame = self.frame_recipe(state.frame)?;
+        let mut chain = Vec::new();
+        let mut at = frame;
+        while at != 0 {
+            let recipe = &self.frames[usize::from(at) - 1];
+            chain.push(recipe.callee);
+            chain.push(recipe.receiver);
+            chain.extend(recipe.slots.iter().map(|&(_, source)| source));
+            chain.extend(recipe.stack.iter().copied());
+            at = recipe.parent;
+        }
         if !recipe_slots
             .iter()
             .map(|(_, source)| source)
             .chain(&recipe_stack)
+            .chain(&chain)
             .all(preserved)
         {
             return Err(Refusal::at(
@@ -1718,8 +1829,7 @@ impl Gen<'_> {
             shape_check: None,
             proof: 0,
             count: Cell::new(0),
-            // The compiled function's (no effect or generic node runs in an inlined frame).
-            frame: self.frame_recipe(state.frame)?,
+            frame,
         };
         let site = self.a.new_label();
         let ret = self.a.new_label();
@@ -1854,7 +1964,21 @@ impl Gen<'_> {
                 }
                 if !unused {
                     let dst = self.gp_dst(n);
-                    self.a.ldr_imm(dst, 22, u32::from(*slot) * 8);
+                    match graph.inlined(node.frame) {
+                        None => self.a.ldr_imm(dst, 22, u32::from(*slot) * 8),
+                        Some(frame) => {
+                            // An inlined frame's node's slot window, above its frame's operand
+                            // capacity from the operand base (`lower_inlined_generic`).
+                            let (_, cfg) = self.inlined[frame.chunk as usize];
+                            let window = cfg.jit_stack_capacity() as u32;
+                            self.a.ldr_imm(
+                                X16,
+                                19,
+                                std::mem::offset_of!(JitCtx, stack_base) as u32,
+                            );
+                            self.a.ldr_imm(dst, X16, 8 * (window + u32::from(*slot)));
+                        }
+                    }
                     self.gp_done(n, dst);
                 }
             }
@@ -2800,6 +2924,9 @@ impl Gen<'_> {
     fn lower_effect(&mut self, n: NodeIx, pc: usize, pops: usize) -> Result<(), Refusal> {
         let graph = self.graph;
         let node = graph.node(n);
+        if !node.frame.is_compiled() {
+            return self.lower_inlined_generic(n, pc, pops);
+        }
         let state = graph.state(node.state.expect("checked"));
         let handlers = !state.handlers.is_empty();
         if self.options.forced_exits {
@@ -2832,7 +2959,7 @@ impl Gen<'_> {
         // A generic node's named slots whose words are stale (P3 stage 3 step 3a): the template
         // reads them in the frame.
         if matches!(node.op, NodeOp::Generic { .. }) {
-            let slots = stale_slots(self.chunk, graph, node);
+            let slots = stale_slots(self.chunk, graph.n_slots, graph, node);
             for (&slot, &v) in slots.iter().zip(&node.inputs[pops..]) {
                 let word = self.boxed(v, X16);
                 self.a.str_imm(word, 22, 8 * u32::from(slot));
@@ -2883,6 +3010,244 @@ impl Gen<'_> {
         self.a.set_hot(false);
         self.last_effect = Some(n);
         Ok(())
+    }
+
+    /// An inlined frame's generic node (P3 stage 3 step 3c; step3c-impl's design note): the
+    /// operation's template, emitted from its frame's chunk, run with its explicit inputs where
+    /// the template ABI's helpers read them, as JSC's DFG stores its node's code origin into the
+    /// frame before each call out (dfg/DFGJITCompiler.h:133-143, dfg/DFGSpeculativeJIT.h:
+    /// 1078-1097): its operands in the compiled frame's operand words at the operation's own
+    /// depth in its frame's chunk (x20 there); its chunk in `JitCtx::chunk`, its template passing
+    /// its pc; its frame's inline site in `Interp::call_site`, as a splice's checked operation
+    /// publishes its implicit position; for a kind that reads them (`liveness::context_use`), the
+    /// frame's receiver in `this_word` and its closure's environment in `env_raw` and
+    /// `env_parent_raw`; for a kind that names a slot, a slot window above the callee's operand
+    /// capacity that x22, `JitCtx::slots` and `n_slots` name, the named slots' values in it. The
+    /// compiled frame's words are saved in the save area before and restored after, on its
+    /// return and on its throw, which leaves by the throw epilogue or, with a handler in a frame
+    /// of its chain, by its exit. Its property helpers are called in line
+    /// (`Asm::plain_accessor_helpers`), its TDZ tests all kept (its pcs are another chunk's).
+    fn lower_inlined_generic(&mut self, n: NodeIx, pc: usize, pops: usize) -> Result<(), Refusal> {
+        let graph = self.graph;
+        let node = graph.node(n);
+        let state = node.state.expect("checked");
+        let frame = graph.inlined(node.frame).expect("an inlined frame's node");
+        let &(view, cfg) = self
+            .inlined
+            .get(frame.chunk as usize)
+            .ok_or(Refusal::at(pc, "an inlined frame's chunk the code lacks"))?;
+        let save = self.save_area.ok_or(Refusal::at(
+            pc,
+            "an inlined frame's generic node without a save area",
+        ))?;
+        if self.options.forced_exits {
+            let site = self.exit(n, ExitKind::Check)?;
+            self.forced(site);
+        }
+        let op = &view.jit_ops()[pc];
+        #[cfg(test)]
+        TEST_INLINED_GENERIC.with(|ops| ops.borrow_mut().push(*op));
+        let depth = cfg.stack_depth_at(pc).expect("checked");
+        let (_, n_slots) = view.jit_frame();
+        let capacity = cfg.jit_stack_capacity();
+        let uses = crate::opt::liveness::context_use(op);
+        let named = crate::opt::liveness::frame_slots(op, n_slots);
+        let stale = stale_slots(view, n_slots, graph, node);
+        let poison = self.options.poison;
+        let switched = Switched {
+            this: uses.this || poison,
+            env: uses.env,
+            slots: !named.is_empty() || poison,
+        };
+        let ctx = |field: usize| field as u32;
+        let stack_base = ctx(std::mem::offset_of!(JitCtx, stack_base));
+        // The operands, at the operation's depth from the compiled frame's operand base.
+        self.a.ldr_imm(X9, 19, stack_base);
+        for (k, &v) in node.inputs[..pops].iter().enumerate() {
+            let word = self.boxed(v, X16);
+            self.a.str_imm(word, X9, (8 * (depth - pops + k)) as u32);
+        }
+        // The slot window above the callee's capacity: its named slots' values, and under the
+        // poison switch the poison in every other word of it.
+        if switched.slots {
+            if poison {
+                self.a.mov_imm64(X16, POISON);
+                for slot in (0..n_slots as u16).filter(|slot| !stale.contains(slot)) {
+                    self.a
+                        .str_imm(X16, X9, 8 * (capacity as u32 + u32::from(slot)));
+                }
+            }
+            for (&slot, &v) in stale.iter().zip(&node.inputs[pops..]) {
+                let word = self.boxed(v, X16);
+                self.a
+                    .str_imm(word, X9, 8 * (capacity as u32 + u32::from(slot)));
+            }
+        }
+        if poison {
+            // The operand words below its operands (`poison`'s for the compiled frame's nodes).
+            self.a.mov_imm64(X16, POISON);
+            for k in 0..depth - pops {
+                self.a.str_imm(X16, X9, 8 * k as u32);
+            }
+        }
+        // The compiled frame's context words saved, the node's written.
+        let chunk_off = ctx(std::mem::offset_of!(JitCtx, chunk));
+        self.a.ldr_imm(X16, 19, chunk_off);
+        self.a.str_imm(X16, 31, save + SAVE_CHUNK);
+        self.a.mov_imm64(X16, view.chunk_addr as u64);
+        self.a.str_imm(X16, 19, chunk_off);
+        let this_off = ctx(std::mem::offset_of!(JitCtx, this_word));
+        if switched.this {
+            self.a.ldr_imm(X16, 19, this_off);
+            self.a.str_imm(X16, 31, save + SAVE_THIS);
+            let word = if uses.this {
+                self.gp(frame.receiver, X16)
+            } else {
+                // A kind that reads no `this` finds the poison there (a Number: the collector
+                // traces none).
+                self.a.mov_imm64(X16, POISON);
+                X16
+            };
+            self.a.str_imm(word, 19, this_off);
+        }
+        if switched.env {
+            if frame.env == 0 {
+                return Err(Refusal::at(pc, "an inlined frame's environment unknown"));
+            }
+            let env_off = ctx(std::mem::offset_of!(JitCtx, env_raw));
+            let parent_off = ctx(std::mem::offset_of!(JitCtx, env_parent_raw));
+            self.a.ldr_imm(X16, 19, env_off);
+            self.a.str_imm(X16, 31, save + SAVE_ENV);
+            self.a.ldr_imm(X16, 19, parent_off);
+            self.a.str_imm(X16, 31, save + SAVE_ENV_PARENT);
+            // The closure's environment and its parent, as the direct sequence installs both
+            // (`emit_direct_sequence`: the parent's word read from the record).
+            self.a.mov_imm64(X16, frame.env as u64);
+            self.a.str_imm(X16, 19, env_off);
+            self.a.ldr_imm(X17, X16, self.layout.scope_parent as u32);
+            self.a.str_imm(X17, 19, parent_off);
+        }
+        if switched.slots {
+            self.a.str_imm(22, 31, save + SAVE_SLOTS);
+            self.a.add_imm(22, X9, 8 * capacity as u32);
+            self.a
+                .str_imm(22, 19, ctx(std::mem::offset_of!(JitCtx, slots)));
+            self.a.movz(X16, n_slots as u32, 0);
+            self.a
+                .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
+        }
+        // The frame's inline site, published as a splice's checked operation publishes its own.
+        let position = if frame.position == crate::stack_trace::NO_POSITION {
+            frame.position
+        } else {
+            crate::stack_trace::implicit_inline_position(frame.position)
+        };
+        self.a
+            .ldr_imm(X17, 19, ctx(std::mem::offset_of!(JitCtx, interp)));
+        self.a.mov_imm64(X16, u64::from(position));
+        self.a.str_w_imm(X16, X17, self.ilayout.call_site as u32);
+        self.a.add_imm(20, X9, (8 * depth) as u32);
+        // A throw restores the context first.
+        let target = if graph.chain_has_handlers(state) {
+            self.exit_throw(n)?
+        } else {
+            self.l_ret_throw
+        };
+        let unwind = self.a.new_label();
+        self.cold.push(Cold::Restore {
+            label: unwind,
+            switched,
+            target,
+        });
+        let hot = self.in_loop[self.compiled_pc(node.frame) as usize] || self.loop_mask(view)[pc];
+        self.a.set_hot(hot);
+        let reads = self.a.replace_initialized_reads(Default::default());
+        let plain = self.a.set_plain_accessor_helpers(true);
+        let fixed = self.a.fixed_activation();
+        self.a.set_fixed_activation(view.jit_fixed_activation());
+        let emitted = operations::emit(
+            &mut self.a,
+            view,
+            self.layout,
+            self.ilayout,
+            pc,
+            self.fast,
+            self.array_intrinsics_on,
+            self.function_call_intrinsic_on,
+            unwind,
+            self.l_direct_finish,
+        );
+        if !emitted {
+            emit_exec(&mut self.a, pc as u32, unwind);
+        }
+        self.a.set_fixed_activation(fixed);
+        self.a.set_plain_accessor_helpers(plain);
+        self.a.replace_initialized_reads(reads);
+        if poison {
+            // The words it poisoned, still the poison: the window's other slots (x22 names the
+            // window still) and the operand words below its operands.
+            let slots: Vec<u16> = (0..n_slots as u16)
+                .filter(|slot| !named.iter().any(|&(name, _)| name == *slot))
+                .collect();
+            self.check_poison(pc, &slots, depth - pops);
+        }
+        self.restore_context(switched);
+        self.a.set_hot(false);
+        self.last_effect = Some(n);
+        Ok(())
+    }
+
+    /// The compiled frame's context words an inlined frame's generic node switched, back from
+    /// the save area (`lower_inlined_generic`), and `Interp::call_site` NO_POSITION again, the
+    /// value it has between operations (contracts 4.3). x16 and x17 scratch; x20 and x0-x1 kept.
+    fn restore_context(&mut self, switched: Switched) {
+        let save = self.save_area.expect("a save area");
+        let ctx = |field: usize| field as u32;
+        self.a.ldr_imm(X16, 31, save + SAVE_CHUNK);
+        self.a
+            .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, chunk)));
+        if switched.this {
+            self.a.ldr_imm(X16, 31, save + SAVE_THIS);
+            self.a
+                .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, this_word)));
+        }
+        if switched.env {
+            self.a.ldr_imm(X16, 31, save + SAVE_ENV);
+            self.a
+                .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, env_raw)));
+            self.a.ldr_imm(X16, 31, save + SAVE_ENV_PARENT);
+            self.a
+                .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, env_parent_raw)));
+        }
+        if switched.slots {
+            self.a.ldr_imm(22, 31, save + SAVE_SLOTS);
+            self.a
+                .str_imm(22, 19, ctx(std::mem::offset_of!(JitCtx, slots)));
+            self.a.movz(X16, self.graph.n_slots as u32, 0);
+            self.a
+                .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
+        }
+        self.a
+            .ldr_imm(X17, 19, ctx(std::mem::offset_of!(JitCtx, interp)));
+        self.a
+            .mov_imm64(X16, u64::from(crate::stack_trace::NO_POSITION));
+        self.a.str_w_imm(X16, X17, self.ilayout.call_site as u32);
+    }
+
+    /// The pc in the compiled chunk of the call that `frame` (an inlined frame, or the compiled
+    /// frame's own 0) descends from.
+    fn compiled_pc(&self, mut frame: FrameIx) -> u32 {
+        let mut pc = 0;
+        while let Some(inlined) = self.graph.inlined(frame) {
+            pc = inlined.call_pc;
+            frame = self.graph.state(inlined.parent).frame;
+        }
+        pc
+    }
+
+    /// The loop bodies of an inlined frame's chunk (`loop_body_mask`).
+    fn loop_mask(&self, view: &FrozenChunk) -> Vec<bool> {
+        loop_body_mask(view.jit_ops())
     }
 
     /// The poison switch's stores before effect `node` (`Options::poison`): before a generic node
@@ -3137,6 +3502,15 @@ impl Gen<'_> {
                     }
                     Cold::Jump { label, target } => {
                         self.a.bind(label);
+                        self.a.b(target);
+                    }
+                    Cold::Restore {
+                        label,
+                        switched,
+                        target,
+                    } => {
+                        self.a.bind(label);
+                        self.restore_context(switched);
                         self.a.b(target);
                     }
                     Cold::ElementUndefined {

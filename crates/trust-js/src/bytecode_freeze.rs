@@ -30,6 +30,7 @@ impl Chunk {
     /// chunk's table, made now if none was (step 16). Main thread only: it upgrades the inline
     /// targets' pins, reads the agent heap's allocation sites and may make atoms.
     pub(crate) fn freeze_into(&self, view: &mut FrozenChunk) {
+        view.chunk_addr = self as *const Chunk as usize;
         let ops = self.ops.as_slice();
         view.ops.clear();
         view.ops.extend_from_slice(ops);

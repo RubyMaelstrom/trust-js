@@ -586,8 +586,10 @@ function c10(o, a) { return rd(o, a); }
 function cat(s) { return s + 'x'; }
 function c11(s) { return cat(s); }
 function rec(n) { return n > 0 ? rec(n - 1) : 0; }
+function spr(a) { return [...a].length; }
+function c12(a) { return spr(a); }
 var o9 = {p: 1}, o10 = {k: 2};
-for (var k = 0; k < 30; k++) { c9(o9); c10(o10, k); c11('s'); rec(2); }
+for (var k = 0; k < 30; k++) { c9(o9); c10(o10, k); c11('s'); rec(2); c12([k]); }
 ";
 
 #[test]
@@ -634,21 +636,21 @@ fn an_inlined_callee_reads_its_kind_bound_flags_from_its_inlined_keys_only() {
         .declines
         .iter()
         .any(|decline| decline.reason == ExitReason::WrongShape && decline.pc == load));
-    // An inlined one is the inlined read's, its generic access an effect, which declines the way
-    // (E0); rd compiled alone ignores it.
+    // An inlined one is the inlined read's: its access is the generic node of the inlined frame
+    // (P3 stage 3 step 3c; E0 declined the way before); rd compiled alone ignores it.
     let mut engine = warmed(MISC);
     let rd = chunk_of(&mut engine, "rd");
     flag(&rd, load, ExitReason::WrongShape, true, 1);
     let built = Compile::new(&mut engine, "c10").build();
-    assert!(
-        matches!(
-            &outcomes(&built)[..],
-            [(0, InlineOutcome::Declined { at: Some((pc, Op::GetPropLocal(..))), .. })] if *pc == load
-        ),
-        "{:?}",
-        built.inlines
+    assert_eq!(outcomes(&built), vec![(0, InlineOutcome::Inlined)]);
+    assert_eq!(
+        nodes(&built.graph, |node| node.frame == FrameIx(1)
+            && matches!(node.op, NodeOp::Generic { pc, .. } if pc == load))
+        .len(),
+        1,
+        "{}",
+        dump(&built.graph)
     );
-    assert!(built.graph.frames.is_empty());
     let alone = Compile::with(&mut engine, "rd", Request::Plan(Default::default())).build();
     assert!(
         !alone
@@ -662,21 +664,41 @@ fn an_inlined_callee_reads_its_kind_bound_flags_from_its_inlined_keys_only() {
 }
 
 #[test]
-fn a_callee_with_an_effect_is_declined_and_its_call_stays() {
+fn a_callee_with_a_generic_operation_is_inlined_and_one_needing_the_whole_frame_declined() {
+    // P3 stage 3 step 3c: cat's `s + 'x'` (no Numbers) is a generic node of its inlined frame,
+    // and c11's call is gone; spr's array spread runs the VM on its frame's slots in place (a
+    // canonical-frame effect), which an inlined frame has none of: E0 declines it, and c12's
+    // call stays.
     let mut engine = warmed(MISC);
     let compile = Compile::new(&mut engine, "c11");
     let built = compile.build();
     let cat = chunk_of(&mut engine, "cat");
     let add = pc_of(&cat, |op| *op == Op::Add);
+    assert_eq!(outcomes(&built), vec![(0, InlineOutcome::Inlined)]);
+    let call = pc_of(&compile.chunk, is_call);
+    assert_eq!(built.graph.frames.len(), 1);
+    assert!(nodes(&built.graph, |node| node.frame.is_compiled()
+        && matches!(node.op, NodeOp::Effect { pc, .. } | NodeOp::Generic { pc, .. } if pc == call))
+    .is_empty());
     assert_eq!(
-        outcomes(&built),
-        vec![(
-            0,
-            InlineOutcome::Declined {
-                reason: super::build::E0_EFFECT,
-                at: Some((add, Op::Add)),
-            }
-        )]
+        nodes(&built.graph, |node| node.frame == FrameIx(1)
+            && matches!(node.op, NodeOp::Generic { pc, .. } if pc == add))
+        .len(),
+        1,
+        "{}",
+        dump(&built.graph)
+    );
+    let compile = Compile::new(&mut engine, "c12");
+    let built = compile.build();
+    let spr = chunk_of(&mut engine, "spr");
+    assert!(
+        matches!(
+            &outcomes(&built)[..],
+            [(0, InlineOutcome::Declined { reason: super::build::E0_EFFECT, at: Some((pc, op)) })]
+                if crate::bytecode::jit_runs_on_vm_copy(op) && spr.jit_ops()[*pc as usize] == *op
+        ),
+        "{:?}",
+        built.inlines
     );
     let call = pc_of(&compile.chunk, is_call);
     assert!(built.graph.frames.is_empty());
@@ -733,18 +755,17 @@ fn callees_whose_equalities_and_typeof_tests_lower_are_inlined() {
         "the callee's speculation: {}",
         dump(&built.graph)
     );
+    // A loose compare with a String constant lowers to nothing: its callee is inlined with the
+    // compare as its frame's generic node (P3 stage 3 step 3c; E0 declined it before).
     let lit = chunk_of(&mut engine, "lit");
     let eq = pc_of(&lit, |op| *op == Op::EqEq);
     let built = Compile::new(&mut engine, "f").build();
+    assert_eq!(outcomes(&built), vec![(0, InlineOutcome::Inlined)]);
     assert_eq!(
-        outcomes(&built),
-        vec![(
-            0,
-            InlineOutcome::Declined {
-                reason: super::build::E0_EFFECT,
-                at: Some((eq, Op::EqEq)),
-            }
-        )]
+        nodes(&built.graph, |node| node.frame == FrameIx(1)
+            && matches!(node.op, NodeOp::Generic { pc, .. } if pc == eq))
+        .len(),
+        1
     );
 }
 
@@ -1417,3 +1438,452 @@ mod chain;
 /// String's length.
 #[path = "create_inline_tests.rs"]
 mod create;
+
+// ---- P3 stage 3 step 3c: generic nodes in inlined frames --------------------------------------
+
+/// The inlined frames' generic nodes the back end lowered since the last call, by operation.
+fn inlined_generic() -> Vec<Op> {
+    super::a64::TEST_INLINED_GENERIC.with(|ops| std::mem::take(&mut *ops.borrow_mut()))
+}
+
+/// `both` under `switches`' graph inlining (`graph_switches` with the poison switch where
+/// `poison`), with `stress` collections at every allocation.
+fn both_poisoned(source: &str, exit_every: u32, stress: bool, poison: bool) -> (String, String) {
+    TestSwitches::default().set();
+    let mut off = jit_engine();
+    let expected = eval(&mut off, source);
+    TestSwitches {
+        poison,
+        ..graph_switches(exit_every)
+    }
+    .set();
+    let mut engine = jit_engine();
+    if stress {
+        let mut core = engine.interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(1);
+        core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    }
+    let got = eval(&mut engine, source);
+    (expected, got)
+}
+
+/// Leaf callees whose operations the tier does not lower, each a kind E0 declined (the census's:
+/// generic named loads through `this`, a local and the stack, stores and an update through
+/// setters, element reads by name, instanceof, template strings, array literals, loose equality,
+/// string concatenation, delete), each through accessors or megamorphic sites so that it stays
+/// a generic node.
+const GENERIC_KINDS: &str = "
+var shapes = [{a: 1, x: 1}, {b: 1, x: 2}, {c: 1, x: 3}, {d: 1, x: 4}, {e: 1, x: 5}, {f: 1, x: 6}];
+function gx(o) { return o.x; }
+function M(v) { this.v = v; }
+Object.defineProperty(M.prototype, 'w', {
+  get: function () { return this.v + 1; },
+  set: function (z) { this.v = z * 2; }
+});
+M.prototype.rw = function () { return this.w; };
+M.prototype.ww = function (z) { this.w = z; };
+function sw(o, z) { o.w = z; }
+function at(o, k) { return o[k]; }
+function isM(o) { return o instanceof M; }
+function str(v) { return `${v}!`; }
+function arr(a, b) { return [a, b]; }
+function loc(o) { var q = o; return q.w; }
+function sloc(o, z) { var q = o; q.w = z; }
+function eqs(a, b) { return a == b; }
+function cat(a, b) { return a + b; }
+function upd(o) { o.w++; }
+function del(o) { delete o.tmp; return o.v; }
+function incs(s) { var q = s; q++; return q; }
+function run(n) {
+  var m = new M(1), s = 0, t = '';
+  for (var i = 0; i < n; i++) {
+    s += gx(shapes[i % 6]);
+    s += m.rw(); m.ww(i); sw(m, i + 1);
+    s += at(m, i & 1 ? 'v' : 'w');
+    if (isM(m)) s++;
+    t = str(i) + cat('a', i);
+    s += arr(i, 2).length + loc(m);
+    sloc(m, 3);
+    if (eqs('1', i % 2)) s++;
+    upd(m);
+    m.tmp = i; s += del(m);
+    s += incs(i & 1 ? '5' : '6');
+  }
+  return s + ':' + t + ':' + m.v;
+}
+var r = ''; for (var k = 0; k < 200; k++) r = run(20); r";
+
+/// Each of an inlined frame's context reads, by a program whose compiled frame holds another
+/// value there: `this` (the method's caller has a `w` of its own), the environment (the caller's
+/// closure binds the name the callee reads from the global object's accessor), a named slot (the
+/// caller's slot of the callee's local's number holds another object).
+const CONTEXT_READS: &[&str] = &[
+    "function M(v) { this.v = v; }
+     Object.defineProperty(M.prototype, 'w', { get: function () { return this.v + 1; } });
+     M.prototype.rw = function () { return this.w; };
+     var holder = { v: 1000, sum: function (m, n) {
+       var s = 0; for (var i = 0; i < n; i++) s += m.rw() + this.v + this.w; return s; } };
+     Object.defineProperty(holder, 'w', { get: function () { return -1; } });
+     var m = new M(2), r = 0; for (var k = 0; k < 300; k++) r += holder.sum(m, 10); r",
+    "Object.defineProperty(globalThis, 'gz', { get: function () { return 3; }, configurable: true });
+     function rg() { return gz; }
+     function mk() { var gz = 5;
+       return function inner(n) { var s = 0; for (var i = 0; i < n; i++) s += rg() + gz; return s; }; }
+     var g = mk(), r = 0; for (var k = 0; k < 300; k++) r += g(10); r",
+    "function M(v) { this.v = v; }
+     Object.defineProperty(M.prototype, 'w', { get: function () { return this.v + 1; } });
+     function loc(o) { var q = o; return q.w; }
+     function rl(n) { var a = new M(50), b = new M(7), s = 0;
+       for (var i = 0; i < n; i++) s += loc(b) + a.w; return s; }
+     var r = 0; for (var k = 0; k < 300; k++) r += rl(10); r",
+];
+
+/// Error.stack, a getter's `caller` and a thrown error's position from an inlined frame's node:
+/// a getter its generic read calls (its frame's caller the inlined callee, which reports its
+/// start), and a TypeError its generic element read raises (the callee's frame at the read, the
+/// caller's at the call).
+const POSITIONS: &str = "
+function G() {}
+var stk = '', cal, cal2;
+Object.defineProperty(G.prototype, 'p', { get: function getter() {
+  stk = new Error('e').stack; cal = getter.caller; return 1; } });
+Object.defineProperty(G.prototype, 'q', { get: function getter2() { cal2 = getter2.caller; return 2; } });
+function viaGet(o) { return o.p; }
+function outer(o) { var s = 0; for (var i = 0; i < 20; i++) s += viaGet(o) + o.q; return s; }
+var g = new G(), r = 0; for (var k = 0; k < 300; k++) r += outer(g);
+function ge(a, k) { return a[k]; }
+function gouter(a) { var s = 0; for (var i = 0; i < 20; i++) s += ge(a, i & 1 ? 'x' : 'y'); return s; }
+var ga = {x: 1, y: 2}; for (var k = 0; k < 300; k++) r += gouter(ga);
+var err = ''; try { gouter(null); } catch (e) { err = e.stack.split('\\n').slice(0, 3).join('|'); }
+r + '|' + stk.split('\\n').slice(0, 4).join('|') + '|' + (cal === viaGet) + (cal2 === outer) + '|' + err";
+
+/// A throw from an inlined frame's node, caught by its caller's handler around the call and by
+/// none (the throw leaves the compiled function).
+const THROWS: &str = "
+function G() {}
+Object.defineProperty(G.prototype, 'p', { get: function () {
+  if (this.bad) throw new TypeError('bad ' + this.bad); return 1; } });
+function viaGet(o) { return o.p; }
+function caught(o) { var s = 0;
+  for (var i = 0; i < 20; i++) { try { s += viaGet(o); } catch (e) { s += 1000; } } return s; }
+function leaves(o) { var s = 0; for (var i = 0; i < 20; i++) s += viaGet(o); return s; }
+var g = new G(), r = 0;
+for (var k = 0; k < 300; k++) { r += caught(g); r += leaves(g); }
+g.bad = 'x';
+var e2 = ''; try { leaves(g); } catch (e) { e2 = e.message + ':' + e.stack.split('\\n').slice(0, 3).join('|'); }
+r + ',' + caught(g) + ',' + e2";
+
+/// Collections while an inlined frame's helper runs, with objects live in both frames: the
+/// getter allocates, the callee and the caller hold objects across it.
+const COLLECTIONS: &str = "
+function M(v) { this.v = v; }
+Object.defineProperty(M.prototype, 'w', { get: function () {
+  var junk = []; for (var j = 0; j < 8; j++) junk.push({j: j, s: 'x' + j}); return this.v + junk.length; } });
+function pair(m, o) { var keep = {a: o.a + 1}; return m.w + keep.a; }
+function hold(n) { var m = new M(3), o = {a: 1}, s = 0;
+  for (var i = 0; i < n; i++) { var t = {b: i}; s += pair(m, o) + t.b + o.a; } return s; }
+var r = 0; for (var k = 0; k < 100; k++) r += hold(10); r";
+
+/// The graph counterparts of the splice subjects step 2's record lists before the flip: a callee
+/// of another realm at a warmed site, a closure callee that outlives its last reference (the
+/// site meets another closure after a collection), a callee's string constants.
+const COUNTERPARTS: &[&str] = &[
+    "var other = $262.createRealm().global;
+     other.eval(\"function fr(o) { return o.w; }\");
+     function M(v) { this.v = v; }
+     Object.defineProperty(M.prototype, 'w', { get: function () { return this.v + 1; } });
+     function fl(o) { return o.w; }
+     function cr(f, o) { var s = 0; for (var i = 0; i < 10; i++) s += f(o); return s; }
+     var m = new M(4), r = 0; for (var k = 0; k < 300; k++) r += cr(fl, m);
+     r + ',' + cr(other.fr, m) + ',' + cr(fl, m)",
+    "function M(v) { this.v = v; }
+     Object.defineProperty(M.prototype, 'w', { get: function () { return this.v + 1; } });
+     function mkc(k) { return function (o) { return o.w + k; }; }
+     var f = mkc(1);
+     function cc(o) { var s = 0; for (var i = 0; i < 10; i++) s += f(o); return s; }
+     var m = new M(4), r = 0; for (var k = 0; k < 300; k++) r += cc(m);
+     f = mkc(2); var junk = []; for (var j = 0; j < 20000; j++) junk.push({j: j}); junk = null;
+     r + ',' + cc(m)",
+    "function M(v) { this.v = v; }
+     Object.defineProperty(M.prototype, 'w', { get: function () { return this.v + 1; } });
+     function sc(o) { return o.w + 'tail' + o.v; }
+     function cs(o) { var t = ''; for (var i = 0; i < 10; i++) t = sc(o) + i; return t; }
+     var m = new M(4), r = ''; for (var k = 0; k < 300; k++) r = cs(m);
+     var junk = []; for (var j = 0; j < 20000; j++) junk.push('s' + j); junk = null; r + cs(m)",
+];
+
+#[test]
+fn an_inlined_frames_generic_node_takes_every_named_slot_and_leaves_it_a_value() {
+    // lw's two reads of `q.w` (an accessor: generic) each take q's value as an input: an inlined
+    // frame has no frame, so the first node's write of its slot window holds nothing the second
+    // can read, and q stays a value (no state of the frame names the frame).
+    let mut engine = warmed(
+        "function M(v) { this.v = v; }
+         Object.defineProperty(M.prototype, 'w', { get: function () { return this.v; } });
+         function lw(o) { var q = o; var a = q.w; var b = q.w; return a + b; }
+         function clw(o) { return lw(o); }
+         var m = new M(1); for (var k = 0; k < 30; k++) clw(m);",
+    );
+    let built = Compile::new(&mut engine, "clw").build();
+    assert_eq!(outcomes(&built), vec![(0, InlineOutcome::Inlined)]);
+    let graph = &built.graph;
+    let reads = nodes(graph, |node| {
+        node.frame == FrameIx(1)
+            && matches!(node.op, NodeOp::Generic { pops: 0, .. })
+            && node.inputs.len() == 1
+    });
+    assert_eq!(reads.len(), 2, "{}", dump(graph));
+    assert_eq!(
+        graph.node(reads[0]).inputs,
+        graph.node(reads[1]).inputs,
+        "both read q's value: {}",
+        dump(graph)
+    );
+    for &read in &reads {
+        let state = graph.state(graph.node(read).state.unwrap());
+        assert!(!state.slots.contains(&SlotSource::Frame));
+    }
+}
+
+#[test]
+fn a_call_whose_inlined_callee_runs_a_generic_node_is_no_lowered_operation() {
+    // G's value, which `bump`'s setter changes, is read in the loop after each call: the loop
+    // prepass must count the inlined call an effect (its callee's generic store may run any
+    // JavaScript), so that no fact of G crosses it or the header.
+    let source = "var G = 1;
+         function M() {}
+         Object.defineProperty(M.prototype, 'g', { set: function (z) { G = z; } });
+         function bump(m, i) { m.g = i; }
+         function loop(m, n) { var s = 0; for (var i = 0; i < n; i++) { s += G; bump(m, i); } return s; }
+         var m = new M(), r = 0; for (var k = 0; k < 300; k++) r += loop(m, 10); r";
+    inlines();
+    inlined_generic();
+    let (expected, got) = both(source, 0, false);
+    assert_eq!(got, expected);
+    assert!(inlines()
+        .iter()
+        .any(|note| note.outcome == InlineOutcome::Inlined));
+    assert!(!inlined_generic().is_empty());
+}
+
+#[test]
+fn the_inliner_declines_a_callee_past_the_compiled_frames_record() {
+    // cbig's 225 locals and big's 30 (the planner's limit is 32): big's generic node's slot
+    // window above its operand words would put cbig's frame past a pooled record (P3 stage 3
+    // step 3c), where a callee without a generic node fits.
+    let locals = |prefix: &str, n: usize| -> String {
+        (0..n)
+            .map(|k| format!("{prefix}{k}"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let source = format!(
+        "function M(v) {{ this.v = v; }}
+         Object.defineProperty(M.prototype, 'w', {{ get: function () {{ return this.v; }} }});
+         function big(o) {{ var {}; return o.w; }}
+         function cbig(o) {{ var {}; return big(o); }}
+         var m = new M(1); for (var k = 0; k < 30; k++) cbig(m);",
+        locals("v", 29),
+        locals("u", 225)
+    );
+    let mut engine = warmed(&source);
+    let built = Compile::new(&mut engine, "cbig").build();
+    assert_eq!(
+        outcomes(&built),
+        vec![(
+            0,
+            InlineOutcome::Declined {
+                reason: super::build::PAST_RECORD,
+                at: None,
+            }
+        )]
+    );
+}
+
+#[test]
+fn generic_operations_of_inlined_callees_give_the_tier_offs_results() {
+    inlines();
+    inlined_generic();
+    let (expected, got) = both(GENERIC_KINDS, 0, false);
+    assert_eq!(got, expected);
+    let inlined = inlines()
+        .iter()
+        .filter(|note| note.outcome == InlineOutcome::Inlined)
+        .count();
+    let ops = inlined_generic();
+    assert!(inlined >= 10, "the callees inline ({inlined} ways)");
+    for kind in [
+        |op: &Op| matches!(op, Op::GetPropThis(..)),
+        |op: &Op| matches!(op, Op::SetPropThisDrop(..)),
+        |op: &Op| matches!(op, Op::GetPropLocal(..)),
+        |op: &Op| matches!(op, Op::SetPropLocalDrop(..)),
+        |op: &Op| matches!(op, Op::GetElem | Op::GetElemLocal(_)),
+        |op: &Op| matches!(op, Op::InstanceOf(_)),
+        |op: &Op| matches!(op, Op::EqEq),
+        |op: &Op| matches!(op, Op::UpdateProp(..)),
+        |op: &Op| matches!(op, Op::UpdateLocal(..)),
+    ] {
+        assert!(ops.iter().any(kind), "{ops:?}");
+    }
+}
+
+#[test]
+fn generic_operations_of_inlined_callees_give_the_tier_offs_results_with_exits_forced() {
+    for every in [7, 100] {
+        let (expected, got) = both(GENERIC_KINDS, every, false);
+        assert_eq!(got, expected, "an exit every {every} checks");
+    }
+}
+
+#[test]
+fn generic_operations_of_inlined_callees_give_the_tier_offs_results_under_the_poison() {
+    for source in std::iter::once(GENERIC_KINDS).chain(CONTEXT_READS.iter().copied()) {
+        super::take_poison_faults();
+        let (expected, got) = both_poisoned(source, 0, false, true);
+        assert_eq!(got, expected, "{source}");
+        assert_eq!(
+            super::take_poison_faults(),
+            0,
+            "no template read or wrote a poisoned word: {source}"
+        );
+    }
+}
+
+#[test]
+fn an_inlined_generic_node_reads_its_frames_this_environment_and_slots() {
+    for source in CONTEXT_READS {
+        inlined_generic();
+        let (expected, got) = both(source, 0, false);
+        assert_eq!(got, expected, "{source}");
+        assert!(
+            !inlined_generic().is_empty(),
+            "a generic node inlined: {source}"
+        );
+    }
+}
+
+#[test]
+fn error_stack_caller_and_positions_from_an_inlined_frames_node_equal_the_tier_offs() {
+    inlined_generic();
+    let (expected, got) = both(POSITIONS, 0, false);
+    assert_eq!(got, expected);
+    assert!(
+        expected.contains("|truetrue|"),
+        "the getters' callers: {expected}"
+    );
+    assert!(!inlined_generic().is_empty());
+    let (expected, got) = both(POSITIONS, 7, false);
+    assert_eq!(got, expected, "with exits forced");
+}
+
+#[test]
+fn a_throw_from_an_inlined_frames_node_is_caught_by_its_callers_handler_or_leaves() {
+    inlined_generic();
+    inlined_exits();
+    let (expected, got) = both(THROWS, 0, false);
+    assert_eq!(got, expected);
+    assert!(!inlined_generic().is_empty());
+    assert!(
+        inlined_exits()
+            .iter()
+            .any(|&(depth, _, reason)| depth == 1 && reason == ExitReason::Throw),
+        "the caught throw exits through the inlined frame"
+    );
+    let (expected, got) = both(THROWS, 7, false);
+    assert_eq!(got, expected, "with exits forced");
+}
+
+#[test]
+fn collections_during_an_inlined_frames_helper_keep_both_frames_values() {
+    let (expected, got) = both(COLLECTIONS, 0, true);
+    assert_eq!(got, expected);
+    let (expected, got) = both(THROWS, 7, true);
+    assert_eq!(got, expected);
+}
+
+#[test]
+fn the_graph_counterparts_of_the_splice_subjects_give_the_tier_offs_results() {
+    for source in COUNTERPARTS {
+        let (expected, got) = both(source, 0, false);
+        assert_eq!(got, expected, "{source}");
+        let (expected, got) = both(source, 7, false);
+        assert_eq!(got, expected, "with exits forced: {source}");
+    }
+}
+
+/// The poison switch's writer check over an inlined frame's generic node: a test hook makes the
+/// exact-PC helper of dl's `delete` write its local x's slot, which `delete` does not name: in
+/// the inlined frame the helper writes the node's slot window, which the check reports; the
+/// tier's code still reads x from its home. Without the hook, no fault.
+#[test]
+fn the_poison_check_reports_an_inlined_frames_template_that_writes_a_slot_it_does_not_name() {
+    let program = "function dl(o, n) { var x = n * 3; delete o.c; return x + o.a; }
+         function cdl(o, n) { return dl(o, n); }
+         var t = 0; for (var k = 0; k < 300; k++) t += cdl({a: k, c: 1}, k); t";
+    TestSwitches::default().set();
+    let mut off = jit_engine();
+    let expected = eval(&mut off, program);
+    TestSwitches {
+        poison: true,
+        ..graph_switches(0)
+    }
+    .set();
+    let mut engine = jit_engine();
+    inlined_generic();
+    assert_eq!(eval(&mut engine, program), expected);
+    assert!(
+        inlined_generic()
+            .iter()
+            .any(|op| matches!(op, Op::DeleteProp(..))),
+        "dl's delete is an inlined frame's generic node"
+    );
+    let dl = chunk_of(&mut engine, "dl");
+    let pc = pc_of(&dl, |op| matches!(op, Op::DeleteProp(..)));
+    let slot = dl
+        .jit_slot_names()
+        .iter()
+        .position(|name| &**name == "x")
+        .expect("x has a slot");
+    super::take_poison_faults();
+    assert_eq!(eval(&mut engine, "cdl({a: 1, c: 2}, 4)"), "13");
+    assert_eq!(super::take_poison_faults(), 0, "no hidden writer, no fault");
+    crate::bytecode::TEST_HIDDEN_SLOT_WRITE.with(|write| {
+        write.set(Some((Rc::as_ptr(&dl) as usize, pc, slot)));
+    });
+    let result = eval(&mut engine, "cdl({a: 1, c: 2}, 4)");
+    crate::bytecode::TEST_HIDDEN_SLOT_WRITE.with(|write| write.set(None));
+    assert_eq!(result, "13", "the tier's code reads x from its home");
+    assert_eq!(
+        super::take_poison_faults(),
+        1,
+        "the check reports the write"
+    );
+}
+
+/// The collector's extent of an active record (`JitCtx::frame_words`): its slots and its chunk's
+/// operand capacity, and the whole record while its slots are not its own first words, as while
+/// an inlined frame's generic node runs on its slot window (P3 stage 3 step 3c).
+#[test]
+fn a_record_whose_slots_are_a_window_is_scanned_whole() {
+    let mut engine = warmed(MISC);
+    let chunk = chunk_of(&mut engine, "rd");
+    let i = &mut engine.interp;
+    let record = crate::jit::JitFrame::alloc(i);
+    // SAFETY: a record just allocated, which no code runs on.
+    let ctx = unsafe { &mut (*record.as_ptr()).ctx };
+    let own = ctx.slots;
+    ctx.chunk = Rc::as_ptr(&chunk);
+    ctx.n_slots = 2;
+    let capacity = chunk.jit.max_stack().expect("rd has template code");
+    assert!(ctx.slots_are_own());
+    assert_eq!(ctx.frame_words(), 2 + capacity);
+    // SAFETY: within the record's words.
+    ctx.slots = unsafe { own.add(2 + capacity) };
+    assert!(!ctx.slots_are_own());
+    assert_eq!(ctx.frame_words(), crate::jit::FRAME_BUF);
+    ctx.slots = own;
+    ctx.chunk = std::ptr::null();
+    ctx.n_slots = 0;
+    // SAFETY: the record runs nothing; it goes to the pool as any finished activation's does.
+    unsafe { crate::jit::JitFrame::release(i, record) };
+}

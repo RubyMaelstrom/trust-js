@@ -2463,6 +2463,16 @@ impl JitCtx {
         unsafe { (*self.slots.add(slot)).get() }
     }
 
+    /// Whether `slots` names the first word of the record this context heads, as every
+    /// activation's does but while the optimizing tier's code runs an inlined frame's generic
+    /// node whose operation names a slot (P3 stage 3 step 3c): the node's slot window lies in
+    /// the record's operand words then, past the slot count `n_slots` holds for the node, so
+    /// that `frame_words` takes the whole record. Meaningful for a pooled record's context only
+    /// (`JitFrame`: the context, then its words).
+    pub(crate) fn slots_are_own(&self) -> bool {
+        self.slots as usize == self as *const JitCtx as usize + FRAME_WORDS_OFF
+    }
+
     /// The words of its record the activation running on this active record's context can have
     /// written, which the collector scans where it does not know the activation's live top
     /// ([`live_tops`]): its `n_slots` slots and its code's operand stack, as deep as the largest
@@ -2474,7 +2484,7 @@ impl JitCtx {
     /// checks (`n_slots + max_stack <= FRAME_BUF`) and an oversized or borrowed entry registers
     /// for the scan (its slots and `max_stack` operand words).
     pub(crate) fn frame_words(&self) -> usize {
-        if self.chunk.is_null() {
+        if self.chunk.is_null() || !self.slots_are_own() {
             return FRAME_BUF;
         }
         // SAFETY: an active record's chunk is its running activation's, which keeps it alive
@@ -3376,6 +3386,14 @@ mod asm {
         /// Empty in code that records nothing: the tier off, the tier's own code, shared stubs
         /// and loose test assemblies.
         element_records: Vec<(u32, u64)>,
+        /// The code being emitted is a template the optimizing tier runs for an inlined frame's
+        /// generic node (P3 stage 3 step 3c): its property reads and stores call their helpers in
+        /// line (`H_GET_PROP`, `H_SET_PROP`), not through the shared helper stub, whose direct
+        /// accessor and trap calls take the accessor's call site from the running chunk's
+        /// accessor table (`AccessorSlot::position`), where an inlined frame's position is the
+        /// one its node published in `Interp::call_site`, which the helpers' call paths take.
+        /// Clear everywhere else, so template code is unchanged.
+        plain_accessor_helpers: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -3427,6 +3445,7 @@ mod asm {
                 loop_counts: None,
                 loop_weights: Vec::new(),
                 element_records: Vec::new(),
+                plain_accessor_helpers: false,
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3572,6 +3591,22 @@ mod asm {
         /// Declare the local reads whose TDZ test is dead (see `Cfg::initialized_reads`).
         pub(crate) fn set_initialized_reads(&mut self, reads: crate::jit_ir::InitializedReads) {
             self.initialized_reads = reads;
+        }
+        /// `set_initialized_reads`, returning the reads it replaces (the optimizing tier's
+        /// inlined frames, whose pcs are another chunk's: P3 stage 3 step 3c).
+        pub(crate) fn replace_initialized_reads(
+            &mut self,
+            reads: crate::jit_ir::InitializedReads,
+        ) -> crate::jit_ir::InitializedReads {
+            std::mem::replace(&mut self.initialized_reads, reads)
+        }
+        /// Set whether the property helpers are called in line (see the
+        /// `plain_accessor_helpers` field); returns the previous setting.
+        pub(crate) fn set_plain_accessor_helpers(&mut self, on: bool) -> bool {
+            std::mem::replace(&mut self.plain_accessor_helpers, on)
+        }
+        pub(crate) fn plain_accessor_helpers(&self) -> bool {
+            self.plain_accessor_helpers
         }
         /// Whether the local read at `pc` surely finds a value, so that it needs no TDZ test.
         pub(crate) fn initialized_read(&self, pc: usize) -> bool {
@@ -23891,7 +23926,10 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
         // General CFG emitters also flush all homes at candidate reads before calling here.
         emit_string_accumulation(a, pc, true, l_unwind);
     }
-    if a.stubs_ok() && shared_stubs_enabled() && idx < N_HELPERS {
+    // An inlined frame's property helpers take no direct accessor call (see
+    // `Asm::plain_accessor_helpers`).
+    let plain = a.plain_accessor_helpers() && matches!(idx, H_GET_PROP | H_SET_PROP);
+    if a.stubs_ok() && shared_stubs_enabled() && idx < N_HELPERS && !plain {
         // A slow path runs rarely and costs far more than a call and return: the sequence
         // lives once in a shared stub, leaving three instructions at every site.
         a.movz(1, pc, 0);

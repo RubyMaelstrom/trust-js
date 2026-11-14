@@ -67,6 +67,10 @@ pub(crate) struct InlineWay {
     /// The records `hops` parent links from `env` that the callee's free names count from, by
     /// `hops`, folded on the main thread as a splice's holders are (snapshot.rs's `holder`).
     pub(crate) holders: Box<[(u16, usize)]>,
+    /// The way's inline site's position (`stack_trace::InlineSites`, registered by the oracle and
+    /// held with the code: the callee, no position of its own, the call's position), which the
+    /// frame's generic nodes publish while they run (P3 stage 3 step 3c); NO_POSITION for none.
+    pub(crate) position: u32,
 }
 
 /// A callee chunk as a compile reads it: its frozen view and its snapshot, whose exit profile is
@@ -101,8 +105,14 @@ pub(crate) enum InlineOutcome {
 /// Why the inliner declines a callee chunk, with its operation where one declined it.
 type Refused = (&'static str, Option<(u32, Op)>);
 
-/// The reason E0 declines a callee for.
+/// The reason E0 declines a callee for: an operation the tier does not lower that needs the
+/// whole canonical frame (P3 stage 3 step 3c: every other one is a generic node of the inlined
+/// frame), or a call (calls from inlined frames are a step of their own: the oracle keeps leaves).
 pub(crate) const E0_EFFECT: &str = "an operation the tier leaves to its template (E0)";
+
+/// The reason the inliner declines a callee whose generic nodes' operand words and slot window
+/// would put the compiled frame past a pooled activation record (P3 stage 3 step 3c).
+pub(crate) const PAST_RECORD: &str = "an inlined frame past its record";
 
 /// A callee chunk's analyses (see the module's doc).
 pub(super) struct Analysis {
@@ -112,6 +122,10 @@ pub(super) struct Analysis {
     liveness: SlotLiveness,
     /// Its index among the chunks the graph's inlined frames run (`InlinedFrame::chunk`).
     frame_chunk: u32,
+    /// Whether an operation of a block its build reaches is a generic node (P3 stage 3 step 3c):
+    /// the callee may then run JavaScript and end the caller's heap facts, so that its call is no
+    /// lowered operation for the caller's loop prepass (`Tree::effect_free`).
+    generic: bool,
 }
 
 /// The callees a compile inlines (see the module's doc).
@@ -147,12 +161,25 @@ impl<'a> Tree<'a> {
     /// Whether the graph builds no generic call at site `cache`'s call at `pc` (the compiled
     /// chunk's, `snapshot` its feedback): one of its kept ways' guards is unflagged, a
     /// CheckCallee, which ends the site's chain.
+    ///   The ways built up to it run no generic node either (P3 stage 3 step 3c: an inlined
+    ///   frame's generic node may run JavaScript and ends the heap facts, as an effect does).
     pub(super) fn effect_free(&self, cache: u32, pc: usize, snapshot: &Snapshot) -> bool {
-        self.sites.get(&cache).is_some_and(|site| {
-            site.ways.iter().enumerate().any(|(place, way)| {
-                self.analyses[way.chunk as usize].is_ok() && !flagged(snapshot, pc, place)
-            })
-        })
+        let Some(site) = self.sites.get(&cache) else {
+            return false;
+        };
+        for (place, way) in site.ways.iter().enumerate() {
+            // A declined way is not built: the next one is its site's.
+            let Ok(analysis) = &self.analyses[way.chunk as usize] else {
+                continue;
+            };
+            if analysis.generic {
+                return false;
+            }
+            if !flagged(snapshot, pc, place) {
+                return true;
+            }
+        }
+        false
     }
 
     /// The binding slots the callees of site `cache`'s ways store at static addresses (their
@@ -242,7 +269,9 @@ fn analyse(
     };
     let flow = Flow::new(view, &cfg, &rules).map_err(at)?;
     // E0: an operation of a block the build reaches (a never-ran block is an exit) that the rules
-    // leave to the template.
+    // leave to the template and that needs the whole canonical frame, or a call; every other
+    // such operation is a generic node of the inlined frame (P3 stage 3 step 3c).
+    let mut generic = false;
     for &id in &flow.rpo {
         let block = &cfg.blocks()[ix(id)];
         if never_ran(snapshot, block.start, block.end)
@@ -250,9 +279,21 @@ fn analyse(
         {
             continue;
         }
-        if let Some(pc) = (block.start..block.end).find(|&pc| !rules.lowers(pc)) {
-            return Err((E0_EFFECT, Some((pc as u32, ops[pc]))));
+        for pc in (block.start..block.end).filter(|&pc| !rules.lowers(pc)) {
+            if canonical(&ops[pc]) || makes_call(&ops[pc]) {
+                return Err((E0_EFFECT, Some((pc as u32, ops[pc]))));
+            }
+            generic = true;
         }
+    }
+    // A generic node's operand words lie at its own depth from the compiled frame's operand
+    // base, its slot window above the callee's capacity (`a64`'s inlined generic nodes): the
+    // compiled frame's record must hold them, as JSC's frame covers every inline call frame's
+    // baseline frame (dfg/DFGGraph.cpp:1290-1300).
+    if generic
+        && compiled.jit_frame().1 + cfg.jit_stack_capacity() + n_slots > crate::jit::FRAME_BUF
+    {
+        return Err((PAST_RECORD, None));
     }
     let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
     Ok(Analysis {
@@ -261,7 +302,25 @@ fn analyse(
         flow,
         liveness,
         frame_chunk,
+        generic,
     })
+}
+
+/// Whether `op` calls or constructs a function as its operation, which an inlined frame does not
+/// yet make (its callee's position and depth: a step of its own, step3c-impl's design note 4).
+fn makes_call(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Call(..)
+            | Op::CallWithThis(..)
+            | Op::CallSpread(..)
+            | Op::CallSpreadThis(..)
+            | Op::CallArgsArray
+            | Op::CallArgsArrayThis
+            | Op::New(..)
+            | Op::NewArgsArray
+            | Op::TailCall(..)
+    )
 }
 
 /// Each frame's snapshot, by its index: `snapshot`, the compiled chunk's, then each inlined
@@ -557,6 +616,8 @@ impl<'a> Builder<'a> {
             call_pc: call.pc as u32,
             callee: call.callee,
             receiver: call.receiver,
+            position: way.position,
+            env: way.env,
         });
         let (n_params, n_slots) = view.jit_frame();
         let undefined = self.word(PACK_UNDEFINED);

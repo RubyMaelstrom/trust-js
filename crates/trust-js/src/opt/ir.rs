@@ -782,7 +782,11 @@ impl NodeOp {
     /// Whether this node reads the compiled function's own context (stage 3): its canonical
     /// slots and operand words, `this`, running environment, chunk (an effect's template, a
     /// splice's guard data) or its return. A node of an inlined frame reads none of it: the
-    /// frame's values are explicit (its states, its descriptor's callee and receiver).
+    /// frame's values are explicit (its states, its descriptor's callee and receiver). A generic
+    /// node of an inlined frame, its projections and slot results read their own frame's: its
+    /// lowering writes its explicit inputs where its template reads them, the frame's chunk,
+    /// position, `this`, environment and named slots among them, and the compiled frame's back
+    /// after it (P3 stage 3 step 3c).
     pub(crate) fn reads_compiled_frame(&self) -> bool {
         matches!(
             self,
@@ -792,11 +796,6 @@ impl NodeOp {
                 | NodeOp::This
                 | NodeOp::Env
                 | NodeOp::Effect { .. }
-                // Its template runs on the compiled frame's operand words (P3 stage 3 step 3a; an
-                // inlined frame's generic nodes are step 3c's).
-                | NodeOp::Generic { .. }
-                | NodeOp::Projection(_)
-                | NodeOp::SlotResult(_)
                 | NodeOp::CheckCallee { .. }
                 | NodeOp::CalleeMatches { .. }
                 | NodeOp::Return
@@ -880,8 +879,33 @@ pub(crate) struct InlinedFrame {
     /// The callee as the call met it (Tagged): a node, or a constant under its identity guard.
     pub(crate) callee: NodeIx,
     /// The receiver the call passes (Tagged): a CallWithThis's operand, undefined for a Call. An
-    /// exit binds it as the call would (OrdinaryCallBindThis).
+    /// exit binds it as the call would (OrdinaryCallBindThis); the frame's generic nodes whose
+    /// kind reads `this` store it in `JitCtx::this_word` while they run (P3 stage 3 step 3c).
     pub(crate) receiver: NodeIx,
+    /// The frame's inline site (`stack_trace::InlineSites`, registered by the oracle on the main
+    /// thread: the callee, no position of its own, the call's position in the parent), which
+    /// the frame's generic nodes publish in `Interp::call_site` while they run, as a splice's
+    /// checked operations publish theirs (P3 stage 3 step 3c; JSC's code origin stored before
+    /// each call out, dfg/DFGJITCompiler.h:133-143); NO_POSITION where none was registered.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(dead_code, reason = "the back end's")
+    )]
+    pub(crate) position: u32,
+    /// The callee's running environment (`Env::as_ptr` of the closure's [[Environment]], a
+    /// constant under the guard), which the frame's generic nodes whose kind reads the
+    /// environment store in `JitCtx::env_raw` while they run (step 3c); 0 where none is known.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        expect(dead_code, reason = "the back end's")
+    )]
+    pub(crate) env: usize,
 }
 
 /// One basic block.

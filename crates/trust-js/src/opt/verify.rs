@@ -159,7 +159,14 @@ pub(crate) fn verify_frames(
         if !node.frame.is_compiled() && node.op.reads_compiled_frame() {
             return fail("a node of an inlined frame reads the compiled frame's context");
         }
-        if let Err(what) = representations(graph, node, ix, chunk, n_slots) {
+        // Against its own frame's chunk (an inlined frame's generic node's operation and slots
+        // are its callee's: P3 stage 3 step 3c).
+        let frame_slots = if node.frame.is_compiled() {
+            n_slots
+        } else {
+            frame_chunk.jit_frame().1
+        };
+        if let Err(what) = representations(graph, node, ix, frame_chunk, frame_slots) {
             return fail(&what);
         }
         if node.op == NodeOp::Phi {

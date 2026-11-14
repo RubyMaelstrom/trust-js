@@ -257,6 +257,60 @@ impl SlotUse {
     }
 }
 
+/// What an operation's template and the helpers it reaches read of the running frame's context
+/// besides its operands and the slots it names (`slot_use`), where an inlined frame's generic
+/// node must write it while the template runs (P3 stage 3 step 3c; the audit in step3c-impl's
+/// design note, 1.2): `this` (ctx.this_word: the PropRecv::This forms, jit_get_prop's and
+/// jit_set_prop's `this` arms, jit_exec_inner's LoadThis), and the running environment
+/// (ctx.env_raw and env_parent_raw: the name, closure and captured-binding operations, which
+/// jit_exec_inner resolves from it). Every operation reads its chunk and pc (its origin) and
+/// publishes positions, which every such node writes; an operation that may read any slot
+/// (`SlotUse::Any`) is a canonical-frame effect, never in an inlined frame.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    expect(dead_code, reason = "the back end's")
+)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ContextUse {
+    pub(crate) this: bool,
+    pub(crate) env: bool,
+}
+
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    expect(dead_code, reason = "the back end's")
+)]
+pub(crate) fn context_use(op: &Op) -> ContextUse {
+    ContextUse {
+        this: matches!(
+            op,
+            Op::LoadThis | Op::GetPropThis(..) | Op::SetPropThisDrop(..)
+        ),
+        env: matches!(
+            op,
+            Op::LoadName(..)
+                | Op::LoadNameForCall(..)
+                | Op::LoadNameIn(..)
+                | Op::LoadNameForCallIn(..)
+                | Op::TypeofName(_)
+                | Op::StoreName(_)
+                | Op::StoreNameCached(..)
+                | Op::UpdateNameCached(..)
+                | Op::LoadCap(_)
+                | Op::StoreCap(_)
+                | Op::StoreCapInit(_)
+                | Op::UpdateCap(..)
+                | Op::MakeClosure(..)
+        ),
+    }
+}
+
 /// The slots of the frame `op` names, each once and in its order, with whether it writes it
 /// (a named number past the frame's `n_slots`, a binding's count or a step's index, is none): a
 /// generic node's slot inputs and outputs (P3 stage 3 step 3a, `opt::build`), which the verifier
