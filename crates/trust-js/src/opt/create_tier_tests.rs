@@ -228,3 +228,31 @@ fn non_extensible_receivers_exit_and_converge_on_the_effect() {
         ExitReason::WrongShape,
     );
 }
+
+#[test]
+fn a_setter_appearing_before_the_first_compile_keeps_the_creation_the_effect() {
+    // The creation's way was filled before the prototype took a setter of the name, and the tier
+    // compiles after: the snapshot's walk of the chain finds the setter and records no chain, so
+    // the creation stays the effect, which calls the setter (no exit ever teaches it).
+    let warm = "function P(x) { this.x = x; return this; }\n\
+         let t = 0; for (let k = 0; k < 300; k++) t = t + new P(k).x; t";
+    let then = "Object.defineProperty(P.prototype, 'x', { set(v) { this.y = v * 2; }, \
+           configurable: true });\n\
+         let u = 0; for (let k = 0; k < 600; k++) u = u + new P(k).y; u";
+    let expected = {
+        let mut vm = Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [eval(&mut vm, warm), eval(&mut vm, then)]
+    };
+    TestSwitches {
+        on: false,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, warm), expected[0]);
+    eager().set();
+    assert_eq!(eval(&mut engine, then), expected[1]);
+    assert!(!creates(&mut engine, "P"), "the setter keeps the effect");
+}
