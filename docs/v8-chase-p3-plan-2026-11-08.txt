@@ -3963,3 +3963,72 @@ frame yet (step 2's), so the tier's code and its exits are what they were.
   compiled-frame top: step 2's.
 - After it, 26a0c2c7: the back end passes clippy on ARM64 with warnings denied (main's two known
   lints removed).
+
+Rule U landed (d3d2394b, fb21e95d, 2026-11-14; target/p3/stage3/ruleu-impl, report.txt; the
+owner's choice of the same day): with the tier on, template code records its in-line element hits.
+- The mechanism, JSC's: an in-line element hit stores what it saw in its site's last-seen bytes
+  (two a pc in the chunk's ChunkProfile: a typed array's native kind; an Array's or another
+  ordinary object's kind tag), as JSC's baseline stores an access's structure in its ArrayProfile
+  (jit/JITInlines.h:328-348, ArrayProfile.h:245-246); the tier ORs them into the element records
+  where it reads them, at the compile's copy and at each checkpoint's fingerprint, and resets
+  them, as computeUpdatedPrediction does at the DFG's read and at every tier-up check
+  (bytecode/ArrayProfile.cpp:126-136, dfg/DFGByteCodeParser.cpp:1354-1359, jit/JITOperations.cpp:
+  2826-2829). A record that holds more keeps it. A wrong guess from a last-seen value is
+  corrected as before: the tier's check exits, the VM records, the recompile widens.
+- Where: every element form of the template JIT (stack, local, the numeric chain, the register
+  regions, the fused name-element site; a loop chain once a loop entry). Through the shared
+  typed-array stub the site stores after the stub's hit (the stub's code is unchanged; its
+  contract now names w17, the kind); a second stage or a splice stores to the byte of the
+  baseline site its record map names. Four instructions a recorded hit (the address and a byte
+  store).
+- The gate: emitted only where the tier is on (it is off by default, and nothing reads the
+  records then) and only for chunks the tier would compile (not over its size limit, not
+  resumable), as JSC's baseline profiles only where the DFG could compile (jit/JIT.cpp:722-733).
+  The tier off's template code is identical (masked hashes and normalized dumps) and its
+  instruction counts equal.
+- Measured (fat LTO against 544d9c86, the tier on; my recount of the first seven agrees):
+  instructions at 5 fixed runs zlib -29.05%, Mandreel -24.51%, NavierStokes -2.75%, GBEMU -1.80%,
+  PdfJS -1.5%, Crypto -0.59%, Richards -0.53%, Djot's pass -0.39%; Box2D +1.53% at 5 runs only
+  (+0.10% at 1, -0.03% at 20: one function waits a checkpoint longer); nothing else above +0.05%.
+  The tier's stub calls a run: zlib 758.0M -> 15.5M, Mandreel 217.6M -> 0, GBEMU 7.9M -> 0.07M;
+  element sites compiled for one recorded kind 995 -> 4,571 decisions (665.6M -> 1,635.7M
+  executions), with an empty record 6,541 -> 1,445 (1,009M -> 21.5M). Octane's timed scores on
+  X925 cores alone, 10 rounds: zlib +26.3% (cycles -18.0%; -16.8% at fixed work in my run),
+  Mandreel +43.1%, NavierStokes +3.2%, GBEMU +1.9%, PdfJS +1.1%; the others within 0.2%. Template
+  code's cost with the tier on: zlib 28.8M recording stores a run (0.19% of its instructions),
+  Mandreel 55.6M (0.9%); template code 0.1-3.2% larger. Compile time within noise. No new
+  WrongElements exit anywhere.
+- Vue's steady state and the binary's layout. At fixed work on one X925 core Vue's steady state
+  ran +1.2% cycles with the tier off and +1.8% with it on at equal instructions on the agent's
+  binary, where the tier off runs none of the new code; on the rebased pair (8d67e365 against
+  fb21e95d) +0.54% and +0.75%, React 0. Four of the day's binaries interleaved (target/p3/stage3/
+  merge-check/cycles-drift.out; Vue's steady state, cycles against stage 2's exit build, the
+  tier off and on): 544d9c86 -1.79% and -2.41% (instructions -0.69%, -0.74%), 8d67e365 with step 1
+  -0.95% and -1.13%, fb21e95d with rule U -0.40% and -0.44%. So Vue's cycles move about 1% either
+  way with the layout of the Rust binary at equal instructions, 544d9c86 was a fast draw, and
+  rule U's binary is inside that band and under stage 2's exit. A profile by symbol shows the
+  difference spread over the runtime's functions, none standing out. To be read in the stage's
+  session; the exemplars order their binaries' functions by profile (PGO, order files), which
+  TRust's build does not: a question for the owner (below).
+- Tests: 17 new (every template form and native kind, the in-line path, declined views, the tier
+  off and an oversized chunk recording nothing, second-stage and splice hits, three builder tests
+  from frozen views, three end-to-end: typed sites in line with no stub call, Array and object
+  sites without the kind branch, alternating sites that settle within two discards); 28
+  mutations, each caught; jit:: and opt:: 815 in four configurations; difftest and the fixtures
+  in four; zombie's check, clippy, Windows' check and suite (2,822).
+- Open, from its counts: (1) the sites still without a record (zlib's 15.5M stub calls, React's
+  steady state 4.1M executions): with template code recording, an empty record now means the
+  site did not run there either, so Maglev's deopt on no feedback (maglev-graph-builder.cc:
+  6494-6497) and the plan's never-ran rule could take element sites: to be counted first.
+  (2) Value records in JSC's form (its baseline notes a double on its in-line double path, jit/
+  JITAddGenerator.cpp:158-160): sites computing in f64 with neither an int32 hint nor a proof
+  execute 787.8M times over the workloads (zlib 391.8M, Mandreel 187.7M; an upper bound); the
+  store would sit on arithmetic paths, hotter than element paths: the owner's to decide after a
+  count of what it would buy. (3) TypedData, the typed array's data address and its checks,
+  executes 666M times for 9.38G of zlib's 61G instructions, 1.74G of Mandreel's 24.8G: derived
+  again after every loop header. Step 0c keeps it through loops without effects.
+- For the owner: the layout question above. The fixtures' steady states spend most of their
+  cycles in the runtime's Rust code, whose function order the build leaves to the compiler; V8,
+  SpiderMonkey and JSC ship with profile-guided optimization and ordered text. A measured
+  experiment (PGO or a link order file from the fixtures' and Octane's profiles) would say what
+  it is worth and would also steady these readings.
