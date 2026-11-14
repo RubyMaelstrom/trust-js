@@ -89,13 +89,13 @@ fn vm_copy_effects_results_equal_the_vms_and_copy_no_word_their_code_did_not_wri
 
 /// What a record's operand words below such an effect's operands hold: what an earlier activation
 /// of the record left there, since the tier's code does not write them. A test hook fills every
-/// pooled record's words above `f`'s slots with the word of an object the program dropped and a
-/// precise major collection freed; `f`, compiled by the tier, then runs an array literal's spread
-/// and a call's argument array with `n * 2` and a sum held in registers below their operands. The
-/// helper's copy holds none of those words while the cell is free (before the fix it copied them,
-/// and with TRUST_JS_GC_STRESS=1 collections ran with the freed cell's word in the copy's precise
-/// trace; under the stress a new cell can take the address, whose word an operand then is), and the
-/// result is the VM's.
+/// pooled record's words above `f`'s slots with the word of a string the program dropped and a
+/// precise major collection freed (a large cell, which no allocation of `f`'s run reuses, so that
+/// it stays free under TRUST_JS_GC_STRESS=1 too); `f`, compiled by the tier, then runs an array
+/// literal's spread and a call's argument array with `n * 2` and a sum held in registers below
+/// their operands. The helper's copy holds none of those words while the cell is free (before the
+/// fix it copied them, and under TRUST_JS_GC_STRESS=1 collections ran with the freed cell's word in
+/// the copy's precise trace), and the result is the VM's.
 #[test]
 fn a_vm_copy_effect_copies_no_word_an_earlier_activation_left_in_its_record() {
     use crate::gc_core::CollectionKind;
@@ -107,7 +107,7 @@ fn a_vm_copy_effect_copies_no_word_an_earlier_activation_left_in_its_record() {
     let mut engine = jit_engine();
     eval(&mut engine, program);
     let chunk = tier_chunk(&mut engine, "f").expect("the tier compiled f");
-    eval(&mut engine, "var dead = {d: [1, 2, 3]}; 0");
+    eval(&mut engine, "var dead = 'x'.repeat(20000); 0");
     let global_env = engine.interp.global_env;
     let word = engine
         .interp
@@ -121,7 +121,7 @@ fn a_vm_copy_effect_copies_no_word_an_earlier_activation_left_in_its_record() {
     assert_eq!(
         engine.interp.gc_heap.core.borrow().cell_age(word),
         None,
-        "the dropped object's cell is freed"
+        "the dropped string's cell is freed"
     );
     crate::jit::fill_pooled_words_for_test(&engine.interp, chunk.jit_frame().1, word);
     crate::bytecode::TEST_COPY_SEEN.with(|seen| seen.set(0));
