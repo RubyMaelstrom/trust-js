@@ -3064,7 +3064,8 @@ impl Gen<'_> {
                         // store_new_slow(cell, key, value, shape) after every check of the
                         // creation, before any write: it runs no JavaScript and does not collect.
                         // The live caller-saved values are kept across it; the value is read
-                        // into x9 before the arguments are set.
+                        // into x9 before they are saved, since a spill slot's offset is the stack
+                        // pointer's, which the save moves.
                         self.a.bind(label);
                         let layout = self.layout;
                         let (value, key, shape) = match self.graph.node(node).op {
@@ -3073,11 +3074,11 @@ impl Gen<'_> {
                             }
                             _ => unreachable!("a creation's slow path"),
                         };
-                        let saved = self.save_live_caller_saved(node);
                         let word = self.gp(value, X9);
                         if word != X9 {
                             self.a.mov(X9, word);
                         }
+                        let saved = self.save_live_caller_saved(node);
                         self.a.sub_imm(0, X17, layout.obj_from_cell as u32);
                         self.a.mov_imm64(1, key);
                         self.a.mov(2, X9);

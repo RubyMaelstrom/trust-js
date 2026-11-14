@@ -153,6 +153,47 @@ fn a_creation_against_its_objects_predicted_layout_has_the_vms_results() {
     }
 }
 
+#[test]
+fn a_creations_slow_path_stores_a_value_from_its_spill_slot() {
+    // `W`'s creations past its 8th key take the slow path's call, around which the caller-saved
+    // values live there (a, b and c) are saved on the stack; the stored values, 24 of them live
+    // across `g()`'s generic node, are in spill slots, whose offsets are the stack pointer's: the
+    // value is read before the save moves it (TypeScript's getParameterList stored another
+    // word when it was read after).
+    let n = 24;
+    let values: Vec<String> = (0..n).map(|i| format!("v{i} = new O(k + {i})")).collect();
+    let stores: String = (0..n).map(|i| format!("this.f{i} = v{i}; ")).collect();
+    let reads: Vec<String> = (0..n).map(|i| format!("w.f{i}.i * {}", i + 1)).collect();
+    let source = format!(
+        "function g() {{ return 1; }}\n\
+         function O(i) {{ this.i = i; }}\n\
+         function W(k, o) {{ var {}; g(); var a = o.x + k, b = o.y * k, c = o.x - k; \
+           {stores}this.s = a + b + c; }}\n\
+         let t = 0; const o = {{ x: 3, y: 5 }};\n\
+         for (let k = 0; k < 3000; k++) {{ const w = new W(k, o); \
+           t = (t * 31 + {} + w.s) % 1000003; }}\n\
+         t",
+        values.join(", "),
+        reads.join(" + ")
+    );
+    let expected = run(Tier::Bytecode, &source);
+    for (label, switches) in configurations() {
+        assert_eq!(
+            with_switches(switches, &source),
+            expected,
+            "{label} {switches:?}"
+        );
+    }
+    eager().set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, &source), expected);
+    assert_eq!(
+        creations(&mut engine, "W"),
+        n + 1,
+        "W's creations, the 9th on by the slow path, are the tier's"
+    );
+}
+
 /// The creations of the tier's code of `name` (its graph as a compile builds it now, its
 /// snapshot taken in the engine's realm, as the driver's): of its tier chunk, else of its first
 /// stage (the chunk a compile of a function with nothing to splice takes).
