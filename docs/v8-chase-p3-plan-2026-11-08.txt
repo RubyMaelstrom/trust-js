@@ -4396,3 +4396,78 @@ and a String's length are the tier's own nodes.
   live registers should take its inputs before it moves the stack pointer, so that the defect
   above cannot recur. For the owner: the template's creation epoch is process-wide; per Agent, as
   SpiderMonkey's fuses are per realm, engines would stop invalidating each other's caches.
+
+Lowerings L1 landed (four commits ending 1375e3b8, rebased by the coordinator over L3; 2026-11-14;
+target/p3/stage3/stepL1-impl, report.txt and design-note.txt): equality and typeof tests are the
+tier's own nodes.
+- Without feedback, from the operation and its operands' facts: `x == null` and `x == undefined`
+  and their `!=` (a test of the value: null, undefined or an object that masquerades, as V8's
+  TestUndetectable and JSC's CompareEq on a known other); every TypeofIs (the tag and the kind,
+  its rare objects through a cold call that runs no JavaScript); under `===` a proven object or
+  Boolean on either side (identity) and a Number, constant or proven, on either side (the other
+  word compared as a double, which every word but a Number's makes unordered).
+- With a record (the reversal of W4 decision 3 for template code with the tier on, in rule U's
+  form): each form of equality in template code stores the pair of operand kinds it met in its
+  site's last-seen byte, and the tier merges it where it reads; the builder speculates on two
+  Numbers, two Strings (the same cell, the lengths, then a cold call of the contents' compare),
+  two objects or two Booleans (identity), each operand checked with a reason whose flag declines
+  the speculation (NotString is new), as Maglev builds a compare from its hint
+  (maglev-graph-builder.cc:2402-2622). The record stays out of the settled-feedback fingerprint.
+- The prepass claims every such case (Rules::equality_lowers, the one place), so loops holding
+  them are free of effects (195 -> 236 loops over the workloads) and callees holding them are no
+  E0 declines (106 -> 58 at graph). No compile with a claimed test ends in a mismatch exit.
+- Measured (fat LTO; the agent's census on 3bf4f72d, my counts on the landed tree against L3's):
+  equality and typeof effect executions 78.4M -> 0.69M (-99.1%), all effects -25.9%;
+  instructions at 5 fixed runs, the tier on: Richards -6.9%, TypeScript -4.0%, DeltaBlue -3.8%,
+  Vue -3.1% (steady -3.5%), React -2.1% (steady -2.5%), Earley-Boyer -2.3%, Djot's steady state
+  -1.6%, PdfJS -1.4%, Splay -1.0%; Octane's geomean -1.32%; the tier off equal (template code
+  identical). The agent's timed scores on X925 cores: Richards +58.6%, DeltaBlue +12.4%,
+  TypeScript +7.7%, the steady states 1.9 to 3.9% faster; cycles at fixed work TypeScript -6.2%,
+  Richards -5.5%. The tier's code bytes -18%. What a lowered equality is worth after step 3a,
+  from single-purpose loops: 21 to 32 instructions an iteration against the generic node's
+  template (64 for a loose `== null`), the spill traffic of values live across it, the heap
+  facts a loop then keeps, and about 140 for a call the inliner no longer declines.
+- Slower: RayTrace +0.8% instructions and +1.3% cycles: `shape != exclude`, an object and
+  sometimes null, speculated as two objects from the last pair seen; 20 exits at the loop's
+  entry, where step 3a had moved the check, 200 in the loop, and two more compiles. Djot's first
+  pass +0.9% instructions (the recording stores in template code). Being answered in a follow-up
+  (L1b): the record accumulates the pairs it has seen (V8's CombineFeedback) and speculates only
+  where it holds one; a pair for an object or null or undefined on each side; and a report on the
+  hoisted check's flag (a check that fails after step 3a moved it flags HoistingFailed at the
+  header, not its own reason at its site, so the recompile pays a second round of exits).
+- Tests: the brief's table of operand pairs for each operation against the VM with the tier on,
+  eager and with forced exits; typeof over every kind; the alternating site; mutations of the
+  claims, each caught; the whole library suite in eight configurations; difftest; the verifier
+  sweep (mine on the landed tree: 42 runs, none refused); zombie's check and suite (2,877).
+- Beside it (43b415d7): three of L3's tests that assert the tier's code creates now run alone in
+  a child process. The template's creation epoch is process-wide; with L1's tests beside them the
+  other engines moved it until the test's sites turned generic (one or two failures in two runs
+  of three; none alone in eight).
+
+The VM-copy helper copies its operation's operands only (five commits ending 52a1e3a5,
+2026-11-14; target/p3/stage3/step3a-impl/report.txt's FOLLOWUP and vmcopy/): the question step
+3a's record left open, settled.
+- What was true: jit_vm_operation copied every operand word from the stack's base into the
+  activation's stack, which the collector traces precisely; below a canonical-frame effect's own
+  operands the tier's code writes those words only at a pc with a handler, and a pooled record
+  keeps what earlier activations wrote. So stale words were copied and traced. Since stage 1.
+- What was not: a use after free. The marker validates every word, precise or conservative,
+  before it reads through it (Heap::mark_word: the page table, then the cell's allocated and
+  zombie bits, or the large-cell map): a freed cell's word is ignored, and a word naming a cell
+  allocated since retains it, as the record's own conservative scan already does. Shown by a test
+  that plants a freed large string's word in every pooled record under GC stress: copied six
+  times while free, with collections during those steps, and the VM's results.
+- The fix, the contracts' form (4.3: a helper's precondition is its operation's operands in the
+  top words, sp and the slots): the helper copies the operands its operation's stack effect
+  names and copies the results back above the words below them; the tier's code gains no store.
+  RequireCallable's stack effect is (1, 1), the tag its VM arm reads. This is template code's
+  helper too: the library suite passes with the tier off, and the coordinator's gate adds Test262.
+- The poison switch now audits both ways: before a canonical-frame effect it poisons the operand
+  words below the operands and the helper reports a copied poison (22 and 50 reports over the
+  library before the fix, from the Super operations, LoadLexicalThis, NewArray and ArraySpread;
+  none after); after each generic node's template it checks that the words it poisoned still
+  hold the poison: no hidden writer in the library suite, difftest, the fixtures or Octane.
+- Measured: every workload within 0.01% in instructions but Vue's steady state +0.20% in both
+  tiers (the helper's call is about 10 instructions longer; VM-copy effects run in the tier's
+  code in Vue alone, 227k times in its steady state). Tests: 9 mutations caught; the tier's
+  modules (442) in six configurations; the verifier sweep.
