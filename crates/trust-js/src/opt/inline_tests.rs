@@ -1082,6 +1082,44 @@ fn an_inlined_callees_exit_rebuilds_both_frames_and_flags_the_callees_first_stag
 }
 
 #[test]
+fn an_exit_through_an_inlined_frame_that_loops_takes_the_loop_limit_at_once() {
+    super::TEST_LIMITS.with(|limits| limits.borrow_mut().clear());
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(
+        &mut engine,
+        "function lp(a) { var t = 0; for (var i = 0; i < a.length; i++) t = t + a[i]; return t; }
+         function cl(a) { return lp(a) * 2; }
+         var a = [1, 2, 3, 4]; for (var i = 0; i < 400; i++) cl(a);",
+    );
+    let cl = chunk_of(&mut engine, "cl");
+    let lp = chunk_of(&mut engine, "lp");
+    assert!(super::in_place(&cl));
+    let code = cl.jit.get().flatten().unwrap();
+    let table = super::exit::table_of(&code).unwrap();
+    let loop_limit = table.loop_limit;
+    assert!(loop_limit < table.limit);
+    // A string element: lp's add exits in its loop, and its rebuilt frame runs the rest of the
+    // loop in the VM, which tries its borrowed-frame code at the back edge.
+    let out = eval(
+        &mut engine,
+        "var t = ''; for (var i = 0; i < 20; i++) t = cl([1, 'x', 2]); t",
+    );
+    assert_eq!(out, "NaN");
+    assert!(
+        lp.osr.get().is_some(),
+        "lp's loop tried its borrowed-frame code"
+    );
+    let limits = super::TEST_LIMITS.with(|limits| std::mem::take(&mut *limits.borrow_mut()));
+    assert!(
+        limits
+            .iter()
+            .any(|&(limit, taken)| limit == super::Limit::InlinedLoop && taken == loop_limit),
+        "{limits:?}"
+    );
+}
+
+#[test]
 fn error_stack_and_caller_from_an_exit_inside_a_callee_are_the_tier_offs() {
     let source = "
         var seen = '';

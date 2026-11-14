@@ -1700,6 +1700,9 @@ pub(crate) enum Limit {
     /// The loop limit (`ExitTable::loop_limit`), at the entry after a loop crossed its warm-up
     /// (`loop_limit_due`).
     Loop,
+    /// The loop limit at an exit through an inlined frame whose callee's first stage tried to
+    /// enter a loop (P3 stage 3, step 2; JSC's, dfg/DFGOSRExitCompilerCommon.cpp:70-104).
+    InlinedLoop,
 }
 
 /// An exit of the tier's code for `chunk` at or past its loop limit, the code not discarded
@@ -1814,6 +1817,11 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
             Limit::Exits => String::new(),
             Limit::Loop => format!(
                 "; at its loop limit: {} exits >= {}",
+                table.taken.get(),
+                table.loop_limit
+            ),
+            Limit::InlinedLoop => format!(
+                "; at its loop limit through an inlined frame that loops: {} exits >= {}",
                 table.taken.get(),
                 table.loop_limit
             ),

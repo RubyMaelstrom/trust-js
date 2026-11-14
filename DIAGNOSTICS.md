@@ -197,7 +197,10 @@ comment/example in the same change.
   decisions and the callees' snapshots, inside the `snapshot` part), `[opt] inlined <name> pc
   <pc> way <k>: <callee>`, `[opt] not inlined <name> pc <pc> way <k> <callee>: <reason>[ at pc
   <m> (<op>)]` and, for a plan left to the splice, `[opt] spliced <name>: a way's callee calls`;
-  a decline in an inlined frame ends with ` (inlined frame <k>)`.
+  a decline in an inlined frame ends with ` (inlined frame <k>)`. An exit through an inlined
+  frame whose callee's first stage has tried to enter a loop (its borrowed-frame code) discards
+  the code at its loop limit at once (`; at its loop limit through an inlined frame that loops`),
+  as JSC's exits through inlined code that loops do.
 - `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE=1` keeps a function on its chunk when its operator chains'
   property reads and stores keep bailing. By default the generic helper counts each property
   operation a chain's bail replays while its site's cache holds the receiver's shape, and at

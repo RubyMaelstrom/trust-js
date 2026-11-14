@@ -539,7 +539,7 @@ pub(crate) unsafe extern "C" fn deoptimize(
         },
     };
     // The frame holds every value by now, so the discard's compile may allocate.
-    count(i, chunk, table, exit, reason);
+    count(i, chunk, table, exit, reason, false);
     ctx.handlers.clear();
     ctx.handlers
         .extend(exit.handlers.iter().map(|&(push_pc, depth)| {
@@ -553,6 +553,8 @@ pub(crate) unsafe extern "C" fn deoptimize(
 /// An exit's count (see the module's doc), forced ones left out: one count and one limit for the
 /// code, whichever frame exits, as JSC counts every exit of a code block on it
 /// (dfg/DFGOSRExitCompilerCommon.cpp:42-104). Every frame's values are in rooted storage.
+/// `from_loop`: the exit passes through an inlined frame whose callee's first stage tried to
+/// enter a loop (P3 stage 3, step 2), whose exits the loop limit takes at once.
 #[inline(always)]
 fn count(
     i: &mut crate::interpreter::Interp,
@@ -560,6 +562,7 @@ fn count(
     table: &ExitTable,
     exit: &ExitRecord,
     reason: ExitReason,
+    from_loop: bool,
 ) {
     if reason != ExitReason::Forced {
         // Repeated exits: at the limit, the code is discarded once (`opt::discard`) and new
@@ -569,6 +572,12 @@ fn count(
         table.taken.set(taken);
         if taken >= table.limit && !table.discarded.get() {
             super::discard(i, chunk, table, super::Limit::Exits);
+        }
+        // JSC's loop rule for inlined frames (D12; dfg/DFGOSRExitCompilerCommon.cpp:70-104): an
+        // exit through an inline call frame whose baseline code tried to enter a loop takes the
+        // loop threshold at once, since only the outermost code block's loops count toward it.
+        if from_loop && taken >= table.loop_limit && !table.discarded.get() {
+            super::discard(i, chunk, table, super::Limit::InlinedLoop);
         }
         // An exited frame that loops (stage 2, step 13; see the module's doc): at the loop limit
         // or past it, the code not discarded, the loop limit's warm-up starts again (JSC's reset
@@ -833,8 +842,16 @@ unsafe fn deoptimize_frames(
             "a rebuilt frame's callee in its call's window"
         );
     }
-    // Every frame's values are in rooted storage: the count, whose discard may allocate.
-    count(i, chunk, table, exit, reason);
+    // Every frame's values are in rooted storage: the count, whose discard may allocate. An
+    // inlined frame's callee whose first stage tried to enter a loop (its borrowed-frame code's
+    // state, made at the VM's first loop transfer: JSC's didTryToEnterInLoop, set at a loop's OSR
+    // entry, dfg/DFGOSREntry.cpp:225-226) puts the exit under the loop limit (P3 stage 3, step 2).
+    let from_loop = chain.iter().any(|&frame| {
+        // SAFETY: the code holds the chunk as long as its table lives (`release`).
+        let callee = unsafe { &*inlined_chunk(code_base, table.frame(frame).chunk) };
+        callee.osr.get().is_some()
+    });
+    count(i, chunk, table, exit, reason, from_loop);
     // Each frame's handler records, rebuilt from its state against its own chunk.
     let frame_handlers = |frame_ctx: &mut crate::jit::JitCtx, handlers: &[(u32, u32)]| {
         let frame_chunk = unsafe { &*frame_ctx.chunk };

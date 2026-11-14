@@ -1078,6 +1078,18 @@ fn object_across(outer: &Chunk, churn: &Chunk) -> Graph {
 #[test]
 fn collections_during_the_inner_run_keep_every_frames_values() {
     let mut engine = fixture(FIXTURES);
+    // churn loops: its rebuilt frame runs its loop on in the VM, which tries its borrowed-frame
+    // code, and from then on every exit through its frame takes the loop limit (step 2's D12
+    // rule), which would discard the code at the fifth; this test's subject is the collections,
+    // so the loop limit is above its twenty exits.
+    super::TestSwitches {
+        on: false,
+        eager: false,
+        exit_every: 0,
+        loop_exit_limit: 100,
+        ..Default::default()
+    }
+    .set();
     let (outer, churn) = (
         chunk_of(&mut engine, "outerC"),
         chunk_of(&mut engine, "churn"),
