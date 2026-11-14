@@ -28,7 +28,10 @@
 //!   Number as an f64, its exact int32, its Boolean, its object's cell, an unboxed value's word),
 //!   which are properties of the immutable value; and the heap facts of the current effect epoch
 //!   (an object's possible shapes, the fields loaded or stored), which an effect ends. Facts meet
-//!   at joins, and a loop header keeps no heap fact. No check or load a fact proves is emitted.
+//!   at joins. A loop header keeps no heap fact, but a loop that can end none (no effect, no
+//!   `%`) keeps its entry's typed arrays' data addresses and free names' facts but the bindings it
+//!   stores (P3 stage 3 step 0c, `Builder::loop_heap_facts`). No check or load a fact proves is
+//!   emitted.
 //! - Feedback: a block whose named and call sites never ran is an exit at its first pc (Maglev,
 //!   Warp and the DFG); arithmetic and comparisons take int32 or f64 from rule U's value classes;
 //!   named loads and stores on own data ways check the shape and load or store the slot.
@@ -766,6 +769,14 @@ struct Loop {
     /// Whether an operation of the loop may lower to an effect, after which every slot is in the
     /// frame.
     effects: bool,
+    /// Whether the loop keeps its entry's heap facts (P3 stage 3 step 0c): no effect, and no `%`,
+    /// whose F64Mod call ends them in the builder's model. Nothing else the loop runs, its poll's
+    /// slow path included, detaches, transfers, resizes or borrows a buffer or writes a binding
+    /// but its own stores (`stored`): opt/build.rs `loop_heap_facts`.
+    keeps_heap: bool,
+    /// The binding slots the loop's free-name stores write, any record's (a store ends every
+    /// record's fact of its slot, `names` store_binding), for a loop that keeps heap facts.
+    stored: Vec<u16>,
 }
 
 impl Flow {
@@ -881,10 +892,14 @@ impl Flow {
                 written: vec![false; n_slots],
                 read: Vec::new(),
                 effects: false,
+                keeps_heap: false,
+                stored: Vec::new(),
             };
+            let mut modulo = false;
             for &index in &body {
                 let block = &blocks[ix(rpo[index])];
                 for pc in block.start..block.end {
+                    modulo |= ops[pc] == Op::Mod;
                     let writes = match ops[pc] {
                         Op::StoreLocal(slot) | Op::UpdateLocal(slot, _) | Op::Tdz(slot) => {
                             slot as usize..slot as usize + 1
@@ -916,6 +931,19 @@ impl Flow {
                 found.read = (0..n_slots)
                     .map(|slot| read[slot / 64] & (1 << (slot % 64)) != 0)
                     .collect();
+                found.keeps_heap = !modulo;
+            }
+            if found.keeps_heap {
+                for &index in &body {
+                    let block = &blocks[ix(rpo[index])];
+                    for pc in block.start..block.end {
+                        if let Some(slot) = rules.name_store_slot(pc) {
+                            if !found.stored.contains(&slot) {
+                                found.stored.push(slot);
+                            }
+                        }
+                    }
+                }
             }
             heads[ix(rpo[header])] = Some(loops.len());
             loops.push(found);
@@ -1113,7 +1141,8 @@ struct State {
     /// too, keeps the view's memory, and the collector moves nothing).
     views: FastMap<NodeIx, NodeIx>,
     typed_lengths: FastMap<NodeIx, NodeIx>,
-    /// A view's elements' address, checked valid this effect epoch (for a store too).
+    /// A view's elements' address, checked valid this effect epoch (for a store too), and
+    /// through the headers of loops that keep heap facts (`Builder::loop_heap_facts`).
     typed_data: FastMap<(NodeIx, bool), NodeIx>,
     /// The free names' facts (stage 2, step 4), value and heap facts (see `names`).
     names: names::Facts,
@@ -2477,6 +2506,7 @@ impl<'a> Builder<'a> {
             }
         }
         let met = meet(&preds);
+        let (typed_data, names) = self.loop_heap_facts(lp, &met);
         let st = State {
             slots,
             stack,
@@ -2488,7 +2518,8 @@ impl<'a> Builder<'a> {
             indices: met.indices,
             views: met.views,
             typed_lengths: met.typed_lengths,
-            names: met.names.at_header(self.moves_env),
+            typed_data,
+            names,
             ..State::default()
         };
         let poll = self.frame_state(pc, &st);
@@ -2499,6 +2530,33 @@ impl<'a> Builder<'a> {
             poll,
         });
         Ok(st)
+    }
+
+    /// The heap facts the header of `lp` keeps from `met`, what its entry edges all hold (P3 stage
+    /// 3 step 0c): none where the loop may end them (`Loop::keeps_heap`); in a loop that keeps
+    /// them, each typed array's data address its entries checked (TypedData: nothing such a loop
+    /// runs detaches, transfers, resizes or borrows a buffer, its poll's slow path included, which
+    /// runs no JavaScript and moves nothing) and the free names' heap facts but the values of the
+    /// bindings its stores write (`names` at_header), so that its accesses read them with no
+    /// check or load again, as Ion's LICM hoists a load whose alias set no instruction of the loop
+    /// stores (jit/LICM.cpp:154-172; MArrayBufferViewElements loads ObjectFields, which a typed
+    /// store does not write, jit/MIROps.yaml:2047-2056, jit/MIR.h:7212-7214), the DFG's a node
+    /// that reads nothing the loop writes (dfg/DFGLICMPhase.cpp:404-409; GetIndexedPropertyStorage
+    /// reads MiscFields, DFGClobberize.h:1679-1683) and TurboFan's loop state keeps what the loop's
+    /// writes do not kill (compiler/load-elimination.cc:1370-1486). A kept fact's node is one every
+    /// entry gave (`meet`), so it dominates the loop.
+    fn loop_heap_facts(
+        &self,
+        lp: &Loop,
+        met: &State,
+    ) -> (FastMap<(NodeIx, bool), NodeIx>, names::Facts) {
+        let kept = lp.keeps_heap.then_some(&lp.stored[..]);
+        let typed_data = if kept.is_some() {
+            met.typed_data.clone()
+        } else {
+            FastMap::default()
+        };
+        (typed_data, met.names.at_header(self.moves_env, kept))
     }
 
     fn jump(&mut self, pc: usize, target: usize, mut st: State) -> Result<(), Refusal> {

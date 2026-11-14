@@ -75,8 +75,12 @@ pub(crate) enum Rep {
     /// take one, each with its owner's cell, which keeps the storage alive while the address is
     /// used (Warp's keep-alive: a storage block a frame names keeps its memory, not its owner or
     /// the values it holds, gc_storage.rs). No frame state, phi or exit recipe holds one. Element
-    /// words and a typed array's data are heap facts, which end at the next effect, so neither
-    /// address crosses a safepoint; a view record is a value fact, fixed at install in a payload
+    /// words and a typed array's data are heap facts, which end at the next effect; element
+    /// words never cross a safepoint, and a typed array's data crosses only a loop header's poll
+    /// in a loop that keeps heap facts (P3 stage 3 step 0c: the bytes are a Vec in the Rust heap,
+    /// reachable from the cell, which the poll's collection neither moves nor frees, and its slow
+    /// path runs no code that detaches, resizes or borrows a buffer); a view record is a value
+    /// fact, fixed at install in a payload
     /// cell that lives as long as its typed array, so its address may (the collector moves
     /// nothing).
     Ptr,
@@ -470,7 +474,8 @@ pub(crate) enum NodeOp {
     /// with the buffer attached, writable for a store, unborrowed by Rust and reaching the view's
     /// end [Detached] (Maglev's CheckTypedArrayValid, TRust having no detaching protector; the
     /// template's checks, jit_typed_array.rs emit_access): a heap fact of the effect epoch, as
-    /// only Rust detaches, resizes or borrows a buffer. The element kind's check precedes it,
+    /// only Rust detaches, resizes or borrows a buffer, which a loop without effects keeps through
+    /// its header (P3 stage 3 step 0c). The element kind's check precedes it,
     /// which a declined view, whose buffer record is null, fails (its kind byte is no kind's).
     TypedData {
         write: bool,

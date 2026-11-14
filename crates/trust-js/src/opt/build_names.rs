@@ -164,11 +164,20 @@ impl Facts {
     }
 
     /// The facts a loop header keeps from its entry's (`meet`): no heap fact (opt/build.rs's
-    /// module doc), and no fact at all in a chunk whose operations move its environment, since a
-    /// back edge may come from another one (a `for (let ...)` loop's CloneLex).
-    pub(super) fn at_header(&self, moves_env: bool) -> Facts {
+    /// module doc) unless the loop keeps its entry's heap facts (P3 stage 3 step 0c, `kept`: the
+    /// binding slots its stores write, `Loop::stored`), which keeps them all but the values of
+    /// those slots: only an effect moves the global property epoch, a global environment's
+    /// generation or a global lexical's value, and a store at a static address writes its slot
+    /// alone; and no fact at all in a chunk whose operations move its environment, since a back
+    /// edge may come from another one (a `for (let ...)` loop's CloneLex).
+    pub(super) fn at_header(&self, moves_env: bool, kept: Option<&[u16]>) -> Facts {
         if moves_env {
             return Facts::default();
+        }
+        if let Some(stored) = kept {
+            let mut facts = self.clone();
+            facts.values.retain(|&(_, slot), _| !stored.contains(&slot));
+            return facts;
         }
         Facts {
             values: FastMap::default(),
@@ -233,6 +242,23 @@ impl Rules<'_> {
                     && !snapshot.declines(pc, ExitReason::NotNumber)
             }
             _ => false,
+        }
+    }
+
+    /// The binding slot the free-name store at `pc` writes in place (a static address's, which
+    /// the rules lower), None for any other operation: a loop's stores (P3 stage 3 step 0c,
+    /// `Loop::stored`).
+    pub(super) fn name_store_slot(&self, pc: usize) -> Option<u16> {
+        match self.ops[pc] {
+            Op::StoreNameCached(..)
+            | Op::StoreCap(_)
+            | Op::StoreCapInit(_)
+            | Op::UpdateNameCached(..)
+            | Op::UpdateCap(..) => match self.snapshot.name(pc) {
+                NameView::Static { address, .. } => Some(address.slot),
+                _ => None,
+            },
+            _ => None,
         }
     }
 
