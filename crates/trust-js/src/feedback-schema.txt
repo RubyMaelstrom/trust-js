@@ -352,26 +352,34 @@ the optimizing tier on). An equality's (==, !=, ===, !==) word in the feedback v
 record's word, which no other writer touches at an equality's pc) holds the pairs of operand
 kinds template code met there, a bit set ORed in (feedback.rs EQ_*):
   bit 0 two Numbers (EQ_NUMBERS), 1 two Strings (EQ_STRINGS), 2 two objects (EQ_OBJECTS),
-  3 two Booleans (EQ_BOOLEANS), 4 any other pair (EQ_OTHER: operands of two kinds, two
-  undefineds or nulls, two Symbols, two BigInts).
-Who writes it: only the optimizing tier's merge, from template code's last-seen byte (rule U's
-mechanism, 5.2): with the tier on and only in chunks the tier would compile (the element bytes'
-gate, opt::element_records), each form of equality in template code stores a pair code into the
-first last-seen byte of its site's pc (opt/profile.rs ChunkProfile; a transformed chunk's into
-its baseline site's, through the record map, which names equality operations since step L1):
-0 for two Numbers (FCMP ordered; four instructions, `strb wzr`), else for two words of one tag
-its code (bits 0-6 of the tag and its sign bit as bit 7: the canonical NaN 0x78, undefined 0x79,
-null 0x7b, a Boolean 0x7c, a BigInt 0x7d, a String 0x7e, a Symbol 0x7f, an object 0xf9) and 1
-for two tags (feedback.rs EQ_SEEN_*, eq_seen_tag; jit.rs emit_equality_numbers_record,
-emit_equality_tags_record). The forms that store: the in-line template (emit_eq_inline, its
-Number path and its tagged path), the compact site (emit_equal_site, before its stub call), the
-compact constant sites of a loose Number constant and of a String constant (emit_eq_constant),
-a local pair feeding a branch (emit_local_eq_branch), the numeric chains' and regions' compares
-of two Numbers; the shared Equal stub is unchanged. The merge (opt::profile::merge_element_hits)
-ORs the code's bit (feedback.rs eq_pair: 0 and 0x78 two Numbers, 0x7e Strings, 0xf9 objects,
-0x7c Booleans, anything else EQ_OTHER) into the record and empties the byte, at the compile's
-copy and at each settled-feedback checkpoint's fingerprint. The VM, the helpers and the tier-off
-template code record nothing for equality.
+  3 two Booleans (EQ_BOOLEANS), 4 any other pair (EQ_OTHER: operands of two kinds, two Symbols,
+  two BigInts, the TDZ marker's), 5 a pair of an object or nullish on each side that is not two
+  objects (EQ_NULLISH, step L1b: two undefineds, two nulls, an object against undefined or null,
+  undefined against null).
+Who writes it: only the optimizing tier's merge, from template code's last-seen class bytes
+(step L1b; rule U's mechanism, 5.2, with a byte per class): with the tier on and only in chunks
+the tier would compile (the element bytes' gate, opt::element_records), each equality site of a
+chunk has a group of 16 bytes (opt/profile.rs ChunkProfile::equality_bytes; a transformed
+chunk's sites use their baseline sites', through the record map, which names equality
+operations since step L1), and each form of equality in template code stores zero into the byte
+of the class of the pair it meets (feedback.rs EQ_CLASS_*, eq_class_of_tag; jit.rs
+emit_equality_numbers_record, emit_equality_tags_record): class 0 for two Numbers (FCMP
+ordered; four instructions, `strb wzr`) and two canonical NaNs; for two words of one tag the
+tag's low three bits and its sign bit as bit 3 (undefined 1, the TDZ marker 2, null 3, a Boolean
+4, a BigInt 5, a String 6, a Symbol 7, an object 9); for two tags, 12 where each is an object or
+nullish, else 8. A class's byte holds a pair met since the last merge whatever came after it, so
+the merge sees every class met in between, as V8 ORs a compare's feedback at every execution
+(codegen/code-stub-assembler.cc:13847-13866); step L1 kept the last pair only (one byte, a pair
+code), and lost a pair met between merges that was not the last. The forms that store: the
+in-line template (emit_eq_inline, its Number path and its tagged path), the compact site
+(emit_equal_site, before its stub call), the compact constant sites of a loose Number constant
+and of a String constant (emit_eq_constant), a local pair feeding a branch
+(emit_local_eq_branch), the numeric chains' and regions' compares of two Numbers; the shared
+Equal stub is unchanged. The merge (opt::profile::merge_element_hits) ORs each marked class's
+bit (feedback.rs eq_class_bit: 0 two Numbers, 6 Strings, 9 objects, 4 Booleans, 1, 3 and 12
+EQ_NULLISH, any other EQ_OTHER) into the record and empties the group, at the compile's copy and
+at each settled-feedback checkpoint's fingerprint. The VM, the helpers and the tier-off template
+code record nothing for equality.
 Reading it: the record alone (no in-line set: the forms that store store every execution's pair).
 A pair met only in the VM, or in a form that stores nothing (an x86-64 template, a site of a
 layout the in-line templates decline), is missing from it: the speculative tier's check then

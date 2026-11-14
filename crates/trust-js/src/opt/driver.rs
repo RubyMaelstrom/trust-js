@@ -446,10 +446,10 @@ pub(crate) fn counts_loops() -> bool {
 /// forwards the VM's records (feedback-schema.txt 5.5); an unmapped pc has none. The bytes
 /// are made here (main thread) and never move; the map holds the chunks it names, so they
 /// outlive the code that embeds their addresses. Tier-off code records nothing and is emitted as
-/// before. Each equality site has its byte too (P3 stage 3, step L1; `jit::emit_equality_record`:
-/// the pair of operand kinds its in-line paths met, feedback-schema.txt 5.8), at its baseline
-/// site's pc, as V8's baseline updates a compare's feedback at every execution (baseline/
-/// baseline-compiler.cc:2155-2196).
+/// before. Each equality site has its group of class bytes (P3 stage 3, steps L1 and L1b;
+/// `ChunkProfile::equality_bytes`: the classes of the pairs of operand kinds its in-line paths
+/// met, feedback-schema.txt 5.8), at its baseline site's pc, as V8 updates a compare's feedback
+/// at every execution (codegen/code-stub-assembler.cc:13847-13866).
 pub(crate) fn element_records(chunk: &Chunk) -> Option<Vec<(u32, u64)>> {
     let ops = chunk.jit_ops();
     if !enabled() || ops.len() > MAX_OPTIMIZED_OPS || chunk.jit_is_resumable() {
@@ -470,7 +470,13 @@ pub(crate) fn element_records(chunk: &Chunk) -> Option<Vec<(u32, u64)>> {
             },
             None => (chunk, pc),
         };
-        if let Some(byte) = ChunkProfile::of(site).element_byte(site.jit_ops().len(), site_pc) {
+        let profile = ChunkProfile::of(site);
+        let byte = if crate::bytecode::feedback_read::is_equality(op) {
+            profile.equality_bytes(site.jit_ops(), site_pc)
+        } else {
+            profile.element_byte(site.jit_ops().len(), site_pc)
+        };
+        if let Some(byte) = byte {
             table.push((pc as u32, byte));
         }
     }

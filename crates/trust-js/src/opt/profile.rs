@@ -118,6 +118,43 @@ pub(crate) struct ChunkProfile {
     /// a pointer: nothing the collector reads. The bytes never move: generated code stores to
     /// their addresses.
     elements: OnceCell<Box<[Cell<u8>]>>,
+    /// Template code's last-seen equality pairs (P3 stage 3, step L1b): a group of
+    /// `feedback::EQ_CLASSES` bytes for each equality of the chunk, made by the first template
+    /// compile that records into them ([`ChunkProfile::equality_bytes`]): byte k of a group is
+    /// [`UNSEEN`], or 0 where an in-line path of the site met a pair of class k
+    /// (`feedback::eq_class_bit`) since the last merge (`jit::emit_equality_numbers_record`,
+    /// `jit::emit_equality_tags_record`). Classes, never a pointer; the bytes never move.
+    equalities: OnceCell<EqualityBytes>,
+}
+
+/// The equality groups of a chunk ([`ChunkProfile::equalities`]): the equalities' pcs, ascending,
+/// and their groups of `feedback::EQ_CLASSES` bytes in that order.
+#[derive(Debug)]
+struct EqualityBytes {
+    pcs: Box<[u32]>,
+    bytes: Box<[Cell<u8>]>,
+}
+
+impl EqualityBytes {
+    fn new(ops: &[crate::bytecode::Op]) -> Self {
+        let pcs: Box<[u32]> = ops
+            .iter()
+            .enumerate()
+            .filter(|(_, op)| crate::bytecode::feedback_read::is_equality(op))
+            .map(|(pc, _)| pc as u32)
+            .collect();
+        let bytes = (0..pcs.len() * crate::feedback::EQ_CLASSES)
+            .map(|_| Cell::new(UNSEEN))
+            .collect();
+        EqualityBytes { pcs, bytes }
+    }
+
+    /// The group of the equality at `pc`, None for a pc that is no equality.
+    fn group(&self, pc: usize) -> Option<&[Cell<u8>]> {
+        let k = self.pcs.binary_search(&u32::try_from(pc).ok()?).ok()?;
+        let n = crate::feedback::EQ_CLASSES;
+        Some(&self.bytes[n * k..n * (k + 1)])
+    }
 }
 
 /// A way the graph inliner took (`ChunkProfile::inline_ways`; P3 stage 3, step 2): its call
@@ -322,8 +359,7 @@ impl ChunkProfile {
     /// byte the next (see the `elements` field), the bytes made [`UNSEEN`] at the first ask (main
     /// thread: a template compile that records, rule U); None past the chunk. Generated code
     /// stores a kind there (`jit::typed_array::emit`) and a tag in the next
-    /// (`jit::emit_family_record`); at an equality's pc, the first byte holds the pair code its
-    /// template code met last (P3 stage 3, step L1; `jit::emit_equality_record`).
+    /// (`jit::emit_family_record`).
     pub(crate) fn element_byte(&self, len: usize, pc: usize) -> Option<u64> {
         let bytes = self
             .elements
@@ -359,18 +395,48 @@ impl ChunkProfile {
         self.elements.get().expect("made")[2 * pc].set(kind);
     }
 
-    /// Store the pair code `code` in the equality at `pc`'s last-seen byte (tests, as
-    /// [`see_element`]; P3 stage 3, step L1).
-    #[cfg(test)]
-    pub(crate) fn see_equality(&self, len: usize, pc: usize, code: u8) {
-        self.element_byte(len, pc).expect("a pc of the chunk");
-        self.elements.get().expect("made")[2 * pc].set(code);
+    /// The address of the equality at `pc`'s group of last-seen class bytes in a chunk whose
+    /// operations are `ops` (see the `equalities` field; P3 stage 3, step L1b), the groups made
+    /// [`UNSEEN`] at the first ask, one for each equality of the chunk (main thread: a template
+    /// compile that records); None for a pc that is no equality. Generated code stores zero into
+    /// the byte of the class of each pair it meets.
+    pub(crate) fn equality_bytes(&self, ops: &[crate::bytecode::Op], pc: usize) -> Option<u64> {
+        let group = self
+            .equalities
+            .get_or_init(|| EqualityBytes::new(ops))
+            .group(pc)?;
+        Some(group[0].as_ptr() as u64)
     }
 
-    /// `pc`'s last-seen equality pair code ([`UNSEEN`] where none was made: tests).
+    /// Mark the pair class `class` met at the equality at `pc` of `chunk`, as template code's
+    /// store does (tests, as [`see_element`]; P3 stage 3, step L1b).
     #[cfg(test)]
-    pub(crate) fn equality_seen(&self, pc: usize) -> u8 {
-        self.seen_byte(2 * pc)
+    pub(crate) fn see_equality(&self, chunk: &Chunk, pc: usize, class: u8) {
+        self.equality_bytes(chunk.jit_ops(), pc)
+            .expect("an equality's pc");
+        let group = self
+            .equalities
+            .get()
+            .expect("made")
+            .group(pc)
+            .expect("made");
+        group[usize::from(class)].set(0);
+    }
+
+    /// The pair classes met at the equality at `pc` since the last merge, bit k class k (0 where
+    /// none was made: tests).
+    #[cfg(test)]
+    pub(crate) fn equality_seen(&self, pc: usize) -> u32 {
+        self.equalities
+            .get()
+            .and_then(|eq| eq.group(pc))
+            .map_or(0, |group| {
+                group
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, byte)| byte.get() != UNSEEN)
+                    .fold(0, |bits, (k, _)| bits | 1 << k)
+            })
     }
 
     /// Store the kind tag `tag` in `pc`'s last-seen family byte (tests, as [`see_element`]).
@@ -386,6 +452,10 @@ impl ChunkProfile {
         std::mem::size_of::<Self>()
             + self.sites.borrow().capacity() * 8
             + self.elements.get().map_or(0, |bytes| bytes.len())
+            + self
+                .equalities
+                .get()
+                .map_or(0, |eq| eq.bytes.len() + 4 * eq.pcs.len())
             + self.inline_ways.borrow().capacity() * std::mem::size_of::<KeptWay>()
             + self.kept.retained_metadata_bytes()
     }
@@ -406,7 +476,9 @@ impl ChunkProfile {
 /// the observed array modes and clears it (bytecode/ArrayProfile.cpp:126-136): a record that holds
 /// more (another kind, other receivers, a String key, the generic mark) keeps all of it. JSC's
 /// first-run pruning (:137-140, the first merge's modes cut to the last-seen one) is not taken:
-/// the record only grows (feedback-schema.txt). Main thread: the tier's preparation and its
+/// the record only grows (feedback-schema.txt). Each equality's group of class bytes ORs every
+/// class met since the last merge into its record and is reset (P3 stage 3, step L1b). Main
+/// thread: the tier's preparation and its
 /// checkpoints' fingerprints (`opt::snapshot`), as JSC merges at each tier-up check and at the
 /// DFG's read (jit/JITOperations.cpp:2826-2829, 2881, 2940; dfg/DFGByteCodeParser.cpp:
 /// 1354-1359). One load where no template code of the chunks recorded.
@@ -424,24 +496,31 @@ fn merge_own_element_hits(chunk: &Chunk) {
     use crate::feedback::{
         elem_typed_kind, ELEM_ARRAY, ELEM_KEY_INDEX, ELEM_ORDINARY, ELEM_TYPED_ARRAY,
     };
-    let Some(bytes) = ChunkProfile::get(chunk).and_then(|profile| profile.elements.get()) else {
+    let Some(profile) = ChunkProfile::get(chunk) else {
         return;
     };
     let feedback = chunk.feedback_vector();
-    let ops = chunk.jit_ops();
-    for (pc, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
-        if ops
-            .get(pc)
-            .is_some_and(crate::bytecode::feedback_read::is_equality)
-        {
-            // An equality's byte holds the pair code its template code met last (P3 stage 3,
-            // step L1; feedback-schema.txt 5.8).
-            let code = pair[0].replace(UNSEEN);
-            if code != UNSEEN {
-                feedback.record(pc, crate::feedback::eq_pair(code));
+    if let Some(eq) = profile.equalities.get() {
+        // Each equality's classes met since the last merge (P3 stage 3, step L1b;
+        // feedback-schema.txt 5.8), every one of them, as V8 ORs a compare's feedback at every
+        // execution (codegen/code-stub-assembler.cc:13847-13866).
+        let n = crate::feedback::EQ_CLASSES;
+        for (&pc, group) in eq.pcs.iter().zip(eq.bytes.chunks_exact(n)) {
+            let mut pairs = 0;
+            for (class, byte) in group.iter().enumerate() {
+                if byte.replace(UNSEEN) != UNSEEN {
+                    pairs |= crate::feedback::eq_class_bit(class as u8);
+                }
             }
-            continue;
+            if pairs != 0 {
+                feedback.record(pc as usize, pairs);
+            }
         }
+    }
+    let Some(bytes) = profile.elements.get() else {
+        return;
+    };
+    for (pc, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
         let kind = pair[0].replace(UNSEEN);
         if kind != UNSEEN {
             feedback.record(

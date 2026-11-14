@@ -7822,53 +7822,76 @@ fn emit_family_record(a: &mut asm::Asm, record: Option<u64>, scratch: u32) {
     }
 }
 
-/// At an equality whose two operands are Numbers: store the pair code of two Numbers
-/// (`feedback::EQ_SEEN_NUMBERS`, 0) in the site's last-seen byte (P3 stage 3, step L1;
-/// `opt::profile::ChunkProfile`'s bytes, an equality's first), which the optimizing tier merges
-/// into the equality record (feedback-schema.txt 5.8), as V8's baseline combines a compare's
-/// feedback at every execution (baseline/baseline-compiler.cc:2155-2196). Four instructions
-/// (the address and `strb wzr`), nothing where the code records nothing (the tier off). Clobbers
-/// x`scratch` only: NZCV and the operands' registers are kept.
+/// At an equality whose two operands are Numbers: mark the class of two Numbers
+/// (`feedback::EQ_CLASS_NUMBERS`, the first byte of the site's group: P3 stage 3, steps L1 and
+/// L1b; `opt::profile::ChunkProfile::equality_bytes`), which the optimizing tier merges into the
+/// equality record (feedback-schema.txt 5.8) with every other class met since its last merge, as
+/// V8 ORs a compare's feedback at every execution (codegen/code-stub-assembler.cc:13847-13866).
+/// Four instructions (the address and `strb wzr`), nothing where the code records nothing (the
+/// tier off). Clobbers x`scratch` only: NZCV and the operands' registers are kept.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_equality_numbers_record(a: &mut asm::Asm, pc: u32, scratch: u32) {
-    if let Some(byte) = a.element_record(pc) {
-        a.mov_imm64(scratch, byte);
+    if let Some(group) = a.element_record(pc) {
+        a.mov_imm64(scratch, group);
         a.strb_imm(31, scratch, 0);
     }
 }
 
 /// At an equality whose operands, the words in x`x` and x`y`, are not two Numbers (one of them is
-/// no Number, or both are the canonical NaN): store their pair code in the site's last-seen byte
-/// (see [`emit_equality_numbers_record`]): their one tag's code
-/// (`feedback::eq_seen_tag`, its bits 0-6 and its sign bit), or two tags'
-/// (`feedback::EQ_SEEN_TWO_TAGS`). Nothing where the code records nothing. Clobbers x16, x17 and
-/// NZCV.
+/// no Number, or both are the canonical NaN): mark their pair's class in the site's group (see
+/// [`emit_equality_numbers_record`]; `feedback::EQ_CLASSES`): for one tag, its low three bits and
+/// its sign bit as bit 3 (`feedback::eq_class_of_tag`); for two tags each an object or nullish
+/// (`(tag & 0x7fff) - 0x7ff9 < 3`, unsigned: undefined, the TDZ marker, null, an object; the
+/// internal lazy-prototype and accessor tags it also takes are no operand's),
+/// `feedback::EQ_CLASS_OBJECT_OR_NULLISH`; else `feedback::EQ_CLASS_TWO_KINDS`. A plain store of
+/// zero into the class's byte, so that the classes met between two merges are all kept (P3 stage
+/// 3, step L1b). Nothing where the code records nothing. Clobbers x16, x17 and NZCV.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 fn emit_equality_tags_record(a: &mut asm::Asm, pc: u32, x: u32, y: u32) {
-    let Some(byte) = a.element_record(pc) else {
+    let Some(group) = a.element_record(pc) else {
         return;
     };
     let two = a.new_label();
+    let other = a.new_label();
     let store = a.new_label();
     a.logic_x(2, 16, x, y);
     a.lsr_imm(16, 16, 48);
     a.cbnz(16, false, two);
-    a.ubfx(16, x, 48, 7);
+    a.ubfx(16, x, 48, 3);
     a.lsr_imm(17, x, 63);
-    a.lsl_imm(17, 17, 7);
-    a.logic_x(1, 16, 16, 17);
+    a.add_shifted(16, 16, 17, 3);
     a.b(store);
     a.bind(two);
-    a.movz(16, u32::from(crate::feedback::EQ_SEEN_TWO_TAGS), 0);
+    // u = tag & 0x7fff; u - 0x7ff9 < 3 as (u + 7) ^ 0x8000 < 3 (u + 7 is below 0x10000), each
+    // step one instruction.
+    let low15 = asm::logical_imm_w(0x7fff).expect("0x7fff is a logical immediate");
+    let bit15 = asm::logical_imm_w(0x8000).expect("0x8000 is a logical immediate");
+    const _: () = assert!((crate::value::PACK_UNDEFINED >> 48) & 0x7fff == 0x8000 - 7);
+    for word in [x, y] {
+        a.lsr_imm(16, word, 48);
+        a.logic_imm_w(0, 16, 16, low15);
+        a.add_imm(16, 16, 7);
+        a.logic_imm_w(2, 16, 16, bit15);
+        a.cmp_imm_w(16, 3);
+        a.b_cond(C_HS, other);
+    }
+    a.movz(
+        16,
+        u32::from(crate::feedback::EQ_CLASS_OBJECT_OR_NULLISH),
+        0,
+    );
+    a.b(store);
+    a.bind(other);
+    a.movz(16, u32::from(crate::feedback::EQ_CLASS_TWO_KINDS), 0);
     a.bind(store);
-    a.mov_imm64(17, byte);
-    a.strb_imm(16, 17, 0);
+    a.mov_imm64(17, group);
+    a.strb_reg(31, 17, 16);
 }
 
 /// Branch to `miss` unless the kind tag already loaded in `reg` is ordinary
@@ -16166,16 +16189,25 @@ fn emit_eq_constant(
                 a.fmov_d_x(1, 10);
                 a.fcmp(0, 1);
             }
-            // The pair's code (P3 stage 3, step L1): two Numbers where the compare is ordered,
-            // else two tags (the constant is a Number, the operand none or NaN); the flags kept.
-            if let Some(byte) = a.element_record(pc) {
-                a.cset_w(16, C_VS);
-                a.mov_imm64(17, byte);
-                a.strb_imm(16, 17, 0);
+            // The pair's class (P3 stage 3, steps L1 and L1b): two Numbers where the compare is
+            // ordered, else two kinds (the constant is a Number, the operand none or NaN), each
+            // path storing to its class's byte of the site's group (the address moved before the
+            // branch; the flags kept), so that the Numbers' path takes the address and one store.
+            if let Some(group) = a.element_record(pc) {
+                let two = a.new_label();
+                a.mov_imm64(17, group);
+                a.b_cond(C_VS, two);
+                a.strb_imm(31, 17, u32::from(crate::feedback::EQ_CLASS_NUMBERS));
+                decide(a, C_EQ);
+                a.b(done);
+                a.bind(two);
+                a.strb_imm(31, 17, u32::from(crate::feedback::EQ_CLASS_TWO_KINDS));
+                a.b(generic);
+            } else {
+                a.b_cond(C_VS, generic);
+                decide(a, C_EQ);
+                a.b(done);
             }
-            a.b_cond(C_VS, generic);
-            decide(a, C_EQ);
-            a.b(done);
             (bits, [false, false])
         }
         EqConstant::Scalar(word) => {

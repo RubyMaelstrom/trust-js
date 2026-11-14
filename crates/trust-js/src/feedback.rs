@@ -401,18 +401,27 @@ pub(crate) const fn elem_typed_kind(kind: u8) -> u32 {
 
 /// The equality record (P3 stage 3, step L1; feedback-schema.txt section 5.8): an equality's
 /// (`==`, `!=`, `===`, `!==`) word holds the pairs of operand kinds template code met there with
-/// the optimizing tier on, ORed in: two Numbers, two Strings, two objects, two Booleans, any
-/// other pair (two kinds, undefined, null, Symbols, BigInts).
+/// the optimizing tier on, ORed in: two Numbers, two Strings, two objects, two Booleans, a pair of
+/// an object or nullish on each side that is not two objects (step L1b), any other pair (two
+/// kinds, Symbols, BigInts).
 pub(crate) const EQ_NUMBERS: u32 = 1 << 0;
 pub(crate) const EQ_STRINGS: u32 = 1 << 1;
 pub(crate) const EQ_OBJECTS: u32 = 1 << 2;
 pub(crate) const EQ_BOOLEANS: u32 = 1 << 3;
 pub(crate) const EQ_OTHER: u32 = 1 << 4;
+pub(crate) const EQ_NULLISH: u32 = 1 << 5;
 
-/// The pair code template code stores in an equality's last-seen byte for two Numbers
-/// (`opt::profile::ChunkProfile`; one `strb wzr`).
-pub(crate) const EQ_SEEN_NUMBERS: u8 = 0;
-/// The pair code for operands of two tags.
+/// Template code's last-seen bytes of an equality site (P3 stage 3, step L1b;
+/// `opt::profile::ChunkProfile::equality_bytes`): one a pair class, each [`opt::profile::UNSEEN`]
+/// or 0 where template code met a pair of its class since the tier last merged them, so that the
+/// merge sees every class met between two merges, as V8 ORs a compare's feedback at every
+/// execution (codegen/code-stub-assembler.cc:13847-13866), with the plain store of JSC's
+/// last-seen buckets (jit/JITInlines.h:312-319): the set's bits are bytes.
+pub(crate) const EQ_CLASSES: usize = 16;
+/// The class of two Numbers, and of two canonical NaNs (byte 0, the Number paths' `strb wzr`).
+pub(crate) const EQ_CLASS_NUMBERS: u8 = 0;
+/// The class of two words of two tags of which one is no object or nullish (a Number and another
+/// kind among them).
 // Only the ARM64 templates store it (x86-64 has no optimizing tier yet).
 #[cfg_attr(
     not(all(
@@ -421,29 +430,44 @@ pub(crate) const EQ_SEEN_NUMBERS: u8 = 0;
     )),
     allow(dead_code)
 )]
-pub(crate) const EQ_SEEN_TWO_TAGS: u8 = 1;
+pub(crate) const EQ_CLASS_TWO_KINDS: u8 = 8;
+/// The class of two words of two tags, each an object or nullish (undefined, null or the TDZ
+/// marker): an object against undefined or null, undefined against null.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) const EQ_CLASS_OBJECT_OR_NULLISH: u8 = 12;
 
-/// The pair code of two words of one tag: the tag's bits 0-6 and its sign bit as bit 7 (value.rs:
-/// the canonical NaN 0x78, undefined 0x79, the TDZ marker 0x7a, null 0x7b, a Boolean 0x7c, a
-/// BigInt 0x7d, a String 0x7e, a Symbol 0x7f, an object 0xf9), as template code computes it from
-/// a word (`ubfx` of bits 48-54, `bfi` of bit 63).
-pub(crate) const fn eq_seen_tag(word: u64) -> u8 {
-    (((word >> 48) & 0x7f) | ((word >> 63) << 7)) as u8
+/// The class of two words of one tag, `word`'s: the tag's low three bits and its sign bit as bit
+/// 3 (value.rs: the canonical NaN 0, undefined 1, the TDZ marker 2, null 3, a Boolean 4, a BigInt
+/// 5, a String 6, a Symbol 7, an object 9; the internal lazy-prototype and accessor tags, 10 and
+/// 11, are no operand's), as template code computes it from a word (`ubfx` of bits 48-50, the
+/// sign added at bit 3).
+pub(crate) const fn eq_class_of_tag(word: u64) -> u8 {
+    (((word >> 48) & 7) | ((word >> 63) << 3)) as u8
 }
 
-/// The equality record's bit for a last-seen pair code (see [`EQ_SEEN_NUMBERS`],
-/// [`eq_seen_tag`]): two Numbers (the canonical NaN's pair too), two Strings, two objects, two
-/// Booleans, else the other pairs'.
-pub(crate) const fn eq_pair(code: u8) -> u32 {
-    const NAN: u8 = eq_seen_tag(crate::value::PACK_CANON_NAN);
-    const STR: u8 = eq_seen_tag(crate::value::PACK_STR);
-    const OBJ: u8 = eq_seen_tag(crate::value::PACK_OBJ);
-    const BOOL: u8 = eq_seen_tag(crate::value::PACK_BOOL);
-    match code {
-        EQ_SEEN_NUMBERS | NAN => EQ_NUMBERS,
+/// The equality record's bit for a pair class (see [`EQ_CLASSES`]): two Numbers, two Strings,
+/// two objects, two Booleans; two undefined, two null, or an object or nullish against another
+/// of them ([`EQ_NULLISH`]); else the other pairs'.
+pub(crate) const fn eq_class_bit(class: u8) -> u32 {
+    // The canonical NaN's class is EQ_CLASS_NUMBERS's (its tag's low bits are 0).
+    const _: () = assert!(eq_class_of_tag(crate::value::PACK_CANON_NAN) == EQ_CLASS_NUMBERS);
+    const UNDEFINED: u8 = eq_class_of_tag(crate::value::PACK_UNDEFINED);
+    const NULL: u8 = eq_class_of_tag(crate::value::PACK_NULL);
+    const STR: u8 = eq_class_of_tag(crate::value::PACK_STR);
+    const OBJ: u8 = eq_class_of_tag(crate::value::PACK_OBJ);
+    const BOOL: u8 = eq_class_of_tag(crate::value::PACK_BOOL);
+    match class {
+        EQ_CLASS_NUMBERS => EQ_NUMBERS,
         STR => EQ_STRINGS,
         OBJ => EQ_OBJECTS,
         BOOL => EQ_BOOLEANS,
+        UNDEFINED | NULL | EQ_CLASS_OBJECT_OR_NULLISH => EQ_NULLISH,
         _ => EQ_OTHER,
     }
 }

@@ -472,24 +472,49 @@ fn equality_pc(chunk: &Chunk) -> usize {
     pcs[0]
 }
 
-/// Store `codes` one after another in the last-seen byte of the global function `name`'s one
+/// Mark the pair classes `classes` one after another at the global function `name`'s one
 /// equality, each merged into its record, as template code's stores and the tier's merges at its
 /// checkpoints make it.
-fn see(engine: &mut Engine, name: &str, codes: &[u8]) {
+fn see(engine: &mut Engine, name: &str, classes: &[u8]) {
     let chunk = chunk_of(engine, name);
     let pc = equality_pc(&chunk);
-    for &code in codes {
-        super::profile::ChunkProfile::of(&chunk).see_equality(chunk.jit_ops().len(), pc, code);
+    for &class in classes {
+        super::profile::ChunkProfile::of(&chunk).see_equality(&chunk, pc, class);
         super::profile::merge_element_hits(&chunk);
     }
 }
 
-/// Pair codes as template code stores them (feedback.rs EQ_SEEN_*, eq_seen_tag).
-const NUMBERS: u8 = crate::feedback::EQ_SEEN_NUMBERS;
-const TWO_TAGS: u8 = crate::feedback::EQ_SEEN_TWO_TAGS;
-const STRINGS: u8 = crate::feedback::eq_seen_tag(crate::value::PACK_STR);
-const OBJECTS: u8 = crate::feedback::eq_seen_tag(crate::value::PACK_OBJ);
-const BOOLEANS: u8 = crate::feedback::eq_seen_tag(crate::value::PACK_BOOL);
+/// Pair classes as template code marks them (feedback.rs EQ_CLASS_*, eq_class_of_tag).
+const NUMBERS: u8 = crate::feedback::EQ_CLASS_NUMBERS;
+const TWO_TAGS: u8 = crate::feedback::EQ_CLASS_TWO_KINDS;
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+const OBJECT_OR_NULLISH: u8 = crate::feedback::EQ_CLASS_OBJECT_OR_NULLISH;
+const STRINGS: u8 = crate::feedback::eq_class_of_tag(crate::value::PACK_STR);
+const OBJECTS: u8 = crate::feedback::eq_class_of_tag(crate::value::PACK_OBJ);
+const BOOLEANS: u8 = crate::feedback::eq_class_of_tag(crate::value::PACK_BOOL);
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+const UNDEFINEDS: u8 = crate::feedback::eq_class_of_tag(crate::value::PACK_UNDEFINED);
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+const NULLS: u8 = crate::feedback::eq_class_of_tag(crate::value::PACK_NULL);
+const SYMBOLS: u8 = crate::feedback::eq_class_of_tag(crate::value::PACK_SYM);
 
 /// The checks of `op` in `graph` and their reasons.
 fn checks(graph: &Graph, op: &NodeOp) -> Vec<Option<ExitReason>> {
@@ -561,12 +586,8 @@ fn an_equality_whose_record_saw_several_pairs_or_another_stays_the_generic_opera
     see(&mut engine, "en", &[NUMBERS, STRINGS]);
     see(&mut engine, "es", &[TWO_TAGS]);
     see(&mut engine, "eo", &[OBJECTS, TWO_TAGS]);
-    // Two undefineds, two Symbols: one tag, but no speculation's.
-    see(
-        &mut engine,
-        "eb",
-        &[crate::feedback::eq_seen_tag(crate::value::PACK_UNDEFINED)],
-    );
+    // Two Symbols: one tag, but no speculation's.
+    see(&mut engine, "eb", &[SYMBOLS]);
     for name in ["en", "es", "eo", "eb", "ec"] {
         let (graph, text) = graph_of(&mut engine, name);
         assert_eq!(count(&graph, is_effect), 1, "{name}: {text}");
@@ -659,17 +680,17 @@ fn template_only(engine: &mut Engine, name: &str, call: &str) {
     eval(engine, call);
 }
 
-/// The equality's last-seen byte and record of the global function `name`.
+/// The pair classes met since the last merge (bit k class k) and the record of the global
+/// function `name`'s equality.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn seen(engine: &mut Engine, name: &str) -> (u8, u32) {
+fn seen(engine: &mut Engine, name: &str) -> (u32, u32) {
     let chunk = chunk_of(engine, name);
     let pc = equality_pc(&chunk);
     (
-        super::profile::ChunkProfile::get(&chunk)
-            .map_or(super::profile::UNSEEN, |profile| profile.equality_seen(pc)),
+        super::profile::ChunkProfile::get(&chunk).map_or(0, |profile| profile.equality_seen(pc)),
         chunk.feedback_vector().record_word(pc),
     )
 }
@@ -680,7 +701,6 @@ fn seen(engine: &mut Engine, name: &str) -> (u8, u32) {
 ))]
 #[test]
 fn template_code_records_the_pair_each_form_met() {
-    use crate::feedback::{EQ_NUMBERS, EQ_OBJECTS, EQ_OTHER, EQ_STRINGS};
     super::pin_forced_exits_off_for_test();
     let mut engine = jit_engine(true);
     eval(&mut engine, FORMS);
@@ -696,26 +716,109 @@ fn template_code_records_the_pair_each_form_met() {
         ("cs", "cs(1)", TWO_TAGS),
         ("lp", "lp(1, 2, 8)", NUMBERS),
         ("lp", "lp('a', 'b', 8)", STRINGS),
-        ("lp", "lp({}, null, 8)", TWO_TAGS),
+        ("lp", "lp({}, null, 8)", OBJECT_OR_NULLISH),
+        ("lp", "lp(1, null, 8)", TWO_TAGS),
         ("lv", "lv({v: 1}, 2, 8)", NUMBERS),
         ("lv", "lv({v: 'a'}, 'b', 8)", STRINGS),
         ("lv", "lv({v: {}}, {}, 8)", OBJECTS),
         ("li", "li(8)", NUMBERS),
     ] {
         template_only(&mut engine, name, call);
-        assert_eq!(seen(&mut engine, name).0, code, "{call}: the byte");
-        // The merge ORs the pair's bit into the record and empties the byte.
+        assert_eq!(seen(&mut engine, name).0, 1 << code, "{call}: the class");
+        // The merge ORs the class's bit into the record and empties the group.
         super::profile::merge_element_hits(&chunk_of(&mut engine, name));
-        let (byte, record) = seen(&mut engine, name);
-        assert_eq!(byte, super::profile::UNSEEN, "{call}");
-        let bit = match code {
-            NUMBERS => EQ_NUMBERS,
-            STRINGS => EQ_STRINGS,
-            OBJECTS => EQ_OBJECTS,
-            BOOLEANS => crate::feedback::EQ_BOOLEANS,
-            _ => EQ_OTHER,
-        };
+        let (classes, record) = seen(&mut engine, name);
+        assert_eq!(classes, 0, "{call}");
+        let bit = crate::feedback::eq_class_bit(code);
         assert_ne!(record & bit, 0, "{call}: {record:#x}");
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn template_code_marks_each_pairs_class() {
+    // The tag path's classes (P3 stage 3 step L1b): a pair of canonical NaNs is two Numbers;
+    // undefined against undefined, null against null, and an object or nullish against another of
+    // them are the nullish pairs; a nullish value against another kind, and a Number against a
+    // String, two kinds; two Symbols their tag's, the other pairs'.
+    super::pin_forced_exits_off_for_test();
+    let mut engine = jit_engine(true);
+    eval(&mut engine, FORMS);
+    template_only(&mut engine, "c2", "c2(1, 2)");
+    super::profile::merge_element_hits(&chunk_of(&mut engine, "c2"));
+    for (call, class) in [
+        ("c2(NaN, NaN)", NUMBERS),
+        ("c2(undefined, undefined)", UNDEFINEDS),
+        ("c2(null, null)", NULLS),
+        ("c2(null, undefined)", OBJECT_OR_NULLISH),
+        ("c2({}, undefined)", OBJECT_OR_NULLISH),
+        ("c2(null, [])", OBJECT_OR_NULLISH),
+        ("c2(1, null)", TWO_TAGS),
+        ("c2(true, null)", TWO_TAGS),
+        ("c2('a', 1)", TWO_TAGS),
+        ("c2(NaN, 1)", TWO_TAGS),
+        ("var sy = Symbol(); c2(sy, sy)", SYMBOLS),
+    ] {
+        eval(&mut engine, call);
+        assert_eq!(seen(&mut engine, "c2").0, 1 << class, "{call}");
+        super::profile::merge_element_hits(&chunk_of(&mut engine, "c2"));
+    }
+    use crate::feedback::{EQ_NULLISH, EQ_NUMBERS, EQ_OTHER};
+    assert_eq!(
+        seen(&mut engine, "c2").1,
+        EQ_NUMBERS | EQ_NULLISH | EQ_OTHER
+    );
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn template_code_keeps_every_pair_met_between_two_merges() {
+    // RayTrace's `shape != exclude`: an object against an object, then against null, then an
+    // object again, all before one merge: both classes are kept and both merged (P3 stage 3 step
+    // L1b), where a last-seen byte kept the last alone; the same for two Numbers and two Strings
+    // at a loop's local pair.
+    use crate::feedback::{EQ_NULLISH, EQ_NUMBERS, EQ_OBJECTS, EQ_STRINGS};
+    super::pin_forced_exits_off_for_test();
+    let mut engine = jit_engine(true);
+    eval(&mut engine, FORMS);
+    for (name, calls, first, classes, record) in [
+        (
+            "c2",
+            &["c2({}, {})", "c2({}, null)", "c2({}, {})"][..],
+            OBJECTS,
+            1u32 << OBJECTS | 1 << OBJECT_OR_NULLISH,
+            EQ_OBJECTS | EQ_NULLISH,
+        ),
+        (
+            "lp",
+            &["lp(1, 2, 8)", "lp('a', 'b', 8)", "lp(3, 4, 8)"][..],
+            NUMBERS,
+            1u32 << NUMBERS | 1 << STRINGS,
+            EQ_NUMBERS | EQ_STRINGS,
+        ),
+    ] {
+        template_only(&mut engine, name, calls[0]);
+        super::profile::merge_element_hits(&chunk_of(&mut engine, name));
+        assert_eq!(
+            seen(&mut engine, name).1,
+            crate::feedback::eq_class_bit(first)
+        );
+        for call in calls {
+            eval(&mut engine, call);
+        }
+        assert_eq!(
+            seen(&mut engine, name).0,
+            classes,
+            "{name}: the classes met"
+        );
+        super::profile::merge_element_hits(&chunk_of(&mut engine, name));
+        assert_eq!(seen(&mut engine, name), (0, record), "{name}: merged");
     }
 }
 
@@ -737,11 +840,7 @@ fn with_the_tier_off_template_code_records_no_pair() {
         ("li", "li(8)"),
     ] {
         template_only(&mut engine, name, call);
-        assert_eq!(
-            seen(&mut engine, name),
-            (super::profile::UNSEEN, 0),
-            "{call}: nothing recorded"
-        );
+        assert_eq!(seen(&mut engine, name), (0, 0), "{call}: nothing recorded");
     }
 }
 
@@ -999,13 +1098,13 @@ fn the_equality_record_leaves_the_settled_feedback_fingerprint_as_it_was() {
     let chunk = chunk_of(&mut engine, "en");
     let before = super::snapshot::fingerprint(&chunk);
     let pc = equality_pc(&chunk);
-    super::profile::ChunkProfile::of(&chunk).see_equality(chunk.jit_ops().len(), pc, NUMBERS);
+    super::profile::ChunkProfile::of(&chunk).see_equality(&chunk, pc, NUMBERS);
     assert_eq!(super::snapshot::fingerprint(&chunk), before);
     assert_eq!(
         chunk.feedback_vector().record_word(pc),
         crate::feedback::EQ_NUMBERS,
         "merged at the fingerprint"
     );
-    super::profile::ChunkProfile::of(&chunk).see_equality(chunk.jit_ops().len(), pc, STRINGS);
+    super::profile::ChunkProfile::of(&chunk).see_equality(&chunk, pc, STRINGS);
     assert_eq!(super::snapshot::fingerprint(&chunk), before);
 }

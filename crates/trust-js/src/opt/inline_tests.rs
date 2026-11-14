@@ -730,7 +730,7 @@ fn callees_whose_equalities_and_typeof_tests_lower_are_inlined() {
     );
     let eqn = chunk_of(&mut engine, "eqn");
     let pc = pc_of(&eqn, |op| *op == Op::EqEq) as usize;
-    ChunkProfile::of(&eqn).see_equality(eqn.jit_ops().len(), pc, crate::feedback::EQ_SEEN_NUMBERS);
+    ChunkProfile::of(&eqn).see_equality(&eqn, pc, crate::feedback::EQ_CLASS_NUMBERS);
     let built = Compile::new(&mut engine, "c").build();
     assert_eq!(
         outcomes(&built),
