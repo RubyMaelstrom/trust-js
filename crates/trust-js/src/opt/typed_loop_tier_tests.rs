@@ -222,3 +222,77 @@ fn an_interruption_at_the_poll_of_a_loop_whose_entry_checked_its_array_leaves_th
     );
     assert_eq!(eval(&mut engine, "spin(T, 100) + spin(T, 3)"), expected[1]);
 }
+
+/// zlib's shape (see build_tests' typed_loop NO_BACK_EDGE): the loop's only path to its back
+/// edge never ran, so its head is no loop header in the tier's graph, and its entry checks stand
+/// before it. `s` starts nonzero, so that the exit's frame shows in the result; `ZD`'s buffer is
+/// detached.
+const NO_BACK_EDGE: &str = "function zl(t, u, n) { let s = (n + 7) | 0, i = 0; const k = 'x';
+     for (;;) { if (i >= n) break; s = (s + (t[i] | 0)) | 0; i = (i + 1) | 0;
+       if (i >= n) break; s = (s + (u[k] | 0)) | 0; }
+     return s | 0; }\n\
+     const Z = new Int32Array(8); Z[0] = 5; const ZD = new Int32Array(8); ZD.buffer.transfer();\n";
+
+#[test]
+fn an_entry_check_before_a_loop_without_a_back_edge_exits_at_its_head_and_backs_off() {
+    let warm =
+        format!("{NO_BACK_EDGE}let t = 0; for (let r = 0; r < 1000; r++) t = t + zl(Z, Z, 1); t");
+    // The graph: entry checks before the bytecode's loop head, which no back edge made a loop
+    // header; entered with a detached buffer, a check exits at that pc with the entry's frame,
+    // the VM's result.
+    {
+        eager().set();
+        let mut engine = jit_engine();
+        assert_eq!(eval(&mut engine, &warm), "13000");
+        let chunk = tier_chunk(&mut engine, "zl").expect("zl's second stage");
+        let graph = graph_now(&chunk);
+        assert!(graph.blocks.iter().all(|block| !block.loop_header));
+        let head = graph
+            .nodes
+            .iter()
+            .find(|node| node.reason == Some(ExitReason::HoistingFailed))
+            .map(|node| graph.state(node.state.expect("a state")).pc)
+            .expect("the entry's checks");
+        let cfg = crate::jit_ir::Cfg::build(&chunk).expect("its Cfg");
+        assert!(cfg.loop_at_header(head as usize).is_some());
+        exits();
+        assert_eq!(eval(&mut engine, "zl(ZD, ZD, 0) + zl(Z, Z, 1)"), "20");
+        assert_eq!(exits(), vec![(head, ExitReason::HoistingFailed)]);
+    }
+    // Until the discard, and its flag's recompile checks at the read, which a zero-trip call
+    // never reaches: no exit after, the VM's results.
+    let chunk = converges(
+        "zl",
+        &warm,
+        "let u = 0; for (let r = 0; r < 600; r++) u = u + zl(ZD, ZD, 0); u",
+        "zl(Z, Z, 1) + ':' + zl(ZD, ZD, 0) + ':' + zl(Z, ZD, 0)",
+        ExitReason::HoistingFailed,
+    );
+    assert_eq!(entry_checks(&chunk), 0, "the recompile checks at the read");
+    // The tier on, eager and with exits forced, detached and live views in turn, some calls
+    // reaching the mismatch's exit: the VM's results.
+    let source = format!(
+        "{NO_BACK_EDGE}let t = 0; for (let r = 0; r < 1000; r++) t = t + zl(Z, Z, 1);\n\
+         for (let r = 0; r < 1200; r++) t = (t + zl(r % 5 ? Z : ZD, Z, r % 7 ? r & 1 : 2)) | 0; t"
+    );
+    let expected = run(Tier::Bytecode, &source);
+    for (label, switches) in [
+        (
+            "on",
+            TestSwitches {
+                on: true,
+                ..Default::default()
+            },
+        ),
+        ("eager", eager()),
+        (
+            "forced exits 7",
+            TestSwitches {
+                exit_every: 7,
+                ..eager()
+            },
+        ),
+    ] {
+        assert_eq!(with_switches(switches, &source), expected, "{label}");
+    }
+}

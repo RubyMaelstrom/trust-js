@@ -22,7 +22,19 @@
 //!   CheckNumber, CheckInt32, CheckObject or CheckElements [HoistingFailed], or a typed array's
 //!   TypedData checked there (step 0c) [HoistingFailed], sits at the end of a
 //!   loop header's entry predecessor, where nothing after it exits or has an effect before the
-//!   jump, and exits at the header's pc with its handlers.
+//!   jump, and exits at the header's pc with its handlers. A HoistingFailed check may also stand
+//!   before a block that heads a loop of its frame's bytecode (the frame's Cfg) and is no loop
+//!   header in the graph, its one predecessor's only successor: the builder makes a loop's
+//!   header state, and step 0c's entry checks of its typed arrays (`Builder::loop_entry_checks`),
+//!   at the header's first entry, before any back edge, and a block becomes a loop header only at
+//!   its first back edge (`Builder::back_edge`), which the build does not reach where every path
+//!   to the latch ends in an exit (a block that never ran; an operation the rules lower whose
+//!   operands the builder cannot take, `Builder::mismatch`, as zlib's). The exit is the same: the
+//!   header's pc, the edge's state, whose flag leaves the checks at their sites. Such a block has
+//!   no poll whose state names the header's handlers, so the rule compares none there: the
+//!   state is the edge's, as the header's is (the builder refuses a block whose edges' handlers
+//!   differ), and its records are checked as every state's. The phi selector's speculations and
+//!   hoisted checks take only headers with a back edge (`phis.rs`).
 //!
 //! Inlined frames (P3 stage 3, step 1; `frames`, which the back end checks too):
 //! - each frame's states and nodes are checked against that frame's chunk and Cfg: a node's pc
@@ -175,7 +187,10 @@ pub(crate) fn verify_frames(
             }
         }
         if speculative(node) {
-            if let Err(what) = speculation(graph, node, &dom, at.1) {
+            let Some((_, frame_cfg)) = chunk_of(node.frame) else {
+                return fail("a frame that does not exist");
+            };
+            if let Err(what) = speculation(graph, node, &dom, at.1, frame_cfg) {
                 return fail(&what);
             }
         }
@@ -500,12 +515,16 @@ fn speculative(node: &Node) -> bool {
 /// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32, any of CheckNumber, CheckInt32,
 /// CheckObject, CheckElements and TypedData for HoistingFailed) at the end of a loop header's entry
 /// predecessor, after which nothing but other speculations exits or has an effect before the jump
-/// to the header, with a state at the header's pc and the header's handlers.
+/// to the header, with a state at the header's pc and the header's handlers; or a HoistingFailed
+/// check before the head of a loop of its frame's bytecode (`cfg`, the frame's) that got no back
+/// edge in the graph, its one predecessor's, with a state at its pc and no poll to compare the
+/// handlers with (see the module's doc).
 fn speculation(
     graph: &Graph,
     node: &Node,
     dom: &Dominators,
     position: usize,
+    cfg: &Cfg,
 ) -> Result<(), String> {
     let check = match node.reason {
         Some(ExitReason::PhiNotNumber) => node.op == NodeOp::CheckNumber,
@@ -527,8 +546,18 @@ fn speculation(
         return Err("a phi's speculation on a block of other than one successor".into());
     };
     let target = graph.block(header);
-    if !target.loop_header || dom.dominates(header, node.block) {
+    if dom.dominates(header, node.block) {
         return Err("a phi's speculation off a loop's entry edge".into());
+    }
+    if !target.loop_header {
+        // A loop of the bytecode whose back edge the build never reached (see the module's doc):
+        // only a HoistingFailed check, before the loop's head, its one entry.
+        if node.reason != Some(ExitReason::HoistingFailed) || target.preds[..] != [node.block] {
+            return Err("a phi's speculation off a loop's entry edge".into());
+        }
+        if cfg.loop_at_header(target.first_pc as usize).is_none() {
+            return Err("an entry check before a block that heads no loop of its bytecode".into());
+        }
     }
     for &later in &block.body[position - block.phis.len() + 1..] {
         let later = graph.node(later);
@@ -549,12 +578,14 @@ fn speculation(
             state.pc, target.first_pc
         ));
     }
-    let poll = graph
-        .node(target.body[0])
-        .state
-        .map(|poll| &graph.state(poll).handlers);
-    if poll != Some(&state.handlers) {
-        return Err("a phi's speculation with other handlers than its header's".into());
+    if target.loop_header {
+        let poll = graph
+            .node(target.body[0])
+            .state
+            .map(|poll| &graph.state(poll).handlers);
+        if poll != Some(&state.handlers) {
+            return Err("a phi's speculation with other handlers than its header's".into());
+        }
     }
     Ok(())
 }

@@ -544,3 +544,55 @@ fn a_read_its_block_then_stores_to_checks_for_the_store() {
         );
     }
 }
+
+/// zlib's shape (P3 stage 3 step 0c's follow-up): an effect-free loop over a typed array whose
+/// only path to its back edge runs `u[k]`, a read the warm-up never reached (every call left at
+/// the second break), whose empty record the rules lower and whose String key the builder then
+/// cannot take: an exit there (Builder::mismatch, as zlib's at pc 1440), so no back edge is built
+/// and the loop's head, a loop head of the bytecode, is no loop header in the graph. `t`'s entry
+/// checks stand before it.
+const NO_BACK_EDGE: &str = "function zl(t, u, n) { var s = 0, i = 0, k = 'x';
+       for (;;) { if (i >= n) break; s = (s + (t[i] | 0)) | 0; i = (i + 1) | 0;
+         if (i >= n) break; s = (s + (u[k] | 0)) | 0; }
+       return s | 0; }
+     var T = new Int32Array(8);
+     for (var r = 0; r < 20; r++) zl(T, T, 1);";
+const NO_BACK_EDGE_DRIVE: &str = "for (var r = 0; r < 20; r++) zl(T, T, 1);";
+
+#[test]
+fn a_loop_whose_back_edge_is_never_built_keeps_its_entry_checks_and_verifies() {
+    let mut engine = warmed(NO_BACK_EDGE, NO_BACK_EDGE_DRIVE);
+    // graph_of verifies the graph.
+    let (chunk, graph) = graph_of(&mut engine, "zl");
+    let text = dump(&graph, &chunk);
+    assert!(
+        graph.blocks.iter().all(|block| !block.loop_header),
+        "no back edge, no loop header: {text}"
+    );
+    assert!(
+        !nodes(&graph, |op| matches!(op, NodeOp::Exit(_))).is_empty(),
+        "{text}"
+    );
+    let entry = nodes(&graph, |op| matches!(op, NodeOp::TypedData { .. }));
+    let [data] = entry[..] else {
+        panic!("one TypedData: {text}")
+    };
+    assert_eq!(data.reason, Some(ExitReason::HoistingFailed), "{text}");
+    let block = &graph.blocks[data.block.index()];
+    let [head] = block.succs[..] else {
+        panic!("one successor: {text}")
+    };
+    let head_pc = graph.blocks[head.index()].first_pc;
+    let cfg = crate::jit_ir::Cfg::build(&chunk).expect("its Cfg");
+    assert!(cfg.loop_at_header(head_pc as usize).is_some(), "{text}");
+    assert_eq!(
+        graph.state(data.state.expect("a state")).pc,
+        head_pc,
+        "{text}"
+    );
+    // The verifier's rule: such a check stands only before a loop head of the bytecode.
+    let mut broken = graph.clone();
+    broken.blocks[head.index()].first_pc = head_pc + 1;
+    let error = verify(&broken, &chunk).expect_err("a block that heads no loop");
+    assert!(error.contains("heads no loop of its bytecode"), "{error}");
+}
