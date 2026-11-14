@@ -208,6 +208,15 @@ fn clear(live: &mut [u64], slot: u16) {
     }
 }
 
+/// Add the slots `op` may read to `read` (one bit per slot, every slot of `all` for an operation
+/// that may read any): `transfer`'s reads from no slot live after it, in `scratch` (P3 stage 3
+/// step 0's loop prepass). The three are as long.
+pub(crate) fn add_reads(op: &Op, read: &mut [u64], scratch: &mut [u64], all: &[u64]) {
+    scratch.fill(0);
+    transfer(op, scratch, all);
+    union(read, scratch);
+}
+
 /// The slots live before `op` from those live after it (`all`: every slot).
 fn transfer(op: &Op, live: &mut [u64], all: &[u64]) {
     match *op {

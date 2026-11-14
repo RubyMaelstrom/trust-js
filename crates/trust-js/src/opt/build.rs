@@ -13,9 +13,9 @@
 //!   the header when nothing in the loop can be an effect, and is in the frame at the header
 //!   otherwise (an effect leaves every slot in the frame); whether an operation can be one is the
 //!   builder's own choice of its form ([`Rules`], stage 2 step 4), which the builder keeps to.
-//!   Where such a loop is entered with the slot in the frame's keeping, its value is loaded once
-//!   at the end of each entry predecessor and held through the loop, the frame still holding it
-//!   (P3 stage 3 step 0, `Builder::invariant`). A header's poll opens its body, with the
+//!   Where such a loop reads such a slot and is entered with it in the frame's keeping, its value
+//!   is loaded once at the end of each entry predecessor and held through the loop, the frame
+//!   still holding it (P3 stage 3 step 0, `Builder::invariant`). A header's poll opens its body, with the
 //!   header's state, once a back edge reaches it.
 //! - Liveness (stage 2 step 6): a slot dead at a pc is Dead in its frame states, no join merges
 //!   it, no flush writes it, and no value holds it after an effect.
@@ -608,6 +608,8 @@ struct Flow {
 struct Loop {
     /// The slots a native write in the loop assigns (StoreLocal, UpdateLocal, Tdz, ResetSlots).
     written: Vec<bool>,
+    /// The slots an operation of the loop may read (`liveness::add_reads`).
+    read: Vec<bool>,
     /// Whether an operation of the loop may lower to an effect, after which every slot is in the
     /// frame.
     effects: bool,
@@ -693,6 +695,15 @@ impl Flow {
         let mut heads = vec![None; blocks.len()];
         let mut loops = Vec::new();
         let mut member = vec![false; rpo.len()];
+        // The read sets' words: every slot of the frame, and the scratch an operation's takes.
+        let words = n_slots.div_ceil(64).max(1);
+        let all: Vec<u64> = (0..words)
+            .map(|word| match n_slots.saturating_sub(64 * word).min(64) {
+                64 => u64::MAX,
+                bits => (1u64 << bits) - 1,
+            })
+            .collect();
+        let mut scratch = vec![0u64; words];
         for (header, latches) in latches.iter().enumerate() {
             if latches.is_empty() {
                 continue;
@@ -715,11 +726,14 @@ impl Flow {
             }
             let mut found = Loop {
                 written: vec![false; n_slots],
+                read: Vec::new(),
                 effects: false,
             };
+            let mut read = vec![0u64; words];
             for index in body {
                 let block = &blocks[ix(rpo[index])];
                 for pc in block.start..block.end {
+                    super::liveness::add_reads(&ops[pc], &mut read, &mut scratch, &all);
                     let writes = match ops[pc] {
                         Op::StoreLocal(slot) | Op::UpdateLocal(slot, _) | Op::Tdz(slot) => {
                             slot as usize..slot as usize + 1
@@ -739,6 +753,9 @@ impl Flow {
                     }
                 }
             }
+            found.read = (0..n_slots)
+                .map(|slot| read[slot / 64] & (1 << (slot % 64)) != 0)
+                .collect();
             heads[ix(rpo[header])] = Some(loops.len());
             loops.push(found);
         }
@@ -2151,15 +2168,16 @@ impl<'a> Builder<'a> {
         (Slot::Dirty(phi), Some(phi))
     }
 
-    /// An effect-free loop's live `slot` that the loop does not write and that its entry edges
-    /// leave in their frames (`merge_slot`'s Frame), at the loop's header (P3 stage 3 step 0): its
-    /// value at the end of each entry predecessor (`value_at_end`, a load where the frame holds
-    /// it, as a written slot's phi inputs are taken), held Clean, the one value or a phi of the
-    /// entries' values (its back edges' inputs itself), so that the loop reads one SSA value and
-    /// never reloads it. Clean because each entry's frame holds the value it gives, which nothing
-    /// in the loop writes: the loop's frame states keep the slot in the frame's keeping. The one
-    /// entry edge's load is noted for the selector, which moves its checks in the loop to that
-    /// edge (`opt::phis`).
+    /// An effect-free loop's live `slot` that the loop reads and does not write and that its entry
+    /// edges leave in their frames (`merge_slot`'s Frame), at the loop's header (P3 stage 3 step
+    /// 0): its value at the end of each entry predecessor (`value_at_end`, a load where the frame
+    /// holds it, as a written slot's phi inputs are taken), held Clean, the one value or a phi of
+    /// the entries' values (its back edges' inputs itself), so that the loop reads one SSA value
+    /// and never reloads it. Clean because each entry's frame holds the value it gives, which
+    /// nothing in the loop writes: the loop's frame states keep the slot in the frame's keeping.
+    /// A slot only read after the loop stays in the frame, which holds it at no cost where an SSA
+    /// value would take a register or a spill slot through the loop. The one entry edge's load is
+    /// noted for the selector, which moves its checks in the loop to that edge (`opt::phis`).
     fn invariant(
         &mut self,
         block: BlockIx,
@@ -2229,7 +2247,7 @@ impl<'a> Builder<'a> {
                 slots.push(Slot::Frame);
             } else {
                 let (mut merged, mut phi) = self.merge_slot(block, &mut preds, slot, pc);
-                if merged == Slot::Frame {
+                if merged == Slot::Frame && lp.read[slot] {
                     (merged, phi) = self.invariant(block, &mut preds, slot, pc);
                 }
                 if let Some(phi) = phi {

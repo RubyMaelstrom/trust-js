@@ -4284,6 +4284,42 @@ fn an_effect_free_loops_invariant_slots_are_loaded_once_on_its_entry() {
 }
 
 #[test]
+fn a_slot_read_only_after_the_loop_stays_in_the_frame_through_it() {
+    // `b` is live at the header but only the return reads it: it stays in the frame through the
+    // loop (no load at the entry, none in the loop) and is read back after it; `a`, which the
+    // loop reads, is loaded at the entry.
+    let mut engine = warmed(
+        "function after(g, a, b, n) { var s = 0; g();
+           for (var i = 0; i < n; i++) s = s + a; return s + b; }
+         function nothing() {}
+         for (var r = 0; r < 20; r++) after(nothing, 1.5, 2.5, 10);",
+        "for (var r = 0; r < 20; r++) after(nothing, 1.5, 2.5, 10);",
+    );
+    let (chunk, graph) = graph_of(&mut engine, "after");
+    let text = dump(&graph, &chunk);
+    let lp = loop_at(&graph, the_loop(&graph));
+    let [entry] = lp.entries[..] else {
+        panic!("one entry edge: {text}")
+    };
+    let [load_a] = loads_of(&graph, &chunk, "a")[..] else {
+        panic!("one load of a: {text}")
+    };
+    assert_eq!(graph.node(load_a).block.index(), entry, "{text}");
+    let [load_b] = loads_of(&graph, &chunk, "b")[..] else {
+        panic!("one load of b: {text}")
+    };
+    let block = graph.node(load_b).block.index();
+    assert!(block != entry && !lp.members[block], "{text}");
+    let b = slot_named(&chunk, "b") as usize;
+    let poll = graph.node(graph.blocks[lp.header].body[0]);
+    assert_eq!(
+        graph.state(poll.state.expect("a poll's state")).slots[b],
+        SlotSource::Frame,
+        "{text}"
+    );
+}
+
+#[test]
 fn an_effect_free_loops_invariant_checks_move_to_its_entry() {
     // The checks in the loop of the loaded `a` and `n` move to the end of the entry predecessor
     // (CheckNumber of `a`, CheckNumber and CheckInt32 of `n`; HoistingFailed, exiting at the
