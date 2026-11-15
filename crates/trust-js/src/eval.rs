@@ -3191,6 +3191,40 @@ impl Interp {
         }
     }
 
+    /// [`Interp::ordinary_chain_get_data`] of an array index (ECMA-262 §6.1.7: an integer in
+    /// 0..2^32-1, a Number key's ToPropertyKey), keyed by the index itself: each object's own
+    /// element words, then its named entries where it holds index keys there
+    /// ([`crate::value::Props::get_index`]), with no decimal text and no text-keyed lookup, as
+    /// V8's LookupIterator walks the holders by index (objects/lookup-inl.h:40-52,
+    /// objects/lookup.cc:78-125), JSC's getPropertySlot by index asks each object's
+    /// getOwnPropertySlotByIndex (runtime/JSObjectInlines.h:244-272) and SpiderMonkey's
+    /// NativeGetElement looks the index up as an integer id along the native chain
+    /// (vm/NativeObject.cpp:2392-2407, 2322-2376). The same objects as the text-keyed walk's
+    /// (an `ic_plain` ordinary object or Array) and the same answers: `None` for an accessor or
+    /// any other object, where the caller takes today's path.
+    pub(crate) fn ordinary_chain_get_index(start: &Gc, index: u32) -> Option<Value> {
+        let mut current = *start;
+        loop {
+            let next = {
+                let object = current.borrow();
+                if !object.ic_plain()
+                    || !(object.kind.is_ordinary()
+                        || matches!(object.kind, crate::value::ObjectKind::Array))
+                {
+                    return None;
+                }
+                if let Some(property) = object.props.get_index(index) {
+                    return (!property.accessor()).then(|| property.value());
+                }
+                object.proto
+            };
+            match next {
+                Some(prototype) => current = prototype,
+                None => return Some(Value::Undefined),
+            }
+        }
+    }
+
     /// OrdinaryGet (ECMA-262 §10.1.8.1) of a String key along a prototype chain of ordinary
     /// objects and Arrays, as far as it runs no author code: `Some(value)` of the first data
     /// property found, `Some(undefined)` when no object on the chain has the key, `None` for an

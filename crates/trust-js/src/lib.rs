@@ -116,6 +116,8 @@ mod gc_pacing_tests;
 #[cfg(test)]
 mod gc_test;
 #[cfg(test)]
+mod index_miss_tests;
+#[cfg(test)]
 mod payload_cell_tests;
 mod rooting;
 

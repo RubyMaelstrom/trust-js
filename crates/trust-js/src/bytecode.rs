@@ -29403,6 +29403,16 @@ fn get_computed_element(
         _ => {}
     }
     record_element_miss(chunk, pc, obj, key);
+    // An array index (a Number key that is one, -0 included) absent from the receiver's own
+    // elements, or one of its holes or named index entries, along a chain of ordinary objects:
+    // walked by the index itself (`ordinary_chain_get_index`), not by its decimal text.
+    if let (ValueView::Obj(object), ValueView::Num(index)) = (&(obj).view(), &(key).view()) {
+        if index.trunc() == *index && (0.0..u32::MAX as f64).contains(index) {
+            if let Some(value) = Interp::ordinary_chain_get_index(object, *index as u32) {
+                return Ok(value);
+            }
+        }
+    }
     // ToPropertyKey of an integral Number is its decimal text, and of a Symbol its encoded
     // key; skip the temporary strings. The Symbol stays owned by `key` during the read.
     if let Some(text) = key.as_num_opt().and_then(crate::value::KeyText::integer) {
