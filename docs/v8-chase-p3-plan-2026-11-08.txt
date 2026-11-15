@@ -5098,3 +5098,82 @@ the collector read the slot as before.
   pay a store-to-load trip at their first read), then the victims' choice by weighted next use
   (through zlib's inner loops 6.5 of 21 x registers hold values live through the loop and not
   read in it while its invariants are spilled).
+
+Stage 3 step L4 landed (6ad38b23, 2026-11-15; target/p3/stage3/stepL4-impl, design-note.txt and
+report.txt): a typed-array store keeps the embedder's book (the buffer's dirty interval and
+write count, read through array_buffer_version and take_array_buffer_dirty_ranges) only for a
+buffer an embedder has observed.
+- What it was. Allocator R1's profile of zlib's hottest function found the store's bookkeeping
+  above its spill loads. Counted: after every native typed store, 13 instructions (the view's
+  offset and buffer, the interval's two loads, compares and rare stores, the count's load, add
+  and store); with the tier on 10.0% of zlib's instructions, 7.5% of Mandreel's, 1.9% of
+  GBEMU's, 0.7% of PdfJS's; the count's three a store-to-load chain from each store to the next
+  (20.7% of the cycle samples of zlib's a8, 38.6% of Mandreel's setAabb). No embedder calls
+  either function (TRust at 8bd6b3f, TRust-release-0.3, trust-sb; TRust's removed
+  lumen_wasm.rs read the version right after creating each buffer and compared it for
+  equality), and nothing inside the engine reads the book.
+- The form. The exemplars keep no such book; their per-store bookkeeping is the write barrier,
+  which tests whether a store is interesting before it keeps anything (V8's page flags before
+  RecordWrite, macro-assembler-arm64.cc:4425-4436; JSC's cell-state branch,
+  AssemblyHelpers.h:1261-1285; SpiderMonkey's nursery tests, CodeGenerator.cpp:6070-6102). Here
+  the interest is an embedder's: a buffer's `observed` flag, set by its first observation
+  through either function and never cleared. Before it no write keeps a book: the template's
+  stub tests the byte first (two instructions), the VM's and the builtins' mark_dirty_range
+  returns.
+- The tier, in V8's protector form. While no buffer of the Agent has been observed (a bit the
+  snapshot reads on the main thread), a store's TypedData tests the buffer's flag, an exit of
+  its own reason, ObservedBuffer, and its stores keep no book: in a loop whose typed array step
+  0c holds, the test is one of the entry checks and the loop's stores do nothing more, as V8's
+  typed stores carry no detach or immutability test while its ArrayBufferDetaching and
+  ArrayBufferMutable protectors hold (js-native-context-specialization.cc:4093-4105). Once any
+  buffer was observed, every compile makes each store test its own buffer's flag and keep
+  today's exact book out of line where it is set, as V8's code carries the test at each access
+  once a protector fell; code made before the first observation is discarded once.
+- What the first build taught (the policy's, kept for step 4p): with the flag's exit as the
+  only teacher, every buffer observed made zlib 291% slower and Mandreel 41%: a function of many
+  store sites was discarded once a site (the first failing check ends each activation's stay in
+  the code, so later sites never exit and are never flagged), R grew and the warm-ups went
+  exponential. A speculation without a record needs a compile-time input; the protector bit is
+  that input.
+- The review's hazard, fixed here: a64.rs's exit_for made a node's second-reason record through
+  `exit`, which attached a moved check's site list (step L1c) to every record of the node, so an
+  entry TypedData's ObservedBuffer exit would have flagged its Detached sites; exit_for now
+  takes the list back, held by a do-while test (a for loop's site is blind and hid it).
+- The embed API's contract, changed, for the owner to accept: a buffer's first observation, by
+  either function, is the embedder's baseline: it marks the whole buffer dirty and leaves the
+  generation as it is; from then on the ranges and the count are exactly as before (the count
+  still counts stores). An embedder that observes a buffer when it makes it sees no difference;
+  one that first observes it later gets the whole buffer in its first take. Two tests changed
+  for it (the native write test observes first; the mirror API test's first take is the whole
+  buffer).
+- Measured (fat LTO). Instructions at 5 fixed runs (my recount of 6ad38b23 against 71ebd5ef,
+  merge-check/counts-l4.out, the agent's to the digit): with the tier on zlib -10.17%, Mandreel
+  -7.24%, GBEMU -1.82%, PdfJS -0.67%, Octane's geomean -1.36% (the floor with no book at all:
+  -10.5%, -7.7%, -1.9%, -0.6%); with the tier off zlib -2.64%, Mandreel -2.31%, GBEMU -1.03%,
+  PdfJS -0.45%, geomean -0.43%; nothing else moves beyond its modes. Cycles at fixed work on
+  one X925 core (the agent's, five rounds), by what the embedder does:
+    nothing observed:                    zlib -8.34%, Mandreel -8.56%, GBEMU -2.19%, PdfJS -0.72%
+    every buffer observed when made:     zlib +1.15%, Mandreel +1.28%, GBEMU +0.11%, PdfJS -0.07%
+    an unrelated buffer observed first:  zlib -7.47%, Mandreel -7.13%, GBEMU -2.56%, PdfJS -0.93%
+  (an observed buffer's store runs 16 instructions where it ran 13: the flag's load, its branch
+  and the branch back). Mine with nothing observed (five rounds at 5 runs, merge-check/
+  cycles-l4.out): zlib -8.34%, Mandreel -8.27%, GBEMU -2.33%, PdfJS -1.01%, zlib with the tier
+  off -1.96%; the controls within 0.2% but Vue's steady state -1.4% with the tier on and off
+  alike (layout). Every live buffer observed a second into the run: one discard a
+  function that stores (zlib 3, GBEMU 6), zlib's 5 runs +12.2% for the recompiles' warm-ups.
+- Tests: opt::observed_tests, nine (the book exact for an observed buffer in the VM, the
+  template and the tier at splice and at graph, with forced exits and under the poison; an
+  unobserved buffer keeps none and its first observation is the baseline; a warmed loop whose
+  buffer is then observed exits at its header alone, one discard, the entry check still moved;
+  a host function observing from inside the loop; two receivers in one loop; the two flags
+  through a view made later, a transfer, a copy, a detach, a resize and a SharedArrayBuffer; an
+  observation before the first compile, a late one, and one between a compile's snapshot and
+  its install). 20 mutations, 19 caught, one equivalent under the protector. The
+  verifier sweep (mine on the landed binary: 42 runs, none refused; the agent's with every
+  buffer observed too); the poison (42 fixture runs the tier off's output); fmt, clippy;
+  zombie's check, clippy, Windows' check and x86-64 suite (2,891). The agent's whole-suite
+  matrix (13 legs), its 200-run counts and the late case's steady state were still running
+  when this was written.
+- Next from the same counts, not built: the count as a plain mark inside the observed path (the
+  chain gone for a tracked buffer too; it would change the count's meaning: an owner's fork if
+  an embedder ever needs it).
