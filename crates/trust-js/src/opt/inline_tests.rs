@@ -2312,3 +2312,149 @@ fn an_accessor_replaced_or_recompiled_while_an_inlined_frame_calls_it_directly_k
     let runs = counted(DIRECT_ACCESSOR_RECOMPILES, 7, false, false);
     assert_eq!(runs[2].0, runs[0].0, "an exit every 7 checks");
 }
+
+/// Callers of inlined accessor reads and stores (GetPropThis, SetPropThisDrop, GetPropLocal,
+/// SetPropLocalDrop), warmed so that each calls its getter or setter directly; a trigger that
+/// reports the error a call of one of them throws, with its stack; and a reference whose
+/// accessor throws its own error (`bad`), whose stack places the caller's frame at the inlined
+/// call.
+const END_POLL_WARM: &str = "
+function M(v) { this.v = v; }
+Object.defineProperty(M.prototype, 'w', {
+  get: function getter() { if (this.boom) throw new TypeError('boom'); return this.v + 1; },
+  set: function setter(z) { if (this.boom) throw new TypeError('boom'); this.v = z; } });
+M.prototype.rw = function rw() { return this.w; };
+M.prototype.ww = function ww(z) { this.w = z; };
+function loc(o) { var q = o; return q.w; }
+function sloc(o, z) { var q = o; q.w = z; }
+function c1(m, n) { var s = 0; for (var i = 0; i < n; i++) s += m.rw(); return s; }
+function c2(m, n) { for (var i = 0; i < n; i++) m.ww(i); return m.v; }
+function c3(m, n) { var s = 0; for (var i = 0; i < n; i++) s += loc(m); return s; }
+function c4(m, n) { for (var i = 0; i < n; i++) sloc(m, i); return m.v; }
+function c5(m, n) { var s = 0;
+  for (var i = 0; i < n; i++) { try { s += m.rw(); } catch (e) { return 'caught ' + e.name + '|' + e.stack.split('\\n').slice(0, 4).join('/'); } }
+  return s; }
+var m = new M(1), r = 0;
+for (var k = 0; k < 300; k++) r += c1(m, 10) + c2(m, 10) + c3(m, 10) + c4(m, 10) + c5(m, 10);
+function trig(f) { try { return 'none:' + f(m, 3); }
+  catch (e) { return e.name + ':' + e.message + '|' + e.stack.split('\\n').slice(0, 4).join('/'); } }
+var bad = new M(1); bad.boom = true;
+function ref(f) { try { return 'none:' + f(bad, 1); }
+  catch (e) { return e.name + ':' + e.message + '|' + e.stack.split('\\n').slice(0, 4).join('/'); } }
+r";
+
+/// The live-object limit's RangeError raised at the end poll of an inlined frame's property node
+/// after its getter or setter returned through the helper stub's direct sequence (P3 stage 3 step
+/// 3c-2's review; `jit::arm_end_poll_limit`, a test-only request that makes that poll's
+/// `gc_check` find the ceiling passed, since no real shape pins which poll first sees it). The
+/// poll helper places no error (`jit_interrupt`): the stack is what `capture_stack_trace` finds
+/// from `Interp::call_site`. After the variant put the node's site back there it names the
+/// inlined callee's frame, reported at its start as a frame whose position is pending is, and the
+/// compiled frame at the inlined call, the position the reference's error (the accessor's own,
+/// with the tier off) gives the caller's frame. Neither the tier off nor the splice gives the
+/// same stack to compare: the tier off's template code for these callees has no end poll at the
+/// site (the request raises the error at its next poll, only checked to be caught), and the
+/// splice's spliced body publishes nothing at its end poll (its stack starts at the compiled
+/// frame, reported at its start: shown, not asserted).
+#[test]
+fn an_error_at_the_end_poll_after_a_direct_accessor_call_has_the_inlined_frame() {
+    const TRIGGERS: [&str; 5] = ["trig(c1)", "trig(c2)", "trig(c3)", "trig(c4)", "c5(m, 3)"];
+    let run = |switches: TestSwitches, any: bool, refs: bool| -> Vec<String> {
+        switches.set();
+        let mut engine = jit_engine();
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow_mut()
+            .set_incremental(crate::gc_core::IncrementalMode::Off);
+        eval(&mut engine, END_POLL_WARM);
+        if refs {
+            return ["ref(c1)", "ref(c2)", "ref(c3)", "ref(c4)"]
+                .iter()
+                .map(|reference| eval(&mut engine, reference))
+                .collect();
+        }
+        TRIGGERS
+            .iter()
+            .map(|trigger| {
+                crate::jit::arm_end_poll_limit(any);
+                let got = eval(&mut engine, trigger);
+                assert!(
+                    !crate::jit::take_end_poll_limit(crate::jit::POLL_HELPER_END),
+                    "the request fell due and no poll took it: {got}"
+                );
+                got
+            })
+            .collect()
+    };
+    let refs = run(TestSwitches::default(), false, true);
+    let off = run(TestSwitches::default(), true, false);
+    for got in &off {
+        assert!(got.contains("RangeError"), "the tier off: {got}");
+    }
+    let splice = run(
+        TestSwitches {
+            inline_graph: Some(false),
+            ..graph_switches(0)
+        },
+        false,
+        false,
+    );
+    for got in &splice {
+        assert!(got.contains("RangeError"), "splice: {got}");
+    }
+    inlined_generic();
+    let graph = run(graph_switches(0), false, false);
+    let lines = |text: &str| -> Vec<String> {
+        text.split('|')
+            .nth(1)
+            .unwrap_or("")
+            .split('/')
+            .map(str::to_string)
+            .collect()
+    };
+    for (k, (callee, caller)) in [("rw", "c1"), ("ww", "c2"), ("loc", "c3"), ("sloc", "c4")]
+        .iter()
+        .enumerate()
+    {
+        let (got, reference) = (lines(&graph[k]), lines(&refs[k]));
+        assert!(
+            graph[k].starts_with("RangeError:allocation limit exceeded|"),
+            "graph: {}",
+            graph[k]
+        );
+        assert!(
+            got[1].starts_with(&format!("    at {callee} (")),
+            "graph names the inlined callee: {} (splice: {})",
+            graph[k],
+            splice[k]
+        );
+        let call = reference
+            .iter()
+            .find(|line| line.starts_with(&format!("    at {caller} (")))
+            .unwrap_or_else(|| panic!("the reference: {}", refs[k]));
+        assert_eq!(
+            &got[2], call,
+            "the compiled frame at the inlined call: {}",
+            graph[k]
+        );
+    }
+    assert!(graph[4].starts_with("caught RangeError|"), "{}", graph[4]);
+    assert!(
+        lines(&graph[4])[1].starts_with("    at rw ("),
+        "{}",
+        graph[4]
+    );
+    let ops = inlined_generic();
+    for kind in [
+        |op: &Op| matches!(op, Op::GetPropThis(..)),
+        |op: &Op| matches!(op, Op::SetPropThisDrop(..)),
+        |op: &Op| matches!(op, Op::GetPropLocal(..)),
+        |op: &Op| matches!(op, Op::SetPropLocalDrop(..)),
+    ] {
+        assert!(ops.iter().any(kind), "{ops:?}");
+    }
+    // The splice's and the tier off's, for the record (`--nocapture`).
+    println!("splice {splice:?}\noff {off:?}\ngraph {graph:?}");
+}

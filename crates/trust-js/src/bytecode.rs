@@ -32411,7 +32411,27 @@ pub(crate) unsafe extern "C" fn jit_interrupt(
         let past = live.saturating_sub(i.gc_heap.agent.next.get()).max(0);
         (core.collections(), core.budget_overshoot(), past)
     };
+    // Tests: the live-object limit's RangeError forced at the end poll a test asked for
+    // (`jit::arm_end_poll_limit`), the ceiling passed for this poll's `gc_check` only.
+    #[cfg(all(
+        test,
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    let forced = crate::jit::take_end_poll_limit(_imm).then(|| {
+        let limit = i.gc_heap.agent.limit.get();
+        i.set_agent_limit(0);
+        limit
+    });
     let result = i.interrupt_poll_force().and_then(|()| i.gc_check());
+    #[cfg(all(
+        test,
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    if let Some(limit) = forced {
+        i.set_agent_limit(limit);
+    }
     ctx.poll_top = std::ptr::null();
     #[cfg(test)]
     {

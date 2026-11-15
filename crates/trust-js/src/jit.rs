@@ -9118,14 +9118,15 @@ fn emit_consume_published_site(
 }
 
 /// `Interp::call_site` the published position again (see [`emit_consume_published_site`]), as the
-/// interpreter's frame pop restores it, where the stub reads it before the node's own restore
+/// interpreter's frame pop restores it, where something reads it before the node's own restore
 /// (`opt::a64`'s `restore_context`, on its return and its unwind) writes NO_POSITION: on the
-/// direct sequence's decline, before the plain helper's call takes it for the accessor's frame,
-/// and after the trap's return, before its invariant check's error captures its stack from it.
-/// After a getter's or setter's return and after any throw nothing reads it before then: the
-/// site's end poll runs no JavaScript and raises no error (an interrupt is a control completion,
-/// `crate::interrupt`), and `jit_accessor_threw` places the error by the chunk's position. Clobbers
-/// x16 and x17.
+/// direct sequence's decline, before the plain helper's call takes it for the accessor's frame;
+/// after a getter's, a setter's and a trap's return, before the trap's invariant check or the
+/// site's end poll creates an error that captures its stack from it (the poll's `gc_check`
+/// throws the live-object limit's RangeError: P3 stage 3 step 3c-2's review), so that the state
+/// after any direct accessor's return is the helper path's. After a throw nothing reads it before
+/// the node's unwind restores the context: `jit_accessor_threw` places the error by the chunk's
+/// position. Clobbers x16 and x17.
 #[cfg(all(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -9173,6 +9174,83 @@ extern "C" fn record_inlined_accessor_call(event: usize) {
 ))]
 pub(crate) fn take_inlined_accessor_calls() -> [u64; 6] {
     INLINED_ACCESSOR_CALLS.with(|calls| calls.replace([0; 6]))
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    /// The live-object limit's RangeError forced at a site's end poll (tests; P3 stage 3 step
+    /// 3c-2's review): 1 armed, waiting for a getter or setter a helper stub calls directly to
+    /// return; 2 due at the next `POLL_HELPER_END` poll (3: at the next poll of any kind), whose
+    /// `gc_check` then finds the ceiling passed (`jit_interrupt`).
+    static END_POLL_LIMIT: Cell<u8> = const { Cell::new(0) };
+    /// Whether the armed request is for the next poll of any kind.
+    static ANY_POLL_LIMIT: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Arm [`END_POLL_LIMIT`] (tests): the end poll after the next direct getter's or setter's return,
+/// from the helper stub or its inlined frames' variant (`any`: the next poll of any kind, for code
+/// whose site has no end poll), throws the live-object limit's RangeError.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn arm_end_poll_limit(any: bool) {
+    END_POLL_LIMIT.with(|state| state.set(1));
+    ANY_POLL_LIMIT.with(|flag| flag.set(any));
+}
+
+/// Whether the `kind` poll (`jit_interrupt`'s immediate) is the end poll [`arm_end_poll_limit`]
+/// asked for, disarming it (tests).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn take_end_poll_limit(kind: u32) -> bool {
+    let any = ANY_POLL_LIMIT.with(Cell::get);
+    END_POLL_LIMIT.with(|state| {
+        let due = (any || kind == POLL_HELPER_END) && state.get() == 2;
+        if due {
+            state.set(0);
+        }
+        due
+    })
+}
+
+/// A getter or setter the helper stub called directly returned (tests): an armed
+/// [`END_POLL_LIMIT`] falls due, and the poll word asks the site's end poll for its slow path
+/// (the install bit, whose install finds nothing to install).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+extern "C" fn note_direct_accessor_returned(ctx: *mut JitCtx) {
+    END_POLL_LIMIT.with(|state| {
+        if state.get() == 1 {
+            state.set(2);
+            // SAFETY: the live context of the code that made the access.
+            unsafe { (*(*ctx).interp).poll.request_install() };
+        }
+    });
+}
+
+/// The test builds' note of a direct getter's or setter's return, in the helper stub and its
+/// variant alike ([`note_direct_accessor_returned`]), where nothing but the stub's frame is live.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_direct_accessor_returned_event(a: &mut asm::Asm) {
+    a.mov(0, 19);
+    a.mov_imm64(16, note_direct_accessor_returned as *const () as u64);
+    a.blr(16);
 }
 
 /// The test builds' count of a [`SharedStub::HelperInlined`] direct call (`event`: 0 getter,
@@ -9451,9 +9529,15 @@ fn emit_get_prop_getter(
     a.b(plain);
     // ---- the getter returned: its result replaced the two words ----
     a.bind(returned);
-    #[cfg(test)]
     if inlined {
-        emit_inlined_accessor_event(a, 0);
+        emit_restore_published_site(a, ilayout, PUBLISHED);
+    }
+    #[cfg(test)]
+    {
+        if inlined {
+            emit_inlined_accessor_event(a, 0);
+        }
+        emit_direct_accessor_returned_event(a);
     }
     a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 0, 0);
@@ -10134,9 +10218,15 @@ fn emit_set_prop_setter(
     a.b(plain);
     // ---- the setter returned: its result replaced the window; the store leaves none ----
     a.bind(returned);
-    #[cfg(test)]
     if inlined {
-        emit_inlined_accessor_event(a, 1);
+        emit_restore_published_site(a, ilayout, PUBLISHED);
+    }
+    #[cfg(test)]
+    {
+        if inlined {
+            emit_inlined_accessor_event(a, 1);
+        }
+        emit_direct_accessor_returned_event(a);
     }
     a.sub_imm(20, 20, 8);
     a.ldp_post(29, 30, frame_bytes);
