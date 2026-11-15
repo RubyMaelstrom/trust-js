@@ -16,11 +16,12 @@
 //!   lowers for the caller's prepass (`Rules::lowers`): its callees run no effect and write no
 //!   slot of the caller, as Maglev's inner builder adds its effects to its caller's loop's
 //!   (maglev-graph-builder.cc:732-735, 14602-14611), none under E0.
-//! - The guards: way k's is CalleeMatches and a branch where WrongCallee is flagged at the call
-//!   with a guard byte above k (the furthest guard of the site's chain that exited, + 1: a
-//!   splice's guards have pcs of their own, these share the call's), else CheckCallee, which ends
-//!   the chain, as a splice's unflagged guard builds no mismatch edge; after a chain of branches
-//!   only, the generic call.
+//! - The guards (P3 stage 3 step 3f, piece D): each kept way's is CalleeMatches and a branch, the
+//!   next way on its mismatch, but the last's, which is CheckCallee and ends the chain (as a
+//!   splice's unflagged guard builds no mismatch edge) unless WrongCallee is flagged at the call
+//!   with a guard byte above its place (the furthest guard of the site's chain that exited, + 1: a
+//!   splice's guards have pcs of their own, these share the call's) or the site's cache is past
+//!   the plan (`past_plan`), where it too is a test and the generic call follows its mismatch.
 //! - The callee's builder: its frame opened after its parent state (the caller's at the call's pc
 //!   + 1 without its operands, one for the site's ways); its entry state the arguments in its
 //!   formals, missing ones undefined and extras dropped (Maglev's SetArgument and undefined
@@ -60,6 +61,9 @@ pub(crate) struct InlineWay {
     /// Its guard's data: an index among the compiled chunk's view's inline targets, whose
     /// `guard` byte is the way's place in its site + 1.
     pub(crate) target: u32,
+    /// The callee its guard expects, by its handle word (the target's `callee`), which the site's
+    /// cache names its callees by (piece D's `past_plan`).
+    pub(crate) callee: usize,
     /// The callee's first-stage chunk: its index among the compile's callee chunks.
     pub(crate) chunk: u32,
     /// The closure's [[Environment]] (`Env::as_ptr`), the callee's running environment.
@@ -102,7 +106,8 @@ pub(crate) enum InlineOutcome {
         reason: &'static str,
         at: Option<(u32, Op)>,
     },
-    /// After its site's unflagged guard, which passes no call on to it (as a splice's).
+    /// After its site's unflagged guard, which passes no call on to it (as a splice's). It no
+    /// longer arises (piece D): only a site's last kept way can be a check (`Builder::call`).
     Unreached,
 }
 
@@ -173,27 +178,35 @@ impl<'a> Tree<'a> {
     }
 
     /// Whether the graph builds no generic call at site `cache`'s call at `pc` (the compiled
-    /// chunk's, `snapshot` its feedback): one of its kept ways' guards is unflagged, a
-    /// CheckCallee, which ends the site's chain.
-    ///   The ways built up to it run no generic node either (P3 stage 3 step 3c: an inlined
-    ///   frame's generic node may run JavaScript and ends the heap facts, as an effect does).
+    /// chunk's, `snapshot` its feedback): its last kept way's guard is neither flagged nor past
+    /// the plan, a CheckCallee, which ends the site's chain (piece D: every way before it is a
+    /// test; `Builder::call` keeps the same ways and asserts that the two agree).
+    ///   Its built ways run no generic node either (P3 stage 3 step 3c: an inlined frame's
+    ///   generic node may run JavaScript and ends the heap facts, as an effect does).
     pub(super) fn effect_free(&self, cache: u32, pc: usize, snapshot: &Snapshot) -> bool {
         let Some(site) = self.sites.get(&cache) else {
             return false;
         };
+        // Every built way (a declined one is not: the next is its site's) and, after the last,
+        // the generic call where its guard is flagged or the site is past the plan (piece D,
+        // `Builder::call`).
+        let mut last = None;
         for (place, way) in site.ways.iter().enumerate() {
-            // A declined way is not built: the next one is its site's.
             let Ok(analysis) = &self.analyses[way.chunk as usize] else {
                 continue;
             };
             if analysis.generic {
                 return false;
             }
-            if !flagged(snapshot, pc, place) {
-                return true;
-            }
+            last = Some(place);
         }
-        false
+        let kept: Vec<usize> = site
+            .ways
+            .iter()
+            .filter(|way| self.analyses[way.chunk as usize].is_ok())
+            .map(|way| way.callee)
+            .collect();
+        last.is_some_and(|place| !flagged(snapshot, pc, place) && !past_plan(snapshot, pc, &kept))
     }
 
     /// The binding slots the callees of site `cache`'s ways store at static addresses (their
@@ -237,6 +250,21 @@ impl<'a> Tree<'a> {
             .filter_map(|(chunk, analysis)| Some((chunk as u32, analysis.ok()?.cfg)))
             .collect()
     }
+}
+
+/// Whether the call site at `pc` of `snapshot`'s chunk is past its plan, whose built ways expect
+/// the callees `kept` (handle words): its cache megamorphic, or naming a callee none of them is
+/// (P3 stage 3 step 3f, piece D): its last way is then a test, the generic call after it.
+fn past_plan(snapshot: &Snapshot, pc: usize, kept: &[usize]) -> bool {
+    let crate::feedback::SiteView::Call(call) = snapshot.site(pc) else {
+        return false;
+    };
+    call.state == crate::feedback::CallState::Megamorphic
+        || call
+            .ways
+            .iter()
+            .flatten()
+            .any(|target| !kept.contains(&target.callee))
 }
 
 /// Whether the guard of way `place` of the call at `pc` is flagged: WrongCallee at the call, the
@@ -549,7 +577,17 @@ impl<'a> Builder<'a> {
         };
         let mut exits = Exits::default();
         let mut generic = true;
-        for (place, way, analysis) in kept {
+        // Every planned way from the first compile (P3 stage 3 step 3f, piece D; the owner's D7):
+        // each but the last a test and a branch, as Maglev's polymorphic call arms compare each
+        // target (maglev-graph-builder.cc:6038-6125) and JSC's polymorphic call inlining switches
+        // on the callee (dfg/DFGByteCodeParser.cpp:2726-2770); the last a check, as Maglev's last
+        // arm checks (BuildCheckMaps), unless its guard is flagged (WrongCallee past it, as
+        // before) or the site's cache is past the plan (megamorphic, or naming a callee no kept
+        // way names), where it too is a test and the generic call follows.
+        let expected: Vec<usize> = kept.iter().map(|&(_, way, _)| way.callee).collect();
+        let past_plan = past_plan(self.snapshot, pc, &expected);
+        let last = kept.len() - 1;
+        for (k, (place, way, analysis)) in kept.into_iter().enumerate() {
             let note = |outcome| InlineNote {
                 pc: pc as u32,
                 way: place as u8,
@@ -560,7 +598,7 @@ impl<'a> Builder<'a> {
                 self.inline_log.push(note(InlineOutcome::Unreached));
                 continue;
             }
-            if flagged(self.snapshot, pc, place) {
+            if k < last || past_plan || flagged(self.snapshot, pc, place) {
                 // The guard's test, the way on its match and the next way on its mismatch.
                 let matches = self.callee_matches(pc, way.target, st)?;
                 let then_block = self.graph.add_block(pc as u32, false);
@@ -588,8 +626,22 @@ impl<'a> Builder<'a> {
             }
             self.inline_log.push(note(InlineOutcome::Inlined));
         }
+        // The compiled frame's loop prepass read this site as `Tree::effect_free` does, from the
+        // same ways (every way of an analysed callee: none is dropped while building, where a
+        // refusal refuses the compile) and the same last guard: the call lowers there where no
+        // generic call is built here and no built way runs a generic node.
+        debug_assert!(
+            self.inlined.is_some()
+                || tree.effect_free(cache, pc, self.snapshot)
+                    == (!generic
+                        && !site.ways.iter().any(|way| {
+                            matches!(&tree.analyses[way.chunk as usize], Ok(analysis) if analysis.generic)
+                        })),
+            "the loop prepass and the build disagree on the call at pc {pc}"
+        );
         if generic {
-            // Every guard flagged: the call itself after the last mismatch.
+            // The last way a test (its guard flagged, or the site past the plan): the call itself
+            // after its mismatch.
             let mut after = st.clone();
             self.effect(pc, &mut after)?;
             let to = exits.continuation(&mut self.graph, pc);

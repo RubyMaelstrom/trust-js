@@ -441,14 +441,16 @@ fn a_flagged_guard_branches_to_its_next_way_and_the_last_to_the_call() {
             .len(),
         )
     };
-    // Unflagged: the first way's guard exits, ending the chain (as a splice's).
+    // Unflagged: the first way a test, the last way's guard a check that ends the chain (P3
+    // stage 3 step 3f, piece D: every planned way from the first compile; a splice's chain
+    // still checks its first).
     let built = Compile::new(&mut engine, "c7").build();
-    assert_eq!(kinds(&built), (1, 0, 0), "{}", dump(&built.graph));
+    assert_eq!(kinds(&built), (1, 1, 0), "{}", dump(&built.graph));
     assert_eq!(
         outcomes(&built),
-        vec![(0, InlineOutcome::Inlined), (1, InlineOutcome::Unreached)]
+        vec![(0, InlineOutcome::Inlined), (1, InlineOutcome::Inlined)]
     );
-    assert_eq!(built.graph.frames.len(), 1);
+    assert_eq!(built.graph.frames.len(), 2);
     // The first guard exited (its byte 1): it branches, the second exits.
     flag(&chunk, call, ExitReason::WrongCallee, false, 1);
     let built = Compile::new(&mut engine, "c7").build();
@@ -1373,10 +1375,10 @@ fn a_reoptimization_inlines_the_ways_its_first_compile_took() {
 
 #[test]
 fn a_sites_later_guard_leaves_its_own_byte_and_the_reoptimization_branches_there_too() {
-    // Two ways at the first compile: the first's guard exits for the second's callee (its byte
-    // 1); the reoptimization branches there and checks the second; a third callee then exits at
-    // the second guard (its byte 2), and the next reoptimization branches at both, the generic
-    // call after them, as a splice's guards converge one at a time.
+    // Two ways at the first compile, both built (P3 stage 3 step 3f, piece D): the first a
+    // test, the second a check, so the second's callee exits nowhere; a third callee then exits
+    // at the second guard (its byte 2), and the reoptimization, its plan three ways, branches at
+    // both and checks the third, with no further exit.
     graph_switches(0).set();
     let mut engine = jit_engine();
     eval(
@@ -1405,7 +1407,7 @@ fn a_sites_later_guard_leaves_its_own_byte_and_the_reoptimization_branches_there
         ChunkProfile::get(&chunk).map(|profile| profile.inline_ways().len()),
         Some(2)
     );
-    assert_eq!(byte(&chunk), Some(1), "the first guard's exits");
+    assert_eq!(byte(&chunk), None, "no guard's exits");
     eval(
         &mut engine,
         "for (var k = 0; k < 6000; k++) t += site(k % 3 == 0 ? c : k % 3 == 1 ? a : b); t",
@@ -4602,6 +4604,227 @@ fn known_shapes_give_the_tier_offs_results() {
          var t = 0;
          for (var i = 0; i < 300; i++) t += h(r, true) + f(p) + h(p, true) + h4(w, true) + rx4(s[i & 3], true);
          t"
+    );
+    let runs = counted(&source, 0, false, false);
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    assert_eq!(runs[2].0, runs[0].0, "graph");
+    for (exit_every, stress, poison) in [
+        (7, false, false),
+        (1, false, false),
+        (0, true, false),
+        (0, false, true),
+    ] {
+        super::take_poison_faults();
+        let runs = counted(&source, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
+}
+
+// ---- P3 stage 3 step 3f, piece D: every planned way of a site from the first compile -----------
+
+/// Sites of two, three and four callees, every one met before the first compile (`sN` calls
+/// `o.m` with receivers of N classes in turn: named method calls, which the tier's planner plans
+/// with several ways, Maglev's rule), one nested in an inlined frame (`outer` inlines `s3`), and
+/// the callees' sum, the tier off's.
+const WAYS_D: &str = "
+function A1() {} A1.prototype.m = function (x) { return x + 1; };
+function A2() {} A2.prototype.m = function (x) { return x + 20; };
+function A3() {} A3.prototype.m = function (x) { return x + 300; };
+function A4() {} A4.prototype.m = function (x) { return x + 4000; };
+var os = [new A1(), new A2(), new A3(), new A4()];
+function s2(o, i) { return o.m(i); }
+function s3(o, i) { return o.m(i); }
+function s4(o, i) { return o.m(i); }
+function outer(o, i) { return s3(o, i) + 1; }
+var t = 0;
+for (var i = 0; i < 1500; i++) {
+  t += s2(os[i % 2], i) + s3(os[i % 3], i) + s4(os[i % 4], i) + outer(os[i % 3], i);
+}
+t";
+
+/// The graph's guards at the call of `s<N>` (frame `frame`): its tests (CalleeMatches) and checks
+/// (CheckCallee).
+fn call_guards(graph: &Graph, frame: u32) -> (usize, usize) {
+    let of = |is: &dyn Fn(&NodeOp) -> bool| {
+        nodes(graph, |node| node.frame == FrameIx(frame) && is(&node.op)).len()
+    };
+    (
+        of(&|op| matches!(op, NodeOp::CalleeMatches { .. })),
+        of(&|op| matches!(op, NodeOp::CheckCallee { .. })),
+    )
+}
+
+#[test]
+fn every_planned_way_of_a_site_is_built_from_the_first_compile() {
+    let mut engine = warmed(WAYS_D);
+    for (name, ways) in [("s2", 2), ("s3", 3), ("s4", 4)] {
+        let built = Compile::new(&mut engine, name).build();
+        let graph = &built.graph;
+        let notes = &built.inlines;
+        let inlined = notes
+            .iter()
+            .filter(|note| note.outcome == InlineOutcome::Inlined)
+            .count();
+        assert_eq!(inlined, ways, "{name}: {notes:?}\n{}", dump(graph));
+        assert!(
+            !notes
+                .iter()
+                .any(|note| note.outcome == InlineOutcome::Unreached),
+            "{name}: {notes:?}"
+        );
+        // Each way but the last a test, the last a check (no callee outside the plan).
+        assert_eq!(
+            call_guards(graph, 0),
+            (ways - 1, 1),
+            "{name}\n{}",
+            dump(graph)
+        );
+    }
+    // The same at a site nested in an inlined frame: outer inlines s3, whose three ways are
+    // frames nested in its frame.
+    let built = Compile::new(&mut engine, "outer").build();
+    let graph = &built.graph;
+    assert_eq!(call_guards(graph, 1), (2, 1), "outer\n{}", dump(graph));
+    // Results, and no exit at any of the sites once compiled.
+    let expected = {
+        TestSwitches::default().set();
+        let mut off = jit_engine();
+        eval(&mut off, WAYS_D)
+    };
+    settled_graph_switches().set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, WAYS_D), expected);
+    for (name, ways) in [("s2", 2), ("s3", 3), ("s4", 4), ("outer", 1)] {
+        let chunk = chunk_of(&mut engine, name);
+        assert!(super::in_place(&chunk), "{name} in place");
+        assert_eq!(
+            ChunkProfile::get(&chunk).map(|profile| profile.inline_ways().len()),
+            Some(ways),
+            "{name}'s kept ways"
+        );
+    }
+    inlined_exits();
+    let more = eval(
+        &mut engine,
+        "var u = 0; for (var i = 0; i < 300; i++) u += s2(os[i % 2], i) + s3(os[i % 3], i) + s4(os[i % 4], i) + outer(os[i % 3], i); u",
+    );
+    assert!(!more.starts_with("throw"), "{more}");
+    for name in ["s2", "s3", "s4", "outer"] {
+        let chunk = chunk_of(&mut engine, name);
+        assert_eq!(
+            ChunkProfile::get(&chunk).map_or(0, ChunkProfile::discards),
+            0,
+            "{name}: no discard"
+        );
+    }
+    let callee_exits: Vec<_> = inlined_exits()
+        .into_iter()
+        .filter(|&(_, _, reason)| reason == ExitReason::WrongCallee)
+        .collect();
+    assert!(callee_exits.is_empty(), "{callee_exits:?}");
+}
+
+#[test]
+fn a_callee_met_after_the_compile_exits_at_the_last_check_and_is_planned_next() {
+    settled_graph_switches().set();
+    let mut engine = jit_engine();
+    eval(&mut engine, WAYS_D);
+    let s2 = chunk_of(&mut engine, "s2");
+    assert!(super::in_place(&s2), "s2 in place");
+    // A2's method replaced: s2's last way's check (A2's way, behind A1's test) exits until the
+    // code is discarded; the next compile plans the new method too (the tier's planner takes
+    // every callee of a named method call, up to four), its three ways two tests and a check,
+    // with no exit.
+    let out = eval(
+        &mut engine,
+        "A2.prototype.m = function (x) { return x + 50000; };
+         var u = 0; for (var i = 0; i < 2000; i++) u += s2(os[i % 2], i); u",
+    );
+    assert!(!out.starts_with("throw"), "{out}");
+    assert_eq!(ChunkProfile::get(&s2).map_or(0, ChunkProfile::discards), 1);
+    let built = Compile::new(&mut engine, "s2").build();
+    assert_eq!(
+        call_guards(&built.graph, 0),
+        (2, 1),
+        "{}",
+        dump(&built.graph)
+    );
+    inlined_exits();
+    let out = eval(
+        &mut engine,
+        "var u = 0; for (var i = 0; i < 600; i++) u += s2(os[i % 2], i); u",
+    );
+    assert!(!out.starts_with("throw"), "{out}");
+    assert_eq!(
+        ChunkProfile::get(&s2).map_or(0, ChunkProfile::discards),
+        1,
+        "converged"
+    );
+}
+
+#[test]
+fn a_site_past_its_plan_tests_every_way_and_calls_the_rest_generically() {
+    // Four classes at one site, one of whose methods is a native the plan has no way for: the
+    // cache names a callee past the plan, so every way is a test and the native takes the
+    // generic call after them.
+    let source = "
+        function B1() {} B1.prototype.m = function (x) { return x + 1; };
+        function B2() {} B2.prototype.m = function (x) { return x + 20; };
+        function B3() {} B3.prototype.m = function (x) { return x + 300; };
+        function B4() {} B4.prototype.m = Math.abs;
+        var bs = [new B1(), new B2(), new B3(), new B4()];
+        function s5(o, i) { return o.m(i); }
+        var t = 0; for (var i = 0; i < 1500; i++) t += s5(bs[i % 4], i); t";
+    let mut engine = warmed(source);
+    let s5 = chunk_of(&mut engine, "s5");
+    let call = pc_of(&s5, |op| matches!(op, Op::CallWithThis(..)));
+    let view = super::snapshot::call_site(&s5, call as usize).expect("s5's call view");
+    assert_eq!(view.ways.iter().flatten().count(), 4, "{view:?}");
+    let built = Compile::new(&mut engine, "s5").build();
+    let inlined = built
+        .inlines
+        .iter()
+        .filter(|note| note.outcome == InlineOutcome::Inlined)
+        .count();
+    assert_eq!(
+        call_guards(&built.graph, 0),
+        (inlined, 0),
+        "{:?}\n{}",
+        built.inlines,
+        dump(&built.graph)
+    );
+    assert!(inlined >= 2, "{:?}", built.inlines);
+    assert!(
+        built.graph.nodes.iter().any(|node| matches!(
+            node.op,
+            NodeOp::Effect { pc, .. } | NodeOp::Generic { pc, .. } if pc == call
+        )),
+        "the generic call after the last test\n{}",
+        dump(&built.graph)
+    );
+    // Live: no exit at the site, no discard.
+    settled_graph_switches().set();
+    let mut engine = jit_engine();
+    eval(&mut engine, source);
+    inlined_exits();
+    eval(
+        &mut engine,
+        "for (var i = 0; i < 600; i++) t += s5(bs[i % 4], i); t",
+    );
+    let s5 = chunk_of(&mut engine, "s5");
+    assert_eq!(ChunkProfile::get(&s5).map_or(0, ChunkProfile::discards), 0);
+}
+
+#[test]
+fn every_planned_way_gives_the_tier_offs_results() {
+    let source = format!(
+        "{WAYS_D}; var u = 0; for (var i = 0; i < 300; i++) u += s2(os[i % 2], i) + outer(os[i % 3], i) + s4(os[i % 4], i);
+         A2.prototype.m = function (x) {{ return x + 50000; }};
+         for (var i = 0; i < 300; i++) u += s2(os[i % 2], i) + outer(os[i % 3], i) + s4(os[i % 4], i); t + u"
     );
     let runs = counted(&source, 0, false, false);
     assert_eq!(runs[1].0, runs[0].0, "splice");

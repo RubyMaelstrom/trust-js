@@ -381,6 +381,7 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
         Some((
             InlineWay {
                 target,
+                callee: crate::bytecode::stored_word(way.obj),
                 chunk: index as u32,
                 env: Env::as_ptr(&env) as usize,
                 holders: holders.into_boxed_slice(),

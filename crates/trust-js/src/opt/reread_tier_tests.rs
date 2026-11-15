@@ -22,15 +22,19 @@ const SOURCE: &str = "function fa(x) { return x + 1; }\n\
                       function h(f, g, k, o, x) { return f(x) + g(x) + k(x) + o.m(x); }\n\
                       var oa = {m: da}, ob = {m: db}, oc = {m: dc};\n\
                       fa(0); fb(0); ga(0); gb(0); ka(0); da(0); db(0); dc(0);";
-/// D's first guard, a check while unflagged, fails for its second callee every other call: those
-/// exits discard the code, whose reoptimization builds D's first guard as a test.
+/// At the splice D's first guard, a check while unflagged, fails for its second callee every other
+/// call: those exits discard the code, whose reoptimization builds D's first guard as a test. At
+/// graph every planned way is built from the first compile (P3 stage 3 step 3f, piece D): D's first
+/// way is a test, its second the check, and nothing exits, so R stays 0.
 const WARM: &str =
     "var t = 0; for (var i = 0; i < 3000; i++) t += h(fa, ga, ka, i % 2 ? oa : ob, i); t";
-/// A's callee changes: its guard fails first in each call, the rest of which the VM runs; 200
-/// exits at R = 1 discard the code again.
+/// A's callee changes: its guard fails first in each call, the rest of which the VM runs; the exit
+/// limit's exits at R (200 at R = 1 at the splice, 100 at R = 0 at graph, whose other 100 calls
+/// run the template code) discard the code again.
 const EXIT: &str = "var u = 0; for (var i = 0; i < 200; i++) u += h(fb, gb, ka, oa, i); u";
-/// The warm-up's template code (its first checkpoint 400 invocations away at R = 2) meets gb at B
-/// and dc at D, which no guard holds; the reoptimization re-reads them.
+/// The warm-up's template code (its first checkpoint 400 invocations from the discard at R = 2 at
+/// the splice, 200 at R = 1 at graph) meets gb at B and dc at D, which no guard holds; the
+/// reoptimization re-reads them.
 const WARM_UP: &str = "var v = 0; for (var i = 0; i < 450; i++) v += h(fb, gb, ka, oc, i); v";
 const AFTER: &str = "var w = 0; for (var i = 0; i < 50; i++) w += h(fb, gb, ka, oc, i); w";
 /// C meets a callee its guard does not hold.
@@ -59,7 +63,9 @@ fn a_reoptimization_turns_the_guards_of_sites_that_met_other_callees_into_tests(
         assert_eq!(eval(&mut engine, WARM), expected[1], "{mode}: warm");
         let chunk = tier_chunk(&mut engine, "h").expect("h's tier chunk");
         assert_eq!(super::super::in_place(&chunk), graph, "{mode}: placement");
-        assert_eq!(discards(&chunk), 1, "{mode}: D's discard while warm");
+        // R after the warm-up: D's discard at the splice; none at graph (piece D).
+        let r = u8::from(!graph);
+        assert_eq!(discards(&chunk), r, "{mode}: D's discard while warm");
         assert!(
             !super::super::reoptimizing(&chunk),
             "{mode}: reoptimized while warm"
@@ -70,14 +76,14 @@ fn a_reoptimization_turns_the_guards_of_sites_that_met_other_callees_into_tests(
         let taken = exits();
         assert_eq!(
             taken.len(),
-            2 * super::super::EXIT_LIMIT as usize,
-            "{mode}: A's guard until the discard at R = 1: {taken:?}"
+            (super::super::EXIT_LIMIT as usize) << r,
+            "{mode}: A's guard until the discard at R = {r}: {taken:?}"
         );
         assert!(
             taken.iter().all(|&(_, why)| why == ExitReason::WrongCallee),
             "{mode}: {taken:?}"
         );
-        assert_eq!(discards(&chunk), 2, "{mode}: R");
+        assert_eq!(discards(&chunk), r + 1, "{mode}: R");
         assert_eq!(eval(&mut engine, WARM_UP), expected[3], "{mode}: warm-up");
         assert!(!super::super::reoptimizing(&chunk), "{mode}: reoptimized");
         let reread: Vec<usize> = super::super::TEST_REREAD.with(|reread| {
@@ -89,14 +95,45 @@ fn a_reoptimization_turns_the_guards_of_sites_that_met_other_callees_into_tests(
                 .collect()
         });
         // B's guard and D's second (its first flagged by D's exits) at the splice; B's call and
-        // D's, its guard byte raised from its first way to both, at graph.
+        // D's at graph.
         assert_eq!(reread.len(), 2, "{mode}: the re-read's flags: {reread:?}");
+        if graph {
+            // The flags' data: at B's call its one way, at D's its guard byte at both ways (no
+            // exit flagged D at graph, whose first compile built both). At graph the recompile's
+            // last ways are tests either way, since the snapshot's caches name the callees met
+            // (piece D's past-plan rule): the flags are this test's subject there.
+            let ops = chunk.jit_ops();
+            let calls: Vec<usize> = (0..ops.len())
+                .filter(|&pc| matches!(ops[pc], crate::bytecode::Op::Call(..)))
+                .collect();
+            let method = (0..ops.len())
+                .find(|&pc| matches!(ops[pc], crate::bytecode::Op::CallWithThis(..)))
+                .expect("D's call");
+            let (b, d) = (calls[1], method);
+            let mut sorted = reread.clone();
+            sorted.sort_unstable();
+            assert_eq!(sorted, vec![b, d], "graph: B's and D's calls re-read");
+            let flag = |pc: usize| {
+                let mut ways = None;
+                super::super::profile::ChunkProfile::of(&chunk).sites_at(
+                    pc as u32,
+                    |reason, inlined, n| {
+                        if reason == ExitReason::WrongCallee as u8 && !inlined {
+                            ways = Some(n);
+                        }
+                    },
+                );
+                ways
+            };
+            assert_eq!(flag(b), Some(1), "graph: B's flag covers its way");
+            assert_eq!(flag(d), Some(2), "graph: D's flag covers both ways");
+        }
         assert_eq!(eval(&mut engine, AFTER), expected[4], "{mode}: after");
         assert!(
             exits().is_empty(),
             "{mode}: B and D take their mismatch edges, no exit"
         );
-        assert_eq!(discards(&chunk), 2, "{mode}: no third discard");
+        assert_eq!(discards(&chunk), r + 1, "{mode}: no further discard");
         assert_eq!(
             eval(&mut engine, C_CHANGES),
             expected[5],
