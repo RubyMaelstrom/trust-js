@@ -4396,6 +4396,14 @@ and a String's length are the tier's own nodes.
   live registers should take its inputs before it moves the stack pointer, so that the defect
   above cannot recur. For the owner: the template's creation epoch is process-wide; per Agent, as
   SpiderMonkey's fuses are per realm, engines would stop invalidating each other's caches.
+- On the landed tree (c70c6281; target/p3/stage3/stepL3-review): the library suite 3,436
+  passed and none failed with the tier off, on, eager and with forced exits, and at graph on,
+  eager and forced; difftest 138 agree and the fixtures' outputs the tier off's in each. Under
+  the poison on passes; eager fails one test, the constructor's creations in the tier's code,
+  by the creation epoch's interference between tests of one process (43b415d7, after this
+  tree, runs it alone in a child). GC stress over the creation and update tests on main's
+  binary, eager (26 tests, among them the slow path's store of a value from its spill slot,
+  the test that had not finished above): all pass, in 2 h 49 min.
 
 Lowerings L1 landed (four commits ending 1375e3b8, rebased by the coordinator over L3; 2026-11-14;
 target/p3/stage3/stepL1-impl, report.txt and design-note.txt): equality and typeof tests are the
@@ -4471,6 +4479,17 @@ The VM-copy helper copies its operation's operands only (five commits ending 52a
   tiers (the helper's call is about 10 instructions longer; VM-copy effects run in the tier's
   code in Vue alone, 227k times in its steady state). Tests: 9 mutations caught; the tier's
   modules (442) in six configurations; the verifier sweep.
+- On the landed tree, L1 with this fix (52a1e3a5; target/p3/stage3/main-review-1): the
+  library suite 3,460 passed and none failed with the tier off, on and eager, and at graph
+  on, eager and forced; Test262 53,572 of 53,575 in each of those and with forced exits, no
+  failure beyond the tier off's; difftest and the fixtures as the tier off's throughout. With
+  forced exits at the default one library test failed, the cyclic list walk's deadline poll
+  test: under load the interruption comes before the walk's code is entered and the VM's
+  safepoint at the script's call reports it, which the test did not allow for (8 runs at once
+  on one core: 14 of 40 fail on this tree, 20 of 40 on step 0's binary, 7 of 40 with the tier
+  off); fixed in 6c028243 (0 of 40). Under the poison at graph eager passes and on fails the
+  known rare realm test alone (a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm;
+  8 of 8 alone).
 
 Stage 3 steps 3b and 3c landed (six commits ending fe601a3c, 2026-11-15; target/p3/stage3/
 step3c-impl, report.txt and design-note.txt): an operation the tier does not lower in a
