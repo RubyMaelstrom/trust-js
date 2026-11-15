@@ -11584,7 +11584,8 @@ impl InlineWay {
     }
 
     /// Whether the callee's chunk splices nothing of its own and every explicit call it makes is
-    /// a plain or method call (P3 stage 3 step 3c-2; see [`makes_plain_calls_only`]).
+    /// a plain or method call or a plain `new` (P3 stage 3 steps 3c-2 and 3e; see
+    /// [`makes_plain_calls_only`]).
     pub(crate) fn plain_calls(&self) -> bool {
         self.f
             .runtime()
@@ -30818,14 +30819,14 @@ fn helper_call_position<const PUBLISHED: bool>(i: &Interp, chunk: &Chunk, pc: us
 
 /// Whether `chunk` splices nothing of its own (a spliced body's positions go through the chunk's
 /// own inline sites, which an inlined frame's would have to chain) and every explicit call it
-/// makes is a plain or method call (`Op::Call`, `Op::CallWithThis`), which an inlined frame of the
-/// optimizing tier's graph makes as a generic call node (P3 stage 3 step 3c-2): no spread,
-/// arguments-array, eval or tail call, no `new`.
+/// makes is a plain or method call (`Op::Call`, `Op::CallWithThis`) or a plain `new`
+/// (`Op::New`), which an inlined frame of the optimizing tier's graph makes as a generic call node
+/// (P3 stage 3 steps 3c-2 and 3e): no spread (`new` included), arguments-array, eval or tail call.
 pub(crate) fn makes_plain_calls_only(chunk: &Chunk) -> bool {
     chunk.inline_sites.is_empty()
         && chunk.ops.iter().all(|op| {
             !(makes_explicit_call(op) || matches!(op, Op::TailCall(..)))
-                || matches!(op, Op::Call(..) | Op::CallWithThis(..))
+                || matches!(op, Op::Call(..) | Op::CallWithThis(..) | Op::New(..))
         })
 }
 

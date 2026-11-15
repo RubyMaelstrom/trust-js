@@ -3328,6 +3328,8 @@ impl Gen<'_> {
         // `Interp::call_site` through the inlined call helpers' table.
         let call_site = match *op {
             Op::Call(_, cache) | Op::CallWithThis(_, cache) => Some(view.call_position(cache)),
+            // A plain `new` (P3 stage 3 step 3e): its construct site's, as a call's.
+            Op::New(_, cache) => Some(view.construct_position(cache)),
             _ => None,
         };
         let switched = Switched {

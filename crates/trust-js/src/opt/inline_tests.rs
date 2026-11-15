@@ -3222,15 +3222,16 @@ fn a_callee_an_inlined_frame_calls_imports_against_its_own_script() {
 /// The rule for a way whose callee calls (P3 stage 3 steps 3c-2 and 3d,
 /// `InlineWay::graph_inlines`): `midN` calls a small leaf the plan inlines in turn, so `outerN`
 /// compiles in place with `leafy` a frame nested in `midN`'s (step 3d); `midX` calls `mkX`, which
-/// the plan inlines in turn and which makes a `new` call, so `outerX`'s plan splices (a second
-/// stage, as at splice); `midP` calls a callee too large to plan, so `outerP` compiles in place
-/// at graph with `midP` inlined and its call a call node of the inlined frame.
+/// the plan inlines in turn and which makes a spread `new` (NewArgsArray, which no inlined frame
+/// makes: a plain `new` is a call node since step 3e), so `outerX`'s plan splices (a second stage,
+/// as at splice); `midP` calls a callee too large to plan, so `outerP` compiles in place at graph
+/// with `midP` inlined and its call a call node of the inlined frame.
 const NESTED_RULE: &str = "
 function leafy(x) { return x + 1; }
 function midN(x) { return leafy(x) * 2; }
 function outerN(n) { var s = 0; for (var i = 0; i < n; i++) s += midN(i); return s; }
 function Pt(x) { this.x = x; }
-function mkX(x) { return new Pt(x).x; }
+function mkX(x) { return new Pt(...[x]).x; }
 function midX(x) { return mkX(x) * 2; }
 function outerX(n) { var s = 0; for (var i = 0; i < n; i++) s += midX(i); return s; }
 function bigc(x) {
@@ -4053,4 +4054,141 @@ fn a_guard_failing_in_a_nested_frame_flags_its_frames_chunk_at_the_call() {
     );
     assert_eq!(discards(&compiled), before + 1, "one discard");
     assert!(super::in_place(&compiled), "tp compiles in place again");
+}
+
+// ---- P3 stage 3 step 3e: `new` from inlined frames ----------------------------------------------
+
+/// An inlined frame's plain `new` (P3 stage 3 step 3e), a call node of its frame: `mkP`'s `new P`
+/// (P records its caller and stack), the same `new` at depth two (`deep` -> `mkP`), a constructor
+/// that throws (caught in the compiled frame), one returning an object, a derived class's (the
+/// construct cache declines it: the helper), and `mkAny`'s `new F` with F a bound function, a
+/// Proxy, a non-constructor (the TypeError names `F`) and an arrow; then P.prototype replaced
+/// after warm-up (the cached prototype shape misses: the live `prototype`); forced exits,
+/// collections at every allocation, the poison and the chunk trap.
+const NEW_SHAPES: &str = "
+var probe = false, log = [];
+function stk(e, from, n) { return e.stack.split('\\n').slice(from, from + n).join('/'); }
+function P(x) { this.x = x;
+  if (probe) log.push('P<' + (P.caller && P.caller.name) + '|' + stk(new Error('p'), 1, 4)); }
+function Q(x) { if (x === 'throw') throw new RangeError('q'); this.q = x; }
+function R(x) { this.r = x; return { boxed: x }; }
+class Base { constructor(x) { this.b = x; } }
+class Derived extends Base { constructor(x) { super(x); this.d = x + 1; } }
+var BoundP = P.bind(null, 7);
+var ProxyP = new Proxy(P, {});
+function mkP(x) { return new P(x).x; }
+function mkQ(x) { return new Q(x).q; }
+function mkR(x) { return new R(x).boxed; }
+function mkD(x) { return new Derived(x).d; }
+function mkAny(F, x) { return new F(x); }
+function deep(x) { return mkP(x) + 1; }
+function top(n, x, F) { var t = 0;
+  for (var i = 0; i < n; i++) {
+    var v = x === undefined ? i : x;
+    t += mkP(v) + deep(v) + mkR(v) + mkD(v);
+    try { t += mkQ(v); } catch (e) { t += 1000; if (probe) log.push('q|' + e.name + '|' + stk(e, 0, 4)); }
+    try { var o = mkAny(F, v); t += (o && o.x) | 0; } catch (e) {
+      t += 2000; if (probe) log.push('any|' + e.name + ':' + e.message + '|' + stk(e, 0, 4)); }
+  }
+  return t; }
+var r = 0;
+for (var j = 0; j < 300; j++) r += top(4, undefined, P);
+probe = true;
+var out = [];
+function at(tag, thunk) { try { out.push(tag + '|' + thunk()); } catch (e) {
+  out.push(tag + '!' + e.name + ':' + e.message + '|' + stk(e, 0, 5)); } }
+at('base', function () { return top(1, undefined, P); });
+at('throw', function () { return top(1, 'throw', P); });
+at('bound', function () { return top(1, 3, BoundP); });
+at('proxy', function () { return top(1, 3, ProxyP); });
+at('notctor', function () { return top(1, 3, Math.max); });
+at('arrow', function () { return top(1, 3, (x) => x); });
+P.prototype = { tag: 'replaced' };
+at('proto', function () { return top(1, 2, P) + '|' + Object.getPrototypeOf(mkAny(P, 2)).tag + '|' + mkAny(P, 3).tag; });
+probe = false;
+at('again', function () { return top(3, undefined, P); });
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn an_inlined_frames_new_gives_the_tier_offs_results() {
+    nested_frames();
+    inlined_generic();
+    let runs = counted(NEW_SHAPES, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for seen in [
+        "P<mkP|",
+        "P<mkAny|",
+        "q|RangeError|",
+        "any|TypeError:F is not a constructor|",
+        "proto|",
+        "|replaced|replaced",
+        "again|",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    assert!(
+        inlined_generic().iter().any(|op| matches!(op, Op::New(..))),
+        "a `new` node of an inlined frame"
+    );
+    assert!(nested_frames() > 0, "deep -> mkP: a `new` at depth two");
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(&mut engine, NEW_SHAPES);
+    assert!(
+        super::in_place(&chunk_of(&mut engine, "top")),
+        "top compiles in place"
+    );
+    for (exit_every, stress, poison) in [
+        (7, false, false),
+        (1, false, false),
+        (0, true, false),
+        (0, false, true),
+    ] {
+        super::take_poison_faults();
+        let runs = counted(NEW_SHAPES, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
+}
+
+/// The end poll after an inlined frame's `new` (P3 stage 3 step 3e): the live-object limit's
+/// RangeError a test-only request makes it throw names the inlined frame `mkP` (the frame whose
+/// `new` completed, reported at its start) above the compiled frame `top`.
+#[test]
+fn an_error_at_the_end_poll_after_an_inlined_frames_new_names_the_frame() {
+    graph_switches(0).set();
+    crate::jit::set_call_done_hook(true);
+    let mut engine = jit_engine();
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_incremental(crate::gc_core::IncrementalMode::Off);
+    inlined_generic();
+    eval(&mut engine, NEW_SHAPES);
+    assert!(inlined_generic().iter().any(|op| matches!(op, Op::New(..))));
+    crate::jit::arm_call_end_poll_limit(false);
+    let got = eval(
+        &mut engine,
+        "try { 'none:' + top(1, 1, P); } catch (e) { e.name + '|' + e.stack.split('\\n').slice(1, 3).join('/') }",
+    );
+    assert!(
+        !crate::jit::take_end_poll_limit(crate::jit::POLL_HELPER_END),
+        "the request fell due and no poll took it: {got}"
+    );
+    let mut parts = got.split('|');
+    assert_eq!(parts.next(), Some("RangeError"), "{got}");
+    let frames: Vec<&str> = parts.next().unwrap_or("").split('/').collect();
+    assert!(frames[0].starts_with("    at mkP ("), "{got}");
+    assert!(
+        frames.get(1).is_some_and(|f| f.starts_with("    at top (")),
+        "{got}"
+    );
+    crate::jit::set_call_done_hook(false);
 }

@@ -116,6 +116,8 @@ pub(crate) fn prepare(
     // A non-leaf way's calls (P3 stage 3 step 3c-2): (its view's index, the callee's call cache,
     // the call's site among `inline_sites`), each call's position in the way's own view.
     let mut call_sites: Vec<(usize, u32, usize)> = Vec::new();
+    // Its plain `new`s likewise (P3 stage 3 step 3e): (the view, the construct cache, the site).
+    let mut construct_sites: Vec<(usize, u32, usize)> = Vec::new();
     for (cache, entry) in entries {
         let Some(&(argc, with_this)) = calls.get(&cache) else {
             continue;
@@ -135,6 +137,7 @@ pub(crate) fn prepare(
                 callees: &mut callees,
                 inline_sites: &mut inline_sites,
                 call_sites: &mut call_sites,
+                construct_sites: &mut construct_sites,
                 memory: &mut memory,
             };
             // The way's frame is the compiled frame's child: its site's caller position is this
@@ -162,6 +165,15 @@ pub(crate) fn prepare(
     held.sites = registered;
     for (view, call, site) in call_sites {
         if let Some(position) = callees[view].0.call_positions.get_mut(call as usize) {
+            *position = positions[site];
+        }
+    }
+    for (view, construct, site) in construct_sites {
+        if let Some(position) = callees[view]
+            .0
+            .construct_positions
+            .get_mut(construct as usize)
+        {
             *position = positions[site];
         }
     }
@@ -200,6 +212,7 @@ struct Prep<'p, 'c, M: FnMut() -> JobMemory> {
     callees: &'p mut Vec<JobMemory>,
     inline_sites: &'p mut Vec<crate::stack_trace::InlineSite>,
     call_sites: &'p mut Vec<(usize, u32, usize)>,
+    construct_sites: &'p mut Vec<(usize, u32, usize)>,
     memory: &'c mut M,
 }
 
@@ -298,6 +311,21 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
                 let (argc, inner_call, with_this) = match *op {
                     Op::Call(argc, inner_call) => (argc, inner_call, false),
                     Op::CallWithThis(argc, inner_call) => (argc, inner_call, true),
+                    // A plain `new` (step 3e): a site of its own, as a call's, the `new`'s
+                    // position in the callee's source; its node's construct cache is the view's,
+                    // the callee chunk's own cell. No way is planned at a construct site.
+                    Op::New(_, construct) => {
+                        let inner = callee.construct_position(construct);
+                        debug_assert!(!crate::stack_trace::is_inline_position(inner));
+                        self.inline_sites.push(crate::stack_trace::InlineSite {
+                            callee: crate::value::Gc::downgrade(&way.obj),
+                            inner,
+                            outer: call.caller_position,
+                        });
+                        self.construct_sites
+                            .push((index, construct, self.inline_sites.len() - 1));
+                        continue;
+                    }
                     _ => continue,
                 };
                 let inner = callee.call_position(inner_call);

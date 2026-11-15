@@ -915,6 +915,13 @@ pub(super) fn emit<C: JitChunk + ?Sized>(
             // sequence; a miss, or a gate the sequence declines, takes the helper.
             let slow = a.new_label();
             let done = a.new_label();
+            // An inlined frame's `new` (P3 stage 3 step 3e; `Asm::inlined_call`), a call node as a
+            // call is (piece B2): the helper path switches the context for the callee's frame at
+            // `slow` and lands on `done`, which restores it; the direct sequence, which switches
+            // nothing (its construct cache is the view's, its position the view's word), lands
+            // past the restore.
+            let inlined = a.inlined_call().is_some();
+            let done_direct = if inlined { a.new_label() } else { done };
             emit_direct_construct(
                 a,
                 chunk,
@@ -925,10 +932,11 @@ pub(super) fn emit<C: JitChunk + ?Sized>(
                 fast,
                 slow,
                 unwind,
-                done,
+                done_direct,
                 direct_finish,
             );
             a.bind(slow);
+            emit_inlined_call_switch(a);
             // H_NEW needs only the pc for optional diagnostics and the statically encoded
             // arity. Pack both so the million-call constructor path does not reload/decode
             // its bytecode op in Rust. A compact site (first-stage code outside loops) calls it
@@ -952,6 +960,16 @@ pub(super) fn emit<C: JitChunk + ?Sized>(
             // Either form lands here with its result pushed. A native constructor allocates
             // after the call's last safepoint.
             a.bind(done);
+            if inlined {
+                emit_inlined_call_restore(a);
+                a.bind(done_direct);
+            }
+            #[cfg(test)]
+            if CALL_DONE_HOOK.with(std::cell::Cell::get) {
+                a.mov(0, 19);
+                a.mov_imm64(16, note_call_done as *const () as u64);
+                a.blr(16);
+            }
             emit_helper_end_poll(a, unwind);
         }
         Op::SetProp(..)
