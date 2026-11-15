@@ -965,6 +965,32 @@ fn is_length_read<'n>(op: &Op, name: &impl Fn(u32) -> &'n str) -> bool {
 /// equalities go on meeting new pairs tiers up when its other feedback settles, a pair it meets
 /// later being a speculation's exit and flag. Main thread.
 pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
+    fingerprint_of(chunk, true)
+}
+
+/// The fingerprint a discard's warm-up compares between its checkpoints (P3 stage 3, step 4p):
+/// [`fingerprint`]'s without call sites' ways, a call site's state alone, as V8's tiering
+/// manager hears of no call feedback (the call ICs' updates never notify it:
+/// builtins/ic-callable.tq:22-50; NotifyICChanged comes from property ICs' transitions,
+/// execution/tiering-manager.cc:497-576, ic/ic.cc:346-430), and JSC and SpiderMonkey wait for no
+/// settling after a jettison or an invalidation at all (a count: bytecode/CodeBlock.cpp:
+/// 2641-2657; jit/Ion.cpp:2637-2652). A call site whose ways change while its state stays (refills
+/// after an epoch move, the ways churning between callees) holds no recompile back; its
+/// transitions (to polymorphic, to megamorphic) still do. A function's first compiles keep
+/// [`fingerprint`] (stage 2, step 11's departure 3, measured on them).
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn warm_up_fingerprint(chunk: &Chunk) -> u64 {
+    fingerprint_of(chunk, false)
+}
+
+/// [`fingerprint`], with call sites' ways where `call_ways`.
+fn fingerprint_of(chunk: &Chunk, call_ways: bool) -> u64 {
     use std::hash::Hasher;
     super::profile::merge_element_hits(chunk);
     let mut hash = crate::fasthash::FxHasher::default();
@@ -992,7 +1018,7 @@ pub(crate) fn fingerprint(chunk: &Chunk) -> u64 {
             }
             SiteView::Call(call) => {
                 hash.write_u8(call.state as u8);
-                if call.state != CallState::Megamorphic {
+                if call_ways && call.state != CallState::Megamorphic {
                     for target in call.ways.iter().flatten() {
                         hash.write_usize(target.callee);
                         hash.write_usize(target.function);

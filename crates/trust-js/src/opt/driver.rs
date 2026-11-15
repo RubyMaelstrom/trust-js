@@ -68,6 +68,9 @@
 //! feedback never settles keeps its template code; so does one whose next checkpoint would pass
 //! the u32 word, which is not armed. The tier refuses a chunk over V8's size limit
 //! (`MAX_OPTIMIZED_OPS`) before its snapshot, or with nothing to splice before its recompile.
+//! A discard's warm-up compares a fingerprint without call sites' ways (P3 stage 3, step 4p:
+//! `warm_up_settled`), as V8 waits after a deoptimization for its budget and for property ICs'
+//! transitions, never for call feedback: a call site whose ways churn holds no recompile back.
 
 use super::exit::{ExitRecord, ExitTable};
 use super::ir::{ExitReason, Refusal};
@@ -579,7 +582,19 @@ thread_local! {
 /// one its previous checkpoint recorded, or, under TRUST_JS_OPT_EAGER, any checkpoint. Records
 /// this checkpoint's fingerprint for the next one, on the chunk (`opt::profile`).
 pub(crate) fn settled(chunk: &Chunk) -> bool {
-    let print = snapshot::fingerprint(chunk);
+    settled_by(chunk, snapshot::fingerprint(chunk))
+}
+
+/// [`settled`] at a checkpoint of a discard's warm-up (P3 stage 3, step 4p): by the warm-up's
+/// fingerprint (`snapshot::warm_up_fingerprint`), which a call site's ways do not change, its
+/// state's transitions only, as V8 waits after a deoptimization for its budget and for the
+/// property ICs' transitions alone (execution/tiering-manager.cc:229-258, 497-576). The discard
+/// records the first one (`discard`).
+fn warm_up_settled(chunk: &Chunk) -> bool {
+    settled_by(chunk, snapshot::warm_up_fingerprint(chunk))
+}
+
+fn settled_by(chunk: &Chunk, print: u64) -> bool {
     let previous = ChunkProfile::of(chunk).settle(print);
     eager() || previous == Some(print)
 }
@@ -590,18 +605,25 @@ pub(crate) fn settled(chunk: &Chunk) -> bool {
 /// change and forces nothing (TieringManager::NotifyICChanged; stage 2, step 11). Logs each wait
 /// under TRUST_JS_OPT_LOG.
 pub(crate) fn waits(chunk: &Chunk) -> bool {
-    waits_at(chunk, chunk.inline_checkpoints(), "")
+    waits_at(chunk, chunk.inline_checkpoints(), false)
 }
 
-/// [`waits`] at `chunk`'s checkpoint `checkpoint`, `what` the log's note of its kind.
-fn waits_at(chunk: &Chunk, checkpoint: u8, what: &str) -> bool {
-    if settled(chunk) {
+/// [`waits`] at `chunk`'s checkpoint `checkpoint`, a discard's warm-up's where `warm_up`
+/// (`warm_up_settled`).
+fn waits_at(chunk: &Chunk, checkpoint: u8, warm_up: bool) -> bool {
+    let settled = if warm_up {
+        warm_up_settled(chunk)
+    } else {
+        settled(chunk)
+    };
+    if settled {
         return false;
     }
     if log_enabled() {
         log_line!(
-            "[opt] waiting {} at checkpoint {checkpoint}: feedback changed{what}",
-            name(chunk)
+            "[opt] waiting {} at checkpoint {checkpoint}: feedback changed{}",
+            name(chunk),
+            if warm_up { " (reoptimization)" } else { "" }
         );
     }
     #[cfg(test)]
@@ -2031,8 +2053,8 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
             profile.arm(1, at);
             chunk.set_inline_retry_at(at);
             // The first checkpoint compares the feedback with this, the exits' VM runs' records
-            // included.
-            profile.settle(snapshot::fingerprint(chunk));
+            // included, by the warm-up's fingerprint (`warm_up_settled`).
+            profile.settle(snapshot::warm_up_fingerprint(chunk));
         } else if log_enabled() {
             log_line!(
                 "[opt] not reoptimized {}: its warm-up would pass the checkpoint word",
@@ -2244,7 +2266,7 @@ pub(crate) fn reoptimize(
             None
         }
     };
-    if waits_at(chunk, checkpoint, " (reoptimization)") {
+    if waits_at(chunk, checkpoint, true) {
         return;
     }
     profile.disarm();

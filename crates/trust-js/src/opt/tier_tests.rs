@@ -3548,3 +3548,7 @@ mod update;
 /// P3 stage 3 step R1: loop caches of spilled values, end to end.
 #[path = "loop_cache_tier_tests.rs"]
 mod loop_cache;
+
+/// P3 stage 3 step 4p: a discard's warm-up and the call sites' feedback, end to end.
+#[path = "warm_up_tier_tests.rs"]
+mod warm_up;
