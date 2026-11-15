@@ -1633,16 +1633,49 @@ impl crate::gc_trace::GcTrace for FramePool {
                 "a live top ({top:?}) above the frame's extent ({frame})"
             );
             // A known top is an operand top: the poll's or a direct call's x20, never below the
-            // activation's stack_base, so every slot lies under it (an inlined frame's node's
-            // slot window, P3 stage 3 step 3c, lies above it, in a record scanned whole).
+            // activation's stack_base, so every slot lies under it; but while an inlined frame's
+            // generic node runs on a slot window (P3 stage 3 step 3c), `n_slots` counts the
+            // window's, which lies above the node's operand top (below).
             debug_assert!(
                 top.is_none_or(|top| top >= record.ctx.n_slots) || !record.ctx.slots_are_own(),
                 "a live top ({top:?}) inside the frame's {} slots",
                 record.ctx.n_slots
             );
-            record.trace_to(sink, top.unwrap_or(frame));
+            let extent = top.unwrap_or(frame);
+            record.trace_to(sink, extent);
+            // An inlined frame's generic node's slot window (P3 stage 3 step 3c): its words, the
+            // record's words at ctx.slots, which its helper may write with a fresh value its slot
+            // result reads after the node's end poll. Where the collector knows the record's top
+            // (that poll's x20) the window lies above it and is scanned here; where it does not,
+            // the frame's extent is the whole record (`JitCtx::frame_words`), which holds it.
+            if let Some((start, words)) = record.slot_window() {
+                let scanned = start + words <= extent || {
+                    record.trace_words(sink, start, words);
+                    true
+                };
+                #[cfg(test)]
+                note_window_trace(top.is_some(), scanned);
+                #[cfg(not(test))]
+                let _ = scanned;
+            }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Records traced while an inlined frame's node ran on a slot window (P3 stage 3 step 3c):
+    /// those traced at a known top, and those whose window the trace left unscanned (tests).
+    pub(crate) static TEST_WINDOW_TRACES: std::cell::Cell<(u64, u64)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+fn note_window_trace(known_top: bool, scanned: bool) {
+    TEST_WINDOW_TRACES.with(|traces| {
+        let (at_top, missed) = traces.get();
+        traces.set((at_top + u64::from(known_top), missed + u64::from(!scanned)));
+    });
 }
 
 /// A string's code units as the UTF-16 view readers take them (see [`crate::lstr::Units`]).

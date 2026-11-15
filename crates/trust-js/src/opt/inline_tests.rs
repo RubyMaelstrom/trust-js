@@ -1981,3 +1981,34 @@ fn an_inlined_callee_that_drops_its_last_reference_runs_on_through_collections()
         .any(|note| note.outcome == InlineOutcome::Inlined));
     assert!(!inlined_generic().is_empty());
 }
+
+/// A slot window above its node's operand top is scanned where the collector knows the record's
+/// top (P3 stage 3 step 3c; the coordinator's review): inc's `x++` of a BigInt is a generic node
+/// that writes x with a fresh cell into its window, which its slot result reads after the
+/// template's end poll; under a collection at every allocation that poll collects with the
+/// record's top its x20, below the window. Every such trace scans the window
+/// (`interpreter::TEST_WINDOW_TRACES`), and the results are the tier off's.
+#[test]
+fn a_slot_window_is_scanned_at_its_nodes_end_poll() {
+    let source = "function inc(x) { x++; return x; }
+         function run(n) { var out = [], b = 2n ** 80n;
+           for (var i = 0; i < n; i++) { b = inc(b); out.push(b); } return out; }
+         var r; for (var k = 0; k < 40; k++) r = run(20);
+         String(r[0]) + ',' + String(r[19]) + ',' + r.length";
+    crate::interpreter::TEST_WINDOW_TRACES.with(|traces| traces.set((0, 0)));
+    inlined_generic();
+    let (expected, got) = both(source, 0, true);
+    assert_eq!(got, expected);
+    assert!(
+        inlined_generic()
+            .iter()
+            .any(|op| matches!(op, Op::UpdateLocal(..))),
+        "inc's update is an inlined frame's generic node"
+    );
+    let (at_top, missed) = crate::interpreter::TEST_WINDOW_TRACES.with(std::cell::Cell::get);
+    assert!(
+        at_top > 0,
+        "a collection ran at a known top while the node's window was live"
+    );
+    assert_eq!(missed, 0, "every window traced was scanned");
+}

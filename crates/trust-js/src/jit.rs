@@ -25001,6 +25001,41 @@ impl JitFrame {
             crate::gc_trace::scan_words(frame.as_ptr().cast::<u64>(), words.min(FRAME_BUF), sink)
         };
     }
+
+    /// The words `start..start + words` of the record (see `trace_to`).
+    pub(crate) fn trace_words(
+        &self,
+        sink: &mut dyn crate::gc_trace::GcSink,
+        start: usize,
+        words: usize,
+    ) {
+        let end = (start + words).min(FRAME_BUF);
+        // SAFETY: as `trace_to`'s, within the record's words.
+        unsafe {
+            crate::gc_trace::scan_words(
+                self.words.as_ptr().add(start.min(end)).cast::<u64>(),
+                end - start.min(end),
+                sink,
+            )
+        };
+    }
+
+    /// The slot window an inlined frame's generic node runs on (P3 stage 3 step 3c), as (its
+    /// first word's index among the record's words, its words): where the context's slots are
+    /// not the record's first word, the `n_slots` words they name, which lie in the record's
+    /// operand words (`opt::a64`'s lower_inlined_generic). None otherwise.
+    pub(crate) fn slot_window(&self) -> Option<(usize, usize)> {
+        if self.ctx.slots_are_own() {
+            return None;
+        }
+        let first = self.words.as_ptr() as usize;
+        let at = (self.ctx.slots as usize).wrapping_sub(first) / std::mem::size_of::<Value>();
+        debug_assert!(
+            (self.ctx.slots as usize) >= first && at + self.ctx.n_slots <= FRAME_BUF,
+            "a slot window inside its record"
+        );
+        Some((at, self.ctx.n_slots))
+    }
 }
 
 /// The live top of each of `records`, the active records of one interpreter, where the
