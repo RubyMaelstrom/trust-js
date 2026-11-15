@@ -156,7 +156,20 @@ pub(crate) fn verify_frames(
         if node.pc as usize >= frame_chunk.jit_ops().len() {
             return fail("a pc past the chunk");
         }
-        if !node.frame.is_compiled() && node.op.reads_compiled_frame() {
+        // A callee guard of a site nested in an inlined frame (P3 stage 3 step 3d) reads its
+        // explicit inputs, its data in the compiled chunk's view (every way's) and the running
+        // global environment, the same in every frame of the code (one Realm), but no caller
+        // environment (a guard whose way requires one, `expected_env`, reads the compiled
+        // frame's).
+        let frame_free_guard = match node.op {
+            NodeOp::CheckCallee { target } | NodeOp::CalleeMatches { target } => {
+                chunk_of(FrameIx::COMPILED).is_some_and(|(compiled, _)| {
+                    compiled.jit_inline_target(target).expected_env == 0
+                })
+            }
+            _ => false,
+        };
+        if !node.frame.is_compiled() && node.op.reads_compiled_frame() && !frame_free_guard {
             return fail("a node of an inlined frame reads the compiled frame's context");
         }
         // Against its own frame's chunk (an inlined frame's generic node's operation and slots
@@ -166,7 +179,9 @@ pub(crate) fn verify_frames(
         } else {
             frame_chunk.jit_frame().1
         };
-        if let Err(what) = representations(graph, node, ix, frame_chunk, frame_slots) {
+        // Every way's guard data is the compiled chunk's view's (a nested site's too, step 3d).
+        let compiled = chunk_of(FrameIx::COMPILED).map_or(frame_chunk, |(compiled, _)| compiled);
+        if let Err(what) = representations(graph, node, ix, frame_chunk, compiled, frame_slots) {
             return fail(&what);
         }
         if node.op == NodeOp::Phi {
@@ -722,6 +737,7 @@ fn representations(
     node: &Node,
     ix: NodeIx,
     chunk: &FrozenChunk,
+    compiled: &FrozenChunk,
     n_slots: usize,
 ) -> Result<(), String> {
     let rep_of = |input: &NodeIx| graph.nodes.get(input.index()).map(|node| node.rep);
@@ -825,7 +841,7 @@ fn representations(
             // A splice's guard is at its InlineGuard; a graph-inlined call's (P3 stage 3, step 2)
             // at its call, of its target's argument count, a plain call's checking no `this`.
             // Its inputs are the callee's word and, for a guard of `this`, the receiver's.
-            let Some(it) = chunk.inline_targets.get(target as usize) else {
+            let Some(it) = compiled.inline_targets.get(target as usize) else {
                 return Err(format!(
                     "the guard of target {target}, which the chunk has not"
                 ));

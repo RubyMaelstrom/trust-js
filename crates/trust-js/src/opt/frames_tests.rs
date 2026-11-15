@@ -2090,11 +2090,11 @@ fn a_stub_call_in_an_inlined_frame_keeps_the_chain_its_exit_reads() {
     assert_eq!(exits().1, vec![(1, get, ExitReason::OutOfBounds)]);
 }
 
-/// A generic node in a frame inlined into an inlined frame is refused by the back end (P3 stage
-/// 3 step 3c): its inline site's caller position is the compiled frame's call's, which a nested
-/// frame's would have to chain; no plan builds one (the oracle keeps leaf callees).
+/// A generic node in a frame inlined into an inlined frame compiles (P3 stage 3 step 3d, stage
+/// (ii)): its operands lie at its own frame's depth from the compiled frame's base, and its site
+/// chains its outer frame's (the oracle's; this hand-made graph's frames have none).
 #[test]
-fn a_generic_node_of_a_frame_inlined_into_an_inlined_frame_is_refused() {
+fn a_generic_node_of_a_frame_inlined_into_an_inlined_frame_compiles() {
     let mut engine = fixture(FIXTURES);
     let top3 = chunk_of(&mut engine, "top3");
     let mid = chunk_of(&mut engine, "mid");
@@ -2136,7 +2136,7 @@ fn a_generic_node_of_a_frame_inlined_into_an_inlined_frame_is_refused() {
     let layout = crate::value::jit_layout(&engine.interp.object_proto);
     let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
     let initialized = cfg.initialized_reads(chunk.jit_ops(), true);
-    let refused = super::a64::compile_frames_with(
+    if let Err(refused) = super::a64::compile_frames_with(
         &chunk,
         &graph,
         &cfg,
@@ -2145,11 +2145,7 @@ fn a_generic_node_of_a_frame_inlined_into_an_inlined_frame_is_refused() {
         &layout,
         &ilayout,
         Options::default(),
-    )
-    .err()
-    .expect("the back end refuses the graph");
-    assert_eq!(
-        refused.reason,
-        "a generic node of a frame inlined into an inlined frame"
-    );
+    ) {
+        panic!("the back end refuses the graph: {}", refused.reason);
+    }
 }

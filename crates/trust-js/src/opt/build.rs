@@ -94,6 +94,13 @@ mod inline;
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) use inline::{E0_EFFECT, PAST_RECORD};
+// The inliner's tests read it where the tier has its back end (P3 stage 3 step 3d).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) use inline::TEST_NESTED_FRAMES;
 // The job and the driver read these where the tier has its back end.
 #[cfg_attr(
     not(all(
@@ -5176,7 +5183,12 @@ impl<'a> Builder<'a> {
         target: u32,
         st: &mut State,
     ) -> Result<Vec<NodeIx>, Refusal> {
-        let guard = self.chunk.jit_inline_target(target);
+        // Every way's guard data is the compiled chunk's view's, a nested frame's too (step 3d).
+        let targets = self
+            .inlined
+            .as_ref()
+            .map_or(self.chunk, |inlined| inlined.compiled());
+        let guard = targets.jit_inline_target(target);
         let callee_depth = guard.argc as usize + 1;
         let check_this = guard.check_this;
         let len = st.stack.len();

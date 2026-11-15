@@ -71,6 +71,10 @@ pub(crate) struct InlineWay {
     /// held with the code: the callee, no position of its own, the call's position), which the
     /// frame's generic nodes publish while they run (P3 stage 3 step 3c); NO_POSITION for none.
     pub(crate) position: u32,
+    /// The sites of the callee's own calls the plan inlines in turn (P3 stage 3 step 3d), by
+    /// the callee chunk's call-cache index: frames nested in this way's frame, whose guards
+    /// run in it and whose sites chain to its call's (`oracle::prepare`).
+    pub(crate) nested: Vec<InlineSite>,
 }
 
 /// A callee chunk as a compile reads it: its frozen view and its snapshot, whose exit profile is
@@ -113,6 +117,12 @@ pub(crate) const E0_EFFECT: &str = "an operation the tier leaves to its template
 /// The reason the inliner declines a callee whose generic nodes' operand words and slot window
 /// would put the compiled frame past a pooled activation record (P3 stage 3 step 3c).
 pub(crate) const PAST_RECORD: &str = "an inlined frame past its record";
+#[cfg(test)]
+thread_local! {
+    /// The frames the builders of this thread opened nested in an inlined frame (tests; P3
+    /// stage 3 step 3d).
+    pub(crate) static TEST_NESTED_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// A callee chunk's analyses (see the module's doc).
 pub(super) struct Analysis {
@@ -130,6 +140,9 @@ pub(super) struct Analysis {
 
 /// The callees a compile inlines (see the module's doc).
 pub(super) struct Tree<'a> {
+    /// The compiled chunk's view, whose inline targets hold every way's guard data, a nested
+    /// frame's too (P3 stage 3 step 3d: `Builder::guard_inputs` of an inlined frame's builder).
+    pub(super) compiled: &'a FrozenChunk,
     callees: &'a [Callee<'a>],
     /// Each callee chunk's analyses, by `InlineWay::chunk`, or why the inliner declines it.
     analyses: Vec<Result<Analysis, Refused>>,
@@ -140,7 +153,7 @@ pub(super) struct Tree<'a> {
 impl<'a> Tree<'a> {
     /// The tree of `sites` in the compile of `compiled`, their callee chunks `callees`.
     pub(super) fn new(
-        compiled: &FrozenChunk,
+        compiled: &'a FrozenChunk,
         sites: &'a [InlineSite],
         callees: &'a [Callee<'a>],
     ) -> Self {
@@ -152,6 +165,7 @@ impl<'a> Tree<'a> {
             analyses.push(analysis);
         }
         Tree {
+            compiled,
             callees,
             analyses,
             sites: sites.iter().map(|site| (site.cache, site)).collect(),
@@ -368,9 +382,18 @@ pub(super) struct Inlined<'a> {
     caller: FrameIx,
     /// The edges into the call's continuation so far.
     exits: Exits,
+    /// The compile's tree (its callee chunks and their analyses) and the sites of this frame's
+    /// own calls the plan inlines in turn (P3 stage 3 step 3d): frames nested in this one.
+    tree: &'a Tree<'a>,
+    nested: &'a [InlineSite],
 }
 
-impl Inlined<'_> {
+impl<'a> Inlined<'a> {
+    /// The compiled chunk's view, which holds the guards' data of the sites nested in this frame.
+    pub(super) fn compiled(&self) -> &'a FrozenChunk {
+        self.tree.compiled
+    }
+
     pub(super) fn receiver(&self) -> NodeIx {
         self.receiver
     }
@@ -450,10 +473,21 @@ impl<'a> Builder<'a> {
         with_this: bool,
         st: &mut State,
     ) -> Result<(), Refusal> {
-        let Some((tree, site)) = self
-            .inlining
-            .and_then(|tree| Some((tree, *tree.sites.get(&cache)?)))
-        else {
+        // The compiled frame's sites, or an inlined frame's own, nested in it (step 3d).
+        let found = match &self.inlined {
+            Some(inlined) => {
+                let tree = inlined.tree;
+                inlined
+                    .nested
+                    .iter()
+                    .find(|site| site.cache == cache)
+                    .map(|site| (tree, site))
+            }
+            None => self
+                .inlining
+                .and_then(|tree| Some((tree, *tree.sites.get(&cache)?))),
+        };
+        let Some((tree, site)) = found else {
             return self.effect(pc, st);
         };
         let mut kept: Vec<(usize, &'a InlineWay, &'a Analysis)> = Vec::new();
@@ -612,7 +646,14 @@ impl<'a> Builder<'a> {
         st: &State,
         exits: &mut Exits,
     ) -> Result<(), Refusal> {
-        let tree = self.inlining.expect("an inlined site's tree");
+        let tree = self
+            .inlining
+            .or_else(|| self.inlined.as_ref().map(|inlined| inlined.tree))
+            .expect("an inlined site's tree");
+        #[cfg(test)]
+        if self.inlined.is_some() {
+            TEST_NESTED_FRAMES.with(|count| count.set(count.get() + 1));
+        }
         let (view, snapshot) = tree.callees[way.chunk as usize];
         let frame = self.graph.open_frame(InlinedFrame {
             chunk: analysis.frame_chunk,
@@ -677,10 +718,14 @@ impl<'a> Builder<'a> {
                 call_pc: call.pc,
                 caller: self.frame,
                 exits: std::mem::take(exits),
+                tree,
+                nested: &way.nested,
             }),
             inline_log: Vec::new(),
         };
         let built = inner.run_inlined(entry);
+        // The nested sites' notes (step 3d), for the log and the tests.
+        self.inline_log.append(&mut inner.inline_log);
         self.graph = std::mem::take(&mut inner.graph);
         self.hoisted = std::mem::take(&mut inner.hoisted);
         self.hoisted_nodes = std::mem::take(&mut inner.hoisted_nodes);

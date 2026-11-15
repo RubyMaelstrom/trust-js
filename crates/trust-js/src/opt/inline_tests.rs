@@ -3219,14 +3219,20 @@ fn a_callee_an_inlined_frame_calls_imports_against_its_own_script() {
         .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
 }
 
-/// The rule for a way whose callee calls (P3 stage 3 step 3c-2, `InlineWay::graph_inlines`):
-/// `midN` calls a small leaf the plan inlines in turn, so `outerN`'s plan splices (a second
+/// The rule for a way whose callee calls (P3 stage 3 steps 3c-2 and 3d,
+/// `InlineWay::graph_inlines`): `midN` calls a small leaf the plan inlines in turn, so `outerN`
+/// compiles in place with `leafy` a frame nested in `midN`'s (step 3d); `midX` calls `mkX`, which
+/// the plan inlines in turn and which makes a `new` call, so `outerX`'s plan splices (a second
 /// stage, as at splice); `midP` calls a callee too large to plan, so `outerP` compiles in place
 /// at graph with `midP` inlined and its call a call node of the inlined frame.
 const NESTED_RULE: &str = "
 function leafy(x) { return x + 1; }
 function midN(x) { return leafy(x) * 2; }
 function outerN(n) { var s = 0; for (var i = 0; i < n; i++) s += midN(i); return s; }
+function Pt(x) { this.x = x; }
+function mkX(x) { return new Pt(x).x; }
+function midX(x) { return mkX(x) * 2; }
+function outerX(n) { var s = 0; for (var i = 0; i < n; i++) s += midX(i); return s; }
 function bigc(x) {
   if (x === -1) {
     var y = 0;
@@ -3296,10 +3302,10 @@ function bigc(x) {
 }
 function midP(x) { return bigc(x) * 2; }
 function outerP(n) { var s = 0; for (var i = 0; i < n; i++) s += midP(i); return s; }
-var r = 0; for (var k = 0; k < 300; k++) r += outerN(10) + outerP(10); r";
+var r = 0; for (var k = 0; k < 300; k++) r += outerN(10) + outerX(10) + outerP(10); r";
 
 #[test]
-fn a_way_whose_callees_calls_the_plan_inlines_keeps_its_plan_spliced() {
+fn a_way_whose_tree_makes_another_kind_of_call_keeps_its_plan_spliced() {
     inlines();
     inlined_generic();
     TestSwitches::default().set();
@@ -3316,7 +3322,11 @@ fn a_way_whose_callees_calls_the_plan_inlines_keeps_its_plan_spliced() {
             .get()
             .is_some_and(Option::is_some)
     };
-    assert!(second_stage(&mut engine, "outerN"), "outerN splices");
+    assert!(
+        !second_stage(&mut engine, "outerN"),
+        "outerN compiles in place"
+    );
+    assert!(second_stage(&mut engine, "outerX"), "outerX splices");
     assert!(
         !second_stage(&mut engine, "outerP"),
         "outerP compiles in place"
@@ -3592,4 +3602,455 @@ fn lazily_switched_kinds_give_their_helpers_the_frames_chunk_and_site() {
     let runs = counted(LAZY_KINDS, 0, false, true);
     assert_eq!(runs[2].0, runs[0].0, "poisoned (the eager switch)");
     assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+}
+
+// ---- P3 stage 3 step 3d: frames nested in inlined frames ---------------------------------------
+
+/// The frames nested in an inlined frame the builders opened since the last call (tests).
+fn nested_frames() -> usize {
+    super::build::TEST_NESTED_FRAMES.with(|count| count.replace(0))
+}
+
+/// Stage (i) of step 3d: leaves nested in an inlined frame (`mid`, which calls the leaf `leaf`,
+/// inlined in `run`; a method chain `o.a()` -> `this.b()` -> the leaf `this.c()`; a nested leaf
+/// with a loop and one in the middle frame's loop; missing and extra arguments; strict and
+/// sloppy `this`; a handler around the outer call; a nested leaf whose property read exits on a
+/// null, its TypeError's stack through the three frames the exit rebuilds; a guard failing in the
+/// outer frame (a second callee at `run`'s site) and in the inner one (a second leaf at `mid`'s);
+/// the TypeError of the nested leaf's exit caught in `run`, its stack through the three frames
+/// the exit rebuilt; a nested leaf whose build reaches a generic node, a generic node of the
+/// nested frame since stage (ii)).
+const NESTED_LEAVES: &str = "
+var probe = false, log = [];
+function gl(x) { return x instanceof Array ? 1 : 0; }
+function mid3(x) { return gl(x) + 1; }
+function run2(n) { var t = 0; for (var i = 0; i < n; i++) t += mid3([i]) + mid3(i); return t; }
+function leaf(x, y) { return x * 2 + (y === undefined ? 1 : y); }
+function mid(x) { return leaf(x) + leaf(x, 3, 4) + 1; }
+var o = { a: function (x) { return this.b(x) + 1; }, b: function (x) { return this.c(x) * 2; },
+  c: function (x) { return x + this.k; }, k: 5 };
+function sum(a) { var s = 0; for (var i = 0; i < a.length; i++) s += a[i]; return s; }
+function viaSum(a) { return sum(a) + 1; }
+function loopy(a) { var t = 0; for (var i = 0; i < 3; i++) t += leaf(a[i]); return t; }
+function sloppyThis() { return typeof this; }
+function strictThis() { 'use strict'; return typeof this; }
+function thisy(f) { return f() + '|'; }
+function deep(p) { return p.q.r; }
+function viaDeep(p) { return deep(p) + 1; }
+var alt = { b: function (x) { return x; } };
+function leaf2(x, y) { return x - 1; }
+var which = leaf;
+function midw(x) { return which(x, 1) + 1; }
+function run(n, p) { var t = 0;
+  for (var i = 0; i < n; i++) {
+    t += mid(i) + viaSum([i, 1, 2]) + loopy([i, i, i]) + midw(i);
+    t += thisy(sloppyThis).length + thisy(strictThis).length;
+    try { t += viaDeep(p); } catch (e) {
+      t += 100; if (probe) log.push('caught|' + e.name + '|' + e.stack.split('\\n').slice(1, 4).join('/')); }
+  }
+  return t; }
+function chain(n) { var t = 0; for (var i = 0; i < n; i++) t += o.a(i); return t; }
+var r = 0, good = { q: { r: 7 } };
+for (var k = 0; k < 300; k++) r += run(5, good) + chain(3) + run2(3);
+var out = [];
+out.push('ok|' + run(2, good));
+try { viaDeep({ q: null }); } catch (e) { out.push('deep|' + e.name + '|' + e.stack.split('\\n').slice(1, 4).join('/')); }
+probe = true; out.push('caught|' + run(1, { q: null })); probe = false;
+which = leaf2; out.push('inner guard|' + run(2, good));
+out.push('chain|' + chain(2));
+o.b = alt.b; out.push('outer guard|' + chain(2));
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn leaves_nested_in_an_inlined_frame_give_the_tier_offs_results() {
+    nested_frames();
+    let runs = counted(NESTED_LEAVES, 0, false, false);
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    assert_eq!(runs[2].0, runs[0].0, "graph");
+    assert!(nested_frames() > 0, "a frame nested in an inlined frame");
+    // `run` compiles in place, its nested frames' guards in its inlined frames; so does `chain`,
+    // whose `o.a` calls `this.b`, which calls the leaf `this.c`, three levels (stage (iv)).
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(&mut engine, NESTED_LEAVES);
+    assert!(
+        super::in_place(&chunk_of(&mut engine, "run")),
+        "run compiles in place"
+    );
+    assert!(
+        super::in_place(&chunk_of(&mut engine, "chain")),
+        "chain compiles in place"
+    );
+    // `run2`'s `mid3` nests `gl`, whose build reaches a generic node (InstanceOf), a generic node
+    // of a frame nested in an inlined frame (stage (ii)), and run2 compiles in place.
+    assert!(
+        super::in_place(&chunk_of(&mut engine, "run2")),
+        "run2 compiles in place"
+    );
+    assert!(runs[0].0.contains("caught|TypeError|"), "{}", runs[0].0);
+    for (exit_every, stress, poison) in [
+        (7, false, false),
+        (1, false, false),
+        (0, true, false),
+        (0, false, true),
+    ] {
+        super::take_poison_faults();
+        let runs = counted(NESTED_LEAVES, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
+}
+
+/// The loop limit through frames nested in an inlined frame (P3 stage 3 step 3d, the
+/// coordinator's point 8.1): an exit whose rebuilt chain holds a frame whose callee's first stage
+/// tried to enter a loop (its borrowed-frame code's state, `Chunk::osr`) takes the loop limit at
+/// once (`Limit::InlinedLoop`, exit.rs's walk of every rebuilt frame), whichever frame loops: the
+/// innermost (`lp`, a leaf nested in `md`'s frame, its add exiting on a string element) or the
+/// middle one (`md2`, whose own add exits, around its nested leaf `lf`). Each discards the
+/// compiled function's code once, at the loop limit's count; the compiled chunk's own template
+/// loops count nothing toward it (its warm-up arms at the same count, `arm_loop_limit`).
+fn loop_limit_through_nested_frames(
+    source: &str,
+    top: &str,
+    looping: &str,
+    probe: &str,
+    again: &str,
+) {
+    super::TEST_LIMITS.with(|limits| limits.borrow_mut().clear());
+    nested_frames();
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(&mut engine, source);
+    let compiled = chunk_of(&mut engine, top);
+    let looper = chunk_of(&mut engine, looping);
+    assert!(super::in_place(&compiled), "{top} compiles in place");
+    assert!(
+        nested_frames() > 0,
+        "a frame nested in {top}'s inlined frame"
+    );
+    let code = compiled.jit.get().flatten().unwrap();
+    let table = super::exit::table_of(&code).unwrap();
+    let loop_limit = table.loop_limit;
+    assert!(loop_limit < table.limit);
+    let out = eval(&mut engine, probe);
+    assert!(!out.is_empty());
+    assert!(
+        looper.osr.get().is_some(),
+        "{looping}'s loop tried its borrowed-frame code"
+    );
+    let limits = super::TEST_LIMITS.with(|limits| std::mem::take(&mut *limits.borrow_mut()));
+    assert!(
+        limits
+            .iter()
+            .any(|&(limit, taken)| limit == super::Limit::InlinedLoop && taken == loop_limit),
+        "{limits:?}"
+    );
+    // The reoptimization takes the kept ways again, the nested ones with them
+    // (`oracle::kept_plan`, `KeptWay::nested`), the flagged add a generic node of its frame,
+    // the middle one's or the nested one's (stage (ii)).
+    nested_frames();
+    eval(&mut engine, again);
+    assert!(super::in_place(&compiled), "{top} compiles in place again");
+    assert!(
+        nested_frames() > 0,
+        "{top}'s reoptimization nests its frame again"
+    );
+}
+
+#[test]
+fn an_exit_through_a_nested_frame_that_loops_takes_the_loop_limit_at_once() {
+    loop_limit_through_nested_frames(
+        "function lp(a) { var t = 0; for (var i = 0; i < a.length; i++) t = t + a[i]; return t; }
+         function md(a) { return lp(a) + 1; }
+         function tp(a) { return md(a) * 2; }
+         var a = [1, 2, 3, 4]; for (var i = 0; i < 400; i++) tp(a);",
+        "tp",
+        "lp",
+        "var t = ''; for (var i = 0; i < 20; i++) t = tp([1, 'x', 2]); t",
+        "for (var i = 0; i < 3000; i++) tp(a);",
+    );
+}
+
+#[test]
+fn an_exit_in_a_middle_frame_that_loops_takes_the_loop_limit_at_once() {
+    loop_limit_through_nested_frames(
+        "function lf(x) { return x + 1; }
+         function md2(a) { var t = 0; for (var i = 0; i < a.length; i++) t = t + a[i] + lf(i); return t; }
+         function tp2(a) { return md2(a) * 2; }
+         var a = [1, 2, 3, 4]; for (var i = 0; i < 400; i++) tp2(a);",
+        "tp2",
+        "md2",
+        "var t = ''; for (var i = 0; i < 20; i++) t = tp2([1, 'x', 2]); t",
+        "for (var i = 0; i < 3000; i++) tp2(a);",
+    );
+}
+
+/// Stage (ii) of step 3d: generic nodes of frames nested in an inlined frame (`top` inlines
+/// `mid`, which inlines the leaves): a megamorphic read whose getter records its caller and stack
+/// (piece A's variant takes the nested frame's chained site), a setter likewise, `in` of an
+/// object (a lazily switched kind), a loose equality whose valueOf records them, instanceof,
+/// a string concatenation; a TypeError from a nested frame's generic node (`in` of a primitive)
+/// caught in the outer inlined frame, in the compiled frame and by none; collections at every
+/// allocation, forced exits, the poison and the test builds' chunk trap at depth two.
+const NESTED_GENERIC_NODES: &str = "
+var probe = false, log = [];
+function stk(e, from, n) { return e.stack.split('\\n').slice(from, from + n).join('/'); }
+function mk(k) { var o = {}; o['f' + k] = k;
+  Object.defineProperty(o, 'g', { get: function gt() {
+    if (probe) log.push('gt<' + (gt.caller && gt.caller.name) + '|' + stk(new Error('g'), 1, 4));
+    return k; }, set: function st(v) {
+    if (probe) log.push('st<' + (st.caller && st.caller.name) + '|' + stk(new Error('s'), 1, 4)); } });
+  return o; }
+var objs = [mk(1), mk(2), mk(3), mk(4), mk(5), mk(6)];
+var vv = { valueOf: function vo() {
+  if (probe) log.push('vo<' + (vo.caller && vo.caller.name) + '|' + stk(new Error('v'), 1, 4));
+  return 2; } };
+function rd(o) { return o.g; }
+function wr(o, v) { o.g = v; return 1; }
+function has(k, o) { return k in o ? 1 : 0; }
+function eq(a, b) { return a == b ? 1 : 0; }
+function io(x) { return x instanceof Array ? 1 : 0; }
+function cat(a, b) { return a + '-' + b; }
+function mid(o, x, k) { return rd(o) + wr(o, x) + has(k, o) + eq(x, 2) + io(x) + cat(x, k).length; }
+function guard(o, x, k) { try { return mid(o, x, k); } catch (e) { if (probe) log.push('mid|' + e.name); return -1; } }
+function top(n, x, k) { var t = 0;
+  for (var i = 0; i < n; i++) {
+    t += mid(objs[i % 6], x, k) + guard(x === 1 ? objs[(i + 1) % 6] : i, x, k);
+    try { t += mid(x === 1 ? objs[i % 6] : i, x, k); } catch (e) { t += 100; if (probe) log.push('top|' + e.name + '|' + stk(e, 1, 4)); }
+  }
+  return t; }
+var r = 0;
+for (var j = 0; j < 300; j++) r += top(6, 1, 'f' + (j % 3));
+probe = true;
+var out = [];
+out.push('probe|' + top(2, vv, 'f1'));
+out.push('throws|' + top(2, 'a', 'f1'));
+try { out.push('none|' + mid(5, 1, 'f1')); } catch (e) { out.push('none!' + e.name + '|' + stk(e, 1, 4)); }
+probe = false;
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn generic_nodes_of_frames_nested_in_an_inlined_frame_give_the_tier_offs_results() {
+    nested_frames();
+    inlined_generic();
+    let runs = counted(NESTED_GENERIC_NODES, 0, false, false);
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    assert_eq!(runs[2].0, runs[0].0, "graph");
+    assert!(nested_frames() > 0, "frames nested in an inlined frame");
+    for seen in [
+        "gt<",
+        "st<",
+        "vo<",
+        "mid|TypeError",
+        "top|TypeError|",
+        "none!TypeError|",
+    ] {
+        assert!(runs[0].0.contains(seen), "{seen}: {}", runs[0].0);
+    }
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(&mut engine, NESTED_GENERIC_NODES);
+    assert!(
+        super::in_place(&chunk_of(&mut engine, "top")),
+        "top compiles in place"
+    );
+    for (exit_every, stress, poison) in [(7, false, false), (0, true, false), (0, false, true)] {
+        super::take_poison_faults();
+        let runs = counted(NESTED_GENERIC_NODES, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
+}
+
+/// Stages (iii) and (iv) of step 3d: calls from frames nested in inlined frames. `ext` (which the
+/// planner leaves a call: it reads `ext.caller`) records its caller, its caller's caller,
+/// `arguments.callee.caller` and its stack, called from `inner`'s frame nested in `mid`'s and
+/// `midT`'s; from `o.c`'s, three deep (`o.a` -> `this.b` -> `this.c`, a method call of `ext`);
+/// from recursion the planner nests (`rec` -> `mrec` -> `rec`, and the compiled `cc` -> `aa` ->
+/// `cc`, a frame of the compiled function's own chunk nested in `aa`'s); its RangeError caught in
+/// the outer inlined frame (`midT`), in the compiled frame (`topB`) and by none (`topC`); a string
+/// argument, whose arithmetic in the nested frames exits; forced exits at every check, collections
+/// at every allocation, the poison and the test builds' chunk trap.
+const NESTED_CALLS: &str = "
+var probe = false, log = [];
+function stk(e, from, n) { return e.stack.split('\\n').slice(from, from + n).join('/'); }
+function ext(x, y) {
+  if (probe) log.push('ext<' + (ext.caller && ext.caller.name) + '<' +
+    (ext.caller && ext.caller.caller && ext.caller.caller.name) + '<' +
+    (arguments.callee.caller && arguments.callee.caller.name) + '|' + y + '|' + stk(new Error('e'), 1, 5));
+  if (x === 'throw') throw new RangeError('ext');
+  return typeof x === 'number' ? x + 1 : 0; }
+function inner(x) { return ext(x, 'i') * 2; }
+function mid(x) { return inner(x) + 1; }
+function midT(x) { try { return inner(x); } catch (e) { if (probe) log.push('midT|' + e.name + '|' + stk(e, 0, 5)); return -2; } }
+var o = { a: function (x) { return this.b(x) + 1; }, b: function (x) { return this.c(x) * 2; },
+  c: function (x) { return this.m(x, this.k); }, k: 5, m: ext };
+function rec(n) { return n <= 0 ? ext(n, 'r') : mrec(n - 1) + 1; }
+function mrec(n) { return rec(n) * 1; }
+function cc(n) { return n <= 0 ? ext(n, 'c') : aa(n); }
+function aa(n) { return cc(n - 1) + 1; }
+function topA(n, x) { var t = 0; for (var i = 0; i < n; i++) t += midT(x === undefined ? i : x) + rec(1); return t; }
+function topB(n, x) { var t = 0;
+  for (var i = 0; i < n; i++) {
+    try { t += mid(x === undefined ? i : x); } catch (e) { t += 100; if (probe) log.push('topB|' + e.name + '|' + stk(e, 0, 5)); }
+  }
+  return t; }
+function topC(n, x) { var t = 0; for (var i = 0; i < n; i++) t += o.a(x === undefined ? i : x); return t; }
+var r = 0;
+for (var j = 0; j < 300; j++) r += topA(3) + topB(3) + topC(3) + cc(2);
+probe = true;
+var out = [];
+function at(tag, thunk) {
+  try { out.push(tag + '|' + thunk()); } catch (e) { out.push(tag + '!' + e.name + ':' + e.message + '|' + stk(e, 0, 6)); } }
+at('A', function () { return topA(1); });
+at('B', function () { return topB(1); });
+at('C', function () { return topC(1); });
+at('cc', function () { return cc(2); });
+at('Athrow', function () { return topA(1, 'throw'); });
+at('Bthrow', function () { return topB(1, 'throw'); });
+at('Cthrow', function () { return topC(1, 'throw'); });
+at('Astr', function () { return topA(2, 's'); });
+probe = false;
+at('again', function () { return topA(3) + topB(3) + topC(3) + cc(2); });
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn calls_from_frames_nested_in_an_inlined_frame_give_the_tier_offs_results() {
+    nested_frames();
+    inlined_generic();
+    let runs = counted(NESTED_CALLS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    assert!(nested_frames() > 0, "frames nested in an inlined frame");
+    for seen in [
+        "ext<inner<mid<inner|i|",
+        "ext<inner<midT<inner|i|",
+        "|5|",
+        "|r|",
+        "|c|",
+        "midT|RangeError|",
+        "topB|RangeError|",
+        "Cthrow!RangeError:ext|",
+        "again|",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(&mut engine, NESTED_CALLS);
+    for top in ["topA", "topB", "topC", "cc"] {
+        assert!(
+            super::in_place(&chunk_of(&mut engine, top)),
+            "{top} compiles in place"
+        );
+    }
+    for (exit_every, stress, poison) in [
+        (7, false, false),
+        (1, false, false),
+        (0, true, false),
+        (0, false, true),
+    ] {
+        super::take_poison_faults();
+        let runs = counted(NESTED_CALLS, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
+}
+
+/// A guard failing in the outer and in the nested frame (step 3d, design note section 4): a
+/// second callee at `md`'s call, the site nested in `md`'s inlined frame, exits from that frame
+/// (depth 1) at the call, WrongCallee flagged on `md`'s first stage at the call's pc, the inlined
+/// key; a second callee at `tp`'s own call flags `tp`'s chunk at its pc. One discard each, and
+/// each reoptimization compiles in place again, the failed guard's site a test whose mismatch
+/// edge is the generic call.
+#[test]
+fn a_guard_failing_in_a_nested_frame_flags_its_frames_chunk_at_the_call() {
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    let source = "function lf(x) { return x + 1; }
+        function lg(x) { return x - 1; }
+        var which = lf;
+        function md(x) { return which(x) * 2; }
+        function md2(x) { return lf(x) * 3; }
+        var outer = md;
+        function tp(n) { var t = 0; for (var i = 0; i < n; i++) t += outer(i); return t; }
+        for (var k = 0; k < 400; k++) tp(5);
+        tp(5)";
+    nested_frames();
+    let warm = eval(&mut engine, source);
+    let compiled = chunk_of(&mut engine, "tp");
+    let mid = chunk_of(&mut engine, "md");
+    assert!(super::in_place(&compiled), "tp compiles in place");
+    assert!(nested_frames() > 0, "lf nested in md's frame");
+    let call_pc = |chunk: &Chunk| -> u32 {
+        chunk
+            .jit_ops()
+            .iter()
+            .position(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..)))
+            .expect("a call") as u32
+    };
+    let wrong = |chunk: &Chunk, pc: u32| -> Vec<bool> {
+        let mut flags = Vec::new();
+        if let Some(profile) = ChunkProfile::get(chunk) {
+            profile.sites_at(pc, |reason, inlined, _| {
+                if reason == ExitReason::WrongCallee as u8 {
+                    flags.push(inlined);
+                }
+            });
+        }
+        flags
+    };
+    let discards = |chunk: &Chunk| {
+        ChunkProfile::get(super::profile::first_stage(chunk)).map_or(0, ChunkProfile::discards)
+    };
+    assert_eq!(warm, "30");
+    assert!(wrong(&mid, call_pc(&mid)).is_empty());
+    let before = discards(&compiled);
+    inlined_exits();
+    let got = eval(
+        &mut engine,
+        "which = lg; var t = 0; for (var k = 0; k < 2000; k++) t += tp(5); t",
+    );
+    assert_eq!(got, "20000");
+    let exits = inlined_exits();
+    assert!(
+        exits.iter().any(|&(depth, pc, why)| depth == 1
+            && pc == call_pc(&mid)
+            && why == ExitReason::WrongCallee),
+        "{exits:?}"
+    );
+    // The inlined key (md's own code, which the tier compiles too, flags its own key as well).
+    assert!(
+        wrong(&mid, call_pc(&mid)).contains(&true),
+        "md's chunk flagged at its call, the inlined key: {:?}",
+        wrong(&mid, call_pc(&mid))
+    );
+    assert_eq!(discards(&compiled), before + 1, "one discard");
+    assert!(super::in_place(&compiled), "tp compiles in place again");
+    let before = discards(&compiled);
+    let got = eval(
+        &mut engine,
+        "outer = md2; var t = 0; for (var k = 0; k < 2000; k++) t += tp(5); t",
+    );
+    assert_eq!(got, "90000");
+    assert!(
+        wrong(&compiled, call_pc(&compiled)).contains(&false),
+        "tp's chunk flagged at its call, its own key: {:?}",
+        wrong(&compiled, call_pc(&compiled))
+    );
+    assert_eq!(discards(&compiled), before + 1, "one discard");
+    assert!(super::in_place(&compiled), "tp compiles in place again");
 }

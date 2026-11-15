@@ -937,8 +937,22 @@ fn prepare(
     };
     if let (Some(inlining), Some(started)) = (&inlining, oracle_timer) {
         let ms = part_ms(started);
+        // The ways nested in inlined frames and their deepest level (P3 stage 3 step 3d).
+        fn nested(sites: &[super::build::InlineSite], level: usize) -> (usize, usize) {
+            let (mut ways, mut depth) = (0, 0);
+            for way in sites.iter().flat_map(|site| site.ways.iter()) {
+                if !way.nested.is_empty() {
+                    let (inner, deepest) = nested(&way.nested, level + 1);
+                    ways += inner + way.nested.iter().map(|site| site.ways.len()).sum::<usize>();
+                    depth = depth.max(deepest).max(level + 1);
+                }
+            }
+            (ways, depth)
+        }
+        let (nested_ways, depth) = nested(&inlining.sites, 1);
         log_line!(
-            "[opt] oracle {}: {} sites, {} ways, {} callee chunks in {ms:.3} ms",
+            "[opt] oracle {}: {} sites, {} ways, {nested_ways} nested ways to level {depth}, {} \
+             positions, {} callee chunks in {ms:.3} ms",
             name(chunk),
             inlining.sites.len(),
             inlining
@@ -946,6 +960,7 @@ fn prepare(
                 .iter()
                 .map(|site| site.ways.len())
                 .sum::<usize>(),
+            held.sites.registered(),
             inlining.callees.len()
         );
     }
@@ -1203,7 +1218,8 @@ fn log_inlines(chunk: &Chunk, inlines: &[super::build::InlineNote], held: &super
 /// (`InlineWay::graph_inlines`) splices as before (P3 stage 3, steps 2 and 3c-2): its line under
 /// TRUST_JS_OPT_LOG, `[opt] spliced <name>: a way's callee calls (<ways not taken>: nested <n>,
 /// other calls <n>, spliced callee <n>; calls <op kinds and counts of their callees>)`, for the
-/// census.
+/// census; `nested` counts a way making plain calls only a way nested in which (at any depth)
+/// makes another kind of call (step 3d).
 pub(crate) fn note_spliced(
     chunk: &Chunk,
     plan: &crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>,
@@ -1227,7 +1243,8 @@ pub(crate) fn note_spliced(
         } else if !way.plain_calls() {
             other += 1;
         } else {
-            // A callee whose calls the plan inlines in turn (`InlineWay::graph_inlines`).
+            // A callee making plain calls only, a way the plan nests in which makes another kind
+            // of call, at any depth (`InlineWay::graph_inlines`, step 3d).
             nested += 1;
         }
         for op in callee.iter().flat_map(|callee| callee.jit_ops().iter()) {
@@ -2541,8 +2558,43 @@ fn reread_call_ways(chunk: &Chunk) -> usize {
             }
         }
     }
-    // A first stage's graph-inlined sites: each kept way's call, every way of it flagged.
-    let ways = profile.inline_ways();
+    if log_enabled() {
+        for &pc in &set {
+            log_line!(
+                "[opt] flag {} pc {pc} WrongCallee own (re-read: its site met another callee)",
+                name(chunk)
+            );
+        }
+    }
+    let mut set: Vec<(usize, usize)> = set
+        .iter()
+        .map(|&pc| (chunk as *const Chunk as usize, pc))
+        .collect();
+    // A first stage's graph-inlined sites: each kept way's call, every way of it flagged; and
+    // the sites nested in the ways' frames in turn (step 3d).
+    reread_kept(chunk, chunk, &profile.inline_ways(), false, &mut set);
+    #[cfg(test)]
+    TEST_REREAD.with(|reread| reread.borrow_mut().extend(set.iter().copied()));
+    set.len()
+}
+
+/// Rule 5 at the sites of kept ways `ways` in `at`: a first stage compiled in place, or a kept
+/// way's callee's first stage, whose sites are frames nested in an inlined frame (`inlined`; P3
+/// stage 3 step 3d), each read from its call's cache in `at` (the outer callee's, which holds
+/// every callee its call met) and flagged with the key its guards' exit sets (`flag`'s inlined
+/// key, an inlined frame's exit) and an inlined frame reads (`snapshot::declined`: WrongCallee is
+/// kind-bound); then at the sites nested in their frames in turn. Each site it flags, to `set`
+/// (its chunk and pc), and to the log as `chunk`'s.
+fn reread_kept(
+    chunk: &Chunk,
+    at: &Chunk,
+    ways: &[super::profile::KeptWay],
+    inlined: bool,
+    set: &mut Vec<(usize, usize)>,
+) {
+    use crate::bytecode::Op;
+    let ops = at.jit_ops();
+    let profile = ChunkProfile::of(at);
     let mut caches: Vec<u32> = ways.iter().map(|way| way.cache).collect();
     caches.sort_unstable();
     caches.dedup();
@@ -2558,12 +2610,20 @@ fn reread_call_ways(chunk: &Chunk) -> usize {
         else {
             continue;
         };
-        if met_another(pc, &guarded) {
+        let met_another = snapshot::call_site(at, pc).is_some_and(|call| {
+            call.state == crate::feedback::CallState::Megamorphic
+                || call
+                    .ways
+                    .iter()
+                    .flatten()
+                    .any(|target| !guarded.contains(&target.callee))
+        });
+        if met_another {
             // Its guard byte: the ways the flag covers (`build_inline::flagged`), raised to all.
             let places = u8::try_from(guarded.len()).unwrap_or(u8::MAX);
             let mut had = None;
-            profile.sites_at(pc as u32, |reason, inlined, ways| {
-                if reason == ExitReason::WrongCallee as u8 && !inlined {
+            profile.sites_at(pc as u32, |reason, key_inlined, ways| {
+                if reason == ExitReason::WrongCallee as u8 && key_inlined == inlined {
                     had = Some(ways);
                 }
             });
@@ -2571,29 +2631,40 @@ fn reread_call_ways(chunk: &Chunk) -> usize {
                 profile.add_site(
                     pc as u32,
                     ExitReason::WrongCallee as u8,
-                    false,
+                    inlined,
                     places,
                     false,
                 );
-                set.push(pc);
+                set.push((at as *const Chunk as usize, pc));
+                if log_enabled() {
+                    let key = if inlined {
+                        format!("at {} pc {pc} (spliced)", name(at))
+                    } else {
+                        "own".to_string()
+                    };
+                    log_line!(
+                        "[opt] flag {} pc {pc} WrongCallee {key} (re-read: its site met another \
+                         callee)",
+                        name(chunk)
+                    );
+                }
             }
         }
     }
-    if log_enabled() {
-        for &pc in &set {
-            log_line!(
-                "[opt] flag {} pc {pc} WrongCallee own (re-read: its site met another callee)",
-                name(chunk)
-            );
+    for way in ways.iter().filter(|way| !way.nested.is_empty()) {
+        let Some(obj) = way.callee.upgrade() else {
+            continue;
+        };
+        let callee = match &obj.borrow().kind {
+            crate::value::ObjectKind::User(user) => {
+                user.func.runtime().code.get().and_then(Option::clone)
+            }
+            _ => None,
+        };
+        if let Some(callee) = callee {
+            reread_kept(chunk, &callee, &way.nested, true, set);
         }
     }
-    #[cfg(test)]
-    TEST_REREAD.with(|reread| {
-        reread
-            .borrow_mut()
-            .extend(set.iter().map(|&pc| (chunk as *const Chunk as usize, pc)))
-    });
-    set.len()
 }
 
 /// Keep the realm's global environment, `pin`'s, from address reuse while the heap lives, where

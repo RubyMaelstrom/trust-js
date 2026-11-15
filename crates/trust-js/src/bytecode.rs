@@ -11566,16 +11566,21 @@ pub struct InlinePlanEntry {
 }
 
 impl InlineWay {
-    /// Whether the optimizing tier's graph inliner takes this way (TRUST_JS_OPT_INLINE=graph):
-    /// a leaf (P3 stage 3, step 2), or a callee whose calls are plain and method calls
-    /// ([`makes_plain_calls_only`]) the plan inlines none of (its `nested` empty), made from its
-    /// inlined frame as generic call nodes (step 3c-2). A way whose callee's calls the plan
-    /// inlines in turn keeps its plan spliced: the graph does not nest frames in inlined frames
-    /// yet, and calling what the splice inlines loses to it (DeltaBlue +8.8%, React's steady state
-    /// +9.4% at fixed 5 when it did). Asked only under graph inlining, so that the planner's
-    /// work, which the template JIT's splices share, is unchanged.
+    /// Whether the optimizing tier's graph inliner takes this way (TRUST_JS_OPT_INLINE=graph): a
+    /// leaf (P3 stage 3, step 2), or a callee whose calls are plain and method calls
+    /// ([`makes_plain_calls_only`]), made from its inlined frame as generic call nodes (step 3c-2)
+    /// where the plan inlines none of their callees, and as frames nested in its frame where it
+    /// does (step 3d), every way the plan nests in it taken by the same test, to the planner's
+    /// depth: a plan with a way anywhere in its tree whose callee makes another kind of call
+    /// (`new`, spread) splices whole. Asked only under graph inlining, so that the planner's work,
+    /// which the template JIT's splices share, is unchanged.
     pub(crate) fn graph_inlines(&self) -> bool {
-        self.leaf || (self.nested.is_empty() && self.plain_calls())
+        self.leaf
+            || (self.plain_calls()
+                && self
+                    .nested
+                    .values()
+                    .all(|entry| entry.ways.iter().all(InlineWay::graph_inlines)))
     }
 
     /// Whether the callee's chunk splices nothing of its own and every explicit call it makes is

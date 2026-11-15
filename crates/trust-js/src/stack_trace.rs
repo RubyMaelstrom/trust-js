@@ -139,6 +139,18 @@ impl InlineSites {
         })
     }
 
+    /// The positions registered (the tier's log: P3 stage 3 step 3d's site count).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn registered(&self) -> usize {
+        self.0.as_ref().map_or(0, |metadata| metadata.ids.len())
+    }
+
     pub(crate) fn retained_bytes(&self) -> usize {
         self.0.as_ref().map_or(0, |metadata| {
             std::mem::size_of::<InlineMetadata>()

@@ -307,6 +307,10 @@ fn spliced_global_closure_reads_ignore_caller_environment_bindings() {
 /// Spliced reads stay live, and replacing either function falls back to the generic call.
 #[test]
 fn spliced_closures_over_non_global_environments_read_live_bindings() {
+    // A splice's subject: under TRUST_JS_OPT_INLINE=graph `hotDecode`'s plan (decode, whose Q is
+    // inlined in turn) compiles in place with Q a frame nested in decode's (P3 stage 3 step 3d),
+    // with no second stage to look at.
+    crate::opt::pin_splice_for_test();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);
@@ -569,7 +573,11 @@ fn spliced_callee_outlives_dropping_its_last_reference() {
 #[test]
 fn legacy_caller_finds_spliced_activations() {
     // `f.caller` of a frame called from a spliced callee names that callee, and a function that
-    // reads its own `caller` keeps its frame (nested splices included).
+    // reads its own `caller` keeps its frame (nested splices included). A splice's subject: under
+    // TRUST_JS_OPT_INLINE=graph `invoke`'s plan (mid, whose leaf is inlined in turn) compiles in
+    // place with leaf a frame nested in mid's (P3 stage 3 step 3d), with no second stage to look
+    // at; opt::inline_tests' nested calls test reads `caller` through such frames.
+    crate::opt::pin_splice_for_test();
     let source = r#"
         function inspect() { return inspect.caller; }
         function leaf(x) { return inspect() === leaf ? x : -1; }

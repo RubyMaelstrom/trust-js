@@ -111,3 +111,110 @@ fn a_reoptimization_turns_the_guards_of_sites_that_met_other_callees_into_tests(
         crate::opt::release_retired(&mut engine.interp);
     }
 }
+
+/// Rule 5 at a site nested in an inlined frame (P3 stage 3 step 3d): `hn` compiles in place at
+/// graph with `md` inlined and `md`'s call of `f` (`la` when warm) a frame nested in `md`'s. A
+/// string `n` discards `hn`'s code (its add's exits), a string `x` `md`'s own (its multiply's), so
+/// that `md` runs its template code too; in `hn`'s warm-up the template code calls `md` with `lb`,
+/// which `md`'s call cache meets and no guard holds; the reoptimization re-reads the
+/// nested site from that cache and flags `md`'s first stage at its call with the inlined key (the
+/// key the nested guard's exit sets and an inlined frame reads), so that the recompile builds the
+/// nested guard as a test whose mismatch edge is the generic call: no exit and no discard after.
+const NESTED: &str = "function la(x) { return x + 1; }\n\
+                      function lb(x) { return x + 2; }\n\
+                      function md(f, x) { return f(x) * 2; }\n\
+                      function hn(f, n, x) { return md(f, x) + n; }\n\
+                      la(0); lb(0);\n\
+                      var t = 0; for (var i = 0; i < 3000; i++) t += hn(la, i, i); t";
+/// The exit limit's exits at R = 0 (`EXIT_LIMIT`) and no call after the discard, so that the
+/// warm-up's template code runs in `NESTED_WARM_UP` alone.
+const NESTED_EXIT: &str = "var u = ''; for (var i = 0; i < 100; i++) u = hn(la, 's' + i, i); u";
+const NESTED_MD_EXIT: &str = "var m = 0; for (var i = 0; i < 100; i++) m = md(la, 's' + i); m";
+const NESTED_WARM_UP: &str =
+    "var v = 0; for (var i = 0; i < 3000; i++) v += hn(i % 2 ? la : lb, i, i); v";
+const NESTED_AFTER: &str =
+    "var w = 0; for (var i = 0; i < 50; i++) w += hn(i % 2 ? la : lb, i, i); w";
+
+#[test]
+fn a_reoptimization_re_reads_the_ways_of_a_site_nested_in_an_inlined_frame() {
+    let expected: Vec<String> = {
+        let mut vm = crate::Engine::new();
+        vm.set_tier(Tier::Bytecode);
+        vm.set_tier_threshold(0);
+        [
+            NESTED,
+            NESTED_EXIT,
+            NESTED_MD_EXIT,
+            NESTED_WARM_UP,
+            NESTED_AFTER,
+        ]
+        .iter()
+        .map(|source| eval(&mut vm, source))
+        .collect()
+    };
+    crate::opt::TestSwitches {
+        inline_graph: Some(true),
+        ..super::eager()
+    }
+    .set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, NESTED), expected[0], "warm");
+    let chunk = tier_chunk(&mut engine, "hn").expect("hn's tier chunk");
+    assert!(super::super::in_place(&chunk), "hn compiles in place");
+    let md = super::first_stage(&mut engine, "md");
+    let md_call = md
+        .jit_ops()
+        .iter()
+        .position(|op| matches!(op, crate::bytecode::Op::Call(..)))
+        .expect("md's call");
+    let before = discards(&chunk);
+    assert_eq!(super::super::EXIT_LIMIT, 100);
+    assert_eq!(eval(&mut engine, NESTED_EXIT), expected[1], "exits");
+    assert_eq!(discards(&chunk), before + 1, "the add's exits discard");
+    let md_before = discards(&md);
+    assert_eq!(eval(&mut engine, NESTED_MD_EXIT), expected[2], "md's exits");
+    assert_eq!(
+        discards(&md),
+        md_before + 1,
+        "md's multiply's exits discard"
+    );
+    super::super::TEST_REREAD.with(|reread| reread.borrow_mut().clear());
+    exits();
+    let warm_before = discards(&chunk);
+    assert_eq!(eval(&mut engine, NESTED_WARM_UP), expected[3], "warm-up");
+    assert!(!super::super::reoptimizing(&chunk), "reoptimized");
+    assert!(super::super::in_place(&chunk), "hn compiles in place again");
+    // The recompile read the flag before any nested guard exited: no WrongCallee exit in the
+    // warm-up's rest and no discard (a nested guard left a check would exit for every `lb` to
+    // the limit and discard again; one flagged with the own key too, which an inlined frame does
+    // not read for a kind-bound reason).
+    assert!(
+        !exits()
+            .iter()
+            .any(|&(_, why)| why == ExitReason::WrongCallee),
+        "no WrongCallee exit after the re-read"
+    );
+    assert_eq!(discards(&chunk), warm_before, "no discard in the warm-up");
+    let reread: Vec<(usize, usize)> =
+        super::super::TEST_REREAD.with(|reread| reread.borrow().clone());
+    assert!(
+        reread.contains(&(std::rc::Rc::as_ptr(&md) as usize, md_call)),
+        "md's call, the nested site, re-read: {reread:?}"
+    );
+    let mut inlined_key = false;
+    super::super::profile::ChunkProfile::of(&md).sites_at(md_call as u32, |reason, inlined, _| {
+        inlined_key |= reason == ExitReason::WrongCallee as u8 && inlined;
+    });
+    assert!(inlined_key, "the flag's key is the inlined one");
+    exits();
+    let after = discards(&chunk);
+    assert_eq!(eval(&mut engine, NESTED_AFTER), expected[4], "after");
+    assert!(
+        !exits()
+            .iter()
+            .any(|&(_, why)| why == ExitReason::WrongCallee),
+        "the nested site takes its mismatch edge"
+    );
+    assert_eq!(discards(&chunk), after, "no discard after");
+    crate::opt::release_retired(&mut engine.interp);
+}

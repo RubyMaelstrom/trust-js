@@ -173,6 +173,9 @@ pub(crate) struct KeptWay {
     pub(crate) leaf: bool,
     pub(crate) expected_genv: usize,
     pub(crate) genv_pin: crate::interpreter::WeakEnv,
+    /// The ways the graph took at the callee's own call sites, frames nested in this one (P3
+    /// stage 3 step 3d), each `cache` the callee chunk's call-cache index.
+    pub(crate) nested: Vec<KeptWay>,
 }
 
 impl std::fmt::Debug for KeptWay {

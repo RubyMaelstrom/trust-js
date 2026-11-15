@@ -526,8 +526,19 @@ fn check_graph(
                     "an exit without a frame state",
                 ));
             }
+            // A callee guard of a site nested in an inlined frame (P3 stage 3 step 3d) reads its
+            // data in the compiled chunk's view and the running global environment, the same in
+            // every frame of the code, and no caller environment (the verifier's frame-free
+            // guard; its lowering refuses one that would).
+            let frame_free_guard = match node.op {
+                NodeOp::CheckCallee { target } | NodeOp::CalleeMatches { target } => {
+                    chunk.jit_inline_target(target).expected_env == 0
+                }
+                _ => false,
+            };
             if !node.frame.is_compiled()
-                && (frame_chunk(node.frame).is_none() || node.op.reads_compiled_frame())
+                && (frame_chunk(node.frame).is_none()
+                    || (node.op.reads_compiled_frame() && !frame_free_guard))
             {
                 return Err(Refusal::at(
                     node.pc as usize,
@@ -576,19 +587,9 @@ fn check_graph(
                     if (pops as usize) > depth || node.inputs.len() != pops as usize + stale {
                         return Err(Refusal::at(pc as usize, "an effect's operands"));
                     }
-                    // An inlined frame's generic node publishes its frame's inline site, whose
-                    // caller position is the compiled frame's call's (the oracle's): a frame
-                    // inlined into an inlined frame (no plan builds one today: the oracle keeps
-                    // leaf callees) would need its site to chain its caller's.
-                    if graph
-                        .inlined(node.frame)
-                        .is_some_and(|frame| !graph.state(frame.parent).frame.is_compiled())
-                    {
-                        return Err(Refusal::at(
-                            pc as usize,
-                            "a generic node of a frame inlined into an inlined frame",
-                        ));
-                    }
+                    // A frame nested in an inlined frame (P3 stage 3 step 3d): its generic node
+                    // publishes its own inline site, which chains its outer frame's call site
+                    // (`oracle::prepare`), and its operands lie at its own frame's depth.
                     // An inlined frame's node's operand words and slot window lie in the
                     // compiled frame's record, from its operand base (`lower_inlined_generic`).
                     if !node.frame.is_compiled()
@@ -3075,6 +3076,14 @@ impl Gen<'_> {
     /// A spliced callee's guard, as the first stage's InlineGuard template tests it.
     fn lower_check_callee(&mut self, n: NodeIx, target: u32) -> Result<(), Refusal> {
         let node = self.graph.node(n);
+        // A guard in an inlined frame (a site nested in it, P3 stage 3 step 3d) reads no caller
+        // environment: the compiled frame's `env_raw` is not its caller's.
+        if !node.frame.is_compiled() && self.chunk.jit_inline_target(target).expected_env != 0 {
+            return Err(Refusal::at(
+                node.pc as usize,
+                "a nested callee guard that requires its caller's environment",
+            ));
+        }
         let site = self.check_exit(n)?;
         let it = *self.chunk.jit_inline_target(target);
         // The expected function's stored word, read out of an Option<Gc> as the first stage's
@@ -3125,6 +3134,14 @@ impl Gen<'_> {
     /// may be an input's whose range ends here.
     fn lower_callee_matches(&mut self, n: NodeIx, target: u32) -> Result<(), Refusal> {
         let node = self.graph.node(n);
+        // A guard in an inlined frame (a site nested in it, P3 stage 3 step 3d) reads no caller
+        // environment: the compiled frame's `env_raw` is not its caller's.
+        if !node.frame.is_compiled() && self.chunk.jit_inline_target(target).expected_env != 0 {
+            return Err(Refusal::at(
+                node.pc as usize,
+                "a nested callee guard that requires its caller's environment",
+            ));
+        }
         let it = *self.chunk.jit_inline_target(target);
         let mismatch = self.a.new_label();
         let done = self.a.new_label();
