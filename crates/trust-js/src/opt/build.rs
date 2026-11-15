@@ -1326,12 +1326,14 @@ enum Source {
 
 /// A receiver an effect-free loop's element sites reach (P3 stage 3 step 0c): its source, the
 /// typed kind every one of its sites accesses in line (None where they differ, or a site takes
-/// the receiver in another form), and whether one stores.
-#[derive(Clone, Copy, Debug)]
+/// the receiver in another form), whether one stores, and the sites' pcs (step L1c: the checks
+/// its entry checks stand for).
+#[derive(Clone, Debug)]
 struct TypedUse {
     source: Source,
     kind: Option<TypedKind>,
     write: bool,
+    pcs: Vec<u32>,
 }
 
 impl Flow {
@@ -1523,11 +1525,13 @@ impl Flow {
                                         known.kind = None;
                                     }
                                     known.write |= write;
+                                    known.pcs.push(pc as u32);
                                 }
                                 None => found.typed.push(TypedUse {
                                     source,
                                     kind,
                                     write,
+                                    pcs: vec![pc as u32],
                                 }),
                             }
                         }
@@ -1935,6 +1939,19 @@ pub(crate) struct Alternatives {
     pub(crate) f64: Option<NodeIx>,
 }
 
+/// A check of a typed array made at a loop's entry edge (P3 stage 3 step 0c) and what it stands
+/// for (step L1c): its node, its own reason, the typed sites of its receiver in the loop, and the
+/// loop's header pc and frame, by which the selector finds the header block once the blocks are
+/// numbered (`phis::Selector::typed_entry_sites`).
+#[derive(Debug)]
+pub(crate) struct TypedEntry {
+    pub(crate) node: NodeIx,
+    pub(crate) reason: ExitReason,
+    pub(crate) pcs: Vec<u32>,
+    pub(crate) header_pc: u32,
+    pub(crate) frame: FrameIx,
+}
+
 /// What the builder hands the phi selector beside the graph (stage 2 step 6).
 #[derive(Debug, Default)]
 pub(crate) struct PhiNotes {
@@ -1946,6 +1963,8 @@ pub(crate) struct PhiNotes {
     /// held at the header (P3 stage 3 step 3a) or loaded at the end of the predecessor where the
     /// frame kept them (`Builder::invariant`).
     pub(crate) invariants: Vec<(NodeIx, BlockIx)>,
+    /// The typed arrays' checks made at loops' entry edges (P3 stage 3 steps 0c and L1c).
+    pub(crate) typed_entry: Vec<TypedEntry>,
 }
 
 /// A built loop header: its phis by the location each merges, the state it assumed for what the
@@ -3340,10 +3359,13 @@ impl<'a> Builder<'a> {
         let state = self.frame_state(pc, st);
         let cur = std::mem::replace(&mut self.cur, pred);
         let mark = self.graph.block(pred).body.len();
+        // Each receiver's nodes, with the sites they stand for (step L1c).
+        let mut stands: Vec<(usize, &[u32])> = Vec::new();
         for typed in &lp.typed {
             let Some(kind) = typed.kind else {
                 continue;
             };
+            stands.push((self.graph.block(pred).body.len(), &typed.pcs));
             let mut cx = Before::with(pc, state);
             let word = match typed.source {
                 Source::Slot(slot) if lp.written[slot] => continue,
@@ -3381,9 +3403,23 @@ impl<'a> Builder<'a> {
         let Graph { blocks, nodes, .. } = &mut self.graph;
         let body = &mut blocks[pred.index()].body;
         let made = body.split_off(mark);
-        for &node in &made {
+        for (k, &node) in made.iter().enumerate() {
             let data = &mut nodes[node.index()];
             if data.state.is_some() {
+                // The sites of the receiver whose nodes start at or before it (step L1c).
+                let at = mark + k;
+                let pcs = stands
+                    .iter()
+                    .rev()
+                    .find(|&&(start, _)| start <= at)
+                    .map_or(&[][..], |&(_, pcs)| pcs);
+                self.notes.typed_entry.push(TypedEntry {
+                    node,
+                    reason: data.reason.expect("a check's reason"),
+                    pcs: pcs.to_vec(),
+                    header_pc: pc as u32,
+                    frame: self.frame,
+                });
                 data.reason = Some(ExitReason::HoistingFailed);
             }
         }

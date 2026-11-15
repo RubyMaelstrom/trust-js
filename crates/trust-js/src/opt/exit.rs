@@ -144,6 +144,21 @@ pub(crate) struct ShapeCheck {
     pub(crate) hop: bool,
 }
 
+/// A check a moved check's exit stands for (P3 stage 3 step L1c; ir.rs `MovedCheck`): its
+/// operation's pc in its chunk, that chunk ([`OWN_CHUNK`], the code's own; else its index among
+/// the code's inlined chunks, as [`FrameRecipe::chunk`] is), its reason, and whether it runs
+/// whenever the loop is entered (`phis::runs_whenever_entered`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MovedSite {
+    pub(crate) pc: u32,
+    pub(crate) chunk: u32,
+    pub(crate) reason: ExitReason,
+    pub(crate) anyway: bool,
+}
+
+/// [`MovedSite::chunk`] of a site of the compiled function's own frame.
+pub(crate) const OWN_CHUNK: u32 = u32::MAX;
+
 /// A code object's exits.
 #[derive(Debug, Default)]
 pub(crate) struct ExitTable {
@@ -176,6 +191,10 @@ pub(crate) struct ExitTable {
     pub(crate) loop_warm_up: u32,
     /// Whether the code was discarded (`opt::discard`).
     pub(crate) discarded: std::cell::Cell<bool>,
+    /// The moved checks' exits (P3 stage 3 step L1c), by their index in `exits`, ascending, each
+    /// with the checks it stands for, which its discard flags (`driver::flag_moved`). Data only:
+    /// nothing in the code reads it.
+    pub(crate) moved: Box<[(u32, Box<[MovedSite]>)]>,
 }
 
 /// The save area the exit stub makes (ARM64): x0..x29 at words 0..29, d0..d31 at words 30..61;
@@ -201,6 +220,23 @@ impl ExitTable {
             + self.exits.iter().map(record_bytes).sum::<usize>()
             + self.frames.iter().map(frame_bytes).sum::<usize>()
             + self.name.len()
+            + self
+                .moved
+                .iter()
+                .map(|(_, sites)| {
+                    std::mem::size_of::<(u32, Box<[MovedSite]>)>()
+                        + sites.len() * std::mem::size_of::<MovedSite>()
+                })
+                .sum::<usize>()
+    }
+
+    /// The checks exit `index` stands for, where it is a moved check's (P3 stage 3 step L1c).
+    pub(crate) fn moved_sites(&self, index: usize) -> Option<&[MovedSite]> {
+        let at = self
+            .moved
+            .binary_search_by_key(&(index as u32), |&(exit, _)| exit)
+            .ok()?;
+        Some(&self.moved[at].1)
     }
 
     /// Inlined frame `frame`'s recipe (`frame` > 0).
@@ -280,6 +316,18 @@ pub(crate) fn exit_chunk<'t>(
     (exit.frame != 0).then(|| {
         // SAFETY: the code holds the chunk as long as its table lives (`release`).
         unsafe { &*inlined_chunk(table.code_base, table.frame(exit.frame).chunk) }
+    })
+}
+
+/// The chunk of a moved check's site `site` (P3 stage 3 step L1c): None for the code's own, else
+/// the inlined chunk it names, which the code holds.
+pub(crate) fn site_chunk<'t>(
+    table: &'t ExitTable,
+    site: &MovedSite,
+) -> Option<&'t crate::bytecode::Chunk> {
+    (site.chunk != OWN_CHUNK).then(|| {
+        // SAFETY: the code holds the chunk as long as its table lives (`release`).
+        unsafe { &*inlined_chunk(table.code_base, site.chunk) }
     })
 }
 

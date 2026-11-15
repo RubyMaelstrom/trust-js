@@ -285,7 +285,9 @@ pub(crate) enum ExitReason {
     /// A check of a loop invariant moved to the loop's entry edge failed there (P3 stage 3 step
     /// 0; JSC's HoistingFailed exit kind, Ion's LICM bailout kind), or one of the checks of a
     /// typed array an effect-free loop accesses, made at its entry edge (step 0c): a flag at the
-    /// header leaves the invariants' and the typed arrays' checks in the loop.
+    /// header leaves the invariants' and the typed arrays' checks in the loop. A moved check whose
+    /// replaced checks all run whenever the loop is entered flags their own sites instead (step
+    /// L1c, `MovedCheck`).
     HoistingFailed,
     /// An equality whose record saw two Strings met a word that is no String (P3 stage 3 step
     /// L1; V8's kNotAString of CheckString): the flag at its pc leaves the equality the generic
@@ -962,6 +964,30 @@ pub(crate) struct Decline {
     pub(crate) frame: FrameIx,
 }
 
+/// A check moved to a loop's one entry edge, exiting at the header's pc [HoistingFailed] (P3
+/// stage 3 steps 0, 0c and 3a), and the checks in the loop it stands for (step L1c): each one's
+/// operation, whose ordinary exit the moved check's exit is where every replaced check runs
+/// whenever the loop is entered (JSC's control equivalence: `phis::runs_whenever_entered`), as
+/// JSC's hoisted node keeps its semantic origin and is marked wasHoisted only where its hoist adds
+/// a blind speculation (dfg/DFGLICMPhase.cpp:252-269, dfg/DFGOSRExitBase.cpp:38-60). The back end
+/// keeps the sites in the exit table (`ExitTable::moved`), which the discard reads
+/// (`driver::flag_moved`); nothing of them is in the generated code.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MovedCheck {
+    pub(crate) node: NodeIx,
+    pub(crate) sites: Vec<MovedSite>,
+}
+
+/// A check a moved check stands for: its operation's pc and frame, its reason, and whether its
+/// block runs whenever the loop is entered (`anyway`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct MovedSite {
+    pub(crate) pc: u32,
+    pub(crate) reason: ExitReason,
+    pub(crate) frame: FrameIx,
+    pub(crate) anyway: bool,
+}
+
 /// A function's graph.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub(crate) struct Graph {
@@ -975,6 +1001,9 @@ pub(crate) struct Graph {
     pub(crate) declines: Vec<Decline>,
     /// The inlined frames, outermost first: `FrameIx(k)` is `frames[k - 1]` (stage 3).
     pub(crate) frames: Vec<InlinedFrame>,
+    /// The checks moved to loops' entry edges and the checks each stands for (P3 stage 3 step
+    /// L1c), by node, ascending.
+    pub(crate) moved: Vec<MovedCheck>,
 }
 
 impl Graph {

@@ -47,6 +47,11 @@
 //!   337-386), which back off after a hoisted check failed (Ion's BailoutKind::LICM and
 //!   hadLICMInvalidation, BaselineBailouts.cpp:2061-2087; JSC's HoistingFailed, DFGLICMPhase.cpp:
 //!   254, 338-339): here a flag at the header, HoistingFailed, leaves the checks in the loop.
+//!   Each moved check keeps the checks it stands for (`Graph::moved`, P3 stage 3 step L1c): where
+//!   all of them run whenever the loop is entered (JSC's control equivalence,
+//!   `Selector::runs_whenever_entered`), its exit flags their own operations instead and the
+//!   header not, as JSC's control-equivalent hoist exits at its node's own bytecode with its own
+//!   kind (dfg/DFGLICMPhase.cpp:252-269, DFGOSRExitBase.cpp:38-60).
 //!   Maglev peels the loop instead (MaglevGraphBuilder::PeelLoop), which the plan's step 6
 //!   departure 2 leaves for its precondition. No hoisting where the loop has two entry edges (no
 //!   pre-header: JSC's LICM needs one, DFGLICMPhase.cpp:150-151).
@@ -65,7 +70,8 @@
 
 use super::build::{Alternatives, PhiNotes};
 use super::ir::{
-    BlockIx, Cond, Decline, ExitReason, FrameIx, Graph, NodeIx, NodeOp, Rep, SlotSource, StateIx,
+    BlockIx, Cond, Decline, ExitReason, FrameIx, Graph, MovedCheck, MovedSite, NodeIx, NodeOp, Rep,
+    SlotSource, StateIx,
 };
 use super::snapshot::Snapshot;
 use crate::fasthash::FastMap;
@@ -156,7 +162,7 @@ pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, snapshots: &[&Snapshot
         .iter()
         .flat_map(|block| block.phis.iter().copied())
         .collect();
-    if phis.is_empty() && notes.invariants.is_empty() {
+    if phis.is_empty() && notes.invariants.is_empty() && notes.typed_entry.is_empty() {
         return;
     }
     let mut selector = Selector::new(graph, notes, snapshots);
@@ -164,6 +170,8 @@ pub(crate) fn select(graph: &mut Graph, notes: &PhiNotes, snapshots: &[&Snapshot
     selector.declines(&phis);
     // Before any rewrite, so that the entry states take the phis' inputs as built.
     let hoisted = selector.hoist_invariant_checks(&notes.invariants);
+    selector.typed_entry_sites(&notes.typed_entry);
+    selector.record_moved();
     let untagged: Vec<NodeIx> = phis
         .iter()
         .copied()
@@ -214,6 +222,9 @@ struct Selector<'g> {
     entry_states: FastMap<(BlockIx, usize), StateIx>,
     /// A speculation's checks at a predecessor's end: (block, word, representation).
     speculated: FastMap<(BlockIx, NodeIx, Rep), NodeIx>,
+    /// The moved checks made and the checks each stands for (P3 stage 3 step L1c), for
+    /// `Graph::moved`.
+    moved: Vec<(NodeIx, Vec<MovedSite>)>,
 }
 
 impl<'g> Selector<'g> {
@@ -287,6 +298,7 @@ impl<'g> Selector<'g> {
             original: FastMap::default(),
             entry_states: FastMap::default(),
             speculated: FastMap::default(),
+            moved: Vec::new(),
         }
     }
 
@@ -650,6 +662,24 @@ impl<'g> Selector<'g> {
                 .expect("an edge into the predecessor's successor");
             self.keep_inputs(header);
             let state = self.entry_state(header, k);
+            // The checks each moved check stands for (step L1c), as built: their operations' pcs,
+            // frames and reasons, and whether each runs whenever the loop is entered.
+            let sites = |selector: &Self, checks: &[NodeIx]| -> Vec<MovedSite> {
+                let mut sites: Vec<MovedSite> = Vec::new();
+                for &check in checks {
+                    let node = selector.graph.node(check);
+                    let site = MovedSite {
+                        pc: node.pc,
+                        reason: node.reason.expect("a check's reason"),
+                        frame: node.frame,
+                        anyway: selector.runs_whenever_entered(header, node.block),
+                    };
+                    if !sites.contains(&site) {
+                        sites.push(site);
+                    }
+                }
+                sites
+            };
             let hoist = |selector: &mut Self, op: NodeOp, input: NodeIx, rep: Rep| {
                 let node = selector.at_end(pred, op, &[input], rep);
                 // The frame its exit rebuilds, the header poll's (`entry_state`).
@@ -663,11 +693,15 @@ impl<'g> Selector<'g> {
             };
             if !numbers.is_empty() {
                 let number = hoist(self, NodeOp::CheckNumber, value, Rep::F64);
+                let stands = sites(self, &numbers);
+                self.moved.push((number, stands));
                 for check in numbers {
                     self.replace(check, number);
                 }
                 if !ints.is_empty() {
                     let int = hoist(self, NodeOp::CheckInt32, number, Rep::I32);
+                    let stands = sites(self, &ints);
+                    self.moved.push((int, stands));
                     for check in ints {
                         self.replace(check, int);
                     }
@@ -675,26 +709,155 @@ impl<'g> Selector<'g> {
             }
             if !cells.is_empty() {
                 let cell = hoist(self, NodeOp::CheckObject, value, Rep::Cell);
+                let stands = sites(self, &cells);
+                self.moved.push((cell, stands));
                 for check in cells {
                     self.replace(check, cell);
                 }
-                let mut made: Vec<(NodeOp, NodeIx)> = Vec::new();
+                let mut made: Vec<(NodeOp, NodeIx, Vec<NodeIx>)> = Vec::new();
                 for check in kinds {
                     let op = self.graph.node(check).op.clone();
-                    let node = match made.iter().find(|(kind, _)| *kind == op) {
-                        Some(&(_, node)) => node,
+                    let node = match made.iter_mut().find(|(kind, _, _)| *kind == op) {
+                        Some((_, node, of)) => {
+                            of.push(check);
+                            *node
+                        }
                         None => {
                             let node = hoist(self, op.clone(), cell, Rep::None);
-                            made.push((op, node));
+                            made.push((op, node, vec![check]));
                             node
                         }
                     };
                     self.replace(check, node);
                 }
+                for (_, node, of) in made {
+                    let stands = sites(self, &of);
+                    self.moved.push((node, stands));
+                }
             }
             moved = true;
         }
         moved
+    }
+
+    /// Whether a check in `block`, a block of loop header `header`'s loop, runs whenever the loop
+    /// is entered (P3 stage 3 step L1c): JSC's control equivalence of the entry edge's predecessor
+    /// and `block` (dfg/DFGControlEquivalenceAnalysis.h:46-69: the predecessor dominates it, the
+    /// header's one way in, and it backwards-dominates the predecessor), on this CFG: no path from
+    /// the header that avoids `block` leaves the natural loop (a block ending in a Return or an
+    /// Exit, a throw's among them, reaches no back edge, so it is outside the loop and an edge to
+    /// it leaves; a path back to the header reaches nothing; a branch on a constant takes its one
+    /// edge). Checks
+    /// and throwing nodes inside blocks are not counted, as JSC's analysis does not count them ("at
+    /// worst we have made the exit happen sooner"). The loops here are not rotated, so the loop's
+    /// test is an exit before every body block: only the header's straight line up to its first
+    /// exiting branch passes, and a do-while's body before its test.
+    fn runs_whenever_entered(&self, header: BlockIx, block: BlockIx) -> bool {
+        let Some(members) = self.loops.get(&header) else {
+            return false;
+        };
+        if !members[block.index()] {
+            return false;
+        }
+        let mut seen = vec![false; self.graph.blocks.len()];
+        let mut work = vec![header];
+        seen[header.index()] = true;
+        while let Some(at) = work.pop() {
+            if at == block {
+                continue;
+            }
+            let data = self.graph.block(at);
+            let Some(&last) = data.body.last() else {
+                continue;
+            };
+            let terminator = self.graph.node(last);
+            // A branch on a constant (`while (true)`'s test) takes one edge: the other is dead,
+            // as the DFG's CFA prunes it before LICM runs.
+            let taken = match terminator.op {
+                NodeOp::Branch {
+                    then_block,
+                    else_block,
+                } => match terminator
+                    .inputs
+                    .first()
+                    .map(|&cond| &self.graph.node(cond).op)
+                {
+                    Some(&NodeOp::ConstBool(value)) => {
+                        Some(if value { then_block } else { else_block })
+                    }
+                    Some(&NodeOp::ConstTagged(word)) if word & !1 == crate::value::PACK_BOOL => {
+                        Some(if word & 1 != 0 {
+                            then_block
+                        } else {
+                            else_block
+                        })
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            for &next in &data.succs {
+                if taken.is_some_and(|taken| taken != next) {
+                    continue;
+                }
+                if !members[next.index()] {
+                    return false;
+                }
+                if !std::mem::replace(&mut seen[next.index()], true) {
+                    work.push(next);
+                }
+            }
+        }
+        true
+    }
+
+    /// The sites step 0c's typed arrays' entry checks stand for (P3 stage 3 step L1c;
+    /// `PhiNotes::typed_entry`): each check's own reason at each of its receiver's typed sites,
+    /// in the block of the site's node in the loop (a site the build pruned counts as blind).
+    fn typed_entry_sites(&mut self, typed: &[super::build::TypedEntry]) {
+        for entry in typed {
+            let Some(header) = (0..self.graph.blocks.len())
+                .map(|b| BlockIx(b as u32))
+                .find(|&b| {
+                    let data = self.graph.block(b);
+                    data.loop_header
+                        && data.first_pc == entry.header_pc
+                        && self.block_frame(b) == entry.frame
+                })
+            else {
+                continue;
+            };
+            let members = self.loops.get(&header).cloned().unwrap_or_default();
+            let mut sites: Vec<MovedSite> = Vec::new();
+            for &pc in &entry.pcs {
+                let block = self.graph.nodes.iter().find_map(|node| {
+                    (node.pc == pc
+                        && node.frame == entry.frame
+                        && members.get(node.block.index()).copied().unwrap_or(false))
+                    .then_some(node.block)
+                });
+                let site = MovedSite {
+                    pc,
+                    reason: entry.reason,
+                    frame: entry.frame,
+                    anyway: block.is_some_and(|block| self.runs_whenever_entered(header, block)),
+                };
+                if !sites.contains(&site) {
+                    sites.push(site);
+                }
+            }
+            self.moved.push((entry.node, sites));
+        }
+    }
+
+    /// `Graph::moved` from the moves made, by node.
+    fn record_moved(&mut self) {
+        let mut moved: Vec<MovedCheck> = std::mem::take(&mut self.moved)
+            .into_iter()
+            .map(|(node, sites)| MovedCheck { node, sites })
+            .collect();
+        moved.sort_by_key(|check| check.node);
+        self.graph.moved = moved;
     }
 
     /// The checks of `word`, input `k` of a phi of loop header `header`, at the end of that
@@ -1097,5 +1260,12 @@ fn compact(graph: &mut Graph) {
         for node in block.phis.iter_mut().chain(block.body.iter_mut()) {
             *node = map(*node);
         }
+    }
+    // A moved check a rewrite removed stands for nothing (P3 stage 3 step L1c).
+    graph
+        .moved
+        .retain(|check| number[check.node.index()] != u32::MAX);
+    for check in &mut graph.moved {
+        check.node = map(check.node);
     }
 }

@@ -979,6 +979,9 @@ struct Gen<'a> {
     drestore: (usize, usize),
     /// (site label, return label, record) per exit.
     exits: Vec<(usize, usize, ExitRecord)>,
+    /// The moved checks' exits (P3 stage 3 step L1c): each one's place in `exits` and the checks
+    /// it stands for (`ExitTable::moved`).
+    moved_exits: Vec<(usize, Box<[crate::opt::exit::MovedSite]>)>,
     cold: Vec<Cold>,
     fast: u32,
     array_intrinsics_on: bool,
@@ -1060,6 +1063,7 @@ impl<'a> Gen<'a> {
             l_dsave: 0,
             drestore: (0, 0),
             exits: Vec::new(),
+            moved_exits: Vec::new(),
             cold: Vec::new(),
             fast,
             array_intrinsics_on: switches.array_intrinsics,
@@ -1173,6 +1177,21 @@ impl<'a> Gen<'a> {
         let mut table = self.table;
         table.return_offsets = exits.iter().map(|&(offset, _)| offset).collect();
         table.exits = exits.into_iter().map(|(_, record)| record).collect();
+        // Each moved check's exit by its index among the sorted records (step L1c).
+        let mut moved: Vec<(u32, Box<[crate::opt::exit::MovedSite]>)> = self
+            .moved_exits
+            .drain(..)
+            .map(|(place, sites)| {
+                let offset = offsets[1 + place];
+                let index = table
+                    .return_offsets
+                    .binary_search(&offset)
+                    .expect("each exit's return offset");
+                (index as u32, sites)
+            })
+            .collect();
+        moved.sort_by_key(|&(index, _)| index);
+        table.moved = moved.into_boxed_slice();
         table.frames = self.frames.into_boxed_slice();
         let names_global = |o: &Op| {
             matches!(
@@ -1730,6 +1749,25 @@ impl Gen<'_> {
             count: Cell::new(0),
             frame,
         };
+        // A moved check's exit keeps the checks it stands for (P3 stage 3 step L1c), each in its
+        // chunk: the code's own, or the inlined chunk its frame runs.
+        if kind == ExitKind::Check {
+            if let Ok(at) = graph.moved.binary_search_by_key(&n, |check| check.node) {
+                let sites = graph.moved[at]
+                    .sites
+                    .iter()
+                    .map(|site| crate::opt::exit::MovedSite {
+                        pc: site.pc,
+                        chunk: graph
+                            .inlined(site.frame)
+                            .map_or(crate::opt::exit::OWN_CHUNK, |inlined| inlined.chunk),
+                        reason: site.reason,
+                        anyway: site.anyway,
+                    })
+                    .collect();
+                self.moved_exits.push((self.exits.len(), sites));
+            }
+        }
         let site = self.a.new_label();
         let ret = self.a.new_label();
         self.exits.push((site, ret, record));

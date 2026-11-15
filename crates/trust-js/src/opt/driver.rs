@@ -1955,9 +1955,15 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
         );
     }
     if reoptimizing && !no_exit_profile() {
-        for exit in &taken {
-            if !matches!(exit.reason, ExitReason::Throw | ExitReason::Unsupported) {
-                flag(chunk, exit, super::exit::exit_chunk(table, exit));
+        for (index, exit) in table.exits.iter().enumerate() {
+            if exit.count.get() == 0
+                || matches!(exit.reason, ExitReason::Throw | ExitReason::Unsupported)
+            {
+                continue;
+            }
+            match table.moved_sites(index) {
+                Some(sites) => flag_moved(chunk, table, exit, sites),
+                None => flag(chunk, exit, super::exit::exit_chunk(table, exit)),
             }
         }
     }
@@ -2047,6 +2053,54 @@ fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'stati
         i.opt_retired.push(retired);
     }
     now
+}
+
+/// The flags of a moved check's taken exit `exit` of `table` (P3 stage 3 step L1c), the checks
+/// it stands for `sites`: where each runs whenever its loop is entered, its operation's ordinary
+/// exit, each site flagged at its own pc with its own reason in its own chunk and the header not,
+/// so that the recompile still moves the loop's other checks, as JSC's control-equivalent hoist
+/// exits at its node's semantic origin with its own kind (dfg/DFGLICMPhase.cpp:252-269,
+/// dfg/DFGOSRExitBase.cpp:38-60); where one is blind (its block may not run: a conditional block,
+/// the loop's body behind its test), HoistingFailed at the header, which leaves every check of the
+/// loop at its operation (JSC's HoistingFailed site), and the sites that run whenever the loop is
+/// entered, whose failure is certain (the same invariant value, on every entry), flagged as well.
+fn flag_moved(
+    chunk: &Chunk,
+    table: &ExitTable,
+    exit: &ExitRecord,
+    sites: &[super::exit::MovedSite],
+) {
+    if sites.is_empty() || !sites.iter().all(|site| site.anyway) {
+        flag(chunk, exit, super::exit::exit_chunk(table, exit));
+    }
+    for site in sites.iter().filter(|site| site.anyway) {
+        let (at, pc, inlined) = match super::exit::site_chunk(table, site) {
+            Some(callee) => (callee, site.pc, true),
+            None => match profile::baseline_site(chunk, site.pc as usize) {
+                Some((baseline, pc, spliced)) => (baseline, pc as u32, spliced),
+                None => (chunk, site.pc, false),
+            },
+        };
+        let new = ChunkProfile::of(at).add_site(pc, site.reason as u8, inlined, 0, false);
+        if new && log_enabled() {
+            let key = if std::ptr::eq(at, chunk) {
+                "own".to_string()
+            } else {
+                format!(
+                    "at {} pc {pc}{}",
+                    name(at),
+                    if inlined { " (spliced)" } else { "" }
+                )
+            };
+            log_line!(
+                "[opt] flag {} pc {} {:?} {key} (moved to pc {})",
+                name(chunk),
+                site.pc,
+                site.reason,
+                exit.pc
+            );
+        }
+    }
 }
 
 /// Add `exit`'s site to the exit profile (see `opt::profile`): at the baseline site `chunk`'s
