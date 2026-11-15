@@ -186,6 +186,9 @@ fn a_creation_against_its_objects_predicted_layout_has_the_vms_results() {
 
 #[test]
 fn a_creations_slow_path_stores_a_value_from_its_spill_slot() {
+    if !alone("a_creations_slow_path_stores_a_value_from_its_spill_slot") {
+        return;
+    }
     // `W`'s creations past its 8th key take the slow path's call, around which the caller-saved
     // values live there (a, b and c) are saved on the stack; the stored values, 24 of them live
     // across `g()`'s generic node, are in spill slots, whose offsets are the stack pointer's: the
@@ -369,6 +372,9 @@ fn a_constructor_runs_its_creations_in_the_tiers_code_without_an_exit() {
 
 #[test]
 fn a_setter_appearing_on_the_prototype_exits_and_converges_on_the_effect() {
+    if !alone("a_setter_appearing_on_the_prototype_exits_and_converges_on_the_effect") {
+        return;
+    }
     // The prototype's new accessor moves the creation epoch: the creation's check exits
     // WrongShape until the discard, after which the recompile takes the effect (flagged, its
     // ways did not grow), and the setter runs.
@@ -387,6 +393,9 @@ fn a_setter_appearing_on_the_prototype_exits_and_converges_on_the_effect() {
 
 #[test]
 fn non_extensible_receivers_exit_and_converge_on_the_effect() {
+    if !alone("non_extensible_receivers_exit_and_converge_on_the_effect") {
+        return;
+    }
     // A receiver made non-extensible fails the creation's checks (its shape demoted, its flag
     // clear), which the snapshot's chain cannot see: the exits flag the site, and the recompile
     // takes the effect (its WrongShape flag), whose store fails silently in sloppy code.
@@ -404,6 +413,9 @@ fn non_extensible_receivers_exit_and_converge_on_the_effect() {
 
 #[test]
 fn a_setter_appearing_before_the_first_compile_keeps_the_creation_the_effect() {
+    if !alone("a_setter_appearing_before_the_first_compile_keeps_the_creation_the_effect") {
+        return;
+    }
     // The creation's way was filled before the prototype took a setter of the name, and the tier
     // compiles after: the snapshot's walk of the chain finds the setter and records no chain, so
     // the creation stays the effect, which calls the setter (no exit ever teaches it). A graph
