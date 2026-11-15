@@ -5831,9 +5831,9 @@ Since the records above (2026-11-16):
 - Step L5's whole-suite matrix on its final tree (the agent's; 3,567 tests): the tier off; the
   splice on, eager and forced; graph on, eager and forced; eager under the poison: all pass;
   the tier's tests under the poison on and forced, 594 each; GC stress over its own tests in
-  three legs, 9 each. Step L1c's GC-stress legs are cut short: the tier-off leg's last test
-  (the blind moved-check test, hours in the collector's verifier) is given eight hours of CPU
-  and the eager leg is dropped; 37 of its 38 tests passed.
+  three legs, 9 each. Step L1c's GC stress with the tier off ended: 38 of 38 tests pass
+  (34,963 s; the blind moved-check test about nine hours of it, nearly all in the collector's
+  marking and heap verifier); its eager and tier-on stress legs are dropped for that cost.
 - The polymorphic read's form, counted and decided (the lowerings' agent; poly-impl/
   design-note.txt). Executed at 200 runs: reads through several shapes at one slot (GBEMU 396M
   to 536M, TypeScript 174M) are already the exemplars' merged form, one check of the set and
