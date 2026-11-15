@@ -1049,6 +1049,62 @@ struct Gen<'a> {
     cur_pos: u32,
     cur_spans: Vec<regalloc::Span>,
     next_span: usize,
+    /// Each ShapeIs whose one use is the Branch right after it in its block
+    /// (`fused_shape_tests`): its compares set the flags the Branch takes, no Boolean between.
+    fused: Vec<bool>,
+}
+
+/// The ShapeIs nodes a Branch takes as flags (`Gen::fused`): a ShapeIs whose one use is the Branch
+/// immediately after it in its block, as Maglev's polymorphic arms branch on the map compare itself
+/// (BranchIfReferenceEqual in BuildCompareMaps, maglev-graph-builder.cc:3750-3804) and B3 and
+/// TurboFan's instruction selectors fuse a compare into the branch that tests it. Its Boolean is
+/// then never materialised: no mov #0 / mov #1 diamond, no cbz.
+pub(crate) fn fused_shape_tests(graph: &Graph) -> Vec<bool> {
+    let mut fused = vec![false; graph.nodes.len()];
+    let pairs = |block: &BlockData| {
+        block
+            .body
+            .windows(2)
+            .map(|pair| (pair[0], pair[1]))
+            .filter(|&(test, branch)| {
+                matches!(graph.node(test).op, NodeOp::ShapeIs(_))
+                    && matches!(graph.node(branch).op, NodeOp::Branch { .. })
+                    && graph.node(branch).inputs[0] == test
+            })
+            .collect::<Vec<_>>()
+    };
+    // Most graphs hold none: their uses are not counted (a pass over every frame state).
+    if !graph.blocks.iter().any(|block| !pairs(block).is_empty()) {
+        return fused;
+    }
+    let mut uses = vec![0u32; graph.nodes.len()];
+    for node in &graph.nodes {
+        for &input in &node.inputs {
+            uses[input.index()] += 1;
+        }
+    }
+    for state in &graph.states {
+        for source in state.slots.iter() {
+            if let SlotSource::Value(value) = *source {
+                uses[value.index()] += 1;
+            }
+        }
+        for &value in state.stack.iter() {
+            uses[value.index()] += 1;
+        }
+    }
+    for frame in &graph.frames {
+        uses[frame.callee.index()] += 1;
+        uses[frame.receiver.index()] += 1;
+    }
+    for block in &graph.blocks {
+        for (test, _) in pairs(block) {
+            if uses[test.index()] == 1 {
+                fused[test.index()] = true;
+            }
+        }
+    }
+    fused
 }
 
 /// What an inlined frame's generic node switched of the context (P3 stage 3 step 3c), which its
@@ -1151,6 +1207,7 @@ impl<'a> Gen<'a> {
             cur_pos: u32::MAX,
             cur_spans: Vec::new(),
             next_span: 0,
+            fused: fused_shape_tests(graph),
         }
     }
 
@@ -2395,6 +2452,32 @@ impl Gen<'_> {
                 self.shape_compare(X17, shapes, site);
                 self.gp_done(n, proto);
             }
+            NodeOp::ShapeIs(shapes) if self.fused[n.index()] => {
+                // The Branch after it takes EQ: one of the shapes (a compare, then a conditional
+                // compare a shape more). Nothing the Branch's position emits first writes the
+                // flags (its span loads are loads).
+                let layout = self.layout;
+                let cell = self.gp(input(0), X16);
+                self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
+                self.a
+                    .ldr_w_imm(X17, X17, (layout.obj_props + layout.props_shape) as u32);
+                for (k, &shape) in shapes.iter().enumerate() {
+                    if k == 0 {
+                        if shape < 4096 {
+                            self.a.cmp_imm_w(X17, shape);
+                        } else {
+                            self.a.mov_imm64(X16, u64::from(shape));
+                            self.a.cmp_reg_w(X17, X16);
+                        }
+                    } else if shape < 32 {
+                        // Where the last compare found its shape (EQ), Z stays set.
+                        self.a.ccmp_imm_w(X17, shape, 0b0100, NE);
+                    } else {
+                        self.a.mov_imm64(X16, u64::from(shape));
+                        self.a.ccmp_reg_w(X17, X16, 0b0100, NE);
+                    }
+                }
+            }
             NodeOp::ShapeIs(shapes) => {
                 if !unused {
                     let layout = self.layout;
@@ -3036,6 +3119,24 @@ impl Gen<'_> {
                 let label = self.block_label(block, *target);
                 if next != Some(*target) || label != self.blocks[target.index()] {
                     self.a.b(label);
+                }
+            }
+            NodeOp::Branch {
+                then_block,
+                else_block,
+            } if self.fused[input(0).index()] => {
+                // The ShapeIs before it set the flags: EQ is its true.
+                let then_label = self.edge_target(block, *then_block);
+                let else_label = self.edge_target(block, *else_block);
+                let then_direct = then_label == self.blocks[then_block.index()];
+                let else_direct = else_label == self.blocks[else_block.index()];
+                if next == Some(*else_block) && else_direct {
+                    self.a.b_cond(EQ, then_label);
+                } else if next == Some(*then_block) && then_direct {
+                    self.a.b_cond(NE, else_label);
+                } else {
+                    self.a.b_cond(EQ, then_label);
+                    self.a.b(else_label);
                 }
             }
             NodeOp::Branch {

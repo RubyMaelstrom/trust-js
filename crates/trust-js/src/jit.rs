@@ -4111,6 +4111,16 @@ mod asm {
         pub fn cmp_reg_w(&mut self, rn: u32, rm: u32) {
             self.emit(0x6B00_001F | (rm << 16) | (rn << 5));
         }
+        /// ccmp wn, #imm5, #nzcv, cond: where `cond` holds, the flags of wn - imm5; else nzcv.
+        pub fn ccmp_imm_w(&mut self, rn: u32, imm5: u32, nzcv: u32, cond: u32) {
+            debug_assert!(imm5 < 32 && nzcv < 16 && cond < 16);
+            self.emit(0x7A40_0800 | (imm5 << 16) | (cond << 12) | (rn << 5) | nzcv);
+        }
+        /// ccmp wn, wm, #nzcv, cond: where `cond` holds, the flags of wn - wm; else nzcv.
+        pub fn ccmp_reg_w(&mut self, rn: u32, rm: u32, nzcv: u32, cond: u32) {
+            debug_assert!(nzcv < 16 && cond < 16);
+            self.emit(0x7A40_0000 | (rm << 16) | (cond << 12) | (rn << 5) | nzcv);
+        }
         /// cmp xn, #imm (any immediate, see `flags`)
         #[inline]
         pub fn cmp_imm_x(&mut self, rn: u32, imm: u32) {
