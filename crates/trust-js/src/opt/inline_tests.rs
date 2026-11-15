@@ -1528,7 +1528,9 @@ const CONTEXT_READS: &[&str] = &[
     "Object.defineProperty(globalThis, 'gz', { get: function () { return 3; }, configurable: true });
      function rg() { return gz; }
      function mk() { var gz = 5;
-       return function inner(n) { var s = 0; for (var i = 0; i < n; i++) s += rg() + gz; return s; }; }
+       return function inner(n) { var s = 0;
+         for (var i = 0; i < n; i++) { s += rg() + gz; var f = function () { return gz; }; s += f(); }
+         return s; }; }
      var g = mk(), r = 0; for (var k = 0; k < 300; k++) r += g(10); r",
     "function M(v) { this.v = v; }
      Object.defineProperty(M.prototype, 'w', { get: function () { return this.v + 1; } });
@@ -1563,18 +1565,19 @@ r + '|' + stk.split('\\n').slice(0, 4).join('|') + '|' + (cal === viaGet) + (cal
 /// none (the throw leaves the compiled function).
 const THROWS: &str = "
 function G() {}
-var calls = 0;
+var calls = 0, msg = '';
 Object.defineProperty(G.prototype, 'p', { get: function () { calls++;
   if (this.bad) throw new TypeError('bad ' + this.bad); return 1; } });
 function viaGet(o) { return o.p; }
 function caught(o) { var s = 0;
-  for (var i = 0; i < 20; i++) { try { s += viaGet(o); } catch (e) { s += 1000; } } return s; }
+  for (var i = 0; i < 20; i++) { try { s += viaGet(o); } catch (e) { s += 1000; msg = e.message; } }
+  return s; }
 function leaves(o) { var s = 0; for (var i = 0; i < 20; i++) s += viaGet(o); return s; }
 var g = new G(), r = 0;
 for (var k = 0; k < 300; k++) { r += caught(g); r += leaves(g); }
 g.bad = 'x';
 var e2 = ''; try { leaves(g); } catch (e) { e2 = e.message + ':' + e.stack.split('\\n').slice(0, 3).join('|'); }
-r + ',' + caught(g) + ',' + e2 + ',' + calls";
+r + ',' + caught(g) + ',' + e2 + ',' + calls + ',' + msg";
 
 /// Collections while an inlined frame's helper runs, with objects live in both frames: the
 /// getter allocates, the callee and the caller hold objects across it.
