@@ -845,7 +845,10 @@ impl Rules<'_> {
         let snapshot = self.snapshot;
         let flagged =
             |reasons: &[ExitReason]| reasons.iter().any(|&reason| snapshot.declines(pc, reason));
-        if has_generic_form(&self.ops[pc]) && flagged(&[ExitReason::Generic]) {
+        if snapshot.any_generic()
+            && flagged(&[ExitReason::Generic])
+            && has_generic_form(&self.ops[pc])
+        {
             return false;
         }
         match self.ops[pc] {
@@ -2295,6 +2298,12 @@ impl<'a> Builder<'a> {
     /// inlined frame, one that needs the whole frame (the inliner declines such a callee: the
     /// flag would refuse the compile).
     fn generic_declined(&mut self, pc: usize) -> bool {
+        // The flag first: no pc of nearly every compile holds it (one load), and no other pc of
+        // one that does, where the operation's tests and its stack effect are not worth
+        // computing.
+        if !self.snapshot.any_generic() || !self.snapshot.declines(pc, ExitReason::Generic) {
+            return false;
+        }
         let op = &self.ops[pc];
         has_generic_form(op)
             && (self.frame.is_compiled() || !canonical(op))
@@ -2413,9 +2422,12 @@ impl<'a> Builder<'a> {
             })
             .collect();
         // The flags the frame's snapshot holds at the state's site, which an exit there compares
-        // its own reason with (P3 stage 3 step L5, `ExitRecord::held`).
-        if let Some(entry) = self.snapshot.declined_entry(pc) {
-            self.graph.held.insert((self.frame, pc as u32), entry);
+        // its own reason with (P3 stage 3 step L5, `ExitRecord::held`): none where no reason it
+        // holds anywhere could make an exit held (`Snapshot::may_hold`; nearly every compile).
+        if self.snapshot.may_hold() {
+            if let Some(entry) = self.snapshot.declined_entry(pc) {
+                self.graph.held.insert((self.frame, pc as u32), entry);
+            }
         }
         self.graph.add_state(FrameState {
             pc: pc as u32,

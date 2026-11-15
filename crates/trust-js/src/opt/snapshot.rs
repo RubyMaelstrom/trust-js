@@ -40,7 +40,7 @@
 //! and its IC statuses' at the matching one (bytecode/DFGExitProfile.h:195-232,
 //! GetByStatus.cpp:462-475, CallLinkStatus.cpp:116-119).
 
-use super::ir::ExitReason;
+use super::ir::{ExitReason, GENERIC_INELIGIBLE};
 use super::profile::ChunkProfile;
 use super::view::FrozenChunk;
 #[cfg(any(test, debug_assertions))]
@@ -72,6 +72,12 @@ pub(crate) struct Snapshot {
     /// expected, for NotNumber at a bitwise operation whether its oddball truncation exited
     /// (TRUNCATION_EXIT); empty where no chunk the compile reads has exit sites.
     declined: Box<[(u32, u8)]>,
+    /// Some pc of `declined` holds Generic (P3 stage 3 step L5), so that the builder's test of
+    /// each operation for it is one load where none does (nearly every compile).
+    generic: bool,
+    /// Some pc of `declined` holds a reason whose held exit makes its site Generic (not
+    /// GENERIC_INELIGIBLE's), so that the builder keeps flags by frame state only then.
+    may_hold: bool,
     /// Each free-name site's view (see [`NameView`]); empty for a chunk without one.
     names: Box<[NameView]>,
     /// The creation ways' chains (see [`CreationChain`]), by pc, ascending; empty where no
@@ -398,10 +404,13 @@ impl Snapshot {
             }
             views.push(site);
         }
+        let any = |mask: u32| raw.declined.iter().any(|&(reasons, _)| reasons & mask != 0);
         Snapshot {
             views: views.into_boxed_slice(),
             ran: ran.into_boxed_slice(),
             declined: raw.declined.clone(),
+            generic: any(bit(ExitReason::Generic)),
+            may_hold: any(!GENERIC_INELIGIBLE),
             names: names.into_boxed_slice(),
             chains: raw.chains.clone().into_boxed_slice(),
             buffers_observed: raw.buffers_observed,
@@ -431,6 +440,17 @@ impl Snapshot {
         self.declined
             .get(pc)
             .is_some_and(|&(reasons, _)| reasons & bit(reason) != 0)
+    }
+
+    /// Whether some pc holds Generic (P3 stage 3 step L5).
+    pub(crate) fn any_generic(&self) -> bool {
+        self.generic
+    }
+
+    /// Whether some pc holds a reason whose held exit would make its site Generic (P3 stage 3
+    /// step L5): where none does, no exit of the compile can be held.
+    pub(crate) fn may_hold(&self) -> bool {
+        self.may_hold
     }
 
     /// The flags at `pc` (reasons, data byte), where it has any (P3 stage 3 step L5).

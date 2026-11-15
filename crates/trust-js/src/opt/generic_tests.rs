@@ -530,7 +530,8 @@ fn forced_exits_flag_no_site_generic() {
 fn the_generic_flag_sends_every_operation_with_a_generic_form_there() {
     // One place honours the flag, before any lowering: an element read, a named read, an
     // arithmetic operation and an equality whose sites are flagged Generic are each built as
-    // their generic operation, and the loop holding them is no longer free of effects.
+    // their generic operation, and the loop holding them is no longer free of effects; no other
+    // operation of the function goes generic.
     TestSwitches {
         on: true,
         ..Default::default()
@@ -567,4 +568,11 @@ fn the_generic_flag_sends_every_operation_with_a_generic_form_there() {
             "pc {pc} generic after its flag"
         );
     }
+    // No other operation went generic: the flag is the pc's alone.
+    let generic_nodes = |graph: &Graph| {
+        count(graph, |op| {
+            matches!(op, NodeOp::Generic { .. } | NodeOp::Effect { .. })
+        })
+    };
+    assert_eq!(generic_nodes(&after), generic_nodes(&before) + 4);
 }

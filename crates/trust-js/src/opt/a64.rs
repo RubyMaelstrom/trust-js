@@ -1243,30 +1243,30 @@ impl<'a> Gen<'a> {
             .collect();
         skip_unused_callee_saved_fp(&mut words, &fp_saves, fp_callee_saved);
         // Whether each record's reason was already flagged at its site with its data (P3 stage 3
-        // step L5): its frame's snapshot's flags, which the builder kept by frame state.
-        let frame_of = |recipe: u16| {
-            if recipe == 0 {
-                return FrameIx::COMPILED;
+        // step L5): its frame's snapshot's flags, which the builder kept by frame state. None
+        // where the builder kept none (a compile whose snapshots flag nothing at any state's
+        // site: nearly every compile); else each record's frame from its recipe through one
+        // table (the recipes are numbered 1.. in the order frame_recipe made them).
+        if !self.graph.held.is_empty() {
+            let mut frame_of = vec![FrameIx::COMPILED; self.frames.len() + 1];
+            for (k, index) in self.frame_index.iter().enumerate() {
+                if let Some(index) = *index {
+                    frame_of[usize::from(index)] = FrameIx(k as u32 + 1);
+                }
             }
-            let k = self
-                .frame_index
-                .iter()
-                .position(|&index| index == Some(recipe))
-                .expect("a recipe's frame");
-            FrameIx(k as u32 + 1)
-        };
-        for (_, _, record) in &mut self.exits {
-            if record.kind != ExitKind::Check {
-                continue;
+            for (_, _, record) in &mut self.exits {
+                if record.kind != ExitKind::Check {
+                    continue;
+                }
+                record.held = self
+                    .graph
+                    .held
+                    .get(&(frame_of[usize::from(record.frame)], record.pc))
+                    .is_some_and(|&(reasons, byte)| {
+                        reasons & (1 << record.reason as u32) != 0
+                            && record.reason.data_unchanged(byte, record.profile_data())
+                    });
             }
-            record.held = self
-                .graph
-                .held
-                .get(&(frame_of(record.frame), record.pc))
-                .is_some_and(|&(reasons, byte)| {
-                    reasons & (1 << record.reason as u32) != 0
-                        && record.reason.data_unchanged(byte, record.profile_data())
-                });
         }
         let mut exits: Vec<(u32, ExitRecord)> = offsets[1..1 + n_exits]
             .iter()
@@ -1937,12 +1937,13 @@ impl Gen<'_> {
                         reason: site.reason,
                         anyway: site.anyway,
                         // A replaced check's exit carries no data (its reasons' bytes are 0).
-                        held: graph.held.get(&(site.frame, site.pc)).is_some_and(
-                            |&(reasons, byte)| {
-                                reasons & (1 << site.reason as u32) != 0
-                                    && site.reason.data_unchanged(byte, 0)
-                            },
-                        ),
+                        held: !graph.held.is_empty()
+                            && graph.held.get(&(site.frame, site.pc)).is_some_and(
+                                |&(reasons, byte)| {
+                                    reasons & (1 << site.reason as u32) != 0
+                                        && site.reason.data_unchanged(byte, 0)
+                                },
+                            ),
                     })
                     .collect();
                 self.moved_exits.push((self.exits.len(), sites));

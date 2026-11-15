@@ -321,6 +321,20 @@ pub(crate) enum ExitReason {
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
 
+/// The reasons whose held exits make no site Generic (`ExitReason::generic_eligible`), as a
+/// declined mask's bits: a snapshot without any other reason flagged keeps no flags by frame state
+/// (`Snapshot::may_hold`).
+pub(crate) const GENERIC_INELIGIBLE: u32 = 1 << ExitReason::Throw as u32
+    | 1 << ExitReason::Unsupported as u32
+    | 1 << ExitReason::Forced as u32
+    | 1 << ExitReason::NeverRan as u32
+    | 1 << ExitReason::HoistingFailed as u32
+    | 1 << ExitReason::PhiNotNumber as u32
+    | 1 << ExitReason::PhiNotInt32 as u32
+    | 1 << ExitReason::ObservedBuffer as u32
+    | 1 << ExitReason::WrongCallee as u32
+    | 1 << ExitReason::Generic as u32;
+
 // The discard's and the back end's (driver.rs, a64.rs): where the tier has none (x86-64 until the
 // plan's stage 6), nothing reads them.
 #[cfg_attr(
@@ -340,19 +354,7 @@ impl ExitReason {
     /// the stores test their own buffers), and WrongCallee, whose guards' ways the policy keeps
     /// (step 4p's rule 5: a reoptimization takes the first compile's ways).
     pub(crate) fn generic_eligible(self) -> bool {
-        !matches!(
-            self,
-            ExitReason::Throw
-                | ExitReason::Unsupported
-                | ExitReason::Forced
-                | ExitReason::NeverRan
-                | ExitReason::HoistingFailed
-                | ExitReason::PhiNotNumber
-                | ExitReason::PhiNotInt32
-                | ExitReason::ObservedBuffer
-                | ExitReason::WrongCallee
-                | ExitReason::Generic
-        )
+        GENERIC_INELIGIBLE & (1 << self as u32) == 0
     }
 
     /// Whether `data`, an exit's profile byte (`driver::flag`'s: a shape check's ways, a free
