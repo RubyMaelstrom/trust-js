@@ -321,6 +321,15 @@ pub(crate) enum ExitReason {
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
 
+// The discard's and the back end's (driver.rs, a64.rs): where the tier has none (x86-64 until the
+// plan's stage 6), nothing reads them.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    expect(dead_code, reason = "the discard's and the back end's")
+)]
 impl ExitReason {
     /// Whether an exit of this reason whose flag its code already held makes its site Generic
     /// (P3 stage 3 step L5): an operation's own exits. Not throws and unsupported operations
