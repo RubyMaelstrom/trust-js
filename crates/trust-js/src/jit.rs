@@ -3387,13 +3387,14 @@ mod asm {
         /// and loose test assemblies.
         element_records: Vec<(u32, u64)>,
         /// The code being emitted is a template the optimizing tier runs for an inlined frame's
-        /// generic node (P3 stage 3 step 3c): its property reads and stores call their helpers in
-        /// line (`H_GET_PROP`, `H_SET_PROP`), not through the shared helper stub, whose direct
-        /// accessor and trap calls take the accessor's call site from the running chunk's
-        /// accessor table (`AccessorSlot::position`), where an inlined frame's position is the
-        /// one its node published in `Interp::call_site`, which the helpers' call paths take.
-        /// Clear everywhere else, so template code is unchanged.
-        plain_accessor_helpers: bool,
+        /// generic node (P3 stage 3 steps 3c and 3c-2): its property reads and stores call their
+        /// helpers (`H_GET_PROP`, `H_SET_PROP`) through the variant of the shared helper stub,
+        /// [`SharedStub::HelperInlined`], whose direct accessor and trap calls take the
+        /// accessor's call site from `Interp::call_site`, the inline position the node published,
+        /// where the base stub's take it from the running chunk's accessor table
+        /// (`AccessorSlot::position`), which names no inline copy of the callee's chunk. Clear
+        /// everywhere else, so template code is unchanged.
+        inlined_frame_helpers: bool,
     }
 
     #[derive(Clone, Copy)]
@@ -3445,7 +3446,7 @@ mod asm {
                 loop_counts: None,
                 loop_weights: Vec::new(),
                 element_records: Vec::new(),
-                plain_accessor_helpers: false,
+                inlined_frame_helpers: false,
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3600,13 +3601,13 @@ mod asm {
         ) -> crate::jit_ir::InitializedReads {
             std::mem::replace(&mut self.initialized_reads, reads)
         }
-        /// Set whether the property helpers are called in line (see the
-        /// `plain_accessor_helpers` field); returns the previous setting.
-        pub(crate) fn set_plain_accessor_helpers(&mut self, on: bool) -> bool {
-            std::mem::replace(&mut self.plain_accessor_helpers, on)
+        /// Set whether the property helpers are an inlined frame's (see the
+        /// `inlined_frame_helpers` field); returns the previous setting.
+        pub(crate) fn set_inlined_frame_helpers(&mut self, on: bool) -> bool {
+            std::mem::replace(&mut self.inlined_frame_helpers, on)
         }
-        pub(crate) fn plain_accessor_helpers(&self) -> bool {
-            self.plain_accessor_helpers
+        pub(crate) fn inlined_frame_helpers(&self) -> bool {
+            self.inlined_frame_helpers
         }
         /// Whether the local read at `pc` surely finds a value, so that it needs no TDZ test.
         pub(crate) fn initialized_read(&self, pc: usize) -> bool {
@@ -9015,6 +9016,155 @@ fn emit_prop_load_inline(
     a.bind(done);
 }
 
+/// The body of [`SharedStub::Helper`], the checked helper call of an operation's slow path, and
+/// of its variant [`SharedStub::HelperInlined`] (`inlined`): the property helpers' direct
+/// accessor and trap calls where the stub can make them, then the plain helper call.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_helper_stub(
+    a: &mut asm::Asm,
+    context: &StubContext<'_>,
+    layout: &crate::value::JitLayout,
+    idx: u8,
+    // [`SharedStub::HelperInlined`]: the direct accessor calls take the published position.
+    inlined: bool,
+) {
+    // The property reads' helper first calls the getter of an accessor its site published, and
+    // the stores' the setter of an accessor their caches prove, through the direct sequence (see
+    // `emit_get_prop_getter`, `emit_set_prop_setter`).
+    let plain = a.new_label();
+    if let (Some(ilayout), Some(direct)) = (context.ilayout, context.direct) {
+        match usize::from(idx) {
+            H_GET_PROP => {
+                // A read without a published accessor tries its Proxy receiver's trap (see
+                // `emit_get_prop_trap`).
+                let trap = get_prop_trap_supported(layout, ilayout, direct);
+                let trap_entry = if trap { a.new_label() } else { plain };
+                if get_prop_getter_supported(layout, ilayout, direct) {
+                    emit_get_prop_getter(a, layout, ilayout, direct, plain, trap_entry, inlined);
+                }
+                if trap {
+                    a.bind(trap_entry);
+                    emit_get_prop_trap(a, layout, ilayout, direct, plain, inlined);
+                }
+            }
+            H_SET_PROP if set_prop_setter_supported(layout, ilayout, direct) => {
+                emit_set_prop_setter(a, layout, ilayout, direct, plain, inlined);
+            }
+            _ => {}
+        }
+    }
+    a.bind(plain);
+    // The site has set x1 = pc; the call preserves nothing the body keeps in caller-saved
+    // registers, exactly like the inline sequence it replaces.
+    a.mov(0, 19);
+    a.mov(2, 20);
+    a.ldr_imm(16, 21, (usize::from(idx) * 8) as u32);
+    a.stp_pre(29, 30, -16);
+    a.blr(16);
+    a.ldp_post(29, 30, 16);
+    a.mov(20, 0);
+    a.ret();
+}
+
+/// The direct accessor call of [`SharedStub::HelperInlined`] (P3 stage 3 step 3c-2): w2 = the
+/// accessor frame's position, the inline position the inlined frame's node published in
+/// `Interp::call_site`, saved at `[sp, #at]` in the stub's frame; and `Interp::call_site`
+/// NO_POSITION while the accessor runs, as the interpreter's frame push moves the published
+/// position into the callee's `FnFrame` (`FnFrame::call_site`), so that what the accessor's own
+/// operations capture or publish starts from its own frame. Clobbers x14 and x16.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_consume_published_site(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
+    at: u32,
+) {
+    const _: () = assert!(crate::stack_trace::NO_POSITION == u32::MAX);
+    a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.ldr_w_imm(2, 16, ilayout.call_site as u32);
+    a.str_imm(2, 31, at);
+    // MOVN: every bit set, whose low word is NO_POSITION.
+    a.mov_imm64(14, u64::MAX);
+    a.str_w_imm(14, 16, ilayout.call_site as u32);
+}
+
+/// `Interp::call_site` the published position again (see [`emit_consume_published_site`]), as the
+/// interpreter's frame pop restores it, where the stub reads it before the node's own restore
+/// (`opt::a64`'s `restore_context`, on its return and its unwind) writes NO_POSITION: on the
+/// direct sequence's decline, before the plain helper's call takes it for the accessor's frame,
+/// and after the trap's return, before its invariant check's error captures its stack from it.
+/// After a getter's or setter's return and after any throw nothing reads it before then: the
+/// site's end poll runs no JavaScript and raises no error (an interrupt is a control completion,
+/// `crate::interrupt`), and `jit_accessor_threw` places the error by the chunk's position. Clobbers
+/// x16 and x17.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_restore_published_site(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
+    at: u32,
+) {
+    a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.ldr_w_imm(17, 31, at);
+    a.str_w_imm(17, 16, ilayout.call_site as u32);
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    /// The direct accessor calls [`SharedStub::HelperInlined`] made on this thread (tests): getter,
+    /// setter and trap calls that returned, then those that threw.
+    static INLINED_ACCESSOR_CALLS: Cell<[u64; 6]> = const { Cell::new([0; 6]) };
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+extern "C" fn record_inlined_accessor_call(event: usize) {
+    INLINED_ACCESSOR_CALLS.with(|calls| {
+        let mut current = calls.get();
+        current[event] += 1;
+        calls.set(current);
+    });
+}
+
+/// The direct accessor calls [`SharedStub::HelperInlined`] made on this thread since the last
+/// take, reset (tests): [getter, setter, trap] returned, then [getter, setter, trap] threw.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn take_inlined_accessor_calls() -> [u64; 6] {
+    INLINED_ACCESSOR_CALLS.with(|calls| calls.replace([0; 6]))
+}
+
+/// The test builds' count of a [`SharedStub::HelperInlined`] direct call (`event`: 0 getter,
+/// 1 setter, 2 trap; +3 when it threw), made where nothing but the stub's frame is live: a C
+/// call, with the site's return address in that frame.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_inlined_accessor_event(a: &mut asm::Asm, event: usize) {
+    a.mov_imm64(0, event as u64);
+    a.mov_imm64(16, record_inlined_accessor_call as *const () as u64);
+    a.blr(16);
+}
+
 /// Whether the property reads' helper stub can call a published accessor's getter (see
 /// [`emit_get_prop_getter`]): every offset it addresses fits, and the direct sequence it enters
 /// is supported.
@@ -9088,11 +9238,16 @@ fn emit_get_prop_getter(
     plain: usize,
     // Where a read without a published accessor goes: the Proxy trap's path, or `plain`.
     no_accessor: usize,
+    // [`SharedStub::HelperInlined`]'s: the getter frame's position is the published one (see
+    // `emit_consume_published_site`), kept in one more pair of the stub's frame.
+    inlined: bool,
 ) {
     use crate::bytecode::{
         AccessorSlot, ACCESSOR_TABLE_MASK_OFF, ACCESSOR_TABLE_SLOTS_OFF, GETTER_READ_THIS,
     };
     use std::mem::offset_of;
+    let frame_bytes: i32 = if inlined { 64 } else { 48 };
+    const PUBLISHED: u32 = 48;
     let holder_off = offset_of!(JitCtx, accessor_holder) as u32;
     let slot_off = offset_of!(JitCtx, accessor_slot) as u32;
     // The published slot's location word (W2d step 3), which the getter's read takes; the
@@ -9145,11 +9300,14 @@ fn emit_get_prop_getter(
     a.add_imm(15, 15, 1);
     a.logic_w(0, 15, 15, 14);
     a.b(probe);
-    // w3 = the read's form, w2 = the getter frame's position, x12 = the read's call cache (its
-    // first way). Nothing below changes x2 or x3 before the sequence reads them.
+    // w3 = the read's form, w2 = the getter frame's position (the variant's at the hit), x12 =
+    // the read's call cache (its first way). Nothing below changes x2 or x3 before the sequence
+    // reads them.
     a.bind(found);
     a.ldr_w_imm(3, 13, offset_of!(AccessorSlot, form) as u32);
-    a.ldr_w_imm(2, 13, offset_of!(AccessorSlot, position) as u32);
+    if !inlined {
+        a.ldr_w_imm(2, 13, offset_of!(AccessorSlot, position) as u32);
+    }
     a.ldr_imm(12, 13, offset_of!(AccessorSlot, calls) as u32);
     // x9 = the live getter's word, which the slot's accessor pair (its word's payload under
     // PACK_ACCESSOR, W2d step 2; none when the accessor never had a function) holds: Undefined's
@@ -9188,12 +9346,15 @@ fn emit_get_prop_getter(
     // form): a frame of [the site's return, pc and form, holder and slot], the publication
     // consumed, then [receiver, getter] over the operands ----
     a.bind(hit);
-    a.stp_pre(29, 30, -48);
+    a.stp_pre(29, 30, -frame_bytes);
     a.stp_off(1, 3, 16);
     a.ldr_imm(16, 19, holder_off);
     a.ldr_w_imm(14, 19, slot_off);
     a.stp_off(16, 14, 32);
     a.str_imm(31, 19, holder_off);
+    if inlined {
+        emit_consume_published_site(a, ilayout, PUBLISHED);
+    }
     let two = a.new_label();
     let this_receiver = a.new_label();
     let local_receiver = a.new_label();
@@ -9246,6 +9407,9 @@ fn emit_get_prop_getter(
     // ---- a gate of the sequence declined, before anything ran: pop the two words, publish
     // the accessor again and take the helper ----
     a.bind(declined);
+    if inlined {
+        emit_restore_published_site(a, ilayout, PUBLISHED);
+    }
     let one = a.new_label();
     let popped = a.new_label();
     a.ldp_off(1, 3, 16);
@@ -9259,20 +9423,28 @@ fn emit_get_prop_getter(
     a.ldp_off(16, 14, 32);
     a.str_imm(16, 19, holder_off);
     a.str_w_imm(14, 19, slot_off);
-    a.ldp_post(29, 30, 48);
+    a.ldp_post(29, 30, frame_bytes);
     a.b(plain);
     // ---- the getter returned: its result replaced the two words ----
     a.bind(returned);
-    a.ldp_post(29, 30, 48);
+    #[cfg(test)]
+    if inlined {
+        emit_inlined_accessor_event(a, 0);
+    }
+    a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 0, 0);
     a.ret();
     // ---- the getter threw: the sequence popped the two words, the error is in the context ----
     a.bind(threw);
+    #[cfg(test)]
+    if inlined {
+        emit_inlined_accessor_event(a, 3);
+    }
     a.mov(0, 19);
     a.ldr_imm(1, 31, 16); // pc
     a.mov_imm64(16, crate::bytecode::jit_accessor_threw as *const () as u64);
     a.blr(16);
-    a.ldp_post(29, 30, 48);
+    a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 1, 0);
     a.ret();
     // ---- the probe after way 0: the `CallSecondary` stub keeps w1 and w3 ----
@@ -9372,10 +9544,15 @@ fn emit_get_prop_trap(
     ilayout: &crate::interpreter::InterpLayout,
     direct: DirectCallContext,
     plain: usize,
+    // [`SharedStub::HelperInlined`]'s: the trap frame's position is the published one (see
+    // `emit_consume_published_site`), kept in one more pair of the stub's frame.
+    inlined: bool,
 ) {
     use crate::bytecode::{TrapSlot, GETTER_READ_THIS, TRAP_TABLE_MASK_OFF, TRAP_TABLE_SLOTS_OFF};
     use std::mem::offset_of;
     let obj_off = layout.obj_from_cell as u32;
+    let frame_bytes: i32 = if inlined { 80 } else { 64 };
+    const PUBLISHED: u32 = 64;
     let entry_gates = |a: &mut asm::Asm, refuse: usize| {
         let enter = a.new_label();
         a.ldrb_imm(16, 12, offset_of!(crate::bytecode::CallIc, direct) as u32);
@@ -9452,8 +9629,9 @@ fn emit_get_prop_trap(
     a.ldr_imm(4, 16, layout.proxy_target as u32);
     a.ldr_imm(5, 16, layout.proxy_handler as u32);
     emit_exec_tag_guard(a, 5, crate::value::PACK_OBJ, 11, plain);
-    // The frame: [fp, lr], [pc, form], [slot, receiver], [target, handler].
-    a.stp_pre(29, 30, -64);
+    // The frame: [fp, lr], [pc, form], [slot, receiver], [target, handler] (and the variant's
+    // published position).
+    a.stp_pre(29, 30, -frame_bytes);
     a.stp_off(1, 3, 16);
     a.stp_off(13, 9, 32);
     a.stp_off(4, 5, 48);
@@ -9507,7 +9685,11 @@ fn emit_get_prop_trap(
     a.stp_base(4, 7, 20, 16);
     a.str_imm(6, 20, 32);
     a.add_imm(20, 20, 40);
-    a.ldr_w_imm(2, 13, offset_of!(TrapSlot, position) as u32);
+    if inlined {
+        emit_consume_published_site(a, ilayout, PUBLISHED);
+    } else {
+        a.ldr_w_imm(2, 13, offset_of!(TrapSlot, position) as u32);
+    }
     let declined = a.new_label();
     let returned = a.new_label();
     let threw = a.new_label();
@@ -9532,12 +9714,20 @@ fn emit_get_prop_trap(
     );
     // ---- a gate of the sequence declined, before anything ran: pop the window ----
     a.bind(declined);
+    if inlined {
+        emit_restore_published_site(a, ilayout, PUBLISHED);
+    }
     a.sub_imm(20, 20, 40);
     a.bind(unframe);
-    a.ldp_post(29, 30, 64);
+    a.ldp_post(29, 30, frame_bytes);
     a.b(plain);
     // ---- the trap returned: its result replaced the window, at the old top ----
     a.bind(returned);
+    if inlined {
+        emit_restore_published_site(a, ilayout, PUBLISHED);
+        #[cfg(test)]
+        emit_inlined_accessor_event(a, 2);
+    }
     let check = a.new_label();
     let checked = a.new_label();
     let kind_ok = a.new_label();
@@ -9580,22 +9770,26 @@ fn emit_get_prop_trap(
     a.stur(16, 20, -16);
     a.sub_imm(20, 20, 8);
     a.bind(placed);
-    a.ldp_post(29, 30, 64);
+    a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 0, 0);
     a.ret();
     // ---- the invariant failed: the check placed its error; drop the result ----
     a.bind(check_threw);
     a.sub_imm(20, 20, 8);
-    a.ldp_post(29, 30, 64);
+    a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 1, 0);
     a.ret();
     // ---- the trap threw: the sequence popped the window, the error is in the context ----
     a.bind(threw);
+    #[cfg(test)]
+    if inlined {
+        emit_inlined_accessor_event(a, 5);
+    }
     a.mov(0, 19);
     a.ldr_w_imm(1, 31, 16); // pc
     a.mov_imm64(16, crate::bytecode::jit_accessor_threw as *const () as u64);
     a.blr(16);
-    a.ldp_post(29, 30, 64);
+    a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 1, 0);
     a.ret();
     // ---- the probe after way 0: the `CallSecondary` stub keeps w1 and w3 ----
@@ -9686,12 +9880,17 @@ fn emit_set_prop_setter(
     ilayout: &crate::interpreter::InterpLayout,
     direct: DirectCallContext,
     plain: usize,
+    // [`SharedStub::HelperInlined`]'s: the setter frame's position is the published one (see
+    // `emit_consume_published_site`), kept in one more pair of the stub's frame.
+    inlined: bool,
 ) {
     use crate::bytecode::{
         AccessorSlot, ACCESSOR_TABLE_MASK_OFF, ACCESSOR_TABLE_SLOTS_OFF, SETTER_STORE_KEEP,
         SETTER_STORE_THIS,
     };
     use std::mem::offset_of;
+    let frame_bytes: i32 = if inlined { 48 } else { 32 };
+    const PUBLISHED: u32 = 32;
     // As the getter's (see `emit_get_prop_getter`): an entry the sequence's first gates would
     // refuse on every store keeps the helper.
     let entry_gates = |a: &mut asm::Asm, refuse: usize| {
@@ -9796,10 +9995,13 @@ fn emit_set_prop_setter(
     a.ubfx(9, 9, 0, 48);
     a.cbz(9, true, plain);
     a.ldr_imm(9, 9, crate::value::ACCESSOR_SET_WORD_OFF as u32);
-    // w2 = the setter frame's position, x12 = the store's call cache (its first way). The call
-    // probe's inputs: x10 = the word EOR the Object tag, w15 = the live epoch, x17 = the active
-    // Realm's global scope. Nothing below changes x2 or x3 before the sequence reads them.
-    a.ldr_w_imm(2, 4, offset_of!(AccessorSlot, position) as u32);
+    // w2 = the setter frame's position (the variant's at the hit), x12 = the store's call cache
+    // (its first way). The call probe's inputs: x10 = the word EOR the Object tag, w15 = the live
+    // epoch, x17 = the active Realm's global scope. Nothing below changes x2 or x3 before the
+    // sequence reads them.
+    if !inlined {
+        a.ldr_w_imm(2, 4, offset_of!(AccessorSlot, position) as u32);
+    }
     a.ldr_imm(12, 4, offset_of!(AccessorSlot, calls) as u32);
     a.mov_imm64(16, crate::value::PACK_OBJ);
     a.logic_x(2, 10, 9, 16);
@@ -9820,8 +10022,11 @@ fn emit_set_prop_setter(
     // ---- hit (x9 = the setter's word, x10, x12 and x15 as the call template's, w3 = the
     // form): a frame of [the site's return, pc and form], then the window over the operands ----
     a.bind(hit);
-    a.stp_pre(29, 30, -32);
+    a.stp_pre(29, 30, -frame_bytes);
     a.stp_off(1, 3, 16);
+    if inlined {
+        emit_consume_published_site(a, ilayout, PUBLISHED);
+    }
     let keep = a.new_label();
     let frame = a.new_label();
     let pushed = a.new_label();
@@ -9875,6 +10080,9 @@ fn emit_set_prop_setter(
     // ---- a gate of the sequence declined, before anything ran: put the operands back and
     // take the helper ----
     a.bind(declined);
+    if inlined {
+        emit_restore_published_site(a, ilayout, PUBLISHED);
+    }
     let keep_back = a.new_label();
     let frame_back = a.new_label();
     let restored = a.new_label();
@@ -9898,21 +10106,29 @@ fn emit_set_prop_setter(
     a.sub_imm(20, 20, 16);
     a.stur(17, 20, -8);
     a.bind(restored);
-    a.ldp_post(29, 30, 32);
+    a.ldp_post(29, 30, frame_bytes);
     a.b(plain);
     // ---- the setter returned: its result replaced the window; the store leaves none ----
     a.bind(returned);
+    #[cfg(test)]
+    if inlined {
+        emit_inlined_accessor_event(a, 1);
+    }
     a.sub_imm(20, 20, 8);
-    a.ldp_post(29, 30, 32);
+    a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 0, 0);
     a.ret();
     // ---- the setter threw: the sequence popped the window, the error is in the context ----
     a.bind(threw);
+    #[cfg(test)]
+    if inlined {
+        emit_inlined_accessor_event(a, 4);
+    }
     a.mov(0, 19);
     a.ldr_imm(1, 31, 16); // pc
     a.mov_imm64(16, crate::bytecode::jit_accessor_threw as *const () as u64);
     a.blr(16);
-    a.ldp_post(29, 30, 32);
+    a.ldp_post(29, 30, frame_bytes);
     a.movz(1, 1, 0);
     a.ret();
     // ---- the probe after way 0: the `CallSecondary` stub keeps w1, w2 and w3 ----
@@ -16527,6 +16743,13 @@ enum SharedStub {
     /// The checked helper call of an operation's slow path (`emit_op_helper`): x1 = the
     /// site's pc → x20 = the helper's new operand top, x1 = its flag (nonzero: threw).
     Helper { idx: u8 },
+    /// [`SharedStub::Helper`] for a template the optimizing tier runs as an inlined frame's
+    /// generic node (P3 stage 3 step 3c-2; `Asm::inlined_frame_helpers`): the property helpers'
+    /// direct getter, setter and Proxy trap calls take their frame's call site from
+    /// `Interp::call_site`, the inline position the node published, where the base stub takes it
+    /// from the running chunk's accessor table (which names no inline site for a callee's own
+    /// chunk); everything else as the base stub. Template code never calls it.
+    HelperInlined { idx: u8 },
     /// [`emit_prop_way_loop`]: x8 = a site's first `IcState` cell, x10 = receiver → w9 = 0 or a
     /// `PROP_PROBE_*` landing, with x11 = holder base and x13 = slot for the data landings.
     #[cfg(all(
@@ -16776,6 +16999,7 @@ impl SharedStub {
     const INTRINSIC_CALL: u32 = 0x1300;
     const STRING_CALL: u32 = 0x1400;
     const CALL_HIT: u32 = 0x1500;
+    const HELPER_INLINED: u32 = 0x1600;
 
     fn key(self) -> u32 {
         match self {
@@ -16785,6 +17009,7 @@ impl SharedStub {
             SharedStub::NameValuePtrIn => Self::NAME_VALUE_PTR_IN,
             SharedStub::NameLoad { for_call } => Self::NAME_LOAD | u32::from(for_call),
             SharedStub::Helper { idx } => Self::HELPER | u32::from(idx),
+            SharedStub::HelperInlined { idx } => Self::HELPER_INLINED | u32::from(idx),
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -16930,6 +17155,9 @@ impl SharedStub {
             ))]
             SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. } => true,
             SharedStub::Helper { idx } => matches!(usize::from(idx), H_GET_PROP | H_SET_PROP),
+            SharedStub::HelperInlined { idx } => {
+                matches!(usize::from(idx), H_GET_PROP | H_SET_PROP)
+            }
             _ => false,
         }
     }
@@ -16944,6 +17172,9 @@ impl SharedStub {
                 for_call: key & 1 != 0,
             },
             Self::HELPER => SharedStub::Helper {
+                idx: (key & 0xff) as u8,
+            },
+            Self::HELPER_INLINED => SharedStub::HelperInlined {
                 idx: (key & 0xff) as u8,
             },
             #[cfg(all(
@@ -17101,6 +17332,9 @@ impl SharedStub {
             SharedStub::NameValuePtrIn => named("NameValuePtrIn", &[]),
             SharedStub::NameLoad { for_call } => named("NameLoad", &[("for_call", for_call)]),
             SharedStub::Helper { idx } => format!("Stub:Helper({})", helper_name(idx.into())),
+            SharedStub::HelperInlined { idx } => {
+                format!("Stub:HelperInlined({})", helper_name(idx.into()))
+            }
             SharedStub::PropWays(flags) => named(
                 "PropWays",
                 &[
@@ -17220,45 +17454,8 @@ impl SharedStub {
                 a.movz(9, 0, 0);
                 a.ret();
             }
-            SharedStub::Helper { idx } => {
-                // The property reads' helper first calls the getter of an accessor its site
-                // published, and the stores' the setter of an accessor their caches prove,
-                // through the direct sequence (see `emit_get_prop_getter`,
-                // `emit_set_prop_setter`).
-                let plain = a.new_label();
-                if let (Some(ilayout), Some(direct)) = (context.ilayout, context.direct) {
-                    match usize::from(idx) {
-                        H_GET_PROP => {
-                            // A read without a published accessor tries its Proxy receiver's
-                            // trap (see `emit_get_prop_trap`).
-                            let trap = get_prop_trap_supported(layout, ilayout, direct);
-                            let trap_entry = if trap { a.new_label() } else { plain };
-                            if get_prop_getter_supported(layout, ilayout, direct) {
-                                emit_get_prop_getter(a, layout, ilayout, direct, plain, trap_entry);
-                            }
-                            if trap {
-                                a.bind(trap_entry);
-                                emit_get_prop_trap(a, layout, ilayout, direct, plain);
-                            }
-                        }
-                        H_SET_PROP if set_prop_setter_supported(layout, ilayout, direct) => {
-                            emit_set_prop_setter(a, layout, ilayout, direct, plain);
-                        }
-                        _ => {}
-                    }
-                }
-                a.bind(plain);
-                // The site has set x1 = pc; the call preserves nothing the body keeps in
-                // caller-saved registers, exactly like the inline sequence it replaces.
-                a.mov(0, 19);
-                a.mov(2, 20);
-                a.ldr_imm(16, 21, (usize::from(idx) * 8) as u32);
-                a.stp_pre(29, 30, -16);
-                a.blr(16);
-                a.ldp_post(29, 30, 16);
-                a.mov(20, 0);
-                a.ret();
-            }
+            SharedStub::Helper { idx } => emit_helper_stub(a, context, layout, idx, false),
+            SharedStub::HelperInlined { idx } => emit_helper_stub(a, context, layout, idx, true),
             SharedStub::NameLoad { for_call } => {
                 let miss = a.new_label();
                 emit_name_ic_value_ptr_body(a, layout, miss, true);
@@ -23926,14 +24123,17 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
         // General CFG emitters also flush all homes at candidate reads before calling here.
         emit_string_accumulation(a, pc, true, l_unwind);
     }
-    // An inlined frame's property helpers take no direct accessor call (see
-    // `Asm::plain_accessor_helpers`).
-    let plain = a.plain_accessor_helpers() && matches!(idx, H_GET_PROP | H_SET_PROP);
-    if a.stubs_ok() && shared_stubs_enabled() && idx < N_HELPERS && !plain {
+    if a.stubs_ok() && shared_stubs_enabled() && idx < N_HELPERS {
         // A slow path runs rarely and costs far more than a call and return: the sequence
-        // lives once in a shared stub, leaving three instructions at every site.
+        // lives once in a shared stub, leaving three instructions at every site. An inlined
+        // frame's property helpers take the stub's variant (see `Asm::inlined_frame_helpers`).
         a.movz(1, pc, 0);
-        let stub = a.shared_stub(SharedStub::Helper { idx: idx as u8 }.key());
+        let stub = if a.inlined_frame_helpers() && matches!(idx, H_GET_PROP | H_SET_PROP) {
+            SharedStub::HelperInlined { idx: idx as u8 }
+        } else {
+            SharedStub::Helper { idx: idx as u8 }
+        };
+        let stub = a.shared_stub(stub.key());
         a.bl_label(stub);
         a.cbnz(1, false, l_unwind);
         if helper_ends_in_poll(idx) {

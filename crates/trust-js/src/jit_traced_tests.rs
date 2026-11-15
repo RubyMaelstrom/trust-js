@@ -884,6 +884,7 @@ fn shared_stubs_embed_no_string_constant() {
         SharedStub::INTRINSICS2,
         SharedStub::NAME_LOAD,
         SharedStub::HELPER,
+        SharedStub::HELPER_INLINED,
         SharedStub::TYPED_ELEMENT,
         SharedStub::NAME_ELEMENT,
     ] {
@@ -941,5 +942,5 @@ fn shared_stubs_embed_no_string_constant() {
         }
     }
     // Direct calls of up to 64 arguments, with and without `this`.
-    assert_eq!(stubs, 10 * 256 + 2 * 65);
+    assert_eq!(stubs, 11 * 256 + 2 * 65);
 }

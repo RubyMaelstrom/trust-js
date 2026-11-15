@@ -3038,8 +3038,8 @@ impl Gen<'_> {
     /// capacity that x22, `JitCtx::slots` and `n_slots` name, the named slots' values in it. The
     /// compiled frame's words are saved in the save area before and restored after, on its
     /// return and on its throw, which leaves by the throw epilogue or, with a handler in a frame
-    /// of its chain, by its exit. Its property helpers are called in line
-    /// (`Asm::plain_accessor_helpers`), its TDZ tests all kept (its pcs are another chunk's).
+    /// of its chain, by its exit. Its property helpers' direct accessor calls take the published
+    /// site (`Asm::inlined_frame_helpers`), its TDZ tests all kept (its pcs are another chunk's).
     fn lower_inlined_generic(&mut self, n: NodeIx, pc: usize, pops: usize) -> Result<(), Refusal> {
         let graph = self.graph;
         let node = graph.node(n);
@@ -3175,7 +3175,7 @@ impl Gen<'_> {
         let hot = self.in_loop[self.compiled_pc(node.frame) as usize] || self.loop_mask(view)[pc];
         self.a.set_hot(hot);
         let reads = self.a.replace_initialized_reads(Default::default());
-        let plain = self.a.set_plain_accessor_helpers(true);
+        let helpers = self.a.set_inlined_frame_helpers(true);
         let fixed = self.a.fixed_activation();
         self.a.set_fixed_activation(view.jit_fixed_activation());
         let emitted = operations::emit(
@@ -3194,7 +3194,7 @@ impl Gen<'_> {
             emit_exec(&mut self.a, pc as u32, unwind);
         }
         self.a.set_fixed_activation(fixed);
-        self.a.set_plain_accessor_helpers(plain);
+        self.a.set_inlined_frame_helpers(helpers);
         self.a.replace_initialized_reads(reads);
         if poison {
             // The words it poisoned, still the poison: the window's other slots (x22 names the

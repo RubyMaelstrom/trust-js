@@ -1646,15 +1646,16 @@ impl crate::gc_trace::GcTrace for FramePool {
             // An inlined frame's generic node's slot window (P3 stage 3 step 3c): its words, the
             // record's words at ctx.slots, which its helper may write with a fresh value its slot
             // result reads after the node's end poll. Where the collector knows the record's top
-            // (that poll's x20) the window lies above it and is scanned here; where it does not,
-            // the frame's extent is the whole record (`JitCtx::frame_words`), which holds it.
+            // (that poll's x20, or a direct accessor call's from the node's helper stub, step
+            // 3c-2) the window lies above it and is scanned here; where it does not, the frame's
+            // extent is the whole record (`JitCtx::frame_words`), which holds it.
             if let Some((start, words)) = record.slot_window() {
                 let scanned = start + words <= extent || {
                     record.trace_words(sink, start, words);
                     true
                 };
                 #[cfg(test)]
-                note_window_trace(top.is_some(), scanned);
+                note_window_trace(top.map(|_| !record.ctx.poll_top.is_null()), scanned);
                 #[cfg(not(test))]
                 let _ = scanned;
             }
@@ -1662,19 +1663,37 @@ impl crate::gc_trace::GcTrace for FramePool {
     }
 }
 
+/// Records traced while an inlined frame's node ran on a slot window (P3 stage 3 steps 3c and
+/// 3c-2; tests): by the record's known top, and those whose window the trace left unscanned.
 #[cfg(test)]
-thread_local! {
-    /// Records traced while an inlined frame's node ran on a slot window (P3 stage 3 step 3c):
-    /// those traced at a known top, and those whose window the trace left unscanned (tests).
-    pub(crate) static TEST_WINDOW_TRACES: std::cell::Cell<(u64, u64)> =
-        const { std::cell::Cell::new((0, 0)) };
+#[derive(Clone, Copy, Default, Debug)]
+pub(crate) struct WindowTraces {
+    /// At the top of the record's poll (`JitCtx::poll_top` set): the node's end poll.
+    pub(crate) poll_tops: u64,
+    /// At a direct call's top (the callee's `final_sp`): an accessor the node's helper stub
+    /// called through the direct sequence.
+    pub(crate) call_tops: u64,
+    pub(crate) missed: u64,
 }
 
 #[cfg(test)]
-fn note_window_trace(known_top: bool, scanned: bool) {
+thread_local! {
+    pub(crate) static TEST_WINDOW_TRACES: std::cell::Cell<WindowTraces> =
+        const { std::cell::Cell::new(WindowTraces { poll_tops: 0, call_tops: 0, missed: 0 }) };
+}
+
+/// `top`: None where the record's top is unknown, else whether it is its poll's.
+#[cfg(test)]
+fn note_window_trace(top: Option<bool>, scanned: bool) {
     TEST_WINDOW_TRACES.with(|traces| {
-        let (at_top, missed) = traces.get();
-        traces.set((at_top + u64::from(known_top), missed + u64::from(!scanned)));
+        let mut current = traces.get();
+        match top {
+            Some(true) => current.poll_tops += 1,
+            Some(false) => current.call_tops += 1,
+            None => {}
+        }
+        current.missed += u64::from(!scanned);
+        traces.set(current);
     });
 }
 

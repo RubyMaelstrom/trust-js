@@ -1995,7 +1995,7 @@ fn a_slot_window_is_scanned_at_its_nodes_end_poll() {
            for (var i = 0; i < n; i++) { b = inc(b); out.push(b); } return out; }
          var r; for (var k = 0; k < 40; k++) r = run(20);
          String(r[0]) + ',' + String(r[19]) + ',' + r.length";
-    crate::interpreter::TEST_WINDOW_TRACES.with(|traces| traces.set((0, 0)));
+    crate::interpreter::TEST_WINDOW_TRACES.with(|traces| traces.set(Default::default()));
     inlined_generic();
     let (expected, got) = both(source, 0, true);
     assert_eq!(got, expected);
@@ -2005,10 +2005,310 @@ fn a_slot_window_is_scanned_at_its_nodes_end_poll() {
             .any(|op| matches!(op, Op::UpdateLocal(..))),
         "inc's update is an inlined frame's generic node"
     );
-    let (at_top, missed) = crate::interpreter::TEST_WINDOW_TRACES.with(std::cell::Cell::get);
+    let traces = crate::interpreter::TEST_WINDOW_TRACES.with(std::cell::Cell::get);
     assert!(
-        at_top > 0,
-        "a collection ran at a known top while the node's window was live"
+        traces.poll_tops > 0,
+        "a collection ran at the node's end poll while its window was live: {traces:?}"
     );
-    assert_eq!(missed, 0, "every window traced was scanned");
+    assert_eq!(
+        traces.missed, 0,
+        "every window traced was scanned: {traces:?}"
+    );
+}
+
+// ---- P3 stage 3 step 3c-2: an inlined frame's direct accessor calls ---------------------------
+
+/// `source`'s completion with the tier off, at TRUST_JS_OPT_INLINE=splice and at graph (an exit
+/// forced every `exit_every` checks; collections at every allocation where `stress`, at graph),
+/// each with the direct accessor calls inlined frames' helper stubs made
+/// (`jit::take_inlined_accessor_calls`: getter, setter and trap calls that returned, then those
+/// that threw), and the poison switch at graph where `poison`.
+fn counted(source: &str, exit_every: u32, stress: bool, poison: bool) -> [(String, [u64; 6]); 3] {
+    let run = |switches: TestSwitches, stress: bool| {
+        switches.set();
+        let mut engine = jit_engine();
+        if stress {
+            let mut core = engine.interp.gc_heap.core.borrow_mut();
+            core.set_stress_every(1);
+            core.set_incremental(crate::gc_core::IncrementalMode::Off);
+        }
+        crate::jit::take_inlined_accessor_calls();
+        let got = eval(&mut engine, source);
+        (got, crate::jit::take_inlined_accessor_calls())
+    };
+    let splice = TestSwitches {
+        inline_graph: Some(false),
+        ..graph_switches(exit_every)
+    };
+    let graph = TestSwitches {
+        poison,
+        ..graph_switches(exit_every)
+    };
+    [
+        run(TestSwitches::default(), false),
+        run(splice, false),
+        run(graph, stress),
+    ]
+}
+
+/// The direct calls' counts of `counted`: none with the tier off or at splice (the variant stub
+/// is an inlined frame's only), and at graph at least one returned call of each accessor kind
+/// `returned` marks ([getter, setter, trap]) and one thrown call of each `threw` marks.
+fn assert_direct_calls(runs: &[(String, [u64; 6]); 3], returned: [bool; 3], threw: [bool; 3]) {
+    assert_eq!(
+        runs[0].1, [0; 6],
+        "no direct call of the variant with the tier off"
+    );
+    assert_eq!(runs[1].1, [0; 6], "no direct call of the variant at splice");
+    let calls = runs[2].1;
+    for (kind, name) in ["getter", "setter", "trap"].iter().enumerate() {
+        if returned[kind] {
+            assert!(calls[kind] > 0, "a direct {name} call returned: {calls:?}");
+        }
+        if threw[kind] {
+            assert!(calls[3 + kind] > 0, "a direct {name} call threw: {calls:?}");
+        }
+    }
+}
+
+/// A getter, a setter and a Proxy `get` trap that inlined frames' generic reads and stores call
+/// (GetPropThis, SetPropThisDrop, GetPropLocal, SetPropLocalDrop, GetProp), each recording what
+/// it sees once the code runs: its caller (`f.caller`), its Error.stack, the stack of a TypeError
+/// its own operation raises, and the caller a toString it calls implicitly sees; then the same
+/// below a recursion past the direct calls' depth (`Interp::direct_call_depth`), where every
+/// direct sequence declines at its depth gate and the stub takes the plain helper.
+const DIRECT_ACCESSORS: &str = "
+var probe = false, log = [];
+var o2 = { toString: function ts() { if (probe) log.push('ts<' + (ts.caller && ts.caller.name)); return 'x'; } };
+function seen(tag, f) {
+  return tag + '<' + (f.caller && f.caller.name) + '|' + new Error(tag).stack.split('\\n').slice(0, 4).join('/');
+}
+function M(v) { this.v = v; }
+Object.defineProperty(M.prototype, 'w', {
+  get: function getter() {
+    if (probe) { var e = ''; try { null.boom; } catch (x) { e = x.stack.split('\\n').slice(0, 4).join('/'); }
+      log.push(seen('g', getter) + '|' + e + '|' + o2); }
+    return this.v + 1; },
+  set: function setter(z) {
+    if (probe) { var e = ''; try { null.boom; } catch (x) { e = x.stack.split('\\n').slice(0, 4).join('/'); }
+      log.push(seen('s', setter) + '|' + e + '|' + o2); }
+    this.v = z * 2; } });
+M.prototype.rw = function rw() { return this.w; };
+M.prototype.ww = function ww(z) { this.w = z; };
+function loc(o) { var q = o; return q.w; }
+function sloc(o, z) { var q = o; q.w = z; }
+var ph = { get: function trap(t, k, r) {
+  if (probe) { var e = ''; try { null.boom; } catch (x) { e = x.stack.split('\\n').slice(0, 4).join('/'); }
+    log.push(seen('t', trap) + '|' + e + '|' + o2); }
+  return k === 'w' ? 7 : 0; } };
+var px = new Proxy({}, ph), h = {p: px};
+function gp(h) { return h.p.w; }
+function run(m, n) { var s = 0;
+  for (var i = 0; i < n; i++) { s += m.rw(); m.ww(i); s += loc(m); sloc(m, i + 1); s += gp(h) + loc(px); }
+  return s; }
+function deep(n) { return n > 0 ? deep(n - 1) : run(m, 1); }
+var m = new M(1), r = 0;
+for (var k = 0; k < 300; k++) r += run(m, 10);
+probe = true; r += run(m, 1); log.push('deep'); r += deep(140); probe = false;
+r + '\\n' + log.join('\\n')";
+
+/// A throw from each accessor kind an inlined frame calls directly, caught by its caller's
+/// handler around the call and by none (the throw leaves the compiled function: each leaving
+/// function twice, since the accessor's first throw exits its own code, whose next call the way
+/// refills through the helper, and the second call is direct again); and the [[Get]]
+/// invariant's TypeError (ECMA-262 §10.5.8 step 10) after a trap's direct call returned, which
+/// captures its stack from `Interp::call_site`.
+const DIRECT_ACCESSOR_THROWS: &str = "
+function M(v) { this.v = v; this.bad = ''; }
+Object.defineProperty(M.prototype, 'w', {
+  get: function () { if (this.bad) throw new TypeError('get ' + this.bad); return this.v; },
+  set: function (z) { if (this.bad) throw new RangeError('set ' + this.bad); this.v = z; } });
+M.prototype.rw = function rw() { return this.w; };
+M.prototype.ww = function ww(z) { this.w = z; };
+function loc(o) { var q = o; return q.w; }
+function sloc(o, z) { var q = o; q.w = z; }
+var tgt = {bad: ''};
+var px = new Proxy(tgt, { get: function (t, k) { if (t.bad) throw new SyntaxError('trap ' + t.bad); return 5; } });
+var h = {p: px};
+function gp(h) { return h.p.w; }
+function caught(m, n) { var s = 0, msg = '';
+  for (var i = 0; i < n; i++) {
+    try { s += m.rw(); } catch (e) { s += 1000; msg += e.message + ';'; }
+    try { m.ww(i); } catch (e) { s += 2000; msg += e.message + ';'; }
+    try { s += loc(m); } catch (e) { s += 3000; msg += e.name + ';'; }
+    try { sloc(m, i); } catch (e) { s += 4000; msg += e.name + ';'; }
+    try { s += gp(h); } catch (e) { s += 5000; msg += e.message + ';'; }
+  }
+  return s + ':' + msg; }
+function l1(m, n) { var s = 0; for (var i = 0; i < n; i++) s += m.rw(); return s; }
+function l2(m, n) { for (var i = 0; i < n; i++) m.ww(i); return m.v; }
+function l3(m, n) { var s = 0; for (var i = 0; i < n; i++) s += loc(m); return s; }
+function l4(m, n) { for (var i = 0; i < n; i++) sloc(m, i); return m.v; }
+function l5(h, n) { var s = 0; for (var i = 0; i < n; i++) s += gp(h); return s; }
+var frozen = {}, lie = false;
+Object.defineProperty(frozen, 'w', {value: 1, writable: false, configurable: false});
+var liar = new Proxy(frozen, { get: function (t, k) { return lie ? 2 : 1; } });
+function l6(n) { var s = 0; for (var i = 0; i < n; i++) s += loc(liar); return s; }
+function stack(e) { return e.name + ':' + e.message + ':' + e.stack.split('\\n').slice(0, 4).join('/'); }
+var m = new M(1), r = '';
+for (var k = 0; k < 300; k++) { r = caught(m, 10); l1(m, 10); l2(m, 10); l3(m, 10); l4(m, 10); l5(h, 10); l6(10); }
+var out = [];
+lie = true; try { out.push(l6(3)); } catch (e) { out.push(stack(e)); } lie = false;
+m.bad = 'x'; tgt.bad = 'y'; out.push(caught(m, 2));
+var leaves = [function () { return l1(m, 3); }, function () { return l2(m, 3); }, function () { return l3(m, 3); },
+              function () { return l4(m, 3); }, function () { return l5(h, 3); }];
+for (var j = 0; j < 2 * leaves.length; j++) { try { out.push(leaves[j >> 1]()); } catch (e) { out.push(stack(e)); } }
+m.bad = ''; tgt.bad = '';
+r + '|' + out.join('|') + '|' + caught(m, 2)";
+
+/// Collections inside the accessors an inlined frame's windowed nodes (GetPropLocal,
+/// SetPropLocalDrop) call directly, with objects live in the window (the local receiver) and in
+/// both frames (the callee's `keep`, the caller's `o` and `t`).
+const DIRECT_ACCESSOR_COLLECTIONS: &str = "
+function M(v) { this.v = v; }
+Object.defineProperty(M.prototype, 'w', {
+  get: function () { var junk = {j: this.v}; return junk.j + 1; },
+  set: function (z) { var junk = [z, z]; this.v = junk[0] + junk.length; } });
+var px = new Proxy({}, { get: function (t, k) { var junk = {k: k}; return junk.k.length; } });
+function loc(o, z) { var q = o, keep = {a: z}; var w = q.w; return w + keep.a; }
+function sloc(o, z) { var q = o, keep = {a: z}; q.w = keep.a; return keep.a; }
+function lpx(z) { var q = px, keep = [z]; return q.w + keep[0]; }
+function hold(n) { var m = new M(3), o = {a: 1}, s = 0;
+  for (var i = 0; i < n; i++) { var t = {b: i}; s += loc(m, i) + sloc(m, i) + lpx(i) + t.b + o.a; }
+  return s + ':' + m.v; }
+var r = ''; for (var k = 0; k < 100; k++) r = hold(10); r";
+
+/// Accessors replaced (a new pair of new functions, the holder's shape kept or not) and
+/// recompiled (the getter's loop makes it hot enough for the tier) while inlined frames call them
+/// directly.
+const DIRECT_ACCESSOR_RECOMPILES: &str = "
+function M(v) { this.v = v; }
+var gen = 0;
+function install() { var g = gen++;
+  Object.defineProperty(M.prototype, 'w', { configurable: true,
+    get: function () { var s = 0; for (var j = 0; j < 4; j++) s += j; return this.v + g + s; },
+    set: function (z) { this.v = z + g; } }); }
+install();
+M.prototype.rw = function () { return this.w; };
+M.prototype.ww = function (z) { this.w = z; };
+function run(m, n) { var s = 0; for (var i = 0; i < n; i++) { s += m.rw(); m.ww(i & 3); } return s; }
+var m = new M(1), r = [];
+for (var k = 0; k < 600; k++) { r.push(run(m, 10)); if (k % 150 == 75) install(); }
+r.slice(-3).join(',') + ':' + r.reduce(function (a, b) { return a + b; }, 0) + ':' + gen";
+
+#[test]
+fn an_inlined_frames_accessors_are_called_directly_with_the_tier_offs_positions_and_stacks() {
+    inlined_generic();
+    let runs = counted(DIRECT_ACCESSORS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for seen in [
+        "g<rw|",
+        "s<ww|",
+        "g<loc|",
+        "s<sloc|",
+        "t<gp|",
+        "t<loc|",
+        "ts<getter",
+        "ts<setter",
+        "ts<trap",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    let ops = inlined_generic();
+    for kind in [
+        |op: &Op| matches!(op, Op::GetPropThis(..)),
+        |op: &Op| matches!(op, Op::SetPropThisDrop(..)),
+        |op: &Op| matches!(op, Op::GetPropLocal(..)),
+        |op: &Op| matches!(op, Op::SetPropLocalDrop(..)),
+        |op: &Op| matches!(op, Op::GetProp(..)),
+    ] {
+        assert!(ops.iter().any(kind), "{ops:?}");
+    }
+    assert_direct_calls(&runs, [true; 3], [false; 3]);
+}
+
+#[test]
+fn an_inlined_frames_direct_accessor_calls_give_the_tier_offs_results_with_exits_forced_and_poisoned(
+) {
+    for source in [DIRECT_ACCESSORS, DIRECT_ACCESSOR_THROWS] {
+        let runs = counted(source, 7, false, false);
+        assert_eq!(runs[2].0, runs[0].0, "an exit every 7 checks: {source}");
+        assert_eq!(
+            runs[1].0, runs[0].0,
+            "splice, an exit every 7 checks: {source}"
+        );
+        super::take_poison_faults();
+        let runs = counted(source, 0, false, true);
+        assert_eq!(runs[2].0, runs[0].0, "poisoned: {source}");
+        assert_eq!(
+            super::take_poison_faults(),
+            0,
+            "no template read or wrote a poisoned word: {source}"
+        );
+        assert!(
+            runs[2].1[..3].iter().all(|&calls| calls > 0),
+            "{:?}",
+            runs[2].1
+        );
+    }
+}
+
+#[test]
+fn a_throw_from_an_accessor_an_inlined_frame_calls_directly_is_caught_by_its_callers_handler_or_leaves(
+) {
+    inlined_exits();
+    let runs = counted(DIRECT_ACCESSOR_THROWS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for thrown in [
+        "TypeError:get x:",
+        "RangeError:set x:",
+        "SyntaxError:trap y:",
+    ] {
+        assert!(expected.contains(thrown), "{thrown}: {expected}");
+    }
+    assert_direct_calls(&runs, [true; 3], [true; 3]);
+    assert!(
+        inlined_exits()
+            .iter()
+            .any(|&(depth, _, reason)| depth == 1 && reason == ExitReason::Throw),
+        "a caught throw exits through the inlined frame"
+    );
+}
+
+/// A slot window above its node's operand top is scanned where a direct accessor call records the
+/// record's top (P3 stage 3 step 3c-2): the getter, setter and trap that GetPropLocal and
+/// SetPropLocalDrop call directly collect at every allocation, with the record's top the call's
+/// (its callee's `final_sp`, the node's x20 and the call's words), below the window.
+#[test]
+fn a_slot_window_is_scanned_at_a_direct_accessor_calls_top() {
+    crate::interpreter::TEST_WINDOW_TRACES.with(|traces| traces.set(Default::default()));
+    let runs = counted(DIRECT_ACCESSOR_COLLECTIONS, 0, true, false);
+    assert_eq!(runs[2].0, runs[0].0);
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    assert_direct_calls(&runs, [true; 3], [false; 3]);
+    let traces = crate::interpreter::TEST_WINDOW_TRACES.with(std::cell::Cell::get);
+    assert!(
+        traces.call_tops > 0,
+        "a collection ran at a direct call's top while the node's window was live: {traces:?}"
+    );
+    assert_eq!(
+        traces.missed, 0,
+        "every window traced was scanned: {traces:?}"
+    );
+}
+
+#[test]
+fn an_accessor_replaced_or_recompiled_while_an_inlined_frame_calls_it_directly_keeps_the_tier_offs_results(
+) {
+    let runs = counted(DIRECT_ACCESSOR_RECOMPILES, 0, false, false);
+    assert_eq!(runs[2].0, runs[0].0);
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    assert!(runs[0].0.ends_with(":5"), "{}", runs[0].0);
+    assert_direct_calls(&runs, [true, true, false], [false; 3]);
+    let runs = counted(DIRECT_ACCESSOR_RECOMPILES, 7, false, false);
+    assert_eq!(runs[2].0, runs[0].0, "an exit every 7 checks");
 }
