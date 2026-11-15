@@ -120,7 +120,7 @@ pub(crate) struct ChunkProfile {
     elements: OnceCell<Box<[Cell<u8>]>>,
     /// Template code's last-seen equality pairs (P3 stage 3, step L1b): a group of
     /// `feedback::EQ_CLASSES` bytes for each equality of the chunk that keeps a record (all but
-    /// those with an undefined or null constant operand, `feedback_read::records_equality`), made
+    /// those a constant operand decides, `feedback_read::records_equality`), made
     /// by the first template compile that records into them ([`ChunkProfile::equality_bytes`]):
     /// byte k of a group is
     /// [`UNSEEN`], or 0 where an in-line path of the site met a pair of class k
@@ -400,8 +400,8 @@ impl ChunkProfile {
     /// The address of the equality at `pc`'s group of last-seen class bytes in `chunk`, this
     /// profile's (see the `equalities` field; P3 stage 3, step L1b), the groups made [`UNSEEN`]
     /// at the first ask, one for each equality of the chunk that keeps a record (main thread: a
-    /// template compile that records); None for a pc that is no such equality (step L1b, D: one
-    /// with an undefined or null constant operand, which then records nothing). Generated code
+    /// template compile that records); None for a pc that is no such equality (steps L1b D and
+    /// L1c: one a constant operand decides, which then records nothing). Generated code
     /// stores zero into the byte of the class of each pair it meets.
     pub(crate) fn equality_bytes(&self, chunk: &Chunk, pc: usize) -> Option<u64> {
         let group = self

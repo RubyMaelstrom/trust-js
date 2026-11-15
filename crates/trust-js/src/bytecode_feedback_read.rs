@@ -70,36 +70,60 @@ pub(crate) fn is_equality(op: &Op) -> bool {
     matches!(op, Op::EqEq | Op::NotEq | Op::StrictEq | Op::StrictNotEq)
 }
 
+/// Whether an equality (`strict`: `===` or `!==`) with the constant `word` as an operand is
+/// decided by that constant whatever the other operand is: under `==` and `!=` an undefined or
+/// null constant (the other's NullOrLikeUndefined), under `===` and `!==` also a Boolean or any
+/// Number (identity, or the other word's double compare). These are the cases `opt::build`'s
+/// `Builder::equality` takes from a constant before it reads the equality's record, and the
+/// cases `Rules::equality_lowers` claims from a constant: the one statement of the invariant (P3
+/// stage 3 step L1c) that an equality keeps a record exactly where the builder may read one
+/// ([`records_equality`]), which opt::equality_tests'
+/// `the_equalities_that_keep_no_record_are_those_their_constant_decides` holds by building each
+/// shape under several records. A String constant decides nothing (the Strings' pair reads the
+/// record), nor does a loose Boolean or Number constant (`==` coerces: the record names the
+/// pair).
+pub(crate) fn constant_decides_equality(word: u64, strict: bool) -> bool {
+    let nullish = word == crate::value::PACK_UNDEFINED || word == crate::value::PACK_NULL;
+    let boolean = word & !1 == crate::value::PACK_BOOL;
+    // A Number's word: its top 16 bits, sign cleared, below the boxes' tags (a canonical NaN's
+    // 0x7ff8 among the Numbers).
+    let number = ((word >> 48) as u16 & 0x7fff) < 0x7ff9;
+    nullish || (strict && (boolean || number))
+}
+
 /// Whether the operation at `pc` of `chunk` is an equality that keeps an equality record (P3
-/// stage 3, step L1b, D; feedback-schema.txt 5.8), `targets` its operations' jump targets
-/// ([`jump_targets`]): every equality but one whose right operand is an undefined or null
-/// constant on every path to it, the operation before it `Undef` or a `Const` of undefined or
-/// null and the equality no jump target. The compiler puts a literal on the right of a
-/// comparison with a non-literal (`null == x` compiles as `x == null`, `Compiler::binary`), the
-/// parser makes the name `undefined` a literal, and `void` of a literal is `Undef`: so `x ==
-/// null`, `undefined != x`, `x === null` and `x !== void 0` keep none, where `x == (c ? y :
-/// null)`, whose equality the conditional's join reaches, keeps one. The tier lowers such an
-/// equality from its constant whatever the other operand (`opt::build`'s `Rules::equality_lowers`
-/// and `Builder::equality`: the other's NullOrLikeUndefined under `==`, identity under `===`),
-/// so a record there would only cost template code its stores, as V8's bytecode generator
-/// compiles a literal comparison with undefined or null to TestUndefined, TestNull or
-/// TestUndetectable, which have no feedback slot (interpreter/bytecode-generator.cc:7862-7883 and
-/// 8010-8017, interpreter/bytecodes.h:118-120), and JSC's to eq_null or neq_null, which profile
-/// nothing (bytecode/BytecodeList.rb:1375-1378; DFG makes them CompareEq with a null constant,
-/// dfg/DFGByteCodeParser.cpp:9379-9385).
+/// stage 3, steps L1b D and L1c; feedback-schema.txt 5.8), `targets` its operations' jump
+/// targets ([`jump_targets`]): every equality but one whose right operand is a constant that
+/// decides it ([`constant_decides_equality`]) on every path to it, the operation before it
+/// `Undef` or such a `Const`, and the equality no jump target. The compiler puts a literal on the
+/// right of a comparison with a non-literal (`null == x` compiles as `x == null`, `5 === x` as `x
+/// === 5`, `Compiler::binary`), the parser makes the name `undefined` a literal, `void` of a
+/// literal is `Undef`, and `-` of a Number literal is its negated constant: so `x == null`,
+/// `undefined != x`, `x === null`, `x !== void 0`, `x === true`, `x !== 0` and `x === -1.5`
+/// keep none, where `x == 5`, `x === 'a'`, `x === NaN` (a name, not a constant) and `x == (c ? y
+/// : null)`, whose equality the conditional's join reaches, keep one. The tier lowers such an
+/// equality from its constant whatever the other operand, so a record there would only cost
+/// template code its stores. V8's bytecode generator compiles a literal comparison with
+/// undefined or null to TestUndefined, TestNull or TestUndetectable and a strict one with a
+/// Boolean to TestReferenceEqual, none with a feedback slot (interpreter/bytecode-generator.cc:
+/// 7862-7890 and 8005-8017, interpreter/bytecodes.h:118-120), and JSC's to eq_null or neq_null,
+/// which profile nothing (bytecode/BytecodeList.rb:1375-1378); V8 does record `x === 5`'s
+/// feedback (a StrictEqual with a slot, whose kSignedSmall makes Maglev's Int32 compare), where
+/// TRust's builder compares the other word as a double whatever it is, so nothing would read it.
 pub(crate) fn records_equality(chunk: &Chunk, targets: &[bool], pc: usize) -> bool {
     let ops = chunk.jit_ops();
     if !ops.get(pc).is_some_and(is_equality) {
         return false;
     }
-    let nullish = match pc.checked_sub(1).map(|before| ops[before]) {
+    let strict = matches!(ops[pc], Op::StrictEq | Op::StrictNotEq);
+    let decides = match pc.checked_sub(1).map(|before| ops[before]) {
         Some(Op::Undef) => true,
-        Some(Op::Const(k)) => chunk.jit_const_scalar_bits(k).is_some_and(|word| {
-            word == crate::value::PACK_UNDEFINED || word == crate::value::PACK_NULL
-        }),
+        Some(Op::Const(k)) => chunk
+            .jit_const_scalar_bits(k)
+            .is_some_and(|word| constant_decides_equality(word, strict)),
         _ => false,
     };
-    !nullish || targets[pc]
+    !decides || targets[pc]
 }
 
 /// Whether `op` is an element load or store with the element record.

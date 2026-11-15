@@ -947,6 +947,52 @@ fn an_equality_with_a_nullish_constant_keeps_no_record() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[test]
+fn a_strict_equality_with_a_boolean_or_number_constant_keeps_no_record() {
+    // P3 stage 3 step L1c: under `===` and `!==` a Boolean or a Number constant decides the
+    // equality too (identity, the word's double compare), so a loop's in-line templates record
+    // nothing there; `0 === a` is compiled as `a === 0`, `-1.5` is a constant. Under `==` a Number
+    // and under `===` a String constant keep their records, which the builder reads.
+    super::pin_forced_exits_off_for_test();
+    let mut engine = jit_engine(true);
+    let shapes = [
+        ("kt", "a === true", false),
+        ("kf", "false !== a", false),
+        ("kz", "a !== 0", false),
+        ("kw", "0 === a", false),
+        ("kn", "a === -1.5", false),
+        ("kl", "a == 0", true),
+        ("ks", "a === 's'", true),
+    ];
+    let mut source = String::new();
+    for (name, test, _) in shapes {
+        source.push_str(&format!(
+            "function {name}(a, n) {{ var c = 0;
+               for (var i = 0; i < n; i++) {{ if ({test}) c++; }} return c; }}"
+        ));
+    }
+    eval(&mut engine, &source);
+    for (name, _, records) in shapes {
+        template_only(&mut engine, name, &format!("{name}('x', 8)"));
+        let chunk = chunk_of(&mut engine, name);
+        let pc = equality_pc(&chunk);
+        assert_eq!(
+            super::profile::ChunkProfile::of(&chunk)
+                .equality_bytes(&chunk, pc)
+                .is_some(),
+            records,
+            "{name}: a group: {:?}",
+            chunk.jit_ops()
+        );
+        let met = seen(&mut engine, name).0;
+        assert_eq!(met != 0, records, "{name}: met {met:#x}");
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
 fn speculated_equality_results_equal_the_vms() {
     // Sites that meet one pair for long, then others late (their checks exit), a String pair
     // of equal lengths and contents in other cells, a long String, interned and made Strings,
@@ -1516,4 +1562,106 @@ fn the_equality_record_leaves_the_settled_feedback_fingerprint_as_it_was() {
     );
     super::profile::ChunkProfile::of(&chunk).see_equality(&chunk, pc, STRINGS);
     assert_eq!(super::snapshot::fingerprint(&chunk), before);
+}
+
+// ---- L1c: the equalities that keep no record ---------------------------------------------------
+
+/// The lowering the builder made of the equality at `pc`: its nodes there, but constants, phis
+/// and the boxing of the result, as debug text, sorted.
+fn lowering(graph: &Graph, pc: usize) -> Vec<String> {
+    let mut ops: Vec<String> = graph
+        .nodes
+        .iter()
+        .filter(|node| node.pc as usize == pc && node.frame == FrameIx::COMPILED)
+        .filter(|node| {
+            !matches!(
+                node.op,
+                NodeOp::ConstTagged(_)
+                    | NodeOp::ConstF64(_)
+                    | NodeOp::ConstI32(_)
+                    | NodeOp::ConstBool(_)
+                    | NodeOp::Phi
+            )
+        })
+        .map(|node| format!("{:?} {:?}", node.op, node.reason))
+        .collect();
+    ops.sort();
+    ops
+}
+
+#[test]
+fn the_equalities_that_keep_no_record_are_those_their_constant_decides() {
+    // The invariant of P3 stage 3 step L1c (`feedback_read::constant_decides_equality`): for each
+    // shape, the equality built under no record and under each pair's is one lowering exactly
+    // where `feedback_read::records_equality` keeps no record. A builder case that decides from a
+    // constant before the record, or a no-record case the builder reads a record for, breaks it
+    // alone. The other operand is a parameter of every kind (no fact proves it).
+    use crate::feedback::{EQ_BOOLEANS, EQ_NULLISH, EQ_NUMBERS, EQ_OBJECTS, EQ_STRINGS};
+    let shapes = [
+        "x === undefined",
+        "x !== null",
+        "x === void 0",
+        "x === true",
+        "false !== x",
+        "x === 0",
+        "x !== -0",
+        "x === 1.5",
+        "5 === x",
+        "x === -2",
+        "x === 'a'",
+        "x !== ''",
+        "x == null",
+        "undefined != x",
+        "x == true",
+        "x == 0",
+        "x == 1.5",
+        "x != 'a'",
+        "x === y",
+        "x == y",
+        "x === NaN",
+        "x == (y ? 1 : null)",
+        "x === (y ? 0 : null)",
+    ];
+    let records = [
+        0,
+        EQ_NUMBERS,
+        EQ_STRINGS,
+        EQ_OBJECTS,
+        EQ_BOOLEANS,
+        EQ_NULLISH,
+        EQ_NULLISH | EQ_OBJECTS,
+    ];
+    for (k, test) in shapes.iter().enumerate() {
+        let name = format!("q{k}");
+        let program = format!(
+            "function {name}(x, y) {{ return {test}; }}
+             var kinds = [1, 'a', null, {{}}, true, undefined, 1.5];
+             for (var r = 0; r < 21; r++) {name}(kinds[r % 7], r & 1);"
+        );
+        let mut keeps = None;
+        let lowerings: Vec<Vec<String>> = records
+            .iter()
+            .map(|&pairs| {
+                let mut engine = warmed(&program);
+                let chunk = chunk_of(&mut engine, &name);
+                let pc = equality_pc(&chunk);
+                let targets = crate::bytecode::jump_targets(chunk.jit_ops());
+                keeps = Some(crate::bytecode::feedback_read::records_equality(
+                    &chunk, &targets, pc,
+                ));
+                if pairs != 0 {
+                    chunk.feedback_vector().record(pc, pairs);
+                }
+                let (graph, _) = graph_of(&mut engine, &name);
+                lowering(&graph, pc)
+            })
+            .collect();
+        let decided = lowerings.iter().all(|lowering| *lowering == lowerings[0]);
+        assert_eq!(
+            keeps,
+            Some(!decided),
+            "{test}: a record kept where the builder decides without it, or none where it reads \
+             one: {lowerings:?}"
+        );
+    }
 }

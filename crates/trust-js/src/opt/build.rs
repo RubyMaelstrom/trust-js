@@ -1004,22 +1004,19 @@ impl Rules<'_> {
             | Op::Plus => self.lowers(p),
             _ => false,
         };
-        let identity = |p: usize| match self.ops[p] {
-            Op::Const(k) => const_word(self.chunk, k)
-                .is_some_and(|word| identity_constant(word) || number_word(word).is_some()),
+        // A constant that decides the equality whatever the other operand (P3 stage 3 step L1c:
+        // `feedback_read::constant_decides_equality`, the invariant's one statement): under `===`
+        // undefined, null, a Boolean or a Number, under `==` undefined or null.
+        let decides = |p: usize| match self.ops[p] {
+            Op::Const(k) => const_word(self.chunk, k).is_some_and(|word| {
+                crate::bytecode::feedback_read::constant_decides_equality(word, strict)
+            }),
             Op::Undef => true,
             _ => false,
         };
-        let nullish = |p: usize| match self.ops[p] {
-            Op::Const(k) => const_word(self.chunk, k)
-                .is_some_and(|word| word == PACK_UNDEFINED || word == PACK_NULL),
-            Op::Undef => true,
-            _ => false,
-        };
-        let either = |which: &dyn Fn(usize) -> bool| a.is_some_and(which) || b.is_some_and(which);
         (a.is_some_and(number) && b.is_some_and(number))
-            || (strict && either(&identity))
-            || (!strict && either(&nullish))
+            || a.is_some_and(decides)
+            || b.is_some_and(decides)
     }
 
     /// The pair the equality at `pc` speculates on: its record's one pair (see
@@ -4182,6 +4179,17 @@ impl<'a> Builder<'a> {
             .equality_record(pc)
             .filter(|pair| !self.declined(pc, pair.reason(), "the generic operation"))
         {
+            // A constant that decides the equality took one of the cases above, so that the
+            // equalities that keep no record (`feedback_read::records_equality`) read none (P3
+            // stage 3 step L1c).
+            debug_assert!(
+                !ca.is_some_and(|word| {
+                    crate::bytecode::feedback_read::constant_decides_equality(word, strict)
+                }) && !cb.is_some_and(|word| {
+                    crate::bytecode::feedback_read::constant_decides_equality(word, strict)
+                }),
+                "the record read at pc {pc}, whose constant decides it"
+            );
             match self.speculated_equality(pc, pair, a, b, strict, negate, st)? {
                 Some(result) => result,
                 // Operands of another kind than the record's (a constant, an unboxed value).
