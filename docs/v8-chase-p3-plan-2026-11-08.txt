@@ -4579,6 +4579,13 @@ operation that needs the whole canonical frame, or a call. The default stays the
   the landed binary: 42 runs at the splice and at graph, none refused); zombie's check,
   clippy, Windows' check and suite (2,888). Three of step 2's tests now assert the new rule
   (a callee's GetPropLocal, Add and EqEq inlined as generic nodes, where E0 declined them).
+- The gate on the final tree (fe601a3c, 2026-11-15, beside the agents' load; target/p3/stage3/
+  step3c-review, gate.out, gate-graph.out, gate-poison.out): at the default with the tier off,
+  on, eager and forced, and at graph on, eager and forced: the library suite 3,477, difftest
+  138 agree, the fixtures' outputs the tier off's, Test262 53,572 of 53,575 (the tier off's
+  three staging/sm failures and none beyond) in each of the seven; under the poison at graph,
+  on and eager: the library suite 3,477, difftest and the fixtures. GC stress over
+  opt::inline_tests and opt::frames_tests was still running when this was written.
 - Open, before the flip (step 4): the direct accessor paths and calls from inlined frames
   (step 3c-2, started); GBEMU's R7; PdfJS's second-callee exits; the owner's question on the
   origin's form, above.
@@ -4743,3 +4750,208 @@ undefined or null constant keeps no record.
   ignored in every tier (target/p3/stage3/stepL1b-review/shadowed-undefined.js). V8 treats only
   the unshadowed global as the literal (ast/ast.cc:107-117). records_equality keys on the
   compiled Undef and stays right when that is fixed.
+
+Stage 3 step L1c landed (811edda4 piece 1, 36a32df3 piece 2, 9c75a199 piece 1's follow-up,
+2026-11-15; target/p3/stage3/stepL1c-impl, report.txt and design-note.txt): a check moved to a
+loop's entry edge keeps the checks it stands for, and its exit is their operations' ordinary exit
+where every one of them runs whenever the loop is entered; and an equality that a constant
+operand decides keeps no record.
+Piece 1, the moved check's exit:
+- What is kept. The selector's moves (CheckNumber, CheckInt32, CheckObject, CheckElements of an
+  invariant) and step 0c's typed arrays' entry checks (CheckObject, CheckElements(Typed),
+  TypedData) each list the checks they replaced: pc, frame, own reason, and whether the check's
+  block runs whenever the loop is entered (Graph::moved; the back end copies the lists into the
+  exit table, ExitTable::moved, by the record's index: data alone, 12 bytes a site, counted in
+  the table's retained bytes; the tier's code identical, 1,521 of 1,521 compiles over the
+  workloads after TypeScript's ten are normalized for an address).
+- "Runs whenever the loop is entered" is JSC's control equivalence of the entry edge's
+  predecessor and the check's block (DFGControlEquivalenceAnalysis.h:46-69) on this CFG: no path
+  from the header that avoids the block leaves the natural loop (a Return's or an Exit's block is
+  outside it; a branch on a constant takes its one edge); checks and throwing nodes inside blocks
+  are not counted, as JSC's analysis does not count them. The loops here are not rotated, so the
+  header holds the test and the moved check sits before the first test: only the condition's
+  straight line and a do-while's body qualify. Every body check behind the test is blind, an
+  unconditional one too (the loop may run no iteration).
+- The discard (driver.rs flag_moved). Every replaced check runs anyway: each one's own pc is
+  flagged with its own reason in its own chunk (a splice's at its baseline site, a graph-inlined
+  frame's at its callee's chunk with the inlined key: the add_site an exit at that pc makes) and
+  the header is NOT flagged, so the recompile takes those operations' other forms and still
+  moves the loop's other checks: JSC's control-equivalent hoist, which exits at its node's
+  semantic origin with its own kind (DFGLICMPhase.cpp:252-269, DFGOSRExitBase.cpp:38-60). One
+  blind (or none listed): HoistingFailed at the header as before, and the sites that run anyway
+  flagged too (their failure is certain), which converges in one round where JSC, hoisting each
+  node apart, takes two.
+- The forms compared (the agent's variants, fat LTO): R, body checks that dominate every back
+  edge counted as running anyway (JSC's answer for the rotated form of the loop), flags PdfJS's
+  copy loop's read NotObject though the read never met null (its 49 failing entries are all
+  loops of no iteration, `buffer` null and `current` 0), which makes the read generic for every
+  call: PdfJS +0.84% and GBEMU +0.15% instructions at 200 runs. S (L1b's report: both always)
+  also teaches TypeScript's and Crypto's guarded sites wrongly. So J, the form built.
+- In the measured workloads nothing changes, by design: all four moved checks that fail there
+  are blind (PdfJS ensureBuffer's zero-trip loop, TypeScript typeCheckFunction's `targetParams
+  && ...`, Crypto bnpFromString's `?:` arm, GBEMU getTypedArray's body store, the one that would
+  have run). Synchronous logs equal on every workload (189 HoistingFailed exits on both;
+  TypeScript's census difference is the marker's load: alone on one CPU the logs are the same,
+  25,458 exits and 114 discards). What it buys is for a loop's condition: an invariant bound that
+  became a double, an array or typed array of another kind, converging in one discard with the
+  loop's other moves kept (opt::moved_tests, each kind at splice and at graph).
+- Measured (fat LTO; my recount of 811edda4 against fc428c00, merge-check/counts-l1c1.out, on
+  cores 5 and 6): instructions at 5 fixed runs within 0.03% with the tier on and off but Vue's
+  steady state +0.16% on and +0.14% off (the binary's layout: the tier's code does not run with
+  it off; the agent's +0.18% both ways) and TypeScript -0.49% on (the marker's two modes);
+  Octane's geomean -0.03% on (TypeScript's), +0.00% off. The agent's at 200 runs: within 0.01%
+  but TypeScript +0.12% inside its spread. The verifier sweep on the landed binary: 42 runs, none
+  refused.
+- Tests: opt::moved_tests, seven (the class of a for loop's bound and body, a do-while's body, a
+  conditional, behind a return, behind a break in `while (true)`; each kind converging in one
+  discard with the header unflagged and the loop's other invariant still moved; a blind move and
+  a mixed one; two typed reads of a condition; an inlined callee's read at the callee's chunk,
+  the spliced key at splice and the inlined key at graph; forced exits flagging nothing; the
+  flag and the next snapshot's declined bit those of the operation's own exit). 11 mutations
+  caught; a twelfth was an equivalent mutant (a Return's block is never in the natural loop) and
+  its dead test was removed. The whole library suite on piece 1's tree (the agent's legs): the
+  tier off, on and forced at the splice, 3,499 each; eager one failure, the host-interruption
+  test's 100 ms deadline under the suite's load (a hand-installed graph, no moved check; alone
+  5 of 5), a known load flake. The tier's and the back end's modules on the merged tree (mine,
+  527 tests) with the tier on, graph eager, forced and off. zombie's check, clippy, Windows'
+  check and x86-64 suite (2,890).
+- Forks kept for later steps. (1) Body checks get the right answer only where the moved check
+  sits after the loop's first test, as V8's peeling and JSC's rotation put it: for the step that
+  peels (step 6's departure 2), not here (it moves code). (2) After a HoistingFailed discard the
+  second round the brief described comes only where the operation's record does not refresh: an
+  equality's record is template code's alone, the VM marks nothing (feedback-schema.txt 5.8),
+  where Ignition updates a compare's feedback at every execution; a fork for the record's owner.
+- The review's two findings, fixed in 9c75a199. (1) A compile-time cliff in piece 1 as it first
+  landed: the typed entry checks' sites were classed by a scan of the graph's nodes from the
+  start for every site of every check, and deduplicated by a linear search: a synthetic loop of
+  2,000 typed sites (1,000 reads and 1,000 writes of one Int32Array, 12,021 nodes) compiled in
+  548 ms against the base's 54.5 ms (a second round 250-364 against 35.5). Now one pass over the
+  nodes for each loop with such checks and a block's class computed once: 36.0 ms (25.0); the
+  moved lists equal on every workload (883 lists over 22 runs). Nothing in the measured
+  workloads had met it. (2) A site is keyed by its check's frame state (pc and frame), from
+  which its own exit record would be made, with a debug assertion that these are the node's (no
+  mismatch in any workload).
+Piece 2, no record where the builder reads none:
+- The rule has one statement, feedback_read::constant_decides_equality: under == and != an
+  undefined or null constant, under === and !== also a Boolean or any Number constant (identity,
+  or the other word's double compare: Builder::equality's cases before its record). An equality
+  whose right operand is such a constant on every path to it keeps no group and stores nothing
+  (records_equality), and the rules' claim of an equality from its constant is the same
+  predicate (the set L1b's D claimed, written once now). Not `==` with a Number, Boolean or
+  String constant, nor `===` with a String (the record's pair is read there), nor a name (`x ===
+  NaN`). V8 compiles a strict comparison with a Boolean literal to TestReferenceEqual, without a
+  feedback slot, as it does TestNull and TestUndefined (bytecode-generator.cc:7884-7890,
+  8005-8009); V8 does record `x === 5` (its kSignedSmall makes Maglev's Int32 compare), where
+  this builder compares the other word as a double whatever it is, so nothing would read the
+  record: the one departure, and safe for that reason. A debug assertion in the builder's record
+  branch and a test that builds 23 shapes under seven records hold the two together.
+- Measured (the agent's probes): sites with a group 3,647 -> 3,252 (GBEMU 327 -> 199, Mandreel
+  752 -> 700, Djot 173 -> 133); recording hits in template code at 5 runs 27,081 fewer of 3.36M
+  (React's steady state 23,676 -> 11,160, Earley-Boyer 10,678 -> 3,125); template words with the
+  tier on -0.05%; the tier's code makes the same effects (equality effects 274,893 on both).
+  Instructions at 5 fixed runs (my recount of 9c75a199 against 811edda4,
+  merge-check/counts-l1c3.out): GBEMU -0.03%, React's fixture -0.05%, Splay -0.07%, every other
+  within 0.03% but Vue's steady state -0.10% on and -0.07% off (layout) and PdfJS +0.25%, its
+  clock's modes (one binary's three runs spread as far: 5,389M, 5,397M, 5,403M); the tier off
+  within 0.05% (GBEMU's two modes). The agent's at 200 runs within noise (Earley-Boyer -0.10%,
+  TypeScript +0.09%). The tier off's template code identical in 3,062 of
+  3,062 compiles.
+- Tests: the invariant's test and the in-line templates' (`a === true`, `false !== a`, `a !== 0`,
+  `0 === a`, `a === -1.5` record nothing; `a == 0` and `a === 's'` record); 6 mutations caught.
+Checks of the final tree (9c75a199): fmt and clippy clean; the verifier sweep on the landed
+binary (42 runs, none refused); the tier's and the back end's modules on main with piece B beside
+it (mine, 569 tests) with the tier on, graph eager, graph forced, forced and off; zombie's check,
+clippy, Windows' check and x86-64 suite (2,891). The agent's whole-suite matrix on the final tree
+(13 legs) was still running when this was written.
+
+Stage 3 step 3c-2, piece B landed (13e509e8, 2026-11-15; target/p3/stage3/step3c2-impl,
+report.txt "PIECE B" and design-note-B.txt): an inlined frame makes plain and method calls.
+Under TRUST_JS_OPT_INLINE=graph a plan compiles in place when each of its ways is a leaf or a
+callee making only plain and method calls, none of which the plan inlines in turn; the default
+stays the splice.
+- The form. A callee's Call and CallWithThis are generic call nodes of its inlined frame. The
+  oracle registers one inline site per (way, call): the way's function at the call's position
+  in the callee, called from the compiled chunk's call; a way whose callee calls gets a view of
+  its own whose call positions are those sites, so the template's direct sequence and the
+  stubs' position words name them. The node publishes its call's site in Interp::call_site and
+  runs its template with x21 on a second helper table (jit::inlined_call_helpers) whose six
+  position helpers (exec, call, call hit, intrinsic, new, call spread) take the published site
+  where the template's take the running chunk's plain position; x21 is put back after the
+  template and on the throw path. JSC stores the call node's inlined origin's CallSiteIndex
+  before each call (DFGSpeculativeJIT64.cpp:1000-1007, 1036-1171); Maglev's calls carry their
+  inlined unit's lazy deopt frame (maglev-graph-builder.cc:1157-1211).
+- The review's finding in the work in progress (reproduced on the agent's first build): the
+  published site stayed in Interp::call_site while a callee entered by the direct sequence
+  ran, so everything that callee's own operations captured started from the inlined frame's
+  site (a stack printed "at mid, at inner" for inner's own error; import() resolved against
+  the wrong script). Fixed: a direct callee runs with NO_POSITION (a variant of the shared
+  direct-call stub and the in-line sequence under the mode consume the site at the frame push,
+  past every gate, so that a declined gate leaves it for the helper that then makes the call),
+  and the call's end publishes the frame's implicit site again for its end poll.
+- The nested-ways rule. A way whose callee's calls the plan inlines in turn keeps its whole
+  plan spliced: frames do not nest in inlined frames yet, and calling what the splice inlines
+  lost to it when the first build took such ways (DeltaBlue +8.8% and React's steady state
+  +9.4% at 5 fixed runs, Richards +16.4% at 200; Richards' -13.0% at 5 runs under that build
+  was warm-up alone, earlier compiles in place: fixed-5 counts of a tier change again).
+- The census at graph (the agent's): ways inlined 644 -> 931; plans left to the splice 297 ->
+  211, of them 134 for nested ways (TypeScript 91, GBEMU 9, DeltaBlue 7, Richards 6, Box2D 6)
+  and 77 for other calls (their callees construct). Exits through inlined frames 101 (100 of
+  them one TypeScript code's repeat until its limit: the policy's, step 4's).
+- Measured, graph against the splice on the landed binary (fat LTO; my recount, merge-check/
+  counts-b.out and counts-b-graph.out, equal to the agent's to the digit shown; in brackets the
+  same on the main before it), instructions at 5 fixed runs: Djot -1.86% (-0.97), its steady
+  state -0.75% (-0.33), Crypto -1.06% (-0.17), Box2D -0.81% (-0.24), DeltaBlue -0.54% (-0.15),
+  Vue -0.51% (-0.48), Mandreel -0.31% (-0.31), Earley-Boyer -0.27% (-0.19), PdfJS -0.26%
+  (-0.50, its clock's modes), Richards -0.12% (-0.12), TypeScript -0.04% (+0.51, inside its
+  spread), GBEMU +1.74% (+1.88), React +5.06% (0.00), React's steady state +10.16% (0.00);
+  Octane's geomean -0.11% (+0.05%). At 200 runs (the agent's): Box2D -0.73%, PdfJS -0.29%,
+  Mandreel -0.29%, TypeScript -0.20%, DeltaBlue -0.16%, Richards -0.01%, GBEMU +1.21%. Timed on
+  one X925 core beside a loaded machine (the agent's three rounds, a first read): Djot's steady
+  state -1.3%, Box2D +1.3% and Earley-Boyer +1.1% in score, GBEMU -3.1%, React's steady state
+  +5.6% slower.
+- Where graph loses, for the pieces before the flip: React, +5.1% and its steady state +10.2%
+  instructions (+5.6% timed): its reducer inlines the self-hosted Array.prototype.map at three
+  sites, and the map's callback call, once an element, is a call node, which costs 20
+  instructions more than the splice's same call (253.7 -> 273.7 an iteration: the chunk switch,
+  the publication, the table switch, the restores, the republication), where JSC's is one
+  store. Piece B2, started: the call node's cost. GBEMU +1.2 to +1.9%, step 2's R7, unchanged.
+- The default and the tier off: at the default my recount of 13e509e8 against 9c75a199 is within
+  0.04% with the tier on but Djot's fixture -0.14% (steady, 0.002% spread, the agent's -0.17%;
+  not traced: the call helpers' bodies are instantiated twice now, which may compile them
+  differently) and PdfJS -0.26% (its
+  clock's modes), and with the tier off within 0.05% but Earley-Boyer +0.10% and Splay -0.22%,
+  the marker's schedule in another binary. Template code at the splice identical in 2,173 of
+  2,173 compiles and the tier's in 1,375 of 1,375 (the agent's dump); with the tier off 2,560
+  of 2,594: GBEMU's 25 vary from run to run on one binary, and Djot's steady state's 9 follow
+  from one splice the template JIT's planner makes in one binary and skips in the other (its
+  callee collected before the plan or not: a collection's timing, the shared compiles
+  identical).
+- Tests: nine new in opt::inline_tests (callers, arguments.callee.caller and stacks seen by a
+  callee of an inlined frame through the direct sequence, a method call, a megamorphic site,
+  the function-call intrinsic, a bound function, a Proxy, a throwing native, throws caught and
+  not, a call back into the compiled function; a direct callee's own error, toString and
+  getters; a decline at the depth gate, at the callee's changed entry and at a moved epoch; a
+  re-entrant call; a callee of another script whose import() and indirect eval's import()
+  resolve against its own script; errors after the call; collections, forced exits and the
+  poison; the depth a recursion through an inlined frame reaches, within 2% of the splice's
+  (off 64,126, splice 64,118, graph 63,606: the native stack's bound, as the exemplars bound
+  theirs); the nested-ways rule). 10 mutations, each caught (three after their test's throw
+  moved out of the compiled function, whose exits had discarded the code before the probe).
+  My own probes of the agent's build (13 call scenarios, target/p3/stage3/step3c2-review/
+  b2-probe): equal output at tier off, splice, graph, graph eager and graph eager with forced
+  exits. The tier's, the back end's, the traced and the inline-context modules on the merged
+  tree (mine, 569 tests) with the tier on, graph eager, graph forced, forced and off; the
+  verifier sweep on the landed binary (42 runs at the splice and at graph, none refused); the
+  whole library suite (the agent's, 3,502) with the tier off, on, eager and forced, and at
+  graph eager but one test whose subject is a splice, pinned to the splice in the landed commit
+  (graph on, graph forced and the poison's two were still running when this was written); GC
+  stress over the nine new tests; difftest (138 agree) and the fixtures in ten configurations;
+  zombie's check, clippy, Windows' check and suite (2,890). Cycles at fixed work at the
+  default against the main before step L1c and this piece (mine, one X925 core, five
+  alternating rounds, merge-check/cycles-b.out), at equal instructions: RayTrace at 200 runs
+  -0.8%, Earley-Boyer -0.4%, Richards at 200 -0.3%, TypeScript -0.2%, DeltaBlue at 200 -0.2%,
+  Djot's steady state -1.2%, React's +0.4%, Vue's +0.6% with the tier on and +0.6% with it
+  off: the binaries' layout.
+- Left for later pieces: `new`, spread and arguments-array calls from inlined frames (77
+  plans); frames nested in inlined frames (134 plans); TypeScript's and PdfJS's repeating
+  exits below their limits (step 4's policy).
