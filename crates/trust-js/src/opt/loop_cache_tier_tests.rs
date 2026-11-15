@@ -308,3 +308,65 @@ fn a_value_cached_through_a_loop_with_an_inlined_frames_generic_node_takes_a_cal
 fn an_inlined_frames_throw_exit_in_a_cached_loop_reads_the_cached_values_slot() {
     equal_with_callee_caches(INLINED_THROW);
 }
+
+/// INLINED_CALL's loop with a callee that makes a plain call (P3 stage 3 step 3c-2's piece B): at
+/// graph `wrap` is built into the loop and its call of `g` (which reads `arguments`, so the plan
+/// inlines none of `wrap`'s calls) is a call node of the inlined frame, whose template runs `g`'s
+/// code with x21 on the inlined call helpers' table: a call in the loop, across which the value
+/// read in the loop and spilled before it lives in a callee-saved cache.
+const INLINED_PLAIN_CALL: &str = "function g(k) { return (k * 3 + arguments.length) & 0xff; }\n\
+     function wrap(s, k) { var t = g(k); return (s + t) & 0xffff; }\n\
+     function f(n, a) { \
+       const v = (a * 7) & 0xffff; \
+       let b1 = (a ^ 1) & 0xfff, b2 = (a ^ 2) & 0xfff, b3 = (a ^ 3) & 0xfff, b4 = (a ^ 4) & 0xfff, \
+         b5 = (a ^ 5) & 0xfff, b6 = (a ^ 6) & 0xfff, b7 = (a ^ 7) & 0xfff, b8 = (a ^ 8) & 0xfff, \
+         b9 = (a ^ 9) & 0xfff, b10 = (a ^ 10) & 0xfff, b11 = (a ^ 11) & 0xfff, b12 = (a ^ 12) & 0xfff, \
+         b13 = (a ^ 13) & 0xfff, b14 = (a ^ 14) & 0xfff, b15 = (a ^ 15) & 0xfff, b16 = (a ^ 16) & 0xfff, \
+         b17 = (a ^ 17) & 0xfff, b18 = (a ^ 18) & 0xfff, b19 = (a ^ 19) & 0xfff, b20 = (a ^ 20) & 0xfff, \
+         b21 = (a ^ 21) & 0xfff, b22 = (a ^ 22) & 0xfff, b23 = (a ^ 23) & 0xfff, b24 = (a ^ 24) & 0xfff; \
+       let r = (b24 + b23 + b22 + b21 + b20 + b19 + b18 + b17 + b16 + b15 + b14 + b13 + b12 + b11 \
+         + b10 + b9 + b8 + b7 + b6 + b5 + b4 + b3 + b2 + b1) & 0xffff; \
+       let s = 0; \
+       for (let i = 0; i < n; i++) { \
+         s = wrap(s, i & 3); \
+         r = (r + v + (v >> 3)) & 0xffff; } \
+       return r + s; }\n\
+     let t = 0; for (let k = 0; k < 300; k++) t = (t + f(12, k)) % 1000003;\n\
+     t + ':' + f(5, 2.5)";
+
+#[test]
+fn a_value_cached_through_a_loop_whose_inlined_frame_makes_a_call_takes_a_callee_saved_register() {
+    // The call node's template enters another function's code: a call by NodeOp::is_effectful,
+    // as every generic node is, so the consistency check after every allocation refuses a
+    // caller-saved cache through the loop; the results equal the VM's in every configuration,
+    // and at graph an inlined frame's call node was lowered and a callee-saved cache made.
+    let expected = run(Tier::Bytecode, INLINED_PLAIN_CALL);
+    for (label, switches) in configurations() {
+        crate::opt::regalloc::TEST_CALLEE_CACHES.with(|made| made.set(0));
+        crate::opt::a64::TEST_INLINED_GENERIC.with(|ops| ops.borrow_mut().clear());
+        assert_eq!(
+            with_switches(switches, INLINED_PLAIN_CALL),
+            expected,
+            "{label}"
+        );
+        let made = crate::opt::regalloc::TEST_CALLEE_CACHES.with(|made| made.replace(0));
+        let calls = crate::opt::a64::TEST_INLINED_GENERIC.with(|ops| {
+            std::mem::take(&mut *ops.borrow_mut())
+                .iter()
+                .filter(|op| {
+                    matches!(
+                        op,
+                        crate::bytecode::Op::Call(..) | crate::bytecode::Op::CallWithThis(..)
+                    )
+                })
+                .count()
+        });
+        if label == "graph" {
+            assert!(calls > 0, "graph: an inlined frame's call node");
+            assert!(
+                made > 0,
+                "graph: the allocations made callee-saved loop caches"
+            );
+        }
+    }
+}
