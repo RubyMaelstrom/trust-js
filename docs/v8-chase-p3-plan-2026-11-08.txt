@@ -5293,3 +5293,61 @@ graph and the exits that repeat, measured, and the first two of five rules.
   << R (SpiderMonkey's 10 with JSC's doubling), last, on a stated acceptance test, else the
   owner's (JSC's 100 was the owner's number). The warm-ups keep JSC's 2^R; the fallback stays
   the first stage's template code.
+
+Stage 3 step L5 landed (8b24a17f, 4db20728, 2026-11-15; target/p3/stage3/stepL5-impl,
+report.txt; step 4p's rule 3): a flag that does not change the build makes its site generic.
+- The case. Step 4p's census found a TypeScript read that exited after every recompile
+  (typesAreIdentical, typescript-compiler.js 17475:51, pc 72: a GetElem on a plain object
+  without element words, a sparse map, by a large int32 key): its OutOfBounds flag widened
+  the load to its past-the-used-words form, which cannot answer undefined for a receiver with
+  named index entries and exits OutOfBounds itself, and the builder does not consult that
+  flag again once the form is widened: 100, 200, ... 1,600 exits, then 2,620, at 5 runs
+  (6,400 at 200), only R growing.
+- The rule, whatever the lowering. The back end marks each exit record whose reason its own
+  frame's snapshot already held flagged at the record's site with the data the exit carries
+  (a WrongShape flag with as many shapes, a WrongName flag with that proof, a NotNumber flag
+  with that truncation mark: a flag whose data the exit would change did change the build);
+  at a discard, an exit so marked adds a second-level flag, Generic, at the site; and the
+  builder takes the operation's generic form at such a site before any lowering (its loop
+  prepass counts it an effect), as JSC's ArrayMode::refine ends its ladder at Generic
+  (DFGArrayMode.cpp:202-222, 299-327) and V8's and SpiderMonkey's ICs end megamorphic or
+  generic, which their compilers lower with nothing to fail. Not for WrongCallee (the
+  policy's ways, step 4p's rule 5), the reasons keyed at a loop header (each flag there ends
+  what raised it), a never-ran block, forced exits, throws; not for an operation without a
+  generic form (control flow, the stack's and frame's own, calls): the flag never makes a
+  function uncompilable. Kind-bound, as a megamorphic IC's state is its site's: a callee
+  inlined where its site went generic keeps its own speculation when compiled for itself. A
+  moved check's sites carry the same mark.
+- The audit of every lowered form (the report's table): each reason's flag removes the check
+  it is named for or carries new data, so the form ends by its own flag: arithmetic, bitwise,
+  relational, the equality pairs, length sites, named loads and stores, element accesses'
+  kind, key and store checks, typed reads, free names, branches. The one family whose flag
+  can leave a form that exits for the same reason is the widened element reads: the load
+  past the used words (a negative index, named index entries, an indexed prototype) and
+  holes read under the same proof. Those now end by Generic.
+- Measured (the agent's synchronous census, 44 runs a side): only TypeScript changes. At 5
+  runs its exits 25,554 -> 20,401 at the splice and 25,454 -> 20,397 at graph, exits at a
+  site whose flag the code held 6,151 -> 273; at 200 runs 43,359 -> 31,970 and 14,986 ->
+  1,712; typesAreIdentical's discards 5 -> 3 at 5 runs and 7 -> 5 at 200 (pc 330, the same
+  map's second read, follows pc 72 to Generic). Instructions (fat LTO): within noise at 5
+  and 200 runs (TypeScript -0.10% at 200, its runs' ranges overlapping). My recount
+  (merge-check/counts-l5.out): within its modes, but Richards +0.07% and Djot's fixture +0.06%
+  at both modes with spreads of 0.002%, where no flag is set: the rule's standing work in a
+  compile (the test before every lowering, the pass over the exit records); a follow-up asked
+  of the agent, the two tests made early-outs.
+- Tests: opt::generic_tests, nine, at the splice and at graph (the sparse-map read: two
+  discards, then Generic and no exit, results the VM's; a flag that ends its exits gets no
+  Generic; grown shapes and another reason's exit are not held; a moved site; an inlined
+  callee at both modes; forced exits flag nothing; Generic planted at an element read, a
+  named read, an add and a strict equality: each generic, the prepass agreeing). 11
+  mutations, each caught. Clippy; the verifier sweep on the landed binary (mine: 42 runs,
+  none refused); zombie's check, clippy, Windows' check and x86-64 suite (2,891).
+- For a later lowering, not built: SpiderMonkey reads a receiver's sparse index entries by a
+  guarded stub (CacheIR.cpp:3067-3143; WarpCacheIRTranspiler.cpp:2383), a better second form
+  than generic for these two sites.
+Piece B's whole library suite, finished since its record (the agent's, 3,502 tests): the tier
+off, on, eager and forced pass; at graph on and graph eager one failure each, the test pinned
+to the splice in the landed commit; at graph forced that one and the 30 ms deadline test
+(recorded with piece B2); its two poison configurations were still running. Step 4p's rule 5
+at 200 runs, counted since its record: TypeScript's discards 189 -> 161 at the splice and 184
+-> 157 at graph (exits 44,161 -> 37,145), DeltaBlue's unchanged.
