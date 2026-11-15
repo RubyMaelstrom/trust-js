@@ -161,6 +161,10 @@ thread_local! {
     /// (stage 2, step 13).
     pub(crate) static TEST_LIMITS: std::cell::RefCell<Vec<(Limit, u32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The guards (chunk, pc) a reoptimization's re-read of its call ways flagged
+    /// (`reread_call_ways`; P3 stage 3, step 4p, rule 5).
+    pub(crate) static TEST_REREAD: std::cell::RefCell<Vec<(usize, usize)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The checkpoints (chunk, number) at which the tier waited for settled feedback, a warm-up's
     /// among them.
     pub(crate) static TEST_WAITS: std::cell::RefCell<Vec<(usize, u8)>> =
@@ -2278,6 +2282,7 @@ pub(crate) fn reoptimize(
             name(chunk)
         );
     }
+    reread_call_ways(chunk);
     // Under TRUST_JS_OPT_INLINE=graph a first stage compiled in place inlines the ways its first
     // compile took (P3 stage 3, step 2; `opt::oracle`), as a second stage keeps its splices.
     let inline = (inline_graph() && in_place(chunk)).then_some(super::oracle::Request::Kept);
@@ -2301,6 +2306,121 @@ pub(crate) fn reoptimize(
         }
     }
     release_retired(i);
+}
+
+/// A reoptimization re-reads the call ways of every site whose callees `chunk`'s code inlines (P3
+/// stage 3, step 4p, rule 5), before its snapshot: a site that met a callee its guards do not hold
+/// gets the WrongCallee flag its guards' exit would have set (`flag`'s key: a splice's guard at
+/// its own pc, a graph-inlined site at its call with every way's place), so that the recompile
+/// builds those guards as tests with their mismatch edges (`Builder::callee_matches`,
+/// `build_inline::flagged`). The exemplars read their call feedback at every compile: JSC's
+/// CallLinkStatus from the baseline's call link info and the site's exit flags
+/// (bytecode/CallLinkStatus.cpp:98-120), Maglev the call slot's feedback, Warp's oracle each IC's
+/// stubs (jit/WarpOracle.cpp:1404-1554). Here an exit's VM run and the fallback's template code
+/// refill the sites the activations it ran reached, which no compile read: each discard taught
+/// the one site whose guard failed first. Weakening only: no way is added or dropped, and the
+/// flag stays (flags only grow), so a site's guard changes once at most. The sites: in a
+/// transformed chunk each chain of InlineGuards to its generic call, whose own cache holds the
+/// callees that missed every guard; in a first stage compiled in place under graph inlining, each
+/// kept way's call site (`ChunkProfile::inline_ways`), whose cache holds every callee it met.
+/// Main thread. The flags it set.
+fn reread_call_ways(chunk: &Chunk) -> usize {
+    use crate::bytecode::Op;
+    let ops = chunk.jit_ops();
+    let met_another = |pc: usize, guarded: &[usize]| {
+        snapshot::call_site(chunk, pc).is_some_and(|call| {
+            call.state == crate::feedback::CallState::Megamorphic
+                || call
+                    .ways
+                    .iter()
+                    .flatten()
+                    .any(|target| !guarded.contains(&target.callee))
+        })
+    };
+    let profile = ChunkProfile::of(chunk);
+    let mut set = Vec::new();
+    // A splice's chains: a guard's mismatch is the next way's guard or the generic call.
+    let mut reached = vec![false; ops.len()];
+    for op in ops {
+        if let Op::InlineGuard(_, mismatch) = *op {
+            if let Some(next) = reached.get_mut(mismatch as usize) {
+                *next = true;
+            }
+        }
+    }
+    for (head, op) in ops.iter().enumerate() {
+        if !matches!(op, Op::InlineGuard(..)) || reached[head] {
+            continue;
+        }
+        let (mut guards, mut guarded, mut at) = (Vec::new(), Vec::new(), head);
+        while let Some(&Op::InlineGuard(target, mismatch)) = ops.get(at) {
+            guards.push(at);
+            guarded.push(chunk.jit_inline_target(target).expected);
+            at = mismatch as usize;
+        }
+        if matches!(ops.get(at), Some(Op::Call(..) | Op::CallWithThis(..)))
+            && met_another(at, &guarded)
+        {
+            for &guard in &guards {
+                if profile.add_site(guard as u32, ExitReason::WrongCallee as u8, false, 0, false) {
+                    set.push(guard);
+                }
+            }
+        }
+    }
+    // A first stage's graph-inlined sites: each kept way's call, every way of it flagged.
+    let ways = profile.inline_ways();
+    let mut caches: Vec<u32> = ways.iter().map(|way| way.cache).collect();
+    caches.sort_unstable();
+    caches.dedup();
+    for cache in caches {
+        let guarded: Vec<usize> = ways
+            .iter()
+            .filter(|way| way.cache == cache)
+            .map(|way| way.callee.as_ptr() as usize)
+            .collect();
+        let Some(pc) = ops
+            .iter()
+            .position(|op| matches!(*op, Op::Call(_, c) | Op::CallWithThis(_, c) if c == cache))
+        else {
+            continue;
+        };
+        if met_another(pc, &guarded) {
+            // Its guard byte: the ways the flag covers (`build_inline::flagged`), raised to all.
+            let places = u8::try_from(guarded.len()).unwrap_or(u8::MAX);
+            let mut had = None;
+            profile.sites_at(pc as u32, |reason, inlined, ways| {
+                if reason == ExitReason::WrongCallee as u8 && !inlined {
+                    had = Some(ways);
+                }
+            });
+            if had.is_none_or(|ways| ways < places) {
+                profile.add_site(
+                    pc as u32,
+                    ExitReason::WrongCallee as u8,
+                    false,
+                    places,
+                    false,
+                );
+                set.push(pc);
+            }
+        }
+    }
+    if log_enabled() {
+        for &pc in &set {
+            log_line!(
+                "[opt] flag {} pc {pc} WrongCallee own (re-read: its site met another callee)",
+                name(chunk)
+            );
+        }
+    }
+    #[cfg(test)]
+    TEST_REREAD.with(|reread| {
+        reread
+            .borrow_mut()
+            .extend(set.iter().map(|&pc| (chunk as *const Chunk as usize, pc)))
+    });
+    set.len()
 }
 
 /// Keep the realm's global environment, `pin`'s, from address reuse while the heap lives, where

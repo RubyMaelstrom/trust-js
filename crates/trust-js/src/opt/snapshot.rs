@@ -989,6 +989,23 @@ pub(crate) fn warm_up_fingerprint(chunk: &Chunk) -> u64 {
     fingerprint_of(chunk, false)
 }
 
+/// The view of `chunk`'s call site at `pc`, its live feedback as the fingerprint reads it; None
+/// for any other operation (P3 stage 3, step 4p: a reoptimization's re-read of its call ways,
+/// `opt::reread_call_ways`). Main thread.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn call_site(chunk: &Chunk, pc: usize) -> Option<crate::feedback::CallView> {
+    match view(chunk, pc) {
+        SiteView::Call(call) => Some(call),
+        _ => None,
+    }
+}
+
 /// [`fingerprint`], with call sites' ways where `call_ways`.
 fn fingerprint_of(chunk: &Chunk, call_ways: bool) -> u64 {
     use std::hash::Hasher;

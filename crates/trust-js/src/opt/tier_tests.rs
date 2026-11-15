@@ -3552,3 +3552,7 @@ mod loop_cache;
 /// P3 stage 3 step 4p: a discard's warm-up and the call sites' feedback, end to end.
 #[path = "warm_up_tier_tests.rs"]
 mod warm_up;
+
+/// P3 stage 3 step 4p, rule 5: a reoptimization re-reads its call sites' ways, end to end.
+#[path = "reread_tier_tests.rs"]
+mod reread;
