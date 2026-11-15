@@ -4584,8 +4584,9 @@ operation that needs the whole canonical frame, or a call. The default stays the
   on, eager and forced, and at graph on, eager and forced: the library suite 3,477, difftest
   138 agree, the fixtures' outputs the tier off's, Test262 53,572 of 53,575 (the tier off's
   three staging/sm failures and none beyond) in each of the seven; under the poison at the
-  default, on and eager: the library suite 3,477, difftest and the fixtures. GC stress over
-  opt::inline_tests and opt::frames_tests was still running when this was written.
+  default, on and eager: the library suite 3,477, difftest and the fixtures. GC stress 1 with the
+  tier eager at graph over opt::inline_tests (50 tests, 3 h 39 min) and opt::frames_tests (22):
+  all pass.
 - Open, before the flip (step 4): the direct accessor paths and calls from inlined frames
   (step 3c-2, started); GBEMU's R7; PdfJS's second-callee exits; the owner's question on the
   origin's form, above.
@@ -4955,3 +4956,67 @@ stays the splice.
 - Left for later pieces: `new`, spread and arguments-array calls from inlined frames (77
   plans); frames nested in inlined frames (134 plans); TypeScript's and PdfJS's repeating
   exits below their limits (step 4's policy).
+
+Stage 3 step 3c-2, piece B2 landed (af0bb7f5, 2026-11-15; target/p3/stage3/step3c2-impl/b2,
+design-note.txt): an inlined frame's call node switches its context only on the paths that reach
+a helper.
+- What piece B's node cost: 25 instructions a call more than the splice's same call (20 as first
+  built, 5 more with the review's fix): the chunk saved and switched, the call's site published,
+  x21 switched, the direct callee's consumption of the site, the republication, the restore. On
+  the direct path nothing reads any of it: the direct sequence and the direct-call stub take the
+  position from the view's own word and the callee's chunk from the way, and the callee runs on
+  its own record; the readers are the helpers (the operation and the call cache from ctx.chunk,
+  the position helpers the published site, through x21's table) and the end poll's slow path.
+- The form. Nothing before the template. A switch of constants (ctx.chunk the callee's, the
+  call's site in Interp::call_site, x21 the inlined call helpers' table) at the template's
+  entries that reach a helper: the call-hit form, the generic call, each of the 14 in-line
+  intrinsic forms' helper calls (so that an intrinsic that finishes in machine code pays
+  nothing), and a cold node's intrinsic section, whose forms are shared stubs. The restore writes
+  constants too (ctx.chunk the code's own chunk, x21 from JitCtx::helpers, NO_POSITION), where
+  those paths end and in the node's unwind, so a path may switch twice and a throw that
+  switched nothing may run the restore; the direct path lands past it. The end poll publishes the
+  frame's site in its slow branch alone. Piece B's variant of the direct-call stub and the
+  consumption are gone. JSC stores one CallSiteIndex before a call out of DFG code
+  (DFGSpeculativeJIT64.cpp:1008, 1036-1171); V8 and Ion store nothing and key their frames'
+  data by the return address (frames.cc:3137, 3441-3462; JSJitFrameIter.cpp:319-322): a direct
+  call here already records its position from a word in the code, so it stores nothing, and the
+  slow paths keep JSC's one store.
+- The constant restore is sound because the code is installed for one chunk and every entry
+  runs with it in ctx.chunk (an in-place first stage, a second stage with a record map, a
+  reoptimization, a function under two closures, a snapshot-shared function in two realms: each
+  read from the installer, design-note.txt 6.2); test builds trap at every inlined frame's node
+  where ctx.chunk is not the code's own or x21 not JitCtx::helpers.
+- Measured (fat LTO; my build of af0bb7f5 byte-identical to the agent's measured binary; my
+  recount merge-check/counts-b2.out and counts-b2-graph.out): the call's cost against the
+  splice's, plain 278.7 -> 253.7 and method 292.7 -> 267.7 instructions an iteration, the
+  splice's exactly. Graph against the splice at 5 fixed runs: React +5.06% -> +2.83%, its steady
+  state +10.16% -> +5.78%; every other as piece B left it (Djot -1.90%, Crypto -1.07%, Box2D
+  -0.85%, PdfJS -0.56%, DeltaBlue -0.56%, Vue -0.54%, GBEMU +1.73%); Octane's geomean -0.10%.
+  Cycles at fixed work on one X925 core (the agent's, five alternating rounds): React's steady
+  state at graph against the splice +4.83% (against piece B's graph -2.43%), Djot's -1.62%,
+  Box2D -1.63%, Crypto -2.61%, DeltaBlue -0.84%.
+- What is left of React's loss is not calls: the inlined Array.prototype.map runs two non-call
+  generic nodes an element (In and the data-property definition: 7.86M executions in the steady
+  state against 3.85M calls), each paying the eager switch of step 3c (16 instructions: the
+  chunk saved and switched, the publication, the restore) though their templates finish in
+  machine code and reach a helper only on their slow paths. Piece B2b, started: the same lazy
+  switch for an allowlist of non-call kinds, each template audited (its work in progress reads
+  React's steady state at graph against the splice +0.46% instructions, +0.09% cycles).
+- The default and the tier off: template code identical with the tier off (2,594 of 2,594
+  compiles) and at the splice (2,173 of 2,173, the tier's 1,375 of 1,375), the agent's dumps;
+  my recount of the default within 0.1% but Vue's steady state +0.18% with the tier on and +0.16%
+  with it off (the binary: the runtime's pointer-keyed tables, not generated code) and the
+  usual modes of Earley-Boyer, PdfJS and TypeScript.
+- Tests: two new (each helper path of an inlined call node finds its chunk and its site; the end
+  poll after a helper call) beside piece B's nine, which hold unchanged; 17 mutations, each
+  caught (the switch dropped at each entry, each restore, x21 left on the inlined table, the
+  restore's chunk wrong, the unwind's chunk store, a publication on the direct path, the end
+  poll's, the frame's site for the call's, and three of piece B's again). The tier's, the back
+  end's, the traced and the inline-context modules (571 tests): the agent's at graph, at the
+  splice, at graph under the poison and at graph forced; mine on main at graph eager and at
+  graph forced. The verifier sweep on the landed binary (42 runs, none refused); fmt, clippy;
+  zombie's check, clippy and Windows' check. Piece B's whole library suite (3,502), finished
+  since its record: the tier off, on, eager and forced all pass; at graph on and graph eager
+  one failure each, the test pinned to the splice in the landed commit; at graph forced that
+  one and script_entry_tests' 30 ms top-level deadline under a load of 35 to 40 (3 of 3 alone
+  on piece B's binary and on the one before it: a load flake of that test).
