@@ -5446,3 +5446,154 @@ geomean better at both) is passed by no limit:
 The agent's recommendation: 10 << R at graph alone, decided when graph is the default, on the
 stage's quiet session (after nested frames and `new` from inlined frames, which change which
 plans compile in place). Until the owner says, 100 stays.
+
+Stage 3 step 3d landed (13bfd95f, 2026-11-15; target/p3/stage3/step3d-impl, design-note.txt and
+report.txt; my checks merge-check/counts-3d.out, counts-3d-graph.out, cycles-3d.out and
+step3d-review): frames nested in inlined frames. Under TRUST_JS_OPT_INLINE=graph a plan whose
+ways' callees make plain and method calls that the plan inlines in turn compiles in place, each
+such callee a frame nested in its caller's inlined frame, to the planner's own depth and
+budgets (INLINE_MAX_DEPTH 3, the shared 320 and small-callee 384 operation budgets, 4 ways a
+site): no new limit. The default (the splice) and the tier off are unchanged.
+- What it builds. The oracle walks the plan's tree (oracle.rs Prep::way): a calling way's own
+  view at any depth, its guard's data in the compiled chunk's view, one inline site a way and
+  one a call of a calling way (at most 704 a compile; the largest in the census 76), a nested
+  frame's site chained to the call site of the frame it is nested in. A callee guard in an
+  inlined frame is frame-free (its explicit inputs, the compiled view's data, the running
+  global environment; a way that would need its caller's environment is refused). check_graph's
+  refusal of a generic node of a frame inlined into an inlined frame goes: such a node keeps its
+  operands at its own frame's depth and publishes its own site. Every flag keys at its frame's
+  first-stage chunk and pc whatever the chain, as JSC keys its frequent exit sites by the
+  baseline code block (dfg/DFGGraph.h:694-697). Kept ways keep their nested ways, so a
+  reoptimization nests again; step 4p's rule 5 re-reads a nested site from the outer callee's
+  first-stage call cache and flags that chunk with the inlined key. An exit whose rebuilt chain
+  holds a frame that already tried its loop's borrowed-frame code takes the loop limit at once
+  (the innermost and the middle frame, tested).
+- The fork, mine: a plan with a way anywhere in its tree that makes a `new` call still splices
+  whole (the note's option A). Option B (such a way stays a call node of its frame) was measured
+  behind a diagnostic branch: within 0.2% of A but for TypeScript at 5 runs, +0.58% (the deep
+  constructing ways became calls where the splice inlined them); it comes with `new` from
+  inlined frames (step 3e), where the two build the same plans.
+- The census at graph (the agent's, fixed 5): plans left to the splice 211 -> 101, every one for
+  a constructing callee (77 with the `new` in a top-level way's callee, 24 under a calling
+  way; the most in TypeScript, 60, then Box2D 12, Earley-Boyer 8, RayTrace 7); ways inlined
+  931 -> 2,092; exits 38,189 against the splice's 46,115 (WrongCallee 10,749 against 15,213),
+  discards 288 against 299; outputs equal at both modes on every workload.
+- Measured at 5 fixed runs (fat LTO; my recount, the agent's within 0.1%). Graph against the
+  graph before it: Richards -12.16%, DeltaBlue -5.98%, Box2D -0.94%, TypeScript -0.91%, GBEMU
+  -0.77%, Earley-Boyer -0.38%, Vue -0.17% (steady -0.20%), Crypto +0.23%, Djot's fixture
+  +0.11% (below), the rest within 0.1%. Graph against the splice on the one binary: Octane's
+  geomean -1.92% (-0.31% before), Richards -12.25%, DeltaBlue -6.51%, Djot -1.83% (steady
+  -0.87%), Box2D -1.77%, GBEMU -1.58%, TypeScript -1.00%, Crypto -0.86%, Vue -0.82%, PdfJS
+  -0.70%; above zero only React (+0.04%, steady +0.29%: piece B2b's residual, no nesting there)
+  and RayTrace (+0.07%). Earley-Boyer's -2.86% is not a result: its splice side was counted
+  beside the library suite (a collecting benchmark's counts move with load); the agent's quiet
+  pair is -0.61%. The default and the tier off: within their modes (TypeScript +0.23% on, -0.48%
+  off). Djot's fixture +0.14% at the default with the collector's pacing off is one collection's
+  survivors, not the step's work: with the shipped pacing it is -0.02%, the tier's log is
+  identical line for line, and the third minor collection keeps 1,229 more objects (137 KB
+  promoted) in this binary as in two earlier ones of the series (9c75a199's and 69e27b5d's)
+  and not in the nine others; what holds them was not traced (a build-dependent root).
+- Measured at steady state (200 fixed runs; mine on 13bfd95f, five alternating rounds on one
+  X925 core alone, its delivered clock moving between 3.9 and 1.4 GHz; graph against the
+  splice, instructions / cycles): Richards -4.53% / -7.79%; TypeScript at 5 runs -0.91% /
+  -1.81%; Box2D at 5 runs -1.78% / -2.10%; DeltaBlue +1.74% / -0.68% (rounds -1.06 to -0.49);
+  GBEMU +0.13% / +0.08% (three rounds), where graph was -0.23% / -0.74% before the step: 3d
+  itself costs GBEMU +0.38% instructions and +1.06% cycles at 200 runs. The agent's 200-run
+  counts on its own tree: Box2D -1.41%, TypeScript -0.91%, Mandreel -0.34%, Earley-Boyer
+  -0.15%, PdfJS +0.01%. So the 5-run gains of DeltaBlue and GBEMU are warm-up (compiles in
+  place that the splice recompiled for), and at steady state the graph's code for them is no
+  better than the splice's.
+- DeltaBlue's steady-state instructions, attributed (the agent's, on main's binary: per-function
+  samples and the annotated code, step3d-impl/db200): one function, Plan.prototype.execute,
+  +13.5% in it. Its frames nested by this step (EqualityConstraint's execute, and output() and
+  input() in it) read this.direction, this.v1 and this.v2 as two-shape reads, because the
+  callee's first-stage feedback is shared by every caller (Equality and Scale constraints lay
+  those slots out differently), where each spliced copy has caches of its own that only this
+  path fills: 7 two-shape diamonds in the function at graph, 1 at the splice, each about 10
+  instructions where a one-shape read is 2. Ruled out with counts: the loop limit's discards
+  (4 of 5 are UnaryConstraint's, which the splice also takes to the same count), rule 5 at
+  nested sites (none in DeltaBlue), spill loads, the eager switch, kept ways losing their
+  nesting. This is the risk the stage's design names ("shared callee feedback going polymorphic
+  where a splice's seeded copy stayed monomorphic"), now measured. The splice's own caches are
+  SpiderMonkey's trial inlining (a fresh ICScript a call site, jit/TrialInlining.h:27-47);
+  Maglev and JSC narrow in the graph instead: an access takes its feedback's maps intersected
+  with the receiver's known maps (maglev-graph-builder.cc:4641-4654), a polymorphic load's arm
+  knows its map set and continues through the call of the loaded function (:5816-5820,
+  5877-5887, 6038 on), and JSC prunes a polymorphic access's cases by the proven structure set
+  (dfg/DFGConstantFoldingPhase.cpp:648-666). Step 15b took Maglev's polymorphic method calls
+  but guards by callee after the merged load, so the arm's shape is lost. Decided, mine: the
+  graph takes Maglev's form, which is the design's step 5 and the owner's answer on D7, taken
+  now as step 3f (a census of the sites it reaches first, then a design note): a read, store or
+  method load intersects its feedback with the receiver's proven shapes, and a method call's way
+  is entered on the receiver's shape group and then the callee's identity. Trial inlining stays
+  the named alternative for what that does not reach, and would be the owner's question. The
+  lowerings' agent takes the polymorphic read's own form (no boolean diamond; SpiderMonkey's
+  GuardMultipleShapesToOffset select where only the offset differs), which both modes pay.
+  Graph is not made the default before DeltaBlue's and GBEMU's steady states are at or under
+  the splice's.
+- Compile cost at graph against the splice (the agent's, all workloads at 5 runs): main-thread
+  snapshots 25.8 ms against 19.7 and installs 60.5 against 56.3 (TypeScript 13.0 against 9.1
+  and 29.9 against 26.9; Djot 0.6 against 0.5 and 1.7 against 1.6): a graph snapshot takes every
+  nested callee's view; the tier's code bytes +1.8% (DeltaBlue +11.0%, Djot +10.4%, Richards
+  -5.3%).
+- Found on the way, open: an exit through a guard whose callee's own tier code was running did
+  not refill the call cache it resumed at, so rule 5 read nothing there until the callee's own
+  discard (step3d-impl/rule5-cache-note.txt); the rule-5 test discards the callee first. Step
+  4p's area.
+- Tests: eight (leaves, generic nodes and calls from nested frames, each at the tier off, the
+  splice and graph, with exits forced every 7 and at every check, collections at every
+  allocation, the poison and the chunk trap; the loop limit through the innermost and a middle
+  frame; a guard failing in a nested frame; the rule's test; rule 5 at a nested site): the
+  method chain three deep, recursion the planner nests (the compiled chunk's own frame nested),
+  handlers, missing and extra arguments, strict and sloppy `this`, throws caught in each frame
+  and in none, stacks and Function#caller through two inlined frames, getters, setters,
+  valueOf and `in` from nested frames. 13 mutations, each caught (two escaped the rule-5
+  test's first form, which was then tightened). GC stress over the eight; the agent's gate in
+  ten configurations (difftest 138 agree; the fixtures' output the tier off's); the verifier
+  sweep on the landed binary (mine: 42 runs, none refused); my probe programs equal in five
+  configurations; fmt, clippy; zombie's check, clippy, Windows' check and x86-64 suite
+  (2,891). Two tests whose subject is the splice are pinned to it (they compile in place at
+  graph now, with the tier off's results).
+
+Since the records above (2026-11-15):
+- The whole library suite on main before step 3d (d12087da's test binary, two threads on two
+  reserved cores, no timeout; target/p3/stage3/main-suite-d12087da): the tier on, 3,573 passed,
+  none failed, 10 ignored; graph eager the same. The tier's and the back end's modules on that
+  tree (631 tests): graph eager, graph forced, on and forced pass. A gate started on 7327d618
+  was stopped and is no result: its library stage ran into the script's 90-minute timeout under
+  a load of 41 to 48 in all four default legs (about 1,200 to 1,500 of 3,522 tests in); the
+  stages that finished passed (difftest 138 agree, the fixtures, Test262 53,572 of 53,575, the
+  three the tier off's).
+- Step 4p's closing census (the agent's, d1b6ae23 at graph; step4p-impl/report.txt section 3).
+  Repeats are still 99% of exits (41,200 at 5 runs against 48,308 before the step's rules):
+  the exit limit's price, the owner's fork above. Slow time (fallback and exited activations'
+  template code plus exits' VM runs) as a share of cycles at 200 runs: Richards 17.4% (26.9%
+  before), DeltaBlue 14.4% (22.3%), Crypto 2.5%, the rest under 1%; at 5 runs GBEMU 22.2%,
+  Richards 18.6%, DeltaBlue 17.3%, zlib 7.5%. The largest single cases are activations that
+  never re-enter (zlib's a8: 484 of 552 Mcycles in its exited activation's template code after
+  6 exits; GBEMU's executeIteration; runMandreel after its install; Richards' schedule, 15.2%
+  of the 200-run run from one discard and 6 exits). Its order for what follows: (1) entry into
+  the tier's code from an activation already running template code, an OSR entry at loop
+  headers (stage 5's subject; JSC's baseline loops enter DFG code once it exists,
+  dfg/DFGOSREntry.cpp); (2) exits into template code instead of the VM (exits' VM runs are
+  DeltaBlue's 8.6% at 200 runs, RayTrace's 4.7% and Crypto's 3.1% at 5; JSC's exits land in
+  baseline code), to be measured against today's borrowed-frame transfer first; (3) the exit
+  limit at graph after the flip; (4) DeltaBlue's late callees, after nested frames.
+- Allocator R2: nothing built, the allocator is done for this stage (stepR2-impl/report.txt).
+  What is left after R1 is zlib's (spill loads 6.4% of its tier words, 69% loop invariants)
+  and Mandreel's (2.3%); everywhere else under 0.5%. A victim chosen by weighted next use was
+  prototyped and took 3% of its bound on zlib (-0.05% instructions) and nothing elsewhere; a
+  read span from the definition is bounded at 0.40% of zlib's instructions and 0.16% of
+  Mandreel's. What would reach the registers that matter is a second location for one value
+  over a loop (Ion splits a bundle at hot code's boundaries, BacktrackingAllocator.cpp:
+  3058-3140; Air splits a tmp around a loop, AirAllocateRegistersByGreedy.cpp:2681-2780, off
+  by default): a later stage's, with every reader of a home taught the location live at its
+  point.
+- The sparse-element read (step L5's second form) is not built: counted, it is 0.03% of
+  TypeScript's instructions in the tier's code (57,082 reads at 5 runs, 78% of them one site
+  in template code). Beside it the count found the runtime's absent-index read on an ordinary
+  object costing about 1,200 instructions (the key's text formatted and the chain walked by
+  text twice); an index-keyed walk is being built as its own commit.
+- Load flakes seen in suite runs beside builds, each passing alone: tests::
+  long_bigint_operations_honor_the_deadline and jit::poll_tests::
+  loop_free_recursion_stops_at_entry_polls_for_cancellation_and_deadlines.
