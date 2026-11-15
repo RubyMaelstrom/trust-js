@@ -682,6 +682,33 @@ fn check_graph(
     Ok(())
 }
 
+/// Whether an inlined frame's generic node of `op`'s kind switches its context lazily (P3 stage
+/// 3 step 3c-2, piece B2b): its template's every way out of machine code is a helper call through
+/// `jit::emit_op_helper` or `jit::emit_helper`, which switch `JitCtx::chunk` and the frame's
+/// publication around the call alone under `Asm::inlined_node`, and its machine code reads
+/// neither the chunk, nor `Interp::call_site`, nor anything else the eager switch writes. Each
+/// kind is admitted only after its template was read end to end (b2/design-note.txt 7's table):
+/// - `In`: `jit::emit_in_keyed` (receiver and key from the operand words, the element words; no
+///   allocation), its one exit `emit_op_helper(H_EXEC)`; without the in-line form, `emit_exec`.
+/// - `Abstract`: CreateDataPropertyOrThrow's `jit::emit_define_elem_inline` (the array, its
+///   `length` slot and element words, an append's card mark; a full block takes the helper,
+///   which grows it: no allocation in line), its one exit `emit_op_helper(H_ABSTRACT)`; every
+///   other abstract operation `emit_op_helper(H_ABSTRACT)` alone.
+/// - The equalities (`StrictEq`, `StrictNotEq`, `EqEq`, `NotEq`): `jit::emit_eq_inline` (the
+///   operands' words, their kinds and string contents; its equality records only where the
+///   template JIT records, never in the tier's code), whose exits are `emit_equal_call` (the
+///   shared Equal stub, whose helper, H_STRICT_EQ or H_EXEC, and whose own end poll run inside
+///   the switch, made around the stub's `bl`) or, without shared stubs, `emit_op_helper` /
+///   `emit_exec`; the compact form `emit_equal_site`, numbers in line and `emit_equal_call`;
+///   the Number-only form, `emit_exec`; no allocation in line.
+/// Every other kind keeps the eager switch, as does every kind under the poison switch.
+fn lazy_kind(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::In | Op::Abstract(_) | Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq
+    )
+}
+
 /// The slots generic node `node` writes before its template, in the order of its slot inputs
 /// (P3 stage 3 step 3a, `build::Builder::effect`): those its operation names that its state holds
 /// as values, their frame words stale; `chunk` and `n_slots` its frame's (an inlined frame's
@@ -1036,6 +1063,10 @@ struct Switched {
     /// that the node saves no chunk word and its unwind writes constants; any other node switches
     /// the chunk and publishes its frame's site before its template.
     call: bool,
+    /// The chunk and the publication switched lazily, by the template's helper calls (a call
+    /// node's, and a node of a kind on `lazy_kind`'s list outside the poison switch: P3 stage 3
+    /// step 3c-2, piece B2b): no chunk word saved, and the unwind writes the constants.
+    lazy: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -3251,10 +3282,22 @@ impl Gen<'_> {
             env: uses.env,
             slots: !named.is_empty() || poison,
             call: call_site.is_some(),
+            lazy: call_site.is_some() || (lazy_kind(op) && !poison),
         };
         let ctx = |field: usize| field as u32;
         #[cfg(test)]
         self.check_node_context(pc);
+        // Test builds: a lazily switched node's template runs with a trap value in
+        // JitCtx::chunk wherever it has not switched (`jit::TRAP_CHUNK`), so that an in-line read
+        // of the chunk by an admitted template, the direct sequence or its stubs, or an
+        // unswitched end poll faults instead of reading the compiled chunk's data; the node's end
+        // and its unwind write the code's own chunk back.
+        #[cfg(test)]
+        if switched.lazy {
+            self.a.mov_imm64(X16, crate::jit::TRAP_CHUNK);
+            self.a
+                .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, chunk)));
+        }
         let stack_base = ctx(std::mem::offset_of!(JitCtx, stack_base));
         // The operands, at the operation's depth from the compiled frame's operand base.
         self.a.ldr_imm(X9, 19, stack_base);
@@ -3287,7 +3330,7 @@ impl Gen<'_> {
         }
         // The compiled frame's context words saved, the node's written (a call node's chunk by
         // its template's helper paths alone).
-        if !switched.call {
+        if !switched.lazy {
             let chunk_off = ctx(std::mem::offset_of!(JitCtx, chunk));
             self.a.ldr_imm(X16, 19, chunk_off);
             self.a.str_imm(X16, 31, save + SAVE_CHUNK);
@@ -3357,8 +3400,10 @@ impl Gen<'_> {
                     site,
                     frame_site,
                     call_site_off: self.ilayout.call_site as u32,
+                    call: true,
                 })
             }
+            None if switched.lazy => None,
             None => {
                 self.a
                     .ldr_imm(X17, 19, ctx(std::mem::offset_of!(JitCtx, interp)));
@@ -3387,6 +3432,19 @@ impl Gen<'_> {
         // template switches for its helpers itself.
         let helpers = self.a.set_inlined_frame_helpers(inlined_call.is_none());
         let outer_call = self.a.set_inlined_call(inlined_call);
+        // A lazily switched kind (piece B2b): its helper calls switch for it.
+        let outer_node = self
+            .a
+            .set_inlined_node((switched.lazy && !switched.call).then_some(
+                crate::jit::InlinedCall {
+                    callee_chunk: view.chunk_addr,
+                    own_chunk: self.chunk.chunk_addr,
+                    site: frame_site,
+                    frame_site,
+                    call_site_off: self.ilayout.call_site as u32,
+                    call: false,
+                },
+            ));
         let fixed = self.a.fixed_activation();
         self.a.set_fixed_activation(view.jit_fixed_activation());
         let emitted = operations::emit(
@@ -3411,6 +3469,7 @@ impl Gen<'_> {
         self.a.set_fixed_activation(fixed);
         self.a.set_inlined_frame_helpers(helpers);
         self.a.set_inlined_call(outer_call);
+        self.a.set_inlined_node(outer_node);
         self.a.replace_initialized_reads(reads);
         if poison {
             // The words it poisoned, still the poison: the window's other slots (x22 names the
@@ -3421,6 +3480,22 @@ impl Gen<'_> {
             self.check_poison(pc, &slots, depth - pops);
         }
         self.restore_context(switched, false);
+        // Test builds: every path of a lazily switched node's template ends unswitched (the
+        // trap again, its restore's; `brk` where a switched path did not restore), and the node's
+        // end writes the code's own chunk.
+        #[cfg(test)]
+        if switched.lazy {
+            let chunk_off = std::mem::offset_of!(JitCtx, chunk) as u32;
+            let ok = self.a.new_label();
+            self.a.ldr_imm(X16, 19, chunk_off);
+            self.a.mov_imm64(X17, crate::jit::TRAP_CHUNK);
+            self.a.cmp_reg_x(X16, X17);
+            self.a.b_cond(EQ, ok);
+            self.a.brk(0xb2e0 | (pc as u32 & 0xf));
+            self.a.bind(ok);
+            self.a.mov_imm64(X16, self.chunk.chunk_addr as u64);
+            self.a.str_imm(X16, 19, chunk_off);
+        }
         self.a.set_hot(false);
         self.last_effect = Some(n);
         Ok(())
@@ -3435,14 +3510,14 @@ impl Gen<'_> {
     fn restore_context(&mut self, switched: Switched, unwind: bool) {
         let save = self.save_area.expect("a save area");
         let ctx = |field: usize| field as u32;
-        if switched.call {
+        if switched.lazy {
             if unwind {
                 self.a.mov_imm64(X16, self.chunk.chunk_addr as u64);
             }
         } else {
             self.a.ldr_imm(X16, 31, save + SAVE_CHUNK);
         }
-        if !switched.call || unwind {
+        if !switched.lazy || unwind {
             self.a
                 .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, chunk)));
         }
@@ -3467,7 +3542,7 @@ impl Gen<'_> {
             self.a
                 .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
         }
-        if switched.call && !unwind {
+        if switched.lazy && !unwind {
             return;
         }
         if switched.call {

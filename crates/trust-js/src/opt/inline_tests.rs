@@ -3484,3 +3484,112 @@ fn an_error_at_the_end_poll_after_an_inlined_frames_helper_call_names_the_frame(
     }
     crate::jit::set_call_done_hook(false);
 }
+
+/// The lazily switched kinds (P3 stage 3 step 3c-2, piece B2b): an inlined frame's `In` and
+/// `Abstract` nodes switch the context for their frame around their helper calls alone. The
+/// self-hosted Array.prototype.map, inlined in the strict `mapper`'s frame (the planner inlines
+/// no callee of another strictness), reaches each helper from its
+/// inlined frame: its `k in O` of a Proxy (the `has` trap records its caller and stack), its
+/// CreateDataPropertyOrThrow on a species' Proxy (the `defineProperty` trap records its key, caller
+/// and stack) and on a non-extensible array (the TypeError's stack), then the machine-code paths
+/// again; and `cmpAll`'s inlined `eqS` and `eqL`, whose equalities stay generic (mixed operands'
+/// feedback) and reach the Equal stub's helpers: a loose equality's valueOf records its caller
+/// and stack, one throws, BigInts take the strict helper (which reads its operation from the
+/// switched chunk); collections at every allocation and forced exits too.
+const LAZY_KINDS: &str = "
+var probe = false, log = [];
+function stk(e, from, n) { return e.stack.split('\\n').slice(from, from + n).join('/'); }
+function cb(x, k) { return x + k; }
+function mapper(a) { 'use strict'; return a.map(cb); }
+var plain = [1, 2, 3, 4];
+var r = 0;
+for (var k = 0; k < 3000; k++) r += mapper(plain).length;
+probe = true;
+var out = [];
+function at(tag, thunk) {
+  try { out.push(tag + '|' + thunk()); } catch (e) { out.push(tag + '!' + e.name + ':' + e.message + '|' + stk(e, 1, 3)); } }
+var hasP = new Proxy([5, 6], { has: function hasT(t, key) {
+  if (probe) log.push('has<' + (hasT.caller && hasT.caller.name) + '|' + key + '|' + stk(new Error('h'), 1, 3));
+  return key in t; } });
+at('has', function () { return mapper(hasP).join(','); });
+function Sp(n) { return new Proxy([], { defineProperty: function defT(t, key, d) {
+  if (probe) log.push('def<' + (defT.caller && defT.caller.name) + '|' + key + '|' + stk(new Error('d'), 1, 3));
+  return Reflect.defineProperty(t, key, d); } }); }
+var sp = [7, 8]; sp.constructor = {}; sp.constructor[Symbol.species] = Sp;
+at('define', function () { return JSON.stringify(mapper(sp)); });
+var ne = [9]; ne.constructor = {}; ne.constructor[Symbol.species] = function () { return Object.preventExtensions([]); };
+at('nonExt', function () { return mapper(ne); });
+at('again', function () { return mapper(plain).join(','); });
+function eqS(a, b) { return a === b; }
+function eqL(a, b) { return a == b; }
+function cmpAll(xs, ys) { var t = 0;
+  for (var i = 0; i < xs.length; i++) t += (eqS(xs[i], ys[i]) ? 1 : 0) + (eqL(xs[i], ys[i]) ? 2 : 0);
+  return t; }
+var mixed = [1, 'a', null, {}, 2.5, 'b'], other = [1, 'a', undefined, {}, 3, 'c'];
+probe = false;
+for (var k = 0; k < 3000; k++) r += cmpAll(mixed, other);
+probe = true;
+var v2 = { valueOf: function vv() {
+  if (probe) log.push('vv<' + (vv.caller && vv.caller.name) + '|' + stk(new Error('vv'), 1, 3));
+  return 3; } };
+var vt2 = { valueOf: function () { throw new RangeError('vt2'); } };
+at('loose', function () { return cmpAll([v2, 'x', v2], [3, 'x', 4]); });
+at('bigint', function () { return cmpAll([1n, 2n, 3n], [1n, 3n, 3n]); });
+at('looseThrow', function () { return cmpAll([vt2], [1]); });
+at('again2', function () { return cmpAll(mixed, other); });
+probe = false;
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn lazily_switched_kinds_give_their_helpers_the_frames_chunk_and_site() {
+    inlined_generic();
+    let runs = counted(LAZY_KINDS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for seen in [
+        "has<",
+        "def<",
+        "define|",
+        "nonExt!TypeError:",
+        "again|",
+        "vv<",
+        "loose|",
+        "bigint|",
+        "looseThrow!RangeError:vt2|",
+        "again2|",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    // The loose equality's valueOf, which the Equal stub's helper calls from the inlined frame
+    // `eqL`, sees that frame on its stack (the switch's published site), as the tier off's does.
+    assert!(
+        runs[2]
+            .0
+            .lines()
+            .any(|line| line.starts_with("vv<") && line.contains("at eqL")),
+        "{}",
+        runs[2].0
+    );
+    let ops = inlined_generic();
+    assert!(ops.iter().any(|op| matches!(op, Op::In)), "{ops:?}");
+    assert!(
+        ops.iter().any(|op| matches!(op, Op::Abstract(_))),
+        "{ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| matches!(op, Op::StrictEq | Op::EqEq)),
+        "{ops:?}"
+    );
+    for (exit_every, stress) in [(7, false), (0, true)] {
+        let runs = counted(LAZY_KINDS, exit_every, stress, false);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}"
+        );
+    }
+    super::take_poison_faults();
+    let runs = counted(LAZY_KINDS, 0, false, true);
+    assert_eq!(runs[2].0, runs[0].0, "poisoned (the eager switch)");
+    assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+}

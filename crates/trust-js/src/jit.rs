@@ -2487,6 +2487,17 @@ impl JitCtx {
         if self.chunk.is_null() || !self.slots_are_own() {
             return FRAME_BUF;
         }
+        // Test builds: a lazily switched node of an inlined frame runs its unswitched machine
+        // code with the trap value in `chunk` (`TRAP_CHUNK`), which names no chunk: the whole
+        // record, as for an unknown chunk (its end poll's top is the poll's).
+        #[cfg(all(
+            test,
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
+        if self.chunk as u64 == TRAP_CHUNK {
+            return FRAME_BUF;
+        }
         // SAFETY: an active record's chunk is its running activation's, which keeps it alive
         // (the callee closure on the caller's operand stack, or the Rust entry's lease).
         let max_stack = unsafe { (*self.chunk).jit.max_stack() };
@@ -2694,6 +2705,17 @@ pub(crate) fn inlined_call_helpers() -> &'static [usize; N_HELPERS] {
     })
 }
 
+/// Test builds: the value a lazily switched node of an inlined frame keeps in `JitCtx::chunk`
+/// while its template runs unswitched (`opt::a64`'s `lower_inlined_generic`, and the restore,
+/// `emit_inlined_call_restore`), an address in the unmapped first page, so that any read of the
+/// chunk there faults (P3 stage 3 step 3c-2, piece B2b).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) const TRAP_CHUNK: u64 = 0x8;
+
 /// An inlined frame's call node whose call template is being emitted (P3 stage 3 step 3c-2,
 /// piece B2; `Asm::inlined_call`): what the template's helper paths switch the context to and
 /// back from. The direct path reads none of it: the direct sequence takes the call's position
@@ -2720,6 +2742,10 @@ pub(crate) struct InlinedCall {
     pub(crate) frame_site: u32,
     /// `Interp::call_site`'s offset (`InterpLayout::call_site`).
     pub(crate) call_site_off: u32,
+    /// A call node's (x21 switched to the inlined call helpers' table); false for a node of a
+    /// kind whose template switches lazily too (`Asm::inlined_node`, P3 stage 3 step 3c-2, piece
+    /// B2b), whose `site` is its frame's implicit site and whose helpers are the activation's.
+    pub(crate) call: bool,
 }
 
 /// The context of an inlined call node's callee frame, for the helper a path of its call
@@ -2733,7 +2759,7 @@ pub(crate) struct InlinedCall {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) fn emit_inlined_call_switch(a: &mut asm::Asm) {
-    let Some(call) = a.inlined_call() else {
+    let Some(call) = a.inlined_call().or(a.inlined_node()) else {
         return;
     };
     a.mov_imm64(16, call.callee_chunk as u64);
@@ -2741,7 +2767,11 @@ pub(crate) fn emit_inlined_call_switch(a: &mut asm::Asm) {
     a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, interp) as u32);
     a.mov_imm64(16, u64::from(call.site));
     a.str_w_imm(16, 21, call.call_site_off);
-    a.mov_imm64(21, inlined_call_helpers().as_ptr() as u64);
+    if call.call {
+        a.mov_imm64(21, inlined_call_helpers().as_ptr() as u64);
+    } else {
+        a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, helpers) as u32);
+    }
 }
 
 /// The compiled frame's context again after an inlined call node's helper path
@@ -2753,10 +2783,19 @@ pub(crate) fn emit_inlined_call_switch(a: &mut asm::Asm) {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) fn emit_inlined_call_restore(a: &mut asm::Asm) {
-    let Some(call) = a.inlined_call() else {
+    let Some(call) = a.inlined_call().or(a.inlined_node()) else {
         return;
     };
-    a.mov_imm64(16, call.own_chunk as u64);
+    // Test builds write the trap value instead (see `TRAP_CHUNK`): the node's end writes the
+    // code's own chunk.
+    #[cfg(not(test))]
+    let restored = call.own_chunk as u64;
+    #[cfg(test)]
+    let restored = {
+        let _ = call.own_chunk;
+        TRAP_CHUNK
+    };
+    a.mov_imm64(16, restored);
     a.str_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
     a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, interp) as u32);
     a.mov_imm64(16, u64::from(crate::stack_trace::NO_POSITION));
@@ -3497,6 +3536,13 @@ mod asm {
         /// position from the call's own word, switches nothing. None everywhere else, so template
         /// code is unchanged.
         inlined_call: Option<super::InlinedCall>,
+        /// The code being emitted is the template of an inlined frame's generic node of a kind
+        /// whose every way out of machine code is a helper call through `emit_op_helper` or
+        /// `emit_helper` (P3 stage 3 step 3c-2, piece B2b; `opt::a64`'s `lazy_kind`): those
+        /// emitters switch the context for the frame around the helper's call alone
+        /// (`super::emit_inlined_call_switch`, `super::emit_inlined_call_restore`), and its
+        /// machine-code path switches nothing. None everywhere else.
+        inlined_node: Option<super::InlinedCall>,
     }
 
     #[derive(Clone, Copy)]
@@ -3550,6 +3596,7 @@ mod asm {
                 element_records: Vec::new(),
                 inlined_frame_helpers: false,
                 inlined_call: None,
+                inlined_node: None,
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3719,6 +3766,17 @@ mod asm {
         }
         pub(crate) fn inlined_call(&self) -> Option<super::InlinedCall> {
             self.inlined_call
+        }
+        /// Set the inlined frame's node whose template switches lazily (see the
+        /// `inlined_node` field); returns the previous setting.
+        pub(crate) fn set_inlined_node(
+            &mut self,
+            node: Option<super::InlinedCall>,
+        ) -> Option<super::InlinedCall> {
+            std::mem::replace(&mut self.inlined_node, node)
+        }
+        pub(crate) fn inlined_node(&self) -> Option<super::InlinedCall> {
+            self.inlined_node
         }
         pub(crate) fn inlined_frame_helpers(&self) -> bool {
             self.inlined_frame_helpers
@@ -16043,7 +16101,16 @@ fn emit_equal_call(
     };
     a.movz(1, pc, 0);
     let stub = a.shared_stub(SharedStub::Equal(flags).key());
+    // A lazily switched inlined frame's node (piece B2b): the frame's context for the stub's
+    // helper, its end poll's error included (`emit_op_helper_marked`).
+    let lazy = a.inlined_node().is_some();
+    if lazy {
+        emit_inlined_call_switch(a);
+    }
     a.bl_label(stub);
+    if lazy {
+        emit_inlined_call_restore(a);
+    }
     if !strict {
         // IsLooselyEqual may call author conversion methods, which may throw.
         a.cbnz(1, false, l_unwind);
@@ -24540,7 +24607,16 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
             SharedStub::Helper { idx: idx as u8 }
         };
         let stub = a.shared_stub(stub.key());
+        // A lazily switched inlined frame's node (piece B2b): the frame's context for the helper
+        // alone (nothing elsewhere).
+        let lazy = a.inlined_node().is_some();
+        if lazy {
+            emit_inlined_call_switch(a);
+        }
         a.bl_label(stub);
+        if lazy {
+            emit_inlined_call_restore(a);
+        }
         a.cbnz(1, false, l_unwind);
         if helper_ends_in_poll(idx) {
             emit_helper_end_poll(a, l_unwind);
@@ -24550,8 +24626,15 @@ fn emit_op_helper_marked(a: &mut asm::Asm, idx: usize, pc: u32, l_unwind: usize)
     a.mov(0, 19);
     a.movz(1, pc, 0);
     a.mov(2, 20);
+    let lazy = a.inlined_node().is_some();
+    if lazy {
+        emit_inlined_call_switch(a);
+    }
     a.ldr_imm(16, 21, (idx * 8) as u32);
     a.blr(16);
+    if lazy {
+        emit_inlined_call_restore(a);
+    }
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     if helper_ends_in_poll(idx) {
@@ -24635,7 +24718,7 @@ fn emit_helper_end_poll(a: &mut asm::Asm, l_unwind: usize) {
     // it, so that an error the helper creates (the live-object limit's RangeError, from
     // `Interp::gc_check`) names the inlined frame, which reports its start as a frame whose
     // position is pending does; NO_POSITION again after (a throw's unwind writes it too).
-    let inlined = a.inlined_call();
+    let inlined = a.inlined_call().or(a.inlined_node());
     if let Some(call) = inlined {
         emit_publish_call_site(a, call.frame_site, call.call_site_off);
     }
@@ -24958,8 +25041,16 @@ fn emit_helper(a: &mut asm::Asm, idx: usize, imm: u32) {
     a.mov(0, 19);
     a.movz(1, imm, 0);
     a.mov(2, 20);
+    // A lazily switched inlined frame's node (piece B2b; `emit_op_helper_marked`).
+    let lazy = a.inlined_node().is_some();
+    if lazy {
+        emit_inlined_call_switch(a);
+    }
     a.ldr_imm(16, 21, (idx * 8) as u32);
     a.blr(16);
+    if lazy {
+        emit_inlined_call_restore(a);
+    }
     a.mov(20, 0);
 }
 
