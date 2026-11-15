@@ -98,7 +98,8 @@ const INLINED: &str = "function st(s, k) { return (s * 31 + k) & 0xfffff; }\n\
      t + ':' + outer(4, 2.5)";
 
 /// Fourteen int32s live across the loop's two calls and read several times between them in one
-/// block: no loop cache (every callee-saved register holds a value across the calls), read spans.
+/// block: no loop cache (every callee-saved register holds a value across the calls), read spans;
+/// then a1, a2 and a3 read once after the second call, outside any span, from their slots.
 const BETWEEN: &str = "function st(s, k) { return (s * 31 + k) & 0xfffff; }\n\
      function st2(s, k) { return (s ^ (k * 7)) & 0xfffff; }\n\
      const fs = [st, st2];\n\
@@ -115,7 +116,8 @@ const BETWEEN: &str = "function st(s, k) { return (s * 31 + k) & 0xfffff; }\n\
            + (a3 ^ a8) + (a4 & a9) + (a4 | a10) + (a5 ^ a11) + (a6 & a12) + (a7 | a13) \
            + (a8 ^ a14) + (a9 & a1) + (a10 | a2) + (a11 ^ a3) + (a12 & a4) + (a13 | a5) \
            + (a14 ^ a6)) & 0xfffff; \
-         s = fs[(i + 1) & 1](s, a1 & 7); } \
+         s = fs[(i + 1) & 1](s, a1 & 7); \
+         s = (s + a1 + (a2 ^ a3)) & 0xfffff; } \
        return s + a1 + a2 + a3 + a4 + a5 + a6 + a7 + a8 + a9 + a10 + a11 + a12 + a13 + a14; }\n\
      let t = 0; for (let k = 0; k < 400; k++) t = (t + between(10, k, k * 3)) % 1000003;\n\
      t + ':' + between(5, 2.5, 1) + ':' + between(3, 1e9, 2)";
@@ -229,4 +231,80 @@ fn objects_cached_through_the_inner_loop_survive_collections_in_the_outer_loops_
 fn a_leafs_loop_inlined_at_graph_reads_its_callers_spilled_values_from_caches() {
     // At splice the leaf is a call; at graph its loop is the caller's.
     equal_with_caches(INLINED, "graph");
+}
+
+/// A value made first and read only in the loop, pushed out by twenty-four int32s read at once
+/// before it (its next use is the farthest), in a loop that calls `cat`, which graph inlining
+/// builds into the loop with its `s + k` a generic node of the inlined frame: a call in the loop,
+/// across which few values live, so the cache is a callee-saved register.
+const INLINED_CALL: &str = "function cat(s, k) { return s + k; }\n\
+     function f(n, a) { \
+       const v = (a * 7) & 0xffff; \
+       let b1 = (a ^ 1) & 0xfff, b2 = (a ^ 2) & 0xfff, b3 = (a ^ 3) & 0xfff, b4 = (a ^ 4) & 0xfff, \
+         b5 = (a ^ 5) & 0xfff, b6 = (a ^ 6) & 0xfff, b7 = (a ^ 7) & 0xfff, b8 = (a ^ 8) & 0xfff, \
+         b9 = (a ^ 9) & 0xfff, b10 = (a ^ 10) & 0xfff, b11 = (a ^ 11) & 0xfff, b12 = (a ^ 12) & 0xfff, \
+         b13 = (a ^ 13) & 0xfff, b14 = (a ^ 14) & 0xfff, b15 = (a ^ 15) & 0xfff, b16 = (a ^ 16) & 0xfff, \
+         b17 = (a ^ 17) & 0xfff, b18 = (a ^ 18) & 0xfff, b19 = (a ^ 19) & 0xfff, b20 = (a ^ 20) & 0xfff, \
+         b21 = (a ^ 21) & 0xfff, b22 = (a ^ 22) & 0xfff, b23 = (a ^ 23) & 0xfff, b24 = (a ^ 24) & 0xfff; \
+       let r = (b24 + b23 + b22 + b21 + b20 + b19 + b18 + b17 + b16 + b15 + b14 + b13 + b12 + b11 \
+         + b10 + b9 + b8 + b7 + b6 + b5 + b4 + b3 + b2 + b1) & 0xffff; \
+       let s = ''; \
+       for (let i = 0; i < n; i++) { \
+         s = cat(s, i & 3); \
+         r = (r + v + (v >> 3)) & 0xffff; } \
+       return r + s.length; }\n\
+     let t = 0; for (let k = 0; k < 300; k++) t = (t + f(12, k)) % 1000003;\n\
+     t + ':' + f(5, 2.5)";
+
+/// INLINED_CALL's loop, `cat`'s `s + k` throwing where k's valueOf does, caught by a handler in
+/// the loop around the call: the inlined frame's generic node at a pc with a handler in its
+/// chain exits by its recipe, which names the cached value's slot.
+const INLINED_THROW: &str = "function cat(s, k) { return s + k; }\n\
+     const bad = { valueOf() { throw new RangeError('no'); } };\n\
+     function f(n, a, odd) { \
+       const v = (a * 7) & 0xffff; \
+       let b1 = (a ^ 1) & 0xfff, b2 = (a ^ 2) & 0xfff, b3 = (a ^ 3) & 0xfff, b4 = (a ^ 4) & 0xfff, \
+         b5 = (a ^ 5) & 0xfff, b6 = (a ^ 6) & 0xfff, b7 = (a ^ 7) & 0xfff, b8 = (a ^ 8) & 0xfff, \
+         b9 = (a ^ 9) & 0xfff, b10 = (a ^ 10) & 0xfff, b11 = (a ^ 11) & 0xfff, b12 = (a ^ 12) & 0xfff, \
+         b13 = (a ^ 13) & 0xfff, b14 = (a ^ 14) & 0xfff, b15 = (a ^ 15) & 0xfff, b16 = (a ^ 16) & 0xfff, \
+         b17 = (a ^ 17) & 0xfff, b18 = (a ^ 18) & 0xfff, b19 = (a ^ 19) & 0xfff, b20 = (a ^ 20) & 0xfff, \
+         b21 = (a ^ 21) & 0xfff, b22 = (a ^ 22) & 0xfff, b23 = (a ^ 23) & 0xfff, b24 = (a ^ 24) & 0xfff; \
+       let r = (b24 + b23 + b22 + b21 + b20 + b19 + b18 + b17 + b16 + b15 + b14 + b13 + b12 + b11 \
+         + b10 + b9 + b8 + b7 + b6 + b5 + b4 + b3 + b2 + b1) & 0xffff; \
+       let s = ''; \
+       for (let i = 0; i < n; i++) { \
+         try { s = cat(s, i === 3 && odd ? bad : i & 3); } catch (e) { r = (r + v + e.message.length) & 0xffff; } \
+         r = (r + v + (v >> 3)) & 0xffff; } \
+       return r + s.length; }\n\
+     let t = 0; for (let k = 0; k < 300; k++) t = (t + f(8, k, k % 5 === 4)) % 1000003;\n\
+     t + ':' + f(6, 11, true)";
+
+/// `program` in each configuration equals the VM's, and the allocations at graph made loop
+/// caches in callee-saved registers.
+fn equal_with_callee_caches(program: &str) {
+    let expected = run(Tier::Bytecode, program);
+    for (label, switches) in configurations() {
+        crate::opt::regalloc::TEST_CALLEE_CACHES.with(|made| made.set(0));
+        assert_eq!(with_switches(switches, program), expected, "{label}");
+        let made = crate::opt::regalloc::TEST_CALLEE_CACHES.with(|made| made.replace(0));
+        if label == "graph" {
+            assert!(
+                made > 0,
+                "graph: the allocations made callee-saved loop caches"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_value_cached_through_a_loop_with_an_inlined_frames_generic_node_takes_a_callee_saved_register()
+{
+    // The consistency check after every allocation refuses a caller-saved cache through a loop
+    // with a call, which an inlined frame's generic node is (NodeOp::Generic).
+    equal_with_callee_caches(INLINED_CALL);
+}
+
+#[test]
+fn an_inlined_frames_throw_exit_in_a_cached_loop_reads_the_cached_values_slot() {
+    equal_with_callee_caches(INLINED_THROW);
 }

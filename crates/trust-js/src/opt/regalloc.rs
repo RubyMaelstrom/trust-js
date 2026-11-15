@@ -1015,6 +1015,12 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         tests::assert_caches(graph, &alloc);
         TEST_CACHES.with(|made| made.set(made.get() + alloc.caches.len()));
         TEST_SPANS.with(|made| made.set(made.get() + alloc.spans.len()));
+        let callee = alloc
+            .caches
+            .iter()
+            .filter(|c| matches!(c.reg, Home::Gp(r) if file.gp_callee.contains(&r)))
+            .count();
+        TEST_CALLEE_CACHES.with(|made| made.set(made.get() + callee));
     }
     Ok(alloc)
 }
@@ -1025,6 +1031,9 @@ thread_local! {
     pub(crate) static TEST_CACHES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The read spans the allocations on this thread made.
     pub(crate) static TEST_SPANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The loop caches in callee-saved x registers the allocations on this thread made.
+    pub(crate) static TEST_CALLEE_CACHES: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
 }
 
 /// 10^k for the static execution estimate of a block at loop depth k (B3's,
@@ -2709,6 +2718,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_block_outside_the_loop_inside_its_hull_reads_the_slot() {
+        // entry (21 words, v spilled, the chain) -> H (q, i; poll; i < 100) -> A (q against v;
+        // branch to X or B) ; B -> H (the latch); X returns q against v; H -> E returns q. In the
+        // code order X lies between A and B, inside the loop's hull but none of its blocks: the
+        // cache serves H, A and B, and X reads v's slot.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let h = g.add_block(1, true);
+        let a = g.add_block(2, false);
+        let b = g.add_block(3, false);
+        let x = g.add_block(4, false);
+        let e = g.add_block(5, false);
+        g.entry = Some(entry);
+        for (from, to) in [(entry, h), (h, a), (h, e), (a, x), (a, b), (b, h)] {
+            g.add_edge(from, to);
+        }
+        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
+        let v = word(&mut g);
+        let mut acc = words[0];
+        for &w in &words[1..] {
+            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
+            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
+        }
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(h), &[], Rep::None, 0);
+        let q = g.add_node(h, NodeOp::Phi, &[acc], Rep::Tagged, 1);
+        let i = g.add_node(h, NodeOp::Phi, &[zero], Rep::I32, 1);
+        let ps = state(&mut g, 1, &[]);
+        let poll = g.add_node(h, NodeOp::Poll, &[], Rep::None, 1);
+        g.node_mut(poll).state = Some(ps);
+        let hundred = g.add_node(h, NodeOp::ConstI32(100), &[], Rep::I32, 1);
+        let lt = g.add_node(h, NodeOp::I32Cmp(Cond::Lt), &[i, hundred], Rep::Bool, 1);
+        let branch = |then_block, else_block| NodeOp::Branch {
+            then_block,
+            else_block,
+        };
+        g.add_node(h, branch(a, e), &[lt], Rep::None, 1);
+        let same = g.add_node(a, NodeOp::TaggedSame, &[q, v], Rep::Bool, 2);
+        g.add_node(a, branch(x, b), &[same], Rep::None, 2);
+        let one = g.add_node(b, NodeOp::ConstI32(1), &[], Rep::I32, 3);
+        let i2 = g.add_node(b, NodeOp::I32Or, &[i, one], Rep::I32, 3);
+        let q2 = compare_each(&mut g, b, q, &[v], 1);
+        g.add_node(b, NodeOp::Jump(h), &[], Rep::None, 3);
+        g.node_mut(q).inputs.push(q2);
+        g.node_mut(i).inputs.push(i2);
+        let out = compare_each(&mut g, x, q, &[v], 1);
+        g.add_node(x, NodeOp::Return, &[out], Rep::None, 4);
+        g.add_node(e, NodeOp::Return, &[q], Rep::None, 5);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        assert_eq!(cache.header, h);
+        let place = |blk: BlockIx| alloc.order.iter().position(|&o| o == blk).unwrap();
+        assert!(
+            place(a) < place(x) && place(x) < place(b),
+            "{:?}",
+            alloc.order
+        );
+        let x_at = alloc.pos[g.block(x).body[0].index()];
+        assert!(
+            cache.hull.0 < x_at && x_at < cache.hull.1,
+            "X inside the hull"
+        );
+        for blk in [h, a, b] {
+            assert_eq!(alloc.cache_of(blk, v), Some(cache.reg), "{blk:?}");
+        }
+        assert_eq!(alloc.cache_of(x, v), None, "X reads the slot");
+        assert!(!alloc.enters_loaded(x, h) && !alloc.enters_loaded(entry, h));
+    }
+
+    #[test]
     fn a_stub_call_in_the_loop_keeps_caches_out_of_the_registers_it_clobbers() {
         // A TypedElement call in the body: ten words read after the loop and live across it take
         // x0-x8 and x10 (not its clobbers), so the caller-saved registers free through the loop
@@ -2885,6 +2969,40 @@ pub(crate) mod tests {
                 assert!(matches!(s.reg, Home::Gp(r) if gp & (1 << r) == 0), "{s:?}");
             }
         }
+    }
+
+    #[test]
+    fn overlapping_runs_take_a_scarce_register_by_the_loads_they_save() {
+        // w, then v, spilled; `keep` words read at the end hold registers over the reads, which
+        // interleave w v w v v v: v's run saves three loads, w's one. With one register free over
+        // both runs, v's takes it though w's comes first by value.
+        for keep in [17usize, 18, 19] {
+            let mut g = Graph::new(2);
+            let entry = g.add_block(0, false);
+            g.entry = Some(entry);
+            let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+            let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
+            let w = word(&mut g);
+            let v = word(&mut g);
+            let mut acc = words[0];
+            for &x in &words[1..] {
+                let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, x], Rep::Bool, 0);
+                acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
+            }
+            let kept: Vec<NodeIx> = (0..keep).map(|_| word(&mut g)).collect();
+            let acc = compare_each(&mut g, entry, acc, &[w, v, w, v, v, v], 1);
+            let out = compare_each(&mut g, entry, acc, &kept, 1);
+            g.add_node(entry, NodeOp::Return, &[out], Rep::None, 1);
+            let alloc = allocate(&g, &ARM64).unwrap();
+            assert_consistent(&g, &alloc);
+            assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+            assert!(matches!(alloc.homes[w.index()], Home::Spill(_)));
+            if alloc.spans.len() == 1 {
+                assert_eq!(alloc.spans[0].value, v, "keep {keep}: {:?}", alloc.spans);
+                return;
+            }
+        }
+        panic!("no keep gave one span");
     }
 
     #[test]

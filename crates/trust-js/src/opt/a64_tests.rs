@@ -4819,6 +4819,157 @@ fn a_spilled_invariant_is_read_from_its_loop_cache_and_its_exits_name_its_slot()
     assert_eq!(exits(), vec![(0, ExitReason::NotInt32)]);
 }
 
+/// `count(n)`'s chunk (header at 6) under a hand-made graph with float pressure (step R1): g = n *
+/// n, then thirty floats made from n and read into 0 before the loop push g out (its next use,
+/// the loop's, is the farthest); twenty-two floats made after them, read after the loop, take
+/// every caller-saved d register through it, so that g's cache in the call-free loop is a
+/// callee-saved one, d8-d15. The loop adds g to an accumulator n times: count(n) = n^3 + 231.
+fn floats_graph() -> (Graph, NodeIx) {
+    let mut b = Build::new(3);
+    let entry = b.block(0, false);
+    let header = b.block(6, true);
+    let body = b.block(10, false);
+    let exit = b.block(18, false);
+    b.edge(entry, header);
+    b.edge(header, body);
+    b.edge(header, exit);
+    b.edge(body, header);
+    let n = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let at_entry = b.state(0, &[], &[], &[]);
+    let fn_ = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[n],
+        Rep::F64,
+        0,
+        at_entry,
+        ExitReason::NotNumber,
+    );
+    let in_ = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[fn_],
+        Rep::I32,
+        0,
+        at_entry,
+        ExitReason::NotInt32,
+    );
+    let g = b.node(entry, NodeOp::F64Mul, &[fn_, fn_], Rep::F64, 0);
+    let words: Vec<NodeIx> = (0..30)
+        .map(|k| {
+            let c = b.node(
+                entry,
+                NodeOp::ConstF64(f64::from(k + 2).to_bits()),
+                &[],
+                Rep::F64,
+                0,
+            );
+            b.node(entry, NodeOp::F64Mul, &[fn_, c], Rep::F64, 0)
+        })
+        .collect();
+    let mut acc = b.node(entry, NodeOp::ConstF64(0), &[], Rep::F64, 0);
+    for &w in &words {
+        let zero = b.node(entry, NodeOp::F64Sub, &[w, w], Rep::F64, 0);
+        acc = b.node(entry, NodeOp::F64Add, &[acc, zero], Rep::F64, 0);
+    }
+    let held: Vec<NodeIx> = (0..22)
+        .map(|k| {
+            let c = b.node(
+                entry,
+                NodeOp::ConstF64(f64::from(k).to_bits()),
+                &[],
+                Rep::F64,
+                0,
+            );
+            b.node(entry, NodeOp::F64Add, &[acc, c], Rep::F64, 0)
+        })
+        .collect();
+    let zero = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+    b.node(entry, NodeOp::Jump(header), &[], Rep::None, 5);
+    let i = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 6);
+    let s = b.node(header, NodeOp::Phi, &[acc], Rep::F64, 6);
+    let at_header = b.state(6, &[], &[(1, s), (2, i)], &[]);
+    b.exiting(
+        header,
+        NodeOp::Poll,
+        &[],
+        Rep::None,
+        6,
+        at_header,
+        ExitReason::Throw,
+    );
+    let lt = b.node(header, NodeOp::I32Cmp(Cond::Lt), &[i, in_], Rep::Bool, 8);
+    b.node(
+        header,
+        NodeOp::Branch {
+            then_block: body,
+            else_block: exit,
+        },
+        &[lt],
+        Rep::None,
+        9,
+    );
+    let s2 = b.node(body, NodeOp::F64Add, &[s, g], Rep::F64, 12);
+    let one = b.node(body, NodeOp::ConstI32(1), &[], Rep::I32, 16);
+    let at_inc = b.state(16, &[], &[(1, s2), (2, i)], &[]);
+    let i2 = b.exiting(
+        body,
+        NodeOp::I32Add,
+        &[i, one],
+        Rep::I32,
+        16,
+        at_inc,
+        ExitReason::Overflow,
+    );
+    b.node(body, NodeOp::Jump(header), &[], Rep::None, 17);
+    b.g.node_mut(i).inputs.push(i2);
+    b.g.node_mut(s).inputs.push(s2);
+    let mut total = s;
+    for &h in &held {
+        total = b.node(exit, NodeOp::F64Add, &[total, h], Rep::F64, 18);
+    }
+    let boxed = b.node(exit, NodeOp::F64ToTagged, &[total], Rep::Tagged, 18);
+    b.node(exit, NodeOp::Return, &[boxed], Rep::None, 19);
+    (b.g, g)
+}
+
+#[test]
+fn a_float_cache_in_d8_to_d15_through_a_call_free_loop_keeps_the_prologues_saves() {
+    // The cache's load writes a d8-d15 register, which the assembler sees: the prologue's d8-d15
+    // save group stays (its fourth word the save, not the branch over the group that an
+    // unwritten group becomes), and the callers' d8-d15 survive.
+    use crate::opt::regalloc::{allocate, Home, ARM64};
+    let (graph, g) = floats_graph();
+    let alloc = allocate(&graph, &ARM64).unwrap();
+    crate::opt::regalloc::tests::assert_consistent(&graph, &alloc);
+    assert!(
+        matches!(alloc.homes[g.index()], Home::Spill(_)),
+        "{:?}",
+        alloc.homes[g.index()]
+    );
+    let cache = *alloc
+        .caches
+        .iter()
+        .find(|c| c.value == g)
+        .expect("g's cache");
+    assert!(
+        matches!(cache.reg, Home::Fp(r) if ARM64.fp_callee.contains(&r)),
+        "{cache:?}"
+    );
+    let mut engine = fixture(COUNT);
+    let code = install(&mut engine, "count", &graph, Options::default());
+    exits();
+    assert_ne!(
+        code_words(&code)[3],
+        0x1400_0004,
+        "the d8-d15 saves were skipped"
+    );
+    assert_eq!(eval(&mut engine, "count(3)"), "258");
+    assert_eq!(eval(&mut engine, "count(10)"), "1231");
+    assert_eq!(eval(&mut engine, "count(2) + count(4) * 0.5"), "386.5");
+    assert!(exits().is_empty());
+}
+
 #[test]
 fn a_polls_slow_path_keeps_a_caller_saved_loop_cache() {
     // Every poll takes its slow path (the poll word set by hand), whose call clobbers the
@@ -4864,8 +5015,10 @@ fn a_polls_slow_path_keeps_a_caller_saved_loop_cache() {
 /// R1): b's int32 y, z = y * y, then twenty-one int32s made from y, which fill the x registers and
 /// push out the values whose next use is the farthest, a's word and z (spilled at their
 /// definitions); a chain reads the twenty-one into 0; then t1 = 0 + z, t2 = t1 + z, ToBoolean(a)
-/// (a BigInt's takes its out-of-line call), t3 = t2 + z: z's three reads in one span; a true a
-/// returns t3, a false one t2. Returns z.
+/// (a BigInt's takes its out-of-line call), t3 = t2 + z: z's three reads in one span; then
+/// twenty-one int32s made from y take every x register up to t4 = t3 + z, which reads z outside
+/// the span, from its slot, and a chain reads them into 0; a true a returns t4, a false one t2.
+/// Returns z.
 fn spans_graph() -> (Graph, NodeIx) {
     let mut b = Build::new(2);
     let entry = b.block(0, false);
@@ -4942,6 +5095,26 @@ fn spans_graph() -> (Graph, NodeIx) {
         at_add,
         ExitReason::Overflow,
     );
+    let more: Vec<NodeIx> = (0..21)
+        .map(|k| {
+            let c = b.node(entry, NodeOp::ConstI32(k), &[], Rep::I32, 2);
+            b.node(entry, NodeOp::I32Or, &[iy, c], Rep::I32, 2)
+        })
+        .collect();
+    let t4 = b.exiting(
+        entry,
+        NodeOp::I32Add,
+        &[t3, z],
+        Rep::I32,
+        2,
+        at_add,
+        ExitReason::Overflow,
+    );
+    let mut acc = t4;
+    for &w in &more {
+        let zero = b.node(entry, NodeOp::I32Xor, &[w, w], Rep::I32, 2);
+        acc = b.node(entry, NodeOp::I32Or, &[acc, zero], Rep::I32, 2);
+    }
     b.node(
         entry,
         NodeOp::Branch {
@@ -4952,11 +5125,23 @@ fn spans_graph() -> (Graph, NodeIx) {
         Rep::None,
         2,
     );
-    for (block, value) in [(yes, t3), (no, t2)] {
+    for (block, value) in [(yes, acc), (no, t2)] {
         let boxed = b.node(block, NodeOp::I32ToTagged, &[value], Rep::Tagged, 3);
         b.node(block, NodeOp::Return, &[boxed], Rep::None, 3);
     }
     (b.g, z)
+}
+
+/// The last node of the entry block that reads `z` (spans_graph's t4).
+fn t4_of(graph: &Graph, z: NodeIx) -> NodeIx {
+    let entry = graph.entry.expect("an entry");
+    *graph
+        .block(entry)
+        .body
+        .iter()
+        .rev()
+        .find(|&&n| graph.node(n).inputs.contains(&z))
+        .expect("a read of z")
 }
 
 #[test]
@@ -4978,13 +5163,14 @@ fn a_spilled_values_reads_in_a_block_share_a_span_kept_across_a_slow_call() {
     exits();
     // A BigInt's ToBoolean calls out between z's reads, which clobbers the caller-saved
     // registers: the span's register is saved and restored around the call.
-    assert_eq!(eval(&mut engine, "add(10n, 3)"), "27");
+    assert_eq!(eval(&mut engine, "add(10n, 3)"), "36");
     assert_eq!(eval(&mut engine, "add(0n, 3)"), "18");
-    assert_eq!(eval(&mut engine, "add(1, 4)"), "48");
+    assert_eq!(eval(&mut engine, "add(1, 4)"), "64");
     assert_eq!(eval(&mut engine, "add(0, 4)"), "32");
     assert!(exits().is_empty());
-    // The span's one load of z's slot, and none into a scratch register; the slow call's save
-    // stores the span's register, where nothing else of this code stores it.
+    // The span's load of z's slot, and one load of it into a scratch register, t4's outside the
+    // span; the slow call's save stores the span's register, where nothing else of this code
+    // stores it.
     let words = code_words(&code);
     assert!(
         holds(
@@ -4995,13 +5181,18 @@ fn a_spilled_values_reads_in_a_block_share_a_span_kept_across_a_slow_call() {
         "x{r} is not saved"
     );
     assert!(words.contains(&encode(|a| a.ldr_imm(u32::from(r), 31, offset))));
-    for scratch in [X9, X16, X17, X30] {
-        let use_load = encode(|a| a.ldr_imm(scratch, 31, offset));
-        assert!(
-            !words.contains(&use_load),
-            "a read loads z's slot into x{scratch}"
-        );
-    }
+    let scratch_loads = [X9, X16, X17, X30]
+        .iter()
+        .map(|&scratch| {
+            let use_load = encode(|a| a.ldr_imm(scratch, 31, offset));
+            words.iter().filter(|&&w| w == use_load).count()
+        })
+        .sum::<usize>();
+    assert_eq!(scratch_loads, 1, "the reads' loads of z's slot");
+    assert!(
+        span.to < alloc.pos[t4_of(&graph, z).index()],
+        "t4 outside the span"
+    );
     // An exit after the span's first read: the VM's Add from the frame's words.
     assert_eq!(eval(&mut engine, "add(1, 2.5)"), "3.5");
     assert_eq!(exits(), vec![(2, ExitReason::NotInt32)]);
