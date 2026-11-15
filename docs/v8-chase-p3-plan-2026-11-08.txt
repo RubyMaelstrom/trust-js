@@ -5224,3 +5224,72 @@ definition and equality nodes switch their context only around their helper call
   the trap build at graph, at the splice and at graph under the poison (the agent's); the
   verifier sweep on the landed binary (mine: 42 runs, none refused); fmt, clippy; zombie's
   check, clippy, Windows' check and x86-64 suite (2,891).
+
+Stage 3 step 4p, rules 1 and 5 landed (69e27b5d, 5ff5ca47, 2026-11-15; target/p3/stage3/
+step4p-impl, design-note.txt, piece0-tables.txt, piece1-exemplars.txt): what a discard costs at
+graph and the exits that repeat, measured, and the first two of five rules.
+- What was measured first (a probe with perf's JIT dump; the fat-LTO counts give the numbers,
+  the census only attributes: its own switches shrink GBEMU's gap). The slow time is the exits',
+  at both modes alike: exited activations' template code and the exits' VM runs are 25% of
+  GBEMU's cycles at 5 runs, 21% of Richards', 16% of DeltaBlue's, and at 200 runs 27% of
+  Richards' and 22% of DeltaBlue's. Over 97% of exits are a site exiting again after its first
+  exit in the same code (GBEMU 15,204 of 15,350, TypeScript 25,109 of 25,358). A discard costs
+  what 10 to 250 exits cost, mostly 25 to 120; five sites over all the workloads are true
+  transients.
+- GBEMU's loss at graph (the design's risk R7) is not the first stage's unspliced fallback. No
+  function is discarded at graph that the splice keeps (125 discards against 132). After a
+  discard, an in-place function's first-stage template code goes on filling the first stage's
+  caches, and the template JIT's stale-chain recompile then makes a bytecode recompile from
+  them, a splice even at graph: executeIteration's plan 358 operations of splices against the
+  splice's own 234, memoryReadNormal no longer inlined, and its warm-up waiting 7 checkpoints
+  (84,008 invocations against 4,002) on one call site whose ways churn. With that recompile off
+  at both modes graph is 1.43% under the splice on GBEMU at 5 runs and 0.20% at 200; it fires in
+  GBEMU alone among the workloads.
+- Rule 1 (69e27b5d): a discard's warm-up waits for no call site's ways. Its settled test
+  compares a fingerprint without them (the call state's transitions still count; first
+  compiles keep step 11's fingerprint), as V8's tiering manager hears of no call feedback
+  (NotifyICChanged comes from property ICs' transitions, tiering-manager.cc:497-576;
+  ic-callable.tq:22-50) and JSC and SpiderMonkey wait for no settling at all. GBEMU's warm-up
+  waits 41 -> 21 at graph; its earlier recompiles meet feedback they had not seen (exits 15,350
+  -> 17,150) and still count less. Instructions at 5 runs (my recount, merge-check/
+  counts-4r1.out and counts-4r1-graph.out, the agent's to the digit): at graph GBEMU -1.32%,
+  DeltaBlue -0.28%, graph against the splice on GBEMU +1.80% -> +0.64%; at the splice GBEMU
+  -0.19%, DeltaBlue -0.27%; Djot's fixture +0.16% at the splice and +0.23% at graph with the
+  same discards, exits, waits and reoptimization checkpoint as before (the binary: inferred).
+  At 200 runs nothing moves beyond 0.2% (a warm-up's gain).
+- Rule 5 (5ff5ca47): a reoptimization re-reads its call sites' ways before its snapshot. A site
+  whose callees the code inlines and which has met a callee its guards do not hold gets the
+  WrongCallee flag its guard's exit would have set (each guard of a splice's chain up to the
+  generic call whose cache holds the new callee; a graph-inlined site at its call with every
+  way's place), so the recompile builds those guards as tests with their mismatch edges, as the
+  exemplars read their call feedback at every compile (JSC's CallLinkStatus,
+  CallLinkStatus.cpp:98-120; Warp's oracle, WarpOracle.cpp:1404-1554). Before it each discard
+  taught the one site whose guard failed first: the first failing check ends an activation's
+  stay in the code, and kept ways changed only when an exit flagged them (step L4 met the same
+  mechanism). Weakening only: no way added or dropped, a flag never cleared, so a guard changes
+  once at most.
+  Richards at 200 runs -9.04% instructions and -11.0% cycles, at both modes (mine at the
+  default, five rounds, merge-check/cycles-4r5.out: [-11.13, -10.85]; the agent's ten rounds at
+  graph and at the splice -10.96% and -10.97%): Scheduler.schedule's second discard is gone
+  (its reoptimization's re-read flags its task dispatch's call, pc 348, where ten WrongCallee
+  exits at its loop limit discarded it again before), and its long activation no longer spends
+  the rest of a run in template code (inferred). TypeScript at 5 runs: discards 115 -> 103,
+  exits 25,850 -> 21,964; PdfJS's discards 22 -> 19. Instructions at 5 runs (my recount,
+  counts-4r5.out, counts-4r5-graph.out): Djot's fixture -0.22%, PdfJS -0.37% (-0.43% at
+  graph), TypeScript -0.8% inside its modes, the rest within 0.09%. At 200 runs (the
+  agent's): Octane's geomean -0.68% at the splice and -0.69% at graph, TypeScript -0.27%
+  and -0.64%, nothing worse than +0.01%.
+- Checks: each rule's tests (a warm-up checkpoint not waiting for a polymorphic site's new way
+  and waiting for a transition; a function of four call sites relearning in one reoptimization,
+  at the splice and at graph) and mutations (4 of 4, 5 of 5); the tier's modules in six
+  configurations on the agent's tree (613 and 615 tests); the verifier sweep on each landed
+  binary (mine: 42 runs, none refused); clippy; zombie's check, clippy, Windows' check and
+  suite (2,891).
+- Decided with the design note, for the commits to come: rule 2, the stale-chain request of an
+  in-place first stage at graph makes the tier's own checkpoint due and no bytecode recompile
+  (it takes GBEMU's 200-run gap; alone it costs GBEMU at 5 runs, its companion, the template
+  code compiled again without chains, to be decided on its evidence); rule 3, a flag that does
+  not change the build becomes the site's generic form (step L5's); rule 4, the exit limit 10
+  << R (SpiderMonkey's 10 with JSC's doubling), last, on a stated acceptance test, else the
+  owner's (JSC's 100 was the owner's number). The warm-ups keep JSC's 2^R; the fallback stays
+  the first stage's template code.
