@@ -4606,12 +4606,22 @@ directly again. The default stays the splice.
   raises started its stack at the inlined frame, and a toString the getter called named the
   wrong caller (the agent's mutation A2 shows both). The site is put back at the direct
   sequence's decline and after a trap's return, before the invariant check's error.
-- Open from the coordinator's review, the agent's next commit (A2, 3de56d63 on its branch,
-  checks running): the site is not put back after a getter's or a setter's return, on the
-  argument that nothing reads it before the node's own restore. The node's end poll does: its
-  gc_check raises the allocation-limit RangeError, whose stack is captured from
-  Interp::call_site and would lack the inlined frame. Found by reading, not reproduced; graph
-  alone.
+- From the coordinator's review, fixed in fc428c00 (A2): piece A did not put the site back
+  after a getter's or a setter's return, on the argument that nothing reads it before the
+  node's own restore. The node's end poll does: its gc_check raises the allocation-limit
+  RangeError, whose stack is captured from Interp::call_site and lacked the inlined frame. Now
+  the state after any direct accessor's return is the helper path's (three instructions on the
+  variant's direct return; the throw paths unchanged). Its test forces that poll's error with
+  a test-only request, since no program shape pins which poll first sees the ceiling passed,
+  for GetPropThis, SetPropThisDrop, GetPropLocal and SetPropLocalDrop, uncaught and caught;
+  two mutations, each caught. What it compares with is a reference stack (the frames of the
+  accessor's own error), because neither other mode gives one: a poll's error is never placed,
+  so the splice's stack starts at the compiled frame's start with no frame for the spliced
+  callee, and the tier off's callee has no end poll at that site. Graph is the most faithful
+  of the three there. On the landed tree (mine): the accessor tests at the default, at graph
+  and under GC stress at graph eager; the recount within 0.05% at the default and at graph
+  but TypeScript's two modes (+0.41%) and PdfJS with the tier off (+0.16%); the verifier
+  sweep, 42 runs, none refused.
 - The live top: a direct accessor call records the compiled record's top below a windowed
   node's slot window, and fe601a3c's rule scans the window at any known top; the test hook now
   counts a poll's top and a direct call's apart, and the new window test misses none.
@@ -4650,3 +4660,86 @@ directly again. The default stays the splice.
 - Beside it (6383ebda, tests only): the other four creation tests that assert the tier's code
   creates run alone in a child process, as 43b415d7's three; one had failed once in lowerings
   L1b's suite with forced exits (the process-wide creation epoch).
+
+Stage 3 lowerings L1b landed (28ad46d0, 08af20b3, 5f46bc17, cb34667a, 2026-11-15; target/p3/
+stage3/stepL1b-impl, report.txt and design-note.txt): the equality record keeps every pair met
+between two merges, an object-or-nullish pair is speculated on, and an equality with an
+undefined or null constant keeps no record.
+- A, the record accumulates. L1's last-seen byte held the last pair template code met before a
+  merge, so a site whose pairs alternate faster than merges come lost the pair that is rarely
+  last (RayTrace's `shape != exclude`: null for a primary ray's call, a shape for the many
+  shadow and reflection rays' calls after it). Now each recording equality has a group of 16
+  bytes, one a pair class, and template code stores zero into its pair's class byte: V8's
+  semantics (a compare's feedback ORed at every execution, code-stub-assembler.cc:13847-13866)
+  with JSC's plain store (JITInlines.h:312-319), so no load, no third register and no
+  read-modify-write. The merge ORs each marked class's bit into the record and resets the
+  group. Measured against the two other forms: an overwrite of one byte gives the gains back
+  (RayTrace +0.74%, Earley-Boyer +0.36%); a single-byte OR costs two instructions a hit (up to
+  +0.19%, Richards).
+- B, the pair. A record of nullish pairs, with or without two objects', (a new bit, EQ_NULLISH;
+  V8's kReceiverOrNullOrUndefined) checks each operand an object or nullish
+  [NotObjectOrNullish, a reason of its own, so that an Objects speculation's flag leaves the
+  recompile free to take this pair], then identity under === and !== (Maglev's form,
+  maglev-graph-builder.cc:2597-2607) and under == and != TurboFan's (js-typed-lowering.cc:
+  1009-1060: the same word equal; a nullish word equal to the other where that one is nullish
+  or [[IsHTMLDDA]]; two objects unequal), which Maglev leaves generic. An object whose
+  ic_plain is clear takes the cold call that asks, as `== null` does.
+- C, comments: `tag | 2` takes undefined and null alone; the template's two-tag class test also
+  takes the TDZ marker, which is no equality's operand (a test reads holes six ways and a
+  binding in its dead zone).
+- D, the coordinator's follow-up of Richards' +0.67% (5 runs) on C: its template code met an
+  object against null 62,438 times at recording sites, on a two-tag path 13 instructions
+  longer than L1's. An equality whose right operand is an undefined or null constant on every
+  path to it (the operation before it Undef or such a Const, the equality no jump target: `x ==
+  null`, `undefined != x`, `x === void 0`, either order) now keeps no record, no group and no
+  template store, as V8's TestNull, TestUndefined and TestUndetectable have no feedback slot
+  (bytecode-generator.cc:7862-7883, 8010-8017) and JSC's eq_null and neq_null profile nothing
+  (BytecodeList.rb:1375-1378); the builder lowered these from the constant before it read a
+  record. With it, the rules' prepass claims an equality with a constant from the constant's
+  producer alone (the builder took the constant's node whatever made the other operand; the
+  claim had needed both producers, so Richards' `while ((peek = next.link) != null)` counted
+  as a possible effect in its loop: 16 of its 17 loops had effects on the base, 1 now).
+- Measured (fat LTO; my recount of cb34667a against f48abe5a, merge-check/counts-l1b.out, the
+  agent's against 7875566a agree to the digit shown): instructions at 5 fixed runs, the tier
+  on: RayTrace -0.82%, Richards -0.62%, Vue -0.08%, Octane's geomean -0.10%; TypeScript -0.27%
+  and PdfJS +0.11% inside their runs' spread; every other within 0.04%. At 200 runs (the
+  agent's): DeltaBlue -0.63%, Richards -0.57%, TypeScript -0.19%, RayTrace -0.17%,
+  Earley-Boyer +0.14% inside its 0.16% spread. The tier off within 0.03% but Splay -0.17% and
+  PdfJS +0.14% (layout and the marker's schedule; its template code identical, 3,062 of 3,062
+  compiles). By the synchronous logs over the workloads: equality effects 695K -> 275K,
+  NotObject exits 567 -> 154, NotString 114 -> 14, RayTrace's exits 400 -> 200 and its
+  HoistingFailed and NotObject exits gone (one discard, as before L1), no NotObjectOrNullish
+  exit anywhere; loops free of effects 250 -> 266 of 1,034. Groups: 3,647 sites, 73 KB.
+- TypeScript on one CPU with incremental marking off counts +0.5% (the agent's): one major
+  collection more in 5 runs (10 against 9: the collection before it kept 173K objects where
+  the base's kept 518K, so its budget grew less), not code: with major collections pushed out
+  of the run the binaries count -0.1%.
+- Cycles at fixed work (mine, core 5 at 1.38 GHz delivered, five alternating rounds,
+  merge-check/cycles-l1b.out): DeltaBlue at 200 runs -1.40%, Richards at 200 -0.50%, Vue's
+  steady state -0.27%, Earley-Boyer -0.10%, TypeScript +0.09%, RayTrace at 200 +0.11%; Djot's
+  steady state +1.60% at equal instructions, of which +1.20% shows with the tier off as well,
+  where the generated code is identical, and Vue's with the tier off is -1.24%: the binaries'
+  layout, the size of what cycles can tell here. The agent's ten rounds over nine benchmarks:
+  geomean -0.03%, RayTrace at 5 runs -1.4%, TypeScript +1.7% (the collection).
+- Tests: the equality module's (the record's accumulation, each class, the pair's results over
+  a 25-value table with $262.IsHTMLDDA, the no-record sites and their claim, convergence in
+  one discard), 7 mutations of D each caught (three after the claim's test was made to check
+  the loop's heap facts), earlier mutations for A and B; the whole library suite on the final
+  tree in 8 legs (3,470 each; two legs with one failure, the creation test 6383ebda now runs
+  alone); the verifier sweep (mine on the landed binary: 42 runs, none refused); zombie's
+  check, clippy, Windows' check and suite (2,890). On the
+  merged tree (mine, cb34667a over step 3c-2's piece A): the tier's modules (464 tests) with
+  the tier off, on, with forced exits and at graph eager, none failing; fmt and clippy.
+- For the exit policy's next step, from the agent's reading of RayTrace before this record: a
+  check the phi selector hoists exits HoistingFailed at the loop's header, which disables the
+  hoist but teaches the operation nothing, so the operation exits again until a second
+  discard (220 exits, two compiles more than needed). JSC makes a control-equivalent hoisted
+  check's exit an ordinary exit of its own kind at its own index (DFGLICMPhase.cpp:254-269);
+  Ion's baseline fallback records the case (BaselineBailouts.cpp:2061-2087). Step L1c, started,
+  with the agent's fork (7) widened: no record at any equality the builder decides from a
+  constant before it reads one.
+- Found beside it, for the owner (not the plan's): the parser makes every reference to the
+  name `undefined` the literal, so a parameter, var, let or catch binding of that name is
+  ignored in every tier (target/p3/stage3/stepL1b-review/shadowed-undefined.js). V8 treats only
+  the unshadowed global as the literal (ast/ast.cc:107-117). records_equality keys on the
+  compiled Undef and stays right when that is fixed.
