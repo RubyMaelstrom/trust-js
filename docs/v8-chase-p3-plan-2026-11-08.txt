@@ -4582,3 +4582,71 @@ operation that needs the whole canonical frame, or a call. The default stays the
 - Open, before the flip (step 4): the direct accessor paths and calls from inlined frames
   (step 3c-2, started); GBEMU's R7; PdfJS's second-callee exits; the owner's question on the
   origin's form, above.
+
+Stage 3 step 3c-2, piece A landed (f48abe5a, 2026-11-15; target/p3/stage3/step3c2-impl,
+report.txt and design-note-A.txt): an inlined frame's property helpers call their accessors
+directly again. The default stays the splice.
+- The form. The tier's inlined nodes call a variant of the shared H_GET_PROP / H_SET_PROP stub
+  (SharedStub::HelperInlined, made once a process as the others: its code reads the context,
+  ctx.interp and the helper table only), whose direct getter, setter and Proxy trap calls take
+  the accessor frame's position from Interp::call_site, the inline site the node published,
+  where the base stub takes it from the running chunk's accessor table, which names no inline
+  copy of the callee's chunk. Everything else is the base stub's sequence, and the base stub,
+  template code, the compiled frame's own nodes, the splice and the tier off never name the
+  variant (the tier off's template code identical in 2,593 of 2,594 compiles, the one
+  GBEMU's own run-to-run difference; at the splice template code 2,174 of 2,174 and the
+  tier's code 1,377 of 1,377). The exemplars take an accessor's caller from the node's own
+  site too: JSC's DFG ICs carry the node's CallSiteIndex and the handler IC stores it before
+  the getter's call (DFGSpeculativeJIT64.cpp:161-193, InlineCacheCompiler.cpp:3310-3313);
+  Maglev's LoadNamedGeneric is a call with the node's lazy deopt frame (maglev-ir.cc:
+  5301-5311); Ion's IC records its inlined script and pc (IonIC.h:120-125).
+- A departure from the brief, taken: while the accessor runs the variant leaves
+  Interp::call_site NO_POSITION, as the interpreter's frame push moves the published position
+  into the callee's frame; with the site still published an error the getter's own operation
+  raises started its stack at the inlined frame, and a toString the getter called named the
+  wrong caller (the agent's mutation A2 shows both). The site is put back at the direct
+  sequence's decline and after a trap's return, before the invariant check's error.
+- Open from the coordinator's review, the agent's next commit (A2, 3de56d63 on its branch,
+  checks running): the site is not put back after a getter's or a setter's return, on the
+  argument that nothing reads it before the node's own restore. The node's end poll does: its
+  gc_check raises the allocation-limit RangeError, whose stack is captured from
+  Interp::call_site and would lack the inlined frame. Found by reading, not reproduced; graph
+  alone.
+- The live top: a direct accessor call records the compiled record's top below a windowed
+  node's slot window, and fe601a3c's rule scans the window at any known top; the test hook now
+  counts a poll's top and a direct call's apart, and the new window test misses none.
+- Measured (fat LTO; my build of f48abe5a is byte-identical to the agent's, and the base
+  fe601a3c's to its base). Graph against the splice: Box2D at 200 runs +0.60% -> -0.05% (the
+  agent's), at 5 runs -0.10% -> -0.24% (mine: merge-check/counts-a1.out and
+  counts-a1-graph.out); a getter read from an inlined frame 1,011 -> 383 instructions an
+  iteration, the splice's 362 (the node's switch is the 21). The rest of graph against the
+  splice as step 3c left it (Djot -0.97%, Vue -0.48%, Mandreel -0.32%, Earley-Boyer -0.27%,
+  PdfJS -0.24%; GBEMU +1.86%, R7). At the default against fe601a3c: the tier on within 0.06%
+  everywhere; the tier off within 0.03% but Earley-Boyer -0.20% and TypeScript +0.22%, counted
+  beside the gate's load (the collecting benchmarks' counts move with it, as recorded above;
+  the agent's quiet count of Earley-Boyer with incremental marking off: +0.0004%).
+- Vue's plain reads from inlined frames pay the stub's probes, 37 instructions a call, as
+  template code and a spliced callee's do; removing them needs a per-site fact the stub can
+  skip on, which changes how stubs are keyed: not built.
+- Tests: 5 new and step 3c's window test moved onto the new hook (a getter, a setter and a
+  trap from inlined GetPropThis, SetPropThisDrop, GetPropLocal, SetPropLocalDrop and GetProp:
+  positions, f.caller and stacks as the tier off's, also past the direct calls' depth, where
+  every sequence declines; throws caught by the caller's handler and by none; the [[Get]]
+  invariant's error after a trap; exits forced every 7; the poison; collections at every
+  allocation inside the accessors; accessors replaced and recompiled while called directly),
+  each comparing the tier off, the splice and graph, with a test-only count of the variant's
+  direct calls (none with the tier off or at the splice); 10 mutations, each caught; GC
+  stress over the six tests; difftest (the corpus grown by 4 programs) and the fixtures in ten
+  configurations; the whole library suite (3,482) with the tier off and at graph eager, none
+  failing, and with the tier on one failure, the known rare cross-realm test (5 of 5 alone);
+  the verifier sweep (mine on the landed binary: 42 runs at the splice and at graph, none
+  refused); fmt and clippy; zombie's check, clippy, Windows' check and suite (2,888).
+- Found in piece B's work in progress by a probe of the coordinator's (not on main; target/p3/
+  stage3/step3c2-review/b1-probe): an inlined frame's call node leaves its published site in
+  Interp::call_site while a callee entered by the direct sequence runs, so an error the
+  callee's own operation raises names the inlined function above the callee. The same rule as
+  the accessors': the site is consumed while a frame the template pushed directly runs. With
+  the agent, inside piece B.
+- Beside it (6383ebda, tests only): the other four creation tests that assert the tier's code
+  creates run alone in a child process, as 43b415d7's three; one had failed once in lowerings
+  L1b's suite with forced exits (the process-wide creation epoch).
