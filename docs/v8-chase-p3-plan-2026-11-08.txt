@@ -5351,3 +5351,53 @@ to the splice in the landed commit; at graph forced that one and the 30 ms deadl
 (recorded with piece B2); its two poison configurations were still running. Step 4p's rule 5
 at 200 runs, counted since its record: TypeScript's discards 189 -> 161 at the splice and 184
 -> 157 at graph (exits 44,161 -> 37,145), DeltaBlue's unchanged.
+
+Stage 3 step 4p, rule 2 landed (ae360f6a, d1b6ae23, 2026-11-15; target/p3/stage3/step4p-impl,
+rule2b-evidence.txt and rule2b-results.txt): under graph inlining a first stage the tier compiled
+in place makes no bytecode recompile for its stale chains. The design's risk R7 is closed: GBEMU
+at graph is under the splice at every measure.
+- (a) The stale-chain request of such a function makes its armed warm-up's checkpoint due at
+  that entry (the tier's own reoptimization, the first compile's ways kept, the settled rule
+  applying), where it made a bytecode recompile with a fresh plan of splices. Alone it took
+  GBEMU's 200-run gap (+1.23% -> -0.04% against the splice) and cost it at 5 runs (+0.62% ->
+  +2.37%): the settled rule then waits at checkpoints 2 to 4 for the property sites the
+  stale chains' bails are teaching (37, 5 and 4 of them changing), and meanwhile the fallback's
+  template code runs its five stale chains on every pass (1.06M helper-reached operations
+  against 60K).
+- (b) So the function gives its property chains up at the request, as the chain recompile's
+  own new chunk builds none: it is marked to build no chain, its record of chains cleared and
+  its replay count reset (the request is not made again); the slot's resident template code,
+  which a warm-up runs, is compiled again without chains and the old one retired until no
+  activation runs it; the kept fallback is discarded, so the next discard compiles one
+  without chains; the borrowed-frame code is discarded, so the next loop transfer compiles
+  one (an activation in flight finishes in the code it holds). The exemplars' baseline code
+  keeps no state that a later shape makes stale at its site (Sparkplug calls the LoadIC
+  builtin with the site's slot, baseline-compiler.cc:1071-1083; JSC's baseline cache repatches
+  at a miss and, giving up, to the slow-path call, Repatch.cpp:754-786). The request fires for
+  two functions of GBEMU and nowhere else in the workloads; executeIteration's five chains are
+  exactly the five that bailed on almost every pass, so it gives up none that worked; its
+  template compile is 0.8 ms on the main thread (the chain recompile it replaces made 0.14 ms
+  of bytecode recompile and a tier compile). With the tier off, removing every property chain
+  everywhere costs 0.06% in the geomean (Richards +0.63%, GBEMU +0.78%): the bound on what a
+  function gives up.
+- Measured (fat LTO). GBEMU at graph against the splice, instructions at 5 runs +0.66% ->
+  -0.79% and cycles +1.26% -> -1.08% (mine, five alternating rounds on one X925 core,
+  merge-check/cycles-4r2.out; the agent's -0.78% and -1.47%); at 200 runs +1.25% -> -0.15%
+  (the agent's); Octane's timed GBEMU score at graph 1.8% above the splice's where it was 0.9%
+  below (the agent's five rounds on two X925 cores, clocks recorded). The splice unchanged
+  (its path is not touched: my recount within 0.05% but Vue's fixture +0.12% at both modes,
+  the binary's); nothing else at graph beyond its spread. Graph against the splice over
+  Octane at 5 runs now -0.31% in the geomean (my recount, counts-4r2.out and
+  counts-4r2-graph.out), no benchmark above +0.17% (TypeScript, inside its modes) and React's
+  steady state the one fixture above zero (+0.30% instructions, -0.47% cycles).
+- Tests: six at graph, each also with forced exits and under the poison (the request in a
+  warm-up: template code compiled again, entry word and epoch moved, the old code retired
+  until nothing runs it; an activation running the old template code when the request comes
+  finishes in it; the kept fallback discarded and the next one without chains; the
+  borrowed-frame code discarded and the next loop transfer's without chains; an exited
+  activation running borrowed-frame code at the request finishes in it and the code is then
+  released; the splice's chain recompile as before); 13 mutations, each caught; the tier's
+  modules in six configurations on the agent's tree (630 tests each); the verifier sweep on
+  the landed binary (mine: 42 runs, none refused); clippy; zombie's check, clippy, Windows'
+  check and suite (2,891). The tier's modules on main with rules 1 and 5 (mine, 615 tests):
+  graph eager, forced and the default pass.
