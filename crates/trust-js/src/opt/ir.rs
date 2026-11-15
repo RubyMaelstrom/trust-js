@@ -217,12 +217,15 @@ pub(crate) enum Store {
 /// Why a check fails or an exit is taken, for the log, the exit profile (stage 2; keyed by the
 /// reason's discriminant, `opt::profile`) and tests.
 // Only the back end builds the reasons of exits on Booleans and of the forced-exit gate: where
-// the tier has none (x86-64 until the plan's stage 6), nothing builds those two.
+// the tier has none (x86-64 until the plan's stage 6), nothing but tests builds those two.
 #[cfg_attr(
-    not(all(
-        target_arch = "aarch64",
-        any(target_os = "macos", target_os = "linux", target_os = "windows")
-    )),
+    all(
+        not(test),
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))
+    ),
     expect(dead_code, reason = "the back end builds NotBoolean and Forced")
 )]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
