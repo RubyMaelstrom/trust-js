@@ -978,8 +978,10 @@ pub(crate) struct MovedCheck {
     pub(crate) sites: Vec<MovedSite>,
 }
 
-/// A check a moved check stands for: its operation's pc and frame, its reason, and whether its
-/// block runs whenever the loop is entered (`anyway`).
+/// A check a moved check stands for: its operation's pc and frame as that check's own exit record
+/// would have them (its frame state's pc and frame, from which a64.rs `exit` makes the record; the
+/// builder makes a check's state at the check's own pc, which a debug assertion holds), its
+/// reason, and whether its block runs whenever the loop is entered (`anyway`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MovedSite {
     pub(crate) pc: u32,

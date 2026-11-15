@@ -184,6 +184,36 @@ fn a_replaced_check_runs_whenever_its_loop_is_entered_only_before_the_loops_firs
     }
 }
 
+#[test]
+fn a_typed_arrays_entry_checks_class_each_of_its_sites_by_its_own_block() {
+    // Step 0c's checks of `x` stand for both of its reads: the condition's, which runs whenever
+    // the loop is entered, and the body's, which does not (blind).
+    for graph_inline in [false, true] {
+        let mut engine = tier_engine(graph_inline, 0);
+        eval(
+            &mut engine,
+            "var I = new Int32Array([4, 1, 2, 3, 4]);
+             function tc(a, x) { var s = 0; for (var i = 0; i < x[0]; i++) s = s + a * x[i + 1];
+               return s; }
+             for (var r = 0; r < 40; r++) tc(1.5, I);",
+        );
+        let (chunk, graph) = graph_of(&mut engine, "tc");
+        let reads = pcs_of(&chunk, |op| {
+            matches!(op, Op::GetElem | Op::GetElemLocal(..))
+        });
+        assert_eq!(reads.len(), 2, "{:?}", chunk.jit_ops());
+        let kinds = moved_sites(&graph, |op| matches!(op, NodeOp::CheckElements(_)));
+        assert_eq!(
+            kinds,
+            [
+                (reads[0], ExitReason::WrongElements, true),
+                (reads[1], ExitReason::WrongElements, false)
+            ],
+            "graph {graph_inline}"
+        );
+    }
+}
+
 // ---- the discard's flags ---------------------------------------------------------------------
 
 /// `call` in a loop of 14,000 rounds, `v` the warm-up's value for the first 1,500 and `then`'s

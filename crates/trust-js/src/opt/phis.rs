@@ -225,6 +225,8 @@ struct Selector<'g> {
     /// The moved checks made and the checks each stands for (P3 stage 3 step L1c), for
     /// `Graph::moved`.
     moved: Vec<(NodeIx, Vec<MovedSite>)>,
+    /// Whether a block runs whenever its loop is entered, by (header, block), once computed.
+    anyway: FastMap<(BlockIx, BlockIx), bool>,
 }
 
 impl<'g> Selector<'g> {
@@ -299,6 +301,7 @@ impl<'g> Selector<'g> {
             entry_states: FastMap::default(),
             speculated: FastMap::default(),
             moved: Vec::new(),
+            anyway: FastMap::default(),
         }
     }
 
@@ -662,17 +665,28 @@ impl<'g> Selector<'g> {
                 .expect("an edge into the predecessor's successor");
             self.keep_inputs(header);
             let state = self.entry_state(header, k);
-            // The checks each moved check stands for (step L1c), as built: their operations' pcs,
-            // frames and reasons, and whether each runs whenever the loop is entered.
-            let sites = |selector: &Self, checks: &[NodeIx]| -> Vec<MovedSite> {
+            // The checks each moved check stands for (step L1c), as built: the key each one's own
+            // exit would have (its frame state's pc and frame, as a64.rs `exit` makes the record),
+            // its reason, and whether it runs whenever the loop is entered.
+            let sites = |selector: &mut Self, checks: &[NodeIx]| -> Vec<MovedSite> {
                 let mut sites: Vec<MovedSite> = Vec::new();
                 for &check in checks {
                     let node = selector.graph.node(check);
+                    let state = selector
+                        .graph
+                        .state(node.state.expect("a check's frame state"));
+                    // The builder makes a check's state at the check's own pc (`Before`).
+                    debug_assert_eq!(
+                        (state.pc, state.frame),
+                        (node.pc, node.frame),
+                        "a replaced check's exit key is its node's"
+                    );
+                    let (pc, frame, block) = (state.pc, state.frame, node.block);
                     let site = MovedSite {
-                        pc: node.pc,
+                        pc,
                         reason: node.reason.expect("a check's reason"),
-                        frame: node.frame,
-                        anyway: selector.runs_whenever_entered(header, node.block),
+                        frame,
+                        anyway: selector.runs_anyway(header, block),
                     };
                     if !sites.contains(&site) {
                         sites.push(site);
@@ -811,40 +825,74 @@ impl<'g> Selector<'g> {
         true
     }
 
+    /// Whether a check in `block` of `header`'s loop runs whenever the loop is entered
+    /// ([`Selector::runs_whenever_entered`]), once per block.
+    fn runs_anyway(&mut self, header: BlockIx, block: BlockIx) -> bool {
+        if let Some(&anyway) = self.anyway.get(&(header, block)) {
+            return anyway;
+        }
+        let anyway = self.runs_whenever_entered(header, block);
+        self.anyway.insert((header, block), anyway);
+        anyway
+    }
+
     /// The sites step 0c's typed arrays' entry checks stand for (P3 stage 3 step L1c;
     /// `PhiNotes::typed_entry`): each check's own reason at each of its receiver's typed sites,
-    /// in the block of the site's node in the loop (a site the build pruned counts as blind).
+    /// keyed as the site's own check would exit (its pc in the loop's frame: the builder makes
+    /// it at the site's pc), in the block of the first node built at that pc in that frame inside
+    /// the loop (a site the build pruned counts as blind). One pass over the nodes for each loop
+    /// with such checks, and a block's class once, so that a loop of N typed sites costs about N
+    /// plus its nodes, not N times its nodes.
     fn typed_entry_sites(&mut self, typed: &[super::build::TypedEntry]) {
+        if typed.is_empty() {
+            return;
+        }
+        // The headers by (first pc, frame).
+        let mut headers: FastMap<(u32, FrameIx), BlockIx> = FastMap::default();
+        for b in 0..self.graph.blocks.len() {
+            let block = BlockIx(b as u32);
+            if self.graph.block(block).loop_header {
+                let key = (self.graph.block(block).first_pc, self.block_frame(block));
+                headers.entry(key).or_insert(block);
+            }
+        }
+        // Each loop's sites' first member blocks, by pc.
+        let mut found: FastMap<BlockIx, FastMap<u32, Option<BlockIx>>> = FastMap::default();
         for entry in typed {
-            let Some(header) = (0..self.graph.blocks.len())
-                .map(|b| BlockIx(b as u32))
-                .find(|&b| {
-                    let data = self.graph.block(b);
-                    data.loop_header
-                        && data.first_pc == entry.header_pc
-                        && self.block_frame(b) == entry.frame
-                })
-            else {
+            if let Some(&header) = headers.get(&(entry.header_pc, entry.frame)) {
+                let wanted = found.entry(header).or_default();
+                for &pc in &entry.pcs {
+                    wanted.entry(pc).or_insert(None);
+                }
+            }
+        }
+        for (&header, wanted) in &mut found {
+            let members = &self.loops[&header];
+            let frame = self.block_frame(header);
+            for node in &self.graph.nodes {
+                if node.frame != frame || !members.get(node.block.index()).copied().unwrap_or(false)
+                {
+                    continue;
+                }
+                if let Some(slot @ None) = wanted.get_mut(&node.pc) {
+                    *slot = Some(node.block);
+                }
+            }
+        }
+        for entry in typed {
+            let Some(&header) = headers.get(&(entry.header_pc, entry.frame)) else {
                 continue;
             };
-            let members = self.loops.get(&header).cloned().unwrap_or_default();
-            let mut sites: Vec<MovedSite> = Vec::new();
+            // A receiver's pcs are distinct (the loop prepass visits each operation once).
+            let mut sites: Vec<MovedSite> = Vec::with_capacity(entry.pcs.len());
             for &pc in &entry.pcs {
-                let block = self.graph.nodes.iter().find_map(|node| {
-                    (node.pc == pc
-                        && node.frame == entry.frame
-                        && members.get(node.block.index()).copied().unwrap_or(false))
-                    .then_some(node.block)
-                });
-                let site = MovedSite {
+                let block = found[&header][&pc];
+                sites.push(MovedSite {
                     pc,
                     reason: entry.reason,
                     frame: entry.frame,
-                    anyway: block.is_some_and(|block| self.runs_whenever_entered(header, block)),
-                };
-                if !sites.contains(&site) {
-                    sites.push(site);
-                }
+                    anyway: block.is_some_and(|block| self.runs_anyway(header, block)),
+                });
             }
             self.moved.push((entry.node, sites));
         }
