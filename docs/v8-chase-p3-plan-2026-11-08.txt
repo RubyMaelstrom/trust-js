@@ -5401,3 +5401,25 @@ at graph is under the splice at every measure.
   the landed binary (mine: 42 runs, none refused); clippy; zombie's check, clippy, Windows'
   check and suite (2,891). The tier's modules on main with rules 1 and 5 (mine, 615 tests):
   graph eager, forced and the default pass.
+
+Since the records above (2026-11-15):
+- Step L5's follow-up landed (e5bac176): the Generic rule's standing work in a compile is two
+  snapshot bits tested first (whether any pc holds Generic; whether any pc holds a reason whose
+  held exit could make a site Generic), the flags kept by frame state only under the second,
+  and the back end's pass over the exit records skipped where none was kept. Richards +0.070%
+  -> +0.026% and Djot's fixture +0.064% -> +0.020% against the main before L5 (my recounts,
+  merge-check/counts-l5.out and counts-l5b.out; the agent's +0.024% and +0.022%: about 2K
+  instructions a compile); the tier's code identical for every compile of TypeScript (1,519 of
+  1,519 at the default, 1,512 of 1,512 at graph, the agent's); the verifier sweep 42 of 42.
+- Step L1c's whole-suite matrix on its final tree (the agent's; 3,502 tests): the tier off; the
+  splice on, eager and forced; graph eager and forced; eager under the poison: all pass; graph
+  on, one failure, the cross-realm splice test that a8a702ea fixed after that tree (5 of 20
+  alone there); the tier's tests under the poison on and forced, 529 each. GC stress over its
+  two modules with the tier off: 37 of 38 passed and the last still running after four hours
+  when this was written (the collector's marking and verifier under stress); the eager leg
+  follows.
+- The tier's and the back end's modules on main, mine (opt::, jit::opt_a64, the traced and
+  inline-context tests; 600 to 638 tests as the modules grew): after allocator R1 (graph eager,
+  forced, on), after step L4 with the typed-array and array-buffer tests (graph eager, forced,
+  on, off), after piece B2b (graph eager, graph forced, on), after step 4p's rules 1 and 5
+  (graph eager, forced, on, graph): all pass.
