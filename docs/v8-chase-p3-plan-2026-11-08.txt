@@ -5423,3 +5423,26 @@ Since the records above (2026-11-15):
   forced, on), after step L4 with the typed-array and array-buffer tests (graph eager, forced,
   on, off), after piece B2b (graph eager, graph forced, on), after step 4p's rules 1 and 5
   (graph eager, forced, on, graph): all pass.
+
+Step 4p's rule 4, the exit limit: not changed, the owner's (2026-11-15; target/p3/stage3/
+step4p-impl, r4-table.txt and its counts, cycles and timed files; measured on d1b6ae23 by
+TRUST_JS_OPT_EXIT_LIMIT, the warm-ups unchanged). The limit is JSC's 100 exits a code, doubling
+with each discard; SpiderMonkey's is 10; V8 discards at the first. The acceptance test set
+before measuring (at 200 runs nothing worse than +0.2% instructions at either mode, the 5-run
+geomean better at both) is passed by no limit:
+- 10 << R. Instructions against 100, splice / graph: at 5 runs the geomean -0.08% / -0.21%,
+  DeltaBlue -4.07% / -4.62%, Djot -1.26% / -1.32%, Box2D -0.73% / -0.76%, and against it
+  TypeScript +1.60% / +0.96%, PdfJS +1.29% / +1.44%, Crypto +0.90% / +0.56%, GBEMU +0.76% /
+  +0.57%, Djot's steady state +1.03% / +0.92% (codes kept today are discarded and pay their
+  warm-ups inside five runs); at 200 runs the geomean -0.07% / -0.17%, DeltaBlue -1.71% /
+  -1.63%, Crypto -0.48% / -0.53%, nothing worse than +0.13% at graph, but GBEMU +1.40% at the
+  splice (the splice's chain recompile planning afresh after the earlier discards; graph no
+  longer makes that recompile).
+- 25 << R: the 5-run geomean -0.09% / -0.15%; TypeScript +0.61% / +0.44% at 200 runs.
+- 50 << R: the 5-run geomean +0.11% / +0.06%; TypeScript +1.19% / +1.20% at 200 runs.
+- Cycles at 5 runs and Octane's timed scores, taken beside a load of 47 to 57: no move beyond
+  its rounds' spread; two signs agree with the instructions in every run, DeltaBlue faster
+  with 10 (score +2 to +3%) and PdfJS slower (-1.4 to -3.6%).
+The agent's recommendation: 10 << R at graph alone, decided when graph is the default, on the
+stage's quiet session (after nested frames and `new` from inlined frames, which change which
+plans compile in place). Until the owner says, 100 stays.
