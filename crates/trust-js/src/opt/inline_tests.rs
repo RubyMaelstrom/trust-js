@@ -3223,9 +3223,10 @@ fn a_callee_an_inlined_frame_calls_imports_against_its_own_script() {
 /// `InlineWay::graph_inlines`): `midN` calls a small leaf the plan inlines in turn, so `outerN`
 /// compiles in place with `leafy` a frame nested in `midN`'s (step 3d); `midX` calls `mkX`, which
 /// the plan inlines in turn and which makes a spread `new` (NewArgsArray, which no inlined frame
-/// makes: a plain `new` is a call node since step 3e), so `outerX`'s plan splices (a second stage,
-/// as at splice); `midP` calls a callee too large to plan, so `outerP` compiles in place at graph
-/// with `midP` inlined and its call a call node of the inlined frame.
+/// makes: a plain `new` is a call node since step 3e), so `outerX` compiles in place with `midX`
+/// inlined and its call of `mkX` a call node of `midX`'s frame (step 3e: a way the graph cannot
+/// take is a call of its frame); `midP` calls a callee too large to plan, so `outerP` compiles in
+/// place at graph with `midP` inlined and its call a call node of the inlined frame.
 const NESTED_RULE: &str = "
 function leafy(x) { return x + 1; }
 function midN(x) { return leafy(x) * 2; }
@@ -3306,7 +3307,7 @@ function outerP(n) { var s = 0; for (var i = 0; i < n; i++) s += midP(i); return
 var r = 0; for (var k = 0; k < 300; k++) r += outerN(10) + outerX(10) + outerP(10); r";
 
 #[test]
-fn a_way_whose_tree_makes_another_kind_of_call_keeps_its_plan_spliced() {
+fn a_way_the_graph_cannot_take_is_a_call_node_of_its_frame() {
     inlines();
     inlined_generic();
     TestSwitches::default().set();
@@ -3327,7 +3328,10 @@ fn a_way_whose_tree_makes_another_kind_of_call_keeps_its_plan_spliced() {
         !second_stage(&mut engine, "outerN"),
         "outerN compiles in place"
     );
-    assert!(second_stage(&mut engine, "outerX"), "outerX splices");
+    assert!(
+        !second_stage(&mut engine, "outerX"),
+        "outerX compiles in place, mkX a call node of midX's frame"
+    );
     assert!(
         !second_stage(&mut engine, "outerP"),
         "outerP compiles in place"
@@ -3338,6 +3342,125 @@ fn a_way_whose_tree_makes_another_kind_of_call_keeps_its_plan_spliced() {
     assert!(inlined_generic()
         .iter()
         .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+}
+
+/// The way `plan` holds for `callee` at any depth, if it holds one.
+fn planned_way<'a>(
+    plan: &'a crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>,
+    callee: &Rc<crate::ast::Function>,
+) -> Option<&'a crate::bytecode::InlineWay> {
+    plan.values()
+        .flat_map(|entry| entry.ways.iter())
+        .find_map(|way| {
+            if Rc::ptr_eq(&way.f, callee) {
+                Some(way)
+            } else {
+                planned_way(&way.nested, callee)
+            }
+        })
+}
+
+/// Option B's rule (P3 stage 3 step 3e, `InlineWay::graph_inlines`) for each kind of call an
+/// inlined frame does not make: `outerK` calls `midK`, which calls `mkK`, and `mkK` makes a
+/// spread call (`S`, Op::CallSpread), a spread method call (`T`, CallSpreadThis), a call whose
+/// spread is not its last argument (`A`, CallArgsArray) or a spread `new` (`N`, NewArgsArray). The
+/// planner plans `mkK` nested in `midK` (the AST splice remaps those operations), and the graph
+/// compiles `outerK` in place with `midK` an inlined frame and its call of `mkK` a call node of
+/// that frame, where step 3d's rule spliced the plan whole. A direct eval (`E`) and a strict tail
+/// call (`C`) need the callee's own context, so the planner plans no callee making one
+/// (`inline_capability`): no plan holds such a way, and `midE` and `midC` are inlined frames
+/// calling theirs.
+const OTHER_KINDS: &str = "
+function tgt(a, b) { return a * 3 + (b === undefined ? 0 : b); }
+var o = { k: 5, m: function (a) { return a + this.k; } };
+function Pt(x) { this.x = x; }
+function mkS(x) { return tgt(...[x]); }
+function mkT(x) { return o.m(...[x]); }
+function mkA(x) { return tgt(...[x], 1); }
+function mkN(x) { return new Pt(...[x]).x; }
+function mkE(x) { return eval('x * 7'); }
+function mkC(x) { 'use strict'; return tgt(x, 2); }
+function midS(x) { return mkS(x) * 2; }
+function midT(x) { return mkT(x) * 2; }
+function midA(x) { return mkA(x) * 2; }
+function midN(x) { return mkN(x) * 2; }
+function midE(x) { return mkE(x) * 2; }
+function midC(x) { return mkC(x) * 2; }
+function outerS(n) { var s = 0; for (var i = 0; i < n; i++) s += midS(i); return s; }
+function outerT(n) { var s = 0; for (var i = 0; i < n; i++) s += midT(i); return s; }
+function outerA(n) { var s = 0; for (var i = 0; i < n; i++) s += midA(i); return s; }
+function outerN(n) { var s = 0; for (var i = 0; i < n; i++) s += midN(i); return s; }
+function outerE(n) { var s = 0; for (var i = 0; i < n; i++) s += midE(i); return s; }
+function outerC(n) { var s = 0; for (var i = 0; i < n; i++) s += midC(i); return s; }
+var r = [0, 0, 0, 0, 0, 0];
+for (var k = 0; k < 300; k++) {
+  r[0] += outerS(10); r[1] += outerT(10); r[2] += outerA(10);
+  r[3] += outerN(10); r[4] += outerE(10); r[5] += outerC(10);
+}
+r.join()";
+
+#[test]
+fn a_nested_way_making_another_kind_of_call_is_a_call_node_of_its_frame() {
+    inlined_generic();
+    let runs = counted(OTHER_KINDS, 0, false, false);
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    assert_eq!(runs[2].0, runs[0].0, "graph");
+    nested_frames();
+    inlines();
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, OTHER_KINDS), runs[0].0);
+    assert_eq!(nested_frames(), 0, "no mkK is a frame nested in midK's");
+    // The oracle declines them (`Prep::way`): no way of an mkK reaches the builder, whose E0
+    // would decline it there.
+    let notes = inlines();
+    assert!(
+        !notes
+            .iter()
+            .any(|note| matches!(note.outcome, InlineOutcome::Declined { .. })),
+        "{notes:?}"
+    );
+    let generic = inlined_generic();
+    assert!(
+        generic
+            .iter()
+            .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))),
+        "a call node of an inlined frame: {generic:?}"
+    );
+    for kind in ["S", "T", "A", "N", "E", "C"] {
+        let (outer, realm) = function(&mut engine, &format!("outer{kind}"));
+        let chunk = first_stage(&outer);
+        let plan = crate::bytecode::plan_inlines(&chunk, &outer, realm, &engine.interp.global_env);
+        let (mid, _) = function(&mut engine, &format!("mid{kind}"));
+        let (mk, _) = function(&mut engine, &format!("mk{kind}"));
+        let mid_way = planned_way(&plan, &mid).expect("midK planned");
+        assert!(mid_way.graph_inlines(), "mid{kind} an inlined frame");
+        match planned_way(&mid_way.nested, &mk) {
+            Some(way) => {
+                assert!(matches!(kind, "S" | "T" | "A" | "N"), "mk{kind} is planned");
+                assert!(!way.graph_inlines(), "mk{kind} a call node of its frame");
+            }
+            None => assert!(matches!(kind, "E" | "C"), "mk{kind} is not planned"),
+        }
+        assert!(
+            super::in_place(&chunk) && outer.runtime().code2.get().is_none_or(Option::is_none),
+            "outer{kind} compiles in place"
+        );
+    }
+    for (exit_every, stress, poison) in [
+        (7, false, false),
+        (1, false, false),
+        (0, true, false),
+        (0, false, true),
+    ] {
+        super::take_poison_faults();
+        let runs = counted(OTHER_KINDS, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
 }
 
 /// The helper paths of an inlined frame's call node (P3 stage 3 step 3c-2, piece B2): its call

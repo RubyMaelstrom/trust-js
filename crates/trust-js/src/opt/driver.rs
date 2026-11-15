@@ -1214,12 +1214,11 @@ fn log_inlines(chunk: &Chunk, inlines: &[super::build::InlineNote], held: &super
     }
 }
 
-/// Under TRUST_JS_OPT_INLINE=graph, a plan a way of which the graph does not take
+/// Under TRUST_JS_OPT_INLINE=graph, a plan a way of whose own sites the graph does not take
 /// (`InlineWay::graph_inlines`) splices as before (P3 stage 3, steps 2 and 3c-2): its line under
-/// TRUST_JS_OPT_LOG, `[opt] spliced <name>: a way's callee calls (<ways not taken>: nested <n>,
-/// other calls <n>, spliced callee <n>; calls <op kinds and counts of their callees>)`, for the
-/// census; `nested` counts a way making plain calls only a way nested in which (at any depth)
-/// makes another kind of call (step 3d).
+/// TRUST_JS_OPT_LOG, `[opt] spliced <name>: a way's callee calls (<ways not taken>: other calls
+/// <n>, spliced callee <n>; calls <op kinds and counts of their callees>)`, for the census. A way
+/// nested in a taken way is never a reason (step 3e: the graph makes it a call node).
 pub(crate) fn note_spliced(
     chunk: &Chunk,
     plan: &crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>,
@@ -1227,7 +1226,7 @@ pub(crate) fn note_spliced(
     if !log_enabled() {
         return;
     }
-    let (mut ways, mut nested, mut other, mut spliced) = (0, 0, 0, 0);
+    let (mut ways, mut other, mut spliced) = (0, 0, 0);
     let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
     for way in plan.values().flat_map(|entry| entry.ways.iter()) {
         if way.graph_inlines() {
@@ -1240,12 +1239,8 @@ pub(crate) fn note_spliced(
             .is_some_and(|callee| !callee.inline_sites_empty());
         if spliced_callee {
             spliced += 1;
-        } else if !way.plain_calls() {
-            other += 1;
         } else {
-            // A callee making plain calls only, a way the plan nests in which makes another kind
-            // of call, at any depth (`InlineWay::graph_inlines`, step 3d).
-            nested += 1;
+            other += 1;
         }
         for op in callee.iter().flat_map(|callee| callee.jit_ops().iter()) {
             use crate::bytecode::Op;
@@ -1265,8 +1260,8 @@ pub(crate) fn note_spliced(
     }
     let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{k} {n}")).collect();
     log_line!(
-        "[opt] spliced {}: a way's callee calls ({ways} ways not taken: nested {nested}, other \
-         calls {other}, spliced callee {spliced}; calls {})",
+        "[opt] spliced {}: a way's callee calls ({ways} ways not taken: other calls {other}, \
+         spliced callee {spliced}; calls {})",
         name(chunk),
         kinds.join(", ")
     );
