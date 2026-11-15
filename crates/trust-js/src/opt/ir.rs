@@ -307,8 +307,57 @@ pub(crate) enum ExitReason {
     /// Its own exit, not the moved check's: the flag keeps the loop's entry checks moved. Not
     /// kind-bound: a buffer's state, as Detached is.
     ObservedBuffer,
+    /// No exit: the second-level flag (P3 stage 3 step L5). A discard adds it at a site one of
+    /// whose exits had a reason its code's own snapshot already held flagged there with the same
+    /// data (`ExitRecord::held`): the form that flag left at the site (the one it built, or the
+    /// one it left as it was) exits for the reason the flag was to end. The builder then takes
+    /// the operation's generic form at the site before any reason's decline, whatever the
+    /// lowering (`Builder::generic_declined`), as JSC's ArrayMode::refine ends its ladder at
+    /// Generic (dfg/DFGArrayMode.cpp:202-222, 262-269, 299-327) and V8's and SpiderMonkey's ICs
+    /// end megamorphic or generic, which their compilers lower with no guard to fail. Kind-bound
+    /// (snapshot.rs `kind_bound`): the context's whose code kept exiting.
+    Generic,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
+}
+
+impl ExitReason {
+    /// Whether an exit of this reason whose flag its code already held makes its site Generic
+    /// (P3 stage 3 step L5): an operation's own exits. Not throws and unsupported operations
+    /// (never flagged), forced exits, a never-ran block's (its flag builds the block, which then
+    /// raises it no more), the exits keyed at a loop header (HoistingFailed, PhiNotNumber,
+    /// PhiNotInt32, ObservedBuffer: the header's operation is not theirs, and each flag ends what
+    /// raised it: the checks stay in the loop, the phis go tagged or f64, the protector makes
+    /// the stores test their own buffers), and WrongCallee, whose guards' ways the policy keeps
+    /// (step 4p's rule 5: a reoptimization takes the first compile's ways).
+    pub(crate) fn generic_eligible(self) -> bool {
+        !matches!(
+            self,
+            ExitReason::Throw
+                | ExitReason::Unsupported
+                | ExitReason::Forced
+                | ExitReason::NeverRan
+                | ExitReason::HoistingFailed
+                | ExitReason::PhiNotNumber
+                | ExitReason::PhiNotInt32
+                | ExitReason::ObservedBuffer
+                | ExitReason::WrongCallee
+                | ExitReason::Generic
+        )
+    }
+
+    /// Whether `data`, an exit's profile byte (`driver::flag`'s: a shape check's ways, a free
+    /// name's proof, a truncation's mark), leaves the flag `held` (the byte the snapshot read at
+    /// the site) as it is: a flag whose data the exit would change did change the build (more
+    /// shapes, another proof, the truncation's decline). Every other reason's flag carries none.
+    pub(crate) fn data_unchanged(self, held: u8, data: u8) -> bool {
+        match self {
+            ExitReason::WrongShape => data <= held,
+            ExitReason::WrongName => data == held,
+            ExitReason::NotNumber => data & !held == 0,
+            _ => true,
+        }
+    }
 }
 
 /// The exit profile's byte for a NotNumber exit that a TruncateNumberOrOddball took (a String,
@@ -1025,6 +1074,10 @@ pub(crate) struct Graph {
     /// The checks moved to loops' entry edges and the checks each stands for (P3 stage 3 step
     /// L1c), by node, ascending.
     pub(crate) moved: Vec<MovedCheck>,
+    /// The exit profile's flags the snapshots held at each frame state's site (P3 stage 3 step
+    /// L5): (frame, pc) -> (reasons, data byte), from the frame's snapshot as the builder read it,
+    /// so that an exit record knows whether its own reason was already flagged there.
+    pub(crate) held: crate::fasthash::FastMap<(FrameIx, u32), (u32, u8)>,
 }
 
 impl Graph {

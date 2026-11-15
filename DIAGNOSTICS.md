@@ -98,7 +98,13 @@ comment/example in the same change.
   header); at a bitwise operation whose record
   holds undefined, null or Booleans, a NotNumber flag declines the operation only once its
   truncation of them exited (a Number check's exits there were oddballs the VM recorded, which
-  the truncation takes). A code whose exited frames loop is
+  the truncation takes). An exit whose own reason the exiting code's compile had already flagged
+  at its site with the same data (a shape check's ways no more than the flag's, a free name's
+  proof, a truncation's mark) shows the form that flag left exits for its reason too: the
+  discard flags the site Generic as well, and the recompile builds the operation's generic form there before any
+  other decline (`Generic: the generic operation`; not for throws, unsupported operations,
+  forced exits, NeverRan, WrongCallee or the exits kept at a loop's header). A code whose
+  exited frames loop is
   discarded sooner, as JSC's from its baseline loop: once its exits reach 5 << R (never more
   than its limit), each exit that does not discard starts a warm-up of its chunk's template loop
   iterations (100 << R invocations' worth, a discard's warm-up's first distance) that entries do

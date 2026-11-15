@@ -2036,7 +2036,16 @@ pub(crate) fn discard(i: &mut Interp, chunk: &Chunk, table: &ExitTable, limit: L
             }
             match table.moved_sites(index) {
                 Some(sites) => flag_moved(chunk, table, exit, sites),
-                None => flag(chunk, exit, super::exit::exit_chunk(table, exit)),
+                None => {
+                    let inlined = super::exit::exit_chunk(table, exit);
+                    flag(chunk, exit, inlined);
+                    // The code's snapshot held this flag and the exit came anyway: the form the
+                    // flag left exits for its reason too, so the site goes generic (P3 stage 3
+                    // step L5).
+                    if exit.held && exit.reason.generic_eligible() {
+                        flag_as(chunk, exit, inlined, ExitReason::Generic);
+                    }
+                }
             }
         }
     }
@@ -2154,24 +2163,33 @@ fn flag_moved(
                 None => (chunk, site.pc, false),
             },
         };
-        let new = ChunkProfile::of(at).add_site(pc, site.reason as u8, inlined, 0, false);
-        if new && log_enabled() {
-            let key = if std::ptr::eq(at, chunk) {
-                "own".to_string()
-            } else {
-                format!(
-                    "at {} pc {pc}{}",
-                    name(at),
-                    if inlined { " (spliced)" } else { "" }
-                )
-            };
-            log_line!(
-                "[opt] flag {} pc {} {:?} {key} (moved to pc {})",
-                name(chunk),
-                site.pc,
-                site.reason,
-                exit.pc
-            );
+        // A site whose own flag the code's snapshot held, which the moved check stood for
+        // anyway: the form that flag left exits for its reason too, so the site goes generic
+        // (P3 stage 3 step L5).
+        let generic = site.held && site.reason.generic_eligible();
+        for reason in [site.reason, ExitReason::Generic] {
+            if reason == ExitReason::Generic && !generic {
+                continue;
+            }
+            let new = ChunkProfile::of(at).add_site(pc, reason as u8, inlined, 0, false);
+            if new && log_enabled() {
+                let key = if std::ptr::eq(at, chunk) {
+                    "own".to_string()
+                } else {
+                    format!(
+                        "at {} pc {pc}{}",
+                        name(at),
+                        if inlined { " (spliced)" } else { "" }
+                    )
+                };
+                log_line!(
+                    "[opt] flag {} pc {} {:?} {key} (moved to pc {})",
+                    name(chunk),
+                    site.pc,
+                    reason,
+                    exit.pc
+                );
+            }
         }
     }
 }
@@ -2184,17 +2202,19 @@ fn flag_moved(
 /// (dfg/DFGOSRExitBase.cpp:38-60); a WrongShape site with the shapes its check expected, a
 /// NotNumber site with whether an oddball truncation exited. Logs each new site.
 fn flag(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>) {
-    let shapes = match exit.reason {
-        // The access's receiver shapes (a prototype's check keeps its access's).
-        ExitReason::WrongShape => exit.shape_check.as_ref().map_or(0, |check| check.ways),
-        // The proof's byte its check expected (stage 2, step 4).
-        ExitReason::WrongName => exit.proof,
-        // Whether a bitwise operation's oddball truncation took it (TRUNCATION_EXIT).
-        ExitReason::NotNumber => exit.proof,
-        // A graph-inlined site's guard's place in its chain + 1, the most a site keeps (P3
-        // stage 3, step 2); 0 for a splice's guard.
-        ExitReason::WrongCallee => exit.proof,
-        _ => 0,
+    flag_as(chunk, exit, inlined, exit.reason);
+}
+
+/// `flag`'s site flagged with `reason`: the exit's own, or Generic (P3 stage 3 step L5).
+fn flag_as(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>, reason: ExitReason) {
+    // The access's receiver shapes (a prototype's check keeps its access's), the proof's byte its
+    // check expected (stage 2, step 4), whether a bitwise operation's oddball truncation took it
+    // (TRUNCATION_EXIT), a graph-inlined site's guard's place in its chain + 1 (P3 stage 3, step
+    // 2; 0 for a splice's guard): `ExitRecord::profile_data`. A Generic flag keeps none.
+    let shapes = if reason == exit.reason {
+        exit.profile_data()
+    } else {
+        0
     };
     let (at, pc, inlined) = match inlined {
         Some(callee) => (callee, exit.pc, true),
@@ -2203,8 +2223,8 @@ fn flag(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>) {
             None => (chunk, exit.pc, false),
         },
     };
-    let latest = exit.reason == ExitReason::WrongName;
-    let new = ChunkProfile::of(at).add_site(pc, exit.reason as u8, inlined, shapes, latest);
+    let latest = reason == ExitReason::WrongName;
+    let new = ChunkProfile::of(at).add_site(pc, reason as u8, inlined, shapes, latest);
     if new && log_enabled() {
         let key = if std::ptr::eq(at, chunk) {
             "own".to_string()
@@ -2219,7 +2239,7 @@ fn flag(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>) {
             "[opt] flag {} pc {} {:?} {key}",
             name(chunk),
             exit.pc,
-            exit.reason
+            reason
         );
     }
 }

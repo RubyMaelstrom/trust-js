@@ -1242,6 +1242,32 @@ impl<'a> Gen<'a> {
             .map(|&offset| offset as usize / 4)
             .collect();
         skip_unused_callee_saved_fp(&mut words, &fp_saves, fp_callee_saved);
+        // Whether each record's reason was already flagged at its site with its data (P3 stage 3
+        // step L5): its frame's snapshot's flags, which the builder kept by frame state.
+        let frame_of = |recipe: u16| {
+            if recipe == 0 {
+                return FrameIx::COMPILED;
+            }
+            let k = self
+                .frame_index
+                .iter()
+                .position(|&index| index == Some(recipe))
+                .expect("a recipe's frame");
+            FrameIx(k as u32 + 1)
+        };
+        for (_, _, record) in &mut self.exits {
+            if record.kind != ExitKind::Check {
+                continue;
+            }
+            record.held = self
+                .graph
+                .held
+                .get(&(frame_of(record.frame), record.pc))
+                .is_some_and(|&(reasons, byte)| {
+                    reasons & (1 << record.reason as u32) != 0
+                        && record.reason.data_unchanged(byte, record.profile_data())
+                });
+        }
         let mut exits: Vec<(u32, ExitRecord)> = offsets[1..1 + n_exits]
             .iter()
             .copied()
@@ -1894,6 +1920,7 @@ impl Gen<'_> {
             proof,
             count: Cell::new(0),
             frame,
+            held: false,
         };
         // A moved check's exit keeps the checks it stands for (P3 stage 3 step L1c), each in its
         // chunk: the code's own, or the inlined chunk its frame runs.
@@ -1909,6 +1936,13 @@ impl Gen<'_> {
                             .map_or(crate::opt::exit::OWN_CHUNK, |inlined| inlined.chunk),
                         reason: site.reason,
                         anyway: site.anyway,
+                        // A replaced check's exit carries no data (its reasons' bytes are 0).
+                        held: graph.held.get(&(site.frame, site.pc)).is_some_and(
+                            |&(reasons, byte)| {
+                                reasons & (1 << site.reason as u32) != 0
+                                    && site.reason.data_unchanged(byte, 0)
+                            },
+                        ),
                     })
                     .collect();
                 self.moved_exits.push((self.exits.len(), sites));
@@ -2028,6 +2062,7 @@ impl Gen<'_> {
             proof: 0,
             count: Cell::new(0),
             frame,
+            held: false,
         };
         let site = self.a.new_label();
         let ret = self.a.new_label();

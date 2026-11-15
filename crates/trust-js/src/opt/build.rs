@@ -839,11 +839,15 @@ impl Rules<'_> {
     }
 
     /// Whether the operation at `pc` lowers without an effect whatever its operands' facts (the
-    /// loop prepass's question).
+    /// loop prepass's question). Not at a site the Generic flag sends to its generic form (P3
+    /// stage 3 step L5): that is an effect, for its loop too.
     fn lowers(&self, pc: usize) -> bool {
         let snapshot = self.snapshot;
         let flagged =
             |reasons: &[ExitReason]| reasons.iter().any(|&reason| snapshot.declines(pc, reason));
+        if has_generic_form(&self.ops[pc]) && flagged(&[ExitReason::Generic]) {
+            return false;
+        }
         match self.ops[pc] {
             Op::Const(k) => const_word(self.chunk, k).is_some(),
             Op::LoadLocal(_) => self.initialized.contains(pc),
@@ -1137,6 +1141,50 @@ impl Rules<'_> {
         self.snapshot.declines(pc, ExitReason::WrongShape)
             && shapes.len() <= self.snapshot.discarded_ways(pc)
     }
+}
+
+/// Whether the tier builds the operation `op` as a generic node or an effect where the Generic
+/// flag names its site (P3 stage 3 step L5): every operation the tier may lower with a
+/// speculation of its own, but control flow and handlers (a branch's NotBoolean flag takes
+/// ToBoolean, a terminator has no generic node), the stack's and the frame's own operations,
+/// which raise nothing, and calls, whose guards' WrongCallee is the policy's (step 4p) and whose
+/// inlined callees' sites are keyed in the callees. Such an operation keeps its lowering, and its
+/// reasons' own flags; the Generic flag never makes a function uncompilable.
+fn has_generic_form(op: &Op) -> bool {
+    !matches!(
+        op,
+        Op::Const(_)
+            | Op::LoadLocal(_)
+            | Op::TypeofIs(..)
+            | Op::Call(..)
+            | Op::CallWithThis(..)
+            | Op::Undef
+            | Op::Dup
+            | Op::Dup2
+            | Op::Pop
+            | Op::StoreLocal(_)
+            | Op::Tdz(_)
+            | Op::ResetSlots(..)
+            | Op::LoadThis
+            | Op::Void
+            | Op::Not
+            | Op::Jump(_)
+            | Op::JumpIfFalse(_)
+            | Op::JumpIfFalsePeek(_)
+            | Op::JumpIfTruePeek(_)
+            | Op::JumpIfNotNullishPeek(_)
+            | Op::InlineGuard(..)
+            | Op::PushHandler(_)
+            | Op::PushIterator(..)
+            | Op::PopHandler
+            | Op::Return
+            | Op::ReturnBare
+            | Op::ReturnUndef
+            | Op::Throw
+            | Op::TailCall(..)
+            | Op::IterAbortL(_)
+            | Op::IterAbortIfNotDoneL(..)
+    )
 }
 
 /// Whether `op`, where the tier does not lower it, runs as a canonical-frame effect (NodeOp::Effect)
@@ -2241,6 +2289,19 @@ impl<'a> Builder<'a> {
         true
     }
 
+    /// Whether the Generic flag sends the operation at `pc` to its generic form (P3 stage 3 step
+    /// L5): a site where the form a reason's flag left exited for that reason again. Not an
+    /// operation without a generic form (`has_generic_form`) or a stack effect, nor, in an
+    /// inlined frame, one that needs the whole frame (the inliner declines such a callee: the
+    /// flag would refuse the compile).
+    fn generic_declined(&mut self, pc: usize) -> bool {
+        let op = &self.ops[pc];
+        has_generic_form(op)
+            && (self.frame.is_compiled() || !canonical(op))
+            && self.chunk.jit_stack_effect(pc).is_some()
+            && self.declined(pc, ExitReason::Generic, "the generic operation")
+    }
+
     /// Whether the block's named and call sites hold some and none of them ran.
     fn never_ran(&self, start: usize, end: usize) -> bool {
         never_ran(self.snapshot, start, end)
@@ -2351,6 +2412,11 @@ impl<'a> Builder<'a> {
                 }
             })
             .collect();
+        // The flags the frame's snapshot holds at the state's site, which an exit there compares
+        // its own reason with (P3 stage 3 step L5, `ExitRecord::held`).
+        if let Some(entry) = self.snapshot.declined_entry(pc) {
+            self.graph.held.insert((self.frame, pc as u32), entry);
+        }
         self.graph.add_state(FrameState {
             pc: pc as u32,
             slots,
@@ -3521,9 +3587,15 @@ impl<'a> Builder<'a> {
 
     // ---- operations ----------------------------------------------------------------------------
 
-    /// Lower the operation at `pc`; false when it ended the block.
+    /// Lower the operation at `pc`; false when it ended the block. A site the Generic flag names
+    /// takes the operation's generic form first, whatever its lowering would read (P3 stage 3
+    /// step L5).
     fn op(&mut self, pc: usize, st: &mut State) -> Result<bool, Refusal> {
         let op = self.ops[pc];
+        if self.generic_declined(pc) {
+            self.effect(pc, st)?;
+            return Ok(!std::mem::take(&mut self.ended));
+        }
         match op {
             Op::Const(k) => match const_word(self.chunk, k) {
                 Some(word) => {

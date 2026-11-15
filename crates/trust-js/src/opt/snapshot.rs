@@ -106,7 +106,7 @@ const MAX_CREATION_LEVELS: usize = 8;
 
 // Every reason has its bit in a declined mask: the discriminants run from 0 to the last reason's
 // (ExitReason's last variant), which the mask's width bounds.
-const _: () = assert!((ExitReason::ObservedBuffer as u32) < u32::BITS);
+const _: () = assert!((ExitReason::Generic as u32) < u32::BITS);
 
 /// Where a free-name read's search starts (stage 2, step 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -433,6 +433,14 @@ impl Snapshot {
             .is_some_and(|&(reasons, _)| reasons & bit(reason) != 0)
     }
 
+    /// The flags at `pc` (reasons, data byte), where it has any (P3 stage 3 step L5).
+    pub(crate) fn declined_entry(&self, pc: usize) -> Option<(u32, u8)> {
+        self.declined
+            .get(pc)
+            .copied()
+            .filter(|&(reasons, _)| reasons != 0)
+    }
+
     /// The most shapes a discarded check at `pc` expected, where WrongShape is flagged there.
     pub(crate) fn discarded_ways(&self, pc: usize) -> usize {
         self.declined
@@ -520,11 +528,15 @@ fn bit(reason: ExitReason) -> u32 {
 
 /// Whether a reason's sites apply only where the inline kind matches: a named access's shapes,
 /// a call's callees and a free name's proof are a site's in its context, as an IC status is,
-/// where a value's type, a binding's TDZ or a block's coverage is the operation's anywhere.
+/// where a value's type, a binding's TDZ or a block's coverage is the operation's anywhere. The
+/// Generic flag too (P3 stage 3 step L5): what the operation met in the context whose code kept
+/// exiting there, as a megamorphic IC's state is the site's, so that a callee inlined where its
+/// site went generic keeps its own speculation when it is compiled for itself.
 fn kind_bound(reason: u8) -> bool {
     reason == ExitReason::WrongShape as u8
         || reason == ExitReason::WrongCallee as u8
         || reason == ExitReason::WrongName as u8
+        || reason == ExitReason::Generic as u8
 }
 
 /// The exit profile's declined reasons per pc of `chunk` (see the module's doc): empty unless the

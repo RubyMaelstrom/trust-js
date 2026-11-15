@@ -107,6 +107,11 @@ pub(crate) struct ExitRecord {
     /// frame's, [`ExitTable::frames`]`[frame - 1]`, whose recipe and its parents' rebuild the
     /// frames below it. In the record's padding: a record is no larger than before.
     pub(crate) frame: u16,
+    /// The code's snapshot already held this record's reason flagged at its site with the data
+    /// the exit carries (P3 stage 3 step L5, `ExitReason::data_unchanged`): an exit here means the
+    /// form that flag left exits for its reason too, and the discard adds the site's Generic
+    /// flag. In the record's padding.
+    pub(crate) held: bool,
 }
 
 /// An inlined frame's part of the exits through it (P3 stage 3, step 1), kept once in the table
@@ -154,6 +159,9 @@ pub(crate) struct MovedSite {
     pub(crate) chunk: u32,
     pub(crate) reason: ExitReason,
     pub(crate) anyway: bool,
+    /// The site's own reason was already flagged at it in the code's snapshot (P3 stage 3 step
+    /// L5): the moved check's exit then makes the site Generic, as an exit there would.
+    pub(crate) held: bool,
 }
 
 /// [`MovedSite::chunk`] of a site of the compiled function's own frame.
@@ -242,6 +250,19 @@ impl ExitTable {
     /// Inlined frame `frame`'s recipe (`frame` > 0).
     fn frame(&self, frame: u16) -> &FrameRecipe {
         &self.frames[usize::from(frame) - 1]
+    }
+}
+
+impl ExitRecord {
+    /// The data byte the exit profile keeps with this exit's flag (`driver::flag`): a WrongShape
+    /// exit's expected shapes, a WrongName exit's proof, a NotNumber exit's truncation mark, a
+    /// WrongCallee exit's guard place; 0 for every other reason.
+    pub(crate) fn profile_data(&self) -> u8 {
+        match self.reason {
+            ExitReason::WrongShape => self.shape_check.as_ref().map_or(0, |check| check.ways),
+            ExitReason::WrongName | ExitReason::NotNumber | ExitReason::WrongCallee => self.proof,
+            _ => 0,
+        }
     }
 }
 
