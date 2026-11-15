@@ -280,7 +280,11 @@ mod off {
         false
     }
 
-    pub(crate) fn note_spliced(_: &Chunk) {}
+    pub(crate) fn note_spliced(
+        _: &Chunk,
+        _: &crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>,
+    ) {
+    }
 
     pub(crate) fn graph_refused(_: &Chunk) -> bool {
         false

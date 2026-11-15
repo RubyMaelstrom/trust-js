@@ -2669,6 +2669,31 @@ pub(crate) fn helper_table() -> [usize; N_HELPERS] {
     ]
 }
 
+/// The helper table an inlined frame's call node runs its template with (P3 stage 3 step 3c-2;
+/// x21 for the node's template, `opt::a64`'s `lower_inlined_generic`): [`helper_table`]'s, but
+/// the call helpers (the six that publish an explicit call's position: H_EXEC, H_CALL, H_CALL_HIT,
+/// H_INTRINSIC, H_NEW, H_CALL_SPREAD) take the call's position from `Interp::call_site`, the
+/// call's inline site the node published, where the template's own take the running chunk's
+/// (`bytecode::call_op_position`), the callee chunk's plain position, which names no inlined
+/// frame. Process-wide: function addresses only.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn inlined_call_helpers() -> &'static [usize; N_HELPERS] {
+    static TABLE: std::sync::OnceLock<[usize; N_HELPERS]> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut table = helper_table();
+        table[H_EXEC] = crate::bytecode::jit_exec_inlined as *const () as usize;
+        table[H_CALL] = crate::bytecode::jit_call_inlined as *const () as usize;
+        table[H_CALL_HIT] = crate::bytecode::jit_call_hit_inlined as *const () as usize;
+        table[H_INTRINSIC] = crate::bytecode::jit_intrinsic_inlined as *const () as usize;
+        table[H_NEW] = crate::bytecode::jit_new_inlined as *const () as usize;
+        table[H_CALL_SPREAD] = crate::bytecode::jit_call_spread_inlined as *const () as usize;
+        table
+    })
+}
+
 /// Helper table indices (multiplied by 8 in the emitted `ldr`).
 pub const H_EXEC: usize = 0;
 pub const H_COND: usize = 1;
@@ -3395,6 +3420,10 @@ mod asm {
         /// (`AccessorSlot::position`), which names no inline copy of the callee's chunk. Clear
         /// everywhere else, so template code is unchanged.
         inlined_frame_helpers: bool,
+        /// The implicit inline site the optimizing tier's node publishes for the inlined frame
+        /// whose template is being emitted (`inlined_frame_helpers`; NO_POSITION elsewhere): a
+        /// call template publishes it again after its call (P3 stage 3 step 3c-2).
+        inlined_frame_site: u32,
     }
 
     #[derive(Clone, Copy)]
@@ -3447,6 +3476,7 @@ mod asm {
                 loop_weights: Vec::new(),
                 element_records: Vec::new(),
                 inlined_frame_helpers: false,
+                inlined_frame_site: crate::stack_trace::NO_POSITION,
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3605,6 +3635,14 @@ mod asm {
         /// `inlined_frame_helpers` field); returns the previous setting.
         pub(crate) fn set_inlined_frame_helpers(&mut self, on: bool) -> bool {
             std::mem::replace(&mut self.inlined_frame_helpers, on)
+        }
+        /// Set the inlined frame's implicit inline site (see the `inlined_frame_site` field);
+        /// returns the previous one.
+        pub(crate) fn set_inlined_frame_site(&mut self, site: u32) -> u32 {
+            std::mem::replace(&mut self.inlined_frame_site, site)
+        }
+        pub(crate) fn inlined_frame_site(&self) -> u32 {
+            self.inlined_frame_site
         }
         pub(crate) fn inlined_frame_helpers(&self) -> bool {
             self.inlined_frame_helpers
@@ -9191,6 +9229,52 @@ thread_local! {
     static ANY_POLL_LIMIT: Cell<bool> = const { Cell::new(false) };
 }
 
+/// Arm [`END_POLL_LIMIT`] for the end poll after the next completed call of a template emitted
+/// with the call hook (tests, `set_call_done_hook`): state 4, which only a call's note takes
+/// (`any`: the next poll of any kind).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn arm_call_end_poll_limit(any: bool) {
+    arm_call_end_poll_limit_at(1, any);
+}
+
+/// [`arm_call_end_poll_limit`] for the `nth` completed call from now (tests).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn arm_call_end_poll_limit_at(nth: u32, any: bool) {
+    END_POLL_LIMIT.with(|state| state.set(4));
+    ANY_POLL_LIMIT.with(|flag| flag.set(any));
+    CALLS_TO_LIMIT.with(|count| count.set(nth));
+}
+
+/// A call of a template emitted with the call hook completed (tests): an armed call request falls
+/// due at the call's end poll (see [`note_direct_accessor_returned`]).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+extern "C" fn note_call_done(ctx: *mut JitCtx) {
+    END_POLL_LIMIT.with(|state| {
+        let due = state.get() == 4
+            && CALLS_TO_LIMIT.with(|count| {
+                count.set(count.get().saturating_sub(1));
+                count.get() == 0
+            });
+        if due {
+            state.set(2);
+            // SAFETY: the live context of the code that made the call.
+            unsafe { (*(*ctx).interp).poll.request_install() };
+        }
+    });
+}
+
 /// Arm [`END_POLL_LIMIT`] (tests): the end poll after the next direct getter's or setter's return,
 /// from the helper stub or its inlined frames' variant (`any`: the next poll of any kind, for code
 /// whose site has no end poll), throws the live-object limit's RangeError.
@@ -9238,6 +9322,31 @@ extern "C" fn note_direct_accessor_returned(ctx: *mut JitCtx) {
             unsafe { (*(*ctx).interp).poll.request_install() };
         }
     });
+}
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+thread_local! {
+    /// Whether the call templates emitted on this thread note each completed call at their end
+    /// poll (tests, [`arm_call_end_poll_limit`]: the call's end poll throws the live-object
+    /// limit's RangeError).
+    static CALL_DONE_HOOK: Cell<bool> = const { Cell::new(false) };
+    /// The completed calls left before an armed call request falls due.
+    static CALLS_TO_LIMIT: Cell<u32> = const { Cell::new(0) };
+}
+
+/// Set whether the call templates emitted on this thread from now on note their completed calls
+/// (tests; see `CALL_DONE_HOOK`).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn set_call_done_hook(on: bool) {
+    CALL_DONE_HOOK.with(|hook| hook.set(on));
 }
 
 /// The test builds' note of a direct getter's or setter's return, in the helper stub and its
@@ -10768,14 +10877,22 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                         argc,
                     )
                 {
-                    // The chunk's shared sequence for this arity and receiver form.
-                    let stub = a.shared_stub(
-                        SharedStub::DirectCall {
-                            argc: argc as u8,
+                    // The chunk's shared sequence for this arity and receiver form (an inlined
+                    // frame's call node's variant: `SharedStub::DirectCallInlined`).
+                    let argc8 = argc as u8;
+                    let stub = a.shared_stub(if a.inlined_frame_helpers() {
+                        SharedStub::DirectCallInlined {
+                            argc: argc8,
                             with_this,
                         }
-                        .key(),
-                    );
+                        .key()
+                    } else {
+                        SharedStub::DirectCall {
+                            argc: argc8,
+                            with_this,
+                        }
+                        .key()
+                    });
                     a.bl_label(stub);
                     let not_returned = a.new_label();
                     const _: () = assert!(DIRECT_CALL_RETURNED == 0);
@@ -10913,6 +11030,24 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
     // Every completed form of the call (H_CALL, H_CALL_HIT, an intrinsic, a direct
     // call) lands here with its result pushed. A native or intrinsic can allocate after the
     // call's last safepoint.
+    #[cfg(test)]
+    if CALL_DONE_HOOK.with(Cell::get) {
+        a.mov(0, 19);
+        a.mov_imm64(16, note_call_done as *const () as u64);
+        a.blr(16);
+    }
+    if a.inlined_frame_helpers() {
+        // An inlined frame's call node (P3 stage 3 step 3c-2): its frame's implicit site in
+        // `Interp::call_site` after the call (which a direct callee ran with NO_POSITION and a
+        // helper's explicit call left NO_POSITION), as a frame's other nodes publish it, so that
+        // an error the end poll creates (the live-object limit's) names the inlined frame, which
+        // reports its start as a frame whose position is pending does: the tier off's frame
+        // after its call; the node's restore writes NO_POSITION after.
+        let site = a.inlined_frame_site();
+        a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+        a.mov_imm64(17, u64::from(site));
+        a.str_w_imm(17, 16, ilayout.call_site as u32);
+    }
     emit_helper_end_poll(a, l_unwind);
 }
 #[cfg(all(
@@ -12994,6 +13129,15 @@ fn emit_direct_sequence(
         }
     }
     a.str_w_imm(5, 6, 8); // call_site
+    if a.inlined_frame_helpers() {
+        // An inlined frame's call node published the call's site in `Interp::call_site` for the
+        // call's helpers (P3 stage 3 step 3c-2): the callee's frame has taken it, and the callee
+        // runs with NO_POSITION there, as the interpreter's frame push leaves it, so that what the
+        // callee's own operations capture or publish starts from its own frame. Past every gate:
+        // a decline keeps the publication for the helper the site calls next.
+        a.mov_imm64(5, u64::MAX);
+        a.str_w_imm(5, 14, il.call_site as u32);
+    }
     a.ldrb_imm(5, 12, IC_STRICT);
     if construct {
         // The frame runs a [[Construct]] (stack traces print `new name`).
@@ -16936,6 +17080,13 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     DirectCall { argc: u8, with_this: bool },
+    /// [`SharedStub::DirectCall`] for a template the optimizing tier runs as an inlined frame's
+    /// call node (P3 stage 3 step 3c-2; `Asm::inlined_frame_helpers`): the callee's frame takes
+    /// the call's site as the base stub's does, and `Interp::call_site`, where the node published
+    /// the site for the call's helpers, is NO_POSITION while the callee runs, as the
+    /// interpreter's frame push leaves it (`emit_direct_sequence`); the template publishes the
+    /// site again after the call. Template code never calls it.
+    DirectCallInlined { argc: u8, with_this: bool },
     /// [`emit_direct_sequence`]'s [[Construct]] form for one arity, entered at a `new` site's
     /// construct-cache hit with its registers (see [`emit_direct_construct`]) → w9 =
     /// `DIRECT_CALL_*`.
@@ -17123,6 +17274,7 @@ impl SharedStub {
     const STRING_CALL: u32 = 0x1400;
     const CALL_HIT: u32 = 0x1500;
     const HELPER_INLINED: u32 = 0x1600;
+    const DIRECT_CALL_INLINED: u32 = 0x1700;
 
     fn key(self) -> u32 {
         match self {
@@ -17196,6 +17348,10 @@ impl SharedStub {
             SharedStub::DirectCall { argc, with_this } => {
                 debug_assert!(argc < 128);
                 Self::DIRECT_CALL | u32::from(argc) | u32::from(with_this) << 7
+            }
+            SharedStub::DirectCallInlined { argc, with_this } => {
+                debug_assert!(argc < 128);
+                Self::DIRECT_CALL_INLINED | u32::from(argc) | u32::from(with_this) << 7
             }
             #[cfg(all(
                 target_arch = "aarch64",
@@ -17276,7 +17432,9 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. } => true,
+            SharedStub::DirectCall { .. }
+            | SharedStub::DirectCallInlined { .. }
+            | SharedStub::DirectConstruct { .. } => true,
             SharedStub::Helper { idx } => matches!(usize::from(idx), H_GET_PROP | H_SET_PROP),
             SharedStub::HelperInlined { idx } => {
                 matches!(usize::from(idx), H_GET_PROP | H_SET_PROP)
@@ -17299,6 +17457,10 @@ impl SharedStub {
             },
             Self::HELPER_INLINED => SharedStub::HelperInlined {
                 idx: (key & 0xff) as u8,
+            },
+            Self::DIRECT_CALL_INLINED => SharedStub::DirectCallInlined {
+                argc: (key & 0x7f) as u8,
+                with_this: key & 0x80 != 0,
             },
             #[cfg(all(
                 target_arch = "aarch64",
@@ -17500,6 +17662,10 @@ impl SharedStub {
             SharedStub::CallSecondary => named("CallSecondary", &[]),
             SharedStub::DirectCall { argc, with_this } => format!(
                 "Stub:DirectCall(argc={argc}{})",
+                if with_this { ",with_this" } else { "" }
+            ),
+            SharedStub::DirectCallInlined { argc, with_this } => format!(
+                "Stub:DirectCallInlined(argc={argc}{})",
                 if with_this { ",with_this" } else { "" }
             ),
             SharedStub::DirectConstruct { argc } => format!("Stub:DirectConstruct(argc={argc})"),
@@ -17811,14 +17977,22 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. } => {
+            SharedStub::DirectCall { .. }
+            | SharedStub::DirectCallInlined { .. }
+            | SharedStub::DirectConstruct { .. } => {
                 let (argc, form) = match self {
-                    SharedStub::DirectCall { argc, with_this } => {
+                    SharedStub::DirectCall { argc, with_this }
+                    | SharedStub::DirectCallInlined { argc, with_this } => {
                         (argc, DirectForm::Call { with_this })
                     }
                     SharedStub::DirectConstruct { argc } => (argc, DirectForm::Construct),
                     _ => unreachable!(),
                 };
+                // The inlined frames' variant consumes the published site (`emit_direct_sequence`).
+                let inlined = a.set_inlined_frame_helpers(matches!(
+                    self,
+                    SharedStub::DirectCallInlined { .. }
+                ));
                 let ilayout = context
                     .ilayout
                     .expect("call stubs are requested only by chunk compilation");
@@ -17847,6 +18021,7 @@ impl SharedStub {
                     direct.finish_stub,
                     DirectCallSite::AfterReturn,
                 );
+                a.set_inlined_frame_helpers(inlined);
                 assert!(emitted, "sites request the stub only when it is supported");
                 // The sequence reaches `returned` with w8 = 0 and `threw` with w8 = 1, the finish
                 // stub's threw flag.
@@ -17888,6 +18063,9 @@ fn direct_stub_is_array(stub: SharedStub, layout: &crate::value::JitLayout) -> b
     matches!(
         stub,
         SharedStub::DirectCall {
+            argc: 1,
+            with_this: false
+        } | SharedStub::DirectCallInlined {
             argc: 1,
             with_this: false
         }

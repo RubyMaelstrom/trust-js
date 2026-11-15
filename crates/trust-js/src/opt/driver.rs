@@ -1165,13 +1165,60 @@ fn log_inlines(chunk: &Chunk, inlines: &[super::build::InlineNote], held: &super
     }
 }
 
-/// Under TRUST_JS_OPT_INLINE=graph, a plan a way of which calls (its callee is no leaf) splices
-/// as before (P3 stage 3, step 2): its line under TRUST_JS_OPT_LOG, `[opt] spliced <name>: a
-/// way's callee calls`.
-pub(crate) fn note_spliced(chunk: &Chunk) {
-    if log_enabled() {
-        log_line!("[opt] spliced {}: a way's callee calls", name(chunk));
+/// Under TRUST_JS_OPT_INLINE=graph, a plan a way of which the graph does not take
+/// (`InlineWay::graph_inlines`) splices as before (P3 stage 3, steps 2 and 3c-2): its line under
+/// TRUST_JS_OPT_LOG, `[opt] spliced <name>: a way's callee calls (<ways not taken>: nested <n>,
+/// other calls <n>, spliced callee <n>; calls <op kinds and counts of their callees>)`, for the
+/// census.
+pub(crate) fn note_spliced(
+    chunk: &Chunk,
+    plan: &crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>,
+) {
+    if !log_enabled() {
+        return;
     }
+    let (mut ways, mut nested, mut other, mut spliced) = (0, 0, 0, 0);
+    let mut kinds: std::collections::BTreeMap<String, usize> = Default::default();
+    for way in plan.values().flat_map(|entry| entry.ways.iter()) {
+        if way.graph_inlines() {
+            continue;
+        }
+        ways += 1;
+        let callee = way.f.runtime().code.get().and_then(Option::clone);
+        let spliced_callee = callee
+            .as_ref()
+            .is_some_and(|callee| !callee.inline_sites_empty());
+        if spliced_callee {
+            spliced += 1;
+        } else if !way.plain_calls() {
+            other += 1;
+        } else {
+            // A callee whose calls the plan inlines in turn (`InlineWay::graph_inlines`).
+            nested += 1;
+        }
+        for op in callee.iter().flat_map(|callee| callee.jit_ops().iter()) {
+            use crate::bytecode::Op;
+            let kind = match op {
+                Op::Call(..) => "Call",
+                Op::CallWithThis(..) => "CallWithThis",
+                Op::CallSpread(..) | Op::CallSpreadThis(..) => "CallSpread",
+                Op::CallArgsArray | Op::CallArgsArrayThis => "CallArgsArray",
+                Op::EvalCallArgsArray | Op::TailEvalCallArgsArray => "EvalCall",
+                Op::New(..) => "New",
+                Op::NewArgsArray => "NewArgsArray",
+                Op::TailCall(..) => "TailCall",
+                _ => continue,
+            };
+            *kinds.entry(kind.to_string()).or_insert(0) += 1;
+        }
+    }
+    let kinds: Vec<String> = kinds.iter().map(|(k, n)| format!("{k} {n}")).collect();
+    log_line!(
+        "[opt] spliced {}: a way's callee calls ({ways} ways not taken: nested {nested}, other \
+         calls {other}, spliced callee {spliced}; calls {})",
+        name(chunk),
+        kinds.join(", ")
+    );
 }
 
 /// Compile `chunk` with the tier and make the code the chunk's native code: `chunk` is a second

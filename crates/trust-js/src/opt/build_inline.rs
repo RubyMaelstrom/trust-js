@@ -269,8 +269,10 @@ fn analyse(
     };
     let flow = Flow::new(view, &cfg, &rules).map_err(at)?;
     // E0: an operation of a block the build reaches (a never-ran block is an exit) that the rules
-    // leave to the template and that needs the whole canonical frame, or a call; every other
-    // such operation is a generic node of the inlined frame (P3 stage 3 step 3c).
+    // leave to the template and that needs the whole canonical frame, or a call other than a
+    // plain or method call; every other such operation is a generic node of the inlined frame
+    // (P3 stage 3 step 3c), a plain or method call too (step 3c-2: the oracle took the way for
+    // making only those, `InlineWay::graph_inlines`).
     let mut generic = false;
     for &id in &flow.rpo {
         let block = &cfg.blocks()[ix(id)];
@@ -280,7 +282,8 @@ fn analyse(
             continue;
         }
         for pc in (block.start..block.end).filter(|&pc| !rules.lowers(pc)) {
-            if canonical(&ops[pc]) || makes_call(&ops[pc]) {
+            let plain_call = matches!(ops[pc], Op::Call(..) | Op::CallWithThis(..));
+            if canonical(&ops[pc]) || (makes_call(&ops[pc]) && !plain_call) {
                 return Err((E0_EFFECT, Some((pc as u32, ops[pc]))));
             }
             generic = true;
@@ -306,8 +309,9 @@ fn analyse(
     })
 }
 
-/// Whether `op` calls or constructs a function as its operation, which an inlined frame does not
-/// yet make (its callee's position and depth: a step of its own, step3c-impl's design note 4).
+/// Whether `op` calls or constructs a function as its operation, which an inlined frame makes as a
+/// generic node only as a plain or method call (P3 stage 3 step 3c-2; the others' positions and
+/// forms: later pieces).
 fn makes_call(op: &Op) -> bool {
     matches!(
         op,

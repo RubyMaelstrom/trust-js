@@ -113,6 +113,9 @@ pub(crate) fn prepare(
     // call's position in this chunk, as a splice's body site (bytecode.rs's `inline_position`
     // with NO_POSITION); registered here, on the main thread, since the code embeds them.
     let mut inline_sites: Vec<crate::stack_trace::InlineSite> = Vec::new();
+    // A non-leaf way's calls (P3 stage 3 step 3c-2): (its view's index, the callee's call cache,
+    // the call's site among `inline_sites`), each call's position in the way's own view.
+    let mut call_sites: Vec<(usize, u32, usize)> = Vec::new();
     for (cache, entry) in entries {
         let Some(&(argc, with_this)) = calls.get(&cache) else {
             continue;
@@ -124,8 +127,9 @@ pub(crate) fn prepare(
         }
         let mut ways = Vec::new();
         for way in &entry.ways {
-            // Leaves only (E0's callees); a plain call passes no `this` its callee could read.
-            if !way.leaf || (!with_this && way.uses_this) {
+            // Leaves, and callees making plain and method calls the plan inlines none of
+            // (`InlineWay::graph_inlines`); a plain call passes no `this` its callee could read.
+            if !way.graph_inlines() || (!with_this && way.uses_this) {
                 continue;
             }
             let Some(callee) = way.f.runtime().code.get().and_then(Option::clone) else {
@@ -139,11 +143,14 @@ pub(crate) fn prepare(
                 crate::value::ObjectKind::User(user) => user.env,
                 _ => continue,
             };
-            let index = match held
+            // A way whose callee calls gets a view of its own: its calls' positions are the way's
+            // inline sites (below), which another way of the same callee does not share.
+            let shared = held
                 .chunks
                 .iter()
                 .position(|held| Rc::ptr_eq(held, &callee))
-            {
+                .filter(|_| way.leaf);
+            let index = match shared {
                 Some(index) => index,
                 None => {
                     let (mut callee_view, mut raw) = memory();
@@ -180,12 +187,13 @@ pub(crate) fn prepare(
                 callee: crate::value::Gc::downgrade(&way.obj),
                 check_this: way.check_this,
                 uses_this: way.uses_this,
+                leaf: way.leaf,
                 expected_genv: way.expected_genv,
                 genv_pin: way.genv_pin.clone(),
             });
-            // A leaf's frame is the compiled frame's child: its site's caller position is this
+            // The way's frame is the compiled frame's child: its site's caller position is this
             // chunk's call's, never an inline position (a nested frame's would chain it).
-            debug_assert!(way.leaf);
+            debug_assert!(way.graph_inlines());
             debug_assert!(!crate::stack_trace::is_inline_position(
                 chunk.call_position(cache)
             ));
@@ -194,13 +202,33 @@ pub(crate) fn prepare(
                 inner: crate::stack_trace::NO_POSITION,
                 outer: chunk.call_position(cache),
             });
+            let way_site = inline_sites.len() - 1;
+            // Each call the callee makes, from its inlined frame (step 3c-2): an inline site of
+            // its own, the callee at the call's position in the callee's source and the compiled
+            // chunk's call's, as a spliced body's call carries (bytecode.rs's inline positions);
+            // the way's view gives it to the call's template and its node publishes it.
+            if !way.leaf {
+                for op in held.chunks[index].jit_ops() {
+                    let (Op::Call(_, call) | Op::CallWithThis(_, call)) = *op else {
+                        continue;
+                    };
+                    let inner = held.chunks[index].call_position(call);
+                    debug_assert!(!crate::stack_trace::is_inline_position(inner));
+                    inline_sites.push(crate::stack_trace::InlineSite {
+                        callee: crate::value::Gc::downgrade(&way.obj),
+                        inner,
+                        outer: chunk.call_position(cache),
+                    });
+                    call_sites.push((index, call, inline_sites.len() - 1));
+                }
+            }
             ways.push(InlineWay {
                 target,
                 chunk: index as u32,
                 env: Env::as_ptr(&env) as usize,
                 holders: holders.into_boxed_slice(),
                 // Its site's index among this job's, until they are registered below.
-                position: (inline_sites.len() - 1) as u32,
+                position: way_site as u32,
             });
         }
         if !ways.is_empty() {
@@ -209,6 +237,11 @@ pub(crate) fn prepare(
     }
     let (registered, positions) = crate::stack_trace::InlineSites::register(inline_sites);
     held.sites = registered;
+    for (view, call, site) in call_sites {
+        if let Some(position) = callees[view].0.call_positions.get_mut(call as usize) {
+            *position = positions[site];
+        }
+    }
     for way in sites
         .iter_mut()
         .flat_map(|site: &mut InlineSite| site.ways.iter_mut())
@@ -244,7 +277,7 @@ fn kept_plan(chunk: &Chunk) -> FastMap<u32, InlinePlanEntry> {
                 obj,
                 check_this: way.check_this,
                 uses_this: way.uses_this,
-                leaf: true,
+                leaf: way.leaf,
                 free_names: Vec::new(),
                 expected_env: 0,
                 expected_genv: way.expected_genv,

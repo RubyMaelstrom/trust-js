@@ -4367,6 +4367,12 @@ impl Chunk {
         self.call_names.as_deref()?.get(pc)
     }
 
+    /// Whether the chunk registers no inline site: it splices no callee.
+    #[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+    pub(crate) fn inline_sites_empty(&self) -> bool {
+        self.inline_sites.is_empty()
+    }
+
     /// The source position of operation `pc` (see [`SourcePositions`]).
     pub(crate) fn position(&self, pc: usize) -> u32 {
         self.positions.at(pc)
@@ -11559,6 +11565,31 @@ pub struct InlinePlanEntry {
     pub ways: Vec<InlineWay>,
 }
 
+impl InlineWay {
+    /// Whether the optimizing tier's graph inliner takes this way (TRUST_JS_OPT_INLINE=graph):
+    /// a leaf (P3 stage 3, step 2), or a callee whose calls are plain and method calls
+    /// ([`makes_plain_calls_only`]) the plan inlines none of (its `nested` empty), made from its
+    /// inlined frame as generic call nodes (step 3c-2). A way whose callee's calls the plan
+    /// inlines in turn keeps its plan spliced: the graph does not nest frames in inlined frames
+    /// yet, and calling what the splice inlines loses to it (DeltaBlue +8.8%, React's steady state
+    /// +9.4% at fixed 5 when it did). Asked only under graph inlining, so that the planner's
+    /// work, which the template JIT's splices share, is unchanged.
+    pub(crate) fn graph_inlines(&self) -> bool {
+        self.leaf || (self.nested.is_empty() && self.plain_calls())
+    }
+
+    /// Whether the callee's chunk splices nothing of its own and every explicit call it makes is
+    /// a plain or method call (P3 stage 3 step 3c-2; see [`makes_plain_calls_only`]).
+    pub(crate) fn plain_calls(&self) -> bool {
+        self.f
+            .runtime()
+            .code
+            .get()
+            .and_then(Option::as_ref)
+            .is_some_and(|chunk| makes_plain_calls_only(chunk))
+    }
+}
+
 #[derive(Clone)]
 pub struct InlineWay {
     pub f: Rc<Function>,
@@ -11566,7 +11597,7 @@ pub struct InlineWay {
     pub check_this: bool,
     pub uses_this: bool,
     /// The callee calls nothing: no call or `new` of its own (the small budget's test), which
-    /// the optimizing tier's graph inliner admits alone (P3 stage 3, step 2).
+    /// the optimizing tier's graph inliner admitted alone (P3 stage 3, step 2).
     pub leaf: bool,
     /// Free names the callee reads. The splice resolves them from the callee's own
     /// [[Environment]] (`Op::LoadNameIn`), so caller bindings never shadow them. Recorded with
@@ -26166,6 +26197,8 @@ fn jit_scope_operation(op: &Op) -> bool {
 /// Dedicated lexical-environment slow path: the same Environment Record operations as the VM,
 /// applied directly to the native activation's canonical LexicalEnvironment, without copying
 /// the operand stack into a one-operation VM. None of them can run author code or throw.
+/// Inlined into both instantiations of `jit_exec` (P3 stage 3 step 3c-2), as into it alone.
+#[inline(always)]
 unsafe fn jit_scope_op(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -26601,6 +26634,29 @@ unsafe fn jit_private_op_inner(
 pub(crate) unsafe extern "C" fn jit_exec(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_exec_at::<false>(ctx, pc, sp)
+}
+
+/// [`jit_exec`] for an inlined frame's call node (P3 stage 3 step 3c-2; `jit::inlined_call_helpers`):
+/// the call's position is the inline site the node published in `Interp::call_site`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_exec_inlined(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_exec_at::<true>(ctx, pc, sp)
+}
+
+#[inline(always)]
+unsafe fn jit_exec_at<const PUBLISHED: bool>(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
     mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let chunk = &*(*ctx).chunk;
@@ -26685,9 +26741,8 @@ pub(crate) unsafe extern "C" fn jit_exec(
     jit_opstat(ctx, pc);
     let result = if makes_explicit_call(&chunk.ops[pc as usize]) {
         let i = &mut *ctx.interp;
-        explicit_call(i, call_op_position(chunk, pc as usize), |_| {
-            jit_exec_inner(ctx, pc, &mut sp)
-        })
+        let position = helper_call_position::<PUBLISHED>(i, chunk, pc as usize);
+        explicit_call(i, position, |_| jit_exec_inner(ctx, pc, &mut sp))
     } else {
         jit_exec_inner(ctx, pc, &mut sp)
     };
@@ -26830,15 +26885,41 @@ pub(crate) unsafe extern "C" fn jit_intrinsic(
     packed: u32,
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    jit_intrinsic_at::<false>(ctx, packed, sp)
+}
+
+/// [`jit_intrinsic`] for an inlined frame's call node (P3 stage 3 step 3c-2; `jit::inlined_call_helpers`):
+/// the call's position is the inline site the node published in `Interp::call_site`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_intrinsic_inlined(
+    ctx: *mut crate::jit::JitCtx,
+    packed: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_intrinsic_at::<true>(ctx, packed, sp)
+}
+
+#[inline(always)]
+unsafe fn jit_intrinsic_at<const PUBLISHED: bool>(
+    ctx: *mut crate::jit::JitCtx,
+    packed: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
     let site = (packed & 0xFFFF) as usize;
     note_call_path(CallPath::Intrinsic);
     let i = unsafe { &mut *(*ctx).interp };
-    let position = call_op_position(unsafe { &*(*ctx).chunk }, site);
+    let position = helper_call_position::<PUBLISHED>(i, unsafe { &*(*ctx).chunk }, site);
     explicit_call(i, position, |_| unsafe {
         jit_intrinsic_inner(ctx, packed, sp)
     })
 }
 
+// Inlined into each of its helper's two instantiations (P3 stage 3 step 3c-2: the tier off's
+// and an inlined frame's call node's), as it was into the helper alone.
+#[inline(always)]
 unsafe fn jit_intrinsic_inner(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
@@ -27419,12 +27500,38 @@ pub(crate) unsafe extern "C" fn jit_call_hit(
     pc: u32,
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    jit_call_hit_at::<false>(ctx, pc, sp)
+}
+
+/// [`jit_call_hit`] for an inlined frame's call node (P3 stage 3 step 3c-2; `jit::inlined_call_helpers`):
+/// the call's position is the inline site the node published in `Interp::call_site`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_call_hit_inlined(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_call_hit_at::<true>(ctx, pc, sp)
+}
+
+#[inline(always)]
+unsafe fn jit_call_hit_at<const PUBLISHED: bool>(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
     let site = (pc & 0xFFFF) as usize;
     let i = unsafe { &mut *(*ctx).interp };
-    let position = call_op_position(unsafe { &*(*ctx).chunk }, site);
+    let position = helper_call_position::<PUBLISHED>(i, unsafe { &*(*ctx).chunk }, site);
     explicit_call(i, position, |_| unsafe { jit_call_hit_inner(ctx, pc, sp) })
 }
 
+// Inlined into each of its helper's two instantiations (P3 stage 3 step 3c-2: the tier off's
+// and an inlined frame's call node's), as it was into the helper alone.
+#[inline(always)]
 unsafe fn jit_call_hit_inner(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
@@ -28774,12 +28881,38 @@ pub(crate) unsafe extern "C" fn jit_new(
     packed: u32,
     sp: *mut Value,
 ) -> crate::jit::SpFlag {
+    jit_new_at::<false>(ctx, packed, sp)
+}
+
+/// [`jit_new`] for an inlined frame's call node (P3 stage 3 step 3c-2; `jit::inlined_call_helpers`):
+/// the call's position is the inline site the node published in `Interp::call_site`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_new_inlined(
+    ctx: *mut crate::jit::JitCtx,
+    packed: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_new_at::<true>(ctx, packed, sp)
+}
+
+#[inline(always)]
+unsafe fn jit_new_at<const PUBLISHED: bool>(
+    ctx: *mut crate::jit::JitCtx,
+    packed: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
     let site = (packed & 0xFFFF) as usize;
     let i = unsafe { &mut *(*ctx).interp };
-    let position = call_op_position(unsafe { &*(*ctx).chunk }, site);
+    let position = helper_call_position::<PUBLISHED>(i, unsafe { &*(*ctx).chunk }, site);
     explicit_call(i, position, |_| unsafe { jit_new_site(ctx, packed, sp) })
 }
 
+// Inlined into each of its helper's two instantiations (P3 stage 3 step 3c-2: the tier off's
+// and an inlined frame's call node's), as it was into the helper alone.
+#[inline(always)]
 unsafe fn jit_new_site(
     ctx: *mut crate::jit::JitCtx,
     packed: u32,
@@ -29779,13 +29912,36 @@ pub(crate) unsafe extern "C" fn jit_get_prop(
 pub(crate) unsafe extern "C" fn jit_call(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_call_at::<false>(ctx, pc, sp)
+}
+
+/// [`jit_call`] for an inlined frame's call node (P3 stage 3 step 3c-2; `jit::inlined_call_helpers`):
+/// the call's position is the inline site the node published in `Interp::call_site`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_call_inlined(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_call_at::<true>(ctx, pc, sp)
+}
+
+#[inline(always)]
+unsafe fn jit_call_at<const PUBLISHED: bool>(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
     mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
     note_call_path(CallPath::Generic);
     let i = &mut *ctx.interp;
-    let position = call_op_position(&*ctx.chunk, pc as usize);
+    let position = helper_call_position::<PUBLISHED>(i, &*ctx.chunk, pc as usize);
     match explicit_call(i, position, |_| jit_call_inner(ctx, pc, &mut sp)) {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
@@ -30013,12 +30169,35 @@ const SPREAD_ARGS_MAX: usize = 32;
 pub(crate) unsafe extern "C" fn jit_call_spread(
     ctx: *mut crate::jit::JitCtx,
     pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_call_spread_at::<false>(ctx, pc, sp)
+}
+
+/// [`jit_call_spread`] for an inlined frame's call node (P3 stage 3 step 3c-2; `jit::inlined_call_helpers`):
+/// the call's position is the inline site the node published in `Interp::call_site`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) unsafe extern "C" fn jit_call_spread_inlined(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
+    sp: *mut Value,
+) -> crate::jit::SpFlag {
+    jit_call_spread_at::<true>(ctx, pc, sp)
+}
+
+#[inline(always)]
+unsafe fn jit_call_spread_at<const PUBLISHED: bool>(
+    ctx: *mut crate::jit::JitCtx,
+    pc: u32,
     mut sp: *mut Value,
 ) -> crate::jit::SpFlag {
     let ctx = &mut *ctx;
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
-    let position = call_op_position(&*ctx.chunk, pc as usize);
+    let position = helper_call_position::<PUBLISHED>(i, &*ctx.chunk, pc as usize);
     match explicit_call(i, position, |_| jit_call_spread_inner(ctx, pc, &mut sp)) {
         Ok(()) => crate::jit::SpFlag { sp, flag: 0 },
         Err(ab) => {
@@ -30028,6 +30207,9 @@ pub(crate) unsafe extern "C" fn jit_call_spread(
     }
 }
 
+// Inlined into each of its helper's two instantiations (P3 stage 3 step 3c-2: the tier off's
+// and an inlined frame's call node's), as it was into the helper alone.
+#[inline(always)]
 unsafe fn jit_call_spread_inner(
     ctx: &mut crate::jit::JitCtx,
     pc: u32,
@@ -30604,6 +30786,32 @@ pub(crate) fn call_op_position(chunk: &Chunk, pc: usize) -> u32 {
         Some(Op::New(_, cache)) => chunk.construct_position(*cache),
         _ => chunk.position(pc),
     }
+}
+
+/// The position of the explicit call (or `new`) at `pc` of `chunk` that a call helper publishes for
+/// its callee's frame: the chunk's (`call_op_position`), or, `PUBLISHED`, the one an inlined
+/// frame's call node published in `Interp::call_site` (P3 stage 3 step 3c-2): the inline site of
+/// the call in that frame, which the callee chunk's own position cannot name.
+#[inline(always)]
+fn helper_call_position<const PUBLISHED: bool>(i: &Interp, chunk: &Chunk, pc: usize) -> u32 {
+    if PUBLISHED {
+        i.call_site
+    } else {
+        call_op_position(chunk, pc)
+    }
+}
+
+/// Whether `chunk` splices nothing of its own (a spliced body's positions go through the chunk's
+/// own inline sites, which an inlined frame's would have to chain) and every explicit call it
+/// makes is a plain or method call (`Op::Call`, `Op::CallWithThis`), which an inlined frame of the
+/// optimizing tier's graph makes as a generic call node (P3 stage 3 step 3c-2): no spread,
+/// arguments-array, eval or tail call, no `new`.
+pub(crate) fn makes_plain_calls_only(chunk: &Chunk) -> bool {
+    chunk.inline_sites.is_empty()
+        && chunk.ops.iter().all(|op| {
+            !(makes_explicit_call(op) || matches!(op, Op::TailCall(..)))
+                || matches!(op, Op::Call(..) | Op::CallWithThis(..))
+        })
 }
 
 /// Whether the operation makes an explicit call (or `new`) whose callee records its position.

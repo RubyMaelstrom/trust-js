@@ -168,6 +168,9 @@ pub(crate) struct KeptWay {
     pub(crate) callee: crate::value::WeakGc,
     pub(crate) check_this: bool,
     pub(crate) uses_this: bool,
+    /// The way's callee calls nothing (P3 stage 3 step 2's ways); or it makes plain and method
+    /// calls only, which its inlined frame makes as generic call nodes (step 3c-2).
+    pub(crate) leaf: bool,
     pub(crate) expected_genv: usize,
     pub(crate) genv_pin: crate::interpreter::WeakEnv,
 }

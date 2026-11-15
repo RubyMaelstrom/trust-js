@@ -225,6 +225,10 @@ fn frame_independent_effects_still_inline_with_local_and_receiver_remapping() {
 /// that are not proper tail calls).
 #[test]
 fn hot_self_hosted_methods_keep_their_intrinsics_when_spliced() {
+    // A splice's subject: under TRUST_JS_OPT_INLINE=graph the self-hosted method, whose calls
+    // (its callback's) the plan inlines none of, is an inlined frame of anyLarge compiled in place
+    // (P3 stage 3 step 3c-2), with no second stage to look at.
+    crate::opt::pin_splice_for_test();
     for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
         let mut engine = Engine::new();
         engine.set_tier(tier);

@@ -1010,6 +1010,9 @@ struct Switched {
     this: bool,
     env: bool,
     slots: bool,
+    /// x21 is the inlined call helpers' table (`jit::inlined_call_helpers`): a call node (P3
+    /// stage 3 step 3c-2).
+    helpers: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -3122,10 +3125,18 @@ impl Gen<'_> {
         let named = crate::opt::liveness::frame_slots(op, n_slots);
         let stale = stale_slots(view, n_slots, graph, node);
         let poison = self.options.poison;
+        // An explicit call (P3 stage 3 step 3c-2): its position is its inline site in this frame,
+        // which the way's view gives its template and the call helpers take from
+        // `Interp::call_site` through the inlined call helpers' table.
+        let call_site = match *op {
+            Op::Call(_, cache) | Op::CallWithThis(_, cache) => Some(view.call_position(cache)),
+            _ => None,
+        };
         let switched = Switched {
             this: uses.this || poison,
             env: uses.env,
             slots: !named.is_empty() || poison,
+            helpers: call_site.is_some(),
         };
         let ctx = |field: usize| field as u32;
         let stack_base = ctx(std::mem::offset_of!(JitCtx, stack_base));
@@ -3204,8 +3215,17 @@ impl Gen<'_> {
             self.a
                 .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
         }
-        // The frame's inline site, published as a splice's checked operation publishes its own.
-        let position = if frame.position == crate::stack_trace::NO_POSITION {
+        // The frame's inline site, published as a splice's checked operation publishes its own; a
+        // call's, its own site, as a spliced body's call publishes it (explicit).
+        let position = if let Some(site) = call_site {
+            if !crate::stack_trace::is_inline_position(site) {
+                return Err(Refusal::at(
+                    pc,
+                    "an inlined frame's call without its inline site",
+                ));
+            }
+            site
+        } else if frame.position == crate::stack_trace::NO_POSITION {
             frame.position
         } else {
             crate::stack_trace::implicit_inline_position(frame.position)
@@ -3214,6 +3234,10 @@ impl Gen<'_> {
             .ldr_imm(X17, 19, ctx(std::mem::offset_of!(JitCtx, interp)));
         self.a.mov_imm64(X16, u64::from(position));
         self.a.str_w_imm(X16, X17, self.ilayout.call_site as u32);
+        if switched.helpers {
+            let table = crate::jit::inlined_call_helpers();
+            self.a.mov_imm64(21, table.as_ptr() as u64);
+        }
         self.a.add_imm(20, X9, (8 * depth) as u32);
         // A throw restores the context first.
         let target = if graph.chain_has_handlers(state) {
@@ -3231,6 +3255,13 @@ impl Gen<'_> {
         self.a.set_hot(hot);
         let reads = self.a.replace_initialized_reads(Default::default());
         let helpers = self.a.set_inlined_frame_helpers(true);
+        let frame_site =
+            self.a
+                .set_inlined_frame_site(if frame.position == crate::stack_trace::NO_POSITION {
+                    frame.position
+                } else {
+                    crate::stack_trace::implicit_inline_position(frame.position)
+                });
         let fixed = self.a.fixed_activation();
         self.a.set_fixed_activation(view.jit_fixed_activation());
         let emitted = operations::emit(
@@ -3250,6 +3281,7 @@ impl Gen<'_> {
         }
         self.a.set_fixed_activation(fixed);
         self.a.set_inlined_frame_helpers(helpers);
+        self.a.set_inlined_frame_site(frame_site);
         self.a.replace_initialized_reads(reads);
         if poison {
             // The words it poisoned, still the poison: the window's other slots (x22 names the
@@ -3294,6 +3326,11 @@ impl Gen<'_> {
             self.a.movz(X16, self.graph.n_slots as u32, 0);
             self.a
                 .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
+        }
+        if switched.helpers {
+            // The activation's own helper table again (`JitCtx::helpers`, as its entry loads it).
+            self.a
+                .ldr_imm(21, 19, ctx(std::mem::offset_of!(JitCtx, helpers)));
         }
         self.a
             .ldr_imm(X17, 19, ctx(std::mem::offset_of!(JitCtx, interp)));

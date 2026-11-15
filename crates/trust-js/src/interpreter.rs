@@ -16895,13 +16895,14 @@ impl Interp {
             crate::jit::perf_inline_plan_sites(plan.len());
         }
         // Under TRUST_JS_OPT_INLINE=graph (P3 stage 3, step 2), a plan whose ways' callees all
-        // call nothing is the tier's to inline in its graph: the first stage compiled in place,
-        // its callees built in from their own first stages (`opt::oracle`), and nothing
-        // recompiles the bytecode. Any other plan splices as below.
+        // call nothing, or make plain and method calls the plan inlines none of (step 3c-2;
+        // `InlineWay::graph_inlines`), is the tier's to inline in its graph: the first stage
+        // compiled in place, its callees built in from their own first stages (`opt::oracle`),
+        // and nothing recompiles the bytecode. Any other plan splices as below.
         if tier && crate::opt::inline_graph() && !crate::opt::graph_refused(chunk) {
             if plan
                 .values()
-                .all(|entry| entry.ways.iter().all(|way| way.leaf))
+                .all(|entry| entry.ways.iter().all(|way| way.graph_inlines()))
             {
                 crate::opt::forget(chunk);
                 if crate::opt::refuses_unspliced(chunk) {
@@ -16919,7 +16920,7 @@ impl Interp {
                 );
                 return;
             }
-            crate::opt::note_spliced(chunk);
+            crate::opt::note_spliced(chunk, &plan);
         }
         // The bytecode recompile that makes the tier's chunk runs on the main thread: its time
         // under TRUST_JS_OPT_LOG (no clock read otherwise).

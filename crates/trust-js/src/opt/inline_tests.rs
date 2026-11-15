@@ -2458,3 +2458,873 @@ fn an_error_at_the_end_poll_after_a_direct_accessor_call_has_the_inlined_frame()
     // The splice's and the tier off's, for the record (`--nocapture`).
     println!("splice {splice:?}\noff {off:?}\ngraph {graph:?}");
 }
+
+// ---- P3 stage 3 step 3c-2: calls from inlined frames ------------------------------------------
+
+/// Functions an inlined frame calls (P3 stage 3 step 3c-2), each recording what it sees once the
+/// code runs: its `caller`, `arguments.callee.caller` and Error.stack, by every path a call takes
+/// from an inlined frame's call node: a plain call to a compiled function (the direct sequence),
+/// a method call, a megamorphic site (the call helpers), the function-call intrinsic
+/// (`f.call`), a callee that builds an environment (`envy`), a bound function (`boundee`: no user
+/// function), a Proxy of a function (`proxied`: the call helper makes its call, and the target's
+/// frame takes the position the helper publishes), a native that throws (JSON.parse), a
+/// function that throws (caught by the
+/// compiled frame's handler and by none) and a call back into the compiled function itself; and
+/// the compiled frame's own calls after the inlined frames' (a megamorphic site's, `envy`'s and
+/// the bound function's, which the call helper makes: its position the compiled chunk's, x21
+/// restored).
+const INLINED_CALLS: &str = "
+var probe = false, log = [];
+function stk(e, from, n) { return e.stack.split('\\n').slice(from, from + n).join('/'); }
+function callee(x) {
+  if (probe) log.push('c<' + (callee.caller && callee.caller.name) + '|'
+    + (arguments.callee.caller && arguments.callee.caller.name) + '|' + stk(new Error('c'), 0, 4));
+  return x + 1;
+}
+function mk(k) { return function mega(x) {
+  if (probe) log.push('m' + k + '<' + (mega.caller && mega.caller.name) + '|' + stk(new Error('m'), 1, 3));
+  return x + k; }; }
+var megas = [mk(1), mk(2), mk(3), mk(4), mk(5), mk(6)];
+var o = { m: function meth(x) {
+  if (probe) log.push('t<' + (meth.caller && meth.caller.name) + '|' + stk(new Error('t'), 1, 3));
+  return x * 2; } };
+function thrower(x) { if (x < 0) throw new RangeError('neg ' + x + ':' + arguments.length); return x; }
+function envy(x) {
+  if (probe) log.push('e<' + (envy.caller && envy.caller.name) + '|' + stk(new Error('e'), 1, 3));
+  var f = function () { return x; }; return f(); }
+function viaEnv(x) { return envy(x) + 1; }
+var boundee = function bnd(x) {
+  if (probe) log.push('bnd<' + (bnd.caller && bnd.caller.name) + '|' + stk(new Error('bd'), 1, 3));
+  return x; }.bind(null);
+function viaBound(x) { return boundee(x) + 1; }
+var proxied = new Proxy(function pt(x) {
+  if (probe) log.push('pt<' + (pt.caller && pt.caller.name) + '|' + stk(new Error('pt'), 1, 3));
+  return x; }, {});
+function viaProxy(x) { return proxied(x) + 1; }
+function viaCall(x) { var s = callee(x); return s + 1; }
+function viaMethod(o, x) { return o.m(x); }
+function viaMega(i, x) { return megas[i % 6](x); }
+function viaApply(x) { return callee.call(null, x); }
+function viaThrow(x) { return thrower(x) + 1; }
+function viaNative(s) { return JSON.parse(s); }
+function run(n) { var s = 0;
+  for (var i = 0; i < n; i++) {
+    s += viaCall(i) + viaMethod(o, i) + viaMega(i, i) + viaApply(i) + viaThrow(i) + viaNative('1') + viaEnv(i) + viaBound(i) + viaProxy(i);
+    s += megas[(i + 1) % 6](i) + envy(i) + boundee(i) + proxied(i);
+  }
+  return s; }
+function caughtT(n, bad) { var s = 0;
+  for (var i = 0; i < n; i++) {
+    try { s += viaThrow(i === bad ? -i : i); } catch (e) { s += 1000; if (probe) log.push('caught|' + stk(e, 0, 4)); }
+  }
+  return s; }
+function reenter(n) { return n > 0 ? viaRe(n - 1) : (probe ? (log.push('re|' + stk(new Error('re'), 1, 5)), 0) : 0); }
+function viaRe(n) { return reenter(n) + 1; }
+var r = 0;
+for (var k = 0; k < 300; k++) { r += run(6); r += reenter(3); r += caughtT(4, -1); }
+probe = true; r += run(2); r += reenter(2); r += caughtT(4, 3);
+var out = [];
+try { viaThrow(-5); } catch (e) { out.push('left|' + stk(e, 0, 4)); }
+function leaves(x) { return viaThrow(x) + viaNative(x < 0 ? '{' : '2'); }
+for (var k = 0; k < 300; k++) r += leaves(k);
+try { leaves(-1); } catch (e) { out.push('left2|' + e.name + '|' + stk(e, 0, 4)); }
+probe = false;
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+/// Collections inside functions an inlined frame calls, the call's arguments and the inlined
+/// frame's values live only in the call's operand words and the frames' homes (alloc's own
+/// plan, the splice would inline in viaAlloc's body, is not taken: viaAlloc's call is a call).
+const INLINED_CALL_COLLECTIONS: &str = "
+function alloc(a, b) { var junk = [a, b, {x: a.v}]; return junk.length + a.v + b.k + arguments.length; }
+function viaAlloc(o, i) { var keep = {k: i}; return alloc({v: o.v + i}, keep) + keep.k; }
+function hold(n) { var o = {v: 3}, s = 0;
+  for (var i = 0; i < n; i++) { var t = {b: i}; s += viaAlloc(o, i) + t.b; } return s; }
+var r = 0; for (var k = 0; k < 100; k++) r += hold(10); r";
+
+/// A recursion through an inlined frame (rec calls mid, inlined, which calls rec) until its
+/// RangeError: the depth it reached.
+const INLINED_CALL_DEPTH: &str = "
+var deepest = 0;
+function rec(n, lim) { if (n > deepest) deepest = n; if (n >= lim) return n; return mid(n, lim); }
+function mid(n, lim) { return rec(n + 1, lim); }
+for (var k = 0; k < 300; k++) rec(0, 8);
+var e = ''; try { rec(0, 1e9); } catch (x) { e = x.name; }
+e + ':' + deepest";
+
+#[test]
+fn a_function_an_inlined_frame_calls_sees_the_tier_offs_callers_and_stacks() {
+    inlines();
+    inlined_generic();
+    let runs = counted(INLINED_CALLS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for seen in [
+        "c<viaCall|viaCall|",
+        "t<viaMethod|",
+        "<viaMega|",
+        "c<viaApply",
+        "e<viaEnv|",
+        "bnd<",
+        "pt<",
+        "caught|",
+        "re|",
+        "left|",
+        "left2|RangeError",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    // A call of a free name is a CallWithThis (its receiver undefined), as a method call is.
+    let ops = inlined_generic();
+    assert!(
+        ops.iter()
+            .filter(|op| matches!(op, Op::CallWithThis(..)))
+            .count()
+            >= 4,
+        "{ops:?}"
+    );
+    assert!(inlines()
+        .iter()
+        .any(|note| note.outcome == InlineOutcome::Inlined));
+}
+
+#[test]
+fn calls_from_inlined_frames_give_the_tier_offs_results_with_exits_forced_poisoned_and_collected() {
+    for source in [INLINED_CALLS, INLINED_CALL_COLLECTIONS] {
+        let runs = counted(source, 7, false, false);
+        assert_eq!(runs[2].0, runs[0].0, "an exit every 7 checks: {source}");
+        super::take_poison_faults();
+        let runs = counted(source, 0, false, true);
+        assert_eq!(runs[2].0, runs[0].0, "poisoned: {source}");
+        assert_eq!(
+            super::take_poison_faults(),
+            0,
+            "no poisoned word read or written: {source}"
+        );
+    }
+    inlined_generic();
+    let runs = counted(INLINED_CALL_COLLECTIONS, 0, true, false);
+    assert_eq!(runs[2].0, runs[0].0, "collections at every allocation");
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+}
+
+/// The depth (P3 stage 3 step 3c-2): the tier off runs an inlined callee in a frame of its own,
+/// the splice and the graph do not, and neither counts it in `Interp::depth`; the RangeError
+/// comes where the native stack runs out (`interpreter::execution_stack_exhausted`, as the
+/// exemplars bound theirs), so a recursion through an inlined frame reaches a depth its frames'
+/// sizes decide: within 2% of the splice's at graph (on this program off 64,126 levels, splice
+/// 64,118, graph 63,606 when written).
+#[test]
+fn a_recursion_through_an_inlined_frame_reaches_the_splices_depth() {
+    let runs = counted(INLINED_CALL_DEPTH, 0, false, false);
+    let depth = |run: &(String, [u64; 6])| -> u64 {
+        let (error, depth) = run.0.split_once(':').expect("error:depth");
+        assert_eq!(error, "RangeError", "{}", run.0);
+        depth.parse().expect("a depth")
+    };
+    let (off, splice, graph) = (depth(&runs[0]), depth(&runs[1]), depth(&runs[2]));
+    assert!(
+        graph * 100 >= splice * 98 && graph * 100 <= splice * 102,
+        "off {off}, splice {splice}, graph {graph}"
+    );
+}
+
+/// A callee an inlined frame calls through the direct sequence (P3 stage 3 step 3c-2's review:
+/// the call node's published site must not stay in `Interp::call_site` while it runs), from a
+/// call outside a loop (`outerS`: the DirectCall stub) and inside one (`outerL`: the in-line
+/// sequence): `inner` is too large to inline, so `mid`'s call to it is a call of the inlined
+/// frame. What its own operations see: the caller a toString and a getter they call implicitly
+/// see (`ts.caller`, `gg.caller`, the getter's stack) and the TypeError `o.x` raises; and what
+/// the getter `mid`'s own read calls before the call sees (the inlined frame's site, not its
+/// call's).
+const DIRECT_CALLEE: &str = "
+var probe = false, log = [];
+var o2 = { toString: function ts() { if (probe) log.push('ts<' + (ts.caller && ts.caller.name)); return 'x'; } };
+var G = {};
+Object.defineProperty(G, 'g', { get: function gg() {
+  if (probe) log.push('gg<' + (gg.caller && gg.caller.name) + '|' + new Error('g').stack.split('\\n').slice(1, 4).join('/'));
+  return 1; } });
+function inner(o) {
+  if (o === -1) {
+    var y = 0;
+    y = y * 3 + 0; if (y > 1e9) y = y % 7;
+    y = y * 3 + 1; if (y > 1e9) y = y % 7;
+    y = y * 3 + 2; if (y > 1e9) y = y % 7;
+    y = y * 3 + 3; if (y > 1e9) y = y % 7;
+    y = y * 3 + 4; if (y > 1e9) y = y % 7;
+    y = y * 3 + 5; if (y > 1e9) y = y % 7;
+    y = y * 3 + 6; if (y > 1e9) y = y % 7;
+    y = y * 3 + 7; if (y > 1e9) y = y % 7;
+    y = y * 3 + 8; if (y > 1e9) y = y % 7;
+    y = y * 3 + 9; if (y > 1e9) y = y % 7;
+    y = y * 3 + 10; if (y > 1e9) y = y % 7;
+    y = y * 3 + 11; if (y > 1e9) y = y % 7;
+    y = y * 3 + 12; if (y > 1e9) y = y % 7;
+    y = y * 3 + 13; if (y > 1e9) y = y % 7;
+    y = y * 3 + 14; if (y > 1e9) y = y % 7;
+    y = y * 3 + 15; if (y > 1e9) y = y % 7;
+    y = y * 3 + 16; if (y > 1e9) y = y % 7;
+    y = y * 3 + 17; if (y > 1e9) y = y % 7;
+    y = y * 3 + 18; if (y > 1e9) y = y % 7;
+    y = y * 3 + 19; if (y > 1e9) y = y % 7;
+    y = y * 3 + 20; if (y > 1e9) y = y % 7;
+    y = y * 3 + 21; if (y > 1e9) y = y % 7;
+    y = y * 3 + 22; if (y > 1e9) y = y % 7;
+    y = y * 3 + 23; if (y > 1e9) y = y % 7;
+    y = y * 3 + 24; if (y > 1e9) y = y % 7;
+    y = y * 3 + 25; if (y > 1e9) y = y % 7;
+    y = y * 3 + 26; if (y > 1e9) y = y % 7;
+    y = y * 3 + 27; if (y > 1e9) y = y % 7;
+    y = y * 3 + 28; if (y > 1e9) y = y % 7;
+    y = y * 3 + 29; if (y > 1e9) y = y % 7;
+    y = y * 3 + 30; if (y > 1e9) y = y % 7;
+    y = y * 3 + 31; if (y > 1e9) y = y % 7;
+    y = y * 3 + 32; if (y > 1e9) y = y % 7;
+    y = y * 3 + 33; if (y > 1e9) y = y % 7;
+    y = y * 3 + 34; if (y > 1e9) y = y % 7;
+    y = y * 3 + 35; if (y > 1e9) y = y % 7;
+    y = y * 3 + 36; if (y > 1e9) y = y % 7;
+    y = y * 3 + 37; if (y > 1e9) y = y % 7;
+    y = y * 3 + 38; if (y > 1e9) y = y % 7;
+    y = y * 3 + 39; if (y > 1e9) y = y % 7;
+    y = y * 3 + 40; if (y > 1e9) y = y % 7;
+    y = y * 3 + 41; if (y > 1e9) y = y % 7;
+    y = y * 3 + 42; if (y > 1e9) y = y % 7;
+    y = y * 3 + 43; if (y > 1e9) y = y % 7;
+    y = y * 3 + 44; if (y > 1e9) y = y % 7;
+    y = y * 3 + 45; if (y > 1e9) y = y % 7;
+    y = y * 3 + 46; if (y > 1e9) y = y % 7;
+    y = y * 3 + 47; if (y > 1e9) y = y % 7;
+    y = y * 3 + 48; if (y > 1e9) y = y % 7;
+    y = y * 3 + 49; if (y > 1e9) y = y % 7;
+    y = y * 3 + 50; if (y > 1e9) y = y % 7;
+    y = y * 3 + 51; if (y > 1e9) y = y % 7;
+    y = y * 3 + 52; if (y > 1e9) y = y % 7;
+    y = y * 3 + 53; if (y > 1e9) y = y % 7;
+    y = y * 3 + 54; if (y > 1e9) y = y % 7;
+    y = y * 3 + 55; if (y > 1e9) y = y % 7;
+    y = y * 3 + 56; if (y > 1e9) y = y % 7;
+    y = y * 3 + 57; if (y > 1e9) y = y % 7;
+    y = y * 3 + 58; if (y > 1e9) y = y % 7;
+    y = y * 3 + 59; if (y > 1e9) y = y % 7;
+    return y;
+  }
+  var t = '' + o2;
+  var u = G.g;
+  return o.x + t.length + u;
+}
+function mid(o) { var g = G.g; var r = inner(o); return r + g; }
+function outerS(o) { return mid(o); }
+function outerL(o, n) { var r = 0; for (var i = 0; i < n; i++) r = mid(o); return r; }
+function mid2(o) { var r = inner(o); return o.k.z + r; }
+function outer2(o) { return mid2(o); }
+var shapes = [{x: 1, a: 1, k: {z: 1, a: 1}}, {x: 1, b: 1, k: {z: 1, b: 1}}, {x: 1, c: 1, k: {z: 1, c: 1}},
+              {x: 1, d: 1, k: {z: 1, d: 1}}, {x: 1, e: 1, k: {z: 1, e: 1}}, {x: 1, f: 1, k: {z: 1, f: 1}}];
+function mid3(o) { var r = inner(o); return o.k.z + r; }
+function outer3(o) { return mid3(o); }
+function stk(e) { return e.name + '|' + e.stack.split('\\n').slice(0, 4).join('/'); }
+var r = 0;
+for (var k = 0; k < 300; k++) { r += outerS({x: 1}) + outerL({x: 1}, 3) + outer2({x: 1, k: {z: 1}}) + outer3(shapes[k % 6]); }
+probe = true; r += outerS({x: 1}) + outerL({x: 1}, 1); probe = false;
+var out = [];
+try { outerS(null); } catch (e) { out.push(stk(e)); }
+try { outerL(null, 1); } catch (e) { out.push(stk(e)); }
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn a_callee_an_inlined_frame_calls_directly_runs_without_the_published_site() {
+    inlined_generic();
+    let runs = counted(DIRECT_CALLEE, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for seen in [
+        "ts<inner",
+        "gg<inner|",
+        "gg<mid|",
+        "TypeError|TypeError: cannot read property 'x' of null/    at inner (",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    assert!(
+        inlined_generic()
+            .iter()
+            .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))),
+        "mid's call is a call node of its inlined frame"
+    );
+    let runs = counted(DIRECT_CALLEE, 7, false, false);
+    assert_eq!(runs[2].0, runs[0].0, "an exit every 7 checks");
+}
+
+/// The live-object limit's RangeError at the end poll of an inlined frame's call node, after the
+/// call returned (P3 stage 3 step 3c-2's review), by the DirectCall stub (`outerS`) and the
+/// in-line sequence (`outerL`), and an error in the inlined frame's next node after the call
+/// (`mid2`'s `o.k.z` of an `o` without `k`, and `mid3`'s, whose megamorphic reads are generic
+/// nodes, so that its helper creates the error from the frame's published site): their stacks
+/// name the inlined frame. A test-only
+/// request makes the call's end poll find the ceiling passed (`jit::set_call_done_hook`,
+/// `jit::arm_call_end_poll_limit`). The poll places no error, so the stack is what the capture
+/// finds in `Interp::call_site`: at graph the inlined frame `mid`, pending (reported at its
+/// start), and the compiled frame at the inlined call, the line the callee's own error's stack
+/// gives it (the reference: `outerS(null)`'s TypeError, the tier off's). The tier off's template
+/// code for `mid` has no end poll at its call (the request meets its next poll, only checked to
+/// throw), and the splice's spliced body publishes nothing at that poll (its stack starts at the
+/// compiled frame): printed, not asserted. The next node's error equals the tier off's.
+#[test]
+fn errors_after_an_inlined_frames_call_returned_name_the_inlined_frame() {
+    let run = |switches: TestSwitches, any: bool| -> Vec<String> {
+        switches.set();
+        crate::jit::set_call_done_hook(true);
+        let mut engine = jit_engine();
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow_mut()
+            .set_incremental(crate::gc_core::IncrementalMode::Off);
+        eval(&mut engine, DIRECT_CALLEE);
+        let mut got: Vec<String> = ["stk2(outerS)", "stk2(outerL)"]
+            .iter()
+            .map(|trigger| {
+                crate::jit::arm_call_end_poll_limit(any);
+                let source = format!(
+                    "function stk2(f) {{ try {{ return 'none:' + f({{x: 1}}, 1); }} catch (e) {{ return stk(e); }} }} {trigger}"
+                );
+                let got = eval(&mut engine, &source);
+                assert!(
+                    !crate::jit::take_end_poll_limit(crate::jit::POLL_HELPER_END),
+                    "the request fell due and no poll took it: {got}"
+                );
+                got
+            })
+            .collect();
+        got.push(eval(
+            &mut engine,
+            "try { outer2({x: 1}); } catch (e) { stk(e) }",
+        ));
+        got.push(eval(
+            &mut engine,
+            "try { outer3({x: 1, g: 1}); } catch (e) { stk(e) }",
+        ));
+        got.push(eval(
+            &mut engine,
+            "try { outerS(null); } catch (e) { stk(e) }",
+        ));
+        crate::jit::set_call_done_hook(false);
+        got
+    };
+    let off = run(TestSwitches::default(), true);
+    let splice = run(
+        TestSwitches {
+            inline_graph: Some(false),
+            ..graph_switches(0)
+        },
+        false,
+    );
+    inlined_generic();
+    let graph = run(graph_switches(0), false);
+    let lines = |text: &str| -> Vec<String> {
+        text.split_once('|')
+            .map_or("", |(_, stack)| stack)
+            .split('/')
+            .map(str::to_string)
+            .collect()
+    };
+    let reference = lines(&off[4]);
+    let caller = reference
+        .iter()
+        .find(|line| line.starts_with("    at outerS ("))
+        .unwrap_or_else(|| panic!("the reference: {}", off[4]));
+    for k in 0..2 {
+        assert!(
+            off[k].starts_with("RangeError|"),
+            "the tier off: {}",
+            off[k]
+        );
+        assert!(
+            splice[k].starts_with("RangeError|"),
+            "splice: {}",
+            splice[k]
+        );
+        let got = lines(&graph[k]);
+        assert!(
+            graph[k].starts_with("RangeError|RangeError: allocation limit exceeded/"),
+            "graph: {}",
+            graph[k]
+        );
+        assert!(
+            got[1].starts_with("    at mid ("),
+            "graph: {} (splice: {})",
+            graph[k],
+            splice[k]
+        );
+        let outer = if k == 0 {
+            caller.clone()
+        } else {
+            caller.replace("outerS", "outerL")
+        };
+        assert_eq!(
+            got[2].split(" (").next(),
+            outer.split(" (").next(),
+            "the compiled frame: {}",
+            graph[k]
+        );
+    }
+    assert_eq!(
+        &got_line(&graph[0], 2),
+        caller,
+        "the compiled frame at the inlined call"
+    );
+    assert_eq!(graph[2], off[2], "the next node");
+    assert_eq!(
+        graph[3], off[3],
+        "the next node, a generic one (megamorphic reads)"
+    );
+    assert_eq!(graph[4], off[4], "the reference");
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+    println!("splice {splice:?}\noff {off:?}\ngraph {graph:?}");
+}
+
+/// Line `k` of the stack a `stk` result reports.
+fn got_line(text: &str, k: usize) -> String {
+    text.split_once('|')
+        .map_or("", |(_, stack)| stack)
+        .split('/')
+        .nth(k)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// A re-entrant call from an inlined frame's call node (P3 stage 3 step 3c-2's review): `innerR`,
+/// which `midR`'s inlined frame calls, calls the compiled function `outerR` again, whose own
+/// activation runs `midR` inlined, its call node publishing and consuming its own site; on the
+/// way back each outer node's state is what its next node (`o.k[n].z`) and its end poll need.
+const REENTRANT_CALLS: &str = "
+var probe = false, log = [];
+function stk(e) { return e.name + '|' + e.stack.split('\\n').slice(0, 6).join('/'); }
+function innerR(o, n) {
+  if (o === -1) {
+    var y = 0;
+    y = y * 3 + 0; if (y > 1e9) y = y % 7;
+    y = y * 3 + 1; if (y > 1e9) y = y % 7;
+    y = y * 3 + 2; if (y > 1e9) y = y % 7;
+    y = y * 3 + 3; if (y > 1e9) y = y % 7;
+    y = y * 3 + 4; if (y > 1e9) y = y % 7;
+    y = y * 3 + 5; if (y > 1e9) y = y % 7;
+    y = y * 3 + 6; if (y > 1e9) y = y % 7;
+    y = y * 3 + 7; if (y > 1e9) y = y % 7;
+    y = y * 3 + 8; if (y > 1e9) y = y % 7;
+    y = y * 3 + 9; if (y > 1e9) y = y % 7;
+    y = y * 3 + 10; if (y > 1e9) y = y % 7;
+    y = y * 3 + 11; if (y > 1e9) y = y % 7;
+    y = y * 3 + 12; if (y > 1e9) y = y % 7;
+    y = y * 3 + 13; if (y > 1e9) y = y % 7;
+    y = y * 3 + 14; if (y > 1e9) y = y % 7;
+    y = y * 3 + 15; if (y > 1e9) y = y % 7;
+    y = y * 3 + 16; if (y > 1e9) y = y % 7;
+    y = y * 3 + 17; if (y > 1e9) y = y % 7;
+    y = y * 3 + 18; if (y > 1e9) y = y % 7;
+    y = y * 3 + 19; if (y > 1e9) y = y % 7;
+    y = y * 3 + 20; if (y > 1e9) y = y % 7;
+    y = y * 3 + 21; if (y > 1e9) y = y % 7;
+    y = y * 3 + 22; if (y > 1e9) y = y % 7;
+    y = y * 3 + 23; if (y > 1e9) y = y % 7;
+    y = y * 3 + 24; if (y > 1e9) y = y % 7;
+    y = y * 3 + 25; if (y > 1e9) y = y % 7;
+    y = y * 3 + 26; if (y > 1e9) y = y % 7;
+    y = y * 3 + 27; if (y > 1e9) y = y % 7;
+    y = y * 3 + 28; if (y > 1e9) y = y % 7;
+    y = y * 3 + 29; if (y > 1e9) y = y % 7;
+    y = y * 3 + 30; if (y > 1e9) y = y % 7;
+    y = y * 3 + 31; if (y > 1e9) y = y % 7;
+    y = y * 3 + 32; if (y > 1e9) y = y % 7;
+    y = y * 3 + 33; if (y > 1e9) y = y % 7;
+    y = y * 3 + 34; if (y > 1e9) y = y % 7;
+    y = y * 3 + 35; if (y > 1e9) y = y % 7;
+    y = y * 3 + 36; if (y > 1e9) y = y % 7;
+    y = y * 3 + 37; if (y > 1e9) y = y % 7;
+    y = y * 3 + 38; if (y > 1e9) y = y % 7;
+    y = y * 3 + 39; if (y > 1e9) y = y % 7;
+    y = y * 3 + 40; if (y > 1e9) y = y % 7;
+    y = y * 3 + 41; if (y > 1e9) y = y % 7;
+    y = y * 3 + 42; if (y > 1e9) y = y % 7;
+    y = y * 3 + 43; if (y > 1e9) y = y % 7;
+    y = y * 3 + 44; if (y > 1e9) y = y % 7;
+    y = y * 3 + 45; if (y > 1e9) y = y % 7;
+    y = y * 3 + 46; if (y > 1e9) y = y % 7;
+    y = y * 3 + 47; if (y > 1e9) y = y % 7;
+    y = y * 3 + 48; if (y > 1e9) y = y % 7;
+    y = y * 3 + 49; if (y > 1e9) y = y % 7;
+    y = y * 3 + 50; if (y > 1e9) y = y % 7;
+    y = y * 3 + 51; if (y > 1e9) y = y % 7;
+    y = y * 3 + 52; if (y > 1e9) y = y % 7;
+    y = y * 3 + 53; if (y > 1e9) y = y % 7;
+    y = y * 3 + 54; if (y > 1e9) y = y % 7;
+    y = y * 3 + 55; if (y > 1e9) y = y % 7;
+    y = y * 3 + 56; if (y > 1e9) y = y % 7;
+    y = y * 3 + 57; if (y > 1e9) y = y % 7;
+    y = y * 3 + 58; if (y > 1e9) y = y % 7;
+    y = y * 3 + 59; if (y > 1e9) y = y % 7;
+    return y;
+  }
+  if (n > 0) { var v = outerR(o, n - 1); if (probe) log.push('back' + n + '|' + stk(new Error('b'))); return v + 1; }
+  if (probe) log.push('bottom|' + stk(new Error('r')));
+  return o.x;
+}
+function midR(o, n) { var r = innerR(o, n); return o.k[n].z + r; }
+function outerR(o, n) { return midR(o, n); }
+var full = {x: 1, k: [{z: 1}, {z: 1}, {z: 1}]}, r = 0;
+for (var k = 0; k < 300; k++) r += outerR(full, 2) + outerR(full, k % 3);
+probe = true; r += outerR(full, 2); probe = false;
+var out = [];
+try { outerR({x: 1, k: [{z: 1}, {z: 1}]}, 2); } catch (e) { out.push(stk(e)); }
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+/// Two scripts for the active script's lookup (ECMA-262 GetActiveScriptOrModule;
+/// `Interp::active_runtime_origin`): the compiled function and its inlined frame are script A's,
+/// the callee the inlined frame calls script B's, and the callee's `import()` and an indirect
+/// eval's `import()` resolve against B, as a stale inline site in `Interp::call_site` would make
+/// them resolve against A (the site names A's function).
+const ORIGIN_A: &str = "
+function midO(o) { var r = innerO(o); return r; }
+function outerOS(o) { return midO(o); }
+function outerOL(o, n) { var r; for (var i = 0; i < n; i++) r = midO(o); return r; }";
+const ORIGIN_B: &str = "
+var probeO = false;
+function innerO(o) {
+  if (o === -1) {
+    var y = 0;
+    y = y * 3 + 0; if (y > 1e9) y = y % 7;
+    y = y * 3 + 1; if (y > 1e9) y = y % 7;
+    y = y * 3 + 2; if (y > 1e9) y = y % 7;
+    y = y * 3 + 3; if (y > 1e9) y = y % 7;
+    y = y * 3 + 4; if (y > 1e9) y = y % 7;
+    y = y * 3 + 5; if (y > 1e9) y = y % 7;
+    y = y * 3 + 6; if (y > 1e9) y = y % 7;
+    y = y * 3 + 7; if (y > 1e9) y = y % 7;
+    y = y * 3 + 8; if (y > 1e9) y = y % 7;
+    y = y * 3 + 9; if (y > 1e9) y = y % 7;
+    y = y * 3 + 10; if (y > 1e9) y = y % 7;
+    y = y * 3 + 11; if (y > 1e9) y = y % 7;
+    y = y * 3 + 12; if (y > 1e9) y = y % 7;
+    y = y * 3 + 13; if (y > 1e9) y = y % 7;
+    y = y * 3 + 14; if (y > 1e9) y = y % 7;
+    y = y * 3 + 15; if (y > 1e9) y = y % 7;
+    y = y * 3 + 16; if (y > 1e9) y = y % 7;
+    y = y * 3 + 17; if (y > 1e9) y = y % 7;
+    y = y * 3 + 18; if (y > 1e9) y = y % 7;
+    y = y * 3 + 19; if (y > 1e9) y = y % 7;
+    y = y * 3 + 20; if (y > 1e9) y = y % 7;
+    y = y * 3 + 21; if (y > 1e9) y = y % 7;
+    y = y * 3 + 22; if (y > 1e9) y = y % 7;
+    y = y * 3 + 23; if (y > 1e9) y = y % 7;
+    y = y * 3 + 24; if (y > 1e9) y = y % 7;
+    y = y * 3 + 25; if (y > 1e9) y = y % 7;
+    y = y * 3 + 26; if (y > 1e9) y = y % 7;
+    y = y * 3 + 27; if (y > 1e9) y = y % 7;
+    y = y * 3 + 28; if (y > 1e9) y = y % 7;
+    y = y * 3 + 29; if (y > 1e9) y = y % 7;
+    y = y * 3 + 30; if (y > 1e9) y = y % 7;
+    y = y * 3 + 31; if (y > 1e9) y = y % 7;
+    y = y * 3 + 32; if (y > 1e9) y = y % 7;
+    y = y * 3 + 33; if (y > 1e9) y = y % 7;
+    y = y * 3 + 34; if (y > 1e9) y = y % 7;
+    y = y * 3 + 35; if (y > 1e9) y = y % 7;
+    y = y * 3 + 36; if (y > 1e9) y = y % 7;
+    y = y * 3 + 37; if (y > 1e9) y = y % 7;
+    y = y * 3 + 38; if (y > 1e9) y = y % 7;
+    y = y * 3 + 39; if (y > 1e9) y = y % 7;
+    y = y * 3 + 40; if (y > 1e9) y = y % 7;
+    y = y * 3 + 41; if (y > 1e9) y = y % 7;
+    y = y * 3 + 42; if (y > 1e9) y = y % 7;
+    y = y * 3 + 43; if (y > 1e9) y = y % 7;
+    y = y * 3 + 44; if (y > 1e9) y = y % 7;
+    y = y * 3 + 45; if (y > 1e9) y = y % 7;
+    y = y * 3 + 46; if (y > 1e9) y = y % 7;
+    y = y * 3 + 47; if (y > 1e9) y = y % 7;
+    y = y * 3 + 48; if (y > 1e9) y = y % 7;
+    y = y * 3 + 49; if (y > 1e9) y = y % 7;
+    y = y * 3 + 50; if (y > 1e9) y = y % 7;
+    y = y * 3 + 51; if (y > 1e9) y = y % 7;
+    y = y * 3 + 52; if (y > 1e9) y = y % 7;
+    y = y * 3 + 53; if (y > 1e9) y = y % 7;
+    y = y * 3 + 54; if (y > 1e9) y = y % 7;
+    y = y * 3 + 55; if (y > 1e9) y = y % 7;
+    y = y * 3 + 56; if (y > 1e9) y = y % 7;
+    y = y * 3 + 57; if (y > 1e9) y = y % 7;
+    y = y * 3 + 58; if (y > 1e9) y = y % 7;
+    y = y * 3 + 59; if (y > 1e9) y = y % 7;
+    return y;
+  }
+  if (probeO) { import('./i.js'); (0, eval)(\"import('./e.js')\"); }
+  return o.x;
+}";
+const ORIGIN_WARM: &str = "
+for (var k = 0; k < 300; k++) { outerOS({x: 1}); outerOL({x: 1}, 2); }
+probeO = true; outerOS({x: 1}); outerOL({x: 1}, 1); probeO = false;";
+
+#[test]
+fn a_reentrant_call_from_an_inlined_frame_keeps_each_activations_published_site() {
+    inlined_generic();
+    let runs = counted(REENTRANT_CALLS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    assert!(
+        expected.contains("bottom|Error|Error: r/    at innerR ("),
+        "{expected}"
+    );
+    assert!(expected.contains("TypeError|"), "{expected}");
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+    let runs = counted(REENTRANT_CALLS, 7, false, false);
+    assert_eq!(runs[2].0, runs[0].0, "an exit every 7 checks");
+    // The end poll of the outermost activation's call node, the fifth call to complete (the
+    // innermost midR's, innerR's of outerR, the middle midR's, innerR's again, then this one).
+    let run = |switches: TestSwitches, any: bool| -> String {
+        switches.set();
+        crate::jit::set_call_done_hook(true);
+        let mut engine = jit_engine();
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow_mut()
+            .set_incremental(crate::gc_core::IncrementalMode::Off);
+        eval(&mut engine, REENTRANT_CALLS);
+        crate::jit::arm_call_end_poll_limit_at(5, any);
+        let got = eval(
+            &mut engine,
+            "try { 'none:' + outerR(full, 2); } catch (e) { stk(e) }",
+        );
+        assert!(
+            !crate::jit::take_end_poll_limit(crate::jit::POLL_HELPER_END),
+            "the request fell due and no poll took it: {got}"
+        );
+        crate::jit::set_call_done_hook(false);
+        got
+    };
+    let off = run(TestSwitches::default(), true);
+    let graph = run(graph_switches(0), false);
+    assert!(off.starts_with("RangeError|"), "the tier off: {off}");
+    assert!(
+        graph.starts_with("RangeError|RangeError: allocation limit exceeded/    at midR ("),
+        "graph: {graph}"
+    );
+    // The outermost outerR's line, the call of midR: the innermost activation's stack has the
+    // same call's (its third frame: innerR, midR, outerR).
+    let bottom = expected
+        .lines()
+        .find(|line| line.starts_with("bottom|"))
+        .unwrap_or_else(|| panic!("{expected}"));
+    let reference = got_line(&format!("x|{bottom}"), 3);
+    assert!(reference.starts_with("    at outerR ("), "{reference}");
+    assert_eq!(got_line(&graph, 2), reference, "graph: {graph}");
+    println!("off {off}\ngraph {graph}\nreference {reference}");
+}
+
+/// A direct call of an inlined frame's call node that declines at each of its gates (P3 stage 3
+/// step 3c-2's review): the depth (`Interp::direct_call_depth`, a recursion past it), the callee's
+/// code changed (its entry word moved, `Chunk::note_entry_change`) and the call caches' epoch
+/// (`bytecode::invalidate_call_caches`). The helper that runs the call next still finds the
+/// node's publication, so the callee's frame takes the call's site: the callee's own error's
+/// stack and what its implicit callbacks see equal the tier off's and the splice's.
+#[test]
+fn a_declined_direct_call_from_an_inlined_frame_leaves_the_helper_the_published_site() {
+    const TRIGGER: &str = "probe = true; log = [];
+        var t = (function () { try { return 'none:' + outerS(null); } catch (e) { return stk(e); } })();
+        probe = false; t + '|' + log.join(';')";
+    const DEEP: &str = "function deepD(n) { return n > 0 ? deepD(n - 1) : outerS(null); }
+        probe = true; log = [];
+        var t = (function () { try { return 'none:' + deepD(140); } catch (e) { return stk(e); } })();
+        probe = false; t + '|' + log.join(';')";
+    let run = |switches: TestSwitches| -> Vec<String> {
+        switches.set();
+        let mut engine = jit_engine();
+        eval(&mut engine, DIRECT_CALLEE);
+        let mut got = vec![eval(&mut engine, DEEP)];
+        chunk_of(&mut engine, "inner").note_entry_change();
+        got.push(eval(&mut engine, TRIGGER));
+        crate::bytecode::invalidate_call_caches();
+        got.push(eval(&mut engine, TRIGGER));
+        got
+    };
+    let off = run(TestSwitches::default());
+    let splice = run(TestSwitches {
+        inline_graph: Some(false),
+        ..graph_switches(0)
+    });
+    inlined_generic();
+    let graph = run(graph_switches(0));
+    for k in 0..3 {
+        assert!(off[k].starts_with("TypeError|"), "the tier off: {}", off[k]);
+        assert!(
+            off[k].contains("ts<inner") && off[k].contains("gg<inner"),
+            "{}",
+            off[k]
+        );
+        assert_eq!(splice[k], off[k], "splice, case {k}");
+        assert_eq!(graph[k], off[k], "graph, case {k}");
+    }
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+}
+
+#[test]
+fn a_callee_an_inlined_frame_calls_imports_against_its_own_script() {
+    let run = |switches: TestSwitches| -> Vec<String> {
+        switches.set();
+        let mut engine = jit_engine();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let log = seen.clone();
+        engine.set_module_loader(move |specifier, referrer| {
+            log.borrow_mut().push(format!("{specifier} <- {referrer}"));
+            Some((
+                format!("{referrer}#{specifier}"),
+                "export default 1;".into(),
+            ))
+        });
+        engine.set_import_base("https://a.test/a.js");
+        eval(&mut engine, ORIGIN_A);
+        engine.set_import_base("https://b.test/b.js");
+        eval(&mut engine, ORIGIN_B);
+        engine.set_import_base("https://c.test/c.js");
+        eval(&mut engine, ORIGIN_WARM);
+        engine.set_import_base("https://doc.test/page.html");
+        engine.run_microtasks();
+        let got = seen.borrow().clone();
+        got
+    };
+    let off = run(TestSwitches::default());
+    let splice = run(TestSwitches {
+        inline_graph: Some(false),
+        ..graph_switches(0)
+    });
+    inlined_generic();
+    let graph = run(graph_switches(0));
+    assert!(
+        !off.is_empty() && off.iter().all(|seen| seen.ends_with("b.test/b.js")),
+        "the tier off: {off:?}"
+    );
+    assert_eq!(splice, off, "splice");
+    assert_eq!(graph, off, "graph");
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+}
+
+/// The rule for a way whose callee calls (P3 stage 3 step 3c-2, `InlineWay::graph_inlines`):
+/// `midN` calls a small leaf the plan inlines in turn, so `outerN`'s plan splices (a second
+/// stage, as at splice); `midP` calls a callee too large to plan, so `outerP` compiles in place
+/// at graph with `midP` inlined and its call a call node of the inlined frame.
+const NESTED_RULE: &str = "
+function leafy(x) { return x + 1; }
+function midN(x) { return leafy(x) * 2; }
+function outerN(n) { var s = 0; for (var i = 0; i < n; i++) s += midN(i); return s; }
+function bigc(x) {
+  if (x === -1) {
+    var y = 0;
+    y = y * 3 + 0; if (y > 1e9) y = y % 7;
+    y = y * 3 + 1; if (y > 1e9) y = y % 7;
+    y = y * 3 + 2; if (y > 1e9) y = y % 7;
+    y = y * 3 + 3; if (y > 1e9) y = y % 7;
+    y = y * 3 + 4; if (y > 1e9) y = y % 7;
+    y = y * 3 + 5; if (y > 1e9) y = y % 7;
+    y = y * 3 + 6; if (y > 1e9) y = y % 7;
+    y = y * 3 + 7; if (y > 1e9) y = y % 7;
+    y = y * 3 + 8; if (y > 1e9) y = y % 7;
+    y = y * 3 + 9; if (y > 1e9) y = y % 7;
+    y = y * 3 + 10; if (y > 1e9) y = y % 7;
+    y = y * 3 + 11; if (y > 1e9) y = y % 7;
+    y = y * 3 + 12; if (y > 1e9) y = y % 7;
+    y = y * 3 + 13; if (y > 1e9) y = y % 7;
+    y = y * 3 + 14; if (y > 1e9) y = y % 7;
+    y = y * 3 + 15; if (y > 1e9) y = y % 7;
+    y = y * 3 + 16; if (y > 1e9) y = y % 7;
+    y = y * 3 + 17; if (y > 1e9) y = y % 7;
+    y = y * 3 + 18; if (y > 1e9) y = y % 7;
+    y = y * 3 + 19; if (y > 1e9) y = y % 7;
+    y = y * 3 + 20; if (y > 1e9) y = y % 7;
+    y = y * 3 + 21; if (y > 1e9) y = y % 7;
+    y = y * 3 + 22; if (y > 1e9) y = y % 7;
+    y = y * 3 + 23; if (y > 1e9) y = y % 7;
+    y = y * 3 + 24; if (y > 1e9) y = y % 7;
+    y = y * 3 + 25; if (y > 1e9) y = y % 7;
+    y = y * 3 + 26; if (y > 1e9) y = y % 7;
+    y = y * 3 + 27; if (y > 1e9) y = y % 7;
+    y = y * 3 + 28; if (y > 1e9) y = y % 7;
+    y = y * 3 + 29; if (y > 1e9) y = y % 7;
+    y = y * 3 + 30; if (y > 1e9) y = y % 7;
+    y = y * 3 + 31; if (y > 1e9) y = y % 7;
+    y = y * 3 + 32; if (y > 1e9) y = y % 7;
+    y = y * 3 + 33; if (y > 1e9) y = y % 7;
+    y = y * 3 + 34; if (y > 1e9) y = y % 7;
+    y = y * 3 + 35; if (y > 1e9) y = y % 7;
+    y = y * 3 + 36; if (y > 1e9) y = y % 7;
+    y = y * 3 + 37; if (y > 1e9) y = y % 7;
+    y = y * 3 + 38; if (y > 1e9) y = y % 7;
+    y = y * 3 + 39; if (y > 1e9) y = y % 7;
+    y = y * 3 + 40; if (y > 1e9) y = y % 7;
+    y = y * 3 + 41; if (y > 1e9) y = y % 7;
+    y = y * 3 + 42; if (y > 1e9) y = y % 7;
+    y = y * 3 + 43; if (y > 1e9) y = y % 7;
+    y = y * 3 + 44; if (y > 1e9) y = y % 7;
+    y = y * 3 + 45; if (y > 1e9) y = y % 7;
+    y = y * 3 + 46; if (y > 1e9) y = y % 7;
+    y = y * 3 + 47; if (y > 1e9) y = y % 7;
+    y = y * 3 + 48; if (y > 1e9) y = y % 7;
+    y = y * 3 + 49; if (y > 1e9) y = y % 7;
+    y = y * 3 + 50; if (y > 1e9) y = y % 7;
+    y = y * 3 + 51; if (y > 1e9) y = y % 7;
+    y = y * 3 + 52; if (y > 1e9) y = y % 7;
+    y = y * 3 + 53; if (y > 1e9) y = y % 7;
+    y = y * 3 + 54; if (y > 1e9) y = y % 7;
+    y = y * 3 + 55; if (y > 1e9) y = y % 7;
+    y = y * 3 + 56; if (y > 1e9) y = y % 7;
+    y = y * 3 + 57; if (y > 1e9) y = y % 7;
+    y = y * 3 + 58; if (y > 1e9) y = y % 7;
+    y = y * 3 + 59; if (y > 1e9) y = y % 7;
+    return y;
+  }
+  return x + 1;
+}
+function midP(x) { return bigc(x) * 2; }
+function outerP(n) { var s = 0; for (var i = 0; i < n; i++) s += midP(i); return s; }
+var r = 0; for (var k = 0; k < 300; k++) r += outerN(10) + outerP(10); r";
+
+#[test]
+fn a_way_whose_callees_calls_the_plan_inlines_keeps_its_plan_spliced() {
+    inlines();
+    inlined_generic();
+    TestSwitches::default().set();
+    let mut off = jit_engine();
+    let expected = eval(&mut off, NESTED_RULE);
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, NESTED_RULE), expected);
+    let second_stage = |engine: &mut Engine, name: &str| {
+        function(engine, name)
+            .0
+            .runtime()
+            .code2
+            .get()
+            .is_some_and(Option::is_some)
+    };
+    assert!(second_stage(&mut engine, "outerN"), "outerN splices");
+    assert!(
+        !second_stage(&mut engine, "outerP"),
+        "outerP compiles in place"
+    );
+    assert!(inlines()
+        .iter()
+        .any(|note| note.outcome == InlineOutcome::Inlined));
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
+}
