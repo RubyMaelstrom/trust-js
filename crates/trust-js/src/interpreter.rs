@@ -17200,7 +17200,7 @@ impl Interp {
         args: *const crate::value::Value,
         argc: usize,
     ) -> Option<Result<Value, Abrupt>> {
-        let (initializer_name, initializer_key, initializer_cache, apply_cache) =
+        let (initializer_name, initializer_key, initializer_cache, apply_cache, call_position) =
             chunk.jit_arguments_apply_forwarder()?;
         // Reuse the exact property feedback owned by the elided bytecode body. The IC probe
         // walks prototype links by borrowed raw pointer, validates every live shape/descriptor,
@@ -17424,6 +17424,10 @@ impl Interp {
             return Some(Err(e));
         }
 
+        // The initializer is called from the body's forwarding call, which its frame records as
+        // its call site, as the body's own `CallWithThis` does when it runs (the VM's stack): the
+        // constructor's frame, which took the `new` site's position, prints that call's line.
+        self.call_site = call_position;
         let mut forwarded_this = std::mem::ManuallyDrop::new(*this_val);
         let fast = unsafe {
             self.call_jit_fast(
@@ -17442,6 +17446,9 @@ impl Interp {
                 self.call(initializer, *this_val, args_ref)
             }
         };
+        // What the constructor's frame push left (it took the `new` site's position), in case a
+        // path above did not consume the forwarding call's.
+        self.call_site = crate::stack_trace::NO_POSITION;
         self.depth -= 1;
         Some(result.map(|_| Value::Undefined))
     }

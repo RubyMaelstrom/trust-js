@@ -300,3 +300,55 @@ fn simple_and_forwarded_initializers_copy_an_immutable_argument_window() {
         }
     }
 }
+
+/// A forwarding constructor whose initializer is not a field plan calls it, and the initializer's
+/// frame is called from the body's forwarding call (`this.initialize.apply(this, arguments)`): the
+/// constructor's frame prints that call's position, at every tier, the VM's as the template JIT's
+/// Rust forwarder's (which recorded none, so that the frame printed the function's start). The
+/// rest of what the initializer can observe, too: its caller, its `arguments`, `new.target`, a
+/// throw's stack, a returned object ignored, missing arguments.
+#[test]
+fn a_forwarded_initializer_is_called_from_the_forwarding_call_at_every_tier() {
+    let source = r#"
+        var Class = { create: function() { return function() { this.initialize.apply(this, arguments); } } };
+        var V = Class.create();
+        var seen = [];
+        V.prototype = {
+            initialize: function(x, y) {
+                this.x = x; this.y = y;
+                if (x === 7) {
+                    seen.push(new Error("probe").stack.split("\n").slice(0, 4).join(" | "));
+                    seen.push((V.prototype.initialize.caller === V) + " " + arguments.length + " ["
+                        + Array.prototype.slice.call(arguments) + "] " + (typeof new.target));
+                }
+                if (x === 8) throw new Error("thrown");
+                if (x === 9) return { other: 1 };
+            }
+        };
+        function make(i) { return new V(i, i + 1, "extra"); }
+        var s = 0;
+        for (var i = 0; i < 600; i++) s += make(i % 6).x;
+        make(7);
+        try { make(8); } catch (e) { seen.push(e.stack.split("\n").slice(0, 3).join(" | ")); }
+        var r9 = make(9);
+        seen.push((r9.other === undefined) + " " + (r9 instanceof V));
+        var m = new V(1);
+        seen.push(m.x + " " + m.y);
+        s + "\n" + seen.join("\n");
+    "#;
+    let mut results = Vec::new();
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        results.push((tier, eval(&mut engine, source)));
+    }
+    let (_, first) = &results[0];
+    assert!(
+        first.contains("at new <anonymous> (") && first.contains("true 3 [7,8,extra] undefined"),
+        "{first}"
+    );
+    for (tier, result) in &results {
+        assert_eq!(result, first, "{tier:?} against {:?}", results[0].0);
+    }
+}

@@ -4726,6 +4726,9 @@ struct ArgumentsForwarder {
     initializer_key: crate::atom::PropKey,
     initializer_cache: u32,
     apply_cache: u32,
+    /// The forwarding call's call-cache index (its `CallWithThis`), whose position the
+    /// initializer's frame records as the call it was made from.
+    call_cache: u32,
 }
 
 struct ForwarderRuntime {
@@ -24602,7 +24605,9 @@ impl Chunk {
     /// live there; any accessor, proxy, `apply` override, or other body shape runs normally.
     #[inline]
     /// The initializer's name, as text and as its key (made with the plan, so a construction
-    /// atomizes nothing), with the two property caches the forwarder reuses.
+    /// atomizes nothing), with the two property caches the forwarder reuses, and the position of
+    /// the body's forwarding call, where the initializer's frame is called from (as the body's own
+    /// `CallWithThis` records it when it runs).
     pub(crate) fn jit_arguments_apply_forwarder(
         &self,
     ) -> Option<(
@@ -24610,9 +24615,10 @@ impl Chunk {
         crate::atom::PropKey,
         &std::cell::Cell<IcState>,
         &std::cell::Cell<IcState>,
+        u32,
     )> {
         let plan = self.arguments_forwarder.get_or_init(|| {
-            let [Op::GetPropThis(initializer, initializer_cache), Op::GetMethod(apply, apply_cache), Op::LoadThis, Op::LoadLocal(arguments), Op::CallWithThis(2, _), Op::Pop, Op::ReturnUndef] =
+            let [Op::GetPropThis(initializer, initializer_cache), Op::GetMethod(apply, apply_cache), Op::LoadThis, Op::LoadLocal(arguments), Op::CallWithThis(2, call_cache), Op::Pop, Op::ReturnUndef] =
                 self.ops.as_slice()
             else {
                 return None;
@@ -24623,6 +24629,7 @@ impl Chunk {
                     initializer_key: self.name_key(*initializer),
                     initializer_cache: *initializer_cache,
                     apply_cache: *apply_cache,
+                    call_cache: *call_cache,
                 })
         });
         let plan = plan.as_ref()?;
@@ -24631,6 +24638,7 @@ impl Chunk {
             plan.initializer_key,
             &self.caches[plan.initializer_cache as usize],
             &self.caches[plan.apply_cache as usize],
+            self.call_position(plan.call_cache),
         ))
     }
 
