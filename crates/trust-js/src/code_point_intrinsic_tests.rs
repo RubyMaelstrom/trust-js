@@ -102,6 +102,11 @@ fn numeric_code_point_calls_enter_the_guarded_native_intrinsic() {
     let (mut hits, mut epoch_before, mut epoch_after) = (0, 0, 1);
     let mut previous_start = None;
     for _attempt in 0..200 {
+        // With the optimizing tier on, the shared compile thread may finish a compile late and
+        // its install would land inside the measured run; installs go between the runs instead
+        // (the run failed once in a whole-suite run under load with 119 of 120 hits at an
+        // unchanged epoch, and never alone).
+        crate::opt::finish_compiles_for_test(&mut engine.interp);
         // The calls run in the template's in-line read (W3's item 2c), or in the fused String
         // method step, which reads the same way without the call (`jit::string_calls`), or, for an
         // index neither takes, the intrinsic helper: each bypasses the native's argument decoding.
