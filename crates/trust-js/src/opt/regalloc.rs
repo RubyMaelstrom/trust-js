@@ -670,61 +670,68 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
     }
 
     // Next uses: each value's reads in code order (a phi's input is read at its edge's block end),
-    // flat: counted, placed, then sorted and deduplicated in each value's run.
-    let mut use_start = vec![0u32; n + 1];
-    for &b in &order {
-        let data = graph.block(b);
-        for &node in &data.body {
-            reads.each(node, |read| use_start[read.index() + 1] += 1);
-        }
-        for k in 0..data.succs.len() {
-            for input in edges.of(b, k) {
-                use_start[input.index() + 1] += 1;
+    // flat: counted, placed, then sorted and deduplicated in each value's run. Made at the forward
+    // pass's first choice of a value to spill, their only reader: never in a compile whose values
+    // all find a register (P3 stage 3 step R1, F5; about a fifth of the pass where they are made).
+    let make_uses = || {
+        let mut use_start = vec![0u32; n + 1];
+        for &b in &order {
+            let data = graph.block(b);
+            for &node in &data.body {
+                reads.each(node, |read| use_start[read.index() + 1] += 1);
+            }
+            for k in 0..data.succs.len() {
+                for input in edges.of(b, k) {
+                    use_start[input.index() + 1] += 1;
+                }
             }
         }
-    }
-    for &(_, v) in &after_call {
-        use_start[v.index() + 1] += 1;
-    }
-    for v in 0..n {
-        use_start[v + 1] += use_start[v];
-    }
-    let mut use_end: Vec<u32> = use_start[..n].to_vec();
-    let mut uses = vec![0u32; use_start[n] as usize];
-    for &b in &order {
-        let data = graph.block(b);
-        for &node in &data.body {
-            let at = pos[node.index()];
-            reads.each(node, |read| {
-                uses[use_end[read.index()] as usize] = at;
-                use_end[read.index()] += 1;
-            });
+        for &(_, v) in &after_call {
+            use_start[v.index() + 1] += 1;
         }
-        for k in 0..data.succs.len() {
-            for input in edges.of(b, k) {
-                uses[use_end[input.index()] as usize] = tail[b.index()];
-                use_end[input.index()] += 1;
+        for v in 0..n {
+            use_start[v + 1] += use_start[v];
+        }
+        let mut use_end: Vec<u32> = use_start[..n].to_vec();
+        let mut uses = vec![0u32; use_start[n] as usize];
+        for &b in &order {
+            let data = graph.block(b);
+            for &node in &data.body {
+                let at = pos[node.index()];
+                reads.each(node, |read| {
+                    uses[use_end[read.index()] as usize] = at;
+                    use_end[read.index()] += 1;
+                });
+            }
+            for k in 0..data.succs.len() {
+                for input in edges.of(b, k) {
+                    uses[use_end[input.index()] as usize] = tail[b.index()];
+                    use_end[input.index()] += 1;
+                }
             }
         }
-    }
-    for &(node, v) in &after_call {
-        uses[use_end[v.index()] as usize] = pos[node.index()] + 1;
-        use_end[v.index()] += 1;
-    }
-    for v in 0..n {
-        let run = &mut uses[use_start[v] as usize..use_end[v] as usize];
-        run.sort_unstable();
-        let mut kept = 0;
-        for k in 0..run.len() {
-            if k == 0 || run[k] != run[kept - 1] {
-                run[kept] = run[k];
-                kept += 1;
-            }
+        for &(node, v) in &after_call {
+            uses[use_end[v.index()] as usize] = pos[node.index()] + 1;
+            use_end[v.index()] += 1;
         }
-        use_end[v] = use_start[v] + kept as u32;
-    }
+        for v in 0..n {
+            let run = &mut uses[use_start[v] as usize..use_end[v] as usize];
+            run.sort_unstable();
+            let mut kept = 0;
+            for k in 0..run.len() {
+                if k == 0 || run[k] != run[kept - 1] {
+                    run[kept] = run[k];
+                    kept += 1;
+                }
+            }
+            use_end[v] = use_start[v] + kept as u32;
+        }
+        (use_start, use_end, uses)
+    };
+    let next_uses = std::cell::OnceCell::new();
     // The first read of `v` after `at`, or the end of its range (a read in a loop's next turn).
     let next_use = |v: NodeIx, at: u32| {
+        let (use_start, use_end, uses) = next_uses.get_or_init(make_uses);
         let list = &uses[use_start[v.index()] as usize..use_end[v.index()] as usize];
         list.get(list.partition_point(|&p| p <= at))
             .copied()
@@ -819,6 +826,9 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
     // where the register is free when such a value is defined, the value takes it and its edge
     // moves nothing (Maglev's SetLoopPhiRegisterHint, maglev-regalloc.cc:1227-1240).
     let mut hints: Vec<Option<u8>> = vec![None; n];
+    // The values the pass spills, as it spills them (a value's home never leaves its slot): the
+    // copies' passes read them (`spill_copies`), and a pass that spills nothing gives them none.
+    let mut spilled: Vec<NodeIx> = Vec::new();
     let mut assign = |v: NodeIx,
                       homes: &mut Vec<Home>,
                       active: &mut Vec<(u32, NodeIx)>,
@@ -891,6 +901,7 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                     };
                     homes[u.index()] = Home::Spill(*spill_bytes);
                     *spill_bytes += 8;
+                    spilled.push(u);
                     register = Some(r);
                 }
             }
@@ -898,11 +909,14 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         let home = match (register, class) {
             (Some(r), Class::Gp) => Home::Gp(r),
             (Some(r), Class::Fp) => Home::Fp(r),
-            (None, _) => Home::Spill(free_slots.pop().unwrap_or_else(|| {
-                let offset = *spill_bytes;
-                *spill_bytes += 8;
-                offset
-            })),
+            (None, _) => {
+                spilled.push(v);
+                Home::Spill(free_slots.pop().unwrap_or_else(|| {
+                    let offset = *spill_bytes;
+                    *spill_bytes += 8;
+                    offset
+                }))
+            }
         };
         if let (Some(r), Class::Gp) = (register, class) {
             if is_callee(file, class, r) && !used_callee_gp.contains(&r) {
@@ -988,10 +1002,18 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
     let copies = spill_copies(
         graph,
         file,
-        (&order, &pos, &head, &tail),
-        &homes,
-        &ranges,
-        &edges,
+        &spilled,
+        &Made {
+            order: &order,
+            head: &head,
+            tail: &tail,
+            homes: &homes,
+            ranges: &ranges,
+            edges: &edges,
+            calls: &calls,
+            stub_calls: &stub_calls,
+            live_in: (&live_in, words),
+        },
         &mut used_callee_gp,
         &mut fp_callee_across_effect,
     );
@@ -1013,6 +1035,7 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
     #[cfg(test)]
     {
         tests::assert_caches(graph, &alloc);
+        tests::assert_reference(graph, file, &alloc);
         TEST_CACHES.with(|made| made.set(made.get() + alloc.caches.len()));
         TEST_SPANS.with(|made| made.set(made.get() + alloc.spans.len()));
         let callee = alloc
@@ -1060,7 +1083,7 @@ struct Loop {
     member: Vec<u64>,
     /// The header's head position to the last tail of its blocks.
     hull: (u32, u32),
-    /// The loops that hold its header, itself among them.
+    /// The loops that hold its header, itself among them (`block_loops`).
     depth: u32,
     /// Whether one of its blocks holds an effect or a call (`NodeOp::is_effectful`).
     call: bool,
@@ -1075,13 +1098,14 @@ fn contains(bits: &[u64], i: usize) -> bool {
 
 /// The natural loops of the code order: a block the builder marked a loop header with a
 /// predecessor at or after it, and the blocks that reach those predecessors without passing it.
-/// A walk that reaches the entry block found no natural loop there, and gives none.
-fn natural_loops(graph: &Graph, order: &[BlockIx], (head, tail): (&[u32], &[u32])) -> Vec<Loop> {
-    let mut place = vec![u32::MAX; graph.blocks.len()];
-    for (k, &b) in order.iter().enumerate() {
-        place[b.index()] = k as u32;
-    }
-    let reachable = |b: BlockIx| place[b.index()] != u32::MAX;
+/// A walk that reaches the entry block found no natural loop there, and gives none. Whether a
+/// loop calls and what its stub calls clobber come from the calls' positions (`Made`), a block's
+/// by a search of its head to its tail, not from its nodes.
+fn natural_loops(graph: &Graph, made: &Made) -> Vec<Loop> {
+    let (order, head, tail) = (made.order, made.head, made.tail);
+    // The code order's places are the heads' order; an unreachable block has none.
+    let place = |b: BlockIx| head[b.index()];
+    let reachable = |b: BlockIx| head[b.index()] != u32::MAX;
     let words = graph.blocks.len().div_ceil(64);
     let mut loops: Vec<Loop> = Vec::new();
     for &h in order {
@@ -1093,7 +1117,7 @@ fn natural_loops(graph: &Graph, order: &[BlockIx], (head, tail): (&[u32], &[u32]
             .preds
             .iter()
             .copied()
-            .filter(|&p| reachable(p) && place[p.index()] >= place[h.index()])
+            .filter(|&p| reachable(p) && place(p) >= place(h))
             .collect();
         if stack.is_empty() {
             continue;
@@ -1127,11 +1151,15 @@ fn natural_loops(graph: &Graph, order: &[BlockIx], (head, tail): (&[u32], &[u32]
         let mut hull = (head[h.index()], 0);
         let (mut call, mut clobbered) = (false, (0, 0));
         for &b in &blocks {
-            hull.1 = hull.1.max(tail[b.index()]);
-            for &node in &graph.block(b).body {
-                let op = &graph.node(node).op;
-                call |= op.is_effectful();
-                let (gp, fp) = clobbers(op);
+            let (from, to) = (head[b.index()], tail[b.index()]);
+            hull.1 = hull.1.max(to);
+            let first = made.calls.partition_point(|&p| p < from);
+            call |= made.calls.get(first).is_some_and(|&p| p <= to);
+            let first = made.stub_calls.partition_point(|&(p, _, _)| p < from);
+            for &(p, gp, fp) in &made.stub_calls[first..] {
+                if p > to {
+                    break;
+                }
                 clobbered = (clobbered.0 | gp, clobbered.1 | fp);
             }
         }
@@ -1145,11 +1173,35 @@ fn natural_loops(graph: &Graph, order: &[BlockIx], (head, tail): (&[u32], &[u32]
             clobbered,
         });
     }
-    for k in 0..loops.len() {
-        let h = loops[k].header.index();
-        loops[k].depth = loops.iter().filter(|l| contains(&l.member, h)).count() as u32;
-    }
     loops
+}
+
+/// Each block's loops (`natural_loops`' indices, ascending) as one flat list, a block's run
+/// `start[b]..start[b + 1]`: its loop depth is the run's length. Each loop's own depth is its
+/// header's.
+fn block_loops(loops: &mut [Loop], blocks: usize) -> (Vec<u32>, Vec<u32>) {
+    let mut start = vec![0u32; blocks + 1];
+    for l in loops.iter() {
+        for &b in &l.blocks {
+            start[b.index() + 1] += 1;
+        }
+    }
+    for b in 0..blocks {
+        start[b + 1] += start[b];
+    }
+    let mut fill = start.clone();
+    let mut list = vec![0u32; start[blocks] as usize];
+    for (k, l) in loops.iter().enumerate() {
+        for &b in &l.blocks {
+            list[fill[b.index()] as usize] = k as u32;
+            fill[b.index()] += 1;
+        }
+    }
+    for l in loops.iter_mut() {
+        let h = l.header.index();
+        l.depth = start[h + 1] - start[h];
+    }
+    (start, list)
 }
 
 /// Loop-level caches of spilled values (P3 stage 3 step R1). A value whose home is a spill slot,
@@ -1170,45 +1222,37 @@ fn loop_caches(
     graph: &Graph,
     file: &RegisterFile,
     loops: &[Loop],
-    depth: &[u32],
-    homes: &[Home],
-    edges: &EdgeInputs,
-    held: &[Vec<Vec<(u32, u32)>>; 2],
+    (start, list): (&[u32], &[u32]),
+    reads: &[Read],
+    held: &Held,
     used_callee_gp: &mut Vec<u8>,
     fp_callee_across_effect: &mut bool,
 ) -> (Vec<Cache>, Vec<Vec<u16>>) {
-    let spilled = |v: NodeIx| matches!(homes[v.index()], Home::Spill(_));
-    // The candidates: (loop, value, weight), each read of a spilled value defined outside the
-    // loop counting its block's frequency.
-    let mut reads: Vec<(u32, u32, u64)> = Vec::new();
-    for (k, l) in loops.iter().enumerate() {
-        let outside = |v: NodeIx| spilled(v) && !contains(&l.member, graph.node(v).block.index());
-        for &b in &l.blocks {
-            let weight = FREQUENCY[(depth[b.index()] as usize).min(9)];
-            let data = graph.block(b);
-            for &node in &data.body {
-                for &input in &graph.node(node).inputs {
-                    if outside(input) {
-                        reads.push((k as u32, input.0, weight));
-                    }
-                }
-            }
-            for s in 0..data.succs.len() {
-                for input in edges.of(b, s) {
-                    if outside(input) {
-                        reads.push((k as u32, input.0, weight));
-                    }
-                }
+    // The candidates: (loop, value, weight), each register read of a spilled value (each read
+    // once: `spilled_reads`) counting its block's frequency for each loop that holds the block
+    // and not the value's definition.
+    let mut weights: Vec<(u32, u32, u64)> = Vec::new();
+    for r in reads {
+        let b = r.block as usize;
+        let loops_of = &list[start[b] as usize..start[b + 1] as usize];
+        if loops_of.is_empty() {
+            continue;
+        }
+        let weight = FREQUENCY[loops_of.len().min(9)];
+        let def = graph.node(NodeIx(r.value)).block.index();
+        for &k in loops_of {
+            if !contains(&loops[k as usize].member, def) {
+                weights.push((k, r.value, weight));
             }
         }
     }
-    if reads.is_empty() {
+    if weights.is_empty() {
         return (Vec::new(), Vec::new());
     }
-    reads.sort_unstable();
+    weights.sort_unstable();
     // (benefit, loop, value): the reads' weight less one load at each entry.
     let mut candidates: Vec<(u64, u32, u32)> = Vec::new();
-    for run in reads.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
+    for run in weights.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
         let (k, v, _) = run[0];
         let weight: u64 = run.iter().map(|r| r.2).sum();
         let entry = FREQUENCY[(loops[k as usize].depth as usize - 1).min(9)];
@@ -1240,10 +1284,8 @@ fn loop_caches(
             Class::Fp => (1, file.fp_caller, file.fp_callee, l.clobbered.1),
         };
         let free = |r: u8| {
-            let list = &held[ci][r as usize];
-            let first = list.partition_point(|&(_, end)| end < l.hull.0);
             avoid & (1 << r) == 0
-                && list.get(first).is_none_or(|&(start, _)| start > l.hull.1)
+                && held.free(ci, r, l.hull)
                 && !caches.iter().any(|c| {
                     matches!((c.reg, class), (Home::Gp(q), Class::Gp) | (Home::Fp(q), Class::Fp) if q == r)
                         && overlap(c.hull, l.hull)
@@ -1308,73 +1350,225 @@ fn free_over(list: &[(u32, u32)], range: (u32, u32)) -> bool {
     list.get(first).is_none_or(|&(start, _)| start > range.1)
 }
 
-/// The register copies of spilled values (`Copies`), only where some value spilled: the natural
-/// loops and each block's depth, each register's ranges, then the loop caches (`loop_caches`),
-/// whose hulls then hold their registers, then the read spans (`read_spans`).
-#[allow(clippy::too_many_arguments)]
+/// Each register's ranges (P3 stage 3 step R1), by class (0 x, 1 d) and number, `32 * class +
+/// number`: the homes' in one flat list, each register's run by start (they do not overlap: one
+/// value a register at a time), and the copies' taken after them, each register's by start.
+struct Held {
+    start: Vec<u32>,
+    homes: Vec<(u32, u32)>,
+    taken: Vec<Vec<(u32, u32)>>,
+}
+
+impl Held {
+    fn new(homes: &[Home], ranges: &[(u32, u32)]) -> Self {
+        let index = |home: &Home| match *home {
+            Home::Gp(r) => Some(r as usize),
+            Home::Fp(r) => Some(32 + r as usize),
+            _ => None,
+        };
+        let mut start = vec![0u32; 65];
+        for home in homes {
+            if let Some(i) = index(home) {
+                start[i + 1] += 1;
+            }
+        }
+        for i in 0..64 {
+            start[i + 1] += start[i];
+        }
+        let mut fill = start.clone();
+        let mut list = vec![(0, 0); start[64] as usize];
+        for (v, home) in homes.iter().enumerate() {
+            if let Some(i) = index(home) {
+                list[fill[i] as usize] = ranges[v];
+                fill[i] += 1;
+            }
+        }
+        for i in 0..64 {
+            list[start[i] as usize..start[i + 1] as usize].sort_unstable();
+        }
+        Held {
+            start,
+            homes: list,
+            taken: vec![Vec::new(); 64],
+        }
+    }
+
+    /// Whether register `r` of class `class` holds nothing over `range`.
+    fn free(&self, class: usize, r: u8, range: (u32, u32)) -> bool {
+        let i = 32 * class + r as usize;
+        free_over(
+            &self.homes[self.start[i] as usize..self.start[i + 1] as usize],
+            range,
+        ) && free_over(&self.taken[i], range)
+    }
+
+    /// Hold register `r` of class `class` over `range`, which it held nothing over.
+    fn hold(&mut self, class: usize, r: u8, range: (u32, u32)) {
+        hold(&mut self.taken[32 * class + r as usize], range);
+    }
+}
+
+/// What the allocation's passes made that the copies' passes read (P3 stage 3 step R1): the code
+/// order, the blocks' head and tail positions, the homes, ranges and edges, the positions of the
+/// calls and of the stub calls with their clobbers, and each block's live-in set (flat, `words`
+/// words a block).
+struct Made<'a> {
+    order: &'a [BlockIx],
+    head: &'a [u32],
+    tail: &'a [u32],
+    homes: &'a [Home],
+    ranges: &'a [(u32, u32)],
+    edges: &'a EdgeInputs,
+    calls: &'a [u32],
+    stub_calls: &'a [(u32, u64, u64)],
+    live_in: (&'a [u64], usize),
+}
+
+/// A register read of a spilled value (P3 stage 3 step R1, `spilled_reads`): one of the inputs of
+/// the node at position `at` in `block`, after `calls` calls in the code order, or (`edge`) one
+/// of the values its edges carry, at its tail.
+#[derive(Clone, Copy, Debug)]
+struct Read {
+    value: u32,
+    block: u32,
+    at: u32,
+    calls: u32,
+    edge: bool,
+}
+
+/// The register reads of the spilled values (`spilled`, a bit set over values): one walk of the
+/// blocks in code order, each block's reads once for both passes, a node's inputs at its
+/// position and its block's edges at its tail, each read with the calls before it.
+fn spilled_reads(graph: &Graph, made: &Made, spilled: &[u64]) -> Vec<Read> {
+    let mut reads: Vec<Read> = Vec::new();
+    let mut calls = 0usize;
+    for &b in made.order {
+        let data = graph.block(b);
+        let mut at = made.head[b.index()];
+        for &node in &data.body {
+            at += 2;
+            while made.calls.get(calls).is_some_and(|&p| p < at) {
+                calls += 1;
+            }
+            for &input in &graph.node(node).inputs {
+                if contains(spilled, input.index()) {
+                    reads.push(Read {
+                        value: input.0,
+                        block: b.0,
+                        at,
+                        calls: calls as u32,
+                        edge: false,
+                    });
+                }
+            }
+        }
+        for s in 0..data.succs.len() {
+            for input in made.edges.of(b, s) {
+                if contains(spilled, input.index()) {
+                    reads.push(Read {
+                        value: input.0,
+                        block: b.0,
+                        at: made.tail[b.index()],
+                        calls: calls as u32,
+                        edge: true,
+                    });
+                }
+            }
+        }
+    }
+    reads
+}
+
+/// The register copies of spilled values (`Copies`), only where they can make one (P3 stage 3
+/// step R1, F5): the values the forward pass spilled (`spilled_list`) and their register reads
+/// (`spilled_reads`); none of the passes where no spilled value is read twice in a block with no
+/// call between (a read span's run) and none is live into a loop header (a loop cache's value,
+/// defined outside the loop); else the natural loops and each block's loops, each register's
+/// ranges, then the loop caches (`loop_caches`) where a loop can have one, whose hulls then hold
+/// their registers, then the read spans (`read_spans`) where a run can be made.
 fn spill_copies(
     graph: &Graph,
     file: &RegisterFile,
-    (order, pos, head, tail): (&[BlockIx], &[u32], &[u32], &[u32]),
-    homes: &[Home],
-    ranges: &[(u32, u32)],
-    edges: &EdgeInputs,
+    spilled_list: &[NodeIx],
+    made: &Made,
     used_callee_gp: &mut Vec<u8>,
     fp_callee_across_effect: &mut bool,
 ) -> Copies {
     let mut copies = Copies::default();
-    if !homes.iter().any(|home| matches!(home, Home::Spill(_))) {
+    let homes = made.homes;
+    if spilled_list.is_empty() {
         return copies;
     }
-    let loops = natural_loops(graph, order, (head, tail));
-    let mut depth = vec![0u32; graph.blocks.len()];
-    for l in &loops {
-        for &b in &l.blocks {
-            depth[b.index()] += 1;
-        }
+    let mut spilled = vec![0u64; homes.len().div_ceil(64)];
+    for &v in spilled_list {
+        insert(&mut spilled, v.index());
     }
-    // Each register's ranges, by start (they do not overlap: one value a register at a time).
-    let mut held: [Vec<Vec<(u32, u32)>>; 2] = [vec![Vec::new(); 32], vec![Vec::new(); 32]];
-    for (v, home) in homes.iter().enumerate() {
-        match *home {
-            Home::Gp(r) => held[0][r as usize].push(ranges[v]),
-            Home::Fp(r) => held[1][r as usize].push(ranges[v]),
-            _ => {}
-        }
+    let reads = spilled_reads(graph, made, &spilled);
+    // The node reads by (block, value, calls before, position): a run is two or more of one
+    // block, value and call count (a call's own read ends a run), which a loop cache of the value
+    // may then take from it (`read_spans`).
+    let mut span_reads: Vec<(u32, u32, u32, u32)> = reads
+        .iter()
+        .filter(|r| !r.edge)
+        .map(|r| (r.block, r.value, r.calls, r.at))
+        .collect();
+    span_reads.sort_unstable();
+    let runs = span_reads
+        .windows(2)
+        .any(|w| (w[0].0, w[0].1, w[0].2) == (w[1].0, w[1].1, w[1].2));
+    // A loop cache's value: a spilled value live into a natural loop's header, so defined outside
+    // the loop. The headers: blocks the builder marked with a predecessor at or after them in the
+    // code order.
+    let (live_in, words) = made.live_in;
+    let in_loop = made.order.iter().any(|&h| {
+        let data = graph.block(h);
+        let at = made.head[h.index()];
+        data.loop_header
+            && data
+                .preds
+                .iter()
+                .any(|&p| made.head[p.index()] != u32::MAX && made.head[p.index()] >= at)
+            && spilled_list
+                .iter()
+                .any(|&v| contains(&live_in[h.index() * words..][..words], v.index()))
+    });
+    if !runs && !in_loop {
+        return copies;
     }
-    for list in held.iter_mut().flatten() {
-        list.sort_unstable();
-    }
-    if !loops.is_empty() {
+    let mut loops = natural_loops(graph, made);
+    let (start, list) = block_loops(&mut loops, graph.blocks.len());
+    let mut held = Held::new(homes, made.ranges);
+    if in_loop && !loops.is_empty() {
         (copies.caches, copies.block_caches) = loop_caches(
             graph,
             file,
             &loops,
-            &depth,
-            homes,
-            edges,
+            (&start, &list),
+            &reads,
             &held,
             used_callee_gp,
             fp_callee_across_effect,
         );
         for c in &copies.caches {
             match c.reg {
-                Home::Gp(r) => hold(&mut held[0][r as usize], c.hull),
-                Home::Fp(r) => hold(&mut held[1][r as usize], c.hull),
+                Home::Gp(r) => held.hold(0, r, c.hull),
+                Home::Fp(r) => held.hold(1, r, c.hull),
                 _ => {}
             }
         }
     }
-    (copies.spans, copies.block_spans) = read_spans(
-        graph,
-        file,
-        (order, pos, head),
-        homes,
-        &depth,
-        (&copies.caches, &copies.block_caches),
-        &mut held,
-        used_callee_gp,
-    );
+    if runs {
+        (copies.spans, copies.block_spans) = read_spans(
+            graph,
+            file,
+            made,
+            span_reads,
+            &start,
+            (&copies.caches, &copies.block_caches),
+            &mut held,
+            used_callee_gp,
+        );
+    }
     copies
 }
 
@@ -1392,39 +1586,26 @@ fn spill_copies(
 fn read_spans(
     graph: &Graph,
     file: &RegisterFile,
-    (order, pos, head): (&[BlockIx], &[u32], &[u32]),
-    homes: &[Home],
-    depth: &[u32],
+    made: &Made,
+    mut reads: Vec<(u32, u32, u32, u32)>,
+    loops_start: &[u32],
     (caches, block_caches): (&[Cache], &[Vec<u16>]),
-    held: &mut [Vec<Vec<(u32, u32)>>; 2],
+    held: &mut Held,
     used_callee_gp: &[u8],
 ) -> (Vec<Span>, Vec<Vec<u16>>) {
-    // (block, value, the calls before it in the block, position) of each read of a spilled value
-    // no loop cache holds there: a run is one block, value and call count.
-    let mut reads: Vec<(u32, u32, u32, u32)> = Vec::new();
-    for &b in order {
-        let cached = |v: NodeIx| {
-            block_caches
-                .get(b.index())
-                .is_some_and(|ks| ks.iter().any(|&k| caches[k as usize].value == v))
-        };
-        let mut calls = 0u32;
-        for &node in &graph.block(b).body {
-            let p = pos[node.index()];
-            for &input in &graph.node(node).inputs {
-                if matches!(homes[input.index()], Home::Spill(_)) && !cached(input) {
-                    reads.push((b.0, input.0, calls, p));
-                }
-            }
-            if graph.node(node).op.is_effectful() {
-                calls += 1;
-            }
-        }
+    // (block, value, the calls before it, position) of each node's read of a spilled value, by
+    // that key (`spill_copies`), but those of a value a loop cache holds in the block: a run is
+    // one block, value and call count.
+    if !caches.is_empty() {
+        reads.retain(|&(b, v, _, _)| {
+            !block_caches
+                .get(b as usize)
+                .is_some_and(|ks| ks.iter().any(|&k| caches[k as usize].value.0 == v))
+        });
     }
     if reads.len() < 2 {
         return (Vec::new(), Vec::new());
     }
-    reads.sort_unstable();
     // (weight, first, end) of each run of two reads or more, as indices into `reads`.
     let mut runs: Vec<(u64, u32, u32)> = Vec::new();
     let mut first = 0;
@@ -1435,7 +1616,9 @@ fn read_spans(
             end += 1;
         }
         if end - first >= 2 {
-            let frequency = FREQUENCY[(depth[reads[first].0 as usize] as usize).min(9)];
+            let b = reads[first].0 as usize;
+            let depth = loops_start[b + 1] - loops_start[b];
+            let frequency = FREQUENCY[(depth as usize).min(9)];
             runs.push((
                 (end - first - 1) as u64 * frequency,
                 first as u32,
@@ -1466,17 +1649,16 @@ fn read_spans(
         };
         // The registers of the class free from position `p` to `q` in the block: no range in
         // them overlaps, and no stub call of the block's nodes there clobbers them.
-        let body = &graph.block(block).body;
-        let base = head[block.index()] + 2;
-        let free = |held: &[Vec<Vec<(u32, u32)>>; 2], p: u32, q: u32| {
-            let clobbered = body[((p - base) / 2) as usize..=((q - base) / 2) as usize]
+        let free = |held: &Held, p: u32, q: u32| {
+            let first = made.stub_calls.partition_point(|&(at, _, _)| at < p);
+            let clobbered = made.stub_calls[first..]
                 .iter()
-                .fold(0u64, |acc, &n| {
-                    let (gp, fp) = clobbers(&graph.node(n).op);
+                .take_while(|&&(at, _, _)| at <= q)
+                .fold(0u64, |acc, &(_, gp, fp)| {
                     acc | if ci == 0 { gp } else { fp }
                 });
             regs.iter().fold(0u64, |mask, &r| {
-                if clobbered & (1 << r) == 0 && free_over(&held[ci][r as usize], (p, q)) {
+                if clobbered & (1 << r) == 0 && held.free(ci, r, (p, q)) {
                     mask | (1 << r)
                 } else {
                     mask
@@ -1487,13 +1669,13 @@ fn read_spans(
         // stays free, up to the definition of its last reading node's value (to + 1), so that the
         // span's register is no home its readers write: a node may write its output before it
         // reads all its inputs, and a cold path's restore would put the copy back over it.
-        let mut take = |held: &mut [Vec<Vec<(u32, u32)>>; 2], from: u32, to: u32, mask: u64| {
+        let mut take = |held: &mut Held, from: u32, to: u32, mask: u64| {
             let r = regs
                 .iter()
                 .copied()
                 .find(|&r| mask & (1 << r) != 0)
                 .expect("a free register");
-            hold(&mut held[ci][r as usize], (from, to));
+            held.hold(ci, r, (from, to));
             spans.push(Span {
                 value: v,
                 reg: if ci == 0 { Home::Gp(r) } else { Home::Fp(r) },
@@ -1502,6 +1684,14 @@ fn read_spans(
                 to,
             });
         };
+        // A register free over the whole run: one span, as the cuts below would make it (their
+        // steps' intervals cover the run's, so their registers are those free over it).
+        let last = run[run.len() - 1].3;
+        let whole = free(held, run[0].3, last + 1);
+        if whole != 0 {
+            take(held, run[0].3, last, whole);
+            continue;
+        }
         let mut start = 0;
         let mut mask = 0u64;
         for k in 1..run.len() {
@@ -1785,6 +1975,474 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    // The copies' passes as step R1's B made them (1cff91e1: each loop's blocks scanned once per
+    // loop that holds them, every block's reads for the spans, the held lists sorted, the
+    // depths by a count over the loops): the reference that F5's cheaper passes must equal on
+    // every test allocation (`assert_reference`).
+    fn natural_loops_ref(
+        graph: &Graph,
+        order: &[BlockIx],
+        (head, tail): (&[u32], &[u32]),
+    ) -> Vec<Loop> {
+        let mut place = vec![u32::MAX; graph.blocks.len()];
+        for (k, &b) in order.iter().enumerate() {
+            place[b.index()] = k as u32;
+        }
+        let reachable = |b: BlockIx| place[b.index()] != u32::MAX;
+        let words = graph.blocks.len().div_ceil(64);
+        let mut loops: Vec<Loop> = Vec::new();
+        for &h in order {
+            let data = graph.block(h);
+            if !data.loop_header {
+                continue;
+            }
+            let mut stack: Vec<BlockIx> = data
+                .preds
+                .iter()
+                .copied()
+                .filter(|&p| reachable(p) && place[p.index()] >= place[h.index()])
+                .collect();
+            if stack.is_empty() {
+                continue;
+            }
+            let mut member = vec![0u64; words];
+            insert(&mut member, h.index());
+            let mut blocks = vec![h];
+            let mut natural = true;
+            while let Some(b) = stack.pop() {
+                if contains(&member, b.index()) {
+                    continue;
+                }
+                if b == order[0] {
+                    natural = false;
+                    break;
+                }
+                insert(&mut member, b.index());
+                blocks.push(b);
+                stack.extend(
+                    graph
+                        .block(b)
+                        .preds
+                        .iter()
+                        .copied()
+                        .filter(|&p| reachable(p) && !contains(&member, p.index())),
+                );
+            }
+            if !natural {
+                continue;
+            }
+            let mut hull = (head[h.index()], 0);
+            let (mut call, mut clobbered) = (false, (0, 0));
+            for &b in &blocks {
+                hull.1 = hull.1.max(tail[b.index()]);
+                for &node in &graph.block(b).body {
+                    let op = &graph.node(node).op;
+                    call |= op.is_effectful();
+                    let (gp, fp) = clobbers(op);
+                    clobbered = (clobbered.0 | gp, clobbered.1 | fp);
+                }
+            }
+            loops.push(Loop {
+                header: h,
+                blocks,
+                member,
+                hull,
+                depth: 0,
+                call,
+                clobbered,
+            });
+        }
+        for k in 0..loops.len() {
+            let h = loops[k].header.index();
+            loops[k].depth = loops.iter().filter(|l| contains(&l.member, h)).count() as u32;
+        }
+        loops
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn loop_caches_ref(
+        graph: &Graph,
+        file: &RegisterFile,
+        loops: &[Loop],
+        depth: &[u32],
+        homes: &[Home],
+        edges: &EdgeInputs,
+        held: &[Vec<Vec<(u32, u32)>>; 2],
+        used_callee_gp: &mut Vec<u8>,
+        fp_callee_across_effect: &mut bool,
+    ) -> (Vec<Cache>, Vec<Vec<u16>>) {
+        let spilled = |v: NodeIx| matches!(homes[v.index()], Home::Spill(_));
+        // The candidates: (loop, value, weight), each read of a spilled value defined outside the
+        // loop counting its block's frequency.
+        let mut reads: Vec<(u32, u32, u64)> = Vec::new();
+        for (k, l) in loops.iter().enumerate() {
+            let outside =
+                |v: NodeIx| spilled(v) && !contains(&l.member, graph.node(v).block.index());
+            for &b in &l.blocks {
+                let weight = FREQUENCY[(depth[b.index()] as usize).min(9)];
+                let data = graph.block(b);
+                for &node in &data.body {
+                    for &input in &graph.node(node).inputs {
+                        if outside(input) {
+                            reads.push((k as u32, input.0, weight));
+                        }
+                    }
+                }
+                for s in 0..data.succs.len() {
+                    for input in edges.of(b, s) {
+                        if outside(input) {
+                            reads.push((k as u32, input.0, weight));
+                        }
+                    }
+                }
+            }
+        }
+        if reads.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        reads.sort_unstable();
+        // (benefit, loop, value): the reads' weight less one load at each entry.
+        let mut candidates: Vec<(u64, u32, u32)> = Vec::new();
+        for run in reads.chunk_by(|a, b| a.0 == b.0 && a.1 == b.1) {
+            let (k, v, _) = run[0];
+            let weight: u64 = run.iter().map(|r| r.2).sum();
+            let entry = FREQUENCY[(loops[k as usize].depth as usize - 1).min(9)];
+            if weight > entry {
+                candidates.push((weight - entry, k, v));
+            }
+        }
+        candidates.sort_unstable_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then(loops[b.1 as usize].depth.cmp(&loops[a.1 as usize].depth))
+                .then(a.2.cmp(&b.2))
+        });
+        let mut caches: Vec<Cache> = Vec::new();
+        let overlap = |a: (u32, u32), b: (u32, u32)| a.0 <= b.1 && b.0 <= a.1;
+        for &(_, k, v) in &candidates {
+            let l = &loops[k as usize];
+            let v = NodeIx(v);
+            if caches
+                .iter()
+                .any(|c| c.value == v && overlap(c.hull, l.hull))
+            {
+                continue;
+            }
+            let Some(class) = class_of(graph.node(v).rep) else {
+                continue;
+            };
+            let (ci, caller, callee, avoid) = match class {
+                Class::Gp => (0, file.gp_caller, file.gp_callee, l.clobbered.0),
+                Class::Fp => (1, file.fp_caller, file.fp_callee, l.clobbered.1),
+            };
+            let free = |r: u8| {
+                let list = &held[ci][r as usize];
+                let first = list.partition_point(|&(_, end)| end < l.hull.0);
+                avoid & (1 << r) == 0
+                    && list.get(first).is_none_or(|&(start, _)| start > l.hull.1)
+                    && !caches.iter().any(|c| {
+                        matches!((c.reg, class), (Home::Gp(q), Class::Gp) | (Home::Fp(q), Class::Fp) if q == r)
+                            && overlap(c.hull, l.hull)
+                    })
+            };
+            let choices: &[u8] = if l.call { &[] } else { caller };
+            let Some(r) = choices.iter().chain(callee).copied().find(|&r| free(r)) else {
+                continue;
+            };
+            let reg = match class {
+                Class::Gp => Home::Gp(r),
+                Class::Fp => Home::Fp(r),
+            };
+            if class == Class::Gp && callee.contains(&r) && !used_callee_gp.contains(&r) {
+                used_callee_gp.push(r);
+            }
+            if class == Class::Fp && callee.contains(&r) && l.call {
+                *fp_callee_across_effect = true;
+            }
+            caches.push(Cache {
+                value: v,
+                reg,
+                header: l.header,
+                hull: l.hull,
+            });
+        }
+        if caches.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        let mut block_caches: Vec<Vec<u16>> = vec![Vec::new(); graph.blocks.len()];
+        for (k, c) in caches.iter().enumerate() {
+            let l = loops
+                .iter()
+                .find(|l| l.header == c.header)
+                .expect("a cache's loop");
+            for &b in &l.blocks {
+                block_caches[b.index()].push(k as u16);
+            }
+        }
+        (caches, block_caches)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spill_copies_ref(
+        graph: &Graph,
+        file: &RegisterFile,
+        (order, pos, head, tail): (&[BlockIx], &[u32], &[u32], &[u32]),
+        homes: &[Home],
+        ranges: &[(u32, u32)],
+        edges: &EdgeInputs,
+        used_callee_gp: &mut Vec<u8>,
+        fp_callee_across_effect: &mut bool,
+    ) -> Copies {
+        let mut copies = Copies::default();
+        if !homes.iter().any(|home| matches!(home, Home::Spill(_))) {
+            return copies;
+        }
+        let loops = natural_loops_ref(graph, order, (head, tail));
+        let mut depth = vec![0u32; graph.blocks.len()];
+        for l in &loops {
+            for &b in &l.blocks {
+                depth[b.index()] += 1;
+            }
+        }
+        // Each register's ranges, by start (they do not overlap: one value a register at a time).
+        let mut held: [Vec<Vec<(u32, u32)>>; 2] = [vec![Vec::new(); 32], vec![Vec::new(); 32]];
+        for (v, home) in homes.iter().enumerate() {
+            match *home {
+                Home::Gp(r) => held[0][r as usize].push(ranges[v]),
+                Home::Fp(r) => held[1][r as usize].push(ranges[v]),
+                _ => {}
+            }
+        }
+        for list in held.iter_mut().flatten() {
+            list.sort_unstable();
+        }
+        if !loops.is_empty() {
+            (copies.caches, copies.block_caches) = loop_caches_ref(
+                graph,
+                file,
+                &loops,
+                &depth,
+                homes,
+                edges,
+                &held,
+                used_callee_gp,
+                fp_callee_across_effect,
+            );
+            for c in &copies.caches {
+                match c.reg {
+                    Home::Gp(r) => hold(&mut held[0][r as usize], c.hull),
+                    Home::Fp(r) => hold(&mut held[1][r as usize], c.hull),
+                    _ => {}
+                }
+            }
+        }
+        (copies.spans, copies.block_spans) = read_spans_ref(
+            graph,
+            file,
+            (order, pos, head),
+            homes,
+            &depth,
+            (&copies.caches, &copies.block_caches),
+            &mut held,
+            used_callee_gp,
+        );
+        copies
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn read_spans_ref(
+        graph: &Graph,
+        file: &RegisterFile,
+        (order, pos, head): (&[BlockIx], &[u32], &[u32]),
+        homes: &[Home],
+        depth: &[u32],
+        (caches, block_caches): (&[Cache], &[Vec<u16>]),
+        held: &mut [Vec<Vec<(u32, u32)>>; 2],
+        used_callee_gp: &[u8],
+    ) -> (Vec<Span>, Vec<Vec<u16>>) {
+        // (block, value, the calls before it in the block, position) of each read of a spilled value
+        // no loop cache holds there: a run is one block, value and call count.
+        let mut reads: Vec<(u32, u32, u32, u32)> = Vec::new();
+        for &b in order {
+            let cached = |v: NodeIx| {
+                block_caches
+                    .get(b.index())
+                    .is_some_and(|ks| ks.iter().any(|&k| caches[k as usize].value == v))
+            };
+            let mut calls = 0u32;
+            for &node in &graph.block(b).body {
+                let p = pos[node.index()];
+                for &input in &graph.node(node).inputs {
+                    if matches!(homes[input.index()], Home::Spill(_)) && !cached(input) {
+                        reads.push((b.0, input.0, calls, p));
+                    }
+                }
+                if graph.node(node).op.is_effectful() {
+                    calls += 1;
+                }
+            }
+        }
+        if reads.len() < 2 {
+            return (Vec::new(), Vec::new());
+        }
+        reads.sort_unstable();
+        // (weight, first, end) of each run of two reads or more, as indices into `reads`.
+        let mut runs: Vec<(u64, u32, u32)> = Vec::new();
+        let mut first = 0;
+        while first < reads.len() {
+            let key = |k: usize| (reads[k].0, reads[k].1, reads[k].2);
+            let mut end = first + 1;
+            while end < reads.len() && key(end) == key(first) {
+                end += 1;
+            }
+            if end - first >= 2 {
+                let frequency = FREQUENCY[(depth[reads[first].0 as usize] as usize).min(9)];
+                runs.push((
+                    (end - first - 1) as u64 * frequency,
+                    first as u32,
+                    end as u32,
+                ));
+            }
+            first = end;
+        }
+        runs.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        // The registers a span may take, by class: caller-saved, then the callee-saved x registers
+        // the prologue saves already.
+        let gp_regs: Vec<u8> = file
+            .gp_caller
+            .iter()
+            .chain(file.gp_callee.iter().filter(|r| used_callee_gp.contains(r)))
+            .copied()
+            .collect();
+        let mut spans: Vec<Span> = Vec::new();
+        for &(_, first, end) in &runs {
+            let run = &reads[first as usize..end as usize];
+            let (block, v) = (BlockIx(run[0].0), NodeIx(run[0].1));
+            let Some(class) = class_of(graph.node(v).rep) else {
+                continue;
+            };
+            let (ci, regs): (usize, &[u8]) = match class {
+                Class::Gp => (0, &gp_regs),
+                Class::Fp => (1, file.fp_caller),
+            };
+            // The registers of the class free from position `p` to `q` in the block: no range in
+            // them overlaps, and no stub call of the block's nodes there clobbers them.
+            let body = &graph.block(block).body;
+            let base = head[block.index()] + 2;
+            let free = |held: &[Vec<Vec<(u32, u32)>>; 2], p: u32, q: u32| {
+                let clobbered = body[((p - base) / 2) as usize..=((q - base) / 2) as usize]
+                    .iter()
+                    .fold(0u64, |acc, &n| {
+                        let (gp, fp) = clobbers(&graph.node(n).op);
+                        acc | if ci == 0 { gp } else { fp }
+                    });
+                regs.iter().fold(0u64, |mask, &r| {
+                    if clobbered & (1 << r) == 0 && free_over(&held[ci][r as usize], (p, q)) {
+                        mask | (1 << r)
+                    } else {
+                        mask
+                    }
+                })
+            };
+            // Segments of the run, each the longest from its first read through which a register
+            // stays free, up to the definition of its last reading node's value (to + 1), so that the
+            // span's register is no home its readers write: a node may write its output before it
+            // reads all its inputs, and a cold path's restore would put the copy back over it.
+            let mut take = |held: &mut [Vec<Vec<(u32, u32)>>; 2], from: u32, to: u32, mask: u64| {
+                let r = regs
+                    .iter()
+                    .copied()
+                    .find(|&r| mask & (1 << r) != 0)
+                    .expect("a free register");
+                hold(&mut held[ci][r as usize], (from, to));
+                spans.push(Span {
+                    value: v,
+                    reg: if ci == 0 { Home::Gp(r) } else { Home::Fp(r) },
+                    block,
+                    from,
+                    to,
+                });
+            };
+            let mut start = 0;
+            let mut mask = 0u64;
+            for k in 1..run.len() {
+                let step = free(held, run[k - 1].3, run[k].3 + 1);
+                let next = if k - 1 == start { step } else { mask & step };
+                if next != 0 {
+                    mask = next;
+                    continue;
+                }
+                if k - 1 > start {
+                    take(held, run[start].3, run[k - 1].3, mask);
+                }
+                start = k;
+                mask = 0;
+            }
+            if run.len() - 1 > start {
+                take(held, run[start].3, run[run.len() - 1].3, mask);
+            }
+        }
+        if spans.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        spans.sort_unstable_by_key(|s| (s.block, s.from, s.value));
+        let mut block_spans: Vec<Vec<u16>> = vec![Vec::new(); graph.blocks.len()];
+        for (k, s) in spans.iter().enumerate() {
+            block_spans[s.block.index()].push(k as u16);
+        }
+        (spans, block_spans)
+    }
+
+    /// F5's copies equal the reference's (`spill_copies_ref`, B's passes) for this allocation:
+    /// the same loop caches and read spans and the same callee-saved x registers.
+    pub(crate) fn assert_reference(graph: &Graph, file: &RegisterFile, alloc: &Allocation) {
+        let order = &alloc.order;
+        let mut head = vec![u32::MAX; graph.blocks.len()];
+        let mut tail = vec![u32::MAX; graph.blocks.len()];
+        let mut next = 0u32;
+        for &b in order {
+            head[b.index()] = next;
+            next += 2 + 2 * graph.block(b).body.len() as u32;
+            tail[b.index()] = next - 1;
+        }
+        let reads = Reads::new(graph);
+        let edges = EdgeInputs::new(graph, order, &reads).expect("the allocation's edges");
+        let mut used: Vec<u8> = file
+            .gp_callee
+            .iter()
+            .copied()
+            .filter(|&r| alloc.homes.contains(&Home::Gp(r)))
+            .collect();
+        let mut fp = false;
+        let copies = spill_copies_ref(
+            graph,
+            file,
+            (order, &alloc.pos, &head, &tail),
+            &alloc.homes,
+            &alloc.ranges,
+            &edges,
+            &mut used,
+            &mut fp,
+        );
+        used.sort_unstable();
+        assert_eq!(
+            copies.caches, alloc.caches,
+            "the loop caches differ from B's"
+        );
+        assert_eq!(
+            copies.block_caches, alloc.block_caches,
+            "the blocks' caches differ"
+        );
+        assert_eq!(copies.spans, alloc.spans, "the read spans differ from B's");
+        assert_eq!(
+            copies.block_spans, alloc.block_spans,
+            "the blocks' spans differ"
+        );
+        assert_eq!(
+            used, alloc.callee_saved_gp,
+            "the callee-saved x registers differ"
+        );
     }
 
     /// `live_at` (its index) and `live_at_scan` at each node the allocation scheduled.
@@ -2891,6 +3549,131 @@ pub(crate) mod tests {
             matches!(span.reg, Home::Gp(r) if ARM64.gp_caller.contains(&r)),
             "{span:?}"
         );
+    }
+
+    #[test]
+    fn the_skip_rules_keep_a_single_loop_read_two_block_reads_and_a_doubled_input() {
+        // F5's skip rules (`spill_copies`) must not skip what one read or one pair can make.
+        // A value spilled before a loop and read once in it, with no other spilled value read
+        // twice in a block (no run): the loop rule alone admits it, and it takes a cache.
+        let l = looped(1, 0, |g, b, q, vs| compare_each(g, b, q, vs, 1));
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert!(matches!(alloc.homes[l.values[0].index()], Home::Spill(_)));
+        assert!(alloc.spans.is_empty(), "{:?}", alloc.spans);
+        assert_eq!(alloc.caches.len(), 1, "{:?}", alloc.caches);
+        assert_eq!(alloc.caches[0].value, l.values[0]);
+        // Two reads of a spilled value in a block with no loop and no call between: the run rule
+        // alone admits them, and they share a span.
+        let (g, v) = straight(|g, b, acc, v| compare_each(g, b, acc, &[v], 2));
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        assert!(alloc.caches.is_empty());
+        let [span] = alloc.spans[..] else {
+            panic!("{:?}", alloc.spans)
+        };
+        assert!(span.value == v && span.from < span.to, "{span:?}");
+        // One node that reads it twice (`v == v`): a run of one node, a span over it.
+        let (g, v) = straight(|g, b, acc, v| {
+            let same = g.add_node(b, NodeOp::TaggedSame, &[v, v], Rep::Bool, 2);
+            let word = g.add_node(b, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2);
+            let same = g.add_node(b, NodeOp::TaggedSame, &[acc, word], Rep::Bool, 2);
+            g.add_node(b, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2)
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
+        let [span] = alloc.spans[..] else {
+            panic!("{:?}", alloc.spans)
+        };
+        assert!(span.value == v && span.from == span.to, "{span:?}");
+    }
+
+    #[test]
+    fn a_one_block_loop_whose_header_is_its_own_latch_is_not_skipped() {
+        // F5's loop rule takes a header's predecessor at or after it in the code order: the
+        // header itself, where the loop is one block. The value spilled before it and read once
+        // in it (no run: the rule for spans does not admit it) takes a cache.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let exit = g.add_block(2, false);
+        g.entry = Some(entry);
+        g.add_edge(entry, header);
+        g.add_edge(header, header);
+        g.add_edge(header, exit);
+        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
+        let v = word(&mut g);
+        let mut acc = words[0];
+        for &w in &words[1..] {
+            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
+            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
+        }
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let q = g.add_node(header, NodeOp::Phi, &[acc], Rep::Tagged, 1);
+        let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
+        let ps = state(&mut g, 1, &[]);
+        let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
+        g.node_mut(poll).state = Some(ps);
+        let q2 = compare_each(&mut g, header, q, &[v], 1);
+        let one = g.add_node(header, NodeOp::ConstI32(1), &[], Rep::I32, 1);
+        let i2 = g.add_node(header, NodeOp::I32Or, &[i, one], Rep::I32, 1);
+        let hundred = g.add_node(header, NodeOp::ConstI32(100), &[], Rep::I32, 1);
+        let lt = g.add_node(
+            header,
+            NodeOp::I32Cmp(Cond::Lt),
+            &[i2, hundred],
+            Rep::Bool,
+            1,
+        );
+        g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: header,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            1,
+        );
+        g.node_mut(q).inputs.push(q2);
+        g.node_mut(i).inputs.push(i2);
+        g.add_node(exit, NodeOp::Return, &[q2], Rep::None, 2);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            matches!(alloc.homes[v.index()], Home::Spill(_)),
+            "{:?}",
+            alloc.homes[v.index()]
+        );
+        assert!(alloc.spans.is_empty(), "{:?}", alloc.spans);
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        assert_eq!((cache.value, cache.header), (v, header));
+        assert!(alloc.enters_loaded(header, header));
+        assert!(!alloc.enters_loaded(entry, header));
+    }
+
+    #[test]
+    fn a_value_only_a_loops_back_edge_carries_takes_a_cache() {
+        // The body reads nothing of v but gives it to the header's phi on its back edge: a read on
+        // the edge, at the body's tail, which the copies' reads must hold (an edge move reads the
+        // cache), as B's scan of each loop block's edges did.
+        let l = looped(1, 0, |_, _, _, vs| vs[0]);
+        let alloc = allocate(&l.g, &ARM64).unwrap();
+        assert_consistent(&l.g, &alloc);
+        let v = l.values[0];
+        assert!(
+            matches!(alloc.homes[v.index()], Home::Spill(_)),
+            "{:?}",
+            alloc.homes[v.index()]
+        );
+        let [cache] = alloc.caches[..] else {
+            panic!("{:?}", alloc.caches)
+        };
+        assert_eq!((cache.value, cache.header), (v, l.header));
+        assert_eq!(alloc.cache_of(l.body, v), Some(cache.reg));
     }
 
     #[test]
