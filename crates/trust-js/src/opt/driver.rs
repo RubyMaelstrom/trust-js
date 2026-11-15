@@ -161,6 +161,10 @@ thread_local! {
     /// (stage 2, step 13).
     pub(crate) static TEST_LIMITS: std::cell::RefCell<Vec<(Limit, u32)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// The stale-chain requests of first stages compiled in place under graph inlining (chunk,
+    /// the warm-up checkpoint made due, if one was armed; P3 stage 3, step 4p, rule 2a).
+    pub(crate) static TEST_CHAIN_REQUESTS: std::cell::RefCell<Vec<(usize, Option<u8>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The guards (chunk, pc) a reoptimization's re-read of its call ways flagged
     /// (`reread_call_ways`; P3 stage 3, step 4p, rule 5).
     pub(crate) static TEST_REREAD: std::cell::RefCell<Vec<(usize, usize)>> =
@@ -2241,6 +2245,43 @@ fn flag_as(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>, reason: Ex
             exit.pc,
             reason
         );
+    }
+}
+
+/// A stale-chain request of `chunk`, a first stage the tier compiled in place under graph
+/// inlining (`Chunk::note_chain_replay`; P3 stage 3, step 4p, rule 2a): no recompile of its
+/// bytecode, which would plan its splices afresh from the first stage's caches the fallback kept
+/// filling (GBEMU's executeIteration: 358 ops of splices where its first compile inlined one way,
+/// and memoryReadNormal no longer inlined), but the tier's own reoptimization: an armed warm-up's
+/// checkpoint due at once, at this entry, the settled rule applying, the first compile's ways
+/// kept (`opt::oracle`'s Request::Kept), as V8 and SpiderMonkey compile the function's one
+/// bytecode again and JSC its baseline code block's copy; with no warm-up armed (the tier's code
+/// installed, or none to come) nothing: the template code keeps its chains until then.
+pub(crate) fn chain_request_in_place(chunk: &Chunk) {
+    let profile = ChunkProfile::of(chunk);
+    let due = profile.warm_up().map(|(checkpoint, _)| {
+        let runs = chunk.jit_runs.get();
+        profile.arm(checkpoint, runs);
+        chunk.set_inline_retry_at(runs.max(1));
+        checkpoint
+    });
+    #[cfg(test)]
+    TEST_CHAIN_REQUESTS.with(|requests| {
+        requests
+            .borrow_mut()
+            .push((chunk as *const Chunk as usize, due))
+    });
+    if log_enabled() {
+        match due {
+            Some(checkpoint) => log_line!(
+                "[opt] stale chains of {}: its warm-up's checkpoint {checkpoint} due now, no recompile",
+                name(chunk)
+            ),
+            None => log_line!(
+                "[opt] stale chains of {}: no warm-up armed, no recompile",
+                name(chunk)
+            ),
+        }
     }
 }
 

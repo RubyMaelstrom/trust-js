@@ -624,6 +624,10 @@ fn no_later_checkpoint_builds_a_second_stage_over_the_tiers_code() {
 
 #[test]
 fn the_chain_recompile_supersedes_a_first_stage_that_carries_the_tiers_code() {
+    // The splice's recompile is this test's subject: under graph inlining an in-place first
+    // stage's request makes no recompile (P3 stage 3, step 4p, rule 2a: opt::tier_tests::
+    // chain_request).
+    super::pin_splice_for_test();
     let (mut engine, first) = add_in_place(synchronous());
     eval(
         &mut engine,

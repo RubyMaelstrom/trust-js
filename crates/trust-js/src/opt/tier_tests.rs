@@ -3556,3 +3556,7 @@ mod warm_up;
 /// P3 stage 3 step 4p, rule 5: a reoptimization re-reads its call sites' ways, end to end.
 #[path = "reread_tier_tests.rs"]
 mod reread;
+
+/// P3 stage 3 step 4p, rule 2a: a stale-chain request of a first stage compiled in place, end to end.
+#[path = "chain_request_tier_tests.rs"]
+mod chain_request;

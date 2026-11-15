@@ -265,6 +265,8 @@ mod off {
         false
     }
 
+    pub(crate) fn chain_request_in_place(_: &Chunk) {}
+
     pub(crate) fn in_place(_: &Chunk) -> bool {
         false
     }
