@@ -5741,3 +5741,67 @@ above the splice on 13bfd95f (the record above) were measured per access site on
   depth and the call counts) and the direct call's (step 7), not a fault.
 - The tier's and the back end's modules on 13bfd95f (mine, 638 tests): graph eager, graph
   forced, graph, on and forced pass.
+
+Stage 3 steps 6 and 7, the input and the decisions (2026-11-15; target/p3/stage3/step67-impl,
+piece0-tables.txt and design-note.txt, counted with a probe on d2f16daf at both modes over every
+workload at 5 and 200 runs; nothing built). The counts reorder the stage's remaining steps.
+- Step 6 as designed, closures guarded by code, removes nothing: no WrongCallee exit in any run
+  is another closure of its guard's function (56 at the splice in TypeScript at 200 runs, of a
+  way never reached); no discard to spare.
+- The largest class of WrongCallee exits is a planned way behind its site's first check: at a
+  first compile the first way is a check that ends the chain and the later ways are not built
+  (build_inline.rs Builder::call; the splice's guards the same), and step 4p's re-read flags
+  only callees outside every kept way, so a site of several planned callees is learnt one way
+  a round of exits and a discard: TypeScript 6,728 of 8,763 exits at graph at 5 runs and 28 of
+  47 discards (9,483 exits and 46 of 68 at 200 runs), DeltaBlue at 200 runs 1,760 exits and 27
+  of 28 discards. This is the owner's answer on D7, not yet built.
+- Calls never inlined though one function's code is called: React's reducer passes a fresh
+  arrow to the self-hosted map, which the graph inlines; the callback's call is a call node
+  over map's shared cache (three functions; the planner declines it): 4.12M calls in React's
+  steady state, 446K in the fixture, about 30% and 27% of their instructions at a call's cost.
+  Others: Djot's steady state 597K at 41 sites, Earley-Boyer 1.9M and PdfJS 1.7M at 200 runs.
+- A call node costs 163 instructions outside the callee (8 of operand stores, 19 the cache's
+  probe, 23 of gates, 28 the frame's push and moves, 17 the install, 44 after the return, the
+  finish stub's 27 among them); the same from an inlined frame. User callees take the direct
+  sequence (the helper under 0.6% everywhere). A call to a known callee would drop 35 to 42 of
+  the 163; the rest is the frame model (a pooled record, the frame side stack, the depth
+  counter, the finish stub), where Maglev's CallKnownJSFunction (maglev-ir.cc:7562-7598) and
+  JSC's DirectCall are 6 to 8 before the callee's prologue. At 35 a call over monomorphic
+  sites: Earley-Boyer 2.95%, React's fixture 2.75%, Splay 1.73%, Djot's steady state 1.46%,
+  Mandreel 1.25%, TypeScript 1.00%, GBEMU 0.60%.
+- Constructs outside the direct path, at every tier. A construct and one field read cost, the
+  tier off / on: an ordinary constructor 558 / 441; one without an instance layout (its stores
+  after a branch) 1,325 / 1,200; Prototype.js's Class.create forwarder
+  (`this.initialize.apply(this, arguments)`, recognised and run in Rust) 1,575 / 1,525;
+  box2dweb's `F.init.apply(this, arguments)` (not recognised: an arguments object and an
+  apply) 3,837 / 3,660. RayTrace makes 332K of the third kind in a 5-run run: 34% of its
+  instructions with the tier off, 39% at the splice, 41% at graph above what the direct path
+  would cost; Box2D 107K of the fourth, 8 to 14%. The exemplars' baseline tiers materialise
+  the arguments object there and gain in their optimizing tiers (the constructor inlined, the
+  apply of the frame's arguments reduced to a call: js-call-reducer.cc:4945-4983,
+  maglev-graph-builder.cc:11730-11756, DFGArgumentsEliminationPhase.cpp:1292-1323,
+  ScalarReplacement.cpp:2406-2440), `this` allocated from a template made at the first
+  constructions.
+- Decided, mine, in this order (the agent's recommendation in each case):
+  A. Constructs, the first stage's and the runtime's, measured with the tier off first: a
+     machine-code form of the forwarder the first stage already recognises (the allocation from
+     the initializer's learned layout, `initialize` and `apply` proven in line, initialize
+     entered directly with the caller's arguments, the helper on any miss), then a layout
+     learned from the first constructions for constructors the pass cannot predict, then the
+     recogniser extended to an initializer read from a binding. No exemplar has a baseline
+     fast path for a forwarding constructor; this moves an existing path of the first stage to
+     machine code, and the tier's construct inline and apply reduction stay the end state (the
+     design's step 9). Built by the steps 6/7 agent.
+  B. A callee that is the graph's own closure, Maglev's form (TryReduceCallForNewClosure,
+     maglev-graph-builder.cc:11963-11980): the creation's function and environment node carried
+     to the inlined frame's call node, the way taken with no guard and no feedback, the inlined
+     body's environment a value, the closure's allocation kept. Mine added: the candidate
+     functions come from the compiled function's own creations passed to calls the plan
+     inlines, not from the callee site's cache, which is shared by every caller of a
+     self-hosted function. Built by step 3e's agent after rule K and D.
+  C. The direct call to a known callee: after A and B have numbers.
+  D. Every planned way of a site built as a test from the first compile, the last a check or
+     the generic call (D7). Built by step 3e's agent after rule K.
+  E. The holder record of a prototype way: not now (a constant holder saves nothing without a
+     dependency on the holder's property; its one consumer is the arm by load shape).
+  F. Guards by code: not now; B takes React's case without them.
