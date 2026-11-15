@@ -405,7 +405,7 @@ fn a_sloppy_callee_that_reads_this_has_its_receiver_checked_a_strict_ones_is_not
         assert!(
             loads.iter().any(|&load| {
                 let cell = graph.node(graph.node(load).inputs[0]);
-                matches!(cell.op, NodeOp::CheckShape(_)) && cell.inputs[0] == frame.receiver
+                matches!(cell.op, NodeOp::CheckShape { .. }) && cell.inputs[0] == frame.receiver
             }),
             "{name}: the callee's `this` is its receiver\n{}",
             dump(graph)
@@ -870,7 +870,7 @@ fn value_facts_flow_into_a_callee_and_back() {
     // o.v's load (cn's is the global object's).
     let loads = nodes(graph, |node| {
         matches!(node.op, NodeOp::LoadField { .. })
-            && matches!(graph.node(node.inputs[0]).op, NodeOp::CheckShape(_))
+            && matches!(graph.node(node.inputs[0]).op, NodeOp::CheckShape { .. })
     });
     let [load] = loads[..] else {
         panic!("{}", dump(graph))
@@ -887,7 +887,7 @@ fn value_facts_flow_into_a_callee_and_back() {
     assert_eq!(graph.frames.len(), 1, "{}", dump(graph));
     let loads = nodes(graph, |node| {
         matches!(node.op, NodeOp::LoadField { .. })
-            && matches!(graph.node(node.inputs[0]).op, NodeOp::CheckShape(_))
+            && matches!(graph.node(node.inputs[0]).op, NodeOp::CheckShape { .. })
     });
     let [load] = loads[..] else {
         panic!("{}", dump(graph))
@@ -4357,4 +4357,267 @@ fn a_callees_jump_only_return_block_takes_the_callers_boxing_in_its_frame() {
             .is_some_and(|profile| !profile.inline_ways().is_empty()),
         "g inlined"
     );
+}
+// ---- P3 stage 3 step 3f: rule K, the receiver's known shapes -----------------------------------
+
+/// Rule K's fixture: `rx` reads `x`, which P keeps at slot 0 and Q at slot 1, so its own feedback
+/// (direct calls with both) is two arms; `f` reads `o.y` of P alone, so its receiver is proven P
+/// when `rx` is inlined; `h` reads `o.y` of P and R (one slot: one check of both) and calls `rx`
+/// only when `k`, which R never passes in the warm-up, so that `rx`'s feedback holds P and Q and
+/// `h`'s facts P and R.
+const KNOWN: &str = "
+function P() { this.x = 1; this.y = 10; }
+function Q() { this.y = 20; this.x = 2; }
+function R() { this.z = 0; this.y = 30; this.x = 3; }
+function rx(o) { return o.x; }
+function f(o) { return o.y + rx(o); }
+function h(o, k) { var t = o.y; if (k) t = t + rx(o); return t; }
+var p = new P(), q = new Q(), r = new R();
+for (var i = 0; i < 400; i++) { rx(p); rx(q); f(p); h(p, true); h(r, false); }";
+
+/// The receiver shapes of the named site at `pc` of `chunk`'s feedback, most recent first, and
+/// its generic mark.
+fn named_shapes(chunk: &Chunk, pc: u32) -> (Vec<u32>, bool) {
+    let named = Snapshot::take(chunk)
+        .named(pc as usize)
+        .expect("a named view");
+    (
+        named.filled().map(|way| way.receiver_shape).collect(),
+        named.generic,
+    )
+}
+
+fn named_read(op: &Op) -> bool {
+    matches!(op, Op::GetProp(..) | Op::GetPropLocal(..))
+}
+
+#[test]
+fn a_reads_arms_and_check_keep_the_shapes_its_receivers_facts_allow() {
+    let mut engine = warmed(KNOWN);
+    let rx = chunk_of(&mut engine, "rx");
+    let load = pc_of(&rx, named_read);
+    let (ways, _) = named_shapes(&rx, load);
+    assert_eq!(ways.len(), 2, "rx's two ways");
+    let in_frame = |graph: &Graph, frame: u32, is: &dyn Fn(&NodeOp) -> bool| {
+        nodes(graph, |node| node.frame == FrameIx(frame) && is(&node.op)).len()
+    };
+    // rx alone proves nothing of its receiver: its two arms, one test of the first.
+    let built = Compile::new(&mut engine, "rx").build();
+    let graph = &built.graph;
+    assert_eq!(
+        in_frame(graph, 0, &|op| matches!(op, NodeOp::ShapeIs(_))),
+        1,
+        "rx: {}",
+        dump(graph)
+    );
+    assert!(graph.narrowed.is_empty(), "rx: {:?}", graph.narrowed);
+    // f proves P: rx's read is P's arm alone, no check, no test, no join.
+    let built = Compile::new(&mut engine, "f").build();
+    let graph = &built.graph;
+    let text = dump(graph);
+    for (what, is) in [
+        (
+            "test",
+            &(|op: &NodeOp| matches!(op, NodeOp::ShapeIs(_))) as &dyn Fn(&NodeOp) -> bool,
+        ),
+        ("check", &|op: &NodeOp| {
+            matches!(op, NodeOp::CheckShape { .. })
+        }),
+        ("join", &|op: &NodeOp| *op == NodeOp::Phi),
+    ] {
+        assert_eq!(in_frame(graph, 1, is), 0, "f: rx's {what}\n{text}");
+    }
+    assert_eq!(
+        in_frame(graph, 1, &|op| matches!(op, NodeOp::LoadField { .. })),
+        1,
+        "f: rx's one load\n{text}"
+    );
+    assert!(
+        graph
+            .narrowed
+            .iter()
+            .any(|narrowed| narrowed.frame == FrameIx(1)
+                && narrowed.arms
+                && narrowed.kept == 1
+                && narrowed.of == 2),
+        "f: {:?}",
+        graph.narrowed
+    );
+    // h proves P and R: rx's check keeps P alone of its two ways, which its exit keeps, and its
+    // read is P's arm.
+    let built = Compile::new(&mut engine, "h").build();
+    let graph = &built.graph;
+    let text = dump(graph);
+    let checks = nodes(graph, |node| {
+        node.frame == FrameIx(1) && matches!(node.op, NodeOp::CheckShape { .. })
+    });
+    let [check] = checks[..] else {
+        panic!("h: rx's one check\n{text}")
+    };
+    let NodeOp::CheckShape {
+        shapes,
+        ways: count,
+    } = &graph.node(check).op
+    else {
+        unreachable!()
+    };
+    assert_eq!(*count, 2, "h: the check keeps the site's two ways\n{text}");
+    assert!(
+        shapes.len() == 1 && ways.contains(&shapes[0]),
+        "h: one of rx's shapes\n{text}"
+    );
+    assert_eq!(
+        in_frame(graph, 1, &|op| matches!(op, NodeOp::ShapeIs(_))),
+        0,
+        "h: no test\n{text}"
+    );
+}
+
+#[test]
+fn a_narrowed_checks_exit_keeps_the_sites_ways_and_its_resumed_read_fills_the_shape() {
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(&mut engine, KNOWN);
+    let h = chunk_of(&mut engine, "h");
+    let rx = chunk_of(&mut engine, "rx");
+    assert!(super::in_place(&h), "h compiled in place");
+    let load = pc_of(&rx, named_read);
+    let (before, _) = named_shapes(&rx, load);
+    assert_eq!(before.len(), 2, "rx's two ways");
+    inlined_exits();
+    // One R through h's inlined rx: the check, which keeps P alone, exits WrongShape there, and
+    // the resumed read (rx's first stage, at the same pc) fills R's way in rx's cache.
+    assert_eq!(eval(&mut engine, "h(r, true)"), "33");
+    let exits = inlined_exits();
+    assert_eq!(
+        exits
+            .iter()
+            .filter(|&&(_, pc, reason)| pc == load && reason == ExitReason::WrongShape)
+            .count(),
+        1,
+        "{exits:?}"
+    );
+    let (after, generic) = named_shapes(&rx, load);
+    assert!(
+        !generic && after.len() == 3 && before.iter().all(|shape| after.contains(shape)),
+        "the resumed read filled R's way: {before:?} -> {after:?}"
+    );
+    // Until h's code is discarded at its limit, its flag the site's two ways, not the check's
+    // one shape, and h compiles again on rx's three ways: P's and R's arms, no further exit
+    // there; one discard.
+    eval(
+        &mut engine,
+        "for (var i = 0; i < 400; i++) { h(r, true); h(p, true); }",
+    );
+    let mut data = Vec::new();
+    ChunkProfile::get(&rx)
+        .expect("rx's record")
+        .sites_at(load, |reason, inlined, ways| {
+            if reason == ExitReason::WrongShape as u8 {
+                data.push((inlined, ways));
+            }
+        });
+    // (rx's own code, which h's first stage calls once h's is discarded, flags its own key.)
+    assert!(
+        data.contains(&(true, 2)) && data.iter().all(|&(_, ways)| ways == 2),
+        "the flag's data: the site's two ways: {data:?}"
+    );
+    inlined_exits();
+    let out = eval(
+        &mut engine,
+        "var t = 0; for (var i = 0; i < 300; i++) t += h(r, true) + h(p, true); t",
+    );
+    assert_eq!(out, (300 * (33 + 11)).to_string());
+    assert!(super::in_place(&h), "h compiled in place again");
+    assert!(
+        !inlined_exits()
+            .iter()
+            .any(|&(_, pc, reason)| pc == load && reason == ExitReason::WrongShape),
+        "converged"
+    );
+    assert_eq!(ChunkProfile::get(&h).map_or(0, ChunkProfile::discards), 1);
+}
+
+/// The always-wrong case: `rx4`'s cache is full (four shapes keeping `x` at slot 0, from direct
+/// calls) and `h4` proves W (its own read of `w`, which only W reaches), which keeps `x` at slot
+/// 1 and which `rx4`'s read never saw (`h4` passes `m` false in the warm-up): the facts allow
+/// none of the check's shapes, so it checks them all and exits every time W reaches it; the
+/// resumed read finds the cache full and marks the site generic, and h4 compiles again with the
+/// generic read.
+const DISJOINT: &str = "
+function rx4(o, m) { return m ? o.x : 0; }
+function h4(o, m) { return o.w + rx4(o, m); }
+var s = [{x: 1, a: 0}, {x: 2, b: 0}, {x: 3, c: 0}, {x: 4, d: 0}], w = {w: 10, x: 5};
+for (var i = 0; i < 400; i++) { rx4(s[i & 3], true); h4(w, false); }";
+
+#[test]
+fn facts_that_allow_none_of_a_checks_shapes_exit_until_the_site_is_generic() {
+    let mut engine = warmed(DISJOINT);
+    let built = Compile::new(&mut engine, "h4").build();
+    assert!(
+        built
+            .graph
+            .narrowed
+            .iter()
+            .any(|narrowed| narrowed.frame == FrameIx(1) && narrowed.kept == 0 && narrowed.of == 4),
+        "{:?}\n{}",
+        built.graph.narrowed,
+        dump(&built.graph)
+    );
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    eval(&mut engine, DISJOINT);
+    let h4 = chunk_of(&mut engine, "h4");
+    let rx4 = chunk_of(&mut engine, "rx4");
+    assert!(super::in_place(&h4), "h4 compiled in place");
+    let load = pc_of(&rx4, named_read);
+    let (ways, generic) = named_shapes(&rx4, load);
+    assert!(ways.len() == 4 && !generic, "rx4's four ways: {ways:?}");
+    let out = eval(
+        &mut engine,
+        "var t = 0; for (var i = 0; i < 2000; i++) t += h4(w, true); t",
+    );
+    assert_eq!(out, (2000 * 15).to_string());
+    let (_, generic) = named_shapes(&rx4, load);
+    assert!(generic, "rx4's site generic");
+    assert_eq!(ChunkProfile::get(&h4).map_or(0, ChunkProfile::discards), 1);
+    inlined_exits();
+    eval(
+        &mut engine,
+        "var t = 0; for (var i = 0; i < 300; i++) t += h4(w, true); t",
+    );
+    assert!(super::in_place(&h4), "h4 compiled in place again");
+    assert!(
+        !inlined_exits()
+            .iter()
+            .any(|&(_, pc, reason)| pc == load && reason == ExitReason::WrongShape),
+        "no exit at the generic read"
+    );
+}
+
+#[test]
+fn known_shapes_give_the_tier_offs_results() {
+    let source = format!(
+        "{KNOWN}; {DISJOINT};
+         var t = 0;
+         for (var i = 0; i < 300; i++) t += h(r, true) + f(p) + h(p, true) + h4(w, true) + rx4(s[i & 3], true);
+         t"
+    );
+    let runs = counted(&source, 0, false, false);
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    assert_eq!(runs[2].0, runs[0].0, "graph");
+    for (exit_every, stress, poison) in [
+        (7, false, false),
+        (1, false, false),
+        (0, true, false),
+        (0, false, true),
+    ] {
+        super::take_poison_faults();
+        let runs = counted(&source, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
 }

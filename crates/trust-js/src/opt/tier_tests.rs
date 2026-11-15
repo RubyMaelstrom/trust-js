@@ -1317,7 +1317,7 @@ fn stays_an_effect(chunk: &crate::bytecode::Chunk, pc: usize) -> bool {
     !graph
         .nodes
         .iter()
-        .any(|node| matches!(node.op, NodeOp::CheckShape(_)))
+        .any(|node| matches!(node.op, NodeOp::CheckShape { .. }))
         && graph
             .nodes
             .iter()
@@ -1624,7 +1624,7 @@ fn an_uncacheable_receiver_converges_on_the_generic_access() {
     assert!(!graph
         .nodes
         .iter()
-        .any(|node| matches!(node.op, super::ir::NodeOp::CheckShape(_))));
+        .any(|node| matches!(node.op, super::ir::NodeOp::CheckShape { .. })));
 }
 
 #[test]
@@ -1642,7 +1642,7 @@ fn a_new_shape_that_fills_a_way_is_checked_again() {
     let graph = graph_now(&chunk);
     assert!(graph.declines.is_empty(), "{:?}", graph.declines);
     assert!(graph.nodes.iter().any(
-        |node| matches!(&node.op, super::ir::NodeOp::CheckShape(shapes) if shapes.len() == 2)
+        |node| matches!(&node.op, super::ir::NodeOp::CheckShape { shapes, .. } if shapes.len() == 2)
     ));
 }
 

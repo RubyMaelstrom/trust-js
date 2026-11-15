@@ -27,7 +27,7 @@ fn assert_exits_at(graph: &Graph, pc: usize, text: &str) {
     for node in graph.nodes.iter().filter(|node| {
         matches!(
             node.op,
-            NodeOp::CheckShape(_) | NodeOp::CheckProto { .. } | NodeOp::CheckStringProto { .. }
+            NodeOp::CheckShape { .. } | NodeOp::CheckProto { .. } | NodeOp::CheckStringProto { .. }
         )
     }) {
         assert_eq!(node.reason, Some(ExitReason::WrongShape), "{text}");
@@ -58,11 +58,14 @@ fn a_method_on_the_prototype_is_its_receivers_check_the_holders_and_its_field() 
             .any(|node| matches!(node.op, NodeOp::Effect { pc: at, .. } if at as usize == pc)),
         "{text}"
     );
-    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }));
     assert_eq!(checks.len(), 1, "{text}");
     assert_eq!(
         checks[0].op,
-        NodeOp::CheckShape(vec![way.receiver_shape]),
+        NodeOp::CheckShape {
+            shapes: vec![way.receiver_shape],
+            ways: 1,
+        },
         "{text}"
     );
     let hops = protos(&graph);
@@ -79,7 +82,7 @@ fn a_method_on_the_prototype_is_its_receivers_check_the_holders_and_its_field() 
     let receiver_check = graph
         .nodes
         .iter()
-        .position(|node| matches!(node.op, NodeOp::CheckShape(_)))
+        .position(|node| matches!(node.op, NodeOp::CheckShape { .. }))
         .expect("the receiver's check");
     assert_eq!(
         hops[0].inputs,
@@ -162,10 +165,10 @@ fn receivers_of_several_shapes_that_share_the_walk_are_checked_together() {
     );
     let (chunk, graph) = graph_of(&mut engine, "f");
     let text = dump(&graph, &chunk);
-    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }));
     assert_eq!(checks.len(), 1, "{text}");
     assert!(
-        matches!(&checks[0].op, NodeOp::CheckShape(shapes) if shapes.len() == 2),
+        matches!(&checks[0].op, NodeOp::CheckShape { shapes, .. } if shapes.len() == 2),
         "{text}"
     );
     let hops = protos(&graph);
@@ -238,7 +241,7 @@ fn the_links_and_the_holders_field_are_facts_until_an_effect() {
     let text = dump(&graph, &chunk);
     assert_eq!(count(&graph, is_effect), 0, "{text}");
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         1,
         "one receiver check: {text}"
     );
@@ -312,8 +315,8 @@ fn a_flagged_walk_is_declined_unless_its_ways_grew() {
     let text = dump(&graph, &chunk);
     assert_eq!(protos(&graph).len(), 1, "{text}");
     assert!(
-        matches!(&nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)))[0].op,
-            NodeOp::CheckShape(shapes) if shapes.len() == 2),
+        matches!(&nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }))[0].op,
+            NodeOp::CheckShape { shapes, .. } if shapes.len() == 2),
         "{text}"
     );
     assert!(graph.declines.is_empty(), "{text}");
@@ -399,7 +402,7 @@ fn a_strings_method_is_its_tag_check_string_prototypes_and_its_field() {
             "{name}: {text}"
         );
         assert_eq!(
-            count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+            count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
             0,
             "{name}: {text}"
         );
@@ -448,9 +451,9 @@ fn receivers_of_several_walks_dispatch_on_their_shape() {
     for (name, hops, calls) in [("walks", 2, 1), ("slots", 0, 0), ("mixed", 1, 0)] {
         let (chunk, graph) = graph_of(&mut engine, name);
         let text = dump(&graph, &chunk);
-        let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+        let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }));
         assert_eq!(checks.len(), 1, "{name}: {text}");
-        let NodeOp::CheckShape(shapes) = &checks[0].op else {
+        let NodeOp::CheckShape { shapes, .. } = &checks[0].op else {
             unreachable!()
         };
         assert_eq!(shapes.len(), 2, "{name}: {text}");

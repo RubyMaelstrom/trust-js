@@ -72,7 +72,7 @@ use super::ir::{
     BlockData, BlockIx, Cond, Decline, ExitReason, FrameIx, FrameState, Graph, NodeIx, NodeOp,
     Refusal, Rep, SlotSource, StateIx,
 };
-use super::ir::{ElemKind, Holes, Store, TypedKind};
+use super::ir::{ElemKind, Holes, Narrowed, Store, TypedKind};
 use super::liveness::{frame_slots, slot_use, SlotLiveness, SlotUse};
 use super::snapshot::{Ran, Snapshot};
 use super::view::FrozenChunk;
@@ -2081,6 +2081,21 @@ fn arm_shapes(arms: &[Chain]) -> Vec<u32> {
         .collect()
 }
 
+/// Those of an access's receiver shapes `shapes` that the facts `known` allow, in the access's
+/// order (P3 stage 3 step 3f, rule K).
+fn allowed_shapes(shapes: &[u32], known: &[u32]) -> Vec<u32> {
+    shapes
+        .iter()
+        .copied()
+        .filter(|shape| known.contains(shape))
+        .collect()
+}
+
+/// An access's count of receiver shapes, as its checks' exits keep it (at most four).
+fn ways_of(shapes: &[u32]) -> u8 {
+    u8::try_from(shapes.len()).expect("at most four ways")
+}
+
 /// The values built once at the head of the entry block, where they dominate every use: the
 /// constants, `this`, and the slots' entry values (read where the frame still holds them).
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -2769,17 +2784,49 @@ impl<'a> Builder<'a> {
         truth
     }
 
-    /// The cell of an object word whose shape is one of `shapes`, checked unless the epoch's
-    /// facts prove it.
+    /// The cell of an object word whose shape is one of `shapes`, the access's receiver shapes,
+    /// checked unless the epoch's facts prove it. Rule K (P3 stage 3 step 3f): the check takes
+    /// only those of `shapes` the word's facts allow, as Maglev intersects an access's feedback
+    /// maps with the node's known maps before it checks them (KnownMapsMerger::
+    /// IntersectWithKnownNodeAspects, maglev-graph-builder.cc:4641-4650) and JSC filters a
+    /// MultiGetByOffset's cases by its base's abstract value (dfg/DFGConstantFoldingPhase.cpp:
+    /// 648-666); its exit keeps the access's count (`ways_of(shapes)`), so that a WrongShape flag
+    /// says what the site's ways were. Facts that allow none of them keep the check of them all,
+    /// which then always exits, as Maglev deopts unconditionally on an empty intersection
+    /// (:4652-4654): the resumed first stage's cache records the receiver's shape.
     fn shaped(&mut self, st: &mut State, cx: &mut Before, word: NodeIx, shapes: &[u32]) -> NodeIx {
+        // The shapes the facts allow, made only where they exclude some (no allocation
+        // otherwise, the compile's common case).
+        let allowed: Option<Vec<u32>> = st
+            .shapes
+            .get(&word)
+            .filter(|known| !shapes.iter().all(|shape| known.contains(shape)))
+            .map(|known| allowed_shapes(shapes, known));
+        let checked: &[u32] = match &allowed {
+            Some(allowed) if !allowed.is_empty() => allowed,
+            _ => shapes,
+        };
         if let (Some(known), Some(cell)) = (st.shapes.get(&word), self.forms(st, word).cell) {
-            if known.iter().all(|shape| shapes.contains(shape)) {
+            if known.iter().all(|shape| checked.contains(shape)) {
                 return cell;
             }
         }
+        if let Some(allowed) = &allowed {
+            self.graph.narrowed.push(Narrowed {
+                pc: cx.pc as u32,
+                frame: self.frame,
+                arms: false,
+                kept: ways_of(allowed),
+                of: ways_of(shapes),
+            });
+        }
+        let checked = checked.to_vec();
         let state = self.before(cx, st);
         let cell = self.add_exit(
-            NodeOp::CheckShape(shapes.to_vec()),
+            NodeOp::CheckShape {
+                shapes: checked.clone(),
+                ways: ways_of(shapes),
+            },
             &[word],
             Rep::Cell,
             cx.pc,
@@ -2793,22 +2840,7 @@ impl<'a> Builder<'a> {
         for member in forms.members() {
             st.forms.insert(member, forms);
         }
-        let proven = match st.shapes.get(&word) {
-            Some(known) => {
-                let both: Vec<u32> = known
-                    .iter()
-                    .copied()
-                    .filter(|shape| shapes.contains(shape))
-                    .collect();
-                if both.is_empty() {
-                    shapes.to_vec()
-                } else {
-                    both
-                }
-            }
-            None => shapes.to_vec(),
-        };
-        st.shapes.insert(word, proven);
+        st.shapes.insert(word, checked);
         cell
     }
 
@@ -4671,6 +4703,14 @@ impl<'a> Builder<'a> {
     /// join with a phi of their values and the facts they all hold (`meet`), as Maglev's
     /// polymorphic access joins its arms (maglev-graph-builder.cc:5775-, the sub-graph's `done`
     /// label). Every check exits WrongShape with the operation's before-state.
+    ///
+    /// Rule K (P3 stage 3 step 3f): each arm keeps only the receiver shapes the word's facts
+    /// allow and an arm left with none goes, as Maglev's polymorphic access drops the access
+    /// infos whose maps the known maps exclude (KnownMapsMerger, maglev-graph-builder.cc:
+    /// 4641-4650; its arms' map checks, :5877-5893, emit nothing for a map known impossible) and
+    /// JSC's constant folding prunes a MultiGetByOffset's cases (dfg/DFGConstantFoldingPhase.cpp:
+    /// 648-666): one arm left is the monomorphic walk, with no test and no join; facts allowing no
+    /// arm keep them all behind the check that then always exits (`shaped`).
     fn poly_load(
         &mut self,
         pc: usize,
@@ -4683,8 +4723,52 @@ impl<'a> Builder<'a> {
         let receiver = self.receiver(recv, st, 0, pc);
         let mut cx = Before::new(pc);
         let word = self.tagged(st, receiver, pc);
-        let ways = u8::try_from(shapes.len()).expect("at most four ways");
+        let ways = ways_of(shapes);
+        // The arms the facts allow, made only where they exclude a shape of one.
+        let excluding = st
+            .shapes
+            .get(&word)
+            .filter(|known| !shapes.iter().all(|shape| known.contains(shape)));
+        let narrows = excluding.is_some();
+        let allowed: Vec<Chain> = match excluding {
+            Some(known) => arms
+                .iter()
+                .filter_map(|arm| {
+                    let shapes = allowed_shapes(&arm.shapes, known);
+                    (!shapes.is_empty()).then(|| Chain {
+                        shapes,
+                        levels: arm.levels.clone(),
+                        ..*arm
+                    })
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let kept: usize = allowed.iter().map(|arm| arm.shapes.len()).sum();
+        if narrows {
+            self.graph.narrowed.push(Narrowed {
+                pc: pc as u32,
+                frame: self.frame,
+                arms: true,
+                kept: u8::try_from(kept).expect("at most four ways"),
+                of: ways,
+            });
+        }
+        let arms = if allowed.is_empty() { arms } else { &allowed };
         let cell = self.shaped(st, &mut cx, word, shapes);
+        if let [arm] = arms {
+            let (mut object, mut cell) = (word, cell);
+            for &shape in &arm.levels {
+                cell = self.prototype(st, &mut cx, object, cell, shape, ways);
+                object = cell;
+            }
+            let value = self.field(st, object, cell, arm.location, arm.slot, pc);
+            if matches!(recv, Recv::Stack) && !method {
+                st.stack.pop();
+            }
+            st.stack.push(value);
+            return Ok(());
+        }
         let state = self.before(&mut cx, st);
         let mut ends = Vec::with_capacity(arms.len());
         for (k, arm) in arms.iter().enumerate() {

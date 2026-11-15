@@ -26,7 +26,7 @@ fn an_update_of_a_numbers_field_is_its_load_arithmetic_and_store() {
         let pc = pc_of(&chunk, |op| matches!(op, Op::UpdateProp(..)));
         assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
         assert_eq!(
-            count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+            count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
             1,
             "{name}: {text}"
         );
@@ -83,7 +83,7 @@ fn an_append_of_two_numbers_adds_and_stores() {
     assert_eq!(count(&graph, |op| *op == NodeOp::F64Add), 1, "{text}");
     assert_eq!(stores(&graph), 1, "{text}");
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         1,
         "the read's check serves the store: {text}"
     );

@@ -416,8 +416,14 @@ pub(crate) enum NodeOp {
     TruncateNumberOrOddball,
     /// Tagged -> Cell.
     CheckObject,
-    /// Tagged -> Cell: an object whose shape is one of these (at most four).
-    CheckShape(Vec<u32>),
+    /// Tagged -> Cell: an object whose shape is one of these (at most four). `ways` is the
+    /// access's receiver shapes, which its exit keeps in the exit profile, where `shapes` may be
+    /// fewer: those of them the receiver's facts allow (P3 stage 3 step 3f, rule K), so that the
+    /// flag's data says what the site's ways were, not what the check narrowed them to.
+    CheckShape {
+        shapes: Vec<u32>,
+        ways: u8,
+    },
     /// Cell -> Cell: the input object's [[Prototype]] (its `proto` field, which no shape
     /// implies), where it is an object of an ordinary kind with IC_PLAIN set and one of
     /// `shapes` (at most four), as the templates' hop checks it (jit.rs emit_baked); else an
@@ -843,7 +849,7 @@ impl NodeOp {
                 | NodeOp::CheckInt32
                 | NodeOp::TruncateNumberOrOddball
                 | NodeOp::CheckObject
-                | NodeOp::CheckShape(_)
+                | NodeOp::CheckShape { .. }
                 | NodeOp::CheckProto { .. }
                 | NodeOp::CheckStringProto { .. }
                 | NodeOp::CheckCreatable { .. }
@@ -1046,6 +1052,18 @@ pub(crate) struct Decline {
     pub(crate) frame: FrameIx,
 }
 
+/// An access whose receiver's facts kept `kept` of its `of` receiver shapes, in its check
+/// (`arms` false) or in a polymorphic load's arms (`arms` true) (P3 stage 3 step 3f, rule K; 0
+/// kept: the facts allowed none, and the check of them all always exits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Narrowed {
+    pub(crate) pc: u32,
+    pub(crate) frame: FrameIx,
+    pub(crate) arms: bool,
+    pub(crate) kept: u8,
+    pub(crate) of: u8,
+}
+
 /// A check moved to a loop's one entry edge, exiting at the header's pc [HoistingFailed] (P3
 /// stage 3 steps 0, 0c and 3a), and the checks in the loop it stands for (step L1c): each one's
 /// operation, whose ordinary exit the moved check's exit is where every replaced check runs
@@ -1083,6 +1101,9 @@ pub(crate) struct Graph {
     pub(crate) entry: Option<BlockIx>,
     /// The speculations the builder declined, in the order it built their sites.
     pub(crate) declines: Vec<Decline>,
+    /// The accesses whose receiver's facts narrowed their shapes or arms (P3 stage 3 step 3f,
+    /// rule K), in the order it built them: the log's.
+    pub(crate) narrowed: Vec<Narrowed>,
     /// The inlined frames, outermost first: `FrameIx(k)` is `frames[k - 1]` (stage 3).
     pub(crate) frames: Vec<InlinedFrame>,
     /// The checks moved to loops' entry edges and the checks each stands for (P3 stage 3 step

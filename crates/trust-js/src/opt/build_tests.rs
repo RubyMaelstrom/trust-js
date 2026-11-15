@@ -639,11 +639,14 @@ fn monomorphic_loads_check_the_shape_and_load_the_field() {
         .next()
         .expect("a filled way");
     assert_eq!(count(&graph, is_effect), 0, "{text}");
-    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }));
     assert_eq!(checks.len(), 1, "{text}");
     assert_eq!(
         checks[0].op,
-        NodeOp::CheckShape(vec![way.receiver_shape]),
+        NodeOp::CheckShape {
+            shapes: vec![way.receiver_shape],
+            ways: 1,
+        },
         "{text}"
     );
     assert_eq!(checks[0].reason, Some(ExitReason::WrongShape), "{text}");
@@ -670,10 +673,10 @@ fn polymorphic_loads_check_every_shape_that_shares_the_slot() {
     );
     let (chunk, graph) = graph_of(&mut engine, "same");
     let text = dump(&graph, &chunk);
-    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }));
     assert_eq!(checks.len(), 1, "{text}");
     assert!(
-        matches!(&checks[0].op, NodeOp::CheckShape(shapes) if shapes.len() == 2),
+        matches!(&checks[0].op, NodeOp::CheckShape { shapes, .. } if shapes.len() == 2),
         "{text}"
     );
     assert_eq!(count(&graph, is_effect), 0, "{text}");
@@ -682,8 +685,8 @@ fn polymorphic_loads_check_every_shape_that_shares_the_slot() {
     let (chunk, graph) = graph_of(&mut engine, "other");
     let text = dump(&graph, &chunk);
     assert!(
-        matches!(&nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)))[..],
-            [check] if matches!(&check.op, NodeOp::CheckShape(shapes) if shapes.len() == 2)),
+        matches!(&nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }))[..],
+            [check] if matches!(&check.op, NodeOp::CheckShape { shapes, .. } if shapes.len() == 2)),
         "{text}"
     );
     assert_eq!(
@@ -709,7 +712,7 @@ fn stores_to_writable_own_data_store_the_field() {
         let text = dump(&graph, &chunk);
         assert_eq!(count(&graph, is_effect), 0, "{name}: {text}");
         assert_eq!(
-            count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+            count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
             1,
             "{text}"
         );
@@ -723,7 +726,7 @@ fn stores_to_writable_own_data_store_the_field() {
     let (chunk, graph) = graph_of(&mut engine, "forward");
     let text = dump(&graph, &chunk);
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         1,
         "{text}"
     );
@@ -747,7 +750,7 @@ fn proven_shapes_and_loaded_fields_last_until_an_effect() {
     let (chunk, graph) = graph_of(&mut engine, "twice");
     let text = dump(&graph, &chunk);
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         1,
         "{text}"
     );
@@ -760,7 +763,7 @@ fn proven_shapes_and_loaded_fields_last_until_an_effect() {
     let text = dump(&graph, &chunk);
     assert_eq!(count(&graph, is_effect), 1, "the call: {text}");
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         2,
         "{text}"
     );
@@ -1336,7 +1339,7 @@ fn the_verifier_rejects_broken_graphs() {
     let check = broken
         .nodes
         .iter_mut()
-        .find(|node| matches!(node.op, NodeOp::CheckShape(_)))
+        .find(|node| matches!(node.op, NodeOp::CheckShape { .. }))
         .expect("the shape check");
     check.state = None;
     rejects("an exit without a state", broken, "frame state");
@@ -1534,14 +1537,17 @@ fn a_flagged_shape_check_is_declined_unless_its_ways_grew() {
          for (var i = 0; i < 20; i++) getx(p);",
     );
     let (chunk, graph) = graph_of(&mut engine, "getx");
-    assert_eq!(count(&graph, |op| matches!(op, NodeOp::CheckShape(_))), 1);
+    assert_eq!(
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
+        1
+    );
     let get = pc_of(&chunk, |op| matches!(op, Op::GetPropLocal(..)));
     // The discarded check expected the one shape the site has: the generic access.
     flag(&chunk, get, ExitReason::WrongShape, false, 1);
     let graph = graph_for(&chunk, "getx flagged");
     let text = dump(&graph, &chunk);
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         0,
         "{text}"
     );
@@ -1551,10 +1557,10 @@ fn a_flagged_shape_check_is_declined_unless_its_ways_grew() {
     eval(&mut engine, "getx({x: 2, y: 3});");
     let graph = graph_for(&chunk, "getx with a new way");
     let text = dump(&graph, &chunk);
-    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    let checks = nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }));
     assert_eq!(checks.len(), 1, "{text}");
     assert!(
-        matches!(&checks[0].op, NodeOp::CheckShape(shapes) if shapes.len() == 2),
+        matches!(&checks[0].op, NodeOp::CheckShape { shapes, .. } if shapes.len() == 2),
         "{text}"
     );
     assert!(graph.declines.is_empty(), "{text}");
@@ -5747,7 +5753,7 @@ fn a_generic_node_ends_the_heap_facts_and_keeps_the_values() {
         2,
         "the field is loaded again after the call: {text}"
     );
-    let shapes = nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)));
+    let shapes = nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }));
     assert_eq!(shapes.len(), 2, "its shape checked again: {text}");
     assert_eq!(shapes[0].inputs, shapes[1].inputs, "one word: {text}");
     assert_eq!(

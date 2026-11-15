@@ -43,7 +43,7 @@ fn assert_creation_exits_at(graph: &Graph, pc: usize, text: &str) {
         node.pc as usize == pc
             && matches!(
                 node.op,
-                NodeOp::CheckShape(_)
+                NodeOp::CheckShape { .. }
                     | NodeOp::CheckProto { .. }
                     | NodeOp::CheckNoProto { .. }
                     | NodeOp::CheckCreatable { .. }
@@ -97,13 +97,16 @@ fn a_constructors_creations_are_its_receivers_checks_once_and_its_stores() {
         "{text}"
     );
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         1,
         "the second creation's receiver is the first's landing shape: {text}"
     );
     assert_eq!(
-        nodes(&graph, |op| matches!(op, NodeOp::CheckShape(_)))[0].op,
-        NodeOp::CheckShape(vec![first[0].receiver_shape]),
+        nodes(&graph, |op| matches!(op, NodeOp::CheckShape { .. }))[0].op,
+        NodeOp::CheckShape {
+            shapes: vec![first[0].receiver_shape],
+            ways: 1,
+        },
         "{text}"
     );
     // The second way's receiver is the first's landing.
@@ -137,7 +140,7 @@ fn after_a_creation_its_field_and_its_landing_shape_are_known() {
     assert_eq!(creations(&graph).len(), 1, "{text}");
     // The loads read the stored value: no check, no load.
     assert_eq!(
-        count(&graph, |op| matches!(op, NodeOp::CheckShape(_))),
+        count(&graph, |op| matches!(op, NodeOp::CheckShape { .. })),
         1,
         "{text}"
     );
@@ -173,7 +176,7 @@ fn a_creation_ends_the_shape_facts_that_hold_its_old_shape_and_keeps_the_others(
         graph
             .nodes
             .iter()
-            .filter(|node| node.pc as usize == pc && matches!(node.op, NodeOp::CheckShape(_)))
+            .filter(|node| node.pc as usize == pc && matches!(node.op, NodeOp::CheckShape { .. }))
             .count()
     };
     assert_eq!(checked_at(pcs[0]), 1, "{text}");
@@ -194,7 +197,7 @@ fn a_creation_ends_the_shape_facts_that_hold_its_old_shape_and_keeps_the_others(
         graph
             .nodes
             .iter()
-            .filter(|node| node.pc as usize == pc && matches!(node.op, NodeOp::CheckShape(_)))
+            .filter(|node| node.pc as usize == pc && matches!(node.op, NodeOp::CheckShape { .. }))
             .count()
     };
     assert_eq!(checked_at(pcs[0]), 1, "{text}");

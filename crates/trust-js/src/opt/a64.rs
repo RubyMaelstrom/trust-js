@@ -612,7 +612,7 @@ fn check_graph(
                         "a creation without a proving landing shape",
                     ));
                 }
-                NodeOp::CheckShape(ref shapes)
+                NodeOp::CheckShape { ref shapes, .. }
                 | NodeOp::CheckProto { ref shapes, .. }
                 | NodeOp::CheckStringProto { ref shapes, .. }
                 | NodeOp::ShapeIs(ref shapes)
@@ -1483,7 +1483,7 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         NodeOp::CheckNumber | NodeOp::TruncateNumberOrOddball => ExitReason::NotNumber,
         NodeOp::CheckInt32 => ExitReason::NotInt32,
         NodeOp::CheckObject => ExitReason::NotObject,
-        NodeOp::CheckShape(_)
+        NodeOp::CheckShape { .. }
         | NodeOp::CheckProto { .. }
         | NodeOp::CheckStringProto { .. }
         | NodeOp::CheckCreatable { .. }
@@ -2291,7 +2291,7 @@ impl Gen<'_> {
                 self.a.ubfx(dst, word, 0, 48);
                 self.gp_done(n, dst);
             }
-            NodeOp::CheckShape(shapes) => {
+            NodeOp::CheckShape { shapes, ways } => {
                 let site = self.check_exit(n)?;
                 // For the log: what a WrongShape exit expected, and where its receiver is.
                 let pc = graph.state(node.state.expect("checked")).pc;
@@ -2300,7 +2300,7 @@ impl Gen<'_> {
                     record.shape_check = Some(Box::new(crate::opt::exit::ShapeCheck {
                         receiver,
                         shapes: shapes.clone().into(),
-                        ways: shapes.len().min(usize::from(u8::MAX)) as u8,
+                        ways: *ways,
                         hop: false,
                     }));
                 }

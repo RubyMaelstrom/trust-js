@@ -615,7 +615,10 @@ fn getx(chunk: &Chunk) -> Graph {
     let at_get = b.state(0, &[], &[], &[]);
     let cell = b.exiting(
         entry,
-        NodeOp::CheckShape(vec![way.recv_shape]),
+        NodeOp::CheckShape {
+            shapes: vec![way.recv_shape],
+            ways: 1,
+        },
         &[o],
         Rep::Cell,
         0,
@@ -685,7 +688,10 @@ fn setx(chunk: &Chunk) -> Graph {
     let at_set = b.state(1, &[v], &[], &[]);
     let cell = b.exiting(
         entry,
-        NodeOp::CheckShape(vec![way.recv_shape]),
+        NodeOp::CheckShape {
+            shapes: vec![way.recv_shape],
+            ways: 1,
+        },
         &[o],
         Rep::Cell,
         1,
@@ -937,7 +943,10 @@ fn keep(chunk: &Chunk) -> Graph {
     let at_load = b.state(3, &[], &[(1, o)], &[]);
     let cell = b.exiting(
         entry,
-        NodeOp::CheckShape(vec![way.recv_shape]),
+        NodeOp::CheckShape {
+            shapes: vec![way.recv_shape],
+            ways: 1,
+        },
         &[o],
         Rep::Cell,
         3,

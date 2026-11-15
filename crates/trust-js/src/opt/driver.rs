@@ -1076,6 +1076,7 @@ fn finish(
     let Finished {
         outcome,
         declines,
+        narrowed,
         verified,
         verify_failure,
         embeds_genv,
@@ -1113,6 +1114,20 @@ fn finish(
                 decline.reason,
                 decline.form,
                 match decline.frame.0 {
+                    0 => String::new(),
+                    frame => format!(" (inlined frame {frame})"),
+                }
+            );
+        }
+        for narrowed in &narrowed {
+            log_line!(
+                "[opt] known shapes {} pc {}: {} of {} shapes{}{}",
+                name(chunk),
+                narrowed.pc,
+                narrowed.kept,
+                narrowed.of,
+                if narrowed.arms { " (arms)" } else { "" },
+                match narrowed.frame.0 {
                     0 => String::new(),
                     frame => format!(" (inlined frame {frame})"),
                 }

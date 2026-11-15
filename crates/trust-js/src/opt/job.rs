@@ -103,6 +103,8 @@ pub(crate) struct Finished {
     pub(crate) stubs: MissingStubs,
     /// The builder's declines, which the install logs.
     pub(crate) declines: Vec<Decline>,
+    /// The accesses rule K narrowed, which the install logs.
+    pub(crate) narrowed: Vec<super::ir::Narrowed>,
     /// Whether a graph was verified, and the verifier's message where it failed (release).
     pub(crate) verified: bool,
     pub(crate) verify_failure: Option<String>,
@@ -134,6 +136,7 @@ pub(crate) fn compile(job: Job) -> Finished {
     #[cfg(test)]
     let _perf_map = job.test_perf_map.clone().install();
     let mut declines = Vec::new();
+    let mut narrowed = Vec::new();
     let mut met = MissingStubs::default();
     let mut verified = false;
     let mut verify_failure = None;
@@ -179,6 +182,7 @@ pub(crate) fn compile(job: Job) -> Finished {
             .map(|(chunk, cfg)| (&callee_memory[*chunk as usize].0, cfg))
             .collect();
         declines = graph.declines.clone();
+        narrowed = graph.narrowed.clone();
         // A guard of a graph-inlined call compares the realm's global environment too (step 2).
         embeds_genv = graph.nodes.iter().any(|node| match node.op {
             super::ir::NodeOp::CheckEnvIs { env, .. } => env as usize == job.genv,
@@ -249,6 +253,7 @@ pub(crate) fn compile(job: Job) -> Finished {
         outcome,
         stubs: met,
         declines,
+        narrowed,
         verified,
         verify_failure,
         elapsed: started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
