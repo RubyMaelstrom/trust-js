@@ -5618,3 +5618,126 @@ Since the records above (2026-11-15):
   differ in alignment only; Djot's steady-state copy compiles 177 where it compiled 172, from a
   minor collection whose survivors differ between builds of one source (5,725 to 5,844 across
   four binaries): the build-dependent root seen in step 3d's recount, not the step's code.
+
+Stage 3 step 3e, stage (a) landed (d2f16daf, 2026-11-15; target/p3/stage3/step3e-impl,
+design-note.txt, census-e1.report.txt, diag-new-e1.txt and countsE1-5.pairs.txt; my checks
+merge-check/counts-3ea.out, counts-3ea-graph.out, cycles-3ea.out and step3e-review): `new` from
+inlined frames. Under TRUST_JS_OPT_INLINE=graph an inlined frame's plain `new` is a generic
+call node of its frame, so a way whose callee constructs no longer sends its plan to the
+splice: no plan of any workload or fixture is spliced at graph (step 3d left 101). The
+default and the tier off are unchanged.
+- What it builds. Piece B2's lazy form for construct sites: the template's Op::New sequence
+  from an inlined frame probes the callee chunk's own construct cache through the view (the
+  cell its own activations use), allocates `this` and enters the constructor's machine code
+  with nothing switched, its position the view's word for the `new` (the oracle registers one
+  inline site a chain of ways and `new`, as for calls); only the helper path (a miss or a
+  declined gate) switches the context to the frame's chunk and the inlined helpers' table and
+  restores it where it lands. E0 and the in-place test (makes_plain_calls_only) admit Op::New;
+  spread `new`, the spread and arguments-array calls, eval and tail calls are still refused.
+  No constructor's body is inlined: the planner plans no construct site at either mode (Maglev
+  inlines a known constructor behind an in-line allocation, maglev-graph-builder.cc:13082-13185,
+  and JSC as InlineCallFrame::Construct: a later step if the counts ask).
+- The construct cache is shared with the callee's own activations where each spliced copy had
+  one of its own. Counted (the agent's diagnostic build, every workload at 5 runs): the
+  helper's share of executed `new`s from inlined frames is 46.25% at graph against 46.68% for
+  the same ways' spliced bodies, and refills 469 against 1,244: the shared cell stays.
+- The census at graph (fixed 5): plans spliced 0; ways inlined 2,092 -> 3,024; exits 37,654
+  against the splice's 46,115 (2,811 through inlined frames), WrongCallee 10,258 against
+  15,213, discards 286 against 299; the tier's refusals are the splice's own (a size limit,
+  a `finally`); outputs equal at both modes everywhere.
+- Measured at 5 fixed runs (fat LTO; my recount, the agent's within 0.1% but where the
+  collector moves). Graph against the graph before it: RayTrace -4.21% (its seven plans for
+  constructing callees), Vue -0.40% (steady -0.31%), Box2D -0.38%, Djot -0.17% (steady the
+  same); TypeScript +0.56% and Splay +0.49%, the collector's (below); the rest within 0.05%.
+  Graph against the splice on the one binary: Octane's geomean -2.00%, Richards -12.24%,
+  DeltaBlue -6.50%, RayTrace -4.14%, Box2D -2.14%, Djot -1.97%, GBEMU -1.54%, Vue -1.17%,
+  Crypto -0.85%, TypeScript -0.68%, Earley-Boyer -0.61%, PdfJS -0.55%; above zero React
+  (+0.05%, steady +0.29%) and Splay (+0.45%). The default: PdfJS +0.24% and TypeScript +0.37%
+  are the incremental marker's (PdfJS equal to five digits with incremental marking off; the
+  tier's code identical for 1,373 of 1,373 compiles, template code at the splice for 2,172 of
+  2,174, two differing in alignment, and with the tier off for 2,589 of 2,589, the agent's).
+- TypeScript's rise at graph, attributed (the agent's): with incremental marking and pacing
+  off it is +0.80% against the graph before, all of it in the collector (+341M of +334M
+  instructions; everything else -8M): one major collection lands in another phase of the heap
+  (7 majors against 8, the seventh at 226 MB live where the other binary's seventh and eighth
+  run at 105 and 91 MB). With major collections held off the pair is +0.17%, not attributed.
+  It is not shared feedback: the executed shape checks of the 60 plans now compiled in place
+  cost 0.36M instructions more than their spliced copies' at 5 runs.
+- Measured at steady state and in cycles (mine, five alternating rounds on one X925 core
+  alone; graph against the splice, instructions / cycles): DeltaBlue at 200 runs -5.43% /
+  -10.46%, where it was +1.74% / -1.05% before this step: at 200 runs the graph before still
+  spliced six plans for constructing callees, which the 5-run census never saw; in place they
+  exit 1,968 times against 3,126 and recompile no bytecode (6 before; outputs equal).
+  RayTrace at 200 runs -0.08% / -0.47% (its 5-run -4.15% / -5.61% is warm-up); TypeScript at
+  5 runs -0.48% / -1.92%; Box2D -2.15% / -2.64%; Earley-Boyer -1.69% / -3.35% (the shipped
+  pacing). So DeltaBlue's steady state no longer holds the flip; GBEMU's at 200 runs has not
+  been measured again on this tree (level with the splice on the one before).
+- Found beside it, for steps 6 and 7's input: RayTrace constructs every Vector, Color and Ray
+  through the helper (332K constructs in a 918M-instruction run: Prototype.js's Class.create
+  body is an arguments.apply forwarder with no instance layout) and Box2D 102K (constructors
+  without an instance layout that read globals); TypeScript's 387K construct misses are one
+  constructor a site and by inference native constructors on their own fast path.
+- Tests: the constructing shapes each at the tier off, the splice and graph, with exits forced
+  every 7 and at every check, collections at every allocation, the poison and the chunk trap,
+  at depth one and two (a constructor's error and stack through the inlined frame,
+  Function#caller, a derived constructor, one returning an object, one that throws, a Proxy
+  and a bound function, a non-constructor's TypeError, a prototype changed after warm-up); the
+  allocation limit's RangeError at the end poll naming the inlined frame. Six mutations, each
+  caught; the tier's modules in five configurations (639 each) and the gate in ten on the
+  agent's tree; GC stress over the end-poll and rule tests (the shapes test still running
+  when this was written); the verifier sweep and my probe programs on the landed binary (42
+  runs none refused; outputs equal in five configurations, nothing spliced); fmt, clippy;
+  zombie's check, clippy with tests, Windows' check and the tier's tests. Mine on the merged
+  tree, running when this was written: the tier's modules in five configurations.
+
+Step 3f, known shapes: the census and the decisions (2026-11-15; target/p3/stage3/step3f-impl,
+design-note.txt with its section 3b, the census k200). DeltaBlue's steady-state instructions
+above the splice on 13bfd95f (the record above) were measured per access site on the tree with
+`new` from inlined frames, where they are no longer a loss but still a cost.
+- What exists: the builder holds each object word's proven shapes for the current effect epoch
+  (State::shapes: made by a shape check and by a polymorphic load's arm, kept at joins as the
+  union, ended by every effect) and uses them only to drop a check; an access's arms are still
+  the feedback's, so a receiver proven to one shape pays the feedback's two-arm diamond. An
+  inlined frame starts from the caller's state, so the facts already reach it.
+- The census at 200 runs (a shape test with its branch about 7 instructions, each further
+  shape of a check about 3). DeltaBlue: the proven shapes alone would narrow 15 sites, 31.3M
+  instructions; 138 more sites, 48.2M, read the inlined frame's `this` where only the method
+  load's arm would prove its shape; the two largest pairs are in Plan.prototype.execute's
+  nested frames (13.9M a site). TypeScript 37.0M and 21.4M (under 0.01% of the run), Box2D
+  nothing. GBEMU: neither rule reaches its remainder, which is the opcode loop's reads through
+  two shapes (the first stage's cache gained the object's later shape, the splice's
+  later-recompiled copy saw only that one): ten of its 13 sites are already one check of two
+  shapes with the live one compared first, three are two-arm reads at slots one apart. Sites
+  whose proven and feedback shapes are disjoint: five in GBEMU, never executed.
+- Decided, mine. (1) Rule K is built now: an access's arms are trimmed to the receiver's
+  proven shapes, one arm left being the monomorphic access, as Maglev intersects feedback with
+  known maps (maglev-graph-builder.cc:4641-4650) and JSC prunes a polymorphic access's cases
+  by the proven structure set (dfg/DFGConstantFoldingPhase.cpp:648-666); a disjoint site keeps
+  its exit (Maglev's unconditional deopt, :4652-4654), its convergence through step L5's rule
+  and its always-wrong case to be measured. (2) The arm (the design's step 5: a polymorphic
+  method load's call built inside each arm, Maglev's continuation, :6038 on, within its
+  limits, :6066-6193) is deferred: a property cache's prototype way keeps no holder and a
+  shape does not imply its prototype, so nothing can pair an arm with the way it gives (V8's
+  handler holds the holder weakly, ic/handler-configuration.cc:119-127; SpiderMonkey's stub
+  embeds it, jit/CacheIR.cpp:1086; JSC derives it from the Structure); it would need a new
+  always-on record, and its reach is DeltaBlue's 48.2M at today's diamond cost, about half of
+  that after the fusion below, and nothing elsewhere. The holder record is assessed with
+  steps 6 and 7's design, which changes the template's call feedback in any case and could use
+  it for a constant holder and a known callee. (3) No trial inlining now: what the rules do
+  not reach is feedback's age and inlining depth, which a per-caller cache changes neither.
+  (4) The lowerings take the form of what stays polymorphic: a shape test that feeds a branch
+  emitted as a compare and branch, and the select of the offset where only the slot differs
+  (SpiderMonkey's GuardMultipleShapesToOffset), counted first.
+- GBEMU's steady-state cost of step 3d, attributed (the two agents', by counts): depth. Its
+  run function now compiles in place four levels deep (iterationEndRoutine, audioJIT,
+  generateAudioFake nested), so the audio loop's callee computeAudioChannels falls past the
+  planner's depth and is called once a sample as a call node of the nested frame: 9,629,416
+  calls at 200 runs, all but 7 by the direct sequence, 163 instructions a call outside the
+  callee, about 1.57G of the run's 325G (0.48%; step 3d's cost was +0.38%). No way is refused,
+  nothing runs template code, and an exited activation is not it (67 of 6,136 samples). Before
+  the step the loop function's own code ran the loop with the callee inlined one level down
+  (by the samples: its own code 3,107 before and 319 after, the callee's 366 and 6,136; which
+  caller reached it then is inferred from the plans). It is the policy's (step 8: Maglev's
+  depth and the call counts) and the direct call's (step 7), not a fault.
+- The tier's and the back end's modules on 13bfd95f (mine, 638 tests): graph eager, graph
+  forced, graph, on and forced pass.
