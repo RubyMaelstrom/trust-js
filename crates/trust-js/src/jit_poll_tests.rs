@@ -867,8 +867,10 @@ fn a_cyclic_list_walk_stops_for_cancellation_and_deadlines() {
         ring.link = ring;
     "#;
     // Under load the interruption can come before the walk starts (this thread waiting for a
-    // core past the canceller's 20 ms, or the deadline's): an entry poll then reports it. Every
-    // attempt must stop for the right reason; the loop's own report must come in one of five.
+    // core past the canceller's 20 ms, or the deadline's): an entry poll then reports it, or,
+    // before `last`'s code is entered at all, the VM's own safepoint at the script's call, which
+    // is no poll of the census. Every attempt must stop for the right reason; the loop's own
+    // report must come in one of five.
     for deadline in [false, true] {
         let mut reported = false;
         for attempt in 0..5 {
@@ -936,10 +938,14 @@ fn attempt_cyclic_walk(source: &str, deadline: bool) -> bool {
         "deadline {deadline}: {:?}",
         started.elapsed()
     );
-    assert!(
-        census.calls.iter().sum::<u64>() >= 1,
-        "a poll reported it: {census:?}"
-    );
+    // No poll of the native code's: the interruption came before `last` was entered, and the
+    // VM's safepoint at the script's call reported it (8 runs at once on one core: 14 of 40 with
+    // the tier's forced exits, 7 of 40 with the tier off). The attempt stopped before the loop,
+    // as one the entry poll reports: with no poll in the loop the walk would not stop at all,
+    // and a walk the VM ran would report none in any attempt.
+    if census.calls.iter().sum::<u64>() == 0 {
+        return false;
+    }
     // On ARM64, the loop header reported it.
     cfg!(not(target_arch = "aarch64")) || census.calls[LOOP] >= 1
 }
