@@ -359,6 +359,9 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
             "14000"
         );
         if tier == Tier::Jit {
+            // With the tier on, the second stage is published at the install of its compile,
+            // which the shared compile thread may finish after the loop returns.
+            crate::opt::finish_compiles_for_test(it);
             let call = shared_method(it, "call");
             assert!(
                 call.runtime().code2.get().is_some_and(Option::is_some),
