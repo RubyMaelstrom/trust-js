@@ -887,24 +887,10 @@ pub(crate) struct InlinedFrame {
     /// the frame's generic nodes publish in `Interp::call_site` while they run, as a splice's
     /// checked operations publish theirs (P3 stage 3 step 3c; JSC's code origin stored before
     /// each call out, dfg/DFGJITCompiler.h:133-143); NO_POSITION where none was registered.
-    #[cfg_attr(
-        not(all(
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        )),
-        expect(dead_code, reason = "the back end's")
-    )]
     pub(crate) position: u32,
     /// The callee's running environment (`Env::as_ptr` of the closure's [[Environment]], a
     /// constant under the guard), which the frame's generic nodes whose kind reads the
     /// environment store in `JitCtx::env_raw` while they run (step 3c); 0 where none is known.
-    #[cfg_attr(
-        not(all(
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        )),
-        expect(dead_code, reason = "the back end's")
-    )]
     pub(crate) env: usize,
 }
 

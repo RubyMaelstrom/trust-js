@@ -1548,20 +1548,23 @@ var stk = '', cal, cal2;
 Object.defineProperty(G.prototype, 'p', { get: function getter() {
   stk = new Error('e').stack; cal = getter.caller; return 1; } });
 Object.defineProperty(G.prototype, 'q', { get: function getter2() { cal2 = getter2.caller; return 2; } });
+var cal3, o2 = { toString: function ts() { cal3 = ts.caller; return 'x'; } };
 function viaGet(o) { return o.p; }
-function outer(o) { var s = 0; for (var i = 0; i < 20; i++) s += viaGet(o) + o.q; return s; }
+function outer(o) { var s = 0;
+  for (var i = 0; i < 20; i++) s += viaGet(o) + o.q + `${o2}`.length; return s; }
 var g = new G(), r = 0; for (var k = 0; k < 300; k++) r += outer(g);
 function ge(a, k) { return a[k]; }
 function gouter(a) { var s = 0; for (var i = 0; i < 20; i++) s += ge(a, i & 1 ? 'x' : 'y'); return s; }
 var ga = {x: 1, y: 2}; for (var k = 0; k < 300; k++) r += gouter(ga);
 var err = ''; try { gouter(null); } catch (e) { err = e.stack.split('\\n').slice(0, 3).join('|'); }
-r + '|' + stk.split('\\n').slice(0, 4).join('|') + '|' + (cal === viaGet) + (cal2 === outer) + '|' + err";
+r + '|' + stk.split('\\n').slice(0, 4).join('|') + '|' + (cal === viaGet) + (cal2 === outer) + (cal3 === outer) + '|' + err";
 
 /// A throw from an inlined frame's node, caught by its caller's handler around the call and by
 /// none (the throw leaves the compiled function).
 const THROWS: &str = "
 function G() {}
-Object.defineProperty(G.prototype, 'p', { get: function () {
+var calls = 0;
+Object.defineProperty(G.prototype, 'p', { get: function () { calls++;
   if (this.bad) throw new TypeError('bad ' + this.bad); return 1; } });
 function viaGet(o) { return o.p; }
 function caught(o) { var s = 0;
@@ -1571,7 +1574,7 @@ var g = new G(), r = 0;
 for (var k = 0; k < 300; k++) { r += caught(g); r += leaves(g); }
 g.bad = 'x';
 var e2 = ''; try { leaves(g); } catch (e) { e2 = e.message + ':' + e.stack.split('\\n').slice(0, 3).join('|'); }
-r + ',' + caught(g) + ',' + e2";
+r + ',' + caught(g) + ',' + e2 + ',' + calls";
 
 /// Collections while an inlined frame's helper runs, with objects live in both frames: the
 /// getter allocates, the callee and the caller hold objects across it.
@@ -1663,6 +1666,24 @@ fn a_call_whose_inlined_callee_runs_a_generic_node_is_no_lowered_operation() {
     assert!(inlines()
         .iter()
         .any(|note| note.outcome == InlineOutcome::Inlined));
+    assert!(!inlined_generic().is_empty());
+    // A loop free of effects keeps a typed array's data address through its header (step 0c):
+    // the inlined callee's setter detaches the array, so the loop must count the call an effect
+    // and check the array again after it.
+    let typed = "var buf = new ArrayBuffer(32), t = new Int32Array(buf), arm = false;
+         for (var j = 0; j < 8; j++) t[j] = j + 1;
+         function M() {}
+         Object.defineProperty(M.prototype, 'g', { set: function (z) {
+           if (arm && z === 4) buf.transfer(); } });
+         function bump(m, i) { m.g = i; }
+         function loop(m, a, n) { var s = 0;
+           for (var i = 0; i < n; i++) { s += a[i] | 0; bump(m, i); } return s; }
+         var m = new M(), r = 0; for (var k = 0; k < 300; k++) r += loop(m, t, 8);
+         arm = true; r + ',' + loop(m, t, 8) + ',' + t.length";
+    inlined_generic();
+    let (expected, got) = both(typed, 0, false);
+    assert_eq!(got, expected);
+    assert_eq!(expected, "10800,15,0");
     assert!(!inlined_generic().is_empty());
 }
 
@@ -1759,6 +1780,11 @@ fn an_inlined_generic_node_reads_its_frames_this_environment_and_slots() {
             !inlined_generic().is_empty(),
             "a generic node inlined: {source}"
         );
+        // An exit after the node resumes the compiled frame in the VM on its context: `this`,
+        // the environment and the slots restored (the compiled frame reads its own bindings
+        // through constants, so only its exits read env_raw again).
+        let (expected, got) = both(source, 7, false);
+        assert_eq!(got, expected, "with exits forced: {source}");
     }
 }
 
@@ -1768,7 +1794,7 @@ fn error_stack_caller_and_positions_from_an_inlined_frames_node_equal_the_tier_o
     let (expected, got) = both(POSITIONS, 0, false);
     assert_eq!(got, expected);
     assert!(
-        expected.contains("|truetrue|"),
+        expected.contains("|truetruetrue|"),
         "the getters' callers: {expected}"
     );
     assert!(!inlined_generic().is_empty());
