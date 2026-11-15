@@ -3677,6 +3677,28 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn the_held_lists_answer_by_start_whatever_order_the_values_come_in() {
+        // F5's flat held lists (`Held`): a register's ranges by start, though the values that
+        // held it come in another order (a builder's graph numbers nodes out of the code order).
+        // x0 holds value 0 over [20, 30] and value 1 over [5, 8]; x1 holds nothing.
+        let homes = [Home::Gp(0), Home::Gp(0), Home::Spill(0)];
+        let ranges = [(20, 30), (5, 8), (1, 40)];
+        let mut held = Held::new(&homes, &ranges);
+        assert!(!held.free(0, 0, (6, 7)), "value 1's range");
+        assert!(!held.free(0, 0, (25, 26)), "value 0's range");
+        assert!(held.free(0, 0, (10, 18)), "between them");
+        assert!(
+            held.free(0, 1, (6, 7)) && held.free(1, 0, (6, 7)),
+            "another register, class"
+        );
+        held.hold(0, 1, (10, 12));
+        assert!(
+            !held.free(0, 1, (11, 11)) && held.free(0, 1, (13, 14)),
+            "a copy taken"
+        );
+    }
+
+    #[test]
     fn a_call_between_a_spilled_values_reads_ends_their_span() {
         // Two reads, a call, two reads: a span on each side, none across the call.
         let (g, v) = straight(|g, b, acc, v| {
