@@ -486,6 +486,14 @@ fn array_buffer_mirror_api_rejects_shared_array_buffers() {
     assert!(engine.interp.array_buffer_set_bytes(&ordinary, &[1; 8]));
     run_in(&mut engine, "new Uint8Array(ordinary)[2] = 5");
     assert_eq!(engine.interp.array_buffer_version(&ordinary), Some(1));
+    // The first take after the buffer's first observation (the version read above) is the
+    // whole buffer: no book was kept before that read (P3 stage 3 step L4); the next is exact.
+    assert_eq!(
+        engine.interp.take_array_buffer_dirty_ranges(&ordinary),
+        Some(std::iter::once(0..8).collect())
+    );
+    run_in(&mut engine, "new Uint8Array(ordinary)[2] = 6");
+    assert_eq!(engine.interp.array_buffer_version(&ordinary), Some(2));
     assert_eq!(
         engine.interp.take_array_buffer_dirty_ranges(&ordinary),
         Some(std::iter::once(2..3).collect())

@@ -3357,7 +3357,10 @@ fn typed_get(kind: Option<TypedKind>, past: bool) -> Graph {
             }
             let data = check(
                 &mut b,
-                NodeOp::TypedData { write: false },
+                NodeOp::TypedData {
+                    write: false,
+                    book: false,
+                },
                 &[cell, view],
                 Rep::Ptr,
                 ExitReason::Detached,
@@ -3613,6 +3616,12 @@ fn the_template_stub_reads_any_kind_and_exits_where_it_declines() {
 /// `set(a, i, v)` (SET) on a typed array: `a` checked a typed array of `kind` (of any kind for the
 /// stub where `kind` is None), `i` an index and `v` a Number, converted as `kind` stores it.
 fn typed_set(kind: Option<TypedKind>) -> Graph {
+    typed_set_with(kind, false)
+}
+
+/// `typed_set`, its TypedData `book` where `book` (the form a flag of ObservedBuffer builds: no
+/// test of the flag, the store's book kept for any buffer; P3 stage 3 step L4).
+fn typed_set_with(kind: Option<TypedKind>, book: bool) -> Graph {
     let mut b = Build::new(3);
     let entry = b.block(0, false);
     let a = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
@@ -3684,7 +3693,7 @@ fn typed_set(kind: Option<TypedKind>) -> Graph {
             );
             let data = check(
                 &mut b,
-                NodeOp::TypedData { write: true },
+                NodeOp::TypedData { write: true, book },
                 &[cell, view],
                 Rep::Ptr,
                 ExitReason::Detached,
@@ -3795,12 +3804,13 @@ fn typed_elements_store_each_kinds_conversion_as_the_vm_does() {
 #[test]
 fn typed_stores_keep_the_buffers_dirty_ranges_and_generation() {
     // Embedders mirror a buffer by its generation and dirty ranges: the stores fold into them
-    // as the template's do (`emit_dirty`).
+    // as the template's do (`emit_dirty`). The booked form (P3 stage 3 step L4: a TypedData
+    // whose ObservedBuffer flag declined its test), which keeps today's book.
     let mut engine = fixture(SET);
     install(
         &mut engine,
         "set",
-        &typed_set(Some(TypedKind::I16)),
+        &typed_set_with(Some(TypedKind::I16), true),
         Options::default(),
     );
     exits();
@@ -3822,6 +3832,69 @@ fn typed_stores_keep_the_buffers_dirty_ranges_and_generation() {
     );
     assert_eq!(engine.interp.array_buffer_version(&buf), Some(version + 2));
     assert_eq!(eval(&mut engine, "Array.from(t).join()"), "0,7,0,8,0,0,0,0");
+}
+
+#[test]
+fn a_store_whose_typed_data_tests_the_flag_keeps_no_book_and_an_observed_buffer_exits() {
+    // P3 stage 3 step L4: the TypedData of a store, not `book`, tests that no embedder observed
+    // the buffer, and the store keeps no book; an observed buffer exits ObservedBuffer at the
+    // TypedData (the VM then stores, keeping the book).
+    let mut engine = fixture(SET);
+    let tested = install(
+        &mut engine,
+        "set",
+        &typed_set(Some(TypedKind::I16)),
+        Options::default(),
+    );
+    // The store behind it emits no test of its own: the `book` form (the store's E1 test, its
+    // flag load and branch, and the book out of line) is longer by those words and the book's.
+    let mut other = fixture(SET);
+    let booked = install(
+        &mut other,
+        "set",
+        &typed_set_with(Some(TypedKind::I16), true),
+        Options::default(),
+    );
+    assert!(
+        tested.code_bytes() + 4 * 10 <= booked.code_bytes(),
+        "{} and {} bytes",
+        tested.code_bytes(),
+        booked.code_bytes()
+    );
+    exits();
+    eval(
+        &mut engine,
+        "var buf = new ArrayBuffer(32); var t = new Int16Array(buf, 4, 8);",
+    );
+    let env = engine.interp.global_env;
+    let buf = engine.interp.get_var("buf", &env).ok().expect("the buffer");
+    let object = buf.as_obj().expect("an object");
+    eval(&mut engine, "set(t, 1, 7); set(t, 3, 8);");
+    assert!(exits().is_empty());
+    // No book: neither the native interval and count nor the generation and ranges moved.
+    crate::native_typed_array::with_array_buffer(&object, |data| {
+        let native = data.native.as_ref().expect("a view's record");
+        assert_eq!(native.observed.get(), 0);
+        assert_eq!(native.dirty_start.get(), usize::MAX);
+        assert_eq!(native.writes.get(), 0);
+        assert_eq!(data.version.get(), 0);
+        assert!(data.dirty.borrow().is_empty());
+    });
+    // The first observation: the baseline, and the whole buffer dirty.
+    let version = engine.interp.array_buffer_version(&buf).expect("attached");
+    assert_eq!(version, 0);
+    assert_eq!(
+        engine.interp.take_array_buffer_dirty_ranges(&buf),
+        Some(std::iter::once(0..32).collect())
+    );
+    eval(&mut engine, "set(t, 2, 9);");
+    assert_eq!(reasons(), vec![ExitReason::ObservedBuffer]);
+    assert_eq!(
+        engine.interp.take_array_buffer_dirty_ranges(&buf),
+        Some(std::iter::once(8..10).collect())
+    );
+    assert_eq!(engine.interp.array_buffer_version(&buf), Some(version + 1));
+    assert_eq!(eval(&mut engine, "Array.from(t).join()"), "0,7,9,8,0,0,0,0");
 }
 
 // ---- a stub's call and the values across it (P3 stage 3 step 0b) ----

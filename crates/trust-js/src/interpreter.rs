@@ -9583,28 +9583,42 @@ impl Interp {
         true
     }
 
-    /// Takes coalesced byte ranges covering JavaScript writes since the previous call. Highly
-    /// fragmented writes collapse to the whole buffer, so ranges may include unchanged bytes.
+    /// Takes coalesced byte ranges of an ordinary ArrayBuffer covering every write of its bytes
+    /// by JavaScript or the engine since the previous take, or, at its first take, since the
+    /// buffer was made. A buffer's first observation, by this function or by
+    /// [`Interp::array_buffer_version`], whichever comes first, is the embedder's baseline: the
+    /// engine keeps no book of a buffer that no embedder has observed, so that observation marks
+    /// the whole buffer dirty, and the first take returns at least the whole buffer. Highly
+    /// fragmented writes collapse to the whole buffer too, so ranges may include unchanged bytes.
     /// As with a full-buffer copy, the embedder must synchronize host writes before allowing JS
-    /// to modify the mirror. Taking the ranges does not change the mutation generation. `None`
-    /// for another value, a detached buffer or a SharedArrayBuffer, which has no dirty ranges.
+    /// to modify the mirror; host writes (`array_buffer_set_bytes`, `array_buffer_set_range`)
+    /// are not reported. Taking the ranges does not change the mutation generation. `None` for
+    /// another value, a detached buffer or a SharedArrayBuffer, which has no dirty ranges.
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value) -> Option<Vec<Range<usize>>> {
         with_array_buffer(&v.as_obj()?, |data| {
-            data.flush_native_writes();
-            data.local()
-                .is_some()
-                .then(|| std::mem::take(&mut *data.dirty.borrow_mut()))
+            data.local().is_some().then(|| {
+                data.observe();
+                data.flush_native_writes();
+                std::mem::take(&mut *data.dirty.borrow_mut())
+            })
         })?
     }
 
-    /// Returns the mutation generation of an attached ordinary ArrayBuffer. The generation is
-    /// intended for embedders that mirror an ArrayBuffer into another storage; it is not an
-    /// observable JavaScript value and may wrap after `u64::MAX` mutations. `None` for another
-    /// value, a detached buffer or a SharedArrayBuffer: other agents write a Shared Data Block
-    /// without any generation this agent could observe.
+    /// Returns the mutation generation of an attached ordinary ArrayBuffer, for embedders that
+    /// mirror the buffer into another storage. A buffer's first observation, by this function or
+    /// by [`Interp::take_array_buffer_dirty_ranges`], whichever comes first, is the embedder's
+    /// baseline: the engine keeps no book of a buffer that no embedder has observed, and that
+    /// observation leaves the generation as it is (it marks the whole buffer dirty instead).
+    /// From then on the generation moves by one for every write of the buffer's bytes by
+    /// JavaScript or the engine, host writes (`array_buffer_set_bytes`,
+    /// `array_buffer_set_range`) excluded, so two reads of it differ exactly when such a write
+    /// came between them. It is not an observable JavaScript value and may wrap after `u64::MAX`
+    /// writes. `None` for another value, a detached buffer or a SharedArrayBuffer: other agents
+    /// write a Shared Data Block without any generation this agent could observe.
     pub fn array_buffer_version(&self, v: &Value) -> Option<u64> {
         with_array_buffer(&v.as_obj()?, |data| {
             data.local().is_some().then(|| {
+                data.observe();
                 data.version
                     .get()
                     .wrapping_add(data.native.as_ref().map_or(0, |buffer| buffer.writes.get()))

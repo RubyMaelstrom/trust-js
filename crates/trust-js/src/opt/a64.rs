@@ -799,6 +799,15 @@ const SAVE_SLOTS: u32 = 32;
 
 /// Out-of-line code, emitted after the body.
 enum Cold {
+    /// The book of a StoreTyped whose buffer an embedder observed (P3 stage 3 step L4): X17 the
+    /// buffer's record, X9 the zero-extended index, `view` the view's register; the interval
+    /// and the count, as `emit_dirty` keeps them.
+    TypedBook {
+        label: usize,
+        view: u32,
+        shift: u32,
+        resume: usize,
+    },
     /// A boxed f64's NaN case (`box_f64`): the canonical NaN's word into `dst`.
     CanonNan {
         label: usize,
@@ -2884,7 +2893,7 @@ impl Gen<'_> {
                     self.gp_done(n, dst);
                 }
             }
-            NodeOp::TypedData { write } => self.lower_typed_data(n, *write)?,
+            NodeOp::TypedData { write, book } => self.lower_typed_data(n, *write, *book)?,
             NodeOp::LoadTyped(kind) => {
                 if !unused {
                     self.lower_load_typed(n, *kind);
@@ -3691,6 +3700,12 @@ impl Gen<'_> {
             }
             for item in cold {
                 match item {
+                    Cold::TypedBook {
+                        label,
+                        view,
+                        shift,
+                        resume,
+                    } => self.emit_typed_book(label, view, shift, resume),
                     Cold::CanonNan { label, dst, resume } => {
                         self.a.bind(label);
                         self.a.movz(dst, 0x7ff8, 3); // PACK_CANON_NAN
@@ -4555,8 +4570,10 @@ impl Gen<'_> {
     /// buffer attached, writable for a store, its bytes borrowed by no Rust code, and reaching
     /// the view's end (a resizable buffer that shrank fails); then the elements' address, the
     /// bytes' plus the view's offset. Native accesses reload the bytes' header, never keeping its
-    /// address (native_typed_array.rs), and this one keeps it for its effect epoch only.
-    fn lower_typed_data(&mut self, n: NodeIx, write: bool) -> Result<(), Refusal> {
+    /// address (native_typed_array.rs), and this one keeps it for its effect epoch only. A
+    /// store's, unless `book`, tests too that no embedder observed the buffer, a further exit of
+    /// its own reason [ObservedBuffer], so that its stores keep no book (P3 stage 3 step L4).
+    fn lower_typed_data(&mut self, n: NodeIx, write: bool, book: bool) -> Result<(), Refusal> {
         use crate::native_typed_array::{NativeBuffer as Buffer, NativeTypedArray as View};
         use std::mem::offset_of;
         let native = self.native()?;
@@ -4571,6 +4588,12 @@ impl Gen<'_> {
             self.a
                 .ldrb_imm(X9, X17, offset_of!(Buffer, writable) as u32);
             self.a.cbz(X9, false, site);
+            if !book {
+                let observed = self.exit_for(n, ExitReason::ObservedBuffer)?;
+                self.a
+                    .ldrb_imm(X9, X17, offset_of!(Buffer, observed) as u32);
+                self.a.cbnz(X9, false, observed);
+            }
         }
         self.a
             .ldr_imm(X17, X17, offset_of!(Buffer, storage_ptr) as u32);
@@ -4676,7 +4699,12 @@ impl Gen<'_> {
 
     /// StoreTyped: the value's low bits (an integer kind's) or its float at the zero-extended
     /// index, then the buffer's dirty interval and write count for embedders, as the template's
-    /// `emit_dirty` keeps them: [view offset + index << shift, + width), one write.
+    /// `emit_dirty` keeps them: [view offset + index << shift, + width), one write (P3 stage 3
+    /// step L4): none where its data's TypedData tested that no embedder observed the buffer
+    /// (nothing can observe it before the store, as nothing can detach it: the epoch's fact);
+    /// elsewhere the store tests the buffer's `observed` byte itself, its buffer load the
+    /// book's, and keeps the book out of line where it is set (`Cold::TypedBook`), as a barrier's
+    /// slow path is (JSC's addSlowPathGeneratorLambda, dfg/DFGSpeculativeJIT.cpp:13130-13147).
     fn lower_store_typed(&mut self, n: NodeIx, kind: TypedKind) {
         use crate::native_typed_array::{NativeBuffer as Buffer, NativeTypedArray as View};
         use std::mem::offset_of;
@@ -4686,6 +4714,13 @@ impl Gen<'_> {
             node.inputs[2],
             node.inputs[3],
             node.inputs[4],
+        );
+        let tested = matches!(
+            self.graph.node(data).op,
+            NodeOp::TypedData {
+                write: true,
+                book: false
+            }
         );
         let data = self.gp(data, X17);
         let index = self.gp(index, X9);
@@ -4716,11 +4751,34 @@ impl Gen<'_> {
                 }
             }
         }
+        if tested {
+            return;
+        }
         let view = self.gp(view, X16);
-        self.a.ldr_imm(X17, view, offset_of!(View, offset) as u32);
-        self.a.add_shifted(X9, X17, X9, shift);
         self.a
             .ldr_imm(X17, view, offset_of!(View, buffer_ptr) as u32);
+        self.a
+            .ldrb_imm(X30, X17, offset_of!(Buffer, observed) as u32);
+        let label = self.a.new_label();
+        let resume = self.a.new_label();
+        self.a.cbnz(X30, false, label);
+        self.a.bind(resume);
+        self.cold.push(Cold::TypedBook {
+            label,
+            view,
+            shift,
+            resume,
+        });
+    }
+
+    /// `Cold::TypedBook`: [view offset + index << shift, + width) folded into the buffer's dirty
+    /// interval, and one write counted, then back to the store's `resume`.
+    fn emit_typed_book(&mut self, label: usize, view: u32, shift: u32, resume: usize) {
+        use crate::native_typed_array::{NativeBuffer as Buffer, NativeTypedArray as View};
+        use std::mem::offset_of;
+        self.a.bind(label);
+        self.a.ldr_imm(X30, view, offset_of!(View, offset) as u32);
+        self.a.add_shifted(X9, X30, X9, shift);
         self.a.add_imm(X30, X9, 1 << shift);
         let start_done = self.a.new_label();
         let end_done = self.a.new_label();
@@ -4740,6 +4798,7 @@ impl Gen<'_> {
         self.a.ldr_imm(X16, X17, writes);
         self.a.add_imm(X16, X16, 1);
         self.a.str_imm(X16, X17, writes);
+        self.a.b(resume);
     }
 
     /// TypedElement: the template's TypedElement stub on its register contract (x11 the Object,
@@ -4786,6 +4845,14 @@ impl Gen<'_> {
     /// another reason than its own (an element read past the used words beside its hole path).
     fn exit_for(&mut self, n: NodeIx, reason: ExitReason) -> Result<usize, Refusal> {
         let site = self.exit(n, ExitKind::Check)?;
+        // A moved check's sites belong to the record of its own reason (`check_exit`), whose
+        // failure they stand for: a further exit flags its own pc and reason alone (P3 stage 3
+        // step L4: an entry TypedData's ObservedBuffer exit, whose flag keeps the loop's entry
+        // checks moved and makes the recompile's TypedData there `book`).
+        let at = self.exits.len();
+        if self.moved_exits.last().is_some_and(|&(k, _)| k + 1 == at) {
+            self.moved_exits.pop();
+        }
         if let Some((_, _, record)) = self.exits.last_mut() {
             record.reason = reason;
         }

@@ -301,6 +301,12 @@ pub(crate) enum ExitReason {
     /// NotObject's: an Objects speculation that met null exits NotObject, and its recompile, whose
     /// record then holds both, takes this pair. Not kind-bound, as NotString is not.
     NotObjectOrNullish,
+    /// A store's TypedData met a buffer an embedder observed (`NativeBuffer::observed`; P3 stage
+    /// 3 step L4): the flag at its pc (the access's, or a loop header's for the entry check step
+    /// 0c made there) makes the TypedData there `book`, its stores keeping the buffer's book.
+    /// Its own exit, not the moved check's: the flag keeps the loop's entry checks moved. Not
+    /// kind-bound: a buffer's state, as Detached is.
+    ObservedBuffer,
     // The last reason: a reason's discriminant is its bit in the snapshot's declined mask (a
     // u32), which snapshot.rs asserts this one's fits; a reason added after it moves the assert.
 }
@@ -599,8 +605,19 @@ pub(crate) enum NodeOp {
     /// its header and makes at its one entry edge where no entry holds it (P3 stage 3 step 0c;
     /// its exit there HoistingFailed). The element kind's check precedes it,
     /// which a declined view, whose buffer record is null, fails (its kind byte is no kind's).
+    /// For a store and not `book` it tests too that no embedder observed the buffer
+    /// (`NativeBuffer::observed`), a further exit of its own reason [ObservedBuffer], and the
+    /// stores it serves keep no book (P3 stage 3 step L4): only a host function can set the flag,
+    /// through the embed API, so the test holds for the epoch as the buffer's attachment does,
+    /// as V8's typed stores keep no detach or immutability test while its ArrayBufferDetaching
+    /// and ArrayBufferMutable protectors hold (js-native-context-specialization.cc:4093-4105).
+    /// `book`, once an embedder observed some buffer of the Agent (the snapshot's protector) or
+    /// where that exit's flag declined the test at the node's pc: no test here, and each store it
+    /// serves tests its buffer's flag itself and keeps the book where it is set, as V8's code
+    /// carries the detach test at each access once its protector is invalid.
     TypedData {
         write: bool,
+        book: bool,
     },
     /// (Cell, Ptr data, I32 index) -> I32 | F64: the element of `kind` at an index below the
     /// length (Maglev's Load{SignedInt,UnsignedInt,Double}TypedArrayElement): an int32, or an
@@ -615,8 +632,10 @@ pub(crate) enum NodeOp {
     /// (Cell, Ptr view, Ptr data, I32 index, value I32 | F64): the store of `kind` (Maglev's
     /// Store{Int,Double}TypedArrayElement, the value converted first): an integer kind's low bits
     /// of an int32 (a ToInt32 truncation's, or ClampToUint8's), a float's f64 (FCVT to Float32);
-    /// then the buffer's dirty range and write count, kept for embedders as the template keeps
-    /// them (jit_typed_array.rs emit_dirty).
+    /// then, where its data's TypedData is `book` (or is no TypedData), a test of the buffer's
+    /// `observed` byte and, where it is set, the buffer's dirty range and write count out of line,
+    /// kept for embedders as the template keeps them (jit_typed_array.rs emit_dirty); where its
+    /// TypedData tested that no embedder observed the buffer, nothing.
     StoreTyped(TypedKind),
     /// F64 -> I32: ToUint8Clamp (ECMA-262 7.1.12): round half to even and clamp to [0, 255], NaN
     /// to 0 (FCVTNS saturates and takes NaN to 0), as the template stores Uint8Clamped.

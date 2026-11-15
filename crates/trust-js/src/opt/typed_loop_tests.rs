@@ -126,7 +126,10 @@ fn an_effect_free_loop_keeps_a_typed_arrays_facts_its_entry_holds() {
         assert_eq!(data.len(), 1, "{name}: {text}");
         assert_eq!(
             data[0].op,
-            NodeOp::TypedData { write: true },
+            NodeOp::TypedData {
+                write: true,
+                book: false
+            },
             "{name}: {text}"
         );
         // No entry check of the array's facts (P3 stage 3 step 3a: the loop bound's Number checks,
@@ -342,7 +345,11 @@ fn a_typed_array_first_accessed_in_an_effect_free_loop_is_checked_at_its_entry()
         let [data] = data[..] else {
             panic!("{name}: one TypedData: {text}")
         };
-        assert_eq!(data.op, NodeOp::TypedData { write }, "{name}: {text}");
+        assert_eq!(
+            data.op,
+            NodeOp::TypedData { write, book: false },
+            "{name}: {text}"
+        );
         for node in nodes(&graph, |op| {
             matches!(
                 op,
@@ -396,7 +403,10 @@ fn a_flag_at_the_header_leaves_the_typed_arrays_checks_in_the_loop() {
         // The loop's read, which its block's store's check serves.
         assert_eq!(
             in_loop(&graph, header_pc, |op| *op
-                == NodeOp::TypedData { write: true })
+                == NodeOp::TypedData {
+                    write: true,
+                    book: false
+                })
             .len(),
             1,
             "{name}: {text}"
@@ -553,8 +563,14 @@ fn a_read_its_block_then_stores_to_checks_for_the_store() {
     assert_eq!(
         data_of(&graph),
         [
-            NodeOp::TypedData { write: true },
-            NodeOp::TypedData { write: true }
+            NodeOp::TypedData {
+                write: true,
+                book: false
+            },
+            NodeOp::TypedData {
+                write: true,
+                book: false
+            }
         ],
         "{text}"
     );
@@ -565,8 +581,14 @@ fn a_read_its_block_then_stores_to_checks_for_the_store() {
         assert_eq!(
             data_of(&graph),
             [
-                NodeOp::TypedData { write: false },
-                NodeOp::TypedData { write: true }
+                NodeOp::TypedData {
+                    write: false,
+                    book: false
+                },
+                NodeOp::TypedData {
+                    write: true,
+                    book: false
+                }
             ],
             "{name}: {text}"
         );

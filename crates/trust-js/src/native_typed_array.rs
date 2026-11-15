@@ -12,11 +12,19 @@ use std::cell::{Cell, RefCell};
 use std::ops::Range;
 use std::rc::Rc;
 
+/// The guard record of an ArrayBuffer's native views, which generated code reads, and the book
+/// its native stores keep for an embedder that mirrors the buffer: the byte interval they wrote
+/// and their count since the last fold ([`ArrayBufferData::flush_native_writes`]). They keep the
+/// book only once the embedder observed the buffer (`observed`, P3 stage 3 step L4).
 #[repr(C)]
 pub(crate) struct NativeBuffer {
     pub storage_ptr: *const RefCell<Vec<u8>>,
     pub attached: Cell<u8>,
     pub writable: u8,
+    /// 1 once an embedder read this buffer's book ([`ArrayBufferData::observe`]); never cleared.
+    /// Where it is 0 the native stores keep no book, as a write barrier keeps none for a store
+    /// nothing will read (V8's page flags, JSC's cell state, SpiderMonkey's nursery test).
+    pub observed: Cell<u8>,
     pub dirty_start: Cell<usize>,
     pub dirty_end: Cell<usize>,
     pub writes: Cell<u64>,
@@ -57,10 +65,16 @@ pub(crate) struct ArrayBufferData {
     /// ArrayBuffer's own bytes only). Detaching clears it and its views' `attached` byte.
     pub(crate) native: Option<Rc<NativeBuffer>>,
     /// The mutation generation host embedders mirror the bytes by
-    /// (`Interp::array_buffer_version`).
+    /// (`Interp::array_buffer_version`): the writes counted since the buffer's first
+    /// observation.
     pub(crate) version: Cell<u64>,
     /// Bounded, conservative byte ranges covering writes since the last host synchronization.
     pub(crate) dirty: RefCell<Vec<Range<usize>>>,
+    /// An embedder read this buffer's book ([`ArrayBufferData::observe`]); never cleared. Before
+    /// it, no write keeps a book: no generation, no ranges, no native interval or count. Where
+    /// `native` is present its `observed` byte is this flag (the record copies it when a view
+    /// makes it, `observe` sets both); a SharedArrayBuffer keeps no book and its flag is unread.
+    pub(crate) observed: Cell<bool>,
     /// Made by transferToImmutable or sliceToImmutable: its bytes can be read but never written,
     /// resized, detached or transferred.
     pub(crate) immutable: bool,
@@ -91,6 +105,7 @@ impl ArrayBufferData {
             dirty: RefCell::new(Vec::new()),
             immutable: false,
             host_keyed: false,
+            observed: Cell::new(false),
             ledger: ledger.clone(),
             counted: Cell::new(counted),
         }
@@ -147,6 +162,42 @@ impl ArrayBufferData {
         self.data.take()
     }
 
+    /// An embedder reads this buffer's book (`Interp::array_buffer_version`,
+    /// `Interp::take_array_buffer_dirty_ranges`; P3 stage 3 step L4). From its first read on,
+    /// every write keeps the book: the native stores' interval and count, the Rust writers'
+    /// generation and ranges. The first read marks the whole buffer dirty, as no book was kept
+    /// before it, and leaves the generation as it is: that read is the embedder's baseline.
+    pub(crate) fn observe(&self) {
+        if self.observed.replace(true) {
+            return;
+        }
+        self.ledger.observed.set(true);
+        if let Some(buffer) = &self.native {
+            buffer.observed.set(1);
+        }
+        if let Some(len) = self
+            .local()
+            .map(|bytes| bytes.borrow().len())
+            .filter(|&len| len > 0)
+        {
+            crate::interpreter::record_buffer_write(&mut self.dirty.borrow_mut(), 0..len, len);
+        }
+    }
+
+    /// The two flags agree: where the buffer has a native record, its `observed` byte is
+    /// `observed` (the record copies the flag when a view makes it; `observe` sets both). Read by
+    /// the tier's tests (opt::observed_tests, ARM64's).
+    #[cfg(all(
+        test,
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn observed_agrees(&self) -> bool {
+        self.native
+            .as_ref()
+            .is_none_or(|buffer| buffer.observed.get() == u8::from(self.observed.get()))
+    }
+
     /// Fold the native views' writes since the last fold into the generation and the dirty
     /// ranges.
     pub(crate) fn flush_native_writes(&self) {
@@ -172,8 +223,12 @@ impl ArrayBufferData {
 
     /// Record a write of `len` bytes from `start` into an ArrayBuffer's own bytes: one more
     /// generation and a dirty range. A Shared Data Block, which other agents write too, has no
-    /// generation or dirty ranges; nor has an empty or out-of-range write.
+    /// generation or dirty ranges; nor has an empty or out-of-range write, nor a buffer no
+    /// embedder observed (`observe`: its first observation marks it whole).
     pub(crate) fn mark_dirty_range(&self, start: usize, len: usize) {
+        if !self.observed.get() {
+            return;
+        }
         let Some(buffer_len) = self.local().map(|bytes| bytes.borrow().len()) else {
             return;
         };
@@ -220,9 +275,28 @@ pub(crate) struct BufferLedger {
     /// The Shared Data Blocks of the live SharedArrayBuffers, each with its number of buffers:
     /// a block counts once however many buffers alias it.
     shared: RefCell<crate::fasthash::FastMap<u64, usize>>,
+    /// An embedder observed some buffer of this Agent ([`ArrayBufferData::observe`]; P3 stage 3
+    /// step L4): the protector the optimizing tier speculates on, as V8's typed stores keep no
+    /// detach check while its ArrayBufferDetaching protector holds and its first detach
+    /// invalidates it for every later compile (execution/protectors.h:19,
+    /// objects/js-array-buffer.cc:243). Never cleared.
+    observed: Cell<bool>,
 }
 
 impl BufferLedger {
+    /// Whether an embedder has observed any buffer of this Agent (`observed`), which the
+    /// optimizing tier's snapshot reads (ARM64's).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn any_observed(&self) -> bool {
+        self.observed.get()
+    }
+
     /// The live buffers' data: their own Data Blocks' counted bytes and each Shared Data Block's
     /// current length.
     pub(crate) fn retained_bytes(&self) -> usize {
@@ -320,6 +394,7 @@ fn native_view(info: TaInfo) -> NativeTypedArray {
         return declined;
     };
     let writable = u8::from(!data.immutable);
+    let observed = u8::from(data.observed.get());
     let storage = storage.clone();
     let buffer = data
         .native
@@ -328,6 +403,7 @@ fn native_view(info: TaInfo) -> NativeTypedArray {
                 storage_ptr: Rc::as_ptr(&storage),
                 attached: Cell::new(1),
                 writable,
+                observed: Cell::new(observed),
                 dirty_start: Cell::new(usize::MAX),
                 dirty_end: Cell::new(0),
                 writes: Cell::new(0),
@@ -441,6 +517,7 @@ pub(crate) fn probe_layout(object_view: usize, sample: &Gc) -> Option<Layout> {
         storage_ptr: Rc::as_ptr(&storage),
         attached: Cell::new(1),
         writable: 1,
+        observed: Cell::new(0),
         dirty_start: Cell::new(usize::MAX),
         dirty_end: Cell::new(0),
         writes: Cell::new(0),
@@ -512,11 +589,18 @@ mod tests {
             var buffer = new ArrayBuffer(64), heap = new Uint8Array(buffer, 4, 16);
             function captured(n) {for (var k = 0; k < n; ++k) heap[k & 15] = k & 255;}
             function local(a, n) {for (var k = 0; k < n; ++k) a[k & 15] = k & 255;}
-            captured(1000); local(heap, 1000);
         "#,
         );
         let buffer = engine_value(&mut engine, "buffer");
         let object = buffer.as_obj().unwrap();
+        // The embedder's first observation, its baseline (P3 stage 3 step L4: no book is kept
+        // for a buffer no embedder observed), which marks the whole buffer dirty.
+        assert_eq!(engine.interp.array_buffer_version(&buffer), Some(0));
+        assert_eq!(
+            engine.interp.take_array_buffer_dirty_ranges(&buffer),
+            Some(std::iter::once(0..64).collect())
+        );
+        eval(&mut engine, "captured(1000); local(heap, 1000);");
         #[cfg(all(
             target_arch = "aarch64",
             any(target_os = "linux", target_os = "macos", target_os = "windows")

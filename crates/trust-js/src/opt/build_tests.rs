@@ -2269,7 +2269,10 @@ fn typed_array_sites_access_their_one_kind_in_line() {
             NodeOp::TypedView,
             NodeOp::TypedLength,
             NodeOp::CheckBounds,
-            NodeOp::TypedData { write: false },
+            NodeOp::TypedData {
+                write: false,
+                book: false,
+            },
             NodeOp::LoadTyped(kind),
         ] {
             let found = nodes(&graph, |candidate| *candidate == op);
@@ -2302,7 +2305,11 @@ fn typed_array_sites_access_their_one_kind_in_line() {
             "{name}: {text}"
         );
         assert_eq!(
-            count(&graph, |op| *op == NodeOp::TypedData { write: true }),
+            count(&graph, |op| *op
+                == NodeOp::TypedData {
+                    write: true,
+                    book: false
+                }),
             1,
             "{name}: {text}"
         );
@@ -2320,12 +2327,20 @@ fn typed_array_sites_access_their_one_kind_in_line() {
     assert_eq!(count(&graph, |op| *op == NodeOp::TypedView), 1, "{text}");
     assert_eq!(count(&graph, |op| *op == NodeOp::CheckBounds), 3, "{text}");
     assert_eq!(
-        count(&graph, |op| *op == NodeOp::TypedData { write: true }),
+        count(&graph, |op| *op
+            == NodeOp::TypedData {
+                write: true,
+                book: false
+            }),
         1,
         "{text}"
     );
     assert_eq!(
-        count(&graph, |op| *op == NodeOp::TypedData { write: false }),
+        count(&graph, |op| *op
+            == NodeOp::TypedData {
+                write: false,
+                book: false
+            }),
         0,
         "{text}"
     );

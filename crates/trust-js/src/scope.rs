@@ -1667,12 +1667,28 @@ impl<'s> Ctx<'s> {
             .array_buffer_copy_range(v.as_internal(), start, len, destination)
     }
 
-    /// The byte ranges JavaScript wrote since the previous call (coalesced).
+    /// Takes coalesced byte ranges of an ordinary `ArrayBuffer` covering every write of its bytes
+    /// by JavaScript or the engine since the previous take, or, at its first take, since the
+    /// buffer was made. A buffer's first observation, by this function or by
+    /// [`Ctx::array_buffer_version`], whichever comes first, is the embedder's baseline: the
+    /// engine keeps no book of a buffer that no embedder has observed, so that observation marks
+    /// the whole buffer dirty, and the first take returns at least the whole buffer. Ranges may
+    /// include unchanged bytes; host writes are not reported; taking them does not change the
+    /// mutation generation. `None` for another value, a detached buffer or a
+    /// `SharedArrayBuffer` (see `Interp::take_array_buffer_dirty_ranges`).
     pub fn take_array_buffer_dirty_ranges(&mut self, v: &Value<'s>) -> Option<Vec<Range<usize>>> {
         self.interp.take_array_buffer_dirty_ranges(v.as_internal())
     }
 
-    /// The mutation generation of an attached ordinary `ArrayBuffer`.
+    /// The mutation generation of an attached ordinary `ArrayBuffer`, for embedders that mirror
+    /// it. A buffer's first observation, by this function or by
+    /// [`Ctx::take_array_buffer_dirty_ranges`], whichever comes first, is the embedder's
+    /// baseline: the engine keeps no book of a buffer that no embedder has observed, and that
+    /// observation leaves the generation as it is (it marks the whole buffer dirty instead). From
+    /// then on the generation moves by one for every write of the buffer's bytes by JavaScript
+    /// or the engine (host writes excluded), so two reads differ exactly when such a write came
+    /// between them; it may wrap. `None` for another value, a detached buffer or a
+    /// `SharedArrayBuffer` (see `Interp::array_buffer_version`).
     pub fn array_buffer_version(&self, v: &Value<'s>) -> Option<u64> {
         self.interp.array_buffer_version(v.as_internal())
     }

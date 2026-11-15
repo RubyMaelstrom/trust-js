@@ -285,11 +285,16 @@ fn emit_to_integer(a: &mut asm::Asm, slow: usize) {
     a.fcvtzs_x_d(16, 1);
 }
 
-/// The element has been written. X9 = element index, X14 = the view's byte offset: record
-/// `[start, end)` and one write in the buffer's bookkeeping. The bytes are authoritative
-/// immediately, including when a later instruction throws. A conservative interval and
-/// generation are folded into host metadata on demand.
+/// The element has been written. X9 = element index, X14 = the view's byte offset: where an
+/// embedder observed the buffer (`NativeBuffer::observed`, P3 stage 3 step L4), record
+/// `[start, end)` and one write in the buffer's bookkeeping; elsewhere nothing, as a write
+/// barrier tests whether a store is interesting before it keeps a book (V8's page flags,
+/// macro-assembler-arm64.cc:4425-4436; JSC's cell state, AssemblyHelpers.h:1261-1285). The bytes
+/// are authoritative immediately, including when a later instruction throws. A conservative
+/// interval and generation are folded into host metadata on demand.
 fn emit_dirty(a: &mut asm::Asm, hit: usize, shift: u32, width: u32) {
+    a.ldrb_imm(16, 13, offset_of!(Buffer, observed) as u32);
+    a.cbz(16, false, hit);
     a.add_shifted(9, 14, 9, shift); // start = byteOffset + (index << shift)
     a.add_imm(16, 9, width); // end
     let start_done = a.new_label();

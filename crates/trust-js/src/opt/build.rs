@@ -5746,7 +5746,14 @@ impl Builder<'_> {
 
     /// The elements' address of the typed array `cell` (its view `view`, its element kind
     /// proven), checked valid, for a store too where `write` [Detached]: a heap fact of the
-    /// epoch, which a store's check serves a load too.
+    /// epoch, which a store's check serves a load too. A store's tests too that no embedder
+    /// observed the buffer [ObservedBuffer], so that the stores it serves keep no book, unless
+    /// it is `book` (its stores testing the flag themselves): where an embedder had observed some
+    /// buffer of the Agent at the snapshot (the protector, as V8's code carries its typed stores'
+    /// detach test at each access once its ArrayBufferDetaching protector is invalid) or that
+    /// exit's flag at this pc declines the test (P3 stage 3 step L4). A compile's TypedData are
+    /// therefore all tested or all `book` (a flag exists only after an observation, which sets
+    /// the protector for good).
     fn typed_data(
         &mut self,
         st: &mut State,
@@ -5762,9 +5769,12 @@ impl Builder<'_> {
         if let Some(&data) = known {
             return data;
         }
+        let book = write
+            && (self.snapshot.buffers_observed()
+                || self.declined(cx.pc, ExitReason::ObservedBuffer, "the booked stores"));
         let state = self.before(cx, st);
         let data = self.add_exit(
-            NodeOp::TypedData { write },
+            NodeOp::TypedData { write, book },
             &[cell, view],
             Rep::Ptr,
             cx.pc,

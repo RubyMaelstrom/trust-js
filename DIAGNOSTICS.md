@@ -92,7 +92,10 @@ comment/example in the same change.
   loop phi for PhiNotInt32 and a tagged one for PhiNotNumber, the two exits of a loop's entry
   check of a word entering an untagged phi, at its header, and the checks in the loop for
   HoistingFailed, the exit of a loop invariant's check or of a typed array's checks moved to
-  the loop's entry, at its header); at a bitwise operation whose record
+  the loop's entry, at its header; the stores' book for ObservedBuffer, the exit of a typed
+  store's TypedData whose buffer an embedder observed through `array_buffer_version` or
+  `take_array_buffer_dirty_ranges`, at the store's pc or, for a loop's entry check, its
+  header); at a bitwise operation whose record
   holds undefined, null or Booleans, a NotNumber flag declines the operation only once its
   truncation of them exited (a Number check's exits there were oddballs the VM recorded, which
   the truncation takes). A code whose exited frames loop is

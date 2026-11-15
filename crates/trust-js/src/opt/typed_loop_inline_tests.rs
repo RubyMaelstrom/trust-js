@@ -111,7 +111,11 @@ fn an_inlined_callees_loop_checks_its_typed_array_at_its_entry_in_its_frame() {
     assert!(
         nodes(graph, |node| node.reason
             == Some(ExitReason::HoistingFailed)
-            && node.op == NodeOp::TypedData { write: true })
+            && node.op
+                == NodeOp::TypedData {
+                    write: true,
+                    book: false
+                })
         .len()
             == 1,
         "{}",

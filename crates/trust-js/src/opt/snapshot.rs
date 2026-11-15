@@ -77,6 +77,9 @@ pub(crate) struct Snapshot {
     /// The creation ways' chains (see [`CreationChain`]), by pc, ascending; empty where no
     /// creation way's prototype is alive or the snapshot read no realm.
     chains: Box<[(u32, Box<[CreationChain]>)]>,
+    /// An embedder had observed some buffer of the realm's Agent (the protector, see
+    /// [`Snapshot::buffers_observed`]).
+    buffers_observed: bool,
 }
 
 /// The prototype chain of a creation way's receiver as the main thread walked it at the
@@ -103,7 +106,7 @@ const MAX_CREATION_LEVELS: usize = 8;
 
 // Every reason has its bit in a declined mask: the discriminants run from 0 to the last reason's
 // (ExitReason's last variant), which the mask's width bounds.
-const _: () = assert!((ExitReason::NotObjectOrNullish as u32) < u32::BITS);
+const _: () = assert!((ExitReason::ObservedBuffer as u32) < u32::BITS);
 
 /// Where a free-name read's search starts (stage 2, step 4).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -206,6 +209,9 @@ pub(crate) struct Raw {
     declined: Box<[(u32, u8)]>,
     /// The creation ways' chains (see [`CreationChain`]; made afresh where there are any).
     chains: Vec<(u32, Box<[CreationChain]>)>,
+    /// An embedder had observed some buffer of the realm's Agent (`BufferLedger::any_observed`,
+    /// P3 stage 3 step L4): the protector read on the main thread.
+    buffers_observed: bool,
 }
 
 impl Raw {
@@ -241,6 +247,8 @@ impl Raw {
             }
         }
         chunk.copy_feedback_into(&mut self.feedback);
+        self.buffers_observed =
+            realm.is_some_and(|realm| realm.gc_heap.agent.buffer_ledger.any_observed());
         self.chains.clear();
         if let Some(realm) = realm {
             for (pc, op) in ops.iter().enumerate() {
@@ -396,7 +404,14 @@ impl Snapshot {
             declined: raw.declined.clone(),
             names: names.into_boxed_slice(),
             chains: raw.chains.clone().into_boxed_slice(),
+            buffers_observed: raw.buffers_observed,
         }
+    }
+
+    /// Whether an embedder had observed some buffer of the Agent when the snapshot was taken (P3
+    /// stage 3 step L4): the builder then books every typed store, speculating on nothing.
+    pub(crate) fn buffers_observed(&self) -> bool {
+        self.buffers_observed
     }
 
     /// The chains of the creation ways of the named store at `pc` whose prototypes the snapshot
