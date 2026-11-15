@@ -894,6 +894,59 @@ fn with_the_tier_off_template_code_records_no_pair() {
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 #[test]
+fn an_equality_with_a_nullish_constant_keeps_no_record() {
+    // A loop's in-line templates record their equalities' pairs (P3 stage 3 step L1b), but not
+    // where the right operand is an undefined or null constant on every path (step L1b, D): such
+    // an equality has no group, and its record stays empty, an object against the constant as
+    // before; `null === a` is compiled as `a === null`. Where the conditional's join reaches the
+    // equality, the constant is one operand of two, and the site records.
+    super::pin_forced_exits_off_for_test();
+    let mut engine = jit_engine(true);
+    let mut source = String::new();
+    for (name, test) in [
+        ("rn", "a == null"),
+        ("ru", "undefined != a"),
+        ("rs", "a === null"),
+        ("rw", "null === a"),
+        ("rv", "a !== void 0"),
+        ("rj", "a == (b ? a : null)"),
+    ] {
+        source.push_str(&format!(
+            "function {name}(a, b, n) {{ var c = 0;
+               for (var i = 0; i < n; i++) {{ if ({test}) c++; }} return c; }}"
+        ));
+    }
+    eval(&mut engine, &source);
+    for name in ["rn", "ru", "rs", "rw", "rv", "rj"] {
+        template_only(&mut engine, name, &format!("{name}({{}}, false, 8)"));
+        let chunk = chunk_of(&mut engine, name);
+        let pc = equality_pc(&chunk);
+        let records = name == "rj";
+        assert_eq!(
+            super::profile::ChunkProfile::of(&chunk)
+                .equality_bytes(&chunk, pc)
+                .is_some(),
+            records,
+            "{name}: a group: {:?}",
+            chunk.jit_ops()
+        );
+        let classes = if records { 1 << OBJECT_OR_NULLISH } else { 0 };
+        assert_eq!(seen(&mut engine, name), (classes, 0), "{name}: met");
+        super::profile::merge_element_hits(&chunk);
+        let record = if records {
+            crate::feedback::EQ_NULLISH
+        } else {
+            0
+        };
+        assert_eq!(seen(&mut engine, name), (0, record), "{name}: merged");
+    }
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
 fn speculated_equality_results_equal_the_vms() {
     // Sites that meet one pair for long, then others late (their checks exit), a String pair
     // of equal lengths and contents in other cells, a long String, interned and made Strings,
@@ -1059,6 +1112,38 @@ fn object_or_nullish_equality_results_equal_the_vms() {
            const a = late ? x : kin[k & 7], b = late ? y : kin[(k >> 3) & 7];
            const bits = [le(a, b), ln(b, a), se(a, b), sn(a, b), le(a, a), se(b, null)];
            for (const bit of bits) {{ h = (h * 2 + (bit ? 1 : 0)) % 1000003; t += bit ? 1 : 0; }}
+         }}
+         h + ':' + t"
+    ));
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn nullish_constant_equality_results_equal_the_vms() {
+    // The table at the equalities of P3 stage 3 step L1b's D: an undefined or null constant
+    // against a conditional's phi and an assignment's value (no record, the rules' claim from the
+    // constant alone), and the constant one arm of a conditional the equality joins (a record);
+    // in loops, whose in-line templates record, and out of them.
+    results_equal_the_vms(&format!(
+        "{TABLE}
+         function pl(a, b, c) {{ return (c ? a : b) == null; }}
+         function ps(a, b, c) {{ return (c ? a : b) !== undefined; }}
+         function al(a) {{ var t; return (t = a) != null; }}
+         function as(a) {{ var t; return (t = a) === null; }}
+         function jn(a, c) {{ return a == (c ? a : null); }}
+         function jv(a, c) {{ return a === (c ? null : void 0); }}
+         function lw(a, b, m) {{ var c = 0;
+           for (var i = 0; i < m; i++) {{ if ((i & 1 ? a : b) != null) c++;
+             if (a === (i & 2 ? null : b)) c += 2; }} return c; }}
+         let h = 0, t = 0;
+         for (let k = 0; k < 5000; k++) {{
+           const a = vals[k % n], b = vals[Math.floor(k / n) % n], c = k & 1;
+           const bits = [pl(a, b, c), ps(a, b, c), al(a), as(b), jn(a, c), jv(b, c),
+             lw(a, b, 4)];
+           for (const bit of bits) {{ h = (h * 3 + (bit | 0)) % 1000003; t += bit | 0; }}
          }}
          h + ':' + t"
     ));
@@ -1286,6 +1371,56 @@ fn a_loop_whose_equalities_and_typeof_tests_lower_is_free_of_effects() {
             .any(|node| members[node.block.index()] && is_effect(&node.op)),
         "{text}"
     );
+}
+
+#[test]
+fn a_constants_equality_lowers_whatever_made_the_other_operand() {
+    // The other operand a conditional's phi, made in other blocks, or an assignment's value, which
+    // no single push made (P3 stage 3 step L1b, D): the rules claim the equality from the
+    // constant's producer alone, so the loop is free of effects and keeps its heap facts (its read
+    // takes the data address the read before it checked, stage 3 step 0c), and the builder lowers
+    // it from the constant: NullOrLikeUndefined under `==`, identity under `===` with undefined
+    // or null, the word's double compare with a Number. Such sites keep no record
+    // (`feedback_read::records_equality`): the constant is the claim's only source.
+    let tests = [
+        ("pl", "(y ? x : y) == null", NodeOp::NullOrLikeUndefined),
+        ("al", "(y = x) != null", NodeOp::NullOrLikeUndefined),
+        ("ps", "(y ? x : y) === null", NodeOp::TaggedSame),
+        ("as", "(y = x) !== undefined", NodeOp::TaggedSame),
+        ("pn", "(y ? x : y) === 0", NodeOp::F64Cmp(Cond::Eq)),
+    ];
+    let mut source = String::from("var T = new Int32Array(8);");
+    let mut drive = String::from("for (var r = 0; r < 20; r++) {");
+    for (name, test, _) in &tests {
+        source.push_str(&format!(
+            "function {name}(t, x, y, n) {{ var s = t[0] | 0;
+               for (var i = 0; i < n; i = (i + 1) | 0) {{
+                 if ({test}) s = (s + (t[i] | 0)) | 0; }}
+               return s | 0; }}"
+        ));
+        drive.push_str(&format!("{name}(T, r & 1 ? null : r, 'b', 8);"));
+    }
+    drive.push('}');
+    let mut engine = warmed(&format!("{source} {drive}"));
+    for (name, test, lowered) in tests {
+        let (graph, text) = graph_of(&mut engine, name);
+        let members = loop_members(&graph, &text);
+        let in_loop = |which: &dyn Fn(&NodeOp) -> bool| {
+            graph
+                .nodes
+                .iter()
+                .any(|node| members[node.block.index()] && which(&node.op))
+        };
+        assert!(
+            !in_loop(&is_effect),
+            "{test}: no effect in the loop: {text}"
+        );
+        assert!(
+            !in_loop(&|op| matches!(op, NodeOp::TypedData { .. })),
+            "{test}: the data address loaded before the loop alone: {text}"
+        );
+        assert!(in_loop(&|op| *op == lowered), "{test}: {lowered:?}: {text}");
+    }
 }
 
 #[test]

@@ -70,6 +70,38 @@ pub(crate) fn is_equality(op: &Op) -> bool {
     matches!(op, Op::EqEq | Op::NotEq | Op::StrictEq | Op::StrictNotEq)
 }
 
+/// Whether the operation at `pc` of `chunk` is an equality that keeps an equality record (P3
+/// stage 3, step L1b, D; feedback-schema.txt 5.8), `targets` its operations' jump targets
+/// ([`jump_targets`]): every equality but one whose right operand is an undefined or null
+/// constant on every path to it, the operation before it `Undef` or a `Const` of undefined or
+/// null and the equality no jump target. The compiler puts a literal on the right of a
+/// comparison with a non-literal (`null == x` compiles as `x == null`, `Compiler::binary`), the
+/// parser makes the name `undefined` a literal, and `void` of a literal is `Undef`: so `x ==
+/// null`, `undefined != x`, `x === null` and `x !== void 0` keep none, where `x == (c ? y :
+/// null)`, whose equality the conditional's join reaches, keeps one. The tier lowers such an
+/// equality from its constant whatever the other operand (`opt::build`'s `Rules::equality_lowers`
+/// and `Builder::equality`: the other's NullOrLikeUndefined under `==`, identity under `===`),
+/// so a record there would only cost template code its stores, as V8's bytecode generator
+/// compiles a literal comparison with undefined or null to TestUndefined, TestNull or
+/// TestUndetectable, which have no feedback slot (interpreter/bytecode-generator.cc:7862-7883 and
+/// 8010-8017, interpreter/bytecodes.h:118-120), and JSC's to eq_null or neq_null, which profile
+/// nothing (bytecode/BytecodeList.rb:1375-1378; DFG makes them CompareEq with a null constant,
+/// dfg/DFGByteCodeParser.cpp:9379-9385).
+pub(crate) fn records_equality(chunk: &Chunk, targets: &[bool], pc: usize) -> bool {
+    let ops = chunk.jit_ops();
+    if !ops.get(pc).is_some_and(is_equality) {
+        return false;
+    }
+    let nullish = match pc.checked_sub(1).map(|before| ops[before]) {
+        Some(Op::Undef) => true,
+        Some(Op::Const(k)) => chunk.jit_const_scalar_bits(k).is_some_and(|word| {
+            word == crate::value::PACK_UNDEFINED || word == crate::value::PACK_NULL
+        }),
+        _ => false,
+    };
+    !nullish || targets[pc]
+}
+
 /// Whether `op` is an element load or store with the element record.
 pub(crate) fn is_element_access(op: &Op) -> bool {
     matches!(

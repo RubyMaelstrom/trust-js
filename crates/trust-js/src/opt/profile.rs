@@ -119,16 +119,18 @@ pub(crate) struct ChunkProfile {
     /// their addresses.
     elements: OnceCell<Box<[Cell<u8>]>>,
     /// Template code's last-seen equality pairs (P3 stage 3, step L1b): a group of
-    /// `feedback::EQ_CLASSES` bytes for each equality of the chunk, made by the first template
-    /// compile that records into them ([`ChunkProfile::equality_bytes`]): byte k of a group is
+    /// `feedback::EQ_CLASSES` bytes for each equality of the chunk that keeps a record (all but
+    /// those with an undefined or null constant operand, `feedback_read::records_equality`), made
+    /// by the first template compile that records into them ([`ChunkProfile::equality_bytes`]):
+    /// byte k of a group is
     /// [`UNSEEN`], or 0 where an in-line path of the site met a pair of class k
     /// (`feedback::eq_class_bit`) since the last merge (`jit::emit_equality_numbers_record`,
     /// `jit::emit_equality_tags_record`). Classes, never a pointer; the bytes never move.
     equalities: OnceCell<EqualityBytes>,
 }
 
-/// The equality groups of a chunk ([`ChunkProfile::equalities`]): the equalities' pcs, ascending,
-/// and their groups of `feedback::EQ_CLASSES` bytes in that order.
+/// The equality groups of a chunk ([`ChunkProfile::equalities`]): the pcs of the equalities that
+/// keep a record, ascending, and their groups of `feedback::EQ_CLASSES` bytes in that order.
 #[derive(Debug)]
 struct EqualityBytes {
     pcs: Box<[u32]>,
@@ -136,12 +138,11 @@ struct EqualityBytes {
 }
 
 impl EqualityBytes {
-    fn new(ops: &[crate::bytecode::Op]) -> Self {
-        let pcs: Box<[u32]> = ops
-            .iter()
-            .enumerate()
-            .filter(|(_, op)| crate::bytecode::feedback_read::is_equality(op))
-            .map(|(pc, _)| pc as u32)
+    fn new(chunk: &Chunk) -> Self {
+        let targets = crate::bytecode::jump_targets(chunk.jit_ops());
+        let pcs: Box<[u32]> = (0..chunk.jit_ops().len())
+            .filter(|&pc| crate::bytecode::feedback_read::records_equality(chunk, &targets, pc))
+            .map(|pc| pc as u32)
             .collect();
         let bytes = (0..pcs.len() * crate::feedback::EQ_CLASSES)
             .map(|_| Cell::new(UNSEEN))
@@ -149,7 +150,8 @@ impl EqualityBytes {
         EqualityBytes { pcs, bytes }
     }
 
-    /// The group of the equality at `pc`, None for a pc that is no equality.
+    /// The group of the equality at `pc`, None for a pc that is no equality or one that keeps no
+    /// record.
     fn group(&self, pc: usize) -> Option<&[Cell<u8>]> {
         let k = self.pcs.binary_search(&u32::try_from(pc).ok()?).ok()?;
         let n = crate::feedback::EQ_CLASSES;
@@ -395,15 +397,16 @@ impl ChunkProfile {
         self.elements.get().expect("made")[2 * pc].set(kind);
     }
 
-    /// The address of the equality at `pc`'s group of last-seen class bytes in a chunk whose
-    /// operations are `ops` (see the `equalities` field; P3 stage 3, step L1b), the groups made
-    /// [`UNSEEN`] at the first ask, one for each equality of the chunk (main thread: a template
-    /// compile that records); None for a pc that is no equality. Generated code stores zero into
-    /// the byte of the class of each pair it meets.
-    pub(crate) fn equality_bytes(&self, ops: &[crate::bytecode::Op], pc: usize) -> Option<u64> {
+    /// The address of the equality at `pc`'s group of last-seen class bytes in `chunk`, this
+    /// profile's (see the `equalities` field; P3 stage 3, step L1b), the groups made [`UNSEEN`]
+    /// at the first ask, one for each equality of the chunk that keeps a record (main thread: a
+    /// template compile that records); None for a pc that is no such equality (step L1b, D: one
+    /// with an undefined or null constant operand, which then records nothing). Generated code
+    /// stores zero into the byte of the class of each pair it meets.
+    pub(crate) fn equality_bytes(&self, chunk: &Chunk, pc: usize) -> Option<u64> {
         let group = self
             .equalities
-            .get_or_init(|| EqualityBytes::new(ops))
+            .get_or_init(|| EqualityBytes::new(chunk))
             .group(pc)?;
         Some(group[0].as_ptr() as u64)
     }
@@ -412,8 +415,7 @@ impl ChunkProfile {
     /// store does (tests, as [`see_element`]; P3 stage 3, step L1b).
     #[cfg(test)]
     pub(crate) fn see_equality(&self, chunk: &Chunk, pc: usize, class: u8) {
-        self.equality_bytes(chunk.jit_ops(), pc)
-            .expect("an equality's pc");
+        self.equality_bytes(chunk, pc).expect("an equality's pc");
         let group = self
             .equalities
             .get()

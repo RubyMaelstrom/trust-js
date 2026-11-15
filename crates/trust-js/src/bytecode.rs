@@ -25781,17 +25781,24 @@ pub(crate) fn stack_effect(
     })
 }
 
-/// [`Chunk::jit_cap_initialized`] for every operation: a cap operation whose binding an earlier
-/// operation of its basic block (from a jump target to the next) checked or initialized.
-pub(crate) fn cap_tdz_known(ops: &[Op]) -> Box<[bool]> {
-    let mut leader = vec![false; ops.len() + 1];
+/// Whether each operation of `ops` (and the end, `ops.len()`) is a jump target: one that a jump,
+/// guard, handler, finally or iterator operation can transfer control to.
+pub(crate) fn jump_targets(ops: &[Op]) -> Box<[bool]> {
+    let mut targeted = vec![false; ops.len() + 1];
     for op in ops {
         for target in op_jump_targets(op) {
-            if let Some(slot) = leader.get_mut(target as usize) {
+            if let Some(slot) = targeted.get_mut(target as usize) {
                 *slot = true;
             }
         }
     }
+    targeted.into_boxed_slice()
+}
+
+/// [`Chunk::jit_cap_initialized`] for every operation: a cap operation whose binding an earlier
+/// operation of its basic block (from a jump target to the next) checked or initialized.
+pub(crate) fn cap_tdz_known(ops: &[Op]) -> Box<[bool]> {
+    let leader = jump_targets(ops);
     let mut known: Vec<u32> = Vec::new();
     let mut out = vec![false; ops.len()];
     for (pc, op) in ops.iter().enumerate() {

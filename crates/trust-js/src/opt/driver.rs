@@ -449,7 +449,9 @@ pub(crate) fn counts_loops() -> bool {
 /// before. Each equality site has its group of class bytes (P3 stage 3, steps L1 and L1b;
 /// `ChunkProfile::equality_bytes`: the classes of the pairs of operand kinds its in-line paths
 /// met, feedback-schema.txt 5.8), at its baseline site's pc, as V8 updates a compare's feedback
-/// at every execution (codegen/code-stub-assembler.cc:13847-13866).
+/// at every execution (codegen/code-stub-assembler.cc:13847-13866), but for one whose operand is
+/// an undefined or null constant (step L1b, D; `feedback_read::records_equality`), which keeps
+/// none, as V8's TestNull and TestUndefined have no feedback slot.
 pub(crate) fn element_records(chunk: &Chunk) -> Option<Vec<(u32, u64)>> {
     let ops = chunk.jit_ops();
     if !enabled() || ops.len() > MAX_OPTIMIZED_OPS || chunk.jit_is_resumable() {
@@ -472,7 +474,7 @@ pub(crate) fn element_records(chunk: &Chunk) -> Option<Vec<(u32, u64)>> {
         };
         let profile = ChunkProfile::of(site);
         let byte = if crate::bytecode::feedback_read::is_equality(op) {
-            profile.equality_bytes(site.jit_ops(), site_pc)
+            profile.equality_bytes(site, site_pc)
         } else {
             profile.element_byte(site.jit_ops().len(), site_pc)
         };

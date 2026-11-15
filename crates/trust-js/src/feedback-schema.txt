@@ -376,11 +376,16 @@ in-line template (emit_eq_inline, its Number path and its tagged path), the comp
 (emit_equal_site, before its stub call), the compact constant sites of a loose Number constant
 and of a String constant (emit_eq_constant), a local pair feeding a branch
 (emit_local_eq_branch), the numeric chains' and regions' compares of two Numbers; the shared
-Equal stub is unchanged. The merge (opt::profile::merge_element_hits) ORs each marked class's
-bit (feedback.rs eq_class_bit: 0 two Numbers, 6 Strings, 9 objects, 4 Booleans, 1, 3 and 12
-EQ_NULLISH, any other EQ_OTHER) into the record and empties the group, at the compile's copy and
-at each settled-feedback checkpoint's fingerprint. The VM, the helpers and the tier-off template
-code record nothing for equality.
+Equal stub is unchanged. An equality whose right operand is an undefined or null constant on
+every path to it (the operation before it Undef or a Const of undefined or null, the equality no
+jump target: `x == null`, `undefined != x`, `x === void 0`; bytecode_feedback_read.rs
+records_equality; step L1b, D) has no group: its forms store nothing and its record stays empty,
+as V8's TestNull, TestUndefined and TestUndetectable have no feedback slot; the tier lowers it
+from the constant (opt/build.rs Rules::equality_lowers). The merge
+(opt::profile::merge_element_hits) ORs each marked class's bit (feedback.rs eq_class_bit: 0 two
+Numbers, 6 Strings, 9 objects, 4 Booleans, 1, 3 and 12 EQ_NULLISH, any other EQ_OTHER) into the
+record and empties the group, at the compile's copy and at each settled-feedback checkpoint's
+fingerprint. The VM, the helpers and the tier-off template code record nothing for equality.
 Reading it: the record alone (no in-line set: the forms that store store every execution's pair).
 A pair met only in the VM, or in a form that stores nothing (an x86-64 template, a site of a
 layout the in-line templates decline), is missing from it: the speculative tier's check then

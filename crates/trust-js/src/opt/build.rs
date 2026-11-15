@@ -971,18 +971,21 @@ impl Rules<'_> {
     /// NullOrLikeUndefined test); or its record names a pair whose speculation no flag declines
     /// (step L1, B): the cases of `Builder::equality` the operations and the snapshot alone
     /// prove, each of which the builder lowers or, where its facts rule the speculation out,
-    /// exits (`Builder::mismatch`); none of them runs JavaScript or anything that writes. Any
-    /// other equality may still lower from the builder's facts, which the prepass cannot see:
-    /// it counts as a possible effect, as before (P3 stage 3 step 0b; asm.js-style code's loop
-    /// conditions, `(k | 0) != 0`, are of the first kind).
+    /// exits (`Builder::mismatch`); none of them runs JavaScript or anything that writes. A
+    /// constant's case needs the constant's producer alone (step L1b, D): the builder takes the
+    /// constant's node whatever made the other operand (a phi of a conditional, an assignment's
+    /// value, another block's push), as V8's TestNull and JSC's CompareEq with a null constant
+    /// are built from the other value alone (maglev-graph-builder.cc:3077-3084, DFGByteCode-
+    /// Parser.cpp:9379-9385); such an equality keeps no record (`feedback_read::records_equality`),
+    /// so this is its only claim. Any other equality may still lower from the builder's facts,
+    /// which the prepass cannot see: it counts as a possible effect, as before (P3 stage 3 step
+    /// 0b; asm.js-style code's loop conditions, `(k | 0) != 0`, are of the first kind).
     fn equality_lowers(&self, pc: usize) -> bool {
         if self.equality_speculation(pc).is_some() {
             return true;
         }
         let strict = matches!(self.ops[pc], Op::StrictEq | Op::StrictNotEq);
-        let (Some(a), Some(b)) = (self.producer(pc, 1), self.producer(pc, 0)) else {
-            return false;
-        };
+        let (a, b) = (self.producer(pc, 1), self.producer(pc, 0));
         let number = |p: usize| match self.ops[p] {
             Op::Const(k) => const_word(self.chunk, k).and_then(number_word).is_some(),
             Op::BitAnd
@@ -1013,9 +1016,10 @@ impl Rules<'_> {
             Op::Undef => true,
             _ => false,
         };
-        (number(a) && number(b))
-            || (strict && (identity(a) || identity(b)))
-            || (!strict && (nullish(a) || nullish(b)))
+        let either = |which: &dyn Fn(usize) -> bool| a.is_some_and(which) || b.is_some_and(which);
+        (a.is_some_and(number) && b.is_some_and(number))
+            || (strict && either(&identity))
+            || (!strict && either(&nullish))
     }
 
     /// The pair the equality at `pc` speculates on: its record's one pair (see
