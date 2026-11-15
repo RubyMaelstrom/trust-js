@@ -5805,3 +5805,45 @@ workload at 5 and 200 runs; nothing built). The counts reorder the stage's remai
   E. The holder record of a prototype way: not now (a constant holder saves nothing without a
      dependency on the holder's property; its one consumer is the arm by load shape).
   F. Guards by code: not now; B takes React's case without them.
+
+Since the records above (2026-11-16):
+- Step 3e's stage (a) on main, the rest of my checks: the tier's and the back end's modules on
+  d2f16daf (640 tests) pass graph eager, graph forced, graph, on and forced. GBEMU at 200 runs
+  on that binary, graph against the splice (three rounds, one X925 core alone): +0.13%
+  instructions, -0.35% cycles (rounds -0.39 to -0.18). With DeltaBlue's -5.43% / -10.46%
+  above, no workload measured at steady state is above the splice in cycles at graph, and
+  only GBEMU in instructions.
+- Steps 6 and 7, part A's first commit landed (95630949): the first stage's Rust path for a
+  forwarding constructor calls the initializer from the body's forwarding call's position
+  where it passed none, so the constructor's frame in an Error's stack prints that call (the
+  VM's and the tree-walker's line) and not the function's start, at every tier and on both
+  architectures; no test or fixture held the old position. It comes before the machine-code
+  form so that the line does not depend on which path a construct took. Zombie's check,
+  clippy with tests, Windows' check and suite (2,892).
+- The callee-origin probe for part B (step67-impl/b5-probe.txt, every workload at both modes
+  and run counts): in React's steady state 3,852,400 of 4,167,215 executed call nodes call a
+  closure an outer frame of the same graph created (map's callback in its inlined frames); in
+  the fixture 52%; elsewhere such calls are under 2.5% of call nodes (Djot's steady state
+  2.38%, Earley-Boyer 1.1%). The callee site's cache named the function at 27 of the 38 such
+  sites and was empty at 11: the creation, not the cache, is the source. The 200-run shares
+  of the parts (counts times a path's cost): A, RayTrace about 47% tier on and 37% off, Box2D
+  about 21% and 10%; C, Earley-Boyer 3.20%, Mandreel 2.38%, Splay 1.60%, TypeScript 1.19%.
+- Step L5's whole-suite matrix on its final tree (the agent's; 3,567 tests): the tier off; the
+  splice on, eager and forced; graph on, eager and forced; eager under the poison: all pass;
+  the tier's tests under the poison on and forced, 594 each; GC stress over its own tests in
+  three legs, 9 each. Step L1c's GC-stress legs are cut short: the tier-off leg's last test
+  (the blind moved-check test, hours in the collector's verifier) is given eight hours of CPU
+  and the eager leg is dropped; 37 of its 38 tests passed.
+- The polymorphic read's form, counted and decided (the lowerings' agent; poly-impl/
+  design-note.txt). Executed at 200 runs: reads through several shapes at one slot (GBEMU 396M
+  to 536M, TypeScript 174M) are already the exemplars' merged form, one check of the set and
+  one load; reads at different own slots (GBEMU 149M, TypeScript 95.7M, DeltaBlue 11.1M at
+  graph) and through prototype arms (TypeScript 58.6M) pay a diamond: the shape loaded again
+  after the check, a Boolean materialised, then tested. Built, to land with its counts: a
+  shape test whose one use is the branch after it sets the flags and the branch reads them
+  (Maglev's BuildCompareMaps, maglev-graph-builder.cc:3750-3804): 2.5 instructions a read.
+  Found beside it and taken next, both the back end's and on every workload: no branch
+  fuses with an integer or float compare (the compare, a set, then a test of the Boolean), and
+  every field load and store adds its base before the access where the offset would fold
+  into the address. The select of the offset where only the slot differs (SpiderMonkey's
+  GuardMultipleShapesToOffset) waits for rule K: about 0.14% of GBEMU, less elsewhere.
