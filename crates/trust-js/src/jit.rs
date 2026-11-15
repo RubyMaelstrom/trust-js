@@ -2694,6 +2694,76 @@ pub(crate) fn inlined_call_helpers() -> &'static [usize; N_HELPERS] {
     })
 }
 
+/// An inlined frame's call node whose call template is being emitted (P3 stage 3 step 3c-2,
+/// piece B2; `Asm::inlined_call`): what the template's helper paths switch the context to and
+/// back from. The direct path reads none of it: the direct sequence takes the call's position
+/// from its own word (the way's view gives the call's inline site), the callee's chunk from the
+/// way, and writes the callee's frame from them, as a spliced body's direct call does; only a
+/// helper reads `JitCtx::chunk` (the operation at its pc, the call cache), x21 (the inlined
+/// call helpers' table, whose position helpers take `Interp::call_site`) and the publication.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy)]
+pub(crate) struct InlinedCall {
+    /// The inlined frame's chunk (`FrozenChunk::chunk_addr` of its view; the code holds it).
+    pub(crate) callee_chunk: usize,
+    /// The compiled chunk's own address, `JitCtx::chunk` at the node's entry: the code is
+    /// installed for that chunk alone, and every entry into it runs with it there (the tier's
+    /// test builds check it at each inlined frame's node).
+    pub(crate) own_chunk: usize,
+    /// The call's inline site (the way's call site, `oracle::prepare`).
+    pub(crate) site: u32,
+    /// The inlined frame's implicit inline site (NO_POSITION where its way has none), which the
+    /// end poll's slow path publishes, as the frame's other nodes publish it.
+    pub(crate) frame_site: u32,
+    /// `Interp::call_site`'s offset (`InterpLayout::call_site`).
+    pub(crate) call_site_off: u32,
+}
+
+/// The context of an inlined call node's callee frame, for the helper a path of its call
+/// template calls next (`Asm::inlined_call`; nothing elsewhere): `JitCtx::chunk` the callee's,
+/// `Interp::call_site` the call's site, x21 the inlined call helpers' table. Constant stores
+/// only, so a path may switch twice, and no word is saved: the restore
+/// (`emit_inlined_call_restore`) writes constants too. x16 scratch; x21 written before its use
+/// as the table; every other register kept (x9-x15 and x0-x8 carry the template's state).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn emit_inlined_call_switch(a: &mut asm::Asm) {
+    let Some(call) = a.inlined_call() else {
+        return;
+    };
+    a.mov_imm64(16, call.callee_chunk as u64);
+    a.str_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
+    a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.mov_imm64(16, u64::from(call.site));
+    a.str_w_imm(16, 21, call.call_site_off);
+    a.mov_imm64(21, inlined_call_helpers().as_ptr() as u64);
+}
+
+/// The compiled frame's context again after an inlined call node's helper path
+/// (`emit_inlined_call_switch`): `JitCtx::chunk` the compiled chunk's, x21 the activation's own
+/// table (`JitCtx::helpers`, as its entry loads it), `Interp::call_site` NO_POSITION, the value it
+/// has between operations. Constants, so a path that switched nothing may run it. x16 scratch.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn emit_inlined_call_restore(a: &mut asm::Asm) {
+    let Some(call) = a.inlined_call() else {
+        return;
+    };
+    a.mov_imm64(16, call.own_chunk as u64);
+    a.str_imm(16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
+    a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.mov_imm64(16, u64::from(crate::stack_trace::NO_POSITION));
+    a.str_w_imm(16, 21, call.call_site_off);
+    a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, helpers) as u32);
+}
+
 /// Helper table indices (multiplied by 8 in the emitted `ldr`).
 pub const H_EXEC: usize = 0;
 pub const H_COND: usize = 1;
@@ -3420,10 +3490,13 @@ mod asm {
         /// (`AccessorSlot::position`), which names no inline copy of the callee's chunk. Clear
         /// everywhere else, so template code is unchanged.
         inlined_frame_helpers: bool,
-        /// The implicit inline site the optimizing tier's node publishes for the inlined frame
-        /// whose template is being emitted (`inlined_frame_helpers`; NO_POSITION elsewhere): a
-        /// call template publishes it again after its call (P3 stage 3 step 3c-2).
-        inlined_frame_site: u32,
+        /// The code being emitted is the call template of an inlined frame's call node (P3 stage
+        /// 3 step 3c-2, piece B2): the template switches the context for its callee's frame only
+        /// on the paths that reach a helper (`super::emit_inlined_call_switch`), and restores it
+        /// where they end (`super::emit_inlined_call_restore`); its direct path, which takes its
+        /// position from the call's own word, switches nothing. None everywhere else, so template
+        /// code is unchanged.
+        inlined_call: Option<super::InlinedCall>,
     }
 
     #[derive(Clone, Copy)]
@@ -3476,7 +3549,7 @@ mod asm {
                 loop_weights: Vec::new(),
                 element_records: Vec::new(),
                 inlined_frame_helpers: false,
-                inlined_frame_site: crate::stack_trace::NO_POSITION,
+                inlined_call: None,
             }
         }
         /// The operand that failed this assembly, if one did: an operand no instruction
@@ -3636,13 +3709,16 @@ mod asm {
         pub(crate) fn set_inlined_frame_helpers(&mut self, on: bool) -> bool {
             std::mem::replace(&mut self.inlined_frame_helpers, on)
         }
-        /// Set the inlined frame's implicit inline site (see the `inlined_frame_site` field);
-        /// returns the previous one.
-        pub(crate) fn set_inlined_frame_site(&mut self, site: u32) -> u32 {
-            std::mem::replace(&mut self.inlined_frame_site, site)
+        /// Set the inlined call node whose call template is being emitted (see the
+        /// `inlined_call` field); returns the previous setting.
+        pub(crate) fn set_inlined_call(
+            &mut self,
+            call: Option<super::InlinedCall>,
+        ) -> Option<super::InlinedCall> {
+            std::mem::replace(&mut self.inlined_call, call)
         }
-        pub(crate) fn inlined_frame_site(&self) -> u32 {
-            self.inlined_frame_site
+        pub(crate) fn inlined_call(&self) -> Option<super::InlinedCall> {
+            self.inlined_call
         }
         pub(crate) fn inlined_frame_helpers(&self) -> bool {
             self.inlined_frame_helpers
@@ -10641,6 +10717,12 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
     let inline_probe = fast & 524288 != 0;
     let slow = a.new_label();
     let done = a.new_label();
+    // An inlined frame's call node (P3 stage 3 step 3c-2, piece B2; `Asm::inlined_call`): the
+    // paths that reach a helper switch the context for the callee's frame at their entries and
+    // land on `done`, which restores it; the direct path, which switches nothing, lands past
+    // the restore.
+    let inlined = a.inlined_call().is_some();
+    let done_direct = if inlined { a.new_label() } else { done };
     if inline_probe {
         let depth = *argc as u32 + 1; // callee sits under the args
         let off = depth as i32 * -8;
@@ -10691,10 +10773,30 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                     || ((1..=8).contains(argc) && function_call_intrinsic_on)
                     || *argc == 2
                     || min_max);
+            let compact = compact_templates(a);
+            let compact_intrinsics = compact && intrinsics;
+            // An inlined call node: its in-line intrinsic forms (the hot ones) switch the context
+            // around each of their helper calls alone, and land past the restore, whether they
+            // finished in machine code or in the helper; a cold node's forms that call a shared
+            // stub (whose helper call the switch must precede) switch at the section's entry and
+            // land on `done`.
+            let section_switch = inlined && (compact_intrinsics || use_shared_stub(a));
+            let intrinsic_done = if inlined && !section_switch {
+                done_direct
+            } else {
+                done
+            };
             if intrinsics {
                 a.ldrb_imm(9, 12, 96);
                 a.cbz(9, false, ordinary_hit);
+                if section_switch {
+                    emit_inlined_call_switch(a);
+                }
             }
+            // An inlined call node's intrinsic forms decline to the call-hit form, not back
+            // through the direct sequence (a native declines it at its first gate anyway), which
+            // a switched path must not take.
+            let intrinsic_declined = if inlined { hit_slow } else { ordinary_hit };
             // A compact site (compact templates' step 4: first-stage code outside loops) tests
             // every intrinsic its arity can reach in one shared stub, which the hit enters only
             // for a native callee, and takes its helpers through their shared stubs: SpiderMonkey's
@@ -10702,8 +10804,6 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
             // generator), V8's Sparkplug calls a Call builtin at every site
             // (baseline-compiler.cc, BuildCall); the callee's identity test stays in line, as
             // JSC's Baseline keeps its call link check (JITCall.cpp).
-            let compact = compact_templates(a);
-            let compact_intrinsics = compact && intrinsics;
             if compact_intrinsics {
                 let stub = a.shared_stub(
                     SharedStub::IntrinsicCall {
@@ -10718,9 +10818,9 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                     a,
                     pc as u32,
                     stub,
-                    ordinary_hit,
+                    intrinsic_declined,
                     hit_slow,
-                    done,
+                    intrinsic_done,
                     l_unwind,
                 );
             }
@@ -10741,7 +10841,15 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                         }
                         .key(),
                     );
-                    emit_intrinsic_stub_call(a, pc as u32, stub, no_intr, hit_slow, done, l_unwind);
+                    emit_intrinsic_stub_call(
+                        a,
+                        pc as u32,
+                        stub,
+                        no_intr,
+                        hit_slow,
+                        intrinsic_done,
+                        l_unwind,
+                    );
                 } else {
                     emit_call_intrinsics1(
                         a,
@@ -10751,7 +10859,7 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                         discard,
                         no_intr,
                         hit_slow,
-                        done,
+                        intrinsic_done,
                         l_unwind,
                     );
                 }
@@ -10768,11 +10876,14 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                 a.movz(1, pc as u32, 0);
                 a.movk(1, crate::bytecode::INTRINSIC_ARRAY_POP as u32, 1);
                 a.mov(2, 20);
+                // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+                emit_inlined_call_switch(a);
                 a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
                 a.blr(16);
+                emit_inlined_call_restore(a);
                 a.mov(20, 0);
                 a.cbnz(1, false, l_unwind);
-                a.b(done);
+                a.b(intrinsic_done);
                 a.bind(no_intr);
             }
             if !compact_intrinsics
@@ -10795,11 +10906,14 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                     1,
                 );
                 a.mov(2, 20);
+                // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+                emit_inlined_call_switch(a);
                 a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
                 a.blr(16);
+                emit_inlined_call_restore(a);
                 a.mov(20, 0);
                 a.cbnz(1, false, l_unwind);
-                a.b(done);
+                a.b(intrinsic_done);
                 a.bind(no_intr);
             }
             if !compact_intrinsics && min_max {
@@ -10819,10 +10933,10 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                     let stub = a.shared_stub(SharedStub::MinMax { argc: *argc as u8 }.key());
                     a.bl_label(stub);
                     const _: () = assert!(INTRINSIC_DONE == 0);
-                    a.cbz(9, false, done);
+                    a.cbz(9, false, intrinsic_done);
                     a.b(hit_slow);
                 } else {
-                    emit_math_intrinsic(a, layout, *argc as u32, no_intr, hit_slow, done);
+                    emit_math_intrinsic(a, layout, *argc as u32, no_intr, hit_slow, intrinsic_done);
                 }
                 a.bind(no_intr);
             }
@@ -10831,7 +10945,15 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                 let no_intr = a.new_label();
                 if use_shared_stub(a) {
                     let stub = a.shared_stub(SharedStub::Intrinsics2 { discard }.key());
-                    emit_intrinsic_stub_call(a, pc as u32, stub, no_intr, hit_slow, done, l_unwind);
+                    emit_intrinsic_stub_call(
+                        a,
+                        pc as u32,
+                        stub,
+                        no_intr,
+                        hit_slow,
+                        intrinsic_done,
+                        l_unwind,
+                    );
                 } else {
                     emit_call_intrinsics2(
                         a,
@@ -10840,7 +10962,7 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                         discard,
                         no_intr,
                         hit_slow,
-                        done,
+                        intrinsic_done,
                         l_unwind,
                     );
                 }
@@ -10852,6 +10974,9 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
             // taking the sequence pays nothing for it. The shared direct-call stub makes the test
             // itself; elsewhere a shared stub of its own does, even in a loop, since few plain
             // calls reach it.
+            if intrinsics && inlined {
+                a.b(intrinsic_declined);
+            }
             let plain_is_array = !with_this && *argc == 1 && layout.valid;
             let mut is_array_here = plain_is_array;
             let native_hit = if plain_is_array {
@@ -10877,27 +11002,19 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                         argc,
                     )
                 {
-                    // The chunk's shared sequence for this arity and receiver form (an inlined
-                    // frame's call node's variant: `SharedStub::DirectCallInlined`).
-                    let argc8 = argc as u8;
-                    let stub = a.shared_stub(if a.inlined_frame_helpers() {
-                        SharedStub::DirectCallInlined {
-                            argc: argc8,
-                            with_this,
-                        }
-                        .key()
-                    } else {
+                    // The chunk's shared sequence for this arity and receiver form.
+                    let stub = a.shared_stub(
                         SharedStub::DirectCall {
-                            argc: argc8,
+                            argc: argc as u8,
                             with_this,
                         }
-                        .key()
-                    });
+                        .key(),
+                    );
                     a.bl_label(stub);
                     let not_returned = a.new_label();
                     const _: () = assert!(DIRECT_CALL_RETURNED == 0);
                     a.cbnz(8, false, not_returned);
-                    a.b(done);
+                    a.b(done_direct);
                     // Never executed: the stub reads the call's position two instructions past
                     // its return address (see `DirectCallSite::AfterReturn`). Neither branch
                     // above can widen: both targets are in range.
@@ -10920,7 +11037,7 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                         with_this,
                         native_hit,
                         l_unwind,
-                        done,
+                        done_direct,
                         l_direct_finish,
                         DirectCallSite::Position(chunk.call_position(*c)),
                     );
@@ -10938,13 +11055,14 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
                         let stub = a.shared_stub(SharedStub::PlainIsArray.key());
                         a.bl_label(stub);
                         const _: () = assert!(INTRINSIC_DONE == 0);
-                        a.cbz(9, false, done);
+                        a.cbz(9, false, done_direct);
                     } else {
-                        emit_plain_is_array(a, layout, hit_slow, done);
+                        emit_plain_is_array(a, layout, hit_slow, done_direct);
                     }
                 }
             }
             a.bind(hit_slow);
+            emit_inlined_call_switch(a);
             // Secondary ways are not indices into the caller's four primary
             // entries. A non-direct/non-intrinsic secondary hit re-probes through
             // the checked helper; it must never alias primary way zero. A code-keyed
@@ -11012,6 +11130,7 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
         }
     }
     a.bind(slow);
+    emit_inlined_call_switch(a);
     if compact_templates(a) {
         a.movz(1, pc as u32, 0);
         let stub = a.shared_stub(SharedStub::Helper { idx: H_CALL as u8 }.key());
@@ -11029,24 +11148,17 @@ fn emit_call_inline_marked<C: JitChunk + ?Sized>(
     a.bind(done);
     // Every completed form of the call (H_CALL, H_CALL_HIT, an intrinsic, a direct
     // call) lands here with its result pushed. A native or intrinsic can allocate after the
-    // call's last safepoint.
+    // call's last safepoint. An inlined call node's helper paths restore the compiled frame's
+    // context here; its direct path, which switched nothing, lands past the restore.
+    if inlined {
+        emit_inlined_call_restore(a);
+        a.bind(done_direct);
+    }
     #[cfg(test)]
     if CALL_DONE_HOOK.with(Cell::get) {
         a.mov(0, 19);
         a.mov_imm64(16, note_call_done as *const () as u64);
         a.blr(16);
-    }
-    if a.inlined_frame_helpers() {
-        // An inlined frame's call node (P3 stage 3 step 3c-2): its frame's implicit site in
-        // `Interp::call_site` after the call (which a direct callee ran with NO_POSITION and a
-        // helper's explicit call left NO_POSITION), as a frame's other nodes publish it, so that
-        // an error the end poll creates (the live-object limit's) names the inlined frame, which
-        // reports its start as a frame whose position is pending does: the tier off's frame
-        // after its call; the node's restore writes NO_POSITION after.
-        let site = a.inlined_frame_site();
-        a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
-        a.mov_imm64(17, u64::from(site));
-        a.str_w_imm(17, 16, ilayout.call_site as u32);
     }
     emit_helper_end_poll(a, l_unwind);
 }
@@ -11728,8 +11840,11 @@ fn emit_call_intrinsics1(
     emit_intrinsic_pc(a, pc);
     a.movk(1, crate::bytecode::INTRINSIC_CHAR_AT as u32, 1);
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -11749,8 +11864,11 @@ fn emit_call_intrinsics1(
     emit_intrinsic_pc(a, pc);
     a.movk(1, crate::bytecode::INTRINSIC_CODE_POINT_AT as u32, 1);
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -11794,8 +11912,11 @@ fn emit_call_intrinsics1(
     emit_intrinsic_pc(a, pc);
     a.movk(1, crate::bytecode::INTRINSIC_CHAR_CODE_AT as u32, 1);
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -11827,8 +11948,11 @@ fn emit_call_intrinsics1(
     emit_intrinsic_pc(a, pc);
     a.movk(1, crate::bytecode::INTRINSIC_FROM_CHAR_CODE as u32, 1);
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -11853,8 +11977,11 @@ fn emit_call_intrinsics1(
         1,
     );
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -11887,8 +12014,11 @@ fn emit_call_intrinsics1(
         emit_intrinsic_pc(a, pc);
         a.movk(1, crate::bytecode::INTRINSIC_ARRAY_PUSH as u32, 1);
         a.mov(2, 20);
+        // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+        emit_inlined_call_switch(a);
         a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
         a.blr(16);
+        emit_inlined_call_restore(a);
         a.mov(20, 0);
         a.cbnz(1, false, l_unwind);
         a.b(done);
@@ -11907,8 +12037,11 @@ fn emit_call_intrinsics1(
         emit_intrinsic_pc(a, pc);
         a.movk(1, crate::bytecode::INTRINSIC_REGEXP_EXEC_DISCARD as u32, 1);
         a.mov(2, 20);
+        // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+        emit_inlined_call_switch(a);
         a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
         a.blr(16);
+        emit_inlined_call_restore(a);
         a.mov(20, 0);
         a.cbnz(1, false, l_unwind);
         a.b(done);
@@ -11927,8 +12060,11 @@ fn emit_call_intrinsics1(
         emit_intrinsic_pc(a, pc);
         a.movk(1, crate::bytecode::INTRINSIC_STRING_SPLIT_DISCARD as u32, 1);
         a.mov(2, 20);
+        // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+        emit_inlined_call_switch(a);
         a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
         a.blr(16);
+        emit_inlined_call_restore(a);
         a.mov(20, 0);
         a.cbnz(1, false, l_unwind);
         a.b(done);
@@ -12010,8 +12146,11 @@ fn emit_call_intrinsics2(
         1,
     );
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -12027,8 +12166,11 @@ fn emit_call_intrinsics2(
     emit_intrinsic_pc(a, pc);
     a.movk(1, crate::bytecode::INTRINSIC_OBJECT_HAS_OWN as u32, 1);
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -12046,8 +12188,11 @@ fn emit_call_intrinsics2(
     emit_intrinsic_pc(a, pc);
     a.movk(1, crate::bytecode::INTRINSIC_FUNCTION_APPLY as u32, 1);
     a.mov(2, 20);
+    // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+    emit_inlined_call_switch(a);
     a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
     a.blr(16);
+    emit_inlined_call_restore(a);
     a.mov(20, 0);
     a.cbnz(1, false, l_unwind);
     a.b(done);
@@ -12070,8 +12215,11 @@ fn emit_call_intrinsics2(
             1,
         );
         a.mov(2, 20);
+        // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+        emit_inlined_call_switch(a);
         a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
         a.blr(16);
+        emit_inlined_call_restore(a);
         a.mov(20, 0);
         a.cbnz(1, false, l_unwind);
         a.b(done);
@@ -13129,15 +13277,6 @@ fn emit_direct_sequence(
         }
     }
     a.str_w_imm(5, 6, 8); // call_site
-    if a.inlined_frame_helpers() {
-        // An inlined frame's call node published the call's site in `Interp::call_site` for the
-        // call's helpers (P3 stage 3 step 3c-2): the callee's frame has taken it, and the callee
-        // runs with NO_POSITION there, as the interpreter's frame push leaves it, so that what the
-        // callee's own operations capture or publish starts from its own frame. Past every gate:
-        // a decline keeps the publication for the helper the site calls next.
-        a.mov_imm64(5, u64::MAX);
-        a.str_w_imm(5, 14, il.call_site as u32);
-    }
     a.ldrb_imm(5, 12, IC_STRICT);
     if construct {
         // The frame runs a [[Construct]] (stack traces print `new name`).
@@ -17080,13 +17219,6 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     DirectCall { argc: u8, with_this: bool },
-    /// [`SharedStub::DirectCall`] for a template the optimizing tier runs as an inlined frame's
-    /// call node (P3 stage 3 step 3c-2; `Asm::inlined_frame_helpers`): the callee's frame takes
-    /// the call's site as the base stub's does, and `Interp::call_site`, where the node published
-    /// the site for the call's helpers, is NO_POSITION while the callee runs, as the
-    /// interpreter's frame push leaves it (`emit_direct_sequence`); the template publishes the
-    /// site again after the call. Template code never calls it.
-    DirectCallInlined { argc: u8, with_this: bool },
     /// [`emit_direct_sequence`]'s [[Construct]] form for one arity, entered at a `new` site's
     /// construct-cache hit with its registers (see [`emit_direct_construct`]) → w9 =
     /// `DIRECT_CALL_*`.
@@ -17274,7 +17406,6 @@ impl SharedStub {
     const STRING_CALL: u32 = 0x1400;
     const CALL_HIT: u32 = 0x1500;
     const HELPER_INLINED: u32 = 0x1600;
-    const DIRECT_CALL_INLINED: u32 = 0x1700;
 
     fn key(self) -> u32 {
         match self {
@@ -17348,10 +17479,6 @@ impl SharedStub {
             SharedStub::DirectCall { argc, with_this } => {
                 debug_assert!(argc < 128);
                 Self::DIRECT_CALL | u32::from(argc) | u32::from(with_this) << 7
-            }
-            SharedStub::DirectCallInlined { argc, with_this } => {
-                debug_assert!(argc < 128);
-                Self::DIRECT_CALL_INLINED | u32::from(argc) | u32::from(with_this) << 7
             }
             #[cfg(all(
                 target_arch = "aarch64",
@@ -17432,9 +17559,7 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::DirectCall { .. }
-            | SharedStub::DirectCallInlined { .. }
-            | SharedStub::DirectConstruct { .. } => true,
+            SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. } => true,
             SharedStub::Helper { idx } => matches!(usize::from(idx), H_GET_PROP | H_SET_PROP),
             SharedStub::HelperInlined { idx } => {
                 matches!(usize::from(idx), H_GET_PROP | H_SET_PROP)
@@ -17457,10 +17582,6 @@ impl SharedStub {
             },
             Self::HELPER_INLINED => SharedStub::HelperInlined {
                 idx: (key & 0xff) as u8,
-            },
-            Self::DIRECT_CALL_INLINED => SharedStub::DirectCallInlined {
-                argc: (key & 0x7f) as u8,
-                with_this: key & 0x80 != 0,
             },
             #[cfg(all(
                 target_arch = "aarch64",
@@ -17662,10 +17783,6 @@ impl SharedStub {
             SharedStub::CallSecondary => named("CallSecondary", &[]),
             SharedStub::DirectCall { argc, with_this } => format!(
                 "Stub:DirectCall(argc={argc}{})",
-                if with_this { ",with_this" } else { "" }
-            ),
-            SharedStub::DirectCallInlined { argc, with_this } => format!(
-                "Stub:DirectCallInlined(argc={argc}{})",
                 if with_this { ",with_this" } else { "" }
             ),
             SharedStub::DirectConstruct { argc } => format!("Stub:DirectConstruct(argc={argc})"),
@@ -17977,22 +18094,14 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::DirectCall { .. }
-            | SharedStub::DirectCallInlined { .. }
-            | SharedStub::DirectConstruct { .. } => {
+            SharedStub::DirectCall { .. } | SharedStub::DirectConstruct { .. } => {
                 let (argc, form) = match self {
-                    SharedStub::DirectCall { argc, with_this }
-                    | SharedStub::DirectCallInlined { argc, with_this } => {
+                    SharedStub::DirectCall { argc, with_this } => {
                         (argc, DirectForm::Call { with_this })
                     }
                     SharedStub::DirectConstruct { argc } => (argc, DirectForm::Construct),
                     _ => unreachable!(),
                 };
-                // The inlined frames' variant consumes the published site (`emit_direct_sequence`).
-                let inlined = a.set_inlined_frame_helpers(matches!(
-                    self,
-                    SharedStub::DirectCallInlined { .. }
-                ));
                 let ilayout = context
                     .ilayout
                     .expect("call stubs are requested only by chunk compilation");
@@ -18021,7 +18130,6 @@ impl SharedStub {
                     direct.finish_stub,
                     DirectCallSite::AfterReturn,
                 );
-                a.set_inlined_frame_helpers(inlined);
                 assert!(emitted, "sites request the stub only when it is supported");
                 // The sequence reaches `returned` with w8 = 0 and `threw` with w8 = 1, the finish
                 // stub's threw flag.
@@ -18063,9 +18171,6 @@ fn direct_stub_is_array(stub: SharedStub, layout: &crate::value::JitLayout) -> b
     matches!(
         stub,
         SharedStub::DirectCall {
-            argc: 1,
-            with_this: false
-        } | SharedStub::DirectCallInlined {
             argc: 1,
             with_this: false
         }
@@ -24525,8 +24630,31 @@ fn emit_helper_end_poll(a: &mut asm::Asm, l_unwind: usize) {
     let done = a.new_label();
     emit_poll_word(a, 9);
     a.cbz(9, true, done);
+    // After an inlined call node's call (P3 stage 3 step 3c-2, piece B2): its frame's implicit
+    // site in `Interp::call_site` while the poll's helper runs, as the frame's other nodes publish
+    // it, so that an error the helper creates (the live-object limit's RangeError, from
+    // `Interp::gc_check`) names the inlined frame, which reports its start as a frame whose
+    // position is pending does; NO_POSITION again after (a throw's unwind writes it too).
+    let inlined = a.inlined_call();
+    if let Some(call) = inlined {
+        emit_publish_call_site(a, call.frame_site, call.call_site_off);
+    }
     emit_op_helper(a, H_INTERRUPT, POLL_HELPER_END, l_unwind);
+    if let Some(call) = inlined {
+        emit_publish_call_site(a, crate::stack_trace::NO_POSITION, call.call_site_off);
+    }
     a.bind(done);
+}
+
+/// `Interp::call_site` = `position` (its offset `call_site_off`). x16, x17 scratch.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_publish_call_site(a: &mut asm::Asm, position: u32, call_site_off: u32) {
+    a.ldr_imm(16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+    a.mov_imm64(17, u64::from(position));
+    a.str_w_imm(17, 16, call_site_off);
 }
 
 /// Try only primitive RHS strings. Miss preserves the canonical state and continues the

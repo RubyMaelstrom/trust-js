@@ -879,7 +879,6 @@ fn shared_stubs_embed_no_string_constant() {
         SharedStub::PROP_WAYS,
         SharedStub::CALL_SECONDARY,
         SharedStub::DIRECT_CALL,
-        SharedStub::DIRECT_CALL_INLINED,
         SharedStub::NAME_VALUE_PTR_IN,
         SharedStub::INTRINSICS1,
         SharedStub::INTRINSICS2,
@@ -893,9 +892,7 @@ fn shared_stubs_embed_no_string_constant() {
         // site can request.
         for low in 0..=0xff {
             let key = base | low;
-            if let SharedStub::DirectCall { argc, .. }
-            | SharedStub::DirectCallInlined { argc, .. } = SharedStub::from_key(key)
-            {
+            if let SharedStub::DirectCall { argc, .. } = SharedStub::from_key(key) {
                 let (attempted, runs, retry) = offsets;
                 let argc = usize::from(argc);
                 if !direct_call_supported(&ilayout, &layout, attempted, runs, retry, argc) {
@@ -926,10 +923,7 @@ fn shared_stubs_embed_no_string_constant() {
                 }
             }
             a.bind(finish);
-            if matches!(
-                SharedStub::from_key(key),
-                SharedStub::DirectCall { .. } | SharedStub::DirectCallInlined { .. }
-            ) {
+            if matches!(SharedStub::from_key(key), SharedStub::DirectCall { .. }) {
                 emit_direct_finish_stub(&mut a, &ilayout, layout.valid);
             }
             let words = a.finish();
@@ -947,7 +941,6 @@ fn shared_stubs_embed_no_string_constant() {
             stubs += 1;
         }
     }
-    // Direct calls of up to 64 arguments, with and without `this`, and their inlined frames'
-    // variant's.
-    assert_eq!(stubs, 11 * 256 + 2 * 2 * 65);
+    // Direct calls of up to 64 arguments, with and without `this`.
+    assert_eq!(stubs, 11 * 256 + 2 * 65);
 }

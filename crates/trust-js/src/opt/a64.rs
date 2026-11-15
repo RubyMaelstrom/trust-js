@@ -1010,9 +1010,12 @@ struct Switched {
     this: bool,
     env: bool,
     slots: bool,
-    /// x21 is the inlined call helpers' table (`jit::inlined_call_helpers`): a call node (P3
-    /// stage 3 step 3c-2).
-    helpers: bool,
+    /// A call node (P3 stage 3 step 3c-2, piece B2): its call template switches `JitCtx::chunk`,
+    /// `Interp::call_site` and x21 on the paths that reach a helper only, and restores them where
+    /// those paths end (`jit::emit_inlined_call_switch`, `jit::emit_inlined_call_restore`), so
+    /// that the node saves no chunk word and its unwind writes constants; any other node switches
+    /// the chunk and publishes its frame's site before its template.
+    call: bool,
 }
 
 impl<'a> Gen<'a> {
@@ -3126,7 +3129,8 @@ impl Gen<'_> {
         let stale = stale_slots(view, n_slots, graph, node);
         let poison = self.options.poison;
         // An explicit call (P3 stage 3 step 3c-2): its position is its inline site in this frame,
-        // which the way's view gives its template and the call helpers take from
+        // which the way's view gives its template (the direct sequence's and the stubs' words)
+        // and its helper paths publish for the call helpers, which take it from
         // `Interp::call_site` through the inlined call helpers' table.
         let call_site = match *op {
             Op::Call(_, cache) | Op::CallWithThis(_, cache) => Some(view.call_position(cache)),
@@ -3136,9 +3140,11 @@ impl Gen<'_> {
             this: uses.this || poison,
             env: uses.env,
             slots: !named.is_empty() || poison,
-            helpers: call_site.is_some(),
+            call: call_site.is_some(),
         };
         let ctx = |field: usize| field as u32;
+        #[cfg(test)]
+        self.check_node_context(pc);
         let stack_base = ctx(std::mem::offset_of!(JitCtx, stack_base));
         // The operands, at the operation's depth from the compiled frame's operand base.
         self.a.ldr_imm(X9, 19, stack_base);
@@ -3169,12 +3175,15 @@ impl Gen<'_> {
                 self.a.str_imm(X16, X9, 8 * k as u32);
             }
         }
-        // The compiled frame's context words saved, the node's written.
-        let chunk_off = ctx(std::mem::offset_of!(JitCtx, chunk));
-        self.a.ldr_imm(X16, 19, chunk_off);
-        self.a.str_imm(X16, 31, save + SAVE_CHUNK);
-        self.a.mov_imm64(X16, view.chunk_addr as u64);
-        self.a.str_imm(X16, 19, chunk_off);
+        // The compiled frame's context words saved, the node's written (a call node's chunk by
+        // its template's helper paths alone).
+        if !switched.call {
+            let chunk_off = ctx(std::mem::offset_of!(JitCtx, chunk));
+            self.a.ldr_imm(X16, 19, chunk_off);
+            self.a.str_imm(X16, 31, save + SAVE_CHUNK);
+            self.a.mov_imm64(X16, view.chunk_addr as u64);
+            self.a.str_imm(X16, 19, chunk_off);
+        }
         let this_off = ctx(std::mem::offset_of!(JitCtx, this_word));
         if switched.this {
             self.a.ldr_imm(X16, 19, this_off);
@@ -3216,28 +3225,38 @@ impl Gen<'_> {
                 .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
         }
         // The frame's inline site, published as a splice's checked operation publishes its own; a
-        // call's, its own site, as a spliced body's call publishes it (explicit).
-        let position = if let Some(site) = call_site {
-            if !crate::stack_trace::is_inline_position(site) {
-                return Err(Refusal::at(
-                    pc,
-                    "an inlined frame's call without its inline site",
-                ));
-            }
-            site
-        } else if frame.position == crate::stack_trace::NO_POSITION {
+        // call's, its own site, as a spliced body's call publishes it (explicit), by its call
+        // template's helper paths alone (`jit::InlinedCall`): its direct path writes the callee's
+        // frame from the call's own word and reads no publication.
+        let frame_site = if frame.position == crate::stack_trace::NO_POSITION {
             frame.position
         } else {
             crate::stack_trace::implicit_inline_position(frame.position)
         };
-        self.a
-            .ldr_imm(X17, 19, ctx(std::mem::offset_of!(JitCtx, interp)));
-        self.a.mov_imm64(X16, u64::from(position));
-        self.a.str_w_imm(X16, X17, self.ilayout.call_site as u32);
-        if switched.helpers {
-            let table = crate::jit::inlined_call_helpers();
-            self.a.mov_imm64(21, table.as_ptr() as u64);
-        }
+        let inlined_call = match call_site {
+            Some(site) => {
+                if !crate::stack_trace::is_inline_position(site) {
+                    return Err(Refusal::at(
+                        pc,
+                        "an inlined frame's call without its inline site",
+                    ));
+                }
+                Some(crate::jit::InlinedCall {
+                    callee_chunk: view.chunk_addr,
+                    own_chunk: self.chunk.chunk_addr,
+                    site,
+                    frame_site,
+                    call_site_off: self.ilayout.call_site as u32,
+                })
+            }
+            None => {
+                self.a
+                    .ldr_imm(X17, 19, ctx(std::mem::offset_of!(JitCtx, interp)));
+                self.a.mov_imm64(X16, u64::from(frame_site));
+                self.a.str_w_imm(X16, X17, self.ilayout.call_site as u32);
+                None
+            }
+        };
         self.a.add_imm(20, X9, (8 * depth) as u32);
         // A throw restores the context first.
         let target = if graph.chain_has_handlers(state) {
@@ -3254,14 +3273,10 @@ impl Gen<'_> {
         let hot = self.in_loop[self.compiled_pc(node.frame) as usize] || self.loop_mask(view)[pc];
         self.a.set_hot(hot);
         let reads = self.a.replace_initialized_reads(Default::default());
-        let helpers = self.a.set_inlined_frame_helpers(true);
-        let frame_site =
-            self.a
-                .set_inlined_frame_site(if frame.position == crate::stack_trace::NO_POSITION {
-                    frame.position
-                } else {
-                    crate::stack_trace::implicit_inline_position(frame.position)
-                });
+        // A property node's helpers take the published site (piece A's variant); a call node's
+        // template switches for its helpers itself.
+        let helpers = self.a.set_inlined_frame_helpers(inlined_call.is_none());
+        let outer_call = self.a.set_inlined_call(inlined_call);
         let fixed = self.a.fixed_activation();
         self.a.set_fixed_activation(view.jit_fixed_activation());
         let emitted = operations::emit(
@@ -3277,11 +3292,15 @@ impl Gen<'_> {
             self.l_direct_finish,
         );
         if !emitted {
+            // The VM's operation through H_EXEC reads the callee's chunk and, for a call, the
+            // published site: switched around it.
+            crate::jit::emit_inlined_call_switch(&mut self.a);
             emit_exec(&mut self.a, pc as u32, unwind);
+            crate::jit::emit_inlined_call_restore(&mut self.a);
         }
         self.a.set_fixed_activation(fixed);
         self.a.set_inlined_frame_helpers(helpers);
-        self.a.set_inlined_frame_site(frame_site);
+        self.a.set_inlined_call(outer_call);
         self.a.replace_initialized_reads(reads);
         if poison {
             // The words it poisoned, still the poison: the window's other slots (x22 names the
@@ -3291,7 +3310,7 @@ impl Gen<'_> {
                 .collect();
             self.check_poison(pc, &slots, depth - pops);
         }
-        self.restore_context(switched);
+        self.restore_context(switched, false);
         self.a.set_hot(false);
         self.last_effect = Some(n);
         Ok(())
@@ -3299,13 +3318,24 @@ impl Gen<'_> {
 
     /// The compiled frame's context words an inlined frame's generic node switched, back from
     /// the save area (`lower_inlined_generic`), and `Interp::call_site` NO_POSITION again, the
-    /// value it has between operations (contracts 4.3). x16 and x17 scratch; x20 and x0-x1 kept.
-    fn restore_context(&mut self, switched: Switched) {
+    /// value it has between operations (contracts 4.3). A call node's chunk, x21 and publication
+    /// are its call template's to restore on the paths that switched them; its unwind (`unwind`,
+    /// the node's `Cold::Restore`), which a path that switched nothing takes too, writes their
+    /// constants (`jit::emit_inlined_call_restore`'s). x16 and x17 scratch; x20 and x0-x1 kept.
+    fn restore_context(&mut self, switched: Switched, unwind: bool) {
         let save = self.save_area.expect("a save area");
         let ctx = |field: usize| field as u32;
-        self.a.ldr_imm(X16, 31, save + SAVE_CHUNK);
-        self.a
-            .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, chunk)));
+        if switched.call {
+            if unwind {
+                self.a.mov_imm64(X16, self.chunk.chunk_addr as u64);
+            }
+        } else {
+            self.a.ldr_imm(X16, 31, save + SAVE_CHUNK);
+        }
+        if !switched.call || unwind {
+            self.a
+                .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, chunk)));
+        }
         if switched.this {
             self.a.ldr_imm(X16, 31, save + SAVE_THIS);
             self.a
@@ -3327,7 +3357,10 @@ impl Gen<'_> {
             self.a
                 .str_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
         }
-        if switched.helpers {
+        if switched.call && !unwind {
+            return;
+        }
+        if switched.call {
             // The activation's own helper table again (`JitCtx::helpers`, as its entry loads it).
             self.a
                 .ldr_imm(21, 19, ctx(std::mem::offset_of!(JitCtx, helpers)));
@@ -3337,6 +3370,29 @@ impl Gen<'_> {
         self.a
             .mov_imm64(X16, u64::from(crate::stack_trace::NO_POSITION));
         self.a.str_w_imm(X16, X17, self.ilayout.call_site as u32);
+    }
+
+    /// Test builds: at an inlined frame's generic node, `JitCtx::chunk` is the compiled chunk's
+    /// own (a call node's restore and unwind write that constant rather than a saved word: the
+    /// code is installed for that chunk alone, and every entry runs with it there) and x21 the
+    /// activation's own table (`JitCtx::helpers`), or the code traps (`brk`). x16, x17 scratch.
+    #[cfg(test)]
+    fn check_node_context(&mut self, pc: usize) {
+        let ok = self.a.new_label();
+        self.a
+            .ldr_imm(X16, 19, std::mem::offset_of!(JitCtx, chunk) as u32);
+        self.a.mov_imm64(X17, self.chunk.chunk_addr as u64);
+        self.a.cmp_reg_x(X16, X17);
+        self.a.b_cond(EQ, ok);
+        self.a.brk(0xb2c0 | (pc as u32 & 0x3f));
+        self.a.bind(ok);
+        let ok = self.a.new_label();
+        self.a
+            .ldr_imm(X16, 19, std::mem::offset_of!(JitCtx, helpers) as u32);
+        self.a.cmp_reg_x(X16, 21);
+        self.a.b_cond(EQ, ok);
+        self.a.brk(0xb210 | (pc as u32 & 0x3f));
+        self.a.bind(ok);
     }
 
     /// The pc in the compiled chunk of the call that `frame` (an inlined frame, or the compiled
@@ -3615,7 +3671,7 @@ impl Gen<'_> {
                         target,
                     } => {
                         self.a.bind(label);
-                        self.restore_context(switched);
+                        self.restore_context(switched, true);
                         self.a.b(target);
                     }
                     Cold::ElementUndefined {

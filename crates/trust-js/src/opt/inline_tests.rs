@@ -3328,3 +3328,159 @@ fn a_way_whose_callees_calls_the_plan_inlines_keeps_its_plan_spliced() {
         .iter()
         .any(|op| matches!(op, Op::Call(..) | Op::CallWithThis(..))));
 }
+
+/// The helper paths of an inlined frame's call node (P3 stage 3 step 3c-2, piece B2): its call
+/// template switches the context for the callee's frame only where a path reaches a helper (the
+/// intrinsic section, the call-hit form, the generic call) and restores it where they end. Each
+/// path from inlined frames (`viaMax`, `viaCode`, `viaIsArray`, `viaPush`, `viaNotFn`,
+/// `viaCallOf`: callees making method and plain calls only, the plan inlining none of them):
+/// Math.max finished in machine code (Numbers) and through the call-hit form and the native's
+/// boundary (an Object whose valueOf records its caller and stack, and one whose valueOf throws),
+/// charCodeAt in line (ASCII) and declined (a non-ASCII string, an index out of bounds), the plain
+/// Array.isArray template (an Array, an Object, a Proxy of an Array), push and pop, a non-callable
+/// callee's TypeError (its message names the callee's expression), a throw from the call-hit
+/// form's native caught by the compiled frame's handler (`guarded`: the exit to the handler reads
+/// the compiled frame's chunk, which the unwind wrote back), the function-call intrinsic
+/// with a callee that is a function and one that is not, each from a call in `run`'s loop (the
+/// in-line forms, which switch around their helper calls alone) and from one before it (a cold
+/// node's shared stubs, which switch at the intrinsic section's entry); then the compiled
+/// frame's own nodes after each, whose context the restore gave back (the test
+/// builds' check at each inlined frame's node traps otherwise).
+const INLINED_CALL_PATHS: &str = "
+var probe = false, log = [];
+function stk(e, from, n) { return e.stack.split('\\n').slice(from, from + n).join('/'); }
+var big = { valueOf: function vo() {
+  if (probe) log.push('vo<' + (vo.caller && vo.caller.name) + '|' + stk(new Error('vo'), 1, 3));
+  return 7; } };
+var bad = { valueOf: function vt() { throw new TypeError('vt'); } };
+var isArr = Array.isArray;
+function callee(x) {
+  if (probe) log.push('c<' + (callee.caller && callee.caller.name) + '|' + stk(new Error('c'), 1, 3));
+  return x + 1; }
+function viaMax(a, b, c) { return Math.max(a, b, c); }
+function viaCode(s, i) { return s.charCodeAt(i); }
+function viaIsArray(x) { return isArr(x) ? 1 : 0; }
+function viaPush(a, v) { a.push(v); return a.pop(); }
+function viaNotFn(o, x) { return o.f(x); }
+function viaCallOf(f, x) { return f.call(null, x); }
+function run(n, mx, str, arr, o, f) {
+  var t = viaMax(n, mx, 1) + viaCode(str, 0) + viaPush([2], n) + viaCallOf(f, n);
+  for (var i = 0; i < n; i++) {
+    t += viaMax(i, mx, 3) + viaCode(str, i % 3) + viaIsArray(arr) + viaPush([1], i);
+    t += viaNotFn(o, i) + viaCallOf(f, i);
+  }
+  return t; }
+function guarded(n, mx) { var t = 0;
+  for (var i = 0; i < n; i++) {
+    try { t += viaMax(i, mx, 3); } catch (e) { t += 1000; if (probe) log.push('g|' + e.message + '|' + stk(e, 0, 3)); }
+  }
+  return t; }
+var good = { f: function gf(x) {
+  if (probe) log.push('gf<' + (gf.caller && gf.caller.name) + '|' + stk(new Error('gf'), 1, 3));
+  return x; } };
+var r = 0;
+for (var k = 0; k < 300; k++) { r += run(6, 2, 'abc', [1], good, callee); r += guarded(6, 2); }
+probe = true;
+var out = [];
+function at(tag, thunk) {
+  try { out.push(tag + '|' + thunk()); } catch (e) { out.push(tag + '!' + e.name + ':' + e.message + '|' + stk(e, 1, 3)); } }
+at('max', function () { return run(2, big, 'abc', [1], good, callee); });
+at('maxThrow', function () { return run(1, bad, 'abc', [1], good, callee); });
+at('code', function () { return run(4, 2, '\\u00e9b', [1], good, callee); });
+at('isArray', function () { return run(1, 2, 'abc', {}, good, callee) + run(1, 2, 'abc', new Proxy([], {}), good, callee); });
+at('notFn', function () { return run(1, 2, 'abc', [1], { f: 5 }, callee); });
+at('callOf', function () { return run(1, 2, 'abc', [1], good, { call: Function.prototype.call }); });
+at('guarded', function () { return guarded(2, bad) + guarded(2, big); });
+at('again', function () { return run(3, 2, 'abc', [1], good, callee) + guarded(3, 2); });
+probe = false;
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn a_helper_path_from_an_inlined_frame_finds_its_site_and_chunk() {
+    inlines();
+    inlined_generic();
+    let runs = counted(INLINED_CALL_PATHS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for seen in [
+        "vo<",
+        "maxThrow!TypeError:vt|",
+        "notFn!TypeError:",
+        "callOf!TypeError:",
+        "g|vt|",
+        "guarded|",
+        "again|",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    let ops = inlined_generic();
+    assert!(
+        ops.iter()
+            .filter(|op| matches!(op, Op::CallWithThis(..) | Op::Call(..)))
+            .count()
+            >= 6,
+        "{ops:?}"
+    );
+    for (exit_every, stress, poison) in [(7, false, false), (0, true, false), (0, false, true)] {
+        super::take_poison_faults();
+        let runs = counted(INLINED_CALL_PATHS, exit_every, stress, poison);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}, poison {poison}"
+        );
+        assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+    }
+}
+
+/// The end poll after an inlined frame's call that a helper path made or an intrinsic finished
+/// in machine code (P3 stage 3 step 3c-2, piece B2): the poll's slow branch publishes the frame's
+/// implicit site, so that the live-object limit's RangeError a test-only request makes it throw
+/// (`jit::set_call_done_hook`, `jit::arm_call_end_poll_limit`) names the inlined frame `viaMax`,
+/// pending (reported at its start), above the compiled frame `run` at the inlined call, as after
+/// a direct call (`errors_after_an_inlined_frames_call_returned_name_the_inlined_frame`).
+#[test]
+fn an_error_at_the_end_poll_after_an_inlined_frames_helper_call_names_the_frame() {
+    graph_switches(0).set();
+    crate::jit::set_call_done_hook(true);
+    let mut engine = jit_engine();
+    engine
+        .interp
+        .gc_heap
+        .core
+        .borrow_mut()
+        .set_incremental(crate::gc_core::IncrementalMode::Off);
+    inlined_generic();
+    eval(&mut engine, INLINED_CALL_PATHS);
+    assert!(inlined_generic()
+        .iter()
+        .any(|op| matches!(op, Op::CallWithThis(..))));
+    // Math.max of Numbers finishes in the intrinsic's machine code; of an Object, through the
+    // call-hit form (a valueOf that makes no call, so that the request's call is Math.max's).
+    for (tag, mx) in [
+        ("machine code", "2"),
+        ("helper", "{ valueOf: function () { return 7; } }"),
+    ] {
+        crate::jit::arm_call_end_poll_limit(false);
+        let got = eval(
+            &mut engine,
+            &format!(
+                "try {{ 'none:' + run(1, {mx}, 'abc', [1], good, callee); }} catch (e) {{ e.name + '|' + e.stack.split('\\n').slice(1, 3).join('/') }}"
+            ),
+        );
+        assert!(
+            !crate::jit::take_end_poll_limit(crate::jit::POLL_HELPER_END),
+            "{tag}: the request fell due and no poll took it: {got}"
+        );
+        let mut parts = got.split('|');
+        assert_eq!(parts.next(), Some("RangeError"), "{tag}: {got}");
+        let stack = parts.next().unwrap_or("");
+        let frames: Vec<&str> = stack.split('/').collect();
+        assert!(frames[0].starts_with("    at viaMax ("), "{tag}: {got}");
+        assert!(
+            frames.get(1).is_some_and(|f| f.starts_with("    at run (")),
+            "{tag}: {got}"
+        );
+    }
+    crate::jit::set_call_done_hook(false);
+}
