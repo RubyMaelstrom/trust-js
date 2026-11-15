@@ -4583,8 +4583,8 @@ operation that needs the whole canonical frame, or a call. The default stays the
   step3c-review, gate.out, gate-graph.out, gate-poison.out): at the default with the tier off,
   on, eager and forced, and at graph on, eager and forced: the library suite 3,477, difftest
   138 agree, the fixtures' outputs the tier off's, Test262 53,572 of 53,575 (the tier off's
-  three staging/sm failures and none beyond) in each of the seven; under the poison at graph,
-  on and eager: the library suite 3,477, difftest and the fixtures. GC stress over
+  three staging/sm failures and none beyond) in each of the seven; under the poison at the
+  default, on and eager: the library suite 3,477, difftest and the fixtures. GC stress over
   opt::inline_tests and opt::frames_tests was still running when this was written.
 - Open, before the flip (step 4): the direct accessor paths and calls from inlined frames
   (step 3c-2, started); GBEMU's R7; PdfJS's second-callee exits; the owner's question on the
