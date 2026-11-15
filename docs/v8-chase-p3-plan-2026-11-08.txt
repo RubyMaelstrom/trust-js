@@ -5177,3 +5177,50 @@ buffer an embedder has observed.
 - Next from the same counts, not built: the count as a plain mark inside the observed path (the
   chain gone for a tracked buffer too; it would change the count's meaning: an owner's fork if
   an embedder ever needs it).
+
+Stage 3 step 3c-2, piece B2b landed (a2a45609, 2026-11-15; target/p3/stage3/step3c2-impl/b2,
+design-note.txt section 7 and report.txt): an inlined frame's In, data-property
+definition and equality nodes switch their context only around their helper calls.
+- The rule. Piece B2's lazy, idempotent switch of constants, for an allowlist of non-call kinds
+  whose templates leave machine code only through a helper call (the op-helper emitters, the
+  shared Equal stub's call), each admitted after its template was read end to end (In:
+  emit_in_keyed; Abstract: CreateDataPropertyOrThrow's in-line form; StrictEq, StrictNotEq, EqEq,
+  NotEq: emit_eq_inline and its compact form): those emitters switch ctx.chunk and publish the
+  frame's site before the call and restore after it; the machine-code path switches nothing.
+  Every other kind, and every kind under the poison, keeps step 3c's eager switch.
+- The audit made a test. A mutation could not construct a failing kind, so the allowlist's
+  soundness rested on reading; now, in test builds, a lazily switched node (piece B2's call
+  nodes too) keeps a trap value in ctx.chunk while its machine code runs, an address that
+  faults, the template's switch writes the frame's chunk, its restore the trap again, and the
+  node's end checks it and writes the code's own chunk. It found one reader, the collector: a
+  record's scan extent where its top is unknown is n_slots plus the largest max_stack its
+  chunk's slot has held (JitCtx::frame_words), which piece B2's unswitched end poll reached in
+  the debug assertion beside a known top. The release scan is right in every state, verified:
+  a code with inlined frames declares max_stack as the largest of its own capacity and each
+  inlined frame's capacity plus its slots (a64.rs, Assembled::max_stack), a record whose slots
+  are a window or whose chunk held no code is scanned whole, and a switched helper's extent
+  (the compiled frame's slots plus the callee's capacity) covers the node's operands. Test
+  builds scan the whole record for the trap value. No other reader in the tier's tests.
+- Measured (fat LTO; my recount, merge-check/counts-b2b.out and counts-b2b-graph.out, the
+  agent's to the digit). Graph against the splice at 5 fixed runs: React +2.83% -> +0.04%, its
+  steady state +5.78% -> +0.29%; cycles at fixed work on one X925 core (the agent's, five
+  rounds): React's steady state -0.47% against the splice (+3.40% before). Every other workload
+  as before (Djot -1.89%, Crypto -1.08%, Box2D -0.85%, DeltaBlue -0.57%, Vue -0.54%, PdfJS
+  -0.53%, Mandreel -0.33%; GBEMU +1.80%, step 4p's subject; TypeScript +0.80% inside its
+  modes, which its splice and its tier off show too); Octane's geomean -0.07%. The 1.86
+  instructions an element still between graph and the splice on a map micro are two loads of
+  a spilled value of the inlined frame, the allocator's. The default and the tier off: within
+  their modes; template code identical with the tier off (2,594 of 2,594 compiles) and at the
+  splice (2,173 of 2,173, the tier's 1,375 of 1,375).
+- What is left on the eager switch, by the census at graph: GetPropLocal the largest (Djot's
+  steady state 0.08%, Vue's 0.06%; 0.18% once frames nest), every other kind at 0.04% or under.
+  GetPropLocal's template writes ctx.accessor_holder and ctx.accessor_slot in line and calls
+  two property stubs: a piece of its own if the flip's numbers ask for it.
+- Tests: the lazy kinds' slow paths from an inlined frame (a Proxy's `has` trap and a
+  data-property definition's trap and TypeError seeing the inlined frame; an equality's
+  valueOf whose stack names the inlined frame), collections and forced exits; mutations (no
+  switch before a helper stub's call, no restore after it, the emitters not told, no switch
+  around the Equal stub: each caught, three by the trap). The tier's modules (601 tests) on
+  the trap build at graph, at the splice and at graph under the poison (the agent's); the
+  verifier sweep on the landed binary (mine: 42 runs, none refused); fmt, clippy; zombie's
+  check, clippy, Windows' check and x86-64 suite (2,891).
