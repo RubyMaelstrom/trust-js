@@ -5597,3 +5597,24 @@ Since the records above (2026-11-15):
 - Load flakes seen in suite runs beside builds, each passing alone: tests::
   long_bigint_operations_honor_the_deadline and jit::poll_tests::
   loop_free_recursion_stops_at_entry_polls_for_cancellation_and_deadlines.
+- Step L4's remaining results (the agent's final report, stepL4-impl/report.txt, on its tree
+  4e3f15c6). Instructions at 200 fixed runs, the tier on, against the main before the step
+  (71ebd5ef's code), medians of 3:
+    nothing observed:                    zlib -11.29%, Mandreel -12.34%, GBEMU -2.28%, PdfJS -0.77%
+    every buffer observed when made:     zlib +2.55%, Mandreel +3.02%, GBEMU +0.47%, PdfJS +0.30%
+    an unrelated buffer observed first:  zlib -8.81%, Mandreel -10.10%, GBEMU -1.82%, PdfJS -0.58%
+    every buffer observed a second in:   zlib +1.10%, Mandreel +2.83%, GBEMU -1.48%
+  (the last from its own session, whose all-observed runs repeat the second row within 0.13%).
+  So an embedder that observes every buffer pays 2.5 to 3% on the two typed-store workloads at
+  steady state where it paid nothing before, and one that observes none gains 11 to 12%: the
+  contract question above stays the owner's. The whole library suite (3,553 tests): the tier
+  off; the splice eager and forced; graph on, eager and forced; eager under the poison: all
+  pass; the splice on, one failure, the code-point intrinsic test (119 of 120 counted calls at
+  an unchanged call-cache epoch; 20 of 20 alone on the same binary), a late install of a
+  finished compile inside its measured run by my reading, not reproduced: the test now waits
+  for the engine's compiles before each measured run (53c11526). The tier's tests under the
+  poison on and forced, 580 each; GC stress over the step's tests, 19 in each of three legs.
+  Template code with the tier off: 3,048 of 3,067 compiles identical; GBEMU's 3 and PdfJS's 2
+  differ in alignment only; Djot's steady-state copy compiles 177 where it compiled 172, from a
+  minor collection whose survivors differ between builds of one source (5,725 to 5,844 across
+  four binaries): the build-dependent root seen in step 3d's recount, not the step's code.
