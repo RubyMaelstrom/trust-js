@@ -4471,3 +4471,95 @@ The VM-copy helper copies its operation's operands only (five commits ending 52a
   tiers (the helper's call is about 10 instructions longer; VM-copy effects run in the tier's
   code in Vue alone, 227k times in its steady state). Tests: 9 mutations caught; the tier's
   modules (442) in six configurations; the verifier sweep.
+
+Stage 3 steps 3b and 3c landed (six commits ending fe601a3c, 2026-11-15; target/p3/stage3/
+step3c-impl, report.txt and design-note.txt): an operation the tier does not lower in a
+graph-inlined leaf callee is a generic node of the inlined frame; E0 now declines only an
+operation that needs the whole canonical frame, or a call. The default stays the splice.
+- The form. An inlined frame's node writes its explicit inputs where the template ABI's helpers
+  read them, for the node alone: its operands in the compiled frame's operand words at the
+  operation's own depth in the callee's chunk; the callee's chunk in ctx.chunk (the template
+  passes the callee's pc, as it always did); the frame's inline site in Interp::call_site (one
+  site a way, registered by the oracle on the main thread, held and released with the code);
+  for the kinds that read them, the receiver in this_word and the closure's environment in
+  env_raw and env_parent_raw; for the kinds that name a slot, a slot window above the callee's
+  operand capacity that x22, ctx.slots and ctx.n_slots name. The compiled frame's words are
+  saved in the tier's native frame and restored after the template and on its throw path; a
+  forced exit comes before the switch. No record and no flush: the inlined frame's slots stay
+  values (D6). A throw with a handler in a frame of the chain exits by recipe and rebuilds
+  every frame (D10); with none it takes the throw epilogue. A callee whose words would put its
+  caller past a pooled record is declined; a generic node of a frame inlined into an inlined
+  frame is refused (no plan builds one: the oracle keeps leaf callees).
+- A departure from the wording recorded above for 3b ("origins where the templates take the
+  pc"): the origin's chunk goes through the context's word and its position through
+  Interp::call_site, JSC's store of a node's code origin into the frame before each call out
+  (dfg/DFGJITCompiler.h:133-143), restored here after the node because the compiled frame's own
+  generic nodes do not store theirs. Not E1: nothing of the callee's frame is kept current in a
+  record. The two other forms, for the owner at step 4: an origin index passed in place of the
+  pc, with thin helper entries, changes about 25 entries and the 40 helper cores that read
+  ctx.chunk, the tier off's Rust code with them; JSC's exact form (every generic node stores
+  its origin, none restores) would add 8 instructions to each of the compiled frame's generic
+  nodes, which outnumber the inlined ones 200 to 1 (178.3M executions against 0.84M over the
+  workloads): +0.04% to +4.7% instructions a workload (the agent's estimate from counts).
+- The switch costs 16 instructions a node, 5 more with `this`, 14 more with the environment, 9
+  more with a window: at most 0.11% of a workload's instructions (Earley-Boyer's 146,734 nodes;
+  Vue's steady state 352,664, TypeScript 241,378, Box2D 23,775, none elsewhere; no environment
+  kind ran).
+- A collector hole, found in the coordinator's review and fixed in the last commit: a template
+  that ends its allocating helper's call in the explicit poll gives the record a known live top
+  (the poll's x20), and the collector scanned the record's words below it only; the slot window
+  lies above it, so a slot the operation writes with a fresh cell (an update of a BigInt local)
+  was unscanned at that poll until its slot result read it. The trace now scans the window's
+  words as well where its extent does not cover them. A release run did not show it (3,000
+  inlined BigInt updates under GC stress gave no wrong value: a stale copy on the native stack
+  kept the cell); the test that does, a_slot_window_is_scanned_at_its_nodes_end_poll, has a
+  hook in the pool's trace and aborts in the heap verifier without the fix, 4 runs of 4. The
+  kinds that can write a cell into a window: UpdateLocal of a non-Number alone.
+- What graph still pays: accessors. An inlined frame's property helpers are called in line,
+  not through the shared stub, whose direct getter, setter and trap calls take their call site
+  from the running chunk's accessor table; an accessor reached from an inlined frame therefore
+  runs through the helper's interpreter call: 869 instructions more a setter call (Box2D:
+  +0.56% against the splice at 200 runs, the whole of its loss; with the direct paths left on,
+  -0.05%), 690 to 807 more a getter call. Step 3c-2's first piece, in a form that leaves the
+  template code the tier off runs identical.
+- Measured at graph (fat LTO; the census over the workloads): E0's declines 46 -> 0, ways
+  inlined 596 -> 644, plans left to the splice for a callee that calls 297 -> 297. Graph
+  against the splice on the landed binary, instructions at 5 fixed runs (my recount,
+  target/p3/stage3/merge-check/counts-3c.out and counts-3c-graph.out; the agent's agree): Djot
+  -0.98% (steady state -0.39%), Earley-Boyer -0.55% (the base's graph: +1.5%), Vue -0.53%
+  (steady -0.50%), Mandreel -0.31%, Crypto -0.17%, DeltaBlue -0.15%, Richards -0.12%, Box2D
+  -0.10%; GBEMU +1.86%, step 2's R7 unchanged. At 200 runs (the agent's): GBEMU +1.23%, Box2D
+  +0.56% (the accessors). Timed on X925 cores (the agent's, five rounds): GBEMU's score -2.4%
+  at graph, the others within their rounds' spread. Djot's compile bar 3.53% at the splice,
+  3.12% at graph.
+- At the default (my recount against 7875566a): the tier on within 0.03% everywhere but PdfJS
+  +0.23% and TypeScript +0.15%, each inside its runs' two modes. The tier off within 0.01% but
+  Earley-Boyer +0.42% and Splay +0.22%, which are the incremental marker's schedule, not code:
+  alone on a quiet core each binary counts the same to six digits (+0.45% and +0.19%), with
+  TRUST_JS_GC_INCREMENTAL=0 they are equal (the agent's: -0.06%, -0.0004%), and under load both
+  binaries spread over the same range with equal medians (8 runs at once on one core, 24 runs
+  a side: Splay +0.03%, Earley-Boyer +0.02%; spreads 0.2 to 1.0%). So tier-off counts of the
+  collecting benchmarks depend on the machine's load; the earlier recounts ran on quiet CPUs.
+  One Splay run of the landed binary with the tier off counted 18% high beside the gate's
+  load; 60 more runs a side under that load gave none over 3% on either binary. With the tier
+  off no pooled record's slots are ever a window (the tier's code alone writes ctx.slots), so
+  the trace is the base's.
+- Tests: 18 new (each kind's results as the tier off's; each context read proved by a test
+  that fails if the compiled frame's were read; Error.stack, f.caller and a thrown error's
+  position from an inlined frame's node; throws caught by the caller's handler and by none;
+  collections during an inlined frame's helper; the graph counterparts step 2's record asked
+  for: a callee of another realm, one that outlives its last reference, a callee's string
+  constants); 25 mutations, each caught, five after their tests were strengthened; the poison
+  switch extended to inlined frames' nodes; the whole library suite (3,473) at graph on,
+  eager, forced, and on and eager under the poison, and at the default on, eager and forced,
+  none failing, on the first commit's binary; with the tier off one failure there, the splay
+  tree's live-data test (live objects 3,502 -> 6,000 for five samples, then back), which
+  passed 10 of 10 alone and, 8 runs at once on one core, 40 of 40 on main's binary and 40 of
+  40 on the branch's: not reproduced, kept as a known rare failure of that test under a
+  loaded suite. difftest and the fixtures in ten configurations; the verifier sweep (mine on
+  the landed binary: 42 runs at the splice and at graph, none refused); zombie's check,
+  clippy, Windows' check and suite (2,888). Three of step 2's tests now assert the new rule
+  (a callee's GetPropLocal, Add and EqEq inlined as generic nodes, where E0 declined them).
+- Open, before the flip (step 4): the direct accessor paths and calls from inlined frames
+  (step 3c-2, started); GBEMU's R7; PdfJS's second-callee exits; the owner's question on the
+  origin's form, above.
