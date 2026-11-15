@@ -16824,12 +16824,13 @@ impl Interp {
         }
         // A first stage the optimizing tier compiled in place under graph inlining makes no
         // bytecode recompile for its stale chains (P3 stage 3, step 4p, rule 2a): the tier's own
-        // reoptimization takes the function's one bytecode again (`opt::chain_request_in_place`).
+        // reoptimization takes the function's one bytecode again, and its template code gives
+        // its chains up (rule 2b; `opt::chain_request_in_place`).
         if crate::opt::inline_graph()
             && crate::opt::in_place(chunk)
             && chunk.reoptimize.replace(false)
         {
-            crate::opt::chain_request_in_place(chunk);
+            crate::opt::chain_request_in_place(self, chunk);
         }
         // Alive as below: the callee object that carried this IC is alive. A declined recompile
         // leaves the checkpoint to run as it would have.

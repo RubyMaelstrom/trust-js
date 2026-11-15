@@ -25247,6 +25247,16 @@ impl Chunk {
     pub(crate) fn stale_chain_replays(&self) -> u32 {
         self.stale_chain_replays.get()
     }
+    /// From now on the chunk's native code builds no property chain (`jit::build_chain`), and
+    /// no code compiled before counts toward a request (P3 stage 3, step 4p, rule 2b: a first
+    /// stage the optimizing tier compiled in place gives its chains up at its stale-chain request,
+    /// `opt::chain_request_in_place`): its record of chains cleared and its replays' count reset,
+    /// so that [`Chunk::note_chain_replay`] counts nothing and the request is not made again.
+    pub(crate) fn drop_property_chains(&self) {
+        self.no_property_chains.set(true);
+        self.property_chains.set(false);
+        self.stale_chain_replays.set(0);
+    }
     /// Four exponentially spaced feedback checkpoints bound compilation work. Empty early
     /// profiles can mature, but unchanged profiles never rerun the planner. Only identities
     /// and immutable compile states enter this signature; no user property reads are needed.

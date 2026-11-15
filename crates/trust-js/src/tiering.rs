@@ -103,6 +103,30 @@ impl OsrCodeState {
         matches!(self.code.get(), Some(None))
     }
 
+    /// Take the borrowed-frame code out, the slot left cold without a cooldown, so that the next
+    /// loop transfer compiles it again (P3 stage 3, step 4p, rule 2b: a first stage that gave its
+    /// property chains up, `opt::chain_request_in_place`); returns the code, which an activation
+    /// may still be running (the caller keeps it alive until none does). The state itself stays:
+    /// it records that the chunk's loops tried to transfer (`opt::exit`'s loop limit).
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn discard(&self) -> Option<Rc<JitCode>> {
+        self.budget_wait_bytes.set(0);
+        self.code.discard()
+    }
+
+    /// The borrowed-frame code, if one is resident (the tier's tests).
+    #[cfg(all(
+        test,
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    pub(crate) fn resident(&self) -> Option<Rc<JitCode>> {
+        self.code.get().flatten()
+    }
+
     pub(crate) fn retained_metadata_bytes(&self) -> usize {
         std::mem::size_of::<Self>() + self.code.retained_metadata_bytes()
     }

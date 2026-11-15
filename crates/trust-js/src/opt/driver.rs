@@ -165,6 +165,10 @@ thread_local! {
     /// the warm-up checkpoint made due, if one was armed; P3 stage 3, step 4p, rule 2a).
     pub(crate) static TEST_CHAIN_REQUESTS: std::cell::RefCell<Vec<(usize, Option<u8>)>> =
         const { std::cell::RefCell::new(Vec::new()) };
+    /// What each of those requests gave up (`drop_chains_in_place`; P3 stage 3, step 4p, rule
+    /// 2b): the chunk and the codes it retired.
+    pub(crate) static TEST_CHAINS_DROPPED: std::cell::RefCell<Vec<(usize, ChainsDropped)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
     /// The guards (chunk, pc) a reoptimization's re-read of its call ways flagged
     /// (`reread_call_ways`; P3 stage 3, step 4p, rule 5).
     pub(crate) static TEST_REREAD: std::cell::RefCell<Vec<(usize, usize)>> =
@@ -2256,8 +2260,12 @@ fn flag_as(chunk: &Chunk, exit: &ExitRecord, inlined: Option<&Chunk>, reason: Ex
 /// checkpoint due at once, at this entry, the settled rule applying, the first compile's ways
 /// kept (`opt::oracle`'s Request::Kept), as V8 and SpiderMonkey compile the function's one
 /// bytecode again and JSC its baseline code block's copy; with no warm-up armed (the tier's code
-/// installed, or none to come) nothing: the template code keeps its chains until then.
-pub(crate) fn chain_request_in_place(chunk: &Chunk) {
+/// installed, or none to come) no checkpoint. Either way the chunk gives its property chains up
+/// at once (rule 2b, `drop_chains_in_place`), as the chain recompile's new chunk builds none: the
+/// template code a warm-up runs, its kept fallback and its borrowed-frame code are compiled
+/// without them, so that the settled rule's waits do not run stale chains.
+pub(crate) fn chain_request_in_place(i: &mut Interp, chunk: &Chunk) {
+    let dropped = drop_chains_in_place(i, chunk);
     let profile = ChunkProfile::of(chunk);
     let due = profile.warm_up().map(|(checkpoint, _)| {
         let runs = chunk.jit_runs.get();
@@ -2266,23 +2274,127 @@ pub(crate) fn chain_request_in_place(chunk: &Chunk) {
         checkpoint
     });
     #[cfg(test)]
-    TEST_CHAIN_REQUESTS.with(|requests| {
-        requests
-            .borrow_mut()
-            .push((chunk as *const Chunk as usize, due))
-    });
+    {
+        let key = chunk as *const Chunk as usize;
+        TEST_CHAIN_REQUESTS.with(|requests| requests.borrow_mut().push((key, due)));
+        TEST_CHAINS_DROPPED.with(|drops| drops.borrow_mut().push((key, dropped)));
+    }
     if log_enabled() {
-        match due {
-            Some(checkpoint) => log_line!(
-                "[opt] stale chains of {}: its warm-up's checkpoint {checkpoint} due now, no recompile",
-                name(chunk)
-            ),
-            None => log_line!(
-                "[opt] stale chains of {}: no warm-up armed, no recompile",
-                name(chunk)
-            ),
+        let due = match due {
+            Some(checkpoint) => format!("its warm-up's checkpoint {checkpoint} due now"),
+            None => "no warm-up armed".to_string(),
+        };
+        let mut given_up = Vec::new();
+        if let Some((_, now)) = dropped.resident {
+            given_up.push(if now == 0 {
+                "its template code (compiled at the next entry)"
+            } else {
+                "its template code (compiled again)"
+            });
+        }
+        if dropped.kept.is_some() {
+            given_up.push("its kept fallback");
+        }
+        if dropped.borrowed.is_some() {
+            given_up.push("its borrowed-frame code");
+        }
+        let given_up = if given_up.is_empty() {
+            "no code to compile again".to_string()
+        } else {
+            given_up.join(", ")
+        };
+        log_line!(
+            "[opt] stale chains of {}: {due}, no recompile; chains given up: {given_up}",
+            name(chunk)
+        );
+    }
+}
+
+/// What a stale-chain request of a first stage compiled in place gave up
+/// (`drop_chains_in_place`): each code it replaced.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ChainsDropped {
+    /// The slot's resident template code, and its compile without chains in its place (0: the
+    /// compile was deferred for executable capacity, the slot left cold for the next entry).
+    pub(crate) resident: Option<(usize, usize)>,
+    /// The kept fallback (`ChunkProfile::kept`).
+    pub(crate) kept: Option<usize>,
+    /// The borrowed-frame code (`tiering::OsrCodeState`), by its `JitCode`'s address (its
+    /// machine code's is an ordinary entry's alone, `JitCode::mem_ptr`).
+    pub(crate) borrowed: Option<usize>,
+}
+
+/// `chunk`, a first stage the tier compiled in place under graph inlining, gives its property
+/// chains up at its stale-chain request (P3 stage 3, step 4p, rule 2b): it builds none from now
+/// on (`Chunk::drop_property_chains`, which also clears its record of chains and resets its
+/// replays' count, so that the request is not made again), and each template code of it that may
+/// hold one is replaced, as the chain recompile's new chunk builds none (`jit::build_chain` reads
+/// `no_property_chains`), applied to the function's one bytecode: the slot's resident template
+/// code, which a discard's warm-up runs, compiled again without chains, as `swap_in_template`
+/// compiles a fallback (a compile deferred for capacity leaves the slot cold, compiled at its
+/// next entry; an unavailable one keeps the code it has); the kept fallback, whose next discard
+/// then compiles one; the borrowed-frame code, whose next loop transfer then compiles one. The
+/// tier's own code is left as it is. Each replaced code is retired, kept until no activation runs
+/// it (the borrowed-frame code by the lease of the loop transfer that runs it): an activation
+/// running it, the one this entry leased among them, finishes in it, and its bails count
+/// nothing. The exemplars' baseline code keeps no state that a later shape makes
+/// stale at its site: V8's Sparkplug calls the LoadIC builtin with the site's feedback slot
+/// (baseline/baseline-compiler.cc:1071-1083), and JSC's baseline get-by cache repatches at a
+/// miss and, giving up, repatches the site to the slow-path call (bytecode/Repatch.cpp:754-786).
+/// The epoch moves where a code a way may hold was retired (the resident code, the kept one,
+/// which a way that missed an install's entry change enters); no way holds borrowed-frame code.
+fn drop_chains_in_place(i: &mut Interp, chunk: &Chunk) -> ChainsDropped {
+    chunk.drop_property_chains();
+    let mut dropped = ChainsDropped::default();
+    let resident = chunk
+        .jit
+        .get()
+        .flatten()
+        .filter(|code| super::exit::table_bytes(code.mem_ptr()) == 0);
+    if let Some(code) = resident {
+        let old = code.mem_ptr() as usize;
+        drop(code);
+        let layout = *i
+            .jit_layout
+            .get_or_init(|| crate::value::jit_layout(&i.object_proto));
+        if !i.interp_layout.get().valid {
+            let layout = crate::interpreter::interp_layout(i);
+            i.interp_layout.set(layout);
+        }
+        DISCARDING.with(|discarding| discarding.set(true));
+        let outcome = crate::jit::compile_profiled(chunk, &layout, &i.interp_layout.get());
+        DISCARDING.with(|discarding| discarding.set(false));
+        let retired = match outcome {
+            crate::jit::JitCompileOutcome::Compiled(code) => {
+                let code = Rc::new(code);
+                dropped.resident = Some((old, code.mem_ptr() as usize));
+                chunk.jit.replace_resident(Some(code))
+            }
+            crate::jit::JitCompileOutcome::Deferred { required_bytes } => {
+                chunk.jit_budget_wait_bytes.set(required_bytes);
+                dropped.resident = Some((old, 0));
+                chunk.jit.discard()
+            }
+            crate::jit::JitCompileOutcome::Unavailable => None,
+        };
+        if let Some(retired) = retired {
+            chunk.note_entry_change();
+            i.opt_retired.push(retired);
         }
     }
+    if let Some(kept) = ChunkProfile::get(chunk).and_then(|profile| profile.kept().discard()) {
+        dropped.kept = Some(kept.mem_ptr() as usize);
+        i.opt_retired.push(kept);
+    }
+    if let Some(borrowed) = chunk.osr.get().and_then(|state| state.discard()) {
+        // An activation running it holds its own lease (the VM's loop transfer keeps the code it
+        // entered while it runs): nothing to retire.
+        dropped.borrowed = Some(Rc::as_ptr(&borrowed) as usize);
+    }
+    if dropped.resident.is_some() || dropped.kept.is_some() {
+        move_epoch("chains given up");
+    }
+    dropped
 }
 
 /// Whether `chunk`'s checkpoint word counts toward a recompile after a discard (its warm-up is
