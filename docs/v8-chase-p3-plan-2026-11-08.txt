@@ -5020,3 +5020,81 @@ a helper.
   one failure each, the test pinned to the splice in the landed commit; at graph forced that
   one and script_entry_tests' 30 ms top-level deadline under a load of 35 to 40 (3 of 3 alone
   on piece B's binary and on the one before it: a load flake of that test).
+
+Stage 3 allocator R1 landed (c5949641, 07069582, 353f15b1, 5d607da9, 3f4b5a7a, 71ebd5ef,
+2026-11-15; target/p3/stage3/stepR1-impl, report.txt and design-note.txt): a spilled value is no
+longer loaded at every use: a register holds a copy of it through a loop, or over a run of its
+reads in a block. The spill slot stays the value's one home; exits, throw and parent recipes and
+the collector read the slot as before.
+- The counts that chose the forms. Spill loads are 9.4% of zlib's executed tier words and 5.1%
+  of Mandreel's, under 1.1% elsewhere. zlib's are loop invariants in call-free loops (64%: the
+  typed arrays' data, length and view facts step 0c holds; one TypedData read 15 times an
+  iteration of its hottest loop); Mandreel's are values defined in the loop (62%) in loops with
+  no register free through them. After step 3a the backend stalls had risen 16.4% on Mandreel
+  and 3.6% on zlib at fewer instructions.
+- Loop caches (form A). After the homes are final and only where a value spilled: for a spilled
+  value defined outside a natural loop and read in it, a register of its class free through the
+  loop's hull (no home's range, no other cache, no stub clobber of the loop; caller-saved only
+  where the loop makes no call, else callee-saved), chosen by the reads' weight, 10^depth a read
+  less one load an entry (Air's frequency-weighted cost, AirAllocateRegistersByGreedy.cpp:
+  733-752; B3EstimateStaticExecutionCounts.cpp:42-43), the outermost loop first. The header
+  loads its caches before a second label that the loop's own edges take, so an entry loads once
+  and a back edge runs nothing: Maglev's reload hint (HoistLoopReloads, maglev-regalloc.cc:
+  2240-2316), placed at the header because the builder admits several forward predecessors.
+- Read spans (form B). Within a block, the reads of a spilled value with no call between them
+  (a call's own read ends a run) take one register, loaded before the first, free from the first
+  read to the definition after the last (so that it is no home its readers write): Maglev's
+  register kept from a reload until the next call (maglev-regalloc.cc:1423-1490, 1680-1683),
+  within one home a value. A cold path's call keeps the caller-saved caches and spans with the
+  live values. The review's case, fixed before it landed: a span's register could be the home
+  of its last reader's own value.
+- Compile cost (the brief's constraint, the review's return). As first built the passes cost
+  about 28 us a compile that spilled (Richards +0.16%, Djot's fixture +0.18% instructions at 5
+  runs). Now: the forward pass records what it spills, so a compile that spills nothing does
+  nothing; the passes run only where a spilled value is read twice in a block without a call
+  between or is live into a loop header; each block's reads are gathered once for both; and the
+  allocator's next-use lists, a fifth of its time and read only by the choice of a value to
+  spill, are made at the first such choice (a saving the base would take on its own). The
+  tier's code is identical to the measured form's in 1,522 of 1,522 compiles.
+- Measured (fat LTO). Cycles at fixed work on one X925 core (the agent's, three alternating
+  rounds): Mandreel -4.26% (backend stalls -8.4%), zlib -2.07%, DeltaBlue -0.90%, TypeScript
+  -0.73%, Box2D -0.28%; Crypto +0.18% and Vue's steady state +0.27% at equal or fewer
+  instructions, each moving as far with the tier off, where none of the step's code runs.
+  Instructions at 5 fixed runs with the tier on (my recount of 71ebd5ef against af0bb7f5,
+  merge-check/counts-r1.out, the agent's to the digit): zlib -1.63%, Mandreel -0.87%, TypeScript
+  -0.16% (inside its modes), Richards -0.16%, Earley-Boyer -0.13%, DeltaBlue -0.11%, Crypto
+  -0.09%, RayTrace +0.04%, Djot's fixture +0.07%, React's +0.02%; Octane's geomean -0.21%; the
+  tier off within 0.06% but Splay's and TypeScript's modes. My cycles at 5 fixed runs on one
+  X925 core (five alternating rounds, merge-check/cycles-r1.out): Mandreel -2.14%, zlib -1.54%,
+  Richards at 200 -0.41%, Earley-Boyer -0.39%, Djot's steady state -0.30%; TypeScript +0.39%
+  at +0.07% instructions, again in six more rounds (cycles-r1-ts): at 5 runs on one core its
+  177 spilled compiles' passes are in the count (inferred: the compile thread's work, about
+  4.9 ms of walks with few instructions a cycle; the agent's 20 runs read -0.73% with the
+  first form).
+  allocate()'s own time (the agent's): Djot -2.1%, Vue -1.1%, TypeScript +8.0% (its 177 spilled
+  compiles of 542). Two of the return's targets are missed by 0.01 and 0.03 points (RayTrace
+  +0.04%, Djot's fixture +0.06% against +0.03%), and over a base with the lazy next uses alone
+  the passes still cost Djot's fixture +0.19%, Richards +0.15%, DeltaBlue +0.10%, RayTrace
+  +0.06% at 5 runs: accepted for Mandreel's and zlib's cycles, on a compile thread.
+- Tests: the allocator's on hand-made graphs with a consistency check of every cache and span
+  after each allocation and the first form's passes kept as a reference; the back end's (a
+  cache read by its uses, the entry falling into the loads, the back edge past them, exits
+  naming the slot, a poll's slow path keeping a caller-saved cache, a d8-d15 cache keeping the
+  prologue's saves); end to end in six configurations with collections, forced exits, an
+  inlined frame's generic node, its throw and its call in the loop. 23 mutations of the forms
+  (22 caught, one equivalent: a spill implies every callee-saved register was already taken)
+  and 16 of the cheapening (15 caught, one equivalent by design). The tier's and the
+  back end's modules at the splice, at graph and under the poison (the agent's, 570 each, on
+  the tree main now has); the whole library suite in six configurations on the first form
+  (3,506 each but the cross-realm splice test under the poison, since fixed in a8a702ea); GC
+  stress over the step's tests; difftest and the fixtures in nine configurations; the verifier
+  sweep (mine on the landed binary: 42 runs, none refused); the tier off's template code
+  identical (539 of 539); fmt, clippy; zombie's check, clippy and Windows' check.
+- Found beside it, for later steps. The typed store's bookkeeping drew more of zlib's hottest
+  function than its spill loads: step L4, started. Mandreel derives its global heap views'
+  TypedData, TypedLength and TypedView again every iteration (39% of its spill loads): a
+  global's typed-view facts through an effect-free loop, a candidate for the lowerings. Next
+  for the allocator, parked: a span from the definition (Mandreel's defined-in-the-loop loads
+  pay a store-to-load trip at their first read), then the victims' choice by weighted next use
+  (through zlib's inner loops 6.5 of 21 x registers hold values live through the loop and not
+  read in it while its invariants are spilled).
