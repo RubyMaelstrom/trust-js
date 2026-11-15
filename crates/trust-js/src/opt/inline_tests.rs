@@ -1570,7 +1570,7 @@ Object.defineProperty(G.prototype, 'p', { get: function () { calls++;
   if (this.bad) throw new TypeError('bad ' + this.bad); return 1; } });
 function viaGet(o) { return o.p; }
 function caught(o) { var s = 0;
-  for (var i = 0; i < 20; i++) { try { s += viaGet(o); } catch (e) { s += 1000; msg = e.message; } }
+  for (var i = 0; i < 20; i++) { try { s += viaGet(o); } catch (e) { s += 1000; msg = msg || e.message; } }
   return s; }
 function leaves(o) { var s = 0; for (var i = 0; i < 20; i++) s += viaGet(o); return s; }
 var g = new G(), r = 0;
