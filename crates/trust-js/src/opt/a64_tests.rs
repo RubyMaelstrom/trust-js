@@ -2111,6 +2111,759 @@ fn every_pure_operation_computes_as_the_language_does() {
     assert_eq!(exits(), vec![(2, ExitReason::Overflow)]);
 }
 
+/// `brK(a, b)`: `op` over the operands as `operands` checks them (`left`, an int32 constant in
+/// place of `a`, where given), `nots` BoolNots of it, and a Branch on the last to a block that
+/// returns 1 and one that returns 2. `then_next` lays the true block out right after the entry
+/// (code order follows the entry's edges), so that the Branch takes the inverse condition to the
+/// false block; otherwise the false block follows and the Branch takes the condition itself.
+fn branch_graph(
+    op: NodeOp,
+    operands: Operands,
+    then_next: bool,
+    nots: usize,
+    left: Option<i32>,
+) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let yes = b.block(4, false);
+    let no = b.block(6, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let check = |b: &mut Build, v| {
+        let f = b.exiting(
+            entry,
+            NodeOp::CheckNumber,
+            &[v],
+            Rep::F64,
+            2,
+            at,
+            ExitReason::NotNumber,
+        );
+        match operands {
+            Operands::F64 => f,
+            Operands::I32 => b.exiting(
+                entry,
+                NodeOp::CheckInt32,
+                &[f],
+                Rep::I32,
+                2,
+                at,
+                ExitReason::NotInt32,
+            ),
+        }
+    };
+    let a = match left {
+        Some(k) => b.node(entry, NodeOp::ConstI32(k), &[], Rep::I32, 2),
+        None => check(&mut b, x),
+    };
+    let c = check(&mut b, y);
+    let mut test = b.node(entry, op, &[a, c], Rep::Bool, 2);
+    for _ in 0..nots {
+        test = b.node(entry, NodeOp::BoolNot, &[test], Rep::Bool, 2);
+    }
+    b.node(
+        entry,
+        NodeOp::Branch {
+            then_block: yes,
+            else_block: no,
+        },
+        &[test],
+        Rep::None,
+        3,
+    );
+    if then_next {
+        b.edge(entry, yes);
+        b.edge(entry, no);
+    } else {
+        b.edge(entry, no);
+        b.edge(entry, yes);
+    }
+    for (block, value) in [(yes, 1.0), (no, 2.0)] {
+        let k = b.node(block, NodeOp::ConstTagged(num(value)), &[], Rep::Tagged, 4);
+        b.node(block, NodeOp::Return, &[k], Rep::None, 5);
+    }
+    b.g
+}
+
+#[test]
+fn a_branch_on_a_compare_takes_its_condition_or_its_inverse_as_the_language_does() {
+    // Each compare fused into its Branch (`fused_tests`), each laid out both ways, so that every
+    // condition and every inverse is taken; a NaN on either side, ±0 and the infinities among the
+    // Numbers, the int32 range's ends among the integers.
+    use Operands::{F64, I32};
+    let relations = [
+        (Cond::Lt, "<"),
+        (Cond::Le, "<="),
+        (Cond::Gt, ">"),
+        (Cond::Ge, ">="),
+        (Cond::Eq, "=="),
+        (Cond::Ne, "!="),
+    ];
+    let ints = ["0", "1", "-1", "2147483647", "-2147483648"];
+    let floats = ["NaN", "-0", "0", "1.5", "-1.5", "Infinity", "-Infinity"];
+    let mut cases = Vec::new();
+    for (cond, text) in relations {
+        for then_next in [true, false] {
+            for nots in 0..3 {
+                cases.push((NodeOp::I32Cmp(cond), I32, then_next, nots, None, text));
+                cases.push((NodeOp::F64Cmp(cond), F64, then_next, nots, None, text));
+            }
+            // A constant on the left, which cmp_i32 moves to the right, swapping the condition.
+            cases.push((NodeOp::I32Cmp(cond), I32, then_next, 0, Some(1), text));
+        }
+    }
+    let source: String = (0..cases.len())
+        .map(|k| format!("function br{k}(a, b) {{ return a + b; }} br{k}(1, 2);\n"))
+        .collect();
+    let mut engine = fixture(&source);
+    for (k, &(ref op, operands, then_next, nots, left, text)) in cases.iter().enumerate() {
+        let graph = branch_graph(op.clone(), operands, then_next, nots, left);
+        let test = graph
+            .nodes
+            .iter()
+            .position(|node| node.op == *op)
+            .expect("the compare");
+        let fused = crate::opt::a64::fused_tests(&graph);
+        assert!(fused[test], "{op:?} feeds only its Branch");
+        let negations = graph.nodes.iter().zip(&fused);
+        assert!(
+            negations
+                .filter(|(node, _)| node.op == NodeOp::BoolNot)
+                .all(|(_, &on)| on),
+            "{op:?}'s BoolNots are fused"
+        );
+        // A frame state naming the Boolean (a slot, or the operand stack) is a use: the test
+        // stays materialised, as it does with a node between it and its Branch.
+        for named in [true, false] {
+            let mut b = Build { g: graph.clone() };
+            let compare = NodeIx(test as u32);
+            if named {
+                b.state(2, &[], &[(1, compare)], &[]);
+            } else {
+                b.state(2, &[compare], &[], &[]);
+            }
+            assert!(
+                !crate::opt::a64::fused_tests(&b.g)[test],
+                "{op:?}, a state names it"
+            );
+        }
+        let mut between = graph.clone();
+        let entry = between.entry.expect("an entry");
+        let body = &mut between.blocks[entry.index()].body;
+        let branch = body.pop().expect("the Branch");
+        let spare = between.new_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 2);
+        between.blocks[entry.index()].body.extend([spare, branch]);
+        assert!(
+            !crate::opt::a64::fused_tests(&between)[test],
+            "{op:?}, a node between"
+        );
+        install(&mut engine, &format!("br{k}"), &graph, Options::default());
+        let values: &[&str] = if operands == I32 { &ints } else { &floats };
+        for a in values {
+            for b in values {
+                let bang = "!".repeat(nots);
+                let l = left.map_or(a.to_string(), |k| k.to_string());
+                let expected = eval(&mut engine, &format!("{bang}(({l}) {text} ({b})) ? 1 : 2"));
+                exits();
+                let got = eval(&mut engine, &format!("br{k}({a}, {b})"));
+                assert!(exits().is_empty(), "{op:?}({a}, {b}) exited");
+                assert_eq!(
+                    got, expected,
+                    "{op:?}({a}, {b}), then next {then_next}, {nots} negations"
+                );
+            }
+        }
+    }
+}
+
+/// `emK(a, b)`: a Branch one of whose edges goes straight to a join and the other through a
+/// block of its own, which precedes the join in the code order (reverse postorder). Two phis of
+/// the join take `a` on the Branch's own edge, so that this edge carries a move (one value into
+/// two registers), and `b` and 100 on the other block's; the join returns their sum: 2a by the
+/// Branch's edge, b + 100 by the block. The Branch tests `a < b` fused into it, or with
+/// `constant` a ConstBool; `join_on_then` puts the join on its true edge.
+fn edge_move_graph(constant: Option<bool>, join_on_then: bool) -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let side = b.block(4, false);
+    let join = b.block(6, false);
+    b.edge(entry, join);
+    b.edge(entry, side);
+    b.edge(side, join);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    let number = |b: &mut Build, v| {
+        b.exiting(
+            entry,
+            NodeOp::CheckNumber,
+            &[v],
+            Rep::F64,
+            2,
+            at,
+            ExitReason::NotNumber,
+        )
+    };
+    let fx = number(&mut b, x);
+    let fy = number(&mut b, y);
+    let test = match constant {
+        Some(value) => b.node(entry, NodeOp::ConstBool(value), &[], Rep::Bool, 2),
+        None => b.node(entry, NodeOp::F64Cmp(Cond::Lt), &[fx, fy], Rep::Bool, 2),
+    };
+    let (then_block, else_block) = if join_on_then {
+        (join, side)
+    } else {
+        (side, join)
+    };
+    b.node(
+        entry,
+        NodeOp::Branch {
+            then_block,
+            else_block,
+        },
+        &[test],
+        Rep::None,
+        3,
+    );
+    let hundred = b.node(side, NodeOp::ConstF64(100f64.to_bits()), &[], Rep::F64, 4);
+    b.node(side, NodeOp::Jump(join), &[], Rep::None, 5);
+    let p = b.node(join, NodeOp::Phi, &[fx, fy], Rep::F64, 6);
+    let q = b.node(join, NodeOp::Phi, &[fx, hundred], Rep::F64, 6);
+    let sum = b.node(join, NodeOp::F64Add, &[p, q], Rep::F64, 6);
+    let boxed = b.node(join, NodeOp::F64ToTagged, &[sum], Rep::Tagged, 6);
+    b.node(join, NodeOp::Return, &[boxed], Rep::None, 7);
+    b.g
+}
+
+/// `count(n)` as `count` builds it, entered behind a Branch of the entry block: one edge to the
+/// loop's header, which follows the entry in the code order and whose phis the edge's moves
+/// fill, the other to a block that returns -1. The Branch tests `n < 100` fused into it, or with
+/// `constant` a ConstBool; `loop_on_then` puts the loop on its true edge.
+fn loop_entry_graph(constant: Option<bool>, loop_on_then: bool) -> Graph {
+    let mut b = Build::new(3);
+    let entry = b.block(0, false);
+    let header = b.block(6, true);
+    let body = b.block(10, false);
+    let exit = b.block(18, false);
+    let out = b.block(20, false);
+    b.edge(entry, header);
+    b.edge(entry, out);
+    b.edge(header, body);
+    b.edge(header, exit);
+    b.edge(body, header);
+    let n = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let at_entry = b.state(0, &[], &[], &[]);
+    let fn_ = b.exiting(
+        entry,
+        NodeOp::CheckNumber,
+        &[n],
+        Rep::F64,
+        0,
+        at_entry,
+        ExitReason::NotNumber,
+    );
+    let in_ = b.exiting(
+        entry,
+        NodeOp::CheckInt32,
+        &[fn_],
+        Rep::I32,
+        0,
+        at_entry,
+        ExitReason::NotInt32,
+    );
+    let zero = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+    let test = match constant {
+        Some(value) => b.node(entry, NodeOp::ConstBool(value), &[], Rep::Bool, 4),
+        None => {
+            let hundred = b.node(entry, NodeOp::ConstI32(100), &[], Rep::I32, 4);
+            b.node(
+                entry,
+                NodeOp::I32Cmp(Cond::Lt),
+                &[in_, hundred],
+                Rep::Bool,
+                4,
+            )
+        }
+    };
+    let (then_block, else_block) = if loop_on_then {
+        (header, out)
+    } else {
+        (out, header)
+    };
+    b.node(
+        entry,
+        NodeOp::Branch {
+            then_block,
+            else_block,
+        },
+        &[test],
+        Rep::None,
+        5,
+    );
+    let i = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 6);
+    let s = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 6);
+    let at_header = b.state(6, &[], &[(1, s), (2, i)], &[]);
+    b.exiting(
+        header,
+        NodeOp::Poll,
+        &[],
+        Rep::None,
+        6,
+        at_header,
+        ExitReason::Throw,
+    );
+    let lt = b.node(header, NodeOp::I32Cmp(Cond::Lt), &[i, in_], Rep::Bool, 8);
+    b.node(
+        header,
+        NodeOp::Branch {
+            then_block: body,
+            else_block: exit,
+        },
+        &[lt],
+        Rep::None,
+        9,
+    );
+    let at_add = b.state(12, &[s, i], &[(1, s), (2, i)], &[]);
+    let s2 = b.exiting(
+        body,
+        NodeOp::I32Add,
+        &[s, i],
+        Rep::I32,
+        12,
+        at_add,
+        ExitReason::Overflow,
+    );
+    let one = b.node(body, NodeOp::ConstI32(1), &[], Rep::I32, 16);
+    let at_inc = b.state(16, &[], &[(1, s2), (2, i)], &[]);
+    let i2 = b.exiting(
+        body,
+        NodeOp::I32Add,
+        &[i, one],
+        Rep::I32,
+        16,
+        at_inc,
+        ExitReason::Overflow,
+    );
+    b.node(body, NodeOp::Jump(header), &[], Rep::None, 17);
+    b.g.node_mut(i).inputs.push(i2);
+    b.g.node_mut(s).inputs.push(s2);
+    let boxed = b.node(exit, NodeOp::I32ToTagged, &[s], Rep::Tagged, 18);
+    b.node(exit, NodeOp::Return, &[boxed], Rep::None, 19);
+    let minus = b.node(out, NodeOp::ConstTagged(num(-1.0)), &[], Rep::Tagged, 18);
+    b.node(out, NodeOp::Return, &[minus], Rep::None, 19);
+    b.g
+}
+
+#[test]
+fn a_branch_on_a_compare_or_a_constant_runs_its_edges_moves_in_every_layout() {
+    // A fused Branch and a constant's take the edges a materialised Boolean's does. An edge with
+    // moves is taken through them: to a join that does not follow (the Branch's condition, or its
+    // inverse, to the moves), and to a loop's header that does follow the Branch's block, which
+    // neither falls into it past the moves nor, the other way, into it at all.
+    let mut cases = Vec::new();
+    for constant in [None, Some(true), Some(false)] {
+        for on_then in [true, false] {
+            cases.push((constant, on_then));
+        }
+    }
+    let source: String = (0..cases.len())
+        .map(|k| {
+            format!(
+                "function em{k}(a, b) {{ return a + b; }} em{k}(1, 2);\n\
+                 function le{k}(n) {{ let s = 0; for (let i = 0; i < n; i++) {{ s = s + i; }} return s; }} le{k}(3);\n"
+            )
+        })
+        .collect();
+    let mut engine = fixture(&source);
+    let values = ["1.5", "2.5", "NaN", "-0", "0"];
+    for (k, &(constant, on_then)) in cases.iter().enumerate() {
+        let graph = edge_move_graph(constant, on_then);
+        let fused = fused_tests(&graph);
+        let compares = graph.nodes.iter().zip(&fused);
+        assert!(
+            compares
+                .filter(|(node, _)| matches!(node.op, NodeOp::F64Cmp(_)))
+                .all(|(_, &on)| on),
+            "the compare feeds only its Branch"
+        );
+        install(&mut engine, &format!("em{k}"), &graph, Options::default());
+        for a in values {
+            for b in values {
+                // Whether the Branch's true edge is taken, and so whether its own edge to the join.
+                let taken = match constant {
+                    Some(value) => value.to_string(),
+                    None => format!("(({a}) < ({b}))"),
+                };
+                let (by_edge, by_block) = (format!("2 * ({a})"), format!("({b}) + 100"));
+                let expected = if on_then {
+                    eval(&mut engine, &format!("{taken} ? {by_edge} : {by_block}"))
+                } else {
+                    eval(&mut engine, &format!("{taken} ? {by_block} : {by_edge}"))
+                };
+                exits();
+                let got = eval(&mut engine, &format!("em{k}({a}, {b})"));
+                assert!(exits().is_empty(), "em{k}({a}, {b}) exited");
+                assert_eq!(
+                    got, expected,
+                    "({a}, {b}): constant {constant:?}, join on then {on_then}"
+                );
+            }
+        }
+        // The loop behind the Branch: its header is the block after the entry.
+        let graph = loop_entry_graph(constant, on_then);
+        let header = graph
+            .blocks
+            .iter()
+            .position(|block| block.loop_header)
+            .expect("the loop");
+        let alloc = crate::opt::regalloc::allocate(&graph, &crate::opt::regalloc::ARM64).unwrap();
+        assert_eq!(
+            alloc.order[1].index(),
+            header,
+            "the header follows the entry"
+        );
+        let fused = fused_tests(&graph);
+        assert!(
+            graph
+                .nodes
+                .iter()
+                .zip(&fused)
+                .filter(|(node, _)| matches!(node.op, NodeOp::I32Cmp(_)))
+                .all(|(_, &on)| on),
+            "each compare feeds only its Branch"
+        );
+        install(&mut engine, &format!("le{k}"), &graph, Options::default());
+        for n in [5i32, 200] {
+            let entered = match constant {
+                Some(value) => value == on_then,
+                None => (n < 100) == on_then,
+            };
+            let expected = if entered { n * (n - 1) / 2 } else { -1 };
+            exits();
+            assert_eq!(
+                eval(&mut engine, &format!("le{k}({n})")),
+                expected.to_string(),
+                "le({n}): constant {constant:?}, loop on then {on_then}"
+            );
+            assert!(exits().is_empty(), "le{k}({n}) exited");
+        }
+    }
+}
+
+/// `viaLeaf(x)` as `via_leaf` reads it, its spliced callee's guard a test (CalleeMatches) and a
+/// Branch on it, as the builder makes a guard whose WrongCallee the exit profile flagged
+/// (`Builder::callee_matches`): the true block, where the splice is, returns 1 and the false
+/// block, where the generic call is, 2. `then_next` lays the true block out right after the
+/// entry, as `branch_graph` does; `named` adds a frame state that names the Boolean, which keeps
+/// it materialised (`fused_tests`).
+fn callee_test_graph(then_next: bool, named: bool) -> Graph {
+    let mut b = Build::new(3);
+    let entry = b.block(0, false);
+    let splice = b.block(3, false);
+    let call = b.block(13, false);
+    let at_name = b.state(0, &[], &[], &[]);
+    let name = b.exiting(
+        entry,
+        NodeOp::Effect {
+            pc: 0,
+            pops: 0,
+            pushes: 2,
+        },
+        &[],
+        Rep::None,
+        0,
+        at_name,
+        ExitReason::Forced,
+    );
+    let callee = b.node(entry, NodeOp::Projection(1), &[name], Rep::Tagged, 0);
+    let test = b.node(
+        entry,
+        NodeOp::CalleeMatches { target: 0 },
+        &[callee],
+        Rep::Bool,
+        2,
+    );
+    if named {
+        b.state(2, &[test], &[], &[]);
+    }
+    b.node(
+        entry,
+        NodeOp::Branch {
+            then_block: splice,
+            else_block: call,
+        },
+        &[test],
+        Rep::None,
+        2,
+    );
+    if then_next {
+        b.edge(entry, splice);
+        b.edge(entry, call);
+    } else {
+        b.edge(entry, call);
+        b.edge(entry, splice);
+    }
+    for (block, value) in [(splice, 1.0), (call, 2.0)] {
+        let k = b.node(block, NodeOp::ConstTagged(num(value)), &[], Rep::Tagged, 13);
+        b.node(block, NodeOp::Return, &[k], Rep::None, 14);
+    }
+    b.g
+}
+
+#[test]
+fn a_branch_on_a_callee_test_takes_the_splice_for_the_live_expected_callee_alone() {
+    // The expected callee live, and dead: the view of a pin that no longer upgrades holds no
+    // callee (`Chunk::freeze_into`), and the test then never matches, whatever is called. Each
+    // with the test fused into its Branch and materialised, each laid out both ways.
+    for dead in [false, true] {
+        for named in [false, true] {
+            for then_next in [true, false] {
+                let mut engine = fixture(
+                    "function leaf(y) { return y + 1; }\n\
+                     function viaLeaf(x) { return leaf(x); }",
+                );
+                engine.set_tier(Tier::Jit);
+                eval(&mut engine, "for (var k = 0; k < 20; k++) viaLeaf(k);");
+                let primary = chunk_of(&mut engine, "viaLeaf");
+                let env = engine.interp.global_env;
+                let value = engine.interp.get_var("viaLeaf", &env).ok().unwrap();
+                let object = value.as_obj().unwrap();
+                let (func, realm) = {
+                    let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+                        panic!("an author function")
+                    };
+                    (user.func.clone(), user.realm)
+                };
+                let plan = crate::bytecode::plan_inlines(&primary, &func, realm, &env);
+                assert!(!plan.is_empty(), "leaf is spliced");
+                let inlined =
+                    crate::bytecode::compile_with_inlines(&func, &plan, &primary).unwrap();
+                assert!(matches!(inlined.jit_ops()[2], Op::InlineGuard(0, 13)));
+                let graph = callee_test_graph(then_next, named);
+                let test = graph
+                    .nodes
+                    .iter()
+                    .position(|node| node.op == NodeOp::CalleeMatches { target: 0 })
+                    .expect("the callee's test");
+                assert_eq!(
+                    fused_tests(&graph)[test],
+                    !named,
+                    "fused unless a state names it"
+                );
+                let mut view = inlined.freeze();
+                assert!(view.inline_targets[0].callee.is_some(), "leaf lives");
+                if dead {
+                    view.inline_targets[0].callee = None;
+                    view.inline_targets[0].env = None;
+                }
+                let layout = crate::value::jit_layout(&engine.interp.object_proto);
+                let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
+                let cfg = crate::jit_ir::Cfg::build(&inlined).expect("the stack depths settle");
+                let initialized = cfg.initialized_reads(inlined.jit_ops(), true);
+                let switches = Switches::read(&inlined);
+                let mut stubs = Stubs::live();
+                let assembled = assemble(
+                    &view,
+                    &graph,
+                    &cfg,
+                    &[],
+                    initialized,
+                    &layout,
+                    &ilayout,
+                    Options::default(),
+                    &switches,
+                    &mut stubs,
+                )
+                .unwrap_or_else(|refusal| panic!("the tier refused viaLeaf: {refusal:?}"));
+                let executable =
+                    ExecutableBuffer::from_bytes(assembled.bytes()).expect("executable memory");
+                let held = crate::opt::exit::Inlined {
+                    chunks: Box::new([]),
+                    pins: Box::new([]),
+                    sites: Default::default(),
+                };
+                let code = link(assembled, executable, &inlined, held);
+                inlined.jit.begin_compile().unwrap().commit(Some(code));
+                assert!(func.runtime().code2.set(Some(inlined)).is_ok());
+                exits();
+                let case = format!("dead {dead}, named {named}, then next {then_next}");
+                let matched = if dead { "2" } else { "1" };
+                assert_eq!(eval(&mut engine, "viaLeaf(41)"), matched, "{case}");
+                assert_eq!(
+                    eval(
+                        &mut engine,
+                        "leaf = function (y) { return y * 10; }; viaLeaf(4)"
+                    ),
+                    "2",
+                    "{case}, another callee"
+                );
+                assert!(exits().is_empty(), "{case}");
+            }
+        }
+    }
+}
+
+/// `stK(o)` (GetPropLocal 0 at pc 0, Return): the receiver checked to have one of `admit`'s
+/// shapes, then a ShapeIs of `chain` on its cell and a Branch on it, as `Builder::poly_load`
+/// tests an arm of a polymorphic read: the true block returns 1, the false block 2. `then_next`
+/// and `named` as `callee_test_graph`'s.
+fn shape_test_graph(admit: &[u32], chain: &[u32], then_next: bool, named: bool) -> Graph {
+    let mut b = Build::new(1);
+    let entry = b.block(0, false);
+    let yes = b.block(4, false);
+    let no = b.block(6, false);
+    let o = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let at = b.state(0, &[], &[], &[]);
+    let cell = b.exiting(
+        entry,
+        NodeOp::CheckShape {
+            shapes: admit.to_vec(),
+            ways: admit.len() as u8,
+        },
+        &[o],
+        Rep::Cell,
+        0,
+        at,
+        ExitReason::WrongShape,
+    );
+    let test = b.node(
+        entry,
+        NodeOp::ShapeIs(chain.to_vec()),
+        &[cell],
+        Rep::Bool,
+        0,
+    );
+    if named {
+        b.state(0, &[test], &[], &[]);
+    }
+    b.node(
+        entry,
+        NodeOp::Branch {
+            then_block: yes,
+            else_block: no,
+        },
+        &[test],
+        Rep::None,
+        0,
+    );
+    if then_next {
+        b.edge(entry, yes);
+        b.edge(entry, no);
+    } else {
+        b.edge(entry, no);
+        b.edge(entry, yes);
+    }
+    for (block, value) in [(yes, 1.0), (no, 2.0)] {
+        let k = b.node(block, NodeOp::ConstTagged(num(value)), &[], Rep::Tagged, 4);
+        b.node(block, NodeOp::Return, &[k], Rep::None, 5);
+    }
+    b.g
+}
+
+#[test]
+fn a_branch_on_a_shape_test_takes_its_chain_of_compares_or_its_boolean() {
+    // A fused ShapeIs is a compare of its first shape and a conditional compare of each further
+    // one, which keeps Z where an earlier compare matched (ccmp ..., #0b0100, ne); a shape below
+    // 4096 is the first compare's immediate, one below 32 a conditional compare's, any other is
+    // moved into x16 first. The two encodings, as binutils reads them.
+    assert_eq!(
+        encode(|a| a.ccmp_imm_w(17, 7, 0b0100, NE)),
+        0x7A47_1A24,
+        "ccmp w17, #7, #4, ne"
+    );
+    assert_eq!(
+        encode(|a| a.ccmp_reg_w(17, 16, 0b0100, NE)),
+        0x7A50_1224,
+        "ccmp w17, w16, #4, ne"
+    );
+    // Chains of the two receivers' shapes and of shapes no receiver has (small ones, which take
+    // the immediate forms that an object's own shape seldom does), in every place of a chain.
+    let chains = |a: u32, b: u32| {
+        vec![
+            vec![a],
+            vec![b],
+            vec![a, b],
+            vec![b, a],
+            vec![5, a],
+            vec![a, 7],
+            vec![5, 7],
+            vec![5, 7, b],
+            vec![a, 7, 9, 11],
+            vec![100, a],
+            vec![a, 100],
+            vec![5, 100, 7, b],
+            vec![70000, 5, 100, 7],
+        ]
+    };
+    let cases = chains(0, 0).len() * 4;
+    let mut source = String::from(
+        "function mkA(x) { return {x: x}; } function mkB(x) { return {y: 0, x: x}; }\n\
+         function geta(o) { return o.x; } geta(mkA(1));\n\
+         function getb(o) { return o.x; } getb(mkB(1));\n",
+    );
+    for k in 0..cases {
+        source.push_str(&format!(
+            "function st{k}(o) {{ return o.x; }} st{k}(mkA(1));\n"
+        ));
+    }
+    let mut engine = fixture(&source);
+    let mut shape_of = |name: &str| {
+        let chunk = chunk_of(&mut engine, name);
+        let Op::GetPropLocal(_, _, cache) = chunk.jit_ops()[0] else {
+            panic!("{name} reads a local's property")
+        };
+        chunk
+            .jit_cache_preferred(cache)
+            .expect("one way")
+            .recv_shape
+    };
+    let (a, b) = (shape_of("geta"), shape_of("getb"));
+    assert_ne!(a, b, "two shapes");
+    let mut k = 0;
+    for chain in chains(a, b) {
+        for (named, then_next) in [(false, true), (false, false), (true, true), (true, false)] {
+            let graph = shape_test_graph(&[a, b], &chain, then_next, named);
+            let test = graph
+                .nodes
+                .iter()
+                .position(|node| matches!(node.op, NodeOp::ShapeIs(_)))
+                .expect("the shape test");
+            assert_eq!(fused_tests(&graph)[test], !named, "{chain:?}");
+            let code = install(&mut engine, &format!("st{k}"), &graph, Options::default());
+            let words = code_words(&code);
+            if !named {
+                for (place, &shape) in chain.iter().enumerate() {
+                    let word = if place == 0 && shape < 4096 {
+                        encode(|asm| asm.cmp_imm_w(17, shape))
+                    } else if place == 0 {
+                        encode(|asm| asm.cmp_reg_w(17, 16))
+                    } else if shape < 32 {
+                        encode(|asm| asm.ccmp_imm_w(17, shape, 0b0100, NE))
+                    } else {
+                        encode(|asm| asm.ccmp_reg_w(17, 16, 0b0100, NE))
+                    };
+                    assert!(
+                        words.contains(&word),
+                        "{chain:?}: shape {shape} at {place} is compared by {word:#010x}"
+                    );
+                }
+            }
+            for (receiver, shape) in [("mkA(3)", a), ("mkB(3)", b)] {
+                let expected = if chain.contains(&shape) { "1" } else { "2" };
+                exits();
+                assert_eq!(
+                    eval(&mut engine, &format!("st{k}({receiver})")),
+                    expected,
+                    "{chain:?} of {receiver}, named {named}, then next {then_next}"
+                );
+                assert!(exits().is_empty(), "{chain:?} of {receiver} exited");
+            }
+            k += 1;
+        }
+    }
+}
+
 #[test]
 fn to_boolean_answers_as_the_language_does_for_every_kind_of_word() {
     let mut engine = fixture(

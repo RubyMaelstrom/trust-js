@@ -1,4 +1,4 @@
-//! A polymorphic read's arm test branches on its shape compares (a64.rs `fused_shape_tests`): a
+//! A polymorphic read's arm test branches on its shape compares (a64.rs `fused_tests`): a
 //! ShapeIs whose one use is the Branch right after it sets the flags that Branch takes, so no
 //! Boolean is materialised between them, as Maglev's arms branch on the map compare itself
 //! (BuildCompareMaps). The reads' results are the VM's for every arm and shape count, the arm
@@ -125,7 +125,7 @@ fn a_polymorphic_reads_arm_tests_are_fused_into_their_branches() {
         .filter(|&n| matches!(graph.node(n).op, NodeOp::ShapeIs(_)))
         .collect();
     assert!(!tests.is_empty(), "a polymorphic read: {:?}", graph.nodes);
-    let fused = super::a64::fused_shape_tests(&graph);
+    let fused = super::a64::fused_tests(&graph);
     for (index, &on) in fused.iter().enumerate() {
         let shape_is = matches!(graph.nodes[index].op, NodeOp::ShapeIs(_));
         assert_eq!(on, shape_is, "node {index}: {:?}", graph.nodes[index].op);

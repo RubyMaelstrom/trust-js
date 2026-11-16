@@ -56,6 +56,42 @@ const LT: u32 = 11;
 const GT: u32 = 12;
 const LE: u32 = 13;
 
+/// The condition that holds where an I32Cmp's `cond` does, after `cmp a, b`.
+fn i32_condition(cond: Cond) -> u32 {
+    match cond {
+        Cond::Lt => LT,
+        Cond::Le => LE,
+        Cond::Gt => GT,
+        Cond::Ge => GE,
+        Cond::Eq => EQ,
+        Cond::Ne => NE,
+    }
+}
+
+/// The condition that holds where an F64Cmp's `cond` does, after `fcmp a, b`: an unordered result
+/// sets C and V and clears N and Z, so Lt is MI (not LT) and Le LS (not LE), which it leaves false,
+/// and of the six only Ne holds for a NaN, as ECMA-262's IsLessThan answers undefined for a NaN
+/// and the relational operators false. SpiderMonkey's arm64 DoubleCondition takes the same codes
+/// for the ordered relations (Assembler-vixl.h:140-157); Maglev branches to the false target on V
+/// first (CompareFloat64AndBranch, maglev-assembler-arm64-inl.h:1182-1189).
+fn f64_condition(cond: Cond) -> u32 {
+    match cond {
+        Cond::Lt => MI,
+        Cond::Le => LS,
+        Cond::Gt => GT,
+        Cond::Ge => GE,
+        Cond::Eq => EQ,
+        Cond::Ne => NE,
+    }
+}
+
+/// The condition that holds on exactly the flag states where `code` does not (the encoding's low
+/// bit; AL and NV, which are not compares' conditions, have no inverse), as vixl's InvertCondition.
+fn inverted(code: u32) -> u32 {
+    debug_assert!(code < 14, "a compare's condition");
+    code ^ 1
+}
+
 /// The condition on (b, a) that holds where `code` holds on (a, b): a comparison's operands
 /// swapped, which reverses an order and keeps an equality (P3 stage 2 step 7).
 fn swapped(code: u32) -> u32 {
@@ -1049,32 +1085,64 @@ struct Gen<'a> {
     cur_pos: u32,
     cur_spans: Vec<regalloc::Span>,
     next_span: usize,
-    /// Each ShapeIs whose one use is the Branch right after it in its block
-    /// (`fused_shape_tests`): its compares set the flags the Branch takes, no Boolean between.
+    /// Each test whose one use is the Branch right after it in its block (`fused_tests`): its
+    /// compare sets the flags the Branch takes, no Boolean between.
     fused: Vec<bool>,
+    /// The condition a fused test left in the flags for its Branch: where it holds, the test's
+    /// Boolean is true.
+    flags: Option<u32>,
 }
 
-/// The ShapeIs nodes a Branch takes as flags (`Gen::fused`): a ShapeIs whose one use is the Branch
-/// immediately after it in its block, as Maglev's polymorphic arms branch on the map compare itself
-/// (BranchIfReferenceEqual in BuildCompareMaps, maglev-graph-builder.cc:3750-3804) and B3 and
-/// TurboFan's instruction selectors fuse a compare into the branch that tests it. Its Boolean is
-/// then never materialised: no mov #0 / mov #1 diamond, no cbz.
-pub(crate) fn fused_shape_tests(graph: &Graph) -> Vec<bool> {
+/// The tests a Branch takes as flags (`Gen::fused`): a compare (ShapeIs, I32Cmp, F64Cmp,
+/// TaggedSame, IsTypedArray, CalleeMatches) whose one use is the Branch immediately after it in its
+/// block, or the BoolNot there whose input it is, each BoolNot of the chain likewise, a use being a
+/// node's input, a frame state's slot or stack entry, or a frame's callee or receiver (so an exit
+/// that names the Boolean keeps it materialised). A fused BoolNot emits nothing and inverts the
+/// condition its test left. Maglev builds the branch on the compare itself
+/// (BranchIfInt32Compare, BranchIfFloat64Compare, BranchIfReferenceEqual from the compare that a
+/// branch tests, maglev-graph-builder.cc:14992-15012; the polymorphic arms' map compares in
+/// BuildCompareMaps, :3750-3804), B3 takes a compare with one use as the Branch's internal
+/// (B3LowerToAir.cpp:482-497, 6768-6779) and Ion emits a compare whose one use is its test at that
+/// use (CanEmitCompareAtUses, Lowering.cpp:1369-1395; LCompareAndBranch, LCompareDAndBranch). The
+/// Boolean is then never materialised: no cset (or mov #0 / mov #1 diamond) and no cbnz.
+pub(crate) fn fused_tests(graph: &Graph) -> Vec<bool> {
     let mut fused = vec![false; graph.nodes.len()];
-    let pairs = |block: &BlockData| {
-        block
-            .body
-            .windows(2)
-            .map(|pair| (pair[0], pair[1]))
-            .filter(|&(test, branch)| {
-                matches!(graph.node(test).op, NodeOp::ShapeIs(_))
-                    && matches!(graph.node(branch).op, NodeOp::Branch { .. })
-                    && graph.node(branch).inputs[0] == test
-            })
-            .collect::<Vec<_>>()
-    };
-    // Most graphs hold none: their uses are not counted (a pass over every frame state).
-    if !graph.blocks.iter().any(|block| !pairs(block).is_empty()) {
+    // Back from each Branch through each BoolNot right before it to a test right before that
+    // (Maglev's branch builder steps over LogicalNot the same way, swapping its targets,
+    // maglev-graph-builder.cc:14968-14973); each such chain fuses where every node of it is the
+    // one use of the next, so the uses are counted (a pass over every frame state) only where a
+    // graph holds a chain.
+    let mut chains = Vec::new();
+    for block in &graph.blocks {
+        for (k, &branch) in block.body.iter().enumerate() {
+            if !matches!(graph.node(branch).op, NodeOp::Branch { .. }) {
+                continue;
+            }
+            let mut value = graph.node(branch).inputs[0];
+            let mut at = k;
+            let mut chain = Vec::new();
+            while at > 0 && block.body[at - 1] == value {
+                chain.push(value);
+                match graph.node(value).op {
+                    NodeOp::BoolNot => {
+                        value = graph.node(value).inputs[0];
+                        at -= 1;
+                    }
+                    NodeOp::ShapeIs(_)
+                    | NodeOp::I32Cmp(_)
+                    | NodeOp::F64Cmp(_)
+                    | NodeOp::TaggedSame
+                    | NodeOp::IsTypedArray
+                    | NodeOp::CalleeMatches { .. } => {
+                        chains.push(chain);
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+    if chains.is_empty() {
         return fused;
     }
     let mut uses = vec![0u32; graph.nodes.len()];
@@ -1097,10 +1165,10 @@ pub(crate) fn fused_shape_tests(graph: &Graph) -> Vec<bool> {
         uses[frame.callee.index()] += 1;
         uses[frame.receiver.index()] += 1;
     }
-    for block in &graph.blocks {
-        for (test, _) in pairs(block) {
-            if uses[test.index()] == 1 {
-                fused[test.index()] = true;
+    for chain in chains {
+        if chain.iter().all(|node| uses[node.index()] == 1) {
+            for node in chain {
+                fused[node.index()] = true;
             }
         }
     }
@@ -1207,7 +1275,8 @@ impl<'a> Gen<'a> {
             cur_pos: u32::MAX,
             cur_spans: Vec::new(),
             next_span: 0,
-            fused: fused_shape_tests(graph),
+            fused: fused_tests(graph),
+            flags: None,
         }
     }
 
@@ -2477,6 +2546,7 @@ impl Gen<'_> {
                         self.a.ccmp_reg_w(X17, X16, 0b0100, NE);
                     }
                 }
+                self.flags = Some(EQ);
             }
             NodeOp::ShapeIs(shapes) => {
                 if !unused {
@@ -2744,21 +2814,23 @@ impl Gen<'_> {
                     self.fp_done(n, d);
                 }
             }
+            NodeOp::I32Cmp(cond) if self.fused[n.index()] => {
+                let code = self.cmp_i32(input(0), input(1), i32_condition(*cond));
+                self.flags = Some(code);
+            }
             NodeOp::I32Cmp(cond) => {
                 if !unused {
                     let w = self.gp_dst(n);
-                    let code = match cond {
-                        Cond::Lt => LT,
-                        Cond::Le => LE,
-                        Cond::Gt => GT,
-                        Cond::Ge => GE,
-                        Cond::Eq => EQ,
-                        Cond::Ne => NE,
-                    };
-                    let code = self.cmp_i32(input(0), input(1), code);
+                    let code = self.cmp_i32(input(0), input(1), i32_condition(*cond));
                     self.a.cset_w(w, code);
                     self.gp_done(n, w);
                 }
+            }
+            NodeOp::F64Cmp(cond) if self.fused[n.index()] => {
+                let a = self.fp(input(0), D30);
+                let b = self.fp(input(1), D31);
+                self.a.fcmp(a, b);
+                self.flags = Some(f64_condition(*cond));
             }
             NodeOp::F64Cmp(cond) => {
                 if !unused {
@@ -2766,18 +2838,15 @@ impl Gen<'_> {
                     let b = self.fp(input(1), D31);
                     let w = self.gp_dst(n);
                     self.a.fcmp(a, b);
-                    // Unordered sets C and V and clears N and Z: of these only NE holds.
-                    let code = match cond {
-                        Cond::Lt => MI,
-                        Cond::Le => LS,
-                        Cond::Gt => GT,
-                        Cond::Ge => GE,
-                        Cond::Eq => EQ,
-                        Cond::Ne => NE,
-                    };
-                    self.a.cset_w(w, code);
+                    self.a.cset_w(w, f64_condition(*cond));
                     self.gp_done(n, w);
                 }
+            }
+            NodeOp::TaggedSame if self.fused[n.index()] => {
+                let a = self.gp(input(0), X16);
+                let b = self.gp(input(1), X17);
+                self.a.cmp_reg_x(a, b);
+                self.flags = Some(EQ);
             }
             NodeOp::TaggedSame => {
                 if !unused {
@@ -2788,6 +2857,9 @@ impl Gen<'_> {
                     self.a.cset_w(w, EQ);
                     self.gp_done(n, w);
                 }
+            }
+            NodeOp::BoolNot if self.fused[n.index()] => {
+                self.flags = Some(inverted(self.flags.expect("a fused test set the flags")));
             }
             NodeOp::BoolNot => {
                 if !unused {
@@ -3078,6 +3150,14 @@ impl Gen<'_> {
                 }
             }
             NodeOp::TypedElement { write } => self.lower_typed_element(n, *write)?,
+            NodeOp::IsTypedArray if self.fused[n.index()] => {
+                let cell = self.gp(input(0), X16);
+                let kind = self.layout.obj_from_cell + self.layout.obj_kind;
+                self.a.ldrb_imm(X17, cell, kind as u32);
+                self.a
+                    .cmp_imm_w(X17, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+                self.flags = Some(EQ);
+            }
             NodeOp::IsTypedArray => {
                 if !unused {
                     let cell = self.gp(input(0), X16);
@@ -3125,18 +3205,40 @@ impl Gen<'_> {
                 then_block,
                 else_block,
             } if self.fused[input(0).index()] => {
-                // The ShapeIs before it set the flags: EQ is its true.
+                // The test before it set the flags, `code` its true; nothing since wrote them
+                // (this position's span loads are loads, its edges' moves are out of line). The
+                // inverse of a condition holds on every flag state it does not, so after an
+                // unordered fcmp (NZCV 0011) a Number's order is false and its negation true.
+                let code = self.flags.take().expect("a fused test set the flags");
                 let then_label = self.edge_target(block, *then_block);
                 let else_label = self.edge_target(block, *else_block);
                 let then_direct = then_label == self.blocks[then_block.index()];
                 let else_direct = else_label == self.blocks[else_block.index()];
                 if next == Some(*else_block) && else_direct {
-                    self.a.b_cond(EQ, then_label);
+                    self.a.b_cond(code, then_label);
                 } else if next == Some(*then_block) && then_direct {
-                    self.a.b_cond(NE, else_label);
+                    self.a.b_cond(inverted(code), else_label);
                 } else {
-                    self.a.b_cond(EQ, then_label);
+                    self.a.b_cond(code, then_label);
                     self.a.b(else_label);
+                }
+            }
+            NodeOp::Branch {
+                then_block,
+                else_block,
+            } if matches!(graph.node(input(0)).op, NodeOp::ConstBool(_)) => {
+                // A constant's Branch is its edge's jump (the builder folds what it proves, not a
+                // constant it hoists), as Maglev's branch builder answers a constant with FromBool
+                // (BuildBranchIfRootConstant, maglev-graph-builder.cc:14975-14977) and B3's
+                // strength reduction turns Branch(constant) into a Jump (B3ReduceStrength.cpp:
+                // 3425-3439).
+                let NodeOp::ConstBool(value) = graph.node(input(0)).op else {
+                    unreachable!("a constant Boolean")
+                };
+                let target = if value { *then_block } else { *else_block };
+                let label = self.edge_target(block, target);
+                if next != Some(target) || label != self.blocks[target.index()] {
+                    self.a.b(label);
                 }
             }
             NodeOp::Branch {
@@ -3276,7 +3378,19 @@ impl Gen<'_> {
                 self.a.b_cond(NE, mismatch);
             }
         } else {
+            // A dead callee: the flags NE for a fused Branch, else straight to the 0.
+            if self.fused[n.index()] {
+                self.a.movz(X17, 0, 0);
+                self.a.cmp_imm_w(X17, 1);
+            }
             self.a.b(mismatch);
+        }
+        if self.fused[n.index()] {
+            // Every test is a compare whose EQ is a match and whose NE branched here: the flags
+            // hold the answer for the Branch after it, EQ the callee's.
+            self.a.bind(mismatch);
+            self.flags = Some(EQ);
+            return Ok(());
         }
         let w = self.gp_dst(n);
         self.a.movz(w, 1, 0);
