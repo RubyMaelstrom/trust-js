@@ -2356,9 +2356,35 @@ impl<'a> Builder<'a> {
         rep: Rep,
         pc: usize,
     ) -> NodeIx {
-        let node = self
-            .graph
-            .add_node_in(self.frame, block, op, inputs, rep, pc as u32);
+        // A phi input's boxing (F64ToTagged, I32ToTagged, BoolToTagged: a conversion, which reads
+        // no frame) is the frame's of the block's terminator: the caller's builder places it at
+        // the end of an inlined callee's return block, which may hold its jump alone (a return
+        // at a jump target that one live predecessor reaches), and a block's first pc is a pc of
+        // its first node's frame. A slot's load or store (FrameSlot, StoreSlot) is this frame's
+        // by meaning, placed only in this frame's blocks: a join's predecessors that are callees'
+        // returns share the caller's slots (`Builder::call`), so no slot differs there, and a
+        // back edge leaves this frame's own block.
+        let terminator = self.graph.blocks[block.index()]
+            .body
+            .last()
+            .map(|&last| (self.graph.node(last).frame, self.graph.node(last).pc));
+        let conversion = matches!(
+            op,
+            NodeOp::F64ToTagged | NodeOp::I32ToTagged | NodeOp::BoolToTagged
+        );
+        let (frame, pc) = match terminator {
+            // In another frame's block, the conversion is at its terminator's pc, a pc of that
+            // frame's chunk, as a node's pc must be.
+            Some((frame, at)) if conversion && frame != self.frame => (frame, at),
+            _ => {
+                debug_assert!(
+                    conversion || terminator.is_none_or(|(frame, _)| frame == self.frame),
+                    "{op:?} at the end of another frame's block"
+                );
+                (self.frame, pc as u32)
+            }
+        };
+        let node = self.graph.add_node_in(frame, block, op, inputs, rep, pc);
         let Graph { blocks, nodes, .. } = &mut self.graph;
         let body = &mut blocks[block.index()].body;
         body.pop();

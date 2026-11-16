@@ -4315,3 +4315,46 @@ fn an_error_at_the_end_poll_after_an_inlined_frames_new_names_the_frame() {
     );
     crate::jit::set_call_done_hook(false);
 }
+
+/// The tier on at graph, compiling at a settled checkpoint (not eagerly, which would compile a
+/// function before its feedback holds its callees and its blocks).
+fn settled_graph_switches() -> TestSwitches {
+    TestSwitches {
+        eager: false,
+        ..graph_switches(0)
+    }
+}
+
+// ---- the boxing of a phi input in a callee's block ---------------------------------------------
+
+/// `g`'s second `return r` starts a block (a jump target) that its one live predecessor reaches,
+/// and `c`'s phi of `g`'s two F64 returns takes them boxed: a boxing at the end of such a block
+/// is the block's frame's, at its terminator's pc. Under the debug engine this program's compile
+/// placed the boxing there; in this harness the graph takes another shape, so the test runs it
+/// under the verifier for its results only. The verifier's failure reproduces on Box2D at fixed 5
+/// (b2Distance), which the 5-run verifier sweep checks; no smaller program reproduced it here.
+const RETURN_BLOCK: &str = "
+function g(o, k) { var r; if (k > 0) r = o.x * 1.5; else r = o.y * 2.5; if (k > 5) return r + 1; return r; }
+function c(o, k) { return g(o, k) + 1; }
+var o = {x: 2, y: 3}; var u = 0;
+for (var i = 0; i < 20000; i++) u += c(o, 1 + (i & 7));
+u";
+
+#[test]
+fn a_callees_jump_only_return_block_takes_the_callers_boxing_in_its_frame() {
+    let expected = {
+        TestSwitches::default().set();
+        let mut off = jit_engine();
+        eval(&mut off, RETURN_BLOCK)
+    };
+    settled_graph_switches().set();
+    let mut engine = jit_engine();
+    // The test build verifies every graph and panics on a failure.
+    assert_eq!(eval(&mut engine, RETURN_BLOCK), expected);
+    assert!(super::in_place(&chunk_of(&mut engine, "c")), "c in place");
+    assert!(
+        ChunkProfile::get(&chunk_of(&mut engine, "c"))
+            .is_some_and(|profile| !profile.inline_ways().is_empty()),
+        "g inlined"
+    );
+}
