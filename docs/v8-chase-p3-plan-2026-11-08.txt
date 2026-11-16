@@ -5847,3 +5847,71 @@ Since the records above (2026-11-16):
   every field load and store adds its base before the access where the offset would fold
   into the address. The select of the offset where only the slot differs (SpiderMonkey's
   GuardMultipleShapesToOffset) waits for rule K: about 0.14% of GBEMU, less elsewhere.
+
+Landed since (2026-11-16; main 4bda8fbf):
+- The absent-index walk (8b9c2269; target/p3/stage3/index-miss-impl, report.txt; the lowerings'
+  agent's, found by the sparse read's count). A computed read of an array index that the
+  receiver's own elements do not answer walked the chain by the key's decimal text, twice
+  (ordinary_chain_get_data, then the general [[Get]]); it now walks an ordinary chain by the
+  index itself (Interp::ordinary_chain_get_index: the same objects and the same own lookup as
+  the text walk, an accessor or any other object leaving it to the general path), as V8's
+  LookupIterator walks holders by index (objects/lookup.cc:78-125), JSC's getPropertySlot asks
+  getOwnPropertySlotByIndex (runtime/JSObjectInlines.h:244-272) and SpiderMonkey's
+  NativeGetElement uses an integer id (vm/NativeObject.cpp:2322-2407). The miss 1,268 -> 583
+  instructions a read; a far key's hit and a dense read unchanged. TypeScript with the tier
+  off -0.34% at 5 runs (seven runs a side, the ranges apart) and -0.29% at 200; with the tier
+  on inside its spread; Octane's geomean -0.04% on and -0.02% off; Vue's steady state +0.10%
+  at both, attributed to Maps keyed by an object's address under another heap layout (the
+  read's own symbol is down). The tier's code identical (1,519 of 1,519 compiles). Tests: five
+  against Node's output (an index on a prototype as data, as a getter with the receiver, in a
+  prototype's words; a Proxy, a typed array, a String wrapper and an arguments object in the
+  chain; 4294967295 and 2^32, -0, 1.5 and "01" as keys; a chain changed between reads); five
+  mutations caught; zombie's check, clippy with tests, Windows' check and suite (2,893).
+- Step 3e's stage (b) (075700db; step3e-impl, the agent's report in step3f-impl/report.txt):
+  option B's rule. A way nested in a taken way that the graph cannot take (its callee makes a
+  spread call, an arguments-array call or a spread `new`) is a call node of the frame it is
+  nested in, the oracle declining it, and no longer a reason to splice the plan; a way of the
+  plan's own sites that the graph cannot take still splices it. In the workloads it builds
+  what stage (a) builds: the tier's code at graph identical for 1,368 of 1,368 compiles and
+  the template's for 2,026 of 2,026, counts inside their spread at 5 and 200 runs (mine at 5
+  runs the same). Direct eval and strict tail calls reach no plan (the planner marks them as
+  needing the call's context), which the test checks. Tests: such a way nested two deep, each
+  kind, compiled in place with a call node, under forced exits, collections at every
+  allocation and the poison; two mutations, the second caught only after an assertion was
+  added that no declined way reaches the builder.
+- A fix (4bda8fbf): a phi input's conversion placed at the end of another frame's block.
+  Since step 3e's stage (a) Box2D at graph failed the graph verifier once in a 5-run run
+  (`block 22 starts past the chunk`, its b2Distance): Builder::add_at_end gave every node it
+  placed the builder's own frame, and the caller's boxing of an inlined callee's float result
+  became the first node of that callee's return block where the block held its jump alone,
+  so the block read as the caller's at a callee's pc. A conversion (F64ToTagged, I32ToTagged,
+  BoolToTagged) now takes its block's terminator's frame and pc; a slot's load or store keeps
+  the builder's frame, which from the code is the only frame it is placed in (asserted in
+  debug builds). The bug needs no `new` and is older than the step that exposed it; release
+  builds run no verifier and compiled that graph, with equal output; the conversions have no
+  exit, call or allocation, so the label served the verifier alone and the tier's code is
+  unchanged (1,368 of 1,368 compiles at graph). No test smaller than Box2D at 5 runs fails
+  without the fix. The sweeps that reported every earlier step clean ran Octane at one fixed
+  run, where that function never reaches the compile: three of them, mine among them, passed
+  a tree that fails at five. The sweep now runs five fixed runs; on 4bda8fbf's binary it is
+  clean in 42 of 42 runs at both modes (mine), every refusal a `finally` or the size limit.
+- My checks of 075700db (the two landings above with part A's first commit): fat LTO, clippy;
+  the recount against d2f16daf at both modes within 0.15% (RayTrace +0.10% at every tier: by
+  its size the forwarder's position, two stores in each of its 332K constructs, not profiled;
+  part A's machine-code form replaces that path);
+  the whole library suite with the tier on, 3,586 passed, none failed, 10 ignored; the tier's
+  modules graph eager and graph forced, 643 each.
+- Piece B's design, decided (step3f-impl/design-note-B.txt): the candidates are the closures a
+  compiled function creates and passes directly to a call its plan inlines, under the
+  planner's rules unchanged (an arrow that observes `this`, `arguments` or new.target refused
+  as today); the way holds no guard, no callee pin and no folded environment; the frame's
+  callee is recovered from the frame, a word of the compiled frame's record written with the
+  closure at the inlined frame's entry, which the inline site names where it names a static
+  object today, as JSC's InlineCallFrame keeps a callee recovery that is not a constant for a
+  closure call (bytecode/InlineCallFrame.h:204-207) and Maglev's frame states hold the closure
+  as a value (maglev-ir.h:1455-1476); an exit is unchanged (its recipe reads the live
+  closure, whose allocation is kept).
+- The agent of steps 3b to 3e stopped with its context full (step3f-impl/report.txt); a new
+  agent continues its line from rule K (built and measured on an earlier base: DeltaBlue at
+  200 runs -3.43% at graph and -0.59% at the splice, 33 of 1,373 tier compiles changed at the
+  default), piece D (built, one test to redo), the flip's rehearsal and piece B.
