@@ -2257,21 +2257,27 @@ impl Gen<'_> {
     /// (property_shapes.rs), as V8, SpiderMonkey and JSC rely on after a map check; the
     /// baseline's check guards a stale cache, which a live-checked constant shape is not (the
     /// plan's Stage 1 record, "Shapes").
-    fn field_object(&mut self, cell: u32, obj: u32) {
-        self.a.add_imm(obj, cell, self.layout.obj_from_cell as u32);
-    }
-
-    /// The address base of a field whose location word is `location`, and the offset from it:
-    /// the Object for a slot in the cell, the record for one past it (W2d step 3; value.rs's
-    /// `location_word`). `obj` becomes the record pointer in the second case.
-    fn field_base(&mut self, obj: u32, location: u16) -> (u32, u32) {
+    /// The address of a field whose location word is `location` (W2d step 3; value.rs's
+    /// `location_word`) in the object of `cell`, as a base and an offset: the cell itself and the
+    /// slot's offset past the cell's start for a slot in the cell, the Object's offset in its cell
+    /// folded into the load's or store's immediate; the record, loaded into `record` from the
+    /// object, and the offset in it for a slot past the cell. Every offset in the cell fits the
+    /// scaled immediate (a cell is at most 192 bytes); `Asm::mem` takes any other in two.
+    /// Maglev's LoadTaggedField and SpiderMonkey's LoadFixedSlot address the object's own fields
+    /// from the object pointer with the field's offset as one immediate the same way.
+    fn field_address(&mut self, cell: u32, record: u32, location: u16) -> (u32, u32) {
+        let layout = self.layout;
         let offset = u32::from(location >> 1);
         if location & 1 != 0 {
-            let layout = self.layout;
-            self.a
-                .ldr_imm(obj, obj, (layout.obj_props + layout.props_record) as u32);
+            self.a.ldr_imm(
+                record,
+                cell,
+                (layout.obj_from_cell + layout.obj_props + layout.props_record) as u32,
+            );
+            (record, offset)
+        } else {
+            (cell, layout.obj_from_cell as u32 + offset)
         }
-        (obj, offset)
     }
 }
 
@@ -2439,16 +2445,20 @@ impl Gen<'_> {
                 self.a.ubfx(cell, word, 0, 48);
                 // As the baseline's property templates test a receiver (`emit_prop_way_probe`):
                 // an ordinary object whose IC-plain flag is set, then its shape.
+                // The Object's fields from the cell, its offset folded into each load's.
                 let layout = self.layout;
-                self.a.add_imm(X16, cell, layout.obj_from_cell as u32);
-                self.a.ldrb_imm(X17, X16, layout.obj_kind as u32);
+                let obj = layout.obj_from_cell;
+                self.a.ldrb_imm(X17, cell, (obj + layout.obj_kind) as u32);
                 self.a
                     .cmp_imm_w(X17, crate::value::KIND_ORDINARY_LAST as u32);
                 self.a.b_cond(HI, site);
-                self.a.ldrb_imm(X17, X16, layout.obj_flags as u32);
+                self.a.ldrb_imm(X17, cell, (obj + layout.obj_flags) as u32);
                 self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
-                self.a
-                    .ldr_w_imm(X17, X16, (layout.obj_props + layout.props_shape) as u32);
+                self.a.ldr_w_imm(
+                    X17,
+                    cell,
+                    (obj + layout.obj_props + layout.props_shape) as u32,
+                );
                 self.shape_compare(X17, shapes, site);
                 self.gp_done(n, cell);
             }
@@ -2467,20 +2477,22 @@ impl Gen<'_> {
                 // As the templates' hop (`emit_baked`): the [[Prototype]] read from the object,
                 // non-null, an ordinary kind, IC_PLAIN, then its shape.
                 let layout = self.layout;
+                let obj = layout.obj_from_cell;
                 let cell = self.gp(input(0), X16);
                 let proto = self.gp_dst(n);
-                self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
-                self.a.ldr_imm(proto, X17, layout.obj_proto as u32);
+                self.a.ldr_imm(proto, cell, (obj + layout.obj_proto) as u32);
                 self.a.cbz(proto, true, site);
-                self.a.add_imm(X16, proto, layout.obj_from_cell as u32);
-                self.a.ldrb_imm(X17, X16, layout.obj_kind as u32);
+                self.a.ldrb_imm(X17, proto, (obj + layout.obj_kind) as u32);
                 self.a
                     .cmp_imm_w(X17, crate::value::KIND_ORDINARY_LAST as u32);
                 self.a.b_cond(HI, site);
-                self.a.ldrb_imm(X17, X16, layout.obj_flags as u32);
+                self.a.ldrb_imm(X17, proto, (obj + layout.obj_flags) as u32);
                 self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
-                self.a
-                    .ldr_w_imm(X17, X16, (layout.obj_props + layout.props_shape) as u32);
+                self.a.ldr_w_imm(
+                    X17,
+                    proto,
+                    (obj + layout.obj_props + layout.props_shape) as u32,
+                );
                 self.shape_compare(X17, shapes, site);
                 self.gp_done(n, proto);
             }
@@ -2513,11 +2525,14 @@ impl Gen<'_> {
                 self.a
                     .ldr_imm(X17, 19, std::mem::offset_of!(JitCtx, interp) as u32);
                 self.a.ldr_imm(proto, X17, offset as u32);
-                self.a.add_imm(X16, proto, layout.obj_from_cell as u32);
-                self.a.ldrb_imm(X17, X16, layout.obj_flags as u32);
+                let obj = layout.obj_from_cell;
+                self.a.ldrb_imm(X17, proto, (obj + layout.obj_flags) as u32);
                 self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
-                self.a
-                    .ldr_w_imm(X17, X16, (layout.obj_props + layout.props_shape) as u32);
+                self.a.ldr_w_imm(
+                    X17,
+                    proto,
+                    (obj + layout.obj_props + layout.props_shape) as u32,
+                );
                 self.shape_compare(X17, shapes, site);
                 self.gp_done(n, proto);
             }
@@ -2527,9 +2542,8 @@ impl Gen<'_> {
                 // flags (its span loads are loads).
                 let layout = self.layout;
                 let cell = self.gp(input(0), X16);
-                self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
-                self.a
-                    .ldr_w_imm(X17, X17, (layout.obj_props + layout.props_shape) as u32);
+                let shape = layout.obj_from_cell + layout.obj_props + layout.props_shape;
+                self.a.ldr_w_imm(X17, cell, shape as u32);
                 for (k, &shape) in shapes.iter().enumerate() {
                     if k == 0 {
                         if shape < 4096 {
@@ -2552,9 +2566,8 @@ impl Gen<'_> {
                 if !unused {
                     let layout = self.layout;
                     let cell = self.gp(input(0), X16);
-                    self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
-                    self.a
-                        .ldr_w_imm(X17, X17, (layout.obj_props + layout.props_shape) as u32);
+                    let shape = layout.obj_from_cell + layout.obj_props + layout.props_shape;
+                    self.a.ldr_w_imm(X17, cell, shape as u32);
                     let dst = self.gp_dst(n);
                     let yes = self.a.new_label();
                     let done = self.a.new_label();
@@ -2920,8 +2933,7 @@ impl Gen<'_> {
             NodeOp::LoadField { location, .. } => {
                 if !unused {
                     let cell = self.gp(input(0), X16);
-                    self.field_object(cell, X17);
-                    let (base, offset) = self.field_base(X17, *location);
+                    let (base, offset) = self.field_address(cell, X17, *location);
                     let dst = self.gp_dst(n);
                     self.a.ldr_imm(dst, base, offset);
                     self.gp_done(n, dst);
@@ -2930,8 +2942,7 @@ impl Gen<'_> {
             NodeOp::StoreField { location, .. } => {
                 let cell = self.gp(input(0), X16);
                 let value = self.gp(input(1), X17);
-                self.field_object(cell, X9);
-                let (base, offset) = self.field_base(X9, *location);
+                let (base, offset) = self.field_address(cell, X9, *location);
                 self.a.str_imm(value, base, offset);
                 if !self.scalar_word(input(1)) {
                     // The receiver's card, after the store and before any safepoint, as the
@@ -2954,17 +2965,17 @@ impl Gen<'_> {
                     }));
                 }
                 let layout = self.layout;
+                let obj = layout.obj_from_cell;
                 let cell = self.gp(input(0), X16);
-                self.a.add_imm(X17, cell, layout.obj_from_cell as u32);
                 if hop {
                     // The chain's end: a null [[Prototype]], read from the object as the
                     // templates' hop reads it.
-                    self.a.ldr_imm(X16, X17, layout.obj_proto as u32);
+                    self.a.ldr_imm(X16, cell, (obj + layout.obj_proto) as u32);
                     self.a.cbnz(X16, true, site);
                 } else {
                     // As the template's creation probe (`emit_prop_create_probe`): extensible
                     // and no marked prototype.
-                    self.a.ldrb_imm(X16, X17, layout.obj_flags as u32);
+                    self.a.ldrb_imm(X16, cell, (obj + layout.obj_flags) as u32);
                     self.a
                         .tbz(X16, flag_bit(crate::value::FLAG_EXTENSIBLE), site);
                     self.a.tbnz(X16, flag_bit(crate::value::FLAG_PROTO), site);
@@ -3086,12 +3097,12 @@ impl Gen<'_> {
             NodeOp::StoreElement(mode) => self.lower_store_element(n, *mode)?,
             NodeOp::LoadArrayLength => {
                 if !unused {
-                    // Slot 0, an Array's first entry (`first_slot_addr`).
+                    // Slot 0, an Array's first entry (`first_slot_addr`), from the cell.
+                    let layout = self.layout;
                     let cell = self.gp(input(0), X16);
-                    self.a.add_imm(X17, cell, self.layout.obj_from_cell as u32);
-                    first_slot_addr(&mut self.a, self.layout, X17, X17);
+                    let slot0 = layout.obj_from_cell + layout.obj_props + layout.props_slots;
                     let dst = self.gp_dst(n);
-                    self.a.ldr_imm(dst, X17, 0);
+                    self.a.ldr_imm(dst, cell, slot0 as u32);
                     self.gp_done(n, dst);
                 }
             }
@@ -4568,8 +4579,11 @@ impl Gen<'_> {
         a.cmp_reg_w(X17, X30);
         a.b_cond(NE, slow);
         a.ubfx(X30, word, 0, 48);
-        a.add_imm(X30, X30, self.layout.obj_from_cell as u32);
-        a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+        a.ldrb_imm(
+            X30,
+            X30,
+            (self.layout.obj_from_cell + self.layout.obj_flags) as u32,
+        );
         a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         a.bind(truthy);
         a.movz(w, 1, 0);
@@ -4593,15 +4607,19 @@ impl Gen<'_> {
         self.gp_done(n, w);
     }
 
-    /// Branch to `not_object` unless `word` is an object's; otherwise x30 = its object's address
-    /// (the cell plus `obj_from_cell`), for its kind and flag bytes. Clobbers x17 and x30.
+    /// Branch to `not_object` unless `word` is an object's; otherwise x30 = its cell, whose
+    /// object's kind and flag bytes are at `obj_from_cell` past it. Clobbers x17 and x30.
     fn object_or(&mut self, word: u32, not_object: usize) {
         // The Object tag 0xfff9 is -7 as a signed half.
         self.a.asr_imm(X17, word, 48);
         self.a.cmn_imm_x(X17, 7);
         self.a.b_cond(NE, not_object);
         self.a.ubfx(X30, word, 0, 48);
-        self.a.add_imm(X30, X30, self.layout.obj_from_cell as u32);
+    }
+
+    /// The offset from an object's cell of its Object's byte at `field` (`obj_flags`, `obj_kind`).
+    fn object_byte(&self, field: usize) -> u32 {
+        (self.layout.obj_from_cell + field) as u32
     }
 
     /// NullOrLikeUndefined (P3 stage 3 step L1): undefined and null by `tag | 2`, an object whose
@@ -4624,7 +4642,8 @@ impl Gen<'_> {
         self.a.cmp_reg_w(X17, X30);
         self.a.b_cond(EQ, nullish);
         self.object_or(word, no);
-        self.a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+        self.a
+            .ldrb_imm(X30, X30, self.object_byte(self.layout.obj_flags));
         self.a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         self.a.bind(no);
         self.a.movz(w, 0, 0);
@@ -4716,8 +4735,8 @@ impl Gen<'_> {
     /// else to `slow`, the cold call that asks. Clobbers x30.
     fn htmldda_test(&mut self, word: u32, no: usize, slow: usize) {
         self.a.ubfx(X30, word, 0, 48);
-        self.a.add_imm(X30, X30, self.layout.obj_from_cell as u32);
-        self.a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+        self.a
+            .ldrb_imm(X30, X30, self.object_byte(self.layout.obj_flags));
         self.a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
         self.a.b(no);
     }
@@ -4784,7 +4803,7 @@ impl Gen<'_> {
         let proxy = u32::from(KIND_PROXY_TAG - KIND_CALLABLE_FIRST);
         // The object's kind tag less the first callable's: at most `callables` for a callable kind.
         let kind = |g: &mut Self| {
-            g.a.ldrb_imm(X17, X30, g.layout.obj_kind as u32);
+            g.a.ldrb_imm(X17, X30, g.object_byte(g.layout.obj_kind));
             g.a.sub_imm(X17, X17, u32::from(KIND_CALLABLE_FIRST));
         };
         match test {
@@ -4826,7 +4845,8 @@ impl Gen<'_> {
                 self.a.cmp_imm_x(X17, 1);
                 self.a.b_cond(LS, yes);
                 self.object_or(word, no);
-                self.a.ldrb_imm(X30, X30, self.layout.obj_flags as u32);
+                self.a
+                    .ldrb_imm(X30, X30, self.object_byte(self.layout.obj_flags));
                 self.a.tbz(X30, flag_bit(crate::value::FLAG_IC_PLAIN), slow);
                 self.a.b(no);
             }
@@ -4844,7 +4864,8 @@ impl Gen<'_> {
             }
             TypeofTest::Function => {
                 self.object_or(word, no);
-                self.a.ldrb_imm(X9, X30, self.layout.obj_flags as u32);
+                self.a
+                    .ldrb_imm(X9, X30, self.object_byte(self.layout.obj_flags));
                 kind(self);
                 self.a.cmp_imm_x(X17, proxy);
                 self.a.b_cond(EQ, slow);

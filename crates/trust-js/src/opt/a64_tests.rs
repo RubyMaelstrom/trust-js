@@ -2820,6 +2820,10 @@ fn a_branch_on_a_shape_test_takes_its_chain_of_compares_or_its_boolean() {
     };
     let (a, b) = (shape_of("geta"), shape_of("getb"));
     assert_ne!(a, b, "two shapes");
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let shape_at = layout.obj_from_cell + layout.obj_props + layout.props_shape;
+    let shape_load = encode(|asm| asm.ldr_w_imm(17, 0, shape_at as u32));
+    let any_base = !(31 << 5);
     let mut k = 0;
     for chain in chains(a, b) {
         for (named, then_next) in [(false, true), (false, false), (true, true), (true, false)] {
@@ -2832,6 +2836,12 @@ fn a_branch_on_a_shape_test_takes_its_chain_of_compares_or_its_boolean() {
             assert_eq!(fused_tests(&graph)[test], !named, "{chain:?}");
             let code = install(&mut engine, &format!("st{k}"), &graph, Options::default());
             let words = code_words(&code);
+            // The check's shape load and the test's own, each from the cell at the folded offset.
+            let loads = words
+                .iter()
+                .filter(|&&w| w & any_base == shape_load & any_base)
+                .count();
+            assert_eq!(loads, 2, "{chain:?}, named {named}: the shape loads");
             if !named {
                 for (place, &shape) in chain.iter().enumerate() {
                     let word = if place == 0 && shape < 4096 {
@@ -5383,6 +5393,203 @@ fn the_poison_switch_overwrites_the_stale_frame_words_before_a_generic_node() {
         assert_eq!(eval(&mut engine, "pz({a: 2}, nothing)"), "5");
         assert!(exits().is_empty(), "poison {poison}");
     }
+}
+
+/// The checks read an object's header bytes and shape from its cell with the Object's offset
+/// folded into each load (a64.rs's fold): for each function, as many kind, flag and shape loads at
+/// the folded offsets as its graph's checks make (CheckShape and CheckProto a kind, a flag and a
+/// shape each, CheckStringProto a flag and a shape, ShapeIs a shape; CheckCreatable a flag and
+/// CheckNoProto a [[Prototype]] into x16; the object paths of ToBoolean, `== null` and
+/// `typeof x === "undefined"` a flag into x30, an equality of objects and nullish values two (each
+/// operand's [[IsHTMLDDA]] test; its graph built by hand); `typeof x === "function"` a flag into
+/// x9 and, as `typeof x === "object"`, a kind), whatever the base register. Where a wrong offset reads a byte whose bits
+/// pass anyway (the kind test after the flag test, a creation's extensible bit) or sends the
+/// test to its cold call, which answers the same, only the code shows it.
+/// `eqo(a, b)` (LoadLocal 0, LoadLocal 1, Eq at pc 2, Return): each operand checked an object or
+/// nullish, their loose equality (ObjectOrNullishEqual) boxed, as the builder lowers an equality
+/// whose record holds such pairs.
+fn object_or_nullish_equal() -> Graph {
+    let mut b = Build::new(2);
+    let entry = b.block(0, false);
+    let x = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+    let y = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+    let at = b.state(2, &[x, y], &[], &[]);
+    for word in [x, y] {
+        b.exiting(
+            entry,
+            NodeOp::CheckObjectOrNullish,
+            &[word],
+            Rep::None,
+            2,
+            at,
+            ExitReason::NotObjectOrNullish,
+        );
+    }
+    let equal = b.node(entry, NodeOp::ObjectOrNullishEqual, &[x, y], Rep::Bool, 2);
+    let boxed = b.node(entry, NodeOp::BoolToTagged, &[equal], Rep::Tagged, 2);
+    b.node(entry, NodeOp::Return, &[boxed], Rep::None, 3);
+    b.g
+}
+
+/// For each of `names`' functions of `engine`, the loads of its tier code at the folded offsets
+/// against the nodes of its graph that make them (see the test), and the counts of those nodes:
+/// shape checks and hops, String prototype checks, shape tests, creation checks and chain ends,
+/// object tests into x30, `typeof x === "function"`, typeof's kind tests.
+fn folded_loads(engine: &mut Engine, names: &[&str]) -> Vec<[usize; 7]> {
+    use crate::value::TypeofTest;
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let obj = layout.obj_from_cell;
+    let any_base = !(31 << 5);
+    let kind = encode(|a| a.ldrb_imm(17, 0, (obj + layout.obj_kind) as u32));
+    let flags = encode(|a| a.ldrb_imm(17, 0, (obj + layout.obj_flags) as u32));
+    let shape =
+        encode(|a| a.ldr_w_imm(17, 0, (obj + layout.obj_props + layout.props_shape) as u32));
+    let creatable = encode(|a| a.ldrb_imm(16, 0, (obj + layout.obj_flags) as u32));
+    let chain_end = encode(|a| a.ldr_imm(16, 0, (obj + layout.obj_proto) as u32));
+    let plain = encode(|a| a.ldrb_imm(30, 0, (obj + layout.obj_flags) as u32));
+    let callable = encode(|a| a.ldrb_imm(9, 0, (obj + layout.obj_flags) as u32));
+    let mut seen = Vec::new();
+    for name in names {
+        let chunk = chunk_of(engine, name);
+        let snapshot = crate::opt::snapshot::Snapshot::take_in(&chunk, Some(&engine.interp));
+        let built = crate::opt::build::build(&chunk, &snapshot).expect("the tier builds it");
+        let count = |f: fn(&NodeOp) -> bool| built.graph.nodes.iter().filter(|n| f(&n.op)).count();
+        let checks =
+            count(|op| matches!(op, NodeOp::CheckShape { .. } | NodeOp::CheckProto { .. }));
+        let strings = count(|op| matches!(op, NodeOp::CheckStringProto { .. }));
+        let tests = count(|op| matches!(op, NodeOp::ShapeIs(_)));
+        let creations = count(|op| matches!(op, NodeOp::CheckCreatable { .. }));
+        let ends = count(|op| matches!(op, NodeOp::CheckNoProto { .. }));
+        let objects = count(|op| {
+            matches!(
+                op,
+                NodeOp::ToBoolean
+                    | NodeOp::NullOrLikeUndefined
+                    | NodeOp::TypeofIs(TypeofTest::Undefined)
+            )
+        });
+        let functions = count(|op| matches!(op, NodeOp::TypeofIs(TypeofTest::Function)));
+        let kinds = count(|op| {
+            matches!(
+                op,
+                NodeOp::TypeofIs(TypeofTest::Function | TypeofTest::Object)
+            )
+        });
+        let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
+        let code = compile_graph(&chunk, &built.graph, &layout, &ilayout, Options::default())
+            .unwrap_or_else(|refusal| panic!("the tier refused {name}: {refusal:?}"));
+        let words = code_words(&code);
+        let found = |word: u32| {
+            words
+                .iter()
+                .filter(|&&w| w & any_base == word & any_base)
+                .count()
+        };
+        assert_eq!(found(kind), checks + kinds, "{name}'s kind loads");
+        assert_eq!(found(flags), checks + strings, "{name}'s flag loads");
+        assert_eq!(
+            found(shape),
+            checks + strings + tests,
+            "{name}'s shape loads"
+        );
+        assert_eq!(found(creatable), creations, "{name}'s creation flag loads");
+        assert_eq!(found(chain_end), ends, "{name}'s chain end loads");
+        assert_eq!(found(plain), objects, "{name}'s object flag loads");
+        assert_eq!(found(callable), functions, "{name}'s callable flag loads");
+        seen.push([
+            checks,
+            strings,
+            tests,
+            creations + ends,
+            objects,
+            functions,
+            kinds,
+        ]);
+    }
+    seen
+}
+
+#[test]
+fn the_checks_read_the_objects_bytes_at_the_folded_offsets() {
+    let source = "function A() {} A.prototype.m = function () { return 3; };
+         function B() {} B.prototype = Object.create(A.prototype);
+         function S1() { this.x = 1; } function S2() { this.a = 0; this.x = 2; }
+         function fshape(o) { return o.x; }
+         function fproto(o) { return o.m; }
+         function fstr(s) { return s.charCodeAt; }
+         function fpoly(o) { return o.x; }
+         function PM(k) { this.x = k; this.y = k; }
+         function ftruthy(o) { return o ? 1 : 2; }
+         function fnull(o) { return o == null ? 1 : 2; }
+         function fund(o) { return typeof o === 'undefined' ? 1 : 2; }
+         function ffun(o) { return typeof o === 'function' ? 1 : 2; }
+         function fobj(o) { return typeof o === 'object' ? 1 : 2; }
+         var b = new B(), s1 = new S1(), s2 = new S2();
+         for (var k = 0; k < 30; k++) {
+           fshape(s1); fproto(b); fstr('ab'); fpoly(k & 1 ? s1 : s2); new PM(k);
+           ftruthy(k & 1 ? s1 : 0); fnull(k & 1 ? s1 : null);
+           fund(k & 1 ? s1 : undefined); ffun(k & 1 ? fshape : s1); fobj(k & 1 ? s1 : 1);
+         }";
+    // Warmed at the first stage, whose caches learn the constructor's creation ways.
+    crate::opt::TestSwitches {
+        on: false,
+        ..Default::default()
+    }
+    .set();
+    let seen = {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        eval(&mut engine, source);
+        folded_loads(
+            &mut engine,
+            &[
+                "fshape", "fproto", "fstr", "fpoly", "PM", "ftruthy", "fnull", "fund", "ffun",
+                "fobj",
+            ],
+        )
+    };
+    // Each form is there: a receiver's check, the prototype hops, the String prototype's, the
+    // polymorphic read's arm tests, a creation's checks, the object tests, typeof's three.
+    assert!(
+        seen[0][0] >= 1
+            && seen[1][0] >= 2
+            && seen[2][1] >= 1
+            && seen[3][2] >= 1
+            && seen[4][3] >= 1
+            && seen[5][4] >= 1
+            && seen[6][4] >= 1
+            && seen[7][4] >= 1
+            && seen[8][5] >= 1
+            && seen[9][6] >= 1,
+        "{seen:?}"
+    );
+    // An equality of objects and nullish values, its graph built by hand (the first engine is
+    // gone): each operand's [[IsHTMLDDA]] test reads the flag byte into x30.
+    let mut engine = fixture("function eqo(a, b) { return a == b; } eqo(1, 2);");
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let plain = encode(|a| a.ldrb_imm(30, 0, (layout.obj_from_cell + layout.obj_flags) as u32));
+    let code = install(
+        &mut engine,
+        "eqo",
+        &object_or_nullish_equal(),
+        Options::default(),
+    );
+    let loads = code_words(&code)
+        .iter()
+        .filter(|&&w| w & !(31 << 5) == plain & !(31 << 5))
+        .count();
+    assert_eq!(loads, 2, "the equality's object flag loads");
+    exits();
+    for (call, expected) in [
+        ("eqo(null, undefined)", "true"),
+        ("eqo({}, null)", "false"),
+        ("eqo(undefined, {})", "false"),
+        ("eqo({}, {})", "false"),
+        ("var o = {}; eqo(o, o)", "true"),
+    ] {
+        assert_eq!(eval(&mut engine, call), expected, "{call}");
+    }
+    assert!(exits().is_empty());
 }
 
 /// The poison switch before a canonical-frame effect (P3 stage 3 step 3a's follow-up): a function
