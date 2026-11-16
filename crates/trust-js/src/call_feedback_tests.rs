@@ -423,12 +423,20 @@ fn a_construct_site_of_fresh_constructors_pins_only_its_entry() {
             let pinned: Vec<usize> = chunk
                 .construct_pins
                 .iter()
-                .map(|pin| pin.borrow().as_ptr() as usize)
+                .map(|pins| pins.borrow()[0].as_ptr() as usize)
                 .filter(|&ptr| ptr != 0)
                 .collect();
             assert_eq!(
                 pinned, named,
                 "{maker} pins exactly its entry's constructor"
+            );
+            // No forwarder here: no initializer pinned (P3 stage 3 steps 6-7, part A2).
+            assert!(
+                chunk
+                    .construct_pins
+                    .iter()
+                    .all(|pins| pins.borrow()[1].as_ptr().is_null()),
+                "{maker} pins no initializer"
             );
             assert!(
                 chunk.call_pins.borrow().is_empty(),

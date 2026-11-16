@@ -15573,6 +15573,57 @@ impl Interp {
         false
     }
 
+    /// `chunk`'s (`func`'s) template code, made as a call at the JIT tier makes it
+    /// (`run_compiled_chunk`): once the function is admitted (`native_admitted`, which counts
+    /// this as a run) and executable capacity allows; None otherwise (P3 stage 3 steps 6-7, part
+    /// A2: a forwarder's initializer that the Rust forwarder runs as a plan never runs itself).
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    fn native_code_for(
+        &mut self,
+        func: &Function,
+        chunk: &crate::bytecode::Chunk,
+    ) -> Option<Rc<crate::jit::JitCode>> {
+        if let Some(Some(code)) = chunk.jit.get() {
+            return Some(code);
+        }
+        if !matches!(self.tier, crate::bytecode::Tier::Jit)
+            || func.run_once
+            || !self.native_admitted(func, chunk)
+        {
+            return None;
+        }
+        let permit = if chunk.jit.ready_to_compile()
+            && crate::jit::ensure_executable_capacity(chunk.jit_budget_wait_bytes.get())
+        {
+            chunk.jit.begin_compile()
+        } else {
+            None
+        }?;
+        let layout = *self
+            .jit_layout
+            .get_or_init(|| crate::value::jit_layout(&self.object_proto));
+        if !self.interp_layout.get().valid {
+            let l = interp_layout(self);
+            self.interp_layout.set(l);
+        }
+        match crate::jit::compile_profiled(chunk, &layout, &self.interp_layout.get()) {
+            crate::jit::JitCompileOutcome::Compiled(code) => {
+                chunk.jit_budget_wait_bytes.set(0);
+                permit.commit(Some(Rc::new(code)));
+            }
+            crate::jit::JitCompileOutcome::Deferred { required_bytes } => {
+                chunk.jit_budget_wait_bytes.set(required_bytes);
+            }
+            crate::jit::JitCompileOutcome::Unavailable => {
+                permit.commit(None);
+            }
+        }
+        chunk.jit.get().flatten()
+    }
+
     /// Run an already-compiled chunk (JIT or bytecode VM), saving/restoring the per-body engine
     /// flags (`strict`, `tco_ok`, field-init / async-gen-body markers). Shared by the lean
     /// [`call_user_inner`] path and the [`call_compiled_fast`] shortcut so they can't diverge.
@@ -17192,6 +17243,7 @@ impl Interp {
     /// native `Function.prototype.apply` call; the initializer's own call performs its normal
     /// step as well. `None` is a guard miss and has not consumed the arguments.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     unsafe fn construct_arguments_apply_forwarder(
         &mut self,
         chunk: &crate::bytecode::Chunk,
@@ -17199,6 +17251,10 @@ impl Interp {
         this_val: &Value,
         args: *const crate::value::Value,
         argc: usize,
+        // The construct site and its constructor (P3 stage 3 steps 6-7, part A2): where the
+        // forward form's entry is recorded.
+        site: Option<(&crate::bytecode::Chunk, u32)>,
+        constructor: usize,
     ) -> Option<Result<Value, Abrupt>> {
         let (initializer_name, initializer_key, initializer_cache, apply_cache, call_position) =
             chunk.jit_arguments_apply_forwarder()?;
@@ -17297,6 +17353,30 @@ impl Interp {
             }
         };
 
+        // The site's forward form (part A2): this construction's initializer and apply, proven
+        // above, recorded with their proofs, so that the next ones enter the initializer's code
+        // from the direct construct sequence.
+        #[cfg(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        ))]
+        let forward_live = self.fill_construct_forward(
+            site,
+            constructor,
+            this,
+            initializer_name,
+            initializer_obj,
+            apply_obj,
+            call_position,
+        );
+        #[cfg(not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )))]
+        let forward_live = {
+            let _ = (site, constructor);
+            false
+        };
         let plan_shapes = initializer_plan.as_ref().and_then(|initializer_chunk| {
             let plan = initializer_chunk
                 .jit_initializer_plan()
@@ -17354,6 +17434,25 @@ impl Interp {
                 ));
             }
 
+            // Where the site's forward form is live (part A2), it enters the initializer's code
+            // and counts toward the code's inline checkpoints, leaving the count that reaches
+            // one to the helper, as the direct call sequence does: this construction, the plan
+            // standing for that code, counts as an entry of it (`note_native_entry`), so that
+            // the checkpoint passes and the forward form runs again.
+            if forward_live && initializer_chunk.inline_retry_at.get() != 0 {
+                let initializer_func = match &initializer_obj.borrow().kind {
+                    ObjectKind::User(user) => Some(Rc::as_ptr(&user.func)),
+                    _ => None,
+                };
+                if let Some(func) = initializer_func {
+                    self.note_native_entry(
+                        func,
+                        initializer_chunk,
+                        Gc::as_ptr(&self.global) as usize,
+                        Env::as_ptr(&self.global_env) as usize,
+                    );
+                }
+            }
             let plan = initializer_chunk
                 .jit_initializer_plan()
                 .expect("initializer plan checked above");
@@ -17453,6 +17552,190 @@ impl Interp {
         Some(result.map(|_| Value::Undefined))
     }
 
+    /// Record construct site `site`'s forward entry (P3 stage 3 steps 6-7, part A2;
+    /// `bytecode::ForwardEntry`), its entry naming the forwarder `constructor`, whose
+    /// construction made `this` and proved `initializer` (`this.<initializer_name>`) and `apply`
+    /// (its `apply`, %Function.prototype.apply%); `position` is the forwarding call's. Nothing
+    /// where the entry already holds a live forward entry, names another constructor or is not the
+    /// live epoch's, or where a proof the forward form makes by identity does not hold: the
+    /// initializer an own data property of the instance's [[Prototype]] P (an ordinary object of a
+    /// cacheable shape); the initializer an ordinary same-Realm function, neither an arrow, a
+    /// generator, an async function nor a class, outside `with`, with machine code a direct call
+    /// can enter, of a cacheable shape without an own `apply`, whose [[Prototype]] is an
+    /// ordinary object of a cacheable shape holding `apply` as an own data property. Whether the
+    /// site holds a live forward entry for `constructor` now.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    #[allow(clippy::too_many_arguments)]
+    fn fill_construct_forward(
+        &mut self,
+        site: Option<(&crate::bytecode::Chunk, u32)>,
+        constructor: usize,
+        this: &Gc,
+        initializer_name: &str,
+        initializer: &Gc,
+        apply: &Gc,
+        position: u32,
+    ) -> bool {
+        let Some((site_chunk, cache)) = site else {
+            return false;
+        };
+        let epoch = crate::bytecode::CALL_IC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+        let initializer_ptr = Gc::as_ptr(initializer) as usize;
+        // The entry's state, read in place: Some(live) where the fill has nothing to do.
+        let settled = site_chunk.with_construct_cache(cache, |entry| {
+            if epoch == u32::MAX || entry.call.callee != constructor || entry.call.epoch != epoch {
+                return Some(false);
+            }
+            if entry.call.direct & crate::bytecode::CALL_IC_FORWARD != 0 {
+                // The forward form declined for a cause of its own (a failed proof clears the
+                // bit), unless its initializer's entry went stale, which a refill renews.
+                let live = entry.forward.init.epoch == epoch
+                    && entry.forward.init.callee == initializer_ptr
+                    && !unsafe { crate::bytecode::entry_stale(&entry.forward.init) };
+                return live.then_some(true);
+            }
+            (entry.forward.refused == initializer_ptr && entry.forward.refused_epoch == epoch)
+                .then_some(false)
+        });
+        if let Some(live) = settled {
+            return live;
+        }
+        // A proof that fails here fails until the program changes what it reads: the refusal is
+        // recorded (`ForwardEntry::refused`), so that the Rust forwarder's next constructions
+        // skip this work.
+        let refuse = || {
+            site_chunk.refuse_construct_forward(cache, initializer_ptr, epoch);
+            false
+        };
+        if !matches!(&apply.borrow().kind, ObjectKind::Native(native)
+            if *native as usize == crate::builtins::nf_function_apply as *const () as usize)
+        {
+            return refuse();
+        }
+        let cacheable = |object: &crate::value::Object| {
+            object.ic_plain() && crate::value::is_cacheable_shape(object.props.shape())
+        };
+        let data_slot = |object: &crate::value::Object, name: &str, value: &Gc| -> Option<u32> {
+            let slot = object.props.slot_of(name)?;
+            let property = object.props.slot_at(slot)?;
+            if property.accessor() {
+                return None;
+            }
+            match (property.value()).view() {
+                ValueView::Obj(found) if Gc::as_ptr(&found) == Gc::as_ptr(value) => {
+                    u32::try_from(slot).ok()
+                }
+                _ => None,
+            }
+        };
+        let Some(proto) = this.borrow().proto else {
+            return refuse();
+        };
+        let (prototype_shape, initializer_slot) = {
+            let b = proto.borrow();
+            if !cacheable(&b) {
+                return refuse();
+            }
+            let Some(slot) = data_slot(&b, initializer_name, initializer) else {
+                return refuse();
+            };
+            (b.props.shape(), slot)
+        };
+        let (func, env, initializer_shape, apply_holder) = {
+            let b = initializer.borrow();
+            let ObjectKind::User(user) = &b.kind else {
+                return refuse();
+            };
+            if !cacheable(&b)
+                || user.realm != Gc::as_ptr(&self.global) as usize
+                || b.class_kind() != 0
+                || b.props.slot_of("apply").is_some()
+            {
+                return refuse();
+            }
+            let Some(holder) = b.proto else {
+                return refuse();
+            };
+            (user.func.clone(), user.env, b.props.shape(), holder)
+        };
+        if func.is_arrow || func.is_generator || func.is_async || env.borrow().under_with() {
+            return refuse();
+        }
+        let (apply_holder_shape, apply_slot) = {
+            let b = apply_holder.borrow();
+            if !cacheable(&b) {
+                return refuse();
+            }
+            let Some(slot) = data_slot(&b, "apply", apply) else {
+                return refuse();
+            };
+            (b.props.shape(), slot)
+        };
+        let runtime = func.runtime();
+        let genv = Env::as_ptr(&self.global_env) as usize;
+        // Not yet compiled (the construction calls it below, which compiles it) or not yet
+        // admitted to machine code: the fill waits, recording nothing.
+        let Some(Some(init_chunk)) = runtime.execution_code_for(genv) else {
+            return false;
+        };
+        if init_chunk.has_tail_calls() || init_chunk.prepared_entry {
+            return refuse();
+        }
+        // A field-plan initializer never runs as code (the Rust forwarder runs its plan): each
+        // forwarded construction counts as a run of it, toward its native admission, as a call
+        // counts (`native_admitted`), and makes its template code once admitted.
+        let Some(code) = self.native_code_for(&func, init_chunk) else {
+            return false;
+        };
+        let (n_params, n_slots) = init_chunk.jit_frame();
+        let (Ok(n_params), Ok(n_slots)) = (u16::try_from(n_params), u16::try_from(n_slots)) else {
+            return refuse();
+        };
+        let init = crate::bytecode::CallIc {
+            callee: Gc::as_ptr(initializer) as usize,
+            env: Env::as_ptr(&env),
+            chunk: init_chunk as *const Rc<crate::bytecode::Chunk>,
+            code: Rc::as_ptr(&code),
+            global_env: genv,
+            strict: func.is_strict,
+            uses_this: init_chunk.needs_frame_this(),
+            n_params,
+            n_slots,
+            direct: init_chunk.jit_direct_flags(&code)
+                | (((init_chunk.inline_attempted.get() || func.runtime().code2.get().is_some())
+                    as u8)
+                    << 2),
+            func: Rc::as_ptr(&func),
+            epoch,
+            entry: u32::from(init_chunk.entry_word()),
+            chunk_raw: Rc::as_ptr(init_chunk),
+            code_mem: code.mem_ptr(),
+            pc_offs_ptr: code.pc_offsets_ptr(),
+            native: 0,
+            intrinsic: 0,
+            native_stub: 0,
+            builtin: 0,
+            realm: Gc::as_ptr(&self.global) as usize,
+        };
+        let forward = crate::bytecode::ForwardEntry {
+            init,
+            prototype_shape,
+            initializer_slot,
+            initializer_shape,
+            apply_holder_shape,
+            apply_slot,
+            position,
+            apply: Gc::as_ptr(apply) as usize,
+            refused_epoch: u32::MAX,
+            refused: 0,
+        };
+        site_chunk.fill_construct_forward(cache, constructor, forward, &Gc::downgrade(initializer));
+        true
+    }
+
     /// The identity-cached JIT construct (`Op::New` with a plain, same-realm compiled function
     /// or base class constructor): replicates `construct` → `construct_dispatch`'s
     /// observable effects for that case — IsConstructor, prototype read (LIVE, each time:
@@ -17493,7 +17776,13 @@ impl Interp {
         // changed in place (its entry word, P3 stage 2 step 14): the fill below refills both
         // caches with the constructor's current code.
         let cached_site = site
-            .map(|(chunk, cache)| chunk.construct_cache(cache))
+            .map(|(chunk, cache)| {
+                // The entry's head: its forward entry (part A2) is the forward form's alone.
+                chunk.with_construct_cache(cache, |entry| crate::bytecode::ConstructSite {
+                    forward: crate::bytecode::ForwardEntry::EMPTY,
+                    ..*entry
+                })
+            })
             .filter(|entry| {
                 entry.call.callee == key
                     && entry.call.epoch == epoch
@@ -17580,6 +17869,9 @@ impl Interp {
                         prototype_shape,
                         prototype_slot,
                         arguments_apply_forwarder,
+                        // A forwarder's entry is recorded by its first construction through it
+                        // (`fill_construct_forward`), below.
+                        forward: crate::bytecode::ForwardEntry::EMPTY,
                     },
                     &entry.pin,
                 );
@@ -17767,7 +18059,9 @@ impl Interp {
         let mut r = with_execution_stack(self.depth, || {
             let forwarded = arguments_apply_forwarder
                 .then(|| unsafe {
-                    self.construct_arguments_apply_forwarder(chunk, &this, &this_val, args, argc)
+                    self.construct_arguments_apply_forwarder(
+                        chunk, &this, &this_val, args, argc, site, key,
+                    )
                 })
                 .flatten();
             if let Some(r) = forwarded {

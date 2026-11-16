@@ -13022,6 +13022,18 @@ enum DirectForm {
     /// comes first, and the sequence allocates the callee's `this` (see
     /// [`emit_direct_construct`]).
     Construct,
+    /// [[Construct]] of a recognized forwarder, `this.<initializer>.apply(this, arguments)` (P3
+    /// stage 3 steps 6-7, part A2; `bytecode::CALL_IC_FORWARD`), entered from the construct
+    /// form's gate of the entry's bit 0 with x12 the site's construct cache and x10 the
+    /// forwarder's cell: the sequence proves the initializer and allocates the instance by
+    /// H_CONSTRUCT_THIS (`bytecode::jit_construct_this`, which takes an entry with the bit to
+    /// `bytecode::forward_this`), pushes the forwarder's [[Construct]] frame
+    /// at the site's position and the elided apply's depth, and enters the initializer's code as
+    /// a [[Call]] with the instance as `this` and the site's arguments (the site's
+    /// `ForwardEntry::init` its `CallIc`, its frame at the forwarding call's position), whose
+    /// completion it drops: the construction's result is the instance, as the forwarder returns
+    /// undefined.
+    Forward,
 }
 
 /// The direct JIT→JIT call sequence: [`emit_direct_sequence`]'s [[Call]] form, emitted after a
@@ -13114,7 +13126,12 @@ fn emit_direct_sequence(
     let (with_this, construct) = match form {
         DirectForm::Call { with_this } => (with_this, false),
         DirectForm::Construct => (false, true),
+        DirectForm::Forward => (false, false),
     };
+    // A forwarder's construction (part A2): a [[Call]] of the initializer that allocates and
+    // binds its instance as a construction does.
+    let forward = form == DirectForm::Forward;
+    let allocates = construct || forward;
     let fits8 = |o: usize| o & 7 == 0 && o / 8 < 4096;
     let il = ilayout;
     const IC_ENV: i32 = 8;
@@ -13146,12 +13163,25 @@ fn emit_direct_sequence(
     // The code-keyed probe is emitted only under these conditions (see `emit_call_code_probe`);
     // without it every hit is an identity hit and the way's recorded environment is the callee's.
     // A construct site's single entry is keyed by identity alone.
-    let call_env_from_callee = !construct
+    let call_env_from_callee = !allocates
         && layout.call_probe_valid
         && fits8(layout.obj_from_cell + layout.obj_kind + 8)
         && fits8(layout.user_env);
 
     // ---- checks (entry state: x12 = ic0 ptr, x10 = callee cell address; NO mutations) ----
+    if forward {
+        // The forward form (part A2): x12 is the site's construct cache and x10 the forwarder's
+        // cell, w15 the live epoch (the construct probe's). The initializer's entry is the live
+        // epoch's (its code and runtime alive), and from here on x12 is that entry and x10 the
+        // initializer's cell, as a call site's way and callee; the site lies at x12 -
+        // FORWARD_INIT_OFF.
+        let init = crate::bytecode::FORWARD_INIT_OFF as u32;
+        a.ldr_w_imm(11, 12, init + IC_EPOCH as u32);
+        a.cmp_reg_w(11, 15);
+        a.b_cond(C_NE, hit_slow);
+        a.add_imm(12, 12, init);
+        a.ldr_imm(10, 12, 0); // init.callee
+    }
     // The static gates (a compiled entry whose frame fits, the global body it needs, a sloppy
     // callee's object receiver) fold into one bit at fill (`CALL_IC_DIRECT_READY`). An entry
     // without it checks them one by one after the sequence, then rejoins here.
@@ -13165,10 +13195,11 @@ fn emit_direct_sequence(
     // x4 = the callee's chunk, kept for the retry gate below.
     let compares_entry = a.compares_entry_words();
     a.ldur(4, 12, IC_CHUNK_RAW);
-    if !construct {
+    if !allocates {
         // recompile settled (live chunk byte — see attempted_off). A construct waits for no
         // attempt: it counts from its first run (below), and its code's first checkpoint is
-        // that attempt.
+        // that attempt. So does a forwarder's initializer, which the Rust forwarder may never
+        // call (it runs a field plan in its place), so that it would wait for ever.
         a.ldrb_imm(11, 4, attempted_off as u32);
         a.cbz(11, false, hit_slow);
     }
@@ -13203,7 +13234,13 @@ fn emit_direct_sequence(
     // (see the prologue), after this call has committed.
     a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
     a.ldr_imm(17, 14, (il.fn_frames + il.fnf_cap_word) as u32);
-    a.cmp_reg_x(16, 17);
+    if forward {
+        // Room for two frames: the forwarder's and the initializer's.
+        a.add_imm(13, 16, 1);
+        a.cmp_reg_x(13, 17);
+    } else {
+        a.cmp_reg_x(16, 17);
+    }
     a.b_cond(C_HS, hit_slow);
     a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
     a.cbz(7, true, hit_slow);
@@ -13275,6 +13312,38 @@ fn emit_direct_sequence(
         a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
         a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
     }
+    if forward {
+        // The forwarder's instance, by H_CONSTRUCT_THIS, whose helper takes an entry with
+        // CALL_IC_FORWARD (the construct form's never has it) to `bytecode::forward_this`: it
+        // proves the initializer and %Function.prototype.apply% and allocates the instance, or
+        // declines with nothing allocated. A helper of its own would move every field after the
+        // helper table in `Interp` (`jit_helpers`), and so every caller's code that reads one. It runs no author code and collects nothing, so
+        // every check above still holds after it. x2 = the instance, which the initializer's
+        // record and the save area root from the run on; until then no safepoint is reached.
+        let keep_return = matches!(call_site, DirectCallSite::AfterReturn);
+        if keep_return {
+            a.stp_pre(12, 10, -32);
+            a.str_imm(30, 31, 16);
+        } else {
+            a.stp_pre(12, 10, -16);
+        }
+        a.sub_imm(0, 12, crate::bytecode::FORWARD_INIT_OFF as u32); // the site
+        a.ldr_imm(1, 0, 0); // the forwarder's cell (site.call.callee)
+        a.ldr_imm(16, 21, (H_CONSTRUCT_THIS * 8) as u32);
+        a.blr(16);
+        if keep_return {
+            a.ldr_imm(30, 31, 16);
+            a.ldp_post(12, 10, 32);
+        } else {
+            a.ldp_post(12, 10, 16);
+        }
+        a.cbz(0, true, uncount);
+        a.mov(2, 0);
+        a.ldr_imm(14, 19, 72);
+        a.ldr_w_imm(11, 14, il.depth as u32);
+        a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
+        a.ldr_imm(7, 14, (il.frame_pool + il.fp_len_word) as u32);
+    }
 
     // x13 = the callee's [[Environment]] (`Env::as_ptr`), kept until the install below. An
     // identity hit's way recorded exactly this closure's environment; a code-keyed hit
@@ -13306,6 +13375,37 @@ fn emit_direct_sequence(
         a.add_imm(5, 5, 1);
         a.str_imm(5, 4, 0);
     }
+    if forward {
+        // The forwarder's own frame first (part A2), a [[Construct]] frame at the site's
+        // position, as the Rust path's (`Interp::construct_jit_fast`), and the depth of it and of
+        // the elided apply (`Interp::construct_arguments_apply_forwarder`); the initializer's
+        // frame and depth follow as a call's.
+        let init = crate::bytecode::FORWARD_INIT_OFF as i32;
+        a.ldr_imm(6, 14, (il.fn_frames + il.fnf_ptr_word) as u32);
+        a.movz(5, 24, 0);
+        a.madd(6, 16, 5, 6);
+        a.ldur(5, 12, -init); // the forwarder's identity (site.call.callee)
+        a.stur(5, 6, 0);
+        match call_site {
+            DirectCallSite::Position(position) => {
+                a.movz(5, position & 0xffff, 0);
+                if position >> 16 != 0 {
+                    a.movk(5, position >> 16, 1);
+                }
+            }
+            // Nothing has called out of this sequence yet but the helper, around which x30 was
+            // kept: x30 is the site's return address.
+            DirectCallSite::AfterReturn => a.ldr_w_imm(5, 30, 8),
+            DirectCallSite::Register(_) => unreachable!("a construction's position is the site's"),
+        }
+        a.str_w_imm(5, 6, 8);
+        a.ldurb(5, 12, IC_STRICT as i32 - init); // the forwarder's strictness
+        a.logic_imm_w(1, 5, 5, asm::logical_imm_w(1 << 8).unwrap()); // and construct
+        a.sturh(5, 6, 12);
+        a.stur(31, 6, 16); // extra = None
+        a.add_imm(16, 16, 1);
+        a.add_imm(11, 11, 2);
+    }
     // The callee's code is entered: its CLOCK reference word takes this site's call-cache address,
     // a nonzero word (`JitCode::referenced`).
     a.ldur(4, 12, IC_CODE);
@@ -13317,21 +13417,26 @@ fn emit_direct_sequence(
     a.movz(5, 24, 0);
     a.madd(6, 16, 5, 6);
     a.stur(10, 6, 0); // fn_ptr = the callee's as_ptr identity
-    match call_site {
-        DirectCallSite::Position(position) => {
-            a.movz(5, position & 0xffff, 0);
-            if position >> 16 != 0 {
-                a.movk(5, position >> 16, 1);
+    if forward {
+        // The initializer's frame, called from the forwarder body's forwarding call.
+        a.ldr_w_imm(5, 12, crate::bytecode::FORWARD_POSITION_FROM_INIT as u32);
+    } else {
+        match call_site {
+            DirectCallSite::Position(position) => {
+                a.movz(5, position & 0xffff, 0);
+                if position >> 16 != 0 {
+                    a.movk(5, position >> 16, 1);
+                }
             }
-        }
-        // Nothing has called out of this sequence yet: x30 is still the site's return address.
-        DirectCallSite::AfterReturn => a.ldr_w_imm(5, 30, 8),
-        DirectCallSite::Register(register) => {
-            debug_assert!(
-                register <= 3 && !construct,
-                "a [[Call]] keeps x0-x3 until here"
-            );
-            a.mov_w(5, register);
+            // Nothing has called out of this sequence yet: x30 is still the site's return address.
+            DirectCallSite::AfterReturn => a.ldr_w_imm(5, 30, 8),
+            DirectCallSite::Register(register) => {
+                debug_assert!(
+                    register <= 3 && !construct,
+                    "a [[Call]] keeps x0-x3 until here"
+                );
+                a.mov_w(5, register);
+            }
         }
     }
     a.str_w_imm(5, 6, 8); // call_site
@@ -13437,7 +13542,7 @@ fn emit_direct_sequence(
         }
         a.str_imm(4, 9, 48);
     }
-    if construct {
+    if allocates {
         // OrdinaryCallBindThis: the instance is the callee's `this` in either mode (ToObject of
         // an Object is itself). An active record's context is traced, so its [48] also roots
         // the instance while the callee runs.
@@ -13527,6 +13632,13 @@ fn emit_direct_sequence(
         a.ldr_imm(14, 19, 72); // ctx.interp (x14 was clobbered by the callee/helpers)
         a.mov_imm64(4, crate::value::PACK_UNDEFINED);
         a.str_imm(4, 14, il.new_target as u32);
+    } else if forward {
+        // The initializer runs as a [[Call]]: this caller state is already its (not
+        // constructing, no NewTarget). The save area keeps [record, the instance], which roots it
+        // on the scanned native stack while the initializer runs and gives it back as the result.
+        a.stp_pre(9, 2, -16);
+        run_and_finish(a, &|a| a.ldr_imm(10, 31, 0));
+        a.ldp_post(10, 11, 16); // x11 = the instance
     } else {
         a.stp_pre(9, 31, -16); // [record, zero]: the pad cannot retain a stale conservative root
         run_and_finish(a, &|a| a.ldp_post(10, 11, 16));
@@ -13537,6 +13649,18 @@ fn emit_direct_sequence(
     // threw ----
     let popped = ((argc + 1 + with_this as usize) * 8) as u32;
     a.sub_imm(20, 20, popped);
+    if forward {
+        // The forwarder's frame and its and the elided apply's depth, before the throw's dispatch,
+        // so that an unwind finds the frames the Rust path leaves (the finish stub popped the
+        // initializer's). w8 (threw) and x11 (the instance) survive.
+        a.ldr_imm(14, 19, 72);
+        a.ldr_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
+        a.sub_imm(16, 16, 1);
+        a.str_imm(16, 14, (il.fn_frames + il.fnf_len_word) as u32);
+        a.ldr_w_imm(6, 14, il.depth as u32);
+        a.sub_imm(6, 6, 2);
+        a.str_w_imm(6, 14, il.depth as u32);
+    }
     #[cfg(test)]
     {
         let normal = a.new_label();
@@ -13549,7 +13673,12 @@ fn emit_direct_sequence(
         a.bind(normal);
     }
     a.cbnz(8, true, l_unwind); // threw → caller unwind (fields restored)
-                               // x2 = the completion word the finish stub took out; no decode/encode.
+    if forward {
+        // The forwarder returns undefined: the construction's result is its instance, whatever
+        // the initializer returned.
+        a.mov(2, 11);
+    }
+    // x2 = the completion word the finish stub took out; no decode/encode.
     if construct {
         // [[Construct]]'s result (ECMA-262 steps 12-13): the body's completion if it is an
         // Object, else `this` (x11, back from the save area).
@@ -13564,6 +13693,8 @@ fn emit_direct_sequence(
     {
         let record: extern "C" fn() = if construct {
             record_direct_construct
+        } else if forward {
+            record_direct_forward
         } else {
             record_direct_packed_return
         };
@@ -13586,7 +13717,7 @@ fn emit_direct_sequence(
         a.add_imm(5, 5, 1);
         a.str_imm(5, 4, 0);
     }
-    if construct {
+    if allocates {
         a.sub_imm(31, 31, 32);
         a.stp_base(9, 2, 31, 0);
         let (construct_base, construct_offset) = byte_field_address(a, 14, il.constructing, 16);
@@ -13594,7 +13725,12 @@ fn emit_direct_sequence(
         a.ldr_imm(5, 14, il.new_target as u32);
         a.stp_base(4, 5, 31, 16);
         a.strb_imm(31, construct_base, construct_offset);
-        new_target_word(a, 4);
+        if forward {
+            // The initializer's [[Call]]: no NewTarget (it is not an arrow: the fill refuses one).
+            a.mov_imm64(4, crate::value::PACK_UNDEFINED);
+        } else {
+            new_target_word(a, 4);
+        }
         a.str_imm(4, 14, il.new_target as u32);
         run_and_finish(a, &|a| a.ldr_imm(10, 31, 0));
         a.ldr_imm(11, 31, 8); // this
@@ -13638,7 +13774,7 @@ fn emit_direct_sequence(
 
     // ---- a declined allocation: the retry gate's count is taken back (the helper counts the
     // construction it makes), then the helper ----
-    if construct {
+    if allocates {
         a.bind(uncount);
         a.ldur(4, 12, IC_CHUNK_RAW);
         a.ldr_w_imm(5, 4, retry_off as u32);
@@ -13651,9 +13787,13 @@ fn emit_direct_sequence(
 
     // ---- the static gates one by one (w9 = the entry's direct bits) ----
     a.bind(static_gates);
+    // A construction's entry without bit 0 may be a recognized forwarder's (part A2): its test is
+    // on the bit-0 branch's target alone, so that an entry with bit 0 (READY off for another
+    // gate, needs_global say) pays nothing for it.
     let field1b = asm::logical_imm_w(1).unwrap();
     a.logic_imm_w(0, 11, 9, field1b); // bit 0: a compiled user-code entry, no force resets
-    a.cbz(11, false, hit_slow);
+    let forward_try = construct.then(|| a.new_label());
+    a.cbz(11, false, forward_try.unwrap_or(hit_slow));
     let field8 = asm::logical_imm_w(8).unwrap();
     a.logic_imm_w(0, 11, 9, field8); // bit 3: frame fits FRAME_BUF
     a.cbz(11, false, hit_slow);
@@ -13666,8 +13806,9 @@ fn emit_direct_sequence(
     a.cbz(11, true, hit_slow);
     a.bind(no_glob);
     // this binding: a this-using SLOPPY callee needs boxing/global fallback unless the
-    // incoming receiver is already an object. A construct's `this` is its new instance.
-    if construct {
+    // incoming receiver is already an object. A construct's `this` is its new instance, and so is
+    // a forwarder's initializer's.
+    if allocates {
         a.b(static_done);
     } else {
         a.ldrb_imm(9, 12, IC_USES_THIS);
@@ -13681,6 +13822,54 @@ fn emit_direct_sequence(
             a.b(static_done);
         } else {
             a.b(hit_slow); // no receiver + sloppy this-user: global boxing → generic
+        }
+    }
+
+    // ---- a recognized forwarder's construction (part A2; `bytecode::CALL_IC_FORWARD`, bit 4 of
+    // w9): the forward form, or the helper ----
+    if let Some(forward_try) = forward_try {
+        a.bind(forward_try);
+        a.tbz(9, 4, hit_slow);
+        match call_site {
+            // An in-line site: the construct stub holds the forward form, which its own gates
+            // reach as these do; entered as a cold site enters the stub (its position after the
+            // return), its landings this sequence's.
+            DirectCallSite::Position(position) if shared_stubs_enabled() => {
+                let stub = a.shared_stub(SharedStub::DirectConstruct { argc: argc as u8 }.key());
+                a.bl_label(stub);
+                let not_returned = a.new_label();
+                const _: () = assert!(DIRECT_CALL_RETURNED == 0);
+                a.cbnz(8, false, not_returned);
+                a.b(done);
+                // Never executed (see the call template's stub call).
+                a.word(position);
+                a.bind(not_returned);
+                a.cmp_imm_w(8, DIRECT_CALL_THREW);
+                a.b_cond(C_EQ, l_unwind);
+                a.b(hit_slow);
+            }
+            // The construct stub itself, or a site without shared stubs: the form in line.
+            _ => {
+                let emitted = emit_direct_sequence(
+                    a,
+                    ilayout,
+                    layout,
+                    attempted_off,
+                    runs_off,
+                    retry_off,
+                    argc,
+                    DirectForm::Forward,
+                    hit_slow,
+                    l_unwind,
+                    done,
+                    finish_stub,
+                    call_site,
+                );
+                debug_assert!(
+                    emitted,
+                    "the construct form's preconditions are the forward form's"
+                );
+            }
         }
     }
 
@@ -13831,6 +14020,20 @@ extern "C" fn record_direct_packed_return() {
 #[cfg(all(test, target_arch = "aarch64"))]
 extern "C" fn record_direct_construct() {
     TEST_DIRECT_CONSTRUCTS.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+thread_local! {
+    /// Forwarders' constructions the direct construct sequence's forward form completed normally
+    /// (P3 stage 3 steps 6-7, part A2).
+    pub(crate) static TEST_DIRECT_FORWARDS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+#[cfg(all(test, target_arch = "aarch64"))]
+extern "C" fn record_direct_forward() {
+    TEST_DIRECT_FORWARDS.with(|count| count.set(count.get() + 1));
 }
 
 #[cfg(all(

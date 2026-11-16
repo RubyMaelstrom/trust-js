@@ -1072,7 +1072,8 @@ pub struct CallIc {
     /// Direct-call gates computed at fill: bit 0 = a compiled user-code entry; bit 1 = the chunk
     /// needs the realm's global body pointer (the sequence requires the caller's
     /// `ctx.global_body` to be live); bit 2 = the callee's inline attempt had been made; bit 3 =
-    /// the frame fits a pooled record; bit 4 is unused (it marked a callee whose activation
+    /// the frame fits a pooled record; bit 4 = [`CALL_IC_FORWARD`] on a construct site's entry
+    /// (a recognized forwarder's), unused on a call site's (it marked a callee whose activation
     /// the Rust entry built, before callees built their own); bits 5-6 =
     /// [`CALL_IC_LEXICAL_THIS`] and [`CALL_IC_SCOPED_NATIVE`]; bit 7 =
     /// [`CALL_IC_DIRECT_READY`], all of the sequence's static gates at once.
@@ -2598,11 +2599,15 @@ mod call_overflow_tests {
 #[derive(Clone, Copy)]
 #[repr(C)]
 pub(crate) struct ConstructSite {
-    /// The constructor's call entry. Its `direct` bits are [`Chunk::jit_construct_flags`].
+    /// The constructor's call entry. Its `direct` bits are [`Chunk::jit_construct_flags`], and
+    /// [`CALL_IC_FORWARD`] where `forward` holds a recognized forwarder's initializer.
     pub call: CallIc,
     pub prototype_shape: u32,
     pub prototype_slot: u32,
     pub arguments_apply_forwarder: bool,
+    /// A forwarding constructor's initializer and its proofs (P3 stage 3 steps 6-7, part A2),
+    /// valid where `call.direct` has [`CALL_IC_FORWARD`].
+    pub forward: ForwardEntry,
 }
 
 impl ConstructSite {
@@ -2611,10 +2616,77 @@ impl ConstructSite {
         prototype_shape: 0,
         prototype_slot: 0,
         arguments_apply_forwarder: false,
+        forward: ForwardEntry::EMPTY,
     };
 }
 
 const _: () = assert!(std::mem::offset_of!(ConstructSite, call) == 0);
+
+/// [`CallIc::direct`] bit 4 of a construct site's entry (P3 stage 3 steps 6-7, part A2): its
+/// constructor is a recognized forwarder (`Chunk::jit_arguments_apply_forwarder`: the body
+/// `this.<initializer>.apply(this, arguments)`) whose initializer and proofs the site's
+/// [`ForwardEntry`] holds, so that the direct construct sequence's forward form enters the
+/// initializer's code itself (`jit::emit_direct_sequence`'s `DirectForm::Forward`). A
+/// forwarder's entry has no bit 0 (`Chunk::jit_construct_flags`), so the sequence's ordinary
+/// form declines it at the gate that tests that bit, which is where this one is tested. Never set
+/// where the forward form is not emitted (x86-64).
+pub const CALL_IC_FORWARD: u8 = 16;
+
+/// What the forward form of the direct construct sequence needs of a recognized forwarder
+/// (see [`CALL_IC_FORWARD`]), filled by the Rust forwarder's success
+/// (`Interp::construct_arguments_apply_forwarder`) and proved again at every construction by
+/// [`forward_this`] before anything is allocated, by identity: the constructor's
+/// [[Prototype]] object `P` (its live `prototype`) has `prototype_shape`, and its slot
+/// `initializer_slot` holds the initializer `init.callee` as a data property (the instance has
+/// no own properties, so `this.<initializer>` is P's); the initializer has
+/// `initializer_shape`, which has no own `apply`, and its [[Prototype]] (whichever object it is)
+/// has `apply_holder_shape`, whose slot `apply_slot` is its own `apply` and holds `apply`,
+/// %Function.prototype.apply%, as a data property. `position` is the body's forwarding call's position, where the
+/// initializer's frame is called from (as the Rust forwarder records it).
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(crate) struct ForwardEntry {
+    /// The initializer's call entry, as a call site's way for it: the direct sequence's
+    /// [`CallIc`] for the call it makes.
+    pub init: CallIc,
+    pub prototype_shape: u32,
+    pub initializer_slot: u32,
+    pub initializer_shape: u32,
+    pub apply_holder_shape: u32,
+    pub apply_slot: u32,
+    pub position: u32,
+    /// With no [`CALL_IC_FORWARD`]: the call-cache epoch at which the fill refused the
+    /// initializer `refused` (a proof the forward form makes did not hold), so that the Rust
+    /// forwarder's next constructions with it at that epoch skip the fill's work.
+    pub refused_epoch: u32,
+    pub apply: usize,
+    pub refused: usize,
+}
+
+impl ForwardEntry {
+    pub(crate) const EMPTY: ForwardEntry = ForwardEntry {
+        init: CallIc::EMPTY,
+        prototype_shape: 0,
+        initializer_slot: 0,
+        initializer_shape: 0,
+        apply_holder_shape: 0,
+        apply_slot: 0,
+        position: NO_POSITION,
+        refused_epoch: u32::MAX,
+        apply: 0,
+        refused: 0,
+    };
+}
+
+/// Byte offset of a construct site's forward entry's initializer [`CallIc`] from the site (the
+/// forward form's x12 while it runs the initializer's call), and of the forwarding call's
+/// position from that [`CallIc`].
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const FORWARD_INIT_OFF: usize =
+    std::mem::offset_of!(ConstructSite, forward) + std::mem::offset_of!(ForwardEntry, init);
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) const FORWARD_POSITION_FROM_INIT: usize =
+    std::mem::offset_of!(ForwardEntry, position) - std::mem::offset_of!(ForwardEntry, init);
 
 /// Which update `UpdateLocal` performs, and the value it leaves on the stack: `Pre*` push the
 /// updated value, `Post*` push the original (coerced) value, `*Discard` push nothing (the update
@@ -3687,8 +3759,10 @@ pub struct Chunk {
     /// most, as a V8 construct feedback slot holds one weak target
     /// (src/builtins/ic-callable.tq:227-276). Kept out of `call_pins`, whose pins outlive
     /// their ways: a site that constructs a fresh class or closure on each pass would pin every
-    /// one of them for the chunk's life, as dead cells the heap must keep reserved.
-    construct_pins: Box<[std::cell::RefCell<crate::value::WeakGc>]>,
+    /// one of them for the chunk's life, as dead cells the heap must keep reserved. The second
+    /// pin is the entry's forwarder's initializer's (`ConstructSite::forward`, P3 stage 3 steps
+    /// 6-7, part A2), kept with the entry that names it as the first is.
+    construct_pins: Box<[std::cell::RefCell<[crate::value::WeakGc; 2]>]>,
     /// One [`PrivateSite`] per private-name operation (`Op::GetPrivate` and its siblings).
     pub(crate) private_sites: Box<[PrivateSite]>,
     /// Weak handles pinning every callee address a call cache has ever recorded (see [`CallIc`]),
@@ -4455,7 +4529,7 @@ impl Chunk {
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(
                 self.construct_pins.len()
-                    * std::mem::size_of::<std::cell::RefCell<crate::value::WeakGc>>(),
+                    * std::mem::size_of::<std::cell::RefCell<[crate::value::WeakGc; 2]>>(),
             )
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
@@ -4987,8 +5061,40 @@ impl Chunk {
             let _ = self.initializer_layout.set(layout.clone());
         }
     }
+    #[cfg(test)]
     pub(crate) fn construct_cache(&self, cache: u32) -> ConstructSite {
         self.construct_caches[cache as usize].get()
+    }
+    /// `f` of construct site `cache`'s entry, read in place (the entry is large: a forwarder's
+    /// holds a second call entry, part A2's); `f` must not fill the site.
+    pub(crate) fn with_construct_cache<R>(
+        &self,
+        cache: u32,
+        f: impl FnOnce(&ConstructSite) -> R,
+    ) -> R {
+        // SAFETY: nothing sets the cell while `f` runs (it fills no construct site), so the
+        // reference does not outlive a write.
+        f(unsafe { &*self.construct_caches[cache as usize].as_ptr() })
+    }
+    /// Record that the fill refused `initializer` for site `cache`'s forward form at `epoch` (see
+    /// [`ForwardEntry::refused`]), its forward bit cleared.
+    // Called where the forward form is built only.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn refuse_construct_forward(&self, cache: u32, initializer: usize, epoch: u32) {
+        let Some(site) = self.construct_caches.get(cache as usize) else {
+            return;
+        };
+        // SAFETY: as `with_construct_cache`: no reference to the entry is live.
+        let entry = unsafe { &mut *site.as_ptr() };
+        entry.call.direct &= !CALL_IC_FORWARD;
+        entry.forward.refused = initializer;
+        entry.forward.refused_epoch = epoch;
     }
     /// Record `entry` at construct site `cache`, with `pin`, the weak pin of its constructor
     /// (`entry.call.callee`): the engine's construct cache's own (`Interp::construct_ics`),
@@ -5005,9 +5111,47 @@ impl Chunk {
         }
         debug_assert_eq!(pin.as_ptr() as usize, entry.call.callee);
         // The entry and its pin change together: once the new entry is stored, no entry of this
-        // site names the old constructor's address, so its pin may go.
+        // site names the old constructor's address, so its pin may go, and a filled entry names
+        // no forwarder's initializer (its forward entry is empty), so that one's may too.
+        debug_assert_eq!(entry.call.direct & CALL_IC_FORWARD, 0);
         self.construct_caches[cache as usize].set(entry);
-        *self.construct_pins[cache as usize].borrow_mut() = pin.clone();
+        *self.construct_pins[cache as usize].borrow_mut() =
+            [pin.clone(), crate::value::WeakGc::new()];
+    }
+    /// Record `forward`, a recognized forwarder's initializer entry and proofs, at construct site
+    /// `cache` while its entry names `constructor` (P3 stage 3 steps 6-7, part A2), with `pin`,
+    /// the initializer's weak pin (`forward.init.callee`), and set the entry's
+    /// [`CALL_IC_FORWARD`]. Nothing where the entry names another constructor now.
+    // Called where the forward form is built only.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn fill_construct_forward(
+        &self,
+        cache: u32,
+        constructor: usize,
+        forward: ForwardEntry,
+        pin: &crate::value::WeakGc,
+    ) {
+        let Some(site) = self.construct_caches.get(cache as usize) else {
+            return;
+        };
+        let mut entry = site.get();
+        if entry.call.callee != constructor
+            || forward.init.epoch == u32::MAX
+            || !crate::value::is_cacheable_shape(forward.prototype_shape)
+        {
+            return;
+        }
+        debug_assert_eq!(pin.as_ptr() as usize, forward.init.callee);
+        entry.forward = forward;
+        entry.call.direct |= CALL_IC_FORWARD;
+        site.set(entry);
+        self.construct_pins[cache as usize].borrow_mut()[1] = pin.clone();
     }
     /// Whether calls need a real activation environment (captured locals / lexical `this`).
     fn makes_env(&self) -> bool {
@@ -10410,7 +10554,9 @@ fn finish_chunk(
         construct_positions,
         inline_sites,
         construct_pins: (0..c.construct_caches.len())
-            .map(|_| std::cell::RefCell::new(crate::value::WeakGc::new()))
+            .map(|_| {
+                std::cell::RefCell::new([crate::value::WeakGc::new(), crate::value::WeakGc::new()])
+            })
             .collect(),
         construct_caches: c.construct_caches,
         private_sites: (0..c.private_sites).map(|_| PrivateSite::new()).collect(),
@@ -29188,6 +29334,15 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     site: *const std::cell::Cell<ConstructSite>,
     callee: usize,
 ) -> u64 {
+    // A recognized forwarder's entry (part A2): the forward form's call. The construct form never
+    // calls with one: a forwarder's entry has no bit 0, which its gates require.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    if unsafe { (*(*site).as_ptr()).call.direct } & CALL_IC_FORWARD != 0 {
+        return unsafe { forward_this(site, callee) };
+    }
     // Read in place: nothing writes the entry while the helper runs (it runs no code).
     let site = unsafe { &*(*site).as_ptr() };
     debug_assert_eq!(site.call.callee, callee);
@@ -29235,6 +29390,139 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     chunk.note_instance(&instance);
     chunk.fill_instance_image(&instance, class);
     Value::Obj(instance).bits()
+}
+
+/// The forward form's instance allocation and proofs (P3 stage 3 steps 6-7, part A2;
+/// `jit::emit_direct_sequence`'s `DirectForm::Forward`, through H_CONSTRUCT_THIS's
+/// [`jit_construct_this`]): for construct site
+/// `site`, whose entry names the forwarder `callee` with [`CALL_IC_FORWARD`], the instance
+/// `this.<initializer>.apply(this, arguments)` would initialize, or 0 with nothing allocated
+/// where a proof fails, which takes H_NEW and its Rust forwarder:
+/// - the constructor's live `prototype` (GetPrototypeFromConstructor, as
+///   [`jit_construct_this`] reads it) is an Object P of the entry's shape, whose slot holds the
+///   initializer the entry names as a data property: the instance has no own property, so its
+///   `<initializer>` is P's (an accessor, another value, a Proxy or a changed P fails here);
+/// - the initializer has the entry's shape, which has no own `apply`, and its live [[Prototype]]
+///   has the entry's holder shape, whose slot is its `apply` and holds
+///   %Function.prototype.apply% as a data property (an own `apply`, another holder or a replaced
+///   Function.prototype.apply fails here).
+/// The instance is OrdinaryObjectCreate(P) with the storage the initializer's learned layout
+/// names, as the Rust forwarder's plan reserves it, and is noted on the constructor's chunk as
+/// that path notes it. It runs no author code and collects nothing (the heaps collect only at
+/// safepoints).
+///
+/// # Safety
+/// `site` is a live construct site whose entry the caller's probe matched for `callee` in the
+/// live epoch and Realm, with [`CALL_IC_FORWARD`] set.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+unsafe fn forward_this(site: *const std::cell::Cell<ConstructSite>, callee: usize) -> u64 {
+    // Read in place: nothing writes the entry while the proofs run (they run no code).
+    let made = unsafe { forward_this_proved(&*(*site).as_ptr(), callee) };
+    if made == 0 {
+        // A proof failed: the program changed what the entry proved. The forward form stands
+        // down (the bit cleared) until the Rust forwarder, which the construction takes now,
+        // proves its initializer again and refills the entry, as a missed IC relearns.
+        // SAFETY: no reference to the entry is live.
+        unsafe { (*(*site).as_ptr()).call.direct &= !CALL_IC_FORWARD };
+    }
+    made
+}
+
+/// [`forward_this`]'s proofs and allocation: the instance's bits, or 0 where a proof fails.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+unsafe fn forward_this_proved(site: &ConstructSite, callee: usize) -> u64 {
+    debug_assert_eq!(site.call.callee, callee);
+    debug_assert_ne!(site.call.direct & CALL_IC_FORWARD, 0);
+    let forward = &site.forward;
+    let constructor = unsafe { crate::value::Gc::from_raw(callee as *const _) };
+    let data_object = |p: Option<crate::value::SlotRef<'_>>| -> Option<crate::value::Gc> {
+        match p {
+            Some(p) if !p.accessor() => match (p.value()).view() {
+                ValueView::Obj(object) => Some(object),
+                _ => None,
+            },
+            _ => None,
+        }
+    };
+    let proto = {
+        let b = constructor.borrow();
+        let property = if b.props.shape() == site.prototype_shape {
+            b.props.slot_at(site.prototype_slot as usize)
+        } else {
+            b.props
+                .get_named("prototype")
+                .map(crate::value::PropRef::slot)
+        };
+        data_object(property)
+    };
+    let Some(proto) = proto else {
+        return 0;
+    };
+    let initializer = {
+        let b = proto.borrow();
+        if !b.ic_plain() || b.props.shape() != forward.prototype_shape {
+            return 0;
+        }
+        data_object(b.props.slot_at(forward.initializer_slot as usize))
+    };
+    let Some(initializer) =
+        initializer.filter(|i| crate::value::Gc::as_ptr(i) as usize == forward.init.callee)
+    else {
+        return 0;
+    };
+    let apply_holder = {
+        let b = initializer.borrow();
+        if b.props.shape() != forward.initializer_shape {
+            return 0;
+        }
+        b.proto
+    };
+    // The live holder: its shape fixes the key at `apply_slot`, and the slot's value is proved by
+    // identity, so which object holds it does not matter.
+    let Some(apply_holder) = apply_holder else {
+        return 0;
+    };
+    let apply = {
+        let b = apply_holder.borrow();
+        if !b.ic_plain() || b.props.shape() != forward.apply_holder_shape {
+            return 0;
+        }
+        data_object(b.props.slot_at(forward.apply_slot as usize))
+    };
+    if apply.is_none_or(|apply| crate::value::Gc::as_ptr(&apply) as usize != forward.apply) {
+        return 0;
+    }
+    // OrdinaryObjectCreate(P), its storage the initializer's learned layout's (the plan's).
+    let init_chunk = unsafe { &*forward.init.chunk_raw };
+    let layout = init_chunk.instance_layout().cloned();
+    let capacity = init_chunk
+        .instance_capacity_hint()
+        .max(layout.as_ref().map_or(0, |keys| keys.len()));
+    let chunk = unsafe { &*site.call.chunk_raw };
+    // SAFETY: the entry's function outlives its validated chunk (the call caches' contract).
+    let class = chunk.instance_class(unsafe { &*site.call.func }, Some(&proto));
+    let instance = crate::value::Object::new_built(
+        Some(proto),
+        crate::value::ObjectKind::Plain,
+        class,
+        |props| props.init_layout(capacity, layout),
+    );
+    chunk.note_instance(&instance);
+    #[cfg(test)]
+    TEST_FORWARD_THIS.with(|count| count.set(count.get() + 1));
+    Value::Obj(instance).bits()
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Constructions [`forward_this`] allocated an instance for.
+    pub(crate) static TEST_FORWARD_THIS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
