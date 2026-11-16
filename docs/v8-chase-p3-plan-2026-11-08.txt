@@ -5915,3 +5915,110 @@ Landed since (2026-11-16; main 4bda8fbf):
   agent continues its line from rule K (built and measured on an earlier base: DeltaBlue at
   200 runs -3.43% at graph and -0.59% at the splice, 33 of 1,373 tier compiles changed at the
   default), piece D (built, one test to redo), the flip's rehearsal and piece B.
+
+Stage 3 step 3f, rule K landed (1982beb6, 2026-11-16; target/p3/stage3/step3f-impl and
+step3g-impl, the two agents' reports; my checks merge-check/counts-k.out, counts-k-graph.out,
+cycles-k.out and stepk-review): a named access checks only those of its feedback's shapes that
+its receiver's proven shapes allow.
+- The rule. Where the builder's facts for an object word (State::shapes) exclude some of an
+  access's receiver shapes, the access's check takes the rest alone, and a polymorphic load
+  drops the arms the facts exclude; one arm left is the monomorphic walk, with no test and no
+  join. The facts after the check are what they were (the intersection), so nothing is assumed
+  that was not proven. As Maglev intersects an access's feedback maps with the node's known
+  maps (maglev-graph-builder.cc:4641-4650) and JSC prunes a polymorphic access's cases by the
+  proven structure set (dfg/DFGConstantFoldingPhase.cpp:648-666). Facts that allow none of the
+  shapes keep the whole check, which then always exits (Maglev's unconditional deopt,
+  :4652-4654): the resumed first stage's read records the shape, the flag's data is the
+  access's own count of ways and not the trimmed one, and the site converges in one discard
+  (to the new shape, or generic by step L5's rule where a full cache never held it): both
+  tested. It takes own reads, method loads, chain walks, polymorphic reads, own stores,
+  creations, updates and appends, in the compiled frame and in inlined frames; a String's
+  prototype check and a chain's levels are left (no shape facts of their own).
+- It is not graph-only: the splice's second stages hold the same facts. The tier's code
+  changes in 33 of 1,373 compiles at the default (DeltaBlue 2, TypeScript 31) and 39 of 1,368
+  at graph, each in a function the compile's log names (`[opt] known shapes`); template code
+  and the tier off are identical.
+- Measured (fat LTO; mine, the agent's the same to 0.05%). At 5 runs against the main before:
+  DeltaBlue -0.38% at the default and -1.58% at graph, Earley-Boyer -0.62% at graph (a
+  collecting benchmark, inside its modes), the rest within their spread (Vue's fixture -0.17%
+  at every tier with the tier off too: the binary's); compile cost level (Richards 0.00%: the
+  first form allocated in every check's path and cost +0.07%, found by its count and fixed
+  before landing). At 200 runs, five alternating rounds on one X925 core: DeltaBlue at graph
+  -3.61% instructions and -1.82% cycles, at the default -0.68% and -0.34%; graph against the
+  splice on the one binary now -8.22% instructions and -12.06% cycles (-5.44% and -10.73%
+  before); Richards, TypeScript, Box2D and Earley-Boyer unmoved. Nothing else moves at 200
+  runs (the agent's eight: within 0.04% but Earley-Boyer inside its spread).
+- Where DeltaBlue's gain is (the agent's profile and node counts at 200 runs): all of it in
+  Plan.prototype.execute, the function step 3d's record names: its shape tests 16.39M -> 7.45M
+  executed (10.88M -> 1.94M at an inlined frame's `this`), with each its join; its checks
+  27.7M -> 25.4M; the rest phis and moves, not counted a node. What rule K cannot reach there,
+  the 1.94M tests on a `this` that only the method load's arm would prove, is what the
+  deferred arm by load shape would take: about 13.6M instructions, 0.4% of the run.
+- Tests: the narrowed check, arm and single arm at each path's kind, the exit's count of ways,
+  the disjoint case's one discard, each at the splice and at graph with forced exits; five
+  mutations caught; GC stress over the four new tests; the 5-run verifier sweep on the landed
+  binary (mine: 42 of 42 at both modes, the agent's refusals equal to main's line for line);
+  clippy; zombie's check, clippy with tests, Windows' check and the tier's tests. The tier's
+  modules on the merged tree: 646 at graph eager (mine; the other four configurations running
+  when this was written).
+
+Steps 6 and 7, part A2 landed (c2b91010, 2026-11-16; target/p3/stage3/step67-impl, report.txt
+section 4 and a2/): a recognised forwarding constructor's construction in machine code. The
+first stage already recognised the body `this.<initializer>.apply(this, arguments)`
+(Prototype.js's Class.create) and ran it in Rust from the construct helper; the direct
+construct sequence now has a forward form for it.
+- What it builds. A construct site's entry for such a constructor gains a forward entry at the
+  Rust path's first success (the initializer's call entry and the proofs; a flag in the
+  entry's direct bits). The sequence's gate that declines an entry without machine code of its
+  own tests that flag, on the declined path alone, and takes the forward form: one helper call
+  proves, by identity and with nothing allocated on a miss, that the constructor's live
+  prototype object has the recorded shape and holds the recorded initializer as a data
+  property (the instance has no own property, so the lookup is that object's), that the
+  initializer has its recorded shape with no own `apply`, and that its prototype has the
+  recorded shape and holds %Function.prototype.apply% in the recorded slot; it then allocates
+  the instance with the initializer's learned layout. Machine code pushes the constructor's
+  [[Construct]] frame at the site's position, with the depth of it and of the apply it
+  elides, enters the initializer's code as a call with the instance as `this` and the site's
+  argument words, and returns the instance whatever the initializer returns; a throw pops
+  both frames. A failed proof clears the flag and the construction takes the Rust path, which
+  proves and refills. x86-64 keeps the Rust path.
+- No exemplar has this at its baseline tier: each materialises the arguments object there
+  and gains in its optimizing tier (the constructor inlined, the apply of the frame's
+  arguments reduced to a call: js-call-reducer.cc:4945-4983, maglev-graph-builder.cc:
+  11730-11756, DFGArgumentsEliminationPhase.cpp:1292-1323, ScalarReplacement.cpp:2406-2440).
+  This moves a path the first stage already had to machine code, for the tier off as well;
+  the tier's own construct inline and apply reduction stay the end state (the design's step
+  9). Decided by me; the owner may want it otherwise.
+- Measured (the agent's, fat LTO, against part A's first commit). A forwarded construction
+  and one field read: 1,577 -> 883 instructions with the tier off, 1,527 -> 747 with it on (an
+  ordinary constructor 558 and 441, unchanged; one that reads a global +0.04). RayTrace at 5
+  runs, the tier off / the default / graph: -33.9% / -42.3% / -44.2% instructions and -30.8%
+  / -39.2% / -41.8% cycles (two X925 cores alone, their clocks recorded); at 200 runs -36.5%
+  / -49.6% / -49.8% and -34.7% / -52.6% / -52.9%. The other workloads within 0.05% where
+  steady (DeltaBlue +0.02% to +0.05%: the flag's test on its declined constructs). Template
+  code: every `new` site's cold gates gain the test (154 of 4,242 compiles with the tier off
+  differ by those blocks alone), the construct stub grows from 1,012 to 1,808 bytes; a
+  construct site's entry now carries the forward entry in line at every site, whose memory I
+  have asked to be measured (out of line if it shows).
+- What it found on the way: the Rust forwarder never counted the initializer's entries (it
+  runs a field plan in its place), so the forward form declined for ever at the initializer's
+  first checkpoint until the plan counted them; a helper slot of its own would have moved
+  every field of the interpreter's state after the helper table in 1,353 compiles, so the
+  form shares the construct sequence's allocation helper; the helper's proofs and allocation
+  are about 330 of the 883 instructions, and moving them in line is the next step of this
+  kind (to about 600).
+- Tests: every observable against the tier off and the VM (the stack through both frames at
+  the VM's positions, initialize's caller, its `arguments` with extra and missing arguments,
+  a throw, a returned object ignored, new.target, the depth inside the initializer and the
+  unwind of a RangeError); a 17-phase proofs test that checks every construction against the
+  VM and which form ran (the initializer replaced, an accessor, a moved key, an own `apply`,
+  another holder, Function.prototype.apply replaced, restored and moved, a stale layout, a
+  Proxy prototype); seven mutations caught; the library suite (3,588) and GC stress over the
+  new tests; zombie's check, clippy with tests, Windows' check and suite (2,899). Mine on the
+  merged tree, running when this was written: fat LTO, the recount at every tier, the 5-run
+  sweep, cycles and the whole library suite with the tier off and on.
+
+Since the records above (2026-11-16): the absent-index walk at 200 runs with the tier on,
+measured again with incremental marking off (the lowerings' agent): TypeScript -0.047%, the
+two binaries' ranges apart, the size the misses predict (889,551 at about 685 instructions);
+the +0.09% read before was the incremental marker under load.
