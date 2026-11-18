@@ -6752,8 +6752,8 @@ and both switches, the path before either existed.
   +54.4% at the default, +55.7% and +55.4% at graph. With neither form: +132.6% and +112.4%,
   +201.3% and +207.8%, +201.7% and +210.4%. At 5 runs, without the forward form: +35.0% and
   +24.6%, +40.1% and +30.4%, +44.3% and +34.8%.
-- So part A2 supplies a benefit that the general forms do not replace: a third to a half of
-  RayTrace's time. It stays. What is left of the earlier question is the layout of its site
+- So part A2 supplies a benefit that the general forms do not replace: without it RayTrace
+  takes 30% more cycles with the tier off and 54% to 55% more with it on. It stays. What is left of the earlier question is the layout of its site
   entry (168 bytes in line in every construct site, which moving out of line made 2% slower
   on RayTrace): the fields the form reads first in line and the rest out of line is the form
   to try, when someone takes it up.
