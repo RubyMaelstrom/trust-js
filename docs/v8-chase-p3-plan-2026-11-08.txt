@@ -6565,3 +6565,93 @@ arguments)` in a body whose other uses of `arguments` are only `arguments.length
   which the rule does not take: to be counted. The later stages of the agent's own sweep
   (the tier's modules in seven configurations, the whole suite with the tier off, on and
   under each switch) were running when it stopped and are read by its successor.
+
+Stage 3 step 3g landed: the Splay retention failure at graph, and the Rust entries' stale
+words (0d94f320, d2d6e985, 73282547, 6de9dc2c, 2026-11-18; target/p3/stage3/step3g-impl,
+report-splay.txt and report-entries.txt, the agents'; my checks stepsplay-review). It closes
+the defect the flip's rehearsal found ("Found by the flip's rehearsal", above).
+- The cause was not graph's and not the tier's. A loop the tree-walker moves into the VM and
+  the VM then moves into template code runs on a borrowed VM frame, whose operand buffer comes
+  from the interpreter's pool. The pool clears a buffer by its length only, and the entry
+  registered the buffer's whole capacity with the collector, so words an earlier user of the
+  buffer left were roots for the frame's whole native run. In Splay's test at graph that
+  buffer had capacity 24 and its words 9 to 12 named removed nodes (an earlier user had grown
+  it; which one was not traced); at the default and with the tier off it had capacity 12 and
+  its stale words named long-lived objects, which is why those passed with the same defect
+  present. Found by marking every root word alone: one word of that range kept 65, 737, 1,809
+  and 3,281 cells over four samples.
+- The fix (0d94f320), two parts. A Rust entry's operand words are scanned up to its
+  activation's live top where the collector knows it, as an active record's are since stage
+  2: the top a direct call left in its callee's record, or the top its poll passed; an
+  inlined frame's slot window above that top is scanned apart, as a record's is; elsewhere
+  the whole range, as before. And a borrowed frame zeroes its buffer past the entry depth at
+  its first transfer, as JSC sanitizes its stack, which removes an earlier user's words in
+  every wait and on x86-64, where the collector never knows the top.
+- The Rust entries' stale words (6de9dc2c), the same defect in the entries that run compiled
+  code on a pooled buffer of their own (jit::run, which serves Reflect.apply, natives'
+  callbacks such as sort's comparator and replace's replacer with the tier off, and a
+  script's own entry; and the entry for frames too large for a record): nearly every such
+  entry held an earlier user's words inside the words it registers (Splay about 500 of 507;
+  every one of 119,993 in a callback script). They zero those words where they take the
+  buffer, in line up to 16 words: 15 to 27 instructions an entry, +0.28% on the callback
+  script and +0.006% on Mandreel with the tier off, level on x86-64 (DeltaBlue +0.005%), no
+  cycle difference beyond the runs' own deviation. The design that would make both clears
+  unnecessary is to publish the run's operand top on every call into Rust; not built.
+- What review changed. The first form scanned an entry to its top and nothing else. My
+  question whether anything live can lie above that top found that it can: the optimizing
+  tier's code runs on a Rust entry when a function is called through Reflect.apply, and an
+  inlined frame's generic node keeps its slot window above the top its end poll passes
+  (1,240 such traces in a diagnostic run); the form as first written would have let the
+  collector miss it. The window is scanned now and a test holds it. The per-entry cost was
+  an allocation and a hash set per entry per collection, and is one pass per trace now (a
+  2,000-deep recursion through a native callback: +3.42% instructions in the first form,
+  +1.17% in the landed one).
+- Measured (the agent's, fat LTO against the commit before). Splay at graph -1.80%
+  instructions at 5 runs and -0.63% at 200, level at the default and with the tier off; graph
+  against the default is -1.30% and -0.47% where the rehearsal read +0.46% and +0.19%, so
+  Splay's rows above zero there were this retention. Anonymous memory within 8 KiB at every
+  mode but Splay at 200 runs with the tier off, 2.8 MB lower (-1.03%).
+- Tests and checks. Ten tests of the fix (a pooled word's object is collected while the
+  frame waits on a direct call, on a native that collects, and at its polls; the top operand
+  word and the slots are roots; the window on a Rust entry) and three of the pooled entries'
+  clear, at each tier an entry can run in; nine mutations of the fix, of which eight are
+  caught by assertions (one of them the heap verifier's) and one, which can only over-scan,
+  is accepted uncaught; the clears' mutations caught. GC
+  stress over the borrowed-frame, rooting and collector tests with the tier off, on and at
+  graph: 45 passed and none failed at each, without two tests (below). The whole library
+  suite at graph, which the Splay test had failed since step 3e: 3,618 passed and none
+  failed on the four commits' tree. difftest 138 agree at the three modes. zombie's check,
+  clippy, Windows' check and suite (2,911, the stale-word tests' legs run there). The tier's
+  modules with forced exits under GC stress were still running when this was written. Mine
+  on main, where the four commits meet the apply form and the lowerings: clippy with tests
+  clean, and the collector's, borrowed-frame, rooting, apply-form and inlining tests, 150
+  passed and none failed with the tier off, on, at graph, and at graph eager with forced
+  exits; the Splay retention test passes in each.
+- The graph counterparts of the four splice-pinned tests that the rehearsal found missing
+  (d2d6e985, tests only): each passes with the environment at any mode and under GC stress
+  at graph.
+- Found on the way, each recorded and none fixed here. The Splay retention test fails under
+  TRUST_JS_GC_STRESS in its VM leg, on the commit before the fix as on it, number for number:
+  one native-stack word in the tree-walker's loop-step frame (eval.rs:1280) keeps removed
+  nodes while collections run at nearly every safepoint; an ordinary run holds at most one
+  such word from its last due collection until the loop ends. The test's comment says it is
+  not a test for stress (73282547). A deep-recursion test under a collection at every
+  allocation is quadratic and is left out of the stress sets (it passes at a sparser
+  interval). jit::proxy_trap_tests::reflect_calls_agree_across_tiers counts hits against a
+  threshold while the call-cache epoch is process-wide, so a parallel run can fail it (seen
+  once on x86-64, 246 of a needed 250). A crashed child of the rooting stress test reads as
+  "different test inventory", because that assertion runs before the exit status's.
+
+The intermittent off-thread test, explained and closed (7e974625, tests only, 2026-11-18;
+target/p3/stage3/step3g-impl/report-offthread.txt and otd/). opt::offthread_tests::
+a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile had failed twice in parallel
+runs of the tier's modules at graph ("nothing installed") and never in 320 runs alone. With
+an assertion at the hold's release that names what is pending, it failed 6 times in 1,000
+alone at graph, each time with two compiles pending: the reoptimization the test is about, and
+the first optimizing compile of its helper function `noop`, queued by the calls the fallback
+made under the hold. The poll after the hold installed that second compile when the compile
+thread finished inside the test's last loop. Whether `noop` had reached its compile before
+depended on when f's own code, which inlines it, was installed: a timing the test assumed. It
+was the test's and not an install after a discard. The test now warms `noop` to its tier
+code before the clear, keeps the assertion at the release, and names the chunks in both
+messages; 0 failures in 1,000 runs alone at graph and 200 at each mode.

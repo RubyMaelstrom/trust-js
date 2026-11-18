@@ -291,9 +291,9 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   morning and is not graph's alone: a loop the tree-walker moves into the VM and then into
   template code runs on a pooled VM operand buffer that is registered with the collector at
   its whole capacity, so words an earlier user of the buffer left are roots for the frame's
-  whole native run. A fix is written (branch p3-s3-step3g, commit e1d1b5de: such a buffer is
-  scanned to its activation's live top where the collector knows it) and is under review; it
-  is not on main. Its review asks are in target/p3/stage3/step3g-impl/STATUS.txt.
+  whole native run. FIXED on local main the same evening (0d94f320, with the Rust entries'
+  clear 6de9dc2c; the plan's record "Stage 3 step 3g landed"): the whole library suite passes
+  at graph again. Origin does not have it until the next push.
 - A SECOND KNOWN DEFECT, in part A2 as main has it: a forwarding constructor's site entry
   compares %Function.prototype.apply% by address and holds no pin for it, and that function
   can be collected once a program replaces it, so a later object at its address would pass
@@ -327,11 +327,20 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
 - Part A1 landed on local main (1aa09634, with its record in the plan): a constructor without
   a static instance layout learns one from its first eight constructions. The apply form's
   code is being written over it.
-- An intermittent test failure to look into, the tier's: opt::offthread_tests::
-  a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile failed once at
-  TRUST_JS_OPT_INLINE=graph under heavy machine load ("nothing installed") and passed in 60
-  other runs, on main's engine as on A1's.
-- The same class of defect as the Splay one, found and not yet fixed: the Rust entries that
-  run compiled code on a pooled operand buffer (jit::run, run_moved_oversized) register words
-  an earlier user of the buffer left, which are roots while the entry waits on a call into
-  Rust (on x86-64, every call). A clear with its cost measured is the D line's next step.
+- The evening's landings on local main, each with its record in the plan: the lowerings
+  (three commits to the tier's ARM64 emission, about -1.2% instructions at 5 runs and -2.3%
+  at 200 over the workloads with the tier on); the apply form (`f.apply(t, arguments)` makes
+  no arguments object; Box2D -4.6% to -10.4% instructions at 200 runs); the Splay retention
+  fix and the Rust entries' clear; the off-thread test's fix (it was the test's timing).
+- What the flip (graph as the default inlining mode) still waits for: piece B (a closure made
+  in compiled code as a known callee; React's steady state is +0.29% at graph without it),
+  being built on branch p3-s3-b (brief target/p3/stage3/briefs/step3g-resume4.txt); the
+  rehearsal's rows taken again on today's main; then the owner's decision.
+- In flight on the construct line (brief briefs/step67-resume4.txt): the apply form's second
+  commit, which reaches the operation through the intrinsic helper (branch
+  p3-s3-apply-route), and the three-way comparison of part A2 the owner asked for.
+- Open, recorded in the plan, not being worked on: a strict body's `return f.apply(this,
+  arguments)` is a tail call the apply form does not take (it runs in no measured workload);
+  an arm that tests two shapes in the tier's code; the design that would make both stale-word
+  clears unnecessary (publish the run's operand top on calls into Rust); the Splay retention
+  test fails under TRUST_JS_GC_STRESS by design of that mode (its comment says so).
