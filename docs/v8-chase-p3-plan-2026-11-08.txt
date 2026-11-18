@@ -6483,3 +6483,85 @@ over piece D, the apply pin and part A1, with which it shares no file.
   per-compile passes (3,000 to 10,000 instructions a compile) stay. DeltaBlue at graph at 5
   runs gains more from the shape-test fusion than its count predicts; not explained.
   Test262 and difftest were not run on the stack.
+
+Steps 6 and 7, the apply form landed (ddeed4f6, 2026-11-18; target/p3/stage3/step67-impl,
+report-apply-impl.txt, apply/facts.txt and apply/, the agents'; my checks stepapply-review and
+merge-check's counts-apf.out, counts-apf-graph.out and cycles-apf.out): `<f>.apply(<t>,
+arguments)` in a body whose other uses of `arguments` are only `arguments.length` and
+`arguments[k]` calls `f` with the frame's actual arguments and makes no arguments object.
+- The rule and the operation. The compiler's lazy-arguments rewrite takes a load of the
+  arguments slot that is the last argument of a two-argument method call whose method a
+  GetMethod of "apply" pushed, in one straight run of operations, and makes the call
+  Op::CallApplyFrameArgs. While `apply` is %Function.prototype.apply% (by its native's address)
+  and `f` is callable, the operation calls `f` with `<t>` and the actual arguments: apply's
+  own steps on the object the body would have made (ECMA-262 20.2.3.1; CreateListFromArrayLike
+  reads each index at the call). Anything else (a replaced, own or getter `apply`, a
+  non-callable `f`) makes the exact object and calls `apply` with it, as before. The call's
+  site records `f`, the forwarded callee.
+- What the facts changed in the design (apply/facts.txt, each shown by a run or marked read).
+  Legacy reflection needs nothing: every compiled frame answers `w.arguments` with null today,
+  so no object is handed out to read back (the defect that is, the owner's question 11 in
+  the handoff note). A sloppy body with simple formals takes the second pass's form, where
+  formals live in the activation: the hit reads each mapped index from its formal's binding at
+  the call, which needs no condition on writes (V8's and JSC's passes have one,
+  js-call-reducer.cc:4891-4900), and a replaced `apply` receives the exact mapped object,
+  which formals in frame slots could not alias. The optimizing tier has no refusal for an
+  operation it does not know: it runs this one as its template's canonical-frame effect, as
+  it runs the other arguments operations, and keeps compiling the 26 of Box2D's 34 such
+  functions it compiled before; no line of opt/ changed. Part A2's recognizer reads the
+  rewritten forwarder. No splice is planned at such a site and it seeds no second stage: a
+  reader must take the site's way as the forwarded callee and never as the call's callee
+  operand (feedback-schema.txt 5.10), which the first-stage inline planner had got wrong
+  (found by the agent's sweep: three of A2's tests and one of A1's on x86-64 failed).
+- Measured on the landed commit against the main before, fat LTO (mine; the agent's on its
+  own base agree). Box2D at 200 runs on one X925 core alone, five alternating rounds (the
+  requested clock 1.4 to 2.8 GHz, the heat guard not tripped), the tier off / the default /
+  graph: instructions -4.64% / -10.14% / -10.38%, cycles -4.49% / -12.72% / -12.81%. At 5
+  runs Box2D -3.97% / -6.56% / -6.72%, RayTrace -0.08% / -0.12% / -0.15% (its forwarder's
+  first constructions make no object now), every other row level or inside its spread.
+  RayTrace at 200 runs level in instructions (+0.02%, +0.03%). A call (the agent's rows,
+  instructions, the tier off): through `target.apply(this, arguments)` without formals 3,222
+  -> 1,711 and with formals 5,894 -> 2,237; Box2D's two constructor forms 3,094 -> 1,579 and
+  4,248 -> 2,673; `target.call` (1,610) and an Array's apply (1,968) equal to the base to the
+  hundredth, after a constant +2.00 on both was traced by disassembly to an arm on a shared
+  dispatch path and removed.
+- One control row that is the binary's and not the form's: DeltaBlue with the tier off, which
+  runs no such call and whose template code is identical, reads +0.46% in cycles at equal
+  instructions, and +0.29% (standard error 0.05%) by the means of 8 runs a side at randomized
+  addresses with instructions equal to a part in a million. Randomized addresses move the
+  stack and the heap, not the placement of the Rust code within the binary, which a
+  341-line change to bytecode.rs shifts. The apply pin's open row on RayTrace is the same
+  kind. Noted for the question of a link order file (the owner's question 6).
+- Tests and checks. The agent's: twelve tests (every program at the tree-walker, the VM and
+  the JIT from the first call and at the default thresholds, compared with the tree-walker:
+  actual, extra and missing arguments; bound, Proxy, native, class, throwing and non-callable
+  callees; a replaced, own and getter `apply`; mapped bodies with written and captured
+  formals, a replaced apply writing arguments[0], duplicate formals; every other way to
+  `arguments`; collections between entry and the call with the words only the callers hold;
+  recursion and Error.stack; the tier compiling the form at both inline modes, eager and with
+  forced exits); twelve of thirteen mutations caught, the thirteenth changing no result;
+  GC stress over the tests; zombie's check, clippy, Windows' check and suite (2,914); the
+  verifier clean. Mine on the landed tree: the 5-run verifier sweep 42 of 42 at both modes;
+  clippy with tests; the form's tests with the call-feedback, constructor-transfer and
+  construct tests, 44 passed with the tier off, on, eager, with forced exits, and eager and
+  with forced exits at graph; the tier's modules 664 passed with forced exits at the default,
+  and 663 with one failed with forced exits at graph, below.
+- The one failure is the intermittent test A1's record names, for the second time:
+  opt::offthread_tests::a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile
+  ("nothing installed", offthread_tests.rs:521), in a parallel run of the modules under a
+  machine load of 17. Alone it passes 25 of 25 at that configuration on this commit and 25 of
+  25 on the main before, alternating, under the same load. Both sightings were at graph in
+  full parallel runs, on trees that hold A1; the runs of trees before A1 did not show it,
+  which is too few runs to mean anything. It asserts that a pending reoptimization is
+  dropped by a loop-limit discard: either the test assumes a timing, or a compile can be
+  installed after its discard. The tier's line is to find out which.
+- Open with this commit. Template code reaches the operation through the generic helper,
+  which leaves a call about 100 instructions above `target.call` and lets the compiled tiers
+  reach the stack's RangeError 12% earlier in a recursion through such a call (the same text,
+  Error.stack and `caller`; the VM reaches it 10% later): the intrinsic route, the next
+  commit, takes both back. Box2D's peak anonymous memory at graph at 200 runs is 52.9 MB in 7
+  of 9 runs against the base's 50.5 MB in 9 of 9, and lower with the tier off: not
+  attributed. A strict body's `return f.apply(this, arguments)` compiles to a tail call,
+  which the rule does not take: to be counted. The later stages of the agent's own sweep
+  (the tier's modules in seven configurations, the whole suite with the tier off, on and
+  under each switch) were running when it stopped and are read by its successor.
