@@ -564,6 +564,9 @@ fn sites_naming(
 fn a_forward_entry_keeps_a_replaced_apply_address_reserved_while_it_names_it() {
     use crate::gc_core::CollectionKind;
     use crate::gc_test::HiddenAddress;
+    // The first stage's construct sequence fills the forward entry this test reads; an eager
+    // optimizing tier compiles `make` before any construction and its `new` fills none.
+    crate::opt::pin_tier_off_for_test();
     /// Whether the cell at `address` is still allocated (live, or dead and weakly pinned).
     #[inline(never)]
     fn reserved(engine: &Engine, address: HiddenAddress) -> bool {

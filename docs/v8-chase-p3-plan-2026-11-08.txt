@@ -6401,3 +6401,15 @@ takes its constructions.
 - Left open: which gate sends Earley-Boyer's 350,080 constructions of a constructor with a
   static layout to the helper; x86-64's instruction counts for A1 (its suite passes there);
   base classes reached through `super` are not counted by the learning (read, not probed).
+
+Since the records above (2026-11-18): the apply pin's test failed with an eager tier. The
+apply form's configuration sweep found call_feedback_tests::
+a_forward_entry_keeps_a_replaced_apply_address_reserved_while_it_names_it failing with
+TRUST_JS_OPT=1 TRUST_JS_OPT_EAGER=1 ("A's site took no forward entry"), on main as on its
+branch: an eager tier compiles the test's `make` before any construction, and its `new` fills
+no forward entry, which only the first stage's construct sequence does. My check of the pin had
+run the tier off, on and GC stress, and not eager. The test is pinned to the tier off, as its
+neighbour is (the entry and its pins are the first stage's); the nine call-feedback tests pass
+with the tier off, on, eager, eager with forced exits, and eager at graph. Read with it: an
+eager compile of a function whose `new` site has no feedback leaves the site without any for
+good, which costs nothing outside that test configuration and is not looked into.
