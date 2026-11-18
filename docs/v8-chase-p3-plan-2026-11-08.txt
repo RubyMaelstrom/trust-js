@@ -6655,3 +6655,81 @@ depended on when f's own code, which inlines it, was installed: a timing the tes
 was the test's and not an install after a discard. The test now warms `noop` to its tier
 code before the clear, keeps the assertion at the release, and names the chunks in both
 messages; 0 failures in 1,000 runs alone at graph and 200 at each mode.
+
+Steps 6 and 7, the apply form's route landed (8bfb6fab, 2026-11-18; target/p3/stage3/
+step67-impl, report-apply-route.txt and route/, the agent's; my checks steproute-review and
+merge-check's counts-rt.out, counts-rt-graph.out and cycles-rt.out): template code reaches
+Op::CallApplyFrameArgs through the intrinsic helper, as the approved note had it, where the
+first commit used the generic one.
+- What it is. A new intrinsic code; an arm in ARM64's and x86-64's template compilers that
+  calls the intrinsic helper directly with no callee probe (the site's way is the forwarded
+  callee, so a probe could not class `apply`; the helper tests it); one arm in the helper's
+  dispatch. No helper slot, nothing in opt/: the tier's canonical-frame effect shares the
+  arm. The operation's semantics, the VM's arm and every test of the first commit stay.
+- The others' rows are untouched, which took two builds. The first form added 5.0
+  instructions to every intrinsic that takes the helper's general path (`target.call`, an
+  Array's apply): its inner closure captured two more values, so it saved a register and
+  loaded a pair more on every use. The landed form reads the code, the count and the pc from
+  the packed operand inside the closure and captures no more words than before. On my
+  binaries, the main before -> the route, instructions a call: `target.call` 1,610.36 ->
+  1,610.36 with the tier off and 1,456.64 -> 1,456.64 with it on; an Array's apply 1,968.17
+  -> 1,968.17 and 1,826.42 -> 1,826.42; the forwarder's construction, the loop and a direct
+  call equal.
+- What it gains (mine). A forwarded call without formals 1,711.02 -> 1,634.66 instructions
+  with the tier off and 1,601.99 -> 1,525.63 with it on (24 above `target.call` with the tier
+  off, 69 at the tier's modes, where the tier takes more off a call it sees through than off
+  this effect); with formals 2,236.79 -> 2,165.32. Box2D at 200 runs on one X925 core alone,
+  five alternating rounds, the tier off / the default / graph: instructions -0.40% / -0.87%
+  / -0.89%, cycles -0.55% / -0.08% / -0.19%; at 5 runs -0.33% / -0.56% / -0.57%. With the
+  first commit the form is worth -5.0% / -10.9% / -11.2% of Box2D's instructions at 200 runs.
+- The recursion depth. A recursion through such a call reaches the stack's RangeError at
+  320,636 levels in template code where the main before the apply form reached 191,236 and
+  the first commit 168,380: two thirds deeper than before the form, not the 12% shallower
+  the first commit left. It is the engine's own exhaustion check that raises it, from the
+  intrinsic helper, with all 64 execution-stack segments taken, and never a guard page; the
+  text, Error.stack and `caller` are the tree-walker's at every tier (the agent's probe and
+  tests, also in a build with debug assertions).
+- Tests and checks. The agent's: four new tests (a counter that fails if a template takes the
+  generic route; a site past the operand's 16-bit pc; the call's level against the
+  tree-walker; the end poll), eight mutations of the route caught, thirteen configurations
+  and GC stress; zombie's check, clippy, Windows' check and suite, where the x86-64 arm
+  runs. Mine on the landed tree: the call-cost rows above; the 5-run verifier sweep 42 of 42
+  at both modes; clippy with tests; the form's tests with the call-feedback,
+  constructor-transfer, construct and borrowed-frame tests, 71 passed in each of six
+  configurations; the tier's modules 666 passed and none failed with forced exits at the
+  default and at graph. The first commit's own sweep, read since its record: the tier's
+  modules 559 passed in each of seven configurations, the whole library suite 3,618 passed
+  with the tier off and with it on; the suite under each of the two switches was still
+  running.
+- Closed with it. Box2D's peak memory at graph (2 MB more in most runs) is not the
+  collector's: the same number of major collections, equal live data after each, fewer minor
+  collections, a lower page peak; the difference is one more 2 MB transparent huge page at
+  the peak in the allocator's arena (the agent's figures). TypeScript's template code with
+  the tier off compiles in one of two orders that depend on addresses; the main before
+  shows both by itself.
+- Open. A strict body's `return f.apply(this, arguments)` compiles to a tail call, which the
+  rule does not take. It runs in no measured workload (counted: none in the fixtures and
+  Octane at 5 and 200 runs); one such call costs 2,950 instructions against 1,226 for the
+  same body with its result in a variable. No work now; JSC forwards the tail case too
+  (TailCallForwardVarargs, DFGVarargsForwardingPhase.cpp:380-383), and module and class
+  code is strict, so a workload that has it would ask for it.
+
+A correction to step 3g's record: Splay's rows were the marker's schedule (2026-11-18;
+target/p3/stage3/steproute-review/splay). That record gives, as the retention fix's measure,
+Splay at graph -1.80% instructions at 5 runs and concludes that the rehearsal's Splay rows
+above zero "were this retention". Both are wrong, and I had passed the first on to the
+owner. My recount of the route showed Splay 1.64% and 1.91% lower at the default and at graph
+for a commit that runs nothing in Splay, with the tier's log equal line for line. The
+collector's log differs: the first major collection ends at 168,025 objects after 191
+marking slices on one binary and at 184,155 after 224 on the other. With
+TRUST_JS_GC_INCREMENTAL=0 the two binaries count 1,291,590,452 and 1,291,593,221. The same
+recount of the fix against its base (the piece D line's own binaries): at graph
+1,092,938,683 -> 1,073,230,628 with the marker, the -1.80% of the record, and 1,305,481,133
+-> 1,305,478,271 without it; at the default equal both ways. So the fix changes no work in
+Octane's Splay, whose loops do not run on the borrowed frame the fix is about; what it
+changes is what its tests show, the objects a collection keeps in that case. And the
+incremental marker's schedule is a property of the binary worth up to 1.9% of Splay with
+the tier on: the rehearsal's +0.46% and +0.19% at graph against the default say nothing
+about graph. The method's note on the collecting benchmarks now carries the numbers and
+the rule that such a row is charged to a change only when the recount without the marker
+shows it too. Why the schedule differs between binaries at equal work was not looked into.

@@ -70,9 +70,14 @@ Instruction counts (`perf stat -e instructions:u`)
   Richards at five runs and -6.6% in its timed score.
 - The collecting benchmarks (Earley-Boyer, Splay) and small fixtures move with the
   incremental marker and with what the conservative scan finds. Count them on idle
-  CPUs; when they differ with no difference in generated code, recount with
-  `TRUST_JS_GC_INCREMENTAL=0` and compare the collector's log (`TRUST_JS_GC_LOG=1`)
-  before looking for a cause in the change.
+  CPUs. The marker's schedule (how many slices a cycle takes, where its first major
+  collection ends) is a property of the binary: it repeats to 0.001% for one build
+  at fixed addresses and moved Splay by 1.6% to 1.9% with the optimizing tier on, and
+  Earley-Boyer by 0.3%, between builds whose work was equal. So a row of these two is
+  charged to a change only when the recount with `TRUST_JS_GC_INCREMENTAL=0` shows
+  it too; compare the collector's log (`TRUST_JS_GC_LOG=1`: the major collections'
+  object counts and slice counts) before looking for a cause in the change. This
+  holds for a change to the collector as much as for any other.
 - PdfJS yields after a time slice of the real clock, so its count follows the machine's
   speed. Give it a deterministic clock before drawing a verdict from it.
 - Under about 1.5%, a difference can be layout: a template's size flipping an admission
