@@ -2698,6 +2698,10 @@ mod tests {
     /// records where the direct sequence exists (ARM64); x86-64's run through Rust entries,
     /// whose frames the native stack scan reads as the VM's, which no sanitizing point here
     /// covers between the calls of a compiled loop (the retention report's open items).
+    /// Not a test for TRUST_JS_GC_STRESS: a collection due at nearly every safepoint leaves a node
+    /// in a dead slot of the live frame that runs `measure`'s loop fragment (run_loop's step), which
+    /// the native stack scan reads until the loop ends, so the VM's leg grows under stress on every
+    /// tree (P3 stage 3 step 3g's report, finding F3).
     #[test]
     fn a_splay_trees_live_data_stays_flat_in_every_tier() {
         let tiers: &[Tier] = if cfg!(target_arch = "aarch64") {
