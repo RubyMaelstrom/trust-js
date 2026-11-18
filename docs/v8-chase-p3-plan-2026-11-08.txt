@@ -6286,9 +6286,11 @@ parked, a defect of part A2 is fixed, and the apply form is counted and designed
   TypeScript makes 1,192; no other workload makes an arguments object in compiled code but
   Earley-Boyer, whose use is another shape. What one costs (fat LTO, instructions a call, the
   tier off / at graph): through `target.apply(this, arguments)` 5,894 / 5,791, a direct call
-  256 / 55, `apply` of an Array literal 1,968 / 1,834, `target.call` 1,610 / 1,465. The
-  object is a mapped one (a sloppy function with simple parameters) and the call template's
-  forwarded path takes only unmapped objects and Arrays, so it runs the builtin. The bound,
+  256 / 55, `apply` of an Array literal 1,968 / 1,834, `target.call` 1,610 / 1,465. Why
+  it costs so much is read from the code and not measured: the object is a mapped one (a
+  sloppy function with simple parameters) and the call template's forwarded path takes only
+  unmapped objects and Arrays, so the call should run the builtin; no run showed that it
+  does, and the 5,638 extra instructions were not profiled. The bound,
   inferred from these products: about 5% of Box2D's instructions with the tier off and 11% at
   graph at 200 runs.
 - The apply form, the design, approved by me under the owner's approval of the form
