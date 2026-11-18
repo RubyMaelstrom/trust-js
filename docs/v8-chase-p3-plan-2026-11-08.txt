@@ -6776,3 +6776,42 @@ The sweeps' counts, for the record: the apply form's first commit, opt:: 559 pas
 seven configurations and the suite 3,618 with the tier off, with it on and with
 TRUST_JS_JIT_NO_APPLY_FORM=1; the route, opt:: 569 in each of the seven and the suite 3,637
 with the tier off and on.
+
+The lowerings' next piece, counted before anything is built (2026-11-18; target/p3/stage3/
+select-impl, report.txt, table.txt and table-detail.txt, the lowerings' agent's; a census engine
+over 218ee9e7 that counts every shape test by the position that matched, every shape check, the
+record-pointer loads and the named sites at different own slots, each by whether a check of the
+same word dominates it; every Octane benchmark at 5 and 200 runs, the fixtures and their
+steady-state copies, at both inline modes; the cost of today's paths read from micros'
+disassembly). Predictions from counts, not measurements of built forms; per cent of the
+workload's instructions at graph at 200 runs.
+- The arm that tests two shapes (the fusion's leftover): only TypeScript runs such arms, and
+  they match their second shape 25.8M times against 2.3M for the first, so Maglev's compare and
+  branch a shape would cost it 0.002%. Not built.
+- The select form (one check of the shape set, the offset selected by the shape, one access):
+  Splay -0.19%, GBEMU -0.15%, RayTrace -0.10%, DeltaBlue -0.06%, nothing elsewhere. Above
+  those workloads' spreads, under 0.2% everywhere. Decided after the next item is measured.
+- What the count found instead, and what is built first: a shape check takes the tagged word,
+  so after every call the second access to the same object tests the word's tag and extracts
+  its cell again, though a value's tag cannot change. Predicted for a check that takes the
+  known cell (Maglev's CheckMaps omits its Smi test for a known heap object,
+  maglev-reducer.h:785-790, maglev-ir.cc:2631): Richards -1.67%, GBEMU -0.82%, Box2D -0.78%,
+  Crypto -0.58%, DeltaBlue -0.46%, TypeScript -0.42%, RayTrace -0.35%, Earley-Boyer -0.31%.
+  A design note, then the code; its measured rows against these are also the test of the
+  count's cost model.
+- Two more, counted and not yet understood: the record pointer loaded again where one load of
+  the same object's dominates (Mandreel -1.37%, all of it the global object's at global reads,
+  which overlaps the global-read piece below; Richards -0.53%, GBEMU -0.42%), and shape, kind
+  and flag loads repeated inside one stretch without effects (Richards -1.17%, Crypto -0.96%,
+  DeltaBlue -0.86%). Why the tier's facts do not already cover them is looked into before
+  anything is built for either.
+- The kind test beside the tag test would about double the first item's gain, but needs an
+  object's kind to be immutable once JavaScript can see it, which value.rs does not promise
+  today. Left out.
+- For the global-read piece (Mandreel's heap views; design step "F4"), a first finding of the
+  same agent: of Mandreel's 6,456M reads of global-object properties in the tier's code at 200
+  runs, 4,030M sit in loops with no effect at all and still run their whole chain of checks
+  and loads every iteration (122 instructions an iteration for three reads in a micro); 1,806M
+  sit in loops with a call. The first kind needs no dependency and no owner decision; the
+  second is owner question 7. The count, a ceiling from a diagnostic build, and the design
+  note follow.
