@@ -6053,3 +6053,47 @@ measurement method and the recipes that until now lived in the agents' briefs un
   into field addresses: bc981bda, f6d97091, 663be02c on p3-s3-cmp-final), whose measurement the
   crash cut. My checks run again on cores 5 and 6 (target/p3/stage3/stepa2-review/checks2.sh;
   part A2's files in merge-check are named pa2). Their results follow as a record.
+
+Steps 6 and 7, part A: the counts for A1 and A3, and the decisions (2026-11-18;
+target/p3/stage3/step67-impl/report-a1.txt and a1/; the agent's counts on c2b91010 with a probe,
+fat LTO, not yet repeated by me; nothing built).
+- A1, constructors without a static instance layout, which the direct construct sequence
+  leaves to the Op::New helper: 745 instructions a construction more than the sequence's with
+  the tier off, 737 with it on. Its bound is 1.2% of DeltaBlue's instructions with the tier off
+  and 2.3% at graph at 200 runs (101,287 constructions: Variable's first store holds a jump,
+  the constraints' fields are set by a super constructor), 0.3-0.4% of Djot's steady state,
+  0.13-0.17% of TypeScript (69,238 of its 94,561 are an empty constructor), nothing elsewhere.
+  The engine already learns a layout for such a constructor on the helper's path; a wrong
+  learned layout was measured at +16 instructions a construction with the tier off and +20
+  with it on, with no exit and nothing relearnt.
+- Box2D's 4.33 million constructions through the helper at 200 runs are none of A1's kind:
+  every one is a forwarding constructor. A fifth are `F.init.apply(this, arguments)` (3,816
+  instructions a construction with the tier off); four fifths a form the first count missed,
+  that call followed by `this.constructor === F && this.init.apply(this, arguments)` (4,971).
+  The bound is 12.8% of Box2D with the tier off and 25.8% at graph at 200 runs; the "8-14%" and
+  "about 21%" of the input's record priced every construction as the first form. Of a
+  construction's instructions the helper's Rust path is 27-32%, the arguments object 18-23%,
+  apply and the forwarded call 17-24% (a profile's shares times the count).
+- Decided by me. A1 is built, the exemplars' form: a chunk takes the layout its instances were
+  observed with once its construct learning ends (V8 makes the initial map at the first
+  construction and corrects it by slack tracking, objects/js-function.cc:939-975; JSC's
+  allocation profile, bytecode/ObjectAllocationProfileInlines.h:67-110; SpiderMonkey's this
+  shape, vm/PlainObject.cpp:40-62). The departure, a template for each chunk where theirs is
+  for each closure, is what the wrong-layout measurement prices. A design note first. No
+  recognizer for Box2D's constructors: the second form runs author code between the facts a
+  recognizer would prove, so it is a body and not a pattern.
+- The owner's (2026-11-18). The agent's next step for Box2D is a template call form for
+  `f.apply(t, arguments)` in a function whose only use of `arguments` is that argument: where
+  the method read finds %Function.prototype.apply%, the call takes the frame's arguments and
+  no arguments object is made, an extension of the rule that already leaves the object unmade
+  where it is read only as `arguments.length` and `arguments[key]`. The exemplars make this
+  reduction in their optimizing tiers alone (js-call-reducer.cc:4926-4983,
+  maglev-graph-builder.cc:11730-11756, DFGArgumentsEliminationPhase.cpp:1292-1345); JSC keeps
+  first-tier operations for it that nothing instantiates now (jit/JITOperations.cpp:4324-4350).
+  Put to the owner as the same kind of choice as part A2: "The agent's recommendation is fine
+  with me. Don't forget that the optimizing tier will *eventually* be on by default, once it's
+  fully completed, so don't count it out completely just because of its current status. But
+  the suggestion makes sense either way." So it is built, after A1, on a count of such sites
+  outside constructors and a design note; its case is what it does at every tier, it must leave
+  the tier's own reduction (the design's step 9) buildable from what the builder sees at the
+  site, and it is measured at the three modes with the tier-on rows weighed as the tier-off's.

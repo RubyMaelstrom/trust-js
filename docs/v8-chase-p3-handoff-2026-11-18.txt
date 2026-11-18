@@ -65,7 +65,8 @@ Read first, in this order:
 
 Phase 3 builds a Maglev-class tier above the template JIT (the plan's "Design: the tier"). It is
 switched by TRUST_JS_OPT=1 and is OFF by default: every landed step keeps the tier off's generated
-code identical unless its record says otherwise. The phase's exit (Decision 1): each fixture
+code identical unless its record says otherwise. It becomes the default once it is complete (the
+owner, 2026-11-18), so a design is weighed for that end state too, not only for today's default. The phase's exit (Decision 1): each fixture
 within 2x of Node limited to Maglev (node-mg) in its measured pass and in steady state, and
 Octane's geomean within 2x, in one session.
 

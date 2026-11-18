@@ -80,6 +80,10 @@ The owner settles design forks. Bring each with a recommendation, grounded like 
   not move objects, NaN-boxed double values, generated code written once), say so and why.
 - Never recommend an option because it is easier to build. When an exemplar's design
   looks costly, find out what it costs them before proposing a shortcut.
+- The optimizing tier is off by default only until it is complete; it will be the
+  default. Weigh a design for that end state as well as for today's default: do not
+  argue for a first-stage special form because the tier is off, and do not let one
+  hide from the tier what its own handling of the case will need.
 - Collection scheduling and host GC policy follow the major browsers' engines' current
   behaviour. Judge a collector change by correctness first (bounded memory), then by
   costs that stay meaningful as generated code gets faster (per allocated and live
