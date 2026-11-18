@@ -192,6 +192,15 @@ Each is recorded where the plan line says; none blocks the lines above.
 9. Whether the measurement tools that now live only under target/ should be tracked (next
    section). The repository's rule so far keeps investigation tools out (.gitignore).
 10. The machine: see "The crash" below.
+11. A second defect outside the plan, found 2026-11-18: `f.arguments` read while the sloppy
+   function `f` is active answers the frame's own arguments object from the tree-walking
+   interpreter and null from every compiled tier (the VM, the template JIT, the optimizing
+   tier), so the answer changes when a function is compiled. V8, SpiderMonkey and JSC each build
+   a fresh object of the frame's actual arguments on every read (V8 builtins/accessors.cc
+   :429-461; SpiderMonkey JSFunction.cpp:159-195; JSC FunctionPrototype.cpp:209-238). Not in
+   ECMA-262 and not in Test262, but old code reads it. Recommended fix, the exemplars' form at
+   every tier; not started. The program that shows it: target/p3/stage3/step67-impl/apply/
+   facts/f1.js.
 
 ## How the work is done
 
@@ -312,4 +321,17 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   optimizing tier will be the default once it is complete, and designs are weighed for that.
 - The implementers hit a weekly usage limit at 08:50 and two lines were restarted from their
   logs; a line's STATUS.txt, its reports and, where one exists, NEXT.txt in its evidence
-  directory are what a restart reads.
+  directory are what a restart reads. Both lines changed hands once more in the afternoon
+  (briefs/step3g-resume3.txt and briefs/step67-resume3.txt under target/p3/stage3 are the
+  current briefs).
+- Part A1 landed on local main (1aa09634, with its record in the plan): a constructor without
+  a static instance layout learns one from its first eight constructions. The apply form's
+  code is being written over it.
+- An intermittent test failure to look into, the tier's: opt::offthread_tests::
+  a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile failed once at
+  TRUST_JS_OPT_INLINE=graph under heavy machine load ("nothing installed") and passed in 60
+  other runs, on main's engine as on A1's.
+- The same class of defect as the Splay one, found and not yet fixed: the Rust entries that
+  run compiled code on a pooled operand buffer (jit::run, run_moved_oversized) register words
+  an earlier user of the buffer left, which are roots while the entry waits on a call into
+  Rust (on x86-64, every call). A clear with its cost measured is the D line's next step.

@@ -6319,3 +6319,85 @@ parked, a defect of part A2 is fixed, and the apply form is counted and designed
   afterwards, where the report and the note disagree; part A2's recognizer against the
   rewrite; x86-64's template compiler handles the operation; Error.stack, `caller` and the
   call depth as today's. Code follows A1.
+
+Steps 6 and 7, part A1 landed (1aa09634, 2026-11-18; target/p3/stage3/step67-impl,
+report-a1-impl.txt, design-note-a1.txt and a1-impl/, the agents'; my checks stepa1-review and
+merge-check's counts-pa1.out, counts-pa1-graph.out and cycles-pa1.out): a constructor whose
+chunk has no static instance layout takes a learned one, and the direct construct sequence then
+takes its constructions.
+- What it changes. The static pass predicts a layout only from a constructor's straight-line
+  `this.<name> = ...` prefix. A constructor with a store behind a branch, fields a called
+  super constructor sets, or fields its maker adds after `new` had none, and every one of its
+  constructions went through Op::New's helper: 1,302.65 instructions with the tier off against
+  558.54 for a constructor with a static layout. The exemplars make a constructor's template
+  from its first constructions and not from its body (V8's initial map and slack tracking,
+  js-function.cc:939-975, map.h:443-473; JSC's allocation profile,
+  ObjectAllocationProfileInlines.h:67-110; SpiderMonkey's this-shape, PlainObject.cpp:40-62).
+  Here the construction that ends a chunk's construct learning (the eighth) measures the
+  previous instance, and the chunk takes that instance's layout if it is one of the largest
+  measured and learnable: default-attribute String-keyed data properties, no indexed, Symbol,
+  private or far storage, and no key index of its own (which an instance builds past sixteen
+  keys). Otherwise it settles without keys. A settled chunk's entries get the direct
+  sequence's gate; an entry filled while the chunk was learning is refreshed by its next
+  construction through the helper. It is not the tier's: the default configuration and the
+  tier off change too, as designed.
+- A layout is a prediction only. An instance allocated with it has no property until a store
+  makes one, and a store the layout does not predict detaches it, so property order and every
+  result are the stores' own; the tests compare them at every tier for wrong, missing and
+  extra keys, a throw, a returned object, a constructor that constructs itself, accessors,
+  frozen and deleted properties, another prototype, closures of one literal, and a base class
+  reached by `new` and by `super`. No layout is kept between constructions and no Chunk field
+  is added: the learned layout lives in the chunk's once-set cell (renamed learned_layout),
+  whose three setters own disjoint kinds of chunk, which a debug assertion states.
+- Measured, fat LTO against the main before (mine; the agent's agree to 0.03 points in
+  instructions). A construction without a static layout 1,302.65 -> 567.54 instructions with
+  the tier off and 1,177.60 -> 446.39 with it on (the agent's rows); Box2D's two forwarding
+  forms 3,815 -> 3,094 and 4,970 -> 4,248. Instructions at 5 runs, the tier off / the default
+  / graph: Box2D -1.91% / -3.01% / -3.09%, DeltaBlue -0.59% / -0.71% / -0.81%, Djot's fixture
+  -0.11% / -0.24% / -0.37% and its steady state -0.30% / -0.39% / -0.32%; every other row
+  under 0.07% or inside its spread but Earley-Boyer, below. At 200 runs on one X925 core
+  alone, five alternating rounds (the requested clock 1.4 to 2.8 GHz, the heat guard not
+  tripped): DeltaBlue -1.16% / -2.03% / -2.49% instructions and -1.63% / -2.02% / -3.53%
+  cycles; Box2D -2.24% / -4.55% / -4.63% instructions and -2.69% / -6.61% / -7.07% cycles
+  (the agent's cycles on another core: -1.46% / -2.34% / -3.88% and -2.74% / -6.69% / -7.21%);
+  Richards, a control, level. Box2D's cycles fall more than its instructions: the helper's
+  path that A1 removes ran at about 3.5 instructions a cycle where the program runs at 5.5
+  (the agent's arithmetic; what made it slow was not profiled).
+- Earley-Boyer with the tier off reads +0.28% at 5 runs (+0.16% at graph, level at the
+  default). It is the incremental marker's schedule and not A1's work: with
+  TRUST_JS_GC_INCREMENTAL=0 the same two binaries differ by +0.02% (0.6M instructions, about
+  1.7 a helper construction: the refresh's test). Runs of one binary agree to 0.001% either
+  way, so it is a difference of schedule between the binaries and not noise; the method's
+  note on the collecting benchmarks covers it.
+- Memory (the agent's, anonymous and file-backed apart, fresh copies of both binaries): the
+  file-backed part equal on every row; anonymous memory within 164 KiB of the base on Box2D
+  (of about 50 MB) and +128 KiB on DeltaBlue at 5 and 200 runs; TypeScript at 5 runs -6.7 MB
+  (-1.2%) with the tier off and -1.9 MB at graph; Box2D's live bytes after each of 19 major
+  collections at equal allocation counts unchanged.
+- Template code. Identical at the default in 3,582 of 3,582 compiles. With the tier off
+  TypeScript's differs in 24 of 942: one compile at another place in the order and 23 of equal
+  length that differ only in embedded words, 442 of them 32-bit words each exactly 9 lower
+  (read as shape numbers in the caches' guards: nine fewer transition shapes exist when these
+  functions compile) and five loads whose offset is one slot lower. No inlining decision
+  differs and no layout or capacity is embedded. The reading of the words is the agent's and
+  not verified; the five loads are not explained.
+- Tests and checks: five tests (the direct sequence after the learning ends; the prediction
+  whatever was measured; the end of the learning exits no compiled function; one setter for
+  each kind of chunk; the bound, sixteen keys learnt and seventeen not), under GC stress too;
+  seven mutations caught; the tier's modules with the tier off, on, eager and with forced
+  exits at both modes; the whole library suite 3,606 passed with the tier off and with it on;
+  zombie's check, clippy, Windows' check and suite (2,902). Mine: the 5-run verifier sweep 42
+  of 42 at both modes on the landed binary; clippy with tests clean and the 12 construct tests
+  passing with the tier off and on, on main.
+- Found on the way. The learning measures each construction's predecessor through a weak
+  handle, so a collection between the last two learning constructions settles the chunk
+  without keys (+7 instructions a construction with the tier off, nothing at graph); GC
+  stress showed it, the tests now keep their instances, and it is left as it is: over the
+  workloads 4,224 constructions settle without keys, all Box2D's. One of the tier's tests,
+  opt::offthread_tests::a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile, failed
+  once at graph under heavy load ("nothing installed", offthread_tests.rs:521) and then
+  passed 30 of 30 under a like load, 15 on the base and 15 on A1, and 12 of 12 alone: not
+  A1's by that count, and an intermittent failure for the tier's line to look into.
+- Left open: which gate sends Earley-Boyer's 350,080 constructions of a constructor with a
+  static layout to the helper; x86-64's instruction counts for A1 (its suite passes there);
+  base classes reached through `super` are not counted by the learning (read, not probed).
