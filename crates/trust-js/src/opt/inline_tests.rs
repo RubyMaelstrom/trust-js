@@ -26,7 +26,7 @@ fn eval(engine: &mut Engine, source: &str) -> String {
 
 /// An engine at the JIT tier that compiles every function at its first call, the tier off, that
 /// ran `source`: the builder tests' feedback, template code's.
-fn warmed(source: &str) -> Engine {
+pub(super) fn warmed(source: &str) -> Engine {
     TestSwitches::default().set();
     let mut engine = Engine::new();
     engine.set_tier(Tier::Jit);
@@ -105,7 +105,7 @@ fn is_call(op: &Op) -> bool {
 /// A compile of a global function's first stage under TRUST_JS_OPT_INLINE=graph as a job makes
 /// it: the planner's plan, the oracle's preparation (the guards appended to the view's inline
 /// targets, each callee's view and raw copy), and the snapshots decoded.
-struct Compile {
+pub(super) struct Compile {
     chunk: Rc<Chunk>,
     view: FrozenChunk,
     snapshot: Snapshot,
@@ -115,7 +115,7 @@ struct Compile {
 }
 
 impl Compile {
-    fn new(engine: &mut Engine, name: &str) -> Self {
+    pub(super) fn new(engine: &mut Engine, name: &str) -> Self {
         let (func, realm) = function(engine, name);
         let plan = crate::bytecode::plan_inlines(
             &first_stage(&func),
@@ -154,7 +154,7 @@ impl Compile {
     }
 
     /// The graph, verified against every frame's chunk as a job verifies it.
-    fn build(&self) -> Built {
+    pub(super) fn build(&self) -> Built {
         let callees: Vec<super::build::Callee<'_>> =
             self.job.as_ref().map_or_else(Vec::new, |job| {
                 job.callees

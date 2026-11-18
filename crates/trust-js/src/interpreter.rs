@@ -1439,7 +1439,10 @@ impl Interp {
             if self.fn_frames[k].fn_ptr == function {
                 return Some(LegacyActivation::Frame(k));
             }
-            let (chain, _) = crate::stack_trace::inline_chain(self.fn_frames[k].call_site);
+            // Frame k's call position is its caller's, the frame below it.
+            let (chain, _) = crate::stack_trace::inline_chain(self.fn_frames[k].call_site, || {
+                self.frame_callee(k.checked_sub(1))
+            });
             if let Some(j) = chain
                 .iter()
                 .position(|(callee, _)| Gc::as_ptr(callee) as usize == function)
@@ -1457,7 +1460,9 @@ impl Interp {
             LegacyActivation::Frame(k) => (k, 0),
             LegacyActivation::Inline(k, j) => (k, j + 1),
         };
-        let (chain, _) = crate::stack_trace::inline_chain(self.fn_frames[k].call_site);
+        let (chain, _) = crate::stack_trace::inline_chain(self.fn_frames[k].call_site, || {
+            self.frame_callee(k.checked_sub(1))
+        });
         if let Some((callee, _)) = chain.into_iter().nth(next) {
             let strict = match &callee.borrow().kind {
                 ObjectKind::User(user) => user.func.is_strict,
@@ -5515,6 +5520,9 @@ fn drop_collected_realm(mut realm: crate::agent_access::Owned<Interp>) {
 
 impl Drop for Interp {
     fn drop(&mut self) {
+        // Its frame-callee table, which outlives it for code that embeds its address (P3 stage
+        // 3, piece B).
+        crate::stack_trace::clear_frame_callees(self as *const Interp as usize);
         // The optimizing tier's compiles still running off the main thread are cancelled: the
         // compile thread skips them or drops their results (P3 stage 2, step 12).
         self.opt_pending.cancel();

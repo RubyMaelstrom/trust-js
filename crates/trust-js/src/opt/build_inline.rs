@@ -79,6 +79,35 @@ pub(crate) struct InlineWay {
     /// the callee chunk's call-cache index: frames nested in this way's frame, whose guards
     /// run in it and whose sites chain to its call's (`oracle::prepare`).
     pub(crate) nested: Vec<InlineSite>,
+    /// The by-literal ways of this way's callee's calls (P3 stage 3, piece B): each a call whose
+    /// callee is a formal the compiled frame binds to a closure it creates, taken where the
+    /// call's callee node is that creation's (`Builder::closures`).
+    pub(crate) literals: Vec<LiteralWay>,
+}
+
+/// A by-literal way (P3 stage 3, piece B; target/p3/stage3/step3f-impl/design-note-B.txt): the
+/// closure literal a call of an inlined callee calls where its callee node is a closure the
+/// compiled frame created from it, built with no guard, as Maglev builds a call of a new
+/// closure (TryReduceCallForNewClosure, maglev-graph-builder.cc:11963-11980).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LiteralWay {
+    /// The call's site in the way's callee chunk: its call-cache index.
+    pub(crate) cache: u32,
+    /// The literal: Op::MakeClosure's function index in the compiled chunk.
+    pub(crate) literal: u32,
+    /// Its first-stage chunk: its index among the compile's callee chunks.
+    pub(crate) chunk: u32,
+    /// Its frame's inline site's position (`stack_trace::InlineCallee::Frame`).
+    pub(crate) position: u32,
+    /// Whether its closures' [[Environment]] is a self-name record: a named function expression
+    /// whose name may be observed (`ast::Function::needs_self_environment`, which the creation,
+    /// `Interp::make_function_named`, and the scope plan's addresses both read), whose one
+    /// binding is the closure and whose parent is the creation's running environment.
+    pub(crate) self_name: bool,
+    /// The interpreter the compile was made for and its frame-callee table
+    /// (`stack_trace::frame_callee_table`), by address.
+    pub(crate) interp: usize,
+    pub(crate) table: usize,
 }
 
 /// A callee chunk as a compile reads it: its frozen view and its snapshot, whose exit profile is
@@ -101,6 +130,8 @@ pub(crate) struct InlineNote {
 pub(crate) enum InlineOutcome {
     /// Built in the graph, an inlined frame.
     Inlined,
+    /// Built in the graph as a by-literal frame, with no guard (P3 stage 3, piece B).
+    ByLiteral,
     /// Declined: why, and the callee's operation where one of them declined it (E0's).
     Declined {
         reason: &'static str,
@@ -127,6 +158,8 @@ thread_local! {
     /// The frames the builders of this thread opened nested in an inlined frame (tests; P3
     /// stage 3 step 3d).
     pub(crate) static TEST_NESTED_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// The by-literal frames the builders of this thread opened (tests; piece B).
+    pub(crate) static TEST_LITERAL_FRAMES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// A callee chunk's analyses (see the module's doc).
@@ -153,6 +186,9 @@ pub(super) struct Tree<'a> {
     analyses: Vec<Result<Analysis, Refused>>,
     /// The sites, by call-cache index.
     sites: FastMap<u32, &'a InlineSite>,
+    /// The closure literals some way's by-literal way names (piece B): the compiled frame's
+    /// creations of them carry a fact (`Builder::closures`).
+    pub(super) literals: Vec<u32>,
 }
 
 impl<'a> Tree<'a> {
@@ -169,11 +205,20 @@ impl<'a> Tree<'a> {
             kept += u32::from(analysis.is_ok());
             analyses.push(analysis);
         }
+        let mut literals: Vec<u32> = sites
+            .iter()
+            .flat_map(|site| &site.ways)
+            .flat_map(|way| &way.literals)
+            .map(|literal| literal.literal)
+            .collect();
+        literals.sort_unstable();
+        literals.dedup();
         Tree {
             compiled,
             callees,
             analyses,
             sites: sites.iter().map(|site| (site.cache, site)).collect(),
+            literals,
         }
     }
 
@@ -401,7 +446,7 @@ pub(super) struct Inlined<'a> {
     /// The receiver the call passes, the callee's `this`.
     receiver: NodeIx,
     /// The closure's [[Environment]], the callee's running environment.
-    env: usize,
+    env: FrameEnv,
     holders: &'a [(u16, usize)],
     /// The values its callers' operations may reach after its return, whose facts its prunes
     /// keep.
@@ -415,6 +460,31 @@ pub(super) struct Inlined<'a> {
     /// own calls the plan inlines in turn (P3 stage 3 step 3d): frames nested in this one.
     tree: &'a Tree<'a>,
     nested: &'a [InlineSite],
+    /// The by-literal ways of this frame's calls (piece B).
+    literals: &'a [LiteralWay],
+    /// A by-literal frame's: its activation's frame-callee table entry and the table, which its
+    /// returns clear.
+    frame_entry: Option<(NodeIx, usize)>,
+}
+
+/// An inlined frame's running environment: a guarded way's closure's, a constant while its guard
+/// holds; a by-literal frame's, its closure's [[Environment]] as two nodes (piece B).
+#[derive(Clone, Copy)]
+pub(super) enum FrameEnv {
+    Const(usize),
+    /// A by-literal frame's: `creation`, the running environment the creation captured, and,
+    /// where the closure's [[Environment]] is a self-name record over it (`LiteralWay::
+    /// self_name`), `self_name`, the frame's callee node, which is that record's one binding. The
+    /// record itself is no node: a read of the name is the callee node, as V8's inlined frame
+    /// reads its function_closure register (Maglev's BuildRegisterFrameInitialization,
+    /// maglev-graph-builder.cc:830-831, from BuildInlineFunction, :7445), Warp's build_Callee its
+    /// inlined call's callee (WarpBuilder.cpp:1969-1983) and JSC's DFG a closure call's callee
+    /// slot (DFGByteCodeParser.cpp:2213-2215); every other name walks from `creation`, one record
+    /// fewer (`Builder::running_walk`).
+    Literal {
+        creation: NodeIx,
+        self_name: Option<NodeIx>,
+    },
 }
 
 impl<'a> Inlined<'a> {
@@ -427,7 +497,7 @@ impl<'a> Inlined<'a> {
         self.receiver
     }
 
-    pub(super) fn env(&self) -> usize {
+    pub(super) fn env(&self) -> FrameEnv {
         self.env
     }
 
@@ -466,6 +536,20 @@ impl Exits {
     }
 }
 
+/// An inlined frame's way, as `Builder::open_inlined` builds it: a guarded way's or a by-literal
+/// way's (piece B).
+struct WayFrame<'a> {
+    /// The callee chunk: its index among the compile's callee chunks.
+    chunk: u32,
+    position: u32,
+    env: FrameEnv,
+    holders: &'a [(u16, usize)],
+    nested: &'a [InlineSite],
+    literals: &'a [LiteralWay],
+    /// A by-literal frame's table entry and table.
+    frame_entry: Option<(NodeIx, usize)>,
+}
+
 /// An edge into a continuation.
 enum Pred {
     /// A callee's return of `value`, its state's facts `facts`.
@@ -502,8 +586,15 @@ impl<'a> Builder<'a> {
         with_this: bool,
         st: &mut State,
     ) -> Result<(), Refusal> {
+        // A call whose callee node is a closure the compiled frame created from a literal this
+        // frame's way lists a by-literal way for (piece B): that way, before any nested site's
+        // guarded ways, as Maglev reduces a call by its target node's kind before a generic call
+        // (ReduceCall, maglev-graph-builder.cc:11940-11983); the identity guards a nested site
+        // would test are not built at it.
+        let literal = self.literal_way(cache, argc, with_this, st);
         // The compiled frame's sites, or an inlined frame's own, nested in it (step 3d).
         let found = match &self.inlined {
+            _ if literal.is_some() => None,
             Some(inlined) => {
                 let tree = inlined.tree;
                 inlined
@@ -516,11 +607,15 @@ impl<'a> Builder<'a> {
                 .inlining
                 .and_then(|tree| Some((tree, *tree.sites.get(&cache)?))),
         };
-        let Some((tree, site)) = found else {
+        if found.is_none() && literal.is_none() {
             return self.effect(pc, st);
-        };
+        }
         let mut kept: Vec<(usize, &'a InlineWay, &'a Analysis)> = Vec::new();
-        for (place, way) in site.ways.iter().enumerate() {
+        for (place, way) in found
+            .iter()
+            .flat_map(|(_, site)| site.ways.iter().enumerate())
+        {
+            let tree = found.expect("a site").0;
             match &tree.analyses[way.chunk as usize] {
                 Ok(analysis) => kept.push((place, way, analysis)),
                 Err((reason, at)) => self.inline_log.push(InlineNote {
@@ -531,7 +626,7 @@ impl<'a> Builder<'a> {
                 }),
             }
         }
-        if kept.is_empty() {
+        if kept.is_empty() && literal.is_none() {
             return self.effect(pc, st);
         }
         let argc = usize::from(argc);
@@ -577,6 +672,70 @@ impl<'a> Builder<'a> {
         };
         let mut exits = Exits::default();
         let mut generic = true;
+        if let Some((way, analysis, env)) = literal {
+            // The activation's table entry (-1: none, the generic call), the closure stored in it
+            // before the frame's first node, the frame on the entry's test.
+            let index = self.hoist(Hoisted::FrameIndex(way.interp as u64, way.table as u64));
+            let zero = self.hoist(Hoisted::I32(0));
+            let stored = self.add(NodeOp::I32Cmp(Cond::Ge), &[index, zero], Rep::Bool, pc);
+            let then_block = self.graph.add_block(pc as u32, false);
+            let else_block = self.graph.add_block(pc as u32, false);
+            self.add(
+                NodeOp::Branch {
+                    then_block,
+                    else_block,
+                },
+                &[stored],
+                Rep::None,
+                pc,
+            );
+            let from = self.cur;
+            self.graph.add_edge(from, then_block);
+            self.graph.add_edge(from, else_block);
+            self.cur = then_block;
+            self.add(
+                NodeOp::StoreFrameCallee {
+                    table: way.table as u64,
+                },
+                &[index, call.callee],
+                Rep::None,
+                pc,
+            );
+            // Test builds: the frame's assumption about its closure's [[Environment]] checked
+            // where it begins (see `NodeOp::CheckFrameEnv`).
+            if cfg!(test) {
+                self.add(
+                    NodeOp::CheckFrameEnv {
+                        self_name: way.self_name,
+                    },
+                    &[call.callee, env],
+                    Rep::None,
+                    pc,
+                );
+            }
+            #[cfg(test)]
+            TEST_LITERAL_FRAMES.with(|count| count.set(count.get() + 1));
+            let frame = WayFrame {
+                chunk: way.chunk,
+                position: way.position,
+                env: FrameEnv::Literal {
+                    creation: env,
+                    self_name: way.self_name.then_some(call.callee),
+                },
+                holders: &[],
+                nested: &[],
+                literals: &[],
+                frame_entry: Some((index, way.table)),
+            };
+            self.open_inlined(&call, frame, analysis, st, &mut exits)?;
+            self.cur = else_block;
+            self.inline_log.push(InlineNote {
+                pc: pc as u32,
+                way: 0,
+                chunk: way.chunk,
+                outcome: InlineOutcome::ByLiteral,
+            });
+        }
         // Every planned way from the first compile (P3 stage 3 step 3f, piece D; the owner's D7):
         // each but the last a test and a branch, as Maglev's polymorphic call arms compare each
         // target (maglev-graph-builder.cc:6038-6125) and JSC's polymorphic call inlining switches
@@ -586,7 +745,7 @@ impl<'a> Builder<'a> {
         // way names), where it too is a test and the generic call follows.
         let expected: Vec<usize> = kept.iter().map(|&(_, way, _)| way.callee).collect();
         let past_plan = past_plan(self.snapshot, pc, &expected);
-        let last = kept.len() - 1;
+        let last = kept.len().saturating_sub(1);
         for (k, (place, way, analysis)) in kept.into_iter().enumerate() {
             let note = |outcome| InlineNote {
                 pc: pc as u32,
@@ -632,11 +791,11 @@ impl<'a> Builder<'a> {
         // generic call is built here and no built way runs a generic node.
         debug_assert!(
             self.inlined.is_some()
-                || tree.effect_free(cache, pc, self.snapshot)
+                || found.is_some_and(|(tree, site)| tree.effect_free(cache, pc, self.snapshot)
                     == (!generic
                         && !site.ways.iter().any(|way| {
                             matches!(&tree.analyses[way.chunk as usize], Ok(analysis) if analysis.generic)
-                        })),
+                        }))),
             "the loop prepass and the build disagree on the call at pc {pc}"
         );
         if generic {
@@ -699,6 +858,68 @@ impl<'a> Builder<'a> {
         st: &State,
         exits: &mut Exits,
     ) -> Result<(), Refusal> {
+        let frame = WayFrame {
+            chunk: way.chunk,
+            position: way.position,
+            env: FrameEnv::Const(way.env),
+            holders: &way.holders,
+            nested: &way.nested,
+            literals: &way.literals,
+            frame_entry: None,
+        };
+        self.open_inlined(call, frame, analysis, st, exits)
+    }
+
+    /// The by-literal way of call site `cache` in this inlined frame, whose operands are on
+    /// `st`'s stack, where its callee node is a creation of the literal the way names (piece B):
+    /// the way, its callee's analyses and the creation's running environment; None otherwise, or
+    /// where the inliner declines the literal's chunk (logged).
+    fn literal_way(
+        &mut self,
+        cache: u32,
+        argc: u16,
+        with_this: bool,
+        st: &State,
+    ) -> Option<(&'a LiteralWay, &'a Analysis, NodeIx)> {
+        let inlined = self.inlined.as_ref()?;
+        let (literals, tree): (&'a [LiteralWay], &'a Tree<'a>) = (inlined.literals, inlined.tree);
+        if literals.is_empty() {
+            return None;
+        }
+        let len = st.stack.len();
+        if len < usize::from(argc) + 1 + usize::from(with_this) {
+            return None;
+        }
+        let callee = st.stack[len - usize::from(argc) - 1];
+        let &(literal, env) = self.closures.get(&callee)?;
+        let way = literals
+            .iter()
+            .find(|way| way.cache == cache && way.literal == literal)?;
+        match &tree.analyses[way.chunk as usize] {
+            Ok(analysis) => Some((way, analysis, env)),
+            Err((reason, at)) => {
+                self.inline_log.push(InlineNote {
+                    pc: 0,
+                    way: 0,
+                    chunk: way.chunk,
+                    outcome: InlineOutcome::Declined { reason, at: *at },
+                });
+                None
+            }
+        }
+    }
+
+    /// A callee built in the graph in a frame of its own, `frame` its way's parts, by a builder
+    /// over its chunk (see the module's doc); its returns' edges into `exits`.
+    fn open_inlined(
+        &mut self,
+        call: &Call,
+        frame: WayFrame<'a>,
+        analysis: &'a Analysis,
+        st: &State,
+        exits: &mut Exits,
+    ) -> Result<(), Refusal> {
+        let way = &frame;
         let tree = self
             .inlining
             .or_else(|| self.inlined.as_ref().map(|inlined| inlined.tree))
@@ -708,14 +929,18 @@ impl<'a> Builder<'a> {
             TEST_NESTED_FRAMES.with(|count| count.set(count.get() + 1));
         }
         let (view, snapshot) = tree.callees[way.chunk as usize];
-        let frame = self.graph.open_frame(InlinedFrame {
+        let frame_ix = self.graph.open_frame(InlinedFrame {
             chunk: analysis.frame_chunk,
             parent: call.parent,
             call_pc: call.pc as u32,
             callee: call.callee,
             receiver: call.receiver,
             position: way.position,
-            env: way.env,
+            env: match way.env {
+                FrameEnv::Const(env) => env,
+                FrameEnv::Literal { .. } => 0,
+            },
+            by_literal: way.frame_entry.is_some(),
         });
         let (n_params, n_slots) = view.jit_frame();
         let undefined = self.word(PACK_UNDEFINED);
@@ -757,22 +982,25 @@ impl<'a> Builder<'a> {
             headers: (0..blocks).map(|_| None).collect(),
             hoisted: std::mem::take(&mut self.hoisted),
             hoisted_nodes: std::mem::take(&mut self.hoisted_nodes),
+            closures: std::mem::take(&mut self.closures),
             moves_env: view.jit_ops().iter().any(names::moves_env),
             checks_store: Vec::new(),
             ended: false,
             notes: std::mem::take(&mut self.notes),
-            frame,
+            frame: frame_ix,
             inlining: None,
             inlined: Some(Inlined {
                 receiver: call.receiver,
                 env: way.env,
-                holders: &way.holders,
+                holders: way.holders,
                 live: call.live.clone(),
                 call_pc: call.pc,
                 caller: self.frame,
                 exits: std::mem::take(exits),
                 tree,
-                nested: &way.nested,
+                nested: way.nested,
+                literals: way.literals,
+                frame_entry: way.frame_entry,
             }),
             inline_log: Vec::new(),
         };
@@ -782,6 +1010,7 @@ impl<'a> Builder<'a> {
         self.graph = std::mem::take(&mut inner.graph);
         self.hoisted = std::mem::take(&mut inner.hoisted);
         self.hoisted_nodes = std::mem::take(&mut inner.hoisted_nodes);
+        self.closures = std::mem::take(&mut inner.closures);
         self.notes = std::mem::take(&mut inner.notes);
         *exits = inner
             .inlined
@@ -823,6 +1052,22 @@ impl<'a> Builder<'a> {
         st.stack.push(value);
         self.prune(&mut st);
         st.stack.clear();
+        // A by-literal frame's entry cleared at its return (piece B: an entry is nonzero exactly
+        // while the by-literal frame that stored it runs).
+        if let Some((index, table)) = self
+            .inlined
+            .as_ref()
+            .and_then(|inlined| inlined.frame_entry)
+        {
+            self.add(
+                NodeOp::ClearFrameCallee {
+                    table: table as u64,
+                },
+                &[index],
+                Rep::None,
+                pc,
+            );
+        }
         let Builder { inlined, graph, .. } = self;
         let inlined = inlined.as_mut().expect("an inlined frame's builder");
         let to = inlined.exits.continuation(graph, inlined.call_pc);

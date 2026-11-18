@@ -309,6 +309,7 @@ impl Build {
             receiver,
             position: crate::stack_trace::NO_POSITION,
             env: 0,
+            by_literal: false,
         })
     }
 }

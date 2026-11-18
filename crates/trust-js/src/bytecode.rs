@@ -10825,7 +10825,9 @@ fn register_inline_sites(c: &mut Compiler) -> crate::stack_trace::InlineSites {
         };
         listed[index] = sites.len() as u32;
         sites.push(InlineSite {
-            callee: c.inline_targets[target as usize].pin.clone(),
+            callee: crate::stack_trace::InlineCallee::Static(
+                c.inline_targets[target as usize].pin.clone(),
+            ),
             inner,
             outer,
         });
@@ -11132,6 +11134,177 @@ fn spread_call_sites(chunk: &Chunk) -> Vec<bool> {
     spread
 }
 
+/// The splice planner's rules for one callee `f`, whose [[Realm]] is `callee_realm` and whose
+/// call's cache names `n_params` parameters, at a call of `chunk`, function `caller`'s, optimized
+/// in `realm`; `max_ops` the callee size limit: its first-stage chunk, or why the planner declines
+/// it. P3 stage 3's piece B applies the same rules to a closure literal the optimized function
+/// creates and passes to an inlined callee (`opt::oracle`).
+pub(crate) fn inline_callee_rules(
+    chunk: &Chunk,
+    caller: &Function,
+    realm: usize,
+    callee_realm: usize,
+    f: &Function,
+    n_params: u16,
+    max_ops: usize,
+) -> Result<Rc<Chunk>, &'static str> {
+    // A splice runs in the caller's Realm: its literals, intrinsics and global object must be
+    // the callee's [[Realm]]'s. The callee's free names resolve from its own [[Environment]]
+    // (`Op::LoadNameIn`, behind the identity guard), so any same-Realm closure qualifies.
+    if callee_realm != realm {
+        return Err("cross-realm callee");
+    }
+    if f.is_strict != caller.is_strict {
+        return Err("strictness");
+    }
+    // Lexical observations must remain in the definition frame. Plain arrow helpers need no
+    // such frame and share the ordinary parameter/free-name guarded splice.
+    if f.is_arrow && f.scan_flags() & (SCAN_THIS | SCAN_ARGUMENTS | SCAN_NEW_TARGET) != 0 {
+        return Err("arrow lexical observations");
+    }
+    if f.params.iter().any(|p| {
+        p.rest || p.default.is_some() || !matches!(p.pattern, crate::ast::Pattern::Ident(_))
+    }) {
+        return Err("param shape");
+    }
+    let runtime = f.runtime();
+    let Some(Some(callee_chunk)) = runtime.code.get() else {
+        return Err("callee not compiled");
+    };
+    if std::ptr::eq(&**callee_chunk, chunk) {
+        return Err("self-recursion");
+    }
+    if callee_chunk.ops.len() > max_ops
+        || callee_chunk.n_slots > 32
+        || !callee_chunk.jit_no_activation()
+        || callee_chunk.env_this
+        || n_params > 8
+    {
+        return Err("callee size/shape");
+    }
+    if callee_chunk
+        .ops
+        .iter()
+        .any(|op| inline_capability(op) == InlineCapability::RequiresCallContext)
+    {
+        return Err("callee operation requires an unremapped call context");
+    }
+    // `typeof name` has no environment-redirected form (see `Compiler::inline_env_op`).
+    if callee_chunk
+        .ops
+        .iter()
+        .any(|op| matches!(op, Op::TypeofName(_)))
+    {
+        return Err("typeof of a free name");
+    }
+    // Legacy `f.caller` / `f.arguments` read an activation's frame, and a splice runs without
+    // one: a callee that names either property keeps its frame (the reflection still finds
+    // splices that call out through their call positions).
+    if callee_chunk
+        .names
+        .iter()
+        .any(|name| matches!(&**name, "caller" | "arguments"))
+    {
+        return Err("legacy caller/arguments reflection");
+    }
+    Ok(callee_chunk.clone())
+}
+
+/// The splice planner's callee size limit, as `plan_inlines_at` reads it (P3 stage 3, piece B).
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn inline_max_ops() -> usize {
+    env_value!("TRUST_JS_INLINE_MAX_OPS")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(96)
+}
+
+/// What the planner's budget leaves after a plan (P3 stage 3, piece B): the shared and small
+/// budgets as [`plan_inlines`] starts them for the optimized chunk, each planned way's take
+/// replayed in the planner's order (sites by cache index, a way's take before its nested plan,
+/// with its site's `in_loop`), so that a closure literal's way takes from what the plan left and
+/// never displaces a planned way.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) struct InlineBudgetLeft(InlineBudget);
+
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+impl InlineBudgetLeft {
+    pub(crate) fn after(
+        chunk: &Chunk,
+        plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
+    ) -> Self {
+        // `plan_inlines`'s start.
+        let limit = env_value!("TRUST_JS_INLINE_BUDGET")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(320usize);
+        let mut budget = InlineBudget {
+            shared: limit.saturating_sub(chunk.ops.len()),
+            small: env_value!("TRUST_JS_INLINE_SMALL_BUDGET")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(INLINE_SMALL_BUDGET),
+        };
+        fn replay(
+            chunk: &Chunk,
+            plan: &crate::fasthash::FastMap<u32, InlinePlanEntry>,
+            outer_in_loop: bool,
+            budget: &mut InlineBudget,
+        ) {
+            let loops = call_sites_in_loops(chunk);
+            let mut entries: Vec<(&u32, &InlinePlanEntry)> = plan.iter().collect();
+            entries.sort_unstable_by_key(|&(cache, _)| *cache);
+            for (&cache, entry) in entries {
+                let in_loop = outer_in_loop || loops.get(cache as usize).copied().unwrap_or(false);
+                for way in &entry.ways {
+                    let Some(Some(callee)) = way.f.runtime().code.get().cloned() else {
+                        continue;
+                    };
+                    budget.take(callee.ops.len(), way.leaf, in_loop);
+                    replay(&callee, &way.nested, in_loop, budget);
+                }
+            }
+        }
+        replay(chunk, plan, false, &mut budget);
+        InlineBudgetLeft(budget)
+    }
+
+    /// Charge a literal's way of `cost` source operations, as the planner charges a way.
+    pub(crate) fn take(&mut self, cost: usize, leaf: bool, in_loop: bool) -> bool {
+        self.0.take(cost, leaf, in_loop)
+    }
+}
+
+/// Whether call site `cache` of `chunk` repeats in a loop of it, as the planner reads it.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn call_site_in_loop(chunk: &Chunk, cache: u32) -> bool {
+    call_sites_in_loops(chunk)
+        .get(cache as usize)
+        .copied()
+        .unwrap_or(false)
+}
+
 fn plan_inlines_at(
     chunk: &Chunk,
     caller: &Function,
@@ -11205,67 +11378,20 @@ fn plan_inlines_at(
             let crate::value::ObjectKind::User(user) = &b.kind else {
                 continue;
             };
-            // A splice runs in the caller's Realm: its literals, intrinsics and global object
-            // must be the callee's [[Realm]]'s. The callee's free names resolve from its own
-            // [[Environment]] (`Op::LoadNameIn`, behind the identity guard), so any same-Realm
-            // closure qualifies.
-            if user.realm != realm {
-                skip!(idx, "cross-realm callee");
-            }
             let f = &user.func;
-            if f.is_strict != caller.is_strict {
-                skip!(idx, "strictness");
-            }
-            // Lexical observations must remain in the definition frame. Plain arrow helpers
-            // need no such frame and share the ordinary parameter/free-name guarded splice.
-            if f.is_arrow && f.scan_flags() & (SCAN_THIS | SCAN_ARGUMENTS | SCAN_NEW_TARGET) != 0 {
-                skip!(idx, "arrow lexical observations");
-            }
-            if f.params.iter().any(|p| {
-                p.rest || p.default.is_some() || !matches!(p.pattern, crate::ast::Pattern::Ident(_))
-            }) {
-                skip!(idx, "param shape");
-            }
-            let runtime = f.runtime();
-            let Some(Some(callee_chunk)) = runtime.code.get() else {
-                skip!(idx, "callee not compiled");
+            let callee_chunk = match inline_callee_rules(
+                chunk,
+                caller,
+                realm,
+                user.realm,
+                f,
+                ic.n_params,
+                max_ops,
+            ) {
+                Ok(callee_chunk) => callee_chunk,
+                Err(why) => skip!(idx, why),
             };
-            if std::ptr::eq(&**callee_chunk, chunk) {
-                skip!(idx, "self-recursion");
-            }
-            if callee_chunk.ops.len() > max_ops
-                || callee_chunk.n_slots > 32
-                || !callee_chunk.jit_no_activation()
-                || callee_chunk.env_this
-                || ic.n_params > 8
-            {
-                skip!(idx, "callee size/shape");
-            }
-            if callee_chunk
-                .ops
-                .iter()
-                .any(|op| inline_capability(op) == InlineCapability::RequiresCallContext)
-            {
-                skip!(idx, "callee operation requires an unremapped call context");
-            }
-            // `typeof name` has no environment-redirected form (see `Compiler::inline_env_op`).
-            if callee_chunk
-                .ops
-                .iter()
-                .any(|op| matches!(op, Op::TypeofName(_)))
-            {
-                skip!(idx, "typeof of a free name");
-            }
-            // Legacy `f.caller` / `f.arguments` read an activation's frame, and a splice runs
-            // without one: a callee that names either property keeps its frame (the reflection
-            // still finds splices that call out through their call positions).
-            if callee_chunk
-                .names
-                .iter()
-                .any(|name| matches!(&**name, "caller" | "arguments"))
-            {
-                skip!(idx, "legacy caller/arguments reflection");
-            }
+            let callee_chunk = &callee_chunk;
             let mut free_names: Vec<Rc<str>> = Vec::new();
             for op in callee_chunk.ops.iter() {
                 if let InlineCapability::ClosureRead(n) = inline_capability(op) {
@@ -24250,6 +24376,11 @@ fn bin_cmp(
 impl Chunk {
     pub(crate) fn jit_ops(&self) -> &[Op] {
         &self.ops
+    }
+    /// The function literal Op::MakeClosure(`index`, _) creates closures of (P3 stage 3, piece
+    /// B: the oracle's by-literal ways).
+    pub(crate) fn function_literal(&self, index: u32) -> Option<&Rc<Function>> {
+        self.funcs.get(index as usize)
     }
     /// A borrowed sloppy ordinary activation may expose slot-backed formals through its
     /// parked legacy arguments map. Fresh compiled entries keep their established contract.

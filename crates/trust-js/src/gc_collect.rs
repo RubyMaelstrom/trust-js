@@ -2267,6 +2267,7 @@ impl Interp {
     }
 
     fn trace_gc_roots(&self, sink: &mut dyn GcSink) {
+        let interp = self as *const Interp as usize;
         let Interp {
             gc_heap: _,
             gc_core_raw: _,
@@ -2497,6 +2498,9 @@ impl Interp {
         }
         host_settings_states.trace_gc(sink);
         fn_frames.trace_gc(sink);
+        // The by-literal frames' callees of activations a frame above runs over (P3 stage 3,
+        // piece B).
+        crate::stack_trace::trace_frame_callees(interp, fn_frames, sink);
         if let Some(tail) = pending_tail {
             let (callee, this, arguments) = &**tail;
             callee.trace_gc(sink);

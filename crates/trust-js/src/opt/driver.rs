@@ -1213,6 +1213,9 @@ fn log_inlines(chunk: &Chunk, inlines: &[super::build::InlineNote], held: &super
             InlineOutcome::Inlined => {
                 log_line!("[opt] inlined {caller} pc {pc} way {way}: {callee}")
             }
+            InlineOutcome::ByLiteral => {
+                log_line!("[opt] inlined {caller} pc {pc} by literal: {callee}")
+            }
             InlineOutcome::Declined {
                 reason,
                 at: Some((at, op)),

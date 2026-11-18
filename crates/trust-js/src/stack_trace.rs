@@ -66,9 +66,233 @@ pub(crate) fn is_inline_position(position: u32) -> bool {
 /// when the caller is spliced too).
 #[derive(Clone)]
 pub(crate) struct InlineSite {
-    pub(crate) callee: crate::value::WeakGc,
+    pub(crate) callee: InlineCallee,
     pub(crate) inner: u32,
     pub(crate) outer: u32,
+}
+
+/// How an inline site names its callee.
+#[derive(Clone)]
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) enum InlineCallee {
+    /// A splice's or a guarded way's callee, whose identity the code checks.
+    Static(crate::value::WeakGc),
+    /// A by-literal frame's (P3 stage 3, piece B): a closure the compiled code made, a fresh
+    /// object at each creation, which the activation running the frame stores in its entry of
+    /// its interpreter's frame-callee table ([`frame_callee_word`]) at the frame's entry and
+    /// clears at its end, as JSC recovers a closure call's callee from its machine frame
+    /// (InlineCallFrame::calleeForCallFrame, bytecode/InlineCallFrame.cpp:44-46).
+    Frame,
+}
+
+impl InlineCallee {
+    /// The callee: a static one while it lives, a by-literal frame's `frame`'s. A by-literal
+    /// site whose frame stored no word is a bug: a reader meets a by-literal position only while
+    /// its frame runs (the code publishes an inlined frame's position in `Interp::call_site` for
+    /// one node's helpers and writes NO_POSITION again after them, `jit::
+    /// emit_inlined_call_restore` and the node's restore in `opt::a64`, and a frame above holds it
+    /// as its call position only while that call runs), when its entry holds the closure; in
+    /// release it is left out, as a dead static callee is (P3 stage 3, piece B's condition 4).
+    pub(crate) fn resolve(
+        &self,
+        frame: &mut dyn FnMut() -> Option<crate::value::Gc>,
+    ) -> Option<crate::value::Gc> {
+        match self {
+            InlineCallee::Static(callee) => callee.upgrade(),
+            InlineCallee::Frame => {
+                let callee = frame();
+                debug_assert!(
+                    callee.is_some(),
+                    "a by-literal frame's site with no callee word"
+                );
+                callee
+            }
+        }
+    }
+
+    /// A static callee's site name.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn of(callee: &crate::value::Gc) -> Self {
+        InlineCallee::Static(crate::value::Gc::downgrade(callee))
+    }
+}
+
+/// The depth of a frame-callee table: the FnFrame indices an activation with a by-literal frame
+/// can store its callee at; an activation deeper than this takes each by-literal frame's call
+/// generically (P3 stage 3, piece B; fewer in test builds, whose tests reach past it).
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) const FRAME_CALLEE_WORDS: usize = if cfg!(test) { 256 } else { 4096 };
+
+thread_local! {
+    /// The frame-callee tables of this thread's interpreters, by the interpreter's address (P3
+    /// stage 3, piece B): each [`FRAME_CALLEE_WORDS`] words, one per FnFrame index, made on the
+    /// main thread by the first compile that has a by-literal frame, zeroed at its interpreter's
+    /// drop and kept for the thread's life, so that the address a compiled code embeds never
+    /// dangles while the thread can run that code (an interpreter later made at the same address
+    /// takes the same table; compiled chunks are thread-bound). An interpreter is no field's
+    /// owner of it: its code compares `JitCtx::interp` with the address it was compiled for.
+    static FRAME_CALLEES: std::cell::RefCell<Vec<(usize, Box<[std::cell::Cell<u64>]>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The frame-callee table of the interpreter at `interp`, made if `make` and none exists: its
+/// first word's address.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn frame_callee_table(interp: usize, make: bool) -> Option<usize> {
+    FRAME_CALLEES.with(|tables| {
+        let mut tables = tables.borrow_mut();
+        if let Some((_, table)) = tables.iter().find(|(at, _)| *at == interp) {
+            return Some(table.as_ptr() as usize);
+        }
+        if !make {
+            return None;
+        }
+        let table: Box<[std::cell::Cell<u64>]> = (0..FRAME_CALLEE_WORDS)
+            .map(|_| std::cell::Cell::new(0))
+            .collect();
+        let address = table.as_ptr() as usize;
+        tables.push((interp, table));
+        Some(address)
+    })
+}
+
+/// The word FnFrame index `index`'s activation of the interpreter at `interp` stored, 0 for none.
+pub(crate) fn frame_callee_word(interp: usize, index: usize) -> u64 {
+    FRAME_CALLEES.with(|tables| {
+        tables
+            .borrow()
+            .iter()
+            .find(|(at, _)| *at == interp)
+            .and_then(|(_, table)| table.get(index))
+            .map_or(0, std::cell::Cell::get)
+    })
+}
+
+/// Clear entry `index` of the interpreter at `interp`'s table, where one exists: an exit from a
+/// code that has a by-literal frame (P3 stage 3, piece B).
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
+pub(crate) fn clear_frame_callee(interp: usize, index: usize) {
+    FRAME_CALLEES.with(|tables| {
+        if let Some(word) = tables
+            .borrow()
+            .iter()
+            .find(|(at, _)| *at == interp)
+            .and_then(|(_, table)| table.get(index))
+        {
+            word.set(0);
+        }
+    });
+}
+
+/// Zero the interpreter at `interp`'s table, at its drop (see [`FRAME_CALLEES`]).
+pub(crate) fn clear_frame_callees(interp: usize) {
+    // The thread's locals may be gone already where an interpreter drops at the thread's end.
+    let _ = FRAME_CALLEES.try_with(|tables| {
+        if let Some((_, table)) = tables.borrow().iter().find(|(at, _)| *at == interp) {
+            table.iter().for_each(|word| word.set(0));
+        }
+    });
+}
+
+/// The collector's reads of the frame-callee table of the interpreter at `interp`, whose
+/// function frames are `frames` (P3 stage 3, piece B's condition 3): entry d only where frame
+/// d + 1 was called from inside a by-literal frame of the activation at d (its call position's
+/// chain names one), which stored the entry at the frame's entry and runs it until the call
+/// returns; never the top frame's entry, whose current position the walk cannot tell from an
+/// older publication, nor any above it, so that a word left from an ended frame keeps nothing.
+pub(crate) fn trace_frame_callees(
+    interp: usize,
+    frames: &[crate::interpreter::FnFrame],
+    sink: &mut dyn crate::gc_trace::GcSink,
+) {
+    // Debug builds: the invariant the clears keep, that an entry is nonzero exactly while the
+    // by-literal frame that stored it runs (P3 stage 3, piece B, the coordinator's point C):
+    // none at or above the frames' count (an ended activation's), and below the top only one
+    // whose frame above was called from inside a by-literal frame. A way out of a frame that no
+    // clear covers fails here at the next collection.
+    #[cfg(debug_assertions)]
+    FRAME_CALLEES.with(|tables| {
+        let tables = tables.borrow();
+        let Some((_, table)) = tables.iter().find(|(at, _)| *at == interp) else {
+            return;
+        };
+        for (d, word) in table.iter().enumerate() {
+            let word = word.get();
+            if word == 0 || d + 1 == frames.len() {
+                continue;
+            }
+            assert!(
+                d < frames.len(),
+                "frame-callee entry {d} nonzero at or above the {} frames: {word:#x}",
+                frames.len()
+            );
+            assert!(
+                names_frame_callee(frames[d + 1].call_site),
+                "frame-callee entry {d} nonzero under a frame not called from a by-literal frame"
+            );
+        }
+    });
+    if frames.len() < 2 {
+        return;
+    }
+    let words: Vec<u64> = FRAME_CALLEES.with(|tables| {
+        let tables = tables.borrow();
+        let Some((_, table)) = tables.iter().find(|(at, _)| *at == interp) else {
+            return Vec::new();
+        };
+        (0..frames.len() - 1)
+            .take_while(|&d| d < table.len())
+            .filter(|&d| names_frame_callee(frames[d + 1].call_site))
+            .map(|d| table[d].get())
+            .filter(|&word| word != 0)
+            .collect()
+    });
+    for word in words {
+        // SAFETY: as `Interp::frame_callee`'s: the running frame's closure.
+        crate::gc_trace::GcTrace::trace_gc(&unsafe { Value::from_bits(word) }, sink);
+    }
+}
+
+/// Whether the chain of inline `position` names a by-literal frame's callee
+/// ([`InlineCallee::Frame`]).
+pub(crate) fn names_frame_callee(mut position: u32) -> bool {
+    while let Some(site) = inline_site(position) {
+        if matches!(site.callee, InlineCallee::Frame) {
+            return true;
+        }
+        position = site.outer;
+    }
+    false
 }
 
 /// The thread's registered inline sites. Compiled chunks are thread-bound (an Agent runs on
@@ -241,11 +465,16 @@ pub(crate) fn inline_site(position: u32) -> Option<InlineSite> {
 }
 
 /// The innermost-first chain of spliced activations an inline `position` runs in, as
-/// (callee, its byte offset), and the byte offset in the context that holds the splices.
-pub(crate) fn inline_chain(mut position: u32) -> (Vec<(crate::value::Gc, u32)>, u32) {
+/// (callee, its byte offset), and the byte offset in the context that holds the splices. A
+/// by-literal frame's callee is `frame`'s: the closure the physical frame the position belongs to
+/// stored ([`Interp::frame_callee`]), the one function every reader resolves it through.
+pub(crate) fn inline_chain(
+    mut position: u32,
+    mut frame: impl FnMut() -> Option<crate::value::Gc>,
+) -> (Vec<(crate::value::Gc, u32)>, u32) {
     let mut chain = Vec::new();
     while let Some(site) = inline_site(position) {
-        if let Some(callee) = site.callee.upgrade() {
+        if let Some(callee) = site.callee.resolve(&mut frame) {
             let inner = if position & IMPLICIT_INLINE_POSITION != 0 {
                 NO_POSITION
             } else {
@@ -793,6 +1022,36 @@ impl Interp {
         }
     }
 
+    /// The FnFrame index of the frame a walk over `function` function frames and `code` code
+    /// frames meets next, whose position it holds: None where that is a code frame (a code
+    /// frame entered at depth d runs above function frames [0, d)), or no frame is left.
+    pub(crate) fn physical_frame(&self, function: usize, code: usize) -> Option<usize> {
+        if code > 0 && self.code_frames[code - 1].depth as usize >= function {
+            return None;
+        }
+        function.checked_sub(1)
+    }
+
+    /// The closure the activation at FnFrame index `index` stored for its running by-literal
+    /// frame (P3 stage 3, piece B: `InlineCallee::Frame`), the one function the readers of a
+    /// by-literal site resolve it through; None where it stored none (0: no by-literal frame of
+    /// it runs, each way out of one clearing the entry) or `index` is None (the position is a
+    /// code frame's).
+    pub(crate) fn frame_callee(&self, index: Option<usize>) -> Option<crate::value::Gc> {
+        let word = frame_callee_word(self as *const Interp as usize, index?);
+        if word == 0 {
+            return None;
+        }
+        // SAFETY: an entry is nonzero exactly while the by-literal frame that stored it runs (its
+        // returns, a throw out of its code and an exit clear it), and holds that frame's closure,
+        // which the frame's callee node keeps for the frame's whole extent: the allocator gives
+        // it a home across every node of the frame (`regalloc`'s by-literal extents), a
+        // callee-saved register or a spill slot across each node that calls and a saved word on
+        // the native stack at each slow path's call, which the collector scans; while a frame
+        // above runs, the collector also reads the entry (`trace_frame_callees`).
+        unsafe { crate::value::Value::from_bits(word) }.as_obj()
+    }
+
     /// ECMA-262 GetActiveScriptOrModule: the source of the innermost execution context whose
     /// ScriptOrModule is not null. Function contexts take their function's (built-in, self-
     /// hosted and host snapshot functions have none); below them lie the script execution
@@ -830,11 +1089,12 @@ impl Interp {
             // position markers preserve the identity-proven callee for explicit AND implicit
             // callbacks; the splice's hidden slot roots that callee throughout execution.
             // Read one site at a time instead of allocating inline_chain's diagnostic Vec.
+            let physical = self.physical_frame(function, code);
             while is_inline_position(position) {
                 let Some(site) = inline_site(position) else {
                     return Some(self.closed_runtime_origin());
                 };
-                let Some(callee) = site.callee.upgrade() else {
+                let Some(callee) = site.callee.resolve(&mut || self.frame_callee(physical)) else {
                     return Some(self.closed_runtime_origin());
                 };
                 if let ObjectKind::User(user) = &callee.borrow().kind {
@@ -1004,7 +1264,8 @@ impl Interp {
             let depth = (function + code) as u32;
             // Callees spliced into this context run above it without frames of their own.
             if is_inline_position(position) {
-                let (chain, outer) = inline_chain(position);
+                let physical = self.physical_frame(function, code);
+                let (chain, outer) = inline_chain(position, || self.frame_callee(physical));
                 for (callee, inner) in chain {
                     if let Skip::UntilSeen(target) = skip {
                         if skipping {
@@ -1091,7 +1352,8 @@ impl Interp {
         if let Some((mut trace, index)) = self.pending_frame(&object) {
             if is_inline_position(position) {
                 // The operation belongs to spliced callees: their frames come first.
-                let (chain, outer) = inline_chain(position);
+                let physical = self.physical_frame(self.fn_frames.len(), self.code_frames.len());
+                let (chain, outer) = inline_chain(position, || self.frame_callee(physical));
                 if trace.frames[index].depth == (self.context_depth() | INLINE_FRAME_DEPTH) {
                     // The callback's capture already expanded the logical splice chain.
                     // Place just its pending innermost frame instead of expanding it twice.
@@ -1275,12 +1537,12 @@ mod tests {
             crate::gc_test::in_frame(|| crate::value::Gc::downgrade(&engine.interp.new_object()));
         let (mut sites, positions) = InlineSites::register(vec![
             InlineSite {
-                callee: pin.clone(),
+                callee: InlineCallee::Static(pin.clone()),
                 inner: 11,
                 outer: 37,
             },
             InlineSite {
-                callee: pin.clone(),
+                callee: InlineCallee::Static(pin.clone()),
                 inner: 19,
                 outer: inline_position(0),
             },

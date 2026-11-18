@@ -291,12 +291,57 @@ impl Builder<'_> {
         }
     }
 
+    /// The record `hops` parent links from the running environment (see [`Self::running_env`]).
+    /// In a by-literal frame whose closure's [[Environment]] is a self-name record (P3 stage 3,
+    /// piece B; `inline::FrameEnv::Literal`), from the creation's running environment, that
+    /// record's parent (`Interp::make_function_named`: `new_scope(Some(env))`), one link fewer:
+    /// the record itself is no node, and its one binding, the name at hops 0, is read as the
+    /// frame's callee ([`Self::self_name`]); a global search never stops at it (it is no global
+    /// environment).
+    fn running_walk(&mut self, st: &mut State, hops: u16, pc: usize) -> NodeIx {
+        if let Some(inline::FrameEnv::Literal {
+            creation,
+            self_name: Some(_),
+        }) = self.inlined.as_ref().map(|inlined| inlined.env())
+        {
+            debug_assert!(hops > 0, "the self-name record is read through its callee");
+            return self.walk(st, creation, hops.saturating_sub(1), pc);
+        }
+        let env = self.running_env(st, pc);
+        self.walk(st, env, hops, pc)
+    }
+
+    /// In a by-literal frame whose closure's [[Environment]] is a self-name record (see
+    /// [`Self::running_walk`]), the value of the static address `address` from `base` where it
+    /// is that record's one binding, the function's own name: the frame's callee node.
+    fn self_name(&self, address: StaticName, base: Base) -> Option<NodeIx> {
+        match self.inlined.as_ref()?.env() {
+            inline::FrameEnv::Literal {
+                self_name: Some(callee),
+                ..
+            } if base == Base::Running && address.hops == 0 => {
+                debug_assert_eq!(address.slot, 0, "a self-name record's one binding");
+                Some(callee)
+            }
+            _ => None,
+        }
+    }
+
     /// The running environment: hoisted where no operation of the chunk moves it. An inlined
     /// callee's is its closure's [[Environment]], a constant while its guard holds, as a splice's
-    /// pinned one (P3 stage 3, step 2: an inlined callee moves no environment).
-    fn running_env(&mut self, st: &mut State, pc: usize) -> NodeIx {
-        if let Some(env) = self.inlined.as_ref().map(|inlined| inlined.env()) {
-            return self.hoist(Hoisted::ConstEnv(env as u64));
+    /// pinned one (P3 stage 3, step 2: an inlined callee moves no environment); a by-literal
+    /// frame's the creation's (piece B), whose walks [`Self::running_walk`] makes.
+    pub(super) fn running_env(&mut self, st: &mut State, pc: usize) -> NodeIx {
+        match self.inlined.as_ref().map(|inlined| inlined.env()) {
+            Some(inline::FrameEnv::Const(env)) => return self.hoist(Hoisted::ConstEnv(env as u64)),
+            Some(inline::FrameEnv::Literal {
+                creation,
+                self_name,
+            }) => {
+                debug_assert!(self_name.is_none(), "a self-name record is walked past");
+                return creation;
+            }
+            None => {}
         }
         if !self.moves_env {
             return self.hoist(Hoisted::Env);
@@ -348,10 +393,7 @@ impl Builder<'_> {
             // thread as a splice's is (P3 stage 3, step 2).
             Base::Running => match self.inlined_holder(address.hops) {
                 Some(holder) => Some(self.hoist(Hoisted::ConstEnv(holder as u64))),
-                None => {
-                    let env = self.running_env(st, pc);
-                    Some(self.walk(st, env, address.hops, pc))
-                }
+                None => Some(self.running_walk(st, address.hops, pc)),
             },
             Base::Holder(holder) => Some(self.hoist(Hoisted::ConstEnv(holder as u64))),
             Base::Unknown => None,
@@ -419,6 +461,9 @@ impl Builder<'_> {
         base: Base,
         pc: usize,
     ) -> Option<NodeIx> {
+        if let Some(callee) = self.self_name(address, base) {
+            return Some(callee);
+        }
         let record = self.static_record(st, address, base, pc)?;
         if address.lexical && !st.names.initialized.contains(&(record, address.slot)) {
             return None;
@@ -598,15 +643,19 @@ impl Builder<'_> {
         }
         let mut cx = Before::new(pc);
         let value = match self.snapshot.name(pc) {
-            NameView::Static { address, base } => {
-                let record = self
-                    .static_record(st, address, base, pc)
-                    .expect("the rules found the record");
-                // A captured binding checked earlier in the operation's block (`cap_tdz_known`).
-                let known =
-                    matches!(self.ops[pc], Op::LoadCap(_)) && self.chunk.jit_cap_initialized(pc);
-                self.binding_value(st, &mut cx, record, address, known)
-            }
+            NameView::Static { address, base } => match self.self_name(address, base) {
+                Some(callee) => callee,
+                None => {
+                    let record = self
+                        .static_record(st, address, base, pc)
+                        .expect("the rules found the record");
+                    // A captured binding checked earlier in the operation's block
+                    // (`cap_tdz_known`).
+                    let known = matches!(self.ops[pc], Op::LoadCap(_))
+                        && self.chunk.jit_cap_initialized(pc);
+                    self.binding_value(st, &mut cx, record, address, known)
+                }
+            },
             view @ NameView::Global { .. } => self.global_read(st, &mut cx, view),
             view @ NameView::GlobalLexical { .. } => self.global_lexical_read(st, &mut cx, view),
             _ => unreachable!("the rules lower only these views"),
@@ -654,8 +703,7 @@ impl Builder<'_> {
         let folded =
             matches!(search, Search::Running(hops) if self.inlined_holder(hops) == Some(genv));
         if let (Search::Running(hops), false) = (search, folded) {
-            let env = self.running_env(st, pc);
-            let record = self.walk(st, env, hops, pc);
+            let record = self.running_walk(st, hops, pc);
             let check = NodeOp::CheckEnvIs {
                 env: genv as u64,
                 proof,
@@ -713,8 +761,7 @@ impl Builder<'_> {
                 self.hoist(Hoisted::ConstEnv(genv as u64))
             }
             Search::Running(hops) => {
-                let env = self.running_env(st, pc);
-                let record = self.walk(st, env, hops, pc);
+                let record = self.running_walk(st, hops, pc);
                 let check = NodeOp::CheckEnvIs {
                     env: genv as u64,
                     proof,

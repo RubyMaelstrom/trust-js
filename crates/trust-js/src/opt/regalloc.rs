@@ -586,6 +586,40 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             }
         }
     }
+    // A by-literal frame's callee (P3 stage 3, piece B) has a home across every node of its frame
+    // and of the frames nested in it, read again just after the last of them in code order: a
+    // home is a value's for its whole range, so the closure is in a callee-saved register or a
+    // spill slot across each of the frame's effectful nodes and among the values a slow path's
+    // call saves at each other (`a64`'s `save_live_caller_saved`), where the collector scans,
+    // while a helper the frame runs collects and then reads the stack, whose by-literal site
+    // names the closure through the activation's frame-callee table (`Interp::frame_callee`).
+    // The table is the way to find the closure, never what keeps it. JSC keeps a closure call's
+    // callee in the inline frame's callee slot of the machine frame for the frame's extent
+    // (DFGByteCodeParser.cpp:2213-2215, flushed at :934), and Maglev's lazy deopt frame state of
+    // each call in an inlined frame holds the closure.
+    let mut extents: Vec<(NodeIx, NodeIx)> = Vec::new();
+    for &b in &order {
+        for &node in &graph.block(b).body {
+            let mut frame = graph.node(node).frame;
+            while let Some(inlined) = graph.inlined(frame) {
+                if inlined.by_literal && reads.is_value(inlined.callee) {
+                    match extents
+                        .iter_mut()
+                        .find(|(callee, _)| *callee == inlined.callee)
+                    {
+                        Some(extent) => extent.1 = node,
+                        None => extents.push((inlined.callee, node)),
+                    }
+                }
+                frame = graph.state(inlined.parent).frame;
+            }
+        }
+    }
+    for (callee, last) in extents {
+        if !after_call.contains(&(last, callee)) {
+            after_call.push((last, callee));
+        }
+    }
 
     // Liveness over the blocks (values that are not constants), to a fixed point, in flat bit
     // sets of `words` words a block, the scratch sets made once.

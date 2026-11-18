@@ -21,7 +21,7 @@
 //!   free names reach from it, folded as a splice's holders are; the callee's pin, which keeps
 //!   the identity the guard embeds from reuse (`exit::Inlined::pins`).
 
-use super::build::{InlineSite, InlineWay};
+use super::build::{InlineSite, InlineWay, LiteralWay};
 use super::job::{InlineJob, JobMemory};
 use super::profile::{ChunkProfile, KeptWay};
 use super::view::{FrozenChunk, InlineTargetView};
@@ -29,6 +29,13 @@ use crate::bytecode::{Chunk, InlinePlanEntry, Op};
 use crate::fasthash::FastMap;
 use crate::interpreter::{Env, Interp};
 use std::rc::Rc;
+
+#[cfg(test)]
+thread_local! {
+    /// Why the oracle made no by-literal way for a candidate, since the tests last took them.
+    pub(crate) static TEST_LITERAL_REFUSALS: std::cell::RefCell<Vec<&'static str>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 /// What a compile's preparation asks the oracle for: the plan its checkpoint made (a first
 /// compile), or the ways that compile took (a reoptimization: `ChunkProfile::inline_ways`).
@@ -91,15 +98,26 @@ pub(crate) fn prepare(
     if plan.is_empty() {
         return None;
     }
-    let mut entries: Vec<(u32, InlinePlanEntry)> = plan.into_iter().collect();
-    entries.sort_unstable_by_key(|&(cache, _)| cache);
-    // Each call site's call: its argument count and whether it passes a receiver.
-    let calls: FastMap<u32, (u16, bool)> = chunk
+    // What the planner's budget leaves for the closure literals this chunk creates (P3 stage 3,
+    // piece B), where it creates any.
+    let mut budget = chunk
         .jit_ops()
         .iter()
-        .filter_map(|op| match *op {
-            Op::Call(argc, cache) => Some((cache, (argc, false))),
-            Op::CallWithThis(argc, cache) => Some((cache, (argc, true))),
+        .any(|op| matches!(op, Op::MakeClosure(..)))
+        .then(|| crate::bytecode::InlineBudgetLeft::after(chunk, &plan));
+    let compiled_cfg = budget
+        .as_ref()
+        .and_then(|_| crate::jit_ir::Cfg::build(chunk).ok());
+    let mut entries: Vec<(u32, InlinePlanEntry)> = plan.into_iter().collect();
+    entries.sort_unstable_by_key(|&(cache, _)| cache);
+    // Each call site's call: its argument count, whether it passes a receiver, and its pc.
+    let calls: FastMap<u32, (u16, bool, usize)> = chunk
+        .jit_ops()
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| match *op {
+            Op::Call(argc, cache) => Some((cache, (argc, false, pc))),
+            Op::CallWithThis(argc, cache) => Some((cache, (argc, true, pc))),
             _ => None,
         })
         .collect();
@@ -119,7 +137,7 @@ pub(crate) fn prepare(
     // Its plain `new`s likewise (P3 stage 3 step 3e): (the view, the construct cache, the site).
     let mut construct_sites: Vec<(usize, u32, usize)> = Vec::new();
     for (cache, entry) in entries {
-        let Some(&(argc, with_this)) = calls.get(&cache) else {
+        let Some(&(argc, with_this, pc)) = calls.get(&cache) else {
             continue;
         };
         // The splice's emission declines a call of more than eight arguments
@@ -127,9 +145,25 @@ pub(crate) fn prepare(
         if argc > 8 {
             continue;
         }
+        // The closure literals the call passes, by argument (piece B): an argument word an
+        // Op::MakeClosure of this chunk pushed.
+        let literal_args: Vec<Option<u32>> = match (&budget, &compiled_cfg) {
+            (Some(_), Some(cfg)) => (0..usize::from(argc))
+                .map(|a| {
+                    let at = producer(chunk, cfg, pc, usize::from(argc) - 1 - a)?;
+                    match chunk.jit_ops()[at] {
+                        Op::MakeClosure(literal, _) => Some(literal),
+                        _ => None,
+                    }
+                })
+                .collect(),
+            _ => Vec::new(),
+        };
         let mut ways = Vec::new();
         for way in &entry.ways {
             let mut prep = Prep {
+                literal_args: &literal_args,
+                budget: &mut budget,
                 i,
                 compiled: chunk,
                 view,
@@ -180,6 +214,9 @@ pub(crate) fn prepare(
     fn place(sites: &mut [InlineSite], positions: &[u32]) {
         for way in sites.iter_mut().flat_map(|site| site.ways.iter_mut()) {
             way.position = positions[way.position as usize];
+            for literal in &mut way.literals {
+                literal.position = positions[literal.position as usize];
+            }
             // The frames nested in it (step 3d).
             place(&mut way.nested, positions);
         }
@@ -206,6 +243,11 @@ struct Call {
 /// What `prepare` grows while it takes ways (P3 stage 3 step 3d: at any depth).
 struct Prep<'p, 'c, M: FnMut() -> JobMemory> {
     i: &'p Interp,
+    /// The compiled chunk's closure literals its call passes, by argument (piece B).
+    literal_args: &'p [Option<u32>],
+    /// What the planner's budget leaves for them (`InlineBudgetLeft`), where the chunk creates
+    /// any.
+    budget: &'p mut Option<crate::bytecode::InlineBudgetLeft>,
     compiled: &'p Chunk,
     view: &'p mut FrozenChunk,
     held: &'p mut Held,
@@ -296,7 +338,7 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
         });
         self.held.pins.push(crate::value::Gc::downgrade(&way.obj));
         self.inline_sites.push(crate::stack_trace::InlineSite {
-            callee: crate::value::Gc::downgrade(&way.obj),
+            callee: crate::stack_trace::InlineCallee::of(&way.obj),
             inner: crate::stack_trace::NO_POSITION,
             outer: call.caller_position,
         });
@@ -306,8 +348,14 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
         // position at the way's call, as a spliced body's call carries; the way's view gives it
         // to the call's template and its node publishes it; by cache, for the nested ways.
         let mut own_calls: FastMap<u32, (u16, bool, usize)> = FastMap::default();
+        // The calls of the callee's formals the compiled chunk's literals are bound to (piece B):
+        // (the call's cache, its argument count and receiver form, its site, the literal).
+        let mut literal_calls: Vec<(u32, u16, bool, usize, u32)> = Vec::new();
+        let callee_cfg = (chain.is_empty() && self.literal_args.iter().any(Option::is_some))
+            .then(|| crate::jit_ir::Cfg::build(&callee).ok())
+            .flatten();
         if !way.leaf {
-            for op in callee.jit_ops() {
+            for (callee_pc, op) in callee.jit_ops().iter().enumerate() {
                 let (argc, inner_call, with_this) = match *op {
                     Op::Call(argc, inner_call) => (argc, inner_call, false),
                     Op::CallWithThis(argc, inner_call) => (argc, inner_call, true),
@@ -318,7 +366,7 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
                         let inner = callee.construct_position(construct);
                         debug_assert!(!crate::stack_trace::is_inline_position(inner));
                         self.inline_sites.push(crate::stack_trace::InlineSite {
-                            callee: crate::value::Gc::downgrade(&way.obj),
+                            callee: crate::stack_trace::InlineCallee::of(&way.obj),
                             inner,
                             outer: call.caller_position,
                         });
@@ -331,13 +379,29 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
                 let inner = callee.call_position(inner_call);
                 debug_assert!(!crate::stack_trace::is_inline_position(inner));
                 self.inline_sites.push(crate::stack_trace::InlineSite {
-                    callee: crate::value::Gc::downgrade(&way.obj),
+                    callee: crate::stack_trace::InlineCallee::of(&way.obj),
                     inner,
                     outer: call.caller_position,
                 });
                 let site = self.inline_sites.len() - 1;
                 self.call_sites.push((index, inner_call, site));
                 own_calls.insert(inner_call, (argc, with_this, site));
+                // A call whose callee word is a formal the compiled frame's call binds to one
+                // of its closure literals (piece B: the compiled frame's own calls only).
+                if let Some(cfg) = &callee_cfg {
+                    // The callee word lies under the arguments, the receiver under it.
+                    let from_top = usize::from(argc);
+                    if let Some(Op::LoadLocal(formal)) =
+                        producer(&callee, cfg, callee_pc, from_top).map(|at| callee.jit_ops()[at])
+                    {
+                        if usize::from(formal) < callee.jit_frame().0 {
+                            if let Some(&Some(literal)) = self.literal_args.get(usize::from(formal))
+                            {
+                                literal_calls.push((inner_call, argc, with_this, site, literal));
+                            }
+                        }
+                    }
+                }
             }
         }
         // The callee's own calls the plan inlines in turn (step 3d): each a site of the way's
@@ -378,10 +442,21 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
                 });
             }
         }
+        let mut literals = Vec::new();
+        for (inner_call, argc, with_this, site, literal) in literal_calls {
+            let in_loop = crate::bytecode::call_site_in_loop(self.compiled, call.cache)
+                || crate::bytecode::call_site_in_loop(&callee, inner_call);
+            if let Some(literal_way) = self.literal(
+                way, &callee, inner_call, argc, with_this, site, literal, in_loop,
+            ) {
+                literals.push(literal_way);
+            }
+        }
         Some((
             InlineWay {
                 target,
                 callee: crate::bytecode::stored_word(way.obj),
+                literals,
                 chunk: index as u32,
                 env: Env::as_ptr(&env) as usize,
                 holders: holders.into_boxed_slice(),
@@ -401,6 +476,195 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
             },
         ))
     }
+}
+
+impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
+    /// The by-literal way of closure literal `literal` of the compiled chunk at call `inner_call`
+    /// of `w`'s callee chunk `w_chunk` (argument count `argc`, a receiver if `with_this`, its
+    /// inline site `site` among this job's, in a loop if `in_loop`), whose callee word is a
+    /// formal the compiled frame's call binds to the literal (P3 stage 3, piece B; the design
+    /// note's section 1): the planner's rules for the literal as a callee of `w`'s function
+    /// (`inline_callee_rules`) and its budget after the plan, the oracle's own filters for any
+    /// way; its chunk's view and snapshot as a way's, its frame's inline site and one per call
+    /// and plain `new` of its chunk, each naming the frame's callee word
+    /// (`InlineCallee::Frame`). No guard, pin, environment or holders: the frame's callee is the
+    /// creation's node, its environment the creation's (`build_inline`).
+    #[allow(clippy::too_many_arguments)]
+    fn literal(
+        &mut self,
+        w: &crate::bytecode::InlineWay,
+        w_chunk: &Chunk,
+        inner_call: u32,
+        argc: u16,
+        with_this: bool,
+        site: usize,
+        literal: u32,
+        in_loop: bool,
+    ) -> Option<LiteralWay> {
+        let f = self.compiled.function_literal(literal)?.clone();
+        let realm = match &w.obj.borrow().kind {
+            crate::value::ObjectKind::User(user) => user.realm,
+            _ => return None,
+        };
+        let n_params = u16::try_from(f.params.len()).ok()?;
+        let refused = |why: &'static str| {
+            #[cfg(test)]
+            TEST_LITERAL_REFUSALS.with(|refusals| refusals.borrow_mut().push(why));
+            if super::log_enabled() {
+                eprintln!(
+                    "[opt] no by-literal way for literal {literal} at call {inner_call}: {why}"
+                );
+            }
+        };
+        let chunk = match crate::bytecode::inline_callee_rules(
+            w_chunk,
+            &w.f,
+            realm,
+            realm,
+            &f,
+            n_params,
+            crate::bytecode::inline_max_ops(),
+        ) {
+            Ok(chunk) => chunk,
+            Err(why) => {
+                refused(why);
+                return None;
+            }
+        };
+        // Recursion (D13): the literal's chunk is the compiled chunk's.
+        if std::ptr::eq(&*chunk, self.compiled) || argc > 8 {
+            return None;
+        }
+        // The oracle's filters for any way (`way`'s): the callee's calls plain or method calls
+        // or plain `new`s; a `this` it reads passed by the call and, where it is sloppy, tested
+        // by a guard, which a by-literal way has none of.
+        let leaf = !chunk.jit_ops().iter().any(|op| {
+            matches!(
+                op,
+                Op::Call(..)
+                    | Op::CallWithThis(..)
+                    | Op::CallApplyFrameArgs(..)
+                    | Op::CallSpread(..)
+                    | Op::CallSpreadThis(..)
+                    | Op::CallArgsArray
+                    | Op::CallArgsArrayThis
+                    | Op::New(..)
+                    | Op::NewArgsArray
+            )
+        });
+        if !leaf && !crate::bytecode::makes_plain_calls_only(&chunk) {
+            refused("a call other than a plain or method call or a plain `new`");
+            return None;
+        }
+        if chunk.uses_this() && (!with_this || !f.is_strict) {
+            refused("a `this` no guard tests");
+            return None;
+        }
+        if !self
+            .budget
+            .as_mut()
+            .is_some_and(|budget| budget.take(chunk.jit_ops().len(), leaf, in_loop))
+        {
+            refused("the planner's budget");
+            return None;
+        }
+        let shared = self
+            .held
+            .chunks
+            .iter()
+            .position(|held| Rc::ptr_eq(held, &chunk))
+            .filter(|_| leaf);
+        let index = match shared {
+            Some(index) => index,
+            None => {
+                let (mut view, mut raw) = (self.memory)();
+                raw.take_inlined_into(&chunk, Some(self.i));
+                chunk.freeze_into(&mut view);
+                #[cfg(debug_assertions)]
+                super::snapshot::check_decode(&chunk, &raw, &view);
+                self.callees.push((view, raw));
+                self.held.chunks.push(chunk.clone());
+                self.held.chunks.len() - 1
+            }
+        };
+        let outer = crate::stack_trace::inline_position(site as u32);
+        self.inline_sites.push(crate::stack_trace::InlineSite {
+            callee: crate::stack_trace::InlineCallee::Frame,
+            inner: crate::stack_trace::NO_POSITION,
+            outer,
+        });
+        let frame_site = self.inline_sites.len() - 1;
+        for op in chunk.jit_ops() {
+            match *op {
+                Op::Call(_, own) | Op::CallWithThis(_, own) => {
+                    self.inline_sites.push(crate::stack_trace::InlineSite {
+                        callee: crate::stack_trace::InlineCallee::Frame,
+                        inner: chunk.call_position(own),
+                        outer,
+                    });
+                    self.call_sites
+                        .push((index, own, self.inline_sites.len() - 1));
+                }
+                Op::New(_, construct) => {
+                    self.inline_sites.push(crate::stack_trace::InlineSite {
+                        callee: crate::stack_trace::InlineCallee::Frame,
+                        inner: chunk.construct_position(construct),
+                        outer,
+                    });
+                    self.construct_sites
+                        .push((index, construct, self.inline_sites.len() - 1));
+                }
+                _ => {}
+            }
+        }
+        // The interpreter's frame-callee table, made here on the main thread (its first compile
+        // with a by-literal way).
+        let interp = self.i as *const Interp as usize;
+        let table = crate::stack_trace::frame_callee_table(interp, true)?;
+        Some(LiteralWay {
+            cache: inner_call,
+            literal,
+            chunk: index as u32,
+            position: frame_site as u32,
+            self_name: f.needs_self_environment(),
+            interp,
+            table,
+        })
+    }
+}
+
+/// The operation whose push is the operand word `from_top` words below the top of the stack
+/// before the operation at `pc` of `chunk` (0: the top): a backward walk of its operations' stack
+/// effects through the blocks of `cfg` (`chunk`'s), from a block's start into its one
+/// predecessor (a `return f(...)`'s call is reached from its tail-call test's branch), stopping
+/// at a join (P3 stage 3, piece B). The builder decides by the node, so a walk that named
+/// another producer than the one that ran would cost a prepared way that is never built.
+fn producer(
+    chunk: &Chunk,
+    cfg: &crate::jit_ir::Cfg,
+    pc: usize,
+    mut from_top: usize,
+) -> Option<usize> {
+    let blocks = cfg.blocks();
+    let mut block = &blocks[cfg.block_at(pc)?.0 as usize];
+    let mut at = pc;
+    // A bound on the blocks walked (a cycle of single predecessors is unreachable code).
+    for _ in 0..blocks.len() {
+        while at > block.start {
+            at -= 1;
+            let (pops, pushes) = chunk.jit_stack_effect(at)?;
+            if from_top < pushes {
+                return Some(at);
+            }
+            from_top = from_top - pushes + pops;
+        }
+        let [only] = block.predecessors[..] else {
+            return None;
+        };
+        block = &blocks[only.0 as usize];
+        at = block.end;
+    }
+    None
 }
 
 /// The plan of the ways `chunk`'s first compile took (`ChunkProfile::inline_ways`), in their

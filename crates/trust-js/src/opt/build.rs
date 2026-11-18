@@ -100,7 +100,7 @@ pub(crate) use inline::{E0_EFFECT, PAST_RECORD};
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-pub(crate) use inline::TEST_NESTED_FRAMES;
+pub(crate) use inline::{TEST_LITERAL_FRAMES, TEST_NESTED_FRAMES};
 // The job and the driver read these where the tier has its back end.
 #[cfg_attr(
     not(all(
@@ -109,7 +109,7 @@ pub(crate) use inline::TEST_NESTED_FRAMES;
     )),
     allow(unused_imports)
 )]
-pub(crate) use inline::{Callee, InlineNote, InlineOutcome, InlineSite, InlineWay};
+pub(crate) use inline::{Callee, InlineNote, InlineOutcome, InlineSite, InlineWay, LiteralWay};
 
 const NUMBER: u32 = ValueClass::NumberInt32.bit() | ValueClass::NumberDouble.bit();
 const INT32: u32 = ValueClass::NumberInt32.bit();
@@ -2112,6 +2112,9 @@ enum Hoisted {
     ConstEnv(u64),
     /// The running realm's global object, as a cell (stage 2, step 4).
     GlobalObject,
+    /// The activation's frame-callee table entry: the interpreter's and the table's addresses
+    /// (P3 stage 3, piece B).
+    FrameIndex(u64, u64),
 }
 
 /// The state an operation's exits share: the frame state before the operation (its operands on
@@ -2158,6 +2161,11 @@ struct Builder<'a> {
     hoisted: FastMap<Hoisted, NodeIx>,
     /// The hoisted nodes in the order made, which head the entry block once it is built.
     hoisted_nodes: Vec<NodeIx>,
+    /// The closures the compiled frame created from a literal some by-literal way names, by
+    /// their node: (the literal, the running environment at the creation, the closure's
+    /// [[Environment]]) (P3 stage 3, piece B). A node's fact reaches an inlined frame's formal
+    /// bound to it; a phi, a reload or a store's value carries none.
+    closures: FastMap<NodeIx, (u32, NodeIx)>,
     /// Whether an operation of the chunk moves its running environment (`names::moves_env`).
     moves_env: bool,
     /// The typed reads of the block being built that check for a store
@@ -2208,6 +2216,7 @@ impl<'a> Builder<'a> {
             headers: (0..blocks).map(|_| None).collect(),
             hoisted: FastMap::default(),
             hoisted_nodes: Vec::new(),
+            closures: FastMap::default(),
             moves_env: chunk.jit_ops().iter().any(names::moves_env),
             checks_store: Vec::new(),
             ended: false,
@@ -2427,6 +2436,7 @@ impl<'a> Builder<'a> {
             Hoisted::Env => (NodeOp::Env, Rep::Env),
             Hoisted::ConstEnv(address) => (NodeOp::ConstEnv(address), Rep::Env),
             Hoisted::GlobalObject => (NodeOp::GlobalObject, Rep::Cell),
+            Hoisted::FrameIndex(interp, table) => (NodeOp::FrameIndex { interp, table }, Rep::I32),
         };
         let entry = self.graph.entry.expect("the entry block is made first");
         let node = self.graph.add_node(entry, op, &[], rep, 0);
@@ -3979,6 +3989,20 @@ impl<'a> Builder<'a> {
         for result in 0..push_count {
             let value = self.add(NodeOp::Projection(result), &[effect], Rep::Tagged, pc);
             st.stack.push(value);
+        }
+        // A closure of a literal a by-literal way names, created by the compiled frame (P3 stage
+        // 3, piece B): its node's fact, with the running environment it captured (the
+        // template's MakeClosure captures `ctx.env_raw`).
+        if let Op::MakeClosure(literal, _) = self.ops[pc] {
+            if !inlined
+                && self
+                    .inlining
+                    .is_some_and(|tree| tree.literals.binary_search(&literal).is_ok())
+            {
+                let closure = *st.stack.last().expect("the closure");
+                let env = self.running_env(st, pc);
+                self.closures.insert(closure, (literal, env));
+            }
         }
         for &(slot, writes) in &named {
             let slot = usize::from(slot);

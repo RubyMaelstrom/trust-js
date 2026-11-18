@@ -1264,6 +1264,7 @@ impl<'a> Gen<'a> {
                 limit: switches.exit_limit,
                 loop_limit: switches.loop_exit_limit,
                 loop_warm_up: switches.loop_warm_up,
+                by_literal: graph.frames.iter().any(|frame| frame.by_literal),
                 ..ExitTable::default()
             }),
             frame_index: vec![None; graph.frames.len()],
@@ -1306,8 +1307,22 @@ impl<'a> Gen<'a> {
             }
         }
         self.emit_cold()?;
-        self.drestore =
-            emit_entry_epilogues(&mut self.a, &self.frame, self.l_ret_ok, self.l_ret_throw);
+        // A code with a by-literal frame clears its activation's frame-callee entry on its way out
+        // by a throw (piece B: `emit_throw_clear`); any other code's throws are unchanged.
+        let frame_index = self.graph.nodes.iter().find_map(|node| match node.op {
+            NodeOp::FrameIndex { interp, table } => Some((interp, table)),
+            _ => None,
+        });
+        let throw = match (frame_index, self.frame_index_len_off()) {
+            (Some((interp, table)), Some(len_off)) => {
+                let epilogue = self.a.new_label();
+                self.emit_throw_clear(interp, table, len_off, epilogue);
+                epilogue
+            }
+            // No index without the layout: FrameIndex refused the compile wherever it is used.
+            _ => self.l_ret_throw,
+        };
+        self.drestore = emit_entry_epilogues(&mut self.a, &self.frame, self.l_ret_ok, throw);
         if !self.exits.is_empty() {
             self.emit_exit_stub();
         }
@@ -2294,6 +2309,50 @@ impl Gen<'_> {
             | NodeOp::ConstBool(_)
             | NodeOp::ConstEnv(_)
             | NodeOp::Phi => {}
+            &NodeOp::FrameIndex { interp, table } => {
+                if !unused {
+                    self.lower_frame_index(n, interp, table)?;
+                }
+            }
+            &NodeOp::StoreFrameCallee { table } => {
+                // The closure in the activation's entry (piece B): str x, [table, w, uxtw #3].
+                let index = self.gp(input(0), X16);
+                let closure = self.gp(input(1), X17);
+                self.a.mov_imm64(X30, table);
+                self.a.str_x_uxtw3(closure, X30, index);
+            }
+            &NodeOp::ClearFrameCallee { table } => {
+                let index = self.gp(input(0), X16);
+                self.a.mov_imm64(X30, table);
+                self.a.str_x_uxtw3(31, X30, index);
+            }
+            // Test builds only (the builder makes it under cfg!(test)): the closure's
+            // [[Environment]] read as the frame's context switch reads it, its parent where the
+            // frame assumes a self-name record, compared with the creation's (piece B).
+            &NodeOp::CheckFrameEnv { self_name } => {
+                #[cfg(test)]
+                {
+                    let env = self.gp(input(1), X17);
+                    let callee = self.gp(input(0), X16);
+                    self.a.ubfx(X16, callee, 0, 48);
+                    self.a.ldr_imm(
+                        X16,
+                        X16,
+                        (self.layout.obj_from_cell + self.layout.obj_kind + 8) as u32,
+                    );
+                    self.a.ldr_imm(X16, X16, self.layout.user_env as u32);
+                    if self_name {
+                        self.a.ldr_imm(X16, X16, self.layout.scope_parent as u32);
+                    }
+                    let ok = self.a.new_label();
+                    self.a.cmp_reg_x(X16, env);
+                    self.a.b_cond(EQ, ok);
+                    self.a.brk(0xb1f0 | u32::from(self_name));
+                    self.a.bind(ok);
+                }
+                #[cfg(not(test))]
+                let _ = self_name;
+            }
             NodeOp::Env
             | NodeOp::EnvParent
             | NodeOp::LoadBinding { .. }
@@ -3633,7 +3692,7 @@ impl Gen<'_> {
             self.a.str_imm(word, 19, this_off);
         }
         if switched.env {
-            if frame.env == 0 {
+            if frame.env == 0 && !frame.by_literal {
                 return Err(Refusal::at(pc, "an inlined frame's environment unknown"));
             }
             let env_off = ctx(std::mem::offset_of!(JitCtx, env_raw));
@@ -3643,8 +3702,21 @@ impl Gen<'_> {
             self.a.ldr_imm(X16, 19, parent_off);
             self.a.str_imm(X16, 31, save + SAVE_ENV_PARENT);
             // The closure's environment and its parent, as the direct sequence installs both
-            // (`emit_direct_sequence`: the parent's word read from the record).
-            self.a.mov_imm64(X16, frame.env as u64);
+            // (`emit_direct_sequence`: the parent's word read from the record). A by-literal
+            // frame's from its callee, the closure the compiled code made (P3 stage 3, piece B),
+            // as the call probe reads a closure's (`jit.rs`: the payload's `user_env`).
+            if frame.by_literal {
+                let callee = self.gp(frame.callee, X16);
+                self.a.ubfx(X16, callee, 0, 48);
+                self.a.ldr_imm(
+                    X16,
+                    X16,
+                    (self.layout.obj_from_cell + self.layout.obj_kind + 8) as u32,
+                );
+                self.a.ldr_imm(X16, X16, self.layout.user_env as u32);
+            } else {
+                self.a.mov_imm64(X16, frame.env as u64);
+            }
             self.a.str_imm(X16, 19, env_off);
             self.a.ldr_imm(X17, X16, self.layout.scope_parent as u32);
             self.a.str_imm(X17, 19, parent_off);
@@ -4605,6 +4677,83 @@ impl Gen<'_> {
             resume: done,
         });
         self.gp_done(n, w);
+    }
+
+    /// FrameIndex (P3 stage 3, piece B): the activation's FnFrame index where `JitCtx::interp` is
+    /// the interpreter at `interp` and the index lies in the frame-callee table at `table`; -1
+    /// otherwise. Emitted in the function's own code (a shared stub never holds the addresses).
+    /// It writes nothing: an entry is nonzero exactly while the by-literal frame that stored it
+    /// runs, whose every way out clears it (its returns, `ClearFrameCallee`; an exit,
+    /// `exit::deoptimize`; a throw out of the code, [`Self::emit_throw_clear`]), so no frame of
+    /// this activation has stored one yet; test builds trap where the entry is not clear.
+    fn lower_frame_index(&mut self, n: NodeIx, interp: u64, table: u64) -> Result<(), Refusal> {
+        let pc = self.graph.node(n).pc as usize;
+        let len_off = self.frame_index_len_off().ok_or(Refusal::at(
+            pc,
+            "no frame-callee table index without the Interp's layout",
+        ))?;
+        let dst = self.gp_dst(n);
+        let none = self.a.new_label();
+        let done = self.a.new_label();
+        self.frame_index_or(interp, len_off, none);
+        #[cfg(test)]
+        {
+            let clear = self.a.new_label();
+            self.a.mov_imm64(X17, table);
+            self.a.ldr_x_lsl3(X9, X17, X16);
+            self.a.cbz(X9, true, clear);
+            self.a.brk(0xb1e8);
+            self.a.bind(clear);
+        }
+        #[cfg(not(test))]
+        let _ = table;
+        self.a.mov(dst, X16);
+        self.a.b(done);
+        self.a.bind(none);
+        self.a.mov_imm64(dst, u64::from(u32::MAX));
+        self.a.bind(done);
+        self.gp_done(n, dst);
+        Ok(())
+    }
+
+    /// The offset in an Interp of `fn_frames`' length word, where its layout gives one a load can
+    /// address.
+    fn frame_index_len_off(&self) -> Option<u32> {
+        let len_off = self.ilayout.fn_frames + self.ilayout.fnf_len_word;
+        (self.ilayout.valid && len_off.is_multiple_of(8) && len_off / 8 < 4096)
+            .then_some(len_off as u32)
+    }
+
+    /// x16 = the activation's FnFrame index (`fn_frames`' length less one, the word at
+    /// `len_off`), where `JitCtx::interp` is the interpreter at `interp` and the index lies in a
+    /// frame-callee table; a branch to `none` otherwise. x17 scratch.
+    fn frame_index_or(&mut self, interp: u64, len_off: u32, none: usize) {
+        self.a
+            .ldr_imm(X16, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+        self.a.mov_imm64(X17, interp);
+        self.a.cmp_reg_x(X16, X17);
+        self.a.b_cond(NE, none);
+        self.a.ldr_imm(X16, X16, len_off);
+        self.a.sub_imm(X16, X16, 1);
+        self.a
+            .cmp_imm_x(X16, (crate::stack_trace::FRAME_CALLEE_WORDS - 1) as u32);
+        self.a.b_cond(HI, none);
+    }
+
+    /// The throw out of a code that has a by-literal frame (piece B, the coordinator's point C):
+    /// bound at `l_ret_throw`, before the shared epilogue at `epilogue`, the activation's
+    /// frame-callee entry cleared, its index computed again as FrameIndex computes it (the
+    /// activation's FnFrame is the top one again once a throw reaches here: a call's helper pops
+    /// its callee's frames on its way back, as for an exit, `exit::deoptimize`'s clear). Every
+    /// throw that no handler in its chain takes leaves here: a generic node's, a poll's, a
+    /// canonical-frame effect's, an exit's that rethrows and the entry's; where no by-literal
+    /// frame ran, the entry is clear already. x16, x17 scratch (the epilogue's own).
+    fn emit_throw_clear(&mut self, interp: u64, table: u64, len_off: u32, epilogue: usize) {
+        self.a.bind(self.l_ret_throw);
+        self.frame_index_or(interp, len_off, epilogue);
+        self.a.mov_imm64(X17, table);
+        self.a.str_x_lsl3(31, X17, X16);
+        self.a.b(epilogue);
     }
 
     /// Branch to `not_object` unless `word` is an object's; otherwise x30 = its cell, whose

@@ -199,6 +199,11 @@ pub(crate) struct ExitTable {
     pub(crate) loop_warm_up: u32,
     /// Whether the code was discarded (`opt::discard`).
     pub(crate) discarded: std::cell::Cell<bool>,
+    /// Whether the code has a by-literal frame (P3 stage 3, piece B), whose activation's
+    /// frame-callee table entry an exit clears: an entry is nonzero exactly while the by-literal
+    /// frame that stored it runs, and an exit ends it (the VM runs the rest of it in a frame of
+    /// its own).
+    pub(crate) by_literal: bool,
     /// The moved checks' exits (P3 stage 3 step L1c), by their index in `exits`, ascending, each
     /// with the checks it stands for, which its discard flags (`driver::flag_moved`). Data only:
     /// nothing in the code reads it.
@@ -568,6 +573,12 @@ pub(crate) unsafe extern "C" fn deoptimize(
     let table = unsafe { &*table };
     let exit = table.exit_at(ret);
     let i = unsafe { &mut *ctx.interp };
+    if table.by_literal {
+        crate::stack_trace::clear_frame_callee(
+            i as *const crate::interpreter::Interp as usize,
+            i.fn_frames.len().wrapping_sub(1),
+        );
+    }
     let mut reason = exit.reason;
     if exit.kind == ExitKind::Check && i.opt_exit_every != 0 && i.opt_exit_countdown == 0 {
         // The forced-exit gate's countdown reached zero at this check (see the module header):

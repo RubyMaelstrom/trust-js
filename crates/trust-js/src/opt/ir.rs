@@ -731,6 +731,36 @@ pub(crate) enum NodeOp {
     /// -> Env: a record known at the compile (a splice's holder, folded from its pinned
     /// [[Environment]]), alive while the splice's guard holds.
     ConstEnv(u64),
+    /// -> I32: the activation's entry in the frame-callee table at `table` of the interpreter at
+    /// `interp` (P3 stage 3, piece B; `stack_trace::frame_callee_table`): its FnFrame's index,
+    /// whose entry it clears, where `JitCtx::interp` is that interpreter and the index lies in
+    /// the table; -1 otherwise, where a by-literal frame's call is the generic call. Hoisted to
+    /// the entry, in the function's own code (never a shared stub's).
+    FrameIndex {
+        interp: u64,
+        table: u64,
+    },
+    /// (I32 index, Tagged closure): the closure a by-literal frame runs stored in entry `index`
+    /// of the table at `table`, before any node of the frame (piece B).
+    StoreFrameCallee {
+        table: u64,
+    },
+    /// (I32 index): entry `index` of the table at `table` cleared, at a by-literal frame's
+    /// return (piece B: an entry is nonzero exactly while the by-literal frame that stored it
+    /// runs; its other ways out, an exit and a throw out of the code, clear it too).
+    ClearFrameCallee {
+        table: u64,
+    },
+    /// (Tagged closure, Env creation): test builds only, at a by-literal frame's entry (piece B):
+    /// traps (`brk`) unless the closure's [[Environment]] is the frame's assumption about it, the
+    /// creation's running environment, or where `self_name` a record whose parent that is
+    /// (`inline::FrameEnv::Literal`). The compile decides it from the literal
+    /// (`LiteralWay::self_name`), the creation again at run time: this makes a disagreement, or a
+    /// record a later change puts between a closure and its creation, fail every test that
+    /// builds such a frame. Never built in a release build.
+    CheckFrameEnv {
+        self_name: bool,
+    },
     /// Env -> Tagged: the binding at `slot` of the record, in place after its header (planned
     /// records never spill); the empty word while a lexical binding is in its TDZ. Maglev's
     /// LoadContextSlot, Warp's MLoadFixedSlot, JSC's GetClosureVar.
@@ -1006,6 +1036,11 @@ pub(crate) struct InlinedFrame {
     /// constant under the guard), which the frame's generic nodes whose kind reads the
     /// environment store in `JitCtx::env_raw` while they run (step 3c); 0 where none is known.
     pub(crate) env: usize,
+    /// A by-literal frame (P3 stage 3, piece B): its callee a closure the compiled code made,
+    /// with no guard, whose [[Environment]] the frame's generic nodes read from the callee
+    /// (`env` 0), and which its activation stores in its frame-callee table entry while the frame
+    /// runs, its inline sites naming that word (`stack_trace::InlineCallee::Frame`).
+    pub(crate) by_literal: bool,
 }
 
 /// One basic block.
