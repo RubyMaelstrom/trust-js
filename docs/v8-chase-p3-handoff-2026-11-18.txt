@@ -353,3 +353,26 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   an arm that tests two shapes in the tier's code; the design that would make both stale-word
   clears unnecessary (publish the run's operand top on calls into Rust); the Splay retention
   test fails under TRUST_JS_GC_STRESS by design of that mode (its comment says so).
+- State at 22:30: local main is 218ee9e7. Three things are in flight.
+  1. PIECE B IS BUILT AND MEASURED BUT NOT LANDED (branch p3-s3-b, commit c7188012, worktree
+     target/p3/stage3/step3g-wt; report-b.txt in target/p3/stage3/step3g-impl). The result is
+     confirmed on the coordinator's builds: React's steady state at graph runs 39.0% fewer
+     instructions (2,210M -> 1,347M) and the fixture 19.6% fewer, the splice and the tier off
+     unchanged. The review (step3g-impl/review-b-coordinator.txt) found three things that
+     hold it back: a miscompile of a named function expression's own name inside its inlined
+     frame (programs in target/p3/stage3/stepb-review/adv/nfe); no rule that keeps the frame's
+     closure alive while the frame runs a helper that collects and then reads the stack; and a
+     throw without a handler leaving the frame's table entry uncleared. The current brief is
+     target/p3/stage3/briefs/step3g-resume5.txt. The profile note (Crypto, GBEMU and Mandreel
+     at graph against the splice) follows it; a partial is in step3g-impl/note-profile.txt.
+  2. The lowerings line's next pieces are being counted, nothing built
+     (briefs/lowerings-next.txt; branch p3-s3-low2, worktree target/p3/stage3/low2-wt): the
+     select form of a polymorphic read with shared shape loads, estimated small, and "F4", a
+     written-once global's value read as a constant in the tier's code (Mandreel's heap views
+     in its two hottest loops), whose design note is to make owner question 7 decidable.
+  3. The Splay fix's confirmation under GC stress with forced exits (the coordinator's
+     target/p3/stage3/stepsplay-review/stress-rest.sh) is still running: at the splice 559
+     tests passed and none failed so far; at graph 400 of 651, none failed. It is slow, not
+     stuck: three of the inliner's tests take about 70 minutes each in that configuration.
+- The construct line is finished. Its last commit made part A2's tests clean under the
+  diagnostic switch that turns its recognizer off (bbf51fbf; the plan's record).
