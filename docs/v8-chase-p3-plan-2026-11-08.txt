@@ -6757,3 +6757,22 @@ and both switches, the path before either existed.
   entry (168 bytes in line in every construct site, which moving out of line made 2% slower
   on RayTrace): the fields the form reads first in line and the rest out of line is the form
   to try, when someone takes it up.
+
+Part A2's tests under its switch (bbf51fbf, tests only, 2026-11-18; target/p3/stage3/
+step67-impl/a2switch, and the coordinator's rerun in steproute-review/a2switch-check.out). The
+apply form's sweep ran the whole library suite under each of its two switches, and under
+TRUST_JS_JIT_NO_FORWARDER=1 ten of part A2's own tests failed (3,608 passed, 10 failed), each
+on an assertion of the path the switch turns off (the forward form ran, the forwarder was
+recognized, its initializer plan committed, its learned layout or forward entry was set), none
+on a result. Those path assertions now hold only while the forwarder is on, as the apply
+form's own tests do under theirs; under the switch the tests assert the path's absence where
+that is cheap to say, and every result assertion runs in both cases (so the results are now
+checked without the forward form for the first time: they hold). The suite under the switch:
+3,654 passed, 0 failed. The four touched modules pass with and without the switch with the
+tier off, on and eager. A suite run under a switch is evidence only when it is clean, so a new
+switch's sweep is part of the change that adds it (AGENTS.md has the rule; the apply form's
+sweep finished after its commit landed, which is how these ten were found late).
+The sweeps' counts, for the record: the apply form's first commit, opt:: 559 passed in each of
+seven configurations and the suite 3,618 with the tier off, with it on and with
+TRUST_JS_JIT_NO_APPLY_FORM=1; the route, opt:: 569 in each of the seven and the suite 3,637
+with the tier off and on.
