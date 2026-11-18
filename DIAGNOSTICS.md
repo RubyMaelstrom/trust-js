@@ -661,6 +661,48 @@ use heap allocation ordinals and completed collections, not elapsed time. Live
 families at collection are a separate population sample. These probes compile out
 of ordinary builds; use them only for diagnostics, never performance acceptance.
 
+## Measurement and profiling recipes
+
+The method (which builds to compare, how to count and time) is in
+`benchmarks/README.md`, "Measurement method". These are the commands and traps that go
+with it; `TRUST_JS_PERF_MAP` and `TRUST_JS_PERF_JITDUMP` above name generated code for
+`perf`.
+
+* Call graphs without privileges: `perf record -g` also asks for kernel call chains and
+  fails with `EACCES` at `kernel.perf_event_paranoid=2`. Add `--user-callchains`. Isolate
+  any other `perf` failure with `-vv` before concluding that access is blocked.
+* Pin `perf` with its workload (`taskset -c <cpus> perf stat ... <command>`). On a
+  machine with two core types each type has its own PMU, and an unpinned run reports
+  two partial counts whose sum varies from run to run.
+* A second `perf record` beside a long one fails on the per-user ring-buffer budget; add
+  `-m 16`. `perf` resolves symbols from the binary now at the recorded path, so profile a
+  copy if the build directory will be rebuilt.
+* Pick a run's map by the engine's process id (`/tmp/perf-<pid>.map`), never the newest
+  file: concurrent runs take each other's maps.
+* To find a broad regression in a fat-LTO build on ARM64, sample with the Statistical
+  Profiling Extension, not the PMU, whose skid moves about 1% between generated code and
+  Rust: `perf record -e arm_spe_0/load_filter=0,store_filter=0,branch_filter=0,jitter=1/u
+  -c 4096`, then `perf report --itrace=i1i`. `nm --size-sort -S` on both binaries shows
+  functions whose inlining flipped.
+* Struct layouts that generated code depends on: build the release engine with
+  `CARGO_PROFILE_RELEASE_DEBUG=2 CARGO_PROFILE_RELEASE_STRIP=none` (debug information
+  does not change layout) and read the type with `llvm-dwarfdump --name=<Type>
+  --show-parents`, picking the definition by its namespace. The library's test binary
+  lays `Interp` out differently, and `pahole -C Object` finds an AST variant of the same
+  name.
+* Rooting defects that the unit tests' GC stress misses: run Test262 with a dev-profile
+  `test262-runner` under `TRUST_JS_GC_STRESS=1 TRUST_JS_TIER=jit
+  TRUST_JS_TIER_THRESHOLD=0`, from a scratch directory (the runner writes
+  `test262-report/` into the current directory). For a suspected site, write a
+  reproducer that drops the program's own references, churns the heap, then uses the
+  held value; a control with collections suppressed (`TRUST_JS_GC_NURSERY_BYTES=0
+  TRUST_JS_GC_MIN_HEAP_BYTES=4000000000`) tells a rooting defect from another fault.
+* The tier's graph verifier in release builds: `TRUST_JS_OPT=1 TRUST_JS_OPT_VERIFY=1
+  TRUST_JS_OPT_LOG=1`, each workload at five fixed runs, once with
+  `TRUST_JS_OPT_INLINE=splice` and once with `graph`; search the log with `grep -a`
+  (it holds non-text bytes) for `verify ... failed`. A clean sweep covers only the
+  compiles the runs reach.
+
 ## Benchmark runners
 
 The tracked benchmark runners use external checkouts:

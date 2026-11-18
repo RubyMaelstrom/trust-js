@@ -1,0 +1,260 @@
+# Phase 3 handoff: where the work stands and how to continue it (2026-11-18)
+
+This note is for an engineer who picks up the Phase 3 work (the speculative optimizing tier)
+without the notes of the person or agent who did it so far. It says where everything is, what is
+landed, what is half done and on which branch, which questions wait for the owner, and how the work
+is done and measured. It is a snapshot: the plan's dated records are the source of truth, and a
+record later than this note supersedes it.
+
+Read first, in this order:
+1. [AGENTS.md](/big/Code/trust-js/AGENTS.md): the standing rules (design decisions, engineering
+   rules, tests, measurement).
+2. [docs/v8-chase-2026-10-15.txt](/big/Code/trust-js/docs/v8-chase-2026-10-15.txt): the program
+   (why, the phases, the acceptance surface).
+3. [docs/v8-chase-p3-plan-2026-11-08.txt](/big/Code/trust-js/docs/v8-chase-p3-plan-2026-11-08.txt):
+   Phase 3's plan. Lines 1-558 are the design and the owner's seven decisions; from "## Stage
+   records" on, every stage's design note and every landed step's record, in the order they were
+   written. "Stage 3, the tier's own inlining (design, 2026-11-12)" and "The owner's answers on stage
+   3's forks" are where stage 3 starts.
+4. [DIAGNOSTICS.md](/big/Code/trust-js/DIAGNOSTICS.md): every TRUST_JS_* switch, and the
+   measurement recipes. [benchmarks/README.md](/big/Code/trust-js/benchmarks/README.md): the
+   regression policy and the measurement method.
+
+## Words the plan uses
+
+- First stage, second stage: the template JIT's two compiles of a function. The first stage is its
+  first native code, which fills the feedback (property, call and element caches). The second
+  stage is a recompile of a hot function on settled feedback.
+- The splice: how the second stage inlines. The caller is recompiled to bytecode from its AST with
+  its callees' bodies spliced in behind identity guards, so inlined callees have no frames of
+  their own.
+- The tier: the speculative optimizing tier, crates/trust-js/src/opt/. It builds a graph from a
+  function's bytecode and a snapshot of its feedback, on a compile thread, and its code replaces
+  the second stage's. TRUST_JS_OPT=1 turns it on. "The tier off" is the default configuration.
+- Splice and graph: the tier's two inlining modes (TRUST_JS_OPT_INLINE). At splice, the default,
+  the tier compiles the spliced bytecode. At graph it inlines callees in its own graph, each with
+  its frame states, as the exemplars do. "The flip" is making graph the default.
+- Exit, discard: a check that fails in the tier's code leaves it for the first stage's code or the
+  VM (other engines' deoptimization). Code whose exits reach a limit (100, doubling with each
+  recompile) is discarded and the function compiled again on what the exits taught.
+- Fixtures: benchmarks/fixtures/{vue,react,djot}.js. Their "measured pass" is the fixture's own
+  timed work; "steady state" is that work repeated in one process.
+- Fixed runs: an Octane benchmark run a set number of times (5, 200) under a driver, for
+  instruction counts; Octane's own runner is used for timed scores.
+- node-mg, node-sp: Node limited to Maglev (`--max-opt=2`) and to Sparkplug (`--max-opt=1`).
+- The exemplars: V8, SpiderMonkey and JSC, whose current source grounds every design choice.
+- The owner decides forks and exits. The coordinator reviews, measures again, lands and writes the
+  plan's records; so far that has been one person's assistant session directing implementers,
+  each on a branch of its own.
+
+## The repository's state
+
+- origin/main is a5411040 (stage 2's exit record). The working main is 28e60d11, 154 commits ahead
+  and NOT PUSHED: all of stage 3 so far exists only in the coordinator's checkout
+  (/big/Code/trust-js on the machine called Crystal). Pushes happen when the owner asks. Until
+  that push, a fresh clone has none of what this note describes after stage 2.
+- The branches named below are local to that checkout too, each in a git worktree under
+  target/p3/stage3/ (`git worktree list`). Many older p2-* and p3-* branches and worktrees are
+  finished probes and landed work, kept for reference; none of them is pending.
+- Engine code on main is c2b91010's; the commits after it are records.
+- `git fsck` complains of ten commits the commit-graph file lists and the object store lacks. They
+  were pruned (amended and rebased commits); no ref or reflog reaches them. Every ref and worktree
+  HEAD reads. `git commit-graph write --reachable --split=replace` removes the complaint.
+
+## Where the phase stands
+
+Phase 3 builds a Maglev-class tier above the template JIT (the plan's "Design: the tier"). It is
+switched by TRUST_JS_OPT=1 and is OFF by default: every landed step keeps the tier off's generated
+code identical unless its record says otherwise. The phase's exit (Decision 1): each fixture
+within 2x of Node limited to Maglev (node-mg) in its measured pass and in steady state, and
+Octane's geomean within 2x, in one session.
+
+- Stages 0 to 2 (tools, the skeleton on ARM64, coverage) are landed. Stage 2's exit session
+  (2026-11-14, plan "Stage 2's exit") met its bars but Djot's main-thread compile time (3.05%
+  against 3%), which the owner carried to stage 3. The owner has not yet formally closed stage 2.
+- At that session, the tier on against node-mg on the same two CPUs: measured passes Vue 3.80x,
+  React 3.00x, Djot 2.65x; steady states 3.93x, 3.39x, 4.04x; Octane 3.99x. The tier on against
+  off: Octane +33.9%, Vue -12%, Djot -13%, React level.
+- Stage 3 (inlining in the tier's own graph) is under way. Its nine steps are in the design; the
+  work reordered them as counts came in. The state of each:
+
+  | Design step | State |
+  | --- | --- |
+  | 1. Frame-state chains, exits through several frames | landed ("Stage 3 step 1 landed") |
+  | 2. The graph inliner for callees without effects | landed (step 2), behind TRUST_JS_OPT_INLINE=graph |
+  | 3. Effects, calls, throws and `new` in inlined frames (the owner's D6: generic nodes with explicit operands) | landed (steps 3a, 3b and 3c, 3c-2's pieces A, B, B2, B2b, 3d, 3e's stages (a) and (b)); at graph no plan of any measured workload splices any more |
+  | 4. The flip: graph inlining the default | NOT DONE. Its preparation, step 4p (what a discard and a repeated exit cost at graph, five rules), landed rules 1, 2 and 5 and, as step L5, rule 3; rule 4, the exit limit, was measured and left at 100 (an owner question). The last measured blocker, DeltaBlue, is now faster at graph than at the splice (rule K's record). Next deliverable: a rehearsal report (below) |
+  | 5. Polymorphic sites: every planned callee a branch from the first compile (D7) | built as "piece D", one commit, checks unfinished (below) |
+  | 6. Closures guarded by code | counted: removes nothing in any workload; not built. In its place "piece B", a closure made in the graph as a known callee (React's steady state, about 30%): designed, approved, not started |
+  | 7. Direct calls to known callees | counted (1-3% on six workloads); after pieces A and B |
+  | 8. Per-site call counts and Maglev's policy numbers (D2, D3) | not started |
+  | 9. Callee shapes beyond the splice's | part A2 landed (a forwarding constructor's construction in machine code, at every tier); A1 and A3 counted next |
+
+  Landed beside those, each with its record: steps 0, 0b, 0c (loops without effects keep slots,
+  facts and typed-array checks), rule U (template code records its in-line element hits), the
+  retention fix (stale words in JIT records kept Splay's dead nodes alive), the lowerings (L1
+  equality and typeof, L1b the equality record, L1c checks moved to a loop's entry, L2 named loads
+  through the prototype chain, L3 creation stores, `o.x++`, `o.x += v` and a String's length, L4 a
+  typed store's bookkeeping for the embedder, L5 a site whose exit flag changes nothing becomes
+  generic), the register allocator's R1 (a spilled value held in a register through a loop), the
+  absent-index walk, and rule K (an access checks only the shapes its receiver's facts allow).
+- Stage 3 has no agreed exit numbers yet. The plan's rule is that a stage's note proposes its exit
+  for the owner's agreement; the flip's session is where that proposal belongs.
+- Stages 4 to 7 (known facts and escape analysis, OSR, x86-64, the phase's end) are not started.
+  The tier is ARM64 only; x86-64 runs the first and second stages and must keep building and
+  passing (it is checked on a second machine).
+
+## Work in flight on 2026-11-18
+
+The machine went down at 03:30 on 2026-11-16 with three lines of work and the coordinator's checks
+running, and stayed idle until 2026-11-18. Nothing committed was lost. What was mid-run was run
+again from 2026-11-18 06:35. Each line keeps a dated log (STATUS.txt) and a report in its evidence
+directory; the briefs that restarted them are target/p3/stage3/briefs/*-resume.txt, with the
+standing rules in briefs/common.txt.
+
+1. Piece D, then the flip's rehearsal, then piece B.
+   Branch p3-s3-step3g, commit f3a190bb (one commit over c2b91010), worktree
+   target/p3/stage3/step3g-wt, evidence target/p3/stage3/step3g-impl.
+   - Piece D: under TRUST_JS_OPT_INLINE=graph every planned callee of a call site is built from the
+     first compile, each but the last a test and a branch to its inlined frame, the last a check.
+     Before, a site learnt one callee a round of exits and a discard: TypeScript at 5 fixed runs
+     took 8,763 WrongCallee exits and 94 discards at graph, 1,336 and 63 with D (the commit's
+     figures). Done before the crash on the final tree: the second machine's checks, the tier
+     off's code identity (2,588 of 2,590 compiles identical: the two to be explained), the tier's
+     tests at graph (649). Owed: identity at the splice, the other test configurations, GC stress,
+     instruction counts and cycles at 5 and 200 runs, then review and landing.
+   - The rehearsal is a report, not a commit: with graph as the mode, does any compile in any
+     workload or test still recompile bytecode; which of the 34 tests that pin the splice stay
+     pinned and which become tests at graph (step3g-impl/rehearsal-pins.txt); and the table of
+     every workload at 5 and 200 runs, graph against the splice on one binary. The flip (design
+     step 4) is decided on it.
+   - Piece B: design in target/p3/stage3/step3f-impl/design-note-B.txt, implementation plan in
+     step3g-impl/b-plan.txt; approved by the coordinator as the exemplars' form (the inlined
+     closure's callee recovered from the frame, as JSC's InlineCallFrame and Maglev's DeoptFrame).
+2. The construct path (design steps 6, 7 and 9, "part A").
+   Branch p3-s3-step67 at c2b91010 (part A2, landed), worktree target/p3/stage3/step67-wt, evidence
+   target/p3/stage3/step67-impl (report.txt section 4, design-note.txt).
+   - Owed first: part A2 put a forward entry in line in every construct site's entry (128 -> 288
+     bytes), which costs React +1.50% and Vue +1.69% peak RSS (step67-impl/a2/rss.out). It moves
+     out of line: one commit, with the sizes, RSS, construction cost and code identity measured.
+     The worktree held an uncommitted, never-compiled start on it when the machine went down.
+   - Then counts, no code: A1 (constructors without a learned instance layout) and A3 (Box2D's
+     `F.init.apply(this, arguments)`, 3,837 instructions a construction), each with a
+     recommendation for the coordinator.
+3. The lowerings (ARM64 emission in crates/trust-js/src/opt/a64.rs).
+   Branch p3-s3-cmp-final, three commits over c2b91010, worktree target/p3/stage3/stepL1-wt,
+   evidence target/p3/stage3/poly-impl, cmpbr-impl, fold-impl and final-builds.
+   - bc981bda: a polymorphic read's shape test fused with its branch (cmp/ccmp + b.cond).
+   - f6d97091: a Branch fused with the int32 or double compare it tests (commit message owed).
+   - 663be02c: the Object's offset folded into field and header addresses, one instruction saved a
+     field access (its note's figures at 5 runs: up to -2.1%, Box2D; commit message owed).
+   - Owed: one mutation no test catches (cmpbr-impl/mutations-cb2.out, cb-callee-dead-eq), and the
+     stack's whole measurement against c2b91010 (the crash cut it), then review and landing.
+   - Next on this line: a polymorphic read's select form and shared shape loads (they waited for
+     rule K), then Mandreel's global typed-array views (target/p3/stage3/f4-impl/notes.txt).
+4. The coordinator's own checks of the last two landings (cores 5 and 6;
+   target/p3/stage3/stepa2-review/checks2.sh): rule K's tests in the three configurations that had
+   not finished, and all of part A2's (fat LTO, clippy, the recount at every tier, the 5-run
+   verifier sweep, cycles, the whole library suite with the tier off and on). Their results go
+   into the plan as a record after this note. No engine code lands on main before the test binary
+   stepa2-review/trust_js-c2b91010-test exists (the chain builds it from the working tree).
+
+## Questions waiting for the owner
+
+Each is recorded where the plan line says; none blocks the lines above.
+1. Close stage 2 (its exit is recorded; Djot's compile bar carried to stage 3).
+2. Push main (154 commits) and whether the in-flight branches should be pushed too.
+3. The embedding API's changed contract (step L4's record: a buffer's first observation marks the
+   whole buffer dirty; an embedder that observes a buffer when it makes it sees no difference).
+4. The exit limit: keep JSC's 100 or take SpiderMonkey's 10 << R at graph once graph is the
+   default ("Step 4p's rule 4, the exit limit").
+5. Part A2 is a first-stage fast path no exemplar has at its baseline tier; the coordinator
+   decided it (its record says why). The owner may want it otherwise.
+6. Profile-guided optimization or a link order file for the Rust binary (rule U's record): the
+   fixtures' cycles move with the binary's layout at equal instructions.
+7. Folding a constant holder or method into code needs dependencies and invalidatable code, which
+   written-once code lacks (L2's record); a per-Agent creation epoch (L3's record).
+8. A conformance bug outside the plan, in every tier: a binding named `undefined` (a parameter,
+   var, let or catch) is read as the literal (`function f(undefined) { return undefined } f(5)`
+   gives undefined). Test262 does not catch it. Recommended fix, V8's form (ast/ast.cc:107-117):
+   the parser emits an ordinary identifier and only an unshadowed global reference becomes the
+   literal. Recorded under "Stage 3 lowerings L1b landed".
+9. Whether the measurement tools that now live only under target/ should be tracked (next
+   section). The repository's rule so far keeps investigation tools out (.gitignore).
+10. The machine: see "The crash" below.
+
+## How the work is done
+
+- A design record before code. Each stage and each step that makes a choice has a note in the plan
+  with its exit; a fork goes to the owner with a recommendation grounded in what V8, SpiderMonkey
+  and JSC do in their current source, with file:line citations and whether their reason applies to
+  TRust (AGENTS.md, "Design decisions").
+- Count first. A step starts from a census or a probe that says how many executions it reaches in
+  each workload; the note states the bound; the record compares the measured gain with it. A change
+  with no measured effect does not land.
+- One line of work, one worktree, one evidence directory. The implementer works on a branch in its
+  own git worktree, keeps logs and outputs in an evidence directory beside it (never /tmp, which is
+  memory-backed and cleared at restart), with a dated STATUS.txt and a final report that marks each
+  statement verified (by a named run) or inferred.
+- The coordinator reviews the diff, reruns the decisive measurements on its own builds (fat LTO,
+  the recount at each mode, the verifier sweep, cycles, the tests), fast-forwards main, and writes
+  the record into the plan from the report. Records state what was measured, by whom, and what was
+  left open.
+- Tests are diagnostics (AGENTS.md, "Testing"): the nearest tests and the tier's modules per step;
+  the whole library suite when a switch changes; full gates (Test262, difftest, the forced-exit and
+  eager modes) at a stage's end.
+
+## Local tools and evidence a fresh clone does not have
+
+Everything under target/ is untracked. The plan cites evidence there by path; those paths exist only
+on the coordinator's machine. What a contributor needs to reproduce a record's numbers, and how to
+rebuild each piece (benchmarks/README.md has the method they implement):
+
+| Local path | What it is | To rebuild |
+| --- | --- | --- |
+| target/p2/tools/build-lto.sh | fat-LTO release build of an exported commit in a fresh target directory | 27 lines: `git archive <sha>` into a new directory, `cargo build --release -p trust-js --bin trust-js --target-dir <new>` |
+| target/p2/octane-fixed/ | Octane's fixed-run driver (prelude.js, driver.js, fixed-1.js, fixed-5.js, clock.js) | load order: a read stub, Octane's base.js, prelude.js (resets the RNG), the benchmark's files, the driver; the driver keeps its state inside a function, runs N times, checks each run, prints "fixed driver complete: ..." last |
+| target/p3/stage2/x925-diag/fixed-200.js, fixed-2000.js, octane-driver-first4.js | long fixed runs and a timed driver | the same driver with N changed; the timed one loads every file as Octane's run.js does |
+| target/p3/stage2/fx3/ | steady-state copies of the three fixtures | each fixture's timed work repeated nine more times before teardown, each pass timed |
+| target/p3/stage3/merge-check/tools/ (common.sh, counts.sh) | instruction counts of two builds over the fixtures, fx3 and Octane at 5 fixed runs | `setarch -R perf stat -e instructions:u`, pinned, TRUST_JS_GC_PACING=0, median of 3, FAIL without the completion line |
+| target/p3/stage3/stepb-review/verify-sweep5.sh | the graph verifier over every workload at 5 fixed runs, both inline modes | TRUST_JS_OPT=1 TRUST_JS_OPT_VERIFY=1 TRUST_JS_OPT_LOG=1; count `verify ... failed` lines |
+| target/p3/stage2/step16-impl/tools/identity*, stepL5-impl/tools/identity-fu.sh | generated-code identity between two builds | dump each compile's code, mask addresses and veneers, compare hashes in order and as multisets |
+| target/p3/stage2/tools/ (session-2cpu.sh, report-2cpu.py, coverage2.py, coverage-s2.sh) and session-launch/ | the timing session on two CPUs and its report; coverage by time from perf's JIT dump | the plan's "Stage 2's exit" describes the session's rules |
+| target/p2/timing/uncapped.sh, HOLD, HEAT | clock-cap log and check; the files that hold heavy work during a timing session or heat | see "Machines" |
+| target/p3/exemplars/{v8,firefox,webkit} | sparse clones of the three engines at V8 63481c19, SpiderMonkey b42441b0, JSC 3f5092b0 | clone at those commits; every citation in the plan is to them |
+| target/claude-closeout/ | the benchmark harness (bench.py, the Octane checkout, the read stub) | scripts/run-octane.sh and the others in DIAGNOSTICS.md are the tracked runners |
+| target/p3/stage3/briefs/ | the standing rules given to each implementer (common.txt) and each step's brief | AGENTS.md now carries the rules |
+
+## Machines (the maintainer's; adapt to yours)
+
+- Crystal, the ARM64 host: 20 CPUs, 0-4 and 10-14 Cortex-A725, 5-9 and 15-19 Cortex-X925 (PMUs
+  armv8_pmuv3_0 and armv8_pmuv3_1). Timing sessions use CPUs 5 and 6 and run under
+  target/p2/timing/HOLD: while that file exists nothing else heavy may start. A thermal daemon caps
+  clocks under heat; a session logs the delivered clock per phase and voids a phase with a capped
+  second (the owner's rule: time as the machine runs, record the clock).
+- A second host, x86-64 Linux with the Windows MSVC target, checks what the ARM64 host cannot
+  compile: x86-64-only code, clippy there, Windows' build, the suite. Run it before a change to
+  shared code is called done. wasm32 is not installed there and is unchecked.
+- /tmp on Crystal is memory-backed and cleared at restart.
+
+## The crash of 2026-11-16, and the heat guard
+
+Crystal's log ends at 03:30:41 on 2026-11-16 with no kernel message; it was restarted at 06:14.
+What the thermal daemon logged: the hottest sensor at 64-71 C all night under the agents' builds
+and tests (about 20 busy CPUs), then 82 C at 03:01 and 90-96 C from 03:02 to the end, when a GPU
+job that starts at 03:00 every day began. The same hour on 2026-11-15 also ran at 96 C, for 55
+minutes, and the machine survived. With the CPUs idle the same GPU job reaches about 60 C. The
+cause is inferred from that log, not proven.
+
+Since 2026-11-18 a guard runs while this work does (target/p2/tools/heat-guard.py, started as the
+transient user unit trustjs-heat-guard; its docstring has the rule). At 86 C for 15 seconds it
+pauses this project's compiler, test and engine processes with SIGSTOP and creates
+target/p2/timing/HEAT; at 72 C for a minute it resumes them and removes the file. Scripts treat
+HEAT as HOLD. A timing with a pause inside it is void (the guard's log, target/p2/tools/
+heat-guard.log, has every pause). The unit does not survive a restart or a logout:
+`systemd-run --user --unit=trustjs-heat-guard /usr/bin/python3 /big/Code/trust-js/target/p2/tools/heat-guard.py`
+starts it again, `systemctl --user stop trustjs-heat-guard` ends it and resumes anything paused.
+
+What the crash cost: no commit, no source file. Outputs written in its last minute were empty or
+cut (two binaries, one identity run, the first lines of two sweeps); every run in flight was run
+again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's are under target/.

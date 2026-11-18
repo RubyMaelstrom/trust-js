@@ -6022,3 +6022,30 @@ Since the records above (2026-11-16): the absent-index walk at 200 runs with the
 measured again with incremental marking off (the lowerings' agent): TypeScript -0.047%, the
 two binaries' ranges apart, the size the misses predict (889,551 at about 685 instructions);
 the +0.09% read before was the incremental marker under load.
+
+The interruption of 2026-11-16 and the restart (2026-11-18;
+docs/v8-chase-p3-handoff-2026-11-18.txt gives the whole state to a reader without this plan's
+history, and AGENTS.md, benchmarks/README.md and DIAGNOSTICS.md now carry the standing rules, the
+measurement method and the recipes that until now lived in the agents' briefs under target/).
+- What happened. Crystal's log ends at 03:30:41 on 2026-11-16, with no kernel message, and the
+  machine was restarted at 06:14; nothing ran until 2026-11-18. The thermal daemon's log has the
+  hottest sensor at 64-71 C all night under the agents' builds and tests, 82 C at 03:01 and 90-96
+  C from 03:02 on, when the GPU job that starts at 03:00 each day began; the same hour of
+  2026-11-15 ran at 96 C for 55 minutes. With the CPUs idle that job reaches about 60 C. The cause
+  is inferred from that log. A guard now pauses this project's compiler, test and engine
+  processes at 86 C and resumes them at 72 C (target/p2/tools/heat-guard.py, the file
+  target/p2/timing/HEAT beside HOLD; a timing with a pause inside it is void).
+- What it cost. No commit and no source file: every ref and worktree reads, and the uncommitted
+  work in the construct path's worktree is whole. Outputs written in the last minute were empty
+  or cut (two binaries, one identity run, two sweeps' first lines), and every run in flight
+  stopped: the three agents' and my checks of rule K (three of the tier's five test
+  configurations) and of part A2 (all of them).
+- Restarted on 2026-11-18, each line by a new agent from its predecessor's log, report and
+  worktree (briefs target/p3/stage3/briefs/*-resume.txt): piece D's remaining checks, then the
+  flip's rehearsal and piece B (f3a190bb on p3-s3-step3g); the forward entry out of line, which
+  part A2's memory requires (React +1.50% and Vue +1.69% peak RSS with it in line,
+  step67-impl/a2/rss.out), then the counts for A1 and A3; and the lowerings' three commits (the
+  shape test fused with its branch, a compare fused with its branch, the Object's offset folded
+  into field addresses: bc981bda, f6d97091, 663be02c on p3-s3-cmp-final), whose measurement the
+  crash cut. My checks run again on cores 5 and 6 (target/p3/stage3/stepa2-review/checks2.sh;
+  part A2's files in merge-check are named pa2). Their results follow as a record.
