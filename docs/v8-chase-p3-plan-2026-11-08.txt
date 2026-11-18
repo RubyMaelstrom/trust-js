@@ -6733,3 +6733,27 @@ the tier on: the rehearsal's +0.46% and +0.19% at graph against the default say 
 about graph. The method's note on the collecting benchmarks now carries the numbers and
 the rule that such a row is charged to a change only when the recount without the marker
 shows it too. Why the schedule differs between binaries at equal work was not looked into.
+
+Part A2's standing, measured again as the owner asked: it stays (2026-11-18;
+target/p3/stage3/steproute-review, a2-n3.out, a2-cycles.out and their directories; the
+construct line's tool on the route's landed binary, 8bfb6fab's engine). The owner kept part
+A2 on the condition that it be measured again once A1 and the apply form were in, with the
+bar that it stays if it supplies some benefit. Three variants on one binary, by the two
+switches the apply form added: the forward form on (the default); TRUST_JS_JIT_NO_FORWARDER=1,
+where the forwarder's body is an ordinary constructor whose `apply` the apply form takes;
+and both switches, the path before either existed.
+- The forwarder's construction, instructions (the tier off / the tier on, both modes alike):
+  882.87 / 738.73 with the forward form; 1,503.00 / 1,288.88 with the apply form alone;
+  3,092.36 / 2,878.11 with neither. The apply form halves what the general path cost, and
+  the forward form still takes 620 and 550 off that.
+- RayTrace at 200 runs against the default, on one X925 core, five rounds with the variants
+  alternating (1.37 GHz delivered, the heat guard not tripped, every run complete). Without
+  the forward form: +40.4% instructions and +30.0% cycles with the tier off, +55.5% and
+  +54.4% at the default, +55.7% and +55.4% at graph. With neither form: +132.6% and +112.4%,
+  +201.3% and +207.8%, +201.7% and +210.4%. At 5 runs, without the forward form: +35.0% and
+  +24.6%, +40.1% and +30.4%, +44.3% and +34.8%.
+- So part A2 supplies a benefit that the general forms do not replace: a third to a half of
+  RayTrace's time. It stays. What is left of the earlier question is the layout of its site
+  entry (168 bytes in line in every construct site, which moving out of line made 2% slower
+  on RayTrace): the fields the form reads first in line and the rest out of line is the form
+  to try, when someone takes it up.
