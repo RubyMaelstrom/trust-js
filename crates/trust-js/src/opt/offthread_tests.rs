@@ -449,6 +449,31 @@ fn discarded() -> Vec<usize> {
     super::TEST_DISCARDED.with(|discarded| std::mem::take(&mut *discarded.borrow_mut()))
 }
 
+/// The test's own chunks by address, for a failure's message: f's tier chunk (`chunk`) and first
+/// stage, noop's tier chunk and first stage, and the pending compiles' chunks.
+fn chunks_named(engine: &mut Engine, chunk: &Rc<Chunk>) -> String {
+    let address = |chunk: Option<Rc<Chunk>>| chunk.map(|chunk| Rc::as_ptr(&chunk) as usize);
+    let mut pending = Vec::new();
+    engine
+        .interp
+        .opt_pending
+        .measure(|pended| pending.push(Rc::as_ptr(pended) as usize));
+    format!(
+        "f's tier chunk {:x}, f's first stage {:x?}, noop's tier chunk {:x?}, noop's first \
+         stage {:x?}, pending {pending:x?}",
+        Rc::as_ptr(chunk) as usize,
+        address(runtime_slot(engine, "f", |runtime| runtime
+            .code
+            .get()
+            .and_then(Option::clone))),
+        address(tier_chunk(engine, "noop")),
+        address(runtime_slot(engine, "noop", |runtime| runtime
+            .code
+            .get()
+            .and_then(Option::clone))),
+    )
+}
+
 #[test]
 fn a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile() {
     // A discard at the loop limit (stage 2, step 13) is a discard as any: it counts R on the
@@ -467,9 +492,19 @@ fn a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile() {
         "function noop() {}\n\
          function f(a, n, cb) { let s = (a | 0) + 1; \
          for (let i = 0; i < n; i++) { if (i === 0) cb(); s = s + (i & 3); } return s; }\n\
+         for (let k = 0; k < 1000; k++) noop();\n\
          let t = 0; for (let k = 0; k < 1000; k++) t = (t + f(k, 4, noop)) | 0; t",
     );
     super::finish_compiles_for_test(&mut engine.interp);
+    // noop's own compile is made and installed here, before the clear: f's fallback calls noop
+    // under the hold below, and a noop that had not reached its checkpoint yet (f's tier code
+    // inlines it, so its own runs depend on when f's compile was installed) would queue its
+    // compile there, which a poll after the hold installs (seen 2026-11-18: noop's first stage
+    // pending beside the reoptimization at the hold's release, 1 run in 10 alone).
+    assert!(
+        tier_chunk(&mut engine, "noop").is_some(),
+        "noop's tier code"
+    );
     let chunk = tier_chunk(&mut engine, "f").expect("f's tier chunk");
     let code = chunk.jit.get().flatten().expect("resident");
     assert!(
@@ -505,6 +540,19 @@ fn a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile() {
     assert!(discarded().is_empty());
     assert_eq!(eval(&mut engine, "f(1, 0, noop)"), "2");
     assert_eq!(discarded(), vec![code.mem_ptr() as usize]);
+    // The evaluations under the hold queued no compile of their own: the reoptimization is the
+    // one job pending when the compile thread is let go.
+    let mut pending = Vec::new();
+    engine
+        .interp
+        .opt_pending
+        .measure(|pended| pending.push(Rc::as_ptr(pended) as usize));
+    assert_eq!(
+        pending,
+        vec![Rc::as_ptr(&chunk) as usize],
+        "only the reoptimization pending at the hold's release ({})",
+        chunks_named(&mut engine, &chunk)
+    );
     drop(hold);
     wait_finished(&engine);
     // Any poll installs: a loop's back edges (an entry of f could also take its warm-up's
@@ -518,7 +566,15 @@ fn a_loop_limit_discard_drops_a_reoptimization_pending_meanwhile() {
     assert_eq!(drops.len(), 1, "{drops:?}");
     assert_eq!(drops[0].0, Rc::as_ptr(&chunk) as usize);
     assert_eq!(drops[0].1, "a discard flagged its sites since its snapshot");
-    assert!(compiled().is_empty(), "nothing installed");
+    // A compile installed here is named against the test's own chunks, so that a failure in a
+    // module run says which chunk's compile ran in the window (it failed twice in parallel
+    // module runs at TRUST_JS_OPT_INLINE=graph on 2026-11-18, never alone).
+    let late = compiled();
+    assert!(
+        late.is_empty(),
+        "nothing installed: compiled {late:x?} ({})",
+        chunks_named(&mut engine, &chunk)
+    );
     let now = chunk.jit.get().flatten().expect("the fallback");
     assert_eq!(
         super::exit::table_bytes(now.mem_ptr()),
