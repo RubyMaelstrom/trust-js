@@ -768,27 +768,13 @@ fn a_shadowed_named_function_expression_keeps_an_unread_self_name_record() {
     assert!(record("r"), "read: a record");
 }
 
-/// Point B's rule (the coordinator's review, 2026-11-18), read in the allocation: a by-literal
-/// frame's callee has a home across every node of its frame (`regalloc`'s by-literal extents),
-/// a callee-saved register or a spill slot across each node that calls, so that a helper the
-/// frame's last node runs, which collects and then reads the stack through the frame-callee
-/// table, finds the closure alive. The shape is the one with nothing after the frame's last call
-/// to keep it: the helper's `return f(a)`, the arrow's `return probe(...)` on two arms, whose
-/// blocks follow the generic call that reads the closure where the table has no entry for it (a
-/// frame of one block lies before that call in code order, which kept the closure across it by
-/// accident: the extent rule's mutation went uncaught on such a shape).
-#[test]
-fn a_by_literal_frames_callee_has_a_home_across_every_node_of_its_frame() {
-    use super::ir::{FrameIx, Graph};
-    use super::regalloc::{Home, ARM64};
-    const SOURCE: &str = "function helper(f, a) { return f(a); }\n\
-         function probe(v) { return new Error('x').stack.length + v; }\n\
-         function W(n, k) { return helper((x) => (x > 1 ? probe(x + k) : probe(k - x)), n); }\n\
-         for (var i = 0; i < 30; i++) W(i % 4, i % 3);";
-    let mut engine = super::inline_tests::warmed(SOURCE);
-    let compile = super::inline_tests::Compile::new(&mut engine, "W");
-    let mut graph = compile.build().graph;
-    let in_frame = |graph: &Graph, mut frame: FrameIx, of: FrameIx| loop {
+/// Whether `frame` is `of` or nested in it.
+fn in_frame(
+    graph: &super::ir::Graph,
+    mut frame: super::ir::FrameIx,
+    of: super::ir::FrameIx,
+) -> bool {
+    loop {
         if frame == of {
             return true;
         }
@@ -796,60 +782,70 @@ fn a_by_literal_frames_callee_has_a_home_across_every_node_of_its_frame() {
             Some(inlined) => frame = graph.state(inlined.parent).frame,
             None => return false,
         }
-    };
-    // Every node of each by-literal frame lies inside its callee's range, whose home is
-    // callee-saved or a spill slot across each node that calls; the frames' callees.
-    let homed = |graph: &Graph| {
-        let alloc = super::regalloc::allocate(graph, &ARM64).expect("the graph allocates");
-        let (mut callees, mut calls) = (Vec::new(), 0);
-        for (k, frame) in graph.frames.iter().enumerate() {
-            if !frame.by_literal {
-                continue;
-            }
-            let of = FrameIx(k as u32 + 1);
-            let callee = frame.callee;
-            callees.push(callee);
-            let end = alloc.ranges[callee.index()].1;
-            let home = alloc.homes[callee.index()];
-            for &b in &alloc.order {
-                for &node in &graph.block(b).body {
-                    if !in_frame(graph, graph.node(node).frame, of) {
-                        continue;
-                    }
-                    let at = alloc.pos[node.index()];
+    }
+}
+
+/// `graph`'s allocation: every node of each by-literal frame lies inside its callee's range,
+/// whose home is callee-saved or a spill slot across each node that calls. The frames' callees,
+/// and the blocks of the frames' nodes that call.
+fn assert_callees_homed(
+    graph: &super::ir::Graph,
+) -> (Vec<super::ir::NodeIx>, Vec<super::ir::BlockIx>) {
+    use super::ir::FrameIx;
+    use super::regalloc::{Home, ARM64};
+    let alloc = super::regalloc::allocate(graph, &ARM64).expect("the graph allocates");
+    let (mut callees, mut calls) = (Vec::new(), Vec::new());
+    for (k, frame) in graph.frames.iter().enumerate() {
+        if !frame.by_literal {
+            continue;
+        }
+        let of = FrameIx(k as u32 + 1);
+        let callee = frame.callee;
+        callees.push(callee);
+        let end = alloc.ranges[callee.index()].1;
+        let home = alloc.homes[callee.index()];
+        for &b in &alloc.order {
+            for &node in &graph.block(b).body {
+                if !in_frame(graph, graph.node(node).frame, of) {
+                    continue;
+                }
+                let at = alloc.pos[node.index()];
+                assert!(
+                    end > at,
+                    "the callee's range ends at {end} (its home {home:?}), a node of its frame \
+                     ({:?}, b{}) is at {at}",
+                    graph.node(node).op,
+                    b.0
+                );
+                if graph.node(node).op.is_effectful() {
+                    calls.push(b);
                     assert!(
-                        end > at,
-                        "the callee's range ends at {end} (its home {home:?}), a node of its \
-                         frame ({:?}) is at {at}",
-                        graph.node(node).op
+                        matches!(home, Home::Gp(r) if ARM64.gp_callee.contains(&r))
+                            || matches!(home, Home::Spill(_)),
+                        "the callee's home across a call: {home:?}"
                     );
-                    if graph.node(node).op.is_effectful() {
-                        calls += 1;
-                        assert!(
-                            matches!(home, Home::Gp(r) if ARM64.gp_callee.contains(&r))
-                                || matches!(home, Home::Spill(_)),
-                            "the callee's home across a call: {home:?}"
-                        );
-                    }
                 }
             }
         }
-        assert!(!callees.is_empty(), "a by-literal frame built");
-        assert!(calls > 0, "a node of the frame that calls");
-        callees
-    };
-    let callees = homed(&graph);
-    // The rule alone: the generic call the code takes where the table has no entry reads the
-    // callee, as its input and in its state (the helper's slot), after the frame in code order
-    // (`regalloc::reverse_postorder` visits a branch's last successor first), which keeps it
-    // across the frame by itself; with every read of it outside its frames taken away (an input
-    // another value, a state that holds it dropped), the rule still must.
+    }
+    assert!(!callees.is_empty(), "a by-literal frame built");
+    assert!(!calls.is_empty(), "a node of the frame that calls");
+    (callees, calls)
+}
+
+/// `graph` with every read of `callees` outside their by-literal frames taken away (an input
+/// another value, the frame's receiver; a state that holds one dropped): the generic call the code
+/// takes where the table has no entry reads the callee, as its input and in its state (the
+/// helper's slot), after the frame in code order (`regalloc::reverse_postorder` visits a branch's
+/// last successor first), which alone keeps it across the frame in today's graphs.
+fn without_outside_reads(graph: &mut super::ir::Graph, callees: &[super::ir::NodeIx]) {
+    use super::ir::FrameIx;
     let mut replaced = 0;
     for k in 0..graph.nodes.len() {
         let frame = graph.nodes[k].frame;
         let outside =
             graph.frames.iter().enumerate().all(|(f, data)| {
-                !data.by_literal || !in_frame(&graph, frame, FrameIx(f as u32 + 1))
+                !data.by_literal || !in_frame(graph, frame, FrameIx(f as u32 + 1))
             });
         if !outside {
             continue;
@@ -876,7 +872,58 @@ fn a_by_literal_frames_callee_has_a_home_across_every_node_of_its_frame() {
         }
     }
     assert!(replaced > 0, "the generic call's read of the callee");
-    homed(&graph);
+}
+
+/// The allocation of a global function `name` of `source`, run first by template code.
+fn graph_of(source: &str, name: &str) -> super::ir::Graph {
+    let mut engine = super::inline_tests::warmed(source);
+    super::inline_tests::Compile::new(&mut engine, name)
+        .build()
+        .graph
+}
+
+/// Point B's rule (the coordinator's review, 2026-11-18), read in the allocation: a by-literal
+/// frame's callee has a home across every node of its frame (`regalloc`'s by-literal extents),
+/// a callee-saved register or a spill slot across each node that calls, so that a helper the
+/// frame's last node runs, which collects and then reads the stack through the frame-callee
+/// table, finds the closure alive; in the graph as built, and with every read of the callee
+/// outside its frame taken away, where the rule alone must keep it (the rule's mutation is caught
+/// there only). The shape has nothing after the frame's last call to keep the closure: the
+/// helper's `return f(a)`, the arrow's `return probe(...)` on two arms.
+#[test]
+fn a_by_literal_frames_callee_has_a_home_across_every_node_of_its_frame() {
+    const SOURCE: &str = "function helper(f, a) { return f(a); }\n\
+         function probe(v) { return new Error('x').stack.length + v; }\n\
+         function W(n, k) { return helper((x) => (x > 1 ? probe(x + k) : probe(k - x)), n); }\n\
+         for (var i = 0; i < 30; i++) W(i % 4, i % 3);";
+    let mut graph = graph_of(SOURCE, "W");
+    let (callees, _) = assert_callees_homed(&graph);
+    without_outside_reads(&mut graph, &callees);
+    assert_callees_homed(&graph);
+}
+
+/// What the rule's one read after the frame's last node pins (the coordinator, 2026-11-18): it
+/// covers an arm of a branching frame that is not on a path to that node only because a home is
+/// held over a value's whole range in code order. A frame that branches into two arms, each with
+/// a call of its own: every node of both arms lies in the callee's range, with the callee's reads
+/// outside the frame taken away, so that an allocator that learns holes in ranges or splits them
+/// fails here instead of silently uncovering an arm.
+#[test]
+fn a_branching_by_literal_frames_callee_has_a_home_across_both_arms() {
+    const SOURCE: &str = "function helper(f, a) { return f(a); }\n\
+         function probe(v) { return new Error('x').stack.length + v; }\n\
+         function probe2(v) { return new Error('y').stack.length - v; }\n\
+         function W(n, k) { return helper((x) => (x > 0 ? probe(x + k) : probe2(k - x)), n); }\n\
+         for (var i = 0; i < 30; i++) W(i % 4 - 1, i % 3);";
+    let mut graph = graph_of(SOURCE, "W");
+    let (callees, calls) = assert_callees_homed(&graph);
+    let arms: std::collections::BTreeSet<_> = calls.iter().map(|b| b.0).collect();
+    assert!(
+        arms.len() >= 2,
+        "a call on each arm, in blocks of their own: {calls:?}"
+    );
+    without_outside_reads(&mut graph, &callees);
+    assert_callees_homed(&graph);
 }
 
 /// The coordinator's point C: a throw out of a by-literal frame that no handler in its chain
