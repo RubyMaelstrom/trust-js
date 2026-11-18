@@ -6167,3 +6167,67 @@ none at 200 runs; of the 34 tests that pin the splice 21 stay its tests and 13 n
 counterpart, four of which are missing; graph against the splice in instructions is below zero
 or below resolution but for React's steady state (+0.29%, the callback call piece B replaces),
 Splay (+0.46% at 5 runs, +0.19% at 200), Crypto (+0.67%) and GBEMU (+0.20%) at 200 runs.
+
+Stage 3 step 3f, piece D landed (9e525fea, 2026-11-18; target/p3/stage3/step3g-impl,
+report-d.txt and its timing files, the agents'; my checks stepd-review and merge-check's
+counts-d.out, counts-d-graph.out and cycles-d.out): under TRUST_JS_OPT_INLINE=graph every
+planned way of a call site is built from the first compile.
+- The rule. Each kept way of a site but the last is a test of the callee's identity
+  (CalleeMatches) and a branch to its inlined frame, the next way on its mismatch; the last is
+  a check (CheckCallee), which ends the chain, unless WrongCallee is flagged at the call past
+  its place (as before) or the site's cache is past the plan (megamorphic, or naming a callee
+  no kept way expects: `past_plan`), where it too is a test and the generic call follows. As
+  JSC's polymorphic call inlining switches on the callee and falls through to the generic call
+  where the call's status could take the slow path, to an exit where it could not
+  (dfg/DFGByteCodeParser.cpp:2726-2770, 2875-2890), and as Maglev's polymorphic access compares
+  each arm and checks the last (maglev-graph-builder.cc:5877-5887); the owner's answer on D7.
+  Before, a first compile built way 0 as a check and left ways 1 to 3 unbuilt, so a site whose
+  callees were all planned was learnt one way a round of a hundred exits and a discard (step
+  4p's rule 5 flags only callees outside every kept way).
+- Two places must agree and now say so: the loop prepass reads a site through
+  Tree::effect_free and the build through Builder::call. Both take the site's ways with an
+  analysed callee, none is dropped while building (a refusal there refuses the compile), and
+  both read the last guard by the same two tests; a debug assertion at the call holds them to
+  it. The splice is untouched: its tier code is identical in 1,373 of 1,373 compiles, template
+  code in 2,174 of 2,174, and with the tier off in 2,588 of 2,590 (the two are one constant
+  whose value is an address of the binary, a move-wide one instruction shorter and a pad two
+  nops longer; identical with nop runs folded).
+- Exits and discards at graph (the agent's logs, main's engine before -> with D). At 5 fixed
+  runs over the 21 workloads: WrongCallee exits 10,258 -> 2,233, all exits 37,654 -> 30,006,
+  discards 286 -> 249, tier compiles 1,516 -> 1,481; TypeScript's WrongCallee exits 8,763 ->
+  1,336 and its discards 94 -> 63. At 200 runs over the fifteen Octane benchmarks: 15,182 ->
+  2,707, discards 400 -> 322; DeltaBlue's discards 29 -> 2 and its tier code 1,037,812 ->
+  357,012 bytes. All tier code at 200 runs 17.13 MB -> 15.39 MB (-10.2%). GBEMU's 791
+  WrongCallee exits are untouched: callees outside every planned way, rule 5's population,
+  not looked into.
+- Instructions at graph (fat LTO, fixed addresses; mine and the agent's agree to 0.05%). At 5
+  runs: Richards -8.00%, DeltaBlue -3.63%, RayTrace -1.86%; TypeScript -0.34% by the means of
+  8 runs a side at randomized addresses with incremental marking off (standard error 0.035%;
+  the agent's). At 200 runs: DeltaBlue -6.27%, Richards -4.70%, RayTrace level. Every other
+  row is under its workload's spread. Richards' 5-run row is the detour gone (a hundred exits,
+  the discard, template code until the recompile) and four functions that now reach their
+  compile within five runs; at 200 runs what remains is the scheduler's second way in line.
+- Cycles on one X925 core alone. Mine (five alternating rounds, the requested clock 1.4 to 2.5
+  GHz, the heat guard not tripped): at 200 runs at graph DeltaBlue -11.52%, Richards -6.77%;
+  the default level. The agent's (three rounds, 1.37 GHz delivered): DeltaBlue -4.99% at 5
+  runs and -12.21% at 200, TypeScript at 5 runs -0.82% inside a spread of 1.0%. Graph against
+  the splice on D's binary at 200 runs is now DeltaBlue -13.98% instructions and -21.39%
+  cycles, Richards -9.01% and -13.40% (mine; the agent's -13.89% and -22.68%, -8.95% and
+  -12.99%).
+- Compile cost at graph at 5 runs, all workloads: the compile thread's instructions -4.4%
+  (TypeScript -8.2%, DeltaBlue -15.0%, RayTrace -25.0%), and timed on one core, the median of
+  three rounds: compile 515.3 -> 491.2 ms, the main thread's snapshots 26.2 -> 24.3 ms, its
+  installs 60.0 -> 58.6 ms. D builds more ways a compile and compiles less often.
+- Tests: four new (every planned way is built from the first compile; a callee met after the
+  compile exits at the last check and is planned next; a site past its plan tests every way
+  and calls the rest generically; every planned way gives the tier off's results) and the
+  flagged-guard and re-read tests changed to the new form; seven mutations caught, the first
+  also with the builder's debug assertion taken out; GC stress over the six that exercise the
+  rule; the tier's modules 649 passed and none failed
+  in six configurations (graph, graph eager, graph with forced exits, the default, forced
+  exits at the default, the tier off); the 5-run verifier sweep 42 of 42 at both modes (mine
+  and the agent's, its refusals equal to main's line for line); clippy with tests; zombie's
+  check, clippy, Windows' check and the tier's tests on x86-64. The landed commit differs from
+  the one measured in comment lines and the assertion: its release binary differs from the
+  measured one in twenty bytes, the line numbers of the file's panic locations.
+- Left open: GBEMU's exits above; the compile thread's comparison at 200 runs was not rerun.
