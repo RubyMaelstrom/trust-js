@@ -268,3 +268,26 @@ starts it again, `systemctl --user stop trustjs-heat-guard` ends it and resumes 
 What the crash cost: no commit, no source file. Outputs written in its last minute were empty or
 cut (two binaries, one identity run, the first lines of two sweeps); every run in flight was run
 again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's are under target/.
+
+## Later the same day (2026-11-18)
+
+- The coordinator's checks of rule K and part A2 finished clean; their record follows the
+  interruption's in the plan. Main's engine code passes the whole library suite with the tier off
+  and on (3,596 passed each).
+- A KNOWN OPEN DEFECT at graph, on main since step 3e's stage (a): the library test
+  interpreter::gc_collect::tests::a_splay_trees_live_data_stays_flat_in_every_tier fails with
+  TRUST_JS_OPT=1 TRUST_JS_OPT_INLINE=graph (removed Splay nodes are kept alive by a stale word;
+  the cause is not found). It passes at the default and with the tier off. It blocks the flip.
+  The plan's record "Found by the flip's rehearsal" has what is known.
+- The measuring rule that the day's two wrong readings produced is in benchmarks/README.md:
+  fixed-address counts of two binaries are one draw of each binary's layout; split a peak-RSS
+  difference into anonymous and file-backed memory before charging it to a structure.
+- Decided since the note was first written (the plan's records of 2026-11-18): A1 (a constructor
+  takes the instance layout its first constructions were observed with) is being built, measured
+  at about -1% to -2.4% of DeltaBlue and -2.2% to -4.6% of Box2D at 200 runs; a template call
+  form for `f.apply(t, arguments)` that makes no arguments object is approved by the owner, a
+  count and a design note first; part A2 stays and is measured again against those two; the
+  optimizing tier will be the default once it is complete, and designs are weighed for that.
+- The implementers hit a weekly usage limit at 08:50 and two lines were restarted from their
+  logs; a line's STATUS.txt, its reports and, where one exists, NEXT.txt in its evidence
+  directory are what a restart reads.

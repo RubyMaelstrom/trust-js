@@ -45,6 +45,18 @@ Instruction counts (`perf stat -e instructions:u`)
 - Pin the run to one core type with `taskset` outside `perf`, switch address
   randomization off (`setarch -R`), set `TRUST_JS_GC_PACING=0`, and take the median of
   three. Unpinned on a machine with two core types, the count is not a count.
+- Fixed addresses make one binary's runs agree; they do not make two binaries
+  comparable to that precision. With `setarch -R` three runs of a binary agree to
+  0.0002%, but each binary has its own addresses, and a workload that hashes by address
+  moves with them: a run's standard deviation at randomized addresses is 0.06% to 0.09%
+  on Vue (fixture and steady state), 0.1% on PdfJS, 0.08% to 0.23% on TypeScript, 0.02%
+  to 0.05% on GBEMU, Splay and Djot's steady state, and 0.012% or less on the other
+  fixtures and Octane benchmarks at five runs. A difference between two binaries that
+  is under about three of those deviations is not a result. Confirm one that matters
+  with the mean of at least eight runs a side without `setarch -R`, the binaries
+  interleaved, and report the mean, the deviation and the standard error. A +0.09% on
+  Vue's steady state, three runs a side agreeing to four decimals, was 0.007% in 24-run
+  means.
 - Run both sides through the same script and invocation. The environment's layout moves
   a count through the conservative stack scan, so a same-binary comparison toggled by an
   environment variable passes an unread variable of equal length on the other side.

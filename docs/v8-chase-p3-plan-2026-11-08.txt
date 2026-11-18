@@ -6110,3 +6110,60 @@ the Rust forwarder still recognizing the constructor (main before A2); and both 
 constructor an ordinary one taken by A1's layout and its apply by the general form. If the
 general path is close, A2's form is removed; otherwise it stays and the numbers go back to the
 owner. A1 and the apply form are designed so that the third variant is a case they cover alone.
+
+Rule K and part A2: my checks on main, run again after the interruption (2026-11-18;
+target/p3/stage3/stepk-review, stepa2-review, merge-check's files named pa2). They close the
+two lines the records above left open ("the other four configurations running", "mine on the
+merged tree, running when this was written").
+- Rule K (1982beb6). The tier's modules on the merged tree in the five configurations: graph,
+  graph eager, graph with forced exits, the default and forced exits at the default, 646
+  passed and none failed in each.
+- Part A2 (c2b91010), against 1982beb6, fat LTO. Clippy with tests clean. Instructions at 5
+  fixed runs: RayTrace -33.94% with the tier off, -42.26% at the default, -44.22% at graph,
+  the agent's figures to a hundredth; every other row within its spread or a collecting
+  benchmark's modes but steady Vue, below. Cycles on one X925 core alone, five alternating
+  rounds (the requested clock between 1.38 and 3.9 GHz over the rounds, the heat guard not
+  tripped): RayTrace at 5 runs -38.0% at the default and -40.5% at graph, at 200 runs -52.1%
+  and -52.5%; the controls level (Box2D at 5 runs +0.02% and -0.34%, DeltaBlue at 200 -0.65%
+  and -0.30%). The verifier sweep at 5 fixed runs: 42 of 42 at both modes. The whole library
+  suite on the merged tree: 3,596 passed and none failed with the tier off and with it on.
+- Steady Vue, and a correction of the method. My recount read Vue's steady state +0.086% with
+  the tier off, +0.103% at the default and +0.102% at graph for part A2, three runs a side
+  agreeing to 0.0002%, and I reported it as the commit's cost. It is not one. Under setarch -R
+  every run of one binary has the same addresses, so its runs agree; two binaries have
+  different addresses, and Vue's count moves with them. The construct agent's 24 runs of each
+  binary at randomized addresses (step67-impl/ool/vue/aslr24.out) give 11,464.94M for 1982beb6
+  with a standard deviation of 6.67M a run, c2b91010 0.84M above it, the difference's standard
+  error 1.9M. The fixed-address figure was one draw of that spread. (The same reading had made
+  a later build seem to return 9M of it; and the day's first error of this family charged the
+  in-line forward entry with +1.5% peak RSS that was the binaries' file-backed pages.)
+- The spread, measured for every workload so that the rule has numbers (c2b91010's binary,
+  8 runs without setarch -R at each tier, TRUST_JS_GC_PACING=0; merge-check/aslr-survey.d and
+  aslr-survey.py). Standard deviation of a run, the tier off / on: Vue's steady state 0.088% /
+  0.058%, Vue's fixture 0.050% / 0.074%, TypeScript 0.080% / 0.231%, PdfJS 0.099% / 0.105%,
+  GBEMU 0.044% / 0.013%, Djot's steady state 0.046% / 0.023%, Splay 0.036% / 0.018%; every
+  other fixture and Octane benchmark at 5 runs 0.012% or less (zlib, Mandreel, Crypto and
+  Richards under 0.005%). A fixed-address count also sits off the randomized mean by more than
+  that spread on several (DeltaBlue 0.2% below, Vue 0.05% to 0.2% below, TypeScript 0.2% to
+  0.5% above): fixed addresses are one particular layout, not a typical one. The rule, now in
+  benchmarks/README.md: a difference between two binaries at fixed addresses that is under
+  about three of these deviations is not a result until the means of randomized-address runs
+  say so; the agents' briefs carry it from today.
+
+Found by the flip's rehearsal (2026-11-18; target/p3/stage3/step3g-impl/report-rehearsal.txt,
+the agent's, its cycles not yet measured; the failure reproduced by me on main's test binary,
+stepa2-review/splay-graph.log): one library test fails at graph, on main since step 3e's stage
+(a) (d2f16daf). interpreter::gc_collect::tests::a_splay_trees_live_data_stays_flat_in_every_tier
+with TRUST_JS_OPT=1 TRUST_JS_OPT_INLINE=graph: the objects a major collection keeps grow from
+3,490 to 6,599 over four samples and fall back; it passes at the default and with the tier off,
+and passed at graph on 13bfd95f (step 3d). It is the test of stage 2's retention fix, so a
+stale word again names removed nodes, and `new` from inlined frames is where to look; the cause
+is not found. The whole library suite had not been run at graph since that step (my checks of
+3e ran the tier's modules at graph and the whole suite at the default): it is 3,599 passed and
+this one failed. It blocks the flip and is the next task of the line that built 3e. The
+rehearsal's other findings so far, for the flip's record when its cycles are in: at graph two
+tier compiles of the workloads still recompile bytecode (Vue's function with `finally`) and
+none at 200 runs; of the 34 tests that pin the splice 21 stay its tests and 13 need a graph
+counterpart, four of which are missing; graph against the splice in instructions is below zero
+or below resolution but for React's steady state (+0.29%, the callback call piece B replaces),
+Splay (+0.46% at 5 runs, +0.19% at 200), Crypto (+0.67%) and GBEMU (+0.20%) at 200 runs.
