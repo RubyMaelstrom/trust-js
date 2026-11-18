@@ -798,6 +798,8 @@ impl Rules<'_> {
             stored.retain(|source| match *source {
                 Source::Slot(slot) => !written.contains(&slot),
                 Source::Name(address, _) => !names.contains(&address.slot),
+                // A global's store is an effect, which cleared them all above (F4 part 1).
+                Source::Global(_) | Source::Lexical(_) => true,
             });
             match self.typed_source(pc) {
                 Some((source, Some(_), true)) if !stored.contains(&source) => stored.push(source),
@@ -838,11 +840,55 @@ impl Rules<'_> {
                     super::snapshot::NameView::Static { address, base } => {
                         Some(Source::Name(address, base))
                     }
-                    _ => None,
+                    _ => self.global_source(at),
                 }
             }
             _ => None,
         }
+    }
+
+    /// The source of the read at `pc` where it is a global-object property's or a script-level
+    /// lexical's that the builder lowers (F4 part 1): its location or its binding.
+    fn global_source(&self, pc: usize) -> Option<Source> {
+        if !matches!(
+            self.ops[pc],
+            Op::LoadName(..)
+                | Op::LoadNameForCall(..)
+                | Op::LoadNameIn(..)
+                | Op::LoadNameForCallIn(..)
+        ) || !self.lowers(pc)
+        {
+            return None;
+        }
+        match self.snapshot.name(pc) {
+            super::snapshot::NameView::Global { location, .. } => Some(Source::Global(location)),
+            super::snapshot::NameView::GlobalLexical { binding, .. } => {
+                Some(Source::Lexical(binding))
+            }
+            _ => None,
+        }
+    }
+
+    /// The field locations a lowered named store, update or append at `pc` may write (its store
+    /// ways' locations; a creation's landing location): none for any other operation.
+    fn stored_field(&self, pc: usize) -> Vec<u16> {
+        let name = match self.ops[pc] {
+            Op::SetProp(name, _)
+            | Op::SetPropDrop(name, _)
+            | Op::SetPropThisDrop(name, _)
+            | Op::SetPropLocalDrop(_, name, _)
+            | Op::UpdateProp(name, _, _)
+            | Op::AppendProp(name, _) => name,
+            _ => return Vec::new(),
+        };
+        let mut locations = Vec::new();
+        if let Some(ways) = self.own_data_ways(pc, name, true) {
+            locations.push(ways.location);
+        }
+        if let Some(creation) = self.creation_ways(pc, name) {
+            locations.push(creation.location);
+        }
+        locations
     }
 
     /// Whether the operation at `pc` lowers without an effect whatever its operands' facts (the
@@ -1364,6 +1410,13 @@ struct Loop {
     /// that keeps heap facts (P3 stage 3 step 0c), whose checks its entry makes once
     /// (`Builder::loop_entry_checks`).
     typed: Vec<TypedUse>,
+    /// The loop's reads of global-object properties and script-level lexicals (their pcs), for a
+    /// loop that keeps heap facts: its entry loads each once and its header keeps the value
+    /// (F4 part 1, Ion's and the DFG's LICM of a global's load out of a loop that writes none).
+    globals: Vec<u32>,
+    /// The field locations the loop's lowered named stores may write (any object's), whose field
+    /// facts its header does not keep.
+    stored_fields: Vec<u16>,
     /// Whether an operation of the loop may be a canonical-frame effect ([`canonical`]), after
     /// which every slot is in the frame (P3 stage 3 step 3a: a generic node leaves the slots it
     /// does not write as they are, so step 0's rules, the load of an invariant slot and the notes
@@ -1377,6 +1430,10 @@ struct Loop {
 enum Source {
     Slot(usize),
     Name(crate::bytecode::StaticName, super::snapshot::Base),
+    /// A global-object property's read (its location in the global object) or a script-level
+    /// lexical's (its binding's address): the loop's entry loads it (F4 part 1).
+    Global(u16),
+    Lexical(usize),
 }
 
 /// A receiver an effect-free loop's element sites reach (P3 stage 3 step 0c): its source, the
@@ -1507,6 +1564,8 @@ impl Flow {
                 keeps_heap: false,
                 stored: Vec::new(),
                 typed: Vec::new(),
+                globals: Vec::new(),
+                stored_fields: Vec::new(),
                 canonical: false,
             };
             let mut modulo = false;
@@ -1571,6 +1630,16 @@ impl Flow {
                         {
                             if !found.stored.contains(&slot) {
                                 found.stored.push(slot);
+                            }
+                        }
+                        if rules.global_source(pc).is_some()
+                            && !found.globals.contains(&(pc as u32))
+                        {
+                            found.globals.push(pc as u32);
+                        }
+                        for location in rules.stored_field(pc) {
+                            if !found.stored_fields.contains(&location) {
+                                found.stored_fields.push(location);
                             }
                         }
                         if let Some((source, kind, write)) = rules.typed_source(pc) {
@@ -3433,7 +3502,7 @@ impl<'a> Builder<'a> {
             self.loop_entry_checks(lp, pc, &mut preds, &mut slots);
         }
         let met = meet(&preds);
-        let (typed_data, names) = self.loop_heap_facts(lp, &met);
+        let (typed_data, names, fields) = self.loop_heap_facts(lp, &met);
         let st = State {
             slots,
             stack,
@@ -3448,6 +3517,7 @@ impl<'a> Builder<'a> {
             str_lengths: met.str_lengths,
             typed_data,
             names,
+            fields,
             ..State::default()
         };
         let poll = self.frame_state(pc, &st);
@@ -3477,14 +3547,36 @@ impl<'a> Builder<'a> {
         &self,
         lp: &Loop,
         met: &State,
-    ) -> (FastMap<(NodeIx, bool), NodeIx>, names::Facts) {
+    ) -> (
+        FastMap<(NodeIx, bool), NodeIx>,
+        names::Facts,
+        FastMap<(NodeIx, u16), NodeIx>,
+    ) {
         let kept = lp.keeps_heap.then_some(&lp.stored[..]);
         let typed_data = if kept.is_some() {
             met.typed_data.clone()
         } else {
             FastMap::default()
         };
-        (typed_data, met.names.at_header(self.moves_env, kept))
+        // The global object's properties its entry loaded (F4 part 1): nothing such a loop runs
+        // stores a global (a store to one is an effect, as every call is), but a lowered store to
+        // a field at the same location of whatever object.
+        let fields = match (lp.keeps_heap, self.hoisted.get(&Hoisted::GlobalObject)) {
+            (true, Some(&global)) => met
+                .fields
+                .iter()
+                .filter(|&(&(object, location), _)| {
+                    object == global && !lp.stored_fields.contains(&location)
+                })
+                .map(|(&key, &value)| (key, value))
+                .collect(),
+            _ => FastMap::default(),
+        };
+        (
+            typed_data,
+            met.names.at_header(self.moves_env, kept),
+            fields,
+        )
     }
 
     /// The checks of the typed arrays that `lp`, a loop keeping heap facts whose header starts at
@@ -3514,7 +3606,7 @@ impl<'a> Builder<'a> {
             return;
         };
         let pred = *pred;
-        if lp.typed.iter().all(|typed| typed.kind.is_none())
+        if (lp.typed.iter().all(|typed| typed.kind.is_none()) && lp.globals.is_empty())
             || self.graph.block(pred).succs.len() != 1
             || self.declined(
                 pc,
@@ -3529,6 +3621,15 @@ impl<'a> Builder<'a> {
         let mark = self.graph.block(pred).body.len();
         // Each receiver's nodes, with the sites they stand for (step L1c).
         let mut stands: Vec<(usize, &[u32])> = Vec::new();
+        // The loop's global reads, once, at the entry (F4 part 1): the read's own nodes, whose
+        // value the header keeps (`loop_heap_facts`) and the loop's reads then take.
+        if !self.moves_env && !lp.globals.is_empty() {
+            stands.push((self.graph.block(pred).body.len(), &lp.globals));
+            for &at in &lp.globals {
+                let mut cx = Before::with(pc, state);
+                self.entry_global(st, &mut cx, at as usize);
+            }
+        }
         for typed in &lp.typed {
             let Some(kind) = typed.kind else {
                 continue;
@@ -3557,6 +3658,18 @@ impl<'a> Builder<'a> {
                         None => continue,
                     }
                 }
+                // Loaded above, or not at all (a chunk that moves its environment).
+                Source::Global(location) => {
+                    let global = self.hoisted.get(&Hoisted::GlobalObject).copied();
+                    match global.and_then(|global| st.fields.get(&(global, location))) {
+                        Some(&word) => word,
+                        None => continue,
+                    }
+                }
+                Source::Lexical(binding) => match st.names.lexical(binding as u64) {
+                    Some(word) => word,
+                    None => continue,
+                },
             };
             if self.rep(word) != Rep::Tagged || self.constant(word).is_some() {
                 continue;

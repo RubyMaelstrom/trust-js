@@ -652,7 +652,8 @@ fn speculative(node: &Node) -> bool {
 
 /// A loop's entry speculation `node`, at `position` among its block's phis and body: its check
 /// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32, any of CheckNumber, CheckInt32,
-/// CheckObject, CheckElements and TypedData for HoistingFailed) at the end of a loop header's entry
+/// CheckObject, CheckElements and TypedData for HoistingFailed, and a loop's global read's
+/// CheckEnvIs, CheckCellIs, CheckGlobalEpoch and CheckEnvGeneration) at the end of a loop header's entry
 /// predecessor, after which nothing but other speculations exits or has an effect before the jump
 /// to the header, with a state at the header's pc and the header's handlers; or a HoistingFailed
 /// check before the head of a loop of its frame's bytecode (`cfg`, the frame's) that got no back
@@ -668,6 +669,7 @@ fn speculation(
     let check = match node.reason {
         Some(ExitReason::PhiNotNumber) => node.op == NodeOp::CheckNumber,
         Some(ExitReason::PhiNotInt32) => node.op == NodeOp::CheckInt32,
+        // A loop's global, read at its entry (F4 part 1): the read's own checks.
         _ => matches!(
             node.op,
             NodeOp::CheckNumber
@@ -675,6 +677,10 @@ fn speculation(
                 | NodeOp::CheckObject
                 | NodeOp::CheckElements(_)
                 | NodeOp::TypedData { .. }
+                | NodeOp::CheckEnvIs { .. }
+                | NodeOp::CheckCellIs { .. }
+                | NodeOp::CheckGlobalEpoch { .. }
+                | NodeOp::CheckEnvGeneration { .. }
         ),
     };
     if !check {

@@ -129,6 +129,11 @@ impl Facts {
             .copied()
     }
 
+    /// The value a global lexical's binding holds in this epoch, where a read loaded it.
+    pub(super) fn lexical(&self, binding: u64) -> Option<NodeIx> {
+        self.lexicals.get(&binding).copied()
+    }
+
     /// The facts every predecessor holds.
     pub(super) fn meet(preds: &[(BlockIx, State)]) -> Facts {
         let (first, rest) = (&preds[0].1.names, &preds[1..]);
@@ -681,6 +686,21 @@ impl Builder<'_> {
         }
         let state = self.before(cx, st);
         self.add_exit(op, &[value], Rep::None, cx.pc, state, ExitReason::WrongName);
+    }
+
+    /// The read at `pc` of a loop's global (a global-object property's or a script-level
+    /// lexical's), made at the loop's entry edge (F4 part 1, `Builder::loop_entry_checks`): the
+    /// read's own nodes, whose value its facts then hold for the loop's reads.
+    pub(super) fn entry_global(&mut self, st: &mut State, cx: &mut Before, pc: usize) {
+        match self.snapshot.name(pc) {
+            view @ NameView::Global { .. } => {
+                self.global_read(st, cx, view);
+            }
+            view @ NameView::GlobalLexical { .. } => {
+                self.global_lexical_read(st, cx, view);
+            }
+            _ => {}
+        }
     }
 
     /// A global-object property's read (see the module's doc), the site's view `view`.
