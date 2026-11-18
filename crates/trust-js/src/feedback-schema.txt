@@ -444,16 +444,21 @@ ConstructWords), not its forward entry.
 Where it lives: in line, in every construct site's entry (ConstructSite::forward, after the
 entry's CallIc, prototype shape and slot and forwarder flag): the forward form reaches the
 initializer's CallIc at a fixed offset from the site (bytecode.rs FORWARD_INIT_OFF). A `new`
-site is 288 bytes with it and its pin cell 24 (128 and 16 before part A2), at every site of
-every constructor, whether or not a forwarder is ever constructed there.
+site is 288 bytes with it and its pin cell 32 (128 and 16 before part A2, 24 before apply's
+pin), at every site of every constructor, whether or not a forwarder is ever constructed there.
 How it is rooted: it holds addresses and shape numbers and no strong reference, so it keeps
-nothing alive and no collector scan reads it. While the entry names the initializer, the second
-weak pin of the site's pin cell (Chunk::construct_pins; the first is the entry's constructor's)
-keeps the initializer's address from being reused: the collector's weak-cell sweep
-(gc_handle.rs clear_dead_weak_cells_in) reads every weak handle's cell from the thread's list,
-clears it when its target dies and keeps the dead target's cell reserved while a handle remains.
-A fill of the site's entry drops that pin with the entry it empties. A construction proves the
-initializer alive by reading it from P's slot and comparing identities, as a call cache proves
-its callee; `apply` is compared by identity with the live slot's value and has no pin of its
-own. The instance the forward form makes is rooted by the initializer's activation record (its
+nothing alive and no collector scan reads it. While the entry names the initializer and
+`apply`, the second and third weak pins of the site's pin cell (Chunk::construct_pins; the
+first is the entry's constructor's) keep their addresses from being reused: the collector's
+weak-cell sweep (gc_handle.rs clear_dead_weak_cells_in) reads every weak handle's cell from the
+thread's list, clears it when its target dies and keeps the dead target's cell reserved while a
+handle remains. `apply` needs its pin as the initializer does: nothing but Function.prototype's
+`apply` property holds %Function.prototype.apply% (no Realm intrinsic does, and the native
+Realm table's entry of it, Interp::native_function_realms, is weak and is evicted when it dies),
+so a program that replaces it lets it die, and a later object at its address would pass the
+comparison. The pins live in the pin cell, which no generated code reads, so the site's entry
+keeps the layout the forward form reads (the cell is 32 bytes a site with the third pin, 24
+before). A fill of the site's entry drops both pins with the entry it empties. A construction
+proves the initializer and `apply` by reading each from its slot and comparing identities, as a
+call cache proves its callee. The instance the forward form makes is rooted by the initializer's activation record (its
 `this` word) and the sequence's save area on the native stack, from the helper's return on.

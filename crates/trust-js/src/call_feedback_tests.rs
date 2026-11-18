@@ -514,3 +514,197 @@ fn a_call_site_records_its_first_code_keyed_hit() {
     }
     panic!("the call-cache epoch moved in each of three runs");
 }
+
+/// The `new` sites of the chunks the global function `name` runs (its second-stage chunk
+/// included) whose entry names `constructor`, with the chunk: (chunk, site index).
+#[cfg(target_arch = "aarch64")]
+fn sites_naming(
+    engine: &mut Engine,
+    name: &str,
+    constructor: usize,
+) -> Vec<(std::rc::Rc<Chunk>, usize)> {
+    let env = engine.interp.global_env;
+    let value: Value = engine.interp.get_var(name, &env).ok().expect("bound name");
+    let ValueView::Obj(function) = value.view() else {
+        panic!("{name} is not an object")
+    };
+    let call = &function.borrow().kind;
+    let ObjectKind::User(user) = call else {
+        panic!("{name} is not a user function")
+    };
+    let runtime = user.func.runtime();
+    let mut found = Vec::new();
+    for chunk in [runtime.code.get(), runtime.code2.get()]
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        for (site, cell) in chunk.construct_caches.iter().enumerate() {
+            if cell.get().call.callee == constructor {
+                found.push((std::rc::Rc::clone(chunk), site));
+            }
+        }
+    }
+    found
+}
+
+/// Part A2's forward entry (P3 stage 3 steps 6-7) proves `apply` by comparing the live slot's
+/// value with the address it recorded, and nothing but Function.prototype's `apply` property
+/// holds %Function.prototype.apply% (no Realm intrinsic does): a program that replaces it lets
+/// it die. The site's third pin (`Chunk::construct_pins`) keeps its address reserved while the
+/// entry names it, so that no later object there can pass the comparison, and a fill of the
+/// site with another constructor releases it. Constructed one at a time until the forward fill,
+/// the site holds its initializer, apply and both their pins before the forward form first
+/// reads the entry.
+#[test]
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn a_forward_entry_keeps_a_replaced_apply_address_reserved_while_it_names_it() {
+    use crate::gc_core::CollectionKind;
+    use crate::gc_test::HiddenAddress;
+    /// Whether the cell at `address` is still allocated (live, or dead and weakly pinned).
+    #[inline(never)]
+    fn reserved(engine: &Engine, address: HiddenAddress) -> bool {
+        engine
+            .interp
+            .gc_heap
+            .core
+            .borrow()
+            .is_allocated_word(address.get() as u64)
+    }
+    let global = |engine: &mut Engine, name: &str| -> usize {
+        let env = engine.interp.global_env;
+        let value: Value = engine.interp.get_var(name, &env).ok().expect("bound name");
+        let ValueView::Obj(object) = value.view() else {
+            panic!("{name} is not an object")
+        };
+        crate::value::Gc::as_ptr(&object) as usize
+    };
+    let forwards = || crate::jit::TEST_DIRECT_FORWARDS.with(std::cell::Cell::get);
+    'attempt: for attempt in 0..8 {
+        let last = attempt == 7;
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var Class = { create: function() { return function() { this.initialize.apply(this, arguments); } } };
+                 var init = function(x) { this.x = x; };
+                 var A = Class.create(); A.prototype = { initialize: init };
+                 function Q(x) { this.x = x; }
+                 function make(C, i) { return new C(i); }
+                 function run(C, n) { var s = 0; for (var i = 0; i < n; i++) s += make(C, i).x; return s; }
+                 var probedApply = Function.prototype.apply;
+                 run(Q, 2000)"
+            ),
+            "1999000"
+        );
+        let (a, init, apply_ptr) = (
+            global(&mut engine, "A"),
+            global(&mut engine, "init"),
+            global(&mut engine, "probedApply"),
+        );
+        // A, one construction at a time until the forward fill: the entry and its pin cell
+        // hold the initializer, apply and their pins before the forward form first reads them.
+        let mut constructions = 0;
+        let (chunk, site) = loop {
+            let before = forwards();
+            assert_eq!(eval(&mut engine, "run(A, 1)"), "0");
+            constructions += 1;
+            let filled = sites_naming(&mut engine, "make", a)
+                .into_iter()
+                .find(|(chunk, site)| {
+                    chunk.construct_caches[*site].get().call.direct & CALL_IC_FORWARD != 0
+                });
+            if let Some(filled) = filled {
+                assert_eq!(
+                    forwards(),
+                    before,
+                    "the fill's construction is the forwarder's"
+                );
+                break filled;
+            }
+            assert!(constructions < 1000, "A's site took no forward entry");
+        };
+        let entry = chunk.construct_caches[site].get();
+        let pins = |chunk: &Chunk| -> [usize; 3] {
+            let pins = chunk.construct_pins[site].borrow();
+            [0, 1, 2].map(|k| pins[k].as_ptr() as usize)
+        };
+        assert_eq!(
+            (entry.forward.init.callee, entry.forward.apply),
+            (init, apply_ptr)
+        );
+        assert_eq!(pins(&chunk), [a, init, apply_ptr]);
+        // The forward form runs from the site.
+        let before = forwards();
+        assert_eq!(eval(&mut engine, "run(A, 2000)"), "1999000");
+        if sites_naming(&mut engine, "make", a)
+            .iter()
+            .all(|(other, other_site)| !std::rc::Rc::ptr_eq(other, &chunk) || *other_site != site)
+        {
+            assert!(!last, "make changed chunks in every run");
+            continue 'attempt;
+        }
+        assert!(forwards() - before > 1000, "{}", forwards() - before);
+
+        // The program replaces apply and drops its own reference: apply dies, and the site's
+        // pin alone keeps its address (the native Realm table's weak entry goes at the first
+        // collection that finds it dead).
+        let (apply, weak) = crate::gc_test::in_frame(|| {
+            let env = engine.interp.global_env;
+            let value: Value = engine
+                .interp
+                .get_var("probedApply", &env)
+                .ok()
+                .expect("bound name");
+            let object = value.as_obj().expect("an object");
+            (
+                HiddenAddress::of(&value),
+                crate::value::Gc::downgrade(&object),
+            )
+        });
+        eval(
+            &mut engine,
+            "Function.prototype.apply = null; probedApply = null;",
+        );
+        for _ in 0..3 {
+            engine
+                .interp
+                .gc_collect_precise_for_test(CollectionKind::Major);
+        }
+        assert!(
+            !crate::gc_test::alive(&weak),
+            "nothing but its property held %Function.prototype.apply%"
+        );
+        drop(weak);
+        engine
+            .interp
+            .gc_collect_precise_for_test(CollectionKind::Major);
+        assert!(
+            reserved(&engine, apply),
+            "the site's pin keeps the dead apply's address reserved"
+        );
+
+        // An ordinary constructor fills the site: its pins of the initializer and apply go, seen
+        // by the pin's handle count (from then on any collection may free the address and any
+        // allocation reuse it).
+        let pin = chunk.construct_pins[site].borrow()[2].clone();
+        let handles = pin.weak_count();
+        assert_eq!(eval(&mut engine, "run(Q, 200)"), "19900");
+        if chunk.construct_caches[site].get().call.callee != global(&mut engine, "Q") {
+            assert!(!last, "make changed chunks in every run");
+            continue 'attempt;
+        }
+        assert_eq!(pins(&chunk)[1..], [0, 0]);
+        assert_eq!(
+            pin.weak_count(),
+            handles - 1,
+            "the fill dropped the site's pin of apply"
+        );
+        return;
+    }
+}

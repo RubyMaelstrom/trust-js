@@ -3761,8 +3761,14 @@ pub struct Chunk {
     /// their ways: a site that constructs a fresh class or closure on each pass would pin every
     /// one of them for the chunk's life, as dead cells the heap must keep reserved. The second
     /// pin is the entry's forwarder's initializer's (`ConstructSite::forward`, P3 stage 3 steps
-    /// 6-7, part A2), kept with the entry that names it as the first is.
-    construct_pins: Box<[std::cell::RefCell<[crate::value::WeakGc; 2]>]>,
+    /// 6-7, part A2), kept with the entry that names it as the first is; the third is the
+    /// forward entry's %Function.prototype.apply% (`ForwardEntry::apply`), which the forward form
+    /// compares by address and which nothing else roots: Function.prototype's `apply` property
+    /// alone holds it (no Realm intrinsic does, and `Interp::native_function_realms` holds it
+    /// weakly and evicts it when it dies), so a program that replaces it lets it die, and
+    /// without the pin a later object at its address would pass the comparison. The pins live
+    /// here, where no generated code reads, so the site's entry keeps its layout.
+    construct_pins: Box<[std::cell::RefCell<[crate::value::WeakGc; 3]>]>,
     /// One [`PrivateSite`] per private-name operation (`Op::GetPrivate` and its siblings).
     pub(crate) private_sites: Box<[PrivateSite]>,
     /// Weak handles pinning every callee address a call cache has ever recorded (see [`CallIc`]),
@@ -4529,7 +4535,7 @@ impl Chunk {
             .saturating_add(vec_bytes!(construct_caches, std::cell::Cell<ConstructSite>))
             .saturating_add(
                 self.construct_pins.len()
-                    * std::mem::size_of::<std::cell::RefCell<[crate::value::WeakGc; 2]>>(),
+                    * std::mem::size_of::<std::cell::RefCell<[crate::value::WeakGc; 3]>>(),
             )
             .saturating_add(self.private_sites.len() * std::mem::size_of::<PrivateSite>())
             .saturating_add(vec_bytes!(inline_targets, InlineTarget));
@@ -5115,12 +5121,16 @@ impl Chunk {
         // no forwarder's initializer (its forward entry is empty), so that one's may too.
         debug_assert_eq!(entry.call.direct & CALL_IC_FORWARD, 0);
         self.construct_caches[cache as usize].set(entry);
-        *self.construct_pins[cache as usize].borrow_mut() =
-            [pin.clone(), crate::value::WeakGc::new()];
+        *self.construct_pins[cache as usize].borrow_mut() = [
+            pin.clone(),
+            crate::value::WeakGc::new(),
+            crate::value::WeakGc::new(),
+        ];
     }
     /// Record `forward`, a recognized forwarder's initializer entry and proofs, at construct site
     /// `cache` while its entry names `constructor` (P3 stage 3 steps 6-7, part A2), with `pin`,
-    /// the initializer's weak pin (`forward.init.callee`), and set the entry's
+    /// the initializer's weak pin (`forward.init.callee`), and `apply_pin`, that of
+    /// %Function.prototype.apply% (`forward.apply`), and set the entry's
     /// [`CALL_IC_FORWARD`]. Nothing where the entry names another constructor now.
     // Called where the forward form is built only.
     #[cfg_attr(
@@ -5136,6 +5146,7 @@ impl Chunk {
         constructor: usize,
         forward: ForwardEntry,
         pin: &crate::value::WeakGc,
+        apply_pin: &crate::value::WeakGc,
     ) {
         let Some(site) = self.construct_caches.get(cache as usize) else {
             return;
@@ -5148,10 +5159,13 @@ impl Chunk {
             return;
         }
         debug_assert_eq!(pin.as_ptr() as usize, forward.init.callee);
+        debug_assert_eq!(apply_pin.as_ptr() as usize, forward.apply);
         entry.forward = forward;
         entry.call.direct |= CALL_IC_FORWARD;
         site.set(entry);
-        self.construct_pins[cache as usize].borrow_mut()[1] = pin.clone();
+        let mut pins = self.construct_pins[cache as usize].borrow_mut();
+        pins[1] = pin.clone();
+        pins[2] = apply_pin.clone();
     }
     /// Whether calls need a real activation environment (captured locals / lexical `this`).
     fn makes_env(&self) -> bool {
@@ -10555,7 +10569,11 @@ fn finish_chunk(
         inline_sites,
         construct_pins: (0..c.construct_caches.len())
             .map(|_| {
-                std::cell::RefCell::new([crate::value::WeakGc::new(), crate::value::WeakGc::new()])
+                std::cell::RefCell::new([
+                    crate::value::WeakGc::new(),
+                    crate::value::WeakGc::new(),
+                    crate::value::WeakGc::new(),
+                ])
             })
             .collect(),
         construct_caches: c.construct_caches,

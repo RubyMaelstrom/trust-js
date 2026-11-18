@@ -17732,7 +17732,13 @@ impl Interp {
             refused_epoch: u32::MAX,
             refused: 0,
         };
-        site_chunk.fill_construct_forward(cache, constructor, forward, &Gc::downgrade(initializer));
+        site_chunk.fill_construct_forward(
+            cache,
+            constructor,
+            forward,
+            &Gc::downgrade(initializer),
+            &Gc::downgrade(apply),
+        );
         true
     }
 
