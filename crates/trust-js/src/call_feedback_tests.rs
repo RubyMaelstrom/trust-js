@@ -610,6 +610,19 @@ fn a_forward_entry_keeps_a_replaced_apply_address_reserved_while_it_names_it() {
             global(&mut engine, "init"),
             global(&mut engine, "probedApply"),
         );
+        // The forward entry is part A2's, off under TRUST_JS_JIT_NO_FORWARDER: A's constructions
+        // still give their results, and no site of `make` takes a forward entry.
+        if crate::bytecode::forwarder_disabled() {
+            for _ in 0..100 {
+                assert_eq!(eval(&mut engine, "run(A, 1)"), "0");
+            }
+            assert!(sites_naming(&mut engine, "make", a)
+                .iter()
+                .all(|(chunk, site)| {
+                    chunk.construct_caches[*site].get().call.direct & CALL_IC_FORWARD == 0
+                }));
+            return;
+        }
         // A, one construction at a time until the forward fill: the entry and its pin cell
         // hold the initializer, apply and their pins before the forward form first reads them.
         let mut constructions = 0;

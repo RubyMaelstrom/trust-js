@@ -345,10 +345,14 @@ fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
             .execution_code()
             .and_then(Option::as_ref)
             .expect("compiled initializer");
-        assert!(crate::value::PropertyLayout::ptr_eq(
-            chunk.instance_layout().expect("learned chunk layout"),
-            a.borrow().props.shared_layout().unwrap()
-        ));
+        // The path: the layout the forwarder's initializer plan learned (part A2's, off under
+        // TRUST_JS_JIT_NO_FORWARDER).
+        if !crate::bytecode::forwarder_disabled() {
+            assert!(crate::value::PropertyLayout::ptr_eq(
+                chunk.instance_layout().expect("learned chunk layout"),
+                a.borrow().props.shared_layout().unwrap()
+            ));
+        }
     }
     engine.interp.construct_capacity_hints = Default::default();
     assert_eq!(
@@ -364,7 +368,7 @@ fn shared_forwarder_chunks_use_the_selected_initializer_layout() {
         c.borrow().props.shared_layout().unwrap()
     ));
     assert!(
-        engine.interp.construct_capacity_hints.is_empty(),
+        crate::bytecode::forwarder_disabled() || engine.interp.construct_capacity_hints.is_empty(),
         "guarded plans must not re-enter the identity hint table per instance"
     );
     assert_eq!(eval(&mut engine, "Wrapper.prototype.initialize=function(x,y){this.different=x+y};b=make();[Object.keys(b),b.different,'x' in b].join('|')"), "different|7|false");

@@ -49,8 +49,11 @@ fn setup(tier: Tier) -> Engine {
     engine
 }
 
+/// The committed packed transfer ran (the path; a forwarded one is part A2's forwarder, which
+/// TRUST_JS_JIT_NO_FORWARDER turns off, so it is asserted only while the forwarder is on).
 fn assert_native_hit(tier: Tier, forwarded: bool, before: usize) {
     if tier == Tier::Jit
+        && !(forwarded && crate::bytecode::forwarder_disabled())
         && cfg!(all(
             any(target_arch = "aarch64", target_arch = "x86_64"),
             any(
@@ -276,11 +279,14 @@ fn simple_and_forwarded_initializers_copy_an_immutable_argument_window() {
             } else {
                 SIMPLE.with(Cell::get)
             };
-            assert_eq!(
-                after,
-                before + 1,
-                "the exact {name} initializer plan must commit"
-            );
+            // The path: the forwarded plan is part A2's, off under TRUST_JS_JIT_NO_FORWARDER.
+            if !(forwarded && crate::bytecode::forwarder_disabled()) {
+                assert_eq!(
+                    after,
+                    before + 1,
+                    "the exact {name} initializer plan must commit"
+                );
+            }
             assert!(
                 arguments
                     .iter()
@@ -373,6 +379,10 @@ fn forwards() -> usize {
     }
 }
 
+/// Whether the template JIT emits and runs part A2's forward form: ARM64's construct sequence,
+/// unless TRUST_JS_JIT_NO_FORWARDER turns the recognizer off (then every forwarding construction
+/// takes the general path, which these tests' path assertions see as the Rust path's "no forward
+/// form"; their results stay asserted).
 fn forward_form_emitted() -> bool {
     cfg!(all(
         target_arch = "aarch64",
@@ -381,7 +391,7 @@ fn forward_form_emitted() -> bool {
             target_os = "linux",
             target_os = "windows"
         )
-    ))
+    )) && !crate::bytecode::forwarder_disabled()
 }
 
 /// A forwarding constructor's observables (A0's), from a cold site (the construct stub's forward

@@ -865,8 +865,17 @@ fn a_learned_layout_has_one_setter_for_each_kind_of_chunk() {
     assert!(branchy.jit_simple_constructor().is_none() && branchy.jit_initializer_plan().is_none());
     assert!(branchy.instance_layout_settled());
     assert_eq!(branchy.learned_layout().map(|layout| layout.len()), Some(2));
+    // The path: part A2's recognizer, which TRUST_JS_JIT_NO_FORWARDER turns off (the forwarders
+    // are then ordinary constructors, whose own cells may learn a layout).
     for forwarder in ["F", "G"] {
         let chunk = chunk(&mut engine, forwarder);
+        if crate::bytecode::forwarder_disabled() {
+            assert!(
+                chunk.jit_arguments_apply_forwarder().is_none(),
+                "{forwarder}"
+            );
+            continue;
+        }
         assert!(
             chunk.jit_arguments_apply_forwarder().is_some(),
             "{forwarder}"
