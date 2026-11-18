@@ -320,8 +320,9 @@ pub(crate) struct JitFrameRoots {
     pub(crate) ctx: *const crate::jit::JitCtx,
     /// Word ranges `(start, words)`: the entry's slots (none for a borrowed VM frame, whose
     /// slots `drive_vm` registers) and its operand buffer. Every word in them has been written
-    /// before the run starts (each entry says how); stale words above the live operand top can
-    /// only retain.
+    /// before the run starts (each entry says how). The operand buffer is scanned up to the
+    /// activation's live top where the collector knows it (`jit::entry_live_top`): above it,
+    /// stale words (a pooled buffer's earlier user's among them) could only retain.
     pub(crate) words: [(*const u64, usize); 2],
 }
 
@@ -457,13 +458,42 @@ pub(crate) fn trace_thread_roots(sink: &mut dyn GcSink) {
         }
     });
     JIT_FRAMES.with(|frames| {
-        for frame in frames.borrow().iter() {
+        let frames = frames.borrow();
+        // SAFETY: as below.
+        let calls = unsafe { entry_call_tops(&frames) };
+        for (frame, call) in frames.iter().zip(calls) {
             // SAFETY: registered only while the entry's native run holds the context and its
             // written word ranges in place.
             unsafe {
-                (*frame.ctx).trace_gc(sink);
+                let ctx = &*frame.ctx;
+                ctx.trace_gc(sink);
                 for &(start, len) in &frame.words {
-                    scan_words(start, len, sink);
+                    if start != ctx.stack_base.cast_const().cast() {
+                        scan_words(start, len, sink);
+                        continue;
+                    }
+                    // The operand words up to the activation's live top where the collector
+                    // knows it, as an active record's (`jit::entry_live_top`).
+                    let top = crate::jit::entry_live_top(ctx, len, call);
+                    let extent = top.map_or(len, |top| top.min(len));
+                    scan_words(start, extent, sink);
+                    // An inlined frame's generic node's slot window above that top (P3 stage 3
+                    // step 3c): a helper may write it with a fresh value its slot result reads
+                    // after the node's end poll, as FramePool's trace scans a record's.
+                    if let Some((at, words)) = crate::jit::entry_slot_window(ctx, len) {
+                        let scanned = at + words <= extent || {
+                            scan_words(start.add(at), words.min(len.saturating_sub(at)), sink);
+                            true
+                        };
+                        #[cfg(test)]
+                        crate::interpreter::note_window_trace(
+                            top.map(|_| !ctx.poll_top.is_null()),
+                            scanned,
+                            true,
+                        );
+                        #[cfg(not(test))]
+                        let _ = scanned;
+                    }
                 }
             }
         }
@@ -481,6 +511,62 @@ pub(crate) fn trace_running_coroutines(sink: &mut dyn GcSink) {
             unsafe { GcTrace::trace_gc(&*coroutine, sink) };
         }
     });
+}
+
+/// The top a direct JIT→JIT call left in each of `frames`' operand words (`jit::entry_live_top`):
+/// every active record of the entries' interpreters whose `final_sp` lies in an entry's operand
+/// buffer, placed among the buffers by address, as `jit::live_tops` places them among records:
+/// the entries sorted once a trace (not at all where no record is active), a binary search a
+/// record.
+///
+/// # Safety
+/// Every registered entry's context and interpreter are live (the trace's contract).
+unsafe fn entry_call_tops(frames: &[JitFrameRoots]) -> Vec<Option<usize>> {
+    const WORD: usize = std::mem::size_of::<crate::value::Value>();
+    let mut tops = vec![None; frames.len()];
+    let mut buffers: Vec<(usize, usize, usize)> = Vec::with_capacity(frames.len());
+    let mut interps: Vec<*mut crate::interpreter::Interp> = Vec::new();
+    for (k, frame) in frames.iter().enumerate() {
+        // SAFETY: the caller's contract.
+        let ctx = unsafe { &*frame.ctx };
+        let base = ctx.stack_base as usize;
+        if let Some(&(_, len)) = frame
+            .words
+            .iter()
+            .find(|&&(start, _)| start as usize == base)
+        {
+            buffers.push((base, len, k));
+        }
+        if !ctx.interp.is_null() && !interps.contains(&ctx.interp) {
+            interps.push(ctx.interp);
+        }
+    }
+    if buffers.is_empty() {
+        return tops;
+    }
+    let mut waiting: Vec<usize> = Vec::new();
+    for interp in interps {
+        // SAFETY: the caller's contract; an active record is allocated.
+        for record in unsafe { (*interp).frame_pool.active_records() } {
+            waiting.push(unsafe { (*record.as_ptr()).ctx.final_sp } as usize);
+        }
+    }
+    // No active record (entries alone: natives' callbacks, x86-64's calls): no sort.
+    if waiting.is_empty() {
+        return tops;
+    }
+    buffers.sort_unstable();
+    for sp in waiting {
+        let at = buffers.partition_point(|&(start, _, _)| start <= sp);
+        let Some(&(start, len, k)) = at.checked_sub(1).map(|at| &buffers[at]) else {
+            continue;
+        };
+        if sp - start <= len * WORD {
+            let top = (sp - start) / WORD;
+            tops[k] = Some(tops[k].map_or(top, |known: usize| known.max(top)));
+        }
+    }
+    tops
 }
 
 impl GcTrace for crate::execution_storage::ValueStack {

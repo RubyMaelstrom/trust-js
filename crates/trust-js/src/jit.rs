@@ -25616,6 +25616,22 @@ pub(crate) unsafe fn run_borrowed_frame(
         resume_step: None,
     };
     stack.set_len(0);
+    // At the frame's first transfer, past the entry depth the buffer holds no live word: an
+    // earlier user's words are there (`Interp::vm_pool` clears a buffer by its length only), which
+    // would be roots wherever the collector does not know the run's top (a wait on a call into
+    // Rust, every call on x86-64). Zero them, as JSC sanitizes the stack below its pointer (P3
+    // stage 3 step 3g). At a later transfer the words past the depth are this frame's own popped
+    // words (its run's before the last exit, the VM's operations' since), no live word either:
+    // each exit sets the VM frame's length to the run's top (below), and between two transfers
+    // the VM frame's operands are traced to that length (`ValueStack`'s trace); zeroing them at
+    // every transfer as well changes no result of x86-64's library suite.
+    if first_transfer {
+        std::ptr::write_bytes(
+            stack_base.add(initial_depth),
+            0,
+            stack.capacity() - initial_depth,
+        );
+    }
     // The lent operand words leave the VM frame's traced length for the native run,
     // so they are this context's roots until it ends: the buffer's whole capacity, which covers
     // the entry depth and `max_stack` and is initialized (see `ValueStack`). The VM frame's
@@ -26016,6 +26032,44 @@ pub(crate) fn live_tops(records: &[std::ptr::NonNull<JitFrame>]) -> Vec<Option<u
         }
     }
     tops
+}
+
+/// The live top of a Rust entry's running activation (`gc_trace::JitFrameRoots`) in its `words`
+/// operand words from `ctx.stack_base`, where the collector knows it, as [`live_tops`] knows an
+/// active record's: the operand top a direct JIT→JIT call left in its callee's `final_sp`
+/// (`call`: `gc_trace::entry_call_tops` places the active records' `final_sp`s among the entries'
+/// buffers), or the top its poll passed (`JitCtx::poll_top`). Above it lie words the activation
+/// popped; a borrowed frame's buffer, which comes from the VM's pool (`Interp::vm_pool`), cleared
+/// by its length only, is zeroed past its entry depth where the run starts
+/// (`run_borrowed_frame`). They belong to no live value of the activation and are not scanned,
+/// as SpiderMonkey reads a frame up to its stack pointer (js/src/vm/Stack.cpp:317-378); an
+/// inlined frame's slot window above the top is scanned apart ([`entry_slot_window`]), as a
+/// record's is. Elsewhere (`None`) the activation waits on a call into Rust whose top is in a
+/// register (on x86-64 every call), and the whole range is scanned.
+pub(crate) fn entry_live_top(ctx: &JitCtx, words: usize, call: Option<usize>) -> Option<usize> {
+    const WORD: usize = std::mem::size_of::<Value>();
+    let start = ctx.stack_base as usize;
+    let poll = ctx.poll_top as usize;
+    let poll = (!ctx.poll_top.is_null() && poll >= start && poll - start <= words * WORD)
+        .then(|| (poll - start) / WORD);
+    poll.max(call)
+}
+
+/// The slot window an inlined frame's generic node runs on (P3 stage 3 step 3c) while its
+/// activation runs on a Rust entry, as (its first word's index among the entry's `words` operand
+/// words, its words): where the context's slots lie in those operand words. None otherwise (a
+/// fresh entry's own slots, a borrowed frame's VM slots).
+pub(crate) fn entry_slot_window(ctx: &JitCtx, words: usize) -> Option<(usize, usize)> {
+    const WORD: usize = std::mem::size_of::<Value>();
+    let start = ctx.stack_base as usize;
+    let slots = ctx.slots as usize;
+    let window = (slots >= start && slots < start + words * WORD)
+        .then(|| ((slots - start) / WORD, ctx.n_slots));
+    debug_assert!(
+        window.is_none_or(|(at, n_slots)| at + n_slots <= words),
+        "a slot window inside its entry's operand words"
+    );
+    window
 }
 
 /// Fill the words `from..` of every pooled record of `i` with `word` (tests: what an earlier

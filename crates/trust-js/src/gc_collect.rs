@@ -105,7 +105,7 @@ fn gc_verify() -> bool {
 
 /// `TRUST_JS_GC_STRESS_MAJOR=M`: under GC stress, every Mth collection is major
 /// ([`GC_STRESS_MAJOR_EVERY`] by default; 1 makes every collection major).
-fn gc_stress_major() -> usize {
+pub(crate) fn gc_stress_major() -> usize {
     static MAJOR: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *MAJOR.get_or_init(|| {
         std::env::var("TRUST_JS_GC_STRESS_MAJOR")

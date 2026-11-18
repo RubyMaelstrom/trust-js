@@ -4844,3 +4844,39 @@ fn every_planned_way_gives_the_tier_offs_results() {
         assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
     }
 }
+
+/// The same on a Rust entry (P3 stage 3 step 3g; the coordinator's review of the entry scan):
+/// `run`, which `Reflect.apply` calls from Rust (`jit::run`: an entry of its own,
+/// `gc_trace::JitFrameRoots`, whose operand words the tier's code shares with its inlined
+/// frames), meets each collection at inc's node's end poll with the window in its entry's operand
+/// words above the poll's top, which the entry's trace scans apart (`jit::entry_slot_window`), as
+/// a record's does. A window it missed would leave the fresh BigInt there to the collection, and
+/// with a collection at every allocation the next BigInt takes its cell: every value is compared.
+/// (A callback of `map`, `replace` or `sort`, or `run.call`, runs on a record, not an entry.)
+#[test]
+fn a_slot_window_is_scanned_at_its_nodes_end_poll_on_a_rust_entry() {
+    let source = "function inc(x) { x++; return x; }
+         function run(n) { var out = [], b = 2n ** 80n;
+           for (var i = 0; i < n; i++) { b = inc(b); out.push(b); } return out; }
+         var r; for (var k = 0; k < 40; k++) r = Reflect.apply(run, null, [20]);
+         r.map(String).join(',') + ',' + r.length";
+    crate::interpreter::TEST_WINDOW_TRACES.with(|traces| traces.set(Default::default()));
+    inlined_generic();
+    let (expected, got) = both(source, 0, true);
+    assert_eq!(got, expected);
+    assert!(
+        inlined_generic()
+            .iter()
+            .any(|op| matches!(op, Op::UpdateLocal(..))),
+        "inc's update is an inlined frame's generic node"
+    );
+    let traces = crate::interpreter::TEST_WINDOW_TRACES.with(std::cell::Cell::get);
+    assert!(
+        traces.entries > 0 && traces.poll_tops > 0,
+        "a collection ran at the node's end poll while its window was live on the entry: {traces:?}"
+    );
+    assert_eq!(
+        traces.missed, 0,
+        "every window traced was scanned: {traces:?}"
+    );
+}

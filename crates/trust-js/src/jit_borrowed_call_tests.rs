@@ -325,3 +325,401 @@ new Ctor(3000).r"#,
         direct: &["add"],
     });
 }
+
+/// `o`, named by a word fifteen operands deep in a pooled VM buffer alone: `fill`'s loop runs in
+/// a fragment whose buffer holds `o` there and goes back to the pool (`Interp::vm_pool`, which
+/// clears a buffer by its length only) when the loop ends; `w` is a WeakRef to it, which keeps it
+/// no longer once this job ends.
+fn leave_a_stale_word(engine: &mut Engine) {
+    eval(
+        engine,
+        r#"
+var w, alive = 0;
+function sink() { return 0; }
+(function fill() {
+    var o = { only: 'a stale word names me' }; w = new WeakRef(o);
+    for (var i = 0; i < 200; i++) sink(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, o);
+    return 1;
+})()"#,
+    );
+}
+
+/// `holder.o`, which only `holder` names, and `w`, a WeakRef to it that keeps it no longer once this
+/// job ends; `sink` takes any arguments.
+fn hold_an_object(engine: &mut Engine) {
+    eval(
+        engine,
+        r#"
+var holder = { o: { only: 'my own popped word names me' } }, w = new WeakRef(holder.o), alive = 0;
+function sink() { return 0; }
+for (var i = 0; i < 64; i++) sink(i);
+1"#,
+    );
+}
+
+/// A borrowed frame's own popped words above the top a direct call leaves are no roots, which the
+/// clear at its run's entry cannot reach (`jit::entry_live_top` bounds them): at the 1,000th turn
+/// the loop pushes `holder.o` fifteen operands deep (the arguments of a direct call to `sink`, compiled) and pops it, and
+/// `holder` lets go; at the 1,023rd it waits on `probe`, whose callee collects and reports what
+/// marked `o` first: no root (`R`); the native stack's conservative scan (`S`) may keep it (ARM64:
+/// x86-64's calls run through Rust entries, whose top the collector does not know).
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn a_borrowed_frames_own_popped_words_are_no_roots_while_it_waits_on_a_call() {
+    let mut engine = super::rooting_tests::jit_engine(32);
+    super::TEST_OSR_ENTRIES.with(|n| n.set(0));
+    super::rooting_tests::run(
+        &mut engine,
+        "var holder = { o: track({ only: 'my own popped word names me' }) };
+         function sink() { return 0; }
+         for (var i = 0; i < 64; i++) sink(i);
+         1",
+    );
+    let source = r#"
+function inner() { return collect(); }
+function probe(k) { return k === 1023 ? inner() : ''; }
+(function own() {
+    var s = 0, m = '';
+    for (var k = 0; k < 3000; k++) {
+        if (k === 1000) { s += sink(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, holder.o); holder.o = null; }
+        m += probe(k);
+    }
+    return m;
+})()"#;
+    let marker = super::rooting_tests::run(&mut engine, source);
+    assert!(marker == "S" || marker == "D", "{marker}");
+    assert!(
+        super::TEST_OSR_ENTRIES.with(|n| n.get()) > 0,
+        "no borrowed native frame ran"
+    );
+    assert!(
+        direct_completions(&mut engine, "probe") > 0,
+        "probe never completed through the direct sequence"
+    );
+}
+
+/// A borrowed frame's operand buffer comes from the VM's pool, so the words past the frame's
+/// operands can name what an earlier activation of the buffer pushed. While the frame waits on a
+/// direct call, the collector scans its operand words up to the top that call left
+/// (`jit::entry_live_top`), not the whole buffer its entry registers: an object only such a word
+/// names is collected (P3 stage 3 step 3g: the Splay retention test's failure at
+/// TRUST_JS_OPT_INLINE=graph, `gc_collect::tests::a_splay_trees_live_data_stays_flat_in_every_tier`,
+/// where `measure`'s loop held removed nodes so).
+#[test]
+fn a_borrowed_frames_stale_operand_words_retain_nothing_while_it_waits_on_a_call() {
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier);
+        super::TEST_OSR_ENTRIES.with(|n| n.set(0));
+        leave_a_stale_word(&mut engine);
+        // `waits`'s loop takes that buffer and waits on `probe`, which collects.
+        eval(
+            &mut engine,
+            r#"
+function inner() { collect(); return w.deref() !== undefined; }
+function probe(k) { if ((k & 255) === 255 && inner()) alive++; return 1; }
+(function waits() { var s = 0; for (var k = 0; k < 3000; k++) s += probe(k); return s; })()"#,
+        );
+        assert_eq!(eval(&mut engine, "alive"), "0", "{tier:?}");
+        #[cfg(target_arch = "aarch64")]
+        if tier == Tier::Jit {
+            assert!(
+                super::TEST_OSR_ENTRIES.with(|n| n.get()) > 0,
+                "no borrowed native frame ran"
+            );
+            assert!(
+                direct_completions(&mut engine, "probe") > 0,
+                "probe never completed through the direct sequence"
+            );
+        }
+    }
+}
+
+/// The same while the borrowed frame waits on a native that collects, a call into Rust whose top
+/// the collector does not know: the frame's run cleared the buffer's words past its entry depth
+/// (`jit::run_borrowed_frame`), so no earlier user's word is left to root.
+#[test]
+fn a_borrowed_frames_stale_operand_words_retain_nothing_while_it_waits_on_a_native() {
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier);
+        super::TEST_OSR_ENTRIES.with(|n| n.set(0));
+        leave_a_stale_word(&mut engine);
+        eval(
+            &mut engine,
+            r#"
+(function waitsOnANative() {
+    var s = 0;
+    for (var k = 0; k < 3000; k++) { if ((k & 255) === 255) { collect(); if (w.deref() !== undefined) alive++; } s += k; }
+    return s;
+})()"#,
+        );
+        assert_eq!(eval(&mut engine, "alive"), "0", "{tier:?}");
+        #[cfg(target_arch = "aarch64")]
+        if tier == Tier::Jit {
+            assert!(
+                super::TEST_OSR_ENTRIES.with(|n| n.get()) > 0,
+                "no borrowed native frame ran"
+            );
+        }
+    }
+}
+
+/// A borrowed frame's own popped words above its poll's top (`JitCtx::poll_top`) are no roots,
+/// which the clear at its run's entry cannot reach (`jit::entry_live_top` bounds them): at the
+/// 1,000th turn the loop pushes `o` fifteen operands deep (the arguments of a direct call to `sink`, compiled) and pops it, and the
+/// global that named it
+/// lets go; from the 2,000th turn a collection is due after every allocation, at its polls.
+#[test]
+fn a_borrowed_frames_own_popped_words_retain_nothing_at_its_polls() {
+    let mut engine = engine(Tier::Jit);
+    let stress = engine.interp.make_native("stressOn", 0, |interp, _, _| {
+        interp.gc_heap.core.borrow_mut().set_stress_every(1);
+        Ok(crate::value::Value::Undefined)
+    });
+    let calm = engine.interp.make_native("stressOff", 0, |interp, _, _| {
+        let every = crate::interpreter::gc_collect::gc_stress();
+        interp.gc_heap.core.borrow_mut().set_stress_every(every);
+        Ok(crate::value::Value::Undefined)
+    });
+    for (name, f) in [("stressOn", stress), ("stressOff", calm)] {
+        engine.interp.global.borrow_mut().props.insert(
+            name,
+            crate::value::Property::data(crate::value::Value::Obj(f), true, true, true),
+        );
+    }
+    super::TEST_OSR_ENTRIES.with(|n| n.set(0));
+    hold_an_object(&mut engine);
+    super::take_poll_census();
+    eval(
+        &mut engine,
+        r#"
+(function polls() {
+    var o = null, s = 0;
+    for (var k = 0; k < 2200; k++) {
+        if (k === 1000) { s += sink(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, holder.o); holder.o = null; }
+        if (k === 2000) stressOn();
+        o = { k: k };
+    }
+    stressOff();
+    return o.k;
+})()"#,
+    );
+    let census = super::take_poll_census();
+    assert_eq!(eval(&mut engine, "w.deref() === undefined"), "true");
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            super::TEST_OSR_ENTRIES.with(|n| n.get()) > 0,
+            "no borrowed native frame ran"
+        );
+        assert!(
+            census.collections.iter().sum::<u64>() > 0,
+            "no collection at a poll: {census:?}"
+        );
+    }
+    let _ = census;
+}
+
+/// A borrowed frame's top operand word is a root while the frame waits on a direct call that
+/// collects: `inner` takes no parameter, so the object `track` follows stays on the frame's operand
+/// stack alone, as its top word, below the top the call left (`jit::entry_live_top`; the record's
+/// form is jit_rooting_tests' a_waiting_callers_top_operand_word_is_a_root).
+#[test]
+fn a_borrowed_frames_top_operand_word_is_a_root_while_it_waits_on_a_call() {
+    let mut engine = super::rooting_tests::jit_engine(32);
+    super::TEST_OSR_ENTRIES.with(|n| n.set(0));
+    let source = r#"
+function inner() { return collect(); }
+(function waits() {
+    var bad = '';
+    for (var k = 0; k < 600; k++) { var m = inner(track({ tag: 'T' + k })); if (m !== 'R') bad += k + ':' + m + ' '; }
+    return bad;
+})()"#;
+    assert_eq!(super::rooting_tests::run(&mut engine, source), "");
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            super::TEST_OSR_ENTRIES.with(|n| n.get()) > 0,
+            "no borrowed native frame ran"
+        );
+        assert!(
+            direct_completions(&mut engine, "inner") > 0,
+            "inner never completed through the direct sequence"
+        );
+    }
+}
+
+/// A borrowed frame's for-of keeps its iterator across the loop's polls, at which a collection is
+/// due after every allocation from the 2,000th turn on: the iterator, which nothing else names, is
+/// a root there, and the loop sees every value. `marks()` at the last turn's start reports the
+/// previous turn's last collection, which ran at the loop's poll. The iterator and its `next`
+/// live in the frame's hidden slots (`%iter%`; `emit_for_of_step`), which `drive_vm` registers,
+/// not in its operand words: the poll's top (`JitCtx::poll_top`) does not bound them.
+#[test]
+fn a_borrowed_frames_iterator_is_a_root_at_its_polls() {
+    let mut engine = super::rooting_tests::jit_engine(32);
+    // Every stress collection a major one: the iterator is old by then, which a minor one does
+    // not mark.
+    let stress = engine.interp.make_native("stressOn", 0, |interp, _, _| {
+        let mut core = interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(1);
+        core.set_stress_major_every(1);
+        Ok(crate::value::Value::Undefined)
+    });
+    let calm = engine.interp.make_native("stressOff", 0, |interp, _, _| {
+        let mut core = interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(crate::interpreter::gc_collect::gc_stress());
+        core.set_stress_major_every(crate::interpreter::gc_collect::gc_stress_major());
+        Ok(crate::value::Value::Undefined)
+    });
+    for (name, f) in [("stressOn", stress), ("stressOff", calm)] {
+        engine.interp.global.borrow_mut().props.insert(
+            name,
+            crate::value::Property::data(crate::value::Value::Obj(f), true, true, true),
+        );
+    }
+    super::TEST_OSR_ENTRIES.with(|n| n.set(0));
+    super::take_poll_census();
+    let source = r#"
+(function iterates() {
+    var iterable = { [Symbol.iterator]() {
+        return track({ i: 0, next() { return this.i < 2200 ? { value: this.i++, done: false } : { value: 0, done: true }; } });
+    } };
+    var sum = 0, o = null, last = '';
+    for (var v of iterable) { if (v === 2199) last = marks(); if (v === 2000) stressOn(); o = { v: v }; sum += v; }
+    stressOff();
+    return sum + ':' + last;
+})()"#;
+    assert_eq!(super::rooting_tests::run(&mut engine, source), "2418900:R");
+    let census = super::take_poll_census();
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            super::TEST_OSR_ENTRIES.with(|n| n.get()) > 0,
+            "no borrowed native frame ran"
+        );
+        assert!(
+            census.collections.iter().sum::<u64>() > 0,
+            "no collection at a poll: {census:?}"
+        );
+    }
+    let _ = census;
+}
+
+/// A Rust entry's slots are roots whatever its operand top: `holder`, run through a native
+/// callback on an entry of its own (`gc_trace::JitFrameRoots`: its slots and its operand words),
+/// waits on a direct call that collects, with the object `track` follows in its ninth slot alone,
+/// above the top of its operand words (`jit::entry_live_top` cuts those alone).
+#[test]
+fn a_rust_entrys_slots_are_roots_while_it_waits_on_a_call() {
+    let mut engine = super::rooting_tests::jit_engine(0);
+    let source = r#"
+function inner() { return collect(); }
+function holder(n) {
+    var a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, g = 7, h = 8;
+    var keep = track({ tag: 'K' + n });
+    var m = inner();
+    return m + (keep.tag === 'K' + n ? '' : '!') + (a + b + c + d + e + f + g + h === 36 ? '' : '?');
+}
+var out = '';
+for (var k = 0; k < 40; k++) out += [k].map(holder)[0];
+out"#;
+    assert_eq!(
+        super::rooting_tests::run(&mut engine, source),
+        "R".repeat(40)
+    );
+}
+
+/// The engine of the end-poll cases below. `armOwn()` arms the call templates' end-poll request
+/// for its own call's completion and `armNext()` for the next call's after it
+/// (`jit::arm_call_end_poll_limit_at`, templates emitted with `jit::set_call_done_hook`): that
+/// call's end poll runs a major collection, its `gc_check` finding the ceiling passed, and throws
+/// the live-object limit's RangeError. `entryCount()` counts the Rust entries registered
+/// (`gc_trace::JitFrameRoots`). No GC stress and no incremental marking: `marks()` reports that
+/// collection.
+#[cfg(target_arch = "aarch64")]
+fn end_poll_engine() -> Engine {
+    use crate::value::Value;
+    let mut engine = super::rooting_tests::jit_engine(0);
+    {
+        let mut core = engine.interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(0);
+        core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    }
+    super::rooting_tests::install(&mut engine, "armOwn", 0, |_, _, _| {
+        super::arm_call_end_poll_limit_at(1, false);
+        Ok(Value::Undefined)
+    });
+    super::rooting_tests::install(&mut engine, "armNext", 0, |_, _, _| {
+        super::arm_call_end_poll_limit_at(2, false);
+        Ok(Value::Undefined)
+    });
+    super::rooting_tests::install(&mut engine, "entryCount", 0, |_, _, _| {
+        Ok(Value::Num(
+            crate::gc_trace::jit_frames_registered().len() as f64
+        ))
+    });
+    super::set_call_done_hook(true);
+    engine
+}
+
+/// Runs `source` on [`end_poll_engine`], checking that the armed request fell due.
+#[cfg(target_arch = "aarch64")]
+fn end_poll_case(source: &str) -> String {
+    let mut engine = end_poll_engine();
+    let got = super::rooting_tests::run(&mut engine, source);
+    super::set_call_done_hook(false);
+    assert!(
+        !super::take_end_poll_limit(super::POLL_HELPER_END),
+        "the request fell due and no poll took it: {got}"
+    );
+    got
+}
+
+/// A Rust entry's top operand word is a root at its poll's top (`JitCtx::poll_top`,
+/// `jit::entry_live_top`): `f`, which `invoke` runs on an entry of its own (`jit::run`; one more
+/// entry than the script's), pushes the object `track` returns as `id`'s argument, and the end
+/// poll after `track`'s call collects with that object in the top operand word alone (the
+/// words of `track`'s argument lie above the top). `marks()` reports a root marking it (`R`), not
+/// the native stack's conservative scan (`S`) nor nothing (`D`).
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn a_rust_entrys_top_operand_word_is_a_root_at_its_polls() {
+    let got = end_poll_case(
+        r#"
+function id(o) { return o; }
+function f() {
+    try { armNext(); return id(track({ tag: 'T' })) ? 'none' : 'none'; }
+    catch (e) { return e.name + ':' + marks() + ':' + (entryCount() - outer); }
+}
+var outer = entryCount();
+invoke(f)"#,
+    );
+    assert_eq!(got, "RangeError:R:1");
+}
+
+/// A Rust entry's slots are roots whatever its operand top, its poll's too: `g`, which `invoke`
+/// runs on an entry of its own, keeps the object `track` follows in its ninth slot alone and
+/// collects at the end poll of `armOwn`'s call, whose top is one operand word, below that slot's
+/// index (`jit::entry_live_top` cuts the operand words alone): `marks()` reports a root marking
+/// it (`R`).
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn a_rust_entrys_slots_past_its_poll_top_are_roots() {
+    let got = end_poll_case(
+        r#"
+function g() {
+    var a = 1, b = 2, c = 3, d = 4, e = 5, f = 6, h = 7, k = 8;
+    var keep = track({ tag: 'K' });
+    try { armOwn(); return 'none'; }
+    catch (x) {
+        // `keep` is read only where it was marked: an object the collection missed is freed.
+        var m = marks();
+        return x.name + ':' + m + ':' + (entryCount() - outer)
+            + (a + b + c + d + e + f + h + k === 36 && (m !== 'R' || keep.tag === 'K') ? '' : '?');
+    }
+}
+var outer = entryCount();
+invoke(g)"#,
+    );
+    assert_eq!(got, "RangeError:R:1");
+}

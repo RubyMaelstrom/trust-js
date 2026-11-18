@@ -1659,7 +1659,7 @@ impl crate::gc_trace::GcTrace for FramePool {
                     true
                 };
                 #[cfg(test)]
-                note_window_trace(top.map(|_| !record.ctx.poll_top.is_null()), scanned);
+                note_window_trace(top.map(|_| !record.ctx.poll_top.is_null()), scanned, false);
                 #[cfg(not(test))]
                 let _ = scanned;
             }
@@ -1678,17 +1678,21 @@ pub(crate) struct WindowTraces {
     /// called through the direct sequence.
     pub(crate) call_tops: u64,
     pub(crate) missed: u64,
+    /// Of those at a known top, the windows of activations on a Rust entry
+    /// (`gc_trace::JitFrameRoots`).
+    pub(crate) entries: u64,
 }
 
 #[cfg(test)]
 thread_local! {
     pub(crate) static TEST_WINDOW_TRACES: std::cell::Cell<WindowTraces> =
-        const { std::cell::Cell::new(WindowTraces { poll_tops: 0, call_tops: 0, missed: 0 }) };
+        const { std::cell::Cell::new(WindowTraces { poll_tops: 0, call_tops: 0, missed: 0, entries: 0 }) };
 }
 
-/// `top`: None where the record's top is unknown, else whether it is its poll's.
+/// `top`: None where the record's top is unknown, else whether it is its poll's; `entry`: an
+/// activation on a Rust entry, not a record.
 #[cfg(test)]
-fn note_window_trace(top: Option<bool>, scanned: bool) {
+pub(crate) fn note_window_trace(top: Option<bool>, scanned: bool, entry: bool) {
     TEST_WINDOW_TRACES.with(|traces| {
         let mut current = traces.get();
         match top {
@@ -1697,6 +1701,7 @@ fn note_window_trace(top: Option<bool>, scanned: bool) {
             None => {}
         }
         current.missed += u64::from(!scanned);
+        current.entries += u64::from(entry && top.is_some());
         traces.set(current);
     });
 }
