@@ -176,8 +176,10 @@ Each is recorded where the plan line says; none blocks the lines above.
    whole buffer dirty; an embedder that observes a buffer when it makes it sees no difference).
 4. The exit limit: keep JSC's 100 or take SpiderMonkey's 10 << R at graph once graph is the
    default ("Step 4p's rule 4, the exit limit").
-5. Part A2 is a first-stage fast path no exemplar has at its baseline tier; the coordinator
-   decided it (its record says why). The owner may want it otherwise.
+5. Answered 2026-11-18 (the plan's "Part A2's standing"): part A2, a first-stage fast path no
+   exemplar has at its baseline tier, stays for now and is measured again against the general
+   forms (A1 and the `f.apply(t, arguments)` call form, also approved that day) once they land;
+   its special form is removed if the general path is close.
 6. Profile-guided optimization or a link order file for the Rust binary (rule U's record): the
    fixtures' cycles move with the binary's layout at equal instructions.
 7. Folding a constant holder or method into code needs dependencies and invalidatable code, which

@@ -6097,3 +6097,16 @@ fat LTO, not yet repeated by me; nothing built).
   outside constructors and a design note; its case is what it does at every tier, it must leave
   the tier's own reduction (the design's step 9) buildable from what the builder sees at the
   site, and it is measured at the three modes with the tier-on rows weighed as the tier-off's.
+
+Part A2's standing, the owner's (2026-11-18). Part A2's record left it "decided by me; the
+owner may want it otherwise": a first-stage form for one idiom, where no exemplar has one. Put
+to the owner with the general forms now approved (A1's learned layouts and the apply form),
+which should cover the same constructor without a special case (my inference, unmeasured), and
+three options: keep and measure again later, keep for good, revert now. The answer: keep, and
+measure again later. A2 stays on main and its site entry still moves out of line. Once A1 and
+the apply form have landed, the forwarder's construction and RayTrace are measured at 5 and 200
+runs at the three modes in three variants on one binary: the forward form on; the form off with
+the Rust forwarder still recognizing the constructor (main before A2); and both off, the
+constructor an ordinary one taken by A1's layout and its apply by the general form. If the
+general path is close, A2's form is removed; otherwise it stays and the numbers go back to the
+owner. A1 and the apply form are designed so that the third variant is a case they cover alone.
