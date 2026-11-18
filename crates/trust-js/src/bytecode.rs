@@ -1229,6 +1229,11 @@ pub const INTRINSIC_MATH_MAX: u8 = 39;
 pub const INTRINSIC_MATH_MIN: u8 = 40;
 pub const INTRINSIC_MATH_FIRST: u8 = INTRINSIC_MATH_FLOOR;
 pub const INTRINSIC_MATH_LAST: u8 = INTRINSIC_MATH_MIN;
+/// [`Op::CallApplyFrameArgs`] from template code: the operation's code in the intrinsic helper's
+/// operand word (`pc | code << 16`, H_INTRINSIC), which classes no native, so no call cache
+/// holds it. The site makes no callee probe: its way is the forwarded callee `f`
+/// (feedback-schema.txt 5.10), and the helper tests `apply` itself (`jit_apply_frame_args`).
+pub const INTRINSIC_APPLY_FRAME_ARGS: u8 = 41;
 
 impl CallIc {
     pub const EMPTY: CallIc = CallIc {
@@ -12308,6 +12313,12 @@ thread_local! {
     pub(crate) static TEST_APPLY_FORM_MISSES: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// [`Op::CallApplyFrameArgs`] runs from template code: through the intrinsic helper
+    /// ([`jit_apply_frame_args`]) and through the generic one (`jit_exec_inner`), in that order
+    /// (tests).
+    pub(crate) static TEST_APPLY_FORM_ROUTES: std::cell::Cell<[usize; 2]> = const {
+        std::cell::Cell::new([0, 0])
+    };
 }
 
 /// Whether `value` is %Function.prototype.apply%: a native function object whose entry is its
@@ -12322,13 +12333,18 @@ fn is_builtin_apply(value: &Value) -> bool {
 }
 
 /// [`Op::CallApplyFrameArgs`] (`<f>.apply(<t>, arguments)` of a body whose arguments object is
-/// elided), for the VM and the generic helper: `operands` are its four words `[f, apply, t,
-/// list]`, rooted by the caller's operand stack for the whole call; `slot` is the arguments
-/// slot, whose state the operation reads (`list` is the copy the LoadLocal before it pushed),
-/// `activation` the body's activation (a mapped body's formals), and `frame` a fresh native
-/// frame's actual arguments, which an Undefined slot stands for (Decision 20e).
-/// `cache`: call `f` through the site's call cache, which then records `f` as its way (the
-/// generic helper's; the VM calls as its `CallWithThis` does).
+/// elided), for the VM and template code: `operands` are its four words `[f, apply, t, list]`,
+/// rooted by the caller's operand stack for the whole call; `slot` is the arguments slot, whose
+/// state the operation reads (`list` is the copy the LoadLocal before it pushed), `activation`
+/// the body's activation (a mapped body's formals), and `frame` a fresh native frame's actual
+/// arguments, which an Undefined slot stands for (Decision 20e).
+/// `cache`: call `f` through the site's call cache, which then records `f` as its way (template
+/// code's; the VM calls as its `CallWithThis` does).
+/// `LEVEL_COUNTED`: the caller counted apply's own call level, checked the stack at it and grew
+/// it (template code's route, the intrinsic helper's general path, which counts it as it does
+/// for the builtin `apply` of a `CallWithThis`, [`INTRINSIC_FUNCTION_APPLY`]); else it is counted
+/// here (the VM, and the generic helper, which a site past the intrinsic operand's 16-bit pc
+/// takes).
 ///
 /// While nothing materialized the object (`list` Undefined, or the VM's plain Array), `apply`
 /// is %Function.prototype.apply% and `f` is callable, apply's steps on the object the body
@@ -12343,7 +12359,7 @@ fn is_builtin_apply(value: &Value) -> bool {
 /// `operands..operands + 4` are initialized execution words, stable for the call; `frame`, when
 /// given, is the caller's rooted words, unchanged for the call (`frame_arguments`).
 #[allow(clippy::too_many_arguments)]
-unsafe fn call_apply_frame_args(
+unsafe fn call_apply_frame_args<const LEVEL_COUNTED: bool>(
     i: &mut Interp,
     chunk: &Chunk,
     pc: usize,
@@ -12399,15 +12415,7 @@ unsafe fn call_apply_frame_args(
         // which it roots (`frame_arguments`), and need none.
         let _root =
             (read.is_some() || snapshot.is_some()).then(|| crate::rooting::root_slice(args));
-        // `apply`'s own call level, as the builtin's call through Interp::call counts it and grows
-        // the stack at it, so that the depth, its stack checks and segments stay what they were
-        // with the object.
-        i.depth += 1;
-        if crate::interpreter::execution_stack_exhausted(i.depth) {
-            i.depth -= 1;
-            return Err(i.throw("RangeError", "Maximum call stack size exceeded"));
-        }
-        let result = crate::interpreter::with_execution_stack(i.depth, || {
+        let call = |i: &mut Interp| {
             if let Some(c) = cache {
                 let site = &chunk.call_caches[c as usize];
                 let mut result =
@@ -12428,7 +12436,19 @@ unsafe fn call_apply_frame_args(
                 }
             }
             i.call(f, unsafe { *this_slot }, args)
-        });
+        };
+        if LEVEL_COUNTED {
+            return call(i);
+        }
+        // `apply`'s own call level, as the builtin's call through Interp::call counts it and grows
+        // the stack at it, so that the depth, its stack checks and segments stay what they were
+        // with the object.
+        i.depth += 1;
+        if crate::interpreter::execution_stack_exhausted(i.depth) {
+            i.depth -= 1;
+            return Err(i.throw("RangeError", "Maximum call stack size exceeded"));
+        }
+        let result = crate::interpreter::with_execution_stack(i.depth, || call(i));
         i.depth -= 1;
         return result;
     }
@@ -12446,12 +12466,65 @@ unsafe fn call_apply_frame_args(
         None => list,
     };
     let args = [unsafe { *this_slot }, object];
+    // The call of `apply` counts its own level, as `CallWithThis`'s did: one the caller counted
+    // is given back for it.
+    if LEVEL_COUNTED {
+        i.depth -= 1;
+    }
     let result = if chunk.feedback.detailed_enabled() {
         call_profiled(i, chunk, pc, apply, f, &args)
     } else {
         i.call(apply, f, &args)
     };
+    if LEVEL_COUNTED {
+        i.depth += 1;
+    }
     result.map_err(|error| name_call_error(i, chunk, pc, &apply, false, error))
+}
+
+/// [`Op::CallApplyFrameArgs`] at `pc` of the compiled frame `ctx` from template code (both
+/// template compilers and the optimizing tier's canonical-frame effect, through the intrinsic
+/// helper with [`INTRINSIC_APPLY_FRAME_ARGS`]): `operands` are its four words `[f, apply, t,
+/// list]` on the frame's operand stack, which the helper's general path left there; that path
+/// counted apply's call level, checked and grew the stack at it, made the safepoint and cleared
+/// the construction state, as it does for the builtin `apply` of a `CallWithThis`
+/// ([`INTRINSIC_FUNCTION_APPLY`]). The slot's state decides the list, as in the generic
+/// helper's arm (`jit_exec_inner`): Undefined, a fresh frame's actual arguments; else the VM's
+/// Array (a borrowed frame, an exit's rebuilt frame) or the object a read materialized.
+/// Out of line, so that the helper's frame stays what it is for every other intrinsic.
+///
+/// # Safety
+/// `ctx` is the running compiled frame's record and `operands..operands + 4` its operand words.
+#[inline(never)]
+unsafe fn jit_apply_frame_args(
+    ctx: &crate::jit::JitCtx,
+    i: &mut Interp,
+    pc: usize,
+    operands: *mut Value,
+) -> Result<Value, Abrupt> {
+    #[cfg(test)]
+    TEST_APPLY_FORM_ROUTES.with(|routes| {
+        let [intrinsic, generic] = routes.get();
+        routes.set([intrinsic + 1, generic]);
+    });
+    let chunk = unsafe { &*ctx.chunk };
+    let Op::CallApplyFrameArgs(s, c) = chunk.ops[pc] else {
+        unreachable!("the apply form's intrinsic at another operation")
+    };
+    // The activation env, as `jit_exec_inner` reconstructs it.
+    let env_h = std::mem::ManuallyDrop::new(unsafe {
+        crate::interpreter::Env::from_raw(
+            ctx.env_raw as *const std::cell::RefCell<crate::interpreter::Scope>,
+        )
+    });
+    let cap_env = unsafe { jit_cap_env(ctx, &env_h) };
+    let slots = unsafe { std::slice::from_raw_parts(ctx.slots, ctx.n_slots) };
+    let slot = &slots[s as usize];
+    let frame = slot
+        .get()
+        .is_undefined()
+        .then(|| unsafe { frame_arguments(ctx) });
+    unsafe { call_apply_frame_args::<true>(i, chunk, pc, slot, cap_env, frame, operands, Some(c)) }
 }
 
 /// `rest[key]` ([`Op::RestElem`]) in a fresh native frame whose rest Array is elided (Decision
@@ -21708,7 +21781,7 @@ fn run_vm_inner(
                 let at = stack.len() - 4;
                 let v = explicit_call(i, chunk.call_position(cache), |i| {
                     stack.with_tail(at, |operands| unsafe {
-                        call_apply_frame_args(
+                        call_apply_frame_args::<false>(
                             i,
                             chunk,
                             op_pc,
@@ -27466,7 +27539,6 @@ unsafe fn jit_intrinsic_inner(
     let i = &mut *ctx.interp;
     let intrinsic = (packed >> 16) as u8;
     let call_argc = (packed >> 24) as usize;
-    let _pc = (packed & 0xffff) as usize;
     let width = match intrinsic {
         INTRINSIC_CHAR_AT | INTRINSIC_CODE_POINT_AT => 3, // [receiver, callee, index]
         INTRINSIC_CHAR_CODE_AT | INTRINSIC_FROM_CHAR_CODE => 3, // [receiver, callee, Number]
@@ -27569,7 +27641,11 @@ unsafe fn jit_intrinsic_inner(
                 // these fields, but a prototype setter or unusual array-like on the miss path can.
                 let saved_ctor = std::mem::replace(&mut i.constructing, false);
                 let saved_nt = std::mem::replace(&mut i.new_target, Value::Undefined);
-                let r = match intrinsic {
+                // The code and the count from the operand word itself, and the frame's context:
+                // the apply form's arm reads its pc and frame from them, so the closure holds no
+                // more words than it did for the other intrinsics.
+                let call_argc = (packed >> 24) as usize;
+                let r = match (packed >> 16) as u8 {
                     INTRINSIC_OBJECT_HAS_OWN => {
                         let object = *base.add(2);
                         let ValueView::Obj(_) = object.view() else {
@@ -27634,6 +27710,12 @@ unsafe fn jit_intrinsic_inner(
                             )
                             .map_err(Abrupt::Throw),
                         }
+                    }
+                    // `<f>.apply(<t>, arguments)` of a body whose object is elided: its own
+                    // helper, out of line (this frame stays what it is for every other
+                    // intrinsic), which reads the words in place.
+                    INTRINSIC_APPLY_FRAME_ARGS => {
+                        jit_apply_frame_args(ctx, i, (packed & 0xffff) as usize, base)
                     }
                     INTRINSIC_ARRAY_PUSH => {
                         let ValueView::Obj(o) = &((*base).clone()).view() else {
@@ -32618,8 +32700,15 @@ unsafe fn jit_exec_inner(
         }
         // Undefined in the slot: a fresh frame elided the object, and its actual arguments are
         // the frame's (Decision 20e); else the Array a VM entry made (a borrowed frame, an exit's
-        // rebuilt frame) or the object a read materialized.
+        // rebuilt frame) or the object a read materialized. Template code reaches the operation
+        // through the intrinsic helper ([`jit_apply_frame_args`]); a site past its operand's
+        // 16-bit pc, here.
         Op::CallApplyFrameArgs(s, c) => {
+            #[cfg(test)]
+            TEST_APPLY_FORM_ROUTES.with(|routes| {
+                let [intrinsic, generic] = routes.get();
+                routes.set([intrinsic, generic + 1]);
+            });
             let operands = sp.sub(4);
             let frame = slots[s as usize]
                 .get()
@@ -32629,7 +32718,7 @@ unsafe fn jit_exec_inner(
             // `makes_explicit_call` and `call_op_position` stay as they were, as do the helpers'
             // paths through them; its position is its cache's, the CallWithThis's it replaced).
             let v = explicit_call(i, chunk.call_position(c), |i| {
-                call_apply_frame_args(
+                call_apply_frame_args::<false>(
                     i,
                     chunk,
                     pc as usize,

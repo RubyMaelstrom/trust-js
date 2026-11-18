@@ -836,6 +836,30 @@ pub(super) fn emit<C: JitChunk + ?Sized>(
                 direct_finish,
             );
         }
+        // `<f>.apply(<t>, arguments)` of a body whose object is elided: the intrinsic helper with
+        // the operation's own code, as the call template's `apply` intrinsic calls it, with no
+        // callee probe (the site's way is the forwarded callee `f`, so a probe could not class
+        // `apply`; the helper tests it). Lands with its result pushed, then the call's end poll.
+        Op::CallApplyFrameArgs(..) => {
+            debug_assert!(
+                pc <= 0xFFFF,
+                "a compiled chunk's pc fits the operand's 16 bits"
+            );
+            a.mark_push("call");
+            a.mov(0, 19);
+            a.movz(1, pc as u32, 0);
+            a.movk(1, crate::bytecode::INTRINSIC_APPLY_FRAME_ARGS as u32, 1);
+            a.mov(2, 20);
+            // An inlined call node's context for the helper alone (`emit_inlined_call_switch`).
+            emit_inlined_call_switch(a);
+            a.ldr_imm(16, 21, (H_INTRINSIC * 8) as u32);
+            a.blr(16);
+            emit_inlined_call_restore(a);
+            a.mov(20, 0);
+            a.cbnz(1, false, unwind);
+            emit_helper_end_poll(a, unwind);
+            a.mark_pop();
+        }
         Op::MakeObject(_, count, tidx) => {
             // W2e step 3: the literal's instance in line from its site's image.
             match chunk.jit_object_site(*tidx, usize::from(*count)) {

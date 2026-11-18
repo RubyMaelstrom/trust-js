@@ -700,3 +700,205 @@ fn a_recompiled_body_keeps_the_form() {
         }
     }
 }
+
+fn reset_routes() {
+    crate::bytecode::TEST_APPLY_FORM_ROUTES.with(|routes| routes.set([0, 0]));
+}
+
+/// Runs of the operation from template code: `[through the intrinsic helper, through the
+/// generic one]`.
+fn routes() -> [usize; 2] {
+    crate::bytecode::TEST_APPLY_FORM_ROUTES.with(std::cell::Cell::get)
+}
+
+/// Template code reaches the operation through the intrinsic helper with its own code
+/// (`INTRINSIC_APPLY_FRAME_ARGS`, no callee probe), never through the generic helper: hits from
+/// a fresh frame and from a mapped body, the object's path for a replaced `apply` and for a
+/// non-callable `f` (apply's TypeError), and a throwing callee; the template of the optimizing
+/// tier's canonical-frame effect is the same emitter. A run in the VM (forced exits) counts in
+/// neither route.
+#[test]
+fn template_code_takes_the_intrinsic_route() {
+    let source = format!(
+        "{TARGET}{}",
+        r#"
+        function fw() { return target.apply(this, arguments); }
+        function mapped(a, b) { a = 'w'; return target.apply(o, arguments); }
+        var own = { apply: function (t, list) { return 'own:' + list.length + ':' + list[0]; } };
+        function replaced() { return own.apply(this, arguments); }
+        var notCallable = { apply: Function.prototype.apply };
+        function typeError() {
+            try { return notCallable.apply(this, arguments); } catch (e) { return e.name; }
+        }
+        function thrower() { throw new Error('t:' + arguments.length); }
+        function rethrows() {
+            try { return thrower.apply(this, arguments); } catch (e) { return e.message; }
+        }
+        var r = [];
+        for (var k = 0; k < 40; k++) {
+            r = [fw.call(o, 1, 2), mapped(1, 2, 3), replaced(4, 5), typeError(6), rethrows(7, 8)];
+        }
+        r.join('|')
+    "#
+    );
+    let (expected, _, _) = same_at_every_tier(&source);
+    assert_eq!(expected, "o,1,2|o,w,2,3|own:2:4|TypeError|t:2");
+    for threshold in [Some(0), None] {
+        reset_routes();
+        let (result, counts) = run(Tier::Jit, threshold, &source);
+        assert_eq!(result, expected, "the JIT at {threshold:?}");
+        let [intrinsic, generic] = routes();
+        assert_eq!(
+            generic, 0,
+            "template code took the generic helper ({threshold:?})"
+        );
+        if form() {
+            assert!(
+                intrinsic > 0 && intrinsic <= counts.hits + counts.misses,
+                "{intrinsic} intrinsic runs, {counts:?} ({threshold:?})"
+            );
+            assert!(counts.hits > 0 && counts.misses > 0, "{counts:?}");
+        } else {
+            assert_eq!(intrinsic, 0);
+        }
+    }
+}
+
+/// A site past the intrinsic operand's 16-bit pc takes the generic helper, which reads the whole
+/// pc: x86-64's template compiler compiles such a chunk; ARM64's compilers refuse a chunk of more
+/// than 0xFFFF operations, which then runs in the VM.
+#[test]
+fn a_site_past_the_operands_pc_takes_the_generic_helper() {
+    let mut body = String::new();
+    for k in 0..20000 {
+        body.push_str(&format!("x = x + {k};\n"));
+    }
+    let source = format!(
+        "{TARGET}function big(a) {{ var x = 0;\n{body}return target.apply(o, arguments) + ':' + x; }}
+         var r;
+         for (var k = 0; k < 3; k++) r = big(1, 2);
+         r"
+    );
+    let (expected, _, _) = same_at_every_tier(&source);
+    assert_eq!(expected, format!("o,1,2:{}", (0..20000u64).sum::<u64>()));
+    if form() {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        reset_routes();
+        assert_eq!(eval(&mut engine, &source), expected);
+        let pc = ops_of(&mut engine, "big")
+            .iter()
+            .position(|op| matches!(op, Op::CallApplyFrameArgs(..)))
+            .expect("the form");
+        assert!(pc > 0xFFFF, "the site's pc {pc}");
+        let [intrinsic, generic] = routes();
+        assert_eq!(intrinsic, 0);
+        if cfg!(target_arch = "x86_64") {
+            assert!(generic > 0, "x86-64's template took no generic helper");
+        }
+    }
+}
+
+/// `depth()`: the engine's call depth (`Interp::depth`), for the level test below.
+fn depth_native(i: &mut crate::interpreter::Interp, _: Value, _: &[Value]) -> Result<Value, Value> {
+    Ok(Value::Num(f64::from(i.depth)))
+}
+
+/// Apply's own call level counts once, as the builtin's call through `Interp::call` counted it
+/// (the intrinsic helper's general path counts it for template code; the VM and the generic
+/// helper, in the operation): the levels between a forwarder and its callee, read by a native
+/// (`depth()`) in both, are the tree-walker's at every tier, on the hit (apply's level and the
+/// callee's) and on the object's path (a replaced `apply`, called as `CallWithThis` called it,
+/// which counts its own level).
+#[test]
+fn apply_counts_one_call_level_as_the_builtins_call() {
+    let source = r#"
+        function probe() { return depth(); }
+        function viaForm() { var d0 = depth(); return probe.apply(this, arguments) - d0; }
+        var own = { apply: function (t, list) { return depth(); } };
+        function ownForm() { var d0 = depth(); return own.apply(this, arguments) - d0; }
+        var r = [];
+        for (var k = 0; k < 40; k++) r = [viaForm(1), ownForm(1)];
+        r.join(',')
+    "#;
+    let mut expected = None;
+    for (tier, threshold) in [
+        (Tier::Interp, None),
+        (Tier::Bytecode, Some(0)),
+        (Tier::Jit, Some(0)),
+        (Tier::Jit, None),
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        if let Some(threshold) = threshold {
+            engine.set_tier_threshold(threshold);
+        }
+        let hook = engine.interp.make_native("depth", 0, depth_native);
+        engine
+            .interp
+            .global
+            .borrow_mut()
+            .props
+            .insert("depth", crate::value::Property::plain(Value::Obj(hook)));
+        reset_routes();
+        let result = eval(&mut engine, source);
+        let expected = expected.get_or_insert_with(|| result.clone());
+        assert_eq!(&result, expected, "{tier:?} at {threshold:?}");
+        if form() && tier == Tier::Jit {
+            assert!(routes()[0] > 0, "{tier:?} at {threshold:?}");
+        }
+    }
+    assert_eq!(expected.as_deref(), Some("2,1"));
+    assert!(!form() || rewritten(&source.replace("depth()", "0"), "viaForm"));
+}
+
+/// The operation's call ends in the call's end poll, as the call template's does: at stress 1,
+/// each of four forms whose native callee allocates (`Array`) collects at its own end poll, where
+/// without that poll the allocations would wait for the caller's (one collection a call).
+#[test]
+fn the_forms_call_ends_in_its_poll() {
+    if !form() {
+        return;
+    }
+    const SOURCE: &str = r#"
+        function four() {
+            var a = Array.apply(null, arguments);
+            var b = Array.apply(null, arguments);
+            var c = Array.apply(null, arguments);
+            var d = Array.apply(null, arguments);
+            return a.length + b.length + c.length + d.length;
+        }
+        four(1, 2, 3);
+    "#;
+    const N: u64 = 50;
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    assert_eq!(eval(&mut engine, SOURCE), "12");
+    assert!(ops_of(&mut engine, "four")
+        .iter()
+        .any(|op| matches!(op, Op::CallApplyFrameArgs(..))));
+    {
+        let mut core = engine.interp.gc_heap.core.borrow_mut();
+        core.set_stress_every(1);
+        core.set_incremental(crate::gc_core::IncrementalMode::Off);
+    }
+    crate::jit::take_poll_census();
+    reset_routes();
+    let result = eval(
+        &mut engine,
+        &format!("var t = 0; for (var k = 0; k < {N}; k++) t += four(1, 2, 3); t"),
+    );
+    let census = crate::jit::take_poll_census();
+    engine.interp.gc_heap.core.borrow_mut().set_stress_every(0);
+    assert_eq!(result, (12 * N).to_string());
+    let end = crate::jit::POLL_HELPER_END as usize;
+    // Calls of `four` that ran in tier code exited to the VM count in neither (forced exits).
+    let runs = routes()[0] as u64;
+    assert!(
+        runs >= 4 * N / 2,
+        "{runs} runs through the intrinsic helper"
+    );
+    assert!(census.collections[end] >= runs, "{runs} runs, {census:?}");
+}

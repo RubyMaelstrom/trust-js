@@ -6,8 +6,9 @@
 
 use super::{
     JitCode, COND_PEEK_TRUTHY, COND_POP_TRUTHY, H_CALL, H_CALL_SPREAD, H_COMPLETE, H_COND, H_EXEC,
-    H_FRAME_SETUP, H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_NEW, H_POP_HANDLER,
-    H_PUSH_HANDLER, H_SET_PROP, H_SLICE_OP, H_STRING_CALL_FILL, H_STRING_READ, H_UNWIND,
+    H_FRAME_SETUP, H_GET_ELEM, H_GET_METHOD_ELEM, H_GET_PROP, H_INTERRUPT, H_INTRINSIC, H_NEW,
+    H_POP_HANDLER, H_PUSH_HANDLER, H_SET_PROP, H_SLICE_OP, H_STRING_CALL_FILL, H_STRING_READ,
+    H_UNWIND,
 };
 use crate::bytecode::{Chunk, Op};
 use crate::value::{PACK_BOOL, PACK_OBJ, PACK_UNDEFINED};
@@ -1307,6 +1308,19 @@ pub(super) fn compile_entry(
             // Ends in the helper end poll (`jit::helper_ends_in_poll`).
             Op::CallSpread(..) | Op::CallSpreadThis(..) => {
                 a.helper_spflag(H_CALL_SPREAD, pc as u32, unwind)
+            }
+            // `<f>.apply(<t>, arguments)` of a body whose object is elided: the intrinsic helper
+            // with the operation's own code and no callee probe (the site's way is the forwarded
+            // callee `f`; the helper tests `apply`), as ARM64's template calls it. A site past the
+            // operand's 16-bit pc takes the generic helper.
+            Op::CallApplyFrameArgs(..) if pc <= 0xFFFF => {
+                a.helper_spflag(
+                    H_INTRINSIC,
+                    pc as u32 | (crate::bytecode::INTRINSIC_APPLY_FRAME_ARGS as u32) << 16,
+                    unwind,
+                );
+                // A native callee can allocate after the call's last safepoint.
+                a.helper_end_poll(unwind);
             }
             // `jit_new` reads the pc from the low 16 bits of its operand, under the count; a site
             // past them takes the generic helper, which reads the whole pc (and ends in the poll).
