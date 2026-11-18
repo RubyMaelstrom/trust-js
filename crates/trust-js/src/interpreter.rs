@@ -1409,6 +1409,10 @@ thread_local! {
     pub(crate) static TEST_LIGHT_NATIVE_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
+    /// Arguments objects compiled code made ([`Interp::make_compiled_arguments_object`]).
+    pub(crate) static TEST_COMPILED_ARGUMENTS_OBJECTS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
     /// Calls [`Interp::call_compiled_target`] entered (W3's item 6).
     pub(crate) static TEST_COMPILED_TARGET_CALLS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
@@ -15503,6 +15507,8 @@ impl Interp {
     /// [`FnFrame`] supplies the observable `callee` identity for both ordinary and activation-aware
     /// moved-frame entries.
     pub(crate) fn make_compiled_arguments_object(&mut self, args: &[Value], scope: &Env) -> Gc {
+        #[cfg(test)]
+        TEST_COMPILED_ARGUMENTS_OBJECTS.with(|count| count.set(count.get() + 1));
         let fn_obj = self
             .fn_frames
             .last()

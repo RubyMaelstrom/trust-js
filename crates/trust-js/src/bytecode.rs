@@ -3047,6 +3047,17 @@ pub enum Op {
     /// Method call: pops argc args, the method, and the receiver pushed by GetMethod*. Second
     /// operand = the per-site [`CallIc`] index.
     CallWithThis(u16, u32),
+    /// `<f>.apply(<t>, arguments)` in a body whose arguments object is elided (the apply form,
+    /// [`lazy_arguments_rewrite`]): pops `[f, apply, t, list]`, where `list` is the arguments
+    /// slot's word that the `LoadLocal` before it pushed (Undefined in a fresh native frame, a
+    /// plain Array of the actual arguments in the VM's entries, or the object a read
+    /// materialized), and pushes the call's result. While `apply` is %Function.prototype.apply%,
+    /// `f` is callable and nothing materialized the object, it calls `f` with `t` and the actual
+    /// arguments, a mapped index reading its formal's binding: Function.prototype.apply's steps
+    /// on the object the body would have made (ECMA-262 §20.2.3.1; CreateListFromArrayLike reads
+    /// each index at the call). The site's [`CallIc`] (second operand) records `f`. Otherwise it
+    /// materializes that exact object into the slot (first operand) and calls `apply` with it.
+    CallApplyFrameArgs(u16, u32),
     /// Speculative-inline guard (see [`plan_inlines`]): with the stack holding
     /// `[this, callee, arg0..argN]` for the call site, verify the callee is the pinned expected
     /// function (and, for a sloppy this-using callee, that the receiver is already an object);
@@ -7139,6 +7150,7 @@ fn feedback_layout_for_ops(
             ),
             Op::Call(..)
             | Op::CallWithThis(..)
+            | Op::CallApplyFrameArgs(..)
             | Op::CallSpread(..)
             | Op::CallSpreadThis(..)
             | Op::CallArgsArray
@@ -9527,6 +9539,8 @@ fn call_cache_seeds(chunk: &Chunk) -> Vec<CallSeed> {
         .iter()
         .filter_map(|op| {
             let cache = match *op {
+                // Not an apply form's site: its way is the forwarded callee, which a second stage
+                // whose rewrite declined there would read as a CallWithThis(2)'s callee.
                 Op::Call(_, cache) | Op::CallWithThis(_, cache) => cache as usize,
                 _ => return None,
             };
@@ -10412,6 +10426,7 @@ fn finish_chunk(
         let slot = match *op {
             Op::Call(_, cache)
             | Op::CallWithThis(_, cache)
+            | Op::CallApplyFrameArgs(_, cache)
             | Op::CallSpread(_, cache)
             | Op::CallSpreadThis(_, cache) => call_positions.get_mut(cache as usize),
             Op::New(_, cache) => construct_positions.get_mut(cache as usize),
@@ -10516,7 +10531,11 @@ fn finish_chunk(
         }
     }
     if c.arguments_length_only
-        && !(lazy_arguments && !c.ops.iter().any(|op| matches!(op, Op::ArgElem(_))))
+        && !(lazy_arguments
+            && !c
+                .ops
+                .iter()
+                .any(|op| matches!(op, Op::ArgElem(_) | Op::CallApplyFrameArgs(..))))
     {
         log_bail("fn", "mapped arguments observed beyond length");
         MAPPED_BEYOND_LENGTH.with(|flag| flag.set(true));
@@ -10939,7 +10958,7 @@ fn call_sites_in_loops(chunk: &Chunk) -> Vec<bool> {
         return in_loop;
     }
     for (pc, op) in chunk.ops.iter().enumerate() {
-        if let Op::Call(_, c) | Op::CallWithThis(_, c) = *op {
+        if let Op::Call(_, c) | Op::CallWithThis(_, c) | Op::CallApplyFrameArgs(_, c) = *op {
             if let Some(slot) = in_loop.get_mut(c as usize) {
                 *slot |= loops.iter().any(|&(start, end)| start <= pc && pc <= end);
             }
@@ -11090,10 +11109,16 @@ fn inline_capability(op: &Op) -> InlineCapability {
 /// For each call-cache site of `chunk`, whether it is a spread call's
 /// ([`Op::CallSpread`], [`Op::CallSpreadThis`]): its cache serves the call, but the planner
 /// splices fixed-argument calls only.
+/// The call caches of spread calls and of the apply form's calls ([`Op::CallApplyFrameArgs`]),
+/// which no splice takes: a spread's arguments are not the call's operands, and an apply form's
+/// way is the forwarded callee `f` while the call's operands are `f`, `apply`, `<t>` and the
+/// list's state (the splice's guard would test `apply` against `f`, and its body would take the
+/// operands as `f`'s parameters, where the frame's actual arguments are).
 fn spread_call_sites(chunk: &Chunk) -> Vec<bool> {
     let mut spread = vec![false; chunk.call_caches.len()];
     for op in &chunk.ops {
-        if let Op::CallSpread(_, c) | Op::CallSpreadThis(_, c) = *op {
+        if let Op::CallSpread(_, c) | Op::CallSpreadThis(_, c) | Op::CallApplyFrameArgs(_, c) = *op
+        {
             if let Some(slot) = spread.get_mut(c as usize) {
                 *slot = true;
             }
@@ -11135,7 +11160,7 @@ fn plan_inlines_at(
     let exemplars_rule = crate::opt::enabled();
     for (idx, site) in chunk.call_caches.iter().enumerate() {
         if spread_sites[idx] {
-            skip!(idx, "spread call (never spliced)")
+            skip!(idx, "spread or apply-form call (never spliced)")
         }
         // As V8's optimizing tiers inline no callee at a megamorphic call slot.
         if site.megamorphic() {
@@ -11251,6 +11276,7 @@ fn plan_inlines_at(
                     op,
                     Op::Call(..)
                         | Op::CallWithThis(..)
+                        | Op::CallApplyFrameArgs(..)
                         | Op::CallSpread(..)
                         | Op::CallSpreadThis(..)
                         | Op::CallArgsArray
@@ -11353,10 +11379,10 @@ fn log_splice_rule(
             .collect();
         format!("fn({})", names.join(","))
     };
-    let at = chunk
-        .ops
-        .iter()
-        .position(|op| matches!(*op, Op::Call(_, c) | Op::CallWithThis(_, c) if c as usize == idx));
+    let at = chunk.ops.iter().position(|op| {
+        matches!(*op, Op::Call(_, c) | Op::CallWithThis(_, c) | Op::CallApplyFrameArgs(_, c)
+                if c as usize == idx)
+    });
     let pc = at.map_or_else(|| "?".to_string(), |pc| pc.to_string());
     let call = at.and_then(|pc| chunk.call_name(pc)).unwrap_or("?");
     let mut callees: Vec<usize> = filled.iter().map(|c| c.callee).collect();
@@ -12032,7 +12058,8 @@ fn op_mentions_slot(op: &Op, slot: u16) -> bool {
         | Op::ArgElem(a)
         | Op::ArgLength(a, ..)
         | Op::RestLength(a, ..)
-        | Op::RestElem(a) => a == slot,
+        | Op::RestElem(a)
+        | Op::CallApplyFrameArgs(a, _) => a == slot,
         Op::IterStepL(a, b)
         | Op::IterCloseIfNotDoneL(a, b)
         | Op::IterAbortIfNotDoneL(a, b)
@@ -12058,25 +12085,92 @@ enum LazyArguments {
     Count,
 }
 
+/// Whether part A2's recognized forwarder is off (TRUST_JS_JIT_NO_FORWARDER, a diagnostic switch
+/// read once): [`Chunk::jit_arguments_apply_forwarder`] then recognizes none.
+pub(crate) fn forwarder_disabled() -> bool {
+    env_flag!("TRUST_JS_JIT_NO_FORWARDER")
+}
+
+/// Whether the apply form is off (TRUST_JS_JIT_NO_APPLY_FORM, a diagnostic switch read once):
+/// [`lazy_arguments_rewrite`] then takes no apply site, and such a body makes its object.
+pub(crate) fn apply_form_disabled() -> bool {
+    env_flag!("TRUST_JS_JIT_NO_APPLY_FORM")
+}
+
+/// Whether the `LoadLocal(slot)` at `k` is an apply site of the apply form
+/// ([`Op::CallApplyFrameArgs`]): the last argument of a `CallWithThis(2)` right after it whose
+/// method is the value a `GetMethod` of "apply" pushed, in one straight run of operations (no
+/// jump lands after that `GetMethod`, up to the call), so that `<f>.apply(<t>, arguments)` is
+/// the expression, whatever `<t>` computes. The method is found by walking back over the
+/// operations' stack effects from the argument below `arguments`.
+fn apply_form_site(ops: &[Op], leaders: &[bool], names: &[Rc<str>], k: usize, slot: u16) -> bool {
+    if !matches!(
+        (ops.get(k), ops.get(k + 1)),
+        (Some(Op::LoadLocal(s)), Some(Op::CallWithThis(2, _))) if *s == slot
+    ) || leaders[k]
+        || leaders[k + 1]
+    {
+        return false;
+    }
+    // Values above the method on the stack after operation `j`: `<t>` alone before `k`.
+    let mut above = 1usize;
+    let mut j = k;
+    while j > 0 {
+        j -= 1;
+        let Some((pops, pushes)) = stack_effect(ops, j, false, false) else {
+            return false;
+        };
+        if above < pushes {
+            // GetMethod pushes the receiver, then the method on top.
+            return above == 0
+                && matches!(ops[j], Op::GetMethod(name, _) if &*names[name as usize] == "apply");
+        }
+        if leaders[j] {
+            return false;
+        }
+        above = above - pushes + pops;
+    }
+    false
+}
+
 /// See [`Chunk::lazy_arguments`]. The arguments object of a body is unobservable when its slot
-/// is read only as `arguments.length` and `arguments[key]`: it is never stored, passed, called,
-/// captured, written or deleted, so no code other than those two reads can reach it. Rewrite
-/// the element reads to [`Op::ArgElem`]; without any, only the length is observable
+/// is read only as `arguments.length`, `arguments[key]` and as the list of
+/// `<f>.apply(<t>, arguments)` ([`apply_form_site`]): it is never stored, passed elsewhere,
+/// called, captured, written or deleted, so no code other than those reads and that call can
+/// reach it. Rewrite the element reads to [`Op::ArgElem`] and the apply sites' calls to
+/// [`Op::CallApplyFrameArgs`] (the `LoadLocal` before each stays: it pushes the slot's state,
+/// which the call reads); without either, only the length is observable
 /// (CreateUnmappedArgumentsObject and CreateMappedArgumentsObject both define it as the number
 /// of actual arguments, ECMA-262 §10.4.4.6–7), so rewrite its reads to slot loads of that
 /// number. Otherwise leave `ops` unchanged and return `None`.
 fn lazy_arguments_rewrite(ops: &mut [Op], slot: u16, names: &[Rc<str>]) -> Option<LazyArguments> {
-    let only_reads = ops.iter().all(|op| match *op {
+    let apply_sites: Vec<usize> = if apply_form_disabled() {
+        Vec::new()
+    } else {
+        let leaders = jump_targets(ops);
+        (0..ops.len().saturating_sub(1))
+            .filter(|&k| apply_form_site(ops, &leaders, names, k, slot))
+            .collect()
+    };
+    let only_reads = ops.iter().enumerate().all(|(pc, op)| match *op {
         Op::GetPropLocal(a, name, _) if a == slot => &*names[name as usize] == "length",
         Op::GetElemLocal(a) if a == slot => true,
+        Op::LoadLocal(a) if a == slot => apply_sites.binary_search(&pc).is_ok(),
         _ => !op_mentions_slot(op, slot),
     });
     if !only_reads {
         return None;
     }
-    if !ops
-        .iter()
-        .any(|op| matches!(*op, Op::GetElemLocal(a) if a == slot))
+    for &k in &apply_sites {
+        let Op::CallWithThis(2, cache) = ops[k + 1] else {
+            unreachable!("an apply site's call");
+        };
+        ops[k + 1] = Op::CallApplyFrameArgs(slot, cache);
+    }
+    if apply_sites.is_empty()
+        && !ops
+            .iter()
+            .any(|op| matches!(*op, Op::GetElemLocal(a) if a == slot))
     {
         for op in ops.iter_mut() {
             if matches!(*op, Op::GetPropLocal(a, ..) if a == slot) {
@@ -12202,6 +12296,162 @@ fn materialization_scope(i: &Interp, chunk: &Chunk, activation: &Env) -> Env {
     } else {
         *activation
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// [`Op::CallApplyFrameArgs`] calls made with the actual arguments, no object made (tests).
+    pub(crate) static TEST_APPLY_FORM_HITS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    /// [`Op::CallApplyFrameArgs`] calls that took the object's path (tests).
+    pub(crate) static TEST_APPLY_FORM_MISSES: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+}
+
+/// Whether `value` is %Function.prototype.apply%: a native function object whose entry is its
+/// builtin, as the call cache's fill classes it (`builtins::declare_template_natives`).
+fn is_builtin_apply(value: &Value) -> bool {
+    value
+        .with_object(|object| {
+            matches!(object.borrow().kind, crate::value::ObjectKind::Native(f)
+                if f as usize == crate::builtins::nf_function_apply as crate::value::NativeFn as usize)
+        })
+        .unwrap_or(false)
+}
+
+/// [`Op::CallApplyFrameArgs`] (`<f>.apply(<t>, arguments)` of a body whose arguments object is
+/// elided), for the VM and the generic helper: `operands` are its four words `[f, apply, t,
+/// list]`, rooted by the caller's operand stack for the whole call; `slot` is the arguments
+/// slot, whose state the operation reads (`list` is the copy the LoadLocal before it pushed),
+/// `activation` the body's activation (a mapped body's formals), and `frame` a fresh native
+/// frame's actual arguments, which an Undefined slot stands for (Decision 20e).
+/// `cache`: call `f` through the site's call cache, which then records `f` as its way (the
+/// generic helper's; the VM calls as its `CallWithThis` does).
+///
+/// While nothing materialized the object (`list` Undefined, or the VM's plain Array), `apply`
+/// is %Function.prototype.apply% and `f` is callable, apply's steps on the object the body
+/// would have made are Call(f, t, the actual arguments), CreateListFromArrayLike reading each
+/// index at the call (ECMA-262 §20.2.3.1, §7.3.20): an index a mapped body maps below the count
+/// reads its formal's current binding (`mapped_formal_value`), any other the argument. Anything
+/// else (a replaced or shadowed `apply`, a non-callable `f`, whose TypeError is apply's, an
+/// object a read materialized, detailed feedback) makes the exact object into the slot, where
+/// every later read and site takes it, and calls `apply` with it, as `CallWithThis` would.
+///
+/// # Safety
+/// `operands..operands + 4` are initialized execution words, stable for the call; `frame`, when
+/// given, is the caller's rooted words, unchanged for the call (`frame_arguments`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn call_apply_frame_args(
+    i: &mut Interp,
+    chunk: &Chunk,
+    pc: usize,
+    slot: &std::cell::Cell<Value>,
+    activation: &Env,
+    frame: Option<&[Value]>,
+    operands: *const Value,
+    cache: Option<u32>,
+) -> Result<Value, Abrupt> {
+    // The slot's state, not the word the LoadLocal before pushed: an exit between the two
+    // resumes in the VM with that word Undefined and the slot already holding the VM's Array
+    // (`run_native_frame_in_vm`).
+    let (f, apply, list) = unsafe { (*operands, *operands.add(1), slot.get()) };
+    let this_slot = unsafe { operands.add(2) };
+    // The actual arguments while the object is not made: the frame's, or the VM's Array's.
+    let lazy_list = matches!(&(list).view(), ValueView::Obj(object)
+        if matches!(object.borrow().kind, crate::value::ObjectKind::Array));
+    let snapshot = if lazy_list {
+        Some(crate::builtins::dense_array_snapshot(i, &list).unwrap_or_default())
+    } else {
+        None
+    };
+    let actual: Option<&[Value]> = if list.is_undefined() {
+        debug_assert!(
+            frame.is_some(),
+            "an elided list outside a fresh native frame"
+        );
+        Some(frame.unwrap_or(&[]))
+    } else {
+        snapshot.as_deref()
+    };
+    if let Some(actual) = actual.filter(|_| {
+        !chunk.feedback.detailed_enabled() && is_builtin_apply(&apply) && f.is_callable()
+    }) {
+        #[cfg(test)]
+        TEST_APPLY_FORM_HITS.with(|count| count.set(count.get() + 1));
+        // A mapped body's mapped indices below the count read their formals (Decision 20f).
+        let mapped = chunk.mapped_formals.len().min(actual.len());
+        let read: Option<Vec<Value>> =
+            (0..mapped)
+                .any(|k| chunk.mapped_formals[k].is_some())
+                .then(|| {
+                    let mut values = actual.to_vec();
+                    for (k, value) in values.iter_mut().enumerate().take(mapped) {
+                        if let Some(formal) = mapped_formal_value(chunk, activation, k) {
+                            *value = formal;
+                        }
+                    }
+                    values
+                });
+        let args = read.as_deref().unwrap_or(actual);
+        // A copy lives in Rust memory: a root for the call. The frame's words are the caller's,
+        // which it roots (`frame_arguments`), and need none.
+        let _root =
+            (read.is_some() || snapshot.is_some()).then(|| crate::rooting::root_slice(args));
+        // `apply`'s own call level, as the builtin's call through Interp::call counts it and grows
+        // the stack at it, so that the depth, its stack checks and segments stay what they were
+        // with the object.
+        i.depth += 1;
+        if crate::interpreter::execution_stack_exhausted(i.depth) {
+            i.depth -= 1;
+            return Err(i.throw("RangeError", "Maximum call stack size exceeded"));
+        }
+        let result = crate::interpreter::with_execution_stack(i.depth, || {
+            if let Some(c) = cache {
+                let site = &chunk.call_caches[c as usize];
+                let mut result =
+                    unsafe { i.call_jit_cached(site, &f, this_slot, args.as_ptr(), args.len()) };
+                if result.is_none() {
+                    result = unsafe {
+                        i.call_jit_fast(
+                            &f,
+                            this_slot,
+                            args.as_ptr(),
+                            args.len(),
+                            Some((site, &chunk.call_pins)),
+                        )
+                    };
+                }
+                if let Some(result) = result {
+                    return result;
+                }
+            }
+            i.call(f, unsafe { *this_slot }, args)
+        });
+        i.depth -= 1;
+        return result;
+    }
+    #[cfg(test)]
+    TEST_APPLY_FORM_MISSES.with(|count| count.set(count.get() + 1));
+    let object = match actual {
+        // The exact object this body would have made, with its actual arguments (a mapped
+        // body's maps its activation's formals).
+        Some(actual) => {
+            let scope = materialization_scope(i, chunk, activation);
+            let object = Value::Obj(i.make_compiled_arguments_object(actual, &scope));
+            slot.set(object);
+            object
+        }
+        None => list,
+    };
+    let args = [unsafe { *this_slot }, object];
+    let result = if chunk.feedback.detailed_enabled() {
+        call_profiled(i, chunk, pc, apply, f, &args)
+    } else {
+        i.call(apply, f, &args)
+    };
+    result.map_err(|error| name_call_error(i, chunk, pc, &apply, false, error))
 }
 
 /// `rest[key]` ([`Op::RestElem`]) in a fresh native frame whose rest Array is elided (Decision
@@ -21452,6 +21702,27 @@ fn run_vm_inner(
                 stack.truncate(at - 2);
                 stack.push(v);
             }
+            Op::CallApplyFrameArgs(s, cache) => {
+                // [f, apply, t, list]: the VM's entries keep the actual arguments in the slot's
+                // plain Array, which the LoadLocal before pushed.
+                let at = stack.len() - 4;
+                let v = explicit_call(i, chunk.call_position(cache), |i| {
+                    stack.with_tail(at, |operands| unsafe {
+                        call_apply_frame_args(
+                            i,
+                            chunk,
+                            op_pc,
+                            &slots[s as usize],
+                            cap_env,
+                            None,
+                            operands.as_ptr(),
+                            None,
+                        )
+                    })
+                })?;
+                stack.truncate(at);
+                stack.push(v);
+            }
             Op::New(argc, cache) => {
                 let at = stack.len() - argc as usize;
                 let callee = stack.read_value(at - 1);
@@ -24854,7 +25125,12 @@ impl Chunk {
         u32,
     )> {
         let plan = self.arguments_forwarder.get_or_init(|| {
-            let [Op::GetPropThis(initializer, initializer_cache), Op::GetMethod(apply, apply_cache), Op::LoadThis, Op::LoadLocal(arguments), Op::CallWithThis(2, call_cache), Op::Pop, Op::ReturnUndef] =
+            if forwarder_disabled() {
+                return None;
+            }
+            // The apply form's rewritten call (`lazy_arguments_rewrite`), or the plain one where
+            // the form is off.
+            let [Op::GetPropThis(initializer, initializer_cache), Op::GetMethod(apply, apply_cache), Op::LoadThis, Op::LoadLocal(arguments), Op::CallWithThis(2, call_cache) | Op::CallApplyFrameArgs(_, call_cache), Op::Pop, Op::ReturnUndef] =
                 self.ops.as_slice()
             else {
                 return None;
@@ -26032,6 +26308,7 @@ pub(crate) fn stack_effect(
         Op::Call(argc, _) => (*argc as usize + 1, 1),
         Op::LoadNameForCall(..) | Op::LoadNameForCallIn(..) => (0, 2),
         Op::CallWithThis(argc, _) => (*argc as usize + 2, 1),
+        Op::CallApplyFrameArgs(..) => (4, 1),
         Op::New(argc, _) => (*argc as usize + 1, 1),
         Op::NewArgsArray => (2, 1),
         Op::MakeRegExp(..) => (0, 1),
@@ -31224,7 +31501,8 @@ fn helper_call_position<const PUBLISHED: bool>(i: &Interp, chunk: &Chunk, pc: us
 pub(crate) fn makes_plain_calls_only(chunk: &Chunk) -> bool {
     chunk.inline_sites.is_empty()
         && chunk.ops.iter().all(|op| {
-            !(makes_explicit_call(op) || matches!(op, Op::TailCall(..)))
+            !(makes_explicit_call(op)
+                || matches!(op, Op::TailCall(..) | Op::CallApplyFrameArgs(..)))
                 || matches!(op, Op::Call(..) | Op::CallWithThis(..) | Op::New(..))
         })
 }
@@ -32336,6 +32614,33 @@ unsafe fn jit_exec_inner(
                 name_call_error(i, chunk, pc as usize, &method, false, error)
             })?;
             *sp = jit_consume(*sp, argc + 2);
+            push!(v);
+        }
+        // Undefined in the slot: a fresh frame elided the object, and its actual arguments are
+        // the frame's (Decision 20e); else the Array a VM entry made (a borrowed frame, an exit's
+        // rebuilt frame) or the object a read materialized.
+        Op::CallApplyFrameArgs(s, c) => {
+            let operands = sp.sub(4);
+            let frame = slots[s as usize]
+                .get()
+                .is_undefined()
+                .then(|| frame_arguments(ctx));
+            // Its own explicit call's position (the operation is in no shared dispatch list:
+            // `makes_explicit_call` and `call_op_position` stay as they were, as do the helpers'
+            // paths through them; its position is its cache's, the CallWithThis's it replaced).
+            let v = explicit_call(i, chunk.call_position(c), |i| {
+                call_apply_frame_args(
+                    i,
+                    chunk,
+                    pc as usize,
+                    &slots[s as usize],
+                    cap_env,
+                    frame,
+                    operands,
+                    Some(c),
+                )
+            })?;
+            *sp = jit_consume(*sp, 4);
             push!(v);
         }
         Op::New(argc, cache) => {

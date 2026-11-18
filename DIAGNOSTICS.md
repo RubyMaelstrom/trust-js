@@ -635,6 +635,14 @@ comment/example in the same change.
   `pop` out of ARM64 call sites, and `TRUST_JS_JIT_NO_FUNCTION_CALL_INTRINSIC=1` that of
   `Function.prototype.call` (sites of one to eight arguments): those calls then take the call-hit
   form, as other natives do. The template JIT and the optimizing tier's code both read them.
+- `TRUST_JS_JIT_NO_APPLY_FORM=1` turns off the apply form: a body whose only uses of `arguments`
+  besides `arguments.length` and `arguments[k]` are `<f>.apply(<t>, arguments)` then makes its
+  arguments object at entry and calls `apply` with it, where the form calls `f` with the actual
+  arguments and makes none (`Op::CallApplyFrameArgs`). `TRUST_JS_JIT_NO_FORWARDER=1` turns off
+  the recognized forwarding constructor `this.<init>.apply(this, arguments)` of part A2
+  (`Chunk::jit_arguments_apply_forwarder` recognizes none): its Rust forwarder and the direct
+  construct sequence's forward form, which only an entry the forwarder filled reaches. Both are
+  read once, at every tier; with both set, such a body runs the general path alone.
 - `TRUST_JS_JIT_NO_PROP_CHAIN=1` builds no ARM64 numeric register chain with a property read or
   store, as a chunk recompiled after its chains bailed has none (see
   `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE`); `TRUST_JS_JIT_NO_PROP_STORE_CHAIN=1` keeps the reads and

@@ -278,7 +278,7 @@ interning nothing: its shapes are the process's shape ids, its targets the proce
 - Named (named loads and stores): each filled way, most recent first (receiver and holder shapes,
   depth, slot, slot location, kind: data, key-checked, accessor, absent or creation), and the
   generic mark; NamedUpdate (UpdateProp) adds the value record's view.
-- Call (Call, CallWithThis, CallSpread, CallSpreadThis): the state (empty, monomorphic,
+- Call (Call, CallWithThis, CallApplyFrameArgs (5.10), CallSpread, CallSpreadThis): the state (empty, monomorphic,
   polymorphic, megamorphic) and each way's target: the callee's cell, its function literal (the
   FeedbackCell's role: closures of one literal share it), a native's builtin id and entry, the
   callee's realm, and whether the entry was filled in the current call-cache epoch.
@@ -462,3 +462,30 @@ before). A fill of the site's entry drops both pins with the entry it empties. A
 proves the initializer and `apply` by reading each from its slot and comparing identities, as a
 call cache proves its callee. The instance the forward form makes is rooted by the initializer's activation record (its
 `this` word) and the sequence's save area on the native stack, from the helper's return on.
+
+5.10 The apply form's call record (P3 stage 3, steps 6-7). `<f>.apply(<t>, arguments)` in a body
+whose arguments object the rule elides (bytecode::lazy_arguments_rewrite) is
+CallApplyFrameArgs(slot, c), whose call cache c is the CallWithThis(2)'s it replaced, at the
+same pc and position. What the record means there: its ways are the forwarded callee `f`, as a
+plain call's ways are its callee, filled by the call the operation makes when `apply` is
+%Function.prototype.apply%, `f` is callable and the object was not made (the generic helper,
+jit_exec's arm, calls through Interp::call_jit_cached and call_jit_fast with the site); never
+`apply` itself, which the operation tests by its native's address (bytecode::is_builtin_apply)
+at every run, the site's own one-compare condition. A run that takes the object's path (a
+replaced or shadowed `apply`, a non-callable `f`, an object a read materialized) calls `apply`
+through Interp::call and fills no way. The VM's arm fills none either (its CallWithThis fills
+none). Who reads it: the second stage's seeds (call_cache_seeds) and the tier's builder, which
+today builds the operation as its template's canonical-frame effect and reads no way of it; a
+lowering of the operation (a call of `f` with the frame's actual arguments, V8's and JSC's
+CallForwardVarargs) is the reader the record is kept for. Exact: the ways as for a plain call.
+The rule for every reader: at this operation a way is the forwarded callee `f`, never the call's
+callee operand (which is `apply`). So no splice is planned at the site (bytecode::
+spread_call_sites lists it with the spread calls, plan_inlines skips it, and the tier's oracle,
+which takes the splice planner's decisions and maps only Call and CallWithThis to calls, plans
+nothing there at either inline mode), and the site seeds no second stage (call_cache_seeds takes
+Call and CallWithThis only): a second stage whose rewrite declined there would read `f` as its
+CallWithThis(2)'s callee. The templates' call probes, fills and direct-call gates (jit_call_inner,
+jit_call_hit_inner, emit_call_inline) run at Call and CallWithThis only; the readers that take
+every site alike (the epoch, pins, tracing, memory scans, the settled-feedback fingerprint, the
+frozen view's and the read API's copies, the census dump) see a user function's way as at any
+call.

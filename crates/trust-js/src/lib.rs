@@ -2012,6 +2012,8 @@ impl Engine {
 }
 
 #[cfg(test)]
+mod apply_form_tests;
+#[cfg(test)]
 mod call_apply_forward_tests;
 #[cfg(test)]
 mod call_error_name_tests;
