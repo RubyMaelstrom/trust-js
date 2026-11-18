@@ -646,6 +646,7 @@ fn monomorphic_loads_check_the_shape_and_load_the_field() {
         NodeOp::CheckShape {
             shapes: vec![way.receiver_shape],
             ways: 1,
+            object: false,
         },
         "{text}"
     );
@@ -5921,3 +5922,7 @@ mod create;
 /// P3 stage 3 step L3: named updates and a String's length.
 #[path = "update_tests.rs"]
 mod update;
+
+/// P3 stage 3 (c-tag): the value fact that a word is an object's, and the checks that take it.
+#[path = "object_fact_tests.rs"]
+mod object_fact;

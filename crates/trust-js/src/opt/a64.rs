@@ -2482,7 +2482,11 @@ impl Gen<'_> {
                 self.a.ubfx(dst, word, 0, 48);
                 self.gp_done(n, dst);
             }
-            NodeOp::CheckShape { shapes, ways } => {
+            NodeOp::CheckShape {
+                shapes,
+                ways,
+                object,
+            } => {
                 let site = self.check_exit(n)?;
                 // For the log: what a WrongShape exit expected, and where its receiver is.
                 let pc = graph.state(node.state.expect("checked")).pc;
@@ -2496,10 +2500,14 @@ impl Gen<'_> {
                     }));
                 }
                 let word = self.gp(input(0), X16);
-                let t = if word == X16 { X17 } else { X16 };
-                self.a.asr_imm(t, word, 48);
-                self.a.cmn_imm_x(t, 7);
-                self.a.b_cond(NE, site);
+                // A word proven an object's (`object`) has its cell taken again with no tag test,
+                // as Maglev's CheckMaps with kOmitHeapObjectCheck (maglev-ir.cc:2631-2632).
+                if !*object {
+                    let t = if word == X16 { X17 } else { X16 };
+                    self.a.asr_imm(t, word, 48);
+                    self.a.cmn_imm_x(t, 7);
+                    self.a.b_cond(NE, site);
+                }
                 let cell = self.gp_dst(n);
                 self.a.ubfx(cell, word, 0, 48);
                 // As the baseline's property templates test a receiver (`emit_prop_way_probe`):

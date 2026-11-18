@@ -618,6 +618,7 @@ fn getx(chunk: &Chunk) -> Graph {
         NodeOp::CheckShape {
             shapes: vec![way.recv_shape],
             ways: 1,
+            object: false,
         },
         &[o],
         Rep::Cell,
@@ -691,6 +692,7 @@ fn setx(chunk: &Chunk) -> Graph {
         NodeOp::CheckShape {
             shapes: vec![way.recv_shape],
             ways: 1,
+            object: false,
         },
         &[o],
         Rep::Cell,
@@ -946,6 +948,7 @@ fn keep(chunk: &Chunk) -> Graph {
         NodeOp::CheckShape {
             shapes: vec![way.recv_shape],
             ways: 1,
+            object: false,
         },
         &[o],
         Rep::Cell,
@@ -2720,6 +2723,7 @@ fn shape_test_graph(admit: &[u32], chain: &[u32], then_next: bool, named: bool) 
         NodeOp::CheckShape {
             shapes: admit.to_vec(),
             ways: admit.len() as u8,
+            object: false,
         },
         &[o],
         Rep::Cell,
@@ -5590,6 +5594,71 @@ fn the_checks_read_the_objects_bytes_at_the_folded_offsets() {
         assert_eq!(eval(&mut engine, call), expected, "{call}");
     }
     assert!(exits().is_empty());
+}
+
+/// P3 stage 3 (c-tag): a shape check of a word proven an object's (`CheckShape::object`) emits no
+/// tag test (asr #48 of the word): each function's graph compiled as built and with every check's
+/// `object` cleared differs by one asr #48 for each check that omits it, and the builder made at
+/// least one such check in each (the read after a call, after a join both arms proved, after an
+/// element read's CheckObject, in a loop whose entry proved the word). Results: the run tests
+/// (object_fact_run_tests).
+#[test]
+fn a_check_of_a_proven_object_emits_no_tag_test() {
+    let source = "function P() { this.x = 1; this.y = 2; this.z = 3; }
+         function g() {}
+         function around(o, g) { var a = o.x; g(); return a + o.y; }
+         function el(o, g) { var s = o[0]; g(); return s + o.x; }
+         function join(o, c, g) { var a; if (c) a = o.x; else a = o.y; g(); return a + o.z; }
+         function before(o, n, g) {
+           var s = o.x; for (var i = 0; i < n; i++) { g(); s += o.y; } return s;
+         }
+         var p = new P(), q = new P(), e = {x: 1}; e[0] = 5;
+         for (var k = 0; k < 30; k++) {
+           around(p, g); el(e, g); join(p, k & 1, g); before(p, 3, g);
+         }";
+    crate::opt::TestSwitches {
+        on: false,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    eval(&mut engine, source);
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let asr48 = encode(|a| a.asr_imm(16, 0, 48));
+    let registers = !(31 << 5 | 31);
+    for name in ["around", "el", "join", "before"] {
+        let chunk = chunk_of(&mut engine, name);
+        let snapshot = crate::opt::snapshot::Snapshot::take_in(&chunk, Some(&engine.interp));
+        let built = crate::opt::build::build(&chunk, &snapshot).expect("the tier builds it");
+        let omitting = built
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| matches!(n.op, NodeOp::CheckShape { object: true, .. }))
+            .count();
+        assert!(omitting >= 1, "{name}: a check that omits its tag test");
+        let mut testing = built.graph.clone();
+        for node in &mut testing.nodes {
+            if let NodeOp::CheckShape { object, .. } = &mut node.op {
+                *object = false;
+            }
+        }
+        let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
+        let tags = |graph: &Graph| {
+            let code = compile_graph(&chunk, graph, &layout, &ilayout, Options::default())
+                .unwrap_or_else(|refusal| panic!("the tier refused {name}: {refusal:?}"));
+            code_words(&code)
+                .iter()
+                .filter(|&&w| w & registers == asr48 & registers)
+                .count()
+        };
+        assert_eq!(
+            tags(&testing) - tags(&built.graph),
+            omitting,
+            "{name}: one tag test fewer for each check that omits it"
+        );
+    }
 }
 
 /// The poison switch before a canonical-frame effect (P3 stage 3 step 3a's follow-up): a function

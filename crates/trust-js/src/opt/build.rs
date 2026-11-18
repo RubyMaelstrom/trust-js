@@ -1722,6 +1722,15 @@ struct Forms {
     i32: Option<NodeIx>,
     boolean: Option<NodeIx>,
     cell: Option<NodeIx>,
+    /// The value is proven an object's (P3 stage 3, c-tag): a CheckObject or CheckShape of its
+    /// word passed, which every cell form implies (`Builder::forms`). A value fact, since a
+    /// value's tag never changes: no effect ends it, and a join keeps it where every predecessor
+    /// holds it, though their cells differ (`meet`), as Maglev's NodeInfo type survives side
+    /// effects (NodeInfo::OnSideEffect stales maps alone, maglev-known-node-aspects.h:281-283)
+    /// and merges paths' types (MergeTypeAndMaps, :247-252), and JSC's abstract value keeps
+    /// SpecCell through a clobber (AbstractValue::clobberStructures, dfg/DFGAbstractValue.h:
+    /// 96-106). A check of a word so proven tests no tag (`NodeOp::CheckShape::object`).
+    object: bool,
 }
 
 impl Forms {
@@ -1732,6 +1741,7 @@ impl Forms {
             i32: self.i32.or(other.i32),
             boolean: self.boolean.or(other.boolean),
             cell: self.cell.or(other.cell),
+            object: self.object || other.object,
         }
     }
 
@@ -1744,6 +1754,7 @@ impl Forms {
             i32: same(self.i32, other.i32),
             boolean: same(self.boolean, other.boolean),
             cell: same(self.cell, other.cell),
+            object: self.object && other.object,
         }
     }
 
@@ -1761,7 +1772,7 @@ struct State {
     stack: Vec<NodeIx>,
     /// The handler records active (push pc, operand depth at the push), innermost last.
     handlers: Vec<(u32, u32)>,
-    /// Each value's other forms (see [`Forms`]).
+    /// Each value's other forms (see [`Forms`]), and whether it is proven an object's.
     forms: FastMap<NodeIx, Forms>,
     /// ToBoolean of a value.
     truth: FastMap<NodeIx, NodeIx>,
@@ -2543,6 +2554,8 @@ impl<'a> Builder<'a> {
             // An environment is no language value (stage 2, step 4).
             Rep::Env | Rep::None => {}
         }
+        // A cell form is an object's (CheckObject's, CheckShape's).
+        forms.object |= forms.cell.is_some();
         forms
     }
 
@@ -2831,11 +2844,15 @@ impl<'a> Builder<'a> {
             });
         }
         let checked = checked.to_vec();
+        // A word proven an object's (the value fact `Forms::object`) is checked without its tag
+        // test (`NodeOp::CheckShape::object`).
+        let object = self.forms(st, word).object;
         let state = self.before(cx, st);
         let cell = self.add_exit(
             NodeOp::CheckShape {
                 shapes: checked.clone(),
                 ways: ways_of(shapes),
+                object,
             },
             &[word],
             Rep::Cell,
@@ -2847,6 +2864,7 @@ impl<'a> Builder<'a> {
         // proved its shape, whatever an earlier epoch checked.
         let mut forms = self.forms(st, word);
         forms.cell = Some(cell);
+        forms.object = true;
         for member in forms.members() {
             st.forms.insert(member, forms);
         }

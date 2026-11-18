@@ -4459,6 +4459,7 @@ fn a_reads_arms_and_check_keep_the_shapes_its_receivers_facts_allow() {
     let NodeOp::CheckShape {
         shapes,
         ways: count,
+        ..
     } = &graph.node(check).op
     else {
         unreachable!()

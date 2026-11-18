@@ -106,6 +106,7 @@ fn a_constructors_creations_are_its_receivers_checks_once_and_its_stores() {
         NodeOp::CheckShape {
             shapes: vec![first[0].receiver_shape],
             ways: 1,
+            object: false,
         },
         "{text}"
     );

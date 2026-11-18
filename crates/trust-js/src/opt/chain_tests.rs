@@ -65,6 +65,7 @@ fn a_method_on_the_prototype_is_its_receivers_check_the_holders_and_its_field() 
         NodeOp::CheckShape {
             shapes: vec![way.receiver_shape],
             ways: 1,
+            object: false,
         },
         "{text}"
     );

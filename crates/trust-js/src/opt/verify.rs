@@ -15,6 +15,8 @@
 //!   depth at the pc, handler records the chunk pushes at their depth, and values of a
 //!   representation an exit can box, available at the node that exits; a slot a state marks
 //!   Dead is dead at its pc (`opt::liveness`, checked in tests and debug builds);
+//! - a CheckShape that tests no tag (`object`) takes a word that a CheckObject or CheckShape of it
+//!   proved an object's on every path to it (`proven_objects`; P3 stage 3, c-tag);
 //! - an address (Rep::Ptr) is never a phi's or a frame state's value, so no block edge or exit
 //!   recipe carries one; the signatures let only element nodes take one;
 //! - a loop's entry speculation (stage 2 step 6), CheckNumber [PhiNotNumber] or CheckInt32
@@ -244,6 +246,7 @@ pub(crate) fn verify_frames(
             }
         }
     }
+    proven_objects(graph, &dom)?;
     // The builder's liveness again, where its cost is a test's or a debug build's: each frame's
     // chunk's.
     let liveness: Vec<Option<SlotLiveness>> = chunks
@@ -523,6 +526,107 @@ impl Dominators {
         }
         a == b
     }
+}
+
+/// The word a node proves an object's where it passes: a CheckObject's or a CheckShape's (each
+/// tests the object tag, or takes a word proven so).
+fn proved_object(node: &Node) -> Option<NodeIx> {
+    match node.op {
+        NodeOp::CheckObject | NodeOp::CheckShape { .. } => node.inputs.first().copied(),
+        _ => None,
+    }
+}
+
+/// The proven-object rule (P3 stage 3, c-tag): a CheckShape that tests no tag (`object`) takes a
+/// word that a check proved an object's on every path to it (`proved_object`), earlier in its
+/// block or on every path into the block, the builder's `Forms::object`: a must-dataflow over the
+/// blocks in reverse postorder, a loop's back edge included, each block's facts at its entry the
+/// intersection of its predecessors' at their ends (none at the entry block).
+fn proven_objects(graph: &Graph, dom: &Dominators) -> Result<(), String> {
+    let omits = |node: &Node| matches!(node.op, NodeOp::CheckShape { object: true, .. });
+    if !graph.nodes.iter().any(omits) {
+        return Ok(());
+    }
+    // The words some check proves, numbered, and each block's proofs as bits of them.
+    let mut number = crate::fasthash::FastMap::<NodeIx, usize>::default();
+    for node in &graph.nodes {
+        if let Some(word) = proved_object(node) {
+            let next = number.len();
+            number.entry(word).or_insert(next);
+        }
+    }
+    let width = number.len().div_ceil(64);
+    let bit = |word: NodeIx| number.get(&word).map(|&k| (k / 64, 1u64 << (k % 64)));
+    let gen: Vec<Vec<u64>> = graph
+        .blocks
+        .iter()
+        .map(|block| {
+            let mut bits = vec![0u64; width];
+            for &n in &block.body {
+                if let Some((w, b)) = proved_object(graph.node(n)).and_then(bit) {
+                    bits[w] |= b;
+                }
+            }
+            bits
+        })
+        .collect();
+    let entry = graph.entry.expect("checked");
+    let mut rpo: Vec<BlockIx> = (0..graph.blocks.len() as u32).map(BlockIx).collect();
+    rpo.sort_by_key(|b| dom.order[b.index()]);
+    // At each block's end: optimistic (every word) before the pass reaches it.
+    let mut out: Vec<Vec<u64>> = vec![vec![u64::MAX; width]; graph.blocks.len()];
+    let in_of = |b: BlockIx, out: &[Vec<u64>]| -> Vec<u64> {
+        if b == entry {
+            return vec![0; width];
+        }
+        let mut bits = vec![u64::MAX; width];
+        for pred in &graph.block(b).preds {
+            for (x, y) in bits.iter_mut().zip(&out[pred.index()]) {
+                *x &= y;
+            }
+        }
+        bits
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in &rpo {
+            let mut bits = in_of(b, &out);
+            for (x, y) in bits.iter_mut().zip(&gen[b.index()]) {
+                *x |= y;
+            }
+            if bits != out[b.index()] {
+                out[b.index()] = bits;
+                changed = true;
+            }
+        }
+    }
+    for &b in &rpo {
+        let mut bits = in_of(b, &out);
+        for &n in &graph.block(b).body {
+            let node = graph.node(n);
+            if omits(node) {
+                let proven = node
+                    .inputs
+                    .first()
+                    .and_then(|&word| bit(word))
+                    .is_some_and(|(w, b)| bits[w] & b != 0);
+                if !proven {
+                    return Err(format!(
+                        "node {} ({:?} at pc {}): a CheckShape without its tag test on a word no \
+                         check proved an object's on every path",
+                        n.index(),
+                        node.op,
+                        node.pc
+                    ));
+                }
+            }
+            if let Some((w, b)) = proved_object(node).and_then(bit) {
+                bits[w] |= b;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Whether a node is a loop's entry speculation (its reason says so).
@@ -905,9 +1009,9 @@ fn representations(
         {
             Err(format!("slot {slot} of {n_slots}"))
         }
-        NodeOp::CheckShape { ref shapes, ways }
-            if shapes.is_empty() || shapes.len() > usize::from(ways) || ways > 4 =>
-        {
+        NodeOp::CheckShape {
+            ref shapes, ways, ..
+        } if shapes.is_empty() || shapes.len() > usize::from(ways) || ways > 4 => {
             Err(format!("{} shapes of {ways} ways", shapes.len()))
         }
         NodeOp::ShapeIs(ref shapes) if shapes.is_empty() || shapes.len() > 4 => {

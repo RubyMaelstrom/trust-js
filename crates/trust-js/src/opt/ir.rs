@@ -420,9 +420,17 @@ pub(crate) enum NodeOp {
     /// access's receiver shapes, which its exit keeps in the exit profile, where `shapes` may be
     /// fewer: those of them the receiver's facts allow (P3 stage 3 step 3f, rule K), so that the
     /// flag's data says what the site's ways were, not what the check narrowed them to.
+    /// `object`: the word is proven an object's on every path to the check (the builder's value
+    /// fact `Forms::object`: a CheckObject or CheckShape of the word passed, which no effect
+    /// ends, since a value's tag never changes), so the check tests no tag and takes the cell
+    /// from the word again (P3 stage 3, c-tag), as Maglev's CheckMaps omits its Smi test where the
+    /// node's type is known a heap object (CheckType::kOmitHeapObjectCheck, GetCheckType,
+    /// maglev-reducer.h:785-791; maglev-ir.cc:2631-2632) and JSC's CheckStructure tests no cell
+    /// where the abstract value proves one (fillSpeculateCell, DFGSpeculativeJIT64.cpp:1491-1550).
     CheckShape {
         shapes: Vec<u32>,
         ways: u8,
+        object: bool,
     },
     /// Cell -> Cell: the input object's [[Prototype]] (its `proto` field, which no shape
     /// implies), where it is an object of an ordinary kind with IC_PLAIN set and one of
