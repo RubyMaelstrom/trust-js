@@ -6231,3 +6231,89 @@ planned way of a call site is built from the first compile.
   the one measured in comment lines and the assertion: its release binary differs from the
   measured one in twenty bytes, the line numbers of the file's panic locations.
 - Left open: GBEMU's exits above; the compile thread's comparison at 200 runs was not rerun.
+
+Steps 6 and 7 since part A2 (2026-11-18; target/p3/stage3/step67-impl: report-ool.txt with its
+section 8, pin/, report-apply.txt, design-note-apply.txt): the site entry's move out of line is
+parked, a defect of part A2 is fixed, and the apply form is counted and designed.
+- The forward entry out of line: parked, not landed (branch p3-s3-step67, 97c82028). Part A2
+  put its 168-byte forward entry in line in every construct site. The commit moves it to a
+  record a site points to and returns the forwarder's two instructions by passing the record's
+  address tagged to the helper: the forwarder's construction 882.90 -> 881.90 instructions
+  with the tier off and 746.78 -> 745.78 with it on, an ordinary helper construction +10, the
+  memory 168 bytes a `new` site back (169 KB on TypeScript by count). I had decided it lands.
+  Its cycles decide otherwise: RayTrace at 200 runs, five alternating rounds on one X925 core,
+  +0.71% with the tier off, +2.09% at the default and +2.38% at graph against c2b91010
+  (spreads 0.2% to 0.4%; the commit before the two-instruction fix +0.57%, +1.63%, +1.70%),
+  and by the means of 8 runs a side at randomized addresses +2.08% at graph (a run's
+  deviation 0.2% to 0.5%), while its instructions fall 0.04% to 0.20%. The counters say where
+  (three runs a side at graph): cycles +70.7M, branch mispredictions -0.4%, first-level data
+  cache refills -8.4%, back-end stall cycles +102.9M (+16%) of which memory stalls +1.8M: a
+  longer chain of dependent loads that hit the cache. The forward form now loads the site's
+  word and then the record where it read a fixed offset of the site; 13.3M constructions at
+  about five cycles a load-to-use step is 67M (the agent's arithmetic; no precise sampling).
+  Two per cent of the benchmark the entry exists for is not worth 0.08% of its memory. The
+  layout is settled when part A2's standing is measured again: the fields the form reads
+  first in line, the rest out of line, is the form to try then.
+  The rule this adds to the method: instruction counts did not show this cost. A change that
+  moves where data lives is measured in cycles as well, before the decision and not after it.
+- A defect of part A2, fixed (5636b4f9; found by reading, the question was the previous
+  agent's). The forward entry proves `apply` by comparing the live slot's value with the
+  address it recorded and held no pin for it. Nothing but Function.prototype's property holds
+  %Function.prototype.apply% (no Realm intrinsic; the natives' realm table holds it weakly),
+  and a swept cell's address is reused: a program that replaced Function.prototype.apply let
+  it die, and a later object at its address, stored in the slot, would pass the comparison, so
+  that the forward form skipped a call of that object. No failing program was written for the
+  old code; the fix's test shows the address reserved. The site's pin cell now holds a third
+  weak pin, apply's, beside the constructor's and the initializer's: set by the forward fill,
+  dropped by a fill of the site. No generated code reads the cell, so the entry keeps its
+  layout: template code at the default identical in 3,582 of 3,582 compiles and with the tier
+  off in every deterministic run; the six construct rows equal or 1.1 instructions lower. The
+  cell grows from 24 to 32 bytes a `new` site. RayTrace at 200 runs in cycles against the main
+  before: +0.04% with the tier off, +0.24% at the default, +0.25% at graph (spreads 0.02% to
+  0.15%), with +0.06% instructions at graph alone (confirmed at randomized addresses), in
+  functions the commit does not change; the agent infers the build's inlining and has not
+  verified it. Landed as a correctness fix with that row open. Tests: the new one (the entry
+  and its three pins before the form first reads them; the dead apply's address still
+  allocated after three major collections; a fill drops the pins), also under GC stress; two
+  mutations caught; zombie's check, clippy and Windows' check. Mine on the landed tree:
+  clippy with tests clean, and the 22 call-feedback and constructor-transfer tests, the new
+  one among them, pass with the tier off, with it on and under GC stress.
+- The apply form, the count (report-apply.txt; a probe build, every Octane benchmark at 5 and
+  200 runs and the fixtures, the tier off and at graph alike). Functions whose only use of
+  `arguments` is `<f>.apply(<t>, arguments)`: Box2D has 34, which at 200 runs make 4,329,249
+  arguments objects in constructions and 186,176 in plain calls and apply them 7,959,885
+  times; RayTrace's one is part A2's forwarder, 13.3M constructions that make no object;
+  TypeScript makes 1,192; no other workload makes an arguments object in compiled code but
+  Earley-Boyer, whose use is another shape. What one costs (fat LTO, instructions a call, the
+  tier off / at graph): through `target.apply(this, arguments)` 5,894 / 5,791, a direct call
+  256 / 55, `apply` of an Array literal 1,968 / 1,834, `target.call` 1,610 / 1,465. The
+  object is a mapped one (a sloppy function with simple parameters) and the call template's
+  forwarded path takes only unmapped objects and Arrays, so it runs the builtin. The bound,
+  inferred from these products: about 5% of Box2D's instructions with the tier off and 11% at
+  graph at 200 runs.
+- The apply form, the design, approved by me under the owner's approval of the form
+  (design-note-apply.txt). The rule extends the compiler's existing lazy-arguments rewrite to
+  a slot whose only other use is the last argument of a method call of `apply`; a sloppy
+  function with simple parameters qualifies only where no parameter is written or captured
+  (V8's condition for mapped arguments, js-call-reducer.cc:4891-4900, decided here on the
+  bytecode). One new operation, CallApplyFrameArgs: where `apply` is the builtin it calls
+  the callee with the frame's actual arguments; otherwise it makes the object and takes
+  today's path. The template reaches it through the intrinsic helper, with no new helper
+  slot. Every exemplar removes the object in its optimizing tier only (V8 above; JSC's
+  DFGVarargsForwardingPhase.cpp:46-389; SpiderMonkey's ScalarReplacement.cpp:1900-2406), and
+  their first tiers make it; this is a departure, on the owner's word that every tier's cost
+  counts, and it hands the tier the forwarded call those passes build for themselves. Not
+  built: SpiderMonkey's baseline form (the object kept, read without the generic apply,
+  CacheIR.cpp:13009-13016), which has no counted reach beyond the same functions.
+  My conditions, each to be answered and tested: `w.arguments` read by reflection gives a
+  fresh object of the actual arguments, as V8 builds one on every read (builtins/
+  accessors.cc:429-461), never null where today it gives an object, and the form never reads
+  one back; which root holds the frame's argument words until the late read, for every kind
+  of caller, under GC stress; every other way to `arguments` or a parameter (eval, `with`, an
+  arrow function, a parameter named `arguments`) declined or shown safe; the site's cache
+  records the forwarded callee so that the tier's plan applies to it, written into the
+  feedback schema; what the tier does with these functions today and after (it declines the
+  new operation until step 9), measured; which construct path Box2D's two forms take
+  afterwards, where the report and the note disagree; part A2's recognizer against the
+  rewrite; x86-64's template compiler handles the operation; Error.stack, `caller` and the
+  call depth as today's. Code follows A1.
