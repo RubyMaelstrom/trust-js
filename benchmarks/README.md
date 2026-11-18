@@ -90,6 +90,12 @@ Time
 - With the optimizing tier on, the engine has a compile thread. Give the engine and
   every reference (Node and its tier-limited modes) the same CPUs, and count the tier's
   main-thread compile work beside the run time.
+- Instruction counts do not show what a memory layout costs. A change that moves where
+  data lives (a field out of line behind a pointer, a record split or merged, a table
+  relocated) is measured in cycles before it is decided, with the counters that say
+  where the cycles went (`branch-misses`, `L1-dcache-load-misses`, the back-end stall
+  events). Moving a call site's 168-byte entry out of line saved instructions and cost
+  RayTrace 2% in cycles: one more dependent load on each construction.
 
 Memory
 

@@ -288,8 +288,9 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
 - A SECOND KNOWN DEFECT, in part A2 as main has it: a forwarding constructor's site entry
   compares %Function.prototype.apply% by address and holds no pin for it, and that function
   can be collected once a program replaces it, so a later object at its address would pass
-  the comparison. Found by reading, no failing program is known; a weak pin and its test are
-  being prepared as a small commit (the construct line, target/p3/stage3/step67-impl).
+  the comparison. Found by reading, no failing program is known. FIXED on local main
+  (5636b4f9: a weak pin of apply in the site's pin cell, with its test); origin does not have
+  it until the next push.
 - Piece D of step 3f landed on local main (9e525fea, with its record in the plan): at graph
   every planned way of a call site is built from the first compile. Local main is ahead of
   origin from here on until the owner asks for a push.
@@ -297,6 +298,9 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   p3-s3-step67, report-ool.txt): it saves 168 bytes a `new` site and instructions, and costs
   RayTrace about 2% in cycles with the tier on. The entry's layout is settled when part A2's
   standing is measured again.
+- The apply form is counted and designed (the plan's record "Steps 6 and 7 since part A2"):
+  Box2D alone has reach, about 5% of its instructions with the tier off and 11% at graph by
+  the count; the design is approved with conditions listed there; its code follows A1.
 - The measuring rule that the day's two wrong readings produced is in benchmarks/README.md:
   fixed-address counts of two binaries are one draw of each binary's layout; split a peak-RSS
   difference into anonymous and file-backed memory before charging it to a structure.
