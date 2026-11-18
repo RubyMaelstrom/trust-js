@@ -425,6 +425,24 @@ pub(crate) fn pin_splice_for_test() {
     pin_splice(true);
 }
 
+/// Pin the tier on with TRUST_JS_OPT_INLINE=graph on this thread, whatever the environment says,
+/// for a splice test's graph counterpart (P3 stage 3 step 3g: the flip's rehearsal), compiling
+/// on the main thread. Called first in the test, as `pin_tier_off_for_test`. Where the tier has
+/// no back end there is no graph inlining to pin.
+#[cfg(test)]
+pub(crate) fn pin_graph_for_test() {
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    TestSwitches {
+        on: true,
+        inline_graph: Some(true),
+        ..Default::default()
+    }
+    .set();
+}
+
 /// Keep the tier as the environment sets it, without its forced exits (TRUST_JS_OPT_EXIT_EVERY),
 /// on this thread: for a test whose subject holds in the tier's code but which counts work that
 /// generated code completes, some of which a forced exit hands to the VM (V8's status-file skips

@@ -389,6 +389,73 @@ fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm() {
         assert_eq!(result, "300/300", "{tier:?}");
     }
 }
+/// The graph inliner's counterpart (P3 stage 3 step 3g): at TRUST_JS_OPT_INLINE=graph the warmed
+/// shared caller is compiled in place with its callee built into its graph; another Realm's
+/// closure of the same caller, handed the first Realm's callee and its own, runs each callee in
+/// its own Realm.
+#[test]
+fn a_shared_inlined_caller_runs_cross_realm_callees_in_their_realm_at_graph() {
+    crate::opt::pin_graph_for_test();
+    const SOURCE: &str = r#"(function () {
+        "use strict";
+        globalThis.shared = {
+            // Not a tail call: a strict `return f()` is a proper tail call, never inlined.
+            call(f) { const result = f(); return result; },
+            callee() { return [7]; },
+        };
+    })();"#;
+    static SNAPSHOT: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
+    let snapshot: &'static [u8] =
+        SNAPSHOT.get_or_init(|| crate::compile_host_snapshot(SOURCE).expect("source parses"));
+    for tier in TIERS {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        let it = &mut *engine.interp;
+        let main = Value::Obj(it.global);
+        let run = |it: &mut Interp| {
+            let body = it.shared_snapshot_program(snapshot).expect("decodes");
+            assert!(it.run_classic_program(&body, None).is_ok());
+        };
+        run(it);
+        // Warm the caller with this Realm's callee until the tier compiles it in place with
+        // the callee in its graph, as a page does before it creates its first nested Window.
+        assert_eq!(
+            eval_string(
+                it,
+                "(function () { let n = 0; for (let i = 0; i < 2000; i++) n += shared.call(shared.callee)[0]; return n; })()"
+            ),
+            "14000"
+        );
+        if tier == Tier::Jit && crate::opt::enabled() {
+            crate::opt::finish_compiles_for_test(it);
+            let call = shared_method(it, "call");
+            let chunk = call.runtime().code.get().and_then(Option::clone);
+            assert!(
+                chunk.is_some_and(|chunk| crate::opt::in_place(&chunk)),
+                "the warmed caller is compiled in place"
+            );
+        }
+        let child = it.create_realm();
+        in_realm(it, &child, run);
+        in_realm(it, &child, |it| set_global(it, "mainRealm", main));
+        let result = in_realm(it, &child, |it| {
+            eval_string(
+                it,
+                r#"(function () {
+                    let main = 0, child = 0;
+                    for (let i = 0; i < 300; i++) {
+                        const fromMain = shared.call(mainRealm.shared.callee);
+                        if (Object.getPrototypeOf(fromMain) === mainRealm.Array.prototype) main++;
+                        const own = shared.call(shared.callee);
+                        if (Object.getPrototypeOf(own) === Array.prototype) child++;
+                    }
+                    return main + "/" + child;
+                })()"#,
+            )
+        });
+        assert_eq!(result, "300/300", "{tier:?}");
+    }
+}
 
 /// Unresolvable global references in shared code: a plain read (caught ReferenceError),
 /// `typeof`, and call position, in Script code, a once-run loop body that compiles at entry,

@@ -4845,6 +4845,53 @@ fn every_planned_way_gives_the_tier_offs_results() {
     }
 }
 
+/// The counterpart at graph of tier_tests' a_late_second_closure_converges_on_the_guards_mismatch_
+/// edge (P3 stage 3 step 3g): a site that met one closure is built with its guard by identity;
+/// fresh closures of the same literal exit WrongCallee there until the discard, and the
+/// reoptimized code tests the flagged guard and calls them generically, with no exit after:
+/// every result the tier off's.
+#[test]
+fn a_late_second_closure_converges_on_the_generic_call_at_graph() {
+    let warm = "function apply1(f, x) { return f(x); }
+        function make(k) { return (v) => v + k; }
+        const one = make(1);
+        let t = 0; for (let k = 0; k < 1000; k++) t += apply1(one, k); t";
+    let exit = "let u = 0; for (let k = 0; k < 600; k++) u += apply1(make(k), k); u";
+    let after = "apply1(make(3), 4) * 100 + apply1(make(5), 6)";
+    TestSwitches::default().set();
+    let mut off = jit_engine();
+    let expected = [warm, exit, after].map(|source| eval(&mut off, source));
+    graph_switches(0).set();
+    let mut engine = jit_engine();
+    assert_eq!(eval(&mut engine, warm), expected[0]);
+    let apply1 = chunk_of(&mut engine, "apply1");
+    assert!(super::in_place(&apply1));
+    let limit = super::exit::table_of(&apply1.jit.get().flatten().unwrap())
+        .unwrap()
+        .limit;
+    let call = pc_of(&apply1, is_call);
+    let wrong = || {
+        super::exit::TEST_EXITS.with(|exits| {
+            std::mem::take(&mut *exits.borrow_mut())
+                .into_iter()
+                .filter(|&(pc, reason)| pc == call && reason == ExitReason::WrongCallee)
+                .count()
+        })
+    };
+    wrong();
+    assert_eq!(eval(&mut engine, exit), expected[1]);
+    let taken = wrong();
+    assert!(
+        taken > 0 && taken as u32 <= limit + limit / 2,
+        "{taken} WrongCallee exits, limit {limit}"
+    );
+    assert_eq!(eval(&mut engine, after), expected[2]);
+    let again = "let w = 0; for (let k = 0; k < 600; k++) w += apply1(make(k), k); w";
+    assert_eq!(eval(&mut engine, again), expected[1]);
+    assert_eq!(wrong(), 0, "an exit after the reoptimization");
+    assert!(super::in_place(&apply1));
+}
+
 /// The same on a Rust entry (P3 stage 3 step 3g; the coordinator's review of the entry scan):
 /// `run`, which `Reflect.apply` calls from Rust (`jit::run`: an entry of its own,
 /// `gc_trace::JitFrameRoots`, whose operand words the tier's code shares with its inlined

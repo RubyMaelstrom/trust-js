@@ -209,6 +209,68 @@ fn constructors_run_only_under_new_reach_their_second_stage_compile() {
     }
 }
 
+/// The graph inliner's counterpart (P3 stage 3 step 3g): at TRUST_JS_OPT_INLINE=graph a class
+/// constructor and a function constructor run only under `new` reach their compiles in place,
+/// their callees built into their graphs, and each callee keeps its strictness (a strict one's
+/// `this` undefined, a sloppy one's the global object).
+#[test]
+fn constructors_run_only_under_new_reach_their_in_place_compile_at_graph() {
+    crate::opt::pin_graph_for_test();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    let before = direct_constructs();
+    const RUN: &str = "var s = 0; for (var k = 0; k < 400; k++) s += make(k); s";
+    assert_eq!(
+        evaluate(
+            &mut engine,
+            r#"
+            function strictStep(x) { 'use strict'; return x + (this === undefined ? 1 : 1000); }
+            function sloppyStep(x) { return x + (this === globalThis ? 2 : 2000); }
+            class Box { constructor(x) { this.v = strictStep(x); } }
+            function Plain(x) { this.v = sloppyStep(x); }
+            function make(k) { return new Box(k).v + new Plain(k).v; }
+            var s = 0;
+            for (var k = 0; k < 400; k++) s += make(k);
+            s;
+        "#
+        ),
+        "160800"
+    );
+    if cfg!(target_arch = "aarch64") {
+        assert!(direct_constructs() > before, "no direct construction");
+    }
+    let in_place = |engine: &mut Engine, name: &str| {
+        let constructor = object(engine, name);
+        let constructor = constructor.borrow();
+        let ObjectKind::User(user) = &constructor.kind else {
+            panic!("{name} is not a user function")
+        };
+        let chunk = user.func.runtime().code.get().and_then(Option::clone);
+        chunk.is_some_and(|chunk| crate::opt::in_place(&chunk))
+    };
+    // The tier compiles at a checkpoint of settled feedback: the constructions go on until both
+    // are compiled.
+    for _ in 0..40 {
+        if !crate::opt::enabled()
+            || ["Box", "Plain"]
+                .iter()
+                .all(|name| in_place(&mut engine, name))
+        {
+            break;
+        }
+        assert_eq!(evaluate(&mut engine, RUN), "160800");
+    }
+    for name in ["Box", "Plain"] {
+        assert_eq!(
+            in_place(&mut engine, name),
+            crate::opt::enabled(),
+            "{name} did not reach its compile in place"
+        );
+    }
+    assert_eq!(evaluate(&mut engine, RUN), "160800");
+}
+
 /// Each construction counts once toward its constructor's checkpoints (an entry's weight: one,
 /// or K with the optimizing tier on, `opt::entry_weight`), whichever path makes it: one whose
 /// allocation declines (a `prototype` that is not an Object) leaves the direct sequence's count

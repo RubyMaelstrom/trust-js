@@ -724,6 +724,61 @@ mod tests {
                 .any(|op| matches!(op, crate::bytecode::Op::InlineGuard(..))));
         }
     }
+
+    /// The graph inliner's counterpart (P3 stage 3 step 3g): at TRUST_JS_OPT_INLINE=graph the
+    /// plain arrow is built into `arrowHot`'s graph, which the tier compiles in place, and an
+    /// arrow that reads its definer's `this` and `arguments` keeps them: the tier off's results.
+    #[test]
+    fn plain_arrow_helpers_inline_at_graph_without_changing_lexical_arrows() {
+        const SOURCE: &str = r#"
+            var arrowTarget=x=>x+2;
+            function arrowHot(x){var y=arrowTarget(x);return y+1}
+            function Holder(b){this.base=b;this.lex=x=>this.base+arguments[0]+x}
+            var holder=new Holder(10);
+            function lexHot(x){return holder.lex(x)+1}
+            function drive(){var result=0;for(var k=0;k<250;k++)result+=arrowHot(1)+lexHot(k);return result}
+            drive()+','+holder.lex(5);
+        "#;
+        let engine = || {
+            let mut engine = Engine::new();
+            engine.set_tier(Tier::Jit);
+            engine.set_tier_threshold(0);
+            engine
+        };
+        crate::opt::pin_tier_off_for_test();
+        assert_eq!(eval(&mut engine(), SOURCE), "37375,25");
+        crate::opt::pin_graph_for_test();
+        let mut engine = engine();
+        assert_eq!(eval(&mut engine, SOURCE), "37375,25");
+        let first_stage = |engine: &mut Engine| {
+            let env = engine.interp.global_env;
+            let value = engine.interp.get_var("arrowHot", &env).ok().unwrap();
+            let object_handle = value.as_obj().unwrap();
+            let object = object_handle.borrow();
+            let ObjectKind::User(user) = &object.kind else {
+                panic!("user")
+            };
+            user.func
+                .runtime()
+                .code
+                .get()
+                .and_then(Option::clone)
+                .unwrap()
+        };
+        // The tier compiles at a checkpoint of settled feedback: the calls go on until it has.
+        for _ in 0..40 {
+            if !crate::opt::enabled() || crate::opt::in_place(&first_stage(&mut engine)) {
+                break;
+            }
+            assert_eq!(eval(&mut engine, "drive()"), "37375");
+        }
+        assert_eq!(
+            crate::opt::in_place(&first_stage(&mut engine)),
+            crate::opt::enabled(),
+            "arrowHot compiled in place"
+        );
+        assert_eq!(eval(&mut engine, "drive()+','+holder.lex(7)"), "37375,27");
+    }
 }
 
 #[cfg(all(
