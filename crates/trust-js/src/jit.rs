@@ -25752,6 +25752,13 @@ pub fn run(
     stack.reserve(code.max_stack);
 
     let stack_base = stack.as_mut_ptr();
+    // The pooled buffer's words are an earlier user's (`Interp::vm_pool` clears a buffer by its
+    // length only), and this entry registers `max_stack` of them as roots (below), which they would
+    // stay wherever the collector does not know the run's top (a wait on a call into Rust, every
+    // call on x86-64): zero them, as `run_borrowed_frame` zeroes a lent buffer past its entry depth
+    // (P3 stage 3 step 3g).
+    // SAFETY: `reserve` made the capacity; zero bits are a Value (the Number +0).
+    unsafe { zero_pooled_words(stack_base, code.max_stack) };
     let env_raw = Env::as_ptr(&env) as *const u8;
     let env_parent_raw = jit_env_parent_raw(&env);
     let mut ctx = JitCtx {
@@ -25825,6 +25832,36 @@ pub fn run(
         Ok(ctx.take_ret())
     } else {
         Err(ctx.error.take().unwrap_or(Abrupt::Throw(Value::Undefined)))
+    }
+}
+
+/// Zero the `words` operand words a Rust entry registers at `base` (`run`, `run_moved_oversized`):
+/// most entries register a few words, which stores in line clear for less than a call to `memset`
+/// costs (36 instructions an entry on tools/callbacks.js); volatile stores, so that the compiler
+/// does not make the loop that call. Longer buffers take `write_bytes`.
+///
+/// # Safety
+/// `base..base + words` lies in an allocation the caller owns; zero bits are a Value (the Number +0).
+#[cfg(any(
+    all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ),
+    all(
+        target_arch = "x86_64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )
+))]
+#[inline(always)]
+unsafe fn zero_pooled_words(base: *mut Value, words: usize) {
+    if words <= 16 {
+        for k in 0..words {
+            // SAFETY: the caller's contract.
+            unsafe { std::ptr::write_volatile(base.add(k).cast::<u64>(), 0) };
+        }
+    } else {
+        // SAFETY: the caller's contract.
+        unsafe { std::ptr::write_bytes(base, 0, words) };
     }
 }
 
@@ -26374,6 +26411,8 @@ unsafe fn run_moved_oversized(
         for k in seed..n_slots {
             slots_ptr.add(k).write(Cell::new(Value::Undefined));
         }
+        // An earlier user's words, as in `run`.
+        zero_pooled_words(stack_base, code.max_stack);
     }
     let env = unsafe { &*env };
     let mut ctx = JitCtx {

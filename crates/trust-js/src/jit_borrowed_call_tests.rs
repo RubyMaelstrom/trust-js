@@ -723,3 +723,168 @@ invoke(g)"#,
     );
     assert_eq!(got, "RangeError:R:1");
 }
+
+/// Writes `word` into the first `words` operand words of every buffer in the VM's pool (four at
+/// least: a script's own entry takes one before its calls do), as an earlier user of a buffer
+/// leaves its words there (`Interp::vm_pool` clears a buffer by its length only).
+fn leave_a_word_in_the_pool(
+    i: &mut crate::interpreter::Interp,
+    word: crate::value::Value,
+    words: usize,
+) {
+    while i.vm_pool.len() < 4 {
+        i.vm_pool.push(Default::default());
+    }
+    for (_, stack) in i.vm_pool.iter_mut() {
+        stack.clear();
+        stack.reserve(words);
+        let base = stack.as_mut_ptr();
+        for k in 0..words {
+            // SAFETY: within the capacity `reserve` made.
+            unsafe { base.add(k).write(word) };
+        }
+    }
+}
+
+thread_local! {
+    /// The Rust entries registered at `collectIf`'s last collection: each one's slot words and
+    /// operand words (`gc_trace::jit_frames_registered`).
+    static POOL_CASE_ENTRIES: std::cell::RefCell<Vec<[usize; 2]>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// The engine of the pooled-buffer cases below: `leaveInPool(o)` leaves `o`'s word in the first
+/// 300 operand words of every pooled buffer, and `collectIf(c)` collects where `c` is true and
+/// reports what marked each object `track` follows (`marks()`: `R` a root), keeping the Rust
+/// entries registered then.
+fn pool_engine() -> Engine {
+    use crate::value::Value;
+    let mut engine = super::rooting_tests::jit_engine(0);
+    super::rooting_tests::install(&mut engine, "leaveInPool", 1, |i, _, args| {
+        let word = args.first().copied().unwrap_or(Value::Undefined);
+        leave_a_word_in_the_pool(i, word, 300);
+        Ok(Value::Undefined)
+    });
+    super::rooting_tests::install(&mut engine, "collectIf", 1, |i, this, args| {
+        if !args.first().is_some_and(|c| i.to_boolean(c)) {
+            return Ok(Value::str(""));
+        }
+        i.gc_collect();
+        POOL_CASE_ENTRIES.with(|entries| {
+            *entries.borrow_mut() = crate::gc_trace::jit_frames_registered();
+        });
+        super::rooting_tests::marks(i, this, &[])
+    });
+    engine
+}
+
+/// `o`, which `track` follows, left in every pooled buffer by a frame of its own that ends: no
+/// other word names it.
+const LEAVE_IN_POOL: &str =
+    "(function leave() { leaveInPool(track({ only: 'a pooled word names me' })); return 0; })();";
+
+/// A Rust entry's pooled operand buffer holds an earlier user's words (`Interp::vm_pool` clears a
+/// buffer by its length only), and the entry registers `max_stack` of them as roots
+/// (`gc_trace::JitFrameRoots`): `jit::run` and `run_moved_oversized` zero them where they take the
+/// buffer, as `run_borrowed_frame` does past its entry depth. An object only such a word names
+/// is collected while the entry waits on a native that collects, a call into Rust whose top the
+/// collector does not know: `big`, which `invoke` runs on a `jit::run` entry, and `bigO`, whose 262
+/// slots put it on `run_moved_oversized` when `callO`'s call cache calls it. Each registers more
+/// operand words than it writes before the wait (a call it does not make has fifteen arguments),
+/// so its own pushes do not cover the earlier user's words.
+#[test]
+fn a_rust_entrys_pooled_buffer_retains_nothing_while_it_waits_on_a_native() {
+    let mut engine = pool_engine();
+    let locals: Vec<String> = (0..260).map(|k| format!("v{k} = {k}")).collect();
+    super::rooting_tests::run(
+        &mut engine,
+        &format!(
+            "function sink() {{ return 0; }}
+             function big(c) {{ if (c === 2) sink(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); return collectIf(c); }}
+             function bigO(c) {{ var {}; if (c === 2) sink(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); return collectIf(c) + (v259 === 259 ? '' : '?'); }}
+             function callO(c) {{ return bigO(c); }}
+             for (var k = 0; k < 4; k++) callO(false);
+             1",
+            locals.join(", ")
+        ),
+    );
+    let marker =
+        super::rooting_tests::run(&mut engine, &format!("{LEAVE_IN_POOL} invoke(big, true)"));
+    assert!(marker == "S" || marker == "D", "jit::run: {marker}");
+    let marker = super::rooting_tests::run(&mut engine, &format!("{LEAVE_IN_POOL} callO(true)"));
+    assert!(
+        marker == "S" || marker == "D",
+        "run_moved_oversized: {marker}"
+    );
+    let entries = POOL_CASE_ENTRIES.with(|entries| entries.borrow().clone());
+    assert!(
+        entries
+            .iter()
+            .any(|&[slots, words]| slots + words > super::FRAME_BUF),
+        "bigO ran on an oversized entry: {entries:?}"
+    );
+}
+
+/// The same for the optimizing tier's code, which `jit::run` enters as it enters template code:
+/// `big` called through `invoke` until it is compiled in place, at `pin` (the splice or graph).
+fn pooled_buffer_case_in_the_tiers_code(pin: fn()) {
+    pin();
+    let mut engine = pool_engine();
+    super::rooting_tests::run(&mut engine, "function sink() { return 0; }
+         function big(c) { if (c === 2) sink(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0); return collectIf(c); }
+         1");
+    let in_place = |engine: &mut Engine| {
+        let env = engine.interp.global_env;
+        let crate::value::ValueView::Obj(big) = engine
+            .interp
+            .get_var("big", &env)
+            .unwrap_or_else(|_| panic!("missing big"))
+            .view()
+        else {
+            panic!("big is not an object")
+        };
+        let big = big.borrow();
+        let crate::value::ObjectKind::User(user) = &big.kind else {
+            panic!("big is not a user function")
+        };
+        let chunk = user.func.runtime().code.get().and_then(Option::clone);
+        chunk.is_some_and(|chunk| crate::opt::in_place(&chunk))
+    };
+    for _ in 0..40 {
+        if !crate::opt::enabled() || in_place(&mut engine) {
+            break;
+        }
+        super::rooting_tests::run(
+            &mut engine,
+            "for (var k = 0; k < 200; k++) invoke(big, false); 1",
+        );
+    }
+    assert_eq!(
+        in_place(&mut engine),
+        crate::opt::enabled(),
+        "big did not reach its compile in place"
+    );
+    let marker =
+        super::rooting_tests::run(&mut engine, &format!("{LEAVE_IN_POOL} invoke(big, true)"));
+    assert!(marker == "S" || marker == "D", "{marker}");
+}
+
+#[test]
+fn a_rust_entrys_pooled_buffer_retains_nothing_in_the_tiers_code_at_graph() {
+    pooled_buffer_case_in_the_tiers_code(crate::opt::pin_graph_for_test);
+}
+
+#[test]
+fn a_rust_entrys_pooled_buffer_retains_nothing_in_the_tiers_code_at_the_splice() {
+    // The tier on at the splice, whatever the environment says (`opt::pin_splice_for_test` pins the
+    // splice alone).
+    pooled_buffer_case_in_the_tiers_code(|| {
+        #[cfg(target_arch = "aarch64")]
+        crate::opt::TestSwitches {
+            on: true,
+            inline_graph: Some(false),
+            ..Default::default()
+        }
+        .set();
+    });
+}
