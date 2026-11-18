@@ -6413,3 +6413,73 @@ neighbour is (the entry and its pins are the first stage's); the nine call-feedb
 with the tier off, on, eager, eager with forced exits, and eager at graph. Read with it: an
 eager compile of a function whose `new` site has no feedback leaves the site without any for
 good, which costs nothing outside that test configuration and is not looked into.
+
+Stage 3 lowerings landed: shape-test fusion, compare-and-branch fusion, folded Object offsets
+(14a0bae0, d922672f, 6a49d05d, 2026-11-18; target/p3/stage3/final-builds, report.txt, the
+agents'; my checks steplow-review and merge-check's counts-low.out, counts-low-graph.out and
+cycles-low.out). Three changes to the tier's ARM64 emission (opt/a64.rs), no change to the
+graph, the builder or the first stage; the stack was built over c2b91010 and is landed rebased
+over piece D, the apply pin and part A1, with which it shares no file.
+- Shape-test fusion (14a0bae0). A ShapeIs whose one use is the Branch right after it in its
+  block sets the flags the Branch takes: `cmp`, then a conditional compare a shape more, then
+  `b.cond`; the Boolean and its test (`mov #0` / `mov #1`, `cbz`) are not emitted. Two
+  instructions fewer where the shape matched, three where not. As Maglev's polymorphic arms
+  branch on the map compare itself (BranchIfReferenceEqual in BuildCompareMaps,
+  maglev-graph-builder.cc:3750-3804). It changes 140 of 1,522 tier compiles.
+- Compare-and-branch fusion (d922672f). The same for an I32Cmp, F64Cmp, TaggedSame,
+  IsTypedArray or CalleeMatches whose one use is the Branch after it: `cmp, cset, cbz` becomes
+  `cmp, b.cond`; a BoolNot between them emits nothing and inverts the condition; a constant's
+  Branch emits nothing. A Number compare keeps the conditions under which an unordered result
+  is false (MI and LS for less and less-or-equal) and its negation true. It changes 714 of
+  1,522 compiles. A fused CalleeMatches saves two on a match and not the note's three (its
+  last compare's branch stays; removing it is worth 0.013% of TypeScript and was left).
+- Folded Object offsets (6a49d05d). The Object's offset in its cell is folded into the address
+  of a field, shape, flag or kind load: `add x17, x4, #8; ldr x4, [x17, #64]` becomes `ldr x4,
+  [x4, #72]`, one instruction fewer at each, two at CheckProto and LoadArrayLength. It changes
+  1,404 of 1,522 compiles.
+- Measured on the landed stack against the main before, fat LTO (mine). Instructions at 5
+  runs, geometric mean of the 21 workloads: +0.002% with the tier off (template code is
+  identical: 3,060 of 3,062 compiles, the two PdfJS's one address's move-wide length), -1.16%
+  at the default and -1.16% at graph, no row slower: TypeScript -2.76% at the default inside
+  its spread, Box2D -2.30% / -2.38%, Earley-Boyer -2.05% / -1.98%, zlib -1.70%, React's steady
+  state -1.68%, RayTrace -1.50% / -1.71%, Crypto -1.48% / -1.52%, DeltaBlue -1.34% / -1.86%,
+  Mandreel -1.25%, GBEMU -1.21% / -1.31%, Richards -1.07% / -1.83%. On one X925 core alone,
+  five alternating rounds (the requested clock 1.4 to 3.9 GHz, the heat guard not tripped),
+  instructions and cycles at the default / at graph: Richards at 200 runs -6.99% and -7.98% /
+  -7.92% and -8.95%; DeltaBlue at 200 -4.72% and -4.96% / -6.03% and -6.06%; Box2D at 200
+  -4.04% and -4.03% / -4.10% and -3.81%; zlib at 5 -1.70% and -0.94% at both; Mandreel at 5
+  -1.25% and -1.41% / -1.25% and -1.53%.
+- The pieces apart (the agent's, on the stack's own base; means of 8 runs a side at
+  randomized addresses at 5 runs, fixed addresses at 200; the default / graph). The shape-test
+  fusion: +0.004% / -0.038% at 5 runs and -0.08% at 200, with DeltaBlue -0.42% / -0.60%, Splay
+  -0.19% / -0.23%, RayTrace -0.15% / -0.16% and GBEMU -0.10% / -0.09% at 200 at randomized
+  addresses. It is not a gain at 5 runs at the default: its scan of every graph costs 3,000 to
+  5,000 instructions a compile, which reads as +0.01% to +0.04% on Djot's fixture, Richards,
+  Box2D and Crypto, workloads with few compiles it changes; it lands on its 200-run rows. The
+  compare-and-branch fusion: -0.37% / -0.37% at 5 runs, -0.57% / -0.58% at 200 (zlib -1.70%,
+  Navier-Stokes -0.81%, Crypto -0.78%, Mandreel -0.69% at 5), its census agreeing in 28 of 30
+  rows at 200. The fold: -0.83% / -0.90% at 5 runs, -1.69% / -1.76% at 200 (Richards -6.5%,
+  DeltaBlue -3.8%, Box2D -3.6%), its census met or exceeded in every row, nothing slower.
+- Tests and checks. The agent's on the stack before the rebase: 55 mutations of the three
+  pieces caught, 51 by failing tests and 4 by a crash of the test process; six verifier
+  sweeps clean; the tier's modules 630 passed in each of six configurations; the whole
+  library suite 3,611 passed with the tier off, on and eager (and at graph eager but for the
+  Splay retention test, the base's failure); GC stress over the new tests; zombie's check,
+  clippy, Windows' check and suite (x86-64 compiles nothing of the stack). Mine on the rebased
+  stack, where it meets piece D's callee tests for the first time: the tier's modules 664
+  passed and none failed at graph, graph eager, graph with forced exits and forced exits at
+  the default; the 5-run verifier sweep 42 of 42 at both modes; clippy with tests.
+- Found while finishing them. A mutation the piece had called equivalent (a dead callee's
+  fused test) is reachable by a plain program and has a test now; the fold's "record" test
+  and micro never reached a record (14 fields fit the cell's fifteen slots) and now use 22;
+  wider mutation lists showed four more untested forms (the fused Branch's layouts, the
+  immediate conditional compare, a materialised ShapeIs, typeof's and the equality's folded
+  loads), each tested now.
+- Left open. An arm that tests two shapes runs both compares, and on its first shape's path
+  is one instruction longer than before where a shape id takes two instructions to
+  materialise (shorter by two to four on the other paths); how often such arms run is not
+  counted, and the count goes with the next piece of this line, the select form, which
+  rewrites those arms, with Maglev's compare and branch a shape as the form to weigh. The
+  per-compile passes (3,000 to 10,000 instructions a compile) stay. DeltaBlue at graph at 5
+  runs gains more from the shape-test fusion than its count predicts; not explained.
+  Test262 and difftest were not run on the stack.
