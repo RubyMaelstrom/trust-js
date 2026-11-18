@@ -13,7 +13,8 @@ Production feedback is the baseline's own caches; nothing extra is recorded on a
 - Named property reads and stores: the property inline caches (IcState ways: receiver shape,
   holder shape, depth, slot location; bytecode.rs), filled on the miss path.
 - Calls and constructions: CallSite and CallIc (callee identity, function literal, chunk, realm,
-  epoch; the megamorphic state, W3 item 7), ConstructSite (the prototype's shape and slot).
+  epoch; the megamorphic state, W3 item 7), ConstructSite (the prototype's shape and slot; for a
+  recognized forwarding constructor also its forward entry: section 5.9).
 - Elements: the word block's kind bits (word_block.rs: NO_HOLES, NUMBERS, INT32, FROZEN, COW,
   SEALED), read live by the element templates.
 - Allocations: a literal site's image (W2e: bytecode.rs ObjectImage), a constructor's learned
@@ -394,3 +395,65 @@ A pair met only in the VM, or in a form that stores nothing (an x86-64 template,
 layout the in-line templates decline), is missing from it: the speculative tier's check then
 exits, its flag at the pc declines the speculation, as a wrong guess from rule U's last-seen
 bytes is corrected. An empty record is "not observed".
+
+5.9 The forward entry of a forwarding constructor's site (P3 stage 3, steps 6-7, part A2). A
+`new` site's ConstructSite holds its constructor's CallIc and the shape and slot of the
+constructor's `prototype`. Where the constructor is a recognized forwarder, a function whose body
+is `this.<initializer>.apply(this, arguments)` (Chunk::jit_arguments_apply_forwarder; Prototype's
+Class.create), the site also records what the direct construct sequence's forward form (jit.rs
+DirectForm::Forward) needs to enter the initializer's machine code itself (bytecode.rs
+ForwardEntry):
+  init                 the initializer's CallIc, as a call site's way for it (its identity,
+                       environment, chunk, code, epoch, entry word and realm);
+  prototype_shape,     the shape of the constructor's `prototype` object P, and the slot of P
+  initializer_slot     that holds the initializer as an own data property;
+  initializer_shape    the initializer's shape, one without an own `apply`;
+  apply_holder_shape,  the shape of the initializer's [[Prototype]], and its slot of `apply`;
+  apply_slot
+  apply                the identity of that slot's value, %Function.prototype.apply%;
+  position             the forwarding call's source position (the initializer's frame's);
+  refused,             an initializer the fill refused, and the call-cache epoch of the refusal.
+  refused_epoch
+Who fills it: Interp::fill_construct_forward, from each success of the Rust forwarder
+(Interp::construct_arguments_apply_forwarder, behind Op::New's helper) while the site's entry
+names the constructor at the live call-cache epoch, on ARM64 only: x86-64 emits no forward form
+and records nothing. It fills the entry and sets CALL_IC_FORWARD, bit 4 of the entry's
+CallIc::direct (a call site's way never has it), when what the forward form proves by identity
+holds: `apply` is the builtin; P is an ordinary object of a cacheable shape with the initializer
+as an own data property; the initializer is an ordinary function of the running Realm, neither
+an arrow, a generator, an async function nor a class constructor, outside `with`, of a cacheable
+shape without an own `apply`, with code a direct call can enter (no tail calls, no prepared
+entry); its [[Prototype]] is an ordinary object of a cacheable shape holding `apply` as an own
+data property. An initializer not yet compiled for the Realm, or not yet admitted to machine
+code, records nothing: the fill waits. Any other failure is a refusal: the bit stays clear and
+`refused` and `refused_epoch` name the initializer, so that the Rust forwarder's next
+constructions with it in that epoch skip the fill's work. An entry with the bit is left as it is
+while its `init` is the live epoch's, names the construction's initializer and holds its chunk's
+current entry word; otherwise the fill renews it.
+Who clears it: a fill of the site's entry (Chunk::fill_construct_cache: another constructor, a
+new epoch, the constructor's code changed in place) stores an entry without the bit and with an
+empty forward entry, a refusal gone with it; a proof that fails at a construction
+(bytecode::forward_this, which the forward form calls through H_CONSTRUCT_THIS before anything
+is allocated) clears the bit alone, and that construction takes Op::New's helper, whose Rust
+forwarder fills the entry again from what it then proves, as a missed cache relearns; a refusal
+clears the bit.
+Who reads it: the forward form alone, at every construction of a site whose entry has the bit;
+it proves the whole entry again each time (forward_this). The read API (5.4) and the optimizing
+tier read a construct site's call words and prototype shape (bytecode_feedback_read.rs
+ConstructWords), not its forward entry.
+Where it lives: in line, in every construct site's entry (ConstructSite::forward, after the
+entry's CallIc, prototype shape and slot and forwarder flag): the forward form reaches the
+initializer's CallIc at a fixed offset from the site (bytecode.rs FORWARD_INIT_OFF). A `new`
+site is 288 bytes with it and its pin cell 24 (128 and 16 before part A2), at every site of
+every constructor, whether or not a forwarder is ever constructed there.
+How it is rooted: it holds addresses and shape numbers and no strong reference, so it keeps
+nothing alive and no collector scan reads it. While the entry names the initializer, the second
+weak pin of the site's pin cell (Chunk::construct_pins; the first is the entry's constructor's)
+keeps the initializer's address from being reused: the collector's weak-cell sweep
+(gc_handle.rs clear_dead_weak_cells_in) reads every weak handle's cell from the thread's list,
+clears it when its target dies and keeps the dead target's cell reserved while a handle remains.
+A fill of the site's entry drops that pin with the entry it empties. A construction proves the
+initializer alive by reading it from P's slot and comparing identities, as a call cache proves
+its callee; `apply` is compared by identity with the live slot's value and has no pin of its
+own. The instance the forward form makes is rooted by the initializer's activation record (its
+`this` word) and the sequence's save area on the native stack, from the helper's return on.
