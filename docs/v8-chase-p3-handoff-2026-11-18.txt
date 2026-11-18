@@ -179,7 +179,10 @@ Each is recorded where the plan line says; none blocks the lines above.
 5. Answered 2026-11-18 (the plan's "Part A2's standing"): part A2, a first-stage fast path no
    exemplar has at its baseline tier, stays for now and is measured again against the general
    forms (A1 and the `f.apply(t, arguments)` call form, also approved that day) once they land;
-   its special form is removed if the general path is close.
+   its special form is removed if the general path is close. MEASURED the same evening (the
+   plan's "Part A2's standing, measured again"): it stays. Without its forward form RayTrace
+   at 200 runs is 30% slower in cycles with the tier off and 54% to 55% with it on, although
+   the apply form halves what the general path cost.
 6. Profile-guided optimization or a link order file for the Rust binary (rule U's record): the
    fixtures' cycles move with the binary's layout at equal instructions.
 7. Folding a constant holder or method into code needs dependencies and invalidatable code, which
@@ -336,9 +339,15 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   in compiled code as a known callee; React's steady state is +0.29% at graph without it),
   being built on branch p3-s3-b (brief target/p3/stage3/briefs/step3g-resume4.txt); the
   rehearsal's rows taken again on today's main; then the owner's decision.
-- In flight on the construct line (brief briefs/step67-resume4.txt): the apply form's second
-  commit, which reaches the operation through the intrinsic helper (branch
-  p3-s3-apply-route), and the three-way comparison of part A2 the owner asked for.
+- The construct line's list is done: the apply form's second commit (the intrinsic route)
+  landed as 8bfb6fab, and part A2's three-way comparison is measured and recorded. What it
+  leaves open is in the plan's records: which gate sends Earley-Boyer's constructions of a
+  constructor with a static layout to the helper; the layout of part A2's site entry.
+- A correction of the same evening, in the plan and in benchmarks/README.md: a Splay or
+  Earley-Boyer instruction row is charged to a change only when the recount with
+  TRUST_JS_GC_INCREMENTAL=0 shows it too. The incremental marker's schedule differs between
+  builds at equal work and moved Splay by up to 1.9%; the retention fix's "-1.80% on Splay"
+  was that, and the fix changes no work in Octane's Splay.
 - Open, recorded in the plan, not being worked on: a strict body's `return f.apply(this,
   arguments)` is a tail call the apply form does not take (it runs in no measured workload);
   an arm that tests two shapes in the tier's code; the design that would make both stale-word
