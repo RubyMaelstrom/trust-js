@@ -84,6 +84,12 @@ Memory
 - Peak RSS includes the binary's file-backed pages, which depend on how the file was
   last written. Copy every binary being compared into a new directory at the same time,
   measure the copies, and include an empty-script run as a control.
+- Before charging a peak-RSS difference between two builds to a data structure, split it
+  into anonymous and file-backed memory (`RssAnon` and `RssFile` in `/proc/<pid>/status`,
+  sampled through the run) and count the structure: instances times bytes. Two builds'
+  layouts touch different pages of the binary, which moves peak RSS by a few hundred KiB
+  either way; a +1.5% reading on a small fixture was that, where the structure's own
+  growth was 1 KB.
 - The largest live-bytes figure among the major collections is a sample, not the peak:
   majors fire at byte thresholds, so builds whose objects differ in size are sampled at
   different points. Sample densely (`TRUST_JS_GC_STRESS=100000 TRUST_JS_GC_STRESS_MAJOR=1

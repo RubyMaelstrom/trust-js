@@ -17,6 +17,35 @@ comment/example in the same change.
 * Instrumented or diagnostic runs are not performance acceptance timings.
   Keep diagnostic switches out of measurement manifests unless a switch's own
   entry below says to record it explicitly.
+* Two forms of switch behave differently. One written `=1` below and read through
+  `env_flag!` is on when the variable is set to anything, `0` and the empty string
+  included; a switch's own entry says where only particular values count (`TRUST_JS_PERF_MAP`,
+  "any value but `0`"). One written `=0` is on by default, and only the exact value `0`
+  turns it off. A cached switch is read at its first use, and a few entries below say they
+  are read at each event, by each `Runtime`, or when the binary is compiled.
+* Test-process markers are not inputs. A lib test that needs a process of its own (a switch read
+  once per process, a process-wide epoch or code budget, an exit path) runs the test binary again
+  with `--exact` and its own name and a marker variable set; the copy runs the test's body and
+  the parent checks its exit status and output. The parent often sets the switches under test on
+  the child too. Nobody sets a marker by hand: with one set, its test takes the child's branch in
+  the first process, without those switches. The markers, all in `crates/trust-js/src` test code:
+  `TRUST_JS_FASTALLOC_EXIT_CHILD`, `TRUST_JS_OPT_D8_CHILD`, `TRUST_JS_OPT_ONE_CPU_CHILD`,
+  `TRUST_JS_PROPSTAT_CHILD`, `TRUST_JS_REMEMBERED_NATIVE_APPEND_CHILD`,
+  `TRUST_JS_STRING_ACCUMULATION_OPSTAT_CHILD`, `TRUST_JS_STRING_ACCUMULATION_REPLAY_CHILD`,
+  `TRUST_JS_STUB_FLAG_CHILD` and, with the prefix `TRUST_JS_TEST_`, `ADDRESS_REUSE_CHILD`,
+  `CACHED_CALLBACK_ENTRY_ROOT_CHILD`, `CACHE_OWNER_DEATH_CHILD`, `CALL_EPOCH_MAX_CHILD`,
+  `CALL_RECORD_CHILD`, `CODE_EPOCH_CHILD`, `CODE_PRESSURE_CHILD`, `CODE_RECLAIM_CHILD`,
+  `CONSTRUCTOR_ARGUMENT_LOAN_CHILD`, `CONSTRUCT_CHILD`, `CREATE_TIER_CHILD`,
+  `CREATION_DIRECTORY_CHILD`, `DIRECT_RECLAIM_CHILD` (its value names the child's mode, `stable`
+  or `stale`), `ELEMENT_RECORD_INLINE_CHILD`, `FAST_CALLBACK_ENTRY_ROOT_CHILD`,
+  `FOREIGN_RUNTIME_RETIREMENT_CHILD`, `GENV_PIN_CHILD`, `METADATA_ADMISSION_CHILD`,
+  `NATIVE_LAYOUT_CARD_CHILD`, `OPT_DEFERRED_DISCARD_CHILD`, `OPT_LOOP_LIMIT_LOG_CHILD`,
+  `PACKED_NEW_TARGET_CHILD`, `PREPARED_INLINE_CHILD`, `PRIMITIVE_MATH_INTRINSICS_CHILD`,
+  `REGION_VOCABULARY_CHILD`, `ROOTING_STRESS_CHILD`, `SCOPED_NATIVE_SIGNATURE_CHILD` and
+  `SPLICE_RULE_CHILD`. The Node compatibility layer marks the processes it starts the same way:
+  `child_process.fork` sets `TRUST_JS_FORK_IPC=1` on its child, whose `process` then carries the
+  IPC channel over stdin and stdout, and `cluster.fork` sets `TRUST_JS_CLUSTER_WORKER=1`, which
+  makes `cluster.isWorker` true there.
 
 ## Execution tier and JIT diagnostic controls
 
@@ -571,6 +600,137 @@ comment/example in the same change.
   record beside the dump; report from `perf.jit.data`. GNU/Linux only; the file lives until it
   is deleted, and the map's switch may be on or off with it.
 
+- `TRUST_JS_AST_HOT=1` reports functions whose calls keep running on the tree-walker: each call
+  that `Interp::call_user_inner` does not hand to a compiled chunk counts, and at a function's
+  1,000th, 10,000th, 100,000th and 1,000,000th it prints `[ast-hot] <name> ×<n>: <the first 60
+  characters of its source>` to standard error. It counts in the per-function call counter that
+  the tier-up budget reads, so it can bring a function's tier-up forward: diagnostic only.
+- `TRUST_JS_INLINE_BUDGET=N` and `TRUST_JS_INLINE_SMALL_BUDGET=N` set the inline planner's two
+  budgets of callee operations for one optimized body (`bytecode::plan_inlines`): the shared
+  budget, N less the caller chunk's own operations (default 320), which every splice draws on
+  first, and the small-callee budget (default 384), which admits a callee of at most 16 operations
+  once the shared budget cannot, if the callee calls nothing or its site repeats in a loop. Both
+  at 0 leave every plan empty. `TRUST_JS_INLINE_MAX_OPS=N` sets the largest callee chunk a site
+  may splice, in operations (default 96); `TRUST_JS_TIER_LOG=1` names a larger callee's site as
+  `callee size/shape`, the reason it prints for the other limits on a callee's shape too. A value
+  that does not parse keeps the default.
+- `TRUST_JS_JIT_NO_CACHE_SEED=1` compiles a second stage (`bytecode::compile_with_inlines`) with
+  empty property, name and call caches instead of seeding them from the chunk that ran. Its
+  caches then hold no evidence of what ran, so it also keeps every register region, as under
+  `TRUST_JS_JIT_UNRUN_REGIONS=1`.
+
+- `TRUST_JS_JIT_FAST=<mask>` sets the ARM64 templates' feature mask, a decimal `u32` (every bit
+  by default; a value that does not parse keeps the default). A cleared bit leaves its templates
+  out and the operations take their generic forms. Bits: 1 arithmetic and bitwise operators; 2
+  comparisons, equality and `typeof` tests; 4 `JumpIfFalse`; 8, 16 and 32 local loads, stores and
+  updates; 64 `Pop`, `Dup` and `ToPropKey`; 128 constants; 256 named reads; 512 `GetMethod`; 1024
+  element reads and `in`; 2048 and 4096 element stores (`SetElemDrop`, `SetElem`); 8192 free-name
+  and captured-binding accesses; 16384 numeric register chains; 32768 register regions (loop and
+  acyclic) and `this` loads; 65536 named stores and updates; 131072 `!`; 262144 a loop region's
+  access to its receivers' element words; 524288 the in-line call-cache probe; 1048576 direct
+  calls (which need 524288); 2097152 the linked-scan loop region. The optimizing tier's effects
+  read the same mask, and `TRUST_JS_FEEDBACK_PROFILE=1` clears fourteen of the bits itself
+  (`TRUST_JS_JIT_FAST=4291167192` is those fourteen off with nothing observed).
+- `TRUST_JS_JIT_NO_ARRAY_INTRINSICS=1` leaves the in-line forms of `Array.prototype.push` and
+  `pop` out of ARM64 call sites, and `TRUST_JS_JIT_NO_FUNCTION_CALL_INTRINSIC=1` that of
+  `Function.prototype.call` (sites of one to eight arguments): those calls then take the call-hit
+  form, as other natives do. The template JIT and the optimizing tier's code both read them.
+- `TRUST_JS_JIT_NO_PROP_CHAIN=1` builds no ARM64 numeric register chain with a property read or
+  store, as a chunk recompiled after its chains bailed has none (see
+  `TRUST_JS_JIT_NO_CHAIN_REOPTIMIZE`); `TRUST_JS_JIT_NO_PROP_STORE_CHAIN=1` keeps the reads and
+  leaves out the stores. `TRUST_JS_JIT_PROP_CHAIN_LOG=1` prints each chain that holds a property
+  read as it is planned: `[jit-prop-chain] <pc>:<operation> | ...`.
+- `TRUST_JS_JIT_NO_CFG_REGION=1` keeps ARM64 loops of the linked-scan shape, `while ((peek =
+  next.link) != null) next = peek`, off their own region (`plan_linked_scan`); such a loop then
+  compiles as any other. Despite the name, the general CFG regions stay on.
+- `TRUST_JS_JIT_LOOPLOG=1` prints the ARM64 helper-free loop plan's decisions (`plan_loop`) as
+  `[jit-loop] head <pc>:` lines: `reject: <why>` (an unchainable operation with its pc, operand
+  depth, receivers, register pressure), `demote I slot <n>` for a local taken out of the integer
+  slots, and for a planned loop `CHAINED <n> ops, <n> slots (<n> I), <n> receivers (<n> vec
+  pins), <n> names, memo elem <r>r/<u>u conv <r>r/<u>u`. `TRUST_JS_JIT_REGIONLOG=1` prints the
+  register regions' as `[jit-region] head <pc>:` lines: a loop head's region IR (`<n> blocks, <n>
+  ops, <n> values, <n> params, <n> exits`, or `reject <error>`; a head that is no loop prints
+  nothing), `EMITTED linked scan`, `EMITTED general CFG (<n> ops, <n> bytes, <n> saved-work
+  units)`, `EMITTED acyclic CFG (<n> ops, <n> bytes, <n> ops in all)`, or `retained baseline
+  (...)` with the reason: its optional bytes and saved work (not profitable), `<n> ops past the
+  region budget`, or `its operations have not run`. Under it every loop head builds a region IR
+  for the log alone.
+- `TRUST_JS_JIT_LOOP_ALIGNMENT=N` aligns the body of an ARM64 helper-free loop region to N bytes:
+  16, 32, 64 (the default) or 128, or 0 for no padding; any other value keeps 64. It is for A/B
+  comparisons of code placement in release builds.
+- `TRUST_JS_SHARED_NATIVE_OPERATIONS=0` makes ARM64 register regions emit their effects from the
+  regions' own, older copies of the operation templates (`regions::emit_effect`) instead of the
+  templates baseline code uses (`jit_operations.rs`).
+- `TRUST_JS_JIT_INLINE_ALLOC=0` makes generated code take no cell in line: environment records,
+  objects (a direct construct's `this` among them) and element blocks then come from the
+  allocation helpers.
+- `TRUST_JS_JIT_NO_PACKED_HOLES=1` (ARM64 builds) makes `Array(n)` with a Number n of 1 to 8
+  reserve no element words. By default the constructor reserves n hole words in the new array's
+  element block, so that the indexed writes that usually follow fill them without growing it.
+- `TRUST_JS_JIT_CODE_BUDGET_MB=N` sets the process-wide cap on live executable code, in MiB (1 to
+  1024; default 128, and any other value keeps it), which the JIT and the native RegExp tier
+  share. It counts the bytes requested for live mappings, not code ever emitted. A request that
+  does not fit first reclaims inactive code, and failing that the function stays on the bytecode
+  VM. The process's code region reserves 1 GiB of addresses, or twice a budget above 512 MiB.
+- `TRUST_JS_ITERATOR_RESULTS=0` makes every step of a built-in Array, String, Map or Set iterator
+  call its `next` and allocate the iterator result object. By default an iterator whose `next` is
+  the intrinsic steps without one (`Interp::try_intrinsic_iterator_step`), and ARM64 code steps
+  an Array iterator in line (see `TRUST_JS_JIT_NO_ITER_STEP`).
+
+- `TRUST_JS_SCOPE_PLANS=0` turns off the per-function environment plans (`bytecode_scope_plan.rs`):
+  every function's plan is opaque, a Script's inner functions get no outer contexts, and no free
+  name gets a static (hops, slot) address, so each tier makes its records its own way and names
+  keep their caches. `TRUST_JS_SCOPE_LOG=1` prints `[scope-plan] <name>@<source start>
+  Public|Private|Opaque <why> prefix=<n>` as each function's plan is made, and from the bytecode
+  compiler `[scope] <its first three slot names> <name>: static hops=<h> slot=<s>|global
+  hops=<h>|dynamic: <where the resolution stopped>` for each free-name read and `[scope] store
+  <name>: static hops=<h> slot=<s>|dynamic` for each free-name store.
+- `TRUST_JS_ACTIVATION_PLANS=0` builds a compiled function's activation record without its
+  chunk's activation plan, binding by binding (`Chunk::make_unplanned_activation`), and no chunk
+  then has a fixed activation (`Chunk::jit_fixed_activation`): generated code reaches captured
+  bindings through its checked caches instead of fixed offsets.
+- `TRUST_JS_COLD_ENV_LAYOUTS=0` keeps the tree-walker's function records off shared binding
+  layouts. By default, once a call has instantiated its parameters, hoisted declarations and
+  lexicals, its variable record (and a separate parameter record, where it has one) takes the
+  layout that its function's calls share; a record under `with` never does.
+- `TRUST_JS_LAYOUT_NAME_IC=0` keeps every name cache and captured-binding cache keyed by one
+  environment record. By default a site that meets a second record of the same binding layout
+  changes to the layout's slot index, which then serves every record of that layout.
+- `TRUST_JS_ELIDE_SELF_ENV=0` gives every named function expression's closure the environment
+  record that binds its own name. By default one whose body cannot observe the binding
+  (`bytecode::named_self_binding_may_be_observed`) gets none.
+
+- `TRUST_JS_FN_PROFILE=1` times the calls that pass `Interp::call_user_inner`, the tree-walker's
+  function entry, and keeps per function and Realm its calls, self and inclusive time and
+  callers. Generated code's direct call sequences do not pass it: a callee reached only that way
+  has no entry and its time is its caller's self time. A dump prints the 32 entries with the
+  most self time to standard error and clears the profile: `[fn-profile] self=<s>s
+  inclusive=<s>s calls=<n> [realm=<address> function=<address>] <name> top_caller_calls=<n>
+  top_caller=<its description>`, then `[fn-profile-state] description=<...>
+  tier=cold|bytecode|bytecode-bail|jit|jit-bail|jit-budget-wait strict= arrow= with= env_depth=
+  same_realm= prepared= activation= code_used= code_limit= code_denials=`, the function's state
+  at its first call of the batch. The profile dumps when its Agent's interpreter is dropped: at
+  the shell's normal exit, but not after an uncaught exception, which exits without dropping it.
+  `TRUST_JS_FN_PROFILE_FLUSH=<name>` also dumps each time an outermost profiled call of a
+  function of that name returns, and `TRUST_JS_FN_PROFILE_FLUSH_SECONDS=<seconds>` each time an
+  outermost profiled call took that long or longer (a finite number, 0 or more).
+  `TRUST_JS_FN_PROFILE_SOURCE=1` adds the first 100 characters of each function's source to its
+  description and a `[fn-profile-source]` line with up to 16,384 characters of it; without it the
+  output holds no source text.
+- `TRUST_JS_PERF_METRICS_INTERVAL_SECONDS=<seconds>` sets the interval of the embedding API's
+  periodic `TRUST_JS_PERF_METRICS` record (`PerformanceMetricsSampler::from_env`, whose
+  `maybe_dump` collects and returns one JSON envelope per interval): a finite positive number,
+  10 by default, anything else ignored. Only a host that calls `from_env` reads it; the shell and
+  `trust-js-cli` do not.
+
+- `TRUST_JS_SCRATCH=<file>` makes the lib test `tests::scratch_eval_file` evaluate the file in a
+  fresh engine and print its console lines and its value or throw (`cargo test scratch_eval_file
+  -- --nocapture`); without it the test does nothing. `TRUST_JS_SCRATCH_PRE=<file>` evaluates a
+  preamble script first, `TRUST_JS_SCRATCH_STRICT=1` evaluates the file as strict code and
+  `TRUST_JS_SCRATCH_MODULE=1` as a module whose relative imports resolve against its directory.
+  `TRUST_JS_SIZES=1` makes `tests::debug_type_sizes` print the sizes of `Stmt`, `Expr`, `Token`
+  and `Tok`.
+
 ## RegExp diagnostic controls
 
 - `TRUST_JS_REGEXP_PROF=1` reports at exit the matcher's executed instructions by kind, the
@@ -651,6 +811,13 @@ comment/example in the same change.
 The fast paths' switches exist so that a workload can run with each forced off and be compared,
 by instruction counts (`perf stat -e instructions:u`); none changes a result.
 
+- `TRUST_JS_REGEXP_FUZZ_TRACE=1` makes the lib tests' fuzzer print each case before it checks it,
+  `[fuzz] /<pattern>/<flags> <subject>`, so that a crash or a hang names its case. On x86-64,
+  `TRUST_JS_REGEXP_X64_ENCODINGS=1` makes the assembler's test
+  `regex::native::x64::tests::encodings_disassemble_as_intended` print each encoding it emits
+  with the instruction it should be (`<hex bytes>` and a tab, then the text) instead of comparing
+  it, for checking against a disassembler: the test then asserts nothing.
+
 ## Architecture diagnostics
 
 The `architecture-diagnostics` feature records allocation sites/lifetimes
@@ -660,6 +827,79 @@ is recorded at allocation, before later function/exotic initialization. Lifetime
 use heap allocation ordinals and completed collections, not elapsed time. Live
 families at collection are a separate population sample. These probes compile out
 of ordinary builds; use them only for diagnostics, never performance acceptance.
+
+## Error and reflection tracing
+
+Each of these prints bounded metadata to standard error. They read native state only: no getter,
+Proxy trap or conversion runs for them.
+
+- `TRUST_JS_TRACE_ERRORS=<text>` prints each error object `Interp::make_error` makes, caught or
+  not, whose message or stack contains the text (`1`: every one): `trust-js-error: <kind>: Error:
+  <message><stack>`, the message's first 512 characters and the stack's first 2,048, at most
+  1,024 errors a process. The text is matched against the message and the stack, not the kind.
+  After each error come the histories the next two switches record, when they are on.
+  `TRUST_JS_TRACE_ERROR_SOURCE=<n>` adds `trust-js-error-source:` lines with the first n
+  characters of the source of the four innermost running functions (800 for a value that is no
+  number above 1, such as `1`; at most 16,384), and, when the filter is `1` or contains `not a
+  function`, a `trust-js-call-error: callee=<preview> this-type=<type> argument-types=[...]` line
+  for each of the first 32 calls of a value that is no object.
+- `TRUST_JS_TRACE_UNDEFINED_PROPERTIES=1` keeps the last 32 slow-path property reads
+  (`Interp::get_member_key`) that gave undefined, which a traced error prints as
+  `trust-js-error-undefined-property: function=<running function's name> base=<type> key=<key>`,
+  with `kind=`, `constructor=` and the first eight own keys (`own=`) for an object read by a key
+  that is no index. A read that gave undefined is not proof of absence: an accessor or a Proxy
+  may return it.
+- `TRUST_JS_TRACE_BOUND_CALLS=1` keeps the last 256 events of bound function calls
+  (`Interp::call_dispatch`), which a traced error prints as `trust-js-error-bound-call:` lines:
+  `enter id=<n> parent=<id> target=<preview> saved=[bound arguments] args=[arguments]` and `exit
+  id=<n> return|throw <preview>`. With it, `TRUST_JS_TRACE_BOUND_ARRAYS=1` adds, at each such
+  call's entry and exit, the elements that changed in the arrays of 16 to 512 elements that the
+  first bound argument holds in its first 16 properties (up to four arrays): `array id=<call>
+  phase=enter|exit object=<address> field=<key> changes=[(index, preview), ...]`.
+- `TRUST_JS_NULLISH_TRACE=1` prints `TRust JS: nullish computed-property read site=<site>
+  key=<type>:<value>` when a computed read's base is undefined or null, before the TypeError;
+  the site is `eval-index`, `bytecode-update-elem`, `bytecode-profiled-get-elem`,
+  `get-method-elem` or `jit-update-elem`. It is read at each such failure.
+- `TRUST_JS_PARSE_TRACE=1` prints each error `Parser::err` makes, with its token: `TRust JS
+  parser: line <n> chars <start>..<end> token <kind>: <message>`. Errors of the checks that run
+  after a construct is consumed (`err_semantic`) are not printed. It is read at each error.
+- `TRUST_JS_TRACE_CODE_POINT_ERRORS=1` prints, for the first 32 arguments `String.fromCodePoint`
+  refuses, `trust-js-code-point: argument_index=<i> converted=<number> argument_count=<n>`.
+- `TRUST_JS_TRACE_FUNCTION_TOSTRING=1` prints, for the first 512 calls of
+  `Function.prototype.toString` on a callable, `trust-js-function-source: name=<name>
+  source_bytes=<n> host_ops=<bool>` (whether the source contains `__dom_`, `__host_` or
+  `__trust`): which functions a page inspects, without their source.
+- `TRUST_JS_TRACE_LEGACY_REFLECTION=1` reports whether a program reads `f.arguments` or `f.caller`
+  of a sloppy function: `[legacy-reflection] arguments: inactive`, `arguments: active,
+  materialized`, `arguments: active, lazily available`, `arguments: active, unavailable`,
+  `caller: inactive` or `caller: active`, each at most once a thread.
+- `TRUST_JS_DBG=1` prints three ShadowRealm debugging lines: `DBG cross enter realm=<address>
+  parent=<...> self=<address> tkind=<target kind>` at each call of a host function wrapped for a
+  ShadowRealm, `DBG cross err: <value>` when that call throws and `DBG cws err: <value>` when a
+  function wrapped from a ShadowRealm throws, each before the TypeError that replaces the throw.
+  It is read at every such call, not once.
+
+## Runtime thread pools
+
+- Each `Runtime` reads these as it is constructed, a worker's too; a value that does not parse
+  keeps the default and one out of range is clamped. `TRUST_JS_BLOCKING_THREADS=N` sets the
+  worker threads of the blocking pool, which runs file-system and other finite blocking work
+  (default 4; 1 to 64), `TRUST_JS_BLOCKING_QUEUE_CAPACITY=N` the tasks its queue holds before a
+  submission fails with `blocking executor queue is full` (default 64 a thread; 1 to 65,536) and
+  `TRUST_JS_BLOCKING_STACK_BYTES=N` each worker's stack (default 1 MiB; 64 KiB to 64 MiB).
+  `TRUST_JS_DEDICATED_THREAD_LIMIT=N` sets how many dedicated threads may run at once, one for
+  each operation that may wait without bound, such as a child's stdio (default 256; 1 to 4,096),
+  past which an operation fails with `dedicated executor thread limit reached`, and
+  `TRUST_JS_DEDICATED_STACK_BYTES=N` their stacks (default 512 KiB; 64 KiB to 64 MiB).
+
+## Build and installer inputs
+
+- `TRUST_JS_VERSION_SUFFIX=<text>` is read when the binaries are compiled (`option_env!`), not
+  when they run: the text follows the package version in `trust-js --version` and in
+  `trust-js-cli --version` and its REPL banner.
+- `scripts/install.sh` takes `TRUST_JS_INSTALL` (the install prefix, `$HOME/.trust-js` by
+  default; the binary goes to its `bin`) and `TRUST_JS_RELEASE` (the release tag to download,
+  `nightly` by default).
 
 ## Measurement and profiling recipes
 

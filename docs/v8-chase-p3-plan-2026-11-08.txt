@@ -6042,9 +6042,13 @@ measurement method and the recipes that until now lived in the agents' briefs un
   configurations) and of part A2 (all of them).
 - Restarted on 2026-11-18, each line by a new agent from its predecessor's log, report and
   worktree (briefs target/p3/stage3/briefs/*-resume.txt): piece D's remaining checks, then the
-  flip's rehearsal and piece B (f3a190bb on p3-s3-step3g); the forward entry out of line, which
-  part A2's memory requires (React +1.50% and Vue +1.69% peak RSS with it in line,
-  step67-impl/a2/rss.out), then the counts for A1 and A3; and the lowerings' three commits (the
+  flip's rehearsal and piece B (f3a190bb on p3-s3-step3g); the forward entry out of line, then
+  the counts for A1 and A3 (the entry in line adds 168 bytes to every `new` site: by count 21 KB
+  on RayTrace at 200 runs, 0.08% of its peak RSS and the most of any workload, 169 KB on
+  TypeScript, step67-impl/a1/rss-sites.out; the +1.50% and +1.69% peak RSS first read on React
+  and Vue between the two binaries were file-backed pages, the binaries' layout, with anonymous
+  memory 12 KiB lower on both, a2/rss-split.out, and I had charged them to the entry in this
+  record's first form); and the lowerings' three commits (the
   shape test fused with its branch, a compare fused with its branch, the Object's offset folded
   into field addresses: bc981bda, f6d97091, 663be02c on p3-s3-cmp-final), whose measurement the
   crash cut. My checks run again on cores 5 and 6 (target/p3/stage3/stepa2-review/checks2.sh;

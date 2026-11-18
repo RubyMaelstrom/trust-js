@@ -135,9 +135,16 @@ standing rules in briefs/common.txt.
    Branch p3-s3-step67 at c2b91010 (part A2, landed), worktree target/p3/stage3/step67-wt, evidence
    target/p3/stage3/step67-impl (report.txt section 4, design-note.txt).
    - Owed first: part A2 put a forward entry in line in every construct site's entry (128 -> 288
-     bytes), which costs React +1.50% and Vue +1.69% peak RSS (step67-impl/a2/rss.out). It moves
-     out of line: one commit, with the sizes, RSS, construction cost and code identity measured.
-     The worktree held an uncommitted, never-compiled start on it when the machine went down.
+     bytes, its pin cell 16 -> 24), so every `new` site of every program carries 168 bytes more
+     for a pattern few sites have: by count 1.2 KB on the React fixture, 21 KB on RayTrace at 200
+     runs (0.08% of its peak RSS, the most of any workload), 169 KB on TypeScript
+     (step67-impl/a1/rss-sites.out). It moves out of line: one commit, with the sizes, the
+     construction cost and code identity measured. The worktree held an uncommitted,
+     never-compiled start on it when the machine went down.
+     A first reading had charged it with +1.50% and +1.69% peak RSS on React and Vue
+     (step67-impl/a2/rss.out). That was wrong: anonymous memory is 12 KiB lower on both, and the
+     difference is file-backed pages, which pages of the binary each build's layout touches
+     (a2/rss-split.out). Peak RSS cannot show this change; its case is the count.
    - Then counts, no code: A1 (constructors without a learned instance layout) and A3 (Box2D's
      `F.init.apply(this, arguments)`, 3,837 instructions a construction), each with a
      recommendation for the coordinator.
