@@ -10087,6 +10087,36 @@ impl Props {
         self.entries.capacity()
     }
 
+    /// The layout of a finished instance that its constructor's chunk may take as its learned
+    /// instance layout (P3 stage 3 steps 6-7, A1; `Chunk::note_instance`): its named keys in
+    /// order, where it holds at least one, each a default data property under a String key
+    /// (writable, enumerable, configurable: what `this.name = value` creates), with no indexed,
+    /// Symbol, private or far storage, and no key index of its own. Any other instance gives
+    /// None, and its constructor's chunk settles without predicted keys. A layout is a
+    /// prediction only: an instance allocated with it has no property until a store makes one,
+    /// and a store the layout does not predict detaches it ([`NamedEntries::push`]).
+    ///
+    /// The bound is the key index: an instance's shared layout indexes its keys up to
+    /// [`SHARED_LAYOUT_MAX_FIELDS`] (16; `PropertyLayout::with_shared_index`, `rebuild_index`),
+    /// past which the instance builds an index of its own ([`Props::ensure_fallback_index`]),
+    /// so an instance without one holds at most sixteen keys, the static pass's bound
+    /// (`bytecode::finish_chunk`), and a learnt layout is one a lookup reads through the
+    /// layout's index or by a short scan.
+    pub(crate) fn learnable_layout(&self) -> Option<&PropertyLayout> {
+        if self.entries.is_empty()
+            || self.entries.index().is_some()
+            || self.named_data_keys().is_none()
+            || (0..self.entries.len()).any(|slot| self.entries.attrs(slot) != PROP_PLAIN)
+        {
+            return None;
+        }
+        debug_assert!(
+            self.entries.len() <= SHARED_LAYOUT_MAX_FIELDS,
+            "an instance past the shared layout's index bound has an index of its own"
+        );
+        self.entries.layout.as_ref()
+    }
+
     /// Final named-property count of a small ordinary instance. The construct JIT records this
     /// after a successful call so forwarding constructors whose own bytecode has no direct
     /// `this.x` stores can reserve the right capacity on later allocations.

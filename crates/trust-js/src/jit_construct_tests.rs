@@ -510,3 +510,360 @@ fn hot_new_sites_construct_through_the_direct_sequence() {
     assert_eq!(evaluate(&mut engine, "run(1000)"), "1000");
     assert_eq!(constructs() - before, 1000);
 }
+
+// ---- P3 stage 3 steps 6-7, A1: a chunk's learned instance layout ----
+
+/// `source` at the three tiers: the same completion at each, which is returned.
+fn same_at_every_tier(source: &str) -> String {
+    let mut results = Vec::new();
+    for tier in [Tier::Interp, Tier::Bytecode, Tier::Jit] {
+        let mut engine = Engine::new();
+        engine.set_tier(tier);
+        engine.set_tier_threshold(0);
+        results.push(evaluate(&mut engine, source));
+        assert!(engine.interp.fn_frames.is_empty(), "{tier:?}");
+    }
+    assert_eq!(results[0], results[1], "the interpreter against the VM");
+    assert_eq!(
+        results[0], results[2],
+        "the interpreter against the template JIT"
+    );
+    results.remove(0)
+}
+
+/// Constructors the static layout pass predicts nothing for (a store behind a jump, fields set
+/// by a called super constructor, no fields at all) go through `Op::New`'s helper for their
+/// first [`crate::bytecode`] learning constructions and through the direct construct sequence
+/// from the second construction after it ends (the first refreshes the site's entry): the
+/// chunk takes the layout of an instance it measured, or settles without keys. Their instances
+/// are the VM's.
+#[test]
+fn a_constructor_without_a_static_layout_takes_the_direct_sequence_once_its_learning_ends() {
+    crate::opt::pin_forced_exits_off_for_test();
+    crate::opt::pin_synchronous_for_test();
+    if !run_alone(
+        "jit::construct_tests::a_constructor_without_a_static_layout_takes_the_direct_sequence_once_its_learning_ends",
+    ) {
+        return;
+    }
+    let program = r#"
+        function Variable(name, initial) { this.value = initial || 0; this.name = name; }
+        function Base(a) { this.a = a; this.b = 1; }
+        function Sub(a) { Base.call(this, a); }
+        function Empty() {}
+        function Bare() {}
+        function variable(k) { return new Variable("v" + k, k); }
+        function sub(k) { return new Sub(k); }
+        function empty(k) { var e = new Empty(); e.late = k; return e; }
+        function bare(k) { return new Bare(); }
+        function shape(o) { return Object.keys(o).join() + ":" + JSON.stringify(o); }
+        function drive(from, to) {
+            var out = [];
+            for (var k = from; k < to; k++) out.push(shape(variable(k)), shape(sub(k)), shape(empty(k)), shape(bare(k)));
+            return out.join(";");
+        }
+    "#;
+    let expected = same_at_every_tier(&format!("{program} drive(0, 40)"));
+    assert!(
+        expected.contains(
+            "value,name:{\"value\":39,\"name\":\"v39\"};a,b:{\"a\":39,\"b\":1};late:{\"late\":39};:{}"
+        ),
+        "{expected}"
+    );
+    for (name, layout) in [
+        ("Variable", Some(2)),
+        ("Sub", Some(2)),
+        ("Empty", Some(1)),
+        ("Bare", None),
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        evaluate(&mut engine, &format!("{program} 0"));
+        let maker = name.to_lowercase();
+        // The learning's constructions (its first eight through the construct cache: those
+        // before the constructor has machine code are not counted): none direct.
+        let before = direct_constructs();
+        evaluate(&mut engine, &format!("{maker}(0); {maker}(1); 0"));
+        let constructor = chunk(&mut engine, name);
+        let mut made = 2;
+        while !constructor.instance_layout_settled() {
+            assert!(made < 24, "{name}: its learning never ended");
+            evaluate(&mut engine, &format!("{maker}({made}); 0"));
+            made += 1;
+        }
+        assert!(made >= 8, "{name}: settled after {made} constructions");
+        assert_eq!(
+            direct_constructs(),
+            before,
+            "{name}: no direct construction while learning"
+        );
+        assert_eq!(
+            constructor.instance_layout().map(|layout| layout.len()),
+            layout,
+            "{name}'s learned layout"
+        );
+        if cfg!(target_arch = "aarch64") {
+            // The next construction refreshes the site's entry through the helper; the rest are
+            // direct (but one where the caller's recompile starts its site afresh).
+            evaluate(&mut engine, &format!("{maker}({made}); 0"));
+            assert_eq!(
+                direct_constructs(),
+                before,
+                "{name}: the construction after the learning refreshes the entry"
+            );
+            evaluate(
+                &mut engine,
+                &format!("for (var k = 0; k < 100; k++) {maker}(k); 0"),
+            );
+            let direct = direct_constructs() - before;
+            assert!(
+                (98..=100).contains(&direct),
+                "{name}: {direct} of 100 direct"
+            );
+        }
+    }
+}
+
+/// What a chunk's learning may keep, and what it gives later instances: only the layout of an
+/// instance of one to sixteen plain String-keyed data properties; an instance with an accessor,
+/// a non-default attribute (frozen), a Symbol or an index key, a deleted property (its layout
+/// then its own), or forty keys settles the chunk without keys, or with the keys of the plain
+/// instance measured last. A layout is a prediction: whatever was kept, every later instance,
+/// of the learned shape or another, equals the VM's, as do a constructor that throws or returns
+/// an object while it learns, one that constructs itself, closures of one literal with
+/// different fields, and a base class reached by `new` and by two subclasses' `super`.
+#[test]
+fn a_learned_layout_is_a_prediction_whatever_the_measured_instances_were() {
+    let prelude = r#"
+        function show(o) {
+            var own = Object.getOwnPropertyNames(o).map(function(k) {
+                var d = Object.getOwnPropertyDescriptor(o, k);
+                return k + (d.get ? "@get" : "=" + d.value) + (d.writable === false ? "!w" : "") + (d.enumerable ? "" : "!e");
+            });
+            return own.join(",") + "/" + Object.getOwnPropertySymbols(o).length + "/" + Object.isFrozen(o) + "/" + (o instanceof Object);
+        }
+        function run(make, n) { var out = []; for (var k = 0; k < n; k++) { try { out.push(show(make(k))); } catch (e) { out.push("threw " + e); } } return out.join(";"); }
+    "#;
+    let cases = [
+        // The shape changes after the learning (the previous agent's L2).
+        "function Q(x, y) { if (x < 12) { this.a = x; this.b = y; } else { this.c = x; this.a = y; } }
+         run(function(k) { return new Q(k, 1); }, 40)",
+        // A return before the stores, a throw, a returned object, while it learns and after.
+        "function R(k) { if (k % 3 == 0) return; this.a = k; if (k % 5 == 1) throw 'no'; if (k % 7 == 2) return { other: k }; this.b = 2; }
+         run(function(k) { return new R(k); }, 40)",
+        // A constructor that constructs itself: the measured instance is unfinished.
+        "function N(d) { this.d = d; if (d > 0) this.child = new N(d - 1).d; this.e = 5; }
+         run(function(k) { return new N(k % 3); }, 30)",
+        // An outlier among the first eight: a bag of forty keys.
+        "function Bag(k) { if (k == 3) { for (var j = 0; j < 40; j++) this['f' + j] = j; } else { this.x = k || 1; this.y = 2; } }
+         run(function(k) { var b = new Bag(k); return k == 3 ? { keys: Object.keys(b).length } : b; }, 40)",
+        // Measured instances that are not plain: an accessor, a non-enumerable property, a
+        // Symbol key, an index key, a frozen instance, a deleted property, another prototype.
+        "function A(k) { this.p = k || 0; Object.defineProperty(this, 'g', { get: function() { return 1; }, enumerable: true, configurable: true }); this.q = 2; }
+         run(function(k) { return new A(k); }, 30)",
+        "function H(k) { this.p = k || 0; Object.defineProperty(this, 'h', { value: 3, enumerable: false, writable: true, configurable: true }); }
+         run(function(k) { return new H(k); }, 30)",
+        "var sym = Symbol('s'); function S(k) { this.p = k || 0; this[sym] = 1; this[7] = 2; this.q = 3; }
+         run(function(k) { return new S(k); }, 30)",
+        "function F(k) { this.p = k || 0; this.q = 1; if (k < 8) Object.freeze(this); }
+         run(function(k) { return new F(k); }, 30)",
+        "function D(k) { this.p = k || 0; this.q = 1; this.r = 2; if (k < 9) delete this.q; }
+         run(function(k) { return new D(k); }, 30)",
+        "var other = { marker: 1 }; function P(k) { this.p = k || 0; if (k % 2) Object.setPrototypeOf(this, other); this.q = 1; }
+         run(function(k) { var p = new P(k); return { keys: Object.keys(p).join(), marker: p.marker }; }, 30)",
+        // Fields the caller adds after the constructor returned are measured too.
+        "function L(k) { this.p = k || 0; }
+         run(function(k) { var l = new L(k); l.after = k; l.more = 1; return l; }, 30)",
+        // Closures of one literal with different fields share the chunk's layout.
+        "function maker(names) { return function(k) { for (var j = 0; j < names.length; j++) this[names[j]] = k + j; if (k < 0) this.neg = 1; }; }
+         var One = maker(['a', 'b']), Two = maker(['c', 'a', 'd']);
+         run(function(k) { return new One(k); }, 20) + '|' + run(function(k) { return new Two(k); }, 20)",
+        // A base class reached by `new` and by two subclasses' `super`, with different fields.
+        "class Base { constructor(k) { this.base = k || 0; } }
+         class Left extends Base { constructor(k) { super(k); this.left = 1; } }
+         class Right extends Base { constructor(k) { super(k); this.right = 2; this.more = 3; } }
+         run(function(k) { return k % 3 == 0 ? new Base(k) : k % 3 == 1 ? new Left(k) : new Right(k); }, 60)",
+        "function FBase(k) { this.base = k || 0; }
+         function FLeft(k) { FBase.call(this, k); this.left = 1; }
+         function FRight(k) { FBase.call(this, k); this.right = 2; this.more = 3; }
+         run(function(k) { return k % 3 == 0 ? new FBase(k) : k % 3 == 1 ? new FLeft(k) : new FRight(k); }, 60)",
+    ];
+    for case in cases {
+        let result = same_at_every_tier(&format!("{prelude} {case}"));
+        assert!(result.len() > 100, "{case}\n{result}");
+    }
+}
+
+/// The end of a constructor's learning changes no shape: an instance starts at the empty shape of
+/// its function's capacity class whether or not its chunk has a layout, so the creation caches at
+/// the constructor's stores, and code the optimizing tier compiled while the constructor was
+/// still learning, see the same shapes before and after. With the tier on (eagerly too) the
+/// functions that read the early instances take no exit for the instances the direct sequence
+/// makes after the switch; with it off the record of exits stays empty. The optimizing tier
+/// and its record of exits are ARM64's.
+#[test]
+#[cfg(target_arch = "aarch64")]
+fn the_end_of_a_constructors_learning_exits_no_compiled_function() {
+    crate::opt::pin_forced_exits_off_for_test();
+    crate::opt::pin_synchronous_for_test();
+    if !run_alone(
+        "jit::construct_tests::the_end_of_a_constructors_learning_exits_no_compiled_function",
+    ) {
+        return;
+    }
+    let early = r#"
+        function Variable(name, initial) { this.value = initial || 0; this.name = name; }
+        function read(o) { return o.value + o.name.length; }
+        function sum(list) { var s = 0; for (var j = 0; j < list.length; j++) s += read(list[j]); return s; }
+        var first = [];
+        for (var k = 0; k < 4; k++) first.push(new Variable("v" + k, k));
+        var total = 0;
+        for (var round = 0; round < 3000; round++) total += sum(first);
+        total
+    "#;
+    let late = r#"
+        var later = [];
+        for (var k = 0; k < 40; k++) later.push(new Variable("w" + k, k));
+        for (var round = 0; round < 300; round++) total += sum(later) + sum(first);
+        total
+    "#;
+    let mut vm = Engine::new();
+    vm.set_tier(Tier::Bytecode);
+    let expected = (evaluate(&mut vm, early), evaluate(&mut vm, late));
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    assert_eq!(evaluate(&mut engine, early), expected.0);
+    let constructor = chunk(&mut engine, "Variable");
+    assert!(!constructor.instance_layout_settled(), "four constructions");
+    let exits = || crate::opt::exit::TEST_EXITS.with(|exits| exits.borrow().len());
+    let before = exits();
+    let direct = direct_constructs();
+    assert_eq!(evaluate(&mut engine, late), expected.1);
+    assert!(constructor.instance_layout_settled());
+    if cfg!(target_arch = "aarch64") {
+        assert!(
+            direct_constructs() > direct,
+            "the later instances are the direct sequence's"
+        );
+    }
+    assert_eq!(
+        exits(),
+        before,
+        "no exit for the instances made after the learning: {:?}",
+        crate::opt::exit::TEST_EXITS.with(|exits| exits.borrow().clone())
+    );
+}
+
+/// The learned layout cell (`Chunk::learned_layout`) has three setters, each owning a kind of
+/// chunk (P3 stage 3 steps 6-7, A1): `Both` is a simple constructor and a forwarder's
+/// initializer, so the simple constructor's path and the Rust forwarder's plan may each set its
+/// cell, from one straight-line body and so with the same keys; `Branchy` has neither plan nor a
+/// static layout and is also a forwarder's initializer, so A1 alone sets its cell, from its own
+/// constructions, and the forwarders' constructions take it as a prediction; a recognized
+/// forwarder's own cell stays empty. Every tier makes the same instances.
+#[test]
+fn a_learned_layout_has_one_setter_for_each_kind_of_chunk() {
+    let program = r#"
+        var Class = { create: function() { return function() { this.initialize.apply(this, arguments); } } };
+        function Both(x, y) { this.x = x; this.y = y; }
+        function Branchy(x) { if (x >= 0) this.a = x; this.b = 1; }
+        var F = Class.create(); F.prototype = { initialize: Both };
+        var G = Class.create(); G.prototype = { initialize: Branchy };
+        function shape(o) { return Object.keys(o).join() + ":" + JSON.stringify(o); }
+        // The instances are kept: the learning measures each construction's predecessor
+        // through a weak handle, which a collection between the two (GC stress) would clear.
+        var kept = [];
+        function made(o) { kept.push(o); return shape(o); }
+        function drive(from, to) {
+            var out = [];
+            for (var k = from; k < to; k++) {
+                out.push(made(new Both(k, -k)), made(new F(k, -k)), made(new Branchy(k)), made(new G(k)));
+                if (k % 7 == 0) out.push(made(new Branchy(-k - 1)), made(new G(-k - 1)));
+            }
+            return out.join(";");
+        }
+    "#;
+    let expected = same_at_every_tier(&format!("{program} drive(0, 60)"));
+    assert!(
+        expected.ends_with(
+            "x,y:{\"x\":59,\"y\":-59};x,y:{\"x\":59,\"y\":-59};a,b:{\"a\":59,\"b\":1};a,b:{\"a\":59,\"b\":1}"
+        ),
+        "{expected}"
+    );
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    evaluate(&mut engine, &format!("{program} drive(0, 60); 0"));
+    let both = chunk(&mut engine, "Both");
+    assert!(both.jit_simple_constructor().is_some() && both.jit_initializer_plan().is_some());
+    assert_eq!(both.learned_layout().map(|layout| layout.len()), Some(2));
+    let branchy = chunk(&mut engine, "Branchy");
+    assert!(branchy.jit_simple_constructor().is_none() && branchy.jit_initializer_plan().is_none());
+    assert!(branchy.instance_layout_settled());
+    assert_eq!(branchy.learned_layout().map(|layout| layout.len()), Some(2));
+    for forwarder in ["F", "G"] {
+        let chunk = chunk(&mut engine, forwarder);
+        assert!(
+            chunk.jit_arguments_apply_forwarder().is_some(),
+            "{forwarder}"
+        );
+        assert!(chunk.learned_layout().is_none(), "{forwarder}'s own cell");
+    }
+}
+
+/// The end of a constructor's learning takes the measured instance's layout only where that
+/// instance is one of the largest measured and its layout is one a chunk may take (P3 stage 3
+/// steps 6-7, A1; `value::Props::learnable_layout`): `Small`'s last measured instance holds one
+/// key where earlier ones held two (it settles without keys), `Attr`'s holds a read-only
+/// property, and `Many`'s seventeen keys, one past the bound (an instance past sixteen keys
+/// carries a key index of its own, `value::Props::learnable_layout`): each settles and takes no
+/// layout; `Bound`'s sixteen, at the bound, are learnt.
+#[test]
+fn a_learned_layout_is_only_a_largest_plain_small_instances() {
+    let program = r#"
+        function Small(k) { if (k >= 0) this.a = k; if (k > 100) this.b = k; }
+        function Attr(k) { if (k >= 0) Object.defineProperty(this, "a", { value: k, writable: false, enumerable: true, configurable: true }); this.b = 1; }
+        function Many(k) { if (k >= 0) { this.f0 = k; this.f1 = k; this.f2 = k; this.f3 = k; this.f4 = k; this.f5 = k; this.f6 = k; this.f7 = k; this.f8 = k; this.f9 = k; this.f10 = k; this.f11 = k; this.f12 = k; this.f13 = k; this.f14 = k; this.f15 = k; this.f16 = k; } }
+        function Bound(k) { if (k >= 0) { this.f0 = k; this.f1 = k; this.f2 = k; this.f3 = k; this.f4 = k; this.f5 = k; this.f6 = k; this.f7 = k; this.f8 = k; this.f9 = k; this.f10 = k; this.f11 = k; this.f12 = k; this.f13 = k; this.f14 = k; this.f15 = k; } }
+        function bound(k) { return new Bound(k); }
+        function small(k) { return new Small(k); }
+        function attr(k) { return new Attr(k); }
+        function many(k) { return new Many(k); }
+        var kept = [];
+    "#;
+    for (name, learnt) in [
+        ("Small", None),
+        ("Attr", None),
+        ("Many", None),
+        ("Bound", Some(16)),
+    ] {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(0);
+        evaluate(&mut engine, &format!("{program} 0"));
+        let maker = name.to_lowercase();
+        evaluate(&mut engine, &format!("{maker}(1000); 0"));
+        let constructor = chunk(&mut engine, name);
+        let mut made = 0;
+        while !constructor.instance_layout_settled() {
+            assert!(made < 40, "{name}: its learning never ended");
+            // Small: two keys until the seventh counted construction, whose instance the
+            // eighth measures, then one.
+            let k = if constructor.construct_learning_count() < 6 {
+                1000
+            } else {
+                5
+            };
+            // Kept: the learning measures each instance through a weak handle.
+            evaluate(&mut engine, &format!("kept.push({maker}({k})); 0"));
+            made += 1;
+        }
+        assert_eq!(
+            constructor.learned_layout().map(|layout| layout.len()),
+            learnt,
+            "{name}'s learnt layout"
+        );
+    }
+}

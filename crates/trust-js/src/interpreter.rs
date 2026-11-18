@@ -17459,8 +17459,7 @@ impl Interp {
             chunk.note_forwarded_capacity(plan.len());
             let mut object = this.borrow_mut();
             let empty_receiver = crate::value::is_empty_shape(object.props.shape());
-            let initialized_layout =
-                empty_receiver && initializer_chunk.initializer_layout().is_some();
+            let initialized_layout = empty_receiver && initializer_chunk.learned_layout().is_some();
             if empty_receiver {
                 if let Some(layout) = initializer_chunk.instance_layout() {
                     object.props.predict_empty_layout(layout);
@@ -17498,7 +17497,7 @@ impl Interp {
                 .props
                 .finish_proven_plain_shape(shapes[plan.len() - 1]);
             if empty_receiver {
-                initializer_chunk.note_initializer_layout(
+                initializer_chunk.note_learned_layout(
                     object
                         .props
                         .shared_layout()
@@ -17835,7 +17834,8 @@ impl Interp {
             self.depth -= 1;
             return Some(r);
         }
-        let (ic, prototype_shape, prototype_slot, arguments_apply_forwarder) = match cached_site {
+        let (mut ic, prototype_shape, prototype_slot, arguments_apply_forwarder) = match cached_site
+        {
             Some(entry) => (
                 entry.call,
                 entry.prototype_shape,
@@ -17903,6 +17903,25 @@ impl Interp {
             }
         };
         let chunk = unsafe { &*ic.chunk };
+        // An entry filled before the chunk's instance layout settled has no bit 0, so every
+        // construction of it comes here; the first one after the chunk's construct learning
+        // ended gives the entry the flags it would be filled with now, in the site's entry and
+        // in the engine's, from which other sites fill (P3 stage 3 steps 6-7, A1). The next
+        // construction at the site takes the direct construct sequence.
+        if ic.direct & 1 == 0 && !arguments_apply_forwarder && chunk.instance_layout_settled() {
+            let direct = chunk.jit_construct_flags(&code, false) | (ic.direct & 4);
+            if direct != ic.direct {
+                ic.direct = direct;
+                if let Some((site_chunk, cache)) = site {
+                    site_chunk.refresh_construct_direct(cache, key, direct);
+                }
+                if let Some(entry) = self.construct_ics.get_mut(&key) {
+                    if entry.pin.as_ptr() == Gc::as_ptr(o) {
+                        entry.call.direct = direct;
+                    }
+                }
+            }
+        }
         let static_capacity = chunk.instance_capacity_hint();
         // A non-zero chunk hint is already the exact straight-line `this.x = ...` prefix that
         // dominates ordinary constructors. Avoid two constructor-identity hash probes per
@@ -18010,7 +18029,7 @@ impl Interp {
             };
             if let Some(shapes) = shapes {
                 let mut object = this.borrow_mut();
-                let initialized_layout = chunk.initializer_layout().is_some();
+                let initialized_layout = chunk.learned_layout().is_some();
                 for field in 0..simple.len() {
                     let (slot, name, _) = simple.field(field);
                     let value = if slot < argc {
@@ -18036,8 +18055,7 @@ impl Interp {
                 object
                     .props
                     .finish_proven_plain_shape(shapes[simple.len() - 1]);
-                chunk
-                    .note_initializer_layout(object.props.shared_layout().expect("created fields"));
+                chunk.note_learned_layout(object.props.shared_layout().expect("created fields"));
                 drop(object);
                 self.depth -= 1;
                 return Some(Ok(this_val));

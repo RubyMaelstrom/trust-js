@@ -3608,10 +3608,33 @@ pub struct Chunk {
     /// latest one's instance, held weakly until the next construction measures it.
     learning: std::cell::Cell<u8>,
     learning_instance: std::cell::RefCell<Option<crate::value::WeakGc>>,
-    /// Key-only prediction learned from this chunk's guarded initializer plan. Forwarding
-    /// closures may share a wrapper chunk while selecting different initializers, so the keys
-    /// belong to the initializer, not the wrapper. Live plan guards remain authoritative.
-    initializer_layout: std::cell::OnceCell<crate::value::PropertyLayout>,
+    /// The instance layout this chunk's code learned (a key-only prediction, read before the
+    /// static one by [`Chunk::instance_layout`]), set once, by the first of its three setters,
+    /// each of which owns a kind of chunk:
+    /// - an initializer's plan (`Chunk::jit_initializer_plan`): the Rust forwarder sets the
+    ///   INITIALIZER's chunk from the instance its plan filled (`Interp::
+    ///   construct_arguments_apply_forwarder`). Forwarding closures may share a wrapper chunk
+    ///   while selecting different initializers, so the keys belong to the initializer, not the
+    ///   wrapper (a recognized forwarder's own cell stays empty). Live plan guards remain
+    ///   authoritative.
+    /// - a simple constructor (`Chunk::jit_simple_constructor`): `Interp::construct_jit_fast`
+    ///   sets the CONSTRUCTOR's chunk from the fields its plan appended. A chunk that is both
+    ///   an initializer and a simple constructor has one straight-line `this.<f> = <param>`
+    ///   body, from which both plans take the same keys in the same order: whichever runs first
+    ///   sets the cell, and the other's layout is the same.
+    /// - A1 (P3 stage 3 steps 6-7): a constructor's chunk that has neither plan, no static
+    ///   layout and is no recognized forwarder ([`Chunk::learns_instance_layout`]) takes the
+    ///   layout of the instance measured when its construct learning ends
+    ///   ([`Chunk::note_instance`]), as the exemplars make a constructor's template from its
+    ///   first constructions and not from its body (V8's initial map and slack tracking,
+    ///   js-function.cc:939-975, map.h:443-473; JSC's allocation profile,
+    ///   ObjectAllocationProfileInlines.h:67-110; SpiderMonkey's this-shape, PlainObject.cpp
+    ///   :40-62). Its chunks are none of the others', so no learned layout ever meets the
+    ///   simple constructor's path, which appends its fields in the layout's order unchecked
+    ///   in release builds (`Props::append_initialized_field`). Every other reader takes the
+    ///   layout as a prediction: an instance whose stores differ makes its own transitions.
+    /// A root from its setting on (`trace_gc`, `value::remember_code_edges`).
+    learned_layout: std::cell::OnceCell<crate::value::PropertyLayout>,
     /// Inner function templates for `MakeClosure`.
     funcs: Vec<Rc<Function>>,
     /// Tagged-template sites retained by the chunk. Each entry carries the Parse Node identity
@@ -4092,7 +4115,7 @@ impl crate::gc_trace::GcTrace for Chunk {
             instance_class: _,
             learning: _,
             learning_instance: _, // weak: the heap clears it
-            initializer_layout,
+            learned_layout,
             funcs: _,
             templates: _,
             eval_exprs: _,
@@ -4184,7 +4207,7 @@ impl crate::gc_trace::GcTrace for Chunk {
         consts.trace_gc(sink);
         private_sites.as_ref().trace_gc(sink);
         instance_layout.trace_gc(sink);
-        if let Some(layout) = initializer_layout.get() {
+        if let Some(layout) = learned_layout.get() {
             layout.trace_gc(sink);
         }
         for map in obj_maps {
@@ -4484,7 +4507,7 @@ impl Chunk {
             if let Some(layout) = &self.instance_layout {
                 visitor.property_layout(layout);
             }
-            if let Some(layout) = self.initializer_layout.get() {
+            if let Some(layout) = self.learned_layout.get() {
                 visitor.property_layout(layout);
             }
         }
@@ -5020,7 +5043,12 @@ impl Chunk {
 
     /// Note a construction's new instance (W2d step 3d): over the first [`CONSTRUCT_LEARNING`]
     /// constructions, raise the learned capacity to what the previous instance holds now, and
-    /// keep this one, weakly, for the next. Afterwards one compare.
+    /// keep this one, weakly, for the next. Afterwards one compare. The construction that ends
+    /// the learning also settles the chunk's instance layout (A1): a chunk without a static
+    /// layout that is no recognized forwarder takes the layout of the instance measured then,
+    /// where that instance is one of the largest measured and its layout is one a chunk may
+    /// take ([`crate::value::Props::learnable_layout`]); otherwise it has none for good.
+    /// Nothing relearns: an instance that differs later makes its own transitions.
     #[inline]
     pub(crate) fn note_instance(&self, instance: &crate::value::Gc) {
         let seen = self.learning.get();
@@ -5031,24 +5059,58 @@ impl Chunk {
     #[inline(never)]
     fn note_instance_learning(&self, instance: &crate::value::Gc, seen: u8) {
         let mut previous = self.learning_instance.borrow_mut();
+        let ends = seen + 1 >= CONSTRUCT_LEARNING;
         if let Some(previous) = previous.take().and_then(|weak| weak.upgrade()) {
-            let held = previous
-                .try_borrow()
-                .map_or(0, |object| object.props.named_len());
-            let held = u8::try_from(held).unwrap_or(u8::MAX);
-            if held > self.learned_capacity.get() {
-                self.learned_capacity.set(held);
+            if let Ok(object) = previous.try_borrow() {
+                let held = u8::try_from(object.props.named_len()).unwrap_or(u8::MAX);
+                if held > self.learned_capacity.get() {
+                    self.learned_capacity.set(held);
+                }
+                if ends && held >= self.learned_capacity.get() && self.learns_instance_layout() {
+                    if let Some(layout) = object.props.learnable_layout() {
+                        self.note_learned_layout(layout);
+                    }
+                }
             }
         }
         self.learning.set(seen + 1);
-        if seen + 1 < CONSTRUCT_LEARNING {
+        if !ends {
             *previous = Some(crate::value::Gc::downgrade(instance));
         }
     }
+    /// Whether the end of the chunk's construct learning may give it a layout (A1): the static
+    /// pass predicted none, and the chunk is no recognized forwarder, whose instances the
+    /// forwarder's paths allocate by its initializer's layout.
+    fn learns_instance_layout(&self) -> bool {
+        // A chunk with an initializer plan or a simple constructor always has a static layout:
+        // both plans are straight-line `this.<name> = <parameter>` bodies, the prefix the static
+        // pass predicts (`finish_chunk`'s instance_capacity_hint), so the static layout's test
+        // keeps A1 from the plans' chunks, whose paths set the learned cell themselves and one
+        // of which appends its fields in the cell's order unchecked in release builds
+        // (`value::Props::append_initialized_field`). A change that breaks this fails here.
+        debug_assert!(
+            self.instance_layout.is_some()
+                || (self.jit_initializer_plan().is_none()
+                    && self.jit_simple_constructor().is_none()),
+            "a planned chunk has no static instance layout"
+        );
+        self.instance_layout.is_none() && self.jit_arguments_apply_forwarder().is_none()
+    }
     pub(crate) fn instance_layout(&self) -> Option<&crate::value::PropertyLayout> {
-        self.initializer_layout
-            .get()
-            .or(self.instance_layout.as_ref())
+        self.learned_layout.get().or(self.instance_layout.as_ref())
+    }
+    /// Whether the chunk's instance layout is settled (A1): it has one (static, an
+    /// initializer's, or learned), or its construct learning is over and it has none for good
+    /// (an empty constructor's instances, or instances no layout a chunk may take describes).
+    /// The direct construct sequence takes a settled chunk's constructions
+    /// ([`Chunk::jit_construct_flags`]): before that, the helper's path allocates and measures.
+    /// The constructions this chunk's construct learning has counted (tests).
+    #[cfg(test)]
+    pub(crate) fn construct_learning_count(&self) -> u8 {
+        self.learning.get()
+    }
+    pub(crate) fn instance_layout_settled(&self) -> bool {
+        self.instance_layout().is_some() || self.learning.get() >= CONSTRUCT_LEARNING
     }
     pub(crate) fn note_forwarded_capacity(&self, capacity: usize) {
         self.forwarded_capacity_hint
@@ -5057,14 +5119,14 @@ impl Chunk {
     pub(crate) fn has_forwarded_capacity(&self) -> bool {
         self.forwarded_capacity_hint.get() != 0
     }
-    pub(crate) fn initializer_layout(&self) -> Option<&crate::value::PropertyLayout> {
-        self.initializer_layout.get()
+    pub(crate) fn learned_layout(&self) -> Option<&crate::value::PropertyLayout> {
+        self.learned_layout.get()
     }
-    pub(crate) fn note_initializer_layout(&self, layout: &crate::value::PropertyLayout) {
-        if self.initializer_layout.get().is_none() {
+    pub(crate) fn note_learned_layout(&self, layout: &crate::value::PropertyLayout) {
+        if self.learned_layout.get().is_none() {
             // A late fill of this registered code root (see `value::remember_code_edges`).
             crate::value::remember_code_edges(layout);
-            let _ = self.initializer_layout.set(layout.clone());
+            let _ = self.learned_layout.set(layout.clone());
         }
     }
     #[cfg(test)]
@@ -5101,6 +5163,20 @@ impl Chunk {
         entry.call.direct &= !CALL_IC_FORWARD;
         entry.forward.refused = initializer;
         entry.forward.refused_epoch = epoch;
+    }
+    /// Give construct site `cache`'s entry the direct gates `direct` while it names `callee`
+    /// (P3 stage 3 steps 6-7, A1): an entry filled before its constructor's chunk settled its
+    /// instance layout, refreshed by the helper's path
+    /// (`Interp::construct_jit_fast`). A forwarder's forward bit, were it set, stays.
+    pub(crate) fn refresh_construct_direct(&self, cache: u32, callee: usize, direct: u8) {
+        let Some(site) = self.construct_caches.get(cache as usize) else {
+            return;
+        };
+        // SAFETY: as `with_construct_cache`: no reference to the entry is live.
+        let entry = unsafe { &mut *site.as_ptr() };
+        if entry.call.callee == callee {
+            entry.call.direct = direct | (entry.call.direct & CALL_IC_FORWARD);
+        }
     }
     /// Record `entry` at construct site `cache`, with `pin`, the weak pin of its constructor
     /// (`entry.call.callee`): the engine's construct cache's own (`Interp::construct_ics`),
@@ -10498,7 +10574,7 @@ fn finish_chunk(
         instance_class: std::cell::Cell::new(crate::function_runtime::CLASS_UNDECIDED),
         learning: std::cell::Cell::new(0),
         learning_instance: std::cell::RefCell::new(None),
-        initializer_layout: std::cell::OnceCell::new(),
+        learned_layout: std::cell::OnceCell::new(),
         funcs: c.funcs,
         templates: c.templates,
         eval_exprs: c.eval_exprs,
@@ -25513,7 +25589,7 @@ impl Chunk {
         arguments_apply_forwarder: bool,
     ) -> u8 {
         let mut f = self.jit_direct_flags(code) & !CALL_IC_DIRECT_READY;
-        if arguments_apply_forwarder || self.instance_layout().is_none() {
+        if arguments_apply_forwarder || !self.instance_layout_settled() {
             f &= !1;
         }
         if f & (1 | 2 | 8) == (1 | 8) {
@@ -29393,7 +29469,10 @@ pub(crate) unsafe extern "C" fn jit_construct_this(
     // layout, which the entry's gate bits require (`Chunk::jit_construct_flags`).
     let chunk = unsafe { &*site.call.chunk_raw };
     let layout = chunk.instance_layout().cloned();
-    debug_assert!(layout.is_some(), "the entry's gates require a field layout");
+    debug_assert!(
+        chunk.instance_layout_settled(),
+        "the entry's gates require a settled field layout"
+    );
     let capacity = chunk
         .instance_capacity_hint()
         .max(layout.as_ref().map_or(0, |keys| keys.len()));
@@ -33337,7 +33416,7 @@ mod layout_cell_roots_tests {
     use crate::value::{new_property_layout, Props};
 
     #[test]
-    fn chunks_root_static_and_late_initializer_layouts_and_constants() {
+    fn chunks_root_static_and_late_learned_layouts_and_constants() {
         let (heap, _release, _active) = isolated();
         let body = crate::parser::parse_script(
             "function C(){this.first=1;this.second=2;return 'kept constant';}",
@@ -33376,7 +33455,7 @@ mod layout_cell_roots_tests {
         assert!(weak_prediction.live_ptr().is_some());
         let learned = new_property_layout(vec![Rc::from("late initializer prediction")]);
         let learned_word = learned.cell_word();
-        chunk.note_initializer_layout(&learned);
+        chunk.note_learned_layout(&learned);
         drop(learned);
         for kind in [CollectionKind::Minor, CollectionKind::Major] {
             collect(&heap, &Words(Vec::new()), kind);
