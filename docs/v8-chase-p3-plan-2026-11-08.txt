@@ -6998,3 +6998,30 @@ target/p3/stage3/f4-impl/design-note.txt, and the flip, on the table above).
 - The flip: graph becomes the default after the register allocator's rule B lands, on the
   table taken again on that main; GBEMU's and Splay's remaining instruction gaps are recorded
   with their causes and their two follow-on pieces, not waited for.
+
+A defect in the default configuration, found and fixed (936676c1, 2026-11-19;
+target/p3/stage3/f4p2-impl/refloc and l1/adv, the agent's; the coordinator's programs
+target/p3/stage3/stepb-review/refloc). Found by the agent building the global dependencies
+while it read every path that writes a global. A top-level assignment to a global (and one in
+a function with a direct eval) is a Reference; the template JIT's in-line ResolveNameRef
+refreshed that Reference's shape and slot from the name's resolution site but not the word
+that locates the slot, on ARM64 and x86-64 alike. The site is shared by every assignment of
+the name in the chunk, each with its own Reference, so after the global's slot moved (the
+global deleted and added again, or an earlier property removed) one assignment's helper
+refilled the site for the new slot and the other assignment then wrote through its stale
+location: into another global's slot.
+- The program: `a = 1; x = 2; b = 3; for (...) { x = i; if (i == 1000) { delete x; x = 0 }
+  x = i + 0.5 }` printed b as 1999 at the default tier and 3 in the VM and the tree-walker.
+  It is on every engine back to the phase-2 exit and not on October's: it came in with the
+  caches' location word (d79b2a13), and it is on origin.
+- The fix: the in-line refresh copies the location word beside the other two (two
+  instructions a ResolveNameRef, both templates). Every other place that fills or copies a
+  Reference or a name cache was read and carries all three words.
+- Tests: seven programs at the three tiers against each other with the neighbour global
+  intact, the read side among them; with the copy removed six fail on each architecture (the
+  seventh is a control that takes no in-line path). The coordinator's three further programs,
+  two of which fail on main's engine (one corrupts three globals), agree at every tier on the
+  fixed engine, with the tier on and at graph as well.
+- The measurements of the two added instructions (template code otherwise identical, the
+  name-store micro, CodeLoad and the fixtures) were still being taken when it landed; they are
+  added below when they are in.
