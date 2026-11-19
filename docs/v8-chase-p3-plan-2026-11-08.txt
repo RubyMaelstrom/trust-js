@@ -8488,3 +8488,47 @@ item1-report.txt).
   when the trap returns a constant, 688 and 666 when it forwards by Reflect.get
   (p1g/proxy/per-read.txt); inferred, the engine's own dispatch is about 3% of Vue's steady
   state at graph.
+
+Graph piece 3, `instanceof` landed (5697a43a; 2026-11-20 00:45;
+target/p3/stage3/gp3-impl/io-commit-msg.txt, report2.txt, q-io3/, the agents'; the
+coordinator's check target/p3/stage3/io-review).
+- What it is: `x instanceof F` whose site's cell holds one plain constructor is built in the
+  graph: the right-hand side's identity by its shape and a CheckCtor (an ordinary function
+  with the realm's own Symbol.hasInstance, no own one), its `prototype` read as a field, and
+  the left-hand side's chain walked in line; in the splice too (a record-map kind of its
+  own). The teacher is the first stage's cell: the helper marks a cell generic when a
+  right-hand side arrives that the cell cannot hold, from the fill decision it already
+  makes.
+- Measured, the coordinator's rows (fat LTO b5572b26, the same crates, against the frame
+  fix's dbf8650d; 200 fixed runs, collections deferred; graph | the splice): Earley-Boyer
+  -8.23% | -7.88%, Box2D -0.23% | -0.22%; the agent's PdfJS -0.11% | -0.10%. At 5 runs
+  deferred: Earley-Boyer -7.4%, Box2D -0.10%. Plain 5-run rows of Splay (+1.9%) and
+  TypeScript (+1.4%) at graph were draws of the incremental marker under load: with the
+  marker not incremental on a quiet core +0.001% and +0.012%.
+- The tier off: the template JIT's code equal by name (Earley-Boyer, PdfJS, Box2D,
+  DeltaBlue, GBEMU); 5-run rows within 0.02% deferred. A RESIDUE stays, by ten randomized
+  runs a side with collections deferred: Earley-Boyer +0.0175% (sd 0.0009%), PdfJS +0.012%,
+  read as the mark's compare on each helper call whose right-hand side matches the cell
+  (the first form's second borrow cost +0.025% and +0.016% and was removed). A form with no
+  cost (the helper does not rewrite a cell that already holds the same shape) is the
+  line's follow-up.
+- Always wrong, the agent's programs: a Proxy left-hand side at a warm site 1,900 to 1,914
+  instructions an execution after two discards; a mixed site level after the decline.
+- Checked: the coordinator's 80 adversarial programs at seven modes, against main's engine
+  and under GC stress at graph: none differs. One new, agreeing with Node first: seventeen
+  kinds of left-hand side against plain constructors and classes; the right-hand side's
+  prototype replaced and restored, the left-hand side's chain changed from outside the
+  loop and from a getter inside it; Symbol.hasInstance as an own static, added after
+  warm-up, returning truthy and falsy values, a throwing getter, undefined, a non-callable,
+  deleted again, on a plain object; bound functions twice bound, arrows, generators, async
+  functions, non-callables, a `prototype` that is no object, a Proxy on either side, a
+  getPrototypeOf trap that changes its answer and one that throws; sixteen constructors at
+  one warm site; an object with a function's own layout that is no function. The agent's
+  mutations all caught (two of the first agent's were not: a CheckCtor test that needed an
+  object reaching the constructor's exact shape, and a mutation that was equivalent because
+  LoadField's code reads its location, never its slot); the verifier sweep clean; Test262
+  eager 53,572 of 53,575. The merged main on the x86-64 host: check, clippy and Windows
+  check 0.
+- Where it meets the folds of the same night: a constructor folded from a global is a
+  FoldedGlobal word on the right-hand side; its shape check and CheckCtor are still built
+  (no dependency replaces them yet).
