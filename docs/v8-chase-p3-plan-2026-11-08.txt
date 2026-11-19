@@ -8212,3 +8212,59 @@ coordinator's check target/p3/stage3/ga-review).
   validated accessor landing (a setter store finds its accessor twice today: about 226 of
   the 682); the tier's node for a typed array's getters; the stub on x86-64. The owner's
   question 16: an accessor kind of its own for the embedding API.
+
+F4 part 2, the functions piece landed: the tier folds a function held in a global (b5b97df1;
+2026-11-19; target/p3/stage3/f4p2-impl/l4/report-fn.txt, the agent's; the coordinator's check
+target/p3/stage3/fn-review).
+- What it is. A global whose state is Constant and whose value is callable becomes a
+  FoldedGlobal as a typed array's does (an object word with a home, loaded from the literal
+  pool), and an inline guard on it builds no callee check when the folded word is the
+  plan's callee, the read's global object is the plan's Realm, there is no closure
+  environment to compare and no receiver to test (V8 treats a constant JSFunction target
+  so, js-call-reducer.cc:5184-5189; the DFG removes a CheckIsConstant it has proven,
+  ConstantFoldingPhase.cpp:450-456). The function's identity fixes its environment, its
+  Realm and its code for good; it does not fix its `prototype` or its own properties: a
+  construction reads `prototype` each time, and that read is not folded (tested).
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/ed95a2d8 against main's
+  53a54236; 200 fixed runs; graph | the splice): Mandreel -4.82% | -4.91% (the count had
+  predicted -3.9%: `uint` and its kin, 355M reads behind 1,102M callee checks), Earley-Boyer
+  -0.61% | -0.96% with collections running (the agent's rows with the marker off: -0.73% |
+  -0.85%); at 5 runs Mandreel -2.04%; the rest within the draws, the tier off equal.
+- Always wrong, the agent's micros: the function replaced once after the compile: one
+  invalidation, compiles and discards as the parent's; replaced every call: never folded;
+  a constructor's prototype replaced: no invalidation.
+- Checked: the coordinator's 74 adversarial programs at seven modes, against main's engine
+  and under GC stress at graph: none differs (three new ones, each agreeing with Node
+  first: a global function replaced by assignment, from inside itself, by eval, by a
+  number, a bound function, a class, an arrow and a Proxy, deleted and added again;
+  constructors with `prototype` and the constructor replaced, sloppy and strict `this`, a
+  throwing callee's stack names; recursion through the global name with the global
+  replaced on the way down, mutual recursion, a closure stored in a global); zombie's
+  check, clippy and Windows check on the landing tree; the agent's tests in four
+  configurations, the tier's modules with the tier on (one test that counted a guard's own
+  WrongCallee on a global that now folds is pinned with the fold off), the verifier sweep.
+  One mutation is not caught: the comparison of the folded function with the plan's callee
+  removed. No program reaches a compile whose plan names another function (a replaced
+  global is planned again first); it stays as a safety condition, with a debug assertion
+  owed with the next commit of the line.
+- What it hands on: a call the tier does not inline whose callee is a folded function has
+  a KNOWN callee with no guard: stage 3's step 7 makes that call direct (263.5M of
+  Mandreel's 351.6M non-inlined calls at 200 runs are of this kind).
+- A build broken by layer 4a and fixed forward the same night (6f76dcad): 804ff7d8 made the
+  builder, which every architecture compiles, call a predicate in the ARM64 back end's
+  register allocator; x86-64 and Windows did not build from 21:22 to 23:20. The megamorphic
+  line's cross-check of an unrelated commit found it. 4a's landing form carried no x86-64
+  check and the coordinator did not ask for one: from here on a landing that touches a file
+  the other architectures compile carries zombie's check, clippy and Windows check, the
+  agent's or the coordinator's own (three to five minutes).
+- The data test, counted (l4/typeddata-count.txt; a probe that numbers effect epochs as
+  they RUN): a typed element access's data test is 10.2% of Mandreel's instructions at 200
+  runs with the folds in; 7.1 points of it repeat a test of the same view with no effect
+  run in between (84% of those in loops): the builder's per-epoch fact is lost where paths
+  merge and at the headers of loops whose call lies on a path not taken; 3.1 points are the
+  first test after an effect. zlib: 3.7 and 0.7 points; GBEMU (after the getter line): 0.5
+  and 3.5. So the next piece of this line is the fact kept across merges and loop headers
+  on paths where no effect runs (the exemplars' load elimination along their effect
+  chains), before any dependency; then the length under the detach bit (4b, decided, not
+  built), then what an effect must really invalidate for a view of a buffer that cannot be
+  resized.
