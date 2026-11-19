@@ -2184,16 +2184,31 @@ fn swap_in_template(i: &mut Interp, chunk: &Chunk, table: &ExitTable) -> &'stati
 /// the loop's body behind its test), HoistingFailed at the header, which leaves every check of the
 /// loop at its operation (JSC's HoistingFailed site), and the sites that run whenever the loop is
 /// entered, whose failure is certain (the same invariant value, on every entry), flagged as well.
+/// A loop's global read's own check made at its entry (F4 part 1) exits for the read's reason
+/// [WrongName], and each read it proves is judged by whether it ran since the compile: its cache
+/// refilled against the snapshot's words (`NameFill::refilled_by`; an epoch move gives the global
+/// object a shape no earlier fill holds). A read that ran would have failed the check in place
+/// (nothing the loop runs moves the epoch, a generation or the environment the check tests): it
+/// is flagged as its own check's exit flags it, WrongName with the proof the check expected
+/// (`Rules::stale_name` then checks again where the epoch moved, and takes the effect where it
+/// did not). A read that did not run, or whose cache was cleared or refilled in another mode, is
+/// a hoisting failure at its own pc [HoistingFailed], after which the loop prepass no longer
+/// moves it (`Rules::global_source`): Ion's LICM bailout, which a baseline fallback hit after it
+/// turns into the guard's own bailout and which otherwise invalidates the script with LICM off
+/// for good (jit/BaselineBailouts.cpp:2061-2084, jit/BaselineIC.cpp:450-458), narrowed from
+/// the script to the read. The header is not flagged. Such a read is never held (a read whose
+/// flag holds its proof is stale and takes the effect: no entry check).
 fn flag_moved(
     chunk: &Chunk,
     table: &ExitTable,
     exit: &ExitRecord,
     sites: &[super::exit::MovedSite],
 ) {
-    if sites.is_empty() || !sites.iter().all(|site| site.anyway) {
+    let own = exit.reason == ExitReason::WrongName;
+    if !own && (sites.is_empty() || !sites.iter().all(|site| site.anyway)) {
         flag(chunk, exit, super::exit::exit_chunk(table, exit));
     }
-    for site in sites.iter().filter(|site| site.anyway) {
+    for site in sites.iter().filter(|site| own || site.anyway) {
         let (at, pc, inlined) = match super::exit::site_chunk(table, site) {
             Some(callee) => (callee, site.pc, true),
             None => match profile::baseline_site(chunk, site.pc as usize) {
@@ -2201,15 +2216,30 @@ fn flag_moved(
                 None => (chunk, site.pc, false),
             },
         };
+        // A global read ran since the compile where its cache, in the chunk whose operation it
+        // is, was refilled since the snapshot.
+        let ran = own
+            && site.fill.is_some_and(|then| {
+                let running = super::exit::site_chunk(table, site).unwrap_or(chunk);
+                super::snapshot::name_fill(running, site.pc as usize)
+                    .is_some_and(|now| then.refilled_by(now))
+            });
+        let first = if own && !ran {
+            ExitReason::HoistingFailed
+        } else {
+            site.reason
+        };
         // A site whose own flag the code's snapshot held, which the moved check stood for
         // anyway: the form that flag left exits for its reason too, so the site goes generic
         // (P3 stage 3 step L5).
-        let generic = site.held && site.reason.generic_eligible();
-        for reason in [site.reason, ExitReason::Generic] {
+        let generic = !own && site.held && site.reason.generic_eligible();
+        for reason in [first, ExitReason::Generic] {
             if reason == ExitReason::Generic && !generic {
                 continue;
             }
-            let new = ChunkProfile::of(at).add_site(pc, reason as u8, inlined, 0, false);
+            // The proof a global read's check expected, the latest kept (as `flag_as` keeps it).
+            let data = if ran { exit.profile_data() } else { 0 };
+            let new = ChunkProfile::of(at).add_site(pc, reason as u8, inlined, data, ran);
             if new && log_enabled() {
                 let key = if std::ptr::eq(at, chunk) {
                     "own".to_string()

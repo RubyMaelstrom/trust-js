@@ -162,6 +162,9 @@ pub(crate) struct MovedSite {
     /// The site's own reason was already flagged at it in the code's snapshot (P3 stage 3 step
     /// L5): the moved check's exit then makes the site Generic, as an exit there would.
     pub(crate) held: bool,
+    /// A loop's global read (F4 part 1): its cache words as the compile's snapshot read them,
+    /// which the discard compares with its cache then (`driver::flag_moved`).
+    pub(crate) fill: Option<super::snapshot::NameFill>,
 }
 
 /// [`MovedSite::chunk`] of a site of the compiled function's own frame.

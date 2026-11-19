@@ -687,6 +687,7 @@ impl<'g> Selector<'g> {
                         reason: node.reason.expect("a check's reason"),
                         frame,
                         anyway: selector.runs_anyway(header, block),
+                        fill: None,
                     };
                     if !sites.contains(&site) {
                         sites.push(site);
@@ -880,18 +881,23 @@ impl<'g> Selector<'g> {
             }
         }
         for entry in typed {
-            let Some(&header) = headers.get(&(entry.header_pc, entry.frame)) else {
-                continue;
-            };
+            // A block that heads a loop of the bytecode and got no back edge (the verifier's
+            // module doc) is no header here: its checks' sites are blind, so that a check whose
+            // exit keeps its sites' reason (a global read's, F4 part 1) still teaches them, and a
+            // HoistingFailed check flags the header as its own exit would.
+            let header = headers.get(&(entry.header_pc, entry.frame)).copied();
             // A receiver's pcs are distinct (the loop prepass visits each operation once).
             let mut sites: Vec<MovedSite> = Vec::with_capacity(entry.pcs.len());
-            for &pc in &entry.pcs {
-                let block = found[&header][&pc];
+            for (k, &pc) in entry.pcs.iter().enumerate() {
+                let anyway = header.is_some_and(|header| {
+                    found[&header][&pc].is_some_and(|block| self.runs_anyway(header, block))
+                });
                 sites.push(MovedSite {
                     pc,
                     reason: entry.reason,
                     frame: entry.frame,
-                    anyway: block.is_some_and(|block| self.runs_anyway(header, block)),
+                    anyway,
+                    fill: entry.fills.get(k).copied(),
                 });
             }
             self.moved.push((entry.node, sites));

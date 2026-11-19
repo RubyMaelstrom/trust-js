@@ -161,6 +161,8 @@ pub(crate) enum NameView {
         slot: u32,
         location: u16,
         epoch: u16,
+        /// The site's cache as the snapshot read it (F4 part 1, `NameFill`).
+        fill: NameFill,
     },
     /// A binding of the realm's global declarative record, a script-level `let`, `const` or
     /// `class` (the cache in scope mode on the realm's global environment), under the cache's
@@ -176,6 +178,8 @@ pub(crate) enum NameView {
         genv: usize,
         generation: u32,
         binding: usize,
+        /// The site's cache as the snapshot read it (F4 part 1, `NameFill`).
+        fill: NameFill,
     },
     /// A cache in a mode the tier keeps the effect for (scope, depth-1, layout, deep, another
     /// realm's), or a store's or update's that has no static address.
@@ -186,7 +190,52 @@ pub(crate) enum NameView {
     Refused,
 }
 
+/// A free-name site's cache words (F4 part 1): its environment word, whose tag bits are its mode
+/// (0 empty, `REFUSED_NAME_IC` refused), and the words a fill writes (`NameIc`'s binding and
+/// generation). A loop's global read moved to the loop's entry keeps the snapshot's; a discard
+/// reads the cache again to learn whether the read ran since (`NameFill::refilled_by`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct NameFill {
+    pub(crate) env: usize,
+    pub(crate) binding: u64,
+    pub(crate) gen: u32,
+}
+
+impl NameFill {
+    fn of(ic: &crate::bytecode::NameIc) -> Self {
+        NameFill {
+            env: ic.env,
+            binding: ic.binding,
+            gen: ic.gen,
+        }
+    }
+
+    /// Whether `now`, the site's cache read after this one, holds a fill made since: in the same
+    /// mode on the same environment (a cleared or refused cache, or one in another mode, is none:
+    /// its environment word differs), with other words. Only the site's own execution fills its
+    /// cache, so a fill since means the read ran since (Ion's baseline-fallback note,
+    /// jit/BaselineIC.cpp:450-458).
+    pub(crate) fn refilled_by(self, now: NameFill) -> bool {
+        now.env == self.env && (now.binding, now.gen) != (self.binding, self.gen)
+    }
+}
+
+/// The cache of the free-name site at `pc` of `chunk` now (a discard's read, on the main
+/// thread), None where `pc` holds no free-name site with a cache.
+pub(crate) fn name_fill(chunk: &Chunk, pc: usize) -> Option<NameFill> {
+    let (_, cache, _) = name_site(chunk.jit_ops().get(pc)?)?;
+    Some(NameFill::of(&chunk.jit_name_ic(cache)))
+}
+
 impl NameView {
+    /// The snapshot's cache words of a global read's site (see [`NameFill`]).
+    pub(crate) fn fill(&self) -> Option<NameFill> {
+        match *self {
+            NameView::Global { fill, .. } | NameView::GlobalLexical { fill, .. } => Some(fill),
+            _ => None,
+        }
+    }
+
     /// The byte of the proof a site's checks expect, which a WrongName exit keeps in the exit
     /// profile as WrongShape's keeps its shapes: a recompile whose proof's byte differs (the
     /// epoch moved, another realm's cache) checks again (stage 2, step 4).
@@ -889,6 +938,7 @@ fn global_view(
                 genv,
                 generation: ic.gen,
                 binding: ic.binding as usize,
+                fill: NameFill::of(ic),
             },
         );
     }
@@ -916,6 +966,7 @@ fn global_view(
         slot: slot as u32,
         location,
         epoch,
+        fill: NameFill::of(ic),
     })
 }
 

@@ -850,6 +850,15 @@ impl Rules<'_> {
     /// The source of the read at `pc` where it is a global-object property's or a script-level
     /// lexical's that the builder lowers (F4 part 1): its location or its binding.
     fn global_source(&self, pc: usize) -> Option<Source> {
+        // A read whose entry check failed where it did not run is no longer moved there
+        // (`driver::flag_moved`: Ion's LICM invalidation, narrowed to the read).
+        #[cfg(test)]
+        if NO_GLOBAL_HOIST.with(std::cell::Cell::get) {
+            return None;
+        }
+        if self.snapshot.declines(pc, ExitReason::HoistingFailed) {
+            return None;
+        }
         if !matches!(
             self.ops[pc],
             Op::LoadName(..)
@@ -1434,6 +1443,19 @@ enum Source {
     /// lexical's (its binding's address): the loop's entry loads it (F4 part 1).
     Global(u16),
     Lexical(usize),
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: the unhoisted form on this thread (F4 part 1's global reads not moved to a loop's
+    /// entry), the baseline of the always-wrong tests.
+    static NO_GLOBAL_HOIST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: turn F4 part 1's global hoist off (or on again) for compiles on this thread.
+#[cfg(test)]
+pub(crate) fn set_no_global_hoist(off: bool) {
+    NO_GLOBAL_HOIST.with(|cell| cell.set(off));
 }
 
 /// A receiver an effect-free loop's element sites reach (P3 stage 3 step 0c): its source, the
@@ -2085,6 +2107,9 @@ pub(crate) struct TypedEntry {
     pub(crate) pcs: Vec<u32>,
     pub(crate) header_pc: u32,
     pub(crate) frame: FrameIx,
+    /// A loop's global read's check (F4 part 1): each read's cache words as the snapshot read
+    /// them, by `pcs`' order (empty for a typed receiver's check).
+    pub(crate) fills: Vec<super::snapshot::NameFill>,
 }
 
 /// What the builder hands the phi selector beside the graph (stage 2 step 6).
@@ -3595,6 +3620,15 @@ impl<'a> Builder<'a> {
     /// speculation here, as step 0's moved checks are: a flag at the header (HoistingFailed, JSC's
     /// exit kind, Ion's BailoutKind::LICM) leaves the checks in the loop. Nothing is made with two
     /// entry edges (no pre-header) or from a predecessor that ends in a branch.
+    ///
+    /// The loop's global reads (F4 part 1) go first: each read's own nodes, its identity, epoch or
+    /// generation checks keeping the read's reason [WrongName] and standing for that read alone,
+    /// which learns from their exit as from its own check (its flag with the proof the check
+    /// expected, `driver::flag_moved`): nothing such a loop runs moves the epoch, a generation or
+    /// the running environment, so the read would fail them on any path, and after an epoch move
+    /// the recompile reads the new epoch and loads the globals at the entry again. No header flag
+    /// declines them; only the checks the hoist adds about a value (a typed receiver's above) are
+    /// HoistingFailed.
     fn loop_entry_checks(
         &mut self,
         lp: &Loop,
@@ -3606,14 +3640,17 @@ impl<'a> Builder<'a> {
             return;
         };
         let pred = *pred;
-        if (lp.typed.iter().all(|typed| typed.kind.is_none()) && lp.globals.is_empty())
-            || self.graph.block(pred).succs.len() != 1
-            || self.declined(
+        if self.graph.block(pred).succs.len() != 1 {
+            return;
+        }
+        let globals = !self.moves_env && !lp.globals.is_empty();
+        let typed_checks = lp.typed.iter().any(|typed| typed.kind.is_some())
+            && !self.declined(
                 pc,
                 ExitReason::HoistingFailed,
                 "the typed arrays' checks in the loop",
-            )
-        {
+            );
+        if !globals && !typed_checks {
             return;
         }
         let state = self.frame_state(pc, st);
@@ -3622,15 +3659,27 @@ impl<'a> Builder<'a> {
         // Each receiver's nodes, with the sites they stand for (step L1c).
         let mut stands: Vec<(usize, &[u32])> = Vec::new();
         // The loop's global reads, once, at the entry (F4 part 1): the read's own nodes, whose
-        // value the header keeps (`loop_heap_facts`) and the loop's reads then take.
-        if !self.moves_env && !lp.globals.is_empty() {
-            stands.push((self.graph.block(pred).body.len(), &lp.globals));
-            for &at in &lp.globals {
+        // value the header keeps (`loop_heap_facts`) and the loop's reads then take. A check of
+        // the global object (CheckCellIs, CheckGlobalEpoch) stands for every global-object read
+        // of the loop and a generation check for every lexical's, which it proves for all of
+        // them (a later read makes none); an environment's identity check for the read that
+        // made it.
+        let (mut object_reads, mut lexical_reads) = (Vec::new(), Vec::new());
+        if globals {
+            for at in &lp.globals {
+                stands.push((self.graph.block(pred).body.len(), std::slice::from_ref(at)));
                 let mut cx = Before::with(pc, state);
-                self.entry_global(st, &mut cx, at as usize);
+                self.entry_global(st, &mut cx, *at as usize);
+                match self.snapshot.name(*at as usize) {
+                    super::snapshot::NameView::Global { .. } => object_reads.push(*at),
+                    super::snapshot::NameView::GlobalLexical { .. } => lexical_reads.push(*at),
+                    _ => {}
+                }
             }
         }
-        for typed in &lp.typed {
+        let hoisted_from = self.graph.block(pred).body.len();
+        let typed_uses: &[TypedUse] = if typed_checks { &lp.typed } else { &[] };
+        for typed in typed_uses {
             let Some(kind) = typed.kind else {
                 continue;
             };
@@ -3689,19 +3738,45 @@ impl<'a> Builder<'a> {
             if data.state.is_some() {
                 // The sites of the receiver whose nodes start at or before it (step L1c).
                 let at = mark + k;
+                let reason = data.reason.expect("a check's reason");
                 let pcs = stands
                     .iter()
                     .rev()
                     .find(|&&(start, _)| start <= at)
                     .map_or(&[][..], |&(_, pcs)| pcs);
+                let (pcs, fills) = if at < hoisted_from {
+                    // A global read's own checks keep their reason (F4 part 1), the reads they
+                    // prove with the snapshot's cache words (`driver::flag_moved`).
+                    let pcs = match data.op {
+                        NodeOp::CheckCellIs { .. } | NodeOp::CheckGlobalEpoch { .. } => {
+                            &object_reads[..]
+                        }
+                        NodeOp::CheckEnvGeneration { .. } => &lexical_reads[..],
+                        _ => pcs,
+                    };
+                    let fills = pcs
+                        .iter()
+                        .map(|&read| {
+                            self.snapshot
+                                .name(read as usize)
+                                .fill()
+                                .expect("a global read's view")
+                        })
+                        .collect();
+                    (pcs, fills)
+                } else {
+                    // A typed receiver's are the hoist's.
+                    data.reason = Some(ExitReason::HoistingFailed);
+                    (pcs, Vec::new())
+                };
                 self.notes.typed_entry.push(TypedEntry {
                     node,
-                    reason: data.reason.expect("a check's reason"),
+                    reason,
                     pcs: pcs.to_vec(),
                     header_pc: pc as u32,
                     frame: self.frame,
+                    fills,
                 });
-                data.reason = Some(ExitReason::HoistingFailed);
             }
         }
         let at = body.len() - 1;

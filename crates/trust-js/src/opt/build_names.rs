@@ -712,6 +712,7 @@ impl Builder<'_> {
             slot,
             location,
             epoch,
+            ..
         } = view
         else {
             unreachable!("a global read's view")
@@ -768,6 +769,7 @@ impl Builder<'_> {
             genv,
             generation,
             binding,
+            ..
         } = view
         else {
             unreachable!("a global lexical's view")

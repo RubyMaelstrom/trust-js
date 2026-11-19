@@ -23,9 +23,13 @@
 //! - a loop's entry speculation (stage 2 step 6), CheckNumber [PhiNotNumber] or CheckInt32
 //!   [PhiNotInt32], or a loop invariant's check moved to the loop's entry (P3 stage 3 step 0),
 //!   CheckNumber, CheckInt32, CheckObject or CheckElements [HoistingFailed], or a typed array's
-//!   TypedData checked there (step 0c) [HoistingFailed], sits at the end of a
+//!   TypedData checked there (step 0c) [HoistingFailed], or a loop's global read's own CheckEnvIs,
+//!   CheckCellIs, CheckGlobalEpoch or CheckEnvGeneration made there (F4 part 1) [WrongName: a
+//!   WrongName check is one where it is built for the first pc of its block's one successor, from
+//!   outside that successor's loop], sits at the end of a
 //!   loop header's entry predecessor, where nothing after it exits or has an effect before the
-//!   jump, and exits at the header's pc with its handlers. A HoistingFailed check may also stand
+//!   jump, and exits at the header's pc with its handlers. A HoistingFailed check (or a global
+//!   read's WrongName check) may also stand
 //!   before a block that heads a loop of its frame's bytecode (the frame's Cfg) and is no loop
 //!   header in the graph, its one predecessor's only successor: the builder makes a loop's
 //!   header state, and step 0c's entry checks of its typed arrays (`Builder::loop_entry_checks`),
@@ -211,7 +215,7 @@ pub(crate) fn verify_frames(
                 return fail("an exit without a reason");
             }
         }
-        if speculative(node) {
+        if speculative(graph, node, &dom) {
             let Some((_, frame_cfg)) = chunk_of(node.frame) else {
                 return fail("a frame that does not exist");
             };
@@ -642,19 +646,40 @@ fn proven_objects(graph: &Graph, dom: &Dominators) -> Result<(), String> {
     Ok(())
 }
 
-/// Whether a node is a loop's entry speculation (its reason says so).
-fn speculative(node: &Node) -> bool {
-    matches!(
-        node.reason,
-        Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32 | ExitReason::HoistingFailed)
-    )
+/// Whether a node is a loop's entry speculation: its reason says so, or it is a WrongName check
+/// built for the first pc of its block's one successor, in that block's frame, from outside that
+/// successor's loop: a loop's global read's own check made at its entry (F4 part 1,
+/// `Builder::loop_entry_checks`, which builds the entry's nodes at the header's pc). A free name's
+/// check made at its read is built for its read's pc, inside its own block.
+fn speculative(graph: &Graph, node: &Node, dom: &Dominators) -> bool {
+    match node.reason {
+        Some(ExitReason::PhiNotNumber | ExitReason::PhiNotInt32 | ExitReason::HoistingFailed) => {
+            true
+        }
+        Some(ExitReason::WrongName) => {
+            let [next] = graph.block(node.block).succs[..] else {
+                return false;
+            };
+            let target = graph.block(next);
+            let frame = target
+                .phis
+                .iter()
+                .chain(&target.body)
+                .next()
+                .map(|&first| graph.node(first).frame);
+            node.pc == target.first_pc
+                && frame == Some(node.frame)
+                && !dom.dominates(next, node.block)
+        }
+        _ => false,
+    }
 }
 
 /// A loop's entry speculation `node`, at `position` among its block's phis and body: its check
 /// (CheckNumber for PhiNotNumber, CheckInt32 for PhiNotInt32, any of CheckNumber, CheckInt32,
-/// CheckObject, CheckElements and TypedData for HoistingFailed, and a loop's global read's
-/// CheckEnvIs, CheckCellIs, CheckGlobalEpoch and CheckEnvGeneration) at the end of a loop header's entry
-/// predecessor, after which nothing but other speculations exits or has an effect before the jump
+/// CheckObject, CheckElements and TypedData for HoistingFailed, and a loop's global read's own
+/// CheckEnvIs, CheckCellIs, CheckGlobalEpoch or CheckEnvGeneration for WrongName) at the end of a
+/// loop header's entry predecessor, after which nothing but other speculations exits or has an effect before the jump
 /// to the header, with a state at the header's pc and the header's handlers; or a HoistingFailed
 /// check before the head of a loop of its frame's bytecode (`cfg`, the frame's) that got no back
 /// edge in the graph, its one predecessor's, with a state at its pc and no poll to compare the
@@ -670,6 +695,13 @@ fn speculation(
         Some(ExitReason::PhiNotNumber) => node.op == NodeOp::CheckNumber,
         Some(ExitReason::PhiNotInt32) => node.op == NodeOp::CheckInt32,
         // A loop's global, read at its entry (F4 part 1): the read's own checks.
+        Some(ExitReason::WrongName) => matches!(
+            node.op,
+            NodeOp::CheckEnvIs { .. }
+                | NodeOp::CheckCellIs { .. }
+                | NodeOp::CheckGlobalEpoch { .. }
+                | NodeOp::CheckEnvGeneration { .. }
+        ),
         _ => matches!(
             node.op,
             NodeOp::CheckNumber
@@ -677,10 +709,6 @@ fn speculation(
                 | NodeOp::CheckObject
                 | NodeOp::CheckElements(_)
                 | NodeOp::TypedData { .. }
-                | NodeOp::CheckEnvIs { .. }
-                | NodeOp::CheckCellIs { .. }
-                | NodeOp::CheckGlobalEpoch { .. }
-                | NodeOp::CheckEnvGeneration { .. }
         ),
     };
     if !check {
@@ -696,8 +724,13 @@ fn speculation(
     }
     if !target.loop_header {
         // A loop of the bytecode whose back edge the build never reached (see the module's doc):
-        // only a HoistingFailed check, before the loop's head, its one entry.
-        if node.reason != Some(ExitReason::HoistingFailed) || target.preds[..] != [node.block] {
+        // only a HoistingFailed check or a global read's own, before the loop's head, its one
+        // entry.
+        if !matches!(
+            node.reason,
+            Some(ExitReason::HoistingFailed | ExitReason::WrongName)
+        ) || target.preds[..] != [node.block]
+        {
             return Err("a phi's speculation off a loop's entry edge".into());
         }
         if cfg.loop_at_header(target.first_pc as usize).is_none() {
@@ -709,7 +742,7 @@ fn speculation(
         if later.op.is_terminator() {
             break;
         }
-        if !speculative(later) && (later.op.can_exit() || later.op.is_effectful()) {
+        if !speculative(graph, later, dom) && (later.op.can_exit() || later.op.is_effectful()) {
             return Err(format!(
                 "a phi's speculation before {:?} in its predecessor",
                 later.op

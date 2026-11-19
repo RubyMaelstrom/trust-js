@@ -1131,13 +1131,15 @@ pub(crate) struct MovedCheck {
 /// A check a moved check stands for: its operation's pc and frame as that check's own exit record
 /// would have them (its frame state's pc and frame, from which a64.rs `exit` makes the record; the
 /// builder makes a check's state at the check's own pc, which a debug assertion holds), its
-/// reason, and whether its block runs whenever the loop is entered (`anyway`).
+/// reason, and whether its block runs whenever the loop is entered (`anyway`); for a loop's global
+/// read (F4 part 1), its cache words as the compile's snapshot read them (`fill`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct MovedSite {
     pub(crate) pc: u32,
     pub(crate) reason: ExitReason,
     pub(crate) frame: FrameIx,
     pub(crate) anyway: bool,
+    pub(crate) fill: Option<super::snapshot::NameFill>,
 }
 
 /// A function's graph.

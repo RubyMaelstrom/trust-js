@@ -2078,6 +2078,7 @@ impl Gen<'_> {
                             .map_or(crate::opt::exit::OWN_CHUNK, |inlined| inlined.chunk),
                         reason: site.reason,
                         anyway: site.anyway,
+                        fill: site.fill,
                         // A replaced check's exit carries no data (its reasons' bytes are 0).
                         held: !graph.held.is_empty()
                             && graph.held.get(&(site.frame, site.pc)).is_some_and(
