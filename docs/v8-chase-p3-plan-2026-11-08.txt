@@ -7444,3 +7444,20 @@ the agent's; the coordinator's check target/p3/stage3/lf3-review).
   prepass that sees a callee's sites on a parameter bound to the caller's slot), and the shape
   of a word loaded in the loop (`this.m`, 4.99M; the field's own fact). c-rec's recount was
   not done.
+
+Validation after the landings of 2026-11-19 (main 27c54229: rule B, the loop's facts with the
+never-ran rule and the moved check, the flip, layer 1 of the global dependencies; run in the
+background beside the work, nothing waiting for it; target/p3/stage3/t262-check).
+- Test262, whole (annexB, built-ins, harness, intl402, language, staging), the tier on and
+  eager at the new default (graph), TRUST_JS_TIER=jit TRUST_JS_TIER_THRESHOLD=0
+  TRUST_JS_INLINE_AT=1: 53,572 of 53,575, the figure of the earlier stage records. The three
+  are the known ones: staging/sm/String/string-upper-lower-mapping.js (a case mapping), and
+  staging/sm/extensions/arguments-property-access-in-function.js and function-properties.js
+  (owner question 11: `f.arguments` in compiled frames).
+- difftest (seed 7, count 150), the tier off, eager, and eager with forced exits: 138 agree
+  and 12 skipped for budget in each, as before.
+- What these cost, for planning: a release runner built from an export in under a minute,
+  Test262 in 220 s with six workers, difftest in 15 s a configuration. Both fit beside a
+  landing's quick check. The whole library suite is the expensive check (18 to 25 minutes a
+  configuration) and stays for changes to every program's default path.
+- Still owed from the flip: the timed Octane table against the reference engines.
