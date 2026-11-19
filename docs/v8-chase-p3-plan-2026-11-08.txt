@@ -7185,3 +7185,39 @@ The same pattern, with no inlining involved, sat in zlib's and Mandreel's loops 
   state 0.67%, TypeScript 0.43%), the lowered mixed store (Splay 0.82%, the one that also
   gains at the splice), the intrinsic call as a node (DeltaBlue 0.32%).
 - The owner's decision of the same day stands on this: the flip follows rule B's landing.
+
+The quiet loop's facts, first commit, landed (the carry; 2026-11-19; target/p3/stage3/
+loopfacts-impl, report.txt, and select-impl/design-note-loopfacts.txt and cause-note.txt, the
+agents'; the coordinator's quick check target/p3/stage3/carry-review). A loop header kept no
+shape, field or prototype-link fact, so a loop that cannot change a shape checked its receivers
+again every iteration (the count behind it: select-impl/loopfacts). A loop that keeps heap
+facts now keeps, through its header, those facts of the objects its operations take: the
+values of the slots it reads and does not write, the frame's own `this` where the loop reads
+it, and what their kept fields and links hold. A creation by any frame in the loop drops the
+shape facts and a store at a location drops that field, by the union rule of F4 part 1, which
+the verifier states on the graph (it now refuses a creation where shapes were kept). Maglev
+keeps the known maps and loaded properties its loop's effects leave (CloneForLoopHeader,
+maglev-known-node-aspects.cc:647-735); Ion's and the DFG's LICM move a shape guard out of a
+loop that writes none.
+- Measured against main with rule B (fat LTO, the coordinator's builds; instructions at 200
+  runs with collections deferred, graph | splice): Box2D -0.63% | -0.60%, Crypto -0.50% |
+  -0.46%, Richards -0.49% | -0.44%, GBEMU -0.14% | -0.14%; at 5 runs Crypto -0.37%, Box2D
+  -0.36%, GBEMU -0.16%; the tier off equal. The agent's cycles: Box2D -0.76%, Crypto -0.35%,
+  Richards -0.21%; GBEMU +0.45% at fewer instructions, in the engine's native code and not
+  the tier's (the typed-array buffer accessor and fmod carry it; the cause, the binary's
+  layout, is inferred). TypeScript at 5 runs reads +0.7% plain and -0.03% with collections
+  deferred: the collector's draw.
+- Decided on the way. Only the facts of the objects the loop takes are kept: keeping every
+  fact the loop leaves intact, as Maglev does, gives Richards a further -0.20% at 200 runs
+  and costs it +0.15% at 5, because this builder's states are copied at joins; recorded for
+  the piece on facts that joins drop. Inside such loops every check this removes had already
+  lost its tag test, so it takes over part of what the tag test's count predicted.
+- Checked: 18 mutations caught; the agents' 16 adversarial programs and the coordinator's
+  (72 in all) agree at four modes; the verifier sweep; the tier's modules in six
+  configurations (the agent's run, before the owner's word on quick checks).
+- Next of this line, planned and measured before any code (loopfacts-impl/NEXT.txt): the
+  first check of a loop-invariant object moved to the loop's entry edge (Crypto's other 70%,
+  about -0.5% more predicted). Its blind case costs one exit cycle a loop and no more. Where
+  the rest of the repeated shape checks are: in loops that call (Richards 75%, DeltaBlue 97%,
+  RayTrace 66%), which need the dependencies the owner approved, and outside any loop
+  (TypeScript 70%, Box2D 23%), where a join drops the fact.
