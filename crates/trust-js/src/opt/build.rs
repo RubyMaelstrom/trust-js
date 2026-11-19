@@ -1423,8 +1423,12 @@ struct Loop {
     /// loop that keeps heap facts: its entry loads each once and its header keeps the value
     /// (F4 part 1, Ion's and the DFG's LICM of a global's load out of a loop that writes none).
     globals: Vec<u32>,
-    /// The field locations the loop's lowered named stores may write (any object's), whose field
-    /// facts its header does not keep.
+    /// The global object's locations those reads read, whose field facts its header keeps but
+    /// where `stored_fields` names them: no other global's, so that the loop's states hold only
+    /// the facts its reads take (the builder's joins and prunes walk every fact a state holds).
+    read_fields: Vec<u16>,
+    /// The field locations the loop's lowered named stores may write (any object's), for a loop
+    /// with `read_fields`.
     stored_fields: Vec<u16>,
     /// Whether an operation of the loop may be a canonical-frame effect ([`canonical`]), after
     /// which every slot is in the frame (P3 stage 3 step 3a: a generic node leaves the slots it
@@ -1587,6 +1591,7 @@ impl Flow {
                 stored: Vec::new(),
                 typed: Vec::new(),
                 globals: Vec::new(),
+                read_fields: Vec::new(),
                 stored_fields: Vec::new(),
                 canonical: false,
             };
@@ -1654,14 +1659,14 @@ impl Flow {
                                 found.stored.push(slot);
                             }
                         }
-                        if rules.global_source(pc).is_some()
-                            && !found.globals.contains(&(pc as u32))
-                        {
-                            found.globals.push(pc as u32);
-                        }
-                        for location in rules.stored_field(pc) {
-                            if !found.stored_fields.contains(&location) {
-                                found.stored_fields.push(location);
+                        if let Some(source) = rules.global_source(pc) {
+                            if !found.globals.contains(&(pc as u32)) {
+                                found.globals.push(pc as u32);
+                            }
+                            if let Source::Global(location) = source {
+                                if !found.read_fields.contains(&location) {
+                                    found.read_fields.push(location);
+                                }
                             }
                         }
                         if let Some((source, kind, write)) = rules.typed_source(pc) {
@@ -1679,6 +1684,18 @@ impl Flow {
                                     write,
                                     pcs: vec![pc as u32],
                                 }),
+                            }
+                        }
+                    }
+                }
+            }
+            if !found.read_fields.is_empty() {
+                for &index in &body {
+                    let block = &blocks[ix(rpo[index])];
+                    for pc in block.start..block.end {
+                        for location in rules.stored_field(pc) {
+                            if !found.stored_fields.contains(&location) {
+                                found.stored_fields.push(location);
                             }
                         }
                     }
@@ -3583,15 +3600,17 @@ impl<'a> Builder<'a> {
         } else {
             FastMap::default()
         };
-        // The global object's properties its entry loaded (F4 part 1): nothing such a loop runs
-        // stores a global (a store to one is an effect, as every call is), but a lowered store to
-        // a field at the same location of whatever object.
+        // The global object's properties its entry loaded for the loop's reads (F4 part 1):
+        // nothing such a loop runs stores a global (a store to one is an effect, as every call
+        // is), but a lowered store to a field at the same location of whatever object.
         let fields = match (lp.keeps_heap, self.hoisted.get(&Hoisted::GlobalObject)) {
-            (true, Some(&global)) => met
+            (true, Some(&global)) if !lp.read_fields.is_empty() => met
                 .fields
                 .iter()
                 .filter(|&(&(object, location), _)| {
-                    object == global && !lp.stored_fields.contains(&location)
+                    object == global
+                        && lp.read_fields.contains(&location)
+                        && !lp.stored_fields.contains(&location)
                 })
                 .map(|(&key, &value)| (key, value))
                 .collect(),

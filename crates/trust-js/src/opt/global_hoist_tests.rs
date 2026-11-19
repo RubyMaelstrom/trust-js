@@ -574,6 +574,57 @@ fn a_loop_whose_back_edge_is_never_built_teaches_its_global_reads_too() {
     super::verify::verify(graph, &chunk, &built.cfg).expect("the graph holds");
 }
 
+#[test]
+fn a_quiet_loop_keeps_only_the_facts_of_the_globals_it_reads() {
+    // `other` is read before and after an effect-free loop that reads `step` alone: the header
+    // keeps `step`'s value, not `other`'s, so `other` is loaded again after the loop (the
+    // builder's joins and prunes in the loop walk no fact its reads do not take).
+    let (_, built) = vm_graph(
+        "var other = 5, step = 3;
+         function f(n) { var s = other; for (var i = 0; i < n; i++) s = (s + step) | 0; return (s + other) | 0; }
+         for (var r = 0; r < 50; r++) f(100);",
+        "f",
+    );
+    let graph = &built.graph;
+    let header = graph
+        .blocks
+        .iter()
+        .position(|block| block.loop_header)
+        .expect("a loop") as u32;
+    let mut loads: Vec<(u16, u32)> = graph
+        .nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                graph.node(*node.inputs.first().unwrap_or(&NodeIx(0))).op,
+                NodeOp::GlobalObject
+            )
+        })
+        .filter_map(|node| match node.op {
+            NodeOp::LoadField { location, .. } => Some((location, node.block.0)),
+            _ => None,
+        })
+        .collect();
+    loads.sort_unstable();
+    assert_eq!(
+        loads.len(),
+        3,
+        "other before and after, step at the entry: {loads:?}"
+    );
+    let after: Vec<_> = loads.iter().filter(|&&(_, block)| block > header).collect();
+    assert_eq!(
+        after.len(),
+        1,
+        "one load after the loop's header: {loads:?}"
+    );
+    assert!(
+        loads
+            .iter()
+            .any(|&(location, block)| location == after[0].0 && block < header),
+        "the load after the loop is other's, loaded before it too: {loads:?}"
+    );
+}
+
 /// The always-wrong programs (F4 part 1, condition c: f4-impl/wrong/*.js, smaller): a hot
 /// effect-free loop reading `step`, the global object's epoch moved between its runs, ROUNDS
 /// times: by a deletion (`del`), by an accessor and back (`acc`), and with the read on a path
