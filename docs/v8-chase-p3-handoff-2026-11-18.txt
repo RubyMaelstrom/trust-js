@@ -547,3 +547,59 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   every collection, so a test that allocates in a loop of thousands of iterations takes an
   hour or more under TRUST_JS_GC_STRESS=1 (one of piece B's never finished in six hours).
   Name the tests a stress run covers and give it a time limit.
+
+## 2026-11-19, 18:00
+
+Read this section before "2026-11-19, midday": where they differ, this one holds.
+
+- LANDED ON LOCAL MAIN since midday, each with its record in the plan (search the commit id):
+  ed6213c0 and 4464ea9b (the state per global property, "F4 part 2 layer 1", and its
+  residuals); e96aa0eb and 632b3cc2 (a block that never ran ends none of its loop's facts;
+  a quiet loop's first shape check at its entry: Mandreel -10.6%, Crypto -1.8% at graph);
+  844667b7 (the lazy context switch for an inlined frame's unlowered operations: DeltaBlue
+  -0.9%, Splay -0.8%); abedce96 (an Array's absent named read cached: Vue -5.5% to -6.0% at
+  graph, -4.8% to -5.1% with the tier off); ab01e00e (the engine-wide property cache's entry
+  holds its key); ce0e88f8 (a test's setup that the moved shape check had emptied).
+- origin/main is still 6496547c; local main is 87 commits ahead and NOT PUSHED.
+- Validated in the background on main: Test262 with the tier on and eager at graph 53,572 of
+  53,575 (twice that day), difftest 138 agree in three configurations, the whole library
+  suite with the tier off clean. Still owed from the flip: the timed Octane table against
+  the reference engines.
+- IN FLIGHT, each with a brief under target/p3/stage3/briefs/ and STATUS.txt / NEXT.txt in
+  its evidence directory:
+  1. Dependencies on global properties, layers 2 to 4 (f4-part2-layers.txt; branch
+     p3-s3-f4p4; evidence f4p2-impl): layer 2 (dependents, the validity word, the
+     Invalidated exit) and layer 3 (the tier folds a constant global's read) are built and
+     being re-measured after a fix to what layer 2 cost the tier off. Layer 3's first rows:
+     Richards -4.7% at graph, Crypto -0.5%. Layer 4 (typed arrays through a folded global)
+     and a hardening (the fuses kept with the heap) follow.
+  2. Built-in accessor getters (getter.txt; branch p3-s3-getter; evidence getter-impl,
+     design-note.txt): a typed array's length costs about 830 instructions a read in every
+     tier because typed arrays never get a cache way, and a native getter found by a way is
+     called through the generic call. Being built: ways for typed arrays and a direct native
+     call (an embedder's accessors measured with them), the typed array's getters in line,
+     the tier's node; the same in line on x86-64 is owed after.
+  3. The polymorphic named store (graph-piece2.txt; branch p3-s3-gp2; evidence gnext-impl):
+     its first commit (SetProp sites of several shapes, replacing or creating) is built and
+     being measured (predicted Splay -2.6%, Box2D -1.5%); a second gives compound assignments
+     the same arms (GBEMU).
+  4. The megamorphic line (mega-build2.txt; branch p3-s3-mega2; evidence mega-impl): the
+     probe of the engine-wide cache from generated code for reads is built and HELD (alone it
+     gains TypeScript 0.5% to 1.7% and costs GBEMU, Djot and Vue 0.1% to 0.6%); then a store
+     table of its own, where the count's gain is (TypeScript's megamorphic creations and
+     stores: 15% of its instructions), then string-keyed sites and `in`.
+- FOUND AND NOBODY's YET (the plan's record "Two findings of 2026-11-19 evening"): a call's
+  cost after a discard and reoptimization at one trip count (+8.7% in a micro, cause
+  unknown); a second way at a property site costing the template JIT about 16 instructions
+  a read. Also unassigned from earlier: what stays out of the loop facts' reach in Crypto;
+  the lowerings after the polymorphic store; inlining JS getters at graph (Vue's steady
+  state spends about 8% in the stub's getter sequence); a string's length and character in
+  the template (PdfJS); creations on maps of more than 8 entries (TypeScript, Box2D).
+- The owner's open questions are 4, 8, 11 and 12 to 15 above; 12 to 15 are built on their
+  recommendations meanwhile, each separable.
+- The coordinator's check of a landing since that afternoon (the owner's word on quick
+  checks, and one lesson): the diff's risky part read; one fat-LTO build; the adversarial
+  programs at five or more modes; the 5-run tables and the rows the change claims; the
+  verifier sweep and the tier's modules in ONE configuration for a tier change (that module
+  run is what would have caught ce0e88f8's case before it landed); a whole-library run only
+  for a change to every program's default path; Test262 and difftest in the background.
