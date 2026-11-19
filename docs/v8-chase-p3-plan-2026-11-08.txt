@@ -6934,3 +6934,10 @@ randomized runs, piece B's in 2 of 10, an engine of three days earlier the highe
   TypeScript, GBEMU and PdfJS). Not built yet: nobody is on it. After it a dead way whose site
   met no other closure of its function still follows liveness, and so does the planner's
   whole-site skip.
+- Piece B's confirmation after landing (2026-11-19): the whole library suite on the landed
+  tree with the tier off 3,675 passed, with TRUST_JS_OPT=1 3,675, none failed
+  (stepb-review/b-suites.log); at graph 3,674, none failed, and the tier's modules 686 in each
+  of six configurations (the agent's run, step3g-impl/bsuite3.out, one test older). Under GC
+  stress 18 of the 20 by-literal tests passed in a six-hour window and none failed; one of the
+  two unfinished passed in the coordinator's stress run, the other
+  (no_entry_outlives_its_by_literal_frame) has never finished in that mode.
