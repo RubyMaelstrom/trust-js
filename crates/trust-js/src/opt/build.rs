@@ -1779,6 +1779,18 @@ impl Flow {
             found.stored = writes.slots;
             if !found.read_fields.is_empty() {
                 found.stored_fields = writes.fields;
+                // A global a store of the loop may write is read in the loop, its value not kept
+                // through the header (`loop_heap_facts`): no entry load and no typed checks of it,
+                // whose value no read of the loop would take (as a binding the loop stores,
+                // `loop_entry_checks`' Source::Name).
+                let stored = &found.stored_fields;
+                found.globals.retain(|&at| {
+                    !matches!(rules.global_source(at as usize),
+                        Some(Source::Global(location)) if stored.contains(&location))
+                });
+                found.typed.retain(|typed| {
+                    !matches!(typed.source, Source::Global(location) if stored.contains(&location))
+                });
             }
             heads[ix(rpo[header])] = Some(loops.len());
             loops.push(found);

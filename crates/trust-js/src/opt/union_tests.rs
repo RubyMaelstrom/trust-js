@@ -154,6 +154,40 @@ fn a_script_level_lexical_and_a_global_stored_by_name_from_a_callee_are_read_ane
     );
 }
 
+#[test]
+fn stores_from_an_inlined_callees_loop_an_inner_loop_and_a_polymorphic_method_are_read_anew() {
+    // The lowerings' own programs (f4-impl/union/adv2, each wrong at graph before the union): the
+    // callee's own loop stores G; an inner loop's inlined call stores the G its outer loop reads;
+    // a callee swaps the global typed array the loop reads with another, through an alias; one
+    // way of three of a method site stores G, another H.
+    for source in [
+        "var G = 1;
+         function fill(o, n) { for (var j = 0; j < n; j++) o.G = j; }
+         function W(n) { var s = 0; var g = globalThis; for (var i = 0; i < n; i++) { s += G; fill(g, i & 3); } return s; }
+         var r = 0; for (var k = 0; k < 3000; k++) r += W(40);
+         r",
+        "var G = 1;
+         function setG(o, v) { o.G = v; }
+         function W(n) { var s = 0; var g = globalThis; for (var i = 0; i < n; i++) { s += G; for (var j = 0; j < 3; j++) { s += j; if (j === 2) setG(g, i + j); } } return s; }
+         var r = 0; for (var k = 0; k < 3000; k++) r += W(30);
+         r",
+        "var A = new Float64Array(16), B = new Float64Array(16);
+         for (var q = 0; q < 16; q++) { A[q] = q; B[q] = 100 + q; }
+         function swo(o, i) { if ((i & 7) === 7) { var t = o.A; o.A = o.B; o.B = t; } }
+         function W(n) { var s = 0; var g = globalThis; for (var i = 0; i < n; i++) { s += A[i & 15]; swo(g, i); } return s; }
+         var r = 0; for (var k = 0; k < 3000; k++) r = (r + W(40)) % 1000003;
+         r",
+        "var G = 1, H = 0;
+         var p1 = { m: function (o, v) { return v; } }, p2 = { m: function (o, v) { o.G = v; return v; } }, p3 = { m: function (o, v) { o.H = v; return v; } };
+         function W(n, p) { var s = 0; var g = globalThis; for (var i = 0; i < n; i++) { s += G; p.m(g, i); } return s; }
+         var ps = [p1, p3, p1, p2];
+         var r = 0; for (var k = 0; k < 3000; k++) r += W(40, ps[k & 3]);
+         r",
+    ] {
+        assert!(agrees_at_graph(source) > 0, "inlined: {source}");
+    }
+}
+
 /// The location of the global-object property `name` as the compile of `compile` reads it.
 fn global_location(compile: &Compile, name: &str) -> u16 {
     let ops = compile.chunk.jit_ops();
@@ -202,7 +236,8 @@ const ALIASED: &str = "
 #[test]
 fn a_loop_keeps_no_fact_of_a_global_its_inlined_callee_stores_and_keeps_the_others() {
     // The loop reads G and H; the inlined setG stores G through an alias: G is read in the loop
-    // body, H still once at the entry (the union drops only what a frame writes).
+    // body and not loaded at its entry, H still once at the entry (the union drops only what a
+    // frame writes).
     let mut engine = warmed(ALIASED);
     let compile = Compile::new(&mut engine, "W");
     let built = compile.build();
@@ -216,9 +251,10 @@ fn a_loop_keeps_no_fact_of_a_global_its_inlined_callee_stores_and_keeps_the_othe
     );
     let (g, header) = global_field_loads(graph, global_location(&compile, "G"));
     let (h, _) = global_field_loads(graph, global_location(&compile, "H"));
+    // G read in the loop, and not at its entry: no read of the loop would take that value.
     assert!(
-        g.iter().any(|&block| block > header),
-        "G read in the loop (header {header}): {g:?}\n{}",
+        !g.is_empty() && g.iter().all(|&block| block > header),
+        "G read in the loop alone (header {header}): {g:?}\n{}",
         dump(graph)
     );
     assert!(
