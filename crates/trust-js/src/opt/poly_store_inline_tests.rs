@@ -525,3 +525,106 @@ t";
 fn the_arms_join_with_the_facts_they_all_hold() {
     against_the_tier_off(JOIN, &configurations());
 }
+
+// ---- Graph-next piece 2, its second part: compound stores on Data arms ----------------------
+
+/// `acc` appends to `n` (`o.n += v`, AppendProp) and `bump` updates it (`o.n++`, UpdateProp) at
+/// two-shape sites (P's `n` in its first slot, Q's in its second); `acc2` appends where R's
+/// prototype holds `n` (its store creates on a fresh R, replaces on one that has its own);
+/// `loopn` holds `acc` in a quiet loop that reads p.n, q sometimes p.
+const COMPOUND: &str = "
+function P(k) { this.n = k; this.m = 0; }
+function Q(k) { this.m = 0; this.n = k; }
+function R(k) { this.k = k; }
+R.prototype.n = 5;
+function acc(o, v) { o.n += v; }
+function acc2(o, v) { o.n += v; }
+function bump(o) { o.n++; }
+function loopn(p, q, n) { var s = p.n; for (var i = 0; i < n; i++) { acc(q, 1); s = (s + p.n) | 0; } return s; }
+";
+
+#[test]
+fn compound_stores_take_their_data_arms_and_never_create() {
+    let warm = format!(
+        "{COMPOUND}
+         for (var k = 0; k < 30; k++) {{
+           var p = new P(k), q = new Q(k), r = new R(k), r2 = new R(k); r2.n = 1;
+           acc((k & 1) ? p : q, k); bump((k & 1) ? q : p); acc2((k & 1) ? r : r2, k);
+           loopn(p, (k & 2) ? p : q, 4);
+         }}"
+    );
+    let mut engine = warmed(&warm);
+    // (function, its Data arms' stores, whether the store stays the generic operation)
+    for (name, stores, generic) in [
+        ("acc", 2, false),
+        ("bump", 2, false),
+        ("acc2", 0, true),
+        ("loopn", 2, false),
+    ] {
+        let built = Compile::new(&mut engine, name).build();
+        let graph = &built.graph;
+        let all = |is: fn(&NodeOp) -> bool| nodes(graph, |node| is(&node.op)).len();
+        assert_eq!(
+            all(|op| matches!(op, NodeOp::StoreField { .. })),
+            stores,
+            "{name}\n{}",
+            dump(graph)
+        );
+        assert_eq!(
+            all(|op| matches!(op, NodeOp::StoreNew { .. })),
+            0,
+            "{name}: a compound store never creates\n{}",
+            dump(graph)
+        );
+        assert_eq!(
+            all(|op| matches!(op, NodeOp::Effect { .. } | NodeOp::Generic { .. })) > 0,
+            generic,
+            "{name}\n{}",
+            dump(graph)
+        );
+        if name == "loopn" {
+            // The loop is quiet (the store lowered: Rules::lowers) and keeps no field fact at
+            // either arm's location (Rules::own_field_writes); the verifier admitted it.
+            assert_eq!(graph.kept.len(), 1, "{}", dump(graph));
+            for store in nodes(graph, |node| matches!(node.op, NodeOp::StoreField { .. })) {
+                let NodeOp::StoreField { location, .. } = graph.node(store).op else {
+                    unreachable!()
+                };
+                assert!(
+                    !graph.kept[0].fields.contains(&location),
+                    "{:?}",
+                    graph.kept
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn compound_stores_have_the_tier_offs_results_when_valueof_moves_or_deletes_the_property() {
+    if !alone(
+        "compound_stores_have_the_tier_offs_results_when_valueof_moves_or_deletes_the_property",
+    ) {
+        return;
+    }
+    // A value whose valueOf adds a property to the receiver (its other shape) or deletes `n`,
+    // which the numeric lowering never calls (its NotNumber exit, then the generic operation);
+    // R's creations through acc2; the quiet loop with q sometimes p.
+    let source = format!(
+        "{COMPOUND}
+         function h(x) {{ return typeof x === 'number' ? (x === x ? x % 1000003 : 7) : x === undefined ? -1 : 9; }}
+         let t = 0;
+         for (let k = 0; k < 1500; k++) {{
+           const p = new P(k), q = new Q(k), o = (k & 1) ? p : q;
+           acc(o, k % 7); bump((k & 2) ? p : q);
+           let v = 1;
+           if (k > 700 && k % 50 === 0) v = {{ valueOf() {{ o.extra = 1; return 3; }} }};
+           if (k > 900 && k % 70 === 0) v = {{ valueOf() {{ delete o.n; return 4; }} }};
+           acc(o, v); bump(o);
+           const r = new R(k); if (k % 3) r.n = 2; acc2(r, k);
+           t = (t * 31 + h(p.n) + 3 * h(q.n) + (o.extra | 0) + h(r.n) + h(loopn(p, (k % 3) ? p : q, 4))) % 1000003;
+         }}
+         t"
+    );
+    against_the_tier_off(&source, &configurations());
+}

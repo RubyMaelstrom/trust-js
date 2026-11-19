@@ -572,6 +572,30 @@ impl Rules<'_> {
         Some(arms)
     }
 
+    /// The arms of a compound store's site (`o.k += v`'s AppendProp, `o.k++`'s UpdateProp;
+    /// graph-next piece 2, its second part): `poly_store_ways` where every arm is a Data arm. A
+    /// compound store never creates here: a site whose ways create takes the generic operation.
+    /// V8 compiles each to a named load, the arithmetic and a named store whose polymorphic
+    /// access Maglev builds as any store's (TryBuildPolymorphicPropertyAccess,
+    /// maglev-graph-builder.cc:5775-), as the DFG's put_by_id becomes MultiPutByOffset.
+    fn poly_data_ways(&self, pc: usize, name: u32) -> Option<Vec<StoreArm>> {
+        let arms = self.poly_store_ways(pc, name)?;
+        arms.iter()
+            .all(|arm| matches!(arm, StoreArm::Data(_)))
+            .then_some(arms)
+    }
+
+    /// Whether a compound store's ways lower (`Builder::append_prop`, `Builder::update_prop`):
+    /// its own data ways or its Data arms, unless WrongShape declines them.
+    fn compound_lowers(&self, pc: usize, name: u32) -> bool {
+        match self.own_data_ways(pc, name, true) {
+            Some(ways) => !self.stale_ways(pc, &ways),
+            None => self
+                .poly_data_ways(pc, name)
+                .is_some_and(|arms| !self.stale_shapes(pc, &store_arm_shapes(&arms))),
+        }
+    }
+
     /// A named load's ways on the prototype chain (P3 stage 3 step L2): data ways of objects at
     /// depth 1 to 3, or of strings at depth 0 to 3 counted from String.prototype (the way's
     /// receiver shape), each level between with its recorded shape (the templates' limit and
@@ -1122,11 +1146,13 @@ impl Rules<'_> {
             return (vec![creation.location], true);
         }
         // A polymorphic store (graph-next piece 2, addition u1): every arm's location, and a
-        // creation where any arm transitions.
-        if matches!(self.ops[pc], Op::UpdateProp(..) | Op::AppendProp(..)) {
-            return (Vec::new(), false);
-        }
-        let Some(arms) = self.poly_store_ways(pc, name) else {
+        // creation where any arm transitions; a compound store's Data arms (`poly_data_ways`).
+        let arms = if matches!(self.ops[pc], Op::UpdateProp(..) | Op::AppendProp(..)) {
+            self.poly_data_ways(pc, name)
+        } else {
+            self.poly_store_ways(pc, name)
+        };
+        let Some(arms) = arms else {
             return (Vec::new(), false);
         };
         let mut locations = Vec::with_capacity(arms.len());
@@ -1199,15 +1225,11 @@ impl Rules<'_> {
             // P3 stage 3 step L3: `Builder::update_prop` and `Builder::append_prop`.
             Op::UpdateProp(name, _, _) => {
                 self.numbers(pc, false).is_some()
-                    && self
-                        .own_data_ways(pc, name, true)
-                        .is_some_and(|ways| !self.stale_ways(pc, &ways))
+                    && self.compound_lowers(pc, name)
                     && !flagged(&[ExitReason::NotNumber])
             }
             Op::AppendProp(name, _) => {
-                self.own_data_ways(pc, name, true)
-                    .is_some_and(|ways| !self.stale_ways(pc, &ways))
-                    && !flagged(&[ExitReason::NotNumber])
+                self.compound_lowers(pc, name) && !flagged(&[ExitReason::NotNumber])
             }
             Op::GetElem | Op::GetElemLocal(_) => self.element_site(pc).is_some_and(|site| {
                 !flagged(LOAD_DECLINES)
@@ -6115,12 +6137,36 @@ impl<'a> Builder<'a> {
         let receiver = self.receiver(recv, st, 1, pc);
         let mut cx = Before::new(pc);
         let word = self.tagged(st, receiver, pc);
+        self.store_by_arms(st, &mut cx, word, value, arms, name);
+        let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
+        st.stack.truncate(len - pops);
+        if keep {
+            st.stack.push(value);
+        }
+        Ok(())
+    }
+
+    /// `poly_store`'s arms, for its receiver's word `word` and its value `value` (a compound
+    /// store's sum too: `append_prop`, `update_prop`): the receiver's shapes checked together
+    /// (unless proven), the value tagged, each arm but the last tested and branched to, the arms
+    /// joined; one arm (the facts allowing only it) stores with no test.
+    fn store_by_arms(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        value: NodeIx,
+        arms: &[StoreArm],
+        name: u32,
+    ) {
+        let pc = cx.pc;
         let shapes = store_arm_shapes(arms);
         let ways = ways_of(&shapes);
         // The arms the facts allow (rule K), made only where they exclude a shape of one.
         let allowed: Option<Vec<usize>> = st
             .shapes
             .get(&word)
+            .filter(|_| arms.len() > 1)
             .filter(|known| !shapes.iter().all(|shape| known.contains(shape)))
             .map(|known| {
                 (0..arms.len())
@@ -6144,12 +6190,12 @@ impl<'a> Builder<'a> {
             Some(allowed) if !allowed.is_empty() => allowed,
             _ => (0..arms.len()).collect(),
         };
-        let cell = self.shaped(st, &mut cx, word, &shapes);
+        let cell = self.shaped(st, cx, word, &shapes);
         let stored = self.tagged(st, value, pc);
         if let [k] = taken[..] {
-            self.store_arm(st, &mut cx, word, cell, stored, &arms[k], name, ways);
+            self.store_arm(st, cx, word, cell, stored, &arms[k], name, ways);
         } else {
-            let state = self.before(&mut cx, st);
+            let state = self.before(cx, st);
             let mut ends = Vec::with_capacity(taken.len());
             for (n, &k) in taken.iter().enumerate() {
                 let arm = &arms[k];
@@ -6211,12 +6257,6 @@ impl<'a> Builder<'a> {
                 ..met
             };
         }
-        let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
-        st.stack.truncate(len - pops);
-        if keep {
-            st.stack.push(value);
-        }
-        Ok(())
     }
 
     /// One arm of `poly_store`, its receiver checked: a Data arm's store, or a Creation arm's
@@ -6260,23 +6300,29 @@ impl<'a> Builder<'a> {
         st: &mut State,
     ) -> Result<(), Refusal> {
         let rules = self.rules();
-        let (Some(values), Some(ways)) = (
-            rules.numbers(pc, false),
-            rules.own_data_ways(pc, name, true),
-        ) else {
+        let Some(values) = rules.numbers(pc, false) else {
             return self.effect(pc, st);
         };
-        if self.stale_ways(pc, &ways)
-            || self.declined(pc, ExitReason::NotNumber, "the generic operation")
-        {
+        let Some(arms) = self.compound_arms(pc, name) else {
+            return self.effect(pc, st);
+        };
+        if self.declined(pc, ExitReason::NotNumber, "the generic operation") {
             return self.effect(pc, st);
         }
         let len = st.stack.len();
         let receiver = st.stack[len - 1];
         let mut cx = Before::new(pc);
         let word = self.tagged(st, receiver, pc);
-        let cell = self.shaped(st, &mut cx, word, &ways.shapes);
-        let old = self.field(st, word, cell, ways.location, ways.slot, pc);
+        // One own way: the field of the checked cell. Several Data arms (graph-next piece 2): the
+        // read is a polymorphic load's (its arms joined by a phi), the store dispatches again.
+        let (old, cell) = match &arms[..] {
+            [StoreArm::Data(ways)] => {
+                let cell = self.shaped(st, &mut cx, word, &ways.shapes);
+                let old = self.field(st, word, cell, ways.location, ways.slot, pc);
+                (old, Some((cell, ways)))
+            }
+            _ => (self.load_by_arms(st, &arms, pc)?, None),
+        };
         if !self.numeric(old) {
             return self.mismatch(pc, ExitReason::NotNumber, st);
         }
@@ -6313,18 +6359,10 @@ impl<'a> Builder<'a> {
             }
         };
         let stored = self.tagged(st, new, pc);
-        self.add(
-            NodeOp::StoreField {
-                location: ways.location,
-                slot: ways.slot,
-            },
-            &[cell, stored],
-            Rep::None,
-            pc,
-        );
-        st.fields
-            .retain(|&(_, location), _| location != ways.location);
-        st.fields.insert((word, ways.location), stored);
+        match cell {
+            Some((cell, ways)) => self.store_field(st, word, cell, stored, ways, pc),
+            None => self.store_by_arms(st, &mut cx, word, stored, &arms, name),
+        }
         st.stack.truncate(len - 1);
         match kind {
             UpdKind::PreInc | UpdKind::PreDec => st.stack.push(new),
@@ -6343,12 +6381,10 @@ impl<'a> Builder<'a> {
     /// the template appends in place) flags the generic operation, as arithmetic's does. Every
     /// check precedes the store.
     fn append_prop(&mut self, pc: usize, name: u32, st: &mut State) -> Result<(), Refusal> {
-        let Some(ways) = self.own_data_ways(pc, name, true) else {
+        let Some(arms) = self.compound_arms(pc, name) else {
             return self.effect(pc, st);
         };
-        if self.stale_ways(pc, &ways)
-            || self.declined(pc, ExitReason::NotNumber, "the generic operation")
-        {
+        if self.declined(pc, ExitReason::NotNumber, "the generic operation") {
             return self.effect(pc, st);
         }
         let len = st.stack.len();
@@ -6384,22 +6420,52 @@ impl<'a> Builder<'a> {
             self.add(NodeOp::F64Add, &[x, y], Rep::F64, pc)
         };
         let word = self.tagged(st, receiver, pc);
-        let cell = self.shaped(st, &mut cx, word, &ways.shapes);
-        let stored = self.tagged(st, sum, pc);
-        self.add(
-            NodeOp::StoreField {
-                location: ways.location,
-                slot: ways.slot,
-            },
-            &[cell, stored],
-            Rep::None,
-            pc,
-        );
-        st.fields
-            .retain(|&(_, location), _| location != ways.location);
-        st.fields.insert((word, ways.location), stored);
+        // The store re-checks the receiver's shapes unless the read's facts survive (an effect
+        // between them ends them); several Data arms dispatch again after the read's join, as
+        // Maglev's and the DFG's stores do (graph-next piece 2).
+        self.store_by_arms(st, &mut cx, word, sum, &arms, name);
         st.stack.truncate(len - 3);
         Ok(())
+    }
+
+    /// UpdateProp's read on several Data arms (graph-next piece 2): `poly_load`'s arms, each the
+    /// field of its location and slot, joined by a phi, which the read leaves on the stack and
+    /// this takes.
+    fn load_by_arms(
+        &mut self,
+        st: &mut State,
+        arms: &[StoreArm],
+        pc: usize,
+    ) -> Result<NodeIx, Refusal> {
+        let chains: Vec<Chain> = arms
+            .iter()
+            .filter_map(|arm| match arm {
+                StoreArm::Data(ways) => Some(Chain {
+                    string: false,
+                    shapes: ways.shapes.clone(),
+                    levels: Vec::new(),
+                    location: ways.location,
+                    slot: ways.slot,
+                }),
+                StoreArm::Creation(_) => None,
+            })
+            .collect();
+        self.poly_load(pc, Recv::Stack, true, &chains, &store_arm_shapes(arms), st)?;
+        Ok(st.stack.pop().expect("the read's value"))
+    }
+
+    /// A compound store's ways (`append_prop`, `update_prop`): its own data ways as one Data arm,
+    /// else its Data arms (`Rules::poly_data_ways`, graph-next piece 2), unless WrongShape
+    /// declines them; None for the generic operation.
+    fn compound_arms(&mut self, pc: usize, name: u32) -> Option<Vec<StoreArm>> {
+        let rules = self.rules();
+        match rules.own_data_ways(pc, name, true) {
+            Some(ways) => (!self.stale_ways(pc, &ways)).then(|| vec![StoreArm::Data(ways)]),
+            None => {
+                let arms = rules.poly_data_ways(pc, name)?;
+                (!self.shapes_declined(pc, &store_arm_shapes(&arms))).then_some(arms)
+            }
+        }
     }
 
     /// The words an InlineGuard tests: the callee's, and for a sloppy callee that reads `this`
