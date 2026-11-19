@@ -4381,33 +4381,28 @@ fn pattern_has_expr(pat: &Pattern) -> bool {
     }
 }
 
-/// One megamorphic-stub-cache entry (see [`Interp::stub_cache`]): the derived resolution for a
-/// (receiver shape, site key) pair. The key is kept separately in `stub_cache_names`.
+/// One entry of the engine-wide property cache (see [`Interp::stub_cache`]): a (receiver shape,
+/// key) pair's key and its derived resolution, in one record, as V8's StubCache entry holds its
+/// name beside its handler and map (ic/stub-cache.h:38-47), JSC's MegamorphicCache entry its uid
+/// beside its structure id (runtime/MegamorphicCache.h:70-100) and SpiderMonkey's its key beside
+/// its shape (vm/Caches.h:65-148), so that one load finds both. The key's word
+/// ([`crate::atom::PropKey::word`]) is 0 in an empty entry. Holds no Value: nothing in it needs
+/// rooting.
 #[derive(Clone, Copy)]
+#[repr(C)]
 pub(crate) struct StubEntry {
+    pub(crate) key: Option<crate::atom::PropKey>,
     pub(crate) st: crate::bytecode::IcState,
 }
 
-impl Default for StubEntry {
-    fn default() -> StubEntry {
-        StubEntry {
-            st: crate::bytecode::IcState {
-                recv_shape: 0,
-                holder_shape: 0,
-                slot: 0,
-                depth: crate::bytecode::IC_EMPTY,
-                mid_ok: 0,
-                loc: 0,
-                mid_shape: 0,
-                mid2_shape: 0,
-                mid3_shape: 0,
-                mid4_shape: 0,
-            },
-        }
-    }
+impl StubEntry {
+    const EMPTY: StubEntry = StubEntry {
+        key: None,
+        st: crate::bytecode::IcState::EMPTY,
+    };
 }
 
-/// Stub-cache capacity (power of two). 4096 × 24-byte entries = 96 KiB.
+/// Stub-cache capacity (power of two). 4096 × 40-byte entries = 160 KiB.
 const STUB_CACHE_SIZE: usize = 4096;
 const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
 
@@ -4548,9 +4543,8 @@ impl Interp {
     /// property for the heap's whole life.
     #[inline]
     fn stub_cache_get(&self, shape: u32, key: crate::atom::PropKey) -> Option<StubEntry> {
-        let slot = stub_slot(shape, key);
-        let same_key = self.stub_cache_names.borrow().get(slot) == Some(&Some(key));
-        same_key.then(|| self.stub_cache[slot].get())
+        let entry = self.stub_cache[stub_slot(shape, key)].get();
+        (entry.key == Some(key)).then_some(entry)
     }
 
     /// Store a stub resolution and its key.
@@ -4559,9 +4553,7 @@ impl Interp {
         if !crate::value::is_cacheable_shape(shape) || !st.has_cacheable_shapes() {
             return;
         }
-        let slot = stub_slot(shape, key);
-        self.stub_cache_names.borrow_mut()[slot] = Some(key);
-        self.stub_cache[slot].set(StubEntry { st });
+        self.stub_cache[stub_slot(shape, key)].set(StubEntry { key: Some(key), st });
     }
 }
 
@@ -4580,6 +4572,10 @@ mod property_read_tests;
 #[cfg(test)]
 #[path = "array_absent_read_tests.rs"]
 mod array_absent_read_tests;
+
+#[cfg(test)]
+#[path = "stub_cache_tests.rs"]
+mod stub_cache_tests;
 
 #[cfg(test)]
 #[path = "constructor_transfer_tests.rs"]
@@ -4915,10 +4911,11 @@ pub struct Interp {
     /// ways (constraint hierarchies, visitor patterns) still resolves by shape compares instead
     /// of re-walking the chain with hashed key lookups. Entries are validated by the same live
     /// shape probe as the per-site ways, so stale entries are misses, never wrong hits — the
-    /// table needs no invalidation. `stub_cache_names` holds each entry's key: an atom lives as
-    /// long as its heap, so a key word is never reused for another name.
-    pub(crate) stub_cache: Vec<std::cell::Cell<StubEntry>>,
-    pub(crate) stub_cache_names: std::cell::RefCell<Vec<Option<crate::atom::PropKey>>>,
+    /// table needs no invalidation. Each entry holds its key ([`StubEntry`]): an atom lives as
+    /// long as its heap, so a key word is never reused for another name. Direct-mapped
+    /// (`stub_slot`), overwritten on a fill, as SpiderMonkey's MegamorphicCache
+    /// (vm/Caches.h:204-211). A boxed array: one thin pointer to the entries.
+    pub(crate) stub_cache: Box<[std::cell::Cell<StubEntry>; STUB_CACHE_SIZE]>,
     /// The shape chain of an arguments object's named properties (`length`, @@iterator,
     /// `callee`) appended to empty or packed element storage, derived once by ordinary insertion
     /// into this interpreter's heap. Holds only keys and shape ids: no JS value or Realm.
@@ -5378,7 +5375,6 @@ interp_memory_inventory! {
     descriptor_maps => "measured",
     iter_result_map => "measured",
     regexp_array_maps => "measured",
-    stub_cache_names => "measured",
     computed_reads => "measured",
     fragment_cache => "measured",
     enumeration_keys => "measured",
@@ -7300,12 +7296,14 @@ impl Interp {
                 .unwrap_or(DEFAULT_JIT_ADMIT_RUNS),
             vm_pool: Vec::new(),
             native_arg_pool: Vec::new(),
-            stub_cache: vec![std::cell::Cell::new(StubEntry::default()); STUB_CACHE_SIZE],
+            stub_cache: vec![std::cell::Cell::new(StubEntry::EMPTY); STUB_CACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("the table has STUB_CACHE_SIZE entries")),
             arguments_shapes: None,
             descriptor_maps: Default::default(),
             iter_result_map: Default::default(),
             regexp_array_maps: Default::default(),
-            stub_cache_names: std::cell::RefCell::new(vec![None; STUB_CACHE_SIZE]),
             computed_reads: Default::default(),
             fragment_cache: Default::default(),
             enumeration_keys: crate::cache::ByteLru::new(1 << 20, 256),
@@ -14412,7 +14410,6 @@ impl Interp {
             vm_pool: _,
             native_arg_pool: _,
             stub_cache: _,
-            stub_cache_names: _,
             arguments_shapes: _,
             descriptor_maps: _,
             iter_result_map: _,

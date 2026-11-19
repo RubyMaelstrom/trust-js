@@ -2302,8 +2302,7 @@ impl Interp {
             jit_admit_runs: _,
             vm_pool,
             native_arg_pool,
-            stub_cache: _,       // shapes and slots
-            stub_cache_names: _, // property names
+            stub_cache: _, // keys, shapes and slots
             arguments_shapes: _,
             descriptor_maps,
             iter_result_map,

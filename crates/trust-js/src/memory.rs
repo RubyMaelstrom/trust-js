@@ -1452,19 +1452,9 @@ fn scan_realm(
             .vm_pool
             .capacity()
             .saturating_mul(size_of::<crate::execution_storage::ExecutionFrame>())
-            .saturating_add(
-                interp
-                    .stub_cache
-                    .capacity()
-                    .saturating_mul(size_of::<std::cell::Cell<crate::interpreter::StubEntry>>()),
-            )
-            .saturating_add(
-                interp
-                    .stub_cache_names
-                    .borrow()
-                    .capacity()
-                    .saturating_mul(size_of::<Option<crate::atom::PropKey>>()),
-            )
+            .saturating_add(size_of_val::<
+                [std::cell::Cell<crate::interpreter::StubEntry>],
+            >(&interp.stub_cache[..]))
             .saturating_add(
                 interp
                     .frame_pool
@@ -3307,11 +3297,9 @@ mod tests {
         let objects = crate::value::heap_gc_snapshot(&engine.interp.gc_heap);
         let scopes = crate::value::gc_scope_snapshot(&engine.interp.gc_heap);
         let snapshot = measure(&engine.interp, &objects, &scopes);
-        let stub_bytes = engine
-            .interp
-            .stub_cache
-            .capacity()
-            .saturating_mul(size_of::<std::cell::Cell<crate::interpreter::StubEntry>>());
+        let stub_bytes = size_of_val::<[std::cell::Cell<crate::interpreter::StubEntry>]>(
+            &engine.interp.stub_cache[..],
+        );
 
         assert!(!engine.interp.vm_pool.is_empty());
         assert!(snapshot.engine_caches.bytes >= stub_bytes);
