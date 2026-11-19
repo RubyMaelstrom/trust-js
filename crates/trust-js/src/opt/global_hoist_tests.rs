@@ -200,8 +200,12 @@ fn flags(chunk: &Chunk, pc: u32) -> Vec<(u8, u8)> {
 }
 
 /// A hot loop reading two globals, and two epoch moves after it (a deletion each), then a read.
+/// The epoch moves once before the compile too, so that the proof byte the reads' checks expect
+/// is not 0 (the realm's environment address is aligned: its byte is the epoch's), which a flag
+/// with no proof would also hold.
 const EPOCH: [&str; 4] = [
     "globalThis.a = 1; globalThis.b = 2; globalThis.c = 3; globalThis.d = 4;
+     globalThis.z = 0; delete globalThis.z;
      function sum(n) { var s = 0; for (var i = 0; i < n; i++) s = s + b + c; return s; }
      let t = 0; for (let k = 0; k < 1000; k++) t += sum(5); t",
     "delete globalThis.a; for (let k = 0; k < 2000; k++) t += sum(5); t",
@@ -280,6 +284,7 @@ fn an_entry_checks_exit_flags_its_reads_with_the_proof_and_not_the_header() {
         })
         .collect();
     assert_eq!(reads.len(), 2, "b and c: {reads:?}");
+    assert!(reads.iter().all(|&(_, proof)| proof != 0), "{reads:?}");
     eval(&mut engine, EPOCH[1]);
     assert!(
         !discarded().is_empty(),
@@ -761,14 +766,16 @@ fn an_epoch_moved_under_a_read_that_does_not_run_costs_one_cycle() {
 
 #[test]
 fn each_read_an_entry_check_proves_is_judged_by_its_own_cache() {
-    // The loop reads `a` every iteration and `b` on a path that stops running; the entry's
-    // epoch check proves both. After a move the VM ran `a` (its cache refilled) and not `b`: the
-    // discard flags `a` WrongName with the proof and `b` a hoisting failure, and the recompile
-    // loads `a` at the entry and `b` in the loop.
-    let source = "var a = 1, b = 2;
+    // The loop reads `a` every iteration and `b` and `c` on a path that stops running; the
+    // entry's epoch check proves all three. After a move the VM ran `a` (its cache refilled) and
+    // not `b` or `c`: the discard flags `a` WrongName with the proof and `b` and `c` hoisting
+    // failures, each judged by its own cache (judged by another's, a blind read would pass for
+    // run whichever read's cache is taken), and the recompile loads `a` at the entry and `b` in
+    // the loop.
+    let source = "var a = 1, b = 2, c = 5;
          function two(n) {
            var s = 0;
-           for (var i = 0; i < n; i++) { s = (s + a) | 0; if ((i & 255) === 255) s = (s + b) | 0; }
+           for (var i = 0; i < n; i++) { s = (s + a) | 0; if ((i & 255) === 255) s = (s + b + c) | 0; }
            return s;
          }
          var t = 0; for (var k = 0; k < 300; k++) t = (t + two(600)) | 0; t";
@@ -791,8 +798,8 @@ fn each_read_an_entry_check_proves_is_judged_by_its_own_cache() {
             _ => None,
         })
         .collect();
-    let [(a, proof), (b, _)] = reads[..] else {
-        panic!("a and b: {reads:?}")
+    let [(a, proof), (b, _), (c, _)] = reads[..] else {
+        panic!("a, b and c: {reads:?}")
     };
     let moves = "globalThis.x = 1; delete globalThis.x;
          for (var k = 0; k < 400; k++) t = (t + two(50)) | 0; t";
@@ -806,11 +813,13 @@ fn each_read_an_entry_check_proves_is_judged_by_its_own_cache() {
         vec![(ExitReason::WrongName as u8, proof)],
         "a ran"
     );
-    assert_eq!(
-        flags(&chunk, b),
-        vec![(ExitReason::HoistingFailed as u8, 0)],
-        "b did not run"
-    );
+    for (read, name) in [(b, "b"), (c, "c")] {
+        assert_eq!(
+            flags(&chunk, read),
+            vec![(ExitReason::HoistingFailed as u8, 0)],
+            "{name} did not run"
+        );
+    }
     let graph = graph_now(&engine, &chunk).graph;
     let header = graph
         .blocks
