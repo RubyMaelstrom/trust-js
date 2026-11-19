@@ -7272,3 +7272,116 @@ it themselves (target/p3/stage3/step3g-impl/rehearsal-pins.txt), so no test chan
   +0.12% (context switches around operations not lowered in inlined frames). Open from the
   flip's preparation: the exit limit at graph (owner question 4: JSC's 100 or SpiderMonkey's
   10 << R), and the inliner's budget.
+
+F4 part 2, layer 1 landed: each realm's global object keeps its properties' states (ed6213c0;
+2026-11-19; target/p3/stage3/f4p2-impl, design-note.txt with its "AFTER REVIEW" section and
+report-layer1.txt, the agents'; the coordinator's check target/p3/stage3/f4p2-review). The
+first of four layers of the dependencies the owner approved that morning (question 7). It adds
+cost and no gain by itself; it lands alone, as the review asked (R-4), so that its cost in the
+default configuration is on record apart from what the tier later gains on it.
+- What it is. A one-way state for each named property of a realm's global object: untracked,
+  constant (stored once), not constant (SpiderMonkey's ObjectFuse rule; V8's property cell
+  types and JSC's watchpoint states hold the same information). Every path that can change a
+  global's property reports to it (the note's writers W1 to W11), and every cache or
+  generated-code fill that would store to a global's slot in line refuses a slot that is not
+  yet "not constant" (fills C1 to C6), so that the second store of a property is always seen.
+  A watched global's shape is its own and never shared (rules U1 to U4), as the exemplars'
+  global is an object whose map no other object has: a store way filled through one realm's
+  global can never hit another's.
+- The first form (19504331) cost too much and was sent back: the fixtures +0.07% to +0.15%
+  with the tier off, a VM store to a global +250 to +800 instructions. The rework: a
+  property's state is read without a lock (atomic words, buffers never freed while the fuse
+  lives); a fill reaches the active realm's fuse through the realm, the report through a
+  thread-local, with the registry only for another realm's global; a site whose cache
+  already holds the current shape and slot asks nothing. The larger part of the first form's
+  cost was not the locks: closure and literal instantiation recomputed a copy's shape at every
+  copy (rule U3's path), found with SPE.
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/ed6213c0 against main's
+  b7514ddc; 5 fixed runs, collections deferred), the tier off: Richards +0.046% (a fixed
+  cost: the engine's setup, +10K instructions on an empty script, and its 22 globals' first
+  stores), React's fixture and steady state +0.034% and +0.036% (ten randomized runs a side
+  agree: +0.036%, standard error 0.000), CodeLoad +0.030%, Djot +0.02%, DeltaBlue and Crypto
+  +0.01%, GBEMU -0.07%, the rest within 0.01%; Octane's mean +0.005%. Vue read +0.09% at
+  fixed addresses and +0.015% and -0.023% (standard errors 0.021 and 0.029) in ten randomized
+  runs a side: nothing. The tier on (graph): the same pattern, Octane's mean +0.009%.
+  The agent's store micro, instructions an iteration for a property that is not constant:
+  compiled code unchanged (name 85, alias 61, update 79, script 372); the VM 0, -1, +22, +26;
+  the tree-walker +47, +51, +94 and, through `o.x = v` on the global, +169.
+- Checked: the coordinator's 66 adversarial programs (eight new ones for a global's store
+  paths, each agreeing with Node first: deletes and re-additions, attribute changes, accessor
+  and back, implicit globals made in a loop, eval's declarations, copies from the global, one
+  store site meeting the global and plain objects, a global made non-extensible, `with`) agree
+  at four modes and with main's engine; the layer's tests (43) with the tier off and on; the
+  verifier sweep; the whole library suite with the tier off, 3,766 passed, none failed, 10 ignored (this layer changes
+  every program's store path); the agent's 18 mutations, all caught, and zombie's check and
+  clippy.
+- Left open, the next agent's first work (briefs/f4-part2-resume.txt):
+  1. Rule U2's test moves from every property addition to the transition lookup's miss path
+     (a watched map's shape is unique, so its lookup never hits); the two tests in the
+     named-data copy that can never be true become debug assertions (React's +0.036%).
+  2. The tree-walker's generic store reports twice; the census's counters leave the release
+     store path; a lookup by text on the watched global costs about 150 instructions more
+     there, cause not found (suspected: its additions take no shared layout).
+  3. The coordinator's review asks one hardening (R-5): the thread-local's raw pointer to the
+     active realm's fuse is cleared by the fuse's own drop only; the engine's teardown clears
+     it too, before its heap goes.
+  4. One fixture copy compiles one more function with the layer (Djot's steady state):
+     unexplained.
+- Next: layer 2 (the dependents' lists, a validity word a code tests, the exit reason), layer
+  3 (the tier folds a constant global's read: the rows), layer 4 (a typed array's data and
+  length through a folded global); then the dependency on a buffer not being detached, V8's
+  engine-wide form.
+
+The graph line after the flip: what inlined frames pay for operations the tier does not
+lower, counted and decided (2026-11-19; target/p3/stage3/gnext-impl: design-note.txt,
+exemplars.txt, count-table.txt, template-reads.txt, the agent's; no engine code yet).
+- The cost. An operation of an inlined callee that the tier does not lower runs the callee's
+  first-stage template with the callee's chunk and call site written first and the caller's
+  restored after (16 instructions; 21 with `this`, 25 with the slot window). At graph that
+  eager switch is 0.86% of Splay's instructions, 0.85% of DeltaBlue's, 0.64% of Vue's steady
+  state, 0.41% of TypeScript's, 0.30% of Djot's steady state, 0.23% of GBEMU's, 0.20% of
+  RayTrace's (200 fixed runs; a probe build's counts).
+- The exemplars pay nothing like it on a fast path. Their generic operation takes its inputs
+  explicitly (Maglev's LoadNamedGeneric calls the LoadIC builtin with context and receiver,
+  maglev-ir.cc:5295-5310; the DFG's generic GetById is a data IC on the base register,
+  DFGSpeculativeJIT64.cpp:161-194), and the inlined frame's identity is found only when
+  something asks: from the return address in V8 and SpiderMonkey (frames.cc:3441-3462;
+  JSJitFrameIter.cpp:319-323), from one store made before a call out in JSC
+  (DFGSpeculativeJIT.h:1078-1097; an IC's fast path stores nothing,
+  JITInlineCacheGenerator.cpp:193-205).
+- Decided, piece 1: the lazy switch for every kind whose template has a machine-code path,
+  with the receiver of the kinds that read `this` or a slot passed as an operand word (a form
+  of the template only the tier asks for), and the frame's context written only around the
+  template's helper calls: JSC's form, which steps B2 and B2b already build for calls and a
+  few kinds. Predicted from the per-site helper counts (a site's template reaches its helper
+  on nearly none of its executions or on all of them): DeltaBlue -0.85%, Splay -0.83%, Vue's
+  steady state -0.31%, Djot's -0.24%, TypeScript -0.24%, GBEMU -0.22%, RayTrace -0.20%; the
+  rule as it stood (this and the window kept eager) would leave a third of Splay's and Vue's
+  behind. The kinds whose template is a helper call alone are not admitted.
+- Decided, piece 2: the polymorphic named store (Splay's mixed store widened: own data ways at
+  different slots and creation ways in one site, up to four shapes; Maglev's polymorphic
+  access with transitioning arms, maglev-graph-builder.cc:5775 and :4380-4382; JSC's
+  MultiPutByOffset, DFGByteCodeParser.cpp:7994-7997). It gains in both modes: 56M executions
+  in GBEMU, 17M in Box2D, 1.6M in Splay at 200 runs; a micro reads the generic store at 41 to
+  67 instructions an execution over a lowered one at the splice and 65 to 91 at graph. The
+  agent's estimate from it: Splay about -3%, Box2D -2%, GBEMU -0.8% (inferred).
+- After those, by reach, each with its own note: GetMethodElem as the element load it is
+  (GBEMU 188M executions in compiled frames), InstanceOf (Earley-Boyer 100M), Array.prototype
+  method loads (key-checked ways: PdfJS 27M, TypeScript 11M), absent arms, `prototype`,
+  accessors as calls, growing element stores, and the intrinsic call's section switch as
+  intrinsics lowered to nodes (DeltaBlue 0.34%, Vue's steady state 0.27%, Box2D 0.19%).
+- What a lazy switch cannot help: sites whose template calls its helper every time
+  (TypeScript's keyed reads with non-index keys, 67M at 200 runs; Mandreel's megamorphic named
+  read, 7.8M). All three exemplars probe an engine-wide megamorphic cache in line (Maglev's
+  LoadIC_Megamorphic, the DFG's compileGetByIdMegamorphic, Warp's MegamorphicLoadSlot). Not
+  counted yet in what a helper call costs there: a line of its own, not started.
+- Also found, not started (inferred, to count): sites that look megamorphic because their
+  caches keep warm-up or stale ways (GBEMU's this.x reads: 14.8M of 18.1M executions are one
+  object's earlier shapes; DeltaBlue's refused method loads keep a stale walk). Maglev derives
+  an access from the current maps and drops deprecated ones (maglev-graph-builder.cc:
+  4693-4708).
+- The owner's open question from step 3c (JSC's constant stores around a helper call, or
+  V8's and SpiderMonkey's return-address tables) now has its bound: after piece 1 the stores
+  cost at most 0.29% of any workload (Vue's fixture), on paths whose helper call costs far
+  more. Recommendation: keep JSC's form; ask again when the megamorphic paths no longer call
+  a helper every time.

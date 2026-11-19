@@ -477,6 +477,9 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
      Box2D -0.6%, Crypto -0.5%, Richards -0.5%.
   6. THE FLIP (b7514ddc): the tier inlines in its graph by default; `splice` is
      TRUST_JS_OPT_INLINE=splice. The plan's record "The flip" has the table.
+  7. The first layer of the dependencies on global properties (ed6213c0, 14:35): each realm's
+     global keeps a state per property. It costs the default configuration a little (React
+     +0.04%, Richards +0.05% at 5 runs) and gains nothing until the tier folds on it.
 - origin/main is still 6496547c (pushed 2026-11-18 09:12); local main is about 70 commits
   ahead and NOT PUSHED. The line above under "The repository's state" that names a5411040 and
   28e60d11 describes the morning of 2026-11-18, before that push. The owner has been asked
@@ -484,23 +487,33 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
 - IN FLIGHT, each with a brief under target/p3/stage3/briefs/ and STATUS.txt / NEXT.txt in
   its evidence directory:
   1. Dependencies on global properties ("F4 part 2"; f4-part2.txt, f4-part2-build.txt,
-     f4-part2-layer1b.txt; branch p3-s3-f4p2; evidence f4p2-impl, design-note.txt with its
+     f4-part2-resume.txt; branch p3-s3-f4p3; evidence f4p2-impl, design-note.txt with its
      "AFTER REVIEW" section). Four layers: (1) a one-way state per global property
-     (untracked, constant, not constant) kept by every store path, which lands and is
-     measured on its own; (2) dependent codes and a validity word; (3) the tier's folded
-     reads with a test after calls; (4) the teacher and the limit. Layer 1's first form cost
-     the default configuration too much (the fixtures +0.14%, a VM store to a global +250 to
-     800 instructions) and is being reworked: a state read without a lock, no second check
-     where a cache already proves the slot. After part 1 is measured: the dependency on a
-     typed array's buffer, V8's engine-wide form.
+     (untracked, constant, not constant) kept by every store path: LANDED (item 7 above;
+     its residuals, listed in the plan's record, are the next agent's first work); (2)
+     dependent codes and a validity word; (3) the tier's folded reads with a test after
+     calls; (4) a typed array's data and length through a folded global, the teacher and the
+     limit. After part 2 is measured: the dependency on a typed array's buffer, V8's
+     engine-wide form.
   2. Shape facts, second commit (loopfacts-commit2.txt; branch p3-s3-loopfacts3; evidence
      lf3-impl): the first shape check of an object the loop does not change, moved to the
-     loop's entry edge. Counted before code: Crypto -0.66% predicted at 200 runs.
-- NOT STARTED, in the order the counts give (the plan's records of rule B and of the carry):
-  the lazy context switch for property reads in inlined frames (DeltaBlue 1.15%, Vue's steady
-  state 0.67%, TypeScript 0.43% predicted); the lowered store that mixes replacing and
-  creating a property (Splay 0.82%, at the splice too); the intrinsic call as a node
-  (DeltaBlue 0.32%); stable shapes through calls on the dependency mechanism (75% of
+     loop's entry edge. Counted before code: Crypto -0.66% predicted at 200 runs. Its first
+     build measured -0.22%: the loop analysis counted operations of blocks that never ran,
+     which the builder makes exits, so Crypto's hot loops were not "quiet". The fix (the
+     analysis skips exactly the blocks the builder makes exits, as the exemplars' forced
+     exits do) is being built as its own first commit, since it also widens the landed loop
+     facts and hoists.
+  3. The graph line after the flip (graph-next.txt; branch p3-s3-gnext; evidence
+     gnext-impl, design-note.txt): what inlined frames pay for operations the tier does not
+     lower. Counted and decided (the plan's record of the same name): piece 1, the lazy
+     context switch with the receiver as an explicit operand, being built; piece 2, the
+     polymorphic named store, after it.
+- NOT STARTED, in the order the counts give (the plan's records of rule B, of the carry and
+  of the graph line): the lowerings after the polymorphic store (GetMethodElem, InstanceOf,
+  Array.prototype method loads, absent arms, `prototype`, accessors as calls, growing element
+  stores); the intrinsic call as a node (DeltaBlue 0.34%); an in-line megamorphic cache for
+  named and keyed reads that call a helper every time; caches that keep stale ways; stable
+  shapes through calls on the dependency mechanism (75% of
   Richards', 97% of DeltaBlue's, 66% of RayTrace's repeated shape checks); facts a join drops
   (TypeScript 70%, Box2D 23% of theirs); the determinism rule for a reoptimization's choice
   of inlined ways (target/p3/stage3/tsmode-impl/report.txt section 7, approved, about an
