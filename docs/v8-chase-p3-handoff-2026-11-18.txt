@@ -376,3 +376,54 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
      stuck: three of the inliner's tests take about 70 minutes each in that configuration.
 - The construct line is finished. Its last commit made part A2's tests clean under the
   diagnostic switch that turns its recognizer off (bbf51fbf; the plan's record).
+
+## The night of 2026-11-18 to 19
+
+- PIECE B LANDED on local main (5dd88e0d, ed4ef848; the plan's record "Stage 3 step 3g, piece B
+  landed"): React's steady state at graph runs 39% fewer instructions and 42% fewer cycles.
+  The whole library suite with the tier off and on is running as its confirmation
+  (target/p3/stage3/stepb-review/b-suites.log); a failure takes the two commits back.
+- What the flip waits for now: the rehearsal's table taken again on today's main (graph
+  against the splice, every workload, 5 and 200 runs, cycles), then the owner's decision.
+  TypeScript's rows in it must be read by the method added to benchmarks/README.md that night
+  (the mutator's instructions): the benchmark has two collector modes 1% apart whose draw
+  depends on the binary (the plan's record "TypeScript's two modes").
+- OWNER QUESTION 7 IS NOW DECIDABLE AND WAITS FOR AN ANSWER. The design note is
+  target/p3/stage3/f4-impl/design-note.txt (section 6 has the question; exemplars.txt the
+  citations). In short: may the tier depend on a global property staying unchanged (a one-way
+  state per property, a list of dependent codes, invalidation at the first change), as V8, JSC
+  and SpiderMonkey do: a ceiling of -6.8 points of Mandreel beyond the hoist below and -5% of
+  Richards; may it also depend on a typed array's buffer not being detached or resized (V8's
+  protector, JSC's per-buffer watchpoint; SpiderMonkey does not): -4.5 points more of
+  Mandreel; and how running code learns of an invalidation (a test where the tier already
+  tests after calls, 0.2 to 0.8 points of the gain, or V8's return-address exit, which the
+  same runtime side can take later). The coordinator recommends yes, yes after the first, and
+  the test form first. The same mechanism would serve stable shapes through calls, where a
+  count of that night puts 75% of Richards', 97% of DeltaBlue's and 66% of RayTrace's repeated
+  shape checks (target/p3/stage3/select-impl/loopfacts/split.txt).
+- In flight, each with its brief under target/p3/stage3/briefs/ and a STATUS.txt and NEXT.txt
+  in its evidence directory:
+  1. The global-read hoist ("F4 part 1"; lowerings-resume2.txt; branch p3-s3-low2, the
+     coordinator's rebase over piece B p3-s3-f4-main; evidence f4-impl): reads of global
+     properties loaded once at the entry of a loop that runs no effect. Mandreel at 200 runs
+     -14.1% instructions, -15.5% cycles. NOT LANDED: the coordinator's programs
+     (target/p3/stage3/stepb-review/f4adv, g01, g03, g08) show a miscompile at graph, where
+     an inlined callee's store to the global inside the loop is not counted among the loop's
+     stores. Being fixed.
+  2. The repeated tag test ("c-tag"; ctag.txt; branch p3-s3-ctag; evidence ctag-impl): a shape
+     check after a call no longer tests the value's tag again. Its first commit measures what
+     the count predicted on nine workloads (Richards -1.66%, GBEMU -0.80%, Box2D -0.75% at 200
+     runs at graph); the second (the receiver test in the inliner's callee checks) is the
+     larger half by count. Landing form not yet sent.
+  3. Shape and field facts through a loop that cannot change them (the same agent as 1; note
+     select-impl/design-note-loopfacts.txt, approved in two commits): predicted Crypto about
+     -0.9%, Box2D and Richards -0.3%. Held behind the fix of 1.
+  4. TypeScript's modes (ts-modes.txt; evidence tsmode-impl): the cause and the measuring
+     method are done; a count of the calls at sites that met several closures of one function
+     is running (it decides whether a code-guarded inlined way, the exemplars' form, is the
+     inliner's next piece); the root that keeps a run's heap alive was not found.
+- Not started, recorded: the profile note of graph against the splice (Crypto, GBEMU,
+  Mandreel, Splay); the inliner's budget (the plan's record of piece B has its count).
+- The heat guard tripped once that night (03:05, 86.7 C, 48 processes paused for 53 minutes,
+  cleared at 66.8 C). With everything paused the machine still read 87 to 93 C under the
+  owner's nightly GPU job alone.
