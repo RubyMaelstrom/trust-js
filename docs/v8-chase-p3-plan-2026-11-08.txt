@@ -7624,3 +7624,8 @@ coordinator's check target/p3/stage3/g1-review).
   inlined frame (a getter, a setter, a Proxy receiver, a null receiver's error and stack,
   valueOf, Symbol.hasInstance), zombie's check.
 - Next of the line: piece 2, the polymorphic named store (briefs/graph-piece2.txt).
+
+Validation again, main 63874468 (2026-11-19 16:53; after layer 1's residuals, the loop-cache
+test's fix and the lazy switch; in the background, nothing waiting): Test262 with the tier on
+and eager at graph 53,572 of 53,575 (the same three); difftest 138 agree with the tier off,
+eager, and eager with forced exits.
