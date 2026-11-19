@@ -7804,3 +7804,8 @@ on but RegExp, -0.07%. The agent's store micro: a property's reported stores (it
 and generic writes to the global) cost 11 instructions more, the lookup now reading the tag
 and then the collector state; the next agent caches the pointer beside the tag. Checked: 42
 adversarial programs at seven modes and against the parent's engine.
+
+Validation again, main 87fe41bf (2026-11-19 19:18; with the fold of Number globals on by
+default, layers 2 and 3 and the fuse change, an Array's cached absence, the cache's entry
+layout; in the background): Test262 with the tier on and eager at graph 53,572 of 53,575
+(the same three); difftest 138 agree with the tier off, eager, and eager with forced exits.
