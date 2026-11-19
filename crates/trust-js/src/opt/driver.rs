@@ -1079,6 +1079,7 @@ fn finish(
         narrowed,
         verified,
         verify_failure,
+        kept,
         embeds_genv,
         memory,
         callee_memory,
@@ -1135,6 +1136,15 @@ fn finish(
         }
         if let Some(message) = &verify_failure {
             log_line!("[opt] verify {} failed: {message}", name(chunk));
+        } else if verified && kept.0 > 0 {
+            // The union rule ran on real loops (verify::kept_heap): the headers that kept their
+            // entry's heap facts, and the loops of them the verifier checked.
+            log_line!(
+                "[opt] verified {}: {} headers kept heap facts, {} loops checked",
+                name(chunk),
+                kept.0,
+                kept.1
+            );
         }
         log_inlines(chunk, &inlines, &held);
     }

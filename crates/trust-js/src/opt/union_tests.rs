@@ -188,6 +188,23 @@ fn stores_from_an_inlined_callees_loop_an_inner_loop_and_a_polymorphic_method_ar
     }
 }
 
+#[test]
+fn a_loop_bound_and_a_typed_array_stored_by_inlined_callees_are_read_anew() {
+    // The coordinator's g10 (stepb-review/f4adv): a global typed array an inlined callee replaces
+    // in every iteration, a global loop bound one stores on one iteration, and a loop that stores
+    // the elements of the global typed array it reads.
+    agrees_at_graph(
+        "var A = new Int32Array(16), B = new Int32Array(16), n = 16; B[3] = 5; A[3] = 2;
+         function pick(o, t) { o.A = t; }
+         function len(o, v) { o.n = v; }
+         function W(m) { var s = 0; var g = globalThis; for (var i = 0; i < m; i++) { s += A[3]; pick(g, (i & 1) ? A : B); } return s; }
+         function W2(m) { var s = 0; var g = globalThis; for (var i = 0; i < n; i++) { s += A[i]; if (i === 4) len(g, 8); } n = 16; return s; }
+         function W3(m) { var s = 0; for (var i = 0; i < m; i++) { s += A[i & 15]; A[(i + 1) & 15] = i; } return s; }
+         var r = 0; for (var k = 0; k < 4000; k++) r += W(40) + W2(40) + W3(40);
+         r",
+    );
+}
+
 /// The location of the global-object property `name` as the compile of `compile` reads it.
 fn global_location(compile: &Compile, name: &str) -> u16 {
     let ops = compile.chunk.jit_ops();
@@ -300,34 +317,45 @@ fn the_union_takes_nested_ways_and_by_literal_frames_at_every_depth() {
         let writes =
             super::super::build::site_writes(&compile.view, &job.sites, &callees, site.cache);
         let way = &site.ways[0];
-        if !way.nested.is_empty() {
+        // The site's union with only its nested ways, or only its by-literal ways, under its way
+        // (helper's frame may hold both for its call of the closure), or neither.
+        let with = |nested: bool, literals: bool| {
+            super::super::build::site_writes(
+                &compile.view,
+                &[super::super::build::InlineSite {
+                    cache: site.cache,
+                    ways: vec![super::super::build::InlineWay {
+                        nested: if nested {
+                            way.nested.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        literals: if literals {
+                            way.literals.clone()
+                        } else {
+                            Vec::new()
+                        },
+                        ..way.clone()
+                    }],
+                }],
+                &callees,
+                site.cache,
+            )
+        };
+        assert!(writes.fields.contains(&location), "{writes:?}");
+        if !way.nested.is_empty() && with(true, false).fields.contains(&location) {
             nested = true;
-            assert!(
-                writes.fields.contains(&location),
-                "outer's site takes inner's store: {writes:?}"
-            );
         }
         if !way.literals.is_empty() {
             literal = true;
+            let only = with(false, true);
             assert!(
-                writes.fields.contains(&location),
-                "helper's site takes the closure's store: {writes:?}"
+                only.fields.contains(&location),
+                "helper's site takes the closure's store through its by-literal way: {only:?}"
             );
         }
         // A way's own chunk stores nothing: the location comes from below it.
-        let own = super::super::build::site_writes(
-            &compile.view,
-            &[super::super::build::InlineSite {
-                cache: site.cache,
-                ways: vec![super::super::build::InlineWay {
-                    nested: Vec::new(),
-                    literals: Vec::new(),
-                    ..way.clone()
-                }],
-            }],
-            &callees,
-            site.cache,
-        );
+        let own = with(false, false);
         assert!(own.fields.is_empty(), "{own:?}");
     }
     assert!(
@@ -446,7 +474,7 @@ fn the_verifier_refuses_a_kept_loop_that_writes_what_its_header_kept() {
     let [slot] = kept.slots[..] else {
         panic!("c's value kept: {kept:?}\n{}", dump(graph))
     };
-    let header = kept.header;
+    let header = super::super::verify::kept_header(graph, kept).expect("its loop header");
     // A block of the loop's body (after the header, branching back to it), and the operands a
     // store takes there: the global object and the entry's load of G.
     let body = graph.blocks[header.index()]

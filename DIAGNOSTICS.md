@@ -180,7 +180,9 @@ comment/example in the same change.
   template covers the window and those operand words.
   `TRUST_JS_OPT_VERIFY=1` verifies each graph the tier builds in a release build (its SSA
   dominance, representations, frame states and terminators) and refuses a graph that fails,
-  logging why under `TRUST_JS_OPT_LOG`; debug builds and the library's tests always verify, and
+  logging why under `TRUST_JS_OPT_LOG`, which with it also logs `[opt] verified <name>: <k>
+  headers kept heap facts, <l> loops checked` for a graph whose loop headers kept their entry's
+  heap facts (the loops the union rule was checked on); debug builds and the library's tests always verify, and
   panic at a failure (Maglev, SpiderMonkey and JSC verify their graphs in debug builds only).
   The tier compiles off the main thread: at a checkpoint the main thread takes the snapshot and
   the chunk's frozen view, and the process's compile thread (`trust-js-opt`, started at the first

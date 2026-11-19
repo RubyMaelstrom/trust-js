@@ -108,6 +108,10 @@ pub(crate) struct Finished {
     /// Whether a graph was verified, and the verifier's message where it failed (release).
     pub(crate) verified: bool,
     pub(crate) verify_failure: Option<String>,
+    /// Of a verified graph: its loop headers that kept their entry's heap facts (`Graph::kept`),
+    /// and how many of them head a loop the verifier checked against the union rule (a header a
+    /// back edge reached), for the log.
+    pub(crate) kept: (usize, usize),
     /// The compile's time on its thread, where it was timed (`Job::timed`; zero otherwise).
     pub(crate) elapsed: std::time::Duration,
     /// The job's memory, its frozen view and its snapshot's raw copy, given back for the next
@@ -140,6 +144,7 @@ pub(crate) fn compile(job: Job) -> Finished {
     let mut met = MissingStubs::default();
     let mut verified = false;
     let mut verify_failure = None;
+    let mut kept = (0, 0);
     let mut embeds_genv = false;
     let mut inlines = Vec::new();
     let mut frame_chunks = Vec::new();
@@ -193,6 +198,14 @@ pub(crate) fn compile(job: Job) -> Finished {
         });
         if job.verifies {
             verified = true;
+            kept = (
+                graph.kept.len(),
+                graph
+                    .kept
+                    .iter()
+                    .filter(|header| verify::kept_header(&graph, header).is_some())
+                    .count(),
+            );
             if let Err(message) = verify::verify_frames(&graph, (&job.view, &cfg), &frames) {
                 if cfg!(any(test, debug_assertions)) {
                     panic!(
@@ -256,6 +269,7 @@ pub(crate) fn compile(job: Job) -> Finished {
         narrowed,
         verified,
         verify_failure,
+        kept,
         elapsed: started.map_or(std::time::Duration::ZERO, |started| started.elapsed()),
         embeds_genv,
     }

@@ -1861,9 +1861,6 @@ fn in_reverse_postorder(mut graph: Graph, notes: &mut PhiNotes) -> Graph {
         }
     }
     graph.entry = Some(renumber(entry));
-    for kept in &mut graph.kept {
-        kept.header = renumber(kept.header);
-    }
     // The notes' blocks too (an invariant's entry predecessor, P3 stage 3 step 3a).
     for (_, pred) in &mut notes.invariants {
         *pred = renumber(*pred);
@@ -3647,7 +3644,8 @@ impl<'a> Builder<'a> {
             fields.sort_unstable();
             fields.dedup();
             self.graph.kept.push(KeptHeap {
-                header: block,
+                header_pc: pc as u32,
+                frame: self.frame,
                 fields,
                 slots: names.value_slots(),
             });

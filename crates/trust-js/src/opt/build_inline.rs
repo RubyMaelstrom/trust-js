@@ -266,6 +266,16 @@ impl<'a> Tree<'a> {
     /// too (its build is an exit there). A construct's inlined initializer, when one is built,
     /// joins here the same way; the verifier checks every built loop against the rule
     /// (`verify::kept_heap`).
+    ///
+    /// Step 0c's binding facts were safe before this union by two properties nobody had written
+    /// down: the planner inlines no callee with a free-name store (`bytecode::inline_capability`
+    /// admits none of StoreNameCached, UpdateNameCached, StoreCap, StoreCapInit and UpdateCap,
+    /// and `inline_callee_rules` refuses such a callee, by-literal ways' too, `oracle.rs`), and a
+    /// frame that calls is generic in its analysis (its Rules inline nothing), so that no nested
+    /// or by-literal frame sits in a loop that keeps heap facts. Neither is relied on any more: a
+    /// frame's binding stores and its nested and by-literal frames are in this union, and the
+    /// verifier refuses a StoreBinding at a slot a header kept, so that a planner that admits a
+    /// free-name store, or a frame that calls without being generic, keeps the rule.
     pub(super) fn writes(&self, cache: u32) -> Writes {
         let mut writes = Writes::default();
         if let Some(site) = self.sites.get(&cache) {

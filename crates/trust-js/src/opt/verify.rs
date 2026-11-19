@@ -468,10 +468,10 @@ fn edges(graph: &Graph, n_ops: impl Fn(FrameIx) -> Option<usize>) -> Result<(), 
 /// fault of the prepass.
 fn kept_heap(graph: &Graph, dom: &Dominators) -> Result<(), String> {
     for kept in &graph.kept {
-        let header = kept.header;
-        if header.index() >= graph.blocks.len() {
-            return Err(format!("a kept header {header:?} that is no block"));
-        }
+        // No loop header (the build reached no back edge): no loop.
+        let Some(header) = kept_header(graph, kept) else {
+            continue;
+        };
         let latches: Vec<BlockIx> = graph
             .block(header)
             .preds
@@ -527,6 +527,24 @@ fn kept_heap(graph: &Graph, dom: &Dominators) -> Result<(), String> {
 pub(crate) fn verify_kept_heap(graph: &Graph) -> Result<(), String> {
     let entry = graph.entry.ok_or("the graph has no entry block")?;
     kept_heap(graph, &Dominators::new(graph, entry)?)
+}
+
+/// The loop header block of `kept`'s frame that starts at its pc, if a back edge made one.
+pub(crate) fn kept_header(graph: &Graph, kept: &super::ir::KeptHeap) -> Option<BlockIx> {
+    graph
+        .blocks
+        .iter()
+        .position(|block| {
+            block.loop_header
+                && block.first_pc == kept.header_pc
+                && block
+                    .phis
+                    .iter()
+                    .chain(&block.body)
+                    .next()
+                    .is_some_and(|&first| graph.node(first).frame == kept.frame)
+        })
+        .map(|at| BlockIx(at as u32))
 }
 
 /// What a node may write that a loop header's kept heap facts rest on ([`kept_heap`]).
