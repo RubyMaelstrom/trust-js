@@ -8359,3 +8359,16 @@ report.txt, the agent's; the coordinator's check target/p3/stage3/rs-review).
   still) 2 of 20, one with no cause found. They passed in both whole-library runs of that
   night. The fix is the next commit of the line: each such test runs its body in a child
   process of the test binary (jit_construct_tests.rs's run_alone), exit 20 of 20.
+
+The megamorphic line's count-asserting tests run in a child process (8df2fe98; landed
+2026-11-20 00:12; tests only; target/p3/stage3/mega-impl/p1g/item0-report.txt): fourteen
+tests that assert exact counts of helper calls, table probes or fills (six of
+jit::mega_store_tests, six of jit::mega_read_tests, two of Reflect.set's) run their body
+through jit::construct_tests::run_alone, where no concurrent test moves the process-wide
+creation epoch or the call caches' epoch; the helper now requires the child to report one
+passed test (a misspelt name ran nothing and passed before). 7e7e0a6a's retry loop is
+removed. 80 of 80 runs of the nearest filter clean, 60 of them beside a release build and a
+suite; before, 2 of 20 failed, and on main before that 2 of 6. The cause of one earlier
+failure (80 helper calls in a warm pass) was not hunted: a child process removes every such
+state at once. The rule for new tests of this kind: a test that asserts an exact count
+depending on a process-wide cache or epoch runs alone in a child.
