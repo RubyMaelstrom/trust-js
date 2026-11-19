@@ -7906,3 +7906,60 @@ the coordinator's check target/p3/stage3/s1-review).
   test against a detached or shrunk buffer. Functions follow 4a: the fold proves the
   callee's identity, and with it what the function object fixes for good (its environment
   and Realm), not its `prototype`.
+
+The graph line's piece 2 landed: the polymorphic named store, and the same arms for compound
+stores (719b0fb9 and af8bd058; 2026-11-19; target/p3/stage3/gnext-impl, report-p2.txt and
+p2/recount-report.txt, the agent's; the coordinator's check target/p3/stage3/gp2-review).
+- The rule (719b0fb9). A named store whose site saw own writable Data ways at several
+  locations, Creation ways at several shapes, or both (up to four receiver shapes, no shape
+  in two ways) is lowered: the receiver's shapes checked together, an arm a way, a Data arm
+  storing at its own location and slot, a Creation arm checking its levels and writing its
+  new slot and landing shape; WrongShape exits. Maglev's polymorphic access with
+  transitioning arms (maglev-graph-builder.cc:5775-, BuildStoreMap kTransitioning
+  :4380-4382), JSC's MultiPutByOffset (DFGByteCodeParser.cpp:7994-7997, :8169-8172). Before,
+  own_data_ways took one location only and a site that mixed replacing and creating was
+  generic. The loop analysis sees every arm's location and any creation (the union rule),
+  and the verifier's write classes know the arms.
+- Compound stores (af8bd058): `o.k += v` and `o.k++` at a site of several shapes get the
+  same Data arms; the store has its own shape dispatch after the read's join, as Maglev's
+  and the DFG's stores have (each named access its own map dispatch; Maglev's continuation
+  that would fuse them applies to a load followed by a call, not to a store). The coordinator
+  had asked for one shape decision for both and withdrew it on that reading. Today's contract
+  for what runs between the read and the store is kept per arm: only a numeric add is
+  lowered, and anything that can run user code is the whole generic operation.
+- Measured, the coordinator's builds against main's engine (fat LTO, target/p2/lto/ad17e7c5
+  and 8527cff5 against da46715b; graph; 200 fixed runs, collections deferred; the first
+  commit | the second over it | both): Splay -4.65% | 0.00% | -4.65% (the agent's row with
+  the marker off and collections running: -1.89%), Box2D -1.78% | 0.00% | -1.78%, GBEMU
+  -0.08% | -0.97% | -1.05%, DeltaBlue -0.44% | 0.00% | -0.44%, Crypto -0.17% | 0.00% |
+  -0.17%. The agent's rows at the splice are within a tenth of these (the piece gains in
+  both modes: the sites are mostly in compiled frames), and TypeScript -0.7% in both. At 5
+  runs: Splay -1.5%, Box2D -0.7% for the first commit, GBEMU -0.6% for the second; the tier
+  off equal. The count had predicted Splay -2.6%, Box2D -1.5%, GBEMU -0.15% and then -0.55%
+  with the compound stores.
+- Slower, accepted: DeltaBlue at 5 runs +0.23% at graph and +0.44% at the splice for the
+  first commit, with equal compiles, discards and exits: the arms' compile work in a run
+  that is mostly warm-up (inferred; no profile); at 200 runs it gains 0.44%.
+- Always wrong, the agent's micros: a site that sees fifty shapes is as on main; a third,
+  fourth and fifth shape arriving after the compile cost one discard each (12 compiles, 6
+  discards, 738 exits against main's 9, 3, 38), after which the site is generic: the
+  teacher is the site's ways and the WrongShape flag.
+- Checked: the coordinator's 78 adversarial programs at six modes (forced exits among them)
+  on each commit, the store programs under GC stress at graph: none differs (four new ones,
+  each agreeing with Node first: one site over shapes that replace and shapes that create,
+  then frozen, sealed, non-extensible and read-only receivers, a setter appearing on the
+  prototype, a fifth shape; creations past the inline slots, on arrays, functions and
+  null-prototype objects, a Proxy at the same site; compound stores with numbers, strings,
+  a valueOf that moves the receiver to the other shape or deletes the property, an accessor,
+  a read-only property; stores in a loop that reads through an alias, and a creation that
+  changes the shape the loop carries); the verifier sweep; the tier's modules with the tier
+  on, on the commits' own base and again on the tree that landed (793 passed, none failed,
+  both times); the agent's 14 mutations (a fifteenth is not observable), Test262 53,572 of
+  53,575, zombie's check.
+- Not verified by the agent and open: that TypeScript's tier-off generated code is
+  identical (its one comparison was disturbed); the coordinator's 5-run tier-off rows are
+  equal within the draws.
+- Next of the line, by reach, nobody on it: GetMethodElem as the element load it is (GBEMU:
+  188M executions in compiled frames), InstanceOf (Earley-Boyer 100M), Array.prototype's
+  method loads (key-checked ways), absent arms, accessors as calls and JS getters inlined
+  (Vue), the intrinsic call as a node.
