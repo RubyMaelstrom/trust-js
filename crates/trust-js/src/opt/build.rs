@@ -79,7 +79,7 @@ use super::view::FrozenChunk;
 use crate::bytecode::IC_PRIMITIVE_STRING;
 use crate::bytecode::{Op, UpdKind};
 use crate::fasthash::FastMap;
-use crate::feedback::{NamedWayKind, ValueClass, ValuesView};
+use crate::feedback::{NamedWay, NamedWayKind, ValueClass, ValuesView};
 use crate::jit_ir::{BlockId, BuildError, Cfg, InitializedReads};
 use crate::value::{PACK_BOOL, PACK_CANON_NAN, PACK_EMPTY, PACK_NULL, PACK_UNDEFINED};
 
@@ -369,14 +369,7 @@ impl Rules<'_> {
         let mut shapes = Vec::new();
         let mut at = None;
         for way in named.filled() {
-            let own = way.kind == NamedWayKind::Data
-                && way.primitive == 0
-                && way.depth == 0
-                && way.receiver_shape == way.holder_shape
-                && crate::value::is_cacheable_shape(way.receiver_shape)
-                && way.location != 0
-                && way.slot < MAX_FIELD_SLOT;
-            if !own || at.is_some_and(|at| at != (way.location, way.slot)) {
+            if !own_data_way(way) || at.is_some_and(|at| at != (way.location, way.slot)) {
                 return None;
             }
             at = Some((way.location, way.slot));
@@ -403,12 +396,7 @@ impl Rules<'_> {
     /// template creates (an index's, `length`, `prototype`: jit.rs store_may_create), a generic
     /// mark, a site without its writability proof, a way of another kind, and the rest.
     fn creation_ways(&self, pc: usize, name: u32) -> Option<Creation> {
-        let text = self.chunk.jit_name(name);
-        if text.is_empty()
-            || text.as_bytes()[0].is_ascii_digit()
-            || text == "length"
-            || text == "prototype"
-        {
+        if !self.creates_name(name) {
             return None;
         }
         let named = self.snapshot.named(pc)?;
@@ -418,10 +406,32 @@ impl Rules<'_> {
         {
             return None;
         }
+        self.creation_of(pc, named.filled())
+    }
+
+    /// Whether a template may create a property named `name` (jit.rs store_may_create): not an
+    /// index's, `length` or `prototype`.
+    fn creates_name(&self, name: u32) -> bool {
+        let text = self.chunk.jit_name(name);
+        !(text.is_empty()
+            || text.as_bytes()[0].is_ascii_digit()
+            || text == "length"
+            || text == "prototype")
+    }
+
+    /// The creation of a named store's creation ways `ways` of one receiver shape at `pc`
+    /// (`creation_ways`' rule): the ways whose prototype the snapshot walked, of one landing
+    /// shape and location, their chains alike or of one length and each ending at null, each
+    /// level's shapes at most four; None where no way remains or they differ.
+    fn creation_of<'w>(
+        &self,
+        pc: usize,
+        ways: impl Iterator<Item = &'w NamedWay>,
+    ) -> Option<Creation> {
         let chains = self.snapshot.creation_chains(pc);
         let mut creation: Option<Creation> = None;
         let mut walks: Vec<&super::snapshot::CreationChain> = Vec::new();
-        for way in named.filled() {
+        for way in ways {
             let Some(chain) = chains.iter().find(|chain| chain.proto == way.proto) else {
                 continue;
             };
@@ -476,6 +486,90 @@ impl Rules<'_> {
             creation.levels.push(shapes);
         }
         Some(creation)
+    }
+
+    /// A polymorphic named store's arms (graph-next piece 2; gnext-impl design note 3, "PIECE
+    /// 2"): own writable data ways and creation ways of cacheable shapes, a Data arm per location
+    /// and slot (`own_data_way`) and a Creation arm per receiver shape (`creation_of`), each
+    /// receiver shape in one arm, in the order the site's ways were filled. The builder checks
+    /// the receiver's shapes together, tests each arm's but the last's and makes each arm its
+    /// store (`Builder::poly_store`), as Maglev's polymorphic access builds an arm per access
+    /// info, a transitioning store's among them (TryBuildPolymorphicPropertyAccess, maglev-graph-
+    /// builder.cc:5775-; TryBuildPropertyStore :4519-, BuildStoreMap kTransitioning :4380-4382)
+    /// and JSC's MultiPutByOffset switches on the structure to its Replace and Transition variants
+    /// (dfg/DFGByteCodeParser.cpp:7994-7997, 8169-8172; ftl/FTLLowerDFGToB3.cpp:12916-12990).
+    /// None for a site the monomorphic rules take or refuse alone (one arm: `own_data_ways`,
+    /// `creation_ways`), a generic mark (a fifth receiver shape), a site without its writability
+    /// proof, a way of another kind (an accessor's, an absence's, a primitive's, a data property
+    /// of the chain), a receiver shape in two arms (which a test of the shape cannot tell apart),
+    /// a creation's name no template creates, and a receiver shape whose creations
+    /// `creation_of` refuses.
+    fn poly_store_ways(&self, pc: usize, name: u32) -> Option<Vec<StoreArm>> {
+        let text = self.chunk.jit_name(name);
+        if text == "prototype" || crate::value::canonical_index(text).is_some() {
+            return None;
+        }
+        let named = self.snapshot.named(pc)?;
+        if named.generic || !named.writable {
+            return None;
+        }
+        // The arms in the ways' order; a creation's arm first holds its receiver shape alone.
+        let mut arms: Vec<StoreArm> = Vec::new();
+        for way in named.filled() {
+            let shape = way.receiver_shape;
+            let at = arms.iter().position(|arm| arm.shapes().contains(&shape));
+            if way.kind == NamedWayKind::Creation {
+                match at.map(|at| &arms[at]) {
+                    None => arms.push(StoreArm::Creation(Creation {
+                        shape,
+                        landing: 0,
+                        location: 0,
+                        levels: Vec::new(),
+                        holder: false,
+                    })),
+                    Some(StoreArm::Creation(_)) => {}
+                    Some(StoreArm::Data(_)) => return None,
+                }
+                continue;
+            }
+            if !own_data_way(way) {
+                return None;
+            }
+            let same = |ways: &Ways| (ways.location, ways.slot) == (way.location, way.slot);
+            match at.map(|at| &arms[at]) {
+                Some(StoreArm::Data(ways)) if same(ways) => {}
+                Some(_) => return None,
+                None => match arms
+                    .iter_mut()
+                    .find(|arm| matches!(arm, StoreArm::Data(ways) if same(ways)))
+                {
+                    Some(StoreArm::Data(ways)) => ways.shapes.push(shape),
+                    _ => arms.push(StoreArm::Data(Ways {
+                        shapes: vec![shape],
+                        location: way.location,
+                        slot: way.slot,
+                    })),
+                },
+            }
+        }
+        if arms.len() < 2 {
+            return None;
+        }
+        for arm in &mut arms {
+            if let StoreArm::Creation(creation) = arm {
+                if !self.creates_name(name) {
+                    return None;
+                }
+                let shape = creation.shape;
+                *creation = self.creation_of(
+                    pc,
+                    named.filled().filter(|way| {
+                        way.kind == NamedWayKind::Creation && way.receiver_shape == shape
+                    }),
+                )?;
+            }
+        }
+        Some(arms)
     }
 
     /// A named load's ways on the prototype chain (P3 stage 3 step L2): data ways of objects at
@@ -1021,15 +1115,28 @@ impl Rules<'_> {
             | Op::AppendProp(name, _) => name,
             _ => return (Vec::new(), false),
         };
-        let mut locations = Vec::new();
         if let Some(ways) = self.own_data_ways(pc, name, true) {
-            locations.push(ways.location);
+            return (vec![ways.location], false);
         }
-        let creation = self.creation_ways(pc, name);
-        if let Some(creation) = &creation {
-            locations.push(creation.location);
+        if let Some(creation) = self.creation_ways(pc, name) {
+            return (vec![creation.location], true);
         }
-        (locations, creation.is_some())
+        // A polymorphic store (graph-next piece 2, addition u1): every arm's location, and a
+        // creation where any arm transitions.
+        if matches!(self.ops[pc], Op::UpdateProp(..) | Op::AppendProp(..)) {
+            return (Vec::new(), false);
+        }
+        let Some(arms) = self.poly_store_ways(pc, name) else {
+            return (Vec::new(), false);
+        };
+        let mut locations = Vec::with_capacity(arms.len());
+        for arm in &arms {
+            if !locations.contains(&arm.location()) {
+                locations.push(arm.location());
+            }
+        }
+        let creation = arms.iter().any(|arm| matches!(arm, StoreArm::Creation(_)));
+        (locations, creation)
     }
 
     /// Whether the operation at `pc` lowers without an effect whatever its operands' facts (the
@@ -1080,10 +1187,14 @@ impl Rules<'_> {
             | Op::SetPropThisDrop(name, _)
             | Op::SetPropLocalDrop(_, name, _) => match self.own_data_ways(pc, name, true) {
                 Some(ways) => !self.stale_ways(pc, &ways),
-                // A creation (P3 stage 3 step L3, `Builder::creation_store`).
-                None => self
-                    .creation_ways(pc, name)
-                    .is_some_and(|creation| !self.stale_shapes(pc, &[creation.shape])),
+                // A creation (P3 stage 3 step L3, `Builder::creation_store`), else the arms of
+                // a polymorphic store (graph-next piece 2, addition u3: `Builder::poly_store`).
+                None => match self.creation_ways(pc, name) {
+                    Some(creation) => !self.stale_shapes(pc, &[creation.shape]),
+                    None => self
+                        .poly_store_ways(pc, name)
+                        .is_some_and(|arms| !self.stale_shapes(pc, &store_arm_shapes(&arms))),
+                },
             },
             // P3 stage 3 step L3: `Builder::update_prop` and `Builder::append_prop`.
             Op::UpdateProp(name, _, _) => {
@@ -2520,6 +2631,51 @@ struct Creation {
     location: u16,
     levels: Vec<Vec<u32>>,
     holder: bool,
+}
+
+/// Whether `way` is an own data way a CheckShape of the receiver proves (`Rules::own_data_ways`):
+/// of an object (no primitive's), at depth 0 with the receiver its holder, of a cacheable shape,
+/// its location in a cache's reach.
+fn own_data_way(way: &NamedWay) -> bool {
+    way.kind == NamedWayKind::Data
+        && way.primitive == 0
+        && way.depth == 0
+        && way.receiver_shape == way.holder_shape
+        && crate::value::is_cacheable_shape(way.receiver_shape)
+        && way.location != 0
+        && way.slot < MAX_FIELD_SLOT
+}
+
+/// An arm of a polymorphic named store (`Rules::poly_store_ways`, graph-next piece 2): own data
+/// ways sharing a location and slot, or the creation ways of one receiver shape.
+enum StoreArm {
+    Data(Ways),
+    Creation(Creation),
+}
+
+impl StoreArm {
+    /// The receiver shapes the arm takes.
+    fn shapes(&self) -> &[u32] {
+        match self {
+            StoreArm::Data(ways) => &ways.shapes,
+            StoreArm::Creation(creation) => std::slice::from_ref(&creation.shape),
+        }
+    }
+
+    /// The field location the arm's store writes.
+    fn location(&self) -> u16 {
+        match self {
+            StoreArm::Data(ways) => ways.location,
+            StoreArm::Creation(creation) => creation.location,
+        }
+    }
+}
+
+/// The receiver shapes of a polymorphic store's arms (`Rules::poly_store_ways`), each once.
+fn store_arm_shapes(arms: &[StoreArm]) -> Vec<u32> {
+    arms.iter()
+        .flat_map(|arm| arm.shapes().iter().copied())
+        .collect()
 }
 
 /// The receiver shapes of a polymorphic load's arms (`Rules::poly_ways`), each once.
@@ -5739,6 +5895,12 @@ impl<'a> Builder<'a> {
                 }
                 return self.creation_store(pc, name, recv, keep, &creation, st);
             }
+            if let Some(arms) = self.rules().poly_store_ways(pc, name) {
+                if self.shapes_declined(pc, &store_arm_shapes(&arms)) {
+                    return self.effect(pc, st);
+                }
+                return self.poly_store(pc, name, recv, keep, &arms, st);
+            }
             return self.effect(pc, st);
         };
         if self.stale_ways(pc, &ways) {
@@ -5751,18 +5913,7 @@ impl<'a> Builder<'a> {
         let word = self.tagged(st, receiver, pc);
         let cell = self.shaped(st, &mut cx, word, &ways.shapes);
         let stored = self.tagged(st, value, pc);
-        self.add(
-            NodeOp::StoreField {
-                location: ways.location,
-                slot: ways.slot,
-            },
-            &[cell, stored],
-            Rep::None,
-            pc,
-        );
-        st.fields
-            .retain(|&(_, location), _| location != ways.location);
-        st.fields.insert((word, ways.location), stored);
+        self.store_field(st, word, cell, stored, &ways, pc);
         let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
         st.stack.truncate(len - pops);
         if keep {
@@ -5808,18 +5959,70 @@ impl<'a> Builder<'a> {
         let mut cx = Before::new(pc);
         let word = self.tagged(st, receiver, pc);
         let cell = self.shaped(st, &mut cx, word, &[creation.shape]);
+        self.creation_checks(st, &mut cx, word, cell, creation, 1);
+        let stored = self.tagged(st, value, pc);
+        self.creation_commit(st, &mut cx, word, cell, stored, creation, name, 1);
+        let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
+        st.stack.truncate(len - pops);
+        if keep {
+            st.stack.push(value);
+        }
+        Ok(())
+    }
+
+    /// A data store's node and facts (`named_store`, a Data arm of `poly_store`): the word
+    /// `stored` at `ways`' location and slot of the checked `cell`, which ends every field fact
+    /// at that location; the receiver's (`word`'s) is then the value.
+    fn store_field(
+        &mut self,
+        st: &mut State,
+        word: NodeIx,
+        cell: NodeIx,
+        stored: NodeIx,
+        ways: &Ways,
+        pc: usize,
+    ) {
+        self.add(
+            NodeOp::StoreField {
+                location: ways.location,
+                slot: ways.slot,
+            },
+            &[cell, stored],
+            Rep::None,
+            pc,
+        );
+        st.fields
+            .retain(|&(_, location), _| location != ways.location);
+        st.fields.insert((word, ways.location), stored);
+    }
+
+    /// A creation's checks after its receiver's (`creation_store`, a Creation arm of
+    /// `poly_store`): each level of the chain reached by its [[Prototype]] and checked by its
+    /// shapes, the chain's end, and the receiver's flags, unless the facts prove them, every
+    /// check exiting WrongShape with the operation's before-state and keeping the access's count
+    /// of receiver shapes, `ways`.
+    fn creation_checks(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        creation: &Creation,
+        ways: u8,
+    ) {
+        let pc = cx.pc;
         let (mut object, mut level) = (word, cell);
         for shapes in &creation.levels {
-            level = self.prototype_in(st, &mut cx, object, level, shapes, 1);
+            level = self.prototype_in(st, cx, object, level, shapes, ways);
             object = level;
         }
         if !creation.holder {
             // The chain's end: the last level's [[Prototype]] null, a link fact to the null word.
             let null = self.word(PACK_NULL);
             if st.protos.get(&object) != Some(&null) {
-                let state = self.before(&mut cx, st);
+                let state = self.before(cx, st);
                 self.add_exit(
-                    NodeOp::CheckNoProto { ways: 1 },
+                    NodeOp::CheckNoProto { ways },
                     &[level],
                     Rep::None,
                     pc,
@@ -5830,9 +6033,9 @@ impl<'a> Builder<'a> {
             }
         }
         if !st.creatable.contains(&word) {
-            let state = self.before(&mut cx, st);
+            let state = self.before(cx, st);
             self.add_exit(
-                NodeOp::CheckCreatable { ways: 1 },
+                NodeOp::CheckCreatable { ways },
                 &[cell],
                 Rep::None,
                 pc,
@@ -5841,14 +6044,32 @@ impl<'a> Builder<'a> {
             );
             st.creatable.insert(word);
         }
-        let stored = self.tagged(st, value, pc);
-        let state = self.before(&mut cx, st);
+    }
+
+    /// A creation's store and facts after its checks (`creation_checks`): StoreNew of `stored`,
+    /// then the receiver's shape the landing one, every other value whose shape fact holds the
+    /// old shape without it (see `creation_store`), every field fact at the new location ended
+    /// and the receiver's the value.
+    #[allow(clippy::too_many_arguments)]
+    fn creation_commit(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        stored: NodeIx,
+        creation: &Creation,
+        name: u32,
+        ways: u8,
+    ) {
+        let pc = cx.pc;
+        let state = self.before(cx, st);
         self.add_exit(
             NodeOp::StoreNew {
                 location: creation.location,
                 shape: creation.landing,
                 key: self.chunk.jit_name_key(name),
-                ways: 1,
+                ways,
             },
             &[cell, stored],
             Rep::None,
@@ -5863,12 +6084,162 @@ impl<'a> Builder<'a> {
         st.fields
             .retain(|&(_, location), _| location != creation.location);
         st.fields.insert((word, creation.location), stored);
+    }
+
+    /// A polymorphic named store (graph-next piece 2; `Rules::poly_store_ways`): the receiver's
+    /// shapes checked together (CheckShape, unless proven), then each arm but the last tested by
+    /// its shapes (ShapeIs) and branched to, the last taking the rest; a Data arm stores at its
+    /// own location and slot (`store_field`, as `named_store`), a Creation arm checks its levels,
+    /// its chain's end and the receiver's flags and creates (`creation_checks` and
+    /// `creation_commit`, as `creation_store`, its landing shape the receiver's fact in its arm);
+    /// the arms join with the facts they all hold (`meet`), so that a field fact at any arm's
+    /// location ends and a shape fact holding a creation arm's old shape goes. Every check exits
+    /// WrongShape with the operation's before-state, each keeping the access's count of receiver
+    /// shapes, so that a discard declines the site where its ways did not grow (`stale_shapes`),
+    /// as an own store's. Maglev's polymorphic store builds a block per access info and joins
+    /// them (TryBuildPolymorphicPropertyAccess, maglev-graph-builder.cc:5775-, its transitioning
+    /// arms' StoreMap :4380-4382); JSC's MultiPutByOffset switches on the structure to a Replace
+    /// or a Transition variant's store (ftl/FTLLowerDFGToB3.cpp:12916-12990). Rule K as
+    /// `poly_load`'s: the arms the receiver's facts allow, one arm left the monomorphic store.
+    fn poly_store(
+        &mut self,
+        pc: usize,
+        name: u32,
+        recv: Recv,
+        keep: bool,
+        arms: &[StoreArm],
+        st: &mut State,
+    ) -> Result<(), Refusal> {
+        let len = st.stack.len();
+        let value = st.stack[len - 1];
+        let receiver = self.receiver(recv, st, 1, pc);
+        let mut cx = Before::new(pc);
+        let word = self.tagged(st, receiver, pc);
+        let shapes = store_arm_shapes(arms);
+        let ways = ways_of(&shapes);
+        // The arms the facts allow (rule K), made only where they exclude a shape of one.
+        let allowed: Option<Vec<usize>> = st
+            .shapes
+            .get(&word)
+            .filter(|known| !shapes.iter().all(|shape| known.contains(shape)))
+            .map(|known| {
+                (0..arms.len())
+                    .filter(|&k| arms[k].shapes().iter().any(|shape| known.contains(shape)))
+                    .collect()
+            });
+        if let (Some(known), Some(allowed)) = (st.shapes.get(&word), &allowed) {
+            let kept: usize = allowed
+                .iter()
+                .map(|&k| allowed_shapes(arms[k].shapes(), known).len())
+                .sum();
+            self.graph.narrowed.push(Narrowed {
+                pc: pc as u32,
+                frame: self.frame,
+                arms: true,
+                kept: u8::try_from(kept).expect("at most four ways"),
+                of: ways,
+            });
+        }
+        let taken: Vec<usize> = match allowed {
+            Some(allowed) if !allowed.is_empty() => allowed,
+            _ => (0..arms.len()).collect(),
+        };
+        let cell = self.shaped(st, &mut cx, word, &shapes);
+        let stored = self.tagged(st, value, pc);
+        if let [k] = taken[..] {
+            self.store_arm(st, &mut cx, word, cell, stored, &arms[k], name, ways);
+        } else {
+            let state = self.before(&mut cx, st);
+            let mut ends = Vec::with_capacity(taken.len());
+            for (n, &k) in taken.iter().enumerate() {
+                let arm = &arms[k];
+                let mut arm_st = st.clone();
+                let next = if n + 1 < taken.len() {
+                    let test = self.add(
+                        NodeOp::ShapeIs(arm.shapes().to_vec()),
+                        &[cell],
+                        Rep::Bool,
+                        pc,
+                    );
+                    let first = self.cur;
+                    let then_block = self.graph.add_block(pc as u32, false);
+                    let else_block = self.graph.add_block(pc as u32, false);
+                    self.add(
+                        NodeOp::Branch {
+                            then_block,
+                            else_block,
+                        },
+                        &[test],
+                        Rep::None,
+                        pc,
+                    );
+                    self.graph.add_edge(first, then_block);
+                    self.graph.add_edge(first, else_block);
+                    self.cur = then_block;
+                    Some(else_block)
+                } else {
+                    None
+                };
+                arm_st.shapes.insert(word, arm.shapes().to_vec());
+                let mut cx = Before::with(pc, state);
+                self.store_arm(&mut arm_st, &mut cx, word, cell, stored, arm, name, ways);
+                ends.push((self.cur, arm_st));
+                if let Some(else_block) = next {
+                    self.cur = else_block;
+                }
+            }
+            let join = self.graph.add_block(pc as u32, false);
+            let mut preds = Vec::with_capacity(ends.len());
+            for (block, arm_st) in ends {
+                self.graph.add_node_in(
+                    self.frame,
+                    block,
+                    NodeOp::Jump(join),
+                    &[],
+                    Rep::None,
+                    pc as u32,
+                );
+                self.graph.add_edge(block, join);
+                preds.push((block, arm_st));
+            }
+            self.cur = join;
+            let met = meet(&preds);
+            *st = State {
+                slots: std::mem::take(&mut st.slots),
+                stack: std::mem::take(&mut st.stack),
+                handlers: std::mem::take(&mut st.handlers),
+                ..met
+            };
+        }
         let pops = if matches!(recv, Recv::Stack) { 2 } else { 1 };
         st.stack.truncate(len - pops);
         if keep {
             st.stack.push(value);
         }
         Ok(())
+    }
+
+    /// One arm of `poly_store`, its receiver checked: a Data arm's store, or a Creation arm's
+    /// checks and store.
+    #[allow(clippy::too_many_arguments)]
+    fn store_arm(
+        &mut self,
+        st: &mut State,
+        cx: &mut Before,
+        word: NodeIx,
+        cell: NodeIx,
+        stored: NodeIx,
+        arm: &StoreArm,
+        name: u32,
+        ways: u8,
+    ) {
+        match arm {
+            StoreArm::Data(data) => self.store_field(st, word, cell, stored, data, cx.pc),
+            StoreArm::Creation(creation) => {
+                self.creation_checks(st, cx, word, cell, creation, ways);
+                self.creation_commit(st, cx, word, cell, stored, creation, name, ways);
+            }
+        }
     }
 
     /// UpdateProp (`o.x++`, `--o.x` and the rest, P3 stage 3 step L3) on own writable data ways

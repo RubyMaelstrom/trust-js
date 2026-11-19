@@ -1451,6 +1451,10 @@ mod chain;
 #[path = "create_inline_tests.rs"]
 mod create;
 
+/// Graph-next piece 2 under TRUST_JS_OPT_INLINE=graph: the polymorphic named store.
+#[path = "poly_store_inline_tests.rs"]
+mod poly_store;
+
 // ---- P3 stage 3 step 3c: generic nodes in inlined frames --------------------------------------
 
 /// The inlined frames' generic nodes the back end lowered since the last call, by operation.
