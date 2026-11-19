@@ -229,6 +229,21 @@ Each is recorded where the plan line says; none blocks the lines above.
    (JSC's form, built) or return-address tables (V8's and SpiderMonkey's). The count bounds
    what the tables could add at 0.29% of any workload. Recommended: keep JSC's form.
 
+16. From the getter line (2026-11-19; target/p3/stage3/getter-impl/embed-note.txt, with the
+   browsers' engines' paths cited in embed-note-exemplars.txt): an accessor an embedder defines
+   through the embedding API (a browser's DOM properties are these) costs 536 instructions a
+   read after that line's direct native call (897 before) and 682 a write, of which about 12
+   are the embedder's own closure. SpiderMonkey, V8 and JSC each give such accessors a call
+   form of their own: the embedder's function called with the receiver's native object behind
+   a class check, with no JS-call machinery, and its effects declared to the optimizing tier
+   (SpiderMonkey's JSJitInfo getters and CallDOMGetter; V8's CallApiGetter and fast API calls;
+   JSC's custom getters and DOMJIT). The question: should the embedding API gain such an
+   accessor kind (a plain function of the interpreter and the receiver, registered with a
+   receiver class and an effect class), which the embedder would then use for its hot
+   accessors? Estimated 150 to 250 instructions a read saved (inferred; nothing built).
+   Recommended: yes, after a count in the embedder of how much of a real page's time its
+   accessors take, since no workload in this repository calls one.
+
 ## How the work is done
 
 - A design record before code. Each stage and each step that makes a choice has a note in the plan
