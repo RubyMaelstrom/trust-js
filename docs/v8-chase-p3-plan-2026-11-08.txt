@@ -7789,3 +7789,18 @@ measured.
 - Next of the line (briefs/f4-part2-layer4.txt): a recount of what a fold still reaches by
   the kind of value (typed arrays, functions, objects), since the day's loop work already
   hoists Mandreel's global reads; then layer 4 for the kinds the count keeps.
+
+F4 part 2, the fuses kept with the heap, landed (da46715b; 2026-11-19; target/p3/stage3/f4p2-impl,
+report-e.txt, the agent's; the coordinator's check target/p3/stage3/e-review). The review's
+R-5 to its end: the active realm's global fuse is held by the Agent's collector state (an
+Arc there, with the map's address and the pointer), read through the active Agent's tag,
+which every entry and every host guard already switches, as SpiderMonkey keeps its fuses with
+the zone (vm/Watchtower.cpp:760). The thread-local raw pointer, its activation and its clear
+at an engine's teardown are gone; an engine's write inside its host guard while another
+engine is active reports through its own fuse with no registry lock (the two-engines test,
+extended to the guard). Measured (fat LTO, target/p2/lto/b2212acd against layer 3's
+b614f6d8; 5 fixed runs, collections deferred): every row within 0.04% with the tier off and
+on but RegExp, -0.07%. The agent's store micro: a property's reported stores (its first two,
+and generic writes to the global) cost 11 instructions more, the lookup now reading the tag
+and then the collector state; the next agent caches the pointer beside the tag. Checked: 42
+adversarial programs at seven modes and against the parent's engine.
