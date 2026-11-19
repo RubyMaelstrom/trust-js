@@ -737,8 +737,9 @@ fn a_folded_number_is_a_constant_of_the_code() {
 }
 
 // Layer 4a: a typed array's identity and the facts it fixes for the object's life (an object, a
-// typed array, its view's kind); its length and data stay loads (a detach or a resize changes
-// them under the same object; 4b's dependency is a separate piece).
+// typed array, its view's kind); its data stays a test each effect epoch (a detach or a resize
+// takes it under the same object); its view's element count is its accesses' bounds limit
+// (layer 4b), never the program's `length`.
 
 /// A typed array `HEAP` read in `f`'s loop after a call each iteration (a new effect epoch, so a
 /// folded read each iteration), warmed; `then` runs after the warm-up, then `f` again.
@@ -756,7 +757,7 @@ fn typed_program(decl: &str, then: &str) -> String {
 }
 
 #[test]
-fn a_folded_typed_array_drops_its_object_and_kind_checks_and_keeps_its_length_and_data() {
+fn a_folded_typed_array_drops_its_object_and_kind_checks_and_keeps_its_data() {
     let source = typed_program("var HEAP = new Int32Array(64);", "");
     let graph = folded_graph(&source, "f");
     assert_eq!(super::verify::verify_folded_reads(&graph), Ok(()));
@@ -779,12 +780,10 @@ fn a_folded_typed_array_drops_its_object_and_kind_checks_and_keeps_its_length_an
         0,
         "no kind check of the folded cell"
     );
-    for (what, op) in [
-        ("TypedView", NodeOp::TypedView),
-        ("TypedLength", NodeOp::TypedLength),
-    ] {
-        assert!(count(&|node| node.op == op) >= 1, "{what} stays");
-    }
+    assert!(
+        count(&|node| node.op == NodeOp::TypedView) >= 1,
+        "TypedView stays"
+    );
     assert!(
         count(&|node| matches!(node.op, NodeOp::TypedData { .. })) >= 1,
         "TypedData stays"
@@ -804,6 +803,298 @@ fn a_folded_typed_array_drops_its_object_and_kind_checks_and_keeps_its_length_an
         word: Value::Num(1.0).bits(),
     };
     assert!(super::verify::verify_folded_reads(&wrong).is_err());
+}
+
+/// The first folded global of `name`'s compile after `source` ran in the VM.
+fn first_fold(source: &str, name: &str) -> Option<super::snapshot::Folded> {
+    TestSwitches {
+        on: false,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Bytecode);
+    eval(&mut engine, source);
+    let chunk = chunk_of(&mut engine, name);
+    folds(true);
+    let mut raw = Raw::take_in(&chunk, Some(&engine.interp));
+    super::global_fold::prepare(&engine.interp, &chunk, std::iter::once(&mut raw));
+    folds(false);
+    let fold = raw.global_reads_mut().find_map(|view| match view {
+        super::snapshot::NameView::Global { folded, .. } => *folded,
+        _ => None,
+    });
+    fold
+}
+
+#[test]
+fn a_folded_typed_arrays_bounds_limit_is_a_constant_beside_its_data_test() {
+    // Layer 4b: the view's element count is the accesses' bounds limit, a constant with no
+    // load (FoldedLength, an immediate of the comparison), where a TypedData of the view is
+    // tested in the same effect epoch. Two accesses an epoch: the first's bounds test comes
+    // before its TypedData, the second's after it.
+    let source = typed_program("var HEAP = new Int32Array(64);", "");
+    let graph = folded_graph(&source, "f");
+    assert_eq!(super::verify::verify_folded_lengths(&graph), Ok(()));
+    let count = |f: &dyn Fn(&Node) -> bool| graph.nodes.iter().filter(|node| f(node)).count();
+    let limit = |k: NodeIx| graph.node(k).op == NodeOp::FoldedLength(64);
+    assert!(count(&|node| node.op == NodeOp::FoldedLength(64)) >= 1);
+    assert_eq!(count(&|node| node.op == NodeOp::TypedLength), 0, "no load");
+    let users: Vec<usize> = (0..graph.nodes.len())
+        .filter(|&k| graph.nodes[k].inputs.iter().any(|&input| limit(input)))
+        .collect();
+    assert!(users.len() >= 2, "{users:?}");
+    for &user in &users {
+        let node = &graph.nodes[user];
+        assert_eq!(node.op, NodeOp::CheckBounds, "node {user}");
+        assert!(
+            limit(node.inputs[1]) && !limit(node.inputs[0]),
+            "node {user}"
+        );
+    }
+    // The verifier's rule, each part broken in a copy. A consumer that is no bounds test: the
+    // constant taken as a number (what answering the program's `length` from it would build).
+    let mut wrong = graph.clone();
+    wrong.nodes[users[0]].op = NodeOp::I32ToTagged;
+    assert!(super::verify::verify_folded_lengths(&wrong).is_err());
+    // The limit as the bounds test's index.
+    let mut wrong = graph.clone();
+    wrong.nodes[users[0]].inputs.swap(0, 1);
+    assert!(super::verify::verify_folded_lengths(&wrong).is_err());
+    // A frame state naming it.
+    let mut wrong = graph.clone();
+    let length = wrong.nodes[users[0]].inputs[1];
+    let state = (0..wrong.states.len())
+        .find(|&k| !wrong.states[k].stack.is_empty())
+        .or_else(|| {
+            (0..wrong.states.len()).find(|&k| {
+                wrong.states[k]
+                    .slots
+                    .iter()
+                    .any(|slot| matches!(slot, SlotSource::Value(_)))
+            })
+        })
+        .expect("a state with a value");
+    if let Some(top) = wrong.states[state].stack.first_mut() {
+        *top = length;
+    } else {
+        let slot = wrong.states[state]
+            .slots
+            .iter_mut()
+            .find(|slot| matches!(slot, SlotSource::Value(_)))
+            .expect("a value slot");
+        *slot = SlotSource::Value(length);
+    }
+    assert!(super::verify::verify_folded_lengths(&wrong).is_err());
+    // No TypedData in the epoch (each made another pure node).
+    let mut wrong = graph.clone();
+    for node in &mut wrong.nodes {
+        if matches!(node.op, NodeOp::TypedData { .. }) {
+            node.op = NodeOp::TypedView;
+        }
+    }
+    assert!(super::verify::verify_folded_lengths(&wrong).is_err());
+    // A length of a view that is no folded typed array's.
+    let mut wrong = graph.clone();
+    for node in &mut wrong.nodes {
+        if node.op == NodeOp::FoldedCell {
+            node.op = NodeOp::CheckObject;
+        }
+    }
+    assert!(super::verify::verify_folded_lengths(&wrong).is_err());
+    // A limit the comparison does not take as its immediate.
+    let mut wrong = graph.clone();
+    for node in &mut wrong.nodes {
+        if node.op == NodeOp::FoldedLength(64) {
+            node.op = NodeOp::FoldedLength(1_000_003);
+        }
+    }
+    assert!(super::verify::verify_folded_lengths(&wrong).is_err());
+    // Such a limit stays the load, made once a view (two instructions a use otherwise).
+    let source = typed_program("var HEAP = new Int32Array(1000003);", "");
+    let graph = folded_graph(&source, "f");
+    assert_eq!(super::verify::verify_folded_lengths(&graph), Ok(()));
+    let count = |f: &dyn Fn(&Node) -> bool| graph.nodes.iter().filter(|node| f(node)).count();
+    assert_eq!(count(&|node| matches!(node.op, NodeOp::FoldedLength(_))), 0);
+    assert!(count(&|node| node.op == NodeOp::TypedLength) >= 1);
+    for (limit, immediate) in [
+        (0, true),
+        (4095, true),
+        (4096, true),
+        (4097, false),
+        (0x3c_b000, true),
+        (0xff_f000, true),
+        (0x100_0000, false),
+        (1_000_003, false),
+        (i32::MAX, false),
+        (-1, false),
+    ] {
+        assert_eq!(limit_immediate(limit), immediate, "{limit}");
+    }
+}
+
+#[test]
+fn a_folded_length_serves_no_access_after_an_effect_without_its_views_data_test() {
+    // Straight-line: an access, a call, an access. Each epoch reads HEAP again (a new folded
+    // node, view, limit and TypedData). The second bounds test given the first epoch's limit
+    // has no TypedData of that view since the call: refused. The array held in a local across
+    // the call keeps its view and its limit (value facts) and tests its data again: accepted.
+    let source = "var HEAP = new Int32Array(64); HEAP[1] = 5; HEAP[2] = 7;
+         function h() {}
+         function f() { var a = HEAP[1] | 0; h(); return (a + (HEAP[2] | 0)) | 0; }
+         function g() { var v = HEAP; var a = v[1] | 0; h(); return (a + (v[2] | 0)) | 0; }
+         var t = 0; for (var k = 0; k < 50; k++) t = (t + f() + g()) | 0;";
+    let graph = folded_graph(source, "f");
+    assert_eq!(super::verify::verify_folded_lengths(&graph), Ok(()));
+    let limits: Vec<usize> = (0..graph.nodes.len())
+        .filter(|&k| graph.nodes[k].op == NodeOp::FoldedLength(64))
+        .collect();
+    assert_eq!(limits.len(), 2, "one an epoch");
+    let mut wrong = graph.clone();
+    let second = (0..wrong.nodes.len())
+        .find(|&k| {
+            wrong.nodes[k].op == NodeOp::CheckBounds
+                && wrong.nodes[k].inputs[1].index() == limits[1]
+        })
+        .expect("the second epoch's bounds test");
+    wrong.nodes[second].inputs[1] = NodeIx(limits[0] as u32);
+    let refused = super::verify::verify_folded_lengths(&wrong);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|why| why.contains("effect epoch")),
+        "{refused:?}"
+    );
+    let held = folded_graph(source, "g");
+    assert_eq!(super::verify::verify_folded_lengths(&held), Ok(()));
+    let count = |f: &dyn Fn(&Node) -> bool| held.nodes.iter().filter(|node| f(node)).count();
+    assert_eq!(count(&|node| node.op == NodeOp::FoldedLength(64)), 1);
+    assert_eq!(
+        count(&|node| matches!(node.op, NodeOp::TypedData { .. })),
+        2
+    );
+    // Its first access without its TypedData: the one after the call does not serve it.
+    let mut wrong = held.clone();
+    let first = (0..wrong.nodes.len())
+        .find(|&k| matches!(wrong.nodes[k].op, NodeOp::TypedData { .. }))
+        .expect("the first epoch's TypedData");
+    wrong.nodes[first].op = NodeOp::TypedView;
+    let refused = super::verify::verify_folded_lengths(&wrong);
+    assert!(
+        refused
+            .as_ref()
+            .is_err_and(|why| why.contains("effect epoch")),
+        "{refused:?}"
+    );
+}
+
+#[test]
+fn a_bounds_limit_folds_for_a_fixed_view_of_a_buffer_that_is_not_resizable() {
+    let f = "function f() { return HEAP[1]; } for (var k = 0; k < 50; k++) f();";
+    for (decl, limit) in [
+        ("var HEAP = new Int32Array(64);", Some(64)),
+        (
+            "var HEAP = new Uint8Array(new ArrayBuffer(256), 16, 100);",
+            Some(100),
+        ),
+        (
+            "var HEAP = new Float64Array(new ArrayBuffer(256), 64);",
+            Some(24),
+        ),
+        // A fixed-length view of a resizable buffer (a shrink puts it out of bounds), and a
+        // length-tracking one: no limit, the kind still folds.
+        (
+            "var HEAP = new Int32Array(new ArrayBuffer(256, { maxByteLength: 512 }), 0, 64);",
+            None,
+        ),
+        (
+            "var HEAP = new Int32Array(new ArrayBuffer(256, { maxByteLength: 512 }));",
+            None,
+        ),
+        // A view whose buffer was detached after its construction keeps its record's count.
+        (
+            "var HEAP = new Int32Array(64); HEAP.buffer.transfer();",
+            Some(64),
+        ),
+    ] {
+        let fold = first_fold(&format!("{decl} {f}"), "f").expect("HEAP folds");
+        assert!(fold.typed.is_some(), "{decl}");
+        assert_eq!(fold.length, limit, "{decl}");
+    }
+    // The record's clamp at 2^31 is no count.
+    use super::global_fold::bounds_limit;
+    assert_eq!(bounds_limit(64, true), Some(64));
+    assert_eq!(bounds_limit(64, false), None);
+    assert_eq!(bounds_limit((1 << 31) - 1, true), Some(i32::MAX));
+    assert_eq!(bounds_limit(1 << 31, true), None);
+}
+
+#[test]
+fn a_folded_typed_arrays_length_reads_zero_once_its_buffer_is_detached() {
+    // The program's `length` (and byteLength, byteOffset) of a folded typed array is never the
+    // folded bounds limit: 0 once the buffer is detached, before the loop, from a callee inside
+    // it, and from the index's valueOf; an element read is undefined then. No list fires (the
+    // property holds the same object; the detach's moment is an object's field, no global).
+    let program = |detach: &str, body: &str| {
+        format!(
+            "var HEAP = new Int32Array(64);
+             for (var j = 0; j < 64; j++) HEAP[j] = j * 3;
+             var calls = 0, ctl = {{ at: -1 }};
+             function h() {{ if (++calls === ctl.at) HEAP.buffer.transfer(); }}
+             var key = {{ valueOf: function () {{ if (++calls === ctl.at) HEAP.buffer.transfer(); return 5; }} }};
+             function f(n) {{ var s = 0; for (var i = 0; i < n; i++) {{ {body} }} return s; }}
+             var t = 0; for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+             {detach}
+             for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+             [t, HEAP.length, HEAP.byteLength, HEAP.byteOffset, HEAP[1]].join()"
+        )
+    };
+    let read = "s = (s + (HEAP[i & 63] | 0) + HEAP.length + HEAP.byteLength) | 0; h();";
+    let keyed = "s = (s + (HEAP[i & 63] | 0) + (HEAP[key & 63] | 0) + HEAP.length) | 0;";
+    let store = "HEAP[i & 63] = i; s = (s + HEAP.length + (HEAP[(i + 7) & 63] | 0)) | 0; h();";
+    for (detach, body) in [
+        ("HEAP.buffer.transfer();", read),
+        ("ctl.at = calls + 12345;", read),
+        ("ctl.at = calls + 12345;", keyed),
+        ("HEAP.buffer.transfer();", store),
+        ("ctl.at = calls + 12345;", store),
+    ] {
+        let source = program(detach, body);
+        let expected = vm(&source);
+        assert!(expected.ends_with(",0,0,0,"), "{detach}: {expected}");
+        for graph in [false, true] {
+            let run = run(&source, graph);
+            assert_eq!(run.result, expected, "{detach} {body} graph {graph}");
+            assert_eq!(run.fired, (0, 0), "{detach} graph {graph}: {run:?}");
+        }
+    }
+}
+
+#[test]
+fn a_folded_typed_arrays_read_past_its_limit_is_undefined() {
+    // A site that reads past the end exits there once and then reads undefined past the length
+    // (LoadTypedOrUndefined), whose length is the folded limit where CMP's immediate holds it
+    // (64) and the load where it does not (1000003). The indices cross the limit, so a limit
+    // off by one reads a word past the view. Then the buffer is detached: every read is
+    // undefined.
+    for len in [64, 1_000_003] {
+        let source = format!(
+            "var HEAP = new Int32Array({len});
+             for (var j = 0; j < 64; j++) HEAP[{len} - 1 - j] = j * 3 + 1;
+             function h() {{}}
+             function f(n) {{ var s = 0; for (var i = 0; i < n; i++) {{ var v = HEAP[{len} - 32 + (i & 63)]; s = (s + (v === undefined ? 7 : v)) | 0; h(); }} return s; }}
+             var t = 0; for (var k = 0; k < 600; k++) t = (t + f(200)) | 0;
+             HEAP.buffer.transfer();
+             for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+             t"
+        );
+        let expected = vm(&source);
+        for graph in [false, true] {
+            let run = run(&source, graph);
+            assert_eq!(run.result, expected, "length {len} graph {graph}");
+            assert_eq!(run.fired, (0, 0), "length {len} graph {graph}: {run:?}");
+        }
+    }
 }
 
 #[test]

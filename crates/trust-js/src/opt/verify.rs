@@ -67,7 +67,7 @@
 //!   available at the node that exits.
 
 use super::ir::{
-    BlockIx, ExitReason, FrameIx, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource,
+    BlockIx, ExitReason, FrameIx, FrameState, Graph, Node, NodeIx, NodeOp, Rep, SlotSource, StateIx,
 };
 use super::liveness::SlotLiveness;
 use super::view::FrozenChunk;
@@ -259,6 +259,7 @@ pub(crate) fn verify_frames(
     proven_objects(graph, &dom)?;
     kept_heap(graph, &dom)?;
     folded_reads(graph)?;
+    folded_lengths(graph)?;
     // The builder's liveness again, where its cost is a test's or a debug build's: each frame's
     // chunk's.
     let liveness: Vec<Option<SlotLiveness>> = chunks
@@ -604,6 +605,192 @@ fn folded_reads(graph: &Graph) -> Result<(), String> {
     Ok(())
 }
 
+/// A folded typed array's bounds limit (`FoldedLength`, F4 part 2 layer 4b) is the limit of an
+/// element access and nothing else. The constant is the element count of the view's record,
+/// which nothing writes after the view's construction; the typed array's length (ECMA-262
+/// TypedArrayLength, what the program reads as `length`) is 0 once the buffer is detached or
+/// the view out of bounds, so the constant may stand only where a TypedData of the same view,
+/// whose attached and end tests leave before the access touches storage that is gone, is tested
+/// in the same effect epoch (V8 guards each access of a constant typed array so,
+/// compiler/js-native-context-specialization.cc:4050-4060 and 4096-4110). So:
+/// - a `FoldedLength`'s input is the `TypedView` of a `FoldedCell` (a folded object's, which
+///   [`folded_reads`] proves), and its value one the comparison takes as its immediate
+///   (`ir::limit_immediate`: a limit made in a register at each use costs more than its load);
+/// - no frame state names one, and its only consumers are a `CheckBounds`, as its limit, and a
+///   `LoadTypedOrUndefined`, as its length, whose address is a `TypedData` of the same view;
+/// - at each consumer a `TypedData` of that view was tested since the last effect on every path
+///   (a forward must-set of views, which a `TypedData` joins and [`heap_write`]'s `Any` empties,
+///   met by intersection, the entry's empty), or one follows it in its block before any effect
+///   (the bounds test of an epoch's first access comes before its TypedData).
+fn folded_lengths(graph: &Graph) -> Result<(), String> {
+    let limit = |node: NodeIx| matches!(graph.node(node).op, NodeOp::FoldedLength(_));
+    // The views with a folded length, numbered: the must-set's bits.
+    let mut views = crate::fasthash::FastMap::<NodeIx, usize>::default();
+    for (index, node) in graph.nodes.iter().enumerate() {
+        let NodeOp::FoldedLength(value) = node.op else {
+            continue;
+        };
+        if !super::ir::limit_immediate(value) {
+            return Err(format!(
+                "node {index} (a folded length {value}) is no immediate of its comparison"
+            ));
+        }
+        let view = node.inputs.first().copied();
+        let folded = view.is_some_and(|view| {
+            let view = graph.node(view);
+            view.op == NodeOp::TypedView
+                && view
+                    .inputs
+                    .first()
+                    .is_some_and(|&cell| graph.node(cell).op == NodeOp::FoldedCell)
+        });
+        let Some(view) = view.filter(|_| folded) else {
+            return Err(format!(
+                "node {index} (a folded length) of no folded typed array's view"
+            ));
+        };
+        let next = views.len();
+        views.entry(view).or_insert(next);
+    }
+    if views.is_empty() {
+        return Ok(());
+    }
+    for state in 0..graph.states.len() {
+        let mut named = None;
+        graph.for_each_exit_value(StateIx(state as u32), |value| {
+            if limit(value) {
+                named = Some(value);
+            }
+        });
+        if let Some(value) = named {
+            return Err(format!(
+                "state {state} names node {} (a folded length, no value of the program)",
+                value.index()
+            ));
+        }
+    }
+    let entry = graph.entry.ok_or("the graph has no entry block")?;
+    let words = views.len().div_ceil(64);
+    let tested_view = |node: &Node| match node.op {
+        NodeOp::TypedData { .. } => node.inputs.get(1).and_then(|view| views.get(view)).copied(),
+        _ => None,
+    };
+    // What a consumer of the folded length `length` must be (see the rule), and its view's bit.
+    let consumer = |user: NodeIx, length: NodeIx| -> Result<usize, String> {
+        let node = graph.node(user);
+        let view = graph.node(length).inputs[0];
+        let limits = node.inputs.iter().filter(|&&input| limit(input)).count();
+        let ok = limits == 1
+            && match node.op {
+                NodeOp::CheckBounds => node.inputs.get(1) == Some(&length),
+                NodeOp::LoadTypedOrUndefined(_) => {
+                    node.inputs.get(3) == Some(&length)
+                        && node.inputs.get(1).is_some_and(|&data| {
+                            let data = graph.node(data);
+                            matches!(data.op, NodeOp::TypedData { .. })
+                                && data.inputs.get(1) == Some(&view)
+                        })
+                }
+                _ => false,
+            };
+        if !ok {
+            return Err(format!(
+                "node {} ({:?} at pc {}) takes node {} (a folded length) as other than an \
+                 element access's bounds limit",
+                user.index(),
+                node.op,
+                node.pc,
+                length.index()
+            ));
+        }
+        Ok(views[&view])
+    };
+    // The must-set at each block's end, from "every view" down, until stable.
+    let mut out = vec![vec![u64::MAX; words]; graph.blocks.len()];
+    let walk = |block: BlockIx, mut set: Vec<u64>, check: bool| -> Result<Vec<u64>, String> {
+        let data = graph.block(block);
+        let nodes: Vec<NodeIx> = data.phis.iter().chain(&data.body).copied().collect();
+        for (at, &index) in nodes.iter().enumerate() {
+            let node = graph.node(index);
+            if check {
+                for &input in node.inputs.iter().filter(|&&input| limit(input)) {
+                    let bit = consumer(index, input)?;
+                    let view = graph.node(input).inputs[0];
+                    // Tested before it in its epoch, or after it in its block before an effect.
+                    let follows = || {
+                        nodes[at + 1..]
+                            .iter()
+                            .map(|&later| graph.node(later))
+                            .take_while(|later| !matches!(heap_write(&later.op), HeapWrite::Any))
+                            .any(|later| {
+                                matches!(later.op, NodeOp::TypedData { .. })
+                                    && later.inputs.get(1) == Some(&view)
+                            })
+                    };
+                    if set[bit / 64] & (1 << (bit % 64)) == 0 && !follows() {
+                        return Err(format!(
+                            "node {} ({:?} at pc {}, block {}) takes a folded length with no \
+                             TypedData of its view in its effect epoch",
+                            index.index(),
+                            node.op,
+                            node.pc,
+                            block.index()
+                        ));
+                    }
+                }
+            }
+            if let Some(bit) = tested_view(node) {
+                set[bit / 64] |= 1 << (bit % 64);
+            } else if matches!(heap_write(&node.op), HeapWrite::Any) {
+                set.fill(0);
+            }
+        }
+        Ok(set)
+    };
+    let in_set = |block: BlockIx, out: &[Vec<u64>]| -> Vec<u64> {
+        let preds = &graph.block(block).preds;
+        if block == entry || preds.is_empty() {
+            return vec![0; words];
+        }
+        let mut set = vec![u64::MAX; words];
+        for pred in preds {
+            for (word, &from) in set.iter_mut().zip(&out[pred.index()]) {
+                *word &= from;
+            }
+        }
+        set
+    };
+    loop {
+        let mut changed = false;
+        for index in 0..graph.blocks.len() {
+            let block = BlockIx(index as u32);
+            let set = walk(block, in_set(block, &out), false)?;
+            if set != out[index] {
+                out[index] = set;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    for index in 0..graph.blocks.len() {
+        let block = BlockIx(index as u32);
+        walk(block, in_set(block, &out), true)?;
+    }
+    Ok(())
+}
+
+/// Tests: the folded lengths' rule alone ([`folded_lengths`]) on `graph`.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn verify_folded_lengths(graph: &Graph) -> Result<(), String> {
+    folded_lengths(graph)
+}
+
 /// Tests: the folded reads' rule alone ([`folded_reads`]) on `graph`.
 #[cfg(all(
     test,
@@ -775,6 +962,7 @@ fn heap_write(op: &NodeOp) -> HeapWrite {
         | NodeOp::CheckCodeValid
         | NodeOp::FoldedGlobal { .. }
         | NodeOp::FoldedCell
+        | NodeOp::FoldedLength { .. }
         | NodeOp::Jump { .. }
         | NodeOp::Branch { .. }
         | NodeOp::Return => HeapWrite::Nothing,
@@ -1219,6 +1407,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::CheckCodeValid => (&[], Rep::None),
         NodeOp::FoldedGlobal { .. } => (&[], Rep::Tagged),
         NodeOp::FoldedCell => (TAGGED, Rep::Cell),
+        NodeOp::FoldedLength(_) => (&[Rep::Ptr], Rep::I32),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),
         NodeOp::Return => (TAGGED, Rep::None),

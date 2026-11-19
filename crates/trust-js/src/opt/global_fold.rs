@@ -23,7 +23,9 @@
 //! loaded from the code's literal pool as V8's arm64 loads an embedded object
 //! (MacroAssembler::Mov, codegen/arm64/macro-assembler-arm64.cc:449), with the facts its
 //! identity fixes: an object, a typed array, its view's element kind (no CheckObject, no
-//! CheckElements); its length and data stay loads (TypedLength, TypedData).
+//! CheckElements); its data stays a test (TypedData), and its view's element count is the
+//! bounds limit of its element accesses where the view is fixed-length over a buffer that is
+//! not resizable (layer 4b, `FoldedLength`; `typed_view`), never the program's `length`.
 //! TRUST_JS_OPT_FOLD_GLOBALS=0 turns the fold off, for measurement.
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -162,7 +164,7 @@ pub(crate) fn prepare<'a>(
             };
             // A Number (layer 3), or a typed array of a kind the tier's element sites take
             // (layer 4a); nothing else folds.
-            let typed = typed_kind(&value);
+            let (typed, length) = typed_view(&value).unzip();
             let function = callable(&value);
             let number = matches!(value.view(), crate::value::ValueView::Num(_));
             if !number && typed.is_none() && !function {
@@ -175,6 +177,7 @@ pub(crate) fn prepare<'a>(
                 word: value.bits(),
                 generation: guard.generation,
                 typed,
+                length: length.flatten(),
                 function,
             });
             if !folds.deps.contains(&(*slot, guard.generation)) {
@@ -190,13 +193,30 @@ pub(crate) fn prepare<'a>(
 }
 
 /// The element kind of `value` where it is a typed array whose view the tier's element sites take
-/// (a kind of `TypedKind::ALL`; a declined view's kind byte is none of them): what a fold of it
-/// may assume for the object's life. Its being a typed array (the object's kind) and its view's
-/// kind are written once, at its construction (`native_typed_array.rs`); its length and its data
-/// are not facts of the object (a detach, a resize, a transfer change them while the property
-/// holds the same object), so the fold leaves them to the loads they are (layer 4a; 4b's
-/// detaching dependency is a separate piece).
-fn typed_kind(value: &crate::value::Value) -> Option<super::ir::TypedKind> {
+/// (a kind of `TypedKind::ALL`; a declined view's kind byte is none of them: BigInt or Float16
+/// elements, a SharedArrayBuffer's, a count past the native range, which have no record and
+/// fold nothing), and its bounds limit where that folds too: what a fold of it may assume for the
+/// object's life. Its being a typed array (the object's kind) and its view's record are written
+/// once, at its construction (`native_typed_array.rs`: `native_view` is the record's only
+/// writer); its data is no fact of the object (a detach, a resize, a transfer change it while
+/// the property holds the same object), so the fold leaves it to the test it is (TypedData).
+///
+/// The limit (layer 4b) is the record's element count, `NativeTypedArray::limit`, which nothing
+/// writes after construction: a detach or a shrink leaves it and takes the storage, which
+/// TypedData's attached and end tests meet. So it is a constant of the object's identity as
+/// the bounds limit of an element access, and it is NOT the typed array's length (ECMA-262
+/// TypedArrayLength, 0 once the buffer is detached or the view out of bounds): the verifier
+/// lets a `FoldedLength` serve a bounds test beside a TypedData of its view and nothing else
+/// (`verify::folded_lengths`). As V8 makes a constant typed array's length a constant with no
+/// dependency and keeps the detach check unless its protector holds (TurboFan,
+/// compiler/js-native-context-specialization.cc:4036-4055 and 4096-4101; Maglev's
+/// BuildLoadTypedArrayLength, maglev/maglev-graph-builder.cc:4909-4918), and as it folds none
+/// for a resizable or growable buffer's view (its RAB/GSAB kinds, :4039 and :4912): folded
+/// here for a fixed-length view (`TaInfo::track` clear) of a buffer that is not resizable, its
+/// count below the record's 2^31 clamp. JSC folds a view's length under a watchpoint of its
+/// buffer because its detach writes the view (runtime/JSArrayBufferView.cpp:260-268), which
+/// this engine's does not.
+fn typed_view(value: &crate::value::Value) -> Option<(super::ir::TypedKind, Option<i32>)> {
     let crate::value::ValueView::Obj(object) = value.view() else {
         return None;
     };
@@ -204,9 +224,30 @@ fn typed_kind(value: &crate::value::Value) -> Option<super::ir::TypedKind> {
     let crate::value::ObjectKind::TypedArray(view) = &object.kind else {
         return None;
     };
-    super::ir::TypedKind::ALL
+    let kind = super::ir::TypedKind::ALL
         .get(usize::from(view.kind))
-        .copied()
+        .copied()?;
+    let fixed = !view.info.track && !resizable(&view.info.buffer);
+    Some((kind, bounds_limit(view.limit, fixed)))
+}
+
+/// A view record's element count `limit` as a folded bounds limit: of a `fixed` view (see
+/// [`typed_view`]) whose count is below the record's clamp at 2^31 (an int32, which an index
+/// compares with).
+pub(crate) fn bounds_limit(limit: usize, fixed: bool) -> Option<i32> {
+    i32::try_from(limit).ok().filter(|_| fixed)
+}
+
+/// Whether `buffer` is a resizable ArrayBuffer ([[ArrayBufferMaxByteLength]] present: its
+/// `#abResizable` slot, written at the buffer's creation, `builtins/typedarray.rs`); a buffer
+/// whose object is borrowed is taken for one.
+fn resizable(buffer: &crate::value::Gc) -> bool {
+    buffer.try_borrow().map_or(true, |buffer| {
+        buffer
+            .internal_slots()
+            .get("#\u{0}abResizable")
+            .is_some_and(|slot| matches!(slot.value().view(), crate::value::ValueView::Bool(true)))
+    })
 }
 
 /// Whether `value` is a function: its identity fixes what a callee guard tests of it, its

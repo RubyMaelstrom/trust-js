@@ -2889,6 +2889,9 @@ struct Builder<'a> {
     /// Each folded object read's global environment (F4 part 2, functions): the Realm whose
     /// global object its CheckCellIs proved, which a callee guard's Realm test then needs not.
     folded_genv: FastMap<NodeIx, usize>,
+    /// Each folded typed array word's bounds limit, where its fold has one (F4 part 2, layer
+    /// 4b; `snapshot::Folded::length`): a fact of the folded identity, as its kind.
+    folded_lengths: FastMap<NodeIx, i32>,
     /// The hoisted nodes in the order made, which head the entry block once it is built.
     hoisted_nodes: Vec<NodeIx>,
     /// The closures the compiled frame created from a literal some by-literal way names, by
@@ -2946,6 +2949,7 @@ impl<'a> Builder<'a> {
             headers: (0..blocks).map(|_| None).collect(),
             hoisted: FastMap::default(),
             folded_genv: FastMap::default(),
+            folded_lengths: FastMap::default(),
             hoisted_nodes: Vec::new(),
             closures: FastMap::default(),
             moves_env: chunk.jit_ops().iter().any(names::moves_env),
@@ -6754,9 +6758,21 @@ impl<'a> Builder<'a> {
         let NodeOp::FoldedGlobal { word } = self.graph.node(inputs[0]).op else {
             return false;
         };
-        let proven = guard
+        let same = guard
             .callee
-            .is_some_and(|cell| word == crate::value::PACK_OBJ | cell as u64)
+            .is_some_and(|cell| word == crate::value::PACK_OBJ | cell as u64);
+        // The identity compared: no program met yet gives a compile a plan that names another
+        // function than the value its site's folded global holds (the first stage plans again
+        // at its guard's failure before the tier compiles), so no test reaches the comparison
+        // failing. A debug build that does reach it stops here and names the program the
+        // comparison's test is to be written from; a release build keeps the guard, as it must.
+        debug_assert!(
+            same || guard.callee.is_none(),
+            "an inline plan (target {target}) names another callee than its site's folded \
+             global {word:#x}: the program that reaches this is the missing test of the \
+             identity comparison below"
+        );
+        let proven = same
             && guard.expected_env == 0
             && (!guard.check_this || this_object)
             && self.folded_genv.get(&inputs[0]) == Some(&guard.expected_genv);
@@ -7419,7 +7435,11 @@ impl Builder<'_> {
     }
 
     /// The view of the typed array `word` names (its cell `cell`) and the view's length, value
-    /// facts.
+    /// facts. The length is the bounds limit of the element access the caller builds, which a
+    /// TypedData of the view accompanies in its effect epoch: for a folded typed array whose
+    /// fold has it and whose comparison takes it as its immediate, the constant (`FoldedLength`,
+    /// F4 part 2 layer 4b; the verifier holds its consumers to that, `verify::folded_lengths`). The program's `length` of a typed array
+    /// (0 once its buffer is detached) is never this node.
     fn typed_view(
         &mut self,
         st: &mut State,
@@ -7438,7 +7458,15 @@ impl Builder<'_> {
         let length = match st.typed_lengths.get(&view) {
             Some(&length) => length,
             None => {
-                let length = self.add(NodeOp::TypedLength, &[view], Rep::I32, pc);
+                // The constant where the comparison takes it as its immediate; any other limit
+                // stays the load, made once and kept (`ir::limit_immediate`).
+                let op = match self.folded_lengths.get(&word) {
+                    Some(&limit) if super::ir::limit_immediate(limit) => {
+                        NodeOp::FoldedLength(limit)
+                    }
+                    _ => NodeOp::TypedLength,
+                };
+                let length = self.add(op, &[view], Rep::I32, pc);
                 st.typed_lengths.insert(view, length);
                 length
             }

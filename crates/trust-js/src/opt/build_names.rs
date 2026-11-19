@@ -824,11 +824,15 @@ impl Builder<'_> {
         if let Some(kind) = fold.typed {
             // A typed array (layer 4a): what its identity fixes for the object's life, value
             // facts as CheckObject's and CheckElements' are: an object (its cell, untagged with
-            // no test), a typed array of its view's kind. Not its length or data: a detach or a
-            // resize changes them under the same object, so TypedLength and TypedData stay.
+            // no test), a typed array of its view's kind. Not its data: a detach or a resize
+            // takes it under the same object, so TypedData stays. Its accesses' bounds limit
+            // where the fold has it (layer 4b), which `typed_view` reads.
             let cell = self.add(NodeOp::FoldedCell, &[word], Rep::Cell, pc);
             self.relate(st, word, cell);
             st.kinds.insert(word, ElemKind::Typed(Some(kind)));
+            if let Some(limit) = fold.length {
+                self.folded_lengths.insert(word, limit);
+            }
         }
         word
     }

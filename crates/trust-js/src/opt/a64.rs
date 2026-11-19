@@ -1829,7 +1829,7 @@ impl Gen<'_> {
         match self.graph.node(v).op {
             NodeOp::ConstTagged(bits) | NodeOp::FoldedGlobal { word: bits } => bits,
             NodeOp::ConstF64(bits) => Value::Num(f64::from_bits(bits)).bits(),
-            NodeOp::ConstI32(x) => Value::Num(f64::from(x)).bits(),
+            NodeOp::ConstI32(x) | NodeOp::FoldedLength(x) => Value::Num(f64::from(x)).bits(),
             NodeOp::ConstBool(b) => Value::Bool(b).bits(),
             // No frame state holds an environment (verify.rs): its address as it is.
             NodeOp::ConstEnv(address) => address,
@@ -1844,7 +1844,7 @@ impl Gen<'_> {
             | NodeOp::ConstF64(bits)
             | NodeOp::ConstEnv(bits)
             | NodeOp::FoldedGlobal { word: bits } => bits,
-            NodeOp::ConstI32(x) => u64::from(x as u32),
+            NodeOp::ConstI32(x) | NodeOp::FoldedLength(x) => u64::from(x as u32),
             NodeOp::ConstBool(b) => u64::from(b),
             _ => unreachable!("a constant node"),
         }
@@ -1971,7 +1971,8 @@ impl Gen<'_> {
     /// its use, as before.
     fn const_i32(&self, v: NodeIx) -> Option<i32> {
         match self.graph.node(v).op {
-            NodeOp::ConstI32(x) => Some(x),
+            // A folded typed array's bounds limit is a constant too (F4 part 2, layer 4b).
+            NodeOp::ConstI32(x) | NodeOp::FoldedLength(x) => Some(x),
             _ => None,
         }
     }
@@ -2484,6 +2485,11 @@ impl Gen<'_> {
             | NodeOp::ConstBool(_)
             | NodeOp::ConstEnv(_)
             | NodeOp::Phi => {}
+            // An immediate of each comparison that takes it (`ir::limit_immediate`).
+            &NodeOp::FoldedLength(limit) => debug_assert!(
+                limit >= 0 && asm::add_sub_imm(limit as u32),
+                "a folded limit {limit} that CMP's immediate does not hold"
+            ),
             &NodeOp::FrameIndex { interp, table } => {
                 if !unused {
                     self.lower_frame_index(n, interp, table)?;
@@ -5709,11 +5715,22 @@ impl Gen<'_> {
         let node = self.graph.node(n);
         let data = self.gp(node.inputs[1], X16);
         let index = self.gp(node.inputs[2], X17);
-        let length = self.gp(node.inputs[3], X30);
+        // A constant length (a folded typed array's bounds limit, F4 part 2 layer 4b) by CMP's
+        // immediate where it encodes, as CheckBounds takes one (`cmp_i32`).
+        let limit = self
+            .const_i32(node.inputs[3])
+            .and_then(|limit| Self::add_sub_imm(limit, true))
+            .filter(|&(subtract, _)| subtract);
+        match limit {
+            Some((_, imm)) => self.a.cmp_imm_w(index, imm),
+            None => {
+                let length = self.gp(node.inputs[3], X30);
+                self.a.cmp_reg_w(index, length);
+            }
+        }
         let dst = self.gp_dst(n);
         let past = self.a.new_label();
         let done = self.a.new_label();
-        self.a.cmp_reg_w(index, length);
         self.a.b_cond(HS, past);
         self.a.mov_w(X30, index);
         match kind {

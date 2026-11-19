@@ -891,6 +891,18 @@ pub(crate) enum NodeOp {
     /// object's life): no test, the word's payload (CheckObject's untag without its exit). Pure;
     /// the cell is the folded value's, so it lives as long as that value's home does (R-2).
     FoldedCell,
+    /// Ptr view -> I32: the bounds limit of a folded typed array's element accesses (F4 part 2,
+    /// layer 4b), its input the TypedView of a folded typed array's `FoldedCell`: the element
+    /// count of the view's record, which nothing writes after the view's construction, so a
+    /// constant of the folded identity with no dependency of its own (V8's constant typed
+    /// array's length, compiler/js-native-context-specialization.cc:4050). An immediate at its
+    /// use, with no code of its own. It is not the typed array's length (0 once its buffer is
+    /// detached or shrunk under it): it may only be the limit of a CheckBounds or the length of
+    /// a LoadTypedOrUndefined beside a TypedData of its view in the same effect epoch, whose
+    /// attached and end tests keep the access off storage that is gone
+    /// (`verify::folded_lengths`). Made only for a limit the comparison holds as its immediate
+    /// ([`limit_immediate`]).
+    FoldedLength(i32),
     /// (Env): the global environment's record has the compile's generation [WrongName]: no
     /// binding was added, removed or moved since, so the cache's binding address is a global
     /// lexical's still (the plan's Q4: the record does not only append).
@@ -1388,14 +1400,8 @@ impl Graph {
     /// values, then its frame's chain's (as `chain_values` lists them, without a vector). The
     /// register allocator keeps each homed at the exiting node (`regalloc`'s reads), and a call on
     /// the node's own path keeps each where its exit after the call finds it (`a64`'s
-    /// `save_live_clobbered`).
-    #[cfg_attr(
-        not(all(
-            target_arch = "aarch64",
-            any(target_os = "macos", target_os = "linux", target_os = "windows")
-        )),
-        expect(dead_code, reason = "the back end's")
-    )]
+    /// `save_live_clobbered`); the verifier reads them for the values no state may name
+    /// (`verify::folded_lengths`).
     pub(crate) fn for_each_exit_value(&self, state: StateIx, mut f: impl FnMut(NodeIx)) {
         let mut state = self.state(state);
         loop {
@@ -1512,13 +1518,25 @@ impl Graph {
 /// keeps a home for its whole range, where the collector finds it (R-2). Read by the builder
 /// (`Builder::constant`) on every architecture and by the register allocator, so it is here and
 /// not in `regalloc`, which only the ARM64 back end compiles.
+/// Whether a folded typed array's bounds limit is taken as a constant (`NodeOp::FoldedLength`):
+/// where ARM64's CMP holds it as its immediate, 12 bits or 12 bits shifted left by 12 (the
+/// assembler's `add_sub_imm`, which the back end asserts of each). Any other limit would be made
+/// in a scratch register at each use, two instructions where the load it replaces is one, made
+/// once a view and kept in a register through a loop: such a limit stays that load
+/// (`TypedLength`).
+pub(crate) fn limit_immediate(limit: i32) -> bool {
+    let value = limit as u32;
+    limit >= 0 && (value < 1 << 12 || (value < 1 << 24 && value & 0xfff == 0))
+}
+
 pub(crate) fn rematerializable(op: &NodeOp) -> bool {
     match *op {
         NodeOp::ConstTagged(_)
         | NodeOp::ConstF64(_)
         | NodeOp::ConstI32(_)
         | NodeOp::ConstBool(_)
-        | NodeOp::ConstEnv(_) => true,
+        | NodeOp::ConstEnv(_)
+        | NodeOp::FoldedLength(_) => true,
         NodeOp::FoldedGlobal { word } => ((word >> 48) as u16 & 0x7fff) < 0x7ff9,
         _ => false,
     }

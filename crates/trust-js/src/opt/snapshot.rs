@@ -251,13 +251,17 @@ pub(crate) enum NameView {
 /// generation the property was made Constant under (`ObjectFuse::try_optimize_constant`), which
 /// the install checks again (`driver::dropped`). For a typed array (layer 4a) its element kind:
 /// a typed array's being one and its view's kind are fixed for the object's life
-/// (`NativeTypedArray`, written once at construction), its length and data are not (a detach, a
-/// resize), so they stay loads.
+/// (`NativeTypedArray`, written once at construction); its data is not (a detach, a resize), so
+/// it stays a load, tested each effect epoch (TypedData). `length` (layer 4b): the element count
+/// of its view's record where the view is fixed-length over a buffer that is neither resizable
+/// nor shared, the bounds limit of its element accesses and nothing else (`ir::FoldedLength`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Folded {
     pub(crate) word: u64,
     pub(crate) generation: u32,
     pub(crate) typed: Option<super::ir::TypedKind>,
+    /// The typed array's bounds limit (see the type's doc), below 2^31.
+    pub(crate) length: Option<i32>,
     /// A function (F4 part 2, functions): its identity fixes its [[Environment]], its Realm and
     /// its code for its life, what a callee guard tests of it; not its own properties
     /// (`prototype` among them), which stay reads.
