@@ -1165,6 +1165,20 @@ pub(crate) struct Graph {
     /// L5): (frame, pc) -> (reasons, data byte), from the frame's snapshot as the builder read it,
     /// so that an exit record knows whether its own reason was already flagged there.
     pub(crate) held: crate::fasthash::FastMap<(FrameIx, u32), (u32, u8)>,
+    /// The loop headers that kept their entry's heap facts, each with what it kept (P3 stage 3
+    /// step 0c, F4 part 1): the verifier's statement of the union rule (`verify::kept_heap`).
+    pub(crate) kept: Vec<KeptHeap>,
+}
+
+/// A loop header that kept its entry's heap facts (`Builder::loop_heap_facts`): the global
+/// object's field locations whose values it kept and the binding slots whose values it kept, any
+/// record's. Its typed arrays' data addresses, the global property epoch, a generation and a
+/// script-level lexical's value it may keep too: only an effect ends those.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct KeptHeap {
+    pub(crate) header: BlockIx,
+    pub(crate) fields: Vec<u16>,
+    pub(crate) slots: Vec<u16>,
 }
 
 impl Graph {

@@ -174,6 +174,9 @@ pub(super) struct Analysis {
     /// the callee may then run JavaScript and end the caller's heap facts, so that its call is no
     /// lowered operation for the caller's loop prepass (`Tree::effect_free`).
     generic: bool,
+    /// What its operations may write in place, every block's (`Rules::chunk_writes`): its share of
+    /// the union a caller's loop takes (`Tree::writes`).
+    writes: Writes,
 }
 
 /// The callees a compile inlines (see the module's doc).
@@ -254,36 +257,38 @@ impl<'a> Tree<'a> {
         last.is_some_and(|place| !flagged(snapshot, pc, place) && !past_plan(snapshot, pc, &kept))
     }
 
-    /// The binding slots the callees of site `cache`'s ways store at static addresses (their
-    /// free-name stores, `Rules::name_store_slot` over each analysed callee chunk), for its
-    /// caller's loop prepass (P3 stage 3 step 0c: `Rules::inlined_stores`).
-    pub(super) fn stored_slots(&self, cache: u32) -> Vec<u16> {
-        let mut slots = Vec::new();
-        let Some(site) = self.sites.get(&cache) else {
-            return slots;
-        };
-        for way in &site.ways {
+    /// What every frame the build may inline at site `cache`'s call may write in place, for its
+    /// caller's loop prepass (`Rules::writes_at`, the union rule): each analysed way's callee chunk
+    /// (a declined way is no frame: the site's guard exits for its callee), and in it, at every
+    /// depth, the frames the build may open: its nested sites' ways (step 3d) and its by-literal
+    /// ways (piece B), which `Builder::call` takes from this tree alone, so that no frame the build
+    /// makes is missing here. Each callee chunk's every operation counts, a block that never ran
+    /// too (its build is an exit there). A construct's inlined initializer, when one is built,
+    /// joins here the same way; the verifier checks every built loop against the rule
+    /// (`verify::kept_heap`).
+    pub(super) fn writes(&self, cache: u32) -> Writes {
+        let mut writes = Writes::default();
+        if let Some(site) = self.sites.get(&cache) {
+            self.ways_writes(&site.ways, &mut writes);
+        }
+        writes
+    }
+
+    fn ways_writes(&self, ways: &[InlineWay], writes: &mut Writes) {
+        for way in ways {
             let Ok(analysis) = &self.analyses[way.chunk as usize] else {
                 continue;
             };
-            let (view, snapshot) = self.callees[way.chunk as usize];
-            let rules = Rules {
-                chunk: view,
-                ops: view.jit_ops(),
-                snapshot,
-                cfg: &analysis.cfg,
-                initialized: &analysis.initialized,
-                inlining: None,
-            };
-            for pc in 0..view.jit_ops().len() {
-                if let Some(slot) = rules.name_store_slot(pc) {
-                    if !slots.contains(&slot) {
-                        slots.push(slot);
-                    }
+            writes.extend(&analysis.writes);
+            for site in &way.nested {
+                self.ways_writes(&site.ways, writes);
+            }
+            for literal in &way.literals {
+                if let Ok(analysis) = &self.analyses[literal.chunk as usize] {
+                    writes.extend(&analysis.writes);
                 }
             }
         }
-        slots
     }
 
     /// The Cfgs of the chunks the graph's inlined frames may run, by `InlinedFrame::chunk`, each
@@ -387,6 +392,7 @@ fn analyse(
         return Err((PAST_RECORD, None));
     }
     let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
+    let writes = rules.chunk_writes();
     Ok(Analysis {
         cfg,
         initialized,
@@ -394,6 +400,7 @@ fn analyse(
         liveness,
         frame_chunk,
         generic,
+        writes,
     })
 }
 

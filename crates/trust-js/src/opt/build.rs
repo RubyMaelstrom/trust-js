@@ -69,8 +69,8 @@
 //!   where a block first needs them.
 
 use super::ir::{
-    BlockData, BlockIx, Cond, Decline, ExitReason, FrameIx, FrameState, Graph, NodeIx, NodeOp,
-    Refusal, Rep, SlotSource, StateIx,
+    BlockData, BlockIx, Cond, Decline, ExitReason, FrameIx, FrameState, Graph, KeptHeap, NodeIx,
+    NodeOp, Refusal, Rep, SlotSource, StateIx,
 };
 use super::ir::{ElemKind, Holes, Narrowed, Store, TypedKind};
 use super::liveness::{frame_slots, slot_use, SlotLiveness, SlotUse};
@@ -171,6 +171,22 @@ pub(crate) fn build(chunk: &crate::bytecode::Chunk, snapshot: &Snapshot) -> Resu
 #[cfg(test)]
 pub(crate) fn build_view(chunk: &FrozenChunk, snapshot: &Snapshot) -> Result<Built, Refusal> {
     build_inlined(chunk, snapshot, None)
+}
+
+/// Tests: what every frame the build may inline at site `cache` of `chunk` may write, `sites` and
+/// `callees` the compile's (`inline::Tree::writes`, the union rule).
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn site_writes(
+    chunk: &FrozenChunk,
+    sites: &[InlineSite],
+    callees: &[Callee<'_>],
+    cache: u32,
+) -> Writes {
+    inline::Tree::new(chunk, sites, callees).writes(cache)
 }
 
 /// [`build_view`] with the callees the oracle inlines at `inlining`'s sites built into the graph,
@@ -793,13 +809,19 @@ impl Rules<'_> {
                 Op::ResetSlots(start, count) => start as usize..start as usize + count as usize,
                 _ => 0..0,
             };
-            let mut names: Vec<u16> = self.name_store_slot(pc).into_iter().collect();
-            names.extend(self.inlined_stores(pc));
+            // What the operation writes in place, an inlined call's frames' writes among them (the
+            // union rule, `Writes`).
+            let writes = self.writes_at(pc);
             stored.retain(|source| match *source {
                 Source::Slot(slot) => !written.contains(&slot),
-                Source::Name(address, _) => !names.contains(&address.slot),
-                // A global's store is an effect, which cleared them all above (F4 part 1).
-                Source::Global(_) | Source::Lexical(_) => true,
+                Source::Name(address, _) => !writes.slots.contains(&address.slot),
+                // A global-object property's: a lowered store at its location, of whatever object
+                // (the global object through an alias, `this` at the top level), in this frame or
+                // a frame inlined at a call here (F4 part 1).
+                Source::Global(location) => !writes.fields.contains(&location),
+                // No lowered operation writes a script-level lexical: a store to one is an effect
+                // (`name_lowers`), which cleared them all above.
+                Source::Lexical(_) => true,
             });
             match self.typed_source(pc) {
                 Some((source, Some(_), true)) if !stored.contains(&source) => stored.push(source),
@@ -810,20 +832,41 @@ impl Rules<'_> {
         reads
     }
 
-    /// The binding slots the callees the graph inlines at the call at `pc` store at static
-    /// addresses, any record's (P3 stage 3 step 0c, `Loop::stored`): an inlined call runs no
-    /// effect (step 2's E0), but its callees' stores end every record's fact of their slots in
-    /// the builder's state, as their nodes write them, so a loop holding the call keeps no value
-    /// of those slots through its header (Maglev's inner builder adds its callee's effects to its
-    /// caller's loop's, maglev-graph-builder.cc:732-735, 14602-14611). Empty for any other
-    /// operation.
-    fn inlined_stores(&self, pc: usize) -> Vec<u16> {
-        match (self.ops[pc], self.inlining) {
-            (Op::Call(_, cache) | Op::CallWithThis(_, cache), Some(tree)) => {
-                tree.stored_slots(cache)
-            }
-            _ => Vec::new(),
+    /// What the operation at `pc` may write in place that a loop's kept heap facts rest on (see
+    /// [`Writes`]): its free-name store's binding slot, its named store's, update's, append's or
+    /// creation's field locations, and at a call whose ways the graph inlines, what every frame
+    /// the build may inline there writes, at every depth (`inline::Tree::writes`): an inlined call
+    /// runs no effect (step 2's E0), but its frames' lowered stores run in the caller's loop as
+    /// its own do, so a loop holding the call keeps no fact they end (the union rule; P3 stage 3
+    /// step 0c for binding slots, F4 part 1's miscompile for fields). Maglev's inlined builder
+    /// records its writes in its caller's loop's effects (maglev-graph-builder.cc:732-735, 14596-
+    /// 14611); the DFG and Ion inline before their loop analyses, which then read the inlined
+    /// nodes as any (dfg/DFGPlan.cpp:202, 424 with DFGLICMPhase.cpp:96-103; jit/Ion.cpp:1204,
+    /// 1290). This prepass runs before the build, on bytecode, so it reads each frame's summary.
+    fn writes_at(&self, pc: usize) -> Writes {
+        let mut writes = Writes::default();
+        if let Some(slot) = self.name_store_slot(pc) {
+            writes.slot(slot);
         }
+        for location in self.stored_field(pc) {
+            writes.field(location);
+        }
+        if let (Op::Call(_, cache) | Op::CallWithThis(_, cache), Some(tree)) =
+            (self.ops[pc], self.inlining)
+        {
+            writes.extend(&tree.writes(cache));
+        }
+        writes
+    }
+
+    /// What every operation of the chunk may write in place (`writes_at` of each pc, every block,
+    /// a block that never ran too): an inlined callee chunk's summary (`inline::Analysis`).
+    fn chunk_writes(&self) -> Writes {
+        let mut writes = Writes::default();
+        for pc in 0..self.ops.len() {
+            writes.extend(&self.writes_at(pc));
+        }
+        writes
     }
 
     /// The source of the word the operation of `pc`'s block that pushed the operand `below`
@@ -1413,7 +1456,8 @@ struct Loop {
     /// but its own stores (`stored`): opt/build.rs `loop_heap_facts`.
     keeps_heap: bool,
     /// The binding slots the loop's free-name stores write, any record's (a store ends every
-    /// record's fact of its slot, `names` store_binding), for a loop that keeps heap facts.
+    /// record's fact of its slot, `names` store_binding), its own and every frame's the build may
+    /// inline into it (`Writes`), for a loop that keeps heap facts.
     stored: Vec<u16>,
     /// The typed arrays the loop's element sites reach, by their receivers' sources, for a loop
     /// that keeps heap facts (P3 stage 3 step 0c), whose checks its entry makes once
@@ -1427,8 +1471,8 @@ struct Loop {
     /// where `stored_fields` names them: no other global's, so that the loop's states hold only
     /// the facts its reads take (the builder's joins and prunes walk every fact a state holds).
     read_fields: Vec<u16>,
-    /// The field locations the loop's lowered named stores may write (any object's), for a loop
-    /// with `read_fields`.
+    /// The field locations the loop's lowered named stores may write (any object's), its own and
+    /// every frame's the build may inline into it (`Writes`), for a loop with `read_fields`.
     stored_fields: Vec<u16>,
     /// Whether an operation of the loop may be a canonical-frame effect ([`canonical`]), after
     /// which every slot is in the frame (P3 stage 3 step 3a: a generic node leaves the slots it
@@ -1447,6 +1491,47 @@ enum Source {
     /// lexical's (its binding's address): the loop's entry loads it (F4 part 1).
     Global(u16),
     Lexical(usize),
+}
+
+/// What lowered operations may write that a loop's kept heap facts rest on (the union rule: what
+/// a loop that keeps heap facts may write is the union over its own operations and every frame
+/// the build may inline into it, at every depth; `Rules::writes_at`): the binding slots of free-name
+/// stores at static addresses, any record's (a store ends every record's fact of its slot,
+/// `names` store_binding), and the field locations of named stores, updates, appends and
+/// creations, any object's (the builder keys a store by its location, `Builder::named_store`, so
+/// that the global object through an alias, `this` or another object at the same location are all
+/// one). Nothing else such a loop runs writes what a kept fact rests on: an element or typed store
+/// changes no typed array's data address, no lowered operation stores a script-level lexical or a
+/// global by name (`name_lowers`), and only an effect moves the global property epoch, a
+/// generation or a buffer's attachment. The verifier checks the built loops against it
+/// (`Graph::kept`, `verify::kept_heap`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Writes {
+    pub(crate) slots: Vec<u16>,
+    pub(crate) fields: Vec<u16>,
+}
+
+impl Writes {
+    fn slot(&mut self, slot: u16) {
+        if !self.slots.contains(&slot) {
+            self.slots.push(slot);
+        }
+    }
+
+    fn field(&mut self, location: u16) {
+        if !self.fields.contains(&location) {
+            self.fields.push(location);
+        }
+    }
+
+    fn extend(&mut self, other: &Writes) {
+        for &slot in &other.slots {
+            self.slot(slot);
+        }
+        for &location in &other.fields {
+            self.field(location);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1653,19 +1738,14 @@ impl Flow {
             // effect and no generic node (P3 stage 3 step 0c's rule; step 3a's generic nodes may
             // run anything, so they count as effects here), and no `%`.
             found.keeps_heap = !found.effects && !modulo;
+            // What the loop may write: the union over its operations and every frame the build may
+            // inline at its calls (`Rules::writes_at`).
+            let mut writes = Writes::default();
             if found.keeps_heap {
                 for &index in &body {
                     let block = &blocks[ix(rpo[index])];
                     for pc in block.start..block.end {
-                        for slot in rules
-                            .name_store_slot(pc)
-                            .into_iter()
-                            .chain(rules.inlined_stores(pc))
-                        {
-                            if !found.stored.contains(&slot) {
-                                found.stored.push(slot);
-                            }
-                        }
+                        writes.extend(&rules.writes_at(pc));
                         if let Some(source) = rules.global_source(pc) {
                             if !found.globals.contains(&(pc as u32)) {
                                 found.globals.push(pc as u32);
@@ -1696,17 +1776,9 @@ impl Flow {
                     }
                 }
             }
+            found.stored = writes.slots;
             if !found.read_fields.is_empty() {
-                for &index in &body {
-                    let block = &blocks[ix(rpo[index])];
-                    for pc in block.start..block.end {
-                        for location in rules.stored_field(pc) {
-                            if !found.stored_fields.contains(&location) {
-                                found.stored_fields.push(location);
-                            }
-                        }
-                    }
-                }
+                found.stored_fields = writes.fields;
             }
             heads[ix(rpo[header])] = Some(loops.len());
             loops.push(found);
@@ -1777,6 +1849,9 @@ fn in_reverse_postorder(mut graph: Graph, notes: &mut PhiNotes) -> Graph {
         }
     }
     graph.entry = Some(renumber(entry));
+    for kept in &mut graph.kept {
+        kept.header = renumber(kept.header);
+    }
     // The notes' blocks too (an invariant's entry predecessor, P3 stage 3 step 3a).
     for (_, pred) in &mut notes.invariants {
         *pred = renumber(*pred);
@@ -3552,6 +3627,19 @@ impl<'a> Builder<'a> {
         }
         let met = meet(&preds);
         let (typed_data, names, fields) = self.loop_heap_facts(lp, &met);
+        if lp.keeps_heap {
+            // What the header kept, for the verifier's check of the loop it heads once a back edge
+            // makes it one (`verify::kept_heap`): no node of the loop, in any frame, is an effect or
+            // writes a kept field's location or a kept binding's slot.
+            let mut fields: Vec<u16> = fields.keys().map(|&(_, location)| location).collect();
+            fields.sort_unstable();
+            fields.dedup();
+            self.graph.kept.push(KeptHeap {
+                header: block,
+                fields,
+                slots: names.value_slots(),
+            });
+        }
         let st = State {
             slots,
             stack,
@@ -3607,9 +3695,12 @@ impl<'a> Builder<'a> {
         } else {
             FastMap::default()
         };
-        // The global object's properties its entry loaded for the loop's reads (F4 part 1):
-        // nothing such a loop runs stores a global (a store to one is an effect, as every call
-        // is), but a lowered store to a field at the same location of whatever object.
+        // The global object's properties its entry loaded for the loop's reads (F4 part 1), but
+        // where a lowered store may write their locations: a named store, update, append or
+        // creation at the same location, of whatever object (the global object through an alias,
+        // `this`), the loop's own or one a frame inlined into the loop makes (`stored_fields`,
+        // the union rule). Nothing else such a loop runs writes a global: a store by name to one is
+        // an effect (`name_lowers`), as is every call the graph does not inline.
         let fields = match (lp.keeps_heap, self.hoisted.get(&Hoisted::GlobalObject)) {
             (true, Some(&global)) if !lp.read_fields.is_empty() => met
                 .fields

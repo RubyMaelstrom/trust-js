@@ -1432,6 +1432,11 @@ fn a_sites_later_guard_leaves_its_own_byte_and_the_reoptimization_branches_there
 #[path = "typed_loop_inline_tests.rs"]
 mod typed_loop;
 
+/// The union rule under TRUST_JS_OPT_INLINE=graph (F4 part 1's miscompile): a loop that keeps heap
+/// facts keeps none an inlined frame's store ends.
+#[path = "union_tests.rs"]
+mod union;
+
 /// P3 stage 3 step L2 under TRUST_JS_OPT_INLINE=graph: callees whose loads go through the chain.
 #[path = "chain_inline_tests.rs"]
 mod chain;

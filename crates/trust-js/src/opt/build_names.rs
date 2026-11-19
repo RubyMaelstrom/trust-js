@@ -129,6 +129,15 @@ impl Facts {
             .copied()
     }
 
+    /// The binding slots whose values these facts hold, any record's (a loop header's kept
+    /// facts, which the verifier checks no store of the loop writes: `verify::kept_heap`).
+    pub(super) fn value_slots(&self) -> Vec<u16> {
+        let mut slots: Vec<u16> = self.values.keys().map(|&(_, slot)| slot).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        slots
+    }
+
     /// The value a global lexical's binding holds in this epoch, where a read loaded it.
     pub(super) fn lexical(&self, binding: u64) -> Option<NodeIx> {
         self.lexicals.get(&binding).copied()

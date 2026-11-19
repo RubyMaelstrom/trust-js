@@ -41,7 +41,10 @@
 //!   no poll whose state names the header's handlers, so the rule compares none there: the
 //!   state is the edge's, as the header's is (the builder refuses a block whose edges' handlers
 //!   differ), and its records are checked as every state's. The phi selector's speculations and
-//!   hoisted checks take only headers with a back edge (`phis.rs`).
+//!   hoisted checks take only headers with a back edge (`phis.rs`);
+//! - a loop whose header kept its entry's heap facts runs, in any of its frames, no effect, and no
+//!   store of it writes a field location or binding slot whose value the header kept (the union
+//!   rule, [`kept_heap`]).
 //!
 //! Inlined frames (P3 stage 3, step 1; `frames`, which the back end checks too):
 //! - each frame's states and nodes are checked against that frame's chunk and Cfg: a node's pc
@@ -252,6 +255,7 @@ pub(crate) fn verify_frames(
         }
     }
     proven_objects(graph, &dom)?;
+    kept_heap(graph, &dom)?;
     // The builder's liveness again, where its cost is a test's or a debug build's: each frame's
     // chunk's.
     let liveness: Vec<Option<SlotLiveness>> = chunks
@@ -450,6 +454,206 @@ fn edges(graph: &Graph, n_ops: impl Fn(FrameIx) -> Option<usize>) -> Result<(), 
         ));
     }
     Ok(())
+}
+
+/// The union rule (P3 stage 3 step 0c; F4 part 1, whose first form missed it: `build::Writes`):
+/// a loop whose header kept its entry's heap facts (`Graph::kept`) runs, in any of its frames, no
+/// effect and no generic node, and none of its stores writes a field location or a binding slot
+/// whose value the header kept. Its loop is the natural loop of the header's back edges in the
+/// graph, with the blocks of every frame inlined into it: the graph's statement of what the loop
+/// prepass, which runs on bytecode before the build, summed over the frames from their chunks.
+/// Maglev checks its loop's end state against an optimistic header's (TryMergeLoop and
+/// IsCompatibleWithLoopHeader, maglev-interpreter-frame-state.cc:423-440,
+/// maglev-known-node-aspects.cc:742-838), peeling where they disagree; here a disagreement is a
+/// fault of the prepass.
+fn kept_heap(graph: &Graph, dom: &Dominators) -> Result<(), String> {
+    for kept in &graph.kept {
+        let header = kept.header;
+        if header.index() >= graph.blocks.len() {
+            return Err(format!("a kept header {header:?} that is no block"));
+        }
+        let latches: Vec<BlockIx> = graph
+            .block(header)
+            .preds
+            .iter()
+            .copied()
+            .filter(|&pred| dom.dominates(header, pred))
+            .collect();
+        // No back edge (the build reached none): no loop.
+        let mut member = vec![false; graph.blocks.len()];
+        member[header.index()] = !latches.is_empty();
+        let mut work = latches;
+        while let Some(block) = work.pop() {
+            if !std::mem::replace(&mut member[block.index()], true) {
+                work.extend(graph.block(block).preds.iter().copied());
+            }
+        }
+        for (index, block) in graph.blocks.iter().enumerate() {
+            if !member[index] {
+                continue;
+            }
+            for &node in block.phis.iter().chain(&block.body) {
+                let data = graph.node(node);
+                let what = match heap_write(&data.op) {
+                    HeapWrite::Any => "an effect",
+                    HeapWrite::Field(location) if kept.fields.contains(&location) => {
+                        "a store at the location of a field it kept"
+                    }
+                    HeapWrite::Binding(slot) if kept.slots.contains(&slot) => {
+                        "a store at the slot of a binding it kept"
+                    }
+                    _ => continue,
+                };
+                return Err(format!(
+                    "node {} ({:?} at pc {}, frame {:?}, block {index}): {what}, in the loop of \
+                     header {header:?}, which kept its entry's heap facts",
+                    node.index(),
+                    data.op,
+                    data.pc,
+                    data.frame
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Tests: the union rule alone ([`kept_heap`]) on `graph`, whatever else it breaks.
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+pub(crate) fn verify_kept_heap(graph: &Graph) -> Result<(), String> {
+    let entry = graph.entry.ok_or("the graph has no entry block")?;
+    kept_heap(graph, &Dominators::new(graph, entry)?)
+}
+
+/// What a node may write that a loop header's kept heap facts rest on ([`kept_heap`]).
+enum HeapWrite {
+    Nothing,
+    /// A field at this location, of whatever object.
+    Field(u16),
+    /// A binding at this slot, of whatever record.
+    Binding(u16),
+    /// Anything: it may run JavaScript.
+    Any,
+}
+
+/// Each operation's [`HeapWrite`], with no arm for "the rest", so that an operation added to the
+/// graph is placed here where it is added (a store a later piece lowers, a construct's).
+fn heap_write(op: &NodeOp) -> HeapWrite {
+    match *op {
+        NodeOp::StoreField { location, .. } | NodeOp::StoreNew { location, .. } => {
+            HeapWrite::Field(location)
+        }
+        NodeOp::StoreBinding { slot } => HeapWrite::Binding(slot),
+        NodeOp::Effect { .. } | NodeOp::Generic { .. } => HeapWrite::Any,
+        // Element and typed stores write element words, which no kept fact is (a typed array's
+        // data address and length stay); StoreSlot writes the frame, the frame-callee table's
+        // nodes its entries; F64Mod calls fmod, which writes nothing; a poll's slow path runs no
+        // JavaScript, and the collector moves nothing; an exit leaves the code.
+        NodeOp::StoreElement { .. }
+        | NodeOp::StoreTyped { .. }
+        | NodeOp::TypedElement { .. }
+        | NodeOp::StoreSlot { .. }
+        | NodeOp::StoreFrameCallee { .. }
+        | NodeOp::ClearFrameCallee { .. }
+        | NodeOp::F64Mod
+        | NodeOp::Poll
+        | NodeOp::Exit { .. }
+        // Constants, reads, checks, arithmetic and control flow write nothing.
+        | NodeOp::ConstTagged { .. }
+        | NodeOp::ConstF64 { .. }
+        | NodeOp::ConstI32 { .. }
+        | NodeOp::ConstBool { .. }
+        | NodeOp::EntrySlot { .. }
+        | NodeOp::FrameSlot { .. }
+        | NodeOp::This
+        | NodeOp::Phi
+        | NodeOp::Projection { .. }
+        | NodeOp::SlotResult { .. }
+        | NodeOp::CheckNumber
+        | NodeOp::CheckInt32
+        | NodeOp::TruncateNumberOrOddball
+        | NodeOp::CheckObject
+        | NodeOp::CheckShape { .. }
+        | NodeOp::CheckProto { .. }
+        | NodeOp::CheckStringProto { .. }
+        | NodeOp::CheckCreatable { .. }
+        | NodeOp::CheckNoProto { .. }
+        | NodeOp::CheckBoolean
+        | NodeOp::ShapeIs { .. }
+        | NodeOp::CheckCallee { .. }
+        | NodeOp::CalleeMatches { .. }
+        | NodeOp::I32ToF64
+        | NodeOp::TruncateToInt32
+        | NodeOp::F64ToTagged
+        | NodeOp::I32ToTagged
+        | NodeOp::BoolToTagged
+        | NodeOp::ToBoolean
+        | NodeOp::F64ToBoolean
+        | NodeOp::I32Add
+        | NodeOp::I32Sub
+        | NodeOp::I32Mul
+        | NodeOp::I32And
+        | NodeOp::I32Or
+        | NodeOp::I32Xor
+        | NodeOp::I32Shl
+        | NodeOp::I32Sar
+        | NodeOp::I32UShr
+        | NodeOp::I32UShrToF64
+        | NodeOp::I32Not
+        | NodeOp::F64Add
+        | NodeOp::F64Sub
+        | NodeOp::F64Mul
+        | NodeOp::F64Div
+        | NodeOp::F64Neg
+        | NodeOp::I32Cmp { .. }
+        | NodeOp::F64Cmp { .. }
+        | NodeOp::TaggedSame
+        | NodeOp::BoolNot
+        | NodeOp::NullOrLikeUndefined
+        | NodeOp::TypeofIs { .. }
+        | NodeOp::CheckString
+        | NodeOp::CheckObjectOrNullish
+        | NodeOp::ObjectOrNullishEqual
+        | NodeOp::StringEqual
+        | NodeOp::WordAsF64
+        | NodeOp::LoadField { .. }
+        | NodeOp::CheckElements { .. }
+        | NodeOp::LoadElements
+        | NodeOp::LoadElementsUsed
+        | NodeOp::CheckIndex
+        | NodeOp::CheckBounds
+        | NodeOp::LoadElement { .. }
+        | NodeOp::LoadElementOrUndefined
+        | NodeOp::StringLength
+        | NodeOp::LoadArrayLength
+        | NodeOp::TypedView
+        | NodeOp::TypedLength
+        | NodeOp::TypedData { .. }
+        | NodeOp::LoadTyped { .. }
+        | NodeOp::LoadTypedOrUndefined { .. }
+        | NodeOp::ClampToUint8
+        | NodeOp::IsTypedArray
+        | NodeOp::Env
+        | NodeOp::EnvParent
+        | NodeOp::ConstEnv { .. }
+        | NodeOp::FrameIndex { .. }
+        | NodeOp::CheckFrameEnv { .. }
+        | NodeOp::LoadBinding { .. }
+        | NodeOp::CheckInitialized
+        | NodeOp::GlobalObject
+        | NodeOp::CheckEnvIs { .. }
+        | NodeOp::CheckCellIs { .. }
+        | NodeOp::CheckGlobalEpoch { .. }
+        | NodeOp::CheckEnvGeneration { .. }
+        | NodeOp::LoadGlobalLexical { .. }
+        | NodeOp::Jump { .. }
+        | NodeOp::Branch { .. }
+        | NodeOp::Return => HeapWrite::Nothing,
+    }
 }
 
 /// The graph's dominator tree, by reverse postorder from the entry.
