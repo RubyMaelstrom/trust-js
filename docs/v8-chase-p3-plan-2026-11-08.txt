@@ -7025,3 +7025,14 @@ location: into another global's slot.
 - The measurements of the two added instructions (template code otherwise identical, the
   name-store micro, CodeLoad and the fixtures) were still being taken when it landed; they are
   added below when they are in.
+- The fix's measurements, in since (f4p2-impl/refloc: identity-report.txt, measure.out,
+  counts.out, counts-deferred.out, zombie-v1.out, zombie-v2.out; fat LTO, the tier off). Template
+  code is identical but for the two instructions: 2,663 of 3,062 compiles by masked hash, and the
+  rest are the workloads whose compiles differ run to run or by addresses alone, identical once
+  normalized, but two of zlib's (its code runs under a direct eval, so its global assignments
+  are References), which differ by exactly the inserted pairs. A script-body `g = i; h += 1`
+  costs 615.0 -> 619.0 instructions an iteration; a function's name store, which is no
+  Reference, 82.29 -> 82.29. CodeLoad at 5 runs +0.0003% (+0.005% with collections deferred),
+  Vue's fixture -0.03% with every compile identical. The other architecture's whole suite:
+  2,937 passed, none failed. Two of the coordinator's programs joined the tests (e3b256a5: two
+  moves in one loop across three names; the read side in a function with a direct eval).
