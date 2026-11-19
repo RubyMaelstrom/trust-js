@@ -8377,3 +8377,38 @@ Validation of the Reflect.set commit's engine (7cf4f19a's code), the megamorphic
 runs (target/p3/stage3/mega-impl/p1f/chk/status.txt, t262.log; reported 2026-11-20 00:09): the
 whole library with the tier off 3,847 passed, 0 failed; the tier's modules with
 TRUST_JS_OPT=1 701 passed, 0 failed; Test262 eager 53,572 of 53,575.
+
+The megamorphic line's read threshold counted and NOT built (2026-11-20;
+target/p3/stage3/mega-impl/p1g/evict-report.txt, persite/table.txt, evict/counts/table.txt).
+The design (p1f/threshold-design.txt) gave each named site a fifth cell and turned a read
+site "probe first" (the engine-wide cache before its four ways) at a ninth distinct shape,
+as the exemplars go to their megamorphic state at 8, 4 and 6 cases. The count before the
+code:
+- A probe-first read saves about 54 instructions when it would have missed its ways and
+  loses about 48 when a way would have served it, so it gains only at a site that misses
+  its ways more than 47% of the time.
+- Per site, at the bytecode tier with collections deferred (every named read counted; the
+  ways there are the same first-in-first-out four without the template's baked ways, so each
+  rate is an upper bound on generated code's): TypeScript-5 has 364 megamorphic read sites
+  with 29.1M reads, 28.4% of them way misses, and TWO sites over the break-even, with 44
+  reads between them. 71% of its megamorphic reads are at 62 sites that miss 25% to 47%:
+  the trigger as designed would have turned 188 sites and lost about 240M instructions
+  there. Djot: 6 sites over, 4,170 reads. Vue: 11 of 14 sites over with 606K reads, and
+  none of those reads ever hits the table (their receivers are Proxies, a kind the table
+  does not hold).
+- In generated code TypeScript-5's megamorphic sites reach the probe on 13.4% of their
+  reads with the tier off and 10.9% at graph, and the probe then hits 99.3%.
+- So the ways stay in front. The exemplars drop their per-site cases at megamorphic
+  because those are generated stubs or handler lists that cost memory and regeneration to
+  keep (JSC replaces the case list by one megamorphic case,
+  bytecode/InlineCacheCompiler.cpp:4689-4696; SpiderMonkey discards the stubs,
+  jit/ICState.h:113-130; V8 copies the handlers into the stub cache and sets the sentinel,
+  ic/ic.cc:1058-1066). Here a way is a data cell rewritten in place: keeping four costs
+  nothing to maintain and serves seven megamorphic reads of eight.
+- Found on the way, for the accessor and Proxy work, not this table: Vue's steady state
+  sends 1.14M reads a run to the helper from megamorphic sites whose receivers are Proxies.
+- Still being counted: the store side (TypeScript-5's generated store probe misses 35%,
+  1.66M to 1.71M a run): per site, and by class (a first sight, a collision, a failed
+  validation, a kind the table never holds), before any store teacher or change of the
+  table's geometry (4096 + 4096 direct-mapped here; V8 4096 + 1024, JSC 2048 + 512,
+  SpiderMonkey 1024 and 1024).
