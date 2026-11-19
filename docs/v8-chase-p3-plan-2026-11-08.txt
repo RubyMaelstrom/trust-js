@@ -7692,3 +7692,24 @@ coordinator's check target/p3/stage3/m1a-review).
   probe for entries the template cannot serve (inferred by its agent). The next agent brings
   it to its exit or says why it cannot get there alone, then builds the store table, where
   the count's gain is.
+
+Two findings of 2026-11-19 evening, counted by micro only and not yet anybody's line.
+- After a discard and its reoptimization a function can cost more a call than before, at one
+  trip count. The dependencies' agent's micro (target/p3/stage3/f4p2-impl/l3/disc/: a function
+  with a loop of n iterations reading a global, compiled in place, discarded once by 100
+  WrongName exits, recompiled): on main's engine 2,370 instructions a call before and 2,576
+  after at n = 100 (+8.7%), but 906 and 909 at n = 10 and 19,716 and 19,717 at n = 1,000: no
+  entry cost and no per-iteration cost. The log shows the first compile "installed in place"
+  and the recompile installed without that line (the Reoptimize landing into install_code).
+  The cause is not known. It is not the fold's (the same with folding off and on main), and
+  it holds at graph and at the splice. The coordinator's own micro (a WrongShape discard,
+  scratch) reads +64% a call, but that one adds an in-loop shape check and a polymorphic site
+  and proves nothing more.
+- A second way at a property site costs the template JIT about 16 instructions a read. The
+  coordinator's micro (a 100-iteration loop reading o.x; the tier off): 8,115 instructions a
+  call while the site has seen one shape, 9,716 after ONE call with another shape, for every
+  later call with the first shape. One stray receiver makes the hot shape the second way.
+  The exemplars' polymorphic sites cost a compare more (V8 checks its handler array in
+  order; JSC regenerates the stub's cascade). To count before a design: how many executions
+  in the fixtures and Octane hit a way other than the first at a site of two to four ways,
+  and what the stub's way loop costs a hit by position.
