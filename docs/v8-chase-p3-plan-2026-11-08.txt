@@ -8109,3 +8109,49 @@ workload shows it); key-checked ways at depths 0 to 3 (Array.prototype's methods
 on the element-load path, its receivers recorded first (GBEMU -1.8% predicted; a first micro
 had read it as nothing: its sum overflowed, the tier's code exited, and the loop measured
 was first-stage code).
+
+Stage 3 step 7, counted and designed (2026-11-19; target/p3/stage3/s7-impl: count-table.txt,
+cost.txt, exemplars.txt, design-note.txt, the agent's; no engine code yet).
+- The count (a census probe on main, 72 runs; the per-call cost from a micro with no exits,
+  its executed path read from an annotated dump): at graph almost every non-inlined call
+  into JavaScript enters the TIER's own code (Mandreel 284.9M entries of the tier's code
+  against 9K of template code at 200 runs; TypeScript 704.4M against 0.5M): a call from the
+  tier to the tier, through the first stage's call template. A monomorphic one costs 194
+  instructions over its inlined form: 154 in the caller, 28 in the callee's entry and exit;
+  a polymorphic site 29 more, closures of one function 39 more, a megamorphic site 46 more.
+  The share of each workload's instructions in non-inlined calls (executions times path
+  costs; inferred): Earley-Boyer 29.4%, Mandreel 18.7%, React's fixture 18.3%, Richards
+  15.4%, GBEMU 11.1%, TypeScript 10.1%, Djot's steady state 9.7%, Splay and Box2D 9.3%,
+  DeltaBlue 8.8%, RayTrace 6.6%, RegExp 5.1%, Vue's steady state 4.9%, PdfJS 3.7%, zlib 1.2%.
+- Why the planner did not inline them (monomorphic sites): the body budget (TypeScript 59%,
+  PdfJS 89%, RegExp 100%), size or shape (zlib 100%, TypeScript 36%), self-recursion
+  (Earley-Boyer 53%, Splay 94%), an unremapped call context (Earley-Boyer 39%, Vue 72%),
+  and a record that was empty when the function was first planned (Mandreel 55%): a
+  reoptimization keeps the first compile's ways, so such a site is never planned again
+  (step 8's, the policy).
+- The design, accepted by the coordinator: the exemplars' call site. A known callee the
+  tier does not inline is called directly (Maglev's CallKnownJSFunction, maglev-ir.cc:
+  7562-7598; the DFG's DirectCall, DFGByteCodeParser.cpp:2681-2722; Ion's visitCallKnown,
+  CodeGenerator.cpp:7307-7382), guarded as an inlined way is or proven by a fold of F4 or a
+  literal of piece B, its arguments padded at compile time. How the call finds its callee's
+  code, decided: the callee's CURRENT entry loaded at every call from a new per-chunk
+  current-entry word that every install, discard, reoptimization, supersession and eviction
+  writes before the old code can be freed, as V8 loads its dispatch table's entry
+  (macro-assembler-arm64.cc:2534-2545; the reason at js-dispatch-table.h:215-220) and
+  SpiderMonkey a script's jitCodeRaw (MacroAssembler.cpp:4265-4276); never an embedded
+  callee code address (JSC's patched call needs code that is rewritten), and not a
+  dependency of the caller on the callee's code (a validity test a call, and every caller
+  discarded at each tier change of a callee). Pieces by the count: P1 a monomorphic callee
+  (about 64 instructions a call saved; Mandreel -6.6%, Richards -5.9% predicted), P5 a
+  known constructor (Earley-Boyer), P2 a polymorphic site's arms called (the owner's D7)
+  with P4 a lean megamorphic call (JSC's virtual call thunk; GBEMU's opcode dispatch meets
+  775 closures at a site its record calls polymorphic: the record needs a refill count
+  first), P3 one function's closures by code.
+- The owner's fork, the handoff's question 17: after those pieces about 118 of a call's 182
+  instructions remain, and they are the frame model (a pooled record, the side stack of
+  frames, a depth count, a finish stub), where the exemplars' machine-stack frames cost
+  about 22; the whole form is predicted at Earley-Boyer -25.9%, Mandreel -16.4%, React's
+  fixture -16.1%, Richards -13.7%. Recommended: the tier's own machine-stack frame as this
+  line's end state, on its own count and note after P1 lands.
+- Also found for the constructs' line: TypeScript runs 40.3M constructs of user constructors
+  a 200-run run through the construct helper and not the direct sequence; not attributed.

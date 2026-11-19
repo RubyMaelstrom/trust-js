@@ -244,6 +244,28 @@ Each is recorded where the plan line says; none blocks the lines above.
    Recommended: yes, after a count in the embedder of how much of a real page's time its
    accessors take, since no workload in this repository calls one.
 
+17. From stage 3's step 7 (2026-11-19; target/p3/stage3/s7-impl/design-note.txt, fork F1, with
+   count-table.txt): THE FRAME. A call the tier does not inline costs 182 instructions today.
+   The direct call being built (the exemplars' call site: Maglev's CallKnownJSFunction, the
+   DFG's DirectCall, Ion's call of a known target) takes about 64 of them. About 118 remain,
+   and they are this engine's frame model: every activation, the tier's included, is a pooled
+   record installed into the context, an entry on the interpreter's side stack of frames, a
+   depth count and a finish stub, where V8's, SpiderMonkey's and JSC's activations are
+   machine-stack frames built by the callee's prologue and found by their return addresses
+   (about 22 instructions a call there, by the note's reading; inferred). The count puts
+   non-inlined calls at 29% of Earley-Boyer's instructions, 19% of Mandreel's, 18% of React's
+   fixture, 15% of Richards', 11% of GBEMU's and 10% of TypeScript's; the exemplars' whole
+   form is predicted to take 26, 16, 16, 14, 10 and 9 points of those where the direct call
+   alone takes 10, 7, 7, 6, 4 and 4 (inferred from executions times path costs). The question:
+   after the direct calls land, does the tier get the exemplars' machine-stack frame for
+   calls from its code to its code (the callee's slots and spills in its machine frame; stack
+   traces, Function#caller, the deoptimizer and the collector reading the tier's frames by
+   return address, as the three engines' stack walkers do)? It changes the tier's calling
+   convention, its exits' frame rebuilding and every stack walker. Recommended: yes, as that
+   line's end state, with its own count (which frames, which walkers, what each costs) and
+   its own design note brought back before any code, once the direct call has landed and
+   measured the call site's share.
+
 ## How the work is done
 
 - A design record before code. Each stage and each step that makes a choice has a note in the plan
