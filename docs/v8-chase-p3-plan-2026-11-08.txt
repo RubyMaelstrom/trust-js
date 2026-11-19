@@ -7565,3 +7565,28 @@ report-partA.txt, the agent's; the coordinator's check target/p3/stage3/parta-re
   graph and at the splice, zombie's check, and a whole-library run with the tier off on the
   commit's first form (3,779 passed; the one failure is the loop-cache test of the next
   record, which fails on main without this commit).
+
+A test broken by the loop's facts, found a landing later and fixed forward (ce0e88f8;
+2026-11-19).
+- opt::tier_tests::loop_cache::objects_cached_through_the_inner_loop_survive_collections_in_
+  the_outer_loops_call failed on main from 632b3cc2 (the first shape check moved to a quiet
+  loop's entry) until this commit. No miscompile: its results equalled the VM's in all six
+  configurations. Its setup's assertion, that the allocation made a loop cache, no longer
+  held: the inner loop read twelve objects' fields, and with the check at the entry edge and
+  the field loads reading the cell carried from there the loop reads no object. Measured on
+  main, caches made in each configuration: the old loop 0; a loop that stores to the fields 0
+  (the store goes through the carried cell); identity tests of the objects 0 (folded); a loop
+  that stores each object into an array's element 8; one that selects between them 7.
+- The test now stores the objects into an array in its inner loop and asserts at graph (the
+  new program makes no cache in the configurations that follow the environment under
+  TRUST_JS_OPT_INLINE=splice; why the spliced second stage needs none is not traced). The
+  allocator mutations it caught stay caught by the other loop-cache tests.
+- How it got through: the pair landed on its agent's nearest tests (the builder's modules at
+  graph, the new tests at graph, at the splice and eager), the coordinator's adversarial
+  programs, counts and the verifier sweep. None of them runs this module with the tier's
+  switches left to the test. Test262 and difftest, run after the landing, do not see a test's
+  setup. A whole-library run of the next change with the tier off found it.
+- The check that would have caught it costs ten minutes: the tier's modules (opt::,
+  jit::opt_a64) in ONE configuration, TRUST_JS_OPT=1 with the inline mode left to the
+  default. The coordinator's landing check of a tier change runs it from here on, beside the
+  counts; the whole library suite stays for changes to every program's default path.
