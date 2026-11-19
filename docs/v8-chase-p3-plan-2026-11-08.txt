@@ -7713,3 +7713,36 @@ Two findings of 2026-11-19 evening, counted by micro only and not yet anybody's 
   order; JSC regenerates the stub's cascade). To count before a design: how many executions
   in the fixtures and Octane hit a way other than the first at a site of two to four ways,
   and what the stub's way loop costs a hit by position.
+
+F4 part 2, layer 2 landed: the dependencies' mechanism, nothing folded yet (d10637a0;
+2026-11-19; target/p3/stage3/f4p2-impl, report-l2.txt, the agent's; the coordinator's check
+target/p3/stage3/l2-review).
+- What it is. Each slot of a watched global keeps a list of the validity words of the codes
+  that depend on it, under the fuse's lock (SpiderMonkey's per-property dependency map,
+  ObjectFuse.h:121-125); a code's word lives with its exit table and is tested by a new
+  node, CheckCodeValid (three instructions: a literal load, a load, a branch), which exits
+  with a new reason, Invalidated; a change of the property (its second store, a removal, a
+  shadowing, a whole change of the map) sets the word of every dependent. Invalidated
+  discards at its first exit and flags no site; after three such discards a function folds
+  no global (the review's R-3: the micro of a thousand globals each changed once). A compile
+  registers its dependencies at install and is dropped if one moved while it compiled. The
+  verifier's folded_reads requires a CheckCodeValid since the last effect before any folded
+  read. In this layer the fold itself runs only under a test switch.
+- What it costs, the coordinator's builds (fat LTO, target/p2/lto/2c299ca7 against its
+  parent 844667b7; 5 fixed runs): the tier on at graph, nothing folded: within the draws of
+  two binaries (Octane's mean 0.00%); the tier off: Octane's mean -0.01%. The agent's
+  randomized 8-run means with the tier off: DeltaBlue +0.016%, Djot's fixture +0.024%
+  (about five standard deviations; not located: what remains on the template JIT's compile
+  path is an empty literal list in the assembler, one byte in the chunk's profile and the
+  fuse's lock type), Richards, Box2D and RegExp under 0.01%. Accepted with that.
+- On the way: the first form cost the tier off +0.03% to +0.08% with the template's code
+  byte-identical. It was the assembler: a new kind of patch entry made every branch patch's
+  bookkeeping dearer at template compile; a first fix (a separate list) measured worse;
+  the literal handling now sits in cold functions behind one emptiness test, and the patch
+  loops are as they were.
+- Checked: the coordinator's 68 adversarial programs at six modes and against the parent's
+  engine; the agent's 19 mutations of the new rules, all caught; the tier's modules with the
+  tier on on the layer's own tree, 779 passed and none failed; the verifier sweep, 42 of 42.
+- Next, built and being measured on the same branch: layer 3 (the tier folds a global whose
+  value is a Number and has been stored once: first rows Richards -4.7% at graph and -4.0%
+  at the splice, Crypto -0.5%, at 200 runs) and the fuses kept with the Agent's heap.
