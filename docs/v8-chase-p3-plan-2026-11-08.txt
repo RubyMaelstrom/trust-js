@@ -7385,3 +7385,62 @@ exemplars.txt, count-table.txt, template-reads.txt, the agent's; no engine code 
   cost at most 0.29% of any workload (Vue's fixture), on paths whose helper call costs far
   more. Recommendation: keep JSC's form; ask again when the megamorphic paths no longer call
   a helper every time.
+
+The quiet loop's facts: the blocks the builder builds, and the first shape check moved to the
+loop's entry, landed (e96aa0eb and 632b3cc2; 2026-11-19; target/p3/stage3/lf3-impl, report.txt,
+the agent's; the coordinator's check target/p3/stage3/lf3-review).
+- How the first came about. The planned move alone measured Crypto -0.22% at 200 runs against
+  a count that predicted -0.66%. The loop analysis (Flow::new) counted the operations of blocks
+  that never ran as effects: such a block has no feedback, so nothing in it is lowered. The
+  builder never builds those blocks; each is its NeverRan exit. Crypto's two hottest loops
+  (montReduce, bnpSquareTo) were therefore "not quiet" for code the compiled function does not
+  contain, and so were Mandreel's loops with a call on a rare path, which is the case F4 part
+  1's hoist was written for.
+- The rule (e96aa0eb). One predicate, Rules::exits_unbuilt (the block never ran and holds no
+  NeverRan flag), is read by the builder, the loop analysis, the summaries of an inlined
+  callee's writes and the inliner, each with its frame's own feedback: a block the builder
+  makes an exit ends none of its loop's facts. JSC's ForceOSRExit for code that never ran
+  leaves the rest of its block unreachable before LICM collects the loop's writes
+  (dfg/DFGByteCodeParser.cpp:1330), Warp's bailout for a cold IC ends its block
+  (jit/WarpBuilder.cpp:4185-4190), Maglev's unconditional deopt builds nothing after it
+  (maglev-graph-builder.cc:1678). It is its own commit because it widens three landed pieces
+  (the loop's facts, the typed entry checks, the global-read hoist) in every program. When the
+  cold block does run, the exit, the discard and the recompile are main's own (four programs,
+  both modes, equal counts); the recompile builds the block and its loop keeps no fact the
+  block ends.
+- The move (632b3cc2). In a loop that keeps heap facts, the first shape check of a word the
+  loop does not write (a slot it reads, `this`, an entry-loaded global) whose entry edges hold
+  no fact is made at the entry edge, with the moved-site records step L1c gave typed checks:
+  a site that runs whenever the loop is entered is taught WrongShape at its own pc, a blind
+  one flags HoistingFailed at the header. Ion's and the DFG's LICM move a shape guard out of a
+  loop that writes none. Always wrong, measured: 100 exits, 1 discard, 2 compiles against the
+  unmoved 0, 0, 1 for a site on a path taken only in warm-up; a shape no record saw at every
+  entry costs what the site's own check costs.
+- Measured, the coordinator's builds against main's engine (fat LTO, target/p2/lto/ed6213c0;
+  graph; 200 fixed runs, collections deferred; the first commit | the move over it | the
+  pair): Mandreel -10.62% | 0.00% | -10.62%, Crypto -1.48% | -0.29% | -1.76%, Box2D -0.01% |
+  -0.09% | -0.10%, GBEMU 0.00% | -0.08% | -0.08%, Richards 0.00% | 0.00% | 0.00%. At 5 runs
+  the first commit: Mandreel -5.09%, Crypto -1.26%, Octane's mean -0.43%; the move: Crypto
+  -0.22%. The splice does not gain (Mandreel -0.04%, Crypto -0.05% at 5 runs): its spliced
+  second stage has no block that "never ran". The tier off equal.
+- Slower, accepted: Richards at 5 runs +0.015% at graph and +0.024% at the splice for the
+  first commit (the agent's 1-run rows: +0.03% to +0.05% for the pair), a fixed cost of the
+  compile (the analysis asks the predicate per block; the builder's states carry the facts at
+  headers) that 200 runs do not show (+0.002%). The exit asked Richards within its spread
+  (0.012%) at 1 and 5 runs; it is over it by that much and lands on the pair's gains.
+  The agent's rows against an older parent showed Djot's fixture +0.09% and +0.17%: against
+  main's engine it is within 0.01%, the layout draw the flip's record describes.
+- Checked: the coordinator's 89 adversarial programs (six new ones in which a cold block
+  first runs in a loop's middle iteration after the compile: reassigning the globals the loop
+  reads, growing the object whose shape it carries, storing and deleting its carried fields,
+  calling and throwing, the same inside an inlined callee and on `this`; each agreeing with
+  Node first) agree on both commits at five modes (bytecode, the tier off, graph, the splice,
+  graph eager); the verifier sweep at 5 runs; the agent's mutations (4 of 4 and 6 of 6: a
+  prepass that skips a block the builder builds is refused by the verifier's kept_heap), its
+  tests at graph, at the splice and eager, and zombie's check.
+- Out of this form's reach in Crypto, each with its count (the report's section 1): a check
+  behind an inner loop's header (3.75M executions; a header that also keeps its enclosing
+  quiet loop's facts), an inlined frame's site on the caller's invariant argument (7.5M; a
+  prepass that sees a callee's sites on a parameter bound to the caller's slot), and the shape
+  of a word loaded in the loop (`this.m`, 4.99M; the field's own fact). c-rec's recount was
+  not done.
