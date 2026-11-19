@@ -4424,6 +4424,21 @@ fn named_read_uncached(name: &str) -> bool {
             .is_some_and(|&byte| byte == 0 || byte.is_ascii_digit())
 }
 
+/// Whether an Array level of a chain proves `name` absent by its shape, for a cached absence
+/// (`IC_ABSENT`, the megamorphic line's piece 2): an Array's elements are its only entries outside
+/// its shape, and their keys are all canonical indices (element inserts and removals keep the
+/// shape; every other key transitions it), so its shape proves a name that cannot be an index
+/// absent as an ordinary object's does. The test is the templates' `arr_ok` gate (not digit-led);
+/// the fill refuses an index name before it (`Interp::ic_get_rederive`). The exemplars cache a
+/// miss on an array as on any receiver: V8's LoadNonExistent handler on the lookup's start map
+/// (ic/ic.cc:1082-1088), JSC's Miss case on the base's structure (bytecode/Repatch.cpp:696),
+/// SpiderMonkey's missing-property stub on any native object, ArrayObject included, refusing only
+/// a typed array's index (jit/CacheIR.cpp:602-617).
+#[inline(always)]
+fn absent_on_arrays(name: &str) -> bool {
+    !name.as_bytes().first().is_some_and(u8::is_ascii_digit)
+}
+
 #[path = "property_read.rs"]
 mod property_read;
 use property_read::CachedGet;
@@ -4561,6 +4576,10 @@ mod ordinary_data_read_tests;
 #[cfg(test)]
 #[path = "property_read_tests.rs"]
 mod property_read_tests;
+
+#[cfg(test)]
+#[path = "array_absent_read_tests.rs"]
+mod array_absent_read_tests;
 
 #[cfg(test)]
 #[path = "constructor_transfer_tests.rs"]
@@ -11077,9 +11096,11 @@ impl Interp {
                 let b = unsafe { (*cur).borrow() };
                 // Absence-of-entry proves OrdinaryGet absence only where no name is
                 // exotic-provided: `None` plus NumWrap/BoolWrap (never StrWrap's
-                // `length`/indices, never Array elements), mirrored in the fill.
+                // `length`/indices), and an Array for a name no element can have, mirrored in
+                // the fill.
                 if !((b.kind.is_ordinary()
-                    || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)))
+                    || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_))
+                    || (matches!(b.kind, ObjectKind::Array) && absent_on_arrays(name)))
                     && b.ic_plain()
                     && b.props.shape() == shape)
                 {
@@ -11252,10 +11273,13 @@ impl Interp {
         let mut mids = [None; 4];
         // Level shapes for an absent-property fill (see `IC_ABSENT`): valid only while every
         // level so far answers no name outside its entries — plain `ObjectKind::ExoticNone` objects and
-        // NumWrap/BoolWrap wrappers. StrWrap (`length`/indices) and Array (elements) answer
-        // names exotically, so absence-of-entry proves nothing across them.
+        // NumWrap/BoolWrap wrappers — or answers the name only from entries its shape pins: an
+        // Array, for a name that cannot be an index (`absent_on_arrays`). StrWrap
+        // (`length`/indices) answers names exotically, so absence-of-entry proves nothing there.
         let mut absent_shapes = [0; 6];
         let mut absent_ok = true;
+        // An Array level proves a name absent for a name that cannot be an index
+        // (`absent_on_arrays`, tested only where an Array level is met).
         unsafe {
             for depth in 0..=IC_MAX_DEPTH {
                 let b = (*cur).borrow();
@@ -11267,7 +11291,8 @@ impl Interp {
                 absent_shapes[depth as usize] = b.props.shape();
                 absent_ok = absent_ok
                     && (b.kind.is_ordinary()
-                        || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)));
+                        || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_))
+                        || (matches!(b.kind, ObjectKind::Array) && absent_on_arrays(name)));
                 if let Some(slot) = key.and_then(|key| b.props.slot_of_key(key)) {
                     let p = b.props.slot_at(slot).unwrap();
                     let v = self.snapshot_cached_get(

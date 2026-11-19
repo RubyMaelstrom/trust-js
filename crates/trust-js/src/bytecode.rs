@@ -179,11 +179,13 @@ pub const IC_PRIMITIVE_STRING: u8 = 1;
 pub const IC_PRIMITIVE_NUMBER: u8 = 2;
 pub const IC_PRIMITIVE_BOOLEAN: u8 = 3;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
-/// is missing along the entire (all `ObjectKind::ExoticNone`, all ic-plain) prototype chain. The chain's
+/// is missing along the entire (all ic-plain) prototype chain, every level ordinary, a Num or
+/// Bool wrapper, or, for a name that cannot be an index (not digit-led), an Array. The chain's
 /// shapes sit in recv_shape/mid_shape/mid2_shape/mid3_shape/mid4_shape/holder_shape in walk
 /// order with the level count in `slot` (1-6); a hit re-walks the live chain and yields
 /// `undefined`. Shape-only proof is sound for absence: a shape pins the exact key set of a
-/// non-elem-mode map, and every level's exotic/side-table gates are re-checked live.
+/// non-elem-mode map and the non-index keys of an elem-mode (Array) map, whose element keys are
+/// all indices, and every level's exotic/side-table gates are re-checked live.
 pub const IC_ABSENT: u8 = 0xFC;
 /// Way count of a property IC site: `Compiler::new_cache` allocates this many consecutive
 /// cells, the Rust probes walk all of them, and the JIT get/set templates loop over them

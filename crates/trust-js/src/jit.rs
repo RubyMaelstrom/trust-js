@@ -272,6 +272,14 @@ mod baked_read_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_array_absent_tests.rs"]
+mod array_absent_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_chain_reoptimize_tests.rs"]
 mod chain_reoptimize_tests;
 
@@ -8205,6 +8213,41 @@ fn guard_exotic_none_or_wrap(
     a.bind(ok);
 }
 
+/// Branch to `miss` unless the kind tag already loaded in `reg` is one whose shape proves a name
+/// absent (a cached absence's level, `IC_ABSENT`): ordinary, a Num or Bool wrapper (they answer
+/// no name outside their entries), or an Array where `arrays` (the site's name passed the
+/// `arr_ok` gate: an Array's elements, its only entries outside its shape, have index keys).
+/// Never a String wrapper (its `length` and indices). Mirrors `Interp::ic_shape_probe`'s absent
+/// branch and the fill (`Interp::ic_get_rederive`). Clobbers NZCV and `scratch`.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn guard_exotic_absent_level(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    reg: u32,
+    scratch: u32,
+    arrays: bool,
+    miss: usize,
+) {
+    if !arrays {
+        guard_exotic_none_or_wrap(a, layout, reg, scratch, false, true, miss);
+        return;
+    }
+    debug_assert_ne!(reg, scratch, "the compares read the tag");
+    let ok = a.new_label();
+    branch_exotic_ordinary(a, layout, reg, scratch, ok);
+    a.cmp_imm_w(reg, layout.exotic_array_tag as u32);
+    a.b_cond(C_EQ, ok);
+    a.cmp_imm_w(reg, layout.exotic_numwrap_tag as u32);
+    a.b_cond(C_EQ, ok);
+    a.cmp_imm_w(reg, layout.exotic_boolwrap_tag as u32);
+    a.b_cond(C_EQ, ok);
+    a.b(miss);
+    a.bind(ok);
+}
+
 /// x10 = the ACTIVE realm's wrapper prototype at `proto_off` within the `Interp` reached
 /// through ctx.interp — never an embedded prototype identity, so a realm swap between the
 /// fill and the hit is observed exactly as the Rust helper observes it.
@@ -8445,10 +8488,11 @@ fn emit_prop_way_probe(
     a.b(load);
     // Cached ABSENCE (`IC_ABSENT`, the AST-shaped read `node.optionalField`): re-walk the
     // live chain — every level ic-plain with a shape matching the recorded walk and an
-    // exotic that answers no name outside its entries (None or Num/Bool wrapper; ABSENT
+    // exotic that answers no name outside the entries its shape pins (None or Num/Bool
+    // wrapper, or an Array where `arr_ok`: the site's name is no element's key; ABSENT
     // states fill only from such chains, so re-require that on receivers the
-    // `arr_ok`/`wrap_ok` gates let through — an Array or StrWrap level keeps the helper,
-    // exactly as in `ic_shape_probe`) — and the chain must END where the fill saw it end.
+    // `arr_ok`/`wrap_ok` gates let through — a StrWrap level keeps the helper, exactly as in
+    // `ic_shape_probe`) — and the chain must END where the fill saw it end.
     // Then the read is `undefined` with no entry scan at all. Method loads keep the
     // helper (an absent method throws there anyway).
     a.bind(other);
@@ -8457,7 +8501,7 @@ fn emit_prop_way_probe(
         a.b_cond(C_NE, kc_route);
         if arr_ok || wrap_ok {
             a.ldrb_imm(14, 11, ex);
-            guard_exotic_none_or_wrap(a, layout, 14, 15, false, true, miss);
+            guard_exotic_absent_level(a, layout, 14, 15, arr_ok, miss);
         }
         let chain_end = a.new_label();
         for (lvl, shape_off) in [
@@ -8473,7 +8517,7 @@ fn emit_prop_way_probe(
             a.cbz(17, true, miss); // chain ended before the recorded level count
             a.add_imm(11, 17, obj_off);
             a.ldrb_imm(14, 11, ex);
-            guard_exotic_none_or_wrap(a, layout, 14, 15, false, true, miss);
+            guard_exotic_absent_level(a, layout, 14, 15, arr_ok, miss);
             a.ldrb_imm(14, 11, plain);
             a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
             a.ldr_w_imm(14, 11, sh);
