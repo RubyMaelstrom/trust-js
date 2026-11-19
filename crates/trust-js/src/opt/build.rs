@@ -811,7 +811,10 @@ impl Rules<'_> {
             };
             // What the operation writes in place, an inlined call's frames' writes among them (the
             // union rule, `Writes`).
-            let writes = self.writes_at(pc);
+            let global = stored
+                .iter()
+                .any(|source| matches!(source, Source::Global(_)));
+            let writes = self.writes_at(pc, global);
             stored.retain(|source| match *source {
                 Source::Slot(slot) => !written.contains(&slot),
                 Source::Name(address, _) => !writes.slots.contains(&address.slot),
@@ -843,13 +846,18 @@ impl Rules<'_> {
     /// 14611); the DFG and Ion inline before their loop analyses, which then read the inlined
     /// nodes as any (dfg/DFGPlan.cpp:202, 424 with DFGLICMPhase.cpp:96-103; jit/Ion.cpp:1204,
     /// 1290). This prepass runs before the build, on bytecode, so it reads each frame's summary.
-    fn writes_at(&self, pc: usize) -> Writes {
+    /// With `fields` false, the operation's own field locations are left out (a loop that reads no
+    /// global needs none: the prepass's cost, `Loop::stored_fields`); an inlined call's frames'
+    /// are their summaries', made once.
+    fn writes_at(&self, pc: usize, fields: bool) -> Writes {
         let mut writes = Writes::default();
         if let Some(slot) = self.name_store_slot(pc) {
             writes.slot(slot);
         }
-        for location in self.stored_field(pc) {
-            writes.field(location);
+        if fields {
+            for location in self.stored_field(pc) {
+                writes.field(location);
+            }
         }
         if let (Op::Call(_, cache) | Op::CallWithThis(_, cache), Some(tree)) =
             (self.ops[pc], self.inlining)
@@ -864,7 +872,7 @@ impl Rules<'_> {
     fn chunk_writes(&self) -> Writes {
         let mut writes = Writes::default();
         for pc in 0..self.ops.len() {
-            writes.extend(&self.writes_at(pc));
+            writes.extend(&self.writes_at(pc, true));
         }
         writes
     }
@@ -1745,7 +1753,7 @@ impl Flow {
                 for &index in &body {
                     let block = &blocks[ix(rpo[index])];
                     for pc in block.start..block.end {
-                        writes.extend(&rules.writes_at(pc));
+                        writes.extend(&rules.writes_at(pc, false));
                         if let Some(source) = rules.global_source(pc) {
                             if !found.globals.contains(&(pc as u32)) {
                                 found.globals.push(pc as u32);
@@ -1778,7 +1786,20 @@ impl Flow {
             }
             found.stored = writes.slots;
             if !found.read_fields.is_empty() {
-                found.stored_fields = writes.fields;
+                // The loop's own field stores, for a loop with global reads alone (its frames'
+                // came with their summaries).
+                let mut fields = writes.fields;
+                for &index in &body {
+                    let block = &blocks[ix(rpo[index])];
+                    for pc in block.start..block.end {
+                        for location in rules.stored_field(pc) {
+                            if !fields.contains(&location) {
+                                fields.push(location);
+                            }
+                        }
+                    }
+                }
+                found.stored_fields = fields;
                 // A global a store of the loop may write is read in the loop, its value not kept
                 // through the header (`loop_heap_facts`): no entry load and no typed checks of it,
                 // whose value no read of the loop would take (as a binding the loop stores,

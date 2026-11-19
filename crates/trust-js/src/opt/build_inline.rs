@@ -175,8 +175,9 @@ pub(super) struct Analysis {
     /// lowered operation for the caller's loop prepass (`Tree::effect_free`).
     generic: bool,
     /// What its operations may write in place, every block's (`Rules::chunk_writes`): its share of
-    /// the union a caller's loop takes (`Tree::writes`).
-    writes: Writes,
+    /// the union a caller's loop takes (`Tree::writes`), made the first time a loop asks, so that a
+    /// compile pays for the callees its quiet loops call only.
+    writes: std::cell::OnceCell<Writes>,
 }
 
 /// The callees a compile inlines (see the module's doc).
@@ -286,19 +287,38 @@ impl<'a> Tree<'a> {
 
     fn ways_writes(&self, ways: &[InlineWay], writes: &mut Writes) {
         for way in ways {
-            let Ok(analysis) = &self.analyses[way.chunk as usize] else {
+            if !self.chunk_writes(way.chunk, writes) {
                 continue;
-            };
-            writes.extend(&analysis.writes);
+            }
             for site in &way.nested {
                 self.ways_writes(&site.ways, writes);
             }
             for literal in &way.literals {
-                if let Ok(analysis) = &self.analyses[literal.chunk as usize] {
-                    writes.extend(&analysis.writes);
-                }
+                self.chunk_writes(literal.chunk, writes);
             }
         }
+    }
+
+    /// Adds callee chunk `chunk`'s summary to `writes`, made at its first use; false where the
+    /// inliner declines the chunk (no frame of it is built).
+    fn chunk_writes(&self, chunk: u32, writes: &mut Writes) -> bool {
+        let Ok(analysis) = &self.analyses[chunk as usize] else {
+            return false;
+        };
+        let own = analysis.writes.get_or_init(|| {
+            let (view, snapshot) = self.callees[chunk as usize];
+            Rules {
+                chunk: view,
+                ops: view.jit_ops(),
+                snapshot,
+                cfg: &analysis.cfg,
+                initialized: &analysis.initialized,
+                inlining: None,
+            }
+            .chunk_writes()
+        });
+        writes.extend(own);
+        true
     }
 
     /// The Cfgs of the chunks the graph's inlined frames may run, by `InlinedFrame::chunk`, each
@@ -402,7 +422,6 @@ fn analyse(
         return Err((PAST_RECORD, None));
     }
     let liveness = SlotLiveness::compute(ops, &cfg, n_slots);
-    let writes = rules.chunk_writes();
     Ok(Analysis {
         cfg,
         initialized,
@@ -410,7 +429,7 @@ fn analyse(
         liveness,
         frame_chunk,
         generic,
-        writes,
+        writes: std::cell::OnceCell::new(),
     })
 }
 
