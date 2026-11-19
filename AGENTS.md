@@ -128,7 +128,9 @@ written down.
 ## Testing
 
 Tests are a diagnostic tool. Running every suite at every commit stalled this project
-once; run what tells you something about the change.
+once; run what tells you something about the change. A change's check before it lands
+takes minutes, not hours: quick checks, then land, and fix forward if something breaks
+later. Count the hours a check plan implies before starting it.
 
 - While developing: `cargo fmt --check`, `cargo clippy --offline --locked -p trust-js
   --lib --tests --features embed -- -D warnings`, and the tests nearest the change.
