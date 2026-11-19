@@ -8372,3 +8372,8 @@ suite; before, 2 of 20 failed, and on main before that 2 of 6. The cause of one 
 failure (80 helper calls in a warm pass) was not hunted: a child process removes every such
 state at once. The rule for new tests of this kind: a test that asserts an exact count
 depending on a process-wide cache or epoch runs alone in a child.
+
+Validation of the Reflect.set commit's engine (7cf4f19a's code), the megamorphic line's own
+runs (target/p3/stage3/mega-impl/p1f/chk/status.txt, t262.log; ended 2026-11-20 00:20): the
+whole library with the tier off 3,847 passed, 0 failed; the tier's modules with
+TRUST_JS_OPT=1 701 passed, 0 failed; Test262 eager 53,572 of 53,575.
