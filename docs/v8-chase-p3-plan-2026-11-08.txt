@@ -8268,3 +8268,40 @@ target/p3/stage3/fn-review).
   chains), before any dependency; then the length under the detach bit (4b, decided, not
   built), then what an effect must really invalidate for a view of a buffer that cannot be
   resized.
+
+The installs of finished compiles out of jit_interrupt's frame (27fea33b; 2026-11-19;
+target/p3/stage3/gp3-impl/x-check.log, x-gcalign/summary.txt, the agent's; the coordinator's
+check target/p3/stage3/x-review). A collector change found through a tier-off row.
+- What was wrong. jit_interrupt is the function generated code calls at an interrupt check;
+  it runs gc_check, so its frame is on the stack at every collection it starts, and the
+  conservative scan reads the whole frame. The installs of finished compiles were inlined
+  into it: its frame was 5,424 bytes, most of them the install path's temporaries (a
+  compile's results), whose stale words the scan read as references. So garbage stayed
+  alive, and any change to the size of a compile's types moved what every later collection
+  kept: `instanceof`'s lowering, which adds a Vec to a snapshot type, read +0.23% on Djot
+  with the tier OFF (identical generated code; level with collections deferred); the getter
+  line met the same thing in a store helper the same evening.
+- The rule: the frame that is live across a collection holds nothing of a compile. The
+  installs are a function of their own (driver::install_requested, never inlined); the
+  frame is 96 bytes. V8's interrupt handler and SpiderMonkey's interrupt callback reach
+  their installs through calls of their own (execution/stack-guard.cc:353-372;
+  vm/Runtime.cpp:421).
+- Measured as a collector change: objects kept at collections both binaries share (a
+  collection every 100,000 cell allocations, every one major, the marker not incremental,
+  fixed addresses; main run twice as the control and equal to itself at every collection).
+  Djot's fixture keeps fewer at 7 of 11 collections and more at none (-11.2% in sum; with
+  the tier on -9.1%); Djot's steady state fewer at 91 of 96 (-13.0%; tier on -6.2%);
+  Earley-Boyer fewer at 51 of 67 and more at 6 by one to four objects (tier on: more at
+  10, nine of them by one to five and ONE by 1,226 of 91,475, the scan's draw in other
+  frames' unwritten slots, which now sit 5.3 KB higher; not chased); Splay fewer at 2 of 56
+  and more at none. The method is the one to use for any change of this kind: with the
+  default schedule two binaries collect at different points and cannot be compared
+  collection by collection.
+- Counts: the tier off, 5 runs, collections deferred, every row within 0.020%; with the
+  default schedule within 0.04% but for TypeScript +0.196% (deferred -0.020%: its two
+  collector modes). The tier on, the coordinator's table, deferred: every row within
+  0.008% but TypeScript -0.033%. The template JIT's code equal by name on eleven workloads.
+- Checked by the coordinator: 47 adversarial programs with the tier on (graph, eager,
+  forced exits) against the parent's engine and under GC stress at graph and at graph
+  eager (a result that only the old frame's stale words kept alive would fail there): none
+  differs. The x86-64 host's check, clippy and Windows check: 0.
