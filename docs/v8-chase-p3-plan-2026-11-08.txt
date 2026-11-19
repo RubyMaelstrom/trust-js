@@ -8155,3 +8155,60 @@ cost.txt, exemplars.txt, design-note.txt, the agent's; no engine code yet).
   line's end state, on its own count and note after P1 lands.
 - Also found for the constructs' line: TypeScript runs 40.3M constructs of user constructors
   a 200-run run through the construct helper and not the direct sequence; not attributed.
+
+The getter line's pieces (a) and (b) landed: a built-in accessor getter is cached and called
+directly, and a typed array's getters are answered by a stub (7f61ea68 and bbb86d40; 2026-11-19;
+target/p3/stage3/getter-impl, design-note.txt, facts.txt, report.txt, the agents'; the
+coordinator's check target/p3/stage3/ga-review).
+- Why it cost about 830 instructions a read in every tier (the agents' facts). A typed
+  array's construction cleared the flag that lets a receiver have a cache way, so its site
+  was marked generic and every read ran three failed cache layers and the full [[Get]]. A
+  native getter on an ordinary receiver (a Map's size) had a way and a validated landing,
+  but the stub's direct sequence is a JavaScript call and a native never gets a call cache,
+  so the helper took the generic call: 870 instructions around a getter that does 16.
+- (a) A typed-array receiver fills ways at a site whose name is not a canonical numeric
+  index (SpiderMonkey excludes only index ids, CacheIR.cpp:603-617), the way recording the
+  receiver's kind because a shape here does not name the class; and a native getter a way
+  finds is called directly with the receiver, keeping a native call's safepoints, in the VM
+  and in the template's validated path. An embedder's accessor (a native closure) is called
+  the same way. All three exemplars do this at their baseline tier (V8's load handlers for
+  accessors; JSC's getter access cases; SpiderMonkey's CallNativeGetter stub).
+- (b) A typed array's length, byteLength and byteOffset are answered by one process-wide
+  stub that the site's accessor landing reaches by a branch: the live getter compared with
+  the intrinsic native of any Realm (JSC's live compare, InlineCacheCompiler.cpp:3463-3467),
+  the receiver a typed array, then the answer from the view's record: 0 for a detached or
+  out-of-bounds view, the computed length of a length-tracking one. The first form emitted
+  the sequence at every length-named site and cost the fixtures' first passes 0.04% to
+  0.06%; in the stub it costs React +0.01% to +0.02% and Djot +0.02% (accepted). The stub
+  reads no engine state (two engines on one thread: tested; the mutation went uncaught until
+  the test also ran warmed engines).
+- Measured, the coordinator's builds (fat LTO of main, of (a) and of (b); the micro's
+  instructions a read, the tier off | graph): a typed array's length 785 | 782 on main (it
+  was 834 before the megamorphic read probe), 656 | 654 with (a), 129 | 125 with (b); its
+  byteLength 771 to 648 to 136; a Map's size 918 to 558; an array's and a string's length
+  unchanged. GBEMU at 200 runs: (a) -9.6% at graph and -5.5% with the tier off; (b) over it
+  -41.3% and -22.7%; together -46.9% and -27.0%. At 5 runs, collections deferred: GBEMU
+  -6.5% | -4.7% then -30.3% | -20.0%, Mandreel -0.14% then -0.54% at graph, Octane's mean
+  -0.45% | -0.32% then -2.4% | -1.5%. The agent's embed micro: an embedder's getter 897
+  instructions a read to 536. Vue +0.02% to +0.03% for (a) by the agent's randomized runs
+  (a first form cost +0.14%: a test of the receiver's plainness ran before the shape test on
+  every probe of a Proxy; moved after it; the residue not found), accepted.
+- Checked: the coordinator's 39 adversarial programs at seven modes on each commit, the
+  getter programs under GC stress with the tier on and off: none differs (three new ones,
+  each agreeing with Node first: the three getters across kinds, a subclass, an own shadow,
+  the getter replaced by a JS getter and restored, a changed prototype, a receiver that
+  only inherits the getter; detached and resized buffers, a length-tracking view, a Proxy
+  over a typed array, a DataView; Map and Set sizes with a subclass and a replaced getter,
+  RegExp getters, a megamorphic length site over eleven kinds of receiver); the tier's
+  modules with the tier on on the landing tree, 806 passed and none failed; the agents'
+  whole library with the tier off (3,814 passed), 13 mutations of (a) of which 9 are caught
+  (one affects only refills, three are defensive kind tests) and 4 of 4 of the stub's.
+  Where the megamorphic read probe meets (a): no typed-array read reaches the helper at a
+  megamorphic-flagged site on GBEMU, Mandreel or TypeScript (counted).
+- Held: a3, a native SETTER called directly (an embedder's setter 963 instructions a write
+  to 682): Djot's fixture, first pass, tier off, is +0.29% with it, level with the call
+  removed and unchanged with the call moved out of line; which of Djot's stores take it is
+  not counted yet. Next of the line (briefs/getter3.txt): that count and a3; a store's
+  validated accessor landing (a setter store finds its accessor twice today: about 226 of
+  the 682); the tier's node for a typed array's getters; the stub on x86-64. The owner's
+  question 16: an accessor kind of its own for the embedding API.
