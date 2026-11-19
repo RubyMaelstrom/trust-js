@@ -7629,3 +7629,42 @@ Validation again, main 63874468 (2026-11-19 16:53; after layer 1's residuals, th
 test's fix and the lazy switch; in the background, nothing waiting): Test262 with the tier on
 and eager at graph 53,572 of 53,575 (the same three); difftest 138 agree with the tier off,
 eager, and eager with forced exits.
+
+The megamorphic line's piece 2 landed: an Array's absent named read is cached (abedce96;
+2026-11-19; target/p3/stage3/mega-impl, p2/report.txt, the agent's; the coordinator's check
+target/p3/stage3/mega-review).
+- The rule. The cache's fill of an absent property may cross an Array level when the name
+  cannot be an index: an Array's shape proves which named keys it holds, and its elements
+  are all canonical indices. The fill refused every Array before, so Vue's reads of
+  `__v_isRef`, `__v_raw` and their kin on arrays took the full lookup each time (0.53M reads
+  at 988 instructions each in its steady state). The Rust probe and the template's absent arm
+  check the Array level's shape like any other level's. The exemplars cache a miss on the
+  receiver's map, structure or shape whatever its class (V8's LoadNonExistent on the start
+  map, ic/ic.cc:1082-1088; JSC's Miss on the base's structure, bytecode/Repatch.cpp:696;
+  SpiderMonkey's missing-property stub, refusing only a typed array's index,
+  jit/CacheIR.cpp:602-617). A symbol's absence is cached too, as SpiderMonkey's is
+  (CacheIR.cpp:645-679); the design note's line that kept such names uncached is dropped.
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/abedce96 against main's
+  844667b7; 5 fixed runs; graph | the tier off): Vue's fixture -5.52% | -4.80%, its steady
+  state -5.97% | -5.08%; PdfJS -0.24% at graph; every other row within 0.03% but TypeScript
+  at graph (+0.5%, its two collector modes). It is the default configuration's gain as much
+  as the tier's.
+- On the way: the first form tested the name's first character before the fill's walk, on
+  every refill, and cost GBEMU +0.26% (its typed-array length reads refill every time, the
+  getter line's subject); the test now runs only where an Array level is met.
+- Checked: the coordinator's 79 adversarial programs at seven modes and against main's
+  engine (four new ones, each agreeing with Node first: the name appearing on Array.prototype,
+  on Object.prototype, on one array, as an accessor, and going again; index-like and
+  almost-index names, constant and computed; a subclass, a changed prototype, a Proxy
+  prototype, arguments, typed arrays, frozen arrays; holes, symbols, one megamorphic site
+  over arrays and objects); the piece's tests and the tier's modules with the tier on (769
+  passed, none failed); the agent's seven mutations (an eighth is equivalent: two guards
+  refuse the same names), zombie's check, and a whole-library run with the tier off on the
+  first form.
+- Found by this line's next commit and worth keeping: a probe of the engine-wide cache at
+  a site whose own ways are still empty serves the site without its helper ever running, so
+  the site's ways never fill and the tier compiles it with no feedback (one function lost
+  the recompile that inlines its callee; the loop-cache test caught it). The exemplars probe
+  only from a site that is megamorphic itself (V8 ic/ic.cc:1059-1066; JSC after 8 cases,
+  InlineCacheCompiler.cpp:4680-4752; SpiderMonkey in Megamorphic mode,
+  jit/CacheIR.cpp:1293-1298), and the commit is gated the same way before it is sent.
