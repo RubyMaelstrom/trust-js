@@ -120,3 +120,25 @@ fn two_engines_on_one_thread_answer_through_the_one_stub() {
         }
     }
 }
+
+/// A view past the guard record's clamp of the count (2^31 elements) is declined by generated
+/// code and answered by the native getter, whose count is the view's own. Ignored by default: it
+/// reserves 2 GiB of address space (its zeroed pages are never touched); the getter line's
+/// mutation runs include it.
+#[test]
+#[ignore = "reserves 2 GiB of address space"]
+fn typed_array_count_past_the_clamp_takes_the_native_getter() {
+    for threshold in [0, 1] {
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        engine.set_tier_threshold(threshold);
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var big = new Uint8Array(2 ** 31 + 16); function r(a) { return a.length; }\
+                 var s = 0; for (var i = 0; i < 200; i++) s += r(big); String(s)"
+            ),
+            "429496732800"
+        );
+    }
+}
