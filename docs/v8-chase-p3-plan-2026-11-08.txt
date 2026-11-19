@@ -7870,3 +7870,39 @@ p1d/report.txt, the agents'; the coordinator's check target/p3/stage3/m1b-review
 - Held on the branch: piece 1c, the store table (0931a521: TypeScript -9.6% | -7.0% over
   1b with collections deferred), for an always-wrong creation case at +22% and a Djot row;
   its whole-library "failures" were a test binary rebuilt under a running suite.
+
+F4 part 2 after layer 3: two leftovers landed, and what a fold still reaches, counted
+(09334385; 2026-11-19; target/p3/stage3/f4p2-impl/l4/count-report.txt and l4/s1, the agent's;
+the coordinator's check target/p3/stage3/s1-review).
+- Landed: a debug assertion in the back end that no value with a constant's home is written
+  to a register (it catches the one mutation of layer 3 that nothing caught), and the active
+  global fuse's pointer cached in a thread-local beside the active Agent's tag, set wherever
+  the tag is set, so that a reported store reads one thread-local again (the store micro's
+  row for a fresh global is layer 3's again: 8,169 instructions an iteration in compiled
+  code, 8,181 with the fuses kept with the heap, 8,170 now). The coordinator's rows against
+  the parent: every workload within 0.03%.
+- The count (a probe on main, graph, 200 runs; the predicted change is the executions times
+  the nodes a fold removes, less the folded object's materialization, given for a
+  three-instruction constant and a one-instruction literal load):
+    a typed array held in a global   Mandreel -6.9% to -8.1% (1,849M reads, 1,475M of them
+                                     in loops with calls, where the hoist of part 1 cannot
+                                     reach)
+    a function held in a global      Mandreel -3.6% to -3.9% (`uint`: 355M reads behind
+                                     1,102M callee checks), Earley-Boyer -0.1% to -0.8%
+                                     (a constructor read 133M times)
+    another object                   DeltaBlue and RayTrace +0.15% to -0.15%: built only if
+                                     the materialization is one instruction
+    a Number layer 3 did not fold    every one is stored more than once: nothing to gain
+  Strings, booleans, undefined and null: nothing in any workload; recorded, not built.
+- Decided by the coordinator on it. A folded object is materialized by a literal-pool load,
+  as V8's arm64 code loads an embedded object (macro-assembler-arm64.cc:449); it is no root,
+  as the immediate was none. And layer 4 is split, because the fold proves the object and
+  not the object's own state: 4a folds a typed array's identity and what cannot change (its
+  being a typed array, its kind), and its length and data stay loads from the view; 4b is
+  the dependency the owner approved that morning, in V8's engine-wide form on layer 2's
+  mechanism: a validity source that the first detach of any ArrayBuffer in the engine
+  invalidates, under which a fixed-length view of a buffer that cannot be resized may have
+  its length and data folded. A length folded without it would pass an element's bounds
+  test against a detached or shrunk buffer. Functions follow 4a: the fold proves the
+  callee's identity, and with it what the function object fixes for good (its environment
+  and Realm), not its `prototype`.
