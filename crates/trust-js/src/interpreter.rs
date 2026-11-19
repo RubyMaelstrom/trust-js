@@ -9177,24 +9177,28 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
-        self.dispatch_native_with::<true>(call, this, args)
+        self.dispatch_native_with::<true, { usize::MAX }>(call, this, args)
     }
 
-    /// [`Interp::dispatch_native`] for arguments the caller roots (none, for a getter: see
-    /// [`Interp::try_native_getter`]). A closure's captures are rooted here as there.
-    pub(crate) fn dispatch_native_rooted(
+    /// [`Interp::dispatch_native`] for `N` arguments the caller roots (none for a getter, the
+    /// value for a setter: see [`Interp::try_native_getter`]). A closure's captures are rooted
+    /// here as there. One copy per `N`: each has one caller, which keeps it in line as the
+    /// getter's did when it was the only one (a copy shared by the getter's and the setter's
+    /// calls was made out of line, 8 instructions a native getter's read).
+    pub(crate) fn dispatch_native_rooted<const N: usize>(
         &mut self,
         call: &ObjectKind,
         this: Value,
-        args: &[Value],
+        args: &[Value; N],
     ) -> Result<Value, Abrupt> {
-        self.dispatch_native_with::<false>(call, this, args)
+        self.dispatch_native_with::<false, N>(call, this, args)
     }
 
     /// The body of both: `ROOT_ARGS` roots the arguments, in [`Interp::dispatch_native`]'s
-    /// order, so that every other native call keeps its code.
+    /// order, so that every other native call keeps its code; `COPY` only tells the copies
+    /// apart (the rooted callers' argument count, `usize::MAX` for every other native call).
     #[inline(always)]
-    fn dispatch_native_with<const ROOT_ARGS: bool>(
+    fn dispatch_native_with<const ROOT_ARGS: bool, const COPY: usize>(
         &mut self,
         call: &ObjectKind,
         this: Value,
@@ -11807,14 +11811,39 @@ impl Interp {
             }
             return Ok(());
         };
-        if let Some((calls, pins)) =
-            site.and_then(|(chunk, pc, form, cache)| chunk.setter_calls(pc, form, cache, &setter))
-        {
-            return self
-                .call_setter(setter, receiver, value, calls, pins)
-                .map(|_| ());
+        if !property_read::is_native(&setter) {
+            if let Some((calls, pins)) = site
+                .and_then(|(chunk, pc, form, cache)| chunk.setter_calls(pc, form, cache, &setter))
+            {
+                return self
+                    .call_setter(setter, receiver, value, calls, pins)
+                    .map(|_| ());
+            }
         }
-        self.call_callback(setter, *receiver, &[value]).map(|_| ())
+        self.call_setter_uncached(setter, *receiver, value)
+            .map(|_| ())
+    }
+
+    /// Call(setter, Receiver, « V ») for a setter no store call cache serves: a native setter
+    /// directly (the getter line, a3: [`Interp::try_native_setter`]), anything else by the full
+    /// call. Out of line, so that the store path, which every named store's helper and the VM's
+    /// stores take and which rarely meets a setter, keeps one call returning the call's result
+    /// and its frame: a frame 0x30 bytes larger there (the direct call's result in line) moved
+    /// the stale words the conservative scan finds and kept up to 3.5K more cells alive in
+    /// Djot's first pass (+0.29% instructions, all of it the collector's).
+    #[inline(never)]
+    fn call_setter_uncached(
+        &mut self,
+        setter: Value,
+        receiver: Value,
+        value: Value,
+    ) -> Result<Value, Abrupt> {
+        if property_read::is_native(&setter) {
+            if let Some(result) = self.try_native_setter(&setter, &receiver, value) {
+                return result;
+            }
+        }
+        self.call_callback(setter, receiver, &[value])
     }
 
     /// Call(setter, Receiver, « V »), ECMA-262 §10.1.9.2 step 6, at a store whose helper stub

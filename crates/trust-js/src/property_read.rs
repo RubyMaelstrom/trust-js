@@ -272,27 +272,52 @@ impl Interp {
     }
 
     /// Call(getter, Receiver) (ECMA-262 §10.1.8.1 OrdinaryGet step 8) for a native getter a
-    /// property cache found (P3 stage 3, the getter line, a2): the native itself with the
-    /// receiver and no arguments, with the safepoints and state a call keeps (`Interp::call`,
-    /// `call_dispatch`: the depth and stack check, the amortized collection check, the interrupt
-    /// polls, `constructing` and `new_target` cleared, a pending tail call run; `dispatch_native`'s
-    /// host-callback scope and a closure's captures rooted), and none of the generic call's
-    /// dispatch (the user-getter proofs, the callee's kind and Realm routing, the rooting of an
-    /// empty argument list). As V8's load handler calls a builtin getter or an API getter
-    /// (ic/accessor-assembler.cc:956-966, 571-599), SpiderMonkey's baseline makes a VM call of
-    /// the native (CallNativeGetterResult, jit/BaselineCacheIRCompiler.cpp:678-702) and JSC's
-    /// stub calls a custom getter's function (bytecode/InlineCacheCompiler.cpp:3345-3351). `None`
-    /// for a getter that is no native callable, another Realm's native (the full call switches
-    /// to its Realm), a Realm's `eval`, or with a tail call pending: the caller makes the full
-    /// call.
+    /// property cache found (P3 stage 3, the getter line, a2), and Call(setter, Receiver, « V »)
+    /// (§10.1.9.2 step 6) for a native setter a store's cache found (a3), `args` the call's
+    /// arguments on the caller's frame (none, or the stored value), which the conservative scan
+    /// roots: the native itself with the receiver, with the safepoints and state a call keeps
+    /// (`Interp::call`, `call_dispatch`: the depth and stack check, the amortized collection
+    /// check, the interrupt polls, `constructing` and `new_target` cleared, a pending tail call
+    /// run; `dispatch_native`'s host-callback scope and a closure's captures rooted), and none of
+    /// the generic call's dispatch (the user-accessor proofs, the callee's kind and Realm
+    /// routing, the registration of the argument list). As V8's load handler calls a builtin
+    /// getter or an API getter (ic/accessor-assembler.cc:956-966, 571-599), SpiderMonkey's
+    /// baseline makes a VM call of the native (CallNativeGetterResult,
+    /// jit/BaselineCacheIRCompiler.cpp:678-702) and JSC's stub calls a custom accessor's function
+    /// (bytecode/InlineCacheCompiler.cpp:3345-3369). `None` for a function that is no native
+    /// callable, another Realm's native (the full call switches to its Realm), a Realm's `eval`,
+    /// or with a tail call pending: the caller makes the full call.
     #[inline(never)]
     pub(crate) fn try_native_getter(
         &mut self,
         getter: &Value,
         receiver: &Value,
     ) -> Option<Result<Value, Abrupt>> {
+        self.try_native_accessor(getter, receiver, [])
+    }
+
+    /// [`Interp::try_native_getter`]'s call of a native setter with the value `value`.
+    #[inline(never)]
+    pub(crate) fn try_native_setter(
+        &mut self,
+        setter: &Value,
+        receiver: &Value,
+        value: Value,
+    ) -> Option<Result<Value, Abrupt>> {
+        self.try_native_accessor(setter, receiver, [value])
+    }
+
+    /// The body of both, in line in each and one per argument count (its closure, which the stack
+    /// guard takes, too), so that a getter's call passes no argument list.
+    #[inline(always)]
+    fn try_native_accessor<const N: usize>(
+        &mut self,
+        function: &Value,
+        receiver: &Value,
+        args: [Value; N],
+    ) -> Option<Result<Value, Abrupt>> {
         use crate::interpreter::{execution_stack_exhausted, with_execution_stack};
-        let object = getter.as_obj()?;
+        let object = function.as_obj()?;
         let call = {
             let body = object.borrow();
             if !body.kind.is_native() {
@@ -310,7 +335,11 @@ impl Interp {
             return None;
         }
         #[cfg(test)]
-        TEST_NATIVE_GETTERS.with(|count| count.set(count.get() + 1));
+        if N == 0 {
+            TEST_NATIVE_GETTERS.with(|count| count.set(count.get() + 1));
+        } else {
+            TEST_NATIVE_SETTERS.with(|count| count.set(count.get() + 1));
+        }
         self.depth += 1;
         if execution_stack_exhausted(self.depth) {
             self.depth -= 1;
@@ -328,11 +357,16 @@ impl Interp {
         let saved_ctor = std::mem::replace(&mut self.constructing, false);
         let saved_target = std::mem::replace(&mut self.new_target, Value::Undefined);
         let this = *receiver;
-        // A host getter may delete its own accessor: as in the full call, its body and captures
-        // are held by `dispatch_native_rooted`'s closure arms (an owned payload handle, the
-        // captures rooted), not by the function object; the receiver word is on this frame.
-        let mut result =
-            with_execution_stack(self.depth, || self.dispatch_native_rooted(&call, this, &[]));
+        // A host accessor may delete its own property: as in the full call, its body and
+        // captures are held by `dispatch_native_rooted`'s closure arms (an owned payload handle,
+        // the captures rooted), not by the function object; the receiver word and the
+        // arguments are on the frames above and in the closure, which takes them by value (a
+        // getter's, none, costs it nothing), all on the native stack the collector scans.
+        let interp = &mut *self;
+        let call = &call;
+        let mut result = with_execution_stack(interp.depth, move || {
+            interp.dispatch_native_rooted(call, this, &args)
+        });
         self.constructing = saved_ctor;
         self.new_target = saved_target;
         while result.is_ok() {
@@ -639,6 +673,9 @@ thread_local! {
         std::cell::Cell::new(0)
     };
     pub(super) static TEST_NATIVE_GETTERS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(super) static TEST_NATIVE_SETTERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     pub(super) static TEST_BINDING_GETTERS: std::cell::Cell<[usize; 3]> = const {

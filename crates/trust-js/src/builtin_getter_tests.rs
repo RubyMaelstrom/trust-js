@@ -11,7 +11,10 @@
 //! prototype changed, an own `length`, subclasses, a Proxy on the chain and as the receiver, a
 //! receiver that is no typed array inheriting the getter, numeric-looking names, a detached
 //! buffer, a resizable one shrunk and grown under fixed and length-tracking views, native getters
-//! that throw and re-enter, and another Realm's typed arrays and natives.
+//! that throw and re-enter, and another Realm's typed arrays and natives; and native setters
+//! (a3: the store's way, the setter called directly with the receiver and the value): one that
+//! throws, `__proto__`'s, another Realm's, a getter-only accessor in strict code, one that
+//! re-enters, and one whose behavior a `new.target` would change.
 
 use super::*;
 use crate::bytecode::{
@@ -246,7 +249,39 @@ log('realm ' + out.join(' '));
     "realm 1800 900 2700 300 true/false 600 true/false",
 );
 
-const PROGRAMS: [(&str, (&str, &str)); 8] = [
+const SETTER: (&str, &str) = (
+    r#"var out = [];
+var P = {}; Object.defineProperty(P, 'x', { set: Function.prototype.call, configurable: true });
+var o = Object.create(P), errs = 0;
+for (var i = 0; i < N; i++) { try { o.x = i; } catch (e) { if (e instanceof TypeError) errs++; } }
+out.push(errs);
+var a = {}, b = {}, protos = [a, b], c = 0;
+for (var i = 0; i < N; i++) { var t = {}; t.__proto__ = protos[i & 1]; if (Object.getPrototypeOf(t) === protos[i & 1]) c++; }
+out.push(c);
+var other = typeof $262 !== 'undefined' ? $262.createRealm().global : require('vm').runInNewContext('this');
+var Q = {}; Object.defineProperty(Q, 'y', { set: other.Function.prototype.call });
+var q = Object.create(Q), re = 0;
+for (var i = 0; i < N; i++) { try { q.y = 1; } catch (e) { if (e instanceof other.TypeError && !(e instanceof TypeError)) re++; } }
+out.push(re);
+var G = {}; Object.defineProperty(G, 'z', { get: Date });
+function sset(o) { 'use strict'; o.z = 1; }
+var g = Object.create(G), se = 0;
+for (var i = 0; i < N; i++) { try { sset(g); } catch (e) { if (e instanceof TypeError) se++; } }
+out.push(se);
+var W = {}; Object.defineProperty(W, 'w', { set: Array.prototype.push });
+var wo = Object.create(W);
+for (var i = 0; i < N; i++) wo.w = i;
+out.push(wo.length, wo[N - 1]);
+var D = {}; Object.defineProperty(D, 'd', { set: Date });
+function F() { var o = Object.create(D); o.d = 1; this.ok = 1; }
+var made = 0; for (var i = 0; i < N; i++) made += new F().ok;
+out.push(made);
+log('setter ' + out.join(' '));
+"#,
+    "setter 300 300 300 300 300 299 300",
+);
+
+const PROGRAMS: [(&str, (&str, &str)); 9] = [
     ("replaced", REPLACED),
     ("proto", PROTO),
     ("shadow", SHADOW),
@@ -255,6 +290,7 @@ const PROGRAMS: [(&str, (&str, &str)); 8] = [
     ("detach", DETACH),
     ("throw", THROW),
     ("realm", REALM),
+    ("setter", SETTER),
 ];
 
 #[test]
@@ -454,4 +490,63 @@ fn host_getter_captures_stay_rooted_through_the_direct_call() {
         "42,undefined"
     );
     assert!(native_getters() > before);
+}
+
+fn native_setters() -> usize {
+    property_read::TEST_NATIVE_SETTERS.with(Cell::get)
+}
+
+/// a3: a native setter found by a store's way is called directly with the receiver and the
+/// value, in the VM and from generated code, an embedder's closures and bare natives alike.
+#[test]
+fn native_setters_found_by_ways_are_called_directly() {
+    for tier in [Tier::Bytecode, Tier::Jit] {
+        let mut engine = engine(tier, 0);
+        engine.scope(|cx| {
+            use crate::embed::{NativeCaptures, Value as V};
+            let proto = V::Obj(cx.new_object());
+            let set = cx.new_native_fn(
+                "set h",
+                1,
+                |cx, this, args| {
+                    let n = args.first().and_then(|v| v.as_num_opt()).unwrap_or(0.0);
+                    let old = cx.member_get(&this, "sum")?.as_num_opt().unwrap_or(0.0);
+                    cx.member_set(&this, "sum", V::Num(old + n))?;
+                    Ok(V::Undefined)
+                },
+                NativeCaptures::None,
+            );
+            cx.define_accessor_value(&proto, "h", None, Some(set), false);
+            fn scoped<'s>(
+                cx: &mut crate::embed::Ctx<'s>,
+                this: crate::embed::Value<'s>,
+                args: &[crate::embed::Value<'s>],
+            ) -> Result<crate::embed::Value<'s>, crate::embed::Value<'s>> {
+                let n = args.first().and_then(|v| v.as_num_opt()).unwrap_or(0.0);
+                let old = cx.member_get(&this, "sum")?.as_num_opt().unwrap_or(0.0);
+                cx.member_set(&this, "sum", crate::embed::Value::Num(old + 2.0 * n))?;
+                Ok(crate::embed::Value::Undefined)
+            }
+            let set = V::Obj(cx.make_native("set g", 1, scoped));
+            cx.define_accessor_value(&proto, "g", None, Some(set), false);
+            let global = cx.global_this();
+            cx.member_set(&global, "HostSetters", proto)
+                .expect("global");
+        });
+        let before = native_setters();
+        assert_eq!(
+            evaluate(
+                &mut engine,
+                "var h = Object.create(HostSetters); h.sum = 0;\
+                 function f(o, i) { o.h = i; o.g = i; }\
+                 for (var i = 0; i < 100; i++) f(h, i); String(h.sum)"
+            ),
+            "14850"
+        );
+        assert!(
+            native_setters() - before >= 2 * 90,
+            "{tier:?}: {} direct calls",
+            native_setters() - before
+        );
+    }
 }
