@@ -208,6 +208,27 @@ Each is recorded where the plan line says; none blocks the lines above.
    every tier; not started. The program that shows it: target/p3/stage3/step67-impl/apply/
    facts/f1.js.
 
+12. From the megamorphic line (2026-11-19; target/p3/stage3/mega-impl/design-note.txt, forks F-B
+   to F-D; the coordinator builds on the recommendations meanwhile, each separable): should
+   string constants carry their property key from the moment a chunk is made, as V8, JSC and
+   SpiderMonkey make literals unique names, so that `o["name"]` probes the shared cache by key?
+   Recommended: yes.
+13. The same line, a departure to confirm: a prototype hit in the engine-wide cache keeps a
+   shape check per prototype level, where JSC and SpiderMonkey keep a holder or a hop count
+   under a generation bumped when a prototype changes. Their form rests on a shape that fixes
+   its prototype; here "same shape does not imply same prototype" (bytecode.rs:212-219), so
+   the exemplars' form would first need the object model changed. Recommended: keep the walk
+   now; count separately what prototype-fixing shapes would save across the engine (every
+   prototype check in the caches and in the tier) before proposing that change.
+14. The same line: sites whose caches keep dead shapes (the tier then refuses to lower them).
+   Recommended: V8's in-place overwrite of a way whose receiver shape is already held, and
+   SpiderMonkey's reset of the ways at a major collection (the only exemplar form that retires
+   an object's own earlier shapes); JSC's form needs a shape liveness this collector lacks.
+15. From the graph line (target/p3/stage3/gnext-impl/design-note.txt, fork F2; your open
+   question from step 3c): constant stores of the frame's identity around a helper call
+   (JSC's form, built) or return-address tables (V8's and SpiderMonkey's). The count bounds
+   what the tables could add at 0.29% of any workload. Recommended: keep JSC's form.
+
 ## How the work is done
 
 - A design record before code. Each stage and each step that makes a choice has a note in the plan
@@ -495,19 +516,23 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
      calls; (4) a typed array's data and length through a folded global, the teacher and the
      limit. After part 2 is measured: the dependency on a typed array's buffer, V8's
      engine-wide form.
-  2. Shape facts, second commit (loopfacts-commit2.txt; branch p3-s3-loopfacts3; evidence
-     lf3-impl): the first shape check of an object the loop does not change, moved to the
-     loop's entry edge. Counted before code: Crypto -0.66% predicted at 200 runs. Its first
-     build measured -0.22%: the loop analysis counted operations of blocks that never ran,
-     which the builder makes exits, so Crypto's hot loops were not "quiet". The fix (the
-     analysis skips exactly the blocks the builder makes exits, as the exemplars' forced
-     exits do) is being built as its own first commit, since it also widens the landed loop
-     facts and hoists.
+  2. Shape facts, second commit: LANDED at 14:57 with the never-ran rule before it (e96aa0eb,
+     632b3cc2; the plan's record): Mandreel -10.6% and Crypto -1.8% at graph. What stays out
+     of its reach in Crypto is listed there; nobody is on it.
   3. The graph line after the flip (graph-next.txt; branch p3-s3-gnext; evidence
      gnext-impl, design-note.txt): what inlined frames pay for operations the tier does not
      lower. Counted and decided (the plan's record of the same name): piece 1, the lazy
      context switch with the receiver as an explicit operand, being built; piece 2, the
      polymorphic named store, after it.
+  4. Built-in accessor getters (getter.txt; branch p3-s3-getter; evidence getter-impl): a
+     typed array's length, a Map's size and their kind cost about 830 instructions a read in
+     every tier (GBEMU: 27% to 45% of its instructions). Facts, a one-page note, then the
+     exemplars' form: the site's way for an accessor on the chain, the typed array's getters
+     as field loads, the tier's nodes.
+  5. The megamorphic line (mega.txt, mega-build.txt; branch p3-s3-mega2; evidence
+     mega-impl, design-note.txt): an Array's absent read cached (Vue), then the engine-wide
+     cache probed by generated code (TypeScript). The plan's record "Property operations that
+     call a helper on every execution" has the count and the decisions.
 - NOT STARTED, in the order the counts give (the plan's records of rule B, of the carry and
   of the graph line): the lowerings after the polymorphic store (GetMethodElem, InstanceOf,
   Array.prototype method loads, absent arms, `prototype`, accessors as calls, growing element

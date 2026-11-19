@@ -7461,3 +7461,67 @@ background beside the work, nothing waiting for it; target/p3/stage3/t262-check)
   landing's quick check. The whole library suite is the expensive check (18 to 25 minutes a
   configuration) and stays for changes to every program's default path.
 - Still owed from the flip: the timed Octane table against the reference engines.
+
+Property operations that call a helper on every execution: counted, and what was found in it
+(2026-11-19; target/p3/stage3/mega-impl: design-note.txt, exemplars.txt, count-table.txt,
+stubcheck/, the agent's; the coordinator's micro target/p3/stage3/getter-impl/micro; no engine
+code yet).
+- The count (a probe build's executions, perf on main's fat LTO for the shares; graph | the
+  tier off, share of the workload's instructions in the four property helpers and their
+  stubs): GBEMU 45.1% | 27.2%, TypeScript 23.0% | 22.9%, Vue's steady state 21.9% | 17.2%
+  (its fixture 19.2% | 17.2%), Djot's steady state 3.8% | 4.1%, PdfJS 3.1% | 4.7%, Box2D 2.4%
+  | 1.2%, Mandreel 1.6% | 0.3%, React 0. These are costs of the default configuration as much
+  as of the tier.
+- FOUND: a built-in accessor getter costs about 830 instructions a read in every tier. The
+  coordinator's micro (instructions an iteration, the tier off | graph): a typed array's
+  length 834 | 833, its byteLength 821 | 820, a Map's size 918 | 916, ta.buffer.byteLength
+  1,785 | 1,790, beside an array's length 107 | 17, a string's 39 | 17, a plain object's own
+  `length` 52 | 18. The read takes the generic [[Get]] each time; no site caches it and the
+  tier does not lower it. GBEMU reads a typed array's length 217M times in 200 runs: that is
+  all of its 45% | 27%. Mandreel's 1.6% is the same, and so is Earley-Boyer's
+  `arguments.length` (0.3%). The exemplars cache an accessor read at the site and call the
+  getter directly, and make the typed array's getters field loads (SpiderMonkey in the IC
+  stub, CacheIR.cpp:2494 and :11917-11957; JSC's IntrinsicGetter case and the DFG's
+  GetArrayLength, InlineCacheCompiler.cpp:4388, DFGByteCodeParser.cpp:6207-6225; TurboFan
+  reduces the getter, js-call-reducer.cc:8749). A line of its own from 15:43
+  (briefs/getter.txt, evidence getter-impl): the facts first (why a JS getter has a direct
+  path in the template's stub and a native one has none; what a host's accessor on a
+  prototype costs an embedder), then the site's way for an accessor on the chain, the typed
+  array's getters in line, and the tier's nodes.
+- TypeScript's 23%: 14.9% is named stores that create a property at megamorphic sites (127M
+  at about 1,140 instructions each) or on maps of more than 8 entries (100M; the template's
+  in-line creation refuses those maps); string-keyed reads 3.2%; megamorphic named reads 2.9%
+  (108M, each a stub-cache hit found by Rust code at about 560 instructions; the cache's hit
+  rate is 99.3%); string-keyed stores 1.6%, which have no cache at all.
+- Vue's 22%: 11% is the template's get_prop stub calling user getters directly (71% of the
+  stub's samples) and running Proxy get traps (28%), with two tables' slot-probe loops its
+  hottest instructions (verified by annotation; not yet counted by call); 5.5% is absent
+  named reads on Arrays (`__v_isRef` and its kin: 0.53M at 988 instructions each, which the
+  cache's fill refuses to remember across an Array level); 3.1% string-keyed reads.
+- The exemplars' form for the megamorphic part: one engine-wide cache keyed by receiver shape
+  and unique name, probed by machine code for named and keyed reads, stores with transitions
+  and `in` (V8's StubCache and its builtins, ic/stub-cache.h:38-93,
+  ic/accessor-assembler.cc:3244-3315; JSC's MegamorphicCache probed in line by the DFG and by
+  the baseline handler after 8 cases, runtime/MegamorphicCache.h:35-320; SpiderMonkey's
+  MegamorphicCache and MegamorphicSetPropCache behind a runtime-wide trampoline,
+  vm/Caches.h:156-366, jit/CodeGenerator.cpp:4916-4970). This engine has the cache
+  (Interp::stub_cache) and only Rust probes it.
+- Decided by the coordinator (briefs/mega-build.txt), building from 15:49: first the Array's
+  absent read cached for a name that cannot be an index (one fill rule; Vue's steady state
+  -5.1% predicted), then the cache with its key inside the entry, probed by a process-wide
+  shared stub that the template's slow path and the tier's generic node call before the Rust
+  helper: reads, then stores with creation entries, then string-keyed sites and `in`.
+  Predicted (inferred from micro costs): TypeScript -14.9% at graph and -11.4% with the tier
+  off, Djot's steady state -2.5%, Vue's -1.5%. After those, each on its own note: creations
+  on large maps in line (TypeScript -3.3%, Box2D -1.9%), a string's length and character in
+  the template (PdfJS -1.7%), stale ways retired.
+- With the owner, the recommendation built on meanwhile (the handoff's questions 12 to 14):
+  string constants carry their key from the chunk's making (all three engines make literals
+  unique names); a prototype hit in the cache keeps the per-hop shape walk, a departure,
+  because a shape here does not fix its prototype where V8's map, JSC's structure and
+  SpiderMonkey's shape do; stale ways retired by V8's in-place overwrite and SpiderMonkey's
+  reset at a major collection.
+- Stale ways, counted: negligible in the template (it refills at each miss; its helper calls
+  are at sites with more than four live shapes), real for the tier, which refuses to lower a
+  site whose record keeps dead shapes (GBEMU 17.3M inlined generic loads at sites that are
+  monomorphic today; DeltaBlue's stale walks).
