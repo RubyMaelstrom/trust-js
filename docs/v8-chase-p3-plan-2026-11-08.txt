@@ -6815,3 +6815,107 @@ workload's instructions at graph at 200 runs.
   sit in loops with a call. The first kind needs no dependency and no owner decision; the
   second is owner question 7. The count, a ceiling from a diagnostic build, and the design
   note follow.
+
+Stage 3 step 3g, piece B landed (5dd88e0d, with a test of its own ed4ef848; 2026-11-19;
+target/p3/stage3/step3g-impl, report-b.txt and report-b3.txt, b-note.txt and b-points.txt, the
+agents'; the coordinator's review step3g-impl/review-b-coordinator.txt and checks
+target/p3/stage3/stepb-review). A closure that the compiled function creates and passes to an
+inlined callee that calls it is a known callee there: under TRUST_JS_OPT_INLINE=graph the call
+is built as an inlined frame with no guard ("by literal"), as Maglev reduces a call whose
+target is a creation node (TryReduceCallForNewClosure, maglev-graph-builder.cc:11963-11980).
+React's reducer passes fresh arrows to the self-hosted map and filter, whose calls of them
+were generic calls (4.12M of them at 163 instructions in the steady-state copy).
+- The form. The builder puts a fact on the node that created the closure (its function
+  literal and the environment it captured); the fact reaches an inlined callee's formal bound
+  to that node and nothing else, and a call there whose callee node carries it is that
+  literal's frame, taken before any identity way planned at the call. The frame's free names
+  walk from the creation's environment; its generic operations read the environment from the
+  closure. The closure is a fresh object each time, so the stack and Function#caller find it
+  through a per-interpreter table with one word per function frame, which the frame stores at
+  its entry and every way out clears (its returns, an exit, a throw out of the code). The
+  table is the way to find the closure and never what keeps it alive: the allocator gives
+  the frame's callee a home across every node of its frame, as JSC keeps a closure call's
+  callee recoverable in the machine frame and Maglev in each call's frame state.
+- Measured (fat LTO against main's engine, the coordinator's builds target/p2/lto/e3099886 and
+  661a2ba5; counts-b3*.out, cycles-b3.out). Instructions at graph: React's steady state
+  2,210,289,458 -> 1,347,248,398 (-39.05%), the fixture 263,512,005 -> 211,795,546 (-19.63%);
+  at the splice both equal (+0.00%), and graph against the splice on the new engine -38.87%
+  and -19.59%. Cycles on one X925 core, five rounds at randomized addresses: the steady state
+  -42.1% at graph, the fixture -17.9%, the splice and two controls (DeltaBlue at 200, zlib)
+  flat. Every other workload at graph within 0.1% but TypeScript (+0.85%, and +1.04% with the
+  incremental marker off), which is not this change: see the next record. With the tier off
+  and at the splice the rows are equal to a few hundredths of a per cent but RegExp (-0.11%
+  to -0.12% in all three modes) and PdfJS with the tier off (-0.21%), not attributed; the
+  agent's masked dumps have the templates' and the tier's code identical there (2,174 and
+  1,373 compiles at the splice, 2,589 with the tier off). The verifier sweep, 5 runs at both
+  modes: 42 of 42.
+- Reach. Of 21 workloads only React has such sites, and three of its five arrows take the
+  form; the other two are in call sites the planner skips for its optimized-body budget.
+  Counted, not built: admitting them (the budget doubled) gives the steady state -0.69% and
+  costs the fixture +0.35%, and the same budget grows the other workloads' tier code by 1% to
+  56%. The budget here charges the caller's own size; Maglev's does not
+  (maglev-inlining.cc:100-118). A planner question for every workload, not this line's next
+  piece.
+- Cost. An activation of a code that has such a frame computes its table index once (12
+  instructions); a frame costs about 10 (the test, the store, a clear at each return); a
+  throw out of such a code 15 more on that path; the table is 32 KB an interpreter that
+  compiled one. Counted from the emitter.
+- What the review found in the first form (c7188012), all fixed before landing. (1) A
+  miscompile: a named function expression whose name can be observed has a record of its own
+  between the closure and the creation's environment, so every free name in its frame was
+  read one record short ("me is not a function", and wrong values silently). The frame now
+  reads the name as its callee node and walks the others from one record further out, as the
+  three engines take a function's own name from the callee; test builds trap at the frame's
+  entry where the closure's environment is not what the compile assumed. (2) No rule kept the
+  closure alive while the frame ran a helper that collects and then reads the stack; what
+  covered it was a read on the fallback path that happens to follow the frame in code order.
+  The allocator's rule above replaces the accident. (3) A throw with no handler left the
+  table entry set; the throw path clears it now, the clear at the activation's entry is gone,
+  and debug builds assert at every collection that an entry is set only while its frame
+  runs. The coordinator's guess at what had held the closure (a stale operand word) was wrong.
+- Tests: opt::literal_tests (22), each rule with its mutation (the agents' tables in
+  report-b3.txt: 20 caught, three equivalent and said why); the coordinator's adversarial
+  programs (stepb-review/adv: recursion through the frame, throws, a reassigned and an aliased
+  formal, parameter scopes, `this`, generators, async and class literals, array methods with
+  holes, named function expressions, script, eval and generator bodies) equal the tier off at
+  both modes and under GC stress; the by-literal tests with their neighbours in six
+  configurations (164 each) and under stress; the tier's modules in six (686 each, the
+  agent's run); the other architecture's check, clippy and suite (2,930). The whole library
+  suite with the tier off and on runs after this landing as its confirmation, and at graph
+  in the agent's run; a failure takes the two commits back off local main.
+- Open. The profile note of graph against the splice (Crypto +0.66% and GBEMU +0.22%
+  instructions at 200 runs, Mandreel's cycles) is not written. Splay at graph against the
+  splice with the marker off read +0.50% at 5 runs on the first form (same compiles, exits
+  and discards): not attributed. Both belong to the flip's table, which is taken again now.
+
+TypeScript's two modes (2026-11-19; target/p3/stage3/stepb-review/ts and
+target/p3/stage3/tsmode-impl, the agent's; benchmarks/README.md has the method that follows from
+it). Found by the row above: Octane's TypeScript at 5 runs sits at one of two levels about
+1.1% of its instructions apart, with the incremental marker off as well, and which one a run
+draws depends on the binary and the address layout (main's engine the lower in 10 of 10
+randomized runs, piece B's in 2 of 10, an engine of three days earlier the higher in 8 of 8).
+- Cause. Each run of the benchmark builds a compiler. In the lower mode something the
+  conservative scan finds keeps the previous run's alive, the heap looks larger, and the
+  collector runs less often (8 major collections against 12); in the higher mode that garbage
+  is collected. The root was not found in the time given: the retained closure is a property
+  of an object that 820 others have as their prototype, reached from a cell the agent's walk
+  could not decode (tsmode-impl has the neutral tracing driver and the walk).
+- Its shadow in the tier, which is how it was seen: a reoptimization takes its earlier ways
+  again "each while its callee lives", through a weak reference, so one nested way of
+  TypeFlow.typeCheckName is prepared or not with the same draw. The plan is worth at most
+  0.1% of the difference; the rest is the collector's work.
+- The method: compare the mutator's instructions from a sampled profile (every sample whose
+  call chain passes through a collection is the collector's). Two builds of equal generated
+  code that drew opposite modes, 1.05% apart in total, agree to 0.02% on it.
+- What the exemplars do at such a site, and what is being counted: all three inline a
+  function's code behind a check of the code, not of the one closure, so a dead or replaced
+  closure changes nothing (V8's feedback cell target, maglev-graph-builder.cc:11447-11520;
+  JSC's closure call by executable, CallLinkStatus.cpp:247-263; SpiderMonkey's
+  GuardFunctionScript, CacheIR.cpp:6607-6623). This engine guards the identity only, and its
+  planner declines a site that met several closures of one function. Piece B is the special
+  case where the closure is made in the compiled function. How many calls sit at such sites
+  in each workload is being counted; it decides whether a code-guarded way is the inliner's
+  next piece. A smaller rule (the reoptimization declining such a way whether its callee
+  lives or not) waits on that count. A few other sites meet a dead callee the same way
+  (GBEMU 1, PdfJS 3, TypeScript 10), and the planner drops a whole site for one dead callee
+  (bytecode.rs:11375): recorded, not changed.
