@@ -442,3 +442,9 @@ again. Scratch briefs kept under /tmp for stage 2's steps were lost; stage 3's a
   hoist (its miscompile fixed by the rule that a loop's stores include every inlined
   frame's) are stacked on branch p3-s3-stack under the coordinator's checks and land
   together.
+- A DEFECT OF THE DEFAULT CONFIGURATION IS FIXED ON LOCAL MAIN AND STILL ON ORIGIN (936676c1,
+  2026-11-19; the plan's record "A defect in the default configuration, found and fixed"): the
+  template JIT's in-line top-level assignment to a global could write another global's
+  property after the first global's slot had moved (deleted and added again, or an earlier
+  global removed). It dates from the phase-2 work on slot locations and is in every push
+  since 2026-11-08. A push of main removes it from origin.
