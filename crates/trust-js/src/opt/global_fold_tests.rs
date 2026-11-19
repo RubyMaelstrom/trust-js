@@ -35,7 +35,7 @@ fn vm(program: &str) -> String {
 }
 
 fn folds(on: bool) {
-    super::global_fold::TEST_FOLDS.with(|folds| folds.set(on));
+    super::global_fold::pin_folds_for_test(on);
 }
 
 fn invalidated_exits() -> usize {
@@ -657,4 +657,78 @@ fn the_valid_fact_meets_by_and_and_an_effectful_loops_header_has_none() {
             .count();
         assert!(tests >= 2, "{body}: {tests} tests");
     }
+}
+
+#[test]
+fn a_constant_number_global_folds_by_default() {
+    // Layer 3: no pin, the environment's default (TRUST_JS_OPT_FOLD_GLOBALS unset folds).
+    let source = changed_once();
+    let expected = vm(&source);
+    for graph in [false, true] {
+        TestSwitches {
+            on: true,
+            inline_graph: Some(graph),
+            ..Default::default()
+        }
+        .set();
+        super::global_fold::TEST_FOLDS.with(|folds| folds.set(None));
+        invalidated_exits();
+        take_fired();
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        assert_eq!(eval(&mut engine, &source), expected, "graph {graph}");
+        if std::env::var("TRUST_JS_OPT_FOLD_GLOBALS").as_deref() == Ok("0") {
+            continue;
+        }
+        assert_eq!(take_fired(), (1, 1), "graph {graph}: folded by default");
+        assert_eq!(invalidated_exits(), 1, "graph {graph}");
+    }
+}
+
+#[test]
+fn a_folded_number_is_a_constant_of_the_code() {
+    // `s + K` with K folded: the addition takes K's value as a constant (no check of K's
+    // number-ness), and the folded node needs no register (it is rematerialized).
+    TestSwitches {
+        on: false,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "var K = 5; function f(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + K) | 0; return s; }
+         for (var k = 0; k < 50; k++) f(10);",
+    );
+    let chunk = chunk_of(&mut engine, "f");
+    folds(true);
+    let mut raw = Raw::take_in(&chunk, Some(&engine.interp));
+    let made = super::global_fold::prepare(&engine.interp, &chunk, std::iter::once(&mut raw));
+    folds(false);
+    assert_eq!(made.count(), 1);
+    let snapshot = Snapshot::live(&chunk, &raw);
+    let graph = build(&chunk, &snapshot).expect("f builds").graph;
+    let folded: Vec<usize> = (0..graph.nodes.len())
+        .filter(|&k| matches!(graph.nodes[k].op, NodeOp::FoldedGlobal { .. }))
+        .collect();
+    assert!(!folded.is_empty());
+    for node in &graph.nodes {
+        if matches!(node.op, NodeOp::CheckNumber | NodeOp::CheckInt32) {
+            assert!(
+                !node
+                    .inputs
+                    .iter()
+                    .any(|input| folded.contains(&input.index())),
+                "a check of the folded value: {:?}",
+                node.op
+            );
+        }
+    }
+    assert!(super::regalloc::rematerializable(&NodeOp::FoldedGlobal {
+        word: Value::Num(5.0).bits()
+    }));
+    assert!(!super::regalloc::rematerializable(&NodeOp::FoldedGlobal {
+        word: crate::value::PACK_OBJ | 0x1000
+    }));
 }

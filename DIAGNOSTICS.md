@@ -248,6 +248,13 @@ comment/example in the same change.
   fallback, at the discard or, deferred there for executable capacity, at a later entry. Each
   part's time leaves out the log's own printing. The main thread's share of the tier's compiles
   is then the main-thread lines and the compile and refusal lines `on the main thread`.
+  `TRUST_JS_OPT_FOLD_GLOBALS=0` turns off the tier's fold of global properties (F4 part 2;
+  measurement only): by default a compile reads a global-object property whose value is a
+  Number and which the realm's global fuse holds Constant as a constant of its code, under a
+  dependency the property's change, removal or shadowing fires (the code exits `Invalidated`
+  at its next test, once, and is discarded; three such discards and the function folds no
+  global). `TRUST_JS_OPT_LOG` prints `[opt] folds <n> globals of <name>` per compile and, at
+  exit, the invalidations among the global stores' census.
   `TRUST_JS_OPT_INLINE` chooses how the tier inlines (P3 stage 3). `graph`, the default since
   2026-11-19 (any value but `splice` too), inlines in the tier's graph; `splice` keeps the
   splices above for every plan. At `graph`: a function whose inline plan's ways all call

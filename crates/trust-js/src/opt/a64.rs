@@ -1766,7 +1766,7 @@ impl Gen<'_> {
     fn const_word(&self, v: NodeIx) -> u64 {
         use crate::value::Value;
         match self.graph.node(v).op {
-            NodeOp::ConstTagged(bits) => bits,
+            NodeOp::ConstTagged(bits) | NodeOp::FoldedGlobal { word: bits } => bits,
             NodeOp::ConstF64(bits) => Value::Num(f64::from_bits(bits)).bits(),
             NodeOp::ConstI32(x) => Value::Num(f64::from(x)).bits(),
             NodeOp::ConstBool(b) => Value::Bool(b).bits(),
@@ -1779,7 +1779,10 @@ impl Gen<'_> {
     /// A constant node's bits in its own representation (what a register of its class holds).
     fn const_bits(&self, v: NodeIx) -> u64 {
         match self.graph.node(v).op {
-            NodeOp::ConstTagged(bits) | NodeOp::ConstF64(bits) | NodeOp::ConstEnv(bits) => bits,
+            NodeOp::ConstTagged(bits)
+            | NodeOp::ConstF64(bits)
+            | NodeOp::ConstEnv(bits)
+            | NodeOp::FoldedGlobal { word: bits } => bits,
             NodeOp::ConstI32(x) => u64::from(x as u32),
             NodeOp::ConstBool(b) => u64::from(b),
             _ => unreachable!("a constant node"),

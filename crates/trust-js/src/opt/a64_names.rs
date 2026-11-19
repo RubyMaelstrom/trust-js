@@ -128,7 +128,9 @@ impl Gen<'_> {
                 self.a.cbnz(X17, false, site);
             }
             NodeOp::FoldedGlobal { word } => {
-                if !unused {
+                // A Number's is a constant each use materializes (`regalloc::rematerializable`);
+                // an object's is made once into its home.
+                if !unused && self.home(n) != Home::Const {
                     let dst = self.gp_dst(n);
                     self.a.mov_imm64(dst, word);
                     self.gp_done(n, dst);

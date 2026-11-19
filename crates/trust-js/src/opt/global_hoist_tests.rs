@@ -229,6 +229,8 @@ fn epoch_expected() -> Vec<String> {
 
 #[test]
 fn a_recompile_after_an_epoch_move_loads_the_globals_at_the_entry_again() {
+    // The unfolded read's checks (F4 part 1): the fold of its Number globals pinned off.
+    super::global_fold::pin_folds_for_test(false);
     // Each deletion moves the global object's epoch: the code exits at its loop's entry, where its
     // reads' checks are, for the reads' reason (WrongName), until its discard; the recompile reads
     // the new epoch and checks it at the entry again, so the second deletion's exits are there too.
@@ -266,6 +268,8 @@ fn a_recompile_after_an_epoch_move_loads_the_globals_at_the_entry_again() {
 
 #[test]
 fn an_entry_checks_exit_flags_its_reads_with_the_proof_and_not_the_header() {
+    // The unfolded read's checks (F4 part 1): the fold of its Number globals pinned off.
+    super::global_fold::pin_folds_for_test(false);
     // The entry's global-object checks prove both of the loop's reads, which run every
     // iteration: after the epoch's move the VM, resumed at the header, ran them (their caches
     // refilled), so the exit flags each with the proof its check expected, as its own exit would
@@ -712,6 +716,8 @@ fn exits_discards_compiles(
 
 #[test]
 fn an_epoch_moved_under_a_read_that_runs_costs_what_the_unhoisted_read_costs() {
+    // The unfolded read's checks (F4 part 1): the fold of its Number globals pinned off.
+    super::global_fold::pin_folds_for_test(false);
     // del and acc: every move is followed by runs that read `step`, so the hoisted form exits,
     // discards and recompiles exactly as often as the unhoisted one, at the splice and at graph.
     for kind in ["del", "acc"] {
@@ -740,6 +746,8 @@ fn an_epoch_moved_under_a_read_that_runs_costs_what_the_unhoisted_read_costs() {
 
 #[test]
 fn an_epoch_moved_under_a_read_that_does_not_run_costs_one_cycle() {
+    // The unfolded read's checks (F4 part 1): the fold of its Number globals pinned off.
+    super::global_fold::pin_folds_for_test(false);
     // blind: the unhoisted read never runs after the warm-up and never exits; the hoisted one's
     // entry check fails at the first move, the read did not run since the compile, so the
     // discard flags a hoisting failure at the read: one exit-limit cycle and one discard, then
@@ -766,6 +774,8 @@ fn an_epoch_moved_under_a_read_that_does_not_run_costs_one_cycle() {
 
 #[test]
 fn each_read_an_entry_check_proves_is_judged_by_its_own_cache() {
+    // The unfolded read's checks (F4 part 1): the fold of its Number globals pinned off.
+    super::global_fold::pin_folds_for_test(false);
     // The loop reads `a` every iteration and `b` and `c` on a path that stops running; the
     // entry's epoch check proves all three. After a move the VM ran `a` (its cache refilled) and
     // not `b` or `c`: the discard flags `a` WrongName with the proof and `b` and `c` hoisting

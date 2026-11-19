@@ -2377,6 +2377,8 @@ fn tier_code(engine: &mut Engine, name: &str) -> Option<Rc<crate::jit::JitCode>>
 
 #[test]
 fn a_global_read_in_a_hot_loop_survives_additions_and_exits_once_a_deletion_moves_the_epoch() {
+    // The unfolded read's checks (F4 part 1): the fold of its Number globals pinned off.
+    super::global_fold::pin_folds_for_test(false);
     // Additions append slots: no exit. A deletion closes its gap and moves the later slots: the
     // epoch moved, the code exits (WrongName) until its discard, and the recompile reads the new
     // slots under the new epoch, without exits.

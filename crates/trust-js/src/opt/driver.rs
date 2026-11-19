@@ -988,6 +988,13 @@ fn prepare(
     // A graph-inlined call's guard compares the realm's global environment as well (step 2).
     let pin = (off_thread || snapshot.reads_global_names_of(genv) || inlining.is_some())
         .then(|| crate::interpreter::Env::downgrade(&i.global_env));
+    if log_enabled() && held.folds.count() > 0 {
+        log_line!(
+            "[opt] folds {} globals of {}",
+            held.folds.count(),
+            name(chunk)
+        );
+    }
     let mut switches = a64::Switches::read(chunk);
     switches.valid_word = held.folds.valid_word();
     let job = Job {

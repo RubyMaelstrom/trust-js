@@ -17,8 +17,8 @@
 //!   profile is the teacher, so a hot function under many globals that each change once ends
 //!   in the tier without folds rather than in template code.
 //!
-//! Layer 2 folds only under a test's switch (`TEST_FOLDS`): the lists, the word, the exit and
-//! the rules, driven by tests; release builds fold nothing.
+//! Folded: Numbers (layer 3), whose word is a constant of the code (no object, nothing to
+//! root). TRUST_JS_OPT_FOLD_GLOBALS=0 turns the fold off, for measurement.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -34,24 +34,30 @@ pub(crate) const FOLD_LIMIT: u8 = 3;
 
 #[cfg(test)]
 thread_local! {
-    /// Whether this thread's compiles fold Number globals (tests; layer 2's only fold).
-    pub(crate) static TEST_FOLDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Whether this thread's compiles fold globals, whatever the environment says (tests: a test
+    /// of the unfolded reads pins it off); None: as the environment says.
+    pub(crate) static TEST_FOLDS: std::cell::Cell<Option<bool>> =
+        const { std::cell::Cell::new(None) };
     /// Whether an Invalidated discard counts the function's R as other discards do (tests:
     /// R-3's two forms, measured by the e4 micro). Default: counted.
     pub(crate) static TEST_INVALIDATION_COUNTS_R: std::cell::Cell<bool> =
         const { std::cell::Cell::new(true) };
 }
 
-/// Whether compiles fold globals now.
+/// Whether compiles fold globals: unless TRUST_JS_OPT_FOLD_GLOBALS=0 (measurement only), as
+/// the owner decided (the design's j3).
 fn folds_enabled() -> bool {
     #[cfg(test)]
-    {
-        TEST_FOLDS.with(std::cell::Cell::get)
+    if let Some(on) = TEST_FOLDS.with(std::cell::Cell::get) {
+        return on;
     }
-    #[cfg(not(test))]
-    {
-        false
-    }
+    env_value!("TRUST_JS_OPT_FOLD_GLOBALS") != Some("0")
+}
+
+/// Pin the fold on or off on this thread, whatever the environment says (tests).
+#[cfg(test)]
+pub(crate) fn pin_folds_for_test(on: bool) {
+    TEST_FOLDS.with(|folds| folds.set(Some(on)));
 }
 
 /// What a compile folded (see the module's doc): the running realm's global fuse, each folded
@@ -67,6 +73,11 @@ impl Folds {
     /// The code's validity word, where the compile folds.
     pub(crate) fn valid(&self) -> Option<&Arc<AtomicU32>> {
         self.valid.as_ref()
+    }
+
+    /// The folded properties (the log's).
+    pub(crate) fn count(&self) -> usize {
+        self.deps.len()
     }
 
     /// The validity word's address, 0 where the compile folds nothing (`a64::Switches`).
