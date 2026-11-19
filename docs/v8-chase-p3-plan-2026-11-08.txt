@@ -7809,3 +7809,64 @@ Validation again, main 87fe41bf (2026-11-19 19:18; with the fold of Number globa
 default, layers 2 and 3 and the fuse change, an Array's cached absence, the cache's entry
 layout; in the background): Test262 with the tier on and eager at graph 53,572 of 53,575
 (the same three); difftest 138 agree with the tier off, eager, and eager with forced exits.
+
+The megamorphic line's piece 1b landed: megamorphic named reads probe the engine-wide cache
+from generated code (2e725cf9; 2026-11-19; target/p3/stage3/mega-impl, p1/report.txt, p1c/ and
+p1d/report.txt, the agents'; the coordinator's check target/p3/stage3/m1b-review).
+- The rule. At a named-read site whose own ways carry the generic mark, the template's
+  shared read stubs probe the engine-wide cache when the ways miss, before the Rust helper:
+  the entry's key and shape compared, then own data, a walk of the chain by shapes, absence
+  or a key-checked Array entry served in generated code, and the hit PROMOTED into the
+  site's ways as the Rust helper's hit is. A receiver that is not plain skips the cache; an
+  entry the stub cannot serve is refused right after the key compare. The cache's address
+  comes through the context (two engines on one thread: tested).
+- Three things this piece learnt, each measured before it was changed:
+  1. The gate. The first form probed from every site whose ways missed, an empty site among
+     them: a new site was then served from another site's entry, its helper never ran, its
+     own ways never filled, and the tier compiled it with no feedback (the loop-cache test
+     caught it: one function lost the recompile that inlines its callee). The exemplars
+     probe only from a megamorphic site (V8 ic/ic.cc:1059-1066; JSC after 8 cases,
+     InlineCacheCompiler.cpp:4680-4752; SpiderMonkey in Megamorphic mode,
+     jit/CacheIR.cpp:1293-1298).
+  2. The promotion. Gated but not promoting, the piece gained TypeScript 1.9% with the tier
+     off and lost 0.1% at graph (collections deferred), and cost GBEMU, Djot and Vue 0.1% to
+     0.6%: the Rust helper's hit copies the entry into the site's ways, so a site of five to
+     eight shapes converges on its ways (four baked into code compiled warm, four live) and
+     stops asking; the stub's hit did not, and those sites paid a failed way loop and a probe
+     on every read (+32 instructions a read in four micros).
+  3. The plain test before a megamorphic site's ways (GBEMU's typed arrays, until the
+     getter line gives them ways of their own).
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/bee46dca against main's
+  ab01e00e; 5 fixed runs; graph | the tier off): TypeScript -3.78% | -3.33% with
+  collections deferred (-2.46% | -3.03% plain), GBEMU -2.28% | -1.37%, Djot's steady state
+  -0.11% | -0.11%, Octane's mean -0.41% | -0.31% deferred; Vue level; Richards +0.04% at
+  graph (the key and the gate at sites whose ways converge: +2.5 instructions a read there,
+  the agent's micro), accepted. The agent's micro of a compact site with eight shapes
+  rotating: 589 instructions a read to 150 with the tier off; always wrong (6,000 shapes at
+  one site): +4.4% to +4.6% on that path.
+- The census behind the next step (a VM census of every named read's receiver shape):
+  TypeScript's reads at megamorphic sites are 8.5% of its named reads, and most are at
+  sites that see more than 8 shapes (by the fewest shapes covering 99% of a site's
+  executions: 5-8 shapes 12.9%, 9-16 64.6%, 17-64 15.5%); Vue's are at two sites of 5 to 8.
+  At a site that keeps churning, promotion costs about 54 instructions a read, where the
+  exemplars' megamorphic site has no ways at all: a threshold above which a site probes
+  first follows as its own commit, its per-site counter's memory measured first.
+- Checked: the coordinator's 60 adversarial programs at seven modes and against main's
+  engine, and under GC stress at graph and with the tier off: none differs (three new ones
+  for megamorphic reads, each agreeing with Node first: one site over 24 shapes with own,
+  inherited, absent and accessor properties while prototypes and receivers change; names
+  found one to five levels up with Proxies, a null prototype and primitives among the
+  receivers; megamorphic method calls from an inlined callee with a getter that throws);
+  the whole library with the tier off in a clean environment on the landing tree: 3,808
+  passed, and the one failure main's own (below); the agent's tier modules with the tier on
+  (766 passed), the verifier sweep, Test262 53,572 of 53,575, four mutations of the new
+  rules.
+- A test broken by piece 1a and fixed forward (37cc79b7): ab01e00e removed
+  Interp::stub_cache_names and its inventory entry and left the memory-inventory test's
+  count at 148 (the inventory has 147); the test failed on main from 17:55 until 19:32. The
+  same lesson as the loop-cache test's: 1a landed on its own tests, programs and counts.
+  After a landing that touches more than the tier the coordinator now runs the whole
+  library in the background on spare CPUs.
+- Held on the branch: piece 1c, the store table (0931a521: TypeScript -9.6% | -7.0% over
+  1b with collections deferred), for an always-wrong creation case at +22% and a Djot row;
+  its whole-library "failures" were a test binary rebuilt under a running suite.
