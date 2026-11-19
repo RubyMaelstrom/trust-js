@@ -8316,3 +8316,46 @@ Validation in the background, 2026-11-19 23:56, on 93ee15f6 (the functions fold 
 fix in): Test262 with the tier on and eager at graph 53,572 of 53,575 (the three known);
 difftest 138 agree in three configurations (the tier off, eager, forced exits)
 (target/p3/stage3/t262-check/t262-93ee15f6.log, difftest-93ee15f6.log).
+
+The megamorphic line: Reflect.set probes the store table first (7cf4f19a, with a test commit
+7e7e0a6a; landed 2026-11-20 00:05; target/p3/stage3/mega-impl/p1f/cure-report.txt and
+report.txt, the agent's; the coordinator's check target/p3/stage3/rs-review).
+- What the store table (52bc29a4) had cost Vue, found: not the ungated Rust probe and fill
+  the line first suspected (a gate on the site's generic mark was built, measured level on
+  Vue by randomized runs, and refused), nor the Interp's layout, the generated probe or the
+  token. Reflect.set's fast path ran the whole store path on fresh scratch ways, about 140
+  instructions a call that no later call could reuse, and Vue's reactive set trap makes one
+  per reactive write (100,991 in its steady state).
+- What it is: Reflect.set's fast path probes the store table once before the scratch ways,
+  through one hit rule (Interp::store_table_commit) that the store path's own probe now
+  uses too; a miss hands the entry it met to the fill, so the table is probed once a store.
+  The cases are the full path's and no more: an ordinary, ic-plain target; the receiver
+  absent, the target, or a Proxy of it with neither a getOwnPropertyDescriptor nor a
+  defineProperty trap. V8's and JSC's Reflect.set take their generic [[Set]]
+  (builtins-reflect.cc:72-99; runtime/ReflectObject.cpp:244-245); the fast path is this
+  engine's own.
+- Measured: the agent's rows, ten randomized-address runs a side with collections
+  deferred: Vue's fixture -0.141% at graph and -0.118% with the tier off, its steady state
+  -0.143% and -0.133%; TypeScript level (-0.025% and +0.007%, SE 0.026%); the always-wrong
+  creation micro level. The coordinator's fixed-address tables agree: Vue -0.14% to -0.19%
+  in all four rows, plain and deferred; TypeScript -0.09% and -0.06% deferred (its plain
+  -1.0% at graph is its collector's mode).
+- Checked: the coordinator's 56 adversarial programs at seven modes and against main's
+  engine, GC stress on the store programs: none differs. One new, agreeing with Node
+  first: Reflect.set at one site over forty shapes, updates and creations; receivers that
+  are the target, another object, a primitive, undefined, a Proxy with no trap, with a
+  defineProperty trap, with a getOwnPropertyDescriptor trap, with a set trap; setters and
+  getter-only accessors on the target and its chain; frozen, sealed and non-extensible
+  targets, a read-only slot own and inherited; Array and typed-array targets, `length`,
+  index and symbol keys; a prototype that gains a setter in mid-run. The agent's
+  mutations: six caught; the writability test dropped is not and cannot be (the shape
+  keys the attributes; the live test stays as the ways keep theirs). The whole library with
+  the tier off on its engine: 3,847 passed, 0 failed. The x86-64 host's check, clippy and
+  Windows check: 0.
+- LEFT OPEN, the line's tests that count: jit::mega_store_tests' tests assert exact counts
+  of helper calls and table probes, which depend on process-wide state (the creation epoch,
+  the call caches' epoch) that concurrent tests move. On main they failed 2 runs of 6 with
+  the nearest filter; with 7e7e0a6a (a pass is checked only when the creation epoch stood
+  still) 2 of 20, one with no cause found. They passed in both whole-library runs of that
+  night. The fix is the next commit of the line: each such test runs its body in a child
+  process of the test binary (jit_construct_tests.rs's run_alone), exit 20 of 20.
