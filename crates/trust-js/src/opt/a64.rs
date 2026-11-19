@@ -1128,6 +1128,10 @@ struct Gen<'a> {
     /// The code's validity word's address, a literal after the stubs (F4 part 2, layer 2:
     /// `CheckCodeValid`), bound only where a test reads it.
     l_valid: usize,
+    /// The words of the folded objects the code loads (F4 part 2, layer 4a), each a literal
+    /// after the validity word's, with its label: one load a definition, as V8's arm64 loads
+    /// an embedded object from its literal pool.
+    folded_literals: Vec<(u64, usize)>,
     l_dsave: usize,
     /// The epilogues' d8..d15 restore groups.
     drestore: (usize, usize),
@@ -1331,6 +1335,7 @@ impl<'a> Gen<'a> {
             l_exit_stub,
             l_trap,
             l_valid,
+            folded_literals: Vec::new(),
             l_dsave: 0,
             drestore: (0, 0),
             exits: Vec::new(),
@@ -1459,6 +1464,13 @@ impl<'a> Gen<'a> {
         if self.a.literal_referenced(self.l_valid) {
             exported.push(self.l_valid);
         }
+        exported.extend(self.folded_literals.iter().map(|&(_, label)| label));
+        debug_assert!(
+            self.folded_literals
+                .iter()
+                .all(|(_, label)| exported.contains(label)),
+            "a folded object's literal is data the FP scan skips"
+        );
         let fp_callee_saved = self.a.writes_callee_saved_fp();
         if self.a.failed().is_some() {
             return Err(Refusal::whole("an operand no instruction encodes"));
@@ -2479,7 +2491,8 @@ impl Gen<'_> {
             | NodeOp::CheckEnvGeneration { .. }
             | NodeOp::LoadGlobalLexical { .. }
             | NodeOp::CheckCodeValid
-            | NodeOp::FoldedGlobal { .. } => self.lower_name(n)?,
+            | NodeOp::FoldedGlobal { .. }
+            | NodeOp::FoldedCell => self.lower_name(n)?,
             NodeOp::EntrySlot(slot) | NodeOp::FrameSlot(slot) => {
                 if !unused {
                     let dst = self.gp_dst(n);

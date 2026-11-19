@@ -754,6 +754,16 @@ impl Builder<'_> {
         };
         self.check_identity(st, cx, check, object);
         if let Some(fold) = fold {
+            // A folded object's word is a value of the epoch, as a load's (layer 4a): one node
+            // a property an epoch, which an effect ends (`st.fields`).
+            if fold.typed.is_some() {
+                if let Some(&value) = st.fields.get(&(object, location)) {
+                    return value;
+                }
+                let value = self.folded_global_read(st, cx, fold);
+                st.fields.insert((object, location), value);
+                return value;
+            }
             return self.folded_global_read(st, cx, fold);
         }
         if !st.names.epoch {
@@ -804,12 +814,22 @@ impl Builder<'_> {
             );
             st.names.valid = true;
         }
-        self.add(
+        let word = self.add(
             NodeOp::FoldedGlobal { word: fold.word },
             &[],
             Rep::Tagged,
             pc,
-        )
+        );
+        if let Some(kind) = fold.typed {
+            // A typed array (layer 4a): what its identity fixes for the object's life, value
+            // facts as CheckObject's and CheckElements' are: an object (its cell, untagged with
+            // no test), a typed array of its view's kind. Not its length or data: a detach or a
+            // resize changes them under the same object, so TypedLength and TypedData stay.
+            let cell = self.add(NodeOp::FoldedCell, &[word], Rep::Cell, pc);
+            self.relate(st, word, cell);
+            st.kinds.insert(word, ElemKind::Typed(Some(kind)));
+        }
+        word
     }
 
     /// A script-level lexical's read (see the module's doc), the site's view `view`.

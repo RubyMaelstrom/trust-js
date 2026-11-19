@@ -129,10 +129,25 @@ impl Gen<'_> {
             }
             NodeOp::FoldedGlobal { word } => {
                 // A Number's is a constant each use materializes (`regalloc::rematerializable`);
-                // an object's is made once into its home.
+                // an object's is made once into its home (R-2), loaded from the code's literal
+                // pool (one instruction, as V8's arm64 loads an embedded object: MacroAssembler::
+                // Mov, codegen/arm64/macro-assembler-arm64.cc:449). The literal is no root: the
+                // global holds the object while the code's word is clear, and the home holds
+                // it past an effect.
                 if !unused && self.home(n) != Home::Const {
                     let dst = self.gp_dst(n);
-                    self.a.mov_imm64(dst, word);
+                    let label = self.folded_literal(word);
+                    self.a.ldr_literal_label(dst, label);
+                    self.gp_done(n, dst);
+                }
+            }
+            NodeOp::FoldedCell => {
+                // The folded object's cell, its word's payload: no test (`verify::folded_reads`
+                // proves the input a folded object's word).
+                if !unused {
+                    let word = self.gp(node.inputs[0], X16);
+                    let dst = self.gp_dst(n);
+                    self.a.ubfx(dst, word, 0, 48);
                     self.gp_done(n, dst);
                 }
             }
@@ -162,7 +177,8 @@ impl Gen<'_> {
     /// reads it. A literal load reaches 1 MiB, which relaxation at most doubling the code keeps
     /// for a code under 512 KiB before it; a larger code that folds is refused.
     pub(super) fn emit_valid_literal(&mut self) -> Result<(), Refusal> {
-        if !self.a.literal_referenced(self.l_valid) {
+        let valid = self.a.literal_referenced(self.l_valid);
+        if !valid && self.folded_literals.is_empty() {
             return Ok(());
         }
         if self.a.len_insns() >= 1 << 17 {
@@ -170,10 +186,29 @@ impl Gen<'_> {
                 "a code that folds a global past a literal's reach",
             ));
         }
-        let address = self.switches.valid_word as u64;
-        self.a.bind(self.l_valid);
-        self.a.word(address as u32);
-        self.a.word((address >> 32) as u32);
+        if valid {
+            let address = self.switches.valid_word as u64;
+            self.a.bind(self.l_valid);
+            self.a.word(address as u32);
+            self.a.word((address >> 32) as u32);
+        }
+        // The folded objects' words (layer 4a), data the FP scan skips (exported in `finish`).
+        for k in 0..self.folded_literals.len() {
+            let (word, label) = self.folded_literals[k];
+            self.a.bind(label);
+            self.a.word(word as u32);
+            self.a.word((word >> 32) as u32);
+        }
         Ok(())
+    }
+
+    /// The label of `word`'s literal (layer 4a), one per folded object a code loads.
+    fn folded_literal(&mut self, word: u64) -> usize {
+        if let Some(&(_, label)) = self.folded_literals.iter().find(|&&(w, _)| w == word) {
+            return label;
+        }
+        let label = self.a.new_label();
+        self.folded_literals.push((word, label));
+        label
     }
 }

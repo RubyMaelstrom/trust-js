@@ -732,3 +732,187 @@ fn a_folded_number_is_a_constant_of_the_code() {
         word: crate::value::PACK_OBJ | 0x1000
     }));
 }
+
+// Layer 4a: a typed array's identity and the facts it fixes for the object's life (an object, a
+// typed array, its view's kind); its length and data stay loads (a detach or a resize changes
+// them under the same object; 4b's dependency is a separate piece).
+
+/// A typed array `HEAP` read in `f`'s loop after a call each iteration (a new effect epoch, so a
+/// folded read each iteration), warmed; `then` runs after the warm-up, then `f` again.
+fn typed_program(decl: &str, then: &str) -> String {
+    format!(
+        "{decl}
+         for (var j = 0; j < 64; j++) HEAP[j] = j * 3;
+         function h() {{}}
+         function f(n) {{ var s = 0; for (var i = 0; i < n; i++) {{ s = (s + (HEAP[i & 63] | 0) + (HEAP[(i + 1) & 63] | 0)) | 0; h(); }} return s; }}
+         var t = 0; for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+         {then}
+         for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+         t"
+    )
+}
+
+#[test]
+fn a_folded_typed_array_drops_its_object_and_kind_checks_and_keeps_its_length_and_data() {
+    let source = typed_program("var HEAP = new Int32Array(64);", "");
+    let graph = folded_graph(&source, "f");
+    assert_eq!(super::verify::verify_folded_reads(&graph), Ok(()));
+    let is = |k: NodeIx, f: &dyn Fn(&NodeOp) -> bool| f(&graph.node(k).op);
+    let object_fold = |op: &NodeOp| matches!(op, NodeOp::FoldedGlobal { word } if word >> 48 == crate::value::PACK_OBJ >> 48);
+    let count = |f: &dyn Fn(&Node) -> bool| graph.nodes.iter().filter(|node| f(node)).count();
+    assert!(count(&|node| object_fold(&node.op)) >= 1, "HEAP folds");
+    assert!(
+        count(&|node| node.op == NodeOp::FoldedCell && is(node.inputs[0], &object_fold)) >= 1,
+        "its cell untagged with no test"
+    );
+    assert_eq!(
+        count(&|node| node.op == NodeOp::CheckObject && is(node.inputs[0], &object_fold)),
+        0,
+        "no CheckObject of the folded word"
+    );
+    assert_eq!(
+        count(&|node| matches!(node.op, NodeOp::CheckElements(_))
+            && is(node.inputs[0], &|op| *op == NodeOp::FoldedCell)),
+        0,
+        "no kind check of the folded cell"
+    );
+    for (what, op) in [
+        ("TypedView", NodeOp::TypedView),
+        ("TypedLength", NodeOp::TypedLength),
+    ] {
+        assert!(count(&|node| node.op == op) >= 1, "{what} stays");
+    }
+    assert!(
+        count(&|node| matches!(node.op, NodeOp::TypedData { .. })) >= 1,
+        "TypedData stays"
+    );
+    // One folded node an epoch, as a load's (the loop reads HEAP twice an iteration).
+    assert!(
+        count(&|node| object_fold(&node.op)) <= count(&|node| node.op == NodeOp::CheckCodeValid),
+        "a folded object read twice in an epoch is one node"
+    );
+    // The verifier refuses a FoldedCell of a word that is no folded object's.
+    let mut wrong = graph.clone();
+    let folded = (0..wrong.nodes.len())
+        .find(|&k| object_fold(&wrong.nodes[k].op))
+        .expect("a folded object");
+    wrong.nodes[folded].op = NodeOp::FoldedGlobal {
+        word: Value::Num(1.0).bits(),
+    };
+    assert!(super::verify::verify_folded_reads(&wrong).is_err());
+}
+
+#[test]
+fn a_typed_array_global_the_tier_declines_is_not_folded() {
+    // A BigInt64Array's view is declined (its kind byte is no TypedKind): no fold, no facts.
+    TestSwitches {
+        on: false,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Bytecode);
+    eval(
+        &mut engine,
+        "var B = new BigInt64Array(8); function f() { return B[1]; } for (var k = 0; k < 50; k++) f();",
+    );
+    let chunk = chunk_of(&mut engine, "f");
+    folds(true);
+    let mut raw = Raw::take_in(&chunk, Some(&engine.interp));
+    let made = super::global_fold::prepare(&engine.interp, &chunk, std::iter::once(&mut raw));
+    folds(false);
+    assert_eq!(made.count(), 0);
+}
+
+#[test]
+fn a_folded_typed_array_replaced_once_invalidates_its_code_once() {
+    let source = typed_program(
+        "var HEAP = new Int32Array(64);",
+        "HEAP = new Int32Array(64); for (var j = 0; j < 64; j++) HEAP[j] = j * 5;",
+    );
+    let expected = vm(&source);
+    for graph in [false, true] {
+        let run = run(&source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
+        assert_eq!(run.fired, (1, 1), "graph {graph}: {run:?}");
+        assert_eq!(
+            (run.invalidated, run.discards),
+            (1, 1),
+            "graph {graph}: {run:?}"
+        );
+        assert!(run.compiles >= 2, "graph {graph}: {run:?}");
+    }
+}
+
+#[test]
+fn a_typed_array_global_replaced_every_call_is_never_folded() {
+    let source = "var HEAP = new Int32Array(64);
+         function f(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + (HEAP[i & 63] | 0)) | 0; return s; }
+         var t = 0;
+         for (var k = 0; k < 600; k++) { HEAP = new Int32Array(64); HEAP[k & 63] = k; t = (t + f(200)) | 0; }
+         t";
+    let expected = vm(source);
+    for graph in [false, true] {
+        let run = run(source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
+        assert_eq!(run.fired, (0, 0), "graph {graph}: {run:?}");
+        assert_eq!(run.invalidated, 0, "graph {graph}: {run:?}");
+    }
+}
+
+#[test]
+fn a_folded_typed_arrays_own_state_changed_under_it_reads_as_the_vm() {
+    // The property keeps the same object; its buffer detached (transfer), or its resizable
+    // buffer shrunk under the fixed-length view: the fold assumed neither its length nor its
+    // data, so TypedData's test (Detached) and the bounds test see it. No list fires.
+    for (decl, then) in [
+        ("var HEAP = new Int32Array(64);", "HEAP.buffer.transfer();"),
+        (
+            "var RAB = new ArrayBuffer(256, { maxByteLength: 512 }); var HEAP = new Int32Array(RAB, 0, 64);",
+            "RAB.resize(64);",
+        ),
+        (
+            "var RAB = new ArrayBuffer(256, { maxByteLength: 512 }); var HEAP = new Int32Array(RAB, 0, 64);",
+            "RAB.resize(64); RAB.resize(512);",
+        ),
+    ] {
+        let source = typed_program(decl, then);
+        let expected = vm(&source);
+        assert!(!expected.starts_with("throw"), "{then}: {expected}");
+        for graph in [false, true] {
+            let run = run(&source, graph);
+            assert_eq!(run.result, expected, "{then} graph {graph}");
+            assert_eq!(run.fired, (0, 0), "{then} graph {graph}: {run:?}");
+        }
+    }
+}
+
+#[test]
+fn a_folded_typed_array_held_across_a_call_that_replaces_and_collects_it_stays_alive() {
+    // R-2: `var h = HEAP; g(); h[i]` with g replacing HEAP and collecting, then filling the heap
+    // with other arrays: h's home (not a root in the code) keeps the old array for the program.
+    let source = "var HEAP = new Int32Array(256);
+         for (var j = 0; j < 256; j++) HEAP[j] = j * 3;
+         var swap = false, junk = [];
+         function g() {
+           if (swap) {
+             HEAP = new Int32Array(256);
+             $262.gc();
+             junk = []; for (var q = 0; q < 400; q++) junk.push(new Int32Array(256).fill(7));
+           }
+         }
+         function f(n) { var s = 0; for (var i = 0; i < n; i++) { var h = HEAP; g(); s = (s + h[i & 255]) | 0; } return s; }
+         var t = 0; for (var k = 0; k < 300; k++) t = (t + f(100)) | 0;
+         swap = true; t = (t + f(3)) | 0; swap = false;
+         for (var k = 0; k < 300; k++) t = (t + f(100)) | 0;
+         t";
+    let expected = vm(source);
+    for graph in [false, true] {
+        let run = run(source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
+        assert_eq!(
+            run.fired.0, 1,
+            "graph {graph}: HEAP folded and fired: {run:?}"
+        );
+    }
+}

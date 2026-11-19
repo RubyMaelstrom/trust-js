@@ -833,6 +833,11 @@ pub(crate) enum NodeOp {
     FoldedGlobal {
         word: u64,
     },
+    /// Tagged -> Cell: the cell of a folded global's object (F4 part 2, layer 4a), its input a
+    /// `FoldedGlobal` whose word is an object's, which the fold proved (an object for the
+    /// object's life): no test, the word's payload (CheckObject's untag without its exit). Pure;
+    /// the cell is the folded value's, so it lives as long as that value's home does (R-2).
+    FoldedCell,
     /// (Env): the global environment's record has the compile's generation [WrongName]: no
     /// binding was added, removed or moved since, so the cache's binding address is a global
     /// lexical's still (the plan's Q4: the record does not only append).

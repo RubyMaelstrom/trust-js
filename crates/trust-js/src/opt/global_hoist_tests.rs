@@ -310,6 +310,9 @@ fn an_entry_checks_exit_flags_its_reads_with_the_proof_and_not_the_header() {
 
 #[test]
 fn a_typed_arrays_decline_leaves_the_globals_at_the_entry() {
+    // The unfolded read's checks (F4 part 1): with layer 4a heap32 folds, and its replacement is
+    // an Invalidated discard, not the entry checks' HoistingFailed cycle this test counts.
+    super::global_fold::pin_folds_for_test(false);
     // heap32 is an Array at entries of the loop that run no iteration: its entry checks exit
     // (HoistingFailed) until the discard, which flags the header (the element site is blind);
     // the recompile checks the typed array in the loop, where the site saw typed arrays alone,

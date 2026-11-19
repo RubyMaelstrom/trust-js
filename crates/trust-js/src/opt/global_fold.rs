@@ -18,7 +18,13 @@
 //!   in the tier without folds rather than in template code.
 //!
 //! Folded: Numbers (layer 3), whose word is a constant of the code (no object, nothing to
-//! root). TRUST_JS_OPT_FOLD_GLOBALS=0 turns the fold off, for measurement.
+//! root); typed arrays (layer 4a), whose word is an ordinary value with a home (the review's
+//! R-2: no root in the code, the global holds the object while the code's word is clear),
+//! loaded from the code's literal pool as V8's arm64 loads an embedded object
+//! (MacroAssembler::Mov, codegen/arm64/macro-assembler-arm64.cc:449), with the facts its
+//! identity fixes: an object, a typed array, its view's element kind (no CheckObject, no
+//! CheckElements); its length and data stay loads (TypedLength, TypedData).
+//! TRUST_JS_OPT_FOLD_GLOBALS=0 turns the fold off, for measurement.
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -150,16 +156,24 @@ pub(crate) fn prepare<'a>(
                 .props
                 .slot_at(*slot as usize)
                 .filter(|value| !value.accessor())
-                .and_then(|value| value.number_value().map(|_| value.value()))
+                .map(|value| value.value())
             else {
                 continue;
             };
+            // A Number (layer 3), or a typed array of a kind the tier's element sites take
+            // (layer 4a); nothing else folds.
+            let typed = typed_kind(&value);
+            let number = matches!(value.view(), crate::value::ValueView::Num(_));
+            if !number && typed.is_none() {
+                continue;
+            }
             let Some(guard) = fuse.try_optimize_constant(*slot as usize) else {
                 continue;
             };
             *folded = Some(Folded {
                 word: value.bits(),
                 generation: guard.generation,
+                typed,
             });
             if !folds.deps.contains(&(*slot, guard.generation)) {
                 folds.deps.push((*slot, guard.generation));
@@ -171,6 +185,26 @@ pub(crate) fn prepare<'a>(
         folds.valid = Some(Arc::new(AtomicU32::new(0)));
     }
     folds
+}
+
+/// The element kind of `value` where it is a typed array whose view the tier's element sites take
+/// (a kind of `TypedKind::ALL`; a declined view's kind byte is none of them): what a fold of it
+/// may assume for the object's life. Its being a typed array (the object's kind) and its view's
+/// kind are written once, at its construction (`native_typed_array.rs`); its length and its data
+/// are not facts of the object (a detach, a resize, a transfer change them while the property
+/// holds the same object), so the fold leaves them to the loads they are (layer 4a; 4b's
+/// detaching dependency is a separate piece).
+fn typed_kind(value: &crate::value::Value) -> Option<super::ir::TypedKind> {
+    let crate::value::ValueView::Obj(object) = value.view() else {
+        return None;
+    };
+    let object = object.try_borrow().ok()?;
+    let crate::value::ObjectKind::TypedArray(view) = &object.kind else {
+        return None;
+    };
+    super::ir::TypedKind::ALL
+        .get(usize::from(view.kind))
+        .copied()
 }
 
 /// Whether `chunk`'s function still folds globals: fewer than [`FOLD_LIMIT`] of its codes were

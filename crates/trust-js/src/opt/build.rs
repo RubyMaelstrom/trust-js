@@ -3151,10 +3151,15 @@ impl<'a> Builder<'a> {
     fn constant(&self, value: NodeIx) -> Option<u64> {
         match self.graph.node(value).op {
             NodeOp::ConstTagged(word) => Some(word),
-            // A folded global's value is a constant of the code (F4 part 2, layer 3): its uses
+            // A folded global's Number is a constant of the code (F4 part 2, layer 3): its uses
             // lie in effect epochs whose validity test proved it, or take the value the program
-            // read before an effect.
-            NodeOp::FoldedGlobal { word } => Some(word),
+            // read before an effect. A folded object is not (layer 4a, R-2): it is an ordinary
+            // value with a home, whose facts (`build_names::folded_global_read`) the fold proved.
+            NodeOp::FoldedGlobal { word }
+                if super::regalloc::rematerializable(&NodeOp::FoldedGlobal { word }) =>
+            {
+                Some(word)
+            }
             NodeOp::ConstF64(bits) if f64::from_bits(bits).is_nan() => Some(PACK_CANON_NAN),
             NodeOp::ConstF64(bits) => Some(bits),
             NodeOp::ConstI32(value) => Some(f64::from(value).to_bits()),

@@ -535,6 +535,20 @@ fn kept_heap(graph: &Graph, dom: &Dominators) -> Result<(), String> {
 /// unreached block's clear; each `FoldedGlobal` needs it set. A loop that keeps the bit through
 /// its body needs no case of its own: its back edge brings the bit its entry had.
 fn folded_reads(graph: &Graph) -> Result<(), String> {
+    // A FoldedCell untags without a test: its input must be a folded object's word (layer 4a).
+    for (index, node) in graph.nodes.iter().enumerate() {
+        if node.op == NodeOp::FoldedCell {
+            let input = node.inputs.first().map(|&input| &graph.node(input).op);
+            let Some(&NodeOp::FoldedGlobal { word }) = input else {
+                return Err(format!("node {index} (a FoldedCell) of no folded global"));
+            };
+            if word >> 48 != crate::value::PACK_OBJ >> 48 {
+                return Err(format!(
+                    "node {index} (a FoldedCell) of a folded word {word:#x}, no object's"
+                ));
+            }
+        }
+    }
     if !graph
         .nodes
         .iter()
@@ -753,6 +767,7 @@ fn heap_write(op: &NodeOp) -> HeapWrite {
         | NodeOp::LoadGlobalLexical { .. }
         | NodeOp::CheckCodeValid
         | NodeOp::FoldedGlobal { .. }
+        | NodeOp::FoldedCell
         | NodeOp::Jump { .. }
         | NodeOp::Branch { .. }
         | NodeOp::Return => HeapWrite::Nothing,
@@ -1191,6 +1206,7 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::LoadGlobalLexical { .. } => (&[Rep::Env], Rep::Tagged),
         NodeOp::CheckCodeValid => (&[], Rep::None),
         NodeOp::FoldedGlobal { .. } => (&[], Rep::Tagged),
+        NodeOp::FoldedCell => (TAGGED, Rep::Cell),
         NodeOp::Poll | NodeOp::Jump(_) | NodeOp::Exit(_) => (&[], Rep::None),
         NodeOp::Branch { .. } => (BOOL, Rep::None),
         NodeOp::Return => (TAGGED, Rep::None),

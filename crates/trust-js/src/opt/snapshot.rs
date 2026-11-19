@@ -195,11 +195,15 @@ pub(crate) enum NameView {
 
 /// A global property's value a compile folds (F4 part 2, layer 2): its bits, and the fuse's
 /// generation the property was made Constant under (`ObjectFuse::try_optimize_constant`), which
-/// the install checks again (`driver::dropped`).
+/// the install checks again (`driver::dropped`). For a typed array (layer 4a) its element kind:
+/// a typed array's being one and its view's kind are fixed for the object's life
+/// (`NativeTypedArray`, written once at construction), its length and data are not (a detach, a
+/// resize), so they stay loads.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Folded {
     pub(crate) word: u64,
     pub(crate) generation: u32,
+    pub(crate) typed: Option<super::ir::TypedKind>,
 }
 
 /// A free-name site's cache words (F4 part 1): its environment word, whose tag bits are its mode
