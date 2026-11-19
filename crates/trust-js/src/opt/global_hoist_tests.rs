@@ -841,3 +841,17 @@ fn each_read_an_entry_check_proves_is_judged_by_its_own_cache() {
     );
     super::release_retired(&mut engine.interp);
 }
+
+#[test]
+fn a_global_read_before_its_store_in_the_loop_reads_the_stored_value() {
+    // The loop reads `g` and then stores it through `this` (sloppy: the global object), a lowered
+    // store at `g`'s location: the header keeps no fact at that location, so each iteration's
+    // read, before the store, takes the value the last iteration stored.
+    agrees_at_every_switch(
+        "var g = 0;
+         function relay(n) { var s = 0; for (var i = 0; i < n; i++) { s = (s * 3 + g) | 0; this.g = i; } return s; }
+         var t = 0;
+         for (var r = 0; r < 300; r++) t = (t * 31 + relay(40)) % 1000003;
+         t",
+    );
+}
