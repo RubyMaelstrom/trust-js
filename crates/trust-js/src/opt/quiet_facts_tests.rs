@@ -517,3 +517,137 @@ fn appends_dictionary_keys_prototype_replacements_and_aliased_receivers_read_as_
         agrees_at_graph(source);
     }
 }
+
+// ---- the blocks the builder builds: a block that never ran is its NeverRan exit --------------
+
+/// A loop with p's shape and p.x read before it, whose only effect, `op`, is in a block that
+/// never ran (`k < i` with k 100 in the warm-up, past the loop's 10 iterations), in the function (`f`) or in a callee the graph
+/// inlines (`outer`'s `cb`): the block's operation is a store to a global the loop reads, a
+/// creation on p, a store to p's field the loop reads, or a call the graph does not inline.
+const COLD_OPS: [(&str, &str); 4] = [
+    ("global", "G = p.y + i;"),
+    ("creation", "p.z = i;"),
+    ("field", "p.x = i;"),
+    ("call", "s = (s + Object.keys(p).length) | 0;"),
+];
+
+fn cold_source(op: &str, then_k: &str, warm: u32, rounds: u32) -> String {
+    format!(
+        "var G = 3;
+         function f(p, n, k) {{ var s = p.x; for (var i = 0; i < n; i++) {{ s = (s + p.x + G) | 0; if (k < i) {{ {op} }} }} return s; }}
+         function cb(p, i, k) {{ var s = 0; if (k < i) {{ {op} }} return s; }}
+         function outer(p, n, k) {{ var s = p.x; for (var i = 0; i < n; i++) s = (s + p.x + G + cb(p, i, k)) | 0; return s; }}
+         var r = 0;
+         for (var j = 0; j < {rounds}; j++) {{
+             var k = j < {warm} ? 100 : {then_k};
+             r = (r + f({{x: j & 7, y: 1}}, 10, k) + outer({{x: j & 7, y: 1}}, 10, k)) % 1000003;
+         }}
+         r"
+    )
+}
+
+#[test]
+fn a_loop_whose_only_effect_is_in_a_block_that_never_ran_keeps_its_facts() {
+    // The block is the builder's NeverRan exit (`Rules::exits_unbuilt`, which the prepass, the
+    // inlined callee's summary and the inliner's E0 read with the frame's own feedback): the loop
+    // keeps heap facts, its header keeps p's shape, and p's shape is checked nowhere in it.
+    for (label, op) in COLD_OPS {
+        let source = cold_source(op, "100", 300, 300);
+        // The planner inlines no callee with a free-name store (`bytecode::inline_capability`):
+        // `cb` with the global store is a call, an effect, in `outer`'s loop.
+        let names: &[&str] = if label == "global" {
+            &["f"]
+        } else {
+            &["f", "outer"]
+        };
+        for &name in names {
+            let graph = graph_after(&source, name);
+            assert!(
+                graph.kept.iter().any(|kept| kept.shapes),
+                "{label} {name}: {:?}\n{}",
+                graph.kept,
+                dump(&graph)
+            );
+            assert_eq!(shape_checks(&graph), 0, "{label} {name}\n{}", dump(&graph));
+        }
+    }
+}
+
+#[test]
+fn a_cold_block_that_runs_exits_and_its_recompile_keeps_no_fact_its_operation_ends() {
+    // After the warm-up the block runs in the loop's middle iteration: the compiled loop leaves
+    // at the block (NeverRan), the VM runs it, and the recompile builds it, whose loop keeps no
+    // fact the operation ends: no heap fact for the global store and the call (effects), no
+    // shape for the creation, p.x reloaded in the loop for the field store. Results are the tier
+    // off's.
+    for (label, op) in COLD_OPS {
+        let source = cold_source(op, "5", 2000, 4000);
+        let expected = tier_off(&source);
+        TestSwitches {
+            on: true,
+            inline_graph: Some(true),
+            ..Default::default()
+        }
+        .set();
+        super::super::exit::TEST_EXITS.with(|exits| exits.borrow_mut().clear());
+        let mut engine = Engine::new();
+        engine.set_tier(Tier::Jit);
+        assert_eq!(eval(&mut engine, &source), expected, "{label}");
+        let exits = super::super::exit::TEST_EXITS.with(|exits| exits.borrow().clone());
+        assert!(
+            exits
+                .iter()
+                .any(|&(_, reason)| reason == ExitReason::NeverRan),
+            "{label}: a NeverRan exit: {:?}",
+            exits.iter().take(8).collect::<Vec<_>>()
+        );
+        for name in ["f", "outer"] {
+            let graph = Compile::new(&mut engine, name).build().graph;
+            let loads = in_loop(&graph, |node| matches!(node.op, NodeOp::LoadField { .. }));
+            match label {
+                "global" | "call" => assert!(
+                    graph.kept.is_empty(),
+                    "{label} {name}: {:?}\n{}",
+                    graph.kept,
+                    dump(&graph)
+                ),
+                "creation" => assert!(
+                    graph.kept.iter().all(|kept| !kept.shapes),
+                    "{label} {name}: {:?}\n{}",
+                    graph.kept,
+                    dump(&graph)
+                ),
+                _ => assert!(!loads.is_empty(), "{label} {name}\n{}", dump(&graph)),
+            }
+        }
+        super::super::release_retired(&mut engine.interp);
+    }
+}
+
+#[test]
+fn a_cold_block_flagged_never_ran_is_built_and_its_loop_keeps_no_fact() {
+    // The block never ran and its start is flagged NeverRan (an exit there taught the build to make
+    // it): the builder builds its call, an effect, and the prepass, reading the builder's own
+    // predicate (`Rules::exits_unbuilt`), counts it, so that the loop keeps no heap fact. A prepass
+    // that skipped the block would keep them, which the verifier refuses (`verify::kept_heap`).
+    let source = cold_source(COLD_OPS[3].1, "100", 300, 300);
+    let mut engine = warmed(&source);
+    let chunk = chunk_of(&mut engine, "f");
+    let ops = chunk.jit_ops();
+    let lts: Vec<usize> = (0..ops.len()).filter(|&pc| ops[pc] == Op::Lt).collect();
+    // `i < n`, then `k < i`, whose JumpIfFalse leads to the cold block.
+    let start = lts[1] + 2;
+    let graph = Compile::new(&mut engine, "f").build().graph;
+    assert!(!graph.kept.is_empty(), "unflagged: quiet\n{}", dump(&graph));
+    flag(&chunk, start as u32, ExitReason::NeverRan, false, 0);
+    let graph = Compile::new(&mut engine, "f").build().graph;
+    assert!(graph.kept.is_empty(), "{:?}\n{}", graph.kept, dump(&graph));
+}
+
+/// The tier off's result of `source`.
+fn tier_off(source: &str) -> String {
+    TestSwitches::default().set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Bytecode);
+    eval(&mut engine, source)
+}

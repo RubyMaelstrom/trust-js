@@ -263,8 +263,9 @@ impl<'a> Tree<'a> {
     /// (a declined way is no frame: the site's guard exits for its callee), and in it, at every
     /// depth, the frames the build may open: its nested sites' ways (step 3d) and its by-literal
     /// ways (piece B), which `Builder::call` takes from this tree alone, so that no frame the build
-    /// makes is missing here. Each callee chunk's every operation counts, a block that never ran
-    /// too (its build is an exit there). A construct's inlined initializer, when one is built,
+    /// makes is missing here. Each callee chunk's every operation counts but those of a block its
+    /// frame's builder builds as the NeverRan exit (`Rules::exits_unbuilt`, the callee's own
+    /// feedback, which the frame's builder reads). A construct's inlined initializer, when one is built,
     /// joins here the same way; the verifier checks every built loop against the rule
     /// (`verify::kept_heap`).
     ///
@@ -399,9 +400,7 @@ fn analyse(
     let mut generic = false;
     for &id in &flow.rpo {
         let block = &cfg.blocks()[ix(id)];
-        if never_ran(snapshot, block.start, block.end)
-            && !snapshot.declines(block.start, ExitReason::NeverRan)
-        {
+        if rules.exits_unbuilt(block.start, block.end) {
             continue;
         }
         for pc in (block.start..block.end).filter(|&pc| !rules.lowers(pc)) {

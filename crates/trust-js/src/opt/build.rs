@@ -869,11 +869,29 @@ impl Rules<'_> {
         writes
     }
 
-    /// What every operation of the chunk may write in place (`writes_at` of each pc, every block,
-    /// a block that never ran too): an inlined callee chunk's summary (`inline::Analysis`).
+    /// What every operation of the chunk may write in place (`writes_at` of each pc) but those of
+    /// a block the builder builds as its NeverRan exit (`exits_unbuilt`, this chunk's feedback:
+    /// the inlined frame's builder reads the same): an inlined callee chunk's summary
+    /// (`inline::Analysis`).
     fn chunk_writes(&self) -> Writes {
         let mut writes = Writes::default();
+        // The block of the last pc and whether it is built, asked once per block.
+        let mut last: Option<(usize, bool)> = None;
         for pc in 0..self.ops.len() {
+            if let Some(block) = self.cfg.block_at(pc) {
+                let exits = match last {
+                    Some((at, exits)) if at == ix(block) => exits,
+                    _ => {
+                        let data = &self.cfg.blocks()[ix(block)];
+                        let exits = self.exits_unbuilt(data.start, data.end);
+                        last = Some((ix(block), exits));
+                        exits
+                    }
+                };
+                if exits {
+                    continue;
+                }
+            }
             writes.extend(&self.writes_at(pc, true));
         }
         writes
@@ -898,6 +916,16 @@ impl Rules<'_> {
             }
             _ => None,
         }
+    }
+
+    /// Whether the builder builds the block from `start` to `end` as its NeverRan exit
+    /// (`Builder::build_block`): it never ran, and no NeverRan flag at its start builds it. The
+    /// one predicate the builder, the loop prepass (`Flow::new`), the summaries of an inlined
+    /// callee's writes (`chunk_writes`) and the inliner's E0 (`build_inline::analyse`) read, each
+    /// with its frame's own feedback: the operations of such a block never run in the compiled
+    /// code, which leaves at the block's start.
+    fn exits_unbuilt(&self, start: usize, end: usize) -> bool {
+        never_ran(self.snapshot, start, end) && !self.snapshot.declines(start, ExitReason::NeverRan)
     }
 
     /// The source of the read at `pc` where it is a global-object property's or a script-level
@@ -1713,10 +1741,24 @@ impl Flow {
                 canonical: false,
             };
             let mut modulo = false;
+            // The body's blocks the builder builds: one that never ran is its NeverRan exit
+            // (`Rules::exits_unbuilt`), whose operations the compiled loop never runs, so that
+            // they end none of its facts, as JSC's ForceOSRExit for code that never executed
+            // (dfg/DFGByteCodeParser.cpp:1330) leaves the rest of its block unreachable before
+            // the DFG's LICM collects the loop's writes, Warp's bailout for a cold IC
+            // (jit/WarpBuilder.cpp:4185-4190) ends its block, and Maglev's unconditional deopt
+            // for insufficient feedback (maglev-graph-builder.cc:1678) builds nothing after it
+            // that its loop's effects record. The slots such a block writes stay written (its
+            // exit's state is the merge's, whatever the header assumed).
+            let mut built = Vec::with_capacity(body.len());
             for &index in &body {
                 let block = &blocks[ix(rpo[index])];
+                let exits = rules.exits_unbuilt(block.start, block.end);
+                if !exits {
+                    built.push(index);
+                }
                 for pc in block.start..block.end {
-                    modulo |= ops[pc] == Op::Mod;
+                    modulo |= !exits && ops[pc] == Op::Mod;
                     let writes = match ops[pc] {
                         Op::StoreLocal(slot) | Op::UpdateLocal(slot, _) | Op::Tdz(slot) => {
                             slot as usize..slot as usize + 1
@@ -1732,7 +1774,7 @@ impl Flow {
                         }
                     }
                     let whole = canonical(&ops[pc]);
-                    if !rules.lowers(pc) {
+                    if !exits && !rules.lowers(pc) {
                         // A generic node or an effect: either may run anything (heap facts end).
                         found.effects = true;
                         found.canonical |= whole;
@@ -1767,7 +1809,7 @@ impl Flow {
             // inline at its calls (`Rules::writes_at`).
             let mut writes = Writes::default();
             if found.keeps_heap {
-                for &index in &body {
+                for &index in &built {
                     let block = &blocks[ix(rpo[index])];
                     for pc in block.start..block.end {
                         writes.extend(&rules.writes_at(pc, false));
@@ -1807,7 +1849,7 @@ impl Flow {
             // summaries, `Rules::writes_at`).
             let (mut fields, mut creates) = (writes.fields, writes.creates);
             if found.keeps_heap {
-                for &index in &body {
+                for &index in &built {
                     let block = &blocks[ix(rpo[index])];
                     for pc in block.start..block.end {
                         let (locations, creation) = rules.own_field_writes(pc);
@@ -2550,8 +2592,11 @@ impl<'a> Builder<'a> {
         self.cur = block;
         self.built[ix(id)] = true;
         self.checks_store = self.rules().store_checking_reads(start, end);
-        let never_ran = self.never_ran(start, end)
-            && !self.declined(start, ExitReason::NeverRan, "the block built");
+        let never_ran = self.rules().exits_unbuilt(start, end);
+        if !never_ran && self.never_ran(start, end) {
+            // The NeverRan flag builds it: the decline listed.
+            self.declined(start, ExitReason::NeverRan, "the block built");
+        }
         let mut st = match self.flow.heads[ix(id)] {
             Some(found) if !never_ran => self.header(id, block, preds, found)?,
             _ => self.merge(block, preds, start, &mut Vec::new())?,
