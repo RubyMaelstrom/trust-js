@@ -215,6 +215,13 @@ impl NameFill {
     /// its environment word differs), with other words. Only the site's own execution fills its
     /// cache, so a fill since means the read ran since (Ion's baseline-fallback note,
     /// jit/BaselineIC.cpp:450-458).
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
     pub(crate) fn refilled_by(self, now: NameFill) -> bool {
         now.env == self.env && (now.binding, now.gen) != (self.binding, self.gen)
     }
@@ -222,6 +229,13 @@ impl NameFill {
 
 /// The cache of the free-name site at `pc` of `chunk` now (a discard's read, on the main
 /// thread), None where `pc` holds no free-name site with a cache.
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn name_fill(chunk: &Chunk, pc: usize) -> Option<NameFill> {
     let (_, cache, _) = name_site(chunk.jit_ops().get(pc)?)?;
     Some(NameFill::of(&chunk.jit_name_ic(cache)))

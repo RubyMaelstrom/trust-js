@@ -1458,6 +1458,13 @@ thread_local! {
 
 /// Tests: turn F4 part 1's global hoist off (or on again) for compiles on this thread.
 #[cfg(test)]
+#[cfg_attr(
+    not(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    )),
+    allow(dead_code)
+)]
 pub(crate) fn set_no_global_hoist(off: bool) {
     NO_GLOBAL_HOIST.with(|cell| cell.set(off));
 }
