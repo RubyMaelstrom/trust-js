@@ -75,6 +75,8 @@ Object.defineProperty(TAP, 'length', { get: Object.getOwnPropertyDescriptor(Map.
 out.push(tryRead(len, ta));
 Object.defineProperty(TAP, 'length', { get: Object.getOwnPropertyDescriptor(TAP, 'byteLength').get, configurable: true });
 out.push(sumOf(len, new Float64Array(3)));
+Object.defineProperty(TAP, 'length', { get: undefined, set: function (v) {}, configurable: true });
+out.push(String(sumOf(len, ta)));
 Object.defineProperty(TAP, 'length', d);
 out.push(sumOf(len, ta));
 var bd = Object.getOwnPropertyDescriptor(TAP, 'byteLength');
@@ -87,7 +89,7 @@ out.push(sumOf(len, ta));
 Object.defineProperty(TAP, 'byteLength', bd);
 log('replaced ' + out.join(' '));
 "#,
-    "replaced 3000 2100 TypeError 7200 3000 29700 300000 600 3000",
+    "replaced 3000 2100 TypeError 7200 NaN 3000 29700 300000 600 3000",
 );
 
 const PROTO: (&str, &str) = (
@@ -157,6 +159,9 @@ out.push(tryRead(len, onTop));
 var both = [ta, fake], s = 0, errs = 0;
 for (var i = 0; i < N; i++) { try { s += both[i & 1].length; } catch (e) { errs++; } }
 out.push(s, errs);
+var both2 = [ta, Object.setPrototypeOf({}, Uint8Array.prototype)], s2 = 0, errs2 = 0;
+for (var i = 0; i < N; i++) { try { s2 += both2[i & 1].length + both2[i & 1].byteOffset; } catch (e) { errs2++; } }
+out.push(s2, errs2);
 var m = new Map([[1, 2]]); var notMap = Object.create(Map.prototype);
 out.push(sumOf(size, m), tryRead(size, notMap));
 var keys = ['-0', '1.5', 'NaN', 'Infinity', '1e+21'], r = [];
@@ -169,7 +174,7 @@ for (var i = 0; i < N; i++) { q += rdNaN(pl) + rdInf(pl); if (rdNaN(ta) !== unde
 out.push(q);
 log('receiver ' + out.join(' '));
 "#,
-    "receiver TypeError TypeError TypeError TypeError 1500 150 300 TypeError 200/1400,200/1400,200/1400,200/1400,200/1400 4200",
+    "receiver TypeError TypeError TypeError TypeError 1500 150 1500 150 300 TypeError 200/1400,200/1400,200/1400,200/1400,200/1400 4200",
 );
 
 const DETACH: (&str, &str) = (
@@ -342,8 +347,8 @@ fn typed_array_absent_names_fill_no_way() {
 }
 
 /// a2: a native getter found by a way is called directly in the VM and from generated code, a
-/// typed array's (a1's way), a Map's and an embedder's closures alike; another Realm's native
-/// takes the full call.
+/// typed array's (a1's way; ARM64's template answers it in line, piece b), a Map's and an
+/// embedder's closures alike; another Realm's native takes the full call.
 #[test]
 fn native_getters_found_by_ways_are_called_directly() {
     for tier in [Tier::Bytecode, Tier::Jit] {
@@ -375,8 +380,14 @@ fn native_getters_found_by_ways_are_called_directly() {
             ),
             "1100"
         );
+        // On ARM64 the template answers a typed array's `length` in line (piece b).
+        let calls = if cfg!(target_arch = "aarch64") && tier == Tier::Jit {
+            3
+        } else {
+            4
+        };
         assert!(
-            native_getters() - before >= 4 * 90,
+            native_getters() - before >= calls * 90,
             "{tier:?}: {} direct calls",
             native_getters() - before
         );

@@ -67,6 +67,129 @@ pub(super) fn stubs_for_test() -> bool {
     use_stub()
 }
 
+/// The intrinsic getters of %TypedArray.prototype% in line at a read's validated accessor
+/// landing (P3 stage 3, the getter line, piece b): where the accessor's live [[Get]] is the native
+/// `length`, `byteLength` or `byteOffset` getter (of any Realm: each computes its answer from a
+/// typed-array receiver alone, `builtins::ta_accessor_of`) and the receiver is a typed array
+/// whose view has a guard record, the answer from the view and its buffer: the element count
+/// of a fixed view that fits the live buffer (shifted for `byteLength`, the view's offset for
+/// `byteOffset`); 0 for a detached buffer or a view out of bounds (ECMA-262
+/// IsTypedArrayOutOfBounds, TypedArrayLength, TypedArrayByteLength, the getters at 23.2.3);
+/// a length-tracking view's count from the buffer's byte length, rounded down. As JSC's inline
+/// cache compares the live getter with the intrinsic and loads the view's length
+/// (bytecode/InlineCacheCompiler.cpp:3463-3467, 4381-4500) and SpiderMonkey's attaches
+/// LoadArrayBufferViewLength behind the native's guard (jit/CacheIR.cpp:11917-11957); a detached
+/// view reads 0 here by its record's `attached` byte, which the view's count does not follow
+/// (V8 selects 0 on its detached bit the same way, js-call-reducer.cc:8784-8792).
+///
+/// In: X12 = the validated slot's accessor word, X10 = the receiver's cell address. To `hit`
+/// with X12 = the answer's Number word; to `decline`, having changed nothing the publication
+/// reads (X10, X11, X13, X14), for any other getter or receiver, a view with no guard record
+/// (BigInt or Float16 elements, a shared buffer) or a count at the record's clamp (2^31): the
+/// native getter answers those. Clobbers X9, X12, X15..X17, D1 and NZCV.
+pub(super) fn emit_named_getter(
+    a: &mut asm::Asm,
+    jl: &JitLayout,
+    layout: &NativeLayout,
+    hit: usize,
+    decline: usize,
+) {
+    use crate::builtins::TaAccessor;
+    let obj = jl.obj_from_cell as u32;
+    let kind = jl.obj_kind as u32;
+    let getter_fn = |which: TaAccessor| {
+        crate::builtins::ta_accessor_getters()
+            .iter()
+            .find(|(accessor, _)| *accessor == which)
+            .map(|(_, f)| *f as usize as u64)
+            .expect("an intrinsic getter")
+    };
+    let view = a.new_label();
+    let tracking = a.new_label();
+    let counted = a.new_label();
+    let offset = a.new_label();
+    let zero = a.new_label();
+    let number = a.new_label();
+    // The receiver first, so that another receiver's accessor (a JS getter's) pays three
+    // instructions: a typed array; X15 = its view.
+    a.add_imm(15, 10, obj);
+    a.ldrb_imm(17, 15, kind);
+    a.cmp_imm_w(17, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+    a.b_cond(C_NE, decline);
+    a.ldr_imm(15, 15, layout.object_view as u32);
+    // The live [[Get]]: the accessor pair's getter word, an object word.
+    a.ubfx(16, 12, 0, 48);
+    a.cbz(16, true, decline);
+    a.ldr_imm(16, 16, crate::value::ACCESSOR_GET_WORD_OFF as u32);
+    a.lsr_imm(17, 16, 48);
+    a.movz(9, (crate::value::PACK_OBJ >> 48) as u32, 0);
+    a.cmp_reg_w(17, 9);
+    a.b_cond(C_NE, decline);
+    // X16 = the getter's kind payload word: an `ObjectKind::Native`'s function. No other kind's
+    // payload is a function of the engine's text (heap cells, keys, an embedder's own functions),
+    // so the identity compares below need no kind test, as JSC compares the getter alone.
+    a.ubfx(16, 16, 0, 48);
+    a.ldr_imm(16, 16, obj + kind + 8);
+    // W9 = which getter: 0 length, 1 byteLength, 2 byteOffset.
+    for (index, which) in [
+        TaAccessor::Length,
+        TaAccessor::ByteLength,
+        TaAccessor::ByteOffset,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        a.movz(9, index as u32, 0);
+        a.mov_imm64(17, getter_fn(which));
+        a.cmp_reg_x(16, 17);
+        a.b_cond(C_EQ, view);
+    }
+    a.b(decline);
+    a.bind(view);
+    a.ldr_imm(16, 15, offset_of!(View, buffer_ptr) as u32);
+    a.cbz(16, true, decline);
+    a.ldrb_imm(17, 16, offset_of!(Buffer, attached) as u32);
+    a.cbz(17, false, zero);
+    a.ldr_imm(16, 16, offset_of!(Buffer, storage_ptr) as u32);
+    // X16 = the buffer's byte length, its bytes' `Vec` length (`BufferData::byte_len`; read, not
+    // the bytes, so no borrow flag is tested); X17 = the view's end (usize::MAX: tracking).
+    a.ldr_imm(16, 16, (layout.refcell_value + layout.vec_len) as u32);
+    a.ldr_imm(17, 15, offset_of!(View, end) as u32);
+    a.cmn_imm_x(17, 1);
+    a.b_cond(C_EQ, tracking);
+    a.cmp_reg_x(16, 17);
+    a.b_cond(C_LO, zero); // a fixed view out of bounds is wholly so
+    a.ldr_imm(16, 15, offset_of!(View, limit) as u32);
+    a.movz(17, 0x8000, 1); // 1 << 31: the record's clamp of the count
+    a.cmp_reg_x(16, 17);
+    a.b_cond(C_HS, decline);
+    a.b(counted);
+    a.bind(tracking);
+    a.ldr_imm(17, 15, offset_of!(View, offset) as u32);
+    a.cmp_reg_x(16, 17);
+    a.b_cond(C_LO, zero);
+    a.sub_reg(16, 16, 17);
+    a.ldrb_imm(17, 15, offset_of!(View, shift) as u32);
+    a.lsr_reg(16, 16, 17);
+    // X16 = the element count of a view in bounds.
+    a.bind(counted);
+    a.cbz(9, false, number);
+    a.cmp_imm_w(9, 1);
+    a.b_cond(C_NE, offset);
+    a.ldrb_imm(17, 15, offset_of!(View, shift) as u32);
+    a.lsl_reg(16, 16, 17);
+    a.b(number);
+    a.bind(offset);
+    a.ldr_imm(16, 15, offset_of!(View, offset) as u32);
+    a.b(number);
+    a.bind(zero);
+    a.movz(16, 0, 0);
+    a.bind(number);
+    a.scvtf_d_x(1, 16);
+    a.fmov_x_d(12, 1);
+    a.b(hit);
+}
+
 /// X11 = Object, X9 = exact unsigned index, W12 its kind tag unless `tag` says the caller
 /// checked it. On read, X12 is a packed Number and D1 its numeric value. The caller chooses the
 /// ownership/stack commit at `hit`.

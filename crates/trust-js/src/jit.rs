@@ -114,6 +114,13 @@ mod getter_call_tests;
 ))]
 #[path = "jit_proxy_trap_tests.rs"]
 mod proxy_trap_tests;
+#[cfg(all(
+    test,
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[path = "jit_typed_getter_tests.rs"]
+mod typed_getter_tests;
 
 #[cfg(all(
     test,
@@ -3239,6 +3246,7 @@ mod shared_stub_tests {
             keys.push(SharedStub::StoreMega.key());
             keys.push(SharedStub::PlainIsArray.key());
             keys.push(SharedStub::ElemStore.key());
+            keys.push(SharedStub::TypedGetter.key());
             for argc in [3u8, 4] {
                 keys.push(SharedStub::MinMax { argc }.key());
             }
@@ -9116,10 +9124,24 @@ fn emit_prop_read_stub(
         a.movz(9, 2, 0);
         a.ret();
     }
-    // The validated accessor: publish its holder (its `Gc::as_ptr`, `obj_from_cell` before the
+    // The validated accessor: a typed array's intrinsic getter answers in line (the getter
+    // line, piece b); else publish its holder (its `Gc::as_ptr`, `obj_from_cell` before the
     // Object base), slot and location for the helper's validated accessor path, which the
     // site's helper call reaches next with nothing run since.
     a.bind(accessor_hit);
+    if let Some(native) = layout
+        .native_typed_array
+        .filter(|_| layout.call_probe_valid)
+    {
+        let answered = a.new_label();
+        let publish = a.new_label();
+        typed_array::emit_named_getter(a, layout, &native, answered, publish);
+        a.bind(answered);
+        emit_place(a, 12);
+        a.movz(9, 1, 0);
+        a.ret();
+        a.bind(publish);
+    }
     a.sub_imm(9, 11, obj_off);
     a.str_imm(9, 19, std::mem::offset_of!(JitCtx, accessor_holder) as u32);
     a.str_w_imm(13, 19, std::mem::offset_of!(JitCtx, accessor_slot) as u32);
@@ -9742,6 +9764,26 @@ fn emit_prop_load_inline(
     // (see `emit_get_prop_getter`), then take the ordinary helper call. No JavaScript can run
     // between the validation above and the helper consuming these.
     a.bind(accessor_hit);
+    // A typed array's intrinsic getter answers in line (the getter line, piece b), at a site
+    // whose name is one of its accessors' (the shared read stub's landing serves every name).
+    if matches!(name.text, "length" | "byteLength" | "byteOffset") {
+        if let Some(native) = layout
+            .native_typed_array
+            .filter(|_| layout.call_probe_valid)
+        {
+            let publish = a.new_label();
+            if shared_stubs_enabled() {
+                // One process-wide copy (`SharedStub::TypedGetter`), as the element accesses'
+                // `SharedStub::TypedElement`: the site keeps a call and a test.
+                let stub = a.shared_stub(SharedStub::TypedGetter.key());
+                a.bl_label(stub);
+                a.cbnz(9, false, val_body);
+            } else {
+                typed_array::emit_named_getter(a, layout, &native, val_body, publish);
+            }
+            a.bind(publish);
+        }
+    }
     // x11 is the Object base; the helper wants the `Gc::as_ptr` form (the RefCell, at the
     // cell address), which sits `obj_from_cell` (the RefCell value offset) before it.
     a.sub_imm(9, 11, obj_off);
@@ -18284,6 +18326,18 @@ enum SharedStub {
     /// (and d1 the Number to store) → w13 = 1 once the element is read (x12 = packed Number,
     /// d1 = value) or written, 0 when the access is declined before anything is written.
     TypedElement { write: bool },
+    /// [`typed_array::emit_named_getter`] (the getter line, piece b), reached by a full site's
+    /// validated accessor landing: x12 = the validated slot's accessor word, x10 = the receiver's
+    /// cell address → w9 = 1 with x12 = the answer's Number word where a typed array's intrinsic
+    /// `length`, `byteLength` or `byteOffset` getter answers in line, else w9 = 0 with x10, x11,
+    /// x12, x13 and x14 as they were (the publication's inputs). Process-wide: it reads the
+    /// receiver, the accessor pair and the getter's native function, compared with the
+    /// intrinsics' functions, which are the binary's text, never an engine's object.
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    TypedGetter,
     /// [`regions::emit_name_element_body`]: a fused `LoadName K; key; GetElem/SetElemDrop` access
     /// with x12 = the name's `NameIc` cell (or, `resolved`, x14 = the binding's word and x7 = 0
     /// from its static address), d3 = the key and (for a write) d1 = the Number to store → w13 =
@@ -18403,6 +18457,7 @@ impl SharedStub {
     const CALL_HIT: u32 = 0x1500;
     const HELPER_INLINED: u32 = 0x1600;
     const STORE_MEGA: u32 = 0x1700;
+    const TYPED_GETTER: u32 = 0x1800;
 
     fn key(self) -> u32 {
         match self {
@@ -18541,6 +18596,11 @@ impl SharedStub {
                 Self::CALL_HIT | u32::from(argc) | u32::from(with_this) << 7
             }
             SharedStub::TypedElement { write } => Self::TYPED_ELEMENT | u32::from(write),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::TypedGetter => Self::TYPED_GETTER,
             SharedStub::ElemStore => Self::ELEM_STORE,
             #[cfg(all(
                 target_arch = "aarch64",
@@ -18708,6 +18768,11 @@ impl SharedStub {
                 argc: (key & 0x7f) as u8,
                 with_this: key & 0x80 != 0,
             },
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            Self::TYPED_GETTER => SharedStub::TypedGetter,
             Self::TYPED_ELEMENT => SharedStub::TypedElement {
                 write: key & 1 != 0,
             },
@@ -18841,6 +18906,11 @@ impl SharedStub {
                 if with_this { ",with_this" } else { "" }
             ),
             SharedStub::TypedElement { write } => named("TypedElement", &[("write", write)]),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::TypedGetter => named("TypedGetter", &[]),
             SharedStub::ElemStore => named("ElemStore", &[]),
             SharedStub::NameElement { write, resolved } => {
                 named("NameElement", &[("write", write), ("resolved", resolved)])
@@ -18905,6 +18975,30 @@ impl SharedStub {
                 a.ret();
                 a.bind(name_miss);
                 a.movz(13, 0, 0);
+                a.ret();
+            }
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::TypedGetter => {
+                let hit = a.new_label();
+                let decline = a.new_label();
+                // Process-wide: no engine's address (see the variant).
+                match layout
+                    .native_typed_array
+                    .filter(|_| layout.call_probe_valid)
+                {
+                    Some(native) => {
+                        typed_array::emit_named_getter(a, layout, &native, hit, decline)
+                    }
+                    None => a.b(decline),
+                }
+                a.bind(hit);
+                a.movz(9, 1, 0);
+                a.ret();
+                a.bind(decline);
+                a.movz(9, 0, 0);
                 a.ret();
             }
             SharedStub::TypedElement { write } => {
