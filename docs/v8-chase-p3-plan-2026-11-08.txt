@@ -8076,3 +8076,8 @@ coordinator's check target/p3/stage3/m1c-review).
   metadata cell, its memory measured at under 0.3% of peak; reads at a site of more than
   eight shapes probe first, as the census found most of TypeScript's megamorphic reads are;
   the store miss teacher); then string-keyed sites and `in`.
+
+Validation again (2026-11-19 21:35; in the background): the whole library with the tier off
+in a clean environment on main's code at af8bd058 (after the megamorphic read probe, the
+global dependencies' layers and leftovers, and the polymorphic store): 3,821 passed, none
+failed. The store table that landed after it had its own such run (3,820 passed) and Test262.
