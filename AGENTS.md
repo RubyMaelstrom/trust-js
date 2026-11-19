@@ -121,6 +121,14 @@ written down.
 - Freed code addresses stay out of use. On Cortex-X925, code mapped at the address of
   code just freed mispredicts persistently, at equal instruction counts (the plan's
   stage 2, step 9).
+- A frame live across a collection stays small. The conservative scan reads the whole
+  frame of every function on the stack when a collection starts, stale words included.
+  The installs of finished compiles, inlined into `jit_interrupt` (which runs `gc_check`),
+  made its frame 5.4 KB of a compile's leftovers: Djot kept 6% to 13% more objects, and a
+  field added to a compile's type read as +0.23% with the tier off at identical generated
+  code. Keep work with large temporaries out of line from a function that can start a
+  collection. When a row moves with no change to generated code, recount with collections
+  deferred, and compare what collections keep at allocation counts both binaries share.
 - A second thread changes `malloc`. Any second thread takes glibc's allocator off its
   single-thread path (CodeLoad +10% from an idle thread alone). When work that parses or
   allocates slows down with the compile thread present, test for that first.
