@@ -8305,3 +8305,9 @@ check target/p3/stage3/x-review). A collector change found through a tier-off ro
   forced exits) against the parent's engine and under GC stress at graph and at graph
   eager (a result that only the old frame's stale words kept alive would fail there): none
   differs. The x86-64 host's check, clippy and Windows check: 0.
+
+Validation in the background, 2026-11-19 23:56: the whole library suite with the tier off in a
+clean environment on the getter line's code (bbb86d40's tree): 3,845 passed, 0 failed, 10
+ignored (target/p3/stage3/ga-review/tests/suite-off-main.log). The megamorphic line's agent
+ran the same on its Reflect.set commit's engine: 3,847 passed, 0 failed
+(target/p3/stage3/mega-impl/p1f/chk/wholelib.log).
