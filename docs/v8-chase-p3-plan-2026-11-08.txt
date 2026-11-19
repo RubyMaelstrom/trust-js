@@ -8311,3 +8311,8 @@ clean environment on the getter line's code (bbb86d40's tree): 3,845 passed, 0 f
 ignored (target/p3/stage3/ga-review/tests/suite-off-main.log). The megamorphic line's agent
 ran the same on its Reflect.set commit's engine: 3,847 passed, 0 failed
 (target/p3/stage3/mega-impl/p1f/chk/wholelib.log).
+
+Validation in the background, 2026-11-19 23:56, on 93ee15f6 (the functions fold and the build
+fix in): Test262 with the tier on and eager at graph 53,572 of 53,575 (the three known);
+difftest 138 agree in three configurations (the tier off, eager, forced exits)
+(target/p3/stage3/t262-check/t262-93ee15f6.log, difftest-93ee15f6.log).
