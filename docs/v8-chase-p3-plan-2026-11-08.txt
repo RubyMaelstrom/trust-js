@@ -8449,3 +8449,42 @@ target/p3/stage3/a3-review).
   and passes alone and in the coordinator's two whole-library runs of the same night: a
   flake to pin down (the line's agent has it: 20 runs on main, then a child process if its
   count depends on process-wide state).
+
+The megamorphic line's store teacher counted and NOT built, and what the store probe's
+misses are (2026-11-20; target/p3/stage3/mega-impl/p1g/miss-note.txt, class/table.txt,
+item1-report.txt).
+- The store teacher (a site that keeps missing the table stops probing for a cool-down,
+  JSC's numbers): its reach on TypeScript-5 is 14M instructions, 0.03% with the tier off and
+  0.045% at graph, and the always-wrong creation micro stands where piece 1c left it
+  (2,445.7 instructions a creation with the tier off, 2,382.4 at graph, about 1.3% over no
+  probe). The rule that a speculation needs a teacher is met here by a measured, bounded
+  always-wrong case; a metadata cell at every named site (0.29% of TypeScript's peak) is not
+  bought for that. Closed. The empty token alone, measured on its own: Vue level in all
+  four rows by ten randomized runs; nothing to land.
+- What the generated store probe's 1.66M misses a run on TypeScript-5 are (the tier off;
+  graph alike): 58% are served by one of the site's ways in Rust (the generated ways
+  refused the store, the Rust ways take it); 37% (616,110) find a VALID table entry, key,
+  shape, prototype, epoch and extensibility all good, which the generated probe refused on
+  a check of its own (emit_prop_create_probe's: a receiver that is a prototype, a map with
+  a key index, a map of eight or more entries, no cached layout; which one is not counted
+  yet) and which the helper then does not probe again, because the probe's token says the
+  table missed: it takes the full lookup and refills the entry it had. Two sites carry
+  625K of them and miss every time in generated code; at the bytecode tier the same two
+  sites take the table 97% and 98% of the time. 4.8% are collisions; first sights are 442.
+- Its size, inferred from piece 1c's landing rows and not measured: up to 1.4% of
+  TypeScript-5 with the tier off and 2.0% at graph for the valid entries alone; if the
+  refusing check is the eight-entry limit, the 58% are creations of the same kind leaving
+  generated code (1.6M a run), the unassigned "creations on maps of more than 8 entries".
+  This is the line's next piece: which check refuses; what V8, SpiderMonkey and JSC do for
+  a creation on an object with many properties; the reach measured by a build whose helper
+  probes the table when the generated refusal was not the entry's own mismatch.
+- Geometry: collisions are 55K to 80K stores and 20K to 27K reads a run, at most 0.18% of
+  TypeScript-5; this table (4096 + 4096, one way) is as large as V8's primary (4096 + 1024
+  secondary, ic/stub-cache.h:90-93) and larger than JSC's (2048 + 512,
+  runtime/MegamorphicCache.h:39-47) and SpiderMonkey's (1024 and 1024, vm/Caches.h:186,
+  343). No change proposed.
+- For the accessor and Proxy work: a named read through a Proxy with one shared handler
+  costs 220 instructions over a plain megamorphic read with the tier off and 261 at graph
+  when the trap returns a constant, 688 and 666 when it forwards by Reflect.get
+  (p1g/proxy/per-read.txt); inferred, the engine's own dispatch is about 3% of Vue's steady
+  state at graph.
