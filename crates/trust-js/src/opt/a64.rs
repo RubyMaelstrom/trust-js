@@ -738,12 +738,81 @@ fn check_graph(
 ///   the switch, made around the stub's `bl`) or, without shared stubs, `emit_op_helper` /
 ///   `emit_exec`; the compact form `emit_equal_site`, numbers in line and `emit_equal_call`;
 ///   the Number-only form, `emit_exec`; no allocation in line.
+/// - Graph-next piece 1 (gnext-impl/design-note.txt, template-reads.txt; each admitted on the
+///   census of main's engine, every Octane benchmark and the fixtures, for a template that
+///   seldom reaches its helper): the named loads (`GetProp`, `GetMethod`, `GetPropThis`,
+///   `GetPropLocal`: `jit::emit_prop_load_inline` and its compact site, whose shared stubs read
+///   the cache cells and write `JitCtx::accessor_*`, one exit `emit_op_helper(H_GET_PROP)`), the
+///   named stores (`SetPropDrop`, `SetPropThisDrop`, `SetPropLocalDrop`: `emit_set_prop_inline`
+///   and its compact site, one exit `emit_op_helper(H_SET_PROP)`), `SetElemLocalDrop`
+///   (`emit_elem_local_inline`: its receiver the only window word it reads; exits
+///   `emit_op_helper`, `emit_exec`), `GetMethodElem` (`emit_computed_method_inline`: operand
+///   words and ctx.interp; exits `emit_op_helper(H_GET_METHOD_ELEM)`), `InstanceOf`
+///   (`emit_instanceof_inline`: operand words and ctx.interp; exit `emit_op_helper(H_INSTANCEOF)`),
+///   `Add` (operand words; exits `emit_op_helper(H_ADD_STRINGS)`, `emit_exec`), `ToStr` (operand
+///   word; exit `emit_exec`), `MakeObject`, `MakeArray`, `MakeArrayLiteral` (`jit_alloc`'s in-line
+///   cells: ctx.interp; exit `emit_op_helper`). The This and Local kinds read their receiver
+///   from an operand word (`explicit_receiver`), their fixed place written around the helper
+///   calls alone.
+/// Not admitted on the census: `GetElem`, `GetElemLocal`, `SetElemDrop` and the relational
+/// comparisons, whose generic sites reached their helper on every execution (a lazy switch costs
+/// those 2 more an execution); the kinds whose template is a helper call alone (`NewObject`,
+/// `ObjectSpread`, `ObjectDataName`, `ForInStepL`, `ForInKeys`); every kind the census did not
+/// meet.
 /// Every other kind keeps the eager switch, as does every kind under the poison switch.
 fn lazy_kind(op: &Op) -> bool {
     matches!(
         op,
-        Op::In | Op::Abstract(_) | Op::StrictEq | Op::StrictNotEq | Op::EqEq | Op::NotEq
+        Op::In
+            | Op::Abstract(_)
+            | Op::StrictEq
+            | Op::StrictNotEq
+            | Op::EqEq
+            | Op::NotEq
+            | Op::GetProp(..)
+            | Op::GetMethod(..)
+            | Op::GetPropThis(..)
+            | Op::GetPropLocal(..)
+            | Op::SetPropDrop(..)
+            | Op::SetPropThisDrop(..)
+            | Op::SetPropLocalDrop(..)
+            | Op::SetElemLocalDrop(_)
+            | Op::GetMethodElem
+            | Op::InstanceOf(_)
+            | Op::Add
+            | Op::ToStr
+            | Op::MakeObject(..)
+            | Op::MakeArray(_)
+            | Op::MakeArrayLiteral(_)
     )
+}
+
+/// Test builds: whether `code` loads `JitCtx::this_word` into any register but x16 (the helper
+/// path's switch saves it through x16) or loads through x22, the fixed places an explicit-input
+/// node's template must not read on its own (graph-next piece 1): LDR (immediate, unsigned
+/// offset, 64-bit) and LDUR (64-bit) encodings.
+#[cfg(test)]
+pub(crate) fn fixed_place_reads(code: &[u32]) -> bool {
+    let this_imm = (std::mem::offset_of!(JitCtx, this_word) / 8) as u32;
+    code.iter().any(|&insn| {
+        let rn = (insn >> 5) & 31;
+        let rt = insn & 31;
+        let ldr = insn & 0xffc0_0000 == 0xf940_0000;
+        let ldur = insn & 0xffe0_0c00 == 0xf840_0000;
+        (ldr && rn == 19 && (insn >> 10) & 0xfff == this_imm && rt != 16)
+            || ((ldr || ldur) && rn == 22)
+    })
+}
+
+/// Where a lazily switched kind's template ABI takes its receiver from a fixed place (graph-next
+/// piece 1): `JitCtx::this_word` (true) or the slot window (false), which the node passes as an
+/// operand word instead (`jit::ExplicitInputs`). None for every other kind.
+fn explicit_receiver(op: &Op) -> Option<bool> {
+    match op {
+        Op::GetPropThis(..) | Op::SetPropThisDrop(..) => Some(true),
+        Op::GetPropLocal(..) | Op::SetPropLocalDrop(..) | Op::SetElemLocalDrop(_) => Some(false),
+        _ => None,
+    }
 }
 
 /// The slots generic node `node` writes before its template, in the order of its slot inputs
@@ -860,6 +929,10 @@ const SAVE_THIS: u32 = 8;
 const SAVE_ENV: u32 = 16;
 const SAVE_ENV_PARENT: u32 = 24;
 const SAVE_SLOTS: u32 = 32;
+/// Test builds: the compiled frame's this_word at an explicit This node's entry, which its end
+/// checks (graph-next piece 1).
+#[cfg(test)]
+const SAVE_CHECK_THIS: u32 = 40;
 
 /// Out-of-line code, emitted after the body.
 enum Cold {
@@ -1455,8 +1528,19 @@ impl<'a> Gen<'a> {
                 continue;
             };
             let (view, cfg) = self.inlined[frame.chunk as usize];
-            max_stack = max_stack.max(cfg.jit_stack_capacity() + view.jit_frame().1);
+            // At least one word above the capacity: a This kind's receiver word (graph-next
+            // piece 1) where the frame has no slot.
+            max_stack = max_stack.max(cfg.jit_stack_capacity() + view.jit_frame().1.max(1));
             inlined_global |= names_global(&view.jit_ops()[node.pc as usize]);
+            // Test builds: an explicit This node's receiver word, the word at the callee's
+            // capacity, lies inside the record every entry's stack holds (graph-next piece 1).
+            #[cfg(test)]
+            if explicit_receiver(&view.jit_ops()[node.pc as usize]) == Some(true) {
+                assert!(
+                    max_stack > cfg.jit_stack_capacity(),
+                    "an explicit This node's receiver word past the record"
+                );
+            }
         }
         Ok(Assembled {
             words,
@@ -3649,10 +3733,21 @@ impl Gen<'_> {
             Op::New(_, cache) => Some(view.construct_position(cache)),
             _ => None,
         };
+        // Graph-next piece 1: a lazily switched This or Local kind passes its receiver as an
+        // operand word (`jit::ExplicitInputs`): the frame's receiver in the word above the
+        // callee's capacity, or the window word of the one slot it names, which holds a value. A
+        // Local kind whose state does not hold its receiver slot as a value keeps the eager
+        // window.
+        let explicit = (call_site.is_none() && lazy_kind(op) && !poison)
+            .then(|| explicit_receiver(op))
+            .flatten()
+            .filter(|&this| {
+                this || (named.len() == 1 && stale.len() == 1 && stale[0] == named[0].0)
+            });
         let switched = Switched {
-            this: uses.this || poison,
+            this: (uses.this && explicit != Some(true)) || poison,
             env: uses.env,
-            slots: !named.is_empty() || poison,
+            slots: (!named.is_empty() && explicit != Some(false)) || poison,
             call: call_site.is_some(),
             lazy: call_site.is_some() || (lazy_kind(op) && !poison),
         };
@@ -3677,9 +3772,10 @@ impl Gen<'_> {
             let word = self.boxed(v, X16);
             self.a.str_imm(word, X9, (8 * (depth - pops + k)) as u32);
         }
-        // The slot window above the callee's capacity: its named slots' values, and under the
-        // poison switch the poison in every other word of it.
-        if switched.slots {
+        // The slot window above the callee's capacity: its named slots' values (an explicit Local
+        // kind's receiver word among them), and under the poison switch the poison in every other
+        // word of it.
+        if switched.slots || explicit == Some(false) {
             if poison {
                 self.a.mov_imm64(X16, POISON);
                 for slot in (0..n_slots as u16).filter(|slot| !stale.contains(slot)) {
@@ -3692,6 +3788,12 @@ impl Gen<'_> {
                 self.a
                     .str_imm(word, X9, 8 * (capacity as u32 + u32::from(slot)));
             }
+        }
+        // An explicit This kind's receiver word, above the callee's capacity (`Assembled`'s
+        // max_stack keeps a word there).
+        if explicit == Some(true) {
+            let word = self.gp(frame.receiver, X16);
+            self.a.str_imm(word, X9, 8 * capacity as u32);
         }
         if poison {
             // The operand words below its operands (`poison`'s for the compiled frame's nodes).
@@ -3786,6 +3888,7 @@ impl Gen<'_> {
                     frame_site,
                     call_site_off: self.ilayout.call_site as u32,
                     call: true,
+                    explicit: None,
                 })
             }
             None if switched.lazy => None,
@@ -3818,6 +3921,27 @@ impl Gen<'_> {
         let helpers = self.a.set_inlined_frame_helpers(inlined_call.is_none());
         let outer_call = self.a.set_inlined_call(inlined_call);
         // A lazily switched kind (piece B2b): its helper calls switch for it.
+        let explicit_inputs = explicit.map(|this| {
+            let receiver = if this {
+                8 * capacity as u32
+            } else {
+                8 * (capacity as u32 + u32::from(stale[0]))
+            };
+            crate::jit::ExplicitInputs {
+                receiver,
+                receiver_x20: receiver as i32 - (8 * depth) as i32,
+                this,
+                window: (!this).then(|| {
+                    (
+                        8 * capacity as u32,
+                        n_slots as u32,
+                        self.graph.n_slots as u32,
+                    )
+                }),
+                save_this: save + SAVE_THIS,
+                save_slots: save + SAVE_SLOTS,
+            }
+        });
         let outer_node = self
             .a
             .set_inlined_node((switched.lazy && !switched.call).then_some(
@@ -3828,10 +3952,19 @@ impl Gen<'_> {
                     frame_site,
                     call_site_off: self.ilayout.call_site as u32,
                     call: false,
+                    explicit: explicit_inputs,
                 },
             ));
         let fixed = self.a.fixed_activation();
         self.a.set_fixed_activation(view.jit_fixed_activation());
+        #[cfg(test)]
+        if explicit_inputs.is_some_and(|e| e.this) {
+            let this_off = ctx(std::mem::offset_of!(JitCtx, this_word));
+            self.a.ldr_imm(X16, 19, this_off);
+            self.a.str_imm(X16, 31, save + SAVE_CHECK_THIS);
+        }
+        #[cfg(test)]
+        let template_start = self.a.buf.len();
         let emitted = operations::emit(
             &mut self.a,
             view,
@@ -3851,6 +3984,13 @@ impl Gen<'_> {
             emit_exec(&mut self.a, pc as u32, unwind);
             crate::jit::emit_inlined_call_restore(&mut self.a);
         }
+        // Test builds: an explicit-input node's template reads neither JitCtx::this_word nor
+        // through x22 but in its helper paths' switch, or its first instruction becomes a trap
+        // (graph-next piece 1; `fixed_place_reads`).
+        #[cfg(test)]
+        if explicit.is_some() && fixed_place_reads(&self.a.buf[template_start..]) {
+            self.a.buf[template_start] = 0xd420_0000 | (0xb2f0 << 5);
+        }
         self.a.set_fixed_activation(fixed);
         self.a.set_inlined_frame_helpers(helpers);
         self.a.set_inlined_call(outer_call);
@@ -3865,6 +4005,36 @@ impl Gen<'_> {
             self.check_poison(pc, &slots, depth - pops);
         }
         self.restore_context(switched, false);
+        // Test builds: an explicit-input node's helper paths restored what they wrote (graph-next
+        // piece 1): this_word as at its entry, x22 and the window's description the compiled
+        // frame's, or the code traps.
+        #[cfg(test)]
+        if let Some(e) = explicit_inputs {
+            let ok = self.a.new_label();
+            let bad = self.a.new_label();
+            if e.this {
+                self.a
+                    .ldr_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, this_word)));
+                self.a.ldr_imm(X17, 31, save + SAVE_CHECK_THIS);
+                self.a.cmp_reg_x(X16, X17);
+                self.a.b_cond(NE, bad);
+            }
+            if e.window.is_some() {
+                self.a
+                    .ldr_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, slots)));
+                self.a.cmp_reg_x(X16, 22);
+                self.a.b_cond(NE, bad);
+                self.a
+                    .ldr_imm(X16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
+                self.a.movz(X17, self.graph.n_slots as u32, 0);
+                self.a.cmp_reg_x(X16, X17);
+                self.a.b_cond(NE, bad);
+            }
+            self.a.b(ok);
+            self.a.bind(bad);
+            self.a.brk(0xb2f1);
+            self.a.bind(ok);
+        }
         // Test builds: every path of a lazily switched node's template ends unswitched (the
         // trap again, its restore's; `brk` where a switched path did not restore), and the node's
         // end writes the code's own chunk.

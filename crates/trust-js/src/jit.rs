@@ -2746,6 +2746,40 @@ pub(crate) struct InlinedCall {
     /// kind whose template switches lazily too (`Asm::inlined_node`, P3 stage 3 step 3c-2, piece
     /// B2b), whose `site` is its frame's implicit site and whose helpers are the activation's.
     pub(crate) call: bool,
+    /// A lazily switched node whose template ABI reads its receiver from a fixed place (P3 stage
+    /// 3, graph-next piece 1): the receiver's operand word the template reads instead, and what
+    /// its helper calls get written around them. None for every other node.
+    pub(crate) explicit: Option<ExplicitInputs>,
+}
+
+/// An inlined frame's node of a kind whose template takes its receiver from `JitCtx::this_word`
+/// (GetPropThis, SetPropThisDrop) or from the x22 slot window (GetPropLocal, SetPropLocalDrop,
+/// SetElemLocalDrop), switched lazily with its inputs explicit (P3 stage 3, graph-next piece 1;
+/// gnext-impl/design-note.txt): the node writes the receiver into an operand word of the
+/// compiled frame's record and the template reads it there (`emit_receiver_load`), as Maglev's
+/// and the DFG's generic nodes take the receiver as an input (maglev-ir.cc:5295-5310,
+/// DFGSpeculativeJIT64.cpp:161-194); the place the helper reads, this_word or the described
+/// window, is written only around its helper calls (`emit_inlined_call_switch`), as JSC stores
+/// its call site only before a call out (DFGSpeculativeJIT.h:1078-1097).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExplicitInputs {
+    /// The receiver word's byte offset from `JitCtx::stack_base`.
+    pub(crate) receiver: u32,
+    /// The same word's byte offset from x20 at the template's entry.
+    pub(crate) receiver_x20: i32,
+    /// `JitCtx::this_word` written from the receiver word around each helper call (its old
+    /// value saved at `save_this` from sp, and restored).
+    pub(crate) this: bool,
+    /// The slot window described around each helper call: its byte offset from
+    /// `JitCtx::stack_base` (the receiver's slot is a word of it), the inlined frame's slot count
+    /// and the compiled frame's (x22 saved at `save_slots` from sp, and restored).
+    pub(crate) window: Option<(u32, u32, u32)>,
+    pub(crate) save_this: u32,
+    pub(crate) save_slots: u32,
 }
 
 /// The context of an inlined call node's callee frame, for the helper a path of its call
@@ -2771,6 +2805,29 @@ pub(crate) fn emit_inlined_call_switch(a: &mut asm::Asm) {
         a.mov_imm64(21, inlined_call_helpers().as_ptr() as u64);
     } else {
         a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, helpers) as u32);
+    }
+    // An explicit-input node's receiver where its helper reads it (graph-next piece 1): this_word
+    // from the receiver's operand word, or the window that holds it described, as the eager
+    // switch writes them before a node's template (opt::a64 lower_inlined_generic).
+    if let Some(e) = call.explicit {
+        let ctx = |field: usize| field as u32;
+        let stack_base = ctx(std::mem::offset_of!(JitCtx, stack_base));
+        if e.this {
+            let this_off = ctx(std::mem::offset_of!(JitCtx, this_word));
+            a.ldr_imm(16, 19, this_off);
+            a.str_imm(16, 31, e.save_this);
+            a.ldr_imm(16, 19, stack_base);
+            a.ldr_imm(16, 16, e.receiver);
+            a.str_imm(16, 19, this_off);
+        }
+        if let Some((window, n_slots, _)) = e.window {
+            a.str_imm(22, 31, e.save_slots);
+            a.ldr_imm(22, 19, stack_base);
+            a.add_imm(22, 22, window);
+            a.str_imm(22, 19, ctx(std::mem::offset_of!(JitCtx, slots)));
+            a.movz(16, n_slots, 0);
+            a.str_imm(16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
+        }
     }
 }
 
@@ -2801,6 +2858,35 @@ pub(crate) fn emit_inlined_call_restore(a: &mut asm::Asm) {
     a.mov_imm64(16, u64::from(crate::stack_trace::NO_POSITION));
     a.str_w_imm(16, 21, call.call_site_off);
     a.ldr_imm(21, 19, std::mem::offset_of!(JitCtx, helpers) as u32);
+    // An explicit-input node's words back from the save area, which its switch wrote on this
+    // same path (graph-next piece 1): every such restore follows its switch.
+    if let Some(e) = call.explicit {
+        let ctx = |field: usize| field as u32;
+        if e.this {
+            a.ldr_imm(16, 31, e.save_this);
+            a.str_imm(16, 19, ctx(std::mem::offset_of!(JitCtx, this_word)));
+        }
+        if let Some((_, _, own_slots)) = e.window {
+            a.ldr_imm(22, 31, e.save_slots);
+            a.str_imm(22, 19, ctx(std::mem::offset_of!(JitCtx, slots)));
+            a.movz(16, own_slots, 0);
+            a.str_imm(16, 19, ctx(std::mem::offset_of!(JitCtx, n_slots)));
+        }
+    }
+}
+
+/// The receiver word of a template whose receiver lives in a fixed place (`JitCtx::this_word`,
+/// x22's window at `fixed_off`) into `dst`; an explicit-input node's from its operand word
+/// (`ExplicitInputs`, graph-next piece 1). Every other template's code is unchanged.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_receiver_load(a: &mut asm::Asm, dst: u32, fixed_base: u32, fixed_off: i32) {
+    match a.inlined_node().and_then(|node| node.explicit) {
+        Some(e) => emit_exec_word_load(a, dst, 20, e.receiver_x20),
+        None => emit_exec_word_load(a, dst, fixed_base, fixed_off),
+    }
 }
 
 /// Helper table indices (multiplied by 8 in the emitted `ldr`).
@@ -8689,9 +8775,9 @@ fn emit_prop_read_site(
                 emit_ascii_string_length(a, 9, true, done, slow);
             }
         }
-        PropRecv::This => emit_exec_word_load(a, 9, 19, 48), // ctx.this_word
+        PropRecv::This => emit_receiver_load(a, 9, 19, 48), // ctx.this_word
         PropRecv::Slot(off) => {
-            emit_exec_word_load(a, 9, 22, off as i32);
+            emit_receiver_load(a, 9, 22, off as i32);
             if string_length {
                 emit_ascii_string_length(a, 9, false, done, slow);
             }
@@ -8908,7 +8994,7 @@ fn emit_prop_load_inline(
         PropRecv::This => {
             // The packed word at [48]: the slot form's guard and payload, and its packed probe
             // for primitive receivers.
-            emit_exec_word_load(a, 9, 19, 48); // ctx.this_word
+            emit_receiver_load(a, 9, 19, 48); // ctx.this_word
             if wrap_ok {
                 emit_packed_probe_receiver(a);
             } else {
@@ -8917,7 +9003,7 @@ fn emit_prop_load_inline(
             }
         }
         PropRecv::Slot(off) => {
-            emit_exec_word_load(a, 9, 22, off as i32);
+            emit_receiver_load(a, 9, 22, off as i32);
             if string_length {
                 emit_ascii_string_length(a, 9, false, done, slow);
             }
@@ -15507,8 +15593,8 @@ fn emit_prop_write_site(
     let done = a.new_label();
     match recv {
         PropRecv::Stack => emit_exec_word_load(a, 9, 20, -16),
-        PropRecv::This => emit_exec_word_load(a, 9, 19, 48), // ctx.this_word
-        PropRecv::Slot(off) => emit_exec_word_load(a, 9, 22, off as i32),
+        PropRecv::This => emit_receiver_load(a, 9, 19, 48), // ctx.this_word
+        PropRecv::Slot(off) => emit_receiver_load(a, 9, 22, off as i32),
     }
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
     emit_exec_payload(a, 9, 10);
@@ -15701,12 +15787,12 @@ fn emit_set_prop_inline(
             emit_exec_payload(a, 9, 10); // receiver pointer
         }
         PropRecv::This => {
-            emit_exec_word_load(a, 9, 19, 48); // ctx.this_word
+            emit_receiver_load(a, 9, 19, 48); // ctx.this_word
             emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
             emit_exec_payload(a, 9, 10);
         }
         PropRecv::Slot(off) => {
-            emit_exec_word_load(a, 9, 22, off as i32);
+            emit_receiver_load(a, 9, 22, off as i32);
             emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
             emit_exec_payload(a, 9, 10);
         }
@@ -20655,7 +20741,7 @@ fn emit_elem_local_keyed(
     let typed = a.new_label();
     let hit = a.new_label();
     // 1. slot holds an Obj; key (from its source) is a Num, loaded into d0
-    emit_exec_word_load(a, 9, 22, slot_off as i32);
+    emit_receiver_load(a, 9, 22, slot_off as i32);
     emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, slow);
     match key {
         KeySrc::Stack => {
@@ -20680,7 +20766,7 @@ fn emit_elem_local_keyed(
     a.fcmp(0, 1);
     a.b_cond(C_NE, slow);
     // 3. the receiver's cell address straight from the slot (nothing is counted or dropped)
-    emit_exec_word_load(a, 10, 22, slot_off as i32);
+    emit_receiver_load(a, 10, 22, slot_off as i32);
     emit_exec_payload(a, 10, 10);
     // 4. object base; the kind ordinary or Array, and plain (a typed array's view is read with
     //    its tag still in w12)

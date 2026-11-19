@@ -4938,3 +4938,206 @@ fn a_slot_window_is_scanned_at_its_nodes_end_poll_on_a_rust_entry() {
         "every window traced was scanned: {traces:?}"
     );
 }
+
+// ---- graph-next piece 1: the lazy switch with explicit inputs ----------------------------------
+
+/// The kinds piece 1 switches lazily, each reaching its helper from an inlined frame once the
+/// code runs (gnext-impl/design-note.txt, piece 1): a getter and a setter through the inlined
+/// `gx`'s and `sx`'s GetPropThis and SetPropThisDrop and through `lx`'s and `setL`'s
+/// GetPropLocal and SetPropLocalDrop (each recording its caller, whether its receiver is the
+/// object read, and its stack), a Proxy receiver through the same reads and stores and through
+/// `setE`'s SetElemLocalDrop, a null receiver's TypeError from `lx`, a throwing
+/// Symbol.hasInstance through `isP`'s InstanceOf, a valueOf through `add`'s Add, a toString
+/// through `ts`'s ToStr, a Proxy's `get` through `callAt`'s GetMethodElem, and `mk2`'s literals.
+/// Every receiver differs from the one before it, so that a stale receiver word shows.
+const EXPLICIT_INPUTS: &str = "
+var probe = false, log = [];
+function stk(e) { return e.stack.split('\\n').slice(1, 4).join('/'); }
+function P() {}
+P.prototype.gx = function gx() { return this.x; };
+P.prototype.sx = function sx(v) { this.x = v; };
+function lx(o) { return o.x; }
+function setL(o, v) { o.x = v; }
+function setE(a, i, v) { a[i] = v; }
+function isP(o, C) { return o instanceof C; }
+function add(a, b) { return a + b; }
+function ts(x) { return `<${x}>`; }
+function callAt(o, k) { return o[k](); }
+function mk2(a) { return { p: a, q: [a, a] }; }
+function mk(i) {
+  var o = new P();
+  if (i % 6 == 0) o.a = 1; else if (i % 6 == 1) o.b = 1; else if (i % 6 == 2) o.c = 1;
+  else if (i % 6 == 3) o.d = 1; else if (i % 6 == 4) o.e = 1;
+  o.x = i; return o; }
+var objs = []; for (var i = 0; i < 12; i++) objs.push(mk(i));
+var arrs = [[1, 2, 3, 4], new Int8Array(4), { 0: 1, 1: 2, 2: 3, 3: 4 }, [5, 6, 7, 8]];
+var xs = [1, 'a', 2.5, undefined, 'b', 3], ys = [2, 'c', 'd', 4, 5, undefined];
+var callees = [{ f: function () { return 1; } }, { g: 0, f: function () { return 2; } }];
+var keys = ['f', 'f'];
+function hotThis(arr) { var t = 0; for (var i = 0; i < arr.length; i++) { t += arr[i].gx(); arr[i].sx(i + t); } return t; }
+function hotLocal(arr) { var t = 0; for (var i = 0; i < arr.length; i++) { t += lx(arr[i]); setL(arr[i], i + t); } return t; }
+function hotElem(as) { for (var i = 0; i < as.length; i++) setE(as[i], i & 3, i); return as.length; }
+function hotIs(arr, C) { var t = 0; for (var i = 0; i < arr.length; i++) if (isP(arr[i], C)) t++; return t; }
+function hotAdd(as, bs) { var r = []; for (var i = 0; i < as.length; i++) r.push(add(as[i], bs[i])); return r.join(','); }
+function hotTs(as) { var r = ''; for (var i = 0; i < as.length; i++) r += ts(as[i]); return r; }
+function hotCall(os, ks) { var t = 0; for (var i = 0; i < os.length; i++) t += callAt(os[i], ks[i]); return t; }
+function hotMk(n) { var t = 0; for (var i = 0; i < n; i++) t += mk2(i).q.length; return t; }
+var r = 0;
+for (var k = 0; k < 300; k++) {
+  r += hotThis(objs) + hotLocal(objs) + hotElem(arrs) + hotIs(objs, P) + hotAdd(xs, ys).length
+    + hotTs(xs).length + hotCall(callees, keys) + hotMk(4);
+  for (var j = 0; j < objs.length; j++) objs[j].x = j;
+}
+probe = true;
+var out = [];
+function at(tag, thunk) {
+  try { out.push(tag + '|' + thunk()); } catch (e) { out.push(tag + '!' + e.name + ':' + e.message + '|' + stk(e)); } }
+var g = Object.create(P.prototype, { x: {
+  get: function gget() { if (probe) log.push('gget<' + (gget.caller && gget.caller.name) + '|' + (this === g) + '|' + stk(new Error('g'))); return 5; },
+  set: function gset(v) { if (probe) log.push('gset<' + (gset.caller && gset.caller.name) + '|' + (this === g) + '|' + v + '|' + stk(new Error('s'))); } } });
+at('thisAcc', function () { return hotThis([objs[0], g, objs[1]]); });
+at('localAcc', function () { return hotLocal([objs[2], g, objs[3]]); });
+var px = new Proxy(mk(3), {
+  get: function pget(t, key, rcv) { if (probe && key === 'x') log.push('pget<' + String(key) + '|' + (rcv === px) + '|' + stk(new Error('p'))); return Reflect.get(t, key, rcv); },
+  set: function pset(t, key, v, rcv) { if (probe) log.push('pset<' + String(key) + '|' + (rcv === px) + '|' + stk(new Error('q'))); return Reflect.set(t, key, v, rcv); } });
+at('proxyThis', function () { return hotThis([objs[4], px, objs[5]]); });
+at('proxyLocal', function () { return hotLocal([objs[6], px, objs[7]]); });
+at('nullLocal', function () { return hotLocal([objs[8], null]); });
+var pa = new Proxy([0, 0, 0, 0], { set: function eset(t, key, v, rcv) {
+  if (probe) log.push('eset<' + key + '|' + (rcv === pa) + '|' + stk(new Error('e'))); t[key] = v; return true; } });
+at('proxyElem', function () { return hotElem([[1, 2, 3, 4], pa, [9, 9, 9, 9]]); });
+var throwsHI = { [Symbol.hasInstance]: function hi(v) {
+  if (probe) log.push('hi<' + (hi.caller && hi.caller.name) + '|' + stk(new Error('h'))); throw new RangeError('hasInstance'); } };
+at('hasInstance', function () { return hotIs([objs[0], objs[1]], throwsHI); });
+var vo = { valueOf: function vof() { if (probe) log.push('vof<' + (vof.caller && vof.caller.name) + '|' + stk(new Error('v'))); return 7; } };
+at('valueOf', function () { return hotAdd([1, vo, 'z'], [2, 3, vo]); });
+var tso = { toString: function tos() { if (probe) log.push('tos<' + (tos.caller && tos.caller.name) + '|' + stk(new Error('t'))); return 'T'; } };
+at('toString', function () { return hotTs([1, tso, 'u']); });
+var calls = new Proxy({ f: function cf() { return 3; } }, { get: function cget(t, key) {
+  if (probe) log.push('cget<' + String(key) + '|' + stk(new Error('c'))); return t[key]; } });
+at('methodElem', function () { return hotCall([callees[0], calls, callees[1]], ['f', 'f', 'f']); });
+at('again', function () { return hotThis(objs) + hotLocal(objs) + hotIs(objs, P) + hotAdd(xs, ys) + hotTs(xs) + hotMk(5); });
+probe = false;
+r + '\\n' + log.join('\\n') + '\\n' + out.join('\\n')";
+
+#[test]
+fn explicit_input_kinds_give_their_helpers_the_frames_receiver_chunk_and_site() {
+    inlined_generic();
+    let runs = counted(EXPLICIT_INPUTS, 0, false, false);
+    let expected = &runs[0].0;
+    assert_eq!(&runs[1].0, expected, "splice");
+    assert_eq!(&runs[2].0, expected, "graph");
+    for seen in [
+        "gget<gx|true|",
+        "gset<sx|true|",
+        "gget<lx|true|",
+        "gset<setL|true|",
+        "pget<x|true|",
+        "pset<x|true|",
+        "nullLocal!TypeError:",
+        "eset<",
+        "hi<isP|",
+        "hasInstance!RangeError:hasInstance|",
+        "vof<add|",
+        "tos<ts|",
+        "cget<f|",
+        "again|",
+    ] {
+        assert!(expected.contains(seen), "{seen}: {expected}");
+    }
+    let ops = inlined_generic();
+    for (name, kind) in [
+        (
+            "GetPropThis",
+            ops.iter().any(|op| matches!(op, Op::GetPropThis(..))),
+        ),
+        (
+            "SetPropThisDrop",
+            ops.iter().any(|op| matches!(op, Op::SetPropThisDrop(..))),
+        ),
+        (
+            "GetPropLocal",
+            ops.iter().any(|op| matches!(op, Op::GetPropLocal(..))),
+        ),
+        (
+            "SetPropLocalDrop",
+            ops.iter().any(|op| matches!(op, Op::SetPropLocalDrop(..))),
+        ),
+        (
+            "InstanceOf",
+            ops.iter().any(|op| matches!(op, Op::InstanceOf(_))),
+        ),
+        (
+            "GetMethodElem",
+            ops.iter().any(|op| matches!(op, Op::GetMethodElem)),
+        ),
+    ] {
+        assert!(kind, "{name} inlined as a generic node: {ops:?}");
+    }
+    // Collections at every allocation over a shorter warm-up (the debug build's time limit;
+    // every site still runs its generic node from the code before the probes).
+    let stressed = EXPLICIT_INPUTS.replace("k < 300", "k < 30");
+    for (exit_every, stress, source) in [(7, false, EXPLICIT_INPUTS), (0, true, &stressed[..])] {
+        let runs = counted(source, exit_every, stress, false);
+        assert_eq!(
+            runs[2].0, runs[0].0,
+            "exits every {exit_every}, stress {stress}"
+        );
+    }
+    super::take_poison_faults();
+    let runs = counted(EXPLICIT_INPUTS, 0, false, true);
+    assert_eq!(runs[2].0, runs[0].0, "poisoned (the eager switch)");
+    assert_eq!(super::take_poison_faults(), 0, "no poisoned word read");
+}
+
+/// The test builds' scan of an explicit-input node's template (graph-next piece 1): a load of
+/// JitCtx::this_word into any register but x16 (the helper path's save), and any load through
+/// x22, are the fixed-place reads its template must not make.
+#[test]
+fn the_explicit_input_scan_finds_fixed_place_reads() {
+    let ldr =
+        |rt: u32, rn: u32, byte_off: u32| 0xf940_0000 | ((byte_off / 8) << 10) | (rn << 5) | rt;
+    let ldur =
+        |rt: u32, rn: u32, off: i32| 0xf840_0000 | (((off as u32) & 0x1ff) << 12) | (rn << 5) | rt;
+    let this = std::mem::offset_of!(crate::jit::JitCtx, this_word) as u32;
+    let scan = super::a64::fixed_place_reads;
+    assert!(scan(&[ldr(9, 19, this)]), "this_word into x9");
+    assert!(!scan(&[ldr(16, 19, this)]), "the switch's save through x16");
+    assert!(scan(&[ldr(9, 22, 16)]), "a window word");
+    assert!(scan(&[ldur(10, 22, -8)]), "a window word, unscaled");
+    assert!(!scan(&[ldr(9, 20, 8), ldur(9, 20, -8)]), "operand words");
+    assert!(
+        !scan(&[0xf900_0000 | (2 << 10) | (22 << 5) | 9]),
+        "a store through x22"
+    );
+}
+
+/// An explicit This node in a callee with no slot whose operand capacity is deeper than its
+/// caller's (graph-next piece 1): its receiver word, the word at the callee's capacity, must lie
+/// inside the record the code declares (`Assembled::max_stack` keeps a word above each inlined
+/// frame's capacity; test builds assert it).
+const SLOTLESS_THIS: &str = "
+function Q() {}
+Q.prototype.deep = function () { return this.x * (this.y + (this.z - (this.w + (this.v + 1)))); };
+function c1(o) { return o.deep(); }
+function mk(i) {
+  var o = new Q(); var k = i % 6;
+  if (k == 0) o.a = 1; else if (k == 1) o.b = 1; else if (k == 2) o.c = 1; else if (k == 3) o.d = 1; else if (k == 4) o.e = 1;
+  o.x = i; o.y = 2; o.z = 3; o.w = 4; o.v = 5; return o; }
+var os = []; for (var i = 0; i < 12; i++) os.push(mk(i));
+var t = 0;
+for (var k = 0; k < 300; k++) for (var j = 0; j < os.length; j++) t += c1(os[j]);
+t";
+
+#[test]
+fn an_explicit_this_nodes_receiver_word_lies_inside_the_record_of_a_shallower_caller() {
+    inlined_generic();
+    let runs = counted(SLOTLESS_THIS, 0, false, false);
+    assert_eq!(runs[2].0, runs[0].0, "graph");
+    assert_eq!(runs[1].0, runs[0].0, "splice");
+    let ops = inlined_generic();
+    assert!(
+        ops.iter().any(|op| matches!(op, Op::GetPropThis(..))),
+        "{ops:?}"
+    );
+}
