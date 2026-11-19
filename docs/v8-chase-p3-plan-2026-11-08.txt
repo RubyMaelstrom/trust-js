@@ -7115,3 +7115,17 @@ DFGLICMPhase.cpp:96-118, 388-413).
   programs at graph, at the splice and under GC stress; the 5-run verifier sweep (the rule
   examined 258 loops whose headers kept facts); the tier's modules in six configurations
   (726 each); the whole library suite with the tier off and on (3,714 each); none failed.
+
+The Splay retention fix's confirmation under GC stress, ended (2026-11-19 12:21;
+target/p3/stage3/step3g-impl/stress-i and stepsplay-review/stress-rest.log). The tier's modules
+(opt:: with jit::opt_a64, the traced and inline-context tests, 651 tests) on the fix's test
+binary with TRUST_JS_GC_STRESS=1 and an exit forced every 100 checks: at graph all 651 passed,
+398 in the first six-hour window and the other 253 run by name without a limit (15 hours:
+three of the inliner's tests take about 70 minutes each in that configuration, and the
+by-literal ones longer); at the splice 589 passed and none failed in two six-hour windows, and
+the last 62 were not reached. With it the deoptimizer's call windows of step 3g's record
+(report-splay.txt 4(b)) are shown at graph, where they were marked inferred. A cost worth
+recording: a test build verifies the heap at every collection, so a test that allocates in a
+loop of thousands of turns runs for an hour or more under GC stress, and the tests of
+by-literal frames are the slowest (one has never finished in six hours); the stress leg of a
+change's check should name the tests it runs.
