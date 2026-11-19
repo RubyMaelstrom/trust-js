@@ -31,9 +31,10 @@ Read first, in this order:
 - The tier: the speculative optimizing tier, crates/trust-js/src/opt/. It builds a graph from a
   function's bytecode and a snapshot of its feedback, on a compile thread, and its code replaces
   the second stage's. TRUST_JS_OPT=1 turns it on. "The tier off" is the default configuration.
-- Splice and graph: the tier's two inlining modes (TRUST_JS_OPT_INLINE). At splice, the default,
-  the tier compiles the spliced bytecode. At graph it inlines callees in its own graph, each with
-  its frame states, as the exemplars do. "The flip" is making graph the default.
+- Splice and graph: the tier's two inlining modes (TRUST_JS_OPT_INLINE). At splice the tier
+  compiles the spliced bytecode. At graph it inlines callees in its own graph, each with its
+  frame states, as the exemplars do. "The flip" made graph the default on 2026-11-19; splice
+  stays selectable, and it is still what the second stage does with the tier off.
 - Exit, discard: a check that fails in the tier's code leaves it for the first stage's code or the
   VM (other engines' deoptimization). Code whose exits reach a limit (100, doubling with each
   recompile) is discarded and the function compiled again on what the exits taught.
@@ -84,7 +85,7 @@ Octane's geomean within 2x, in one session.
   | 1. Frame-state chains, exits through several frames | landed ("Stage 3 step 1 landed") |
   | 2. The graph inliner for callees without effects | landed (step 2), behind TRUST_JS_OPT_INLINE=graph |
   | 3. Effects, calls, throws and `new` in inlined frames (the owner's D6: generic nodes with explicit operands) | landed (steps 3a, 3b and 3c, 3c-2's pieces A, B, B2, B2b, 3d, 3e's stages (a) and (b)); at graph no plan of any measured workload splices any more |
-  | 4. The flip: graph inlining the default | NOT DONE. Its preparation, step 4p (what a discard and a repeated exit cost at graph, five rules), landed rules 1, 2 and 5 and, as step L5, rule 3; rule 4, the exit limit, was measured and left at 100 (an owner question). The last measured blocker, DeltaBlue, is now faster at graph than at the splice (rule K's record). Next deliverable: a rehearsal report (below) |
+  | 4. The flip: graph inlining the default | DONE 2026-11-19 (the plan's record "The flip"). Before it: Its preparation, step 4p (what a discard and a repeated exit cost at graph, five rules), landed rules 1, 2 and 5 and, as step L5, rule 3; rule 4, the exit limit, was measured and left at 100 (an owner question). The last measured blocker, DeltaBlue, is now faster at graph than at the splice (rule K's record). Next deliverable: a rehearsal report (below) |
   | 5. Polymorphic sites: every planned callee a branch from the first compile (D7) | built as "piece D", one commit, checks unfinished (below) |
   | 6. Closures guarded by code | counted: removes nothing in any workload; not built. In its place "piece B", a closure made in the graph as a known callee (React's steady state, about 30%): designed, approved, not started |
   | 7. Direct calls to known callees | counted (1-3% on six workloads); after pieces A and B |

@@ -287,12 +287,12 @@ pub(crate) fn exit_every() -> u32 {
         .unwrap_or(0)
 }
 
-/// TRUST_JS_OPT_INLINE=graph (P3 stage 3, step 2; default `splice`, any other value too): a
-/// function whose inline plan's ways are all leaves (their callees call nothing) is compiled by
-/// the tier on its first stage with those callees built into its graph, each an inlined frame
-/// (`opt::oracle`, `build`'s inliner), where `splice` recompiles its bytecode with them spliced
-/// in (stage 2); every other plan splices either way. Read once a process, as the other
-/// switches.
+/// TRUST_JS_OPT_INLINE (P3 stage 3, step 2): `graph`, the default since the flip (design step 4;
+/// any value but `splice` too): a function whose inline plan's ways are all leaves (their
+/// callees call nothing) is compiled by the tier on its first stage with those callees built
+/// into its graph, each an inlined frame (`opt::oracle`, `build`'s inliner), where `splice`
+/// recompiles its bytecode with them spliced in (stage 2); every other plan splices either way.
+/// Read once a process, as the other switches.
 pub(crate) fn inline_graph() -> bool {
     #[cfg(test)]
     if SPLICE_PINNED.with(Cell::get) {
@@ -302,7 +302,7 @@ pub(crate) fn inline_graph() -> bool {
     if let Some(graph) = test_switches().and_then(|switches| switches.inline_graph) {
         return graph;
     }
-    matches!(env_value!("TRUST_JS_OPT_INLINE"), Some("graph"))
+    !matches!(env_value!("TRUST_JS_OPT_INLINE"), Some("splice"))
 }
 
 #[cfg(test)]

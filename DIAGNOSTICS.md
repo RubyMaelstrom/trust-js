@@ -243,8 +243,9 @@ comment/example in the same change.
   fallback, at the discard or, deferred there for executable capacity, at a later entry. Each
   part's time leaves out the log's own printing. The main thread's share of the tier's compiles
   is then the main-thread lines and the compile and refusal lines `on the main thread`.
-  `TRUST_JS_OPT_INLINE=graph` inlines in the tier's graph (P3 stage 3; the default, `splice`,
-  and any other value keep the splices above): a function whose inline plan's ways all call
+  `TRUST_JS_OPT_INLINE` chooses how the tier inlines (P3 stage 3). `graph`, the default since
+  2026-11-19 (any value but `splice` too), inlines in the tier's graph; `splice` keeps the
+  splices above for every plan. At `graph`: a function whose inline plan's ways all call
   nothing (no call or `new` in a callee) is compiled on its first stage, as one with nothing to
   splice, each such callee built into its graph from the callee's own first stage behind the
   guard a splice has, an inlined frame whose exits rebuild the callee's frame and its caller's;

@@ -136,7 +136,8 @@ later. Count the hours a check plan implies before starting it.
   --lib --tests --features embed -- -D warnings`, and the tests nearest the change.
 - For the optimizing tier: its modules (`cargo test -p trust-js --lib --features embed
   opt::`) with the tier off, with `TRUST_JS_OPT=1`, and with `TRUST_JS_OPT=1
-  TRUST_JS_OPT_EAGER=1`; add forced exits (`TRUST_JS_OPT_EXIT_EVERY=100`) and GC stress
+  TRUST_JS_OPT_EAGER=1` (the tier inlines in its graph by default; add
+  `TRUST_JS_OPT_INLINE=splice` where a change touches the splice, while it exists); add forced exits (`TRUST_JS_OPT_EXIT_EVERY=100`) and GC stress
   over the new tests where a change touches exits or the collector's contract. A new or
   changed switch is checked over the whole library suite, not `opt::` alone.
 - Release builds do not run the tier's graph verifier. Before reporting a tier change,
