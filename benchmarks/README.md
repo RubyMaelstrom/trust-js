@@ -93,6 +93,18 @@ Instruction counts (`perf stat -e instructions:u`)
   equal generated code that drew opposite collector modes (totals 1.05% apart) agreed
   to 0.02% on it. Report the collector's part beside it. Splay and Earley-Boyer showed
   no second mode at this length.
+- The same draw reaches benchmarks that are not known as collecting ones: two builds
+  whose generated code for DeltaBlue was the same, word for word but for addresses,
+  stood 0.23% apart at 200 fixed runs, at fixed and at randomized addresses alike,
+  because one build's minor collections found more survivors (5.64 MB promoted against
+  5.17 MB). So before a row between two builds is charged to generated code, count
+  it again with collections deferred (`TRUST_JS_GC_NURSERY_BYTES=8000000000
+  TRUST_JS_GC_MIN_HEAP_BYTES=16000000000`, where the workload's allocation fits in
+  memory): that pair agreed to 0.004% there. A difference that the recount removes is
+  the collector's work; compare the collector's log (`TRUST_JS_GC_LOG=1`: the live set
+  after each collection, the bytes promoted) to tell a draw of the conservative scan,
+  where nothing in the change touches what is kept alive, from a change that really
+  keeps more.
 - PdfJS yields after a time slice of the real clock, so its count follows the machine's
   speed. Give it a deterministic clock before drawing a verdict from it.
 - Under about 1.5%, a difference can be layout: a template's size flipping an admission
