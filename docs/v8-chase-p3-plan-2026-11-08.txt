@@ -7036,3 +7036,82 @@ location: into another global's slot.
   Vue's fixture -0.03% with every compile identical. The other architecture's whole suite:
   2,937 passed, none failed. Two of the coordinator's programs joined the tests (e3b256a5: two
   moves in one loop across three names; the read side in a function with a direct eval).
+
+The repeated tag test landed (143d39aa, 990b6cbd; 2026-11-19; target/p3/stage3/ctag-impl,
+report.txt and design-note.txt with its addenda, the agent's; the count it rests on,
+select-impl/report.txt; the coordinator's checks target/p3/stage3/stepctag-review and
+stack-review). A value that a check has proven an object's stays one: its tag cannot change,
+whatever a call does. The builder keeps that as a bit of the value's forms, kept where every
+predecessor of a join holds it, as Maglev's node type survives side effects and merges at
+joins (maglev-known-node-aspects.h:247-252, 281-283) and JSC's abstract value keeps SpecCell
+through a clobber; a shape check of such a value tests no tag and takes its cell again
+(Maglev's CheckMaps with kOmitHeapObjectCheck, maglev-ir.cc:2631), and the inliner's callee
+guard does not test a receiver so proven (second commit). The verifier proves on the graph
+that every check so relieved has a proof on every path to it.
+- Measured against main's engine (fat LTO; the coordinator's builds, stack-review; instructions
+  at graph at 200 runs, the first commit | both): Richards -1.67% | -3.89%, DeltaBlue -0.45% |
+  -2.71%, Box2D -0.73% | -0.97%, GBEMU -0.83% | -0.83%, Crypto -0.58% | -0.81%, RayTrace -0.35%
+  | -0.49%, Earley-Boyer -0.38% with the marker off; the splice alike; the tier off equal.
+  Cycles for both, five rounds at randomized addresses on a loaded machine: Richards -2.1%,
+  DeltaBlue -1.4%, Box2D -0.6%, Crypto -0.3%, GBEMU -0.3%. Each row is the count's prediction
+  to within a quarter, most within a twentieth: the count's cost model holds.
+- Three forms of the fact were built and measured (the agent's table): a separate set (5-run
+  compile cost +0.15% on Richards), the bit (+0.03%), and "the value has a cell form" (no
+  cost, but it loses the joins whose arms check the value again: GBEMU -0.71% against -0.82%).
+  The bit landed, as the exemplars' merge at a join. The checked cell is taken again from the
+  word and not kept: keeping it is better only on GBEMU (-1.40%) and Crypto and worse on four
+  others, because the kept value takes a register from something hotter.
+- Tests: the fact's and the guards' with their 23 mutations (all caught; three needed new
+  tests); the coordinator's programs (primitives reaching a read through a join; Number and
+  String receivers through strict and sloppy methods; null and undefined) equal at every mode.
+- Open: a per-site choice between keeping and retaking the cell is the allocator's (GBEMU
+  0.6%, Crypto 0.09% at most); a phi of proven values (0.04% at most); the kind test beside
+  the tag test, which would about double the gain, waits on an object's kind being immutable
+  once JavaScript can see it.
+
+F4 part 1 landed: a global read leaves a loop that runs no effect (62c19047 to 8edf64c4, eleven
+commits; 2026-11-19; target/p3/stage3/f4-impl, design-note.txt sections 0 to 3 and
+report-part1.txt, the agents'; the coordinator's programs target/p3/stage3/stepb-review/f4adv
+and checks stack-review). The tier loaded a global-object property, checked its kind and loaded
+a typed array's view and data again at every read, also inside a loop that runs nothing able
+to change them: the loop rule of step 0c named locals and closure variables as loop invariants
+and not globals. Mandreel's two hottest loops read four heap views that way (4,030M of its
+6,456M global reads in the tier's code sit in loops with no effect). The read's own nodes are
+now made once at the loop's entry edge and the header keeps the value, as Ion's and the DFG's
+LICM move a global's load out of a loop that writes none (jit/LICM.cpp:154-172;
+DFGLICMPhase.cpp:96-118, 388-413).
+- Measured (fat LTO; the coordinator's builds over the tag test): Mandreel at 200 runs -14.13%
+  instructions and -15.1% cycles at graph, the splice alike; at 5 runs -0.95%; Crypto -0.18%
+  instructions and +0.10% cycles (its hot function's later loops sit 48 bytes further on;
+  measured, the cause inferred); nothing else beyond its spread; a micro's loop over three
+  global typed arrays 122 -> 26 instructions an iteration.
+- A MISCOMPILE in its first form, found by the coordinator's programs and by nothing of the
+  piece's own (22 tests, the sweep at graph): a function inlined into the loop that stores the
+  global (through an alias of the global object, by name, a script-level lexical) was not
+  among the loop's stores, because the loop's analysis runs on bytecode before the graph is
+  built and listed the compiled function's own operations only; the header then kept the
+  entry's value. Every test of the piece had stored in the compiled function itself. The
+  rule now: what a loop that keeps heap facts may write is the union over its own operations
+  and every frame the build may inline into it, at every depth, from a summary each inlined
+  chunk carries; and the verifier states it on the built graph (a loop whose header kept
+  facts holds, in any frame, no effect and no store that could end one; its classification
+  of nodes has no default arm). A census over every workload found no loop that loses a fact
+  to the rule: the class never occurred in them. The older facts of step 0c were safe by two
+  properties nobody had written down (the planner inlines no callee that stores a free name;
+  a frame that calls is generic); neither is relied on any more.
+- The entry checks' reason. A hoisted copy of the read's own check keeps the read's reason
+  and teacher, so that after the global object's layout changes once the recompile hoists
+  again; but only where the read ran since the compile: a read on a path the loop no longer
+  takes is marked not to be hoisted, alone. That is Ion's distinction (an LICM bailout that a
+  baseline fallback confirms is the guard's own; otherwise LICM is off for the script,
+  BaselineBailouts.cpp:2061-2084), narrowed from the script to the read. The coordinator's
+  first decision (always the read's reason) cost a blind read one exit cycle per layout
+  change (56,100 exits over 300 changes against none); its own condition found that.
+- DeltaBlue read +0.23% at graph at 200 runs with the union rule and is not its doing: the
+  generated code is the same word for word, and with collections deferred the row is +0.004%.
+  It is the conservative scan's draw between two builds, as TypeScript's modes are
+  (benchmarks/README.md has the control since).
+- Checks of the two pieces together, on the stack they landed as: the coordinator's 53
+  programs at graph, at the splice and under GC stress; the 5-run verifier sweep (the rule
+  examined 258 loops whose headers kept facts); the tier's modules in six configurations
+  (726 each); the whole library suite with the tier off and on (3,714 each); none failed.
