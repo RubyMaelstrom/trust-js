@@ -7525,3 +7525,43 @@ code yet).
   are at sites with more than four live shapes), real for the tier, which refuses to lower a
   site whose record keeps dead shapes (GBEMU 17.3M inlined generic loads at sites that are
   monomorphic today; DeltaBlue's stale walks).
+
+F4 part 2, layer 1's residuals landed (4464ea9b; 2026-11-19; target/p3/stage3/f4p2-impl,
+report-partA.txt, the agent's; the coordinator's check target/p3/stage3/parta-review).
+- Rule U2 (a watched global's every shape is a fresh serial, no transition entry read or
+  written for it) keeps its meaning and loses its cost: the test for "watched" runs only
+  where a transition lookup misses, which is where a watched map always arrives, and a hit
+  asserts in debug builds that the map is not watched. The exemplars' globals: V8's is a
+  dictionary-mode object with a map of its own (factory.cc:3524-3533; additions change no
+  map, js-objects.cc:2991-3008); JSC's becomes a cacheable dictionary at its creation
+  (JSGlobalObject.cpp:1019, JSObject.cpp:4138-4143); SpiderMonkey's is not created a
+  dictionary, its shape unique because the base shape holds class and realm
+  (Shape.h:238-247).
+- The named-data copy is back to its code before layer 1, with debug assertions for the two
+  facts that made its watched tests dead.
+- Corrected from layer 1's record: the tree-walker's generic store did not report twice
+  (103,013 reports for 103,000 stores); the cost was the census's counters, which now count
+  only under TRUST_JS_OPT_LOG. And the lookup that read 150 instructions slower on the watched
+  global was a draw of one build pair, not a cost: the key index hashes an atom's address, so
+  its probe length differs between binaries; between the coordinator's builds the two read
+  the same.
+- R-5, the review's hardening: an engine's teardown clears the thread's pointer to its
+  global's fuse before its heap goes. Found on the way: with two engines alternating on a
+  thread, the engine that was not last installed took the registry's lock on every reported
+  store; an entry that switches the thread's Agent now installs that engine's fuse. A first
+  form that installed at every entry cost Djot's steady state +0.16% (every native call's
+  return passes there) and was replaced. Left, correct and slow: an engine's code run inside
+  a host's raw-access guard entered while another engine was active reports through the
+  registry for the guard's length; the form that ends it is SpiderMonkey's, the fuses kept
+  with the heap (Watchtower.cpp:760), which the next agent builds if its reading holds.
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/4464ea9b against 632b3cc2; 5
+  fixed runs, collections deferred; the tier off): React's fixture and steady state -0.021%
+  and -0.028% (layer 1 had cost them +0.034% and +0.036%), Vue +0.009% and -0.019%, Djot
+  +0.016% and +0.022%, Richards +0.016%, RegExp +0.047% (an addition to the global costs
+  about 50 instructions more: the miss path's lookups come before the test), the rest within
+  0.011%; Octane's mean +0.007%. Layer 1 and its residuals together are level on the fixtures.
+- Checked: 53 adversarial programs at six modes (the tree-walker among them) and against
+  main's engine; the agent's seven mutations, its 74 nearest tests with the tier off, at
+  graph and at the splice, zombie's check, and a whole-library run with the tier off on the
+  commit's first form (3,779 passed; the one failure is the loop-cache test of the next
+  record, which fails on main without this commit).
