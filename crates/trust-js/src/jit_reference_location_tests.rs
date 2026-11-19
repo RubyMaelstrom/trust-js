@@ -132,3 +132,32 @@ fn reference_location_store_to_a_direct_evals_var() {
         false,
     );
 }
+
+#[test]
+fn reference_location_two_moves_in_one_loop_across_three_names() {
+    // The coordinator's r1: an earlier property removed while the loop runs, then the name
+    // deleted and added again past a new property, with compound assignments of two names.
+    check(
+        "globalThis.p=10;globalThis.q=20;globalThis.x=0;globalThis.r=30;globalThis.s=40;
+         for(var i=0;i<3000;i++){x=i;if(i===1500){delete globalThis.p;}
+           if(i===2200){delete globalThis.x;globalThis.t=7;globalThis.x=-1;}x=x+1;r+=1;}
+         [typeof p,q,x,r,s,t].join(' ')",
+        "undefined 20 3000 3030 40 7",
+        true,
+    );
+}
+
+#[test]
+fn reference_location_load_through_a_logical_assignment_in_a_function_with_a_direct_eval() {
+    // The coordinator's r2: the read side (`||=`) and a compound store in a function whose
+    // direct eval makes every free name a Reference.
+    check(
+        "globalThis.a=1;globalThis.x=2;globalThis.b=3;var acc=0;
+         function f(n){for(var i=0;i<n;i++){eval('');x=i;
+           if(i===900){delete globalThis.x;globalThis.y=5;globalThis.x=0;}acc+=(x||=9);x+=2;}
+           return acc;}
+         var v=f(2500);[a,x,b,y,v].join(' ')",
+        "1 2501 3 5 3122868",
+        true,
+    );
+}
