@@ -8983,6 +8983,7 @@ mod feedback_layout_tests {
                 Value::Num(4.0),
                 &caches[0],
                 &mut set_trace,
+                0,
             )
             .is_ok());
         assert_eq!(set_trace.outcome, Some(PropertyOutcome::Exotic));
@@ -9022,6 +9023,7 @@ mod feedback_layout_tests {
                 Value::Num(9.0),
                 &caches[0],
                 &mut trace,
+                0,
             )
             .is_ok());
 
@@ -9053,6 +9055,7 @@ mod feedback_layout_tests {
                 Value::Num(9.0),
                 &caches[0],
                 &mut trace,
+                0,
             )
             .is_ok());
 
@@ -9241,6 +9244,7 @@ mod feedback_layout_tests {
                 Value::Num(9.0),
                 &caches[0],
                 &mut trace,
+                0,
             )
             .is_err());
 
@@ -24045,7 +24049,7 @@ fn set_named_property(
     value: Value,
     cache: &std::cell::Cell<IcState>,
 ) -> Result<(), Abrupt> {
-    set_named_property_at(i, chunk, pc, base, n, value, cache, None)
+    set_named_property_at(i, chunk, pc, base, n, value, cache, None, 0)
 }
 
 /// [`set_named_property`] for a native store whose helper stub calls setters through the
@@ -24062,14 +24066,15 @@ fn set_named_property_at(
     value: Value,
     cache: &std::cell::Cell<IcState>,
     form: Option<u32>,
+    probed: usize,
 ) -> Result<(), Abrupt> {
     let (name, key) = (&chunk.names[n as usize], chunk.name_key(n));
     if !chunk.feedback.detailed_enabled() {
         let site = form.map(|form| (chunk, pc as u32, form));
-        return i.set_prop_ic(base, name, key, value, cache, site);
+        return i.set_prop_ic(base, name, key, value, cache, site, probed);
     }
     let mut trace = crate::feedback::CurrentPropertyTrace::default();
-    let result = i.set_prop_ic_profiled(base, name, key, value, cache, &mut trace);
+    let result = i.set_prop_ic_profiled(base, name, key, value, cache, &mut trace, probed);
     chunk
         .feedback
         .observe_current_property(pc, &chunk.feedback_shapes, trace);
@@ -30159,6 +30164,19 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
     jit_opstat(ctx, pc);
     let i = &mut *ctx.interp;
     let chunk = &*ctx.chunk;
+    // The store table's token (`Interp::store_probe_token`), taken and cleared for every store
+    // that reaches this entry: the site's generated code probed the table and missed when it
+    // names this site's cache, and the store then does not probe it again (one probe a miss).
+    let token = i.store_probe_token[0].replace(0);
+    let entry = i.store_probe_token[1].get();
+    let probed = |cache: &std::cell::Cell<IcState>| {
+        // Bit 0 set: probed, whatever the entry word (8-aligned, so its slot is unchanged).
+        if token == cache as *const _ as usize {
+            entry | 1
+        } else {
+            0
+        }
+    };
     let _inline_position = ImplicitCallPosition::enter(ctx.interp, chunk, pc as usize);
     // The store's setter form, for the stores' helper stub's setter call (ARM64 only: no other
     // code reads the setter table).
@@ -30178,6 +30196,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                 v,
                 &chunk.caches[c as usize],
                 form(SETTER_STORE_KEEP),
+                probed(&chunk.caches[c as usize]),
             )?;
             sp.write(v);
             sp = sp.add(1);
@@ -30199,6 +30218,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                 v,
                 &chunk.caches[c as usize],
                 form(SETTER_STORE_DROP),
+                probed(&chunk.caches[c as usize]),
             )
         }
         Op::SetPropThisDrop(n, c) => {
@@ -30214,6 +30234,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                 v,
                 &chunk.caches[c as usize],
                 form(SETTER_STORE_THIS),
+                probed(&chunk.caches[c as usize]),
             )
         }
         Op::SetPropLocalDrop(s, n, c) => {
@@ -30238,6 +30259,7 @@ pub(crate) unsafe extern "C" fn jit_set_prop(
                 v,
                 &chunk.caches[c as usize],
                 form(SETTER_STORE_LOCAL | (u32::from(s) * 8) << 8),
+                probed(&chunk.caches[c as usize]),
             )
         }
         _ => unreachable!("jit_set_prop emitted only for property stores"),

@@ -4404,6 +4404,8 @@ impl StubEntry {
 
 /// Stub-cache capacity (power of two). 4096 × 40-byte entries = 160 KiB.
 pub(crate) const STUB_CACHE_SIZE: usize = 4096;
+/// Store-cache capacity (power of two). 4096 × 40-byte entries = 160 KiB per engine.
+pub(crate) const STORE_CACHE_SIZE: usize = 4096;
 const COMPUTED_STUB_KEY_MAX_BYTES: usize = 256;
 
 /// Whether a named read of `name` is left to the general [[Get]] rather than the property ICs'
@@ -4538,7 +4540,70 @@ fn stub_slot(shape: u32, key: crate::atom::PropKey) -> usize {
     (shape as usize ^ n ^ (n >> 7)) & (STUB_CACHE_SIZE - 1)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// `Interp::try_ic_set`'s probes of the store table and their hits, for tests of the one
+    /// probe a miss (`Interp::store_probe_token`).
+    pub(crate) static TEST_STORE_TABLE_PROBES: std::cell::Cell<[usize; 2]> =
+        const { std::cell::Cell::new([0, 0]) };
+}
+
+/// The store table's index for a (receiver shape, key, prototype) triple (`Interp::store_cache`):
+/// the read table's mix of shape and key, and the prototype's address (`Gc::as_ptr`, 0 for
+/// none) with its alignment bits shifted off, so that one shape under many prototypes (a base
+/// constructor's `this.x =` on instances of many classes) spreads over the table. Generated code
+/// computes the same (`jit::emit_store_mega`).
+#[inline(always)]
+pub(crate) fn store_slot(shape: u32, key: crate::atom::PropKey, proto: usize) -> usize {
+    let n = key.word() as usize >> 3;
+    let p = proto >> 4;
+    (shape as usize ^ n ^ (n >> 7) ^ p ^ (p >> 12)) & (STORE_CACHE_SIZE - 1)
+}
+
 impl Interp {
+    /// The store table's entry for a store of `key` into a receiver of `shape` under the
+    /// prototype `proto` (`Gc::as_ptr`, 0 for none), when it holds that key.
+    #[inline]
+    pub(crate) fn store_cache_get(
+        &self,
+        shape: u32,
+        key: crate::atom::PropKey,
+        proto: usize,
+    ) -> Option<StubEntry> {
+        let entry = self.store_cache[store_slot(shape, key, proto)].get();
+        (entry.key == Some(key)).then_some(entry)
+    }
+
+    /// Store a store resolution: the store fill's alone, under R2 (its callers fill a store way
+    /// only where `may_store_in_line` holds, and an entry here only where they do), and only
+    /// after `ic_insert` took the same state into the site's ways: its `has_cacheable_shapes`
+    /// (the receiver's shape, `shape`, among them) is the proof that the table holds no
+    /// uncacheable shape. In line in the fill, with no check of its own: an always-missing
+    /// creation site fills on every store (piece 1c's always-wrong case).
+    #[inline(always)]
+    /// `probed` is the entry the store's generated probe met (`store_probe_token`), whose slot is
+    /// this store's (the same receiver, key and prototype, nothing run between), else 0: the
+    /// slot is hashed.
+    fn store_cache_put(
+        &self,
+        probed: usize,
+        shape: u32,
+        key: crate::atom::PropKey,
+        proto: usize,
+        st: crate::bytecode::IcState,
+    ) {
+        debug_assert!(st.recv_shape == shape && st.has_cacheable_shapes());
+        let stride = std::mem::size_of::<std::cell::Cell<StubEntry>>();
+        let off = probed.wrapping_sub(self.store_cache.as_ptr() as usize);
+        let slot = if off < STORE_CACHE_SIZE * stride {
+            off / stride
+        } else {
+            store_slot(shape, key, proto)
+        };
+        debug_assert_eq!(slot, store_slot(shape, key, proto));
+        self.store_cache[slot].set(StubEntry { key: Some(key), st });
+    }
+
     /// Probe the megamorphic property cache. An entry holds its key, a word that names one
     /// property for the heap's whole life.
     #[inline]
@@ -4709,6 +4774,12 @@ pub(crate) struct InterpLayout {
     /// `stub_cache`: the engine-wide property cache's entries (a boxed array: one pointer), which
     /// the shared read stubs probe through `ctx.interp` (the megamorphic line's piece 1b).
     pub stub_cache: usize,
+    /// `store_cache`: the engine-wide store cache's entries (a boxed array: one pointer), which
+    /// the shared store stubs probe through `ctx.interp` (the megamorphic line's piece 1c).
+    pub store_cache: usize,
+    /// `store_probe_token`: where a store site's probe of the store table that missed leaves the
+    /// site's cache address for its helper (one probe a miss, piece 1c).
+    pub store_probe_token: usize,
     pub valid: bool,
 }
 
@@ -4789,6 +4860,8 @@ pub(crate) fn interp_layout(i: &mut Interp) -> InterpLayout {
         computed_read_sets: off(&i.computed_reads.raw_sets as *const _ as usize),
         computed_read_mask: off(&i.computed_reads.mask as *const _ as usize),
         stub_cache: off(&i.stub_cache as *const _ as usize),
+        store_cache: off(&i.store_cache as *const _ as usize),
+        store_probe_token: off(&i.store_probe_token as *const _ as usize),
         valid: true,
     }
 }
@@ -4920,6 +4993,28 @@ pub struct Interp {
     /// (`stub_slot`), overwritten on a fill, as SpiderMonkey's MegamorphicCache
     /// (vm/Caches.h:204-211). A boxed array: one thin pointer to the entries.
     pub(crate) stub_cache: Box<[std::cell::Cell<StubEntry>; STUB_CACHE_SIZE]>,
+    /// The engine-wide store cache (the megamorphic line's piece 1c), a table of its own as V8's
+    /// store stub cache (execution/isolate.cc:6266), JSC's MegamorphicCache store entries
+    /// (runtime/MegamorphicCache.h:240-250) and SpiderMonkey's MegamorphicSetPropCache
+    /// (vm/Caches.h:269-366): (receiver shape, key, prototype) to an update of an own writable data
+    /// property (depth 0) or a creation (`IC_CREATE`: the prototype's identity and the creation
+    /// epoch, then the landing shape), filled only by the store fill under R2 and never by a
+    /// read. The prototype selects the slot because a shape here does not fix it (a creation's
+    /// proof is the chain's; the exemplars' hidden classes hold the prototype). Same entry
+    /// layout as the read table, allocated at engine start (as all three exemplars allocate
+    /// theirs), per engine.
+    pub(crate) store_cache: Box<[std::cell::Cell<StubEntry>; STORE_CACHE_SIZE]>,
+    /// The store table's one-probe token: the address of a store site's cache (its first way)
+    /// and the address of the table's entry its probe met, which generated code writes when its
+    /// probe of `store_cache` has missed (`jit::emit_store_mega`), right before the site calls its
+    /// store helper. The helper's entry (`bytecode::jit_set_prop`) takes it, clearing the site's
+    /// word, for every store that reaches it, and passes `try_ic_set` the entry only when the
+    /// token names the calling site: the table is then not probed again (one probe a miss, as
+    /// V8's StoreIC_Miss, SpiderMonkey's SetPropertyMegamorphic and JSC's putMegamorphic do not
+    /// probe theirs again) and the fill writes that entry, whose slot the probe computed for the
+    /// same receiver, key and prototype. Addresses, no Value; a token that does not match only
+    /// means "probe as before", and an entry address outside this table only "hash the slot".
+    pub(crate) store_probe_token: [std::cell::Cell<usize>; 2],
     /// The shape chain of an arguments object's named properties (`length`, @@iterator,
     /// `callee`) appended to empty or packed element storage, derived once by ordinary insertion
     /// into this interpreter's heap. Holds only keys and shape ids: no JS value or Realm.
@@ -5375,6 +5470,8 @@ interp_memory_inventory! {
     vm_pool => "measured",
     native_arg_pool => "measured",
     stub_cache => "measured",
+    store_cache => "measured",
+    store_probe_token => "non_owning",
     arguments_shapes => "measured",
     descriptor_maps => "measured",
     iter_result_map => "measured",
@@ -5509,7 +5606,7 @@ fn interp_managed_memory_inventory_is_exhaustive_and_classified() {
             "invalid Interp memory classification for {name}: {class}"
         );
     }
-    assert_eq!(names.len(), 147);
+    assert_eq!(names.len(), 149);
     assert!(
         INTERP_MEMORY_INVENTORY
             .iter()
@@ -7311,6 +7408,11 @@ impl Interp {
                 .into_boxed_slice()
                 .try_into()
                 .unwrap_or_else(|_| unreachable!("the table has STUB_CACHE_SIZE entries")),
+            store_cache: vec![std::cell::Cell::new(StubEntry::EMPTY); STORE_CACHE_SIZE]
+                .into_boxed_slice()
+                .try_into()
+                .unwrap_or_else(|_| unreachable!("the table has STORE_CACHE_SIZE entries")),
+            store_probe_token: [std::cell::Cell::new(0), std::cell::Cell::new(0)],
             arguments_shapes: None,
             descriptor_maps: Default::default(),
             iter_result_map: Default::default(),
@@ -10793,7 +10895,7 @@ impl Interp {
         }
         let scratch = [const { std::cell::Cell::new(crate::bytecode::IcState::EMPTY) };
             crate::bytecode::PROP_IC_WAYS];
-        match self.try_ic_set::<false>(object, key, &value, &scratch[0]) {
+        match self.try_ic_set::<false>(object, key, &value, &scratch[0], 0) {
             IcSet::Stored => Some(Value::Bool(true)),
             _ => None,
         }
@@ -11028,11 +11130,11 @@ impl Interp {
         &self,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         mut st: crate::bytecode::IcState,
-    ) {
+    ) -> bool {
         use crate::bytecode::{IC_EMPTY, IC_MID_GENERIC, PROP_IC_WAYS};
         if !st.has_cacheable_shapes() {
             self.ic_mark_generic(cache);
-            return;
+            return false;
         }
         let generic = cache.get().mid_ok & IC_MID_GENERIC != 0
             || self.ic_way(cache, PROP_IC_WAYS - 1).get().depth != IC_EMPTY;
@@ -11043,6 +11145,7 @@ impl Interp {
             st.mid_ok |= IC_MID_GENERIC;
         }
         cache.set(st);
+        true
     }
 
     /// Mark a named site generic (W4 step 5): its fill was refused, an uncacheable receiver or
@@ -11516,9 +11619,10 @@ impl Interp {
         v: Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         site: Option<(&crate::bytecode::Chunk, u32, u32)>,
+        probed: usize,
     ) -> Result<(), Abrupt> {
         if let ValueView::Obj(o) = &(base).view() {
-            match self.try_ic_set::<true>(o, key, &v, cache) {
+            match self.try_ic_set::<true>(o, key, &v, cache, probed) {
                 IcSet::Stored => return Ok(()),
                 IcSet::Setter { holder, slot } => {
                     let site = site.map(|(chunk, pc, form)| (chunk, pc, form, cache));
@@ -11545,11 +11649,12 @@ impl Interp {
         v: Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
         trace: &mut crate::feedback::CurrentPropertyTrace,
+        probed: usize,
     ) -> Result<(), Abrupt> {
         trace.receiver_shape = self.property_receiver_shape(base);
         if let ValueView::Obj(o) = &(base).view() {
             // Accessors take the canonical [[Set]], whose trace records them.
-            if let IcSet::Stored = self.try_ic_set::<false>(o, key, &v, cache) {
+            if let IcSet::Stored = self.try_ic_set::<false>(o, key, &v, cache, probed) {
                 return Ok(());
             }
         }
@@ -11707,6 +11812,7 @@ impl Interp {
         key: crate::atom::PropKey,
         v: &Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
+        probed: usize,
     ) -> IcSet {
         let mut b = o.borrow_mut();
         // A receiver the store cache cannot hold (an Array or other exotic, a proxy or
@@ -11736,28 +11842,6 @@ impl Interp {
                 }
             }
         }
-        // Stub-cache probe (shared with the get path — a depth-0 entry means "this shape maps
-        // this name at this slot", and accessor/writable are re-checked live either way): a
-        // store site rotating through more shapes than its ways still resolves without the
-        // hashed existence scan below. Promote into way 1 like the get path does.
-        {
-            let shape = b.props.shape();
-            if let Some(e) = self.stub_cache_get(shape, key) {
-                if e.st.recv_shape == shape && e.st.depth == 0 {
-                    if let Some(p) = b.props.property_at(e.st.slot as usize) {
-                        if !p.accessor() && p.writable() {
-                            b.props.set_value_at(e.st.slot as usize, *v);
-                            // A store way only for a property a cache may store to with no
-                            // report (F4 part 2, R2): the stub cache's entries are reads' too.
-                            if self.may_store_in_line(&b.props, e.st.slot as usize) {
-                                self.ic_insert(cache, e.st);
-                            }
-                            return IcSet::Stored;
-                        }
-                    }
-                }
-            }
-        }
         // Creation fast path (see IC_CREATE), every polymorphic way: a shared base constructor
         // commonly initializes subclass instances that have the same empty shape but distinct
         // prototypes. Shape + epoch + prototype identity re-prove the fill-time chain walk, and
@@ -11777,6 +11861,55 @@ impl Interp {
                     if cached_proto == proto_ptr {
                         b.props
                             .append_new(key, Property::plain(*v), st.holder_shape);
+                        return IcSet::Stored;
+                    }
+                }
+            }
+        }
+        // The store table (the megamorphic line's piece 1c), after the site's ways, as the
+        // template's store stub probes it: an update of an own writable data property (the shape
+        // proves the slot and its attributes; live checks kept, as the ways keep them) or a
+        // creation (the prototype's identity and the epoch re-prove the fill's chain walk, as a
+        // creation way's do). A hit is promoted into the site's ways, as a read's hit of the read
+        // table is. Filled by the store fill alone, under R2 (`may_store_in_line`): a hit stores
+        // with no report, as a way does. A store whose generated code has just probed the table
+        // for this site and missed (`probed`: the site's token, which the helper's entry took)
+        // does not probe it again: the table is probed once a miss, as the exemplars' miss
+        // handlers do not probe their caches again (V8's StoreIC_Miss, ic/ic.cc:1160-1170;
+        // SpiderMonkey's SetPropertyMegamorphic, whose lookup is DEBUG-only,
+        // jit/VMFunctions.cpp:2298-2320; JSC's putMegamorphic, jit/JITOperations.cpp:1058-1096).
+        // Skipping a probe that would have hit only loses that hit's fast path: the fill below
+        // stores by the full lookup and writes the same entry.
+        if probed == 0 {
+            use crate::bytecode::IC_CREATE;
+            let shape = b.props.shape();
+            let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
+            #[cfg(test)]
+            TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0] + 1, c.get()[1]]));
+            if let Some(e) = self
+                .store_cache_get(shape, key, proto_ptr)
+                .filter(|e| e.st.recv_shape == shape)
+            {
+                let st = e.st;
+                if st.depth == 0 {
+                    if let Some(p) = b.props.property_at(st.slot as usize) {
+                        if !p.accessor() && p.writable() {
+                            b.props.set_value_at_proven(st.slot as usize, *v);
+                            self.ic_insert(cache, st);
+                            #[cfg(test)]
+                            TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0], c.get()[1] + 1]));
+                            return IcSet::Stored;
+                        }
+                    }
+                } else if st.depth == IC_CREATE && b.extensible() {
+                    let epoch = crate::value::proto_epoch();
+                    let cached_proto = (((st.mid2_shape as u64) << 32) | st.slot as u64) as usize;
+                    if st.mid_shape == epoch && epoch != u32::MAX && cached_proto == proto_ptr {
+                        b.props
+                            .append_new(key, Property::plain(*v), st.holder_shape);
+                        self.ic_insert(cache, st);
+                        #[cfg(test)]
+                        TEST_STORE_TABLE_PROBES.with(|c| c.set([c.get()[0], c.get()[1] + 1]));
                         return IcSet::Stored;
                     }
                 }
@@ -11856,13 +11989,15 @@ impl Interp {
                     mid3_shape: 0,
                     mid4_shape: 0,
                 };
-                self.ic_insert(cache, st);
-                // Mirror into the stub cache (see the probe above).
-                self.stub_cache_set(shape, key, st);
+                // And into the store table (piece 1c), under the same rule, once the ways took it.
+                if self.ic_insert(cache, st) {
+                    let proto_ptr = b.proto.as_ref().map_or(0, |p| Gc::as_ptr(p) as usize);
+                    self.store_cache_put(probed, shape, key, proto_ptr, st);
+                }
                 IcSet::Stored
             }
             None => {
-                if self.try_ic_create(o, b, key, v, cache) {
+                if self.try_ic_create(o, b, key, v, cache, probed) {
                     return IcSet::Stored;
                 }
                 if !ACCESSORS {
@@ -11997,6 +12132,7 @@ impl Interp {
         key: crate::atom::PropKey,
         v: &Value,
         cache: &std::cell::Cell<crate::bytecode::IcState>,
+        probed: usize,
     ) -> bool {
         use crate::bytecode::{IcState, IC_CREATE};
         // Index-like names belong to the dense-element machinery — generic path. (A way made on
@@ -12058,22 +12194,26 @@ impl Interp {
         let Some(loc) = b.props.slot_location(b.props.named_len() - 1) else {
             return true;
         };
-        self.ic_insert(
-            cache,
-            IcState {
-                depth: IC_CREATE,
-                slot: proto_ptr as u32,
-                recv_shape,
-                // The memoized child shape the insert just landed on: hits append straight to it.
-                holder_shape: b.props.shape(),
-                mid_ok: 0,
-                loc,
-                mid_shape: crate::value::proto_epoch(),
-                mid2_shape: ((proto_ptr as u64) >> 32) as u32,
-                mid3_shape: 0,
-                mid4_shape: 0,
-            },
-        );
+        let st = IcState {
+            depth: IC_CREATE,
+            slot: proto_ptr as u32,
+            recv_shape,
+            // The memoized child shape the insert just landed on: hits append straight to it.
+            holder_shape: b.props.shape(),
+            mid_ok: 0,
+            loc,
+            mid_shape: crate::value::proto_epoch(),
+            mid2_shape: ((proto_ptr as u64) >> 32) as u32,
+            mid3_shape: 0,
+            mid4_shape: 0,
+        };
+        // The store table's creation entry (piece 1c): the same state, under the same pin
+        // (below) and epoch, so that a prototype's death fences it as it fences the way
+        // (`gc_prune_dead_pins` moves the epoch before the address can be reused), once the ways
+        // took it.
+        if self.ic_insert(cache, st) {
+            self.store_cache_put(probed, recv_shape, key, proto_ptr, st);
+        }
         let pin = cur.take().map(|p| Gc::downgrade(&p)).unwrap_or_default();
         // A prototype keeps one pin: a fill under a prototype pinned already (the same live
         // object) inserts nothing (TypeScript re-inserted 3.18M times, W2g's census).
@@ -14418,6 +14558,8 @@ impl Interp {
             vm_pool: _,
             native_arg_pool: _,
             stub_cache: _,
+            store_cache: _,
+            store_probe_token: _,
             arguments_shapes: _,
             descriptor_maps: _,
             iter_result_map: _,

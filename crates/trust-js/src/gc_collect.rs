@@ -2302,7 +2302,9 @@ impl Interp {
             jit_admit_runs: _,
             vm_pool,
             native_arg_pool,
-            stub_cache: _, // keys, shapes and slots
+            stub_cache: _,        // keys, shapes and slots
+            store_cache: _, // keys, shapes, slots; creation entries' prototypes by address, pinned
+            store_probe_token: _, // a store site's cache address, taken by the next store helper
             arguments_shapes: _,
             descriptor_maps,
             iter_result_map,

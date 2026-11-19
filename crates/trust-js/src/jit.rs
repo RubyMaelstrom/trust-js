@@ -288,6 +288,14 @@ mod mega_read_tests;
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[path = "jit_mega_store_tests.rs"]
+mod mega_store_tests;
+
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
 #[path = "jit_chain_reoptimize_tests.rs"]
 mod chain_reoptimize_tests;
 
@@ -3228,6 +3236,7 @@ mod shared_stub_tests {
                 );
             }
             keys.push(SharedStub::CallSecondary.key());
+            keys.push(SharedStub::StoreMega.key());
             keys.push(SharedStub::PlainIsArray.key());
             keys.push(SharedStub::ElemStore.key());
             for argc in [3u8, 4] {
@@ -4483,6 +4492,26 @@ mod asm {
                 _ => 0xCA00_0000,
             };
             self.emit(bits | (rm << 16) | (rn << 5) | rd);
+        }
+        /// and/orr/eor xd, xn, xm, lsr #amount (`lsr`) or lsl #amount — op: 0=and, 1=orr, 2=eor
+        /// (logical (shifted register), sf=1, shift 01 for LSR, 00 for LSL; Arm 100076, C6.2.81).
+        pub fn logic_x_shifted(
+            &mut self,
+            op: u32,
+            rd: u32,
+            rn: u32,
+            rm: u32,
+            lsr: bool,
+            amount: u32,
+        ) {
+            assert!(rd < 32 && rn < 32 && rm < 32 && amount < 64);
+            let bits = match op {
+                0 => 0x8A00_0000u32,
+                1 => 0xAA00_0000,
+                _ => 0xCA00_0000,
+            };
+            let shift = if lsr { 1u32 << 22 } else { 0 };
+            self.emit(bits | shift | (rm << 16) | (amount << 10) | (rn << 5) | rd);
         }
         /// lslv/lsrv/asrv wd, wn, wm (shift amount = wm mod 32, matching JS) — op: 0=lsl, 1=lsr, 2=asr
         pub fn shift_w(&mut self, op: u32, rd: u32, rn: u32, rm: u32) {
@@ -15721,6 +15750,7 @@ fn emit_prop_create_probe(
     a: &mut asm::Asm,
     layout: &crate::value::JitLayout,
     name: Option<JitName<'_>>,
+    table_entry: bool,
     miss: usize,
     commit: usize,
 ) {
@@ -15729,9 +15759,14 @@ fn emit_prop_create_probe(
         IC_OFF_MID_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
     };
     let sh = (layout.obj_props + layout.props_shape) as u32;
-    a.ldrb_imm(9, 12, IC_OFF_DEPTH);
-    a.cmp_imm_w(9, IC_CREATE as u32);
-    a.b_cond(C_NE, miss);
+    // A store table's entry (`emit_store_mega`, `table_entry`) comes with its depth and its
+    // prototype compared by the caller, the prototype first: the table's slot mixes in the
+    // prototype, and the entry an always-new prototype meets is a dead prototype's.
+    if !table_entry {
+        a.ldrb_imm(9, 12, IC_OFF_DEPTH);
+        a.cmp_imm_w(9, IC_CREATE as u32);
+        a.b_cond(C_NE, miss);
+    }
     a.ldr_w_imm(13, 11, sh);
     a.ldr_w_imm(14, 12, IC_OFF_RECV_SHAPE);
     a.cmp_reg_w(13, 14);
@@ -15741,13 +15776,15 @@ fn emit_prop_create_probe(
     // instance) fills ways that differ only there, and these compares reject them before the
     // map's checks. The cache stores `Gc::as_ptr(proto)`; Object::proto stores the cell address,
     // the same word (or null).
-    a.ldr_w_imm(14, 12, IC_OFF_SLOT);
-    a.ldr_w_imm(15, 12, IC_OFF_MID2_SHAPE);
-    a.lsl_imm(15, 15, 32);
-    a.logic_x(1, 14, 14, 15);
-    a.ldr_imm(16, 11, layout.obj_proto as u32);
-    a.cmp_reg_x(14, 16);
-    a.b_cond(C_NE, miss);
+    if !table_entry {
+        a.ldr_w_imm(14, 12, IC_OFF_SLOT);
+        a.ldr_w_imm(15, 12, IC_OFF_MID2_SHAPE);
+        a.lsl_imm(15, 15, 32);
+        a.logic_x(1, 14, 14, 15);
+        a.ldr_imm(16, 11, layout.obj_proto as u32);
+        a.cmp_reg_x(14, 16);
+        a.b_cond(C_NE, miss);
+    }
     // Same live global epoch recorded by the fill; saturation is never cacheable.
     a.mov_imm64(16, crate::value::proto_epoch_ptr() as usize as u64);
     a.ldr_w_imm(16, 16, 0);
@@ -15854,6 +15891,142 @@ fn emit_prop_create_probe(
     a.ldp_off(10, 11, 16);
     a.ldp_post(6, 8, 64);
     a.b(room);
+}
+
+/// The engine-wide store table probed by generated code (the megamorphic line's piece 1c), at a
+/// megamorphic store site whose ways missed: x10 = the receiver's cell, x11 = its Object (ordinary
+/// and ic-plain, tested by the caller), x8 = just past the site's last way (as the way loop leaves
+/// it), x6 = the site's key word. Only a site whose way 0 holds the generic mark probes, as only a
+/// megamorphic read site probes the read table (`emit_mega_way`). The entry the receiver's shape,
+/// the key and the receiver's prototype select (`interpreter::store_slot`) is taken when its key
+/// is the site's and validated as a way of the site's own: an update (depth 0: the receiver's
+/// shape, the slot in bounds; the shape proves an own writable data property) lands at `update`
+/// with x15 = the slot's address; a creation (`IC_CREATE`) runs `emit_prop_create_probe` (the
+/// prototype's identity, the epoch, the map's room) and lands at `create` with its registers.
+/// Either is first promoted into the site's ways, as the helper's hit of the table is
+/// (`Interp::try_ic_set` -> `ic_insert`). Anything else branches to `miss`. Process-wide: the
+/// table is found through `ctx.interp`, the key comes from the site. V8's megamorphic stores probe
+/// their store stub cache from a builtin (ic/keyed-store-generic.cc:1157-1161), JSC's
+/// PutByIdMegamorphic its store table (dfg/DFGSpeculativeJIT64.cpp:8610), SpiderMonkey's
+/// megamorphic SetProp its MegamorphicSetPropCache (vm/Caches.h:269-366), whose entries add a
+/// property by a before and after shape, as a creation entry here does. A probe that misses
+/// leaves the site's token (its cache's address) in `Interp::store_probe_token`, so that the
+/// helper the site calls next does not probe the table again, as none of the three exemplars'
+/// miss handlers probes its cache again; a miss after the probe falls through to the code that
+/// follows this sequence, where the caller binds `miss`. Clobbers x5, x7, x9,
+/// x12..x17 and NZCV.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_store_mega(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    il: Option<&crate::interpreter::InterpLayout>,
+    miss: usize,
+    update: usize,
+    create: usize,
+) {
+    use crate::bytecode::{
+        IcState, IC_CREATE, IC_MID_GENERIC, IC_OFF_DEPTH, IC_OFF_LOC, IC_OFF_MID2_SHAPE,
+        IC_OFF_MID_OK, IC_OFF_RECV_SHAPE, IC_OFF_SLOT, PROP_IC_WAYS,
+    };
+    use crate::interpreter::{StubEntry, STORE_CACHE_SIZE};
+    let Some(il) = il.filter(|il| {
+        il.valid && il.store_cache.is_multiple_of(8) && il.store_probe_token.is_multiple_of(8)
+    }) else {
+        a.b(miss);
+        return;
+    };
+    const _: () = assert!(std::mem::offset_of!(StubEntry, key) == 0);
+    let state = std::mem::offset_of!(StubEntry, st) as u32;
+    let stride = std::mem::size_of::<std::cell::Cell<StubEntry>>() as u32;
+    let sh = (layout.obj_props + layout.props_shape) as u32;
+    let ways = (PROP_IC_WAYS * std::mem::size_of::<std::cell::Cell<IcState>>()) as u32;
+    // Every miss after the gate has probed the table: it leaves the site's token (below).
+    let probed_miss = a.new_label();
+    a.sub_imm(15, 8, ways);
+    a.ldrb_imm(15, 15, IC_OFF_MID_OK);
+    a.tbz(15, IC_MID_GENERIC.trailing_zeros(), miss);
+    a.ldr_imm(5, 19, 72); // ctx.interp, kept for the token
+    if il.store_cache / 8 < 4096 {
+        a.ldr_imm(16, 5, il.store_cache as u32);
+    } else {
+        a.mov_imm64(17, (il.store_cache / 8) as u64);
+        a.ldr_x_lsl3(16, 5, 17);
+    }
+    // The slot (`store_slot`): with n = the key's word >> 3 and p = the prototype's address >> 4,
+    // (shape ^ n ^ n >> 7 ^ p ^ p >> 12) & (size - 1). Object::proto holds the cell's address
+    // (`Gc::as_ptr`) or 0, as the creation way records it; x17 keeps it for the creation's
+    // prototype compare.
+    a.ldr_w_imm(13, 11, sh);
+    a.ldr_imm(17, 11, layout.obj_proto as u32);
+    a.lsr_imm(14, 6, 3);
+    a.logic_x_shifted(2, 14, 14, 14, true, 7);
+    a.logic_x(2, 14, 14, 13);
+    a.logic_x_shifted(2, 14, 14, 17, true, 4);
+    a.logic_x_shifted(2, 14, 14, 17, true, 16);
+    a.logic_imm_w(
+        0,
+        14,
+        14,
+        asm::logical_imm_w(STORE_CACHE_SIZE as u32 - 1).expect("a mask of low bits"),
+    );
+    a.movz(15, stride, 0);
+    a.madd(12, 14, 15, 16);
+    a.ldr_imm(15, 12, 0);
+    a.cmp_reg_x(15, 6);
+    a.b_cond(C_NE, probed_miss);
+    // x12 stays the entry until a path goes on (the state is at `state` past it): a creation
+    // whose prototype differs leaves before the add.
+    let creation = a.new_label();
+    a.ldrb_imm(9, 12, state + IC_OFF_DEPTH);
+    a.cbnz(9, false, creation);
+    a.add_imm(12, 12, state);
+    // An update: the receiver's shape (w13) and the slot within the live count.
+    a.ldr_w_imm(14, 12, IC_OFF_RECV_SHAPE);
+    a.cmp_reg_w(13, 14);
+    a.b_cond(C_NE, probed_miss);
+    a.ldr_w_imm(13, 12, IC_OFF_SLOT);
+    named_len(a, layout, 16, 11);
+    a.cmp_reg_x(13, 16);
+    a.b_cond(C_HS, probed_miss);
+    emit_mega_promote(a);
+    a.ldrh_imm(14, 12, IC_OFF_LOC);
+    slot_addr_loc(a, layout, 15, 11, 14);
+    a.b(update);
+    // A creation: the prototype's identity first (the entry an always-new prototype meets holds
+    // a dead prototype's, refused here), then the creation way's probe on the entry, the key
+    // word in x6.
+    a.bind(creation);
+    a.cmp_imm_w(9, IC_CREATE as u32);
+    a.b_cond(C_NE, probed_miss);
+    a.ldr_w_imm(14, 12, state + IC_OFF_SLOT);
+    a.ldr_w_imm(15, 12, state + IC_OFF_MID2_SHAPE);
+    a.logic_x_shifted(1, 14, 14, 15, false, 32);
+    a.cmp_reg_x(14, 17);
+    a.b_cond(C_NE, probed_miss);
+    a.add_imm(12, 12, state);
+    let created = a.new_label();
+    emit_prop_create_probe(a, layout, None, true, probed_miss, created);
+    a.bind(created);
+    emit_mega_promote(a);
+    a.b(create);
+    // The table missed: the site's token (its cache's address, its first way) and the entry the
+    // probe met (x12: the entry, or its state) for the store helper it calls next, which then
+    // does not probe the table again and fills that entry (`Interp::store_probe_token`,
+    // `bytecode::jit_set_prop`). Then into `miss`, which the caller binds right after.
+    a.bind(probed_miss);
+    a.sub_imm(15, 8, ways);
+    if (il.store_probe_token + 8) / 8 < 4096 {
+        a.str_imm(15, 5, il.store_probe_token as u32);
+        a.str_imm(12, 5, il.store_probe_token as u32 + 8);
+    } else {
+        a.mov_imm64(17, (il.store_probe_token / 8) as u64);
+        a.str_x_lsl3(15, 5, 17);
+        a.add_imm(17, 17, 1);
+        a.str_x_lsl3(12, 5, 17);
+    }
 }
 
 /// The write barrier's card store (S6 step 10b; `gc_core::card_mark`), emitted after a store of
@@ -15994,7 +16167,12 @@ fn emit_prop_write_site(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-fn emit_prop_write_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, flags: PropWriteFlags) {
+fn emit_prop_write_stub(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    il: Option<&crate::interpreter::InterpLayout>,
+    flags: PropWriteFlags,
+) {
     use crate::bytecode::{
         IC_CREATE, IC_OFF_DEPTH, IC_OFF_HOLDER_SHAPE, IC_OFF_RECV_SHAPE, IC_OFF_SLOT,
     };
@@ -16031,7 +16209,7 @@ fn emit_prop_write_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, flag
         a.ldrb_imm(9, 12, IC_OFF_DEPTH);
         a.cmp_imm_w(9, IC_CREATE as u32);
         a.b_cond(C_NE, update);
-        emit_prop_create_probe(a, layout, None, next, create_commit);
+        emit_prop_create_probe(a, layout, None, false, next, create_commit);
         a.bind(update);
     }
     a.ldrb_imm(9, 12, IC_OFF_DEPTH);
@@ -16052,6 +16230,11 @@ fn emit_prop_write_stub(a: &mut asm::Asm, layout: &crate::value::JitLayout, flag
     a.add_imm(8, 8, ic_stride as u32);
     a.sub_imm(5, 5, 1);
     a.cbnz(5, false, way);
+    // The ways missed: at a megamorphic site, the engine-wide store table's entry (piece 1c),
+    // landing as a way's (the key word is in x6 wherever the site may create).
+    if create {
+        emit_store_mega(a, layout, il, miss, commit, create_commit);
+    }
     a.bind(miss);
     a.movz(9, 0, 0);
     a.ret();
@@ -16226,7 +16409,7 @@ fn emit_set_prop_inline(
             a.ldrb_imm(9, 12, IC_OFF_DEPTH);
             a.cmp_imm_w(9, IC_CREATE as u32);
             a.b_cond(C_NE, update_way);
-            emit_prop_create_probe(a, layout, Some(name), l_way_next, create_commit);
+            emit_prop_create_probe(a, layout, Some(name), false, l_way_next, create_commit);
             a.bind(update_way);
         }
         way(a, 0, l_way_next);
@@ -16236,7 +16419,23 @@ fn emit_set_prop_inline(
         a.add_imm(8, 8, ic_stride as u32);
         a.sub_imm(6, 6, 1);
         a.cbnz(6, false, l_way);
-        a.b(slow);
+        // The ways missed: a site whose ways held the generic mark when its code was made probes
+        // the engine-wide store table (piece 1c, `SharedStub::StoreMega`) before its helper,
+        // with its key word in x6 (the way count's register, spent). Another site passes no key.
+        if create_ok
+            && ways[0].mid_ok & crate::bytecode::IC_MID_GENERIC != 0
+            && shared_stubs_enabled()
+        {
+            a.mov_imm64(6, name.key_word());
+            let stub = a.shared_stub(SharedStub::StoreMega.key());
+            a.bl_label(stub);
+            a.cbz(9, false, slow);
+            a.cmp_imm_w(9, 1);
+            a.b_cond(C_EQ, commit);
+            a.b(create_commit);
+        } else {
+            a.b(slow);
+        }
     }
     a.bind(commit);
     // --- commit: everything validated; from here only writes ---
@@ -17949,6 +18148,15 @@ enum SharedStub {
         any(target_os = "macos", target_os = "linux", target_os = "windows")
     ))]
     CallSecondary,
+    /// [`emit_store_mega`], an in-line named store's probe of the engine-wide store table after
+    /// its ways missed (piece 1c): x10 = receiver, x11 = its Object, x8 = past the site's last
+    /// way, x6 = the site's key word → w9 = 0, 1 (an update: x15 = the slot's address) or 2 (a
+    /// creation: x7, x12, x13 as `emit_prop_create_probe` leaves them).
+    #[cfg(all(
+        target_arch = "aarch64",
+        any(target_os = "macos", target_os = "linux", target_os = "windows")
+    ))]
+    StoreMega,
     /// [`emit_direct_call`] for one arity and receiver form, entered at a call site's primary
     /// hit with its registers → w9 = `DIRECT_CALL_*` (a declined gate keeps x10/x12/x15 for
     /// the site's H_CALL_HIT form).
@@ -18144,6 +18352,7 @@ impl SharedStub {
     const STRING_CALL: u32 = 0x1400;
     const CALL_HIT: u32 = 0x1500;
     const HELPER_INLINED: u32 = 0x1600;
+    const STORE_MEGA: u32 = 0x1700;
 
     fn key(self) -> u32 {
         match self {
@@ -18212,6 +18421,11 @@ impl SharedStub {
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
             SharedStub::CallSecondary => Self::CALL_SECONDARY,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::StoreMega => Self::STORE_MEGA,
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
@@ -18383,6 +18597,11 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
+            Self::STORE_MEGA => SharedStub::StoreMega,
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
             Self::DIRECT_CALL => SharedStub::DirectCall {
                 argc: (key & 0x7f) as u8,
                 with_this: key & 0x80 != 0,
@@ -18525,6 +18744,11 @@ impl SharedStub {
                 ],
             ),
             SharedStub::CallSecondary => named("CallSecondary", &[]),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::StoreMega => named("StoreMega", &[]),
             SharedStub::DirectCall { argc, with_this } => format!(
                 "Stub:DirectCall(argc={argc}{})",
                 if with_this { ",with_this" } else { "" }
@@ -18696,7 +18920,22 @@ impl SharedStub {
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")
             ))]
-            SharedStub::PropWrite(flags) => emit_prop_write_stub(a, layout, flags),
+            SharedStub::PropWrite(flags) => emit_prop_write_stub(a, layout, context.ilayout, flags),
+            #[cfg(all(
+                target_arch = "aarch64",
+                any(target_os = "macos", target_os = "linux", target_os = "windows")
+            ))]
+            SharedStub::StoreMega => {
+                let miss = a.new_label();
+                let update = a.new_label();
+                let create = a.new_label();
+                emit_store_mega(a, layout, context.ilayout, miss, update, create);
+                for (landing, status) in [(miss, 0), (update, 1), (create, 2)] {
+                    a.bind(landing);
+                    a.movz(9, status, 0);
+                    a.ret();
+                }
+            }
             #[cfg(all(
                 target_arch = "aarch64",
                 any(target_os = "macos", target_os = "linux", target_os = "windows")

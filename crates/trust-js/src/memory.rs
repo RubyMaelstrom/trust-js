@@ -1455,6 +1455,9 @@ fn scan_realm(
             .saturating_add(size_of_val::<
                 [std::cell::Cell<crate::interpreter::StubEntry>],
             >(&interp.stub_cache[..]))
+            .saturating_add(size_of_val::<
+                [std::cell::Cell<crate::interpreter::StubEntry>],
+            >(&interp.store_cache[..]))
             .saturating_add(
                 interp
                     .frame_pool

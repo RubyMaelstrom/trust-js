@@ -88,7 +88,8 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
             &first,
             crate::atom::PropKey::from_text(&key),
             &Value::Num(11.0),
-            &cache[0]
+            &cache[0],
+            0
         ),
         crate::interpreter::IcSet::Stored
     ));
@@ -97,7 +98,8 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
             &second,
             crate::atom::PropKey::from_text(&key),
             &Value::Num(13.0),
-            &cache[0]
+            &cache[0],
+            0
         ),
         crate::interpreter::IcSet::Stored
     ));
@@ -114,6 +116,17 @@ fn uncacheable_shapes_skip_property_computed_stub_and_creation_publication() {
         (second.borrow().props.get("beta").unwrap().value()).view(),
         ValueView::Num(9.0)
     ));
+    // The store table (piece 1c) holds no uncacheable shape either: the updates above and a
+    // creation leave no entry, its fill writing only what the ways took (`ic_insert`).
+    let fresh = crate::atom::PropKey::from_text("fresh");
+    assert!(i
+        .store_cache_get(SHAPE_UNCACHEABLE, crate::atom::PropKey::from_text(&key), 0)
+        .is_none());
+    assert!(matches!(
+        i.try_ic_set::<true>(&first, fresh, &Value::Num(5.0), &cache[0], 0),
+        crate::interpreter::IcSet::Stored
+    ));
+    assert!(i.store_cache_get(SHAPE_UNCACHEABLE, fresh, 0).is_none());
 }
 
 #[test]

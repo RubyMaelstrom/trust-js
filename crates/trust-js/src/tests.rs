@@ -3975,6 +3975,126 @@ fn creation_cache_after_address_reuse(tier: crate::bytecode::Tier) {
     );
 }
 
+/// The megamorphic line's piece 1c, the note's test 1f: the store table's creation entry names its
+/// receiver's prototype by address, under the same pin and creation epoch as a creation way. A
+/// creation site made megamorphic by eight prototypes (one empty shape under each) keeps the
+/// victim's entry in the table after its ways evicted it; the victim dies, a new object whose own
+/// prototype holds a setter of the created name takes its address, and the entry must not stand
+/// for the new chain: the setter runs. The fence is `gc_prune_dead_pins`, which moves the epoch
+/// when a pinned prototype dies, before its address can be reused.
+#[test]
+fn store_table_creation_entries_do_not_trust_a_reused_prototype_address() {
+    const CHILD: &str = "TRUST_JS_TEST_ADDRESS_REUSE_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::store_table_creation_entries_do_not_trust_a_reused_prototype_address",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .expect("isolated address-reuse test");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    crate::opt::pin_tier_off_for_test();
+    for tier in [crate::bytecode::Tier::Bytecode, crate::bytecode::Tier::Jit] {
+        crate::scrubbed(|| store_table_creation_after_address_reuse(tier));
+    }
+}
+
+#[inline(never)]
+fn store_table_creation_after_address_reuse(tier: crate::bytecode::Tier) {
+    let mut engine = Engine::new();
+    engine.set_tier(tier);
+    engine.set_tier_threshold(0);
+    eval_to_string(
+        &mut engine,
+        "var C = class { constructor() { this.x = 1; } };
+         var args = [];
+         var hits = 0;
+         var H = { set x(v) { hits++; } };
+         var NTs = [];
+         for (var k = 0; k < 8; k++) { var f = function () {}; f.prototype = {}; NTs.push(f); }
+         var NT = NTs[0];
+         Reflect.construct(C, args, NT);
+         for (var r = 0; r < 4; r++) for (var k = 1; k < 8; k++) Reflect.construct(C, args, NTs[k]);
+         0",
+    );
+    let cached = crate::gc_test::in_frame(|| {
+        let global = crate::value::Value::Obj(engine.interp.global);
+        let nt = engine.interp.member_get(&global, "NT").ok().expect("NT");
+        let proto = engine
+            .interp
+            .member_get(&nt, "prototype")
+            .ok()
+            .expect("NT.prototype");
+        crate::gc_test::HiddenAddress::of(&proto)
+    });
+    eval_to_string(
+        &mut engine,
+        "NT.prototype = null; NTs[0].prototype = null; 0",
+    );
+    engine.interp.gc_collect();
+    engine.interp.gc_collect();
+    let holder = {
+        let global = crate::value::Value::Obj(engine.interp.global);
+        match engine
+            .interp
+            .member_get(&global, "H")
+            .ok()
+            .expect("H")
+            .view()
+        {
+            crate::value::ValueView::Obj(h) => h,
+            _ => panic!("H"),
+        }
+    };
+    let reused = crate::gc_test::in_frame(|| object_at_under(&mut engine, cached, holder))
+        .expect("a new object takes the dead prototype's address");
+    let global = crate::value::Value::Obj(engine.interp.global);
+    assert!(engine
+        .interp
+        .member_set(&global, "P2", crate::value::Value::Obj(reused))
+        .is_ok());
+    assert_eq!(
+        eval_to_string(
+            &mut engine,
+            "NT.prototype = P2;
+             var o = Reflect.construct(C, args, NT);
+             hits + ':' + Object.hasOwn(o, 'x')",
+        ),
+        "1:false",
+        "{tier:?}: the setter on the new prototype's chain runs"
+    );
+}
+
+/// A new object whose prototype is `proto` at `address`, allocating until the allocator hands
+/// that address out.
+#[inline(never)]
+fn object_at_under(
+    engine: &mut Engine,
+    address: crate::gc_test::HiddenAddress,
+    proto: crate::value::Gc,
+) -> Option<crate::value::Gc> {
+    let _ = &engine;
+    let mut held = Vec::new();
+    for _ in 0..200_000 {
+        let object = crate::value::Object::new(Some(proto));
+        if crate::value::Gc::as_ptr(&object) as usize == address.get() {
+            return Some(object);
+        }
+        held.push(object);
+    }
+    None
+}
+
 /// A new plain object at `address`, allocating until the allocator hands that address out.
 #[inline(never)]
 fn object_at(
