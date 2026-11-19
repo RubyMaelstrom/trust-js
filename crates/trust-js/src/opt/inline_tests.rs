@@ -955,7 +955,7 @@ fn the_verifier_refuses_a_guard_unlike_its_call() {
             .nodes
             .iter()
             .find_map(|node| match node.op {
-                NodeOp::CheckCallee { target } => Some(target as usize),
+                NodeOp::CheckCallee { target, .. } => Some(target as usize),
                 _ => None,
             })
             .unwrap();

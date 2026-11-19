@@ -15,8 +15,9 @@
 //!   depth at the pc, handler records the chunk pushes at their depth, and values of a
 //!   representation an exit can box, available at the node that exits; a slot a state marks
 //!   Dead is dead at its pc (`opt::liveness`, checked in tests and debug builds);
-//! - a CheckShape that tests no tag (`object`) takes a word that a CheckObject or CheckShape of it
-//!   proved an object's on every path to it (`proven_objects`; P3 stage 3, c-tag);
+//! - a CheckShape that tests no tag (`object`), or a callee guard that does not test its receiver
+//!   (`this_object`), takes a word that a CheckObject or a CheckShape of it proved an object's on
+//!   every path to it (`proven_objects`; P3 stage 3, c-tag);
 //! - an address (Rep::Ptr) is never a phi's or a frame state's value, so no block edge or exit
 //!   recipe carries one; the signatures let only element nodes take one;
 //! - a loop's entry speculation (stage 2 step 6), CheckNumber [PhiNotNumber] or CheckInt32
@@ -164,7 +165,7 @@ pub(crate) fn verify_frames(
         // environment (a guard whose way requires one, `expected_env`, reads the compiled
         // frame's).
         let frame_free_guard = match node.op {
-            NodeOp::CheckCallee { target } | NodeOp::CalleeMatches { target } => {
+            NodeOp::CheckCallee { target, .. } | NodeOp::CalleeMatches { target, .. } => {
                 chunk_of(FrameIx::COMPILED).is_some_and(|(compiled, _)| {
                     compiled.jit_inline_target(target).expected_env == 0
                 })
@@ -529,7 +530,8 @@ impl Dominators {
 }
 
 /// The word a node proves an object's where it passes: a CheckObject's or a CheckShape's (each
-/// tests the object tag, or takes a word proven so).
+/// tests the object tag, or takes a word proven so), as the builder records it (a callee guard
+/// records nothing).
 fn proved_object(node: &Node) -> Option<NodeIx> {
     match node.op {
         NodeOp::CheckObject | NodeOp::CheckShape { .. } => node.inputs.first().copied(),
@@ -537,14 +539,29 @@ fn proved_object(node: &Node) -> Option<NodeIx> {
     }
 }
 
-/// The proven-object rule (P3 stage 3, c-tag): a CheckShape that tests no tag (`object`) takes a
-/// word that a check proved an object's on every path to it (`proved_object`), earlier in its
+/// The word a node takes as proven an object's without testing its tag: an `object` CheckShape's,
+/// a `this_object` guard's receiver.
+fn omitted_test(node: &Node) -> Option<NodeIx> {
+    match node.op {
+        NodeOp::CheckShape { object: true, .. } => node.inputs.first().copied(),
+        NodeOp::CheckCallee {
+            this_object: true, ..
+        }
+        | NodeOp::CalleeMatches {
+            this_object: true, ..
+        } => node.inputs.get(1).copied(),
+        _ => None,
+    }
+}
+
+/// The proven-object rule (P3 stage 3, c-tag): a CheckShape that tests no tag (`object`), or a
+/// callee guard that does not test its receiver (`this_object`), takes a word that a check proved
+/// an object's on every path to it (`proved_object`), earlier in its
 /// block or on every path into the block, the builder's `Forms::object`: a must-dataflow over the
 /// blocks in reverse postorder, a loop's back edge included, each block's facts at its entry the
 /// intersection of its predecessors' at their ends (none at the entry block).
 fn proven_objects(graph: &Graph, dom: &Dominators) -> Result<(), String> {
-    let omits = |node: &Node| matches!(node.op, NodeOp::CheckShape { object: true, .. });
-    if !graph.nodes.iter().any(omits) {
+    if !graph.nodes.iter().any(|node| omitted_test(node).is_some()) {
         return Ok(());
     }
     // The words some check proves, numbered, and each block's proofs as bits of them.
@@ -605,16 +622,12 @@ fn proven_objects(graph: &Graph, dom: &Dominators) -> Result<(), String> {
         let mut bits = in_of(b, &out);
         for &n in &graph.block(b).body {
             let node = graph.node(n);
-            if omits(node) {
-                let proven = node
-                    .inputs
-                    .first()
-                    .and_then(|&word| bit(word))
-                    .is_some_and(|(w, b)| bits[w] & b != 0);
+            if let Some(word) = omitted_test(node) {
+                let proven = bit(word).is_some_and(|(w, b)| bits[w] & b != 0);
                 if !proven {
                     return Err(format!(
-                        "node {} ({:?} at pc {}): a CheckShape without its tag test on a word no \
-                         check proved an object's on every path",
+                        "node {} ({:?} at pc {}): a check without its tag test on a word no check \
+                         proved an object's on every path",
                         n.index(),
                         node.op,
                         node.pc
@@ -945,7 +958,14 @@ fn representations(
                 ));
             }
         }
-        &NodeOp::CheckCallee { target } | &NodeOp::CalleeMatches { target } => {
+        &NodeOp::CheckCallee {
+            target,
+            this_object,
+        }
+        | &NodeOp::CalleeMatches {
+            target,
+            this_object,
+        } => {
             // A splice's guard is at its InlineGuard; a graph-inlined call's (P3 stage 3, step 2)
             // at its call, of its target's argument count, a plain call's checking no `this`.
             // Its inputs are the callee's word and, for a guard of `this`, the receiver's.
@@ -966,6 +986,9 @@ fn representations(
             let inputs = 1 + usize::from(it.check_this);
             if reps.len() != inputs || reps.iter().any(|&rep| rep != Rep::Tagged) {
                 return Err(format!("operands {reps:?} for {inputs} words"));
+            }
+            if this_object && !it.check_this {
+                return Err("a guard that omits a receiver test it has not".into());
             }
             let check = matches!(node.op, NodeOp::CheckCallee { .. });
             if (check && !matches!(node.rep, Rep::None | Rep::Tagged))

@@ -1548,7 +1548,10 @@ fn via_leaf() -> Graph {
     let at_guard = b.state(2, &[this, callee, x], &[], &[]);
     b.exiting(
         entry,
-        NodeOp::CheckCallee { target: 0 },
+        NodeOp::CheckCallee {
+            target: 0,
+            this_object: false,
+        },
         &[callee],
         Rep::None,
         2,
@@ -1571,6 +1574,41 @@ fn via_leaf() -> Graph {
     let boxed = b.node(entry, NodeOp::F64ToTagged, &[sum], Rep::Tagged, 8);
     b.node(entry, NodeOp::Return, &[boxed], Rep::None, 14);
     b.g
+}
+
+/// P3 stage 3 (c-tag): the verifier refuses a guard that omits a receiver test it does not have
+/// (`this_object` where the target checks no `this`: `leaf` reads none).
+#[test]
+fn a_guard_that_omits_a_receiver_test_it_has_not_is_refused() {
+    let mut engine = fixture(
+        "function leaf(y) { return y + 1; }\n\
+         function viaLeaf(x) { return leaf(x); }",
+    );
+    engine.set_tier(Tier::Jit);
+    eval(&mut engine, "for (var k = 0; k < 20; k++) viaLeaf(k);");
+    let primary = chunk_of(&mut engine, "viaLeaf");
+    let env = engine.interp.global_env;
+    let value = engine.interp.get_var("viaLeaf", &env).ok().unwrap();
+    let object = value.as_obj().unwrap();
+    let (func, realm) = {
+        let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+            panic!("an author function")
+        };
+        (user.func.clone(), user.realm)
+    };
+    let plan = crate::bytecode::plan_inlines(&primary, &func, realm, &env);
+    let inlined = crate::bytecode::compile_with_inlines(&func, &plan, &primary).unwrap();
+    assert!(!inlined.jit_inline_target(0).check_this);
+    let cfg = crate::jit_ir::Cfg::build(&inlined).expect("the chunk's stack depths settle");
+    let mut graph = via_leaf();
+    assert_eq!(crate::opt::verify::verify(&graph, &inlined, &cfg), Ok(()));
+    for node in &mut graph.nodes {
+        if let NodeOp::CheckCallee { this_object, .. } = &mut node.op {
+            *this_object = true;
+        }
+    }
+    let error = crate::opt::verify::verify(&graph, &inlined, &cfg).expect_err("refused");
+    assert!(error.contains("omits a receiver test"), "{error}");
 }
 
 #[test]
@@ -2582,7 +2620,10 @@ fn callee_test_graph(then_next: bool, named: bool) -> Graph {
     let callee = b.node(entry, NodeOp::Projection(1), &[name], Rep::Tagged, 0);
     let test = b.node(
         entry,
-        NodeOp::CalleeMatches { target: 0 },
+        NodeOp::CalleeMatches {
+            target: 0,
+            this_object: false,
+        },
         &[callee],
         Rep::Bool,
         2,
@@ -2647,7 +2688,7 @@ fn a_branch_on_a_callee_test_takes_the_splice_for_the_live_expected_callee_alone
                 let test = graph
                     .nodes
                     .iter()
-                    .position(|node| node.op == NodeOp::CalleeMatches { target: 0 })
+                    .position(|node| matches!(node.op, NodeOp::CalleeMatches { target: 0, .. }))
                     .expect("the callee's test");
                 assert_eq!(
                     fused_tests(&graph)[test],
@@ -5657,6 +5698,111 @@ fn a_check_of_a_proven_object_emits_no_tag_test() {
             tags(&testing) - tags(&built.graph),
             omitting,
             "{name}: one tag test fewer for each check that omits it"
+        );
+    }
+}
+
+/// P3 stage 3 (c-tag): a callee guard whose receiver is proven an object's (`this_object`) emits
+/// no tag test of it: the second stage of a caller whose method load's shape check proves the
+/// receiver, compiled as built and with every guard's `this_object` cleared, differs by one
+/// asr #48 for the guard that omits it, a check (CheckCallee) and, its site flagged, a test
+/// (CalleeMatches).
+#[test]
+fn a_guard_of_a_proven_receiver_emits_no_tag_test() {
+    if crate::bytecode::inline_recompile_at() != 100 {
+        return;
+    }
+    crate::opt::TestSwitches {
+        on: false,
+        ..Default::default()
+    }
+    .set();
+    let mut engine = Engine::new();
+    engine.set_tier(Tier::Jit);
+    engine.set_tier_threshold(0);
+    eval(
+        &mut engine,
+        "function get() { return this.v; }
+         function caller(o) { return o.get(); }
+         var p = {v: 1, get: get};
+         function drive(n) { var t = 0; for (var i = 0; i < n; i++) t += caller(p); return t; }",
+    );
+    fn second(engine: &mut Engine) -> Option<Rc<Chunk>> {
+        let env = engine.interp.global_env;
+        let value = engine.interp.get_var("caller", &env).ok()?;
+        let object = value.as_obj()?;
+        let crate::value::ObjectKind::User(user) = &object.borrow().kind else {
+            return None;
+        };
+        let runtime = user.func.runtime();
+        runtime.code2.get().and_then(Option::as_ref).cloned()
+    }
+    let mut chunk = None;
+    for _ in 0..20 {
+        eval(&mut engine, "drive(150)");
+        if let Some(c) = second(&mut engine) {
+            chunk = Some(c);
+            break;
+        }
+    }
+    let chunk = chunk.expect("caller reached its second stage");
+    let layout = crate::value::jit_layout(&engine.interp.object_proto);
+    let ilayout = crate::interpreter::interp_layout(&mut engine.interp);
+    let asr48 = encode(|a| a.asr_imm(16, 0, 48));
+    let registers = !(31 << 5 | 31);
+    let tags = |graph: &Graph| {
+        let code = compile_graph(&chunk, graph, &layout, &ilayout, Options::default())
+            .unwrap_or_else(|refusal| panic!("the tier refused caller: {refusal:?}"));
+        code_words(&code)
+            .iter()
+            .filter(|&&w| w & registers == asr48 & registers)
+            .count()
+    };
+    // The guard as a check (CheckCallee), then, its site flagged WrongCallee, as a test
+    // (CalleeMatches).
+    for flagged in [false, true] {
+        if flagged {
+            let guard = chunk
+                .jit_ops()
+                .iter()
+                .position(|op| matches!(op, Op::InlineGuard(..)))
+                .expect("the guard");
+            crate::opt::profile::ChunkProfile::of(&chunk).add_site(
+                guard as u32,
+                ExitReason::WrongCallee as u8,
+                false,
+                0,
+                false,
+            );
+        }
+        let snapshot = crate::opt::snapshot::Snapshot::take_in(&chunk, Some(&engine.interp));
+        let built = crate::opt::build::build(&chunk, &snapshot).expect("the tier builds it");
+        let omitting = built
+            .graph
+            .nodes
+            .iter()
+            .filter(|n| match n.op {
+                NodeOp::CheckCallee { this_object, .. } => !flagged && this_object,
+                NodeOp::CalleeMatches { this_object, .. } => flagged && this_object,
+                _ => false,
+            })
+            .count();
+        assert_eq!(
+            omitting, 1,
+            "the guard of a proven receiver, flagged {flagged}"
+        );
+        let mut testing = built.graph.clone();
+        for node in &mut testing.nodes {
+            if let NodeOp::CheckCallee { this_object, .. }
+            | NodeOp::CalleeMatches { this_object, .. } = &mut node.op
+            {
+                *this_object = false;
+            }
+        }
+        assert_eq!(
+            tags(&testing) - tags(&built.graph),
+            omitting,
+            "flagged {flagged}"
         );
     }
 }

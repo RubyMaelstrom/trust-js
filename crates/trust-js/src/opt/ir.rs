@@ -477,16 +477,23 @@ pub(crate) enum NodeOp {
     /// A spliced callee's guard (InlineGuard): inputs the callee word (Tagged), then, when the
     /// InlineTarget's `check_this` is set, the receiver word (Tagged), which must be an object;
     /// the expected callee cell, its closure environment and the planning Realm's global
-    /// environment are the chunk's InlineTarget.
+    /// environment are the chunk's InlineTarget. `this_object`: the receiver word is proven an
+    /// object's (the builder's `Forms::object`), so the guard does not test it again (P3 stage
+    /// 3, c-tag), as Maglev returns a receiver known a JSReceiver with no ConvertReceiver
+    /// (GetConvertReceiver, maglev-reducer-inl.h:4287-4312), JSC folds ToThis of a proven object
+    /// to Identity (dfg/DFGConstantFoldingPhase.cpp:965-970) and SpiderMonkey's MBoxNonStrictThis
+    /// folds to an Object input (jit/MIR.cpp:4322-4328); the receiver stays an input.
     CheckCallee {
         target: u32,
+        this_object: bool,
     },
     /// The test of a guard whose WrongCallee exits the profile flagged (stage 2): inputs as
     /// CheckCallee's; true where the callee, its environment, the Realm and the receiver are as
     /// the guard expects, without an exit (-> Bool), so that the code branches to the splice or
-    /// to the guard's mismatch, the generic call.
+    /// to the guard's mismatch, the generic call. `this_object` as CheckCallee's.
     CalleeMatches {
         target: u32,
+        this_object: bool,
     },
 
     // Conversions (no exit).

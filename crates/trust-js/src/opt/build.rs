@@ -5328,13 +5328,14 @@ impl<'a> Builder<'a> {
     }
 
     /// The words an InlineGuard tests: the callee's, and for a sloppy callee that reads `this`
-    /// the receiver's.
+    /// the receiver's; and whether that receiver is proven an object's (`Forms::object`), which
+    /// the guard then does not test again.
     fn guard_inputs(
         &mut self,
         pc: usize,
         target: u32,
         st: &mut State,
-    ) -> Result<Vec<NodeIx>, Refusal> {
+    ) -> Result<(Vec<NodeIx>, bool), Refusal> {
         // Every way's guard data is the compiled chunk's view's, a nested frame's too (step 3d).
         let targets = self
             .inlined
@@ -5349,11 +5350,14 @@ impl<'a> Builder<'a> {
         }
         let callee = st.stack[len - callee_depth];
         let mut inputs = vec![self.tagged(st, callee, pc)];
+        let mut this_object = false;
         if check_this {
             let receiver = st.stack[len - callee_depth - 1];
-            inputs.push(self.tagged(st, receiver, pc));
+            let word = self.tagged(st, receiver, pc);
+            this_object = self.forms(st, word).object;
+            inputs.push(word);
         }
-        Ok(inputs)
+        Ok((inputs, this_object))
     }
 
     /// InlineGuard (a spliced callee's): the callee and the Realm compared, and for a sloppy
@@ -5361,17 +5365,23 @@ impl<'a> Builder<'a> {
     /// and then the receiver's); a failure exits at the guard, whose mismatch the VM then takes,
     /// so the mismatch edge is not built.
     fn inline_guard(&mut self, pc: usize, target: u32, st: &mut State) -> Result<(), Refusal> {
-        let inputs = self.guard_inputs(pc, target, st)?;
+        let (inputs, this_object) = self.guard_inputs(pc, target, st)?;
         let mut cx = Before::new(pc);
         let state = self.before(&mut cx, st);
         self.add_exit(
-            NodeOp::CheckCallee { target },
+            NodeOp::CheckCallee {
+                target,
+                this_object,
+            },
             &inputs,
             Rep::None,
             pc,
             state,
             ExitReason::WrongCallee,
         );
+        // A guard that tests its receiver proves it an object's, but it records nothing: the
+        // receiver is the word the method load's shape check took before the call, which proved
+        // it already (a guard that tests none, of a callee that reads no `this`, proves nothing).
         Ok(())
     }
 
@@ -5387,8 +5397,16 @@ impl<'a> Builder<'a> {
         target: u32,
         st: &mut State,
     ) -> Result<NodeIx, Refusal> {
-        let inputs = self.guard_inputs(pc, target, st)?;
-        Ok(self.add(NodeOp::CalleeMatches { target }, &inputs, Rep::Bool, pc))
+        let (inputs, this_object) = self.guard_inputs(pc, target, st)?;
+        Ok(self.add(
+            NodeOp::CalleeMatches {
+                target,
+                this_object,
+            },
+            &inputs,
+            Rep::Bool,
+            pc,
+        ))
     }
 }
 

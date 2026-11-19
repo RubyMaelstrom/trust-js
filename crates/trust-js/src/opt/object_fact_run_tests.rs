@@ -99,3 +99,30 @@ fn a_non_object_after_a_phi_still_exits_at_its_check() {
         t",
     );
 }
+
+#[test]
+fn a_guard_of_a_proven_receiver_answers_as_the_vm_does() {
+    // Sloppy methods that read `this`, spliced (or inlined at graph) behind guards whose
+    // receivers the method loads' shape checks proved; and a String receiver, whose method loads
+    // keep its word, that passes the guard of a callee that reads no `this`, which tests no
+    // receiver and so proves nothing, then reaches the guard of one that does, which must test
+    // it: `this` is the String's wrapper there, typeof "object". (A strict callee's guard tests
+    // none either, but no strict callee is spliced into a sloppy function: the callee set keeps
+    // the compiled function's strictness.)
+    agrees_at_every_switch(
+        "
+        function P(k) { this.x = k; this.y = k + 1; }
+        P.prototype.sum = function () { return this.x + this.y; };
+        P.prototype.twice = function () { return this.sum() * 2; };
+        String.prototype.n = function () { return 'n'; };
+        String.prototype.l = function () { return typeof this; };
+        function m(o) { return o.sum() + o.twice(); }
+        function both(v) { return v.n() + v.l(); }
+        var t = 0, last = '';
+        for (var r = 0; r < 3000; r++) {
+          t = (t * 31 + m(new P(r & 63))) % 1000003;
+          last = both('s' + (r & 3));
+        }
+        t + ':' + last",
+    );
+}

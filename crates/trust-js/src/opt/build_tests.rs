@@ -1113,7 +1113,10 @@ fn a_second_stage_guards_its_spliced_callee_and_reads_baseline_records() {
     let Op::InlineGuard(target, mismatch) = ops[guard] else {
         unreachable!()
     };
-    let checks = nodes(&graph, |op| *op == NodeOp::CheckCallee { target });
+    let checks = nodes(
+        &graph,
+        |op| matches!(op, NodeOp::CheckCallee { target: t, .. } if *t == target),
+    );
     assert_eq!(checks.len(), 1, "{text}");
     assert_eq!(checks[0].reason, Some(ExitReason::WrongCallee), "{text}");
     // The callee's word, and the receiver's for a guard of `this`.
@@ -1186,7 +1189,10 @@ fn a_spliced_method_that_reads_this_guards_its_receiver_too() {
         .first()
         .unwrap_or_else(|| panic!("get is spliced: {text}"));
     assert!(transformed.jit_inline_target(target).check_this, "{text}");
-    let checks = nodes(&graph, |op| *op == NodeOp::CheckCallee { target });
+    let checks = nodes(
+        &graph,
+        |op| matches!(op, NodeOp::CheckCallee { target: t, .. } if *t == target),
+    );
     assert_eq!(checks.len(), 1, "{text}");
     assert_eq!(
         checks[0].inputs.len(),
@@ -1628,7 +1634,10 @@ fn a_flagged_guard_branches_to_its_mismatch_without_an_exit() {
         0,
         "{text}"
     );
-    let tests = nodes(&graph, |op| *op == NodeOp::CalleeMatches { target });
+    let tests = nodes(
+        &graph,
+        |op| matches!(op, NodeOp::CalleeMatches { target: t, .. } if *t == target),
+    );
     assert_eq!(tests.len(), 1, "{text}");
     assert_eq!(tests[0].rep, Rep::Bool, "{text}");
     assert!(tests[0].state.is_none(), "no exit: {text}");
@@ -1642,9 +1651,8 @@ fn a_flagged_guard_branches_to_its_mismatch_without_an_exit() {
     else {
         panic!("the guard branches: {text}")
     };
-    assert_eq!(
-        graph.node(last.inputs[0]).op,
-        NodeOp::CalleeMatches { target },
+    assert!(
+        matches!(graph.node(last.inputs[0]).op, NodeOp::CalleeMatches { target: t, .. } if t == target),
         "{text}"
     );
     assert_eq!(

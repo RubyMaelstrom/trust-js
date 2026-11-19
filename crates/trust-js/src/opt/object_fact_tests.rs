@@ -119,3 +119,121 @@ fn the_verifier_refuses_a_check_without_its_tag_test_on_a_word_no_check_proved()
         assert!(error.contains("no check proved"), "{name}: {error}");
     }
 }
+
+/// The guard of a spliced sloppy callee that reads `this` (CheckCallee): `caller`'s receiver is
+/// proven by the method load's shape check before the guard, so the guard does not test it again
+/// (`this_object`); `callNum`'s, a Number's, is proven by nothing, and its guard tests it. Either
+/// guard made to skip a test its receiver needs is refused.
+#[test]
+fn a_guard_of_a_receiver_a_check_proved_does_not_test_it_again() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "function get() { return this.v; }
+         function caller(o) { return o.get(); }
+         Number.prototype.kind = function () { return typeof this; };
+         function callNum(v) { return v.kind(); }
+         var p = {v: 1, get: get};
+         function drive(n) {
+           var t = 0;
+           for (var i = 0; i < n; i++) t += caller(p) + callNum(i).length;
+           return t;
+         }
+         drive(150);",
+    );
+    for (name, proven) in [("caller", true), ("callNum", false)] {
+        let Some(transformed) = second_stage(&mut engine, name, "drive(150)") else {
+            return;
+        };
+        let mut graph = graph_for(&transformed, name);
+        let text = dump(&graph, &transformed);
+        let guards: Vec<NodeIx> = (0..graph.nodes.len() as u32)
+            .map(NodeIx)
+            .filter(|&n| {
+                matches!(
+                    graph.node(n).op,
+                    NodeOp::CheckCallee { .. } | NodeOp::CalleeMatches { .. }
+                ) && graph.node(n).inputs.len() == 2
+            })
+            .collect();
+        let [guard] = guards[..] else {
+            panic!("{name}: one guard of `this`\n{text}")
+        };
+        let (NodeOp::CheckCallee { this_object, .. } | NodeOp::CalleeMatches { this_object, .. }) =
+            graph.node(guard).op
+        else {
+            unreachable!()
+        };
+        assert_eq!(this_object, proven, "{name}\n{text}");
+        if proven {
+            // The receiver word is the one the method load's shape check took.
+            let receiver = graph.node(guard).inputs[1];
+            assert!(
+                shape_checks(&graph)
+                    .iter()
+                    .any(|&(_, word, _)| word == receiver),
+                "{name}\n{text}"
+            );
+        } else {
+            if let NodeOp::CheckCallee { this_object, .. }
+            | NodeOp::CalleeMatches { this_object, .. } = &mut graph.nodes[guard.index()].op
+            {
+                *this_object = true;
+            }
+            let error = verify(&graph, &transformed).expect_err(name);
+            assert!(error.contains("no check proved"), "{name}: {error}");
+        }
+    }
+}
+
+/// A guard that tests no receiver proves nothing: in `both`, whose String receiver's method loads
+/// keep the receiver's word (the String prototype's check), the guard of `n`, a callee that reads
+/// no `this`, does not test that word, so the guard of `l`, which reads it, still tests it (a
+/// strict callee's guard tests none either, but no strict callee is spliced into a sloppy
+/// function).
+#[test]
+fn a_guard_that_tests_no_receiver_proves_nothing() {
+    let mut engine = engine(Tier::Jit);
+    eval(
+        &mut engine,
+        "String.prototype.n = function () { return 'n'; };
+         String.prototype.l = function () { return typeof this; };
+         function both(v) { return v.n() + v.l(); }
+         function drive(k) { var t = ''; for (var i = 0; i < k; i++) t = both('s' + (i & 3)); return t; }
+         drive(150);",
+    );
+    let Some(transformed) = second_stage(&mut engine, "both", "drive(150)") else {
+        return;
+    };
+    let graph = graph_for(&transformed, "both");
+    let text = dump(&graph, &transformed);
+    let guards: Vec<&Node> = nodes(&graph, |op| {
+        matches!(
+            op,
+            NodeOp::CheckCallee { .. } | NodeOp::CalleeMatches { .. }
+        )
+    });
+    assert_eq!(guards.len(), 2, "{text}");
+    for guard in guards {
+        let (NodeOp::CheckCallee { this_object, .. } | NodeOp::CalleeMatches { this_object, .. }) =
+            guard.op
+        else {
+            unreachable!()
+        };
+        assert!(!this_object, "{text}");
+    }
+    // One guard has a receiver to test, `l`'s, and it is the word both calls take: the slot's.
+    let receivers: Vec<NodeIx> = nodes(&graph, |op| {
+        matches!(
+            op,
+            NodeOp::CheckCallee { .. } | NodeOp::CalleeMatches { .. }
+        )
+    })
+    .iter()
+    .filter_map(|guard| guard.inputs.get(1).copied())
+    .collect();
+    let [receiver] = receivers[..] else {
+        panic!("one guard tests the receiver: {text}")
+    };
+    assert_eq!(graph.node(receiver).op, NodeOp::EntrySlot(0), "{text}");
+}

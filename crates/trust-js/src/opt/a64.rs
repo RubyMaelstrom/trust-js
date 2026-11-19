@@ -567,7 +567,7 @@ fn check_graph(
             // every frame of the code, and no caller environment (the verifier's frame-free
             // guard; its lowering refuses one that would).
             let frame_free_guard = match node.op {
-                NodeOp::CheckCallee { target } | NodeOp::CalleeMatches { target } => {
+                NodeOp::CheckCallee { target, .. } | NodeOp::CalleeMatches { target, .. } => {
                     chunk.jit_inline_target(target).expected_env == 0
                 }
                 _ => false,
@@ -2047,7 +2047,7 @@ impl Gen<'_> {
             | NodeOp::CheckEnvGeneration { proof, .. } => proof,
             NodeOp::TruncateNumberOrOddball => TRUNCATION_EXIT,
             // A graph-inlined site's guard's place in its chain (P3 stage 3, step 2).
-            NodeOp::CheckCallee { target } => self.chunk.jit_inline_target(target).guard,
+            NodeOp::CheckCallee { target, .. } => self.chunk.jit_inline_target(target).guard,
             _ => 0,
         };
         let frame = self.frame_recipe(state.frame)?;
@@ -2667,8 +2667,14 @@ impl Gen<'_> {
                 self.a.mov_w(dst, t);
                 self.gp_done(n, dst);
             }
-            NodeOp::CheckCallee { target } => self.lower_check_callee(n, *target)?,
-            NodeOp::CalleeMatches { target } => self.lower_callee_matches(n, *target)?,
+            NodeOp::CheckCallee {
+                target,
+                this_object,
+            } => self.lower_check_callee(n, *target, *this_object)?,
+            NodeOp::CalleeMatches {
+                target,
+                this_object,
+            } => self.lower_callee_matches(n, *target, *this_object)?,
             NodeOp::I32ToF64 => {
                 if !unused {
                     let w = self.gp(input(0), X16);
@@ -3354,8 +3360,14 @@ impl Gen<'_> {
         Ok(())
     }
 
-    /// A spliced callee's guard, as the first stage's InlineGuard template tests it.
-    fn lower_check_callee(&mut self, n: NodeIx, target: u32) -> Result<(), Refusal> {
+    /// A spliced callee's guard, as the first stage's InlineGuard template tests it; a receiver
+    /// proven an object's (`this_object`) is not tested again.
+    fn lower_check_callee(
+        &mut self,
+        n: NodeIx,
+        target: u32,
+        this_object: bool,
+    ) -> Result<(), Refusal> {
         let node = self.graph.node(n);
         // A guard in an inlined frame (a site nested in it, P3 stage 3 step 3d) reads no caller
         // environment: the compiled frame's `env_raw` is not its caller's.
@@ -3402,10 +3414,12 @@ impl Gen<'_> {
                 node.pc as usize,
                 "a callee check of `this` without the receiver",
             ))?;
-            let word = self.gp(receiver, X16);
-            self.a.asr_imm(X17, word, 48);
-            self.a.cmn_imm_x(X17, 7);
-            self.a.b_cond(NE, site);
+            if !this_object {
+                let word = self.gp(receiver, X16);
+                self.a.asr_imm(X17, word, 48);
+                self.a.cmn_imm_x(X17, 7);
+                self.a.b_cond(NE, site);
+            }
         }
         Ok(())
     }
@@ -3413,7 +3427,12 @@ impl Gen<'_> {
     /// A guard's test without an exit (CalleeMatches): `lower_check_callee`'s comparisons, each
     /// mismatch giving false. The result is written after every input is read, since its home
     /// may be an input's whose range ends here.
-    fn lower_callee_matches(&mut self, n: NodeIx, target: u32) -> Result<(), Refusal> {
+    fn lower_callee_matches(
+        &mut self,
+        n: NodeIx,
+        target: u32,
+        this_object: bool,
+    ) -> Result<(), Refusal> {
         let node = self.graph.node(n);
         // A guard in an inlined frame (a site nested in it, P3 stage 3 step 3d) reads no caller
         // environment: the compiled frame's `env_raw` is not its caller's.
@@ -3450,10 +3469,14 @@ impl Gen<'_> {
                     node.pc as usize,
                     "a callee test of `this` without the receiver",
                 ))?;
-                let word = self.gp(receiver, X16);
-                self.a.asr_imm(X17, word, 48);
-                self.a.cmn_imm_x(X17, 7);
-                self.a.b_cond(NE, mismatch);
+                // A receiver proven an object's (`this_object`): the callee's compare, the last
+                // test left, leaves the answer in the flags.
+                if !this_object {
+                    let word = self.gp(receiver, X16);
+                    self.a.asr_imm(X17, word, 48);
+                    self.a.cmn_imm_x(X17, 7);
+                    self.a.b_cond(NE, mismatch);
+                }
             }
         } else {
             // A dead callee: the flags NE for a fused Branch, else straight to the 0.
