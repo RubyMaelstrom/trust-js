@@ -7963,3 +7963,52 @@ p2/recount-report.txt, the agent's; the coordinator's check target/p3/stage3/gp2
   188M executions in compiled frames), InstanceOf (Earley-Boyer 100M), Array.prototype's
   method loads (key-checked ways), absent arms, accessors as calls and JS getters inlined
   (Vue), the intrinsic call as a node.
+
+F4 part 2, layer 4a landed: the tier folds a typed array held in a global, its identity and
+its kind (804ff7d8; 2026-11-19; target/p3/stage3/f4p2-impl/l4/report-4a.txt, the agent's; the
+coordinator's check target/p3/stage3/l4a-review).
+- What it is. A global whose state is Constant and whose value is a typed array of a kind
+  the tier's element sites take becomes a FoldedGlobal: the object's word, loaded from the
+  code's literal pool into its home (the review's R-2: a home, never a root in the code's
+  table; the literal is no root, as an immediate was none), with its cell form and the fact
+  of its kind. The read, the object check and the kind check are gone; the view's record,
+  its length and its data stay loads. The fold may assume what is written once at the
+  view's construction (its being a typed array, its kind); it may not assume length or
+  data: a detached buffer or a resizable one shrunk under the view changes them without the
+  global changing, and the data test still keeps every access off storage that is gone
+  (a64_tests' a_detached_or_shrunk_buffer_exits_where_the_vm_reads_undefined). A folded
+  length would pass a bounds test against such a buffer; it waits for 4b.
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/804ff7d8 against main's
+  af8bd058; 200 fixed runs): Mandreel -6.29% at graph and -9.12% at the splice; at 5 runs
+  -2.66% at graph; every other row within the draws, the tier off equal. The count had
+  predicted -7.5% with a one-instruction materialization; the agent's row with the
+  three-instruction constant in its place: -5.04% (the literal is worth 1.25 points). With
+  part 1's hoist, the never-ran rule and this, Mandreel's reads of its heap views have been
+  taken out of its loops three ways in one day.
+- Always wrong, the agent's micros: the global replaced once after the compile +1.0% at
+  graph (one invalidation, one exit, one discard, a third compile; the cost after a discard
+  is main's own, recorded earlier); replaced every call: never folded, 0.00%; its buffer
+  detached once, or a resizable buffer shrunk under it: no invalidation, the detached
+  exits as on the parent.
+- Checked: the coordinator's 63 adversarial programs at seven modes, against main's engine
+  and under GC stress at graph: none differs (three new ones, each agreeing with Node first:
+  the global replaced by other kinds, a plain array and undefined; the buffer detached
+  mid-loop from a callee, from a valueOf in the index, between calls, a resizable buffer
+  shrunk and grown under a fixed-length and a length-tracking view; seven views of one
+  buffer in seven globals replaced one at a time). The agent's: its tests in four
+  configurations and under GC stress, the tier's modules with the tier on (one test of part
+  1's hoist counted a cycle on a global that now folds: pinned with the fold off, as layer
+  3 pinned six), the verifier sweep, six of seven mutations caught and the seventh (the
+  literals not exported as data) given a debug assertion.
+- Decided for 4b (the agent's note, l4/note-4b.txt): the engine-wide form the owner chose:
+  one "no buffer was ever detached" bit a heap with its dependents, set by the one function
+  every detach passes through (transfer and transferToFixedLength, the test host's detach,
+  the embedding API's, WebAssembly's memory.grow); under it the LENGTH of a fixed-length
+  view of a buffer that is neither resizable nor shared is folded (Mandreel about -0.6%).
+  V8's refinement that keeps its protector when a buffer with one tracked view is detached
+  (js-array-buffer.cc:182-218) rests on changing that view's map and is not built. The data
+  pointer is not folded: its test covers what no detach dependency does (storage borrowed
+  by native code, an observed buffer for stores), and embedding it would be a second
+  address of the object's storage. That test is 9.4% of Mandreel at 200 runs by the agent's
+  count: a count of how often it repeats for one view with no effect between is asked
+  before any design.
