@@ -43,21 +43,36 @@ runu(32); runc(32);
 
 const STEPS: [&str; 2] = ["runu(80)", "runc(80)"];
 
-/// Each step's value; with `native`, each step's second pass must make no store helper call.
+/// Each step's value; with `native`, a pass after a filling pass must make no store helper call.
+/// The creation ways and entries hold the process-wide creation epoch, which concurrent tests move
+/// (a pinned prototype dropped with its engine, a prototype redefined): a pass under which it
+/// moved refills them, so the check takes a filling pass and a checked pass with the epoch still
+/// through both, and runs the two again (bounded) when it was not.
 fn steps(engine: &mut Engine, native: Option<&str>) -> Vec<String> {
     let mut values = Vec::new();
     for step in STEPS {
         let first = eval(engine, step);
-        let before = helpers();
-        let again = eval(engine, step);
-        assert_eq!(first, again);
-        if let Some(form) = native {
-            assert_eq!(
-                helpers() - before,
-                0,
-                "{form} `{step}`: every store native once the entries are filled"
-            );
-        }
+        let mut tries = 0;
+        let again = loop {
+            let epoch = crate::value::proto_epoch();
+            assert_eq!(eval(engine, step), first);
+            let (before, filled) = (helpers(), crate::value::proto_epoch());
+            let again = eval(engine, step);
+            assert_eq!(first, again);
+            let still = epoch == filled && filled == crate::value::proto_epoch();
+            if let Some(form) = native {
+                if !still && tries < 16 {
+                    tries += 1;
+                    continue;
+                }
+                assert_eq!(
+                    helpers() - before,
+                    0,
+                    "{form} `{step}`: every store native once the entries are filled"
+                );
+            }
+            break again;
+        };
         values.push(again);
     }
     values
