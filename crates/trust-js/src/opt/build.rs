@@ -855,9 +855,11 @@ impl Rules<'_> {
             writes.slot(slot);
         }
         if fields {
-            for location in self.stored_field(pc) {
+            let (locations, creation) = self.own_field_writes(pc);
+            for location in locations {
                 writes.field(location);
             }
+            writes.creates |= creation;
         }
         if let (Op::Call(_, cache) | Op::CallWithThis(_, cache), Some(tree)) =
             (self.ops[pc], self.inlining)
@@ -930,8 +932,9 @@ impl Rules<'_> {
     }
 
     /// The field locations a lowered named store, update or append at `pc` may write (its store
-    /// ways' locations; a creation's landing location): none for any other operation.
-    fn stored_field(&self, pc: usize) -> Vec<u16> {
+    /// ways' locations; a creation's landing location) and whether it may create (a shape
+    /// transition, `Builder::creation_store`): none and false for any other operation.
+    fn own_field_writes(&self, pc: usize) -> (Vec<u16>, bool) {
         let name = match self.ops[pc] {
             Op::SetProp(name, _)
             | Op::SetPropDrop(name, _)
@@ -939,16 +942,17 @@ impl Rules<'_> {
             | Op::SetPropLocalDrop(_, name, _)
             | Op::UpdateProp(name, _, _)
             | Op::AppendProp(name, _) => name,
-            _ => return Vec::new(),
+            _ => return (Vec::new(), false),
         };
         let mut locations = Vec::new();
         if let Some(ways) = self.own_data_ways(pc, name, true) {
             locations.push(ways.location);
         }
-        if let Some(creation) = self.creation_ways(pc, name) {
+        let creation = self.creation_ways(pc, name);
+        if let Some(creation) = &creation {
             locations.push(creation.location);
         }
-        locations
+        (locations, creation.is_some())
     }
 
     /// Whether the operation at `pc` lowers without an effect whatever its operands' facts (the
@@ -1479,9 +1483,16 @@ struct Loop {
     /// where `stored_fields` names them: no other global's, so that the loop's states hold only
     /// the facts its reads take (the builder's joins and prunes walk every fact a state holds).
     read_fields: Vec<u16>,
-    /// The field locations the loop's lowered named stores may write (any object's), its own and
-    /// every frame's the build may inline into it (`Writes`), for a loop with `read_fields`.
+    /// The field locations the loop's lowered named stores, updates, appends and creations may
+    /// write (any object's), its own and every frame's the build may inline into it (`Writes`),
+    /// for a loop that keeps heap facts.
     stored_fields: Vec<u16>,
+    /// Whether the loop holds a lowered creation store (a shape transition), for a loop that
+    /// keeps heap facts: its header then keeps no shape fact (P3 stage 3, the quiet loop's facts).
+    creates: bool,
+    /// Whether an operation of the loop reads its frame's `this`, for a loop that keeps heap
+    /// facts: only then does its header keep the facts of `this` (`Builder::loop_object_facts`).
+    reads_this: bool,
     /// Whether an operation of the loop may be a canonical-frame effect ([`canonical`]), after
     /// which every slot is in the frame (P3 stage 3 step 3a: a generic node leaves the slots it
     /// does not write as they are, so step 0's rules, the load of an invariant slot and the notes
@@ -1517,6 +1528,9 @@ enum Source {
 pub(crate) struct Writes {
     pub(crate) slots: Vec<u16>,
     pub(crate) fields: Vec<u16>,
+    /// Whether a lowered creation store (a shape transition, `Builder::creation_store`) may run:
+    /// the one lowered operation that changes an object's shape (the quiet loop's facts).
+    pub(crate) creates: bool,
 }
 
 impl Writes {
@@ -1539,6 +1553,7 @@ impl Writes {
         for &location in &other.fields {
             self.field(location);
         }
+        self.creates |= other.creates;
     }
 }
 
@@ -1692,6 +1707,8 @@ impl Flow {
                 typed: Vec::new(),
                 globals: Vec::new(),
                 read_fields: Vec::new(),
+                creates: false,
+                reads_this: false,
                 stored_fields: Vec::new(),
                 canonical: false,
             };
@@ -1785,21 +1802,31 @@ impl Flow {
                 }
             }
             found.stored = writes.slots;
-            if !found.read_fields.is_empty() {
-                // The loop's own field stores, for a loop with global reads alone (its frames'
-                // came with their summaries).
-                let mut fields = writes.fields;
+            // The loop's own field stores and creations, for every quiet loop: the carried object
+            // facts and the global reads' facts rest on them (its frames' came with their
+            // summaries, `Rules::writes_at`).
+            let (mut fields, mut creates) = (writes.fields, writes.creates);
+            if found.keeps_heap {
                 for &index in &body {
                     let block = &blocks[ix(rpo[index])];
                     for pc in block.start..block.end {
-                        for location in rules.stored_field(pc) {
+                        let (locations, creation) = rules.own_field_writes(pc);
+                        for location in locations {
                             if !fields.contains(&location) {
                                 fields.push(location);
                             }
                         }
+                        creates |= creation;
+                        found.reads_this |= matches!(
+                            ops[pc],
+                            Op::LoadThis | Op::GetPropThis(..) | Op::SetPropThisDrop(..)
+                        );
                     }
                 }
-                found.stored_fields = fields;
+            }
+            found.stored_fields = fields;
+            found.creates = creates;
+            if !found.read_fields.is_empty() {
                 // A global a store of the loop may write is read in the loop, its value not kept
                 // through the header (`loop_heap_facts`): no entry load and no typed checks of it,
                 // whose value no read of the loop would take (as a binding the loop stores,
@@ -2223,6 +2250,15 @@ fn meet_elements(first: &State, rest: &[(BlockIx, State)]) -> State {
 pub(crate) struct Alternatives {
     pub(crate) i32: Option<NodeIx>,
     pub(crate) f64: Option<NodeIx>,
+}
+
+/// The object facts a loop header keeps (`Builder::loop_object_facts`).
+#[derive(Default)]
+struct CarriedFacts {
+    shapes: FastMap<NodeIx, Vec<u32>>,
+    fields: FastMap<(NodeIx, u16), NodeIx>,
+    protos: FastMap<NodeIx, NodeIx>,
+    creatable: crate::fasthash::FastSet<NodeIx>,
 }
 
 /// A check of a typed array made at a loop's entry edge (P3 stage 3 step 0c) and what it stands
@@ -3657,18 +3693,25 @@ impl<'a> Builder<'a> {
         }
         let met = meet(&preds);
         let (typed_data, names, fields) = self.loop_heap_facts(lp, &met);
+        let carried = self.loop_object_facts(lp, &met, &slots);
         if lp.keeps_heap {
             // What the header kept, for the verifier's check of the loop it heads once a back edge
-            // makes it one (`verify::kept_heap`): no node of the loop, in any frame, is an effect or
-            // writes a kept field's location or a kept binding's slot.
-            let mut fields: Vec<u16> = fields.keys().map(|&(_, location)| location).collect();
-            fields.sort_unstable();
-            fields.dedup();
+            // makes it one (`verify::kept_heap`): no node of the loop, in any frame, is an effect,
+            // writes a kept field's location or a kept binding's slot, or, where it kept a shape
+            // fact, creates a property.
+            let mut kept: Vec<u16> = fields
+                .keys()
+                .chain(carried.fields.keys())
+                .map(|&(_, location)| location)
+                .collect();
+            kept.sort_unstable();
+            kept.dedup();
             self.graph.kept.push(KeptHeap {
                 header_pc: pc as u32,
                 frame: self.frame,
-                fields,
+                fields: kept,
                 slots: names.value_slots(),
+                shapes: !carried.shapes.is_empty(),
             });
         }
         let st = State {
@@ -3685,7 +3728,10 @@ impl<'a> Builder<'a> {
             str_lengths: met.str_lengths,
             typed_data,
             names,
-            fields,
+            fields: carried.fields.into_iter().chain(fields).collect(),
+            shapes: carried.shapes,
+            protos: carried.protos,
+            creatable: carried.creatable,
             ..State::default()
         };
         let poll = self.frame_state(pc, &st);
@@ -3750,6 +3796,87 @@ impl<'a> Builder<'a> {
             met.names.at_header(self.moves_env, kept),
             fields,
         )
+    }
+
+    /// The shape, field, prototype and creation facts of the objects the loop's sites take that the
+    /// header of `lp` keeps from `met`, what its entry edges all hold (P3 stage 3, the quiet loop's
+    /// facts): in a loop that keeps heap facts (no effect, no generic node: Flow::new), whose
+    /// shapes only a lowered creation store changes (`Loop::creates`: then no shape fact), whose
+    /// fields only a lowered store at their location writes (`Loop::stored_fields`), and whose
+    /// links and flags only an effect changes, as Maglev's loop header keeps the known maps and
+    /// loaded properties its loop's effects leave (KnownNodeAspects::CloneForLoopHeader,
+    /// maglev-known-node-aspects.cc:647-735; LoopEffects, maglev-interpreter-frame-state.h:
+    /// 716-760, recorded at maglev-graph-builder.h:2057-2080) and Ion's and the DFG's LICM move a
+    /// shape guard and a slots load out of a loop that writes neither (MGuardShape and MSlots
+    /// load ObjectFields, jit/MIROps.yaml:2481-2493, 1895-1905; CheckStructure reads
+    /// JSCell_structureID, dfg/DFGClobberize.h:1511-1513). Only the objects the loop takes: the
+    /// values of the slots it reads and does not write (`slots`), the frame's `this` where the loop
+    /// reads it (`Loop::reads_this`: an inlined frame's is its receiver, not the compiled
+    /// frame's), and the objects their kept fields and links hold, so that the loop's states carry
+    /// no fact its sites do not use (F4 part 1's lesson: the builder's joins and prunes walk every
+    /// fact a state holds, and kept facts stay in the states after the loop too).
+    fn loop_object_facts(&self, lp: &Loop, met: &State, slots: &[Slot]) -> CarriedFacts {
+        let mut carried = CarriedFacts::default();
+        if !lp.keeps_heap
+            || (met.shapes.is_empty()
+                && met.fields.is_empty()
+                && met.protos.is_empty()
+                && met.creatable.is_empty())
+        {
+            return carried;
+        }
+        let mut taken: Vec<NodeIx> = Vec::new();
+        for (slot, held) in slots.iter().enumerate() {
+            if let (Slot::Clean(value) | Slot::Dirty(value), true, false) = (
+                held,
+                lp.read.get(slot).copied().unwrap_or(false),
+                lp.written[slot],
+            ) {
+                taken.push(*value);
+            }
+        }
+        // The frame's own `this` (an inlined frame's receiver), where the loop reads it.
+        if lp.reads_this {
+            let this = match &self.inlined {
+                Some(inlined) => Some(inlined.receiver()),
+                None => self.hoisted.get(&Hoisted::This).copied(),
+            };
+            taken.extend(this);
+        }
+        let mut seen: crate::fasthash::FastSet<NodeIx> = taken.iter().copied().collect();
+        // The fields each object holds, met once.
+        let mut held: FastMap<NodeIx, Vec<(u16, NodeIx)>> = FastMap::default();
+        for (&(holder, location), &value) in &met.fields {
+            if !lp.stored_fields.contains(&location) {
+                held.entry(holder).or_default().push((location, value));
+            }
+        }
+        let mut k = 0;
+        while k < taken.len() {
+            let object = taken[k];
+            k += 1;
+            if !lp.creates {
+                if let Some(shapes) = met.shapes.get(&object) {
+                    carried.shapes.insert(object, shapes.clone());
+                }
+            }
+            if let Some(&proto) = met.protos.get(&object) {
+                carried.protos.insert(object, proto);
+                if seen.insert(proto) {
+                    taken.push(proto);
+                }
+            }
+            if met.creatable.contains(&object) {
+                carried.creatable.insert(object);
+            }
+            for &(location, value) in held.get(&object).into_iter().flatten() {
+                carried.fields.insert((object, location), value);
+                if seen.insert(value) {
+                    taken.push(value);
+                }
+            }
+        }
+        carried
     }
 
     /// The checks of the typed arrays that `lp`, a loop keeping heap facts whose header starts at

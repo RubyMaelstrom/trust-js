@@ -1437,6 +1437,11 @@ mod typed_loop;
 #[path = "union_tests.rs"]
 mod union;
 
+/// The quiet loop's facts: a loop that keeps heap facts keeps its objects' shapes, fields, links
+/// and flags through its header but what its frames may end.
+#[path = "quiet_facts_tests.rs"]
+mod quiet_facts;
+
 /// P3 stage 3 step L2 under TRUST_JS_OPT_INLINE=graph: callees whose loads go through the chain.
 #[path = "chain_inline_tests.rs"]
 mod chain;

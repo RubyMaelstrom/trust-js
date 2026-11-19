@@ -1170,18 +1170,20 @@ pub(crate) struct Graph {
     pub(crate) kept: Vec<KeptHeap>,
 }
 
-/// A loop header that kept its entry's heap facts (`Builder::loop_heap_facts`): the global
-/// object's field locations whose values it kept and the binding slots whose values it kept, any
-/// record's. Its typed arrays' data addresses, the global property epoch, a generation and a
-/// script-level lexical's value it may keep too: only an effect ends those.
-/// The header is named by its frame and first pc, as a typed entry's (`TypedEntry`), so that the
-/// blocks' renumbering leaves it right: one loop header block of a frame starts at a pc.
+/// A loop header that kept its entry's heap facts (`Builder::loop_heap_facts`,
+/// `Builder::loop_object_facts`): the field locations whose values it kept (the global object's
+/// and the loop's objects'), the binding slots whose values it kept, any record's, and whether it
+/// kept a shape fact. Its typed arrays' data addresses, links, extensibility, the global property
+/// epoch, a generation and a script-level lexical's value it may keep too: only an effect ends
+/// those. The header is named by its frame and first pc, as a typed entry's (`TypedEntry`), so
+/// that the blocks' renumbering leaves it right: one loop header block of a frame starts at a pc.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct KeptHeap {
     pub(crate) header_pc: u32,
     pub(crate) frame: FrameIx,
     pub(crate) fields: Vec<u16>,
     pub(crate) slots: Vec<u16>,
+    pub(crate) shapes: bool,
 }
 
 impl Graph {

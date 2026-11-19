@@ -458,8 +458,9 @@ fn edges(graph: &Graph, n_ops: impl Fn(FrameIx) -> Option<usize>) -> Result<(), 
 
 /// The union rule (P3 stage 3 step 0c; F4 part 1, whose first form missed it: `build::Writes`):
 /// a loop whose header kept its entry's heap facts (`Graph::kept`) runs, in any of its frames, no
-/// effect and no generic node, and none of its stores writes a field location or a binding slot
-/// whose value the header kept. Its loop is the natural loop of the header's back edges in the
+/// effect and no generic node, none of its stores writes a field location or a binding slot whose
+/// value the header kept, and where it kept a shape fact, no creation changes a shape (the quiet
+/// loop's facts). Its loop is the natural loop of the header's back edges in the
 /// graph, with the blocks of every frame inlined into it: the graph's statement of what the loop
 /// prepass, which runs on bytecode before the build, summed over the frames from their chunks.
 /// Maglev checks its loop's end state against an optimistic header's (TryMergeLoop and
@@ -496,7 +497,12 @@ fn kept_heap(graph: &Graph, dom: &Dominators) -> Result<(), String> {
                 let data = graph.node(node);
                 let what = match heap_write(&data.op) {
                     HeapWrite::Any => "an effect",
-                    HeapWrite::Field(location) if kept.fields.contains(&location) => {
+                    HeapWrite::Creation(_) if kept.shapes => {
+                        "a creation (a shape transition), where it kept shape facts"
+                    }
+                    HeapWrite::Field(location) | HeapWrite::Creation(location)
+                        if kept.fields.contains(&location) =>
+                    {
                         "a store at the location of a field it kept"
                     }
                     HeapWrite::Binding(slot) if kept.slots.contains(&slot) => {
@@ -552,6 +558,8 @@ enum HeapWrite {
     Nothing,
     /// A field at this location, of whatever object.
     Field(u16),
+    /// A field at this location created, its object's shape changed.
+    Creation(u16),
     /// A binding at this slot, of whatever record.
     Binding(u16),
     /// Anything: it may run JavaScript.
@@ -562,9 +570,8 @@ enum HeapWrite {
 /// graph is placed here where it is added (a store a later piece lowers, a construct's).
 fn heap_write(op: &NodeOp) -> HeapWrite {
     match *op {
-        NodeOp::StoreField { location, .. } | NodeOp::StoreNew { location, .. } => {
-            HeapWrite::Field(location)
-        }
+        NodeOp::StoreField { location, .. } => HeapWrite::Field(location),
+        NodeOp::StoreNew { location, .. } => HeapWrite::Creation(location),
         NodeOp::StoreBinding { slot } => HeapWrite::Binding(slot),
         NodeOp::Effect { .. } | NodeOp::Generic { .. } => HeapWrite::Any,
         // Element and typed stores write element words, which no kept fact is (a typed array's
