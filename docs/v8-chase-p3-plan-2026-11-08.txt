@@ -8081,3 +8081,31 @@ Validation again (2026-11-19 21:35; in the background): the whole library with t
 in a clean environment on main's code at af8bd058 (after the megamorphic read probe, the
 global dependencies' layers and leftovers, and the polymorphic store): 3,821 passed, none
 failed. The store table that landed after it had its own such run (3,820 passed) and Test262.
+
+Stage 3 step 7 started: a call the tier does not inline, direct to its known callee
+(2026-11-19 21:48; briefs/step7-calls.txt; evidence target/p3/stage3/s7-impl; the facts that
+started it target/p3/stage3/gp3-impl/call-facts.txt). The step has been on the stage's list
+since its design (point 5; the owner's D7). The graph line's recount found what its absence
+costs: a call whose record is Monomorphic and whose callee the planner does not inline (too
+large, an unremapped context, the budget, recursion) is a generic node, the first stage's call
+template run from the tier's code, about 200 instructions a call over an inlined callee in a
+micro; every call after Mandreel's computed-key method loads is of that kind (21.4M
+executions, compiled C functions over the inline limit), TypeScript's likewise (58.3M), and
+GBEMU's opcode dispatch meets 775 closures at one site. A count of every non-inlined call
+in the tier's code with its cost split between caller and callee comes first, then the
+exemplars (Maglev's CallKnownJSFunction and V8's dispatch table, the DFG's DirectCall and
+its repatching, Ion's call of a known target), then the note: generated code written once
+and freed code addresses kept out of use make the callee's code address the design's
+question.
+The graph line's piece 3, counted and decided the same evening (target/p3/stage3/gp3-impl,
+recount-report.txt and design-note.txt): InstanceOf in SpiderMonkey's form, which is this
+engine's record (the right-hand side's shape, a constructor check, its `prototype` loaded at
+the recorded slot, a walk of the left-hand side's chain; Warp's tryAttachFunction,
+CacheIR.cpp:5753-5842): predicted Earley-Boyer -8.5% at graph and -6.9% at the splice; the
+walk exits on a Proxy where V8 and SpiderMonkey call the runtime from a deferred path (no
+workload has one; the mixed site's cost is to be measured, and the deferred call built if a
+workload shows it); key-checked ways at depths 0 to 3 (Array.prototype's methods): DeltaBlue
+-2.3%, PdfJS -1.5%, Djot's steady state -1.4% predicted; then the computed-key method load
+on the element-load path, its receivers recorded first (GBEMU -1.8% predicted; a first micro
+had read it as nothing: its sum overflowed, the tier's code exited, and the loop measured
+was first-stage code).
