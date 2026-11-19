@@ -833,14 +833,16 @@ fn two_engines_alternating_report_through_their_own_fuse() {
             "round {round}: {active} {start:?}"
         );
     }
-    // A's global written while B is the active engine (A's Agent entered by a guard, as a host's
-    // raw access does, which leaves the thread's fuse B's): the registry, correctly, and A's state
-    // moves. An entry that switches no Agent leaves the thread's fuse as it was.
+    // A's global written while B is the active engine, A's Agent entered by a guard as a host's
+    // raw access does: the guard switches the Agent and with it the active global fuse, the
+    // Agent's heap's (R-5), so the write reports through A's own fuse, with no registry, and A's
+    // state moves; the guard's end makes B's Agent, and B's fuse, active again.
     eval(&mut a, "var F = 0;");
     eval(&mut b, "G = 3;");
-    let registry = paths().1;
+    let (active, registry) = paths();
     {
         let _agent = a.interp.enter_agent();
+        assert_eq!(crate::object_fuse::active_global_props(), props_of(&a));
         make_constant(&a, "F");
         let slot = a.interp.global.borrow().props.slot_of("F").unwrap();
         a.interp
@@ -850,7 +852,8 @@ fn two_engines_alternating_report_through_their_own_fuse() {
             .set_value_at(slot, crate::value::Value::Num(7.0));
         assert_eq!(state(&a, "F"), PropertyState::NotConstant);
     }
-    assert_eq!(paths().1, registry + 1);
+    assert_eq!(paths(), (active + 1, registry));
+    assert_eq!(crate::object_fuse::active_global_props(), props_of(&b));
     // B dropped while its fuse is held elsewhere: B's drop clears the thread's pointer.
     eval(&mut b, "G = 1;");
     assert_eq!(crate::object_fuse::active_global_props(), props_of(&b));

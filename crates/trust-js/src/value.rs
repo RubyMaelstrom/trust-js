@@ -3409,6 +3409,15 @@ impl InternalSlots {
 
 pub(crate) struct GcState {
     pub(crate) agent: crate::agent_control::AgentControl,
+    /// The active realm's global object's fuse (F4 part 2, R-5; `set_active_global`), held so
+    /// that `active_global_word`'s pointer never outlives it.
+    active_global: RefCell<Option<std::sync::Arc<crate::object_fuse::ObjectFuse>>>,
+    /// That fuse's map address and the fuse, which a watched global's reported write reads
+    /// through the active Agent's tag (`active_global_fuse`): whichever Agent the thread entered
+    /// (an execution entry, a host's guard), its global's writes find their own fuse with no
+    /// registry and no lock, as SpiderMonkey keeps its object fuses per zone
+    /// (cx->zone()->objectFuses, vm/Watchtower.cpp:760).
+    active_global_word: Cell<(usize, *const crate::object_fuse::ObjectFuse)>,
     heap_id: u64,
     #[cfg(feature = "architecture-diagnostics")]
     diagnostics: RefCell<allocation_diagnostics::State>,
@@ -5448,6 +5457,8 @@ pub(crate) fn new_gc_heap() -> GcHeap {
     let heap_id = NEXT_HEAP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let heap = Rc::new(GcState {
         agent: crate::agent_control::AgentControl::new(heap_id),
+        active_global: RefCell::new(None),
+        active_global_word: Cell::new((0, std::ptr::null())),
         heap_id,
         #[cfg(feature = "architecture-diagnostics")]
         diagnostics: RefCell::new(allocation_diagnostics::State::default()),
@@ -5970,6 +5981,39 @@ thread_local! {
 }
 
 /// The heap allocation uses while no Agent is active.
+/// Make `fuse` the active realm's global fuse of `heap`'s Agent (`Interp::set_realm_fuses`; F4
+/// part 2, R-5): the Arc first, so that the word never names a fuse the heap does not hold.
+pub(crate) fn set_active_global(
+    heap: &GcHeap,
+    fuse: Option<&std::sync::Arc<crate::object_fuse::ObjectFuse>>,
+) {
+    let replaced = heap.active_global.replace(fuse.cloned());
+    heap.active_global_word
+        .set(fuse.map_or((0, std::ptr::null()), |fuse| {
+            (fuse.props(), std::sync::Arc::as_ptr(fuse))
+        }));
+    drop(replaced);
+}
+
+/// Clear `heap`'s active global fuse if `owned` says it is one of a dropping interpreter's (a
+/// ShadowRealm's interpreter shares its parent's heap; `Interp`'s `Drop`).
+pub(crate) fn clear_active_global_of(
+    heap: &GcHeap,
+    owned: impl Fn(*const crate::object_fuse::ObjectFuse) -> bool,
+) {
+    let fuse = heap.active_global_word.get().1;
+    if !fuse.is_null() && owned(fuse) {
+        set_active_global(heap, None);
+    }
+}
+
+/// The active Agent's active global fuse: its map's address and the fuse (null for none), which
+/// the Agent's heap holds (see `GcState::active_global_word`).
+#[inline]
+pub(crate) fn active_global_fuse() -> (usize, *const crate::object_fuse::ObjectFuse) {
+    with_agent_heap(|state| state.active_global_word.get())
+}
+
 fn unowned_gc_heap() -> GcHeap {
     DEFAULT_GC_HEAP.with(Rc::clone)
 }

@@ -186,6 +186,11 @@ impl ObjectFuse {
     pub(crate) const INVALIDATED_OFF: usize = std::mem::offset_of!(ObjectFuse, invalidated);
     /// The offset of `generation`.
     pub(crate) const GENERATION_OFF: usize = std::mem::offset_of!(ObjectFuse, generation);
+    /// The map the fuse watches (the registry's key).
+    pub(crate) fn props(&self) -> usize {
+        self.props
+    }
+
     /// The offset of `words`, the state words' published address.
     pub(crate) const WORDS_OFF: usize = std::mem::offset_of!(ObjectFuse, words);
 
@@ -489,55 +494,10 @@ impl ObjectFuse {
 
 impl Drop for ObjectFuse {
     fn drop(&mut self) {
+        // No Agent's heap names it any more: a heap that does holds an Arc of it
+        // (`value::set_active_global`).
         registry_remove(self.props, self);
-        // The fuse drops on its realm's thread (its holders, RealmFuses in an Interp, stay there).
-        let _ = ACTIVE_GLOBAL.try_with(|active| {
-            if std::ptr::eq(active.get().1, self) {
-                active.set((0, std::ptr::null()));
-            }
-        });
     }
-}
-
-thread_local! {
-    /// The global fuse of the realm active on this thread (`Interp::set_realm_fuses`) and its
-    /// map's address: how a watched global's reported write finds its fuse with no registry and
-    /// no lock (F4 part 2). Cleared as that fuse drops, on this thread (see `Drop`).
-    static ACTIVE_GLOBAL: Cell<(usize, *const ObjectFuse)> =
-        const { Cell::new((0, std::ptr::null())) };
-}
-
-/// Make `fuse` the active realm's global fuse on this thread (`Interp::set_realm_fuses`).
-pub(crate) fn set_active_global(fuse: Option<&Arc<ObjectFuse>>) {
-    ACTIVE_GLOBAL.set(fuse.map_or((0, std::ptr::null()), |fuse| {
-        (fuse.props, Arc::as_ptr(fuse))
-    }));
-}
-
-/// Make `fuse`, the active realm's global fuse of the interpreter that is entered, the thread's
-/// unless it is already (`Interp::activate_gc_heap`, at an entry that switches the thread's
-/// Agent): two engines alternating on one thread then each report their global's writes through
-/// it, with no registry and no lock (F4 part 2, R-5). It names a fuse its interpreter holds,
-/// which clears it before dropping (`clear_active_global_of`).
-#[inline]
-pub(crate) fn activate_global(fuse: Option<&ObjectFuse>) {
-    let ptr = fuse.map_or(std::ptr::null(), |fuse| fuse as *const ObjectFuse);
-    if ACTIVE_GLOBAL.get().1 != ptr {
-        ACTIVE_GLOBAL.set(fuse.map_or((0, std::ptr::null()), |fuse| (fuse.props, ptr)));
-    }
-}
-
-/// Clear the thread's active global fuse if `owned` says it is one of a dropping interpreter's
-/// (`Interp`'s `Drop`, before its heap goes): the thread-local's pointer then never outlives the
-/// interpreter whose realm it names, whichever thread drops the fuse's last `Arc` (the registry
-/// hands out upgrades of its weak handles) (F4 part 2, R-5).
-pub(crate) fn clear_active_global_of(owned: impl Fn(*const ObjectFuse) -> bool) {
-    let _ = ACTIVE_GLOBAL.try_with(|active| {
-        let fuse = active.get().1;
-        if !fuse.is_null() && owned(fuse) {
-            active.set((0, std::ptr::null()));
-        }
-    });
 }
 
 #[cfg(test)]
@@ -547,17 +507,19 @@ thread_local! {
     pub(crate) static TEST_REPORT_PATHS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
-/// The map address of this thread's active global fuse, 0 for none (tests).
+/// The map address of the active Agent's active global fuse, 0 for none (tests).
 #[cfg(test)]
 pub(crate) fn active_global_props() -> usize {
-    ACTIVE_GLOBAL.get().0
+    crate::value::active_global_fuse().0
 }
 
-/// The fuse of the watched map at `props` when it is the active realm's global on this thread.
+/// The fuse of the watched map at `props` when it is the active realm's global of the thread's
+/// active Agent (F4 part 2, R-5: the Agent's heap holds it, `value::active_global_fuse`).
 #[inline]
 fn active_global_for(props: usize) -> Option<&'static ObjectFuse> {
-    let (active, fuse) = ACTIVE_GLOBAL.get();
-    // SAFETY: the pointer names a live fuse: it is cleared before that fuse drops.
+    let (active, fuse) = crate::value::active_global_fuse();
+    // SAFETY: the pointer names a fuse the active Agent's heap holds an Arc of
+    // (`value::set_active_global`), which the report cannot drop.
     (active == props && !fuse.is_null()).then(|| unsafe { &*fuse })
 }
 

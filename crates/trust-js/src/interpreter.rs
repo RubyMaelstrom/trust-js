@@ -5571,7 +5571,7 @@ impl Drop for Interp {
         }
         // The thread's active global fuse, if it is one of this interpreter's realms', is cleared
         // once nothing of it runs again and before its fields and heap go (F4 part 2, R-5).
-        crate::object_fuse::clear_active_global_of(|fuse| self.holds_global_fuse(fuse));
+        crate::value::clear_active_global_of(&self.gc_heap, |fuse| self.holds_global_fuse(fuse));
         // The whole Agent is ending, not merely reaching a GC safepoint: the heap's owner
         // (`heap_release`) finalizes and frees every cell once all other fields have dropped,
         // and a ShadowRealm's interpreter must not touch the heap it shares with its parent.
@@ -6842,7 +6842,8 @@ impl Interp {
             .as_ref()
             .and_then(|fuses| fuses.string_proto.as_ref())
             .map_or(0, |fuse| std::sync::Arc::as_ptr(fuse) as usize);
-        crate::object_fuse::set_active_global(
+        crate::value::set_active_global(
+            &self.gc_heap,
             fuses.as_ref().and_then(|fuses| fuses.global.as_ref()),
         );
         self.realm_fuses = fuses;
@@ -7419,12 +7420,9 @@ impl Interp {
     /// worker, while embedders may alternate independent engines on one driver thread.
     #[inline]
     pub(crate) fn activate_gc_heap(&self) {
-        // An entry that switches the thread's Agent makes its active realm's global fuse the
-        // thread's too (F4 part 2, R-5); one that finds its Agent active (a native's return, the
-        // common case) leaves it, as the Agent was left.
-        if crate::value::activate_agent(&self.gc_heap, &self.symbol_agent) {
-            crate::object_fuse::activate_global(self.active_global_fuse());
-        }
+        // The active realm's global fuse is the Agent's heap's (F4 part 2, R-5): switching the
+        // Agent switches it.
+        crate::value::activate_agent(&self.gc_heap, &self.symbol_agent);
     }
 
     /// Temporarily make this interpreter's heap and Symbol state current, restoring the
