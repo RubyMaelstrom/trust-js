@@ -1,7 +1,7 @@
 //! The optimizing tier's register allocator (P3 stage 1; the plan's Design point 10 and the
 //! "Stage 1" record's back end): Maglev's single forward pass over the scheduled blocks.
 //!
-//! Live ranges and next uses come first: a dataflow liveness over the graph, frame states'
+//! Live ranges come first: a dataflow liveness over the graph, frame states'
 //! values counting as uses of the nodes that carry them, and each value's range the hull of the
 //! positions where it is live in code order. One pass in code order then gives each value its
 //! home at its definition: a free register of its class; a callee-saved one (x23-x28, d8-d15) or
@@ -10,8 +10,11 @@
 //! no baseline template touches x23-x28 or writes d8-d15); none of the registers a shared stub's
 //! call clobbers when it lives across a node whose own path makes that call (`clobbers`: P3
 //! stage 3 step 0b, the exemplars' clobber sets). When no register is free, the held
-//! value whose next use is the farthest gives up its register and is spilled at its definition,
-//! or the new value is when its own next use is farther (Maglev's choice). A home is the value's
+//! value whose whole range is cheapest in memory gives up its register and is spilled at its
+//! definition, or the new value is when it is cheaper still (P3 stage 3, rule B: Ion's spill
+//! weight over the range, in which an exit state's read weighs nothing, as TurboFan's and Ion's
+//! frame-state uses claim no register); a held value the loop around the choice has already read
+//! in a register in its current turn is never the one. A home is the value's
 //! for its whole range, so an exit's recipe names one place per value; registers and slots free
 //! again where ranges end. Phis take their inputs by parallel moves on the edges into their blocks
 //! (`a64`). Code order is the builder's, a loop's body right after its header and its exit code
@@ -346,6 +349,19 @@ impl<'g> Reads<'g> {
     /// Whether `v` is a value some home holds.
     fn is_value(&self, v: NodeIx) -> bool {
         self.value[v.index()]
+    }
+
+    /// Each value `node` reads as an input of its own, which its code takes in a register: not
+    /// its state's, which only its exit reads, from any home (a phi's are its edges').
+    fn each_input(&self, node: NodeIx, mut f: impl FnMut(NodeIx)) {
+        let n = self.graph.node(node);
+        if n.op != NodeOp::Phi {
+            for &input in &n.inputs {
+                if self.value[input.index()] {
+                    f(input);
+                }
+            }
+        }
     }
 
     /// Each value `node` reads.
@@ -703,25 +719,27 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
         range.1 = range.1.max(pos[node.index()] + 1);
     }
 
-    // Next uses: each value's reads in code order (a phi's input is read at its edge's block end),
-    // flat: counted, placed, then sorted and deduplicated in each value's run. Made at the forward
-    // pass's first choice of a value to spill, their only reader: never in a compile whose values
-    // all find a register (P3 stage 3 step R1, F5; about a fifth of the pass where they are made).
-    let make_uses = || {
+    // Register reads (P3 stage 3, rule B): the reads that need a register, each value's node
+    // inputs and phi edge inputs (a phi's input is read at its edge's block end) in code order,
+    // without the reads of exit states and throw recipes, which an exit makes from any home.
+    // TurboFan's frame state inputs are REGISTER_OR_SLOT and not register-beneficial
+    // (instruction-selector.cc:665-668, register-allocator.cc:75-88); Ion's snapshot uses are
+    // KEEPALIVE, which neither require nor prefer a register and add nothing to a bundle's spill
+    // weight (Lowering-shared.cpp:207-221, BacktrackingAllocator.cpp:1547-1583, 3446-3452). Made
+    // at the forward pass's first choice of a value to spill, their only reader: never in a
+    // compile whose values all find a register (step R1, F5).
+    let make_register_uses = || {
         let mut use_start = vec![0u32; n + 1];
         for &b in &order {
             let data = graph.block(b);
             for &node in &data.body {
-                reads.each(node, |read| use_start[read.index() + 1] += 1);
+                reads.each_input(node, |read| use_start[read.index() + 1] += 1);
             }
             for k in 0..data.succs.len() {
                 for input in edges.of(b, k) {
                     use_start[input.index() + 1] += 1;
                 }
             }
-        }
-        for &(_, v) in &after_call {
-            use_start[v.index() + 1] += 1;
         }
         for v in 0..n {
             use_start[v + 1] += use_start[v];
@@ -732,7 +750,7 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             let data = graph.block(b);
             for &node in &data.body {
                 let at = pos[node.index()];
-                reads.each(node, |read| {
+                reads.each_input(node, |read| {
                     uses[use_end[read.index()] as usize] = at;
                     use_end[read.index()] += 1;
                 });
@@ -744,34 +762,83 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
                 }
             }
         }
-        for &(node, v) in &after_call {
-            uses[use_end[v.index()] as usize] = pos[node.index()] + 1;
-            use_end[v.index()] += 1;
-        }
-        for v in 0..n {
-            let run = &mut uses[use_start[v] as usize..use_end[v] as usize];
-            run.sort_unstable();
-            let mut kept = 0;
-            for k in 0..run.len() {
-                if k == 0 || run[k] != run[kept - 1] {
-                    run[kept] = run[k];
-                    kept += 1;
-                }
-            }
-            use_end[v] = use_start[v] + kept as u32;
-        }
+        // In code order already (blocks in order, a block's nodes in order, its edges at its
+        // tail); a node that reads a value twice lists it twice, which no search minds.
         (use_start, use_end, uses)
     };
-    let next_uses = std::cell::OnceCell::new();
-    // The first read of `v` after `at`, or the end of its range (a read in a loop's next turn).
-    let next_use = |v: NodeIx, at: u32| {
-        let (use_start, use_end, uses) = next_uses.get_or_init(make_uses);
-        let list = &uses[use_start[v.index()] as usize..use_end[v.index()] as usize];
-        list.get(list.partition_point(|&p| p <= at))
-            .copied()
-            .unwrap_or(ranges[v.index()].1)
+    let register_uses = std::cell::OnceCell::new();
+    // The loops' hulls in code order (rule B): a header's head to the last tail of the blocks
+    // after it that jump back to it; a loop's body follows its header (`reverse_postorder`).
+    let loop_hulls: Vec<(u32, u32)> = order
+        .iter()
+        .filter(|&&b| graph.block(b).loop_header)
+        .map(|&h| {
+            let end = graph
+                .block(h)
+                .preds
+                .iter()
+                .filter(|p| head[p.index()] != u32::MAX && head[p.index()] >= head[h.index()])
+                .map(|p| tail[p.index()])
+                .max()
+                .unwrap_or(tail[h.index()]);
+            (head[h.index()], end)
+        })
+        .collect();
+    // Rule B's rank of `v` as the victim of a choice at `at` (higher: the better victim): the
+    // inverse of its whole range's spill weight, as Ion chooses (computeSpillWeight,
+    // BacktrackingAllocator.cpp:1547-1583), since a value has one home for its whole range and a
+    // victim is spilled at its definition: each read that needs a register loads it from its slot
+    // and its definition stores it. Each such read and the definition weigh 8 to the power of
+    // their loop depth (the graph has no block frequencies; JSC's Air weighs a use by its block's
+    // frequency, Ion by a loop's depth in its bundles' splitting); an exit state's read weighs
+    // nothing (Ion's snapshot uses are KEEPALIVE, adding no weight; TurboFan's frame-state inputs
+    // are not register-beneficial, register-allocator.cc:75-88), nor does a phi's definition at a
+    // merge outside loops; the sum is over the range's length, what the register frees.
+    let depth_at = |p: u32| {
+        loop_hulls
+            .iter()
+            .filter(|&&(start, end)| start <= p && p <= end)
+            .count()
+            .min(6) as u32
     };
-
+    // The innermost loop whose hull holds position `at`, if any.
+    let innermost = |at: u32| {
+        loop_hulls
+            .iter()
+            .filter(|&&(start, end)| start <= at && at <= end)
+            .min_by_key(|&&(start, end)| end - start)
+            .copied()
+    };
+    let victim_rank = |v: NodeIx, at: u32| -> u64 {
+        let (use_start, use_end, uses) = register_uses.get_or_init(make_register_uses);
+        let list = &uses[use_start[v.index()] as usize..use_end[v.index()] as usize];
+        let (start, end) = ranges[v.index()];
+        let mut weight: u64 = list.iter().map(|&p| 8u64.pow(depth_at(p))).sum();
+        let def_depth = depth_at(start);
+        if graph.node(v).op != NodeOp::Phi || def_depth > 0 {
+            weight += 8u64.pow(def_depth);
+        }
+        let length = u64::from(end - start) + 1;
+        // Fixed point: weight per position, scaled; the best victim the lightest.
+        let rank = u64::MAX - (weight << 20) / length;
+        // A value the innermost loop around `at` has already read in a register in its current
+        // turn (a read in [the loop's head, at] after its definition) is never the victim: its
+        // spill would load it at those reads each turn, on the path the turn has taken, which a
+        // static weight cannot tell from reads on paths only some turns take (Richards'
+        // scheduler). Maglev keeps spilled across a loop only a value with no register use in it
+        // (maglev-pre-regalloc-codegen-processors.h:276-300, 385-394). The new value has no read
+        // yet and outranks it, so when every candidate has such a read the new value is spilled.
+        // Only the innermost loop's turn: over every enclosing loop (prototype 5) a value read
+        // once in an outer turn would outrank one an inner loop reads every iteration (Crypto
+        // +5.35% at graph).
+        if let Some((l0, _)) = innermost(at) {
+            let behind = &list[..list.partition_point(|&p| p <= at)];
+            if behind.iter().any(|&p| p >= l0 && p > start) {
+                return 0;
+            }
+        }
+        rank
+    };
     // The positions of effects and calls, which clobber the caller-saved registers.
     let mut calls: Vec<u32> = order
         .iter()
@@ -909,9 +976,10 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             }
         });
         if register.is_none() {
-            // No register is free: as Maglev chooses, the held value whose next use is the
-            // farthest gives up its register and is spilled at its definition, unless this
-            // value's own next use is farther. Its range began before now, so its slot is a new
+            // No register is free: the held value of the highest rank (`victim_rank`: the
+            // cheapest whole range in memory) gives up its register and is spilled at its
+            // definition, unless this value ranks as high (then it is spilled at its own; a tie
+            // keeps the held value). Its range began before now, so the victim's slot is a new
             // one, which nothing else has held.
             let def = range.0;
             let fits = |home: Home| match (home, class) {
@@ -926,10 +994,10 @@ pub(crate) fn allocate(graph: &Graph, file: &RegisterFile) -> Result<Allocation,
             let victim = active
                 .iter()
                 .filter(|&&(_, u)| fits(homes[u.index()]))
-                .map(|&(_, u)| (next_use(u, def), u))
+                .map(|&(_, u)| (victim_rank(u, def), u))
                 .max();
             if let Some((far, u)) = victim {
-                if far > next_use(v, def) {
+                if far > victim_rank(v, def) {
                     let (Home::Gp(r) | Home::Fp(r)) = homes[u.index()] else {
                         unreachable!("the victim holds a register")
                     };
@@ -2938,16 +3006,158 @@ pub(crate) mod tests {
         assert_eq!(live, slots);
     }
 
-    /// A loop over values spilled before it (step R1's tests): the entry defines 21 words and
-    /// then `values`, which the loop reads; the words fill every x register and die in a chain
-    /// before the loop, and each value's next use, in the loop, is farther than theirs, so each
-    /// spills at its definition; then `keep` words read only after the loop, each holding a
-    /// register through it. header: q = phi(acc, q'), i = phi(0, i'); poll; branch i < 100.
-    /// body: `body` builds from (q, the values) the word the back edge gives q; i' = i | 1; jump
-    /// header. exit: the kept words and return q.
+    /// Rule B's pressure on values live through it (rule B's tests, and a value its loop makes
+    /// and the code after the loop spills): `from` defines `n` words and jumps to a nest of two
+    /// loops whose inner body reads each word twice an iteration (a chain from the inner loop's
+    /// phi); the nest exits to `to`, which the caller fills and ends. Each word's read weighs 8
+    /// to the power 2, so a value defined before the words, live through the nest and not read
+    /// in it, has a cheaper whole range than any word (its range the longer, its reads lighter)
+    /// and gives up its register at the nest's choices; past the nest the words are dead.
+    /// Seventeen words make the nest's peak 21 x registers (the words, the outer counter, the
+    /// inner phi and counter, one temporary) plus one for each such value: each such value spills;
+    /// sixteen leave one register for two such values, so that the lighter spills. A value whose
+    /// own reads weigh more than a word's (two at depth two) may not.
+    fn words_nest(g: &mut Graph, from: BlockIx, to: BlockIx, n: usize) {
+        words_nest_with(g, from, to, n, |_, _| {});
+    }
+
+    /// `words_nest` with `between` building in `from` after the words, before its jump.
+    fn words_nest_with(
+        g: &mut Graph,
+        from: BlockIx,
+        to: BlockIx,
+        n: usize,
+        between: impl FnOnce(&mut Graph, &[NodeIx]),
+    ) {
+        let outer = g.add_block(20, true);
+        let inner = g.add_block(21, true);
+        let body = g.add_block(22, false);
+        let latch = g.add_block(23, false);
+        for (a, b) in [
+            (from, outer),
+            (outer, inner),
+            (outer, to),
+            (inner, body),
+            (inner, latch),
+            (body, inner),
+            (latch, outer),
+        ] {
+            g.add_edge(a, b);
+        }
+        let words: Vec<NodeIx> = (0..n)
+            .map(|_| g.add_node(from, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0))
+            .collect();
+        let zero = g.add_node(from, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        let one = g.add_node(from, NodeOp::ConstI32(1), &[], Rep::I32, 0);
+        let ten = g.add_node(from, NodeOp::ConstI32(10), &[], Rep::I32, 0);
+        between(g, &words);
+        g.add_node(from, NodeOp::Jump(outer), &[], Rep::None, 0);
+        // A header: (a word phi, a counter phi); poll; branch counter < bound.
+        let header = |g: &mut Graph, h: BlockIx, then_block, else_block, init, bound| {
+            let a = g.add_node(h, NodeOp::Phi, &[init], Rep::Tagged, 20);
+            let j = g.add_node(h, NodeOp::Phi, &[zero], Rep::I32, 20);
+            let ps = state(g, 20, &[]);
+            let poll = g.add_node(h, NodeOp::Poll, &[], Rep::None, 20);
+            g.node_mut(poll).state = Some(ps);
+            let lt = g.add_node(h, NodeOp::I32Cmp(Cond::Lt), &[j, bound], Rep::Bool, 20);
+            g.add_node(
+                h,
+                NodeOp::Branch {
+                    then_block,
+                    else_block,
+                },
+                &[lt],
+                Rep::None,
+                20,
+            );
+            (a, j)
+        };
+        let (a, j) = header(g, outer, inner, to, words[0], ten);
+        // The inner loop runs j turns: the outer counter is read at depth two as well, so that
+        // it is never lighter than a value live through the nest (it was, read at depth one).
+        let (b, k) = header(g, inner, body, latch, a, j);
+        let b2 = compare_each(g, body, b, &words, 2);
+        let k2 = g.add_node(body, NodeOp::I32Or, &[k, one], Rep::I32, 22);
+        g.add_node(body, NodeOp::Jump(inner), &[], Rep::None, 22);
+        let j2 = g.add_node(latch, NodeOp::I32Or, &[j, one], Rep::I32, 23);
+        g.add_node(latch, NodeOp::Jump(outer), &[], Rep::None, 23);
+        g.node_mut(a).inputs.push(b);
+        g.node_mut(j).inputs.push(j2);
+        g.node_mut(b).inputs.push(b2);
+        g.node_mut(k).inputs.push(k2);
+    }
+
+    /// Rule B's pressure for step R1's tests: `from` defines 21 words, each read once an
+    /// iteration in a nest of three loops (each read weighs 8 to the power 3; the loops branch on
+    /// a constant and carry no value, so the nest holds no x register of its own), and the nest
+    /// exits to `to`. The caller defines its values in `to` or after it and then reads the words
+    /// once more (`release`): until then every x register holds a word, much heavier than any
+    /// value these tests read, so each value is spilled at its own definition, as the 21 words
+    /// of a chain spilled it under the farthest next use; past `release` every register is
+    /// free. No value the tests spill is live through the nest. Returns the words.
+    fn crowd(g: &mut Graph, from: BlockIx, to: BlockIx) -> Vec<NodeIx> {
+        let words: Vec<NodeIx> = (0..21)
+            .map(|_| g.add_node(from, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0))
+            .collect();
+        let go = g.add_node(from, NodeOp::ConstBool(true), &[], Rep::Bool, 0);
+        let h1 = g.add_block(40, true);
+        let h2 = g.add_block(41, true);
+        let h3 = g.add_block(42, true);
+        let body = g.add_block(43, false);
+        let t2 = g.add_block(44, false);
+        let t1 = g.add_block(45, false);
+        for (a, b) in [
+            (from, h1),
+            (h1, h2),
+            (h1, to),
+            (h2, h3),
+            (h2, t1),
+            (h3, body),
+            (h3, t2),
+            (body, h3),
+            (t2, h2),
+            (t1, h1),
+        ] {
+            g.add_edge(a, b);
+        }
+        g.add_node(from, NodeOp::Jump(h1), &[], Rep::None, 0);
+        for (h, then_block, else_block) in [(h1, h2, to), (h2, h3, t1), (h3, body, t2)] {
+            g.add_node(
+                h,
+                NodeOp::Branch {
+                    then_block,
+                    else_block,
+                },
+                &[go],
+                Rep::None,
+                40,
+            );
+        }
+        release(g, body, &words);
+        g.add_node(body, NodeOp::Jump(h3), &[], Rep::None, 43);
+        g.add_node(t2, NodeOp::Jump(h2), &[], Rep::None, 44);
+        g.add_node(t1, NodeOp::Jump(h1), &[], Rep::None, 45);
+        words
+    }
+
+    /// Each of `words` read once in `b`, two to a node whose result nothing reads.
+    fn release(g: &mut Graph, b: BlockIx, words: &[NodeIx]) {
+        for k in (0..words.len()).step_by(2) {
+            let other = words[(k + 1) % words.len()];
+            g.add_node(b, NodeOp::TaggedSame, &[words[k], other], Rep::Bool, 0);
+        }
+    }
+
+    /// A loop over values spilled before it (step R1's tests): the entry and the words' nest
+    /// (`crowd`) fill every x register, then `pre` defines `values`, which the loop reads, each
+    /// spilled at its definition; then the words die, and `pre` defines q's first word and `keep`
+    /// words read only after the loop, each holding a register through it, and enters the loop.
+    /// header: q = phi(first, q'), i = phi(0, i'); poll; branch i < 100. body: `body` builds
+    /// from (q, the values) the word the back edge gives q; i' = i | 1; jump header. exit: the
+    /// kept words and return q.
     struct Looped {
         g: Graph,
-        entry: BlockIx,
+        pre: BlockIx,
         header: BlockIx,
         body: BlockIx,
         values: Vec<NodeIx>,
@@ -2960,27 +3170,27 @@ pub(crate) mod tests {
     ) -> Looped {
         let mut g = Graph::new(2);
         let entry = g.add_block(0, false);
+        let pre = g.add_block(4, false);
         let header = g.add_block(1, true);
         let body_block = g.add_block(2, false);
         let exit = g.add_block(3, false);
         g.entry = Some(entry);
-        g.add_edge(entry, header);
+        let words = crowd(&mut g, entry, pre);
+        let vs: Vec<NodeIx> = (0..values)
+            .map(|_| g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 4))
+            .collect();
+        release(&mut g, pre, &words);
+        g.add_edge(pre, header);
         g.add_edge(header, body_block);
         g.add_edge(header, exit);
         g.add_edge(body_block, header);
-        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
-        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
-        let vs: Vec<NodeIx> = (0..values).map(|_| word(&mut g)).collect();
-        let mut acc = words[0];
-        for &w in &words[1..] {
-            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
-            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
-        }
-        // Defined once the chain freed the registers: each holds one through the loop.
+        let word = |g: &mut Graph| g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 4);
+        let first = word(&mut g);
+        // Defined once the words freed the registers: each holds one through the loop.
         let kept: Vec<NodeIx> = (0..keep).map(|_| word(&mut g)).collect();
-        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
-        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
-        let q = g.add_node(header, NodeOp::Phi, &[acc], Rep::Tagged, 1);
+        let zero = g.add_node(pre, NodeOp::ConstI32(0), &[], Rep::I32, 4);
+        g.add_node(pre, NodeOp::Jump(header), &[], Rep::None, 4);
+        let q = g.add_node(header, NodeOp::Phi, &[first], Rep::Tagged, 1);
         let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
         let ps = state(&mut g, 1, &[]);
         let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
@@ -3017,7 +3227,7 @@ pub(crate) mod tests {
         g.add_node(exit, NodeOp::Return, &[out], Rep::None, 3);
         Looped {
             g,
-            entry,
+            pre,
             header,
             body: body_block,
             values: vs,
@@ -3064,9 +3274,9 @@ pub(crate) mod tests {
         assert!(ARM64.gp_caller.contains(&r), "x{r}");
         assert_eq!(alloc.cache_of(l.body, v), Some(cache.reg));
         assert_eq!(alloc.cache_of(l.header, v), Some(cache.reg));
-        assert_eq!(alloc.cache_of(l.entry, v), None);
+        assert_eq!(alloc.cache_of(l.pre, v), None);
         assert!(alloc.enters_loaded(l.body, l.header));
-        assert!(!alloc.enters_loaded(l.entry, l.header));
+        assert!(!alloc.enters_loaded(l.pre, l.header));
     }
 
     #[test]
@@ -3110,12 +3320,14 @@ pub(crate) mod tests {
         assert!(alloc.caches.is_empty(), "{:?}", alloc.caches);
     }
 
-    /// Nested loops over a value spilled before them: entry (21 words in a chain, v, `keep` words
-    /// read after the loops) -> H1 (q1, i; poll; i < 10) -> B1 (an effect where `call`) -> H2 (q2,
-    /// j; poll; j < 10) -> B2 (q2 compared with v; j | 1) -> H2; H2 -> L1 (i | 1) -> H1; H1 -> X.
+    /// Nested loops over a value spilled before them: entry (the words' nest: `crowd`) -> pre
+    /// (v, spilled at its definition; the words' last reads; q1's first word, `keep` words read
+    /// after the loops) -> H1 (q1, i; poll; i < 10) -> B1 (an effect where `call`) -> H2 (q2, j;
+    /// poll; j < 10) -> B2 (q2 compared with v; j | 1) -> H2; H2 -> L1 (i | 1) -> H1; H1 -> X.
     fn nested(call: bool, keep: usize) -> (Graph, [BlockIx; 4], NodeIx) {
         let mut g = Graph::new(2);
         let entry = g.add_block(0, false);
+        let pre = g.add_block(7, false);
         let h1 = g.add_block(1, true);
         let b1 = g.add_block(2, false);
         let h2 = g.add_block(3, true);
@@ -3123,8 +3335,11 @@ pub(crate) mod tests {
         let l1 = g.add_block(5, false);
         let x = g.add_block(6, false);
         g.entry = Some(entry);
+        let words = crowd(&mut g, entry, pre);
+        let v = g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 7);
+        release(&mut g, pre, &words);
         for (a, b) in [
-            (entry, h1),
+            (pre, h1),
             (h1, b1),
             (h1, x),
             (b1, h2),
@@ -3135,19 +3350,13 @@ pub(crate) mod tests {
         ] {
             g.add_edge(a, b);
         }
-        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
-        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
-        let v = word(&mut g);
-        let mut acc = words[0];
-        for &w in &words[1..] {
-            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
-            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
-        }
+        let word = |g: &mut Graph| g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 7);
+        let first = word(&mut g);
         let kept: Vec<NodeIx> = (0..keep).map(|_| word(&mut g)).collect();
-        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
-        let one = g.add_node(entry, NodeOp::ConstI32(1), &[], Rep::I32, 0);
-        let ten = g.add_node(entry, NodeOp::ConstI32(10), &[], Rep::I32, 0);
-        g.add_node(entry, NodeOp::Jump(h1), &[], Rep::None, 0);
+        let zero = g.add_node(pre, NodeOp::ConstI32(0), &[], Rep::I32, 7);
+        let one = g.add_node(pre, NodeOp::ConstI32(1), &[], Rep::I32, 7);
+        let ten = g.add_node(pre, NodeOp::ConstI32(10), &[], Rep::I32, 7);
+        g.add_node(pre, NodeOp::Jump(h1), &[], Rep::None, 7);
         let header = |g: &mut Graph, h: BlockIx, body: BlockIx, out: BlockIx, init: NodeIx| {
             let q = g.add_node(h, NodeOp::Phi, &[init], Rep::Tagged, 1);
             let i = g.add_node(h, NodeOp::Phi, &[zero], Rep::I32, 1);
@@ -3167,7 +3376,7 @@ pub(crate) mod tests {
             );
             (q, i)
         };
-        let (q1, i) = header(&mut g, h1, b1, x, acc);
+        let (q1, i) = header(&mut g, h1, b1, x, first);
         if call {
             let s = state(&mut g, 2, &[q1]);
             let effect = g.add_node(
@@ -3241,12 +3450,12 @@ pub(crate) mod tests {
         let acc = g.node(g.block(l.header).phis[0]).inputs[0];
         let zero = g.node(g.block(l.header).phis[1]).inputs[0];
         // The entry's jump becomes a branch to A and B.
-        g.blocks[l.entry.index()].body.pop();
-        g.blocks[l.entry.index()].succs.clear();
-        g.blocks[l.header.index()].preds.retain(|&p| p != l.entry);
-        let c = g.add_node(l.entry, NodeOp::TaggedSame, &[acc, acc], Rep::Bool, 0);
+        g.blocks[l.pre.index()].body.pop();
+        g.blocks[l.pre.index()].succs.clear();
+        g.blocks[l.header.index()].preds.retain(|&p| p != l.pre);
+        let c = g.add_node(l.pre, NodeOp::TaggedSame, &[acc, acc], Rep::Bool, 0);
         g.add_node(
-            l.entry,
+            l.pre,
             NodeOp::Branch {
                 then_block: a,
                 else_block: b,
@@ -3255,8 +3464,8 @@ pub(crate) mod tests {
             Rep::None,
             0,
         );
-        g.add_edge(l.entry, a);
-        g.add_edge(l.entry, b);
+        g.add_edge(l.pre, a);
+        g.add_edge(l.pre, b);
         for from in [a, b] {
             g.add_node(from, NodeOp::Jump(l.header), &[], Rep::None, 0);
             g.add_edge(from, l.header);
@@ -3338,15 +3547,16 @@ pub(crate) mod tests {
 
     #[test]
     fn a_value_made_in_its_loops_header_and_spilled_after_the_loop_gets_no_cache() {
-        // vt is made in the header each iteration, read in the body and after the loop, where
-        // twenty-two words made from q push it out (its next use is the farthest): its home is
-        // a slot, and registers are free through the loop. A cache loaded at the header would
-        // hold the previous iteration's vt.
+        // vt is made in the header each iteration, read in the body and after the words' nest
+        // that follows the loop, whose choice pushes it out (it is live through the nest and not
+        // read there: `words_nest`): its home is a slot, and registers are free through the
+        // loop. A cache loaded at the header would hold the previous iteration's vt.
         let mut g = Graph::new(2);
         let entry = g.add_block(0, false);
         let header = g.add_block(1, true);
         let body = g.add_block(2, false);
         let exit = g.add_block(3, false);
+        let tail = g.add_block(5, false);
         g.entry = Some(entry);
         g.add_edge(entry, header);
         g.add_edge(header, body);
@@ -3386,15 +3596,9 @@ pub(crate) mod tests {
         g.add_node(body, NodeOp::Jump(header), &[], Rep::None, 2);
         g.node_mut(q).inputs.push(q2);
         g.node_mut(i).inputs.push(i2);
-        let words: Vec<NodeIx> = (0..22)
-            .map(|_| {
-                let same = g.add_node(exit, NodeOp::TaggedSame, &[q, q], Rep::Bool, 3);
-                g.add_node(exit, NodeOp::BoolToTagged, &[same], Rep::Tagged, 3)
-            })
-            .collect();
-        let acc = compare_each(&mut g, exit, words[0], &words[1..], 1);
-        let out = compare_each(&mut g, exit, acc, &[vt], 1);
-        g.add_node(exit, NodeOp::Return, &[out], Rep::None, 3);
+        words_nest(&mut g, exit, tail, 17);
+        let out = compare_each(&mut g, tail, vt, &[vt], 1);
+        g.add_node(tail, NodeOp::Return, &[out], Rep::None, 5);
         let alloc = allocate(&g, &ARM64).unwrap();
         assert_consistent(&g, &alloc);
         assert!(
@@ -3411,32 +3615,29 @@ pub(crate) mod tests {
 
     #[test]
     fn a_block_outside_the_loop_inside_its_hull_reads_the_slot() {
-        // entry (21 words, v spilled, the chain) -> H (q, i; poll; i < 100) -> A (q against v;
-        // branch to X or B) ; B -> H (the latch); X returns q against v; H -> E returns q. In the
-        // code order X lies between A and B, inside the loop's hull but none of its blocks: the
-        // cache serves H, A and B, and X reads v's slot.
+        // entry (the words' nest: `crowd`) -> pre (v, spilled at its definition) -> H (q, i;
+        // poll; i < 100) -> A (q against v; branch to X or B) ; B -> H (the latch); X returns q
+        // against v; H -> E returns q. In the code order X lies between A and B, inside the
+        // loop's hull but none of its blocks: the cache serves H, A and B, and X reads v's slot.
         let mut g = Graph::new(2);
         let entry = g.add_block(0, false);
+        let pre = g.add_block(6, false);
         let h = g.add_block(1, true);
         let a = g.add_block(2, false);
         let b = g.add_block(3, false);
         let x = g.add_block(4, false);
         let e = g.add_block(5, false);
         g.entry = Some(entry);
-        for (from, to) in [(entry, h), (h, a), (h, e), (a, x), (a, b), (b, h)] {
+        let words = crowd(&mut g, entry, pre);
+        let v = g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 6);
+        release(&mut g, pre, &words);
+        for (from, to) in [(pre, h), (h, a), (h, e), (a, x), (a, b), (b, h)] {
             g.add_edge(from, to);
         }
-        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
-        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
-        let v = word(&mut g);
-        let mut acc = words[0];
-        for &w in &words[1..] {
-            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
-            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
-        }
-        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
-        g.add_node(entry, NodeOp::Jump(h), &[], Rep::None, 0);
-        let q = g.add_node(h, NodeOp::Phi, &[acc], Rep::Tagged, 1);
+        let first = g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 6);
+        let zero = g.add_node(pre, NodeOp::ConstI32(0), &[], Rep::I32, 6);
+        g.add_node(pre, NodeOp::Jump(h), &[], Rep::None, 6);
+        let q = g.add_node(h, NodeOp::Phi, &[first], Rep::Tagged, 1);
         let i = g.add_node(h, NodeOp::Phi, &[zero], Rep::I32, 1);
         let ps = state(&mut g, 1, &[]);
         let poll = g.add_node(h, NodeOp::Poll, &[], Rep::None, 1);
@@ -3481,7 +3682,7 @@ pub(crate) mod tests {
             assert_eq!(alloc.cache_of(blk, v), Some(cache.reg), "{blk:?}");
         }
         assert_eq!(alloc.cache_of(x, v), None, "X reads the slot");
-        assert!(!alloc.enters_loaded(x, h) && !alloc.enters_loaded(entry, h));
+        assert!(!alloc.enters_loaded(x, h) && !alloc.enters_loaded(pre, h));
     }
 
     #[test]
@@ -3518,26 +3719,24 @@ pub(crate) mod tests {
         );
     }
 
-    /// Straight-line reads of a spilled value (step R1's read spans): the entry defines 21 words
-    /// and then v, spilled at its definition (its next use is the farthest); the words die in a
-    /// chain, then `reads` builds on (the chain's word, v) and the result is returned.
+    /// Straight-line reads of a spilled value (step R1's read spans): the entry and the words'
+    /// nest (`crowd`) fill every x register, then block `b` defines v, spilled at its
+    /// definition, the words die, `b` defines a first word, `reads` builds on (that word, v) in
+    /// `b`, and the result is returned. Returns (the graph, b, v).
     fn straight(
         reads: impl FnOnce(&mut Graph, BlockIx, NodeIx, NodeIx) -> NodeIx,
-    ) -> (Graph, NodeIx) {
+    ) -> (Graph, BlockIx, NodeIx) {
         let mut g = Graph::new(2);
         let entry = g.add_block(0, false);
+        let b = g.add_block(1, false);
         g.entry = Some(entry);
-        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
-        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
-        let v = word(&mut g);
-        let mut acc = words[0];
-        for &w in &words[1..] {
-            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
-            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
-        }
-        let out = reads(&mut g, entry, acc, v);
-        g.add_node(entry, NodeOp::Return, &[out], Rep::None, 1);
-        (g, v)
+        let words = crowd(&mut g, entry, b);
+        let v = g.add_node(b, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+        release(&mut g, b, &words);
+        let first = g.add_node(b, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+        let out = reads(&mut g, b, first, v);
+        g.add_node(b, NodeOp::Return, &[out], Rep::None, 1);
+        (g, b, v)
     }
 
     fn effect(g: &mut Graph, b: BlockIx, keep: NodeIx) {
@@ -3560,12 +3759,12 @@ pub(crate) mod tests {
     fn a_spilled_values_reads_with_no_call_between_share_one_loaded_register() {
         // Three reads of v after the chain: one span from the first to the last, in a
         // caller-saved register.
-        let (g, v) = straight(|g, b, acc, v| compare_each(g, b, acc, &[v], 3));
+        let (g, block, v) = straight(|g, b, acc, v| compare_each(g, b, acc, &[v], 3));
         let alloc = allocate(&g, &ARM64).unwrap();
         assert_consistent(&g, &alloc);
         assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
         let readers: Vec<u32> = g
-            .block(g.entry.unwrap())
+            .block(block)
             .body
             .iter()
             .filter(|&&n| g.node(n).inputs.contains(&v))
@@ -3598,7 +3797,7 @@ pub(crate) mod tests {
         assert_eq!(alloc.caches[0].value, l.values[0]);
         // Two reads of a spilled value in a block with no loop and no call between: the run rule
         // alone admits them, and they share a span.
-        let (g, v) = straight(|g, b, acc, v| compare_each(g, b, acc, &[v], 2));
+        let (g, _, v) = straight(|g, b, acc, v| compare_each(g, b, acc, &[v], 2));
         let alloc = allocate(&g, &ARM64).unwrap();
         assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
         assert!(alloc.caches.is_empty());
@@ -3607,7 +3806,7 @@ pub(crate) mod tests {
         };
         assert!(span.value == v && span.from < span.to, "{span:?}");
         // One node that reads it twice (`v == v`): a run of one node, a span over it.
-        let (g, v) = straight(|g, b, acc, v| {
+        let (g, _, v) = straight(|g, b, acc, v| {
             let same = g.add_node(b, NodeOp::TaggedSame, &[v, v], Rep::Bool, 2);
             let word = g.add_node(b, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2);
             let same = g.add_node(b, NodeOp::TaggedSame, &[acc, word], Rep::Bool, 2);
@@ -3628,23 +3827,20 @@ pub(crate) mod tests {
         // in it (no run: the rule for spans does not admit it) takes a cache.
         let mut g = Graph::new(2);
         let entry = g.add_block(0, false);
+        let pre = g.add_block(3, false);
         let header = g.add_block(1, true);
         let exit = g.add_block(2, false);
         g.entry = Some(entry);
-        g.add_edge(entry, header);
+        let words = crowd(&mut g, entry, pre);
+        let v = g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 3);
+        release(&mut g, pre, &words);
+        g.add_edge(pre, header);
         g.add_edge(header, header);
         g.add_edge(header, exit);
-        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
-        let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
-        let v = word(&mut g);
-        let mut acc = words[0];
-        for &w in &words[1..] {
-            let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, w], Rep::Bool, 0);
-            acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
-        }
-        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
-        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
-        let q = g.add_node(header, NodeOp::Phi, &[acc], Rep::Tagged, 1);
+        let first = g.add_node(pre, NodeOp::EntrySlot(1), &[], Rep::Tagged, 3);
+        let zero = g.add_node(pre, NodeOp::ConstI32(0), &[], Rep::I32, 3);
+        g.add_node(pre, NodeOp::Jump(header), &[], Rep::None, 3);
+        let q = g.add_node(header, NodeOp::Phi, &[first], Rep::Tagged, 1);
         let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
         let ps = state(&mut g, 1, &[]);
         let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
@@ -3686,7 +3882,7 @@ pub(crate) mod tests {
         };
         assert_eq!((cache.value, cache.header), (v, header));
         assert!(alloc.enters_loaded(header, header));
-        assert!(!alloc.enters_loaded(entry, header));
+        assert!(!alloc.enters_loaded(pre, header));
     }
 
     #[test]
@@ -3735,7 +3931,7 @@ pub(crate) mod tests {
     #[test]
     fn a_call_between_a_spilled_values_reads_ends_their_span() {
         // Two reads, a call, two reads: a span on each side, none across the call.
-        let (g, v) = straight(|g, b, acc, v| {
+        let (g, block, v) = straight(|g, b, acc, v| {
             let acc = compare_each(g, b, acc, &[v], 2);
             effect(g, b, acc);
             compare_each(g, b, acc, &[v], 2)
@@ -3744,7 +3940,7 @@ pub(crate) mod tests {
         assert_consistent(&g, &alloc);
         assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
         let call = g
-            .block(g.entry.unwrap())
+            .block(block)
             .body
             .iter()
             .find(|&&n| g.node(n).op.is_effectful())
@@ -3757,7 +3953,7 @@ pub(crate) mod tests {
             alloc.spans
         );
         // One read on each side: no span.
-        let (g, _) = straight(|g, b, acc, v| {
+        let (g, _, _) = straight(|g, b, acc, v| {
             let acc = compare_each(g, b, acc, &[v], 1);
             effect(g, b, acc);
             compare_each(g, b, acc, &[v], 1)
@@ -3771,7 +3967,7 @@ pub(crate) mod tests {
     fn a_stub_call_between_a_spilled_values_reads_keeps_their_span_out_of_its_clobbers() {
         // A TypedElement call between the reads, with ten words read after it holding x0-x8 and
         // x10: the caller-saved registers left are its clobbers, which the span may not take.
-        let (g, v) = straight(|g, b, acc, v| {
+        let (g, block, v) = straight(|g, b, acc, v| {
             let kept: Vec<NodeIx> = (0..10)
                 .map(|_| g.add_node(b, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0))
                 .collect();
@@ -3797,7 +3993,7 @@ pub(crate) mod tests {
         let (gp, _) = clobbers(&NodeOp::TypedElement { write: false });
         assert!(!alloc.spans.is_empty());
         let te = g
-            .block(g.entry.unwrap())
+            .block(block)
             .body
             .iter()
             .find(|&&n| matches!(g.node(n).op, NodeOp::TypedElement { .. }))
@@ -3812,26 +4008,25 @@ pub(crate) mod tests {
 
     #[test]
     fn overlapping_runs_take_a_scarce_register_by_the_loads_they_save() {
-        // w, then v, spilled; `keep` words read at the end hold registers over the reads, which
-        // interleave w v w v v v: v's run saves three loads, w's one. With one register free over
-        // both runs, v's takes it though w's comes first by value.
+        // w, then v, spilled at their definitions after the words' nest (`crowd`); then `keep`
+        // words read at the end hold registers over the reads, which interleave w v w v v v: v's
+        // run saves three loads, w's one. With one register free over both runs, v's takes it
+        // though w's comes first by value.
         for keep in [17usize, 18, 19] {
             let mut g = Graph::new(2);
             let entry = g.add_block(0, false);
+            let after = g.add_block(1, false);
             g.entry = Some(entry);
-            let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
-            let words: Vec<NodeIx> = (0..21).map(|_| word(&mut g)).collect();
-            let w = word(&mut g);
-            let v = word(&mut g);
-            let mut acc = words[0];
-            for &x in &words[1..] {
-                let same = g.add_node(entry, NodeOp::TaggedSame, &[acc, x], Rep::Bool, 0);
-                acc = g.add_node(entry, NodeOp::BoolToTagged, &[same], Rep::Tagged, 0);
-            }
+            let words = crowd(&mut g, entry, after);
+            let w = g.add_node(after, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+            let v = g.add_node(after, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+            release(&mut g, after, &words);
+            let word = |g: &mut Graph| g.add_node(after, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+            let first = word(&mut g);
             let kept: Vec<NodeIx> = (0..keep).map(|_| word(&mut g)).collect();
-            let acc = compare_each(&mut g, entry, acc, &[w, v, w, v, v, v], 1);
-            let out = compare_each(&mut g, entry, acc, &kept, 1);
-            g.add_node(entry, NodeOp::Return, &[out], Rep::None, 1);
+            let acc = compare_each(&mut g, after, first, &[w, v, w, v, v, v], 1);
+            let out = compare_each(&mut g, after, acc, &kept, 1);
+            g.add_node(after, NodeOp::Return, &[out], Rep::None, 1);
             let alloc = allocate(&g, &ARM64).unwrap();
             assert_consistent(&g, &alloc);
             assert!(matches!(alloc.homes[v.index()], Home::Spill(_)));
@@ -3891,5 +4086,800 @@ pub(crate) mod tests {
         assert_eq!(alloc.order, vec![entry, header, body, exit]);
         assert!(matches!(alloc.homes[i.index()], Home::Fp(_)));
         assert_eq!(alloc.homes[next.index()], alloc.homes[i.index()]);
+    }
+
+    // ---- rule B: the eviction ranks by reads that need a register (P3 stage 3) -------------
+
+    /// A loop whose x registers are all taken (rule B's tests). entry: `fillers` words, then
+    /// `before` words of the test, then a zero. header: q = phi(first word, q'), i = phi(0, i');
+    /// the test's header nodes (`header_poll` or its own). body: first the test's nodes (`build`,
+    /// from q), then every filler read in a register (compared into q'), i' = i | 1; jump.
+    struct Pressure {
+        g: Graph,
+        header: BlockIx,
+        body: BlockIx,
+        exit: BlockIx,
+    }
+
+    fn pressure(
+        fillers: usize,
+        before: usize,
+        build: impl FnOnce(&mut Graph, BlockIx, NodeIx, &[NodeIx]) -> NodeIx,
+    ) -> (Pressure, Vec<NodeIx>) {
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let body = g.add_block(2, false);
+        let exit = g.add_block(3, false);
+        g.entry = Some(entry);
+        g.add_edge(entry, header);
+        g.add_edge(header, body);
+        g.add_edge(header, exit);
+        g.add_edge(body, header);
+        let word = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let fill: Vec<NodeIx> = (0..fillers).map(|_| word(&mut g)).collect();
+        let words: Vec<NodeIx> = (0..before).map(|_| word(&mut g)).collect();
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let q = g.add_node(header, NodeOp::Phi, &[fill[0]], Rep::Tagged, 1);
+        let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
+        let acc = build(&mut g, body, q, &words);
+        let q2 = compare_each(&mut g, body, acc, &fill, 1);
+        let one = g.add_node(body, NodeOp::ConstI32(1), &[], Rep::I32, 2);
+        let i2 = g.add_node(body, NodeOp::I32Or, &[i, one], Rep::I32, 2);
+        g.add_node(body, NodeOp::Jump(header), &[], Rep::None, 2);
+        g.node_mut(q).inputs.push(q2);
+        g.node_mut(i).inputs.push(i2);
+        (
+            Pressure {
+                g,
+                header,
+                body,
+                exit,
+            },
+            words,
+        )
+    }
+
+    /// The header's nodes: a poll whose exit state holds `held`, then (if `read` is given) a real
+    /// read of it, and the branch i < 100.
+    fn header_poll(p: &mut Pressure, held: &[NodeIx], read: Option<NodeIx>) {
+        let (header, body, exit) = (p.header, p.body, p.exit);
+        let q = p.g.block(header).phis[0];
+        let i = p.g.block(header).phis[1];
+        let ps = state(&mut p.g, 1, held);
+        let poll = p.g.add_node(header, NodeOp::Poll, &[], Rep::None, 1);
+        p.g.node_mut(poll).state = Some(ps);
+        if let Some(r) = read {
+            let same =
+                p.g.add_node(header, NodeOp::TaggedSame, &[q, r], Rep::Bool, 1);
+            p.g.add_node(header, NodeOp::BoolToTagged, &[same], Rep::Tagged, 1);
+        }
+        let hundred =
+            p.g.add_node(header, NodeOp::ConstI32(100), &[], Rep::I32, 1);
+        let lt = p.g.add_node(
+            header,
+            NodeOp::I32Cmp(Cond::Lt),
+            &[i, hundred],
+            Rep::Bool,
+            1,
+        );
+        p.g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: body,
+                else_block: exit,
+            },
+            &[lt],
+            Rep::None,
+            1,
+        );
+    }
+
+    /// The exit block: q compared with each of `reads`, returned.
+    fn exit_reads(p: &mut Pressure, reads: &[NodeIx]) {
+        let q = p.g.block(p.header).phis[0];
+        let r = compare_each(&mut p.g, p.exit, q, reads, 1);
+        p.g.add_node(p.exit, NodeOp::Return, &[r], Rep::None, 3);
+    }
+
+    /// `x` made from `from` in `b` (a Cell, x-register class), read by a later node's exit state
+    /// alone (a check of `from`, whose state holds `x`).
+    fn state_only(g: &mut Graph, b: BlockIx, from: NodeIx) -> NodeIx {
+        let x = g.add_node(b, NodeOp::CheckObject, &[from], Rep::Cell, 2);
+        let s = state(g, 2, &[x]);
+        let check = g.add_node(b, NodeOp::CheckNumber, &[from], Rep::F64, 2);
+        g.node_mut(check).state = Some(s);
+        x
+    }
+
+    fn home(alloc: &Allocation, v: NodeIx) -> Home {
+        alloc.homes[v.index()]
+    }
+
+    #[test]
+    fn a_value_only_exit_states_read_in_the_loop_gives_up_its_register_first() {
+        // 19 fillers (the first also q's entry value), `s` and `v`, and the loop's q and i: 22
+        // values through the loop for 21 x registers. `s` is read by the header poll's exit
+        // state alone (as an inlined frame's callee or receiver is), `v` first in the body each
+        // iteration. Under the farthest next use the poll's state read made `s` the nearest, and
+        // a filler the loop reads spilled; rule B weighs `s` by its definition's store alone,
+        // the lightest range: `s` spills, which no read needs in a register, and `v` keeps one.
+        let (mut p, words) = pressure(19, 2, |g, body, q, words| {
+            compare_each(g, body, q, &words[1..], 1)
+        });
+        let (s, v) = (words[0], words[1]);
+        header_poll(&mut p, &[s], None);
+        exit_reads(&mut p, &[]);
+        let alloc = allocate(&p.g, &ARM64).unwrap();
+        assert_consistent(&p.g, &alloc);
+        assert!(
+            matches!(home(&alloc, s), Home::Spill(_)),
+            "s: {:?}",
+            home(&alloc, s)
+        );
+        assert!(
+            matches!(home(&alloc, v), Home::Gp(_)),
+            "v: {:?}",
+            home(&alloc, v)
+        );
+    }
+
+    #[test]
+    fn a_value_exit_states_read_in_the_loop_weighs_by_its_real_reads_alone() {
+        // `u` is read by three exit states in the loop (the poll's and two checks') and by one
+        // real read after it; every other value through the loop by one real read in the body.
+        // An exit reads from any home, so u's weight is that read and its definition's store,
+        // the lightest over its range: u gives up its register, and of the three registers the
+        // loop's q, i and its header's compare need, the fillers give two. Counting the states'
+        // reads (8 each), u would outweigh every filler and keep its register.
+        let (mut p, words) = pressure(20, 1, |g, body, q, words| {
+            for _ in 0..2 {
+                let s = state(g, 2, &[words[0]]);
+                let check = g.add_node(body, NodeOp::CheckObject, &[q], Rep::Cell, 2);
+                g.node_mut(check).state = Some(s);
+            }
+            q
+        });
+        let u = words[0];
+        header_poll(&mut p, &[u], None);
+        exit_reads(&mut p, &[u]);
+        let alloc = allocate(&p.g, &ARM64).unwrap();
+        assert_consistent(&p.g, &alloc);
+        assert!(
+            matches!(home(&alloc, u), Home::Spill(_)),
+            "u: {:?}",
+            home(&alloc, u)
+        );
+        let spilled_in_loop = (0..p.g.nodes.len())
+            .filter(|&k| p.g.node(NodeIx(k as u32)).op == NodeOp::EntrySlot(1))
+            .filter(|&k| k != u.index() && matches!(alloc.homes[k], Home::Spill(_)))
+            .count();
+        assert_eq!(
+            spilled_in_loop, 2,
+            "two fillers beside u: q, i and the header's compare need three registers"
+        );
+    }
+
+    #[test]
+    fn a_value_made_in_the_loop_weighs_its_definitions_store_each_turn() {
+        // 18 fillers, `o` (read after the loop alone), q and i hold all 21 x registers through
+        // the loop, whose header branches on a constant (no compare to hold a register). The
+        // body reads every filler, then makes `t` from that chain's word, read by a later
+        // node's exit state alone: the choice falls at t's definition, where every value the
+        // turn has read ranks last. Spilling `t` would store it each iteration (its definition's
+        // store weighs 8 in the loop); spilling `o` stores it once before the loop and loads it
+        // once after (2): `o` spills, `t` keeps a register. Without the definition's store, `t`
+        // (no register read) would weigh nothing and spill itself.
+        let (mut p, words) = pressure(18, 1, |_, _, q, _| q);
+        let (o, header, body, exit) = (words[0], p.header, p.body, p.exit);
+        // `t` after the body's chain over the fillers (q's back-edge word), before i' = i | 1.
+        let tail: Vec<NodeIx> = (0..3)
+            .map(|_| p.g.blocks[body.index()].body.pop().expect("1, i', jump"))
+            .collect();
+        let chain = p.g.node(p.g.block(header).phis[0]).inputs[1];
+        let t = state_only(&mut p.g, body, chain);
+        p.g.blocks[body.index()].body.extend(tail.into_iter().rev());
+        let go =
+            p.g.add_node(header, NodeOp::ConstBool(true), &[], Rep::Bool, 1);
+        p.g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: body,
+                else_block: exit,
+            },
+            &[go],
+            Rep::None,
+            1,
+        );
+        exit_reads(&mut p, &[o]);
+        let alloc = allocate(&p.g, &ARM64).unwrap();
+        assert_consistent(&p.g, &alloc);
+        assert!(
+            matches!(home(&alloc, o), Home::Spill(_)),
+            "o: {:?}",
+            home(&alloc, o)
+        );
+        assert!(
+            matches!(home(&alloc, t), Home::Gp(_)),
+            "t: {:?}",
+            home(&alloc, t)
+        );
+    }
+
+    #[test]
+    fn a_value_the_loop_reads_each_turn_outweighs_one_read_after_it() {
+        // 17 fillers, `r` (read in a register in the header each iteration, so live across the
+        // back edge), `o` (read after the loop alone), q and i: 21 values for 21 x registers.
+        // The choice falls at the header's read of `r`, whose result needs a register: `r` has
+        // been read this turn (never the victim) and weighs a read at depth 1 besides, so `o`,
+        // read after the loop, spills; ranked by its next read alone, behind the choice, `r`
+        // would rank as never read again and spill.
+        let (mut p, words) = pressure(17, 2, |_, _, q, _| q);
+        let (r, o) = (words[0], words[1]);
+        header_poll(&mut p, &[], Some(r));
+        exit_reads(&mut p, &[o]);
+        let alloc = allocate(&p.g, &ARM64).unwrap();
+        assert_consistent(&p.g, &alloc);
+        assert!(
+            matches!(home(&alloc, r), Home::Gp(_)),
+            "r: {:?}",
+            home(&alloc, r)
+        );
+        assert!(
+            matches!(home(&alloc, o), Home::Spill(_)),
+            "o: {:?}",
+            home(&alloc, o)
+        );
+    }
+
+    #[test]
+    fn a_value_its_loop_already_read_in_a_register_this_turn_keeps_its_register() {
+        // 18 fillers, q and i, and `v` made first in the body from q: 21 values for 21 x
+        // registers. `v` is read in a register at once (w = a field of v), then by a later
+        // check's exit state alone. The choice falls at w's definition. As a victim `v` would be
+        // spilled at its definition, so its read behind the choice, in the loop, would load it
+        // each turn and its definition store it: it is never the victim, and a filler gives up
+        // its register (the fillers are the lighter here by weight too: the term itself is
+        // `a_value_the_loop_read_in_a_register_this_turn_is_not_the_victim_though_lightest`).
+        let mut made = None;
+        let (mut p, _) = pressure(18, 0, |g, body, q, _| {
+            let v = g.add_node(body, NodeOp::CheckObject, &[q], Rep::Cell, 2);
+            let w = g.add_node(
+                body,
+                NodeOp::LoadField {
+                    location: 128,
+                    slot: 0,
+                },
+                &[v],
+                Rep::Tagged,
+                2,
+            );
+            let s = state(g, 2, &[v]);
+            let check = g.add_node(body, NodeOp::CheckNumber, &[w], Rep::F64, 2);
+            g.node_mut(check).state = Some(s);
+            let same = g.add_node(body, NodeOp::TaggedSame, &[w, q], Rep::Bool, 2);
+            made = Some(v);
+            g.add_node(body, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2)
+        });
+        let v = made.expect("v");
+        header_poll(&mut p, &[], None);
+        exit_reads(&mut p, &[]);
+        let alloc = allocate(&p.g, &ARM64).unwrap();
+        assert_consistent(&p.g, &alloc);
+        assert!(
+            matches!(home(&alloc, v), Home::Gp(_)),
+            "v: {:?}",
+            home(&alloc, v)
+        );
+    }
+
+    // ---- rule B's weight part by part, its term and its ties (the landing form) -------------
+
+    /// `x` then `y` defined in the entry, live through the words' nest and not read in it, with
+    /// one register spare for them there (sixteen words): the nest's choice spills the lighter.
+    /// `after` builds their reads past the nest from block `b` and a first word, and returns the
+    /// block and word to return. Returns (the graph, x, y).
+    fn two_through_the_nest(
+        after: impl FnOnce(&mut Graph, BlockIx, NodeIx, NodeIx, NodeIx) -> (BlockIx, NodeIx),
+    ) -> (Graph, NodeIx, NodeIx) {
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let b = g.add_block(1, false);
+        g.entry = Some(entry);
+        let x = g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let y = g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        words_nest(&mut g, entry, b, 16);
+        let first = g.add_node(b, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+        let (last, out) = after(&mut g, b, first, x, y);
+        g.add_node(last, NodeOp::Return, &[out], Rep::None, 1);
+        (g, x, y)
+    }
+
+    /// A loop after `from`: header L (r = phi(init, back(body's word)), c = phi(0, c'); poll;
+    /// c < 10) -> body (`body` builds from r the word r takes back; c' = c | 1) -> L; L -> X.
+    /// Returns (X, r).
+    fn loop_after(
+        g: &mut Graph,
+        from: BlockIx,
+        init: NodeIx,
+        body: impl FnOnce(&mut Graph, BlockIx, NodeIx) -> NodeIx,
+    ) -> (BlockIx, NodeIx) {
+        let header = g.add_block(30, true);
+        let block = g.add_block(31, false);
+        let x = g.add_block(32, false);
+        for (a, b) in [
+            (from, header),
+            (header, block),
+            (header, x),
+            (block, header),
+        ] {
+            g.add_edge(a, b);
+        }
+        let zero = g.add_node(from, NodeOp::ConstI32(0), &[], Rep::I32, 30);
+        let one = g.add_node(from, NodeOp::ConstI32(1), &[], Rep::I32, 30);
+        let ten = g.add_node(from, NodeOp::ConstI32(10), &[], Rep::I32, 30);
+        g.add_node(from, NodeOp::Jump(header), &[], Rep::None, 30);
+        let r = g.add_node(header, NodeOp::Phi, &[init], Rep::Tagged, 30);
+        let c = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 30);
+        let ps = state(g, 30, &[]);
+        let poll = g.add_node(header, NodeOp::Poll, &[], Rep::None, 30);
+        g.node_mut(poll).state = Some(ps);
+        let lt = g.add_node(header, NodeOp::I32Cmp(Cond::Lt), &[c, ten], Rep::Bool, 30);
+        g.add_node(
+            header,
+            NodeOp::Branch {
+                then_block: block,
+                else_block: x,
+            },
+            &[lt],
+            Rep::None,
+            30,
+        );
+        let back = body(g, block, r);
+        let c2 = g.add_node(block, NodeOp::I32Or, &[c, one], Rep::I32, 31);
+        g.add_node(block, NodeOp::Jump(header), &[], Rep::None, 31);
+        g.node_mut(r).inputs.push(back);
+        g.node_mut(c).inputs.push(c2);
+        (x, r)
+    }
+
+    fn spilled(alloc: &Allocation, v: NodeIx) -> bool {
+        matches!(alloc.homes[v.index()], Home::Spill(_))
+    }
+
+    fn in_register(alloc: &Allocation, v: NodeIx) -> bool {
+        matches!(alloc.homes[v.index()], Home::Gp(_) | Home::Fp(_))
+    }
+
+    #[test]
+    fn a_register_read_adds_to_a_values_weight() {
+        // Past the nest y is read once, then x three times: x's range is the longer. By weight
+        // (its reads and its store over its range) y is the lighter and spills; were reads not
+        // counted, x's longer range would make it the lighter.
+        let (g, x, y) = two_through_the_nest(|g, b, first, x, y| {
+            let acc = compare_each(g, b, first, &[y], 1);
+            (b, compare_each(g, b, acc, &[x], 3))
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            spilled(&alloc, y) && in_register(&alloc, x),
+            "{:?} {:?}",
+            home(&alloc, x),
+            home(&alloc, y)
+        );
+    }
+
+    #[test]
+    fn a_read_in_a_loop_weighs_eight_times_a_read_outside_it() {
+        // Past the nest y is read once in each turn of a loop, x three times after that loop
+        // (its range the longer). y's read weighs 8 (8 to its loop depth), x's three 3: x spills.
+        // Weighing every read as one, y (2 against 4) would be the lighter.
+        let (g, x, y) = two_through_the_nest(|g, b, first, x, y| {
+            let (out, r) = loop_after(g, b, first, |g, body, r| compare_each(g, body, r, &[y], 1));
+            (out, compare_each(g, out, r, &[x], 3))
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            spilled(&alloc, x) && in_register(&alloc, y),
+            "{:?} {:?}",
+            home(&alloc, x),
+            home(&alloc, y)
+        );
+    }
+
+    #[test]
+    fn of_two_values_of_equal_weight_the_one_of_the_longer_range_spills() {
+        // Past the nest y is read once, then x once: equal weights, x's range the longer, and x
+        // (the lighter over its range) spills. By weight alone they would tie, and the tie would
+        // go to y, the later defined.
+        let (g, x, y) = two_through_the_nest(|g, b, first, x, y| {
+            let acc = compare_each(g, b, first, &[y], 1);
+            (b, compare_each(g, b, acc, &[x], 1))
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            spilled(&alloc, x) && in_register(&alloc, y),
+            "{:?} {:?}",
+            home(&alloc, x),
+            home(&alloc, y)
+        );
+    }
+
+    #[test]
+    fn a_phi_input_on_a_loops_back_edge_is_a_register_read() {
+        // Past the nest a loop's phi takes y on its back edge each turn (a read at the body's
+        // tail, at depth 1, by the edge's move); x is read twice after the loop. y weighs 9, x 3:
+        // x spills. Were edge inputs not counted, y (its definition's store alone) would.
+        let (g, x, y) = two_through_the_nest(|g, b, first, x, y| {
+            let (out, r) = loop_after(g, b, first, |_, _, _| y);
+            (out, compare_each(g, out, r, &[x], 2))
+        });
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            spilled(&alloc, x) && in_register(&alloc, y),
+            "{:?} {:?}",
+            home(&alloc, x),
+            home(&alloc, y)
+        );
+    }
+
+    #[test]
+    fn a_phi_at_a_merge_outside_loops_weighs_no_store() {
+        // entry: y; a branch to A (a) or B (b); M: p = phi(a, b), then the nest, past which p and
+        // then y are read once each. A phi's value is written by its edges' moves, and Ion counts
+        // no phi's definition in a spill weight (computeSpillWeight): p weighs its read alone
+        // (1), y its read and its store (2) over a range not twice as long: p spills. Counting
+        // p's definition, y (the longer) would.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let a_block = g.add_block(1, false);
+        let b_block = g.add_block(2, false);
+        let m = g.add_block(3, false);
+        let after = g.add_block(4, false);
+        g.entry = Some(entry);
+        for (from, to) in [
+            (entry, a_block),
+            (entry, b_block),
+            (a_block, m),
+            (b_block, m),
+        ] {
+            g.add_edge(from, to);
+        }
+        let y = g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let e = g.add_node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
+        let c = g.add_node(entry, NodeOp::TaggedSame, &[e, e], Rep::Bool, 0);
+        g.add_node(
+            entry,
+            NodeOp::Branch {
+                then_block: a_block,
+                else_block: b_block,
+            },
+            &[c],
+            Rep::None,
+            0,
+        );
+        let a = g.add_node(a_block, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+        g.add_node(a_block, NodeOp::Jump(m), &[], Rep::None, 1);
+        let b = g.add_node(b_block, NodeOp::EntrySlot(1), &[], Rep::Tagged, 2);
+        g.add_node(b_block, NodeOp::Jump(m), &[], Rep::None, 2);
+        let phi = g.add_node(m, NodeOp::Phi, &[a, b], Rep::Tagged, 3);
+        words_nest(&mut g, m, after, 16);
+        let first = g.add_node(after, NodeOp::EntrySlot(1), &[], Rep::Tagged, 4);
+        let acc = compare_each(&mut g, after, first, &[phi, y], 1);
+        g.add_node(after, NodeOp::Return, &[acc], Rep::None, 4);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            spilled(&alloc, phi) && in_register(&alloc, y),
+            "{:?} {:?}",
+            home(&alloc, phi),
+            home(&alloc, y)
+        );
+    }
+
+    #[test]
+    fn a_loop_phi_weighs_its_definitions_store_each_turn() {
+        // x and 18 fillers, then a loop whose phi r takes a word the body makes from the fillers
+        // (each read three times a turn) and which nothing in the loop reads; x and r are read
+        // once each after the loop. The header's compare needs a register while all 21 are held.
+        // A spilled loop phi's slot is written on each back edge, so r weighs that store (8) and
+        // its read: 9 over its range, against x's 2 over a range not 4.5 times as long: x spills.
+        // Were a loop phi's definition not counted, r (its read alone) would be the lighter.
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        g.entry = Some(entry);
+        let slot = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let x = slot(&mut g);
+        let fillers: Vec<NodeIx> = (0..18).map(|_| slot(&mut g)).collect();
+        let first = slot(&mut g);
+        let (out, r) = loop_after(&mut g, entry, first, |g, body, _| {
+            compare_each(g, body, fillers[0], &fillers, 3)
+        });
+        let acc = compare_each(&mut g, out, r, &[x], 1);
+        g.add_node(out, NodeOp::Return, &[acc], Rep::None, 1);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(
+            spilled(&alloc, x) && in_register(&alloc, r),
+            "{:?} {:?}",
+            home(&alloc, x),
+            home(&alloc, r)
+        );
+    }
+
+    #[test]
+    fn of_two_held_values_of_equal_rank_the_later_defined_is_the_victim() {
+        // After 19 words (the nest's), x and y are defined, then z, which needs a register while
+        // all 21 are held; x and y are read once each at the same distance from their
+        // definitions (equal weights over equal lengths), z twice at once. x and y tie as the
+        // lightest, and the tie goes to the later defined (the larger node index): y spills.
+        let mut held = None;
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let after = g.add_block(1, false);
+        g.entry = Some(entry);
+        words_nest_with(&mut g, entry, after, 19, |g, words| {
+            let slot = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+            let (x, y, z) = (slot(g), slot(g), slot(g));
+            g.add_node(entry, NodeOp::TaggedSame, &[z, z], Rep::Bool, 0);
+            for _ in 0..2 {
+                g.add_node(
+                    entry,
+                    NodeOp::TaggedSame,
+                    &[words[0], words[0]],
+                    Rep::Bool,
+                    0,
+                );
+            }
+            g.add_node(entry, NodeOp::TaggedSame, &[x, words[0]], Rep::Bool, 0);
+            g.add_node(entry, NodeOp::TaggedSame, &[y, words[0]], Rep::Bool, 0);
+            held = Some((x, y));
+        });
+        let (x, y) = held.expect("x, y");
+        let first = g.add_node(after, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+        g.add_node(after, NodeOp::Return, &[first], Rep::None, 1);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert_eq!(
+            alloc.ranges[x.index()].1 - alloc.ranges[x.index()].0,
+            alloc.ranges[y.index()].1 - alloc.ranges[y.index()].0
+        );
+        assert!(
+            spilled(&alloc, y) && in_register(&alloc, x),
+            "{:?} {:?}",
+            home(&alloc, x),
+            home(&alloc, y)
+        );
+    }
+
+    #[test]
+    fn a_new_value_that_ranks_as_the_lightest_held_value_spills_itself() {
+        // After 20 words (the nest's), x and then v are defined, each read once at the same
+        // distance from its definition: v needs a register while all 21 are held, and x, the
+        // lightest held value, ranks exactly as v does. A held value gives up its register only
+        // to a new value it outranks: v spills itself, and x keeps its register.
+        let mut made = None;
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let after = g.add_block(1, false);
+        g.entry = Some(entry);
+        words_nest_with(&mut g, entry, after, 20, |g, words| {
+            let slot = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+            let (x, v) = (slot(g), slot(g));
+            for _ in 0..2 {
+                g.add_node(
+                    entry,
+                    NodeOp::TaggedSame,
+                    &[words[0], words[0]],
+                    Rep::Bool,
+                    0,
+                );
+            }
+            g.add_node(entry, NodeOp::TaggedSame, &[x, words[0]], Rep::Bool, 0);
+            g.add_node(entry, NodeOp::TaggedSame, &[v, words[0]], Rep::Bool, 0);
+            made = Some((x, v));
+        });
+        let (x, v) = made.expect("x, v");
+        let first = g.add_node(after, NodeOp::EntrySlot(1), &[], Rep::Tagged, 1);
+        g.add_node(after, NodeOp::Return, &[first], Rep::None, 1);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert_eq!(
+            alloc.ranges[x.index()].1 - alloc.ranges[x.index()].0,
+            alloc.ranges[v.index()].1 - alloc.ranges[v.index()].0
+        );
+        assert!(
+            spilled(&alloc, v) && in_register(&alloc, x),
+            "{:?} {:?}",
+            home(&alloc, x),
+            home(&alloc, v)
+        );
+    }
+
+    #[test]
+    fn a_value_read_before_the_loop_and_held_through_it_by_exit_states_alone_spills() {
+        // Crypto's shape (an inlined frame's callee or receiver, read once before montReduce's
+        // inlined am3 loop and by the loop's exit states alone after that): u is read in a
+        // register in the entry, then held through the loop by the header poll's state and the
+        // state of a check at the body's top; 20 fillers are read in the body each turn. u
+        // weighs that one read at depth 0 and its store, the lightest: u spills. Under the
+        // farthest next use, the check's state was u's next use at the header's choices, the
+        // nearest, and a filler the loop reads spilled in its place.
+        let (mut p, words) = pressure(20, 1, |g, body, q, words| {
+            let s = state(g, 2, &[words[0]]);
+            let check = g.add_node(body, NodeOp::CheckObject, &[q], Rep::Cell, 2);
+            g.node_mut(check).state = Some(s);
+            q
+        });
+        let u = words[0];
+        let entry = p.g.entry.expect("entry");
+        let fill0 = p.g.node(p.g.block(p.header).phis[0]).inputs[0];
+        p.g.add_node(entry, NodeOp::TaggedSame, &[u, fill0], Rep::Bool, 0);
+        // The read before the entry's jump.
+        let body = &mut p.g.blocks[entry.index()].body;
+        let read = body.pop().expect("the read");
+        let jump = body.pop().expect("the jump");
+        body.push(read);
+        body.push(jump);
+        header_poll(&mut p, &[u], None);
+        exit_reads(&mut p, &[]);
+        let alloc = allocate(&p.g, &ARM64).unwrap();
+        assert_consistent(&p.g, &alloc);
+        assert!(spilled(&alloc, u), "u: {:?}", home(&alloc, u));
+    }
+
+    #[test]
+    fn a_value_the_loop_read_in_a_register_this_turn_is_not_the_victim_though_lightest() {
+        // Richards' shape (Scheduler.schedule's values: made in the loop, read at once, then held
+        // to the turn's end by exit states alone): v is made first in the body and read in a
+        // register at once (w = a field of v); then 20 words are made from w and read three
+        // times each in a chain, and a check at the turn's end holds v in its state. By weight
+        // v (one read and its store over the whole body) is the lightest value at the body's
+        // choices, but the turn has read it in a register: spilled, it would be stored and
+        // loaded on the path every turn takes. It keeps its register, and the words made after
+        // it spill instead. A static weight cannot see that the alternatives' reads may sit on
+        // paths only some turns take (Richards' task frames).
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let header = g.add_block(1, true);
+        let body = g.add_block(2, false);
+        let exit = g.add_block(3, false);
+        g.entry = Some(entry);
+        for (a, b) in [
+            (entry, header),
+            (header, body),
+            (header, exit),
+            (body, header),
+        ] {
+            g.add_edge(a, b);
+        }
+        let first = g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(header), &[], Rep::None, 0);
+        let q = g.add_node(header, NodeOp::Phi, &[first], Rep::Tagged, 1);
+        let i = g.add_node(header, NodeOp::Phi, &[zero], Rep::I32, 1);
+        let mut p = Pressure {
+            g,
+            header,
+            body,
+            exit,
+        };
+        header_poll(&mut p, &[], None);
+        let g = &mut p.g;
+        let v = g.add_node(body, NodeOp::CheckObject, &[q], Rep::Cell, 2);
+        let w = g.add_node(
+            body,
+            NodeOp::LoadField {
+                location: 128,
+                slot: 0,
+            },
+            &[v],
+            Rep::Tagged,
+            2,
+        );
+        let words: Vec<NodeIx> = (0..20)
+            .map(|_| {
+                let same = g.add_node(body, NodeOp::TaggedSame, &[w, w], Rep::Bool, 2);
+                g.add_node(body, NodeOp::BoolToTagged, &[same], Rep::Tagged, 2)
+            })
+            .collect();
+        let acc = compare_each(g, body, w, &words, 3);
+        let s = state(g, 2, &[v]);
+        let check = g.add_node(body, NodeOp::CheckNumber, &[acc], Rep::F64, 2);
+        g.node_mut(check).state = Some(s);
+        let one = g.add_node(body, NodeOp::ConstI32(1), &[], Rep::I32, 2);
+        let i2 = g.add_node(body, NodeOp::I32Or, &[i, one], Rep::I32, 2);
+        g.add_node(body, NodeOp::Jump(header), &[], Rep::None, 2);
+        g.node_mut(q).inputs.push(acc);
+        g.node_mut(i).inputs.push(i2);
+        exit_reads(&mut p, &[]);
+        let alloc = allocate(&p.g, &ARM64).unwrap();
+        assert_consistent(&p.g, &alloc);
+        assert!(in_register(&alloc, v), "v: {:?}", home(&alloc, v));
+        assert!(words.iter().any(|&x| spilled(&alloc, x)), "a word spills");
+    }
+
+    #[test]
+    fn the_term_is_the_innermost_loops_turn() {
+        // Crypto's nest: an outer loop reads o once a turn before its inner loop, whose body
+        // reads 17 fillers each turn; the first choice falls in the inner loop. By weight o (one
+        // read at depth 1) is the lightest and spills. The inner loop has not read o in its turn;
+        // protecting what an enclosing loop read in its turn (prototype 5) would keep o, read
+        // once an outer turn, over a filler the inner loop reads every turn (Crypto +5.35% at
+        // graph).
+        let mut g = Graph::new(2);
+        let entry = g.add_block(0, false);
+        let h1 = g.add_block(1, true);
+        let b1 = g.add_block(2, false);
+        let h2 = g.add_block(3, true);
+        let b2 = g.add_block(4, false);
+        let l1 = g.add_block(5, false);
+        let x = g.add_block(6, false);
+        g.entry = Some(entry);
+        for (a, b) in [
+            (entry, h1),
+            (h1, b1),
+            (h1, x),
+            (b1, h2),
+            (h2, b2),
+            (h2, l1),
+            (b2, h2),
+            (l1, h1),
+        ] {
+            g.add_edge(a, b);
+        }
+        let slot = |g: &mut Graph| g.add_node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
+        let fillers: Vec<NodeIx> = (0..17).map(|_| slot(&mut g)).collect();
+        let o = slot(&mut g);
+        let first = slot(&mut g);
+        let zero = g.add_node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
+        let one = g.add_node(entry, NodeOp::ConstI32(1), &[], Rep::I32, 0);
+        let ten = g.add_node(entry, NodeOp::ConstI32(10), &[], Rep::I32, 0);
+        g.add_node(entry, NodeOp::Jump(h1), &[], Rep::None, 0);
+        let header = |g: &mut Graph, h: BlockIx, then_block, else_block, init| {
+            let q = g.add_node(h, NodeOp::Phi, &[init], Rep::Tagged, 1);
+            let i = g.add_node(h, NodeOp::Phi, &[zero], Rep::I32, 1);
+            let ps = state(g, 1, &[]);
+            let poll = g.add_node(h, NodeOp::Poll, &[], Rep::None, 1);
+            g.node_mut(poll).state = Some(ps);
+            let lt = g.add_node(h, NodeOp::I32Cmp(Cond::Lt), &[i, ten], Rep::Bool, 1);
+            g.add_node(
+                h,
+                NodeOp::Branch {
+                    then_block,
+                    else_block,
+                },
+                &[lt],
+                Rep::None,
+                1,
+            );
+            (q, i)
+        };
+        let (q1, i) = header(&mut g, h1, b1, x, first);
+        let t = compare_each(&mut g, b1, q1, &[o], 1);
+        g.add_node(b1, NodeOp::Jump(h2), &[], Rep::None, 2);
+        let (q2, j) = header(&mut g, h2, b2, l1, t);
+        let q2b = compare_each(&mut g, b2, q2, &fillers, 1);
+        let j2 = g.add_node(b2, NodeOp::I32Or, &[j, one], Rep::I32, 4);
+        g.add_node(b2, NodeOp::Jump(h2), &[], Rep::None, 4);
+        g.node_mut(q2).inputs.push(q2b);
+        g.node_mut(j).inputs.push(j2);
+        let i2 = g.add_node(l1, NodeOp::I32Or, &[i, one], Rep::I32, 5);
+        g.add_node(l1, NodeOp::Jump(h1), &[], Rep::None, 5);
+        g.node_mut(q1).inputs.push(q2);
+        g.node_mut(i).inputs.push(i2);
+        g.add_node(x, NodeOp::Return, &[q1], Rep::None, 6);
+        let alloc = allocate(&g, &ARM64).unwrap();
+        assert_consistent(&g, &alloc);
+        assert!(spilled(&alloc, o), "o: {:?}", home(&alloc, o));
+        assert!(
+            fillers.iter().all(|&f| in_register(&alloc, f)),
+            "every filler keeps a register"
+        );
     }
 }

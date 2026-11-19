@@ -5850,14 +5850,99 @@ fn the_poison_switch_overwrites_the_operand_words_below_a_canonical_frame_effect
 
 // ---- loop caches of spilled values (P3 stage 3 step R1) ----
 
+/// Rule B's pressure for the loop-cache graphs (P3 stage 3): `from` jumps to a nest of two counted
+/// loops (each runs twice: k' = (k << 1) | 1 while k < 3) whose inner body folds each of `words`
+/// twice a turn into an accumulator by `fold` (which keeps it unchanged); the nest exits to `to`.
+/// Each word's read weighs 8 to the power 2, so a value live through the nest and not read in it
+/// has the cheapest whole range there and gives up its register at the nest's choices, as the
+/// farthest next use pushed it out before; past the nest the words are dead. Each header polls
+/// with `at_entry`, a state at pc 0 that holds no value (the functions are pure: an exit there
+/// would run them again from the start).
+#[allow(clippy::too_many_arguments)]
+fn counted_nest(
+    b: &mut Build,
+    from: BlockIx,
+    to: BlockIx,
+    words: &[NodeIx],
+    init: NodeIx,
+    rep: Rep,
+    at_entry: StateIx,
+    fold: impl Fn(&mut Build, BlockIx, NodeIx, NodeIx) -> NodeIx,
+) {
+    let outer = b.block(40, true);
+    let inner = b.block(41, true);
+    let body = b.block(42, false);
+    let latch = b.block(43, false);
+    for (x, y) in [
+        (from, outer),
+        (outer, inner),
+        (outer, to),
+        (inner, body),
+        (inner, latch),
+        (body, inner),
+        (latch, outer),
+    ] {
+        b.edge(x, y);
+    }
+    let zero = b.node(from, NodeOp::ConstI32(0), &[], Rep::I32, 40);
+    let one = b.node(from, NodeOp::ConstI32(1), &[], Rep::I32, 40);
+    let three = b.node(from, NodeOp::ConstI32(3), &[], Rep::I32, 40);
+    b.node(from, NodeOp::Jump(outer), &[], Rep::None, 40);
+    let header = |b: &mut Build, h: BlockIx, then_block, else_block, init| {
+        let a = b.node(h, NodeOp::Phi, &[init], rep, 40);
+        let k = b.node(h, NodeOp::Phi, &[zero], Rep::I32, 40);
+        b.exiting(
+            h,
+            NodeOp::Poll,
+            &[],
+            Rep::None,
+            0,
+            at_entry,
+            ExitReason::Throw,
+        );
+        let lt = b.node(h, NodeOp::I32Cmp(Cond::Lt), &[k, three], Rep::Bool, 40);
+        b.node(
+            h,
+            NodeOp::Branch {
+                then_block,
+                else_block,
+            },
+            &[lt],
+            Rep::None,
+            40,
+        );
+        (a, k)
+    };
+    let step = |b: &mut Build, blk: BlockIx, k: NodeIx| {
+        let shifted = b.node(blk, NodeOp::I32Shl, &[k, one], Rep::I32, 42);
+        b.node(blk, NodeOp::I32Or, &[shifted, one], Rep::I32, 42)
+    };
+    let (a, j) = header(b, outer, inner, to, init);
+    let (c, k) = header(b, inner, body, latch, a);
+    let mut acc = c;
+    for _ in 0..2 {
+        for &w in words {
+            acc = fold(b, body, acc, w);
+        }
+    }
+    let k2 = step(b, body, k);
+    b.node(body, NodeOp::Jump(inner), &[], Rep::None, 42);
+    let j2 = step(b, latch, j);
+    b.node(latch, NodeOp::Jump(outer), &[], Rep::None, 43);
+    b.g.node_mut(a).inputs.push(c);
+    b.g.node_mut(j).inputs.push(j2);
+    b.g.node_mut(c).inputs.push(acc);
+    b.g.node_mut(k).inputs.push(k2);
+}
+
 const INV: &str =
     "function inv(n, a) { let s = 0; for (let i = 0; i < n; i++) { s = s + a; } return s; } inv(3, 1);";
 
 /// `inv(n, a)` (slots n, a, s, i; the loop's header at pc 6, its Add at 12 on [s, a], i's
 /// increment at 16, the return at 18) on int32s, over hand-made pressure: a's int32, then
-/// twenty-one int32s made from n, which fill the x registers and push out the values whose next
-/// use is the farthest, a's and n's, read in the loop (spilled at their definitions); a chain
-/// reads the twenty-one into s's initial 0.
+/// seventeen int32s made from n, which a nest of two loops reads before the loop
+/// (`counted_nest`) and through which a's and n's int32s, read in the loop, live unread: rule B
+/// spills them there; s starts at 0.
 /// The loop reads the spilled a, and n's int32, from their loop caches. Returns a's int32.
 fn inv_graph() -> (Graph, NodeIx) {
     let mut b = Build::new(4);
@@ -5865,10 +5950,7 @@ fn inv_graph() -> (Graph, NodeIx) {
     let header = b.block(6, true);
     let body = b.block(10, false);
     let exit = b.block(18, false);
-    b.edge(entry, header);
-    b.edge(header, body);
-    b.edge(header, exit);
-    b.edge(body, header);
+    let pre = b.block(5, false);
     let n = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
     let a = b.node(entry, NodeOp::EntrySlot(1), &[], Rep::Tagged, 0);
     let at_entry = b.state(0, &[], &[], &[]);
@@ -5908,19 +5990,32 @@ fn inv_graph() -> (Graph, NodeIx) {
         at_entry,
         ExitReason::NotInt32,
     );
-    let words: Vec<NodeIx> = (0..21)
+    let words: Vec<NodeIx> = (0..17)
         .map(|k| {
             let c = b.node(entry, NodeOp::ConstI32(k), &[], Rep::I32, 0);
             b.node(entry, NodeOp::I32Or, &[in_, c], Rep::I32, 0)
         })
         .collect();
-    let mut acc = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
-    for &w in &words {
-        let zero = b.node(entry, NodeOp::I32Xor, &[w, w], Rep::I32, 0);
-        acc = b.node(entry, NodeOp::I32Or, &[acc, zero], Rep::I32, 0);
-    }
     let zero = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
-    b.node(entry, NodeOp::Jump(header), &[], Rep::None, 5);
+    counted_nest(
+        &mut b,
+        entry,
+        pre,
+        &words,
+        zero,
+        Rep::I32,
+        at_entry,
+        |b, blk, acc, w| {
+            let none = b.node(blk, NodeOp::I32Xor, &[w, w], Rep::I32, 42);
+            b.node(blk, NodeOp::I32Or, &[acc, none], Rep::I32, 42)
+        },
+    );
+    b.edge(pre, header);
+    b.edge(header, body);
+    b.edge(header, exit);
+    b.edge(body, header);
+    b.node(pre, NodeOp::Jump(header), &[], Rep::None, 5);
+    let acc = zero;
     let i = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 6);
     let s = b.node(header, NodeOp::Phi, &[acc], Rep::I32, 6);
     let at_header = b.state(6, &[], &[(2, s), (3, i)], &[]);
@@ -6077,20 +6172,18 @@ fn a_spilled_invariant_is_read_from_its_loop_cache_and_its_exits_name_its_slot()
 }
 
 /// `count(n)`'s chunk (header at 6) under a hand-made graph with float pressure (step R1): g = n *
-/// n, then thirty floats made from n and read into 0 before the loop push g out (its next use,
-/// the loop's, is the farthest); twenty-two floats made after them, read after the loop, take
-/// every caller-saved d register through it, so that g's cache in the call-free loop is a
-/// callee-saved one, d8-d15. The loop adds g to an accumulator n times: count(n) = n^3 + 231.
+/// n, then twenty-seven floats made from n, which a nest of two loops reads before the loop
+/// (`counted_nest`), through which g lives unread: rule B spills it there; twenty-two floats made
+/// after the nest, read after the loop, take every caller-saved d register through it, so that
+/// g's cache in the call-free loop is a callee-saved one, d8-d15. The loop adds g to an
+/// accumulator n times: count(n) = n^3 + 231.
 fn floats_graph() -> (Graph, NodeIx) {
     let mut b = Build::new(3);
     let entry = b.block(0, false);
     let header = b.block(6, true);
     let body = b.block(10, false);
     let exit = b.block(18, false);
-    b.edge(entry, header);
-    b.edge(header, body);
-    b.edge(header, exit);
-    b.edge(body, header);
+    let pre = b.block(5, false);
     let n = b.node(entry, NodeOp::EntrySlot(0), &[], Rep::Tagged, 0);
     let at_entry = b.state(0, &[], &[], &[]);
     let fn_ = b.exiting(
@@ -6112,7 +6205,7 @@ fn floats_graph() -> (Graph, NodeIx) {
         ExitReason::NotInt32,
     );
     let g = b.node(entry, NodeOp::F64Mul, &[fn_, fn_], Rep::F64, 0);
-    let words: Vec<NodeIx> = (0..30)
+    let words: Vec<NodeIx> = (0..27)
         .map(|k| {
             let c = b.node(
                 entry,
@@ -6124,25 +6217,38 @@ fn floats_graph() -> (Graph, NodeIx) {
             b.node(entry, NodeOp::F64Mul, &[fn_, c], Rep::F64, 0)
         })
         .collect();
-    let mut acc = b.node(entry, NodeOp::ConstF64(0), &[], Rep::F64, 0);
-    for &w in &words {
-        let zero = b.node(entry, NodeOp::F64Sub, &[w, w], Rep::F64, 0);
-        acc = b.node(entry, NodeOp::F64Add, &[acc, zero], Rep::F64, 0);
-    }
+    let acc = b.node(entry, NodeOp::ConstF64(0), &[], Rep::F64, 0);
+    counted_nest(
+        &mut b,
+        entry,
+        pre,
+        &words,
+        acc,
+        Rep::F64,
+        at_entry,
+        |b, blk, acc, w| {
+            let none = b.node(blk, NodeOp::F64Sub, &[w, w], Rep::F64, 42);
+            b.node(blk, NodeOp::F64Add, &[acc, none], Rep::F64, 42)
+        },
+    );
+    b.edge(pre, header);
+    b.edge(header, body);
+    b.edge(header, exit);
+    b.edge(body, header);
     let held: Vec<NodeIx> = (0..22)
         .map(|k| {
             let c = b.node(
-                entry,
+                pre,
                 NodeOp::ConstF64(f64::from(k).to_bits()),
                 &[],
                 Rep::F64,
                 0,
             );
-            b.node(entry, NodeOp::F64Add, &[acc, c], Rep::F64, 0)
+            b.node(pre, NodeOp::F64Add, &[acc, c], Rep::F64, 5)
         })
         .collect();
-    let zero = b.node(entry, NodeOp::ConstI32(0), &[], Rep::I32, 0);
-    b.node(entry, NodeOp::Jump(header), &[], Rep::None, 5);
+    let zero = b.node(pre, NodeOp::ConstI32(0), &[], Rep::I32, 5);
+    b.node(pre, NodeOp::Jump(header), &[], Rep::None, 5);
     let i = b.node(header, NodeOp::Phi, &[zero], Rep::I32, 6);
     let s = b.node(header, NodeOp::Phi, &[acc], Rep::F64, 6);
     let at_header = b.state(6, &[], &[(1, s), (2, i)], &[]);
@@ -6237,8 +6343,10 @@ fn a_polls_slow_path_keeps_a_caller_saved_loop_cache() {
     let alloc = allocate(&graph, &ARM64).unwrap();
     let mut engine = fixture(INV);
     let code = install(&mut engine, "inv", &graph, Options::default());
-    // The slow path's save stores each caller-saved cache register on the stack, where nothing
-    // else of this code stores it.
+    // Each poll's slow path stores on the stack every caller-saved register live across it, a
+    // cache's among them; the pressure nest's polls store most registers too, so each cache
+    // register's stores are counted against the polls across which it is live (as a value's
+    // home or as a cache of that poll's block), one each.
     let words = code_words(&code);
     let caller: Vec<u8> = alloc
         .caches
@@ -6249,14 +6357,30 @@ fn a_polls_slow_path_keeps_a_caller_saved_loop_cache() {
         })
         .collect();
     assert!(!caller.is_empty(), "{:?}", alloc.caches);
+    let polls: Vec<NodeIx> = (0..graph.nodes.len())
+        .map(|k| NodeIx(k as u32))
+        .filter(|&n| graph.node(n).op == NodeOp::Poll)
+        .collect();
     for r in caller {
+        let owed = polls
+            .iter()
+            .filter(|&&p| {
+                let block = graph.node(p).block;
+                alloc.live_at(p).iter().any(|&v| {
+                    alloc.homes[v.index()] == Home::Gp(r)
+                        || alloc.cache_of(block, v) == Some(Home::Gp(r))
+                })
+            })
+            .count();
+        let stored = words
+            .iter()
+            .filter(|&&w| {
+                w & 0xFFC0_03FF == encode(|a| a.str_imm(u32::from(r), 31, 0)) & 0xFFC0_03FF
+            })
+            .count();
         assert!(
-            holds(
-                &words,
-                encode(|a| a.str_imm(u32::from(r), 31, 0)),
-                0xFFC0_03FF
-            ),
-            "x{r} is not saved"
+            owed > 0 && stored >= owed,
+            "x{r}: {stored} stores for {owed} polls"
         );
     }
     exits();

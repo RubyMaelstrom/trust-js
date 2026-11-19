@@ -76,24 +76,35 @@ const OBJECTS: &str = "function mk(s, k) { const o = { v: s + k, w: [s, k, s ^ k
      let t = 0; for (let k = 0; k < 200; k++) t = (t + objs(10, k)) % 1000003;\n\
      t + ':' + objs(6, 1.5)";
 
-/// A leaf whose loop reads its arguments, inlined at graph into a loop of a caller that keeps
-/// a dozen int32s across its own call.
+/// A leaf whose loop reads its argument k, inlined at graph into a loop of a caller that keeps six
+/// int32s across its own call, each read ten times a turn: they outweigh k (read once in the
+/// leaf's loop, at depth 2), which is defined after them while every callee-saved register holds
+/// one and so is spilled at its definition (rule B), and the leaf's loop reads it from a cache.
+/// (Eight reads a turn left k the heavier; twelve made the caller too large for the plan to
+/// inline the leaf.)
 const INLINED: &str = "function st(s, k) { return (s * 31 + k) & 0xfffff; }\n\
      function st2(s, k) { return (s ^ (k * 7)) & 0xfffff; }\n\
      const fs = [st, st2];\n\
-     function sumk(t, k, m) { let s = 0; for (let j = 0; j < m; j++) s = (s + t[j & 3] * k) & 0xffff; \
+     function sumk(k, m) { let s = 0; for (let j = 0; j < m; j++) s = (s + (j & 3) * k) & 0xffff; \
        return s; }\n\
      function outer(n, a) { \
        let a1 = (a * 3) & 0xfff, a2 = (a1 ^ 5) & 0xfff, a3 = (a2 + 7) & 0xfff, \
-         a4 = (a3 - 1) & 0xfff, a5 = (a4 * 7) & 0xfff, a6 = (a5 ^ a) & 0xfff, \
-         a7 = (a6 + 2) & 0xfff, a8 = (a7 >> 1) & 0xfff, a9 = (a8 + 11) & 0xfff, \
-         a10 = (a9 ^ 4) & 0xfff, a11 = (a10 + 6) & 0xfff, a12 = (a11 * 5) & 0xfff; \
-       const arr = [a1, a2, a3, a4]; \
+         a4 = (a3 - 1) & 0xfff, a5 = (a4 * 7) & 0xfff, a6 = (a5 ^ a) & 0xfff; \
+       const k5 = (a * 5 + 1) & 0xfff; \
        let s = 0; \
        for (let i = 0; i < n; i++) { \
          s = fs[i & 1](s, i); \
-         s = (s + sumk(arr, a5, 8) + (a6 ^ i) + (a7 & a8) + (a9 | a10) + (a11 ^ a12)) & 0xfffff; } \
-       return s + a1 + a12; }\n\
+         s = (s + sumk(k5, 8) + ((a1 + 1) ^ a2) + ((a3 + 1) & a4) + ((a5 + 1) | a6) \
+           + ((a1 + 2) ^ a2) + ((a3 + 2) & a4) + ((a5 + 2) | a6) \
+           + ((a1 + 3) ^ a2) + ((a3 + 3) & a4) + ((a5 + 3) | a6) \
+           + ((a1 + 4) ^ a2) + ((a3 + 4) & a4) + ((a5 + 4) | a6) \
+           + ((a1 + 5) ^ a2) + ((a3 + 5) & a4) + ((a5 + 5) | a6) \
+           + ((a1 + 6) ^ a2) + ((a3 + 6) & a4) + ((a5 + 6) | a6) \
+           + ((a1 + 7) ^ a2) + ((a3 + 7) & a4) + ((a5 + 7) | a6) \
+           + ((a1 + 8) ^ a2) + ((a3 + 8) & a4) + ((a5 + 8) | a6) \
+           + ((a1 + 9) ^ a2) + ((a3 + 9) & a4) + ((a5 + 9) | a6) \
+           + ((a1 + 10) ^ a2) + ((a3 + 10) & a4) + ((a5 + 10) | a6)) & 0xfffff; } \
+       return s + a1 + a6; }\n\
      let t = 0; for (let k = 0; k < 300; k++) t = (t + outer(10, k)) % 1000003;\n\
      t + ':' + outer(4, 2.5)";
 
@@ -233,10 +244,11 @@ fn a_leafs_loop_inlined_at_graph_reads_its_callers_spilled_values_from_caches() 
     equal_with_caches(INLINED, "graph");
 }
 
-/// A value made first and read only in the loop, pushed out by twenty-four int32s read at once
-/// before it (its next use is the farthest), in a loop that calls `cat`, which graph inlining
-/// builds into the loop with its `s + k` a generic node of the inlined frame: a call in the loop,
-/// across which few values live, so the cache is a callee-saved register.
+/// A value made first and read only in the loop, pushed out by twenty-four int32s that a nest of
+/// two loops reads before the loop (each read weighing 8 to the power 2, rule B), through which
+/// it lives unread and so has the cheapest whole range, in a loop that calls `cat`, which graph
+/// inlining builds into the loop with its `s + k` a generic node of the inlined frame: a call in
+/// the loop, across which few values live, so the cache is a callee-saved register.
 const INLINED_CALL: &str = "function cat(s, k) { return s + k; }\n\
      function f(n, a) { \
        const v = (a * 7) & 0xffff; \
@@ -246,8 +258,10 @@ const INLINED_CALL: &str = "function cat(s, k) { return s + k; }\n\
          b13 = (a ^ 13) & 0xfff, b14 = (a ^ 14) & 0xfff, b15 = (a ^ 15) & 0xfff, b16 = (a ^ 16) & 0xfff, \
          b17 = (a ^ 17) & 0xfff, b18 = (a ^ 18) & 0xfff, b19 = (a ^ 19) & 0xfff, b20 = (a ^ 20) & 0xfff, \
          b21 = (a ^ 21) & 0xfff, b22 = (a ^ 22) & 0xfff, b23 = (a ^ 23) & 0xfff, b24 = (a ^ 24) & 0xfff; \
-       let r = (b24 + b23 + b22 + b21 + b20 + b19 + b18 + b17 + b16 + b15 + b14 + b13 + b12 + b11 \
-         + b10 + b9 + b8 + b7 + b6 + b5 + b4 + b3 + b2 + b1) & 0xffff; \
+       let r = 0; \
+       for (let x = 0; x < 2; x++) for (let y = 0; y < 2; y++) \
+         r = (r + (b1 ^ b2) + (b3 ^ b4) + (b5 ^ b6) + (b7 ^ b8) + (b9 ^ b10) + (b11 ^ b12) \
+           + (b13 ^ b14) + (b15 ^ b16) + (b17 ^ b18) + (b19 ^ b20) + (b21 ^ b22) + (b23 ^ b24)) & 0xffff; \
        let s = ''; \
        for (let i = 0; i < n; i++) { \
          s = cat(s, i & 3); \
@@ -269,8 +283,10 @@ const INLINED_THROW: &str = "function cat(s, k) { return s + k; }\n\
          b13 = (a ^ 13) & 0xfff, b14 = (a ^ 14) & 0xfff, b15 = (a ^ 15) & 0xfff, b16 = (a ^ 16) & 0xfff, \
          b17 = (a ^ 17) & 0xfff, b18 = (a ^ 18) & 0xfff, b19 = (a ^ 19) & 0xfff, b20 = (a ^ 20) & 0xfff, \
          b21 = (a ^ 21) & 0xfff, b22 = (a ^ 22) & 0xfff, b23 = (a ^ 23) & 0xfff, b24 = (a ^ 24) & 0xfff; \
-       let r = (b24 + b23 + b22 + b21 + b20 + b19 + b18 + b17 + b16 + b15 + b14 + b13 + b12 + b11 \
-         + b10 + b9 + b8 + b7 + b6 + b5 + b4 + b3 + b2 + b1) & 0xffff; \
+       let r = 0; \
+       for (let x = 0; x < 2; x++) for (let y = 0; y < 2; y++) \
+         r = (r + (b1 ^ b2) + (b3 ^ b4) + (b5 ^ b6) + (b7 ^ b8) + (b9 ^ b10) + (b11 ^ b12) \
+           + (b13 ^ b14) + (b15 ^ b16) + (b17 ^ b18) + (b19 ^ b20) + (b21 ^ b22) + (b23 ^ b24)) & 0xffff; \
        let s = ''; \
        for (let i = 0; i < n; i++) { \
          try { s = cat(s, i === 3 && odd ? bad : i & 3); } catch (e) { r = (r + v + e.message.length) & 0xffff; } \
@@ -324,8 +340,10 @@ const INLINED_PLAIN_CALL: &str = "function g(k) { return (k * 3 + arguments.leng
          b13 = (a ^ 13) & 0xfff, b14 = (a ^ 14) & 0xfff, b15 = (a ^ 15) & 0xfff, b16 = (a ^ 16) & 0xfff, \
          b17 = (a ^ 17) & 0xfff, b18 = (a ^ 18) & 0xfff, b19 = (a ^ 19) & 0xfff, b20 = (a ^ 20) & 0xfff, \
          b21 = (a ^ 21) & 0xfff, b22 = (a ^ 22) & 0xfff, b23 = (a ^ 23) & 0xfff, b24 = (a ^ 24) & 0xfff; \
-       let r = (b24 + b23 + b22 + b21 + b20 + b19 + b18 + b17 + b16 + b15 + b14 + b13 + b12 + b11 \
-         + b10 + b9 + b8 + b7 + b6 + b5 + b4 + b3 + b2 + b1) & 0xffff; \
+       let r = 0; \
+       for (let x = 0; x < 2; x++) for (let y = 0; y < 2; y++) \
+         r = (r + (b1 ^ b2) + (b3 ^ b4) + (b5 ^ b6) + (b7 ^ b8) + (b9 ^ b10) + (b11 ^ b12) \
+           + (b13 ^ b14) + (b15 ^ b16) + (b17 ^ b18) + (b19 ^ b20) + (b21 ^ b22) + (b23 ^ b24)) & 0xffff; \
        let s = 0; \
        for (let i = 0; i < n; i++) { \
          s = wrap(s, i & 3); \
