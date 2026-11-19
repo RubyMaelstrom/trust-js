@@ -1016,6 +1016,7 @@ impl<'a> Builder<'a> {
             built: vec![false; blocks],
             headers: (0..blocks).map(|_| None).collect(),
             hoisted: std::mem::take(&mut self.hoisted),
+            folded_genv: std::mem::take(&mut self.folded_genv),
             hoisted_nodes: std::mem::take(&mut self.hoisted_nodes),
             closures: std::mem::take(&mut self.closures),
             moves_env: view.jit_ops().iter().any(names::moves_env),
@@ -1044,6 +1045,7 @@ impl<'a> Builder<'a> {
         self.inline_log.append(&mut inner.inline_log);
         self.graph = std::mem::take(&mut inner.graph);
         self.hoisted = std::mem::take(&mut inner.hoisted);
+        self.folded_genv = std::mem::take(&mut inner.folded_genv);
         self.hoisted_nodes = std::mem::take(&mut inner.hoisted_nodes);
         self.closures = std::mem::take(&mut inner.closures);
         self.notes = std::mem::take(&mut inner.notes);

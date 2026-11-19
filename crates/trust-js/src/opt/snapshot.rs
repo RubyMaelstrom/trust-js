@@ -204,6 +204,18 @@ pub(crate) struct Folded {
     pub(crate) word: u64,
     pub(crate) generation: u32,
     pub(crate) typed: Option<super::ir::TypedKind>,
+    /// A function (F4 part 2, functions): its identity fixes its [[Environment]], its Realm and
+    /// its code for its life, what a callee guard tests of it; not its own properties
+    /// (`prototype` among them), which stay reads.
+    pub(crate) function: bool,
+}
+
+impl Folded {
+    /// Whether the folded value is an object's (a typed array's or a function's): an ordinary
+    /// value with a home (R-2), no constant of the code.
+    pub(crate) fn object(&self) -> bool {
+        self.typed.is_some() || self.function
+    }
 }
 
 /// A free-name site's cache words (F4 part 1): its environment word, whose tag bits are its mode

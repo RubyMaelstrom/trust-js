@@ -388,17 +388,20 @@ fn the_verifier_refuses_a_folded_read_after_a_call_without_its_test() {
     let folded = graph
         .nodes
         .iter()
-        .filter(|node| matches!(node.op, NodeOp::FoldedGlobal { .. }))
+        // K's (h, a function, folds too: the functions piece).
+        .filter(|node| {
+            matches!(node.op, NodeOp::FoldedGlobal { word } if word >> 48 != crate::value::PACK_OBJ >> 48)
+        })
         .count();
     assert_eq!((tests.len(), folded), (2, 2), "a test per effect epoch");
-    // h's read, before the call, keeps its epoch check; K's two reads take none.
+    // h's read folds too (the functions piece): no read here takes an epoch check.
     assert_eq!(
         graph
             .nodes
             .iter()
             .filter(|node| matches!(node.op, NodeOp::CheckGlobalEpoch { .. }))
             .count(),
-        1,
+        0,
         "no epoch check for a folded read"
     );
     assert_eq!(super::verify::verify_folded_reads(&graph), Ok(()));
@@ -788,7 +791,8 @@ fn a_folded_typed_array_drops_its_object_and_kind_checks_and_keeps_its_length_an
     );
     // One folded node an epoch, as a load's (the loop reads HEAP twice an iteration).
     assert!(
-        count(&|node| object_fold(&node.op)) <= count(&|node| node.op == NodeOp::CheckCodeValid),
+        count(&|node| node.op == NodeOp::FoldedCell)
+            <= count(&|node| node.op == NodeOp::CheckCodeValid),
         "a folded object read twice in an epoch is one node"
     );
     // The verifier refuses a FoldedCell of a word that is no folded object's.
@@ -914,5 +918,122 @@ fn a_folded_typed_array_held_across_a_call_that_replaces_and_collects_it_stays_a
             run.fired.0, 1,
             "graph {graph}: HEAP folded and fired: {run:?}"
         );
+    }
+}
+
+// The functions piece: a global function's identity proves its callee guard (its [[Environment]],
+// Realm and code are fixed by its identity); its own properties are not folded.
+
+/// `g`, a global function, called in `f`'s loop; `then` after the warm-up.
+fn function_program(then: &str) -> String {
+    format!(
+        "function g(x) {{ return (x * 3 + 1) | 0; }}
+         function f(n) {{ var s = 0; for (var i = 0; i < n; i++) s = (s + g(i)) | 0; return s; }}
+         var t = 0; for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+         {then}
+         for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+         t"
+    )
+}
+
+#[test]
+fn a_folded_global_function_needs_no_callee_guard() {
+    // g's call is inlined behind a guard (splice and graph); g folded, the fold proves it.
+    let source = function_program("");
+    let expected = vm(&source);
+    for graph in [false, true] {
+        let before = super::build::TEST_FOLDED_GUARDS.load(Ordering::Relaxed);
+        let run = run(&source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
+        let proven = super::build::TEST_FOLDED_GUARDS.load(Ordering::Relaxed) - before;
+        assert!(proven > 0, "graph {graph}: a guard proven by the fold");
+    }
+}
+
+#[test]
+fn a_folded_global_function_replaced_once_invalidates_its_code_once() {
+    let source = function_program("g = function (x) { return (x * 5 + 2) | 0; };");
+    let expected = vm(&source);
+    for graph in [false, true] {
+        let run = run(&source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
+        assert_eq!(run.fired.0, 1, "graph {graph}: {run:?}");
+        assert_eq!(run.invalidated, 1, "graph {graph}: {run:?}");
+    }
+}
+
+#[test]
+fn a_global_function_replaced_every_call_is_never_folded() {
+    let source = "function f(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + g(i)) | 0; return s; }
+         var t = 0;
+         for (var k = 0; k < 600; k++) { var c = k; g = function (x) { return (x + c) | 0; }; t = (t + f(200)) | 0; }
+         t";
+    let expected = vm(source);
+    for graph in [false, true] {
+        let run = run(source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
+        assert_eq!(run.fired, (0, 0), "graph {graph}: {run:?}");
+    }
+}
+
+#[test]
+fn a_folded_constructors_prototype_replaced_is_read_again() {
+    // `new C()` reads C.prototype at each construction: the fold proves C, not its prototype.
+    let source = "function C(x) { this.x = x; }
+         C.prototype.get = function () { return this.x; };
+         function f(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + new C(i).get()) | 0; return s; }
+         var t = 0; for (var k = 0; k < 300; k++) t = (t + f(100)) | 0;
+         C.prototype = { get: function () { return -this.x; } };
+         for (var k = 0; k < 300; k++) t = (t + f(100)) | 0;
+         C.prototype.get = function () { return 2 * this.x; };
+         for (var k = 0; k < 300; k++) t = (t + f(100)) | 0;
+         t";
+    let expected = vm(source);
+    for graph in [false, true] {
+        let run = run(source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
+        assert_eq!(
+            run.fired,
+            (0, 0),
+            "graph {graph}: C itself never changed: {run:?}"
+        );
+    }
+}
+
+#[test]
+fn a_folded_function_other_than_the_guards_target_keeps_the_guard() {
+    // The call site warmed on g1, then g stored once (Constant, folded as g2): the plan's target
+    // is g1, so the fold proves no guard; the guard tests g2 and leaves.
+    let source = "function g(x) { return (x * 3 + 1) | 0; }
+         function f(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + g(i)) | 0; return s; }
+         var t = 0; for (var k = 0; k < WARM; k++) t = (t + f(200)) | 0;
+         g = function (x) { return (x * 7 + 5) | 0; };
+         for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+         t";
+    // The swap early (the template planned g1, the tier not yet compiled) and late.
+    for warm in [3, 20, 300] {
+        let source = source.replace("WARM", &warm.to_string());
+        let expected = vm(&source);
+        for graph in [false, true] {
+            let run = run(&source, graph);
+            assert_eq!(run.result, expected, "warm {warm} graph {graph}");
+        }
+    }
+}
+
+#[test]
+fn a_folded_sloppy_function_reading_this_reads_the_global_object() {
+    // A plain call of a sloppy global function that reads `this`: the receiver is undefined and
+    // `this` the global object; a guard that tests the receiver stays (the fold proves only the
+    // callee).
+    let source = "var mark = 7;
+         function g(x) { return this === undefined ? -1 : (this.mark + x) | 0; }
+         function f(n) { var s = 0; for (var i = 0; i < n; i++) s = (s + g(i)) | 0; return s; }
+         var t = 0; for (var k = 0; k < 300; k++) t = (t + f(200)) | 0;
+         t";
+    let expected = vm(source);
+    for graph in [false, true] {
+        let run = run(source, graph);
+        assert_eq!(run.result, expected, "graph {graph}");
     }
 }

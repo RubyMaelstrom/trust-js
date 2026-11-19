@@ -756,12 +756,13 @@ impl Builder<'_> {
         if let Some(fold) = fold {
             // A folded object's word is a value of the epoch, as a load's (layer 4a): one node
             // a property an epoch, which an effect ends (`st.fields`).
-            if fold.typed.is_some() {
+            if fold.object() {
                 if let Some(&value) = st.fields.get(&(object, location)) {
                     return value;
                 }
                 let value = self.folded_global_read(st, cx, fold);
                 st.fields.insert((object, location), value);
+                self.folded_genv.insert(value, genv);
                 return value;
             }
             return self.folded_global_read(st, cx, fold);

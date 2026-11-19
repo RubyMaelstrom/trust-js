@@ -163,8 +163,9 @@ pub(crate) fn prepare<'a>(
             // A Number (layer 3), or a typed array of a kind the tier's element sites take
             // (layer 4a); nothing else folds.
             let typed = typed_kind(&value);
+            let function = callable(&value);
             let number = matches!(value.view(), crate::value::ValueView::Num(_));
-            if !number && typed.is_none() {
+            if !number && typed.is_none() && !function {
                 continue;
             }
             let Some(guard) = fuse.try_optimize_constant(*slot as usize) else {
@@ -174,6 +175,7 @@ pub(crate) fn prepare<'a>(
                 word: value.bits(),
                 generation: guard.generation,
                 typed,
+                function,
             });
             if !folds.deps.contains(&(*slot, guard.generation)) {
                 folds.deps.push((*slot, guard.generation));
@@ -205,6 +207,17 @@ fn typed_kind(value: &crate::value::Value) -> Option<super::ir::TypedKind> {
     super::ir::TypedKind::ALL
         .get(usize::from(view.kind))
         .copied()
+}
+
+/// Whether `value` is a function: its identity fixes what a callee guard tests of it, its
+/// [[Environment]], its Realm and its code, all written at its creation (functions piece).
+fn callable(value: &crate::value::Value) -> bool {
+    let crate::value::ValueView::Obj(object) = value.view() else {
+        return false;
+    };
+    object
+        .try_borrow()
+        .is_ok_and(|object| object.kind.is_callable())
 }
 
 /// Whether `chunk`'s function still folds globals: fewer than [`FOLD_LIMIT`] of its codes were

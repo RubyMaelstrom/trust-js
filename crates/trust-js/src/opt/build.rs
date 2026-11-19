@@ -2765,6 +2765,11 @@ impl Before {
     }
 }
 
+/// Callee guards a fold proved (tests: the functions piece).
+#[cfg(test)]
+pub(crate) static TEST_FOLDED_GUARDS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
 struct Builder<'a> {
     chunk: &'a FrozenChunk,
     ops: &'a [Op],
@@ -2785,6 +2790,9 @@ struct Builder<'a> {
     built: Vec<bool>,
     headers: Vec<Option<Header>>,
     hoisted: FastMap<Hoisted, NodeIx>,
+    /// Each folded object read's global environment (F4 part 2, functions): the Realm whose
+    /// global object its CheckCellIs proved, which a callee guard's Realm test then needs not.
+    folded_genv: FastMap<NodeIx, usize>,
     /// The hoisted nodes in the order made, which head the entry block once it is built.
     hoisted_nodes: Vec<NodeIx>,
     /// The closures the compiled frame created from a literal some by-literal way names, by
@@ -2841,6 +2849,7 @@ impl<'a> Builder<'a> {
             built: vec![false; blocks],
             headers: (0..blocks).map(|_| None).collect(),
             hoisted: FastMap::default(),
+            folded_genv: FastMap::default(),
             hoisted_nodes: Vec::new(),
             closures: FastMap::default(),
             moves_env: chunk.jit_ops().iter().any(names::moves_env),
@@ -6512,6 +6521,9 @@ impl<'a> Builder<'a> {
     /// so the mismatch edge is not built.
     fn inline_guard(&mut self, pc: usize, target: u32, st: &mut State) -> Result<(), Refusal> {
         let (inputs, this_object) = self.guard_inputs(pc, target, st)?;
+        if self.folded_callee(target, &inputs, this_object) {
+            return Ok(());
+        }
         let mut cx = Before::new(pc);
         let state = self.before(&mut cx, st);
         self.add_exit(
@@ -6529,6 +6541,37 @@ impl<'a> Builder<'a> {
         // receiver is the word the method load's shape check took before the call, which proved
         // it already (a guard that tests none, of a callee that reads no `this`, proves nothing).
         Ok(())
+    }
+
+    /// Whether the guard of `target` is proven by a fold (F4 part 2, functions): its callee input
+    /// a folded global whose word is the expected function's, read in the planning Realm (its
+    /// CheckCellIs proved the Realm's global object, which the guard's Realm test compares by
+    /// its global environment), with no closure environment to compare (a global function's
+    /// is the global one) and no receiver to test. The function's [[Environment]], Realm and
+    /// code are fixed by its identity; its `prototype` and other own properties are not, and
+    /// stay reads. V8 specializes a call whose target is a constant JSFunction
+    /// (compiler/js-call-reducer.cc:5184-5189); the DFG removes a CheckIsConstant whose child is
+    /// proven that constant (dfg/DFGConstantFoldingPhase.cpp:450-456).
+    fn folded_callee(&self, target: u32, inputs: &[NodeIx], this_object: bool) -> bool {
+        let targets = self
+            .inlined
+            .as_ref()
+            .map_or(self.chunk, |inlined| inlined.compiled());
+        let guard = targets.jit_inline_target(target);
+        let NodeOp::FoldedGlobal { word } = self.graph.node(inputs[0]).op else {
+            return false;
+        };
+        let proven = guard
+            .callee
+            .is_some_and(|cell| word == crate::value::PACK_OBJ | cell as u64)
+            && guard.expected_env == 0
+            && (!guard.check_this || this_object)
+            && self.folded_genv.get(&inputs[0]) == Some(&guard.expected_genv);
+        #[cfg(test)]
+        if proven {
+            TEST_FOLDED_GUARDS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        proven
     }
 
     /// An InlineGuard whose WrongCallee the exit profile flagged: its test as a Boolean

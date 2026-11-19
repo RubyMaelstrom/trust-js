@@ -4119,6 +4119,9 @@ fn calls_from_frames_nested_in_an_inlined_frame_give_the_tier_offs_results() {
 #[test]
 fn a_guard_failing_in_a_nested_frame_flags_its_frames_chunk_at_the_call() {
     graph_switches(0).set();
+    // The guard's own failure (WrongCallee): with the functions piece `which` folds, its guard is
+    // proven, and its change is an Invalidated discard instead.
+    super::global_fold::pin_folds_for_test(false);
     let mut engine = jit_engine();
     let source = "function lf(x) { return x + 1; }
         function lg(x) { return x - 1; }
