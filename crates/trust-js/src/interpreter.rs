@@ -4643,6 +4643,10 @@ mod array_absent_read_tests;
 mod stub_cache_tests;
 
 #[cfg(test)]
+#[path = "builtin_getter_tests.rs"]
+mod builtin_getter_tests;
+
+#[cfg(test)]
 #[path = "constructor_transfer_tests.rs"]
 mod constructor_transfer_tests;
 
@@ -7156,6 +7160,18 @@ fn function_realm_key(callback: &Value) -> Option<usize> {
     }
 }
 
+/// Whether a probe admits `b`, an object whose IC-plain flag is clear, as a way's receiver: a
+/// typed array on a way whose receiver kind is a typed array's (`IC_RECEIVER_TYPED_ARRAY`,
+/// `mid_ok` the way's), which its fill made only for a name a typed array reads by OrdinaryGet.
+/// Out of the probe's line, and asked after the receiver's kind passed (a Proxy never asks): an
+/// ordinary receiver never asks.
+#[cold]
+#[inline(never)]
+fn typed_receiver_way(b: &Object, mid_ok: u8) -> bool {
+    mid_ok & crate::bytecode::IC_MID_PRIMITIVE == crate::bytecode::IC_MID_TYPED_ARRAY
+        && matches!(b.kind, ObjectKind::TypedArray(_))
+}
+
 /// The intrinsic %TypedArray.prototype% getter that OrdinaryGet of `key` finds starting at
 /// `start`, and the object holding it, when every object it consults is an ordinary one whose
 /// properties all live in its property map (no Proxy, TypedArray, namespace, host or wrapper
@@ -9156,10 +9172,33 @@ impl Interp {
         this: Value,
         args: &[Value],
     ) -> Result<Value, Abrupt> {
+        self.dispatch_native_with::<true>(call, this, args)
+    }
+
+    /// [`Interp::dispatch_native`] for arguments the caller roots (none, for a getter: see
+    /// [`Interp::try_native_getter`]). A closure's captures are rooted here as there.
+    pub(crate) fn dispatch_native_rooted(
+        &mut self,
+        call: &ObjectKind,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
+        self.dispatch_native_with::<false>(call, this, args)
+    }
+
+    /// The body of both: `ROOT_ARGS` roots the arguments, in [`Interp::dispatch_native`]'s
+    /// order, so that every other native call keeps its code.
+    #[inline(always)]
+    fn dispatch_native_with<const ROOT_ARGS: bool>(
+        &mut self,
+        call: &ObjectKind,
+        this: Value,
+        args: &[Value],
+    ) -> Result<Value, Abrupt> {
         self.interrupt_poll_force()?;
         let perf_started = crate::jit::perf_stage_start();
         // I1: the arguments often live in the caller's Rust-heap buffer.
-        let _arguments = crate::rooting::root_slice(args);
+        let _arguments = ROOT_ARGS.then(|| crate::rooting::root_slice(args));
         let result = self.with_host_callback(|interp| {
             match call {
                 ObjectKind::Native(f) => f(interp, this, args),
@@ -11258,7 +11297,13 @@ impl Interp {
                     rb.kind,
                     ObjectKind::StrWrap(_) | ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_)
                 ) && non_digit);
-            if recv_shape_ok && rb.ic_plain() && rb.props.shape() == st.recv_shape {
+            // A typed array (its IC-plain flag clear) on a way its fill made for one (the
+            // way's kind, `IC_RECEIVER_TYPED_ARRAY`): such a way exists only for a name whose
+            // [[Get]] on it is OrdinaryGet.
+            if recv_shape_ok
+                && (rb.ic_plain() || typed_receiver_way(&rb, st.mid_ok))
+                && rb.props.shape() == st.recv_shape
+            {
                 if depth == 0 {
                     let property = if keychk {
                         rb.props
@@ -11341,6 +11386,15 @@ impl Interp {
         None
     }
 
+    /// Whether a typed-array receiver's [[Get]] of `name` is OrdinaryGet: a name that is no
+    /// CanonicalNumericIndexString (ECMA-262 10.4.5.5). Out of the fill's line: an ordinary
+    /// receiver, a Proxy or another side-table object never asks.
+    #[cold]
+    #[inline(never)]
+    fn typed_receiver_reads_ordinarily(&self, name: &str) -> bool {
+        self.canonical_numeric_index(name).is_none()
+    }
+
     /// [`try_ic_get`]'s miss path: re-derive the resolution by a raw-pointer chain walk and
     /// refill the cache. Split out so the shape fast path's early bail-outs can tail into it.
     /// `key` is the name's key, none where text with no atom names no property.
@@ -11367,13 +11421,19 @@ impl Interp {
         // `o`, nothing mutates during the read). On an ordinary descriptor within reach record
         // (depth, slot, receiver shape, holder shape); a non-plain level defers to full
         // `[[Get]]`. An ordinary accessor is invoked only after this lookup returns.
-        let (recv_shape, primitive) = unsafe {
+        // A typed-array receiver (its IC-plain flag clear) at a read of a name that is no
+        // CanonicalNumericIndexString reads by OrdinaryGet (ECMA-262 10.4.5.5): its level is a
+        // plain one and the way records its kind (`IC_RECEIVER_TYPED_ARRAY`), the one kind of
+        // way a probe admits it on. No absence way is made for it.
+        let (recv_shape, mut primitive) = unsafe {
             let receiver = (*head).borrow();
             (
                 receiver.props.shape(),
                 crate::value::primitive_kind_bits(&receiver.kind),
             )
         };
+        // Set where the receiver's level is a typed array's (`typed_receiver_reads_ordinarily`).
+        let mut typed_receiver = false;
         let mut cur: *const ObjCell = head;
         // The depth-1 hop's shape, recorded when that hop is a plain (non-array) ordinary object:
         // a depth-2 fill stores it as `mid_shape` so later hits can shape-validate the whole
@@ -11393,12 +11453,20 @@ impl Interp {
             for depth in 0..=IC_MAX_DEPTH {
                 let b = (*cur).borrow();
                 if !self.ic_plain_ptr(cur as usize, &b) {
-                    // An uncacheable receiver or chain: the site is generic (W4 step 5).
-                    self.ic_mark_generic(cache);
-                    return None;
+                    if depth != 0
+                        || !matches!(b.kind, ObjectKind::TypedArray(_))
+                        || !self.typed_receiver_reads_ordinarily(name)
+                    {
+                        // An uncacheable receiver or chain: the site is generic (W4 step 5).
+                        self.ic_mark_generic(cache);
+                        return None;
+                    }
+                    typed_receiver = true;
+                    primitive = crate::bytecode::IC_MID_TYPED_ARRAY;
                 }
                 absent_shapes[depth as usize] = b.props.shape();
                 absent_ok = absent_ok
+                    && !typed_receiver
                     && (b.kind.is_ordinary()
                         || matches!(b.kind, ObjectKind::NumWrap(_) | ObjectKind::BoolWrap(_))
                         || (matches!(b.kind, ObjectKind::Array) && absent_on_arrays(name)));
@@ -11519,6 +11587,11 @@ impl Interp {
                                 self.stub_cache_set(recv_shape, key, st);
                             }
                             return Some(CachedGet::undefined());
+                        }
+                        if typed_receiver {
+                            // A typed array's absent name fills no way: its site stays as
+                            // generic as the refused fill made it before typed arrays filled.
+                            self.ic_mark_generic(cache);
                         }
                         return None;
                     }

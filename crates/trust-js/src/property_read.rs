@@ -157,6 +157,11 @@ impl Interp {
             Ok(Value::Undefined)
         } else {
             let getter = read.value;
+            if is_native(&getter) {
+                if let Some(result) = self.try_native_getter(&getter, receiver) {
+                    return result;
+                }
+            }
             if let Some(value) = self.try_binding_getter(&getter) {
                 return Ok(value);
             }
@@ -207,6 +212,11 @@ impl Interp {
         let Some(getter) = getter else {
             return Some(Ok(Value::Undefined));
         };
+        if is_native(&getter) {
+            if let Some(result) = self.try_native_getter(&getter, receiver) {
+                return Some(result);
+            }
+        }
         if let Some(result) = self.try_record_getter(&getter, receiver) {
             return Some(result);
         }
@@ -259,6 +269,80 @@ impl Interp {
                 })
         };
         result.unwrap_or_else(|| self.call(getter, *receiver, &[]))
+    }
+
+    /// Call(getter, Receiver) (ECMA-262 §10.1.8.1 OrdinaryGet step 8) for a native getter a
+    /// property cache found (P3 stage 3, the getter line, a2): the native itself with the
+    /// receiver and no arguments, with the safepoints and state a call keeps (`Interp::call`,
+    /// `call_dispatch`: the depth and stack check, the amortized collection check, the interrupt
+    /// polls, `constructing` and `new_target` cleared, a pending tail call run; `dispatch_native`'s
+    /// host-callback scope and a closure's captures rooted), and none of the generic call's
+    /// dispatch (the user-getter proofs, the callee's kind and Realm routing, the rooting of an
+    /// empty argument list). As V8's load handler calls a builtin getter or an API getter
+    /// (ic/accessor-assembler.cc:956-966, 571-599), SpiderMonkey's baseline makes a VM call of
+    /// the native (CallNativeGetterResult, jit/BaselineCacheIRCompiler.cpp:678-702) and JSC's
+    /// stub calls a custom getter's function (bytecode/InlineCacheCompiler.cpp:3345-3351). `None`
+    /// for a getter that is no native callable, another Realm's native (the full call switches
+    /// to its Realm), a Realm's `eval`, or with a tail call pending: the caller makes the full
+    /// call.
+    #[inline(never)]
+    pub(crate) fn try_native_getter(
+        &mut self,
+        getter: &Value,
+        receiver: &Value,
+    ) -> Option<Result<Value, Abrupt>> {
+        use crate::interpreter::{execution_stack_exhausted, with_execution_stack};
+        let object = getter.as_obj()?;
+        let call = {
+            let body = object.borrow();
+            if !body.kind.is_native() {
+                return None;
+            }
+            body.kind.clone_callable()
+        };
+        if self.pending_tail.is_some()
+            || self.callee_realm_global(&object).is_some()
+            || (self.multi_realm()
+                && self
+                    .eval_realm_fns
+                    .contains(&(crate::value::Gc::as_ptr(&object) as usize)))
+        {
+            return None;
+        }
+        #[cfg(test)]
+        TEST_NATIVE_GETTERS.with(|count| count.set(count.get() + 1));
+        self.depth += 1;
+        if execution_stack_exhausted(self.depth) {
+            self.depth -= 1;
+            return Some(Err(
+                self.throw("RangeError", "Maximum call stack size exceeded")
+            ));
+        }
+        if let Err(error) = self
+            .gc_check_amortized()
+            .and_then(|()| self.interrupt_poll())
+        {
+            self.depth -= 1;
+            return Some(Err(error));
+        }
+        let saved_ctor = std::mem::replace(&mut self.constructing, false);
+        let saved_target = std::mem::replace(&mut self.new_target, Value::Undefined);
+        let this = *receiver;
+        // A host getter may delete its own accessor: as in the full call, its body and captures
+        // are held by `dispatch_native_rooted`'s closure arms (an owned payload handle, the
+        // captures rooted), not by the function object; the receiver word is on this frame.
+        let mut result =
+            with_execution_stack(self.depth, || self.dispatch_native_rooted(&call, this, &[]));
+        self.constructing = saved_ctor;
+        self.new_target = saved_target;
+        while result.is_ok() {
+            match self.run_pending_tail(true) {
+                Some(next) => result = next,
+                None => break,
+            }
+        }
+        self.depth -= 1;
+        Some(result)
     }
 
     /// A getter whose entire body is `return <identifier>` — the export accessors module
@@ -535,12 +619,26 @@ impl Interp {
     }
 }
 
+/// Whether `function` is a native callable, by its kind's tag read in place (no borrow is
+/// counted, as `bytecode::jit_proxy_read` reads a kind): the test a user getter's read makes
+/// before [`Interp::try_native_getter`], in line.
+#[inline(always)]
+pub(super) fn is_native(function: &Value) -> bool {
+    function
+        .as_obj()
+        // SAFETY: the function's live payload, which nothing borrows mutably during the read.
+        .is_some_and(|object| unsafe { (*object.object_ptr()).kind.is_native() })
+}
+
 #[cfg(test)]
 thread_local! {
     pub(super) static TEST_RECORD_GETTERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     pub(super) static TEST_VALIDATED_ACCESSORS: std::cell::Cell<usize> = const {
+        std::cell::Cell::new(0)
+    };
+    pub(super) static TEST_NATIVE_GETTERS: std::cell::Cell<usize> = const {
         std::cell::Cell::new(0)
     };
     pub(super) static TEST_BINDING_GETTERS: std::cell::Cell<[usize; 3]> = const {

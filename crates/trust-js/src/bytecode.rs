@@ -173,11 +173,24 @@ pub const IC_MID_GENERIC: u8 = 0x80;
 /// SpiderMonkey's string guards do: a fill on the prototype itself or on a wrapper object records
 /// the kind too. Symbols and BigInts fill no named way. No probe reads the bits; the optimizing
 /// tier keeps a marked site generic.
+///
+/// The same bits record a typed-array receiver, [`IC_RECEIVER_TYPED_ARRAY`] (P3 stage 3, the
+/// getter line, a1): its object's IC-plain flag is clear, and a probe admits such a receiver only
+/// on a way of this kind, as V8's typed-array maps, SpiderMonkey's typed-array shapes and JSC's
+/// typed-view structures name the receiver's class in the entry that caches it. The fill makes one
+/// only where the name is no CanonicalNumericIndexString, whose [[Get]] on a typed array is
+/// OrdinaryGet (ECMA-262 10.4.5.5; SpiderMonkey's CheckHasNoSuchOwnProperty refuses only a
+/// typed-array index, CacheIR.cpp:603-617), so a typed array can reach no way filled for another
+/// name. The optimizing tier refuses a way of any kind but 0 for an object read.
 pub const IC_MID_PRIMITIVE: u8 = 0x70;
 pub const IC_MID_PRIMITIVE_SHIFT: u32 = 4;
 pub const IC_PRIMITIVE_STRING: u8 = 1;
 pub const IC_PRIMITIVE_NUMBER: u8 = 2;
 pub const IC_PRIMITIVE_BOOLEAN: u8 = 3;
+/// A way's receiver kind (bits 4-6 of its `mid_ok`, as [`IC_MID_PRIMITIVE`]'s): a typed array.
+pub const IC_RECEIVER_TYPED_ARRAY: u8 = 4;
+/// [`IC_RECEIVER_TYPED_ARRAY`] in place in `mid_ok`.
+pub const IC_MID_TYPED_ARRAY: u8 = IC_RECEIVER_TYPED_ARRAY << IC_MID_PRIMITIVE_SHIFT;
 /// `IcState::depth` marker for a cached ABSENT property: on a receiver of `recv_shape`, `name`
 /// is missing along the entire (all ic-plain) prototype chain, every level ordinary, a Num or
 /// Bool wrapper, or, for a name that cannot be an index (not digit-led), an Array. The chain's

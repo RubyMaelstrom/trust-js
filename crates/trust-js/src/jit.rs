@@ -8530,7 +8530,12 @@ fn emit_prop_way_probe(
         guard_exotic_ordinary(a, layout, 14, 14, miss);
     }
     a.ldrb_imm(14, 11, plain);
-    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
+    // A receiver whose IC-plain flag is clear passes on a typed-array way alone (the getter
+    // line, a1; `IC_RECEIVER_TYPED_ARRAY`): out of the line, at `typed_receiver`.
+    let typed_receiver = a.new_label();
+    let receiver_plain = a.new_label();
+    a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), typed_receiver);
+    a.bind(receiver_plain);
     a.ldr_w_imm(14, 11, sh);
     a.ldr_w_imm(16, 12, IC_OFF_RECV_SHAPE);
     a.cmp_reg_w(14, 16);
@@ -8692,6 +8697,41 @@ fn emit_prop_way_probe(
         a.b_cond(C_NE, miss);
         a.b(load_kc);
     }
+    // The receiver hop's typed array (x11 = its Object base): a TypedArray kind, on a way whose
+    // receiver kind is the typed array's (`Interp::ic_shape_probe`'s rule); its shape follows.
+    emit_typed_receiver_gate(a, layout, typed_receiver, receiver_plain, miss);
+}
+
+/// The out-of-line receiver gate of a property way probe for an object whose IC-plain flag is
+/// clear (P3 stage 3, the getter line, a1): at `at`, with x11 = the receiver's Object base and
+/// x12 = the way's `IcState` cell, to `pass` for a typed array on a way whose receiver kind is
+/// [`crate::bytecode::IC_RECEIVER_TYPED_ARRAY`], else to `miss`. Such a way exists only for a
+/// name whose [[Get]] on a typed array is OrdinaryGet, so no name is compared here. Clobbers w14.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+fn emit_typed_receiver_gate(
+    a: &mut asm::Asm,
+    layout: &crate::value::JitLayout,
+    at: usize,
+    pass: usize,
+    miss: usize,
+) {
+    a.bind(at);
+    a.ldrb_imm(14, 11, layout.obj_kind as u32);
+    a.cmp_imm_w(14, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+    a.b_cond(C_NE, miss);
+    a.ldrb_imm(14, 12, crate::bytecode::IC_OFF_MID_OK);
+    a.logic_imm_w(
+        0,
+        14,
+        14,
+        asm::logical_imm_w(u32::from(crate::bytecode::IC_MID_PRIMITIVE)).unwrap(),
+    );
+    a.cmp_imm_w(14, u32::from(crate::bytecode::IC_MID_TYPED_ARRAY));
+    a.b_cond(C_NE, miss);
+    a.b(pass);
 }
 
 /// Status codes the shared property way loop returns in w9 (0 = no way validated).
@@ -9406,7 +9446,15 @@ fn emit_prop_load_inline(
         let depth = plain_depth(&st);
         a.add_imm(11, 10, obj_off);
         a.ldrb_imm(14, 11, ex);
-        if arr_ok || wrap_ok {
+        // A typed-array way (the getter line, a1) bakes its receiver's kind, as a V8 map or a
+        // SpiderMonkey shape names a typed array's class: the IC-plain flag, clear on every typed
+        // array, is not tested. Another receiver of its shape takes the way loop.
+        let typed =
+            st.mid_ok & crate::bytecode::IC_MID_PRIMITIVE == crate::bytecode::IC_MID_TYPED_ARRAY;
+        if typed {
+            a.cmp_imm_w(14, crate::value::KIND_TYPED_ARRAY_TAG as u32);
+            a.b_cond(C_NE, miss);
+        } else if arr_ok || wrap_ok {
             let recv_exotic_ok = a.new_label();
             branch_exotic_ordinary(a, layout, 14, 15, recv_exotic_ok);
             if arr_ok && depth >= 1 {
@@ -9426,8 +9474,10 @@ fn emit_prop_load_inline(
         } else {
             guard_exotic_ordinary(a, layout, 14, 14, miss);
         }
-        a.ldrb_imm(14, 11, plain);
-        a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
+        if !typed {
+            a.ldrb_imm(14, 11, plain);
+            a.tbz(14, flag_bit(crate::value::FLAG_IC_PLAIN), miss);
+        }
         a.ldr_w_imm(14, 11, sh);
         a.mov_imm64(16, st.recv_shape as u64);
         a.cmp_reg_w(14, 16);
