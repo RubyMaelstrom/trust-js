@@ -5846,15 +5846,17 @@ pub(crate) fn remember_code_edges(value: &dyn crate::gc_trace::GcTrace) {
     with_active_gc_heap(|heap| value.trace_gc(&mut Words(&mut heap.young_code_words.borrow_mut())));
 }
 
+/// Make the Agent of `heap` and `symbols` the thread's; true when another one was.
 #[inline]
-pub(crate) fn activate_agent(heap: &GcHeap, symbols: &SymbolAgent) {
+pub(crate) fn activate_agent(heap: &GcHeap, symbols: &SymbolAgent) -> bool {
     let next = (Rc::as_ptr(heap) as usize, Rc::as_ptr(symbols) as usize);
     // Nearly every activation finds its Agent active already (a native's return, a callback's
     // end): that test stays in line, the switch out of line.
     if ACTIVE_AGENT_TAG.with(|tag| tag.get() == next) {
-        return;
+        return false;
     }
     activate_other_agent(heap, symbols, next);
+    true
 }
 
 /// [`activate_agent`]'s switch to an Agent that is not the active one.
@@ -8793,11 +8795,18 @@ impl ShapeTable {
 /// The child shape reached by adding `key` with attributes `attrs` ([`Property::attrs`]) to
 /// shape `parent` (memoized so it is shared). Two maps with the same keys but different
 /// attributes get different shapes; the layout records keys only.
+///
+/// `map` is the map that takes the child, where the caller has it. A watched global's map
+/// (F4 part 2, R-1 U2) takes a fresh serial and no layout, and no entry is read or written for
+/// it: its shape is its own for its life, so its lookup never hits, and the test for it is made
+/// on the miss alone (the exemplars' global is a map no transition leads to: V8's own dictionary
+/// map, heap/factory.cc:3524-3533; JSC's dictionary structure, JSGlobalObject.cpp:1019).
 fn shape_transition(
     parent: u32,
     key: PropKey,
     attrs: u8,
     prefix: Option<&[(PropKey, u8)]>,
+    map: Option<&NamedEntries>,
 ) -> (u32, Option<PropertyLayout>) {
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
@@ -8817,11 +8826,15 @@ fn shape_transition(
             },
         );
         let id = if let Some(id) = recent {
+            debug_assert!(!map.is_some_and(NamedEntries::watched), "{WATCHED_HIT}");
             id
         } else {
             let pair = (parent, key, attrs);
             let id = if let Some(&id) = shapes.transitions.get(&pair) {
+                debug_assert!(!map.is_some_and(NamedEntries::watched), "{WATCHED_HIT}");
                 id
+            } else if map.is_some_and(NamedEntries::watched) {
+                return (watched_fresh(&mut shapes, class), None);
             } else {
                 let id = shapes.fresh(class);
                 if is_cacheable_shape(id) {
@@ -8876,8 +8889,9 @@ fn shape_transition(
 
 /// The child shape reached when the existing key `key` of a map of shape `parent` takes the
 /// attributes `attrs` (memoized under `attrs | SHAPE_CHANGE`, as JSC memoizes an attribute
-/// change). The keys keep their order and slots: the map keeps its layout.
-fn shape_change(parent: u32, key: PropKey, attrs: u8) -> u32 {
+/// change). The keys keep their order and slots: the map keeps its layout. `map` as in
+/// [`shape_transition`]: a watched global's map takes a fresh serial, tested on the miss alone.
+fn shape_change(parent: u32, key: PropKey, attrs: u8, map: Option<&NamedEntries>) -> u32 {
     debug_assert!(attrs & !(PROP_FLAG_MASK as u8) == 0);
     with_active_gc_heap(|heap| {
         let mut shapes = heap.shapes.borrow_mut();
@@ -8887,7 +8901,11 @@ fn shape_change(parent: u32, key: PropKey, attrs: u8) -> u32 {
         }
         let pair = (parent, key, attrs | SHAPE_CHANGE);
         if let Some(&id) = shapes.transitions.get(&pair) {
+            debug_assert!(!map.is_some_and(NamedEntries::watched), "{WATCHED_HIT}");
             return id;
+        }
+        if map.is_some_and(NamedEntries::watched) {
+            return watched_fresh(&mut shapes, class);
         }
         let id = shapes.fresh(class);
         if is_cacheable_shape(id) {
@@ -8918,7 +8936,7 @@ fn rebased_shape(entries: &NamedEntries, class: u32) -> u32 {
     }
     let mut rebased = empty_shape(class);
     for (slot, &key) in entries.keys().iter().enumerate() {
-        rebased = shape_transition(rebased, key, entries.attrs(slot), None).0;
+        rebased = shape_transition(rebased, key, entries.attrs(slot), None, None).0;
         if !is_cacheable_shape(rebased) {
             return rebased;
         }
@@ -8941,23 +8959,12 @@ fn rebased_shape(entries: &NamedEntries, class: u32) -> u32 {
 fn keyed_shape(entries: &NamedEntries, class: u32) -> u32 {
     let mut shape = empty_shape(class);
     for (slot, &key) in entries.keys().iter().enumerate() {
-        shape = shape_transition(shape, key, entries.attrs(slot), None).0;
+        shape = shape_transition(shape, key, entries.attrs(slot), None, None).0;
         if !is_cacheable_shape(shape) {
             break;
         }
     }
     shape
-}
-
-/// The shape a copy of `source`'s keys and attributes takes in class `class`: [`rebased_shape`]
-/// (the source's own when the classes agree), or for a watched global's map [`keyed_shape`].
-#[inline]
-fn copied_shape(source: &NamedEntries, class: u32) -> u32 {
-    if source.watched() {
-        keyed_shape(source, class)
-    } else {
-        rebased_shape(source, class)
-    }
 }
 
 fn shape_layout(id: u32) -> Option<PropertyLayout> {
@@ -8967,10 +8974,48 @@ fn shape_layout(id: u32) -> Option<PropertyLayout> {
 /// A fresh unique shape id of capacity class `class` (a structural removal / deopt — no cache
 /// should still match).
 fn shape_fresh(class: u32) -> u32 {
-    let shape = with_active_gc_heap(|heap| heap.shapes.borrow_mut().fresh(class));
+    with_active_gc_heap(|heap| watched_fresh(&mut heap.shapes.borrow_mut(), class))
+}
+
+/// A fresh serial of `shapes`' heap for a map whose shape must be its own (a watched global's,
+/// [`NamedEntries::set_shape`]; a removal's), recorded for the debug net of U4.
+fn watched_fresh(shapes: &mut ShapeTable, class: u32) -> u32 {
+    let shape = shapes.fresh(class);
     #[cfg(debug_assertions)]
     watched_shapes::LAST_FRESH.with(|last| last.set(shape));
     shape
+}
+
+/// The debug assertion of a transition's hit: a watched global's shape is a fresh serial no entry
+/// leads from (F4 part 2, R-1 U2), so its map's lookup never hits.
+const WATCHED_HIT: &str = "a watched global's map found a transition from its shape";
+
+/// The active heap's transition from `parent` by `key` with attributes `attrs`, an addition's or
+/// (`change`) an attribute change's, in its table or its recent cache (tests, R-1 U2).
+#[cfg(test)]
+pub(crate) fn transition_entry_for_test(
+    parent: u32,
+    key: PropKey,
+    attrs: u8,
+    change: bool,
+) -> Option<u32> {
+    let attrs = if change { attrs | SHAPE_CHANGE } else { attrs };
+    with_active_gc_heap(|heap| {
+        let shapes = heap.shapes.borrow();
+        shapes
+            .transitions
+            .get(&(parent, key, attrs))
+            .copied()
+            .or_else(|| {
+                shapes
+                    .recent
+                    .iter()
+                    .flatten()
+                    .find_map(|&(p, k, a, child)| {
+                        (p == parent && k == key && a == attrs).then_some(child)
+                    })
+            })
+    })
 }
 
 /// Entry count up to which a `Props` runs without a hash index (linear-scan lookups, no hash
@@ -9442,12 +9487,16 @@ impl Props {
         if self.entries.is_empty()
             && self.entries.index().is_none()
             && !self.elem_mode()
-            && !self.entries.watched()
             && source
                 .entries
                 .props()
                 .all(|property| property.attrs() == PROP_PLAIN)
         {
+            // A watched global's map meets this path neither way (F4 part 2, R-1 U3): it is
+            // never empty (NaN, Infinity and undefined are its first properties) and never all
+            // plain (those three are read-only), so the copy never takes a watched id.
+            debug_assert!(!self.entries.watched(), "an empty watched global");
+            debug_assert!(!source.entries.watched(), "a watched global copied whole");
             // Shapes encode (key, attributes): sharing the source shape is sound only when
             // every copied field's attributes match its plain replacement's. Otherwise the
             // per-key insert path below rebuilds the correct plain chain. In particular a frozen
@@ -9462,7 +9511,7 @@ impl Props {
             }
             // The source's shape, or across capacity classes the one its keys reach in this
             // map's class (W2d step 3).
-            let shape = copied_shape(&source.entries, self.entries.class());
+            let shape = rebased_shape(&source.entries, self.entries.class());
             self.entries.set_shape(shape);
             self.entries.len_slot.set(source.entries.len_slot.get());
             self.entries.proto_slot.set(source.entries.proto_slot.get());
@@ -10113,7 +10162,7 @@ impl Props {
         {
             if self.entries.watched() {
                 // The census counts a store of the value the slot holds (F4 part 2, a2).
-                let same = self.entries.slot(slot).0.get() == v.0;
+                let same = crate::object_fuse::census() && self.entries.slot(slot).0.get() == v.0;
                 crate::object_fuse::note_global_value_change(
                     self as *const Self as usize,
                     slot,
@@ -11119,7 +11168,7 @@ impl Props {
             if self.entries.replace(slot, p) && !(elem_mode && key.as_index().is_some()) {
                 changed = true;
                 if !watched {
-                    shape = shape_change(shape, key, attrs);
+                    shape = shape_change(shape, key, attrs, None);
                 }
             }
         }
@@ -11368,11 +11417,7 @@ impl Props {
             // tracks named keys only. A replacement that keeps the attributes keeps the shape.
             let attrs = prop.attrs();
             if self.entries.replace(i, prop) && !(self.elem_mode() && key.as_index().is_some()) {
-                let shape = if self.entries.watched() {
-                    shape_fresh(self.entries.class())
-                } else {
-                    shape_change(self.entries.shape, key, attrs)
-                };
+                let shape = shape_change(self.entries.shape, key, attrs, Some(&self.entries));
                 self.entries.set_shape(shape);
             }
         } else {
@@ -11396,12 +11441,14 @@ impl Props {
                         .map(|(name, property)| (name, property.attrs()))
                         .collect::<Vec<_>>()
                 });
-                // A watched global's map reads and writes no transition (R-1, U2).
-                let (shape, layout) = if self.entries.watched() {
-                    (shape_fresh(self.entries.class()), None)
-                } else {
-                    shape_transition(self.entries.shape, key, prop.attrs(), prefix.as_deref())
-                };
+                // A watched global's map takes a fresh serial (R-1, U2: `shape_transition`).
+                let (shape, layout) = shape_transition(
+                    self.entries.shape,
+                    key,
+                    prop.attrs(),
+                    prefix.as_deref(),
+                    Some(&self.entries),
+                );
                 self.entries.set_shape(shape);
                 if let Some(layout) = layout {
                     self.entries.layout = Some(layout);

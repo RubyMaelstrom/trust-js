@@ -60,6 +60,7 @@ fn property_shapes_foreign_mutation_cannot_alias_local_transition() {
             PropKey::from_text("delta"),
             PROP_PLAIN,
             Some(&prefix),
+            None,
         );
         assert_ne!(
             foreign_shape, local_shape,

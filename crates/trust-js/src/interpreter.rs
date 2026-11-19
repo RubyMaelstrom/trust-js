@@ -5554,6 +5554,9 @@ impl Drop for Interp {
         for coroutine in coroutines.values_mut(&self.gc_heap) {
             coroutine.terminate(self);
         }
+        // The thread's active global fuse, if it is one of this interpreter's realms', is cleared
+        // once nothing of it runs again and before its fields and heap go (F4 part 2, R-5).
+        crate::object_fuse::clear_active_global_of(|fuse| self.holds_global_fuse(fuse));
         // The whole Agent is ending, not merely reaching a GC safepoint: the heap's owner
         // (`heap_release`) finalizes and frees every cell once all other fields have dropped,
         // and a ShadowRealm's interpreter must not touch the heap it shares with its parent.
@@ -6351,6 +6354,26 @@ impl Interp {
     #[cfg(test)]
     pub(crate) fn global_fuse(&self) -> Option<std::sync::Arc<crate::object_fuse::ObjectFuse>> {
         self.realm_fuses.as_ref()?.global.clone()
+    }
+
+    /// Whether `fuse` is the global fuse of one of this interpreter's realms: the active one's,
+    /// a recorded realm's, or the constructor caller's saved one.
+    fn holds_global_fuse(&self, fuse: *const crate::object_fuse::ObjectFuse) -> bool {
+        let global_of = |fuses: &Option<std::sync::Arc<crate::object_fuse::RealmFuses>>| {
+            fuses
+                .as_deref()
+                .and_then(|fuses| fuses.global.as_deref())
+                .is_some_and(|global| std::ptr::eq(global, fuse))
+        };
+        global_of(&self.realm_fuses)
+            || self
+                .realms
+                .values()
+                .any(|realm| global_of(&realm.realm_fuses))
+            || self
+                .ctor_caller_realm
+                .as_ref()
+                .is_some_and(|realm| global_of(&realm.realm_fuses))
     }
 
     /// The active realm's global object's fuse, reached from the realm with no registry.
@@ -7373,7 +7396,12 @@ impl Interp {
     /// worker, while embedders may alternate independent engines on one driver thread.
     #[inline]
     pub(crate) fn activate_gc_heap(&self) {
-        crate::value::activate_agent(&self.gc_heap, &self.symbol_agent);
+        // An entry that switches the thread's Agent makes its active realm's global fuse the
+        // thread's too (F4 part 2, R-5); one that finds its Agent active (a native's return, the
+        // common case) leaves it, as the Agent was left.
+        if crate::value::activate_agent(&self.gc_heap, &self.symbol_agent) {
+            crate::object_fuse::activate_global(self.active_global_fuse());
+        }
     }
 
     /// Temporarily make this interpreter's heap and Symbol state current, restoring the

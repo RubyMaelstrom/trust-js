@@ -401,6 +401,39 @@ pub(crate) fn set_active_global(fuse: Option<&Arc<ObjectFuse>>) {
     }));
 }
 
+/// Make `fuse`, the active realm's global fuse of the interpreter that is entered, the thread's
+/// unless it is already (`Interp::activate_gc_heap`, at an entry that switches the thread's
+/// Agent): two engines alternating on one thread then each report their global's writes through
+/// it, with no registry and no lock (F4 part 2, R-5). It names a fuse its interpreter holds,
+/// which clears it before dropping (`clear_active_global_of`).
+#[inline]
+pub(crate) fn activate_global(fuse: Option<&ObjectFuse>) {
+    let ptr = fuse.map_or(std::ptr::null(), |fuse| fuse as *const ObjectFuse);
+    if ACTIVE_GLOBAL.get().1 != ptr {
+        ACTIVE_GLOBAL.set(fuse.map_or((0, std::ptr::null()), |fuse| (fuse.props, ptr)));
+    }
+}
+
+/// Clear the thread's active global fuse if `owned` says it is one of a dropping interpreter's
+/// (`Interp`'s `Drop`, before its heap goes): the thread-local's pointer then never outlives the
+/// interpreter whose realm it names, whichever thread drops the fuse's last `Arc` (the registry
+/// hands out upgrades of its weak handles) (F4 part 2, R-5).
+pub(crate) fn clear_active_global_of(owned: impl Fn(*const ObjectFuse) -> bool) {
+    let _ = ACTIVE_GLOBAL.try_with(|active| {
+        let fuse = active.get().1;
+        if !fuse.is_null() && owned(fuse) {
+            active.set((0, std::ptr::null()));
+        }
+    });
+}
+
+#[cfg(test)]
+thread_local! {
+    /// This thread's watched-global value reports, by the path that found the fuse: the active
+    /// realm's thread-local, or the registry (tests, R-5).
+    pub(crate) static TEST_REPORT_PATHS: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
+}
+
 /// The map address of this thread's active global fuse, 0 for none (tests).
 #[cfg(test)]
 pub(crate) fn active_global_props() -> usize {
@@ -535,7 +568,8 @@ fn value_change_slow(props: usize, slot: usize) {
 /// The census of a watched global's reported writes (F4 part 2, R-4): value writes that reached
 /// Rust (each a checked store: an in-line store reports nothing), those that made a Constant
 /// property NotConstant, and of these the ones that stored the value it held (a2: the evidence
-/// for V8's same-value rule); printed at exit under TRUST_JS_OPT_LOG ([`global_census_dump`]).
+/// for V8's same-value rule); counted and printed at exit only under TRUST_JS_OPT_LOG
+/// ([`census`], [`global_census_dump`]), so that a store's report counts nothing otherwise.
 static GLOBAL_CHECKED_STORES: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_CHANGED_CONSTANTS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_SAME_VALUE_CHANGES: AtomicU64 = AtomicU64::new(0);
@@ -543,6 +577,18 @@ static GLOBAL_SAME_VALUE_CHANGES: AtomicU64 = AtomicU64::new(0);
 /// top-level assignment of a global that is not yet NotConstant takes the checked path).
 static GLOBAL_REFUSED_FILLS: AtomicU64 = AtomicU64::new(0);
 static GLOBAL_REFUSED_HINTS: AtomicU64 = AtomicU64::new(0);
+
+/// Whether the census counts: TRUST_JS_OPT_LOG, read once.
+#[inline]
+pub(crate) fn census() -> bool {
+    env_flag!("TRUST_JS_OPT_LOG")
+}
+
+/// The census's count of checked stores, process-wide (tests).
+#[cfg(test)]
+pub(crate) fn census_checked_stores() -> u64 {
+    GLOBAL_CHECKED_STORES.load(Ordering::Relaxed)
+}
 
 #[cfg(test)]
 thread_local! {
@@ -552,19 +598,30 @@ thread_local! {
 
 /// A watched global's map at `props` wrote the value at `slot` (`Props::set_value`,
 /// `Props::set_value_at`): a value change, as [`note_value_change`]'s; `same` when the value
-/// stored is the one the slot held.
+/// stored is the one the slot held (computed only for the census).
 #[inline]
 pub(crate) fn note_global_value_change(props: usize, slot: usize, same: bool) {
-    GLOBAL_CHECKED_STORES.fetch_add(1, Ordering::Relaxed);
+    let census = census();
+    if census {
+        GLOBAL_CHECKED_STORES.fetch_add(1, Ordering::Relaxed);
+    }
     #[cfg(test)]
     TEST_GLOBAL_CHECKED.with(|count| count.set(count.get() + 1));
     // The active realm's global: its fuse with no registry, and a NotConstant property with no
     // lock (`ObjectFuse::handle_value_change`).
     let state = match active_global_for(props) {
-        Some(fuse) => fuse.handle_value_change(slot),
-        None => registered_value_change(props, slot),
+        Some(fuse) => {
+            #[cfg(test)]
+            TEST_REPORT_PATHS.with(|paths| paths.set((paths.get().0 + 1, paths.get().1)));
+            fuse.handle_value_change(slot)
+        }
+        None => {
+            #[cfg(test)]
+            TEST_REPORT_PATHS.with(|paths| paths.set((paths.get().0, paths.get().1 + 1)));
+            registered_value_change(props, slot)
+        }
     };
-    if state == PropertyState::Constant {
+    if census && state == PropertyState::Constant {
         GLOBAL_CHANGED_CONSTANTS.fetch_add(1, Ordering::Relaxed);
         if same {
             GLOBAL_SAME_VALUE_CHANGES.fetch_add(1, Ordering::Relaxed);
@@ -616,7 +673,7 @@ pub(crate) fn global_may_store_in_line(
         Some(fuse) if fuse.props == props => fuse.may_store_in_line(slot),
         _ => registered_may_store_in_line(props, slot),
     };
-    if !may {
+    if !may && census() {
         GLOBAL_REFUSED_FILLS.fetch_add(1, Ordering::Relaxed);
     }
     may
@@ -630,7 +687,9 @@ fn registered_may_store_in_line(props: usize, slot: usize) -> bool {
 
 /// A Reference's hint refused by the rule (the census, [`global_census_dump`]).
 pub(crate) fn note_refused_hint() {
-    GLOBAL_REFUSED_HINTS.fetch_add(1, Ordering::Relaxed);
+    if census() {
+        GLOBAL_REFUSED_HINTS.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 /// The state of the watched global's property at `slot`, Untracked where the map has no fuse.
@@ -642,7 +701,7 @@ pub(crate) fn global_property_state(props: usize, slot: usize) -> PropertyState 
 /// Print the census of a watched global's writes under TRUST_JS_OPT_LOG (the shell's end of
 /// run, `trust_js::unstable_feedback_census_dump`).
 pub(crate) fn global_census_dump() {
-    if std::env::var_os("TRUST_JS_OPT_LOG").is_some() {
+    if census() {
         eprintln!(
             "[opt] global stores: checked {}, constants changed {}, same value {}, fills refused {}, reference hints refused {}",
             GLOBAL_CHECKED_STORES.load(Ordering::Relaxed),

@@ -655,8 +655,8 @@ fn a_writing_name_site_asks_again_for_a_property_added_anew() {
 
 /// A: a watched global's reported write finds the active realm's fuse through a thread-local
 /// with no registry. It names a live fuse only: two engines on one thread, the second made last
-/// (its fuse the thread's) and then dropped (the thread's cleared); the first's writes move its
-/// own states throughout, through the registry.
+/// (its fuse the thread's) and then dropped (the thread's cleared); each engine's writes move its
+/// own states throughout.
 #[test]
 fn two_engines_on_one_thread_move_their_own_states() {
     // Each engine's map is read under its own Agent (an embedder's entry activates it).
@@ -690,4 +690,174 @@ fn two_engines_on_one_thread_move_their_own_states() {
     make_constant(&a, "H");
     eval(&mut a, "H = 2;");
     assert_eq!(state(&a, "H"), PropertyState::NotConstant);
+}
+
+/// R-1 U2, its test on the transition's miss alone: a watched global's addition and attribute
+/// change take fresh serials and write no transition, in the table or the recent cache, while a
+/// plain object's same addition writes one. The miss path's test is the only one: `Props::insert`
+/// tests nothing for it.
+#[test]
+fn a_watched_globals_changes_write_no_transition() {
+    use crate::atom::PropKey;
+    use crate::value::{Property, Value};
+    let engine = engine(Tier::Bytecode);
+    engine.interp.activate_gc_heap();
+    let key = PropKey::from_text("addedToTheGlobal");
+    let plain = Property::plain(Value::Num(1.0)).attrs();
+    let before = engine.interp.global.borrow().props.shape();
+    engine
+        .interp
+        .global
+        .borrow_mut()
+        .props
+        .insert("addedToTheGlobal", Property::plain(Value::Num(1.0)));
+    let added = engine.interp.global.borrow().props.shape();
+    assert_ne!(added, before);
+    assert_eq!(
+        crate::value::transition_entry_for_test(before, key, plain, false),
+        None,
+        "an addition's transition from a watched shape"
+    );
+    let hidden = Property::data(Value::Num(1.0), true, false, true);
+    let hidden_attrs = hidden.attrs();
+    engine
+        .interp
+        .global
+        .borrow_mut()
+        .props
+        .insert("addedToTheGlobal", hidden);
+    assert_ne!(engine.interp.global.borrow().props.shape(), added);
+    assert_eq!(
+        crate::value::transition_entry_for_test(added, key, hidden_attrs, true),
+        None,
+        "an attribute change's transition from a watched shape"
+    );
+    // The probe sees a plain object's: the same addition from the empty shape writes one.
+    let mut object = crate::value::Props::new();
+    let empty = object.shape();
+    object.insert("addedToTheGlobal", Property::plain(Value::Num(1.0)));
+    assert_eq!(
+        crate::value::transition_entry_for_test(empty, key, plain, false),
+        Some(object.shape())
+    );
+    // Through the program as well, at each tier: a global made by assignment and then by `var`.
+    for tier in TIERS {
+        let mut engine = self::engine(tier);
+        let shape = |engine: &Engine| engine.interp.global.borrow().props.shape();
+        let before = shape(&engine);
+        eval(&mut engine, "globalThis.madeByAssignment = 1;");
+        let key = PropKey::from_text("madeByAssignment");
+        assert_eq!(
+            crate::value::transition_entry_for_test(before, key, plain, false),
+            None,
+            "{tier:?}"
+        );
+        assert!(engine.interp.global.borrow().watched_global(), "{tier:?}");
+    }
+}
+
+/// R-1 U3 and the named-data copy's fast path, which a watched global meets neither way (never
+/// empty, never all plain): copies from and into the global take no watched shape and leave the
+/// global watched (the debug assertions of `try_copy_named_data_from` and U4's net run here).
+#[test]
+fn copies_from_and_into_the_global_take_no_watched_shape() {
+    for tier in TIERS {
+        let mut engine = engine(tier);
+        assert_eq!(
+            eval(
+                &mut engine,
+                "var spread = { ...globalThis }; var assigned = Object.assign({}, globalThis); \
+                 Object.assign(globalThis, { copiedIn: 1 }); var again = { ...{ a: 1, b: 2 } }; \
+                 [typeof spread, typeof assigned, copiedIn, again.b].join()"
+            ),
+            "object,object,1,2",
+            "{tier:?}"
+        );
+        let global = engine.interp.global.borrow();
+        assert!(global.watched_global(), "{tier:?}");
+        let mut empty = crate::value::Props::new();
+        assert!(!empty.try_copy_named_data_from(&global.props), "{tier:?}");
+    }
+}
+
+/// A.3: the tree-walker's generic store to the global (`o.x = v`, OrdinarySet through
+/// set_member_key) reports once a store, and the census counts nothing without its switch
+/// (TRUST_JS_OPT_LOG), so that the release store path carries no counter.
+#[test]
+fn a_generic_store_to_the_global_reports_once_and_counts_no_census() {
+    let mut engine = engine(Tier::Interp);
+    eval(&mut engine, "var gx = 0; var o = globalThis;");
+    let (reports, census) = (checked(), crate::object_fuse::census_checked_stores());
+    eval(
+        &mut engine,
+        "(function () { for (var i = 0; i < 50; i++) o.gx = i; })();",
+    );
+    assert_eq!(checked() - reports, 50);
+    if !crate::object_fuse::census() {
+        assert_eq!(crate::object_fuse::census_checked_stores(), census);
+    }
+}
+
+/// R-5: two engines alive on one thread, stores to each one's watched global alternately: each
+/// engine's entry makes its own global's fuse the thread's (`Interp::activate_gc_heap`), so every
+/// store reports through it and none through the registry; a write to the other engine's global
+/// takes the registry, correctly. An engine dropped while its fuse lives on (another holder)
+/// clears the thread's pointer itself, before its heap goes.
+#[test]
+fn two_engines_alternating_report_through_their_own_fuse() {
+    use std::cell::Cell;
+    let paths = || crate::object_fuse::TEST_REPORT_PATHS.with(Cell::get);
+    let props_of = |engine: &Engine| {
+        let global = engine.interp.global.borrow();
+        &global.props as *const _ as usize
+    };
+    let mut a = engine(Tier::Interp);
+    let mut b = engine(Tier::Interp);
+    eval(&mut a, "var G = 0;");
+    eval(&mut b, "var G = 0;");
+    let start = paths();
+    for round in 0..3 {
+        eval(&mut a, "for (var k = 0; k < 10; k++) globalThis.G = k;");
+        assert_eq!(crate::object_fuse::active_global_props(), props_of(&a));
+        eval(&mut b, "for (var k = 0; k < 10; k++) globalThis.G = k;");
+        assert_eq!(crate::object_fuse::active_global_props(), props_of(&b));
+        let (active, registry) = paths();
+        assert_eq!(
+            registry, start.1,
+            "round {round}: a store through the registry"
+        );
+        // Each round stores G ten times in each engine (the loops' `k` stops reporting once its
+        // Reference hint holds a NotConstant slot).
+        assert!(
+            active >= start.0 + 20 * (round + 1),
+            "round {round}: {active} {start:?}"
+        );
+    }
+    // A's global written while B is the active engine (A's Agent entered by a guard, as a host's
+    // raw access does, which leaves the thread's fuse B's): the registry, correctly, and A's state
+    // moves. An entry that switches no Agent leaves the thread's fuse as it was.
+    eval(&mut a, "var F = 0;");
+    eval(&mut b, "G = 3;");
+    let registry = paths().1;
+    {
+        let _agent = a.interp.enter_agent();
+        make_constant(&a, "F");
+        let slot = a.interp.global.borrow().props.slot_of("F").unwrap();
+        a.interp
+            .global
+            .borrow_mut()
+            .props
+            .set_value_at(slot, crate::value::Value::Num(7.0));
+        assert_eq!(state(&a, "F"), PropertyState::NotConstant);
+    }
+    assert_eq!(paths().1, registry + 1);
+    // B dropped while its fuse is held elsewhere: B's drop clears the thread's pointer.
+    eval(&mut b, "G = 1;");
+    assert_eq!(crate::object_fuse::active_global_props(), props_of(&b));
+    let held = b.interp.global_fuse().expect("B's global fuse");
+    drop(b);
+    assert_eq!(crate::object_fuse::active_global_props(), 0);
+    drop(held);
+    eval(&mut a, "G = 2;");
+    assert_eq!(crate::object_fuse::active_global_props(), props_of(&a));
 }
