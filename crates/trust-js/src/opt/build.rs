@@ -101,6 +101,13 @@ pub(crate) use inline::{E0_EFFECT, PAST_RECORD};
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
 pub(crate) use inline::{TEST_LITERAL_FRAMES, TEST_NESTED_FRAMES};
+
+#[cfg(test)]
+thread_local! {
+    /// The InstanceOf sites the builders of this thread built as OrdinaryHasInstance (tests; P3
+    /// stage 3, graph piece 3).
+    pub(crate) static TEST_INSTANCE_OFS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 // The job and the driver read these where the tier has its back end.
 #[cfg_attr(
     not(all(
@@ -777,6 +784,24 @@ impl Rules<'_> {
         (arms.len() >= 2).then_some(arms)
     }
 
+    /// The InstanceOf at `pc` lowered as OrdinaryHasInstance on its right-hand side's recorded
+    /// form (P3 stage 3, graph piece 3; `Builder::instance_of`), or None for the generic
+    /// operation: no filled cell, the cell's generic mark (a right-hand side its guards
+    /// rejected), a `prototype` slot out of a field load's reach, or a WrongShape or NotObject
+    /// flag at the site (a discarded check of the form). The cell is SpiderMonkey's stub's facts
+    /// (InstanceOfIRGenerator::tryAttachFunction, jit/CacheIR.cpp:5753-5842); V8 takes the generic
+    /// form where its feedback holds no one callable (maglev-reducer-inl.h:2942-2950).
+    fn instance_of_site(&self, pc: usize) -> Option<super::snapshot::InstanceOfView> {
+        let view = self.snapshot.instance_of(pc)?;
+        (!view.generic
+            && view.location != 0
+            && view.slot < MAX_FIELD_SLOT
+            && crate::value::is_cacheable_shape(view.shape)
+            && !self.snapshot.declines(pc, ExitReason::WrongShape)
+            && !self.snapshot.declines(pc, ExitReason::NotObject))
+        .then_some(view)
+    }
+
     /// The element site at `pc` lowered on element words, or None for the generic access (an
     /// effect): a generic mark, a key that is no index, or receivers by rule R (the record's where
     /// it holds any, else the in-line set's) other than Arrays and ordinary objects.
@@ -1187,6 +1212,7 @@ impl Rules<'_> {
             // A test of the tag and the kind, its rare objects through a cold call that runs no
             // JavaScript (P3 stage 3 step L1).
             Op::TypeofIs(..) => true,
+            Op::InstanceOf(_) => self.instance_of_site(pc).is_some(),
             Op::Add | Op::Sub | Op::Mul | Op::Div | Op::Mod | Op::Lt | Op::Gt | Op::Le | Op::Ge => {
                 self.numbers(pc, true).is_some() && !flagged(&[ExitReason::NotNumber])
             }
@@ -4699,6 +4725,7 @@ impl<'a> Builder<'a> {
             Op::UpdateProp(name, _, kind) => self.update_prop(pc, name, kind, st)?,
             Op::AppendProp(name, _) => self.append_prop(pc, name, st)?,
             Op::GetElem => self.element_load(pc, Recv::Stack, st)?,
+            Op::InstanceOf(_) => self.instance_of(pc, st)?,
             Op::GetElemLocal(slot) => {
                 let slot = self.slot(pc, slot as usize)?;
                 self.element_load(pc, Recv::Slot(slot), st)?
@@ -6943,6 +6970,60 @@ impl Builder<'_> {
         };
         st.loaded.insert((words, key), value);
         value
+    }
+
+    /// InstanceOf as OrdinaryHasInstance on the right-hand side the site's cell recorded (P3
+    /// stage 3, graph piece 3; `Rules::instance_of_site`): the right-hand side's shape checked
+    /// (CheckShape: no own @@hasInstance, its `prototype` a data property at the cell's slot),
+    /// CheckCtor (an ordinary constructor whose [[Prototype]] is the realm's Function.prototype,
+    /// whose @@hasInstance is immutable), its `prototype` loaded and checked an object, then the
+    /// left-hand side's chain walked (HasInPrototypeChain: no object is false, a Proxy exits).
+    /// SpiderMonkey's stub in Warp: GuardShape, the prototype guards to Function.prototype,
+    /// LoadDynamicSlot, GuardToObject, LoadInstanceOfObjectResult (jit/CacheIR.cpp:5753-5842);
+    /// V8 pins the callable and makes `prototype` a constant under DependOnPrototypeProperty
+    /// (maglev-reducer-inl.h:2756-2767), which needs prototype dependencies this tier does not
+    /// have, so the slot is loaded (a field fact of the epoch). Every check exits with the
+    /// operation's before-state; the result is a Bool.
+    fn instance_of(&mut self, pc: usize, st: &mut State) -> Result<(), Refusal> {
+        let Some(view) = self.rules().instance_of_site(pc) else {
+            if self.snapshot.instance_of(pc).is_some() {
+                // The log's line where a flag declined the form (TRUST_JS_OPT_LOG).
+                let _ = self.declined(pc, ExitReason::WrongShape, "the generic instanceof")
+                    || self.declined(pc, ExitReason::NotObject, "the generic instanceof");
+            }
+            return self.effect(pc, st);
+        };
+        let len = st.stack.len();
+        let (lhs, rhs) = (st.stack[len - 2], st.stack[len - 1]);
+        let mut cx = Before::new(pc);
+        let rword = self.tagged(st, rhs, pc);
+        let rcell = self.shaped(st, &mut cx, rword, &[view.shape]);
+        let state = self.before(&mut cx, st);
+        self.add_exit(
+            NodeOp::CheckCtor,
+            &[rcell],
+            Rep::None,
+            pc,
+            state,
+            ExitReason::WrongShape,
+        );
+        let proto = self.field(st, rword, rcell, view.location, view.slot, pc);
+        let pcell = self.object_cell(st, &mut cx, proto);
+        let lword = self.tagged(st, lhs, pc);
+        let state = self.before(&mut cx, st);
+        let result = self.add_exit(
+            NodeOp::HasInPrototypeChain,
+            &[lword, pcell],
+            Rep::Bool,
+            pc,
+            state,
+            ExitReason::WrongShape,
+        );
+        st.stack.truncate(len - 2);
+        st.stack.push(result);
+        #[cfg(test)]
+        TEST_INSTANCE_OFS.with(|count| count.set(count.get() + 1));
+        Ok(())
     }
 
     /// GetElem and GetElemLocal on element words (Maglev's element load on a JSArray or JSObject,

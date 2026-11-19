@@ -4443,6 +4443,19 @@ impl Chunk {
         self.record_getter_plan().is_some() && !self.feedback.detailed_enabled()
     }
 
+    /// The state of property cache `cache` (an InstanceOf site's cell, which the optimizing tier's
+    /// snapshot reads: opt::snapshot::InstanceOfView), or None past the chunk's caches.
+    #[cfg_attr(
+        not(all(
+            target_arch = "aarch64",
+            any(target_os = "macos", target_os = "linux", target_os = "windows")
+        )),
+        allow(dead_code)
+    )]
+    pub(crate) fn cache_state(&self, cache: u32) -> Option<IcState> {
+        self.caches.get(cache as usize).map(std::cell::Cell::get)
+    }
+
     pub(crate) fn record_getter_values(&self, receiver: &crate::value::Props) -> Option<[f64; 8]> {
         let plan = self.record_getter_plan()?;
         if self.feedback.detailed_enabled() {
@@ -7676,6 +7689,7 @@ fn mapped_operation(op: &Op) -> bool {
         || feedback_read::is_element_access(op)
         || feedback_read::is_equality(op)
         || named_site_cache(op).is_some()
+        || matches!(op, Op::InstanceOf(_))
 }
 
 /// A code for each kind of operation the record map names, one a variant (0: not named): the
@@ -7731,12 +7745,14 @@ fn mapped_kind(op: &Op) -> usize {
         Op::NotEq => 46,
         Op::StrictEq => 47,
         Op::StrictNotEq => 48,
+        // P3 stage 3, graph piece 3: an InstanceOf's cell (opt::snapshot::InstanceOfView).
+        Op::InstanceOf(_) => 49,
         _ => 0,
     }
 }
 
 /// The kind codes' count (0 included).
-const MAPPED_KINDS: usize = 49;
+const MAPPED_KINDS: usize = 50;
 
 /// A chunk's named operations grouped by kind, each group in pc order (a counting sort): kind
 /// k's pcs are `pcs[start[k]..start[k + 1]]`.

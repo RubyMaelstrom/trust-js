@@ -1451,6 +1451,8 @@ mod chain;
 #[path = "create_inline_tests.rs"]
 mod create;
 
+#[path = "instance_of_inline_tests.rs"]
+mod instance_of;
 /// Graph-next piece 2 under TRUST_JS_OPT_INLINE=graph: the polymorphic named store.
 #[path = "poly_store_inline_tests.rs"]
 mod poly_store;

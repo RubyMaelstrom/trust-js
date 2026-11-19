@@ -474,6 +474,23 @@ pub(crate) enum NodeOp {
     CheckNoProto {
         ways: u8,
     },
+    /// Cell -> None: the object is an ordinary constructor whose [[Prototype]] is the running
+    /// realm's Function.prototype (`Interp::function_proto`, read through ctx.interp, never
+    /// embedded), its kind exotic-none and IC_PLAIN and CONSTRUCTOR set, as the InstanceOf
+    /// template guards its right-hand side (jit.rs emit_instanceof_inline); else an exit
+    /// [WrongShape]. With a CheckShape of the cell's shape (no own @@hasInstance) it proves that
+    /// `instanceof` is OrdinaryHasInstance on its `prototype` (P3 stage 3, graph piece 3), as
+    /// SpiderMonkey's stub guards the shape and the chain to Function.prototype, whose
+    /// @@hasInstance is immutable (jit/CacheIR.cpp:5753-5842).
+    CheckCtor,
+    /// (Tagged, Cell) -> Bool: OrdinaryHasInstance's walk (P3 stage 3, graph piece 3): false for
+    /// a left-hand side that is no object, else whether the cell (an object) is on its
+    /// [[Prototype]] chain, read field by field as the template walks it; a Proxy on the chain
+    /// (its [[GetPrototypeOf]] a trap) exits [WrongShape] with the operation's before-state.
+    /// Maglev's HasInPrototypeChain and Ion's InstanceOf walk the same way and call the runtime
+    /// for a proxy from a deferred path (maglev-ir.cc:5141-, CodeGenerator.cpp:20277-); here
+    /// the flag declines the site after a discard (the coordinator's F1, 2026-11-19).
+    HasInPrototypeChain,
     /// Tagged -> Bool [NotBoolean]: an equality's operand where its record saw two Booleans (P3
     /// stage 3 step L1); the builder branches through ToBoolean.
     CheckBoolean,
@@ -922,6 +939,8 @@ impl NodeOp {
                 | NodeOp::CheckStringProto { .. }
                 | NodeOp::CheckCreatable { .. }
                 | NodeOp::CheckNoProto { .. }
+                | NodeOp::CheckCtor
+                | NodeOp::HasInPrototypeChain
                 | NodeOp::StoreNew { .. }
                 | NodeOp::StringLength
                 | NodeOp::CheckBoolean

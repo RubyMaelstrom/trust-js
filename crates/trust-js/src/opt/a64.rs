@@ -1744,6 +1744,8 @@ fn default_reason(op: &NodeOp) -> ExitReason {
         | NodeOp::CheckStringProto { .. }
         | NodeOp::CheckCreatable { .. }
         | NodeOp::CheckNoProto { .. }
+        | NodeOp::CheckCtor
+        | NodeOp::HasInPrototypeChain
         | NodeOp::StoreNew { .. }
         | NodeOp::StringLength => ExitReason::WrongShape,
         NodeOp::CheckBoolean => ExitReason::NotBoolean,
@@ -3152,6 +3154,72 @@ impl Gen<'_> {
                     // minor collection then finds an old object's edge to a young value.
                     emit_card_mark(&mut self.a, cell, X9, X30);
                 }
+            }
+            NodeOp::CheckCtor => {
+                // As the InstanceOf template guards its right-hand side (jit.rs
+                // emit_instanceof_inline): an ordinary kind, IC_PLAIN and CONSTRUCTOR, and the
+                // [[Prototype]] the running realm's Function.prototype, read through ctx.interp
+                // (code a shared stub holds embeds no heap address).
+                let site = self.check_exit(n)?;
+                let pc = graph.state(node.state.expect("checked")).pc;
+                let offset = self.ilayout.function_proto;
+                if !self.ilayout.valid || !offset.is_multiple_of(8) || offset / 8 >= 4096 {
+                    return Err(Refusal::at(
+                        pc as usize,
+                        "a Function.prototype out of reach",
+                    ));
+                }
+                let layout = self.layout;
+                let obj = layout.obj_from_cell;
+                let cell = self.gp(input(0), X16);
+                self.a.ldrb_imm(X17, cell, (obj + layout.obj_kind) as u32);
+                self.a
+                    .cmp_imm_w(X17, crate::value::KIND_EXOTIC_NONE_LAST as u32);
+                self.a.b_cond(HI, site);
+                self.a.ldrb_imm(X17, cell, (obj + layout.obj_flags) as u32);
+                self.a.tbz(X17, flag_bit(crate::value::FLAG_IC_PLAIN), site);
+                self.a
+                    .tbz(X17, flag_bit(crate::value::FLAG_CONSTRUCTOR), site);
+                self.a.ldr_imm(X17, cell, (obj + layout.obj_proto) as u32);
+                self.a
+                    .ldr_imm(X9, 19, std::mem::offset_of!(JitCtx, interp) as u32);
+                self.a.ldr_imm(X9, X9, offset as u32);
+                self.a.cmp_reg_x(X17, X9);
+                self.a.b_cond(NE, site);
+            }
+            NodeOp::HasInPrototypeChain => {
+                // OrdinaryHasInstance's walk as the template's (jit.rs emit_instanceof_inline):
+                // no object is false; each holder's kind byte and [[Prototype]] read together, a
+                // Proxy exits before its trap could run, a null [[Prototype]] is false, the
+                // prototype's cell is true. The walk keeps X9 (the holder) and X30 (its kind);
+                // the result is written last, so it may share an input's register.
+                let site = self.check_exit(n)?;
+                let layout = self.layout;
+                let obj = layout.obj_from_cell;
+                let word = self.gp(input(0), X16);
+                let target = self.gp(input(1), X17);
+                let walk = self.a.new_label();
+                let no = self.a.new_label();
+                let done = self.a.new_label();
+                // The Object tag 0xfff9 is -7 as a signed half.
+                self.a.asr_imm(X9, word, 48);
+                self.a.cmn_imm_x(X9, 7);
+                self.a.b_cond(NE, no);
+                self.a.ubfx(X9, word, 0, 48);
+                self.a.bind(walk);
+                self.a.ldrb_imm(X30, X9, (obj + layout.obj_kind) as u32);
+                self.a.ldr_imm(X9, X9, (obj + layout.obj_proto) as u32);
+                self.a.tbnz(X30, crate::value::KIND_PROXY_BIT, site);
+                self.a.cbz(X9, true, no);
+                self.a.cmp_reg_x(X9, target);
+                self.a.b_cond(NE, walk);
+                let dst = self.gp_dst(n);
+                self.a.movz(dst, 1, 0);
+                self.a.b(done);
+                self.a.bind(no);
+                self.a.movz(dst, 0, 0);
+                self.a.bind(done);
+                self.gp_done(n, dst);
             }
             NodeOp::CheckCreatable { ways } | NodeOp::CheckNoProto { ways } => {
                 let site = self.check_exit(n)?;

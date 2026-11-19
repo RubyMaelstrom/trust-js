@@ -697,6 +697,8 @@ fn heap_write(op: &NodeOp) -> HeapWrite {
         | NodeOp::CheckStringProto { .. }
         | NodeOp::CheckCreatable { .. }
         | NodeOp::CheckNoProto { .. }
+        | NodeOp::CheckCtor
+        | NodeOp::HasInPrototypeChain
         | NodeOp::CheckBoolean
         | NodeOp::ShapeIs { .. }
         | NodeOp::CheckCallee { .. }
@@ -1118,6 +1120,8 @@ fn signature(op: &NodeOp) -> Option<(&'static [Rep], Rep)> {
         NodeOp::CheckProto { .. } => (CELL, Rep::Cell),
         NodeOp::CheckStringProto { .. } => (TAGGED, Rep::Cell),
         NodeOp::CheckCreatable { .. } | NodeOp::CheckNoProto { .. } => (CELL, Rep::None),
+        NodeOp::CheckCtor => (CELL, Rep::None),
+        NodeOp::HasInPrototypeChain => (&[Rep::Tagged, Rep::Cell], Rep::Bool),
         NodeOp::ShapeIs(_) => (CELL, Rep::Bool),
         NodeOp::CheckBoolean | NodeOp::ToBoolean => (TAGGED, Rep::Bool),
         NodeOp::F64ToBoolean => (F64, Rep::Bool),

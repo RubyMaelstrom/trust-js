@@ -9027,13 +9027,35 @@ impl Interp {
             _ => None,
         };
         let out = self.instanceof(l, r)?;
+        // The optimizing tier's teacher for the site (P3 stage 3, graph piece 3): a filled cell is
+        // marked generic once a right-hand side fails its guards, as V8's InstanceOf feedback
+        // holds one callable or none (maglev-reducer-inl.h:2942-2950). `fill` already tested the
+        // template's guards on this right-hand side (a plain constructor of a cacheable shape
+        // whose [[Prototype]] is Function.prototype, no own @@hasInstance, `prototype` a data
+        // object): it fails them when it is no such constructor or its shape is another. A
+        // primitive or proxied left-hand side under a matching right-hand side is no mismatch.
+        // The mark stays once set (nothing clears it, as the named sites' IC_MID_GENERIC); no
+        // template reads it (jit.rs emit_instanceof_inline reads the depth, shape and slot).
+        let marked = cached.mid_ok & crate::bytecode::IC_MID_GENERIC != 0;
+        let generic = cached.depth == 0
+            && (marked || fill.is_none_or(|(shape, _, _)| shape != cached.recv_shape));
+        if generic && !marked && fill.is_none() {
+            cache.set(crate::bytecode::IcState {
+                mid_ok: cached.mid_ok | crate::bytecode::IC_MID_GENERIC,
+                ..cached
+            });
+        }
         if let Some((shape, slot, loc)) = fill {
             cache.set(crate::bytecode::IcState {
                 recv_shape: shape,
                 holder_shape: shape,
                 slot,
                 depth: 0,
-                mid_ok: 0,
+                mid_ok: if generic {
+                    crate::bytecode::IC_MID_GENERIC
+                } else {
+                    0
+                },
                 loc,
                 mid_shape: 0,
                 mid2_shape: 0,

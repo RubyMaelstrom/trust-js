@@ -83,9 +83,59 @@ pub(crate) struct Snapshot {
     /// The creation ways' chains (see [`CreationChain`]), by pc, ascending; empty where no
     /// creation way's prototype is alive or the snapshot read no realm.
     chains: Box<[(u32, Box<[CreationChain]>)]>,
+    /// The InstanceOf sites' cells (see [`InstanceOfView`]), by pc, ascending.
+    instance_ofs: Box<[(u32, InstanceOfView)]>,
     /// An embedder had observed some buffer of the realm's Agent (the protector, see
     /// [`Snapshot::buffers_observed`]).
     buffers_observed: bool,
+}
+
+/// An InstanceOf site's cell as the first stage filled it (P3 stage 3, graph piece 3): the
+/// right-hand side's shape (a plain constructor of a cacheable shape whose [[Prototype]] was the
+/// realm's Function.prototype and which held no own @@hasInstance), its `prototype` data slot
+/// (location and slot, a named way's encoding), and the cell's generic mark (IC_MID_GENERIC: some
+/// execution's right-hand side failed a filled cell's guards). Eval.rs `Interp::instanceof_ic`
+/// fills it; SpiderMonkey's InstanceOf stub holds the same facts (jit/CacheIR.cpp:5753-5842).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct InstanceOfView {
+    pub(crate) shape: u32,
+    pub(crate) location: u16,
+    pub(crate) slot: u32,
+    pub(crate) generic: bool,
+}
+
+/// The filled InstanceOf cells of `chunk`'s operations (main thread).
+fn instance_ofs(chunk: &Chunk, ops: &[Op], out: &mut Vec<(u32, InstanceOfView)>) {
+    out.clear();
+    for (pc, op) in ops.iter().enumerate() {
+        let Op::InstanceOf(cache) = *op else {
+            continue;
+        };
+        // A transformed (spliced) chunk's site reads its baseline's cell through the record map,
+        // as its value and element sites read their baselines' records (copy_feedback_into).
+        let mapped = chunk
+            .feedback_vector()
+            .record_map()
+            .and_then(|map| map.target(pc))
+            .map(|(baseline, at)| match baseline.jit_ops().get(at) {
+                Some(&Op::InstanceOf(cache)) => baseline.cache_state(cache),
+                _ => None,
+            });
+        let Some(state) = mapped.unwrap_or_else(|| chunk.cache_state(cache)) else {
+            continue;
+        };
+        if state.depth == 0 {
+            out.push((
+                pc as u32,
+                InstanceOfView {
+                    shape: state.recv_shape,
+                    location: state.loc,
+                    slot: state.slot,
+                    generic: state.mid_ok & crate::bytecode::IC_MID_GENERIC != 0,
+                },
+            ));
+        }
+    }
 }
 
 /// The prototype chain of a creation way's receiver as the main thread walked it at the
@@ -306,6 +356,8 @@ pub(crate) struct Raw {
     declined: Box<[(u32, u8)]>,
     /// The creation ways' chains (see [`CreationChain`]; made afresh where there are any).
     chains: Vec<(u32, Box<[CreationChain]>)>,
+    /// The InstanceOf sites' cells (see [`InstanceOfView`]).
+    instance_ofs: Vec<(u32, InstanceOfView)>,
     /// An embedder had observed some buffer of the realm's Agent (`BufferLedger::any_observed`,
     /// P3 stage 3 step L4): the protector read on the main thread.
     buffers_observed: bool,
@@ -346,6 +398,7 @@ impl Raw {
         chunk.copy_feedback_into(&mut self.feedback);
         self.buffers_observed =
             realm.is_some_and(|realm| realm.gc_heap.agent.buffer_ledger.any_observed());
+        instance_ofs(chunk, ops, &mut self.instance_ofs);
         self.chains.clear();
         if let Some(realm) = realm {
             for (pc, op) in ops.iter().enumerate() {
@@ -520,6 +573,7 @@ impl Snapshot {
             may_hold: any(!GENERIC_INELIGIBLE),
             names: names.into_boxed_slice(),
             chains: raw.chains.clone().into_boxed_slice(),
+            instance_ofs: raw.instance_ofs.clone().into_boxed_slice(),
             buffers_observed: raw.buffers_observed,
         }
     }
@@ -528,6 +582,14 @@ impl Snapshot {
     /// stage 3 step L4): the builder then books every typed store, speculating on nothing.
     pub(crate) fn buffers_observed(&self) -> bool {
         self.buffers_observed
+    }
+
+    /// The InstanceOf cell at `pc` where the first stage filled it (see [`InstanceOfView`]).
+    pub(crate) fn instance_of(&self, pc: usize) -> Option<InstanceOfView> {
+        self.instance_ofs
+            .binary_search_by_key(&(pc as u32), |&(at, _)| at)
+            .ok()
+            .map(|at| self.instance_ofs[at].1)
     }
 
     /// The chains of the creation ways of the named store at `pc` whose prototypes the snapshot
