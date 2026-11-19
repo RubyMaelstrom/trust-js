@@ -13691,7 +13691,163 @@ fn emit_direct_call(
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
+#[allow(clippy::too_many_arguments)]
 fn emit_direct_sequence(
+    a: &mut asm::Asm,
+    ilayout: &crate::interpreter::InterpLayout,
+    layout: &crate::value::JitLayout,
+    attempted_off: usize,
+    runs_off: usize,
+    retry_off: usize,
+    argc: usize,
+    form: DirectForm,
+    hit_slow: usize,
+    l_unwind: usize,
+    done: usize,
+    finish_stub: usize,
+    call_site: DirectCallSite,
+) -> bool {
+    emit_direct_sequence_with(
+        a,
+        ilayout,
+        layout,
+        attempted_off,
+        runs_off,
+        retry_off,
+        argc,
+        form,
+        hit_slow,
+        l_unwind,
+        done,
+        finish_stub,
+        call_site,
+        None,
+    )
+}
+
+/// The optimizing tier's direct call of a known callee (P3 stage 3 step 7, P1): the direct
+/// sequence's known form for the call at `pc` of `chunk` (its frame's chunk), entered with the
+/// call's operand words in place and x20 above them, as the call's template is; any gate it
+/// fails takes `slow`, where the caller emits the call's template, and a finished call lands on
+/// `done` with the result pushed, as the template's direct path does. False where the form
+/// does not apply (nothing emitted).
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_known_sequence<C: JitChunk + ?Sized>(
+    a: &mut asm::Asm,
+    chunk: &C,
+    layout: &crate::value::JitLayout,
+    ilayout: &crate::interpreter::InterpLayout,
+    pc: usize,
+    fast: u32,
+    l_unwind: usize,
+    l_direct_finish: usize,
+    known: KnownCallee,
+    slow: usize,
+    done: usize,
+) -> bool {
+    use crate::bytecode::Op;
+    let (argc, cache, with_this) = match chunk.jit_ops()[pc] {
+        Op::Call(argc, cache) => (argc, cache, false),
+        Op::CallWithThis(argc, cache) => (argc, cache, true),
+        _ => return false,
+    };
+    if fast & (1 << 20) == 0 || !crate::bytecode::direct_shared_context_enabled() {
+        return false;
+    }
+    let returned = a.new_label();
+    let emitted = emit_direct_sequence_with(
+        a,
+        ilayout,
+        layout,
+        chunk.jit_inline_attempted_off(),
+        chunk.jit_runs_off(),
+        chunk.jit_inline_retry_at_off(),
+        usize::from(argc),
+        DirectForm::Call { with_this },
+        slow,
+        l_unwind,
+        returned,
+        l_direct_finish,
+        DirectCallSite::Position(chunk.call_position(cache)),
+        Some(known),
+    );
+    if emitted {
+        // The call template's tail, as every completed form of the call runs it
+        // (`emit_call_inline_marked`): the test builds' note, then the end poll.
+        a.bind(returned);
+        #[cfg(test)]
+        if CALL_DONE_HOOK.with(Cell::get) {
+            a.mov(0, 19);
+            a.mov_imm64(16, note_call_done as *const () as u64);
+            a.blr(16);
+        }
+        emit_helper_end_poll(a, l_unwind);
+        a.b(done);
+    }
+    emitted
+}
+
+/// What the direct sequence's known form knows of its callee at compile time (P3 stage 3 step
+/// 7, P1; the optimizing tier's direct call of a known callee, `opt::view::CalledWay`): its
+/// identity, chunk, closure environment, frame and strictness, and the address of its chunk's
+/// code slot's entry word, from which every call reads the callee's current code
+/// (`jit::cache::EntryWord`), as V8's CallKnownJSFunction loads its callee's dispatch-table
+/// entry (codegen/arm64/macro-assembler-arm64.cc:2534-2545) and SpiderMonkey's visitCallKnown
+/// its script's jitCodeRaw (jit/CodeGenerator.cpp:7342). No code address is embedded.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct KnownCallee {
+    pub(crate) callee: usize,
+    pub(crate) chunk: usize,
+    pub(crate) entry: usize,
+    pub(crate) env: usize,
+    pub(crate) n_params: u16,
+    pub(crate) n_slots: u16,
+    pub(crate) strict: bool,
+    /// The static gates left to the call: the caller's global body, and a sloppy callee's
+    /// object receiver (a [[Call]] with a receiver word).
+    pub(crate) needs_global: bool,
+    pub(crate) sloppy_this: bool,
+    /// The labels of literal words holding `entry`, `callee`, `chunk` and `env`, one load each
+    /// (the optimizing tier's literal pool, as V8's arm64 loads an embedded object), or
+    /// `usize::MAX` for a word to materialize.
+    pub(crate) literals: [usize; 4],
+}
+
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+impl KnownCallee {
+    /// Load word `k` of [`KnownCallee::literals`]' order (0 entry, 1 callee, 2 chunk, 3 env).
+    fn load(&self, a: &mut asm::Asm, rd: u32, k: usize) {
+        let value = [self.entry, self.callee, self.chunk, self.env][k];
+        match self.literals[k] {
+            usize::MAX => a.mov_imm64(rd, value as u64),
+            label => a.ldr_literal_label(rd, label),
+        }
+    }
+}
+
+/// [`emit_direct_sequence`], or with `known` its known form (a [[Call]] only): the call site's
+/// whole contract with its callee's frame (P3 stage 3 step 7: the arguments placed, the entry
+/// loaded, the callee entered, the result taken), so that the frame can change under it in one
+/// place. The known form's entry state: x20 the operand top, nothing else; it sets x12 to the
+/// entry word and x10 to the callee, and drops what the callee's identity makes a compile-time
+/// fact: the way's probe (the caller's guard proved the callee), the static gates (the way fill's
+/// ready bit, `opt::oracle::called_ways`), the attempted gate (the one-shot byte was set at the
+/// compile), the entry-word compare (the entry is read where it lives), the environment's
+/// source, the parameter and slot counts' loads, and the arrow test (an arrow reads its new.target from its environment, never from the word the test keeps). A zero entry word (no code,
+/// or a superseded chunk) takes `hit_slow`, the template's call.
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[allow(clippy::too_many_arguments)]
+fn emit_direct_sequence_with(
     a: &mut asm::Asm,
     ilayout: &crate::interpreter::InterpLayout,
     // A stored handle word is the cell's `Gc::as_ptr` identity: FnFrame.fn_ptr records the
@@ -13715,9 +13871,13 @@ fn emit_direct_sequence(
     finish_stub: usize,
     // Where the call's source position comes from (the callee's `FnFrame::call_site`).
     call_site: DirectCallSite,
+    known: Option<KnownCallee>,
 ) -> bool {
     use std::mem::offset_of;
     if !direct_call_supported(ilayout, layout, attempted_off, runs_off, retry_off, argc) {
+        return false;
+    }
+    if known.is_some() && !matches!(form, DirectForm::Call { .. }) {
         return false;
     }
     let (with_this, construct) = match form {
@@ -13784,15 +13944,42 @@ fn emit_direct_sequence(
     // without it checks them one by one after the sequence, then rejoins here.
     let static_gates = a.new_label();
     let static_done = a.new_label();
-    a.ldurb(9, 12, IC_DIRECT);
-    let ready = asm::logical_imm_w(crate::bytecode::CALL_IC_DIRECT_READY as u32).unwrap();
-    a.logic_imm_w(0, 11, 9, ready);
-    a.cbz(11, false, static_gates);
+    if let Some(k) = known {
+        // The known form (P3 stage 3 step 7, P1): x12 the callee's entry word, its code's
+        // address zero where the call must take the template's (no code, or superseded); x10
+        // the callee's cell, which the caller's guard proved.
+        const _: () = assert!(std::mem::offset_of!(cache::EntryWord, code) == 0);
+        k.load(a, 12, 0);
+        a.ldr_imm(4, 12, 0);
+        a.cbz(4, true, hit_slow);
+        if k.needs_global {
+            a.ldr_imm(11, 19, 56); // ctx.global_body
+            a.cbz(11, true, hit_slow);
+        }
+        if k.sloppy_this {
+            debug_assert!(
+                with_this,
+                "a sloppy callee that reads `this` needs the receiver"
+            );
+            a.sub_imm(9, 20, ((argc + 2) * 8) as u32);
+            a.ldr_imm(9, 9, 0);
+            emit_exec_tag_guard(a, 9, crate::value::PACK_OBJ, 11, hit_slow);
+        }
+        k.load(a, 10, 1);
+    } else {
+        a.ldurb(9, 12, IC_DIRECT);
+        let ready = asm::logical_imm_w(crate::bytecode::CALL_IC_DIRECT_READY as u32).unwrap();
+        a.logic_imm_w(0, 11, 9, ready);
+        a.cbz(11, false, static_gates);
+    }
     a.bind(static_done);
     // x4 = the callee's chunk, kept for the retry gate below.
-    let compares_entry = a.compares_entry_words();
-    a.ldur(4, 12, IC_CHUNK_RAW);
-    if !allocates {
+    let compares_entry = a.compares_entry_words() && known.is_none();
+    match known {
+        Some(k) => k.load(a, 4, 2),
+        None => a.ldur(4, 12, IC_CHUNK_RAW),
+    }
+    if !allocates && known.is_none() {
         // recompile settled (live chunk byte — see attempted_off). A construct waits for no
         // attempt: it counts from its first run (below), and its code's first checkpoint is
         // that attempt. So does a forwarder's initializer, which the Rust forwarder may never
@@ -13946,7 +14133,9 @@ fn emit_direct_sequence(
     // identity hit's way recorded exactly this closure's environment; a code-keyed hit
     // (CALL_CODE_HIT in x15) matched another closure of the same function, so read the LIVE
     // closure's (x10 is the stored callee pointer).
-    if call_env_from_callee {
+    if let Some(k) = known {
+        k.load(a, 13, 3);
+    } else if call_env_from_callee {
         let code_env = a.new_label();
         let env_done = a.new_label();
         let code_bit = asm::logical_imm_w(CALL_CODE_HIT).unwrap();
@@ -14005,8 +14194,14 @@ fn emit_direct_sequence(
     }
     // The callee's code is entered: its CLOCK reference word takes this site's call-cache address,
     // a nonzero word (`JitCode::referenced`).
-    a.ldur(4, 12, IC_CODE);
-    a.str_imm(12, 4, JIT_CODE_REFERENCED_OFF);
+    if known.is_some() {
+        // The entry's code, referenced for the code cache's CLOCK by its own (nonzero) address.
+        a.ldr_imm(4, 12, 0);
+        a.str_imm(4, 4, JIT_CODE_REFERENCED_OFF);
+    } else {
+        a.ldur(4, 12, IC_CODE);
+        a.str_imm(12, 4, JIT_CODE_REFERENCED_OFF);
+    }
     a.add_imm(11, 11, 1);
     a.str_w_imm(11, 14, il.depth as u32); // depth++ (u32 field)
                                           // FnFrame push: entry = ptr + len*24
@@ -14037,7 +14232,10 @@ fn emit_direct_sequence(
         }
     }
     a.str_w_imm(5, 6, 8); // call_site
-    a.ldrb_imm(5, 12, IC_STRICT);
+    match known {
+        Some(k) => a.movz(5, u32::from(k.strict), 0),
+        None => a.ldrb_imm(5, 12, IC_STRICT),
+    }
     if construct {
         // The frame runs a [[Construct]] (stack traces print `new name`).
         a.logic_imm_w(1, 5, 5, asm::logical_imm_w(1 << 8).unwrap());
@@ -14060,9 +14258,20 @@ fn emit_direct_sequence(
     let surplus = a.new_label();
     let init_body = a.new_label();
     let init_done = a.new_label();
-    a.ldrh_imm(6, 12, IC_NPARAMS);
-    a.cmp_imm_w(6, argc as u32);
-    a.b_cond(C_LO, surplus);
+    match known {
+        Some(k) => {
+            // The surplus path reads the parameter count in w6.
+            if usize::from(k.n_params) < argc {
+                a.movz(6, u32::from(k.n_params), 0);
+                a.b(surplus);
+            }
+        }
+        None => {
+            a.ldrh_imm(6, 12, IC_NPARAMS);
+            a.cmp_imm_w(6, argc as u32);
+            a.b_cond(C_LO, surplus);
+        }
+    }
     for k in (0..argc - argc % 2).step_by(2) {
         a.ldp_base(4, 3, 20, -(((argc - k) * 8) as i32));
         a.stp_base(4, 3, 15, (k * 8) as i32);
@@ -14073,9 +14282,21 @@ fn emit_direct_sequence(
     }
     // Initialize every remaining local, from slot argc, to a complete packed Undefined word;
     // x5 = n_slots survives for the installation below.
-    a.ldrh_imm(5, 12, IC_NSLOTS);
-    a.subs_imm_w(4, 5, argc as u32);
-    a.b_cond(C_LS, init_done); // n_slots <= argc: nothing left
+    match known {
+        Some(k) => {
+            a.movz(5, u32::from(k.n_slots), 0);
+            if usize::from(k.n_slots) <= argc {
+                a.b(init_done);
+            } else {
+                a.movz(4, u32::from(k.n_slots) - argc as u32, 0);
+            }
+        }
+        None => {
+            a.ldrh_imm(5, 12, IC_NSLOTS);
+            a.subs_imm_w(4, 5, argc as u32);
+            a.b_cond(C_LS, init_done); // n_slots <= argc: nothing left
+        }
+    }
     a.add_imm(3, 15, (argc * 8) as u32);
     // w4 words from x3: four per iteration (two STPs), then a pair and a single word for the
     // remainder.
@@ -14120,9 +14341,19 @@ fn emit_direct_sequence(
     a.ldr_imm(6, 13, layout.scope_parent as u32);
     a.str_imm(6, 9, cx_env_parent_raw);
     // Adjacent fields move in pairs: chunk and n_slots (x5), code base and pc offsets.
-    a.ldur(4, 12, IC_CHUNK_RAW);
+    match known {
+        Some(k) => k.load(a, 4, 2),
+        None => a.ldur(4, 12, IC_CHUNK_RAW),
+    }
     a.stp_base(4, 5, 9, cx_chunk as i32);
-    a.ldp_base(4, 6, 12, IC_CODE_MEM);
+    const _: () = assert!(
+        std::mem::offset_of!(cache::EntryWord, pc_offs)
+            == std::mem::offset_of!(cache::EntryWord, mem) + 8
+    );
+    match known {
+        Some(_) => a.ldp_base(4, 6, 12, std::mem::offset_of!(cache::EntryWord, mem) as i32),
+        None => a.ldp_base(4, 6, 12, IC_CODE_MEM),
+    }
     a.stp_base(4, 6, 9, cx_code_base as i32);
     // Same Realm as the caller (the probe compared genv): its global body and scope.
     a.ldp_base(4, 6, 19, 56);
@@ -14154,7 +14385,10 @@ fn emit_direct_sequence(
         // The argument count, as V8 passes it in a register on every call (Decision 20d): a
         // callee that needs its arguments finds them under this frame's operand top.
         a.movz(1, argc as u32, 0);
-        a.ldur(16, 12, IC_CODE_MEM);
+        match known {
+            Some(_) => a.ldr_imm(16, 12, std::mem::offset_of!(cache::EntryWord, mem) as u32),
+            None => a.ldur(16, 12, IC_CODE_MEM),
+        }
         a.blr(16);
         // w0 = 1 ok / 0 threw → w1 = threw for the finish stub.
         let field1 = asm::logical_imm_w(1).unwrap();
@@ -14350,10 +14584,19 @@ fn emit_direct_sequence(
         a.stur(4, 31, 16);
         a.stur(31, 31, 24); // initialized padding cannot retain a stale conservative root
         let lexical_target = a.new_label();
-        a.ldurb(4, 12, IC_DIRECT);
-        let lexical_bit = asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
-        a.logic_imm_w(0, 4, 4, lexical_bit);
-        a.cbnz(4, false, lexical_target);
+        // The known form clears the word for an arrow too: an arrow reads its new.target from its
+        // environment, never from this word (`lean_new_target` is false for every arrow,
+        // bytecode.rs's compile), so the template's arrow test keeps nothing a known callee reads.
+        match known {
+            Some(_) => {}
+            None => {
+                a.ldurb(4, 12, IC_DIRECT);
+                let lexical_bit =
+                    asm::logical_imm_w(crate::bytecode::CALL_IC_LEXICAL_THIS as u32).unwrap();
+                a.logic_imm_w(0, 4, 4, lexical_bit);
+                a.cbnz(4, false, lexical_target);
+            }
+        }
         a.mov_imm64(4, crate::value::PACK_UNDEFINED);
         a.str_imm(4, 14, il.new_target as u32); // ordinary calls clear the complete word
         a.bind(lexical_target); // arrows retain their lexical function environment's new.target
@@ -14487,7 +14730,10 @@ fn emit_direct_sequence(
         a.b(move_loop);
         a.bind(move_done);
     }
-    a.ldrh_imm(5, 12, IC_NSLOTS);
+    match known {
+        Some(k) => a.movz(5, u32::from(k.n_slots), 0),
+        None => a.ldrh_imm(5, 12, IC_NSLOTS),
+    }
     a.subs_reg_w(4, 5, 6);
     a.b_cond(C_LS, init_done); // n_slots <= n_params: nothing left
     a.add_shifted(3, 15, 6, 3);

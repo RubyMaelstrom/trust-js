@@ -30,7 +30,30 @@ enum CodeState {
     Resident(Rc<JitCode>),
 }
 
+/// The slot's current entry (P3 stage 3 step 7): what a direct call from the optimizing tier's
+/// code enters, read by that code at every call through the slot's address, as V8's calls read
+/// a function's dispatch-table entry (src/sandbox/js-dispatch-table.h, the class comment: "only
+/// the entry needs to be updated") and SpiderMonkey's its script's jitCodeRaw
+/// (jit/MacroAssembler.cpp:4265-4276). `code` is the resident code's address (`Rc::as_ptr`) and
+/// `mem` and `pc_offs` its entry and pc table (`JitCode::mem_ptr`, `JitCode::pc_offsets_ptr`);
+/// all three zero when the slot holds no code a call may enter (cold, pending, unavailable, or
+/// its chunk superseded): the caller then takes the template's call. Every change of the
+/// slot's code writes it under the same borrow, before the code it held can be retired or
+/// freed, so a stale entry is never read (a stale entry would be a jump into freed code).
+#[repr(C)]
+#[derive(Default)]
+pub(crate) struct EntryWord {
+    pub(crate) code: Cell<usize>,
+    pub(crate) mem: Cell<usize>,
+    pub(crate) pc_offs: Cell<usize>,
+}
+
 struct SlotState {
+    /// The slot's current entry (see [`EntryWord`]).
+    entry: EntryWord,
+    /// Whether a direct call may enter the resident code: cleared while the chunk is superseded
+    /// by a newer chunk of its function (`Chunk::supersede`), whose code a call should run.
+    enterable: Cell<bool>,
     code: RefCell<CodeState>,
     registration: Cell<u32>,
     evictions: Cell<u8>,
@@ -44,6 +67,8 @@ struct SlotState {
 impl Default for SlotState {
     fn default() -> Self {
         Self {
+            entry: EntryWord::default(),
+            enterable: Cell::new(true),
             code: RefCell::new(CodeState::Cold),
             registration: Cell::new(NO_REGISTRATION),
             evictions: Cell::new(0),
@@ -54,6 +79,25 @@ impl Default for SlotState {
 }
 
 impl SlotState {
+    /// The entry word for `code`, the slot's code after a change (None: no code to enter).
+    fn publish(&self, code: Option<&Rc<JitCode>>) {
+        // A code a call enters fresh (not a borrowed or loop-fragment entry), as the call ways'.
+        let code = code.filter(|code| {
+            self.enterable.get() && code.entry_kind == super::NativeEntryKind::FreshFrame
+        });
+        let (code, mem, pc_offs) = match code {
+            Some(code) => (
+                Rc::as_ptr(code) as usize,
+                code.mem_ptr() as usize,
+                code.pc_offsets_ptr() as usize,
+            ),
+            None => (0, 0, 0),
+        };
+        self.entry.code.set(code);
+        self.entry.mem.set(mem);
+        self.entry.pc_offs.set(pc_offs);
+    }
+
     /// `code` becomes resident: its operand depth counts toward the slot's bound.
     fn note_max_stack(&self, code: &JitCode) {
         let stack = u32::try_from(code.max_stack).unwrap_or(u32::MAX);
@@ -137,9 +181,13 @@ impl NativeCodeSlot {
             Some(code) => {
                 code.referenced.set(1);
                 state.note_max_stack(&code);
+                state.publish(Some(&code));
                 CodeState::Resident(code)
             }
-            None => CodeState::Unavailable,
+            None => {
+                state.publish(None);
+                CodeState::Unavailable
+            }
         };
         let CodeState::Resident(old) = std::mem::replace(&mut *contents, next) else {
             unreachable!("checked: resident")
@@ -166,6 +214,7 @@ impl NativeCodeSlot {
         let CodeState::Resident(code) = std::mem::take(&mut *contents) else {
             unreachable!("checked: resident")
         };
+        state.publish(None);
         drop(contents);
         state.cooldown.set(0);
         let mut retired = Retirement::default();
@@ -178,6 +227,25 @@ impl NativeCodeSlot {
         });
         retired.finish();
         Some(code)
+    }
+
+    /// The address of the slot's entry word ([`EntryWord`]), which lives as long as the slot's
+    /// chunk; None before the slot's first compile.
+    pub(crate) fn entry_word(&self) -> Option<&EntryWord> {
+        self.state.get().map(|state| &state.entry)
+    }
+
+    /// Whether a direct call may enter the slot's resident code (see `SlotState::enterable`): a
+    /// superseded chunk's slot is not; its entry word becomes zero, or the resident code's again.
+    pub(crate) fn set_enterable(&self, enterable: bool) {
+        let Some(state) = self.state.get() else {
+            return;
+        };
+        state.enterable.set(enterable);
+        match &*state.code.borrow() {
+            CodeState::Resident(code) => state.publish(Some(code)),
+            _ => state.publish(None),
+        }
     }
 
     /// No compile was ever attempted for this slot (nothing resident, pending or reclaimed).
@@ -244,11 +312,13 @@ impl CompilePermit {
         if let Some(code) = code {
             code.referenced.set(1);
             state.note_max_stack(&code);
+            state.publish(Some(&code));
             *state.code.borrow_mut() = CodeState::Resident(code);
             REGISTRY.with(|registry| registry.borrow_mut().pending -= 1);
         } else {
             // Structural unavailability is permanent; allocation/pressure
             // failures instead leave the permit uncommitted and retryable.
+            state.publish(None);
             *state.code.borrow_mut() = CodeState::Unavailable;
             release_reservation(&state);
         }
@@ -259,6 +329,7 @@ impl Drop for CompilePermit {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
             debug_assert!(matches!(*state.code.borrow(), CodeState::Pending));
+            state.publish(None);
             *state.code.borrow_mut() = CodeState::Cold;
             release_reservation(&state);
         }
@@ -436,6 +507,7 @@ impl Registry {
                         let CodeState::Resident(code) = std::mem::take(&mut *contents) else {
                             unreachable!()
                         };
+                        state.publish(None);
                         bytes = bytes.saturating_add(retired.push_code(code));
                         let count = state.evictions.get().saturating_add(1);
                         state.evictions.set(count);

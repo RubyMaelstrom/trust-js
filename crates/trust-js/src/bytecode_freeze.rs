@@ -102,6 +102,7 @@ impl Chunk {
             .sort_unstable_by_key(|&(name, _)| name);
         view.resolution_sites.dedup_by_key(|&mut (name, _)| name);
         view.inline_targets.clear();
+        view.called.clear();
         view.inline_targets
             .extend(self.inline_targets.iter().enumerate().map(|(t, target)| {
                 InlineTargetView {

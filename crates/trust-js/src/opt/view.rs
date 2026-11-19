@@ -63,6 +63,45 @@ pub(crate) struct InlineTargetView {
     pub(crate) guard: u8,
 }
 
+/// A call site's known callee that the tier calls directly where it does not inline it (P3 stage
+/// 3 step 7, P1): Maglev's CallKnownJSFunction (maglev-ir.cc:7562-7598), JSC's DirectCall
+/// (DFGByteCodeParser.cpp:2681-2722), Ion's visitCallKnown (CodeGenerator.cpp:7307-7382). Words
+/// to embed, never to read off the main thread: the code pins the callee, whose identity the
+/// guard (`target`, a CheckCallee of the compiled view's inline targets, or F4's fold) proves
+/// before every call reads the entry word (`jit::cache::EntryWord`) of the callee's chunk, which
+/// the live callee's runtime holds in its set-once slot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CalledWay {
+    /// The call's cache index in this chunk.
+    pub(crate) cache: u32,
+    /// The guard's inline target in the compiled chunk's view.
+    pub(crate) target: u32,
+    /// The callee's identity (`Gc::as_ptr`), its chunk (`Rc::as_ptr`), the address of that
+    /// chunk's code slot's entry word, and the callee closure's [[Environment]].
+    pub(crate) callee: usize,
+    pub(crate) chunk: usize,
+    pub(crate) entry: usize,
+    pub(crate) env: usize,
+    /// The callee chunk's frame (`Chunk::jit_frame`) and its function's strictness.
+    pub(crate) n_params: u16,
+    pub(crate) n_slots: u16,
+    pub(crate) strict: bool,
+    /// The direct sequence's run-time static gates its callee needs: a global body in the
+    /// caller's context, an object receiver for a sloppy callee that reads `this`.
+    pub(crate) needs_global: bool,
+    pub(crate) sloppy_this: bool,
+}
+
+impl FrozenChunk {
+    /// The call site `cache`'s called way, if the preparation made one.
+    pub(crate) fn called_way(&self, cache: u32) -> Option<&CalledWay> {
+        self.called
+            .binary_search_by_key(&cache, |way| way.cache)
+            .ok()
+            .map(|k| &self.called[k])
+    }
+}
+
 /// The frozen view of a chunk (see the module's doc); empty by default, a husk whose vectors a
 /// freeze fills (`Chunk::freeze_into`).
 #[derive(Default)]
@@ -126,6 +165,10 @@ pub(crate) struct FrozenChunk {
     pub(crate) call_positions: Vec<u32>,
     pub(crate) construct_positions: Vec<u32>,
     pub(crate) inline_targets: Vec<InlineTargetView>,
+    /// The call sites of this chunk whose callee the tier calls directly when it does not inline
+    /// it (P3 stage 3 step 7, P1; `oracle::called_ways`), by call cache, ascending; filled on the
+    /// main thread at the compile's preparation, empty otherwise.
+    pub(crate) called: Vec<CalledWay>,
     /// The object literals' images' addresses, by template index; the constant array literals'
     /// by site; the MakeArrays' image's.
     pub(crate) object_images: Vec<usize>,

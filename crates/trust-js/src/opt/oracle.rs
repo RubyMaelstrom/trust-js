@@ -98,8 +98,28 @@ pub(crate) fn prepare(
         Request::Plan(plan) => plan,
         Request::Kept => kept_plan(chunk),
     };
+    let mut held = Held::default();
+    // The compiled frame's called ways (P3 stage 3 step 7, P1), whether or not anything is
+    // inlined.
+    let genv = Env::as_ptr(&i.global_env) as usize;
+    view.called = called_ways(i, chunk, genv, &mut view.inline_targets, &mut held);
+    if super::driver::log_enabled() && !view.called.is_empty() {
+        eprintln!(
+            "[opt] calls directly {} known callee(s) of {}",
+            view.called.len(),
+            view.label()
+        );
+    }
     if plan.is_empty() {
-        return None;
+        return (!view.called.is_empty()).then(|| {
+            (
+                InlineJob {
+                    sites: Vec::new(),
+                    callees: Vec::new(),
+                },
+                held,
+            )
+        });
     }
     // What the planner's budget leaves for the closure literals this chunk creates (P3 stage 3,
     // piece B), where it creates any.
@@ -126,7 +146,6 @@ pub(crate) fn prepare(
         .collect();
     let mut sites = Vec::new();
     let mut callees: Vec<JobMemory> = Vec::new();
-    let mut held = Held::default();
     let mut kept: Vec<KeptWay> = Vec::new();
     // Each way's inline site, in the order of the ways (`InlineWay::position`): the callee, no
     // position of its own (its frame's operations place a thrown error, `Interp::place_thrown`,
@@ -227,7 +246,113 @@ pub(crate) fn prepare(
     place(&mut sites, &positions);
     // The ways a reoptimization takes again (see the module's doc).
     ChunkProfile::of(chunk).set_inline_ways(kept);
-    (!sites.is_empty()).then_some((InlineJob { sites, callees }, held))
+    (!sites.is_empty() || !view.called.is_empty()).then_some((InlineJob { sites, callees }, held))
+}
+
+/// The called ways of `chunk`'s call sites (P3 stage 3 step 7, P1; the design note's section 4):
+/// a site whose record names one callee, a user function the template's way fill would make
+/// direct (the same tests: `Interp::call_jit_fast`, an ordinary closure of this Realm, not a
+/// class constructor, not under `with`, its current chunk's resident code entered fresh, not
+/// prepared, not resumable; `Chunk::jit_direct_flags`' ready bit) whose chunk's one-shot
+/// recompile was attempted (so that the direct sequence's attempted gate is a compile-time fact)
+/// and is not superseded, as Maglev's TryBuildCallKnownJSFunction calls every known callee it
+/// does not inline (maglev-graph-builder.cc:11086-11120). Each gets a guard (a CheckCallee
+/// target in `targets`, the compiled view's: the callee's identity and the Realm, place 0), the
+/// callee's pin (its chunk is the live callee's own). Main thread only.
+pub(crate) fn called_ways(
+    i: &Interp,
+    chunk: &Chunk,
+    genv: usize,
+    targets: &mut Vec<crate::opt::view::InlineTargetView>,
+    held: &mut Held,
+) -> Vec<crate::opt::view::CalledWay> {
+    use crate::value::ObjectKind;
+    let mut called = Vec::new();
+    for op in chunk.jit_ops() {
+        let (argc, cache, with_this) = match *op {
+            Op::Call(argc, cache) => (argc, cache, false),
+            Op::CallWithThis(argc, cache) => (argc, cache, true),
+            _ => continue,
+        };
+        let Some(obj) = chunk.call_site_single_callee(cache) else {
+            continue;
+        };
+        let object = obj.borrow();
+        let ObjectKind::User(user) = &object.kind else {
+            continue;
+        };
+        if !object.ic_plain()
+            || object.class_kind() != 0
+            || user.realm != crate::value::Gc::as_ptr(&i.global) as usize
+            || user.env.borrow().under_with()
+        {
+            continue;
+        }
+        let (func, env) = (user.func.clone(), user.env);
+        drop(object);
+        let runtime = func.runtime();
+        let Some(Some(callee_chunk)) = runtime.execution_code_for(genv) else {
+            continue;
+        };
+        let Some(Some(code)) = callee_chunk.jit.get() else {
+            continue;
+        };
+        let (n_params, n_slots) = callee_chunk.jit_frame();
+        // The direct sequence's static gates (`jit::emit_direct_sequence`'s static_gates): a
+        // compiled entry whose frame fits the pooled buffer; the global body a code that needs
+        // one reads, and a sloppy callee's object receiver, tested at the call.
+        let flags = callee_chunk.jit_direct_flags(&code);
+        let needs_global = flags & 2 != 0;
+        let sloppy_this = callee_chunk.needs_frame_this() && !callee_chunk.jit_is_strict();
+        if callee_chunk.prepared_entry
+            || callee_chunk.jit_is_resumable()
+            || callee_chunk.superseded()
+            || flags & (1 | 8) != (1 | 8)
+            || (sloppy_this && !with_this)
+            || !(callee_chunk.inline_attempted.get() || runtime.code2.get().is_some())
+            || n_params > u16::MAX as usize
+            || n_slots > u16::MAX as usize
+        {
+            continue;
+        }
+        let Some(entry) = callee_chunk.jit.entry_word() else {
+            continue;
+        };
+        if entry.code.get() == 0 {
+            continue;
+        }
+        targets.push(crate::opt::view::InlineTargetView {
+            argc,
+            check_this: false,
+            expected_env: 0,
+            expected_genv: genv,
+            callee: Some(crate::bytecode::stored_word(obj)),
+            env: Some(Env::as_ptr(&env) as usize),
+            guard: 1,
+        });
+        // The pin keeps the callee's address from reuse, so that the guard passes only while
+        // the callee lives; a live function's runtime holds this chunk in its set-once slot
+        // (`FunctionRuntime::execution_code_for`), so the entry word the call reads after the
+        // guard (or after F4's fold, whose validity word says the global still holds it) is
+        // live. The code holds no strong reference of its own to the chunk.
+        held.pins.push(crate::value::Gc::downgrade(&obj));
+        called.push(crate::opt::view::CalledWay {
+            cache,
+            target: (targets.len() - 1) as u32,
+            callee: crate::value::Gc::as_ptr(&obj) as usize,
+            chunk: Rc::as_ptr(callee_chunk) as usize,
+            entry: entry as *const crate::jit::cache::EntryWord as usize,
+            env: Env::as_ptr(&env) as usize,
+            n_params: n_params as u16,
+            n_slots: n_slots as u16,
+            strict: func.is_strict,
+            needs_global,
+            sloppy_this,
+        });
+    }
+    called.sort_unstable_by_key(|way| way.cache);
+    called.dedup_by_key(|way| way.cache);
+    called
 }
 
 /// A call site whose ways `Prep::way` takes (P3 stage 3 step 3d): its cache in its caller's
@@ -321,6 +446,18 @@ impl<M: FnMut() -> JobMemory> Prep<'_, '_, M> {
                 self.held.chunks.len() - 1
             }
         };
+        // A calling way's own view: its call sites' called ways (P3 stage 3 step 7, P1), their
+        // guards the compiled view's targets.
+        if !way.leaf {
+            let called = called_ways(
+                self.i,
+                &callee,
+                way.expected_genv,
+                &mut self.view.inline_targets,
+                self.held,
+            );
+            self.callees[index].0.called = called;
+        }
         let mut holders: Vec<(u16, usize)> = Vec::new();
         for hops in self.callees[index].1.running_hops() {
             if !holders.iter().any(|&(at, _)| at == hops) {

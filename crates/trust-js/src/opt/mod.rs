@@ -133,6 +133,12 @@ pub(crate) mod view;
 mod accessor_tests;
 #[cfg(test)]
 mod build_tests;
+#[cfg(all(
+    test,
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+mod called_tests;
 #[cfg(test)]
 mod equality_tests;
 #[cfg(all(

@@ -768,3 +768,72 @@ fn dead_code_owners_leave_unmatchable_call_ics_and_live_siblings_keep_sharing() 
         );
     }
 }
+
+/// P3 stage 3 step 7, P1: every change of a slot's code writes its entry word
+/// (`cache::EntryWord`), which the optimizing tier's direct calls read at every call, before the
+/// code the slot held can be retired or freed; zero means "no code to enter: take the template's
+/// call". The writers: a compile's commit, `replace_resident`, `discard`, the CLOCK eviction, and
+/// a supersession's `set_enterable`. (A rollback and a commit of no code leave a pending slot's
+/// zero word as it was: no test can tell their writes from none.)
+#[cfg(all(
+    target_arch = "aarch64",
+    any(target_os = "macos", target_os = "linux", target_os = "windows")
+))]
+#[test]
+fn every_change_of_a_slots_code_writes_its_entry_word() {
+    let mut e = engine();
+    eval(
+        &mut e,
+        "function f(x){return x+1;} function g(x){return x+2;} f(1); g(1);",
+    );
+    let f = chunk(&mut e.interp, "f");
+    let g = chunk(&mut e.interp, "g");
+    let word = |c: &Chunk| {
+        let w = c.jit.entry_word().expect("a compiled slot");
+        (w.code.get(), w.mem.get(), w.pc_offs.get())
+    };
+    let of = |code: &Rc<JitCode>| {
+        (
+            Rc::as_ptr(code) as usize,
+            code.mem_ptr() as usize,
+            code.pc_offsets_ptr() as usize,
+        )
+    };
+    // The commit.
+    let own = f.jit.get().flatten().expect("f's code");
+    assert_eq!(word(&f), of(&own), "the commit writes the word");
+    // replace_resident, both ways back.
+    let other = g.jit.get().flatten().expect("g's code");
+    let old = f
+        .jit
+        .replace_resident(Some(other.clone()))
+        .expect("resident");
+    assert_eq!(word(&f), of(&other), "replace_resident writes the word");
+    f.jit.replace_resident(Some(old.clone())).expect("resident");
+    assert_eq!(word(&f), of(&own));
+    // A supersession, and its end.
+    f.supersede();
+    assert_eq!(word(&f), (0, 0, 0), "a superseded chunk's word is zero");
+    f.unsupersede();
+    assert_eq!(
+        word(&f),
+        of(&own),
+        "the end of a supersession writes it again"
+    );
+    // A discard leaves the slot cold.
+    let discarded = f.jit.discard().expect("resident");
+    assert_eq!(word(&f), (0, 0, 0), "a discard clears the word");
+    // An unavailable slot's word is zero too.
+    g.jit.replace_resident(None).expect("g resident");
+    assert_eq!(word(&g), (0, 0, 0), "an unavailable slot's word is zero");
+    drop((discarded, old, own, other));
+    // A later compile commits again; then the CLOCK evicts it.
+    assert_eq!(eval(&mut e, "var r;for(var n=0;n<40;n++)r=f(n);r;"), "40");
+    let again = f.jit.get().flatten().expect("f recompiled");
+    assert_eq!(word(&f), of(&again));
+    drop(again);
+    cache::reclaim(usize::MAX);
+    cache::reclaim(usize::MAX);
+    assert!(f.jit.get().is_none(), "f's code evicted");
+    assert_eq!(word(&f), (0, 0, 0), "the eviction clears the word");
+}

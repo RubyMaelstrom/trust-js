@@ -255,6 +255,13 @@ comment/example in the same change.
   at its next test, once, and is discarded; three such discards and the function folds no
   global). `TRUST_JS_OPT_LOG` prints `[opt] folds <n> globals of <name>` per compile and, at
   exit, the invalidations among the global stores' census.
+  At `graph`, a call the tier does not inline whose site's record names one user function that
+  the template JIT's call would enter directly is the known callee's direct call (P3 stage 3
+  step 7): its identity guarded as an inlined callee's is (a WrongCallee exit, after which the
+  site's recompile calls generically), the callee's current code read at every call from its
+  chunk's code-slot entry word, which every install, discard, reoptimization, supersession and
+  eviction writes (zero: the call's template runs). `TRUST_JS_OPT_LOG` prints `[opt] calls
+  directly <n> known callee(s) of <name>` per compile that has such sites in its own frame.
   `TRUST_JS_OPT_INLINE` chooses how the tier inlines (P3 stage 3). `graph`, the default since
   2026-11-19 (any value but `splice` too), inlines in the tier's graph; `splice` keeps the
   splices above for every plan. At `graph`: a function whose inline plan's ways all call

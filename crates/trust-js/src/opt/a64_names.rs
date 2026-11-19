@@ -203,7 +203,7 @@ impl Gen<'_> {
     }
 
     /// The label of `word`'s literal (layer 4a), one per folded object a code loads.
-    fn folded_literal(&mut self, word: u64) -> usize {
+    pub(super) fn folded_literal(&mut self, word: u64) -> usize {
         if let Some(&(_, label)) = self.folded_literals.iter().find(|&&(w, _)| w == word) {
             return label;
         }

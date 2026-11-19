@@ -100,7 +100,7 @@ pub(crate) use inline::{E0_EFFECT, PAST_RECORD};
     target_arch = "aarch64",
     any(target_os = "macos", target_os = "linux", target_os = "windows")
 ))]
-pub(crate) use inline::{TEST_LITERAL_FRAMES, TEST_NESTED_FRAMES};
+pub(crate) use inline::{TEST_KNOWN_CALLS, TEST_LITERAL_FRAMES, TEST_NESTED_FRAMES};
 
 #[cfg(test)]
 thread_local! {

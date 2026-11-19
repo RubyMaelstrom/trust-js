@@ -17453,7 +17453,10 @@ impl Interp {
             // fallback (`opt::compile_in_place`).
             let chunk_rc = runtime_chunk(&runtime, chunk);
             drop(runtime);
-            crate::opt::compile_in_place(self, chunk, chunk_rc, function_weak(func), None);
+            // Under TRUST_JS_OPT_INLINE=graph the oracle runs with nothing to inline: the
+            // chunk's call sites may still call known callees directly (P3 stage 3 step 7, P1).
+            let plan = crate::opt::inline_graph().then(Default::default);
+            crate::opt::compile_in_place(self, chunk, chunk_rc, function_weak(func), plan);
             return;
         } else {
             crate::jit::perf_inline_plan_sites(plan.len());

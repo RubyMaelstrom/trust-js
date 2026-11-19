@@ -1261,6 +1261,10 @@ pub(crate) struct Graph {
     /// The loop headers that kept their entry's heap facts, each with what it kept (P3 stage 3
     /// step 0c, F4 part 1): the verifier's statement of the union rule (`verify::kept_heap`).
     pub(crate) kept: Vec<KeptHeap>,
+    /// The generic call nodes whose callee a guard proved, by frame and pc, with their callees
+    /// (P3 stage 3 step 7, P1): each lowers to the direct call of its known callee
+    /// (`jit::emit_known_call`), its template its slow path.
+    pub(crate) known_calls: Vec<(FrameIx, u32, super::view::CalledWay)>,
 }
 
 /// A loop header that kept its entry's heap facts (`Builder::loop_heap_facts`,

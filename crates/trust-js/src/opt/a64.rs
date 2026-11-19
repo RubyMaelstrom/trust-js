@@ -3722,13 +3722,16 @@ impl Gen<'_> {
             self.a.b_cond(NE, site);
         }
         // Same-Realm proof: the splice runs in the planning Realm only.
+        // The Realm's and the callee's words from the literal pool, one load each (P3 stage 3
+        // step 7: the guard every called and inlined way has).
         self.a
             .ldr_imm(X17, 19, std::mem::offset_of!(JitCtx, genv) as u32);
-        self.a.mov_imm64(X30, it.expected_genv as u64);
+        let genv = self.folded_literal(it.expected_genv as u64);
+        self.a.ldr_literal_label(X30, genv);
         self.a.cmp_reg_x(X17, X30);
         self.a.b_cond(NE, site);
-        self.a
-            .mov_imm64(X17, crate::value::PACK_OBJ | stored as u64);
+        let word = self.folded_literal(crate::value::PACK_OBJ | stored as u64);
+        self.a.ldr_literal_label(X17, word);
         self.a.cmp_reg_x(callee, X17);
         self.a.b_cond(NE, site);
         if it.check_this {
@@ -3827,6 +3830,31 @@ impl Gen<'_> {
 
     /// An effect: the operation's baseline template on the canonical frame (see the module
     /// header).
+    /// The known callee of a generic call node whose callee a guard proved (P3 stage 3 step 7,
+    /// P1; `Graph::known_calls`).
+    fn known_call(&mut self, n: NodeIx) -> Option<KnownCallee> {
+        let node = self.graph.node(n);
+        let &(_, _, way) = self
+            .graph
+            .known_calls
+            .iter()
+            .find(|(frame, pc, _)| *frame == node.frame && *pc == node.pc)?;
+        let literals = [way.entry, way.callee, way.chunk, way.env]
+            .map(|word| self.folded_literal(word as u64));
+        Some(KnownCallee {
+            callee: way.callee,
+            chunk: way.chunk,
+            entry: way.entry,
+            env: way.env,
+            n_params: way.n_params,
+            n_slots: way.n_slots,
+            strict: way.strict,
+            needs_global: way.needs_global,
+            sloppy_this: way.sloppy_this,
+            literals,
+        })
+    }
+
     fn lower_effect(&mut self, n: NodeIx, pc: usize, pops: usize) -> Result<(), Refusal> {
         let graph = self.graph;
         let node = graph.node(n);
@@ -3890,6 +3918,27 @@ impl Gen<'_> {
             self.l_ret_throw
         };
         self.a.set_hot(self.in_loop[pc]);
+        // A known callee's direct call, the template its slow path (P3 stage 3 step 7, P1).
+        let known_done = self.known_call(n).and_then(|known| {
+            let (slow, done) = (self.a.new_label(), self.a.new_label());
+            emit_known_sequence(
+                &mut self.a,
+                self.chunk,
+                self.layout,
+                self.ilayout,
+                pc,
+                self.fast,
+                unwind,
+                self.l_direct_finish,
+                known,
+                slow,
+                done,
+            )
+            .then(|| {
+                self.a.bind(slow);
+                done
+            })
+        });
         let emitted = operations::emit(
             &mut self.a,
             self.chunk,
@@ -3909,6 +3958,9 @@ impl Gen<'_> {
                 }
                 _ => emit_exec(&mut self.a, pc as u32, unwind),
             }
+        }
+        if let Some(done) = known_done {
+            self.a.bind(done);
         }
         if let Some(slots) = poisoned.filter(|_| generic) {
             self.check_poison(pc, &slots, depth - pops);
@@ -4200,6 +4252,28 @@ impl Gen<'_> {
             self.a.ldr_imm(X16, 19, this_off);
             self.a.str_imm(X16, 31, save + SAVE_CHECK_THIS);
         }
+        // A known callee's direct call, the template its slow path (P3 stage 3 step 7, P1): the
+        // direct path switches nothing, as the template's (piece B2).
+        let known_done = self.known_call(n).and_then(|known| {
+            let (slow, done) = (self.a.new_label(), self.a.new_label());
+            emit_known_sequence(
+                &mut self.a,
+                view,
+                self.layout,
+                self.ilayout,
+                pc,
+                self.fast,
+                unwind,
+                self.l_direct_finish,
+                known,
+                slow,
+                done,
+            )
+            .then(|| {
+                self.a.bind(slow);
+                done
+            })
+        });
         #[cfg(test)]
         let template_start = self.a.buf.len();
         let emitted = operations::emit(
@@ -4220,6 +4294,9 @@ impl Gen<'_> {
             crate::jit::emit_inlined_call_switch(&mut self.a);
             emit_exec(&mut self.a, pc as u32, unwind);
             crate::jit::emit_inlined_call_restore(&mut self.a);
+        }
+        if let Some(done) = known_done {
+            self.a.bind(done);
         }
         // Test builds: an explicit-input node's template reads neither JitCtx::this_word nor
         // through x22 but in its helper paths' switch, or its first instruction becomes a trap

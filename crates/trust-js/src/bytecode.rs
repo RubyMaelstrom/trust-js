@@ -24542,6 +24542,29 @@ impl Chunk {
     pub(crate) fn jit_cache_ways(&self, idx: u32) -> [IcState; PROP_IC_WAYS] {
         std::array::from_fn(|way| self.caches[idx as usize + way].get())
     }
+    /// The one callee call site `cache`'s record names (P3 stage 3 step 7, P1:
+    /// `opt::oracle::called_ways`): a site not megamorphic, that never met another closure of a
+    /// way's function, whose filled ways all hold one user function (no native way), that
+    /// function's object if its pin still upgrades.
+    pub(crate) fn call_site_single_callee(&self, cache: u32) -> Option<crate::value::Gc> {
+        let site = self.call_caches.get(cache as usize)?;
+        // A site that met another closure of a way's function calls closures of one function,
+        // whose identity guard would fail at each fresh closure: the closures' call is P3's
+        // (guarded by code, as V8's feedback cell and SpiderMonkey's GuardFunctionScript).
+        if site.megamorphic() || site.met_another_closure() {
+            return None;
+        }
+        let mut ways = site
+            .entries
+            .iter()
+            .map(|e| e.get())
+            .filter(|ic| ic.callee != 0);
+        let first = ways.next()?;
+        if ways.any(|ic| ic.callee != first.callee) || first.native != 0 {
+            return None;
+        }
+        self.call_pins.borrow().get(&first.callee)?.upgrade()
+    }
     /// The stable address of call site `idx`'s way-1 `Cell<CallIc>` (same contract as
     /// [`Chunk::jit_cache_ptr`]: `call_caches` is fixed once compilation finishes and the Chunk
     /// outlives its JIT code).
@@ -25978,6 +26001,9 @@ impl Chunk {
             // Rust's probes and, with the optimizing tier on, the direct sequence find its ways
             // stale by the entry word alone (`entry_stale`).
             self.note_entry_change();
+            // The tier's direct calls of this chunk take the template's call, which enters the
+            // function's current code (P3 stage 3 step 7: the slot's entry word).
+            self.jit.set_enterable(false);
             #[cfg(feature = "architecture-diagnostics")]
             call_cache_diagnostics::supersede();
         }
@@ -25986,6 +26012,7 @@ impl Chunk {
     /// count toward the checkpoint it had.
     pub(crate) fn unsupersede(&self) {
         if let Some(at) = self.superseded.take() {
+            self.jit.set_enterable(true);
             self.inline_retry_at.set(at);
             self.set_loop_word(at);
         }

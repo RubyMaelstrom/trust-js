@@ -597,6 +597,13 @@ enum Pred {
     Generic { block: BlockIx, state: State },
 }
 
+#[cfg(test)]
+thread_local! {
+    /// The calls built as a known callee's direct call (P3 stage 3 step 7, P1), since the tests
+    /// last took them.
+    pub(crate) static TEST_KNOWN_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A call an inlined site's ways share.
 struct Call {
     pc: usize,
@@ -610,6 +617,30 @@ struct Call {
 }
 
 impl<'a> Builder<'a> {
+    /// A call at `pc` (site `cache`) that the graph does not inline: its known callee's direct
+    /// call where the preparation made the site a called way (P3 stage 3 step 7, P1): the guard
+    /// an inlined way's callee has (CheckCallee, its WrongCallee exit at place 0) and the generic
+    /// node, which `a64` lowers to the direct call of the known callee with its template as the
+    /// slow path; as Maglev calls a known callee it does not inline (TryBuildCallKnownJSFunction,
+    /// maglev-graph-builder.cc:11086-11120) and JSC's DirectCall follows its function check
+    /// (DFGByteCodeParser.cpp:2681-2722). A site whose guard WrongCallee flagged takes the
+    /// generic call alone, as JSC's BadConstantValue exit site leaves the call a plain Call
+    /// (:2690-2692). Every other call: the generic node.
+    fn called_or_effect(&mut self, pc: usize, cache: u32, st: &mut State) -> Result<(), Refusal> {
+        let Some(&way) = self.chunk.called_way(cache) else {
+            return self.effect(pc, st);
+        };
+        if flagged(self.snapshot, pc, 0) {
+            return self.effect(pc, st);
+        }
+        self.inline_guard(pc, way.target, st)?;
+        self.effect(pc, st)?;
+        self.graph.known_calls.push((self.frame, pc as u32, way));
+        #[cfg(test)]
+        TEST_KNOWN_CALLS.with(|count| count.set(count.get() + 1));
+        Ok(())
+    }
+
     /// Op::Call and Op::CallWithThis (`with_this`) of `argc` arguments at `pc`, call site
     /// `cache`: its ways built in the graph where the oracle inlines the site (see the module's
     /// doc), the call's template otherwise.
@@ -643,7 +674,7 @@ impl<'a> Builder<'a> {
                 .and_then(|tree| Some((tree, *tree.sites.get(&cache)?))),
         };
         if found.is_none() && literal.is_none() {
-            return self.effect(pc, st);
+            return self.called_or_effect(pc, cache, st);
         }
         let mut kept: Vec<(usize, &'a InlineWay, &'a Analysis)> = Vec::new();
         for (place, way) in found
@@ -662,7 +693,7 @@ impl<'a> Builder<'a> {
             }
         }
         if kept.is_empty() && literal.is_none() {
-            return self.effect(pc, st);
+            return self.called_or_effect(pc, cache, st);
         }
         let argc = usize::from(argc);
         let pops = argc + 1 + usize::from(with_this);

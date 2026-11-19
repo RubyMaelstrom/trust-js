@@ -1532,7 +1532,9 @@ pub(crate) fn compile_in_place(
     func: std::rc::Weak<crate::ast::Function>,
     plan: Option<crate::fasthash::FastMap<u32, crate::bytecode::InlinePlanEntry>>,
 ) {
-    let graph = plan.is_some();
+    // A refused compile splices next only where the graph had something to inline (an empty
+    // plan reaches the oracle for its called ways alone, P3 stage 3 step 7).
+    let graph = plan.as_ref().is_some_and(|plan| !plan.is_empty());
     let inline = plan.map(super::oracle::Request::Plan);
     if asynchronous() {
         if let Some(chunk_rc) = chunk_rc {
