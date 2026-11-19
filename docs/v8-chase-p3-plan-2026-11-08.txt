@@ -8012,3 +8012,67 @@ coordinator's check target/p3/stage3/l4a-review).
   address of the object's storage. That test is 9.4% of Mandreel at 200 runs by the agent's
   count: a count of how often it repeats for one view with no effect between is asked
   before any design.
+
+The megamorphic line's piece 1c landed: the store table (52bc29a4; 2026-11-19;
+target/p3/stage3/mega-impl, p1d/report.txt and p1e/report.txt, the agents'; the
+coordinator's check target/p3/stage3/m1c-review).
+- What it is. An engine-wide table for megamorphic named STORES, of its own beside the read
+  table (4,096 direct-mapped entries, 160 KiB an engine), as V8, JSC and SpiderMonkey each
+  keep one (V8's four stub caches, execution/isolate.h:1382-1384; JSC's load, store and has
+  tables, runtime/MegamorphicCache.h:39-65; SpiderMonkey's MegamorphicSetPropCache,
+  vm/Caches.h:269-366): one table would make a read's cached absence and a store's creation
+  of the same name on the same shape evict each other at every `if (!o.x) o.x = v`. An
+  entry is an update of an own writable data property or a creation (before-shape, key and
+  the prototype's identity to after-shape, slot and location). A megamorphic store site's
+  stubs probe it in generated code when the site's ways miss and promote the hit into the
+  ways; the fill stays in Rust, under the rule of F4 part 2 that a watched global's slot is
+  stored in line only once it is not constant.
+- Creation entries hold a prototype's address and are NOT cleared at collections: the fill
+  pins the prototype as the per-site creation way's fill does, and the entry carries the
+  creation epoch that moves when a pinned prototype dies, before its address can be reused.
+  Shown by test (a creation entry after its prototype died and another object took the
+  address is refused) with two mutations (the fill does not pin; the epoch is not compared).
+- One probe a miss, as the exemplars have: the stub's probed miss leaves a token (the site's
+  cache address and the entry it met) that the store helper takes and clears at its entry
+  for every store and honours only for the calling site, so the Rust path does not probe
+  again and the fill writes the probed slot. A token can only cost speed: honoured where
+  the table would hit, the full lookup stores the same value (tested); a stale one never
+  suppresses another store's hit (tested, with the mutation that never clears it).
+- Measured, the coordinator's builds (fat LTO, target/p2/lto/907b044b against its parent
+  2e725cf9; 5 fixed runs, collections deferred; graph | the tier off): TypeScript -9.15% |
+  -6.58%, Octane's mean -0.63% | -0.45%. With piece 1b, TypeScript is about 12.6% | 9.7%
+  under what it was that morning (the count had predicted 14.9% | 11.4% for the piece with
+  its keyed part, which is still to come). The agent's micros: a megamorphic creation
+  1,956 instructions to 1,052, a megamorphic store 737 to 500.
+- Costs, measured and recorded:
+  1. Vue +0.06% to +0.09% (ten randomized runs a side, standard error 0.005%; fixed
+     addresses had read it as inside the spread). The agent's step table of four builds
+     puts 6.7M of the 7.6M instructions on the Rust store path probing and filling the table
+     at every store whose ways missed, megamorphic site or not, and the rest on the token's
+     two-word take at every store that reaches the helper. The follow-up commit gates the
+     Rust probe and fill on the site's generic mark, as the generated probe is and as the
+     three engines fill their store caches from megamorphic stores only, and makes the
+     empty token one load and a branch.
+  2. Always wrong: a megamorphic creation site that meets a new prototype at every object
+     pays a probe and a fill each time, +11.2% | +14.6% on that path (it was +22% before
+     the miss path was cut: the Rust re-probe removed, the prototype compare first, the fill
+     behind the ways' insert). In kind it is the exemplars' cost (they fill on every miss).
+     What it lacks is a teacher; a count of a site's consecutive table misses that turns its
+     probe and fill off goes into the per-site cell of the threshold commit, with this micro
+     under +3% as its exit. 6,000 shapes rotating at one store site: -2.0% | -0.7%.
+  3. Djot's rows with collections running (+0.1%) are the collector's work: level with
+     collections deferred, equal helper calls, compiles and exits.
+- Checked: the coordinator's 55 adversarial programs at seven modes and against the parent's
+  engine, the store programs under GC stress with the tier on and off: none differs. The
+  agent's: the whole library with the tier off in a clean environment from a target
+  directory nothing built in, 3,820 passed and none failed; Test262 53,572 of 53,575; the
+  tier's modules with the tier on (781 passed); the verifier sweep; fifteen mutations of the
+  table's, the token's and the fill's rules, all caught; zombie's check.
+- A harness lesson on the way: an earlier whole-library run of this piece showed 30 failures
+  that were none of its own. The test binary had been rebuilt in the same target directory
+  while the suite ran from it, and every failing test spawns its own executable as a child
+  (AGENTS.md's trap, met again).
+- Next of the line (briefs/mega-build4.txt): the follow-up above; the threshold (a per-site
+  metadata cell, its memory measured at under 0.3% of peak; reads at a site of more than
+  eight shapes probe first, as the census found most of TypeScript's megamorphic reads are;
+  the store miss teacher); then string-keyed sites and `in`.
