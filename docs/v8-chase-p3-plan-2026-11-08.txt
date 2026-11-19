@@ -8412,3 +8412,40 @@ code:
   validation, a kind the table never holds), before any store teacher or change of the
   table's geometry (4096 + 4096 direct-mapped here; V8 4096 + 1024, JSC 2048 + 512,
   SpiderMonkey 1024 and 1024).
+
+The getter line's piece a3 landed: a native setter a store's way finds is called directly
+(edbcafc1, with a tests commit 02efe116; 2026-11-20 00:30;
+target/p3/stage3/getter-impl/msg-a3r.txt, the agent's; the coordinator's check
+target/p3/stage3/a3-review).
+- What it is: Call(setter, Receiver, « V ») for a native setter goes to the native itself
+  with the safepoints and state a call keeps and none of the generic call's dispatch, as a2
+  did for native getters (Interp::try_native_setter beside try_native_getter, one body, one
+  copy per argument count); a native setter skips the probe of the user-setter call cache.
+  The call sits out of line (Interp::call_setter_uncached), so the store path's frame is
+  main's.
+- Measured: an embedder's setter 980 instructions a write to 737 (a closure and a bare
+  native alike; the first out-of-line form without the cache skip read 770); native
+  getters level (a Map's size 558 to 557). Djot, Vue and React level, plain and with
+  collections deferred, the collector's live counts equal to main's at every collection;
+  the coordinator's 5-run tables level in every row (TypeScript -0.06% to -0.08% deferred).
+  No Octane or fixture row moves: the reach is the host's property writes (a DOM setter),
+  which the embedding API's accessors take.
+- A cost found on the way and kept out: with the direct call's result in line,
+  set_named_property_at's frame grew by 0x30 bytes and Djot kept up to 3,500 more cells
+  alive (18,635 to 22,179 at its last collection), +0.29% instructions, all of it the
+  collector's. The landing form keeps the frame (the engineering rule on frames live across
+  a collection).
+- Checked: the coordinator's 71 adversarial programs at seven modes and against main's
+  engine, GC stress on the store programs: none differs. One new, agreeing with Node
+  first: native functions as setters at warm store sites (Array.prototype.push,
+  Set.prototype.add, the __proto__ setter under its own name and borrowed under another,
+  Math.abs), receivers of many shapes, primitives and a Proxy, the setter replaced in
+  mid-run by a closure, a data property and nothing, super stores, Reflect.set with a
+  receiver, each throwing case. The agent's mutation (the direct call removed) is caught;
+  the x86-64 host's check, clippy and Windows check 0; Test262 eager 53,572 of 53,575 on
+  its first form.
+- Open from its whole-library run (3,845 passed, 1 failed):
+  jit::opt_a64::tests::the_checks_read_the_objects_bytes_at_the_folded_offsets failed once
+  and passes alone and in the coordinator's two whole-library runs of the same night: a
+  flake to pin down (the line's agent has it: 20 runs on main, then a child process if its
+  count depends on process-wide state).
